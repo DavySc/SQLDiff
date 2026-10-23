@@ -2,7 +2,7 @@
 //! review queue): pack `ignore`, `shared`, `dialect_map`, pairing rules and
 //! explicit pairs, then one engine diff per pair with pack policy applied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -60,6 +60,82 @@ pub fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Art
 /// rules, overrides, declared assumptions.
 pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
     diff_with(a, b, cfg, &cfg.options())
+}
+
+/// Template-level diff: the SQL fragments of two templates in the pack's
+/// `[template]` syntax, with locations and witnesses in the templates.
+///
+/// `known` holds each side's parameter names when its source knows them; the
+/// pack's `known_parameters` are added to a given list. With a list, only its
+/// names are placeholders and any other delimited name stays SQL (reported
+/// as `template.unresolved`), since `[name]` is also a quoted identifier in
+/// T-SQL. Without one the name pattern decides, and where the delimiters can
+/// quote names the report says which names that made placeholders.
+pub fn template_report(
+    a: &Artifact,
+    b: &Artifact,
+    known: [Option<&BTreeSet<String>>; 2],
+    cfg: &Resolved,
+    opts: &Options,
+) -> Result<Report> {
+    use sqldiff_core::composition::{remap_to_template, template_notes};
+    use sqldiff_core::model::Side;
+    use sqldiff_syntax::template::Template;
+
+    let t = cfg
+        .policy
+        .template
+        .as_ref()
+        .ok_or_else(|| Error::new("no [template] syntax in the loaded packs or config"))?;
+    let syntax = crate::compose::compile(t)?;
+    let with_pack = |k: Option<&BTreeSet<String>>| {
+        k.map(|k| {
+            k.iter()
+                .chain(t.known_parameters.iter())
+                .cloned()
+                .collect::<BTreeSet<String>>()
+        })
+    };
+    let (ka, kb) = (with_pack(known[0]), with_pack(known[1]));
+    let ta = Template::parse(&a.text, &syntax, ka.as_ref());
+    let tb = Template::parse(&b.text, &syntax, kb.as_ref());
+    let (fa, fb) = (ta.fragment(), tb.fragment());
+    let mut xa = a.clone();
+    xa.text = fa.text.clone();
+    let mut xb = b.clone();
+    xb.text = fb.text.clone();
+    let mut r = sqldiff_core::diff(&xa, &xb, opts);
+    for (side, tpl, frag, art, k) in [(Side::A, &ta, &fa, a, &ka), (Side::B, &tb, &fb, b, &kb)] {
+        remap_to_template(&mut r, side, tpl, frag, art.dialect, opts.excerpt_lines);
+        template_notes(
+            &mut r,
+            side,
+            tpl,
+            &art.path,
+            art.dialect,
+            k.is_some(),
+            (&t.open, &t.close),
+            opts.excerpt_lines,
+        );
+    }
+    Ok(r)
+}
+
+/// [`template_report`] with pack policy (limit rules, overrides, declared
+/// assumptions), as [`diff`] adds it to an engine diff.
+pub fn template_diff(
+    a: &Artifact,
+    b: &Artifact,
+    known: [Option<&BTreeSet<String>>; 2],
+    cfg: &Resolved,
+    opts: &Options,
+) -> Result<Report> {
+    Ok(with_policy(
+        template_report(a, b, known, cfg, opts)?,
+        a,
+        Some(b),
+        cfg,
+    ))
 }
 
 /// [`diff`] with explicit engine options (e.g. scenario flips).

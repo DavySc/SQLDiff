@@ -39,6 +39,7 @@ pub fn syntax_def(t: &TemplateSyntax) -> template::TemplateSyntax {
             .iter()
             .map(|f| (f.name.clone(), f.pattern.clone()))
             .collect(),
+        ignore_case: t.ignore_case,
     }
 }
 
@@ -356,6 +357,8 @@ mod tests {
             special_forms: vec![],
             parameter_sources: vec!["composition".into(), "cli".into()],
             collision: Some("error".into()),
+            known_parameters: vec![],
+            ignore_case: false,
         };
         let mut c = Composition::from_spans(
             "x",

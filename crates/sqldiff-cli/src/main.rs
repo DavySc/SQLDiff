@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use sqldiff_core::composition;
-use sqldiff_core::model::Side as ReportSide;
-use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
+use sqldiff_core::{render, Artifact, Dialect, Report, Verdict};
 use sqldiff_syntax::template::{ExpandProblem, SegmentKind, Template};
 
 use sqldiff_source::{compose, tree, Resolved};
@@ -76,6 +74,11 @@ enum Command {
         /// their SQL fragments, with locations in the templates.
         #[arg(long, conflicts_with = "templates")]
         template: bool,
+        /// With --template: a parameter name of the templates (repeatable).
+        /// Then only these and the pack's `known_parameters` are placeholders;
+        /// any other delimited name is SQL, e.g. a quoted `[name]` in T-SQL.
+        #[arg(long = "parameter", value_name = "NAME", requires = "template")]
+        parameters: Vec<String>,
         #[command(flatten)]
         flips: queue_cmd::FlipArgs,
         #[command(flatten)]
@@ -182,41 +185,6 @@ fn template_syntax(cfg: &Resolved) -> Result<sqldiff_syntax::template::Compiled,
         .as_ref()
         .ok_or("no [template] syntax in the loaded packs or config")?;
     compose::compile(t).map_err(|e| e.0)
-}
-
-/// Template-level diff: the SQL fragments of two templates, located in the templates.
-fn template_diff(
-    a: &Artifact,
-    b: &Artifact,
-    cfg: &Resolved,
-    opts: &Options,
-) -> Result<Report, String> {
-    let syntax = template_syntax(cfg)?;
-    let ta = Template::parse(&a.text, &syntax, None);
-    let tb = Template::parse(&b.text, &syntax, None);
-    let (fa, fb) = (ta.fragment(), tb.fragment());
-    let mut xa = a.clone();
-    xa.text = fa.text.clone();
-    let mut xb = b.clone();
-    xb.text = fb.text.clone();
-    let mut r = sqldiff_core::diff(&xa, &xb, opts);
-    composition::remap_to_template(
-        &mut r,
-        ReportSide::A,
-        &ta,
-        &fa,
-        a.dialect,
-        opts.excerpt_lines,
-    );
-    composition::remap_to_template(
-        &mut r,
-        ReportSide::B,
-        &tb,
-        &fb,
-        b.dialect,
-        opts.excerpt_lines,
-    );
-    Ok(tree::with_policy(r, a, Some(b), cfg))
 }
 
 fn template_cmd(
@@ -355,6 +323,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             templates,
             params,
             template,
+            parameters,
             cfg,
             review,
         } => {
@@ -367,7 +336,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             catalogs.apply(&mut opts, a.dialect, Some(b.dialect))?;
             let mut pipe = Pipeline::new(cfg, &review)?;
             if template {
-                let report = template_diff(&a, &b, &pipe.cfg, &opts)?;
+                let known: Option<BTreeSet<String>> =
+                    (!parameters.is_empty()).then(|| parameters.into_iter().collect());
+                let report =
+                    tree::template_diff(&a, &b, [known.as_ref(), known.as_ref()], &pipe.cfg, &opts)
+                        .map_err(|e| e.0)?;
                 let verdict = report.open_verdict();
                 emit(report, format, &mut pipe)?;
                 return Ok(exit_for(verdict));

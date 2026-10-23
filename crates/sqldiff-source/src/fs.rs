@@ -119,6 +119,7 @@ impl Source for FsSource {
             info,
             text,
             metadata: Default::default(),
+            template: None,
         })
     }
 

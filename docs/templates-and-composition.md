@@ -16,6 +16,8 @@ name_pattern = "[A-Z][A-Z0-9_]*"
 special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
 parameter_sources = ["composition", "cli"]   # lookup order
 collision = "error"                           # first | last | error
+known_parameters = ["SCHEMA"]                 # supplied by the generator itself
+ignore_case = false                           # true: [schema] is parameter SCHEMA
 ```
 
 A template is split losslessly into SQL spans, placeholders, special forms
@@ -40,6 +42,38 @@ sqldiff template proc.tpl.sql -d tsql --pack gen-pack            # placeholders,
 sqldiff template proc.tpl.sql -d tsql --pack gen-pack --param SCHEMA=dbo --render
 sqldiff diff --template a.tpl.sql b.tpl.sql -d tsql --pack gen-pack   # template-level diff
 ```
+
+### Placeholder or quoted name?
+
+With `open = "["`, `[TAB]` can be a placeholder or, in T-SQL, a quoted
+identifier for an object named `TAB`. The delimiters alone cannot tell, so
+the parameter names decide:
+
+| Parameter names given by | Then |
+|---|---|
+| the source (`template.parameters` on the artifact, see [adapter-protocol.md](adapter-protocol.md)) or `--parameter NAME` on `diff --template` | Only those names, plus the pack's `known_parameters`, are placeholders. Any other name that matches the pattern is read as SQL and reported as `template.unresolved`, with its location in the template. |
+| nobody | The name pattern decides. Where the delimiters also quote names in that dialect (`[...]` in T-SQL, `"..."` in any dialect), the report says which names were taken as placeholders on that basis. This is an unknown reason, so such a pair is never reported as plain *equal*. |
+
+`known_parameters` in `[template]` lists names the generator always supplies
+(for example an object id or a column list), which a source does not list
+per template. They are added to a given list; on their own they do not make
+a list.
+
+`ignore_case = true` is for generators that resolve placeholder names in any
+letter case: `[comma]` then is parameter `COMMA`, and a value given as
+`comma` fills `[COMMA]`. Names are kept in upper case, so the same
+placeholder spelled differently on two sides compares equal. With a
+parameter list, `name_pattern` can be as broad as the generator's names
+(including lower case): the list decides, and a name outside it is SQL.
+
+```sh
+sqldiff diff --template a.tpl.sql b.tpl.sql -d tsql --pack gen-pack --parameter TAB --parameter COL
+```
+
+`pairs --diff`, the queue and the MCP `diff` compare a pair as templates when
+the source marks both sides as templates and the config has a `[template]`
+syntax. A template without that syntax is compared as plain SQL, and the
+report says so.
 
 A template-level diff compares the two fragments; locations point into the
 templates and witnesses quote placeholders as the template spells them.

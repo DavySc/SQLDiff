@@ -143,6 +143,18 @@ pub struct Provenance {
     pub revision: Option<String>,
 }
 
+/// Marks an artifact as a template in the pack's `[template]` syntax rather
+/// than plain SQL.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateInfo {
+    /// The template's parameter names, when the source knows them. Then only
+    /// these are placeholders and any other delimited name is SQL (`[name]` is
+    /// a quoted identifier in T-SQL). Absent: the pack's name pattern decides,
+    /// and the report says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Vec<String>>,
+}
+
 /// A whole artifact, as the core sees it after chunk reassembly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactData {
@@ -152,6 +164,8 @@ pub struct ArtifactData {
     pub provenance: Provenance,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +187,8 @@ pub struct ArtifactChunk {
     pub provenance: Provenance,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateInfo>,
     pub offset: usize,
     pub data: String,
     pub total_bytes: usize,

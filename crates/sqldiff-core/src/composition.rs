@@ -28,8 +28,8 @@ use crate::artifact::{content_hash, Analyzed, Artifact};
 use crate::classify::{stmt_kind, StmtKind};
 use crate::facts;
 use crate::model::{
-    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Report,
-    Severity, Side, Verdict,
+    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Location,
+    Report, Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::Options;
@@ -841,6 +841,84 @@ pub fn remap_to_template(
     ));
 }
 
+/// Whether the template delimiters also quote identifiers in `dialect`, so a
+/// delimited name may be SQL rather than a placeholder.
+pub fn delimiters_quote_names(open: &str, dialect: sqldiff_syntax::Dialect) -> bool {
+    open == "\"" || (open == "[" && dialect == sqldiff_syntax::Dialect::Tsql)
+}
+
+/// What the reader of a template diff must know about one side's
+/// placeholders: names that looked like placeholders but are not parameters
+/// (`template.unresolved`, read as SQL), and, without a parameter list,
+/// which names the pattern alone made placeholders where the delimiters also
+/// quote names. Call after [`remap_to_template`].
+#[allow(clippy::too_many_arguments)]
+pub fn template_notes(
+    report: &mut Report,
+    side: Side,
+    template: &Template,
+    path: &str,
+    dialect: sqldiff_syntax::Dialect,
+    parameters_known: bool,
+    (open, close): (&str, &str),
+    excerpt_lines: usize,
+) {
+    let text = &template.text;
+    let lines = sqldiff_syntax::LineIndex::new(text);
+    for s in template.unresolved() {
+        let spelled = template.slice(s);
+        let (sl, sc) = lines.line_col(s.start);
+        let (el, ec) = lines.line_col(s.end);
+        let loc = Location {
+            side,
+            path: path.to_string(),
+            start_line: sl,
+            start_col: sc,
+            end_line: el,
+            end_col: ec,
+            byte_start: s.start,
+            byte_end: s.end,
+            excerpt: text[s.start..s.end]
+                .lines()
+                .take(excerpt_lines.max(1))
+                .map(|l| l.trim_end().to_string())
+                .collect(),
+        };
+        let class = ChangeClass::Structural;
+        report.findings.push(Finding {
+            fingerprint: fingerprint(&FingerprintInput {
+                object: &report.a.object,
+                class,
+                rule: "template.unresolved",
+                anchor_a: if side == Side::A { spelled } else { "" },
+                anchor_b: if side == Side::B { spelled } else { "" },
+            }),
+            rule: "template.unresolved".to_string(),
+            class,
+            severity: Severity::Medium,
+            verdict: Verdict::Unknown,
+            witness: format!(
+                "Side {side:?} line {sl}: `{spelled}` looks like a placeholder but is not one of the template's parameters; it was read as SQL."
+            ),
+            a: (side == Side::A).then(|| loc.clone()),
+            b: (side == Side::B).then_some(loc),
+            assumptions: Vec::new(),
+        });
+    }
+    if !parameters_known && delimiters_quote_names(open, dialect) {
+        let names = template.parameters();
+        if !names.is_empty() {
+            let shown: Vec<String> = names.iter().map(|n| format!("{open}{n}{close}")).collect();
+            report.unknown_reasons.push(format!(
+                "side {side:?}: no parameter list for the template, so {} were taken as placeholders by the name pattern; in {} they could also be quoted names",
+                shown.join(", "),
+                dialect.display_name()
+            ));
+        }
+    }
+    report.verdict = crate::session::derive_verdict(report);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,6 +991,7 @@ mod tests {
             close: "}}".into(),
             name_pattern: "[A-Z][A-Z0-9_]*".into(),
             special_forms: vec![],
+            ignore_case: false,
         })
         .unwrap();
         let text = "-- [part:body template=b table=dbo.t]\nDELETE FROM dbo.t;  \r\n-- [/part]\n";

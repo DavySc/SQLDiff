@@ -7,14 +7,15 @@
 //! source. [`entries`] ranks pairs by review state, verdict, severity,
 //! whether an assumption flips the verdict, recency and size.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqldiff_core::model::{hex, AssumptionSource};
 use sqldiff_core::{Artifact, ChangeClass, Report, Severity, Verdict};
 
-use crate::protocol::{Describe, ObjectFilter, Pair, PairScope};
+use crate::protocol::{Describe, ObjectFilter, Pair, PairScope, TemplateInfo};
+use crate::source::to_artifact;
 use crate::{pairing, policy, Resolved, Result, Source};
 
 /// One diffed pair, before session flips.
@@ -71,10 +72,40 @@ pub fn run_with(
     let opts = cfg.options();
     let mut pairs = Vec::new();
     for x in &p.pairs {
-        let a = src.load_artifact(&x.a)?;
-        let b = src.load_artifact(&x.b)?;
-        let mut r = sqldiff_core::diff(&a, &b, &opts);
-        crate::compose::apply_source(&mut r, src, (&x.a, &a), (&x.b, &b), &cfg.policy, &opts);
+        let (da, db) = (src.get_artifact(&x.a)?, src.get_artifact(&x.b)?);
+        let (a, b) = (to_artifact(&da)?, to_artifact(&db)?);
+        let mut r = match (&da.template, &db.template, &cfg.policy.template) {
+            // Both sides are templates: compare them as templates, each with
+            // the parameter names its source knows.
+            (Some(ta), Some(tb), Some(_)) => {
+                let known = |t: &TemplateInfo| {
+                    t.parameters
+                        .as_ref()
+                        .map(|p| p.iter().cloned().collect::<BTreeSet<String>>())
+                };
+                let (ka, kb) = (known(ta), known(tb));
+                crate::tree::template_report(&a, &b, [ka.as_ref(), kb.as_ref()], cfg, &opts)?
+            }
+            (ta, tb, syntax) => {
+                let mut r = sqldiff_core::diff(&a, &b, &opts);
+                crate::compose::apply_source(
+                    &mut r,
+                    src,
+                    (&x.a, &a),
+                    (&x.b, &b),
+                    &cfg.policy,
+                    &opts,
+                );
+                if (ta.is_some() || tb.is_some()) && syntax.is_none() {
+                    r.unknown_reasons.push(
+                        "the source marks a template, but no [template] syntax is configured; compared as plain SQL"
+                            .to_string(),
+                    );
+                    r.verdict = sqldiff_core::session::derive_verdict(&r);
+                }
+                r
+            }
+        };
         policy::add_limits(&mut r, &a, Some(&b), cfg);
         policy::apply(&mut r, cfg);
         post(&mut r, &a, &b);

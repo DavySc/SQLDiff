@@ -180,6 +180,14 @@ pub struct TemplateSyntax {
     /// What happens when two sources define a parameter: `first`, `last` or `error`.
     #[serde(default)]
     pub collision: Option<String>,
+    /// Parameter names the generator always supplies, which a source does not
+    /// list per template. Added to a source's parameter list; on their own
+    /// they do not decide what is a placeholder.
+    #[serde(default)]
+    pub known_parameters: Vec<String>,
+    /// Placeholder names match parameter names in any letter case.
+    #[serde(default)]
+    pub ignore_case: bool,
 }
 
 fn default_placeholder_name() -> String {

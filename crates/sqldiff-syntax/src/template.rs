@@ -32,6 +32,9 @@ pub struct TemplateSyntax {
     /// regex matches the whole form, delimiters included; capture groups
     /// are its arguments.
     pub special_forms: Vec<(String, String)>,
+    /// Placeholder names match parameter names in any letter case, as the
+    /// generator resolves them. Names are then kept in upper case.
+    pub ignore_case: bool,
 }
 
 /// A compiled [`TemplateSyntax`].
@@ -39,6 +42,7 @@ pub struct TemplateSyntax {
 pub struct Compiled {
     placeholder: Regex,
     specials: Vec<(String, Regex)>,
+    ignore_case: bool,
 }
 
 impl Compiled {
@@ -65,6 +69,7 @@ impl Compiled {
         Ok(Compiled {
             placeholder,
             specials,
+            ignore_case: s.ignore_case,
         })
     }
 }
@@ -99,6 +104,8 @@ pub struct Segment {
 pub struct Template {
     pub text: String,
     pub segments: Vec<Segment>,
+    /// Parameter values are looked up in any letter case.
+    pub ignore_case: bool,
 }
 
 /// One span of an [`OffsetMap`]: `src` in the template, `dst` in the
@@ -271,9 +278,18 @@ impl Template {
             if overlaps(&marks, all.start(), all.end()) {
                 continue;
             }
-            let name = c["tplname"].to_string();
+            let raw = &c["tplname"];
+            let name = if syntax.ignore_case {
+                raw.to_ascii_uppercase()
+            } else {
+                raw.to_string()
+            };
+            let is_known = |k: &BTreeSet<String>| {
+                k.contains(&name)
+                    || (syntax.ignore_case && k.iter().any(|x| x.eq_ignore_ascii_case(&name)))
+            };
             let kind = match known {
-                Some(k) if !k.contains(&name) => SegmentKind::Unresolved { name },
+                Some(k) if !is_known(k) => SegmentKind::Unresolved { name },
                 _ => SegmentKind::Placeholder { name },
             };
             marks.push(Segment {
@@ -306,6 +322,7 @@ impl Template {
         Template {
             text: text.to_string(),
             segments,
+            ignore_case: syntax.ignore_case,
         }
     }
 
@@ -358,7 +375,12 @@ impl Template {
     ) -> Result<Derived, Vec<ExpandProblem>> {
         let mut problems = Vec::new();
         let out = self.derive(|s| match &s.kind {
-            SegmentKind::Placeholder { name } => match params.get(name) {
+            SegmentKind::Placeholder { name } => match params.get(name).or_else(|| {
+                self.ignore_case
+                    .then(|| params.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
+                    .flatten()
+                    .map(|(_, v)| v)
+            }) {
                 Some(v) => Some(v.clone()),
                 None => {
                     problems.push(ExpandProblem::MissingParameter {
@@ -496,6 +518,7 @@ mod tests {
             close: close.into(),
             name_pattern: "[A-Za-z_][A-Za-z0-9_]*".into(),
             special_forms: vec![("include".into(), r"<%@include\s+(\S+)\s*%>".into())],
+            ignore_case: false,
         })
         .unwrap()
     }
@@ -576,6 +599,30 @@ mod tests {
         let f = t.fragment();
         assert_eq!(f.text, "SELECT [qty] FROM TPL_TABLE;");
         assert_eq!(t.print(), text);
+    }
+
+    #[test]
+    fn ignore_case_matches_parameters_in_any_case() {
+        let def = |ignore_case| TemplateSyntax {
+            open: "[".into(),
+            close: "]".into(),
+            name_pattern: "[A-Za-z_][A-Za-z0-9_]*".into(),
+            special_forms: vec![],
+            ignore_case,
+        };
+        let text = "SELECT a[comma] b FROM [Tab];";
+        let known: BTreeSet<String> = ["COMMA".to_string(), "TAB".to_string()].into();
+        let t = Template::parse(text, &Compiled::new(&def(true)).unwrap(), Some(&known));
+        // One spelling per name, so `[comma]` and `[COMMA]` are the same stand-in.
+        assert_eq!(t.parameters(), vec!["COMMA", "TAB"]);
+        assert_eq!(t.unresolved().count(), 0);
+        assert_eq!(t.fragment().text, "SELECT aTPL_COMMA b FROM TPL_TAB;");
+        let values: BTreeMap<String, String> =
+            [("comma".into(), ",".into()), ("tab".into(), "t".into())].into();
+        assert_eq!(t.substitute(&values).unwrap().text, "SELECT a, b FROM t;");
+        // Case-sensitive by default: neither name is known.
+        let t = Template::parse(text, &Compiled::new(&def(false)).unwrap(), Some(&known));
+        assert_eq!(t.unresolved().count(), 2);
     }
 
     #[test]
