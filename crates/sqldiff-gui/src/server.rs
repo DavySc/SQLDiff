@@ -15,6 +15,11 @@
 //! - `GET /api/what_if?pair=N&line=L&side=a|b&error=<kind>`: "what if this
 //!   statement fails?" (design §6.1)
 //! - `GET /api/overlay?pair=N`: transaction brackets of both sides (design §6.2)
+//!
+//! Every request must name a loopback host (or the address the server is
+//! bound to) in `Host`, which defeats DNS rebinding. POSTs must also be
+//! `application/json` and, when the browser sends `Origin`, come from this
+//! server's own origin, so another web page cannot write decisions (CSRF).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -25,7 +30,7 @@ use sqldiff_core::ir::ErrorKind;
 use sqldiff_core::model::Side;
 
 use crate::page;
-use crate::review::ReviewState;
+use crate::review::State;
 use crate::session::{Flip, Session};
 
 #[derive(Deserialize)]
@@ -46,7 +51,7 @@ struct SetFlip {
 struct Review {
     fingerprint: String,
     snapshot: String,
-    state: Option<ReviewState>,
+    state: Option<State>,
     #[serde(default)]
     comment: Option<String>,
 }
@@ -55,12 +60,24 @@ struct Review {
 pub(crate) const MAX_BODY: usize = 16 * 1024 * 1024;
 
 pub fn serve(listener: TcpListener, session: Session) -> std::io::Result<()> {
+    serve_with_hosts(listener, session, &[])
+}
+
+/// [`serve`], also answering requests addressed to `extra` host names
+/// (`--allow-host`, for a server bound to a non-loopback address).
+pub fn serve_with_hosts(
+    listener: TcpListener,
+    session: Session,
+    extra: &[String],
+) -> std::io::Result<()> {
     let session = Arc::new(Mutex::new(session));
+    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let session = Arc::clone(&session);
+        let hosts = Arc::clone(&hosts);
         std::thread::spawn(move || {
-            let _ = handle(stream, &session);
+            let _ = handle(stream, &session, &hosts);
         });
     }
     Ok(())
@@ -124,57 +141,129 @@ pub(crate) struct Request {
     pub body: Vec<u8>,
 }
 
-/// Reads one request. `Err(response)` when it must be refused: a body over
-/// `MAX_BODY`, or a cross-site POST (an `Origin` that is not this server).
-pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Result<Request, Response>> {
+/// Host names (without port) a request may address: loopback names, the
+/// address the listener is bound to (`0.0.0.0` included) and `extra`.
+/// A DNS name only passes when it is listed, which defeats DNS rebinding.
+pub(crate) fn allowed_hosts(
+    listener: &TcpListener,
+    extra: &[String],
+) -> std::io::Result<Vec<String>> {
+    let ip = listener.local_addr()?.ip();
+    let mut v: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
+        .map(String::from)
+        .to_vec();
+    v.push(match ip {
+        std::net::IpAddr::V4(a) => a.to_string(),
+        std::net::IpAddr::V6(a) => format!("[{a}]"),
+    });
+    v.extend(extra.iter().map(|h| host_name(h).to_string()));
+    Ok(v)
+}
+
+/// `host[:port]` without the port.
+fn host_name(h: &str) -> &str {
+    let h = h.trim();
+    if h.starts_with('[') {
+        return h.find(']').map_or(h, |e| &h[..=e]);
+    }
+    h.rsplit_once(':').map_or(h, |(n, _)| n)
+}
+
+#[derive(Default)]
+struct Headers {
+    content_length: usize,
+    host: Option<String>,
+    origin: Option<String>,
+    content_type: Option<String>,
+    fetch_site: Option<String>,
+}
+
+/// Why a request is refused before it is routed, if it is.
+fn refuse(method: &str, h: &Headers, hosts: &[String]) -> Option<Response> {
+    let forbidden = |why: &str| Some(("403 Forbidden", "text/plain", why.to_string()));
+    let host_ok = h
+        .host
+        .as_deref()
+        .is_some_and(|x| hosts.iter().any(|a| a.eq_ignore_ascii_case(host_name(x))));
+    if !host_ok {
+        return forbidden("unexpected Host");
+    }
+    if method != "POST" {
+        return None;
+    }
+    // Browsers send Origin on cross-site POSTs: only this server's own page may post.
+    if let Some(o) = &h.origin {
+        let authority = o.split_once("://").map_or(o.as_str(), |(_, a)| a);
+        if !h
+            .host
+            .as_deref()
+            .is_some_and(|x| authority.eq_ignore_ascii_case(x.trim()))
+        {
+            return forbidden("cross-origin request");
+        }
+    }
+    if h.fetch_site.as_deref() == Some("cross-site") {
+        return forbidden("cross-site request");
+    }
+    // Not a CORS-safelisted type, so a foreign page cannot send it without a preflight.
+    let json = h.content_type.as_deref().is_some_and(|c| {
+        c.trim()
+            .to_ascii_lowercase()
+            .starts_with("application/json")
+    });
+    if !json {
+        return Some((
+            "415 Unsupported Media Type",
+            "text/plain",
+            "POST bodies must be application/json".to_string(),
+        ));
+    }
+    if h.content_length > MAX_BODY {
+        return Some(("413 Payload Too Large", "text/plain", String::new()));
+    }
+    None
+}
+
+/// Reads one request. `Err(response)` when it must be refused (see
+/// [`refuse`]); a refused body is drained first, so the client reads the
+/// response instead of a reset connection.
+pub(crate) fn read_request(
+    stream: &TcpStream,
+    hosts: &[String],
+) -> std::io::Result<Result<Request, Response>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("").to_string();
-    let mut content_length = 0usize;
-    let (mut host, mut origin) = (None, None);
+    let mut h = Headers::default();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
-            let v = v.trim();
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.parse().unwrap_or(0);
-            } else if k.eq_ignore_ascii_case("host") {
-                host = Some(v.to_string());
-            } else if k.eq_ignore_ascii_case("origin") {
-                origin = Some(v.to_string());
+            let v = v.trim().to_string();
+            match k.trim().to_ascii_lowercase().as_str() {
+                "content-length" => h.content_length = v.parse().unwrap_or(0),
+                "host" => h.host = Some(v),
+                "origin" => h.origin = Some(v),
+                "content-type" => h.content_type = Some(v),
+                "sec-fetch-site" => h.fetch_site = Some(v),
+                _ => {}
             }
         }
+    }
+    if let Some(r) = refuse(&method, &h, hosts) {
+        let drain = h.content_length.min(MAX_BODY) as u64;
+        let _ = std::io::copy(&mut reader.by_ref().take(drain), &mut std::io::sink());
+        return Ok(Err(r));
     }
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let mut body = Vec::new();
     if method == "POST" {
-        // Browsers send Origin on cross-site POSTs: only this server's own page may post.
-        let own = |o: &str| {
-            let authority = o.split_once("://").map_or(o, |(_, a)| a);
-            host.as_deref() == Some(authority)
-        };
-        if content_length > MAX_BODY {
-            return Ok(Err(("413 Payload Too Large", "text/plain", String::new())));
-        }
-        if origin.as_deref().is_some_and(|o| !own(o)) {
-            // Read the body first: closing a socket with unread bytes resets the connection.
-            std::io::copy(
-                &mut (&mut reader).take(content_length as u64),
-                &mut std::io::sink(),
-            )?;
-            return Ok(Err((
-                "403 Forbidden",
-                "text/plain",
-                "cross-origin request".to_string(),
-            )));
-        }
-        body = vec![0; content_length];
+        body = vec![0; h.content_length];
         reader.read_exact(&mut body)?;
     }
     Ok(Ok(Request {
@@ -185,8 +274,12 @@ pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Result<Request
     }))
 }
 
-fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()> {
-    let req = match read_request(&stream)? {
+fn handle(
+    mut stream: TcpStream,
+    session: &Mutex<Session>,
+    hosts: &[String],
+) -> std::io::Result<()> {
+    let req = match read_request(&stream, hosts)? {
         Ok(r) => r,
         Err(res) => return respond(&mut stream, res),
     };
@@ -208,11 +301,12 @@ fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()
         ("GET", "/api/session") => {
             json(&serde_json::json!({ "session": s.info(), "queue": s.queue() }))
         }
-        ("GET", "/api/report") => (
-            "200 OK",
-            "text/markdown; charset=utf-8",
-            s.session_report(param(query, "redact").is_some_and(|v| v != "0")),
-        ),
+        ("GET", "/api/report") => {
+            match s.session_report(param(query, "redact").is_some_and(|v| v != "0")) {
+                Ok(md) => ("200 OK", "text/markdown; charset=utf-8", md),
+                Err(e) => ("500 Internal Server Error", "text/plain", e),
+            }
+        }
         ("GET", p) if p.starts_with("/api/pair/") => {
             match p["/api/pair/".len()..]
                 .parse()

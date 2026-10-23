@@ -33,8 +33,11 @@ pub struct Payload {
     pub live: bool,
     /// Position of the pair in the session queue.
     pub index: usize,
-    /// Review snapshot key: both content hashes.
+    /// Review snapshot key (`sqldiff_review::snapshot`): both content hashes.
     pub snapshot: String,
+    /// Review status of each finding, resolved by the store (exact snapshot,
+    /// then `*`, expiry, outdated). Empty where no store is behind the page.
+    pub review: Vec<sqldiff_review::Status>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,10 +95,8 @@ pub fn build_view(a: &Artifact, b: &Artifact, report: Report, live: bool) -> Pay
     attach_findings(&mut bb, &report, false);
     let rows = align(ba, bb);
     Payload {
-        snapshot: review::snapshot(
-            &report.a.content_hash,
-            report.b.as_ref().map_or("", |b| b.content_hash.as_str()),
-        ),
+        snapshot: sqldiff_review::snapshot(&report),
+        review: Vec::new(),
         report,
         view: View { rows },
         sources: [a.text.clone(), b.text.clone()],

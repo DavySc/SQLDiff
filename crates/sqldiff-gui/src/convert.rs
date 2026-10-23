@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sqldiff_convert::Conversion;
 use sqldiff_core::Dialect;
 
-use crate::server::{bad, json, not_found, read_request, respond};
+use crate::server::{allowed_hosts, bad, json, not_found, read_request, respond};
 
 /// The convert page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
 pub const CONVERT_HTML: &str = include_str!("../assets/convert.html");
@@ -112,20 +112,22 @@ struct Edit {
     text: String,
 }
 
-pub fn serve(listener: TcpListener, setup: Setup) -> std::io::Result<()> {
+pub fn serve(listener: TcpListener, setup: Setup, extra_hosts: &[String]) -> std::io::Result<()> {
     let setup = Arc::new(setup);
+    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let setup = Arc::clone(&setup);
+        let hosts = Arc::clone(&hosts);
         std::thread::spawn(move || {
-            let _ = handle(stream, &setup);
+            let _ = handle(stream, &setup, &hosts);
         });
     }
     Ok(())
 }
 
-fn handle(mut stream: TcpStream, setup: &Setup) -> std::io::Result<()> {
-    let req = match read_request(&stream)? {
+fn handle(mut stream: TcpStream, setup: &Setup, hosts: &[String]) -> std::io::Result<()> {
+    let req = match read_request(&stream, hosts)? {
         Ok(r) => r,
         Err(res) => return respond(&mut stream, res),
     };

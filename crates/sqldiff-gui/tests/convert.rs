@@ -46,12 +46,12 @@ fn unsupported_pair_reports_an_error() {
 fn server_converts_posted_text() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || serve(listener, setup("SELECT 1;")));
+    std::thread::spawn(move || serve(listener, setup("SELECT 1;"), &[]));
     let body = r#"{"text":"SELECT TOP 3 a FROM dbo.t;"}"#;
     let mut s = TcpStream::connect(addr).unwrap();
     write!(
         s,
-        "POST /api/convert HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+        "POST /api/convert HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -63,7 +63,7 @@ fn server_converts_posted_text() {
     assert_eq!(v["conversion"]["output"], "SELECT a FROM t\nLIMIT 3;\n");
 
     let mut s = TcpStream::connect(addr).unwrap();
-    write!(s, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    write!(s, "GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n").unwrap();
     let mut resp = String::new();
     s.read_to_string(&mut resp).unwrap();
     assert!(resp.contains("SQLDiff convert"));
@@ -73,13 +73,13 @@ fn server_converts_posted_text() {
 fn cross_origin_posts_are_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || serve(listener, setup("SELECT 1;")));
+    std::thread::spawn(move || serve(listener, setup("SELECT 1;"), &[]));
     let body = r#"{"text":"SELECT 1;"}"#;
     let post = |origin: &str| {
         let mut s = TcpStream::connect(addr).unwrap();
         write!(
             s,
-            "POST /api/convert HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /api/convert HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();

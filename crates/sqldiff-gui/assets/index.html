@@ -333,28 +333,33 @@ const label = (s) => String(s || "").replace(/_/g, " ");
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 async function api(method, path, body) {
-  const res = await fetch(path, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  const post = method === "POST";
+  const res = await fetch(path, { method, headers: post ? { "Content-Type": "application/json" } : {}, body: post ? JSON.stringify(body || {}) : undefined });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
 // ---------- review decisions ----------
-function decision(fp, snap) {
-  let best = null;
-  for (const d of state.page.session.reviews) {
-    if (d.fingerprint !== fp) continue;
-    if (d.snapshot === snap) return { d, current: true };
-    if (!best || d.at > best.at) best = d;
-  }
-  return best ? { d: best, current: false } : null;
+// The server resolves each finding's status (exact snapshot, then "*", expiry,
+// outdated); the page only reads it.
+function decision(fp) {
+  const i = state.data.report.findings.findIndex((f) => f.fingerprint === fp);
+  const st = (state.data.review || [])[i];
+  if (!st || !st.decision) return null;
+  return { d: st.decision, state: st.state, snapshot: st.snapshot, current: ["accepted", "rejected", "commented"].includes(st.state) };
 }
 function isAccepted(f) {
-  const x = decision(f.fingerprint, state.data.snapshot);
-  return !!(x && x.current && x.d.state === "accepted");
+  const x = decision(f.fingerprint);
+  return !!(x && x.state === "accepted");
 }
+// Decisions are keyed by the files on disk; a scratchpad edit has no snapshot to record against.
+function canReview() { return state.live && !state.scratchDirty; }
 async function setReview(i, st, comment) {
-  if (!state.live) return;
+  if (!canReview()) { if (state.scratchDirty) flash("reset edits to review: decisions apply to the files on disk"); return; }
   const f = state.data.report.findings[i];
+  const x = decision(f.fingerprint);
+  // Clearing removes the decision where it was recorded (possibly "*"); new decisions go on this snapshot.
+  const snapshot = st === null && x && x.current ? x.snapshot : state.data.snapshot;
   try {
     // Triage flow: deciding the focused finding moves on to the next open one. Held by fingerprint,
     // since a re-diff during the request can replace and reorder the findings.
@@ -362,8 +367,13 @@ async function setReview(i, st, comment) {
     const at = open.indexOf(f.fingerprint);
     const advance = (st === "accepted" || st === "rejected") && state.focus === i && at >= 0;
     const nextFp = advance ? (open[at + 1] ?? open[at - 1] ?? null) : null;
-    applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot: state.data.snapshot, state: st, comment: comment == null ? null : comment }));
+    const pair = state.cur;
+    applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot, state: st, comment: comment == null ? null : comment }));
     if (state.comment && state.comment.fp === f.fingerprint) state.comment = null;
+    // Fresh statuses from the store, unless the user started editing or moved to another pair
+    // meanwhile: reloading would redraw the panes from disk under the edit buffer.
+    if (state.cur === pair && !state.scratchDirty) await loadPair(pair, true);
+    else state.page.pairs[pair] = null;
     // Advance only if focus is still on the decided finding (the user may have moved on meanwhile).
     const fs = state.data.report.findings;
     const stillThere = state.focus >= 0 && fs[state.focus] && fs[state.focus].fingerprint === f.fingerprint;
@@ -380,8 +390,13 @@ async function setFlip(id, flip) {
   if (!state.live) return;
   try {
     applySession(await api("POST", "/api/assumption", { id, flip }));
+    // Every pair's report depends on the flips: drop cached payloads.
+    state.page.pairs = [];
     if (state.view === "pair") {
       if (state.scratchDirty) scheduleDiff(); else await loadPair(state.cur, true);
+    } else {
+      // From the queue: forget the last open pair so reopening it fetches the flipped report.
+      cancelScratch(); state.data = null; state.cur = -1;
     }
     render();
     flash(`${id}: ${flip}`);
@@ -443,8 +458,15 @@ async function refresh() {
   if (!state.live) return;
   $("busy").textContent = "reading…";
   try {
+    // Pairs can be added or removed: find the open pair again by its paths.
+    const cur = state.view === "pair" ? state.page.queue[state.cur] : null;
     applySession(await api("POST", "/api/refresh"));
-    if (state.view === "pair") { state.scratchDirty = false; await loadPair(state.cur, false); }
+    state.page.pairs = [];
+    cancelScratch();
+    state.scratchDirty = false;
+    const now = cur ? state.page.queue.find((e) => e.a === cur.a && e.b === cur.b) : null;
+    if (now) { state.cur = now.index; await loadPair(now.index, false); }
+    else { if (cur) flash("the open pair is gone"); state.view = "queue"; state.cur = -1; state.data = null; }
     render();
     flash("re-read");
   } catch (e) { $("busy").textContent = "error: " + e.message; }
@@ -560,8 +582,8 @@ function stepQueue(d) {
 // ---------- navigation ----------
 async function loadPair(i, keepFocus) {
   const fp = keepFocus && state.data && state.focus >= 0 ? state.data.report.findings[state.focus].fingerprint : null;
-  let data = state.page.pairs[i];
-  if (state.live) { data = await api("GET", "/api/pair/" + i); state.page.pairs[i] = data; }
+  let data = keepFocus ? null : state.page.pairs[i];
+  if (!data && state.live) { data = await api("GET", "/api/pair/" + i); state.page.pairs[i] = data; }
   if (!data) throw new Error("pair " + i + " could not be read");
   state.data = data;
   state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
@@ -580,7 +602,7 @@ function syncEditors(data) {
 }
 async function openPair(i, fp) {
   try {
-    if (state.cur !== i || !state.data) await loadPair(i, false);
+    if (state.cur !== i || !state.data) { cancelScratch(); await loadPair(i, false); }
     state.cur = i;
     state.view = "pair";
     history.replaceState(null, "", "#p=" + i + (fp ? "&f=" + fp : ""));
@@ -601,7 +623,7 @@ function showQueue() {
 // ---------- pair view ----------
 // Accepted or rejected on the current snapshot: off the to-do list. A comment alone keeps it open.
 function isDone(f) {
-  const x = decision(f.fingerprint, state.data.snapshot);
+  const x = decision(f.fingerprint);
   return !!(x && x.current && (x.d.state === "accepted" || x.d.state === "rejected"));
 }
 function orderedFindings() {
@@ -753,12 +775,12 @@ function gotoRow(k) {
 
 
 function findingCard(f, i, asm) {
-  const x = decision(f.fingerprint, state.data.snapshot);
+  const x = decision(f.fingerprint);
   const cur = x && x.current ? x.d.state : null;
   const mark = { accepted: "✓ Accepted", rejected: "✕ Rejected", commented: "Commented" };
-  const tag = x ? `<span class="tag ${x.current ? esc(x.d.state) : ""}" title="${x.current ? "" : "Decided on an earlier snapshot"}">${esc(mark[x.d.state] || cap(x.d.state))}${x.current ? "" : " (earlier)"}</span>` : "";
-  const dec = x && (x.d.comment || !x.current) ? `<div class="dec">${x.current ? "" : `${esc(cap(x.d.state))} on an earlier snapshot · `}${x.d.comment ? `“${esc(x.d.comment)}”` : ""}</div>` : "";
-  const dis = state.live ? "" : "disabled";
+  const tag = x ? `<span class="tag ${x.current ? esc(x.d.state) : ""}" title="${x.current ? (x.snapshot === "*" ? "Applies to every snapshot" : "") : x.state === "expired" ? "The decision has expired" : "Decided on an earlier snapshot"}">${esc(mark[x.d.state] || cap(x.d.state))}${x.current ? "" : x.state === "expired" ? " (expired)" : " (earlier)"}</span>` : "";
+  const dec = x && (x.d.comment || !x.current) ? `<div class="dec">${x.current ? "" : `${esc(cap(x.d.state))} ${x.state === "expired" ? "(expired)" : "on an earlier snapshot"} · `}${x.d.comment ? `“${esc(x.d.comment)}”` : ""}</div>` : "";
+  const dis = canReview() ? "" : `disabled title="${state.live ? "Decisions apply to the files on disk: reset edits to review" : "Reviewing needs sqldiff-gui serve"}"`;
   const acts = `<div class="racts">
       <button data-rv="accepted" class="outline" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept and go to the next open finding">Accept <kbd>a</kbd></button>
       <button data-rv="rejected" ${dis} aria-pressed="${cur === "rejected"}" title="Needs a fix: reject and go to the next open finding">Reject <kbd>x</kbd></button>
@@ -839,7 +861,7 @@ function renderSide() {
   wireSections($("side"));
 }
 function reviewAction(i, act) {
-  if (!state.live) return;
+  if (!canReview()) { if (state.scratchDirty) flash("reset edits to review: decisions apply to the files on disk"); return; }
   if (act === "comment") {
     const fp = state.data.report.findings[i].fingerprint;
     if (state.comment && state.comment.fp === fp) saveComment(i);
@@ -848,13 +870,13 @@ function reviewAction(i, act) {
 }
 function currentComment(i) {
   const f = state.data.report.findings[i];
-  const x = decision(f.fingerprint, state.data.snapshot);
+  const x = decision(f.fingerprint);
   return x && x.current ? x.d.comment || null : null;
 }
 function saveComment(i) {
   const f = state.data.report.findings[i];
   const text = state.comment && state.comment.fp === f.fingerprint ? state.comment.text : "";
-  const x = decision(f.fingerprint, state.data.snapshot);
+  const x = decision(f.fingerprint);
   // A comment keeps an accept or reject; on its own it is a "commented" decision.
   const st = x && x.current && x.d.state !== "commented" ? x.d.state : "commented";
   if (!text.trim() && st === "commented") { setReview(i, null, null); return; }
@@ -925,6 +947,8 @@ function flash(msg) { $("busy").textContent = msg; setTimeout(() => { if ($("bus
 
 // Inline editing: every code cell is editable; edits re-diff on the server, debounced; stale responses are dropped.
 let seq = 0, timer = null;
+// Drops a pending or in-flight scratch diff (its response is ignored).
+function cancelScratch() { clearTimeout(timer); seq++; }
 function onCodeInput(el) {
   const side = +el.dataset.side, start = +el.dataset.start, end = +el.dataset.end;
   const text = el.innerText.replace(/\r/g, "").replace(/\n$/, "");
@@ -992,7 +1016,8 @@ function scheduleDiff() {
   }, 250);
 }
 async function resetEdits() {
-  clearTimeout(timer); seq++;
+  cancelScratch();
+  if (state.live) state.page.pairs[state.cur] = null;
   await loadPair(state.cur, false);
   render();
 }
@@ -1128,8 +1153,6 @@ function init() {
   const p = h.has("p") ? +h.get("p") : INITIAL.open;
   const fp = h.get("f");
   if (p != null && p >= 0 && p < INITIAL.queue.length) {
-    state.data = INITIAL.pairs[p];
-    if (state.data) { state.cur = p; state.view = "pair"; syncEditors(state.data); }
     openPair(p, fp);
   } else {
     render();
