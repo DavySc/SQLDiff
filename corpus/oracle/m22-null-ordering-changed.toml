@@ -1,0 +1,12 @@
+case = "m22-null-ordering-changed"
+pairs = [["original", "mutated"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at) VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO orders (customer_id, status, created_at, shipped_at) VALUES (1, 'S', '2026-01-02 09:00:00', '2026-01-03 09:00:00');
+INSERT INTO orders (customer_id, status, created_at, shipped_at) VALUES (1, 'N', '2026-01-02 09:00:00', NULL);
+"""
+
+[[scenario]]
+name = "oldest shipments"
+call.tsql = "EXEC dbo.oldest_shipments 1;"
+call.pg = "SELECT order_id, shipped_at FROM oldest_shipments(1);"

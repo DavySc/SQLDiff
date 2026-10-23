@@ -2,8 +2,9 @@
 //!
 //! Suppressed findings move from `findings` to `suppressed`, with the
 //! reason, so every output can still show them (SARIF marks them with
-//! `suppressions`). The report's `verdict` is left as computed; gates use
-//! [`gate_verdict`], which never turns a suppressed difference into "equal".
+//! `suppressions`). `verdict` becomes the verdict over the open findings and
+//! the engine's verdict is kept in `verdict_before_suppression`; suppression
+//! never turns a difference into "equal".
 
 use sqldiff_core::model::{Suppressed, SuppressionKind};
 use sqldiff_core::{Report, Verdict};
@@ -39,6 +40,7 @@ pub fn suppress(report: &mut Report, store: &Store, now: &str) -> usize {
         }
     }
     report.findings = kept;
+    report.settle_suppression();
     n
 }
 
