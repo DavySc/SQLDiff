@@ -283,6 +283,8 @@ impl Catalog {
                     })
                     .collect();
                 x.triggers = t.triggers.clone();
+                // An adapter that sent no columns did not describe them.
+                x.columns_known = !t.columns.is_empty();
                 x
             })
             .collect();
@@ -411,3 +413,24 @@ pub struct IdParam {
 
 /// Declared runtime settings (commit level, naming, isolation, ...).
 pub type Settings = BTreeMap<String, String>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tables_without_columns_are_not_column_checked() {
+        let c = Catalog {
+            tables: vec![Table {
+                schema: None,
+                name: "t".into(),
+                columns: Vec::new(),
+                keys: BTreeMap::new(),
+                indexes: BTreeMap::new(),
+                triggers: Vec::new(),
+            }],
+            routines: Vec::new(),
+        };
+        assert!(!c.to_core("x").tables[0].columns_known);
+    }
+}

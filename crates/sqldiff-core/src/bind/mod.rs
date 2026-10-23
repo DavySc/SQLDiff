@@ -905,7 +905,14 @@ impl<'a> Binder<'a> {
         let second = t.get(1).map(Tok::upper).unwrap_or_default();
         match (self.d, head.as_str()) {
             (_, "CREATE") => self.create_statement(&t, stmt),
-            (_, "ALTER" | "DROP" | "GRANT" | "REVOKE" | "COMMENT" | "USE" | "DENY") => {}
+            // ALTER TABLE on a table the artifact created (temp tables) changes its columns;
+            // persistent tables come from the catalog, which reflects the ALTER already.
+            (_, "ALTER") => {
+                if second == "TABLE" {
+                    ddl::apply_statement(&mut self.local, &t, self.d);
+                }
+            }
+            (_, "DROP" | "GRANT" | "REVOKE" | "COMMENT" | "USE" | "DENY") => {}
             (_, "BEGIN" | "COMMIT" | "SAVE" | "SAVEPOINT" | "RELEASE") => {
                 // Transaction names are not references; T-SQL may name them with a variable.
                 self.analyze_vars_only(&t, stmt);
@@ -1297,7 +1304,7 @@ impl<'a> Binder<'a> {
         let rest = &t[k..];
         // name ALIAS FOR $1 | param
         if rest.first().is_some_and(|x| x.is_kw("ALIAS")) {
-            self.analyze(&rest[2..], stmt);
+            self.analyze(rest.get(2..).unwrap_or(&[]), stmt);
             self.declare(
                 DeclKind::Variable,
                 &name,
@@ -1479,9 +1486,15 @@ impl<'a> Binder<'a> {
             self.variable_token(&v, stmt);
             k += 2;
         }
+        // `EXEC @proc ...`: a variable holding the procedure name is dynamic.
+        if let Some(v) = t.get(k).filter(|x| x.is(SyntaxKind::VARIABLE)).cloned() {
+            self.variable_token(&v, stmt);
+            self.analyze(&t[k + 1..], stmt);
+            return;
+        }
         let (parts, after) = tokens::qualified(t, k);
         if parts.is_empty() {
-            self.analyze(&t[k..], stmt);
+            self.analyze(t.get(k..).unwrap_or(&[]), stmt);
             return;
         }
         let name_span = (t[k].start, t[after - 1].end);
@@ -1503,12 +1516,6 @@ impl<'a> Binder<'a> {
                 args.push(CallArg::Positional);
                 self.analyze(&item, stmt);
             }
-        }
-        // A variable holding the procedure name is dynamic.
-        if t[k].is(SyntaxKind::VARIABLE) {
-            let v = t[k].clone();
-            self.variable_token(&v, stmt);
-            return;
         }
         self.resolve_call(&parts, name_span, stmt, &args, CallStyle::Exec);
     }

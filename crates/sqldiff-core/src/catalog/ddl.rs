@@ -341,7 +341,7 @@ pub fn type_end(el: &[Tok], from: usize) -> usize {
         }
         k += 1;
     }
-    k
+    k.min(el.len())
 }
 
 fn paren_names(t: &[Tok], dialect: Dialect) -> (Vec<String>, usize) {
@@ -428,23 +428,12 @@ fn create_index(cat: &mut Catalog, t: &[Tok], from: usize, dialect: Dialect) {
         }) && !t[close..].iter().any(|x| x.is_kw("WHERE"))
     };
     let unique = unique && plain && !cols.is_empty();
-    let view = super::CatalogView::new(dialect, &[&*cat]);
-    let found = match view.table(&parts) {
-        super::Lookup::Found(tb) => Some((tb.schema.clone(), tb.name.clone())),
-        _ => None,
-    };
-    if let Some((schema, tname)) = found {
-        if let Some(tb) = cat
-            .tables
-            .iter_mut()
-            .find(|x| x.schema == schema && x.name == tname)
-        {
-            tb.indexes.push(Index {
-                name,
-                unique,
-                columns: cols,
-            });
-        }
+    if let Some(i) = super::table_position(dialect, cat, &parts) {
+        cat.tables[i].indexes.push(Index {
+            name,
+            unique,
+            columns: cols,
+        });
     }
 }
 
@@ -458,20 +447,10 @@ fn alter_table(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
         i += 1;
     }
     let (parts, j) = qualified(t, i);
-    let view = super::CatalogView::new(dialect, &[&*cat]);
-    let Some((schema, tname)) = (match view.table(&parts) {
-        super::Lookup::Found(tb) => Some((tb.schema.clone(), tb.name.clone())),
-        _ => None,
-    }) else {
+    let Some(i) = super::table_position(dialect, cat, &parts) else {
         return;
     };
-    let Some(tb) = cat
-        .tables
-        .iter_mut()
-        .find(|x| x.schema == schema && x.name == tname)
-    else {
-        return;
-    };
+    let tb = &mut cat.tables[i];
     // T-SQL lists several items after one verb: `ADD a int, b int`,
     // `DROP COLUMN a, b`; an item without a verb continues the last one.
     #[derive(Clone, Copy, PartialEq)]
@@ -690,7 +669,6 @@ fn view_table(
     let (schema, vname) = stored_name(&name, dialect).unwrap_or((None, String::new()));
     let mut tb = Table::new(schema, vname, TableKind::View);
     let outputs = select_outputs(query);
-    let view = super::CatalogView::new(dialect, &[cat]);
     // Tables in the top-level FROM, for typing plain column references.
     let mut from_tables: Vec<(Option<Ident>, &Table)> = Vec::new();
     if let Some(f) = find_kw(query, 0, "FROM") {
@@ -701,7 +679,7 @@ fn view_table(
             .unwrap_or(query.len());
         for item in split_commas(&query[f + 1..end]) {
             let (parts, after) = qualified(item, 0);
-            if let super::Lookup::Found(t) = view.table(&parts) {
+            if let Some(t) = super::table_position(dialect, cat, &parts).map(|i| &cat.tables[i]) {
                 let alias = item
                     .get(after)
                     .filter(|x| x.is_kw("AS"))
@@ -714,6 +692,24 @@ fn view_table(
             }
         }
     }
+    // NOT NULL survives only a plain inner query: outer joins, set operations
+    // and grouping extensions can produce NULL in any column.
+    let keeps_not_null = !query.iter().any(|x| {
+        x.is_any_kw(&[
+            "LEFT",
+            "RIGHT",
+            "FULL",
+            "OUTER",
+            "APPLY",
+            "UNION",
+            "EXCEPT",
+            "INTERSECT",
+            "MINUS",
+            "ROLLUP",
+            "CUBE",
+            "GROUPING",
+        ])
+    });
     match (outputs, cols) {
         (Some(outs), explicit) => {
             for (k, o) in outs.iter().enumerate() {
@@ -745,7 +741,7 @@ fn view_table(
                     data_type: src
                         .map(|c| c.data_type.clone())
                         .unwrap_or_else(DataType::unknown),
-                    nullable: src.map(|c| c.nullable).unwrap_or(true),
+                    nullable: !keeps_not_null || src.map(|c| c.nullable).unwrap_or(true),
                     identity: false,
                     has_default: false,
                     collation: src.and_then(|c| c.collation.clone()),

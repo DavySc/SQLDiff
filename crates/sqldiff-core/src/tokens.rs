@@ -83,7 +83,9 @@ pub fn close_paren(t: &[Tok], open: usize) -> usize {
             _ => {}
         }
     }
-    t.len().saturating_sub(1)
+    // Unclosed (incomplete input): one past the end, so `t[open + 1..close]`
+    // is the rest and `close + 1` is past every token.
+    t.len()
 }
 
 /// Splits `t` at top-level commas.

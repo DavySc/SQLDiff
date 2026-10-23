@@ -544,3 +544,132 @@ fn cited_assumptions_are_reported() {
         }
     }
 }
+
+/// The GUI re-diffs on every keystroke: binding and catalog loading must not
+/// panic on any prefix of real code (unclosed parentheses, half statements).
+#[test]
+fn incomplete_input_never_panics() {
+    let mut texts: Vec<(String, Dialect, String)> = corpus_files()
+        .into_iter()
+        .map(|(case, name, a)| (format!("{case}/{name}"), a.dialect, a.text))
+        .collect();
+    for d in [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i] {
+        texts.push(("catalog".into(), d, catalog(d).text));
+    }
+    for (snippet, d) in [
+        ("SELECT f(", Dialect::Tsql),
+        ("CREATE TABLE t (", Dialect::Postgres),
+        ("CREATE VIEW v (", Dialect::Postgres),
+        ("DECLARE @t TABLE (", Dialect::Tsql),
+        ("CALL p(", Dialect::Db2i),
+        (
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpgsql AS $$ DECLARE x ALIAS; BEGIN END $$;",
+            Dialect::Postgres,
+        ),
+    ] {
+        texts.push((snippet.into(), d, snippet.into()));
+    }
+    let mut failures = Vec::new();
+    let prev = std::panic::take_hook();
+    static WHERE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    std::panic::set_hook(Box::new(|info| {
+        if let Ok(mut w) = WHERE.lock() {
+            *w = info.location().map(|l| l.to_string()).unwrap_or_default();
+        }
+    }));
+    for (id, d, text) in &texts {
+        let cat = ddl::load(&catalog(*d).text, *d, "corpus");
+        let cuts: Vec<usize> = text
+            .char_indices()
+            .filter(|(_, c)| !c.is_alphanumeric() && *c != '_')
+            .map(|(i, _)| i)
+            .chain([text.len()])
+            .collect();
+        for cut in cuts {
+            let prefix = &text[..cut];
+            let r = std::panic::catch_unwind(|| {
+                let a = Artifact::new("p.sql", *d, prefix);
+                let analyzed = Analyzed::new(&a, Side::A, 3);
+                let view = CatalogView::new(*d, &[&cat]);
+                bind::bind(
+                    &analyzed,
+                    &BindInput {
+                        view: &view,
+                        helpers: &[],
+                    },
+                );
+                ddl::load(prefix, *d, "p");
+            });
+            if r.is_err() {
+                let at = WHERE.lock().map(|w| w.clone()).unwrap_or_default();
+                let tail: String = prefix
+                    .chars()
+                    .rev()
+                    .take(40)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                failures.push(format!("{id} @{cut} ({at}): …{tail}"));
+                break;
+            }
+        }
+    }
+    std::panic::set_hook(prev);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// ALTER TABLE on a temp table the routine created adds its columns.
+#[test]
+fn alter_on_local_table() {
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  CREATE TABLE #t (a int);\n  ALTER TABLE #t ADD b int;\n  SELECT a, b FROM #t;\nEND";
+    let r = check_rules(Dialect::Tsql, src, Some("CREATE TABLE dbo.x (id int);"));
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let pg = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n  CREATE TEMP TABLE t (a int);\n  ALTER TABLE t ADD COLUMN b int;\n  PERFORM b FROM t;\nEND;\n$$;";
+    let r = check_rules(Dialect::Postgres, pg, Some("CREATE TABLE x (id int);"));
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+}
+
+/// ISNULL lengths: literal characters ('' is one quote), and a T-SQL
+/// `varchar` without a length holds one character.
+#[test]
+fn isnull_lengths() {
+    let cat = "CREATE TABLE dbo.c (id int NOT NULL, name varchar(7) NULL, code varchar(3) NULL);";
+    let quote = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT ISNULL(name, 'O''Brien') FROM dbo.c;\nEND";
+    let r = check_rules(Dialect::Tsql, quote, Some(cat));
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let long = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT ISNULL(name, 'O''Briens') FROM dbo.c;\nEND";
+    let r = check_rules(Dialect::Tsql, long, Some(cat));
+    assert!(
+        has(
+            &r,
+            "types.isnull-truncation",
+            ChangeClass::Semantic,
+            Verdict::Different
+        ),
+        "{:?}",
+        rules(&r)
+    );
+    let bare = "CREATE PROCEDURE p AS\nBEGIN\n  DECLARE @v varchar;\n  SELECT ISNULL(code, @v) FROM dbo.c;\nEND";
+    let r = check_rules(Dialect::Tsql, bare, Some(cat));
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+}
+
+/// A view keeps NOT NULL only through a plain inner query.
+#[test]
+fn view_nullability() {
+    let d = Dialect::Postgres;
+    let c = ddl::load(
+        "CREATE TABLE a (id int NOT NULL, x int NOT NULL);\nCREATE TABLE b (id int NOT NULL, y int NOT NULL);\nCREATE VIEW v1 AS SELECT a.x FROM a JOIN b ON a.id = b.id;\nCREATE VIEW v2 AS SELECT b.y FROM a LEFT JOIN b ON a.id = b.id;\nCREATE VIEW v3 AS SELECT x FROM a UNION SELECT NULL FROM b;",
+        d,
+        "c",
+    );
+    let view = CatalogView::new(d, &[&c]);
+    let nullable = |v: &str| match view.table(&[sqldiff_core::catalog::Ident::plain(v)]) {
+        sqldiff_core::catalog::Lookup::Found(t) => t.columns[0].nullable,
+        _ => panic!("{v}"),
+    };
+    assert!(!nullable("v1"));
+    assert!(nullable("v2"));
+    assert!(nullable("v3"));
+}

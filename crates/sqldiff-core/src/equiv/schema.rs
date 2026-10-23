@@ -10,7 +10,7 @@ use sqldiff_syntax::{parse, Dialect};
 
 use super::ast::Type;
 use crate::artifact::Artifact;
-use crate::catalog::{ddl, Catalog, CatalogView, DataType};
+use crate::catalog::{ddl, Catalog, CatalogView, DataType, TableKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fam {
@@ -221,7 +221,14 @@ impl Schema {
             sources: view.origins.clone(),
             ..Schema::default()
         };
-        for t in &view.catalog.tables {
+        // Base and temporary tables only: view columns are derived, and their
+        // types and nullability are not facts equivalence may rely on.
+        for t in view
+            .catalog
+            .tables
+            .iter()
+            .filter(|t| matches!(t.kind, TableKind::Table | TableKind::Temporary))
+        {
             let lower = |v: &[String]| v.iter().map(|c| c.to_lowercase()).collect::<Vec<_>>();
             let mut keys: Vec<Vec<String>> = t.keys.iter().map(|k| lower(&k.columns)).collect();
             keys.extend(

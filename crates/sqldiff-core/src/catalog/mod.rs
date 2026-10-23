@@ -351,6 +351,37 @@ pub enum Lookup<T> {
     OutOfScope,
 }
 
+fn schema_matches(d: Dialect, stored: Option<&str>, want: Option<&Ident>) -> bool {
+    match (stored, want) {
+        (_, None) => match (stored, default_schema(d)) {
+            (None, _) => true,
+            (Some(s), Some(def)) => key(d, s) == key(d, &stored_sys(d, def)),
+            // Db2 library list: an unqualified name may live in any schema.
+            (Some(_), None) => true,
+        },
+        (Some(s), Some(w)) => key(d, s) == w.key(d),
+        (None, Some(w)) => match default_schema(d) {
+            Some(def) => w.key(d) == key(d, &stored_sys(d, def)),
+            // Db2: unqualified DDL lands in the current schema, which we do not know.
+            None => true,
+        },
+    }
+}
+
+/// Index of the table a qualified name (`[schema.]name`) refers to, without
+/// building a view (the DDL loader looks tables up on every statement).
+pub fn table_position(d: Dialect, cat: &Catalog, parts: &[Ident]) -> Option<usize> {
+    let (schema, name) = match parts {
+        [n] => (None, n),
+        [s, n] => (Some(s), n),
+        _ => return None,
+    };
+    let k = name.key(d);
+    cat.tables
+        .iter()
+        .position(|t| key(d, &t.name) == k && schema_matches(d, t.schema.as_deref(), schema))
+}
+
 /// The merged catalog one side binds against.
 #[derive(Debug, Clone)]
 pub struct CatalogView {
@@ -421,40 +452,15 @@ impl CatalogView {
                 .any(|s| key(d, s) == k)
     }
 
-    fn schema_matches(&self, stored: Option<&str>, want: Option<&Ident>) -> bool {
-        let d = self.dialect;
-        match (stored, want) {
-            (_, None) => match (stored, default_schema(d)) {
-                (None, _) => true,
-                (Some(s), Some(def)) => key(d, s) == key(d, &stored_sys(d, def)),
-                // Db2 library list: an unqualified name may live in any schema.
-                (Some(_), None) => true,
-            },
-            (Some(s), Some(w)) => key(d, s) == w.key(d),
-            (None, Some(w)) => match default_schema(d) {
-                Some(def) => w.key(d) == key(d, &stored_sys(d, def)),
-                // Db2: unqualified DDL lands in the current schema, which we do not know.
-                None => true,
-            },
-        }
-    }
-
     /// Finds a table or view by a qualified name (`[schema.]name`).
     pub fn table(&self, parts: &[Ident]) -> Lookup<&Table> {
-        let d = self.dialect;
-        let (schema, name) = match parts {
-            [n] => (None, n),
-            [s, n] => (Some(s), n),
+        let schema = match parts {
+            [_] => None,
+            [s, _] => Some(s),
             _ => return Lookup::OutOfScope,
         };
-        let k = name.key(d);
-        if let Some(t) = self
-            .catalog
-            .tables
-            .iter()
-            .find(|t| key(d, &t.name) == k && self.schema_matches(t.schema.as_deref(), schema))
-        {
-            return Lookup::Found(t);
+        if let Some(i) = table_position(self.dialect, &self.catalog, parts) {
+            return Lookup::Found(&self.catalog.tables[i]);
         }
         match schema {
             Some(s) if !self.schema_known(s) => Lookup::NoSchema(s.text.clone()),
@@ -475,7 +481,7 @@ impl CatalogView {
             .catalog
             .routines
             .iter()
-            .filter(|r| key(d, &r.name) == k && self.schema_matches(r.schema.as_deref(), schema))
+            .filter(|r| key(d, &r.name) == k && schema_matches(d, r.schema.as_deref(), schema))
             .collect();
         if !found.is_empty() {
             return Lookup::Found(found);

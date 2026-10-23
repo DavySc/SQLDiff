@@ -4,6 +4,7 @@
 //! `git:REPO[@REV][//SUBDIR]` or `adapter:NAME`. Without one, the `[source]`
 //! of the project or user config is used.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -69,48 +70,76 @@ pub struct CatalogArgs {
 }
 
 impl CatalogArgs {
-    /// Adds the catalogs to `opts`; side B is skipped for `check`.
+    /// Adds the catalogs to `opts`; `b` is `None` for `check`, which has one side.
     pub fn apply(&self, opts: &mut Options, a: Dialect, b: Option<Dialect>) -> Result<(), String> {
+        if b.is_none() && !self.catalog_b.is_empty() {
+            return Err("--catalog-b needs two sides; check takes --catalog or --catalog-a".into());
+        }
+        let mut cache = HashMap::new();
         for p in self.catalog.iter().chain(&self.catalog_a) {
-            load_catalog(p, a, &mut opts.catalog_a, &mut opts.facts_a)?;
+            load_catalog(p, a, &mut cache, &mut opts.catalog_a, &mut opts.facts_a)?;
         }
         if let Some(b) = b {
             for p in self.catalog.iter().chain(&self.catalog_b) {
-                load_catalog(p, b, &mut opts.catalog_b, &mut opts.facts_b)?;
+                load_catalog(p, b, &mut cache, &mut opts.catalog_b, &mut opts.facts_b)?;
             }
         }
         Ok(())
     }
 }
 
+/// A catalog file as read once: a bundle, or DDL text.
+enum CatalogFile {
+    Bundle(Box<Bundle>, Option<Arc<sqldiff_core::catalog::Catalog>>),
+    Ddl(String),
+}
+
 fn load_catalog(
     path: &Path,
     dialect: Dialect,
+    cache: &mut HashMap<PathBuf, CatalogFile>,
     ddl: &mut Vec<Artifact>,
     facts: &mut Vec<Arc<sqldiff_core::catalog::Catalog>>,
 ) -> Result<(), String> {
-    if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
-    {
-        let bundle = Bundle::load(path).map_err(|e| e.0)?;
-        let short = &bundle.snapshot_id[..bundle.snapshot_id.len().min(12)];
-        if !bundle.catalog.is_empty() {
-            facts.push(Arc::new(bundle.catalog.to_core(&format!("bundle:{short}"))));
-        }
-        for o in &bundle.objects {
-            if o.info.kind != "script" && o.info.dialect.as_deref() == Some(dialect.id()) {
-                ddl.push(Artifact::new(
-                    format!("bundle:{short}/{}", o.info.id),
-                    dialect,
-                    o.text.clone(),
-                ));
+    if !cache.contains_key(path) {
+        let file = if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            let bundle = Bundle::load(path).map_err(|e| e.0)?;
+            let short = &bundle.snapshot_id[..bundle.snapshot_id.len().min(12)];
+            let core = (!bundle.catalog.is_empty())
+                .then(|| Arc::new(bundle.catalog.to_core(&format!("bundle:{short}"))));
+            CatalogFile::Bundle(Box::new(bundle), core)
+        } else {
+            CatalogFile::Ddl(
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?,
+            )
+        };
+        cache.insert(path.to_path_buf(), file);
+    }
+    match &cache[path] {
+        CatalogFile::Bundle(bundle, core) => {
+            let short = &bundle.snapshot_id[..bundle.snapshot_id.len().min(12)];
+            facts.extend(core.iter().cloned());
+            for o in &bundle.objects {
+                if o.info.kind != "script" && o.info.dialect.as_deref() == Some(dialect.id()) {
+                    ddl.push(Artifact::new(
+                        format!("bundle:{short}/{}", o.info.id),
+                        dialect,
+                        o.text.clone(),
+                    ));
+                }
             }
         }
-        return Ok(());
+        CatalogFile::Ddl(text) => {
+            ddl.push(Artifact::new(
+                path.display().to_string(),
+                dialect,
+                text.clone(),
+            ));
+        }
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    ddl.push(Artifact::new(path.display().to_string(), dialect, text));
     Ok(())
 }
 

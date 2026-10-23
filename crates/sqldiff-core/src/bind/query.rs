@@ -300,7 +300,7 @@ impl<'a> Binder<'a> {
                             })
                             .collect::<Vec<_>>(),
                     );
-                    for m in j..=c {
+                    for m in j..=c.min(t.len() - 1) {
                         an.consumed[m] = true;
                     }
                     j = c + 1;
@@ -562,7 +562,7 @@ impl<'a> Binder<'a> {
                 && t.get(k + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN))
             {
                 let c = close_paren(t, k + 1);
-                for m in k..=c {
+                for m in k..=c.min(t.len() - 1) {
                     an.consumed[m] = true;
                 }
                 k = c + 1;
@@ -598,7 +598,7 @@ impl<'a> Binder<'a> {
                         .filter_map(|e| e.first().filter(|y| y.is_name()).map(Tok::ident))
                         .collect(),
                 );
-                for m in k..=c {
+                for m in k..=c.min(t.len() - 1) {
                     an.consumed[m] = true;
                 }
                 k = c + 1;
@@ -608,7 +608,7 @@ impl<'a> Binder<'a> {
                 && t.get(k + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN))
             {
                 let c = close_paren(t, k + 1);
-                for m in k..=c {
+                for m in k..=c.min(t.len() - 1) {
                     an.consumed[m] = true;
                 }
                 k = c + 1;
@@ -623,7 +623,7 @@ impl<'a> Binder<'a> {
                     .is_some_and(|y| y.is_any_kw(&["SELECT", "WITH", "VALUES"]))
             {
                 let c = close_paren(t, k);
-                for m in k..=c {
+                for m in k..=c.min(t.len() - 1) {
                     an.consumed[m] = true;
                 }
                 col_list = Some((k + 1, c));
@@ -1073,7 +1073,7 @@ impl<'a> Binder<'a> {
                         self.target_column(n, ti, stmt, an);
                     }
                 }
-                for m in i..=c {
+                for m in i..=c.min(t.len() - 1) {
                     an.consumed[m] = true;
                 }
                 i = c + 1;
@@ -1463,7 +1463,7 @@ impl<'a> Binder<'a> {
                     .is_some_and(|y| y.is(SyntaxKind::NUMBER) || y.is_kw("MAX"))
             {
                 let c = close_paren(t, k);
-                for m in k..=c {
+                for m in k..=c.min(t.len() - 1) {
                     an.consumed[m] = true;
                 }
                 k = c + 1;
@@ -1473,6 +1473,7 @@ impl<'a> Binder<'a> {
                 break;
             }
         }
+        let k = k.min(t.len());
         if k > start {
             let ty = DataType::parse(&tokens::texts(&t[start..k]));
             self.check_type(&ty, (t[start].start, t[k - 1].end), stmt);
@@ -2555,11 +2556,13 @@ impl<'a> Binder<'a> {
             let ty = |s: usize, e: usize| -> Option<(DataType, bool, String)> {
                 let text = tokens::texts(&t[s..e]).join("");
                 if e == s + 1 && t[s].is(SyntaxKind::STRING) {
-                    let len = t[s]
-                        .text
-                        .trim_start_matches(['N', 'n'])
-                        .len()
-                        .saturating_sub(2) as u32;
+                    // Characters of the value: no N prefix or quotes, '' is one quote.
+                    let body = t[s].text.trim_start_matches(['N', 'n']);
+                    let inner = body
+                        .strip_prefix('\'')
+                        .and_then(|b| b.strip_suffix('\''))
+                        .unwrap_or(body);
+                    let len = inner.replace("''", "'").chars().count() as u32;
                     return Some((DataType::parse_str(&format!("varchar({len})")), false, text));
                 }
                 // The last reference recorded inside the argument span.
@@ -2589,13 +2592,24 @@ impl<'a> Binder<'a> {
             if !null1 {
                 continue;
             }
+            // T-SQL declarations: `varchar` / `nvarchar` without a length hold one character.
+            let tsql_len = |dt: &DataType| -> Option<u32> {
+                if dt.args.is_empty()
+                    && !dt.max
+                    && matches!(dt.base.as_str(), "VARCHAR" | "NVARCHAR")
+                {
+                    Some(1)
+                } else {
+                    dt.char_length()
+                }
+            };
             let hazard = if t1.is_string() && t2.is_string() {
-                match (t1.char_length(), t2.char_length(), t2.max) {
-                    (Some(l1), Some(l2), _) if l2 > l1 => Some(format!(
+                match (tsql_len(&t1), tsql_len(&t2)) {
+                    (Some(l1), Some(l2)) if l2 > l1 => Some(format!(
                         "when {a1} is NULL, values of {a2} longer than {l1} characters are truncated to {l1}; COALESCE would return {}",
                         t2.text
                     )),
-                    (Some(l1), None, _) => Some(format!("when {a1} is NULL, {a2} is truncated to {l1} characters")),
+                    (Some(l1), None) => Some(format!("when {a1} is NULL, {a2} is truncated to {l1} characters")),
                     _ => None,
                 }
             } else if matches!(
