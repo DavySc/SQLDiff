@@ -17,6 +17,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Hook self-test
+        run: bash scripts/test-hooks.sh
       - name: Leak scan
         env:
           SQLDIFF_DENYLIST: ${{ secrets.SQLDIFF_DENYLIST }}

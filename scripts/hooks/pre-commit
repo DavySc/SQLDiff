@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Block a commit whose staged content or author/committer identity contains a
+# deny-listed term (docs/private-overlay.md).
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(git rev-parse --show-toplevel)"
+
+terms="$(mktemp)"
+trap 'rm -f "$terms"' EXIT
+"$here/denylist.sh" "$terms"
+[[ -s "$terms" ]] || exit 0
+
+SQLDIFF_DENYLIST_FILE="$terms" "$root/scripts/leak-scan.sh" --cached
+
+if { git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT; } | grep -q -i -F -f "$terms"; then
+  echo "pre-commit: the author or committer identity contains a deny-listed term." >&2
+  echo "  Set an identity for this clone: git config user.email <address>" >&2
+  exit 1
+fi

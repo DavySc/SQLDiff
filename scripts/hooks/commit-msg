@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Block a commit message that contains a deny-listed term.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(git rev-parse --show-toplevel)"
+
+terms="$(mktemp)"
+trap 'rm -f "$terms"' EXIT
+"$here/denylist.sh" "$terms"
+[[ -s "$terms" ]] || exit 0
+
+SQLDIFF_DENYLIST_FILE="$terms" "$root/scripts/leak-scan.sh" --file "$1"
