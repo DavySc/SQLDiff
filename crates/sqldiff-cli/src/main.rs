@@ -13,6 +13,7 @@ use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
 use sqldiff_source::{tree, Resolved};
 use sqldiff_syntax::ast;
 
+mod deny_hash;
 mod queue_cmd;
 mod review_cmd;
 mod source_cmd;
