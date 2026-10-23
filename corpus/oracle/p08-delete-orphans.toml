@@ -1,0 +1,15 @@
+case = "p08-delete-orphans"
+pairs = [["tsql", "pg"]]
+observe = ["price_feed(item_id, unit_price)"]
+faults = ["price_feed:delete"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO price_feed (item_id, unit_price) VALUES (1, 5.00);
+INSERT INTO price_feed (item_id, unit_price) VALUES (2, 6.00);
+INSERT INTO price_feed (item_id, unit_price) VALUES (2, 6.50);
+"""
+
+[[scenario]]
+name = "purge"
+call.tsql = "EXEC dbo.purge_orphan_feed;"
+call.pg = "CALL purge_orphan_feed();"

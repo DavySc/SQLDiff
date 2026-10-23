@@ -1,0 +1,12 @@
+case = "m02-commit-before-last-dml"
+pairs = [["original", "mutated"]]
+observe = ["stock(item_id, qty)", "stock_log(item_id, delta)"]
+faults = ["stock_log"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO stock (item_id, qty) VALUES (1, 10);
+"""
+
+[[scenario]]
+name = "adjust"
+call = "EXEC dbo.adjust_stock 1, -2;"

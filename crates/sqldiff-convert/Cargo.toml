@@ -1,0 +1,16 @@
+[package]
+name = "sqldiff-convert"
+description = "Rule-based dialect conversion, checked statement by statement by the SQLDiff engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-syntax.workspace = true
+sqldiff-core.workspace = true
+rowan.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

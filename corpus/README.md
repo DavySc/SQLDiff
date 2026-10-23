@@ -18,7 +18,9 @@ corpus/
     <id>/                one plausible conversion mistake per case
       case.toml  original.<dialect>.sql  mutated.<dialect>.sql
   packs/                 synthetic packs referenced by cases
+  oracle/<id>.toml       seed data, calls and fault points for the execution oracle
   tools/check_corpus.py  validator
+  tools/fault_oracle.py  fault-injection execution oracle (PostgreSQL, SQL Server)
 ```
 
 Dialect keys are `tsql`, `pg` and `db2i`. Files are UTF-8 without BOM, LF line
@@ -94,7 +96,7 @@ is confirmed. Until then the tool may cap it (design §12, oracle availability).
 | p04-display-name | NULL-safe concatenation in a view | equal ×3 |
 | p05-email-lookup | case-insensitive compare emulated; trailing spaces and key uniqueness not | different ×3 |
 | p06-paged-orders | OFFSET/FETCH vs LIMIT/OFFSET | equal ×3 |
-| p07-insert-return-id | SCOPE_IDENTITY / RETURNING / FINAL TABLE | equal ×3 |
+| p07-insert-return-id | SCOPE_IDENTITY / RETURNING / FINAL TABLE; T-SQL continues after a failed INSERT | different ×2, equal |
 | p08-delete-orphans | anti-join vs NOT EXISTS | equal ×3 |
 | p09-error-rollback | TRY/CATCH + XACT_ABORT / procedure COMMIT / EXIT handler | assumed ×3 |
 | p10-temp-state-rollback | table variable vs temp table in an exception block vs NOT LOGGED DGTT | different ×3 |
@@ -136,10 +138,47 @@ PostgreSQL 18 for p10, p12, m11, m15, m18, m21, m22; SQL Server 2022 for p05, p1
 m05, m10, m13, m14, m16, m22. Db2 for i fixtures are not executed (no container
 oracle, design §12).
 
+## Execution oracle
+
+`tools/fault_oracle.py` runs the T-SQL and PostgreSQL sides of a case on real
+engines and compares what a caller observes: whether an error reached the client
+(and its codes, when both sides run on one engine), the rows returned, and the
+durable state of the observed tables read in a fresh session. Each scenario runs
+once without a fault and once per fault point; a fault point makes every write to
+one table fail with a constraint violation. The specs live in `oracle/<case>.toml`:
+
+```toml
+case = "p01-move-stock"
+pairs = [["tsql", "pg"]]                  # side names from case.toml
+observe = ["stock(item_id, qty)"]         # durable state; leave out time-dependent columns
+faults = ["stock", "price_feed:delete"]   # write fault, or delete fault [":key"]
+seed = "INSERT INTO ..."                  # shared, or seed.tsql / seed.pg
+# reproducible = false, why = "..."       # a "different" the oracle cannot show
+# known_divergence."tsql~pg" = "..."     # an open contradiction of an equal verdict
+
+[[scenario]]
+name = "caller checks the return code"
+call.tsql = "DECLARE @rc int; EXEC @rc = dbo.move_stock 1, 3; SELECT @rc;"
+call.pg = "SELECT move_stock(1, 3);"     # or call = "..." for both
+```
+
+```
+python3 corpus/tools/fault_oracle.py \
+  --pg "host=localhost user=postgres password=postgres dbname=postgres" \
+  --mssql "docker exec -i mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P <pw> -C -I" \
+  [--sqldiff target/debug/sqldiff] [p01 m1 ...]
+```
+
+It fails when a case expected to be equal diverges, when a "different" case shows
+no divergence, and (with `--sqldiff`) when the engine says "equal" for a pair that
+diverges. See `docs/validation.md` for how this fits with the golden runner.
+
 ## Adding a case
 
 1. Create `pairs/<id>/` or `mutations/<id>/` with the SQL files and a `case.toml`.
 2. Use only the catalog schema, or add the objects to all three catalog files.
 3. For a mutation, add its entry to `mutations/CATALOG.toml`.
 4. Add the directory to `MANIFEST.toml`.
-5. Run the validator.
+5. If it has T-SQL or PostgreSQL sides, add `oracle/<id>.toml` and run the oracle.
+6. Run the validator, then `cargo test -p sqldiff-corpus`: a new expectation the
+   engine cannot meet yet goes into `crates/sqldiff-corpus/known-failing.toml`.

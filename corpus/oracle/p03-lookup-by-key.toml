@@ -1,0 +1,16 @@
+case = "p03-lookup-by-key"
+pairs = [["tsql", "pg"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+"""
+
+[[scenario]]
+name = "existing key"
+call.tsql = "SELECT dbo.customer_last_name(1);"
+call.pg = "SELECT customer_last_name(1);"
+
+[[scenario]]
+name = "missing key"
+call.tsql = "SELECT dbo.customer_last_name(2);"
+call.pg = "SELECT customer_last_name(2);"
