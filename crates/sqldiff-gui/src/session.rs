@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sqldiff_core::ir::behaviour::RERUN_ASSUMPTIONS;
 use sqldiff_core::model::AssumptionSource;
-use sqldiff_core::{session as flips, Artifact, ChangeClass, Dialect, Report, Severity, Verdict};
+use sqldiff_core::{Artifact, ChangeClass, Dialect, Report, Severity, Verdict};
 use sqldiff_source::tree::{self, Ambiguous, Tree, TreePair};
 use sqldiff_source::{LayerRef, Resolved};
 
@@ -51,6 +52,8 @@ struct Loaded {
     sides: Option<(Artifact, Artifact)>,
     /// Engine report with pack policy, before session flips.
     base: Option<Report>,
+    /// `base` re-diffed under the session's scenario flips, when any are set.
+    rerun: Option<Report>,
     error: Option<String>,
 }
 
@@ -179,6 +182,7 @@ impl Session {
                 Ok((a, b)) => Loaded {
                     pair: p.clone(),
                     base: Some(tree::diff(&a, &b, &self.cfg)),
+                    rerun: None,
                     sides: Some((a, b)),
                     error: None,
                 },
@@ -186,6 +190,7 @@ impl Session {
                     pair: p.clone(),
                     sides: None,
                     base: None,
+                    rerun: None,
                     error: Some(e.0),
                 },
             })
@@ -195,6 +200,7 @@ impl Session {
         {
             return Err(e.clone());
         }
+        self.rerun();
         self.loaded_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -210,23 +216,48 @@ impl Session {
         self.pairs.is_empty()
     }
 
-    fn ids(&self, f: Flip) -> Vec<String> {
+    /// The session's flips as the engine takes them: id → holds.
+    fn flip_map(&self) -> BTreeMap<String, bool> {
         self.flips
             .iter()
-            .filter(|(_, v)| **v == f)
-            .map(|(k, _)| k.clone())
+            .map(|(id, f)| (id.clone(), *f == Flip::Confirmed))
             .collect()
     }
 
-    /// A report with the session's flips applied.
+    /// A report with the session's flips applied, as the CLI and MCP do.
     fn flipped(&self, mut r: Report) -> Report {
-        flips::confirm_assumptions(&mut r, &self.ids(Flip::Confirmed));
-        flips::deny_assumptions(&mut r, &self.ids(Flip::Denied));
+        sqldiff_core::ledger::relabel(&mut r, &self.flip_map());
         r
     }
 
+    /// Engine options for the session's scenario flips only.
+    fn scenario_options(&self, flips: &BTreeMap<String, bool>) -> sqldiff_core::Options {
+        sqldiff_core::Options {
+            flips: sqldiff_core::ledger::scenario_flips(flips),
+            ..self.cfg.options()
+        }
+    }
+
+    /// Re-diffs every pair under the session's scenario flips (they re-run
+    /// the behavioural analysis), or drops the re-runs when there are none.
+    fn rerun(&mut self) {
+        let opts = self.scenario_options(&self.flip_map());
+        for l in &mut self.pairs {
+            l.rerun = match &l.sides {
+                Some((a, b)) if !opts.flips.is_empty() => {
+                    Some(tree::diff_with(a, b, &self.cfg, &opts))
+                }
+                _ => None,
+            };
+        }
+    }
+
     pub fn report(&self, i: usize) -> Option<Report> {
-        self.pairs.get(i)?.base.clone().map(|r| self.flipped(r))
+        let l = self.pairs.get(i)?;
+        l.rerun
+            .clone()
+            .or_else(|| l.base.clone())
+            .map(|r| self.flipped(r))
     }
 
     pub fn set_flip(&mut self, id: &str, f: Flip) {
@@ -234,6 +265,9 @@ impl Session {
             self.flips.remove(id);
         } else {
             self.flips.insert(id.to_string(), f);
+        }
+        if RERUN_ASSUMPTIONS.contains(&id) {
+            self.rerun();
         }
     }
 
@@ -246,13 +280,52 @@ impl Session {
         Some(p)
     }
 
+    /// Engine options for pair `i`'s re-runs: pack config plus session flips.
+    fn options(&self) -> sqldiff_core::Options {
+        sqldiff_core::Options {
+            flips: self.flip_map(),
+            ..self.cfg.options()
+        }
+    }
+
+    /// "What if the statement on `line` of `side` fails with `kind`?" for pair `i`.
+    pub fn what_if(
+        &self,
+        i: usize,
+        side: sqldiff_core::model::Side,
+        line: usize,
+        kind: sqldiff_core::ir::ErrorKind,
+    ) -> Option<sqldiff_core::ir::witness::WhatIf> {
+        let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
+        Some(sqldiff_core::what_if(
+            a,
+            b,
+            &self.options(),
+            side,
+            line,
+            kind,
+        ))
+    }
+
+    /// Transaction brackets of both sides of pair `i`.
+    pub fn overlay(&self, i: usize) -> Option<sqldiff_core::ir::overlay::Overlay> {
+        let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
+        Some(sqldiff_core::overlay(a, b))
+    }
+
     /// Scratchpad texts diffed as pair `i` (same paths, dialects and versions).
     pub fn scratch(&self, i: usize, ta: String, tb: String) -> Option<Payload> {
         let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
         let (mut a, mut b) = (a.clone(), b.clone());
         a.text = ta;
         b.text = tb;
-        let mut p = build_view(&a, &b, self.flipped(tree::diff(&a, &b, &self.cfg)), true);
+        let opts = self.scenario_options(&self.flip_map());
+        let mut p = build_view(
+            &a,
+            &b,
+            self.flipped(tree::diff_with(&a, &b, &self.cfg, &opts)),
+            true,
+        );
         p.index = i;
         Some(p)
     }
@@ -370,8 +443,20 @@ impl Session {
                 }
                 row.pairs.push(i);
                 // Would denying it alone change this pair's verdict?
-                let mut denied = base.clone();
-                flips::deny_assumptions(&mut denied, std::slice::from_ref(&id));
+                let mut deny = BTreeMap::new();
+                deny.insert(id.clone(), false);
+                let denied = match &l.sides {
+                    Some((a, b)) if RERUN_ASSUMPTIONS.contains(&id.as_str()) => {
+                        let mut r = tree::diff_with(a, b, &self.cfg, &self.scenario_options(&deny));
+                        sqldiff_core::ledger::relabel(&mut r, &deny);
+                        r
+                    }
+                    _ => {
+                        let mut r = base.clone();
+                        sqldiff_core::ledger::relabel(&mut r, &deny);
+                        r
+                    }
+                };
                 if denied.verdict != base.verdict {
                     row.flips_verdict.push(i);
                 }
