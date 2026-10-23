@@ -74,7 +74,7 @@ Verdict: DIFFERENT
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
 | Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
 | Review workflow | Review store keyed by fingerprint and snapshot with expiry and optional encryption at rest; accepted findings and in-source deliberate-difference markers suppressed (kept in JSON and SARIF `suppressions`); author-declared assumptions from pack markers; redacted export with salted stable placeholders, leak-checked; per-content-hash report cache ([docs/review-and-export.md](docs/review-and-export.md)). |
-| GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
+| GUI | `sqldiff-gui serve` / `export` / `report`: two files open the pair view, two directories open a review queue (filter by class, dialect pair, folder, review state; sort by severity). Pair view aligned by statement with a location pane, findings with accept / reject / comment, assumption panel (deny or confirm an assumption and watch verdicts update), provenance bar (sources, snapshot, packs and hashes, dialect versions, refresh), command palette (Ctrl+K), scratchpad that re-diffs on edit, deep links `?a=<path>&b=<path>#f=<fingerprint>`, session report as Markdown (`--redact`). Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
 Not yet built: full binding against catalogs, the CFG with error edges (M4) and equivalence across control flow (loops, branches, error handlers that write), named-lock idioms, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
@@ -113,7 +113,7 @@ crates/sqldiff-source   packs, layered config, adapter protocol, fs/git/bundle a
 crates/sqldiff-review   review store, suppression, author markers, redaction, cache
 crates/sqldiff-cli      the `sqldiff` binary
 crates/sqldiff-mcp      the `sqldiff-mcp` stdio MCP server
-crates/sqldiff-gui      the `sqldiff-gui` pair view (local server + embedded page)
+crates/sqldiff-gui      the `sqldiff-gui` review queue and pair view (local server + embedded page)
 tests/fixtures          synthetic fixtures (all written for this repository)
 docs/examples/pack      synthetic example pack using every section
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time

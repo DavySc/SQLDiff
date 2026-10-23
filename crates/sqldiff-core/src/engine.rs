@@ -186,17 +186,7 @@ fn finish(mut r: Report) -> Report {
             .then(y.verdict.cmp(&x.verdict))
             .then(first_line(x).cmp(&first_line(y)))
     });
-    r.verdict = if r.findings.iter().any(|f| f.verdict == Verdict::Different) {
-        Verdict::Different
-    } else if r.findings.iter().any(|f| f.verdict == Verdict::Unknown)
-        || !r.unknown_reasons.is_empty()
-    {
-        Verdict::Unknown
-    } else if !r.assumptions.is_empty() {
-        Verdict::EqualUnderAssumptions
-    } else {
-        Verdict::Equal
-    };
+    r.verdict = crate::session::derive_verdict(&r);
     r
 }
 
