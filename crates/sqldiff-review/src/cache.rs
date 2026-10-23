@@ -78,7 +78,10 @@ impl Cache {
     }
 
     fn file(&self, ns: &str, key: &str) -> PathBuf {
-        self.dir.join(ns).join(&key[..2.min(key.len())]).join(format!("{key}.json"))
+        self.dir
+            .join(ns)
+            .join(&key[..2.min(key.len())])
+            .join(format!("{key}.json"))
     }
 
     pub fn get<T: DeserializeOwned>(&self, ns: &str, key: &str) -> Option<T> {

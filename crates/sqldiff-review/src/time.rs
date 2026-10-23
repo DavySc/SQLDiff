@@ -69,7 +69,11 @@ pub fn normalize(t: &str) -> Result<String> {
         }
         let h = digits(parts[0])?;
         let mi = digits(parts[1])?;
-        let se = if parts.len() == 3 { digits(parts[2])? } else { 0 };
+        let se = if parts.len() == 3 {
+            digits(parts[2])?
+        } else {
+            0
+        };
         if h > 23 || mi > 59 || se > 60 {
             return Err(bad());
         }
@@ -112,7 +116,15 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+    (
+        if m <= 2 {
+            yoe + era * 400 + 1
+        } else {
+            yoe + era * 400
+        },
+        m,
+        d,
+    )
 }
 
 #[cfg(test)]
@@ -133,12 +145,22 @@ mod tests {
             normalize("2026-10-23T17:30:00.123+02:00").unwrap(),
             "2026-10-23T15:30:00Z"
         );
-        assert_eq!(normalize("2026-10-23 01:00-01:30").unwrap(), "2026-10-23T02:30:00Z");
+        assert_eq!(
+            normalize("2026-10-23 01:00-01:30").unwrap(),
+            "2026-10-23T02:30:00Z"
+        );
     }
 
     #[test]
     fn rejects() {
-        for t in ["", "2026-13-01", "2023-02-29", "2026-10-23T25:00Z", "2026-10-23T10:00", "tomorrow"] {
+        for t in [
+            "",
+            "2026-13-01",
+            "2023-02-29",
+            "2026-10-23T25:00Z",
+            "2026-10-23T10:00",
+            "tomorrow",
+        ] {
             assert!(normalize(t).is_err(), "{t}");
         }
     }

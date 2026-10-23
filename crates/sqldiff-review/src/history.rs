@@ -37,7 +37,10 @@ pub fn group(entries: &[HistoryEntry], cfg: &Resolved) -> Vec<ChangeGroup> {
             continue;
         }
         for w in items {
-            let g = match groups.iter().position(|g| g.work_item.as_deref() == Some(&w)) {
+            let g = match groups
+                .iter()
+                .position(|g| g.work_item.as_deref() == Some(&w))
+            {
                 Some(i) => &mut groups[i],
                 None => {
                     groups.push(ChangeGroup {

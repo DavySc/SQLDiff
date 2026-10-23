@@ -474,6 +474,7 @@ dependencies = [
  "clap",
  "serde_json",
  "sqldiff-core",
+ "sqldiff-review",
  "sqldiff-source",
  "sqldiff-syntax",
 ]

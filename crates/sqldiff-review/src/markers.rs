@@ -79,15 +79,21 @@ fn marked(f: &Finding, side: Side, line: usize) -> bool {
 }
 
 /// Applies author markers to a report made from `a_text` (and `b_text`).
-pub fn apply(report: &mut Report, a_text: &str, b_text: Option<&str>, cfg: &Resolved) -> MarkerSummary {
+pub fn apply(
+    report: &mut Report,
+    a_text: &str,
+    b_text: Option<&str>,
+    cfg: &Resolved,
+) -> MarkerSummary {
     let found = find(a_text, b_text, cfg);
     let mut summary = MarkerSummary::default();
     for m in &found {
         match m.marker.kind {
             MarkerKind::IntentionalDifference => {
-                let (hit, kept): (Vec<Finding>, Vec<Finding>) = std::mem::take(&mut report.findings)
-                    .into_iter()
-                    .partition(|f| marked(f, m.side, m.marker.line));
+                let (hit, kept): (Vec<Finding>, Vec<Finding>) =
+                    std::mem::take(&mut report.findings)
+                        .into_iter()
+                        .partition(|f| marked(f, m.side, m.marker.line));
                 report.findings = kept;
                 for f in hit {
                     report.suppressed.push(Suppressed {

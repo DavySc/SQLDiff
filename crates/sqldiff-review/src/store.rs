@@ -77,7 +77,9 @@ impl std::str::FromStr for State {
             "accepted" | "accept" => Ok(State::Accepted),
             "rejected" | "reject" => Ok(State::Rejected),
             "commented" | "comment" => Ok(State::Commented),
-            _ => Err(format!("review state `{s}`: expected accepted, rejected or commented")),
+            _ => Err(format!(
+                "review state `{s}`: expected accepted, rejected or commented"
+            )),
         }
     }
 }
@@ -289,7 +291,8 @@ impl Store {
             cleared: None,
         };
         self.append(&r)?;
-        self.entries.insert(Key::new(fingerprint, snapshot), decision);
+        self.entries
+            .insert(Key::new(fingerprint, snapshot), decision);
         Ok(())
     }
 
@@ -381,7 +384,10 @@ impl Store {
                 decision: Some(d.clone()),
                 cleared: None,
             };
-            out.push_str(&crypto::encode(self.key.as_ref(), &serde_json::to_string(&r)?));
+            out.push_str(&crypto::encode(
+                self.key.as_ref(),
+                &serde_json::to_string(&r)?,
+            ));
             out.push('\n');
         }
         write_atomic(&path, out.as_bytes())?;

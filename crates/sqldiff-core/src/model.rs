@@ -267,7 +267,11 @@ impl Report {
         if self.suppressed.is_empty() {
             return self.verdict;
         }
-        if self.findings.iter().any(|f| f.verdict == Verdict::Different) {
+        if self
+            .findings
+            .iter()
+            .any(|f| f.verdict == Verdict::Different)
+        {
             Verdict::Different
         } else if self.findings.iter().any(|f| f.verdict == Verdict::Unknown)
             || !self.unknown_reasons.is_empty()

@@ -148,9 +148,17 @@ impl Redactor {
         h.update(kind.prefix().as_bytes());
         h.update([0]);
         h.update(lower.as_bytes());
-        let mut placeholder = format!("{}_{}", kind.prefix(), hex(&h.finalize()[..4]).to_uppercase());
+        let mut placeholder = format!(
+            "{}_{}",
+            kind.prefix(),
+            hex(&h.finalize()[..4]).to_uppercase()
+        );
         if kind == Kind::Path {
-            if let Some(ext) = term.rsplit_once('.').map(|(_, e)| e).filter(|e| e.len() <= 4 && !e.contains(['/', '\\'])) {
+            if let Some(ext) = term
+                .rsplit_once('.')
+                .map(|(_, e)| e)
+                .filter(|e| e.len() <= 4 && !e.contains(['/', '\\']))
+            {
                 placeholder.push('.');
                 placeholder.push_str(&ext.to_lowercase());
             }
@@ -168,12 +176,20 @@ impl Redactor {
     /// Adds a possibly qualified object name: every part is a term, the
     /// last as an object, the others as schemas (or databases).
     pub fn add_object(&mut self, name: &str) {
-        let parts: Vec<&str> = name.split('.').map(unquote).filter(|p| !p.is_empty()).collect();
+        let parts: Vec<&str> = name
+            .split('.')
+            .map(unquote)
+            .filter(|p| !p.is_empty())
+            .collect();
         if parts.len() > 1 {
             self.add(Kind::Object, &parts.join("."));
         }
         for (i, p) in parts.iter().enumerate() {
-            let kind = if i + 1 == parts.len() { Kind::Object } else { Kind::Schema };
+            let kind = if i + 1 == parts.len() {
+                Kind::Object
+            } else {
+                Kind::Schema
+            };
             self.add(kind, p);
         }
     }
@@ -222,7 +238,11 @@ impl Redactor {
             let mut keys: Vec<&String> = self.terms.keys().collect();
             // Longest first, so a qualified name or a path wins over its parts.
             keys.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
-            let alt = keys.iter().map(|k| regex::escape(k)).collect::<Vec<_>>().join("|");
+            let alt = keys
+                .iter()
+                .map(|k| regex::escape(k))
+                .collect::<Vec<_>>()
+                .join("|");
             self.matcher = Some(
                 RegexBuilder::new(&alt)
                     .case_insensitive(true)
@@ -246,8 +266,8 @@ impl Redactor {
             let e = &self.terms[&m.as_str().to_lowercase()];
             let before = s[..m.start()].chars().next_back();
             let after = s[m.end()..].chars().next();
-            let bounded = !e.whole_word
-                || (!before.is_some_and(is_ident) && !after.is_some_and(is_ident));
+            let bounded =
+                !e.whole_word || (!before.is_some_and(is_ident) && !after.is_some_and(is_ident));
             if bounded {
                 out.push((m.start(), m.end(), e.placeholder.clone()));
                 pos = m.end();
