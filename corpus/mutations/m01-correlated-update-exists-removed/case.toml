@@ -1,0 +1,23 @@
+id = "m01-correlated-update-exists-removed"
+title = "Correlated UPDATE without its EXISTS restriction"
+catalog_item = "remove WHERE EXISTS from a correlated UPDATE"
+refs = ["design §7 cardinality contracts"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "db2i"
+file = "original.db2i.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic", "cardinality"]
+witnesses = [
+  "For an item_price row with no price_feed row, the original leaves it unchanged; the mutated UPDATE assigns NULL, which violates NOT NULL on unit_price and fails the whole statement.",
+]

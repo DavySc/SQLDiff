@@ -1,0 +1,25 @@
+id = "m12-merge-by-source-split"
+title = "MERGE with NOT MATCHED BY SOURCE split into DELETE + MERGE"
+catalog_item = "split a MERGE with `NOT MATCHED BY SOURCE` into MERGE + DELETE"
+refs = ["design §7 upserts and MERGE"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional", "concurrency"]
+facts = ["V1", "V3"]
+witnesses = [
+  "If price_feed holds two rows for one item, the T-SQL MERGE fails as a whole and deletes nothing; the Db2 DELETE is already durable under *NONE when its MERGE fails.",
+  "A price_feed row inserted by another session between the two Db2 statements is merged although its item was just deleted; the single T-SQL statement sees one consistent source.",
+]

@@ -1,0 +1,23 @@
+id = "m16-outdated-signature"
+title = "Call with an outdated routine signature"
+catalog_item = "call a routine with an outdated signature"
+refs = ["design §3 layer 2 binding", "design §16 outdated signature"]
+detected_by = "early-check"
+milestone = "M3"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["binding"]
+witnesses = [
+  "dbo.log_stock_change takes three parameters without defaults; the mutated call passes two and fails at run time with 'expects parameter @Reason', after the stock UPDATE has run.",
+]

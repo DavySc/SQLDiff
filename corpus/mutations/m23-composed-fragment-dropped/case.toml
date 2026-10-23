@@ -1,0 +1,26 @@
+id = "m23-composed-fragment-dropped"
+title = "Generated output missing its session-options fragment"
+catalog_item = "drop a composed fragment from a generated output"
+refs = ["design §3 layer 4 composition", "design §5.3 template syntax is configuration"]
+detected_by = "behavioural"
+milestone = "M5a"
+pack = "../../packs/synthetic-generator.toml"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional"]
+assumptions = ["caller XACT_ABORT is off", "caller has no open transaction"]
+witnesses = [
+  "Composition: part 'session-options' (template xact-abort) is present in the original and missing from the mutated output.",
+  "If the INSERT fails, the original aborts and rolls back the UPDATE; without XACT_ABORT only the INSERT fails, execution continues and the COMMIT makes the UPDATE durable without its log row.",
+]

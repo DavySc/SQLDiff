@@ -1,0 +1,23 @@
+id = "m13-coalesce-to-isnull"
+title = "COALESCE replaced by ISNULL with a narrower first argument"
+catalog_item = "`COALESCE` → `ISNULL` with differing lengths"
+refs = ["design §7 NULL, strings, types"]
+detected_by = "early-check"
+milestone = "M3"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "For a customer with NULL first_name and a 60-character email, the original returns the whole email; ISNULL takes the type of first_name (varchar(50)) and truncates it to 50 characters.",
+]

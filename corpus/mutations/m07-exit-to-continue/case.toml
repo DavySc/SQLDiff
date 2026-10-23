@@ -1,0 +1,23 @@
+id = "m07-exit-to-continue"
+title = "EXIT handler turned into CONTINUE"
+catalog_item = "EXIT → CONTINUE"
+refs = ["design §7 error handling"]
+detected_by = "behavioural"
+milestone = "M5b"
+
+[sides.original]
+dialect = "db2i"
+file = "original.db2i.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional", "semantic"]
+witnesses = [
+  "If the INSERT fails, the original rolls back and returns -1; the mutated version rolls back, then runs the stock UPDATE and commits it, returning -1 with stock reduced and no order line.",
+]

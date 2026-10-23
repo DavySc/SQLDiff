@@ -1,0 +1,24 @@
+id = "m19-case-insensitivity-dropped"
+title = "Case-insensitive comparison lost in conversion"
+catalog_item = "drop a case-insensitivity emulation (`upper` / `lower` / `ILIKE`) from a comparison"
+refs = ["design §8 equiv case-insensitive-compare", "design §16 case-insensitive comparison lost"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic"]
+assumptions = ["T-SQL database collation is case-insensitive"]
+witnesses = [
+  "For a stored 'Ann@Example.com' and @Email = 'ann@example.com', T-SQL returns the id; the PostgreSQL function returns NULL.",
+]

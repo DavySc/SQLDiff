@@ -1,0 +1,24 @@
+id = "m21-time-source-changed"
+title = "now() replaced by clock_timestamp()"
+catalog_item = "change `now()` to `clock_timestamp()` (or the reverse)"
+refs = ["design §4 transaction-scoped time", "design §7 time source"]
+detected_by = "early-check"
+milestone = "M4"
+
+[sides.original]
+dialect = "pg"
+file = "original.pg.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic"]
+facts = ["V20"]
+witnesses = [
+  "When two orders are shipped by one call, the original gives both the transaction start time; the mutated version gives each row the wall-clock time at which it was updated, so the values differ from each other and from the transaction start.",
+]

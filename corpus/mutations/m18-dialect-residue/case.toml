@@ -1,0 +1,24 @@
+id = "m18-dialect-residue"
+title = "Schema qualifier and built-in left over from T-SQL"
+catalog_item = "leave a schema qualifier or syntax from another dialect behind"
+refs = ["design §2 residue class", "design §16 residue"]
+detected_by = "early-check"
+milestone = "M3"
+note = "PL/pgSQL bodies are not bound at CREATE time, so the conversion is created without error and fails on first call."
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["residue", "binding"]
+witnesses = [
+  "The PostgreSQL body references schema dbo and the T-SQL built-in GETDATE(), neither of which exists in the PostgreSQL catalog; every call fails.",
+]

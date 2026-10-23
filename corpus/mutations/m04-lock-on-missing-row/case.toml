@@ -1,0 +1,23 @@
+id = "m04-lock-on-missing-row"
+title = "Advisory lock replaced by a lock on a row that can be missing"
+catalog_item = "replace advisory-lock emulation with a lock on a row that can be missing"
+refs = ["design §7 concurrency and isolation", "design §16 lock emulation"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "pg"
+file = "original.pg.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["concurrency"]
+witnesses = [
+  "If app_lock has no 'price-feed' row, the mutated version locks nothing and two sessions run the DELETE concurrently; the original always serialises them.",
+]
