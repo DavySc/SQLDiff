@@ -18,11 +18,6 @@ const KNOWN_MISSES: &[(&str, &str, &str)] = &[
     ("p13-named-lock", "tsql", "db2i"),
     ("p13-named-lock", "pg", "db2i"),
     // Same-dialect mutations outside statement equivalence (handlers, binding, lints).
-    (
-        "m01-correlated-update-exists-removed",
-        "original",
-        "mutated",
-    ),
     ("m14-terminator-before-throw", "original", "mutated"),
     ("m15-dropped-column-reference", "original", "mutated"),
     ("m16-outdated-signature", "original", "mutated"),

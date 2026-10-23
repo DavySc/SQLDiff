@@ -12,6 +12,7 @@ use crate::model::{
     Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
+use crate::rules;
 use crate::treediff;
 
 #[derive(Debug, Clone)]
@@ -92,11 +93,25 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 findings.push(lint::to_finding(&ab, &h));
             }
         }
+        // Idiom-rule lints that are new in B (design section 8).
+        let old = rules::analysis::hits(&aa, &schema_a, false);
+        for h in rules::analysis::new_hits(&old, rules::analysis::hits(&ab, &schema_b, false)) {
+            let v = if h.diff_different {
+                Verdict::Different
+            } else {
+                Verdict::Unknown
+            };
+            findings.push(rules::analysis::to_finding(&ab, &h, v));
+        }
     } else {
         findings.extend(pair_writes(&aa, &ab));
-        for side in [&aa, &ab] {
+        for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
+            }
+            // Rule lints describe one side's code: they do not decide the verdict.
+            for h in rules::analysis::hits(side, schema, false) {
+                findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
             }
         }
         eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
@@ -155,10 +170,14 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
-    let findings = lint::all_hits(&aa)
+    let schema = equiv::schema::Schema::load(&opts.catalog_a);
+    let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
         .collect();
+    for h in rules::analysis::hits(&aa, &schema, true) {
+        findings.push(rules::analysis::to_finding(&aa, &h, Verdict::Unknown));
+    }
     let diagnostics = aa.diagnostics();
     let mut unknown_reasons = Vec::new();
     if !diagnostics.is_empty() {

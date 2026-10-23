@@ -5,187 +5,266 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SQLDiff review</title>
 <style>
+/* Shared palette (convert.html keeps a copy of these tokens; keep the two in sync). */
 :root {
-  --bg: #f6f7f9; --panel: #ffffff; --fg: #16181d; --muted: #667085; --line: #e4e7ec; --soft: #eef1f5;
-  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08); --accent: #4f46e5;
-  --same: transparent; --chg-bg: #fff6dc; --chg-tok: #f5d77a; --del-bg: #fde8e8; --del-tok: #f4b4b4;
-  --add-bg: #e3f5e8; --add-tok: #a8dfb6; --focus: #4f46e5;
-  --kw: #8a3ab9; --id: #1d1f21; --var: #b0551c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828; --op: #444;
-  --transactional: #c62828; --semantic: #d96b00; --structural: #3b6fd4; --cosmetic: #8a8f98; --residue: #7a4fc0;
-  --cardinality: #b8336a; --concurrency: #a15c00; --binding: #0f7a6b; --limit: #6b6f76;
-  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --pop: 0 12px 40px rgba(16,24,40,.18), 0 2px 6px rgba(16,24,40,.08); --accent: #4f46e5;
+  --same: transparent; --chg-bg: #fff8e1; --chg-tok: #f9e08f; --del-bg: #fdecec; --del-tok: #f6c1c1;
+  --add-bg: #e8f6ec; --add-tok: #b5e3c1; --focus: #4f46e5;
+  --kw: #7c3aad; --id: #1d1f21; --var: #a8521c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828; --op: #4b5563;
+  --transactional: #d92d20; --semantic: #dc6803; --structural: #3b6fd4; --cosmetic: #98a2b3; --residue: #7a4fc0;
+  --cardinality: #c11574; --concurrency: #b54708; --binding: #0e9384; --limit: #6b7280;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --code: 12.5px; --row-pad: 0px; --item-pad: 10px;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #0f1115; --panel: #171a20; --fg: #e6e8ec; --muted: #8b93a1; --line: #262b33; --soft: #1e232b;
-    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8;
-    --chg-bg: #3a3218; --chg-tok: #6b5a1c; --del-bg: #3d2222; --del-tok: #6e2f2f;
-    --add-bg: #1e3626; --add-tok: #2d5e3a; --focus: #818cf8;
-    --kw: #c792ea; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #7d838c; --err: #ff6b6b; --op: #c7c9cc;
-    --transactional: #ff6b6b; --semantic: #ffa94d; --structural: #7aa2ff; --cosmetic: #9096a0; --residue: #b197fc;
-    --cardinality: #f783ac; --concurrency: #e8a33d; --binding: #5fd3c0; --limit: #9096a0;
+    --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --pop: 0 16px 48px rgba(0,0,0,.55), 0 0 0 1px #2a2f37; --accent: #818cf8;
+    --chg-bg: #2a2614; --chg-tok: #5a4c1c; --del-bg: #2f1c1c; --del-tok: #5e2a2a;
+    --add-bg: #17291d; --add-tok: #285236; --focus: #818cf8;
+    --kw: #c4a1f0; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #6b717b; --err: #ff6b6b; --op: #aeb3ba;
+    --transactional: #f97066; --semantic: #fdb022; --structural: #7aa2ff; --cosmetic: #7d8490; --residue: #b197fc;
+    --cardinality: #f783ac; --concurrency: #e8a33d; --binding: #5fd3c0; --limit: #8b93a1;
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; }
-body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
-header { padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; box-shadow: var(--shadow); position: relative; z-index: 3; }
-header h1 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: -.01em; display: flex; align-items: center; gap: 8px; }
-header h1::before { content: ""; width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
-.verdict { font-weight: 600; padding: 2px 10px; border-radius: 999px; font-size: 11.5px; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
-.verdict.different { background: var(--del-bg); color: var(--transactional); }
-.verdict.unknown { background: var(--chg-bg); color: var(--semantic); }
-.verdict.equal, .verdict.equal_under_assumptions { background: var(--add-bg); color: var(--str); }
-.prov { color: var(--muted); font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
-.prov code { font-family: var(--mono); }
-.spacer { flex: 1; }
-button, .chip { font: inherit; font-size: 12px; font-weight: 500; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 6px; padding: 4px 10px; cursor: pointer; transition: border-color .12s, background .12s, color .12s; }
-button:hover:not(:disabled), .chip:hover { border-color: var(--focus); color: var(--focus); }
-button:disabled { opacity: .45; cursor: default; }
-.chip { border-radius: 999px; }
+body { background: var(--bg); color: var(--fg); font: 13.5px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+body.compact { --code: 12px; --item-pad: 6px; font-size: 13px; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-button[aria-pressed="true"] { background: var(--focus); color: #fff; border-color: var(--focus); }
-.chip.off { opacity: .4; text-decoration: line-through; }
-.chip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
-main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 14px 380px; min-height: 0; }
+.spacer { flex: 1; }
+kbd { font: 10.5px/1 var(--mono); color: var(--muted); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 2px 4px; background: var(--panel); }
+
+/* Buttons: quiet by default, one filled style for the primary action. */
+button { font: inherit; font-size: 12.5px; font-weight: 500; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 3px 8px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: background .12s, color .12s, border-color .12s; }
+button:hover:not(:disabled) { background: var(--soft); color: var(--fg); }
+button:disabled { opacity: .4; cursor: default; }
+button.outline { border-color: var(--line); color: var(--fg); background: var(--panel); }
+button.primary { background: var(--fg); color: var(--panel); }
+button.primary:hover:not(:disabled) { background: var(--fg); color: var(--panel); opacity: .88; }
+button[aria-pressed="true"] { color: var(--fg); background: var(--soft); }
+button.icon { padding: 3px 6px; }
+
+/* Header: one calm line. Where you are, the verdict, and the command bar. */
+header { height: 44px; flex: none; padding: 0 12px 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 10px; align-items: center; position: relative; z-index: 5; min-width: 0; }
+.logo { width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); flex: none; }
+#nav { display: flex; gap: 2px; align-items: center; min-width: 0; font-size: 13px; }
+#nav .sep { color: var(--faint); padding: 0 4px; }
+#nav .crumb { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 44vw; }
+#nav .count { color: var(--faint); font-weight: 400; margin-left: 2px; }
+.verdict { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 500; white-space: nowrap; color: var(--fg); }
+.verdict::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+.verdict.different::before { background: var(--transactional); }
+.verdict.unknown { color: var(--muted); } .verdict.unknown::before { background: var(--semantic); }
+.verdict.equal::before, .verdict.equal_under_assumptions::before { background: var(--str); }
+.verdict.error { color: var(--err); } .verdict.error::before { background: var(--err); }
+#summary { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
+#busy { font-size: 12px; color: var(--muted); white-space: nowrap; }
+#btn-palette { border: 1px solid var(--line); background: var(--bg); color: var(--faint); min-width: 220px; justify-content: space-between; padding: 4px 6px 4px 10px; font-weight: 400; }
+#btn-palette:hover { color: var(--muted); background: var(--bg); border-color: color-mix(in srgb, var(--focus) 40%, var(--line)); }
+
+/* Details popover (provenance). Hidden until asked for. */
+#provbar { display: none; position: absolute; right: 12px; top: calc(100% + 4px); z-index: 8; width: min(440px, calc(100vw - 24px)); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--pop); padding: 6px 0; font-size: 12.5px; }
+body.show-info #provbar { display: block; }
+#provbar .kv { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 5px 14px; }
+#provbar .k { color: var(--muted); }
+#provbar code { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+#provbar .layer { display: block; }
+#provbar .acts { border-top: 1px solid var(--line); margin-top: 6px; padding: 8px 10px 2px; display: flex; gap: 4px; flex-wrap: wrap; }
+#provbar a { color: var(--fg); text-decoration: none; font-weight: 500; padding: 3px 8px; border-radius: 6px; }
+#provbar a:hover { background: var(--soft); }
+
+/* Pair view */
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 10px 360px; min-height: 0; }
+#pane { overflow: auto; min-height: 0; background: var(--panel); }
 #overview { position: relative; background: var(--panel); border-left: 1px solid var(--line); cursor: pointer; }
-#overview div { position: absolute; left: 3px; right: 3px; border-radius: 1px; }
-#toolbar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 6px 16px; border-bottom: 1px solid var(--line); background: var(--bg); }
-body:not(.show-info) #provbar { display: none; }
-body.v-queue #toolbar { display: none !important; }
-/* Compact findings: only the focused card shows meta and actions. */
-.finding:not(.focus) .meta, .finding:not(.focus) .racts, .finding:not(.focus) > button[data-copy] { display: none; }
-.finding:not(.focus) p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.finding.focus .racts { margin-top: 8px; }
-header { padding: 8px 16px; }
-#summary { color: var(--muted); font-size: 12.5px; }
-#pane { overflow: auto; min-height: 0; }
-.cols { display: grid; grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr); position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
-.cols div { padding: 4px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.row { display: grid; grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr); border-bottom: 1px solid var(--line); }
-.row.focus { outline: 2px solid var(--focus); outline-offset: -2px; }
-.mid { background: var(--line); }
+#overview div { position: absolute; left: 2px; right: 2px; border-radius: 1px; }
+.cols { display: grid; grid-template-columns: minmax(0, 1fr) 4px minmax(0, 1fr); position: sticky; top: 0; z-index: 2; background: color-mix(in srgb, var(--panel) 92%, transparent); backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.cols div { padding: 6px 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cols b { color: var(--fg); font-weight: 600; margin-right: 6px; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) 4px minmax(0, 1fr); border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); }
+.row.focus { box-shadow: inset 0 0 0 1.5px var(--focus); }
+.mid { background: transparent; }
 .row .mid.has-f { background: var(--fc, var(--focus)); }
-.cell { display: grid; grid-template-columns: 44px minmax(0, 1fr); font: 12.5px/1.5 var(--mono); min-height: 1.5em; }
-.cell.empty { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--line) 6px 7px); opacity: .6; }
-.row.changed .cell { background: var(--chg-bg); }
-.row.only_a .cell.a { background: var(--del-bg); }
-.row.only_b .cell.b { background: var(--add-bg); }
-.ln { color: var(--muted); text-align: right; padding-right: 8px; user-select: none; white-space: pre; border-right: 1px solid var(--line); }
+.cell { display: grid; grid-template-columns: 48px minmax(0, 1fr); font: var(--code)/1.6 var(--mono); font-variant-ligatures: none; min-height: 1.6em; padding: var(--row-pad) 0; }
+.cell.empty { background: repeating-linear-gradient(135deg, transparent 0 7px, color-mix(in srgb, var(--line) 70%, transparent) 7px 8px); }
+.row.changed .cell { background: color-mix(in srgb, var(--chg-bg) 55%, var(--panel)); }
+.row.changed .ln { background: var(--chg-bg); }
+.row.only_a .cell.a { background: color-mix(in srgb, var(--del-bg) 70%, var(--panel)); }
+.row.only_a .cell.a .ln { background: var(--del-bg); }
+.row.only_b .cell.b { background: color-mix(in srgb, var(--add-bg) 70%, var(--panel)); }
+.row.only_b .cell.b .ln { background: var(--add-bg); }
+.ln { color: var(--faint); text-align: right; padding-right: 10px; user-select: none; white-space: pre; }
+.code { white-space: pre-wrap; word-break: break-word; padding: 0 12px 0 10px; tab-size: 4; }
 .code[contenteditable] { cursor: text; outline: none; caret-color: var(--focus); }
-.cell:has(.code[contenteditable]:hover) { box-shadow: inset 0 0 0 1px var(--line); }
-.cell:has(.code[contenteditable]:focus) { box-shadow: inset 0 0 0 1.5px var(--focus); }
-#editnote { font-size: 12px; color: var(--str); }
-.code { white-space: pre-wrap; word-break: break-word; padding-left: 8px; tab-size: 4; }
-.m1 { background: var(--chg-tok); border-radius: 2px; }
-.m3 { text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
-.row.only_a .m2 { background: var(--del-tok); border-radius: 2px; }
-.row.only_b .m2 { background: var(--add-tok); border-radius: 2px; }
-.t-kw { color: var(--kw); font-weight: 600; } .t-id { color: var(--id); } .t-var { color: var(--var); }
+.cell:has(.code[contenteditable]:focus) { box-shadow: inset 2px 0 0 var(--focus); }
+.m1 { background: color-mix(in srgb, var(--chg-tok) 70%, transparent); border-radius: 3px; }
+/* When most of a block changed, word highlights stop carrying information: the row tint says it all. */
+.cell.dense .m1, .row .cell.dense .m2 { background: none; }
+.m3 { text-decoration: underline dotted var(--faint); text-underline-offset: 3px; }
+.row.only_a .m2 { background: var(--del-tok); border-radius: 3px; }
+.row.only_b .m2 { background: var(--add-tok); border-radius: 3px; }
+.t-kw { color: var(--kw); } .t-id { color: var(--id); } .t-var { color: var(--var); }
 .t-num { color: var(--num); } .t-str { color: var(--str); } .t-cmt { color: var(--cmt); font-style: italic; }
 .t-err { color: var(--err); text-decoration: wavy underline; } .t-op, .t-pun { color: var(--op); }
-.fold { padding: 3px 10px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); cursor: pointer; text-align: center; }
+.fold { padding: 4px 12px; font-size: 12px; color: var(--faint); background: var(--bg); border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); cursor: pointer; display: flex; gap: 8px; align-items: center; }
+.fold::before { content: "⋯"; font-weight: 700; }
 .fold:hover { color: var(--focus); }
+
+/* Side panel: a list, not a stack of cards. */
 aside { border-left: 1px solid var(--line); background: var(--bg); overflow: auto; min-height: 0; }
-aside h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 16px 14px 8px; }
-.finding { margin: 0 12px 10px; padding: 10px 12px; border: 1px solid var(--line); border-left: 3px solid var(--fc); border-radius: var(--radius); cursor: pointer; background: var(--panel); box-shadow: var(--shadow); transition: box-shadow .12s, border-color .12s; }
-.finding:hover { border-color: color-mix(in srgb, var(--fc) 50%, var(--line)); }
-.finding.focus { border-color: var(--focus); border-left-color: var(--fc); box-shadow: 0 0 0 1px var(--focus); }
-.finding .head { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
-.finding .cls { font-weight: 700; color: var(--fc); text-transform: uppercase; letter-spacing: .04em; }
-.finding .rule { font-family: var(--mono); color: var(--muted); }
-.finding p { margin: 4px 0; font-size: 13px; }
-.finding .meta { font-size: 11.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 10px; }
-.finding .meta abbr { text-decoration: underline dotted; cursor: help; }
-.finding .loc { font-family: var(--mono); }
-.finding button { float: right; margin-left: 6px; }
-.empty-note { margin: 0 14px; color: var(--muted); font-size: 13px; }
-.small { font-size: 12px; color: var(--muted); margin: 0 14px 4px; }
-.small ul { margin: 2px 0 8px; padding-left: 18px; }
-#busy { font-size: 12px; color: var(--muted); }
-#help { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.35); align-items: center; justify-content: center; z-index: 9; }
-#help.open { display: flex; }
-#help div { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.25); padding: 16px 22px; min-width: 280px; }
-#help kbd { font-family: var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; }
-#help td { padding: 2px 10px 2px 0; }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; } #overview { display: none; } aside { border-left: 0; border-top: 1px solid var(--line); max-height: 40vh; } }
-body:not(.show-info) #provbar { display: none; }
-#provbar { padding: 4px 16px; border-bottom: 1px solid var(--line); background: var(--bg); color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
-#provbar code { font-family: var(--mono); }
-#provbar .layer { white-space: nowrap; }
-#provbar a { color: var(--focus); }
-#nav { display: flex; gap: 8px; align-items: center; min-width: 0; }
-#nav .crumb { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
-#queue { flex: 1; display: none; grid-template-columns: minmax(0, 1fr) 380px; min-height: 0; }
+.sh { position: sticky; top: 0; z-index: 2; background: var(--bg); display: flex; gap: 6px; align-items: center; padding: 10px 14px 8px; }
+.sh h2 { font-size: 12.5px; font-weight: 600; margin: 0; }
+.sh .n { color: var(--faint); font-weight: 400; margin-left: 4px; }
+#classes { display: flex; gap: 2px; flex-wrap: wrap; padding: 0 10px 8px; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; color: var(--muted); }
+.chip.off { opacity: .45; text-decoration: line-through; }
+.chip .dot, .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.finding { position: relative; padding: var(--item-pad) 14px var(--item-pad) 16px; cursor: pointer; border-top: 1px solid var(--line); }
+.finding::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: transparent; }
+.finding:hover { background: color-mix(in srgb, var(--soft) 70%, transparent); }
+.finding.focus { background: var(--panel); }
+.finding.focus::before { background: var(--fc); }
+.finding .head { display: flex; gap: 7px; align-items: center; font-size: 12px; color: var(--muted); }
+.finding .cls { font-weight: 600; color: var(--fg); text-transform: capitalize; }
+.finding .at { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-left: auto; white-space: nowrap; }
+.finding p { margin: 3px 0 0; font-size: 13px; color: var(--fg); }
+.finding:not(.focus) p { color: color-mix(in srgb, var(--fg) 78%, var(--bg)); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.finding:not(.focus) .meta, .finding:not(.focus):not(.commenting) .racts, .finding:not(.focus):not(.commenting) textarea { display: none; }
+.finding .meta { margin-top: 8px; font-size: 11px; color: var(--faint); display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: center; }
+.finding .meta button { font-size: 11px; padding: 0 6px; margin-left: auto; }
+.finding .assumes { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.finding .assumes .k { color: var(--faint); font-size: 11px; }
+.finding .assumes ul { margin: 2px 0 0; padding-left: 16px; }
+.finding:not(.focus) .assumes { display: none; }
+.finding .loc { font-family: var(--mono); font-size: 11px; }
+.finding .racts { display: flex; gap: 0; margin: 10px 0 0 -8px; flex-wrap: wrap; }
+.finding .racts kbd { margin-left: 2px; }
+.finding .racts button[aria-pressed="true"] { color: var(--fg); background: var(--soft); }
+.finding .tag { font-size: 11px; font-weight: 500; padding: 0 6px; border-radius: 4px; background: var(--soft); color: var(--muted); }
+.finding .tag.accepted { color: var(--str); } .finding .tag.rejected { color: var(--transactional); } .finding .tag.commented { color: var(--focus); }
+.finding .dec { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+.finding textarea { width: 100%; margin-top: 8px; font: 12.5px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; outline: none; }
+.finding textarea:focus { border-color: var(--focus); }
+.finding.done:not(.focus) { opacity: .6; }
+.finding.done:not(.focus) p { -webkit-line-clamp: 1; }
+.row.hover:not(.focus) { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--focus) 45%, transparent); }
+.sh .progress { margin-left: auto; display: inline-flex; gap: 8px; align-items: center; font-size: 11.5px; color: var(--faint); }
+.sh .progress .bar { width: 56px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.sh .progress .bar i { display: block; height: 100%; background: var(--str); transition: width .2s; }
+.all-done { margin: 4px 14px 12px; padding: 12px; border-radius: 8px; background: color-mix(in srgb, var(--add-bg) 60%, transparent); color: var(--str); font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: space-between; }
+details.sec[data-sec="done"] .finding:first-child { border-top: 0; }
+.empty-note { margin: 4px 16px 12px; color: var(--muted); font-size: 12.5px; }
+
+/* Secondary sections: progressive disclosure. */
+details.sec { border-top: 1px solid var(--line); }
+details.sec > summary { list-style: none; cursor: pointer; padding: 10px 14px; font-size: 12.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; user-select: none; }
+details.sec > summary::-webkit-details-marker { display: none; }
+details.sec > summary::before { content: "›"; color: var(--faint); width: 10px; transition: transform .12s; display: inline-block; }
+details.sec[open] > summary::before { transform: rotate(90deg); }
+details.sec > summary .n { color: var(--faint); font-weight: 400; }
+details.sec > summary:hover { color: var(--focus); }
+.small { font-size: 12px; color: var(--muted); padding: 0 14px 10px 30px; }
+.small ul { margin: 0; padding-left: 14px; }
+.small li { margin: 2px 0; }
+.asm { padding: 8px 14px 10px 30px; font-size: 12.5px; }
+.asm + .asm { border-top: 1px dashed var(--line); }
+.asm .top { display: flex; gap: 8px; align-items: baseline; }
+.asm .id { font-family: var(--mono); font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.asm .tag { font-size: 11px; color: var(--faint); margin-left: auto; white-space: nowrap; }
+.asm.denied .tag { color: var(--transactional); } .asm.confirmed .tag { color: var(--str); }
+.asm .txt { margin: 2px 0 0; }
+.asm .acts { margin: 4px 0 0 -8px; display: flex; gap: 2px; flex-wrap: wrap; align-items: center; }
+.asm .flipnote { font-size: 11.5px; color: var(--semantic); margin-left: 6px; }
+.hint { font-size: 11.5px; color: var(--faint); padding: 0 14px 12px 30px; }
+
+/* Status bar: secondary toggles and key hints, out of the way. */
+footer { height: 28px; flex: none; display: flex; align-items: center; gap: 4px; padding: 0 10px; border-top: 1px solid var(--line); background: var(--panel); font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; }
+footer button { font-size: 12px; padding: 1px 7px; }
+footer .keys { display: flex; gap: 12px; align-items: center; color: var(--faint); }
+footer .keys span { display: inline-flex; gap: 4px; align-items: center; }
+#editnote { display: inline-flex; gap: 6px; align-items: center; padding: 0 6px; }
+#editnote::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--str); }
+#editnote.dirty::before { background: var(--semantic); }
+#editnote:empty { display: none; }
+
+/* Review queue */
+#queue { flex: 1; display: none; grid-template-columns: minmax(0, 1fr) 360px; min-height: 0; }
 body.v-queue #queue { display: grid; }
 body.v-queue main, body.v-queue .pair-only { display: none !important; }
-#qmain { overflow: auto; min-height: 0; }
-.filters { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; font-size: 12px; align-items: center; }
-.filters { color: var(--muted); }
-.filters select, .filters input { font: inherit; font-size: 12px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; margin-left: 4px; }
-.filters input { min-width: 180px; }
-table.q { width: calc(100% - 32px); margin: 12px 16px; border-collapse: separate; border-spacing: 0; font-size: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
-table.q tr:last-child td { border-bottom: 0; }
-table.q th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; padding: 6px 10px; border-bottom: 1px solid var(--line); }
-table.q td { padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+#qmain { overflow: auto; min-height: 0; background: var(--panel); }
+.filters { display: flex; flex-wrap: wrap; gap: 6px 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; font-size: 12.5px; align-items: center; color: var(--muted); }
+.seg { display: inline-flex; background: var(--soft); border-radius: 7px; padding: 2px; }
+.seg button { padding: 2px 10px; border-radius: 5px; }
+.seg button[aria-pressed="true"] { background: var(--panel); color: var(--fg); box-shadow: var(--shadow); }
+.seg .n { color: var(--faint); font-weight: 400; }
+.filters select, .filters input { font: inherit; font-size: 12.5px; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 8px; outline: none; }
+.filters input { min-width: 200px; }
+.filters input:focus, .filters select:focus { border-color: var(--focus); }
+.filters .more { flex-basis: 100%; display: flex; gap: 6px 14px; flex-wrap: wrap; padding-top: 2px; }
+table.q { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.q th { text-align: left; font-size: 11.5px; color: var(--faint); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: var(--fh, 49px); background: var(--panel); z-index: 1; }
+table.q td { padding: var(--item-pad) 12px; border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); vertical-align: middle; }
+table.q th:first-child, table.q td:first-child { padding-left: 20px; }
 table.q tr.qrow { cursor: pointer; }
-table.q tr.qrow:hover td { background: var(--soft); }
-table.q tr.qrow.sel td { background: color-mix(in srgb, var(--focus) 8%, var(--panel)); }
+table.q tr.qrow:hover td { background: color-mix(in srgb, var(--soft) 60%, var(--panel)); }
+table.q tr.qrow.sel td { background: var(--soft); }
 table.q tr.qrow.sel td:first-child { box-shadow: inset 3px 0 0 var(--focus); }
-table.q .path { font-family: var(--mono); font-size: 12px; word-break: break-all; }
-table.q .num { text-align: right; font-variant-numeric: tabular-nums; }
-.clsdot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; }
-.rv { font-size: 11px; font-weight: 500; padding: 1px 8px; border-radius: 999px; background: var(--soft); white-space: nowrap; }
-.rv.done { background: var(--add-bg); } .rv.part { background: var(--chg-bg); }
-.unpaired { margin: 12px 16px; font-size: 12px; color: var(--muted); }
-.unpaired code { font-family: var(--mono); }
-.asm { margin: 0 12px 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); font-size: 12.5px; box-shadow: var(--shadow); }
-.asm.denied { border-color: var(--transactional); }
-.asm.confirmed { border-color: var(--str); }
-.asm .id { font-family: var(--mono); font-size: 11.5px; }
-.asm .tag { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
-.asm.denied .tag { color: var(--transactional); } .asm.confirmed .tag { color: var(--str); }
-.asm .acts { margin-top: 4px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.asm .flipnote { font-size: 11.5px; color: var(--semantic); }
-.finding .dec { font-size: 11.5px; margin-top: 4px; }
-.finding .dec .st { font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
-.finding .dec .st.accepted { color: var(--str); } .finding .dec .st.rejected { color: var(--transactional); } .finding .dec .st.commented { color: var(--focus); }
-.finding .racts { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
-.finding .racts button { float: none; margin: 0; }
-.finding textarea { width: 100%; margin-top: 6px; font: 12.5px/1.4 system-ui, sans-serif; background: var(--panel); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
-.finding.accepted { opacity: .65; }
-#palette { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 10; align-items: flex-start; justify-content: center; padding-top: 12vh; }
-#palette.open { display: flex; }
-#palette .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; width: min(620px, calc(100vw - 32px)); box-shadow: 0 10px 40px rgba(0,0,0,.25); overflow: hidden; }
-#palette input { width: 100%; border: 0; border-bottom: 1px solid var(--line); padding: 10px 14px; font: inherit; font-size: 15px; background: var(--panel); color: var(--fg); outline: none; }
-#palette ul { list-style: none; margin: 0; padding: 4px 0; max-height: 50vh; overflow: auto; }
+table.q .name { font-weight: 500; }
+table.q .path { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-top: 1px; word-break: break-all; }
+table.q .num { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+table.q .top { display: inline-flex; gap: 6px; align-items: center; color: var(--fg); text-transform: capitalize; }
+table.q .sev { color: var(--faint); text-transform: none; }
+table.q .none { color: var(--faint); }
+.rv { display: inline-flex; gap: 8px; align-items: center; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.rv .bar { width: 44px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.rv .bar i { display: block; height: 100%; background: var(--str); }
+.rv.done { color: var(--str); }
+.unpaired { margin: 0; }
+.unpaired code { font-family: var(--mono); font-size: 11.5px; display: block; }
+#qside .asm { padding-left: 14px; }
+#qside .intro { font-size: 12px; color: var(--muted); padding: 0 14px 10px; margin: 0; }
+
+/* Dialogs */
+#help, #palette { display: none; position: fixed; inset: 0; background: rgba(15,17,21,.32); z-index: 10; align-items: flex-start; justify-content: center; padding-top: 14vh; }
+#help.open, #palette.open { display: flex; }
+#help > div, #palette .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: var(--pop); overflow: hidden; }
+#help > div { padding: 14px 18px; min-width: 320px; }
+#help h3 { margin: 0 0 8px; font-size: 13px; }
+#help td { padding: 3px 14px 3px 0; font-size: 12.5px; }
+#help td:first-child { white-space: nowrap; }
+#palette .box { width: min(620px, calc(100vw - 32px)); }
+#palette input { width: 100%; border: 0; border-bottom: 1px solid var(--line); padding: 14px 16px; font: inherit; font-size: 15px; background: var(--panel); color: var(--fg); outline: none; }
+#palette ul { list-style: none; margin: 0; padding: 6px 0; max-height: 50vh; overflow: auto; }
 #palette li { margin: 0 6px; border-radius: 6px; padding: 7px 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
-#palette li.sel { background: var(--focus); color: #fff; }
-#palette li kbd { font-family: var(--mono); font-size: 11px; opacity: .7; }
-@media (max-width: 900px) { #queue { grid-template-columns: 1fr; } #queue aside { max-height: 40vh; } }
+#palette li.sel { background: var(--soft); }
+#palette li kbd { flex: none; }
+
+@media (max-width: 900px) {
+  main, #queue { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; } #overview { display: none; }
+  header { height: auto; min-height: 44px; flex-wrap: wrap; padding-top: 6px; padding-bottom: 6px; }
+  #nav .crumb { max-width: 60vw; }
+  aside { border-left: 0; border-top: 1px solid var(--line); max-height: 40vh; }
+  #btn-palette { min-width: 0; } #btn-palette .lbl, footer .keys { display: none; }
+}
 </style>
 </head>
 <body>
 <header>
-  <h1>SQLDiff</h1>
-  <div id="nav"></div>
+  <span class="logo" aria-hidden="true"></span>
+  <nav id="nav"></nav>
   <span id="verdict" class="verdict pair-only"></span>
   <span id="summary" class="pair-only"></span>
   <span class="spacer"></span>
-  <span id="busy"></span>
-  <button id="btn-info" title="Sources, hashes and config layers">Details</button>
-  <button id="btn-palette" title="Command palette (Ctrl+K or :)">⌘K</button>
-  <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
+  <span id="busy" aria-live="polite"></span>
+  <button id="btn-palette" title="Command palette (Ctrl+K or :)"><span class="lbl">Search or run a command…</span><kbd>Ctrl K</kbd></button>
+  <button id="btn-info" class="icon" aria-expanded="false" title="Sources, hashes, config and reports" aria-label="Details">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6.3"/><path d="M8 7.2v3.8M8 5v.1" stroke-linecap="round"/></svg>
+  </button>
+  <div id="provbar"></div>
 </header>
-<div id="provbar"></div>
-<div id="toolbar" class="pair-only">
-  <span id="editnote" title="Edits re-diff live and are never written to the files"></span>
-  <button id="btn-reset" hidden title="Discard edits and re-read the sources">Reset edits</button>
-  <span id="classes"></span>
-  <span class="spacer"></span>
-  <button id="btn-accepted" aria-pressed="false" title="Hide findings accepted in the review store (h)">Hide accepted</button>
-  <button id="btn-fold" aria-pressed="true" title="Collapse unchanged statements (c)">Collapse unchanged</button>
-</div>
 <section id="queue">
   <div id="qmain"></div>
   <aside id="qside"></aside>
@@ -195,21 +274,35 @@ table.q .num { text-align: right; font-variant-numeric: tabular-nums; }
   <div id="overview" title="Location pane: changed rows and findings; click to jump"></div>
   <aside id="side"></aside>
 </main>
+<footer>
+  <span id="editnote" class="pair-only" title="Edits re-diff live and are never written to the files"></span>
+  <button id="btn-reset" class="pair-only" hidden title="Discard edits and re-read the sources">Reset</button>
+  <button id="btn-fold" class="pair-only" aria-pressed="true" title="Collapse unchanged statements (c)">Collapse unchanged</button>
+  <button id="btn-accepted" class="pair-only" aria-pressed="false" title="Hide findings accepted in the review store (h)">Hide accepted</button>
+  <button id="btn-density" aria-pressed="false" title="Compact density (d)">Compact</button>
+  <span class="spacer"></span>
+  <span class="keys" id="keys"></span>
+  <button id="btn-help" title="Keyboard shortcuts (?)"><kbd>?</kbd></button>
+</footer>
 <div id="palette" role="dialog" aria-label="Command palette"><div class="box">
   <input id="pal-in" placeholder="Type a command, a pair or an assumption…" autocomplete="off" spellcheck="false">
   <ul id="pal-list"></ul>
 </div></div>
 <div id="help" role="dialog" aria-label="Keyboard shortcuts"><div>
+  <h3>Keyboard shortcuts</h3>
   <table>
-    <tr><td><kbd>Ctrl</kbd>+<kbd>K</kbd> / <kbd>:</kbd></td><td>Command palette</td></tr>
+    <tr><td><kbd>Ctrl</kbd> <kbd>K</kbd> or <kbd>:</kbd></td><td>Command palette</td></tr>
     <tr><td><kbd>q</kbd></td><td>Review queue</td></tr>
-    <tr><td><kbd>j</kbd> / <kbd>k</kbd></td><td>Next / previous finding (queue: pair)</td></tr>
+    <tr><td><kbd>j</kbd> <kbd>k</kbd></td><td>Next / previous finding (queue: pair)</td></tr>
     <tr><td><kbd>Enter</kbd></td><td>Open selected pair</td></tr>
-    <tr><td><kbd>]</kbd> / <kbd>[</kbd></td><td>Next / previous changed row</td></tr>
-    <tr><td><kbd>a</kbd> / <kbd>x</kbd> / <kbd>m</kbd></td><td>Accept / reject / comment focused finding</td></tr>
+    <tr><td><kbd>/</kbd></td><td>Filter pairs (queue)</td></tr>
+    <tr><td><kbd>]</kbd> <kbd>[</kbd></td><td>Next / previous changed row</td></tr>
+    <tr><td><kbd>a</kbd> <kbd>x</kbd> <kbd>m</kbd></td><td>Accept / reject / comment focused finding</td></tr>
+    <tr><td><kbd>y</kbd></td><td>Copy focused finding as text</td></tr>
     <tr><td><kbd>h</kbd></td><td>Hide or show accepted findings</td></tr>
     <tr><td><kbd>c</kbd></td><td>Collapse or expand unchanged</td></tr>
-    <tr><td><kbd>y</kbd></td><td>Copy focused finding as text</td></tr>
+    <tr><td><kbd>d</kbd></td><td>Compact or comfortable density</td></tr>
+    <tr><td><kbd>i</kbd></td><td>Details: sources, hashes, config</td></tr>
     <tr><td><kbd>r</kbd></td><td>Re-read sources</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>Close</td></tr>
   </table>
@@ -223,13 +316,21 @@ const VERD = { different: 3, unknown: 2, equal_under_assumptions: 1, equal: 0 };
 const state = {
   page: null, live: false, view: "queue", cur: -1, data: null,
   fold: true, hidden: new Set(), focus: -1, expanded: new Set(), rowFocus: -1, hideAccepted: false,
-  scratchDirty: false, commenting: -1, src: ["", ""],
-  q: { cls: "", dialects: "", folder: "", review: "", text: "", sort: "severity" }, qsel: 0,
+  // The comment being written: { fp, text, grab }, keyed by fingerprint so re-diffs cannot move it to another finding.
+  scratchDirty: false, comment: null, src: ["", ""],
+  q: { cls: "", dialects: "", folder: "", review: "", text: "", sort: "severity" }, qsel: 0, qmore: false,
+  // Side-panel sections that are expanded; everything else stays folded away.
+  open: new Set(["asm"]),
+};
+const store = {
+  get(k) { try { return localStorage.getItem("sqldiff." + k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem("sqldiff." + k, v); } catch (e) { /* private window */ } },
 };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const clsColor = (c) => `var(--${CLASS_ORDER.includes(c) ? c : "structural"})`;
 const label = (s) => String(s || "").replace(/_/g, " ");
+const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 async function api(method, path, body) {
   const res = await fetch(path, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
@@ -255,9 +356,21 @@ async function setReview(i, st, comment) {
   if (!state.live) return;
   const f = state.data.report.findings[i];
   try {
+    // Triage flow: deciding the focused finding moves on to the next open one. Held by fingerprint,
+    // since a re-diff during the request can replace and reorder the findings.
+    const open = orderedFindings().open.map(({ f: g }) => g.fingerprint);
+    const at = open.indexOf(f.fingerprint);
+    const advance = (st === "accepted" || st === "rejected") && state.focus === i && at >= 0;
+    const nextFp = advance ? (open[at + 1] ?? open[at - 1] ?? null) : null;
     applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot: state.data.snapshot, state: st, comment: comment == null ? null : comment }));
-    state.commenting = -1;
+    if (state.comment && state.comment.fp === f.fingerprint) state.comment = null;
+    // Advance only if focus is still on the decided finding (the user may have moved on meanwhile).
+    const fs = state.data.report.findings;
+    const stillThere = state.focus >= 0 && fs[state.focus] && fs[state.focus].fingerprint === f.fingerprint;
+    const next = advance && stillThere ? (nextFp ? fs.findIndex((g) => g.fingerprint === nextFp) : -1) : null;
+    if (next != null) state.focus = next;
     renderSide(); renderPane(); renderHeader();
+    if (next != null && next >= 0) focusFinding(next, true);
     flash(st ? st : "cleared");
   } catch (e) { flash("error: " + e.message); }
 }
@@ -277,7 +390,7 @@ async function setFlip(id, flip) {
 function applySession(x) { state.page.session = x.session; state.page.queue = x.queue; }
 
 function asmCard(a, pairScope) {
-  const tag = a.flip === "open" ? ({ declared: "declared", composed_output: "proven from composed output", author: "author-declared" }[a.source] || "open (tool default)") : a.flip;
+  const tag = a.flip === "open" ? ({ declared: "declared", composed_output: "proven from composed output", author: "author-declared" }[a.source] || "tool default") : a.flip;
   const btn = (flip, text) => `<button data-flip="${flip}" data-id="${esc(a.id)}" ${state.live ? "" : "disabled"}>${text}</button>`;
   const acts = a.flip === "open" ? btn("denied", "Deny") + btn("confirmed", "Confirm") : btn("open", "Reset");
   const n = a.flips_verdict.length;
@@ -285,9 +398,16 @@ function asmCard(a, pairScope) {
     ? (n ? `verdict changed in ${n} pair${n === 1 ? "" : "s"}` : "")
     : (n ? `denying it changes the verdict of ${n} pair${n === 1 ? "" : "s"}` : "");
   const pairs = !pairScope && a.pairs.length ? ` · used by ${a.pairs.length} pair${a.pairs.length === 1 ? "" : "s"}` : "";
-  return `<div class="asm ${a.flip}"><div><span class="tag">${esc(tag)}</span> <span class="id">${esc(a.id)}</span>${pairs}</div>
-    <div>${esc(a.text || "(no longer used by any pair)")}</div>
+  return `<div class="asm ${a.flip}"><div class="top"><span class="id" title="${esc(a.id)}">${esc(a.id)}</span><span class="tag">${esc(tag)}${esc(pairs)}</span></div>
+    <p class="txt">${esc(a.text || "(no longer used by any pair)")}</p>
     <div class="acts">${acts}${note ? `<span class="flipnote">${esc(note)}</span>` : ""}</div></div>`;
+}
+// A folded side-panel section; its open state survives re-renders.
+function section(key, title, n, body) {
+  return `<details class="sec" data-sec="${key}" ${state.open.has(key) ? "open" : ""}><summary>${title}${n != null ? ` <span class="n">${n}</span>` : ""}</summary>${body}</details>`;
+}
+function wireSections(root) {
+  for (const d of root.querySelectorAll("details[data-sec]")) d.ontoggle = () => { d.open ? state.open.add(d.dataset.sec) : state.open.delete(d.dataset.sec); };
 }
 function wireFlips(root) {
   for (const b of root.querySelectorAll("button[data-flip]")) b.onclick = (e) => { e.stopPropagation(); setFlip(b.dataset.id, b.dataset.flip); };
@@ -297,21 +417,27 @@ function wireFlips(root) {
 function renderProv() {
   const s = state.page.session;
   const o = s.origin;
-  const parts = [`<span>${o.kind === "trees" ? "trees" : "files"} <code>${esc(o.a)}</code> ↔ <code>${esc(o.b)}</code></span>`];
-  parts.push(`<span title="When the sources were read">snapshot ${esc(s.loaded_at.replace("T", " ").replace("Z", " UTC"))}</span>`);
+  const kv = (k, v) => `<div class="kv"><span class="k">${k}</span><span>${v}</span></div>`;
+  const parts = [kv(o.kind === "trees" ? "Trees" : "Files", `<code>${esc(o.a)}</code><br><code>${esc(o.b)}</code>`)];
+  parts.push(kv("Snapshot", esc(s.loaded_at.replace("T", " ").replace("Z", " UTC"))));
   if (state.view === "pair" && state.data) {
     const r = state.data.report;
-    const side = (x, n) => x ? `<span>${n} ${esc(x.dialect)} ${esc(x.dialect_version)} <code title="content hash ${esc(x.content_hash)}">${esc(x.content_hash.slice(0, 8))}</code></span>` : "";
+    const side = (x, n) => x ? kv(`Side ${n}`, `${esc(x.dialect)} ${esc(x.dialect_version)} · <code title="content hash ${esc(x.content_hash)}">${esc(x.content_hash.slice(0, 8))}</code>`) : "";
     parts.push(side(r.a, "A") + side(r.b, "B"));
   } else {
-    parts.push(`<span>${Object.entries(s.dialect_versions).map(([d, v]) => `${esc(d)} ${esc(v)}`).join(" · ")}</span>`);
+    parts.push(kv("Dialects", Object.entries(s.dialect_versions).map(([d, v]) => `${esc(d)} ${esc(v)}`).join(" · ")));
   }
-  const layers = s.layers.length ? s.layers.map((l) => `<span class="layer" title="${esc(l.kind)} · ${esc(l.hash)}">${esc(l.name)}${l.version ? " " + esc(l.version) : ""} <code>${esc(l.hash.slice(0, 8))}</code></span>`).join(" ") : "<span>built-in config</span>";
-  parts.push(`<span>config ${layers}</span>`);
-  parts.push(`<span>sqldiff ${esc(s.tool_version)}${state.live ? "" : " · static export"}</span>`);
-  if (state.live) parts.push(`<button id="btn-refresh" title="Re-read the sources (r)">Refresh</button> <a href="/api/report" target="_blank">Report</a> <a href="/api/report?redact=1" target="_blank">Redacted report</a>`);
+  const layers = s.layers.length ? s.layers.map((l) => `<span class="layer" title="${esc(l.kind)} · ${esc(l.hash)}">${esc(l.name)}${l.version ? " " + esc(l.version) : ""} <code>${esc(l.hash.slice(0, 8))}</code></span>`).join("") : "built-in";
+  parts.push(kv("Config", layers));
+  parts.push(kv("Tool", `sqldiff ${esc(s.tool_version)}${state.live ? "" : " · static export"}`));
+  if (state.live) parts.push(`<div class="acts"><button id="btn-refresh" title="Re-read the sources (r)">Re-read sources <kbd>r</kbd></button><a href="/api/report" target="_blank">Report ↗</a><a href="/api/report?redact=1" target="_blank">Redacted report ↗</a></div>`);
   $("provbar").innerHTML = parts.join("");
   if ($("btn-refresh")) $("btn-refresh").onclick = refresh;
+}
+function toggleInfo(on) {
+  const open = on == null ? !document.body.classList.contains("show-info") : on;
+  document.body.classList.toggle("show-info", open);
+  $("btn-info").setAttribute("aria-expanded", open);
 }
 async function refresh() {
   if (!state.live) return;
@@ -331,8 +457,9 @@ function reviewState(e) {
   if (e.reviewed >= e.findings) return "reviewed";
   return e.reviewed ? "partial" : "unreviewed";
 }
-function queueRows() {
-  const q = state.q;
+// Rows matching the filters; `review` overrides the review filter (for the segment counts).
+function queueRows(review = state.q.review) {
+  const q = { ...state.q, review };
   const text = q.text.toLowerCase();
   const rows = state.page.queue.filter((e) =>
     (!q.cls || e.highest_class === q.cls) &&
@@ -348,46 +475,78 @@ function queueRows() {
   }[q.sort];
   return rows.sort((x, y) => { const a = key(x), b = key(y); for (let k = 0; k < a.length; k++) { if (a[k] < b[k]) return -1; if (a[k] > b[k]) return 1; } return x.index - y.index; });
 }
+// Display name of a pair: the shared file stem, without directory or dialect suffix.
+function pairName(e) {
+  const stem = (p) => String(p || "").split(/[\\/]/).pop().replace(/(\.(tsql|pg|pgsql|postgres|db2i?|mssql|sql))+$/i, "");
+  const a = stem(e.a), b = stem(e.b);
+  return a === b || !b ? a : `${a} ↔ ${b}`;
+}
+const dirOf = (p) => { const k = String(p || "").search(/[\\/][^\\/]*$/); return k < 0 ? "" : p.slice(0, k + 1); };
 function renderQueue() {
   const all = state.page.queue;
   const uniq = (f) => [...new Set(all.map(f).filter(Boolean))].sort();
   const opt = (v, cur, text) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(text || v || "all")}</option>`;
   const q = state.q;
+  // Calm default: a search box and one segmented control. Rarer filters sit behind "Filters".
+  const count = (r) => queueRows(r).length;
+  const segs = [["", "All"], ["open", "Needs review"], ["reviewed", "Reviewed"], ["clean", "Clean"]];
+  if (all.some((e) => e.error)) segs.push(["error", "Errors"]);
+  if (q.review && !segs.some(([v]) => v === q.review)) segs.push([q.review, label(q.review)]);
+  const seg = `<span class="seg" role="group" aria-label="Review state">${segs.map(([v, t]) => `<button data-seg="${v}" aria-pressed="${q.review === v}">${t} <span class="n">${count(v)}</span></button>`).join("")}</span>`;
+  const sel = (key, name, values) => values.length > 1 || q[key] ? `<label>${name} <select data-q="${key}">${values.join("")}</select></label>` : "";
+  const narrowed = [q.cls, q.dialects, q.folder].filter(Boolean).length;
+  const more = state.qmore ? `<div class="more">
+    ${sel("cls", "Class", [opt("", q.cls), ...CLASS_ORDER.filter((c) => all.some((e) => e.highest_class === c)).map((c) => opt(c, q.cls))])}
+    ${sel("dialects", "Dialects", [opt("", q.dialects), ...uniq((e) => e.dialect_a && `${e.dialect_a} → ${e.dialect_b}`).map((d) => opt(d, q.dialects))])}
+    ${sel("folder", "Folder", [opt("", q.folder), ...uniq((e) => e.folder).map((d) => opt(d, q.folder))])}
+    <label>Sort <select data-q="sort">${[["severity", "severity"], ["verdict", "verdict"], ["findings", "open findings"], ["path", "path"]].map(([v, t]) => opt(v, q.sort, t)).join("")}</select></label>
+  </div>` : "";
   const filters = `<div class="filters">
-    <label>class <select data-q="cls">${opt("", q.cls)}${CLASS_ORDER.filter((c) => all.some((e) => e.highest_class === c)).map((c) => opt(c, q.cls)).join("")}</select></label>
-    <label>dialects <select data-q="dialects">${opt("", q.dialects)}${uniq((e) => e.dialect_a && `${e.dialect_a} → ${e.dialect_b}`).map((d) => opt(d, q.dialects)).join("")}</select></label>
-    <label>folder <select data-q="folder">${opt("", q.folder)}${uniq((e) => e.folder).map((d) => opt(d, q.folder)).join("")}</select></label>
-    <label>review <select data-q="review">${["", "open", "unreviewed", "partial", "reviewed", "clean", "error"].map((v) => opt(v, q.review)).join("")}</select></label>
-    <label>sort <select data-q="sort">${[["severity", "severity"], ["verdict", "verdict"], ["findings", "open findings"], ["path", "path"]].map(([v, t]) => opt(v, q.sort, t)).join("")}</select></label>
-    <input data-q="text" placeholder="filter paths" value="${esc(q.text)}">
+    <input data-q="text" placeholder="Filter pairs  /" value="${esc(q.text)}" aria-label="Filter pairs">
+    ${seg}<span class="spacer"></span>
+    <button id="btn-qmore" aria-pressed="${state.qmore}">Filters${narrowed ? ` · ${narrowed}` : ""}</button>
+    ${more}
   </div>`;
   const rows = queueRows();
+  const showDirs = new Set(all.map((e) => dirOf(e.a) + "|" + dirOf(e.b))).size > 1;
   state.qsel = Math.min(state.qsel, Math.max(rows.length - 1, 0));
   const body = rows.map((e, k) => {
     const rs = reviewState(e);
-    return `<tr class="qrow ${k === state.qsel ? "sel" : ""}" data-i="${e.index}" data-k="${k}">
-      <td><span class="verdict ${esc(e.verdict || "unknown")}">${esc(e.error ? "error" : label(e.verdict))}</span></td>
-      <td>${e.highest_class ? `<span class="clsdot" style="background:${clsColor(e.highest_class)}"></span>${esc(e.highest_class)}` : "–"}</td>
-      <td>${esc(e.severity || "–")}</td>
-      <td class="num">${e.findings}</td>
-      <td><span class="rv ${rs === "reviewed" ? "done" : rs === "partial" ? "part" : ""}">${esc(rs)}${e.findings ? ` ${e.reviewed}/${e.findings}` : ""}</span></td>
-      <td class="path">${esc(e.a)}<br>${esc(e.b)}${e.error ? `<br><span style="color:var(--err)">${esc(e.error)}</span>` : ""}</td>
+    const da = dirOf(e.a), db = dirOf(e.b);
+    const pct = e.findings ? Math.round(100 * e.reviewed / e.findings) : 0;
+    const rv = !e.findings ? `<span class="rv">${rs === "error" ? "–" : "nothing to review"}</span>`
+      : `<span class="rv ${rs === "reviewed" ? "done" : ""}"><span class="bar"><i style="width:${pct}%"></i></span>${e.reviewed}/${e.findings}</span>`;
+    return `<tr class="qrow ${k === state.qsel ? "sel" : ""}" data-i="${e.index}" data-k="${k}" title="${esc(e.a)} ↔ ${esc(e.b)}">
+      <td><div class="name">${esc(pairName(e))}</div>${showDirs && (da || db) ? `<div class="path">${esc(da)} ↔ ${esc(db)}</div>` : ""}${e.error ? `<div class="path" style="color:var(--err)">${esc(e.error)}</div>` : ""}</td>
+      <td><span class="verdict ${esc(e.error ? "error" : e.verdict || "unknown")}">${esc(e.error ? "Error" : cap(label(e.verdict)))}</span></td>
+      <td>${e.highest_class ? `<span class="top"><span class="dot" style="background:${clsColor(e.highest_class)}"></span>${esc(e.highest_class)}<span class="sev">· ${esc(e.severity || "")}</span></span>` : `<span class="none">–</span>`}</td>
+      <td class="num">${e.findings || ""}</td>
+      <td>${rv}</td>
     </tr>`;
   }).join("");
   const s = state.page.session;
-  const list = (title, xs) => xs.length ? `<div class="unpaired"><b>${title}</b> (${xs.length})<br>${xs.map((x) => `<code>${esc(x)}</code>`).join("<br>")}</div>` : "";
-  $("qmain").innerHTML = filters + `<table class="q"><thead><tr><th>verdict</th><th>highest</th><th>severity</th><th class="num">findings</th><th>review</th><th>pair</th></tr></thead><tbody>${body || `<tr><td colspan="6" class="empty-note">No pairs match the filters.</td></tr>`}</tbody></table>`
+  const list = (title, xs) => xs.length ? section("u-" + title, title, xs.length, `<div class="small unpaired">${xs.map((x) => `<code>${esc(x)}</code>`).join("")}</div>`) : "";
+  $("qmain").innerHTML = filters + `<table class="q"><thead><tr><th>Pair</th><th>Verdict</th><th>Top finding</th><th class="num">Findings</th><th>Reviewed</th></tr></thead><tbody>${body || `<tr><td colspan="5" class="empty-note">No pairs match.</td></tr>`}</tbody></table>`
     + list("Only in A", s.only_a) + list("Only in B", s.only_b)
     + list("Ambiguous", s.ambiguous.map((a) => `${a.side}: ${a.ids.join(", ")}`)) + list("No dialect", s.no_dialect);
   for (const el of $("qmain").querySelectorAll("[data-q]")) {
     el.oninput = () => { state.q[el.dataset.q] = el.value; state.qsel = 0; renderQueue(); if (el.tagName === "INPUT") { const n = $("qmain").querySelector("input[data-q]"); n.focus(); n.setSelectionRange(n.value.length, n.value.length); } };
   }
+  for (const el of $("qmain").querySelectorAll("button[data-seg]")) el.onclick = () => { state.q.review = el.dataset.seg; state.qsel = 0; renderQueue(); };
+  $("btn-qmore").onclick = () => { state.qmore = !state.qmore; renderQueue(); };
+  syncFilterHeight();
   for (const el of $("qmain").querySelectorAll("tr.qrow")) el.onclick = () => openPair(+el.dataset.i);
+  wireSections($("qmain"));
   // Session-wide assumption panel.
   const asm = s.assumptions;
-  $("qside").innerHTML = `<h2>Assumptions</h2>` + (asm.length ? asm.map((a) => asmCard(a, false)).join("") : `<p class="empty-note">No pair relies on an assumption.</p>`)
-    + `<p class="small">Deny an assumption to see what it was holding up: every finding and verdict relying on it drops to unknown. Flips last for this session only.</p>`;
+  $("qside").innerHTML = `<div class="sh"><h2>Assumptions<span class="n">${asm.length}</span></h2></div>`
+    + (asm.length ? `<p class="intro">Deny one to see what it holds up: every finding and verdict relying on it drops to unknown. Flips last for this session.</p>` + asm.map((a) => asmCard(a, false)).join("") : `<p class="empty-note">No pair relies on an assumption.</p>`);
   wireFlips($("qside"));
+}
+// The table header sticks just below the filter bar, whose height changes with Filters and with the width.
+function syncFilterHeight() {
+  const bar = $("qmain").querySelector(".filters");
+  if (bar) $("qmain").style.setProperty("--fh", bar.offsetHeight + "px");
 }
 function stepQueue(d) {
   const n = queueRows().length;
@@ -407,7 +566,7 @@ async function loadPair(i, keepFocus) {
   state.data = data;
   state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
   if (!keepFocus) {
-    state.expanded.clear(); state.rowFocus = -1; state.scratchDirty = false;
+    state.expanded.clear(); state.rowFocus = -1; state.scratchDirty = false; state.comment = null;
     syncEditors(data);
   }
 }
@@ -416,7 +575,8 @@ function syncEditors(data) {
   state.src = data.sources.map((t) => t.replace(/\r\n?/g, "\n"));
   state.scratchDirty = false;
   $("btn-reset").hidden = true;
-  $("editnote").textContent = state.live ? "● live editing: click any code to edit; nothing is saved to disk" : "";
+  $("editnote").classList.remove("dirty");
+  $("editnote").textContent = state.live ? "Live editing · click any code to edit, nothing is saved to disk" : "";
 }
 async function openPair(i, fp) {
   try {
@@ -439,18 +599,33 @@ function showQueue() {
 }
 
 // ---------- pair view ----------
-function visibleFindings() {
-  return state.data.report.findings.map((f, i) => ({ f, i })).filter(({ f }) => !state.hidden.has(f.class) && !(state.hideAccepted && isAccepted(f)));
+// Accepted or rejected on the current snapshot: off the to-do list. A comment alone keeps it open.
+function isDone(f) {
+  const x = decision(f.fingerprint, state.data.snapshot);
+  return !!(x && x.current && (x.d.state === "accepted" || x.d.state === "rejected"));
 }
+function orderedFindings() {
+  const all = state.data.report.findings.map((f, i) => ({ f, i })).filter(({ f }) => !state.hidden.has(f.class) && !(state.hideAccepted && isAccepted(f)));
+  return { open: all.filter(({ f }) => !isDone(f)), done: all.filter(({ f }) => isDone(f)) };
+}
+// In list order: open findings first, then reviewed ones.
+function visibleFindings() { const { open, done } = orderedFindings(); return [...open, ...done]; }
 
 function renderNav() {
   const multi = state.page.queue.length > 1;
-  let html = multi ? `<button id="btn-queue" ${state.view === "queue" ? 'aria-pressed="true"' : ""} title="Review queue (q)">Queue ${state.page.queue.length}</button>` : "";
-  if (state.view === "pair" && state.data) {
+  const pair = state.view === "pair" && state.data;
+  let html = "";
+  if (multi) html += pair
+    ? `<button id="btn-queue" title="Review queue (q)">Queue<span class="count">${state.page.queue.length}</span></button><span class="sep">/</span>`
+    : `<span class="crumb">Review queue<span class="count">${state.page.queue.length} pairs</span></span>`;
+  if (pair) {
     const r = state.data.report;
-    html += `<span class="crumb" title="${esc(r.a.path)} ↔ ${esc(r.b ? r.b.path : "")}">${esc(r.a.path)} ↔ ${esc(r.b ? r.b.path : "")}</span>`;
-    if (multi) html += `<button id="btn-prevpair" title="Previous pair in the queue order">‹</button><button id="btn-nextpair" title="Next pair in the queue order">›</button>`;
+    const e = state.page.queue[state.cur];
+    const name = e ? pairName(e) : r.a.path;
+    html += `<span class="crumb" title="${esc(r.a.path)} ↔ ${esc(r.b ? r.b.path : "")}">${esc(name)}</span>`;
+    if (multi) html += `<button id="btn-prevpair" class="icon" title="Previous pair in the queue order" aria-label="Previous pair">‹</button><button id="btn-nextpair" class="icon" title="Next pair in the queue order" aria-label="Next pair">›</button>`;
   }
+  if (!multi && !pair) html = `<span class="crumb">SQLDiff</span>`;
   $("nav").innerHTML = html;
   if ($("btn-queue")) $("btn-queue").onclick = showQueue;
   if ($("btn-prevpair")) $("btn-prevpair").onclick = () => stepPair(-1);
@@ -465,24 +640,34 @@ function stepPair(d) {
 
 function renderHeader() {
   renderNav();
+  renderKeys();
   if (state.view !== "pair" || !state.data) return;
   const r = state.data.report;
   const v = $("verdict");
   v.className = "verdict pair-only " + r.verdict;
-  v.textContent = label(r.verdict);
+  v.textContent = cap(label(r.verdict));
   const n = r.findings.length;
   const acc = r.findings.filter(isAccepted).length;
   const hid = r.noise.cosmetic + r.noise.structural;
-  $("summary").textContent = `${n} finding${n === 1 ? "" : "s"}${acc ? `, ${acc} accepted` : ""}${hid ? ` · ${hid} cosmetic/structural hidden` : ""}`;
-  const counts = {};
-  for (const f of r.findings) counts[f.class] = (counts[f.class] || 0) + 1;
-  $("classes").innerHTML = CLASS_ORDER.filter((c) => counts[c]).map((c) =>
-    `<button class="chip ${state.hidden.has(c) ? "off" : ""}" data-cls="${c}" title="Show or hide ${c} findings"><span class="dot" style="background:${clsColor(c)}"></span>${c} ${counts[c]}</button>`).join(" ");
-  for (const b of $("classes").querySelectorAll("button")) b.onclick = () => toggleClass(b.dataset.cls);
+  $("summary").textContent = `· ${n} finding${n === 1 ? "" : "s"}${acc ? `, ${acc} accepted` : ""}${hid ? ` · ${hid} noise hidden` : ""}`;
+  $("summary").title = hid ? `${hid} cosmetic or structural difference${hid === 1 ? "" : "s"} hidden as noise` : "";
   $("btn-accepted").setAttribute("aria-pressed", state.hideAccepted);
+  $("btn-fold").setAttribute("aria-pressed", state.fold);
+}
+// Key hints in the status bar: the few keys that matter in this view.
+function renderKeys() {
+  const k = (keys, text) => `<span>${keys.map((x) => `<kbd>${x}</kbd>`).join("")} ${text}</span>`;
+  $("keys").innerHTML = state.view === "pair"
+    ? k(["j", "k"], "findings") + k(["[", "]"], "changes") + (state.live ? k(["a"], "accept") + k(["x"], "reject") : "") + (state.page.queue.length > 1 ? k(["q"], "queue") : "")
+    : k(["j", "k"], "move") + k(["↵"], "open") + k(["/"], "filter");
 }
 function toggleClass(c) { state.hidden.has(c) ? state.hidden.delete(c) : state.hidden.add(c); render(); }
 function toggleAccepted() { state.hideAccepted = !state.hideAccepted; render(); }
+function setDensity(compact) {
+  document.body.classList.toggle("compact", compact);
+  $("btn-density").setAttribute("aria-pressed", compact);
+  store.set("density", compact ? "compact" : "comfortable");
+}
 
 function blockHtml(blk, side) {
   if (!blk) return `<div class="cell ${side} empty"><div class="ln"></div><div class="code"></div></div>`;
@@ -495,8 +680,11 @@ function blockHtml(blk, side) {
     });
   }
   if (lines.length > 1 && lines[lines.length - 1].length === 0) lines.pop();
+  let marked = 0, total = 0;
+  for (const [text, , mark] of blk.segs) { const n = text.replace(/\s/g, "").length; total += n; if (mark === 1 || mark === 2) marked += n; }
+  const dense = total && marked / total > 0.5 ? " dense" : "";
   const nums = lines.map((_, k) => blk.lines[0] + k).join("\n");
-  return `<div class="cell ${side}"><div class="ln">${nums}</div><div class="code"${state.live ? ` contenteditable="plaintext-only" spellcheck="false" data-side="${side === "a" ? 0 : 1}" data-start="${blk.lines[0]}" data-end="${blk.lines[1]}"` : ""}>${lines.map((l) => l.join("")).join("\n")}</div></div>`;
+  return `<div class="cell ${side}${dense}"><div class="ln">${nums}</div><div class="code"${state.live ? ` contenteditable="plaintext-only" spellcheck="false" data-side="${side === "a" ? 0 : 1}" data-start="${blk.lines[0]}" data-end="${blk.lines[1]}"` : ""}>${lines.map((l) => l.join("")).join("\n")}</div></div>`;
 }
 
 function rowFindings(row) {
@@ -508,14 +696,15 @@ function rowFindings(row) {
 function renderPane() {
   const r = state.data.report;
   const rows = state.data.view.rows;
-  const out = [`<div class="cols"><div>A · ${esc(r.a.path)}</div><div></div><div>B · ${esc(r.b ? r.b.path : "")}</div></div>`];
+  const side = (x, n) => x ? `<div title="${esc(x.path)}"><b>${n}</b>${esc(x.path)}<span style="color:var(--faint)"> · ${esc(x.dialect)}</span></div>` : "<div></div>";
+  const out = [`<div class="cols">${side(r.a, "A")}<div></div>${side(r.b, "B")}</div>`];
   let i = 0;
   while (i < rows.length) {
     // Runs of unchanged rows with no findings fold into one line.
     let j = i;
     while (j < rows.length && rows[j].kind === "same" && rowFindings(rows[j]).length === 0) j++;
     if (state.fold && j - i >= 3 && !state.expanded.has(i)) {
-      out.push(`<div class="fold" data-fold="${i}">⋯ ${j - i} unchanged rows (A ${rows[i].a.lines[0]}–${rows[j - 1].a.lines[1]}, B ${rows[i].b.lines[0]}–${rows[j - 1].b.lines[1]}) · click to expand</div>`);
+      out.push(`<div class="fold" data-fold="${i}">${j - i} unchanged statements <span style="opacity:.7">A ${rows[i].a.lines[0]}–${rows[j - 1].a.lines[1]} · B ${rows[i].b.lines[0]}–${rows[j - 1].b.lines[1]}</span></div>`);
       i = j;
       continue;
     }
@@ -562,68 +751,99 @@ function gotoRow(k) {
   if (el) { el.classList.add("focus"); el.scrollIntoView({ block: "center", behavior: "smooth" }); }
 }
 
-function locText(l) { return l ? `${l.side.toUpperCase()} ${l.start_line}:${l.start_col}` : ""; }
 
 function findingCard(f, i, asm) {
-  const as = f.assumptions.map((id) => `<abbr title="${esc(asm[id] ? asm[id].text : id)}">${esc(id)}</abbr>`).join(" ");
   const x = decision(f.fingerprint, state.data.snapshot);
-  const dec = x ? `<div class="dec"><span class="st ${esc(x.d.state)}">${esc(x.d.state)}</span>${x.current ? "" : " on an earlier snapshot"} · ${esc(x.d.at.replace("T", " ").replace("Z", ""))}${x.d.comment ? ` · “${esc(x.d.comment)}”` : ""}</div>` : "";
-  const dis = state.live ? "" : "disabled";
   const cur = x && x.current ? x.d.state : null;
+  const mark = { accepted: "✓ Accepted", rejected: "✕ Rejected", commented: "Commented" };
+  const tag = x ? `<span class="tag ${x.current ? esc(x.d.state) : ""}" title="${x.current ? "" : "Decided on an earlier snapshot"}">${esc(mark[x.d.state] || cap(x.d.state))}${x.current ? "" : " (earlier)"}</span>` : "";
+  const dec = x && (x.d.comment || !x.current) ? `<div class="dec">${x.current ? "" : `${esc(cap(x.d.state))} on an earlier snapshot · `}${x.d.comment ? `“${esc(x.d.comment)}”` : ""}</div>` : "";
+  const dis = state.live ? "" : "disabled";
   const acts = `<div class="racts">
-      <button data-rv="accepted" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept (a)">Accept</button>
-      <button data-rv="rejected" ${dis} aria-pressed="${cur === "rejected"}" title="Needs a fix: reject (x)">Reject</button>
-      <button data-rv="comment" ${dis} title="Comment (m)">Comment</button>
-      ${x && x.current ? `<button data-rv="clear" ${dis}>Clear</button>` : ""}
+      <button data-rv="accepted" class="outline" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept and go to the next open finding">Accept <kbd>a</kbd></button>
+      <button data-rv="rejected" ${dis} aria-pressed="${cur === "rejected"}" title="Needs a fix: reject and go to the next open finding">Reject <kbd>x</kbd></button>
+      <button data-rv="comment" ${dis} title="Comment">Comment <kbd>m</kbd></button>
+      ${x && x.current ? `<button data-rv="clear" ${dis} title="Undo the decision">Undo</button>` : ""}
     </div>`;
-  const box = state.commenting === i ? `<textarea id="cmt-${i}" rows="2" placeholder="Comment, Ctrl+Enter to save">${esc(x && x.current && x.d.comment || "")}</textarea>` : "";
-  return `<div class="finding ${state.focus === i ? "focus" : ""} ${cur === "accepted" ? "accepted" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
-      <button data-copy="${i}" title="Copy as text (y)">Copy</button>
-      <div class="head"><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)} · ${esc(label(f.verdict))}</span><span class="rule">${esc(f.rule)}</span></div>
+  const editing = !!(state.comment && state.comment.fp === f.fingerprint);
+  const box = editing ? `<textarea id="cmt-${i}" rows="2" placeholder="Comment, Ctrl+Enter to save">${esc(state.comment.text)}</textarea>` : "";
+  // Where it is, in the short form shown on the right of every item.
+  const at = [f.a, f.b].filter(Boolean).map((l) => `${l.side.toUpperCase()} ${l.start_line}`).join(" · ");
+  const assumes = f.assumptions.map((id) => `<li title="${esc(id)}">${esc(asm[id] && asm[id].text ? asm[id].text : id)}</li>`).join("");
+  return `<div class="finding ${state.focus === i ? "focus" : ""} ${editing ? "commenting" : ""} ${cur === "accepted" || cur === "rejected" ? "done" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
+      <div class="head"><span class="dot" style="background:var(--fc)"></span><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)}</span>${tag}<span class="at">${esc(at)}</span></div>
       <p>${esc(f.witness)}</p>
-      <div class="meta"><span class="loc">${esc([locText(f.a), locText(f.b)].filter(Boolean).join(" ↔ "))}</span>${as ? `<span>assumes ${as}</span>` : ""}<span class="loc">${esc(f.fingerprint)}</span></div>
+      ${assumes ? `<div class="assumes"><span class="k">Holds only if</span><ul>${assumes}</ul></div>` : ""}
       ${dec}${acts}${box}
+      <div class="meta"><span class="loc" title="Rule">${esc(f.rule)}</span><span class="loc" title="Fingerprint">${esc(f.fingerprint)}</span><span>${esc(label(f.verdict))}</span><button data-copy="${i}" title="Copy as text (y)">Copy</button></div>
     </div>`;
 }
 
 function renderSide() {
   const r = state.data.report;
-  const fs = visibleFindings();
+  const { open, done } = orderedFindings();
+  const fs = [...open, ...done];
   const asm = Object.fromEntries(r.assumptions.map((a) => [a.id, a]));
-  const parts = [`<h2>Findings</h2>`];
-  if (!fs.length) parts.push(`<p class="empty-note">${r.findings.length ? "All findings are hidden by the filters." : "No findings."}</p>`);
-  for (const { f, i } of fs) parts.push(findingCard(f, i, asm));
-  // Assumption panel: what this pair relies on, with session flips.
+  const counts = {};
+  for (const f of r.findings) counts[f.class] = (counts[f.class] || 0) + 1;
+  const classes = CLASS_ORDER.filter((c) => counts[c]);
+  const reviewed = r.findings.filter(isDone).length;
+  const n = r.findings.length;
+  const parts = [`<div class="sh"><h2>Findings<span class="n">${fs.length === n ? n : `${fs.length} of ${n}`}</span></h2>${n ? `<span class="progress" title="${reviewed} of ${n} accepted or rejected"><span class="bar"><i style="width:${Math.round(100 * reviewed / n)}%"></i></span>${reviewed}/${n} reviewed</span>` : ""}</div>`];
+  // Class filter only earns its space when there is more than one class to tell apart.
+  if (classes.length > 1 || state.hidden.size) parts.push(`<div id="classes">${classes.map((c) =>
+    `<button class="chip ${state.hidden.has(c) ? "off" : ""}" data-cls="${c}" title="Show or hide ${c} findings"><span class="dot" style="background:${clsColor(c)}"></span>${c} ${counts[c]}</button>`).join("")}</div>`);
+  const hiddenOpen = n - reviewed - open.length;
+  if (!n) parts.push(`<p class="empty-note">No findings. Nothing to review here.</p>`);
+  else if (reviewed === n) parts.push(`<p class="all-done">✓ All findings reviewed${state.page.queue.length > 1 ? ` <button id="btn-nextpair2">Next pair ›</button>` : ""}</p>`);
+  else if (!open.length) parts.push(`<p class="empty-note">${hiddenOpen} open finding${hiddenOpen === 1 ? " is" : "s are"} hidden by the filters.</p>`);
+  for (const { f, i } of open) parts.push(findingCard(f, i, asm));
+  // Reviewed findings drop out of the way, like a done column.
+  if (done.length) parts.push(section("done", "Reviewed", done.length, done.map(({ f, i }) => findingCard(f, i, asm)).join("")));
+  // Secondary detail is folded away; assumptions start open because they can change the verdict.
   const used = new Set([...r.assumptions.map((a) => a.id), ...r.findings.flatMap((f) => f.assumptions)]);
   const rows = state.page.session.assumptions.filter((a) => used.has(a.id) || a.pairs.includes(state.cur));
-  if (rows.length) parts.push(`<h2>Assumptions</h2>` + rows.map((a) => asmCard(a, true)).join(""));
-  if (r.unknown_reasons.length) parts.push(`<h2>Why not stronger</h2><div class="small"><ul>${r.unknown_reasons.map((u) => `<li>${esc(u)}</li>`).join("")}</ul></div>`);
-  parts.push(`<h2>Normalizations</h2><div class="small"><ul>${r.normalizations.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></div>`);
-  if (r.diagnostics.length) parts.push(`<h2>Parse diagnostics</h2><div class="small"><ul>${r.diagnostics.map((d) => `<li>${esc(d.side.toUpperCase())} ${d.line}:${d.col} ${esc(d.message)}</li>`).join("")}</ul></div>`);
+  if (rows.length) parts.push(section("asm", "Assumptions", rows.length, rows.map((a) => asmCard(a, true)).join("") + `<p class="hint">Deny one to see what it holds up.</p>`));
+  const ul = (xs) => `<div class="small"><ul>${xs.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+  if (r.unknown_reasons.length) parts.push(section("why", "Why not stronger", r.unknown_reasons.length, ul(r.unknown_reasons)));
+  if (r.normalizations.length) parts.push(section("norm", "Normalizations", r.normalizations.length, ul(r.normalizations)));
+  if (r.diagnostics.length) parts.push(section("diag", "Parse diagnostics", r.diagnostics.length, ul(r.diagnostics.map((d) => `${d.side.toUpperCase()} ${d.line}:${d.col} ${d.message}`))));
   $("side").innerHTML = parts.join("");
+  for (const b of $("side").querySelectorAll("button[data-cls]")) b.onclick = () => toggleClass(b.dataset.cls);
   for (const el of $("side").querySelectorAll(".finding")) el.onclick = (e) => { if (!e.target.closest("button,textarea")) focusFinding(+el.dataset.i, true); };
   for (const el of $("side").querySelectorAll("button[data-copy]")) el.onclick = () => copyFinding(+el.dataset.copy);
+  // Hovering an item shows its rows in the diff.
+  for (const el of $("side").querySelectorAll(".finding")) {
+    el.onmouseenter = () => { for (const k of rowsOf(+el.dataset.i)) { const row = $("row-" + k); if (row) row.classList.add("hover"); } };
+    el.onmouseleave = () => { for (const row of $("pane").querySelectorAll(".row.hover")) row.classList.remove("hover"); };
+  }
+  if ($("btn-nextpair2")) $("btn-nextpair2").onclick = () => stepPair(1);
   for (const el of $("side").querySelectorAll("button[data-rv]")) {
     el.onclick = () => {
       const i = +el.closest(".finding").dataset.i;
       reviewAction(i, el.dataset.rv);
     };
   }
-  const ta = state.commenting >= 0 && $("cmt-" + state.commenting);
+  const ta = $("side").querySelector(".finding.commenting textarea");
   if (ta) {
-    ta.focus();
+    const i = +ta.closest(".finding").dataset.i;
+    // Take keyboard focus only when the box first opens; later re-renders leave focus where the user put it.
+    if (state.comment.grab) { state.comment.grab = false; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+    ta.oninput = () => { state.comment.text = ta.value; };
     ta.onkeydown = (e) => {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveComment(state.commenting); }
-      else if (e.key === "Escape") { state.commenting = -1; renderSide(); }
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveComment(i); }
+      else if (e.key === "Escape") { state.comment = null; renderSide(); }
     };
   }
   wireFlips($("side"));
+  wireSections($("side"));
 }
 function reviewAction(i, act) {
   if (!state.live) return;
   if (act === "comment") {
-    if (state.commenting === i) saveComment(i);
-    else { state.commenting = i; state.focus = i; renderSide(); }
+    const fp = state.data.report.findings[i].fingerprint;
+    if (state.comment && state.comment.fp === fp) saveComment(i);
+    else { state.comment = { fp, text: currentComment(i) || "", grab: true }; state.focus = i; renderSide(); }
   } else setReview(i, act === "clear" ? null : act, currentComment(i));
 }
 function currentComment(i) {
@@ -632,8 +852,8 @@ function currentComment(i) {
   return x && x.current ? x.d.comment || null : null;
 }
 function saveComment(i) {
-  const text = $("cmt-" + i) ? $("cmt-" + i).value : "";
   const f = state.data.report.findings[i];
+  const text = state.comment && state.comment.fp === f.fingerprint ? state.comment.text : "";
   const x = decision(f.fingerprint, state.data.snapshot);
   // A comment keeps an accept or reject; on its own it is a "commented" decision.
   const st = x && x.current && x.d.state !== "commented" ? x.d.state : "commented";
@@ -661,6 +881,7 @@ function ensureRowVisible(k) {
 
 function focusFinding(i, scroll) {
   state.focus = i;
+  if (isDone(state.data.report.findings[i]) && !state.open.has("done")) { state.open.add("done"); renderSide(); }
   history.replaceState(null, "", "#p=" + state.cur + "&f=" + state.data.report.findings[i].fingerprint);
   const rows = rowsOf(i);
   rows.forEach(ensureRowVisible);
@@ -713,6 +934,8 @@ function onCodeInput(el) {
   state.src[side] = lines.join("\n");
   el.dataset.end = start + repl.length - 1;
   $("btn-reset").hidden = false;
+  $("editnote").classList.add("dirty");
+  $("editnote").textContent = "Edited · re-diffs live, not saved to disk";
   scheduleDiff();
 }
 function lineOffset(text, line) { let o = 0; for (let k = 0; k < line; k++) { const i = text.indexOf("\n", o); o = i < 0 ? text.length + 1 : i + 1; } return o; }
@@ -816,6 +1039,8 @@ function commands() {
     add("Open session report", () => window.open("/api/report", "_blank"));
     add("Open redacted session report", () => window.open("/api/report?redact=1", "_blank"));
   }
+  add("Show details: sources, hashes, config", () => toggleInfo(true), "i");
+  add(document.body.classList.contains("compact") ? "Comfortable density" : "Compact density", () => setDensity(!document.body.classList.contains("compact")), "d");
   add("Keyboard shortcuts", () => $("help").classList.add("open"), "?");
   return c;
 }
@@ -850,8 +1075,15 @@ function init() {
   $("btn-accepted").onclick = toggleAccepted;
   $("btn-palette").onclick = openPalette;
   $("btn-help").onclick = () => $("help").classList.add("open");
+  $("btn-info").onclick = (e) => { e.stopPropagation(); toggleInfo(); };
+  window.addEventListener("resize", syncFilterHeight);
+  $("provbar").onclick = (e) => e.stopPropagation();
+  document.addEventListener("click", () => toggleInfo(false));
+  $("btn-density").onclick = () => setDensity(!document.body.classList.contains("compact"));
+  setDensity(store.get("density") === "compact");
   $("help").onclick = () => $("help").classList.remove("open");
-  $("palette").onclick = (e) => { if (e.target === $("palette")) closePalette(); };
+  // Clicks inside the palette must not reach the document handler that closes the details popover.
+  $("palette").onclick = (e) => { e.stopPropagation(); if (e.target === $("palette")) closePalette(); };
   $("pal-in").oninput = filterPalette;
   $("pal-in").onkeydown = (e) => {
     if (e.key === "ArrowDown") { palSel = Math.min(palSel + 1, palItems.length - 1); drawPalette(); }
@@ -870,7 +1102,10 @@ function init() {
     if (k === ":") openPalette();
     else if (k === "q") showQueue();
     else if (k === "?") $("help").classList.toggle("open");
-    else if (k === "Escape") { $("help").classList.remove("open"); closePalette(); }
+    else if (k === "Escape") { $("help").classList.remove("open"); closePalette(); toggleInfo(false); }
+    else if (k === "i") toggleInfo();
+    else if (k === "d") setDensity(!document.body.classList.contains("compact"));
+    else if (!pair && k === "/") { const n = $("qmain").querySelector("input[data-q]"); if (n) n.focus(); }
     else if (k === "r" && state.live) refresh();
     else if (!pair && (k === "j" || k === "ArrowDown")) stepQueue(1);
     else if (!pair && (k === "k" || k === "ArrowUp")) stepQueue(-1);
