@@ -15,7 +15,12 @@ pub fn derive_verdict(r: &Report) -> Verdict {
         || !r.unknown_reasons.is_empty()
     {
         Verdict::Unknown
-    } else if !r.assumptions.is_empty() {
+    } else if r
+        .assumptions
+        .iter()
+        .any(|a| a.source != AssumptionSource::ComposedOutput)
+    {
+        // Facts proven from composed output are discharged, not open.
         Verdict::EqualUnderAssumptions
     } else {
         Verdict::Equal

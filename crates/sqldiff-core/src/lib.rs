@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod bind;
 pub mod catalog;
 pub mod classify;
+pub mod composition;
 mod engine;
 pub mod equiv;
 pub mod facts;
