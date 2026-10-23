@@ -170,7 +170,7 @@ pub fn ledger(raw: &Report, flips: &Flips) -> Vec<LedgerEntry> {
                 (Some(true), _) => Status::Confirmed,
                 (Some(false), _) => Status::Denied,
                 (None, AssumptionSource::Declared) => Status::Declared,
-                (None, AssumptionSource::Default) => Status::Open,
+                (None, AssumptionSource::Default | AssumptionSource::Author) => Status::Open,
             };
             let mut other = flips.clone();
             // Flipping a denied one restores it; anything else is denied.

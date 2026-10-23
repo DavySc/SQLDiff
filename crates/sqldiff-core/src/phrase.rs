@@ -246,6 +246,7 @@ mod tests {
             id: "ASM-X".to_string(),
             text: "The caller's XACT_ABORT setting is OFF".to_string(),
             source: AssumptionSource::Default,
+            cite: None,
         }];
         let f1 = finding("bb", ChangeClass::Semantic, Verdict::Unknown, &[]);
         let f2 = finding(
