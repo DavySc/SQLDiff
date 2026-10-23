@@ -32,8 +32,15 @@ witnesses = [
 [[expect]]
 a = "tsql"
 b = "db2i"
-verdict = "equal"
-classes = ["structural"]
+verdict = "different"
+classes = ["transactional"]
+assumptions = [
+  "caller XACT_ABORT is off",
+  "Db2 for i ends the procedure and returns the error to the caller when the INSERT fails and no handler is declared (not verified on a real system)",
+]
+witnesses = [
+  "If the INSERT fails, T-SQL reports the error and continues, so a calling batch goes on with @OrderId = NULL; Db2 for i ends the procedure with the SQLSTATE.",
+]
 
 [[expect]]
 a = "pg"
