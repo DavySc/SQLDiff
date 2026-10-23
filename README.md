@@ -68,7 +68,7 @@ Verdict: DIFFERENT
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
 | Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
-| GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
+| GUI | `sqldiff-gui serve` / `export` / `report`: two files open the pair view, two directories open a review queue (filter by class, dialect pair, folder, review state; sort by severity). Pair view aligned by statement with a location pane, findings with accept / reject / comment, assumption panel (deny or confirm an assumption and watch verdicts update), provenance bar (sources, snapshot, packs and hashes, dialect versions, refresh), command palette (Ctrl+K), scratchpad that re-diffs on edit, deep links `?a=<path>&b=<path>#f=<fingerprint>`, session report as Markdown (`--redact`). Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
 Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
@@ -99,7 +99,7 @@ crates/sqldiff-core     findings model, normalization, diff engines, checks, ren
 crates/sqldiff-source   packs, layered config, adapter protocol, fs/git/bundle adapters, pairing
 crates/sqldiff-cli      the `sqldiff` binary
 crates/sqldiff-mcp      the `sqldiff-mcp` stdio MCP server
-crates/sqldiff-gui      the `sqldiff-gui` pair view (local server + embedded page)
+crates/sqldiff-gui      the `sqldiff-gui` review queue and pair view (local server + embedded page)
 tests/fixtures          synthetic fixtures (all written for this repository)
 docs/examples/pack      synthetic example pack using every section
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time

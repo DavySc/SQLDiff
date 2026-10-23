@@ -23,6 +23,7 @@ pub mod policy;
 pub mod process;
 pub mod protocol;
 mod source;
+pub mod tree;
 mod walk;
 
 pub use bundle::{Bundle, BundleSource};

@@ -12,6 +12,7 @@ pub mod lint;
 pub mod model;
 pub mod normalize;
 pub mod render;
+pub mod session;
 pub mod treediff;
 
 pub use artifact::Artifact;
