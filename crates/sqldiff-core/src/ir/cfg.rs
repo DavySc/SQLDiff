@@ -243,6 +243,8 @@ pub struct Cfg {
     pub scopes: Vec<Scope>,
     pub entry: NodeId,
     pub temps: BTreeMap<String, TempObject>,
+    /// Nodes with a durable effect, in document order.
+    effect_order: Vec<NodeId>,
 }
 
 impl Cfg {
@@ -252,19 +254,10 @@ impl Cfg {
 
     /// Statement nodes with a durable effect, in document order.
     pub fn effect_nodes(&self) -> Vec<(NodeId, &Effect)> {
-        let mut v: Vec<(NodeId, &Effect)> = self
-            .nodes
+        self.effect_order
             .iter()
-            .enumerate()
-            .filter_map(|(i, n)| n.stmt().and_then(|s| s.durable_effect()).map(|e| (i, e)))
-            .collect();
-        v.sort_by_key(|(i, _)| {
-            self.nodes[*i]
-                .syntax
-                .as_ref()
-                .map(|s| s.text_range().start())
-        });
-        v
+            .filter_map(|&i| self.nodes[i].stmt()?.durable_effect().map(|e| (i, e)))
+            .collect()
     }
 
     /// The statement node that produces the durable effect `key`.
@@ -400,6 +393,14 @@ pub fn lower(a: &Analyzed) -> Cfg {
     } else {
         None
     };
+    let mut effect_order: Vec<NodeId> = l
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.stmt().and_then(|s| s.durable_effect()).is_some())
+        .map(|(i, _)| i)
+        .collect();
+    effect_order.sort_by_key(|i| l.nodes[*i].syntax.as_ref().map(|s| s.text_range().start()));
     Cfg {
         dialect: d,
         routine,
@@ -408,6 +409,7 @@ pub fn lower(a: &Analyzed) -> Cfg {
         scopes: l.scopes,
         entry,
         temps: l.temps,
+        effect_order,
     }
 }
 
@@ -1409,17 +1411,17 @@ impl Lowerer {
                 form: "throw",
             },
             "RAISERROR" => {
-                // RAISERROR (msg, severity, state): severity <= 10 is informational.
-                let args: Vec<&SyntaxToken> = toks
-                    .iter()
-                    .filter(|t| t.kind() == SyntaxKind::NUMBER)
-                    .collect();
-                let sev = args.first().and_then(|t| t.text().parse::<u32>().ok());
+                // RAISERROR (msg, severity, state): severity <= 10 is
+                // informational, 20 and above ends the connection. A severity
+                // that is not a literal is taken as an error.
+                let sev = raiserror_severity(toks);
                 if sev.is_some_and(|s| s <= 10) {
                     Action::None
                 } else {
                     Action::Raise {
-                        kind: ErrorKind::UserSignal,
+                        kind: sev
+                            .and_then(|s| self.prof.kind_of_severity(s))
+                            .unwrap_or(ErrorKind::UserSignal),
                         form: "raiserror",
                     }
                 }
@@ -1440,32 +1442,77 @@ impl Lowerer {
                 if bare {
                     return Action::Reraise { form: "raise" };
                 }
-                let mut kind = ErrorKind::UserSignal;
-                if let Some(i) = toks
+                // An optional level word comes first: RAISE EXCEPTION SQLSTATE
+                // '23505', RAISE EXCEPTION unique_violation.
+                let at = if matches!(
+                    w(1).as_str(),
+                    "DEBUG" | "LOG" | "INFO" | "NOTICE" | "WARNING" | "EXCEPTION"
+                ) {
+                    2
+                } else {
+                    1
+                };
+                // condition_kinds takes a condition name or a SQLSTATE.
+                let kind_of = |name: &str| self.prof.condition_kinds(name).first().copied();
+                let errcode = toks
                     .iter()
                     .position(|t| t.text().eq_ignore_ascii_case("ERRCODE"))
-                {
-                    if let Some(c) = toks[i..].iter().find(|t| t.kind() == SyntaxKind::STRING) {
-                        let code = c.text().trim_matches('\'');
-                        kind = self
-                            .prof
-                            .kind_of_code(code)
-                            .or_else(|| self.prof.condition_kinds(code).first().copied())
-                            .unwrap_or(kind);
-                    }
-                } else if toks.get(1).is_some_and(|t| t.kind() == SyntaxKind::IDENT)
-                    && !matches!(w(1).as_str(), "EXCEPTION")
-                {
-                    if let Some(k) = self.prof.condition_kinds(&w(1)).first() {
-                        kind = *k;
-                    }
+                    .and_then(|i| toks[i..].iter().find(|t| t.kind() == SyntaxKind::STRING));
+                let kind = if let Some(c) = errcode {
+                    kind_of(c.text().trim_matches('\''))
+                } else if w(at) == "SQLSTATE" {
+                    // RAISE SQLSTATE '23505' raises that code, not P0001.
+                    toks.get(at + 1)
+                        .filter(|t| t.kind() == SyntaxKind::STRING)
+                        .and_then(|c| kind_of(c.text().trim_matches('\'')))
+                } else if toks.get(at).is_some_and(|t| t.kind() == SyntaxKind::IDENT) {
+                    kind_of(&w(at))
+                } else {
+                    None
                 }
+                .unwrap_or(ErrorKind::UserSignal);
                 Action::Raise {
                     kind,
                     form: "raise",
                 }
             }
         }
+    }
+}
+
+/// The literal severity of `RAISERROR (msg, severity, state)`: the second
+/// argument at the top level of the parentheses.
+fn raiserror_severity(toks: &[SyntaxToken]) -> Option<u32> {
+    let mut depth = 0;
+    let mut arg = 0;
+    let mut found: Vec<&SyntaxToken> = Vec::new();
+    for t in toks.iter().skip(1) {
+        match t.kind() {
+            SyntaxKind::L_PAREN => {
+                depth += 1;
+                if depth == 1 {
+                    continue;
+                }
+            }
+            SyntaxKind::R_PAREN => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            SyntaxKind::COMMA if depth == 1 => {
+                arg += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if depth >= 1 && arg == 1 {
+            found.push(t);
+        }
+    }
+    match found.as_slice() {
+        [t] if t.kind() == SyntaxKind::NUMBER => t.text().parse().ok(),
+        _ => None,
     }
 }
 

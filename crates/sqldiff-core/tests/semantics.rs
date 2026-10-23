@@ -883,3 +883,124 @@ fn error_kind_codes_map_back() {
     assert_eq!(ts.kind_of_code("50010"), Some(ErrorKind::UserSignal));
     assert!(!ts.condition_kinds("CATCH").contains(&NameResolution));
 }
+
+/// The raise action each statement of a routine lowers to, in node order.
+fn raises(d: Dialect, sql: &str) -> Vec<Action> {
+    let art = Artifact::new("case.sql", d, sql);
+    let a = Analyzed::new(&art, Side::A, 3);
+    let cfg = ir::lower(&a);
+    (0..cfg.nodes.len())
+        .filter_map(|n| cfg.node(n).stmt().map(|s| s.action.clone()))
+        .filter(|a| matches!(a, Action::Raise { .. } | Action::None))
+        .collect()
+}
+
+#[test]
+fn raise_forms_lower_to_their_kind() {
+    use sqldiff_core::ir::cfg::Action::Raise;
+    // RAISERROR's severity is the second argument, not the message id.
+    let ts = raises(
+        Tsql,
+        "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR(50001, 10, 1);\nEND",
+    );
+    assert_eq!(ts, vec![Action::None], "informational message");
+    let ts = raises(
+        Tsql,
+        "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR('x', 16, 1);\nEND",
+    );
+    assert_eq!(
+        ts,
+        vec![Raise {
+            kind: ErrorKind::UserSignal,
+            form: "raiserror"
+        }]
+    );
+    let ts = raises(
+        Tsql,
+        "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR('x', 20, 1) WITH LOG;\nEND",
+    );
+    assert_eq!(
+        ts,
+        vec![Raise {
+            kind: Cancel,
+            form: "raiserror"
+        }]
+    );
+    // RAISE SQLSTATE raises that code, so WHEN unique_violation catches it.
+    let pg = raises(
+        Pg,
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  RAISE SQLSTATE '23505';\nEND;\n$$;",
+    );
+    assert_eq!(
+        pg,
+        vec![Raise {
+            kind: Constraint,
+            form: "raise"
+        }]
+    );
+    let pg = raises(
+        Pg,
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  RAISE EXCEPTION 'x' USING ERRCODE = 'unique_violation';\nEND;\n$$;",
+    );
+    assert_eq!(
+        pg,
+        vec![Raise {
+            kind: Constraint,
+            form: "raise"
+        }]
+    );
+}
+
+#[test]
+fn raise_with_a_level_word_keeps_its_condition() {
+    use sqldiff_core::ir::cfg::Action::Raise;
+    for stmt in [
+        "RAISE EXCEPTION SQLSTATE '23505';",
+        "RAISE EXCEPTION unique_violation;",
+        "RAISE unique_violation USING MESSAGE = 'dup';",
+    ] {
+        let sql =
+            format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  {stmt}\nEND;\n$$;");
+        assert_eq!(
+            raises(Pg, &sql),
+            vec![Raise {
+                kind: Constraint,
+                form: "raise"
+            }],
+            "{stmt}"
+        );
+    }
+}
+
+#[test]
+fn raiserror_severity_20_ends_the_routine() {
+    // Severity 20+ drops the connection: the INSERT after it never runs.
+    let sql = "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR('x', 20, 1) WITH LOG;\n  INSERT INTO t (c) VALUES (1);\nEND";
+    let art = Artifact::new("case.sql", Tsql, sql);
+    let a = Analyzed::new(&art, Side::A, 3);
+    let outs = ir::explore(&ir::lower(&a), &Scenario::default());
+    assert_eq!(outs.len(), 1);
+    let o = &outs[0];
+    assert!(o.effects.is_empty(), "{:?}", o.effects);
+    assert!(matches!(o.exit, Exit::Raised(_)), "{:?}", o.exit);
+    assert!(o.rows.contains("tsql.unhandled.cancel"), "{:?}", o.rows);
+    // Severity 16 is an ordinary error: the batch goes on.
+    let sql = sql.replace("20, 1) WITH LOG", "16, 1)");
+    let art = Artifact::new("case.sql", Tsql, sql.as_str());
+    let a = Analyzed::new(&art, Side::A, 3);
+    let outs = ir::explore(&ir::lower(&a), &Scenario::default());
+    assert!(
+        outs[0].effects.contains_key("Insert:T#1"),
+        "{:?}",
+        outs[0].effects
+    );
+}
+
+#[test]
+fn tsql_cancel_is_a_severity_not_an_error_number() {
+    let ts = Profile::of(Tsql);
+    assert_ne!(ts.kind_of_code("8152"), Some(Cancel));
+    assert_eq!(ts.kind_of_code("attention"), Some(Cancel));
+    assert_eq!(ts.kind_of_severity(20), Some(Cancel));
+    assert_eq!(ts.kind_of_severity(16), None);
+}

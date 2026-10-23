@@ -19,7 +19,7 @@
 //! `concurrency.split-statement`. [`what_if`] answers one scenario on demand,
 //! and [`Env`] re-runs the analysis under flipped scenario assumptions.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use sqldiff_syntax::{ast, SyntaxNode};
 
@@ -91,6 +91,41 @@ impl SideIr<'_, '_> {
             .find(|(_, e)| e.key == key)
     }
 
+    /// Statements that read temporary object `t` without a durable effect
+    /// of their own, in document order.
+    fn plain_reads(&self, t: &str) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = (0..self.cfg.nodes.len())
+            .filter(|&i| {
+                self.cfg.node(i).stmt().is_some_and(|s| {
+                    s.durable_effect().is_none() && s.temp_reads.iter().any(|x| x == t)
+                })
+            })
+            .collect();
+        v.sort_by_key(|&i| self.syntax(i).map(|s| s.text_range().start()));
+        v
+    }
+
+    /// Key of a statement that reads a temporary object: its durable effect,
+    /// or `Read:T#n` for the n-th plain read of `T`.
+    fn read_key(&self, n: NodeId, t: &str) -> Option<String> {
+        let s = self.cfg.node(n).stmt()?;
+        if let Some(e) = s.durable_effect() {
+            return Some(e.key.clone());
+        }
+        let i = self.plain_reads(t).iter().position(|&x| x == n)?;
+        Some(format!("Read:{t}#{}", i + 1))
+    }
+
+    /// The statement behind an effect or read key.
+    fn locate(&self, key: &str) -> Option<NodeId> {
+        if let Some((n, _)) = self.effect(key) {
+            return Some(n);
+        }
+        let (t, i) = key.strip_prefix("Read:")?.rsplit_once('#')?;
+        let i: usize = i.parse().ok()?;
+        self.plain_reads(t).get(i.checked_sub(1)?).copied()
+    }
+
     fn syntax(&self, n: NodeId) -> Option<&SyntaxNode> {
         self.cfg.node(n).syntax.as_ref()
     }
@@ -103,6 +138,14 @@ impl SideIr<'_, '_> {
 
     /// Effect phrase, with an ordinal when the same write occurs more than once.
     fn phrase(&self, key: &str) -> String {
+        if let Some((t, n)) = key.strip_prefix("Read:").and_then(|k| k.rsplit_once('#')) {
+            let name = t.to_lowercase();
+            return if self.plain_reads(t).len() > 1 {
+                format!("the read of {name} (occurrence {n})")
+            } else {
+                format!("the read of {name}")
+            };
+        }
         let Some((_, e)) = self.effect(key) else {
             return key.to_string();
         };
@@ -129,8 +172,8 @@ impl SideIr<'_, '_> {
     }
 
     fn phrase_at(&self, key: &str) -> String {
-        match self.effect(key) {
-            Some((n, _)) => format!("{} ({})", self.phrase(key), self.line(n)),
+        match self.locate(key) {
+            Some(n) => format!("{} ({})", self.phrase(key), self.line(n)),
             None => key.to_string(),
         }
     }
@@ -352,6 +395,42 @@ fn diff(
             out.push(d);
         }
     }
+    // 2a. The caller's own uncommitted work (caller-transaction scenario).
+    let caller = super::interp::CALLER;
+    let (ca, cb) = (
+        oa.effects.get(caller).copied(),
+        ob.effects.get(caller).copied(),
+    );
+    if (ca.is_some() || cb.is_some()) && ca != cb {
+        let caller_phrase = |f: Option<Fate>| match f {
+            Some(Fate::Durable) => "commits the caller's earlier work",
+            Some(Fate::Undone) => "rolls back the caller's earlier work",
+            Some(Fate::Caller) => "leaves the caller's earlier work to the caller",
+            Some(Fate::Partial) | None => "leaves the caller's transaction in an unknown state",
+        };
+        // The caller's work ran before anything here: under a caller
+        // transaction the environment asserts, a fault makes it atomicity.
+        let rule = match sc {
+            Kind::CallerTxn => "txn.caller-transaction",
+            Kind::Fault { .. } => "txn.atomicity",
+            _ => "txn.durability",
+        };
+        let mut d = Div::new(
+            rule,
+            ChangeClass::Transactional,
+            Severity::Critical,
+            caller,
+            format!(
+                "{} {}; {} {}",
+                sa.name(),
+                caller_phrase(ca),
+                sb.name(),
+                caller_phrase(cb)
+            ),
+        );
+        d.durability = true;
+        out.push(d);
+    }
     // 2. Effects that ran on both sides with different fates.
     let mut keys: Vec<&String> = oa.effects.keys().collect();
     for k in ob.effects.keys() {
@@ -549,44 +628,47 @@ fn diff(
             }
         }
     }
-    // 7. Temporary state seen by aligned statements.
-    let reads = |s: &SideIr, o: &Outcome| -> BTreeSet<(String, String, TempState)> {
+    // 7. Temporary state seen by aligned statements. One finding per
+    // statement (the first temporary table that differs): the scenario
+    // counts a divergence once per outcome pair.
+    type Reads = BTreeSet<(String, String, TempState)>;
+    let reads = |s: &SideIr, o: &Outcome| -> Reads {
         o.temp_reads
             .iter()
-            .filter_map(|(n, t, st)| {
-                let key = s.cfg.node(*n).stmt()?.durable_effect()?.key.clone();
-                Some((key, t.clone(), *st))
-            })
+            .filter_map(|(n, t, st)| Some((s.read_key(*n, t)?, t.clone(), *st)))
             .collect()
     };
     let (ra, rb) = (reads(sa, oa), reads(sb, ob));
-    if let Some((k, t, _)) = ra.symmetric_difference(&rb).next() {
-        if both(k) {
-            let state = |r: &BTreeSet<(String, String, TempState)>| {
-                r.iter()
-                    .find(|(x, y, _)| x == k && y == t)
-                    .map(|(_, _, s)| match s {
-                        TempState::Rows => "still holds the rows written earlier",
-                        TempState::Empty => "is empty (the rows were rolled back or never written)",
-                    })
-                    .unwrap_or("is not read")
-            };
-            out.push(Div::new(
-                "txn.temp-state",
-                ChangeClass::Transactional,
-                Severity::High,
-                k,
-                format!(
-                    "{} reads the temporary table {}, which on {} {} and on {} {}",
-                    sa.phrase(k),
-                    t.to_lowercase(),
-                    sa.name(),
-                    state(&ra),
-                    sb.name(),
-                    state(&rb)
-                ),
-            ));
+    let mut reported: Vec<&String> = Vec::new();
+    for (k, t, _) in ra.symmetric_difference(&rb) {
+        if reported.contains(&k) || sa.locate(k).is_none() || sb.locate(k).is_none() {
+            continue;
         }
+        reported.push(k);
+        let state = |r: &Reads| {
+            r.iter()
+                .find(|(x, y, _)| x == k && y == t)
+                .map(|(_, _, s)| match s {
+                    TempState::Rows => "still holds the rows written earlier",
+                    TempState::Empty => "is empty (the rows were rolled back or never written)",
+                })
+                .unwrap_or("is not read")
+        };
+        out.push(Div::new(
+            "txn.temp-state",
+            ChangeClass::Transactional,
+            Severity::High,
+            k,
+            format!(
+                "{} reads the temporary table {}, which on {} {} and on {} {}",
+                sa.phrase(k),
+                t.to_lowercase(),
+                sa.name(),
+                state(&ra),
+                sb.name(),
+                state(&rb)
+            ),
+        ));
     }
     out
 }
@@ -822,7 +904,8 @@ struct Collector<'x, 'a> {
     splits: Vec<Split>,
     out: Behaviour,
     seen: HashSet<(String, String)>,
-    contract_seen: HashSet<&'static str>,
+    /// Index in `out.findings` of the routine-wide finding of each rule.
+    contract_at: HashMap<&'static str, usize>,
 }
 
 impl<'x, 'a> Collector<'x, 'a> {
@@ -837,7 +920,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             splits: Vec::new(),
             out: Behaviour::default(),
             seen: HashSet::new(),
-            contract_seen: HashSet::new(),
+            contract_at: HashMap::new(),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -898,7 +981,13 @@ impl<'x, 'a> Collector<'x, 'a> {
         let combos = ps.len();
         let mut found: Vec<(Div, &Outcome, &Outcome, usize)> = Vec::new();
         for (oa, ob) in &ps {
+            // Each divergence counts once per outcome pair.
+            let mut here: Vec<(&str, String)> = Vec::new();
             for d in diff(&self.sa, &self.sb, &self.splits, &sc, oa, ob) {
+                if here.contains(&(d.rule, d.anchor.clone())) {
+                    continue;
+                }
+                here.push((d.rule, d.anchor.clone()));
                 if let Some(x) = found
                     .iter_mut()
                     .find(|x| x.0.rule == d.rule && x.0.anchor == d.anchor)
@@ -932,14 +1021,7 @@ impl<'x, 'a> Collector<'x, 'a> {
         scens: Option<(&Scenario, &Scenario)>,
     ) {
         let key = (d.rule.to_string(), d.anchor.clone());
-        // The error contract and the caller's continuation are properties of
-        // the routine as a whole: the first failing statement shows them.
-        if matches!(d.rule, "error.contract" | "txn.caller-continuation")
-            && !self.contract_seen.insert(d.rule)
-        {
-            return;
-        }
-        if !self.seen.insert(key) {
+        if self.seen.contains(&key) {
             return;
         }
         let imprecise = !oa.imprecise.is_empty() || !ob.imprecise.is_empty();
@@ -961,6 +1043,18 @@ impl<'x, 'a> Collector<'x, 'a> {
         } else {
             Verdict::Unknown
         };
+        // The error contract and the caller's continuation are properties of
+        // the routine as a whole: one finding each, the most certain one, so
+        // an imprecise path cannot hide a proven difference.
+        let replace = if matches!(d.rule, "error.contract" | "txn.caller-continuation") {
+            match self.contract_at.get(d.rule) {
+                Some(&i) if rank(verdict) <= rank(self.out.findings[i].verdict) => return,
+                at => at.copied(),
+            }
+        } else {
+            None
+        };
+        self.seen.insert(key);
         let mut ids: Vec<String> = d.assumptions.clone();
         for x in oa.assumptions.iter().chain(&ob.assumptions) {
             if !ids.contains(x) {
@@ -1028,17 +1122,11 @@ impl<'x, 'a> Collector<'x, 'a> {
         let anchor_b = d.anchor_b.clone().unwrap_or_else(|| d.anchor.clone());
         let node_a = |c: &Self| match sc {
             Kind::Fault { key, na, .. } if *key == d.anchor => c.sa.syntax(*na).cloned(),
-            _ => {
-                c.sa.effect(&d.anchor)
-                    .and_then(|(n, _)| c.sa.syntax(n).cloned())
-            }
+            _ => c.sa.locate(&d.anchor).and_then(|n| c.sa.syntax(n).cloned()),
         };
         let node_b = |c: &Self| match sc {
             Kind::Fault { key, nb, .. } if *key == anchor_b => c.sb.syntax(*nb).cloned(),
-            _ => {
-                c.sb.effect(&anchor_b)
-                    .and_then(|(n, _)| c.sb.syntax(n).cloned())
-            }
+            _ => c.sb.locate(&anchor_b).and_then(|n| c.sb.syntax(n).cloned()),
         };
         let (la, lb) = (node_a(self), node_b(self));
         let anchor_text = |n: &Option<SyntaxNode>| {
@@ -1046,8 +1134,9 @@ impl<'x, 'a> Collector<'x, 'a> {
                 .map(|n| ast::first_words(n, 3).join(" "))
                 .unwrap_or_default()
         };
-        // Same anchors as the syntactic checks had, so stored review
-        // decisions keep matching; the effect key only splits a collision.
+        // Anchored at the first words of the statement on each side, so
+        // reformatting keeps the fingerprint; the effect key is added only to
+        // split two findings that would otherwise collide.
         let print = |ka: &str, kb: &str| {
             fingerprint(&FingerprintInput {
                 object: &self.sa.a.object,
@@ -1058,17 +1147,23 @@ impl<'x, 'a> Collector<'x, 'a> {
             })
         };
         let mut fp = print("", "");
-        if self.out.findings.iter().any(|f| f.fingerprint == fp) {
+        if self
+            .out
+            .findings
+            .iter()
+            .enumerate()
+            .any(|(i, f)| f.fingerprint == fp && Some(i) != replace)
+        {
             fp = print(&format!("{}|", d.anchor), &format!("{anchor_b}|"));
         }
-        self.out.witnesses.push(Witness {
+        let w = Witness {
             fingerprint: fp.clone(),
             rule: d.rule.to_string(),
             scenario: scenario_info(&self.sa, &self.sb, sc, &self.env, oa),
             a: side_outcome(&self.sa, oa),
             b: side_outcome(&self.sb, ob),
-        });
-        self.out.findings.push(Finding {
+        };
+        let f = Finding {
             fingerprint: fp,
             rule: d.rule.to_string(),
             class: d.class,
@@ -1078,7 +1173,28 @@ impl<'x, 'a> Collector<'x, 'a> {
             a: la.as_ref().map(|n| self.sa.a.node_location(n)),
             b: lb.as_ref().map(|n| self.sb.a.node_location(n)),
             assumptions: ids,
-        });
+        };
+        match replace {
+            Some(i) => {
+                let old = std::mem::replace(&mut self.out.findings[i], f);
+                match self
+                    .out
+                    .witnesses
+                    .iter_mut()
+                    .find(|x| x.fingerprint == old.fingerprint)
+                {
+                    Some(x) => *x = w,
+                    None => self.out.witnesses.push(w),
+                }
+            }
+            None => {
+                if matches!(d.rule, "error.contract" | "txn.caller-continuation") {
+                    self.contract_at.insert(d.rule, self.out.findings.len());
+                }
+                self.out.witnesses.push(w);
+                self.out.findings.push(f);
+            }
+        }
     }
 
     /// Faults at every write both sides perform, in document order of side A.
@@ -1247,7 +1363,25 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
         };
         c.run(Kind::CallerTxn, caller.clone(), caller);
     }
+    // A replaced routine-wide finding may have brought assumptions that no
+    // finding uses any more.
+    let used: HashSet<String> = c
+        .out
+        .findings
+        .iter()
+        .flat_map(|f| f.assumptions.iter().cloned())
+        .collect();
+    c.out.assumptions.retain(|x| used.contains(&x.id));
     c.out
+}
+
+fn rank(v: Verdict) -> u8 {
+    match v {
+        Verdict::Different => 3,
+        Verdict::Unknown => 2,
+        Verdict::EqualUnderAssumptions => 1,
+        _ => 0,
+    }
 }
 
 /// "What if this statement fails with this error kind?" for the statement

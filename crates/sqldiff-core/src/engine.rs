@@ -265,8 +265,8 @@ fn first_line(f: &Finding) -> (usize, usize) {
 /// Cross-dialect: every durable write on one side should have a counterpart
 /// (same kind, same target object after case and `_` folding) on the other.
 fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
-    let wa = facts::extract(a).writes;
-    let wb = facts::extract(b).writes;
+    let wa = facts::writes(a);
+    let wb = facts::writes(b);
     // MERGE and INSERT ... ON CONFLICT are both upserts.
     let key = |w: &facts::Write| {
         let kind = if w.upsert {

@@ -212,3 +212,113 @@ fn caller_transaction_and_error_contract_on_the_worked_example() {
     assert!(e.witness.contains("returns code 1"), "{}", e.witness);
     assert!(e.assumptions.contains(&"ASM-CALLER-CHECKS-RC".to_string()));
 }
+
+fn pair(a: (&str, Dialect), b: (&str, Dialect)) -> Report {
+    diff(
+        &Artifact::new("a.sql", a.1, a.0.to_string()),
+        &Artifact::new("b.sql", b.1, b.0.to_string()),
+        &Options::default(),
+    )
+}
+
+#[test]
+fn caller_work_committed_by_one_side_only() {
+    // T-SQL COMMIT inside the caller's transaction only decrements
+    // @@TRANCOUNT; Db2 for i COMMIT commits the caller's work too.
+    let r = pair(
+        (
+            "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRAN;\n  INSERT INTO t (c) VALUES (1);\n  COMMIT;\nEND",
+            Dialect::Tsql,
+        ),
+        (
+            "CREATE PROCEDURE p ()\nLANGUAGE SQL\nSET OPTION COMMIT = *CHG\nBEGIN\n  INSERT INTO t (c) VALUES (1);\n  COMMIT;\nEND",
+            Dialect::Db2i,
+        ),
+    );
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "txn.caller-transaction" && f.witness.contains("caller's earlier work"))
+        .unwrap_or_else(|| panic!("{:#?}", r.findings));
+    assert!(
+        f.witness
+            .contains("side A (T-SQL) leaves the caller's earlier work to the caller"),
+        "{}",
+        f.witness
+    );
+    assert!(
+        f.witness
+            .contains("side B (Db2 for i) commits the caller's earlier work"),
+        "{}",
+        f.witness
+    );
+}
+
+#[test]
+fn error_contract_keeps_the_proven_difference() {
+    // Failing t1 is unknown (side B's handler branches on @x); failing t2
+    // is a proven difference (code 1 against an error). The pair keeps one
+    // error.contract finding, the proven one.
+    let r = pair(
+        (
+            "CREATE PROCEDURE p @x int AS\nBEGIN\n  BEGIN TRY\n    INSERT INTO t1 (c) VALUES (1);\n    INSERT INTO t2 (c) VALUES (1);\n  END TRY\n  BEGIN CATCH\n    RETURN 1;\n  END CATCH\nEND",
+            Dialect::Tsql,
+        ),
+        (
+            "CREATE PROCEDURE p @x int AS\nBEGIN\n  BEGIN TRY\n    INSERT INTO t1 (c) VALUES (1);\n  END TRY\n  BEGIN CATCH\n    IF @x = 1 RETURN 1;\n    THROW;\n  END CATCH\n  INSERT INTO t2 (c) VALUES (1);\nEND",
+            Dialect::Tsql,
+        ),
+    );
+    let contracts: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "error.contract")
+        .collect();
+    assert_eq!(contracts.len(), 1, "{:#?}", r.findings);
+    assert_eq!(
+        contracts[0].verdict,
+        Verdict::Different,
+        "{:#?}",
+        contracts[0]
+    );
+    assert!(
+        contracts[0].witness.contains("t2"),
+        "{}",
+        contracts[0].witness
+    );
+}
+
+#[test]
+fn temp_state_read_without_a_durable_write() {
+    // The CATCH block counts the rows of the temporary table after ROLLBACK:
+    // a table variable keeps them, a #temp table loses them.
+    let body = |decl: &str, t: &str| {
+        format!(
+            "CREATE PROCEDURE p AS\nBEGIN\n  {decl};\n  DECLARE @n int;\n  BEGIN TRY\n    BEGIN TRAN;\n    INSERT INTO {t} (id) VALUES (1);\n    INSERT INTO t (c) VALUES (1);\n    COMMIT;\n  END TRY\n  BEGIN CATCH\n    ROLLBACK;\n    SELECT @n = COUNT(*) FROM {t};\n  END CATCH\nEND"
+        )
+    };
+    let a = body("DECLARE @log TABLE (id int)", "@log");
+    let b = body("CREATE TABLE #log (id int)", "#log");
+    let r = pair((&a, Dialect::Tsql), (&b, Dialect::Tsql));
+    let f = finding(&r, "txn.temp-state");
+    assert_eq!(f.verdict, Verdict::Different);
+    assert!(f.witness.contains("the read of log"), "{}", f.witness);
+    assert!(f.a.is_some() && f.b.is_some(), "{f:#?}");
+}
+
+#[test]
+fn temp_state_on_two_tables_counts_once_per_path() {
+    // The CATCH INSERT reads two temporary tables. Side B refills both on
+    // one of its two CATCH paths only, so the read differs on some paths:
+    // one finding, Unknown, not Different.
+    let a = "CREATE PROCEDURE p @x int AS\nBEGIN\n  DECLARE @a TABLE (id int);\n  DECLARE @b TABLE (id int);\n  DECLARE @n int;\n  BEGIN TRY\n    BEGIN TRAN;\n    INSERT INTO @a (id) VALUES (1);\n    INSERT INTO @b (id) VALUES (1);\n    INSERT INTO t (c) VALUES (1);\n    COMMIT;\n  END TRY\n  BEGIN CATCH\n    ROLLBACK;\n    INSERT INTO audit (c) SELECT x.id FROM @a x JOIN @b y ON x.id = y.id;\n  END CATCH\nEND";
+    let b = "CREATE PROCEDURE p @x int AS\nBEGIN\n  CREATE TABLE #a (id int);\n  CREATE TABLE #b (id int);\n  DECLARE @n int;\n  BEGIN TRY\n    BEGIN TRAN;\n    INSERT INTO #a (id) VALUES (1);\n    INSERT INTO #b (id) VALUES (1);\n    INSERT INTO t (c) VALUES (1);\n    COMMIT;\n  END TRY\n  BEGIN CATCH\n    ROLLBACK;\n    IF @x = 1\n    BEGIN\n      INSERT INTO #a (id) VALUES (1);\n      INSERT INTO #b (id) VALUES (1);\n    END\n    INSERT INTO audit (c) SELECT x.id FROM #a x JOIN #b y ON x.id = y.id;\n  END CATCH\nEND";
+    let r = pair((a, Dialect::Tsql), (b, Dialect::Tsql));
+    let ts: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "txn.temp-state")
+        .collect();
+    assert_eq!(ts.len(), 1, "{:#?}", r.findings);
+    assert_eq!(ts[0].verdict, Verdict::Unknown, "{:#?}", ts[0]);
+}
