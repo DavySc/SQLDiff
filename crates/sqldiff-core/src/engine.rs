@@ -119,6 +119,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         normalizations,
         assumptions,
         unknown_reasons,
+        suppressed: Vec::new(),
         diagnostics,
     })
 }
@@ -145,6 +146,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         normalizations: Vec::new(),
         assumptions: Vec::new(),
         unknown_reasons,
+        suppressed: Vec::new(),
         diagnostics,
     })
 }
