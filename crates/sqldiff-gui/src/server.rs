@@ -39,6 +39,7 @@ impl Pair {
     fn options(&self) -> Options {
         Options {
             excerpt_lines: self.excerpt_lines,
+            ..Options::default()
         }
     }
 }

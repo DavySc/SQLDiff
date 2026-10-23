@@ -328,6 +328,7 @@ fn pairs(
     let stale = |id: &str| objects.iter().any(|o| o.id == id && o.stale);
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
     let mut reports: Vec<Report> = Vec::new();
     for x in &p.pairs {
