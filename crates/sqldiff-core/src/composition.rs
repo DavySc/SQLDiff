@@ -148,7 +148,13 @@ impl Markers {
 /// Read mode: splits `text` by the first marker syntax that finds a part.
 /// `None` when no syntax matches anything.
 pub fn read(text: &str, markers: &[Markers]) -> Option<Composition> {
-    markers.iter().find_map(|m| read_one(text, m))
+    // A syntax that finds parts wins; stray marker-like lines of another
+    // syntax are reported only when no syntax finds any part.
+    let read: Vec<Composition> = markers.iter().filter_map(|m| read_one(text, m)).collect();
+    read.iter()
+        .position(|c| !c.parts.is_empty())
+        .or(if read.is_empty() { None } else { Some(0) })
+        .map(|i| read[i].clone())
 }
 
 fn read_one(text: &str, m: &Markers) -> Option<Composition> {
@@ -276,9 +282,15 @@ pub fn check(
                     unresolved: Vec::new(),
                 };
             };
+            // Every placeholder needs a value. Only when that fails is a
+            // candidate that names no parameter read as SQL (a collision such
+            // as `[qty]`), and only if that reading reproduces the part.
+            let all = Template::parse(&tpl, syntax, None);
             let known: BTreeSet<String> = p.parameters.keys().cloned().collect();
-            let t = Template::parse(&tpl, syntax, Some(&known));
-            let unresolved = t.unresolved().map(|s| t.slice(s).to_string()).collect();
+            let resolved = Template::parse(&tpl, syntax, Some(&known));
+            let missing = all.substitute(&p.parameters).is_err();
+            let t = if missing { &resolved } else { &all };
+            let unresolved: Vec<String> = t.unresolved().map(|s| t.slice(s).to_string()).collect();
             if p.template_hash
                 .as_ref()
                 .is_some_and(|h| *h != content_hash(&tpl))
@@ -291,7 +303,7 @@ pub fn check(
             }
             let outcome = match t.substitute(&p.parameters) {
                 Err(e) => Outcome::NotExpandable(e.iter().map(|x| x.to_string()).collect()),
-                Ok(out) => {
+                Ok(out) => 'cmp: {
                     let norm = |s: &str| -> Vec<String> {
                         let mut v: Vec<String> =
                             s.lines().map(|l| l.trim_end().to_string()).collect();
@@ -302,7 +314,18 @@ pub fn check(
                     };
                     let want = norm(&out.text);
                     let got = norm(&text[p.body_start..p.body_end]);
-                    match (0..want.len().max(got.len())).find(|&k| want.get(k) != got.get(k)) {
+                    let first = (0..want.len().max(got.len())).find(|&k| want.get(k) != got.get(k));
+                    if first.is_some() && !unresolved.is_empty() {
+                        // Reading the candidates as SQL does not explain the
+                        // part either: they are missing parameters.
+                        let Err(e) = all.substitute(&p.parameters) else {
+                            unreachable!("missing parameters")
+                        };
+                        break 'cmp Outcome::NotExpandable(
+                            e.iter().map(|x| x.to_string()).collect(),
+                        );
+                    }
+                    match first {
                         None => Outcome::Match,
                         Some(k) => Outcome::Mismatch {
                             line: lines.line_col(p.body_start).0 + k,
@@ -571,10 +594,10 @@ fn compare_parts(
             }
             let stmts = statements_in(p, &units);
             let kinds: Vec<StmtKind> = stmts.iter().map(|n| stmt_kind(n, an.dialect())).collect();
-            let effectful: Vec<ChangeClass> = kinds
+            // As in treediff: a compound is effectful when a statement in it is.
+            let effectful: Vec<ChangeClass> = stmts
                 .iter()
-                .filter(|k| k.is_effectful())
-                .map(|k| k.class())
+                .filter_map(|n| effect_class(n, an.dialect()))
                 .collect();
             let (class, verdict) = if let Some(c) = effectful
                 .iter()
@@ -649,15 +672,33 @@ fn compare_parts(
     }
 }
 
+/// The class of what running `n` does: its own kind when that is
+/// effectful, else the most severe effectful statement inside it.
+fn effect_class(n: &SyntaxNode, dialect: sqldiff_syntax::Dialect) -> Option<ChangeClass> {
+    let k = stmt_kind(n, dialect);
+    if k.is_effectful() {
+        return Some(k.class());
+    }
+    n.descendants()
+        .skip(1)
+        .filter(|c| c.kind().is_unit())
+        .map(|c| stmt_kind(&c, dialect))
+        .filter(|k| k.is_effectful())
+        .map(|k| k.class())
+        .max_by_key(|c| c.default_severity())
+}
+
 /// A wrapper fact: transaction, error-handling or session behaviour stated
 /// by a part other than the one holding the routine's writes.
 fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
     let f = facts::extract(an);
-    let body = f
+    // Body parts hold the routine's writes; every other part is wrapper.
+    let body: BTreeSet<String> = f
         .writes
-        .first()
-        .and_then(|w| comp.part_at(ast::sig_range(&w.node).0))
-        .map(|p| p.name.clone());
+        .iter()
+        .filter_map(|w| comp.part_at(ast::sig_range(&w.node).0))
+        .map(|p| p.name.clone())
+        .collect();
     let mut found: Vec<(usize, String, String)> = Vec::new();
     for n in an.root.descendants().filter(|n| n.kind().is_unit()) {
         let kind = stmt_kind(&n, an.dialect());
@@ -678,6 +719,17 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
             StmtKind::Block if f.atomic_blocks.contains(&n) => "atomic".to_string(),
             _ => continue,
         };
+        // A handler inside another handler is covered by the outer one.
+        let nested = key.starts_with("handler-")
+            && n.ancestors().skip(1).any(|x| {
+                matches!(
+                    stmt_kind(&x, an.dialect()),
+                    StmtKind::Handler | StmtKind::TryCatch | StmtKind::ExceptionSection
+                ) && x.kind().is_unit()
+            });
+        if nested {
+            continue;
+        }
         found.push((ast::sig_range(&n).0, key, an.snippet(&n, 60)));
     }
     if let Some((level, off)) = &f.commit_level {
@@ -689,18 +741,11 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
     }
     for (off, key, what) in found {
         let Some(p) = comp.part_at(off) else { continue };
-        if body.as_deref() == Some(p.name.as_str()) {
+        if body.contains(&p.name) {
             continue;
         }
-        // Handlers nested in another wrapper fact are covered by it.
-        if key.starts_with("handler-")
-            && report.assumptions.iter().any(|x| {
-                x.id.starts_with(&format!("COMPOSED-{:?}:{}:handler-", an.side, p.name))
-            })
-        {
-            continue;
-        }
-        let id = format!("COMPOSED-{:?}:{}:{key}", an.side, p.name);
+        let line = an.lines.line_col(off).0;
+        let id = format!("COMPOSED-{:?}:{}:{key}@{line}", an.side, p.name);
         if report.assumptions.iter().any(|x| x.id == id) {
             continue;
         }
@@ -837,6 +882,21 @@ mod tests {
     }
 
     #[test]
+    fn a_syntax_with_parts_wins_over_stray_lines() {
+        let both = vec![
+            Markers::new("one", r"^-- BEGIN (?P<part>\S+)$", r"^-- END$").unwrap(),
+            markers().remove(0),
+        ];
+        let text = "-- END\n-- [part:a template=x]\nSELECT 1;\n-- [/part]\n";
+        let c = read(text, &both).unwrap();
+        assert_eq!(c.parts.len(), 1);
+        assert!(c.problems.is_empty(), "{:?}", c.problems);
+        // With no parts anywhere, the problems still show.
+        let c = read("-- END\n", &both).unwrap();
+        assert!(c.parts.is_empty() && c.problems.len() == 1);
+    }
+
+    #[test]
     fn unbalanced_markers_are_problems() {
         let c = read(
             "-- [part:a template=x]\nSELECT 1;\n-- [part:b template=y]\nSELECT 2;\n",
@@ -871,12 +931,23 @@ mod tests {
             matches!(&bad[0].outcome, Outcome::Mismatch { line: 2, .. }),
             "{bad:?}"
         );
-        // KEY is not a parameter of the part: kept as SQL and listed, never guessed.
+        // KEY has no value and reading it as SQL does not explain the part:
+        // a missing parameter, never a silent match or a guess.
         let unknown = check(text, &c, &syntax, &|_| {
             Some("DELETE FROM {{TABLE}} WHERE k = {{KEY}};".into())
         });
-        assert_eq!(unknown[0].unresolved, vec!["{{KEY}}".to_string()]);
-        assert!(matches!(&unknown[0].outcome, Outcome::Mismatch { .. }));
+        assert!(
+            matches!(&unknown[0].outcome, Outcome::NotExpandable(e) if e[0].contains("KEY")),
+            "{unknown:?}"
+        );
+        // A candidate that is literally in the output is SQL (a collision), listed.
+        let lit = "-- [part:body template=b table=dbo.t]\nDELETE FROM dbo.t WHERE k = {{KEY}};\n-- [/part]\n";
+        let cl = read(lit, &markers()).unwrap();
+        let sql = check(lit, &cl, &syntax, &|_| {
+            Some("DELETE FROM {{TABLE}} WHERE k = {{KEY}};".into())
+        });
+        assert_eq!(sql[0].outcome, Outcome::Match);
+        assert_eq!(sql[0].unresolved, vec!["{{KEY}}".to_string()]);
         let none = check(text, &c, &syntax, &|_| None);
         assert_eq!(none[0].outcome, Outcome::NoTemplate);
         let mut stale = c.clone();

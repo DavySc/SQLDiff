@@ -158,21 +158,11 @@ fn check_mode(text: &str, dir: &TemplateDir, extra: &BTreeMap<String, String>) -
     let art = Artifact::new("gen.tsql.sql", Dialect::Tsql, text);
     let opts = Options::default();
     let mut r = sqldiff_core::check(&art, &opts);
-    let mut comp = compose::read(text, &pack.policy).unwrap().unwrap();
-    compose::merge_parameters(
-        &mut comp,
-        &[("cli", extra)],
-        pack.policy.template.as_ref().unwrap(),
-    );
-    compose::annotate(
-        &mut r,
-        (&art, Some(&comp)),
-        None,
-        &pack.policy,
-        Some(dir),
-        &opts,
-    )
-    .unwrap();
+    // Extra values arrive as parameter source `cli`, merged by the pack's rule.
+    let dir = TemplateDir::new(&dir.root)
+        .unwrap()
+        .with_params(extra.clone());
+    compose::apply(&mut r, &art, None, &pack.policy, Some(&dir), &opts);
     r
 }
 
@@ -203,13 +193,54 @@ fn check_mode_matches_and_mismatches() {
     // No value for SCHEMA: the header cannot be checked, which is never hidden.
     let none = check_mode(GENERATED, &dir, &BTreeMap::new());
     assert!(
-        none.findings
+        none.unknown_reasons
             .iter()
-            .any(|f| f.rule == "template.unresolved"),
-        "{:#?}",
-        none.findings
+            .any(|r| r.contains("part 'header'") && r.contains("no value for parameter `SCHEMA`")),
+        "{:?}",
+        none.unknown_reasons
     );
     assert_eq!(none.verdict, Verdict::Unknown);
+}
+
+/// A dropped part holding a compound with a write inside stays DIFFERENT.
+#[test]
+fn dropped_compound_part_is_different() {
+    let tail = "-- [part:body template=b]\n  UPDATE dbo.t SET x = 1;\n-- [/part]\nEND\n";
+    let a_text = format!(
+        "CREATE PROCEDURE dbo.p AS\nBEGIN\n-- [part:guard template=g]\n  BEGIN TRY\n    INSERT INTO dbo.audit (x) VALUES (1);\n  END TRY\n  BEGIN CATCH\n    THROW;\n  END CATCH;\n-- [/part]\n{tail}"
+    );
+    let b_text = format!("CREATE PROCEDURE dbo.p AS\nBEGIN\n{tail}");
+    let a = Artifact::new("a.sql", Dialect::Tsql, a_text);
+    let b = Artifact::new("b.sql", Dialect::Tsql, b_text);
+    let r = diff(&a, &b, &pack(), None);
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "composition.part-removed")
+        .expect("part finding");
+    assert_eq!(f.verdict, Verdict::Different, "{}", f.witness);
+    assert_eq!(r.verdict, Verdict::Different);
+}
+
+/// Check mode asked for without composition markers says so.
+#[test]
+fn templates_without_markers_are_not_silent() {
+    let (_d, dir) = template_dir("x");
+    let pack = pack();
+    let mut policy = pack.policy.clone();
+    policy.composition.clear();
+    let art = Artifact::new("gen.tsql.sql", Dialect::Tsql, GENERATED);
+    let opts = Options::default();
+    let mut r = sqldiff_core::check(&art, &opts);
+    compose::apply(&mut r, &art, None, &policy, Some(&dir), &opts);
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("check mode") && x.contains("did not run")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert_eq!(r.verdict, Verdict::Unknown);
 }
 
 #[test]
