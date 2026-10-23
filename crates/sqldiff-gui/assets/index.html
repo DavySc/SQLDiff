@@ -132,7 +132,7 @@ aside { border-left: 1px solid var(--line); background: var(--bg); overflow: aut
 .finding .at { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-left: auto; white-space: nowrap; }
 .finding p { margin: 3px 0 0; font-size: 13px; color: var(--fg); }
 .finding:not(.focus) p { color: color-mix(in srgb, var(--fg) 78%, var(--bg)); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.finding:not(.focus) .meta, .finding:not(.focus) .racts, .finding:not(.focus) textarea { display: none; }
+.finding:not(.focus) .meta, .finding:not(.focus):not(.commenting) .racts, .finding:not(.focus):not(.commenting) textarea { display: none; }
 .finding .meta { margin-top: 8px; font-size: 11px; color: var(--faint); display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: center; }
 .finding .meta button { font-size: 11px; padding: 0 6px; margin-left: auto; }
 .finding .assumes { margin-top: 8px; font-size: 12px; color: var(--muted); }
@@ -205,7 +205,7 @@ body.v-queue main, body.v-queue .pair-only { display: none !important; }
 .filters input:focus, .filters select:focus { border-color: var(--focus); }
 .filters .more { flex-basis: 100%; display: flex; gap: 6px 14px; flex-wrap: wrap; padding-top: 2px; }
 table.q { width: 100%; border-collapse: collapse; font-size: 13px; }
-table.q th { text-align: left; font-size: 11.5px; color: var(--faint); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: 49px; background: var(--panel); z-index: 1; }
+table.q th { text-align: left; font-size: 11.5px; color: var(--faint); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--line); position: sticky; top: var(--fh, 49px); background: var(--panel); z-index: 1; }
 table.q td { padding: var(--item-pad) 12px; border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); vertical-align: middle; }
 table.q th:first-child, table.q td:first-child { padding-left: 20px; }
 table.q tr.qrow { cursor: pointer; }
@@ -243,7 +243,9 @@ table.q .none { color: var(--faint); }
 #palette li kbd { flex: none; }
 
 @media (max-width: 900px) {
-  main, #queue { grid-template-columns: 1fr; } #overview { display: none; }
+  main, #queue { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) auto; } #overview { display: none; }
+  header { height: auto; min-height: 44px; flex-wrap: wrap; padding-top: 6px; padding-bottom: 6px; }
+  #nav .crumb { max-width: 60vw; }
   aside { border-left: 0; border-top: 1px solid var(--line); max-height: 40vh; }
   #btn-palette { min-width: 0; } #btn-palette .lbl, footer .keys { display: none; }
 }
@@ -448,8 +450,9 @@ function reviewState(e) {
   if (e.reviewed >= e.findings) return "reviewed";
   return e.reviewed ? "partial" : "unreviewed";
 }
-function queueRows() {
-  const q = state.q;
+// Rows matching the filters; `review` overrides the review filter (for the segment counts).
+function queueRows(review = state.q.review) {
+  const q = { ...state.q, review };
   const text = q.text.toLowerCase();
   const rows = state.page.queue.filter((e) =>
     (!q.cls || e.highest_class === q.cls) &&
@@ -478,7 +481,7 @@ function renderQueue() {
   const opt = (v, cur, text) => `<option value="${esc(v)}" ${v === cur ? "selected" : ""}>${esc(text || v || "all")}</option>`;
   const q = state.q;
   // Calm default: a search box and one segmented control. Rarer filters sit behind "Filters".
-  const count = (r) => all.filter((e) => !r || (r === "open" ? ["unreviewed", "partial"].includes(reviewState(e)) : reviewState(e) === r)).length;
+  const count = (r) => queueRows(r).length;
   const segs = [["", "All"], ["open", "Needs review"], ["reviewed", "Reviewed"], ["clean", "Clean"]];
   if (all.some((e) => e.error)) segs.push(["error", "Errors"]);
   if (q.review && !segs.some(([v]) => v === q.review)) segs.push([q.review, label(q.review)]);
@@ -524,6 +527,7 @@ function renderQueue() {
   }
   for (const el of $("qmain").querySelectorAll("button[data-seg]")) el.onclick = () => { state.q.review = el.dataset.seg; state.qsel = 0; renderQueue(); };
   $("btn-qmore").onclick = () => { state.qmore = !state.qmore; renderQueue(); };
+  $("qmain").style.setProperty("--fh", $("qmain").querySelector(".filters").offsetHeight + "px");
   for (const el of $("qmain").querySelectorAll("tr.qrow")) el.onclick = () => openPair(+el.dataset.i);
   wireSections($("qmain"));
   // Session-wide assumption panel.
@@ -633,7 +637,7 @@ function renderHeader() {
   const n = r.findings.length;
   const acc = r.findings.filter(isAccepted).length;
   const hid = r.noise.cosmetic + r.noise.structural;
-  $("summary").textContent = `· ${n} finding${n === 1 ? "" : "s"}${acc ? `, ${acc} accepted` : ""}`;
+  $("summary").textContent = `· ${n} finding${n === 1 ? "" : "s"}${acc ? `, ${acc} accepted` : ""}${hid ? ` · ${hid} noise hidden` : ""}`;
   $("summary").title = hid ? `${hid} cosmetic or structural difference${hid === 1 ? "" : "s"} hidden as noise` : "";
   $("btn-accepted").setAttribute("aria-pressed", state.hideAccepted);
   $("btn-fold").setAttribute("aria-pressed", state.fold);
@@ -754,7 +758,7 @@ function findingCard(f, i, asm) {
   // Where it is, in the short form shown on the right of every item.
   const at = [f.a, f.b].filter(Boolean).map((l) => `${l.side.toUpperCase()} ${l.start_line}`).join(" · ");
   const assumes = f.assumptions.map((id) => `<li title="${esc(id)}">${esc(asm[id] && asm[id].text ? asm[id].text : id)}</li>`).join("");
-  return `<div class="finding ${state.focus === i ? "focus" : ""} ${cur === "accepted" || cur === "rejected" ? "done" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
+  return `<div class="finding ${state.focus === i ? "focus" : ""} ${state.commenting === i ? "commenting" : ""} ${cur === "accepted" || cur === "rejected" ? "done" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
       <div class="head"><span class="dot" style="background:var(--fc)"></span><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)}</span>${tag}<span class="at">${esc(at)}</span></div>
       <p>${esc(f.witness)}</p>
       ${assumes ? `<div class="assumes"><span class="k">Holds only if</span><ul>${assumes}</ul></div>` : ""}
@@ -1060,7 +1064,8 @@ function init() {
   $("btn-density").onclick = () => setDensity(!document.body.classList.contains("compact"));
   setDensity(store.get("density") === "compact");
   $("help").onclick = () => $("help").classList.remove("open");
-  $("palette").onclick = (e) => { if (e.target === $("palette")) closePalette(); };
+  // Clicks inside the palette must not reach the document handler that closes the details popover.
+  $("palette").onclick = (e) => { e.stopPropagation(); if (e.target === $("palette")) closePalette(); };
   $("pal-in").oninput = filterPalette;
   $("pal-in").onkeydown = (e) => {
     if (e.key === "ArrowDown") { palSel = Math.min(palSel + 1, palItems.length - 1); drawPalette(); }

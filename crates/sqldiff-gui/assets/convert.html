@@ -8,10 +8,10 @@
 /* Palette shared with index.html (pair view); keep the two in sync. */
 :root {
   --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
-  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08); --accent: #4f46e5;
-  --chg-bg: #fff6dc; --chg-tok: #f5d77a; --del-bg: #fde8e8; --add-bg: #e3f5e8; --focus: #4f46e5;
-  --kw: #8a3ab9; --id: #1d1f21; --var: #b0551c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828;
-  --transactional: #c62828; --semantic: #d96b00;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5;
+  --chg-bg: #fff8e1; --chg-tok: #f9e08f; --del-bg: #fdecec; --add-bg: #e8f6ec; --focus: #4f46e5;
+  --kw: #7c3aad; --id: #1d1f21; --var: #a8521c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828;
+  --transactional: #d92d20; --semantic: #dc6803;
   --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-differs: #d92d20; --s-not_converted: #98a2b3;
   --b-assumptions: #fff6dc; --b-decision: #eef0ff; --b-differs: #fde8e8; --b-not_converted: #f2f4f7;
   --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
@@ -20,9 +20,9 @@
   :root {
     --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
     --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8;
-    --chg-bg: #3a3218; --chg-tok: #6b5a1c; --del-bg: #3d2222; --add-bg: #1e3626; --focus: #818cf8;
-    --kw: #c792ea; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #7d838c; --err: #ff6b6b;
-    --transactional: #ff6b6b; --semantic: #ffa94d;
+    --chg-bg: #2a2614; --chg-tok: #5a4c1c; --del-bg: #2f1c1c; --add-bg: #17291d; --focus: #818cf8;
+    --kw: #c4a1f0; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #6b717b; --err: #ff6b6b;
+    --transactional: #f97066; --semantic: #fdb022;
     --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-differs: #f97066; --s-not_converted: #667085;
     --b-assumptions: #3a3218; --b-decision: #24254a; --b-differs: #3d2222; --b-not_converted: #1e232b;
   }
@@ -48,7 +48,7 @@ button, .chip { font: inherit; font-size: 12.5px; font-weight: 500; border: 1px 
 button:hover:not(:disabled), .chip:hover { background: var(--soft); color: var(--fg); }
 button.outline { border-color: var(--line); background: var(--panel); color: var(--fg); }
 button:disabled { opacity: .45; cursor: default; }
-.chip { border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; }
+.chip { border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; border-color: var(--line); color: var(--fg); }
 .chip b { font-variant-numeric: tabular-nums; }
 .chip.zero { opacity: .45; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
