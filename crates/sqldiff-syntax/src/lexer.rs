@@ -183,10 +183,9 @@ impl<'a> Lexer<'a> {
                 DOT
             }
             ':' => {
-                if self.starts_with("::") && self.dialect != Dialect::Db2i {
-                    self.pos += 2;
-                    OP
-                } else if self.starts_with(":=") && self.dialect == Dialect::Postgres {
+                let cast = self.starts_with("::") && self.dialect != Dialect::Db2i;
+                let assign = self.starts_with(":=") && self.dialect == Dialect::Postgres;
+                if cast || assign {
                     self.pos += 2;
                     OP
                 } else {

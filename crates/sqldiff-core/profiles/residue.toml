@@ -1,0 +1,226 @@
+# Residue rules: syntax or names from one dialect left in an artifact of another.
+#
+# Each rule matches a sequence of significant tokens as the *target* dialect's
+# lexer produces them. Matchers:
+#   word:A|B     unquoted word, case-insensitive, any alternative
+#   text:X       exact token text
+#   prefix:X     token text starts with X (case-insensitive)
+#   kind:K|L     token kind (IDENT, NUMBER, OP, ...)
+# A leading `+` means the token must directly touch the previous one (no
+# whitespace or comments between them).
+
+# ---- T-SQL left in PostgreSQL / Db2 for i ---------------------------------
+
+[[rule]]
+id = "tsql.variable"
+origin = "tsql"
+targets = ["postgres"]
+message = "T-SQL variable syntax"
+pattern = ["text:@|@@", "+kind:IDENT"]
+
+[[rule]]
+id = "tsql.variable"
+origin = "tsql"
+targets = ["db2i"]
+message = "T-SQL variable syntax"
+pattern = ["prefix:@"]
+
+[[rule]]
+id = "tsql.bracket-identifier"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL bracketed identifier"
+pattern = ["text:[", "+kind:IDENT|QUOTED_IDENT", "+text:]"]
+
+[[rule]]
+id = "tsql.dbo-schema"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "SQL Server `dbo` schema qualifier"
+pattern = ["word:dbo", "+text:."]
+
+[[rule]]
+id = "tsql.builtin"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL built-in function"
+pattern = ["word:GETDATE|GETUTCDATE|SYSDATETIME|SYSUTCDATETIME|ISNULL|LEN|CHARINDEX|NEWID|SCOPE_IDENTITY|IIF|OBJECT_ID|DATALENGTH|SUSER_SNAME|ERROR_MESSAGE|ERROR_NUMBER|XACT_STATE", "text:("]
+
+[[rule]]
+id = "tsql.top"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL `TOP` row limit"
+pattern = ["word:SELECT|DISTINCT", "word:TOP"]
+
+[[rule]]
+id = "tsql.table-hint"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL table hint"
+pattern = ["word:NOLOCK|ROWLOCK|UPDLOCK|HOLDLOCK|READPAST|TABLOCKX"]
+
+[[rule]]
+id = "tsql.session-option"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL session option"
+pattern = ["word:SET", "word:NOCOUNT|XACT_ABORT|ANSI_NULLS|QUOTED_IDENTIFIER"]
+
+[[rule]]
+id = "tsql.statement"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL-only statement"
+pattern = ["word:RAISERROR|PRINT|EXEC"]
+
+[[rule]]
+id = "tsql.begin-tran"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL `BEGIN TRAN`"
+pattern = ["word:BEGIN", "word:TRAN"]
+
+[[rule]]
+id = "tsql.type"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "T-SQL data type"
+pattern = ["word:DATETIME2|DATETIMEOFFSET|UNIQUEIDENTIFIER|SMALLDATETIME|TINYINT|NTEXT|MONEY|SMALLMONEY|SQL_VARIANT"]
+
+# ---- PostgreSQL left in T-SQL / Db2 for i ---------------------------------
+
+[[rule]]
+id = "pg.cast-operator"
+origin = "postgres"
+targets = ["db2i"]
+message = "PostgreSQL `::` cast"
+pattern = ["text::", "+text::"]
+
+[[rule]]
+id = "pg.cast-operator"
+origin = "postgres"
+targets = ["tsql"]
+message = "PostgreSQL `::` cast"
+pattern = ["text:::", "+word:INT|INTEGER|TEXT|VARCHAR|NUMERIC|DATE|TIMESTAMP|BOOLEAN|BIGINT|UUID|JSONB|JSON"]
+
+[[rule]]
+id = "pg.ilike"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PostgreSQL `ILIKE`"
+pattern = ["word:ILIKE"]
+
+[[rule]]
+id = "pg.assignment"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PL/pgSQL `:=` assignment"
+pattern = ["text::", "+text:="]
+
+[[rule]]
+id = "pg.dollar-quote"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PostgreSQL dollar quoting"
+pattern = ["prefix:$$"]
+
+[[rule]]
+id = "pg.statement"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PL/pgSQL-only statement"
+pattern = ["word:PERFORM|RAISE"]
+
+[[rule]]
+id = "pg.builtin"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PostgreSQL built-in function"
+pattern = ["word:NOW|CLOCK_TIMESTAMP|STATEMENT_TIMESTAMP|GEN_RANDOM_UUID|STRING_AGG|ARRAY_AGG|PG_ADVISORY_XACT_LOCK|PG_ADVISORY_LOCK", "text:("]
+
+[[rule]]
+id = "pg.clause"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PostgreSQL-only clause"
+pattern = ["word:RETURNING"]
+
+[[rule]]
+id = "pg.on-conflict"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PostgreSQL `ON CONFLICT`"
+pattern = ["word:ON", "word:CONFLICT"]
+
+[[rule]]
+id = "pg.limit"
+origin = "postgres"
+targets = ["tsql"]
+message = "PostgreSQL `LIMIT`"
+pattern = ["word:LIMIT", "kind:NUMBER|PARAM|VARIABLE"]
+
+[[rule]]
+id = "pg.language"
+origin = "postgres"
+targets = ["tsql", "db2i"]
+message = "PostgreSQL routine language"
+pattern = ["word:LANGUAGE", "word:PLPGSQL"]
+
+# ---- Db2 for i left in T-SQL / PostgreSQL ---------------------------------
+
+[[rule]]
+id = "db2i.special-value"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 for i special value"
+pattern = ["text:*", "+word:NONE|NC|CHG|CS|ALL|RR|SYS|SQL|SOURCE|LIBL"]
+
+[[rule]]
+id = "db2i.set-option"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 for i `SET OPTION`"
+pattern = ["word:SET", "word:OPTION"]
+
+[[rule]]
+id = "db2i.signal"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 `SIGNAL`/`RESIGNAL`"
+pattern = ["word:SIGNAL|RESIGNAL"]
+
+[[rule]]
+id = "db2i.handler"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 condition handler"
+pattern = ["word:DECLARE", "word:CONTINUE|EXIT|UNDO", "word:HANDLER"]
+
+[[rule]]
+id = "db2i.special-register"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 special register written with a space"
+pattern = ["word:CURRENT", "word:TIMESTAMP|DATE|TIME|SCHEMA|PATH|SERVER"]
+
+[[rule]]
+id = "db2i.system-naming"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 for i system naming `LIB/FILE`"
+pattern = ["word:FROM|INTO|UPDATE|JOIN|TABLE|CALL", "kind:IDENT", "+text:/", "+kind:IDENT"]
+
+[[rule]]
+id = "db2i.builtin"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 built-in function"
+pattern = ["word:IDENTITY_VAL_LOCAL|GENERATE_UUID|VARCHAR_FORMAT|TIMESTAMPDIFF|DAYS|MICROSECOND|LOCATE_IN_STRING", "text:("]
+
+[[rule]]
+id = "db2i.final-table"
+origin = "db2i"
+targets = ["tsql", "postgres"]
+message = "Db2 `FINAL TABLE`"
+pattern = ["word:FINAL|NEW|OLD", "word:TABLE", "text:("]
