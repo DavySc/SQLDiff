@@ -13,19 +13,7 @@ id = "m04-lock-on-missing-row:original~mutated"
 reason = "no concurrency finding with verdict different [WP10 lock-intent analysis]"
 
 [[failing]]
-id = "m05-table-variable-to-temp-table:original~mutated"
-reason = "no transactional finding with verdict different [WP3 temp-state model]"
-
-[[failing]]
-id = "m06-continue-handler-removed:original~mutated"
-reason = "no semantic finding with verdict different [WP3 IR + WP9 behavioural diff]"
-
-[[failing]]
 id = "m07-exit-to-continue:original~mutated"
-reason = "verdict unknown != different [WP3 IR + WP9 behavioural diff]"
-
-[[failing]]
-id = "m08-atomic-dropped:original~mutated"
 reason = "verdict unknown != different [WP3 IR + WP9 behavioural diff]"
 
 [[failing]]
@@ -127,10 +115,6 @@ reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing
 [[failing]]
 id = "p08-delete-orphans:pg~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p09-error-rollback:tsql~db2i"
-reason = "verdict unknown != equal-under-assumptions [WP3 + WP9]"
 
 [[failing]]
 id = "p10-temp-state-rollback:tsql~pg"

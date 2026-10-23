@@ -31,7 +31,7 @@ $B diff tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.pg.sql
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif
 
 # Review: accept a deliberate difference by fingerprint; later runs suppress it
-$B review accept 06ccfd05e423182d --pair a.sql b.sql -c "callers map codes"
+$B review accept aacde30caae50448 --pair a.sql b.sql -c "callers map codes"
 $B diff a.sql b.sql --redact -f sarif         # shareable: names replaced by stable placeholders
 
 # Sources, packs and snapshots (design section 5)

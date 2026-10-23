@@ -88,13 +88,13 @@ fn ledger_comment_and_link() {
         &a,
         &b,
         "--finding",
-        "06ccfd05e423182d",
+        "aacde30caae50448",
         "--gui-url",
         "http://h:9/",
     ]);
     assert_eq!(code, 0);
     assert!(link.starts_with("http://h:9/?a="), "{link}");
-    assert!(link.trim_end().ends_with("#f=06ccfd05e423182d"));
+    assert!(link.trim_end().ends_with("#f=aacde30caae50448"));
     let (code, _) = sqldiff(&["open", &a, &b, "--finding", "nope"]);
     assert_eq!(code, 2);
 }
@@ -113,7 +113,7 @@ fn accepted_findings_are_suppressed_and_unknown_pairs_still_need_review() {
     let (a, b) = (f("movestock.tsql.sql"), f("movestock.pg.sql"));
     let (code, _) = sqldiff_in(
         &data,
-        &["review", "accept", "06ccfd05e423182d", "--pair", &a, &b],
+        &["review", "accept", "aacde30caae50448", "--pair", &a, &b],
     );
     assert_eq!(code, 0);
     let (_, out) = sqldiff_in(&data, &["queue", &dir, "-f", "json"]);
