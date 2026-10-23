@@ -154,15 +154,20 @@ pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Result<Request
             let authority = o.split_once("://").map_or(o, |(_, a)| a);
             host.as_deref() == Some(authority)
         };
+        if content_length > MAX_BODY {
+            return Ok(Err(("413 Payload Too Large", "text/plain", String::new())));
+        }
         if origin.as_deref().is_some_and(|o| !own(o)) {
+            // Read the body first: closing a socket with unread bytes resets the connection.
+            std::io::copy(
+                &mut (&mut reader).take(content_length as u64),
+                &mut std::io::sink(),
+            )?;
             return Ok(Err((
                 "403 Forbidden",
                 "text/plain",
                 "cross-origin request".to_string(),
             )));
-        }
-        if content_length > MAX_BODY {
-            return Ok(Err(("413 Payload Too Large", "text/plain", String::new())));
         }
         body = vec![0; content_length];
         reader.read_exact(&mut body)?;
