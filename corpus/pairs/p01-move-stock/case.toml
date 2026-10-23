@@ -1,0 +1,54 @@
+id = "p01-move-stock"
+title = "Move stock: the worked example of section 7"
+refs = ["design §7 worked example", "design §16 rollback scope"]
+tags = ["transaction", "error-contract"]
+description = """
+T-SQL manages its own transaction and reports failures through return codes.
+The Db2 for i conversion runs under commit level *NONE with no handler. The
+PostgreSQL conversion runs inside the caller's transaction and propagates errors.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "different"
+classes = ["transactional", "semantic"]
+assumptions = ["caller XACT_ABORT is off", "no triggers on stock_log"]
+witnesses = [
+  "If the INSERT fails, T-SQL rolls back the UPDATE and returns 2; Db2 exits with the UPDATE already durable.",
+  "If the caller already holds an open transaction, T-SQL's COMMIT only decrements @@TRANCOUNT; Db2 under *NONE has no transaction to join.",
+  "T-SQL returns 1 or 2 and raises nothing to a caller that checks only return codes; Db2 propagates the SQLSTATE.",
+]
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "different"
+classes = ["transactional", "semantic"]
+assumptions = ["caller XACT_ABORT is off"]
+witnesses = [
+  "If the INSERT fails, T-SQL rolls back and returns 2; PostgreSQL raises and dooms the caller's transaction block, so the caller must roll back.",
+  "T-SQL commits on success; the PostgreSQL function leaves durability to the caller's transaction.",
+]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "different"
+classes = ["transactional"]
+assumptions = []
+witnesses = [
+  "If the INSERT fails, PostgreSQL rolls back the UPDATE with the caller's transaction; Db2 under *NONE has already made the UPDATE durable.",
+]

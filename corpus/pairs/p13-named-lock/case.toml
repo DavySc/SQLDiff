@@ -1,0 +1,46 @@
+id = "p13-named-lock"
+title = "Named application lock: applock, advisory lock, row-lock emulation"
+refs = ["design §3 canonical advisory-lock node", "design §7 concurrency and isolation"]
+tags = ["concurrency", "idiom", "lock"]
+description = """
+Transaction-scoped exclusive named lock, then a delete. PostgreSQL maps the name to
+an advisory-lock key by hashing, so unrelated names can collide (extra blocking, never
+lost exclusion). Db2 for i emulates the lock with an exclusive row lock on app_lock,
+which only excludes anyone if the row exists.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal-under-assumptions"
+classes = ["structural"]
+assumptions = ["caller has no open transaction"]
+facts = ["V21"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural", "concurrency"]
+assumptions = ["app_lock contains the row 'price-feed'", "caller has no open transaction"]
+facts = ["V15"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural", "concurrency"]
+assumptions = ["app_lock contains the row 'price-feed'"]
+facts = ["V15", "V21"]

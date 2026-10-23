@@ -1,0 +1,122 @@
+# Origin and licence of every fixture in corpus/ (design §5.6).
+# Every fixture is synthetic: written for this repository, not derived from any
+# private or third-party code. They are covered by the repository's licence.
+
+[defaults]
+origin = "synthetic"
+author = "SQLDiff contributors"
+licence = "repository licence"
+
+[[fixture]]
+path = "catalog"
+
+[[fixture]]
+path = "packs"
+
+[[fixture]]
+path = "pairs/p01-move-stock"
+
+[[fixture]]
+path = "pairs/p02-upsert-price"
+
+[[fixture]]
+path = "pairs/p03-lookup-by-key"
+
+[[fixture]]
+path = "pairs/p04-display-name"
+
+[[fixture]]
+path = "pairs/p05-email-lookup"
+
+[[fixture]]
+path = "pairs/p06-paged-orders"
+
+[[fixture]]
+path = "pairs/p07-insert-return-id"
+
+[[fixture]]
+path = "pairs/p08-delete-orphans"
+
+[[fixture]]
+path = "pairs/p09-error-rollback"
+
+[[fixture]]
+path = "pairs/p10-temp-state-rollback"
+
+[[fixture]]
+path = "pairs/p11-string-aggregation"
+
+[[fixture]]
+path = "pairs/p12-days-between"
+
+[[fixture]]
+path = "pairs/p13-named-lock"
+
+[[fixture]]
+path = "mutations/m01-correlated-update-exists-removed"
+
+[[fixture]]
+path = "mutations/m02-commit-before-last-dml"
+
+[[fixture]]
+path = "mutations/m03-merge-lock-hint-dropped"
+
+[[fixture]]
+path = "mutations/m04-lock-on-missing-row"
+
+[[fixture]]
+path = "mutations/m05-table-variable-to-temp-table"
+
+[[fixture]]
+path = "mutations/m06-continue-handler-removed"
+
+[[fixture]]
+path = "mutations/m07-exit-to-continue"
+
+[[fixture]]
+path = "mutations/m08-atomic-dropped"
+
+[[fixture]]
+path = "mutations/m09-commit-level-none"
+
+[[fixture]]
+path = "mutations/m10-set-subquery-to-select-assign"
+
+[[fixture]]
+path = "mutations/m11-select-into-without-strict"
+
+[[fixture]]
+path = "mutations/m12-merge-by-source-split"
+
+[[fixture]]
+path = "mutations/m13-coalesce-to-isnull"
+
+[[fixture]]
+path = "mutations/m14-terminator-before-throw"
+
+[[fixture]]
+path = "mutations/m15-dropped-column-reference"
+
+[[fixture]]
+path = "mutations/m16-outdated-signature"
+
+[[fixture]]
+path = "mutations/m17-shadowed-variable"
+
+[[fixture]]
+path = "mutations/m18-dialect-residue"
+
+[[fixture]]
+path = "mutations/m19-case-insensitivity-dropped"
+
+[[fixture]]
+path = "mutations/m20-trigger-to-out-of-engine-handler"
+
+[[fixture]]
+path = "mutations/m21-time-source-changed"
+
+[[fixture]]
+path = "mutations/m22-null-ordering-changed"
+
+[[fixture]]
+path = "mutations/m23-composed-fragment-dropped"

@@ -1,0 +1,40 @@
+id = "p08-delete-orphans"
+title = "Delete orphans: anti-join vs NOT EXISTS"
+refs = ["design §3 canonical delete-orphans node"]
+tags = ["idiom"]
+description = """
+The T-SQL LEFT JOIN ... IS NULL form and the NOT EXISTS form lift to the same
+delete-orphans node. The rewrite is sound because item.item_id is a non-null key.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal"
+classes = ["structural"]
+discharged = ["item.item_id is the primary key (catalog)"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal"
+classes = ["structural"]
+discharged = ["item.item_id is the primary key (catalog)"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal"
+classes = ["cosmetic"]

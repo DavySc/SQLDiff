@@ -1,0 +1,24 @@
+id = "m08-atomic-dropped"
+title = "ATOMIC compound replaced by a plain compound"
+catalog_item = "drop an `ATOMIC` compound"
+refs = ["design §7 transactions", "design §7 statement atomicity"]
+detected_by = "behavioural"
+milestone = "M5b"
+
+[sides.original]
+dialect = "db2i"
+file = "original.db2i.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional"]
+facts = ["V4"]
+witnesses = [
+  "If the second stock UPDATE fails, the original undoes the first UPDATE before returning the error; the mutated version leaves it in the caller's unit of work, where a later COMMIT makes it durable.",
+]

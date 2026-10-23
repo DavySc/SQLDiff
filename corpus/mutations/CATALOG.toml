@@ -1,0 +1,95 @@
+# The mutation catalog of design §12, one entry per mutation, with the case that
+# covers it. tools/check_corpus.py fails if an entry has no case or a case is not
+# listed here.
+
+[[mutation]]
+item = "remove WHERE EXISTS from a correlated UPDATE"
+case = "m01-correlated-update-exists-removed"
+
+[[mutation]]
+item = "move a COMMIT before the last DML"
+case = "m02-commit-before-last-dml"
+
+[[mutation]]
+item = "drop a locking hint from a MERGE"
+case = "m03-merge-lock-hint-dropped"
+
+[[mutation]]
+item = "replace advisory-lock emulation with a lock on a row that can be missing"
+case = "m04-lock-on-missing-row"
+
+[[mutation]]
+item = "table variable → transactional temporary table"
+case = "m05-table-variable-to-temp-table"
+
+[[mutation]]
+item = "remove CONTINUE handlers"
+case = "m06-continue-handler-removed"
+
+[[mutation]]
+item = "EXIT → CONTINUE"
+case = "m07-exit-to-continue"
+
+[[mutation]]
+item = "drop an `ATOMIC` compound"
+case = "m08-atomic-dropped"
+
+[[mutation]]
+item = "change the commit level to `*NONE`"
+case = "m09-commit-level-none"
+
+[[mutation]]
+item = "SET @v = (subquery) → SELECT @v = …"
+case = "m10-set-subquery-to-select-assign"
+
+[[mutation]]
+item = "`SELECT INTO` without `STRICT`"
+case = "m11-select-into-without-strict"
+
+[[mutation]]
+item = "split a MERGE with `NOT MATCHED BY SOURCE` into MERGE + DELETE"
+case = "m12-merge-by-source-split"
+
+[[mutation]]
+item = "`COALESCE` → `ISNULL` with differing lengths"
+case = "m13-coalesce-to-isnull"
+
+[[mutation]]
+item = "remove the terminator before `THROW`"
+case = "m14-terminator-before-throw"
+
+[[mutation]]
+item = "reference a column that no longer exists"
+case = "m15-dropped-column-reference"
+
+[[mutation]]
+item = "call a routine with an outdated signature"
+case = "m16-outdated-signature"
+
+[[mutation]]
+item = "shadow a variable"
+case = "m17-shadowed-variable"
+
+[[mutation]]
+item = "leave a schema qualifier or syntax from another dialect behind"
+case = "m18-dialect-residue"
+
+[[mutation]]
+item = "drop a case-insensitivity emulation (`upper` / `lower` / `ILIKE`) from a comparison"
+case = "m19-case-insensitivity-dropped"
+
+[[mutation]]
+item = "replace an engine trigger with an out-of-engine handler"
+case = "m20-trigger-to-out-of-engine-handler"
+
+[[mutation]]
+item = "change `now()` to `clock_timestamp()` (or the reverse)"
+case = "m21-time-source-changed"
+
+[[mutation]]
+item = "change NULL ordering"
+case = "m22-null-ordering-changed"
+
+[[mutation]]
+item = "drop a composed fragment from a generated output"
+case = "m23-composed-fragment-dropped"

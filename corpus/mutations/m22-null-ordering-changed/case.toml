@@ -1,0 +1,25 @@
+id = "m22-null-ordering-changed"
+title = "NULL ordering changed in conversion"
+catalog_item = "change NULL ordering"
+refs = ["design §4 NULL ordering", "design §7 NULL ordering"]
+detected_by = "early-check"
+milestone = "M4"
+note = "The faithful conversion orders by o.shipped_at NULLS FIRST."
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic"]
+facts = ["V19"]
+witnesses = [
+  "For a customer with unshipped orders (shipped_at NULL), T-SQL sorts them first and returns them in the top 10; PostgreSQL sorts NULLs last and may return none of them.",
+]

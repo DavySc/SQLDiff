@@ -1,0 +1,23 @@
+id = "m14-terminator-before-throw"
+title = "Missing terminator turns THROW into a transaction name"
+catalog_item = "remove the terminator before `THROW`"
+refs = ["design §3 layer 1 T-SQL hard cases", "design §16 missing terminator"]
+detected_by = "parse-lint"
+milestone = "M3"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "If the INSERT fails, the original rolls back and re-raises; in the mutated version `ROLLBACK THROW` parses as a rollback of a transaction named THROW, so the error is swallowed and the procedure returns normally.",
+]

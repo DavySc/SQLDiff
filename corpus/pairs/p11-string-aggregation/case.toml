@@ -1,0 +1,42 @@
+id = "p11-string-aggregation"
+title = "Ordered string aggregation"
+refs = ["design §7 built-in availability"]
+tags = ["builtins", "limit"]
+description = """
+STRING_AGG, string_agg and LISTAGG with an explicit order. The results agree as
+long as the aggregate fits: T-SQL errors past 8000 bytes for a non-max input and
+LISTAGG has its own result length, while PostgreSQL text is unbounded.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal-under-assumptions"
+classes = ["structural", "limit"]
+assumptions = ["the aggregated list stays under 8000 bytes"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural", "limit"]
+assumptions = ["the aggregated list stays under 8000 bytes", "the aggregated list fits the LISTAGG result length"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural", "limit"]
+assumptions = ["the aggregated list fits the LISTAGG result length"]

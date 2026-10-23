@@ -1,0 +1,41 @@
+id = "p04-display-name"
+title = "NULL-safe concatenation in a view"
+refs = ["design §7 NULL, strings, types"]
+tags = ["null", "strings"]
+description = """
+`+` and `||` both yield NULL when an operand is NULL, so the ISNULL / COALESCE
+wrappers are what make the three views agree. last_name is NOT NULL.
+ISNULL takes the type of its first argument, which is wide enough here.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal"
+classes = ["structural"]
+discharged = ["customer.last_name is NOT NULL (catalog)"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal"
+classes = ["structural"]
+discharged = ["customer.last_name is NOT NULL (catalog)"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal"
+classes = ["cosmetic"]

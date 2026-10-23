@@ -1,0 +1,23 @@
+id = "m06-continue-handler-removed"
+title = "CONTINUE handler removed"
+catalog_item = "remove CONTINUE handlers"
+refs = ["design §7 error handling"]
+detected_by = "behavioural"
+milestone = "M5b"
+
+[sides.original]
+dialect = "db2i"
+file = "original.db2i.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "If the customer already exists, the original sets p_skipped = 1, writes the audit row and returns normally; the mutated version exits with SQLSTATE 23505 and writes no audit row.",
+]

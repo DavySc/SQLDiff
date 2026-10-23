@@ -1,0 +1,24 @@
+id = "m15-dropped-column-reference"
+title = "Reference to a column that no longer exists"
+catalog_item = "reference a column that no longer exists"
+refs = ["design §3 layer 2 binding", "design §16 column removed or renamed"]
+detected_by = "early-check"
+milestone = "M3"
+note = "PL/pgSQL bodies are not bound at CREATE time, so the mutated function is created without error and fails on first call."
+
+[sides.original]
+dialect = "pg"
+file = "original.pg.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["binding"]
+witnesses = [
+  "stock has no column reserved_qty in the catalog; every call of the mutated function fails with undefined_column.",
+]

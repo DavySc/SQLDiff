@@ -1,0 +1,32 @@
+id = "m20-trigger-to-out-of-engine-handler"
+title = "Engine trigger replaced by an out-of-engine handler"
+catalog_item = "replace an engine trigger with an out-of-engine handler"
+refs = ["design §7 triggers, handlers and substitutes", "design §16 trigger replaced"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "pg"
+file = "original.pg.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+# Out-of-engine substitutes are facts supplied by an adapter or pack (design §7).
+# The corpus states them here so a test can feed them to the core.
+[[substitutes]]
+side = "mutated"
+replaces = "AFTER UPDATE ON stock FOR EACH ROW"
+handler = "stock_audit_handler"
+invocation = "application, once per updated row, after the triggering transaction commits"
+error_propagation = "none: a failing handler does not affect the triggering transaction"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional"]
+witnesses = [
+  "If the audit INSERT fails, the original rolls back the stock UPDATE with it; with the out-of-engine handler the UPDATE is already committed and the audit row is lost.",
+]
