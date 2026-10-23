@@ -1,0 +1,212 @@
+# Db2 for i semantic tables (design §4, §7). Target: IBM i 7.4-7.6.
+# Format: docs/semantic-profiles.md. Tests: crates/sqldiff-core/tests/semantics.rs.
+# Several rows rest on facts that could not be read in the vendor docs (V4, V5,
+# V14): they are `unverified` or `partial` and become assumptions when used.
+
+dialect = "db2i"
+
+# ---- Error kinds (codes are SQLSTATEs) ----------------------------------------
+[error_kinds.constraint]
+class = "error"
+codes = ["23*"]
+[error_kinds.conversion]
+class = "error"
+codes = ["22018", "22007", "22008", "22003", "22023"]
+[error_kinds.arithmetic]
+class = "error"
+codes = ["22012"]
+[error_kinds.cardinality]
+class = "error"
+codes = ["21000", "21506"]
+[error_kinds.not_found]
+class = "warning"
+codes = ["02000"]
+[error_kinds.lock]
+class = "error"
+codes = ["57033", "40001"]
+[error_kinds.user_signal]
+class = "error"
+codes = ["75000", "38*"]
+[error_kinds.name_resolution]
+class = "error"
+codes = ["42704", "42703", "42884"]
+[error_kinds.cancel]
+class = "error"
+codes = ["57014"]
+[error_kinds.other]
+class = "error"
+codes = ["*"]
+
+# Handler conditions -> kinds. SQLEXCEPTION is every SQLSTATE class other than
+# 00, 01 and 02; NOT FOUND is class 02.
+[conditions]
+SQLEXCEPTION = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "user_signal", "name_resolution", "cancel", "other"]
+SQLWARNING = []
+"NOT FOUND" = ["not_found"]
+
+[raises]
+insert = ["constraint", "conversion", "arithmetic", "lock", "other"]
+update = ["constraint", "conversion", "arithmetic", "cardinality", "not_found", "lock", "other"]
+delete = ["constraint", "not_found", "lock", "other"]
+merge = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "other"]
+select_into = ["conversion", "arithmetic", "cardinality", "not_found", "lock", "other"]
+commit = []
+call = ["other"]
+
+# ---- Unhandled conditions ------------------------------------------------------
+[[unhandled]]
+id = "db2i.unhandled.warning"
+kinds = ["not_found"]
+statement = "rollback"
+transaction = "none"
+control = "next"
+status = "confirmed"
+note = "Warnings and NOT FOUND without a handler: execution continues."
+
+[[unhandled]]
+id = "db2i.unhandled.no-commit"
+when = { no_commit = true }
+statement = "partial"
+transaction = "none"
+control = "exit"
+fact = "V2"
+status = "corrected"
+note = "Under COMMIT(*NONE) a statement is not atomic: rows changed before the error stay changed, and the routine exits with the SQLSTATE."
+
+[[unhandled]]
+id = "db2i.unhandled.exception"
+statement = "rollback"
+transaction = "none"
+control = "exit"
+fact = "V6"
+status = "partial"
+note = "Under commitment control the failing statement is rolled back and the routine exits; earlier changes stay pending in the caller's unit of work. Unhandled inside ATOMIC: the compound is rolled back first."
+
+# ---- Caught conditions ---------------------------------------------------------
+[[caught]]
+id = "db2i.caught.undo-handler-no-commit"
+construct = "undo_handler"
+when = { no_commit = true }
+statement = "partial"
+transaction = "none"
+fact = "V4"
+status = "unverified"
+note = "Inference: without commitment control nothing can be undone."
+
+[[caught]]
+id = "db2i.caught.no-commit"
+when = { no_commit = true }
+statement = "partial"
+transaction = "none"
+fact = "V2"
+status = "corrected"
+note = "Under *NONE the failing statement keeps the rows it changed before the error, also when a handler catches it."
+
+[[caught]]
+id = "db2i.caught.continue-handler"
+construct = "continue_handler"
+statement = "rollback"
+transaction = "none"
+status = "confirmed"
+note = "The handler runs, then execution continues after the statement that raised the condition."
+
+[[caught]]
+id = "db2i.caught.exit-handler"
+construct = "exit_handler"
+statement = "rollback"
+transaction = "none"
+status = "confirmed"
+note = "The handler runs, then control leaves the compound statement that declared it."
+
+[[caught]]
+id = "db2i.caught.undo-handler"
+construct = "undo_handler"
+statement = "rollback"
+transaction = "rollback_scope"
+fact = "V4"
+status = "partial"
+note = "UNDO (only in ATOMIC) rolls back the compound's changes, runs the handler and leaves the compound."
+
+# ---- Transactions --------------------------------------------------------------
+[transactions]
+nesting = { value = "flat", status = "confirmed" }
+rollback_scope = { value = "all", status = "confirmed", note = "ROLLBACK ends the unit of work of the commitment definition." }
+commit_without_txn = { value = "noop", fact = "V4", status = "partial", note = "Under *NONE COMMIT and ROLLBACK have nothing to act on." }
+rollback_without_txn = { value = "noop", fact = "V4", status = "partial" }
+savepoints = { value = "savepoint", fact = "V14", status = "partial" }
+savepoints_need_commitment_control = { value = true, fact = "V14", status = "partial" }
+commit_in_exception_block = { value = "allowed", status = "confirmed" }
+commit_in_atomic = { value = "error", fact = "V4", status = "confirmed", note = "COMMIT and ROLLBACK (except ROLLBACK TO SAVEPOINT) are not allowed in ATOMIC." }
+commit_in_caller_txn = { value = "commits_caller", fact = "V6", status = "confirmed", note = "The commitment definition is scoped to the activation group (*CALLER), so COMMIT commits the caller's work too." }
+doomed_commit = { value = "error", status = "partial" }
+doomed_writes = { value = "allowed", status = "confirmed", note = "An error does not doom the unit of work." }
+no_commit_levels = { value = ["*NONE", "*NC"], fact = "V2", status = "corrected" }
+survives_rollback = { value = ["identity", "sequence", "no_commit"], status = "confirmed" }
+ddl = { value = "verify", status = "unverified" }
+commit_level_default = { value = "unknown", fact = "V5", status = "partial", note = "Taken from the creating environment; never assume, read SET OPTION COMMIT." }
+prerequisite = { value = "journaled", status = "confirmed", note = "Commitment control needs journaled tables." }
+
+[transactions.routine_mode]
+procedure = { value = "commit_level", fact = "V6", status = "confirmed", note = "Runs in the caller's activation group; changes join the caller's unit of work unless COMMIT = *NONE." }
+function = { value = "commit_level", status = "partial" }
+trigger = { value = "commit_level", status = "partial" }
+anonymous = { value = "commit_level", fact = "V6", status = "confirmed" }
+script = { value = "commit_level", fact = "V5", status = "partial" }
+
+[atomicity]
+statement = { value = "commitment_control", fact = "V2", status = "corrected", note = "Statements are atomic only under commitment control." }
+routine_body = { value = "none", status = "confirmed", note = "Not atomic unless the body is BEGIN ATOMIC." }
+atomic_compound = { value = "savepoint", fact = "V14", status = "partial", note = "BEGIN ATOMIC opens a savepoint level; an unhandled error rolls the compound back." }
+atomic_under_no_commit = { value = false, fact = "V4", status = "unverified", note = "Inference: under *NONE an ATOMIC compound cannot roll anything back." }
+merge = { value = "commitment_control", fact = "V2", status = "corrected", note = "ATOMIC is honoured only with an isolation level other than No Commit." }
+merge_not_atomic = { value = "partial", fact = "V2", status = "confirmed", note = "MERGE ... NOT ATOMIC CONTINUE|STOP ON SQLEXCEPTION keeps the rows processed before the error." }
+
+[[temp]]
+id = "db2i.temp.dgtt"
+object = "dgtt"
+schema = "SESSION"
+on_rollback = "empty"
+on_commit = "empty"
+lifetime = "job"
+fact = "V7"
+status = "corrected"
+note = "Defaults ON COMMIT DELETE ROWS and, with NOT LOGGED, ON ROLLBACK DELETE ROWS; PRESERVE ROWS keeps them. ON ROLLBACK does not apply under No Commit."
+
+[[cardinality]]
+id = "db2i.card.select-into"
+form = "select_into"
+many = "error"
+none = "not_found_warning"
+status = "confirmed"
+note = "More than one row raises SQLSTATE 21000; no rows raises the NOT FOUND condition (02000)."
+
+[[cardinality]]
+id = "db2i.card.scalar-subquery"
+form = "scalar_subquery"
+many = "error"
+none = "null"
+status = "confirmed"
+
+[[cardinality]]
+id = "db2i.card.correlated-update"
+form = "update_from"
+many = "error"
+none = "null"
+status = "confirmed"
+note = "A correlated UPDATE ... SET c = (SELECT ...) sets NULL for rows without a match unless restricted with EXISTS."
+
+[[cardinality]]
+id = "db2i.card.merge-many-sources"
+form = "merge"
+many = "error"
+none = "unchanged"
+fact = "V3"
+status = "partial"
+
+[[cardinality]]
+id = "db2i.card.dml-no-rows"
+form = "dml"
+many = "ok"
+none = "not_found_warning"
+status = "confirmed"
+note = "A searched UPDATE or DELETE that touches no rows raises NOT FOUND (02000), which a NOT FOUND handler catches."

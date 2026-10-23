@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod classify;
 mod engine;
 pub mod facts;
+pub mod ir;
 pub mod lint;
 pub mod model;
 pub mod normalize;
