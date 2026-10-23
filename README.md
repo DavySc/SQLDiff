@@ -25,6 +25,13 @@ $B tree src/tsql src/db2 --dialect-a tsql --dialect-b db2i
 # Machine output for CI
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif
 
+# Sources, packs and snapshots (design section 5)
+$B pairs tests/fixtures --diff                        # pair by pack rules, diff every pair
+$B pairs git:.@main//db --pack ../private-pack --diff  # committed tree at a revision
+$B snapshot git:.@v1.2//db -o v1.2.json --history     # canonical, content-hashed bundle
+$B pairs v1.2.json --diff                             # offline, from the bundle
+$B config                                             # merged config and its layers
+
 # Pair view in the browser (statement-aligned, findings panel, live scratchpad)
 target/release/sqldiff-gui serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
 target/release/sqldiff-gui export --report report.json -o pair.html   # static, read-only
@@ -54,10 +61,11 @@ Verdict: DIFFERENT
 | 5 Structural diff | Same-dialect: statements aligned by normalized content (not lines), cosmetic changes counted and hidden, edits, additions, removals and moves classified, including moves across transaction boundaries. T-SQL identifier case folds only under an explicit collation assumption. |
 | Behavioural checks | Summary-level transaction/error model: atomicity when a later write fails, Db2 `*NONE` statement atomicity, caller-owned transactions vs `*NONE`, return-code vs raised-error contract. Cross-dialect write pairing (incl. MERGE vs `ON CONFLICT` upserts, Db2 `FINAL TABLE`). |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
-| Interfaces | CLI `diff` / `check` / `parse` / `tree`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
+| 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
+| Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
 | GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
-Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, packs/adapters, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
+Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
 ## MCP server
 
@@ -83,10 +91,12 @@ Each result carries a readable text block and the same data as `structuredConten
 ```
 crates/sqldiff-syntax   lexers, parser, CST helpers (no analysis)
 crates/sqldiff-core     findings model, normalization, diff engines, checks, renderers
+crates/sqldiff-source   packs, layered config, adapter protocol, fs/git/bundle adapters, pairing
 crates/sqldiff-cli      the `sqldiff` binary
 crates/sqldiff-mcp      the `sqldiff-mcp` stdio MCP server
 crates/sqldiff-gui      the `sqldiff-gui` pair view (local server + embedded page)
 tests/fixtures          synthetic fixtures (all written for this repository)
+docs/examples/pack      synthetic example pack using every section
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time
 ```
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sqldiff-syntax", "crates/sqldiff-core", "crates/sqldiff-cli", "crates/sqldiff-mcp", "crates/sqldiff-gui"]
+members = ["crates/sqldiff-syntax", "crates/sqldiff-core", "crates/sqldiff-source", "crates/sqldiff-cli", "crates/sqldiff-mcp", "crates/sqldiff-gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,9 +11,11 @@ publish = false
 [workspace.dependencies]
 sqldiff-syntax = { path = "crates/sqldiff-syntax" }
 sqldiff-core = { path = "crates/sqldiff-core" }
+sqldiff-source = { path = "crates/sqldiff-source" }
 rowan = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
+regex = "1"

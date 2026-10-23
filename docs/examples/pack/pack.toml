@@ -1,0 +1,114 @@
+# Example pack (synthetic). Copy it to a private location and adapt it;
+# organisation-specific packs never belong in this repository.
+
+# Terms the leak scan rejects. Real deny-lists live only in private packs.
+deny_list = []
+
+# Paths a filesystem or git source skips.
+ignore = ["**/generated/tmp/**"]
+
+[pack]
+name = "example"
+version = "0.1.0"
+schema = 1
+description = "Synthetic example of every pack section"
+
+# Target engine versions (project policy: SQL Server 2022, PostgreSQL 18).
+[dialect_versions]
+tsql = "2022"
+postgres = "18"
+db2i = "7.6"
+
+# Which files are written in which dialect; first match wins. Without a
+# match, a directory or file-name part naming a dialect decides
+# (tsql/x.sql, x.pg.sql); otherwise the dialect is unknown.
+[[dialect_map]]
+glob = "mssql/**/*.sql"
+dialect = "tsql"
+
+[[dialect_map]]
+glob = "postgres/**/*.sql"
+dialect = "postgres"
+
+[[dialect_map]]
+glob = "ibmi/**/*.sql"
+dialect = "db2i"
+version = "7.5"
+
+# Pairing: names become keys; objects with equal keys in two dialects pair.
+[[pairing.rules]]
+name = "tsql-prefixes"
+dialect = "tsql"
+strip_prefix = ["usp_", "fn_"]
+case = "lower"
+ignore_chars = "_-"
+
+[[pairing.rules]]
+name = "db2-suffix"
+dialect = "db2i"
+strip_suffix = ["_p"]
+
+[[pairing.pairs]]
+a = "mssql/legacy_name.sql"
+b = "postgres/new_name.sql"
+
+[pairing]
+shared = ["common/**"]
+
+# Template syntax of a code generator (section 5.3).
+[template]
+open = "<%"
+close = "%>"
+name_pattern = "[A-Z_][A-Z0-9_]*"
+parameter_sources = ["environment", "object"]
+collision = "error"
+special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
+
+[[composition]]
+name = "part markers"
+begin = "^-- BEGIN PART (?P<part>\\S+)"
+end = "^-- END PART"
+
+[[helpers]]
+name = "fmt_amount"
+dialect = "tsql"
+returns = "varchar(32)"
+deterministic = true
+description = "Formats an amount for display"
+
+[[author_markers]]
+kind = "intentional_difference"
+pattern = "--\\s*SYNC-OK:\\s*(.*)"
+
+[[author_markers]]
+kind = "sync_partner"
+pattern = "--\\s*SYNC-WITH:\\s*(\\S+)"
+
+[[change_patterns]]
+name = "work item"
+pattern = "\\b(WI-[0-9]+)\\b"
+
+[[limits]]
+id = "routine-size"
+message = "Routine larger than the platform's statement size limit"
+dialects = ["db2i"]
+max_bytes = 2097152
+
+[[limits]]
+id = "no-cursor"
+message = "Cursors are not allowed by local policy"
+pattern = "(?i)\\bdeclare\\s+\\w+\\s+cursor\\b"
+severity = "medium"
+
+[assumptions]
+ASM-TSQL-CALLER-XACT-ABORT-OFF = "Callers never set XACT_ABORT ON (declared by the example pack)"
+
+[[overrides]]
+rule = "residue.*"
+severity = "high"
+
+[[adapters]]
+name = "catalog-export"
+command = ["my-adapter", "--stdio"]
+env = { ADAPTER_LOG = "warn" }
+credential = "env:MY_ADAPTER_CREDENTIAL"
