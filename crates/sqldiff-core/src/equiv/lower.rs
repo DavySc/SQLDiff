@@ -72,8 +72,9 @@ pub struct Unit {
     pub uncovered: Vec<(SyntaxNode, String)>,
     /// Explicit transaction control or a recognised rollback-and-rethrow protocol.
     pub txn_control: bool,
-    /// T-SQL `SET XACT_ABORT ON` in the routine: a failed statement ends it.
-    pub xact_abort_on: bool,
+    /// T-SQL: SET XACT_ABORT ON or a CATCH that rethrows, so a failing
+    /// statement ends the routine instead of letting it continue.
+    pub stops_on_error: bool,
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
     pub notes: Vec<String>,
@@ -92,7 +93,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         stmts: Vec::new(),
         uncovered: Vec::new(),
         txn_control: false,
-        xact_abort_on: false,
+        stops_on_error: false,
         txn_stmts: Vec::new(),
         notes: Vec::new(),
     };
@@ -415,6 +416,7 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
                     SyntaxKind::CATCH_BLOCK => {
                         if is_rollback_rethrow(&part, d) {
                             u.txn_control = true;
+                            u.stops_on_error = true;
                         } else {
                             u.uncovered.push((part.clone(), "a CATCH block".into()));
                         }
@@ -537,7 +539,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         }
         StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => {
             u.txn_control = true;
-            u.xact_abort_on = true;
+            u.stops_on_error = true;
         }
         _ => {
             let what = format!(

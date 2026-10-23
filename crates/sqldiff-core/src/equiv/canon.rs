@@ -2058,14 +2058,9 @@ impl<'a> Canon<'a> {
     pub fn lift(&mut self, stmts: Vec<Item>) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         for mut it in stmts {
-            // T-SQL: INSERT ...; SET @v = SCOPE_IDENTITY(). Only with XACT_ABORT ON:
-            // otherwise a failed INSERT continues and sets @v to NULL (corpus p07),
-            // which a single INSERT ... RETURNING does not do.
+            // T-SQL: INSERT ...; SET @v = SCOPE_IDENTITY();
             let t = it.term.clone();
-            if self.unit.xact_abort_on
-                && t.is("assign")
-                && t.kid(1).is_some_and(|v| v.is("scope_identity"))
-            {
+            if t.is("assign") && t.kid(1).is_some_and(|v| v.is("scope_identity")) {
                 if let Some(prev) = out.last() {
                     if prev.term.is("insert1") && prev.err.is_none() {
                         let table = prev.term.kids()[0].atom().unwrap_or("").to_string();
