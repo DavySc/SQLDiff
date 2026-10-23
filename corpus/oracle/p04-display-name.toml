@@ -1,0 +1,14 @@
+case = "p04-display-name"
+pairs = [["tsql", "pg"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (2, 'bo@example.com', NULL, 'Baker', '2026-01-01 10:00:00');
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (3, 'cy@example.com', '', 'Cole', '2026-01-01 10:00:00');
+"""
+
+[[scenario]]
+name = "every row"
+call = "SELECT customer_id, display_name FROM customer_display ORDER BY customer_id;"

@@ -713,6 +713,7 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
                 part_label(p)
             ),
             source: AssumptionSource::ComposedOutput,
+            cite: Some(format!("{:?}:{}", an.side, an.lines.line_col(off).0)),
         });
     }
 }

@@ -3,7 +3,8 @@
 //! Exit codes: 0 equal (or equal under assumptions), 1 different or
 //! unknown, 2 usage or I/O error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -11,12 +12,16 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqldiff_core::composition;
 use sqldiff_core::model::Side as ReportSide;
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
-use sqldiff_source::protocol::ObjectFilter;
-use sqldiff_source::{compose, pairing, policy, FsSource, Resolved, Source};
-use sqldiff_syntax::ast;
 use sqldiff_syntax::template::{ExpandProblem, SegmentKind, Template};
 
+use sqldiff_source::{compose, tree, Resolved};
+use sqldiff_syntax::ast;
+
+mod queue_cmd;
+mod review_cmd;
 mod source_cmd;
+
+use review_cmd::{Pipeline, ReviewArgs};
 
 #[derive(Parser)]
 #[command(
@@ -57,16 +62,21 @@ enum Command {
         /// Maximum excerpt lines per location (default: config, else 3).
         #[arg(long)]
         excerpt_lines: Option<usize>,
-        /// Check mode: templates by name (file stem) for the pack's composition
-        /// markers; each generated part is compared with its substituted template.
+        /// Check mode: templates by name (file stem) for the composed parts;
+        /// each generated part is compared with its substituted template.
         #[arg(long, value_name = "DIR")]
         templates: Option<PathBuf>,
+        /// Extra parameter value for check mode (source `cli`): NAME=VALUE.
+        #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value, requires = "templates")]
+        params: Vec<(String, String)>,
         /// Both sides are templates in the pack's `[template]` syntax: diff
         /// their SQL fragments, with locations in the templates.
         #[arg(long, conflicts_with = "templates")]
         template: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
+        #[command(flatten)]
+        review: ReviewArgs,
     },
     /// Lint one artifact: residue from other dialects, terminator hazards,
     /// parse problems and pack limits.
@@ -80,8 +90,13 @@ enum Command {
         /// Check mode for composed output: templates by name (file stem).
         #[arg(long, value_name = "DIR")]
         templates: Option<PathBuf>,
+        /// Extra parameter value for check mode (source `cli`): NAME=VALUE.
+        #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value, requires = "templates")]
+        params: Vec<(String, String)>,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
+        #[command(flatten)]
+        review: ReviewArgs,
     },
     /// Read a template with the pack's `[template]` syntax: list its
     /// placeholders and special forms, parse its SQL fragment and verify the
@@ -90,10 +105,14 @@ enum Command {
         file: PathBuf,
         #[arg(short, long)]
         dialect: Option<Dialect>,
-        /// Parameter value: NAME=VALUE. Repeatable. With any, placeholder
-        /// candidates that name no parameter are reported as unresolved.
+        /// Parameter value: NAME=VALUE. Repeatable. With --known-only,
+        /// placeholder candidates that name no parameter are kept as SQL and
+        /// reported as unresolved (for syntaxes that collide with SQL).
         #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value)]
         params: Vec<(String, String)>,
+        /// Resolve placeholder candidates against the --param names.
+        #[arg(long)]
+        known_only: bool,
         /// Print the substituted output instead of the summary.
         #[arg(long)]
         render: bool,
@@ -122,57 +141,31 @@ enum Command {
         format: Format,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
+        #[command(flatten)]
+        review: ReviewArgs,
     },
+    /// Review decisions: accept, reject or comment on findings by fingerprint.
+    #[command(subcommand)]
+    Review(review_cmd::ReviewCommand),
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
-}
-
-/// Path with `/` separators, as `dialect_map` globs and pairing see it.
-fn slashed(path: &Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-        .replace("//", "/")
+    #[command(flatten)]
+    Queue(queue_cmd::QueueCommand),
 }
 
 /// Reads an artifact. Dialect: the given one, else `dialect_map` or the path
-/// convention. Version: `dialect_map`, else the configured target version.
+/// convention.
 fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Artifact, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    artifact(
-        path.display().to_string(),
-        &slashed(path),
-        dialect,
-        text,
-        cfg,
-    )
+    tree::read(path, dialect, cfg).map_err(|e| e.0)
 }
 
-fn artifact(
-    display: String,
-    rel: &str,
-    dialect: Option<Dialect>,
-    text: String,
-    cfg: &Resolved,
-) -> Result<Artifact, String> {
-    let (found, version) = sqldiff_source::classify(rel, cfg);
-    let d = dialect.or(found).ok_or_else(|| {
-        format!("{display}: dialect unknown; give a dialect flag or map it with dialect_map")
-    })?;
-    let mut a = Artifact::new(display, d, text);
-    a.version = match version {
-        Some(v) if found == Some(d) => v,
-        _ => cfg.dialect_version(d),
-    };
-    Ok(a)
-}
-
-/// Pack policy on an engine report: limit rules, overrides, declared assumptions.
-fn with_policy(mut r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
-    policy::add_limits(&mut r, a, b, cfg);
-    policy::apply(&mut r, cfg);
-    r
+fn template_dir(
+    dir: Option<&Path>,
+    params: Vec<(String, String)>,
+) -> Result<Option<compose::TemplateDir>, String> {
+    dir.map(|d| compose::TemplateDir::new(d).map(|t| t.with_params(params.into_iter().collect())))
+        .transpose()
+        .map_err(|e| e.0)
 }
 
 fn template_syntax(cfg: &Resolved) -> Result<sqldiff_syntax::template::Compiled, String> {
@@ -216,42 +209,55 @@ fn template_diff(
         b.dialect,
         opts.excerpt_lines,
     );
-    Ok(with_policy(r, a, Some(b), cfg))
+    Ok(tree::with_policy(r, a, Some(b), cfg))
 }
 
 fn template_cmd(
     art: &Artifact,
     params: &BTreeMap<String, String>,
+    known_only: bool,
     render: bool,
     cfg: &Resolved,
 ) -> Result<ExitCode, String> {
     let syntax = template_syntax(cfg)?;
-    let known: std::collections::BTreeSet<String> = params.keys().cloned().collect();
-    let t = Template::parse(&art.text, &syntax, (!params.is_empty()).then_some(&known));
+    let known: BTreeSet<String> = params.keys().cloned().collect();
+    let t = Template::parse(&art.text, &syntax, known_only.then_some(&known));
     if t.print() != art.text {
         return Err("round trip failed: template segments differ from input".into());
     }
     let lines = sqldiff_syntax::LineIndex::new(&art.text);
+    let unresolved: Vec<_> = t.unresolved().collect();
     if render {
-        return match t.substitute(params) {
-            Ok(out) => {
+        let mut problems: Vec<(usize, String)> = unresolved
+            .iter()
+            .map(|s| {
+                (
+                    s.start,
+                    format!("unresolved `{}`: not a parameter", t.slice(s)),
+                )
+            })
+            .collect();
+        match t.substitute(params) {
+            Ok(out) if problems.is_empty() => {
                 print!("{}", out.text);
-                Ok(ExitCode::SUCCESS)
+                return Ok(ExitCode::SUCCESS);
             }
-            Err(problems) => {
-                for p in problems {
-                    let off = match &p {
-                        ExpandProblem::MissingParameter { offset, .. }
-                        | ExpandProblem::SpecialForm { offset, .. } => *offset,
-                    };
-                    let (l, c) = lines.line_col(off);
-                    eprintln!("{}:{l}:{c}: {p}", art.path);
-                }
-                Ok(ExitCode::from(1))
-            }
-        };
+            Ok(_) => {}
+            Err(e) => problems.extend(e.iter().map(|p| {
+                let off = match p {
+                    ExpandProblem::MissingParameter { offset, .. }
+                    | ExpandProblem::SpecialForm { offset, .. } => *offset,
+                };
+                (off, p.to_string())
+            })),
+        }
+        problems.sort();
+        for (off, msg) in problems {
+            let (l, c) = lines.line_col(off);
+            eprintln!("{}:{l}:{c}: {msg}", art.path);
+        }
+        return Ok(ExitCode::from(1));
     }
-    let mut problems = 0;
     for s in &t.segments {
         let (l, c) = lines.line_col(s.start);
         match &s.kind {
@@ -266,14 +272,11 @@ fn template_cmd(
                     args.join(" ")
                 )
             }
-            SegmentKind::Unresolved { name } => {
-                problems += 1;
-                println!(
-                    "{}:{l}:{c}: unresolved `{}`: {name} is not a parameter; kept as SQL",
-                    art.path,
-                    t.slice(s)
-                )
-            }
+            SegmentKind::Unresolved { name } => println!(
+                "{}:{l}:{c}: unresolved `{}`: {name} is not a parameter; kept as SQL",
+                art.path,
+                t.slice(s)
+            ),
         }
     }
     let (parse, diags) = t.fragment().parse(art.dialect);
@@ -292,17 +295,13 @@ fn template_cmd(
         t.parameters().len(),
         diags.len()
     );
-    Ok(ExitCode::from(if diags.is_empty() && problems == 0 {
-        0
-    } else {
-        1
-    }))
-}
-
-fn template_dir(dir: Option<&Path>) -> Result<Option<compose::TemplateDir>, String> {
-    dir.map(compose::TemplateDir::new)
-        .transpose()
-        .map_err(|e| e.0)
+    Ok(ExitCode::from(
+        if diags.is_empty() && unresolved.is_empty() {
+            0
+        } else {
+            1
+        },
+    ))
 }
 
 fn exit_for(verdict: Verdict) -> ExitCode {
@@ -312,12 +311,16 @@ fn exit_for(verdict: Verdict) -> ExitCode {
     }
 }
 
-fn emit(report: &Report, format: Format) {
-    match format {
-        Format::Text => print!("{}", render::text(report, false)),
-        Format::Json => println!("{}", render::json(report)),
-        Format::Sarif => println!("{}", render::sarif(std::slice::from_ref(report))),
-    }
+/// Prints a report, redacted and leak-checked when the pipeline redacts.
+fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), String> {
+    let report = pipe.redact_reports(vec![report])?.remove(0);
+    let out = match format {
+        Format::Text => render::text(&report, false),
+        Format::Json => render::json(&report) + "\n",
+        Format::Sarif => render::sarif(std::slice::from_ref(&report)) + "\n",
+    };
+    print!("{out}");
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -341,8 +344,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             format,
             excerpt_lines,
             templates,
+            params,
             template,
             cfg,
+            review,
         } => {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
@@ -350,63 +355,54 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let opts = Options {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
             };
+            let mut pipe = Pipeline::new(cfg, &review)?;
             if template {
-                let report = template_diff(&a, &b, &cfg, &opts)?;
-                emit(&report, format);
-                return Ok(exit_for(report.verdict));
+                let report = template_diff(&a, &b, &pipe.cfg, &opts)?;
+                let verdict = report.open_verdict();
+                emit(report, format, &mut pipe)?;
+                return Ok(exit_for(verdict));
             }
-            let templates = template_dir(templates.as_deref())?;
-            let mut report = sqldiff_core::diff(&a, &b, &opts);
-            compose::apply(
-                &mut report,
-                &a,
-                Some(&b),
-                &cfg.policy,
-                templates.as_ref(),
-                &opts,
-            )
-            .map_err(|e| e.0)?;
-            let report = with_policy(report, &a, Some(&b), &cfg);
-            emit(&report, format);
-            Ok(exit_for(report.verdict))
+            pipe.templates = template_dir(templates.as_deref(), params)?;
+            let report = pipe.run(&a, Some(&b), &opts);
+            let verdict = report.open_verdict();
+            emit(report, format, &mut pipe)?;
+            Ok(exit_for(verdict))
         }
         Command::Check {
             file,
             dialect,
             format,
             templates,
+            params,
             cfg,
+            review,
         } => {
             let cfg = cfg.resolve()?;
             let art = read(&file, dialect, &cfg)?;
-            let opts = Options {
-                excerpt_lines: cfg.excerpt_lines,
-            };
-            let templates = template_dir(templates.as_deref())?;
-            let mut report = sqldiff_core::check(&art, &opts);
-            compose::apply(
-                &mut report,
-                &art,
-                None,
-                &cfg.policy,
-                templates.as_ref(),
-                &opts,
-            )
-            .map_err(|e| e.0)?;
-            let report = with_policy(report, &art, None, &cfg);
-            emit(&report, format);
-            Ok(exit_for(report.verdict))
+            let mut pipe = Pipeline::new(cfg, &review)?;
+            pipe.templates = template_dir(templates.as_deref(), params)?;
+            let report = pipe.run(&art, None, &pipe.options());
+            let verdict = report.open_verdict();
+            emit(report, format, &mut pipe)?;
+            Ok(exit_for(verdict))
         }
         Command::Template {
             file,
             dialect,
             params,
+            known_only,
             render,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
             let art = read(&file, dialect, &cfg)?;
-            template_cmd(&art, &params.into_iter().collect(), render, &cfg)
+            template_cmd(
+                &art,
+                &params.into_iter().collect(),
+                known_only,
+                render,
+                &cfg,
+            )
         }
         Command::Parse {
             file,
@@ -450,85 +446,18 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             cfg,
+            review,
         } => tree(
             &dir_a,
             &dir_b,
             dialect_a,
             dialect_b,
             format,
-            &cfg.resolve()?,
+            Pipeline::new(cfg.resolve()?, &review)?,
         ),
+        Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),
-    }
-}
-
-/// One side of a tree: its objects by pairing key.
-struct Side {
-    dir: PathBuf,
-    dialect: Option<Dialect>,
-    by_key: BTreeMap<String, String>,
-    /// Keys held by several objects; none of them is paired.
-    ambiguous: BTreeMap<String, Vec<String>>,
-    no_dialect: Vec<String>,
-}
-
-impl Side {
-    /// Lists a directory with pack `ignore` and `dialect_map`, skipping shared
-    /// artifacts, and keys every object by its pairing rule.
-    fn load(dir: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Side, String> {
-        let src = FsSource::new(dir, cfg).map_err(|e| e.0)?;
-        let objects = src
-            .list_objects(&ObjectFilter::default())
-            .map_err(|e| e.0)?;
-        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut no_dialect = Vec::new();
-        for o in objects {
-            if cfg.is_shared(&o.id) {
-                continue;
-            }
-            let Some(d) = dialect.or_else(|| o.dialect.as_deref().and_then(|d| d.parse().ok()))
-            else {
-                no_dialect.push(o.id);
-                continue;
-            };
-            let rule = cfg.pairing_rule(&o.id, Some(d));
-            groups
-                .entry(pairing::key(&o.name, &rule))
-                .or_default()
-                .push(o.id);
-        }
-        let (unique, ambiguous): (BTreeMap<_, _>, BTreeMap<_, _>) =
-            groups.into_iter().partition(|(_, ids)| ids.len() == 1);
-        Ok(Side {
-            dir: dir.to_path_buf(),
-            dialect,
-            by_key: unique
-                .into_iter()
-                .map(|(k, mut ids)| (k, ids.remove(0)))
-                .collect(),
-            ambiguous,
-            no_dialect,
-        })
-    }
-
-    fn display(&self, id: &str) -> String {
-        self.dir.join(id).display().to_string()
-    }
-
-    fn read(&self, id: &str, cfg: &Resolved) -> Result<Artifact, String> {
-        let p = self.dir.join(id);
-        let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        artifact(p.display().to_string(), id, self.dialect, text, cfg)
-    }
-
-    /// Takes an object out by id, wherever it is keyed.
-    fn take(&mut self, id: &str) -> bool {
-        let key = self
-            .by_key
-            .iter()
-            .find(|(_, v)| v.as_str() == id)
-            .map(|(k, _)| k.clone());
-        key.is_some_and(|k| self.by_key.remove(&k).is_some())
+        Command::Queue(cmd) => queue_cmd::run(cmd),
     }
 }
 
@@ -538,72 +467,73 @@ fn tree(
     da: Option<Dialect>,
     db: Option<Dialect>,
     format: Format,
-    cfg: &Resolved,
+    mut pipe: Pipeline,
 ) -> Result<ExitCode, String> {
-    let mut sa = Side::load(dir_a, da, cfg)?;
-    let mut sb = Side::load(dir_b, db, cfg)?;
+    let cfg = &pipe.cfg.clone();
+    let t = tree::pair_dirs(dir_a, dir_b, da, db, cfg).map_err(|e| e.0)?;
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
     };
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    // Explicit pack pairs first: `a` relative to DIR_A, `b` relative to DIR_B.
-    for e in &cfg.policy.pairing.pairs {
-        for (x, y) in [(&e.a, &e.b), (&e.b, &e.a)] {
-            if sa.by_key.values().any(|v| v == x) && sb.by_key.values().any(|v| v == y) {
-                sa.take(x);
-                sb.take(y);
-                pairs.push((x.clone(), y.clone()));
-                break;
-            }
-        }
-    }
-    let mut only_a = Vec::new();
-    let mut only_b = Vec::new();
-    for (k, ia) in &sa.by_key {
-        match sb.by_key.get(k) {
-            Some(ib) => pairs.push((ia.clone(), ib.clone())),
-            None => only_a.push(sa.display(ia)),
-        }
-    }
-    for (k, ib) in &sb.by_key {
-        if !sa.by_key.contains_key(k) {
-            only_b.push(sb.display(ib));
-        }
-    }
     let mut reports = Vec::new();
-    for (ia, ib) in &pairs {
-        let a = sa.read(ia, cfg)?;
-        let b = sb.read(ib, cfg)?;
-        let mut r = sqldiff_core::diff(&a, &b, &opts);
-        compose::apply(&mut r, &a, Some(&b), &cfg.policy, None, &opts).map_err(|e| e.0)?;
-        reports.push(with_policy(r, &a, Some(&b), cfg));
+    for p in &t.pairs {
+        let (a, b) = t.read(p, cfg).map_err(|e| e.0)?;
+        reports.push(pipe.run(&a, Some(&b), &opts));
     }
-    let ambiguous: Vec<serde_json::Value> = [(&sa, "A"), (&sb, "B")]
+    let (only_a, only_b) = (t.only_a, t.only_b);
+    let ambiguous: Vec<serde_json::Value> = t
+        .ambiguous
         .iter()
-        .flat_map(|(s, side)| {
-            s.ambiguous.iter().map(move |(k, ids)| {
-                serde_json::json!({
-                    "side": side,
-                    "key": k,
-                    "ids": ids.iter().map(|i| s.display(i)).collect::<Vec<_>>(),
-                })
-            })
-        })
+        .map(|a| serde_json::json!({ "side": a.side, "key": a.key, "ids": a.ids }))
         .collect();
-    let no_dialect: Vec<String> = sa
-        .no_dialect
-        .iter()
-        .map(|i| sa.display(i))
-        .chain(sb.no_dialect.iter().map(|i| sb.display(i)))
-        .collect();
+    let no_dialect = t.no_dialect;
     // Most severe first.
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
-            r.verdict,
+            r.open_verdict(),
             r.findings.iter().map(|f| f.severity).max(),
             r.findings.len(),
         ))
     });
+    let worst = reports
+        .iter()
+        .map(|r| r.open_verdict())
+        .max()
+        .unwrap_or(Verdict::Equal);
+    if pipe.redacting() {
+        let mut paths: Vec<String> = vec![dir_a.display().to_string(), dir_b.display().to_string()];
+        paths.extend(only_a.iter().chain(&only_b).chain(&no_dialect).cloned());
+        for a in &ambiguous {
+            for id in a["ids"].as_array().into_iter().flatten() {
+                paths.extend(id.as_str().map(str::to_string));
+            }
+        }
+        pipe.add_paths(paths.iter().map(String::as_str));
+    }
+    let complete =
+        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
+    let reports = pipe.redact_reports(reports)?;
+    // Everything printed outside the reports goes through the redactor too.
+    let mut extra = serde_json::json!({
+        "only_a": only_a,
+        "only_b": only_b,
+        "ambiguous": ambiguous,
+        "no_dialect": no_dialect,
+        "provenance": cfg.layers,
+    });
+    pipe.redact_json(&mut extra)?;
+    let strings = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    };
+    let only_a = strings(&extra["only_a"]);
+    let only_b = strings(&extra["only_b"]);
+    let no_dialect = strings(&extra["no_dialect"]);
+    let ambiguous: Vec<serde_json::Value> =
+        extra["ambiguous"].as_array().cloned().unwrap_or_default();
+    let mut out = String::new();
     match format {
         Format::Json => {
             let v = serde_json::json!({
@@ -612,19 +542,23 @@ fn tree(
                 "only_b": only_b,
                 "ambiguous": ambiguous,
                 "no_dialect": no_dialect,
-                "provenance": cfg.layers,
+                "provenance": extra["provenance"],
             });
-            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            let _ = writeln!(out, "{}", serde_json::to_string_pretty(&v).unwrap());
         }
-        Format::Sarif => println!("{}", render::sarif(&reports)),
+        Format::Sarif => {
+            let _ = writeln!(out, "{}", render::sarif(&reports));
+        }
         Format::Text => {
-            println!(
+            let _ = writeln!(
+                out,
                 "{:<26} {:<14} {:>8}  pair",
                 "verdict", "highest", "findings"
             );
             for r in &reports {
                 let b = r.b.as_ref().map(|b| b.path.as_str()).unwrap_or("");
-                println!(
+                let _ = writeln!(
+                    out,
                     "{:<26} {:<14} {:>8}  {} ↔ {}",
                     r.verdict.label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
@@ -634,13 +568,14 @@ fn tree(
                 );
             }
             for p in &only_a {
-                println!("{:<26} {:<14} {:>8}  {p}", "only in A", "-", "-");
+                let _ = writeln!(out, "{:<26} {:<14} {:>8}  {p}", "only in A", "-", "-");
             }
             for p in &only_b {
-                println!("{:<26} {:<14} {:>8}  {p}", "only in B", "-", "-");
+                let _ = writeln!(out, "{:<26} {:<14} {:>8}  {p}", "only in B", "-", "-");
             }
             for a in &ambiguous {
-                println!(
+                let _ = writeln!(
+                    out,
                     "{:<26} {:<14} {:>8}  {}",
                     format!("ambiguous in {}", a["side"].as_str().unwrap_or("")),
                     "-",
@@ -655,17 +590,11 @@ fn tree(
                 );
             }
             for p in &no_dialect {
-                println!("{:<26} {:<14} {:>8}  {p}", "no dialect", "-", "-");
+                let _ = writeln!(out, "{:<26} {:<14} {:>8}  {p}", "no dialect", "-", "-");
             }
         }
     }
-    let worst = reports
-        .iter()
-        .map(|r| r.verdict)
-        .max()
-        .unwrap_or(Verdict::Equal);
-    let complete =
-        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
+    print!("{out}");
     Ok(exit_for(if complete {
         worst
     } else {

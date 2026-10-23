@@ -1,0 +1,16 @@
+[package]
+name = "sqldiff-review"
+description = "Review store, suppressions, author markers, redacted export and caching for SQLDiff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-core.workspace = true
+sqldiff-source.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+regex.workspace = true
+chacha20poly1305 = "0.10"

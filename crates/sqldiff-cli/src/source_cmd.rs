@@ -9,13 +9,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
-use sqldiff_core::{render, Options, Report, Verdict};
+use sqldiff_core::{render, Report, Verdict};
 use sqldiff_source::bundle::CaptureOptions;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::protocol::{ObjectFilter, PairScope};
-use sqldiff_source::{
-    compose, pairing, policy, process, Bundle, Pack, Resolved, Source, SourceSpec,
-};
+use sqldiff_source::{pairing, process, queue, Bundle, Pack, Resolved, Source, SourceSpec};
 
 use crate::{exit_for, Format};
 
@@ -39,6 +37,10 @@ pub struct ConfigArgs {
     /// Target version for a dialect: DIALECT=VERSION. Repeatable.
     #[arg(long = "dialect-version", value_name = "DIALECT=VERSION", value_parser = key_value)]
     dialect_versions: Vec<(String, String)>,
+    /// Data directory for the review store and cache (default: config, else
+    /// $SQLDIFF_DATA_DIR or the platform data directory).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 pub fn key_value(s: &str) -> Result<(String, String), String> {
@@ -56,7 +58,12 @@ impl ConfigArgs {
             isolated: self.isolated,
             cwd: None,
             packs: self.packs.clone(),
-            cli: config::cli_layer(&self.assume, &self.dialect_versions, None).map_err(|e| e.0)?,
+            cli: {
+                let mut l = config::cli_layer(&self.assume, &self.dialect_versions, None)
+                    .map_err(|e| e.0)?;
+                l.file.data_dir = self.data_dir.clone();
+                l
+            },
         };
         Resolved::load(&sources).map_err(|e| e.0)
     }
@@ -296,17 +303,17 @@ fn pairs(
     diff: bool,
     format: Format,
 ) -> Result<ExitCode, String> {
-    let objects = src
-        .list_objects(&ObjectFilter::default())
-        .map_err(|e| e.0)?;
-    let mut p = pairing::pair(&objects, cfg, &scope).map_err(|e| e.0)?;
-    // An adapter that pairs by itself wins over pack rules.
-    let adapter_pairs = src.get_pairs(&scope).map_err(|e| e.0)?;
-    if !adapter_pairs.is_empty() {
-        p.pairs = adapter_pairs;
-    }
-    let source = src.describe().map_err(|e| e.0)?;
     if !diff {
+        let objects = src
+            .list_objects(&ObjectFilter::default())
+            .map_err(|e| e.0)?;
+        let mut p = pairing::pair(&objects, cfg, &scope).map_err(|e| e.0)?;
+        // An adapter that pairs by itself wins over pack rules.
+        let adapter_pairs = src.get_pairs(&scope).map_err(|e| e.0)?;
+        if !adapter_pairs.is_empty() {
+            p.pairs = adapter_pairs;
+        }
+        let source = src.describe().map_err(|e| e.0)?;
         match format {
             Format::Text => {
                 for x in &p.pairs {
@@ -327,31 +334,9 @@ fn pairs(
         return Ok(ExitCode::SUCCESS);
     }
 
-    let stale = |id: &str| objects.iter().any(|o| o.id == id && o.stale);
-    let opts = Options {
-        excerpt_lines: cfg.excerpt_lines,
-    };
-    let mut reports: Vec<Report> = Vec::new();
-    for x in &p.pairs {
-        let a = src.load_artifact(&x.a).map_err(|e| e.0)?;
-        let b = src.load_artifact(&x.b).map_err(|e| e.0)?;
-        let mut r = sqldiff_core::diff(&a, &b, &opts);
-        let ca = compose::for_object(src, &x.a, &a.text, &cfg.policy).map_err(|e| e.0)?;
-        let cb = compose::for_object(src, &x.b, &b.text, &cfg.policy).map_err(|e| e.0)?;
-        compose::annotate(
-            &mut r,
-            (&a, ca.as_ref()),
-            Some((&b, cb.as_ref())),
-            &cfg.policy,
-            None,
-            &opts,
-        )
-        .map_err(|e| e.0)?;
-        policy::add_limits(&mut r, &a, Some(&b), cfg);
-        policy::apply(&mut r, cfg);
-        policy::cap_stale(&mut r, stale(&x.a), stale(&x.b));
-        reports.push(r);
-    }
+    let run = queue::run(src, cfg, &scope).map_err(|e| e.0)?;
+    let (source, p) = (run.source, run.pairing);
+    let mut reports: Vec<Report> = run.pairs.into_iter().map(|x| x.report).collect();
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
             r.verdict,

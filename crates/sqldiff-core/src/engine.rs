@@ -7,8 +7,8 @@ use crate::classify::pairing_key;
 use crate::facts;
 use crate::lint;
 use crate::model::{
-    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, NoiseCounts,
-    Report, Severity, Side, Verdict,
+    fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, NoiseCounts, Report, Severity,
+    Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::treediff;
@@ -91,7 +91,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
-    let (bf, ba) = facts::compare(&aa, &ab);
+    let (bf, ba) = crate::ir::behaviour::compare(&aa, &ab);
     // Same-dialect diffs keep behavioural findings only when the facts actually differ.
     findings.extend(bf);
     for x in ba {
@@ -119,6 +119,8 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         normalizations,
         assumptions,
         unknown_reasons,
+        suppressed: Vec::new(),
+        verdict_before_suppression: None,
         diagnostics,
     })
 }
@@ -145,6 +147,8 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         normalizations: Vec::new(),
         assumptions: Vec::new(),
         unknown_reasons,
+        suppressed: Vec::new(),
+        verdict_before_suppression: None,
         diagnostics,
     })
 }
@@ -157,21 +161,7 @@ pub(crate) fn finish(mut r: Report) -> Report {
             .then(y.verdict.cmp(&x.verdict))
             .then(first_line(x).cmp(&first_line(y)))
     });
-    r.verdict = if r.findings.iter().any(|f| f.verdict == Verdict::Different) {
-        Verdict::Different
-    } else if r.findings.iter().any(|f| f.verdict == Verdict::Unknown)
-        || !r.unknown_reasons.is_empty()
-    {
-        Verdict::Unknown
-    } else if r
-        .assumptions
-        .iter()
-        .any(|a| a.source != AssumptionSource::ComposedOutput)
-    {
-        Verdict::EqualUnderAssumptions
-    } else {
-        Verdict::Equal
-    };
+    r.verdict = crate::session::derive_verdict(&r);
     r
 }
 

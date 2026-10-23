@@ -1,0 +1,207 @@
+# PostgreSQL semantic tables (design §4, §7). Target: PostgreSQL 18.
+# Format: docs/semantic-profiles.md. Tests: crates/sqldiff-core/tests/semantics.rs.
+
+dialect = "postgres"
+
+# ---- Error kinds (codes are SQLSTATEs; `xx*` is a class) ---------------------
+[error_kinds.constraint]
+class = "error"
+codes = ["23*"]
+[error_kinds.conversion]
+class = "error"
+codes = ["22P02", "22007", "22008", "22003"]
+[error_kinds.arithmetic]
+class = "error"
+codes = ["22012"]
+[error_kinds.cardinality]
+class = "error"
+codes = ["21000", "P0003"]
+[error_kinds.not_found]
+class = "error"
+codes = ["P0002"]
+[error_kinds.lock]
+class = "error"
+codes = ["40P01", "40001", "55P03"]
+[error_kinds.user_signal]
+class = "error"
+codes = ["P0001"]
+[error_kinds.name_resolution]
+class = "error"
+codes = ["42P01", "42703", "42883"]
+[error_kinds.cancel]
+class = "error"
+codes = ["57014", "P0004"]
+[error_kinds.other]
+class = "error"
+codes = ["*"]
+
+# EXCEPTION WHEN condition names -> kinds. OTHERS matches everything except
+# QUERY_CANCELED and ASSERT_FAILURE, the `cancel` kind (V18).
+[conditions]
+OTHERS = ["constraint", "conversion", "arithmetic", "cardinality", "not_found", "lock", "user_signal", "name_resolution", "other"]
+SQLSTATE = []
+UNIQUE_VIOLATION = ["constraint"]
+FOREIGN_KEY_VIOLATION = ["constraint"]
+NOT_NULL_VIOLATION = ["constraint"]
+CHECK_VIOLATION = ["constraint"]
+INTEGRITY_CONSTRAINT_VIOLATION = ["constraint"]
+EXCLUSION_VIOLATION = ["constraint"]
+INVALID_TEXT_REPRESENTATION = ["conversion"]
+DATA_EXCEPTION = ["conversion", "arithmetic"]
+DIVISION_BY_ZERO = ["arithmetic"]
+NUMERIC_VALUE_OUT_OF_RANGE = ["conversion"]
+NO_DATA_FOUND = ["not_found"]
+TOO_MANY_ROWS = ["cardinality"]
+CARDINALITY_VIOLATION = ["cardinality"]
+DEADLOCK_DETECTED = ["lock"]
+SERIALIZATION_FAILURE = ["lock"]
+LOCK_NOT_AVAILABLE = ["lock"]
+RAISE_EXCEPTION = ["user_signal"]
+UNDEFINED_TABLE = ["name_resolution"]
+UNDEFINED_COLUMN = ["name_resolution"]
+QUERY_CANCELED = ["cancel"]
+ASSERT_FAILURE = ["cancel"]
+
+[raises]
+insert = ["constraint", "conversion", "arithmetic", "lock", "other"]
+update = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "other"]
+delete = ["constraint", "lock", "other"]
+merge = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "other"]
+select_into = ["conversion", "arithmetic", "lock", "other"]
+select_into_strict = ["conversion", "arithmetic", "cardinality", "not_found", "lock", "other"]
+commit = ["constraint"]
+call = ["other"]
+
+# ---- Unhandled errors ----------------------------------------------------------
+[[unhandled]]
+id = "postgres.unhandled.routine-in-caller-txn"
+when = { context = "routine", caller_txn = true }
+statement = "rollback"
+transaction = "doom"
+control = "exit"
+status = "confirmed"
+note = "Called inside the caller's transaction block, an unhandled error aborts that block: it can only be rolled back."
+
+[[unhandled]]
+id = "postgres.unhandled.routine"
+when = { context = "routine" }
+statement = "rollback"
+transaction = "rollback_all"
+control = "exit"
+status = "confirmed"
+note = "An unhandled error leaves the function or procedure; the calling statement fails, so everything since the last COMMIT is rolled back."
+
+[[unhandled]]
+id = "postgres.unhandled.transaction-block"
+when = { context = "script", in_txn = true }
+statement = "rollback"
+transaction = "doom"
+control = "next"
+status = "confirmed"
+note = "After an error the transaction block is aborted: further commands fail until ROLLBACK (or ROLLBACK TO SAVEPOINT); COMMIT rolls back."
+
+[[unhandled]]
+id = "postgres.unhandled.autocommit"
+when = { context = "script", in_txn = false }
+statement = "rollback"
+transaction = "none"
+control = "next"
+status = "confirmed"
+note = "Outside a transaction block each statement is its own transaction; the client goes on with the next one (assumption: the client does not stop on error)."
+
+# ---- Caught errors -------------------------------------------------------------
+[[caught]]
+id = "postgres.caught.exception-block"
+construct = "exception_block"
+statement = "rollback"
+transaction = "rollback_scope"
+fact = "V18"
+status = "confirmed"
+note = "An EXCEPTION block is a subtransaction: when an error is caught, all database changes made in the block are rolled back; variables keep their values."
+
+# ---- Transactions --------------------------------------------------------------
+[transactions]
+nesting = { value = "flat", status = "confirmed", note = "BEGIN inside a transaction block only warns." }
+rollback_scope = { value = "all", status = "confirmed" }
+commit_without_txn = { value = "noop", status = "confirmed", note = "Warning: there is no transaction in progress." }
+rollback_without_txn = { value = "noop", status = "confirmed" }
+savepoints = { value = "savepoint", status = "confirmed", note = "SAVEPOINT / ROLLBACK TO / RELEASE at top level; PL/pgSQL has no SAVEPOINT statement, exception blocks are implicit savepoints." }
+savepoints_need_commitment_control = { value = false, status = "confirmed" }
+commit_in_function = { value = "error", fact = "V17", status = "confirmed" }
+commit_in_exception_block = { value = "error", fact = "V17", status = "confirmed" }
+commit_in_atomic = { value = "allowed", status = "confirmed" }
+commit_in_caller_txn = { value = "error", fact = "V17", status = "confirmed", note = "A procedure called inside a transaction block cannot run transaction control statements." }
+doomed_commit = { value = "rolls_back", status = "confirmed", note = "COMMIT of an aborted transaction block performs ROLLBACK." }
+doomed_writes = { value = "error", status = "confirmed", note = "current transaction is aborted, commands ignored until end of transaction block (25P02)." }
+no_commit_levels = { value = [], status = "confirmed" }
+survives_rollback = { value = ["sequence", "session_advisory_lock"], fact = "V21", status = "confirmed" }
+ddl = { value = "transactional", status = "confirmed" }
+deferred_constraints = { value = "commit", fact = "V22", status = "confirmed", note = "DEFERRED constraints are checked at COMMIT, so a constraint error can surface there." }
+
+[transactions.routine_mode]
+procedure = { value = "call", fact = "V17", status = "confirmed", note = "CALL runs in one transaction; the procedure may COMMIT when every frame above it is CALL or DO." }
+function = { value = "caller", status = "confirmed", note = "A function runs inside the calling statement." }
+trigger = { value = "caller", status = "confirmed" }
+anonymous = { value = "call", fact = "V17", status = "confirmed" }
+script = { value = "autocommit", status = "confirmed" }
+
+[atomicity]
+statement = { value = "always", status = "confirmed" }
+routine_body = { value = "caller", status = "confirmed", note = "A routine body is part of the caller's transaction (or the CALL's)." }
+atomic_compound = { value = "subtransaction", fact = "V18", status = "confirmed", note = "Only blocks with an EXCEPTION clause roll back as a unit, and only when the error is caught." }
+merge = { value = "always", fact = "V12", status = "confirmed" }
+
+[[temp]]
+id = "postgres.temp.temporary-table"
+object = "temp_table"
+schema = "pg_temp"
+on_rollback = "revert"
+on_commit = "keep"
+lifetime = "session"
+status = "confirmed"
+note = "Temporary tables are transactional; ON COMMIT DELETE ROWS / DROP change the commit behaviour; a second CREATE fails without IF NOT EXISTS."
+
+[[cardinality]]
+id = "postgres.card.select-into"
+form = "select_into"
+many = "first_silent"
+none = "null"
+status = "confirmed"
+note = "PL/pgSQL SELECT INTO keeps the first row; no rows sets the targets to NULL. FOUND tells which."
+
+[[cardinality]]
+id = "postgres.card.select-into-strict"
+form = "select_into_strict"
+many = "error"
+none = "error"
+status = "confirmed"
+note = "STRICT raises TOO_MANY_ROWS or NO_DATA_FOUND."
+
+[[cardinality]]
+id = "postgres.card.scalar-subquery"
+form = "scalar_subquery"
+many = "error"
+none = "null"
+status = "confirmed"
+
+[[cardinality]]
+id = "postgres.card.update-from-join"
+form = "update_from"
+many = "any_silent"
+none = "unchanged"
+status = "confirmed"
+
+[[cardinality]]
+id = "postgres.card.merge-many-sources"
+form = "merge"
+many = "error"
+none = "unchanged"
+fact = "V3"
+status = "confirmed"
+
+[[cardinality]]
+id = "postgres.card.dml-no-rows"
+form = "dml"
+many = "ok"
+none = "silent"
+status = "confirmed"

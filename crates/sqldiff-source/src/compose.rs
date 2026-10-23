@@ -69,7 +69,10 @@ pub fn from_protocol(text: &str, c: &protocol::Composition) -> Composition {
 /// Templates by name from a directory: the first file whose name without
 /// extensions equals the template name.
 pub struct TemplateDir {
+    pub root: PathBuf,
     files: BTreeMap<String, PathBuf>,
+    /// Parameter values given for check mode, as parameter source `cli`.
+    pub params: BTreeMap<String, String>,
 }
 
 impl TemplateDir {
@@ -90,7 +93,16 @@ impl TemplateDir {
             let stem = name.split('.').next().unwrap_or(name).to_string();
             files.entry(stem).or_insert(p);
         }
-        Ok(TemplateDir { files })
+        Ok(TemplateDir {
+            root: dir.to_path_buf(),
+            files,
+            params: BTreeMap::new(),
+        })
+    }
+
+    pub fn with_params(mut self, params: BTreeMap<String, String>) -> Self {
+        self.params = params;
+        self
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
@@ -171,8 +183,9 @@ pub fn check(
 }
 
 /// The shared step for every engine report built from files (CLI `diff`,
-/// `check`, `tree`, the GUI and MCP): read mode over the pack's markers on
-/// each side, then [`annotate`]. A no-op when no markers are configured.
+/// `check` and `tree`, the GUI, the review pipeline): read mode over the
+/// pack's markers on each side, then [`annotate`]. Problems never abort the
+/// report; they become unknown reasons.
 pub fn apply(
     report: &mut Report,
     a: &Artifact,
@@ -180,27 +193,66 @@ pub fn apply(
     policy: &Policy,
     templates: Option<&TemplateDir>,
     opts: &Options,
-) -> Result<()> {
-    if policy.composition.is_empty() {
-        return Ok(());
+) {
+    let res = (|| {
+        let ca = read(&a.text, policy)?;
+        let cb = match b {
+            Some(b) => read(&b.text, policy)?,
+            None => None,
+        };
+        annotate(
+            report,
+            (a, ca.as_ref()),
+            b.map(|b| (b, cb.as_ref())),
+            policy,
+            templates,
+            opts,
+        )
+    })();
+    if let Err(e) = res {
+        unknown(report, &e.0);
     }
-    let ca = read(&a.text, policy)?;
-    let cb = match b {
-        Some(b) => read(&b.text, policy)?,
-        None => None,
-    };
-    annotate(
-        report,
-        (a, ca.as_ref()),
-        b.map(|b| (b, cb.as_ref())),
-        policy,
-        templates,
-        opts,
-    )
+}
+
+/// [`apply`] for objects of a source: the adapter's persisted composition
+/// when it has one, else pack markers. A failing `get_composition` makes
+/// the pair unknown instead of aborting the run.
+pub fn apply_source(
+    report: &mut Report,
+    src: &dyn Source,
+    a: (&str, &Artifact),
+    b: (&str, &Artifact),
+    policy: &Policy,
+    opts: &Options,
+) {
+    let res = (|| {
+        let ca = for_object(src, a.0, &a.1.text, policy)?;
+        let cb = for_object(src, b.0, &b.1.text, policy)?;
+        annotate(
+            report,
+            (a.1, ca.as_ref()),
+            Some((b.1, cb.as_ref())),
+            policy,
+            None,
+            opts,
+        )
+    })();
+    if let Err(e) = res {
+        unknown(report, &e.0);
+    }
+}
+
+fn unknown(report: &mut Report, why: &str) {
+    report
+        .unknown_reasons
+        .push(format!("composition not read: {why}"));
+    report.verdict = report.verdict.max(sqldiff_core::Verdict::Unknown);
 }
 
 /// Runs read mode (and check mode with `templates`) on both sides and adds
-/// the composition findings and wrapper facts to an engine report.
+/// the composition findings and wrapper facts to an engine report. Check
+/// mode that was asked for but cannot run is an unknown reason, never
+/// skipped silently.
 pub fn annotate(
     report: &mut Report,
     a: (&Artifact, Option<&Composition>),
@@ -209,25 +261,59 @@ pub fn annotate(
     templates: Option<&TemplateDir>,
     opts: &Options,
 ) -> Result<()> {
-    if a.1.is_none() && b.map_or(true, |b| b.1.is_none()) {
+    let none = a.1.is_none() && b.map_or(true, |b| b.1.is_none());
+    if let Some(dir) = templates {
+        let why = if policy.template.is_none() {
+            Some("no [template] syntax in the loaded packs or config".to_string())
+        } else if none {
+            Some(if policy.composition.is_empty() {
+                "no [[composition]] markers in the loaded packs or config and no adapter composition".to_string()
+            } else {
+                "no composition markers found in the input".to_string()
+            })
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            unknown(
+                report,
+                &format!(
+                    "check mode against {} did not run: {why}",
+                    dir.root.display()
+                ),
+            );
+            return Ok(());
+        }
+    }
+    if none {
         return Ok(());
     }
-    let checks_a = match a.1 {
+    // Check mode merges the extra parameter sources into every part.
+    let merged = |c: Option<&Composition>| -> Option<Composition> {
+        let (c, dir, t) = (c?, templates?, policy.template.as_ref()?);
+        let mut c = c.clone();
+        merge_parameters(&mut c, &[("cli", &dir.params)], t);
+        Some(c)
+    };
+    let (ma, mb) = (merged(a.1), b.and_then(|b| merged(b.1)));
+    let ca = ma.as_ref().or(a.1);
+    let cb = b.and_then(|b| mb.as_ref().or(b.1));
+    let checks_a = match ca {
         Some(c) => check(&a.0.text, c, policy, templates)?,
         None => Vec::new(),
     };
-    let checks_b = match b.and_then(|b| b.1.map(|c| (b.0, c))) {
-        Some((art, c)) => check(&art.text, c, policy, templates)?,
-        None => Vec::new(),
+    let checks_b = match (b, cb) {
+        (Some((art, _)), Some(c)) => check(&art.text, c, policy, templates)?,
+        _ => Vec::new(),
     };
     let side_a = Composed {
         artifact: a.0,
-        composition: a.1,
+        composition: ca,
         checks: &checks_a,
     };
-    let side_b = b.map(|(art, c)| Composed {
+    let side_b = b.map(|(art, _)| Composed {
         artifact: art,
-        composition: c,
+        composition: cb,
         checks: &checks_b,
     });
     composition::annotate(report, side_a, side_b, opts);

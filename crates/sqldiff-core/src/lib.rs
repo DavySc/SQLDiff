@@ -9,10 +9,13 @@ pub mod classify;
 pub mod composition;
 mod engine;
 pub mod facts;
+pub mod ir;
 pub mod lint;
 pub mod model;
 pub mod normalize;
+pub mod phrase;
 pub mod render;
+pub mod session;
 pub mod treediff;
 
 pub use artifact::Artifact;
