@@ -1,0 +1,15 @@
+[package]
+name = "sqldiff-mcp"
+description = "Local stdio MCP server for SQLDiff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sqldiff-mcp"
+path = "src/main.rs"
+
+[dependencies]
+sqldiff-core.workspace = true
+serde_json.workspace = true
