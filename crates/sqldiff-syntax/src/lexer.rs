@@ -109,6 +109,13 @@ impl<'a> Lexer<'a> {
         let start = self.pos;
         let c = self.peek().expect("not at end");
 
+        // A byte-order mark at the start of the text (written by many Windows
+        // tools) is trivia, not an unexpected character. Kept as a token, so
+        // print(parse(x)) still equals x.
+        if c == '\u{feff}' && start == 0 {
+            self.bump();
+            return WHITESPACE;
+        }
         if c.is_whitespace() {
             while matches!(self.peek(), Some(c) if c.is_whitespace()) {
                 self.bump();

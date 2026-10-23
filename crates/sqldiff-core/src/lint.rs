@@ -1,4 +1,5 @@
-//! Single-artifact lints: residue from other dialects and parse hazards.
+//! Single-artifact lints: residue from other dialects, parse hazards and
+//! statements that cannot run (INSERT column counts).
 
 use std::sync::OnceLock;
 
@@ -6,6 +7,7 @@ use serde::Deserialize;
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode, SyntaxToken};
 
 use crate::artifact::Analyzed;
+use crate::classify::pairing_key;
 use crate::model::{fingerprint, ChangeClass, Finding, FingerprintInput, Severity, Side, Verdict};
 
 #[derive(Debug, Deserialize)]
@@ -192,6 +194,68 @@ pub fn terminator_hits(root: &SyntaxNode, dialect: Dialect) -> Vec<Hit> {
     hits
 }
 
+/// INSERT whose column list and SELECT list or VALUES row differ in length:
+/// the statement fails at run time in every dialect. The statement is read
+/// with the equivalence parser; anything it cannot read, and `*` or `x.*`
+/// lists, give no hit, so a hit is never a guess.
+pub fn insert_arity_hits(root: &SyntaxNode, dialect: Dialect) -> Vec<Hit> {
+    use crate::equiv::ast::{parse_stmt, tokens, Expr, InsertSource, Stmt};
+    let mut hits = Vec::new();
+    for node in root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::STATEMENT && ast::starts_with_kw(n, "INSERT"))
+    {
+        let mut toks = tokens(&node);
+        // `OVERRIDING SYSTEM|USER VALUE` decides identity values, not how many
+        // there are; the parser has no use for it here.
+        if let Some(i) = toks.iter().position(|t| t.up == "OVERRIDING") {
+            if toks.get(i + 2).is_some_and(|t| t.up == "VALUE") {
+                toks.drain(i..i + 3);
+            }
+        }
+        let Ok(Stmt::Insert {
+            target,
+            cols,
+            source,
+            ..
+        }) = parse_stmt(&toks, dialect)
+        else {
+            continue;
+        };
+        if cols.is_empty() {
+            continue;
+        }
+        let (kind, counts): (&str, Vec<usize>) = match &source {
+            InsertSource::Values(rows) => ("VALUES row", rows.iter().map(Vec::len).collect()),
+            InsertSource::Query(q) if q.items.iter().any(|i| matches!(i.expr, Expr::Star(_))) => {
+                continue
+            }
+            InsertSource::Query(q) => ("SELECT list", vec![q.items.len()]),
+            InsertSource::Default => continue,
+        };
+        let n = cols.len();
+        let Some(&got) = counts.iter().find(|&&c| c != n) else {
+            continue;
+        };
+        let (s, e) = ast::sig_range(&node);
+        hits.push(Hit {
+            rule: "hazard.insert-column-count".to_string(),
+            class: ChangeClass::Semantic,
+            severity: Severity::High,
+            message: format!(
+                "INSERT into {} names {n} column{} but its {kind} supplies {got}; the statement fails when it runs.",
+                target.join("."),
+                if n == 1 { "" } else { "s" }
+            ),
+            start: s,
+            end: e,
+            // Case and quoting of the target do not make a hit new.
+            key: format!("INSERT {} {n}/{got}", pairing_key(&target)),
+        });
+    }
+    hits
+}
+
 fn last_statement(node: &SyntaxNode) -> Option<SyntaxNode> {
     if node.kind() == SyntaxKind::STATEMENT {
         return Some(node.clone());
@@ -205,6 +269,7 @@ fn last_statement(node: &SyntaxNode) -> Option<SyntaxNode> {
 pub fn all_hits(a: &Analyzed) -> Vec<Hit> {
     let mut hits = residue_hits(&a.root, a.dialect());
     hits.extend(terminator_hits(&a.root, a.dialect()));
+    hits.extend(insert_arity_hits(&a.root, a.dialect()));
     hits.sort_by_key(|h| h.start);
     hits
 }
