@@ -6,6 +6,7 @@
 
 pub mod artifact;
 pub mod classify;
+pub mod composition;
 mod engine;
 pub mod equiv;
 pub mod facts;
