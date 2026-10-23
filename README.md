@@ -24,6 +24,10 @@ $B tree src/tsql src/db2 --dialect-a tsql --dialect-b db2i
 
 # Machine output for CI
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif
+
+# Pair view in the browser (statement-aligned, findings panel, live scratchpad)
+target/release/sqldiff-gui serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
+target/release/sqldiff-gui export --report report.json -o pair.html   # static, read-only
 ```
 
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
@@ -51,8 +55,9 @@ Verdict: DIFFERENT
 | Behavioural checks | Summary-level transaction/error model: atomicity when a later write fails, Db2 `*NONE` statement atomicity, caller-owned transactions vs `*NONE`, return-code vs raised-error contract. Cross-dialect write pairing (incl. MERGE vs `ON CONFLICT` upserts, Db2 `FINAL TABLE`). |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
 | Interfaces | CLI `diff` / `check` / `parse` / `tree`, text, JSON and SARIF 2.1.0. Findings carry stable fingerprints that survive reformatting. |
+| GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
-Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, packs/adapters, MCP server, GUI. See design §14 for the milestones.
+Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, packs/adapters, MCP server, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
 ## Layout
 
@@ -60,6 +65,7 @@ Not yet built: binding against catalogs, the semantic IR and CFG with error edge
 crates/sqldiff-syntax   lexers, parser, CST helpers (no analysis)
 crates/sqldiff-core     findings model, normalization, diff engines, checks, renderers
 crates/sqldiff-cli      the `sqldiff` binary
+crates/sqldiff-gui      the `sqldiff-gui` pair view (local server + embedded page)
 tests/fixtures          synthetic fixtures (all written for this repository)
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time
 ```

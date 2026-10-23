@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLDiff pair view</title>
+<style>
+:root {
+  --bg: #fbfbfa; --panel: #ffffff; --fg: #1d1f21; --muted: #6b6f76; --line: #e3e4e6;
+  --same: transparent; --chg-bg: #fff6dc; --chg-tok: #f5d77a; --del-bg: #fde8e8; --del-tok: #f4b4b4;
+  --add-bg: #e3f5e8; --add-tok: #a8dfb6; --focus: #3b6fd4;
+  --kw: #8a3ab9; --id: #1d1f21; --var: #b0551c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828; --op: #444;
+  --transactional: #c62828; --semantic: #d96b00; --structural: #3b6fd4; --cosmetic: #8a8f98; --residue: #7a4fc0;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16181b; --panel: #1d2024; --fg: #e4e6e9; --muted: #9096a0; --line: #2d3136;
+    --chg-bg: #3a3218; --chg-tok: #6b5a1c; --del-bg: #3d2222; --del-tok: #6e2f2f;
+    --add-bg: #1e3626; --add-tok: #2d5e3a; --focus: #7aa2ff;
+    --kw: #c792ea; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #7d838c; --err: #ff6b6b; --op: #c7c9cc;
+    --transactional: #ff6b6b; --semantic: #ffa94d; --structural: #7aa2ff; --cosmetic: #9096a0; --residue: #b197fc;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; display: flex; flex-direction: column; }
+header { padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+.verdict { font-weight: 700; padding: 2px 8px; border-radius: 4px; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; }
+.verdict.different { background: var(--del-bg); color: var(--transactional); }
+.verdict.unknown { background: var(--chg-bg); color: var(--semantic); }
+.verdict.equal, .verdict.equal_under_assumptions { background: var(--add-bg); color: var(--str); }
+.prov { color: var(--muted); font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
+.prov code { font-family: var(--mono); }
+.spacer { flex: 1; }
+button, .chip { font: inherit; font-size: 12px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); border-radius: 4px; padding: 3px 8px; cursor: pointer; }
+button:hover, .chip:hover { border-color: var(--focus); }
+button[aria-pressed="true"] { background: var(--focus); color: #fff; border-color: var(--focus); }
+.chip.off { opacity: .4; text-decoration: line-through; }
+.chip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 380px; min-height: 0; }
+#scratch { display: none; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+#scratch.open { display: grid; }
+#scratch label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 2px; }
+#scratch textarea { width: 100%; height: 180px; font: 12.5px/1.45 var(--mono); background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 6px; resize: vertical; tab-size: 4; }
+#scratch .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+#pane { overflow: auto; min-height: 0; }
+.cols { display: grid; grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr); position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+.cols div { padding: 4px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr); border-bottom: 1px solid var(--line); }
+.row.focus { outline: 2px solid var(--focus); outline-offset: -2px; }
+.mid { background: var(--line); }
+.row .mid.has-f { background: var(--fc, var(--focus)); }
+.cell { display: grid; grid-template-columns: 44px minmax(0, 1fr); font: 12.5px/1.5 var(--mono); min-height: 1.5em; }
+.cell.empty { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--line) 6px 7px); opacity: .6; }
+.row.changed .cell { background: var(--chg-bg); }
+.row.only_a .cell.a { background: var(--del-bg); }
+.row.only_b .cell.b { background: var(--add-bg); }
+.ln { color: var(--muted); text-align: right; padding-right: 8px; user-select: none; white-space: pre; border-right: 1px solid var(--line); }
+.code { white-space: pre-wrap; word-break: break-word; padding-left: 8px; tab-size: 4; }
+.m1 { background: var(--chg-tok); border-radius: 2px; }
+.m3 { text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+.row.only_a .m2 { background: var(--del-tok); border-radius: 2px; }
+.row.only_b .m2 { background: var(--add-tok); border-radius: 2px; }
+.t-kw { color: var(--kw); font-weight: 600; } .t-id { color: var(--id); } .t-var { color: var(--var); }
+.t-num { color: var(--num); } .t-str { color: var(--str); } .t-cmt { color: var(--cmt); font-style: italic; }
+.t-err { color: var(--err); text-decoration: wavy underline; } .t-op, .t-pun { color: var(--op); }
+.fold { padding: 3px 10px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); cursor: pointer; text-align: center; }
+.fold:hover { color: var(--focus); }
+aside { border-left: 1px solid var(--line); background: var(--panel); overflow: auto; min-height: 0; }
+aside h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 12px 14px 6px; }
+.finding { margin: 0 10px 8px; padding: 8px 10px; border: 1px solid var(--line); border-left: 4px solid var(--fc); border-radius: 4px; cursor: pointer; background: var(--bg); }
+.finding.focus { border-color: var(--focus); border-left-color: var(--fc); box-shadow: 0 0 0 1px var(--focus); }
+.finding .head { display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; font-size: 12px; }
+.finding .cls { font-weight: 700; color: var(--fc); text-transform: uppercase; letter-spacing: .04em; }
+.finding .rule { font-family: var(--mono); color: var(--muted); }
+.finding p { margin: 4px 0; font-size: 13px; }
+.finding .meta { font-size: 11.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.finding .meta abbr { text-decoration: underline dotted; cursor: help; }
+.finding .loc { font-family: var(--mono); }
+.finding button { float: right; margin-left: 6px; }
+.empty-note { margin: 0 14px; color: var(--muted); font-size: 13px; }
+.small { font-size: 12px; color: var(--muted); margin: 0 14px 4px; }
+.small ul { margin: 2px 0 8px; padding-left: 18px; }
+#busy { font-size: 12px; color: var(--muted); }
+#help { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.35); align-items: center; justify-content: center; z-index: 9; }
+#help.open { display: flex; }
+#help div { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 22px; min-width: 280px; }
+#help kbd { font-family: var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; }
+#help td { padding: 2px 10px 2px 0; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-left: 0; border-top: 1px solid var(--line); max-height: 40vh; } #scratch { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>SQLDiff</h1>
+  <span id="verdict" class="verdict"></span>
+  <span id="summary"></span>
+  <div class="prov" id="prov"></div>
+  <span class="spacer"></span>
+  <span id="classes"></span>
+  <button id="btn-fold" aria-pressed="true" title="Collapse unchanged statements (c)">Collapse unchanged</button>
+  <button id="btn-scratch" aria-pressed="false" title="Edit both sides in a scratchpad; sources are never written (e)">Scratchpad</button>
+  <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
+  <span id="busy"></span>
+</header>
+<div id="scratch">
+  <div><label for="ta-a">A</label><textarea id="ta-a" spellcheck="false"></textarea></div>
+  <div><label for="ta-b">B</label><textarea id="ta-b" spellcheck="false"></textarea></div>
+  <div class="note">Scratchpad: edits re-diff as you type and are never written back to the files. Reload the page to start again from disk.</div>
+</div>
+<main>
+  <div id="pane"></div>
+  <aside id="side"></aside>
+</main>
+<div id="help" role="dialog" aria-label="Keyboard shortcuts"><div>
+  <table>
+    <tr><td><kbd>j</kbd> / <kbd>n</kbd></td><td>Next finding</td></tr>
+    <tr><td><kbd>k</kbd> / <kbd>p</kbd></td><td>Previous finding</td></tr>
+    <tr><td><kbd>]</kbd> / <kbd>[</kbd></td><td>Next / previous changed row</td></tr>
+    <tr><td><kbd>c</kbd></td><td>Collapse or expand unchanged</td></tr>
+    <tr><td><kbd>e</kbd></td><td>Scratchpad</td></tr>
+    <tr><td><kbd>y</kbd></td><td>Copy focused finding as text</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>Close</td></tr>
+  </table>
+</div></div>
+<script>
+"use strict";
+const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+const CLASS_ORDER = ["transactional", "semantic", "residue", "structural", "cosmetic"];
+const state = { data: null, fold: true, hidden: new Set(), focus: -1, expanded: new Set(), rowFocus: -1 };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const clsColor = (c) => `var(--${CLASS_ORDER.includes(c) ? c : "structural"})`;
+
+function visibleFindings() {
+  return state.data.report.findings.map((f, i) => ({ f, i })).filter(({ f }) => !state.hidden.has(f.class));
+}
+
+function renderHeader() {
+  const r = state.data.report;
+  const v = $("verdict");
+  v.className = "verdict " + r.verdict;
+  v.textContent = r.verdict.replace(/_/g, " ");
+  const n = r.findings.length;
+  $("summary").textContent = `${n} finding${n === 1 ? "" : "s"} · ${r.noise.cosmetic} cosmetic, ${r.noise.structural} structural hidden`;
+  const side = (s) => s ? `<span><b>${esc(s === r.a ? "A" : "B")}</b> <code>${esc(s.path)}</code> ${esc(s.dialect)} ${esc(s.dialect_version)} · <code title="content hash">${esc(s.content_hash.slice(0, 8))}</code></span>` : "";
+  $("prov").innerHTML = side(r.a) + side(r.b) + `<span>sqldiff ${esc(r.tool_version)}${state.data.live ? "" : " · static export"}</span>`;
+  const counts = {};
+  for (const f of r.findings) counts[f.class] = (counts[f.class] || 0) + 1;
+  $("classes").innerHTML = CLASS_ORDER.filter((c) => counts[c]).map((c) =>
+    `<button class="chip ${state.hidden.has(c) ? "off" : ""}" data-cls="${c}" title="Show or hide ${c} findings"><span class="dot" style="background:${clsColor(c)}"></span>${c} ${counts[c]}</button>`).join(" ");
+  for (const b of $("classes").querySelectorAll("button")) {
+    b.onclick = () => { const c = b.dataset.cls; state.hidden.has(c) ? state.hidden.delete(c) : state.hidden.add(c); render(); };
+  }
+}
+
+function blockHtml(blk, side) {
+  if (!blk) return `<div class="cell ${side} empty"><div class="ln"></div><div class="code"></div></div>`;
+  const lines = [[]];
+  for (const [text, style, mark] of blk.segs) {
+    const parts = text.split("\n");
+    parts.forEach((p, k) => {
+      if (k > 0) lines.push([]);
+      if (p) lines[lines.length - 1].push(`<span class="t-${style}${mark ? " m" + mark : ""}">${esc(p)}</span>`);
+    });
+  }
+  if (lines.length > 1 && lines[lines.length - 1].length === 0) lines.pop();
+  const nums = lines.map((_, k) => blk.lines[0] + k).join("\n");
+  return `<div class="cell ${side}"><div class="ln">${nums}</div><div class="code">${lines.map((l) => l.join("")).join("\n")}</div></div>`;
+}
+
+function rowFindings(row) {
+  const ids = new Set([...(row.a ? row.a.findings : []), ...(row.b ? row.b.findings : [])]);
+  return [...ids].filter((i) => !state.hidden.has(state.data.report.findings[i].class));
+}
+
+function renderPane() {
+  const r = state.data.report;
+  const rows = state.data.view.rows;
+  const out = [`<div class="cols"><div>A · ${esc(r.a.path)}</div><div></div><div>B · ${esc(r.b ? r.b.path : "")}</div></div>`];
+  let i = 0;
+  while (i < rows.length) {
+    // Runs of unchanged rows with no findings fold into one line.
+    let j = i;
+    while (j < rows.length && rows[j].kind === "same" && rowFindings(rows[j]).length === 0) j++;
+    if (state.fold && j - i >= 3 && !state.expanded.has(i)) {
+      out.push(`<div class="fold" data-fold="${i}">⋯ ${j - i} unchanged rows (A ${rows[i].a.lines[0]}–${rows[j - 1].a.lines[1]}, B ${rows[i].b.lines[0]}–${rows[j - 1].b.lines[1]}) · click to expand</div>`);
+      i = j;
+      continue;
+    }
+    for (const end = Math.max(j, i + 1); i < end; i++) {
+      const row = rows[i];
+      const fs = rowFindings(row);
+      const worst = fs.length ? r.findings[fs[0]].class : null;
+      out.push(`<div class="row ${row.kind}" id="row-${i}" data-f="${fs.join(" ")}">${blockHtml(row.a, "a")}<div class="mid ${fs.length ? "has-f" : ""}" style="${worst ? "--fc:" + clsColor(worst) : ""}" title="${fs.length ? fs.length + " finding(s)" : ""}"></div>${blockHtml(row.b, "b")}</div>`);
+    }
+  }
+  $("pane").innerHTML = out.join("");
+  for (const el of $("pane").querySelectorAll(".fold")) el.onclick = () => { state.expanded.add(+el.dataset.fold); renderPane(); };
+  for (const el of $("pane").querySelectorAll(".row[data-f]")) {
+    el.onclick = () => { const f = el.dataset.f.split(" ").filter(Boolean); if (f.length) focusFinding(+f[0], false); };
+  }
+}
+
+function locText(l) { return l ? `${l.side.toUpperCase()} ${l.start_line}:${l.start_col}` : ""; }
+
+function renderSide() {
+  const r = state.data.report;
+  const fs = visibleFindings();
+  const asm = Object.fromEntries(r.assumptions.map((a) => [a.id, a]));
+  const parts = [`<h2>Findings</h2>`];
+  if (!fs.length) parts.push(`<p class="empty-note">${r.findings.length ? "All findings are hidden by the class filter." : "No findings."}</p>`);
+  for (const { f, i } of fs) {
+    const as = f.assumptions.map((id) => `<abbr title="${esc(asm[id] ? asm[id].text : id)}">${esc(id)}</abbr>`).join(" ");
+    parts.push(`<div class="finding ${state.focus === i ? "focus" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
+      <button data-copy="${i}" title="Copy as text (y)">Copy</button>
+      <div class="head"><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)} · ${esc(f.verdict.replace(/_/g, " "))}</span><span class="rule">${esc(f.rule)}</span></div>
+      <p>${esc(f.witness)}</p>
+      <div class="meta"><span class="loc">${esc([locText(f.a), locText(f.b)].filter(Boolean).join(" ↔ "))}</span>${as ? `<span>assumes ${as}</span>` : ""}<span class="loc">${esc(f.fingerprint)}</span></div>
+    </div>`);
+  }
+  if (r.unknown_reasons.length) parts.push(`<h2>Why not stronger</h2><div class="small"><ul>${r.unknown_reasons.map((u) => `<li>${esc(u)}</li>`).join("")}</ul></div>`);
+  if (r.assumptions.length) parts.push(`<h2>Assumptions</h2><div class="small"><ul>${r.assumptions.map((a) => `<li><code>${esc(a.id)}</code> ${esc(a.text)} <i>(${esc(a.source)})</i></li>`).join("")}</ul></div>`);
+  parts.push(`<h2>Normalizations</h2><div class="small"><ul>${r.normalizations.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></div>`);
+  if (r.diagnostics.length) parts.push(`<h2>Parse diagnostics</h2><div class="small"><ul>${r.diagnostics.map((d) => `<li>${esc(d.side.toUpperCase())} ${d.line}:${d.col} ${esc(d.message)}</li>`).join("")}</ul></div>`);
+  $("side").innerHTML = parts.join("");
+  for (const el of $("side").querySelectorAll(".finding")) el.onclick = (e) => { if (!e.target.dataset.copy) focusFinding(+el.dataset.i, true); };
+  for (const el of $("side").querySelectorAll("button[data-copy]")) el.onclick = () => copyFinding(+el.dataset.copy);
+}
+
+function render() { renderHeader(); renderPane(); renderSide(); }
+
+function rowsOf(i) {
+  return state.data.view.rows.map((row, k) => ({ row, k })).filter(({ row }) =>
+    (row.a && row.a.findings.includes(i)) || (row.b && row.b.findings.includes(i))).map(({ k }) => k);
+}
+
+function ensureRowVisible(k) {
+  if (document.getElementById("row-" + k)) return;
+  // The row is inside a folded run: expand the run that starts at or before it.
+  const folds = [...$("pane").querySelectorAll(".fold")].map((el) => +el.dataset.fold).filter((s) => s <= k);
+  if (folds.length) { state.expanded.add(Math.max(...folds)); renderPane(); }
+}
+
+function focusFinding(i, scroll) {
+  state.focus = i;
+  history.replaceState(null, "", "#f=" + state.data.report.findings[i].fingerprint);
+  const rows = rowsOf(i);
+  rows.forEach(ensureRowVisible);
+  for (const el of $("pane").querySelectorAll(".row.focus")) el.classList.remove("focus");
+  for (const k of rows) { const el = $("row-" + k); if (el) el.classList.add("focus"); }
+  if (scroll && rows.length) $("row-" + rows[0]).scrollIntoView({ block: "center", behavior: "smooth" });
+  for (const el of $("side").querySelectorAll(".finding")) el.classList.toggle("focus", +el.dataset.i === i);
+  const card = $("f-" + i);
+  if (card) card.scrollIntoView({ block: "nearest" });
+}
+
+function stepFinding(d) {
+  const fs = visibleFindings().map(({ i }) => i);
+  if (!fs.length) return;
+  const at = fs.indexOf(state.focus);
+  const next = at < 0 ? (d > 0 ? 0 : fs.length - 1) : (at + d + fs.length) % fs.length;
+  focusFinding(fs[next], true);
+}
+
+function stepRow(d) {
+  const rows = state.data.view.rows;
+  let k = state.rowFocus;
+  for (let n = 0; n < rows.length; n++) {
+    k = (k + d + rows.length) % rows.length;
+    if (rows[k].kind !== "same") break;
+  }
+  state.rowFocus = k;
+  ensureRowVisible(k);
+  for (const el of $("pane").querySelectorAll(".row.focus")) el.classList.remove("focus");
+  const el = $("row-" + k);
+  if (el) { el.classList.add("focus"); el.scrollIntoView({ block: "center", behavior: "smooth" }); }
+}
+
+function findingText(f) {
+  const loc = (l) => l ? `\n${l.side.toUpperCase()} ${l.path}:${l.start_line}\n${l.excerpt.map((x) => "    " + x).join("\n")}` : "";
+  return `[${f.class} · ${f.severity} · ${f.verdict}] ${f.rule} ${f.fingerprint}\n${f.witness}${loc(f.a)}${loc(f.b)}${f.assumptions.length ? "\nassumes: " + f.assumptions.join(", ") : ""}\n`;
+}
+
+function copyFinding(i) {
+  const text = findingText(state.data.report.findings[i]);
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => flash("copied"), () => flash("copy failed"));
+}
+
+function flash(msg) { $("busy").textContent = msg; setTimeout(() => { if ($("busy").textContent === msg) $("busy").textContent = ""; }, 1200); }
+
+// Scratchpad: edits re-diff on the server, debounced; stale responses are dropped.
+let seq = 0, timer = null;
+function scheduleDiff() {
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    const mine = ++seq;
+    $("busy").textContent = "diffing…";
+    try {
+      const res = await fetch("/api/diff", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ a: $("ta-a").value, b: $("ta-b").value }) });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (mine !== seq) return;
+      const fp = state.focus >= 0 ? state.data.report.findings[state.focus].fingerprint : null;
+      state.data = data;
+      state.expanded.clear();
+      state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
+      render();
+      $("busy").textContent = "";
+    } catch (e) {
+      if (mine === seq) $("busy").textContent = "error: " + e.message;
+    }
+  }, 200);
+}
+
+function toggleScratch() {
+  const open = !$("scratch").classList.contains("open");
+  $("scratch").classList.toggle("open", open);
+  $("btn-scratch").setAttribute("aria-pressed", open);
+  if (open) $("ta-a").focus();
+}
+
+function toggleFold() {
+  state.fold = !state.fold;
+  state.expanded.clear();
+  $("btn-fold").setAttribute("aria-pressed", state.fold);
+  renderPane();
+}
+
+function init() {
+  if (!INITIAL) { document.body.innerHTML = "<p style='padding:20px'>No data. Open this page through <code>sqldiff-gui serve</code> or <code>sqldiff-gui export</code>.</p>"; return; }
+  state.data = INITIAL;
+  $("ta-a").value = INITIAL.sources[0];
+  $("ta-b").value = INITIAL.sources[1];
+  $("ta-a").previousElementSibling.textContent = `A · ${INITIAL.report.a.path} (${INITIAL.report.a.dialect})`;
+  if (INITIAL.report.b) $("ta-b").previousElementSibling.textContent = `B · ${INITIAL.report.b.path} (${INITIAL.report.b.dialect})`;
+  if (!INITIAL.live) { $("btn-scratch").disabled = true; $("btn-scratch").title = "Editing needs sqldiff-gui serve"; }
+  $("ta-a").oninput = $("ta-b").oninput = scheduleDiff;
+  $("btn-scratch").onclick = toggleScratch;
+  $("btn-fold").onclick = toggleFold;
+  $("btn-help").onclick = () => $("help").classList.add("open");
+  $("help").onclick = () => $("help").classList.remove("open");
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "TEXTAREA" || e.metaKey || e.ctrlKey || e.altKey) { if (e.key === "Escape") e.target.blur(); return; }
+    const k = e.key;
+    if (k === "j" || k === "n") stepFinding(1);
+    else if (k === "k" || k === "p") stepFinding(-1);
+    else if (k === "]") stepRow(1);
+    else if (k === "[") stepRow(-1);
+    else if (k === "c") toggleFold();
+    else if (k === "e" && state.data.live) toggleScratch();
+    else if (k === "y" && state.focus >= 0) copyFinding(state.focus);
+    else if (k === "?") $("help").classList.toggle("open");
+    else if (k === "Escape") $("help").classList.remove("open");
+    else return;
+    e.preventDefault();
+  });
+  render();
+  // Deep link: #f=<fingerprint> opens that finding.
+  const m = location.hash.match(/^#f=([0-9a-f]+)/);
+  if (m) {
+    const i = state.data.report.findings.findIndex((f) => f.fingerprint === m[1]);
+    if (i >= 0) focusFinding(i, true);
+  }
+}
+init();
+</script>
+</body>
+</html>
