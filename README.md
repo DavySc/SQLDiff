@@ -19,8 +19,13 @@ $B diff tests/fixtures/movestock.tsql.sql tests/fixtures/movestock_reformatted.t
 # Lint one file: residue from other dialects, missing terminator before THROW
 $B check tests/fixtures/catch_rethrow.tsql.sql -d tsql
 
-# Collection drift report: pair .sql files of two trees by name
-$B tree src/tsql src/db2 --dialect-a tsql --dialect-b db2i
+# Collection drift report: pair .sql files of two trees by pack pairing rules
+$B tree src/tsql src/db2 --dialect-a tsql --dialect-b db2i --pack ../private-pack
+
+# diff, check and tree read sqldiff.toml, user config and --pack like the source
+# commands: pairing rules, dialect_map, limits, overrides, declared assumptions.
+# Without a dialect flag, the dialect comes from dialect_map or the path (x.pg.sql).
+$B diff tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.pg.sql
 
 # Machine output for CI
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif

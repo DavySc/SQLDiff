@@ -9,6 +9,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
+use sqldiff_source::protocol::ObjectFilter;
+use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
 
 mod source_cmd;
@@ -34,6 +36,9 @@ enum Format {
 #[derive(Subcommand)]
 enum Command {
     /// Compare two artifacts (versions of one object, or one object in two dialects).
+    ///
+    /// Without a dialect flag, a side's dialect comes from `dialect_map` or
+    /// the path convention (`tsql/x.sql`, `x.pg.sql`).
     Diff {
         a: PathBuf,
         b: PathBuf,
@@ -46,17 +51,23 @@ enum Command {
         dialect_b: Option<Dialect>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
-        /// Maximum excerpt lines per location.
-        #[arg(long, default_value_t = 3)]
-        excerpt_lines: usize,
+        /// Maximum excerpt lines per location (default: config, else 3).
+        #[arg(long)]
+        excerpt_lines: Option<usize>,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
     },
-    /// Lint one artifact: residue from other dialects, terminator hazards, parse problems.
+    /// Lint one artifact: residue from other dialects, terminator hazards,
+    /// parse problems and pack limits.
     Check {
         file: PathBuf,
+        /// Dialect (default: from `dialect_map` or the path convention).
         #[arg(short, long)]
-        dialect: Dialect,
+        dialect: Option<Dialect>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
     },
     /// Parse one artifact, verify the lossless round trip and optionally dump the tree.
     Parse {
@@ -66,24 +77,71 @@ enum Command {
         #[arg(long)]
         tree: bool,
     },
-    /// Collection drift report: pair `.sql` files of two trees by name and diff each pair.
+    /// Collection drift report: pair the SQL files of two trees by pack
+    /// pairing rules and diff each pair.
     Tree {
         dir_a: PathBuf,
         dir_b: PathBuf,
+        /// Dialect of every file in DIR_A (default: per file, from `dialect_map` or the path convention).
         #[arg(long)]
-        dialect_a: Dialect,
+        dialect_a: Option<Dialect>,
         #[arg(long)]
-        dialect_b: Dialect,
+        dialect_b: Option<Dialect>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
     },
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
 }
 
-fn read(path: &Path, dialect: Dialect) -> Result<Artifact, String> {
+/// Path with `/` separators, as `dialect_map` globs and pairing see it.
+fn slashed(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+        .replace("//", "/")
+}
+
+/// Reads an artifact. Dialect: the given one, else `dialect_map` or the path
+/// convention. Version: `dialect_map`, else the configured target version.
+fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Artifact, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Artifact::new(path.display().to_string(), dialect, text))
+    artifact(
+        path.display().to_string(),
+        &slashed(path),
+        dialect,
+        text,
+        cfg,
+    )
+}
+
+fn artifact(
+    display: String,
+    rel: &str,
+    dialect: Option<Dialect>,
+    text: String,
+    cfg: &Resolved,
+) -> Result<Artifact, String> {
+    let (found, version) = sqldiff_source::classify(rel, cfg);
+    let d = dialect.or(found).ok_or_else(|| {
+        format!("{display}: dialect unknown; give a dialect flag or map it with dialect_map")
+    })?;
+    let mut a = Artifact::new(display, d, text);
+    a.version = match version {
+        Some(v) if found == Some(d) => v,
+        _ => cfg.dialect_version(d),
+    };
+    Ok(a)
+}
+
+/// Pack policy on an engine report: limit rules, overrides, declared assumptions.
+fn with_policy(mut r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
+    policy::add_limits(&mut r, a, b, cfg);
+    policy::apply(&mut r, cfg);
+    r
 }
 
 fn exit_for(verdict: Verdict) -> ExitCode {
@@ -121,15 +179,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
+            cfg,
         } => {
-            let da = dialect_a
-                .or(dialect)
-                .ok_or("give --dialect or --dialect-a")?;
-            let db = dialect_b
-                .or(dialect)
-                .ok_or("give --dialect or --dialect-b")?;
-            let report =
-                sqldiff_core::diff(&read(&a, da)?, &read(&b, db)?, &Options { excerpt_lines });
+            let cfg = cfg.resolve()?;
+            let a = read(&a, dialect_a.or(dialect), &cfg)?;
+            let b = read(&b, dialect_b.or(dialect), &cfg)?;
+            let opts = Options {
+                excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
+            };
+            let report = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
             emit(&report, format);
             Ok(exit_for(report.verdict))
         }
@@ -137,8 +195,14 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             file,
             dialect,
             format,
+            cfg,
         } => {
-            let report = sqldiff_core::check(&read(&file, dialect)?, &Options::default());
+            let cfg = cfg.resolve()?;
+            let art = read(&file, dialect, &cfg)?;
+            let opts = Options {
+                excerpt_lines: cfg.excerpt_lines,
+            };
+            let report = with_policy(sqldiff_core::check(&art, &opts), &art, None, &cfg);
             emit(&report, format);
             Ok(exit_for(report.verdict))
         }
@@ -147,7 +211,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect,
             tree,
         } => {
-            let art = read(&file, dialect)?;
+            let art = Artifact::new(
+                file.display().to_string(),
+                dialect,
+                std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?,
+            );
             let parse = sqldiff_syntax::parse(&art.text, dialect);
             let root = parse.syntax();
             if tree {
@@ -179,64 +247,156 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_a,
             dialect_b,
             format,
-        } => tree(&dir_a, &dir_b, dialect_a, dialect_b, format),
+            cfg,
+        } => tree(
+            &dir_a,
+            &dir_b,
+            dialect_a,
+            dialect_b,
+            format,
+            &cfg.resolve()?,
+        ),
         Command::Source(cmd) => source_cmd::run(cmd),
     }
 }
 
-/// Pairing key: file stem, case-insensitive, `_` and `-` ignored, dialect suffixes stripped.
-fn pair_key(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    let stem = name.split('.').next().unwrap_or("").to_string();
-    stem.replace(['_', '-'], "")
+/// One side of a tree: its objects by pairing key.
+struct Side {
+    dir: PathBuf,
+    dialect: Option<Dialect>,
+    by_key: BTreeMap<String, String>,
+    /// Keys held by several objects; none of them is paired.
+    ambiguous: BTreeMap<String, Vec<String>>,
+    no_dialect: Vec<String>,
 }
 
-fn sql_files(dir: &Path) -> Result<BTreeMap<String, PathBuf>, String> {
-    let mut out = BTreeMap::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).map_err(|e| format!("{}: {e}", d.display()))? {
-            let p = entry.map_err(|e| e.to_string())?.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("sql")) {
-                out.insert(pair_key(&p), p);
+impl Side {
+    /// Lists a directory with pack `ignore` and `dialect_map`, skipping shared
+    /// artifacts, and keys every object by its pairing rule.
+    fn load(dir: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Side, String> {
+        let src = FsSource::new(dir, cfg).map_err(|e| e.0)?;
+        let objects = src
+            .list_objects(&ObjectFilter::default())
+            .map_err(|e| e.0)?;
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut no_dialect = Vec::new();
+        for o in objects {
+            if cfg.is_shared(&o.id) {
+                continue;
             }
+            let Some(d) = dialect.or_else(|| o.dialect.as_deref().and_then(|d| d.parse().ok()))
+            else {
+                no_dialect.push(o.id);
+                continue;
+            };
+            let rule = cfg.pairing_rule(&o.id, Some(d));
+            groups
+                .entry(pairing::key(&o.name, &rule))
+                .or_default()
+                .push(o.id);
         }
+        let (unique, ambiguous): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            groups.into_iter().partition(|(_, ids)| ids.len() == 1);
+        Ok(Side {
+            dir: dir.to_path_buf(),
+            dialect,
+            by_key: unique
+                .into_iter()
+                .map(|(k, mut ids)| (k, ids.remove(0)))
+                .collect(),
+            ambiguous,
+            no_dialect,
+        })
     }
-    Ok(out)
+
+    fn display(&self, id: &str) -> String {
+        self.dir.join(id).display().to_string()
+    }
+
+    fn read(&self, id: &str, cfg: &Resolved) -> Result<Artifact, String> {
+        let p = self.dir.join(id);
+        let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        artifact(p.display().to_string(), id, self.dialect, text, cfg)
+    }
+
+    /// Takes an object out by id, wherever it is keyed.
+    fn take(&mut self, id: &str) -> bool {
+        let key = self
+            .by_key
+            .iter()
+            .find(|(_, v)| v.as_str() == id)
+            .map(|(k, _)| k.clone());
+        key.is_some_and(|k| self.by_key.remove(&k).is_some())
+    }
 }
 
 fn tree(
     dir_a: &Path,
     dir_b: &Path,
-    da: Dialect,
-    db: Dialect,
+    da: Option<Dialect>,
+    db: Option<Dialect>,
     format: Format,
+    cfg: &Resolved,
 ) -> Result<ExitCode, String> {
-    let fa = sql_files(dir_a)?;
-    let fb = sql_files(dir_b)?;
-    let mut reports = Vec::new();
+    let mut sa = Side::load(dir_a, da, cfg)?;
+    let mut sb = Side::load(dir_b, db, cfg)?;
+    let opts = Options {
+        excerpt_lines: cfg.excerpt_lines,
+    };
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    // Explicit pack pairs first: `a` relative to DIR_A, `b` relative to DIR_B.
+    for e in &cfg.policy.pairing.pairs {
+        for (x, y) in [(&e.a, &e.b), (&e.b, &e.a)] {
+            if sa.by_key.values().any(|v| v == x) && sb.by_key.values().any(|v| v == y) {
+                sa.take(x);
+                sb.take(y);
+                pairs.push((x.clone(), y.clone()));
+                break;
+            }
+        }
+    }
     let mut only_a = Vec::new();
     let mut only_b = Vec::new();
-    for (k, pa) in &fa {
-        match fb.get(k) {
-            Some(pb) => reports.push(sqldiff_core::diff(
-                &read(pa, da)?,
-                &read(pb, db)?,
-                &Options::default(),
-            )),
-            None => only_a.push(pa.display().to_string()),
+    for (k, ia) in &sa.by_key {
+        match sb.by_key.get(k) {
+            Some(ib) => pairs.push((ia.clone(), ib.clone())),
+            None => only_a.push(sa.display(ia)),
         }
     }
-    for (k, pb) in &fb {
-        if !fa.contains_key(k) {
-            only_b.push(pb.display().to_string());
+    for (k, ib) in &sb.by_key {
+        if !sa.by_key.contains_key(k) {
+            only_b.push(sb.display(ib));
         }
     }
+    let mut reports = Vec::new();
+    for (ia, ib) in &pairs {
+        let a = sa.read(ia, cfg)?;
+        let b = sb.read(ib, cfg)?;
+        reports.push(with_policy(
+            sqldiff_core::diff(&a, &b, &opts),
+            &a,
+            Some(&b),
+            cfg,
+        ));
+    }
+    let ambiguous: Vec<serde_json::Value> = [(&sa, "A"), (&sb, "B")]
+        .iter()
+        .flat_map(|(s, side)| {
+            s.ambiguous.iter().map(move |(k, ids)| {
+                serde_json::json!({
+                    "side": side,
+                    "key": k,
+                    "ids": ids.iter().map(|i| s.display(i)).collect::<Vec<_>>(),
+                })
+            })
+        })
+        .collect();
+    let no_dialect: Vec<String> = sa
+        .no_dialect
+        .iter()
+        .map(|i| sa.display(i))
+        .chain(sb.no_dialect.iter().map(|i| sb.display(i)))
+        .collect();
     // Most severe first.
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
@@ -247,7 +407,14 @@ fn tree(
     });
     match format {
         Format::Json => {
-            let v = serde_json::json!({ "pairs": reports, "only_a": only_a, "only_b": only_b });
+            let v = serde_json::json!({
+                "pairs": reports,
+                "only_a": only_a,
+                "only_b": only_b,
+                "ambiguous": ambiguous,
+                "no_dialect": no_dialect,
+                "provenance": cfg.layers,
+            });
             println!("{}", serde_json::to_string_pretty(&v).unwrap());
         }
         Format::Sarif => println!("{}", render::sarif(&reports)),
@@ -273,6 +440,24 @@ fn tree(
             for p in &only_b {
                 println!("{:<26} {:<14} {:>8}  {p}", "only in B", "-", "-");
             }
+            for a in &ambiguous {
+                println!(
+                    "{:<26} {:<14} {:>8}  {}",
+                    format!("ambiguous in {}", a["side"].as_str().unwrap_or("")),
+                    "-",
+                    "-",
+                    a["ids"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            for p in &no_dialect {
+                println!("{:<26} {:<14} {:>8}  {p}", "no dialect", "-", "-");
+            }
         }
     }
     let worst = reports
@@ -280,7 +465,9 @@ fn tree(
         .map(|r| r.verdict)
         .max()
         .unwrap_or(Verdict::Equal);
-    Ok(exit_for(if only_a.is_empty() && only_b.is_empty() {
+    let complete =
+        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
+    Ok(exit_for(if complete {
         worst
     } else {
         worst.max(Verdict::Unknown)

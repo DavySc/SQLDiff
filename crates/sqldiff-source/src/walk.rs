@@ -30,7 +30,7 @@ fn dialect_token(s: &str) -> Option<Dialect> {
 /// Dialect from `dialect_map`, else from the path convention: a directory
 /// or a dot-separated part of the file name that names a dialect
 /// (`tsql/x.sql`, `x.pg.sql`, `pairs/x/db2i.sql`). Otherwise unknown.
-pub(crate) fn classify(rel: &str, config: &Resolved) -> (Option<Dialect>, Option<String>) {
+pub fn classify(rel: &str, config: &Resolved) -> (Option<Dialect>, Option<String>) {
     if let Some((d, v)) = config.mapped_dialect(rel) {
         return (
             Some(d),
