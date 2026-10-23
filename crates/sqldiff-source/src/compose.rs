@@ -170,6 +170,35 @@ pub fn check(
     }))
 }
 
+/// The shared step for every engine report built from files (CLI `diff`,
+/// `check`, `tree`, the GUI and MCP): read mode over the pack's markers on
+/// each side, then [`annotate`]. A no-op when no markers are configured.
+pub fn apply(
+    report: &mut Report,
+    a: &Artifact,
+    b: Option<&Artifact>,
+    policy: &Policy,
+    templates: Option<&TemplateDir>,
+    opts: &Options,
+) -> Result<()> {
+    if policy.composition.is_empty() {
+        return Ok(());
+    }
+    let ca = read(&a.text, policy)?;
+    let cb = match b {
+        Some(b) => read(&b.text, policy)?,
+        None => None,
+    };
+    annotate(
+        report,
+        (a, ca.as_ref()),
+        b.map(|b| (b, cb.as_ref())),
+        policy,
+        templates,
+        opts,
+    )
+}
+
 /// Runs read mode (and check mode with `templates`) on both sides and adds
 /// the composition findings and wrapper facts to an engine report.
 pub fn annotate(

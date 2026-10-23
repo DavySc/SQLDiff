@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use sqldiff_core::composition::{self, Composition};
+use sqldiff_core::composition;
 use sqldiff_core::model::Side as ReportSide;
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
 use sqldiff_source::protocol::ObjectFilter;
@@ -299,11 +299,6 @@ fn template_cmd(
     }))
 }
 
-/// Read mode over the pack's composition markers.
-fn composed(art: &Artifact, cfg: &Resolved) -> Result<Option<Composition>, String> {
-    compose::read(&art.text, &cfg.policy).map_err(|e| e.0)
-}
-
 fn template_dir(dir: Option<&Path>) -> Result<Option<compose::TemplateDir>, String> {
     dir.map(compose::TemplateDir::new)
         .transpose()
@@ -362,11 +357,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             }
             let templates = template_dir(templates.as_deref())?;
             let mut report = sqldiff_core::diff(&a, &b, &opts);
-            let (ca, cb) = (composed(&a, &cfg)?, composed(&b, &cfg)?);
-            compose::annotate(
+            compose::apply(
                 &mut report,
-                (&a, ca.as_ref()),
-                Some((&b, cb.as_ref())),
+                &a,
+                Some(&b),
                 &cfg.policy,
                 templates.as_ref(),
                 &opts,
@@ -390,10 +384,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             };
             let templates = template_dir(templates.as_deref())?;
             let mut report = sqldiff_core::check(&art, &opts);
-            let comp = composed(&art, &cfg)?;
-            compose::annotate(
+            compose::apply(
                 &mut report,
-                (&art, comp.as_ref()),
+                &art,
                 None,
                 &cfg.policy,
                 templates.as_ref(),
@@ -582,16 +575,7 @@ fn tree(
         let a = sa.read(ia, cfg)?;
         let b = sb.read(ib, cfg)?;
         let mut r = sqldiff_core::diff(&a, &b, &opts);
-        let (ca, cb) = (composed(&a, cfg)?, composed(&b, cfg)?);
-        compose::annotate(
-            &mut r,
-            (&a, ca.as_ref()),
-            Some((&b, cb.as_ref())),
-            &cfg.policy,
-            None,
-            &opts,
-        )
-        .map_err(|e| e.0)?;
+        compose::apply(&mut r, &a, Some(&b), &cfg.policy, None, &opts).map_err(|e| e.0)?;
         reports.push(with_policy(r, &a, Some(&b), cfg));
     }
     let ambiguous: Vec<serde_json::Value> = [(&sa, "A"), (&sb, "B")]
