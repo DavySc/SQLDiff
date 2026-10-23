@@ -11,6 +11,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
 use sqldiff_syntax::ast;
 
+mod source_cmd;
+
 #[derive(Parser)]
 #[command(
     name = "sqldiff",
@@ -75,6 +77,8 @@ enum Command {
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
+    #[command(flatten)]
+    Source(source_cmd::SourceCommand),
 }
 
 fn read(path: &Path, dialect: Dialect) -> Result<Artifact, String> {
@@ -176,6 +180,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
         } => tree(&dir_a, &dir_b, dialect_a, dialect_b, format),
+        Command::Source(cmd) => source_cmd::run(cmd),
     }
 }
 
