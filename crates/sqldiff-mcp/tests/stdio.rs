@@ -12,6 +12,7 @@ fn fixture(name: &str) -> String {
 /// Send each message and collect one response per request (not per notification).
 fn session(messages: &[Value]) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+        .arg("--isolated")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -64,7 +65,19 @@ fn handshake_list_and_conversion_review() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["diff", "check", "finding"]);
+    assert_eq!(
+        names,
+        [
+            "diff",
+            "check",
+            "finding",
+            "queue",
+            "assumptions",
+            "set_assumption",
+            "comment_text",
+            "open_in_gui"
+        ]
+    );
 
     let res = &r[2]["result"];
     assert_eq!(res["isError"], false);
@@ -178,4 +191,130 @@ fn parse_error_and_ping() {
     assert!(server
         .handle_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#)
         .is_none());
+}
+
+fn text(r: &Value) -> &str {
+    r["result"]["content"][0]["text"].as_str().unwrap()
+}
+
+#[test]
+fn queue_flip_comment_and_link() {
+    let fixtures = fixture("");
+    let r = session(&[
+        call(1, "queue", json!({ "source": fixtures })),
+        call(
+            2,
+            "queue",
+            json!({ "source": fixtures, "min_severity": "loud" }),
+        ),
+        call(
+            3,
+            "queue",
+            json!({ "source": fixtures, "classes": ["semantic"], "limit": 1 }),
+        ),
+    ]);
+    let filtered = &r[2]["result"]["structuredContent"];
+    assert_eq!(filtered["pairs"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["omitted_pairs"], 1);
+    let s = &r[0]["result"]["structuredContent"];
+    let pairs = s["pairs"].as_array().unwrap();
+    assert_eq!(pairs.len(), 3);
+    // Most severe first; the T-SQL ↔ PG pair hinges on one assumption.
+    assert_eq!(pairs[0]["highest_severity"], "critical");
+    let pg = pairs
+        .iter()
+        .find(|p| p["b"] == "movestock.pg.sql" && p["a"] == "movestock.tsql.sql")
+        .unwrap();
+    assert_eq!(pg["verdict_flipping"], json!(["ASM-CALLER-CHECKS-RC"]));
+    assert_eq!(pg["review"]["unreviewed"], 1);
+    assert_eq!(r[1]["result"]["isError"], true);
+
+    let pid = pg["id"].as_str().unwrap();
+    let r = session(&[
+        call(1, "queue", json!({ "source": fixtures })),
+        call(2, "assumptions", json!({ "pair": pid })),
+        call(
+            3,
+            "set_assumption",
+            json!({ "id": "ASM-CALLER-CHECKS-RC", "holds": false }),
+        ),
+        call(
+            4,
+            "queue",
+            json!({ "source": fixtures, "verdicts": ["unknown"] }),
+        ),
+        call(
+            5,
+            "set_assumption",
+            json!({ "id": "ASM-CALLER-CHECKS-RC", "holds": null }),
+        ),
+        call(6, "assumptions", json!({ "pair": pid })),
+    ]);
+    let ledger = &r[1]["result"]["structuredContent"]["assumptions"];
+    assert_eq!(ledger[0]["id"], "ASM-CALLER-CHECKS-RC");
+    assert_eq!(ledger[0]["status"], "open");
+    assert_eq!(ledger[0]["flips_verdict"], true);
+    assert_eq!(ledger[0]["verdict_if_flipped"], "unknown");
+    let changed = &r[2]["result"]["structuredContent"]["changed"];
+    assert!(changed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["pair_id"] == pid && c["from"] == "different" && c["to"] == "unknown"));
+    let unknown = r[3]["result"]["structuredContent"]["pairs"]
+        .as_array()
+        .unwrap();
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0]["id"], pid);
+    assert_eq!(r[5]["result"]["structuredContent"]["verdict"], "different");
+
+    // Comment text is deterministic and cites the finding; the link selects it.
+    let ask = |id| {
+        session(&[
+            call(1, "queue", json!({ "source": fixtures })),
+            call(2, "finding", json!({ "fingerprint": "06ccfd05e423182d" })),
+            call(
+                3,
+                "comment_text",
+                json!({ "finding_ids": ["06ccfd05e423182d"] }),
+            ),
+            call(
+                4,
+                "open_in_gui",
+                json!({ "finding_id": "06ccfd05e423182d", "gui_url": "http://h:1" }),
+            ),
+            call(id, "comment_text", json!({ "finding_ids": ["nope"] })),
+        ])
+    };
+    let (x, y) = (ask(5), ask(5));
+    assert_eq!(text(&x[2]), text(&y[2]));
+    assert!(text(&x[2]).starts_with("SQLDiff found 1 issue to review."));
+    assert!(text(&x[2]).contains("(sqldiff 06ccfd05e423182d)"));
+    let url = x[3]["result"]["structuredContent"]["url"].as_str().unwrap();
+    assert!(url.starts_with("http://h:1/?a="), "{url}");
+    assert!(url.ends_with("#f=06ccfd05e423182d"), "{url}");
+    assert!(x[3]["result"]["structuredContent"]["command"]
+        .as_str()
+        .unwrap()
+        .starts_with("sqldiff-gui serve --dialect-a tsql"));
+    assert_eq!(x[4]["result"]["isError"], true);
+}
+
+#[test]
+fn inline_text_has_no_gui_link() {
+    let r = session(&[call(
+        1,
+        "diff",
+        json!({ "a": { "text": "select 1;", "dialect": "tsql" }, "b": { "text": "select 2;", "dialect": "tsql" } }),
+    )]);
+    let pid = r[0]["result"]["structuredContent"]["pair_id"].clone();
+    let r = session(&[
+        call(
+            1,
+            "diff",
+            json!({ "a": { "text": "select 1;", "dialect": "tsql" }, "b": { "text": "select 2;", "dialect": "tsql" } }),
+        ),
+        call(2, "open_in_gui", json!({ "pair": pid })),
+    ]);
+    assert_eq!(r[1]["result"]["isError"], true);
 }
