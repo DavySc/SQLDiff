@@ -10,15 +10,18 @@
 //!
 //! Identifiers are replaced as whole words (SQL identifier characters are
 //! `[A-Za-z0-9_@#$]`), deny-listed terms anywhere, case-insensitively.
-//! [`Redactor::leaks`] re-checks an output; exports refuse to write one
-//! that still contains a term.
+//! Only free-text values change: JSON keys, enum tags, versions and hashes
+//! (fingerprints, content hashes, snapshots) are kept, and no term matches
+//! inside a placeholder or a hex run of 16 or more characters.
+//! [`Redactor::verify_report`] and [`Redactor::verify_value`] re-check the
+//! redacted data; exports refuse to write data that still contains a term.
 
 use std::collections::HashMap;
 
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqldiff_core::model::hex;
+use sqldiff_core::model::{hex, Finding, Location};
 use sqldiff_core::Report;
 use sqldiff_source::{Error, Resolved, Result};
 
@@ -71,8 +74,47 @@ pub struct Redactor {
     terms: HashMap<String, Entry>,
     work_items: Vec<Regex>,
     matcher: Option<Regex>,
+    /// Registered terms, longest first, for the fallback at one start.
+    ordered: Vec<String>,
     pub options: Options,
 }
+
+/// Spans no term may match inside: placeholders, and hex runs of 16 or
+/// more characters (fingerprints, content hashes, snapshot ids).
+fn opaque() -> &'static Regex {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"\b(?:(?:OBJ|SCHEMA|PATH|WI|HELPER|RULE|PACK|TERM)_[0-9A-F]{8}(?:\.[a-z0-9]{1,4})?|[0-9a-fA-F]{16,})\b",
+        )
+        .expect("opaque pattern compiles")
+    })
+}
+
+/// JSON keys whose string values are hashes, enum tags or versions: never
+/// redacted, so a redacted value still deserializes and still correlates.
+const KEEP_KEYS: &[&str] = &[
+    "fingerprint",
+    "content_hash",
+    "snapshot",
+    "hash",
+    "sqldiff/v1",
+    "verdict",
+    "verdict_before_suppression",
+    "class",
+    "severity",
+    "kind",
+    "error_kind",
+    "side",
+    "source",
+    "dialect",
+    "dialect_version",
+    "tool_version",
+    "level",
+    "state",
+    "version",
+    "$schema",
+];
 
 fn is_ident(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')
@@ -97,6 +139,7 @@ impl Redactor {
             terms: HashMap::new(),
             work_items: Vec::new(),
             matcher: None,
+            ordered: Vec::new(),
             options: Options::default(),
         };
         for t in &cfg.policy.deny_list {
@@ -238,6 +281,7 @@ impl Redactor {
             let mut keys: Vec<&String> = self.terms.keys().collect();
             // Longest first, so a qualified name or a path wins over its parts.
             keys.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+            self.ordered = keys.iter().map(|k| k.to_string()).collect();
             let alt = keys
                 .iter()
                 .map(|k| regex::escape(k))
@@ -254,28 +298,55 @@ impl Redactor {
         self.matcher.as_ref()
     }
 
-    /// Matches of registered terms, as (start, end, placeholder).
+    fn bounded(&self, s: &str, start: usize, end: usize, whole_word: bool) -> bool {
+        !whole_word
+            || (!s[..start].chars().next_back().is_some_and(is_ident)
+                && !s[end..].chars().next().is_some_and(is_ident))
+    }
+
+    /// The longest registered term that matches at `start` and passes its
+    /// boundary check, as (end, placeholder).
+    fn best_at(&self, s: &str, start: usize) -> Option<(usize, String)> {
+        self.ordered.iter().find_map(|k| {
+            let end = start + k.len();
+            let t = s.get(start..end)?;
+            if t.to_lowercase() != *k {
+                return None;
+            }
+            let e = &self.terms[k];
+            self.bounded(s, start, end, e.whole_word)
+                .then(|| (end, e.placeholder.clone()))
+        })
+    }
+
+    /// Matches of registered terms outside opaque spans, as (start, end, placeholder).
     fn matches(&mut self, s: &str) -> Vec<(usize, usize, String)> {
         let Some(re) = self.matcher().cloned() else {
             return Vec::new();
         };
+        let blocked: Vec<(usize, usize)> = opaque()
+            .find_iter(s)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        let in_blocked = |a: usize, b: usize| blocked.iter().any(|&(x, y)| a < y && x < b);
         let mut out = Vec::new();
         let mut pos = 0;
-        while pos <= s.len() {
+        while pos < s.len() {
             let Some(m) = re.find_at(s, pos) else { break };
-            let e = &self.terms[&m.as_str().to_lowercase()];
-            let before = s[..m.start()].chars().next_back();
-            let after = s[m.end()..].chars().next();
-            let bounded =
-                !e.whole_word || (!before.is_some_and(is_ident) && !after.is_some_and(is_ident));
-            if bounded {
-                out.push((m.start(), m.end(), e.placeholder.clone()));
-                pos = m.end();
-            } else {
-                pos = m.start() + s[m.start()..].chars().next().map_or(1, char::len_utf8);
-            }
-            if m.end() == m.start() {
-                pos += 1;
+            let next = m.start() + s[m.start()..].chars().next().map_or(1, char::len_utf8);
+            let hit = self
+                .terms
+                .get(&m.as_str().to_lowercase())
+                .filter(|e| self.bounded(s, m.start(), m.end(), e.whole_word))
+                .map(|e| (m.end(), e.placeholder.clone()))
+                // The longest alternative failed its boundary: a shorter one may pass.
+                .or_else(|| self.best_at(s, m.start()));
+            match hit {
+                Some((end, p)) if !in_blocked(m.start(), end) => {
+                    out.push((m.start(), end, p));
+                    pos = end.max(next);
+                }
+                _ => pos = next,
             }
         }
         out
@@ -297,31 +368,117 @@ impl Redactor {
         out
     }
 
-    /// Redacts every string in a JSON value, keys included.
+    /// Redacts the string values of a JSON value. Keys are never changed,
+    /// and values under hash, enum and version keys are kept.
     pub fn redact_value(&mut self, v: &mut Value) {
         match v {
             Value::String(s) => *s = self.redact_str(s),
             Value::Array(a) => a.iter_mut().for_each(|x| self.redact_value(x)),
             Value::Object(o) => {
-                let old = std::mem::take(o);
-                for (k, mut x) in old {
+                for (k, x) in o.iter_mut() {
                     if self.options.drop_excerpts && k == "excerpt" {
-                        x = Value::Array(Vec::new());
+                        *x = Value::Array(Vec::new());
+                    } else if !KEEP_KEYS.contains(&k.as_str()) {
+                        self.redact_value(x);
                     }
-                    self.redact_value(&mut x);
-                    o.insert(self.redact_str(&k), x);
                 }
             }
             _ => {}
         }
     }
 
+    fn redact_location(&mut self, l: &mut Location) {
+        l.path = self.redact_str(&l.path);
+        if self.options.drop_excerpts {
+            l.excerpt.clear();
+        } else {
+            for e in &mut l.excerpt {
+                *e = self.redact_str(e);
+            }
+        }
+    }
+
+    fn redact_finding(&mut self, f: &mut Finding) {
+        f.rule = self.redact_str(&f.rule);
+        f.witness = self.redact_str(&f.witness);
+        for l in [&mut f.a, &mut f.b].into_iter().flatten() {
+            self.redact_location(l);
+        }
+        for a in &mut f.assumptions {
+            *a = self.redact_str(a);
+        }
+    }
+
     /// A redacted copy of a report. Registers the report's own terms first.
+    /// Only free-text fields change; fingerprints, hashes, enums and
+    /// numbers are kept.
     pub fn redact_report(&mut self, r: &Report) -> Report {
         self.add_report(r);
-        let mut v = serde_json::to_value(r).expect("report serializes");
-        self.redact_value(&mut v);
-        serde_json::from_value(v).expect("redacted report deserializes")
+        let mut r = r.clone();
+        for info in std::iter::once(&mut r.a).chain(r.b.as_mut()) {
+            info.path = self.redact_str(&info.path);
+            info.object = self.redact_str(&info.object);
+        }
+        for f in &mut r.findings {
+            self.redact_finding(f);
+        }
+        for s in &mut r.suppressed {
+            self.redact_finding(&mut s.finding);
+            s.justification = self.redact_str(&s.justification);
+        }
+        for w in &mut r.witnesses {
+            w.rule = self.redact_str(&w.rule);
+            let sc = &mut w.scenario;
+            sc.text = self.redact_str(&sc.text);
+            if let Some(t) = &mut sc.statement {
+                *t = self.redact_str(t);
+            }
+            for p in &mut sc.path {
+                p.condition = self.redact_str(&p.condition);
+            }
+            for o in [&mut w.a, &mut w.b] {
+                for t in [
+                    &mut o.control,
+                    &mut o.exit,
+                    &mut o.rollback,
+                    &mut o.transaction,
+                ] {
+                    *t = self.redact_str(t);
+                }
+                for t in o
+                    .durable
+                    .iter_mut()
+                    .chain(&mut o.undone)
+                    .chain(&mut o.partial)
+                    .chain(&mut o.left_to_caller)
+                    .chain(&mut o.not_proven)
+                {
+                    *t = self.redact_str(t);
+                }
+            }
+        }
+        for d in &mut r.discharged {
+            d.id = self.redact_str(&d.id);
+            d.cite = self.redact_str(&d.cite);
+            if let Some(v) = &mut d.value {
+                *v = self.redact_str(v);
+            }
+        }
+        for a in &mut r.assumptions {
+            a.id = self.redact_str(&a.id);
+            a.text = self.redact_str(&a.text);
+        }
+        for t in r
+            .normalizations
+            .iter_mut()
+            .chain(r.unknown_reasons.iter_mut())
+        {
+            *t = self.redact_str(t);
+        }
+        for d in &mut r.diagnostics {
+            d.message = self.redact_str(&d.message);
+        }
+        r
     }
 
     /// Registered terms still present in `s` (lower-cased, sorted).
@@ -348,8 +505,49 @@ impl Redactor {
         Ok(())
     }
 
+    /// Checks the string values of a JSON value the way [`redact_value`]
+    /// treats them: keys and hash, enum and version values are not scanned,
+    /// since a name like `error` or `text` may legitimately equal a key or
+    /// a label of the output format.
+    ///
+    /// [`redact_value`]: Redactor::redact_value
+    pub fn verify_value(&mut self, v: &Value) -> Result<()> {
+        let mut texts = Vec::new();
+        collect_free_text(v, &mut texts);
+        let mut n = 0;
+        for t in texts {
+            n += self.leaks(&t).len();
+        }
+        if n > 0 {
+            return Err(Error::new(format!(
+                "redacted export still contains {n} identifying term(s); not written"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`verify_value`](Redactor::verify_value) over a report's fields.
+    pub fn verify_report(&mut self, r: &Report) -> Result<()> {
+        self.verify_value(&serde_json::to_value(r)?)
+    }
+
     pub fn term_count(&self) -> usize {
         self.terms.len()
+    }
+}
+
+fn collect_free_text(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| collect_free_text(x, out)),
+        Value::Object(o) => {
+            for (k, x) in o {
+                if !KEEP_KEYS.contains(&k.as_str()) {
+                    collect_free_text(x, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 

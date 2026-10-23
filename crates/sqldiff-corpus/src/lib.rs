@@ -40,21 +40,11 @@ pub struct Expect {
     pub classes: Vec<String>,
     #[serde(default)]
     pub assumptions: Vec<String>,
-    #[serde(default)]
-    pub facts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Case {
     pub id: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub detected_by: Option<String>,
-    #[serde(default)]
-    pub milestone: Option<String>,
-    #[serde(default)]
-    pub pack: Option<String>,
     pub sides: BTreeMap<String, Side>,
     #[serde(default)]
     pub expect: Vec<Expect>,

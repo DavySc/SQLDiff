@@ -246,6 +246,10 @@ pub struct Report {
     /// not count towards [`Report::open_verdict`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub suppressed: Vec<Suppressed>,
+    /// The engine's verdict before anything was suppressed; `verdict` is
+    /// then the verdict over the open findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_before_suppression: Option<Verdict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -274,6 +278,7 @@ impl Report {
         if self.suppressed.is_empty() {
             return self.verdict;
         }
+
         if self
             .findings
             .iter()
@@ -287,6 +292,20 @@ impl Report {
         } else {
             Verdict::EqualUnderAssumptions
         }
+    }
+
+    /// After findings were moved to `suppressed`: records the engine's
+    /// verdict once in `verdict_before_suppression` and sets `verdict` to
+    /// the [`open_verdict`](Report::open_verdict), so text, JSON, SARIF and
+    /// exit codes agree.
+    pub fn settle_suppression(&mut self) {
+        if self.suppressed.is_empty() {
+            return;
+        }
+        if self.verdict_before_suppression.is_none() {
+            self.verdict_before_suppression = Some(self.verdict);
+        }
+        self.verdict = self.open_verdict();
     }
 
     pub fn highest_class(&self) -> Option<ChangeClass> {

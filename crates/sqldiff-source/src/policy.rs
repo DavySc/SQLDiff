@@ -141,10 +141,18 @@ pub fn limit_findings(art: &Artifact, side: Side, config: &Resolved) -> Vec<Find
 }
 
 /// Adds limit findings for both sides of a report.
+/// Limit findings are unknown, so a report that gains one can no longer be
+/// equal; its verdict is derived again.
 pub fn add_limits(report: &mut Report, a: &Artifact, b: Option<&Artifact>, config: &Resolved) {
+    let before = report.findings.len();
     report.findings.extend(limit_findings(a, Side::A, config));
     if let Some(b) = b {
         report.findings.extend(limit_findings(b, Side::B, config));
+    }
+    if report.findings.len() > before {
+        report.verdict = report
+            .verdict
+            .max(sqldiff_core::session::derive_verdict(report));
     }
 }
 

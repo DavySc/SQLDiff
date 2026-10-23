@@ -43,10 +43,7 @@ vars == <<c, plan, st>>
 Cs == Cases[c]
 D  == Cs.dialect
 
-Kinds(d) ==
-    CASE d = "tsql"     -> {"stmt", "batch", "uncatchable", "notfound"}
-      [] d = "postgres" -> {"stmt", "uncatchable", "notfound"}
-      [] d = "db2i"     -> {"stmt", "notfound"}
+\* FaultKinds(d), the fault kinds each dialect has, comes from ProfileCases.
 
 \* The caller's own pending work, if the routine runs inside a caller transaction.
 CallerTag == "caller"
@@ -80,20 +77,33 @@ Put(s, tags) ==
 
 Abort(s) == [s EXCEPT !.raised = TRUE, !.aborted = TRUE, !.done = TRUE]
 
-TsqlRollbackAll(s) == [s EXCEPT !.open = {}, !.tc = 0, !.doomed = FALSE]
+NoSp == [x \in {} |-> {}]
+
+\* Restore the pending set to snapshot x.  Savepoints set after x are gone.
+Restore(s, x) ==
+    [s EXCEPT !.open = x,
+              !.sp = [n \in {m \in DOMAIN s.sp : s.sp[m] \subseteq x} |-> s.sp[n]]]
+
+\* End of the transaction: every savepoint is released.
+EndTxn(s) == [s EXCEPT !.sp = NoSp]
+
+TsqlRollbackAll(s) == EndTxn([s EXCEPT !.open = {}, !.tc = 0, !.doomed = FALSE])
 
 \* Replace frame t (a TRY, exception block or handler compound) by a frame
 \* that runs its handler body; execution then continues after the block.
+\* The handler belongs to the block: it keeps the block's ATOMIC flag and its
+\* entry snapshot, so an unhandled error in the handler of an ATOMIC
+\* compound rolls back the whole compound.
 Catch(s, t) ==
     [s EXCEPT !.stack = SubSeq(@, 1, t - 1)
-                        \o <<Frame(@[t].onerr, "catch", @[t], s.open, t)>>]
+                        \o <<Frame(@[t].onerr, "catch", @[t], @[t].snap, t)>>]
 
 Innermost(s, P(_)) ==
-    LET idx == {i \in 1..Len(s.stack) : P(s.stack[i])}
+    LET idx == {i \in 1..Len(s.stack) : P(i)}
     IN  IF idx = {} THEN 0 ELSE CHOOSE i \in idx : \A j \in idx : j <= i
 
 Outermost(s, P(_)) ==
-    LET idx == {i \in 1..Len(s.stack) : P(s.stack[i])}
+    LET idx == {i \in 1..Len(s.stack) : P(i)}
     IN  IF idx = {} THEN 0 ELSE CHOOSE i \in idx : \A j \in idx : i <= j
 
 \* A Db2 handler does not handle conditions raised in its own body: frames
@@ -109,7 +119,7 @@ Excluded(s, j) ==
 \* uncommittable.  THROW ends the batch even with XACT_ABORT OFF but leaves
 \* the transaction open.  RAISERROR never honours XACT_ABORT.
 TsqlFail(s, k) ==
-    LET t        == Innermost(s, LAMBDA f : f.kind = "try")
+    LET t        == Innermost(s, LAMBDA i : s.stack[i].kind = "try")
         abortish == k = "batch" \/ (Cs.xact_abort /\ k \in {"stmt", "throw"})
     IN  IF k = "uncatchable" THEN Abort(TsqlRollbackAll(s))
         ELSE IF t > 0
@@ -124,32 +134,30 @@ TsqlFail(s, k) ==
 \* aborted: the caller's transaction is doomed, a top-level CALL's
 \* transaction is rolled back (earlier COMMITs stay).
 PgFail(s, k) ==
-    LET e == Innermost(s, LAMBDA f : f.kind = "exc")
+    LET e == Innermost(s, LAMBDA i : s.stack[i].kind = "exc")
     IN  IF e > 0 /\ k # "uncatchable"
-        THEN [Catch(s, e) EXCEPT !.open = s.stack[e].snap]
-        ELSE Abort([s EXCEPT !.open = {}, !.doomed = Cs.caller_txn])
+        THEN Restore(Catch(s, e), s.stack[e].snap)
+        ELSE Abort(EndTxn([s EXCEPT !.open = {}, !.doomed = Cs.caller_txn]))
 
 \* Db2 for i.  The innermost eligible handler decides; an unhandled error
 \* exits the routine, rolling back the outermost enclosing ATOMIC compound
 \* but leaving other pending work for the caller.  Under *NONE nothing is
 \* undone (V4 is unverified: this is the documented inference).
 Db2Fail(s, k) ==
-    LET hs      == {i \in 1..Len(s.stack) :
-                        /\ s.stack[i].kind = "compound"
-                        /\ s.stack[i].handler \in {"continue", "exit", "undo"}
-                        /\ ~Excluded(s, i)}
-        h       == IF hs = {} THEN 0 ELSE CHOOSE i \in hs : \A j \in hs : j <= i
-        hOk     == h > 0
+    LET h       == Innermost(s, LAMBDA i :
+                                /\ s.stack[i].kind = "compound"
+                                /\ s.stack[i].handler \in {"continue", "exit", "undo"}
+                                /\ ~Excluded(s, i))
         canUndo == ~NoCommit
-        a       == Outermost(s, LAMBDA f : f.atomic)
-    IN  IF hOk
+        a       == Outermost(s, LAMBDA i : s.stack[i].atomic)
+    IN  IF h > 0
         THEN LET f == s.stack[h] IN
              CASE f.handler = "continue" ->
-                    [s EXCEPT !.stack = Append(@, Frame(f.onerr, "handler", f, s.open, h))]
+                    [s EXCEPT !.stack = Append(@, Frame(f.onerr, "handler", f, f.snap, h))]
                [] f.handler = "exit" -> Catch(s, h)
                [] f.handler = "undo" ->
-                    [Catch(s, h) EXCEPT !.open = IF canUndo THEN f.snap ELSE @]
-        ELSE Abort(IF a > 0 /\ canUndo THEN [s EXCEPT !.open = s.stack[a].snap] ELSE s)
+                    IF canUndo THEN Restore(Catch(s, h), f.snap) ELSE Catch(s, h)
+        ELSE Abort(IF a > 0 /\ canUndo THEN Restore(s, s.stack[a].snap) ELSE s)
 
 Fail(s, k) ==
     LET s1 == [s EXCEPT !.lastErr = TRUE, !.lastNF = FALSE]
@@ -180,13 +188,15 @@ InAtomic(s) == \E i \in 1..Len(s.stack) : s.stack[i].atomic
 
 Write(s, w) ==
     LET k == Fault(w.id)
+        \* IMPLICIT_TRANSACTIONS: any DML opens a transaction, also one that
+        \* matches no row or fails.
         s0 == IF D = "tsql" /\ Cs.implicit_transactions /\ s.tc = 0
               THEN [s EXCEPT !.tc = 1] ELSE s
     IN  IF D = "tsql" /\ s.doomed THEN Fail(s, "stmt")          \* error 3930
         ELSE IF k = "ok" THEN Ok(Put(s0, Tags(w)))
-        ELSE IF k = "notfound" THEN [Ok(s) EXCEPT !.lastNF = TRUE]
+        ELSE IF k = "notfound" THEN [Ok(s0) EXCEPT !.lastNF = TRUE]
         ELSE LET partial == w.rows > 1 /\ D = "db2i" /\ (NoCommit \/ w.notatomic)
-             IN  Fail(IF partial THEN Put(s, {w.id \o ".1"}) ELSE s, k)  \* V2
+             IN  Fail(IF partial THEN Put(s0, {w.id \o ".1"}) ELSE s0, k)  \* V2
 
 \* PostgreSQL: COMMIT/ROLLBACK only in a top-level CALL chain and not inside
 \* an exception block (V17).
@@ -196,13 +206,13 @@ Commit(s) ==
     CASE D = "tsql" ->
            IF s.doomed \/ s.tc = 0 THEN Fail(s, "stmt")          \* 3930 / 3902
            ELSE IF s.tc > 1 THEN Ok([s EXCEPT !.tc = @ - 1])
-           ELSE Ok([s EXCEPT !.durable = @ \cup s.open, !.open = {}, !.tc = 0])
+           ELSE Ok(EndTxn([s EXCEPT !.durable = @ \cup s.open, !.open = {}, !.tc = 0]))
       [] D = "postgres" ->
            IF ~PgTxnCtlAllowed(s) THEN Fail(s, "stmt")           \* 2D000
-           ELSE Ok([s EXCEPT !.durable = @ \cup s.open, !.open = {}])
+           ELSE Ok(EndTxn([s EXCEPT !.durable = @ \cup s.open, !.open = {}]))
       [] D = "db2i" ->
            IF InAtomic(s) THEN Assert(FALSE, "COMMIT inside ATOMIC")
-           ELSE Ok([s EXCEPT !.durable = @ \cup s.open, !.open = {}])
+           ELSE Ok(EndTxn([s EXCEPT !.durable = @ \cup s.open, !.open = {}]))
 
 Rollback(s) ==
     CASE D = "tsql" ->
@@ -210,10 +220,10 @@ Rollback(s) ==
            ELSE Ok(TsqlRollbackAll(s))
       [] D = "postgres" ->
            IF ~PgTxnCtlAllowed(s) THEN Fail(s, "stmt")
-           ELSE Ok([s EXCEPT !.open = {}, !.doomed = FALSE])
+           ELSE Ok(EndTxn([s EXCEPT !.open = {}, !.doomed = FALSE]))
       [] D = "db2i" ->
            IF InAtomic(s) THEN Assert(FALSE, "ROLLBACK inside ATOMIC")
-           ELSE Ok([s EXCEPT !.open = {}])
+           ELSE Ok(EndTxn([s EXCEPT !.open = {}]))
 
 SetSp(s, name) ==
     Ok([s EXCEPT !.sp = [x \in DOMAIN @ \cup {name} |-> IF x = name THEN s.open ELSE @[x]]])
@@ -231,7 +241,7 @@ RollbackTo(s, name) ==
     IF D = "postgres" THEN Assert(FALSE, "PL/pgSQL has no ROLLBACK TO")
     ELSE IF name \notin DOMAIN s.sp \/ (D = "tsql" /\ (s.tc = 0 \/ s.doomed)) \/ NoCommit
          THEN Fail(s, "stmt")
-         ELSE Ok([s EXCEPT !.open = s.sp[name]])
+         ELSE Ok(Restore(s, s.sp[name]))
 
 Exec(s, x) ==
     CASE x.op = "write"       -> Write(s, x)
@@ -242,7 +252,7 @@ Exec(s, x) ==
       [] x.op = "rollback_to" -> RollbackTo(s, x.id)
       [] x.op = "throw"       -> Fail(s, "throw")
       [] x.op = "raiserror"   -> Fail(s, "raiserror")
-      [] x.op = "notice"      -> Ok(s)
+      [] x.op = "notice"      -> s       \* RAISE NOTICE leaves FOUND alone
       [] x.op = "onerror" ->
            IF ~s.lastErr THEN s
            ELSE LET s1 == IF x.rollback THEN Rollback(s) ELSE s
@@ -263,7 +273,7 @@ Step(s) ==
 -----------------------------------------------------------------------------
 
 Plans(cs) ==
-    IF Explore THEN [cs.writes -> Kinds(cs.dialect) \cup {"ok"}] ELSE {cs.faults}
+    IF Explore THEN [cs.writes -> FaultKinds(cs.dialect) \cup {"ok"}] ELSE {cs.faults}
 
 Init ==
     /\ c \in CaseIds
@@ -278,7 +288,7 @@ Init ==
              raised  |-> FALSE,
              aborted |-> FALSE,
              code    |-> 0,
-             sp      |-> [x \in {} |-> {}],
+             sp      |-> NoSp,
              done    |-> FALSE]
 
 Next == ~st.done /\ st' = Step(st) /\ UNCHANGED <<c, plan>>
@@ -328,6 +338,9 @@ DoomedOnlyWhenExpected ==
 
 AbortRaises == st.aborted => st.raised
 
+\* A savepoint never holds work that is no longer pending.
+SavepointsPending == \A n \in DOMAIN st.sp : st.sp[n] \subseteq st.open
+
 Safety ==
     /\ NoCommitHasNoTxn
     /\ TsqlNoTxnNoPending
@@ -336,12 +349,10 @@ Safety ==
     /\ PgAbortLosesPending
     /\ DoomedOnlyWhenExpected
     /\ AbortRaises
+    /\ SavepointsPending
 
 \* Committed work is never undone.
 DurableMonotone == [][st.durable \subseteq st'.durable]_vars
-
-\* Under *NONE, every successful write is durable at once.
-NoCommitImmediate == [][NoCommit => st.durable \subseteq st'.durable]_vars
 
 \* Every routine terminates.
 Terminates == <>st.done

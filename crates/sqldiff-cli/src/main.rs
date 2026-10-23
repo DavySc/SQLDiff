@@ -130,10 +130,6 @@ fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Artifac
     tree::read(path, dialect, cfg).map_err(|e| e.0)
 }
 
-fn with_policy(r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
-    tree::with_policy(r, a, b, cfg)
-}
-
 fn exit_for(verdict: Verdict) -> ExitCode {
     match verdict {
         Verdict::Equal | Verdict::EqualUnderAssumptions => ExitCode::from(0),
@@ -143,13 +139,12 @@ fn exit_for(verdict: Verdict) -> ExitCode {
 
 /// Prints a report, redacted and leak-checked when the pipeline redacts.
 fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), String> {
-    let report = pipe.redact_reports(vec![report]).remove(0);
+    let report = pipe.redact_reports(vec![report])?.remove(0);
     let out = match format {
         Format::Text => render::text(&report, false),
         Format::Json => render::json(&report) + "\n",
         Format::Sarif => render::sarif(std::slice::from_ref(&report)) + "\n",
     };
-    pipe.verify(&out)?;
     print!("{out}");
     Ok(())
 }
@@ -329,19 +324,41 @@ fn tree(
         }
         pipe.add_paths(paths.iter().map(String::as_str));
     }
-    let reports = pipe.redact_reports(reports);
+    let complete =
+        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
+    let reports = pipe.redact_reports(reports)?;
+    // Everything printed outside the reports goes through the redactor too.
+    let mut extra = serde_json::json!({
+        "only_a": only_a,
+        "only_b": only_b,
+        "ambiguous": ambiguous,
+        "no_dialect": no_dialect,
+        "provenance": cfg.layers,
+    });
+    pipe.redact_json(&mut extra)?;
+    let strings = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    };
+    let only_a = strings(&extra["only_a"]);
+    let only_b = strings(&extra["only_b"]);
+    let no_dialect = strings(&extra["no_dialect"]);
+    let ambiguous: Vec<serde_json::Value> =
+        extra["ambiguous"].as_array().cloned().unwrap_or_default();
     let mut out = String::new();
     match format {
         Format::Json => {
-            let mut v = serde_json::json!({
+            let v = serde_json::json!({
                 "pairs": reports,
                 "only_a": only_a,
                 "only_b": only_b,
                 "ambiguous": ambiguous,
                 "no_dialect": no_dialect,
-                "provenance": cfg.layers,
+                "provenance": extra["provenance"],
             });
-            pipe.redact_json(&mut v);
             let _ = writeln!(out, "{}", serde_json::to_string_pretty(&v).unwrap());
         }
         Format::Sarif => {
@@ -392,10 +409,7 @@ fn tree(
             }
         }
     }
-    pipe.verify(&out)?;
     print!("{out}");
-    let complete =
-        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
     Ok(exit_for(if complete {
         worst
     } else {

@@ -6,6 +6,8 @@
 //! the targets in `fuzz/`). [`measure`] parses a text and counts statements
 //! and error nodes; the M2 gate is error nodes < 1% of statements.
 
+use std::collections::BTreeSet;
+
 use sqldiff_syntax::{parse, Dialect, SyntaxKind, SyntaxNode};
 
 /// A source of choices.
@@ -48,7 +50,7 @@ impl Source for Bytes<'_> {
 }
 
 /// Parse statistics of one text.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Stats {
     /// Statement units (simple and compound) in the tree.
     pub units: usize,
@@ -57,6 +59,9 @@ pub struct Stats {
     pub diagnostics: usize,
     /// The tree prints back to the input.
     pub round_trips: bool,
+    /// Node kinds present in the tree; lets tests check that generated
+    /// compounds were recognised as compounds, not just absorbed without errors.
+    pub kinds: BTreeSet<SyntaxKind>,
 }
 
 impl std::ops::AddAssign for Stats {
@@ -65,6 +70,7 @@ impl std::ops::AddAssign for Stats {
         self.errors += o.errors;
         self.diagnostics += o.diagnostics;
         self.round_trips &= o.round_trips;
+        self.kinds.extend(o.kinds);
     }
 }
 
@@ -80,18 +86,9 @@ pub fn measure(text: &str, dialect: Dialect) -> Stats {
     s
 }
 
-/// Node kinds present in the tree of `text`; lets tests check that generated
-/// compounds were recognised as compounds, not just absorbed without errors.
-pub fn kinds(text: &str, dialect: Dialect) -> std::collections::BTreeSet<SyntaxKind> {
-    parse(text, dialect)
-        .syntax()
-        .descendants()
-        .map(|n| n.kind())
-        .collect()
-}
-
 fn count(node: &SyntaxNode, s: &mut Stats) {
     let k = node.kind();
+    s.kinds.insert(k);
     if k == SyntaxKind::ERROR {
         s.errors += 1;
     }
@@ -110,6 +107,8 @@ pub fn program(src: &mut dyn Source, dialect: Dialect) -> String {
         d: dialect,
         out: String::new(),
         indent: 0,
+        labels: 0,
+        top: false,
     };
     let n = 1 + g.pick(3);
     for _ in 0..n {
@@ -130,6 +129,9 @@ struct Gen<'a> {
     d: Dialect,
     out: String,
     indent: usize,
+    labels: usize,
+    /// Outside a routine: no parameters or variables in scope.
+    top: bool,
 }
 
 impl Gen<'_> {
@@ -142,6 +144,18 @@ impl Gen<'_> {
     }
 
     fn line(&mut self, s: &str) {
+        // T-SQL: THROW must follow a terminated statement, and END of a block
+        // carries no terminator (`END; ELSE` would be invalid).
+        let s = &if self.d == Dialect::Tsql
+            && s.starts_with("THROW")
+            && matches!(
+                self.out.lines().last().map(str::trim),
+                Some("END" | "END TRY" | "END CATCH")
+            ) {
+            format!(";{s}")
+        } else {
+            s.to_string()
+        };
         for _ in 0..self.indent {
             self.out.push_str("  ");
         }
@@ -186,15 +200,17 @@ impl Gen<'_> {
                 0 => cols[self.pick(cols.len())].to_string(),
                 1 => self.pick(1000).to_string(),
                 2 => format!("'{}'", self.one(&["A", "N", "x y", "it''s"])),
-                3 => self.param(),
-                4 => self.var(),
+                3 if !self.top => self.param(),
+                4 if !self.top => self.var(),
+                3 | 4 => self.pick(100).to_string(),
                 _ => "NULL".to_string(),
             };
         }
         let d = depth - 1;
         match self.pick(9) {
             0 => {
-                let op = self.one(&["+", "-", "*", "=", "<>", "<=", ">"]);
+                // Comparisons are not values in T-SQL or SQL PL; they live in `cond`.
+                let op = self.one(&["+", "-", "*"]);
                 format!("{} {op} {}", self.expr(cols, d), self.expr(cols, d))
             }
             1 => format!("({})", self.expr(cols, d)),
@@ -351,9 +367,12 @@ impl Gen<'_> {
     fn top_level(&mut self) {
         match self.pick(4) {
             0 => {
+                self.top = true;
                 let s = self.dml();
+                self.top = false;
                 self.line(&format!("{s};"));
-                if self.d == Dialect::Tsql && self.pick(2) == 0 {
+                // CREATE PROCEDURE must start its batch.
+                if self.d == Dialect::Tsql {
                     self.line("GO");
                 }
             }
@@ -485,11 +504,13 @@ impl Gen<'_> {
             }
             (Dialect::Postgres, 0) => {
                 let c = self.cond(&["v_a", "p_qty"], 1);
-                self.line(&format!("IF {c} THEN"));
+                // PL/pgSQL ends the condition at the first THEN outside
+                // parentheses, so a CASE in it must be wrapped.
+                self.line(&format!("IF ({c}) THEN"));
                 self.nested(d);
                 if self.pick(2) == 0 {
                     let c = self.cond(&["v_a"], 0);
-                    self.line(&format!("ELSIF {c} THEN"));
+                    self.line(&format!("ELSIF ({c}) THEN"));
                     self.nested(d);
                 }
                 if self.pick(2) == 0 {
@@ -537,10 +558,12 @@ impl Gen<'_> {
                     self.nested(d);
                     self.line("END WHILE;");
                 } else {
-                    self.line("lbl: LOOP");
+                    self.labels += 1;
+                    let l = format!("lbl{}", self.labels);
+                    self.line(&format!("{l}: LOOP"));
                     self.nested(d);
-                    self.line("  LEAVE lbl;");
-                    self.line("END LOOP lbl;");
+                    self.line(&format!("  LEAVE {l};"));
+                    self.line(&format!("END LOOP {l};"));
                 }
             }
             (Dialect::Db2i, _) => {
@@ -566,10 +589,31 @@ impl Gen<'_> {
         self.indent -= 1;
     }
 
+    /// DML inside a routine body. PL/pgSQL and SQL PL have no bare SELECT:
+    /// PL/pgSQL discards rows with PERFORM, SQL PL needs SELECT ... INTO.
+    fn body_dml(&mut self) -> String {
+        if self.d == Dialect::Tsql || self.pick(4) != 0 {
+            let s = self.dml();
+            if !s.starts_with("SELECT ") {
+                return s;
+            }
+        }
+        match self.d {
+            Dialect::Tsql => self.select(),
+            Dialect::Postgres => format!("PERFORM {}", &self.select()["SELECT ".len()..]),
+            Dialect::Db2i => {
+                let (t, cols) = self.table();
+                let t = self.qualified(t);
+                let c = self.cond(cols, 2);
+                format!("SELECT COUNT(*) INTO v_a FROM {t} WHERE {c}")
+            }
+        }
+    }
+
     fn simple(&mut self) {
         let v = self.var();
         let s = match (self.d, self.pick(8)) {
-            (_, 0..=2) => self.dml(),
+            (_, 0..=2) => self.body_dml(),
             (Dialect::Tsql, 3) => format!("SET {v} = {}", self.expr(&["@p_qty"], 2)),
             (Dialect::Tsql, 4) => format!("SELECT {v} = qty FROM dbo.stock WHERE item_id = @p_item"),
             (Dialect::Tsql, 5) => self

@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sqldiff_syntax::Dialect;
 
+use crate::classify::StmtKind;
+
 use super::cfg::{Action, Cfg, Edge, NodeId, Op, RoutineKind, ScopeId, ScopeKind, Test, EXIT_OK};
 use super::profile::{Context, ErrorKind, Profile, Situation, Status, TxnEffect};
 
@@ -578,8 +580,22 @@ impl Interp<'_> {
         let s = node.stmt().expect("statement node");
         let d = self.cfg.dialect;
         st.last_error = None;
-        st.no_rows = None;
         st.trace.push(id);
+        // FOUND is set only by queries and DML; RAISE NOTICE and the like
+        // leave it alone.
+        if d != Dialect::Postgres || s.category.is_some() || s.kind == StmtKind::Select {
+            st.no_rows = None;
+        }
+        // IMPLICIT_TRANSACTIONS opens the transaction when DML starts, even if
+        // it then touches no rows or fails.
+        if d == Dialect::Tsql
+            && st.implicit
+            && st.depth == 0
+            && !st.no_commit
+            && s.effects.iter().any(|e| e.temp.is_none())
+        {
+            st.depth = 1;
+        }
 
         // Injected fault.
         if !st.faults_done.contains(&id) {
@@ -722,9 +738,6 @@ impl Interp<'_> {
         if st.no_commit {
             st.live.insert(key.to_string(), Live::Durable);
             return;
-        }
-        if st.depth == 0 && st.implicit && self.cfg.dialect == Dialect::Tsql {
-            st.depth = 1;
         }
         if st.depth > 0 {
             st.live.insert(key.to_string(), Live::Pending);

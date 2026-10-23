@@ -200,6 +200,7 @@ pub struct Store {
     path: Option<PathBuf>,
     key: Option<DataKey>,
     entries: BTreeMap<Key, Decision>,
+    warnings: Vec<String>,
 }
 
 impl Store {
@@ -219,6 +220,7 @@ impl Store {
             path: Some(data_dir.join(STORE_FILE)),
             key,
             entries: BTreeMap::new(),
+            warnings: Vec::new(),
         };
         s.reload()?;
         Ok(s)
@@ -234,6 +236,11 @@ impl Store {
         self.path.as_deref()
     }
 
+    /// Lines the last [`Store::reload`] skipped because they did not decode.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
     /// Re-reads the log, picking up writes from other processes.
     pub fn reload(&mut self) -> Result<()> {
         let Some(path) = &self.path else {
@@ -245,13 +252,28 @@ impl Store {
             Err(e) => return Err(Error::new(format!("{}: {e}", path.display()))),
         };
         let mut entries = BTreeMap::new();
+        let mut warnings = Vec::new();
+        let (mut good, mut first_bad) = (0usize, None);
         for (i, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             let at = |e: Error| e.context(format!("{}:{}", path.display(), i + 1));
-            let plain = crypto::decode(self.key.as_ref(), line).map_err(at)?;
-            let r: Record = serde_json::from_str(&plain).map_err(|e| at(e.into()))?;
+            let parsed = crypto::decode(self.key.as_ref(), line)
+                .and_then(|plain| serde_json::from_str::<Record>(&plain).map_err(Error::from))
+                .map_err(at);
+            let r = match parsed {
+                Ok(r) => r,
+                Err(e) => {
+                    // A torn line (a crash mid-append) or a corrupt one is
+                    // skipped; a store where nothing decodes is an error
+                    // (wrong or missing data key).
+                    warnings.push(format!("skipped: {e}"));
+                    first_bad.get_or_insert(e);
+                    continue;
+                }
+            };
+            good += 1;
             let k = Key {
                 fingerprint: r.fingerprint,
                 snapshot: r.snapshot,
@@ -265,7 +287,13 @@ impl Store {
                 }
             }
         }
+        if good == 0 {
+            if let Some(e) = first_bad {
+                return Err(e);
+            }
+        }
         self.entries = entries;
+        self.warnings = warnings;
         Ok(())
     }
 
@@ -371,11 +399,17 @@ impl Store {
     /// Rewrites the log with one record per live key, dropping decisions
     /// that expired before `now`.
     pub fn compact(&mut self, now: &str) -> Result<usize> {
-        let before = self.entries.len();
-        self.entries.retain(|_, d| !d.is_expired(now));
         let Some(path) = self.path.clone() else {
+            let before = self.entries.len();
+            self.entries.retain(|_, d| !d.is_expired(now));
             return Ok(before - self.entries.len());
         };
+        // Under the lock, re-read so records other processes appended since
+        // this store was opened are kept.
+        let _lock = Lock::take(&path)?;
+        self.reload()?;
+        let before = self.entries.len();
+        self.entries.retain(|_, d| !d.is_expired(now));
         let mut out = String::new();
         for (k, d) in &self.entries {
             let r = Record {
@@ -403,6 +437,7 @@ impl Store {
         }
         let mut line = crypto::encode(self.key.as_ref(), &serde_json::to_string(r)?);
         line.push('\n');
+        let _lock = Lock::take(path)?;
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -421,4 +456,70 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// The store as the review queue sees it at one moment: expired and
+/// outdated decisions count as unreviewed.
+pub struct Lookup<'a> {
+    pub store: &'a Store,
+    pub now: String,
+}
+
+impl sqldiff_source::queue::ReviewLookup for Lookup<'_> {
+    fn state(
+        &self,
+        fingerprint: &str,
+        snapshot: &str,
+    ) -> Option<sqldiff_source::queue::ReviewState> {
+        use sqldiff_source::queue::ReviewState as Q;
+        match self.store.status(fingerprint, snapshot, &self.now).state {
+            ReviewState::Accepted => Some(Q::Accepted),
+            ReviewState::Rejected => Some(Q::Rejected),
+            ReviewState::Commented => Some(Q::Commented),
+            ReviewState::Unreviewed | ReviewState::Expired | ReviewState::Outdated => None,
+        }
+    }
+}
+
+/// An advisory lock file next to the log, held by appends and compaction so
+/// a compaction never drops a concurrent append. A lock older than ten
+/// seconds is taken to be left over from a crash and is broken.
+struct Lock(PathBuf);
+
+impl Lock {
+    fn take(log: &Path) -> Result<Lock> {
+        let path = log.with_extension("lock");
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        for _ in 0..500 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Lock(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age.as_secs() > 10);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                Err(e) => return Err(Error::new(format!("{}: {e}", path.display()))),
+            }
+        }
+        Err(Error::new(format!("{}: store is locked", path.display())))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }

@@ -189,12 +189,26 @@ def check_oracle_specs(cases: dict):
             continue
         if path.stem != spec["case"]:
             err(rel, "file name must be the case id")
+        sides = case.get("sides", {})
+        expects = {(e.get("a"), e.get("b")) for e in case.get("expect", [])}
+        if not spec.get("pairs"):
+            err(rel, "no pairs")
         for pair in spec.get("pairs", []):
+            if len(pair) != 2:
+                err(rel, f"pair {pair!r} must name two sides")
+                continue
             for side in pair:
-                if side not in case.get("sides", {}):
+                if side not in sides:
                     err(rel, f"case has no side {side!r}")
+                elif sides[side].get("dialect") not in {"tsql", "pg"}:
+                    err(rel, f"side {side!r}: only tsql and pg run on the oracle")
+            if tuple(pair) not in expects:
+                err(rel, f"case has no [[expect]] for {pair[0]}~{pair[1]}")
         if not spec.get("scenario"):
             err(rel, "no [[scenario]]")
+        for sc in spec.get("scenario", []):
+            if "name" not in sc or "call" not in sc:
+                err(rel, "every [[scenario]] needs name and call")
 
 
 def engine_jobs(dialect: str, cases: dict):

@@ -34,7 +34,20 @@ pub fn text(report: &Report, show_assumption_details: bool) -> String {
             );
         }
     }
-    let _ = writeln!(out, "Verdict: {}", report.verdict.label().to_uppercase());
+    match report.verdict_before_suppression {
+        Some(before) if before != report.verdict => {
+            let _ = writeln!(
+                out,
+                "Verdict: {} ({} before {} suppressed)",
+                report.verdict.label().to_uppercase(),
+                before.label(),
+                report.suppressed.len()
+            );
+        }
+        _ => {
+            let _ = writeln!(out, "Verdict: {}", report.verdict.label().to_uppercase());
+        }
+    }
 
     let mut by_class: Vec<(&str, usize)> = Vec::new();
     for f in &report.findings {

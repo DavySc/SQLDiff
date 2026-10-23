@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqldiff_core::model::{hex, AssumptionSource};
-use sqldiff_core::{ChangeClass, Report, Severity, Verdict};
+use sqldiff_core::{Artifact, ChangeClass, Report, Severity, Verdict};
 
 use crate::protocol::{Describe, ObjectFilter, Pair, PairScope};
 use crate::{pairing, policy, Resolved, Result, Source};
@@ -49,6 +49,17 @@ pub fn pair_id(a: &str, b: Option<&str>) -> String {
 
 /// Pairs a source by pack rules (or the adapter's own pairs) and diffs each pair.
 pub fn run(src: &dyn Source, cfg: &Resolved, scope: &PairScope) -> Result<Run> {
+    run_with(src, cfg, scope, &mut |_, _, _| {})
+}
+
+/// [`run`], with `post` applied to each report after pack policy (author
+/// markers and review suppression live in `sqldiff_review`).
+pub fn run_with(
+    src: &dyn Source,
+    cfg: &Resolved,
+    scope: &PairScope,
+    post: &mut dyn FnMut(&mut Report, &Artifact, &Artifact),
+) -> Result<Run> {
     let objects = src.list_objects(&ObjectFilter::default())?;
     let mut p = pairing::pair(&objects, cfg, scope)?;
     // An adapter that pairs by itself wins over pack rules.
@@ -65,6 +76,7 @@ pub fn run(src: &dyn Source, cfg: &Resolved, scope: &PairScope) -> Result<Run> {
         let mut r = sqldiff_core::diff(&a, &b, &opts);
         policy::add_limits(&mut r, &a, Some(&b), cfg);
         policy::apply(&mut r, cfg);
+        post(&mut r, &a, &b);
         let (ia, ib) = (info(&x.a), info(&x.b));
         let stale = ia.is_some_and(|o| o.stale) || ib.is_some_and(|o| o.stale);
         policy::cap_stale(
@@ -130,6 +142,15 @@ pub fn apply(r: &mut Report, flips: &Flips) {
     sqldiff_core::ledger::relabel(r, flips);
 }
 
+/// The denied ids among the flips.
+pub fn denied(flips: &Flips) -> Vec<String> {
+    flips
+        .iter()
+        .filter(|(_, holds)| !**holds)
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
 /// Where an assumption's status comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -175,7 +196,7 @@ pub fn ledger(raw: &Report, flips: &Flips) -> Vec<LedgerEntry> {
             let mut other = flips.clone();
             // Flipping a denied one restores it; anything else is denied.
             other.insert(a.id.clone(), status == Status::Denied);
-            let verdict_if_flipped = view(raw, &other).verdict;
+            let verdict_if_flipped = view(raw, &other).open_verdict();
             LedgerEntry {
                 id: a.id.clone(),
                 text: a.text.clone(),
@@ -187,7 +208,7 @@ pub fn ledger(raw: &Report, flips: &Flips) -> Vec<LedgerEntry> {
                     .map(|f| f.fingerprint.clone())
                     .collect(),
                 verdict_if_flipped,
-                flips_verdict: verdict_if_flipped != current.verdict,
+                flips_verdict: verdict_if_flipped != current.open_verdict(),
             }
         })
         .collect();
@@ -204,26 +225,18 @@ pub enum ReviewState {
     Commented,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Decision {
-    pub state: ReviewState,
-    #[serde(default)]
-    pub comment: Option<String>,
-    #[serde(default)]
-    pub at: Option<String>,
-}
-
-/// Read access to the review store. The store itself is a separate package;
-/// until it lands, [`NoReviews`] reports every finding as unreviewed.
+/// Read access to the review store (implemented by `sqldiff_review`).
+/// [`NoReviews`] reports every finding as unreviewed.
 pub trait ReviewLookup {
-    /// `snapshot` identifies the content reviewed: see [`snapshot`].
-    fn decision(&self, fingerprint: &str, snapshot: &str) -> Option<Decision>;
+    /// The live decision on a finding, if any. `snapshot` identifies the
+    /// content reviewed: see [`snapshot`].
+    fn state(&self, fingerprint: &str, snapshot: &str) -> Option<ReviewState>;
 }
 
 pub struct NoReviews;
 
 impl ReviewLookup for NoReviews {
-    fn decision(&self, _: &str, _: &str) -> Option<Decision> {
+    fn state(&self, _: &str, _: &str) -> Option<ReviewState> {
         None
     }
 }
@@ -238,6 +251,8 @@ pub fn snapshot(r: &Report) -> String {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewCounts {
+    /// Accepted in the review store or marked as deliberate in source;
+    /// these findings are suppressed.
     pub accepted: usize,
     pub rejected: usize,
     pub commented: usize,
@@ -252,7 +267,11 @@ pub struct Entry {
     pub b: String,
     pub dialect_a: String,
     pub dialect_b: String,
+    /// The verdict over open (not suppressed) findings.
     pub verdict: Verdict,
+    /// Unreviewed findings, or a verdict short of equal with no finding to
+    /// decide on (an unknown reason, a parse problem, a denied assumption).
+    pub needs_review: bool,
     pub highest_class: Option<ChangeClass>,
     pub highest_severity: Option<Severity>,
     pub findings: usize,
@@ -268,9 +287,9 @@ pub struct Entry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewFilter {
-    /// Pairs with at least one finding nobody has decided on.
+    /// Pairs that need review: see [`Entry::needs_review`].
     Unreviewed,
-    /// Pairs whose findings are all decided.
+    /// Pairs whose findings are all decided and whose verdict rests on them.
     Reviewed,
 }
 
@@ -300,29 +319,36 @@ pub fn entries(
         .filter_map(|p| {
             let r = view(&p.report, flips);
             let snap = snapshot(&r);
-            let mut review = ReviewCounts::default();
+            let verdict = r.open_verdict();
+            let mut review = ReviewCounts {
+                accepted: r.suppressed.len(),
+                ..ReviewCounts::default()
+            };
             for f in &r.findings {
-                match reviews.decision(&f.fingerprint, &snap).map(|d| d.state) {
+                match reviews.state(&f.fingerprint, &snap) {
                     Some(ReviewState::Accepted) => review.accepted += 1,
                     Some(ReviewState::Rejected) => review.rejected += 1,
                     Some(ReviewState::Commented) => review.commented += 1,
                     None => review.unreviewed += 1,
                 }
             }
+            let needs_review = review.unreviewed > 0
+                || (r.findings.is_empty()
+                    && !matches!(verdict, Verdict::Equal | Verdict::EqualUnderAssumptions));
             let keep = (filter.classes.is_empty()
                 || r.findings.iter().any(|f| filter.classes.contains(&f.class)))
                 && filter
                     .min_severity
                     .map_or(true, |s| r.findings.iter().any(|f| f.severity >= s))
-                && (filter.verdicts.is_empty() || filter.verdicts.contains(&r.verdict))
+                && (filter.verdicts.is_empty() || filter.verdicts.contains(&verdict))
                 && filter
                     .folder
                     .as_deref()
                     .map_or(true, |d| p.pair.a.starts_with(d) || p.pair.b.starts_with(d))
                 && match filter.review {
                     None => true,
-                    Some(ReviewFilter::Unreviewed) => review.unreviewed > 0,
-                    Some(ReviewFilter::Reviewed) => review.unreviewed == 0,
+                    Some(ReviewFilter::Unreviewed) => needs_review,
+                    Some(ReviewFilter::Reviewed) => !needs_review,
                 };
             if !keep {
                 return None;
@@ -334,7 +360,8 @@ pub fn entries(
                 b: p.pair.b.clone(),
                 dialect_a: r.a.dialect.clone(),
                 dialect_b: r.b.as_ref().map(|b| b.dialect.clone()).unwrap_or_default(),
-                verdict: r.verdict,
+                verdict,
+                needs_review,
                 highest_class: r.highest_class(),
                 highest_severity: r.findings.iter().map(|f| f.severity).max(),
                 findings: r.findings.len(),
@@ -357,7 +384,7 @@ pub fn entries(
     out.sort_by(|x, y| {
         let key = |e: &Entry| {
             (
-                e.review.unreviewed > 0,
+                e.needs_review,
                 e.verdict,
                 e.highest_severity,
                 !e.verdict_flipping.is_empty(),
@@ -384,6 +411,18 @@ pub fn deep_link(base: &str, a: &str, b: Option<&str>, fingerprint: Option<&str>
         s.push_str(&format!("#f={}", encode(fp)));
     }
     s
+}
+
+/// Quotes a word for a POSIX shell when it needs it.
+pub fn shell_word(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@=,".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
 }
 
 /// Percent-encodes everything but unreserved characters and `/`.

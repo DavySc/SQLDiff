@@ -3,9 +3,7 @@
 //! `SQLDIFF_FUZZ_ITERS` raises the number of generated programs per dialect
 //! (default 400) for longer local or nightly runs.
 
-use std::collections::BTreeSet;
-
-use sqldiff_corpus::fuzz::{kinds, measure, program, Lcg, Stats};
+use sqldiff_corpus::fuzz::{measure, program, Lcg, Stats};
 use sqldiff_corpus::{corpus_root, load_cases};
 use sqldiff_syntax::{Dialect, SyntaxKind};
 
@@ -26,11 +24,9 @@ fn generated_programs_stay_under_error_budget() {
             ..Stats::default()
         };
         let mut worst: Option<(usize, String)> = None;
-        let mut seen = BTreeSet::new();
         for seed in 0..iters() {
             let text = program(&mut Lcg(seed ^ 0x5eed_f00d), d);
             let s = measure(&text, d);
-            seen.extend(kinds(&text, d));
             assert!(s.round_trips, "{d} seed {seed} lost bytes:\n{text}");
             if s.errors + s.diagnostics > 0 && worst.as_ref().map_or(true, |w| s.errors > w.0) {
                 worst = Some((s.errors, text.clone()));
@@ -50,7 +46,7 @@ fn generated_programs_stay_under_error_budget() {
         });
         for k in want {
             assert!(
-                seen.contains(&k),
+                total.kinds.contains(&k),
                 "{d}: generated compounds never parsed as {k:?}"
             );
         }

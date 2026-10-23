@@ -13,6 +13,10 @@ fn fixture(name: &str) -> String {
 fn session(messages: &[Value]) -> Vec<Value> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
         .arg("--isolated")
+        .env(
+            "SQLDIFF_DATA_DIR",
+            std::env::temp_dir().join(format!("sqldiff-mcp-data-{}", std::process::id())),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -221,7 +225,7 @@ fn queue_flip_comment_and_link() {
     let s = &r[0]["result"]["structuredContent"];
     let pairs = s["pairs"].as_array().unwrap();
     assert_eq!(pairs.len(), 3);
-    // Most severe first; the T-SQL ↔ PG pair hinges on the caller's environment.
+    // Most severe first; the T-SQL ↔ PG pair hinges on the caller's XACT_ABORT.
     assert_eq!(pairs[0]["highest_severity"], "critical");
     let pg = pairs
         .iter()
@@ -229,7 +233,7 @@ fn queue_flip_comment_and_link() {
         .unwrap();
     assert_eq!(
         pg["verdict_flipping"],
-        json!(["ASM-NO-CALLER-TXN", "ASM-TSQL-CALLER-XACT-ABORT-OFF"])
+        json!(["ASM-TSQL-CALLER-XACT-ABORT-OFF"])
     );
     assert_eq!(pg["review"]["unreviewed"], 3);
     assert_eq!(r[1]["result"]["isError"], true);
@@ -331,4 +335,60 @@ fn inline_text_has_no_gui_link() {
         call(2, "open_in_gui", json!({ "pair": pid })),
     ]);
     assert_eq!(r[1]["result"]["isError"], true);
+}
+
+#[test]
+fn inline_pairs_do_not_replace_each_other() {
+    let inline = |t: &str| json!({ "text": t, "dialect": "tsql" });
+    let r = session(&[
+        call(
+            1,
+            "diff",
+            json!({ "a": inline("select 1;"), "b": inline("select 2;\nTHROW 50000, 'x', 1") }),
+        ),
+        call(
+            2,
+            "diff",
+            json!({ "a": inline("select 3;"), "b": inline("select 4;\nTHROW 50000, 'y', 1") }),
+        ),
+    ]);
+    let (p1, p2) = (
+        &r[0]["result"]["structuredContent"]["pair_id"],
+        &r[1]["result"]["structuredContent"]["pair_id"],
+    );
+    assert_ne!(p1, p2);
+    let r = session(&[
+        call(
+            1,
+            "diff",
+            json!({ "a": inline("select 1;"), "b": inline("select 2;\nTHROW 50000, 'x', 1") }),
+        ),
+        call(
+            2,
+            "diff",
+            json!({ "a": inline("select 3;"), "b": inline("select 4;\nTHROW 50000, 'y', 1") }),
+        ),
+        call(3, "assumptions", json!({ "pair": p1 })),
+    ]);
+    assert_eq!(r[2]["result"]["isError"], false, "{}", text(&r[2]));
+}
+
+#[test]
+fn single_file_check_has_no_gui_pair() {
+    let r = session(&[call(
+        1,
+        "check",
+        json!({ "artifact": { "path": fixture("catch_rethrow.tsql.sql"), "dialect": "tsql" } }),
+    )]);
+    let pid = r[0]["result"]["structuredContent"]["pair_id"].clone();
+    let r = session(&[
+        call(
+            1,
+            "check",
+            json!({ "artifact": { "path": fixture("catch_rethrow.tsql.sql"), "dialect": "tsql" } }),
+        ),
+        call(2, "open_in_gui", json!({ "pair": pid })),
+    ]);
+    assert_eq!(r[1]["result"]["isError"], true);
+    assert!(text(&r[1]).contains("single-file"));
 }

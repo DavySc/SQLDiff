@@ -92,6 +92,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p sqldiff-cli
+      - name: Empty user config and data directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/home/.config" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$RUNNER_TEMP/home/.local/share" >> "$GITHUB_ENV"
       - name: Run the oracle
         run: >-
           python3 corpus/tools/fault_oracle.py

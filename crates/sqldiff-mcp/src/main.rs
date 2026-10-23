@@ -58,7 +58,13 @@ fn main() -> ExitCode {
     let gui_url = cli
         .gui_url
         .or_else(|| std::env::var("SQLDIFF_GUI_URL").ok());
-    let mut server = sqldiff_mcp::Server::with_config(cfg, gui_url);
+    let mut server = match sqldiff_mcp::Server::with_config(cfg, gui_url) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sqldiff-mcp: review store: {e}");
+            return ExitCode::from(2);
+        }
+    };
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {

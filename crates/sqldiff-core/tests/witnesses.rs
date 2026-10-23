@@ -68,7 +68,9 @@ fn worked_example_tsql_db2i() {
         .expect("witness 1");
     assert_eq!(f.verdict, Verdict::Different);
     assert_eq!(f.class, ChangeClass::Transactional);
-    assert!(f
+    // With XACT_ABORT ON T-SQL still undoes the UPDATE, so the finding does
+    // not rest on that default.
+    assert!(!f
         .assumptions
         .contains(&"ASM-TSQL-CALLER-XACT-ABORT-OFF".to_string()));
     assert!(f.assumptions.contains(&"ASM-NO-TRIGGERS".to_string()));

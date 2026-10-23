@@ -21,8 +21,8 @@ Then it checks the outcome against the corpus:
 
   - expected "equal" or "equal-under-assumptions" and the oracle shows a
     divergence: the corpus expectation is wrong (soundness failure);
-    (`known_divergence = "..."` in the spec records an open question and turns
-    this into a warning until the case is fixed);
+    (`known_divergence."<a>~<b>" = "..."` in the spec records an open question
+    for that pair and turns this into a warning until the case is fixed);
   - expected "different" and no divergence: the witness was not reproduced,
     unless the spec says why it cannot be (`reproducible = false`);
   - with --sqldiff, the engine said "equal" where the oracle diverges.
@@ -103,8 +103,8 @@ class Postgres:
         sql = ""
         if key is None:
             key = "sqldiff_rowid"
-            sql += (f"ALTER TABLE {table} ADD COLUMN {key} integer "
-                    f"GENERATED ALWAYS AS IDENTITY UNIQUE;\n")
+            # A sequence, not an identity: the table may already have one.
+            sql += f"ALTER TABLE {table} ADD COLUMN {key} bigserial UNIQUE;\n"
         return sql + (f"CREATE TABLE sqldiff_fault_ref AS SELECT {key} FROM {table};\n"
                       f"ALTER TABLE sqldiff_fault_ref ADD FOREIGN KEY ({key}) "
                       f"REFERENCES {table} ({key});\n")
@@ -125,14 +125,12 @@ class SqlServer:
 
     @staticmethod
     def _errors(stderr: str) -> list[str]:
+        # Only server errors (Msg header, severity above 10). With -r1, PRINT
+        # and informational messages also arrive on stderr and are not errors.
         msgs = []
         for m in re.finditer(r"^Msg (\d+), Level (\d+).*\n(.*)$", stderr, re.M):
             if int(m.group(2)) > 10:
                 msgs.append(f"Msg {m.group(1)}: {m.group(3).strip()}")
-        if not msgs and stderr.strip():
-            # Connection or tool errors carry no Msg header.
-            if re.search(r"Sqlcmd: Error|Login failed|error", stderr, re.I):
-                msgs.append(stderr.strip().splitlines()[-1])
         return msgs
 
     def reset(self):
@@ -153,6 +151,9 @@ class SqlServer:
     def call(self, sql: str):
         p = self._sqlcmd(RUN_DB, f"SET NOCOUNT ON;\n{sql}\nGO\n")
         errs = self._errors(p.stderr)
+        if p.returncode != 0 and not errs:
+            # Without -b, sqlcmd fails only for connection or tool errors.
+            raise SetupError(f"sqlcmd failed: {p.stderr.strip()}")
         return bool(errs), p.stdout, errs
 
     @staticmethod
@@ -162,8 +163,8 @@ class SqlServer:
     def query(self, sql: str) -> str:
         p = self._sqlcmd(RUN_DB, f"SET NOCOUNT ON;\n{sql}\nGO\n")
         errs = self._errors(p.stderr)
-        if errs:
-            raise SetupError(" | ".join(errs))
+        if errs or p.returncode != 0:
+            raise SetupError(" | ".join(errs) or p.stderr.strip())
         return p.stdout
 
     def write_fault(self, table: str) -> str:
@@ -174,7 +175,11 @@ class SqlServer:
         sql = ""
         if key is None:
             key = "sqldiff_rowid"
-            sql += (f"ALTER TABLE dbo.{table} ADD {key} int IDENTITY(1,1) NOT NULL "
+            # A sequence default, not IDENTITY: a table has at most one
+            # identity column (Msg 2744). Existing rows get distinct values.
+            sql += (f"CREATE SEQUENCE dbo.sqldiff_rowid_seq AS bigint START WITH 1;\n"
+                    f"ALTER TABLE dbo.{table} ADD {key} bigint NOT NULL "
+                    f"CONSTRAINT sqldiff_rowid_df DEFAULT (NEXT VALUE FOR dbo.sqldiff_rowid_seq) "
                     f"CONSTRAINT sqldiff_rowid_uq UNIQUE;\nGO\n")
         return sql + (f"SELECT {key} INTO dbo.sqldiff_fault_ref FROM dbo.{table};\n"
                       f"ALTER TABLE dbo.sqldiff_fault_ref ADD FOREIGN KEY ({key}) "
@@ -311,7 +316,8 @@ def compare(ra: dict, rb: dict, same_dialect: bool) -> list[str]:
 
 
 def engine_verdict(sqldiff: str, case_dir: Path, sa: dict, sb: dict) -> str:
-    cmd = [sqldiff, "diff", "--format", "json",
+    # --isolated: user and project config and packs must not change the verdict.
+    cmd = [sqldiff, "diff", "--isolated", "--format", "json",
            "--dialect-a", sa["dialect"], "--dialect-b", sb["dialect"],
            str(case_dir / sa["file"]), str(case_dir / sb["file"])]
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -376,15 +382,18 @@ def main():
                   f"({len(divergences)}/{len(runs)} runs differ)")
             for d in divergences:
                 print(f"    {d}")
-            known = spec.get("known_divergence")
-            if divergences and expected in ("equal", "equal-under-assumptions"):
-                if known:
+            known = spec.get("known_divergence", {}).get(f"{a}~{b}")
+            if expected in ("equal", "equal-under-assumptions"):
+                if divergences and known:
                     warnings.append(f"{pair_id}: known divergence from the corpus: {known}")
-                else:
+                elif divergences:
                     failures.append(f"{pair_id}: corpus says {expected} but the oracle diverges")
+                elif known:
+                    failures.append(f"{pair_id}: known_divergence is set but the oracle no "
+                                    f"longer contradicts the corpus; remove it from the spec")
             elif known:
-                failures.append(f"{pair_id}: known_divergence is set but the oracle no longer "
-                                f"contradicts the corpus; remove it from the spec")
+                failures.append(f"{pair_id}: known_divergence only applies to pairs the "
+                                f"corpus expects to be equal")
             if not divergences and expected == "different":
                 if spec.get("reproducible", True):
                     failures.append(f"{pair_id}: corpus says different but no run diverged")

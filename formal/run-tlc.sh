@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Check the error/transaction model: regenerate-check the cases, then run TLC
 # on both configurations.  TLA2TOOLS points at tla2tools.jar; if unset, the
-# pinned release is downloaded into formal/.tools/.
+# pinned release is downloaded into formal/.tools/.  Either way the jar must
+# match the pinned checksum.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-TLA_VERSION=1.8.0
-TLA_SHA256=d4a12081bb7acd49d6d6158e818d8d69f8eb3f9a1f140cb39d20d50c4ce77f44
+# 1.7.4 is the latest stable release; 1.8.0 is a pre-release whose asset is
+# replaced over time.
+TLA_VERSION=1.7.4
+TLA_SHA256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88
 
 python3 gen_cases.py --check
 
@@ -17,9 +20,12 @@ if [[ -z "$jar" ]]; then
     mkdir -p .tools
     curl -fsSL -o "$jar.tmp" \
       "https://github.com/tlaplus/tlaplus/releases/download/v$TLA_VERSION/tla2tools.jar"
-    echo "$TLA_SHA256  $jar.tmp" | sha256sum -c - >/dev/null
     mv "$jar.tmp" "$jar"
   fi
+fi
+if ! echo "$TLA_SHA256  $jar" | sha256sum -c - >/dev/null 2>&1; then
+  echo "run-tlc: $jar does not match the pinned tla2tools $TLA_VERSION checksum" >&2
+  exit 1
 fi
 
 meta=$(mktemp -d)

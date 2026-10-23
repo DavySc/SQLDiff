@@ -191,8 +191,10 @@ pub fn relabel(r: &mut Report, flips: &Flips) {
         }
     }
     for id in denied {
-        r.unknown_reasons
-            .push(format!("assumption {id} is denied in this session"));
+        let reason = format!("assumption {id} is denied in this session");
+        if !r.unknown_reasons.contains(&reason) {
+            r.unknown_reasons.push(reason);
+        }
     }
     r.verdict = derive_verdict(r);
 }

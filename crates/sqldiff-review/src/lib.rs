@@ -24,7 +24,7 @@ pub mod time;
 pub use cache::Cache;
 pub use crypto::DataKey;
 pub use redact::Redactor;
-pub use store::{snapshot, Decision, Key, ReviewState, State, Status, Store, ANY_SNAPSHOT};
+pub use store::{snapshot, Decision, Key, Lookup, ReviewState, State, Status, Store, ANY_SNAPSHOT};
 pub use suppress::{gate_verdict, suppress};
 
 use sqldiff_source::{Resolved, Result};

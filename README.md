@@ -31,7 +31,7 @@ $B diff tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.pg.sql
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif
 
 # Review: accept a deliberate difference by fingerprint; later runs suppress it
-$B review accept 06ccfd05e423182d --pair a.sql b.sql -c "callers map codes"
+$B review accept aacde30caae50448 --pair a.sql b.sql -c "callers map codes"
 $B diff a.sql b.sql --redact -f sarif         # shareable: names replaced by stable placeholders
 
 # Sources, packs and snapshots (design section 5)
@@ -41,7 +41,7 @@ $B snapshot git:.@v1.2//db -o v1.2.json --history     # canonical, content-hashe
 $B pairs v1.2.json --diff                             # offline, from the bundle
 $B config                                             # merged config and its layers
 
-# Pair view in the browser (statement-aligned, findings panel, live scratchpad)
+# Pair view in the browser (statement-aligned, findings panel, live in-pane editing)
 target/release/sqldiff-gui serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
 target/release/sqldiff-gui export --report report.json -o pair.html   # static, read-only
 
@@ -105,7 +105,7 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 | `comment_text` | `finding_ids`, `excerpt_lines` (1), `fingerprints` (true) | A plain-text review comment from the phrase grammar: same findings, same text |
 | `open_in_gui` | `finding_id` or `pair`, `gui_url` | `{gui}/?a=<path>&b=<path>#f=<fingerprint>` and the `sqldiff-gui serve` command for the pair |
 
-The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store once it lands; until then every finding counts as unreviewed.
+The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store: accepted findings (and in-source deliberate-difference markers) are suppressed and counted, and a pair still needs review while it has an undecided finding or a verdict short of equal.
 
 Each result carries a readable text block and the same data as `structuredContent` JSON.
 

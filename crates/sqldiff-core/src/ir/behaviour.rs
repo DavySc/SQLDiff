@@ -855,22 +855,44 @@ impl<'x, 'a> Collector<'x, 'a> {
         }
     }
 
+    fn outcomes(
+        &self,
+        sc: &Kind,
+        scen_a: &Scenario,
+        scen_b: &Scenario,
+    ) -> (Vec<Outcome>, Vec<Outcome>) {
+        let mut pa = explore(&self.sa.cfg, scen_a);
+        let mut pb = explore(&self.sb.cfg, scen_b);
+        if let Kind::Fault { key, .. } = sc {
+            // Only paths that reach the failing statement belong to the scenario.
+            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key);
+            pa.retain(reached);
+            pb.retain(reached);
+        }
+        (pa, pb)
+    }
+
+    /// Whether a divergence still shows with a default setting flipped; if
+    /// so, the finding does not rest on the assumption behind that default.
+    fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
+        let (pa, pb) = self.outcomes(sc, scen_a, scen_b);
+        let (ps, _) = pairs(&pa, &pb);
+        ps.iter().any(|(oa, ob)| {
+            diff(&self.sa, &self.sb, &self.splits, sc, oa, ob)
+                .iter()
+                .any(|x| x.rule == d.rule && x.anchor == d.anchor)
+        })
+    }
+
     fn run(
         &mut self,
         sc: Kind,
         scen_a: Scenario,
         scen_b: Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
-        let mut pa = explore(&self.sa.cfg, &scen_a);
-        let mut pb = explore(&self.sb.cfg, &scen_b);
-        if let Kind::Fault { key, .. } = &sc {
-            // Only paths that reach the failing statement belong to the scenario.
-            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key);
-            pa.retain(reached);
-            pb.retain(reached);
-            if pa.is_empty() || pb.is_empty() {
-                return (pa, pb);
-            }
+        let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
+        if pa.is_empty() || pb.is_empty() {
+            return (pa, pb);
         }
         let (ps, exact) = pairs(&pa, &pb);
         let combos = ps.len();
@@ -888,12 +910,27 @@ impl<'x, 'a> Collector<'x, 'a> {
             }
         }
         for (d, oa, ob, hits) in found {
-            self.emit(&sc, d, oa, ob, exact || hits == combos);
+            self.emit(
+                &sc,
+                d,
+                oa,
+                ob,
+                exact || hits == combos,
+                Some((&scen_a, &scen_b)),
+            );
         }
         (pa, pb)
     }
 
-    fn emit(&mut self, sc: &Kind, d: Div, oa: &Outcome, ob: &Outcome, all_agree: bool) {
+    fn emit(
+        &mut self,
+        sc: &Kind,
+        d: Div,
+        oa: &Outcome,
+        ob: &Outcome,
+        all_agree: bool,
+        scens: Option<(&Scenario, &Scenario)>,
+    ) {
         let key = (d.rule.to_string(), d.anchor.clone());
         // The error contract and the caller's continuation are properties of
         // the routine as a whole: the first failing statement shows them.
@@ -933,6 +970,23 @@ impl<'x, 'a> Collector<'x, 'a> {
         if matches!(sc, Kind::CallerTxn) {
             ids.insert(0, "ASM-NO-CALLER-TXN".to_string());
             ids.dedup();
+        } else if let Some((scen_a, scen_b)) = scens {
+            for id in RERUN_ASSUMPTIONS {
+                if !ids.iter().any(|x| x == id) {
+                    continue;
+                }
+                let (mut fa, mut fb) = (scen_a.clone(), scen_b.clone());
+                for s in [&mut fa, &mut fb] {
+                    if id == "ASM-NO-CALLER-TXN" {
+                        s.caller_txn = true;
+                    } else {
+                        s.xact_abort = true;
+                    }
+                }
+                if self.persists(sc, &fa, &fb, &d) {
+                    ids.retain(|x| x != id);
+                }
+            }
         }
         let mut text = format!(
             "{}, {}.",
@@ -992,13 +1046,21 @@ impl<'x, 'a> Collector<'x, 'a> {
                 .map(|n| ast::first_words(n, 3).join(" "))
                 .unwrap_or_default()
         };
-        let fp = fingerprint(&FingerprintInput {
-            object: &self.sa.a.object,
-            class: d.class,
-            rule: d.rule,
-            anchor_a: &format!("{}|{}", d.anchor, anchor_text(&la)),
-            anchor_b: &format!("{}|{}", anchor_b, anchor_text(&lb)),
-        });
+        // Same anchors as the syntactic checks had, so stored review
+        // decisions keep matching; the effect key only splits a collision.
+        let print = |ka: &str, kb: &str| {
+            fingerprint(&FingerprintInput {
+                object: &self.sa.a.object,
+                class: d.class,
+                rule: d.rule,
+                anchor_a: &format!("{ka}{}", anchor_text(&la)),
+                anchor_b: &format!("{kb}{}", anchor_text(&lb)),
+            })
+        };
+        let mut fp = print("", "");
+        if self.out.findings.iter().any(|f| f.fingerprint == fp) {
+            fp = print(&format!("{}|", d.anchor), &format!("{anchor_b}|"));
+        }
         self.out.witnesses.push(Witness {
             fingerprint: fp.clone(),
             rule: d.rule.to_string(),
@@ -1092,7 +1154,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             }
             d.assumptions = vec!["ASM-CONCURRENT-WRITERS".into(), "ASM-READ-COMMITTED".into()];
             let o = Outcome::empty();
-            self.emit(&Kind::Baseline, d, &o, &o, true);
+            self.emit(&Kind::Baseline, d, &o, &o, true, None);
         }
     }
 }
