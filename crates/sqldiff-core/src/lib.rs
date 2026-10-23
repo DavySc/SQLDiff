@@ -13,6 +13,7 @@ mod engine;
 pub mod equiv;
 pub mod facts;
 pub mod ir;
+pub mod ledger;
 pub mod lint;
 pub mod model;
 pub mod normalize;
@@ -24,6 +25,6 @@ pub mod tokens;
 pub mod treediff;
 
 pub use artifact::Artifact;
-pub use engine::{check, diff, Options, TOOL_VERSION};
+pub use engine::{check, diff, overlay, what_if, Options, TOOL_VERSION};
 pub use model::{ChangeClass, Finding, Report, Severity, Verdict};
 pub use sqldiff_syntax::Dialect;

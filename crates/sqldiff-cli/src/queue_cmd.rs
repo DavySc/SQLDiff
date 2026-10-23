@@ -9,10 +9,14 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use serde::de::DeserializeOwned;
-use sqldiff_core::{phrase, ChangeClass, Dialect, Report, Severity, Verdict};
+use sqldiff_core::ir::witness::{SideOutcome, WhatIf};
+use sqldiff_core::ir::ErrorKind;
+use sqldiff_core::ledger::Status as LedgerStatus;
+use sqldiff_core::model::Side;
+use sqldiff_core::{phrase, Artifact, ChangeClass, Dialect, Options, Report, Severity, Verdict};
 use sqldiff_review::{markers, Lookup, Store};
 use sqldiff_source::protocol::PairScope;
-use sqldiff_source::queue::{self, Filter, Flips, ReviewFilter, Status};
+use sqldiff_source::queue::{self, Filter, Flips, ReviewFilter};
 use sqldiff_source::{Resolved, SourceSpec};
 
 use crate::review_cmd::{Pipeline, ReviewArgs};
@@ -36,7 +40,7 @@ pub struct FlipArgs {
 }
 
 impl FlipArgs {
-    fn flips(&self) -> Flips {
+    pub fn flips(&self) -> Flips {
         let mut f = Flips::new();
         for id in &self.confirm {
             f.insert(id.clone(), true);
@@ -67,11 +71,34 @@ impl PairArgs {
     /// Diffs the pair as `diff` does (pack policy, author markers, review
     /// suppression); returns the report before flips and the config.
     fn report(&self) -> Result<(Report, Resolved), String> {
+        self.report_with(&Flips::new())
+    }
+
+    /// Diffs the pair with scenario flips applied (they re-run the
+    /// behavioural analysis); other flips are left to `queue::view`.
+    fn report_with(&self, flips: &Flips) -> Result<(Report, Resolved), String> {
+        let (pipe, a, b) = self.pipeline()?;
+        let opts = Options {
+            flips: flips.clone(),
+            ..pipe.options()
+        };
+        let r = pipe.run_scenario(&a, Some(&b), &opts);
+        Ok((r, pipe.cfg))
+    }
+
+    /// The review pipeline `diff` uses, and both sides.
+    fn pipeline(&self) -> Result<(Pipeline, Artifact, Artifact), String> {
         let pipe = Pipeline::new(self.cfg.resolve()?, &ReviewArgs::default())?;
         let a = read(&self.a, self.dialect_a.or(self.dialect), &pipe.cfg)?;
         let b = read(&self.b, self.dialect_b.or(self.dialect), &pipe.cfg)?;
-        let r = pipe.run(&a, Some(&b), &pipe.options());
-        Ok((r, pipe.cfg))
+        Ok((pipe, a, b))
+    }
+
+    fn load(&self) -> Result<(Artifact, Artifact, Resolved), String> {
+        let cfg = self.cfg.resolve()?;
+        let a = read(&self.a, self.dialect_a.or(self.dialect), &cfg)?;
+        let b = read(&self.b, self.dialect_b.or(self.dialect), &cfg)?;
+        Ok((a, b, cfg))
     }
 }
 
@@ -137,6 +164,34 @@ pub enum QueueCommand {
         no_fingerprints: bool,
         #[command(flatten)]
         flips: FlipArgs,
+    },
+    /// "What if this statement fails?": both sides' control target, rollback
+    /// scope, durable effects and transaction state when the statement on
+    /// (or before) LINE fails with an error kind, and the divergences.
+    WhatIf {
+        #[command(flatten)]
+        pair: PairArgs,
+        /// Line of the statement (on side A unless --side b).
+        #[arg(long)]
+        line: usize,
+        #[arg(long, default_value = "a", value_parser = ["a", "b"])]
+        side: String,
+        /// constraint, conversion, arithmetic, cardinality, not-found, lock,
+        /// user-signal, name-resolution, cancel or other.
+        #[arg(long = "error", default_value = "constraint", value_parser = snake::<ErrorKind>)]
+        error: ErrorKind,
+        #[command(flatten)]
+        flips: FlipArgs,
+        #[arg(short, long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+    /// Transaction overlay: transactions, savepoints, atomic and exception
+    /// regions and handlers on both sides, each paired with its partner.
+    Overlay {
+        #[command(flatten)]
+        pair: PairArgs,
+        #[arg(short, long, value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
     /// Print a GUI deep link for a pair (and finding), and the command that serves it.
     Open {
@@ -270,10 +325,19 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
             flips,
             format,
         } => {
-            let (raw, _) = pair.report()?;
+            // The same pipeline as `diff` (pack policy, markers, review
+            // suppression), so the verdicts agree.
+            let (pipe, a, b) = pair.pipeline()?;
             let flips = flips.flips();
-            let view = queue::view(&raw, &flips);
-            let ledger = queue::ledger(&raw, &flips);
+            let base = pipe.options();
+            let (view, ledger) =
+                sqldiff_core::ledger::ledger_by(&flips, &base.declared, &mut |f| {
+                    let opts = Options {
+                        flips: f.clone(),
+                        ..base.clone()
+                    };
+                    pipe.run_scenario(&a, Some(&b), &opts)
+                });
             match format {
                 Format::Text => {
                     println!("Verdict: {}", view.verdict.label().to_uppercase());
@@ -282,18 +346,33 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                     }
                     for e in &ledger {
                         let status = match e.status {
-                            Status::Open => "open",
-                            Status::Declared => "declared",
-                            Status::Proven => "proven",
-                            Status::Confirmed => "confirmed",
-                            Status::Denied => "denied",
+                            LedgerStatus::Open => "open",
+                            LedgerStatus::Declared => "declared",
+                            LedgerStatus::Confirmed => "confirmed",
+                            LedgerStatus::Denied => "denied",
+                            LedgerStatus::Discharged
+                                if e.source == sqldiff_core::ledger::Source::Composition =>
+                            {
+                                "proven from composed output"
+                            }
+                            LedgerStatus::Discharged => "proven from source",
                         };
                         println!("\n{}  [{status}]\n    {}", e.id, e.text);
+                        if let Some(c) = &e.cite {
+                            println!("    {c}");
+                        }
                         if e.flips_verdict {
-                            println!(
-                                "    flipping it makes the verdict {}",
-                                e.verdict_if_flipped.label()
-                            );
+                            if let Some(v) = e.verdict_if_flipped {
+                                println!(
+                                    "    flipping it {} and makes the verdict {}",
+                                    if e.reruns {
+                                        "re-runs the analysis"
+                                    } else {
+                                        "relabels its findings"
+                                    },
+                                    v.label()
+                                );
+                            }
                         }
                         if !e.findings.is_empty() {
                             println!("    relied on by {}", e.findings.join(", "));
@@ -319,8 +398,8 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
             no_fingerprints,
             flips,
         } => {
-            let (raw, cfg) = pair.report()?;
             let flips = flips.flips();
+            let (raw, cfg) = pair.report_with(&flips)?;
             let view = queue::view(&raw, &flips);
             let unknown: Vec<&String> = findings
                 .iter()
@@ -359,6 +438,54 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        QueueCommand::WhatIf {
+            pair,
+            line,
+            side,
+            error,
+            flips,
+            format,
+        } => {
+            let (a, b, cfg) = pair.load()?;
+            let opts = Options {
+                flips: flips.flips(),
+                ..cfg.options()
+            };
+            let side = if side == "b" { Side::B } else { Side::A };
+            let w = sqldiff_core::what_if(&a, &b, &opts, side, line, error);
+            match format {
+                Format::Text => print!("{}", what_if_text(&w)),
+                _ => println!("{}", serde_json::to_string_pretty(&w).unwrap()),
+            }
+            let differs = w.findings.iter().any(|f| f.verdict == Verdict::Different);
+            Ok(ExitCode::from(u8::from(differs)))
+        }
+        QueueCommand::Overlay { pair, format } => {
+            let (a, b, _) = pair.load()?;
+            let o = sqldiff_core::overlay(&a, &b);
+            match format {
+                Format::Text => {
+                    for (name, side, other) in [("A", &o.a, "B"), ("B", &o.b, "A")] {
+                        println!("Side {name}:");
+                        if side.is_empty() {
+                            println!("  (no brackets)");
+                        }
+                        for (i, br) in side.iter().enumerate() {
+                            let partner = br
+                                .partner
+                                .map(|p| format!("  ↔ {other}#{p}"))
+                                .unwrap_or_default();
+                            println!(
+                                "  #{i} lines {}-{}  {}{partner}",
+                                br.start_line, br.end_line, br.label
+                            );
+                        }
+                    }
+                }
+                _ => println!("{}", serde_json::to_string_pretty(&o).unwrap()),
+            }
+            Ok(ExitCode::from(0))
+        }
         QueueCommand::Open {
             pair,
             finding,
@@ -388,4 +515,62 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Plain-text form of a `what_if` answer.
+fn what_if_text(w: &WhatIf) -> String {
+    let mut out = format!("{}\n", w.scenario.text);
+    let outcome = |name: &str, v: &[SideOutcome], out: &mut String| {
+        if v.is_empty() {
+            out.push_str(&format!("\n{name}: no path reaches the statement\n"));
+        }
+        for (i, o) in v.iter().enumerate() {
+            let path = if v.len() > 1 {
+                format!(" (path {})", i + 1)
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("\n{name}{path}:\n"));
+            out.push_str(&format!("  control      {}\n", o.control));
+            out.push_str(&format!("  ends         {}\n", o.exit));
+            out.push_str(&format!("  rolls back   {}\n", o.rollback));
+            out.push_str(&format!("  transaction  {}\n", o.transaction));
+            for (label, xs) in [
+                ("durable", &o.durable),
+                ("undone", &o.undone),
+                ("kept partly", &o.partial),
+                ("to caller", &o.left_to_caller),
+            ] {
+                if !xs.is_empty() {
+                    out.push_str(&format!("  {label:<12} {}\n", xs.join("; ")));
+                }
+            }
+            let lines: Vec<String> = o.path.iter().map(|l| l.to_string()).collect();
+            out.push_str(&format!("  path         lines {}\n", lines.join(", ")));
+            for n in &o.not_proven {
+                out.push_str(&format!("  not proven   {n}\n"));
+            }
+        }
+    };
+    outcome("Side A", &w.a, &mut out);
+    outcome("Side B", &w.b, &mut out);
+    if w.findings.is_empty() {
+        out.push_str("\nNo divergence under this scenario.\n");
+    } else {
+        out.push_str("\nDivergences:\n");
+        for f in &w.findings {
+            out.push_str(&format!(
+                "  [{}] {} · {} · {}\n    {}\n",
+                f.fingerprint,
+                f.class.label(),
+                f.verdict.label(),
+                f.rule,
+                f.witness
+            ));
+        }
+    }
+    for n in &w.notes {
+        out.push_str(&format!("Note: {n}\n"));
+    }
+    out
 }

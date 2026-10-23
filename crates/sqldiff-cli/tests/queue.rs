@@ -52,14 +52,16 @@ fn queue_ranks_and_flips() {
         "--verdict",
         "unknown",
         "--deny",
-        "ASM-CALLER-CHECKS-RC",
+        "ASM-TSQL-CALLER-XACT-ABORT-OFF",
         "-f",
         "json",
     ]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let pairs = v["pairs"].as_array().unwrap();
+    // T-SQL ↔ Db2 diverges with XACT_ABORT ON as well, so only the PG pair
+    // rests on the assumption.
     assert_eq!(pairs.len(), 1);
-    assert_eq!(pairs[0]["b"], "movestock.pg.sql");
+    assert!(pairs.iter().any(|p| p["b"] == "movestock.pg.sql"));
 }
 
 #[test]
@@ -67,8 +69,9 @@ fn ledger_comment_and_link() {
     let (a, b) = (f("movestock.tsql.sql"), f("movestock.pg.sql"));
     let (_, out) = sqldiff(&["assumptions", &a, &b, "-f", "json"]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-    assert_eq!(v["assumptions"][0]["id"], "ASM-CALLER-CHECKS-RC");
+    assert_eq!(v["assumptions"][0]["id"], "ASM-TSQL-CALLER-XACT-ABORT-OFF");
     assert_eq!(v["assumptions"][0]["flips_verdict"], true);
+    assert_eq!(v["assumptions"][0]["reruns"], true);
 
     let (code, one) = sqldiff(&["comment", &a, &b]);
     let (_, two) = sqldiff(&["comment", &a, &b]);
@@ -76,7 +79,7 @@ fn ledger_comment_and_link() {
     assert_eq!(one, two);
     // Equivalence adds an `equiv.unproven` finding for the UPDATE (ItemId vs item_id).
     assert!(
-        one.starts_with("SQLDiff found 2 issues to review."),
+        one.starts_with("SQLDiff found 3 issues to review."),
         "{one}"
     );
     assert!(one.contains("Please confirm the new behaviour is intended."));
@@ -84,18 +87,21 @@ fn ledger_comment_and_link() {
     let (_, denied) = sqldiff(&["comment", &a, &b, "--deny", "ASM-CALLER-CHECKS-RC"]);
     assert!(denied.contains("relies on what review says does not hold"));
 
-    let (code, link) = sqldiff(&[
-        "open",
-        &a,
-        &b,
-        "--finding",
-        "aacde30caae50448",
-        "--gui-url",
-        "http://h:9/",
-    ]);
+    let (_, json) = sqldiff(&["diff", &a, &b, "-f", "json"]);
+    let r: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let fp = r["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule"] == "error.contract")
+        .unwrap()["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (code, link) = sqldiff(&["open", &a, &b, "--finding", &fp, "--gui-url", "http://h:9/"]);
     assert_eq!(code, 0);
     assert!(link.starts_with("http://h:9/?a="), "{link}");
-    assert!(link.trim_end().ends_with("#f=aacde30caae50448"));
+    assert!(link.trim_end().ends_with(&format!("#f={fp}")));
     let (code, _) = sqldiff(&["open", &a, &b, "--finding", "nope"]);
     assert_eq!(code, 2);
 }
@@ -112,11 +118,18 @@ fn accepted_findings_are_suppressed_and_unknown_pairs_still_need_review() {
     let data = scratch("accept");
     let dir = fixtures().display().to_string();
     let (a, b) = (f("movestock.tsql.sql"), f("movestock.pg.sql"));
-    let (code, _) = sqldiff_in(
-        &data,
-        &["review", "accept", "aacde30caae50448", "--pair", &a, &b],
-    );
-    assert_eq!(code, 0);
+    let (_, json) = sqldiff(&["diff", &a, &b, "-f", "json"]);
+    let r: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let fps: Vec<String> = r["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["fingerprint"].as_str().unwrap().to_string())
+        .collect();
+    for fp in &fps {
+        let (code, _) = sqldiff_in(&data, &["review", "accept", fp, "--pair", &a, &b]);
+        assert_eq!(code, 0);
+    }
     let (_, out) = sqldiff_in(&data, &["queue", &dir, "-f", "json"]);
     let v: serde_json::Value = serde_json::from_str(&out).unwrap();
     let pairs = v["pairs"].as_array().unwrap();
@@ -124,10 +137,9 @@ fn accepted_findings_are_suppressed_and_unknown_pairs_still_need_review() {
         .iter()
         .find(|p| p["a"] == "movestock.tsql.sql" && p["b"] == "movestock.pg.sql")
         .unwrap();
-    // The `equiv.unproven` finding stays; the accepted one is suppressed.
-    assert_eq!(pg["findings"], 1);
-    assert_eq!(pg["review"]["accepted"], 1);
-    // Not proven equal: the verdict is still unknown, so the verdict is still unknown: it needs review.
+    assert_eq!(pg["findings"], 0);
+    assert_eq!(pg["review"]["accepted"], fps.len());
+    // No finding left, but the verdict is still unknown: it needs review.
     assert_eq!(pg["verdict"], "unknown");
     assert_eq!(pg["needs_review"], true);
     let (_, out) = sqldiff_in(
@@ -178,4 +190,56 @@ fn open_quotes_paths_with_spaces() {
         .unwrap();
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains(&format!("'{a}' '{b}'")), "{err}");
+}
+
+// Regressions from the review of PR #23.
+
+#[test]
+fn assumptions_runs_the_diff_pipeline() {
+    let dir = scratch("asm-pipeline");
+    let pack = dir.join("pack.toml");
+    std::fs::write(
+        &pack,
+        "[pack]\nname = \"t\"\nversion = \"1\"\n\n[[author_markers]]\nkind = \"assumption\"\npattern = \"--\\\\s*ASSUMES:\\\\s*(.*)\"\n",
+    )
+    .unwrap();
+    let a = dir.join("a.tsql.sql");
+    let b = dir.join("b.tsql.sql");
+    let body = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  -- ASSUMES: stock rows exist\n  UPDATE dbo.stock SET qty = 0;\nEND\n";
+    std::fs::write(&a, body).unwrap();
+    std::fs::write(&b, body).unwrap();
+    let (pack, a, b) = (
+        pack.display().to_string(),
+        a.display().to_string(),
+        b.display().to_string(),
+    );
+    let (_, out) = sqldiff(&["diff", &a, &b, "--pack", &pack, "-f", "json"]);
+    let d: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let asm = d["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["source"] == "author")
+        .unwrap_or_else(|| panic!("{d}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The author's assumption is in the ledger, with the same verdict.
+    let (_, out) = sqldiff(&["assumptions", &a, &b, "--pack", &pack, "-f", "json"]);
+    let l: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(l["verdict"], d["verdict"]);
+    assert!(
+        l["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"] == asm.as_str()),
+        "{l}"
+    );
+    // Denying it reaches the marker's assumption.
+    let (_, out) = sqldiff(&[
+        "diff", &a, &b, "--pack", &pack, "--deny", &asm, "-f", "json",
+    ]);
+    let r: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(r["verdict"], "unknown", "{r}");
 }

@@ -195,10 +195,13 @@ struct Compiled {
 }
 
 impl Resolved {
-    /// Core options from this config: excerpt length and pack helper functions.
-    pub fn core_options(&self) -> sqldiff_core::Options {
+    /// Engine options from this configuration: excerpt cap, declared facts (a
+    /// declared Db2 for i commit level is used by the analysis) and pack helper
+    /// functions for the built-in catalog.
+    pub fn options(&self) -> sqldiff_core::Options {
         sqldiff_core::Options {
             excerpt_lines: self.excerpt_lines,
+            declared: self.policy.assumptions.clone(),
             helpers: self
                 .policy
                 .helpers

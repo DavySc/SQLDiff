@@ -1,6 +1,6 @@
 //! Entry points: diff two artifacts, or check one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::artifact::{content_hash, Analyzed, Artifact};
@@ -36,6 +36,15 @@ pub struct Options {
     pub facts_b: Vec<Arc<Catalog>>,
     /// Pack-supplied helper functions, added to the built-in catalog.
     pub helpers: Vec<Helper>,
+    /// Session assumption flips (id → holds). Flips of scenario assumptions
+    /// (`ir::behaviour::RERUN_ASSUMPTIONS`) re-run the behavioural analysis
+    /// under the flipped environment; the rest are applied to verdicts by
+    /// the caller (see `sqldiff_source::queue::apply`).
+    pub flips: BTreeMap<String, bool>,
+    /// Facts declared in packs or project config, by assumption id (the
+    /// declaration's text). A declared Db2 for i commit level is used for
+    /// routines that do not state one.
+    pub declared: BTreeMap<String, String>,
 }
 
 impl Default for Options {
@@ -47,6 +56,8 @@ impl Default for Options {
             facts_a: Vec::new(),
             facts_b: Vec::new(),
             helpers: Vec::new(),
+            flips: BTreeMap::new(),
+            declared: BTreeMap::new(),
         }
     }
 }
@@ -233,14 +244,19 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         normalizations.push("names bound against the catalog".to_string());
     }
 
-    let (bf, ba) = crate::ir::behaviour::compare(&aa, &ab);
-    // Same-dialect diffs keep behavioural findings only when the facts actually differ.
-    findings.extend(bf);
-    for x in ba {
+    let env = crate::ir::behaviour::Env::from_options(opts);
+    let beh = crate::ir::behaviour::analyze(&aa, &ab, &env);
+    let witnesses = beh.witnesses;
+    findings.extend(beh.findings);
+    for x in beh.assumptions {
         if !assumptions.iter().any(|y| y.id == x.id) {
             assumptions.push(x);
         }
     }
+
+    findings.extend(crate::ledger::contradictions(&[&aa, &ab], opts));
+    let mut discharged = crate::ledger::discharges(&aa);
+    discharged.extend(crate::ledger::discharges(&ab));
 
     let mut diagnostics = aa.diagnostics();
     diagnostics.extend(ab.diagnostics());
@@ -264,7 +280,33 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         suppressed: Vec::new(),
         verdict_before_suppression: None,
         diagnostics,
+        witnesses,
+        discharged,
     })
+}
+
+/// "What if this statement fails?" (design §6.1 `what_if`): the statement
+/// on or before `line` of side `side`, failing with `kind`, under the
+/// environment `opts.flips` and `opts.declared` describe.
+pub fn what_if(
+    a: &Artifact,
+    b: &Artifact,
+    opts: &Options,
+    side: Side,
+    line: usize,
+    kind: crate::ir::ErrorKind,
+) -> crate::ir::witness::WhatIf {
+    let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let ab = Analyzed::new(b, Side::B, opts.excerpt_lines);
+    let env = crate::ir::behaviour::Env::from_options(opts);
+    crate::ir::behaviour::what_if(&aa, &ab, side, line, kind, &env)
+}
+
+/// Transaction overlay brackets of both sides (design §6.2).
+pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
+    let aa = Analyzed::new(a, Side::A, 1);
+    let ab = Analyzed::new(b, Side::B, 1);
+    crate::ir::overlay::overlay(&aa, &ab)
 }
 
 /// Lint one artifact on its own.
@@ -310,6 +352,8 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         suppressed: Vec::new(),
         verdict_before_suppression: None,
         diagnostics,
+        witnesses: Vec::new(),
+        discharged: Vec::new(),
     })
 }
 

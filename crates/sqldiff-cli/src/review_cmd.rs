@@ -77,11 +77,25 @@ impl Pipeline {
     }
 
     pub fn options(&self) -> Options {
-        self.cfg.core_options()
+        self.cfg.options()
     }
 
-    /// `diff` (or `check` when `b` is `None`) with everything applied.
+    /// `diff` (or `check` when `b` is `None`) with everything applied,
+    /// session flips last so they also reach assumptions that markers add.
     pub fn run(&self, a: &Artifact, b: Option<&Artifact>, opts: &Options) -> Report {
+        let mut r = self.run_scenario(a, b, opts);
+        sqldiff_core::ledger::relabel(&mut r, &opts.flips);
+        r
+    }
+
+    /// [`run`](Pipeline::run) with only the scenario flips in `opts` (they
+    /// re-run the behavioural analysis); the others are not applied.
+    pub fn run_scenario(&self, a: &Artifact, b: Option<&Artifact>, opts: &Options) -> Report {
+        let opts = Options {
+            flips: sqldiff_core::ledger::scenario_flips(&opts.flips),
+            ..opts.clone()
+        };
+        let opts = &opts;
         let mut r = self.cache.report(a, b, opts, &self.cfg, || match b {
             Some(b) => sqldiff_core::diff(a, b, opts),
             None => sqldiff_core::check(a, opts),
