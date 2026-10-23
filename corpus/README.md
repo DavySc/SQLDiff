@@ -154,7 +154,7 @@ observe = ["stock(item_id, qty)"]         # durable state; leave out time-depend
 faults = ["stock", "price_feed:delete"]   # write fault, or delete fault [":key"]
 seed = "INSERT INTO ..."                  # shared, or seed.tsql / seed.pg
 # reproducible = false, why = "..."       # a "different" the oracle cannot show
-# known_divergence = "..."                # an open contradiction of case.toml
+# known_divergence."tsql~pg" = "..."     # an open contradiction of an equal verdict
 
 [[scenario]]
 name = "caller checks the return code"
