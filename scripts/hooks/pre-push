@@ -28,7 +28,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       git grep -l -i -F -f "$terms" "$c" -- . ':!target' | sed "s/^$c://" >&2
       bad=1
     fi
-    if git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$c" | grep -q -i -F -f "$terms"; then
+    # Capture first; see the note in pre-commit about pipefail and SIGPIPE.
+    meta="$(git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$c")"
+    if grep -q -i -F -f "$terms" <<<"$meta"; then
       echo "pre-push: $short ($local_ref) has a deny-listed term in its message or identity" >&2
       bad=1
     fi

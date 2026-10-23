@@ -12,7 +12,10 @@ trap 'rm -f "$terms"' EXIT
 
 SQLDIFF_DENYLIST_FILE="$terms" "$root/scripts/leak-scan.sh" --cached
 
-if { git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT; } | grep -q -i -F -f "$terms"; then
+# Capture first: `... | grep -q` under pipefail reports failure when grep exits
+# early and the writer gets SIGPIPE, which silently disables this check on Linux.
+idents="$(git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT)"
+if grep -q -i -F -f "$terms" <<<"$idents"; then
   echo "pre-commit: the author or committer identity contains a deny-listed term." >&2
   echo "  Set an identity for this clone: git config user.email <address>" >&2
   exit 1
