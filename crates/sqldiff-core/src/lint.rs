@@ -7,6 +7,7 @@ use serde::Deserialize;
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode, SyntaxToken};
 
 use crate::artifact::Analyzed;
+use crate::classify::pairing_key;
 use crate::model::{fingerprint, ChangeClass, Finding, FingerprintInput, Severity, Side, Verdict};
 
 #[derive(Debug, Deserialize)]
@@ -193,27 +194,47 @@ pub fn terminator_hits(root: &SyntaxNode, dialect: Dialect) -> Vec<Hit> {
     hits
 }
 
-/// INSERT with a column list whose SELECT list or VALUES row has a different
-/// number of items: the statement fails at run time in every dialect. Only
-/// shapes that can be counted exactly are checked; `*`, `x.*` and anything
-/// unexpected are skipped, so a hit is never a guess.
-pub fn insert_arity_hits(root: &SyntaxNode) -> Vec<Hit> {
+/// INSERT whose column list and SELECT list or VALUES row differ in length:
+/// the statement fails at run time in every dialect. The statement is read
+/// with the equivalence parser; anything it cannot read, and `*` or `x.*`
+/// lists, give no hit, so a hit is never a guess.
+pub fn insert_arity_hits(root: &SyntaxNode, dialect: Dialect) -> Vec<Hit> {
+    use crate::equiv::ast::{parse_stmt, tokens, Expr, InsertSource, Stmt};
     let mut hits = Vec::new();
     for node in root
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::STATEMENT && ast::starts_with_kw(n, "INSERT"))
     {
-        let toks: Vec<SyntaxToken> = ast::sig_tokens(&node).collect();
-        let Some(InsertShape {
+        let mut toks = tokens(&node);
+        // `OVERRIDING SYSTEM|USER VALUE` decides identity values, not how many
+        // there are; the parser has no use for it here.
+        if let Some(i) = toks.iter().position(|t| t.up == "OVERRIDING") {
+            if toks.get(i + 2).is_some_and(|t| t.up == "VALUE") {
+                toks.drain(i..i + 3);
+            }
+        }
+        let Ok(Stmt::Insert {
             target,
             cols,
-            source: kind,
-            counts,
-        }) = insert_shape(&toks)
+            source,
+            ..
+        }) = parse_stmt(&toks, dialect)
         else {
             continue;
         };
-        let Some(&got) = counts.iter().find(|&&c| c != cols) else {
+        if cols.is_empty() {
+            continue;
+        }
+        let (kind, counts): (&str, Vec<usize>) = match &source {
+            InsertSource::Values(rows) => ("VALUES row", rows.iter().map(Vec::len).collect()),
+            InsertSource::Query(q) if q.items.iter().any(|i| matches!(i.expr, Expr::Star(_))) => {
+                continue
+            }
+            InsertSource::Query(q) => ("SELECT list", vec![q.items.len()]),
+            InsertSource::Default => continue,
+        };
+        let n = cols.len();
+        let Some(&got) = counts.iter().find(|&&c| c != n) else {
             continue;
         };
         let (s, e) = ast::sig_range(&node);
@@ -222,167 +243,17 @@ pub fn insert_arity_hits(root: &SyntaxNode) -> Vec<Hit> {
             class: ChangeClass::Semantic,
             severity: Severity::High,
             message: format!(
-                "INSERT into {target} names {cols} column{} but its {kind} supplies {got}; the statement fails when it runs.",
-                if cols == 1 { "" } else { "s" }
+                "INSERT into {} names {n} column{} but its {kind} supplies {got}; the statement fails when it runs.",
+                target.join("."),
+                if n == 1 { "" } else { "s" }
             ),
             start: s,
             end: e,
-            key: format!("INSERT {target} {cols}/{got}"),
+            // Case and quoting of the target do not make a hit new.
+            key: format!("INSERT {} {n}/{got}", pairing_key(&target)),
         });
     }
     hits
-}
-
-fn upper(t: &SyntaxToken) -> String {
-    t.text().to_ascii_uppercase()
-}
-
-struct InsertShape {
-    target: String,
-    /// Columns in the column list.
-    cols: usize,
-    /// `VALUES row` or `SELECT list`.
-    source: &'static str,
-    /// Items per VALUES row, or the one SELECT list.
-    counts: Vec<usize>,
-}
-
-fn insert_shape(toks: &[SyntaxToken]) -> Option<InsertShape> {
-    let mut i = 1;
-    if toks.get(i).map(upper).as_deref() == Some("INTO") {
-        i += 1;
-    }
-    // Target: a (qualified) name, up to its column list or source.
-    const AFTER_TARGET: &[&str] = &[
-        "SELECT",
-        "VALUES",
-        "DEFAULT",
-        "OVERRIDING",
-        "WITH",
-        "OUTPUT",
-        "EXEC",
-        "EXECUTE",
-    ];
-    let start = i;
-    while i < toks.len()
-        && toks[i].kind() != SyntaxKind::L_PAREN
-        && !AFTER_TARGET.contains(&upper(&toks[i]).as_str())
-    {
-        i += 1;
-    }
-    let target: String = toks[start..i].iter().map(|t| t.text()).collect();
-    if target.is_empty() || toks.get(i)?.kind() != SyntaxKind::L_PAREN {
-        return None;
-    }
-    if toks.get(i + 1).map(upper).as_deref() == Some("SELECT") {
-        return None; // no column list
-    }
-    let (cols, after) = count_items(toks, i)?;
-    i = after;
-    if toks.get(i).map(upper).as_deref() == Some("OVERRIDING") {
-        i += 3; // OVERRIDING SYSTEM|USER VALUE
-    }
-    let (source, counts) = match toks.get(i).map(upper).as_deref() {
-        Some("VALUES") => {
-            let mut rows = Vec::new();
-            i += 1;
-            while toks.get(i).map(|t| t.kind()) == Some(SyntaxKind::L_PAREN) {
-                let (n, after) = count_items(toks, i)?;
-                rows.push(n);
-                i = after;
-                if toks.get(i).map(|t| t.kind()) != Some(SyntaxKind::COMMA) {
-                    break;
-                }
-                i += 1;
-            }
-            if rows.is_empty() {
-                return None;
-            }
-            ("VALUES row", rows)
-        }
-        Some("SELECT") => ("SELECT list", vec![select_items(toks, i + 1)?]),
-        _ if toks.get(i).map(|t| t.kind()) == Some(SyntaxKind::L_PAREN)
-            && toks.get(i + 1).map(upper).as_deref() == Some("SELECT") =>
-        {
-            ("SELECT list", vec![select_items(toks, i + 2)?])
-        }
-        _ => return None,
-    };
-    Some(InsertShape {
-        target,
-        cols,
-        source,
-        counts,
-    })
-}
-
-/// Items of the parenthesized list opening at `open`, and the index after its `)`.
-fn count_items(toks: &[SyntaxToken], open: usize) -> Option<(usize, usize)> {
-    let mut depth = 0usize;
-    let mut items = 1;
-    for (k, t) in toks.iter().enumerate().skip(open) {
-        match t.kind() {
-            SyntaxKind::L_PAREN => depth += 1,
-            SyntaxKind::R_PAREN => {
-                depth -= 1;
-                if depth == 0 {
-                    return (k > open + 1).then_some((items, k + 1));
-                }
-            }
-            SyntaxKind::COMMA if depth == 1 => items += 1,
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Items of a SELECT list starting at `i` (after SELECT); `None` for `*`.
-fn select_items(toks: &[SyntaxToken], mut i: usize) -> Option<usize> {
-    while matches!(toks.get(i).map(upper).as_deref(), Some("DISTINCT" | "ALL")) {
-        i += 1;
-    }
-    if toks.get(i).map(upper).as_deref() == Some("TOP") {
-        i += 1;
-        if toks.get(i)?.kind() == SyntaxKind::L_PAREN {
-            i = count_items(toks, i)?.1;
-        } else {
-            i += 1;
-        }
-    }
-    const END: &[&str] = &[
-        "FROM",
-        "INTO",
-        "WHERE",
-        "GROUP",
-        "HAVING",
-        "ORDER",
-        "UNION",
-        "EXCEPT",
-        "INTERSECT",
-        "LIMIT",
-        "OFFSET",
-        "FETCH",
-        "FOR",
-        "OPTION",
-        "WITH",
-    ];
-    let mut depth = 0usize;
-    let mut items = 1;
-    let mut any = false;
-    for t in &toks[i..] {
-        match t.kind() {
-            SyntaxKind::L_PAREN => depth += 1,
-            SyntaxKind::R_PAREN if depth == 0 => break,
-            SyntaxKind::R_PAREN => depth -= 1,
-            SyntaxKind::SEMICOLON if depth == 0 => break,
-            SyntaxKind::COMMA if depth == 0 => items += 1,
-            _ if depth == 0 && END.contains(&upper(t).as_str()) => break,
-            _ if depth == 0 && t.text() == "*" => return None,
-            _ => {}
-        }
-        any = true;
-    }
-    any.then_some(items)
 }
 
 fn last_statement(node: &SyntaxNode) -> Option<SyntaxNode> {
@@ -398,7 +269,7 @@ fn last_statement(node: &SyntaxNode) -> Option<SyntaxNode> {
 pub fn all_hits(a: &Analyzed) -> Vec<Hit> {
     let mut hits = residue_hits(&a.root, a.dialect());
     hits.extend(terminator_hits(&a.root, a.dialect()));
-    hits.extend(insert_arity_hits(&a.root));
+    hits.extend(insert_arity_hits(&a.root, a.dialect()));
     hits.sort_by_key(|h| h.start);
     hits
 }

@@ -331,6 +331,38 @@ fn error_handler_writes_are_paired_by_target_not_count() {
                        UPDATE parcel SET checked = 1;\n  DELETE FROM old_parcel;\nEND;";
     let r = run(tsql, Dialect::Tsql, db2_handler, Dialect::Db2i);
     assert!(unpaired(&r).is_empty(), "{:?}", unpaired(&r));
+
+    // Both sides write the log on the normal path (paired); only A also
+    // writes it on the error path, so B has no error-path counterpart.
+    let a = "BEGIN TRY\n  UPDATE run_state SET step = 1;\nEND TRY\n\
+             BEGIN CATCH\n  UPDATE run_state SET failed = 1;\nEND CATCH;";
+    let b = "BEGIN\n  UPDATE run_state SET step = 1;\nEND;";
+    let r = run(a, Dialect::Tsql, b, Dialect::Db2i);
+    let f: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "write.unpaired")
+        .collect();
+    assert_eq!(f.len(), 1, "{:?}", unpaired(&r));
+    assert_eq!(f[0].verdict, Verdict::Different);
+    assert!(
+        f[0].witness.contains("no error handler writes it"),
+        "{}",
+        f[0].witness
+    );
+
+    // A normal-path write is not excused by a different kind of write to the
+    // same table on the other side's error path.
+    let a = "UPDATE parcel SET checked = 1;";
+    let b = "BEGIN\n  DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n      \
+             INSERT INTO parcel (id) VALUES (0);\n    END;\n  DELETE FROM old_parcel;\nEND;";
+    let r = run(a, Dialect::Tsql, b, Dialect::Db2i);
+    let main = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "write.unpaired" && f.witness.contains("UPDATE of parcel"))
+        .expect("finding for the UPDATE");
+    assert_eq!(main.verdict, Verdict::Different, "{}", main.witness);
 }
 
 #[test]
@@ -372,9 +404,41 @@ fn insert_column_count_mismatch_is_reported() {
         ("insert into t (a, b) select x.* from s x;", Dialect::Postgres),
         ("insert into t values (1, 2);", Dialect::Tsql),
         ("insert into t (a, b) values (1, 2), (3, 4);", Dialect::Db2i),
+        // Commas inside brackets, trailing clauses and keywords inside
+        // expressions are not list items.
+        ("INSERT INTO t (a, b) VALUES (1, ARRAY[1, 2]);", Dialect::Postgres),
+        (
+            "INSERT INTO t (a, b) SELECT 1, 2 ON CONFLICT (a) DO UPDATE SET a = 1, b = 2;",
+            Dialect::Postgres,
+        ),
+        ("INSERT INTO t (a, b) SELECT $1, $2 RETURNING a, b;", Dialect::Postgres),
+        ("INSERT INTO t (id, name) SELECT NEXT VALUE FOR seq, s.name FROM s;", Dialect::Tsql),
+        ("INSERT INTO t (a, b) SELECT x IS DISTINCT FROM y, z FROM s;", Dialect::Postgres),
+        // Targets that are not a plain table name.
+        ("INSERT INTO t AS x (a, b) VALUES (1, 2, 3);", Dialect::Postgres),
+        (
+            "INSERT INTO OPENQUERY(srv, 'select a,b,c from t') VALUES (1, 2, 3);",
+            Dialect::Tsql,
+        ),
     ] {
         assert!(lint(sql, d).is_empty(), "{d}: {sql}");
     }
+    // The fingerprint does not depend on the case or quoting of the target.
+    let fp = |sql: &str| {
+        check(
+            &Artifact::new("i.sql", Dialect::Postgres, sql),
+            &Options::default(),
+        )
+        .findings
+        .into_iter()
+        .find(|f| f.rule == "hazard.insert-column-count")
+        .map(|f| f.fingerprint)
+        .expect("hit")
+    };
+    assert_eq!(
+        fp("insert into T (a) values (1, 2);"),
+        fp("insert into \"t\" (a) values (1, 2);")
+    );
 }
 
 #[test]

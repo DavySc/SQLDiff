@@ -480,31 +480,45 @@ fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
     const SAME_TABLE: &str = "the same table is written by a different kind of statement";
 
     let pairs = lcs_pairs(&ka, &kb);
-    let mut out = Vec::new();
     let matched_a: HashSet<usize> = pairs.iter().map(|p| p.0).collect();
     let matched_b: HashSet<usize> = pairs.iter().map(|p| p.1).collect();
-    for (side, other, ws, keys, matched, other_main, other_handler) in [
-        (a, b, &wa, &ka, &matched_a, &kb, &khb),
-        (b, a, &wb, &kb, &matched_b, &ka, &kha),
+    // Lookups built once: keys, targets and the normal-path writes left over
+    // after in-order matching, per side and family.
+    let set = |ks: &[String]| -> HashSet<String> { ks.iter().cloned().collect() };
+    let targets = |ks: &[String]| -> HashSet<String> { ks.iter().map(&target_of).collect() };
+    let leftover = |ks: &[String], m: &HashSet<usize>| -> HashSet<String> {
+        ks.iter()
+            .enumerate()
+            .filter(|(i, _)| !m.contains(i))
+            .map(|(_, k)| k.clone())
+            .collect()
+    };
+    let (main_a, main_b) = (set(&ka), set(&kb));
+    let (main_ta, main_tb) = (targets(&ka), targets(&kb));
+    let (hand_a, hand_b) = (set(&kha), set(&khb));
+    let (hand_ta, hand_tb) = (targets(&kha), targets(&khb));
+    let (left_a, left_b) = (leftover(&ka, &matched_a), leftover(&kb, &matched_b));
+
+    let mut out = Vec::new();
+    // Normal path: only the other side's normal path can be a counterpart.
+    for (side, other, ws, keys, matched, o_main, o_main_t, o_hand) in [
+        (a, b, &wa, &ka, &matched_a, &main_b, &main_tb, &hand_b),
+        (b, a, &wb, &kb, &matched_b, &main_a, &main_ta, &hand_a),
     ] {
         for (i, w) in ws.iter().enumerate() {
             if matched.contains(&i) {
                 continue;
             }
             let k = &keys[i];
-            let same_target = other_main
-                .iter()
-                .chain(other_handler.iter())
-                .any(|o| target_of(o) == target_of(k));
-            let outcome = if other_main.contains(k) {
+            let outcome = if o_main.contains(k) {
                 (Verdict::Unknown, "it appears there in a different order")
-            } else if other_handler.contains(k) {
+            } else if o_main_t.contains(&target_of(k)) {
+                (Verdict::Unknown, SAME_TABLE)
+            } else if o_hand.contains(k) {
                 (
-                    Verdict::Unknown,
+                    Verdict::Different,
                     "it is written there only in an error handler",
                 )
-            } else if same_target {
-                (Verdict::Unknown, SAME_TABLE)
             } else {
                 (Verdict::Different, "it has no corresponding write")
             };
@@ -512,29 +526,36 @@ fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
             out.push(unpaired(side, other, w, k, outcome, &place));
         }
     }
-    for (side, other, ws, keys, other_main, other_handler) in
-        [(a, b, &ha, &kha, &kb, &khb), (b, a, &hb, &khb, &ka, &kha)]
-    {
+    // Error handlers: by key, once per key.
+    for (side, other, ws, keys, o_hand, o_hand_t, o_left) in [
+        (a, b, &ha, &kha, &hand_b, &hand_tb, &left_b),
+        (b, a, &hb, &khb, &hand_a, &hand_ta, &left_a),
+    ] {
+        let mut count: HashMap<&String, usize> = HashMap::new();
+        for k in keys.iter() {
+            *count.entry(k).or_default() += 1;
+        }
         let mut seen = HashSet::new();
         for (w, k) in ws.iter().zip(keys) {
-            if other_handler.contains(k) || !seen.insert(k) {
+            if o_hand.contains(k) || !seen.insert(k) {
                 continue;
             }
-            let same_target = other_main
-                .iter()
-                .chain(other_handler.iter())
-                .any(|o| target_of(o) == target_of(k));
-            let outcome = if other_main.contains(k) {
+            let outcome = if o_left.contains(k) {
+                // A normal-path write the in-order matching left over may be
+                // where the other side records the same thing.
                 (
                     Verdict::Unknown,
                     "it is written there outside an error handler",
                 )
-            } else if same_target {
-                (Verdict::Unknown, SAME_TABLE)
+            } else if o_hand_t.contains(&target_of(k)) {
+                (
+                    Verdict::Unknown,
+                    "an error handler writes the same table with a different kind of statement",
+                )
             } else {
                 (Verdict::Different, "no error handler writes it")
             };
-            let more = keys.iter().filter(|x| *x == k).count() - 1;
+            let more = count[k] - 1;
             let place = format!(
                 " in an error handler (line {}{})",
                 side.line_of(&w.node),
