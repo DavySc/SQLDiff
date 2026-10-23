@@ -1064,7 +1064,16 @@ impl<'a> Binder<'a> {
                     self.analyze(&t, stmt);
                 }
             }
-            _ => self.analyze(&t, stmt),
+            // Statements that carry expressions. Anything else (`LABEL ON`, `RENAME`,
+            // vendor commands the binder does not model) names objects or is
+            // unclassified, and reading its words as references would guess a
+            // `different`; it gets no binding findings.
+            (
+                _,
+                "SELECT" | "WITH" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "VALUES" | "SET"
+                | "RETURN" | "(",
+            ) => self.analyze(&t, stmt),
+            _ => {}
         }
     }
 
@@ -1643,7 +1652,7 @@ impl<'a> Binder<'a> {
         let msg = match self.d {
             Dialect::Tsql => format!("`{}` is not declared in this batch before its use; SQL Server fails with \"Must declare the scalar variable\".", x.text),
             Dialect::Postgres => format!("`{}` is not a variable, parameter or column in scope; the statement fails with undefined_column (42703) when it runs.", x.text),
-            Dialect::Db2i => format!("`{}` is not a variable, parameter or column in scope; Db2 for i rejects the routine (SQL0206).", x.text),
+            Dialect::Db2i => format!("`{}` is not a variable, parameter or column in scope; Db2 for i rejects the statement (SQL0206).", x.text),
         };
         self.fail(
             RefKind::Variable,

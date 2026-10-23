@@ -427,6 +427,31 @@ fn tsql_loop_is_not_a_scope() {
     );
 }
 
+/// Object-naming statements (`LABEL ON`, `RENAME`) and statements the binder
+/// does not classify hold no references, so they give no binding findings (#32).
+#[test]
+fn object_naming_statements_bind_nothing() {
+    let src = "CREATE TABLE shipment (id INTEGER NOT NULL, name VARCHAR(50), insert_user VARCHAR(30));\nLABEL ON TABLE shipment IS 'Shipment';\nLABEL ON COLUMN shipment.name IS 'Name';\nLABEL ON COLUMN shipment (id TEXT IS 'Shipment id', name TEXT IS 'Shipment name', insert_user TEXT IS 'Created by');\nRENAME TABLE shipment TO shipment_old;\nRENAME INDEX shipment_ix TO shipment_old_ix;\nCOMMENT ON TABLE shipment_old IS 'x';\nGRANT SELECT ON shipment_old TO PUBLIC;\nCREATE ALIAS shipment_a FOR shipment_old;\n";
+    let r = check_rules(Dialect::Db2i, src, None);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let pg = "COPY t (a, b) FROM STDIN;\nREFRESH MATERIALIZED VIEW mv;\n";
+    let r = check_rules(Dialect::Postgres, pg, None);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    // Statements that carry expressions are still checked.
+    let undeclared = "CREATE PROCEDURE p ()\nLANGUAGE SQL\nBEGIN\n  DECLARE n INTEGER DEFAULT 0;\n  SET n = missing_var + 1;\nEND";
+    let r = check_rules(Dialect::Db2i, undeclared, None);
+    assert!(
+        has(
+            &r,
+            "bind.unknown-variable",
+            ChangeClass::Binding,
+            Verdict::Different
+        ),
+        "{:?}",
+        rules(&r)
+    );
+}
+
 /// Ordinals count within the routine: an unrelated routine added in front
 /// does not make unchanged references look rebound.
 #[test]
