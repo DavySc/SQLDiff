@@ -36,6 +36,8 @@ pub struct Param {
     pub name: String,
     pub ty: Option<Ty>,
     pub out: bool,
+    /// Default value tokens (keywords upper-cased), when declared.
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +72,9 @@ pub struct Unit {
     pub uncovered: Vec<(SyntaxNode, String)>,
     /// Explicit transaction control or a recognised rollback-and-rethrow protocol.
     pub txn_control: bool,
+    /// T-SQL: SET XACT_ABORT ON or a CATCH that rethrows, so a failing
+    /// statement ends the routine instead of letting it continue.
+    pub stops_on_error: bool,
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
     pub notes: Vec<String>,
@@ -88,6 +93,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         stmts: Vec::new(),
         uncovered: Vec::new(),
         txn_control: false,
+        stops_on_error: false,
         txn_stmts: Vec::new(),
         notes: Vec::new(),
     };
@@ -352,18 +358,28 @@ fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
     }
     let mut p = Parser::new(&toks[i..], d);
     let ty: Type = p.ty().ok()?;
+    let mut default: Option<Vec<String>> = None;
     for t in &toks[i + p.i..] {
-        if matches!(t.up.as_str(), "OUTPUT" | "OUT") {
-            out = true;
-        }
-        if t.up == "READONLY" {
-            return None;
+        match t.up.as_str() {
+            "OUTPUT" | "OUT" => out = true,
+            "READONLY" => return None,
+            "=" | "DEFAULT" if default.is_none() => default = Some(Vec::new()),
+            _ => {
+                if let Some(v) = default.as_mut() {
+                    v.push(if t.kind == K::Word {
+                        t.up.clone()
+                    } else {
+                        t.text.clone()
+                    });
+                }
+            }
         }
     }
     Some(Param {
         name,
         ty: Some(Ty::from_type(&ty, d, false)),
         out,
+        default: default.map(|v| v.join(" ")),
     })
 }
 
@@ -400,6 +416,7 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
                     SyntaxKind::CATCH_BLOCK => {
                         if is_rollback_rethrow(&part, d) {
                             u.txn_control = true;
+                            u.stops_on_error = true;
                         } else {
                             u.uncovered.push((part.clone(), "a CATCH block".into()));
                         }
@@ -449,21 +466,28 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let ast = parse_stmt(&toks, d);
+            let mut ast = parse_stmt(&toks, d);
+            let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {
                     name: name.trim_start_matches('@').to_lowercase(),
                     ty: ty.as_ref().map(|t| Ty::from_type(t, d, false)),
                 });
-                if default.is_none() {
-                    return;
-                }
+                let Some(init) = default else { return };
+                // `DECLARE @x T = v` is an assignment of the initial value.
+                let target = if name.starts_with('@') {
+                    super::ast::Expr::Var(name.clone())
+                } else {
+                    super::ast::Expr::Name(vec![name.clone()])
+                };
+                ast = Ok(Stmt::Assign(target, init.clone()));
+                from_declare = true;
             }
             u.stmts.push(LStmt {
                 node: c.clone(),
                 toks,
                 ast,
-                from_declare: false,
+                from_declare,
             });
         }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
@@ -513,7 +537,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 u.txn_stmts.push((c.clone(), kind));
             }
         }
-        StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => u.txn_control = true,
+        StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => {
+            u.txn_control = true;
+            u.stops_on_error = true;
+        }
         _ => {
             let what = format!(
                 "{} `{}`",

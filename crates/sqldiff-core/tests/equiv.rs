@@ -183,3 +183,140 @@ fn unsupported_control_flow_stays_unknown() {
       BEGIN UPDATE item SET name = 'x' WHERE item_id = p_x; END; $$;";
     assert_eq!(run(ts, T, pg, P, true).verdict, Verdict::Unknown);
 }
+
+fn not_equal(r: &Report) -> bool {
+    !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions)
+}
+
+#[test]
+fn literal_case_in_unlowered_statements_is_a_change() {
+    let ts = |s: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.p AS
+             BEGIN
+               UPDATE c SET nick = '{s}' FROM dbo.customer AS c JOIN dbo.orders AS o ON o.customer_id = c.customer_id;
+             END"
+        )
+    };
+    let r = run(&ts("abc"), T, &ts("ABC"), T, false);
+    assert!(not_equal(&r), "{:?}", r.findings);
+    assert!(rules(&r).contains(&"stmt.modified"), "{:?}", rules(&r));
+}
+
+#[test]
+fn in_list_of_strings_depends_on_collation() {
+    let ts =
+        "CREATE VIEW dbo.v AS SELECT customer_id FROM dbo.customer WHERE email IN ('A@x.com');";
+    let pg = "CREATE VIEW v AS SELECT customer_id FROM customer WHERE email IN ('A@x.com');";
+    for catalog in [false, true] {
+        let r = run(ts, T, pg, P, catalog);
+        assert!(not_equal(&r), "catalog={catalog}: {:?}", r.verdict);
+    }
+}
+
+#[test]
+fn different_parameter_defaults_are_not_equal() {
+    let ts = |take: u32| {
+        format!(
+            "CREATE FUNCTION dbo.top_items (@take int = {take}) RETURNS TABLE AS
+             RETURN SELECT TOP (@take) item_id FROM dbo.item ORDER BY item_id;"
+        )
+    };
+    let pg = "CREATE FUNCTION top_items(p_take integer DEFAULT 50) RETURNS TABLE (item_id integer)
+              LANGUAGE sql AS $$ SELECT item_id FROM item ORDER BY item_id LIMIT p_take; $$;";
+    assert_eq!(run(&ts(50), T, pg, P, true).verdict, Verdict::Equal);
+    let r = run(&ts(10), T, pg, P, true);
+    assert!(not_equal(&r), "{:?}", r.verdict);
+}
+
+#[test]
+fn declared_initial_value_survives_zero_rows() {
+    let ts = "CREATE FUNCTION dbo.f (@id int) RETURNS int AS
+             BEGIN
+               DECLARE @r int = -1;
+               SELECT @r = customer_id FROM dbo.customer WHERE customer_id = @id;
+               RETURN @r;
+             END";
+    let pg = "CREATE FUNCTION f(p_id integer) RETURNS integer LANGUAGE plpgsql AS $$
+              DECLARE r integer := -1;
+              BEGIN
+                SELECT customer_id INTO r FROM customer WHERE customer_id = p_id;
+                RETURN r;
+              END; $$;";
+    // T-SQL keeps -1 when no row qualifies; PL/pgSQL SELECT INTO sets NULL.
+    let r = run(ts, T, pg, P, true);
+    assert_eq!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert!(rules(&r).contains(&"equiv.no-rows"));
+}
+
+#[test]
+fn anti_join_delete_keeps_joined_table_columns_apart() {
+    let ddl =
+        "CREATE TABLE price_feed (item_id integer NOT NULL, unit_price decimal(12,2) NOT NULL);
+               CREATE TABLE item (item_id integer PRIMARY KEY, discontinued integer);";
+    let pg = |cond: &str| {
+        format!(
+            "CREATE PROCEDURE purge() LANGUAGE sql AS $$
+             DELETE FROM price_feed pf WHERE NOT EXISTS (SELECT 1 FROM item i WHERE i.item_id = pf.item_id) AND {cond}; $$;"
+        )
+    };
+    let ts = |cond: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.purge AS
+             BEGIN
+               DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id
+                WHERE i.item_id IS NULL AND {cond};
+             END"
+        )
+    };
+    let with = |a: &str, b: &str| {
+        diff(
+            &Artifact::new("a.sql", T, a),
+            &Artifact::new("b.sql", P, b),
+            &Options {
+                catalog_a: vec![Artifact::new("c.sql", T, ddl)],
+                catalog_b: vec![Artifact::new("c.sql", P, ddl)],
+                ..Options::default()
+            },
+        )
+    };
+    // `discontinued` belongs to the joined table, not the delete target.
+    let a = ts("discontinued = 1");
+    let b = pg("discontinued = 1");
+    assert!(not_equal(&run(&a, T, &b, P, false)));
+    assert!(not_equal(&with(&a, &b)));
+    // A target column is fine once the catalog shows it.
+    assert_eq!(
+        with(&ts("unit_price > 0"), &pg("unit_price > 0")).verdict,
+        Verdict::Equal
+    );
+}
+
+#[test]
+fn tsql_continues_after_a_failed_statement() {
+    let ts = |setting: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.create_order @Customer int, @OrderId int OUTPUT AS
+             BEGIN
+               {setting}
+               INSERT INTO dbo.orders (customer_id, created_at) VALUES (@Customer, SYSDATETIME());
+               SET @OrderId = SCOPE_IDENTITY();
+             END"
+        )
+    };
+    let pg = "CREATE PROCEDURE create_order(p_customer integer, INOUT p_order_id integer DEFAULT NULL)
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                INSERT INTO orders (customer_id, created_at) VALUES (p_customer, statement_timestamp())
+                RETURNING order_id INTO p_order_id;
+              END; $$;";
+    let r = run(&ts(""), T, pg, P, true);
+    assert_eq!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert!(rules(&r).contains(&"equiv.error-continues"));
+    let r = run(&ts("SET XACT_ABORT ON;"), T, pg, P, true);
+    assert!(
+        !rules(&r).contains(&"equiv.error-continues"),
+        "{:?}",
+        rules(&r)
+    );
+}
