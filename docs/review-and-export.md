@@ -23,8 +23,8 @@ repository. `sqldiff review compact` rewrites it with one line per decision
 and drops expired ones.
 
 ```sh
-sqldiff review accept 06ccfd05e423182d --pair a.sql b.sql -c "callers map codes" --expires 2027-01-01
-sqldiff review accept 06ccfd05e423182d             # every snapshot
+sqldiff review accept aacde30caae50448 --pair a.sql b.sql -c "callers map codes" --expires 2027-01-01
+sqldiff review accept aacde30caae50448             # every snapshot
 sqldiff review reject FP --snapshot HASH_A:HASH_B
 sqldiff review comment FP -c "check with the owner"
 sqldiff review list [--state accepted] [-f json]

@@ -46,7 +46,9 @@ fn worked_example_tsql_to_db2() {
         atom.witness
     );
     assert!(atom.witness.contains("UPDATE of Stock"), "{}", atom.witness);
-    assert!(atom
+    // Under XACT_ABORT ON T-SQL is still atomic, so the finding does not
+    // rest on the caller's setting.
+    assert!(!atom
         .assumptions
         .contains(&"ASM-TSQL-CALLER-XACT-ABORT-OFF".to_string()));
     // Every write is paired across dialects, and the converted side has no residue.

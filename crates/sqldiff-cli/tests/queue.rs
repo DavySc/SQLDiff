@@ -72,13 +72,13 @@ fn ledger_comment_and_link() {
         &a,
         &b,
         "--finding",
-        "06ccfd05e423182d",
+        "aacde30caae50448",
         "--gui-url",
         "http://h:9/",
     ]);
     assert_eq!(code, 0);
     assert!(link.starts_with("http://h:9/?a="), "{link}");
-    assert!(link.trim_end().ends_with("#f=06ccfd05e423182d"));
+    assert!(link.trim_end().ends_with("#f=aacde30caae50448"));
     let (code, _) = sqldiff(&["open", &a, &b, "--finding", "nope"]);
     assert_eq!(code, 2);
 }

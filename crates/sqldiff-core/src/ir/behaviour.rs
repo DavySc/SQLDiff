@@ -454,17 +454,39 @@ struct Collector<'x, 'a> {
 }
 
 impl Collector<'_, '_> {
-    fn run(&mut self, sc: Kind, scen_a: Scenario, scen_b: Scenario) {
-        let mut pa = explore(&self.sa.cfg, &scen_a);
-        let mut pb = explore(&self.sb.cfg, &scen_b);
-        if let Kind::Fault { key, .. } = &sc {
+    fn outcomes(
+        &self,
+        sc: &Kind,
+        scen_a: &Scenario,
+        scen_b: &Scenario,
+    ) -> (Vec<Outcome>, Vec<Outcome>) {
+        let mut pa = explore(&self.sa.cfg, scen_a);
+        let mut pb = explore(&self.sb.cfg, scen_b);
+        if let Kind::Fault { key, .. } = sc {
             // Only paths that reach the failing statement belong to the scenario.
             let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key);
             pa.retain(reached);
             pb.retain(reached);
-            if pa.is_empty() || pb.is_empty() {
-                return;
-            }
+        }
+        (pa, pb)
+    }
+
+    /// Whether a divergence still shows with a default setting flipped; if
+    /// so, the finding does not rest on the assumption behind that default.
+    fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
+        let (pa, pb) = self.outcomes(sc, scen_a, scen_b);
+        let (ps, _) = pairs(&pa, &pb);
+        ps.iter().any(|(oa, ob)| {
+            diff(&self.sa, &self.sb, sc, oa, ob)
+                .iter()
+                .any(|x| x.rule == d.rule && x.anchor == d.anchor)
+        })
+    }
+
+    fn run(&mut self, sc: Kind, scen_a: Scenario, scen_b: Scenario) {
+        let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
+        if pa.is_empty() || pb.is_empty() {
+            return;
         }
         let (ps, exact) = pairs(&pa, &pb);
         let combos = ps.len();
@@ -518,6 +540,23 @@ impl Collector<'_, '_> {
             if matches!(sc, Kind::CallerTxn) {
                 ids.insert(0, "ASM-NO-CALLER-TXN".to_string());
                 ids.dedup();
+            } else {
+                for id in ["ASM-NO-CALLER-TXN", "ASM-TSQL-CALLER-XACT-ABORT-OFF"] {
+                    if !ids.iter().any(|x| x == id) {
+                        continue;
+                    }
+                    let (mut fa, mut fb) = (scen_a.clone(), scen_b.clone());
+                    for s in [&mut fa, &mut fb] {
+                        if id == "ASM-NO-CALLER-TXN" {
+                            s.caller_txn = true;
+                        } else {
+                            s.xact_abort = true;
+                        }
+                    }
+                    if self.persists(&sc, &fa, &fb, &d) {
+                        ids.retain(|x| x != id);
+                    }
+                }
             }
             let mut text = format!(
                 "{}, {}.",
@@ -565,14 +604,23 @@ impl Collector<'_, '_> {
                     .unwrap_or_default()
             };
             let class = d.class;
-            self.out.push(Finding {
-                fingerprint: fingerprint(&FingerprintInput {
+            // Same anchors as the syntactic checks had, so stored review
+            // decisions keep matching; the effect key only splits a collision.
+            let print = |key: &str| {
+                fingerprint(&FingerprintInput {
                     object: &self.sa.a.object,
                     class,
                     rule: d.rule,
-                    anchor_a: &format!("{}|{}", d.anchor, anchor_text(&la)),
-                    anchor_b: &format!("{}|{}", d.anchor, anchor_text(&lb)),
-                }),
+                    anchor_a: &format!("{key}{}", anchor_text(&la)),
+                    anchor_b: &format!("{key}{}", anchor_text(&lb)),
+                })
+            };
+            let mut fp = print("");
+            if self.out.iter().any(|f| f.fingerprint == fp) {
+                fp = print(&format!("{}|", d.anchor));
+            }
+            self.out.push(Finding {
+                fingerprint: fp,
                 rule: d.rule.to_string(),
                 class,
                 severity: d.severity,
