@@ -129,13 +129,16 @@ aside { border-left: 1px solid var(--line); background: var(--bg); overflow: aut
 .finding.focus::before { background: var(--fc); }
 .finding .head { display: flex; gap: 7px; align-items: center; font-size: 12px; color: var(--muted); }
 .finding .cls { font-weight: 600; color: var(--fg); text-transform: capitalize; }
-.finding .rule { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; }
+.finding .at { font-family: var(--mono); font-size: 11px; color: var(--faint); margin-left: auto; white-space: nowrap; }
 .finding p { margin: 3px 0 0; font-size: 13px; color: var(--fg); }
 .finding:not(.focus) p { color: color-mix(in srgb, var(--fg) 78%, var(--bg)); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .finding:not(.focus) .meta, .finding:not(.focus) .racts, .finding:not(.focus) textarea { display: none; }
-.finding .meta { margin-top: 8px; font-size: 11.5px; color: var(--muted); display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 2px 8px; }
-.finding .meta .k { color: var(--faint); }
-.finding .meta abbr { text-decoration: underline dotted; cursor: help; }
+.finding .meta { margin-top: 8px; font-size: 11px; color: var(--faint); display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: center; }
+.finding .meta button { font-size: 11px; padding: 0 6px; margin-left: auto; }
+.finding .assumes { margin-top: 8px; font-size: 12px; color: var(--muted); }
+.finding .assumes .k { color: var(--faint); font-size: 11px; }
+.finding .assumes ul { margin: 2px 0 0; padding-left: 16px; }
+.finding:not(.focus) .assumes { display: none; }
 .finding .loc { font-family: var(--mono); font-size: 11px; }
 .finding .racts { display: flex; gap: 0; margin: 10px 0 0 -8px; flex-wrap: wrap; }
 .finding .racts kbd { margin-left: 2px; }
@@ -145,7 +148,14 @@ aside { border-left: 1px solid var(--line); background: var(--bg); overflow: aut
 .finding .dec { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
 .finding textarea { width: 100%; margin-top: 8px; font: 12.5px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; outline: none; }
 .finding textarea:focus { border-color: var(--focus); }
-.finding.accepted:not(.focus) { opacity: .55; }
+.finding.done:not(.focus) { opacity: .6; }
+.finding.done:not(.focus) p { -webkit-line-clamp: 1; }
+.row.hover:not(.focus) { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--focus) 45%, transparent); }
+.sh .progress { margin-left: auto; display: inline-flex; gap: 8px; align-items: center; font-size: 11.5px; color: var(--faint); }
+.sh .progress .bar { width: 56px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.sh .progress .bar i { display: block; height: 100%; background: var(--str); transition: width .2s; }
+.all-done { margin: 4px 14px 12px; padding: 12px; border-radius: 8px; background: color-mix(in srgb, var(--add-bg) 60%, transparent); color: var(--str); font-size: 13px; font-weight: 500; display: flex; align-items: center; justify-content: space-between; }
+details.sec[data-sec="done"] .finding:first-child { border-top: 0; }
 .empty-note { margin: 4px 16px 12px; color: var(--muted); font-size: 12.5px; }
 
 /* Secondary sections: progressive disclosure. */
@@ -343,9 +353,15 @@ async function setReview(i, st, comment) {
   if (!state.live) return;
   const f = state.data.report.findings[i];
   try {
+    // Triage flow: deciding the focused finding moves on to the next open one.
+    const open = orderedFindings().open.map(({ i: k }) => k);
+    const at = open.indexOf(i);
+    const next = (st === "accepted" || st === "rejected") && state.focus === i && at >= 0 ? (open[at + 1] ?? open[at - 1] ?? -1) : null;
     applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot: state.data.snapshot, state: st, comment: comment == null ? null : comment }));
     state.commenting = -1;
+    if (next != null) state.focus = next;
     renderSide(); renderPane(); renderHeader();
+    if (next != null && next >= 0) focusFinding(next, true);
     flash(st ? st : "cleared");
   } catch (e) { flash("error: " + e.message); }
 }
@@ -567,9 +583,17 @@ function showQueue() {
 }
 
 // ---------- pair view ----------
-function visibleFindings() {
-  return state.data.report.findings.map((f, i) => ({ f, i })).filter(({ f }) => !state.hidden.has(f.class) && !(state.hideAccepted && isAccepted(f)));
+// Accepted or rejected on the current snapshot: off the to-do list. A comment alone keeps it open.
+function isDone(f) {
+  const x = decision(f.fingerprint, state.data.snapshot);
+  return !!(x && x.current && (x.d.state === "accepted" || x.d.state === "rejected"));
 }
+function orderedFindings() {
+  const all = state.data.report.findings.map((f, i) => ({ f, i })).filter(({ f }) => !state.hidden.has(f.class) && !(state.hideAccepted && isAccepted(f)));
+  return { open: all.filter(({ f }) => !isDone(f)), done: all.filter(({ f }) => isDone(f)) };
+}
+// In list order: open findings first, then reviewed ones.
+function visibleFindings() { const { open, done } = orderedFindings(); return [...open, ...done]; }
 
 function renderNav() {
   const multi = state.page.queue.length > 1;
@@ -714,47 +738,51 @@ function gotoRow(k) {
 function locText(l) { return l ? `${l.side.toUpperCase()} ${l.start_line}:${l.start_col}` : ""; }
 
 function findingCard(f, i, asm) {
-  const as = f.assumptions.map((id) => `<abbr title="${esc(asm[id] ? asm[id].text : id)}">${esc(id)}</abbr>`).join(", ");
   const x = decision(f.fingerprint, state.data.snapshot);
   const cur = x && x.current ? x.d.state : null;
-  const tag = x ? `<span class="tag ${x.current ? esc(x.d.state) : ""}" title="${x.current ? "" : "Decided on an earlier snapshot"}">${esc(cap(x.d.state))}${x.current ? "" : " (earlier)"}</span>` : "";
-  const dec = x ? `<div class="dec">${esc(cap(x.d.state))}${x.current ? "" : " on an earlier snapshot"} · ${esc(x.d.at.replace("T", " ").replace("Z", ""))}${x.d.comment ? ` · “${esc(x.d.comment)}”` : ""}</div>` : "";
+  const mark = { accepted: "✓ Accepted", rejected: "✕ Rejected", commented: "Commented" };
+  const tag = x ? `<span class="tag ${x.current ? esc(x.d.state) : ""}" title="${x.current ? "" : "Decided on an earlier snapshot"}">${esc(mark[x.d.state] || cap(x.d.state))}${x.current ? "" : " (earlier)"}</span>` : "";
+  const dec = x && (x.d.comment || !x.current) ? `<div class="dec">${x.current ? "" : `${esc(cap(x.d.state))} on an earlier snapshot · `}${x.d.comment ? `“${esc(x.d.comment)}”` : ""}</div>` : "";
   const dis = state.live ? "" : "disabled";
   const acts = `<div class="racts">
-      <button data-rv="accepted" class="outline" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept">Accept <kbd>a</kbd></button>
-      <button data-rv="rejected" ${dis} aria-pressed="${cur === "rejected"}" title="Needs a fix: reject">Reject <kbd>x</kbd></button>
+      <button data-rv="accepted" class="outline" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept and go to the next open finding">Accept <kbd>a</kbd></button>
+      <button data-rv="rejected" ${dis} aria-pressed="${cur === "rejected"}" title="Needs a fix: reject and go to the next open finding">Reject <kbd>x</kbd></button>
       <button data-rv="comment" ${dis} title="Comment">Comment <kbd>m</kbd></button>
-      <button data-copy="${i}" title="Copy as text (y)">Copy</button>
-      ${x && x.current ? `<button data-rv="clear" ${dis}>Clear</button>` : ""}
+      ${x && x.current ? `<button data-rv="clear" ${dis} title="Undo the decision">Undo</button>` : ""}
     </div>`;
   const box = state.commenting === i ? `<textarea id="cmt-${i}" rows="2" placeholder="Comment, Ctrl+Enter to save">${esc(x && x.current && x.d.comment || "")}</textarea>` : "";
-  const loc = [locText(f.a), locText(f.b)].filter(Boolean).join(" ↔ ");
-  return `<div class="finding ${state.focus === i ? "focus" : ""} ${cur === "accepted" ? "accepted" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
-      <div class="head"><span class="dot" style="background:var(--fc)"></span><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)}</span>${tag}<span class="rule" title="${esc(f.rule)}">${esc(f.rule)}</span></div>
+  // Where it is, in the short form shown on the right of every item.
+  const at = [f.a, f.b].filter(Boolean).map((l) => `${l.side.toUpperCase()} ${l.start_line}`).join(" · ");
+  const assumes = f.assumptions.map((id) => `<li title="${esc(id)}">${esc(asm[id] && asm[id].text ? asm[id].text : id)}</li>`).join("");
+  return `<div class="finding ${state.focus === i ? "focus" : ""} ${cur === "accepted" || cur === "rejected" ? "done" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
+      <div class="head"><span class="dot" style="background:var(--fc)"></span><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)}</span>${tag}<span class="at">${esc(at)}</span></div>
       <p>${esc(f.witness)}</p>
-      <div class="meta">
-        ${loc ? `<span class="k">Where</span><span class="loc">${esc(loc)}</span>` : ""}
-        <span class="k">Verdict</span><span>${esc(label(f.verdict))}</span>
-        ${as ? `<span class="k">Assumes</span><span>${as}</span>` : ""}
-        <span class="k">ID</span><span class="loc">${esc(f.fingerprint)}</span>
-      </div>
+      ${assumes ? `<div class="assumes"><span class="k">Holds only if</span><ul>${assumes}</ul></div>` : ""}
       ${dec}${acts}${box}
+      <div class="meta"><span class="loc" title="Rule">${esc(f.rule)}</span><span class="loc" title="Fingerprint">${esc(f.fingerprint)}</span><span>${esc(label(f.verdict))}</span><button data-copy="${i}" title="Copy as text (y)">Copy</button></div>
     </div>`;
 }
 
 function renderSide() {
   const r = state.data.report;
-  const fs = visibleFindings();
+  const { open, done } = orderedFindings();
+  const fs = [...open, ...done];
   const asm = Object.fromEntries(r.assumptions.map((a) => [a.id, a]));
   const counts = {};
   for (const f of r.findings) counts[f.class] = (counts[f.class] || 0) + 1;
   const classes = CLASS_ORDER.filter((c) => counts[c]);
-  const parts = [`<div class="sh"><h2>Findings<span class="n">${fs.length === r.findings.length ? r.findings.length : `${fs.length} of ${r.findings.length}`}</span></h2></div>`];
+  const reviewed = r.findings.filter(isDone).length;
+  const n = r.findings.length;
+  const parts = [`<div class="sh"><h2>Findings<span class="n">${fs.length === n ? n : `${fs.length} of ${n}`}</span></h2>${n ? `<span class="progress" title="${reviewed} of ${n} accepted or rejected"><span class="bar"><i style="width:${Math.round(100 * reviewed / n)}%"></i></span>${reviewed}/${n} reviewed</span>` : ""}</div>`];
   // Class filter only earns its space when there is more than one class to tell apart.
   if (classes.length > 1 || state.hidden.size) parts.push(`<div id="classes">${classes.map((c) =>
     `<button class="chip ${state.hidden.has(c) ? "off" : ""}" data-cls="${c}" title="Show or hide ${c} findings"><span class="dot" style="background:${clsColor(c)}"></span>${c} ${counts[c]}</button>`).join("")}</div>`);
-  if (!fs.length) parts.push(`<p class="empty-note">${r.findings.length ? "All findings are hidden by the filters." : "No findings. Nothing to review here."}</p>`);
-  for (const { f, i } of fs) parts.push(findingCard(f, i, asm));
+  if (!n) parts.push(`<p class="empty-note">No findings. Nothing to review here.</p>`);
+  else if (!open.length && done.length) parts.push(`<p class="all-done">✓ All findings reviewed${state.page.queue.length > 1 ? ` <button id="btn-nextpair2">Next pair ›</button>` : ""}</p>`);
+  else if (!fs.length) parts.push(`<p class="empty-note">All findings are hidden by the filters.</p>`);
+  for (const { f, i } of open) parts.push(findingCard(f, i, asm));
+  // Reviewed findings drop out of the way, like a done column.
+  if (done.length) parts.push(section("done", "Reviewed", done.length, done.map(({ f, i }) => findingCard(f, i, asm)).join("")));
   // Secondary detail is folded away; assumptions start open because they can change the verdict.
   const used = new Set([...r.assumptions.map((a) => a.id), ...r.findings.flatMap((f) => f.assumptions)]);
   const rows = state.page.session.assumptions.filter((a) => used.has(a.id) || a.pairs.includes(state.cur));
@@ -767,6 +795,12 @@ function renderSide() {
   for (const b of $("side").querySelectorAll("button[data-cls]")) b.onclick = () => toggleClass(b.dataset.cls);
   for (const el of $("side").querySelectorAll(".finding")) el.onclick = (e) => { if (!e.target.closest("button,textarea,abbr")) focusFinding(+el.dataset.i, true); };
   for (const el of $("side").querySelectorAll("button[data-copy]")) el.onclick = () => copyFinding(+el.dataset.copy);
+  // Hovering an item shows its rows in the diff.
+  for (const el of $("side").querySelectorAll(".finding")) {
+    el.onmouseenter = () => { for (const k of rowsOf(+el.dataset.i)) { const row = $("row-" + k); if (row) row.classList.add("hover"); } };
+    el.onmouseleave = () => { for (const row of $("pane").querySelectorAll(".row.hover")) row.classList.remove("hover"); };
+  }
+  if ($("btn-nextpair2")) $("btn-nextpair2").onclick = () => stepPair(1);
   for (const el of $("side").querySelectorAll("button[data-rv]")) {
     el.onclick = () => {
       const i = +el.closest(".finding").dataset.i;
@@ -826,6 +860,7 @@ function ensureRowVisible(k) {
 
 function focusFinding(i, scroll) {
   state.focus = i;
+  if (isDone(state.data.report.findings[i]) && !state.open.has("done")) { state.open.add("done"); renderSide(); }
   history.replaceState(null, "", "#p=" + state.cur + "&f=" + state.data.report.findings[i].fingerprint);
   const rows = rowsOf(i);
   rows.forEach(ensureRowVisible);
