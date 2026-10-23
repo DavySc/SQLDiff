@@ -380,6 +380,7 @@ name = "sqldiff-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "serde",
  "serde_json",
  "sqldiff-core",
  "sqldiff-source",
@@ -413,8 +414,11 @@ dependencies = [
 name = "sqldiff-mcp"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "serde",
  "serde_json",
  "sqldiff-core",
+ "sqldiff-source",
 ]
 
 [[package]]

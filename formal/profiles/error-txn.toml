@@ -1,0 +1,1030 @@
+# Error and transaction profile tables (design doc section 7), in a form the
+# TLA+ model checks.  gen_cases.py turns this file into ProfileCases.tla.
+#
+# [[cell]]  one cell of the section 7 tables: a row for one dialect.
+#   status = "modelled"      at least one case must cover it
+#            "not-modelled"  outside this model; `reason` says why
+#            "n/a"           the dialect has no such feature
+#   facts lists the section 13 fact ids the claim rests on (see
+#   docs/vendor-facts-verification.md).
+#
+# [[case]]  a routine, its settings, a fault plan and the expected outcome.
+#   dialect                tsql | postgres | db2i
+#   xact_abort             T-SQL SET XACT_ABORT (default false)
+#   implicit_transactions  T-SQL SET IMPLICIT_TRANSACTIONS (default false)
+#   commit                 Db2 for i commit level, "NONE" or "CHG" (required for db2i)
+#   caller_txn             the caller has an open transaction with its own
+#                          pending work (tag "caller").  PostgreSQL: true means
+#                          CALL inside a transaction block or from a function;
+#                          false means a top-level CALL.
+#   verified               false when the expected outcome rests on a fact
+#                          that is not verified on a real system
+#   faults                 write tag -> stmt | batch | uncatchable | notfound
+#   expect                 durable, open, raised, aborted, code, tc, doomed
+#                          (tc defaults to the entry trancount, the rest to
+#                          empty / false / 0)
+#
+# Program syntax, one statement per line, `#` starts a comment:
+#   write T [rows=2] [notatomic]      DML writing tag T (rows=2 gives T.1, T.2;
+#                                     a fault fails the second row)
+#   begin | commit | rollback         transaction control
+#   savepoint S | rollback-to S
+#   throw | raiserror                 T-SQL raising
+#   raise | notice                    PL/pgSQL RAISE EXCEPTION / RAISE NOTICE
+#   signal                            SQL PL SIGNAL
+#   on-error [rollback] return N      T-SQL IF @@ERROR <> 0 ...; SQL PL a handler
+#                                     flag or SQLSTATE check
+#   on-notfound return N              @@ROWCOUNT = 0, NOT FOUND, SQLSTATE 02000
+#   return N
+#   try { ... } catch { ... }                         T-SQL
+#   begin-exception { ... } when-others { ... }       PL/pgSQL
+#   compound [atomic] [continue|exit|undo] { ... } [handler { ... }]   SQL PL
+# Braces close on their own line: "} catch {", "} handler {", "}".
+
+# ---------------------------------------------------------------- error table
+
+[[cell]]
+id = "error.after-runtime-error.tsql"
+claim = "Often statement-only; some errors abort the batch"
+facts = ["V10"]
+status = "modelled"
+
+[[cell]]
+id = "error.after-runtime-error.postgres"
+claim = "Whole transaction block doomed until rollback or savepoint, unless an exception block catches it"
+status = "modelled"
+
+[[cell]]
+id = "error.after-runtime-error.db2i"
+claim = "Unhandled exits the routine; warnings and not-found continue"
+status = "modelled"
+
+[[cell]]
+id = "error.session-switch.tsql"
+claim = "XACT_ABORT"
+facts = ["V10"]
+status = "modelled"
+
+[[cell]]
+id = "error.session-switch.postgres"
+claim = "none"
+status = "n/a"
+
+[[cell]]
+id = "error.session-switch.db2i"
+claim = "none"
+status = "n/a"
+
+[[cell]]
+id = "error.structured-handling.tsql"
+claim = "TRY/CATCH (severity 11-19)"
+facts = ["V10"]
+status = "modelled"
+
+[[cell]]
+id = "error.structured-handling.postgres"
+claim = "BEGIN ... EXCEPTION WHEN (subtransaction)"
+facts = ["V18"]
+status = "modelled"
+
+[[cell]]
+id = "error.structured-handling.db2i"
+claim = "CONTINUE / EXIT / UNDO handlers (UNDO only in ATOMIC)"
+facts = ["V4"]
+status = "modelled"
+
+[[cell]]
+id = "error.status-checks.tsql"
+claim = "@@ERROR, RETURN codes, XACT_STATE()"
+facts = ["V11"]
+status = "modelled"
+
+[[cell]]
+id = "error.status-checks.postgres"
+claim = "FOUND, GET [STACKED] DIAGNOSTICS"
+status = "modelled"
+
+[[cell]]
+id = "error.status-checks.db2i"
+claim = "SQLSTATE / SQLCODE, GET DIAGNOSTICS"
+status = "modelled"
+
+[[cell]]
+id = "error.raising.tsql"
+claim = "THROW (honours XACT_ABORT), RAISERROR"
+facts = ["V10"]
+status = "modelled"
+
+[[cell]]
+id = "error.raising.postgres"
+claim = "RAISE EXCEPTION; notices do not affect flow"
+status = "modelled"
+
+[[cell]]
+id = "error.raising.db2i"
+claim = "SIGNAL / RESIGNAL"
+status = "modelled"
+
+[[cell]]
+id = "error.unterminated-statement.tsql"
+claim = "THROW or ROLLBACK can be read as part of the previous statement"
+status = "not-modelled"
+reason = "Lexical: decided by the parser and the early checks, not by run-time semantics."
+
+[[cell]]
+id = "error.unterminated-statement.postgres"
+claim = "n/a"
+status = "n/a"
+
+[[cell]]
+id = "error.unterminated-statement.db2i"
+claim = "n/a"
+status = "n/a"
+
+# ---------------------------------------------------------- transaction table
+
+[[cell]]
+id = "txn.default-mode.tsql"
+claim = "Autocommit / IMPLICIT_TRANSACTIONS"
+status = "modelled"
+
+[[cell]]
+id = "txn.default-mode.postgres"
+claim = "Function: caller's transaction; procedure may commit under conditions"
+facts = ["V17"]
+status = "modelled"
+
+[[cell]]
+id = "txn.default-mode.db2i"
+claim = "Commitment control level; *NONE means no transaction"
+facts = ["V5"]
+status = "modelled"
+
+[[cell]]
+id = "txn.nesting.tsql"
+claim = "@@TRANCOUNT; bare ROLLBACK ends the outermost"
+status = "modelled"
+
+[[cell]]
+id = "txn.nesting.postgres"
+claim = "none"
+facts = ["V17"]
+status = "modelled"
+
+[[cell]]
+id = "txn.nesting.db2i"
+claim = "none; COMMIT/ROLLBACK end the unit of work"
+facts = ["V6"]
+status = "modelled"
+
+[[cell]]
+id = "txn.savepoints.tsql"
+claim = "SAVE TRAN"
+status = "modelled"
+
+[[cell]]
+id = "txn.savepoints.postgres"
+claim = "SAVEPOINT, implicit in exception blocks"
+status = "modelled"
+
+[[cell]]
+id = "txn.savepoints.db2i"
+claim = "SAVEPOINT (needs commitment control); ATOMIC acts as an implicit savepoint (verify under *NONE)"
+facts = ["V4", "V14"]
+status = "modelled"
+
+[[cell]]
+id = "txn.commit-scope.tsql"
+claim = "session"
+status = "modelled"
+
+[[cell]]
+id = "txn.commit-scope.postgres"
+claim = "session"
+status = "modelled"
+
+[[cell]]
+id = "txn.commit-scope.db2i"
+claim = "commitment definition, scoped to the activation group (ACTGRP(*CALLER))"
+facts = ["V6"]
+status = "modelled"
+
+[[cell]]
+id = "txn.prerequisite.tsql"
+claim = "none"
+status = "n/a"
+
+[[cell]]
+id = "txn.prerequisite.postgres"
+claim = "none"
+status = "n/a"
+
+[[cell]]
+id = "txn.prerequisite.db2i"
+claim = "tables journaled"
+status = "not-modelled"
+reason = "Catalog fact checked by binding, not run-time behaviour."
+
+[[cell]]
+id = "txn.survives-rollback.tsql"
+claim = "table variables, identity values"
+facts = ["V16"]
+status = "not-modelled"
+reason = "Non-transactional state (table variables, identity, sequences) is part of the WP3 state model; follow-up for this spec."
+
+[[cell]]
+id = "txn.survives-rollback.postgres"
+claim = "sequence values"
+status = "not-modelled"
+reason = "Non-transactional state is part of the WP3 state model; follow-up for this spec."
+
+[[cell]]
+id = "txn.survives-rollback.db2i"
+claim = "identity/sequence; everything under *NONE"
+facts = ["V7", "V16"]
+status = "modelled"
+
+[[cell]]
+id = "txn.ddl.tsql"
+claim = "transactional in most cases"
+status = "not-modelled"
+reason = "DDL is not in the abstract statement set."
+
+[[cell]]
+id = "txn.ddl.postgres"
+claim = "transactional"
+status = "not-modelled"
+reason = "DDL is not in the abstract statement set."
+
+[[cell]]
+id = "txn.ddl.db2i"
+claim = "verify"
+status = "not-modelled"
+reason = "DDL is not in the abstract statement set; the fact is open."
+
+# ----------------------------------------------------------------- atomicity
+
+[[cell]]
+id = "atomicity.statement.tsql"
+claim = "Single statements are atomic"
+status = "modelled"
+
+[[cell]]
+id = "atomicity.statement.postgres"
+claim = "Single statements are atomic"
+status = "modelled"
+
+[[cell]]
+id = "atomicity.statement.db2i"
+claim = "Atomic only under commitment control; MERGE NOT ATOMIC keeps earlier rows"
+facts = ["V2"]
+status = "modelled"
+
+[[cell]]
+id = "atomicity.routine.tsql"
+claim = "Routine bodies are not atomic"
+status = "modelled"
+
+[[cell]]
+id = "atomicity.routine.postgres"
+claim = "Part of the caller's transaction"
+status = "modelled"
+
+[[cell]]
+id = "atomicity.routine.db2i"
+claim = "Not atomic unless ATOMIC or commitment control applies"
+facts = ["V4"]
+status = "modelled"
+
+# ===================================================================== cases
+# ------------------------------------------------------------------- T-SQL
+
+[[case]]
+id = "tsql-stmt-error-continues"
+covers = ["error.after-runtime-error.tsql"]
+dialect = "tsql"
+faults = { b = "stmt" }
+program = """
+begin
+write a
+write b
+write c
+commit
+"""
+expect = { durable = ["a", "c"], raised = true }
+
+[[case]]
+id = "tsql-batch-abort-error"
+covers = ["error.after-runtime-error.tsql"]
+dialect = "tsql"
+faults = { b = "batch" }
+program = """
+begin
+write a
+write b
+write c
+commit
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "tsql-xact-abort-on-rolls-back"
+covers = ["error.session-switch.tsql"]
+dialect = "tsql"
+xact_abort = true
+faults = { b = "stmt" }
+program = """
+begin
+write a
+write b
+write c
+commit
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "tsql-xact-abort-autocommit"
+covers = ["error.session-switch.tsql", "txn.default-mode.tsql", "atomicity.routine.tsql"]
+dialect = "tsql"
+xact_abort = true
+faults = { b = "stmt" }
+program = """
+write a
+write b
+write c
+"""
+expect = { durable = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "tsql-try-catch-rollback"
+covers = ["error.structured-handling.tsql"]
+dialect = "tsql"
+faults = { b = "stmt" }
+program = """
+try {
+  begin
+  write a
+  write b
+  write c
+  commit
+} catch {
+  rollback
+  return 5
+}
+"""
+expect = { code = 5 }
+
+[[case]]
+id = "tsql-try-uncatchable"
+covers = ["error.structured-handling.tsql"]
+dialect = "tsql"
+faults = { b = "uncatchable" }
+program = """
+try {
+  write a
+  write b
+} catch {
+  write h
+}
+"""
+expect = { durable = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "tsql-xact-abort-catch-is-uncommittable"
+covers = ["error.structured-handling.tsql", "error.status-checks.tsql"]
+dialect = "tsql"
+xact_abort = true
+faults = { b = "stmt" }
+program = """
+begin
+try {
+  write a
+  write b
+} catch {
+  write h
+}
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "tsql-xact-abort-catch-rollback"
+covers = ["error.structured-handling.tsql"]
+dialect = "tsql"
+xact_abort = true
+faults = { b = "stmt" }
+program = """
+begin
+try {
+  write a
+  write b
+} catch {
+  rollback
+  return 3
+}
+"""
+expect = { code = 3 }
+
+[[case]]
+id = "tsql-worked-example"
+covers = ["error.status-checks.tsql"]
+dialect = "tsql"
+faults = { log = "stmt" }
+program = """
+begin
+write stock
+on-error rollback return 1
+write log
+on-error rollback return 2
+commit
+return 0
+"""
+expect = { code = 2, raised = true }
+
+[[case]]
+id = "tsql-worked-example-xact-abort"
+covers = ["error.session-switch.tsql"]
+dialect = "tsql"
+xact_abort = true
+faults = { log = "stmt" }
+program = """
+begin
+write stock
+on-error rollback return 1
+write log
+on-error rollback return 2
+commit
+return 0
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "tsql-worked-example-caller-txn"
+covers = ["txn.nesting.tsql", "txn.commit-scope.tsql"]
+dialect = "tsql"
+caller_txn = true
+program = """
+begin
+write stock
+on-error rollback return 1
+write log
+on-error rollback return 2
+commit
+return 0
+"""
+expect = { open = ["caller", "stock", "log"] }
+
+[[case]]
+id = "tsql-rowcount-check"
+covers = ["error.status-checks.tsql"]
+dialect = "tsql"
+faults = { a = "notfound" }
+program = """
+write a
+on-notfound return 3
+return 0
+"""
+expect = { code = 3 }
+
+[[case]]
+id = "tsql-throw-ends-batch"
+covers = ["error.raising.tsql"]
+dialect = "tsql"
+program = """
+begin
+write a
+throw
+write b
+"""
+expect = { open = ["a"], tc = 1, raised = true, aborted = true }
+
+[[case]]
+id = "tsql-throw-honours-xact-abort"
+covers = ["error.raising.tsql"]
+dialect = "tsql"
+xact_abort = true
+program = """
+begin
+write a
+throw
+write b
+commit
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "tsql-raiserror-ignores-xact-abort"
+covers = ["error.raising.tsql"]
+dialect = "tsql"
+xact_abort = true
+program = """
+begin
+write a
+raiserror
+write b
+commit
+"""
+expect = { durable = ["a", "b"], raised = true }
+
+[[case]]
+id = "tsql-implicit-transactions"
+covers = ["txn.default-mode.tsql"]
+dialect = "tsql"
+implicit_transactions = true
+faults = { b = "stmt" }
+program = """
+write a
+write b
+rollback
+"""
+expect = { raised = true }
+
+[[case]]
+id = "tsql-autocommit-rollback-fails"
+covers = ["txn.default-mode.tsql"]
+dialect = "tsql"
+faults = { b = "stmt" }
+program = """
+write a
+write b
+rollback
+"""
+expect = { durable = ["a"], raised = true }
+
+[[case]]
+id = "tsql-inner-rollback-ends-outer"
+covers = ["txn.nesting.tsql"]
+dialect = "tsql"
+caller_txn = true
+program = """
+begin
+write a
+rollback
+"""
+expect = { tc = 0, raised = true }
+
+[[case]]
+id = "tsql-save-tran"
+covers = ["txn.savepoints.tsql"]
+dialect = "tsql"
+program = """
+begin
+write a
+savepoint s
+write b
+rollback-to s
+write c
+commit
+"""
+expect = { durable = ["a", "c"] }
+
+[[case]]
+id = "tsql-save-tran-needs-transaction"
+covers = ["txn.savepoints.tsql"]
+dialect = "tsql"
+program = """
+write a
+savepoint s
+write b
+"""
+expect = { durable = ["a", "b"], raised = true }
+
+[[case]]
+id = "tsql-statement-atomic"
+covers = ["atomicity.statement.tsql"]
+dialect = "tsql"
+faults = { m = "stmt" }
+program = """
+begin
+write m rows=2
+commit
+"""
+expect = { raised = true }
+
+# -------------------------------------------------------------- PostgreSQL
+
+[[case]]
+id = "pg-error-dooms-caller-txn"
+covers = ["error.after-runtime-error.postgres", "txn.default-mode.postgres", "atomicity.routine.postgres", "txn.commit-scope.postgres"]
+dialect = "postgres"
+caller_txn = true
+faults = { b = "stmt" }
+program = """
+write a
+write b
+write c
+"""
+expect = { doomed = true, raised = true, aborted = true }
+
+[[case]]
+id = "pg-error-in-top-level-call"
+covers = ["error.after-runtime-error.postgres", "txn.default-mode.postgres"]
+dialect = "postgres"
+faults = { b = "stmt" }
+program = """
+write a
+commit
+write b
+write c
+"""
+expect = { durable = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "pg-commit-in-call"
+covers = ["txn.default-mode.postgres"]
+dialect = "postgres"
+program = """
+write a
+commit
+write b
+"""
+expect = { durable = ["a", "b"] }
+
+[[case]]
+id = "pg-commit-in-transaction-block-fails"
+covers = ["txn.default-mode.postgres", "txn.nesting.postgres", "txn.commit-scope.postgres"]
+dialect = "postgres"
+caller_txn = true
+program = """
+write a
+commit
+"""
+expect = { doomed = true, raised = true, aborted = true }
+
+[[case]]
+id = "pg-commit-in-exception-block-fails"
+covers = ["txn.default-mode.postgres"]
+dialect = "postgres"
+program = """
+write a
+begin-exception {
+  write b
+  commit
+} when-others {
+  write h
+}
+"""
+expect = { durable = ["a", "h"] }
+
+[[case]]
+id = "pg-exception-block-is-subtransaction"
+covers = ["error.structured-handling.postgres", "txn.savepoints.postgres", "error.after-runtime-error.postgres"]
+dialect = "postgres"
+faults = { c = "stmt" }
+program = """
+write a
+begin-exception {
+  write b
+  write c
+} when-others {
+  write h
+}
+write d
+"""
+expect = { durable = ["a", "h", "d"] }
+
+[[case]]
+id = "pg-others-skips-query-canceled"
+covers = ["error.structured-handling.postgres"]
+dialect = "postgres"
+faults = { b = "uncatchable" }
+program = """
+write a
+begin-exception {
+  write b
+} when-others {
+  write h
+}
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "pg-found-check"
+covers = ["error.status-checks.postgres"]
+dialect = "postgres"
+faults = { a = "notfound" }
+program = """
+write a
+on-notfound return 3
+write b
+"""
+expect = { code = 3 }
+
+[[case]]
+id = "pg-raise-exception"
+covers = ["error.raising.postgres"]
+dialect = "postgres"
+program = """
+write a
+raise
+write b
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "pg-notice-does-not-affect-flow"
+covers = ["error.raising.postgres"]
+dialect = "postgres"
+program = """
+write a
+notice
+write b
+"""
+expect = { durable = ["a", "b"] }
+
+[[case]]
+id = "pg-statement-atomic"
+covers = ["atomicity.statement.postgres"]
+dialect = "postgres"
+faults = { m = "stmt" }
+program = """
+write x
+begin-exception {
+  write m rows=2
+} when-others {
+}
+"""
+expect = { durable = ["x"] }
+
+# ------------------------------------------------------------- Db2 for i
+
+[[case]]
+id = "db2-unhandled-exits-leaves-pending"
+covers = ["error.after-runtime-error.db2i", "txn.default-mode.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt" }
+program = """
+write a
+write b
+write c
+"""
+expect = { open = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-unhandled-exits-none"
+covers = ["error.after-runtime-error.db2i", "atomicity.routine.db2i", "txn.survives-rollback.db2i"]
+dialect = "db2i"
+commit = "NONE"
+faults = { b = "stmt" }
+program = """
+write a
+write b
+write c
+"""
+expect = { durable = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-notfound-continues"
+covers = ["error.after-runtime-error.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { a = "notfound" }
+program = """
+write a
+write b
+"""
+expect = { open = ["b"] }
+
+[[case]]
+id = "db2-continue-handler"
+covers = ["error.structured-handling.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt" }
+program = """
+compound continue {
+  write a
+  write b
+  write c
+} handler {
+  write h
+}
+"""
+expect = { open = ["a", "h", "c"] }
+
+[[case]]
+id = "db2-exit-handler"
+covers = ["error.structured-handling.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt" }
+program = """
+compound exit {
+  write a
+  write b
+  write c
+} handler {
+  write h
+}
+write d
+"""
+expect = { open = ["a", "h", "d"] }
+
+[[case]]
+id = "db2-undo-handler"
+covers = ["error.structured-handling.db2i", "txn.savepoints.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt" }
+program = """
+compound atomic undo {
+  write a
+  write b
+  write c
+} handler {
+  write h
+}
+write d
+"""
+expect = { open = ["h", "d"] }
+
+[[case]]
+id = "db2-undo-handler-under-none"
+covers = ["error.structured-handling.db2i", "txn.savepoints.db2i"]
+dialect = "db2i"
+commit = "NONE"
+verified = false   # V4
+faults = { b = "stmt" }
+program = """
+compound atomic undo {
+  write a
+  write b
+  write c
+} handler {
+  write h
+}
+write d
+"""
+expect = { durable = ["a", "h", "d"] }
+
+[[case]]
+id = "db2-handler-error-goes-outward"
+covers = ["error.structured-handling.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt", h = "stmt" }
+program = """
+compound exit {
+  compound continue {
+    write a
+    write b
+    write c
+  } handler {
+    write h
+  }
+} handler {
+  write g
+}
+"""
+expect = { open = ["a", "g"] }
+
+[[case]]
+id = "db2-atomic-unhandled"
+covers = ["atomicity.routine.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt" }
+program = """
+write x
+compound atomic {
+  write a
+  write b
+}
+"""
+expect = { open = ["x"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-sqlstate-check"
+covers = ["error.status-checks.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { a = "stmt" }
+program = """
+compound continue {
+  write a
+  on-error return 4
+  write b
+} handler {
+}
+"""
+expect = { code = 4 }
+
+[[case]]
+id = "db2-notfound-check"
+covers = ["error.status-checks.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { a = "notfound" }
+program = """
+write a
+on-notfound return 3
+write b
+"""
+expect = { code = 3 }
+
+[[case]]
+id = "db2-signal"
+covers = ["error.raising.db2i"]
+dialect = "db2i"
+commit = "CHG"
+program = """
+write a
+signal
+write b
+"""
+expect = { open = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-none-has-no-transaction"
+covers = ["txn.default-mode.db2i", "txn.survives-rollback.db2i"]
+dialect = "db2i"
+commit = "NONE"
+program = """
+write a
+write b
+rollback
+"""
+expect = { durable = ["a", "b"] }
+
+[[case]]
+id = "db2-commit-ends-callers-unit-of-work"
+covers = ["txn.nesting.db2i", "txn.commit-scope.db2i"]
+dialect = "db2i"
+commit = "CHG"
+caller_txn = true
+program = """
+write a
+commit
+"""
+expect = { durable = ["caller", "a"] }
+
+[[case]]
+id = "db2-savepoint"
+covers = ["txn.savepoints.db2i"]
+dialect = "db2i"
+commit = "CHG"
+program = """
+write a
+savepoint s
+write b
+rollback-to s
+"""
+expect = { open = ["a"] }
+
+[[case]]
+id = "db2-savepoint-needs-commitment-control"
+covers = ["txn.savepoints.db2i"]
+dialect = "db2i"
+commit = "NONE"
+verified = false   # V14 is partial
+program = """
+write a
+savepoint s
+write b
+"""
+expect = { durable = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-statement-partial-under-none"
+covers = ["atomicity.statement.db2i"]
+dialect = "db2i"
+commit = "NONE"
+faults = { m = "stmt" }
+program = """
+write m rows=2
+"""
+expect = { durable = ["m.1"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-merge-not-atomic"
+covers = ["atomicity.statement.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { m = "stmt" }
+program = """
+write m rows=2 notatomic
+"""
+expect = { open = ["m.1"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-statement-atomic-under-commitment-control"
+covers = ["atomicity.statement.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { m = "stmt" }
+program = """
+write m rows=2
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "db2-worked-example"
+covers = ["error.after-runtime-error.db2i"]
+dialect = "db2i"
+commit = "NONE"
+faults = { log = "stmt" }
+program = """
+write stock
+write log
+"""
+expect = { durable = ["stock"], raised = true, aborted = true }

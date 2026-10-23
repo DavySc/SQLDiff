@@ -13,6 +13,7 @@ use sqldiff_source::protocol::ObjectFilter;
 use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
 
+mod queue_cmd;
 mod source_cmd;
 
 #[derive(Parser)]
@@ -105,6 +106,8 @@ enum Command {
     },
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
+    #[command(flatten)]
+    Queue(queue_cmd::QueueCommand),
 }
 
 /// Path with `/` separators, as `dialect_map` globs and pairing see it.
@@ -288,6 +291,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             &cfg.resolve()?,
         ),
         Command::Source(cmd) => source_cmd::run(cmd),
+        Command::Queue(cmd) => queue_cmd::run(cmd),
     }
 }
 
