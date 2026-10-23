@@ -13,8 +13,6 @@ use sqldiff_core::{diff, Artifact, Dialect, Options, Verdict};
 /// Expectations the engine does not reach yet: (case id, side a, side b).
 /// Each is still checked for soundness.
 const KNOWN_MISSES: &[(&str, &str, &str)] = &[
-    // Error handlers that write in the error path and UPDATE ... FROM are not lowered.
-    ("p10-temp-state-rollback", "tsql", "db2i"),
     // Named-lock idioms (sp_getapplock, advisory locks, row-lock emulation) are not lifted.
     ("p13-named-lock", "tsql", "pg"),
     ("p13-named-lock", "tsql", "db2i"),
@@ -25,12 +23,9 @@ const KNOWN_MISSES: &[(&str, &str, &str)] = &[
         "original",
         "mutated",
     ),
-    ("m07-exit-to-continue", "original", "mutated"),
-    ("m08-atomic-dropped", "original", "mutated"),
     ("m14-terminator-before-throw", "original", "mutated"),
     ("m15-dropped-column-reference", "original", "mutated"),
     ("m16-outdated-signature", "original", "mutated"),
-    ("m18-dialect-residue", "original", "mutated"),
 ];
 
 fn corpus() -> Option<PathBuf> {

@@ -180,6 +180,16 @@ struct Compiled {
 }
 
 impl Resolved {
+    /// Engine options from this configuration: excerpt cap and declared
+    /// facts (a declared Db2 for i commit level is used by the analysis).
+    pub fn options(&self) -> sqldiff_core::Options {
+        sqldiff_core::Options {
+            excerpt_lines: self.excerpt_lines,
+            declared: self.policy.assumptions.clone(),
+            ..sqldiff_core::Options::default()
+        }
+    }
+
     /// Built-in defaults only: what the core runs with when no pack is loaded.
     pub fn builtin() -> Resolved {
         Resolved::from_layers(Vec::new(), Vec::new()).expect("built-in config is valid")

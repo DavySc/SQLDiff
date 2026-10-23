@@ -65,9 +65,29 @@ pub enum TempState {
     Rows,
 }
 
+/// Where the injected fault sent control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Routed {
+    /// Into a handler (`try_catch`, `exception_block`, `exit_handler`, ...).
+    Handler {
+        construct: &'static str,
+        entry: NodeId,
+    },
+    /// On to the next statement (statement-level error, or no rows).
+    Next(NodeId),
+    /// Out of the routine with the error.
+    Exit,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub exit: Exit,
+    /// Statement nodes run, in order.
+    pub trace: Vec<NodeId>,
+    /// Index in `trace` of the statement the fault was injected into.
+    pub fault_index: Option<usize>,
+    /// Where the injected fault sent control.
+    pub fault_route: Option<Routed>,
     /// Fate of each durable effect that ran, by effect key. In
     /// caller-transaction scenarios the key `caller` stands for the caller's
     /// own pending work.
@@ -103,6 +123,39 @@ pub struct Outcome {
     /// Profile rows this path relied on.
     pub rows: BTreeSet<String>,
     pub assumptions: BTreeSet<String>,
+    /// Profile rows this path relied on that are marked unverified (not
+    /// tested on a real system): verdicts that depend on them are capped.
+    pub untested: BTreeSet<String>,
+}
+
+impl Outcome {
+    /// An outcome of a run that did nothing (for findings that need no run).
+    pub fn empty() -> Outcome {
+        Outcome {
+            exit: Exit::Normal,
+            trace: Vec::new(),
+            fault_index: None,
+            fault_route: None,
+            effects: BTreeMap::new(),
+            open: BTreeSet::new(),
+            partial: BTreeSet::new(),
+            effect_nodes: BTreeMap::new(),
+            before_fault: BTreeSet::new(),
+            faulted: None,
+            fault_hit: false,
+            temp_reads: BTreeSet::new(),
+            raised: false,
+            depth: 0,
+            left_open: false,
+            doomed: false,
+            signature: Vec::new(),
+            imprecise: Vec::new(),
+            durability_unknown: None,
+            rows: BTreeSet::new(),
+            assumptions: BTreeSet::new(),
+            untested: BTreeSet::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +222,10 @@ struct State {
     rows: BTreeSet<String>,
     assumptions: BTreeSet<String>,
     steps: usize,
+    trace: Vec<NodeId>,
+    fault_index: Option<usize>,
+    fault_route: Option<Routed>,
+    untested: BTreeSet<String>,
 }
 
 /// Pseudo-effect for the caller's pending work in caller-transaction scenarios.
@@ -259,6 +316,12 @@ impl Interp<'_> {
         if status != Status::Confirmed {
             st.assumptions.insert(row_assumption_id(fact, id));
         }
+        if status == Status::Unverified {
+            st.untested.insert(match fact {
+                Some(f) => format!("vendor fact {f} ({id})"),
+                None => format!("profile row {id}"),
+            });
+        }
     }
 
     fn initial(&self) -> State {
@@ -299,6 +362,10 @@ impl Interp<'_> {
             rows: BTreeSet::new(),
             assumptions: BTreeSet::new(),
             steps: 0,
+            trace: Vec::new(),
+            fault_index: None,
+            fault_route: None,
+            untested: BTreeSet::new(),
         };
         let key = format!(
             "{}.transactions.routine_mode.{}",
@@ -338,6 +405,10 @@ impl Interp<'_> {
                     .commit_level
                     .clone()
                     .or_else(|| sc.commit_level.clone());
+                if self.cfg.commit_level.is_none() && level.is_some() {
+                    // Declared in configuration, not stated by the routine.
+                    st.assumptions.insert("ASM-DB2-COMMIT-LEVEL".into());
+                }
                 match &level {
                     Some(l) if self.prof.is_no_commit_level(l) => {
                         st.no_commit = true;
@@ -508,11 +579,15 @@ impl Interp<'_> {
         let d = self.cfg.dialect;
         st.last_error = None;
         st.no_rows = None;
+        st.trace.push(id);
 
         // Injected fault.
         if !st.faults_done.contains(&id) {
             if let Some(f) = self.sc.faults.iter().find(|f| f.node == id) {
                 st.faults_done.insert(id);
+                if st.fault_index.is_none() {
+                    st.fault_index = Some(st.trace.len() - 1);
+                }
                 if st.before_fault.is_none() {
                     st.before_fault = Some(st.live.keys().cloned().collect());
                     st.faulted = s.durable_effect().map(|e| e.key.clone());
@@ -531,6 +606,9 @@ impl Interp<'_> {
                 if f.kind == ErrorKind::NotFound && !s.raises.contains(&ErrorKind::NotFound) {
                     // Not an error in this dialect: the statement touches no rows.
                     st.no_rows = Some(true);
+                    if st.fault_route.is_none() {
+                        st.fault_route = node.next(Edge::Next).map(Routed::Next);
+                    }
                     return self.next(id, st);
                 }
                 return self.fail(id, f.kind, st, None);
@@ -981,6 +1059,19 @@ impl Interp<'_> {
             }),
         }
         .cloned();
+        let first_fault = st.fault_index.is_some() && st.fault_route.is_none();
+        if first_fault {
+            st.fault_route = Some(
+                match (&route.handler, rule.as_ref().and_then(|r| r.control)) {
+                    (Some(h), _) => Routed::Handler {
+                        construct: h.construct,
+                        entry: h.entry,
+                    },
+                    (None, Some(super::profile::Control::Next)) => Routed::Next(route.resume),
+                    _ => Routed::Exit,
+                },
+            );
+        }
         let Some(rule) = rule else {
             st.imprecise.push(format!("no profile row for {kind:?}"));
             st.raising = Some(kind);
@@ -1142,6 +1233,9 @@ impl Interp<'_> {
         }
         Outcome {
             exit,
+            trace: st.trace,
+            fault_index: st.fault_index,
+            fault_route: st.fault_route,
             effects,
             open,
             partial: st.partial,
@@ -1159,6 +1253,7 @@ impl Interp<'_> {
             durability_unknown: st.durability_unknown,
             rows: st.rows,
             assumptions: st.assumptions,
+            untested: st.untested,
         }
     }
 }

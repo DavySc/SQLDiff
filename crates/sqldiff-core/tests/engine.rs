@@ -161,8 +161,14 @@ fn commit_level_change_is_transactional() {
     let a = "CREATE PROCEDURE p () LANGUAGE SQL SET OPTION COMMIT = *CHG\nBEGIN ATOMIC\n  UPDATE a SET x = 1;\n  UPDATE b SET y = 1;\nEND";
     let b = a.replace("*CHG", "*NONE");
     let r = run(a, Dialect::Db2i, &b, Dialect::Db2i);
-    assert_eq!(r.verdict, Verdict::Different);
+    // ATOMIC under *NONE rests on vendor fact V4, untested on a real IBM i:
+    // the witness is shown, the verdict capped (milestone M5b).
+    assert_eq!(r.verdict, Verdict::Unknown);
     assert!(rules(&r).contains(&"txn.atomicity"), "{:?}", rules(&r));
+    assert!(r
+        .findings
+        .iter()
+        .any(|f| f.rule == "txn.atomicity" && f.witness.contains("vendor fact V4")));
     assert!(r
         .findings
         .iter()

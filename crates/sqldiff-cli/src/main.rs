@@ -67,6 +67,8 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         catalog_b: Vec<PathBuf>,
         #[command(flatten)]
+        flips: queue_cmd::FlipArgs,
+        #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
     /// Lint one artifact: residue from other dialects, terminator hazards,
@@ -196,6 +198,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             catalog,
             catalog_a,
             catalog_b,
+            flips,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
@@ -219,8 +222,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
                 catalog_a: cat_a,
                 catalog_b: cat_b,
+                flips: flips.flips(),
+                ..cfg.options()
             };
-            let report = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
+            let report = with_policy(
+                sqldiff_core::ledger::evaluate(&a, &b, &opts),
+                &a,
+                Some(&b),
+                &cfg,
+            );
             emit(&report, format);
             Ok(exit_for(report.verdict))
         }

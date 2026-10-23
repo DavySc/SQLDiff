@@ -3,6 +3,9 @@
 //! `GET /` serves the page for the files as they are on disk now, so a
 //! browser refresh re-reads them. `POST /api/diff` with `{"a": "...", "b": "..."}`
 //! re-diffs scratchpad texts; nothing is ever written to a source.
+//! `GET /api/what_if?line=N&side=a&error=constraint` answers "what if this
+//! fails?" for a statement, and `GET /api/overlay` returns the transaction
+//! brackets of both sides (design §6.2), both on the files as on disk.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,6 +13,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use sqldiff_core::ir::ErrorKind;
+use sqldiff_core::model::Side;
 use sqldiff_core::{Artifact, Dialect, Options};
 
 use crate::{build, page};
@@ -88,8 +93,55 @@ fn handle(mut stream: TcpStream, pair: &Pair) -> std::io::Result<()> {
             }
         }
     }
-    let path = path.split('?').next().unwrap_or("");
+    let (path, query) = path.split_once('?').unwrap_or((path.as_str(), ""));
+    let param = |k: &str| {
+        query
+            .split('&')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(x, _)| *x == k)
+            .map(|(_, v)| v.to_string())
+    };
     let (status, ctype, body) = match (method.as_str(), path) {
+        ("GET", "/api/what_if") => {
+            let line = param("line").and_then(|l| l.parse::<usize>().ok());
+            let side = if param("side").as_deref() == Some("b") {
+                Side::B
+            } else {
+                Side::A
+            };
+            let kind = serde_json::from_value::<ErrorKind>(serde_json::Value::String(
+                param("error").unwrap_or_else(|| "constraint".into()),
+            ));
+            match (line, kind, pair.artifacts(None)) {
+                (Some(line), Ok(kind), Ok((a, b))) => (
+                    "200 OK",
+                    "application/json",
+                    serde_json::to_string(&sqldiff_core::what_if(
+                        &a,
+                        &b,
+                        &pair.options(),
+                        side,
+                        line,
+                        kind,
+                    ))
+                    .unwrap(),
+                ),
+                (_, _, Err(e)) => ("500 Internal Server Error", "text/plain", e),
+                _ => (
+                    "400 Bad Request",
+                    "text/plain",
+                    "give line=N, and optionally side=a|b and error=<kind>".to_string(),
+                ),
+            }
+        }
+        ("GET", "/api/overlay") => match pair.artifacts(None) {
+            Ok((a, b)) => (
+                "200 OK",
+                "application/json",
+                serde_json::to_string(&sqldiff_core::overlay(&a, &b)).unwrap(),
+            ),
+            Err(e) => ("500 Internal Server Error", "text/plain", e),
+        },
         ("GET", "/") => match pair.artifacts(None) {
             Ok((a, b)) => (
                 "200 OK",

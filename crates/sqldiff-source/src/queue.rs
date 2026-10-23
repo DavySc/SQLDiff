@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqldiff_core::model::{hex, AssumptionSource};
-use sqldiff_core::{ChangeClass, Options, Report, Severity, Verdict};
+use sqldiff_core::{ChangeClass, Report, Severity, Verdict};
 
 use crate::protocol::{Describe, ObjectFilter, Pair, PairScope};
 use crate::{pairing, policy, Resolved, Result, Source};
@@ -57,10 +57,7 @@ pub fn run(src: &dyn Source, cfg: &Resolved, scope: &PairScope) -> Result<Run> {
         p.pairs = adapter_pairs;
     }
     let info = |id: &str| objects.iter().find(|o| o.id == id);
-    let opts = Options {
-        excerpt_lines: cfg.excerpt_lines,
-        ..Options::default()
-    };
+    let opts = cfg.options();
     let mut pairs = Vec::new();
     for x in &p.pairs {
         let a = src.load_artifact(&x.a)?;
@@ -99,57 +96,23 @@ pub fn run(src: &dyn Source, cfg: &Resolved, scope: &PairScope) -> Result<Run> {
 /// assumption, `false` denies it.
 pub type Flips = BTreeMap<String, bool>;
 
-/// Verdict, assumption-flip and re-derivation helpers. These mirror
-/// `sqldiff_core::session` from the GUI work; once that lands, this module
-/// re-exports it instead.
+/// Verdict and assumption-flip helpers, from `sqldiff_core::ledger`.
 pub mod session {
     use super::*;
 
-    /// The verdict a report's findings, reasons and assumptions support.
-    pub fn derive_verdict(r: &Report) -> Verdict {
-        if r.findings.iter().any(|f| f.verdict == Verdict::Different) {
-            Verdict::Different
-        } else if r.findings.iter().any(|f| f.verdict == Verdict::Unknown)
-            || !r.unknown_reasons.is_empty()
-        {
-            Verdict::Unknown
-        } else if !r.assumptions.is_empty() {
-            Verdict::EqualUnderAssumptions
-        } else {
-            Verdict::Equal
-        }
-    }
+    pub use sqldiff_core::ledger::derive_verdict;
 
     /// The listed assumptions do not hold: every finding that relies on one
     /// drops to unknown, since its witness was only shown under it.
     pub fn deny_assumptions(r: &mut Report, ids: &[String]) {
-        let present: Vec<&String> = ids
-            .iter()
-            .filter(|id| r.assumptions.iter().any(|a| &a.id == *id))
-            .collect();
-        if present.is_empty() {
-            return;
-        }
-        for f in &mut r.findings {
-            if f.assumptions.iter().any(|a| ids.contains(a)) {
-                f.verdict = Verdict::Unknown;
-            }
-        }
-        for id in present {
-            r.unknown_reasons
-                .push(format!("assumption {id} is denied in this session"));
-        }
-        r.verdict = derive_verdict(r);
+        let flips: Flips = ids.iter().map(|id| (id.clone(), false)).collect();
+        sqldiff_core::ledger::relabel(r, &flips);
     }
 
     /// The listed assumptions are confirmed: they show as declared.
     pub fn confirm_assumptions(r: &mut Report, ids: &[String]) {
-        for a in &mut r.assumptions {
-            if ids.contains(&a.id) {
-                a.source = AssumptionSource::Declared;
-            }
-        }
-        r.verdict = derive_verdict(r);
+        let flips: Flips = ids.iter().map(|id| (id.clone(), true)).collect();
+        sqldiff_core::ledger::relabel(r, &flips);
     }
 }
 
@@ -160,12 +123,11 @@ pub fn view(raw: &Report, flips: &Flips) -> Report {
     r
 }
 
-/// Applies session flips to a report in place.
+/// Applies session flips to a report in place. Flips of scenario
+/// assumptions only take full effect when the pair is re-diffed with them
+/// (`Options::flips`); here they relabel like any other.
 pub fn apply(r: &mut Report, flips: &Flips) {
-    let (deny, confirm): (Vec<_>, Vec<_>) = flips.iter().partition(|(_, holds)| !**holds);
-    let ids = |v: Vec<(&String, &bool)>| v.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-    session::confirm_assumptions(r, &ids(confirm));
-    session::deny_assumptions(r, &ids(deny));
+    sqldiff_core::ledger::relabel(r, flips);
 }
 
 /// Where an assumption's status comes from.
