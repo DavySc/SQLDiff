@@ -211,7 +211,8 @@ fn accepted_findings_are_suppressed() {
     assert!(r.suppressed[0]
         .justification
         .contains("accepted by dana: intended"));
-    assert_eq!(r.verdict, Verdict::Different, "verdict as computed is kept");
+    assert_eq!(r.verdict_before_suppression, Some(Verdict::Different));
+    assert_eq!(r.verdict, r.open_verdict(), "verdict is the open verdict");
     if r.findings.iter().all(|f| f.verdict != Verdict::Different) {
         assert_ne!(r.open_verdict(), Verdict::Different);
     }
@@ -500,4 +501,138 @@ fn data_key_config() {
     s.put("fp", "s", Decision::new(State::Accepted)).unwrap();
     let raw = std::fs::read_to_string(s.path().unwrap()).unwrap();
     assert!(raw.starts_with("enc1:"));
+}
+
+// Regressions from the review of PR #12.
+
+const WORDS_PACK: &str = r#"deny_list = ["data", "obj", "06cc"]
+
+[pack]
+name = "p"
+version = "1"
+"#;
+
+#[test]
+fn redaction_never_touches_keys_enums_or_hashes() {
+    let dir = scratch("keys");
+    let cfg = config(&dir, WORDS_PACK);
+    for (pa, pb) in [
+        ("rule.sql", "rule2.sql"),
+        ("path.sql", "text.sql"),
+        ("error.sql", "info.sql"),
+        ("object.sql", "different.sql"),
+    ] {
+        let (mut a, mut b) = movestock();
+        a.path = pa.into();
+        b.path = pb.into();
+        let r = sqldiff_core::diff(&a, &b, &Options::default());
+        let mut red = Redactor::from_config(&cfg).unwrap();
+        let out = red.redact_report(&r);
+        let json = render::json(&out);
+        let back: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.verdict, r.verdict);
+        assert_eq!(back.a.content_hash, r.a.content_hash);
+        for (x, y) in back.findings.iter().zip(&r.findings) {
+            assert_eq!(x.fingerprint, y.fingerprint);
+            assert_eq!(x.class, y.class);
+        }
+        red.verify_report(&out).unwrap();
+        // Keys and labels of the output formats ("rule", "text", "error",
+        // "different") may equal a name; they are not leaks.
+        let sarif: serde_json::Value =
+            serde_json::from_str(&render::sarif(std::slice::from_ref(&out))).unwrap();
+        red.verify_value(&sarif).unwrap();
+        assert!(!json.contains(&format!("\"{pa}\"")), "{json}");
+    }
+}
+
+#[test]
+fn shorter_term_is_tried_when_the_longest_fails_its_boundary() {
+    let dir = scratch("fallback");
+    let cfg = config(&dir, WORDS_PACK);
+    let mut red = Redactor::new(&cfg, b"0123456789abcdef");
+    red.add_object("sales.order");
+    let s = red.redact_str("SELECT * FROM sales.OrderLines JOIN sales.order o");
+    assert!(!s.to_lowercase().contains("sales"), "{s}");
+    assert!(s.contains("OrderLines"), "{s}");
+    assert!(red.verify(&s).is_ok());
+    assert!(red.verify("sales.OrderLines").is_err());
+}
+
+#[test]
+fn whole_body_finding_is_not_hidden_by_an_inner_marker() {
+    let dir = scratch("inner");
+    let cfg = config(&dir, PACK);
+    let mut text: Vec<String> = (1..=30).map(|i| format!("-- line {i}")).collect();
+    text[9] = "-- DELIBERATE: this one statement".into();
+    let text = text.join("\n");
+    let mut r = report();
+    r.findings.truncate(1);
+    let mut f = r.findings[0].clone();
+    let mut loc = f.a.clone().or(f.b.clone()).unwrap();
+    loc.side = sqldiff_core::model::Side::A;
+    loc.start_line = 1;
+    loc.end_line = 30;
+    f.a = Some(loc.clone());
+    f.b = None;
+    r.findings = vec![f.clone()];
+    let mut whole = r.clone();
+    assert_eq!(markers::apply(&mut whole, &text, None, &cfg).suppressed, 0);
+    assert_eq!(whole.findings.len(), 1);
+
+    loc.start_line = 11;
+    loc.end_line = 12;
+    f.a = Some(loc);
+    r.findings = vec![f];
+    assert_eq!(markers::apply(&mut r, &text, None, &cfg).suppressed, 1);
+    assert_eq!(r.verdict, r.open_verdict());
+    assert!(r.verdict_before_suppression.is_some());
+}
+
+#[test]
+fn compact_keeps_records_appended_by_another_handle() {
+    let dir = scratch("compact");
+    let mut gui = Store::open(&dir).unwrap();
+    gui.put("fp1", "s", Decision::new(State::Accepted)).unwrap();
+    let mut cli = Store::open(&dir).unwrap();
+    cli.put("fp2", "s", Decision::new(State::Rejected)).unwrap();
+    gui.compact(&sqldiff_review::time::now()).unwrap();
+    let fresh = Store::open(&dir).unwrap();
+    assert!(fresh.get("fp1", "s").is_some());
+    assert!(
+        fresh.get("fp2", "s").is_some(),
+        "concurrent append survived"
+    );
+    assert!(!dir.join("review/decisions.lock").exists());
+}
+
+#[test]
+fn torn_last_line_is_skipped_with_a_warning() {
+    let dir = scratch("torn");
+    let mut s = Store::open(&dir).unwrap();
+    s.put("fp1", "s", Decision::new(State::Accepted)).unwrap();
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(s.path().unwrap())
+        .unwrap();
+    f.write_all(b"{\"fingerprint\":\"fp2\",\"snap").unwrap();
+    let t = Store::open(&dir).unwrap();
+    assert!(t.get("fp1", "s").is_some());
+    assert_eq!(t.warnings().len(), 1);
+    // Sealed records without the key still fail as a whole.
+    let edir = scratch("torn-enc");
+    let k = DataKey::from_secret(b"0123456789abcdef0123456789abcdef");
+    Store::open_with(&edir, Some(k))
+        .unwrap()
+        .put("fp", "s", Decision::new(State::Accepted))
+        .unwrap();
+    assert!(Store::open(&edir).is_err());
+}
+
+#[test]
+fn time_rejects_non_ascii() {
+    assert!(Decision::new(State::Accepted)
+        .expires("2026-10-2é")
+        .is_err());
 }
