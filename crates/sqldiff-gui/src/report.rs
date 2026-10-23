@@ -165,7 +165,7 @@ pub fn markdown(
         .map(|a| {
             format!(
                 "{} {}",
-                a.id,
+                red.apply(&a.id),
                 if a.flip == Flip::Denied {
                     "denied"
                 } else {

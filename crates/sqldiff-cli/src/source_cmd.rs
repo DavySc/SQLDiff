@@ -4,8 +4,8 @@
 //! `git:REPO[@REV][//SUBDIR]` or `adapter:NAME`. Without one, the `[source]`
 //! of the project or user config is used.
 
-use std::io::BufReader;
-use std::path::PathBuf;
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
@@ -15,7 +15,7 @@ use sqldiff_source::config::{self, Sources};
 use sqldiff_source::protocol::{ObjectFilter, PairScope};
 use sqldiff_source::{pairing, process, queue, Bundle, Pack, Resolved, Source, SourceSpec};
 
-use crate::{exit_for, Format};
+use crate::{deny_hash, exit_for, Format};
 
 #[derive(Args, Clone, Default)]
 pub struct ConfigArgs {
@@ -43,7 +43,7 @@ pub struct ConfigArgs {
     data_dir: Option<PathBuf>,
 }
 
-fn key_value(s: &str) -> Result<(String, String), String> {
+pub fn key_value(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
@@ -139,6 +139,26 @@ pub enum PackCommand {
     DenyList {
         #[command(flatten)]
         cfg: ConfigArgs,
+    },
+    /// Print the deny-list as salted hashes, for CI: the output holds no term.
+    DenyHashes {
+        #[command(flatten)]
+        cfg: ConfigArgs,
+    },
+    /// Scan files (default: stdin) against a hashed deny-list. Prints where a
+    /// term occurs, never which; exits 1 when any does.
+    Scan {
+        /// The hashed deny-list (`pack deny-hashes` output).
+        #[arg(long, value_name = "FILE")]
+        hashes: PathBuf,
+        /// Also scan the NUL-separated paths in FILE (`-` for stdin), as
+        /// `git ls-files -z` prints them.
+        #[arg(long, value_name = "FILE")]
+        files_from: Option<PathBuf>,
+        /// Name for stdin in the report.
+        #[arg(long, default_value = "<stdin>")]
+        label: String,
+        paths: Vec<PathBuf>,
     },
 }
 
@@ -275,6 +295,16 @@ pub fn run(cmd: SourceCommand) -> Result<ExitCode, String> {
                 }
                 Ok(ExitCode::SUCCESS)
             }
+            PackCommand::DenyHashes { cfg } => {
+                print!("{}", deny_hash::render(&cfg.resolve()?.policy.deny_list));
+                Ok(ExitCode::SUCCESS)
+            }
+            PackCommand::Scan {
+                hashes,
+                files_from,
+                label,
+                paths,
+            } => scan(&hashes, files_from.as_deref(), &label, paths),
         },
         SourceCommand::Serve {
             source,
@@ -294,6 +324,60 @@ pub fn run(cmd: SourceCommand) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn scan(
+    hashes: &Path,
+    files_from: Option<&Path>,
+    label: &str,
+    mut paths: Vec<PathBuf>,
+) -> Result<ExitCode, String> {
+    let read_all = |p: &Path| -> Result<Vec<u8>, String> {
+        if p == Path::new("-") {
+            let mut buf = Vec::new();
+            std::io::stdin()
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("stdin: {e}"))?;
+            Ok(buf)
+        } else {
+            std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
+        }
+    };
+    let text = String::from_utf8(read_all(hashes)?)
+        .map_err(|_| format!("{}: not UTF-8", hashes.display()))?;
+    let list = deny_hash::DenyHashes::parse(&text)?;
+    if let Some(f) = files_from {
+        let names = read_all(f)?;
+        paths.extend(
+            names
+                .split(|&b| b == 0)
+                .filter(|n| !n.is_empty())
+                .map(|n| PathBuf::from(String::from_utf8_lossy(n).into_owned())),
+        );
+    }
+    let mut inputs: Vec<(String, Vec<u8>)> = Vec::new();
+    if paths.is_empty() {
+        inputs.push((label.to_string(), read_all(Path::new("-"))?));
+    }
+    for p in &paths {
+        inputs.push((p.display().to_string(), read_all(p)?));
+    }
+    let mut found = false;
+    for (name, bytes) in &inputs {
+        let lines = list.lines_with_terms(bytes);
+        if !lines.is_empty() {
+            found = true;
+            let lines: Vec<String> = lines.iter().map(usize::to_string).collect();
+            println!("{name} (lines: {})", lines.join(","));
+        }
+    }
+    eprintln!(
+        "scan: {} input(s), {} hashed term(s), {}",
+        inputs.len(),
+        list.len(),
+        if found { "terms found" } else { "clean" }
+    );
+    Ok(ExitCode::from(if found { 1 } else { 0 }))
 }
 
 fn pairs(

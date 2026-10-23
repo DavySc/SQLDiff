@@ -363,6 +363,51 @@ fn redacted_report_does_not_trip_on_its_own_template_words() {
 }
 
 #[test]
+fn edited_panes_keep_disk_decisions_and_foreign_snapshots_are_refused() {
+    let (mut s, _dir) = tree_session("scratch");
+    let i = s.queue().iter().position(|e| e.findings > 0).unwrap();
+    let p = s.payload(i, true).unwrap();
+    let fp = p.report.findings[0].fingerprint.clone();
+    s.review(&fp, &p.snapshot, Some(State::Accepted), None)
+        .unwrap();
+    // Edit side A a little: the finding survives, and so does its decision.
+    let edited = format!("-- note\n{}", p.sources[0]);
+    let e = s.scratch(i, edited, p.sources[1].clone()).unwrap();
+    assert_ne!(e.snapshot, p.snapshot);
+    let k = e
+        .report
+        .findings
+        .iter()
+        .position(|f| f.fingerprint == fp)
+        .unwrap();
+    assert_eq!(e.review[k].state, sqldiff_review::ReviewState::Accepted);
+    // Decisions only go on the files' own snapshots (or `*`).
+    assert!(s
+        .review(&fp, &e.snapshot, Some(State::Rejected), None)
+        .is_err());
+    assert!(s.review(&fp, "*", Some(State::Rejected), None).is_ok());
+}
+
+#[test]
+fn wildcard_bind_answers_its_own_address() {
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || serve(listener, pair_session()));
+    for host in ["0.0.0.0", "127.0.0.1", "localhost"] {
+        let res = request(
+            port,
+            &format!("GET /api/session HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"),
+        );
+        assert!(res.starts_with("HTTP/1.1 200"), "{host}: {res}");
+    }
+    let res = request(
+        port,
+        &format!("GET /api/session HTTP/1.1\r\nHost: rebind.example:{port}\r\n\r\n"),
+    );
+    assert!(res.starts_with("HTTP/1.1 403"));
+}
+
+#[test]
 fn deep_links_match_whole_path_components() {
     let (s, _dir) = tree_session("find");
     assert!(s

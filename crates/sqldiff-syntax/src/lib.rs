@@ -12,6 +12,7 @@ pub mod dialect;
 pub mod kind;
 pub mod lexer;
 mod parser;
+pub mod template;
 
 pub use dialect::{Dialect, IdentFolding};
 pub use kind::{SqlLanguage, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken};

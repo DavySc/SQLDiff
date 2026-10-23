@@ -9,10 +9,6 @@ id = "m01-correlated-update-exists-removed:original~mutated"
 reason = "verdict unknown != different [WP10 idioms / cardinality]"
 
 [[failing]]
-id = "m03-merge-lock-hint-dropped:original~mutated"
-reason = "verdict unknown != different [WP10 idioms / concurrency]"
-
-[[failing]]
 id = "m04-lock-on-missing-row:original~mutated"
 reason = "no concurrency finding with verdict different [WP10 lock-intent analysis]"
 
@@ -23,10 +19,6 @@ reason = "verdict unknown != different [WP3 IR + WP9 behavioural diff]"
 [[failing]]
 id = "m10-set-subquery-to-select-assign:original~mutated"
 reason = "no cardinality finding with verdict different [WP10 cardinality contracts]"
-
-[[failing]]
-id = "m11-select-into-without-strict:original~mutated"
-reason = "verdict unknown != different [WP10 cardinality contracts]"
 
 [[failing]]
 id = "m12-merge-by-source-split:original~mutated"
@@ -57,16 +49,8 @@ id = "m18-dialect-residue:original~mutated"
 reason = "verdict unknown != different [WP1 binding]"
 
 [[failing]]
-id = "m19-case-insensitivity-dropped:original~mutated"
-reason = "verdict unknown != different [cross-dialect equivalence]"
-
-[[failing]]
 id = "m20-trigger-to-out-of-engine-handler:original~mutated"
 reason = "no transactional finding with verdict different [WP3 effects (triggers/substitutes)]"
-
-[[failing]]
-id = "m21-time-source-changed:original~mutated"
-reason = "verdict unknown != different [WP3 effects (time source)]"
 
 [[failing]]
 id = "m22-null-ordering-changed:original~mutated"
@@ -79,14 +63,6 @@ reason = "no transactional finding with verdict different [WP3 transaction model
 [[failing]]
 id = "p02-upsert-price:tsql~pg"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p02-upsert-price:tsql~db2i"
-reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p02-upsert-price:pg~db2i"
-reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
 id = "p03-lookup-by-key:tsql~pg"
@@ -109,20 +85,12 @@ id = "p04-display-name:tsql~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
-id = "p04-display-name:pg~db2i"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
 id = "p05-email-lookup:tsql~pg"
 reason = "verdict unknown != different [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
 id = "p05-email-lookup:tsql~db2i"
 reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p05-email-lookup:pg~db2i"
-reason = "verdict unknown != different [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
 id = "p06-paged-orders:tsql~pg"
@@ -137,18 +105,6 @@ id = "p06-paged-orders:pg~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
-id = "p07-insert-return-id:tsql~pg"
-reason = "verdict unknown != different [WP3 error model + WP9: T-SQL continues after a failed INSERT]"
-
-[[failing]]
-id = "p07-insert-return-id:tsql~db2i"
-reason = "verdict unknown != different [WP3 error model + WP9: T-SQL continues after a failed INSERT; Db2 side unverified]"
-
-[[failing]]
-id = "p07-insert-return-id:pg~db2i"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
 id = "p08-delete-orphans:tsql~pg"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
@@ -159,18 +115,6 @@ reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing
 [[failing]]
 id = "p08-delete-orphans:pg~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p09-error-rollback:tsql~pg"
-reason = "verdict unknown != equal-under-assumptions [WP3 + WP9]"
-
-[[failing]]
-id = "p09-error-rollback:tsql~db2i"
-reason = "verdict unknown != equal-under-assumptions [WP3 + WP9]"
-
-[[failing]]
-id = "p09-error-rollback:pg~db2i"
-reason = "verdict unknown != equal-under-assumptions [WP3 + WP9]"
 
 [[failing]]
 id = "p10-temp-state-rollback:tsql~pg"
@@ -193,24 +137,12 @@ id = "p11-string-aggregation:tsql~db2i"
 reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
-id = "p11-string-aggregation:pg~db2i"
-reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
 id = "p12-days-between:tsql~pg"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p12-days-between:tsql~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
 id = "p12-days-between:pg~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p12-days-between:tsql~pg_nearmiss"
-reason = "verdict unknown != different [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
 id = "p12-days-between:pg~pg_nearmiss"

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use crate::artifact::{Analyzed, Artifact};
 use crate::classify::pairing_key;
+use crate::equiv;
 use crate::facts;
 use crate::lint;
 use crate::model::{
@@ -11,17 +12,28 @@ use crate::model::{
     Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
+use crate::rules;
 use crate::treediff;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Maximum lines of excerpt per location.
     pub excerpt_lines: usize,
+    /// DDL artifacts (CREATE TABLE / CREATE UNIQUE INDEX) describing the
+    /// catalog side A runs against; used to discharge key, nullability and
+    /// type side conditions of statement equivalence.
+    pub catalog_a: Vec<Artifact>,
+    /// The same for side B.
+    pub catalog_b: Vec<Artifact>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { excerpt_lines: 3 }
+        Options {
+            excerpt_lines: 3,
+            catalog_a: Vec::new(),
+            catalog_b: Vec::new(),
+        }
     }
 }
 
@@ -43,12 +55,16 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     ];
     let mut unknown_reasons = Vec::new();
     let mut noise = NoiseCounts::default();
+    let schema_a = equiv::schema::Schema::load(&opts.catalog_a);
+    let schema_b = equiv::schema::Schema::load(&opts.catalog_b);
+    let mut eq = equiv::Outcome::default();
 
     if same {
-        let td = treediff::diff(&aa, &ab);
+        let mut td = treediff::diff(&aa, &ab);
+        equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
         noise.cosmetic = td.cosmetic;
-        noise.structural = td.structural;
+        noise.structural = td.structural + eq.structural;
         match a.dialect.lexical().folding {
             sqldiff_syntax::IdentFolding::Lower => {
                 normalizations.push("unquoted identifiers folded to lower case".to_string())
@@ -77,18 +93,44 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 findings.push(lint::to_finding(&ab, &h));
             }
         }
+        // Idiom-rule lints that are new in B (design section 8).
+        let old = rules::analysis::hits(&aa, &schema_a, false);
+        for h in rules::analysis::new_hits(&old, rules::analysis::hits(&ab, &schema_b, false)) {
+            let v = if h.diff_different {
+                Verdict::Different
+            } else {
+                Verdict::Unknown
+            };
+            findings.push(rules::analysis::to_finding(&ab, &h, v));
+        }
     } else {
         findings.extend(pair_writes(&aa, &ab));
-        for side in [&aa, &ab] {
+        for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
             }
+            // Rule lints describe one side's code: they do not decide the verdict.
+            for h in rules::analysis::hits(side, schema, false) {
+                findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
+            }
         }
-        unknown_reasons.push(format!(
-            "statement-level semantic equivalence between {} and {} is not implemented yet; only transaction, error-contract, write-pairing and residue checks ran",
-            a.dialect.display_name(),
-            b.dialect.display_name()
-        ));
+        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
+        findings.append(&mut eq.findings);
+        noise.structural += eq.structural;
+        unknown_reasons.append(&mut eq.unknown_reasons);
+        normalizations.push(
+            "statement lowering: parameters by position, aliases resolved, dialect built-ins and idioms mapped to one form".to_string(),
+        );
+    }
+    for x in eq.normalizations.drain(..) {
+        if !normalizations.contains(&x) {
+            normalizations.push(x);
+        }
+    }
+    for x in eq.assumptions.drain(..) {
+        if !assumptions.iter().any(|y| y.id == x.id) {
+            assumptions.push(x);
+        }
     }
 
     let (bf, ba) = crate::ir::behaviour::compare(&aa, &ab);
@@ -128,10 +170,14 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
-    let findings = lint::all_hits(&aa)
+    let schema = equiv::schema::Schema::load(&opts.catalog_a);
+    let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
         .collect();
+    for h in rules::analysis::hits(&aa, &schema, true) {
+        findings.push(rules::analysis::to_finding(&aa, &h, Verdict::Unknown));
+    }
     let diagnostics = aa.diagnostics();
     let mut unknown_reasons = Vec::new();
     if !diagnostics.is_empty() {
@@ -153,7 +199,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     })
 }
 
-fn finish(mut r: Report) -> Report {
+pub(crate) fn finish(mut r: Report) -> Report {
     // Same fingerprint twice (e.g. the same residue on two lines): keep both, they have different locations.
     r.findings.sort_by(|x, y| {
         y.severity

@@ -1,0 +1,185 @@
+; Idioms: dialect patterns lifted to canonical nodes (design sections 3 and 8).
+;
+; Each idiom has one canonical node and a form per dialect. A form is
+; two-way unless marked: lifting matches the form and builds the canon,
+; emitting matches the canon and builds the form. Surface shapes are in
+; src/rules/surface.rs. Examples are checked by tests/rules.rs: the rules
+; convert the first side, and the equivalence engine (which does not use
+; these rules) must agree with the expected verdict.
+
+; ---------------------------------------------------------------- upserts
+
+(idiom upsert/if-exists
+  (doc "IF EXISTS (key lookup) UPDATE ELSE INSERT: an upsert in two statements, which races unless the lookup is locked.")
+  (canon (upsert (target ?t) (key ?k...) (cols ?c...) (row ?v...) (on-match ?sets...) (concurrency ?conc)))
+  (form tsql
+    (if (exists (select (?or (items (item (num 1))) (items _...)) (from (table ?t)) (where ?pred)))
+        (?block (update (table ?t) (set ?sets...) (where ?pred)))
+        (?block (insert (table ?t) (cols ?c...) (values (row ?v...)))))
+    (bind ?conc race)
+    (let ?k (?fn key-cols ?pred ?c... ?v...))
+    (emit-let ?pred (?fn key-pred ?k... ?c... ?v...)))
+  (example
+    (tsql "IF EXISTS (SELECT 1 FROM dbo.customer WHERE customer_id = @Id) UPDATE dbo.customer SET last_name = @Name WHERE customer_id = @Id; ELSE INSERT INTO dbo.customer (customer_id, last_name) VALUES (@Id, @Name);")
+    (postgres "INSERT INTO customer (customer_id, last_name) VALUES (p_id, p_name) ON CONFLICT (customer_id) DO UPDATE SET last_name = p_name;")
+    (params (Id int) (Name "nvarchar(50)"))
+    ; The equivalence engine does not cover IF yet; the race is in the note.
+    (expect unknown)))
+
+(idiom upsert/if-exists-locked
+  (doc "The same with UPDLOCK, HOLDLOCK (or SERIALIZABLE) on the lookup: serialised.")
+  (priority 1)
+  (canon (upsert (target ?t) (key ?k...) (cols ?c...) (row ?v...) (on-match ?sets...) (concurrency ?conc)))
+  (form tsql
+    (if (exists (select (items _...) (from (table ?t (?opt (alias _)) (hints _... (?or holdlock serializable) _...))) (where ?pred)))
+        (?block (update (table ?t) (set ?sets...) (where ?pred)))
+        (?block (insert (table ?t) (cols ?c...) (values (row ?v...)))))
+    (lift-only)
+    (bind ?conc serialized)
+    (let ?k (?fn key-cols ?pred ?c... ?v...))))
+
+(idiom upsert/merge
+  (doc "MERGE of a one-row source: WHEN MATCHED UPDATE, WHEN NOT MATCHED INSERT. Without HOLDLOCK it races like the two-statement form.")
+  (canon (upsert (target ?t) (key ?k...) (cols ?c...) (row ?v...) (on-match ?sets...) (concurrency ?conc)))
+  (form tsql
+    (merge (table ?t (?opt (alias _)) (hints _... (?or holdlock serializable) _...))
+           (using (sub (select (items ?src...)) (alias ?sa)))
+           (on ?on)
+           (when-matched (update-set ?msets...))
+           (when-not-matched (insert-row (cols ?c...) (row ?mv...))))
+    (lift-only)
+    (bind ?conc serialized)
+    (let ?pred (?fn inline ?sa ?src... ?on))
+    (let ?v (?fn inline-seq ?sa ?src... ?mv...))
+    (let ?sets (?fn inline-seq ?sa ?src... ?msets...))
+    (let ?k (?fn key-cols ?pred ?c... ?v...)))
+  (form tsql
+    (merge (table ?t (?opt (alias _)))
+           (using (sub (select (items ?src...)) (alias ?sa)))
+           (on ?on)
+           (when-matched (update-set ?msets...))
+           (when-not-matched (insert-row (cols ?c...) (row ?mv...))))
+    (lift-only)
+    (bind ?conc race)
+    (let ?pred (?fn inline ?sa ?src... ?on))
+    (let ?v (?fn inline-seq ?sa ?src... ?mv...))
+    (let ?sets (?fn inline-seq ?sa ?src... ?msets...))
+    (let ?k (?fn key-cols ?pred ?c... ?v...)))
+  (example
+    (tsql "MERGE dbo.item_price WITH (HOLDLOCK) AS t USING (SELECT @Item AS item_id, @Price AS unit_price) AS s ON t.item_id = s.item_id WHEN MATCHED THEN UPDATE SET unit_price = s.unit_price WHEN NOT MATCHED THEN INSERT (item_id, unit_price) VALUES (s.item_id, s.unit_price);")
+    (postgres "INSERT INTO item_price (item_id, unit_price) VALUES (p_item, p_price) ON CONFLICT (item_id) DO UPDATE SET unit_price = p_price;")
+    (params (Item int) (Price "decimal(12,2)"))
+    (expect equal)))
+
+(idiom upsert/on-conflict
+  (doc "PostgreSQL INSERT ... ON CONFLICT (key) DO UPDATE: an atomic upsert.")
+  (canon (upsert (target ?t) (key ?k...) (cols ?c...) (row ?v...) (on-match ?sets...) (concurrency ?conc)))
+  (form postgres
+    (insert (table ?t) (cols ?c...) (values (row ?v...)) (on-conflict (cols ?k...) (do-update (set ?sets...))))
+    (bind ?conc atomic)
+    (emit-any ?conc))
+  (require postgres (unique ?t ?k...) ASM-UPSERT-KEY-UNIQUE "A unique index or constraint covers the key columns (ON CONFLICT needs one, and the original matches at most one row)")
+  (note postgres decision "ON CONFLICT is atomic. The original checks and then writes, so two sessions can both miss the row and one INSERT fails with a duplicate key; the conversion removes that race." (if ?conc race))
+  (note postgres converted "MERGE WITH (HOLDLOCK) serialises the upsert; ON CONFLICT is atomic as well." (if ?conc serialized)))
+
+(idiom insert-if-absent/if-not-exists
+  (doc "IF NOT EXISTS (key lookup) INSERT: insert unless the key is present.")
+  (canon (insert-if-absent (target ?t) (key ?k...) (cols ?c...) (row ?v...) (concurrency ?conc)))
+  (form tsql
+    (if (not (exists (select (?or (items (item (num 1))) (items _...)) (from (table ?t)) (where ?pred))))
+        (?block (insert (table ?t) (cols ?c...) (values (row ?v...)))))
+    (bind ?conc race)
+    (let ?k (?fn key-cols ?pred ?c... ?v...))
+    (emit-let ?pred (?fn key-pred ?k... ?c... ?v...)))
+  (example
+    (tsql "IF NOT EXISTS (SELECT 1 FROM dbo.item WHERE item_id = @Id) INSERT INTO dbo.item (item_id, name) VALUES (@Id, @Name);")
+    (postgres "INSERT INTO item (item_id, name) VALUES (p_id, p_name) ON CONFLICT (item_id) DO NOTHING;")
+    (params (Id int) (Name "varchar(100)"))
+    (expect unknown)))
+
+(idiom insert-if-absent/on-conflict
+  (doc "PostgreSQL INSERT ... ON CONFLICT (key) DO NOTHING.")
+  (canon (insert-if-absent (target ?t) (key ?k...) (cols ?c...) (row ?v...) (concurrency ?conc)))
+  (form postgres
+    (insert (table ?t) (cols ?c...) (values (row ?v...)) (on-conflict (cols ?k...) (do-nothing)))
+    (bind ?conc atomic)
+    (emit-any ?conc))
+  (require postgres (unique ?t ?k...) ASM-UPSERT-KEY-UNIQUE "A unique index or constraint covers the key columns (ON CONFLICT needs one, and the original matches at most one row)")
+  (note postgres decision "ON CONFLICT DO NOTHING is atomic. The original checks and then inserts, so a concurrent insert of the same key makes it fail with a duplicate key; the conversion removes that race." (if ?conc race)))
+
+; ------------------------------------------------------------ delete-orphans
+
+(idiom delete-orphans/anti-join
+  (doc "DELETE t FROM t LEFT JOIN u ON <equalities> WHERE u.c IS NULL: delete rows of t without a match in u.")
+  (canon (delete-orphans (target ?t) (other ?u) (on ?on)))
+  (form tsql
+    (delete (table ?t (?opt (alias _)))
+            (from (join left (table ?t (?opt (alias _))) (table ?u (?opt (alias _))) ?on))
+            (where (is-null (col ?u ?nc))))
+    (lift-only))
+  ; `u.c IS NULL` selects exactly the unmatched rows when ON requires an equality on c:
+  ; a top-level conjunct, not one under OR or NOT.
+  (if-conjunct tsql ?on (?or (= (col ?u ?nc) _) (= _ (col ?u ?nc))))
+  (form postgres
+    (delete (table ?t) (where (not (exists (select (?or (items (item (num 1))) (items _...)) (from (table ?u)) (where ?on)))))))
+  (example
+    (tsql "DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id WHERE i.item_id IS NULL;")
+    (postgres "DELETE FROM price_feed WHERE NOT EXISTS (SELECT 1 FROM item WHERE item.item_id = price_feed.item_id);")
+    (expect equal)))
+
+; ------------------------------------------------------------- generated keys
+
+(idiom insert-identity/returning
+  (doc "INSERT followed by reading the generated key of that INSERT.")
+  (canon (insert-identity (target ?t) (cols ?c...) (row ?v...) (into ?idv) (identity ?ic)))
+  (form tsql
+    (seq (insert (table ?t) (cols ?c...) (values (row ?v...)))
+         (assign ?idv (call scope_identity)))
+    (lift-only)
+    (let ?ic (?fact identity-col ?t)))
+  (form postgres
+    (insert (table ?t) (cols ?c...) (values (row ?v...)) (returning (item (col ?ic))) (returning-into ?idv)))
+  (unless postgres ?ic unknown)
+  (note postgres decision "If the INSERT fails, RETURNING INTO raises; T-SQL with XACT_ABORT OFF continues and sets the id to NULL (corpus p07). The conversion stops at the error instead.")
+  (example
+    (tsql "INSERT INTO dbo.orders (customer_id) VALUES (@Customer); SET @OrderId = SCOPE_IDENTITY();")
+    (postgres "INSERT INTO orders (customer_id) VALUES (p_customer) RETURNING order_id INTO p_order_id;")
+    (params (Customer int) (OrderId int))
+    ; Equal here because the id is not an OUTPUT parameter. With one, T-SQL continuing
+    ; after a failed INSERT is visible to the caller and the engine says different (p07).
+    (expect equal)))
+
+(idiom insert-identity/lastval
+  (doc "Without a catalog the identity column is unknown: read the session's last sequence value.")
+  (priority -1)
+  (canon (insert-identity (target ?t) (cols ?c...) (row ?v...) (into ?idv) (identity unknown)))
+  (form postgres
+    (seq (insert (table ?t) (cols ?c...) (values (row ?v...)))
+         (assign ?idv (call lastval)))
+    (emit-only))
+  (note postgres decision "If the INSERT fails, PostgreSQL raises; T-SQL with XACT_ABORT OFF continues and sets the id to NULL (corpus p07). The conversion stops at the error instead.")
+  (assume postgres ASM-LASTVAL-SAME-INSERT "No trigger on the target inserts into another table with a sequence, so lastval() is the key of this INSERT (SCOPE_IDENTITY ignores triggers; lastval does not)"))
+
+; -------------------------------------------------------------- named locks
+
+(idiom advisory-lock/applock
+  (doc "Transaction-scoped exclusive named lock, waiting forever.")
+  (canon (advisory-lock (key ?res) (mode exclusive) (scope transaction)))
+  (form tsql
+    (seq (exec (into (var ?rc)) (name sp_getapplock)
+               (arg (var @Resource) ?res) (arg (var @LockMode) (str Exclusive))
+               (arg (var @LockOwner) (str Transaction)) (arg (var @LockTimeout) (?or (neg (num 1)) (num -1))))
+         (if (< (var ?rc) (num 0)) _...))
+    (lift-only))
+  (form tsql
+    (exec (name sp_getapplock)
+          (arg (var @Resource) ?res) (arg (var @LockMode) (str Exclusive))
+          (arg (var @LockOwner) (str Transaction)) (?opt (arg (var @LockTimeout) (?or (neg (num 1)) (num -1)))))
+    (lift-only))
+  (assume tsql ASM-APPLOCK-CHECK-RAISES "The `IF @rc < 0` branch after sp_getapplock only rolls back and raises (with an infinite timeout it runs only for a deadlock or cancel, which PostgreSQL raises as an error)")
+  (form postgres (perform (call pg_advisory_xact_lock (call hashtext ?res))))
+  (note postgres converted "hashtext() maps lock names to 32-bit keys, so two different names can share a key: more blocking, never less exclusion.")
+  (example
+    (tsql "EXEC @rc = sp_getapplock @Resource = 'price-feed', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1; IF @rc < 0 BEGIN ROLLBACK; THROW 50020, 'lock not granted', 1; END")
+    (postgres "PERFORM pg_advisory_xact_lock(hashtext('price-feed'));")
+    (expect unknown)))

@@ -11,7 +11,7 @@ use sqldiff_core::{session as flips, Artifact, ChangeClass, Dialect, Report, Sev
 use sqldiff_source::tree::{self, Ambiguous, Tree, TreePair};
 use sqldiff_source::{LayerRef, Resolved};
 
-use crate::review::{time, Decision, State, Store};
+use crate::review::{self, time, Decision, State, Store};
 use crate::{build_view, Payload};
 
 /// What the session compares.
@@ -156,7 +156,8 @@ impl Session {
 
     /// Re-reads the sources (and re-pairs trees) and diffs every pair.
     pub fn refresh(&mut self) -> Result<(), String> {
-        self.tree = match &self.origin {
+        // Build everything first: a failure leaves the session as it was.
+        let tree = match &self.origin {
             Origin::Trees { a, b } => {
                 tree::pair_dirs(a, b, self.dialect_a, self.dialect_b, &self.cfg).map_err(|e| e.0)?
             }
@@ -172,11 +173,10 @@ impl Session {
                 ..Tree::default()
             },
         };
-        self.pairs = self
-            .tree
+        let pairs: Vec<Loaded> = tree
             .pairs
             .iter()
-            .map(|p| match self.tree.read(p, &self.cfg) {
+            .map(|p| match tree.read(p, &self.cfg) {
                 Ok((a, b)) => Loaded {
                     pair: p.clone(),
                     base: Some(tree::diff(&a, &b, &self.cfg)),
@@ -192,14 +192,16 @@ impl Session {
             })
             .collect();
         if let (Origin::Files { .. }, Some(Loaded { error: Some(e), .. })) =
-            (&self.origin, self.pairs.first())
+            (&self.origin, pairs.first())
         {
             return Err(e.clone());
         }
-        self.assumptions = self.assumption_rows();
-        self.loaded_at = time::now();
         // Pick up decisions other processes (CLI, MCP, another GUI) made meanwhile.
         self.store.reload().map_err(|e| e.0)?;
+        self.tree = tree;
+        self.pairs = pairs;
+        self.assumptions = self.assumption_rows();
+        self.loaded_at = time::now();
         Ok(())
     }
 
@@ -262,6 +264,15 @@ impl Session {
         b.text = tb;
         let mut p = build_view(&a, &b, self.flipped(tree::diff(&a, &b, &self.cfg)), true);
         p.index = i;
+        // Decisions belong to the files on disk: show them for the findings the edit still has.
+        let disk = sqldiff_review::snapshot(self.pairs[i].base.as_ref()?);
+        let now = time::now();
+        p.review = p
+            .report
+            .findings
+            .iter()
+            .map(|f| self.store.status(&f.fingerprint, &disk, &now))
+            .collect();
         Some(p)
     }
 
@@ -273,6 +284,18 @@ impl Session {
         state: Option<State>,
         comment: Option<String>,
     ) -> Result<(), String> {
+        // Only a snapshot of this session's files on disk, or every snapshot.
+        let known = snapshot == review::ANY_SNAPSHOT
+            || self
+                .pairs
+                .iter()
+                .filter_map(|l| l.base.as_ref())
+                .any(|r| sqldiff_review::snapshot(r) == snapshot);
+        if !known {
+            return Err(format!(
+                "snapshot {snapshot} is not one of this session's files"
+            ));
+        }
         self.store.reload().map_err(|e| e.0)?;
         match state {
             None => self.store.clear(fingerprint, snapshot).map(|_| ()),

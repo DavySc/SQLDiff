@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The leak scan reads every commit of the push or pull request.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -21,5 +24,15 @@ jobs:
         run: bash scripts/test-hooks.sh
       - name: Leak scan
         env:
-          SQLDIFF_DENYLIST: ${{ secrets.SQLDIFF_DENYLIST }}
-        run: scripts/leak-scan.sh
+          # Salted hashes from `sqldiff pack deny-hashes`; the terms never reach CI.
+          SQLDIFF_DENYHASHES: ${{ secrets.SQLDIFF_DENYHASHES }}
+          # Forks get no secrets; everywhere else a missing list is a failure.
+          SQLDIFF_REQUIRE_DENYLIST: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          cargo build -p sqldiff-cli
+          scripts/leak-scan.sh
+          # Every commit, so a leak added and removed again is still caught.
+          if git cat-file -e "$BASE^{commit}" 2>/dev/null; then range="$BASE..$HEAD"; else range="$HEAD"; fi
+          scripts/leak-scan.sh --commits "$range"

@@ -55,8 +55,18 @@ struct Review {
 pub(crate) const MAX_BODY: usize = 16 * 1024 * 1024;
 
 pub fn serve(listener: TcpListener, session: Session) -> std::io::Result<()> {
+    serve_with_hosts(listener, session, &[])
+}
+
+/// [`serve`], also answering requests addressed to `extra` host names
+/// (`--allow-host`, for a server bound to a non-loopback address).
+pub fn serve_with_hosts(
+    listener: TcpListener,
+    session: Session,
+    extra: &[String],
+) -> std::io::Result<()> {
     let session = Arc::new(Mutex::new(session));
-    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener)?);
+    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let session = Arc::clone(&session);
@@ -126,19 +136,22 @@ pub(crate) struct Request {
     pub body: Vec<u8>,
 }
 
-/// Host names (without port) a request may address: loopback names and
-/// the address the listener is bound to.
-pub(crate) fn allowed_hosts(listener: &TcpListener) -> std::io::Result<Vec<String>> {
+/// Host names (without port) a request may address: loopback names, the
+/// address the listener is bound to (`0.0.0.0` included) and `extra`.
+/// A DNS name only passes when it is listed, which defeats DNS rebinding.
+pub(crate) fn allowed_hosts(
+    listener: &TcpListener,
+    extra: &[String],
+) -> std::io::Result<Vec<String>> {
     let ip = listener.local_addr()?.ip();
     let mut v: Vec<String> = ["localhost", "127.0.0.1", "[::1]"]
         .map(String::from)
         .to_vec();
-    if !ip.is_unspecified() {
-        v.push(match ip {
-            std::net::IpAddr::V4(a) => a.to_string(),
-            std::net::IpAddr::V6(a) => format!("[{a}]"),
-        });
-    }
+    v.push(match ip {
+        std::net::IpAddr::V4(a) => a.to_string(),
+        std::net::IpAddr::V6(a) => format!("[{a}]"),
+    });
+    v.extend(extra.iter().map(|h| host_name(h).to_string()));
     Ok(v)
 }
 

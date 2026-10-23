@@ -112,9 +112,9 @@ struct Edit {
     text: String,
 }
 
-pub fn serve(listener: TcpListener, setup: Setup) -> std::io::Result<()> {
+pub fn serve(listener: TcpListener, setup: Setup, extra_hosts: &[String]) -> std::io::Result<()> {
     let setup = Arc::new(setup);
-    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener)?);
+    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let setup = Arc::clone(&setup);

@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use sqldiff_core::Dialect;
 use sqldiff_gui::convert;
 use sqldiff_gui::review::Store;
-use sqldiff_gui::server::serve;
+use sqldiff_gui::server::serve_with_hosts;
 use sqldiff_gui::session::{Origin, Session};
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::Resolved;
@@ -73,6 +73,10 @@ enum Command {
         host: String,
         #[arg(short, long, default_value_t = 7878)]
         port: u16,
+        /// Also answer requests addressed to this host name or address
+        /// (when bound to a non-loopback address). Repeatable.
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allow_hosts: Vec<String>,
     },
     /// Convert mode: edit T-SQL on the left, see PostgreSQL on the right, live.
     Convert {
@@ -89,6 +93,9 @@ enum Command {
         host: String,
         #[arg(short, long, default_value_t = 7879)]
         port: u16,
+        /// Also answer requests addressed to this host name or address. Repeatable.
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allow_hosts: Vec<String>,
     },
     /// Write a self-contained, read-only HTML file.
     Export {
@@ -153,6 +160,18 @@ fn open(p: PairArgs) -> Result<Session, String> {
     )
 }
 
+/// The URL to open: a wildcard bind (`0.0.0.0`, `::`) is reachable locally as loopback.
+fn url(listener: &TcpListener) -> Result<String, String> {
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    if addr.ip().is_unspecified() {
+        eprintln!(
+            "listening on all interfaces; from another machine, add --allow-host <name or address>"
+        );
+        return Ok(format!("http://127.0.0.1:{}/", addr.port()));
+    }
+    Ok(format!("http://{addr}/"))
+}
+
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -165,12 +184,16 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Command::Serve { pair, host, port } => {
+        Command::Serve {
+            pair,
+            host,
+            port,
+            allow_hosts,
+        } => {
             let session = open(pair)?;
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-            let addr = listener.local_addr().map_err(|e| e.to_string())?;
-            println!("SQLDiff: http://{addr}/");
-            serve(listener, session).map_err(|e| e.to_string())
+            println!("SQLDiff: {}", url(&listener)?);
+            serve_with_hosts(listener, session, &allow_hosts).map_err(|e| e.to_string())
         }
         Command::Convert {
             file,
@@ -179,6 +202,7 @@ fn run(cli: Cli) -> Result<(), String> {
             stdout,
             host,
             port,
+            allow_hosts,
         } => {
             let (name, text) = match &file {
                 Some(p) => (
@@ -215,9 +239,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Err(format!("no conversion rules from {from} to {to} yet"));
             }
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-            let addr = listener.local_addr().map_err(|e| e.to_string())?;
-            println!("SQLDiff convert: http://{addr}/");
-            convert::serve(listener, setup).map_err(|e| e.to_string())
+            println!("SQLDiff convert: {}", url(&listener)?);
+            convert::serve(listener, setup, &allow_hosts).map_err(|e| e.to_string())
         }
         Command::Export { pair, output } => {
             let session = open(pair)?;

@@ -46,7 +46,7 @@ fn unsupported_pair_reports_an_error() {
 fn server_converts_posted_text() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || serve(listener, setup("SELECT 1;")));
+    std::thread::spawn(move || serve(listener, setup("SELECT 1;"), &[]));
     let body = r#"{"text":"SELECT TOP 3 a FROM dbo.t;"}"#;
     let mut s = TcpStream::connect(addr).unwrap();
     write!(
@@ -73,7 +73,7 @@ fn server_converts_posted_text() {
 fn cross_origin_posts_are_refused() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || serve(listener, setup("SELECT 1;")));
+    std::thread::spawn(move || serve(listener, setup("SELECT 1;"), &[]));
     let body = r#"{"text":"SELECT 1;"}"#;
     let post = |origin: &str| {
         let mut s = TcpStream::connect(addr).unwrap();
