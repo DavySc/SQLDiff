@@ -1051,14 +1051,52 @@ impl<'a> Parser<'a> {
                 break;
             }
         }
-        // Locking clauses are kept as words.
+        // Locking and isolation clauses are kept as words; anything else
+        // (FOR XML, FOR JSON, FOR BROWSE, ...) is refused.
         if self.is_kw("FOR") || self.is_kw("WITH") {
+            const WORDS: &[&str] = &[
+                "FOR",
+                "UPDATE",
+                "SHARE",
+                "NO",
+                "KEY",
+                "NOWAIT",
+                "SKIP",
+                "LOCKED",
+                "READ",
+                "ONLY",
+                "FETCH",
+                "WITH",
+                "RS",
+                "RR",
+                "CS",
+                "UR",
+                "NC",
+                "USE",
+                "AND",
+                "KEEP",
+                "EXCLUSIVE",
+                "LOCKS",
+                "DATA",
+            ];
+            let mut of = false;
             while let Some(t) = self.peek() {
                 if t.kind == K::RParen {
                     break;
                 }
+                let word = t.kind == K::Word && WORDS.contains(&t.up.as_str());
+                if t.kind == K::Word && t.up == "OF" {
+                    of = true;
+                } else if word {
+                    of = false;
+                } else if !(of && matches!(t.kind, K::Word | K::Quoted | K::Dot | K::Comma)) {
+                    return Err(self.err("unsupported FOR/WITH clause"));
+                }
                 s.locking.push(t.up.clone());
                 self.i += 1;
+            }
+            if s.locking.len() < 2 {
+                return Err(self.err("unsupported FOR/WITH clause"));
             }
         }
         Ok(s)
@@ -1677,5 +1715,27 @@ mod tests {
                 panic!("{sql}: {e}");
             }
         }
+    }
+
+    #[test]
+    fn locking_trailers_only() {
+        for (sql, d) in [
+            (
+                "SELECT qty FROM stock WHERE item_id = p FOR UPDATE OF stock SKIP LOCKED;",
+                Dialect::Postgres,
+            ),
+            (
+                "SELECT qty FROM stock WHERE item_id = p WITH RS USE AND KEEP EXCLUSIVE LOCKS;",
+                Dialect::Db2i,
+            ),
+        ] {
+            let t = toks(sql, d);
+            if let Err(e) = parse_stmt(&t, d) {
+                panic!("{sql}: {e}");
+            }
+        }
+        let sql =
+            "SELECT STUFF((SELECT ',' + name FROM dbo.item FOR XML PATH('')), 1, 1, '') AS n;";
+        assert!(parse_stmt(&toks(sql, Dialect::Tsql), Dialect::Tsql).is_err());
     }
 }

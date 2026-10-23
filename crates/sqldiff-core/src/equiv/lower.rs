@@ -36,6 +36,8 @@ pub struct Param {
     pub name: String,
     pub ty: Option<Ty>,
     pub out: bool,
+    /// Default value tokens (keywords upper-cased), when declared.
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,18 +354,28 @@ fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
     }
     let mut p = Parser::new(&toks[i..], d);
     let ty: Type = p.ty().ok()?;
+    let mut default: Option<Vec<String>> = None;
     for t in &toks[i + p.i..] {
-        if matches!(t.up.as_str(), "OUTPUT" | "OUT") {
-            out = true;
-        }
-        if t.up == "READONLY" {
-            return None;
+        match t.up.as_str() {
+            "OUTPUT" | "OUT" => out = true,
+            "READONLY" => return None,
+            "=" | "DEFAULT" if default.is_none() => default = Some(Vec::new()),
+            _ => {
+                if let Some(v) = default.as_mut() {
+                    v.push(if t.kind == K::Word {
+                        t.up.clone()
+                    } else {
+                        t.text.clone()
+                    });
+                }
+            }
         }
     }
     Some(Param {
         name,
         ty: Some(Ty::from_type(&ty, d, false)),
         out,
+        default: default.map(|v| v.join(" ")),
     })
 }
 
@@ -449,21 +461,28 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let ast = parse_stmt(&toks, d);
+            let mut ast = parse_stmt(&toks, d);
+            let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {
                     name: name.trim_start_matches('@').to_lowercase(),
                     ty: ty.as_ref().map(|t| Ty::from_type(t, d, false)),
                 });
-                if default.is_none() {
-                    return;
-                }
+                let Some(init) = default else { return };
+                // `DECLARE @x T = v` is an assignment of the initial value.
+                let target = if name.starts_with('@') {
+                    super::ast::Expr::Var(name.clone())
+                } else {
+                    super::ast::Expr::Name(vec![name.clone()])
+                };
+                ast = Ok(Stmt::Assign(target, init.clone()));
+                from_declare = true;
             }
             u.stmts.push(LStmt {
                 node: c.clone(),
                 toks,
                 ast,
-                from_declare: false,
+                from_declare,
             });
         }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
