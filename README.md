@@ -40,6 +40,10 @@ $B config                                             # merged config and its la
 # Pair view in the browser (statement-aligned, findings panel, live scratchpad)
 target/release/sqldiff-gui serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
 target/release/sqldiff-gui export --report report.json -o pair.html   # static, read-only
+
+# Convert mode: type T-SQL on the left, checked PostgreSQL appears on the right as you type
+target/release/sqldiff-gui convert                       # starts with a sample
+target/release/sqldiff-gui convert my_proc.sql --stdout  # print the conversion and per-statement badges
 ```
 
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
@@ -69,6 +73,7 @@ Verdict: DIFFERENT
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
 | Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
 | GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
+| Conversion (P0) | `sqldiff-gui convert`: rule-based T-SQL → PostgreSQL that updates live; every statement gets a badge (converted, under assumptions, needs a decision, differs, not converted) from its rules plus the engine's diff of input against output. Constructs without a rule stay as comments, never guessed. See [docs/convert-mode.md](docs/convert-mode.md). |
 
 Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
@@ -99,7 +104,8 @@ crates/sqldiff-core     findings model, normalization, diff engines, checks, ren
 crates/sqldiff-source   packs, layered config, adapter protocol, fs/git/bundle adapters, pairing
 crates/sqldiff-cli      the `sqldiff` binary
 crates/sqldiff-mcp      the `sqldiff-mcp` stdio MCP server
-crates/sqldiff-gui      the `sqldiff-gui` pair view (local server + embedded page)
+crates/sqldiff-convert  rule-based dialect conversion, checked unit by unit by the engine
+crates/sqldiff-gui      the `sqldiff-gui` pair view and convert mode (local server + embedded pages)
 tests/fixtures          synthetic fixtures (all written for this repository)
 docs/examples/pack      synthetic example pack using every section
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time

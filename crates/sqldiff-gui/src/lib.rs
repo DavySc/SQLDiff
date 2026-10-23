@@ -10,6 +10,7 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, Options, Report};
 use sqldiff_syntax::{ast, parse, LineIndex, SyntaxElement, SyntaxKind, SyntaxNode};
 
+pub mod convert;
 pub mod server;
 
 /// The UI page; the payload is injected by the server or by `export`.
