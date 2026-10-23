@@ -1,0 +1,10 @@
+[package]
+name = "sqldiff-syntax"
+description = "Lossless lexers and concrete syntax trees for T-SQL, PostgreSQL (incl. PL/pgSQL) and Db2 for i SQL PL"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+rowan.workspace = true
