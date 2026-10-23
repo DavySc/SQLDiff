@@ -219,7 +219,6 @@ fn queue_flip_comment_and_link() {
     ]);
     let filtered = &r[2]["result"]["structuredContent"];
     assert_eq!(filtered["pairs"].as_array().unwrap().len(), 1);
-    // Every pair has a semantic finding once statement equivalence runs.
     assert_eq!(filtered["omitted_pairs"], 2);
     let s = &r[0]["result"]["structuredContent"];
     let pairs = s["pairs"].as_array().unwrap();
@@ -235,7 +234,7 @@ fn queue_flip_comment_and_link() {
         pg["verdict_flipping"],
         json!(["ASM-CALLER-CHECKS-RC", "ASM-TSQL-CALLER-XACT-ABORT-OFF"])
     );
-    // error.contract and equiv.unproven.
+    // Plus the unproven ItemId/item_id statement.
     assert_eq!(pg["review"]["unreviewed"], 2);
     assert_eq!(r[1]["result"]["isError"], true);
 
