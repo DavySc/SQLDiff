@@ -422,3 +422,26 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
+
+/// The store as the review queue sees it at one moment: expired and
+/// outdated decisions count as unreviewed.
+pub struct Lookup<'a> {
+    pub store: &'a Store,
+    pub now: String,
+}
+
+impl sqldiff_source::queue::ReviewLookup for Lookup<'_> {
+    fn state(
+        &self,
+        fingerprint: &str,
+        snapshot: &str,
+    ) -> Option<sqldiff_source::queue::ReviewState> {
+        use sqldiff_source::queue::ReviewState as Q;
+        match self.store.status(fingerprint, snapshot, &self.now).state {
+            ReviewState::Accepted => Some(Q::Accepted),
+            ReviewState::Rejected => Some(Q::Rejected),
+            ReviewState::Commented => Some(Q::Commented),
+            ReviewState::Unreviewed | ReviewState::Expired | ReviewState::Outdated => None,
+        }
+    }
+}

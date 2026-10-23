@@ -117,10 +117,6 @@ fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Artifac
     tree::read(path, dialect, cfg).map_err(|e| e.0)
 }
 
-fn with_policy(r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
-    tree::with_policy(r, a, b, cfg)
-}
-
 fn exit_for(verdict: Verdict) -> ExitCode {
     match verdict {
         Verdict::Equal | Verdict::EqualUnderAssumptions => ExitCode::from(0),
