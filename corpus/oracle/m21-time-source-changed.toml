@@ -1,0 +1,13 @@
+case = "m21-time-source-changed"
+pairs = [["original", "mutated"]]
+reproducible = false
+why = "now() and clock_timestamp() differ only in a multi-statement transaction or a slow statement, and timestamps are not compared"
+observe = ["orders(order_id, status)"]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at) VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO orders (customer_id, status, created_at) VALUES (1, 'N', '2026-01-02 09:00:00');
+"""
+
+[[scenario]]
+name = "ship"
+call = "CALL ship_orders(1);"

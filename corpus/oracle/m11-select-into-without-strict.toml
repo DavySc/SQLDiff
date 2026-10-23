@@ -1,0 +1,14 @@
+case = "m11-select-into-without-strict"
+pairs = [["original", "mutated"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at) VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at) VALUES (2, 'al@example.com', 'Al', 'Archer', '2026-01-01 10:00:00');
+"""
+
+[[scenario]]
+name = "two customers share the last name"
+call = "SELECT customer_by_last_name('Archer') IS NOT NULL;"
+
+[[scenario]]
+name = "no customer has the last name"
+call = "SELECT customer_by_last_name('Nobody');"
