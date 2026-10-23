@@ -400,6 +400,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqldiff-corpus"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sqldiff-core",
+ "sqldiff-syntax",
+ "toml",
+]
+
+[[package]]
 name = "sqldiff-gui"
 version = "0.1.0"
 dependencies = [

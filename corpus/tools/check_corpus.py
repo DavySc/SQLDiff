@@ -164,13 +164,37 @@ def check_mutation_catalog(mutations: dict):
 def check_manifest():
     manifest = tomllib.loads((CORPUS / "MANIFEST.toml").read_text("utf-8"))
     paths = {f["path"] for f in manifest.get("fixture", [])}
-    expected = {"catalog", "packs"}
+    expected = {"catalog", "packs", "oracle"}
     expected |= {f"pairs/{d.name}" for d in (CORPUS / "pairs").iterdir() if d.is_dir()}
     expected |= {f"mutations/{d.name}" for d in (CORPUS / "mutations").iterdir() if d.is_dir()}
     for p in sorted(expected - paths):
         err("MANIFEST.toml", f"{p} has no entry")
     for p in sorted(paths - expected):
         err("MANIFEST.toml", f"{p} does not exist")
+
+
+def check_oracle_specs(cases: dict):
+    """corpus/oracle/*.toml name an existing case and sides it has (tools/fault_oracle.py)."""
+    by_id = {d.name: c for d, c in cases.items() if c}
+    for path in sorted((CORPUS / "oracle").glob("*.toml")):
+        rel = path.relative_to(CORPUS)
+        try:
+            spec = tomllib.loads(path.read_text("utf-8"))
+        except tomllib.TOMLDecodeError as e:
+            err(rel, str(e))
+            continue
+        case = by_id.get(spec.get("case"))
+        if case is None:
+            err(rel, f"case {spec.get('case')!r} does not exist")
+            continue
+        if path.stem != spec["case"]:
+            err(rel, "file name must be the case id")
+        for pair in spec.get("pairs", []):
+            for side in pair:
+                if side not in case.get("sides", {}):
+                    err(rel, f"case has no side {side!r}")
+        if not spec.get("scenario"):
+            err(rel, "no [[scenario]]")
 
 
 def engine_jobs(dialect: str, cases: dict):
@@ -249,6 +273,7 @@ def main():
             cases[d] = mutations[d.name] = check_case(d, "mutation")
     check_mutation_catalog(mutations)
     check_manifest()
+    check_oracle_specs(cases)
     if args.pg:
         check_pg(args.pg, cases)
     if args.mssql:

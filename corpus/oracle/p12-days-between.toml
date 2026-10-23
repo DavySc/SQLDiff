@@ -1,0 +1,13 @@
+case = "p12-days-between"
+pairs = [["tsql", "pg"], ["tsql", "pg_nearmiss"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO orders (customer_id, status, created_at, shipped_at) VALUES (1, 'S', '2026-01-02 23:00:00', '2026-01-03 01:00:00');
+INSERT INTO orders (customer_id, status, created_at, shipped_at) VALUES (1, 'S', '2026-01-02 09:00:00', '2026-01-05 08:00:00');
+INSERT INTO orders (customer_id, status, created_at, shipped_at) VALUES (1, 'N', '2026-01-02 09:00:00', NULL);
+"""
+
+[[scenario]]
+name = "every order"
+call = "SELECT order_id, ship_days FROM order_ship_days ORDER BY order_id;"

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sqldiff-syntax", "crates/sqldiff-core", "crates/sqldiff-source", "crates/sqldiff-cli", "crates/sqldiff-mcp", "crates/sqldiff-gui"]
+members = ["crates/sqldiff-syntax", "crates/sqldiff-core", "crates/sqldiff-source", "crates/sqldiff-cli", "crates/sqldiff-mcp", "crates/sqldiff-gui", "crates/sqldiff-corpus"]
 
 [workspace.package]
 version = "0.1.0"

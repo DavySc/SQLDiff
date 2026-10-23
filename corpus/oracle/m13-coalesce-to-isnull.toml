@@ -1,0 +1,9 @@
+case = "m13-coalesce-to-isnull"
+pairs = [["original", "mutated"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at) VALUES (1, 'a.very.long.address.that.goes.on.and.on.and.on@example.com', NULL, 'Archer', '2026-01-01 10:00:00');
+"""
+
+[[scenario]]
+name = "NULL first name, long email"
+call = "SELECT customer_id, greeting_name FROM dbo.customer_greeting;"

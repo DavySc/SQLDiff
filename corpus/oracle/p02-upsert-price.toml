@@ -1,0 +1,19 @@
+case = "p02-upsert-price"
+pairs = [["tsql", "pg"]]
+observe = ["item_price(item_id, unit_price)"]
+faults = ["item_price"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO item (item_id, name) VALUES (2, 'nut');
+INSERT INTO item_price (item_id, unit_price) VALUES (1, 5.00);
+"""
+
+[[scenario]]
+name = "update an existing price"
+call.tsql = "EXEC dbo.set_item_price 1, 6.25;"
+call.pg = "CALL set_item_price(1, 6.25);"
+
+[[scenario]]
+name = "insert a new price"
+call.tsql = "EXEC dbo.set_item_price 2, 7.50;"
+call.pg = "CALL set_item_price(2, 7.50);"

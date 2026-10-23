@@ -1,0 +1,13 @@
+case = "p01-move-stock"
+pairs = [["tsql", "pg"]]
+observe = ["stock(item_id, qty)", "stock_log(item_id, delta)"]
+faults = ["stock", "stock_log"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO stock (item_id, qty) VALUES (1, 10);
+"""
+
+[[scenario]]
+name = "caller checks the return code"
+call.tsql = "DECLARE @rc int; EXEC @rc = dbo.move_stock 1, 3; SELECT @rc;"
+call.pg = "SELECT move_stock(1, 3);"
