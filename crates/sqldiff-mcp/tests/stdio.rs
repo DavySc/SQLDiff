@@ -1,0 +1,181 @@
+//! Drives the `sqldiff-mcp` binary over stdio like an MCP client would.
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
+
+use serde_json::{json, Value};
+
+fn fixture(name: &str) -> String {
+    format!("{}/../../tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Send each message and collect one response per request (not per notification).
+fn session(messages: &[Value]) -> Vec<Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sqldiff-mcp"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let mut responses = Vec::new();
+    for m in messages {
+        writeln!(stdin, "{m}").unwrap();
+        stdin.flush().unwrap();
+        if m.get("id").is_some() {
+            let mut line = String::new();
+            out.read_line(&mut line).unwrap();
+            responses.push(serde_json::from_str(&line).unwrap());
+        }
+    }
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    responses
+}
+
+fn call(id: u64, name: &str, args: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": args } })
+}
+
+#[test]
+fn handshake_list_and_conversion_review() {
+    let r = session(&[
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                            "clientInfo": { "name": "test", "version": "0" } } }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        call(
+            3,
+            "diff",
+            json!({
+                "a": { "path": fixture("movestock.tsql.sql"), "dialect": "tsql" },
+                "b": { "path": fixture("movestock.db2i.sql"), "dialect": "db2i" },
+            }),
+        ),
+    ]);
+    assert_eq!(r[0]["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(r[0]["result"]["serverInfo"]["name"], "sqldiff");
+
+    let names: Vec<&str> = r[1]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["diff", "check", "finding"]);
+
+    let res = &r[2]["result"];
+    assert_eq!(res["isError"], false);
+    let s = &res["structuredContent"];
+    assert_eq!(s["verdict"], "different");
+    let cards = s["findings"].as_array().unwrap();
+    assert!(cards.iter().any(|c| c["class"] == "transactional"));
+    // Most severe first.
+    assert_eq!(cards[0]["severity"], "critical");
+    assert!(res["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("Verdict: DIFFERENT"));
+}
+
+#[test]
+fn reformat_is_equal_and_finding_expands() {
+    let reformatted = session(&[call(
+        1,
+        "diff",
+        json!({
+            "a": { "path": fixture("movestock.tsql.sql"), "dialect": "tsql" },
+            "b": { "path": fixture("movestock_reformatted.tsql.sql"), "dialect": "tsql" },
+        }),
+    )]);
+    let s = &reformatted[0]["result"]["structuredContent"];
+    assert!(matches!(
+        s["verdict"].as_str(),
+        Some("equal" | "equal_under_assumptions")
+    ));
+    assert_eq!(s["finding_count"], 0);
+
+    // Expand a card from an earlier call in the same session; inline text works too.
+    let text = |f: &str| std::fs::read_to_string(fixture(f)).unwrap();
+    let r = session(&[call(
+        1,
+        "diff",
+        json!({
+            "a": { "text": text("movestock.tsql.sql"), "dialect": "tsql", "name": "movestock.tsql.sql" },
+            "b": { "text": text("movestock.pg.sql"), "dialect": "postgres", "name": "movestock.pg.sql" },
+            "max_findings": 1,
+        }),
+    )]);
+    let s = &r[0]["result"]["structuredContent"];
+    assert_eq!(s["findings"].as_array().unwrap().len(), 1);
+    let fp = s["findings"][0]["fingerprint"].clone();
+    let r = session(&[
+        call(
+            1,
+            "diff",
+            json!({
+                "a": { "text": text("movestock.tsql.sql"), "dialect": "tsql", "name": "movestock.tsql.sql" },
+                "b": { "text": text("movestock.pg.sql"), "dialect": "postgres", "name": "movestock.pg.sql" },
+            }),
+        ),
+        call(2, "finding", json!({ "fingerprint": fp })),
+        call(3, "finding", json!({ "fingerprint": "nope" })),
+    ]);
+    assert_eq!(
+        r[1]["result"]["structuredContent"]["finding"]["fingerprint"],
+        fp
+    );
+    assert_eq!(r[2]["result"]["isError"], true);
+}
+
+#[test]
+fn check_and_errors() {
+    let r = session(&[
+        call(
+            1,
+            "check",
+            json!({ "artifact": { "path": fixture("catch_rethrow.tsql.sql"), "dialect": "tsql" } }),
+        ),
+        call(
+            2,
+            "check",
+            json!({ "artifact": { "path": "x.sql", "text": "x", "dialect": "tsql" } }),
+        ),
+        call(
+            3,
+            "check",
+            json!({ "artifact": { "text": "select 1", "dialect": "oracle" } }),
+        ),
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "no/such" }),
+        call(5, "nope", json!({})),
+    ]);
+    let s = &r[0]["result"]["structuredContent"];
+    assert!(s["findings"].as_array().unwrap().iter().any(|c| c["rule"]
+        .as_str()
+        .unwrap()
+        .contains("terminator")
+        || c["witness"].as_str().unwrap().contains("THROW")));
+    assert_eq!(r[1]["result"]["isError"], true);
+    assert_eq!(r[2]["result"]["isError"], true);
+    assert_eq!(r[3]["error"]["code"], -32601);
+    assert_eq!(r[4]["error"]["code"], -32602);
+}
+
+#[test]
+fn parse_error_and_ping() {
+    let mut server = sqldiff_mcp::Server::new();
+    let out: Value = serde_json::from_str(&server.handle_line("{not json").unwrap()).unwrap();
+    assert_eq!(out["error"]["code"], -32700);
+    let out: Value = serde_json::from_str(
+        &server
+            .handle_line(r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(out["result"], json!({}));
+    assert!(server
+        .handle_line(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#)
+        .is_none());
+}
