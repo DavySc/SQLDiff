@@ -5,6 +5,8 @@
 //! equivalent is reported as "unknown" or "equal under assumptions".
 
 pub mod artifact;
+pub mod bind;
+pub mod catalog;
 pub mod classify;
 pub mod composition;
 mod engine;
@@ -19,6 +21,7 @@ pub mod phrase;
 pub mod render;
 pub mod rules;
 pub mod session;
+pub mod tokens;
 pub mod treediff;
 
 pub use artifact::Artifact;

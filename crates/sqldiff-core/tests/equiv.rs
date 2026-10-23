@@ -170,7 +170,21 @@ fn parameter_shadowed_by_a_column_is_not_resolved() {
       BEGIN RETURN (SELECT name FROM item WHERE item.item_id = item_id); END; $$;";
     let db2 = "CREATE FUNCTION f (item_id INTEGER) RETURNS VARCHAR(100) LANGUAGE SQL
       BEGIN RETURN (SELECT name FROM item WHERE item.item_id = item_id); END;";
-    assert_eq!(run(pg, P, db2, D, true).verdict, Verdict::Unknown);
+    // Equivalence does not resolve the name; binding does: under PL/pgSQL's
+    // default `variable_conflict = error` the PostgreSQL side raises
+    // "column reference is ambiguous", while Db2 takes the column.
+    let r = run(pg, P, db2, D, true);
+    assert_eq!(r.verdict, Verdict::Different, "{:?}", rules(&r));
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "bind.ambiguous-name")
+        .expect("ambiguous-name finding");
+    assert_eq!(f.assumptions, ["ASM-PG-VARIABLE-CONFLICT-ERROR"]);
+    assert!(r
+        .assumptions
+        .iter()
+        .any(|a| a.id == "ASM-PG-VARIABLE-CONFLICT-ERROR"));
 }
 
 #[test]
@@ -319,4 +333,36 @@ fn tsql_continues_after_a_failed_statement() {
         "{:?}",
         rules(&r)
     );
+}
+
+/// Large character types (T-SQL `ntext`, Db2 `clob`) compare as strings: the
+/// collation difference keeps the pair from being equal.
+#[test]
+fn large_character_columns_are_strings() {
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            T,
+            "CREATE VIEW dbo.v AS SELECT id FROM dbo.notes WHERE body = title;",
+        ),
+        &Artifact::new(
+            "b.sql",
+            D,
+            "CREATE VIEW v AS SELECT id FROM notes WHERE body = title;",
+        ),
+        &Options {
+            catalog_a: vec![Artifact::new(
+                "c.sql",
+                T,
+                "CREATE TABLE dbo.notes (id int NOT NULL PRIMARY KEY, body ntext NULL, title ntext NULL);",
+            )],
+            catalog_b: vec![Artifact::new(
+                "c.sql",
+                D,
+                "CREATE TABLE notes (id int NOT NULL PRIMARY KEY, body clob(1M), title clob(1M));",
+            )],
+            ..Options::default()
+        },
+    );
+    assert!(not_equal(&r), "{:?} {:?}", r.verdict, rules(&r));
 }

@@ -2,15 +2,15 @@
 //! nullability, identity columns and unique keys, read from CREATE TABLE and
 //! CREATE UNIQUE INDEX statements in DDL artifacts.
 //!
-//! Deliberately minimal and private to `equiv`; a full catalog model with
-//! binding is separate work and can replace this behind [`Schema::table`].
+//! Built from the shared catalog (`crate::catalog`) that binding uses.
 
 use std::collections::HashMap;
 
-use sqldiff_syntax::{parse, Dialect, SyntaxKind};
+use sqldiff_syntax::{parse, Dialect};
 
-use super::ast::{tokens, Parser, Tok, Type, K};
+use super::ast::Type;
 use crate::artifact::Artifact;
+use crate::catalog::{ddl, Catalog, CatalogView, DataType, TableKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fam {
@@ -113,6 +113,19 @@ impl Ty {
                 fam_len(Fam::VarChar, tsql_default)
             }
             "TEXT" => Ty::of(Fam::VarChar),
+            // Large and double-byte character types compare as strings too
+            // (collation applies); CITEXT is left out on purpose (case-insensitive).
+            "CLOB" | "NCLOB" | "DBCLOB" | "NTEXT" | "VARGRAPHIC" | "LONG VARCHAR"
+            | "LONG VARGRAPHIC" => Ty {
+                fam: Fam::VarChar,
+                len: if max { None } else { n(0) },
+                scale: None,
+            },
+            "GRAPHIC" => Ty {
+                fam: Fam::Char,
+                len: n(0).or(Some(1)),
+                scale: None,
+            },
             "CHAR" | "NCHAR" | "CHARACTER" | "BPCHAR" => Ty {
                 fam: Fam::Char,
                 len: n(0).or(Some(1)),
@@ -184,179 +197,86 @@ impl Schema {
         self.tables.get(&name.to_lowercase())
     }
 
+    /// Reads DDL artifacts through the shared catalog loader; files fold in order.
     pub fn load(artifacts: &[Artifact]) -> Schema {
-        let mut s = Schema::default();
+        let Some(first) = artifacts.first() else {
+            return Schema::default();
+        };
+        let mut cat = Catalog::default();
         for a in artifacts {
-            s.sources.push(a.path.clone());
-            s.add_ddl(&a.text, a.dialect);
+            let root = parse(&a.text, a.dialect).syntax();
+            ddl::load_tree(&mut cat, &root, a.dialect);
+            cat.origin = a.path.clone();
         }
+        let mut s = Schema::from_view(&CatalogView::new(first.dialect, &[&cat]));
+        s.sources = artifacts.iter().map(|a| a.path.clone()).collect();
         s
     }
 
-    fn add_ddl(&mut self, text: &str, d: Dialect) {
-        let root = parse(text, d).syntax();
-        for node in root
-            .descendants()
-            .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+    /// The facts equivalence needs from one side's catalog (DDL, bundles and
+    /// adapter catalogs, as the binder sees them).
+    pub fn from_view(view: &CatalogView) -> Schema {
+        let d = view.dialect;
+        let mut s = Schema {
+            sources: view.origins.clone(),
+            ..Schema::default()
+        };
+        // Base and temporary tables only: view columns are derived, and their
+        // types and nullability are not facts equivalence may rely on.
+        for t in view
+            .catalog
+            .tables
+            .iter()
+            .filter(|t| matches!(t.kind, TableKind::Table | TableKind::Temporary))
         {
-            let toks = tokens(&node);
-            let w = |i: usize| toks.get(i).map(|t| t.up.as_str()).unwrap_or("");
-            if w(0) != "CREATE" {
-                continue;
-            }
-            if w(1) == "TABLE" {
-                let skip = if (w(2), w(3), w(4)) == ("IF", "NOT", "EXISTS") {
-                    5
-                } else {
-                    2
-                };
-                if let Some(t) = create_table(&toks[skip..], d) {
-                    self.tables.insert(t.name.clone(), t);
-                }
-            } else if w(1) == "UNIQUE" {
-                let mut i = 2;
-                if matches!(w(i), "CLUSTERED" | "NONCLUSTERED") {
-                    i += 1;
-                }
-                if w(i) != "INDEX" {
-                    continue;
-                }
-                if let Some((table, cols)) = unique_index(&toks[i + 1..], d) {
-                    if let Some(t) = self.tables.get_mut(&table) {
-                        t.keys.push(cols);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn split_top(toks: &[Tok]) -> Vec<&[Tok]> {
-    let mut out = Vec::new();
-    let mut depth = 0;
-    let mut start = 0;
-    for (i, t) in toks.iter().enumerate() {
-        match t.kind {
-            K::LParen => depth += 1,
-            K::RParen => depth -= 1,
-            K::Comma if depth == 0 => {
-                out.push(&toks[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(&toks[start..]);
-    out
-}
-
-fn paren_names(toks: &[Tok]) -> Vec<String> {
-    toks.iter()
-        .skip_while(|t| t.kind != K::LParen)
-        .take_while(|t| t.kind != K::RParen)
-        .filter(|t| matches!(t.kind, K::Word | K::Quoted))
-        .map(|t| sqldiff_syntax::ast::unquote(&t.text).to_lowercase())
-        .collect()
-}
-
-fn create_table(toks: &[Tok], d: Dialect) -> Option<Table> {
-    let mut p = Parser::new(toks, d);
-    let name = p.qname().ok()?.last()?.to_lowercase();
-    let open = toks.iter().position(|t| t.kind == K::LParen)?;
-    let close = toks.iter().rposition(|t| t.kind == K::RParen)?;
-    let mut t = Table {
-        name,
-        ..Table::default()
-    };
-    let mut pk: Vec<String> = Vec::new();
-    for el in split_top(&toks[open + 1..close]) {
-        let Some(first) = el.first() else { continue };
-        match first.up.as_str() {
-            "PRIMARY" => pk = paren_names(el),
-            "UNIQUE" => t.keys.push(paren_names(el)),
-            "CONSTRAINT" | "FOREIGN" | "CHECK" | "INDEX" => {
-                if el.iter().any(|x| x.up == "PRIMARY") {
-                    pk = paren_names(el);
-                } else if el.iter().any(|x| x.up == "UNIQUE") {
-                    t.keys.push(paren_names(el));
-                }
-            }
-            _ => {
-                let mut p = Parser::new(el, d);
-                let Ok(cname) = p.qname() else { continue };
-                let ty = p
-                    .ty()
-                    .map(|ty| Ty::from_type(&ty, d, false))
-                    .unwrap_or(Ty::of(Fam::Other));
-                let rest = &el[p.i..];
-                let has = |a: &str, b: &str| rest.windows(2).any(|w| w[0].up == a && w[1].up == b);
-                let name = cname.last().unwrap().to_lowercase();
-                let is_pk = has("PRIMARY", "KEY");
-                if is_pk {
-                    pk = vec![name.clone()];
-                }
-                if rest.iter().any(|x| x.up == "UNIQUE") {
-                    t.keys.push(vec![name.clone()]);
-                }
-                t.columns.push(Column {
-                    not_null: is_pk || has("NOT", "NULL"),
-                    identity: rest.iter().any(|x| x.up == "IDENTITY"),
+            let lower = |v: &[String]| v.iter().map(|c| c.to_lowercase()).collect::<Vec<_>>();
+            let mut keys: Vec<Vec<String>> = t.keys.iter().map(|k| lower(&k.columns)).collect();
+            keys.extend(
+                t.indexes
+                    .iter()
+                    .filter(|i| i.unique)
+                    .map(|i| lower(&i.columns)),
+            );
+            let columns = t
+                .columns
+                .iter()
+                .map(|c| Column {
+                    name: c.name.to_lowercase(),
+                    ty: ty_of(&c.data_type, d),
+                    not_null: !c.nullable,
+                    identity: c.identity,
+                })
+                .collect();
+            let name = t.name.to_lowercase();
+            s.tables.insert(
+                name.clone(),
+                Table {
                     name,
-                    ty,
-                });
-            }
+                    columns,
+                    keys,
+                },
+            );
         }
+        s
     }
-    if !pk.is_empty() {
-        for c in &mut t.columns {
-            if pk.contains(&c.name) {
-                c.not_null = true;
-            }
-        }
-        t.keys.insert(0, pk);
-    }
-    Some(t)
 }
 
-/// The key of `CREATE UNIQUE INDEX ... ON t (c, ...)`. None for an index
-/// that is not a plain column key: expression elements or a WHERE filter
-/// (partial or filtered index).
-fn unique_index(toks: &[Tok], d: Dialect) -> Option<(String, Vec<String>)> {
-    let on = toks.iter().position(|t| t.up == "ON")?;
-    let rest = &toks[on + 1..];
-    let mut p = Parser::new(rest, d);
-    let table = p.qname().ok()?.last()?.to_lowercase();
-    let open = p.i;
-    if rest.get(open)?.kind != K::LParen {
-        return None;
+fn ty_of(t: &DataType, d: Dialect) -> Ty {
+    if !t.is_known() {
+        return Ty::of(Fam::Other);
     }
-    let mut depth = 0;
-    let close = (open..rest.len()).find(|&i| {
-        match rest[i].kind {
-            K::LParen => depth += 1,
-            K::RParen => depth -= 1,
-            _ => {}
-        }
-        depth == 0
-    })?;
-    let mut cols = Vec::new();
-    for el in split_top(&rest[open + 1..close]) {
-        match el {
-            [c] | [c, _]
-                if matches!(c.kind, K::Word | K::Quoted)
-                    && el
-                        .get(1)
-                        .map_or(true, |o| matches!(o.up.as_str(), "ASC" | "DESC")) =>
-            {
-                cols.push(sqldiff_syntax::ast::unquote(&c.text).to_lowercase());
-            }
-            _ => return None,
-        }
+    let mut args: Vec<String> = t.args.iter().map(u32::to_string).collect();
+    if t.max {
+        args.insert(0, "MAX".to_string());
     }
-    if cols.is_empty() || rest[close + 1..].iter().any(|t| t.up == "WHERE") {
-        return None;
-    }
-    Some((table, cols))
+    Ty::from_type(
+        &Type {
+            name: t.base.clone(),
+            args,
+        },
+        d,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -422,5 +342,23 @@ mod tests {
         assert_eq!(ty(Dialect::Tsql), (Some(18), Some(0)));
         assert_eq!(ty(Dialect::Db2i), (Some(5), Some(0)));
         assert_eq!(ty(Dialect::Postgres), (None, None));
+    }
+
+    #[test]
+    fn large_character_types_are_strings() {
+        for (ddl, d) in [
+            ("CREATE TABLE t (a ntext, b nvarchar(max));", Dialect::Tsql),
+            ("CREATE TABLE t (a clob(1M), b dbclob(100));", Dialect::Db2i),
+            (
+                "CREATE TABLE t (a vargraphic(20), b graphic(4));",
+                Dialect::Db2i,
+            ),
+        ] {
+            let s = Schema::load(&[Artifact::new("t.sql", d, ddl)]);
+            let t = s.table("t").unwrap();
+            for c in &t.columns {
+                assert!(c.ty.is_string(), "{ddl}: {} is {:?}", c.name, c.ty);
+            }
+        }
     }
 }

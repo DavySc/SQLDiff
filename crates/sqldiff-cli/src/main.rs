@@ -63,17 +63,8 @@ enum Command {
         /// Maximum excerpt lines per location (default: config, else 3).
         #[arg(long)]
         excerpt_lines: Option<usize>,
-        /// DDL file (CREATE TABLE, CREATE UNIQUE INDEX) describing the catalog
-        /// both sides run against, read in each side's dialect. Repeatable.
-        /// Keys, nullability and column types discharge equivalence side conditions.
-        #[arg(long, value_name = "FILE")]
-        catalog: Vec<PathBuf>,
-        /// Catalog DDL for side A only. Repeatable.
-        #[arg(long, value_name = "FILE")]
-        catalog_a: Vec<PathBuf>,
-        /// Catalog DDL for side B only. Repeatable.
-        #[arg(long, value_name = "FILE")]
-        catalog_b: Vec<PathBuf>,
+        #[command(flatten)]
+        catalogs: source_cmd::CatalogArgs,
         /// Check mode: templates by name (file stem) for the composed parts;
         /// each generated part is compared with its substituted template.
         #[arg(long, value_name = "DIR")]
@@ -107,6 +98,8 @@ enum Command {
         /// Extra parameter value for check mode (source `cli`): NAME=VALUE.
         #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value, requires = "templates")]
         params: Vec<(String, String)>,
+        #[command(flatten)]
+        catalogs: source_cmd::CatalogArgs,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
         #[command(flatten)]
@@ -357,9 +350,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
-            catalog,
-            catalog_a,
-            catalog_b,
+            catalogs,
             flips,
             templates,
             params,
@@ -370,27 +361,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
             let b = read(&b, dialect_b.or(dialect), &cfg)?;
-            let ddl = |paths: &[PathBuf], d: Dialect| -> Result<Vec<Artifact>, String> {
-                paths
-                    .iter()
-                    .map(|p| {
-                        let text = std::fs::read_to_string(p)
-                            .map_err(|e| format!("{}: {e}", p.display()))?;
-                        Ok(Artifact::new(p.display().to_string(), d, text))
-                    })
-                    .collect()
-            };
-            let mut cat_a = ddl(&catalog, a.dialect)?;
-            cat_a.extend(ddl(&catalog_a, a.dialect)?);
-            let mut cat_b = ddl(&catalog, b.dialect)?;
-            cat_b.extend(ddl(&catalog_b, b.dialect)?);
-            let opts = Options {
-                excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
-                catalog_a: cat_a,
-                catalog_b: cat_b,
-                flips: flips.flips(),
-                ..cfg.options()
-            };
+            let mut opts = cfg.options();
+            opts.excerpt_lines = excerpt_lines.unwrap_or(cfg.excerpt_lines);
+            opts.flips = flips.flips();
+            catalogs.apply(&mut opts, a.dialect, Some(b.dialect))?;
             let mut pipe = Pipeline::new(cfg, &review)?;
             if template {
                 let report = template_diff(&a, &b, &pipe.cfg, &opts)?;
@@ -408,6 +382,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             file,
             dialect,
             format,
+            catalogs,
             templates,
             params,
             cfg,
@@ -417,7 +392,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let art = read(&file, dialect, &cfg)?;
             let mut pipe = Pipeline::new(cfg, &review)?;
             pipe.templates = template_dir(templates.as_deref(), params)?;
-            let report = pipe.run(&art, None, &pipe.options());
+            let mut opts = pipe.options();
+            catalogs.apply(&mut opts, art.dialect, None)?;
+            let report = pipe.run(&art, None, &opts);
             let verdict = report.open_verdict();
             emit(report, format, &mut pipe)?;
             Ok(exit_for(verdict))

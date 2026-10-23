@@ -4,12 +4,14 @@
 //! `git:REPO[@REV][//SUBDIR]` or `adapter:NAME`. Without one, the `[source]`
 //! of the project or user config is used.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Args, Subcommand};
-use sqldiff_core::{render, Report, Verdict};
+use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
 use sqldiff_source::bundle::CaptureOptions;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::protocol::{ObjectFilter, PairScope};
@@ -48,6 +50,97 @@ pub fn key_value(s: &str) -> Result<(String, String), String> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
         .ok_or_else(|| format!("expected KEY=VALUE, got `{s}`"))
+}
+
+/// Catalogs the binder and statement equivalence check names against.
+#[derive(Args, Clone, Default)]
+pub struct CatalogArgs {
+    /// Catalog for both sides: DDL (`.sql`, read in each side's dialect) or a
+    /// snapshot bundle (`.json`: its catalog and object DDL). Repeatable; files
+    /// fold in order. Names are bound against it, and keys, nullability and
+    /// column types discharge equivalence side conditions.
+    #[arg(long, value_name = "FILE")]
+    catalog: Vec<PathBuf>,
+    /// Catalog for side A only. Repeatable.
+    #[arg(long, value_name = "FILE")]
+    catalog_a: Vec<PathBuf>,
+    /// Catalog for side B only. Repeatable.
+    #[arg(long, value_name = "FILE")]
+    catalog_b: Vec<PathBuf>,
+}
+
+impl CatalogArgs {
+    /// Adds the catalogs to `opts`; `b` is `None` for `check`, which has one side.
+    pub fn apply(&self, opts: &mut Options, a: Dialect, b: Option<Dialect>) -> Result<(), String> {
+        if b.is_none() && !self.catalog_b.is_empty() {
+            return Err("--catalog-b needs two sides; check takes --catalog or --catalog-a".into());
+        }
+        let mut cache = HashMap::new();
+        for p in self.catalog.iter().chain(&self.catalog_a) {
+            load_catalog(p, a, &mut cache, &mut opts.catalog_a, &mut opts.facts_a)?;
+        }
+        if let Some(b) = b {
+            for p in self.catalog.iter().chain(&self.catalog_b) {
+                load_catalog(p, b, &mut cache, &mut opts.catalog_b, &mut opts.facts_b)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A catalog file as read once: a bundle, or DDL text.
+enum CatalogFile {
+    Bundle(Box<Bundle>, Option<Arc<sqldiff_core::catalog::Catalog>>),
+    Ddl(String),
+}
+
+fn load_catalog(
+    path: &Path,
+    dialect: Dialect,
+    cache: &mut HashMap<PathBuf, CatalogFile>,
+    ddl: &mut Vec<Artifact>,
+    facts: &mut Vec<Arc<sqldiff_core::catalog::Catalog>>,
+) -> Result<(), String> {
+    if !cache.contains_key(path) {
+        let file = if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+        {
+            let bundle = Bundle::load(path).map_err(|e| e.0)?;
+            let short = &bundle.snapshot_id[..bundle.snapshot_id.len().min(12)];
+            let core = (!bundle.catalog.is_empty())
+                .then(|| Arc::new(bundle.catalog.to_core(&format!("bundle:{short}"))));
+            CatalogFile::Bundle(Box::new(bundle), core)
+        } else {
+            CatalogFile::Ddl(
+                std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?,
+            )
+        };
+        cache.insert(path.to_path_buf(), file);
+    }
+    match &cache[path] {
+        CatalogFile::Bundle(bundle, core) => {
+            let short = &bundle.snapshot_id[..bundle.snapshot_id.len().min(12)];
+            facts.extend(core.iter().cloned());
+            for o in &bundle.objects {
+                if o.info.kind != "script" && o.info.dialect.as_deref() == Some(dialect.id()) {
+                    ddl.push(Artifact::new(
+                        format!("bundle:{short}/{}", o.info.id),
+                        dialect,
+                        o.text.clone(),
+                    ));
+                }
+            }
+        }
+        CatalogFile::Ddl(text) => {
+            ddl.push(Artifact::new(
+                path.display().to_string(),
+                dialect,
+                text.clone(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl ConfigArgs {

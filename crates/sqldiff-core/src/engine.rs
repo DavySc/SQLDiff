@@ -1,15 +1,19 @@
 //! Entry points: diff two artifacts, or check one.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::artifact::{Analyzed, Artifact};
+use crate::artifact::{content_hash, Analyzed, Artifact};
+use crate::bind::{self, BindInput, Bindings};
+use crate::catalog::builtins::Helper;
+use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::equiv;
 use crate::facts;
 use crate::lint;
 use crate::model::{
-    fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, NoiseCounts, Report, Severity,
-    Side, Verdict,
+    fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Location, NoiseCounts, Report,
+    Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::rules;
@@ -19,12 +23,19 @@ use crate::treediff;
 pub struct Options {
     /// Maximum lines of excerpt per location.
     pub excerpt_lines: usize,
-    /// DDL artifacts (CREATE TABLE / CREATE UNIQUE INDEX) describing the
-    /// catalog side A runs against; used to discharge key, nullability and
-    /// type side conditions of statement equivalence.
+    /// Catalog DDL for side A (`CREATE TABLE`, `CREATE UNIQUE INDEX`,
+    /// `CREATE PROCEDURE`, ...), each read in its own dialect. Binding checks
+    /// names against it; statement equivalence uses keys, nullability and types
+    /// to discharge side conditions. `check` uses these for its one artifact.
     pub catalog_a: Vec<Artifact>,
-    /// The same for side B.
+    /// Catalog DDL for side B.
     pub catalog_b: Vec<Artifact>,
+    /// Structured catalog facts for side A (adapter `get_catalog`, snapshot bundles).
+    pub facts_a: Vec<Arc<Catalog>>,
+    /// Structured catalog facts for side B.
+    pub facts_b: Vec<Arc<Catalog>>,
+    /// Pack-supplied helper functions, added to the built-in catalog.
+    pub helpers: Vec<Helper>,
     /// Session assumption flips (id → holds). Flips of scenario assumptions
     /// (`ir::behaviour::RERUN_ASSUMPTIONS`) re-run the behavioural analysis
     /// under the flipped environment; the rest are applied to verdicts by
@@ -42,10 +53,67 @@ impl Default for Options {
             excerpt_lines: 3,
             catalog_a: Vec::new(),
             catalog_b: Vec::new(),
+            facts_a: Vec::new(),
+            facts_b: Vec::new(),
+            helpers: Vec::new(),
             flips: BTreeMap::new(),
             declared: BTreeMap::new(),
         }
     }
+}
+
+/// Catalog DDL files folded into one catalog in order, so a later migration's
+/// `ALTER TABLE` applies to a table an earlier file created. Cached by paths and
+/// content (tree diffs reuse one catalog for every pair); the cache is bounded
+/// because the GUI and MCP server run for a long time.
+fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalog> {
+    type Cache = Mutex<HashMap<String, Arc<Catalog>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    const MAX_ENTRIES: usize = 32;
+    let mut key = dialect.id().to_string();
+    for a in ddl {
+        key.push('\0');
+        key.push_str(&a.path);
+        key.push('\0');
+        key.push_str(a.dialect.id());
+        key.push('\0');
+        key.push_str(&content_hash(&a.text));
+    }
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(c) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return c;
+    }
+    let mut cat = Catalog {
+        origin: ddl
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        ..Catalog::default()
+    };
+    for a in ddl {
+        let root = sqldiff_syntax::parse(&a.text, a.dialect).syntax();
+        ddl::load_tree(&mut cat, &root, a.dialect);
+    }
+    let c = Arc::new(cat);
+    if let Ok(mut m) = cache.lock() {
+        if m.len() >= MAX_ENTRIES {
+            m.clear();
+        }
+        m.insert(key, c.clone());
+    }
+    c
+}
+
+/// The catalog one side binds against.
+fn catalog_view(
+    dialect: sqldiff_syntax::Dialect,
+    ddl: &[Artifact],
+    facts: &[Arc<Catalog>],
+) -> CatalogView {
+    let loaded = (!ddl.is_empty()).then(|| ddl_catalog(dialect, ddl));
+    let sources: Vec<&Catalog> = loaded.iter().chain(facts).map(|c| c.as_ref()).collect();
+    CatalogView::new(dialect, &sources)
 }
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -66,8 +134,11 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     ];
     let mut unknown_reasons = Vec::new();
     let mut noise = NoiseCounts::default();
-    let schema_a = equiv::schema::Schema::load(&opts.catalog_a);
-    let schema_b = equiv::schema::Schema::load(&opts.catalog_b);
+    // One catalog per side serves binding and statement equivalence.
+    let view_a = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let view_b = catalog_view(b.dialect, &opts.catalog_b, &opts.facts_b);
+    let schema_a = equiv::schema::Schema::from_view(&view_a);
+    let schema_b = equiv::schema::Schema::from_view(&view_b);
     let mut eq = equiv::Outcome::default();
 
     if same {
@@ -144,6 +215,35 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         }
     }
 
+    let bound_a = bind::bind(
+        &aa,
+        &BindInput {
+            view: &view_a,
+            helpers: &opts.helpers,
+        },
+    );
+    let bound_b = bind::bind(
+        &ab,
+        &BindInput {
+            view: &view_b,
+            helpers: &opts.helpers,
+        },
+    );
+    let (bindf, binda) = bind::binding_findings(&Bindings {
+        a: (&aa, &bound_a, view_a.supplied),
+        b: Some((&ab, &bound_b, view_b.supplied)),
+    });
+    absorb_residue(&mut findings, &bindf);
+    findings.extend(bindf);
+    for x in binda {
+        if !assumptions.iter().any(|y| y.id == x.id) {
+            assumptions.push(x);
+        }
+    }
+    if view_a.supplied || view_b.supplied {
+        normalizations.push("names bound against the catalog".to_string());
+    }
+
     let env = crate::ir::behaviour::Env::from_options(opts);
     let beh = crate::ir::behaviour::analyze(&aa, &ab, &env);
     let witnesses = beh.witnesses;
@@ -212,7 +312,8 @@ pub fn overlay(a: &Artifact, b: &Artifact) -> crate::ir::overlay::Overlay {
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
-    let schema = equiv::schema::Schema::load(&opts.catalog_a);
+    let view = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let schema = equiv::schema::Schema::from_view(&view);
     let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
@@ -220,6 +321,19 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     for h in rules::analysis::hits(&aa, &schema, true) {
         findings.push(rules::analysis::to_finding(&aa, &h, Verdict::Unknown));
     }
+    let bound = bind::bind(
+        &aa,
+        &BindInput {
+            view: &view,
+            helpers: &opts.helpers,
+        },
+    );
+    let (bindf, assumptions) = bind::binding_findings(&Bindings {
+        a: (&aa, &bound, view.supplied),
+        b: None,
+    });
+    absorb_residue(&mut findings, &bindf);
+    findings.extend(bindf);
     let diagnostics = aa.diagnostics();
     let mut unknown_reasons = Vec::new();
     if !diagnostics.is_empty() {
@@ -233,7 +347,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         findings,
         noise: NoiseCounts::default(),
         normalizations: Vec::new(),
-        assumptions: Vec::new(),
+        assumptions,
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
@@ -241,6 +355,21 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         witnesses: Vec::new(),
         discharged: Vec::new(),
     })
+}
+
+/// A proven binding error (`GETDATE()` in PostgreSQL fails to bind) says more
+/// than the residue hit on the same text, so the residue finding is dropped.
+fn absorb_residue(findings: &mut Vec<Finding>, binding: &[Finding]) {
+    let overlaps = |x: &Option<Location>, y: &Option<Location>| match (x, y) {
+        (Some(x), Some(y)) => x.byte_start < y.byte_end && y.byte_start < x.byte_end,
+        _ => false,
+    };
+    findings.retain(|f| {
+        f.class != ChangeClass::Residue
+            || !binding.iter().any(|b| {
+                b.verdict == Verdict::Different && (overlaps(&f.a, &b.a) || overlaps(&f.b, &b.b))
+            })
+    });
 }
 
 pub(crate) fn finish(mut r: Report) -> Report {

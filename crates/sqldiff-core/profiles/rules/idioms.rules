@@ -181,6 +181,7 @@
   (form postgres (perform (call pg_advisory_xact_lock (call hashtext ?res))))
   (note postgres converted "hashtext() maps lock names to 32-bit keys, so two different names can share a key: more blocking, never less exclusion.")
   (example
+    (params (rc int))
     (tsql "EXEC @rc = sp_getapplock @Resource = 'price-feed', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1; IF @rc < 0 BEGIN ROLLBACK; THROW 50020, 'lock not granted', 1; END")
     (postgres "PERFORM pg_advisory_xact_lock(hashtext('price-feed'));")
     (expect unknown)))

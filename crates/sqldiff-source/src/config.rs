@@ -195,12 +195,25 @@ struct Compiled {
 }
 
 impl Resolved {
-    /// Engine options from this configuration: excerpt cap and declared
-    /// facts (a declared Db2 for i commit level is used by the analysis).
+    /// Engine options from this configuration: excerpt cap, declared facts (a
+    /// declared Db2 for i commit level is used by the analysis) and pack helper
+    /// functions for the built-in catalog.
     pub fn options(&self) -> sqldiff_core::Options {
         sqldiff_core::Options {
             excerpt_lines: self.excerpt_lines,
             declared: self.policy.assumptions.clone(),
+            helpers: self
+                .policy
+                .helpers
+                .iter()
+                .filter_map(|h| {
+                    Some(sqldiff_core::catalog::builtins::Helper {
+                        name: h.name.clone(),
+                        dialect: h.dialect.parse().ok()?,
+                        returns: h.returns.clone(),
+                    })
+                })
+                .collect(),
             ..sqldiff_core::Options::default()
         }
     }

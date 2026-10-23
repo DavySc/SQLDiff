@@ -171,6 +171,15 @@ pub fn report_key(a: &Artifact, b: Option<&Artifact>, opts: &Options, cfg: &Reso
         h.update(l.hash.as_bytes());
         h.update([0]);
     }
+    // Structured catalog facts change binding too; pack helpers are covered by
+    // the layer hashes.
+    for (tag, facts) in [(b"FA", &opts.facts_a), (b"FB", &opts.facts_b)] {
+        h.update(tag);
+        for f in facts {
+            h.update(serde_json::to_vec(f.as_ref()).unwrap_or_default());
+            h.update([0]);
+        }
+    }
     artifact_part(&mut h, a);
     match b {
         Some(b) => {

@@ -220,12 +220,16 @@ fn residue_in_converted_code() {
     let rs = rules(&r);
     for e in [
         "residue.tsql.dbo-schema",
-        "residue.tsql.builtin",
         "residue.tsql.variable",
+        // T-SQL built-ins fail to bind in Db2: a proven binding error replaces the residue hit.
+        "bind.unknown-builtin",
     ] {
         assert!(rs.contains(&e), "missing {e}: {rs:?}");
     }
-    assert!(r.findings.iter().all(|f| f.class == ChangeClass::Residue));
+    assert!(r
+        .findings
+        .iter()
+        .all(|f| f.class == ChangeClass::Residue || f.rule == "bind.unknown-builtin"));
     let pg = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n  SIGNAL SQLSTATE '75001';\n  UPDATE t SET ts = CURRENT TIMESTAMP;\nEND;\n$$;";
     let rs: Vec<String> = check(
         &Artifact::new("f.sql", Dialect::Postgres, pg),
