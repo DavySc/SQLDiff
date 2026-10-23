@@ -41,7 +41,7 @@ $B snapshot git:.@v1.2//db -o v1.2.json --history     # canonical, content-hashe
 $B pairs v1.2.json --diff                             # offline, from the bundle
 $B config                                             # merged config and its layers
 
-# Pair view in the browser (statement-aligned, findings panel, live scratchpad)
+# Pair view in the browser (statement-aligned, findings panel, live in-pane editing)
 target/release/sqldiff-gui serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
 target/release/sqldiff-gui export --report report.json -o pair.html   # static, read-only
 

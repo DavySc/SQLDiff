@@ -349,7 +349,7 @@ fn redacted_export_passes_leak_check() {
     let out_file = dir.join("export.json");
     std::fs::write(&out_file, &json).unwrap();
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/leak-scan.sh");
-    let scan = std::process::Command::new("bash")
+    let scan = std::process::Command::new(bash())
         .arg(&script)
         .arg("--file")
         .arg(&out_file)
@@ -365,6 +365,26 @@ fn redacted_export_passes_leak_check() {
         String::from_utf8_lossy(&scan.stdout),
         String::from_utf8_lossy(&scan.stderr)
     );
+}
+
+/// The bash that runs the leak scan. On Windows a bare `bash` resolves to the
+/// WSL relay in System32 (which fails without a distro) before PATH is
+/// consulted, so prefer `SQLDIFF_BASH`, then Git for Windows' bash.
+fn bash() -> PathBuf {
+    if let Some(p) = std::env::var_os("SQLDIFF_BASH") {
+        return PathBuf::from(p);
+    }
+    if cfg!(windows) {
+        for root in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(dir) = std::env::var_os(root) {
+                let p = PathBuf::from(dir).join("Git/bin/bash.exe");
+                if p.exists() {
+                    return p;
+                }
+            }
+        }
+    }
+    PathBuf::from("bash")
 }
 
 #[test]
