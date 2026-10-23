@@ -172,7 +172,7 @@ pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
     }
     match w0.as_str() {
         "SELECT" | "VALUES" => StmtKind::Select,
-        "WITH" => match dml_index(&toks).map(&w).as_deref() {
+        "WITH" => match dml_index(&toks).map(w).as_deref() {
             Some("INSERT") => StmtKind::Insert,
             Some("UPDATE") => StmtKind::Update,
             Some("DELETE") => StmtKind::Delete,
