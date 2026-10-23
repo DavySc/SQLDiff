@@ -1,63 +1,62 @@
 //! Session report: a short Markdown summary of a review session (design
 //! §6.2 "sessions export as short reports, optionally redacted").
 //!
-//! Redaction here is a stand-in until the shared redacted export of WP6
-//! lands: paths, object names, pack names, identifiers seen in either
-//! source and string literals become stable placeholders.
+//! Redaction uses the shared redactor of `sqldiff-review` (pack-derived
+//! terms, stable keyed placeholders, leak check), seeded with the session's
+//! paths, objects and every identifier seen in either source; string
+//! literals are masked as well.
 
-use std::collections::BTreeMap;
 use std::fmt::Write;
 
 use regex::Regex;
 use sqldiff_core::Report;
+use sqldiff_review::redact::Kind;
+use sqldiff_source::Resolved;
 use sqldiff_syntax::{SyntaxElement, SyntaxKind};
 
-use crate::review::Store;
+use crate::review::{time, Store};
 use crate::session::{Flip, QueueEntry, SessionInfo};
 
-/// Replaces names with stable placeholders.
+/// Replaces names with stable placeholders, or passes text through.
 pub struct Redactor {
-    on: bool,
-    /// Exact strings (paths), longest first.
-    exact: Vec<(String, String)>,
-    /// Lower-cased identifiers.
-    words: BTreeMap<String, String>,
-    word_re: Regex,
-    string_re: Regex,
+    inner: Option<sqldiff_review::Redactor>,
+    literal: Regex,
 }
 
 impl Redactor {
-    pub fn new(on: bool) -> Redactor {
+    pub fn new(cfg: &Resolved) -> Result<Redactor, String> {
+        Ok(Redactor {
+            inner: Some(sqldiff_review::Redactor::from_config(cfg).map_err(|e| e.0)?),
+            literal: Regex::new(r"'(?:[^']|'')*'").unwrap(),
+        })
+    }
+
+    pub fn off() -> Redactor {
         Redactor {
-            on,
-            exact: Vec::new(),
-            words: BTreeMap::new(),
-            word_re: Regex::new(r"[@#]?[A-Za-z_][A-Za-z0-9_$#@]*").unwrap(),
-            string_re: Regex::new(r"'(?:[^']|'')*'").unwrap(),
+            inner: None,
+            literal: Regex::new("$^").unwrap(),
         }
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.inner.is_some()
     }
 
     pub fn path(&mut self, p: &str) {
-        if self.on && !p.is_empty() && !self.exact.iter().any(|(k, _)| k == p) {
-            let n = self.exact.len() + 1;
-            self.exact.push((p.to_string(), format!("object-{n}")));
-            self.exact.sort_by_key(|(k, _)| std::cmp::Reverse(k.len()));
+        if let Some(r) = &mut self.inner {
+            r.add_path(p);
         }
     }
 
-    pub fn word(&mut self, w: &str) {
-        let k = w.trim_start_matches(['@', '#']).to_lowercase();
-        if self.on && !k.is_empty() && !self.words.contains_key(&k) {
-            let n = self.words.len() + 1;
-            self.words.insert(k, format!("name-{n}"));
+    pub fn report(&mut self, rep: &Report) {
+        if let Some(r) = &mut self.inner {
+            r.add_report(rep);
         }
     }
 
     /// Every identifier, variable and parameter of a source text.
     pub fn source(&mut self, text: &str, dialect: sqldiff_syntax::Dialect) {
-        if !self.on {
-            return;
-        }
+        let Some(r) = &mut self.inner else { return };
         let parse = sqldiff_syntax::parse(text, dialect);
         for t in parse
             .syntax()
@@ -67,37 +66,34 @@ impl Redactor {
             use SyntaxKind::*;
             let keep = match t.kind() {
                 IDENT => {
-                    let up = t.text().to_ascii_uppercase();
+                    let up = t.text().to_uppercase();
                     !(sqldiff_core::normalize::is_keyword(&up) || crate::is_extra_keyword(&up))
                 }
                 QUOTED_IDENT | VARIABLE | PARAM => true,
                 _ => false,
             };
             if keep {
-                self.word(&sqldiff_syntax::ast::unquote(t.text()));
+                let name = sqldiff_syntax::ast::unquote(t.text());
+                r.add(Kind::Object, &name);
+                r.add(Kind::Object, name.trim_start_matches(['@', '#', ':']));
             }
         }
     }
 
-    pub fn apply(&self, s: &str) -> String {
-        if !self.on {
+    pub fn apply(&mut self, s: &str) -> String {
+        let Some(r) = &mut self.inner else {
             return s.to_string();
+        };
+        let s = self.literal.replace_all(s, "'…'");
+        r.redact_str(&s)
+    }
+
+    /// Refuses output that still holds a registered term.
+    pub fn verify(&mut self, s: &str) -> Result<(), String> {
+        match &mut self.inner {
+            Some(r) => r.verify(s).map_err(|e| e.0),
+            None => Ok(()),
         }
-        let mut s = s.to_string();
-        for (k, v) in &self.exact {
-            s = s.replace(k.as_str(), v);
-        }
-        let s = self.string_re.replace_all(&s, "'…'");
-        self.word_re
-            .replace_all(&s, |c: &regex::Captures| {
-                let w = &c[0];
-                let k = w.trim_start_matches(['@', '#']).to_lowercase();
-                match self.words.get(&k) {
-                    Some(p) => p.clone(),
-                    None => w.to_string(),
-                }
-            })
-            .into_owned()
     }
 }
 
@@ -107,8 +103,9 @@ pub fn markdown(
     queue: &[QueueEntry],
     reports: &[(Option<Report>, String)],
     store: &Store,
-    red: &Redactor,
+    red: &mut Redactor,
 ) -> String {
+    let now = time::now();
     let mut o = String::new();
     let _ = writeln!(o, "# SQLDiff review session\n");
     let _ = writeln!(
@@ -116,13 +113,13 @@ pub fn markdown(
         "- sqldiff {} · read {}{}",
         info.tool_version,
         info.loaded_at,
-        if red.on { " · redacted" } else { "" }
+        if red.is_on() { " · redacted" } else { "" }
     );
     let layers: Vec<String> = info
         .layers
         .iter()
         .map(|l| {
-            let name = if red.on {
+            let name = if red.is_on() {
                 format!("{:?}", l.kind).to_lowercase()
             } else {
                 l.name.clone()
@@ -214,7 +211,7 @@ pub fn markdown(
                 f.class.label(),
                 f.severity.label(),
                 f.verdict.label(),
-                f.rule,
+                red.apply(&f.rule),
                 f.fingerprint,
                 if at.is_empty() {
                     String::new()
@@ -223,13 +220,12 @@ pub fn markdown(
                 },
                 red.apply(&f.witness)
             );
-            if let Some((d, current)) = store.lookup(&f.fingerprint, snap) {
-                let _ = write!(
-                    o,
-                    " — {}{}",
-                    format!("{:?}", d.state).to_lowercase(),
-                    if current { "" } else { " (earlier snapshot)" }
-                );
+            let st = store.status(&f.fingerprint, snap, &now);
+            if let Some(d) = &st.decision {
+                let _ = write!(o, " — {}", st.state.label());
+                if st.state == sqldiff_review::ReviewState::Outdated {
+                    let _ = write!(o, " ({} on an earlier snapshot)", d.state.label());
+                }
                 if let Some(c) = &d.comment {
                     let _ = write!(o, ": “{}”", red.apply(c));
                 }

@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sqldiff_core::model::AssumptionSource;
@@ -12,7 +11,7 @@ use sqldiff_core::{session as flips, Artifact, ChangeClass, Dialect, Report, Sev
 use sqldiff_source::tree::{self, Ambiguous, Tree, TreePair};
 use sqldiff_source::{LayerRef, Resolved};
 
-use crate::review::{self, Decision, ReviewState, Store};
+use crate::review::{self, time, Decision, State, Store};
 use crate::{build_view, Payload};
 
 /// What the session compares.
@@ -62,8 +61,10 @@ pub struct Session {
     tree: Tree,
     pairs: Vec<Loaded>,
     flips: BTreeMap<String, Flip>,
+    /// Assumption rows from the reports as read, without flips (recomputed on refresh).
+    assumptions: Vec<AssumptionRow>,
     pub store: Store,
-    loaded_at: u64,
+    loaded_at: String,
 }
 
 /// One row of the review queue.
@@ -146,8 +147,9 @@ impl Session {
             tree: Tree::default(),
             pairs: Vec::new(),
             flips: BTreeMap::new(),
+            assumptions: Vec::new(),
             store,
-            loaded_at: 0,
+            loaded_at: String::new(),
         };
         s.refresh()?;
         Ok(s)
@@ -195,10 +197,10 @@ impl Session {
         {
             return Err(e.clone());
         }
-        self.loaded_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        self.assumptions = self.assumption_rows();
+        self.loaded_at = time::now();
+        // Pick up decisions other processes (CLI, MCP, another GUI) made meanwhile.
+        self.store.reload().map_err(|e| e.0)?;
         Ok(())
     }
 
@@ -262,37 +264,36 @@ impl Session {
         &mut self,
         fingerprint: &str,
         snapshot: &str,
-        state: Option<ReviewState>,
+        state: Option<State>,
         comment: Option<String>,
     ) -> Result<(), String> {
+        self.store.reload().map_err(|e| e.0)?;
         match state {
-            None => self.store.remove(fingerprint, snapshot),
-            Some(state) => self.store.put(
-                fingerprint,
-                snapshot,
-                Decision {
-                    state,
-                    comment: comment.filter(|c| !c.trim().is_empty()),
-                    author: None,
-                    at: review::now_rfc3339(),
-                    expires: None,
-                },
-            ),
+            None => self.store.clear(fingerprint, snapshot).map(|_| ()),
+            Some(state) => {
+                let mut d = Decision::new(state);
+                if let Some(c) = comment.filter(|c| !c.trim().is_empty()) {
+                    d = d.comment(c);
+                }
+                self.store.put(fingerprint, snapshot, d)
+            }
         }
+        .map_err(|e| e.0)
     }
 
-    /// The pair whose paths end with `a` and `b` (deep links from agents and scripts).
+    /// The pair whose paths end with `a` and `b` on a path-component
+    /// boundary (deep links from agents and scripts).
     pub fn find(&self, a: &str, b: &str) -> Option<usize> {
-        let norm = |s: &str| s.replace('\\', "/");
-        let (a, b) = (norm(a), norm(b));
-        let ends = |p: &Path, id: &str, q: &str| {
+        let side = |p: &Path, id: &str, q: &str| {
+            let full = p.display().to_string().replace('\\', "/");
+            let q = q.replace('\\', "/");
             !q.is_empty()
-                && (norm(&p.display().to_string()).ends_with(q)
-                    || id.ends_with(q)
-                    || q.ends_with(id))
+                && (ends_on_component(&full, &q)
+                    || ends_on_component(id, &q)
+                    || ends_on_component(&q, id))
         };
         self.pairs.iter().position(|l| {
-            ends(&l.pair.path_a, &l.pair.id_a, &a) && ends(&l.pair.path_b, &l.pair.id_b, &b)
+            side(&l.pair.path_a, &l.pair.id_a, a) && side(&l.pair.path_b, &l.pair.id_b, b)
         })
     }
 
@@ -334,19 +335,23 @@ impl Session {
         e.highest_class = r.highest_class();
         e.severity = r.findings.iter().map(|f| f.severity).max();
         e.findings = r.findings.len();
+        let now = time::now();
         for f in &r.findings {
-            if let Some(d) = self.store.get(&f.fingerprint, &snap) {
+            let st = self.store.status(&f.fingerprint, &snap, &now).state;
+            if st.is_reviewed() {
                 e.reviewed += 1;
-                if d.state == ReviewState::Accepted {
-                    e.accepted += 1;
-                }
+            }
+            if st == sqldiff_review::ReviewState::Accepted {
+                e.accepted += 1;
             }
         }
         e.assumptions = used_assumptions(&r);
         e
     }
 
-    pub fn info(&self) -> SessionInfo {
+    /// Assumptions across the session, with the pairs relying on each and
+    /// the pairs whose verdict denying it alone would change.
+    fn assumption_rows(&self) -> Vec<AssumptionRow> {
         let mut rows: BTreeMap<String, AssumptionRow> = BTreeMap::new();
         for (i, l) in self.pairs.iter().enumerate() {
             let Some(base) = &l.base else { continue };
@@ -358,7 +363,7 @@ impl Session {
                     .map(|a| (a.text.clone(), a.source))
                     .unwrap_or((String::new(), AssumptionSource::Default));
                 let row = rows.entry(id.clone()).or_insert_with(|| AssumptionRow {
-                    flip: self.flips.get(&id).copied().unwrap_or(Flip::Open),
+                    flip: Flip::Open,
                     id: id.clone(),
                     text: String::new(),
                     source,
@@ -369,7 +374,6 @@ impl Session {
                     row.text = text;
                 }
                 row.pairs.push(i);
-                // Would denying it alone change this pair's verdict?
                 let mut denied = base.clone();
                 flips::deny_assumptions(&mut denied, std::slice::from_ref(&id));
                 if denied.verdict != base.verdict {
@@ -377,28 +381,59 @@ impl Session {
                 }
             }
         }
+        rows.into_values().collect()
+    }
+
+    /// Decisions on findings of this session (any snapshot), unexpired.
+    fn reviews(&self) -> Vec<review::Entry> {
+        let fps: BTreeSet<&str> = self
+            .pairs
+            .iter()
+            .filter_map(|l| l.base.as_ref())
+            .flat_map(|r| r.findings.iter().map(|f| f.fingerprint.as_str()))
+            .collect();
+        let now = time::now();
+        self.store
+            .all()
+            .into_iter()
+            .filter(|(k, d)| fps.contains(k.fingerprint.as_str()) && !d.is_expired(&now))
+            .map(|(k, d)| review::Entry {
+                fingerprint: k.fingerprint,
+                snapshot: k.snapshot,
+                decision: d,
+            })
+            .collect()
+    }
+
+    pub fn info(&self) -> SessionInfo {
+        let mut rows = self.assumptions.clone();
+        for r in &mut rows {
+            r.flip = self.flips.get(&r.id).copied().unwrap_or(Flip::Open);
+        }
         // Flipped ids no pair uses any more stay visible so they can be reset.
         for (id, f) in &self.flips {
-            rows.entry(id.clone()).or_insert_with(|| AssumptionRow {
-                id: id.clone(),
-                text: String::new(),
-                source: AssumptionSource::Default,
-                flip: *f,
-                pairs: Vec::new(),
-                flips_verdict: Vec::new(),
-            });
+            if !rows.iter().any(|r| &r.id == id) {
+                rows.push(AssumptionRow {
+                    id: id.clone(),
+                    text: String::new(),
+                    source: AssumptionSource::Default,
+                    flip: *f,
+                    pairs: Vec::new(),
+                    flips_verdict: Vec::new(),
+                });
+            }
         }
         SessionInfo {
             origin: self.origin.clone(),
-            loaded_at: review::rfc3339(self.loaded_at),
+            loaded_at: self.loaded_at.clone(),
             tool_version: sqldiff_core::TOOL_VERSION.to_string(),
             layers: self.cfg.layers.clone(),
             dialect_versions: Dialect::ALL
                 .iter()
                 .map(|d| (d.id().to_string(), self.cfg.dialect_version(*d)))
                 .collect(),
-            assumptions: rows.into_values().collect(),
-            reviews: self.store.all().collect(),
+            assumptions: rows,
+            reviews: self.reviews(),
             only_a: self.tree.only_a.clone(),
             only_b: self.tree.only_b.clone(),
             ambiguous: self.tree.ambiguous.clone(),
@@ -429,23 +464,27 @@ impl Session {
 }
 
 impl Session {
-    /// The session report as Markdown, optionally redacted.
-    pub fn session_report(&self, redact: bool) -> String {
-        let mut red = crate::report::Redactor::new(redact);
+    /// The session report as Markdown, optionally redacted. A redacted
+    /// report is checked for leftover terms and refused if any remain.
+    pub fn session_report(&self, redact: bool) -> Result<String, String> {
+        let mut red = if redact {
+            crate::report::Redactor::new(&self.cfg)?
+        } else {
+            crate::report::Redactor::off()
+        };
         let info = self.info();
         let queue = self.queue();
         for l in &self.pairs {
             red.path(&l.pair.path_a.display().to_string());
             red.path(&l.pair.path_b.display().to_string());
+            red.path(&l.pair.id_a);
+            red.path(&l.pair.id_b);
             if let Some((a, b)) = &l.sides {
                 red.source(&a.text, a.dialect);
                 red.source(&b.text, b.dialect);
             }
             if let Some(r) = &l.base {
-                red.word(&r.a.object);
-                if let Some(b) = &r.b {
-                    red.word(&b.object);
-                }
+                red.report(r);
             }
         }
         for p in info
@@ -456,23 +495,33 @@ impl Session {
         {
             red.path(p);
         }
+        for a in &info.ambiguous {
+            for p in &a.ids {
+                red.path(p);
+            }
+        }
         let (Origin::Files { a, b } | Origin::Trees { a, b }) = &self.origin;
         red.path(&a.display().to_string());
         red.path(&b.display().to_string());
         let reports: Vec<(Option<Report>, String)> = (0..self.pairs.len())
             .map(|i| {
                 let r = self.report(i);
-                let snap = r.as_ref().map_or(String::new(), |r| {
-                    review::snapshot(
-                        &r.a.content_hash,
-                        r.b.as_ref().map_or("", |b| b.content_hash.as_str()),
-                    )
-                });
+                let snap = r.as_ref().map_or(String::new(), sqldiff_review::snapshot);
                 (r, snap)
             })
             .collect();
-        crate::report::markdown(&info, &queue, &reports, &self.store, &red)
+        let md = crate::report::markdown(&info, &queue, &reports, &self.store, &mut red);
+        red.verify(&md)?;
+        Ok(md)
     }
+}
+
+/// Whether `full` ends with `tail` at a `/` boundary (or equals it).
+fn ends_on_component(full: &str, tail: &str) -> bool {
+    let tail = tail.trim_start_matches("./");
+    !tail.is_empty()
+        && full.ends_with(tail)
+        && (full.len() == tail.len() || full[..full.len() - tail.len()].ends_with('/'))
 }
 
 /// Assumption ids a report relies on: report-level and per finding.

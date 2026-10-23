@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use sqldiff_core::{Artifact, Dialect, Options};
-use sqldiff_gui::review::{ReviewState, Store};
+use sqldiff_gui::review::{State, Store};
 use sqldiff_gui::server::serve;
 use sqldiff_gui::session::{Flip, Origin, Session};
 use sqldiff_gui::{build, page, Payload, Row, RowKind};
@@ -142,7 +142,7 @@ fn post(port: u16, path: &str, body: &serde_json::Value) -> (String, serde_json:
     let res = request(
         port,
         &format!(
-            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         ),
     );
@@ -150,7 +150,15 @@ fn post(port: u16, path: &str, body: &serde_json::Value) -> (String, serde_json:
     (res, json)
 }
 
+/// Built-in config with the data directory (review store, redaction salt) in `dir`.
+fn cfg(dir: &std::path::Path) -> Resolved {
+    let mut c = Resolved::builtin();
+    c.data_dir = dir.join("data");
+    c
+}
+
 fn pair_session() -> Session {
+    let dir = std::env::temp_dir().join(format!("sqldiff-gui-pair-{}", std::process::id()));
     Session::open(
         Origin::Files {
             a: fixture_path("movestock.tsql.sql").into(),
@@ -158,7 +166,7 @@ fn pair_session() -> Session {
         },
         Some(Dialect::Tsql),
         Some(Dialect::Db2i),
-        Resolved::builtin(),
+        cfg(&dir),
         Store::in_memory(),
     )
     .unwrap()
@@ -184,7 +192,7 @@ fn tree_session(name: &str) -> (Session, std::path::PathBuf) {
         Origin::detect(dir.join("a"), dir.join("b")),
         None,
         None,
-        Resolved::builtin(),
+        cfg(&dir),
         Store::open(&dir.join("data")).unwrap(),
     )
     .unwrap();
@@ -252,7 +260,7 @@ fn review_decisions_persist_and_count_in_the_queue() {
     s.review(
         &fp,
         &p.snapshot,
-        Some(ReviewState::Accepted),
+        Some(State::Accepted),
         Some("deliberate".into()),
     )
     .unwrap();
@@ -260,10 +268,22 @@ fn review_decisions_persist_and_count_in_the_queue() {
     assert_eq!((e.reviewed, e.accepted), (1, 1));
     // A new store over the same directory sees the decision.
     let store = Store::open(&dir.join("data")).unwrap();
-    let (d, current) = store.lookup(&fp, &p.snapshot).unwrap();
-    assert!(current);
+    let d = store.get(&fp, &p.snapshot).unwrap();
     assert_eq!(d.comment.as_deref(), Some("deliberate"));
-    assert!(store.lookup(&fp, "other:snapshot").is_some_and(|(_, c)| !c));
+    assert!(store.get(&fp, "other:snapshot").is_none());
+    // Decisions of fingerprints outside the session stay out of the page.
+    let mut other = Store::open(&dir.join("data")).unwrap();
+    other
+        .put(
+            "0123456789abcdef",
+            "x:y",
+            sqldiff_gui::review::Decision::new(State::Rejected),
+        )
+        .unwrap();
+    s.refresh().unwrap();
+    let reviews = s.info().reviews;
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].fingerprint, fp);
     s.review(&fp, &p.snapshot, None, None).unwrap();
     assert_eq!(s.queue()[i].reviewed, 0);
 }
@@ -271,14 +291,55 @@ fn review_decisions_persist_and_count_in_the_queue() {
 #[test]
 fn redacted_report_hides_paths_and_identifiers() {
     let (s, dir) = tree_session("report");
-    let plain = s.session_report(false);
+    let plain = s.session_report(false).unwrap();
     assert!(plain.contains("move_stock.tsql.sql"));
-    let red = s.session_report(true);
+    let red = s.session_report(true).unwrap();
     assert!(red.contains("redacted"));
     for leak in ["move_stock", "StockLog", dir.to_str().unwrap(), "lonely"] {
+        assert!(
+            !red.to_lowercase().contains(&leak.to_lowercase()),
+            "{leak} leaked:\n{red}"
+        );
+    }
+    assert!(red.contains("PATH_") || red.contains("OBJ_"));
+}
+
+#[test]
+fn redaction_covers_unicode_and_hyphenated_names() {
+    let dir = std::env::temp_dir().join(format!("sqldiff-gui-uni-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("order-sync.tsql.sql");
+    let b = dir.join("order-sync.pg.sql");
+    std::fs::write(
+        &a,
+        "CREATE PROCEDURE [order-sync] AS\nBEGIN\n  UPDATE Lager SET Größe = 1;\n  COMMIT;\nEND\n",
+    )
+    .unwrap();
+    std::fs::write(&b, "CREATE PROCEDURE \"order-sync\"()\nLANGUAGE plpgsql AS $$\nBEGIN\n  UPDATE Lager SET Größe = 2;\nEND\n$$;\n").unwrap();
+    let s = Session::open(
+        Origin::detect(a, b),
+        None,
+        None,
+        cfg(&dir),
+        Store::in_memory(),
+    )
+    .unwrap();
+    let red = s.session_report(true).unwrap();
+    for leak in ["order-sync", "Größe", "Lager"] {
         assert!(!red.contains(leak), "{leak} leaked:\n{red}");
     }
-    assert!(red.contains("object-"));
+}
+
+#[test]
+fn deep_links_match_whole_path_components() {
+    let (s, _dir) = tree_session("find");
+    assert!(s
+        .find("move_stock.tsql.sql", "move_stock.db2i.sql")
+        .is_some());
+    assert!(s.find("stock.tsql.sql", "move_stock.db2i.sql").is_none());
+    assert!(s.find("e.tsql.sql", "e.tsql.sql").is_none());
+    assert!(s.find("inv/same.tsql.sql", "same.tsql.sql").is_some());
 }
 
 #[test]
@@ -299,7 +360,9 @@ fn server_serves_page_and_rediffs_edits() {
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || serve(listener, pair_session()));
 
-    let res = request(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let host = format!("Host: 127.0.0.1:{port}\r\n");
+    let get = |path: &str| request(port, &format!("GET {path} HTTP/1.1\r\n{host}\r\n"));
+    let res = get("/");
     assert!(res.starts_with("HTTP/1.1 200"));
     assert!(res.contains("txn.atomicity"));
 
@@ -312,7 +375,7 @@ fn server_serves_page_and_rediffs_edits() {
     assert_eq!(json["report"]["findings"].as_array().unwrap().len(), 0);
     assert_eq!(json["live"], true);
 
-    let res = request(port, "GET /api/pair/0 HTTP/1.1\r\n\r\n");
+    let res = get("/api/pair/0");
     let pair: serde_json::Value =
         serde_json::from_str(res.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     let fp = pair["report"]["findings"][0]["fingerprint"]
@@ -338,12 +401,36 @@ fn server_serves_page_and_rediffs_edits() {
     );
     assert_eq!(json["session"]["assumptions"][0]["flip"], "denied");
 
-    let res = request(port, "GET /api/report?redact=1 HTTP/1.1\r\n\r\n");
+    let res = get("/api/report?redact=1");
     assert!(res.starts_with("HTTP/1.1 200") && res.contains("redacted"));
+    assert!(get("/?a=movestock.tsql.sql&b=movestock.db2i.sql").contains("\"open\":0"));
+    assert!(get("/nope").starts_with("HTTP/1.1 404"));
+
+    // DNS rebinding: a foreign Host is refused, even for reads.
     assert!(request(
         port,
-        "GET /?a=movestock.tsql.sql&b=movestock.db2i.sql HTTP/1.1\r\n\r\n"
+        "GET /api/pair/0 HTTP/1.1\r\nHost: evil.example\r\n\r\n"
     )
-    .contains("\"open\":0"));
-    assert!(request(port, "GET /nope HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
+    .starts_with("HTTP/1.1 403"));
+    assert!(request(port, "GET / HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 403"));
+    // CSRF: a cross-origin or non-JSON POST does not write.
+    let body =
+        serde_json::json!({ "fingerprint": fp, "snapshot": snap, "state": "accepted" }).to_string();
+    let raw = |extra: &str, ctype: &str| {
+        request(
+            port,
+            &format!(
+                "POST /api/review HTTP/1.1\r\n{host}{extra}Content-Type: {ctype}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        )
+    };
+    assert!(raw("Origin: https://evil.example\r\n", "application/json").starts_with("HTTP/1.1 403"));
+    assert!(raw("Sec-Fetch-Site: cross-site\r\n", "application/json").starts_with("HTTP/1.1 403"));
+    assert!(raw("", "text/plain").starts_with("HTTP/1.1 415"));
+    assert!(raw(
+        &format!("Origin: http://127.0.0.1:{port}\r\n"),
+        "application/json"
+    )
+    .starts_with("HTTP/1.1 200"));
 }

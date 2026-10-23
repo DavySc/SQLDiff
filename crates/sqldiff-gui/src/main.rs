@@ -57,7 +57,7 @@ struct PairArgs {
     /// Ignore project and user config files not named on the command line.
     #[arg(long)]
     isolated: bool,
-    /// Review store directory (default: the configured data directory).
+    /// Data directory for the review store and redaction salt (default: configured).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
 }
@@ -122,8 +122,11 @@ fn open(p: PairArgs) -> Result<Session, String> {
         packs: p.packs,
         cli: config::cli_layer(&[], &[], p.excerpt_lines).map_err(|e| e.0)?,
     };
-    let cfg = Resolved::load(&sources).map_err(|e| e.0)?;
-    let store = Store::open(p.data_dir.as_ref().unwrap_or(&cfg.data_dir))?;
+    let mut cfg = Resolved::load(&sources).map_err(|e| e.0)?;
+    if let Some(d) = p.data_dir {
+        cfg.data_dir = d;
+    }
+    let store = Store::from_config(&cfg).map_err(|e| e.0)?;
     Session::open(
         Origin::detect(a, b),
         p.dialect_a.or(p.dialect).or(da),
@@ -164,7 +167,7 @@ fn run(cli: Cli) -> Result<(), String> {
             redact,
             output,
         } => {
-            let md = open(pair)?.session_report(redact);
+            let md = open(pair)?.session_report(redact)?;
             match output {
                 Some(o) => std::fs::write(&o, md).map_err(|e| format!("{}: {e}", o.display())),
                 None => {

@@ -224,7 +224,8 @@ const clsColor = (c) => `var(--${CLASS_ORDER.includes(c) ? c : "structural"})`;
 const label = (s) => String(s || "").replace(/_/g, " ");
 
 async function api(method, path, body) {
-  const res = await fetch(path, { method, headers: body ? { "Content-Type": "application/json" } : {}, body: body ? JSON.stringify(body) : undefined });
+  const post = method === "POST";
+  const res = await fetch(path, { method, headers: post ? { "Content-Type": "application/json" } : {}, body: post ? JSON.stringify(body || {}) : undefined });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -234,7 +235,7 @@ function decision(fp, snap) {
   let best = null;
   for (const d of state.page.session.reviews) {
     if (d.fingerprint !== fp) continue;
-    if (d.snapshot === snap) return { d, current: true };
+    if (d.snapshot === snap || d.snapshot === "*") return { d, current: true };
     if (!best || d.at > best.at) best = d;
   }
   return best ? { d: best, current: false } : null;
@@ -243,8 +244,10 @@ function isAccepted(f) {
   const x = decision(f.fingerprint, state.data.snapshot);
   return !!(x && x.current && x.d.state === "accepted");
 }
+// Decisions are keyed by the files on disk; a scratchpad edit has no snapshot to record against.
+function canReview() { return state.live && !state.scratchDirty; }
 async function setReview(i, st, comment) {
-  if (!state.live) return;
+  if (!canReview()) { if (state.scratchDirty) flash("reload the pair to review: the scratchpad is edited"); return; }
   const f = state.data.report.findings[i];
   try {
     applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot: state.data.snapshot, state: st, comment: comment == null ? null : comment }));
@@ -309,8 +312,15 @@ async function refresh() {
   if (!state.live) return;
   $("busy").textContent = "reading…";
   try {
+    // Pairs can be added or removed: find the open pair again by its paths.
+    const cur = state.view === "pair" ? state.page.queue[state.cur] : null;
     applySession(await api("POST", "/api/refresh"));
-    if (state.view === "pair") { state.scratchDirty = false; await loadPair(state.cur, false); }
+    state.page.pairs = [];
+    cancelScratch();
+    state.scratchDirty = false;
+    const now = cur ? state.page.queue.find((e) => e.a === cur.a && e.b === cur.b) : null;
+    if (now) { state.cur = now.index; await loadPair(now.index, false); }
+    else if (cur) { state.view = "queue"; state.cur = -1; state.data = null; flash("the open pair is gone"); }
     render();
     flash("re-read");
   } catch (e) { $("busy").textContent = "error: " + e.message; }
@@ -393,8 +403,8 @@ function stepQueue(d) {
 // ---------- navigation ----------
 async function loadPair(i, keepFocus) {
   const fp = keepFocus && state.data && state.focus >= 0 ? state.data.report.findings[state.focus].fingerprint : null;
-  let data = state.page.pairs[i];
-  if (state.live) { data = await api("GET", "/api/pair/" + i); state.page.pairs[i] = data; }
+  let data = keepFocus ? null : state.page.pairs[i];
+  if (!data && state.live) { data = await api("GET", "/api/pair/" + i); state.page.pairs[i] = data; }
   if (!data) throw new Error("pair " + i + " could not be read");
   state.data = data;
   state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
@@ -408,7 +418,7 @@ async function loadPair(i, keepFocus) {
 }
 async function openPair(i, fp) {
   try {
-    if (state.cur !== i || !state.data) await loadPair(i, false);
+    if (state.cur !== i || !state.data) { cancelScratch(); await loadPair(i, false); }
     state.cur = i;
     state.view = "pair";
     history.replaceState(null, "", "#p=" + i + (fp ? "&f=" + fp : ""));
@@ -554,7 +564,7 @@ function findingCard(f, i, asm) {
   const as = f.assumptions.map((id) => `<abbr title="${esc(asm[id] ? asm[id].text : id)}">${esc(id)}</abbr>`).join(" ");
   const x = decision(f.fingerprint, state.data.snapshot);
   const dec = x ? `<div class="dec"><span class="st ${esc(x.d.state)}">${esc(x.d.state)}</span>${x.current ? "" : " on an earlier snapshot"} · ${esc(x.d.at.replace("T", " ").replace("Z", ""))}${x.d.comment ? ` · “${esc(x.d.comment)}”` : ""}</div>` : "";
-  const dis = state.live ? "" : "disabled";
+  const dis = canReview() ? "" : `disabled title="${state.live ? "Review decisions apply to the files on disk; the scratchpad is edited" : "Reviewing needs sqldiff-gui serve"}"`;
   const cur = x && x.current ? x.d.state : null;
   const acts = `<div class="racts">
       <button data-rv="accepted" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept (a)">Accept</button>
@@ -606,7 +616,7 @@ function renderSide() {
   wireFlips($("side"));
 }
 function reviewAction(i, act) {
-  if (!state.live) return;
+  if (!canReview()) { if (state.scratchDirty) flash("reload the pair to review: the scratchpad is edited"); return; }
   if (act === "comment") {
     if (state.commenting === i) saveComment(i);
     else { state.commenting = i; state.focus = i; renderSide(); }
@@ -690,6 +700,8 @@ function flash(msg) { $("busy").textContent = msg; setTimeout(() => { if ($("bus
 
 // Scratchpad: edits re-diff on the server, debounced; stale responses are dropped.
 let seq = 0, timer = null;
+// Drops a pending or in-flight scratch diff (its response is ignored).
+function cancelScratch() { clearTimeout(timer); seq++; }
 function scheduleDiff() {
   clearTimeout(timer);
   state.scratchDirty = true;
@@ -841,8 +853,6 @@ function init() {
   const p = h.has("p") ? +h.get("p") : INITIAL.open;
   const fp = h.get("f");
   if (p != null && p >= 0 && p < INITIAL.queue.length) {
-    state.data = INITIAL.pairs[p];
-    if (state.data) { state.cur = p; state.view = "pair"; }
     openPair(p, fp);
   } else {
     render();
