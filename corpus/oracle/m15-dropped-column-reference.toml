@@ -1,0 +1,10 @@
+case = "m15-dropped-column-reference"
+pairs = [["original", "mutated"]]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO stock (item_id, qty) VALUES (1, 10);
+"""
+
+[[scenario]]
+name = "available quantity"
+call = "SELECT available_qty(1);"
