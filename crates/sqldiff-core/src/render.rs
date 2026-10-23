@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use serde_json::{json, Value};
 
-use crate::model::{Finding, Location, Report, Severity};
+use crate::model::{Finding, Location, Report, Severity, SuppressionKind};
 
 pub fn json(report: &Report) -> String {
     serde_json::to_string_pretty(report).expect("report serializes")
@@ -66,6 +66,9 @@ pub fn text(report: &Report, show_assumption_details: bool) -> String {
             report.noise.structural
         );
     }
+    if !report.suppressed.is_empty() {
+        let _ = write!(summary, " · {} suppressed", report.suppressed.len());
+    }
     let _ = writeln!(out, "{summary}");
 
     for (i, f) in report.findings.iter().enumerate() {
@@ -86,6 +89,21 @@ pub fn text(report: &Report, show_assumption_details: bool) -> String {
         }
         if !f.assumptions.is_empty() {
             let _ = writeln!(out, "    assumes: {}", f.assumptions.join(", "));
+        }
+    }
+
+    if !report.suppressed.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Suppressed:");
+        for s in &report.suppressed {
+            let _ = writeln!(
+                out,
+                "  {} {} {}  {}",
+                s.finding.fingerprint,
+                s.finding.class.label(),
+                s.finding.rule,
+                s.justification
+            );
         }
     }
 
@@ -181,14 +199,31 @@ fn sarif_result(f: &Finding) -> Value {
 pub fn sarif(reports: &[Report]) -> String {
     let mut rules: Vec<String> = reports
         .iter()
-        .flat_map(|r| r.findings.iter().map(|f| f.rule.clone()))
+        .flat_map(|r| {
+            r.findings
+                .iter()
+                .chain(r.suppressed.iter().map(|s| &s.finding))
+                .map(|f| f.rule.clone())
+        })
         .collect();
     rules.sort();
     rules.dedup();
-    let results: Vec<Value> = reports
+    let mut results: Vec<Value> = reports
         .iter()
         .flat_map(|r| r.findings.iter().map(sarif_result))
         .collect();
+    // Suppressed findings stay in the log, marked as such (SARIF 3.35).
+    for s in reports.iter().flat_map(|r| &r.suppressed) {
+        let mut v = sarif_result(&s.finding);
+        v["suppressions"] = json!([{
+            "kind": match s.kind {
+                SuppressionKind::Review => "external",
+                SuppressionKind::InSource => "inSource",
+            },
+            "justification": s.justification,
+        }]);
+        results.push(v);
+    }
     let doc = json!({
         "version": "2.1.0",
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",

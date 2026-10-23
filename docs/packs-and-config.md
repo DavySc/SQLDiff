@@ -52,7 +52,7 @@ schema = 1                  # packs newer than the build are rejected
 | `[template]` | Placeholder delimiters, name pattern, special forms, parameter sources, collision rule |
 | `[[composition]]` | Begin and end markers of composed parts |
 | `[[helpers]]` | Organisation functions for the built-in catalog |
-| `[[author_markers]]` | `review_note`, `intentional_difference`, `sync_partner` comment patterns |
+| `[[author_markers]]` | `kind` (`review_note`, `intentional_difference`, `sync_partner`, `assumption`) and a `pattern` whose first group is the value; see [review-and-export.md](review-and-export.md) |
 | `[[change_patterns]]` | Work-item ids in change descriptions (first capture group) |
 | `[[limits]]` | Lint rules of class `limit`: `pattern`, `max_bytes` or `max_lines`, optional `dialects`, `severity` |
 | `[assumptions]` | Declared facts by assumption id; matching report assumptions become *declared* |
@@ -77,6 +77,7 @@ packs = ["../shared-pack"]
 private_packs = ["/secure/org-pack"]
 data_dir = "/var/lib/sqldiff"      # cache, snapshots, review store; default $SQLDIFF_DATA_DIR or ~/.local/share/sqldiff
 excerpt_lines = 3
+data_key = "env:SQLDIFF_DATA_KEY"  # optional: encrypt the review store and cache at rest (env:NAME or file:PATH)
 
 [source]                            # default SOURCE for commands
 kind = "git"                        # fs (root), git (repo, rev, subdir), bundle (path), adapter (name, credential)

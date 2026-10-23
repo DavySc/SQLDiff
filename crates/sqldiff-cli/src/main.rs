@@ -4,6 +4,7 @@
 //! unknown, 2 usage or I/O error.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -14,7 +15,10 @@ use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
 
 mod queue_cmd;
+mod review_cmd;
 mod source_cmd;
+
+use review_cmd::{Pipeline, ReviewArgs};
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +61,8 @@ enum Command {
         excerpt_lines: Option<usize>,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
+        #[command(flatten)]
+        review: ReviewArgs,
     },
     /// Lint one artifact: residue from other dialects, terminator hazards,
     /// parse problems and pack limits.
@@ -69,6 +75,8 @@ enum Command {
         format: Format,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
+        #[command(flatten)]
+        review: ReviewArgs,
     },
     /// Parse one artifact, verify the lossless round trip and optionally dump the tree.
     Parse {
@@ -92,7 +100,12 @@ enum Command {
         format: Format,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
+        #[command(flatten)]
+        review: ReviewArgs,
     },
+    /// Review decisions: accept, reject or comment on findings by fingerprint.
+    #[command(subcommand)]
+    Review(review_cmd::ReviewCommand),
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
     #[command(flatten)]
@@ -140,7 +153,6 @@ fn artifact(
     Ok(a)
 }
 
-/// Pack policy on an engine report: limit rules, overrides, declared assumptions.
 fn with_policy(mut r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
     policy::add_limits(&mut r, a, b, cfg);
     policy::apply(&mut r, cfg);
@@ -154,12 +166,17 @@ fn exit_for(verdict: Verdict) -> ExitCode {
     }
 }
 
-fn emit(report: &Report, format: Format) {
-    match format {
-        Format::Text => print!("{}", render::text(report, false)),
-        Format::Json => println!("{}", render::json(report)),
-        Format::Sarif => println!("{}", render::sarif(std::slice::from_ref(report))),
-    }
+/// Prints a report, redacted and leak-checked when the pipeline redacts.
+fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), String> {
+    let report = pipe.redact_reports(vec![report]).remove(0);
+    let out = match format {
+        Format::Text => render::text(&report, false),
+        Format::Json => render::json(&report) + "\n",
+        Format::Sarif => render::sarif(std::slice::from_ref(&report)) + "\n",
+    };
+    pipe.verify(&out)?;
+    print!("{out}");
+    Ok(())
 }
 
 fn main() -> ExitCode {
@@ -183,6 +200,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             format,
             excerpt_lines,
             cfg,
+            review,
         } => {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
@@ -190,24 +208,26 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let opts = Options {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
             };
-            let report = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
-            emit(&report, format);
-            Ok(exit_for(report.verdict))
+            let mut pipe = Pipeline::new(cfg, &review)?;
+            let report = pipe.run(&a, Some(&b), &opts);
+            let verdict = report.open_verdict();
+            emit(report, format, &mut pipe)?;
+            Ok(exit_for(verdict))
         }
         Command::Check {
             file,
             dialect,
             format,
             cfg,
+            review,
         } => {
             let cfg = cfg.resolve()?;
             let art = read(&file, dialect, &cfg)?;
-            let opts = Options {
-                excerpt_lines: cfg.excerpt_lines,
-            };
-            let report = with_policy(sqldiff_core::check(&art, &opts), &art, None, &cfg);
-            emit(&report, format);
-            Ok(exit_for(report.verdict))
+            let mut pipe = Pipeline::new(cfg, &review)?;
+            let report = pipe.run(&art, None, &pipe.options());
+            let verdict = report.open_verdict();
+            emit(report, format, &mut pipe)?;
+            Ok(exit_for(verdict))
         }
         Command::Parse {
             file,
@@ -251,14 +271,16 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             cfg,
+            review,
         } => tree(
             &dir_a,
             &dir_b,
             dialect_a,
             dialect_b,
             format,
-            &cfg.resolve()?,
+            Pipeline::new(cfg.resolve()?, &review)?,
         ),
+        Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),
         Command::Queue(cmd) => queue_cmd::run(cmd),
     }
@@ -340,8 +362,9 @@ fn tree(
     da: Option<Dialect>,
     db: Option<Dialect>,
     format: Format,
-    cfg: &Resolved,
+    mut pipe: Pipeline,
 ) -> Result<ExitCode, String> {
+    let cfg = &pipe.cfg.clone();
     let mut sa = Side::load(dir_a, da, cfg)?;
     let mut sb = Side::load(dir_b, db, cfg)?;
     let opts = Options {
@@ -376,12 +399,7 @@ fn tree(
     for (ia, ib) in &pairs {
         let a = sa.read(ia, cfg)?;
         let b = sb.read(ib, cfg)?;
-        reports.push(with_policy(
-            sqldiff_core::diff(&a, &b, &opts),
-            &a,
-            Some(&b),
-            cfg,
-        ));
+        reports.push(pipe.run(&a, Some(&b), &opts));
     }
     let ambiguous: Vec<serde_json::Value> = [(&sa, "A"), (&sb, "B")]
         .iter()
@@ -404,14 +422,31 @@ fn tree(
     // Most severe first.
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
-            r.verdict,
+            r.open_verdict(),
             r.findings.iter().map(|f| f.severity).max(),
             r.findings.len(),
         ))
     });
+    let worst = reports
+        .iter()
+        .map(|r| r.open_verdict())
+        .max()
+        .unwrap_or(Verdict::Equal);
+    if pipe.redacting() {
+        let mut paths: Vec<String> = vec![dir_a.display().to_string(), dir_b.display().to_string()];
+        paths.extend(only_a.iter().chain(&only_b).chain(&no_dialect).cloned());
+        for a in &ambiguous {
+            for id in a["ids"].as_array().into_iter().flatten() {
+                paths.extend(id.as_str().map(str::to_string));
+            }
+        }
+        pipe.add_paths(paths.iter().map(String::as_str));
+    }
+    let reports = pipe.redact_reports(reports);
+    let mut out = String::new();
     match format {
         Format::Json => {
-            let v = serde_json::json!({
+            let mut v = serde_json::json!({
                 "pairs": reports,
                 "only_a": only_a,
                 "only_b": only_b,
@@ -419,17 +454,22 @@ fn tree(
                 "no_dialect": no_dialect,
                 "provenance": cfg.layers,
             });
-            println!("{}", serde_json::to_string_pretty(&v).unwrap());
+            pipe.redact_json(&mut v);
+            let _ = writeln!(out, "{}", serde_json::to_string_pretty(&v).unwrap());
         }
-        Format::Sarif => println!("{}", render::sarif(&reports)),
+        Format::Sarif => {
+            let _ = writeln!(out, "{}", render::sarif(&reports));
+        }
         Format::Text => {
-            println!(
+            let _ = writeln!(
+                out,
                 "{:<26} {:<14} {:>8}  pair",
                 "verdict", "highest", "findings"
             );
             for r in &reports {
                 let b = r.b.as_ref().map(|b| b.path.as_str()).unwrap_or("");
-                println!(
+                let _ = writeln!(
+                    out,
                     "{:<26} {:<14} {:>8}  {} ↔ {}",
                     r.verdict.label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
@@ -439,13 +479,14 @@ fn tree(
                 );
             }
             for p in &only_a {
-                println!("{:<26} {:<14} {:>8}  {p}", "only in A", "-", "-");
+                let _ = writeln!(out, "{:<26} {:<14} {:>8}  {p}", "only in A", "-", "-");
             }
             for p in &only_b {
-                println!("{:<26} {:<14} {:>8}  {p}", "only in B", "-", "-");
+                let _ = writeln!(out, "{:<26} {:<14} {:>8}  {p}", "only in B", "-", "-");
             }
             for a in &ambiguous {
-                println!(
+                let _ = writeln!(
+                    out,
                     "{:<26} {:<14} {:>8}  {}",
                     format!("ambiguous in {}", a["side"].as_str().unwrap_or("")),
                     "-",
@@ -460,15 +501,12 @@ fn tree(
                 );
             }
             for p in &no_dialect {
-                println!("{:<26} {:<14} {:>8}  {p}", "no dialect", "-", "-");
+                let _ = writeln!(out, "{:<26} {:<14} {:>8}  {p}", "no dialect", "-", "-");
             }
         }
     }
-    let worst = reports
-        .iter()
-        .map(|r| r.verdict)
-        .max()
-        .unwrap_or(Verdict::Equal);
+    pipe.verify(&out)?;
+    print!("{out}");
     let complete =
         only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
     Ok(exit_for(if complete {
