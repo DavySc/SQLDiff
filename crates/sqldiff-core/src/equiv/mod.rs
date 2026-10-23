@@ -87,7 +87,15 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
                 n(
                     "raw",
                     std::iter::once(a(unit.dialect.id()))
-                        .chain(s.toks.iter().map(|t| a(t.up.clone())))
+                        .chain(s.toks.iter().map(|t| {
+                            // Only keywords and unquoted names fold; literals and
+                            // quoted identifiers keep their case.
+                            a(if t.kind == ast::K::Word {
+                                t.up.clone()
+                            } else {
+                                t.text.clone()
+                            })
+                        }))
                         .collect(),
                 ),
                 Some(e),
@@ -188,6 +196,20 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
             (Some(tx), Some(ty)) if tx != ty => out.assume(Assumption::default(
                 "ASM-ARGUMENT-LENGTHS",
                 "Arguments fit the shorter of the declared parameter types",
+            )),
+            _ => {}
+        }
+        match (&x.default, &y.default) {
+            (Some(dx), Some(dy)) if dx != dy => out.unknown_reasons.push(format!(
+                "parameter {} defaults to {dx} on {na} and {dy} on {nb}",
+                i + 1
+            )),
+            // A default on one side only widens which calls are accepted;
+            // calls both sides accept behave the same.
+            (Some(_), None) | (None, Some(_)) => out.normalizations.push(format!(
+                "parameter {} has a default only on {}; calls that omit it are valid only there",
+                i + 1,
+                if x.default.is_some() { na } else { nb }
             )),
             _ => {}
         }

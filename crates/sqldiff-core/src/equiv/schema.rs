@@ -92,11 +92,20 @@ impl Ty {
                 len: Some(64),
                 scale: None,
             },
-            "DECIMAL" | "NUMERIC" | "DEC" => Ty {
-                fam: Fam::Exact,
-                len: n(0),
-                scale: n(1).or(t.args.first().map(|_| 0)),
-            },
+            "DECIMAL" | "NUMERIC" | "DEC" => {
+                // Without precision: T-SQL (18,0), Db2 for i (5,0), PostgreSQL unbounded.
+                let default = match d {
+                    Dialect::Tsql => Some(18),
+                    Dialect::Db2i => Some(5),
+                    Dialect::Postgres => None,
+                };
+                let len = n(0).or(if t.args.is_empty() { default } else { None });
+                Ty {
+                    fam: Fam::Exact,
+                    len,
+                    scale: n(1).or(len.map(|_| 0)),
+                }
+            }
             "REAL" | "FLOAT" | "DOUBLE PRECISION" | "DOUBLE" | "FLOAT8" | "FLOAT4" => {
                 Ty::of(Fam::Float)
             }
@@ -196,11 +205,23 @@ impl Schema {
                 continue;
             }
             if w(1) == "TABLE" {
-                if let Some(t) = create_table(&toks[2..], d) {
+                let skip = if (w(2), w(3), w(4)) == ("IF", "NOT", "EXISTS") {
+                    5
+                } else {
+                    2
+                };
+                if let Some(t) = create_table(&toks[skip..], d) {
                     self.tables.insert(t.name.clone(), t);
                 }
-            } else if w(1) == "UNIQUE" && w(2) == "INDEX" {
-                if let Some((table, cols)) = unique_index(&toks[3..], d) {
+            } else if w(1) == "UNIQUE" {
+                let mut i = 2;
+                if matches!(w(i), "CLUSTERED" | "NONCLUSTERED") {
+                    i += 1;
+                }
+                if w(i) != "INDEX" {
+                    continue;
+                }
+                if let Some((table, cols)) = unique_index(&toks[i + 1..], d) {
                     if let Some(t) = self.tables.get_mut(&table) {
                         t.keys.push(cols);
                     }
@@ -297,17 +318,42 @@ fn create_table(toks: &[Tok], d: Dialect) -> Option<Table> {
     Some(t)
 }
 
+/// The key of `CREATE UNIQUE INDEX ... ON t (c, ...)`. None for an index
+/// that is not a plain column key: expression elements or a WHERE filter
+/// (partial or filtered index).
 fn unique_index(toks: &[Tok], d: Dialect) -> Option<(String, Vec<String>)> {
     let on = toks.iter().position(|t| t.up == "ON")?;
-    let mut p = Parser::new(&toks[on + 1..], d);
+    let rest = &toks[on + 1..];
+    let mut p = Parser::new(rest, d);
     let table = p.qname().ok()?.last()?.to_lowercase();
-    let cols = paren_names(&toks[on + 1..]);
-    // Expression indexes (`lower(email)`) are not column keys.
-    if toks[on + 1..]
-        .windows(2)
-        .any(|w| w[0].kind == K::Word && w[1].kind == K::LParen && w[0].up != "ON")
-        && cols.len() > 1
-    {
+    let open = p.i;
+    if rest.get(open)?.kind != K::LParen {
+        return None;
+    }
+    let mut depth = 0;
+    let close = (open..rest.len()).find(|&i| {
+        match rest[i].kind {
+            K::LParen => depth += 1,
+            K::RParen => depth -= 1,
+            _ => {}
+        }
+        depth == 0
+    })?;
+    let mut cols = Vec::new();
+    for el in split_top(&rest[open + 1..close]) {
+        match el {
+            [c] | [c, _]
+                if matches!(c.kind, K::Word | K::Quoted)
+                    && el
+                        .get(1)
+                        .map_or(true, |o| matches!(o.up.as_str(), "ASC" | "DESC")) =>
+            {
+                cols.push(sqldiff_syntax::ast::unquote(&c.text).to_lowercase());
+            }
+            _ => return None,
+        }
+    }
+    if cols.is_empty() || rest[close + 1..].iter().any(|t| t.up == "WHERE") {
         return None;
     }
     Some((table, cols))
@@ -353,5 +399,28 @@ mod tests {
             );
             assert!(!ol.is_unique(&["order_id".into()]), "{file}");
         }
+    }
+
+    #[test]
+    fn unique_indexes_if_not_exists_and_decimal_defaults() {
+        let ddl =
+            "CREATE TABLE IF NOT EXISTS t (a int NOT NULL, b int NOT NULL, c int, amt decimal);
+                   CREATE UNIQUE INDEX ux_ab ON t (a, b DESC);
+                   CREATE UNIQUE INDEX ux_c ON t (c) WHERE c IS NOT NULL;
+                   CREATE UNIQUE INDEX ux_expr ON t (lower(a));";
+        let s = Schema::load(&[Artifact::new("t.sql", Dialect::Postgres, ddl)]);
+        let t = s.table("t").expect("IF NOT EXISTS table");
+        assert!(t.is_unique(&["a".into(), "b".into()]));
+        assert!(!t.is_unique(&["a".into()]));
+        assert!(!t.is_unique(&["c".into()]), "partial index is not a key");
+        assert_eq!(t.column("amt").unwrap().ty.len, None);
+        let ty = |d: Dialect| {
+            let s = Schema::load(&[Artifact::new("t.sql", d, "CREATE TABLE t (amt decimal);")]);
+            let c = s.table("t").unwrap().column("amt").unwrap().ty;
+            (c.len, c.scale)
+        };
+        assert_eq!(ty(Dialect::Tsql), (Some(18), Some(0)));
+        assert_eq!(ty(Dialect::Db2i), (Some(5), Some(0)));
+        assert_eq!(ty(Dialect::Postgres), (None, None));
     }
 }

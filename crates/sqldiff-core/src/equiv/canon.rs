@@ -432,13 +432,20 @@ impl<'a> Canon<'a> {
             Expr::InList(x, list, neg) => {
                 let (t, ty) = self.expr(x)?;
                 let mut items = Vec::new();
+                let (mut string, mut known) = (ty.is_some_and(|t| t.is_string()), ty.is_some());
                 for l in list {
-                    items.push(self.expr(l)?.0);
+                    let (it, ity) = self.expr(l)?;
+                    string |= ity.is_some_and(|t| t.is_string());
+                    known |= ity.is_some();
+                    items.push(it);
                 }
                 items.sort();
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
-                if ty.is_some_and(|t| t.is_string()) {
+                // Like `=`: string membership depends on the collation.
+                if string {
                     kids.push(self.dtag());
+                } else if !known {
+                    self.assume(asm::UNTYPED);
                 }
                 (n("in", kids), None)
             }
@@ -446,7 +453,9 @@ impl<'a> Canon<'a> {
                 let (t, ty) = self.expr(x)?;
                 let q = self.query(q, QCtx::Scalar)?;
                 let mut kids = vec![t, q.0, a(neg.to_string())];
-                if ty.is_some_and(|t| t.is_string()) {
+                // The subquery's column type is not tracked, so only a known
+                // non-string operand avoids the collation.
+                if ty.map_or(true, |t| t.is_string()) {
                     kids.push(self.dtag());
                 }
                 (n("inq", kids), None)
@@ -1998,6 +2007,28 @@ impl<'a> Canon<'a> {
         if !in_eq || conj.iter().any(|c| mentions(c, &rkey)) {
             return unsupported();
         }
+        // Unqualified names in the rest of WHERE could belong to the joined
+        // table; keep them only when the catalog shows they cannot.
+        let mut bare = Vec::new();
+        for c in &conj {
+            unqualified(c, &mut bare);
+        }
+        let ltab = self.schema.table(lname.last().unwrap());
+        let rtab = self.schema.table(rname.last().unwrap());
+        for name in &bare {
+            let in_l = ltab.map(|t| t.column(name).is_some());
+            let in_r = rtab.map(|t| t.column(name).is_some());
+            let ok = match (in_l, in_r) {
+                (Some(true), Some(false)) => true,
+                (Some(false), Some(false)) => self.sym(name).is_some(),
+                _ => false,
+            };
+            if !ok {
+                return Err(format!(
+                    "DELETE anti-join: `{name}` may name a column of the joined table"
+                ));
+            }
+        }
         let sub = Select {
             items: vec![SelItem {
                 expr: Expr::Num("1".into()),
@@ -2080,7 +2111,10 @@ impl<'a> Canon<'a> {
                     .iter()
                     .map(|s| s.term.count(&|t| t == &sym))
                     .sum::<usize>();
-                let first_def = !out[..i].iter().any(|s| s.term.any(&|t| t == &sym));
+                // A statement that was not lowered may assign the local too.
+                let first_def = !out[..i]
+                    .iter()
+                    .any(|s| s.err.is_some() || s.term.any(&|t| t == &sym));
                 if returns_it && uses == 2 && first_def {
                     let v = x.kids()[1].map(&|t| {
                         (t.is("scalar") && t.kid(2).and_then(Term::atom) == Some("unchanged")).then(
@@ -2210,6 +2244,31 @@ fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {
             flatten_and(r, out);
         }
         _ => out.push(e.clone()),
+    }
+}
+
+/// Single-part names in an expression (subqueries are refused by `mentions`).
+fn unqualified(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Name(p) if p.len() == 1 => out.push(p[0].clone()),
+        Expr::Bin(_, l, r) | Expr::Like(l, r, _, _) => {
+            unqualified(l, out);
+            unqualified(r, out);
+        }
+        Expr::Unary(_, x) | Expr::IsNull(x, _) | Expr::Cast(x, _) | Expr::Extract(_, x) => {
+            unqualified(x, out)
+        }
+        Expr::Call(c) => {
+            c.args.iter().for_each(|x| unqualified(x, out));
+            c.order.iter().for_each(|o| unqualified(&o.expr, out));
+        }
+        Expr::InList(x, l, _) => {
+            unqualified(x, out);
+            l.iter().for_each(|y| unqualified(y, out));
+        }
+        Expr::Between(x, y, z, _) => [x, y, z].iter().for_each(|v| unqualified(v, out)),
+        Expr::Tuple(l) => l.iter().for_each(|y| unqualified(y, out)),
+        _ => {}
     }
 }
 
