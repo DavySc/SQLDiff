@@ -11,9 +11,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
 use sqldiff_source::protocol::ObjectFilter;
-use sqldiff_source::{pairing, FsSource, Resolved, Source};
+use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
 
+mod queue_cmd;
 mod review_cmd;
 mod source_cmd;
 
@@ -107,6 +108,8 @@ enum Command {
     Review(review_cmd::ReviewCommand),
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
+    #[command(flatten)]
+    Queue(queue_cmd::QueueCommand),
 }
 
 /// Path with `/` separators, as `dialect_map` globs and pairing see it.
@@ -148,6 +151,12 @@ fn artifact(
         _ => cfg.dialect_version(d),
     };
     Ok(a)
+}
+
+fn with_policy(mut r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
+    policy::add_limits(&mut r, a, b, cfg);
+    policy::apply(&mut r, cfg);
+    r
 }
 
 fn exit_for(verdict: Verdict) -> ExitCode {
@@ -273,6 +282,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         ),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),
+        Command::Queue(cmd) => queue_cmd::run(cmd),
     }
 }
 

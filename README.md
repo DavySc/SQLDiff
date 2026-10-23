@@ -71,7 +71,7 @@ Verdict: DIFFERENT
 | Behavioural checks | Summary-level transaction/error model: atomicity when a later write fails, Db2 `*NONE` statement atomicity, caller-owned transactions vs `*NONE`, return-code vs raised-error contract. Cross-dialect write pairing (incl. MERGE vs `ON CONFLICT` upserts, Db2 `FINAL TABLE`). |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
-| Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
+| Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
 | Review workflow | Review store keyed by fingerprint and snapshot with expiry and optional encryption at rest; accepted findings and in-source deliberate-difference markers suppressed (kept in JSON and SARIF `suppressions`); author-declared assumptions from pack markers; redacted export with salted stable placeholders, leak-checked; per-content-hash report cache ([docs/review-and-export.md](docs/review-and-export.md)). |
 | GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
@@ -79,7 +79,7 @@ Not yet built: binding against catalogs, the semantic IR and CFG with error edge
 
 ## MCP server
 
-`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files, never writes, and sends nothing over the network.
+`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files, never writes, and sends nothing over the network. It resolves packs and config like the CLI (`--pack`, `--config`, `--user-config`, `--isolated`); `--gui-url` (or `$SQLDIFF_GUI_URL`) sets where `open_in_gui` links point.
 
 ```sh
 cargo build --release
@@ -93,6 +93,13 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 | `diff` | `a`, `b`: `{dialect, path \| text, name?, version?}`; `max_findings` (20), `excerpt_lines` (3) | Verdict and finding cards, most severe first; cosmetic and structural noise counted |
 | `check` | `artifact`: as above | Lint findings for one file |
 | `finding` | `fingerprint` | One finding from this session in full: both locations with excerpts and the text of each assumption |
+| `queue` | `source` (directory, bundle, `git:…`, `adapter:…`; default `[source]`), `dialect_a`/`dialect_b`, `classes`, `min_severity`, `verdicts`, `folder`, `review`, `limit` (25) | Every pair of the source diffed and ranked: unreviewed, verdict, severity, whether one assumption decides the verdict, recency, size. A few lines per pair, each with a pair id |
+| `assumptions` | `pair` id or a finding `fingerprint` | The pair's assumption ledger: open, declared, confirmed or denied; findings relying on each; which flip the verdict |
+| `set_assumption` | `id`, `holds` (true, false or null to reset) | Session-local flip; every held pair's verdict is re-derived and changes are listed. A denied assumption makes the findings relying on it unknown |
+| `comment_text` | `finding_ids`, `excerpt_lines` (1), `fingerprints` (true) | A plain-text review comment from the phrase grammar: same findings, same text |
+| `open_in_gui` | `finding_id` or `pair`, `gui_url` | `{gui}/?a=<path>&b=<path>#f=<fingerprint>` and the `sqldiff-gui serve` command for the pair |
+
+The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store once it lands; until then every finding counts as unreviewed.
 
 Each result carries a readable text block and the same data as `structuredContent` JSON.
 

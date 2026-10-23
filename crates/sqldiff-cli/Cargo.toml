@@ -15,5 +15,6 @@ sqldiff-syntax.workspace = true
 sqldiff-core.workspace = true
 sqldiff-source.workspace = true
 sqldiff-review.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
