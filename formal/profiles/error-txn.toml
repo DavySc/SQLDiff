@@ -1028,3 +1028,118 @@ write stock
 write log
 """
 expect = { durable = ["stock"], raised = true, aborted = true }
+
+# ------------------------------------------------- regression cases (PR #9 review)
+
+[[case]]
+id = "tsql-rollback-releases-savepoints"
+covers = ["txn.savepoints.tsql"]
+dialect = "tsql"
+program = """
+begin
+write a
+savepoint s
+rollback
+begin
+write b
+rollback-to s
+commit
+"""
+expect = { durable = ["b"], raised = true }
+
+[[case]]
+id = "db2-commit-releases-savepoints"
+covers = ["txn.savepoints.db2i"]
+dialect = "db2i"
+commit = "CHG"
+program = """
+write a
+savepoint s
+commit
+rollback-to s
+"""
+expect = { durable = ["a"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-rollback-to-releases-later-savepoints"
+covers = ["txn.savepoints.db2i"]
+dialect = "db2i"
+commit = "CHG"
+program = """
+write a
+savepoint s
+write b
+savepoint t
+write c
+rollback-to s
+write d
+rollback-to t
+"""
+expect = { open = ["a", "d"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-atomic-exit-handler-fails"
+covers = ["error.structured-handling.db2i", "atomicity.routine.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt", c = "stmt" }
+program = """
+write x
+compound atomic exit {
+  write a
+  write b
+} handler {
+  write c
+}
+"""
+expect = { open = ["x"], raised = true, aborted = true }
+
+[[case]]
+id = "db2-undo-handler-fails"
+covers = ["error.structured-handling.db2i"]
+dialect = "db2i"
+commit = "CHG"
+faults = { b = "stmt", c = "stmt" }
+program = """
+compound atomic undo {
+  write a
+  write b
+} handler {
+  write c
+}
+"""
+expect = { raised = true, aborted = true }
+
+[[case]]
+id = "tsql-implicit-transaction-on-zero-rows"
+covers = ["txn.default-mode.tsql"]
+dialect = "tsql"
+implicit_transactions = true
+faults = { a = "notfound" }
+program = """
+write a
+"""
+expect = { tc = 1, raised = true }
+
+[[case]]
+id = "tsql-implicit-transaction-on-failed-write"
+covers = ["txn.default-mode.tsql"]
+dialect = "tsql"
+implicit_transactions = true
+faults = { a = "stmt" }
+program = """
+write a
+"""
+expect = { tc = 1, raised = true }
+
+[[case]]
+id = "pg-notice-keeps-found"
+covers = ["error.raising.postgres", "error.status-checks.postgres"]
+dialect = "postgres"
+faults = { a = "notfound" }
+program = """
+write a
+notice
+on-notfound return 1
+"""
+expect = { code = 1 }
