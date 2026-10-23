@@ -283,6 +283,101 @@ fn missing_terminator_before_throw() {
 }
 
 #[test]
+fn error_handler_writes_are_paired_by_target_not_count() {
+    // Three steps, each recording a failure in its own CATCH block.
+    let tsql = "BEGIN TRY\n  INSERT INTO parcel (id) SELECT id FROM old_parcel;\nEND TRY\n\
+                BEGIN CATCH\n  UPDATE run_state SET failed = 1;\nEND CATCH;\n\
+                BEGIN TRY\n  UPDATE parcel SET checked = 1;\nEND TRY\n\
+                BEGIN CATCH\n  UPDATE run_state SET failed = 1;\nEND CATCH;\n\
+                BEGIN TRY\n  DELETE FROM old_parcel;\nEND TRY\n\
+                BEGIN CATCH\n  UPDATE run_state SET failed = 1;\nEND CATCH;";
+    // One handler covering all three steps.
+    let pg = "do $$\nbegin\n  insert into parcel (id) select id from old_parcel;\n  \
+              update parcel set checked = 1;\n  delete from old_parcel;\n\
+              exception when others then\n  update run_state set failed = true;\n  raise;\nend;\n$$;";
+    let unpaired = |r: &Report| -> Vec<String> {
+        r.findings
+            .iter()
+            .filter(|f| f.rule == "write.unpaired")
+            .map(|f| f.witness.clone())
+            .collect()
+    };
+    let r = run(tsql, Dialect::Tsql, pg, Dialect::Postgres);
+    assert!(unpaired(&r).is_empty(), "{:?}", unpaired(&r));
+
+    // No failure recording at all: one finding, not one per CATCH block.
+    let db2 = "BEGIN\n  INSERT INTO parcel (id) SELECT id FROM old_parcel;\n  \
+               UPDATE parcel SET checked = 1;\n  DELETE FROM old_parcel;\nEND;";
+    let r = run(tsql, Dialect::Tsql, db2, Dialect::Db2i);
+    let w = unpaired(&r);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("UPDATE of run_state in an error handler (line 5, and 2 more)")
+            && w[0].contains("no error handler writes it"),
+        "{}",
+        w[0]
+    );
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule == "write.unpaired")
+        .unwrap();
+    assert_eq!(f.verdict, Verdict::Different);
+
+    // A Db2 condition handler that records the failure pairs with them.
+    let db2_handler = "BEGIN\n  DECLARE EXIT HANDLER FOR SQLEXCEPTION\n    BEGIN\n      \
+                       UPDATE run_state SET failed = 1;\n      RESIGNAL;\n    END;\n  \
+                       INSERT INTO parcel (id) SELECT id FROM old_parcel;\n  \
+                       UPDATE parcel SET checked = 1;\n  DELETE FROM old_parcel;\nEND;";
+    let r = run(tsql, Dialect::Tsql, db2_handler, Dialect::Db2i);
+    assert!(unpaired(&r).is_empty(), "{:?}", unpaired(&r));
+}
+
+#[test]
+fn insert_column_count_mismatch_is_reported() {
+    let lint = |sql: &str, d: Dialect| -> Vec<String> {
+        check(&Artifact::new("i.sql", d, sql), &Options::default())
+            .findings
+            .into_iter()
+            .filter(|f| f.rule == "hazard.insert-column-count")
+            .map(|f| f.witness)
+            .collect()
+    };
+    // Two large columns left out of the SELECT but kept in the column list.
+    let short = "INSERT INTO shipment (id, label, payload, note)\nOVERRIDING SYSTEM VALUE\n\
+                 SELECT s.id, s.label FROM old_shipment s WITH NC;";
+    let w = lint(short, Dialect::Db2i);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(
+        w[0].contains("names 4 columns but its SELECT list supplies 2"),
+        "{}",
+        w[0]
+    );
+    let rows = "insert into t (a, b) values (1, 2), (3);";
+    for d in Dialect::ALL {
+        assert_eq!(lint(rows, d).len(), 1, "{d}");
+    }
+    // Countable and matching, or not countable: no finding.
+    for (sql, d) in [
+        (
+            "INSERT INTO shipment (id, label) OVERRIDING SYSTEM VALUE SELECT s.id, s.label FROM old_shipment s WITH NC;",
+            Dialect::Db2i,
+        ),
+        (
+            "insert into t (a, b) select coalesce(x.a, x.b), cast(x.c as int) from s x;",
+            Dialect::Postgres,
+        ),
+        ("insert into t (a, b) select top (5) x.a, x.b from s x;", Dialect::Tsql),
+        ("insert into t (a, b) select * from s;", Dialect::Tsql),
+        ("insert into t (a, b) select x.* from s x;", Dialect::Postgres),
+        ("insert into t values (1, 2);", Dialect::Tsql),
+        ("insert into t (a, b) values (1, 2), (3, 4);", Dialect::Db2i),
+    ] {
+        assert!(lint(sql, d).is_empty(), "{d}: {sql}");
+    }
+}
+
+#[test]
 fn hazard_introduced_in_new_version_is_reported() {
     let old =
         "BEGIN TRY\n  UPDATE t SET x = 1;\nEND TRY\nBEGIN CATCH\n  ROLLBACK;\n  THROW;\nEND CATCH";

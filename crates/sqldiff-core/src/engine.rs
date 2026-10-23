@@ -391,11 +391,26 @@ fn first_line(f: &Finding) -> (usize, usize) {
     )
 }
 
+/// Inside a CATCH block, an EXCEPTION section or a condition handler.
+fn in_error_handler(node: &sqldiff_syntax::SyntaxNode) -> bool {
+    use sqldiff_syntax::SyntaxKind as K;
+    node.ancestors().any(|n| {
+        matches!(
+            n.kind(),
+            K::CATCH_BLOCK | K::EXCEPTION_SECTION | K::EXCEPTION_HANDLER | K::HANDLER
+        )
+    })
+}
+
 /// Cross-dialect: every durable write on one side should have a counterpart
 /// (same kind, same target object after case and `_` folding) on the other.
+///
+/// Writes on the normal path are matched in order. Writes inside error
+/// handlers are matched by key only, and reported once per key: one
+/// EXCEPTION block that records a failure covers several CATCH blocks that
+/// each record it, so how often and in what order they occur is not compared
+/// here (the behavioural diff compares the error paths themselves).
 fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
-    let wa = facts::writes(a);
-    let wb = facts::writes(b);
     // MERGE and INSERT ... ON CONFLICT are both upserts.
     let key = |w: &facts::Write| {
         let kind = if w.upsert {
@@ -410,75 +425,133 @@ fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
             .map(|x| x.1.to_string())
             .unwrap_or_default()
     };
+    let split = |x: &Analyzed| -> (Vec<facts::Write>, Vec<facts::Write>) {
+        facts::writes(x)
+            .into_iter()
+            .partition(|w| !in_error_handler(&w.node))
+    };
+    let (wa, ha) = split(a);
+    let (wb, hb) = split(b);
     let ka: Vec<String> = wa.iter().map(key).collect();
     let kb: Vec<String> = wb.iter().map(key).collect();
+    let kha: Vec<String> = ha.iter().map(key).collect();
+    let khb: Vec<String> = hb.iter().map(key).collect();
+    let unpaired = |side: &Analyzed,
+                    other: &Analyzed,
+                    w: &facts::Write,
+                    anchor: &str,
+                    (verdict, tail): (Verdict, &str),
+                    place: &str| {
+        let witness = format!(
+            "Side {:?} ({}) runs {} {}{place}; on side {:?} ({}) {tail}.",
+            side.side,
+            side.dialect().display_name(),
+            crate::treediff::article(crate::classify::StmtKind::label(w.kind)),
+            match w.kind {
+                crate::classify::StmtKind::Insert | crate::classify::StmtKind::Merge =>
+                    format!("into {}", w.target),
+                crate::classify::StmtKind::Delete => format!("from {}", w.target),
+                _ => format!("of {}", w.target),
+            },
+            other.side,
+            other.dialect().display_name(),
+        );
+        let is_a = side.side == Side::A;
+        let loc = side.node_location(&w.node);
+        let class = ChangeClass::Semantic;
+        Finding {
+            fingerprint: fingerprint(&FingerprintInput {
+                object: &a.object,
+                class,
+                rule: "write.unpaired",
+                anchor_a: if is_a { anchor } else { "" },
+                anchor_b: if is_a { "" } else { anchor },
+            }),
+            rule: "write.unpaired".to_string(),
+            class,
+            severity: Severity::High,
+            verdict,
+            witness,
+            a: is_a.then(|| loc.clone()),
+            b: (!is_a).then_some(loc),
+            assumptions: Vec::new(),
+        }
+    };
+    const SAME_TABLE: &str = "the same table is written by a different kind of statement";
+
     let pairs = lcs_pairs(&ka, &kb);
     let mut out = Vec::new();
     let matched_a: HashSet<usize> = pairs.iter().map(|p| p.0).collect();
     let matched_b: HashSet<usize> = pairs.iter().map(|p| p.1).collect();
-    for (side, other, ws, keys, matched, is_a) in [
-        (a, b, &wa, &ka, &matched_a, true),
-        (b, a, &wb, &kb, &matched_b, false),
+    for (side, other, ws, keys, matched, other_main, other_handler) in [
+        (a, b, &wa, &ka, &matched_a, &kb, &khb),
+        (b, a, &wb, &kb, &matched_b, &ka, &kha),
     ] {
         for (i, w) in ws.iter().enumerate() {
             if matched.contains(&i) {
                 continue;
             }
-            let other_keys = if is_a { &kb } else { &ka };
-            let elsewhere = other_keys.contains(&keys[i]);
-            let same_target = other_keys
+            let k = &keys[i];
+            let same_target = other_main
                 .iter()
-                .any(|k| target_of(k) == target_of(&keys[i]));
-            let (verdict, tail) = if elsewhere {
+                .chain(other_handler.iter())
+                .any(|o| target_of(o) == target_of(k));
+            let outcome = if other_main.contains(k) {
+                (Verdict::Unknown, "it appears there in a different order")
+            } else if other_handler.contains(k) {
                 (
                     Verdict::Unknown,
-                    "it appears there in a different order".to_string(),
+                    "it is written there only in an error handler",
                 )
             } else if same_target {
+                (Verdict::Unknown, SAME_TABLE)
+            } else {
+                (Verdict::Different, "it has no corresponding write")
+            };
+            let place = format!(" (line {})", side.line_of(&w.node));
+            out.push(unpaired(side, other, w, k, outcome, &place));
+        }
+    }
+    for (side, other, ws, keys, other_main, other_handler) in
+        [(a, b, &ha, &kha, &kb, &khb), (b, a, &hb, &khb, &ka, &kha)]
+    {
+        let mut seen = HashSet::new();
+        for (w, k) in ws.iter().zip(keys) {
+            if other_handler.contains(k) || !seen.insert(k) {
+                continue;
+            }
+            let same_target = other_main
+                .iter()
+                .chain(other_handler.iter())
+                .any(|o| target_of(o) == target_of(k));
+            let outcome = if other_main.contains(k) {
                 (
                     Verdict::Unknown,
-                    "the same table is written by a different kind of statement".to_string(),
+                    "it is written there outside an error handler",
                 )
+            } else if same_target {
+                (Verdict::Unknown, SAME_TABLE)
             } else {
-                (
-                    Verdict::Different,
-                    "it has no corresponding write".to_string(),
-                )
+                (Verdict::Different, "no error handler writes it")
             };
-            let witness = format!(
-                "Side {:?} ({}) runs {} {} (line {}); on side {:?} ({}) {tail}.",
-                side.side,
-                side.dialect().display_name(),
-                crate::treediff::article(crate::classify::StmtKind::label(w.kind)),
-                match w.kind {
-                    crate::classify::StmtKind::Insert | crate::classify::StmtKind::Merge =>
-                        format!("into {}", w.target),
-                    crate::classify::StmtKind::Delete => format!("from {}", w.target),
-                    _ => format!("of {}", w.target),
-                },
+            let more = keys.iter().filter(|x| *x == k).count() - 1;
+            let place = format!(
+                " in an error handler (line {}{})",
                 side.line_of(&w.node),
-                other.side,
-                other.dialect().display_name(),
+                if more > 0 {
+                    format!(", and {more} more")
+                } else {
+                    String::new()
+                }
             );
-            let loc = side.node_location(&w.node);
-            let class = ChangeClass::Semantic;
-            out.push(Finding {
-                fingerprint: fingerprint(&FingerprintInput {
-                    object: &a.object,
-                    class,
-                    rule: "write.unpaired",
-                    anchor_a: if is_a { &keys[i] } else { "" },
-                    anchor_b: if is_a { "" } else { &keys[i] },
-                }),
-                rule: "write.unpaired".to_string(),
-                class,
-                severity: Severity::High,
-                verdict,
-                witness,
-                a: is_a.then(|| loc.clone()),
-                b: (!is_a).then_some(loc),
-                assumptions: Vec::new(),
-            });
+            out.push(unpaired(
+                side,
+                other,
+                w,
+                &format!("handler:{k}"),
+                outcome,
+                &place,
+            ));
         }
     }
     out

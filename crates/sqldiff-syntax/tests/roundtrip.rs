@@ -89,6 +89,7 @@ const PIECES: &[&str] = &[
     "SET",
     "THROW",
     "ROLLBACK",
+    "\u{feff}",
 ];
 
 struct Lcg(u64);
@@ -122,6 +123,19 @@ fn random_inputs_round_trip() {
                 "parser lost bytes for {d}: {text:?}"
             );
         }
+    }
+}
+
+#[test]
+fn leading_byte_order_mark_is_trivia() {
+    for d in Dialect::ALL {
+        let text = "\u{feff}/* c */\ninsert into t (a) select a from s;\n";
+        let p = parse(text, d);
+        assert_eq!(p.syntax().text().to_string(), text, "{d}");
+        assert!(p.diagnostics.is_empty(), "{d}: {:?}", p.diagnostics);
+        // Anywhere else U+FEFF is not a byte-order mark, and still reported.
+        let inner = "select 1;\u{feff}\n";
+        assert!(!parse(inner, d).diagnostics.is_empty(), "{d}");
     }
 }
 
