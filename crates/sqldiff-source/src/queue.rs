@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqldiff_core::model::{hex, AssumptionSource};
-use sqldiff_core::{ChangeClass, Options, Report, Severity, Verdict};
+use sqldiff_core::{ChangeClass, Report, Severity, Verdict};
 
 use crate::protocol::{Describe, ObjectFilter, Pair, PairScope};
 use crate::{pairing, policy, Resolved, Result, Source};
@@ -57,9 +57,7 @@ pub fn run(src: &dyn Source, cfg: &Resolved, scope: &PairScope) -> Result<Run> {
         p.pairs = adapter_pairs;
     }
     let info = |id: &str| objects.iter().find(|o| o.id == id);
-    let opts = Options {
-        excerpt_lines: cfg.excerpt_lines,
-    };
+    let opts = cfg.core_options();
     let mut pairs = Vec::new();
     for x in &p.pairs {
         let a = src.load_artifact(&x.a)?;

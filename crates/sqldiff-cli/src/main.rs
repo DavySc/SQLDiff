@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
+use sqldiff_core::{render, Artifact, Dialect, Report, Verdict};
 use sqldiff_source::protocol::ObjectFilter;
 use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
@@ -56,6 +56,8 @@ enum Command {
         #[arg(long)]
         excerpt_lines: Option<usize>,
         #[command(flatten)]
+        catalogs: source_cmd::CatalogArgs,
+        #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
     /// Lint one artifact: residue from other dialects, terminator hazards,
@@ -67,6 +69,8 @@ enum Command {
         dialect: Option<Dialect>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        #[command(flatten)]
+        catalogs: source_cmd::CatalogArgs,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -182,14 +186,15 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
+            catalogs,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
             let b = read(&b, dialect_b.or(dialect), &cfg)?;
-            let opts = Options {
-                excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
-            };
+            let mut opts = cfg.core_options();
+            opts.excerpt_lines = excerpt_lines.unwrap_or(cfg.excerpt_lines);
+            catalogs.apply(&mut opts, a.dialect, Some(b.dialect))?;
             let report = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
             emit(&report, format);
             Ok(exit_for(report.verdict))
@@ -198,13 +203,13 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             file,
             dialect,
             format,
+            catalogs,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
             let art = read(&file, dialect, &cfg)?;
-            let opts = Options {
-                excerpt_lines: cfg.excerpt_lines,
-            };
+            let mut opts = cfg.core_options();
+            catalogs.apply(&mut opts, art.dialect, None)?;
             let report = with_policy(sqldiff_core::check(&art, &opts), &art, None, &cfg);
             emit(&report, format);
             Ok(exit_for(report.verdict))
@@ -344,9 +349,7 @@ fn tree(
 ) -> Result<ExitCode, String> {
     let mut sa = Side::load(dir_a, da, cfg)?;
     let mut sb = Side::load(dir_b, db, cfg)?;
-    let opts = Options {
-        excerpt_lines: cfg.excerpt_lines,
-    };
+    let opts = cfg.core_options();
     let mut pairs: Vec<(String, String)> = Vec::new();
     // Explicit pack pairs first: `a` relative to DIR_A, `b` relative to DIR_B.
     for e in &cfg.policy.pairing.pairs {

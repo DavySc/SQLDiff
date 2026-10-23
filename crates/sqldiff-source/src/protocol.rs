@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sqldiff_core::catalog::{self as core, types::DataType};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -233,6 +234,85 @@ impl Catalog {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty() && self.routines.is_empty()
     }
+
+    /// The core's catalog model, for binding. `origin` names the source in witnesses.
+    pub fn to_core(&self, origin: &str) -> core::Catalog {
+        let tables = self
+            .tables
+            .iter()
+            .map(|t| {
+                let mut x =
+                    core::Table::new(t.schema.clone(), t.name.clone(), core::TableKind::Table);
+                x.columns = t
+                    .columns
+                    .iter()
+                    .map(|c| core::Column {
+                        name: c.name.clone(),
+                        data_type: DataType::parse_str(&c.data_type),
+                        nullable: c.nullable,
+                        identity: false,
+                        has_default: false,
+                        collation: c.collation.clone(),
+                    })
+                    .collect();
+                x.keys = t
+                    .keys
+                    .iter()
+                    .map(|(name, cols)| core::Key {
+                        primary: name == "primary",
+                        name: Some(name.clone()),
+                        columns: cols.clone(),
+                    })
+                    .collect();
+                x.indexes = t
+                    .indexes
+                    .iter()
+                    .map(|(name, cols)| core::Index {
+                        name: name.clone(),
+                        unique: false,
+                        columns: cols.clone(),
+                    })
+                    .collect();
+                x.triggers = t.triggers.clone();
+                x
+            })
+            .collect();
+        let routines = self
+            .routines
+            .iter()
+            .map(|r| core::Routine {
+                schema: r.schema.clone(),
+                name: r.name.clone(),
+                kind: match r.kind.to_ascii_lowercase().as_str() {
+                    "function" => core::RoutineKind::Function,
+                    "trigger" => core::RoutineKind::Trigger,
+                    _ => core::RoutineKind::Procedure,
+                },
+                params: r
+                    .parameters
+                    .iter()
+                    .map(|p| core::Param {
+                        name: p.name.clone(),
+                        data_type: DataType::parse_str(&p.data_type),
+                        mode: match p.mode.to_ascii_lowercase().as_str() {
+                            "out" => core::ParamMode::Out,
+                            "inout" => core::ParamMode::InOut,
+                            "variadic" => core::ParamMode::Variadic,
+                            _ => core::ParamMode::In,
+                        },
+                        has_default: p.has_default,
+                    })
+                    .collect(),
+                returns: r.returns.as_deref().map(DataType::parse_str),
+            })
+            .collect();
+        core::Catalog {
+            origin: origin.to_string(),
+            tables,
+            routines,
+            schemas: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +366,13 @@ pub struct Parameter {
     /// `in`, `out` or `inout`.
     #[serde(default = "mode_in")]
     pub mode: String,
+    /// The parameter has a default, so callers may omit it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub has_default: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn mode_in() -> String {

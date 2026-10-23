@@ -180,6 +180,26 @@ struct Compiled {
 }
 
 impl Resolved {
+    /// Core options from this config: excerpt length and pack helper functions.
+    pub fn core_options(&self) -> sqldiff_core::Options {
+        sqldiff_core::Options {
+            excerpt_lines: self.excerpt_lines,
+            helpers: self
+                .policy
+                .helpers
+                .iter()
+                .filter_map(|h| {
+                    Some(sqldiff_core::catalog::builtins::Helper {
+                        name: h.name.clone(),
+                        dialect: h.dialect.parse().ok()?,
+                        returns: h.returns.clone(),
+                    })
+                })
+                .collect(),
+            ..sqldiff_core::Options::default()
+        }
+    }
+
     /// Built-in defaults only: what the core runs with when no pack is loaded.
     pub fn builtin() -> Resolved {
         Resolved::from_layers(Vec::new(), Vec::new()).expect("built-in config is valid")

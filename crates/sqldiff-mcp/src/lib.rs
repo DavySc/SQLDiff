@@ -162,6 +162,7 @@ impl Server {
                 .and_then(Value::as_u64)
                 .map(|n| n as usize)
                 .unwrap_or(self.config.excerpt_lines),
+            ..self.config.core_options()
         }
     }
 

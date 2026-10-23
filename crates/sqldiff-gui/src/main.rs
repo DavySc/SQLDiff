@@ -124,6 +124,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let b = Artifact::new(pair.b.display().to_string(), pair.dialect_b, read(&pair.b)?);
             let opts = Options {
                 excerpt_lines: pair.excerpt_lines,
+                ..Options::default()
             };
             let html = sqldiff_gui::page(&sqldiff_gui::build(&a, &b, &opts, false));
             std::fs::write(&output, html).map_err(|e| format!("{}: {e}", output.display()))?;

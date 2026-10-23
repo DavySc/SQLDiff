@@ -64,7 +64,9 @@ adapter that pairs by itself overrides pack pairing rules.
 **Catalog**: `tables[]` with `schema`, `name`, `columns[]` (`name`, `type`,
 `nullable`, `collation`), `keys` and `indexes` (name to columns),
 `triggers[]`; `routines[]` with `schema`, `name`, `kind`, `parameters[]`
-(`name`, `type`, `mode`), `returns`.
+(`name`, `type`, `mode`, optional `has_default`), `returns`. The core binds
+names against it (`sqldiff diff --catalog BUNDLE.json`); a parameter with
+`has_default` may be left out of a call.
 
 **HistoryEntry**: `revision`, `time`, `author`, `description`,
 `work_items[]` (from pack change patterns), `artifact_id` (pass to

@@ -27,6 +27,12 @@ $B tree src/tsql src/db2 --dialect-a tsql --dialect-b db2i --pack ../private-pac
 # Without a dialect flag, the dialect comes from dialect_map or the path (x.pg.sql).
 $B diff tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.pg.sql
 
+# Bind names against a catalog: DDL (.sql, read in each side's dialect) or a
+# snapshot bundle (.json); --catalog-a / --catalog-b for one side. Unknown
+# tables, columns, schemas, routine signatures and other dialects' built-ins
+# become proven findings; without a catalog they become assumptions.
+$B check corpus/mutations/m15-dropped-column-reference/mutated.pg.sql --catalog corpus/catalog/pg.sql
+
 # Machine output for CI
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif
 
@@ -65,12 +71,13 @@ Verdict: DIFFERENT
 | 1 Parsing | Hand-written lossless lexers and a statement-level CST (rowan) for all three dialects: `print(parse(x)) == x` for any input (fuzz-tested). Procedural compounds (blocks, IF, loops, CASE, Db2 handlers, T-SQL TRY/CATCH, PL/pgSQL EXCEPTION), T-SQL `GO` batches and inferred terminators, Db2 labels and `SET OPTION`, nested PL/pgSQL/SQL parsing of dollar-quoted bodies with offsets into the outer file. Expressions are kept flat for now. |
 | 5 Structural diff | Same-dialect: statements aligned by normalized content (not lines), cosmetic changes counted and hidden, edits, additions, removals and moves classified, including moves across transaction boundaries. T-SQL identifier case folds only under an explicit collation assumption. |
 | Behavioural checks | Summary-level transaction/error model: atomicity when a later write fails, Db2 `*NONE` statement atomicity, caller-owned transactions vs `*NONE`, return-code vs raised-error contract. Cross-dialect write pairing (incl. MERGE vs `ON CONFLICT` upserts, Db2 `FINAL TABLE`). |
+| 2 Binding and early checks | Every name is bound to a declaration, a catalog object, a built-in ([profiles/builtins.toml](crates/sqldiff-core/profiles/builtins.toml): functions, procedures, types and the version that introduced them) or a pack `[[helpers]]` function, or becomes a recorded assumption (`ASM-BIND-*`). Scopes per batch, routine, block, loop and handler; identifier folding per dialect. Catalogs come from DDL (`CREATE TABLE/VIEW/INDEX/PROCEDURE/FUNCTION`, `ALTER TABLE`), snapshot bundles and adapter catalogs. Early checks: unknown table, schema, column, alias, record field and routine; call signatures (missing, extra and named arguments); built-ins of another dialect or a newer version; ambiguous names (PL/pgSQL `variable_conflict`, Db2 column/variable), duplicate and shadowing declarations, references captured by a new shadowing declaration (`bind.rebound-variable`), `ISNULL` truncation to the first argument's type. |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
 | Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
 | GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
-Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
+Not yet built: the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
 ## MCP server
 

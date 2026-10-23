@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use serde::de::DeserializeOwned;
-use sqldiff_core::{phrase, ChangeClass, Dialect, Options, Report, Severity, Verdict};
+use sqldiff_core::{phrase, ChangeClass, Dialect, Report, Severity, Verdict};
 use sqldiff_source::protocol::PairScope;
 use sqldiff_source::queue::{self, Filter, Flips, ReviewFilter, Status};
 use sqldiff_source::{Resolved, SourceSpec};
@@ -65,9 +65,7 @@ impl PairArgs {
         let cfg = self.cfg.resolve()?;
         let a = read(&self.a, self.dialect_a.or(self.dialect), &cfg)?;
         let b = read(&self.b, self.dialect_b.or(self.dialect), &cfg)?;
-        let opts = Options {
-            excerpt_lines: cfg.excerpt_lines,
-        };
+        let opts = cfg.core_options();
         let r = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
         Ok((r, cfg))
     }

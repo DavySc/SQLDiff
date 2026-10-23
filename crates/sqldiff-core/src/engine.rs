@@ -1,14 +1,18 @@
 //! Entry points: diff two artifacts, or check one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::artifact::{Analyzed, Artifact};
+use crate::artifact::{content_hash, Analyzed, Artifact};
+use crate::bind::{self, BindInput, Bindings};
+use crate::catalog::builtins::Helper;
+use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
 use crate::facts;
 use crate::lint;
 use crate::model::{
-    fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, NoiseCounts, Report, Severity,
-    Side, Verdict,
+    fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Location, NoiseCounts, Report,
+    Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::treediff;
@@ -17,12 +21,57 @@ use crate::treediff;
 pub struct Options {
     /// Maximum lines of excerpt per location.
     pub excerpt_lines: usize,
+    /// Catalog DDL for side A (`CREATE TABLE`, `CREATE PROCEDURE`, ...), each
+    /// read in its own dialect. `check` uses these for its one artifact.
+    pub catalog_a: Vec<Artifact>,
+    /// Catalog DDL for side B.
+    pub catalog_b: Vec<Artifact>,
+    /// Structured catalog facts for side A (adapter `get_catalog`, snapshot bundles).
+    pub facts_a: Vec<Arc<Catalog>>,
+    /// Structured catalog facts for side B.
+    pub facts_b: Vec<Arc<Catalog>>,
+    /// Pack-supplied helper functions, added to the built-in catalog.
+    pub helpers: Vec<Helper>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { excerpt_lines: 3 }
+        Options {
+            excerpt_lines: 3,
+            catalog_a: Vec::new(),
+            catalog_b: Vec::new(),
+            facts_a: Vec::new(),
+            facts_b: Vec::new(),
+            helpers: Vec::new(),
+        }
     }
+}
+
+/// Parsed catalog DDL, cached by content hash (tree diffs reuse one catalog for every pair).
+fn ddl_catalog(a: &Artifact) -> Arc<Catalog> {
+    type Cache = Mutex<HashMap<(String, &'static str), Arc<Catalog>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = (content_hash(&a.text), a.dialect.id());
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(c) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
+        return c;
+    }
+    let c = Arc::new(ddl::load(&a.text, a.dialect, &a.path));
+    if let Ok(mut m) = cache.lock() {
+        m.insert(key, c.clone());
+    }
+    c
+}
+
+/// The catalog one side binds against.
+fn catalog_view(
+    dialect: sqldiff_syntax::Dialect,
+    ddl: &[Artifact],
+    facts: &[Arc<Catalog>],
+) -> CatalogView {
+    let loaded: Vec<Arc<Catalog>> = ddl.iter().map(ddl_catalog).collect();
+    let sources: Vec<&Catalog> = loaded.iter().chain(facts).map(|c| c.as_ref()).collect();
+    CatalogView::new(dialect, &sources)
 }
 
 pub const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -91,6 +140,37 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
+    let view_a = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let view_b = catalog_view(b.dialect, &opts.catalog_b, &opts.facts_b);
+    let bound_a = bind::bind(
+        &aa,
+        &BindInput {
+            view: &view_a,
+            helpers: &opts.helpers,
+        },
+    );
+    let bound_b = bind::bind(
+        &ab,
+        &BindInput {
+            view: &view_b,
+            helpers: &opts.helpers,
+        },
+    );
+    let (bindf, binda) = bind::binding_findings(&Bindings {
+        a: (&aa, &bound_a, view_a.supplied),
+        b: Some((&ab, &bound_b, view_b.supplied)),
+    });
+    absorb_residue(&mut findings, &bindf);
+    findings.extend(bindf);
+    for x in binda {
+        if !assumptions.iter().any(|y| y.id == x.id) {
+            assumptions.push(x);
+        }
+    }
+    if view_a.supplied || view_b.supplied {
+        normalizations.push("names bound against the catalog".to_string());
+    }
+
     let (bf, ba) = facts::compare(&aa, &ab);
     // Same-dialect diffs keep behavioural findings only when the facts actually differ.
     findings.extend(bf);
@@ -126,10 +206,24 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
-    let findings = lint::all_hits(&aa)
+    let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
         .collect();
+    let view = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let bound = bind::bind(
+        &aa,
+        &BindInput {
+            view: &view,
+            helpers: &opts.helpers,
+        },
+    );
+    let (bindf, assumptions) = bind::binding_findings(&Bindings {
+        a: (&aa, &bound, view.supplied),
+        b: None,
+    });
+    absorb_residue(&mut findings, &bindf);
+    findings.extend(bindf);
     let diagnostics = aa.diagnostics();
     let mut unknown_reasons = Vec::new();
     if !diagnostics.is_empty() {
@@ -143,10 +237,25 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         findings,
         noise: NoiseCounts::default(),
         normalizations: Vec::new(),
-        assumptions: Vec::new(),
+        assumptions,
         unknown_reasons,
         diagnostics,
     })
+}
+
+/// A proven binding error (`GETDATE()` in PostgreSQL fails to bind) says more
+/// than the residue hit on the same text, so the residue finding is dropped.
+fn absorb_residue(findings: &mut Vec<Finding>, binding: &[Finding]) {
+    let overlaps = |x: &Option<Location>, y: &Option<Location>| match (x, y) {
+        (Some(x), Some(y)) => x.byte_start < y.byte_end && y.byte_start < x.byte_end,
+        _ => false,
+    };
+    findings.retain(|f| {
+        f.class != ChangeClass::Residue
+            || !binding.iter().any(|b| {
+                b.verdict == Verdict::Different && (overlaps(&f.a, &b.a) || overlaps(&f.b, &b.b))
+            })
+    });
 }
 
 fn finish(mut r: Report) -> Report {
