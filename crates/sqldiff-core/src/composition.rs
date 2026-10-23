@@ -691,10 +691,8 @@ fn effect_class(n: &SyntaxNode, dialect: sqldiff_syntax::Dialect) -> Option<Chan
 /// A wrapper fact: transaction, error-handling or session behaviour stated
 /// by a part other than the one holding the routine's writes.
 fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
-    let f = facts::extract(an);
     // Body parts hold the routine's writes; every other part is wrapper.
-    let body: BTreeSet<String> = f
-        .writes
+    let body: BTreeSet<String> = facts::writes(an)
         .iter()
         .filter_map(|w| comp.part_at(ast::sig_range(&w.node).0))
         .map(|p| p.name.clone())
@@ -716,7 +714,7 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
                     kind.label().replace(['/', ' '], "-").to_lowercase()
                 )
             }
-            StmtKind::Block if f.atomic_blocks.contains(&n) => "atomic".to_string(),
+            StmtKind::Block if facts::is_atomic_block(&n) => "atomic".to_string(),
             _ => continue,
         };
         // A handler inside another handler is covered by the outer one.
@@ -732,12 +730,11 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
         }
         found.push((ast::sig_range(&n).0, key, an.snippet(&n, 60)));
     }
-    if let Some((level, off)) = &f.commit_level {
-        found.push((
-            *off,
-            "commit-level".to_string(),
-            format!("COMMIT = {level}"),
-        ));
+    let commit_level = (an.dialect() == sqldiff_syntax::Dialect::Db2i)
+        .then(|| facts::find_commit_level(an))
+        .flatten();
+    if let Some((level, off)) = commit_level {
+        found.push((off, "commit-level".to_string(), format!("COMMIT = {level}")));
     }
     for (off, key, what) in found {
         let Some(p) = comp.part_at(off) else { continue };

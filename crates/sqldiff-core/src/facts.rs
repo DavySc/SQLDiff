@@ -54,6 +54,21 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
     out
 }
 
+/// `BEGIN ATOMIC` (Db2 compound, SQL-standard function body).
+pub fn is_atomic_block(node: &SyntaxNode) -> bool {
+    if node.kind() != SyntaxKind::BLOCK {
+        return false;
+    }
+    let toks: Vec<String> = ast::header_tokens(node)
+        .iter()
+        .take(4)
+        .map(|t| t.text().to_ascii_uppercase())
+        .collect();
+    toks.iter()
+        .position(|t| t == "BEGIN")
+        .is_some_and(|i| toks.get(i + 1).is_some_and(|t| t == "ATOMIC"))
+}
+
 fn has_on_conflict(node: &SyntaxNode) -> bool {
     let words: Vec<String> = ast::sig_tokens(node)
         .map(|t| t.text().to_ascii_uppercase())
