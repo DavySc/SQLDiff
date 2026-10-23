@@ -66,7 +66,7 @@ header { height: 44px; flex: none; padding: 0 12px 0 16px; border-bottom: 1px so
 #btn-palette:hover { color: var(--muted); background: var(--bg); border-color: color-mix(in srgb, var(--focus) 40%, var(--line)); }
 
 /* Details popover (provenance). Hidden until asked for. */
-#provbar { display: none; position: absolute; right: 12px; top: 48px; z-index: 8; width: min(440px, calc(100vw - 24px)); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--pop); padding: 6px 0; font-size: 12.5px; }
+#provbar { display: none; position: absolute; right: 12px; top: calc(100% + 4px); z-index: 8; width: min(440px, calc(100vw - 24px)); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--pop); padding: 6px 0; font-size: 12.5px; }
 body.show-info #provbar { display: block; }
 #provbar .kv { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px; padding: 5px 14px; }
 #provbar .k { color: var(--muted); }
@@ -316,7 +316,8 @@ const VERD = { different: 3, unknown: 2, equal_under_assumptions: 1, equal: 0 };
 const state = {
   page: null, live: false, view: "queue", cur: -1, data: null,
   fold: true, hidden: new Set(), focus: -1, expanded: new Set(), rowFocus: -1, hideAccepted: false,
-  scratchDirty: false, commenting: -1, src: ["", ""],
+  // The comment being written: { fp, text, grab }, keyed by fingerprint so re-diffs cannot move it to another finding.
+  scratchDirty: false, comment: null, src: ["", ""],
   q: { cls: "", dialects: "", folder: "", review: "", text: "", sort: "severity" }, qsel: 0, qmore: false,
   // Side-panel sections that are expanded; everything else stays folded away.
   open: new Set(["asm"]),
@@ -355,12 +356,18 @@ async function setReview(i, st, comment) {
   if (!state.live) return;
   const f = state.data.report.findings[i];
   try {
-    // Triage flow: deciding the focused finding moves on to the next open one.
-    const open = orderedFindings().open.map(({ i: k }) => k);
-    const at = open.indexOf(i);
-    const next = (st === "accepted" || st === "rejected") && state.focus === i && at >= 0 ? (open[at + 1] ?? open[at - 1] ?? -1) : null;
+    // Triage flow: deciding the focused finding moves on to the next open one. Held by fingerprint,
+    // since a re-diff during the request can replace and reorder the findings.
+    const open = orderedFindings().open.map(({ f: g }) => g.fingerprint);
+    const at = open.indexOf(f.fingerprint);
+    const advance = (st === "accepted" || st === "rejected") && state.focus === i && at >= 0;
+    const nextFp = advance ? (open[at + 1] ?? open[at - 1] ?? null) : null;
     applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot: state.data.snapshot, state: st, comment: comment == null ? null : comment }));
-    state.commenting = -1;
+    if (state.comment && state.comment.fp === f.fingerprint) state.comment = null;
+    // Advance only if focus is still on the decided finding (the user may have moved on meanwhile).
+    const fs = state.data.report.findings;
+    const stillThere = state.focus >= 0 && fs[state.focus] && fs[state.focus].fingerprint === f.fingerprint;
+    const next = advance && stillThere ? (nextFp ? fs.findIndex((g) => g.fingerprint === nextFp) : -1) : null;
     if (next != null) state.focus = next;
     renderSide(); renderPane(); renderHeader();
     if (next != null && next >= 0) focusFinding(next, true);
@@ -527,7 +534,7 @@ function renderQueue() {
   }
   for (const el of $("qmain").querySelectorAll("button[data-seg]")) el.onclick = () => { state.q.review = el.dataset.seg; state.qsel = 0; renderQueue(); };
   $("btn-qmore").onclick = () => { state.qmore = !state.qmore; renderQueue(); };
-  $("qmain").style.setProperty("--fh", $("qmain").querySelector(".filters").offsetHeight + "px");
+  syncFilterHeight();
   for (const el of $("qmain").querySelectorAll("tr.qrow")) el.onclick = () => openPair(+el.dataset.i);
   wireSections($("qmain"));
   // Session-wide assumption panel.
@@ -535,6 +542,11 @@ function renderQueue() {
   $("qside").innerHTML = `<div class="sh"><h2>Assumptions<span class="n">${asm.length}</span></h2></div>`
     + (asm.length ? `<p class="intro">Deny one to see what it holds up: every finding and verdict relying on it drops to unknown. Flips last for this session.</p>` + asm.map((a) => asmCard(a, false)).join("") : `<p class="empty-note">No pair relies on an assumption.</p>`);
   wireFlips($("qside"));
+}
+// The table header sticks just below the filter bar, whose height changes with Filters and with the width.
+function syncFilterHeight() {
+  const bar = $("qmain").querySelector(".filters");
+  if (bar) $("qmain").style.setProperty("--fh", bar.offsetHeight + "px");
 }
 function stepQueue(d) {
   const n = queueRows().length;
@@ -554,7 +566,7 @@ async function loadPair(i, keepFocus) {
   state.data = data;
   state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
   if (!keepFocus) {
-    state.expanded.clear(); state.rowFocus = -1; state.scratchDirty = false;
+    state.expanded.clear(); state.rowFocus = -1; state.scratchDirty = false; state.comment = null;
     syncEditors(data);
   }
 }
@@ -739,7 +751,6 @@ function gotoRow(k) {
   if (el) { el.classList.add("focus"); el.scrollIntoView({ block: "center", behavior: "smooth" }); }
 }
 
-function locText(l) { return l ? `${l.side.toUpperCase()} ${l.start_line}:${l.start_col}` : ""; }
 
 function findingCard(f, i, asm) {
   const x = decision(f.fingerprint, state.data.snapshot);
@@ -754,11 +765,12 @@ function findingCard(f, i, asm) {
       <button data-rv="comment" ${dis} title="Comment">Comment <kbd>m</kbd></button>
       ${x && x.current ? `<button data-rv="clear" ${dis} title="Undo the decision">Undo</button>` : ""}
     </div>`;
-  const box = state.commenting === i ? `<textarea id="cmt-${i}" rows="2" placeholder="Comment, Ctrl+Enter to save">${esc(x && x.current && x.d.comment || "")}</textarea>` : "";
+  const editing = !!(state.comment && state.comment.fp === f.fingerprint);
+  const box = editing ? `<textarea id="cmt-${i}" rows="2" placeholder="Comment, Ctrl+Enter to save">${esc(state.comment.text)}</textarea>` : "";
   // Where it is, in the short form shown on the right of every item.
   const at = [f.a, f.b].filter(Boolean).map((l) => `${l.side.toUpperCase()} ${l.start_line}`).join(" · ");
   const assumes = f.assumptions.map((id) => `<li title="${esc(id)}">${esc(asm[id] && asm[id].text ? asm[id].text : id)}</li>`).join("");
-  return `<div class="finding ${state.focus === i ? "focus" : ""} ${state.commenting === i ? "commenting" : ""} ${cur === "accepted" || cur === "rejected" ? "done" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
+  return `<div class="finding ${state.focus === i ? "focus" : ""} ${editing ? "commenting" : ""} ${cur === "accepted" || cur === "rejected" ? "done" : ""}" data-i="${i}" id="f-${i}" style="--fc:${clsColor(f.class)}">
       <div class="head"><span class="dot" style="background:var(--fc)"></span><span class="cls">${esc(f.class)}</span><span>${esc(f.severity)}</span>${tag}<span class="at">${esc(at)}</span></div>
       <p>${esc(f.witness)}</p>
       ${assumes ? `<div class="assumes"><span class="k">Holds only if</span><ul>${assumes}</ul></div>` : ""}
@@ -781,9 +793,10 @@ function renderSide() {
   // Class filter only earns its space when there is more than one class to tell apart.
   if (classes.length > 1 || state.hidden.size) parts.push(`<div id="classes">${classes.map((c) =>
     `<button class="chip ${state.hidden.has(c) ? "off" : ""}" data-cls="${c}" title="Show or hide ${c} findings"><span class="dot" style="background:${clsColor(c)}"></span>${c} ${counts[c]}</button>`).join("")}</div>`);
+  const hiddenOpen = n - reviewed - open.length;
   if (!n) parts.push(`<p class="empty-note">No findings. Nothing to review here.</p>`);
-  else if (!open.length && done.length) parts.push(`<p class="all-done">✓ All findings reviewed${state.page.queue.length > 1 ? ` <button id="btn-nextpair2">Next pair ›</button>` : ""}</p>`);
-  else if (!fs.length) parts.push(`<p class="empty-note">All findings are hidden by the filters.</p>`);
+  else if (reviewed === n) parts.push(`<p class="all-done">✓ All findings reviewed${state.page.queue.length > 1 ? ` <button id="btn-nextpair2">Next pair ›</button>` : ""}</p>`);
+  else if (!open.length) parts.push(`<p class="empty-note">${hiddenOpen} open finding${hiddenOpen === 1 ? " is" : "s are"} hidden by the filters.</p>`);
   for (const { f, i } of open) parts.push(findingCard(f, i, asm));
   // Reviewed findings drop out of the way, like a done column.
   if (done.length) parts.push(section("done", "Reviewed", done.length, done.map(({ f, i }) => findingCard(f, i, asm)).join("")));
@@ -797,7 +810,7 @@ function renderSide() {
   if (r.diagnostics.length) parts.push(section("diag", "Parse diagnostics", r.diagnostics.length, ul(r.diagnostics.map((d) => `${d.side.toUpperCase()} ${d.line}:${d.col} ${d.message}`))));
   $("side").innerHTML = parts.join("");
   for (const b of $("side").querySelectorAll("button[data-cls]")) b.onclick = () => toggleClass(b.dataset.cls);
-  for (const el of $("side").querySelectorAll(".finding")) el.onclick = (e) => { if (!e.target.closest("button,textarea,abbr")) focusFinding(+el.dataset.i, true); };
+  for (const el of $("side").querySelectorAll(".finding")) el.onclick = (e) => { if (!e.target.closest("button,textarea")) focusFinding(+el.dataset.i, true); };
   for (const el of $("side").querySelectorAll("button[data-copy]")) el.onclick = () => copyFinding(+el.dataset.copy);
   // Hovering an item shows its rows in the diff.
   for (const el of $("side").querySelectorAll(".finding")) {
@@ -811,12 +824,15 @@ function renderSide() {
       reviewAction(i, el.dataset.rv);
     };
   }
-  const ta = state.commenting >= 0 && $("cmt-" + state.commenting);
+  const ta = $("side").querySelector(".finding.commenting textarea");
   if (ta) {
-    ta.focus();
+    const i = +ta.closest(".finding").dataset.i;
+    // Take keyboard focus only when the box first opens; later re-renders leave focus where the user put it.
+    if (state.comment.grab) { state.comment.grab = false; ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); }
+    ta.oninput = () => { state.comment.text = ta.value; };
     ta.onkeydown = (e) => {
-      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveComment(state.commenting); }
-      else if (e.key === "Escape") { state.commenting = -1; renderSide(); }
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); saveComment(i); }
+      else if (e.key === "Escape") { state.comment = null; renderSide(); }
     };
   }
   wireFlips($("side"));
@@ -825,8 +841,9 @@ function renderSide() {
 function reviewAction(i, act) {
   if (!state.live) return;
   if (act === "comment") {
-    if (state.commenting === i) saveComment(i);
-    else { state.commenting = i; state.focus = i; renderSide(); }
+    const fp = state.data.report.findings[i].fingerprint;
+    if (state.comment && state.comment.fp === fp) saveComment(i);
+    else { state.comment = { fp, text: currentComment(i) || "", grab: true }; state.focus = i; renderSide(); }
   } else setReview(i, act === "clear" ? null : act, currentComment(i));
 }
 function currentComment(i) {
@@ -835,8 +852,8 @@ function currentComment(i) {
   return x && x.current ? x.d.comment || null : null;
 }
 function saveComment(i) {
-  const text = $("cmt-" + i) ? $("cmt-" + i).value : "";
   const f = state.data.report.findings[i];
+  const text = state.comment && state.comment.fp === f.fingerprint ? state.comment.text : "";
   const x = decision(f.fingerprint, state.data.snapshot);
   // A comment keeps an accept or reject; on its own it is a "commented" decision.
   const st = x && x.current && x.d.state !== "commented" ? x.d.state : "commented";
@@ -1059,6 +1076,7 @@ function init() {
   $("btn-palette").onclick = openPalette;
   $("btn-help").onclick = () => $("help").classList.add("open");
   $("btn-info").onclick = (e) => { e.stopPropagation(); toggleInfo(); };
+  window.addEventListener("resize", syncFilterHeight);
   $("provbar").onclick = (e) => e.stopPropagation();
   document.addEventListener("click", () => toggleInfo(false));
   $("btn-density").onclick = () => setDensity(!document.body.classList.contains("compact"));
