@@ -2,13 +2,17 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
 }
 
+/// A fresh directory per call: tests run in parallel, so no two may share one.
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("sqldiff-queue-{name}-{}", std::process::id()));
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("sqldiff-queue-{name}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
