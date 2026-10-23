@@ -19,10 +19,16 @@ elif [[ -n "${SQLDIFF_DENYLIST:-}" ]]; then
   printf '%s\n' "${SQLDIFF_DENYLIST}" >> "$out"
 else
   root="$(git rev-parse --show-toplevel)"
-  bin=""
-  for c in sqldiff "$root/target/release/sqldiff" "$root/target/debug/sqldiff"; do
-    if command -v "$c" >/dev/null 2>&1; then bin="$c"; break; fi
-  done
+  bin="$(command -v sqldiff 2>/dev/null)" || bin=""
+  if [[ -z "$bin" ]]; then
+    # The newer of the two builds: an old one may not read a pack that uses
+    # newer keys, and strict mode would then refuse every commit.
+    for c in "$root/target/release/sqldiff" "$root/target/debug/sqldiff"; do
+      for f in "$c" "$c.exe"; do
+        if [[ -f "$f" && ( -z "$bin" || "$f" -nt "$bin" ) ]]; then bin="$f"; fi
+      done
+    done
+  fi
   if [[ -n "${SQLDIFF_CONFIG:-}" ]]; then
     cfg="${SQLDIFF_CONFIG}"
   elif [[ -n "${APPDATA:-}" ]]; then
