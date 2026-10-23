@@ -47,7 +47,7 @@ struct Review {
 }
 
 /// Largest request body accepted (scratchpad texts).
-const MAX_BODY: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_BODY: usize = 16 * 1024 * 1024;
 
 pub fn serve(listener: TcpListener, session: Session) -> std::io::Result<()> {
     let session = Arc::new(Mutex::new(session));
@@ -61,9 +61,9 @@ pub fn serve(listener: TcpListener, session: Session) -> std::io::Result<()> {
     Ok(())
 }
 
-type Response = (&'static str, &'static str, String);
+pub(crate) type Response = (&'static str, &'static str, String);
 
-fn json<T: serde::Serialize>(v: &T) -> Response {
+pub(crate) fn json<T: serde::Serialize>(v: &T) -> Response {
     (
         "200 OK",
         "application/json",
@@ -71,11 +71,11 @@ fn json<T: serde::Serialize>(v: &T) -> Response {
     )
 }
 
-fn bad(e: impl ToString) -> Response {
+pub(crate) fn bad(e: impl ToString) -> Response {
     ("400 Bad Request", "text/plain", e.to_string())
 }
 
-fn not_found() -> Response {
+pub(crate) fn not_found() -> Response {
     ("404 Not Found", "text/plain", "not found".to_string())
 }
 
@@ -111,7 +111,17 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()> {
+/// A parsed request.
+pub(crate) struct Request {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub body: Vec<u8>,
+}
+
+/// Reads one request. `Err(response)` when it must be refused: a body over
+/// `MAX_BODY`, or a cross-site POST (an `Origin` that is not this server).
+pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Result<Request, Response>> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
@@ -119,29 +129,58 @@ fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("").to_string();
     let mut content_length = 0usize;
+    let (mut host, mut origin) = (None, None);
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
             break;
         }
         if let Some((k, v)) = line.split_once(':') {
+            let v = v.trim();
             if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
+                content_length = v.parse().unwrap_or(0);
+            } else if k.eq_ignore_ascii_case("host") {
+                host = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("origin") {
+                origin = Some(v.to_string());
             }
         }
     }
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     let mut body = Vec::new();
     if method == "POST" {
+        // Browsers send Origin on cross-site POSTs: only this server's own page may post.
+        let own = |o: &str| {
+            let authority = o.split_once("://").map_or(o, |(_, a)| a);
+            host.as_deref() == Some(authority)
+        };
+        if origin.as_deref().is_some_and(|o| !own(o)) {
+            return Ok(Err((
+                "403 Forbidden",
+                "text/plain",
+                "cross-origin request".to_string(),
+            )));
+        }
         if content_length > MAX_BODY {
-            return respond(
-                &mut stream,
-                ("413 Payload Too Large", "text/plain", String::new()),
-            );
+            return Ok(Err(("413 Payload Too Large", "text/plain", String::new())));
         }
         body = vec![0; content_length];
         reader.read_exact(&mut body)?;
     }
+    Ok(Ok(Request {
+        method,
+        path: path.to_string(),
+        query: query.to_string(),
+        body,
+    }))
+}
+
+fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()> {
+    let req = match read_request(&stream)? {
+        Ok(r) => r,
+        Err(res) => return respond(&mut stream, res),
+    };
+    let (method, path, query, body) = (req.method, req.path.as_str(), req.query.as_str(), req.body);
     let mut s = session.lock().unwrap_or_else(|e| e.into_inner());
     let res: Response = match (method.as_str(), path) {
         ("GET", "/") => {
@@ -205,7 +244,10 @@ fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()
     respond(&mut stream, res)
 }
 
-fn respond(stream: &mut TcpStream, (status, ctype, body): Response) -> std::io::Result<()> {
+pub(crate) fn respond(
+    stream: &mut TcpStream,
+    (status, ctype, body): Response,
+) -> std::io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",

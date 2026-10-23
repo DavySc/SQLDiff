@@ -481,6 +481,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqldiff-convert"
+version = "0.1.0"
+dependencies = [
+ "rowan",
+ "serde",
+ "serde_json",
+ "sqldiff-core",
+ "sqldiff-syntax",
+]
+
+[[package]]
 name = "sqldiff-core"
 version = "0.1.0"
 dependencies = [
@@ -511,6 +522,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sqldiff-convert",
  "sqldiff-core",
  "sqldiff-source",
  "sqldiff-syntax",
