@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Last local line of defence: refuse to push any commit whose tree, message or
+# author/committer identity contains a deny-listed term. Every commit that the
+# remote does not have yet is checked, not only the branch tip.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+
+terms="$(mktemp)"
+trap 'rm -f "$terms"' EXIT
+"$here/denylist.sh" "$terms"
+[[ -s "$terms" ]] || exit 0
+
+zero="0000000000000000000000000000000000000000"
+remote_name="${1:-origin}"
+bad=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ "$local_sha" == "$zero" ]] && continue          # branch deletion
+  if [[ "$remote_sha" == "$zero" ]]; then
+    # New branch: everything not already on THIS remote.
+    range=("$local_sha" --not "--remotes=$remote_name")
+  else
+    range=("$remote_sha..$local_sha")
+  fi
+  for c in $(git rev-list "${range[@]}"); do
+    short="$(git rev-parse --short "$c")"
+    if git grep -q -i -F -f "$terms" "$c" -- . ':!target' 2>/dev/null; then
+      echo "pre-push: $short ($local_ref) has deny-listed terms in:" >&2
+      git grep -l -i -F -f "$terms" "$c" -- . ':!target' | sed "s/^$c://" >&2
+      bad=1
+    fi
+    # Capture first; see the note in pre-commit about pipefail and SIGPIPE.
+    meta="$(git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$c")"
+    if grep -q -i -F -f "$terms" <<<"$meta"; then
+      echo "pre-push: $short ($local_ref) has a deny-listed term in its message or identity" >&2
+      bad=1
+    fi
+  done
+done
+
+if [[ "$bad" -ne 0 ]]; then
+  echo "pre-push: push refused. Nothing was sent." >&2
+  exit 1
+fi

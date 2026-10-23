@@ -1,0 +1,7 @@
+# Shell scripts and git hooks must keep LF endings to run under bash on any OS.
+*.sh text eol=lf
+scripts/hooks/* text eol=lf
+
+# Fixtures are compared byte for byte and edited by string replacement in tests;
+# a CRLF checkout on Windows breaks them.
+tests/fixtures/* text eol=lf
