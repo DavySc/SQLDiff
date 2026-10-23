@@ -334,3 +334,132 @@ fn pack_rules_load_next_to_the_builtin_ones() {
         )
         .is_err());
 }
+
+fn to_pg(src: &str) -> (String, Vec<String>) {
+    let o = Options {
+        rules: RuleSet::builtin(),
+        facts: &sqldiff_core::rules::rewrite::NoFacts,
+        vars: &param,
+    };
+    let (out, pieces) = convert_text(src, Dialect::Tsql, Dialect::Postgres, &o);
+    (out, pieces.into_iter().flat_map(|p| p.rules).collect())
+}
+
+#[test]
+fn correlation_to_the_same_table_keeps_both_aliases() {
+    let (out, _) = to_pg("SELECT o.id FROM dbo.orders o WHERE EXISTS (SELECT 1 FROM dbo.orders o2 WHERE o2.cust = o.cust AND o2.id <> o.id);");
+    assert!(out.contains("o2.cust = o.cust AND o2.id <> o.id"), "{out}");
+}
+
+#[test]
+fn double_negation_does_not_print_a_comment() {
+    let (out, _) = to_pg("SELECT -(-1) AS x, 1 AS y;");
+    assert!(!out.contains("--"), "{out}");
+    assert!(out.contains("1 AS y"), "{out}");
+}
+
+#[test]
+fn anti_join_needs_the_equality_in_every_match() {
+    let (_, rules) = to_pg("DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id OR i.alt_id = pf.item_id WHERE i.item_id IS NULL;");
+    assert!(
+        !rules.iter().any(|r| r == "delete-orphans/anti-join"),
+        "{rules:?}"
+    );
+    let (_, rules) = to_pg("DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id AND i.active = 1 WHERE i.item_id IS NULL;");
+    assert!(
+        rules.iter().any(|r| r == "delete-orphans/anti-join"),
+        "{rules:?}"
+    );
+}
+
+fn same_dialect(a: &str, b: &str) -> sqldiff_core::Report {
+    diff(
+        &Artifact::new("x.tsql.sql", Dialect::Tsql, a),
+        &Artifact::new("x.tsql.sql", Dialect::Tsql, b),
+        &Default::default(),
+    )
+}
+
+fn lint_count(r: &sqldiff_core::Report, rule: &str) -> usize {
+    r.findings.iter().filter(|f| f.rule == rule).count()
+}
+
+#[test]
+fn a_lint_the_old_version_had_is_not_new_after_an_edit() {
+    let upd = |s: &str| {
+        format!("UPDATE dbo.item_price SET unit_price = (SELECT f.unit_price FROM dbo.price_feed f WHERE f.item_id = item_price.item_id), note = '{s}';")
+    };
+    let b = Artifact::new("x.tsql.sql", Dialect::Tsql, upd("b"));
+    let c = sqldiff_core::check(&b, &Default::default());
+    assert_eq!(
+        lint_count(&c, "rules.cardinality/correlated-update-unrestricted"),
+        1
+    );
+    let r = same_dialect(&upd("a"), &upd("b"));
+    assert_eq!(
+        lint_count(&r, "rules.cardinality/correlated-update-unrestricted"),
+        0,
+        "{:#?}",
+        r.findings
+    );
+}
+
+#[test]
+fn a_second_copy_of_a_race_is_new() {
+    let race = "IF EXISTS (SELECT 1 FROM dbo.customer WHERE customer_id = @Id) UPDATE dbo.customer SET last_name = @Name WHERE customer_id = @Id; ELSE INSERT INTO dbo.customer (customer_id, last_name) VALUES (@Id, @Name);";
+    let r = same_dialect(race, &format!("{race}\n{race}"));
+    assert_eq!(
+        lint_count(&r, "rules.concurrency/upsert-race"),
+        1,
+        "{:#?}",
+        r.findings
+    );
+    let a = Artifact::new("x.tsql.sql", Dialect::Tsql, format!("{race}\n{race}"));
+    let c = sqldiff_core::check(&a, &Default::default());
+    assert_eq!(lint_count(&c, "rules.concurrency/upsert-race"), 2);
+}
+
+#[test]
+fn unrelated_predicates_are_not_near_misses() {
+    let a = Artifact::new(
+        "near.tsql.sql",
+        Dialect::Tsql,
+        "IF EXISTS (SELECT 1 FROM dbo.customer WHERE a = 1) UPDATE dbo.customer SET x = 1 WHERE b > @z; ELSE INSERT INTO dbo.customer (a, x) VALUES (1, 1);",
+    );
+    let r = sqldiff_core::check(&a, &Default::default());
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.rule.starts_with("rules.idiom.near-miss")),
+        "{:#?}",
+        r.findings
+    );
+}
+
+#[test]
+fn cross_dialect_diffs_report_rule_lints() {
+    let race = "IF EXISTS (SELECT 1 FROM dbo.customer WHERE customer_id = @Id) UPDATE dbo.customer SET last_name = @Name WHERE customer_id = @Id; ELSE INSERT INTO dbo.customer (customer_id, last_name) VALUES (@Id, @Name);";
+    let r = diff(
+        &Artifact::new("x.tsql.sql", Dialect::Tsql, race),
+        &Artifact::new("x.pg.sql", Dialect::Postgres, "SELECT 1;"),
+        &Default::default(),
+    );
+    assert_eq!(lint_count(&r, "rules.concurrency/upsert-race"), 1);
+}
+
+#[test]
+fn sequence_near_misses_see_top_level_statements() {
+    let a = Artifact::new(
+        "lock.tsql.sql",
+        Dialect::Tsql,
+        "CREATE PROCEDURE dbo.p_lock AS\nBEGIN\nDECLARE @rc int, @other int;\nEXEC @rc = sp_getapplock @Resource = 'r', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1;\nIF @other < 0 THROW 50000, 'no lock', 1;\nEND",
+    );
+    let r = sqldiff_core::check(&a, &Default::default());
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.rule == "rules.idiom.near-miss/advisory-lock/applock"),
+        "{:#?}",
+        r.findings
+    );
+}

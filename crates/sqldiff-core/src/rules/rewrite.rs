@@ -182,44 +182,6 @@ fn helper(name: &str, args: &[Bound]) -> R<Option<Bound>> {
             }
             Some(Bound::Seq(keys))
         }
-        // (?fn set-without-keys (set...) (keys...)): SET items not assigning a key column.
-        "sets-without" => {
-            let (sets, keys) = (seq(0)?, seq(1)?);
-            Some(Bound::Seq(
-                sets.iter()
-                    .filter(|s| {
-                        !s.kid(0)
-                            .and_then(|c| c.kid(0))
-                            .is_some_and(|c| keys.iter().any(|k| same(k, c)))
-                    })
-                    .cloned()
-                    .collect(),
-            ))
-        }
-        // (?fn excluded-sets (cols...) (row...) (sets...)): `c = EXCLUDED.c`
-        // when the SET value is the value inserted into c.
-        "excluded-sets" => {
-            let (cols, vals, sets) = (seq(0)?, seq(1)?, seq(2)?);
-            let mut out = Vec::new();
-            for s in sets {
-                let c = &s.kids()[0];
-                let v = &s.kids()[1];
-                let col = c.kid(0).cloned().unwrap_or_else(|| a("?"));
-                let j = cols.iter().position(|x| same(x, &col));
-                if j.is_some_and(|j| vals.get(j).is_some_and(|x| same(x, v))) {
-                    out.push(n(
-                        "=",
-                        vec![
-                            c.clone(),
-                            n("col", vec![n("name", vec![a("excluded")]), col]),
-                        ],
-                    ));
-                } else {
-                    out.push(s.clone());
-                }
-            }
-            Some(Bound::Seq(out))
-        }
         // (?fn key-pred keys... cols... vals...): `k = value` for each key.
         "key-pred" => {
             let (keys, cols, vals) = (seq(0)?, seq(1)?, seq(2)?);
@@ -281,17 +243,6 @@ fn helper(name: &str, args: &[Bound]) -> R<Option<Bound>> {
                 Some(Bound::Seq(out))
             }
         }
-        // (?fn eq-col ON TABLE): a column of TABLE that takes part in an equality of ON.
-        "eq-col" => {
-            let (on, t) = (one(0)?, one(1)?);
-            let mut conj = Vec::new();
-            flatten_and(on, &mut conj);
-            conj.iter()
-                .filter(|c| c.is("="))
-                .flat_map(|c| c.kids().iter())
-                .find(|x| x.is("col") && x.kids().len() == 2 && same(&x.kids()[0], t))
-                .map(|x| Bound::One(x.kids()[1].clone()))
-        }
         // (?fn stringy A B): `yes` when A or B is visibly a character string.
         "stringy" => {
             fn stringy(t: &Term) -> bool {
@@ -330,15 +281,6 @@ fn helper(name: &str, args: &[Bound]) -> R<Option<Bound>> {
             }
             (stringy(one(0)?) || stringy(one(1)?)).then(|| Bound::One(a("yes")))
         }
-        "and" => {
-            let (x, y) = (one(0)?, one(1)?);
-            Some(Bound::One(n("AND", vec![x.clone(), y.clone()])))
-        }
-        // (?fn lower-name (str "x")): the string as an identifier atom.
-        "atom-of" => one(0)?
-            .kid(0)
-            .and_then(Term::atom)
-            .map(|s| Bound::One(a(s))),
         _ => return Err(format!("unknown helper `{name}`")),
     })
 }
@@ -503,22 +445,23 @@ pub fn unmark(t: &Term) -> Term {
 pub struct Engine<'a> {
     pub rules: &'a RuleSet,
     pub facts: &'a dyn Facts,
+    /// Idioms and translations, highest priority first.
+    ordered: Vec<&'a Rule>,
 }
 
 impl<'a> Engine<'a> {
     pub fn new(rules: &'a RuleSet, facts: &'a dyn Facts) -> Self {
-        Engine { rules, facts }
-    }
-
-    fn ordered(&self) -> Vec<&'a Rule> {
-        let mut v: Vec<&Rule> = self
-            .rules
+        let mut ordered: Vec<&Rule> = rules
             .rules
             .iter()
             .filter(|r| r.kind != Kind::Lint)
             .collect();
-        v.sort_by_key(|r| -r.priority);
-        v
+        ordered.sort_by_key(|r| -r.priority);
+        Engine {
+            rules,
+            facts,
+            ordered,
+        }
     }
 
     /// Side conditions of `r` for dialect `d`. `Ok(false)` means the rule
@@ -548,12 +491,23 @@ impl<'a> Engine<'a> {
                         return Ok(false);
                     }
                 }
-                Cond::IfContains { term, pat } => {
+                Cond::IfContains {
+                    term,
+                    pat,
+                    conjunct,
+                } => {
                     let Some(t) = inst1(term, b, false)? else {
                         return Ok(false);
                     };
                     let pat = &subst(pat, b);
-                    if !t.any(&|x| matches(pat, x).is_some()) {
+                    let hit = if *conjunct {
+                        let mut conj = Vec::new();
+                        flatten_and(&t, &mut conj);
+                        conj.iter().any(|x| matches(pat, x).is_some())
+                    } else {
+                        t.any(&|x| matches(pat, x).is_some())
+                    };
+                    if !hit {
                         return Ok(false);
                     }
                 }
@@ -595,7 +549,7 @@ impl<'a> Engine<'a> {
 
     /// Tries to lift `t` with any rule's `d` form: (rule, canonical node).
     pub fn lift_once(&self, t: &Term, d: Dialect, log: &mut Log) -> R<Option<(&'a Rule, Term)>> {
-        for r in self.ordered() {
+        for r in self.ordered.iter().copied() {
             for f in r.form(d).filter(|f| f.lift && !f.pat.is("seq")) {
                 if let Some(c) = self.try_lift(r, f, t, d, log)? {
                     return Ok(Some((r, c)));
@@ -630,7 +584,7 @@ impl<'a> Engine<'a> {
 
     /// Emits a canonical node in dialect `d` (values marked as source).
     pub fn emit_once(&self, c: &Term, d: Dialect, log: &mut Log) -> R<Option<Term>> {
-        for r in self.ordered() {
+        for r in self.ordered.iter().copied() {
             let Some(canon) = &r.canon else { continue };
             let Some(b0) = matches(canon, c) else {
                 continue;
@@ -741,7 +695,7 @@ impl<'a> Engine<'a> {
 
     /// A sequence rule matching a prefix of `items`: (statements used, canon).
     pub fn lift_seq(&self, items: &[Term], d: Dialect, log: &mut Log) -> R<Option<(usize, Term)>> {
-        for r in self.ordered() {
+        for r in self.ordered.iter().copied() {
             for f in r.form(d).filter(|f| f.lift && f.pat.is("seq")) {
                 let len = f.pat.kids().len();
                 if items.len() < len {
@@ -819,8 +773,8 @@ impl<'a> Engine<'a> {
         out
     }
 
-    /// Patterns that match except for metavariables bound to different terms,
-    /// closest first.
+    /// Patterns that match except for metavariables bound to different terms
+    /// that are still alike (see `near`), closest first.
     pub fn near_misses(&self, t: &Term, d: Dialect) -> Vec<NearMiss> {
         let mut out = Vec::new();
         let rules: Vec<&Rule> = self
@@ -839,16 +793,7 @@ impl<'a> Engine<'a> {
                     }
                     .m(&f.pat, x, &mut b);
                     if ok && !c.is_empty() {
-                        let dist = c
-                            .iter()
-                            .map(|k| distance(&k.first, &k.second))
-                            .sum::<usize>();
-                        let budget = c
-                            .iter()
-                            .map(|k| size(&k.first).max(size(&k.second)))
-                            .sum::<usize>();
-                        // Only report when the difference is small against what differs.
-                        if dist * 2 <= budget.max(2) * 2 {
+                        if let Some(dist) = near(&c) {
                             out.push(NearMiss {
                                 rule: r.id.clone(),
                                 conflicts: c,
@@ -877,7 +822,7 @@ impl<'a> Engine<'a> {
                         .m(&f.pat, &w, &mut b)
                             && !c.is_empty()
                         {
-                            let dist = c.iter().map(|k| distance(&k.first, &k.second)).sum();
+                            let Some(dist) = near(&c) else { continue };
                             out.push(NearMiss {
                                 rule: r.id.clone(),
                                 conflicts: c,
@@ -968,4 +913,20 @@ pub fn overlaps(rs: &RuleSet) -> Vec<(String, String, String)> {
     }
     out.dedup();
     out
+}
+
+/// The edit distance of the conflicts when it is at most half of what
+/// differs: `@Id` against `@Other` is a near miss, `a = 1` against `b > @z`
+/// is just different code.
+fn near(c: &[Conflict]) -> Option<usize> {
+    let dist = c
+        .iter()
+        .map(|k| distance(&k.first, &k.second))
+        .sum::<usize>();
+    let budget = c
+        .iter()
+        .map(|k| size(&k.first).max(size(&k.second)))
+        .sum::<usize>();
+    // A single renamed atom (`@rc` against `@other`) is the closest miss there is.
+    (dist * 2 <= budget.max(2)).then_some(dist)
 }

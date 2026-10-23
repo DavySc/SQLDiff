@@ -167,7 +167,7 @@ impl<'a> Printer<'a> {
                 _ => return Err(format!("bad column {t}")),
             },
             "var" => self.var(t)?,
-            "num" => atom(&k[0])?.to_string(),
+            "num" => num(atom(&k[0])?),
             "str" => quote_str(atom(&k[0])?),
             "null" => "NULL".into(),
             "bool" => atom(&k[0])?.to_uppercase(),
@@ -179,7 +179,15 @@ impl<'a> Printer<'a> {
             "typed" => format!("{} {}", atom(&k[0])?, quote_str(atom(&k[1])?)),
             "call" => self.call(t)?,
             "not" => format!("NOT {}", self.wrap(&k[0], prec(&k[0]) < 3)?),
-            "neg" => format!("-{}", self.wrap(&k[0], prec(&k[0]) < 9)?),
+            "neg" => {
+                let x = self.wrap(&k[0], prec(&k[0]) < 9)?;
+                // `--` would start a line comment.
+                if x.starts_with('-') {
+                    format!("-({x})")
+                } else {
+                    format!("-{x}")
+                }
+            }
             "is-null" => format!("{} IS NULL", self.wrap(&k[0], prec(&k[0]) <= 4)?),
             "is-not-null" => format!("{} IS NOT NULL", self.wrap(&k[0], prec(&k[0]) <= 4)?),
             "in" | "not-in" => format!(
@@ -857,4 +865,13 @@ fn reserved_pg(s: &str) -> bool {
         "with",
     ];
     W.contains(&s.to_ascii_lowercase().as_str())
+}
+
+/// A numeric literal; the parser folds signs into it (`-(-1)` is `--1`),
+/// and `--` would start a line comment.
+fn num(s: &str) -> String {
+    match s.strip_prefix('-') {
+        Some(rest) if rest.starts_with('-') => format!("-({})", num(rest)),
+        _ => s.to_string(),
+    }
 }

@@ -22,7 +22,8 @@
 //! (lint ID (form DIALECT|any P) (class C) [(severity S)] (message "...")
 //!   [(diff-verdict different)])   ; new in the second version: the pair differs
 //! `(if-contains [DIALECT] TERM PATTERN)` applies a rule only when TERM has a
-//! matching subterm. `(?fact NAME args...)` in a `let` asks the catalog for
+//! matching subterm; `(if-conjunct [DIALECT] TERM PATTERN)` only when one of
+//! TERM's top-level AND operands matches. `(?fact NAME args...)` in a `let` asks the catalog for
 //! a value (`unknown` when it cannot say).
 //! (functions DIALECT name...)     ; functions printable in that dialect
 //! ```
@@ -108,10 +109,12 @@ pub enum Cond {
         pat: Term,
         anywhere: bool,
     },
-    /// Apply the rule only when the term or a subterm matches.
+    /// Apply the rule only when the term or a subterm matches (with
+    /// `conjunct`, only when one of its top-level AND operands matches).
     IfContains {
         term: Term,
         pat: Term,
+        conjunct: bool,
     },
 }
 
@@ -393,18 +396,17 @@ fn parse_rule(top: &Term, origin: &str) -> Result<Rule, String> {
                     },
                 ));
             }
-            "if-contains" => {
+            head @ ("if-contains" | "if-conjunct") => {
                 let (d, k) = opt_dialect(k);
                 if k.len() != 2 {
-                    return Err(ctx(
-                        "if-contains: (if-contains [DIALECT] TERM PATTERN)".into()
-                    ));
+                    return Err(ctx(format!("{head}: ({head} [DIALECT] TERM PATTERN)")));
                 }
                 r.conds.push((
                     d,
                     Cond::IfContains {
                         term: k[0].clone(),
                         pat: k[1].clone(),
+                        conjunct: head == "if-conjunct",
                     },
                 ));
             }

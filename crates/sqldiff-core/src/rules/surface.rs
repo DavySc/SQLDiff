@@ -272,10 +272,22 @@ impl Scope {
         for f in from {
             collect(f, &mut frame);
         }
-        // Self-joins keep their aliases: renaming would conflate them.
+        // Self-joins keep their aliases: renaming would conflate them. That
+        // includes a subquery reading a table an outer query also reads, where
+        // a correlated reference must stay apart from the inner table.
         let names: Vec<String> = frame.iter().map(|e| e.target.to_string()).collect();
         for (i, e) in frame.iter_mut().enumerate() {
-            if names.iter().filter(|x| **x == names[i]).count() > 1 {
+            let outer = self
+                .frames
+                .iter_mut()
+                .flatten()
+                .filter(|o| o.target.to_string() == names[i]);
+            let mut clash = false;
+            for o in outer {
+                o.target = n("alias", vec![a(o.key.clone())]);
+                clash = true;
+            }
+            if clash || names.iter().filter(|x| **x == names[i]).count() > 1 {
                 e.target = n("alias", vec![a(e.key.clone())]);
             }
         }

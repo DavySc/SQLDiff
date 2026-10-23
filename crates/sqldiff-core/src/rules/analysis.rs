@@ -2,6 +2,7 @@
 
 use sqldiff_syntax::ast as cst;
 
+use super::pattern::{distance, size};
 use super::print::Printer;
 use super::rewrite::{Engine, Facts, Log, NearMiss};
 use super::rule::RuleSet;
@@ -18,6 +19,7 @@ pub struct Hit {
     pub message: String,
     /// Normalised matched term, the fingerprint anchor.
     pub key: String,
+    pub term: Term,
     pub start: usize,
     pub end: usize,
     /// New in the second version of a same-dialect diff: the pair differs.
@@ -58,18 +60,37 @@ pub fn hits(a: &Analyzed, facts: &dyn Facts, near: bool) -> Vec<Hit> {
     let rules = RuleSet::builtin();
     let engine = Engine::new(rules, facts);
     let d = a.dialect();
+    let units = surface::units(&surface::body_units(&a.root), d);
+    let terms: Vec<Term> = units.iter().map(|u| u.term.clone()).collect();
+    let range = |i: usize, len: usize| {
+        (
+            cst::sig_range(&units[i].node).0,
+            cst::sig_range(&units[i + len - 1].node).1,
+        )
+    };
     let mut out: Vec<Hit> = Vec::new();
-    for u in surface::units(&surface::body_units(&a.root), d) {
-        let (start, end) = cst::sig_range(&u.node);
+    for (i, u) in units.iter().enumerate() {
         let mut log = Log::default();
         let lifted = engine
             .lift(&u.term, d, &mut log)
             .unwrap_or_else(|_| u.term.clone());
-        for t in [&u.term, &lifted] {
-            for (r, m) in engine.lints(t, d) {
+        let mut cands = vec![(u.term.clone(), range(i, 1)), (lifted, range(i, 1))];
+        // Sequence idioms over consecutive statements of the body.
+        if let Ok(Some((len, c))) = engine.lift_seq(&terms[i..], d, &mut Log::default()) {
+            if len > 1 {
+                let c = engine.lift(&c, d, &mut Log::default()).unwrap_or(c);
+                cands.push((c, range(i, len)));
+            }
+        }
+        for (t, (start, end)) in cands {
+            for (r, m) in engine.lints(&t, d) {
                 let spec = r.lint.as_ref().unwrap();
                 let key = sexp::write(&m);
-                if out.iter().any(|h| h.rule == r.id && h.key == key) {
+                // The unit and its lifted form can both match; other units are other hits.
+                if out
+                    .iter()
+                    .any(|h| h.rule == r.id && h.key == key && h.start == start)
+                {
                     continue;
                 }
                 out.push(Hit {
@@ -78,6 +99,7 @@ pub fn hits(a: &Analyzed, facts: &dyn Facts, near: bool) -> Vec<Hit> {
                     severity: spec.severity,
                     message: spec.message.clone(),
                     key,
+                    term: m,
                     start,
                     end,
                     diff_different: spec.diff_different,
@@ -86,17 +108,76 @@ pub fn hits(a: &Analyzed, facts: &dyn Facts, near: bool) -> Vec<Hit> {
         }
         if near {
             if let Some(m) = engine.near_misses(&u.term, d).into_iter().next() {
-                out.push(Hit {
-                    rule: format!("idiom.near-miss/{}", m.rule),
-                    class: ChangeClass::Semantic,
-                    severity: Severity::Low,
-                    message: near_message(a, &m),
-                    key: sexp::write(&m.at),
-                    start,
-                    end,
-                    diff_different: false,
-                });
+                let (start, end) = range(i, 1);
+                out.push(near_hit(a, &m, start, end));
             }
+        }
+    }
+    if near && !terms.is_empty() {
+        // Sequence near misses over consecutive top-level statements.
+        let body = Term::N("block".into(), terms.clone());
+        for m in engine.near_misses(&body, d) {
+            let Some(i) = top_window(&terms, &m.at) else {
+                continue;
+            };
+            let (start, end) = range(i, m.at.kids().len());
+            if !out
+                .iter()
+                .any(|h| h.start == start && h.rule.ends_with(&m.rule))
+            {
+                out.push(near_hit(a, &m, start, end));
+            }
+        }
+    }
+    out
+}
+
+/// Where a `(seq ...)` near miss starts among the top-level statements.
+fn top_window(terms: &[Term], at: &Term) -> Option<usize> {
+    let k = at.kids();
+    if !at.is("seq") || k.is_empty() || k.len() > terms.len() {
+        return None;
+    }
+    (0..=terms.len() - k.len()).find(|&i| terms[i..i + k.len()] == *k)
+}
+
+fn near_hit(a: &Analyzed, m: &NearMiss, start: usize, end: usize) -> Hit {
+    Hit {
+        rule: format!("idiom.near-miss/{}", m.rule),
+        class: ChangeClass::Semantic,
+        severity: Severity::Low,
+        message: near_message(a, m),
+        key: sexp::write(&m.at),
+        term: m.at.clone(),
+        start,
+        end,
+        diff_different: false,
+    }
+}
+
+/// Hits of `new` that `old` does not have. Each old hit accounts for one new
+/// hit of the same rule: the same term first, then a close one, so an edit
+/// elsewhere in a flagged statement does not report its hazard again, while
+/// a second copy of a flagged statement does.
+pub fn new_hits(old: &[Hit], new: Vec<Hit>) -> Vec<Hit> {
+    let mut used = vec![false; old.len()];
+    let mut left = Vec::new();
+    for h in new {
+        match (0..old.len()).find(|&i| !used[i] && old[i].rule == h.rule && old[i].key == h.key) {
+            Some(i) => used[i] = true,
+            None => left.push(h),
+        }
+    }
+    let mut out = Vec::new();
+    for h in left {
+        let close = (0..old.len())
+            .filter(|&i| !used[i] && old[i].rule == h.rule)
+            .map(|i| (distance(&old[i].term, &h.term), i))
+            .filter(|&(d, i)| d * 4 <= size(&old[i].term).max(size(&h.term)))
+            .min();
+        match close {
+            Some((_, i)) => used[i] = true,
+            None => out.push(h),
         }
     }
     out

@@ -94,25 +94,24 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             }
         }
         // Idiom-rule lints that are new in B (design section 8).
-        let old: HashSet<(String, String)> = rules::analysis::hits(&aa, &schema_a, false)
-            .into_iter()
-            .map(|h| (h.rule, h.key))
-            .collect();
-        for h in rules::analysis::hits(&ab, &schema_b, false) {
-            if !old.contains(&(h.rule.clone(), h.key.clone())) {
-                let v = if h.diff_different {
-                    Verdict::Different
-                } else {
-                    Verdict::Unknown
-                };
-                findings.push(rules::analysis::to_finding(&ab, &h, v));
-            }
+        let old = rules::analysis::hits(&aa, &schema_a, false);
+        for h in rules::analysis::new_hits(&old, rules::analysis::hits(&ab, &schema_b, false)) {
+            let v = if h.diff_different {
+                Verdict::Different
+            } else {
+                Verdict::Unknown
+            };
+            findings.push(rules::analysis::to_finding(&ab, &h, v));
         }
     } else {
         findings.extend(pair_writes(&aa, &ab));
-        for side in [&aa, &ab] {
+        for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
+            }
+            // Rule lints describe one side's code: they do not decide the verdict.
+            for h in rules::analysis::hits(side, schema, false) {
+                findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
             }
         }
         eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);

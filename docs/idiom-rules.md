@@ -29,7 +29,7 @@ An **idiom** has one canonical node and a form per dialect:
 - Forms are two-way unless marked `(lift-only)` or `(emit-only)`. `let` and `emit-let` compute bindings with helpers (`key-cols`, `key-pred`, `inline`, ...); `(?fact identity-col ?t)` asks the catalog.
 - **Conversion** of a statement is lift with a source form, then emit with any target form whose canon matches, outermost first; the values taken from the source are converted in turn. A node no rule matches keeps its head (shared vocabulary), and the printer (`rules/print.rs`) refuses anything without a target spelling, so a statement is converted completely or not at all.
 - A **translate** rule is an idiom with an implied canon `(~ID vars...)`, for direct rewrites such as `ISNULL` ↔ `coalesce`.
-- **Side conditions**: `require` asks the catalog (proven: discharged; refuted: the rule does not apply; unknown: an assumption), `assume` records an assumption, `unless` / `unless-contains` / `if-contains` test the bindings.
+- **Side conditions**: `require` asks the catalog (proven: discharged; refuted: the rule does not apply; unknown: an assumption), `assume` records an assumption, `unless` / `unless-contains` / `if-contains` / `if-conjunct` (one of the top-level AND operands matches) test the bindings.
 - **Notes** carry the conversion status (`converted`, `assumptions`, `decision`, `differs`) the live conversion view shows.
 
 Pattern syntax: `?x`, `?x...` (a run of siblings), `_`, `_...`, `(?or p q)`, `(?opt p)`, `(?block p)` (a statement or a BEGIN/END holding only it), `(seq p q)` (consecutive statements). The full grammar is in the module docs of `rules/rule.rs` and `rules/pattern.rs`.
@@ -42,7 +42,7 @@ Other gates in the same test file:
 - **Confluence**: two rules that can apply to the same term in the same direction must have different priorities (`rewrite::overlaps`).
 - **Two-way**: for rules with two-way forms in both dialects, PostgreSQL → T-SQL → PostgreSQL gives the example back.
 - **Near misses**: a pattern that matches except for a metavariable bound to two different terms is reported by `sqldiff check` ("almost the upsert/if-exists idiom: pred is `customer_id = @Id` in one place and `customer_id = @Other` in another"), ranked by tree edit distance.
-- **Lints in diffs**: in a same-dialect diff, a lint hit that only the new version has is a finding; with `(diff-verdict different)` it makes the pair different (m01 now passes the corpus test).
+- **Lints in diffs**: in a same-dialect diff, a lint hit that only the new version has is a finding; with `(diff-verdict different)` it makes the pair different (m01 now passes the corpus test). Each hit of the old version accounts for one hit of the new: the same term, or else a close one, so an unrelated edit in a flagged statement is not a new hazard but a second copy of it is. In a cross-dialect diff both sides' rule lints are reported without deciding the verdict.
 
 ## Using it for conversion
 

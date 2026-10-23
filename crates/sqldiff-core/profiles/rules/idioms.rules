@@ -117,8 +117,9 @@
             (from (join left (table ?t (?opt (alias _))) (table ?u (?opt (alias _))) ?on))
             (where (is-null (col ?u ?nc))))
     (lift-only))
-  ; `u.c IS NULL` selects exactly the unmatched rows when c takes part in an equality of ON.
-  (if-contains tsql ?on (?or (= (col ?u ?nc) _) (= _ (col ?u ?nc))))
+  ; `u.c IS NULL` selects exactly the unmatched rows when ON requires an equality on c:
+  ; a top-level conjunct, not one under OR or NOT.
+  (if-conjunct tsql ?on (?or (= (col ?u ?nc) _) (= _ (col ?u ?nc))))
   (form postgres
     (delete (table ?t) (where (not (exists (select (?or (items (item (num 1))) (items _...)) (from (table ?u)) (where ?on)))))))
   (example
