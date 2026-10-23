@@ -1442,37 +1442,35 @@ impl Lowerer {
                 if bare {
                     return Action::Reraise { form: "raise" };
                 }
-                let mut kind = ErrorKind::UserSignal;
-                if let Some(i) = toks
+                // An optional level word comes first: RAISE EXCEPTION SQLSTATE
+                // '23505', RAISE EXCEPTION unique_violation.
+                let at = if matches!(
+                    w(1).as_str(),
+                    "DEBUG" | "LOG" | "INFO" | "NOTICE" | "WARNING" | "EXCEPTION"
+                ) {
+                    2
+                } else {
+                    1
+                };
+                // condition_kinds takes a condition name or a SQLSTATE.
+                let kind_of = |name: &str| self.prof.condition_kinds(name).first().copied();
+                let errcode = toks
                     .iter()
                     .position(|t| t.text().eq_ignore_ascii_case("ERRCODE"))
-                {
-                    if let Some(c) = toks[i..].iter().find(|t| t.kind() == SyntaxKind::STRING) {
-                        let code = c.text().trim_matches('\'');
-                        kind = self
-                            .prof
-                            .kind_of_code(code)
-                            .or_else(|| {
-                                let name = code.to_ascii_uppercase();
-                                self.prof.condition_kinds(&name).first().copied()
-                            })
-                            .unwrap_or(kind);
-                    }
-                } else if w(1) == "SQLSTATE" {
+                    .and_then(|i| toks[i..].iter().find(|t| t.kind() == SyntaxKind::STRING));
+                let kind = if let Some(c) = errcode {
+                    kind_of(c.text().trim_matches('\''))
+                } else if w(at) == "SQLSTATE" {
                     // RAISE SQLSTATE '23505' raises that code, not P0001.
-                    if let Some(c) = toks.get(2).filter(|t| t.kind() == SyntaxKind::STRING) {
-                        kind = self
-                            .prof
-                            .kind_of_code(c.text().trim_matches('\''))
-                            .unwrap_or(kind);
-                    }
-                } else if toks.get(1).is_some_and(|t| t.kind() == SyntaxKind::IDENT)
-                    && !matches!(w(1).as_str(), "EXCEPTION")
-                {
-                    if let Some(k) = self.prof.condition_kinds(&w(1)).first() {
-                        kind = *k;
-                    }
+                    toks.get(at + 1)
+                        .filter(|t| t.kind() == SyntaxKind::STRING)
+                        .and_then(|c| kind_of(c.text().trim_matches('\'')))
+                } else if toks.get(at).is_some_and(|t| t.kind() == SyntaxKind::IDENT) {
+                    kind_of(&w(at))
+                } else {
+                    None
                 }
+                .unwrap_or(ErrorKind::UserSignal);
                 Action::Raise {
                     kind,
                     form: "raise",

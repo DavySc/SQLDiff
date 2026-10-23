@@ -952,6 +952,51 @@ fn raise_forms_lower_to_their_kind() {
 }
 
 #[test]
+fn raise_with_a_level_word_keeps_its_condition() {
+    use sqldiff_core::ir::cfg::Action::Raise;
+    for stmt in [
+        "RAISE EXCEPTION SQLSTATE '23505';",
+        "RAISE EXCEPTION unique_violation;",
+        "RAISE unique_violation USING MESSAGE = 'dup';",
+    ] {
+        let sql =
+            format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  {stmt}\nEND;\n$$;");
+        assert_eq!(
+            raises(Pg, &sql),
+            vec![Raise {
+                kind: Constraint,
+                form: "raise"
+            }],
+            "{stmt}"
+        );
+    }
+}
+
+#[test]
+fn raiserror_severity_20_ends_the_routine() {
+    // Severity 20+ drops the connection: the INSERT after it never runs.
+    let sql = "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR('x', 20, 1) WITH LOG;\n  INSERT INTO t (c) VALUES (1);\nEND";
+    let art = Artifact::new("case.sql", Tsql, sql);
+    let a = Analyzed::new(&art, Side::A, 3);
+    let outs = ir::explore(&ir::lower(&a), &Scenario::default());
+    assert_eq!(outs.len(), 1);
+    let o = &outs[0];
+    assert!(o.effects.is_empty(), "{:?}", o.effects);
+    assert!(matches!(o.exit, Exit::Raised(_)), "{:?}", o.exit);
+    assert!(o.rows.contains("tsql.unhandled.cancel"), "{:?}", o.rows);
+    // Severity 16 is an ordinary error: the batch goes on.
+    let sql = sql.replace("20, 1) WITH LOG", "16, 1)");
+    let art = Artifact::new("case.sql", Tsql, sql.as_str());
+    let a = Analyzed::new(&art, Side::A, 3);
+    let outs = ir::explore(&ir::lower(&a), &Scenario::default());
+    assert!(
+        outs[0].effects.contains_key("Insert:T#1"),
+        "{:?}",
+        outs[0].effects
+    );
+}
+
+#[test]
 fn tsql_cancel_is_a_severity_not_an_error_number() {
     let ts = Profile::of(Tsql);
     assert_ne!(ts.kind_of_code("8152"), Some(Cancel));

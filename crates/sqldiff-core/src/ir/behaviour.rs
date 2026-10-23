@@ -123,11 +123,11 @@ impl SideIr<'_, '_> {
     /// Effect phrase, with an ordinal when the same write occurs more than once.
     fn phrase(&self, key: &str) -> String {
         if let Some((t, n)) = key.strip_prefix("Read:").and_then(|k| k.rsplit_once('#')) {
-            let t = t.to_lowercase();
-            return if self.plain_reads(&t.to_uppercase()).len() > 1 {
-                format!("the read of {t} (occurrence {n})")
+            let name = t.to_lowercase();
+            return if self.plain_reads(t).len() > 1 {
+                format!("the read of {name} (occurrence {n})")
             } else {
-                format!("the read of {t}")
+                format!("the read of {name}")
             };
         }
         let Some((_, e)) = self.effect(key) else {
@@ -417,12 +417,14 @@ fn diff(sa: &SideIr, sb: &SideIr, sc: &Kind, oa: &Outcome, ob: &Outcome) -> Vec<
             .collect()
     };
     let (ra, rb) = (reads(sa, oa), reads(sb, ob));
-    let mut reported: Vec<(&String, &String)> = Vec::new();
+    // One finding per statement (the first temporary table that differs):
+    // the scenario counts a divergence once per outcome pair.
+    let mut reported: Vec<&String> = Vec::new();
     for (k, t, _) in ra.symmetric_difference(&rb) {
-        if reported.contains(&(k, t)) || sa.locate(k).is_none() || sb.locate(k).is_none() {
+        if reported.contains(&k) || sa.locate(k).is_none() || sb.locate(k).is_none() {
             continue;
         }
-        reported.push((k, t));
+        reported.push(k);
         let state = |r: &Reads| {
             r.iter()
                 .find(|(x, y, _)| x == k && y == t)
@@ -565,7 +567,13 @@ impl Collector<'_, '_> {
         let combos = ps.len();
         let mut found: Vec<(Div, &Outcome, &Outcome, usize)> = Vec::new();
         for (oa, ob) in &ps {
+            // Each divergence counts once per outcome pair.
+            let mut here: Vec<(&str, String)> = Vec::new();
             for d in diff(&self.sa, &self.sb, &sc, oa, ob) {
+                if here.contains(&(d.rule, d.anchor.clone())) {
+                    continue;
+                }
+                here.push((d.rule, d.anchor.clone()));
                 if let Some(x) = found
                     .iter_mut()
                     .find(|x| x.0.rule == d.rule && x.0.anchor == d.anchor)

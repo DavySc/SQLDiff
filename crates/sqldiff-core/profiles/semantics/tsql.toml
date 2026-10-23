@@ -68,6 +68,8 @@ call = ["other"]
 [[unhandled]]
 id = "tsql.unhandled.raiserror"
 construct = "raiserror"
+# Severity 20+ maps to `cancel` and ends the routine (tsql.unhandled.cancel).
+kinds = ["user_signal"]
 statement = "rollback"
 transaction = "none"
 control = "next"

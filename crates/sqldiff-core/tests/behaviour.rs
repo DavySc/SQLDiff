@@ -305,3 +305,20 @@ fn temp_state_read_without_a_durable_write() {
     assert!(f.witness.contains("the read of log"), "{}", f.witness);
     assert!(f.a.is_some() && f.b.is_some(), "{f:#?}");
 }
+
+#[test]
+fn temp_state_on_two_tables_counts_once_per_path() {
+    // The CATCH INSERT reads two temporary tables. Side B refills both on
+    // one of its two CATCH paths only, so the read differs on some paths:
+    // one finding, Unknown, not Different.
+    let a = "CREATE PROCEDURE p @x int AS\nBEGIN\n  DECLARE @a TABLE (id int);\n  DECLARE @b TABLE (id int);\n  DECLARE @n int;\n  BEGIN TRY\n    BEGIN TRAN;\n    INSERT INTO @a (id) VALUES (1);\n    INSERT INTO @b (id) VALUES (1);\n    INSERT INTO t (c) VALUES (1);\n    COMMIT;\n  END TRY\n  BEGIN CATCH\n    ROLLBACK;\n    INSERT INTO audit (c) SELECT x.id FROM @a x JOIN @b y ON x.id = y.id;\n  END CATCH\nEND";
+    let b = "CREATE PROCEDURE p @x int AS\nBEGIN\n  CREATE TABLE #a (id int);\n  CREATE TABLE #b (id int);\n  DECLARE @n int;\n  BEGIN TRY\n    BEGIN TRAN;\n    INSERT INTO #a (id) VALUES (1);\n    INSERT INTO #b (id) VALUES (1);\n    INSERT INTO t (c) VALUES (1);\n    COMMIT;\n  END TRY\n  BEGIN CATCH\n    ROLLBACK;\n    IF @x = 1\n    BEGIN\n      INSERT INTO #a (id) VALUES (1);\n      INSERT INTO #b (id) VALUES (1);\n    END\n    INSERT INTO audit (c) SELECT x.id FROM #a x JOIN #b y ON x.id = y.id;\n  END CATCH\nEND";
+    let r = pair((a, Dialect::Tsql), (b, Dialect::Tsql));
+    let ts: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "txn.temp-state")
+        .collect();
+    assert_eq!(ts.len(), 1, "{:#?}", r.findings);
+    assert_eq!(ts[0].verdict, Verdict::Unknown, "{:#?}", ts[0]);
+}
