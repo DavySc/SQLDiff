@@ -86,6 +86,8 @@ enum Command {
         #[arg(long, conflicts_with = "templates")]
         template: bool,
         #[command(flatten)]
+        flips: queue_cmd::FlipArgs,
+        #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
         #[command(flatten)]
         review: ReviewArgs,
@@ -358,6 +360,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             catalog,
             catalog_a,
             catalog_b,
+            flips,
             templates,
             params,
             template,
@@ -385,6 +388,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
                 catalog_a: cat_a,
                 catalog_b: cat_b,
+                flips: flips.flips(),
+                ..cfg.options()
             };
             let mut pipe = Pipeline::new(cfg, &review)?;
             if template {
@@ -502,10 +507,7 @@ fn tree(
 ) -> Result<ExitCode, String> {
     let cfg = &pipe.cfg.clone();
     let t = tree::pair_dirs(dir_a, dir_b, da, db, cfg).map_err(|e| e.0)?;
-    let opts = Options {
-        excerpt_lines: cfg.excerpt_lines,
-        ..Options::default()
-    };
+    let opts = cfg.options();
     let mut reports = Vec::new();
     for p in &t.pairs {
         let (a, b) = t.read(p, cfg).map_err(|e| e.0)?;

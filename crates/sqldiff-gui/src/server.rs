@@ -12,12 +12,17 @@
 //! - `POST /api/assumption` `{"id": "...", "flip": "open|confirmed|denied"}`
 //! - `POST /api/review` `{"fingerprint", "snapshot", "state": "accepted|rejected|commented|null", "comment"}`
 //! - `POST /api/refresh`: re-read sources
+//! - `GET /api/what_if?pair=N&line=L&side=a|b&error=<kind>`: "what if this
+//!   statement fails?" (design §6.1)
+//! - `GET /api/overlay?pair=N`: transaction brackets of both sides (design §6.2)
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
+use sqldiff_core::ir::ErrorKind;
+use sqldiff_core::model::Side;
 
 use crate::page;
 use crate::review::ReviewState;
@@ -215,6 +220,37 @@ fn handle(mut stream: TcpStream, session: &Mutex<Session>) -> std::io::Result<()
                 .and_then(|i| s.payload(i, true))
             {
                 Some(pl) => json(&pl),
+                None => not_found(),
+            }
+        }
+        ("GET", "/api/what_if") => {
+            let pair = param(query, "pair")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            let line = param(query, "line").and_then(|l| l.parse::<usize>().ok());
+            let side = if param(query, "side").as_deref() == Some("b") {
+                Side::B
+            } else {
+                Side::A
+            };
+            let kind = serde_json::from_value::<ErrorKind>(serde_json::Value::String(
+                param(query, "error").unwrap_or_else(|| "constraint".into()),
+            ));
+            match (line, kind) {
+                (Some(line), Ok(kind)) => match s.what_if(pair, side, line, kind) {
+                    Some(w) => json(&w),
+                    None => not_found(),
+                },
+                _ => bad("give line=N, and optionally pair=N, side=a|b and error=<kind>"),
+            }
+        }
+        ("GET", "/api/overlay") => {
+            match s.overlay(
+                param(query, "pair")
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
+            ) {
+                Some(o) => json(&o),
                 None => not_found(),
             }
         }

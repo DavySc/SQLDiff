@@ -96,9 +96,18 @@ fn m23_dropped_part_is_the_finding() {
         .expect("wrapper fact");
     assert_eq!(fact.source, AssumptionSource::ComposedOutput);
     assert!(fact.text.contains("SET XACT_ABORT ON"), "{}", fact.text);
-    let classes: Vec<ChangeClass> = r.findings.iter().map(|f| f.class).collect();
+    // Everything is transactional except which statements run after the
+    // error, which is control flow (error.control is semantic since WP9).
+    let classes: Vec<(&str, ChangeClass)> = r
+        .findings
+        .iter()
+        .map(|f| (f.rule.as_str(), f.class))
+        .collect();
     assert!(
-        classes.iter().all(|c| *c == ChangeClass::Transactional),
+        classes
+            .iter()
+            .all(|(rule, c)| *c == ChangeClass::Transactional
+                || (*rule == "error.control" && *c == ChangeClass::Semantic)),
         "{classes:?}"
     );
 }

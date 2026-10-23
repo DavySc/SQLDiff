@@ -238,6 +238,13 @@ pub struct Report {
     /// Why the verdict could not be stronger.
     pub unknown_reasons: Vec<String>,
     pub diagnostics: Vec<DiagnosticInfo>,
+    /// Structured witnesses of behavioural findings, by fingerprint: the
+    /// scenario and both sides' outcomes (design §2 "must carry").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnesses: Vec<crate::ir::witness::Witness>,
+    /// Defaults the objects' own source states (ledger status "discharged").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discharged: Vec<crate::ledger::Discharge>,
     /// Findings hidden by review decisions or in-source markers; they do
     /// not count towards [`Report::open_verdict`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
