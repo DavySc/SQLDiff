@@ -55,4 +55,49 @@ echo q >> ok.txt; git add ok.txt
 APPDATA=/nonexistent SQLDIFF_CONFIG=/nonexistent HOME=/nonexistent git commit -q -m nolist >/dev/null 2>&1 \
   && bad "strict mode allowed an unscanned commit" || ok "strict mode refuses without a deny-list"
 
+git reset -q ok.txt; git checkout -q ok.txt
+git config sqldiff.requireDenylist false
+
+# Hashed deny-list (what CI holds): needs the sqldiff binary.
+bin="${SQLDIFF_BIN:-}"
+for c in "$root/target/debug/sqldiff" "$root/target/release/sqldiff"; do
+  [[ -z "$bin" ]] && command -v "$c" >/dev/null 2>&1 && bin="$c"
+done
+if [[ -z "$bin" ]]; then
+  if [[ "${CI:-}" == "true" ]]; then bad "hashed scan: no sqldiff binary to test with"
+  else echo "  skip hashed scan tests (cargo build -p sqldiff-cli first)"; fi
+else
+  export SQLDIFF_BIN="$bin"
+  printf 'deny_list = ["zq-secret-term-1", "zq-corp.example"]\n[pack]\nname = "t"\nversion = "1"\n' > "$tmp/pack.toml"
+  "$bin" pack deny-hashes --isolated --pack "$tmp/pack.toml" > "$tmp/deny.hashes"
+  grep -q -i zq- "$tmp/deny.hashes" && bad "hash list holds a plain term" || ok "hash list holds no plain term"
+  export SQLDIFF_DENYHASHES_FILE="$tmp/deny.hashes"
+  scan() { bash scripts/leak-scan.sh "$@" > "$tmp/scan.out" 2>&1; }
+
+  scan && ok "hashed: clean tree passes" || bad "hashed: clean tree blocked"
+  echo "x ZQ-Secret-Term-1" > leak.txt; git add leak.txt
+  scan && bad "hashed: tree term not found" || ok "hashed: tree term found (case-insensitive)"
+  grep -q -i zq- "$tmp/scan.out" && bad "hashed: report names the term" || ok "hashed: report names the place, not the term"
+  scan --cached && bad "hashed: staged term not found" || ok "hashed: staged term found"
+  git reset -q leak.txt; rm -f leak.txt
+
+  base="$(git rev-parse HEAD)"
+  echo "y zq-corp.example" > deep.txt; git add deep.txt; git commit -q --no-verify -m deep
+  git rm -q deep.txt; git commit -q --no-verify -m removed
+  scan --commits "$base..HEAD" && bad "hashed: leak buried in history not found" || ok "hashed: leak buried in history found"
+  git commit -q --no-verify --allow-empty -m "names zq-secret-term-1"
+  scan --commits HEAD~1..HEAD && bad "hashed: message term not found" || ok "hashed: message term found"
+  git reset -q --hard "$base"
+  scan --commits "$base" && ok "hashed: clean history passes" || bad "hashed: clean history blocked"
+
+  printf '#!/bin/sh\nexit 3\n' > "$tmp/broken"; chmod +x "$tmp/broken"
+  SQLDIFF_BIN="$tmp/broken" scan; rc=$?
+  [[ $rc -eq 2 ]] && ! grep -q 'leak-scan: clean' "$tmp/scan.out" && ok "hashed: a failing scanner is an error, not clean" \
+    || bad "hashed: a failing scanner was reported as status $rc"
+  unset SQLDIFF_DENYHASHES_FILE
+fi
+
+SQLDIFF_REQUIRE_DENYLIST=true bash scripts/leak-scan.sh >/dev/null 2>&1 \
+  && bad "required deny-list missing, scan passed" || ok "required deny-list missing fails the scan"
+
 [[ $fail -eq 0 ]] && echo "hook self-test: all passed" || { echo "hook self-test: FAILED" >&2; exit 1; }

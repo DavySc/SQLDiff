@@ -8,6 +8,7 @@ use crate::bind::{self, BindInput, Bindings};
 use crate::catalog::builtins::Helper;
 use crate::catalog::{ddl, Catalog, CatalogView};
 use crate::classify::pairing_key;
+use crate::equiv;
 use crate::facts;
 use crate::lint;
 use crate::model::{
@@ -15,14 +16,17 @@ use crate::model::{
     Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
+use crate::rules;
 use crate::treediff;
 
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Maximum lines of excerpt per location.
     pub excerpt_lines: usize,
-    /// Catalog DDL for side A (`CREATE TABLE`, `CREATE PROCEDURE`, ...), each
-    /// read in its own dialect. `check` uses these for its one artifact.
+    /// Catalog DDL for side A (`CREATE TABLE`, `CREATE UNIQUE INDEX`,
+    /// `CREATE PROCEDURE`, ...), each read in its own dialect. Binding checks
+    /// names against it; statement equivalence uses keys, nullability and types
+    /// to discharge side conditions. `check` uses these for its one artifact.
     pub catalog_a: Vec<Artifact>,
     /// Catalog DDL for side B.
     pub catalog_b: Vec<Artifact>,
@@ -119,12 +123,19 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     ];
     let mut unknown_reasons = Vec::new();
     let mut noise = NoiseCounts::default();
+    // One catalog per side serves binding and statement equivalence.
+    let view_a = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let view_b = catalog_view(b.dialect, &opts.catalog_b, &opts.facts_b);
+    let schema_a = equiv::schema::Schema::from_view(&view_a);
+    let schema_b = equiv::schema::Schema::from_view(&view_b);
+    let mut eq = equiv::Outcome::default();
 
     if same {
-        let td = treediff::diff(&aa, &ab);
+        let mut td = treediff::diff(&aa, &ab);
+        equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
         noise.cosmetic = td.cosmetic;
-        noise.structural = td.structural;
+        noise.structural = td.structural + eq.structural;
         match a.dialect.lexical().folding {
             sqldiff_syntax::IdentFolding::Lower => {
                 normalizations.push("unquoted identifiers folded to lower case".to_string())
@@ -153,22 +164,46 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 findings.push(lint::to_finding(&ab, &h));
             }
         }
+        // Idiom-rule lints that are new in B (design section 8).
+        let old = rules::analysis::hits(&aa, &schema_a, false);
+        for h in rules::analysis::new_hits(&old, rules::analysis::hits(&ab, &schema_b, false)) {
+            let v = if h.diff_different {
+                Verdict::Different
+            } else {
+                Verdict::Unknown
+            };
+            findings.push(rules::analysis::to_finding(&ab, &h, v));
+        }
     } else {
         findings.extend(pair_writes(&aa, &ab));
-        for side in [&aa, &ab] {
+        for (side, schema) in [(&aa, &schema_a), (&ab, &schema_b)] {
             for h in lint::all_hits(side) {
                 findings.push(lint::to_finding(side, &h));
             }
+            // Rule lints describe one side's code: they do not decide the verdict.
+            for h in rules::analysis::hits(side, schema, false) {
+                findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
+            }
         }
-        unknown_reasons.push(format!(
-            "statement-level semantic equivalence between {} and {} is not implemented yet; only transaction, error-contract, write-pairing and residue checks ran",
-            a.dialect.display_name(),
-            b.dialect.display_name()
-        ));
+        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
+        findings.append(&mut eq.findings);
+        noise.structural += eq.structural;
+        unknown_reasons.append(&mut eq.unknown_reasons);
+        normalizations.push(
+            "statement lowering: parameters by position, aliases resolved, dialect built-ins and idioms mapped to one form".to_string(),
+        );
+    }
+    for x in eq.normalizations.drain(..) {
+        if !normalizations.contains(&x) {
+            normalizations.push(x);
+        }
+    }
+    for x in eq.assumptions.drain(..) {
+        if !assumptions.iter().any(|y| y.id == x.id) {
+            assumptions.push(x);
+        }
     }
 
-    let view_a = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
-    let view_b = catalog_view(b.dialect, &opts.catalog_b, &opts.facts_b);
     let bound_a = bind::bind(
         &aa,
         &BindInput {
@@ -235,11 +270,15 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 /// Lint one artifact on its own.
 pub fn check(a: &Artifact, opts: &Options) -> Report {
     let aa = Analyzed::new(a, Side::A, opts.excerpt_lines);
+    let view = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    let schema = equiv::schema::Schema::from_view(&view);
     let mut findings: Vec<Finding> = lint::all_hits(&aa)
         .iter()
         .map(|h| lint::to_finding(&aa, h))
         .collect();
-    let view = catalog_view(a.dialect, &opts.catalog_a, &opts.facts_a);
+    for h in rules::analysis::hits(&aa, &schema, true) {
+        findings.push(rules::analysis::to_finding(&aa, &h, Verdict::Unknown));
+    }
     let bound = bind::bind(
         &aa,
         &BindInput {

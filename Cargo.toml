@@ -21,3 +21,11 @@ sha2 = "0.10"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
+
+# The hashed leak scan (sqldiff pack scan) hashes every substring of the tree.
+# Unoptimized, that takes about a minute in the debug build CI uses.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.sqldiff-cli]
+opt-level = 3

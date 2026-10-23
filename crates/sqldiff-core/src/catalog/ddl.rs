@@ -412,8 +412,22 @@ fn create_index(cat: &mut Catalog, t: &[Tok], from: usize, dialect: Dialect) {
     if t.get(j).is_some_and(|x| x.is_kw("ONLY")) {
         j += 1;
     }
-    let (parts, after) = qualified(t, j);
+    let (parts, mut after) = qualified(t, j);
+    // T-SQL / PG `USING method` before the column list.
+    if t.get(after).is_some_and(|x| x.is_kw("USING")) {
+        after += 2;
+    }
     let (cols, _) = paren_names(&t[after..], dialect);
+    // Only a plain column list without a filter is a key: an expression
+    // element or a WHERE clause (partial, filtered index) is not.
+    let plain = t.get(after).is_some_and(|x| x.is(SyntaxKind::L_PAREN)) && {
+        let close = close_paren(t, after);
+        split_commas(&t[after + 1..close]).iter().all(|el| {
+            matches!(el, [c] | [c, _] if c.is_name()
+                && el.get(1).map_or(true, |o| o.is_any_kw(&["ASC", "DESC"])))
+        }) && !t[close..].iter().any(|x| x.is_kw("WHERE"))
+    };
+    let unique = unique && plain && !cols.is_empty();
     let view = super::CatalogView::new(dialect, &[&*cat]);
     let found = match view.table(&parts) {
         super::Lookup::Found(tb) => Some((tb.schema.clone(), tb.name.clone())),
