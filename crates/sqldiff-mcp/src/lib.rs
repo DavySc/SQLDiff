@@ -56,6 +56,9 @@ struct Held {
     artifacts: Option<(Artifact, Artifact)>,
     /// Options the pair was diffed with (excerpt cap, catalogs, declared facts).
     opts: Option<Options>,
+    /// The pair re-diffed under the session's scenario flips, when any are
+    /// set and the artifacts are held.
+    rerun: Option<Report>,
 }
 
 pub struct Server {
@@ -220,6 +223,7 @@ impl Server {
             h.artifacts = Some((a, b));
             h.opts = Some(opts);
         }
+        self.refresh_rerun(&id);
         Ok(self.summarize(&id, args))
     }
 
@@ -284,28 +288,46 @@ impl Server {
                 files,
                 artifacts: None,
                 opts: None,
+                rerun: None,
             },
         );
+    }
+
+    /// Re-diffs a held pair under the session's scenario flips (or drops
+    /// the re-run when there are none) and registers its findings, so
+    /// findings that only show under a flip can be looked up.
+    fn refresh_rerun(&mut self, id: &str) {
+        let scen = sqldiff_core::ledger::scenario_flips(&self.flips);
+        let Some(h) = self.pairs.get(id) else { return };
+        let r = match (&h.artifacts, &h.opts) {
+            (Some((a, b)), Some(o)) if !scen.is_empty() => Some(self.run_diff(
+                a,
+                b,
+                &Options {
+                    flips: scen,
+                    ..o.clone()
+                },
+            )),
+            _ => None,
+        };
+        if let Some(r) = &r {
+            for f in &r.findings {
+                self.findings.insert(f.fingerprint.clone(), id.to_string());
+            }
+        }
+        if let Some(h) = self.pairs.get_mut(id) {
+            h.rerun = r;
+        }
     }
 
     /// A held pair's report with session flips applied. Flips of scenario
     /// assumptions re-run the analysis when the pair's artifacts are held.
     fn view(&self, id: &str) -> Option<Report> {
         let h = self.pairs.get(id)?;
-        let rerun = self
-            .flips
-            .keys()
-            .any(|k| RERUN_ASSUMPTIONS.contains(&k.as_str()));
-        match (&h.artifacts, &h.opts) {
-            (Some((a, b)), Some(o)) if rerun => {
-                let opts = Options {
-                    flips: self.flips.clone(),
-                    ..o.clone()
-                };
-                Some(queue::view(&self.run_diff(a, b, &opts), &self.flips))
-            }
-            _ => Some(queue::view(&h.pair.report, &self.flips)),
-        }
+        Some(queue::view(
+            h.rerun.as_ref().unwrap_or(&h.pair.report),
+            &self.flips,
+        ))
     }
 
     /// The pair a `pair` id or `fingerprint` argument names.
@@ -631,12 +653,14 @@ impl Server {
         let held = &self.pairs[&id];
         if let (Some((a, b)), Some(o)) = (&held.artifacts, &held.opts) {
             // Full ledger: sources, proven-from-source facts, and flips that re-run.
-            let opts = Options {
-                flips: self.flips.clone(),
-                ..o.clone()
-            };
-            let (_, ledger) = sqldiff_core::ledger::ledger(a, b, &opts);
-            let report = self.view(&id).expect("held pair");
+            let (report, ledger) =
+                sqldiff_core::ledger::ledger_by(&self.flips, &o.declared, &mut |f| {
+                    let opts = Options {
+                        flips: f.clone(),
+                        ..o.clone()
+                    };
+                    self.run_diff(a, b, &opts)
+                });
             let mut text = format!(
                 "{}  [{id}]\nVerdict: {}\n",
                 pair_label(&report),
@@ -726,6 +750,12 @@ impl Server {
             Some(h) => self.flips.insert(aid.clone(), h),
             None => self.flips.remove(&aid),
         };
+        if RERUN_ASSUMPTIONS.contains(&aid.as_str()) {
+            let ids: Vec<String> = self.pairs.keys().cloned().collect();
+            for k in ids {
+                self.refresh_rerun(&k);
+            }
+        }
         let mut changed = Vec::new();
         let mut affected = 0;
         for (k, h) in &self.pairs {
@@ -733,8 +763,8 @@ impl Server {
                 continue;
             }
             affected += 1;
-            let now = queue::view(&h.pair.report, &self.flips).open_verdict();
-            if before.get(k).copied().flatten() != Some(now) {
+            let now = self.view(k).map(|r| r.open_verdict());
+            if before.get(k).copied().flatten() != now {
                 changed.push(json!({
                     "pair_id": k,
                     "pair": pair_label(&h.pair.report),
@@ -772,12 +802,26 @@ impl Server {
         if args.get("a").is_some() || args.get("b").is_some() {
             let (a, _) = artifact(args.get("a"), "a")?;
             let (b, _) = artifact(args.get("b"), "b")?;
-            return Ok((a, b, self.options(args)));
+            return Ok((
+                a,
+                b,
+                Options {
+                    flips: self.flips.clone(),
+                    ..self.options(args)
+                },
+            ));
         }
         let id = self.pair_arg(args)?;
         let h = &self.pairs[&id];
         match (&h.artifacts, &h.opts) {
-            (Some((a, b)), Some(o)) => Ok((a.clone(), b.clone(), o.clone())),
+            (Some((a, b)), Some(o)) => Ok((
+                a.clone(),
+                b.clone(),
+                Options {
+                    flips: self.flips.clone(),
+                    ..o.clone()
+                },
+            )),
             _ => Err(format!(
                 "pair `{id}` came from `queue` or `check`; give `a` and `b` (or diff them first)"
             )),

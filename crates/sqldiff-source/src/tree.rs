@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use sqldiff_core::{Artifact, Dialect, Report};
+use sqldiff_core::{Artifact, Dialect, Options, Report};
 
 use crate::protocol::ObjectFilter;
 use crate::{pairing, policy, Error, FsSource, Resolved, Result, Source};
@@ -58,7 +58,12 @@ pub fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Art
 
 /// Engine diff with pack policy: limit rules, overrides, declared assumptions.
 pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
-    with_policy(sqldiff_core::diff(a, b, &cfg.options()), a, Some(b), cfg)
+    diff_with(a, b, cfg, &cfg.options())
+}
+
+/// [`diff`] with explicit engine options (e.g. scenario flips).
+pub fn diff_with(a: &Artifact, b: &Artifact, cfg: &Resolved, opts: &Options) -> Report {
+    with_policy(sqldiff_core::diff(a, b, opts), a, Some(b), cfg)
 }
 
 /// Pack policy on an engine report.

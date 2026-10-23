@@ -115,6 +115,18 @@ pub fn declared_commit_level(text: &str) -> Option<String> {
         .map(|(_, l)| l.to_string())
 }
 
+/// The canonical name of a Db2 for i commit level: `*UR` is `*CHG`, `*RS`
+/// is `*ALL`, `*NC` is `*NONE` (`*CS` and `*RR` have no synonym in use).
+pub fn canonical_commit_level(level: &str) -> String {
+    let up = level.trim().to_ascii_uppercase();
+    match up.as_str() {
+        "*UR" => "*CHG".into(),
+        "*RS" => "*ALL".into(),
+        "*NC" => "*NONE".into(),
+        _ => up,
+    }
+}
+
 /// Findings for declarations that contradict what a side's source states.
 pub fn contradictions(sides: &[&Analyzed], opts: &Options) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -124,7 +136,7 @@ pub fn contradictions(sides: &[&Analyzed], opts: &Options) -> Vec<Finding> {
                 continue;
             };
             let contradicts = match (&d.value, declared_commit_level(text)) {
-                (Some(v), Some(w)) => *v != w,
+                (Some(v), Some(w)) => canonical_commit_level(v) != canonical_commit_level(&w),
                 _ => false,
             };
             if !contradicts {
@@ -136,7 +148,8 @@ pub fn contradictions(sides: &[&Analyzed], opts: &Options) -> Vec<Finding> {
                     object: &a.object,
                     class: ChangeClass::Transactional,
                     rule: "assumption.contradiction",
-                    anchor_a: &d.id,
+                    // One finding per side: the side is part of the anchor.
+                    anchor_a: &format!("{}|{:?}", d.id, d.side),
                     anchor_b: text,
                 }),
                 rule: "assumption.contradiction".into(),
@@ -156,47 +169,28 @@ pub fn contradictions(sides: &[&Analyzed], opts: &Options) -> Vec<Finding> {
     out
 }
 
-/// The verdict a report's findings, reasons and assumptions support.
-pub fn derive_verdict(r: &Report) -> Verdict {
-    if r.findings.iter().any(|f| f.verdict == Verdict::Different) {
-        Verdict::Different
-    } else if r.findings.iter().any(|f| f.verdict == Verdict::Unknown)
-        || !r.unknown_reasons.is_empty()
-    {
-        Verdict::Unknown
-    } else if !r.assumptions.is_empty() {
-        Verdict::EqualUnderAssumptions
-    } else {
-        Verdict::Equal
-    }
-}
+pub use crate::session::derive_verdict;
 
 /// Applies flips that do not change scenarios: a denied assumption drops
 /// every finding that relies on it to unknown (its witness was only shown
-/// under it); a confirmed one shows as declared.
+/// under it); a confirmed one shows as declared. Without a denial that
+/// hits, the report and its verdict are left as they are; with one, the
+/// verdict is derived again, never better than "equal under assumptions"
+/// when review accepted findings.
 pub fn relabel(r: &mut Report, flips: &Flips) {
-    for a in &mut r.assumptions {
-        if flips.get(&a.id) == Some(&true) {
-            a.source = AssumptionSource::Declared;
-        }
+    let ids = |holds: bool| -> Vec<String> {
+        flips
+            .iter()
+            .filter(|(_, h)| **h == holds)
+            .map(|(k, _)| k.clone())
+            .collect()
+    };
+    crate::session::confirm_assumptions(r, &ids(true));
+    let before = r.verdict;
+    crate::session::deny_assumptions(r, &ids(false));
+    if r.verdict != before && !r.suppressed.is_empty() {
+        r.verdict = r.open_verdict();
     }
-    let denied: Vec<&String> = flips
-        .iter()
-        .filter(|(id, holds)| !**holds && r.assumptions.iter().any(|a| &a.id == *id))
-        .map(|(id, _)| id)
-        .collect();
-    for f in &mut r.findings {
-        if f.assumptions.iter().any(|a| denied.contains(&a)) {
-            f.verdict = Verdict::Unknown;
-        }
-    }
-    for id in denied {
-        let reason = format!("assumption {id} is denied in this session");
-        if !r.unknown_reasons.contains(&reason) {
-            r.unknown_reasons.push(reason);
-        }
-    }
-    r.verdict = derive_verdict(r);
 }
 
 /// Diff under flips: scenario flips re-run the analysis, the rest relabel.
@@ -236,20 +230,54 @@ pub struct Entry {
     pub reruns: bool,
 }
 
+/// Only the flips that re-run the behavioural analysis.
+pub fn scenario_flips(flips: &Flips) -> Flips {
+    flips
+        .iter()
+        .filter(|(k, _)| RERUN_ASSUMPTIONS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect()
+}
+
 /// The pair's report under `opts.flips` and its ledger: verdict-deciding
 /// assumptions first, then open ones, then by source.
 pub fn ledger(a: &Artifact, b: &Artifact, opts: &Options) -> (Report, Vec<Entry>) {
-    let report = evaluate(a, b, opts);
+    ledger_by(&opts.flips, &opts.declared, &mut |f| {
+        engine::diff(
+            a,
+            b,
+            &Options {
+                flips: f.clone(),
+                ..opts.clone()
+            },
+        )
+    })
+}
+
+/// The ledger over a caller's own pipeline: `run` diffs the pair under the
+/// given scenario flips with everything the caller shows applied (pack
+/// policy, markers, review suppression), so "verdict if flipped" compares
+/// against the verdict the caller displays. Only scenario flips re-run; the
+/// others relabel a copy of that report.
+pub fn ledger_by(
+    flips: &Flips,
+    declared: &BTreeMap<String, String>,
+    run: &mut dyn FnMut(&Flips) -> Report,
+) -> (Report, Vec<Entry>) {
+    let scen = scenario_flips(flips);
+    let raw = run(&scen);
+    let mut report = raw.clone();
+    relabel(&mut report, flips);
     let mut ids: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
     for id in RERUN_ASSUMPTIONS {
-        if opts.flips.contains_key(id) && !ids.iter().any(|x| x == id) {
+        if flips.contains_key(id) && !ids.iter().any(|x| x == id) {
             ids.push(id.to_string());
         }
     }
     let mut out = Vec::new();
     for id in ids {
         let asm = report.assumptions.iter().find(|x| x.id == id);
-        let flipped = opts.flips.get(&id).copied();
+        let flipped = flips.get(&id).copied();
         let (status, source, cite) = match (flipped, asm.map(|x| x.source)) {
             (Some(true), _) => (
                 Status::Confirmed,
@@ -261,21 +289,30 @@ pub fn ledger(a: &Artifact, b: &Artifact, opts: &Options) -> (Report, Vec<Entry>
                 Source::Session,
                 Some("denied in this session".into()),
             ),
-            (None, Some(AssumptionSource::Declared)) | (None, _)
-                if opts.declared.contains_key(&id) =>
-            {
-                (
-                    Status::Declared,
-                    Source::Config,
-                    opts.declared.get(&id).map(|t| format!("declared: {t}")),
-                )
-            }
+            (None, _) if declared.contains_key(&id) => (
+                Status::Declared,
+                Source::Config,
+                declared.get(&id).map(|t| format!("declared: {t}")),
+            ),
+            (None, Some(AssumptionSource::Declared)) => (Status::Declared, Source::Config, None),
+            (None, Some(AssumptionSource::Author)) => (
+                Status::Open,
+                Source::Author,
+                Some("stated by the author in source".into()),
+            ),
             _ => (Status::Open, Source::Default, None),
         };
-        let mut other = opts.clone();
+        let mut other = flips.clone();
         // Flipping a denied one restores it; anything else is denied.
-        other.flips.insert(id.clone(), status == Status::Denied);
-        let v = evaluate(a, b, &other).verdict;
+        other.insert(id.clone(), status == Status::Denied);
+        let reruns = RERUN_ASSUMPTIONS.contains(&id.as_str());
+        let mut r = if reruns {
+            run(&scenario_flips(&other))
+        } else {
+            raw.clone()
+        };
+        relabel(&mut r, &other);
+        let v = r.verdict;
         out.push(Entry {
             text: asm
                 .map(|x| x.text.clone())
@@ -286,7 +323,7 @@ pub fn ledger(a: &Artifact, b: &Artifact, opts: &Options) -> (Report, Vec<Entry>
                 .filter(|f| f.assumptions.contains(&id))
                 .map(|f| f.fingerprint.clone())
                 .collect(),
-            reruns: RERUN_ASSUMPTIONS.contains(&id.as_str()),
+            reruns,
             verdict_if_flipped: Some(v),
             flips_verdict: v != report.verdict,
             id,

@@ -83,13 +83,16 @@ pub fn brackets(a: &Analyzed) -> Vec<Bracket> {
         .map(|n| line(&n).0)
         .unwrap_or(1);
     // A transaction runs from BEGIN (or, where transactions start
-    // implicitly, from the start of the body or the previous unit's end) to
-    // the last COMMIT or ROLLBACK before the next one starts; branches can
-    // end it at several places, all listed in the label.
+    // implicitly, from the start of the body or the first statement after
+    // the previous unit's end) to the last COMMIT or ROLLBACK before the next
+    // one starts; branches can end it at several places (ends with no other
+    // statement between them), all listed in the label.
     let implicit = a.dialect() != Dialect::Tsql;
     let mut units: Vec<(usize, Vec<(usize, &str)>)> = Vec::new();
     let mut cur: Option<(usize, Vec<(usize, &str)>)> = None;
     let mut savepoints: Vec<(String, usize)> = Vec::new();
+    // Where the next implicit unit starts, once the previous one has ended.
+    let mut next_start: Option<usize> = None;
     for (_, l, act) in &stmts {
         match act {
             Action::Begin => {
@@ -108,7 +111,10 @@ pub fn brackets(a: &Analyzed) -> Vec<Bracket> {
                 };
                 match &mut cur {
                     Some(u) => u.1.push((*l, what)),
-                    None if implicit => cur = Some((body_start, vec![(*l, what)])),
+                    None if implicit => {
+                        let start = next_start.take().unwrap_or(body_start);
+                        cur = Some((start, vec![(*l, what)]));
+                    }
                     None => {}
                 }
                 savepoints.clear();
@@ -125,6 +131,11 @@ pub fn brackets(a: &Analyzed) -> Vec<Bracket> {
                         partner: None,
                     });
                 }
+            }
+            // Work after an ended unit starts the next one.
+            _ if implicit && cur.as_ref().is_some_and(|u| !u.1.is_empty()) => {
+                units.extend(cur.take());
+                next_start = Some(*l);
             }
             _ => {}
         }

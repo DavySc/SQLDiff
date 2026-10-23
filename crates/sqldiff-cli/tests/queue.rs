@@ -190,3 +190,55 @@ fn open_quotes_paths_with_spaces() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert!(err.contains(&format!("'{a}' '{b}'")), "{err}");
 }
+
+// Regressions from the review of PR #23.
+
+#[test]
+fn assumptions_runs_the_diff_pipeline() {
+    let dir = scratch("asm-pipeline");
+    let pack = dir.join("pack.toml");
+    std::fs::write(
+        &pack,
+        "[pack]\nname = \"t\"\nversion = \"1\"\n\n[[author_markers]]\nkind = \"assumption\"\npattern = \"--\\\\s*ASSUMES:\\\\s*(.*)\"\n",
+    )
+    .unwrap();
+    let a = dir.join("a.tsql.sql");
+    let b = dir.join("b.tsql.sql");
+    let body = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  -- ASSUMES: stock rows exist\n  UPDATE dbo.stock SET qty = 0;\nEND\n";
+    std::fs::write(&a, body).unwrap();
+    std::fs::write(&b, body).unwrap();
+    let (pack, a, b) = (
+        pack.display().to_string(),
+        a.display().to_string(),
+        b.display().to_string(),
+    );
+    let (_, out) = sqldiff(&["diff", &a, &b, "--pack", &pack, "-f", "json"]);
+    let d: serde_json::Value = serde_json::from_str(&out).unwrap();
+    let asm = d["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["source"] == "author")
+        .unwrap_or_else(|| panic!("{d}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The author's assumption is in the ledger, with the same verdict.
+    let (_, out) = sqldiff(&["assumptions", &a, &b, "--pack", &pack, "-f", "json"]);
+    let l: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(l["verdict"], d["verdict"]);
+    assert!(
+        l["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x["id"] == asm.as_str()),
+        "{l}"
+    );
+    // Denying it reaches the marker's assumption.
+    let (_, out) = sqldiff(&[
+        "diff", &a, &b, "--pack", &pack, "--deny", &asm, "-f", "json",
+    ]);
+    let r: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(r["verdict"], "unknown", "{r}");
+}

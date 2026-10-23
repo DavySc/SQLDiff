@@ -392,3 +392,41 @@ fn single_file_check_has_no_gui_pair() {
     assert_eq!(r[1]["result"]["isError"], true);
     assert!(text(&r[1]).contains("single-file"));
 }
+
+#[test]
+fn findings_that_only_show_under_a_flip_can_be_expanded() {
+    let pair = json!({
+        "a": { "path": fixture("movestock.tsql.sql"), "dialect": "tsql" },
+        "b": { "path": fixture("movestock.db2i.sql"), "dialect": "db2i" },
+    });
+    let deny = json!({ "id": "ASM-NO-CALLER-TXN", "holds": false });
+    // A caller transaction makes durability differ: a finding the default run lacks.
+    let r = session(&[
+        call(1, "set_assumption", deny.clone()),
+        call(2, "diff", pair.clone()),
+    ]);
+    let fp = r[1]["result"]["structuredContent"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["rule"] == "txn.durability")
+        .unwrap_or_else(|| panic!("{}", r[1]))["fingerprint"]
+        .clone();
+    let r = session(&[call(1, "diff", pair.clone())]);
+    assert!(!r[0]["result"]["structuredContent"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["fingerprint"] == fp));
+    // Flipped after the diff: the re-run's findings are registered.
+    let r = session(&[
+        call(1, "diff", pair),
+        call(2, "set_assumption", deny),
+        call(3, "finding", json!({ "fingerprint": fp })),
+    ]);
+    assert_eq!(
+        r[2]["result"]["structuredContent"]["finding"]["fingerprint"], fp,
+        "{}",
+        r[2]
+    );
+}

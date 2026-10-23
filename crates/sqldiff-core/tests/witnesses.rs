@@ -399,3 +399,85 @@ fn m5b_untested_db2_facts_cap_the_verdict() {
     assert!(capped.iter().all(|f| f.verdict == Verdict::Unknown));
     assert!(capped.iter().any(|f| f.witness.contains("vendor fact V4")));
 }
+
+// Regressions from the review of PR #23.
+
+#[test]
+fn commit_level_synonyms_do_not_contradict() {
+    // p01's Db2 routine says COMMIT = *NONE; *NC is the same level.
+    let (a, b) = p01("db2i.sql", Dialect::Db2i);
+    let mut o = Options::default();
+    o.declared
+        .insert("ASM-DB2-COMMIT-LEVEL".into(), "*NC".into());
+    let r = diff(&a, &b, &o);
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.rule == "assumption.contradiction"),
+        "{:#?}",
+        r.findings
+    );
+    assert_eq!(ledger::canonical_commit_level("*ur"), "*CHG");
+    assert_eq!(ledger::canonical_commit_level("*RS"), "*ALL");
+}
+
+#[test]
+fn contradictions_on_both_sides_have_their_own_fingerprints() {
+    let d = "CREATE PROCEDURE p ()\nLANGUAGE SQL\nSET OPTION COMMIT = *NONE\nBEGIN\n  UPDATE stock SET qty = 0;\nEND;\n";
+    let (a, b) = (
+        Artifact::new("a.sql", Dialect::Db2i, d),
+        Artifact::new("b.sql", Dialect::Db2i, d),
+    );
+    let mut o = Options::default();
+    o.declared
+        .insert("ASM-DB2-COMMIT-LEVEL".into(), "*CHG".into());
+    let r = diff(&a, &b, &o);
+    let fps: Vec<&str> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "assumption.contradiction")
+        .map(|f| f.fingerprint.as_str())
+        .collect();
+    assert_eq!(fps.len(), 2, "{:#?}", r.findings);
+    assert_ne!(fps[0], fps[1]);
+}
+
+#[test]
+fn relabel_without_a_hit_keeps_the_verdict() {
+    let (a, b) = p01("pg.sql", Dialect::Postgres);
+    let mut r = diff(&a, &b, &Options::default());
+    // As after review accepted every finding.
+    r.verdict = Verdict::EqualUnderAssumptions;
+    r.findings.clear();
+    let before = r.clone();
+    ledger::relabel(&mut r, &Default::default());
+    assert_eq!(r.verdict, before.verdict);
+    let mut flips = std::collections::BTreeMap::new();
+    flips.insert("ASM-NOT-USED".to_string(), false);
+    ledger::relabel(&mut r, &flips);
+    assert_eq!(r.verdict, before.verdict);
+}
+
+#[test]
+fn overlay_splits_sequential_implicit_units() {
+    let pg = "CREATE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  UPDATE stock SET qty = 0;\n  COMMIT;\n  INSERT INTO stock_log (item_id) VALUES (1);\n  COMMIT;\nEND;\n$$;\n";
+    let ts = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  BEGIN TRAN;\n  UPDATE dbo.stock SET qty = 0;\n  COMMIT;\n  BEGIN TRAN;\n  INSERT INTO dbo.stock_log (item_id) VALUES (1);\n  COMMIT;\nEND\n";
+    let o = overlay(
+        &Artifact::new("a.sql", Dialect::Tsql, ts),
+        &Artifact::new("b.sql", Dialect::Postgres, pg),
+    );
+    let units: Vec<(usize, usize)> =
+        o.b.iter()
+            .filter(|x| x.label.starts_with("unit of work"))
+            .map(|x| (x.start_line, x.end_line))
+            .collect();
+    assert_eq!(units.len(), 2, "{:#?}", o.b);
+    assert_eq!(units[0].1, 6);
+    assert_eq!(units[1], (7, 8));
+    let ta: Vec<_> =
+        o.a.iter()
+            .filter(|x| x.label.starts_with("transaction"))
+            .collect();
+    assert_eq!(ta.len(), 2);
+    assert_eq!(ta[1].partner.map(|p| o.b[p].start_line), Some(7));
+}

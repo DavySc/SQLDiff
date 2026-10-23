@@ -77,15 +77,21 @@ impl PairArgs {
     /// Diffs the pair with scenario flips applied (they re-run the
     /// behavioural analysis); other flips are left to `queue::view`.
     fn report_with(&self, flips: &Flips) -> Result<(Report, Resolved), String> {
-        let pipe = Pipeline::new(self.cfg.resolve()?, &ReviewArgs::default())?;
-        let a = read(&self.a, self.dialect_a.or(self.dialect), &pipe.cfg)?;
-        let b = read(&self.b, self.dialect_b.or(self.dialect), &pipe.cfg)?;
+        let (pipe, a, b) = self.pipeline()?;
         let opts = Options {
             flips: flips.clone(),
             ..pipe.options()
         };
-        let r = pipe.run(&a, Some(&b), &opts);
+        let r = pipe.run_scenario(&a, Some(&b), &opts);
         Ok((r, pipe.cfg))
+    }
+
+    /// The review pipeline `diff` uses, and both sides.
+    fn pipeline(&self) -> Result<(Pipeline, Artifact, Artifact), String> {
+        let pipe = Pipeline::new(self.cfg.resolve()?, &ReviewArgs::default())?;
+        let a = read(&self.a, self.dialect_a.or(self.dialect), &pipe.cfg)?;
+        let b = read(&self.b, self.dialect_b.or(self.dialect), &pipe.cfg)?;
+        Ok((pipe, a, b))
     }
 
     fn load(&self) -> Result<(Artifact, Artifact, Resolved), String> {
@@ -319,14 +325,19 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
             flips,
             format,
         } => {
-            let (a, b, cfg) = pair.load()?;
+            // The same pipeline as `diff` (pack policy, markers, review
+            // suppression), so the verdicts agree.
+            let (pipe, a, b) = pair.pipeline()?;
             let flips = flips.flips();
-            let opts = Options {
-                flips: flips.clone(),
-                ..cfg.options()
-            };
-            let (raw, ledger) = sqldiff_core::ledger::ledger(&a, &b, &opts);
-            let view = sqldiff_source::tree::with_policy(raw, &a, Some(&b), &cfg);
+            let base = pipe.options();
+            let (view, ledger) =
+                sqldiff_core::ledger::ledger_by(&flips, &base.declared, &mut |f| {
+                    let opts = Options {
+                        flips: f.clone(),
+                        ..base.clone()
+                    };
+                    pipe.run_scenario(&a, Some(&b), &opts)
+                });
             match format {
                 Format::Text => {
                     println!("Verdict: {}", view.verdict.label().to_uppercase());
