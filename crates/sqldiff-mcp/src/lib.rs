@@ -7,7 +7,9 @@
 //! `assumptions` and `set_assumption` show and flip the assumption ledger
 //! (session-local, verdicts are re-derived); `comment_text` drafts a review
 //! comment from the deterministic phrase grammar; `open_in_gui` gives a deep
-//! link. The server only reads files and never writes anywhere.
+//! link. Findings accepted in the review store, or marked as deliberate in
+//! source, are suppressed and counted. The server only reads files and the
+//! review store, and never writes anywhere.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -15,8 +17,9 @@ use serde_json::{json, Map, Value};
 use sqldiff_core::model::{Assumption, Location};
 use sqldiff_core::phrase;
 use sqldiff_core::{Artifact, Dialect, Finding, Options, Report, TOOL_VERSION};
+use sqldiff_review::{markers, Lookup, Store};
 use sqldiff_source::protocol::{Pair, PairScope};
-use sqldiff_source::queue::{self, Filter, Flips, PairReport, ReviewLookup};
+use sqldiff_source::queue::{self, Filter, Flips, PairReport};
 use sqldiff_source::{policy, Resolved, SourceSpec};
 
 /// Protocol revisions this server understands, newest first.
@@ -53,12 +56,14 @@ pub struct Server {
     pairs: BTreeMap<String, Held>,
     /// Fingerprint → pair id.
     findings: HashMap<String, String>,
-    reviews: Box<dyn ReviewLookup>,
+    /// Read-only; re-read before each analysis so decisions made in the CLI
+    /// or GUI show up.
+    store: Store,
 }
 
 impl Default for Server {
     fn default() -> Self {
-        Self::with_config(Resolved::builtin(), None)
+        Self::build(Resolved::builtin(), None, Store::in_memory())
     }
 }
 
@@ -68,18 +73,35 @@ impl Server {
         Self::default()
     }
 
-    /// A server with resolved configuration (packs, excerpt cap, source) and
-    /// the GUI address deep links point at.
-    pub fn with_config(config: Resolved, gui_url: Option<String>) -> Self {
+    /// A server with resolved configuration (packs, excerpt cap, source,
+    /// review store in the data directory) and the GUI address deep links
+    /// point at.
+    pub fn with_config(config: Resolved, gui_url: Option<String>) -> Result<Self, String> {
+        let store = Store::from_config(&config).map_err(|e| e.0)?;
+        Ok(Self::build(config, gui_url, store))
+    }
+
+    fn build(config: Resolved, gui_url: Option<String>, store: Store) -> Self {
         Server {
             config,
             gui_url: gui_url.unwrap_or_else(|| queue::DEFAULT_GUI_URL.to_string()),
             flips: Flips::new(),
             pairs: BTreeMap::new(),
             findings: HashMap::new(),
-            // The review store is a separate package; until it lands every finding is unreviewed.
-            reviews: Box::new(queue::NoReviews),
+            store,
         }
+    }
+
+    /// Pack policy, author markers and review suppression on an engine report.
+    fn finish(&self, r: &mut Report, a: &Artifact, b: Option<&Artifact>, now: &str) {
+        policy::add_limits(r, a, b, &self.config);
+        policy::apply(r, &self.config);
+        markers::apply(r, &a.text, b.map(|b| b.text.as_str()), &self.config);
+        sqldiff_review::suppress(r, &self.store, now);
+    }
+
+    fn reload_store(&mut self) -> Result<(), String> {
+        self.store.reload().map_err(|e| e.0)
     }
 
     /// Handle one incoming JSON-RPC message (already parsed). Returns the
@@ -170,37 +192,42 @@ impl Server {
         let (a, fa) = artifact(args.get("a"), "a")?;
         let (b, fb) = artifact(args.get("b"), "b")?;
         let mut report = sqldiff_core::diff(&a, &b, &self.options(args));
-        policy::add_limits(&mut report, &a, Some(&b), &self.config);
-        policy::apply(&mut report, &self.config);
+        self.reload_store()?;
+        self.finish(&mut report, &a, Some(&b), &sqldiff_review::time::now());
         let files = fa.zip(fb).map(|(x, y)| (x, Some(y)));
-        let id = self.hold(&a.path, Some(&b.path), report, files);
+        let id = self.hold(report, files);
         Ok(self.summarize(&id, args))
     }
 
     fn check(&mut self, args: &Value) -> Result<(String, Value), String> {
         let (a, fa) = artifact(args.get("artifact"), "artifact")?;
         let mut report = sqldiff_core::check(&a, &self.options(args));
-        policy::add_limits(&mut report, &a, None, &self.config);
-        policy::apply(&mut report, &self.config);
-        let id = self.hold(&a.path, None, report, fa.map(|x| (x, None)));
+        self.reload_store()?;
+        self.finish(&mut report, &a, None, &sqldiff_review::time::now());
+        let id = self.hold(report, fa.map(|x| (x, None)));
         Ok(self.summarize(&id, args))
     }
 
-    /// Keeps a report for later lookups and returns its pair id.
-    fn hold(
-        &mut self,
-        a: &str,
-        b: Option<&str>,
-        report: Report,
-        files: Option<(String, Option<String>)>,
-    ) -> String {
-        let id = queue::pair_id(a, b);
+    /// Keeps a report for later lookups and returns its pair id. The id
+    /// covers names and content, so two inline texts never share one.
+    fn hold(&mut self, report: Report, files: Option<(String, Option<String>)>) -> String {
+        let side = |i: &sqldiff_core::model::ArtifactInfo| format!("{}@{}", i.path, i.content_hash);
+        let id = queue::pair_id(&side(&report.a), report.b.as_ref().map(side).as_deref());
+        let (a, b) = (
+            report.a.path.clone(),
+            report
+                .b
+                .as_ref()
+                .map(|b| b.path.clone())
+                .unwrap_or_default(),
+        );
+        self.make_room(1);
         self.hold_pair(
             PairReport {
                 id: id.clone(),
                 pair: Pair {
-                    a: a.to_string(),
-                    b: b.unwrap_or("").to_string(),
+                    a,
+                    b,
                     key: String::new(),
                     rule: "diff".to_string(),
                 },
@@ -213,11 +240,16 @@ impl Server {
         id
     }
 
-    fn hold_pair(&mut self, pair: PairReport, files: Option<(String, Option<String>)>) {
-        if self.pairs.len() >= CACHE_LIMIT && !self.pairs.contains_key(&pair.id) {
+    /// Resets the session cache if `n` more pairs would overflow it, so ids
+    /// handed out by one call stay valid.
+    fn make_room(&mut self, n: usize) {
+        if self.pairs.len() + n > CACHE_LIMIT {
             self.pairs.clear();
             self.findings.clear();
         }
+    }
+
+    fn hold_pair(&mut self, pair: PairReport, files: Option<(String, Option<String>)>) {
         for f in &pair.report.findings {
             self.findings.insert(f.fingerprint.clone(), pair.id.clone());
         }
@@ -341,7 +373,13 @@ impl Server {
         };
         let structured = json!({
             "pair_id": id,
-            "verdict": report.verdict,
+            "verdict": report.open_verdict(),
+            "verdict_before_suppression": report.verdict,
+            "suppressed": report.suppressed.iter().map(|x| json!({
+                "fingerprint": x.finding.fingerprint,
+                "kind": x.kind,
+                "justification": x.justification,
+            })).collect::<Vec<_>>(),
             "a": side(&report.a),
             "b": report.b.as_ref().map(side),
             "finding_count": report.findings.len(),
@@ -357,9 +395,15 @@ impl Server {
 
         let mut text = format!(
             "{pair}  [{id}]\nVerdict: {}\n{} finding(s)",
-            report.verdict.label().to_uppercase(),
+            report.open_verdict().label().to_uppercase(),
             report.findings.len()
         );
+        if !report.suppressed.is_empty() {
+            text.push_str(&format!(
+                "; {} accepted or marked deliberate (suppressed)",
+                report.suppressed.len()
+            ));
+        }
         if report.noise.cosmetic + report.noise.structural > 0 {
             text.push_str(&format!(
                 "; hidden: {} cosmetic, {} structural",
@@ -423,7 +467,13 @@ impl Server {
             a_dialect: str_arg(args, "dialect_a"),
             b_dialect: str_arg(args, "dialect_b"),
         };
-        let run = queue::run(src.as_ref(), &self.config, &scope).map_err(|e| e.0)?;
+        self.reload_store()?;
+        let now = sqldiff_review::time::now();
+        let run = queue::run_with(src.as_ref(), &self.config, &scope, &mut |r, a, b| {
+            markers::apply(r, &a.text, Some(&b.text), &self.config);
+            sqldiff_review::suppress(r, &self.store, &now);
+        })
+        .map_err(|e| e.0)?;
         let filter = Filter {
             classes: list_arg(args, "classes")?,
             min_severity: enum_arg(args, "min_severity")?,
@@ -441,7 +491,12 @@ impl Server {
             _ => None,
         };
         let file = |id: &str| root.as_ref().map(|r| r.join(id).display().to_string());
-        let rows = queue::entries(&run.pairs, &self.flips, &filter, self.reviews.as_ref());
+        let lookup = Lookup {
+            store: &self.store,
+            now: now.clone(),
+        };
+        let rows = queue::entries(&run.pairs, &self.flips, &filter, &lookup);
+        self.make_room(run.pairs.len());
         for p in run.pairs {
             let files = file(&p.pair.a)
                 .zip(file(&p.pair.b))
@@ -570,8 +625,9 @@ impl Server {
         };
         let before: BTreeMap<String, _> = self
             .pairs
-            .keys()
-            .map(|k| (k.clone(), self.view(k).map(|r| r.verdict)))
+            .iter()
+            .filter(|(_, h)| h.pair.report.assumptions.iter().any(|a| a.id == aid))
+            .map(|(k, _)| (k.clone(), self.view(k).map(|r| r.open_verdict())))
             .collect();
         match holds {
             Some(h) => self.flips.insert(aid.clone(), h),
@@ -584,7 +640,7 @@ impl Server {
                 continue;
             }
             affected += 1;
-            let now = queue::view(&h.pair.report, &self.flips).verdict;
+            let now = queue::view(&h.pair.report, &self.flips).open_verdict();
             if before.get(k).copied().flatten() != Some(now) {
                 changed.push(json!({
                     "pair_id": k,
@@ -706,29 +762,24 @@ impl Server {
         };
         let held = &self.pairs[&id];
         let (a, b) = held.files.clone().ok_or(
-            "this pair was given as inline text, so the GUI cannot open it; diff files by `path` instead",
+            "no file paths for this pair (inline text, or a git, bundle or adapter source), so the GUI cannot open it; diff files by `path` instead",
         )?;
+        let Some(b) = b else {
+            return Err("the GUI opens pairs; this is a single-file `check`, so diff it against another file first".to_string());
+        };
         let base = args
             .get("gui_url")
             .and_then(Value::as_str)
             .unwrap_or(&self.gui_url);
-        let url = queue::deep_link(base, &a, b.as_deref(), fp);
+        let url = queue::deep_link(base, &a, Some(&b), fp);
         let r = &held.pair.report;
-        let command = match (&b, &r.b) {
-            (Some(b), Some(rb)) => format!(
-                "sqldiff-gui serve --dialect-a {} --dialect-b {} {} {}",
-                r.a.dialect,
-                rb.dialect,
-                shell_word(&a),
-                shell_word(b)
-            ),
-            _ => format!(
-                "sqldiff-gui serve --dialect {} {} {}",
-                r.a.dialect,
-                shell_word(&a),
-                shell_word(&a)
-            ),
-        };
+        let command = format!(
+            "sqldiff-gui serve --dialect-a {} --dialect-b {} {} {}",
+            r.a.dialect,
+            r.b.as_ref().map(|x| x.dialect.as_str()).unwrap_or(""),
+            queue::shell_word(&a),
+            queue::shell_word(&b)
+        );
         let text = format!("{url}\nIf the GUI is not running: {command}\n");
         Ok((
             text,
@@ -743,18 +794,6 @@ fn status_label(s: queue::Status) -> &'static str {
         queue::Status::Declared => "declared (pack or config)",
         queue::Status::Confirmed => "confirmed in this session",
         queue::Status::Denied => "denied in this session",
-    }
-}
-
-/// Quotes a path for a POSIX shell when it needs it.
-fn shell_word(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._-+:@".contains(c))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
     }
 }
 

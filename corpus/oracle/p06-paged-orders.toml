@@ -1,0 +1,20 @@
+case = "p06-paged-orders"
+pairs = [["tsql", "pg"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO orders (customer_id, status, total, created_at) VALUES (1, 'N', 10.00, '2026-01-02 09:00:00');
+INSERT INTO orders (customer_id, status, total, created_at) VALUES (1, 'N', 12.50, '2026-01-03 09:00:00');
+INSERT INTO orders (customer_id, status, total, created_at) VALUES (1, 'S', NULL, '2026-01-03 09:00:00');
+INSERT INTO orders (customer_id, status, total, created_at) VALUES (1, 'N', 7.00, '2026-01-04 09:00:00');
+"""
+
+[[scenario]]
+name = "second page of two"
+call.tsql = "SELECT order_id, status, total, created_at FROM dbo.customer_orders_page(1, 2, 2);"
+call.pg = "SELECT order_id, status, total, created_at FROM customer_orders_page(1, 2, 2);"
+
+[[scenario]]
+name = "past the end"
+call.tsql = "SELECT order_id, status, total, created_at FROM dbo.customer_orders_page(1, 10, 2);"
+call.pg = "SELECT order_id, status, total, created_at FROM customer_orders_page(1, 10, 2);"

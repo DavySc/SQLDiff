@@ -1,0 +1,15 @@
+case = "m05-table-variable-to-temp-table"
+pairs = [["original", "mutated"]]
+observe = ["item_price(item_id, unit_price)", "audit_event(table_name, key_value, action)"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO item (item_id, name) VALUES (2, 'nut');
+INSERT INTO item_price (item_id, unit_price) VALUES (1, 5.00);
+INSERT INTO item_price (item_id, unit_price) VALUES (2, 6.00);
+INSERT INTO price_feed (item_id, unit_price) VALUES (1, 5.50);
+INSERT INTO price_feed (item_id, unit_price) VALUES (2, 0.00);
+"""
+
+[[scenario]]
+name = "feed with a non-positive price"
+call = "EXEC dbo.apply_price_feed;"

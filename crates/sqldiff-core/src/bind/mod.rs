@@ -1033,9 +1033,12 @@ impl<'a> Binder<'a> {
                         self.check_type(&c.data_type, span, stmt);
                     }
                 }
-                // `CREATE TABLE t AS SELECT ...` reads its query.
-                if let Some(q) = t.iter().position(|x| x.is_any_kw(&["SELECT", "WITH"])) {
-                    self.analyze(&t[q..], stmt);
+                // `CREATE TABLE t AS SELECT ...` (Db2: `AS (SELECT ...) WITH DATA`)
+                // reads its query; `AS` inside the column list (`GENERATED
+                // ALWAYS AS IDENTITY (START WITH 1)`) does not start one.
+                if let Some(q) = create_table_query(t) {
+                    let (from, to) = q;
+                    self.analyze(&t[from..to], stmt);
                 }
                 self.local.put_table(self.d, tb);
             }
@@ -1786,4 +1789,30 @@ fn is_pg_assignment(t: &[Tok]) -> bool {
 pub(crate) fn snippet(t: &[Tok], max: usize) -> String {
     let words: Vec<String> = t.iter().take(max).map(|x| x.text.clone()).collect();
     crate::artifact::snippet_of(&words, 80)
+}
+
+/// Token range of the query in `CREATE TABLE ... AS query`: a top-level `AS`
+/// followed by `SELECT` / `WITH`, or by a parenthesized query.
+fn create_table_query(t: &[Tok]) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    for (i, x) in t.iter().enumerate() {
+        if x.is(SyntaxKind::L_PAREN) {
+            depth += 1;
+        } else if x.is(SyntaxKind::R_PAREN) {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && x.is_kw("AS") {
+            match t.get(i + 1) {
+                Some(n) if n.is_any_kw(&["SELECT", "WITH"]) => return Some((i + 1, t.len())),
+                Some(n)
+                    if n.is(SyntaxKind::L_PAREN)
+                        && t.get(i + 2)
+                            .is_some_and(|y| y.is_any_kw(&["SELECT", "WITH"])) =>
+                {
+                    return Some((i + 2, close_paren(t, i + 1)));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }

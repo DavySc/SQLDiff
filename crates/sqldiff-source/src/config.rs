@@ -64,6 +64,10 @@ pub struct ConfigFile {
     pub source: Option<SourceSpec>,
     #[serde(default)]
     pub excerpt_lines: Option<usize>,
+    /// Key for encryption at rest of the data directory: `env:NAME` or
+    /// `file:PATH`. A reference, never the key itself.
+    #[serde(default)]
+    pub data_key: Option<String>,
 }
 
 /// A parsed config file: its own keys plus its policy.
@@ -81,6 +85,7 @@ const CONFIG_KEYS: &[&str] = &[
     "data_dir",
     "source",
     "excerpt_lines",
+    "data_key",
 ];
 
 impl ConfigLayer {
@@ -131,6 +136,14 @@ impl ConfigLayer {
         {
             crate::pack::check_credential_ref(c)?;
         }
+        if let Some(k) = &file.data_key {
+            let ok = matches!(k.split_once(':'), Some(("env" | "file", rest)) if !rest.is_empty());
+            if !ok {
+                return Err(Error::new(format!(
+                    "data_key `{k}`: expected env:NAME or file:PATH, a reference, never the key"
+                )));
+            }
+        }
         Ok(ConfigLayer {
             file,
             policy,
@@ -166,6 +179,8 @@ pub struct Resolved {
     pub data_dir: PathBuf,
     pub source: Option<SourceSpec>,
     pub excerpt_lines: usize,
+    /// Reference to the data key, if the data directory is encrypted.
+    pub data_key: Option<String>,
     compiled: Compiled,
 }
 
@@ -308,6 +323,9 @@ impl Resolved {
             if c.file.excerpt_lines.is_some() {
                 file.excerpt_lines = c.file.excerpt_lines;
             }
+            if c.file.data_key.is_some() {
+                file.data_key = c.file.data_key.clone();
+            }
         }
         let compiled = compile(&policy)?;
         Ok(Resolved {
@@ -317,6 +335,7 @@ impl Resolved {
             data_dir: file.data_dir.unwrap_or_else(default_data_dir),
             source: file.source,
             excerpt_lines: file.excerpt_lines.unwrap_or(3),
+            data_key: file.data_key,
             compiled,
         })
     }
@@ -580,6 +599,7 @@ pub fn summary(r: &Resolved) -> serde_json::Value {
         "data_dir": r.data_dir,
         "source": r.source,
         "excerpt_lines": r.excerpt_lines,
+        "data_key": r.data_key,
         "policy": r.policy,
         "dialect_versions": Dialect::ALL
             .iter()

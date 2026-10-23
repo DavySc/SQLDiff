@@ -173,7 +173,9 @@ pub fn item(
     out
 }
 
-/// Most severe first; ties by class, then fingerprint, so order is stable.
+/// Most severe first; ties by class, fingerprint, then position, so order is
+/// stable. The engine keeps one fingerprint at several locations (the same
+/// residue on two lines), so only exact repeats are dropped.
 fn ordered<'a>(fs: &[&'a Finding]) -> Vec<&'a Finding> {
     let mut v = fs.to_vec();
     v.sort_by(|x, y| {
@@ -181,9 +183,20 @@ fn ordered<'a>(fs: &[&'a Finding]) -> Vec<&'a Finding> {
             .cmp(&x.severity)
             .then(y.class.cmp(&x.class))
             .then(x.fingerprint.cmp(&y.fingerprint))
+            .then(position(x).cmp(&position(y)))
     });
-    v.dedup_by(|x, y| x.fingerprint == y.fingerprint);
+    v.dedup_by(|x, y| x == y);
     v
+}
+
+fn position(f: &Finding) -> (usize, usize, usize, usize) {
+    let at = |l: &Option<Location>| {
+        l.as_ref()
+            .map(|l| (l.start_line, l.start_col))
+            .unwrap_or((usize::MAX, usize::MAX))
+    };
+    let (a, b) = (at(&f.a), at(&f.b));
+    (a.0, a.1, b.0, b.1)
 }
 
 /// A plain-text review comment for findings of one or more pairs.
@@ -246,6 +259,7 @@ mod tests {
             id: "ASM-X".to_string(),
             text: "The caller's XACT_ABORT setting is OFF".to_string(),
             source: AssumptionSource::Default,
+            cite: None,
         }];
         let f1 = finding("bb", ChangeClass::Semantic, Verdict::Unknown, &[]);
         let f2 = finding(
@@ -277,6 +291,22 @@ A: a.sql line 4: `COMMIT;`\n   \
 Please confirm the new behaviour is intended. (sqldiff bb)\n"
         );
         assert_eq!(f1.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn same_fingerprint_at_two_locations_is_two_items() {
+        let x = finding("cc", ChangeClass::Residue, Verdict::Different, &[]);
+        let mut y = x.clone();
+        y.a.as_mut().unwrap().start_line = 9;
+        let g = Group {
+            label: String::new(),
+            findings: vec![&y, &x, &x],
+            assumptions: &[],
+            denied: &[],
+        };
+        let c = comment(&[g], &Style::default());
+        assert!(c.starts_with("SQLDiff found 2 issues"), "{c}");
+        assert!(c.find("line 4").unwrap() < c.find("line 9").unwrap());
     }
 
     #[test]

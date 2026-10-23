@@ -369,3 +369,30 @@ fn every_reference_resolves_or_is_assumed() {
     }
     assert!(refs > 1000, "too few references recorded: {refs}");
 }
+
+/// `START WITH` inside an identity clause is not the query of `CREATE TABLE ... AS`.
+#[test]
+fn identity_options_are_not_a_query() {
+    let pg = "CREATE TABLE t (\n  id integer GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) PRIMARY KEY,\n  flag boolean NOT NULL DEFAULT FALSE\n);\n";
+    let r = sqldiff_core::check(
+        &Artifact::new("t.sql", Dialect::Postgres, pg),
+        &Options::default(),
+    );
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let as_query = "CREATE TABLE t2 AS SELECT nope FROM t;\n";
+    let o = Options {
+        catalog_a: vec![Artifact::new("c.sql", Dialect::Postgres, pg)],
+        ..Options::default()
+    };
+    let r = sqldiff_core::check(&Artifact::new("t2.sql", Dialect::Postgres, as_query), &o);
+    assert!(
+        has(
+            &r,
+            "bind.unknown-column",
+            ChangeClass::Binding,
+            Verdict::Different
+        ),
+        "{:?}",
+        rules(&r)
+    );
+}

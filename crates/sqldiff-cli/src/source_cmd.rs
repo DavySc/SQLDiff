@@ -38,6 +38,10 @@ pub struct ConfigArgs {
     /// Target version for a dialect: DIALECT=VERSION. Repeatable.
     #[arg(long = "dialect-version", value_name = "DIALECT=VERSION", value_parser = key_value)]
     dialect_versions: Vec<(String, String)>,
+    /// Data directory for the review store and cache (default: config, else
+    /// $SQLDIFF_DATA_DIR or the platform data directory).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 fn key_value(s: &str) -> Result<(String, String), String> {
@@ -116,7 +120,12 @@ impl ConfigArgs {
             isolated: self.isolated,
             cwd: None,
             packs: self.packs.clone(),
-            cli: config::cli_layer(&self.assume, &self.dialect_versions, None).map_err(|e| e.0)?,
+            cli: {
+                let mut l = config::cli_layer(&self.assume, &self.dialect_versions, None)
+                    .map_err(|e| e.0)?;
+                l.file.data_dir = self.data_dir.clone();
+                l
+            },
         };
         Resolved::load(&sources).map_err(|e| e.0)
     }
