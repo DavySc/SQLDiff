@@ -3,15 +3,14 @@
 //! Exit codes: 0 equal (or equal under assumptions), 1 different or
 //! unknown, 2 usage or I/O error.
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
-use sqldiff_source::protocol::ObjectFilter;
-use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
+
+use sqldiff_source::{tree, Resolved};
 use sqldiff_syntax::ast;
 
 mod queue_cmd;
@@ -112,51 +111,14 @@ enum Command {
     Queue(queue_cmd::QueueCommand),
 }
 
-/// Path with `/` separators, as `dialect_map` globs and pairing see it.
-fn slashed(path: &Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-        .replace("//", "/")
-}
-
 /// Reads an artifact. Dialect: the given one, else `dialect_map` or the path
-/// convention. Version: `dialect_map`, else the configured target version.
+/// convention.
 fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Artifact, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    artifact(
-        path.display().to_string(),
-        &slashed(path),
-        dialect,
-        text,
-        cfg,
-    )
+    tree::read(path, dialect, cfg).map_err(|e| e.0)
 }
 
-fn artifact(
-    display: String,
-    rel: &str,
-    dialect: Option<Dialect>,
-    text: String,
-    cfg: &Resolved,
-) -> Result<Artifact, String> {
-    let (found, version) = sqldiff_source::classify(rel, cfg);
-    let d = dialect.or(found).ok_or_else(|| {
-        format!("{display}: dialect unknown; give a dialect flag or map it with dialect_map")
-    })?;
-    let mut a = Artifact::new(display, d, text);
-    a.version = match version {
-        Some(v) if found == Some(d) => v,
-        _ => cfg.dialect_version(d),
-    };
-    Ok(a)
-}
-
-fn with_policy(mut r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
-    policy::add_limits(&mut r, a, b, cfg);
-    policy::apply(&mut r, cfg);
-    r
+fn with_policy(r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved) -> Report {
+    tree::with_policy(r, a, b, cfg)
 }
 
 fn exit_for(verdict: Verdict) -> ExitCode {
@@ -168,13 +130,12 @@ fn exit_for(verdict: Verdict) -> ExitCode {
 
 /// Prints a report, redacted and leak-checked when the pipeline redacts.
 fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), String> {
-    let report = pipe.redact_reports(vec![report]).remove(0);
+    let report = pipe.redact_reports(vec![report])?.remove(0);
     let out = match format {
         Format::Text => render::text(&report, false),
         Format::Json => render::json(&report) + "\n",
         Format::Sarif => render::sarif(std::slice::from_ref(&report)) + "\n",
     };
-    pipe.verify(&out)?;
     print!("{out}");
     Ok(())
 }
@@ -286,76 +247,6 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     }
 }
 
-/// One side of a tree: its objects by pairing key.
-struct Side {
-    dir: PathBuf,
-    dialect: Option<Dialect>,
-    by_key: BTreeMap<String, String>,
-    /// Keys held by several objects; none of them is paired.
-    ambiguous: BTreeMap<String, Vec<String>>,
-    no_dialect: Vec<String>,
-}
-
-impl Side {
-    /// Lists a directory with pack `ignore` and `dialect_map`, skipping shared
-    /// artifacts, and keys every object by its pairing rule.
-    fn load(dir: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Side, String> {
-        let src = FsSource::new(dir, cfg).map_err(|e| e.0)?;
-        let objects = src
-            .list_objects(&ObjectFilter::default())
-            .map_err(|e| e.0)?;
-        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut no_dialect = Vec::new();
-        for o in objects {
-            if cfg.is_shared(&o.id) {
-                continue;
-            }
-            let Some(d) = dialect.or_else(|| o.dialect.as_deref().and_then(|d| d.parse().ok()))
-            else {
-                no_dialect.push(o.id);
-                continue;
-            };
-            let rule = cfg.pairing_rule(&o.id, Some(d));
-            groups
-                .entry(pairing::key(&o.name, &rule))
-                .or_default()
-                .push(o.id);
-        }
-        let (unique, ambiguous): (BTreeMap<_, _>, BTreeMap<_, _>) =
-            groups.into_iter().partition(|(_, ids)| ids.len() == 1);
-        Ok(Side {
-            dir: dir.to_path_buf(),
-            dialect,
-            by_key: unique
-                .into_iter()
-                .map(|(k, mut ids)| (k, ids.remove(0)))
-                .collect(),
-            ambiguous,
-            no_dialect,
-        })
-    }
-
-    fn display(&self, id: &str) -> String {
-        self.dir.join(id).display().to_string()
-    }
-
-    fn read(&self, id: &str, cfg: &Resolved) -> Result<Artifact, String> {
-        let p = self.dir.join(id);
-        let text = std::fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        artifact(p.display().to_string(), id, self.dialect, text, cfg)
-    }
-
-    /// Takes an object out by id, wherever it is keyed.
-    fn take(&mut self, id: &str) -> bool {
-        let key = self
-            .by_key
-            .iter()
-            .find(|(_, v)| v.as_str() == id)
-            .map(|(k, _)| k.clone());
-        key.is_some_and(|k| self.by_key.remove(&k).is_some())
-    }
-}
-
 fn tree(
     dir_a: &Path,
     dir_b: &Path,
@@ -365,60 +256,22 @@ fn tree(
     mut pipe: Pipeline,
 ) -> Result<ExitCode, String> {
     let cfg = &pipe.cfg.clone();
-    let mut sa = Side::load(dir_a, da, cfg)?;
-    let mut sb = Side::load(dir_b, db, cfg)?;
+    let t = tree::pair_dirs(dir_a, dir_b, da, db, cfg).map_err(|e| e.0)?;
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
     };
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    // Explicit pack pairs first: `a` relative to DIR_A, `b` relative to DIR_B.
-    for e in &cfg.policy.pairing.pairs {
-        for (x, y) in [(&e.a, &e.b), (&e.b, &e.a)] {
-            if sa.by_key.values().any(|v| v == x) && sb.by_key.values().any(|v| v == y) {
-                sa.take(x);
-                sb.take(y);
-                pairs.push((x.clone(), y.clone()));
-                break;
-            }
-        }
-    }
-    let mut only_a = Vec::new();
-    let mut only_b = Vec::new();
-    for (k, ia) in &sa.by_key {
-        match sb.by_key.get(k) {
-            Some(ib) => pairs.push((ia.clone(), ib.clone())),
-            None => only_a.push(sa.display(ia)),
-        }
-    }
-    for (k, ib) in &sb.by_key {
-        if !sa.by_key.contains_key(k) {
-            only_b.push(sb.display(ib));
-        }
-    }
     let mut reports = Vec::new();
-    for (ia, ib) in &pairs {
-        let a = sa.read(ia, cfg)?;
-        let b = sb.read(ib, cfg)?;
+    for p in &t.pairs {
+        let (a, b) = t.read(p, cfg).map_err(|e| e.0)?;
         reports.push(pipe.run(&a, Some(&b), &opts));
     }
-    let ambiguous: Vec<serde_json::Value> = [(&sa, "A"), (&sb, "B")]
+    let (only_a, only_b) = (t.only_a, t.only_b);
+    let ambiguous: Vec<serde_json::Value> = t
+        .ambiguous
         .iter()
-        .flat_map(|(s, side)| {
-            s.ambiguous.iter().map(move |(k, ids)| {
-                serde_json::json!({
-                    "side": side,
-                    "key": k,
-                    "ids": ids.iter().map(|i| s.display(i)).collect::<Vec<_>>(),
-                })
-            })
-        })
+        .map(|a| serde_json::json!({ "side": a.side, "key": a.key, "ids": a.ids }))
         .collect();
-    let no_dialect: Vec<String> = sa
-        .no_dialect
-        .iter()
-        .map(|i| sa.display(i))
-        .chain(sb.no_dialect.iter().map(|i| sb.display(i)))
-        .collect();
+    let no_dialect = t.no_dialect;
     // Most severe first.
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
@@ -442,19 +295,41 @@ fn tree(
         }
         pipe.add_paths(paths.iter().map(String::as_str));
     }
-    let reports = pipe.redact_reports(reports);
+    let complete =
+        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
+    let reports = pipe.redact_reports(reports)?;
+    // Everything printed outside the reports goes through the redactor too.
+    let mut extra = serde_json::json!({
+        "only_a": only_a,
+        "only_b": only_b,
+        "ambiguous": ambiguous,
+        "no_dialect": no_dialect,
+        "provenance": cfg.layers,
+    });
+    pipe.redact_json(&mut extra)?;
+    let strings = |v: &serde_json::Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect()
+    };
+    let only_a = strings(&extra["only_a"]);
+    let only_b = strings(&extra["only_b"]);
+    let no_dialect = strings(&extra["no_dialect"]);
+    let ambiguous: Vec<serde_json::Value> =
+        extra["ambiguous"].as_array().cloned().unwrap_or_default();
     let mut out = String::new();
     match format {
         Format::Json => {
-            let mut v = serde_json::json!({
+            let v = serde_json::json!({
                 "pairs": reports,
                 "only_a": only_a,
                 "only_b": only_b,
                 "ambiguous": ambiguous,
                 "no_dialect": no_dialect,
-                "provenance": cfg.layers,
+                "provenance": extra["provenance"],
             });
-            pipe.redact_json(&mut v);
             let _ = writeln!(out, "{}", serde_json::to_string_pretty(&v).unwrap());
         }
         Format::Sarif => {
@@ -505,10 +380,7 @@ fn tree(
             }
         }
     }
-    pipe.verify(&out)?;
     print!("{out}");
-    let complete =
-        only_a.is_empty() && only_b.is_empty() && ambiguous.is_empty() && no_dialect.is_empty();
     Ok(exit_for(if complete {
         worst
     } else {

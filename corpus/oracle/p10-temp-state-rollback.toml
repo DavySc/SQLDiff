@@ -1,0 +1,25 @@
+case = "p10-temp-state-rollback"
+pairs = [["tsql", "pg"]]
+observe = ["item_price(item_id, unit_price)", "audit_event(table_name, key_value, action)"]
+faults = ["item_price", "audit_event"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO item (item_id, name) VALUES (2, 'nut');
+INSERT INTO item_price (item_id, unit_price) VALUES (1, 5.00);
+INSERT INTO item_price (item_id, unit_price) VALUES (2, 6.00);
+"""
+
+[[scenario]]
+name = "valid feed"
+seed = "INSERT INTO price_feed (item_id, unit_price) VALUES (1, 5.50);"
+call.tsql = "EXEC dbo.apply_price_feed;"
+call.pg = "CALL apply_price_feed();"
+
+[[scenario]]
+name = "feed with a non-positive price"
+seed = """
+INSERT INTO price_feed (item_id, unit_price) VALUES (1, 5.50);
+INSERT INTO price_feed (item_id, unit_price) VALUES (2, 0.00);
+"""
+call.tsql = "EXEC dbo.apply_price_feed;"
+call.pg = "CALL apply_price_feed();"

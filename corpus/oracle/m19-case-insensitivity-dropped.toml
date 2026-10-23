@@ -1,0 +1,10 @@
+case = "m19-case-insensitivity-dropped"
+pairs = [["original", "mutated"]]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at) VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+"""
+
+[[scenario]]
+name = "different case"
+call.tsql = "SELECT dbo.customer_by_email('Ann@Example.COM');"
+call.pg = "SELECT customer_by_email('Ann@Example.COM');"

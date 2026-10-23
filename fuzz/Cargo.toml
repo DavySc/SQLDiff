@@ -1,0 +1,32 @@
+# cargo-fuzz targets (nightly only): `cargo +nightly fuzz run parse_bytes`.
+# Kept out of the main workspace so stable builds never see libfuzzer.
+[package]
+name = "sqldiff-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sqldiff-syntax = { path = "../crates/sqldiff-syntax" }
+sqldiff-corpus = { path = "../crates/sqldiff-corpus" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "parse_bytes"
+path = "fuzz_targets/parse_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_grammar"
+path = "fuzz_targets/parse_grammar.rs"
+test = false
+doc = false
+bench = false

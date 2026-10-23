@@ -1,0 +1,14 @@
+case = "p13-named-lock"
+pairs = [["tsql", "pg"]]
+observe = ["price_feed(item_id, unit_price)"]
+faults = ["price_feed:delete"]
+seed = """
+INSERT INTO price_feed (item_id, unit_price) VALUES (1, 5.00);
+INSERT INTO price_feed (item_id, unit_price) VALUES (2, 0.00);
+INSERT INTO price_feed (item_id, unit_price) VALUES (3, -1.00);
+"""
+
+[[scenario]]
+name = "purge"
+call.tsql = "EXEC dbo.purge_bad_feed;"
+call.pg = "CALL purge_bad_feed();"
