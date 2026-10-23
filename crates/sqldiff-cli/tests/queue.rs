@@ -77,6 +77,7 @@ fn ledger_comment_and_link() {
     let (_, two) = sqldiff(&["comment", &a, &b]);
     assert_eq!(code, 0);
     assert_eq!(one, two);
+    // Equivalence adds an `equiv.unproven` finding for the UPDATE (ItemId vs item_id).
     assert!(
         one.starts_with("SQLDiff found 3 issues to review."),
         "{one}"

@@ -16,6 +16,7 @@ pub mod model;
 pub mod normalize;
 pub mod phrase;
 pub mod render;
+pub mod rules;
 pub mod session;
 pub mod treediff;
 

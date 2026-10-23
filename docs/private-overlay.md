@@ -159,8 +159,27 @@ Check the list against the repository whenever you change it:
 SQLDIFF_DENYLIST="$(sqldiff pack deny-list --isolated --user-config <config>)" scripts/leak-scan.sh
 ```
 
-Add the same list as the repository secret `SQLDIFF_DENYLIST` so CI scans pull
-requests too. Without the secret, CI skips the scan.
+### CI gets hashes, not terms
+
+CI scans the tree and every commit of a push or pull request, but it never sees
+the terms. Store salted SHA-256 hashes of them as the repository secret
+`SQLDIFF_DENYHASHES`:
+
+```sh
+sqldiff pack deny-hashes --isolated --user-config <config> | gh secret set SQLDIFF_DENYHASHES
+```
+
+`sqldiff pack scan` hashes every substring of each listed length and reports
+the file and line of a match, never the term. Matching is the same as the
+hooks': anywhere in the text, ignoring ASCII case. Re-run the command whenever
+the deny-list changes; each run uses a fresh salt.
+
+The hashes are not a reason to publish the list. A short term (a ticket number,
+a common surname) can be found by hashing guesses, so the hashes stay in the
+secret. What they buy is that the plain terms never leave your machine.
+
+On pushes and on pull requests from this repository a missing secret fails the
+scan. Pull requests from forks get no secrets, so there the scan is skipped.
 
 ## What the protection cannot do
 
@@ -179,7 +198,9 @@ requests too. Without the secret, CI skips the scan.
 `scripts/test-hooks.sh` builds a throwaway repository and a local bare "remote"
 with synthetic terms and verifies that each protection fires: staged content,
 commit messages, identities, a bypassed commit at push time, a leak buried in
-history, a clean push, and strict mode without a deny-list. CI runs it, and you
+history, a clean push, strict mode without a deny-list, and the same cases for
+the hashed list CI uses (including that a failing scanner never reports
+clean). CI runs it, and you
 can run it after changing any script in `scripts/`.
 
 ## If something private does get pushed
