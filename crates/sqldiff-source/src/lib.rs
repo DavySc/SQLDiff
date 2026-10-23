@@ -14,6 +14,7 @@
 //!   session-local assumption flips and GUI deep links.
 
 pub mod bundle;
+pub mod compose;
 pub mod config;
 mod error;
 pub mod fs;

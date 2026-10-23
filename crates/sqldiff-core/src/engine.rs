@@ -243,7 +243,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     })
 }
 
-fn finish(mut r: Report) -> Report {
+pub(crate) fn finish(mut r: Report) -> Report {
     // Same fingerprint twice (e.g. the same residue on two lines): keep both, they have different locations.
     r.findings.sort_by(|x, y| {
         y.severity

@@ -289,6 +289,11 @@ pub fn ledger_by(
                 Source::Session,
                 Some("denied in this session".into()),
             ),
+            (None, Some(AssumptionSource::ComposedOutput)) => (
+                Status::Discharged,
+                Source::Composition,
+                Some("proven from composed output".into()),
+            ),
             (None, _) if declared.contains_key(&id) => (
                 Status::Declared,
                 Source::Config,

@@ -74,6 +74,7 @@ pub fn run_with(
         let a = src.load_artifact(&x.a)?;
         let b = src.load_artifact(&x.b)?;
         let mut r = sqldiff_core::diff(&a, &b, &opts);
+        crate::compose::apply_source(&mut r, src, (&x.a, &a), (&x.b, &b), &cfg.policy, &opts);
         policy::add_limits(&mut r, &a, Some(&b), cfg);
         policy::apply(&mut r, cfg);
         post(&mut r, &a, &b);
@@ -159,6 +160,8 @@ pub enum Status {
     Open,
     /// Declared in a pack, project config or on the command line.
     Declared,
+    /// Proven from composed output (a wrapper part states it); discharged.
+    Proven,
     /// Confirmed in this session.
     Confirmed,
     /// Denied in this session.
@@ -191,6 +194,7 @@ pub fn ledger(raw: &Report, flips: &Flips) -> Vec<LedgerEntry> {
                 (Some(true), _) => Status::Confirmed,
                 (Some(false), _) => Status::Denied,
                 (None, AssumptionSource::Declared) => Status::Declared,
+                (None, AssumptionSource::ComposedOutput) => Status::Proven,
                 (None, AssumptionSource::Default | AssumptionSource::Author) => Status::Open,
             };
             let mut other = flips.clone();

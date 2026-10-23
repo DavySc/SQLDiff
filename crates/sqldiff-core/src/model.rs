@@ -123,6 +123,9 @@ pub enum AssumptionSource {
     /// Stated by the author in a source comment (a pack author marker);
     /// open until someone resolves it.
     Author,
+    /// Proven from the composed output of a generator (a wrapper part
+    /// states the fact); discharged, not an open assumption.
+    ComposedOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

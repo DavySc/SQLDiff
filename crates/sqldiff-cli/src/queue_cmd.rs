@@ -350,6 +350,11 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                             LedgerStatus::Declared => "declared",
                             LedgerStatus::Confirmed => "confirmed",
                             LedgerStatus::Denied => "denied",
+                            LedgerStatus::Discharged
+                                if e.source == sqldiff_core::ledger::Source::Composition =>
+                            {
+                                "proven from composed output"
+                            }
                             LedgerStatus::Discharged => "proven from source",
                         };
                         println!("\n{}  [{status}]\n    {}", e.id, e.text);

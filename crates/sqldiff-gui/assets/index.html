@@ -390,7 +390,7 @@ async function setFlip(id, flip) {
 function applySession(x) { state.page.session = x.session; state.page.queue = x.queue; }
 
 function asmCard(a, pairScope) {
-  const tag = a.flip === "open" ? (a.source === "declared" ? "declared" : "tool default") : a.flip;
+  const tag = a.flip === "open" ? ({ declared: "declared", composed_output: "proven from composed output", author: "author-declared" }[a.source] || "tool default") : a.flip;
   const btn = (flip, text) => `<button data-flip="${flip}" data-id="${esc(a.id)}" ${state.live ? "" : "disabled"}>${text}</button>`;
   const acts = a.flip === "open" ? btn("denied", "Deny") + btn("confirmed", "Confirm") : btn("open", "Reset");
   const n = a.flips_verdict.length;
