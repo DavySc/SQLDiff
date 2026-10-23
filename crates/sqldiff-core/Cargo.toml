@@ -1,0 +1,15 @@
+[package]
+name = "sqldiff-core"
+description = "Deterministic semantic diff engine for SQL artifacts across dialects"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqldiff-syntax.workspace = true
+rowan.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+toml.workspace = true

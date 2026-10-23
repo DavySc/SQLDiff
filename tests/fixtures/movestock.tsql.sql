@@ -1,0 +1,11 @@
+CREATE PROCEDURE dbo.MoveStock @Item int, @Qty int AS
+BEGIN
+  SET NOCOUNT ON;
+  BEGIN TRAN;
+  UPDATE Stock SET Qty = Qty - @Qty WHERE ItemId = @Item;
+  IF @@ERROR <> 0 BEGIN ROLLBACK; RETURN 1; END
+  INSERT INTO StockLog (ItemId, Delta) VALUES (@Item, -@Qty);
+  IF @@ERROR <> 0 BEGIN ROLLBACK; RETURN 2; END
+  COMMIT;
+  RETURN 0;
+END
