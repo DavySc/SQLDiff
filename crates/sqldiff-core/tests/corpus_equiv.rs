@@ -13,6 +13,10 @@ use sqldiff_core::{diff, Artifact, Dialect, Options, Verdict};
 /// Expectations the engine does not reach yet: (case id, side a, side b).
 /// Each is still checked for soundness.
 const KNOWN_MISSES: &[(&str, &str, &str)] = &[
+    // A failed INSERT before `SET @id = SCOPE_IDENTITY()` continues with XACT_ABORT off;
+    // the error-path difference (an OUTPUT parameter set to NULL) needs the IR.
+    ("p07-insert-return-id", "tsql", "pg"),
+    ("p07-insert-return-id", "tsql", "db2i"),
     // Named-lock idioms (sp_getapplock, advisory locks, row-lock emulation) are not lifted.
     ("p13-named-lock", "tsql", "pg"),
     ("p13-named-lock", "tsql", "db2i"),

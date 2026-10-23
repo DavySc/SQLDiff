@@ -75,7 +75,10 @@ fn ledger_comment_and_link() {
     assert_eq!(code, 0);
     assert_eq!(one, two);
     // Equivalence adds an `equiv.unproven` finding for the UPDATE (ItemId vs item_id).
-    assert!(one.starts_with("SQLDiff found 2 issues to review."), "{one}");
+    assert!(
+        one.starts_with("SQLDiff found 2 issues to review."),
+        "{one}"
+    );
     assert!(one.contains("Please confirm the new behaviour is intended."));
 
     let (_, denied) = sqldiff(&["comment", &a, &b, "--deny", "ASM-CALLER-CHECKS-RC"]);

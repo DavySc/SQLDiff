@@ -139,11 +139,14 @@
   (form postgres
     (insert (table ?t) (cols ?c...) (values (row ?v...)) (returning (item (col ?ic))) (returning-into ?idv)))
   (unless postgres ?ic unknown)
+  (note postgres decision "If the INSERT fails, RETURNING INTO raises; T-SQL with XACT_ABORT OFF continues and sets the id to NULL (corpus p07). The conversion stops at the error instead.")
   (example
     (tsql "INSERT INTO dbo.orders (customer_id) VALUES (@Customer); SET @OrderId = SCOPE_IDENTITY();")
     (postgres "INSERT INTO orders (customer_id) VALUES (p_customer) RETURNING order_id INTO p_order_id;")
     (params (Customer int) (OrderId int))
-    (expect equal)))
+    ; Different by the oracle (p07): T-SQL continues after a failed INSERT. The engine
+    ; cannot show that yet (it needs the IR to model the OUTPUT parameter).
+    (expect unknown)))
 
 (idiom insert-identity/lastval
   (doc "Without a catalog the identity column is unknown: read the session's last sequence value.")
@@ -153,6 +156,7 @@
     (seq (insert (table ?t) (cols ?c...) (values (row ?v...)))
          (assign ?idv (call lastval)))
     (emit-only))
+  (note postgres decision "If the INSERT fails, PostgreSQL raises; T-SQL with XACT_ABORT OFF continues and sets the id to NULL (corpus p07). The conversion stops at the error instead.")
   (assume postgres ASM-LASTVAL-SAME-INSERT "No trigger on the target inserts into another table with a sequence, so lastval() is the key of this INSERT (SCOPE_IDENTITY ignores triggers; lastval does not)"))
 
 ; -------------------------------------------------------------- named locks

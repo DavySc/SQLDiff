@@ -72,6 +72,8 @@ pub struct Unit {
     pub uncovered: Vec<(SyntaxNode, String)>,
     /// Explicit transaction control or a recognised rollback-and-rethrow protocol.
     pub txn_control: bool,
+    /// T-SQL `SET XACT_ABORT ON` in the routine: a failed statement ends it.
+    pub xact_abort_on: bool,
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
     pub notes: Vec<String>,
@@ -90,6 +92,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         stmts: Vec::new(),
         uncovered: Vec::new(),
         txn_control: false,
+        xact_abort_on: false,
         txn_stmts: Vec::new(),
         notes: Vec::new(),
     };
@@ -532,7 +535,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 u.txn_stmts.push((c.clone(), kind));
             }
         }
-        StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => u.txn_control = true,
+        StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => {
+            u.txn_control = true;
+            u.xact_abort_on = true;
+        }
         _ => {
             let what = format!(
                 "{} `{}`",
