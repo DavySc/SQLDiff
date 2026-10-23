@@ -132,12 +132,20 @@ targets = ["tsql", "db2i"]
 message = "PL/pgSQL-only statement"
 pattern = ["word:PERFORM|RAISE"]
 
+# STRING_AGG is T-SQL too (SQL Server 2017+); NOW() and ARRAY_AGG exist in Db2 for i.
 [[rule]]
 id = "pg.builtin"
 origin = "postgres"
-targets = ["tsql", "db2i"]
+targets = ["tsql"]
 message = "PostgreSQL built-in function"
-pattern = ["word:NOW|CLOCK_TIMESTAMP|STATEMENT_TIMESTAMP|GEN_RANDOM_UUID|STRING_AGG|ARRAY_AGG|PG_ADVISORY_XACT_LOCK|PG_ADVISORY_LOCK", "text:("]
+pattern = ["word:NOW|CLOCK_TIMESTAMP|STATEMENT_TIMESTAMP|GEN_RANDOM_UUID|ARRAY_AGG|PG_ADVISORY_XACT_LOCK|PG_ADVISORY_LOCK", "text:("]
+
+[[rule]]
+id = "pg.builtin"
+origin = "postgres"
+targets = ["db2i"]
+message = "PostgreSQL built-in function"
+pattern = ["word:CLOCK_TIMESTAMP|STATEMENT_TIMESTAMP|GEN_RANDOM_UUID|STRING_AGG|PG_ADVISORY_XACT_LOCK|PG_ADVISORY_LOCK", "text:("]
 
 [[rule]]
 id = "pg.clause"

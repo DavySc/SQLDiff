@@ -6,8 +6,10 @@ description = """
 T-SQL relies on a case-insensitive collation; the conversions emulate it with
 lower() / UPPER(). The emulation restores case-insensitivity but not the T-SQL
 rule that trailing spaces are ignored by `=`.
-Note: the unique index on email is case-sensitive in PostgreSQL, so lower(email)
-can match several rows there; the SQL function then silently returns the first.
+Note: the unique index on email is case-sensitive in PostgreSQL and Db2 for i, so
+lower(email) / UPPER(email) can match several rows there; the PostgreSQL SQL function
+then silently returns the first, and the Db2 scalar subquery raises an error.
+Blank padding (V8) makes Db2 agree with T-SQL on trailing spaces.
 """
 
 [sides.tsql]
@@ -36,14 +38,16 @@ witnesses = [
 [[expect]]
 a = "tsql"
 b = "db2i"
-verdict = "equal-under-assumptions"
-classes = ["semantic"]
+verdict = "different"
+classes = ["cardinality"]
 assumptions = [
   "T-SQL database collation is case-insensitive",
-  "Db2 for i pads the shorter VARCHAR with blanks when comparing",
   "UPPER and the T-SQL collation fold the same characters",
 ]
 facts = ["V8"]
+witnesses = [
+  "If 'A@example.com' and 'a@example.com' are both stored (allowed by the case-sensitive unique index on Db2 for i), the Db2 scalar subquery raises a cardinality error; T-SQL's case-insensitive unique index allows only one of them, so T-SQL returns its id.",
+]
 
 [[expect]]
 a = "pg"

@@ -149,6 +149,12 @@ pub fn report_key(a: &Artifact, b: Option<&Artifact>, opts: &Options, cfg: &Reso
     h.update(build_id().as_bytes());
     h.update([0]);
     h.update(opts.excerpt_lines.to_le_bytes());
+    for (tag, cat) in [(b"CA", &opts.catalog_a), (b"CB", &opts.catalog_b)] {
+        for c in cat.iter() {
+            h.update(tag);
+            artifact_part(&mut h, c);
+        }
+    }
     for l in &cfg.layers {
         h.update(l.hash.as_bytes());
         h.update([0]);

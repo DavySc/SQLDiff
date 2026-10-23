@@ -3,16 +3,21 @@
 //! Exit codes: 0 equal (or equal under assumptions), 1 different or
 //! unknown, 2 usage or I/O error.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use sqldiff_core::composition;
+use sqldiff_core::model::Side as ReportSide;
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
+use sqldiff_syntax::template::{ExpandProblem, SegmentKind, Template};
 
-use sqldiff_source::{tree, Resolved};
+use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
 
+mod deny_hash;
 mod queue_cmd;
 mod review_cmd;
 mod source_cmd;
@@ -58,6 +63,28 @@ enum Command {
         /// Maximum excerpt lines per location (default: config, else 3).
         #[arg(long)]
         excerpt_lines: Option<usize>,
+        /// DDL file (CREATE TABLE, CREATE UNIQUE INDEX) describing the catalog
+        /// both sides run against, read in each side's dialect. Repeatable.
+        /// Keys, nullability and column types discharge equivalence side conditions.
+        #[arg(long, value_name = "FILE")]
+        catalog: Vec<PathBuf>,
+        /// Catalog DDL for side A only. Repeatable.
+        #[arg(long, value_name = "FILE")]
+        catalog_a: Vec<PathBuf>,
+        /// Catalog DDL for side B only. Repeatable.
+        #[arg(long, value_name = "FILE")]
+        catalog_b: Vec<PathBuf>,
+        /// Check mode: templates by name (file stem) for the composed parts;
+        /// each generated part is compared with its substituted template.
+        #[arg(long, value_name = "DIR")]
+        templates: Option<PathBuf>,
+        /// Extra parameter value for check mode (source `cli`): NAME=VALUE.
+        #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value, requires = "templates")]
+        params: Vec<(String, String)>,
+        /// Both sides are templates in the pack's `[template]` syntax: diff
+        /// their SQL fragments, with locations in the templates.
+        #[arg(long, conflicts_with = "templates")]
+        template: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
         #[command(flatten)]
@@ -72,10 +99,37 @@ enum Command {
         dialect: Option<Dialect>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        /// Check mode for composed output: templates by name (file stem).
+        #[arg(long, value_name = "DIR")]
+        templates: Option<PathBuf>,
+        /// Extra parameter value for check mode (source `cli`): NAME=VALUE.
+        #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value, requires = "templates")]
+        params: Vec<(String, String)>,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
         #[command(flatten)]
         review: ReviewArgs,
+    },
+    /// Read a template with the pack's `[template]` syntax: list its
+    /// placeholders and special forms, parse its SQL fragment and verify the
+    /// round trip; with --render, print the output for the --param values.
+    Template {
+        file: PathBuf,
+        #[arg(short, long)]
+        dialect: Option<Dialect>,
+        /// Parameter value: NAME=VALUE. Repeatable. With --known-only,
+        /// placeholder candidates that name no parameter are kept as SQL and
+        /// reported as unresolved (for syntaxes that collide with SQL).
+        #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value)]
+        params: Vec<(String, String)>,
+        /// Resolve placeholder candidates against the --param names.
+        #[arg(long)]
+        known_only: bool,
+        /// Print the substituted output instead of the summary.
+        #[arg(long)]
+        render: bool,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
     },
     /// Parse one artifact, verify the lossless round trip and optionally dump the tree.
     Parse {
@@ -117,6 +171,151 @@ fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Artifac
     tree::read(path, dialect, cfg).map_err(|e| e.0)
 }
 
+fn template_dir(
+    dir: Option<&Path>,
+    params: Vec<(String, String)>,
+) -> Result<Option<compose::TemplateDir>, String> {
+    dir.map(|d| compose::TemplateDir::new(d).map(|t| t.with_params(params.into_iter().collect())))
+        .transpose()
+        .map_err(|e| e.0)
+}
+
+fn template_syntax(cfg: &Resolved) -> Result<sqldiff_syntax::template::Compiled, String> {
+    let t = cfg
+        .policy
+        .template
+        .as_ref()
+        .ok_or("no [template] syntax in the loaded packs or config")?;
+    compose::compile(t).map_err(|e| e.0)
+}
+
+/// Template-level diff: the SQL fragments of two templates, located in the templates.
+fn template_diff(
+    a: &Artifact,
+    b: &Artifact,
+    cfg: &Resolved,
+    opts: &Options,
+) -> Result<Report, String> {
+    let syntax = template_syntax(cfg)?;
+    let ta = Template::parse(&a.text, &syntax, None);
+    let tb = Template::parse(&b.text, &syntax, None);
+    let (fa, fb) = (ta.fragment(), tb.fragment());
+    let mut xa = a.clone();
+    xa.text = fa.text.clone();
+    let mut xb = b.clone();
+    xb.text = fb.text.clone();
+    let mut r = sqldiff_core::diff(&xa, &xb, opts);
+    composition::remap_to_template(
+        &mut r,
+        ReportSide::A,
+        &ta,
+        &fa,
+        a.dialect,
+        opts.excerpt_lines,
+    );
+    composition::remap_to_template(
+        &mut r,
+        ReportSide::B,
+        &tb,
+        &fb,
+        b.dialect,
+        opts.excerpt_lines,
+    );
+    Ok(tree::with_policy(r, a, Some(b), cfg))
+}
+
+fn template_cmd(
+    art: &Artifact,
+    params: &BTreeMap<String, String>,
+    known_only: bool,
+    render: bool,
+    cfg: &Resolved,
+) -> Result<ExitCode, String> {
+    let syntax = template_syntax(cfg)?;
+    let known: BTreeSet<String> = params.keys().cloned().collect();
+    let t = Template::parse(&art.text, &syntax, known_only.then_some(&known));
+    if t.print() != art.text {
+        return Err("round trip failed: template segments differ from input".into());
+    }
+    let lines = sqldiff_syntax::LineIndex::new(&art.text);
+    let unresolved: Vec<_> = t.unresolved().collect();
+    if render {
+        let mut problems: Vec<(usize, String)> = unresolved
+            .iter()
+            .map(|s| {
+                (
+                    s.start,
+                    format!("unresolved `{}`: not a parameter", t.slice(s)),
+                )
+            })
+            .collect();
+        match t.substitute(params) {
+            Ok(out) if problems.is_empty() => {
+                print!("{}", out.text);
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(_) => {}
+            Err(e) => problems.extend(e.iter().map(|p| {
+                let off = match p {
+                    ExpandProblem::MissingParameter { offset, .. }
+                    | ExpandProblem::SpecialForm { offset, .. } => *offset,
+                };
+                (off, p.to_string())
+            })),
+        }
+        problems.sort();
+        for (off, msg) in problems {
+            let (l, c) = lines.line_col(off);
+            eprintln!("{}:{l}:{c}: {msg}", art.path);
+        }
+        return Ok(ExitCode::from(1));
+    }
+    for s in &t.segments {
+        let (l, c) = lines.line_col(s.start);
+        match &s.kind {
+            SegmentKind::Sql => {}
+            SegmentKind::Placeholder { name } => {
+                println!("{}:{l}:{c}: placeholder {name}", art.path)
+            }
+            SegmentKind::Special { form, args } => {
+                println!(
+                    "{}:{l}:{c}: special form {form} {}",
+                    art.path,
+                    args.join(" ")
+                )
+            }
+            SegmentKind::Unresolved { name } => println!(
+                "{}:{l}:{c}: unresolved `{}`: {name} is not a parameter; kept as SQL",
+                art.path,
+                t.slice(s)
+            ),
+        }
+    }
+    let (parse, diags) = t.fragment().parse(art.dialect);
+    for d in &diags {
+        let (l, c) = lines.line_col(d.offset);
+        eprintln!("{}:{l}:{c}: {}", art.path, d.message);
+    }
+    let statements = parse
+        .syntax()
+        .descendants()
+        .filter(|n| n.kind().is_unit())
+        .count();
+    eprintln!(
+        "{}: {} parameters, {statements} statements in the fragment, {} diagnostics, round trip ok",
+        art.path,
+        t.parameters().len(),
+        diags.len()
+    );
+    Ok(ExitCode::from(
+        if diags.is_empty() && unresolved.is_empty() {
+            0
+        } else {
+            1
+        },
+    ))
+}
+
 fn exit_for(verdict: Verdict) -> ExitCode {
     match verdict {
         Verdict::Equal | Verdict::EqualUnderAssumptions => ExitCode::from(0),
@@ -156,16 +355,45 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
+            catalog,
+            catalog_a,
+            catalog_b,
+            templates,
+            params,
+            template,
             cfg,
             review,
         } => {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
             let b = read(&b, dialect_b.or(dialect), &cfg)?;
+            let ddl = |paths: &[PathBuf], d: Dialect| -> Result<Vec<Artifact>, String> {
+                paths
+                    .iter()
+                    .map(|p| {
+                        let text = std::fs::read_to_string(p)
+                            .map_err(|e| format!("{}: {e}", p.display()))?;
+                        Ok(Artifact::new(p.display().to_string(), d, text))
+                    })
+                    .collect()
+            };
+            let mut cat_a = ddl(&catalog, a.dialect)?;
+            cat_a.extend(ddl(&catalog_a, a.dialect)?);
+            let mut cat_b = ddl(&catalog, b.dialect)?;
+            cat_b.extend(ddl(&catalog_b, b.dialect)?);
             let opts = Options {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
+                catalog_a: cat_a,
+                catalog_b: cat_b,
             };
             let mut pipe = Pipeline::new(cfg, &review)?;
+            if template {
+                let report = template_diff(&a, &b, &pipe.cfg, &opts)?;
+                let verdict = report.open_verdict();
+                emit(report, format, &mut pipe)?;
+                return Ok(exit_for(verdict));
+            }
+            pipe.templates = template_dir(templates.as_deref(), params)?;
             let report = pipe.run(&a, Some(&b), &opts);
             let verdict = report.open_verdict();
             emit(report, format, &mut pipe)?;
@@ -175,16 +403,37 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             file,
             dialect,
             format,
+            templates,
+            params,
             cfg,
             review,
         } => {
             let cfg = cfg.resolve()?;
             let art = read(&file, dialect, &cfg)?;
             let mut pipe = Pipeline::new(cfg, &review)?;
+            pipe.templates = template_dir(templates.as_deref(), params)?;
             let report = pipe.run(&art, None, &pipe.options());
             let verdict = report.open_verdict();
             emit(report, format, &mut pipe)?;
             Ok(exit_for(verdict))
+        }
+        Command::Template {
+            file,
+            dialect,
+            params,
+            known_only,
+            render,
+            cfg,
+        } => {
+            let cfg = cfg.resolve()?;
+            let art = read(&file, dialect, &cfg)?;
+            template_cmd(
+                &art,
+                &params.into_iter().collect(),
+                known_only,
+                render,
+                &cfg,
+            )
         }
         Command::Parse {
             file,
@@ -255,6 +504,7 @@ fn tree(
     let t = tree::pair_dirs(dir_a, dir_b, da, db, cfg).map_err(|e| e.0)?;
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
     let mut reports = Vec::new();
     for p in &t.pairs {

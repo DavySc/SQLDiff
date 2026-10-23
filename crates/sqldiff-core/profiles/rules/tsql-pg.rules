@@ -1,0 +1,104 @@
+; T-SQL <-> PostgreSQL translations: direct, two-way rewrites without a
+; canonical node of their own (the implied canon is (~ID vars...)). They are
+; for conversion only; analysis lifts idioms, not translations.
+
+(functions postgres
+  count sum min max avg coalesce nullif greatest least upper lower abs round floor ceil ceiling
+  mod power sqrt exp ln length rtrim ltrim btrim trim replace substring substr strpos left right
+  lpad rpad reverse concat repeat statement_timestamp clock_timestamp now gen_random_uuid string_agg
+  pg_advisory_xact_lock pg_advisory_lock hashtext lastval date_trunc to_char)
+
+(functions tsql
+  count sum min max avg coalesce nullif upper lower abs round floor ceiling len ltrim rtrim replace
+  substring charindex left right isnull iif sysdatetime getdate newid scope_identity string_agg
+  datediff dateadd datepart concat replicate reverse)
+
+(translate dbo-schema
+  (doc "dbo.x is x: the PostgreSQL objects live in the search path's first schema.")
+  (form tsql (name dbo ?x))
+  (form postgres (name ?x) (emit-only))
+  (assume tsql ASM-DBO-SCHEMA "Objects in schema dbo are created in the PostgreSQL schema first on the search path"))
+
+(translate isnull/coalesce
+  (form tsql (call isnull ?a ?b))
+  (form postgres (call coalesce ?a ?b))
+  (assume tsql ASM-ISNULL-TYPE "The replacement fits the type of the first argument (ISNULL converts it to that type; COALESCE takes the wider type)")
+  (example (tsql "SELECT ISNULL(first_name, '') AS n FROM dbo.customer;")
+           (postgres "SELECT coalesce(first_name, '') AS n FROM customer;")
+           (expect equal)))
+
+(translate len/length
+  (doc "LEN ignores trailing spaces.")
+  (form tsql (call len ?a))
+  (form postgres (call length (call rtrim ?a)))
+  (example (tsql "SELECT LEN(last_name) AS n FROM dbo.customer;")
+           (postgres "SELECT length(rtrim(last_name)) AS n FROM customer;")
+           (expect unknown)))
+
+(translate charindex/strpos
+  (form tsql (call charindex ?needle ?hay))
+  (form postgres (call strpos ?hay ?needle))
+  (assume tsql ASM-TSQL-CI-COLLATION "T-SQL string comparisons use a case-insensitive collation")
+  (note postgres assumptions "CHARINDEX follows the column collation (usually case-insensitive); strpos is case-sensitive."))
+
+(translate newid/gen-random-uuid
+  (form tsql (call newid))
+  (form postgres (call gen_random_uuid)))
+
+(translate iif/case
+  (form tsql (call iif ?c ?x ?y))
+  (form postgres (case (when ?c ?x) (else ?y))))
+
+(translate sysdatetime/statement-timestamp
+  (form tsql (call sysdatetime))
+  (form postgres (call statement_timestamp))
+  (assume tsql ASM-TSQL-SYSDATETIME-PER-STATEMENT "SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20)"))
+
+(translate plus/concat
+  (doc "T-SQL `+` concatenates when an operand is visibly a string.")
+  (form tsql (+ ?a ?b) (let ?s (?fn stringy ?a ?b)) (lift-only))
+  (form postgres (|| ?a ?b))
+  (assume tsql ASM-TSQL-PLUS-IS-CONCAT "Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates"))
+
+(translate string-agg/within-group
+  (form tsql (call string_agg ?x ?sep (within-group ?o...)))
+  (form postgres (call string_agg ?x ?sep (order ?o...)))
+  (assume tsql ASM-TSQL-STRING-AGG-8000 "The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that)")
+  (example (tsql "SELECT order_id, STRING_AGG(CAST(item_id AS varchar(12)), ',') WITHIN GROUP (ORDER BY line_no) AS items FROM dbo.order_line GROUP BY order_id;")
+           (postgres "SELECT order_id, string_agg(CAST(item_id AS varchar(12)), ',' ORDER BY line_no) AS items FROM order_line GROUP BY order_id;")
+           (expect equal-under-assumptions)))
+
+(translate datediff-day/date-minus
+  (doc "DATEDIFF(day, a, b) counts day boundaries: the difference of the dates.")
+  (form tsql (call datediff (col (?or day dd d)) ?x ?y) (lift-only))
+  (form postgres (- (cast ?y (type date)) (cast ?x (type date)))))
+
+(translate top/limit
+  (example (tsql "SELECT TOP (10) order_id FROM dbo.orders ORDER BY created_at DESC, order_id DESC;")
+           (postgres "SELECT order_id FROM orders ORDER BY created_at DESC, order_id DESC LIMIT 10;")
+           (expect equal))
+  (form tsql (select (top ?n) ?rest...) (lift-only))
+  (form postgres (select ?rest... (limit ?n))))
+
+(translate top-distinct/limit
+  (priority 1)
+  (form tsql (select (distinct) (top ?n) ?rest...) (lift-only))
+  (form postgres (select (distinct) ?rest... (limit ?n))))
+
+(translate select-assign/into
+  (priority 2)
+  (doc "SELECT @v = e FROM ... is SELECT e INTO v FROM ... when one row qualifies.")
+  (form tsql (select (items (assign-item ?v ?e)) ?rest...) (lift-only))
+  (form postgres (select (items (item ?e)) (into ?v) ?rest...))
+  (assume tsql ASM-SINGLE-ROW "The query returns exactly one row (with none, T-SQL keeps the variable and PostgreSQL sets it to NULL; with several, they keep different rows)"))
+
+(translate select-assign2/into
+  (priority 2)
+  (form tsql (select (items (assign-item ?v ?e) (assign-item ?w ?f)) ?rest...) (lift-only))
+  (form postgres (select (items (item ?e) (item ?f)) (into ?v ?w) ?rest...))
+  (assume tsql ASM-SINGLE-ROW "The query returns exactly one row (with none, T-SQL keeps the variable and PostgreSQL sets it to NULL; with several, they keep different rows)"))
+
+(translate nolock/plain-read
+  (form tsql (table ?n (?opt (alias ?al)) (hints nolock)) (lift-only))
+  (form postgres (table ?n (?opt (alias ?al))) (emit-only))
+  (note postgres decision "NOLOCK reads uncommitted rows; PostgreSQL always reads committed data, so the conversion can see fewer rows mid-transaction of others."))

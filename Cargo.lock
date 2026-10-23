@@ -474,6 +474,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "sqldiff-core",
  "sqldiff-review",
  "sqldiff-source",
@@ -495,6 +496,7 @@ dependencies = [
 name = "sqldiff-core"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "rowan",
  "serde",
  "serde_json",
@@ -570,6 +572,7 @@ dependencies = [
 name = "sqldiff-syntax"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "rowan",
 ]
 

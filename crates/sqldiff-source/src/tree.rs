@@ -56,12 +56,16 @@ pub fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Art
     )
 }
 
-/// Engine diff with pack policy: limit rules, overrides, declared assumptions.
+/// Engine diff with composition (pack markers) and pack policy: limit
+/// rules, overrides, declared assumptions.
 pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
-    with_policy(sqldiff_core::diff(a, b, &opts), a, Some(b), cfg)
+    let mut r = sqldiff_core::diff(a, b, &opts);
+    crate::compose::apply(&mut r, a, Some(b), &cfg.policy, None, &opts);
+    with_policy(r, a, Some(b), cfg)
 }
 
 /// Pack policy on an engine report.

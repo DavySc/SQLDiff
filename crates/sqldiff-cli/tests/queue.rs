@@ -74,7 +74,11 @@ fn ledger_comment_and_link() {
     let (_, two) = sqldiff(&["comment", &a, &b]);
     assert_eq!(code, 0);
     assert_eq!(one, two);
-    assert!(one.starts_with("SQLDiff found 1 issue to review."), "{one}");
+    // Equivalence adds an `equiv.unproven` finding for the UPDATE (ItemId vs item_id).
+    assert!(
+        one.starts_with("SQLDiff found 2 issues to review."),
+        "{one}"
+    );
     assert!(one.contains("Please confirm the new behaviour is intended."));
 
     let (_, denied) = sqldiff(&["comment", &a, &b, "--deny", "ASM-CALLER-CHECKS-RC"]);
@@ -120,9 +124,10 @@ fn accepted_findings_are_suppressed_and_unknown_pairs_still_need_review() {
         .iter()
         .find(|p| p["a"] == "movestock.tsql.sql" && p["b"] == "movestock.pg.sql")
         .unwrap();
-    assert_eq!(pg["findings"], 0);
+    // The `equiv.unproven` finding stays; the accepted one is suppressed.
+    assert_eq!(pg["findings"], 1);
     assert_eq!(pg["review"]["accepted"], 1);
-    // No finding left, but the verdict is still unknown: it needs review.
+    // Not proven equal: the verdict is still unknown, so the verdict is still unknown: it needs review.
     assert_eq!(pg["verdict"], "unknown");
     assert_eq!(pg["needs_review"], true);
     let (_, out) = sqldiff_in(
