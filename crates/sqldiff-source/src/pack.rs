@@ -222,6 +222,9 @@ pub enum MarkerKind {
     ReviewNote,
     IntentionalDifference,
     SyncPartner,
+    /// A premise the author states but has not verified; becomes an
+    /// author-declared assumption (design section 9).
+    Assumption,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

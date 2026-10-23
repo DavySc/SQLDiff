@@ -1,6 +1,6 @@
 [package]
 name = "sqldiff-gui"
-description = "Pair view: a local web UI over SQLDiff reports"
+description = "Review queue and pair view: a local web UI over SQLDiff reports"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 sqldiff-syntax.workspace = true
 sqldiff-core.workspace = true
+sqldiff-source.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+regex.workspace = true
 clap.workspace = true

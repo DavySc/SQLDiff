@@ -42,6 +42,10 @@ fn sqldiff(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sqldiff"))
         .args(args)
         .arg("--isolated")
+        .env(
+            "SQLDIFF_DATA_DIR",
+            std::env::temp_dir().join(format!("sqldiff-packs-data-{}", std::process::id())),
+        )
         .output()
         .unwrap()
 }
