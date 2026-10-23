@@ -150,7 +150,7 @@ reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing
 
 [[failing]]
 id = "p07-insert-return-id:tsql~pg"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+reason = "verdict unknown != different [WP3 error model + WP9: T-SQL continues after a failed INSERT]"
 
 [[failing]]
 id = "p07-insert-return-id:tsql~db2i"

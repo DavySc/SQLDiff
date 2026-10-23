@@ -2,12 +2,6 @@ case = "p07-insert-return-id"
 pairs = [["tsql", "pg"]]
 observe = ["orders(order_id, customer_id, status)"]
 faults = ["orders"]
-# The corpus says "equal", but when the INSERT fails, T-SQL (XACT_ABORT off)
-# reports the error and continues: the caller's batch goes on with
-# @OrderId = NULL. PostgreSQL raises and the caller's transaction is aborted.
-# Like p01, this needs either an assumption ("caller XACT_ABORT is on" or
-# "the INSERT cannot fail") or a "different" verdict.
-known_divergence = "a failing INSERT leaves @OrderId NULL in a T-SQL caller that continues; PostgreSQL raises"
 seed = """
 INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
 VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
