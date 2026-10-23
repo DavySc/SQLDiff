@@ -1733,6 +1733,35 @@ impl<'a> Binder<'a> {
         };
         if !elsewhere.is_empty() {
             let names: Vec<&str> = elsewhere.iter().map(|x| x.display_name()).collect();
+            if !builtins::of(d).known_absent(&word) {
+                // Not on the verified-absent list: the built-in list may just be incomplete.
+                let id = self.assume(
+                    format!("ASM-BUILTIN-ABSENT:{}", word.to_lowercase()),
+                    format!(
+                        "{} has no built-in function `{word}` (it is not on SQLDiff's built-in list)",
+                        d.display_name()
+                    ),
+                );
+                let msg = format!(
+                    "`{word}()` is a {} built-in and is not on SQLDiff's {} built-in list, and no helper or catalog routine provides it; if {} has no such function, the statement fails when it runs.",
+                    names.join("/"),
+                    d.display_name(),
+                    d.display_name()
+                );
+                self.issue(Issue {
+                    rule: "bind.unknown-builtin",
+                    class: ChangeClass::Binding,
+                    severity: Severity::Medium,
+                    proven: false,
+                    message: msg,
+                    start: span.0,
+                    end: span.1,
+                    key: format!("builtin {}", word.to_lowercase()),
+                    assumptions: vec![id.clone()],
+                });
+                self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
+                return;
+            }
             let msg = format!(
                 "`{word}()` is a {} built-in; {} has no function of that name and no helper or catalog routine provides one, so the statement fails when it runs.",
                 names.join("/"),

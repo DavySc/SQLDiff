@@ -396,3 +396,151 @@ fn identity_options_are_not_a_query() {
         rules(&r)
     );
 }
+
+fn check_rules(d: Dialect, text: &str, catalog: Option<&str>) -> sqldiff_core::Report {
+    let o = Options {
+        catalog_a: catalog
+            .map(|c| vec![Artifact::new("c.sql", d, c)])
+            .unwrap_or_default(),
+        ..Options::default()
+    };
+    sqldiff_core::check(&Artifact::new("x.sql", d, text), &o)
+}
+
+/// T-SQL variables live for the whole batch, loops and CATCH included.
+#[test]
+fn tsql_loop_is_not_a_scope() {
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  WHILE 1 = 1\n  BEGIN\n    DECLARE @x int = 1;\n    BREAK;\n  END\n  SELECT @x;\n  BEGIN TRY SELECT 1; END TRY\n  BEGIN CATCH DECLARE @e int = 1; END CATCH\n  SELECT @e;\nEND";
+    let r = check_rules(Dialect::Tsql, src, None);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let dup = "CREATE PROCEDURE p AS\nBEGIN\n  DECLARE @x int;\n  WHILE 1 = 1\n  BEGIN\n    DECLARE @x int;\n    BREAK;\n  END\nEND";
+    let r = check_rules(Dialect::Tsql, dup, None);
+    assert!(
+        has(
+            &r,
+            "bind.duplicate-declaration",
+            ChangeClass::Binding,
+            Verdict::Different
+        ),
+        "{:?}",
+        rules(&r)
+    );
+}
+
+/// Ordinals count within the routine: an unrelated routine added in front
+/// does not make unchanged references look rebound.
+#[test]
+fn rebound_ignores_other_routines() {
+    let g = "CREATE FUNCTION g() RETURNS int LANGUAGE plpgsql AS $$\nDECLARE n int := 0;\nBEGIN\n  DECLARE n int := 1;\n  BEGIN\n    n := 2;\n  END;\n  RETURN n;\nEND;\n$$;\n";
+    let h = "CREATE FUNCTION h() RETURNS int LANGUAGE plpgsql AS $$\nDECLARE n int := 5;\nBEGIN\n  RETURN n;\nEND;\n$$;\n";
+    let a = Artifact::new("a.sql", Dialect::Postgres, g);
+    let b = Artifact::new("b.sql", Dialect::Postgres, format!("{h}{g}"));
+    let r = diff(&a, &b, &Options::default());
+    assert!(
+        !r.findings.iter().any(|f| f.rule == "bind.rebound-variable"),
+        "{:?}",
+        rules(&r)
+    );
+}
+
+/// Catalog files fold in order: a later ALTER TABLE applies to an earlier CREATE.
+#[test]
+fn catalog_files_fold_in_order() {
+    let d = Dialect::Postgres;
+    let o = Options {
+        catalog_a: vec![
+            Artifact::new("001.sql", d, "CREATE TABLE t (a int);"),
+            Artifact::new("002.sql", d, "ALTER TABLE t ADD COLUMN b int;"),
+        ],
+        ..Options::default()
+    };
+    let r = sqldiff_core::check(&Artifact::new("x.sql", d, "SELECT a, b FROM t;"), &o);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let r = sqldiff_core::check(&Artifact::new("x.sql", d, "SELECT c FROM t;"), &o);
+    assert!(has(
+        &r,
+        "bind.unknown-column",
+        ChangeClass::Binding,
+        Verdict::Different
+    ));
+}
+
+/// Built-ins missing from the list are not proven errors; verified-absent ones are.
+#[test]
+fn builtin_list_gaps_are_assumptions() {
+    let r = check_rules(
+        Dialect::Tsql,
+        "SELECT BIT_COUNT(5), GET_BIT(5, 0), LEFT_SHIFT(1, 2);",
+        None,
+    );
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let r = check_rules(Dialect::Postgres, "SELECT regr_count(y, x) FROM t;", None);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    // An other-dialect name that is not verified absent: Unknown, with its assumption.
+    let r = check_rules(Dialect::Db2i, "VALUES ISNULL(1, 2);", None);
+    assert!(
+        has(
+            &r,
+            "bind.unknown-builtin",
+            ChangeClass::Binding,
+            Verdict::Unknown
+        ),
+        "{:?}",
+        rules(&r)
+    );
+    assert!(r
+        .assumptions
+        .iter()
+        .any(|a| a.id == "ASM-BUILTIN-ABSENT:isnull"));
+    let r = check_rules(Dialect::Postgres, "SELECT GETDATE();", None);
+    assert!(
+        has(
+            &r,
+            "bind.unknown-builtin",
+            ChangeClass::Binding,
+            Verdict::Different
+        ),
+        "{:?}",
+        rules(&r)
+    );
+}
+
+/// PL/pgSQL FOREACH assigns to a declared variable; it does not declare one.
+#[test]
+fn foreach_uses_declared_target() {
+    let ok = "CREATE FUNCTION f(a int[]) RETURNS int LANGUAGE plpgsql AS $$\nDECLARE x int; s int := 0;\nBEGIN\n  FOREACH x IN ARRAY a LOOP\n    s := s + x;\n  END LOOP;\n  RETURN s;\nEND;\n$$;";
+    let r = check_rules(Dialect::Postgres, ok, None);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+    let missing = ok.replace("DECLARE x int; s int := 0;", "DECLARE s int := 0;");
+    let r = check_rules(Dialect::Postgres, &missing, None);
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.rule.starts_with("bind.") && f.witness.contains("`x`")),
+        "{:?}",
+        rules(&r)
+    );
+}
+
+/// Every assumption a finding cites is in the report, with or without a catalog.
+#[test]
+fn cited_assumptions_are_reported() {
+    let with_temp = "CREATE FUNCTION f(id int) RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n  CREATE TEMP TABLE t (id int);\n  RETURN (SELECT id FROM t WHERE t.id = id);\nEND;\n$$;";
+    let plain = "CREATE FUNCTION f(id int) RETURNS int LANGUAGE plpgsql AS $$\nBEGIN\n  RETURN (SELECT id FROM t WHERE t.id = id);\nEND;\n$$;";
+    for (src, cat) in [(with_temp, None), (plain, Some("CREATE TABLE t (id int);"))] {
+        let r = check_rules(Dialect::Postgres, src, cat);
+        assert!(
+            r.findings.iter().any(|f| !f.assumptions.is_empty()),
+            "{:?}",
+            rules(&r)
+        );
+        for f in &r.findings {
+            for id in &f.assumptions {
+                assert!(
+                    r.assumptions.iter().any(|a| &a.id == id),
+                    "{id} not in report ({cat:?})"
+                );
+            }
+        }
+    }
+}

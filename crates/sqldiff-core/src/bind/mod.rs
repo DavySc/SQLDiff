@@ -118,8 +118,11 @@ pub struct Decl {
     pub start: usize,
     pub end: usize,
     pub scope: usize,
-    /// Position among declarations with the same key in the artifact.
+    /// Position among declarations with the same key in the enclosing routine
+    /// (the artifact outside routines), so unrelated routines do not shift it.
     pub ordinal: usize,
+    /// Key of the enclosing routine, if any.
+    pub routine: Option<String>,
     pub data_type: Option<DataType>,
     /// Field names of a row (Db2 `FOR l AS SELECT`, PL/pgSQL `%ROWTYPE`, records).
     pub row: Option<Vec<OutputCol>>,
@@ -170,7 +173,6 @@ enum ScopeKind {
 #[derive(Debug, Clone)]
 struct Scope {
     id: usize,
-    #[allow(dead_code)]
     kind: ScopeKind,
     label: Option<String>,
     /// The label as written, for messages.
@@ -192,6 +194,7 @@ pub(crate) struct Binder<'a> {
     d: Dialect,
     version: String,
     text: &'a str,
+    lines: &'a sqldiff_syntax::LineIndex,
     input: &'a BindInput<'a>,
     out: Bound,
     scopes: Vec<Scope>,
@@ -212,6 +215,7 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
         d: a.dialect(),
         version: a.artifact.version.clone(),
         text: &a.artifact.text,
+        lines: &a.lines,
         input,
         out: Bound::default(),
         scopes: Vec::new(),
@@ -259,11 +263,7 @@ impl<'a> Binder<'a> {
     }
 
     fn line(&self, offset: usize) -> usize {
-        self.text[..offset.min(self.text.len())]
-            .bytes()
-            .filter(|b| *b == b'\n')
-            .count()
-            + 1
+        self.lines.line_col(offset.min(self.text.len())).0
     }
 
     /// Declares a name in the innermost scope; reports duplicates and shadowing.
@@ -343,6 +343,12 @@ impl<'a> Binder<'a> {
                 });
             }
         }
+        let routine = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|s| s.kind == ScopeKind::Routine)
+            .and_then(|s| s.label.clone());
         let ordinal = {
             let n = self.ordinals.entry(key.clone()).or_insert(0);
             *n += 1;
@@ -357,6 +363,7 @@ impl<'a> Binder<'a> {
             end,
             scope: scope.id,
             ordinal,
+            routine,
             data_type,
             row,
         });
@@ -489,13 +496,18 @@ impl<'a> Binder<'a> {
             SyntaxKind::LOOP_STMT => self.loop_stmt(node),
             SyntaxKind::HANDLER => self.db2_handler(node),
             SyntaxKind::EXCEPTION_HANDLER => {
-                self.push_scope(ScopeKind::Handler, None);
+                let scoped = self.d != Dialect::Tsql;
+                if scoped {
+                    self.push_scope(ScopeKind::Handler, None);
+                }
                 for c in node.children() {
                     if c.kind() != SyntaxKind::CONDITION {
                         self.walk(&c);
                     }
                 }
-                self.pop_scope();
+                if scoped {
+                    self.pop_scope();
+                }
             }
             SyntaxKind::CONDITION => {
                 let stmt = ast::sig_range(&node.parent().unwrap_or_else(|| node.clone()));
@@ -515,6 +527,7 @@ impl<'a> Binder<'a> {
             .and_then(|h| h.name.last())
             .map(|n| n.key(self.d));
         self.push_scope(ScopeKind::Routine, label);
+        let saved_ordinals = std::mem::take(&mut self.ordinals);
         let saved_trigger = self.trigger.take();
         if let Some(h) = &header {
             if h.view.is_none() {
@@ -596,6 +609,7 @@ impl<'a> Binder<'a> {
         }
         self.goto_labels = saved_labels;
         self.trigger = saved_trigger;
+        self.ordinals = saved_ordinals;
         self.pop_scope();
     }
 
@@ -722,14 +736,19 @@ impl<'a> Binder<'a> {
             .find(|t| !t.is(SyntaxKind::COLON) && !t.is_op("<<") && !t.is_op(">>"))
             .is_some_and(|t| t.is_any_kw(&["FOR", "FOREACH"]))
             || head.get(2).is_some_and(|t| t.is_kw("FOR"));
-        self.push_scope(ScopeKind::Loop, label);
+        let foreach = head.iter().any(|t| t.is_kw("FOREACH"));
+        // T-SQL variables live for the whole batch: a loop is not a scope.
+        let scoped = self.d != Dialect::Tsql;
+        if scoped {
+            self.push_scope(ScopeKind::Loop, label);
+        }
         let cond = node.children().find(|c| c.kind() == SyntaxKind::CONDITION);
         match (is_for, cond) {
             (true, Some(c)) => {
                 let t = tokens::of_node(&c);
                 match self.d {
                     Dialect::Db2i => self.db2_for(&t, stmt),
-                    Dialect::Postgres => self.pg_for(&t, stmt),
+                    Dialect::Postgres => self.pg_for(&t, stmt, foreach),
                     Dialect::Tsql => self.analyze(&t, stmt),
                 }
             }
@@ -744,7 +763,9 @@ impl<'a> Binder<'a> {
                 self.walk(&c);
             }
         }
-        self.pop_scope();
+        if scoped {
+            self.pop_scope();
+        }
     }
 
     /// Db2 `FOR l AS [c CURSOR [WITH HOLD] FOR] SELECT ...`: `l` names the row,
@@ -790,13 +811,28 @@ impl<'a> Binder<'a> {
     }
 
     /// PL/pgSQL `FOR i IN [REVERSE] a..b`, `FOR r IN query`, `FOREACH x IN ARRAY e`.
-    fn pg_for(&mut self, t: &[Tok], stmt: (usize, usize)) {
+    fn pg_for(&mut self, t: &[Tok], stmt: (usize, usize), foreach: bool) {
         let Some(in_at) = t.iter().position(|x| x.is_kw("IN")) else {
             self.analyze(t, stmt);
             return;
         };
         let targets = &t[..in_at];
         let rest = &t[in_at + 1..];
+        if foreach || t.first().is_some_and(|x| x.is_kw("FOREACH")) {
+            // FOREACH assigns to declared variables: `FOREACH x [SLICE n] IN ARRAY e`.
+            self.analyze(rest, stmt);
+            let end = targets
+                .iter()
+                .position(|x| x.is_kw("SLICE"))
+                .unwrap_or(targets.len());
+            for tg in targets[..end]
+                .iter()
+                .filter(|x| x.is_name() && !x.is_kw("FOREACH"))
+            {
+                self.loop_target(tg, stmt, None, false);
+            }
+            return;
+        }
         let is_query = rest
             .iter()
             .find(|x| !x.is_kw("REVERSE"))
@@ -806,46 +842,53 @@ impl<'a> Binder<'a> {
             let outs = ddl::select_outputs(rest);
             let row = self.typed_outputs(outs, rest);
             // The targets must be declared; a record takes the query's shape.
+            let single = targets.len() == 1;
             for tg in targets.iter().filter(|x| x.is_name()) {
-                let key = tg.ident().key(self.d);
-                match self.lookup(
-                    &key,
-                    &[DeclKind::Variable, DeclKind::Parameter, DeclKind::LoopVar],
-                ) {
-                    Some(i) => {
-                        if targets.len() == 1 && self.out.decls[i].row.is_none() {
-                            self.out.decls[i].row = row.clone();
-                        }
-                        self.add_ref(
-                            RefKind::Variable,
-                            tg.text.clone(),
-                            (tg.start, tg.end),
-                            stmt,
-                            Resolution::Resolved(Target::Decl(i)),
-                        );
-                    }
-                    None => self.unknown_variable(tg, stmt),
-                }
+                self.loop_target(tg, stmt, row.clone(), single);
             }
         } else {
             self.analyze(rest, stmt);
             // Integer loop: the variable is declared by the loop.
             if let Some(tg) = targets.iter().find(|x| x.is_name()) {
-                let ty = if t.first().is_some_and(|x| x.is_kw("FOREACH")) {
-                    None
-                } else {
-                    Some(DataType::parse_str("integer"))
-                };
                 self.declare(
                     DeclKind::LoopVar,
                     &tg.ident().text,
                     tg.kind == SyntaxKind::QUOTED_IDENT,
                     tg.start,
                     tg.end,
-                    ty,
+                    Some(DataType::parse_str("integer")),
                     None,
                 );
             }
+        }
+    }
+
+    /// A loop target that must already be declared; a lone record target takes the row shape.
+    fn loop_target(
+        &mut self,
+        tg: &Tok,
+        stmt: (usize, usize),
+        row: Option<Vec<OutputCol>>,
+        single: bool,
+    ) {
+        let key = tg.ident().key(self.d);
+        match self.lookup(
+            &key,
+            &[DeclKind::Variable, DeclKind::Parameter, DeclKind::LoopVar],
+        ) {
+            Some(i) => {
+                if single && self.out.decls[i].row.is_none() {
+                    self.out.decls[i].row = row;
+                }
+                self.add_ref(
+                    RefKind::Variable,
+                    tg.text.clone(),
+                    (tg.start, tg.end),
+                    stmt,
+                    Resolution::Resolved(Target::Decl(i)),
+                );
+            }
+            None => self.unknown_variable(tg, stmt),
         }
     }
 

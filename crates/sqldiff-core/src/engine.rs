@@ -47,17 +47,44 @@ impl Default for Options {
     }
 }
 
-/// Parsed catalog DDL, cached by content hash (tree diffs reuse one catalog for every pair).
-fn ddl_catalog(a: &Artifact) -> Arc<Catalog> {
-    type Cache = Mutex<HashMap<(String, &'static str), Arc<Catalog>>>;
+/// Catalog DDL files folded into one catalog in order, so a later migration's
+/// `ALTER TABLE` applies to a table an earlier file created. Cached by paths and
+/// content (tree diffs reuse one catalog for every pair); the cache is bounded
+/// because the GUI and MCP server run for a long time.
+fn ddl_catalog(dialect: sqldiff_syntax::Dialect, ddl: &[Artifact]) -> Arc<Catalog> {
+    type Cache = Mutex<HashMap<String, Arc<Catalog>>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
-    let key = (content_hash(&a.text), a.dialect.id());
+    const MAX_ENTRIES: usize = 32;
+    let mut key = dialect.id().to_string();
+    for a in ddl {
+        key.push('\0');
+        key.push_str(&a.path);
+        key.push('\0');
+        key.push_str(a.dialect.id());
+        key.push('\0');
+        key.push_str(&content_hash(&a.text));
+    }
     let cache = CACHE.get_or_init(Default::default);
     if let Some(c) = cache.lock().ok().and_then(|m| m.get(&key).cloned()) {
         return c;
     }
-    let c = Arc::new(ddl::load(&a.text, a.dialect, &a.path));
+    let mut cat = Catalog {
+        origin: ddl
+            .iter()
+            .map(|a| a.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        ..Catalog::default()
+    };
+    for a in ddl {
+        let root = sqldiff_syntax::parse(&a.text, a.dialect).syntax();
+        ddl::load_tree(&mut cat, &root, a.dialect);
+    }
+    let c = Arc::new(cat);
     if let Ok(mut m) = cache.lock() {
+        if m.len() >= MAX_ENTRIES {
+            m.clear();
+        }
         m.insert(key, c.clone());
     }
     c
@@ -69,7 +96,7 @@ fn catalog_view(
     ddl: &[Artifact],
     facts: &[Arc<Catalog>],
 ) -> CatalogView {
-    let loaded: Vec<Arc<Catalog>> = ddl.iter().map(ddl_catalog).collect();
+    let loaded = (!ddl.is_empty()).then(|| ddl_catalog(dialect, ddl));
     let sources: Vec<&Catalog> = loaded.iter().chain(facts).map(|c| c.as_ref()).collect();
     CatalogView::new(dialect, &sources)
 }

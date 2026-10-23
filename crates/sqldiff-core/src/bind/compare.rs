@@ -22,21 +22,14 @@ pub fn binding_findings(x: &Bindings) -> (Vec<Finding>, Vec<Assumption>) {
     let mut findings = Vec::new();
     let mut assumptions: Vec<Assumption> = Vec::new();
     let (aa, ba, cat_a) = x.a;
+    // Assumptions behind unresolved references, when a catalog was supplied
+    // (without one, every persistent name would add one).
     let push_asm = |out: &mut Vec<Assumption>, b: &Bound, only: Option<&HashSet<String>>| {
         for r in &b.refs {
             if let Resolution::Assumed(id) = &r.resolution {
                 if only.is_some_and(|o| o.contains(id)) {
                     continue;
                 }
-                if let Some(asm) = b.assumption(id) {
-                    if !out.iter().any(|y| y.id == asm.id) {
-                        out.push(asm.clone());
-                    }
-                }
-            }
-        }
-        for i in &b.issues {
-            for id in &i.assumptions {
                 if let Some(asm) = b.assumption(id) {
                     if !out.iter().any(|y| y.id == asm.id) {
                         out.push(asm.clone());
@@ -98,6 +91,18 @@ pub fn binding_findings(x: &Bindings) -> (Vec<Finding>, Vec<Assumption>) {
             }
         }
     }
+    // Every assumption a finding cites is in the report, catalog or not.
+    let bounds: Vec<&Bound> = std::iter::once(ba).chain(x.b.map(|b| b.1)).collect();
+    for f in &findings {
+        for id in &f.assumptions {
+            if assumptions.iter().any(|y| &y.id == id) {
+                continue;
+            }
+            if let Some(asm) = bounds.iter().find_map(|b| b.assumption(id)) {
+                assumptions.push(asm.clone());
+            }
+        }
+    }
     (findings, assumptions)
 }
 
@@ -137,9 +142,9 @@ fn to_finding(side: &Analyzed, i: &Issue, verdict: Verdict, other: Option<&Analy
     }
 }
 
-/// A variable reference as seen from its statement: statement text,
-/// variable key, occurrence within the statement.
-type RefKey = (String, String, usize);
+/// A variable reference as seen from its statement: enclosing routine,
+/// statement text, variable key, occurrence.
+type RefKey = (Option<String>, String, String, usize);
 
 struct Use {
     decl: usize,
@@ -148,7 +153,7 @@ struct Use {
 }
 
 fn uses(side: &Analyzed, b: &Bound) -> BTreeMap<RefKey, Use> {
-    let mut seen: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut seen: BTreeMap<(Option<String>, String, String), usize> = BTreeMap::new();
     let mut out = BTreeMap::new();
     for r in &b.refs {
         let Resolution::Resolved(Target::Decl(d)) = r.resolution else {
@@ -162,9 +167,11 @@ fn uses(side: &Analyzed, b: &Bound) -> BTreeMap<RefKey, Use> {
             continue;
         }
         let text = normalize(&side.artifact.text[r.stmt.0..r.stmt.1]);
-        let n = seen.entry((text.clone(), decl.key.clone())).or_insert(0);
+        let n = seen
+            .entry((decl.routine.clone(), text.clone(), decl.key.clone()))
+            .or_insert(0);
         out.insert(
-            (text, decl.key.clone(), *n),
+            (decl.routine.clone(), text, decl.key.clone(), *n),
             Use {
                 decl: d,
                 stmt: r.stmt,
@@ -241,7 +248,7 @@ fn rebound(aa: &Analyzed, ba: &Bound, ab: &Analyzed, bb: &Bound) -> Vec<Finding>
             db.name,
             decl_line(ab, db.start),
         );
-        let anchor = format!("{} {}", k.0, k.1);
+        let anchor = format!("{} {}", k.1, k.2);
         let class = ChangeClass::Semantic;
         out.push(Finding {
             fingerprint: fingerprint(&FingerprintInput {

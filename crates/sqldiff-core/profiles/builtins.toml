@@ -55,6 +55,7 @@ keywords = [
 
 [tsql]
 functions = [
+  "BIT_COUNT", "GET_BIT", "SET_BIT", "LEFT_SHIFT", "RIGHT_SHIFT", "CONTAINS", "FREETEXT", "CONTAINSTABLE", "FREETEXTTABLE",
   "ABS", "ACOS", "ASIN", "ATAN", "ATN2", "CEILING", "COS", "COT", "DEGREES", "EXP", "FLOOR",
   "LOG", "LOG10", "PI", "POWER", "RADIANS", "RAND", "ROUND", "SIGN", "SIN", "SQRT", "SQUARE",
   "TAN", "ASCII", "CHAR", "CHARINDEX", "CONCAT", "CONCAT_WS", "DIFFERENCE", "FORMAT", "LEFT",
@@ -124,7 +125,18 @@ keywords = [
   "OUTPUT", "SYSTEM_TIME", "CONTAINED", "PERIOD", "NEXT", "OPENJSON",
 ]
 
+# Functions of other dialects verified not to exist here: calling one is a
+# proven binding error. Other unknown names only become assumptions.
+absent = [
+  "NOW", "CLOCK_TIMESTAMP", "STATEMENT_TIMESTAMP", "GEN_RANDOM_UUID", "PG_ADVISORY_XACT_LOCK", "PG_ADVISORY_LOCK", "IDENTITY_VAL_LOCAL", "GENERATE_UUID", "ARRAY_AGG", "NVL",
+]
+
 [tsql.since]
+BIT_COUNT = "2022"
+GET_BIT = "2022"
+SET_BIT = "2022"
+LEFT_SHIFT = "2022"
+RIGHT_SHIFT = "2022"
 STRING_AGG = "2017"
 CONCAT_WS = "2017"
 TRANSLATE = "2017"
@@ -153,6 +165,7 @@ CURRENT_TRANSACTION_ID = "2016"
 
 [postgres]
 functions = [
+  "REGR_COUNT", "REGR_AVGX", "REGR_AVGY", "REGR_INTERCEPT", "REGR_R2", "REGR_SLOPE", "REGR_SXX", "REGR_SXY", "REGR_SYY",
   "ABS", "CBRT", "CEIL", "CEILING", "DEGREES", "DIV", "EXP", "FACTORIAL", "FLOOR", "GCD", "LCM",
   "LN", "LOG", "LOG10", "MIN_SCALE", "MOD", "PI", "POWER", "RADIANS", "ROUND", "SCALE", "SIGN",
   "SQRT", "TRIM_SCALE", "TRUNC", "WIDTH_BUCKET", "RANDOM", "RANDOM_NORMAL", "SETSEED", "ACOS",
@@ -244,6 +257,12 @@ keywords = [
   "USE_COLUMN", "USE_VARIABLE", "PRINT_STRICT_PARAMS", "SCROLL", "OWNED", "OVERRIDING",
   "SYSTEM", "UNLISTEN", "DISCARD", "RESET", "SHOW", "ABORT", "BACKWARD", "FORWARD", "MOVE",
   "AND", "CHAIN", "SECURITY", "LAST", "DEFERRABLE", "INITIALLY", "IMMEDIATE",
+]
+
+# Functions of other dialects verified not to exist here: calling one is a
+# proven binding error. Other unknown names only become assumptions.
+absent = [
+  "GETDATE", "GETUTCDATE", "SYSDATETIME", "SYSUTCDATETIME", "ISNULL", "LEN", "CHARINDEX", "NEWID", "SCOPE_IDENTITY", "IIF", "DATALENGTH", "IDENTITY_VAL_LOCAL", "GENERATE_UUID", "LOCATE_IN_STRING", "VARCHAR_FORMAT",
 ]
 
 [postgres.since]
@@ -344,6 +363,12 @@ keywords = [
   "AUTONOMOUS", "INHERIT", "SPECIAL", "REGISTERS", "CONCURRENT", "ACCESS", "RESOLUTION",
   "CURRENTLY", "WAIT", "OUTCOME", "YES", "SERVER", "PATH", "IMPLICITLY", "HIDDEN", "OVERRIDING",
   "SYSTEM_TIME", "DB2_NUMBER_ROWS", "MORE", "COMMAND_FUNCTION", "SAVEPOINT", "LEVEL",
+]
+
+# Functions of other dialects verified not to exist here: calling one is a
+# proven binding error. Other unknown names only become assumptions.
+absent = [
+  "GETDATE", "GETUTCDATE", "SYSDATETIME", "SYSUTCDATETIME", "NEWID", "SCOPE_IDENTITY", "DATALENGTH", "CLOCK_TIMESTAMP", "GEN_RANDOM_UUID", "PG_ADVISORY_XACT_LOCK", "PG_ADVISORY_LOCK",
 ]
 
 [db2i.since]

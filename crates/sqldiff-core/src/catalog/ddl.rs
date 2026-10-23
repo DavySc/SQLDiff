@@ -194,11 +194,54 @@ const TABLE_CONSTRAINTS: &[&str] = &[
     "LIKE",
 ];
 
+/// Whether a table element is a constraint (or index, period, LIKE) rather
+/// than a column whose name happens to be one of those words (`period int`).
+fn is_constraint(el: &[Tok], dialect: Dialect) -> bool {
+    let Some(first) = el.first() else {
+        return false;
+    };
+    if first.kind != SyntaxKind::IDENT || !first.is_any_kw(TABLE_CONSTRAINTS) {
+        return false;
+    }
+    let next = el.get(1);
+    let paren = |x: Option<&Tok>| x.is_some_and(|x| x.is(SyntaxKind::L_PAREN));
+    match first.upper().as_str() {
+        "CONSTRAINT" => el.get(2).is_some_and(|x| {
+            x.is_any_kw(&[
+                "PRIMARY", "UNIQUE", "FOREIGN", "CHECK", "EXCLUDE", "DEFAULT",
+            ])
+        }),
+        "PRIMARY" | "FOREIGN" => next.is_some_and(|x| x.is_kw("KEY")),
+        "UNIQUE" => {
+            paren(next)
+                || next.is_some_and(|x| {
+                    x.is_any_kw(&["KEY", "INDEX", "NULLS", "CLUSTERED", "NONCLUSTERED"])
+                })
+        }
+        "CHECK" => paren(next) || next.is_some_and(|x| x.is_kw("NOT")),
+        "EXCLUDE" => paren(next) || next.is_some_and(|x| x.is_kw("USING")),
+        "PERIOD" => next.is_some_and(|x| x.is_kw("FOR")),
+        // T-SQL inline index: `INDEX ix (a, b)` or `INDEX ix CLUSTERED ...`;
+        // `index varchar(10)` is a column with a length argument.
+        "INDEX" => match el.get(2) {
+            Some(x) if x.is(SyntaxKind::L_PAREN) => el[3..].first().is_some_and(|y| y.is_name()),
+            Some(x) => x.is_any_kw(&["CLUSTERED", "NONCLUSTERED", "UNIQUE", "COLUMNSTORE"]),
+            None => false,
+        },
+        "LIKE" => next.is_some_and(|x| {
+            x.is_name()
+                && super::builtins::of(dialect).data_type(&x.upper(), "")
+                    == super::builtins::Availability::Unknown
+        }),
+        _ => false,
+    }
+}
+
 /// Reads the element list of a table definition (between the parentheses).
 pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
     for el in split_commas(inner) {
         let Some(first) = el.first() else { continue };
-        if first.kind == SyntaxKind::IDENT && first.is_any_kw(TABLE_CONSTRAINTS) {
+        if is_constraint(el, dialect) {
             table_constraint(tb, el, dialect);
             continue;
         }
@@ -415,32 +458,80 @@ fn alter_table(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
     else {
         return;
     };
+    // T-SQL lists several items after one verb: `ADD a int, b int`,
+    // `DROP COLUMN a, b`; an item without a verb continues the last one.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Verb {
+        Add,
+        DropColumn,
+        Other,
+    }
+    let mut last = Verb::Other;
+    let verbs = [
+        "ADD", "DROP", "ALTER", "ENABLE", "DISABLE", "SET", "RENAME", "WITH", "NOCHECK", "OWNER",
+        "VALIDATE",
+    ];
     for action in split_commas(&t[j..]) {
         let Some(verb) = action.first() else { continue };
-        let mut k = 1;
-        if verb.is_kw("ADD") {
-            if action.get(k).is_some_and(|x| x.is_kw("COLUMN")) {
-                k += 1;
-            }
-            if action
-                .get(k)
-                .is_some_and(|x| x.is_any_kw(TABLE_CONSTRAINTS))
-            {
-                table_constraint(tb, &action[k..], dialect);
-            } else {
-                column_defs(tb, &action[k..], dialect);
-            }
+        let (kind, mut k) = if verb.is_kw("ADD") {
+            (Verb::Add, 1)
         } else if verb.is_kw("DROP") {
-            if action.get(k).is_some_and(|x| x.is_kw("COLUMN")) {
-                k += 1;
+            let column = action.get(1).is_some_and(|x| x.is_kw("COLUMN"))
+                || (dialect != Dialect::Tsql
+                    && action.get(1).is_some_and(|x| {
+                        x.is_name()
+                            && !x.is_any_kw(&[
+                                "CONSTRAINT",
+                                "PRIMARY",
+                                "UNIQUE",
+                                "FOREIGN",
+                                "CHECK",
+                                "INDEX",
+                                "PERIOD",
+                            ])
+                    }));
+            (
+                if column {
+                    Verb::DropColumn
+                } else {
+                    Verb::Other
+                },
+                1,
+            )
+        } else if verb.is_any_kw(&verbs) {
+            (Verb::Other, 1)
+        } else {
+            (last, 0)
+        };
+        last = kind;
+        match kind {
+            Verb::Add => {
+                if action.get(k).is_some_and(|x| x.is_kw("COLUMN")) {
+                    k += 1;
+                }
+                if action.get(k).is_some_and(|x| x.is_kw("IF")) {
+                    k += 3; // IF NOT EXISTS
+                }
+                let item = &action[k.min(action.len())..];
+                if is_constraint(item, dialect) {
+                    table_constraint(tb, item, dialect);
+                } else {
+                    column_defs(tb, item, dialect);
+                }
             }
-            if action.get(k).is_some_and(|x| x.is_kw("IF")) {
-                k += 2;
+            Verb::DropColumn => {
+                if action.get(k).is_some_and(|x| x.is_kw("COLUMN")) {
+                    k += 1;
+                }
+                if action.get(k).is_some_and(|x| x.is_kw("IF")) {
+                    k += 2;
+                }
+                if let Some(c) = action.get(k).filter(|x| x.is_name()) {
+                    let ck = c.ident().key(dialect);
+                    tb.columns.retain(|x| super::key(dialect, &x.name) != ck);
+                }
             }
-            if let Some(c) = action.get(k).filter(|x| x.is_name()) {
-                let ck = c.ident().key(dialect);
-                tb.columns.retain(|x| super::key(dialect, &x.name) != ck);
-            }
+            Verb::Other => {}
         }
     }
 }
@@ -1050,5 +1141,42 @@ mod tests {
         assert_eq!(vw.kind, TableKind::View);
         assert_eq!(vw.columns[1].name, "d");
         assert_eq!(vw.columns[1].data_type.base, "DATE");
+    }
+
+    fn columns(c: &Catalog, d: Dialect, t: &str) -> Vec<String> {
+        let v = CatalogView::new(d, &[c]);
+        let Lookup::Found(t) = v.table(&[Ident::plain(t)]) else {
+            panic!("{t} missing")
+        };
+        t.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    #[test]
+    fn tsql_alter_lists() {
+        let c = load(
+            "CREATE TABLE t (a int, b int, c int);\nALTER TABLE t ADD x int, y varchar(5) NULL, CONSTRAINT pk PRIMARY KEY (x);\nALTER TABLE t DROP COLUMN a, b;",
+            Dialect::Tsql,
+            "t",
+        );
+        assert_eq!(columns(&c, Dialect::Tsql, "t"), ["c", "x", "y"]);
+    }
+
+    #[test]
+    fn keyword_column_names() {
+        let c = load(
+            "CREATE TABLE t (period int, index varchar(10), check date, unique_code int, like text, PRIMARY KEY (period), CHECK (period > 0));",
+            Dialect::Postgres,
+            "t",
+        );
+        assert_eq!(
+            columns(&c, Dialect::Postgres, "t"),
+            ["period", "index", "check", "unique_code", "like"]
+        );
+        let c = load(
+            "CREATE TABLE t (id int, INDEX ix_id (id), period int);",
+            Dialect::Tsql,
+            "t",
+        );
+        assert_eq!(columns(&c, Dialect::Tsql, "t"), ["id", "period"]);
     }
 }

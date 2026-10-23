@@ -31,6 +31,9 @@ struct Section {
     keywords: Vec<String>,
     #[serde(default)]
     since: BTreeMap<String, String>,
+    /// Functions of other dialects verified not to exist in this one.
+    #[serde(default)]
+    absent: Vec<String>,
 }
 
 /// One dialect's built-ins.
@@ -42,6 +45,7 @@ pub struct Builtins {
     types: HashSet<String>,
     keywords: HashSet<String>,
     since: BTreeMap<String, String>,
+    absent: HashSet<String>,
 }
 
 /// Whether a built-in exists at the target version.
@@ -85,6 +89,7 @@ fn all() -> &'static [Builtins; 3] {
                     .iter()
                     .map(|(k, v)| (k.to_ascii_uppercase(), v.clone()))
                     .collect(),
+                absent: upper(&s.absent),
             }
         };
         [
@@ -124,6 +129,12 @@ impl Builtins {
             Some(since) if version_lt(version, since) => Availability::Since(since.clone()),
             _ => Availability::Available,
         }
+    }
+
+    /// The function is verified missing from this dialect. The function list is
+    /// never complete, so only these names make an unknown call a proven error.
+    pub fn known_absent(&self, name: &str) -> bool {
+        self.absent.contains(&name.to_ascii_uppercase())
     }
 
     pub fn function(&self, name: &str, version: &str) -> Availability {
