@@ -7,11 +7,13 @@
 pub mod artifact;
 pub mod classify;
 mod engine;
+pub mod equiv;
 pub mod facts;
 pub mod ir;
 pub mod lint;
 pub mod model;
 pub mod normalize;
+pub mod phrase;
 pub mod render;
 pub mod treediff;
 
