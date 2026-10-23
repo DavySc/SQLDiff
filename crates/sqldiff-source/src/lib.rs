@@ -33,3 +33,4 @@ pub use git::GitSource;
 pub use pack::{Pack, Policy};
 pub use process::ProcessSource;
 pub use source::{open, Source, SourceSpec};
+pub use walk::classify;
