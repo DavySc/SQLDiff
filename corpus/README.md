@@ -110,7 +110,7 @@ is confirmed. Until then the tool may cap it (design §12, oracle availability).
 one is missing. Most mutations stay in one dialect so they can run against a single
 oracle; m12, m18, m19 and m22 are cross-dialect because the mistake only exists in a
 conversion. m23 uses composed output with provenance markers defined by
-`packs/synthetic-generator.toml` (a draft; the pack format is not fixed yet).
+`packs/synthetic-generator.toml`; see `docs/templates-and-composition.md`.
 
 ## Validation
 

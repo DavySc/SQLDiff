@@ -43,7 +43,7 @@ pub struct ConfigArgs {
     data_dir: Option<PathBuf>,
 }
 
-fn key_value(s: &str) -> Result<(String, String), String> {
+pub fn key_value(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())

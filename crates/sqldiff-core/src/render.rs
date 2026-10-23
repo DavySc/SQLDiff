@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use serde_json::{json, Value};
 
-use crate::model::{Finding, Location, Report, Severity, SuppressionKind};
+use crate::model::{AssumptionSource, Finding, Location, Report, Severity, SuppressionKind};
 
 pub fn json(report: &Report) -> String {
     serde_json::to_string_pretty(report).expect("report serializes")
@@ -120,15 +120,26 @@ pub fn text(report: &Report, show_assumption_details: bool) -> String {
         }
     }
 
-    if !report.assumptions.is_empty() {
+    let (proven, open): (Vec<_>, Vec<_>) = report
+        .assumptions
+        .iter()
+        .partition(|x| x.source == AssumptionSource::ComposedOutput);
+    if !open.is_empty() {
         let _ = writeln!(out);
         let _ = writeln!(out, "Assumptions:");
-        for x in &report.assumptions {
+        for x in open {
             if show_assumption_details {
                 let _ = writeln!(out, "  {:<32} {:?}  {}", x.id, x.source, x.text);
             } else {
                 let _ = writeln!(out, "  {:<32} {}", x.id, x.text);
             }
+        }
+    }
+    if !proven.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Proven from composed output:");
+        for x in proven {
+            let _ = writeln!(out, "  {}", x.text);
         }
     }
     if !report.normalizations.is_empty() && report.findings.is_empty() {

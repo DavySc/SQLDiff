@@ -792,6 +792,7 @@ fn status_label(s: queue::Status) -> &'static str {
     match s {
         queue::Status::Open => "open (tool default, nobody declared it)",
         queue::Status::Declared => "declared (pack or config)",
+        queue::Status::Proven => "proven from composed output",
         queue::Status::Confirmed => "confirmed in this session",
         queue::Status::Denied => "denied in this session",
     }

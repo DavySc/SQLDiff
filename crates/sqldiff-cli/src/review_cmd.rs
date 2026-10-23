@@ -8,6 +8,7 @@ use clap::{Args, Subcommand};
 use sqldiff_core::artifact::content_hash;
 use sqldiff_core::{Artifact, Options, Report};
 use sqldiff_review::{markers, Cache, Decision, Redactor, State, Store, ANY_SNAPSHOT};
+use sqldiff_source::compose::{self, TemplateDir};
 use sqldiff_source::{policy, Resolved};
 
 use crate::source_cmd::ConfigArgs;
@@ -38,6 +39,8 @@ pub struct Pipeline {
     cache: Cache,
     redactor: Option<Redactor>,
     now: String,
+    /// Check mode for composed output (`--templates`).
+    pub templates: Option<TemplateDir>,
 }
 
 impl Pipeline {
@@ -69,6 +72,7 @@ impl Pipeline {
             cache,
             redactor,
             now: sqldiff_review::time::now(),
+            templates: None,
         })
     }
 
@@ -85,6 +89,14 @@ impl Pipeline {
             Some(b) => sqldiff_core::diff(a, b, opts),
             None => sqldiff_core::check(a, opts),
         });
+        compose::apply(
+            &mut r,
+            a,
+            b,
+            &self.cfg.policy,
+            self.templates.as_ref(),
+            opts,
+        );
         policy::add_limits(&mut r, a, b, &self.cfg);
         policy::apply(&mut r, &self.cfg);
         markers::apply(&mut r, &a.text, b.map(|b| b.text.as_str()), &self.cfg);

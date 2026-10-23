@@ -70,8 +70,11 @@ adapter that pairs by itself overrides pack pairing rules.
 `work_items[]` (from pack change patterns), `artifact_id` (pass to
 `get_artifact` for that version's text).
 
-**Composition**: `id`, `parts[]` with `name`, byte `start` and `end`,
-`template`, `parameters`.
+**Composition**: `id`, `stale` (output older than its inputs; caps verdicts
+at unknown), `parts[]` with `name`, byte `start` and `end` of the fragment,
+`template`, `parameters`, optional `template_hash` (content hash of the
+template it was generated from; check mode flags a part stale when the
+current template differs). See [templates-and-composition.md](templates-and-composition.md).
 
 ## Reference adapters
 

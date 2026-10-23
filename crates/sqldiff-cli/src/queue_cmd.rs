@@ -284,6 +284,7 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                         let status = match e.status {
                             Status::Open => "open",
                             Status::Declared => "declared",
+                            Status::Proven => "proven",
                             Status::Confirmed => "confirmed",
                             Status::Denied => "denied",
                         };
