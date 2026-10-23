@@ -110,7 +110,7 @@ fn accepted_findings_are_suppressed_and_unknown_pairs_still_need_review() {
     let (a, b) = (f("movestock.tsql.sql"), f("movestock.pg.sql"));
     let (code, _) = sqldiff_in(
         &data,
-        &["review", "accept", "06ccfd05e423182d", "--pair", &a, &b],
+        &["review", "accept", "aacde30caae50448", "--pair", &a, &b],
     );
     assert_eq!(code, 0);
     let (_, out) = sqldiff_in(&data, &["queue", &dir, "-f", "json"]);
