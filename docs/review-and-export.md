@@ -19,12 +19,16 @@ as `outdated`, so a reviewer can see the source changed since.
 
 The store is an append-only log at `<data_dir>/review/decisions.jsonl`
 (the last record per key wins). It lives in the data directory, outside any
-repository. `sqldiff review compact` rewrites it with one line per decision
+repository. Appends and compaction take a lock file next to the log, and
+compaction re-reads the log first, so it never drops a decision another
+process wrote. A line that does not decode (for example one torn by a
+crash) is skipped with a warning; if no line decodes, opening fails (wrong
+or missing data key). `sqldiff review compact` rewrites it with one line per decision
 and drops expired ones.
 
 ```sh
-sqldiff review accept 06ccfd05e423182d --pair a.sql b.sql -c "callers map codes" --expires 2027-01-01
-sqldiff review accept 06ccfd05e423182d             # every snapshot
+sqldiff review accept aacde30caae50448 --pair a.sql b.sql -c "callers map codes" --expires 2027-01-01
+sqldiff review accept aacde30caae50448             # every snapshot
 sqldiff review reject FP --snapshot HASH_A:HASH_B
 sqldiff review comment FP -c "check with the owner"
 sqldiff review list [--state accepted] [-f json]
@@ -44,11 +48,13 @@ report's `suppressed` list with their justification; they are not dropped:
 - SARIF keeps them as results with `suppressions` (`external` for review
   decisions, `inSource` for markers).
 
-The report's `verdict` is left as the engine computed it. The exit code uses
-the **open verdict**, the verdict over the findings still open, which is
-never better than "equal under assumptions" once anything was suppressed:
-an accepted difference is still a difference. `--no-suppress` shows
-everything.
+Once anything is suppressed, the report's `verdict` becomes the **open
+verdict**, the verdict over the findings still open, and the engine's
+verdict is kept in `verdict_before_suppression` (text shows
+`Verdict: UNKNOWN (different before 1 suppressed)`). Text, JSON, SARIF and
+the exit code all agree. The open verdict is never better than "equal under
+assumptions": an accepted difference is still a difference.
+`--no-suppress` shows everything.
 
 ## Author markers
 
@@ -57,7 +63,7 @@ is the marker's value. No AI is involved.
 
 | `kind` | Effect |
 |---|---|
-| `intentional_difference` | Deliberate difference: findings on that side whose location covers the marker's line, or starts on the next line, are suppressed (`in_source`) |
+| `intentional_difference` | Deliberate difference: findings on that side that start on the marker's line (a trailing comment) or the next line (a comment above the statement) are suppressed (`in_source`). A finding that merely spans the marker, such as a whole-body finding, is not |
 | `assumption` | Author-declared premise: becomes an assumption with source `author`, id `ASM-AUTHOR-XXXXXXXX` (hash of the text, case and whitespace folded), cited as `A:12`; open until resolved |
 | `review_note`, `sync_partner` | Parsed and shown, no effect on the verdict |
 
@@ -85,7 +91,12 @@ identifying terms with stable placeholders:
 | `HELPER_…`, `RULE_…`, `PACK_…` | Pack helper names, limit rule ids, pack names |
 | `TERM_…` | Pack `deny_list` terms, matched anywhere, also inside words |
 
-Identifiers are matched case-insensitively as whole words. A placeholder is
+Identifiers are matched case-insensitively as whole words; when the longest
+matching term fails its word boundary, shorter terms at the same place are
+tried. Only free-text values change: JSON keys, enum values, versions and
+hashes (fingerprints, content hashes, snapshots) are kept, so a file named
+`rule.sql` or `error.sql` cannot break the output, and no term matches
+inside a placeholder or a hex run of 16 or more characters. A placeholder is
 a keyed hash of the term with a salt kept in `<data_dir>/redact.salt`: the
 same environment always produces the same placeholder, so exports can be
 compared, and nobody without the salt can confirm a guessed name.
@@ -93,13 +104,14 @@ Fingerprints, verdicts, classes and line numbers are kept.
 
 `--drop-excerpts` removes source excerpts instead of redacting them; use it
 when excerpts may hold sensitive text that no pack names. Before printing,
-the output is checked again for every registered term and refused if one
+the redacted data (every free-text value, including tree listings and
+provenance) is checked again for every registered term and refused if one
 is left. The deny-list scan (`scripts/leak-scan.sh --file`) passes on
 redacted output; a test asserts this.
 
 Library use (GUI session reports, MCP): `Redactor::from_config(&cfg)`, then
-`redact_report`, or `add_*` and `redact_value` for other JSON, and `verify`
-before writing.
+`redact_report`, or `add_*` and `redact_value` for other JSON, and
+`verify_report` / `verify_value` before writing.
 
 ## Encryption at rest
 

@@ -21,6 +21,8 @@ use crate::session::{Flip, QueueEntry, SessionInfo};
 pub struct Redactor {
     inner: Option<sqldiff_review::Redactor>,
     literal: Regex,
+    /// Redacted outputs that still held a registered term.
+    leaked: usize,
 }
 
 impl Redactor {
@@ -28,6 +30,7 @@ impl Redactor {
         Ok(Redactor {
             inner: Some(sqldiff_review::Redactor::from_config(cfg).map_err(|e| e.0)?),
             literal: Regex::new(r"'(?:[^']|'')*'").unwrap(),
+            leaked: 0,
         })
     }
 
@@ -35,6 +38,7 @@ impl Redactor {
         Redactor {
             inner: None,
             literal: Regex::new("$^").unwrap(),
+            leaked: 0,
         }
     }
 
@@ -85,15 +89,24 @@ impl Redactor {
             return s.to_string();
         };
         let s = self.literal.replace_all(s, "'…'");
-        r.redact_str(&s)
+        let out = r.redact_str(&s);
+        if !r.leaks(&out).is_empty() {
+            self.leaked += 1;
+        }
+        out
     }
 
-    /// Refuses output that still holds a registered term.
-    pub fn verify(&mut self, s: &str) -> Result<(), String> {
-        match &mut self.inner {
-            Some(r) => r.verify(s).map_err(|e| e.0),
-            None => Ok(()),
+    /// Refuses the report if any redacted value still held a registered
+    /// term. Only values that went through [`Redactor::apply`] are checked:
+    /// the report's own template words (`config`, `verdict`) are not data.
+    pub fn verify(&self) -> Result<(), String> {
+        if self.leaked > 0 {
+            return Err(format!(
+                "redacted report still contains identifying terms in {} value(s); not written",
+                self.leaked
+            ));
         }
+        Ok(())
     }
 }
 

@@ -47,7 +47,7 @@ pub fn normalize(t: &str) -> Result<String> {
         }
         r.parse().map_err(|_| bad())
     };
-    if s.len() < 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
+    if !s.is_ascii() || s.len() < 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
         return Err(bad());
     }
     let (y, mo, d) = (digits(&s[0..4])?, digits(&s[5..7])?, digits(&s[8..10])?);

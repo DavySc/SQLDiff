@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 sqldiff-syntax.workspace = true
 sqldiff-core.workspace = true
+sqldiff-convert.workspace = true
 sqldiff-source.workspace = true
 sqldiff-review.workspace = true
 serde.workspace = true

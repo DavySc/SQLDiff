@@ -1,0 +1,268 @@
+# T-SQL semantic tables (design §4, §7). Target: SQL Server 2022.
+#
+# This file is data for the IR lowering and the transaction interpreter
+# (crates/sqldiff-core/src/ir). The format is described in
+# docs/semantic-profiles.md. Every row carries the vendor fact it rests on
+# (`fact`, design §13 / docs/vendor-facts-verification.md) and a `status`;
+# rows that are not `confirmed` turn into assumptions when the interpreter
+# relies on them. Every row id must have a test in
+# crates/sqldiff-core/tests/semantics.rs (M4 gate).
+
+dialect = "tsql"
+
+# ---- Error kinds -------------------------------------------------------------
+# Abstract kind -> class (error or warning) and the native codes that map to it.
+# T-SQL codes are error numbers.
+
+[error_kinds.constraint]
+class = "error"
+codes = ["2627", "2601", "547", "515"]
+[error_kinds.conversion]
+class = "error"
+codes = ["245", "8114", "241", "242"]
+[error_kinds.arithmetic]
+class = "error"
+codes = ["8134", "8115"]
+[error_kinds.cardinality]
+class = "error"
+codes = ["512", "8672"]
+[error_kinds.lock]
+class = "error"
+codes = ["1205", "1222", "3960"]
+[error_kinds.user_signal]
+class = "error"
+codes = ["50000+"]
+[error_kinds.name_resolution]
+class = "error"
+codes = ["208", "207", "2812"]
+[error_kinds.cancel]
+class = "error"
+codes = ["attention", "20+"]
+[error_kinds.other]
+class = "error"
+codes = ["*"]
+
+# Handler condition names -> kinds they catch. TRY/CATCH catches severity 11-19
+# but not compile or deferred name resolution errors at the same level (V10).
+[conditions]
+CATCH = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "user_signal", "other"]
+
+# ---- What each statement category can raise ----------------------------------
+[raises]
+insert = ["constraint", "conversion", "arithmetic", "lock", "other"]
+update = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "other"]
+delete = ["constraint", "lock", "other"]
+merge = ["constraint", "conversion", "arithmetic", "cardinality", "lock", "other"]
+select_into = ["conversion", "arithmetic", "cardinality", "lock", "other"]
+commit = []
+call = ["other"]
+
+# ---- Unhandled errors ----------------------------------------------------------
+# First matching row wins. `statement`: what happens to the failing statement's
+# own changes. `transaction`: none | rollback_all | doom | rollback_scope.
+# `control`: next (continue with the next statement) | exit (leave the routine
+# or batch with the error).
+
+[[unhandled]]
+id = "tsql.unhandled.raiserror"
+construct = "raiserror"
+statement = "rollback"
+transaction = "none"
+control = "next"
+fact = "V10"
+status = "confirmed"
+note = "RAISERROR does not honour XACT_ABORT: the message goes to the caller and execution continues."
+
+[[unhandled]]
+id = "tsql.unhandled.xact-abort-on"
+when = { xact_abort = true }
+statement = "rollback"
+transaction = "rollback_all"
+control = "exit"
+fact = "V10"
+status = "confirmed"
+note = "SET XACT_ABORT ON: a run-time error rolls back the whole transaction and aborts the batch."
+
+[[unhandled]]
+id = "tsql.unhandled.throw"
+construct = "throw"
+statement = "rollback"
+transaction = "none"
+control = "exit"
+fact = "V10"
+status = "confirmed"
+note = "THROW outside TRY ends the batch; with XACT_ABORT OFF an open transaction stays open."
+
+[[unhandled]]
+id = "tsql.unhandled.cancel"
+kinds = ["cancel"]
+statement = "rollback"
+transaction = "none"
+control = "exit"
+fact = "V10"
+status = "partial"
+note = "Attentions, KILL and severity >= 20 are not caught by TRY/CATCH; the batch ends."
+
+[[unhandled]]
+id = "tsql.unhandled.batch-abort-lock"
+kinds = ["lock"]
+statement = "rollback"
+transaction = "rollback_all"
+control = "exit"
+fact = "V10"
+status = "partial"
+note = "Deadlock victim (1205): the transaction is rolled back and the batch ends, whatever XACT_ABORT says."
+
+[[unhandled]]
+id = "tsql.unhandled.batch-abort-conversion"
+kinds = ["conversion"]
+statement = "rollback"
+transaction = "rollback_all"
+control = "exit"
+fact = "V10"
+status = "unverified"
+note = "Conversion errors abort the batch with XACT_ABORT OFF. Microsoft publishes no list; seeded from known classes, pack-extensible."
+
+[[unhandled]]
+id = "tsql.unhandled.batch-abort-name-resolution"
+kinds = ["name_resolution"]
+statement = "rollback"
+transaction = "none"
+control = "exit"
+fact = "V10"
+status = "partial"
+note = "Compile and deferred name resolution errors end the batch and are not affected by XACT_ABORT; the open transaction stays open."
+
+[[unhandled]]
+id = "tsql.unhandled.statement-only"
+when = { xact_abort = false }
+statement = "rollback"
+transaction = "none"
+control = "next"
+fact = "V10"
+status = "confirmed"
+note = "XACT_ABORT OFF: in some cases only the failing statement is rolled back and execution continues."
+
+# ---- Caught errors -------------------------------------------------------------
+
+[[caught]]
+id = "tsql.caught.try-catch-xact-abort-on"
+construct = "try_catch"
+when = { xact_abort = true, in_txn = true }
+statement = "rollback"
+transaction = "doom"
+fact = "V10"
+status = "confirmed"
+note = "With XACT_ABORT ON an error inside TRY makes the transaction uncommittable (XACT_STATE() = -1)."
+
+[[caught]]
+id = "tsql.caught.try-catch-deadlock"
+construct = "try_catch"
+kinds = ["lock"]
+statement = "rollback"
+transaction = "rollback_all"
+fact = "V10"
+status = "partial"
+note = "A deadlock victim's transaction is already rolled back when CATCH runs."
+
+[[caught]]
+id = "tsql.caught.try-catch"
+construct = "try_catch"
+statement = "rollback"
+transaction = "none"
+fact = "V10"
+status = "partial"
+note = "XACT_ABORT OFF: the transaction usually stays committable; some severities doom it (pack-extensible)."
+
+# ---- Transactions --------------------------------------------------------------
+[transactions]
+nesting = { value = "counted", status = "confirmed", note = "@@TRANCOUNT; COMMIT decrements; only the outermost COMMIT makes work durable." }
+rollback_scope = { value = "all", status = "confirmed", note = "A bare ROLLBACK rolls back to the outermost BEGIN TRAN and sets @@TRANCOUNT to 0." }
+commit_without_txn = { value = "error", status = "confirmed", note = "Error 3902." }
+rollback_without_txn = { value = "error", status = "confirmed", note = "Error 3903." }
+savepoints = { value = "save_tran", status = "confirmed", note = "SAVE TRAN name; ROLLBACK TRAN name does not change @@TRANCOUNT." }
+savepoints_need_commitment_control = { value = false, status = "confirmed" }
+commit_in_exception_block = { value = "allowed", status = "confirmed" }
+commit_in_atomic = { value = "allowed", status = "confirmed" }
+commit_in_caller_txn = { value = "decrement", status = "confirmed", note = "Inside a caller's transaction COMMIT only decrements @@TRANCOUNT." }
+doomed_commit = { value = "error", status = "confirmed", note = "An uncommittable transaction only allows reads and ROLLBACK (error 3930); it is rolled back at batch end." }
+doomed_writes = { value = "error", status = "confirmed" }
+no_commit_levels = { value = [], status = "confirmed" }
+survives_rollback = { value = ["table_variable", "identity"], status = "confirmed", note = "Table variables and identity values are not rolled back." }
+ddl = { value = "transactional", status = "partial", note = "Most DDL is transactional." }
+session_switch = { value = "XACT_ABORT", status = "confirmed" }
+trancount_mismatch_at_exit = { value = "error", status = "confirmed", note = "A procedure that ends with a different @@TRANCOUNT than it started with raises error 266." }
+
+[transactions.routine_mode]
+procedure = { value = "autocommit", status = "confirmed", note = "A procedure runs in the caller's session; without BEGIN TRAN each statement commits on its own." }
+function = { value = "caller", status = "confirmed" }
+trigger = { value = "caller", status = "confirmed", note = "Triggers run inside the firing statement's transaction (XACT_ABORT ON by default)." }
+anonymous = { value = "autocommit", status = "confirmed" }
+script = { value = "autocommit", status = "confirmed" }
+
+# ---- Atomicity -----------------------------------------------------------------
+[atomicity]
+statement = { value = "always", status = "confirmed" }
+routine_body = { value = "none", status = "confirmed", note = "Routine bodies are not atomic." }
+atomic_compound = { value = "none", status = "confirmed", note = "T-SQL has no ATOMIC compound (except natively compiled modules)." }
+merge = { value = "always", status = "confirmed" }
+
+# ---- Temporary state -----------------------------------------------------------
+[[temp]]
+id = "tsql.temp.table-variable"
+object = "table_variable"
+prefix = "@"
+on_rollback = "keep"
+on_commit = "keep"
+lifetime = "batch"
+fact = "V16"
+status = "confirmed"
+
+[[temp]]
+id = "tsql.temp.local-temp-table"
+object = "temp_table"
+prefix = "#"
+on_rollback = "revert"
+on_commit = "keep"
+lifetime = "session"
+status = "confirmed"
+
+# ---- Cardinality contracts -----------------------------------------------------
+[[cardinality]]
+id = "tsql.card.select-assign"
+form = "select_into"
+many = "last_silent"
+none = "unchanged"
+status = "confirmed"
+note = "SELECT @v = col keeps the last row silently; no rows leaves @v unchanged."
+
+[[cardinality]]
+id = "tsql.card.scalar-subquery"
+form = "scalar_subquery"
+many = "error"
+none = "null"
+status = "confirmed"
+note = "Error 512."
+
+[[cardinality]]
+id = "tsql.card.update-from-join"
+form = "update_from"
+many = "any_silent"
+none = "unchanged"
+status = "confirmed"
+
+[[cardinality]]
+id = "tsql.card.merge-many-sources"
+form = "merge"
+many = "error"
+none = "unchanged"
+status = "confirmed"
+note = "Error 8672."
+
+[[cardinality]]
+id = "tsql.card.dml-no-rows"
+form = "dml"
+many = "ok"
+none = "silent"
+status = "confirmed"
+note = "UPDATE/DELETE that touch no rows succeed; @@ROWCOUNT = 0."

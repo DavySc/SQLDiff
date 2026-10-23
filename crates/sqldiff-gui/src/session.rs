@@ -11,7 +11,7 @@ use sqldiff_core::{session as flips, Artifact, ChangeClass, Dialect, Report, Sev
 use sqldiff_source::tree::{self, Ambiguous, Tree, TreePair};
 use sqldiff_source::{LayerRef, Resolved};
 
-use crate::review::{self, time, Decision, State, Store};
+use crate::review::{time, Decision, State, Store};
 use crate::{build_view, Payload};
 
 /// What the session compares.
@@ -113,7 +113,6 @@ pub struct SessionInfo {
     pub layers: Vec<LayerRef>,
     pub dialect_versions: BTreeMap<String, String>,
     pub assumptions: Vec<AssumptionRow>,
-    pub reviews: Vec<review::Entry>,
     pub only_a: Vec<String>,
     pub only_b: Vec<String>,
     pub ambiguous: Vec<Ambiguous>,
@@ -245,6 +244,13 @@ impl Session {
         let (a, b) = l.sides.as_ref()?;
         let mut p = build_view(a, b, self.report(i)?, live);
         p.index = i;
+        let now = time::now();
+        p.review = p
+            .report
+            .findings
+            .iter()
+            .map(|f| self.store.status(&f.fingerprint, &p.snapshot, &now))
+            .collect();
         Some(p)
     }
 
@@ -325,10 +331,7 @@ impl Session {
             error: l.error.clone(),
         };
         let Some(r) = self.report(i) else { return e };
-        let snap = review::snapshot(
-            &r.a.content_hash,
-            r.b.as_ref().map_or("", |b| b.content_hash.as_str()),
-        );
+        let snap = sqldiff_review::snapshot(&r);
         e.dialect_a = r.a.dialect.clone();
         e.dialect_b = r.b.as_ref().map(|b| b.dialect.clone()).unwrap_or_default();
         e.verdict = Some(r.verdict);
@@ -384,27 +387,6 @@ impl Session {
         rows.into_values().collect()
     }
 
-    /// Decisions on findings of this session (any snapshot), unexpired.
-    fn reviews(&self) -> Vec<review::Entry> {
-        let fps: BTreeSet<&str> = self
-            .pairs
-            .iter()
-            .filter_map(|l| l.base.as_ref())
-            .flat_map(|r| r.findings.iter().map(|f| f.fingerprint.as_str()))
-            .collect();
-        let now = time::now();
-        self.store
-            .all()
-            .into_iter()
-            .filter(|(k, d)| fps.contains(k.fingerprint.as_str()) && !d.is_expired(&now))
-            .map(|(k, d)| review::Entry {
-                fingerprint: k.fingerprint,
-                snapshot: k.snapshot,
-                decision: d,
-            })
-            .collect()
-    }
-
     pub fn info(&self) -> SessionInfo {
         let mut rows = self.assumptions.clone();
         for r in &mut rows {
@@ -433,7 +415,6 @@ impl Session {
                 .map(|d| (d.id().to_string(), self.cfg.dialect_version(*d)))
                 .collect(),
             assumptions: rows,
-            reviews: self.reviews(),
             only_a: self.tree.only_a.clone(),
             only_b: self.tree.only_b.clone(),
             ambiguous: self.tree.ambiguous.clone(),
@@ -511,7 +492,7 @@ impl Session {
             })
             .collect();
         let md = crate::report::markdown(&info, &queue, &reports, &self.store, &mut red);
-        red.verify(&md)?;
+        red.verify()?;
         Ok(md)
     }
 }

@@ -11,6 +11,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use sqldiff_core::Dialect;
+use sqldiff_gui::convert;
 use sqldiff_gui::review::Store;
 use sqldiff_gui::server::serve;
 use sqldiff_gui::session::{Origin, Session};
@@ -71,6 +72,22 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(short, long, default_value_t = 7878)]
+        port: u16,
+    },
+    /// Convert mode: edit T-SQL on the left, see PostgreSQL on the right, live.
+    Convert {
+        /// Initial input; a sample is shown when omitted.
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "tsql")]
+        from: Dialect,
+        #[arg(long, default_value = "postgres")]
+        to: Dialect,
+        /// Print the conversion and the unit badges instead of serving the page.
+        #[arg(long)]
+        stdout: bool,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(short, long, default_value_t = 7879)]
         port: u16,
     },
     /// Write a self-contained, read-only HTML file.
@@ -154,6 +171,53 @@ fn run(cli: Cli) -> Result<(), String> {
             let addr = listener.local_addr().map_err(|e| e.to_string())?;
             println!("SQLDiff: http://{addr}/");
             serve(listener, session).map_err(|e| e.to_string())
+        }
+        Command::Convert {
+            file,
+            from,
+            to,
+            stdout,
+            host,
+            port,
+        } => {
+            let (name, text) = match &file {
+                Some(p) => (
+                    p.display().to_string(),
+                    std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?,
+                ),
+                None => (String::new(), convert::SAMPLE.to_string()),
+            };
+            let setup = convert::Setup {
+                from,
+                to,
+                text,
+                name,
+            };
+            if stdout {
+                let p = convert::run(&setup, &setup.text, false);
+                let c = p.conversion.ok_or(p.error.unwrap_or_default())?;
+                print!("{}", c.output);
+                for u in &c.units {
+                    eprintln!(
+                        "line {:>4} -> {:>4}  {}{}",
+                        u.src.line,
+                        u.out.line,
+                        u.status.label(),
+                        u.notes
+                            .first()
+                            .map(|n| format!(": {}", n.text))
+                            .unwrap_or_default()
+                    );
+                }
+                return Ok(());
+            }
+            if !sqldiff_convert::supported(from, to) {
+                return Err(format!("no conversion rules from {from} to {to} yet"));
+            }
+            let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
+            let addr = listener.local_addr().map_err(|e| e.to_string())?;
+            println!("SQLDiff convert: http://{addr}/");
+            convert::serve(listener, setup).map_err(|e| e.to_string())
         }
         Command::Export { pair, output } => {
             let session = open(pair)?;

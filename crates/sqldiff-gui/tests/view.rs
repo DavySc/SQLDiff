@@ -281,9 +281,12 @@ fn review_decisions_persist_and_count_in_the_queue() {
         )
         .unwrap();
     s.refresh().unwrap();
-    let reviews = s.info().reviews;
-    assert_eq!(reviews.len(), 1);
-    assert_eq!(reviews[0].fingerprint, fp);
+    let pl = s.payload(i, true).unwrap();
+    assert_eq!(pl.review.len(), pl.report.findings.len());
+    assert_eq!(pl.review[0].state, sqldiff_review::ReviewState::Accepted);
+    assert!(!serde_json::to_string(&s.page(Some(i), true))
+        .unwrap()
+        .contains("0123456789abcdef"));
     s.review(&fp, &p.snapshot, None, None).unwrap();
     assert_eq!(s.queue()[i].reviewed, 0);
 }
@@ -329,6 +332,34 @@ fn redaction_covers_unicode_and_hyphenated_names() {
     for leak in ["order-sync", "Größe", "Lager"] {
         assert!(!red.contains(leak), "{leak} leaked:\n{red}");
     }
+}
+
+#[test]
+fn redacted_report_does_not_trip_on_its_own_template_words() {
+    let dir = std::env::temp_dir().join(format!("sqldiff-gui-tpl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let a = dir.join("config.tsql.sql");
+    let b = dir.join("config.pg.sql");
+    std::fs::write(
+        &a,
+        "CREATE PROCEDURE Session AS\nBEGIN\n  UPDATE Verdict SET Pair = 1;\n  COMMIT;\nEND\n",
+    )
+    .unwrap();
+    std::fs::write(&b, "CREATE PROCEDURE session()\nLANGUAGE plpgsql AS $$\nBEGIN\n  UPDATE verdict SET pair = 2;\nEND\n$$;\n").unwrap();
+    let s = Session::open(
+        Origin::detect(a, b),
+        None,
+        None,
+        cfg(&dir),
+        Store::in_memory(),
+    )
+    .unwrap();
+    let red = s
+        .session_report(true)
+        .expect("template words are not leaks");
+    assert!(red.contains("- config:"));
+    assert!(!red.contains("config.tsql.sql"));
 }
 
 #[test]

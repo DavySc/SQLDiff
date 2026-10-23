@@ -91,7 +91,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
-    let (bf, ba) = facts::compare(&aa, &ab);
+    let (bf, ba) = crate::ir::behaviour::compare(&aa, &ab);
     // Same-dialect diffs keep behavioural findings only when the facts actually differ.
     findings.extend(bf);
     for x in ba {
@@ -120,6 +120,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         assumptions,
         unknown_reasons,
         suppressed: Vec::new(),
+        verdict_before_suppression: None,
         diagnostics,
     })
 }
@@ -147,6 +148,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         assumptions: Vec::new(),
         unknown_reasons,
         suppressed: Vec::new(),
+        verdict_before_suppression: None,
         diagnostics,
     })
 }

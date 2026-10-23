@@ -50,11 +50,15 @@ button[aria-pressed="true"] { background: var(--focus); color: #fff; border-colo
 main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 14px 380px; min-height: 0; }
 #overview { position: relative; background: var(--panel); border-left: 1px solid var(--line); cursor: pointer; }
 #overview div { position: absolute; left: 3px; right: 3px; border-radius: 1px; }
-#scratch { display: none; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
-#scratch.open { display: grid; }
-#scratch label { font-size: 12px; color: var(--muted); display: block; margin-bottom: 2px; }
-#scratch textarea { width: 100%; height: 180px; font: 12.5px/1.45 var(--mono); background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: var(--radius); padding: 6px; resize: vertical; tab-size: 4; }
-#scratch .note { grid-column: 1 / -1; font-size: 12px; color: var(--muted); }
+#toolbar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 6px 16px; border-bottom: 1px solid var(--line); background: var(--bg); }
+body:not(.show-info) #provbar { display: none; }
+body.v-queue #toolbar { display: none !important; }
+/* Compact findings: only the focused card shows meta and actions. */
+.finding:not(.focus) .meta, .finding:not(.focus) .racts, .finding:not(.focus) > button[data-copy] { display: none; }
+.finding:not(.focus) p { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.finding.focus .racts { margin-top: 8px; }
+header { padding: 8px 16px; }
+#summary { color: var(--muted); font-size: 12.5px; }
 #pane { overflow: auto; min-height: 0; }
 .cols { display: grid; grid-template-columns: minmax(0, 1fr) 6px minmax(0, 1fr); position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--muted); }
 .cols div { padding: 4px 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -68,6 +72,10 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 14px 380px;
 .row.only_a .cell.a { background: var(--del-bg); }
 .row.only_b .cell.b { background: var(--add-bg); }
 .ln { color: var(--muted); text-align: right; padding-right: 8px; user-select: none; white-space: pre; border-right: 1px solid var(--line); }
+.code[contenteditable] { cursor: text; outline: none; caret-color: var(--focus); }
+.cell:has(.code[contenteditable]:hover) { box-shadow: inset 0 0 0 1px var(--line); }
+.cell:has(.code[contenteditable]:focus) { box-shadow: inset 0 0 0 1.5px var(--focus); }
+#editnote { font-size: 12px; color: var(--str); }
 .code { white-space: pre-wrap; word-break: break-word; padding-left: 8px; tab-size: 4; }
 .m1 { background: var(--chg-tok); border-radius: 2px; }
 .m3 { text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
@@ -100,7 +108,8 @@ aside h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-
 #help div { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.25); padding: 16px 22px; min-width: 280px; }
 #help kbd { font-family: var(--mono); border: 1px solid var(--line); border-radius: 3px; padding: 0 5px; }
 #help td { padding: 2px 10px 2px 0; }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; } #overview { display: none; } aside { border-left: 0; border-top: 1px solid var(--line); max-height: 40vh; } #scratch { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } #overview { display: none; } aside { border-left: 0; border-top: 1px solid var(--line); max-height: 40vh; } }
+body:not(.show-info) #provbar { display: none; }
 #provbar { padding: 4px 16px; border-bottom: 1px solid var(--line); background: var(--bg); color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
 #provbar code { font-family: var(--mono); }
 #provbar .layer { white-space: nowrap; }
@@ -109,7 +118,7 @@ aside h2 { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-
 #nav .crumb { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50vw; }
 #queue { flex: 1; display: none; grid-template-columns: minmax(0, 1fr) 380px; min-height: 0; }
 body.v-queue #queue { display: grid; }
-body.v-queue main, body.v-queue #scratch, body.v-queue .pair-only { display: none !important; }
+body.v-queue main, body.v-queue .pair-only { display: none !important; }
 #qmain { overflow: auto; min-height: 0; }
 .filters { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; font-size: 12px; align-items: center; }
 .filters { color: var(--muted); }
@@ -163,19 +172,19 @@ table.q .num { text-align: right; font-variant-numeric: tabular-nums; }
   <span id="verdict" class="verdict pair-only"></span>
   <span id="summary" class="pair-only"></span>
   <span class="spacer"></span>
-  <span id="classes" class="pair-only"></span>
-  <button id="btn-accepted" class="pair-only" aria-pressed="false" title="Hide findings accepted in the review store (h)">Hide accepted</button>
-  <button id="btn-fold" class="pair-only" aria-pressed="true" title="Collapse unchanged statements (c)">Collapse unchanged</button>
-  <button id="btn-scratch" class="pair-only" aria-pressed="false" title="Edit both sides in a scratchpad; sources are never written (e)">Scratchpad</button>
+  <span id="busy"></span>
+  <button id="btn-info" title="Sources, hashes and config layers">Details</button>
   <button id="btn-palette" title="Command palette (Ctrl+K or :)">⌘K</button>
   <button id="btn-help" title="Keyboard shortcuts (?)">?</button>
-  <span id="busy"></span>
 </header>
 <div id="provbar"></div>
-<div id="scratch">
-  <div><label for="ta-a">A</label><textarea id="ta-a" spellcheck="false"></textarea></div>
-  <div><label for="ta-b">B</label><textarea id="ta-b" spellcheck="false"></textarea></div>
-  <div class="note">Scratchpad: edits re-diff as you type and are never written back to the files. Reload the page to start again from disk.</div>
+<div id="toolbar" class="pair-only">
+  <span id="editnote" title="Edits re-diff live and are never written to the files"></span>
+  <button id="btn-reset" hidden title="Discard edits and re-read the sources">Reset edits</button>
+  <span id="classes"></span>
+  <span class="spacer"></span>
+  <button id="btn-accepted" aria-pressed="false" title="Hide findings accepted in the review store (h)">Hide accepted</button>
+  <button id="btn-fold" aria-pressed="true" title="Collapse unchanged statements (c)">Collapse unchanged</button>
 </div>
 <section id="queue">
   <div id="qmain"></div>
@@ -200,7 +209,6 @@ table.q .num { text-align: right; font-variant-numeric: tabular-nums; }
     <tr><td><kbd>a</kbd> / <kbd>x</kbd> / <kbd>m</kbd></td><td>Accept / reject / comment focused finding</td></tr>
     <tr><td><kbd>h</kbd></td><td>Hide or show accepted findings</td></tr>
     <tr><td><kbd>c</kbd></td><td>Collapse or expand unchanged</td></tr>
-    <tr><td><kbd>e</kbd></td><td>Scratchpad</td></tr>
     <tr><td><kbd>y</kbd></td><td>Copy focused finding as text</td></tr>
     <tr><td><kbd>r</kbd></td><td>Re-read sources</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>Close</td></tr>
@@ -215,7 +223,7 @@ const VERD = { different: 3, unknown: 2, equal_under_assumptions: 1, equal: 0 };
 const state = {
   page: null, live: false, view: "queue", cur: -1, data: null,
   fold: true, hidden: new Set(), focus: -1, expanded: new Set(), rowFocus: -1, hideAccepted: false,
-  scratchDirty: false, commenting: -1,
+  scratchDirty: false, commenting: -1, src: ["", ""],
   q: { cls: "", dialects: "", folder: "", review: "", text: "", sort: "severity" }, qsel: 0,
 };
 const $ = (id) => document.getElementById(id);
@@ -231,26 +239,29 @@ async function api(method, path, body) {
 }
 
 // ---------- review decisions ----------
-function decision(fp, snap) {
-  let best = null;
-  for (const d of state.page.session.reviews) {
-    if (d.fingerprint !== fp) continue;
-    if (d.snapshot === snap || d.snapshot === "*") return { d, current: true };
-    if (!best || d.at > best.at) best = d;
-  }
-  return best ? { d: best, current: false } : null;
+// The server resolves each finding's status (exact snapshot, then "*", expiry,
+// outdated); the page only reads it.
+function decision(fp) {
+  const i = state.data.report.findings.findIndex((f) => f.fingerprint === fp);
+  const st = (state.data.review || [])[i];
+  if (!st || !st.decision) return null;
+  return { d: st.decision, state: st.state, snapshot: st.snapshot, current: ["accepted", "rejected", "commented"].includes(st.state) };
 }
 function isAccepted(f) {
-  const x = decision(f.fingerprint, state.data.snapshot);
-  return !!(x && x.current && x.d.state === "accepted");
+  const x = decision(f.fingerprint);
+  return !!(x && x.state === "accepted");
 }
 // Decisions are keyed by the files on disk; a scratchpad edit has no snapshot to record against.
 function canReview() { return state.live && !state.scratchDirty; }
 async function setReview(i, st, comment) {
-  if (!canReview()) { if (state.scratchDirty) flash("reload the pair to review: the scratchpad is edited"); return; }
+  if (!canReview()) { if (state.scratchDirty) flash("reset edits to review: decisions apply to the files on disk"); return; }
   const f = state.data.report.findings[i];
+  const x = decision(f.fingerprint);
+  // Clearing removes the decision where it was recorded (possibly "*"); new decisions go on this snapshot.
+  const snapshot = st === null && x && x.current ? x.snapshot : state.data.snapshot;
   try {
-    applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot: state.data.snapshot, state: st, comment: comment == null ? null : comment }));
+    applySession(await api("POST", "/api/review", { fingerprint: f.fingerprint, snapshot, state: st, comment: comment == null ? null : comment }));
+    await loadPair(state.cur, true);
     state.commenting = -1;
     renderSide(); renderPane(); renderHeader();
     flash(st ? st : "cleared");
@@ -262,6 +273,8 @@ async function setFlip(id, flip) {
   if (!state.live) return;
   try {
     applySession(await api("POST", "/api/assumption", { id, flip }));
+    // Every pair's report depends on the flips: drop cached payloads.
+    state.page.pairs = [];
     if (state.view === "pair") {
       if (state.scratchDirty) scheduleDiff(); else await loadPair(state.cur, true);
     }
@@ -320,7 +333,7 @@ async function refresh() {
     state.scratchDirty = false;
     const now = cur ? state.page.queue.find((e) => e.a === cur.a && e.b === cur.b) : null;
     if (now) { state.cur = now.index; await loadPair(now.index, false); }
-    else if (cur) { state.view = "queue"; state.cur = -1; state.data = null; flash("the open pair is gone"); }
+    else { if (cur) flash("the open pair is gone"); state.view = "queue"; state.cur = -1; state.data = null; }
     render();
     flash("re-read");
   } catch (e) { $("busy").textContent = "error: " + e.message; }
@@ -410,11 +423,15 @@ async function loadPair(i, keepFocus) {
   state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
   if (!keepFocus) {
     state.expanded.clear(); state.rowFocus = -1; state.scratchDirty = false;
-    $("ta-a").value = data.sources[0];
-    $("ta-b").value = data.sources[1];
-    $("ta-a").previousElementSibling.textContent = `A · ${data.report.a.path} (${data.report.a.dialect})`;
-    if (data.report.b) $("ta-b").previousElementSibling.textContent = `B · ${data.report.b.path} (${data.report.b.dialect})`;
+    syncEditors(data);
   }
+}
+// Fills the editors from a pair payload. Called for every freshly loaded pair, including the one the page opens with.
+function syncEditors(data) {
+  state.src = data.sources.map((t) => t.replace(/\r\n?/g, "\n"));
+  state.scratchDirty = false;
+  $("btn-reset").hidden = true;
+  $("editnote").textContent = state.live ? "● live editing: click any code to edit; nothing is saved to disk" : "";
 }
 async function openPair(i, fp) {
   try {
@@ -470,7 +487,8 @@ function renderHeader() {
   v.textContent = label(r.verdict);
   const n = r.findings.length;
   const acc = r.findings.filter(isAccepted).length;
-  $("summary").textContent = `${n} finding${n === 1 ? "" : "s"}${acc ? `, ${acc} accepted` : ""} · ${r.noise.cosmetic} cosmetic, ${r.noise.structural} structural hidden`;
+  const hid = r.noise.cosmetic + r.noise.structural;
+  $("summary").textContent = `${n} finding${n === 1 ? "" : "s"}${acc ? `, ${acc} accepted` : ""}${hid ? ` · ${hid} cosmetic/structural hidden` : ""}`;
   const counts = {};
   for (const f of r.findings) counts[f.class] = (counts[f.class] || 0) + 1;
   $("classes").innerHTML = CLASS_ORDER.filter((c) => counts[c]).map((c) =>
@@ -493,7 +511,7 @@ function blockHtml(blk, side) {
   }
   if (lines.length > 1 && lines[lines.length - 1].length === 0) lines.pop();
   const nums = lines.map((_, k) => blk.lines[0] + k).join("\n");
-  return `<div class="cell ${side}"><div class="ln">${nums}</div><div class="code">${lines.map((l) => l.join("")).join("\n")}</div></div>`;
+  return `<div class="cell ${side}"><div class="ln">${nums}</div><div class="code"${state.live ? ` contenteditable="plaintext-only" spellcheck="false" data-side="${side === "a" ? 0 : 1}" data-start="${blk.lines[0]}" data-end="${blk.lines[1]}"` : ""}>${lines.map((l) => l.join("")).join("\n")}</div></div>`;
 }
 
 function rowFindings(row) {
@@ -524,6 +542,7 @@ function renderPane() {
     }
   }
   $("pane").innerHTML = out.join("");
+  for (const el of $("pane").querySelectorAll(".code[contenteditable]")) el.oninput = () => onCodeInput(el);
   for (const el of $("pane").querySelectorAll(".fold")) el.onclick = () => { state.expanded.add(+el.dataset.fold); renderPane(); };
   for (const el of $("pane").querySelectorAll(".row[data-f]")) {
     el.onclick = () => { const f = el.dataset.f.split(" ").filter(Boolean); if (f.length) focusFinding(+f[0], false); };
@@ -562,9 +581,10 @@ function locText(l) { return l ? `${l.side.toUpperCase()} ${l.start_line}:${l.st
 
 function findingCard(f, i, asm) {
   const as = f.assumptions.map((id) => `<abbr title="${esc(asm[id] ? asm[id].text : id)}">${esc(id)}</abbr>`).join(" ");
-  const x = decision(f.fingerprint, state.data.snapshot);
-  const dec = x ? `<div class="dec"><span class="st ${esc(x.d.state)}">${esc(x.d.state)}</span>${x.current ? "" : " on an earlier snapshot"} · ${esc(x.d.at.replace("T", " ").replace("Z", ""))}${x.d.comment ? ` · “${esc(x.d.comment)}”` : ""}</div>` : "";
-  const dis = canReview() ? "" : `disabled title="${state.live ? "Review decisions apply to the files on disk; the scratchpad is edited" : "Reviewing needs sqldiff-gui serve"}"`;
+  const x = decision(f.fingerprint);
+  const note = x && x.state === "outdated" ? " on an earlier snapshot" : x && x.state === "expired" ? " (expired)" : x && x.snapshot === "*" ? " for every snapshot" : "";
+  const dec = x ? `<div class="dec"><span class="st ${esc(x.d.state)}">${esc(x.d.state)}</span>${note} · ${esc(x.d.at.replace("T", " ").replace("Z", ""))}${x.d.comment ? ` · “${esc(x.d.comment)}”` : ""}</div>` : "";
+  const dis = canReview() ? "" : `disabled title="${state.live ? "Decisions apply to the files on disk: reset edits to review" : "Reviewing needs sqldiff-gui serve"}"`;
   const cur = x && x.current ? x.d.state : null;
   const acts = `<div class="racts">
       <button data-rv="accepted" ${dis} aria-pressed="${cur === "accepted"}" title="Deliberate or harmless: accept (a)">Accept</button>
@@ -616,7 +636,7 @@ function renderSide() {
   wireFlips($("side"));
 }
 function reviewAction(i, act) {
-  if (!canReview()) { if (state.scratchDirty) flash("reload the pair to review: the scratchpad is edited"); return; }
+  if (!canReview()) { if (state.scratchDirty) flash("reset edits to review: decisions apply to the files on disk"); return; }
   if (act === "comment") {
     if (state.commenting === i) saveComment(i);
     else { state.commenting = i; state.focus = i; renderSide(); }
@@ -624,13 +644,13 @@ function reviewAction(i, act) {
 }
 function currentComment(i) {
   const f = state.data.report.findings[i];
-  const x = decision(f.fingerprint, state.data.snapshot);
+  const x = decision(f.fingerprint);
   return x && x.current ? x.d.comment || null : null;
 }
 function saveComment(i) {
   const text = $("cmt-" + i) ? $("cmt-" + i).value : "";
   const f = state.data.report.findings[i];
-  const x = decision(f.fingerprint, state.data.snapshot);
+  const x = decision(f.fingerprint);
   // A comment keeps an accept or reject; on its own it is a "commented" decision.
   const st = x && x.current && x.d.state !== "commented" ? x.d.state : "commented";
   if (!text.trim() && st === "commented") { setReview(i, null, null); return; }
@@ -698,10 +718,51 @@ function copyFinding(i) {
 
 function flash(msg) { $("busy").textContent = msg; setTimeout(() => { if ($("busy").textContent === msg) $("busy").textContent = ""; }, 1500); }
 
-// Scratchpad: edits re-diff on the server, debounced; stale responses are dropped.
+// Inline editing: every code cell is editable; edits re-diff on the server, debounced; stale responses are dropped.
 let seq = 0, timer = null;
 // Drops a pending or in-flight scratch diff (its response is ignored).
 function cancelScratch() { clearTimeout(timer); seq++; }
+function onCodeInput(el) {
+  const side = +el.dataset.side, start = +el.dataset.start, end = +el.dataset.end;
+  const text = el.innerText.replace(/\r/g, "").replace(/\n$/, "");
+  const lines = state.src[side].split("\n");
+  const repl = text.split("\n");
+  lines.splice(start - 1, end - start + 1, ...repl);
+  state.src[side] = lines.join("\n");
+  el.dataset.end = start + repl.length - 1;
+  $("btn-reset").hidden = false;
+  scheduleDiff();
+}
+function lineOffset(text, line) { let o = 0; for (let k = 0; k < line; k++) { const i = text.indexOf("\n", o); o = i < 0 ? text.length + 1 : i + 1; } return o; }
+function captureCaret() {
+  const el = document.activeElement;
+  if (!el || !el.matches || !el.matches(".code[contenteditable]")) return null;
+  const sel = getSelection();
+  if (!sel.rangeCount) return null;
+  const r = sel.getRangeAt(0).cloneRange();
+  r.setStart(el, 0);
+  const side = +el.dataset.side;
+  return { side, abs: lineOffset(state.src[side], +el.dataset.start - 1) + r.toString().length };
+}
+function restoreCaret(c) {
+  if (!c) return;
+  for (const el of $("pane").querySelectorAll(`.code[contenteditable][data-side="${c.side}"]`)) {
+    const from = lineOffset(state.src[c.side], +el.dataset.start - 1);
+    const to = lineOffset(state.src[c.side], +el.dataset.end);
+    if (c.abs < from || c.abs > to) continue;
+    let left = c.abs - from;
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    let n, last = null;
+    el.focus({ preventScroll: true });
+    while ((n = w.nextNode())) {
+      last = n;
+      if (left <= n.length) { getSelection().collapse(n, left); return; }
+      left -= n.length;
+    }
+    if (last) getSelection().collapse(last, last.length); else getSelection().collapse(el, 0);
+    return;
+  }
+}
 function scheduleDiff() {
   clearTimeout(timer);
   state.scratchDirty = true;
@@ -709,26 +770,27 @@ function scheduleDiff() {
     const mine = ++seq;
     $("busy").textContent = "diffing…";
     try {
-      const data = await api("POST", "/api/diff", { pair: state.cur, a: $("ta-a").value, b: $("ta-b").value });
+      const data = await api("POST", "/api/diff", { pair: state.cur, a: state.src[0], b: state.src[1] });
       if (mine !== seq) return;
       const fp = state.focus >= 0 ? state.data.report.findings[state.focus].fingerprint : null;
+      const caret = captureCaret();
+      const top = $("pane").scrollTop;
       state.data = data;
-      state.expanded.clear();
       state.focus = fp ? data.report.findings.findIndex((f) => f.fingerprint === fp) : -1;
       render();
+      $("pane").scrollTop = top;
+      restoreCaret(caret);
       $("busy").textContent = "";
     } catch (e) {
       if (mine === seq) $("busy").textContent = "error: " + e.message;
     }
-  }, 200);
+  }, 250);
 }
-
-function toggleScratch() {
-  if (!state.live || state.view !== "pair") return;
-  const open = !$("scratch").classList.contains("open");
-  $("scratch").classList.toggle("open", open);
-  $("btn-scratch").setAttribute("aria-pressed", open);
-  if (open) $("ta-a").focus();
+async function resetEdits() {
+  cancelScratch();
+  if (state.live) state.page.pairs[state.cur] = null;
+  await loadPair(state.cur, false);
+  render();
 }
 
 function toggleFold() {
@@ -753,7 +815,7 @@ function commands() {
     for (const cl of CLASS_ORDER) if (state.data.report.findings.some((f) => f.class === cl)) add(`${state.hidden.has(cl) ? "Show" : "Hide"} ${cl} findings`, () => toggleClass(cl));
     add(state.hideAccepted ? "Show accepted findings" : "Hide accepted findings", toggleAccepted, "h");
     add(state.fold ? "Expand unchanged rows" : "Collapse unchanged rows", toggleFold, "c");
-    if (state.live) add("Toggle scratchpad", toggleScratch, "e");
+    if (state.live) add("Reset edits", resetEdits);
     if (state.focus >= 0) {
       add("Copy focused finding as text", () => copyFinding(state.focus), "y");
       if (state.live) {
@@ -802,9 +864,7 @@ function init() {
   if (!INITIAL) { document.body.innerHTML = "<p style='padding:20px'>No data. Open this page through <code>sqldiff-gui serve</code> or <code>sqldiff-gui export</code>.</p>"; return; }
   state.page = INITIAL;
   state.live = INITIAL.live;
-  if (!state.live) { $("btn-scratch").disabled = true; $("btn-scratch").title = "Editing needs sqldiff-gui serve"; }
-  $("ta-a").oninput = $("ta-b").oninput = scheduleDiff;
-  $("btn-scratch").onclick = toggleScratch;
+  $("btn-reset").onclick = resetEdits;
   $("btn-fold").onclick = toggleFold;
   $("btn-accepted").onclick = toggleAccepted;
   $("btn-palette").onclick = openPalette;
@@ -823,7 +883,7 @@ function init() {
   document.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); return; }
     const t = e.target.tagName;
-    if (t === "TEXTAREA" || t === "INPUT" || t === "SELECT" || e.metaKey || e.ctrlKey || e.altKey) { if (e.key === "Escape") e.target.blur(); return; }
+    if (t === "TEXTAREA" || t === "INPUT" || t === "SELECT" || e.target.isContentEditable || e.metaKey || e.ctrlKey || e.altKey) { if (e.key === "Escape") e.target.blur(); return; }
     const k = e.key;
     const pair = state.view === "pair";
     if (k === ":") openPalette();
@@ -840,7 +900,6 @@ function init() {
     else if (pair && k === "[") stepRow(-1);
     else if (pair && k === "c") toggleFold();
     else if (pair && k === "h") toggleAccepted();
-    else if (pair && k === "e" && state.live) toggleScratch();
     else if (pair && k === "y" && state.focus >= 0) copyFinding(state.focus);
     else if (pair && k === "a" && state.focus >= 0) reviewAction(state.focus, "accepted");
     else if (pair && k === "x" && state.focus >= 0) reviewAction(state.focus, "rejected");

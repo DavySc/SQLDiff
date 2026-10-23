@@ -10,7 +10,7 @@ Design §14 M1 asks for a two-pane view with per-token styling and synchronised 
 cargo build --release
 G=target/release/sqldiff-gui
 
-# Live: local server on 127.0.0.1:7878, scratchpad edits re-diff as you type
+# Live: local server on 127.0.0.1:7878, edits in the panes re-diff as you type
 $G serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
 
 # From a CLI report: paths and dialects are taken from `sqldiff diff -f json`
@@ -25,9 +25,9 @@ $G export --report report.json -o pair.html
 - **Synchronised scroll** for free: both sides are cells of the same rows in one scroll container.
 - **Per-token styling** from the lossless CST tokens (keyword, identifier, variable, literal, comment, error), plus change marks: changed tokens inside a paired row, rows present on one side only, and a dotted underline where tokens pair only through the cross-dialect key.
 - **Findings panel** with class, severity, verdict, witness, assumption ids (hover for text) and fingerprint. Rows carrying a finding get a coloured gutter; clicking either jumps to the other.
-- **Keyboard:** `j`/`k` next/previous finding, `]`/`[` next/previous changed row, `c` collapse unchanged, `e` scratchpad, `y` copy finding as text, `?` help.
+- **Keyboard:** `j`/`k` next/previous finding, `]`/`[` next/previous changed row, `c` collapse unchanged, `y` copy finding as text, `?` help.
 - **Deep links:** `#f=<fingerprint>` opens that finding (for `open_in_gui`).
-- **Re-render on edit:** the scratchpad posts both texts to `/api/diff`; the server re-runs the engine and returns a new payload. Sources on disk are never written. Fingerprints are stable, so the focused finding survives edits. A browser refresh re-reads the files.
+- **Inline editing:** every code cell in the pair view is `contenteditable="plaintext-only"` in live mode (not in a static export). An edit splices the cell text into that side's source (by the block's line range) and, 250 ms after the last keystroke, posts both texts to `/api/diff`; the server re-runs the engine and returns a new payload. Sources on disk are never written. Fingerprints are stable, so the focused finding survives edits. A browser refresh re-reads the files.
 
 The page consumes exactly the `sqldiff diff -f json` report, plus a `view` (rows, blocks, token segments) and the two source texts. All analysis and alignment runs in Rust; the page only renders.
 
@@ -42,6 +42,23 @@ The page consumes exactly the `sqldiff diff -f json` report, plus a `view` (rows
 What the spike did *not* settle, and the trigger to revisit:
 
 - **Large files.** Rendering is plain DOM, one element per token. Fine for routines of a few thousand lines; for very large files, swap the code cells for a virtualised code view (CodeMirror 6 is the likely choice) behind the same payload.
-- **In-place editing.** The scratchpad is a pair of textareas above the view. Editing inside the panes would need a real editor component (same trigger as above).
+- **Inline editing limits.** Editing is per code cell on plain DOM. Cells with no counterpart on the other side (hatched) and rows folded by "Collapse unchanged" cannot be typed into; add a statement by pressing Enter at the end of a neighbouring line. A real editor component (CodeMirror, same trigger as above) would remove these limits.
 - **Incremental re-diff.** Each edit re-runs the full diff; it is fast enough on routine-sized inputs, and the design's incremental re-diff can come with the IR (M4).
 - **Review queue, lens switch, transaction overlay, "what if", assumption flips, review store.** Out of scope for M1; the payload has room for them.
+
+## Notes for agents picking this up
+
+What changed after the M1 spike, and why (all in `crates/sqldiff-gui/assets/index.html` unless noted):
+
+- **Live editing was broken.** On startup the page set `state.data` directly, so `openPair` skipped `loadPair`, the only place that filled the editor textareas. Both stayed empty. `syncEditors()` now runs for every freshly loaded pair, including the first.
+- **The scratchpad was replaced by inline editing.** Users expected to type in the diff panes, not in a hidden box. The `#scratch` textareas, the Edit button and the `e` key are gone. The source texts live in `state.src` (normalised to LF); `onCodeInput` edits them, `scheduleDiff` re-diffs, and `captureCaret`/`restoreCaret` keep the caret in place across the re-render by tracking an absolute character offset in the side's source. Pane scroll position is kept too. **Reset edits** (toolbar, palette) calls `loadPair(cur, false)`.
+- **Decluttered.** Filter chips, Hide accepted and Collapse unchanged moved to a toolbar row. Config and hash details sit behind **Details** (`body.show-info`). Finding cards are compact: only the focused card shows meta and the Accept/Reject/Comment buttons, and others clamp the witness to three lines.
+- **Test fix** (`crates/sqldiff-review/tests/review.rs`): `redacted_export_passes_leak_check` ran a bare `bash`, which on Windows resolves to the WSL relay in `System32` and fails without a distro. The `bash()` helper uses `SQLDIFF_BASH`, then Git for Windows' bash, then `bash`.
+
+Gotchas:
+
+- Editing the CSS block by regex is risky: one earlier edit deleted the tail of a line and left an unclosed `@media`, which silently dropped all later rules. Check that braces balance after CSS edits.
+- To verify GUI behaviour for real, drive headless Edge over the DevTools protocol (`--remote-debugging-port`, `Input.insertText` into a focused `.code` cell) rather than posting to `/api/diff`; the API worked all along while the page did not.
+- A running `sqldiff-gui.exe` locks `target/release/sqldiff-gui.exe` on Windows; stop it before `cargo build --release`.
+
+Not done yet: terminal output is still plain (no colour, long witnesses are not wrapped) and the `movestock` demo fixture is only about 10 lines.
