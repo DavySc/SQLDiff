@@ -113,6 +113,19 @@ impl Ty {
                 fam_len(Fam::VarChar, tsql_default)
             }
             "TEXT" => Ty::of(Fam::VarChar),
+            // Large and double-byte character types compare as strings too
+            // (collation applies); CITEXT is left out on purpose (case-insensitive).
+            "CLOB" | "NCLOB" | "DBCLOB" | "NTEXT" | "VARGRAPHIC" | "LONG VARCHAR"
+            | "LONG VARGRAPHIC" => Ty {
+                fam: Fam::VarChar,
+                len: if max { None } else { n(0) },
+                scale: None,
+            },
+            "GRAPHIC" => Ty {
+                fam: Fam::Char,
+                len: n(0).or(Some(1)),
+                scale: None,
+            },
             "CHAR" | "NCHAR" | "CHARACTER" | "BPCHAR" => Ty {
                 fam: Fam::Char,
                 len: n(0).or(Some(1)),
@@ -322,5 +335,23 @@ mod tests {
         assert_eq!(ty(Dialect::Tsql), (Some(18), Some(0)));
         assert_eq!(ty(Dialect::Db2i), (Some(5), Some(0)));
         assert_eq!(ty(Dialect::Postgres), (None, None));
+    }
+
+    #[test]
+    fn large_character_types_are_strings() {
+        for (ddl, d) in [
+            ("CREATE TABLE t (a ntext, b nvarchar(max));", Dialect::Tsql),
+            ("CREATE TABLE t (a clob(1M), b dbclob(100));", Dialect::Db2i),
+            (
+                "CREATE TABLE t (a vargraphic(20), b graphic(4));",
+                Dialect::Db2i,
+            ),
+        ] {
+            let s = Schema::load(&[Artifact::new("t.sql", d, ddl)]);
+            let t = s.table("t").unwrap();
+            for c in &t.columns {
+                assert!(c.ty.is_string(), "{ddl}: {} is {:?}", c.name, c.ty);
+            }
+        }
     }
 }

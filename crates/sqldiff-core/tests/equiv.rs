@@ -334,3 +334,35 @@ fn tsql_continues_after_a_failed_statement() {
         rules(&r)
     );
 }
+
+/// Large character types (T-SQL `ntext`, Db2 `clob`) compare as strings: the
+/// collation difference keeps the pair from being equal.
+#[test]
+fn large_character_columns_are_strings() {
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            T,
+            "CREATE VIEW dbo.v AS SELECT id FROM dbo.notes WHERE body = title;",
+        ),
+        &Artifact::new(
+            "b.sql",
+            D,
+            "CREATE VIEW v AS SELECT id FROM notes WHERE body = title;",
+        ),
+        &Options {
+            catalog_a: vec![Artifact::new(
+                "c.sql",
+                T,
+                "CREATE TABLE dbo.notes (id int NOT NULL PRIMARY KEY, body ntext NULL, title ntext NULL);",
+            )],
+            catalog_b: vec![Artifact::new(
+                "c.sql",
+                D,
+                "CREATE TABLE notes (id int NOT NULL PRIMARY KEY, body clob(1M), title clob(1M));",
+            )],
+            ..Options::default()
+        },
+    );
+    assert!(not_equal(&r), "{:?} {:?}", r.verdict, rules(&r));
+}
