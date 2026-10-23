@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use sqldiff_syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
+use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
 use crate::out::Out;
@@ -16,6 +16,16 @@ use crate::tok::{
 use crate::{Note, Status};
 
 const INDENT: usize = 2;
+
+/// Rule id of a refusal because of where the unit stands.
+const CONTEXT: &str = "not-converted.context";
+
+/// The idiom rules (`sqldiff_core::rules`), for what the token rules refuse.
+mod rules {
+    pub use sqldiff_core::rules::convert::{convert_nodes, Options, Piece};
+    pub use sqldiff_core::rules::rewrite::NoFacts;
+    pub use sqldiff_core::rules::rule::{RuleSet, Status};
+}
 
 pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
     let mut cx = Cx {
@@ -28,12 +38,17 @@ pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
         in_cast: false,
         return_code: false,
         decls: Vec::new(),
+        context: false,
     };
     let mut out = Out::default();
-    for el in root.children_with_tokens() {
+    let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
+    let mut joined = 0;
+    for (i, el) in els.iter().cloned().enumerate() {
         match el {
             SyntaxElement::Node(n) if n.kind() == BATCH => cx.batch(&mut out, &n),
-            SyntaxElement::Node(n) if n.kind().is_unit() => cx.unit(&mut out, &n, 0),
+            SyntaxElement::Node(n) if n.kind().is_unit() => {
+                cx.list_unit(&mut out, &els, i, 0, &mut joined)
+            }
             SyntaxElement::Token(t) if matches!(t.kind(), LINE_COMMENT | BLOCK_COMMENT) => {
                 out.lines(0, t.text())
             }
@@ -91,6 +106,10 @@ struct Cx<'a> {
     /// A procedure returns a value somewhere: it gets an INOUT `return_code`.
     return_code: bool,
     decls: Vec<Decl>,
+    /// The unit being converted was refused because of where it stands, not
+    /// for want of a rule: the idiom rules, which see statements out of
+    /// context, must not take it either.
+    context: bool,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -111,6 +130,12 @@ impl Cx<'_> {
                 text: text.to_string(),
             });
         }
+    }
+
+    /// A refusal because of the unit's context (see `context`).
+    fn misplaced<T>(&mut self, reason: &str) -> R<T> {
+        self.context = true;
+        no(reason)
     }
 
     fn take_notes(&mut self) -> Vec<Note> {
@@ -136,13 +161,18 @@ impl Cx<'_> {
     fn refuse(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, reason: &str) {
         let text = self.commented(n, reason);
         self.notes.clear();
+        let rule = if std::mem::take(&mut self.context) {
+            CONTEXT
+        } else {
+            "not-converted"
+        };
         out.unit(
             Self::range(n),
             indent,
             &text,
             vec![Note {
                 status: Status::NotConverted,
-                rule: "not-converted".into(),
+                rule: rule.into(),
                 text: reason.to_string(),
             }],
         );
@@ -331,7 +361,7 @@ impl Cx<'_> {
             );
             let output = p.iter().any(|t| t.is("OUTPUT") || t.is("OUT"));
             if output && func {
-                return no("OUTPUT parameters on a function");
+                return self.misplaced("OUTPUT parameters on a function");
             }
             let mut text = format!("{}{pname} {ty}", if output { "INOUT " } else { "" });
             if let Some(eq) = p[..].iter().position(|t| t.k == OP && t.s == "=") {
@@ -421,9 +451,13 @@ impl Cx<'_> {
 
     /// Writes the units and comments directly inside `n`, skipping its own keywords.
     fn body_elements(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
-        for el in n.children_with_tokens() {
+        let els: Vec<SyntaxElement> = n.children_with_tokens().collect();
+        let mut joined = 0;
+        for (i, el) in els.iter().cloned().enumerate() {
             match el {
-                SyntaxElement::Node(c) if c.kind().is_unit() => self.unit(out, &c, indent),
+                SyntaxElement::Node(c) if c.kind().is_unit() => {
+                    self.list_unit(out, &els, i, indent, &mut joined)
+                }
                 SyntaxElement::Node(c) if c.kind().is_container() => {
                     self.body_elements(out, &c, indent)
                 }
@@ -435,20 +469,148 @@ impl Cx<'_> {
         }
     }
 
+    /// Converts the unit `els[i]` of a list. `joined` is where the last pair
+    /// converted together ended: a unit before it is already written.
+    fn list_unit(
+        &mut self,
+        out: &mut Out,
+        els: &[SyntaxElement],
+        i: usize,
+        indent: usize,
+        joined: &mut usize,
+    ) {
+        let Some(n) = els[i].as_node() else { return };
+        if Self::range(n).0 < *joined {
+            return;
+        }
+        if let Some(next) = adjacent_unit(els, i) {
+            if self.idiom_pair(out, n, &next, indent) {
+                *joined = Self::range(&next).1;
+                return;
+            }
+        }
+        self.unit(out, n, indent)
+    }
+
+    /// The idiom rules on `nodes`, with variables spelled as the token rules
+    /// spell them (so after the DECLAREs seen so far). Also says whether a
+    /// variable had no declaration.
+    fn idioms(&self, nodes: &[SyntaxNode]) -> (Vec<rules::Piece>, bool) {
+        let undeclared = std::cell::Cell::new(false);
+        let vars = |v: &str| {
+            self.declared(v).unwrap_or_else(|| {
+                undeclared.set(true);
+                undeclared_name(v)
+            })
+        };
+        let opts = rules::Options {
+            rules: rules::RuleSet::builtin(),
+            facts: &rules::NoFacts,
+            vars: &vars,
+        };
+        let pieces = rules::convert_nodes(nodes, Dialect::Tsql, Dialect::Postgres, &opts);
+        (pieces, undeclared.get())
+    }
+
+    /// Two adjacent statements the idiom rules convert as one (INSERT +
+    /// SCOPE_IDENTITY, sp_getapplock + its return-code check), which the
+    /// token rules see apart. Only in a procedure or DO block and outside
+    /// TRY/CATCH, where the rules' plain statements mean what they say.
+    fn idiom_pair(&mut self, out: &mut Out, a: &SyntaxNode, b: &SyntaxNode, indent: usize) -> bool {
+        if !matches!(self.mode, Mode::Proc | Mode::Do)
+            || self.in_try
+            || self.in_catch
+            || a.kind() != STATEMENT
+            || !matches!(first_word(a).as_str(), "INSERT" | "EXEC" | "EXECUTE")
+        {
+            return false;
+        }
+        let (pieces, undeclared) = self.idioms(&[a.clone(), b.clone()]);
+        match pieces.as_slice() {
+            [p] if p.units.len() == 2 && p.output.is_ok() && !p.rules.is_empty() => {
+                self.piece(out, p, undeclared, indent);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A data statement the token rules refused for want of a rule (MERGE,
+    /// DELETE … JOIN), if an idiom rule converts it. Never a refusal because
+    /// of context, never a statement whose meaning depends on where it stands
+    /// (RETURN, THROW, transaction control, result sets), never a compound.
+    fn idiom_single(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) -> bool {
+        if self.context
+            || !matches!(
+                first_word(n).as_str(),
+                "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+            )
+            || self.mode == Mode::Top && procedural(n)
+        {
+            return false;
+        }
+        let (pieces, undeclared) = self.idioms(std::slice::from_ref(n));
+        match pieces.as_slice() {
+            [p] if p.output.is_ok() && !p.rules.is_empty() => {
+                self.notes.clear();
+                self.piece(out, p, undeclared, indent);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn piece(&mut self, out: &mut Out, p: &rules::Piece, undeclared: bool, indent: usize) {
+        let mut notes = vec![Note {
+            status: Status::Converted,
+            rule: "idiom-rules".into(),
+            text: format!("Converted by the idiom rules ({}).", p.rules.join(", ")),
+        }];
+        notes.extend(p.notes.iter().map(|a| Note {
+            status: a.status.into(),
+            rule: a.rule.clone(),
+            text: a.text.clone(),
+        }));
+        notes.extend(p.assumptions.iter().map(|(id, text)| Note {
+            status: Status::Assumptions,
+            rule: id.clone(),
+            text: text.clone(),
+        }));
+        if undeclared {
+            notes.push(Note {
+                status: Status::Assumptions,
+                rule: "ASM-UNDECLARED-VAR".into(),
+                text: UNDECLARED.into(),
+            });
+        }
+        let text = p.output.as_deref().unwrap_or_default();
+        out.unit(p.src, indent, text, notes);
+    }
+
+    /// How a declared T-SQL variable (or parameter) is spelled in the output.
+    fn declared(&self, v: &str) -> Option<String> {
+        self.vars
+            .get(&v.trim_start_matches('@').to_ascii_lowercase())
+            .map(|x| x.name.clone())
+    }
+
     fn unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
         self.notes.clear();
+        self.context = false;
         match n.kind() {
-            STATEMENT => match self.stmt(n) {
-                Ok(_) if self.blocked().is_some() => {
-                    let reason = self.blocked().unwrap();
+            STATEMENT => {
+                let reason = match self.stmt(n) {
+                    Ok(_) if self.blocked().is_some() => self.blocked().unwrap(),
+                    Ok(text) => {
+                        let notes = self.take_notes();
+                        return out.unit(Self::range(n), indent, &text, notes);
+                    }
+                    Err(No(reason)) => reason,
+                };
+                if !self.idiom_single(out, n, indent) {
                     self.refuse(out, n, indent, &reason)
                 }
-                Ok(text) => {
-                    let notes = self.take_notes();
-                    out.unit(Self::range(n), indent, &text, notes);
-                }
-                Err(No(reason)) => self.refuse(out, n, indent, &reason),
-            },
+            }
             BLOCK => self.body_elements(out, n, indent),
             IF_STMT if self.mode != Mode::Top => self.if_stmt(out, n, indent, false),
             LOOP_STMT if self.mode != Mode::Top => self.while_stmt(out, n, indent),
@@ -584,13 +746,13 @@ impl Cx<'_> {
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
         if self.mode == Mode::Top && procedural(n) {
-            return no("uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block");
+            return self.misplaced("uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block");
         }
         let text = match w(0).as_str() {
             "SELECT" | "WITH" => {
                 let (q, assigns) = self.select(&ts)?;
                 if self.mode != Mode::Top && !assigns {
-                    return no("returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed");
+                    return self.misplaced("returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed");
                 }
                 q
             }
@@ -951,9 +1113,9 @@ impl Cx<'_> {
                 self.return_code = true;
                 Ok(format!("return_code := {v};\nRETURN;"))
             }
-            (Mode::Func, None) => no("RETURN without a value in a function"),
+            (Mode::Func, None) => self.misplaced("RETURN without a value in a function"),
             (_, None) => Ok("RETURN".into()),
-            (_, Some(_)) => no("RETURN with a value outside a procedure"),
+            (_, Some(_)) => self.misplaced("RETURN with a value outside a procedure"),
         }
     }
 
@@ -964,7 +1126,7 @@ impl Cx<'_> {
             if self.in_catch {
                 return Ok("RAISE".into());
             }
-            return no("THROW without arguments outside CATCH");
+            return self.misplaced("THROW without arguments outside CATCH");
         }
         let args = split_commas(&ts[s[1]..]);
         if args.len() != 3 {
@@ -989,13 +1151,15 @@ impl Cx<'_> {
                 }
                 Ok(kw.to_string())
             }
-            Mode::Func => no("transaction control inside a function is not allowed in PostgreSQL"),
+            Mode::Func => {
+                self.misplaced("transaction control inside a function is not allowed in PostgreSQL")
+            }
             Mode::Proc | Mode::Do => {
                 if self.in_try && kw != "BEGIN" {
-                    return no("COMMIT/ROLLBACK inside TRY: the PostgreSQL block with an EXCEPTION clause is a subtransaction, and committing inside it fails at runtime; move the transaction control outside the block");
+                    return self.misplaced("COMMIT/ROLLBACK inside TRY: the PostgreSQL block with an EXCEPTION clause is a subtransaction, and committing inside it fails at runtime; move the transaction control outside the block");
                 }
                 if self.in_catch {
-                    return no("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
+                    return self.misplaced("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
                 }
                 if kw == "BEGIN" {
                     self.note(Status::Decision, "pg.proc-transaction", "A PostgreSQL procedure already runs inside a transaction; BEGIN TRAN is dropped. Nested-transaction behaviour (@@TRANCOUNT) does not exist.");
@@ -1300,12 +1464,11 @@ impl Cx<'_> {
             );
             return v.to_string();
         }
-        let key = v[1..].to_ascii_lowercase();
-        if let Some(x) = self.vars.get(&key) {
-            return x.name.clone();
+        if let Some(name) = self.declared(v) {
+            return name;
         }
-        self.note(Status::Assumptions, "ASM-UNDECLARED-VAR", "A variable is used without a declaration in this unit; it was renamed with the v_ prefix.");
-        format!("v_{}", snake(&v[1..]))
+        self.note(Status::Assumptions, "ASM-UNDECLARED-VAR", UNDECLARED);
+        undeclared_name(v)
     }
 
     fn operand_kind(&self, ts: &[T], j: Option<usize>) -> (bool, bool) {
@@ -1737,6 +1900,48 @@ impl Cx<'_> {
 }
 
 /// Whether a batch-level unit needs PL/pgSQL (variables or control flow).
+/// Note text for a variable used without a declaration.
+const UNDECLARED: &str =
+    "A variable is used without a declaration in this unit; it was renamed with the v_ prefix.";
+
+fn undeclared_name(v: &str) -> String {
+    format!("v_{}", snake(v.trim_start_matches('@')))
+}
+
+/// The first keyword of a unit, upper case.
+fn first_word(n: &SyntaxNode) -> String {
+    tokens(n)
+        .iter()
+        .find(|t| t.sig())
+        .map(|t| t.up())
+        .unwrap_or_default()
+}
+
+/// The unit after `els[i]` when only whitespace and semicolons stand between
+/// them (a comment or anything else keeps them apart).
+fn adjacent_unit(els: &[SyntaxElement], i: usize) -> Option<SyntaxNode> {
+    for el in &els[i + 1..] {
+        match el {
+            SyntaxElement::Node(n) if n.kind().is_unit() => return Some(n.clone()),
+            SyntaxElement::Token(t) if matches!(t.kind(), WHITESPACE | SEMICOLON) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+impl From<rules::Status> for Status {
+    fn from(s: rules::Status) -> Self {
+        match s {
+            rules::Status::Converted => Status::Converted,
+            rules::Status::Assumptions => Status::Assumptions,
+            rules::Status::Decision => Status::Decision,
+            rules::Status::Differs => Status::Differs,
+            rules::Status::NotConverted => Status::NotConverted,
+        }
+    }
+}
+
 fn procedural(n: &SyntaxNode) -> bool {
     if matches!(n.kind(), IF_STMT | LOOP_STMT | TRY_CATCH | BLOCK) {
         return true;

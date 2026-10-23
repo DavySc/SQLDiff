@@ -347,3 +347,157 @@ fn declare_notes_are_counted_once() {
         .count();
     assert_eq!((decl, time), (1, 1), "{:#?}", c.units);
 }
+
+const IDIOMS: &str = "CREATE PROCEDURE dbo.Feed @Item int, @Price decimal(12,2), @Customer int AS
+BEGIN
+  DECLARE @OrderId int, @rc int;
+  MERGE dbo.item_price WITH (HOLDLOCK) AS t USING (SELECT @Item AS item_id, @Price AS unit_price) AS s ON t.item_id = s.item_id WHEN MATCHED THEN UPDATE SET unit_price = s.unit_price WHEN NOT MATCHED THEN INSERT (item_id, unit_price) VALUES (s.item_id, s.unit_price);
+  DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id WHERE i.item_id IS NULL;
+  INSERT INTO dbo.orders (customer_id) VALUES (@Customer);
+  SET @OrderId = SCOPE_IDENTITY();
+  EXEC @rc = sp_getapplock @Resource = 'price-feed', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1;
+  IF @rc < 0 BEGIN ROLLBACK; THROW 50020, 'lock not granted', 1; END
+END
+";
+
+#[test]
+fn idiom_rules_convert_what_the_token_rules_refuse() {
+    let c = tsql(IDIOMS);
+    let cases = [
+        (
+            "MERGE",
+            "ON CONFLICT (item_id) DO UPDATE SET unit_price = p_price",
+        ),
+        (
+            "DELETE pf",
+            "NOT EXISTS (SELECT 1 FROM item WHERE item.item_id = price_feed.item_id)",
+        ),
+        (
+            "EXEC @rc",
+            "PERFORM pg_advisory_xact_lock(hashtext('price-feed'));",
+        ),
+    ];
+    for (needle, want) in cases {
+        let u = unit(&c, IDIOMS, needle);
+        // The rules' own verdict; the engine may still find the procedure's
+        // autocommit-per-statement behaviour different around it.
+        assert!(
+            u.notes.iter().all(|n| n.status < Status::Differs),
+            "{needle}: {:?}",
+            u.notes
+        );
+        assert!(has_rule(u, "idiom-rules"), "{needle}");
+        assert!(out_of(&c, u).contains(want), "{needle}: {}", out_of(&c, u));
+    }
+    assert_eq!(c.counts.not_converted, 0, "{}", c.output);
+}
+
+#[test]
+fn idiom_rules_join_statements_the_token_rules_see_apart() {
+    let c = tsql(IDIOMS);
+    let insert = unit(&c, IDIOMS, "INSERT INTO dbo.orders");
+    let identity = unit(&c, IDIOMS, "SCOPE_IDENTITY");
+    // One unit for INSERT + SCOPE_IDENTITY, named with the procedure's variables.
+    assert_eq!(insert.src, identity.src);
+    assert!(
+        out_of(&c, insert).contains("v_order_id := lastval();"),
+        "{}",
+        out_of(&c, insert)
+    );
+    // Without a catalog the rules cannot prove RETURNING, and say so.
+    assert!(
+        has_rule(insert, "ASM-LASTVAL-SAME-INSERT"),
+        "{:?}",
+        insert.notes
+    );
+    // The lock check after sp_getapplock is part of the lock unit.
+    assert_eq!(
+        unit(&c, IDIOMS, "IF @rc").src,
+        unit(&c, IDIOMS, "EXEC @rc").src
+    );
+}
+
+#[test]
+fn idiom_rules_use_the_declared_names() {
+    // The DECLARE spells it @orderid, the use site @OrderId: one variable, one name.
+    let src = "CREATE PROCEDURE p @Customer int AS\nBEGIN\n  DECLARE @orderid int;\n  INSERT INTO dbo.orders (customer_id) VALUES (@Customer);\n  SET @OrderId = SCOPE_IDENTITY();\nEND\n";
+    let c = tsql(src);
+    assert!(c.output.contains("v_orderid integer;"), "{}", c.output);
+    assert!(c.output.contains("v_orderid := lastval();"), "{}", c.output);
+    assert!(!has_rule(
+        unit(&c, src, "SCOPE_IDENTITY"),
+        "ASM-UNDECLARED-VAR"
+    ));
+    // Undeclared variables are named as the token rules name them, and noted.
+    let src = "CREATE PROCEDURE p @Customer int AS\nBEGIN\n  INSERT INTO dbo.orders (customer_id) VALUES (@Customer);\n  SET @NewId = SCOPE_IDENTITY();\nEND\n";
+    let c = tsql(src);
+    let u = unit(&c, src, "SCOPE_IDENTITY");
+    assert!(
+        out_of(&c, u).contains("v_new_id := lastval();"),
+        "{}",
+        c.output
+    );
+    assert!(has_rule(u, "ASM-UNDECLARED-VAR"), "{:?}", u.notes);
+}
+
+#[test]
+fn context_refusals_are_not_handed_to_the_idiom_rules() {
+    let cases = [
+        // RETURN with a value in a DO block, THROW; outside CATCH.
+        ("DECLARE @x int = 1;\nRETURN 1;\n", "RETURN 1"),
+        ("DECLARE @x int = 1;\nTHROW;\n", "THROW"),
+        // RETURN; in a scalar function.
+        (
+            "CREATE FUNCTION f() RETURNS int AS\nBEGIN\n  RETURN;\nEND\n",
+            "RETURN;",
+        ),
+        // A result set in a procedure.
+        (
+            "CREATE PROCEDURE p AS\nBEGIN\n  SELECT a FROM t;\nEND\n",
+            "SELECT",
+        ),
+    ];
+    for (src, needle) in cases {
+        let c = tsql(src);
+        let u = unit(&c, src, needle);
+        assert_eq!(u.status, Status::NotConverted, "{needle}: {}", c.output);
+        assert!(!has_rule(u, "idiom-rules"), "{needle}");
+    }
+}
+
+#[test]
+fn statement_pairs_keep_the_context_checks() {
+    // Beside a routine in one batch: plain SQL, no variables, so no pair.
+    let src = "INSERT INTO t (a) VALUES (1);\nSET @id = SCOPE_IDENTITY();\nCREATE VIEW v AS SELECT a FROM t;\nGO\n";
+    let c = tsql(src);
+    let set = unit(&c, src, "SET @id");
+    assert_eq!(set.status, Status::NotConverted, "{}", c.output);
+    assert!(!c.output.contains("lastval"), "{}", c.output);
+    // Inside TRY (a subtransaction) the lock and its ROLLBACK are not joined.
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  DECLARE @rc int;\n  BEGIN TRY\n    EXEC @rc = sp_getapplock @Resource = 'r', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1;\n    IF @rc < 0 BEGIN ROLLBACK; THROW 50020, 'no lock', 1; END\n  END TRY\n  BEGIN CATCH\n    PRINT 'x';\n  END CATCH\nEND\n";
+    let c = tsql(src);
+    assert!(!c.output.contains("pg_advisory_xact_lock"), "{}", c.output);
+    assert_eq!(unit(&c, src, "EXEC @rc").status, Status::NotConverted);
+    // A comment between the two statements keeps them apart.
+    let src = "CREATE PROCEDURE p @Customer int AS\nBEGIN\n  DECLARE @id int;\n  INSERT INTO dbo.orders (customer_id) VALUES (@Customer);\n  -- the key\n  SET @id = SCOPE_IDENTITY();\nEND\n";
+    let c = tsql(src);
+    assert_ne!(unit(&c, src, "INSERT").src, unit(&c, src, "SET @id").src);
+}
+
+#[test]
+fn only_the_refused_statement_goes_to_the_idiom_rules() {
+    let src = "CREATE PROCEDURE p @Item int, @Price decimal(12,2) AS\nBEGIN\n  IF @Price > 0\n  BEGIN\n    MERGE dbo.item_price WITH (HOLDLOCK) AS t USING (SELECT @Item AS item_id, @Price AS unit_price) AS s ON t.item_id = s.item_id WHEN MATCHED THEN UPDATE SET unit_price = s.unit_price WHEN NOT MATCHED THEN INSERT (item_id, unit_price) VALUES (s.item_id, s.unit_price);\n    RETURN 1;\n  END\nEND\n";
+    let c = tsql(src);
+    // The IF and RETURN keep the token rules' spelling; only the MERGE is the rules'.
+    assert!(c.output.contains("IF p_price > 0 THEN"), "{}", c.output);
+    assert!(c.output.contains("return_code := 1;"), "{}", c.output);
+    assert!(c.output.contains("INOUT return_code"), "{}", c.output);
+    let m = unit(&c, src, "MERGE");
+    assert!(has_rule(m, "idiom-rules"), "{:?}", m.notes);
+    assert!(
+        out_of(&c, m).contains("ON CONFLICT (item_id)"),
+        "{}",
+        out_of(&c, m)
+    );
+    assert!(!has_rule(unit(&c, src, "RETURN 1"), "idiom-rules"));
+}
