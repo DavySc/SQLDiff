@@ -24,6 +24,8 @@ pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
         notes: Vec::new(),
         mode: Mode::Top,
         in_catch: false,
+        in_try: false,
+        in_cast: false,
         return_code: false,
         decls: Vec::new(),
     };
@@ -82,6 +84,10 @@ struct Cx<'a> {
     notes: Vec<Note>,
     mode: Mode,
     in_catch: bool,
+    /// Inside the TRY part of a `BEGIN … EXCEPTION` block (a subtransaction).
+    in_try: bool,
+    /// Mapping the target type of CAST/CONVERT (string lengths default to 30 there, 1 elsewhere).
+    in_cast: bool,
     /// A procedure returns a value somewhere: it gets an INOUT `return_code`.
     return_code: bool,
     decls: Vec<Decl>,
@@ -146,8 +152,11 @@ impl Cx<'_> {
 
     fn batch(&mut self, out: &mut Out, b: &SyntaxNode) {
         let units: Vec<SyntaxNode> = b.children().filter(|c| c.kind().is_unit()).collect();
-        if let Some(r) = units.iter().find(|u| u.kind() == ROUTINE) {
-            self.routine(out, r);
+        if units.iter().any(|u| u.kind() == ROUTINE) {
+            // T-SQL wants CREATE PROCEDURE alone in its batch, but views and
+            // tables can share one: convert every unit, never drop one.
+            self.mode = Mode::Top;
+            self.body_elements(out, b, 0);
             return;
         }
         if units.iter().any(procedural) {
@@ -249,7 +258,7 @@ impl Cx<'_> {
             .children()
             .find(|c| c.kind() == STATEMENT)
             .ok_or(No("view body is not a query".into()))?;
-        let q = self.select(&tokens(&stmt))?;
+        let (q, _) = self.select(&tokens(&stmt))?;
         Ok(Some(format!("CREATE OR REPLACE VIEW {name} AS\n{q};")))
     }
 
@@ -280,10 +289,10 @@ impl Cx<'_> {
         }
         let name = self.expr(&name_toks).trim().to_string();
         // Parameters: up to RETURNS (functions) or a top-level WITH / AS.
+        let ds = crate::tok::depths(&ts[i..]);
         let stop = (i..ts.len())
             .find(|&j| {
-                crate::tok::depths(&ts[i..])[j - i] == 0
-                    && (ts[j].is("RETURNS") || ts[j].is("AS") || ts[j].is("WITH"))
+                ds[j - i] == 0 && (ts[j].is("RETURNS") || ts[j].is("AS") || ts[j].is("WITH"))
             })
             .unwrap_or(ts.len());
         let mut ptoks = trimmed(&ts[i..stop]).to_vec();
@@ -380,6 +389,13 @@ impl Cx<'_> {
             params.push("INOUT return_code integer DEFAULT NULL".into());
         }
         self.notes = header_notes;
+        if ts[..kw].iter().any(|t| t.is("ALTER")) {
+            self.note(
+                Status::Assumptions,
+                "ASM-ROUTINE-REPLACE",
+                "ALTER becomes CREATE OR REPLACE, which replaces the routine only if the parameter types are unchanged. With a changed parameter list PostgreSQL adds a second overload (calls can become ambiguous): drop the old signature first.",
+            );
+        }
         if self.return_code {
             self.note(
                 Status::Assumptions,
@@ -550,7 +566,9 @@ impl Cx<'_> {
         );
         let notes = self.take_notes();
         out.unit((s, s + 9), indent, "BEGIN", notes);
+        let was_try = std::mem::replace(&mut self.in_try, true);
         self.body_elements(out, &try_b, indent + INDENT);
+        self.in_try = was_try;
         out.lines(indent, "EXCEPTION WHEN OTHERS THEN");
         let was = std::mem::replace(&mut self.in_catch, true);
         self.body_elements(out, &catch_b, indent + INDENT);
@@ -565,10 +583,13 @@ impl Cx<'_> {
         let s = sig(&ts);
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
+        if self.mode == Mode::Top && procedural(n) {
+            return no("uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block");
+        }
         let text = match w(0).as_str() {
             "SELECT" | "WITH" => {
-                let q = self.select(&ts)?;
-                if self.mode != Mode::Top && !q.contains(" INTO ") && !q.contains(":=") {
+                let (q, assigns) = self.select(&ts)?;
+                if self.mode != Mode::Top && !assigns {
                     return no("returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed");
                 }
                 q
@@ -622,7 +643,8 @@ impl Cx<'_> {
         v
     }
 
-    fn select(&mut self, ts: &[T]) -> R<String> {
+    /// A query, and whether it assigns variables (`SELECT @a = …`).
+    fn select(&mut self, ts: &[T]) -> R<(String, bool)> {
         let ts = Self::body_toks(ts);
         let ds = crate::tok::depths(&ts);
         let s = sig(&ts);
@@ -630,10 +652,11 @@ impl Cx<'_> {
             if ts.iter().any(|t| t.is("TOP")) {
                 return no("TOP inside a CTE query");
             }
-            return Ok(self.expr(&ts));
+            return Ok((self.expr(&ts), false));
         }
         let mut i = 1; // index into s
         let mut limit = None;
+        let mut list_from = None; // first token of the select list after TOP
         let mut cut = Vec::new(); // token indices removed
         if s.get(1)
             .is_some_and(|&j| ts[j].is("DISTINCT") || ts[j].is("ALL"))
@@ -658,7 +681,7 @@ impl Cx<'_> {
                 cut.extend(end + 1..nx);
             }
             limit = Some(lim);
-            i += 2;
+            list_from = next_sig(&ts, end);
         }
         if ts
             .iter()
@@ -693,7 +716,7 @@ impl Cx<'_> {
             }
         }
         // Assignment: SELECT @a = e, @b = f [FROM …]
-        let list_start = s.get(i).copied().unwrap_or(ts.len());
+        let list_start = list_from.or_else(|| s.get(i).copied()).unwrap_or(ts.len());
         let list_end = from.unwrap_or_else(|| option.unwrap_or(ts.len()));
         let items = split_commas(&ts[list_start..list_end]);
         let assigns: Vec<bool> = items
@@ -716,12 +739,15 @@ impl Cx<'_> {
                 exprs.push(self.expr(&t[eq + 1..]).trim().to_string());
             }
             if from.is_none() && limit.is_none() {
-                return Ok(targets
-                    .iter()
-                    .zip(&exprs)
-                    .map(|(t, e)| format!("{t} := {e};"))
-                    .collect::<Vec<_>>()
-                    .join("\n"));
+                return Ok((
+                    targets
+                        .iter()
+                        .zip(&exprs)
+                        .map(|(t, e)| format!("{t} := {e};"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    true,
+                ));
             }
             self.note(
                 Status::Assumptions,
@@ -743,7 +769,7 @@ impl Cx<'_> {
             if let Some(l) = limit {
                 q.push_str(&format!(" LIMIT {l}"));
             }
-            return Ok(q.trim_end().to_string());
+            return Ok((q.trim_end().to_string(), true));
         }
         let kept: Vec<T> = ts
             .iter()
@@ -755,7 +781,7 @@ impl Cx<'_> {
         if let Some(l) = limit {
             q.push_str(&format!("\nLIMIT {l}"));
         }
-        Ok(q)
+        Ok((q, false))
     }
 
     fn dml(&mut self, ts: &[T]) -> R<String> {
@@ -859,7 +885,7 @@ impl Cx<'_> {
             return no("cursors: declare a PL/pgSQL cursor (or use a FOR loop over the query)");
         }
         let mut lines = Vec::new();
-        let mut inits = Vec::new();
+        let mut pending = Vec::new(); // (variable, initialiser tokens)
         for item in split_commas(&ts[s[1]..]) {
             let it = trimmed(item);
             let Some(v) = it.first().filter(|t| t.k == VARIABLE) else {
@@ -886,16 +912,21 @@ impl Cx<'_> {
             );
             lines.push(format!("{name} {ty};"));
             if let Some(eq) = eq {
-                inits.push(format!("{name} := {};", self.expr(&it[eq + 1..]).trim()));
+                pending.push((name, it[eq + 1..].to_vec()));
             }
         }
+        // Type notes belong to the hoisted declaration; initialiser notes to
+        // the assignment left in place. Each note is counted once.
         let notes = self.take_notes();
         self.decls.push(Decl {
             src: Self::range(n),
             lines,
-            notes: notes.clone(),
+            notes,
         });
-        self.notes = notes;
+        let inits: Vec<String> = pending
+            .iter()
+            .map(|(name, init)| format!("{name} := {};", self.expr(init).trim()))
+            .collect();
         if inits.is_empty() {
             Ok(format!(
                 "-- DECLARE {}: moved to the DECLARE section",
@@ -960,6 +991,9 @@ impl Cx<'_> {
             }
             Mode::Func => no("transaction control inside a function is not allowed in PostgreSQL"),
             Mode::Proc | Mode::Do => {
+                if self.in_try && kw != "BEGIN" {
+                    return no("COMMIT/ROLLBACK inside TRY: the PostgreSQL block with an EXCEPTION clause is a subtransaction, and committing inside it fails at runtime; move the transaction control outside the block");
+                }
                 if self.in_catch {
                     return no("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
                 }
@@ -1212,6 +1246,10 @@ impl Cx<'_> {
 
     fn alter_table(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
+        let first = sig(&ts)[0];
+        if find_word(&ts, first + 1, "ALTER").is_some() {
+            return no("ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions");
+        }
         if let Some(add) = find_word(&ts, 0, "ADD") {
             let nx = next_sig(&ts, add).ok_or(No("ADD without a column".into()))?;
             if ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
@@ -1233,9 +1271,6 @@ impl Cx<'_> {
                 .trim_end_matches(|c: char| c.is_ascii_alphabetic())
                 .trim_end();
             return Ok(format!("{head} {}", cols?.join(", ")));
-        }
-        if find_word(&ts, 0, "ALTER").is_some_and(|i| i > 0) {
-            return no("ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions");
         }
         Ok(self.expr(&ts))
     }
@@ -1532,11 +1567,17 @@ impl Cx<'_> {
             ("CAST", 1) => {
                 let at = crate::tok::find_word(a[0], 0, "AS")?;
                 let x = self.expr(&a[0][..at]).trim().to_string();
-                let (ty, _, _) = self.ty(&a[0][at + 1..]).ok()?;
+                self.in_cast = true;
+                let ty = self.ty(&a[0][at + 1..]);
+                self.in_cast = false;
+                let (ty, _, _) = ty.ok()?;
                 format!("CAST({x} AS {ty})")
             }
             ("CONVERT", 2) => {
-                let (ty, _, _) = self.ty(a[0]).ok()?;
+                self.in_cast = true;
+                let ty = self.ty(a[0]);
+                self.in_cast = false;
+                let (ty, _, _) = ty.ok()?;
                 format!("CAST({} AS {ty})", e(self, 1))
             }
             ("CONVERT", 3) => {
@@ -1612,6 +1653,24 @@ impl Cx<'_> {
             }
         };
         let max = args.first().is_some_and(|a| a.eq_ignore_ascii_case("MAX"));
+        // T-SQL defaults when the length or precision is left out.
+        let len_default = if self.in_cast { "30" } else { "1" };
+        let sized = |a: &[String]| {
+            if a.is_empty() {
+                format!("({len_default})")
+            } else {
+                format!("({})", a.join(", "))
+            }
+        };
+        let frac = |cx: &mut Self, a: &[String]| -> String {
+            match a.first().map(|p| p.parse::<u32>().unwrap_or(7)) {
+                Some(p) if p <= 6 => format!("({p})"),
+                _ => {
+                    cx.note(Status::Assumptions, "ASM-FRACTIONAL-SECONDS", "T-SQL keeps 7 fractional digits (100 ns) by default; PostgreSQL keeps at most 6 (microseconds), so the last digit is rounded.");
+                    String::new()
+                }
+            }
+        };
         let num = |t: &str| (t.to_string(), false, true);
         let txt = |t: String| (t, true, false);
         Ok(match up.as_str() {
@@ -1626,6 +1685,7 @@ impl Cx<'_> {
                 self.note(Status::Decision, "pg.bit-boolean", "BIT becomes boolean: comparisons with 1/0 must become TRUE/FALSE. Use smallint instead to keep numeric comparisons.");
                 ("boolean".into(), false, false)
             }
+            "DECIMAL" | "NUMERIC" | "DEC" if args.is_empty() => num("numeric(18,0)"),
             "DECIMAL" | "NUMERIC" | "DEC" => (format!("numeric{}", paren(&args)), false, true),
             "MONEY" => num("numeric(19,4)"),
             "SMALLMONEY" => num("numeric(10,4)"),
@@ -1641,19 +1701,23 @@ impl Cx<'_> {
                 self.note(Status::Assumptions, "ASM-DATETIME-PRECISION", "DATETIME becomes timestamp(3): T-SQL rounds DATETIME to 1/300 s, PostgreSQL keeps milliseconds exactly.");
                 ("timestamp(3)".into(), false, false)
             }
-            "DATETIME2" => (format!("timestamp{}", paren(&args)), false, false),
+            "DATETIME2" => (format!("timestamp{}", frac(self, &args)), false, false),
             "SMALLDATETIME" => ("timestamp(0)".into(), false, false),
             "DATE" => ("date".into(), false, false),
-            "TIME" => (format!("time{}", paren(&args)), false, false),
+            "TIME" => (format!("time{}", frac(self, &args)), false, false),
             "DATETIMEOFFSET" => {
                 self.note(Status::Assumptions, "ASM-DATETIMEOFFSET", "DATETIMEOFFSET becomes timestamptz, which stores the instant but not the original offset.");
                 (format!("timestamptz{}", paren(&args)), false, false)
             }
-            "CHAR" | "NCHAR" => txt(format!("char{}", paren(&args))),
+            "CHAR" | "NCHAR" => txt(format!("char{}", sized(&args))),
             "VARCHAR" | "NVARCHAR" if max => txt("text".into()),
-            "VARCHAR" | "NVARCHAR" => txt(format!("varchar{}", paren(&args))),
+            "VARCHAR" | "NVARCHAR" => txt(format!("varchar{}", sized(&args))),
             "TEXT" | "NTEXT" => txt("text".into()),
             "SYSNAME" => txt("varchar(128)".into()),
+            "VARBINARY" | "BINARY" if !max => {
+                self.note(Status::Assumptions, "ASM-BINARY-LENGTH", "bytea has no length limit: values longer than the T-SQL length are no longer rejected, and BINARY(n) values are no longer zero-padded.");
+                ("bytea".into(), false, false)
+            }
             "VARBINARY" | "BINARY" | "IMAGE" => ("bytea".into(), false, false),
             "UNIQUEIDENTIFIER" => ("uuid".into(), false, false),
             "XML" => ("xml".into(), false, false),

@@ -3,10 +3,9 @@
 //! `GET /` serves the page with the initial text converted; `POST /api/convert`
 //! with `{"text": "..."}` converts again. Every unit of the output carries a
 //! badge from `sqldiff_convert` (rules + the engine's diff of input against
-//! output). Nothing is written to disk. Own server so it can run beside the
-//! pair view without sharing its state.
+//! output). Nothing is written to disk. Own server (sharing the request handling in
+//! `server`) so it can run beside the pair view without sharing its state.
 
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,6 +13,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sqldiff_convert::Conversion;
 use sqldiff_core::Dialect;
+
+use crate::server::{bad, json, not_found, read_request, respond};
 
 /// The convert page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
 pub const CONVERT_HTML: &str = include_str!("../assets/convert.html");
@@ -111,9 +112,6 @@ struct Edit {
     text: String,
 }
 
-/// Largest request body accepted.
-const MAX_BODY: usize = 16 * 1024 * 1024;
-
 pub fn serve(listener: TcpListener, setup: Setup) -> std::io::Result<()> {
     let setup = Arc::new(setup);
     for stream in listener.incoming() {
@@ -127,51 +125,21 @@ pub fn serve(listener: TcpListener, setup: Setup) -> std::io::Result<()> {
 }
 
 fn handle(mut stream: TcpStream, setup: &Setup) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("").to_string();
-    let path = parts.next().unwrap_or("").to_string();
-    let mut content_length = 0usize;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 || line == "\r\n" || line == "\n" {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            if k.eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
-            }
-        }
-    }
-    let path = path.split('?').next().unwrap_or("");
-    let (status, ctype, body) = match (method.as_str(), path) {
+    let req = match read_request(&stream)? {
+        Ok(r) => r,
+        Err(res) => return respond(&mut stream, res),
+    };
+    let res = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => (
             "200 OK",
             "text/html; charset=utf-8",
             page(&run(setup, &setup.text, true)),
         ),
-        ("POST", "/api/convert") if content_length <= MAX_BODY => {
-            let mut buf = vec![0; content_length];
-            reader.read_exact(&mut buf)?;
-            match serde_json::from_slice::<Edit>(&buf) {
-                Ok(e) => (
-                    "200 OK",
-                    "application/json",
-                    serde_json::to_string(&run(setup, &e.text, true)).unwrap(),
-                ),
-                Err(e) => ("400 Bad Request", "text/plain", e.to_string()),
-            }
-        }
-        ("POST", "/api/convert") => ("413 Payload Too Large", "text/plain", String::new()),
-        _ => ("404 Not Found", "text/plain", "not found".to_string()),
+        ("POST", "/api/convert") => match serde_json::from_slice::<Edit>(&req.body) {
+            Ok(e) => json(&run(setup, &e.text, true)),
+            Err(e) => bad(e),
+        },
+        _ => not_found(),
     };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    stream.write_all(body.as_bytes())?;
-    stream.flush()
+    respond(&mut stream, res)
 }

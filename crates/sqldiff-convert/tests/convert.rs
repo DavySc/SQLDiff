@@ -239,3 +239,111 @@ fn corpus_outputs_parse_and_carry_no_residue() {
         }
     }
 }
+
+// ----- cross-review fixes ------------------------------------------------------
+
+#[test]
+fn commit_inside_try_is_refused() {
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRY\n    BEGIN TRAN;\n    DELETE FROM t;\n    COMMIT;\n  END TRY\n  BEGIN CATCH\n    PRINT ERROR_MESSAGE();\n  END CATCH\nEND\n";
+    let c = tsql(src);
+    let u = unit(&c, src, "COMMIT");
+    assert_eq!(u.status, Status::NotConverted, "{}", c.output);
+    assert!(
+        !c.output.lines().any(|l| l.trim() == "COMMIT;"),
+        "{}",
+        c.output
+    );
+}
+
+#[test]
+fn alter_column_is_refused() {
+    let src = "ALTER TABLE t ALTER COLUMN Name nvarchar(100) NOT NULL;";
+    let c = tsql(src);
+    assert_eq!(c.units[0].status, Status::NotConverted, "{}", c.output);
+    let add = "ALTER TABLE t ADD Note varchar(10) NULL;";
+    let c = tsql(add);
+    assert_eq!(
+        c.output,
+        "ALTER TABLE t ADD COLUMN Note varchar(10) NULL;\n"
+    );
+}
+
+#[test]
+fn top_in_parentheses_with_assignment() {
+    let src = "DECLARE @n nvarchar(10);\nSELECT TOP (1) @n = Name FROM t ORDER BY Name;\n";
+    let c = tsql(src);
+    assert!(
+        c.output
+            .contains("SELECT Name INTO v_n FROM t ORDER BY Name LIMIT (1);"),
+        "{}",
+        c.output
+    );
+}
+
+#[test]
+fn units_beside_a_routine_are_kept() {
+    let src = "CREATE TABLE x (a int);\nCREATE VIEW v AS SELECT a FROM x;\nGO\n";
+    let c = tsql(src);
+    assert!(c.output.contains("CREATE TABLE x"), "{}", c.output);
+    assert!(
+        c.output.contains("CREATE OR REPLACE VIEW v AS"),
+        "{}",
+        c.output
+    );
+    assert_eq!(c.units.len(), 2);
+}
+
+#[test]
+fn type_defaults_follow_tsql() {
+    let c = tsql("CREATE TABLE t (a decimal, b varchar, c nchar, d varchar(5));");
+    assert!(c.output.contains("a numeric(18,0)"), "{}", c.output);
+    assert!(c.output.contains("b varchar(1)"), "{}", c.output);
+    assert!(c.output.contains("c char(1)"), "{}", c.output);
+    let c = tsql("SELECT CAST(a AS varchar) FROM t;");
+    assert!(c.output.contains("CAST(a AS varchar(30))"), "{}", c.output);
+    let c = tsql("CREATE TABLE t (a datetime2, b datetime2(3));");
+    assert!(c.output.contains("a timestamp,"), "{}", c.output);
+    assert!(c.output.contains("b timestamp(3)"), "{}", c.output);
+    assert!(has_rule(&c.units[0], "ASM-FRACTIONAL-SECONDS"));
+}
+
+#[test]
+fn alter_procedure_notes_the_overload_risk() {
+    let src = "ALTER PROCEDURE dbo.q @a int AS\nBEGIN\n  DELETE FROM t WHERE id = @a;\nEND\n";
+    let c = tsql(src);
+    assert!(c.output.starts_with("CREATE OR REPLACE PROCEDURE q("));
+    assert!(has_rule(
+        unit(&c, src, "ALTER PROCEDURE"),
+        "ASM-ROUTINE-REPLACE"
+    ));
+}
+
+#[test]
+fn result_set_check_is_structural() {
+    // ' INTO ' in a literal must not make a result set look like an assignment.
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  SELECT 'x INTO y' AS a, ':=' AS b FROM t;\nEND\n";
+    let c = tsql(src);
+    assert_eq!(
+        unit(&c, src, "SELECT").status,
+        Status::NotConverted,
+        "{}",
+        c.output
+    );
+}
+
+#[test]
+fn declare_notes_are_counted_once() {
+    let src = "DECLARE @d datetime = GETDATE();\nPRINT @d;\n";
+    let c = tsql(src);
+    let decl = c
+        .units
+        .iter()
+        .filter(|u| has_rule(u, "ASM-DATETIME-PRECISION"))
+        .count();
+    let time = c
+        .units
+        .iter()
+        .filter(|u| has_rule(u, "ASM-TIME-SOURCE"))
+        .count();
+    assert_eq!((decl, time), (1, 1), "{:#?}", c.units);
+}

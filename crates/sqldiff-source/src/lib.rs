@@ -10,6 +10,8 @@
 //!   bundle is the canonical offline and fixture format.
 //! - [`pairing`] and [`policy`]: pack-driven pairing, and pack policy applied
 //!   to engine reports (overrides, declared assumptions, limits).
+//! - [`queue`]: every pair of a source diffed and ranked for review, with
+//!   session-local assumption flips and GUI deep links.
 
 pub mod bundle;
 pub mod config;
@@ -22,7 +24,9 @@ pub mod pairing;
 pub mod policy;
 pub mod process;
 pub mod protocol;
+pub mod queue;
 mod source;
+pub mod tree;
 mod walk;
 
 pub use bundle::{Bundle, BundleSource};

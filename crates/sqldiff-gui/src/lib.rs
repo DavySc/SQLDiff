@@ -5,13 +5,20 @@
 //! blocks of whole lines around statements, aligned by statement content
 //! rather than by line, with per-token styling classes and change marks.
 //! The browser UI in `assets/` renders that payload; it does no analysis.
+//!
+//! A [`session::Session`] holds one pair or two paired trees, the
+//! session's assumption flips and the review store, and feeds the review
+//! queue, assumption panel and provenance bar around the pair view.
 
 use serde::Serialize;
 use sqldiff_core::{Artifact, Options, Report};
 use sqldiff_syntax::{ast, parse, LineIndex, SyntaxElement, SyntaxKind, SyntaxNode};
 
 pub mod convert;
+pub mod report;
+pub mod review;
 pub mod server;
+pub mod session;
 
 /// The UI page; the payload is injected by the server or by `export`.
 pub const INDEX_HTML: &str = include_str!("../assets/index.html");
@@ -24,6 +31,10 @@ pub struct Payload {
     pub sources: [String; 2],
     /// Whether a server is behind the page (edits re-diff) or it is a static export.
     pub live: bool,
+    /// Position of the pair in the session queue.
+    pub index: usize,
+    /// Review snapshot key: both content hashes.
+    pub snapshot: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,22 +81,31 @@ pub struct Block {
 
 /// Diff two artifacts and build the pair view.
 pub fn build(a: &Artifact, b: &Artifact, opts: &Options, live: bool) -> Payload {
-    let report = sqldiff_core::diff(a, b, opts);
+    build_view(a, b, sqldiff_core::diff(a, b, opts), live)
+}
+
+/// The pair view over a report already made for these artifacts.
+pub fn build_view(a: &Artifact, b: &Artifact, report: Report, live: bool) -> Payload {
     let mut ba = blocks(&a.text, a.dialect);
     let mut bb = blocks(&b.text, b.dialect);
     attach_findings(&mut ba, &report, true);
     attach_findings(&mut bb, &report, false);
     let rows = align(ba, bb);
     Payload {
+        snapshot: review::snapshot(
+            &report.a.content_hash,
+            report.b.as_ref().map_or("", |b| b.content_hash.as_str()),
+        ),
         report,
         view: View { rows },
         sources: [a.text.clone(), b.text.clone()],
         live,
+        index: 0,
     }
 }
 
-/// The page with a payload embedded.
-pub fn page(payload: &Payload) -> String {
+/// The page with a payload embedded: a [`session::Page`], or a bare [`Payload`].
+pub fn page<T: Serialize>(payload: &T) -> String {
     // `</` cannot appear inside the script element.
     let json = serde_json::to_string(payload)
         .unwrap()
@@ -119,7 +139,7 @@ fn style(kind: SyntaxKind, text: &str) -> &'static str {
 }
 
 /// Keywords the normalizer does not need (their case already folds) but that read better styled.
-fn is_extra_keyword(text: &str) -> bool {
+pub(crate) fn is_extra_keyword(text: &str) -> bool {
     const EXTRA: &[&str] = &[
         "SELECT",
         "FROM",

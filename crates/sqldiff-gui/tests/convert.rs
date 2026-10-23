@@ -68,3 +68,25 @@ fn server_converts_posted_text() {
     s.read_to_string(&mut resp).unwrap();
     assert!(resp.contains("SQLDiff convert"));
 }
+
+#[test]
+fn cross_origin_posts_are_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || serve(listener, setup("SELECT 1;")));
+    let body = r#"{"text":"SELECT 1;"}"#;
+    let post = |origin: &str| {
+        let mut s = TcpStream::connect(addr).unwrap();
+        write!(
+            s,
+            "POST /api/convert HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    };
+    assert!(post("https://evil.example").starts_with("HTTP/1.1 403"));
+    assert!(post(&format!("http://{addr}")).starts_with("HTTP/1.1 200"));
+}
