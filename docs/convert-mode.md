@@ -18,7 +18,13 @@ Every converted unit (a statement, a compound header such as `IF … THEN`, a ro
 
 The status is the worst of the rule notes and of the engine's own check (`checked`). The engine check runs the normal `sqldiff diff` of the input (side A) against the output (side B) and attaches each finding to the unit it points into, so engine findings such as `error.contract` or `write.unpaired` show up next to the statement that caused them. Today the cross-dialect engine cannot prove statement equality, so the best a unit can get is "converted": tested rules, no assumption, nothing found. "Proven" needs the equivalence and IR work.
 
-A rule never guesses: if any part of a statement has no rule (for example `@@ERROR`, `MERGE`, `UPDATE … FROM` with a join, `DATEDIFF(week, …)`), the whole statement is commented out and marked not converted.
+A rule never guesses: if any part of a statement has no rule (for example `@@ERROR`, `UPDATE … FROM` with a join, `DATEDIFF(week, …)`), the whole statement is commented out and marked not converted.
+
+### Idiom rules
+
+Before a statement is commented out, it goes to the idiom rules (`sqldiff_core::rules`, see [idiom-rules.md](idiom-rules.md)), which recognise whole patterns rather than tokens: `MERGE` and `IF EXISTS` upserts → `INSERT … ON CONFLICT`, `IF NOT EXISTS … INSERT` → `ON CONFLICT DO NOTHING`, the `LEFT JOIN … IS NULL` delete → `NOT EXISTS`, `INSERT` + `SCOPE_IDENTITY()` → `RETURNING … INTO` or `lastval()`, and `sp_getapplock` with its return-code check → `pg_advisory_xact_lock`. Their output replaces the comment when they convert the statement completely, with their notes (and an `idiom-rules` note naming the rules) on the unit. Patterns that span statements (`INSERT` + `SCOPE_IDENTITY`, `sp_getapplock` + its check) become one unit, since the token rules cannot see them as a pair.
+
+Two limits keep this honest. Statements the token rules already convert keep their conversion (a plain `IF EXISTS … UPDATE … ELSE INSERT` stays an `IF`, with the race intact, rather than becoming an atomic `ON CONFLICT`). And a statement refused because of where it stands (a result set in a procedure, `COMMIT` inside a TRY block) is never handed to the rules, which see statements out of context. The rules never check themselves: their output goes through the same engine diff as everything else.
 
 ## The page
 
@@ -43,4 +49,4 @@ The tests in `crates/sqldiff-convert/tests/convert.rs` convert every T-SQL file 
 
 ## Next (P1 and later)
 
-Expression trees (from the equivalence work) and binding let rules see types, so `+`, comparisons and `ISNULL` stop needing assumptions; the behavioural IR (WP3) and idiom rules (WP10, ideally written two-way: lift and emit) bring `@@ERROR`/`@@ROWCOUNT` checks, `MERGE`/upserts and transaction structure into scope. Db2 for i output follows the same pattern once the PostgreSQL rules are proven against the oracle containers.
+Expression trees (from the equivalence work) and binding let rules see types, so `+`, comparisons and `ISNULL` stop needing assumptions; the behavioural IR (WP3) and more idiom rules bring `@@ERROR`/`@@ROWCOUNT` checks and transaction structure into scope, and a catalog (`Facts`) lets the idiom rules prove key uniqueness and identity columns instead of assuming them. Db2 for i output follows the same pattern once the PostgreSQL rules are proven against the oracle containers.

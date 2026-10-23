@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use sqldiff_syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
+use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
 use crate::out::Out;
@@ -16,6 +16,16 @@ use crate::tok::{
 use crate::{Note, Status};
 
 const INDENT: usize = 2;
+
+/// Rule id of a refusal because of where the unit stands.
+const CONTEXT: &str = "not-converted.context";
+
+/// The idiom rules (`sqldiff_core::rules`), for what the token rules refuse.
+mod rules {
+    pub use sqldiff_core::rules::convert::{convert_nodes, Options, Piece};
+    pub use sqldiff_core::rules::rewrite::NoFacts;
+    pub use sqldiff_core::rules::rule::{RuleSet, Status};
+}
 
 pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
     let mut cx = Cx {
@@ -28,12 +38,14 @@ pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
         in_cast: false,
         return_code: false,
         decls: Vec::new(),
+        context: false,
     };
     let mut out = Out::default();
+    let mut run = cx.idioms(root);
     for el in root.children_with_tokens() {
         match el {
             SyntaxElement::Node(n) if n.kind() == BATCH => cx.batch(&mut out, &n),
-            SyntaxElement::Node(n) if n.kind().is_unit() => cx.unit(&mut out, &n, 0),
+            SyntaxElement::Node(n) if n.kind().is_unit() => cx.next_unit(&mut out, &n, 0, &mut run),
             SyntaxElement::Token(t) if matches!(t.kind(), LINE_COMMENT | BLOCK_COMMENT) => {
                 out.lines(0, t.text())
             }
@@ -91,6 +103,19 @@ struct Cx<'a> {
     /// A procedure returns a value somewhere: it gets an INOUT `return_code`.
     return_code: bool,
     decls: Vec<Decl>,
+    /// The unit being converted was refused because of where it stands, not
+    /// for want of a rule: the idiom rules, which see statements out of
+    /// context, must not take it either.
+    context: bool,
+}
+
+/// The idiom rules' pieces of one unit list, consumed in order.
+struct Idioms {
+    /// By index of their first unit.
+    pieces: HashMap<usize, rules::Piece>,
+    next: usize,
+    /// Units still covered by the last piece written.
+    skip: usize,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -111,6 +136,12 @@ impl Cx<'_> {
                 text: text.to_string(),
             });
         }
+    }
+
+    /// A refusal because of the unit's context (see `context`).
+    fn misplaced<T>(&mut self, reason: &str) -> R<T> {
+        self.context = true;
+        no(reason)
     }
 
     fn take_notes(&mut self) -> Vec<Note> {
@@ -136,13 +167,18 @@ impl Cx<'_> {
     fn refuse(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, reason: &str) {
         let text = self.commented(n, reason);
         self.notes.clear();
+        let rule = if std::mem::take(&mut self.context) {
+            CONTEXT
+        } else {
+            "not-converted"
+        };
         out.unit(
             Self::range(n),
             indent,
             &text,
             vec![Note {
                 status: Status::NotConverted,
-                rule: "not-converted".into(),
+                rule: rule.into(),
                 text: reason.to_string(),
             }],
         );
@@ -421,9 +457,12 @@ impl Cx<'_> {
 
     /// Writes the units and comments directly inside `n`, skipping its own keywords.
     fn body_elements(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
+        let mut run = self.idioms(n);
         for el in n.children_with_tokens() {
             match el {
-                SyntaxElement::Node(c) if c.kind().is_unit() => self.unit(out, &c, indent),
+                SyntaxElement::Node(c) if c.kind().is_unit() => {
+                    self.next_unit(out, &c, indent, &mut run)
+                }
                 SyntaxElement::Node(c) if c.kind().is_container() => {
                     self.body_elements(out, &c, indent)
                 }
@@ -435,8 +474,97 @@ impl Cx<'_> {
         }
     }
 
+    /// The idiom rules' conversion of the units directly inside `n`, by unit.
+    fn idioms(&self, n: &SyntaxNode) -> Idioms {
+        let units: Vec<SyntaxNode> = n.children().filter(|c| c.kind().is_unit()).collect();
+        let vars = |v: &str| self.var_name(v);
+        let opts = rules::Options {
+            rules: rules::RuleSet::builtin(),
+            facts: &rules::NoFacts,
+            vars: &vars,
+        };
+        let pieces = rules::convert_nodes(&units, Dialect::Tsql, Dialect::Postgres, &opts);
+        Idioms {
+            pieces: pieces.into_iter().map(|p| (p.units.start, p)).collect(),
+            next: 0,
+            skip: 0,
+        }
+    }
+
+    /// Converts the next unit of a list. A run of units that only the idiom
+    /// rules understand together (INSERT + SCOPE_IDENTITY, sp_getapplock + its
+    /// check) is converted by them; a single unit the token rules refuse is
+    /// handed to them; otherwise the token rules' output stands.
+    fn next_unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, run: &mut Idioms) {
+        let k = run.next;
+        run.next += 1;
+        if run.skip > 0 {
+            run.skip -= 1;
+            return;
+        }
+        let piece = run
+            .pieces
+            .remove(&k)
+            .filter(|p| p.output.is_ok() && !(self.mode == Mode::Top && procedural(n)));
+        if let Some(p) = &piece {
+            if p.units.len() > 1 {
+                run.skip = p.units.len() - 1;
+                return self.piece(out, p, indent);
+            }
+        }
+        let mut own = Out::default();
+        self.unit(&mut own, n, indent);
+        let notes = || own.units.iter().flat_map(|u| &u.notes);
+        let refused = notes().any(|x| x.status == Status::NotConverted);
+        match piece {
+            Some(p) if refused && !notes().any(|x| x.rule == CONTEXT) => {
+                self.piece(out, &p, indent)
+            }
+            _ => out.append(own),
+        }
+    }
+
+    fn piece(&mut self, out: &mut Out, p: &rules::Piece, indent: usize) {
+        let status = |s: rules::Status| match s {
+            rules::Status::Converted => Status::Converted,
+            rules::Status::Assumptions => Status::Assumptions,
+            rules::Status::Decision => Status::Decision,
+            rules::Status::Differs => Status::Differs,
+            rules::Status::NotConverted => Status::NotConverted,
+        };
+        let mut notes = vec![Note {
+            status: Status::Converted,
+            rule: "idiom-rules".into(),
+            text: format!("Converted by the idiom rules ({}).", p.rules.join(", ")),
+        }];
+        notes.extend(p.notes.iter().map(|a| Note {
+            status: status(a.status),
+            rule: a.rule.clone(),
+            text: a.text.clone(),
+        }));
+        notes.extend(p.assumptions.iter().map(|(id, text)| Note {
+            status: Status::Assumptions,
+            rule: id.clone(),
+            text: text.clone(),
+        }));
+        let text = p.output.as_deref().unwrap_or_default();
+        out.unit(p.src, indent, text, notes);
+    }
+
+    /// How a T-SQL variable is spelled in the output.
+    fn var_name(&self, v: &str) -> String {
+        match self
+            .vars
+            .get(&v.trim_start_matches('@').to_ascii_lowercase())
+        {
+            Some(x) => x.name.clone(),
+            None => format!("v_{}", snake(v.trim_start_matches('@'))),
+        }
+    }
+
     fn unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
         self.notes.clear();
+        self.context = false;
         match n.kind() {
             STATEMENT => match self.stmt(n) {
                 Ok(_) if self.blocked().is_some() => {
@@ -584,13 +712,13 @@ impl Cx<'_> {
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
         if self.mode == Mode::Top && procedural(n) {
-            return no("uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block");
+            return self.misplaced("uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block");
         }
         let text = match w(0).as_str() {
             "SELECT" | "WITH" => {
                 let (q, assigns) = self.select(&ts)?;
                 if self.mode != Mode::Top && !assigns {
-                    return no("returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed");
+                    return self.misplaced("returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed");
                 }
                 q
             }
@@ -989,13 +1117,15 @@ impl Cx<'_> {
                 }
                 Ok(kw.to_string())
             }
-            Mode::Func => no("transaction control inside a function is not allowed in PostgreSQL"),
+            Mode::Func => {
+                self.misplaced("transaction control inside a function is not allowed in PostgreSQL")
+            }
             Mode::Proc | Mode::Do => {
                 if self.in_try && kw != "BEGIN" {
-                    return no("COMMIT/ROLLBACK inside TRY: the PostgreSQL block with an EXCEPTION clause is a subtransaction, and committing inside it fails at runtime; move the transaction control outside the block");
+                    return self.misplaced("COMMIT/ROLLBACK inside TRY: the PostgreSQL block with an EXCEPTION clause is a subtransaction, and committing inside it fails at runtime; move the transaction control outside the block");
                 }
                 if self.in_catch {
-                    return no("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
+                    return self.misplaced("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
                 }
                 if kw == "BEGIN" {
                     self.note(Status::Decision, "pg.proc-transaction", "A PostgreSQL procedure already runs inside a transaction; BEGIN TRAN is dropped. Nested-transaction behaviour (@@TRANCOUNT) does not exist.");

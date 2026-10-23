@@ -347,3 +347,72 @@ fn declare_notes_are_counted_once() {
         .count();
     assert_eq!((decl, time), (1, 1), "{:#?}", c.units);
 }
+
+const IDIOMS: &str = "CREATE PROCEDURE dbo.Feed @Item int, @Price decimal(12,2), @Customer int AS
+BEGIN
+  DECLARE @OrderId int, @rc int;
+  MERGE dbo.item_price WITH (HOLDLOCK) AS t USING (SELECT @Item AS item_id, @Price AS unit_price) AS s ON t.item_id = s.item_id WHEN MATCHED THEN UPDATE SET unit_price = s.unit_price WHEN NOT MATCHED THEN INSERT (item_id, unit_price) VALUES (s.item_id, s.unit_price);
+  DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id WHERE i.item_id IS NULL;
+  INSERT INTO dbo.orders (customer_id) VALUES (@Customer);
+  SET @OrderId = SCOPE_IDENTITY();
+  EXEC @rc = sp_getapplock @Resource = 'price-feed', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1;
+  IF @rc < 0 BEGIN ROLLBACK; THROW 50020, 'lock not granted', 1; END
+END
+";
+
+#[test]
+fn idiom_rules_convert_what_the_token_rules_refuse() {
+    let c = tsql(IDIOMS);
+    let cases = [
+        (
+            "MERGE",
+            "ON CONFLICT (item_id) DO UPDATE SET unit_price = p_price",
+        ),
+        (
+            "DELETE pf",
+            "NOT EXISTS (SELECT 1 FROM item WHERE item.item_id = price_feed.item_id)",
+        ),
+        (
+            "EXEC @rc",
+            "PERFORM pg_advisory_xact_lock(hashtext('price-feed'));",
+        ),
+    ];
+    for (needle, want) in cases {
+        let u = unit(&c, IDIOMS, needle);
+        // The rules' own verdict; the engine may still find the procedure's
+        // autocommit-per-statement behaviour different around it.
+        assert!(
+            u.notes.iter().all(|n| n.status < Status::Differs),
+            "{needle}: {:?}",
+            u.notes
+        );
+        assert!(has_rule(u, "idiom-rules"), "{needle}");
+        assert!(out_of(&c, u).contains(want), "{needle}: {}", out_of(&c, u));
+    }
+    assert_eq!(c.counts.not_converted, 0, "{}", c.output);
+}
+
+#[test]
+fn idiom_rules_join_statements_the_token_rules_see_apart() {
+    let c = tsql(IDIOMS);
+    let insert = unit(&c, IDIOMS, "INSERT INTO dbo.orders");
+    let identity = unit(&c, IDIOMS, "SCOPE_IDENTITY");
+    // One unit for INSERT + SCOPE_IDENTITY, named with the procedure's variables.
+    assert_eq!(insert.src, identity.src);
+    assert!(
+        out_of(&c, insert).contains("v_order_id := lastval();"),
+        "{}",
+        out_of(&c, insert)
+    );
+    // Without a catalog the rules cannot prove RETURNING, and say so.
+    assert!(
+        has_rule(insert, "ASM-LASTVAL-SAME-INSERT"),
+        "{:?}",
+        insert.notes
+    );
+    // The lock check after sp_getapplock is part of the lock unit.
+    assert_eq!(
+        unit(&c, IDIOMS, "IF @rc").src,
+        unit(&c, IDIOMS, "EXEC @rc").src
+    );
+}
