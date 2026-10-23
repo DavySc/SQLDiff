@@ -41,11 +41,14 @@ pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
         context: false,
     };
     let mut out = Out::default();
-    let mut run = cx.idioms(root);
-    for el in root.children_with_tokens() {
+    let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
+    let mut joined = 0;
+    for (i, el) in els.iter().cloned().enumerate() {
         match el {
             SyntaxElement::Node(n) if n.kind() == BATCH => cx.batch(&mut out, &n),
-            SyntaxElement::Node(n) if n.kind().is_unit() => cx.next_unit(&mut out, &n, 0, &mut run),
+            SyntaxElement::Node(n) if n.kind().is_unit() => {
+                cx.list_unit(&mut out, &els, i, 0, &mut joined)
+            }
             SyntaxElement::Token(t) if matches!(t.kind(), LINE_COMMENT | BLOCK_COMMENT) => {
                 out.lines(0, t.text())
             }
@@ -107,15 +110,6 @@ struct Cx<'a> {
     /// for want of a rule: the idiom rules, which see statements out of
     /// context, must not take it either.
     context: bool,
-}
-
-/// The idiom rules' pieces of one unit list, consumed in order.
-struct Idioms {
-    /// By index of their first unit.
-    pieces: HashMap<usize, rules::Piece>,
-    next: usize,
-    /// Units still covered by the last piece written.
-    skip: usize,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -367,7 +361,7 @@ impl Cx<'_> {
             );
             let output = p.iter().any(|t| t.is("OUTPUT") || t.is("OUT"));
             if output && func {
-                return no("OUTPUT parameters on a function");
+                return self.misplaced("OUTPUT parameters on a function");
             }
             let mut text = format!("{}{pname} {ty}", if output { "INOUT " } else { "" });
             if let Some(eq) = p[..].iter().position(|t| t.k == OP && t.s == "=") {
@@ -457,11 +451,12 @@ impl Cx<'_> {
 
     /// Writes the units and comments directly inside `n`, skipping its own keywords.
     fn body_elements(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
-        let mut run = self.idioms(n);
-        for el in n.children_with_tokens() {
+        let els: Vec<SyntaxElement> = n.children_with_tokens().collect();
+        let mut joined = 0;
+        for (i, el) in els.iter().cloned().enumerate() {
             match el {
                 SyntaxElement::Node(c) if c.kind().is_unit() => {
-                    self.next_unit(out, &c, indent, &mut run)
+                    self.list_unit(out, &els, i, indent, &mut joined)
                 }
                 SyntaxElement::Node(c) if c.kind().is_container() => {
                     self.body_elements(out, &c, indent)
@@ -474,71 +469,105 @@ impl Cx<'_> {
         }
     }
 
-    /// The idiom rules' conversion of the units directly inside `n`, by unit.
-    fn idioms(&self, n: &SyntaxNode) -> Idioms {
-        let units: Vec<SyntaxNode> = n.children().filter(|c| c.kind().is_unit()).collect();
-        let vars = |v: &str| self.var_name(v);
+    /// Converts the unit `els[i]` of a list. `joined` is where the last pair
+    /// converted together ended: a unit before it is already written.
+    fn list_unit(
+        &mut self,
+        out: &mut Out,
+        els: &[SyntaxElement],
+        i: usize,
+        indent: usize,
+        joined: &mut usize,
+    ) {
+        let Some(n) = els[i].as_node() else { return };
+        if Self::range(n).0 < *joined {
+            return;
+        }
+        if let Some(next) = adjacent_unit(els, i) {
+            if self.idiom_pair(out, n, &next, indent) {
+                *joined = Self::range(&next).1;
+                return;
+            }
+        }
+        self.unit(out, n, indent)
+    }
+
+    /// The idiom rules on `nodes`, with variables spelled as the token rules
+    /// spell them (so after the DECLAREs seen so far). Also says whether a
+    /// variable had no declaration.
+    fn idioms(&self, nodes: &[SyntaxNode]) -> (Vec<rules::Piece>, bool) {
+        let undeclared = std::cell::Cell::new(false);
+        let vars = |v: &str| {
+            self.declared(v).unwrap_or_else(|| {
+                undeclared.set(true);
+                undeclared_name(v)
+            })
+        };
         let opts = rules::Options {
             rules: rules::RuleSet::builtin(),
             facts: &rules::NoFacts,
             vars: &vars,
         };
-        let pieces = rules::convert_nodes(&units, Dialect::Tsql, Dialect::Postgres, &opts);
-        Idioms {
-            pieces: pieces.into_iter().map(|p| (p.units.start, p)).collect(),
-            next: 0,
-            skip: 0,
+        let pieces = rules::convert_nodes(nodes, Dialect::Tsql, Dialect::Postgres, &opts);
+        (pieces, undeclared.get())
+    }
+
+    /// Two adjacent statements the idiom rules convert as one (INSERT +
+    /// SCOPE_IDENTITY, sp_getapplock + its return-code check), which the
+    /// token rules see apart. Only in a procedure or DO block and outside
+    /// TRY/CATCH, where the rules' plain statements mean what they say.
+    fn idiom_pair(&mut self, out: &mut Out, a: &SyntaxNode, b: &SyntaxNode, indent: usize) -> bool {
+        if !matches!(self.mode, Mode::Proc | Mode::Do)
+            || self.in_try
+            || self.in_catch
+            || a.kind() != STATEMENT
+            || !matches!(first_word(a).as_str(), "INSERT" | "EXEC" | "EXECUTE")
+        {
+            return false;
+        }
+        let (pieces, undeclared) = self.idioms(&[a.clone(), b.clone()]);
+        match pieces.as_slice() {
+            [p] if p.units.len() == 2 && p.output.is_ok() && !p.rules.is_empty() => {
+                self.piece(out, p, undeclared, indent);
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Converts the next unit of a list. A run of units that only the idiom
-    /// rules understand together (INSERT + SCOPE_IDENTITY, sp_getapplock + its
-    /// check) is converted by them; a single unit the token rules refuse is
-    /// handed to them; otherwise the token rules' output stands.
-    fn next_unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, run: &mut Idioms) {
-        let k = run.next;
-        run.next += 1;
-        if run.skip > 0 {
-            run.skip -= 1;
-            return;
+    /// A data statement the token rules refused for want of a rule (MERGE,
+    /// DELETE … JOIN), if an idiom rule converts it. Never a refusal because
+    /// of context, never a statement whose meaning depends on where it stands
+    /// (RETURN, THROW, transaction control, result sets), never a compound.
+    fn idiom_single(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) -> bool {
+        if self.context
+            || !matches!(
+                first_word(n).as_str(),
+                "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+            )
+            || self.mode == Mode::Top && procedural(n)
+        {
+            return false;
         }
-        let piece = run
-            .pieces
-            .remove(&k)
-            .filter(|p| p.output.is_ok() && !(self.mode == Mode::Top && procedural(n)));
-        if let Some(p) = &piece {
-            if p.units.len() > 1 {
-                run.skip = p.units.len() - 1;
-                return self.piece(out, p, indent);
+        let (pieces, undeclared) = self.idioms(std::slice::from_ref(n));
+        match pieces.as_slice() {
+            [p] if p.output.is_ok() && !p.rules.is_empty() => {
+                self.notes.clear();
+                self.piece(out, p, undeclared, indent);
+                true
             }
-        }
-        let mut own = Out::default();
-        self.unit(&mut own, n, indent);
-        let notes = || own.units.iter().flat_map(|u| &u.notes);
-        let refused = notes().any(|x| x.status == Status::NotConverted);
-        match piece {
-            Some(p) if refused && !notes().any(|x| x.rule == CONTEXT) => {
-                self.piece(out, &p, indent)
-            }
-            _ => out.append(own),
+            _ => false,
         }
     }
 
-    fn piece(&mut self, out: &mut Out, p: &rules::Piece, indent: usize) {
-        let status = |s: rules::Status| match s {
-            rules::Status::Converted => Status::Converted,
-            rules::Status::Assumptions => Status::Assumptions,
-            rules::Status::Decision => Status::Decision,
-            rules::Status::Differs => Status::Differs,
-            rules::Status::NotConverted => Status::NotConverted,
-        };
+    fn piece(&mut self, out: &mut Out, p: &rules::Piece, undeclared: bool, indent: usize) {
         let mut notes = vec![Note {
             status: Status::Converted,
             rule: "idiom-rules".into(),
             text: format!("Converted by the idiom rules ({}).", p.rules.join(", ")),
         }];
         notes.extend(p.notes.iter().map(|a| Note {
-            status: status(a.status),
+            status: a.status.into(),
             rule: a.rule.clone(),
             text: a.text.clone(),
         }));
@@ -547,36 +576,41 @@ impl Cx<'_> {
             rule: id.clone(),
             text: text.clone(),
         }));
+        if undeclared {
+            notes.push(Note {
+                status: Status::Assumptions,
+                rule: "ASM-UNDECLARED-VAR".into(),
+                text: UNDECLARED.into(),
+            });
+        }
         let text = p.output.as_deref().unwrap_or_default();
         out.unit(p.src, indent, text, notes);
     }
 
-    /// How a T-SQL variable is spelled in the output.
-    fn var_name(&self, v: &str) -> String {
-        match self
-            .vars
+    /// How a declared T-SQL variable (or parameter) is spelled in the output.
+    fn declared(&self, v: &str) -> Option<String> {
+        self.vars
             .get(&v.trim_start_matches('@').to_ascii_lowercase())
-        {
-            Some(x) => x.name.clone(),
-            None => format!("v_{}", snake(v.trim_start_matches('@'))),
-        }
+            .map(|x| x.name.clone())
     }
 
     fn unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
         self.notes.clear();
         self.context = false;
         match n.kind() {
-            STATEMENT => match self.stmt(n) {
-                Ok(_) if self.blocked().is_some() => {
-                    let reason = self.blocked().unwrap();
+            STATEMENT => {
+                let reason = match self.stmt(n) {
+                    Ok(_) if self.blocked().is_some() => self.blocked().unwrap(),
+                    Ok(text) => {
+                        let notes = self.take_notes();
+                        return out.unit(Self::range(n), indent, &text, notes);
+                    }
+                    Err(No(reason)) => reason,
+                };
+                if !self.idiom_single(out, n, indent) {
                     self.refuse(out, n, indent, &reason)
                 }
-                Ok(text) => {
-                    let notes = self.take_notes();
-                    out.unit(Self::range(n), indent, &text, notes);
-                }
-                Err(No(reason)) => self.refuse(out, n, indent, &reason),
-            },
+            }
             BLOCK => self.body_elements(out, n, indent),
             IF_STMT if self.mode != Mode::Top => self.if_stmt(out, n, indent, false),
             LOOP_STMT if self.mode != Mode::Top => self.while_stmt(out, n, indent),
@@ -1079,9 +1113,9 @@ impl Cx<'_> {
                 self.return_code = true;
                 Ok(format!("return_code := {v};\nRETURN;"))
             }
-            (Mode::Func, None) => no("RETURN without a value in a function"),
+            (Mode::Func, None) => self.misplaced("RETURN without a value in a function"),
             (_, None) => Ok("RETURN".into()),
-            (_, Some(_)) => no("RETURN with a value outside a procedure"),
+            (_, Some(_)) => self.misplaced("RETURN with a value outside a procedure"),
         }
     }
 
@@ -1092,7 +1126,7 @@ impl Cx<'_> {
             if self.in_catch {
                 return Ok("RAISE".into());
             }
-            return no("THROW without arguments outside CATCH");
+            return self.misplaced("THROW without arguments outside CATCH");
         }
         let args = split_commas(&ts[s[1]..]);
         if args.len() != 3 {
@@ -1430,12 +1464,11 @@ impl Cx<'_> {
             );
             return v.to_string();
         }
-        let key = v[1..].to_ascii_lowercase();
-        if let Some(x) = self.vars.get(&key) {
-            return x.name.clone();
+        if let Some(name) = self.declared(v) {
+            return name;
         }
-        self.note(Status::Assumptions, "ASM-UNDECLARED-VAR", "A variable is used without a declaration in this unit; it was renamed with the v_ prefix.");
-        format!("v_{}", snake(&v[1..]))
+        self.note(Status::Assumptions, "ASM-UNDECLARED-VAR", UNDECLARED);
+        undeclared_name(v)
     }
 
     fn operand_kind(&self, ts: &[T], j: Option<usize>) -> (bool, bool) {
@@ -1867,6 +1900,48 @@ impl Cx<'_> {
 }
 
 /// Whether a batch-level unit needs PL/pgSQL (variables or control flow).
+/// Note text for a variable used without a declaration.
+const UNDECLARED: &str =
+    "A variable is used without a declaration in this unit; it was renamed with the v_ prefix.";
+
+fn undeclared_name(v: &str) -> String {
+    format!("v_{}", snake(v.trim_start_matches('@')))
+}
+
+/// The first keyword of a unit, upper case.
+fn first_word(n: &SyntaxNode) -> String {
+    tokens(n)
+        .iter()
+        .find(|t| t.sig())
+        .map(|t| t.up())
+        .unwrap_or_default()
+}
+
+/// The unit after `els[i]` when only whitespace and semicolons stand between
+/// them (a comment or anything else keeps them apart).
+fn adjacent_unit(els: &[SyntaxElement], i: usize) -> Option<SyntaxNode> {
+    for el in &els[i + 1..] {
+        match el {
+            SyntaxElement::Node(n) if n.kind().is_unit() => return Some(n.clone()),
+            SyntaxElement::Token(t) if matches!(t.kind(), WHITESPACE | SEMICOLON) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+impl From<rules::Status> for Status {
+    fn from(s: rules::Status) -> Self {
+        match s {
+            rules::Status::Converted => Status::Converted,
+            rules::Status::Assumptions => Status::Assumptions,
+            rules::Status::Decision => Status::Decision,
+            rules::Status::Differs => Status::Differs,
+            rules::Status::NotConverted => Status::NotConverted,
+        }
+    }
+}
+
 fn procedural(n: &SyntaxNode) -> bool {
     if matches!(n.kind(), IF_STMT | LOOP_STMT | TRY_CATCH | BLOCK) {
         return true;
