@@ -75,6 +75,7 @@ impl Pipeline {
     pub fn options(&self) -> Options {
         Options {
             excerpt_lines: self.cfg.excerpt_lines,
+            ..Options::default()
         }
     }
 

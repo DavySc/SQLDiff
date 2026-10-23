@@ -458,7 +458,10 @@ fn cache_hits_on_same_content_only() {
         cache::report_key(&a, Some(&b), &opts, &cfg),
         cache::report_key(&a, Some(&b2), &opts, &cfg)
     );
-    let opts5 = Options { excerpt_lines: 5 };
+    let opts5 = Options {
+        excerpt_lines: 5,
+        ..Options::default()
+    };
     assert_ne!(
         cache::report_key(&a, Some(&b), &opts, &cfg),
         cache::report_key(&a, Some(&b), &opts5, &cfg)

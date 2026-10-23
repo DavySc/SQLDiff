@@ -219,7 +219,7 @@ fn queue_flip_comment_and_link() {
     ]);
     let filtered = &r[2]["result"]["structuredContent"];
     assert_eq!(filtered["pairs"].as_array().unwrap().len(), 1);
-    assert_eq!(filtered["omitted_pairs"], 1);
+    assert_eq!(filtered["omitted_pairs"], 2);
     let s = &r[0]["result"]["structuredContent"];
     let pairs = s["pairs"].as_array().unwrap();
     assert_eq!(pairs.len(), 3);
@@ -234,7 +234,8 @@ fn queue_flip_comment_and_link() {
         pg["verdict_flipping"],
         json!(["ASM-CALLER-CHECKS-RC", "ASM-TSQL-CALLER-XACT-ABORT-OFF"])
     );
-    assert_eq!(pg["review"]["unreviewed"], 1);
+    // Plus the unproven ItemId/item_id statement.
+    assert_eq!(pg["review"]["unreviewed"], 2);
     assert_eq!(r[1]["result"]["isError"], true);
 
     let pid = pg["id"].as_str().unwrap();

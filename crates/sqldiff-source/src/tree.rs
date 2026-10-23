@@ -60,6 +60,7 @@ pub fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Art
 pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
     with_policy(sqldiff_core::diff(a, b, &opts), a, Some(b), cfg)
 }

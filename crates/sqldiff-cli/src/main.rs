@@ -58,6 +58,17 @@ enum Command {
         /// Maximum excerpt lines per location (default: config, else 3).
         #[arg(long)]
         excerpt_lines: Option<usize>,
+        /// DDL file (CREATE TABLE, CREATE UNIQUE INDEX) describing the catalog
+        /// both sides run against, read in each side's dialect. Repeatable.
+        /// Keys, nullability and column types discharge equivalence side conditions.
+        #[arg(long, value_name = "FILE")]
+        catalog: Vec<PathBuf>,
+        /// Catalog DDL for side A only. Repeatable.
+        #[arg(long, value_name = "FILE")]
+        catalog_a: Vec<PathBuf>,
+        /// Catalog DDL for side B only. Repeatable.
+        #[arg(long, value_name = "FILE")]
+        catalog_b: Vec<PathBuf>,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
         #[command(flatten)]
@@ -156,14 +167,33 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
+            catalog,
+            catalog_a,
+            catalog_b,
             cfg,
             review,
         } => {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
             let b = read(&b, dialect_b.or(dialect), &cfg)?;
+            let ddl = |paths: &[PathBuf], d: Dialect| -> Result<Vec<Artifact>, String> {
+                paths
+                    .iter()
+                    .map(|p| {
+                        let text = std::fs::read_to_string(p)
+                            .map_err(|e| format!("{}: {e}", p.display()))?;
+                        Ok(Artifact::new(p.display().to_string(), d, text))
+                    })
+                    .collect()
+            };
+            let mut cat_a = ddl(&catalog, a.dialect)?;
+            cat_a.extend(ddl(&catalog_a, a.dialect)?);
+            let mut cat_b = ddl(&catalog, b.dialect)?;
+            cat_b.extend(ddl(&catalog_b, b.dialect)?);
             let opts = Options {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
+                catalog_a: cat_a,
+                catalog_b: cat_b,
             };
             let mut pipe = Pipeline::new(cfg, &review)?;
             let report = pipe.run(&a, Some(&b), &opts);
@@ -255,6 +285,7 @@ fn tree(
     let t = tree::pair_dirs(dir_a, dir_b, da, db, cfg).map_err(|e| e.0)?;
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
     let mut reports = Vec::new();
     for p in &t.pairs {

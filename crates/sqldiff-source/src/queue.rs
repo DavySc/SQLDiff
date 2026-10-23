@@ -71,6 +71,7 @@ pub fn run_with(
     let info = |id: &str| objects.iter().find(|o| o.id == id);
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
     let mut pairs = Vec::new();
     for x in &p.pairs {

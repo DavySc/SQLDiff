@@ -94,7 +94,7 @@ is confirmed. Until then the tool may cap it (design §12, oracle availability).
 | p02-upsert-price | MERGE HOLDLOCK / ON CONFLICT / Db2 MERGE | equal, assumed, assumed |
 | p03-lookup-by-key | three single-row contracts made equal by a primary key | equal ×3 |
 | p04-display-name | NULL-safe concatenation in a view | equal ×3 |
-| p05-email-lookup | case-insensitive compare emulated; trailing spaces not | different, assumed, different |
+| p05-email-lookup | case-insensitive compare emulated; trailing spaces and key uniqueness not | different ×3 |
 | p06-paged-orders | OFFSET/FETCH vs LIMIT/OFFSET | equal ×3 |
 | p07-insert-return-id | SCOPE_IDENTITY / RETURNING / FINAL TABLE; T-SQL continues after a failed INSERT | different ×2, equal |
 | p08-delete-orphans | anti-join vs NOT EXISTS | equal ×3 |
