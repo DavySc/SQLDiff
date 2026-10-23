@@ -120,6 +120,9 @@ pub enum AssumptionSource {
     Default,
     /// Declared in source, a pack or project config.
     Declared,
+    /// Stated by the author in a source comment (a pack author marker);
+    /// open until someone resolves it.
+    Author,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +131,9 @@ pub struct Assumption {
     pub id: String,
     pub text: String,
     pub source: AssumptionSource,
+    /// Where the assumption was stated, e.g. `A:12` for side A line 12.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cite: Option<String>,
 }
 
 impl Assumption {
@@ -136,6 +142,7 @@ impl Assumption {
             id: id.to_string(),
             text: text.to_string(),
             source: AssumptionSource::Default,
+            cite: None,
         }
     }
 }
@@ -228,9 +235,49 @@ pub struct Report {
     /// Why the verdict could not be stronger.
     pub unknown_reasons: Vec<String>,
     pub diagnostics: Vec<DiagnosticInfo>,
+    /// Findings hidden by review decisions or in-source markers; they do
+    /// not count towards [`Report::open_verdict`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<Suppressed>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuppressionKind {
+    /// Accepted in the review store.
+    Review,
+    /// A deliberate-difference marker in the source.
+    InSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Suppressed {
+    pub finding: Finding,
+    pub kind: SuppressionKind,
+    /// Why: the review comment or the marker text.
+    pub justification: String,
 }
 
 impl Report {
+    /// The verdict over the findings that are still open. It equals
+    /// `verdict` when nothing is suppressed. When something is, it is never
+    /// better than "equal under assumptions": an accepted difference is
+    /// still a difference, so suppression never produces "equal".
+    pub fn open_verdict(&self) -> Verdict {
+        if self.suppressed.is_empty() {
+            return self.verdict;
+        }
+        if self.findings.iter().any(|f| f.verdict == Verdict::Different) {
+            Verdict::Different
+        } else if self.findings.iter().any(|f| f.verdict == Verdict::Unknown)
+            || !self.unknown_reasons.is_empty()
+        {
+            Verdict::Unknown
+        } else {
+            Verdict::EqualUnderAssumptions
+        }
+    }
+
     pub fn highest_class(&self) -> Option<ChangeClass> {
         self.findings
             .iter()
