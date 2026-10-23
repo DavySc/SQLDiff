@@ -883,3 +883,79 @@ fn error_kind_codes_map_back() {
     assert_eq!(ts.kind_of_code("50010"), Some(ErrorKind::UserSignal));
     assert!(!ts.condition_kinds("CATCH").contains(&NameResolution));
 }
+
+/// The raise action each statement of a routine lowers to, in node order.
+fn raises(d: Dialect, sql: &str) -> Vec<Action> {
+    let art = Artifact::new("case.sql", d, sql);
+    let a = Analyzed::new(&art, Side::A, 3);
+    let cfg = ir::lower(&a);
+    (0..cfg.nodes.len())
+        .filter_map(|n| cfg.node(n).stmt().map(|s| s.action.clone()))
+        .filter(|a| matches!(a, Action::Raise { .. } | Action::None))
+        .collect()
+}
+
+#[test]
+fn raise_forms_lower_to_their_kind() {
+    use sqldiff_core::ir::cfg::Action::Raise;
+    // RAISERROR's severity is the second argument, not the message id.
+    let ts = raises(
+        Tsql,
+        "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR(50001, 10, 1);\nEND",
+    );
+    assert_eq!(ts, vec![Action::None], "informational message");
+    let ts = raises(
+        Tsql,
+        "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR('x', 16, 1);\nEND",
+    );
+    assert_eq!(
+        ts,
+        vec![Raise {
+            kind: ErrorKind::UserSignal,
+            form: "raiserror"
+        }]
+    );
+    let ts = raises(
+        Tsql,
+        "CREATE PROCEDURE p AS\nBEGIN\n  RAISERROR('x', 20, 1) WITH LOG;\nEND",
+    );
+    assert_eq!(
+        ts,
+        vec![Raise {
+            kind: Cancel,
+            form: "raiserror"
+        }]
+    );
+    // RAISE SQLSTATE raises that code, so WHEN unique_violation catches it.
+    let pg = raises(
+        Pg,
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  RAISE SQLSTATE '23505';\nEND;\n$$;",
+    );
+    assert_eq!(
+        pg,
+        vec![Raise {
+            kind: Constraint,
+            form: "raise"
+        }]
+    );
+    let pg = raises(
+        Pg,
+        "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  RAISE EXCEPTION 'x' USING ERRCODE = 'unique_violation';\nEND;\n$$;",
+    );
+    assert_eq!(
+        pg,
+        vec![Raise {
+            kind: Constraint,
+            form: "raise"
+        }]
+    );
+}
+
+#[test]
+fn tsql_cancel_is_a_severity_not_an_error_number() {
+    let ts = Profile::of(Tsql);
+    assert_ne!(ts.kind_of_code("8152"), Some(Cancel));
+    assert_eq!(ts.kind_of_code("attention"), Some(Cancel));
+    assert_eq!(ts.kind_of_severity(20), Some(Cancel));
+    assert_eq!(ts.kind_of_severity(16), None);
+}

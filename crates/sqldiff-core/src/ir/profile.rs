@@ -87,6 +87,10 @@ pub struct KindRow {
     /// `error` or `warning`.
     pub class: String,
     pub codes: Vec<String>,
+    /// T-SQL severity levels (`n+` = n and above) that map to the kind
+    /// whatever the error number.
+    #[serde(default)]
+    pub severities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -361,6 +365,19 @@ impl Profile {
             }
         }
         None
+    }
+
+    /// Kind for a T-SQL severity level, when the table maps that level.
+    pub fn kind_of_severity(&self, severity: u32) -> Option<ErrorKind> {
+        self.error_kinds.iter().find_map(|(k, row)| {
+            row.severities
+                .iter()
+                .any(|c| match c.strip_suffix('+') {
+                    Some(n) => n.parse::<u32>().is_ok_and(|m| severity >= m),
+                    None => c.parse::<u32>().is_ok_and(|m| severity == m),
+                })
+                .then_some(*k)
+        })
     }
 
     pub fn unhandled_rule(&self, kind: ErrorKind, s: &Situation) -> Option<&Rule> {

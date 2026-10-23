@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashSet};
 use sqldiff_syntax::{ast, SyntaxNode};
 
 use super::cfg::{lower, Cfg, Effect, NodeId};
-use super::interp::{explore, Exit, Fate, Fault, Outcome, Scenario, TempState};
+use super::interp::{explore, Exit, Fate, Fault, Outcome, Scenario, TempState, CALLER};
 use super::profile::ErrorKind;
 use crate::artifact::Analyzed;
 use crate::classify::StmtKind;
@@ -75,6 +75,41 @@ impl SideIr<'_, '_> {
             .find(|(_, e)| e.key == key)
     }
 
+    /// Statements that read temporary object `t` without a durable effect
+    /// of their own, in document order.
+    fn plain_reads(&self, t: &str) -> Vec<NodeId> {
+        let mut v: Vec<NodeId> = (0..self.cfg.nodes.len())
+            .filter(|&i| {
+                self.cfg.node(i).stmt().is_some_and(|s| {
+                    s.durable_effect().is_none() && s.temp_reads.iter().any(|x| x == t)
+                })
+            })
+            .collect();
+        v.sort_by_key(|&i| self.syntax(i).map(|s| s.text_range().start()));
+        v
+    }
+
+    /// Key of a statement that reads a temporary object: its durable effect,
+    /// or `Read:T#n` for the n-th plain read of `T`.
+    fn read_key(&self, n: NodeId, t: &str) -> Option<String> {
+        let s = self.cfg.node(n).stmt()?;
+        if let Some(e) = s.durable_effect() {
+            return Some(e.key.clone());
+        }
+        let i = self.plain_reads(t).iter().position(|&x| x == n)?;
+        Some(format!("Read:{t}#{}", i + 1))
+    }
+
+    /// The statement behind an effect or read key.
+    fn locate(&self, key: &str) -> Option<NodeId> {
+        if let Some((n, _)) = self.effect(key) {
+            return Some(n);
+        }
+        let (t, i) = key.strip_prefix("Read:")?.rsplit_once('#')?;
+        let i: usize = i.parse().ok()?;
+        self.plain_reads(t).get(i.checked_sub(1)?).copied()
+    }
+
     fn syntax(&self, n: NodeId) -> Option<&SyntaxNode> {
         self.cfg.node(n).syntax.as_ref()
     }
@@ -87,6 +122,14 @@ impl SideIr<'_, '_> {
 
     /// Effect phrase, with an ordinal when the same write occurs more than once.
     fn phrase(&self, key: &str) -> String {
+        if let Some((t, n)) = key.strip_prefix("Read:").and_then(|k| k.rsplit_once('#')) {
+            let t = t.to_lowercase();
+            return if self.plain_reads(&t.to_uppercase()).len() > 1 {
+                format!("the read of {t} (occurrence {n})")
+            } else {
+                format!("the read of {t}")
+            };
+        }
         let Some((_, e)) = self.effect(key) else {
             return key.to_string();
         };
@@ -113,8 +156,8 @@ impl SideIr<'_, '_> {
     }
 
     fn phrase_at(&self, key: &str) -> String {
-        match self.effect(key) {
-            Some((n, _)) => format!("{} ({})", self.phrase(key), self.line(n)),
+        match self.locate(key) {
+            Some(n) => format!("{} ({})", self.phrase(key), self.line(n)),
             None => key.to_string(),
         }
     }
@@ -225,6 +268,34 @@ fn diff(sa: &SideIr, sb: &SideIr, sc: &Kind, oa: &Outcome, ob: &Outcome) -> Vec<
                 durability: true,
             });
         }
+    }
+    // 2a. The caller's own uncommitted work (caller-transaction scenario).
+    let (ca, cb) = (
+        oa.effects.get(CALLER).copied(),
+        ob.effects.get(CALLER).copied(),
+    );
+    if (ca.is_some() || cb.is_some()) && ca != cb {
+        let caller_phrase = |f: Option<Fate>| match f {
+            Some(Fate::Durable) => "commits the caller's earlier work",
+            Some(Fate::Undone) => "rolls back the caller's earlier work",
+            Some(Fate::Caller) => "leaves the caller's earlier work to the caller",
+            Some(Fate::Partial) | None => "leaves the caller's transaction in an unknown state",
+        };
+        out.push(Div {
+            rule: "txn.caller-transaction",
+            class: ChangeClass::Transactional,
+            severity: Severity::Critical,
+            anchor: CALLER.to_string(),
+            text: format!(
+                "{} {}; {} {}",
+                sa.name(),
+                caller_phrase(ca),
+                sb.name(),
+                caller_phrase(cb)
+            ),
+            assumptions: Vec::new(),
+            durability: true,
+        });
     }
     // 2. Effects that ran on both sides with different fates.
     let mut keys: Vec<&String> = oa.effects.keys().collect();
@@ -338,45 +409,46 @@ fn diff(sa: &SideIr, sb: &SideIr, sc: &Kind, oa: &Outcome, ob: &Outcome) -> Vec<
         });
     }
     // 5. Temporary state seen by aligned statements.
-    let reads = |s: &SideIr, o: &Outcome| -> BTreeSet<(String, String, TempState)> {
+    type Reads = BTreeSet<(String, String, TempState)>;
+    let reads = |s: &SideIr, o: &Outcome| -> Reads {
         o.temp_reads
             .iter()
-            .filter_map(|(n, t, st)| {
-                let key = s.cfg.node(*n).stmt()?.durable_effect()?.key.clone();
-                Some((key, t.clone(), *st))
-            })
+            .filter_map(|(n, t, st)| Some((s.read_key(*n, t)?, t.clone(), *st)))
             .collect()
     };
     let (ra, rb) = (reads(sa, oa), reads(sb, ob));
-    if let Some((k, t, _)) = ra.symmetric_difference(&rb).next() {
-        if both(k) {
-            let state = |r: &BTreeSet<(String, String, TempState)>| {
-                r.iter()
-                    .find(|(x, y, _)| x == k && y == t)
-                    .map(|(_, _, s)| match s {
-                        TempState::Rows => "still holds the rows written earlier",
-                        TempState::Empty => "is empty (the rows were rolled back or never written)",
-                    })
-                    .unwrap_or("is not read")
-            };
-            out.push(Div {
-                rule: "txn.temp-state",
-                class: ChangeClass::Transactional,
-                severity: Severity::High,
-                anchor: k.clone(),
-                text: format!(
-                    "{} reads the temporary table {}, which on {} {} and on {} {}",
-                    sa.phrase(k),
-                    t.to_lowercase(),
-                    sa.name(),
-                    state(&ra),
-                    sb.name(),
-                    state(&rb)
-                ),
-                assumptions: Vec::new(),
-                durability: false,
-            });
+    let mut reported: Vec<(&String, &String)> = Vec::new();
+    for (k, t, _) in ra.symmetric_difference(&rb) {
+        if reported.contains(&(k, t)) || sa.locate(k).is_none() || sb.locate(k).is_none() {
+            continue;
         }
+        reported.push((k, t));
+        let state = |r: &Reads| {
+            r.iter()
+                .find(|(x, y, _)| x == k && y == t)
+                .map(|(_, _, s)| match s {
+                    TempState::Rows => "still holds the rows written earlier",
+                    TempState::Empty => "is empty (the rows were rolled back or never written)",
+                })
+                .unwrap_or("is not read")
+        };
+        out.push(Div {
+            rule: "txn.temp-state",
+            class: ChangeClass::Transactional,
+            severity: Severity::High,
+            anchor: k.clone(),
+            text: format!(
+                "{} reads the temporary table {}, which on {} {} and on {} {}",
+                sa.phrase(k),
+                t.to_lowercase(),
+                sa.name(),
+                state(&ra),
+                sb.name(),
+                state(&rb)
+            ),
+            assumptions: Vec::new(),
+            durability: false,
+        });
     }
     out
 }
@@ -450,7 +522,8 @@ struct Collector<'x, 'a> {
     out: Vec<Finding>,
     assumptions: Vec<Assumption>,
     seen: HashSet<(String, String)>,
-    contract_seen: bool,
+    /// Index in `out` of the error.contract finding, if any.
+    contract_at: Option<usize>,
 }
 
 impl Collector<'_, '_> {
@@ -505,13 +578,7 @@ impl Collector<'_, '_> {
         }
         for (d, oa, ob, hits) in found {
             let key = (d.rule.to_string(), d.anchor.clone());
-            if d.rule == "error.contract" {
-                if self.contract_seen {
-                    continue;
-                }
-                self.contract_seen = true;
-            }
-            if !self.seen.insert(key) {
+            if self.seen.contains(&key) {
                 continue;
             }
             let all_agree = exact || hits == combos;
@@ -531,6 +598,17 @@ impl Collector<'_, '_> {
             } else {
                 Verdict::Unknown
             };
+            // One error.contract finding per pair: the most certain one, so
+            // an imprecise path cannot hide a proven difference.
+            let replace = if d.rule == "error.contract" {
+                match self.contract_at {
+                    Some(i) if rank(verdict) <= rank(self.out[i].verdict) => continue,
+                    at => at,
+                }
+            } else {
+                None
+            };
+            self.seen.insert(key);
             let mut ids: Vec<String> = d.assumptions.clone();
             for x in oa.assumptions.iter().chain(&ob.assumptions) {
                 if !ids.contains(x) {
@@ -592,20 +670,21 @@ impl Collector<'_, '_> {
             }
             let la = self
                 .sa
-                .effect(&d.anchor)
-                .and_then(|(n, _)| self.sa.syntax(n).cloned());
+                .locate(&d.anchor)
+                .and_then(|n| self.sa.syntax(n).cloned());
             let lb = self
                 .sb
-                .effect(&d.anchor)
-                .and_then(|(n, _)| self.sb.syntax(n).cloned());
+                .locate(&d.anchor)
+                .and_then(|n| self.sb.syntax(n).cloned());
             let anchor_text = |n: &Option<SyntaxNode>| {
                 n.as_ref()
                     .map(|n| ast::first_words(n, 3).join(" "))
                     .unwrap_or_default()
             };
             let class = d.class;
-            // Same anchors as the syntactic checks had, so stored review
-            // decisions keep matching; the effect key only splits a collision.
+            // Anchored at the first words of the statement on each side, so
+            // reformatting keeps the fingerprint; the effect key is added
+            // only to split two findings that would otherwise collide.
             let print = |key: &str| {
                 fingerprint(&FingerprintInput {
                     object: &self.sa.a.object,
@@ -616,10 +695,15 @@ impl Collector<'_, '_> {
                 })
             };
             let mut fp = print("");
-            if self.out.iter().any(|f| f.fingerprint == fp) {
+            if self
+                .out
+                .iter()
+                .enumerate()
+                .any(|(i, f)| f.fingerprint == fp && Some(i) != replace)
+            {
                 fp = print(&format!("{}|", d.anchor));
             }
-            self.out.push(Finding {
+            let f = Finding {
                 fingerprint: fp,
                 rule: d.rule.to_string(),
                 class,
@@ -629,8 +713,26 @@ impl Collector<'_, '_> {
                 a: la.as_ref().map(|n| self.sa.a.node_location(n)),
                 b: lb.as_ref().map(|n| self.sb.a.node_location(n)),
                 assumptions: ids,
-            });
+            };
+            match replace {
+                Some(i) => self.out[i] = f,
+                None => {
+                    if f.rule == "error.contract" {
+                        self.contract_at = Some(self.out.len());
+                    }
+                    self.out.push(f);
+                }
+            }
         }
+    }
+}
+
+fn rank(v: Verdict) -> u8 {
+    match v {
+        Verdict::Different => 3,
+        Verdict::Unknown => 2,
+        Verdict::EqualUnderAssumptions => 1,
+        _ => 0,
     }
 }
 
@@ -645,7 +747,7 @@ pub fn compare(a: &Analyzed, b: &Analyzed) -> (Vec<Finding>, Vec<Assumption>) {
         out: Vec::new(),
         assumptions: Vec::new(),
         seen: HashSet::new(),
-        contract_seen: false,
+        contract_at: None,
     };
     // Faults at every write both sides perform, in document order of side A.
     let keys: Vec<String> =
@@ -698,5 +800,14 @@ pub fn compare(a: &Analyzed, b: &Analyzed) -> (Vec<Finding>, Vec<Assumption>) {
         ..Scenario::default()
     };
     c.run(Kind::CallerTxn, caller.clone(), caller);
-    (c.out, c.assumptions)
+    // A replaced error.contract finding may have brought assumptions that no
+    // finding uses any more.
+    let used: HashSet<&String> = c.out.iter().flat_map(|f| &f.assumptions).collect();
+    let assumptions = c
+        .assumptions
+        .iter()
+        .filter(|x| used.contains(&x.id))
+        .cloned()
+        .collect();
+    (c.out, assumptions)
 }

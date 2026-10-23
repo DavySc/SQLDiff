@@ -8,7 +8,11 @@ GUI, CLI and MCP share it.
 A decision is keyed by **finding fingerprint** and **snapshot**:
 
 - the fingerprint is stable across reformatting (object, class, rule and
-  normalized anchors);
+  normalized anchors). It changes when an engine change moves a finding's
+  anchor: the behavioural IR (WP3) anchors transaction and error findings at
+  the statement whose failure they describe, so decisions stored for those
+  rules before it (for example the movestock `error.contract` finding,
+  formerly `06ccfd05e423182d`) no longer match and show as unreviewed;
 - the snapshot is `<content_hash_a>:<content_hash_b>` of the pair (just the
   hash of A for a check), or `*` for every snapshot.
 
