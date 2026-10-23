@@ -1,5 +1,6 @@
 id = "m14-terminator-before-throw"
 title = "Missing terminator turns THROW into a transaction name"
+note = "Checked on SQL Server 2022: with a bare ROLLBACK the missing terminator is a syntax error; with ROLLBACK TRAN it parses and changes behaviour."
 catalog_item = "remove the terminator before `THROW`"
 refs = ["design §3 layer 1 T-SQL hard cases", "design §16 missing terminator"]
 detected_by = "parse-lint"
@@ -19,5 +20,5 @@ b = "mutated"
 verdict = "different"
 classes = ["semantic"]
 witnesses = [
-  "If the INSERT fails, the original rolls back and re-raises; in the mutated version `ROLLBACK THROW` parses as a rollback of a transaction named THROW, so the error is swallowed and the procedure returns normally.",
+  "If the INSERT fails with a foreign key violation (547), the original rolls back and re-raises error 547; in the mutated version `ROLLBACK TRAN THROW` parses as a rollback of a transaction named THROW, which fails with error 6401 ('Cannot roll back THROW'), so the caller sees 6401 and the original error is lost.",
 ]

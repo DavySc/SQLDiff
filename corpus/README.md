@@ -56,7 +56,7 @@ milestone = "M3"                  # design §14 milestone whose gate covers it
 [sides.<name>]                    # pairs use the dialect as the name; mutations use
 dialect = "pg"                    # "original" and "mutated"
 file = "pg.sql"
-pg_create = "ok"                  # optional: "error" if creating it in PostgreSQL must fail
+create = "ok"                     # optional: "error" if creating it on its engine must fail
 
 [[expect]]                        # one per compared pair of sides
 a = "tsql"
@@ -113,16 +113,28 @@ conversion. m23 uses composed output with provenance markers defined by
 ## Validation
 
 ```
-python3 corpus/tools/check_corpus.py                 # format, hygiene, coverage, manifest
-python3 corpus/tools/check_corpus.py --pg "<dsn>"    # also create every PG file on a server
-python3 corpus/tools/check_corpus.py --deny <file>   # leak scan with a runtime deny-list
+python3 corpus/tools/check_corpus.py                  # format, hygiene, coverage, manifest
+python3 corpus/tools/check_corpus.py --pg "<dsn>"     # also create every PostgreSQL file
+python3 corpus/tools/check_corpus.py --mssql "<cmd>"  # also create every T-SQL file
+python3 corpus/tools/check_corpus.py --deny <file>    # leak scan with a runtime deny-list
 ```
 
-`--pg` loads `catalog/pg.sql` and one fixture at a time inside a rolled-back
-transaction on PostgreSQL 16 or later. PL/pgSQL bodies are only parsed at create
-time, so a fixture with a binding mistake (m15, m18) is still created; the
-behavioural claims of several PostgreSQL witnesses (p10, p12, m11, m15, m18, m21, m22)
-were checked by running them. T-SQL and Db2 for i fixtures are not executed yet.
+Target engines are **PostgreSQL 18** and **SQL Server 2022**; CI runs both as
+service containers. `--pg` loads `catalog/pg.sql` and one fixture at a time inside a
+rolled-back transaction. `--mssql` takes a `sqlcmd` command line (it must use `-b`
+to stop on errors and `-I` for QUOTED_IDENTIFIER ON) and creates `catalog/tsql.sql`
+plus one fixture at a time in a fresh case-insensitive database, for example:
+
+```
+python3 corpus/tools/check_corpus.py --mssql \
+  "docker exec -i mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P <pw> -C -b -I"
+```
+
+PL/pgSQL and T-SQL bodies are only partly bound at create time, so fixtures with a
+binding mistake (m15, m16, m18) are still created. Witnesses checked by execution:
+PostgreSQL 18 for p10, p12, m11, m15, m18, m21, m22; SQL Server 2022 for p05, p10,
+m05, m10, m13, m14, m16, m22. Db2 for i fixtures are not executed (no container
+oracle, design §12).
 
 ## Adding a case
 

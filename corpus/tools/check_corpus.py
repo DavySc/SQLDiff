@@ -4,17 +4,20 @@
 Checks every case.toml against the format in corpus/README.md, the text hygiene
 of every fixture, mutation-catalog coverage and the manifest. With --pg, also
 creates every PostgreSQL fixture on a live server (inside a rolled-back
-transaction, on top of catalog/pg.sql). With --deny, scans the corpus for terms
+transaction, on top of catalog/pg.sql), and with --mssql every T-SQL fixture
+on a SQL Server (in a scratch database, on top of catalog/tsql.sql). With --deny, scans the corpus for terms
 from a deny-list that must never appear in fixtures (design §5.6).
 
 Usage:
     python3 corpus/tools/check_corpus.py
     python3 corpus/tools/check_corpus.py --pg "host=/tmp port=5432 user=postgres dbname=corpus"
+    python3 corpus/tools/check_corpus.py --mssql "sqlcmd -S localhost -U sa -P <pw> -C -b -I"
     python3 corpus/tools/check_corpus.py --deny /path/to/deny-list.txt
 """
 
 import argparse
 import re
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -35,7 +38,7 @@ FACT_ID = re.compile(r"^V\d+$")
 CASE_KEYS = {"id", "title", "refs", "description", "tags", "sides", "expect",
              "note", "substitutes", "pack"}
 MUTATION_KEYS = {"catalog_item", "detected_by", "milestone"}
-SIDE_KEYS = {"dialect", "file", "pg_create"}
+SIDE_KEYS = {"dialect", "file", "create"}
 EXPECT_KEYS = {"a", "b", "verdict", "classes", "assumptions", "discharged",
                "facts", "witnesses"}
 
@@ -90,8 +93,8 @@ def check_case(case_dir: Path, kind: str):
             err(rel, f"side {name}: unknown key {key!r}")
         if side.get("dialect") not in DIALECTS:
             err(rel, f"side {name}: dialect must be one of {sorted(DIALECTS)}")
-        if side.get("pg_create", "ok") not in {"ok", "error"}:
-            err(rel, f"side {name}: pg_create must be 'ok' or 'error'")
+        if side.get("create", "ok") not in {"ok", "error"}:
+            err(rel, f"side {name}: create must be 'ok' or 'error'")
         file = side.get("file")
         if not file or not (case_dir / file).is_file():
             err(rel, f"side {name}: file {file!r} not found")
@@ -170,25 +173,47 @@ def check_manifest():
         err("MANIFEST.toml", f"{p} does not exist")
 
 
-def check_pg(dsn: str, cases: dict):
-    catalog = (CORPUS / "catalog/pg.sql").read_text("utf-8")
-    jobs = [("catalog/pg.sql", "", "ok")]
+def engine_jobs(dialect: str, cases: dict):
+    """(path, text, expected outcome) for the catalog and every side in a dialect."""
+    jobs = [(Path(f"catalog/{dialect}.sql"), "", "ok")]
     for case_dir, case in cases.items():
         for side in (case or {}).get("sides", {}).values():
-            if side.get("dialect") == "pg":
+            if side.get("dialect") == dialect:
                 path = case_dir / side["file"]
                 jobs.append((path.relative_to(CORPUS), path.read_text("utf-8"),
-                             side.get("pg_create", "ok")))
+                             side.get("create", "ok")))
+    return jobs
+
+
+def run_jobs(engine: str, cmd: list[str], jobs, wrap):
     for rel, sql, expected in jobs:
-        script = f"BEGIN;\n{catalog}\n{sql}\nROLLBACK;\n"
-        proc = subprocess.run(
-            ["psql", dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1"],
-            input=script, capture_output=True, text=True)
+        proc = subprocess.run(cmd, input=wrap(sql), capture_output=True, text=True)
         outcome = "ok" if proc.returncode == 0 else "error"
         if outcome != expected:
-            detail = proc.stderr.strip().splitlines()[0] if proc.stderr.strip() else ""
-            err(rel, f"PostgreSQL create: expected {expected}, got {outcome} {detail}")
-    print(f"PostgreSQL: created {len(jobs)} files")
+            output = (proc.stderr + proc.stdout).strip().splitlines()
+            detail = " | ".join(output[-3:])
+            err(rel, f"{engine} create: expected {expected}, got {outcome}: {detail}")
+    print(f"{engine}: created {len(jobs)} files")
+
+
+def check_pg(dsn: str, cases: dict):
+    catalog = (CORPUS / "catalog/pg.sql").read_text("utf-8")
+    run_jobs("PostgreSQL", ["psql", dsn, "-X", "-q", "-v", "ON_ERROR_STOP=1"],
+             engine_jobs("pg", cases),
+             lambda sql: f"BEGIN;\n{catalog}\n{sql}\nROLLBACK;\n")
+
+
+def check_mssql(command: str, cases: dict):
+    # Each fixture gets a fresh database with a case-insensitive collation,
+    # as catalog/tsql.sql assumes. The command must stop on the first error
+    # (sqlcmd -b) and read the script from standard input.
+    catalog = (CORPUS / "catalog/tsql.sql").read_text("utf-8")
+    db = "corpus_check"
+    setup = (f"USE master;\nGO\nIF DB_ID('{db}') IS NOT NULL DROP DATABASE {db};\nGO\n"
+             f"CREATE DATABASE {db} COLLATE Latin1_General_CI_AS;\nGO\nUSE {db};\nGO\n")
+    run_jobs("SQL Server", shlex.split(command), engine_jobs("tsql", cases),
+             lambda sql: f"{setup}{catalog}\nGO\n{sql}\nGO\nUSE master;\nGO\n"
+                         f"DROP DATABASE {db};\nGO\n")
 
 
 def check_deny(deny_file: Path):
@@ -205,6 +230,8 @@ def check_deny(deny_file: Path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--pg", metavar="DSN", help="create PostgreSQL fixtures on this server")
+    ap.add_argument("--mssql", metavar="CMD",
+                    help="create T-SQL fixtures by piping scripts to this sqlcmd command")
     ap.add_argument("--deny", metavar="FILE", type=Path, help="deny-list, one term per line")
     args = ap.parse_args()
 
@@ -224,6 +251,8 @@ def main():
     check_manifest()
     if args.pg:
         check_pg(args.pg, cases)
+    if args.mssql:
+        check_mssql(args.mssql, cases)
     if args.deny:
         check_deny(args.deny)
 
