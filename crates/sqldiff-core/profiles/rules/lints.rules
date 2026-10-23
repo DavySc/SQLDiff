@@ -1,0 +1,34 @@
+; Lints over surface terms and lifted canonical nodes. In a same-dialect
+; diff only hits that the second version adds are reported; with
+; (diff-verdict different) such a hit makes the pair different.
+
+(lint cardinality/correlated-update-unrestricted
+  (doc "Design section 7, cardinality contracts; mutation m01.")
+  (form any (update (table ?t (?opt (alias _))) (set _... (= _ (subq (select _... (where ?corr) _...))) _...)))
+  (if-contains ?corr (col ?t _))
+  (class cardinality)
+  (severity high)
+  (diff-verdict different)
+  (message "UPDATE assigns a correlated scalar subquery to every row without restricting the UPDATE to rows that have a match (WHERE EXISTS ...): rows without a match get NULL, or the whole statement fails on a NOT NULL column."))
+
+(lint concurrency/upsert-race
+  (doc "Design section 7, upserts and concurrency; mutation m03.")
+  (form any (upsert _... (concurrency race)))
+  (class concurrency)
+  (severity medium)
+  (diff-verdict different)
+  (message "Upsert that checks and then writes without a lock (no HOLDLOCK/UPDLOCK): two sessions can both miss the row, and one INSERT fails with a duplicate key or one update is lost."))
+
+(lint concurrency/insert-if-absent-race
+  (form any (insert-if-absent _... (concurrency race)))
+  (class concurrency)
+  (severity medium)
+  (diff-verdict different)
+  (message "Insert-if-absent that checks and then inserts without a lock: a concurrent insert of the same key makes the INSERT fail with a duplicate key."))
+
+(lint semantic/top-without-order
+  (form tsql (select (?opt (distinct)) (top _) ?rest...))
+  (unless-contains (all ?rest...) (order _...))
+  (class semantic)
+  (severity low)
+  (message "TOP without ORDER BY returns arbitrary rows; a conversion may pick different ones."))

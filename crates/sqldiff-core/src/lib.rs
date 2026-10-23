@@ -15,6 +15,7 @@ pub mod model;
 pub mod normalize;
 pub mod phrase;
 pub mod render;
+pub mod rules;
 pub mod treediff;
 
 pub use artifact::Artifact;
