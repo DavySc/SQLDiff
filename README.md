@@ -54,10 +54,29 @@ Verdict: DIFFERENT
 | 5 Structural diff | Same-dialect: statements aligned by normalized content (not lines), cosmetic changes counted and hidden, edits, additions, removals and moves classified, including moves across transaction boundaries. T-SQL identifier case folds only under an explicit collation assumption. |
 | Behavioural checks | Summary-level transaction/error model: atomicity when a later write fails, Db2 `*NONE` statement atomicity, caller-owned transactions vs `*NONE`, return-code vs raised-error contract. Cross-dialect write pairing (incl. MERGE vs `ON CONFLICT` upserts, Db2 `FINAL TABLE`). |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
-| Interfaces | CLI `diff` / `check` / `parse` / `tree`, text, JSON and SARIF 2.1.0. Findings carry stable fingerprints that survive reformatting. |
+| Interfaces | CLI `diff` / `check` / `parse` / `tree`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
 | GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
-Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, packs/adapters, MCP server, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
+Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, packs/adapters, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
+
+## MCP server
+
+`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files, never writes, and sends nothing over the network.
+
+```sh
+cargo build --release
+claude mcp add sqldiff -- "$PWD/target/release/sqldiff-mcp"
+```
+
+Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldiff-mcp"}}`.
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `diff` | `a`, `b`: `{dialect, path \| text, name?, version?}`; `max_findings` (20), `excerpt_lines` (3) | Verdict and finding cards, most severe first; cosmetic and structural noise counted |
+| `check` | `artifact`: as above | Lint findings for one file |
+| `finding` | `fingerprint` | One finding from this session in full: both locations with excerpts and the text of each assumption |
+
+Each result carries a readable text block and the same data as `structuredContent` JSON.
 
 ## Layout
 
@@ -65,6 +84,7 @@ Not yet built: binding against catalogs, the semantic IR and CFG with error edge
 crates/sqldiff-syntax   lexers, parser, CST helpers (no analysis)
 crates/sqldiff-core     findings model, normalization, diff engines, checks, renderers
 crates/sqldiff-cli      the `sqldiff` binary
+crates/sqldiff-mcp      the `sqldiff-mcp` stdio MCP server
 crates/sqldiff-gui      the `sqldiff-gui` pair view (local server + embedded page)
 tests/fixtures          synthetic fixtures (all written for this repository)
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time

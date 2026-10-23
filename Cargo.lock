@@ -371,6 +371,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqldiff-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqldiff-core",
+]
+
+[[package]]
 name = "sqldiff-syntax"
 version = "0.1.0"
 dependencies = [

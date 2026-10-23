@@ -1,0 +1,23 @@
+id = "m05-table-variable-to-temp-table"
+title = "Table variable replaced by a temporary table"
+catalog_item = "table variable → transactional temporary table"
+refs = ["design §7 temporary state", "design §16 table variable replaced"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional"]
+witnesses = [
+  "If a non-positive price is found, the original audits every updated item; in the mutated version the ROLLBACK also removes the rows of #attempted, so nothing is audited.",
+]

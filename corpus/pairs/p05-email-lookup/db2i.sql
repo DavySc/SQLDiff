@@ -1,0 +1,6 @@
+CREATE FUNCTION customer_by_email (p_email VARCHAR(254)) RETURNS INTEGER
+LANGUAGE SQL
+READS SQL DATA
+BEGIN
+  RETURN (SELECT customer_id FROM customer WHERE UPPER(email) = UPPER(p_email));
+END;

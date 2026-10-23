@@ -1,0 +1,23 @@
+id = "m10-set-subquery-to-select-assign"
+title = "SET from a subquery replaced by SELECT assignment"
+catalog_item = "SET @v = (subquery) → SELECT @v = …"
+refs = ["design §7 cardinality contracts"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["cardinality"]
+witnesses = [
+  "If two customers share the last name, the original raises 'Subquery returned more than 1 value'; the mutated version silently returns one of the ids.",
+]

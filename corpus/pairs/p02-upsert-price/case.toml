@@ -1,0 +1,44 @@
+id = "p02-upsert-price"
+title = "Single-row upsert: MERGE with HOLDLOCK, ON CONFLICT, Db2 MERGE"
+refs = ["design §7 upserts and MERGE", "design §8 lift upsert"]
+tags = ["upsert", "concurrency", "idiom"]
+description = """
+Three spellings of the canonical upsert node. All use a per-statement time source.
+The T-SQL MERGE is race-free only because of HOLDLOCK; ON CONFLICT relies on the
+primary key on item_price.item_id.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal"
+classes = ["structural"]
+discharged = ["item_price.item_id is the primary key (catalog)"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural"]
+assumptions = ["Db2 for i MERGE does not raise a duplicate key when two sessions insert the same key concurrently"]
+facts = ["V3"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural"]
+assumptions = ["Db2 for i MERGE does not raise a duplicate key when two sessions insert the same key concurrently"]
+facts = ["V3"]

@@ -1,0 +1,17 @@
+# Synthetic pack for the corpus: describes the provenance markers that a made-up
+# code generator writes into its output. Draft format; the pack schema is not
+# fixed yet (design §5.2, open decision 7).
+name = "synthetic-generator"
+version = "0.1.0"
+
+[composition.markers]
+# A part starts with a line comment naming the part and its template,
+# and ends with a closing marker on its own line.
+begin = '^-- \[part:(?P<part>[a-z0-9-]+) template=(?P<template>[a-z0-9-]+)\]$'
+end = '^-- \[/part\]$'
+nesting = false
+
+[template]
+# Placeholders as the generator's templates would spell them (not used by the
+# current fixtures, which only contain composed output).
+placeholder = '\{\{(?P<name>[A-Z][A-Z0-9_]*)\}\}'

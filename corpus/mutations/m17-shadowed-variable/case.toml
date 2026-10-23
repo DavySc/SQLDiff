@@ -1,0 +1,23 @@
+id = "m17-shadowed-variable"
+title = "Inner declaration shadows the accumulator"
+catalog_item = "shadow a variable"
+refs = ["design §3 layer 2 binding", "design §16 variable shadowing"]
+detected_by = "early-check"
+milestone = "M3"
+
+[sides.original]
+dialect = "db2i"
+file = "original.db2i.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["binding", "semantic"]
+witnesses = [
+  "For an order whose lines total 10.00, the original returns 10.00; the mutated version accumulates into the inner v_total and returns the outer one, 0.00.",
+]

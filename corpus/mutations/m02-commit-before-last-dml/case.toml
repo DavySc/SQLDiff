@@ -1,0 +1,24 @@
+id = "m02-commit-before-last-dml"
+title = "COMMIT moved above the last DML"
+catalog_item = "move a COMMIT before the last DML"
+refs = ["design §7 transactions"]
+detected_by = "behavioural"
+milestone = "M5a"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional"]
+assumptions = ["caller has no open transaction"]
+witnesses = [
+  "If the INSERT into stock_log fails, the original rolls back the stock UPDATE; the mutated version has already committed it.",
+]

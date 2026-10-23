@@ -1,0 +1,38 @@
+id = "p06-paged-orders"
+title = "Paged read with a total order"
+refs = ["design §3 canonical paged-read node", "design §7 cardinality contracts"]
+tags = ["idiom", "paging"]
+description = """
+OFFSET/FETCH, LIMIT/OFFSET and OFFSET/FETCH FIRST lift to the same paged-read node.
+The sort key ends in the primary key, so the page is deterministic on every side.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal"
+classes = ["structural"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal"
+classes = ["structural"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal"
+classes = ["structural"]

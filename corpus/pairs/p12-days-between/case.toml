@@ -1,0 +1,61 @@
+id = "p12-days-between"
+title = "Day difference: boundaries crossed vs elapsed days"
+refs = ["design §7 date difference semantics", "design §3 every rewrite rule ships with a near-miss"]
+tags = ["dates", "near-miss"]
+description = """
+DATEDIFF(day, ...) counts midnight boundaries crossed. Subtracting dates in
+PostgreSQL and subtracting DAYS() in Db2 for i do the same. The near-miss side
+extracts the day field of the interval, which counts whole elapsed days.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.pg_nearmiss]
+dialect = "pg"
+file = "pg_nearmiss.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal"
+classes = ["structural"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal"
+classes = ["structural"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal"
+classes = ["structural"]
+
+[[expect]]
+a = "tsql"
+b = "pg_nearmiss"
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "For created_at = 2026-01-01 23:00 and shipped_at = 2026-01-02 01:00, T-SQL returns 1 and the near-miss returns 0.",
+]
+
+[[expect]]
+a = "pg"
+b = "pg_nearmiss"
+verdict = "different"
+classes = ["semantic"]
+witnesses = [
+  "For created_at = 2026-01-01 23:00 and shipped_at = 2026-01-02 01:00, date subtraction returns 1 and the interval's day field is 0.",
+]

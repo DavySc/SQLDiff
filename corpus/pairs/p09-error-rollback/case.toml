@@ -1,0 +1,49 @@
+id = "p09-error-rollback"
+title = "All-or-nothing unit of work with rethrow"
+refs = ["design §7 error handling", "design §7 transactions"]
+tags = ["transaction", "error-contract"]
+description = """
+Each side commits both statements together or rolls both back and re-raises.
+T-SQL: TRY/CATCH with XACT_ABORT. PostgreSQL: procedure with COMMIT, so an error
+aborts the CALL's transaction and propagates. Db2 for i: EXIT handler with ROLLBACK
+and RESIGNAL under commitment control.
+All three differ when the caller already holds a transaction: T-SQL's ROLLBACK ends
+the caller's transaction, PostgreSQL refuses the COMMIT inside a transaction block,
+and Db2 commits the caller's pending work.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal-under-assumptions"
+classes = ["structural"]
+assumptions = ["caller has no open transaction"]
+facts = ["V17"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural"]
+assumptions = ["caller has no open transaction", "commitment definition is scoped to the caller's job"]
+facts = ["V5", "V6"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["structural"]
+assumptions = ["caller has no open transaction"]
+facts = ["V6", "V17"]
