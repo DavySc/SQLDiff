@@ -34,6 +34,17 @@ impl Dialect {
         }
     }
 
+    /// Default target engine version. Version-dependent facts (built-in
+    /// availability, MERGE clauses, defaults) are evaluated against it.
+    /// Project policy: SQL Server 2022 and PostgreSQL 18.
+    pub fn default_version(self) -> &'static str {
+        match self {
+            Dialect::Tsql => "2022",
+            Dialect::Postgres => "18",
+            Dialect::Db2i => "7.6",
+        }
+    }
+
     pub fn lexical(self) -> &'static LexicalProfile {
         match self {
             Dialect::Tsql => &TSQL,

@@ -149,3 +149,39 @@ fn fixtures_round_trip_cleanly() {
     }
     assert!(count > 0);
 }
+
+/// The shared test corpus (corpus/), when present: every file round-trips without diagnostics.
+#[test]
+fn corpus_round_trips_when_present() {
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../corpus"));
+    if !root.exists() {
+        return;
+    }
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".sql") else {
+                continue;
+            };
+            let key = stem.rsplit('.').next().unwrap_or(stem);
+            let Ok(dialect) = key.parse::<Dialect>() else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&path).unwrap();
+            let p = parse(&text, dialect);
+            assert_eq!(p.syntax().text().to_string(), text, "{}", path.display());
+            assert!(
+                p.diagnostics.is_empty(),
+                "{}: {:?}",
+                path.display(),
+                p.diagnostics
+            );
+        }
+    }
+}
