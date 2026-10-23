@@ -49,8 +49,8 @@ schema = 1                  # packs newer than the build are rejected
 | `[[dialect_map]]` | `glob`, `dialect`, optional `version`; first match wins |
 | `[dialect_versions]` | Target version per dialect |
 | `ignore` | Globs a tree source skips |
-| `[template]` | Placeholder delimiters, name pattern, special forms, parameter sources, collision rule |
-| `[[composition]]` | Begin and end markers of composed parts |
+| `[template]` | Placeholder delimiters, name pattern, special forms, parameter sources, collision rule ([templates-and-composition.md](templates-and-composition.md)) |
+| `[[composition]]` | Begin and end line markers of composed parts; named groups `part`, `template`, others become parameters |
 | `[[helpers]]` | Organisation functions for the built-in catalog |
 | `[[author_markers]]` | `review_note`, `intentional_difference`, `sync_partner` comment patterns |
 | `[[change_patterns]]` | Work-item ids in change descriptions (first capture group) |

@@ -8,10 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use sqldiff_core::composition::{self, Composition};
+use sqldiff_core::model::Side as ReportSide;
 use sqldiff_core::{render, Artifact, Dialect, Options, Report, Verdict};
 use sqldiff_source::protocol::ObjectFilter;
-use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
+use sqldiff_source::{compose, pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
+use sqldiff_syntax::template::{ExpandProblem, SegmentKind, Template};
 
 mod source_cmd;
 
@@ -54,6 +57,14 @@ enum Command {
         /// Maximum excerpt lines per location (default: config, else 3).
         #[arg(long)]
         excerpt_lines: Option<usize>,
+        /// Check mode: templates by name (file stem) for the pack's composition
+        /// markers; each generated part is compared with its substituted template.
+        #[arg(long, value_name = "DIR")]
+        templates: Option<PathBuf>,
+        /// Both sides are templates in the pack's `[template]` syntax: diff
+        /// their SQL fragments, with locations in the templates.
+        #[arg(long, conflicts_with = "templates")]
+        template: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -66,6 +77,26 @@ enum Command {
         dialect: Option<Dialect>,
         #[arg(short, long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        /// Check mode for composed output: templates by name (file stem).
+        #[arg(long, value_name = "DIR")]
+        templates: Option<PathBuf>,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
+    },
+    /// Read a template with the pack's `[template]` syntax: list its
+    /// placeholders and special forms, parse its SQL fragment and verify the
+    /// round trip; with --render, print the output for the --param values.
+    Template {
+        file: PathBuf,
+        #[arg(short, long)]
+        dialect: Option<Dialect>,
+        /// Parameter value: NAME=VALUE. Repeatable. With any, placeholder
+        /// candidates that name no parameter are reported as unresolved.
+        #[arg(long = "param", value_name = "NAME=VALUE", value_parser = source_cmd::key_value)]
+        params: Vec<(String, String)>,
+        /// Print the substituted output instead of the summary.
+        #[arg(long)]
+        render: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -144,6 +175,141 @@ fn with_policy(mut r: Report, a: &Artifact, b: Option<&Artifact>, cfg: &Resolved
     r
 }
 
+fn template_syntax(cfg: &Resolved) -> Result<sqldiff_syntax::template::Compiled, String> {
+    let t = cfg
+        .policy
+        .template
+        .as_ref()
+        .ok_or("no [template] syntax in the loaded packs or config")?;
+    compose::compile(t).map_err(|e| e.0)
+}
+
+/// Template-level diff: the SQL fragments of two templates, located in the templates.
+fn template_diff(
+    a: &Artifact,
+    b: &Artifact,
+    cfg: &Resolved,
+    opts: &Options,
+) -> Result<Report, String> {
+    let syntax = template_syntax(cfg)?;
+    let ta = Template::parse(&a.text, &syntax, None);
+    let tb = Template::parse(&b.text, &syntax, None);
+    let (fa, fb) = (ta.fragment(), tb.fragment());
+    let mut xa = a.clone();
+    xa.text = fa.text.clone();
+    let mut xb = b.clone();
+    xb.text = fb.text.clone();
+    let mut r = sqldiff_core::diff(&xa, &xb, opts);
+    composition::remap_to_template(
+        &mut r,
+        ReportSide::A,
+        &ta,
+        &fa,
+        a.dialect,
+        opts.excerpt_lines,
+    );
+    composition::remap_to_template(
+        &mut r,
+        ReportSide::B,
+        &tb,
+        &fb,
+        b.dialect,
+        opts.excerpt_lines,
+    );
+    Ok(with_policy(r, a, Some(b), cfg))
+}
+
+fn template_cmd(
+    art: &Artifact,
+    params: &BTreeMap<String, String>,
+    render: bool,
+    cfg: &Resolved,
+) -> Result<ExitCode, String> {
+    let syntax = template_syntax(cfg)?;
+    let known: std::collections::BTreeSet<String> = params.keys().cloned().collect();
+    let t = Template::parse(&art.text, &syntax, (!params.is_empty()).then_some(&known));
+    if t.print() != art.text {
+        return Err("round trip failed: template segments differ from input".into());
+    }
+    let lines = sqldiff_syntax::LineIndex::new(&art.text);
+    if render {
+        return match t.substitute(params) {
+            Ok(out) => {
+                print!("{}", out.text);
+                Ok(ExitCode::SUCCESS)
+            }
+            Err(problems) => {
+                for p in problems {
+                    let off = match &p {
+                        ExpandProblem::MissingParameter { offset, .. }
+                        | ExpandProblem::SpecialForm { offset, .. } => *offset,
+                    };
+                    let (l, c) = lines.line_col(off);
+                    eprintln!("{}:{l}:{c}: {p}", art.path);
+                }
+                Ok(ExitCode::from(1))
+            }
+        };
+    }
+    let mut problems = 0;
+    for s in &t.segments {
+        let (l, c) = lines.line_col(s.start);
+        match &s.kind {
+            SegmentKind::Sql => {}
+            SegmentKind::Placeholder { name } => {
+                println!("{}:{l}:{c}: placeholder {name}", art.path)
+            }
+            SegmentKind::Special { form, args } => {
+                println!(
+                    "{}:{l}:{c}: special form {form} {}",
+                    art.path,
+                    args.join(" ")
+                )
+            }
+            SegmentKind::Unresolved { name } => {
+                problems += 1;
+                println!(
+                    "{}:{l}:{c}: unresolved `{}`: {name} is not a parameter; kept as SQL",
+                    art.path,
+                    t.slice(s)
+                )
+            }
+        }
+    }
+    let (parse, diags) = t.fragment().parse(art.dialect);
+    for d in &diags {
+        let (l, c) = lines.line_col(d.offset);
+        eprintln!("{}:{l}:{c}: {}", art.path, d.message);
+    }
+    let statements = parse
+        .syntax()
+        .descendants()
+        .filter(|n| n.kind().is_unit())
+        .count();
+    eprintln!(
+        "{}: {} parameters, {statements} statements in the fragment, {} diagnostics, round trip ok",
+        art.path,
+        t.parameters().len(),
+        diags.len()
+    );
+    Ok(ExitCode::from(if diags.is_empty() && problems == 0 {
+        0
+    } else {
+        1
+    }))
+}
+
+/// Read mode over the pack's composition markers.
+fn composed(art: &Artifact, cfg: &Resolved) -> Result<Option<Composition>, String> {
+    compose::read(&art.text, &cfg.policy).map_err(|e| e.0)
+}
+
+fn template_dir(dir: Option<&Path>) -> Result<Option<compose::TemplateDir>, String> {
+    dir.map(compose::TemplateDir::new)
+        .transpose()
+        .map_err(|e| e.0)
+}
+
 fn exit_for(verdict: Verdict) -> ExitCode {
     match verdict {
         Verdict::Equal | Verdict::EqualUnderAssumptions => ExitCode::from(0),
@@ -179,6 +345,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
+            templates,
+            template,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
@@ -187,7 +355,24 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let opts = Options {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
             };
-            let report = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
+            if template {
+                let report = template_diff(&a, &b, &cfg, &opts)?;
+                emit(&report, format);
+                return Ok(exit_for(report.verdict));
+            }
+            let templates = template_dir(templates.as_deref())?;
+            let mut report = sqldiff_core::diff(&a, &b, &opts);
+            let (ca, cb) = (composed(&a, &cfg)?, composed(&b, &cfg)?);
+            compose::annotate(
+                &mut report,
+                (&a, ca.as_ref()),
+                Some((&b, cb.as_ref())),
+                &cfg.policy,
+                templates.as_ref(),
+                &opts,
+            )
+            .map_err(|e| e.0)?;
+            let report = with_policy(report, &a, Some(&b), &cfg);
             emit(&report, format);
             Ok(exit_for(report.verdict))
         }
@@ -195,6 +380,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             file,
             dialect,
             format,
+            templates,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
@@ -202,9 +388,32 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let opts = Options {
                 excerpt_lines: cfg.excerpt_lines,
             };
-            let report = with_policy(sqldiff_core::check(&art, &opts), &art, None, &cfg);
+            let templates = template_dir(templates.as_deref())?;
+            let mut report = sqldiff_core::check(&art, &opts);
+            let comp = composed(&art, &cfg)?;
+            compose::annotate(
+                &mut report,
+                (&art, comp.as_ref()),
+                None,
+                &cfg.policy,
+                templates.as_ref(),
+                &opts,
+            )
+            .map_err(|e| e.0)?;
+            let report = with_policy(report, &art, None, &cfg);
             emit(&report, format);
             Ok(exit_for(report.verdict))
+        }
+        Command::Template {
+            file,
+            dialect,
+            params,
+            render,
+            cfg,
+        } => {
+            let cfg = cfg.resolve()?;
+            let art = read(&file, dialect, &cfg)?;
+            template_cmd(&art, &params.into_iter().collect(), render, &cfg)
         }
         Command::Parse {
             file,
@@ -372,12 +581,18 @@ fn tree(
     for (ia, ib) in &pairs {
         let a = sa.read(ia, cfg)?;
         let b = sb.read(ib, cfg)?;
-        reports.push(with_policy(
-            sqldiff_core::diff(&a, &b, &opts),
-            &a,
-            Some(&b),
-            cfg,
-        ));
+        let mut r = sqldiff_core::diff(&a, &b, &opts);
+        let (ca, cb) = (composed(&a, cfg)?, composed(&b, cfg)?);
+        compose::annotate(
+            &mut r,
+            (&a, ca.as_ref()),
+            Some((&b, cb.as_ref())),
+            &cfg.policy,
+            None,
+            &opts,
+        )
+        .map_err(|e| e.0)?;
+        reports.push(with_policy(r, &a, Some(&b), cfg));
     }
     let ambiguous: Vec<serde_json::Value> = [(&sa, "A"), (&sb, "B")]
         .iter()

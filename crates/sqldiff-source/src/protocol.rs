@@ -201,6 +201,10 @@ pub struct Pair {
 pub struct Composition {
     pub id: String,
     pub parts: Vec<CompositionPart>,
+    /// The output is older than its templates or parameters; verdicts that
+    /// depend on it are capped at unknown.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,6 +217,11 @@ pub struct CompositionPart {
     pub template: Option<String>,
     #[serde(default)]
     pub parameters: BTreeMap<String, String>,
+    /// Content hash (as `content_hash` in `ObjectInfo`) of the template the
+    /// part was generated from; check mode flags the part stale when the
+    /// current template hashes differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

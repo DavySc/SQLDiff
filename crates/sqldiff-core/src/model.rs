@@ -120,6 +120,9 @@ pub enum AssumptionSource {
     Default,
     /// Declared in source, a pack or project config.
     Declared,
+    /// Proven from the composed output of a generator (a wrapper part
+    /// states the fact); discharged, not an open assumption.
+    ComposedOutput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

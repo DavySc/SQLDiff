@@ -12,6 +12,7 @@
 //!   to engine reports (overrides, declared assumptions, limits).
 
 pub mod bundle;
+pub mod compose;
 pub mod config;
 mod error;
 pub mod fs;

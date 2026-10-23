@@ -7,8 +7,8 @@ use crate::classify::pairing_key;
 use crate::facts;
 use crate::lint;
 use crate::model::{
-    fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, NoiseCounts, Report, Severity,
-    Side, Verdict,
+    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, NoiseCounts,
+    Report, Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::treediff;
@@ -149,7 +149,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
     })
 }
 
-fn finish(mut r: Report) -> Report {
+pub(crate) fn finish(mut r: Report) -> Report {
     // Same fingerprint twice (e.g. the same residue on two lines): keep both, they have different locations.
     r.findings.sort_by(|x, y| {
         y.severity
@@ -163,7 +163,11 @@ fn finish(mut r: Report) -> Report {
         || !r.unknown_reasons.is_empty()
     {
         Verdict::Unknown
-    } else if !r.assumptions.is_empty() {
+    } else if r
+        .assumptions
+        .iter()
+        .any(|a| a.source != AssumptionSource::ComposedOutput)
+    {
         Verdict::EqualUnderAssumptions
     } else {
         Verdict::Equal

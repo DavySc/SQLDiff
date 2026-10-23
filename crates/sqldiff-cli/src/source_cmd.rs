@@ -13,7 +13,9 @@ use sqldiff_core::{render, Options, Report, Verdict};
 use sqldiff_source::bundle::CaptureOptions;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::protocol::{ObjectFilter, PairScope};
-use sqldiff_source::{pairing, policy, process, Bundle, Pack, Resolved, Source, SourceSpec};
+use sqldiff_source::{
+    compose, pairing, policy, process, Bundle, Pack, Resolved, Source, SourceSpec,
+};
 
 use crate::{exit_for, Format};
 
@@ -39,7 +41,7 @@ pub struct ConfigArgs {
     dialect_versions: Vec<(String, String)>,
 }
 
-fn key_value(s: &str) -> Result<(String, String), String> {
+pub fn key_value(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
         .filter(|(k, _)| !k.is_empty())
@@ -334,6 +336,17 @@ fn pairs(
         let a = src.load_artifact(&x.a).map_err(|e| e.0)?;
         let b = src.load_artifact(&x.b).map_err(|e| e.0)?;
         let mut r = sqldiff_core::diff(&a, &b, &opts);
+        let ca = compose::for_object(src, &x.a, &a.text, &cfg.policy).map_err(|e| e.0)?;
+        let cb = compose::for_object(src, &x.b, &b.text, &cfg.policy).map_err(|e| e.0)?;
+        compose::annotate(
+            &mut r,
+            (&a, ca.as_ref()),
+            Some((&b, cb.as_ref())),
+            &cfg.policy,
+            None,
+            &opts,
+        )
+        .map_err(|e| e.0)?;
         policy::add_limits(&mut r, &a, Some(&b), cfg);
         policy::apply(&mut r, cfg);
         policy::cap_stale(&mut r, stale(&x.a), stale(&x.b));
