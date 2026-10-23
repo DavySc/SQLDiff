@@ -65,16 +65,17 @@ Verdict: DIFFERENT
 | 1 Parsing | Hand-written lossless lexers and a statement-level CST (rowan) for all three dialects: `print(parse(x)) == x` for any input (fuzz-tested). Procedural compounds (blocks, IF, loops, CASE, Db2 handlers, T-SQL TRY/CATCH, PL/pgSQL EXCEPTION), T-SQL `GO` batches and inferred terminators, Db2 labels and `SET OPTION`, nested PL/pgSQL/SQL parsing of dollar-quoted bodies with offsets into the outer file. Expressions are kept flat for now. |
 | 5 Structural diff | Same-dialect: statements aligned by normalized content (not lines), cosmetic changes counted and hidden, edits, additions, removals and moves classified, including moves across transaction boundaries. T-SQL identifier case folds only under an explicit collation assumption. |
 | Behavioural checks | Summary-level transaction/error model: atomicity when a later write fails, Db2 `*NONE` statement atomicity, caller-owned transactions vs `*NONE`, return-code vs raised-error contract. Cross-dialect write pairing (incl. MERGE vs `ON CONFLICT` upserts, Db2 `FINAL TABLE`). |
+| 2-4 Statement equivalence | Per-statement canonical terms for views, functions, procedures and scripts in all three dialects, with dialect semantics made explicit (string collation and padding, NULL ordering, scalar-subquery cardinality, empty-result behaviour, time sources, upsert concurrency) and idiom lifting (MERGE vs `ON CONFLICT` upserts, identity retrieval via `SCOPE_IDENTITY` / `RETURNING` / `FINAL TABLE`, anti-join deletes, `ISNULL` vs `COALESCE`, date differences, string aggregation). Cross-dialect pairs get `equal`, `equal under assumptions` (listed) or `different` with a witness; anything not lowered stays `unknown` with the reason. `--catalog FILE` (or `--catalog-a` / `--catalog-b`) supplies CREATE TABLE / CREATE UNIQUE INDEX DDL so keys, nullability and types discharge assumptions. 53 of 64 corpus expectations match, none falsely equal. |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
-| Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check` and `finding` tools. Findings carry stable fingerprints that survive reformatting. |
+| Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
 | GUI (M1 spike) | `sqldiff-gui serve` / `export`: pair view aligned by statement, per-token styling, findings panel, keyboard navigation, `#f=<fingerprint>` deep links, scratchpad that re-diffs on edit. Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
 
-Not yet built: binding against catalogs, the semantic IR and CFG with error edges (M4), statement-level cross-dialect equivalence, idiom lifting, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
+Not yet built: full binding against catalogs, the CFG with error edges (M4) and equivalence across control flow (loops, branches, error handlers that write), named-lock idioms, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
 ## MCP server
 
-`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files, never writes, and sends nothing over the network.
+`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files, never writes, and sends nothing over the network. It resolves packs and config like the CLI (`--pack`, `--config`, `--user-config`, `--isolated`); `--gui-url` (or `$SQLDIFF_GUI_URL`) sets where `open_in_gui` links point.
 
 ```sh
 cargo build --release
@@ -88,6 +89,13 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 | `diff` | `a`, `b`: `{dialect, path \| text, name?, version?}`; `max_findings` (20), `excerpt_lines` (3) | Verdict and finding cards, most severe first; cosmetic and structural noise counted |
 | `check` | `artifact`: as above | Lint findings for one file |
 | `finding` | `fingerprint` | One finding from this session in full: both locations with excerpts and the text of each assumption |
+| `queue` | `source` (directory, bundle, `git:…`, `adapter:…`; default `[source]`), `dialect_a`/`dialect_b`, `classes`, `min_severity`, `verdicts`, `folder`, `review`, `limit` (25) | Every pair of the source diffed and ranked: unreviewed, verdict, severity, whether one assumption decides the verdict, recency, size. A few lines per pair, each with a pair id |
+| `assumptions` | `pair` id or a finding `fingerprint` | The pair's assumption ledger: open, declared, confirmed or denied; findings relying on each; which flip the verdict |
+| `set_assumption` | `id`, `holds` (true, false or null to reset) | Session-local flip; every held pair's verdict is re-derived and changes are listed. A denied assumption makes the findings relying on it unknown |
+| `comment_text` | `finding_ids`, `excerpt_lines` (1), `fingerprints` (true) | A plain-text review comment from the phrase grammar: same findings, same text |
+| `open_in_gui` | `finding_id` or `pair`, `gui_url` | `{gui}/?a=<path>&b=<path>#f=<fingerprint>` and the `sqldiff-gui serve` command for the pair |
+
+The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store once it lands; until then every finding counts as unreviewed.
 
 Each result carries a readable text block and the same data as `structuredContent` JSON.
 

@@ -13,6 +13,7 @@ use sqldiff_source::protocol::ObjectFilter;
 use sqldiff_source::{pairing, policy, FsSource, Resolved, Source};
 use sqldiff_syntax::ast;
 
+mod queue_cmd;
 mod source_cmd;
 
 #[derive(Parser)]
@@ -54,6 +55,17 @@ enum Command {
         /// Maximum excerpt lines per location (default: config, else 3).
         #[arg(long)]
         excerpt_lines: Option<usize>,
+        /// DDL file (CREATE TABLE, CREATE UNIQUE INDEX) describing the catalog
+        /// both sides run against, read in each side's dialect. Repeatable.
+        /// Keys, nullability and column types discharge equivalence side conditions.
+        #[arg(long, value_name = "FILE")]
+        catalog: Vec<PathBuf>,
+        /// Catalog DDL for side A only. Repeatable.
+        #[arg(long, value_name = "FILE")]
+        catalog_a: Vec<PathBuf>,
+        /// Catalog DDL for side B only. Repeatable.
+        #[arg(long, value_name = "FILE")]
+        catalog_b: Vec<PathBuf>,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -94,6 +106,8 @@ enum Command {
     },
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
+    #[command(flatten)]
+    Queue(queue_cmd::QueueCommand),
 }
 
 /// Path with `/` separators, as `dialect_map` globs and pairing see it.
@@ -179,13 +193,32 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_b,
             format,
             excerpt_lines,
+            catalog,
+            catalog_a,
+            catalog_b,
             cfg,
         } => {
             let cfg = cfg.resolve()?;
             let a = read(&a, dialect_a.or(dialect), &cfg)?;
             let b = read(&b, dialect_b.or(dialect), &cfg)?;
+            let ddl = |paths: &[PathBuf], d: Dialect| -> Result<Vec<Artifact>, String> {
+                paths
+                    .iter()
+                    .map(|p| {
+                        let text = std::fs::read_to_string(p)
+                            .map_err(|e| format!("{}: {e}", p.display()))?;
+                        Ok(Artifact::new(p.display().to_string(), d, text))
+                    })
+                    .collect()
+            };
+            let mut cat_a = ddl(&catalog, a.dialect)?;
+            cat_a.extend(ddl(&catalog_a, a.dialect)?);
+            let mut cat_b = ddl(&catalog, b.dialect)?;
+            cat_b.extend(ddl(&catalog_b, b.dialect)?);
             let opts = Options {
                 excerpt_lines: excerpt_lines.unwrap_or(cfg.excerpt_lines),
+                catalog_a: cat_a,
+                catalog_b: cat_b,
             };
             let report = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
             emit(&report, format);
@@ -201,6 +234,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let art = read(&file, dialect, &cfg)?;
             let opts = Options {
                 excerpt_lines: cfg.excerpt_lines,
+                ..Options::default()
             };
             let report = with_policy(sqldiff_core::check(&art, &opts), &art, None, &cfg);
             emit(&report, format);
@@ -257,6 +291,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             &cfg.resolve()?,
         ),
         Command::Source(cmd) => source_cmd::run(cmd),
+        Command::Queue(cmd) => queue_cmd::run(cmd),
     }
 }
 
@@ -342,6 +377,7 @@ fn tree(
     let mut sb = Side::load(dir_b, db, cfg)?;
     let opts = Options {
         excerpt_lines: cfg.excerpt_lines,
+        ..Options::default()
     };
     let mut pairs: Vec<(String, String)> = Vec::new();
     // Explicit pack pairs first: `a` relative to DIR_A, `b` relative to DIR_B.

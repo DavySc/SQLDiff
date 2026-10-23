@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use crate::artifact::{Analyzed, Artifact};
 use crate::classify::pairing_key;
+use crate::equiv;
 use crate::facts;
 use crate::lint;
 use crate::model::{
@@ -17,11 +18,21 @@ use crate::treediff;
 pub struct Options {
     /// Maximum lines of excerpt per location.
     pub excerpt_lines: usize,
+    /// DDL artifacts (CREATE TABLE / CREATE UNIQUE INDEX) describing the
+    /// catalog side A runs against; used to discharge key, nullability and
+    /// type side conditions of statement equivalence.
+    pub catalog_a: Vec<Artifact>,
+    /// The same for side B.
+    pub catalog_b: Vec<Artifact>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { excerpt_lines: 3 }
+        Options {
+            excerpt_lines: 3,
+            catalog_a: Vec::new(),
+            catalog_b: Vec::new(),
+        }
     }
 }
 
@@ -43,12 +54,16 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     ];
     let mut unknown_reasons = Vec::new();
     let mut noise = NoiseCounts::default();
+    let schema_a = equiv::schema::Schema::load(&opts.catalog_a);
+    let schema_b = equiv::schema::Schema::load(&opts.catalog_b);
+    let mut eq = equiv::Outcome::default();
 
     if same {
-        let td = treediff::diff(&aa, &ab);
+        let mut td = treediff::diff(&aa, &ab);
+        equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
         noise.cosmetic = td.cosmetic;
-        noise.structural = td.structural;
+        noise.structural = td.structural + eq.structural;
         match a.dialect.lexical().folding {
             sqldiff_syntax::IdentFolding::Lower => {
                 normalizations.push("unquoted identifiers folded to lower case".to_string())
@@ -84,11 +99,23 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 findings.push(lint::to_finding(side, &h));
             }
         }
-        unknown_reasons.push(format!(
-            "statement-level semantic equivalence between {} and {} is not implemented yet; only transaction, error-contract, write-pairing and residue checks ran",
-            a.dialect.display_name(),
-            b.dialect.display_name()
-        ));
+        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
+        findings.append(&mut eq.findings);
+        noise.structural += eq.structural;
+        unknown_reasons.append(&mut eq.unknown_reasons);
+        normalizations.push(
+            "statement lowering: parameters by position, aliases resolved, dialect built-ins and idioms mapped to one form".to_string(),
+        );
+    }
+    for x in eq.normalizations.drain(..) {
+        if !normalizations.contains(&x) {
+            normalizations.push(x);
+        }
+    }
+    for x in eq.assumptions.drain(..) {
+        if !assumptions.iter().any(|y| y.id == x.id) {
+            assumptions.push(x);
+        }
     }
 
     let (bf, ba) = crate::ir::behaviour::compare(&aa, &ab);
