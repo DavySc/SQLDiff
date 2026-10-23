@@ -104,6 +104,7 @@ const KEEP_KEYS: &[&str] = &[
     "class",
     "severity",
     "kind",
+    "error_kind",
     "side",
     "source",
     "dialect",
@@ -424,6 +425,44 @@ impl Redactor {
         for s in &mut r.suppressed {
             self.redact_finding(&mut s.finding);
             s.justification = self.redact_str(&s.justification);
+        }
+        for w in &mut r.witnesses {
+            w.rule = self.redact_str(&w.rule);
+            let sc = &mut w.scenario;
+            sc.text = self.redact_str(&sc.text);
+            if let Some(t) = &mut sc.statement {
+                *t = self.redact_str(t);
+            }
+            for p in &mut sc.path {
+                p.condition = self.redact_str(&p.condition);
+            }
+            for o in [&mut w.a, &mut w.b] {
+                for t in [
+                    &mut o.control,
+                    &mut o.exit,
+                    &mut o.rollback,
+                    &mut o.transaction,
+                ] {
+                    *t = self.redact_str(t);
+                }
+                for t in o
+                    .durable
+                    .iter_mut()
+                    .chain(&mut o.undone)
+                    .chain(&mut o.partial)
+                    .chain(&mut o.left_to_caller)
+                    .chain(&mut o.not_proven)
+                {
+                    *t = self.redact_str(t);
+                }
+            }
+        }
+        for d in &mut r.discharged {
+            d.id = self.redact_str(&d.id);
+            d.cite = self.redact_str(&d.cite);
+            if let Some(v) = &mut d.value {
+                *v = self.redact_str(v);
+            }
         }
         for a in &mut r.assumptions {
             a.id = self.redact_str(&a.id);

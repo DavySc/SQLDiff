@@ -6,8 +6,10 @@
 pub mod behaviour;
 pub mod cfg;
 pub mod interp;
+pub mod overlay;
 pub mod profile;
+pub mod witness;
 
 pub use cfg::{lower, Cfg};
-pub use interp::{explore, Exit, Fate, Fault, Outcome, Scenario};
+pub use interp::{explore, Exit, Fate, Fault, Outcome, Routed, Scenario};
 pub use profile::{ErrorKind, Profile};

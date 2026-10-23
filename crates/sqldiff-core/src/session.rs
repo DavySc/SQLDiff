@@ -40,10 +40,10 @@ pub fn deny_assumptions(r: &mut Report, ids: &[String]) {
     }
     for a in &r.assumptions {
         if ids.contains(&a.id) {
-            r.unknown_reasons.push(format!(
-                "assumption {} is denied in this session: {}",
-                a.id, a.text
-            ));
+            let reason = format!("assumption {} is denied in this session: {}", a.id, a.text);
+            if !r.unknown_reasons.contains(&reason) {
+                r.unknown_reasons.push(reason);
+            }
             hit = true;
         }
     }

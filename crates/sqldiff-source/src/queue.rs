@@ -12,8 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqldiff_core::model::{hex, AssumptionSource};
-use sqldiff_core::session;
-use sqldiff_core::{Artifact, ChangeClass, Options, Report, Severity, Verdict};
+use sqldiff_core::{Artifact, ChangeClass, Report, Severity, Verdict};
 
 use crate::protocol::{Describe, ObjectFilter, Pair, PairScope};
 use crate::{pairing, policy, Resolved, Result, Source};
@@ -69,10 +68,7 @@ pub fn run_with(
         p.pairs = adapter_pairs;
     }
     let info = |id: &str| objects.iter().find(|o| o.id == id);
-    let opts = Options {
-        excerpt_lines: cfg.excerpt_lines,
-        ..Options::default()
-    };
+    let opts = cfg.options();
     let mut pairs = Vec::new();
     for x in &p.pairs {
         let a = src.load_artifact(&x.a)?;
@@ -113,6 +109,26 @@ pub fn run_with(
 /// assumption, `false` denies it.
 pub type Flips = BTreeMap<String, bool>;
 
+/// Verdict and assumption-flip helpers, from `sqldiff_core::ledger`.
+pub mod session {
+    use super::*;
+
+    pub use sqldiff_core::ledger::derive_verdict;
+
+    /// The listed assumptions do not hold: every finding that relies on one
+    /// drops to unknown, since its witness was only shown under it.
+    pub fn deny_assumptions(r: &mut Report, ids: &[String]) {
+        let flips: Flips = ids.iter().map(|id| (id.clone(), false)).collect();
+        sqldiff_core::ledger::relabel(r, &flips);
+    }
+
+    /// The listed assumptions are confirmed: they show as declared.
+    pub fn confirm_assumptions(r: &mut Report, ids: &[String]) {
+        let flips: Flips = ids.iter().map(|id| (id.clone(), true)).collect();
+        sqldiff_core::ledger::relabel(r, &flips);
+    }
+}
+
 /// A report with session flips applied.
 pub fn view(raw: &Report, flips: &Flips) -> Report {
     let mut r = raw.clone();
@@ -120,13 +136,11 @@ pub fn view(raw: &Report, flips: &Flips) -> Report {
     r
 }
 
-/// Applies session flips to a report in place. Without flips the report is
-/// left exactly as computed.
+/// Applies session flips to a report in place. Flips of scenario
+/// assumptions only take full effect when the pair is re-diffed with them
+/// (`Options::flips`); here they relabel like any other.
 pub fn apply(r: &mut Report, flips: &Flips) {
-    let (deny, confirm): (Vec<_>, Vec<_>) = flips.iter().partition(|(_, holds)| !**holds);
-    let ids = |v: Vec<(&String, &bool)>| v.into_iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
-    session::confirm_assumptions(r, &ids(confirm));
-    session::deny_assumptions(r, &ids(deny));
+    sqldiff_core::ledger::relabel(r, flips);
 }
 
 /// The denied ids among the flips.

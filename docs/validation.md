@@ -37,6 +37,10 @@ cargo run -p sqldiff-corpus --bin corpus-report -- --json
 cargo run -p sqldiff-corpus --bin corpus-report -- --write-known-failing
 ```
 
+Milestones M5a/M5b (behavioural diff) are proved by
+`crates/sqldiff-core/tests/witnesses.rs` together with the oracle run; see
+`docs/behavioural-diff.md`.
+
 ## Fuzzing
 
 `sqldiff_corpus::fuzz` generates well-formed routines and scripts for each dialect

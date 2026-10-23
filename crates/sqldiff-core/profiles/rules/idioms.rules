@@ -145,9 +145,10 @@
     (tsql "INSERT INTO dbo.orders (customer_id) VALUES (@Customer); SET @OrderId = SCOPE_IDENTITY();")
     (postgres "INSERT INTO orders (customer_id) VALUES (p_customer) RETURNING order_id INTO p_order_id;")
     (params (Customer int) (OrderId int))
-    ; Equal here because the id is not an OUTPUT parameter. With one, T-SQL continuing
-    ; after a failed INSERT is visible to the caller and the engine says different (p07).
-    (expect equal)))
+    ; The decision above, as the engine sees it: when the INSERT fails, T-SQL (XACT_ABORT
+    ; OFF) reports the error and returns normally, while PostgreSQL raises, so the caller
+    ; continues on one side only (txn.caller-continuation; corpus p07, oracle-confirmed).
+    (expect different)))
 
 (idiom insert-identity/lastval
   (doc "Without a catalog the identity column is unknown: read the session's last sequence value.")

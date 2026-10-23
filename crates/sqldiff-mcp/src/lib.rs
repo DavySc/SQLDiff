@@ -14,7 +14,10 @@
 use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Map, Value};
-use sqldiff_core::model::{Assumption, Location};
+use sqldiff_core::ir::behaviour::RERUN_ASSUMPTIONS;
+use sqldiff_core::ir::witness::{SideOutcome, WhatIf};
+use sqldiff_core::ir::ErrorKind;
+use sqldiff_core::model::{Assumption, Location, Side};
 use sqldiff_core::phrase;
 use sqldiff_core::{Artifact, Dialect, Finding, Options, Report, TOOL_VERSION};
 use sqldiff_review::{markers, Lookup, Store};
@@ -39,7 +42,8 @@ equivalence could not be shown. Use `queue` to rank every pair of a source for r
 for two versions of one object or one object in two dialects, `check` to lint a single file and \
 `finding` to expand a card by fingerprint. `assumptions` lists what a verdict relies on and \
 `set_assumption` flips one for this session only. `comment_text` drafts a plain-text review \
-comment and `open_in_gui` gives a deep link for a human.";
+comment and `open_in_gui` gives a deep link for a human. `what_if` shows both sides' outcome \
+when one statement fails, and `overlay` the transaction brackets of both sides.";
 
 /// A diffed pair (or checked artifact) kept for later lookups.
 struct Held {
@@ -47,6 +51,14 @@ struct Held {
     pair: PairReport,
     /// Files the GUI can open, when both sides came from disk.
     files: Option<(String, Option<String>)>,
+    /// The artifacts of a `diff`, kept so scenario flips can re-run it and
+    /// `what_if` can answer on it.
+    artifacts: Option<(Artifact, Artifact)>,
+    /// Options the pair was diffed with (excerpt cap, catalogs, declared facts).
+    opts: Option<Options>,
+    /// The pair re-diffed under the session's scenario flips, when any are
+    /// set and the artifacts are held.
+    rerun: Option<Report>,
 }
 
 pub struct Server {
@@ -160,6 +172,8 @@ impl Server {
             "assumptions" => self.assumptions(args),
             "set_assumption" => self.set_assumption(args),
             "comment_text" => self.comment_text(args),
+            "what_if" => self.what_if(args),
+            "overlay" => self.overlay(args),
             "open_in_gui" => self.open_in_gui(args),
             other => return Err((-32602, format!("unknown tool: {other}"))),
         };
@@ -178,24 +192,38 @@ impl Server {
     }
 
     fn options(&self, args: &Value) -> Options {
+        let base = self.config.options();
         Options {
             excerpt_lines: args
                 .get("excerpt_lines")
                 .and_then(Value::as_u64)
                 .map(|n| n as usize)
-                .unwrap_or(self.config.excerpt_lines),
-            ..Options::default()
+                .unwrap_or(base.excerpt_lines),
+            ..base
         }
+    }
+
+    /// Diffs a pair as held: raw (no session flips), with pack policy,
+    /// author markers and review suppression.
+    fn run_diff(&self, a: &Artifact, b: &Artifact, opts: &Options) -> Report {
+        let mut report = sqldiff_core::diff(a, b, opts);
+        self.finish(&mut report, a, Some(b), &sqldiff_review::time::now());
+        report
     }
 
     fn diff(&mut self, args: &Value) -> Result<(String, Value), String> {
         let (a, fa) = artifact(args.get("a"), "a")?;
         let (b, fb) = artifact(args.get("b"), "b")?;
-        let mut report = sqldiff_core::diff(&a, &b, &self.options(args));
+        let opts = self.options(args);
         self.reload_store()?;
-        self.finish(&mut report, &a, Some(&b), &sqldiff_review::time::now());
+        let report = self.run_diff(&a, &b, &opts);
         let files = fa.zip(fb).map(|(x, y)| (x, Some(y)));
         let id = self.hold(report, files);
+        if let Some(h) = self.pairs.get_mut(&id) {
+            h.artifacts = Some((a, b));
+            h.opts = Some(opts);
+        }
+        self.refresh_rerun(&id);
         Ok(self.summarize(&id, args))
     }
 
@@ -253,14 +281,53 @@ impl Server {
         for f in &pair.report.findings {
             self.findings.insert(f.fingerprint.clone(), pair.id.clone());
         }
-        self.pairs.insert(pair.id.clone(), Held { pair, files });
+        self.pairs.insert(
+            pair.id.clone(),
+            Held {
+                pair,
+                files,
+                artifacts: None,
+                opts: None,
+                rerun: None,
+            },
+        );
     }
 
-    /// A held pair's report with session flips applied.
+    /// Re-diffs a held pair under the session's scenario flips (or drops
+    /// the re-run when there are none) and registers its findings, so
+    /// findings that only show under a flip can be looked up.
+    fn refresh_rerun(&mut self, id: &str) {
+        let scen = sqldiff_core::ledger::scenario_flips(&self.flips);
+        let Some(h) = self.pairs.get(id) else { return };
+        let r = match (&h.artifacts, &h.opts) {
+            (Some((a, b)), Some(o)) if !scen.is_empty() => Some(self.run_diff(
+                a,
+                b,
+                &Options {
+                    flips: scen,
+                    ..o.clone()
+                },
+            )),
+            _ => None,
+        };
+        if let Some(r) = &r {
+            for f in &r.findings {
+                self.findings.insert(f.fingerprint.clone(), id.to_string());
+            }
+        }
+        if let Some(h) = self.pairs.get_mut(id) {
+            h.rerun = r;
+        }
+    }
+
+    /// A held pair's report with session flips applied. Flips of scenario
+    /// assumptions re-run the analysis when the pair's artifacts are held.
     fn view(&self, id: &str) -> Option<Report> {
-        self.pairs
-            .get(id)
-            .map(|h| queue::view(&h.pair.report, &self.flips))
+        let h = self.pairs.get(id)?;
+        Some(queue::view(
+            h.rerun.as_ref().unwrap_or(&h.pair.report),
+            &self.flips,
+        ))
     }
 
     /// The pair a `pair` id or `fingerprint` argument names.
@@ -337,11 +404,18 @@ impl Server {
                 text.push_str(&format!("  {}  {}{flip}\n", x.id, x.text));
             }
         }
+        let detail = report.witnesses.iter().find(|w| w.fingerprint == fp);
+        if let Some(w) = detail {
+            text.push_str(&format!("\n{}\n", w.scenario.text));
+            text.push_str(&outcome_text("A", &w.a));
+            text.push_str(&outcome_text("B", &w.b));
+        }
         let structured = json!({
             "pair": pair,
             "pair_id": id,
             "finding": f,
             "assumptions": assumptions,
+            "witness": detail,
         });
         Ok((text, structured))
     }
@@ -577,6 +651,49 @@ impl Server {
     fn assumptions(&self, args: &Value) -> Result<(String, Value), String> {
         let id = self.pair_arg(args)?;
         let held = &self.pairs[&id];
+        if let (Some((a, b)), Some(o)) = (&held.artifacts, &held.opts) {
+            // Full ledger: sources, proven-from-source facts, and flips that re-run.
+            let (report, ledger) =
+                sqldiff_core::ledger::ledger_by(&self.flips, &o.declared, &mut |f| {
+                    let opts = Options {
+                        flips: f.clone(),
+                        ..o.clone()
+                    };
+                    self.run_diff(a, b, &opts)
+                });
+            let mut text = format!(
+                "{}  [{id}]\nVerdict: {}\n",
+                pair_label(&report),
+                report.verdict.label().to_uppercase()
+            );
+            if ledger.is_empty() {
+                text.push_str("No assumptions.\n");
+            }
+            for e in &ledger {
+                text.push_str(&format!("\n{}  {:?}\n    {}\n", e.id, e.status, e.text));
+                if let Some(c) = &e.cite {
+                    text.push_str(&format!("    {c}\n"));
+                }
+                if let (true, Some(v)) = (e.flips_verdict, e.verdict_if_flipped) {
+                    text.push_str(&format!(
+                        "    flipping it {} and makes the verdict {}\n",
+                        if e.reruns {
+                            "re-runs the analysis"
+                        } else {
+                            "relabels its findings"
+                        },
+                        v.label()
+                    ));
+                }
+                if !e.findings.is_empty() {
+                    text.push_str(&format!("    relied on by {}\n", e.findings.join(", ")));
+                }
+            }
+            return Ok((
+                text,
+                json!({ "pair_id": id, "verdict": report.verdict, "assumptions": ledger }),
+            ));
+        }
         let report = queue::view(&held.pair.report, &self.flips);
         let ledger = queue::ledger(&held.pair.report, &self.flips);
         let mut text = format!(
@@ -633,6 +750,12 @@ impl Server {
             Some(h) => self.flips.insert(aid.clone(), h),
             None => self.flips.remove(&aid),
         };
+        if RERUN_ASSUMPTIONS.contains(&aid.as_str()) {
+            let ids: Vec<String> = self.pairs.keys().cloned().collect();
+            for k in ids {
+                self.refresh_rerun(&k);
+            }
+        }
         let mut changed = Vec::new();
         let mut affected = 0;
         for (k, h) in &self.pairs {
@@ -640,8 +763,8 @@ impl Server {
                 continue;
             }
             affected += 1;
-            let now = queue::view(&h.pair.report, &self.flips).open_verdict();
-            if before.get(k).copied().flatten() != Some(now) {
+            let now = self.view(k).map(|r| r.open_verdict());
+            if before.get(k).copied().flatten() != now {
                 changed.push(json!({
                     "pair_id": k,
                     "pair": pair_label(&h.pair.report),
@@ -672,6 +795,83 @@ impl Server {
             text,
             json!({ "id": aid, "holds": holds, "affected_pairs": affected, "changed": changed, "flips": self.flips }),
         ))
+    }
+
+    /// The artifacts and options of a held `diff` pair, or of `a` and `b` given inline.
+    fn pair_artifacts(&self, args: &Value) -> Result<(Artifact, Artifact, Options), String> {
+        if args.get("a").is_some() || args.get("b").is_some() {
+            let (a, _) = artifact(args.get("a"), "a")?;
+            let (b, _) = artifact(args.get("b"), "b")?;
+            return Ok((
+                a,
+                b,
+                Options {
+                    flips: self.flips.clone(),
+                    ..self.options(args)
+                },
+            ));
+        }
+        let id = self.pair_arg(args)?;
+        let h = &self.pairs[&id];
+        match (&h.artifacts, &h.opts) {
+            (Some((a, b)), Some(o)) => Ok((
+                a.clone(),
+                b.clone(),
+                Options {
+                    flips: self.flips.clone(),
+                    ..o.clone()
+                },
+            )),
+            _ => Err(format!(
+                "pair `{id}` came from `queue` or `check`; give `a` and `b` (or diff them first)"
+            )),
+        }
+    }
+
+    fn what_if(&self, args: &Value) -> Result<(String, Value), String> {
+        let (a, b, opts) = self.pair_artifacts(args)?;
+        let line = args
+            .get("line")
+            .and_then(Value::as_u64)
+            .ok_or("`line` is required: the line of the statement")? as usize;
+        let side = match args.get("side").and_then(Value::as_str) {
+            None | Some("a") => Side::A,
+            Some("b") => Side::B,
+            Some(x) => return Err(format!("`side` must be a or b, not {x}")),
+        };
+        let kind: ErrorKind = match enum_arg(args, "error_kind")? {
+            Some(k) => k,
+            None => ErrorKind::Constraint,
+        };
+        let opts = Options {
+            flips: self.flips.clone(),
+            ..opts
+        };
+        let w = sqldiff_core::what_if(&a, &b, &opts, side, line, kind);
+        Ok((
+            what_if_text(&w),
+            serde_json::to_value(&w).unwrap_or(Value::Null),
+        ))
+    }
+
+    fn overlay(&self, args: &Value) -> Result<(String, Value), String> {
+        let (a, b, _) = self.pair_artifacts(args)?;
+        let o = sqldiff_core::overlay(&a, &b);
+        let mut text = String::new();
+        for (name, side, other) in [("A", &o.a, "B"), ("B", &o.b, "A")] {
+            text.push_str(&format!("Side {name}:\n"));
+            for (i, br) in side.iter().enumerate() {
+                let partner = br
+                    .partner
+                    .map(|p| format!("  <-> {other}#{p}"))
+                    .unwrap_or_default();
+                text.push_str(&format!(
+                    "  #{i} lines {}-{}  {}{partner}\n",
+                    br.start_line, br.end_line, br.label
+                ));
+            }
+        }
+        Ok((text, serde_json::to_value(&o).unwrap_or(Value::Null)))
     }
 
     fn comment_text(&self, args: &Value) -> Result<(String, Value), String> {
@@ -1000,7 +1200,7 @@ fn tools() -> Value {
         {
             "name": "set_assumption",
             "title": "Flip an assumption",
-            "description": "Confirm (holds=true) or deny (holds=false) an assumption for this session only, or reset it (holds=null); every held pair's verdict is re-derived and changes are listed. A denied assumption makes the findings that rely on it unknown. Nothing is written to packs, config or sources.",
+            "description": "Confirm (holds=true) or deny (holds=false) an assumption for this session only, or reset it (holds=null); every held pair's verdict is re-derived and changes are listed. Flipping ASM-NO-CALLER-TXN or ASM-TSQL-CALLER-XACT-ABORT-OFF re-runs the behavioural analysis of pairs from `diff` under that scenario; any other denied assumption makes the findings that rely on it unknown. Nothing is written to packs, config or sources.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1027,6 +1227,38 @@ fn tools() -> Value {
             "annotations": ro,
         },
         {
+            "name": "what_if",
+            "title": "What if this statement fails?",
+            "description": "For the statement on (or before) `line` of one side, failing with `error_kind`: both sides' control target (handler, next statement or exit), rollback scope, durable and undone effects, transaction state and path, plus the divergences as findings. Give the pair by `pair` id (from `diff`) or `a` and `b`. Session flips of ASM-NO-CALLER-TXN / ASM-TSQL-CALLER-XACT-ABORT-OFF change the scenario.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pair": { "type": "string", "description": "Pair id from `diff`" },
+                    "a": artifact_schema("Side A, instead of `pair`"),
+                    "b": artifact_schema("Side B, instead of `pair`"),
+                    "line": { "type": "integer", "minimum": 1 },
+                    "side": { "type": "string", "enum": ["a", "b"], "description": "Side the line refers to (default a)" },
+                    "error_kind": { "type": "string", "enum": ["constraint", "conversion", "arithmetic", "cardinality", "not_found", "lock", "user_signal", "name_resolution", "cancel", "other"], "description": "Default constraint" },
+                },
+                "required": ["line"],
+            },
+            "annotations": ro,
+        },
+        {
+            "name": "overlay",
+            "title": "Transaction overlay",
+            "description": "Brackets for transactions (or who owns the transaction), savepoints, atomic and exception regions and handlers on both sides, each paired with its partner on the other side.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "pair": { "type": "string", "description": "Pair id from `diff`" },
+                    "a": artifact_schema("Side A, instead of `pair`"),
+                    "b": artifact_schema("Side B, instead of `pair`"),
+                },
+            },
+            "annotations": ro,
+        },
+        {
             "name": "open_in_gui",
             "title": "Deep link to the GUI",
             "description": "A URL that opens the pair in the SQLDiff GUI with the finding selected, and the command that starts the GUI on it. Only for pairs read from files.",
@@ -1041,4 +1273,51 @@ fn tools() -> Value {
             "annotations": ro,
         },
     ])
+}
+
+fn outcome_text(side: &str, o: &SideOutcome) -> String {
+    let mut t = format!(
+        "Side {side}: {}; {}; rolls back {}; {}.\n",
+        o.control, o.exit, o.rollback, o.transaction
+    );
+    for (label, xs) in [
+        ("durable", &o.durable),
+        ("undone", &o.undone),
+        ("kept partly", &o.partial),
+        ("left to the caller", &o.left_to_caller),
+    ] {
+        if !xs.is_empty() {
+            t.push_str(&format!("  {label}: {}\n", xs.join("; ")));
+        }
+    }
+    t
+}
+
+fn what_if_text(w: &WhatIf) -> String {
+    let mut t = format!("{}\n", w.scenario.text);
+    for (side, v) in [("A", &w.a), ("B", &w.b)] {
+        if v.is_empty() {
+            t.push_str(&format!("Side {side}: no path reaches the statement.\n"));
+        }
+        for o in v {
+            t.push_str(&outcome_text(side, o));
+        }
+    }
+    if w.findings.is_empty() {
+        t.push_str("No divergence under this scenario.\n");
+    }
+    for f in &w.findings {
+        t.push_str(&format!(
+            "[{}] {} {} {}: {}\n",
+            f.fingerprint,
+            f.class.label(),
+            f.verdict.label(),
+            f.rule,
+            f.witness
+        ));
+    }
+    for n in &w.notes {
+        t.push_str(&format!("Note: {n}\n"));
+    }
+    t
 }
