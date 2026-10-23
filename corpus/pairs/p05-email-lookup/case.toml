@@ -1,0 +1,57 @@
+id = "p05-email-lookup"
+title = "Case-insensitive lookup and trailing spaces"
+refs = ["design §7 NULL, strings, types", "design §8 equiv case-insensitive-compare"]
+tags = ["collation", "strings", "cardinality"]
+description = """
+T-SQL relies on a case-insensitive collation; the conversions emulate it with
+lower() / UPPER(). The emulation restores case-insensitivity but not the T-SQL
+rule that trailing spaces are ignored by `=`.
+Note: the unique index on email is case-sensitive in PostgreSQL, so lower(email)
+can match several rows there; the SQL function then silently returns the first.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "different"
+classes = ["semantic", "cardinality"]
+assumptions = ["T-SQL database collation is case-insensitive"]
+witnesses = [
+  "For @Email = 'a@example.com ' (trailing space) and a stored 'a@example.com', T-SQL returns the id; PostgreSQL returns NULL because trailing spaces are significant for varchar.",
+  "If 'A@example.com' and 'a@example.com' are both stored (allowed by the case-sensitive unique index in PostgreSQL), PostgreSQL returns one of them arbitrarily.",
+]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal-under-assumptions"
+classes = ["semantic"]
+assumptions = [
+  "T-SQL database collation is case-insensitive",
+  "Db2 for i pads the shorter VARCHAR with blanks when comparing",
+  "UPPER and the T-SQL collation fold the same characters",
+]
+facts = ["V8"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "different"
+classes = ["semantic"]
+assumptions = ["Db2 for i pads the shorter VARCHAR with blanks when comparing"]
+facts = ["V8"]
+witnesses = [
+  "For p_email = 'a@example.com ' (trailing space), Db2 matches the stored 'a@example.com'; PostgreSQL does not.",
+]

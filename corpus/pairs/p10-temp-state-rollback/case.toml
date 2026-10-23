@@ -1,0 +1,54 @@
+id = "p10-temp-state-rollback"
+title = "Temporary state that must survive a rollback"
+refs = ["design §7 temporary state", "design §16 table variable replaced"]
+tags = ["temporary-state", "transaction", "cardinality"]
+description = """
+The audit in the error path reads rows collected before the rollback. A T-SQL table
+variable keeps them. A PostgreSQL temporary table filled inside an exception block
+loses them when the block's subtransaction rolls back. A Db2 for i NOT LOGGED
+declared temporary table with ON ROLLBACK PRESERVE ROWS is meant to keep them.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "different"
+classes = ["transactional"]
+witnesses = [
+  "If a non-positive price is found, T-SQL writes one audit row per updated item; PostgreSQL writes none, because the exception block's rollback also removed the rows from attempted.",
+  "On success T-SQL commits; the PostgreSQL procedure leaves the commit to the CALL's transaction.",
+]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "different"
+classes = ["cardinality"]
+assumptions = ["NOT LOGGED ON ROLLBACK PRESERVE ROWS keeps rows across ROLLBACK"]
+facts = ["V7", "V16"]
+witnesses = [
+  "If price_feed holds two rows for one item, T-SQL updates with one of them silently; Db2's scalar subquery raises a cardinality error, which reaches the handler and writes audit rows.",
+]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "different"
+classes = ["transactional", "cardinality"]
+assumptions = ["NOT LOGGED ON ROLLBACK PRESERVE ROWS keeps rows across ROLLBACK"]
+facts = ["V16"]
+witnesses = [
+  "If a non-positive price is found, Db2 writes one audit row per updated item; PostgreSQL writes none.",
+]

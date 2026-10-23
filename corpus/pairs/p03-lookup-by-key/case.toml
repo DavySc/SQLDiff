@@ -1,0 +1,43 @@
+id = "p03-lookup-by-key"
+title = "Scalar lookup by primary key"
+refs = ["design §7 cardinality contracts"]
+tags = ["cardinality"]
+description = """
+Three different single-row contracts (SELECT @v = keeps the last row, SELECT INTO
+keeps the first row, scalar subquery errors on several rows). They agree here only
+because the predicate is on the primary key, which the catalog proves.
+Zero rows yields NULL on every side.
+"""
+
+[sides.tsql]
+dialect = "tsql"
+file = "tsql.sql"
+
+[sides.pg]
+dialect = "pg"
+file = "pg.sql"
+
+[sides.db2i]
+dialect = "db2i"
+file = "db2i.sql"
+
+[[expect]]
+a = "tsql"
+b = "pg"
+verdict = "equal"
+classes = []
+discharged = ["customer.customer_id is the primary key (catalog)"]
+
+[[expect]]
+a = "tsql"
+b = "db2i"
+verdict = "equal"
+classes = []
+discharged = ["customer.customer_id is the primary key (catalog)"]
+
+[[expect]]
+a = "pg"
+b = "db2i"
+verdict = "equal"
+classes = []
+discharged = ["customer.customer_id is the primary key (catalog)"]

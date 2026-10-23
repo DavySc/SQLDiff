@@ -399,6 +399,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqldiff-gui"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "sqldiff-core",
+ "sqldiff-syntax",
+]
+
+[[package]]
+name = "sqldiff-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqldiff-core",
+]
+
+[[package]]
 name = "sqldiff-source"
 version = "0.1.0"
 dependencies = [

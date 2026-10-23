@@ -1,0 +1,23 @@
+id = "m03-merge-lock-hint-dropped"
+title = "MERGE upsert without HOLDLOCK"
+catalog_item = "drop a locking hint from a MERGE"
+refs = ["design §7 upserts and MERGE"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "tsql"
+file = "original.tsql.sql"
+
+[sides.mutated]
+dialect = "tsql"
+file = "mutated.tsql.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["concurrency"]
+witnesses = [
+  "If two sessions upsert the same new item at once, the original serialises them; in the mutated version both see no match and one fails with a primary key violation.",
+]

@@ -1,0 +1,24 @@
+id = "m09-commit-level-none"
+title = "Commit level changed to *NONE"
+catalog_item = "change the commit level to `*NONE`"
+refs = ["design §7 transactions", "design §16 commit level not declared"]
+detected_by = "behavioural"
+milestone = "M5b"
+
+[sides.original]
+dialect = "db2i"
+file = "original.db2i.sql"
+
+[sides.mutated]
+dialect = "db2i"
+file = "mutated.db2i.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["transactional"]
+facts = ["V4", "V5"]
+witnesses = [
+  "If the stock UPDATE fails, the original's handler rolls back the order line; under *NONE the order line is already durable and the ROLLBACK has nothing to undo.",
+]

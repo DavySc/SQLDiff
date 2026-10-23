@@ -1,0 +1,24 @@
+id = "m11-select-into-without-strict"
+title = "SELECT INTO without STRICT"
+catalog_item = "`SELECT INTO` without `STRICT`"
+refs = ["design §7 cardinality contracts", "design §16 SELECT INTO row-count contract"]
+detected_by = "behavioural"
+milestone = "M6"
+
+[sides.original]
+dialect = "pg"
+file = "original.pg.sql"
+
+[sides.mutated]
+dialect = "pg"
+file = "mutated.pg.sql"
+
+[[expect]]
+a = "original"
+b = "mutated"
+verdict = "different"
+classes = ["cardinality"]
+witnesses = [
+  "If two customers share the last name, the original raises TOO_MANY_ROWS; the mutated version returns the first row found.",
+  "If no customer has the last name, the original raises NO_DATA_FOUND; the mutated version returns NULL.",
+]
