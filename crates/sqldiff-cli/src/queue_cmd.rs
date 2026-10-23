@@ -1,19 +1,23 @@
 //! Review commands that mirror the MCP tools (design section 6.1): `queue`,
 //! `assumptions`, `comment` and `open`. Assumption flips (`--deny`,
 //! `--confirm`) last for one invocation only and never change packs or config.
+//! Findings accepted in the review store or marked as deliberate in source
+//! are suppressed, as in `diff`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
 use serde::de::DeserializeOwned;
-use sqldiff_core::{phrase, ChangeClass, Dialect, Options, Report, Severity, Verdict};
+use sqldiff_core::{phrase, ChangeClass, Dialect, Report, Severity, Verdict};
+use sqldiff_review::{markers, Lookup, Store};
 use sqldiff_source::protocol::PairScope;
 use sqldiff_source::queue::{self, Filter, Flips, ReviewFilter, Status};
 use sqldiff_source::{Resolved, SourceSpec};
 
+use crate::review_cmd::{Pipeline, ReviewArgs};
 use crate::source_cmd::ConfigArgs;
-use crate::{exit_for, read, with_policy, Format};
+use crate::{exit_for, read, Format};
 
 /// A value spelled as in JSON output, e.g. `transactional` or `equal_under_assumptions`.
 fn snake<T: DeserializeOwned>(s: &str) -> Result<T, String> {
@@ -60,17 +64,14 @@ pub struct PairArgs {
 }
 
 impl PairArgs {
-    /// Diffs the pair with pack policy; returns the raw report and the dialects.
+    /// Diffs the pair as `diff` does (pack policy, author markers, review
+    /// suppression); returns the report before flips and the config.
     fn report(&self) -> Result<(Report, Resolved), String> {
-        let cfg = self.cfg.resolve()?;
-        let a = read(&self.a, self.dialect_a.or(self.dialect), &cfg)?;
-        let b = read(&self.b, self.dialect_b.or(self.dialect), &cfg)?;
-        let opts = Options {
-            excerpt_lines: cfg.excerpt_lines,
-            ..Options::default()
-        };
-        let r = with_policy(sqldiff_core::diff(&a, &b, &opts), &a, Some(&b), &cfg);
-        Ok((r, cfg))
+        let pipe = Pipeline::new(self.cfg.resolve()?, &ReviewArgs::default())?;
+        let a = read(&self.a, self.dialect_a.or(self.dialect), &pipe.cfg)?;
+        let b = read(&self.b, self.dialect_b.or(self.dialect), &pipe.cfg)?;
+        let r = pipe.run(&a, Some(&b), &pipe.options());
+        Ok((r, pipe.cfg))
     }
 }
 
@@ -175,12 +176,18 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                     .ok_or("give a SOURCE or set [source] in sqldiff.toml")?,
             };
             let src = sqldiff_source::open(&spec, &cfg).map_err(|e| e.0)?;
-            let run = queue::run(
+            let store = Store::from_config(&cfg).map_err(|e| e.0)?;
+            let now = sqldiff_review::time::now();
+            let run = queue::run_with(
                 src.as_ref(),
                 &cfg,
                 &PairScope {
                     a_dialect: dialect_a,
                     b_dialect: dialect_b,
+                },
+                &mut |r, a, b| {
+                    markers::apply(r, &a.text, Some(&b.text), &cfg);
+                    sqldiff_review::suppress(r, &store, &now);
                 },
             )
             .map_err(|e| e.0)?;
@@ -192,7 +199,11 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                 folder,
                 review,
             };
-            let rows = queue::entries(&run.pairs, &flips, &filter, &queue::NoReviews);
+            let lookup = Lookup {
+                store: &store,
+                now: now.clone(),
+            };
+            let rows = queue::entries(&run.pairs, &flips, &filter, &lookup);
             let shown = &rows[..rows.len().min(limit.unwrap_or(usize::MAX))];
             match format {
                 Format::Text => {
@@ -246,7 +257,8 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                     println!("{}", sqldiff_core::render::sarif(&reports));
                 }
             }
-            let worst = shown
+            // Over every matching pair, not just those shown under --limit.
+            let worst = rows
                 .iter()
                 .map(|e| e.verdict)
                 .max()
@@ -323,11 +335,7 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                         .join(", ")
                 ));
             }
-            let denied: Vec<String> = flips
-                .iter()
-                .filter(|(_, h)| !**h)
-                .map(|(k, _)| k.clone())
-                .collect();
+            let denied = queue::denied(&flips);
             let group = phrase::Group {
                 label: String::new(),
                 findings: view
@@ -370,9 +378,11 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                 queue::deep_link(&base, &a, Some(&b), finding.as_deref())
             );
             eprintln!(
-                "If the GUI is not running: sqldiff-gui serve --dialect-a {} --dialect-b {} {a} {b}",
+                "If the GUI is not running: sqldiff-gui serve --dialect-a {} --dialect-b {} {} {}",
                 raw.a.dialect,
-                raw.b.as_ref().map(|x| x.dialect.as_str()).unwrap_or("")
+                raw.b.as_ref().map(|x| x.dialect.as_str()).unwrap_or(""),
+                queue::shell_word(&a),
+                queue::shell_word(&b)
             );
             Ok(ExitCode::SUCCESS)
         }

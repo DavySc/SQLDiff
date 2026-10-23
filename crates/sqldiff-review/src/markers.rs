@@ -1,8 +1,8 @@
 //! Pack author markers applied to reports (design sections 5.2, 6.3 and 9).
 //!
 //! - `intentional_difference`: a deliberate difference stated in the
-//!   source. Findings on that side whose location covers the marker's line,
-//!   or starts on the next line, are suppressed with kind `in_source`.
+//!   source. Findings on that side that start on the marker's line or the
+//!   next line are suppressed with kind `in_source`.
 //! - `assumption`: a premise the author states but has not verified. It
 //!   becomes an assumption with source `author`, open until resolved.
 //! - `review_note` and `sync_partner` are returned for display only.
@@ -66,8 +66,12 @@ pub fn assumption_id(text: &str) -> String {
     format!("ASM-AUTHOR-{}", hex(&h[..4]).to_uppercase())
 }
 
+/// A marker applies to the finding that starts on its line (a trailing
+/// comment) or on the next line (a comment above the statement). A finding
+/// that merely contains the marker line, such as a whole-body finding, is
+/// not covered: one marker must not hide unrelated differences.
 fn covers(loc: &Location, line: usize) -> bool {
-    (loc.start_line <= line && line <= loc.end_line) || loc.start_line == line + 1
+    loc.start_line == line || loc.start_line == line + 1
 }
 
 fn marked(f: &Finding, side: Side, line: usize) -> bool {
@@ -137,6 +141,7 @@ pub fn apply(
     if !summary.assumptions.is_empty() && report.verdict == Verdict::Equal {
         report.verdict = Verdict::EqualUnderAssumptions;
     }
+    report.settle_suppression();
     summary.markers = found;
     summary
 }

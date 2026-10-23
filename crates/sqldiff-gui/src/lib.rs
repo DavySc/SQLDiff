@@ -14,6 +14,7 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, Options, Report};
 use sqldiff_syntax::{ast, parse, LineIndex, SyntaxElement, SyntaxKind, SyntaxNode};
 
+pub mod convert;
 pub mod report;
 pub mod review;
 pub mod server;

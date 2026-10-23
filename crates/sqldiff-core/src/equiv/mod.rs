@@ -165,7 +165,110 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         }
     }
     pair_items(a, b, &ia, &ib, &mut out);
+    error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
     out
+}
+
+/// T-SQL keeps executing a procedure after a statement fails (unless
+/// XACT_ABORT is on or a CATCH rethrows); PostgreSQL and Db2 for i stop at
+/// the error. Any later statement with an effect then runs on one side only.
+fn error_continues(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    ia: &[Item],
+    ib: &[Item],
+    out: &mut Outcome,
+) {
+    use sqldiff_syntax::Dialect::Tsql;
+    let (t_is_a, t, items, tside, oside) = match (ua.dialect, ub.dialect) {
+        (Tsql, d) if d != Tsql => (true, ua, ia, a, b),
+        (d, Tsql) if d != Tsql => (false, ub, ib, b, a),
+        _ => return,
+    };
+    // Error handlers on either side (uncovered) and statements that were not
+    // lowered leave the error path to other checks.
+    let o = if t_is_a { ub } else { ua };
+    if t.stops_on_error
+        || !matches!(t.kind, UnitKind::Proc | UnitKind::Script)
+        || !t.uncovered.is_empty()
+        || !o.uncovered.is_empty()
+        || items.iter().any(|it| it.err.is_some())
+    {
+        return;
+    }
+    let out_param = |s: &Term| {
+        s.is("sym")
+            && s.kid(0)
+                .and_then(Term::atom)
+                .and_then(|v| v.strip_prefix('p'))
+                .and_then(|i| i.parse::<usize>().ok())
+                .and_then(|i| t.params.get(i - 1))
+                .is_some_and(|p| p.out)
+    };
+    let effect = |x: &Term| -> bool {
+        if x.is("assign") {
+            // Only an OUTPUT parameter is visible to the caller.
+            return x.kid(0).is_some_and(out_param);
+        }
+        !(x.is("return") && x.kids().is_empty())
+    };
+    // An item lifted from several statements (INSERT; SET @id =
+    // SCOPE_IDENTITY()) continues inside itself: the INSERT can fail and the
+    // assignment still runs.
+    let inner = |it: &Item| {
+        it.nodes.len() > 1
+            && (it.term.is("return")
+                || it
+                    .term
+                    .kid(2)
+                    .is_some_and(|k| k.is("into") && k.kid(0).is_some_and(out_param)))
+    };
+    let Some((i, j)) = (0..items.len()).find_map(|i| {
+        if inner(&items[i]) {
+            return Some((i, i));
+        }
+        (i + 1..items.len())
+            .find(|&j| effect(&items[j].term))
+            .map(|j| (i, j))
+    }) else {
+        return;
+    };
+    let (x, y) = (&items[i], &items[j]);
+    let lx = location(tside, &x.nodes[..1]);
+    let ly = location(tside, &y.nodes[y.nodes.len() - 1..]);
+    let tname = side_name(tside);
+    let oname = side_name(oside);
+    let witness = format!(
+        "If the statement at {tname} line {} fails, {tname} reports the error and continues with line {} (no SET XACT_ABORT ON or rethrowing CATCH); {oname} stops at the error.",
+        lx.start_line, ly.start_line
+    );
+    let asm = Assumption::default(
+        "ASM-TSQL-CALLER-XACT-ABORT-OFF",
+        "The caller's XACT_ABORT setting is OFF",
+    );
+    let rule = "equiv.error-continues";
+    let class = ChangeClass::Transactional;
+    let anchor = crate::normalize::hash_strs(std::iter::once(x.term.to_string().as_str()));
+    out.findings.push(Finding {
+        fingerprint: fingerprint(&FingerprintInput {
+            object: &a.object,
+            class,
+            rule,
+            anchor_a: if t_is_a { &anchor } else { "" },
+            anchor_b: if t_is_a { "" } else { &anchor },
+        }),
+        rule: rule.to_string(),
+        class,
+        severity: class.default_severity(),
+        verdict: Verdict::Different,
+        witness,
+        a: t_is_a.then(|| lx.clone()),
+        b: (!t_is_a).then(|| lx.clone()),
+        assumptions: vec![asm.id.clone()],
+    });
+    out.assume(asm);
 }
 
 fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {

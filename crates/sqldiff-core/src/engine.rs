@@ -147,6 +147,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         assumptions,
         unknown_reasons,
         suppressed: Vec::new(),
+        verdict_before_suppression: None,
         diagnostics,
     })
 }
@@ -174,6 +175,7 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         assumptions: Vec::new(),
         unknown_reasons,
         suppressed: Vec::new(),
+        verdict_before_suppression: None,
         diagnostics,
     })
 }

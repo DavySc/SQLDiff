@@ -30,7 +30,6 @@ const KNOWN_MISSES: &[(&str, &str, &str)] = &[
     ("m14-terminator-before-throw", "original", "mutated"),
     ("m15-dropped-column-reference", "original", "mutated"),
     ("m16-outdated-signature", "original", "mutated"),
-    ("m18-dialect-residue", "original", "mutated"),
 ];
 
 fn corpus() -> Option<PathBuf> {

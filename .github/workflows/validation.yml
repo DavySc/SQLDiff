@@ -1,0 +1,164 @@
+name: validation
+
+# Design §12 validation layers that need more than `cargo test`:
+#   golden     corpus expectations against the engine, with no pack or user config
+#   oracle     fault-injection execution oracle on PostgreSQL 18 and SQL Server 2022
+#   fuzz       grammar-aware and coverage-guided parser fuzzing
+#   separation determinism and no network dependencies in the core (AI separation placeholder)
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "corpus/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/validation.yml"
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Throwaway password for the CI-only SQL Server container.
+  MSSQL_SA_PASSWORD: Corpus_Passw0rd!
+
+jobs:
+  golden:
+    name: corpus golden runner (no pack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Empty user config and data directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/home/.config" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$RUNNER_TEMP/home/.local/share" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$HOME/.rustup" >> "$GITHUB_ENV"
+      - name: No pack or project config in the tree
+        run: |
+          found=$(git ls-files | grep -E '(^|/)\.?sqldiff(\.[a-z]+)?\.toml$' || true)
+          if [ -n "$found" ]; then echo "config files would load packs: $found"; exit 1; fi
+      - name: Workspace tests with no pack loaded
+        run: cargo test --workspace
+      - name: Corpus report
+        run: |
+          cargo run -q -p sqldiff-corpus --bin corpus-report > corpus-report.txt
+          {
+            echo '### Corpus golden runner'
+            echo '```'
+            tail -n 1 corpus-report.txt
+            echo '```'
+            echo '<details><summary>All expectations</summary>'
+            echo
+            echo '```'
+            cat corpus-report.txt
+            echo '```'
+            echo '</details>'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  oracle:
+    name: fault-injection oracle (PG 18, SQL Server 2022)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Corpus_Passw0rd!
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P Corpus_Passw0rd! -C -Q 'SELECT 1'"
+          --health-interval 10s --health-timeout 5s --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p sqldiff-cli
+      - name: Empty user config and data directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "HOME=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+          echo "XDG_CONFIG_HOME=$RUNNER_TEMP/home/.config" >> "$GITHUB_ENV"
+          echo "XDG_DATA_HOME=$RUNNER_TEMP/home/.local/share" >> "$GITHUB_ENV"
+      - name: Run the oracle
+        run: >-
+          python3 corpus/tools/fault_oracle.py
+          --pg "host=localhost port=5432 user=postgres password=postgres dbname=postgres"
+          --mssql "docker exec -i ${{ job.services.mssql.id }} /opt/mssql-tools18/bin/sqlcmd
+          -S localhost -U sa -P $MSSQL_SA_PASSWORD -C -I"
+          --sqldiff target/debug/sqldiff
+          --json oracle-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: oracle-report
+          path: oracle-report.json
+          if-no-files-found: ignore
+
+  fuzz:
+    name: parser fuzzing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Long grammar run (error budget < 1% of statements)
+        env:
+          SQLDIFF_FUZZ_ITERS: "20000"
+        run: cargo test --release -p sqldiff-corpus --test fuzz -- --nocapture
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Coverage-guided fuzzing
+        run: |
+          secs=60
+          if [ "${{ github.event_name }}" = "schedule" ]; then secs=900; fi
+          for t in parse_bytes parse_grammar; do
+            cargo +nightly fuzz run "$t" -- -max_total_time="$secs"
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  separation:
+    name: determinism and AI separation (placeholder)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # There is no AI module yet (design §11, M8). Until there is, check the two
+      # properties it must not break: the engine's crates have no network
+      # client in their dependency tree, and findings are byte-identical across runs.
+      - name: No network clients in the engine crates
+        run: |
+          for p in sqldiff-syntax sqldiff-core sqldiff-corpus; do
+            if cargo tree -p "$p" -e normal --prefix none | grep -E '^(reqwest|hyper|ureq|tokio|isahc|curl|surf) '; then
+              echo "$p depends on a network client"; exit 1
+            fi
+          done
+      - name: Byte-identical corpus results
+        run: |
+          cargo run -q -p sqldiff-corpus --bin corpus-report -- --json > run1.json
+          cargo run -q -p sqldiff-corpus --bin corpus-report -- --json > run2.json
+          cmp run1.json run2.json

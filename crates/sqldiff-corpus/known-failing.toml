@@ -1,0 +1,177 @@
+# Corpus expectations the engine does not meet yet (design §12, §14 gates).
+# `cargo test -p sqldiff-corpus` fails when an expectation not listed here fails,
+# and when one listed here passes: remove it in the same change that fixes it.
+# Regenerate with `cargo run -p sqldiff-corpus --bin corpus-report -- --write-known-failing`,
+# then review the diff: only removals should appear unless you added cases.
+
+[[failing]]
+id = "m01-correlated-update-exists-removed:original~mutated"
+reason = "verdict unknown != different [WP10 idioms / cardinality]"
+
+[[failing]]
+id = "m04-lock-on-missing-row:original~mutated"
+reason = "no concurrency finding with verdict different [WP10 lock-intent analysis]"
+
+[[failing]]
+id = "m05-table-variable-to-temp-table:original~mutated"
+reason = "no transactional finding with verdict different [WP3 temp-state model]"
+
+[[failing]]
+id = "m06-continue-handler-removed:original~mutated"
+reason = "no semantic finding with verdict different [WP3 IR + WP9 behavioural diff]"
+
+[[failing]]
+id = "m07-exit-to-continue:original~mutated"
+reason = "verdict unknown != different [WP3 IR + WP9 behavioural diff]"
+
+[[failing]]
+id = "m08-atomic-dropped:original~mutated"
+reason = "verdict unknown != different [WP3 IR + WP9 behavioural diff]"
+
+[[failing]]
+id = "m10-set-subquery-to-select-assign:original~mutated"
+reason = "no cardinality finding with verdict different [WP10 cardinality contracts]"
+
+[[failing]]
+id = "m12-merge-by-source-split:original~mutated"
+reason = "no concurrency finding with verdict different [WP10 idioms (MERGE lift) / WP9]"
+
+[[failing]]
+id = "m13-coalesce-to-isnull:original~mutated"
+reason = "verdict unknown != different [WP1 binding (type/length of ISNULL)]"
+
+[[failing]]
+id = "m14-terminator-before-throw:original~mutated"
+reason = "verdict unknown != different [WP3 error model (THROW terminator)]"
+
+[[failing]]
+id = "m15-dropped-column-reference:original~mutated"
+reason = "verdict unknown != different [WP1 binding]"
+
+[[failing]]
+id = "m16-outdated-signature:original~mutated"
+reason = "verdict unknown != different [WP1 binding]"
+
+[[failing]]
+id = "m17-shadowed-variable:original~mutated"
+reason = "no binding finding with verdict different [WP1 binding]"
+
+[[failing]]
+id = "m18-dialect-residue:original~mutated"
+reason = "verdict unknown != different [WP1 binding]"
+
+[[failing]]
+id = "m20-trigger-to-out-of-engine-handler:original~mutated"
+reason = "no transactional finding with verdict different [WP3 effects (triggers/substitutes)]"
+
+[[failing]]
+id = "m22-null-ordering-changed:original~mutated"
+reason = "verdict unknown != different [cross-dialect equivalence]"
+
+[[failing]]
+id = "p01-move-stock:tsql~pg"
+reason = "no transactional finding with verdict different [WP3 transaction model + WP9]"
+
+[[failing]]
+id = "p02-upsert-price:tsql~pg"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p03-lookup-by-key:tsql~pg"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p03-lookup-by-key:tsql~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p03-lookup-by-key:pg~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p04-display-name:tsql~pg"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p04-display-name:tsql~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p05-email-lookup:tsql~pg"
+reason = "verdict unknown != different [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p05-email-lookup:tsql~db2i"
+reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p06-paged-orders:tsql~pg"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p06-paged-orders:tsql~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p06-paged-orders:pg~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p08-delete-orphans:tsql~pg"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p08-delete-orphans:tsql~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p08-delete-orphans:pg~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p09-error-rollback:tsql~db2i"
+reason = "verdict unknown != equal-under-assumptions [WP3 + WP9]"
+
+[[failing]]
+id = "p10-temp-state-rollback:tsql~pg"
+reason = "no transactional finding with verdict different [WP3 temp-state model + WP9]"
+
+[[failing]]
+id = "p10-temp-state-rollback:tsql~db2i"
+reason = "verdict unknown != different [WP3 temp-state model + WP9]"
+
+[[failing]]
+id = "p10-temp-state-rollback:pg~db2i"
+reason = "no transactional finding with verdict different; no cardinality finding with verdict different [WP3 temp-state model + WP9]"
+
+[[failing]]
+id = "p11-string-aggregation:tsql~pg"
+reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p11-string-aggregation:tsql~db2i"
+reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p12-days-between:tsql~pg"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p12-days-between:pg~db2i"
+reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p12-days-between:pg~pg_nearmiss"
+reason = "verdict unknown != different [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p13-named-lock:tsql~pg"
+reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p13-named-lock:tsql~db2i"
+reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"
+
+[[failing]]
+id = "p13-named-lock:pg~db2i"
+reason = "verdict unknown != equal-under-assumptions [cross-dialect equivalence (statement pairing) and WP9]"

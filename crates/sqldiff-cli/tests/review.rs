@@ -101,10 +101,16 @@ fn accepting_everything_never_yields_equal_exit() {
     let out = sqldiff(&data, &["diff", &a, &b, "-f", "json"]);
     let r = json(&out);
     assert!(r["findings"].as_array().unwrap().is_empty());
-    assert_eq!(r["verdict"], "different", "the computed verdict is kept");
-    // Open verdict is at best "equal under assumptions" (exit 0), or unknown.
+    assert_eq!(r["verdict_before_suppression"], "different");
+    // The shown verdict is the open one, and the exit code agrees with it.
     let code = out.status.code().unwrap();
-    assert!(code == 0 || code == 1);
+    match r["verdict"].as_str().unwrap() {
+        "equal_under_assumptions" => assert_eq!(code, 0),
+        "unknown" | "different" => assert_eq!(code, 1),
+        v => panic!("suppression must never yield {v}"),
+    }
+    let text = String::from_utf8_lossy(&sqldiff(&data, &["diff", &a, &b]).stdout).to_string();
+    assert!(text.contains("(different before"), "{text}");
 }
 
 #[test]
@@ -164,4 +170,91 @@ fn cache_is_written_and_can_be_cleared() {
     assert!(!nocache.join("cache").exists());
     assert!(sqldiff(&data, &["review", "clear-cache"]).status.success());
     assert!(!data.join("cache").exists());
+}
+
+#[test]
+fn tree_text_redacts_unpaired_paths() {
+    let data = scratch("tree-text");
+    let t = scratch("tree-text-src");
+    for (side, f) in [("a", "movestock.tsql.sql"), ("b", "movestock.pg.sql")] {
+        std::fs::create_dir_all(t.join(side)).unwrap();
+        std::fs::copy(fixture(f), t.join(side).join("movestock.sql")).unwrap();
+    }
+    std::fs::write(t.join("b").join("onlyhere_secretname.sql"), "SELECT 1;\n").unwrap();
+    let out = sqldiff(
+        &data,
+        &[
+            "tree",
+            t.join("a").to_str().unwrap(),
+            t.join("b").to_str().unwrap(),
+            "--dialect-a",
+            "tsql",
+            "--dialect-b",
+            "postgres",
+            "--redact",
+        ],
+    );
+    let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(s.contains("only in b"), "{s}");
+    for term in ["movestock", "secretname"] {
+        assert!(!s.contains(term), "{term} in {s}");
+    }
+}
+
+#[test]
+fn redact_survives_names_that_are_json_keys() {
+    let data = scratch("keys");
+    let d = scratch("keys-src");
+    for name in ["rule.sql", "rule2.sql"] {
+        std::fs::copy(fixture("movestock.tsql.sql"), d.join(name)).unwrap();
+    }
+    let (a, b) = (d.join("rule.sql"), d.join("rule2.sql"));
+    for fmt in ["text", "json", "sarif"] {
+        let out = sqldiff(
+            &data,
+            &[
+                "diff",
+                a.to_str().unwrap(),
+                b.to_str().unwrap(),
+                "-d",
+                "tsql",
+                "--redact",
+                "-f",
+                fmt,
+            ],
+        );
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
+    }
+}
+
+#[test]
+fn non_ascii_snapshot_does_not_panic() {
+    let data = scratch("utf8");
+    let out = sqldiff(
+        &data,
+        &["review", "accept", "fp", "--snapshot", "ééééééééé:x"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(sqldiff(&data, &["review", "list"]).status.success());
+    let out = sqldiff(
+        &data,
+        &["review", "accept", "fp", "--expires", "2026-10-2é"],
+    );
+    assert_eq!(out.status.code(), Some(2));
 }

@@ -41,9 +41,13 @@ $B snapshot git:.@v1.2//db -o v1.2.json --history     # canonical, content-hashe
 $B pairs v1.2.json --diff                             # offline, from the bundle
 $B config                                             # merged config and its layers
 
-# Pair view in the browser (statement-aligned, findings panel, live scratchpad)
+# Pair view in the browser (statement-aligned, findings panel, live in-pane editing)
 target/release/sqldiff-gui serve tests/fixtures/movestock.tsql.sql tests/fixtures/movestock.db2i.sql --dialect-a tsql --dialect-b db2i
 target/release/sqldiff-gui export --report report.json -o pair.html   # static, read-only
+
+# Convert mode: type T-SQL on the left, checked PostgreSQL appears on the right as you type
+target/release/sqldiff-gui convert                       # starts with a sample
+target/release/sqldiff-gui convert my_proc.sql --stdout  # print the conversion and per-statement badges
 ```
 
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
@@ -75,6 +79,7 @@ Verdict: DIFFERENT
 | Interfaces | CLI `diff` / `check` / `parse` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
 | Review workflow | Review store keyed by fingerprint and snapshot with expiry and optional encryption at rest; accepted findings and in-source deliberate-difference markers suppressed (kept in JSON and SARIF `suppressions`); author-declared assumptions from pack markers; redacted export with salted stable placeholders, leak-checked; per-content-hash report cache ([docs/review-and-export.md](docs/review-and-export.md)). |
 | GUI | `sqldiff-gui serve` / `export` / `report`: two files open the pair view, two directories open a review queue (filter by class, dialect pair, folder, review state; sort by severity). Pair view aligned by statement with a location pane, findings with accept / reject / comment, assumption panel (deny or confirm an assumption and watch verdicts update), provenance bar (sources, snapshot, packs and hashes, dialect versions, refresh), command palette (Ctrl+K), scratchpad that re-diffs on edit, deep links `?a=<path>&b=<path>#f=<fingerprint>`, session report as Markdown (`--redact`). Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
+| Conversion (P0) | `sqldiff-gui convert`: rule-based T-SQL → PostgreSQL that updates live; every statement gets a badge (converted, under assumptions, needs a decision, differs, not converted) from its rules plus the engine's diff of input against output. Constructs without a rule stay as comments, never guessed. See [docs/convert-mode.md](docs/convert-mode.md). |
 
 Not yet built: full binding against catalogs, the CFG with error edges (M4) and equivalence across control flow (loops, branches, error handlers that write), named-lock idioms, catalog-aware binding of adapter catalogs, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 
@@ -100,7 +105,7 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 | `comment_text` | `finding_ids`, `excerpt_lines` (1), `fingerprints` (true) | A plain-text review comment from the phrase grammar: same findings, same text |
 | `open_in_gui` | `finding_id` or `pair`, `gui_url` | `{gui}/?a=<path>&b=<path>#f=<fingerprint>` and the `sqldiff-gui serve` command for the pair |
 
-The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store once it lands; until then every finding counts as unreviewed.
+The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store: accepted findings (and in-source deliberate-difference markers) are suppressed and counted, and a pair still needs review while it has an undecided finding or a verdict short of equal.
 
 Each result carries a readable text block and the same data as `structuredContent` JSON.
 
@@ -113,7 +118,8 @@ crates/sqldiff-source   packs, layered config, adapter protocol, fs/git/bundle a
 crates/sqldiff-review   review store, suppression, author markers, redaction, cache
 crates/sqldiff-cli      the `sqldiff` binary
 crates/sqldiff-mcp      the `sqldiff-mcp` stdio MCP server
-crates/sqldiff-gui      the `sqldiff-gui` review queue and pair view (local server + embedded page)
+crates/sqldiff-convert  rule-based dialect conversion, checked unit by unit by the engine
+crates/sqldiff-gui      the `sqldiff-gui` review queue, pair view and convert mode (local server + embedded pages)
 tests/fixtures          synthetic fixtures (all written for this repository)
 docs/examples/pack      synthetic example pack using every section
 scripts/leak-scan.sh    deny-list scan (design §5.6); the list itself is supplied at run time

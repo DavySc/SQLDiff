@@ -45,7 +45,11 @@ impl Pipeline {
         let store = if args.no_suppress {
             None
         } else {
-            Some(Store::from_config(&cfg).map_err(|e| e.0)?)
+            let s = Store::from_config(&cfg).map_err(|e| e.0)?;
+            for w in s.warnings() {
+                eprintln!("sqldiff: review store: {w}");
+            }
+            Some(s)
         };
         let cache = if args.no_cache {
             Cache::disabled()
@@ -103,30 +107,33 @@ impl Pipeline {
         }
     }
 
-    pub fn redact_reports(&mut self, reports: Vec<Report>) -> Vec<Report> {
+    /// Redacted copies of reports, each checked for leftover terms.
+    pub fn redact_reports(&mut self, reports: Vec<Report>) -> Result<Vec<Report>, String> {
         let Some(red) = &mut self.redactor else {
-            return reports;
+            return Ok(reports);
         };
         // Register every report's terms before redacting any, so a name
         // from one pair is also replaced in another pair's witnesses.
         for r in &reports {
             red.add_report(r);
         }
-        reports.iter().map(|r| red.redact_report(r)).collect()
+        reports
+            .iter()
+            .map(|r| {
+                let out = red.redact_report(r);
+                red.verify_report(&out).map_err(|e| e.0)?;
+                Ok(out)
+            })
+            .collect()
     }
 
-    pub fn redact_json(&mut self, v: &mut serde_json::Value) {
+    /// Redacts and checks the string values of other output.
+    pub fn redact_json(&mut self, v: &mut serde_json::Value) -> Result<(), String> {
         if let Some(r) = &mut self.redactor {
             r.redact_value(v);
+            r.verify_value(v).map_err(|e| e.0)?;
         }
-    }
-
-    /// Checks redacted output for leftover terms before it is printed.
-    pub fn verify(&mut self, out: &str) -> Result<(), String> {
-        match &mut self.redactor {
-            Some(r) => r.verify(out).map_err(|e| e.0),
-            None => Ok(()),
-        }
+        Ok(())
     }
 }
 
@@ -331,7 +338,7 @@ fn short_snapshot(s: &str) -> String {
         return "any snapshot".into();
     }
     s.split(':')
-        .map(|h| &h[..h.len().min(8)])
+        .map(|h| h.chars().take(8).collect::<String>())
         .collect::<Vec<_>>()
         .join(":")
 }

@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLDiff convert</title>
+<style>
+/* Palette shared with index.html (pair view); keep the two in sync. */
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --fg: #16181d; --muted: #667085; --line: #e4e7ec; --soft: #eef1f5;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.06), 0 1px 3px rgba(16,24,40,.08); --accent: #4f46e5;
+  --chg-bg: #fff6dc; --chg-tok: #f5d77a; --del-bg: #fde8e8; --add-bg: #e3f5e8; --focus: #4f46e5;
+  --kw: #8a3ab9; --id: #1d1f21; --var: #b0551c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828;
+  --transactional: #c62828; --semantic: #d96b00;
+  --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-differs: #d92d20; --s-not_converted: #98a2b3;
+  --b-assumptions: #fff6dc; --b-decision: #eef0ff; --b-differs: #fde8e8; --b-not_converted: #f2f4f7;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1115; --panel: #171a20; --fg: #e6e8ec; --muted: #8b93a1; --line: #262b33; --soft: #1e232b;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8;
+    --chg-bg: #3a3218; --chg-tok: #6b5a1c; --del-bg: #3d2222; --add-bg: #1e3626; --focus: #818cf8;
+    --kw: #c792ea; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #7d838c; --err: #ff6b6b;
+    --transactional: #ff6b6b; --semantic: #ffa94d;
+    --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-differs: #f97066; --s-not_converted: #667085;
+    --b-assumptions: #3a3218; --b-decision: #24254a; --b-differs: #3d2222; --b-not_converted: #1e232b;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+header { padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; box-shadow: var(--shadow); position: relative; z-index: 3; }
+header h1 { font-size: 15px; margin: 0; font-weight: 700; letter-spacing: -.01em; display: flex; align-items: center; gap: 8px; }
+header h1::before { content: ""; width: 18px; height: 18px; border-radius: 5px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
+.pair { font-size: 12px; font-weight: 600; color: var(--muted); background: var(--soft); border-radius: 999px; padding: 2px 10px; }
+.verdict { font-weight: 600; padding: 2px 10px; border-radius: 999px; font-size: 11.5px; letter-spacing: .03em; text-transform: uppercase; white-space: nowrap; }
+.verdict.different { background: var(--del-bg); color: var(--transactional); }
+.verdict.unknown { background: var(--chg-bg); color: var(--semantic); }
+.verdict.equal, .verdict.equal_under_assumptions { background: var(--add-bg); color: var(--str); }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+button, .chip { font: inherit; font-size: 12px; font-weight: 500; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 6px; padding: 4px 10px; cursor: pointer; transition: border-color .12s, color .12s; }
+button:hover:not(:disabled), .chip:hover { border-color: var(--focus); color: var(--focus); }
+button:disabled { opacity: .45; cursor: default; }
+.chip { border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; }
+.chip b { font-variant-numeric: tabular-nums; }
+.chip.zero { opacity: .45; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--soft); }
+
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 14px; grid-template-rows: auto minmax(0, 1fr); min-height: 0; gap: 0; }
+.ph { padding: 6px 12px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+.ph strong { color: var(--fg); font-weight: 600; }
+.ph.right { border-left: 1px solid var(--line); }
+#src { width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); background: var(--panel); color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; }
+#out { overflow: auto; background: var(--panel); border-left: 1px solid var(--line); font: 12.5px/1.6 var(--mono); padding: 8px 0; }
+.ln { display: grid; grid-template-columns: 40px 16px minmax(0, 1fr); cursor: pointer; }
+.ln .no { color: var(--muted); text-align: right; padding-right: 6px; user-select: none; opacity: .7; }
+.ln .g { display: flex; align-items: center; justify-content: center; }
+.ln .g .dot { width: 7px; height: 7px; }
+.ln .tx { white-space: pre; padding-right: 12px; }
+.ln.s-assumptions { background: var(--b-assumptions); }
+.ln.s-decision { background: var(--b-decision); }
+.ln.s-differs { background: var(--b-differs); }
+.ln.s-not_converted { background: var(--b-not_converted); }
+.ln.sel { box-shadow: inset 3px 0 0 var(--focus); }
+.ln.sel .no { color: var(--focus); opacity: 1; font-weight: 600; }
+.ln:hover .no { opacity: 1; }
+#overview { position: relative; background: var(--panel); border-left: 1px solid var(--line); cursor: pointer; grid-row: 1 / 3; grid-column: 3; }
+#overview .m { position: absolute; left: 3px; right: 3px; min-height: 2px; border-radius: 1px; }
+#overview .vp { position: absolute; left: 0; right: 0; border: 1px solid var(--muted); border-radius: 2px; opacity: .5; pointer-events: none; }
+.t-kw { color: var(--kw); font-weight: 600; } .t-str { color: var(--str); } .t-num { color: var(--num); }
+.t-cmt { color: var(--cmt); font-style: italic; } .t-var { color: var(--var); }
+
+#detail { height: 34vh; min-height: 140px; border-top: 1px solid var(--line); background: var(--bg); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+#detail .dh { grid-column: 1 / -1; padding: 6px 14px; display: flex; gap: 10px; align-items: center; font-size: 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--soft); }
+#detail pre { margin: 0; padding: 8px 14px; font: 12px/1.55 var(--mono); overflow: auto; white-space: pre; }
+#detail .code { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 0; overflow: hidden; border-right: 1px solid var(--line); }
+#detail .code pre + pre { border-left: 1px dashed var(--line); }
+#notes { overflow: auto; padding: 8px 14px; font-size: 13px; }
+.note { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 8px; box-shadow: var(--shadow); }
+.note .r { font: 11px var(--mono); color: var(--muted); }
+.note.finding { border-left: 3px solid var(--transactional); }
+.note.accepted { opacity: .6; }
+.note .acc { float: right; margin-top: -2px; font: 500 11px/1.4 system-ui, sans-serif; padding: 1px 8px; }
+.empty { color: var(--muted); font-size: 13px; padding: 10px 14px; }
+#err { display: none; padding: 8px 16px; background: var(--del-bg); color: var(--transactional); font-size: 13px; }
+#help { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 10; }
+#help.open { display: flex; }
+#help > div { background: var(--panel); border-radius: 12px; padding: 18px 22px; box-shadow: 0 10px 30px rgba(0,0,0,.25); max-width: 520px; font-size: 13px; }
+#help td { padding: 3px 10px 3px 0; vertical-align: top; }
+@media (max-width: 900px) {
+  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 40vh auto 40vh; }
+  #overview { display: none; }
+  .ph.right, #out { border-left: 0; }
+  #detail { grid-template-columns: 1fr; height: auto; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>SQLDiff convert</h1>
+  <span class="pair" id="pair">T-SQL → PostgreSQL</span>
+  <span id="verdict" class="verdict"></span>
+  <span id="chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
+  <span class="spacer"></span>
+  <button id="prev" title="Previous unit that needs attention (Alt+↑)">↑ Prev</button>
+  <button id="next" title="Next unit that needs attention (Alt+↓)">Next ↓</button>
+  <button id="copy" title="Copy the PostgreSQL output">Copy</button>
+  <button id="save" title="Download the PostgreSQL output as .sql">Save .sql</button>
+  <button id="helpbtn" title="Keyboard shortcuts (?)">?</button>
+</header>
+<div id="err"></div>
+<main>
+  <div class="ph"><strong>T-SQL</strong><span id="srcname"></span><span class="spacer"></span><span>edit freely; nothing is saved</span></div>
+  <div class="ph right"><strong>PostgreSQL</strong><span>converted, checked by SQLDiff</span><span class="spacer"></span><span id="timing"></span></div>
+  <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="T-SQL input"></textarea>
+  <div id="out" role="listbox" aria-label="PostgreSQL output"></div>
+  <div id="overview" title="Location pane: click to jump"></div>
+</main>
+<section id="detail">
+  <div class="dh" id="dh"><span class="muted">Select a statement on either side, or press <kbd>Alt</kbd>+<kbd>↓</kbd> for the next one that needs attention.</span></div>
+  <div class="code"><pre id="dsrc"></pre><pre id="dout"></pre></div>
+  <div id="notes"></div>
+</section>
+<div id="help"><div>
+  <h3 style="margin-top:0">Convert mode</h3>
+  <p class="muted">Each converted statement gets a badge. Only <em>converted</em> means no assumption was needed and SQLDiff found no difference.</p>
+  <table>
+    <tr><td><span class="dot" style="background:var(--s-converted)"></span> converted</td><td>Rules without assumptions; the engine found nothing.</td></tr>
+    <tr><td><span class="dot" style="background:var(--s-assumptions)"></span> under assumptions</td><td>Equal if the listed facts hold.</td></tr>
+    <tr><td><span class="dot" style="background:var(--s-decision)"></span> needs a decision</td><td>Several faithful targets exist; check the note.</td></tr>
+    <tr><td><span class="dot" style="background:var(--s-differs)"></span> differs</td><td>The engine found a difference or leftover T-SQL.</td></tr>
+    <tr><td><span class="dot" style="background:var(--s-not_converted)"></span> not converted</td><td>No rule yet; kept as a comment.</td></tr>
+  </table>
+  <table style="margin-top:10px">
+    <tr><td><kbd>Alt</kbd>+<kbd>↓</kbd> / <kbd>Alt</kbd>+<kbd>↑</kbd></td><td>Next / previous unit that needs attention</td></tr>
+    <tr><td><kbd>Alt</kbd>+<kbd>Home</kbd> / <kbd>Alt</kbd>+<kbd>End</kbd></td><td>First / last such unit</td></tr>
+    <tr><td>Accept everywhere</td><td>Mark an assumption as known to hold; statements that only needed it count as converted (remembered in this browser).</td></tr>
+    <tr><td><kbd>Esc</kbd></td><td>Back to the editor</td></tr>
+    <tr><td><kbd>?</kbd></td><td>This help (outside the editor)</td></tr>
+  </table>
+</div></div>
+<script>
+const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+const $ = (id) => document.getElementById(id);
+const LABEL = { converted: "converted", assumptions: "under assumptions", decision: "needs a decision", differs: "differs", not_converted: "not converted" };
+const SHORT = { converted: "converted", assumptions: "assumptions", decision: "decisions", differs: "differs", not_converted: "not converted" };
+const ORDER = ["not_converted", "differs", "decision", "assumptions", "converted"];
+const state = { data: null, sel: -1, lineUnit: [], seq: 0, shown: 0, syncing: false, st: [], accepted: new Set() };
+const ACCEPT_KEY = "sqldiff.convert.accepted";
+try { state.accepted = new Set(JSON.parse(localStorage.getItem(ACCEPT_KEY) || "[]")); } catch { /* storage unavailable */ }
+function saveAccepted() { try { localStorage.setItem(ACCEPT_KEY, JSON.stringify([...state.accepted])); } catch { /* ignore */ } }
+const RANK = { converted: 0, assumptions: 1, decision: 2, differs: 3, not_converted: 4 };
+const acceptable = (n) => n.status === "assumptions" || n.status === "decision";
+// A unit's status once the viewer has accepted some assumptions: the engine's part always stays.
+function effective(u) {
+  let s = u.checked;
+  for (const n of u.notes) if (!(acceptable(n) && state.accepted.has(n.rule)) && RANK[n.status] > RANK[s]) s = n.status;
+  return s;
+}
+
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const KW = new Set(("select from where and or not null is in exists insert into values update set delete create replace procedure function " +
+  "returns return language as begin end if then else elsif while loop exit continue declare table view index unique primary key " +
+  "foreign references default generated always identity start with increment by order group having limit offset fetch next rows only " +
+  "join left right inner outer full cross on case when distinct union all except intersect call raise notice exception others using " +
+  "commit rollback temp cast coalesce like true false do inout include check constraint").split(" "));
+function hl(line) {
+  const re = /(--.*$)|('(?:[^']|'')*'?)|(\$\$)|(\b\d+(?:\.\d+)?\b)|(@@?\w+)|([A-Za-z_][A-Za-z0-9_]*)|([^A-Za-z0-9_'@$-]+|.)/g;
+  let out = "", m;
+  while ((m = re.exec(line))) {
+    const [t, c, s, d, n, v, w] = m;
+    if (c) out += `<span class="t-cmt">${esc(c)}</span>`;
+    else if (s) out += `<span class="t-str">${esc(s)}</span>`;
+    else if (d) out += `<span class="t-kw">$$</span>`;
+    else if (n) out += `<span class="t-num">${n}</span>`;
+    else if (v) out += `<span class="t-var">${esc(v)}</span>`;
+    else if (w) out += KW.has(w.toLowerCase()) ? `<span class="t-kw">${w}</span>` : esc(w);
+    else out += esc(t);
+  }
+  return out;
+}
+
+function render(data, keepSel) {
+  state.data = data;
+  $("err").style.display = data.error ? "block" : "none";
+  $("err").textContent = data.error || "";
+  $("srcname").textContent = data.name ? `· ${data.name}` : "";
+  $("timing").textContent = `converted and checked in ${data.ms.toFixed(1)} ms`;
+  const c = data.conversion;
+  if (!c) { $("out").innerHTML = ""; return; }
+  const v = c.report.verdict;
+  $("verdict").className = `verdict ${v}`;
+  $("verdict").textContent = v.replace(/_/g, " ");
+  $("verdict").title = (c.report.unknown_reasons || []).join("\n");
+  state.st = c.units.map(effective);
+  const counts = {};
+  state.st.forEach((s) => (counts[s] = (counts[s] || 0) + 1));
+  $("chips").innerHTML = ORDER.slice().reverse().map((s) => {
+    const n = counts[s] || 0;
+    return `<button class="chip${n ? "" : " zero"}" data-s="${s}" title="Jump to the next '${LABEL[s]}' unit"><span class="dot" style="background:var(--s-${s})"></span>${SHORT[s]} <b>${n}</b></button>`;
+  }).join("") + (state.accepted.size ? `<button class="chip" id="reset" title="Accepted assumptions count as true. Click to un-accept all.">${state.accepted.size} accepted ✕</button>` : "");
+  // Lines of the output, each tagged with the unit that owns it.
+  const lines = c.output.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  state.lineUnit = new Array(lines.length).fill(-1);
+  c.units.forEach((u, i) => {
+    for (let l = u.out.line; l <= u.out.end_line; l++) if (state.lineUnit[l - 1] === -1 || isNarrower(i, state.lineUnit[l - 1])) state.lineUnit[l - 1] = i;
+  });
+  $("out").innerHTML = lines.map((t, i) => {
+    const ui = state.lineUnit[i];
+    const u = ui >= 0 ? c.units[ui] : null;
+    const st = u ? state.st[ui] : "";
+    const first = u && u.out.line === i + 1;
+    const cls = u ? ` s-${st}` : "";
+    const g = first ? `<span class="dot" style="background:var(--s-${st})" title="${LABEL[st]}"></span>` : "";
+    return `<div class="ln${cls}" data-l="${i + 1}" data-u="${ui}"><span class="no">${i + 1}</span><span class="g">${g}</span><span class="tx">${hl(t) || " "}</span></div>`;
+  }).join("");
+  overview();
+  if (!keepSel || state.sel >= c.units.length) state.sel = -1;
+  if (state.sel >= 0) select(state.sel, { scroll: false, caret: false });
+  else showDetail(-1);
+}
+function isNarrower(a, b) {
+  const u = state.data.conversion.units;
+  return (u[a].out.end - u[a].out.start) < (u[b].out.end - u[b].out.start);
+}
+
+function overview() {
+  const c = state.data.conversion, total = Math.max(1, state.lineUnit.length);
+  const ov = $("overview");
+  ov.innerHTML = c.units.map((u, i) => state.st[i] === "converted" ? "" :
+    `<div class="m" data-u="${i}" style="top:${(u.out.line - 1) / total * 100}%;height:${(u.out.end_line - u.out.line + 1) / total * 100}%;background:var(--s-${state.st[i]})" title="${LABEL[state.st[i]]}"></div>`).join("") + `<div class="vp" id="vp"></div>`;
+  viewport();
+}
+function viewport() {
+  const o = $("out"), vp = $("vp");
+  if (!vp || !o.scrollHeight) return;
+  vp.style.top = `${o.scrollTop / o.scrollHeight * 100}%`;
+  vp.style.height = `${o.clientHeight / o.scrollHeight * 100}%`;
+}
+
+// Which unit owns an input offset: the narrowest whose source range contains it.
+function unitAt(offset) {
+  const units = state.data.conversion?.units || [];
+  let best = -1;
+  units.forEach((u, i) => {
+    if (u.src.start_u16 <= offset && offset <= u.src.end_u16 &&
+        (best < 0 || (u.src.end_u16 - u.src.start_u16) < (units[best].src.end_u16 - units[best].src.start_u16))) best = i;
+  });
+  return best;
+}
+
+function lineHeight(el) { return parseFloat(getComputedStyle(el).lineHeight) || 20; }
+
+function select(i, { scroll = true, caret = true } = {}) {
+  const c = state.data.conversion;
+  state.sel = i;
+  document.querySelectorAll(".ln.sel").forEach((e) => e.classList.remove("sel"));
+  if (i < 0) return showDetail(-1);
+  const u = c.units[i];
+  for (let l = u.out.line; l <= u.out.end_line; l++) {
+    const e = document.querySelector(`.ln[data-l="${l}"]`);
+    if (e) e.classList.add("sel");
+  }
+  if (scroll) {
+    const e = document.querySelector(`.ln[data-l="${u.out.line}"]`), o = $("out");
+    if (e && (e.offsetTop < o.scrollTop || e.offsetTop > o.scrollTop + o.clientHeight - 40)) o.scrollTop = e.offsetTop - o.clientHeight / 3;
+  }
+  if (caret) {
+    const ta = $("src");
+    ta.setSelectionRange(u.src.start_u16, u.src.end_u16);
+    const top = (u.src.line - 1) * lineHeight(ta);
+    if (top < ta.scrollTop || top > ta.scrollTop + ta.clientHeight - 40) ta.scrollTop = top - ta.clientHeight / 3;
+  }
+  showDetail(i);
+}
+
+function showDetail(i) {
+  const d = state.data, c = d.conversion;
+  if (i < 0 || !c) {
+    $("dh").innerHTML = `<span class="muted">Select a statement on either side, or press <kbd>Alt</kbd>+<kbd>↓</kbd> for the next one that needs attention.</span>`;
+    $("dsrc").textContent = ""; $("dout").textContent = "";
+    $("notes").innerHTML = c ? summary(c) : "";
+    return;
+  }
+  const u = c.units[i], st = state.st[i];
+  $("dh").innerHTML = `<span class="badge"><span class="dot" style="background:var(--s-${st})"></span>${LABEL[st]}</span>
+    <span class="muted">T-SQL line ${u.src.line}${u.src.end_line > u.src.line ? "–" + u.src.end_line : ""} → PostgreSQL line ${u.out.line}${u.out.end_line > u.out.line ? "–" + u.out.end_line : ""}</span>`;
+  $("dsrc").textContent = d.input.slice(u.src.start_u16, u.src.end_u16);
+  $("dout").textContent = c.output.split("\n").slice(u.out.line - 1, u.out.end_line).join("\n");
+  const notes = u.notes.map((n) => {
+    const acc = acceptable(n) && state.accepted.has(n.rule);
+    const btn = acceptable(n) ? `<button class="acc" data-rule="${esc(n.rule)}" title="${acc ? "Count this assumption as open again" : "I know this holds: accept it for every statement"}">${acc ? "Accepted · undo" : "Accept everywhere"}</button>` : "";
+    return `<div class="note${acc ? " accepted" : ""}"><span class="badge"><span class="dot" style="background:var(--s-${n.status})"></span>${LABEL[n.status]}</span> ${esc(n.text)}<div class="r">${esc(n.rule)} ${btn}</div></div>`;
+  });
+  const finds = u.findings.map((fi) => {
+    const f = c.report.findings[fi];
+    return `<div class="note finding"><span class="badge">SQLDiff · ${esc(f.class)} · ${esc(f.verdict.replace(/_/g, " "))}</span> ${esc(f.witness)}<div class="r">${esc(f.rule)}</div></div>`;
+  });
+  $("notes").innerHTML = notes.concat(finds).join("") || `<div class="empty">Converted by rules that need no assumption, and SQLDiff found no difference here.</div>`;
+}
+
+function summary(c) {
+  const a = (c.report.assumptions || []).map((x) => `<li><code>${esc(x.id)}</code> ${esc(x.text)}</li>`).join("");
+  const r = (c.report.unknown_reasons || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  return `<div class="empty">${c.units.length} statements converted and checked.${r ? `<br>Why the verdict is not stronger:<ul>${r}</ul>` : ""}${a ? `Engine assumptions:<ul>${a}</ul>` : ""}</div>`;
+}
+
+// Navigation over units that need attention, in output order (WinMerge Alt+↓/↑).
+function attention() {
+  const c = state.data.conversion;
+  if (!c) return [];
+  return c.units.map((u, i) => [u, i]).filter(([, i]) => state.st[i] !== "converted").sort((x, y) => x[0].out.line - y[0].out.line).map(([, i]) => i);
+}
+function step(dir, status) {
+  const c = state.data.conversion;
+  let list = attention();
+  if (status) list = c.units.map((u, i) => [u, i]).filter(([, i]) => state.st[i] === status).sort((x, y) => x[0].out.line - y[0].out.line).map(([, i]) => i);
+  if (!list.length) return;
+  const cur = state.sel >= 0 ? c.units[state.sel].out.line : (dir > 0 ? 0 : Infinity);
+  const pick = dir > 0 ? list.find((i) => c.units[i].out.line > cur) ?? list[0]
+                       : [...list].reverse().find((i) => c.units[i].out.line < cur) ?? list[list.length - 1];
+  select(pick);
+}
+
+// Live conversion: debounced, stale responses dropped.
+let timer = null;
+function schedule() {
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    const seq = ++state.seq;
+    try {
+      const r = await fetch("/api/convert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("src").value }) });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      if (seq < state.shown) return;
+      state.shown = seq;
+      render(data, true);
+      followCaret();
+    } catch (e) {
+      $("err").style.display = "block";
+      $("err").textContent = `Conversion failed: ${e.message}`;
+    }
+  }, 150);
+}
+function followCaret() {
+  const i = unitAt($("src").selectionStart);
+  if (i >= 0 && i !== state.sel) select(i, { caret: false });
+}
+
+// Scroll sync by unit: the unit at the top of one side brings its partner to the top of the other.
+function syncFrom(side) {
+  if (state.syncing || !state.data.conversion) return;
+  const c = state.data.conversion, ta = $("src"), o = $("out");
+  const lh = lineHeight(ta);
+  state.syncing = true;
+  if (side === "src") {
+    const top = ta.scrollTop / lh + 1;
+    const u = c.units.filter((u) => u.src.line <= top).sort((a, b) => b.src.line - a.src.line)[0];
+    if (u) o.scrollTop = (u.out.line - 1 + (top - u.src.line)) * lh;
+    else o.scrollTop = 0;
+  } else {
+    const top = o.scrollTop / lh + 1;
+    const u = c.units.filter((u) => u.out.line <= top).sort((a, b) => b.out.line - a.out.line)[0];
+    if (u) ta.scrollTop = (u.src.line - 1 + (top - u.out.line)) * lh;
+    else ta.scrollTop = 0;
+  }
+  requestAnimationFrame(() => (state.syncing = false));
+  viewport();
+}
+
+function download() {
+  const blob = new Blob([state.data.conversion?.output || ""], { type: "application/sql" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = (state.data.name || "converted").replace(/\.[^.]*$/, "").replace(/^.*[\/\\]/, "") + ".pg.sql";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function init() {
+  const ta = $("src");
+  ta.value = INITIAL.input;
+  render(INITIAL, false);
+  if (!INITIAL.live) { ta.readOnly = true; ta.title = "Editing needs sqldiff-gui convert"; }
+  ta.addEventListener("input", schedule);
+  ["click", "keyup", "select"].forEach((ev) => ta.addEventListener(ev, followCaret));
+  ta.addEventListener("scroll", () => syncFrom("src"));
+  $("out").addEventListener("scroll", () => syncFrom("out"));
+  $("out").addEventListener("click", (e) => {
+    const ln = e.target.closest(".ln");
+    if (ln && +ln.dataset.u >= 0) select(+ln.dataset.u);
+  });
+  $("overview").addEventListener("click", (e) => {
+    const m = e.target.closest(".m");
+    if (m) return select(+m.dataset.u);
+    const o = $("out"), r = $("overview").getBoundingClientRect();
+    o.scrollTop = (e.clientY - r.top) / r.height * o.scrollHeight - o.clientHeight / 2;
+  });
+  $("chips").addEventListener("click", (e) => {
+    const b = e.target.closest(".chip");
+    if (!b) return;
+    if (b.id === "reset") { state.accepted.clear(); saveAccepted(); return render(state.data, true); }
+    step(1, b.dataset.s);
+  });
+  $("notes").addEventListener("click", (e) => {
+    const b = e.target.closest(".acc");
+    if (!b) return;
+    const r = b.dataset.rule;
+    if (state.accepted.has(r)) state.accepted.delete(r); else state.accepted.add(r);
+    saveAccepted();
+    render(state.data, true);
+  });
+  $("next").onclick = () => step(1);
+  $("prev").onclick = () => step(-1);
+  $("copy").onclick = async () => {
+    try { await navigator.clipboard.writeText(state.data.conversion?.output || ""); $("copy").textContent = "Copied"; }
+    catch { $("copy").textContent = "Copy failed"; }
+    setTimeout(() => ($("copy").textContent = "Copy"), 1200);
+  };
+  $("save").onclick = download;
+  $("helpbtn").onclick = () => $("help").classList.add("open");
+  $("help").onclick = () => $("help").classList.remove("open");
+  window.addEventListener("resize", viewport);
+  document.addEventListener("keydown", (e) => {
+    if (e.altKey && e.key === "ArrowDown") { e.preventDefault(); step(1); }
+    else if (e.altKey && e.key === "ArrowUp") { e.preventDefault(); step(-1); }
+    else if (e.altKey && e.key === "Home") { e.preventDefault(); const l = attention(); if (l.length) select(l[0]); }
+    else if (e.altKey && e.key === "End") { e.preventDefault(); const l = attention(); if (l.length) select(l[l.length - 1]); }
+    else if (e.key === "Escape") { $("help").classList.remove("open"); ta.focus(); }
+    else if (e.key === "?" && document.activeElement !== ta) $("help").classList.add("open");
+  });
+}
+init();
+</script>
+</body>
+</html>

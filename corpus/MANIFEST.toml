@@ -14,6 +14,9 @@ path = "catalog"
 path = "packs"
 
 [[fixture]]
+path = "oracle"
+
+[[fixture]]
 path = "pairs/p01-move-stock"
 
 [[fixture]]

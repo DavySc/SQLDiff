@@ -1,0 +1,14 @@
+case = "p07-insert-return-id"
+pairs = [["tsql", "pg"]]
+observe = ["orders(order_id, customer_id, status)"]
+faults = ["orders"]
+seed = """
+INSERT INTO customer (customer_id, email, first_name, last_name, created_at)
+VALUES (1, 'ann@example.com', 'Ann', 'Archer', '2026-01-01 10:00:00');
+INSERT INTO orders (customer_id, status, created_at) VALUES (1, 'S', '2026-01-02 09:00:00');
+"""
+
+[[scenario]]
+name = "new order"
+call.tsql = "DECLARE @id int; EXEC dbo.create_order 1, @id OUTPUT; SELECT @id;"
+call.pg = "CALL create_order(1);"

@@ -1,0 +1,11 @@
+case = "m16-outdated-signature"
+pairs = [["original", "mutated"]]
+observe = ["stock(item_id, qty)", "stock_log(item_id, delta, reason)"]
+seed = """
+INSERT INTO item (item_id, name) VALUES (1, 'bolt');
+INSERT INTO stock (item_id, qty) VALUES (1, 10);
+"""
+
+[[scenario]]
+name = "write off"
+call = "EXEC dbo.write_off_stock 1, 3;"

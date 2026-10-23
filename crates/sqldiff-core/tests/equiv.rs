@@ -291,3 +291,32 @@ fn anti_join_delete_keeps_joined_table_columns_apart() {
         Verdict::Equal
     );
 }
+
+#[test]
+fn tsql_continues_after_a_failed_statement() {
+    let ts = |setting: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.create_order @Customer int, @OrderId int OUTPUT AS
+             BEGIN
+               {setting}
+               INSERT INTO dbo.orders (customer_id, created_at) VALUES (@Customer, SYSDATETIME());
+               SET @OrderId = SCOPE_IDENTITY();
+             END"
+        )
+    };
+    let pg = "CREATE PROCEDURE create_order(p_customer integer, INOUT p_order_id integer DEFAULT NULL)
+              LANGUAGE plpgsql AS $$
+              BEGIN
+                INSERT INTO orders (customer_id, created_at) VALUES (p_customer, statement_timestamp())
+                RETURNING order_id INTO p_order_id;
+              END; $$;";
+    let r = run(&ts(""), T, pg, P, true);
+    assert_eq!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert!(rules(&r).contains(&"equiv.error-continues"));
+    let r = run(&ts("SET XACT_ABORT ON;"), T, pg, P, true);
+    assert!(
+        !rules(&r).contains(&"equiv.error-continues"),
+        "{:?}",
+        rules(&r)
+    );
+}
