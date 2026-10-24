@@ -84,6 +84,12 @@ impl Redactor {
         }
     }
 
+    /// A name that is not SQL, such as a template parameter.
+    pub fn name(&mut self, n: &str) {
+        let Some(r) = &mut self.inner else { return };
+        r.add(Kind::Object, n);
+    }
+
     pub fn apply(&mut self, s: &str) -> String {
         let Some(r) = &mut self.inner else {
             return s.to_string();

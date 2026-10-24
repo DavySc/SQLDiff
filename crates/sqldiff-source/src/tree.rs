@@ -63,6 +63,42 @@ pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
     diff_with(a, b, cfg, &cfg.options())
 }
 
+/// One side read as a template: the template, its SQL fragment, the
+/// artifact the analyses read (the fragment's text, same path, dialect and
+/// version) and what decided which names are placeholders. The diff, the
+/// GUI's pair view, what-if, overlay and redaction all start from this, so
+/// they read the same SQL.
+pub struct TemplateArtifact {
+    pub template: sqldiff_syntax::template::Template,
+    pub fragment: sqldiff_syntax::template::Derived,
+    pub analysed: Artifact,
+    pub basis: sqldiff_core::composition::PlaceholderBasis,
+}
+
+impl TemplateArtifact {
+    pub fn new(
+        a: &Artifact,
+        known: Option<&BTreeSet<String>>,
+        placeholders: &Placeholders,
+    ) -> TemplateArtifact {
+        let (template, basis) = placeholders.parse(&a.text, a.dialect, known);
+        let fragment = template.fragment();
+        let mut analysed = a.clone();
+        analysed.text = fragment.text.clone();
+        TemplateArtifact {
+            template,
+            fragment,
+            analysed,
+            basis,
+        }
+    }
+
+    /// The way from fragment results back to the template.
+    pub fn side(&self) -> sqldiff_core::composition::TemplateSide<'_> {
+        sqldiff_core::composition::TemplateSide::new(&self.template, &self.fragment)
+    }
+}
+
 /// Template-level diff: the SQL fragments of two templates in the pack's
 /// `[template]` syntax, with locations and witnesses in the templates.
 ///
@@ -80,26 +116,25 @@ pub fn template_report(
     use sqldiff_core::composition::{remap_to_template, template_notes};
     use sqldiff_core::model::Side;
 
-    let (ta, basis_a) = placeholders.parse(&a.text, a.dialect, known[0]);
-    let (tb, basis_b) = placeholders.parse(&b.text, b.dialect, known[1]);
-    let (fa, fb) = (ta.fragment(), tb.fragment());
-    let mut xa = a.clone();
-    xa.text = fa.text.clone();
-    let mut xb = b.clone();
-    xb.text = fb.text.clone();
-    let mut r = sqldiff_core::diff(&xa, &xb, opts);
-    for (side, tpl, frag, art, basis) in [
-        (Side::A, &ta, &fa, a, basis_a),
-        (Side::B, &tb, &fb, b, basis_b),
-    ] {
-        remap_to_template(&mut r, side, tpl, frag, art.dialect, opts.excerpt_lines);
+    let ta = TemplateArtifact::new(a, known[0], placeholders);
+    let tb = TemplateArtifact::new(b, known[1], placeholders);
+    let mut r = sqldiff_core::diff(&ta.analysed, &tb.analysed, opts);
+    for (side, t, art) in [(Side::A, &ta, a), (Side::B, &tb, b)] {
+        remap_to_template(
+            &mut r,
+            side,
+            &t.template,
+            &t.fragment,
+            art.dialect,
+            opts.excerpt_lines,
+        );
         template_notes(
             &mut r,
             side,
-            tpl,
+            &t.template,
             &art.path,
             art.dialect,
-            basis,
+            t.basis,
             placeholders.delimiters(),
             opts.excerpt_lines,
         );

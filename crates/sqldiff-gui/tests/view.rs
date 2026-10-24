@@ -517,18 +517,34 @@ const TPL_B: &str = "update [TAB] set qty = 0;\n";
 /// A pack with the `[template]` syntax and two template files: `[TAB]` is a
 /// parameter; in T-SQL `[qty]` is a quoted column.
 fn template_dir(name: &str) -> (Resolved, std::path::PathBuf) {
+    template_pack(
+        name,
+        ("[", "]"),
+        [("upd.tsql.sql", TPL_A), ("upd.db2i.sql", TPL_B)],
+    )
+}
+
+/// A pack with these placeholder delimiters and two template files.
+fn template_pack(
+    name: &str,
+    (open, close): (&str, &str),
+    files: [(&str, &str); 2],
+) -> (Resolved, std::path::PathBuf) {
     use sqldiff_source::config::Sources;
     let dir = std::env::temp_dir().join(format!("sqldiff-gui-tpl-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("pack.toml"),
-        "[pack]\nname = \"t\"\nversion = \"1\"\n\n[template]\nopen = \"[\"\nclose = \"]\"\n\
-         name_pattern = \"[A-Z][A-Z0-9_]*\"\n",
+        format!(
+            "[pack]\nname = \"t\"\nversion = \"1\"\n\n[template]\nopen = {open:?}\nclose = {close:?}\n\
+             name_pattern = \"[A-Z][A-Z0-9_]*\"\n"
+        ),
     )
     .unwrap();
-    std::fs::write(dir.join("upd.tsql.sql"), TPL_A).unwrap();
-    std::fs::write(dir.join("upd.db2i.sql"), TPL_B).unwrap();
+    for (f, text) in files {
+        std::fs::write(dir.join(f), text).unwrap();
+    }
     let mut c = Resolved::load(&Sources {
         isolated: true,
         packs: vec![dir.clone()],
@@ -537,6 +553,30 @@ fn template_dir(name: &str) -> (Resolved, std::path::PathBuf) {
     .unwrap();
     c.data_dir = dir.join("data");
     (c, dir)
+}
+
+/// A template-mode session over the two files of [`template_pack`].
+fn templates_session(
+    name: &str,
+    delimiters: (&str, &str),
+    files: [(&str, &str); 2],
+    known: &[&str],
+) -> Session {
+    use sqldiff_gui::session::TemplateMode;
+    let (c, dir) = template_pack(name, delimiters, files);
+    let template = TemplateMode {
+        placeholders: sqldiff_source::tree::placeholders(&c).unwrap(),
+        known: Some(known.iter().map(|s| s.to_string()).collect()),
+    };
+    Session::open_with(
+        Origin::detect(dir.join(files[0].0), dir.join(files[1].0)),
+        None,
+        None,
+        c,
+        Some(template),
+        Store::in_memory(),
+    )
+    .unwrap()
 }
 
 fn template_session(name: &str, known: Option<&[&str]>) -> Session {
@@ -621,4 +661,142 @@ fn template_mode_without_parameters_uses_the_pack_rules() {
     );
     assert!(s.overlay(0).is_some());
     assert_eq!(pair_session().info().template, None);
+}
+
+/// p01 with its tables as `${…}` placeholders: each is a byte shorter than
+/// its stand-in (`TPL_LOG`), so fragment offsets drift from the template's.
+fn p01_templates() -> [String; 2] {
+    let corpus = format!(
+        "{}/../../corpus/pairs/p01-move-stock",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    ["tsql.sql", "pg.sql"].map(|f| {
+        std::fs::read_to_string(format!("{corpus}/{f}"))
+            .unwrap()
+            .replace("stock_log", "${LOG}")
+            .replace("stock SET", "${STOCK} SET")
+    })
+}
+
+/// A location's excerpt is what the template has at its offsets.
+fn in_template(loc: &sqldiff_core::model::Location, template: &str) {
+    let at = &template[loc.byte_start..loc.byte_end];
+    assert_eq!(
+        loc.excerpt.first().map(String::as_str),
+        at.lines().next().map(str::trim_end),
+        "{loc:?}"
+    );
+    let line_start = template[..loc.byte_start].rfind('\n').map_or(0, |i| i + 1);
+    assert_eq!(loc.start_col, loc.byte_start - line_start + 1, "{loc:?}");
+    assert_eq!(
+        loc.start_line,
+        template[..loc.byte_start].matches('\n').count() + 1
+    );
+}
+
+#[test]
+fn template_what_if_answers_in_template_lines_and_names() {
+    use sqldiff_core::ir::ErrorKind;
+    use sqldiff_core::model::Side;
+    let [ta, tb] = p01_templates();
+    let s = templates_session(
+        "whatif",
+        ("${", "}"),
+        [("move.tsql.sql", &ta), ("move.pg.sql", &tb)],
+        &["LOG", "STOCK"],
+    );
+    // Line 7 of the T-SQL template is the INSERT into the log table.
+    let w = s.what_if(0, Side::A, 7, ErrorKind::Constraint).unwrap();
+    assert_eq!(
+        w.scenario.statement.as_deref(),
+        Some("the INSERT into ${LOG}")
+    );
+    assert_eq!(w.scenario.line_a, Some(7));
+    assert!(!w.findings.is_empty());
+    let json = serde_json::to_string(&w).unwrap();
+    assert!(!json.contains("TPL_"), "{json}");
+    for f in &w.findings {
+        for loc in [&f.a, &f.b].into_iter().flatten() {
+            in_template(loc, if loc.side == Side::A { &ta } else { &tb });
+        }
+    }
+    // The same finding in the pair view sits at the same place.
+    let p = s.payload(0, true).unwrap();
+    for f in &w.findings {
+        if let Some(g) = p
+            .report
+            .findings
+            .iter()
+            .find(|g| g.fingerprint == f.fingerprint)
+        {
+            assert_eq!(
+                f.a.as_ref().map(|l| (l.byte_start, l.byte_end)),
+                g.a.as_ref().map(|l| (l.byte_start, l.byte_end))
+            );
+        }
+    }
+    // Brackets are in template lines too: BEGIN TRAN on line 4.
+    let o = s.overlay(0).unwrap();
+    assert!(o.a.iter().any(|b| b.start_line == 4), "{:?}", o.a);
+    assert!(!serde_json::to_string(&o).unwrap().contains("TPL_"));
+}
+
+#[test]
+fn redacted_template_report_hides_names_between_dollar_placeholders() {
+    // As SQL, `$TAB$ … $ID$` is a dollar-quoted string: the names inside it
+    // must still be known to the redactor.
+    let a = "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS 'UPDATE x SET y = 1';\n\
+             UPDATE $TAB$ SET secretcol = 0 WHERE $ID$ = 1;\n";
+    let b = "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS 'UPDATE x SET y = 1';\n\
+             UPDATE $TAB$ SET secretcol = 1, hiddencol = 2 WHERE $ID$ = 1;\n";
+    let s = templates_session(
+        "redact",
+        ("$", "$"),
+        [("upd.pg.sql", a), ("upd2.pg.sql", b)],
+        &["TAB", "ID"],
+    );
+    let plain = s.session_report(false).unwrap();
+    assert!(plain.contains("hiddencol"), "{plain}");
+    let red = s.session_report(true).unwrap();
+    for leak in ["secretcol", "hiddencol", "TAB$", "$ID"] {
+        assert!(!red.contains(leak), "{leak} leaked:\n{red}");
+    }
+}
+
+#[test]
+fn template_pair_view_blocks_follow_the_fragment() {
+    // Parsed raw, `$T$ set a = 1;\nupdate $T$` is one dollar-quoted string:
+    // the first two statements would run together into one block.
+    let a = "update $T$ set a = 1;\nupdate $T$ set b = 2;\nupdate $U$ set c = 3;\n";
+    let b = "update $T$ set a = 1;\nupdate $T$ set b = 5;\nupdate $U$ set c = 3;\n";
+    let s = templates_session(
+        "blocks",
+        ("$", "$"),
+        [("v.pg.sql", a), ("w.pg.sql", b)],
+        &["T", "U"],
+    );
+    let p = s.payload(0, true).unwrap();
+    // One block per statement, shown in the template's own text.
+    assert_eq!(p.view.rows.len(), 3, "{:#?}", p.view.rows);
+    let all: String = p.view.rows.iter().map(|r| text(r, true)).collect();
+    assert_eq!(all, a);
+    let all: String = p.view.rows.iter().map(|r| text(r, false)).collect();
+    assert_eq!(all, b);
+    assert_eq!(p.sources, [a.to_string(), b.to_string()]);
+    let kinds: Vec<RowKind> = p.view.rows.iter().map(|r| r.kind).collect();
+    assert_eq!(kinds, [RowKind::Same, RowKind::Changed, RowKind::Same]);
+    // Every finding sits in the block of its statement: the second.
+    assert!(!p.report.findings.is_empty());
+    for (i, r) in p.view.rows.iter().enumerate() {
+        for blk in [&r.a, &r.b].into_iter().flatten() {
+            if i == 1 {
+                assert!(!blk.findings.is_empty(), "{blk:?}");
+            } else {
+                assert!(blk.findings.is_empty(), "{blk:?}");
+            }
+        }
+    }
+    // Edits re-diff the same way.
+    let e = s.scratch(0, a.into(), b.into()).unwrap();
+    assert_eq!(e.view.rows.len(), 3);
 }

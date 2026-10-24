@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use sqldiff_core::ir::behaviour::RERUN_ASSUMPTIONS;
 use sqldiff_core::model::AssumptionSource;
 use sqldiff_core::{Artifact, ChangeClass, Dialect, Report, Severity, Verdict};
-use sqldiff_source::tree::{self, Ambiguous, Tree, TreePair};
+use sqldiff_source::tree::{self, Ambiguous, TemplateArtifact, Tree, TreePair};
 use sqldiff_source::{LayerRef, Resolved};
 
 use crate::review::{self, time, Decision, State, Store};
-use crate::{build_view, Payload};
+use crate::{build_view, build_view_on, Payload};
 
 /// What the session compares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -256,20 +256,23 @@ impl Session {
         }
     }
 
-    /// The texts the analyses read: in template mode each side's SQL
-    /// fragment (placeholders as identifiers on the same lines), else the
-    /// sides as they are.
-    fn analysed(&self, a: &Artifact, b: &Artifact) -> (Artifact, Artifact) {
-        let fragment = |x: &Artifact| match &self.template {
-            Some(t) => {
-                let (tpl, _) = t.placeholders.parse(&x.text, x.dialect, t.known.as_ref());
-                let mut f = x.clone();
-                f.text = tpl.fragment().text;
-                f
+    /// In template mode, both sides read as templates: what the analyses
+    /// read (the SQL fragments) and the way back to the templates.
+    fn templates(&self, a: &Artifact, b: &Artifact) -> Option<[TemplateArtifact; 2]> {
+        let t = self.template.as_ref()?;
+        let side = |x| TemplateArtifact::new(x, t.known.as_ref(), &t.placeholders);
+        Some([side(a), side(b)])
+    }
+
+    /// The pair view of `a` and `b` over `report`: in template mode, blocks
+    /// from the fragments the engine diffed, shown in the templates.
+    fn view(&self, a: &Artifact, b: &Artifact, report: Report, live: bool) -> Payload {
+        match self.templates(a, b) {
+            Some([ta, tb]) => {
+                build_view_on(a, b, [Some(&ta.fragment), Some(&tb.fragment)], report, live)
             }
-            None => x.clone(),
-        };
-        (fragment(a), fragment(b))
+            None => build_view(a, b, report, live),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -338,7 +341,7 @@ impl Session {
     pub fn payload(&self, i: usize, live: bool) -> Option<Payload> {
         let l = self.pairs.get(i)?;
         let (a, b) = l.sides.as_ref()?;
-        let mut p = build_view(a, b, self.report(i)?, live);
+        let mut p = self.view(a, b, self.report(i)?, live);
         p.index = i;
         let now = time::now();
         p.review = p
@@ -366,23 +369,34 @@ impl Session {
         line: usize,
         kind: sqldiff_core::ir::ErrorKind,
     ) -> Option<sqldiff_core::ir::witness::WhatIf> {
+        use sqldiff_core::composition::remap_what_if;
+        use sqldiff_core::model::Side;
         let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
-        let (a, b) = self.analysed(a, b);
-        Some(sqldiff_core::what_if(
-            &a,
-            &b,
-            &self.options(),
-            side,
-            line,
-            kind,
-        ))
+        let opts = self.options();
+        let Some([ta, tb]) = self.templates(a, b) else {
+            return Some(sqldiff_core::what_if(a, b, &opts, side, line, kind));
+        };
+        // The asked line is a template line; the engine reads the fragment.
+        let (sa, sb) = (ta.side(), tb.side());
+        let asked = if side == Side::A { &sa } else { &sb };
+        let line = asked.fragment_line(line);
+        let mut w = sqldiff_core::what_if(&ta.analysed, &tb.analysed, &opts, side, line, kind);
+        remap_what_if(&mut w, Side::A, &sa, opts.excerpt_lines);
+        remap_what_if(&mut w, Side::B, &sb, opts.excerpt_lines);
+        Some(w)
     }
 
     /// Transaction brackets of both sides of pair `i`.
     pub fn overlay(&self, i: usize) -> Option<sqldiff_core::ir::overlay::Overlay> {
+        use sqldiff_core::composition::remap_brackets;
         let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
-        let (a, b) = self.analysed(a, b);
-        Some(sqldiff_core::overlay(&a, &b))
+        let Some([ta, tb]) = self.templates(a, b) else {
+            return Some(sqldiff_core::overlay(a, b));
+        };
+        let mut o = sqldiff_core::overlay(&ta.analysed, &tb.analysed);
+        remap_brackets(&mut o.a, &ta.side());
+        remap_brackets(&mut o.b, &tb.side());
+        Some(o)
     }
 
     /// Scratchpad texts diffed as pair `i` (same paths, dialects and versions).
@@ -392,7 +406,7 @@ impl Session {
         a.text = ta;
         b.text = tb;
         let opts = self.scenario_options(&self.flip_map());
-        let mut p = build_view(&a, &b, self.flipped(self.diff(&a, &b, &opts)), true);
+        let mut p = self.view(&a, &b, self.flipped(self.diff(&a, &b, &opts)), true);
         p.index = i;
         // Decisions belong to the files on disk: show them for the findings the edit still has.
         let disk = sqldiff_review::snapshot(self.pairs[i].base.as_ref()?);
@@ -633,8 +647,22 @@ impl Session {
             red.path(&l.pair.id_a);
             red.path(&l.pair.id_b);
             if let Some((a, b)) = &l.sides {
-                red.source(&a.text, a.dialect);
-                red.source(&b.text, b.dialect);
+                match self.templates(a, b) {
+                    // Placeholder syntax is not SQL (`$T$` would read as a
+                    // dollar quote): the names are in the fragment.
+                    Some(ts) => {
+                        for t in &ts {
+                            red.source(&t.fragment.text, t.analysed.dialect);
+                            for name in t.template.parameters() {
+                                red.name(&name);
+                            }
+                        }
+                    }
+                    None => {
+                        red.source(&a.text, a.dialect);
+                        red.source(&b.text, b.dialect);
+                    }
+                }
             }
             if let Some(r) = &l.base {
                 red.report(r);

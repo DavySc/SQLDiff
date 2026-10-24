@@ -12,6 +12,7 @@
 
 use serde::Serialize;
 use sqldiff_core::{Artifact, Options, Report};
+use sqldiff_syntax::template::Derived;
 use sqldiff_syntax::{ast, parse, LineIndex, SyntaxElement, SyntaxKind, SyntaxNode};
 
 pub mod convert;
@@ -89,8 +90,25 @@ pub fn build(a: &Artifact, b: &Artifact, opts: &Options, live: bool) -> Payload 
 
 /// The pair view over a report already made for these artifacts.
 pub fn build_view(a: &Artifact, b: &Artifact, report: Report, live: bool) -> Payload {
-    let mut ba = blocks(&a.text, a.dialect);
-    let mut bb = blocks(&b.text, b.dialect);
+    build_view_on(a, b, [None, None], report, live)
+}
+
+/// [`build_view`] where a side is a template: its blocks come from the SQL
+/// fragment the engine diffed (`fragment`), shown in the template's text,
+/// so findings (in template offsets) attach to the statement they are in.
+pub fn build_view_on(
+    a: &Artifact,
+    b: &Artifact,
+    fragment: [Option<&Derived>; 2],
+    report: Report,
+    live: bool,
+) -> Payload {
+    let side = |x: &Artifact, f: Option<&Derived>| match f {
+        Some(f) => onto_template(blocks(&f.text, x.dialect), f, &x.text),
+        None => blocks(&x.text, x.dialect),
+    };
+    let mut ba = side(a, fragment[0]);
+    let mut bb = side(b, fragment[1]);
     attach_findings(&mut ba, &report, true);
     attach_findings(&mut bb, &report, false);
     let rows = align(ba, bb);
@@ -398,6 +416,59 @@ fn blocks(text: &str, dialect: sqldiff_syntax::Dialect) -> Vec<Block> {
             key,
             tok_keys,
         });
+    }
+    out
+}
+
+/// Blocks of a template's fragment, moved onto the template: block ranges,
+/// lines and segment texts in the template (a stand-in shows as the
+/// placeholder it stands for), comparison keys as the fragment has them.
+fn onto_template(blocks: Vec<Block>, fragment: &Derived, template: &str) -> Vec<Block> {
+    let li = LineIndex::new(template);
+    let mut cursor = 0;
+    let mut out = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        let start = fragment.map.to_src(b.range.0).max(cursor);
+        let end = fragment.map.to_src(b.range.1).max(start);
+        let mut segs = Vec::with_capacity(b.segs.len());
+        // Where each fragment segment went, for the token keys.
+        let mut moved = Vec::with_capacity(b.segs.len());
+        let mut at = start;
+        let mut fs = b.range.0;
+        for (text, style, mark) in b.segs {
+            let fe = fs + text.len();
+            let (s, e) = fragment.map.src_range(fs, fe);
+            let (s, e) = (s.max(at), e.min(end).max(s.max(at)));
+            if s > at {
+                segs.push((template[at..s].to_string(), "ws", 0));
+            }
+            moved.push(segs.len());
+            segs.push((template[s..e].to_string(), style, mark));
+            at = e;
+            fs = fe;
+        }
+        if end > at {
+            segs.push((template[at..end].to_string(), "ws", 0));
+        }
+        let lines = (
+            li.line_col(start).0,
+            li.line_col(end.max(start + 1) - 1)
+                .0
+                .max(li.line_col(start).0),
+        );
+        out.push(Block {
+            lines,
+            segs,
+            findings: Vec::new(),
+            range: (start, end),
+            key: b.key,
+            tok_keys: b
+                .tok_keys
+                .into_iter()
+                .map(|(i, k, u)| (moved[i], k, u))
+                .collect(),
+        });
+        cursor = end;
     }
     out
 }
