@@ -7,8 +7,8 @@
 //! guessed silently: a construct without a rule is kept as a commented-out
 //! block and marked "not converted".
 //!
-//! Supported today: T-SQL → PostgreSQL (token-level rules over the lossless
-//! CST; see `tsql_pg`). Expression-level and behavioural conversion follow
+//! Supported today: T-SQL → PostgreSQL and T-SQL → Db2 for i (token-level
+//! rules over the lossless CST; see `tsql`). Expression-level and behavioural conversion follow
 //! once expression trees and the semantic IR land.
 
 use serde::Serialize;
@@ -17,7 +17,7 @@ use sqldiff_syntax::{parse, LineIndex};
 
 mod out;
 mod tok;
-mod tsql_pg;
+mod tsql;
 
 /// How far a converted unit can be trusted, from best to worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -108,20 +108,26 @@ pub struct Conversion {
 
 /// Dialect pairs with rules.
 pub fn supported(from: Dialect, to: Dialect) -> bool {
-    matches!((from, to), (Dialect::Tsql, Dialect::Postgres))
+    matches!(
+        (from, to),
+        (Dialect::Tsql, Dialect::Postgres) | (Dialect::Tsql, Dialect::Db2i)
+    )
 }
 
 /// Convert `text` from one dialect to another and check the result.
 pub fn convert(text: &str, from: Dialect, to: Dialect) -> Result<Conversion, String> {
-    if !supported(from, to) {
-        return Err(format!(
-            "no conversion rules from {} to {} yet (supported: T-SQL to PostgreSQL)",
+    let raw = match (from, to) {
+        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
+            tsql::convert(&parse(text, from).syntax(), text, to)
+        }
+        _ => {
+            return Err(format!(
+            "no conversion rules from {} to {} yet (supported: T-SQL to PostgreSQL or Db2 for i)",
             from.display_name(),
             to.display_name()
-        ));
-    }
-    let root = parse(text, from).syntax();
-    let raw = tsql_pg::convert(&root, text);
+        ))
+        }
+    };
     Ok(verify(text, from, to, raw))
 }
 
