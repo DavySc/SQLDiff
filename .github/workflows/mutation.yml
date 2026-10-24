@@ -1,0 +1,41 @@
+name: mutation
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ext
+          key: mutation-sources-${{ hashFiles('eval/mutation/sources.json') }}
+      - run: cargo build --release -p sqldiff-cli
+      - name: Fetch pinned sources
+        run: python3 eval/mutation/mutate.py fetch "$RUNNER_TEMP/ext"
+      - name: Generate cases
+        run: |
+          python3 eval/mutation/mutate.py gen tsql "$RUNNER_TEMP/ext" "$RUNNER_TEMP/cases/tsql"
+          python3 eval/mutation/mutate.py gen pg "$RUNNER_TEMP/ext" "$RUNNER_TEMP/cases/pg"
+      - name: Run sqldiff on every case
+        run: |
+          mkdir -p results
+          python3 eval/mutation/mutate.py run "$RUNNER_TEMP/cases/tsql" results/tsql.json
+          python3 eval/mutation/mutate.py run "$RUNNER_TEMP/cases/pg" results/pg.json
+      - name: Gate
+        run: python3 eval/mutation/mutate.py gate results/tsql.json results/pg.json --min 0.80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-results
+          path: results/

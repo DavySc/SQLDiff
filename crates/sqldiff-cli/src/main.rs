@@ -15,6 +15,8 @@ use sqldiff_syntax::template::{ExpandProblem, SegmentKind};
 use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
 
+mod changes_cmd;
+mod convert_cmd;
 mod deny_hash;
 mod queue_cmd;
 mod review_cmd;
@@ -154,6 +156,41 @@ enum Command {
         #[command(flatten)]
         review: ReviewArgs,
     },
+    /// Convert a source tree (or one file) into another dialect: an output
+    /// tree with the same layout, checked statement by statement, and a
+    /// report (`conversion-report.json` and `.md` in the output directory).
+    ///
+    /// A unit counts as converted only when its rules needed no assumption
+    /// and neither the engine's diff nor the output's own check (binding,
+    /// leftover source syntax, target limits) finds anything in it. Every
+    /// other unit gets a `-- [sqldiff: <status>]` comment line in the output.
+    /// Exit code 0 when every file is converted or converted under
+    /// assumptions, 1 otherwise.
+    Convert {
+        src: PathBuf,
+        /// Output directory (created; must be empty unless --overwrite).
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long, default_value = "tsql")]
+        from: Dialect,
+        #[arg(long)]
+        to: Dialect,
+        /// Parallel jobs (default: available cores).
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// Replace files in a non-empty output directory.
+        #[arg(long)]
+        overwrite: bool,
+        /// Check each file alone, without catalogs built from the whole tree.
+        #[arg(long)]
+        no_catalog: bool,
+    },
+    /// Review what a branch changed (the pull request workflow): diff every
+    /// SQL file changed between the merge base of --base and --head, base
+    /// against head. Files that did not change are not read. SARIF results
+    /// are located at the head revision; --markdown writes the pull request
+    /// comment.
+    Changes(changes_cmd::ChangesArgs),
     /// Review decisions: accept, reject or comment on findings by fingerprint.
     #[command(subcommand)]
     Review(review_cmd::ReviewCommand),
@@ -438,6 +475,24 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             format,
             Pipeline::new(cfg.resolve()?, &review)?,
         ),
+        Command::Convert {
+            src,
+            out,
+            from,
+            to,
+            jobs,
+            overwrite,
+            no_catalog,
+        } => convert_cmd::run(convert_cmd::Args {
+            src,
+            out,
+            from,
+            to,
+            jobs,
+            overwrite,
+            no_catalog,
+        }),
+        Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),
         Command::Queue(cmd) => queue_cmd::run(cmd),
@@ -501,7 +556,15 @@ fn tree(
         .iter()
         .map(|p| t.read(p, cfg).map_err(|e| e.0))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut reports = run_pairs(&pipe, &sides, &opts);
+    let frag = |f: Option<&str>| f.map(|f| format!("#{f}")).unwrap_or_default();
+    let mut reports: Vec<_> = run_pairs(&pipe, &sides, &opts)
+        .into_iter()
+        .zip(&t.pairs)
+        .map(|(r, p)| {
+            let (fa, fb) = p.fragments();
+            (r, [frag(fa), frag(fb)])
+        })
+        .collect();
     let (only_a, only_b) = (t.only_a, t.only_b);
     let ambiguous: Vec<serde_json::Value> = t
         .ambiguous
@@ -510,13 +573,15 @@ fn tree(
         .collect();
     let no_dialect = t.no_dialect;
     // Most severe first.
-    reports.sort_by_key(|r| {
+    reports.sort_by_key(|(r, _)| {
         std::cmp::Reverse((
             r.open_verdict(),
             r.findings.iter().map(|f| f.severity).max(),
             r.findings.len(),
         ))
     });
+    // Which object of a file with several each pair row compares.
+    let (reports, fragments): (Vec<_>, Vec<_>) = reports.into_iter().unzip();
     let worst = reports
         .iter()
         .map(|r| r.open_verdict())
@@ -525,6 +590,11 @@ fn tree(
     if pipe.redacting() {
         let mut paths: Vec<String> = vec![dir_a.display().to_string(), dir_b.display().to_string()];
         paths.extend(only_a.iter().chain(&only_b).chain(&no_dialect).cloned());
+        let objects = fragments
+            .iter()
+            .flatten()
+            .filter_map(|f| f.strip_prefix('#'));
+        paths.extend(objects.map(str::to_string));
         for a in &ambiguous {
             for id in a["ids"].as_array().into_iter().flatten() {
                 paths.extend(id.as_str().map(str::to_string));
@@ -542,6 +612,7 @@ fn tree(
         "ambiguous": ambiguous,
         "no_dialect": no_dialect,
         "provenance": cfg.layers,
+        "fragments": fragments,
     });
     pipe.redact_json(&mut extra)?;
     let strings = |v: &serde_json::Value| -> Vec<String> {
@@ -578,16 +649,19 @@ fn tree(
                 "{:<26} {:<14} {:>8}  pair",
                 "verdict", "highest", "findings"
             );
-            for r in &reports {
+            for (i, r) in reports.iter().enumerate() {
                 let b = r.b.as_ref().map(|b| b.path.as_str()).unwrap_or("");
+                let frag = |side: usize| extra["fragments"][i][side].as_str().unwrap_or("");
                 let _ = writeln!(
                     out,
-                    "{:<26} {:<14} {:>8}  {} ↔ {}",
+                    "{:<26} {:<14} {:>8}  {}{} ↔ {}{}",
                     r.verdict.label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
                     r.findings.len(),
                     r.a.path,
-                    b
+                    frag(0),
+                    b,
+                    frag(1)
                 );
             }
             for p in &only_a {

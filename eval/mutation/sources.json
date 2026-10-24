@@ -1,0 +1,41 @@
+{
+  "repos": {
+    "sql-server-samples": {
+      "url": "https://github.com/microsoft/sql-server-samples",
+      "sha": "348bbbc25079785f93ea74be3dd0d6369a59358f",
+      "sparse": ["samples/databases/wide-world-importers"]
+    },
+    "pg_partman": {
+      "url": "https://github.com/pgpartman/pg_partman",
+      "sha": "63d0a6f04256efaa866f06c36c3b0cce07786146"
+    },
+    "sql-server-maintenance-solution": {
+      "url": "https://github.com/olahallengren/sql-server-maintenance-solution",
+      "sha": "41617578643e722b790ea4d57ef80f8de38ae747"
+    },
+    "pgmq": {
+      "url": "https://github.com/pgmq/pgmq",
+      "sha": "8efb078dbe7afe16c83be72e9fffefbb03ebd9e9"
+    }
+  },
+  "sets": {
+    "tsql": {
+      "dialect": "tsql",
+      "repo": "sql-server-samples",
+      "root": "samples/databases/wide-world-importers",
+      "include": ["wwi-ssdt", "wwi-dw-ssdt", "sample-scripts", "workload-drivers"],
+      "catalogs": {"wwi-dw-ssdt": "wwi-dw-ssdt/**/Tables/*.sql", "*": "wwi-ssdt/**/Tables/*.sql"},
+      "files": 80,
+      "seed": 7
+    },
+    "pg": {
+      "dialect": "postgres",
+      "repo": "pg_partman",
+      "root": "sql",
+      "include": ["functions", "procedures", "tables"],
+      "catalogs": {"*": "tables/*.sql"},
+      "files": 80,
+      "seed": 7
+    }
+  }
+}

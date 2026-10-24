@@ -10,7 +10,10 @@
 pub mod ast;
 pub mod canon;
 pub mod compare;
+pub mod edit;
+pub mod eval;
 pub mod lower;
+pub mod options;
 pub mod schema;
 pub mod term;
 
@@ -107,6 +110,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
             asm: std::mem::take(&mut c.asm),
             disc: std::mem::take(&mut c.discharged),
             err,
+            names: std::mem::take(&mut c.names),
         });
     }
     c.reset();
@@ -145,6 +149,9 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         }
     }
     signature(&ua, &ub, &na, &nb, &mut out);
+    for x in ua.assumptions.iter().chain(&ub.assumptions) {
+        out.assume(x.clone());
+    }
     if ua.txn_control || ub.txn_control {
         out.assume(asm::make(asm::NO_CALLER_TXN));
     }
@@ -164,6 +171,8 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
             }
         }
     }
+    let touches = ia.iter().chain(&ib).any(|it| !it.names.is_empty());
+    security(a, b, &ua, &ub, touches, &mut out);
     pair_items(a, b, &ia, &ib, &mut out);
     error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
     out
@@ -271,6 +280,102 @@ fn error_continues(
     out.assume(asm);
 }
 
+/// Compares whose privileges the statements run with. Matching contexts
+/// still need an assumption about the privileges themselves; an owner's
+/// context against a caller's is a difference for any caller that may run
+/// the routine but not touch its tables, the usual reason for the option.
+fn security(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, touches: bool, out: &mut Outcome) {
+    use lower::Security::{Caller, Naming, Owner};
+    use sqldiff_syntax::Dialect::Tsql;
+    let routine = |u: &Unit| !matches!(u.kind, UnitKind::View | UnitKind::Script);
+    if !routine(ua) || !routine(ub) {
+        return;
+    }
+    let tsql = ua.dialect == Tsql || ub.dialect == Tsql;
+    let (na, nb) = (side_name(a), side_name(b));
+    let cite = |u: &Unit| match &u.security_cite {
+        Some((text, _)) => text.clone(),
+        None => match (u.dialect, u.security) {
+            (_, Naming) => "no SET OPTION USRPRF".to_string(),
+            (Tsql, _) => "EXECUTE AS CALLER, the default".to_string(),
+            _ => "SECURITY INVOKER, the default".to_string(),
+        },
+    };
+    // Privileges matter only to statements that use tables.
+    match (ua.security, ub.security) {
+        _ if ua.security == ub.security && !touches => {}
+        (Caller, Caller) => {
+            if tsql {
+                out.assume(asm::make(asm::OWNERSHIP_CHAIN));
+            }
+        }
+        (Owner, Owner) => out.assume(asm::make(asm::OWNER_PRIVILEGES)),
+        (Naming, Caller) | (Caller, Naming) if !touches => {}
+        (Naming, Caller) | (Caller, Naming) => {
+            out.assume(asm::make(asm::DB2_USRPRF_USER));
+            if tsql {
+                out.assume(asm::make(asm::OWNERSHIP_CHAIN));
+            }
+        }
+        (Naming, Owner) | (Owner, Naming) => {
+            let (owner, oname) = if ua.security == Owner {
+                (ua, &na)
+            } else {
+                (ub, &nb)
+            };
+            out.unknown_reasons.push(format!(
+                "{oname} runs with the owner's privileges ({}) and the Db2 for i side states no SET OPTION USRPRF, so its authority depends on the naming convention it was created with",
+                cite(owner)
+            ));
+        }
+        (Owner, Caller) | (Caller, Owner) => {
+            let owner_is_a = ua.security == Owner;
+            let (owner, caller, oname, cname) = if owner_is_a {
+                (ua, ub, &na, &nb)
+            } else {
+                (ub, ua, &nb, &na)
+            };
+            if caller.dialect == Tsql {
+                out.unknown_reasons.push(format!(
+                    "{oname} runs with the owner's privileges ({}); {cname} checks the caller's ({}) except along T-SQL ownership chains, so which calls fail a permission check depends on who owns the objects",
+                    cite(owner),
+                    cite(caller)
+                ));
+                return;
+            }
+            let witness = format!(
+                "A caller that may run the routine but holds no privileges of its own on the objects it uses: {oname} runs the statements with the owner's privileges ({}) and succeeds, {cname} checks the caller's privileges ({}) and fails with a permission error. Functions that report the current user differ too.",
+                cite(owner),
+                cite(caller)
+            );
+            let loc = |side: &Analyzed, u: &Unit| {
+                let (s, e) = u.security_cite.as_ref().map(|c| c.1).unwrap_or(u.header_at);
+                side.location(s, e)
+            };
+            let rule = "equiv.security-context";
+            let class = ChangeClass::Semantic;
+            out.findings.push(Finding {
+                fingerprint: fingerprint(&FingerprintInput {
+                    object: &a.object,
+                    class,
+                    rule,
+                    anchor_a: &format!("{:?}", ua.security),
+                    anchor_b: &format!("{:?}", ub.security),
+                }),
+                rule: rule.to_string(),
+                class,
+                severity: class.default_severity(),
+                verdict: Verdict::Different,
+                witness,
+                a: Some(loc(a, ua)),
+                b: Some(loc(b, ub)),
+                assumptions: Vec::new(),
+            });
+        }
+        (Naming, Naming) => {}
+    }
+}
+
 fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
     let result_kind = |k: UnitKind| matches!(k, UnitKind::View | UnitKind::TableFn);
     if ua.kind != ub.kind && !(result_kind(ua.kind) && result_kind(ub.kind)) {
@@ -369,6 +474,35 @@ fn pair_items(a: &Analyzed, b: &Analyzed, ia: &[Item], ib: &[Item], out: &mut Ou
     }
 }
 
+/// What matching the two statements' table names relies on. Across
+/// dialects: case folding, and default schemas mapping to each other. In one
+/// dialect: only a default schema written on one side and left out on the
+/// other (`dbo.t` against `t`).
+fn name_assumptions(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item) -> Vec<Assumption> {
+    let mut v = Vec::new();
+    let defaults = |it: &Item| -> Vec<(String, String)> {
+        it.names
+            .iter()
+            .filter_map(|(k, d)| d.clone().map(|d| (k.clone(), d)))
+            .collect()
+    };
+    let (dx, dy) = (defaults(x), defaults(y));
+    if a.dialect() != b.dialect() {
+        if !x.names.is_empty() || !y.names.is_empty() {
+            v.push(asm::make(asm::IDENT_FOLD));
+        }
+        if !dx.is_empty() || !dy.is_empty() {
+            v.push(asm::make(asm::DEFAULT_SCHEMA));
+        }
+    } else if dx
+        .iter()
+        .any(|(k, d)| dy.iter().any(|(k2, d2)| k == k2 && d != d2))
+    {
+        v.push(asm::make(asm::DEFAULT_SCHEMA));
+    }
+    v
+}
+
 fn compare_pair(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item, out: &mut Outcome) {
     let (na, nb) = (side_name(a), side_name(b));
     let la = location(a, &x.nodes);
@@ -421,6 +555,11 @@ fn compare_pair(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item, out: &mut Outcom
     }
     let c = compare::compare(&x.term, &y.term);
     let mut asms: Vec<Assumption> = x.asm.clone();
+    for s in name_assumptions(a, b, x, y) {
+        if !asms.iter().any(|z| z.id == s.id) {
+            asms.push(s);
+        }
+    }
     for s in y.asm.iter().chain(c.assumptions.iter()) {
         if !asms.iter().any(|z| z.id == s.id) {
             asms.push(s.clone());
@@ -493,6 +632,20 @@ fn compare_pair(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item, out: &mut Outcom
     );
 }
 
+/// Declared types of the `DECLARE` statements behind an item, in order.
+fn declared_types(it: &Item, side: &Analyzed) -> Vec<Option<ast::Type>> {
+    it.nodes
+        .iter()
+        .filter_map(|n| match ast::parse_stmt(&ast::tokens(n), side.dialect()) {
+            Ok(ast::Stmt::Declare { ty, .. }) => Some(ty.map(|t| ast::Type {
+                name: t.name.to_ascii_uppercase(),
+                args: t.args,
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Same dialect: re-examines statements the structural diff could only call
 /// "modified". Equal ones are dropped (counted as structural), and ones with a
 /// known behavioural difference become "different" with a witness.
@@ -536,8 +689,36 @@ pub fn refine_modified(
             keep.push(f);
             continue;
         };
+        if declared_types(&ia[i], a) != declared_types(&ib[j], b) {
+            // The terms leave out the declared type, which converts the value.
+            keep.push(f);
+            continue;
+        }
         let mut sub = Outcome::default();
         compare_pair(a, b, &ia[i], &ib[j], &mut sub);
+        if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
+            eprintln!(
+                "A: {}{}",
+                ia[i].term,
+                ia[i]
+                    .err
+                    .as_ref()
+                    .map(|e| format!("  [{e}]"))
+                    .unwrap_or_default()
+            );
+            eprintln!(
+                "B: {}{}",
+                ib[j].term,
+                ib[j]
+                    .err
+                    .as_ref()
+                    .map(|e| format!("  [{e}]"))
+                    .unwrap_or_default()
+            );
+            for g in &sub.findings {
+                eprintln!("=> {} {:?} {}", g.rule, g.verdict, g.witness);
+            }
+        }
         if sub.findings.is_empty() {
             out.structural += 1;
             for s in sub.assumptions {

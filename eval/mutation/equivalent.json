@@ -1,0 +1,13 @@
+{
+  "tsql": {
+    "wwi-ssdt/wwi-ssdt/Application/Stored Procedures/Configuration_RemoveColumnstoreIndexing.sql:literal:78:31": "EXISTS (SELECT 1 ...) -> EXISTS (SELECT 2 ...): EXISTS only tests whether a row exists; the select list is never evaluated.",
+    "wwi-ssdt/wwi-ssdt/DataLoadSimulation/Stored Procedures/ReactivateTemporalTablesAfterDataLoad.sql:literal:7:23": "EXISTS (SELECT 1 ...) -> EXISTS (SELECT 2 ...): the select list of EXISTS is never evaluated.",
+    "wwi-ssdt/wwi-ssdt/Application/Stored Procedures/AddRoleMemberIfNonexistent.sql:literal:11:27": "NOT EXISTS (SELECT 1 ...) -> NOT EXISTS (SELECT 2 ...): the select list of EXISTS is never evaluated.",
+    "wwi-ssdt/wwi-ssdt/Sequences/Stored Procedures/ReseedSequenceBeyondTableValues.sql:literal:31:133": "CAST(@NewSequenceValue AS nvarchar(20)) -> nvarchar(21) where @NewSequenceValue is bigint: the longest bigint text, -9223372036854775808, has 20 characters (checked on SQL Server 2022: LEN = 20, no error), so both casts give the same text and the result is concatenated into an nvarchar(max) string.",
+    "wwi-dw-ssdt/wwi-dw-ssdt/Sequences/Stored Procedures/ReseedSequenceBeyondTableValues.sql:literal:31:133": "Same procedure as in wwi-ssdt: a bigint always fits in nvarchar(20).",
+    "wwi-ssdt/wwi-ssdt/Integration/Stored Procedures/GetOrderUpdates.sql:relop_gt:29:40": "CASE WHEN a > b THEN a ELSE b END -> CASE WHEN a >= b THEN a ELSE b END: when a = b both branches give the same value, and when either is NULL both conditions are unknown and both give b."
+  },
+  "pg": {
+    "functions/partition_data_id.sql:literal:28:36": "v_lock_iter int := 1 -> := 2: the only other uses (lines 177-179) assign v_lock_iter := 0 before reading it, so the initial value is never read."
+  }
+}

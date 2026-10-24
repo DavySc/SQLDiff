@@ -49,7 +49,10 @@ does not call the rest.
 `postgres`, `db2i`, or absent when unknown), `version`, `name` (used for
 pairing), `content_hash` (normalized SHA-256, see the bundle format),
 `bytes`, `last_changed` (RFC 3339), `stale` (generated output older than its
-inputs; verdicts that depend on it are capped at *unknown*).
+inputs; verdicts that depend on it are capped at *unknown*), optional
+`defines` (the one table, view or routine the text defines, as
+`relation:schema.name` or `routine:schema.name`, lower case, schema empty when
+unqualified; see "Files with several objects" in cross-dialect-proofs.md).
 
 **ArtifactChunk**: `info`, `provenance` (`author_kind`: `human`,
 `generated` or `unknown`; `author`, `time`, `revision`), `metadata`, optional

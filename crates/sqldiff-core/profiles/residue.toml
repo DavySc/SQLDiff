@@ -232,3 +232,38 @@ origin = "db2i"
 targets = ["tsql", "postgres"]
 message = "Db2 `FINAL TABLE`"
 pattern = ["word:FINAL|NEW|OLD", "word:TABLE", "text:("]
+
+[[rule]]
+id = "tsql.next-value-for"
+origin = "tsql"
+targets = ["postgres"]
+message = "T-SQL sequence expression; PostgreSQL uses nextval('name')"
+pattern = ["word:NEXT", "word:VALUE", "word:FOR"]
+
+[[rule]]
+id = "tsql.temporal"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "SQL Server system-versioned table syntax"
+pattern = ["word:PERIOD", "word:FOR", "word:SYSTEM_TIME"]
+
+[[rule]]
+id = "tsql.temporal"
+origin = "tsql"
+targets = ["postgres", "db2i"]
+message = "SQL Server system-versioned table syntax"
+pattern = ["word:SYSTEM_VERSIONING"]
+
+[[rule]]
+id = "tsql.temporal"
+origin = "tsql"
+targets = ["postgres"]
+message = "SQL Server system-versioned table syntax"
+pattern = ["word:AS", "word:ROW", "word:START|END"]
+
+[[rule]]
+id = "tsql.temporal"
+origin = "tsql"
+targets = ["db2i"]
+message = "SQL Server system-versioned table syntax (Db2 for i says ROW BEGIN)"
+pattern = ["word:AS", "word:ROW", "word:START"]

@@ -118,6 +118,7 @@ fn object(id: &str, dialect: &str, text: &str, template: Option<TemplateInfo>) -
             content_hash: String::new(),
             bytes: 0,
             last_changed: None,
+            defines: None,
             stale: false,
         },
         text: text.into(),

@@ -129,6 +129,12 @@ pub struct ObjectInfo {
     /// Generated output older than its inputs; verdicts that depend on it are capped at unknown.
     #[serde(default)]
     pub stale: bool,
+    /// The one table, view or routine the text defines, as
+    /// `relation:schema.name` or `routine:schema.name` (lower case, schema
+    /// empty when unqualified). Pairs a file with the same object of a file
+    /// the other side holds with several objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defines: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

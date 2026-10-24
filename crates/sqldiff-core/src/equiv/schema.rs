@@ -82,6 +82,12 @@ impl Ty {
                 len: Some(32),
                 scale: None,
             },
+            // T-SQL bit: an integer that is 0 or 1.
+            "BIT" if d == Dialect::Tsql => Ty {
+                fam: Fam::Int,
+                len: Some(1),
+                scale: None,
+            },
             "SMALLINT" | "INT2" => Ty {
                 fam: Fam::Int,
                 len: Some(16),
@@ -113,6 +119,12 @@ impl Ty {
                 fam_len(Fam::VarChar, tsql_default)
             }
             "TEXT" => Ty::of(Fam::VarChar),
+            // T-SQL sysname is nvarchar(128) NOT NULL.
+            "SYSNAME" if d == Dialect::Tsql => Ty {
+                fam: Fam::VarChar,
+                len: Some(128),
+                scale: None,
+            },
             // Large and double-byte character types compare as strings too
             // (collation applies); CITEXT is left out on purpose (case-insensitive).
             "CLOB" | "NCLOB" | "DBCLOB" | "NTEXT" | "VARGRAPHIC" | "LONG VARCHAR"
@@ -186,6 +198,44 @@ impl Table {
 pub struct Schema {
     tables: HashMap<String, Table>,
     pub sources: Vec<String>,
+    /// PostgreSQL: the system catalogs are known too.
+    pg_system: bool,
+    /// T-SQL: the `sys` catalog views are known too.
+    tsql_system: bool,
+}
+
+/// The SQL Server catalog views in `sys_catalog.sql`.
+fn tsql_system() -> &'static Schema {
+    static SYSTEM: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        let text = include_str!("sys_catalog.sql");
+        let mut cat = Catalog::default();
+        ddl::load_tree(
+            &mut cat,
+            &parse(text, Dialect::Tsql).syntax(),
+            Dialect::Tsql,
+        );
+        let mut s = Schema::from_view(&CatalogView::new(Dialect::Tsql, &[&cat]));
+        s.tsql_system = false;
+        s
+    })
+}
+
+/// The PostgreSQL system catalogs in `pg_catalog.sql`.
+fn pg_system() -> &'static Schema {
+    static SYSTEM: std::sync::OnceLock<Schema> = std::sync::OnceLock::new();
+    SYSTEM.get_or_init(|| {
+        let text = include_str!("pg_catalog.sql");
+        let mut cat = Catalog::default();
+        ddl::load_tree(
+            &mut cat,
+            &parse(text, Dialect::Postgres).syntax(),
+            Dialect::Postgres,
+        );
+        let mut s = Schema::from_view(&CatalogView::new(Dialect::Postgres, &[&cat]));
+        s.pg_system = false;
+        s
+    })
 }
 
 impl Schema {
@@ -193,8 +243,30 @@ impl Schema {
         self.tables.is_empty()
     }
 
+    /// The tables of the catalog (system catalogs left out).
+    pub fn tables(&self) -> impl Iterator<Item = &Table> {
+        self.tables.values()
+    }
+
+    /// A table by name, qualified or not; user tables are found by their
+    /// unqualified name.
     pub fn table(&self, name: &str) -> Option<&Table> {
-        self.tables.get(&name.to_lowercase())
+        let name = name.to_lowercase();
+        let parts: Vec<&str> = name.split('.').collect();
+        let last = *parts.last()?;
+        // SQL Server catalog views: `sys.name`.
+        if parts.len() >= 2 && parts[parts.len() - 2] == "sys" {
+            return self
+                .tsql_system
+                .then(|| tsql_system().tables.get(last))
+                .flatten();
+        }
+        self.tables.get(last).or_else(|| {
+            // pg_catalog comes first on every search path.
+            (self.pg_system && last.starts_with("pg_"))
+                .then(|| pg_system().tables.get(last))
+                .flatten()
+        })
     }
 
     /// Reads DDL artifacts through the shared catalog loader; files fold in order.
@@ -219,6 +291,8 @@ impl Schema {
         let d = view.dialect;
         let mut s = Schema {
             sources: view.origins.clone(),
+            pg_system: d == Dialect::Postgres,
+            tsql_system: d == Dialect::Tsql,
             ..Schema::default()
         };
         // Base and temporary tables only: view columns are derived, and their

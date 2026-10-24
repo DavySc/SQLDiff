@@ -80,6 +80,31 @@ pub mod asm {
         "The caller does not hold an open transaction",
     );
 
+    pub const OWNER_PRIVILEGES: (&str, &str) = (
+        "ASM-OWNER-PRIVILEGES",
+        "The routine owner holds every privilege its statements need on both sides (Db2 for i USRPRF *OWNER adds the owner's authority to the caller's; T-SQL EXECUTE AS OWNER and PostgreSQL SECURITY DEFINER use the owner's alone)",
+    );
+    pub const OWNERSHIP_CHAIN: (&str, &str) = (
+        "ASM-TSQL-OWNERSHIP-CHAIN",
+        "Callers hold the privileges the statements need themselves: T-SQL skips permission checks along an ownership chain (routine and objects with one owner), the other side does not",
+    );
+    pub const DB2_USRPRF_USER: (&str, &str) = (
+        "ASM-DB2-USRPRF-USER",
+        "The Db2 for i routine has no SET OPTION USRPRF, so its authority comes from USRPRF *NAMING: assumed to be the caller's (system naming at creation; under SQL naming it runs with the owner's authority; fact V25, not checked on a real system)",
+    );
+    pub const DEFAULT_SCHEMA: (&str, &str) = (
+        "ASM-DEFAULT-SCHEMA",
+        "Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides (the default schema, search_path or Db2 for i current schema in effect)",
+    );
+    pub const IDENT_FOLD: (&str, &str) = (
+        "ASM-IDENT-FOLD",
+        "Unquoted names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
+    );
+    pub const ROUTINE_LABEL: (&str, &str) = (
+        "ASM-ROUTINE-LABEL",
+        "The routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful: its result depends only on its arguments and data that does not change while the calling statement runs, so evaluating it fewer times gives the same results",
+    );
+
     pub fn make(x: (&str, &str)) -> crate::model::Assumption {
         crate::model::Assumption::default(x.0, x.1)
     }
@@ -111,6 +136,8 @@ pub struct Canon<'a> {
     /// only some statements of two versions are compared, so a renaming is
     /// not checked across the whole routine.
     pub by_name: bool,
+    /// Table names of the statement being lowered (see `Item::names`).
+    pub names: Vec<(String, Option<String>)>,
 }
 
 /// Folded name; names whose quoting is significant (leading `"`) keep their case.
@@ -135,6 +162,7 @@ impl<'a> Canon<'a> {
             seen_tables: HashMap::new(),
             excluded: None,
             by_name: false,
+            names: Vec::new(),
         }
     }
 
@@ -145,6 +173,7 @@ impl<'a> Canon<'a> {
         self.single_row = false;
         self.seen_tables.clear();
         self.excluded = None;
+        self.names.clear();
     }
 
     fn assume(&mut self, x: (&str, &str)) {
@@ -165,25 +194,46 @@ impl<'a> Canon<'a> {
 
     // ---- names ----------------------------------------------------------
 
-    pub fn table_name(parts: &[String]) -> String {
+    /// Key of a table name: the folded name, prefixed with its folded schema
+    /// (and database) unless the schema is the default one (none written,
+    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`.
+    /// Returns the key and, for a default schema, how it was written.
+    pub fn table_name(parts: &[String]) -> (String, Option<String>) {
         let last = parts.last().map(|s| lc(s)).unwrap_or_default();
-        if last.starts_with('"') {
-            return last;
-        }
         let temp = last.starts_with('#')
             || last.starts_with('@')
             || parts
                 .first()
                 .is_some_and(|p| p.eq_ignore_ascii_case("SESSION") && parts.len() > 1);
         if temp {
-            format!("temp:{}", last.trim_start_matches(['#', '@']))
-        } else {
-            last
+            return (
+                format!("temp:{}", last.trim_start_matches(['#', '@'])),
+                None,
+            );
+        }
+        let quals: Vec<String> = parts[..parts.len().saturating_sub(1)]
+            .iter()
+            .map(|s| lc(s))
+            .collect();
+        match quals.as_slice() {
+            [] => (last, Some(String::new())),
+            [q] if q == "dbo" || q == "public" => (last, Some(q.clone())),
+            _ => (format!("{}.{last}", quals.join(".")), None),
         }
     }
 
+    /// `table_name`, remembering the name for the statement's item.
+    fn table_key(&mut self, parts: &[String]) -> String {
+        let (key, default) = Self::table_name(parts);
+        let x = (key.clone(), default);
+        if !self.names.contains(&x) {
+            self.names.push(x);
+        }
+        key
+    }
+
     fn bind_table(&mut self, parts: &[String], alias: &Option<String>) -> Binding {
-        let table = Self::table_name(parts);
+        let table = self.table_key(parts);
         let k = self.seen_tables.entry(table.clone()).or_insert(0);
         *k += 1;
         let canon = if *k > 1 {
@@ -205,8 +255,14 @@ impl<'a> Canon<'a> {
         self.scopes.iter().map(Vec::len).sum()
     }
 
+    /// Catalog name of a table key: without its occurrence number and schema
+    /// (the catalog is keyed by table name).
     fn base_table(t: &str) -> &str {
-        t.split('#').next().unwrap_or(t)
+        let t = t.split('#').next().unwrap_or(t);
+        if t.starts_with('"') {
+            return t;
+        }
+        t.rsplit_once('.').map_or(t, |(_, name)| name)
     }
 
     fn col_ty(&self, table: &str, col: &str) -> (Option<Ty>, Option<bool>) {
@@ -969,7 +1025,8 @@ impl<'a> Canon<'a> {
         for o in items {
             let (t, ty) = self.expr(&o.expr)?;
             let nulls_first = o.nulls_first.unwrap_or(match self.d {
-                // T-SQL: NULL is the lowest value. PostgreSQL and Db2 for i: the highest (fact V19).
+                // T-SQL: NULL is the lowest value. PostgreSQL and Db2 for i: the highest
+                // (fact V19, Db2 for i part not checked on a real system).
                 Dialect::Tsql => !o.desc,
                 Dialect::Postgres | Dialect::Db2i => o.desc,
             });
@@ -1041,9 +1098,9 @@ impl<'a> Canon<'a> {
                 });
                 Ok(n("sub", vec![q.0]))
             }
-            From::Values { .. } | From::DataChange { .. } => {
-                Err("VALUES or data-change table in FROM is not supported here".into())
-            }
+            From::Values { .. } | From::DataChange { .. } | From::Func { .. } => Err(
+                "VALUES, table function or data-change table in FROM is not supported here".into(),
+            ),
         }
     }
 
@@ -1339,7 +1396,7 @@ impl<'a> Canon<'a> {
                 if cols.is_empty() {
                     return Err("INSERT without a column list".into());
                 }
-                let table = Self::table_name(target);
+                let table = self.table_key(target);
                 let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
                 if let Some((keys, action)) = on_conflict {
                     return self.on_conflict(&table, &cols, source, keys, action, returning);
@@ -1638,7 +1695,7 @@ impl<'a> Canon<'a> {
         if !returning.is_empty() || on_conflict.is_some() {
             return Err("unsupported INSERT in FINAL TABLE".into());
         }
-        let table = Self::table_name(target);
+        let table = self.table_key(target);
         let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
         let ins = self.insert(&table, &cols, source)?;
         self.returning(ins, &table, &sel.items, &sel.into)
@@ -1730,7 +1787,7 @@ impl<'a> Canon<'a> {
         on: &Expr,
         whens: &[super::ast::When],
     ) -> R<Term> {
-        let table = Self::table_name(target);
+        let table = self.table_key(target);
         self.single_row = true;
         // Single-row source: SELECT without FROM, or one VALUES row.
         let src: Vec<(String, Term, Option<Ty>)> = match source {
@@ -2155,6 +2212,9 @@ pub struct Item {
     pub asm: Vec<Assumption>,
     pub disc: Vec<String>,
     pub err: Option<String>,
+    /// Tables the statement names: (key, schema as written when it is the
+    /// default one: "", "dbo" or "public"; `None` for an explicit schema).
+    pub names: Vec<(String, Option<String>)>,
 }
 
 impl Item {
@@ -2172,6 +2232,11 @@ impl Item {
         }
         if self.err.is_none() {
             self.err = other.err;
+        }
+        for x in other.names {
+            if !self.names.contains(&x) {
+                self.names.push(x);
+            }
         }
     }
 }

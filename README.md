@@ -2,7 +2,7 @@
 
 A semantic diff for **T-SQL (SQL Server 2022), PostgreSQL 18 (incl. PL/pgSQL) and Db2 for i SQL PL**. It tells you what changed between two SQL artifacts, whether the *meaning* changed, and gives a concrete scenario for every behavioural difference. It is built for code kept in sync across dialects and for reviewing conversions.
 
-The full design is in [docs/design.md](docs/design.md). Its first rule: **never a false "equal"**. When equivalence can't be shown, the verdict is `unknown` or `equal under assumptions`.
+The full design is in [docs/design.md](docs/design.md). Its first rule: **never a false "equal"**. When equivalence can't be shown, the verdict is `unknown` or `equal under assumptions`. What a cross-dialect proof of a routine compares and assumes (routine options, security context, schema and case folding, files with several objects) is in [docs/cross-dialect-proofs.md](docs/cross-dialect-proofs.md).
 
 ## Quick start
 
@@ -36,6 +36,10 @@ $B check corpus/mutations/m15-dropped-column-reference/mutated.pg.sql --catalog 
 # Machine output for CI
 $B diff a.sql b.sql -d postgres -f json      # or -f sarif
 
+# Pull request review: every SQL file the branch changed, base against head;
+# SARIF located at head, Markdown for the PR comment (docs/pr-review.md, action.yml)
+$B changes --base origin/main --sarif out.sarif --markdown comment.md
+
 # Review: accept a deliberate difference by fingerprint; later runs suppress it
 $B review accept aacde30caae50448 --pair a.sql b.sql -c "callers map codes"
 $B diff a.sql b.sql --redact -f sarif         # shareable: names replaced by stable placeholders
@@ -55,6 +59,9 @@ target/release/sqldiff-gui export --report report.json -o pair.html   # static, 
 target/release/sqldiff-gui convert                       # starts with a sample
 target/release/sqldiff-gui convert my_proc.sql --stdout  # print the conversion and per-statement badges
 target/release/sqldiff-gui convert proc.tpl.sql --template --pack my-pack  # a generator template: placeholders kept
+
+# Convert a whole tree: mirrored output tree, every statement checked, report in OUT
+$B convert src/tsql -o out/pg --to postgres        # or --to db2i; -j N parallel jobs
 ```
 
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
@@ -85,10 +92,11 @@ Verdict: DIFFERENT
 | 2-4 Statement equivalence | Per-statement canonical terms for views, functions, procedures and scripts in all three dialects, with dialect semantics made explicit (string collation and padding, NULL ordering, scalar-subquery cardinality, empty-result behaviour, time sources, upsert concurrency) and idiom lifting (MERGE vs `ON CONFLICT` upserts, identity retrieval via `SCOPE_IDENTITY` / `RETURNING` / `FINAL TABLE`, anti-join deletes, `ISNULL` vs `COALESCE`, date differences, string aggregation). Cross-dialect pairs get `equal`, `equal under assumptions` (listed) or `different` with a witness; anything not lowered stays `unknown` with the reason. `--catalog FILE` (or `--catalog-a` / `--catalog-b`) supplies CREATE TABLE / CREATE UNIQUE INDEX DDL so keys, nullability and types discharge assumptions. 53 of 64 corpus expectations match, none falsely equal. |
 | Lints | Data-driven residue rules ([profiles/residue.toml](crates/sqldiff-core/profiles/residue.toml)) and the missing-`;`-before-`THROW` hazard. |
 | 0 Acquisition and configuration | Layered config (built-in < shared packs < private packs < project `sqldiff.toml` < user < command line) with provenance hashes; validated, schema-versioned packs ([docs/packs-and-config.md](docs/packs-and-config.md)); secrets rejected in favour of credential references. Filesystem, git and snapshot-bundle adapters ([docs/snapshot-bundle.md](docs/snapshot-bundle.md)); out-of-process adapters over a JSON stdio protocol with chunked, hash-verified transfer ([docs/adapter-protocol.md](docs/adapter-protocol.md)). Pack-driven pairing, limit rules, severity overrides and declared assumptions. |
-| Interfaces | CLI `diff` / `check` / `parse` / `template` / `tree` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
+| Interfaces | CLI `diff` / `check` / `parse` / `template` / `tree` / `changes` / `objects` / `pairs` / `snapshot` / `config` / `pack` / `serve` / `queue` / `assumptions` / `comment` / `open`, text, JSON and SARIF 2.1.0. Stdio MCP server `sqldiff-mcp` with `diff`, `check`, `finding`, `queue`, `assumptions`, `set_assumption`, `comment_text` and `open_in_gui`. Review comments come from a deterministic phrase grammar (no AI). Findings carry stable fingerprints that survive reformatting. |
+| Pull request workflow | `sqldiff changes`: only the files a branch changed since its merge base, paired by path, git rename and schema-qualified object name; nothing dropped silently (added, removed, ambiguous, no dialect, unreadable and config changes are listed and keep the verdict at unknown). SARIF with every result located at the head commit, a Markdown PR comment in the phrase grammar, and a GitHub Action (`action.yml`) that uploads and comments ([docs/pr-review.md](docs/pr-review.md)). |
 | Review workflow | Review store keyed by fingerprint and snapshot with expiry and optional encryption at rest; accepted findings and in-source deliberate-difference markers suppressed (kept in JSON and SARIF `suppressions`); author-declared assumptions from pack markers; redacted export with salted stable placeholders, leak-checked; per-content-hash report cache ([docs/review-and-export.md](docs/review-and-export.md)). |
 | GUI | `sqldiff-gui serve` / `export` / `report`: two files open the pair view, two directories open a review queue (filter by class, dialect pair, folder, review state; sort by severity). Pair view aligned by statement with a location pane, findings with accept / reject / comment, assumption panel (deny or confirm an assumption and watch verdicts update), provenance bar (sources, snapshot, packs and hashes, dialect versions, template mode, refresh), command palette (Ctrl+K), scratchpad that re-diffs on edit, deep links `?a=<path>&b=<path>#f=<fingerprint>`, session report as Markdown (`--redact`), template mode (`--template`, `--parameter NAME`; see [docs/templates-and-composition.md](docs/templates-and-composition.md)). Stack decision in [docs/gui-spike.md](docs/gui-spike.md). |
-| Conversion (P0) | `sqldiff-gui convert`: rule-based T-SQL → PostgreSQL that updates live; every statement gets a badge (converted, under assumptions, needs a decision, differs, not converted) from its rules plus the engine's diff of input against output. Constructs without a rule stay as comments, never guessed. See [docs/convert-mode.md](docs/convert-mode.md). |
+| Conversion (P0) | `sqldiff convert SRC -o OUT --to postgres|db2i` converts a whole tree (parallel, with catalogs built from every file) and writes `conversion-report.json`/`.md`; a statement counts as converted only when the output's own binder check finds nothing in it either. `sqldiff-gui convert`: rule-based T-SQL → PostgreSQL / Db2 for i that updates live; every statement gets a badge (converted, under assumptions, needs a decision, differs, not converted) from its rules plus the engine's diff of input against output. Constructs without a rule stay as comments, never guessed. See [docs/convert-mode.md](docs/convert-mode.md). |
 
 Not yet built: the CFG-level equivalence across control flow (loops, branches, error handlers that write), named-lock idioms, the rest of the GUI (review queue, lens switch, transaction overlay). See design §14 for the milestones.
 

@@ -127,10 +127,11 @@ fn modified_statement_is_never_equal() {
     let a = "CREATE PROCEDURE p AS\nBEGIN\n  UPDATE t SET x = 1 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id);\n  SELECT 1;\nEND";
     let b = "CREATE PROCEDURE p AS\nBEGIN\n  UPDATE t SET x = 1;\n  SELECT 1;\nEND";
     let r = run(a, Dialect::Tsql, b, Dialect::Tsql);
-    assert_eq!(r.verdict, Verdict::Unknown);
+    // The edit is evaluated: with no matching row in s, only B updates t.
+    assert_eq!(r.verdict, Verdict::Different);
     let f = &r.findings[0];
-    assert_eq!(f.rule, "stmt.modified");
-    assert!(f.witness.contains("was removed"), "{}", f.witness);
+    assert_eq!(f.rule, "equiv.edit");
+    assert!(f.witness.contains("s has no rows"), "{}", f.witness);
     assert_eq!(f.a.as_ref().unwrap().start_line, 3);
 }
 

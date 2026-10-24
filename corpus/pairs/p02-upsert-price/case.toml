@@ -23,7 +23,8 @@ file = "db2i.sql"
 [[expect]]
 a = "tsql"
 b = "pg"
-verdict = "equal"
+verdict = "equal-under-assumptions"
+assumptions = ["callers hold the privileges themselves (no T-SQL ownership chain needed)", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
 classes = ["structural"]
 discharged = ["item_price.item_id is the primary key (catalog)"]
 

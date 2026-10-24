@@ -68,7 +68,7 @@ fn procedure_becomes_sql_pl_with_the_commit_level_written_out() {
     let c = db2(src);
     let o = &c.output;
     assert!(
-        o.starts_with("CREATE OR REPLACE PROCEDURE Bump (IN p_id INTEGER, INOUT p_total INTEGER)\nLANGUAGE SQL\nSET OPTION COMMIT = *CS\nBEGIN\n  DECLARE v_n INTEGER;\n"),
+        o.starts_with("CREATE OR REPLACE PROCEDURE Bump (IN p_id INTEGER, INOUT p_total INTEGER)\nLANGUAGE SQL\nSET OPTION COMMIT = *CS, USRPRF = *USER, DYNUSRPRF = *USER\nBEGIN\n  DECLARE v_n INTEGER;\n"),
         "{o}"
     );
     assert!(o.contains("SET v_n = 0;"), "{o}");
@@ -458,4 +458,25 @@ fn result_cursor_over_a_temp_table_notes_runtime_resolution() {
     let src =
         "CREATE PROCEDURE p AS\nBEGIN\n  CREATE TABLE #r (id INT);\n  SELECT id FROM #r;\nEND\n";
     assert!(any_rule(&db2(src), "ASM-DB2-SESSION-RUNTIME"));
+}
+
+#[test]
+fn execute_as_owner_becomes_usrprf_owner() {
+    let src = "CREATE PROCEDURE dbo.Purge @Id int WITH EXECUTE AS OWNER AS\nBEGIN\n  DELETE FROM dbo.item WHERE item_id = @Id;\nEND\n";
+    let c = db2(src);
+    assert!(
+        c.output
+            .contains("SET OPTION COMMIT = *CS, USRPRF = *OWNER, DYNUSRPRF = *OWNER\nBEGIN"),
+        "{}",
+        c.output
+    );
+    assert!(any_rule(&c, "ASM-OWNER-PRIVILEGES"));
+    let f = "CREATE FUNCTION dbo.F (@Id int) RETURNS int AS\nBEGIN\n  RETURN @Id + 1;\nEND\n";
+    let c = db2(f);
+    assert!(
+        c.output
+            .contains("SET OPTION USRPRF = *USER, DYNUSRPRF = *USER"),
+        "{}",
+        c.output
+    );
 }

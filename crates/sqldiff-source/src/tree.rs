@@ -9,7 +9,7 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 
 use crate::compose::Placeholders;
-use crate::protocol::ObjectFilter;
+use crate::protocol::{ObjectFilter, ObjectInfo};
 use crate::{pairing, policy, Error, FsSource, Resolved, Result, Source};
 
 /// Builds an artifact. Dialect: the given one, else `dialect_map` or the path
@@ -205,6 +205,24 @@ pub struct TreePair {
     pub path_b: PathBuf,
 }
 
+impl TreePair {
+    /// The object fragments of the two ids, for ids that name one object of
+    /// a file with several.
+    pub fn fragments(&self) -> (Option<&str>, Option<&str>) {
+        (
+            fragment(&self.path_a, &self.id_a),
+            fragment(&self.path_b, &self.id_b),
+        )
+    }
+}
+
+fn fragment<'i>(path: &Path, id: &'i str) -> Option<&'i str> {
+    match crate::split::split_id(id) {
+        (_, Some(f)) if !path.ends_with(id) => Some(f),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Ambiguous {
     pub side: &'static str,
@@ -229,10 +247,29 @@ pub struct Tree {
 impl Tree {
     /// Reads both sides of a pair.
     pub fn read(&self, p: &TreePair, cfg: &Resolved) -> Result<(Artifact, Artifact)> {
-        let load = |path: &Path, id: &str, d| {
-            let text = std::fs::read_to_string(path)
+        let load = |path: &Path, id: &str, d: Option<Dialect>| {
+            let mut text = std::fs::read_to_string(path)
                 .map_err(|e| Error(format!("{}: {e}", path.display())))?;
-            artifact(path.display().to_string(), id, d, text, cfg)
+            // One object of a file with several (see `split`).
+            let frag = fragment(path, id);
+            let rel = if frag.is_some() {
+                crate::split::split_id(id).0
+            } else {
+                id
+            };
+            let mut object = None;
+            if let Some(frag) = frag {
+                let dialect = d
+                    .or(crate::classify(rel, cfg).0)
+                    .ok_or_else(|| Error(format!("{}: dialect unknown", path.display())))?;
+                let (t, name) = crate::split::object(&text, dialect, frag)
+                    .ok_or_else(|| Error(format!("{}: no object `{frag}`", path.display())))?;
+                text = t;
+                object = Some(name);
+            }
+            let mut a = artifact(path.display().to_string(), rel, d, text, cfg)?;
+            a.object = object;
+            Ok::<_, Error>(a)
         };
         Ok((
             load(&p.path_a, &p.id_a, self.dialect_a)?,
@@ -248,16 +285,20 @@ struct Side {
     /// Keys held by several objects; none of them is paired.
     ambiguous: BTreeMap<String, Vec<String>>,
     no_dialect: Vec<String>,
+    dialects: BTreeMap<String, Dialect>,
+    infos: BTreeMap<String, ObjectInfo>,
 }
 
 impl Side {
     /// Lists a directory with pack `ignore` and `dialect_map`, skipping shared
     /// artifacts, and keys every object by its pairing rule.
     fn load(dir: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Side> {
-        let src = FsSource::new(dir, cfg)?;
+        let src = FsSource::new(dir, cfg)?.with_dialect(dialect);
         let objects = src.list_objects(&ObjectFilter::default())?;
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut no_dialect = Vec::new();
+        let mut dialects = BTreeMap::new();
+        let mut infos = BTreeMap::new();
         for o in objects {
             if cfg.is_shared(&o.id) {
                 continue;
@@ -267,11 +308,13 @@ impl Side {
                 no_dialect.push(o.id);
                 continue;
             };
+            dialects.insert(o.id.clone(), d);
             let rule = cfg.pairing_rule(&o.id, Some(d));
             groups
                 .entry(pairing::key(&o.name, &rule))
                 .or_default()
-                .push(o.id);
+                .push(o.id.clone());
+            infos.insert(o.id.clone(), o);
         }
         let (unique, ambiguous): (BTreeMap<_, _>, BTreeMap<_, _>) =
             groups.into_iter().partition(|(_, ids)| ids.len() == 1);
@@ -283,7 +326,22 @@ impl Side {
                 .collect(),
             ambiguous,
             no_dialect,
+            dialects,
+            infos,
         })
+    }
+
+    /// Takes every object with this key out, unique or ambiguous.
+    fn take_key(&mut self, key: &str) -> Vec<String> {
+        let mut ids = self.ambiguous.remove(key).unwrap_or_default();
+        ids.extend(self.by_key.remove(key));
+        ids
+    }
+
+    /// The one object the file defines (see [`crate::defined_name`]).
+    fn defined(&self, id: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.dir.join(id)).ok()?;
+        crate::defined_name(&text, *self.dialects.get(id)?)
     }
 
     fn display(&self, id: &str) -> String {
@@ -325,25 +383,93 @@ pub fn pair_dirs(
     }
     let mut only_a = Vec::new();
     let mut only_b = Vec::new();
+    // Keys several files share on a side (a table and a view both named
+    // `Cities.sql` in different schema folders): pair by the one
+    // schema-qualified object each file defines, where that is unique on
+    // both sides. The rest stay ambiguous, or unpaired when one is left.
+    let shared_keys: BTreeSet<String> = sa
+        .ambiguous
+        .keys()
+        .chain(sb.ambiguous.keys())
+        .cloned()
+        .collect();
+    let mut ambiguous_left: Vec<(&'static str, String, Vec<String>)> = Vec::new();
+    for k in shared_keys {
+        let (ca, cb) = (sa.take_key(&k), sb.take_key(&k));
+        let named = |side: &Side, ids: &[String]| -> BTreeMap<String, Vec<String>> {
+            let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for id in ids {
+                if let Some(n) = side.defined(id) {
+                    m.entry(n).or_default().push(id.clone());
+                }
+            }
+            m
+        };
+        let (na, nb) = (named(&sa, &ca), named(&sb, &cb));
+        let mut done: BTreeSet<String> = BTreeSet::new();
+        for (name, xs) in &na {
+            if let (1, Some(ys)) = (xs.len(), nb.get(name)) {
+                if ys.len() == 1 {
+                    ids.push((xs[0].clone(), ys[0].clone()));
+                    done.insert(xs[0].clone());
+                    done.insert(ys[0].clone());
+                }
+            }
+        }
+        let la: Vec<String> = ca.into_iter().filter(|i| !done.contains(i)).collect();
+        let lb: Vec<String> = cb.into_iter().filter(|i| !done.contains(i)).collect();
+        for (side, left, s, only) in [("A", la, &sa, &mut only_a), ("B", lb, &sb, &mut only_b)] {
+            match left.len() {
+                0 => {}
+                1 => only.push(s.display(&left[0])),
+                _ => ambiguous_left.push((side, k.clone(), left)),
+            }
+        }
+    }
+    let mut left_a = Vec::new();
     for (k, ia) in &sa.by_key {
         match sb.by_key.get(k) {
             Some(ib) => ids.push((ia.clone(), ib.clone())),
-            None => only_a.push(sa.display(ia)),
+            None => left_a.push(&sa.infos[ia]),
         }
     }
-    for (k, ib) in &sb.by_key {
-        if !sa.by_key.contains_key(k) {
-            only_b.push(sb.display(ib));
-        }
-    }
-    let ambiguous = [(&sa, "A"), (&sb, "B")]
+    let left_b: Vec<&ObjectInfo> = sb
+        .by_key
         .iter()
-        .flat_map(|(s, side)| {
-            s.ambiguous.iter().map(move |(k, ids)| Ambiguous {
+        .filter(|(k, _)| !sa.by_key.contains_key(*k))
+        .map(|(_, ib)| &sb.infos[ib])
+        .collect();
+    // A file split on one side only: its object pairs with the other
+    // side's whole file (see `pairing::split_matches`).
+    let rule = |o: &ObjectInfo, id: &str| {
+        cfg.pairing_rule(id, o.dialect.as_deref().and_then(|d| d.parse().ok()))
+    };
+    let split = pairing::split_matches(
+        &left_a,
+        &left_b,
+        |o| pairing::key(&o.name, &rule(o, &o.id)),
+        |o, rel| pairing::key(&crate::walk::object_name(rel), &rule(o, rel)),
+    );
+    let matched: BTreeSet<&str> = split
+        .iter()
+        .flat_map(|(a, b)| [a.id.as_str(), b.id.as_str()])
+        .collect();
+    ids.extend(split.iter().map(|(a, b)| (a.id.clone(), b.id.clone())));
+    for o in left_a.iter().filter(|o| !matched.contains(o.id.as_str())) {
+        only_a.push(sa.display(&o.id));
+    }
+    for o in left_b.iter().filter(|o| !matched.contains(o.id.as_str())) {
+        only_b.push(sb.display(&o.id));
+    }
+    let ambiguous = ambiguous_left
+        .into_iter()
+        .map(|(side, key, ids)| {
+            let s = if side == "A" { &sa } else { &sb };
+            Ambiguous {
                 side,
-                key: k.clone(),
+                key,
                 ids: ids.iter().map(|i| s.display(i)).collect(),
-            })
+            }
         })
         .collect();
     let no_dialect = sa
@@ -356,8 +482,8 @@ pub fn pair_dirs(
         pairs: ids
             .into_iter()
             .map(|(a, b)| TreePair {
-                path_a: sa.dir.join(&a),
-                path_b: sb.dir.join(&b),
+                path_a: crate::split::locate(&sa.dir, &a).0,
+                path_b: crate::split::locate(&sb.dir, &b).0,
                 id_a: a,
                 id_b: b,
             })

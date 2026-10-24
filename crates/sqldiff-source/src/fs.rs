@@ -8,7 +8,7 @@ use crate::protocol::{
     ArtifactData, Describe, ObjectFilter, ObjectInfo, Pair, PairScope, Provenance,
 };
 use crate::source::Source;
-use crate::walk::{is_candidate, object_info};
+use crate::walk::{is_candidate, object_text, objects, whole_info};
 use crate::{pairing, Error, Resolved, Result};
 
 /// Directories never descended into.
@@ -17,6 +17,8 @@ const SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn", "target", "node_modules"];
 pub struct FsSource {
     root: PathBuf,
     config: Resolved,
+    /// Dialect of every file, instead of `dialect_map` and path conventions.
+    dialect: Option<sqldiff_core::Dialect>,
 }
 
 impl FsSource {
@@ -27,7 +29,14 @@ impl FsSource {
         Ok(FsSource {
             root: root.to_path_buf(),
             config: config.clone(),
+            dialect: None,
         })
+    }
+
+    /// Every file read in dialect `d` (`--dialect` on tree commands).
+    pub fn with_dialect(mut self, d: Option<sqldiff_core::Dialect>) -> FsSource {
+        self.dialect = d;
+        self
     }
 
     /// Relative paths of candidate files, sorted, with `/` separators.
@@ -73,14 +82,44 @@ impl FsSource {
         Ok(self.root.join(id))
     }
 
-    fn read(&self, id: &str) -> Result<(ObjectInfo, String)> {
-        let p = self.path_of(id)?;
-        let text = std::fs::read_to_string(&p).map_err(|e| Error::new(format!("{id}: {e}")))?;
-        let changed = std::fs::metadata(&p)
+    fn changed(&self, rel: &str) -> Option<String> {
+        let p = self.path_of(rel).ok()?;
+        std::fs::metadata(&p)
             .and_then(|m| m.modified())
             .ok()
-            .map(rfc3339);
-        Ok((object_info(id, &text, &self.config, changed), text))
+            .map(rfc3339)
+    }
+
+    fn file(&self, rel: &str) -> Result<String> {
+        let p = self.path_of(rel)?;
+        std::fs::read_to_string(&p).map_err(|e| Error::new(format!("{rel}: {e}")))
+    }
+
+    /// One object by id: a file, or `file#name` for one object of a file.
+    fn read(&self, id: &str) -> Result<(ObjectInfo, String)> {
+        // A file whose name contains `#` is still a file.
+        let (rel, frag) = if self.path_of(id).is_ok_and(|p| p.is_file()) {
+            (id, None)
+        } else {
+            crate::split::split_id(id)
+        };
+        let text = self.file(rel)?;
+        let changed = self.changed(rel);
+        if frag.is_none() {
+            return Ok((
+                whole_info(rel, &text, &self.config, changed, self.dialect),
+                text,
+            ));
+        }
+        let (info, text) = object_text(id, &self.config, self.dialect, |_| Ok(text.clone()))
+            .and_then(|(_, t)| {
+                objects(rel, &text, &self.config, changed, self.dialect)
+                    .into_iter()
+                    .find(|o| o.id == id)
+                    .map(|o| (o, t))
+                    .ok_or_else(|| Error::new(format!("{id}: no such object")))
+            })?;
+        Ok((info, text))
     }
 }
 
@@ -100,9 +139,11 @@ impl Source for FsSource {
     fn list_objects(&self, filter: &ObjectFilter) -> Result<Vec<ObjectInfo>> {
         let mut out = Vec::new();
         for rel in self.files()? {
-            let (info, _) = self.read(&rel)?;
-            if filter.matches(&info) {
-                out.push(info);
+            let text = self.file(&rel)?;
+            for info in objects(&rel, &text, &self.config, self.changed(&rel), self.dialect) {
+                if filter.matches(&info) {
+                    out.push(info);
+                }
             }
         }
         Ok(out)

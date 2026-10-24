@@ -708,3 +708,36 @@ fn a_placeholder_decided_by_pattern_is_an_open_question() {
     );
     assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
 }
+
+#[test]
+fn execute_as_owner_becomes_security_definer() {
+    let src = "CREATE PROCEDURE dbo.Purge @Id int WITH RECOMPILE, EXECUTE AS OWNER AS\nBEGIN\n  DELETE FROM dbo.item WHERE item_id = @Id;\nEND\n";
+    let c = tsql(src);
+    assert!(
+        c.output
+            .contains("LANGUAGE plpgsql\nSECURITY DEFINER\nAS $$"),
+        "{}",
+        c.output
+    );
+    let u = unit(&c, src, "CREATE PROCEDURE");
+    assert!(has_rule(u, "ASM-OWNER-PRIVILEGES"), "{:?}", u.notes);
+    assert!(!has_rule(u, "tsql.routine-options"), "{:?}", u.notes);
+    // EXECUTE AS CALLER is the default: nothing to write.
+    let c = tsql(&src.replace("WITH RECOMPILE, EXECUTE AS OWNER", "WITH EXECUTE AS CALLER"));
+    assert!(!c.output.contains("SECURITY DEFINER"), "{}", c.output);
+    // Other principals have no PostgreSQL form.
+    let c = tsql(&src.replace("WITH RECOMPILE, EXECUTE AS OWNER", "WITH EXECUTE AS 'app'"));
+    assert!(!c.output.contains("SECURITY DEFINER"), "{}", c.output);
+    assert!(c.units.iter().any(|u| has_rule(u, "tsql.routine-options")));
+}
+
+#[test]
+fn security_definer_procedures_cannot_commit() {
+    let src = "CREATE PROCEDURE dbo.Purge @Id int WITH EXECUTE AS OWNER AS\nBEGIN\n  BEGIN TRAN;\n  DELETE FROM dbo.item WHERE item_id = @Id;\n  COMMIT;\nEND\n";
+    let c = tsql(src);
+    assert!(!c.output.contains("SECURITY DEFINER"), "{}", c.output);
+    assert!(c
+        .units
+        .iter()
+        .any(|u| has_rule(u, "pg.security-definer-transaction")));
+}
