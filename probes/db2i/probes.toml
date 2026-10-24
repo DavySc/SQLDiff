@@ -23,7 +23,8 @@
 # outcome.when   fields: create (SQLSTATE of creating the procedure), call (SQLSTATE
 #                of the CALL itself), state, code, n1, n2, text (the O_ values).
 #                Patterns: "00000" exact, "!00000" set and different, "null", "*",
-#                "=0", ">0", ">=1", "<3", "contains:UPDATE", "prefix:*USER/".
+#                "=0", ">0", ">=1", "<3", "contains:UPDATE", "prefix:*USER/",
+#                "regex:..." (the whole value must match).
 #                First match wins.
 # outcome.verdict  consistent (the fact or assumption holds), refines (holds in
 #                substance, a detail is wrong), contradicts, open (an answer to an
@@ -1357,8 +1358,9 @@ procedure = "V25SQL"
 question = "Which USRPRF does a procedure get when it is created under SQL naming without SET OPTION USRPRF (the *NAMING default)?"
 source = "IBM i CREATE PROCEDURE (SQL), SET OPTION USRPRF *NAMING, as summarised in vendor-facts V25: *OWNER under SQL naming. QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
 outcome = [
-  { label = "owner", when = { create = "00000", state = "00000", text = "prefix:*OWNER/" }, verdict = "consistent", meaning = "Under SQL naming the default adopts the owner's authority (text also shows DYNUSRPRF and the naming)." },
-  { label = "user", when = { create = "00000", state = "00000", text = "prefix:*USER/" }, verdict = "contradicts", meaning = "Under SQL naming the default is the caller's authority only." },
+  { label = "owner", when = { create = "00000", state = "00000", text = 'regex:\*OWNER/.*/\*SQL' }, verdict = "consistent", meaning = "Under SQL naming the default adopts the owner's authority (text also shows DYNUSRPRF)." },
+  { label = "user", when = { create = "00000", state = "00000", text = 'regex:\*USER/.*/\*SQL' }, verdict = "contradicts", meaning = "Under SQL naming the default is the caller's authority only." },
+  { label = "not SQL naming", when = { create = "00000", state = "00000", text = 'regex:\*(OWNER|USER)/.*/\*SYS' }, verdict = "open", meaning = "The interface created the routine under system naming, so this run does not answer the SQL naming case; rerun with SQL naming." },
   { label = "view unreadable", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "QSYS2.PROGRAM_INFO could not be read (SQLSTATE in state)." },
 ]
 
@@ -1396,8 +1398,9 @@ procedure = "V25SYS"
 question = "Which USRPRF does a procedure get when it is created under system naming without SET OPTION USRPRF?"
 source = "IBM i CREATE PROCEDURE (SQL), SET OPTION USRPRF *NAMING, as summarised in vendor-facts V25: *USER under system naming. The procedure is created by RUN_DDL_SYS (SET OPTION NAMING = *SYS). QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
 outcome = [
-  { label = "user", when = { create = "00000", state = "00000", text = "prefix:*USER/" }, verdict = "consistent", meaning = "Under system naming the default is the caller's authority (text also shows DYNUSRPRF and the naming)." },
-  { label = "owner", when = { create = "00000", state = "00000", text = "prefix:*OWNER/" }, verdict = "contradicts", meaning = "Under system naming the default still adopts the owner's authority." },
+  { label = "user", when = { create = "00000", state = "00000", text = 'regex:\*USER/.*/\*SYS' }, verdict = "consistent", meaning = "Under system naming the default is the caller's authority (text also shows DYNUSRPRF)." },
+  { label = "owner", when = { create = "00000", state = "00000", text = 'regex:\*OWNER/.*/\*SYS' }, verdict = "contradicts", meaning = "Under system naming the default still adopts the owner's authority." },
+  { label = "not system naming", when = { create = "00000", state = "00000", text = 'regex:\*(OWNER|USER)/.*/\*SQL' }, verdict = "open", meaning = "RUN_DDL_SYS did not create the routine under system naming, so this run does not answer the system naming case." },
   { label = "view unreadable", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "QSYS2.PROGRAM_INFO could not be read (SQLSTATE in state)." },
 ]
 

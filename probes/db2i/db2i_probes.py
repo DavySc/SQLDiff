@@ -136,6 +136,11 @@ def validate(defs: dict, facts: dict) -> list[str]:
                     errs.append(f"probe {pid}: outcome {o.get('label')!r} field {k!r}")
                 if not isinstance(pat, str):
                     errs.append(f"probe {pid}: outcome {o.get('label')!r} pattern for {k} must be a string")
+                elif pat.startswith("regex:"):
+                    try:
+                        re.compile(pat[len("regex:"):])
+                    except re.error as e:
+                        errs.append(f"probe {pid}: outcome {o.get('label')!r} bad regex: {e}")
             if not o.get("meaning"):
                 errs.append(f"probe {pid}: outcome {o.get('label')!r} has no meaning")
         if pr.get("role") == "control" and not any(o["verdict"] == "consistent" for o in outs):
@@ -559,6 +564,8 @@ def matches(pattern: str, value) -> bool:
         return pattern[len("contains:"):] in str(value)
     if pattern.startswith("prefix:"):
         return str(value).startswith(pattern[len("prefix:"):])
+    if pattern.startswith("regex:"):
+        return re.fullmatch(pattern[len("regex:"):], str(value)) is not None
     if pattern.startswith("!"):
         return str(value) != pattern[1:]
     m = re.fullmatch(r"(>=|<=|=|>|<)(-?\d+)", pattern)
