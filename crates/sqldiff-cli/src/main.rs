@@ -499,6 +499,47 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     }
 }
 
+/// Reports of every pair, in pair order. Pairs are independent, so they run
+/// on all cores; each report is the one a sequential run gives.
+fn run_pairs(
+    pipe: &Pipeline,
+    sides: &[(Artifact, Artifact)],
+    opts: &sqldiff_core::Options,
+) -> Vec<Report> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(sides.len());
+    if threads <= 1 {
+        return sides
+            .iter()
+            .map(|(a, b)| pipe.run(a, Some(b), opts))
+            .collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut done: Vec<(usize, Report)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((a, b)) = sides.get(i) else {
+                            return out;
+                        };
+                        out.push((i, pipe.run(a, Some(b), opts)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+            .collect()
+    });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
 fn tree(
     dir_a: &Path,
     dir_b: &Path,
@@ -510,13 +551,20 @@ fn tree(
     let cfg = &pipe.cfg.clone();
     let t = tree::pair_dirs(dir_a, dir_b, da, db, cfg).map_err(|e| e.0)?;
     let opts = cfg.options();
-    let mut reports = Vec::new();
-    for p in &t.pairs {
-        let (a, b) = t.read(p, cfg).map_err(|e| e.0)?;
-        let (fa, fb) = p.fragments();
-        let frag = |f: Option<&str>| f.map(|f| format!("#{f}")).unwrap_or_default();
-        reports.push((pipe.run(&a, Some(&b), &opts), [frag(fa), frag(fb)]));
-    }
+    let sides = t
+        .pairs
+        .iter()
+        .map(|p| t.read(p, cfg).map_err(|e| e.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    let frag = |f: Option<&str>| f.map(|f| format!("#{f}")).unwrap_or_default();
+    let mut reports: Vec<_> = run_pairs(&pipe, &sides, &opts)
+        .into_iter()
+        .zip(&t.pairs)
+        .map(|(r, p)| {
+            let (fa, fb) = p.fragments();
+            (r, [frag(fa), frag(fb)])
+        })
+        .collect();
     let (only_a, only_b) = (t.only_a, t.only_b);
     let ambiguous: Vec<serde_json::Value> = t
         .ambiguous

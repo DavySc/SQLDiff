@@ -11,5 +11,5 @@ pub mod profile;
 pub mod witness;
 
 pub use cfg::{lower, Cfg};
-pub use interp::{explore, Exit, Fate, Fault, Outcome, Routed, Scenario};
+pub use interp::{explore, Exit, Explorer, Fate, Fault, Outcome, Routed, Scenario};
 pub use profile::{ErrorKind, Profile};

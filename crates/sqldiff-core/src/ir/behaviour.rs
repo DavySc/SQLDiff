@@ -19,12 +19,14 @@
 //! `concurrency.split-statement`. [`what_if`] answers one scenario on demand,
 //! and [`Env`] re-runs the analysis under flipped scenario assumptions.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use sqldiff_syntax::{ast, SyntaxNode};
 
 use super::cfg::{lower, Cfg, Effect, NodeId};
-use super::interp::{explore, Exit, Fate, Fault, Outcome, Routed, Scenario, TempState};
+use super::interp::{Exit, Explorer, Fate, Fault, Outcome, Routed, Scenario, TempState};
 use super::profile::ErrorKind;
 use super::witness::{PathStep, ScenarioInfo, ScenarioKind, SideOutcome, WhatIf, Witness};
 use crate::artifact::Analyzed;
@@ -73,6 +75,53 @@ pub fn assumption(id: &str) -> Assumption {
 struct SideIr<'x, 'a> {
     a: &'x Analyzed<'a>,
     cfg: Cfg,
+    /// Document-order position and node of the first effect with each key.
+    at: HashMap<String, (usize, NodeId)>,
+    /// Plain reads of each temporary object, in document order.
+    reads: HashMap<String, Vec<NodeId>>,
+    /// Number of effects per key without its `#n` occurrence suffix.
+    bases: HashMap<String, usize>,
+}
+
+impl<'x, 'a> SideIr<'x, 'a> {
+    /// Lowers one side and indexes its effects and reads: the scenarios
+    /// look keys up for every outcome pair, so a scan per lookup made large
+    /// routines cubic.
+    fn new(a: &'x Analyzed<'a>) -> Self {
+        let cfg = lower(a);
+        let mut at = HashMap::new();
+        let mut bases = HashMap::new();
+        for (i, (n, e)) in cfg.effect_nodes().into_iter().enumerate() {
+            at.entry(e.key.clone()).or_insert((i, n));
+            if let Some((b, _)) = e.key.rsplit_once('#') {
+                *bases.entry(b.to_string()).or_insert(0) += 1;
+            }
+        }
+        let mut reads: HashMap<String, Vec<NodeId>> = HashMap::new();
+        for i in 0..cfg.nodes.len() {
+            let Some(s) = cfg.node(i).stmt() else {
+                continue;
+            };
+            if s.durable_effect().is_some() {
+                continue;
+            }
+            for (j, t) in s.temp_reads.iter().enumerate() {
+                if !s.temp_reads[..j].contains(t) {
+                    reads.entry(t.clone()).or_default().push(i);
+                }
+            }
+        }
+        for v in reads.values_mut() {
+            v.sort_by_key(|&i| cfg.node(i).syntax.as_ref().map(|s| s.text_range().start()));
+        }
+        SideIr {
+            a,
+            cfg,
+            at,
+            reads,
+            bases,
+        }
+    }
 }
 
 impl SideIr<'_, '_> {
@@ -85,24 +134,14 @@ impl SideIr<'_, '_> {
     }
 
     fn effect(&self, key: &str) -> Option<(NodeId, &Effect)> {
-        self.cfg
-            .effect_nodes()
-            .into_iter()
-            .find(|(_, e)| e.key == key)
+        let &(_, n) = self.at.get(key)?;
+        Some((n, self.cfg.node(n).stmt()?.durable_effect()?))
     }
 
     /// Statements that read temporary object `t` without a durable effect
     /// of their own, in document order.
-    fn plain_reads(&self, t: &str) -> Vec<NodeId> {
-        let mut v: Vec<NodeId> = (0..self.cfg.nodes.len())
-            .filter(|&i| {
-                self.cfg.node(i).stmt().is_some_and(|s| {
-                    s.durable_effect().is_none() && s.temp_reads.iter().any(|x| x == t)
-                })
-            })
-            .collect();
-        v.sort_by_key(|&i| self.syntax(i).map(|s| s.text_range().start()));
-        v
+    fn plain_reads(&self, t: &str) -> &[NodeId] {
+        self.reads.get(t).map_or(&[], Vec::as_slice)
     }
 
     /// Key of a statement that reads a temporary object: its durable effect,
@@ -151,13 +190,7 @@ impl SideIr<'_, '_> {
         };
         let p = effect_phrase(e);
         let (base, n) = key.rsplit_once('#').unwrap_or((key, "1"));
-        let repeated = self
-            .cfg
-            .effect_nodes()
-            .iter()
-            .filter(|(_, x)| x.key.rsplit_once('#').map(|y| y.0) == Some(base))
-            .count()
-            > 1;
+        let repeated = self.bases.get(base).is_some_and(|&c| c > 1);
         if !repeated {
             return p;
         }
@@ -176,15 +209,6 @@ impl SideIr<'_, '_> {
             Some(n) => format!("{} ({})", self.phrase(key), self.line(n)),
             None => key.to_string(),
         }
-    }
-
-    /// Position of an effect in document order (for ordering divergences).
-    fn order(&self, key: &str) -> usize {
-        self.cfg
-            .effect_nodes()
-            .iter()
-            .position(|(_, e)| e.key == key)
-            .unwrap_or(usize::MAX)
     }
 }
 
@@ -355,21 +379,73 @@ fn continues(o: &Outcome) -> bool {
         && !matches!(o.exit, Exit::Raised(_))
 }
 
-/// Differences between one outcome of each side under one scenario.
+/// Keys of the effects whose fate differs between two outcomes (including
+/// effects that ran in only one), in key order.
+fn differing<'o>(a: &'o BTreeMap<Rc<str>, Fate>, b: &'o BTreeMap<Rc<str>, Fate>) -> Vec<&'o str> {
+    let mut out = Vec::new();
+    let (mut ia, mut ib) = (a.iter().peekable(), b.iter().peekable());
+    loop {
+        match (ia.peek(), ib.peek()) {
+            (None, None) => return out,
+            (Some(&(ka, fa)), Some(&(kb, fb))) if ka == kb => {
+                if fa != fb {
+                    out.push(&**ka);
+                }
+                ia.next();
+                ib.next();
+            }
+            (Some(&(ka, _)), Some(&(kb, _))) if ka < kb => {
+                out.push(&**ka);
+                ia.next();
+            }
+            (Some(&(ka, _)), None) => {
+                out.push(&**ka);
+                ia.next();
+            }
+            (_, Some(&(kb, _))) => {
+                out.push(&**kb);
+                ib.next();
+            }
+        }
+    }
+}
+
+/// Temporary objects an outcome reads, by read key: (key, object, state seen).
+type Reads = BTreeSet<(String, String, TempState)>;
+
+fn reads(s: &SideIr, o: &Outcome) -> Reads {
+    o.temp_reads
+        .iter()
+        .filter_map(|(n, t, st)| Some((s.read_key(*n, t)?, t.clone(), *st)))
+        .collect()
+}
+
+/// Differences between one outcome of each side under one scenario. The
+/// text of a divergence is written only when `need(rule, anchor)`: a caller
+/// that already has the divergence from another outcome pair only counts it,
+/// and writing the text for every pair of a branchy routine was most of the
+/// work.
 fn diff(
     sa: &SideIr,
     sb: &SideIr,
     splits: &[Split],
     sc: &Kind,
-    oa: &Outcome,
-    ob: &Outcome,
+    (oa, ra): (&Outcome, &Reads),
+    (ob, rb): (&Outcome, &Reads),
+    need: &dyn Fn(&str, &str) -> bool,
 ) -> Vec<Div> {
+    let text = |rule: &str, anchor: &str, f: &dyn Fn() -> String| {
+        if need(rule, anchor) {
+            f()
+        } else {
+            String::new()
+        }
+    };
     let mut out = Vec::new();
     let fault_key = match sc {
         Kind::Fault { key, .. } => Some(key.as_str()),
         _ => None,
     };
-    let both = |k: &String| sa.effect(k).is_some() && sb.effect(k).is_some();
     // 1. The failing statement's own rows.
     if let Some(fk) = fault_key {
         let (fa, fb) = (oa.effects.get(fk), ob.effects.get(fk));
@@ -384,11 +460,13 @@ fn diff(
                 ChangeClass::Transactional,
                 Severity::High,
                 fk,
-                format!(
+                text("txn.statement-atomicity", fk, &|| {
+                    format!(
                     "{} rolls the statement back; {} keeps the rows it changed before the error, because statements are atomic only under commitment control",
                     q.name(),
                     p.name()
-                ),
+                )
+                }),
             );
             d.assumptions = vec!["ASM-MULTI-ROW".into()];
             d.durability = true;
@@ -420,41 +498,50 @@ fn diff(
             ChangeClass::Transactional,
             Severity::Critical,
             caller,
-            format!(
-                "{} {}; {} {}",
-                sa.name(),
-                caller_phrase(ca),
-                sb.name(),
-                caller_phrase(cb)
-            ),
+            text(rule, caller, &|| {
+                format!(
+                    "{} {}; {} {}",
+                    sa.name(),
+                    caller_phrase(ca),
+                    sb.name(),
+                    caller_phrase(cb)
+                )
+            }),
         );
         d.durability = true;
         out.push(d);
     }
-    // 2. Effects that ran on both sides with different fates.
-    let mut keys: Vec<&String> = oa.effects.keys().collect();
-    for k in ob.effects.keys() {
-        if !keys.contains(&k) {
-            keys.push(k);
-        }
-    }
-    keys.sort_by_key(|k| (sa.order(k), sb.order(k)));
-    let mut fate_diffs = Vec::new();
-    let mut control_diffs = Vec::new();
-    for k in keys {
-        if Some(k.as_str()) == fault_key || !both(k) {
+    // 2. Effects that ran on both sides with different fates; the first of
+    // each kind in document order is reported.
+    type First<'k> = Option<((usize, usize), &'k str, Option<Fate>, Option<Fate>)>;
+    let (mut first_fate, mut first_control): (First, First) = (None, None);
+    for k in differing(&oa.effects, &ob.effects) {
+        if Some(k) == fault_key {
             continue;
         }
+        let (Some(&(ia, _)), Some(&(ib, _))) = (sa.at.get(k), sb.at.get(k)) else {
+            continue;
+        };
         let (fa, fb) = (oa.effects.get(k).copied(), ob.effects.get(k).copied());
-        if fa == fb {
-            continue;
-        }
-        let ran_before = oa.before_fault.contains(k) || ob.before_fault.contains(k);
-        match (fa, fb) {
-            (Some(_), Some(_)) => fate_diffs.push((k.clone(), fa, fb, ran_before)),
-            _ => control_diffs.push((k.clone(), fa, fb)),
+        let slot = match (fa, fb) {
+            (Some(_), Some(_)) => &mut first_fate,
+            _ => &mut first_control,
+        };
+        if !matches!(slot, Some((o, ..)) if *o <= (ia, ib)) {
+            *slot = Some(((ia, ib), k, fa, fb));
         }
     }
+    let fate_diffs: Vec<_> = first_fate
+        .map(|(_, k, fa, fb)| {
+            let ran_before = oa.before_fault.contains(k) || ob.before_fault.contains(k);
+            (k.to_string(), fa, fb, ran_before)
+        })
+        .into_iter()
+        .collect();
+    let control_diffs: Vec<_> = first_control
+        .map(|(_, k, fa, fb)| (k.to_string(), fa, fb))
+        .into_iter()
+        .collect();
     let scenario_rule = |before: bool| match sc {
         Kind::CallerTxn => "txn.caller-transaction",
         Kind::Fault { .. } if before => "txn.atomicity",
@@ -472,13 +559,15 @@ fn diff(
             ChangeClass::Transactional,
             Severity::Critical,
             k,
-            format!(
-                "{} {}; {} {}",
-                sa.name(),
-                fate_phrase(sa, k, *fa),
-                sb.name(),
-                fate_phrase(sb, k, *fb)
-            ),
+            text(scenario_rule(*before), k, &|| {
+                format!(
+                    "{} {}; {} {}",
+                    sa.name(),
+                    fate_phrase(sa, k, *fa),
+                    sb.name(),
+                    fate_phrase(sb, k, *fb)
+                )
+            }),
         );
         d.assumptions = asm;
         d.durability = true;
@@ -489,13 +578,17 @@ fn diff(
     // so does the durable state (transactional).
     if fault_key.is_some() {
         if let Some((k, fa, fb)) = control_diffs.first() {
-            let text = format!(
-                "{} {}; {} {}",
-                sa.name(),
-                fate_phrase(sa, k, *fa),
-                sb.name(),
-                fate_phrase(sb, k, *fb)
-            );
+            let text = if need("error.control", k) || need("txn.durability", k) {
+                format!(
+                    "{} {}; {} {}",
+                    sa.name(),
+                    fate_phrase(sa, k, *fa),
+                    sb.name(),
+                    fate_phrase(sb, k, *fb)
+                )
+            } else {
+                String::new()
+            };
             out.push(Div::new(
                 "error.control",
                 ChangeClass::Semantic,
@@ -540,13 +633,15 @@ fn diff(
             },
             Severity::High,
             fault_key.unwrap_or("exit"),
-            format!(
-                "{} {}; {} {}",
-                sa.name(),
-                exit_phrase(oa),
-                sb.name(),
-                exit_phrase(ob)
-            ),
+            text(rule, fault_key.unwrap_or("exit"), &|| {
+                format!(
+                    "{} {}; {} {}",
+                    sa.name(),
+                    exit_phrase(oa),
+                    sb.name(),
+                    exit_phrase(ob)
+                )
+            }),
         );
         d.assumptions = asm;
         out.push(d);
@@ -564,25 +659,28 @@ fn diff(
             None
         };
         if let Some((c, oc, x, _)) = pair {
-            let next = after_fault(oc)
-                .map(|n| c.line(n))
-                .filter(|l| !l.is_empty())
-                .map(|l| format!(" ({l} runs next)"))
-                .unwrap_or_default();
-            let ends = match &oc.exit {
-                Exit::Code(code) => format!("returns code {code}"),
-                _ => "returns normally".to_string(),
-            };
+            let t = text("txn.caller-continuation", fk, &|| {
+                let next = after_fault(oc)
+                    .map(|n| c.line(n))
+                    .filter(|l| !l.is_empty())
+                    .map(|l| format!(" ({l} runs next)"))
+                    .unwrap_or_default();
+                let ends = match &oc.exit {
+                    Exit::Code(code) => format!("returns code {code}"),
+                    _ => "returns normally".to_string(),
+                };
+                format!(
+                    "{} reports the error and carries on{next}; the call {ends}, so the caller's batch goes on and can commit its work; {} raises the error, so the calling statement fails and a caller's transaction block is aborted",
+                    c.name(),
+                    x.name()
+                )
+            });
             out.push(Div::new(
                 "txn.caller-continuation",
                 ChangeClass::Transactional,
                 Severity::High,
                 fk,
-                format!(
-                    "{} reports the error and carries on{next}; the call {ends}, so the caller's batch goes on and can commit its work; {} raises the error, so the calling statement fails and a caller's transaction block is aborted",
-                    c.name(),
-                    x.name()
-                ),
+                t,
             ));
         }
     }
@@ -596,24 +694,34 @@ fn diff(
                 (sb, ob, sa, oa)
             };
             let kept = matches!(
-                op.effects.get(&s.part_key),
+                op.effects.get(s.part_key.as_str()),
                 Some(Fate::Durable | Fate::Partial)
             );
             let merge_kept = matches!(
-                om.effects.get(&s.merge_key),
+                om.effects.get(s.merge_key.as_str()),
                 Some(Fate::Durable | Fate::Partial)
             );
-            if kept && !merge_kept && op.before_fault.contains(&s.part_key) {
+            if kept && !merge_kept && op.before_fault.contains(s.part_key.as_str()) {
                 let mut d = Div::new(
                     "txn.atomicity",
                     ChangeClass::Transactional,
                     Severity::Critical,
                     &s.merge_key,
-                    format!(
-                        "{} does it in one statement, which fails as a whole and changes nothing; {} has already run {}, which stays durable",
-                        m.name(),
-                        p.name(),
-                        p.phrase_at(&s.part_key)
+                    text(
+                        "txn.atomicity",
+                        if s.merge_on_a {
+                            &s.merge_key
+                        } else {
+                            &s.part_key
+                        },
+                        &|| {
+                            format!(
+                            "{} does it in one statement, which fails as a whole and changes nothing; {} has already run {}, which stays durable",
+                            m.name(),
+                            p.name(),
+                            p.phrase_at(&s.part_key)
+                        )
+                        },
                     ),
                 );
                 if !s.merge_on_a {
@@ -631,16 +739,8 @@ fn diff(
     // 7. Temporary state seen by aligned statements. One finding per
     // statement (the first temporary table that differs): the scenario
     // counts a divergence once per outcome pair.
-    type Reads = BTreeSet<(String, String, TempState)>;
-    let reads = |s: &SideIr, o: &Outcome| -> Reads {
-        o.temp_reads
-            .iter()
-            .filter_map(|(n, t, st)| Some((s.read_key(*n, t)?, t.clone(), *st)))
-            .collect()
-    };
-    let (ra, rb) = (reads(sa, oa), reads(sb, ob));
     let mut reported: Vec<&String> = Vec::new();
-    for (k, t, _) in ra.symmetric_difference(&rb) {
+    for (k, t, _) in ra.symmetric_difference(rb) {
         if reported.contains(&k) || sa.locate(k).is_none() || sb.locate(k).is_none() {
             continue;
         }
@@ -659,15 +759,17 @@ fn diff(
             ChangeClass::Transactional,
             Severity::High,
             k,
-            format!(
-                "{} reads the temporary table {}, which on {} {} and on {} {}",
-                sa.phrase(k),
-                t.to_lowercase(),
-                sa.name(),
-                state(&ra),
-                sb.name(),
-                state(&rb)
-            ),
+            text("txn.temp-state", k, &|| {
+                format!(
+                    "{} reads the temporary table {}, which on {} {} and on {} {}",
+                    sa.phrase(k),
+                    t.to_lowercase(),
+                    sa.name(),
+                    state(ra),
+                    sb.name(),
+                    state(rb)
+                )
+            }),
         ));
     }
     out
@@ -777,7 +879,7 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
         ..SideOutcome::default()
     };
     for (k, f) in &o.effects {
-        let p = if k == super::interp::CALLER {
+        let p = if &**k == super::interp::CALLER {
             "the caller's earlier work".to_string()
         } else {
             s.phrase_at(k)
@@ -794,7 +896,7 @@ fn side_outcome(s: &SideIr, o: &Outcome) -> SideOutcome {
         .iter()
         .filter(|(k, f)| **f == Fate::Undone && o.before_fault.contains(*k))
         .map(|(k, _)| {
-            if k == super::interp::CALLER {
+            if &**k == super::interp::CALLER {
                 "the caller's earlier work".to_string()
             } else {
                 s.phrase(k)
@@ -860,9 +962,9 @@ fn norm_cond(c: &str) -> String {
 /// Pairs the outcomes of both sides: by path signature when both sides
 /// branch on the same conditions, otherwise every combination (and the
 /// verdict is capped at unknown unless all combinations agree).
-fn pairs<'o>(pa: &'o [Outcome], pb: &'o [Outcome]) -> (Vec<(&'o Outcome, &'o Outcome)>, bool) {
+fn pairs(pa: &[Outcome], pb: &[Outcome]) -> (Vec<(usize, usize)>, bool) {
     if pa.len() == 1 && pb.len() == 1 {
-        return (vec![(&pa[0], &pb[0])], true);
+        return (vec![(0, 0)], true);
     }
     let sig = |o: &Outcome| -> Vec<(String, bool)> {
         o.signature
@@ -870,19 +972,27 @@ fn pairs<'o>(pa: &'o [Outcome], pb: &'o [Outcome]) -> (Vec<(&'o Outcome, &'o Out
             .map(|(c, b)| (norm_cond(c), *b))
             .collect()
     };
-    let sb: HashSet<_> = pb.iter().map(sig).collect();
-    let sa: HashSet<_> = pa.iter().map(sig).collect();
+    let (siga, sigb): (Vec<_>, Vec<_>) =
+        (pa.iter().map(sig).collect(), pb.iter().map(sig).collect());
+    let sb: HashSet<_> = sigb.iter().collect();
+    let sa: HashSet<_> = siga.iter().collect();
     if sa == sb {
-        let v = pa
+        // The first outcome of B with each signature.
+        let mut first: HashMap<&Vec<(String, bool)>, usize> = HashMap::new();
+        for (j, s) in sigb.iter().enumerate() {
+            first.entry(s).or_insert(j);
+        }
+        let v = siga
             .iter()
-            .filter_map(|a| pb.iter().find(|b| sig(b) == sig(a)).map(|b| (a, b)))
+            .enumerate()
+            .filter_map(|(i, s)| first.get(s).map(|&j| (i, j)))
             .collect();
         return (v, true);
     }
     let mut v = Vec::new();
-    for a in pa {
-        for b in pb {
-            v.push((a, b));
+    for i in 0..pa.len() {
+        for j in 0..pb.len() {
+            v.push((i, j));
         }
     }
     (v, false)
@@ -906,21 +1016,23 @@ struct Collector<'x, 'a> {
     seen: HashSet<(String, String)>,
     /// Index in `out.findings` of the routine-wide finding of each rule.
     contract_at: HashMap<&'static str, usize>,
+    /// Each side's fault-free run, which fault scenarios resume from.
+    xa: OnceCell<Explorer>,
+    xb: OnceCell<Explorer>,
 }
 
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(a: &'x Analyzed<'a>, b: &'x Analyzed<'a>, env: Env) -> Self {
         let mut c = Collector {
-            sa: SideIr { a, cfg: lower(a) },
-            sb: SideIr {
-                a: b,
-                cfg: lower(b),
-            },
+            sa: SideIr::new(a),
+            sb: SideIr::new(b),
             env,
             splits: Vec::new(),
             out: Behaviour::default(),
             seen: HashSet::new(),
             contract_at: HashMap::new(),
+            xa: OnceCell::new(),
+            xb: OnceCell::new(),
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -944,11 +1056,19 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_a: &Scenario,
         scen_b: &Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
-        let mut pa = explore(&self.sa.cfg, scen_a);
-        let mut pb = explore(&self.sb.cfg, scen_b);
+        let base = self.env.scenario();
+        let (ca, cb) = (&self.sa.cfg, &self.sb.cfg);
+        let mut pa = self
+            .xa
+            .get_or_init(|| Explorer::new(ca, &base))
+            .explore(ca, scen_a);
+        let mut pb = self
+            .xb
+            .get_or_init(|| Explorer::new(cb, &base))
+            .explore(cb, scen_b);
         if let Kind::Fault { key, .. } = sc {
             // Only paths that reach the failing statement belong to the scenario.
-            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key);
+            let reached = |o: &Outcome| o.fault_hit || o.effects.contains_key(key.as_str());
             pa.retain(reached);
             pb.retain(reached);
         }
@@ -960,8 +1080,11 @@ impl<'x, 'a> Collector<'x, 'a> {
     fn persists(&self, sc: &Kind, scen_a: &Scenario, scen_b: &Scenario, d: &Div) -> bool {
         let (pa, pb) = self.outcomes(sc, scen_a, scen_b);
         let (ps, _) = pairs(&pa, &pb);
-        ps.iter().any(|(oa, ob)| {
-            diff(&self.sa, &self.sb, &self.splits, sc, oa, ob)
+        let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
+        let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
+        ps.iter().any(|&(i, j)| {
+            let (a, b) = ((&pa[i], &ra[i]), (&pb[j], &rb[j]));
+            diff(&self.sa, &self.sb, &self.splits, sc, a, b, &|_, _| false)
                 .iter()
                 .any(|x| x.rule == d.rule && x.anchor == d.anchor)
         })
@@ -979,11 +1102,23 @@ impl<'x, 'a> Collector<'x, 'a> {
         }
         let (ps, exact) = pairs(&pa, &pb);
         let combos = ps.len();
+        let ra: Vec<Reads> = pa.iter().map(|o| reads(&self.sa, o)).collect();
+        let rb: Vec<Reads> = pb.iter().map(|o| reads(&self.sb, o)).collect();
         let mut found: Vec<(Div, &Outcome, &Outcome, usize)> = Vec::new();
-        for (oa, ob) in &ps {
+        for &(i, j) in &ps {
+            let (oa, ob) = (&pa[i], &pb[j]);
             // Each divergence counts once per outcome pair.
             let mut here: Vec<(&str, String)> = Vec::new();
-            for d in diff(&self.sa, &self.sb, &self.splits, &sc, oa, ob) {
+            // Text only for divergences that may still be emitted.
+            let need = |rule: &str, anchor: &str| {
+                !found
+                    .iter()
+                    .any(|x| x.0.rule == rule && x.0.anchor == anchor)
+                    && !self.seen.contains(&(rule.to_string(), anchor.to_string()))
+            };
+            let (a, b) = ((oa, &ra[i]), (ob, &rb[j]));
+            let ds = diff(&self.sa, &self.sb, &self.splits, &sc, a, b, &need);
+            for d in ds {
                 if here.contains(&(d.rule, d.anchor.clone())) {
                     continue;
                 }
@@ -1205,11 +1340,11 @@ impl<'x, 'a> Collector<'x, 'a> {
             .effect_nodes()
             .into_iter()
             .map(|(_, e)| e.key.clone())
-            .filter(|k| self.sb.cfg.node_of_effect(k).is_some())
+            .filter(|k| self.sb.effect(k).is_some())
             .collect();
         for key in keys {
-            let na = self.sa.cfg.node_of_effect(&key).expect("effect node");
-            let nb = self.sb.cfg.node_of_effect(&key).expect("effect node");
+            let na = self.sa.effect(&key).expect("effect node").0;
+            let nb = self.sb.effect(&key).expect("effect node").0;
             let (ra, rb) = (self.sa.raises(na), self.sb.raises(nb));
             for kind in ErrorKind::ALL {
                 if !ra.contains(&kind) && !rb.contains(&kind) {
