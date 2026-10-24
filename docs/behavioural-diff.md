@@ -23,6 +23,15 @@ Per scenario and path, the outcome tuples are compared. Each kind of divergence
 becomes one finding, anchored to both sides, with a plain-language witness and
 a structured one.
 
+A fault scenario runs exactly like the baseline until the exploration first
+reaches the failing statement (the scenario's faults are consulted only
+there), so `ir::Explorer` runs the baseline once, keeps checkpoints of the
+whole exploration, and resumes each fault scenario from the checkpoint before
+its statement. The outcomes are the ones a full run gives, in the same order
+(`crates/sqldiff-core/tests/explorer.rs` checks every statement and error kind
+on the corpus); this keeps routines of several hundred statements well under
+a second.
+
 | Rule | Class | Divergence |
 |---|---|---|
 | `txn.statement-atomicity` | transactional | One side keeps the failing statement's rows changed before the error |
