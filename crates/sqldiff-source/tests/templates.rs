@@ -299,3 +299,32 @@ fn a_convention_plus_the_item_list_decides_in_t_sql() {
     assert!(a.text.contains("([COMMA], [TAB])"), "{}", a.text);
     assert!(!a.text.contains("READ"), "{}", a.text);
 }
+
+#[test]
+fn glued_names_are_placeholders_without_a_list() {
+    let pack = format!("{PACK}placeholders = \"pattern\"\n");
+    let cfg = cfg_with(&pack, "glued");
+    let text = "set @[parmtr_id][comma] = 1;\nexecute exh_[add_chg_del]_item;\n\
+                select [read] from [dbo].[t];\n";
+    let r = tree::template_diff(
+        &Artifact::new("a.sql", Dialect::Tsql, text),
+        &Artifact::new("b.sql", Dialect::Tsql, text),
+        [None, None],
+        &cfg,
+        &Options::default(),
+    )
+    .unwrap();
+    let a = r
+        .assumptions
+        .iter()
+        .find(|a| a.id == "ASM-TEMPLATE-PLACEHOLDER-PATTERN-A")
+        .expect("declared convention");
+    // Lower-case, but glued to `@`, an identifier or another delimited name.
+    for p in ["[parmtr_id]", "[comma]", "[add_chg_del]"] {
+        assert!(a.text.contains(p), "{p}: {}", a.text);
+    }
+    // Free-standing lower-case names stay quoted names.
+    for q in ["[read]", "[dbo]", "[t]"] {
+        assert!(!a.text.contains(q), "{q}: {}", a.text);
+    }
+}

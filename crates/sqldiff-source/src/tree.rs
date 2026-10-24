@@ -85,7 +85,7 @@ pub fn template_report(
     };
     use sqldiff_core::model::Side;
     use sqldiff_syntax::template::Template;
-    use sqldiff_syntax::template::{Compiled, Decision};
+    use sqldiff_syntax::template::{Candidate, Compiled, Decision};
 
     let t = cfg
         .policy
@@ -133,22 +133,27 @@ pub fn template_report(
         Compiled::new(&def).map_err(Error::new)?
     };
     let parse = |text: &str, d: Dialect, list: &Option<BTreeSet<String>>| -> Template {
-        match list {
-            _ if !by_pattern => Template::parse(text, syntax_for(d), list.as_ref()),
-            Some(l) if delimiters_quote_names(&t.open, d) => {
-                let listed = |n: &str| {
-                    l.contains(n) || (t.ignore_case && l.iter().any(|x| x.eq_ignore_ascii_case(n)))
-                };
-                Template::parse_with(text, &any_name, &|raw| {
-                    if convention.is_match(raw) || listed(raw) {
-                        Decision::Placeholder
-                    } else {
-                        Decision::Sql
-                    }
-                })
-            }
-            _ => Template::parse(text, syntax_for(d), None),
+        if !by_pattern {
+            return Template::parse(text, syntax_for(d), list.as_ref());
         }
+        if !delimiters_quote_names(&t.open, d) {
+            return Template::parse(text, syntax_for(d), None);
+        }
+        // Where the delimiters also quote names: the convention, the source's
+        // list, and placement decide. A glued name (`@[x]`, `a_[x]`, `[x][y]`)
+        // cannot be a quoted identifier, whatever its case.
+        let listed = |n: &str| {
+            list.as_ref().is_some_and(|l| {
+                l.contains(n) || (t.ignore_case && l.iter().any(|x| x.eq_ignore_ascii_case(n)))
+            })
+        };
+        Template::parse_with(text, &any_name, &|c: &Candidate| {
+            if convention.is_match(c.name) || listed(c.name) || c.glued(&t.open, &t.close) {
+                Decision::Placeholder
+            } else {
+                Decision::Sql
+            }
+        })
     };
     let basis = |k: &Option<BTreeSet<String>>| match (k, by_pattern) {
         (_, true) => PlaceholderBasis::DeclaredPattern,

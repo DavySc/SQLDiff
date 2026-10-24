@@ -109,6 +109,31 @@ pub enum Decision {
     Sql,
 }
 
+/// One match of the name pattern, as [`Template::parse_with`] offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidate<'a> {
+    /// The name as written between the delimiters.
+    pub name: &'a str,
+    /// The character just before the opening delimiter.
+    pub prev: Option<char>,
+    /// The character just after the closing delimiter.
+    pub next: Option<char>,
+}
+
+impl Candidate<'_> {
+    /// Directly attached to a variable sigil, to identifier characters or to
+    /// another delimited name (`@[x]`, `a_[x]_b`, `[x][y]`). A quoted
+    /// identifier always stands apart (separated by space, punctuation or a
+    /// `.`), so a glued match can only be a placeholder.
+    pub fn glued(&self, open: &str, close: &str) -> bool {
+        let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
+        self.prev.is_some_and(|c| word(c) || close.ends_with(c))
+            || self
+                .next
+                .is_some_and(|c| (word(c) && c != '@') || open.starts_with(c))
+    }
+}
+
 /// A template split into segments. Segments are contiguous and cover every
 /// byte, so [`Template::print`] returns the input.
 #[derive(Debug, Clone)]
@@ -262,10 +287,10 @@ impl Template {
     /// a placeholder.
     pub fn parse(text: &str, syntax: &Compiled, known: Option<&BTreeSet<String>>) -> Template {
         let ignore_case = syntax.ignore_case;
-        Template::parse_with(text, syntax, &|raw: &str| match known {
+        Template::parse_with(text, syntax, &|c: &Candidate| match known {
             Some(k)
-                if !k.contains(raw)
-                    && !(ignore_case && k.iter().any(|x| x.eq_ignore_ascii_case(raw))) =>
+                if !k.contains(c.name)
+                    && !(ignore_case && k.iter().any(|x| x.eq_ignore_ascii_case(c.name))) =>
             {
                 Decision::Unresolved
             }
@@ -274,12 +299,12 @@ impl Template {
     }
 
     /// Splits `text`, deciding for each match of the name pattern (by its
-    /// name as written) whether it is a placeholder, an unresolved candidate,
-    /// or plain SQL.
+    /// name as written and the characters around it) whether it is a
+    /// placeholder, an unresolved candidate, or plain SQL.
     pub fn parse_with(
         text: &str,
         syntax: &Compiled,
-        decide: &dyn Fn(&str) -> Decision,
+        decide: &dyn Fn(&Candidate) -> Decision,
     ) -> Template {
         let mut marks: Vec<Segment> = Vec::new();
         for (form, re) in &syntax.specials {
@@ -315,7 +340,12 @@ impl Template {
             } else {
                 raw.to_string()
             };
-            let kind = match decide(raw) {
+            let candidate = Candidate {
+                name: raw,
+                prev: text[..all.start()].chars().next_back(),
+                next: text[all.end()..].chars().next(),
+            };
+            let kind = match decide(&candidate) {
                 Decision::Sql => continue,
                 Decision::Unresolved => SegmentKind::Unresolved { name },
                 Decision::Placeholder => SegmentKind::Placeholder { name },
@@ -627,6 +657,26 @@ mod tests {
         let f = t.fragment();
         assert_eq!(f.text, "SELECT [qty] FROM TPL_TABLE;");
         assert_eq!(t.print(), text);
+    }
+
+    #[test]
+    fn glued_names_cannot_be_quoted_identifiers() {
+        let at = |text: &str, name: &str| {
+            let s = text.find(&format!("[{name}]")).unwrap();
+            Candidate {
+                name,
+                prev: text[..s].chars().next_back(),
+                next: text[s + name.len() + 2..].chars().next(),
+            }
+            .glued("[", "]")
+        };
+        let text = "set @[p][comma] = x_[k]_y; select [dbo].[t], ([c]) from [s] where a=[v];";
+        for glued in ["p", "comma", "k"] {
+            assert!(at(text, glued), "{glued}");
+        }
+        for apart in ["dbo", "t", "c", "s", "v"] {
+            assert!(!at(text, apart), "{apart}");
+        }
     }
 
     #[test]
