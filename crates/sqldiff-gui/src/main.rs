@@ -74,7 +74,8 @@ struct PairArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the GUI on a local port and print its URL.
+    /// Serve the GUI on a local port and print its URL. Without files it opens
+    /// convert mode (with its scratch compare).
     Serve {
         #[command(flatten)]
         pair: PairArgs,
@@ -225,8 +226,21 @@ fn run(cli: Cli) -> Result<(), String> {
             port,
             allow_hosts,
         } => {
-            let session = open(pair)?;
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
+            if pair.a.is_none() && pair.report.is_none() {
+                // Nothing to compare yet: open convert mode, whose Compare
+                // switch diffs scratch texts.
+                println!("SQLDiff: {}", url(&listener)?);
+                let setup = convert::Setup {
+                    from: Dialect::Tsql,
+                    to: Dialect::Postgres,
+                    template: None,
+                    text: convert::SAMPLE.to_string(),
+                    name: String::new(),
+                };
+                return convert::serve(listener, setup, &allow_hosts).map_err(|e| e.to_string());
+            }
+            let session = open(pair)?;
             println!("SQLDiff: {}", url(&listener)?);
             serve_with_hosts(listener, session, &allow_hosts).map_err(|e| e.to_string())
         }

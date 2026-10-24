@@ -511,6 +511,26 @@ fn server_serves_page_and_rediffs_edits() {
     .starts_with("HTTP/1.1 200"));
 }
 
+#[test]
+fn convert_mode_is_served_beside_the_pair_view() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || serve(listener, pair_session()));
+    let page = request(
+        port,
+        &format!("GET /convert HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"),
+    );
+    assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+    assert!(page.contains(r#""pair_view":true"#));
+    let (res, v) = post(
+        port,
+        "/api/convert",
+        &serde_json::json!({ "text": "SELECT TOP 1 a FROM t;", "to": "postgres" }),
+    );
+    assert!(res.starts_with("HTTP/1.1 200"), "{res}");
+    assert_eq!(v["conversion"]["output"], "SELECT a FROM t\nLIMIT 1;\n");
+}
+
 const TPL_A: &str = "update [TAB] set [qty] = 0;\n";
 const TPL_B: &str = "update [TAB] set qty = 0;\n";
 

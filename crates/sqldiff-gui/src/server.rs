@@ -12,6 +12,8 @@
 //! - `POST /api/assumption` `{"id": "...", "flip": "open|confirmed|denied"}`
 //! - `POST /api/review` `{"fingerprint", "snapshot", "state": "accepted|rejected|commented|null", "comment"}`
 //! - `POST /api/refresh`: re-read sources
+//! - `GET /convert`, `POST /api/convert`, `POST /api/compare`: convert mode
+//!   and its scratch compare (see `convert`)
 //! - `GET /api/what_if?pair=N&line=L&side=a|b&error=<kind>`: "what if this
 //!   statement fails?" (design §6.1)
 //! - `GET /api/overlay?pair=N`: transaction brackets of both sides (design §6.2)
@@ -139,6 +141,18 @@ pub(crate) struct Request {
     pub path: String,
     pub query: String,
     pub body: Vec<u8>,
+}
+
+/// Convert mode's start: T-SQL → PostgreSQL with the sample.
+fn convert_setup() -> &'static crate::convert::Setup {
+    static SETUP: std::sync::OnceLock<crate::convert::Setup> = std::sync::OnceLock::new();
+    SETUP.get_or_init(|| crate::convert::Setup {
+        from: sqldiff_core::Dialect::Tsql,
+        to: sqldiff_core::Dialect::Postgres,
+        template: None,
+        text: crate::convert::SAMPLE.to_string(),
+        name: String::new(),
+    })
 }
 
 /// Host names (without port) a request may address: loopback names, the
@@ -283,6 +297,10 @@ fn handle(
         Ok(r) => r,
         Err(res) => return respond(&mut stream, res),
     };
+    // Convert mode lives beside the pair view, at /convert.
+    if let Some(res) = crate::convert::route(convert_setup(), &req, "/convert") {
+        return respond(&mut stream, res);
+    }
     let (method, path, query, body) = (req.method, req.path.as_str(), req.query.as_str(), req.body);
     let mut s = session.lock().unwrap_or_else(|e| e.into_inner());
     let res: Response = match (method.as_str(), path) {

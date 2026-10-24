@@ -37,13 +37,55 @@ fn page_embeds_the_payload_safely() {
 }
 
 #[test]
-fn unsupported_pair_reports_an_error() {
+fn a_pair_without_rules_shows_statements_as_not_converted() {
     let s = Setup {
         from: Dialect::Db2i,
         ..setup("SELECT 1")
     };
-    let p = run(&s, "SELECT 1", false);
-    assert!(p.conversion.is_none() && p.error.is_some());
+    let p = run(&s, "SELECT 1;", false);
+    assert!(!p.rules);
+    let c = p.conversion.expect("a conversion, not an error");
+    assert_eq!(c.counts.not_converted, 1);
+    assert!(p.with_rules.contains(&("tsql", "postgres")));
+}
+
+fn post(addr: std::net::SocketAddr, path: &str, body: &serde_json::Value) -> serde_json::Value {
+    let body = body.to_string();
+    let mut s = TcpStream::connect(addr).unwrap();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    serde_json::from_str(resp.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+}
+
+#[test]
+fn the_target_and_the_mode_are_chosen_per_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || serve(listener, setup("SELECT 1;"), &[]));
+    // Another target: no rules yet, every statement not converted.
+    let v = post(
+        addr,
+        "/api/convert",
+        &serde_json::json!({ "text": "SELECT 1;\nSELECT 2;", "to": "db2i" }),
+    );
+    assert_eq!(v["to"], "db2i");
+    assert_eq!(v["rules"], false);
+    assert_eq!(v["conversion"]["counts"]["not_converted"], 2);
+    // Compare: the engine's diff of two scratch texts in any two dialects.
+    let v = post(
+        addr,
+        "/api/compare",
+        &serde_json::json!({ "a": "UPDATE t SET a = 1 WHERE id = 2;", "b": "UPDATE t SET a = 2 WHERE id = 2;", "from": "tsql", "to": "postgres" }),
+    );
+    assert_ne!(v["report"]["verdict"], "equal", "{v}");
+    assert!(!v["report"]["findings"].as_array().unwrap().is_empty());
 }
 
 #[test]
