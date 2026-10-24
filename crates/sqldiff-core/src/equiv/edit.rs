@@ -1,0 +1,2972 @@
+//! Same-dialect edits that the structural diff could only call "modified"
+//! and statement equivalence could not decide: a witness search over the
+//! two versions of the statement (or condition) with `eval`.
+//!
+//! A finding becomes "different" only when the search finds inputs under
+//! which both versions run to completion and their results certainly
+//! differ, and the result is observable: rows written to a table, a result
+//! set, a returned value or raised error, a variable that is read later, or
+//! a condition that sends the two versions into branches that do different
+//! things. Inputs are parameters and columns (chosen freely, within catalog
+//! nullability), constants the routine sets, and local variables whose
+//! earlier assignments are not traced; a witness that needs the latter
+//! carries an assumption that names them.
+
+use std::collections::{HashMap, HashSet};
+
+use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
+
+use super::ast::{parse_stmt_ext as parse_stmt, tokens, Expr, Parser, Stmt, Tok, K};
+use super::eval::{self, Class, Ctx, Found, Hint, Key, Miss, Obs, Origin, Probe, VarFact, V};
+use super::lower;
+use super::schema::{Schema, Ty};
+use super::Outcome;
+use crate::artifact::Analyzed;
+use crate::classify::{stmt_kind, StmtKind};
+use crate::model::{fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Verdict};
+
+const RULE: &str = "equiv.edit";
+
+pub fn witness_path() -> Assumption {
+    Assumption::default(
+        "ASM-WITNESS-PATH",
+        "The witness inputs reach the changed code and its different result reaches a later effect (some conditions, jumps or later statements on the way are not evaluated)",
+    )
+}
+
+pub fn local_values() -> Assumption {
+    Assumption::default(
+        "ASM-LOCAL-VALUES",
+        "Local variables can hold the witness values at the changed statement (their earlier assignments are not traced)",
+    )
+}
+
+/// Re-examines "modified" statements and headers that are still unknown.
+pub fn decide(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    findings: &mut Vec<Finding>,
+    out: &mut Outcome,
+) {
+    if !findings.iter().any(candidate) {
+        return;
+    }
+    let ra = Routine::new(a);
+    let rb = Routine::new(b);
+    for f in findings.iter_mut() {
+        if !candidate(f) {
+            continue;
+        }
+        let (Some(la), Some(lb)) = (&f.a, &f.b) else {
+            continue;
+        };
+        let (Some(na), Some(nb)) = (ra.node_at(la.byte_start), rb.node_at(lb.byte_start)) else {
+            continue;
+        };
+        if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
+            eprintln!("edit: {} at A line {}", f.rule, la.start_line);
+        }
+        let r = examine(&ra, &rb, &na, &nb, sa, sb);
+        if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
+            match &r {
+                Ok(g) => eprintln!("  => different: {}", g.witness),
+                Err(e) => eprintln!("  => {e}"),
+            }
+        }
+        if let Ok(g) = r {
+            for id in &g.assumptions {
+                if *id == local_values().id {
+                    out.assume(local_values());
+                } else if *id == witness_path().id {
+                    out.assume(witness_path());
+                }
+            }
+            let class = f.class.max(ChangeClass::Semantic);
+            *f = Finding {
+                fingerprint: fingerprint(&FingerprintInput {
+                    object: &a.object,
+                    class,
+                    rule: RULE,
+                    anchor_a: &hash_node(&na),
+                    anchor_b: &hash_node(&nb),
+                }),
+                rule: RULE.to_string(),
+                class,
+                severity: class.default_severity(),
+                verdict: Verdict::Different,
+                witness: g.witness,
+                a: f.a.take(),
+                b: f.b.take(),
+                assumptions: g.assumptions,
+            };
+        }
+    }
+}
+
+fn candidate(f: &Finding) -> bool {
+    matches!(f.rule.as_str(), "stmt.modified" | "header.modified") && f.verdict == Verdict::Unknown
+}
+
+fn hash_node(n: &SyntaxNode) -> String {
+    let toks: Vec<String> = cst::sig_tokens(n).map(|t| t.text().to_string()).collect();
+    crate::normalize::hash_strs(toks.iter().map(String::as_str))
+}
+
+struct Decided {
+    witness: String,
+    assumptions: Vec<String>,
+}
+
+// ---- the routine around a statement -----------------------------------------------
+
+/// Where a variable is assigned.
+#[derive(Debug, Clone)]
+struct Site {
+    start: usize,
+    end: usize,
+    /// The assigned expression when it is a plain constant.
+    constant: Option<Expr>,
+    /// The value is a row count (`COUNT(*)`, `ROW_COUNT`).
+    count: bool,
+    /// A declaration (its position fixes the variable's initial value).
+    declare: bool,
+}
+
+struct Routine<'x, 'a> {
+    side: &'x Analyzed<'a>,
+    d: Dialect,
+    params: HashMap<String, (Option<Ty>, bool)>,
+    locals: HashMap<String, Option<Ty>>,
+    records: HashSet<String>,
+    sites: HashMap<String, Vec<Site>>,
+    strict: bool,
+    /// Byte ranges of loop bodies.
+    loops: Vec<(usize, usize)>,
+    /// Significant tokens of the routine body, in order: (offset, upper text, kind).
+    toks: Vec<Tok>,
+    /// T-SQL procedure or script (a bare SELECT returns a result set).
+    result_sets: bool,
+}
+
+impl<'x, 'a> Routine<'x, 'a> {
+    fn new(side: &'x Analyzed<'a>) -> Self {
+        let d = side.dialect();
+        let u = lower::lower(side);
+        let mut params = HashMap::new();
+        for p in &u.params {
+            params.insert(p.name.clone(), (p.ty, p.out));
+        }
+        // Names the routine header declares, also when the routine name is
+        // a template placeholder the header lowering does not accept.
+        if let Some(r) = side
+            .root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ROUTINE)
+        {
+            for p in header_params(&r, d) {
+                params.entry(p.name.clone()).or_insert((p.ty, p.out));
+            }
+        }
+        let strict = d == Dialect::Postgres
+            && side
+                .root
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::ROUTINE)
+                .is_some_and(|r| {
+                    cst::header_tokens(&r)
+                        .iter()
+                        .any(|t| t.text().eq_ignore_ascii_case("STRICT"))
+                });
+        let mut r = Routine {
+            side,
+            d,
+            params,
+            locals: HashMap::new(),
+            records: HashSet::new(),
+            sites: HashMap::new(),
+            strict,
+            loops: Vec::new(),
+            toks: tokens(&side.root),
+            result_sets: d == Dialect::Tsql
+                && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
+        };
+        r.scan();
+        r
+    }
+
+    fn node_at(&self, offset: usize) -> Option<SyntaxNode> {
+        self.side.root.descendants().find(|n| {
+            (n.kind().is_unit() || n.kind() == SyntaxKind::STATEMENT)
+                && cst::sig_range(n).0 == offset
+        })
+    }
+
+    /// Declarations, assignment sites and loops.
+    fn scan(&mut self) {
+        let d = self.d;
+        for n in self.side.root.descendants() {
+            match n.kind() {
+                SyntaxKind::LOOP_STMT => {
+                    let (s, e) = cst::sig_range(&n);
+                    self.loops.push((s, e));
+                    // PL/pgSQL `FOR r IN query LOOP` / `FOR i IN 1..n LOOP`.
+                    if let Some(c) = n.children().find(|c| c.kind() == SyntaxKind::CONDITION) {
+                        let t = tokens(&c);
+                        if t.len() >= 2 && t[1].up == "IN" {
+                            let name = t[0].text.to_lowercase();
+                            if t.get(2)
+                                .is_some_and(|x| x.up == "SELECT" || x.up == "EXECUTE")
+                            {
+                                self.records.insert(name.clone());
+                            }
+                            self.site(&name, &c, None, false, false);
+                        }
+                    }
+                }
+                SyntaxKind::STATEMENT => self.scan_statement(&n, d),
+                _ => {}
+            }
+        }
+    }
+
+    fn site(
+        &mut self,
+        name: &str,
+        node: &SyntaxNode,
+        constant: Option<Expr>,
+        count: bool,
+        declare: bool,
+    ) {
+        let (start, end) = cst::sig_range(node);
+        self.sites.entry(name.to_string()).or_default().push(Site {
+            start,
+            end,
+            constant,
+            count,
+            declare,
+        });
+    }
+
+    fn scan_statement(&mut self, n: &SyntaxNode, d: Dialect) {
+        let t = tokens(n);
+        if t.is_empty() {
+            return;
+        }
+        let in_declare_section = n
+            .parent()
+            .is_some_and(|p| p.kind() == SyntaxKind::DECLARE_SECTION);
+        let constant = |e: &[Tok]| -> Option<Expr> {
+            let mut p = Parser::ext(e, d);
+            let x = p.expr().ok()?;
+            if !p.at_end() {
+                return None;
+            }
+            matches!(
+                x,
+                Expr::Num(_) | Expr::Str(_) | Expr::Null | Expr::Special(_)
+            )
+            .then_some(x)
+        };
+        let is_count = |e: &[Tok]| {
+            e.len() >= 4
+                && matches!(e[0].up.as_str(), "COUNT" | "COUNT_BIG")
+                && e[1].kind == K::LParen
+        };
+        if in_declare_section {
+            // `name [CONSTANT] type [:= | = | DEFAULT init];`
+            let name = t[0].text.to_lowercase();
+            let mut p = Parser::ext(&t[1..], d);
+            let ty = p.ty().ok();
+            let at = 1 + p.i;
+            match &ty {
+                Some(ty) if ty.name == "RECORD" => {
+                    self.records.insert(name.clone());
+                }
+                _ => {}
+            }
+            if t.iter().any(|x| x.up.contains("%ROWTYPE") || x.up == "%") {
+                self.records.insert(name.clone());
+            }
+            let ty = ty.map(|ty| Ty::from_type(&ty, d, false));
+            self.locals.insert(name.clone(), ty);
+            let init = t
+                .get(at)
+                .is_some_and(|x| x.text == ":=" || x.text == "=" || x.up == "DEFAULT");
+            let c = if init {
+                constant(&t[at + 1..])
+            } else {
+                Some(Expr::Null)
+            };
+            if init || c.is_some() {
+                self.site(&name, n, c, false, true);
+            }
+            return;
+        }
+        let first = t[0].up.as_str();
+        match first {
+            "DECLARE" if d == Dialect::Tsql => {
+                // DECLARE @a int = 1, @b nvarchar(10);
+                let mut i = 1;
+                while i < t.len() {
+                    if t[i].kind != K::Var {
+                        break;
+                    }
+                    let name = t[i].text.trim_start_matches('@').to_lowercase();
+                    let mut j = i + 1;
+                    if t.get(j).is_some_and(|x| x.up == "AS") {
+                        j += 1;
+                    }
+                    if t.get(j)
+                        .is_some_and(|x| x.up == "CURSOR" || x.up == "TABLE")
+                    {
+                        break;
+                    }
+                    let mut p = Parser::ext(&t[j..], d);
+                    let ty = p.ty().ok().map(|ty| Ty::from_type(&ty, d, false));
+                    self.locals.insert(name.clone(), ty);
+                    let mut k = j + p.i;
+                    let mut depth = 0;
+                    let init_start = if t.get(k).is_some_and(|x| x.text == "=") {
+                        k += 1;
+                        Some(k)
+                    } else {
+                        None
+                    };
+                    while k < t.len() {
+                        match t[k].kind {
+                            K::LParen => depth += 1,
+                            K::RParen => depth -= 1,
+                            K::Comma if depth == 0 => break,
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    let c = match init_start {
+                        Some(s) => constant(&t[s..k]),
+                        None => Some(Expr::Null),
+                    };
+                    let count = init_start.is_some_and(|s| {
+                        t.get(s).is_some_and(|x| x.kind == K::LParen)
+                            && is_count(&t[(s + 1).min(t.len())..])
+                    });
+                    self.site(&name, n, c, count, true);
+                    i = k + 1;
+                }
+            }
+            "SET" if t.len() >= 3 && (t[1].kind == K::Var || t[2].text.ends_with('=')) => {
+                let name = t[1].text.trim_start_matches('@').to_lowercase();
+                let plain = t[2].text == "=";
+                let c = if plain { constant(&t[3..]) } else { None };
+                self.site(&name, n, c, false, false);
+            }
+            "SELECT" if d == Dialect::Tsql => {
+                // SELECT @a = x, @b = y FROM ...
+                let mut depth = 0;
+                for (i, x) in t.iter().enumerate() {
+                    match x.kind {
+                        K::LParen => depth += 1,
+                        K::RParen => depth -= 1,
+                        K::Var if depth == 0 && t.get(i + 1).is_some_and(|y| y.text == "=") => {
+                            let prev_ok = i == 1 || t[i - 1].kind == K::Comma;
+                            if prev_ok {
+                                let name = x.text.trim_start_matches('@').to_lowercase();
+                                let count = is_count(&t[i + 2..]);
+                                self.site(&name, n, None, count, false);
+                            }
+                        }
+                        K::Word if depth == 0 && x.up == "FROM" => break,
+                        _ => {}
+                    }
+                }
+            }
+            "GET" => {
+                // GET DIAGNOSTICS v = ROW_COUNT
+                if let Some(i) = t.iter().position(|x| x.text == "=" || x.text == ":=") {
+                    if i >= 1 {
+                        let name = t[i - 1].text.to_lowercase();
+                        let count = t.get(i + 1).is_some_and(|x| x.up == "ROW_COUNT");
+                        self.site(&name, n, None, count, false);
+                    }
+                }
+            }
+            _ => {}
+        }
+        // PL/pgSQL `v := e` / `v = e`.
+        if d != Dialect::Tsql
+            && t.len() >= 3
+            && matches!(t[0].kind, K::Word | K::Quoted)
+            && (t[1].text == ":=" || (t[1].text == "=" && !matches!(first, "SET" | "UPDATE")))
+        {
+            let name = t[0].text.to_lowercase();
+            self.site(&name, n, constant(&t[2..]), false, false);
+        }
+        if d != Dialect::Tsql && t.len() >= 4 && t[1].kind == K::LParen {
+            // `arr[0] := e` style targets are not traced.
+        }
+        // INTO targets: SELECT ... INTO a, b / FETCH c INTO a / RETURNING ... INTO / EXECUTE ... INTO.
+        let mut depth = 0;
+        let mut i = 0;
+        while i < t.len() {
+            match t[i].kind {
+                K::LParen => depth += 1,
+                K::RParen => depth -= 1,
+                K::Word if depth == 0 && t[i].up == "INTO" && first != "INSERT" => {
+                    let count = first == "SELECT" && is_count(&t[1..]);
+                    let mut j = i + 1;
+                    if t.get(j).is_some_and(|x| x.up == "STRICT") {
+                        j += 1;
+                    }
+                    while let Some(x) = t.get(j) {
+                        if !matches!(x.kind, K::Word | K::Var | K::Quoted) || is_clause(&x.up) {
+                            break;
+                        }
+                        let name = x.text.trim_start_matches('@').to_lowercase();
+                        self.site(&name, n, None, count, false);
+                        j += 1;
+                        if t.get(j).is_some_and(|x| x.kind == K::Comma) {
+                            j += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i = j;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        // EXEC ... @v OUTPUT.
+        if d == Dialect::Tsql {
+            for (i, x) in t.iter().enumerate() {
+                if x.kind == K::Var
+                    && t.get(i + 1)
+                        .is_some_and(|y| y.up == "OUTPUT" || y.up == "OUT")
+                {
+                    let name = x.text.trim_start_matches('@').to_lowercase();
+                    self.site(&name, n, None, false, false);
+                }
+            }
+        }
+    }
+
+    fn in_loop(&self, at: usize) -> Option<(usize, usize)> {
+        self.loops
+            .iter()
+            .filter(|(s, e)| *s < at && at < *e)
+            .min_by_key(|(s, e)| e - s)
+            .copied()
+    }
+
+    /// Facts about every parameter and variable, as seen at `at`.
+    fn facts(&self, at: usize, node: &SyntaxNode) -> HashMap<String, VarFact> {
+        let mut out = HashMap::new();
+        let names: HashSet<&String> = self.params.keys().chain(self.locals.keys()).collect();
+        let lp = self.in_loop(at);
+        for name in names {
+            let sites = self.sites.get(name).cloned().unwrap_or_default();
+            let ty = self
+                .params
+                .get(name)
+                .map(|p| p.0)
+                .or_else(|| self.locals.get(name).copied())
+                .flatten();
+            let is_param = self.params.contains_key(name);
+            let assigns: Vec<&Site> = sites.iter().filter(|s| !s.declare).collect();
+            let mut f = VarFact {
+                ty,
+                origin: Origin::Assumed,
+                value: None,
+                nullable: true,
+                non_negative: false,
+                cands: Vec::new(),
+            };
+            if is_param && assigns.is_empty() {
+                f.origin = Origin::Free;
+                f.nullable = !self.strict;
+            } else if !is_param {
+                // Constant: one site, a constant, before `at` and not repeated by a loop.
+                let reachable: Vec<&Site> = sites
+                    .iter()
+                    .filter(|s| {
+                        s.start < at || lp.is_some_and(|(ls, le)| ls <= s.start && s.end <= le)
+                    })
+                    .collect();
+                if let [only] = reachable.as_slice() {
+                    if let (Some(c), true) = (
+                        &only.constant,
+                        sites.len() == 1
+                            || only.declare
+                                && sites.iter().all(|s| {
+                                    s.start > at
+                                        && lp.map_or(true, |(ls, le)| {
+                                            !(ls <= s.start && s.end <= le)
+                                        })
+                                }),
+                    ) {
+                        if let Some(v) = constant_value(c) {
+                            f.origin = Origin::Fixed;
+                            f.value = Some(v);
+                        }
+                    }
+                }
+                if f.origin != Origin::Fixed
+                    && !reachable.is_empty()
+                    && reachable.iter().all(|s| s.count)
+                {
+                    f.origin = Origin::Free;
+                    f.non_negative = true;
+                    f.nullable = false;
+                }
+            }
+            out.insert(name.clone(), f);
+        }
+        // T-SQL system values that depend on the previous statement.
+        if self.d == Dialect::Tsql {
+            let prev_reads_table = prev_statement(node).is_some_and(|p| {
+                let k = stmt_kind(&p, self.d);
+                matches!(
+                    k,
+                    StmtKind::Select
+                        | StmtKind::Insert
+                        | StmtKind::Update
+                        | StmtKind::Delete
+                        | StmtKind::Merge
+                ) || cst::first_words(&p, 1)
+                    .first()
+                    .is_some_and(|w| w == "FETCH")
+            });
+            let origin = if prev_reads_table {
+                Origin::Free
+            } else {
+                Origin::Assumed
+            };
+            out.insert(
+                "@rowcount".into(),
+                VarFact {
+                    ty: Some(Ty::of(super::schema::Fam::Int)),
+                    origin,
+                    value: None,
+                    nullable: false,
+                    non_negative: true,
+                    cands: vec![V::Int(0), V::Int(1), V::Int(2)],
+                },
+            );
+            out.insert(
+                "@fetch_status".into(),
+                VarFact {
+                    ty: Some(Ty::of(super::schema::Fam::Int)),
+                    origin,
+                    value: None,
+                    nullable: false,
+                    non_negative: false,
+                    cands: vec![V::Int(0), V::Int(-1)],
+                },
+            );
+        } else {
+            out.insert(
+                "found".into(),
+                VarFact {
+                    ty: Some(Ty::of(super::schema::Fam::Bool)),
+                    origin: Origin::Assumed,
+                    value: None,
+                    nullable: false,
+                    non_negative: false,
+                    cands: vec![V::Bool(true), V::Bool(false)],
+                },
+            );
+        }
+        out
+    }
+
+    fn is_out(&self, name: &str) -> bool {
+        self.params.get(name).is_some_and(|p| p.1)
+    }
+
+    /// Whether a table is a temporary table or table variable that is not read after the statement.
+    fn dead_table(&self, table: &str, end: usize) -> bool {
+        let temp = table.starts_with('#') || table.starts_with('@');
+        if !temp {
+            return false;
+        }
+        !self
+            .toks
+            .iter()
+            .any(|t| t.off >= end && t.text.eq_ignore_ascii_case(table))
+    }
+}
+
+fn header_params(r: &SyntaxNode, d: Dialect) -> Vec<lower::Param> {
+    let toks: Vec<Tok> = cst::header_tokens(r)
+        .iter()
+        .map(Tok::from_syntax)
+        .filter(|t| t.kind != K::Semi)
+        .collect();
+    let Some(kw) = toks
+        .iter()
+        .position(|t| matches!(t.up.as_str(), "FUNCTION" | "PROCEDURE" | "PROC"))
+    else {
+        return Vec::new();
+    };
+    let list: &[Tok] = if d == Dialect::Tsql {
+        let Some(first) = toks[kw..]
+            .iter()
+            .position(|t| t.kind == K::Var || t.kind == K::LParen)
+        else {
+            return Vec::new();
+        };
+        let start = kw + first;
+        if toks[start].kind == K::LParen {
+            let close = lower::matching(&toks, start);
+            &toks[start + 1..close.min(toks.len())]
+        } else {
+            let end = toks[start..]
+                .iter()
+                .position(|t| {
+                    t.kind == K::Word && matches!(t.up.as_str(), "AS" | "WITH" | "RETURNS")
+                })
+                .map(|x| start + x)
+                .unwrap_or(toks.len());
+            &toks[start..end]
+        }
+    } else {
+        let Some(open) = toks[kw..].iter().position(|t| t.kind == K::LParen) else {
+            return Vec::new();
+        };
+        let open = kw + open;
+        let close = lower::matching(&toks, open);
+        &toks[open + 1..close.min(toks.len())]
+    };
+    lower::split_commas(list)
+        .into_iter()
+        .filter_map(|p| lower::param(p, d))
+        .collect()
+}
+
+fn is_clause(up: &str) -> bool {
+    matches!(
+        up,
+        "FROM"
+            | "WHERE"
+            | "USING"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "RETURNING"
+            | "VALUES"
+            | "SELECT"
+    )
+}
+
+fn prev_statement(n: &SyntaxNode) -> Option<SyntaxNode> {
+    let mut cur = n.prev_sibling();
+    while let Some(p) = cur {
+        if p.kind() == SyntaxKind::STATEMENT {
+            return Some(p);
+        }
+        if p.kind().is_unit() {
+            return None;
+        }
+        cur = p.prev_sibling();
+    }
+    None
+}
+
+fn constant_value(e: &Expr) -> Option<V> {
+    Some(match e {
+        Expr::Null => V::Null,
+        Expr::Num(n) => match n.parse::<i128>() {
+            Ok(i) => V::Int(i),
+            Err(_) => V::Num(n.parse().ok()?),
+        },
+        Expr::Str(s) => V::Str(s.clone()),
+        Expr::Special(s) if s == "TRUE" => V::Bool(true),
+        Expr::Special(s) if s == "FALSE" => V::Bool(false),
+        _ => return None,
+    })
+}
+
+// ---- reaching the statement and reading its result ---------------------------------
+
+/// A jump that leaves the statement sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Jump {
+    /// Always leaves (RETURN, THROW, RAISE EXCEPTION, GOTO, BREAK, ...).
+    Always,
+    /// May leave (RAISERROR inside TRY, EXIT WHEN, ...).
+    Maybe,
+}
+
+/// How the changed unit is reached: conditions that must hold for the
+/// witness, and the lines of conditions or jumps on the way that are not
+/// evaluated.
+#[derive(Debug, Default)]
+struct Reach {
+    guards: Vec<(Expr, bool)>,
+    untraced: Vec<usize>,
+}
+
+/// Whether a value is read after the changed unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    /// Read on every path that continues (line of the read).
+    Always(usize),
+    /// Read only on some paths (line of the first possible read).
+    Maybe(usize),
+    /// Overwritten or never mentioned again.
+    Never,
+}
+
+/// Outcome of scanning a unit for a variable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    Read(usize),
+    Overwritten,
+    /// Possibly read (inside a branch or loop body).
+    Maybe(usize),
+    Untouched,
+}
+
+impl<'x, 'a> Routine<'x, 'a> {
+    fn line(&self, n: &SyntaxNode) -> usize {
+        self.side.line_of(n)
+    }
+
+    /// Whether a statement jumps out of the sequence that holds `target`.
+    fn jump(&self, s: &SyntaxNode, target: &SyntaxNode) -> Option<Jump> {
+        let w = cst::first_words(s, 2);
+        let first = w.first().map(String::as_str).unwrap_or("");
+        let second = w.get(1).map(String::as_str).unwrap_or("");
+        let in_try = || {
+            target
+                .ancestors()
+                .any(|a| a.kind() == SyntaxKind::TRY_BLOCK)
+        };
+        // Loop jumps only matter when the loop they leave holds the target.
+        let loop_holds_target = || {
+            s.ancestors()
+                .find(|a| a.kind() == SyntaxKind::LOOP_STMT)
+                .is_some_and(|lp| target.ancestors().any(|a| a == lp))
+        };
+        let conditional = tokens(s).iter().any(|t| t.up == "WHEN");
+        match first {
+            "RETURN" if matches!(second, "NEXT" | "QUERY") => None,
+            "RETURN" | "GOTO" | "SIGNAL" | "RESIGNAL" => Some(Jump::Always),
+            "THROW" => Some(Jump::Always),
+            "RAISE" if self.d == Dialect::Postgres => {
+                (!matches!(second, "NOTICE" | "INFO" | "LOG" | "DEBUG" | "WARNING"))
+                    .then_some(Jump::Always)
+            }
+            "RAISERROR" => in_try().then_some(Jump::Maybe),
+            "BREAK" | "CONTINUE" | "EXIT" | "LEAVE" | "ITERATE" if loop_holds_target() => {
+                Some(if conditional {
+                    Jump::Maybe
+                } else {
+                    Jump::Always
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether some statement inside `u` may jump out of the sequence that holds `target`.
+    fn has_jump(&self, u: &SyntaxNode, target: &SyntaxNode) -> bool {
+        u.descendants_with_tokens().any(|e| {
+            e.as_node().is_some_and(|x| {
+                x.kind() == SyntaxKind::STATEMENT && self.jump(x, target).is_some()
+            }) || e.as_node().is_some_and(|x| x.kind() == SyntaxKind::LABEL)
+        }) || (u.kind() == SyntaxKind::STATEMENT && self.jump(u, target).is_some())
+    }
+
+    /// Whether running `u` always ends in a jump out of the sequence that holds `target`.
+    fn always_jumps(&self, u: &SyntaxNode, target: &SyntaxNode) -> bool {
+        match u.kind() {
+            SyntaxKind::STATEMENT => self.jump(u, target) == Some(Jump::Always),
+            SyntaxKind::BLOCK | SyntaxKind::BRANCH => u
+                .children()
+                .filter(|c| c.kind().is_unit())
+                .last()
+                .is_some_and(|c| self.always_jumps(&c, target)),
+            _ => false,
+        }
+    }
+
+    /// Conditions under which `n` runs, from enclosing IF/WHILE conditions
+    /// and earlier `IF ... RETURN`-style guards. Err when `n` is never reached.
+    fn reach(&self, n: &SyntaxNode) -> Result<Reach, String> {
+        let at = cst::sig_range(n).0;
+        let mut r = Reach::default();
+        let mut cur = n.clone();
+        while let Some(p) = cur.parent() {
+            if matches!(
+                p.kind(),
+                SyntaxKind::ROUTINE | SyntaxKind::BATCH | SyntaxKind::SOURCE_FILE
+            ) {
+                break;
+            }
+            // Handlers run after an error, not after the units before them.
+            let handler = matches!(
+                cur.kind(),
+                SyntaxKind::CATCH_BLOCK
+                    | SyntaxKind::EXCEPTION_SECTION
+                    | SyntaxKind::EXCEPTION_HANDLER
+                    | SyntaxKind::HANDLER
+            );
+            let earlier: Vec<SyntaxNode> = if handler {
+                Vec::new()
+            } else {
+                cur.siblings(rowan::Direction::Prev)
+                    .skip(1)
+                    .filter(|s| s.kind().is_unit())
+                    .collect()
+            };
+            for s in earlier {
+                self.earlier(&s, n, at, &mut r)?;
+            }
+            match p.kind() {
+                SyntaxKind::BRANCH => {
+                    if let Some(g) = p.parent() {
+                        let conds: Vec<SyntaxNode> = g
+                            .children()
+                            .filter(|c| c.kind() == SyntaxKind::CONDITION)
+                            .collect();
+                        let idx = g
+                            .children()
+                            .filter(|c| c.kind() == SyntaxKind::BRANCH)
+                            .position(|b| b == p)
+                            .unwrap_or(0);
+                        match g.kind() {
+                            SyntaxKind::IF_STMT => {
+                                for (j, c) in conds.iter().enumerate() {
+                                    if j > idx {
+                                        break;
+                                    }
+                                    self.guard(c, j == idx, at, &mut r);
+                                }
+                            }
+                            SyntaxKind::LOOP_STMT => {
+                                let w = cst::first_words(&g, 1);
+                                match w.first().map(String::as_str) {
+                                    Some("WHILE") if conds.len() == 1 => {
+                                        self.guard(&conds[0], true, at, &mut r)
+                                    }
+                                    Some("LOOP") => {}
+                                    _ => r.untraced.push(self.line(&g)),
+                                }
+                            }
+                            _ => r.untraced.push(self.line(&g)),
+                        }
+                    }
+                }
+                SyntaxKind::CATCH_BLOCK
+                | SyntaxKind::EXCEPTION_SECTION
+                | SyntaxKind::EXCEPTION_HANDLER
+                | SyntaxKind::HANDLER
+                | SyntaxKind::CASE_STMT => r.untraced.push(self.line(&p)),
+                _ => {}
+            }
+            cur = p;
+        }
+        r.untraced.sort_unstable();
+        r.untraced.dedup();
+        Ok(r)
+    }
+
+    /// An earlier unit `s` in a sequence that leads to `n`.
+    fn earlier(
+        &self,
+        s: &SyntaxNode,
+        n: &SyntaxNode,
+        at: usize,
+        r: &mut Reach,
+    ) -> Result<(), String> {
+        if !self.has_jump(s, n) {
+            return Ok(());
+        }
+        if s.kind() == SyntaxKind::STATEMENT
+            && self.jump(s, n) == Some(Jump::Always)
+            && !self.has_labels()
+        {
+            return Err(format!(
+                "the statement is never reached (it follows the jump at line {})",
+                self.line(s)
+            ));
+        }
+        if s.kind() == SyntaxKind::IF_STMT {
+            let conds: Vec<SyntaxNode> = s
+                .children()
+                .filter(|c| c.kind() == SyntaxKind::CONDITION)
+                .collect();
+            let branches: Vec<SyntaxNode> = s
+                .children()
+                .filter(|c| c.kind() == SyntaxKind::BRANCH)
+                .collect();
+            if conds.len() == 1 && !self.has_labels() {
+                let then = &branches[0];
+                let els = branches.get(1);
+                let then_jumps = self.always_jumps(then, n);
+                let else_jumps = els.is_some_and(|e| self.always_jumps(e, n));
+                if then_jumps && else_jumps {
+                    return Err(format!(
+                        "the statement is never reached (both branches at line {} jump)",
+                        self.line(s)
+                    ));
+                }
+                if then_jumps && !els.is_some_and(|e| self.has_jump(e, n)) {
+                    self.guard(&conds[0], false, at, r);
+                    return Ok(());
+                }
+                if else_jumps && !self.has_jump(then, n) {
+                    self.guard(&conds[0], true, at, r);
+                    return Ok(());
+                }
+            }
+        }
+        r.untraced.push(self.line(s));
+        Ok(())
+    }
+
+    fn has_labels(&self) -> bool {
+        self.side
+            .root
+            .descendants()
+            .any(|x| x.kind() == SyntaxKind::LABEL)
+    }
+
+    /// Adds condition `c` as a guard when its value at `c` is still its
+    /// value at `at`: the variables it reads are not assigned in between,
+    /// and the tables it reads are not written in between.
+    fn guard(&self, c: &SyntaxNode, must: bool, at: usize, r: &mut Reach) {
+        let line = self.line(c);
+        let Ok(e) = cond_expr(c, self.d) else {
+            r.untraced.push(line);
+            return;
+        };
+        let (cs, ce) = cst::sig_range(c);
+        // Loops around `at` that do not hold the condition repeat assignments.
+        let loops: Vec<(usize, usize)> = self
+            .loops
+            .iter()
+            .filter(|(s, e)| *s < at && at < *e && !(*s <= cs && ce <= *e))
+            .copied()
+            .collect();
+        let between = |pos: usize| {
+            (ce <= pos && pos < at) || loops.iter().any(|(s, e)| *s <= pos && pos < *e)
+        };
+        let mut ok = true;
+        let mut reads_table = false;
+        eval::walk_expr(&e, &mut |x| match x {
+            Expr::Var(v) => {
+                let k = eval::var_key(v);
+                if k.starts_with('@')
+                    || self
+                        .sites
+                        .get(&k)
+                        .is_some_and(|ss| ss.iter().any(|s| !s.declare && between(s.start)))
+                {
+                    ok = false;
+                }
+            }
+            Expr::Name(p) if p.len() == 1 && self.d != Dialect::Tsql => {
+                let k = p[0].to_lowercase();
+                if k == "found"
+                    || self
+                        .sites
+                        .get(&k)
+                        .is_some_and(|ss| ss.iter().any(|s| !s.declare && between(s.start)))
+                {
+                    ok = false;
+                }
+            }
+            Expr::Exists(_) | Expr::Subquery(_) | Expr::InQuery(..) => reads_table = true,
+            Expr::Call(_) => {}
+            _ => {}
+        });
+        if reads_table {
+            let writes = self.side.root.descendants().any(|s| {
+                s.kind() == SyntaxKind::STATEMENT && between(cst::sig_range(&s).0) && {
+                    let k = stmt_kind(&s, self.d);
+                    matches!(
+                        k,
+                        StmtKind::Insert
+                            | StmtKind::Update
+                            | StmtKind::Delete
+                            | StmtKind::Merge
+                            | StmtKind::Call
+                            | StmtKind::Ddl
+                    ) || cst::first_words(&s, 1).first().is_some_and(|w| {
+                        matches!(
+                            w.as_str(),
+                            "EXEC" | "EXECUTE" | "PERFORM" | "CALL" | "TRUNCATE"
+                        )
+                    })
+                }
+            });
+            if writes {
+                ok = false;
+            }
+        }
+        if ok {
+            r.guards.push((e, must));
+        } else {
+            r.untraced.push(line);
+        }
+    }
+
+    /// Whether variable `name` is read after unit `n` runs.
+    fn read_after(&self, name: &str, n: &SyntaxNode) -> Read {
+        let mut maybe: Option<usize> = None;
+        let mut cur = n.clone();
+        loop {
+            let later: Vec<SyntaxNode> = cur
+                .siblings(rowan::Direction::Next)
+                .skip(1)
+                .filter(|s| s.kind().is_unit())
+                .collect();
+            for s in later {
+                match self.scan_var(name, &s) {
+                    Scan::Read(l) => return maybe.map_or(Read::Always(l), Read::Maybe),
+                    Scan::Overwritten => return maybe.map_or(Read::Never, Read::Maybe),
+                    Scan::Maybe(l) => {
+                        maybe.get_or_insert(l);
+                    }
+                    Scan::Untouched => {}
+                }
+            }
+            let Some(p) = cur.parent() else { break };
+            if matches!(
+                p.kind(),
+                SyntaxKind::ROUTINE | SyntaxKind::BATCH | SyntaxKind::SOURCE_FILE
+            ) {
+                break;
+            }
+            // The end of a loop body goes back to the condition and the body.
+            if p.kind() == SyntaxKind::BRANCH {
+                if let Some(g) = p.parent().filter(|g| g.kind() == SyntaxKind::LOOP_STMT) {
+                    for c in g.children().filter(|c| c.kind() == SyntaxKind::CONDITION) {
+                        if self.mentions(name, &c) {
+                            return maybe.map_or(Read::Always(self.line(&c)), Read::Maybe);
+                        }
+                    }
+                    if self.mentions(name, &p) {
+                        maybe.get_or_insert(self.line(&p));
+                    }
+                }
+            }
+            cur = p;
+        }
+        if self.is_out(name) {
+            return maybe.map_or(Read::Always(0), Read::Maybe);
+        }
+        maybe.map_or(Read::Never, Read::Maybe)
+    }
+
+    /// Whether a parameter's incoming value is read by the routine body.
+    fn read_in_body(&self, name: &str) -> Read {
+        let Some(body) = self
+            .side
+            .root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ROUTINE_BODY)
+        else {
+            return Read::Never;
+        };
+        match self.scan_var(name, &body) {
+            Scan::Read(l) => Read::Always(l),
+            Scan::Maybe(l) => Read::Maybe(l),
+            Scan::Overwritten => Read::Never,
+            Scan::Untouched if self.is_out(name) => Read::Always(0),
+            Scan::Untouched => Read::Never,
+        }
+    }
+
+    fn mentions(&self, name: &str, n: &SyntaxNode) -> bool {
+        tokens(n).iter().any(|t| match t.kind {
+            K::Var => t.text.trim_start_matches('@').eq_ignore_ascii_case(name),
+            K::Word | K::Quoted => self.d != Dialect::Tsql && t.text.eq_ignore_ascii_case(name),
+            _ => false,
+        })
+    }
+
+    /// What unit `u` does with variable `name`.
+    fn scan_var(&self, name: &str, u: &SyntaxNode) -> Scan {
+        match u.kind() {
+            SyntaxKind::STATEMENT => {
+                if !self.mentions(name, u) {
+                    return Scan::Untouched;
+                }
+                let t = tokens(u);
+                let is = |x: &Tok| match x.kind {
+                    K::Var => x.text.trim_start_matches('@').eq_ignore_ascii_case(name),
+                    K::Word | K::Quoted => {
+                        self.d != Dialect::Tsql && x.text.eq_ignore_ascii_case(name)
+                    }
+                    _ => false,
+                };
+                let count = t.iter().filter(|x| is(x)).count();
+                // SET @v = e / v := e without reading v: a plain overwrite.
+                let plain_target = if t.first().is_some_and(|x| x.up == "SET") && t.len() > 2 {
+                    is(&t[1]) && t[2].text == "="
+                } else {
+                    self.d != Dialect::Tsql
+                        && t.len() > 2
+                        && is(&t[0])
+                        && (t[1].text == ":=" || t[1].text == "=")
+                };
+                if plain_target && count == 1 {
+                    return Scan::Overwritten;
+                }
+                // T-SQL SELECT @v = e without FROM also always assigns.
+                if self.d == Dialect::Tsql
+                    && t.first().is_some_and(|x| x.up == "SELECT")
+                    && !t.iter().any(|x| x.up == "FROM")
+                    && count == 1
+                    && t.iter()
+                        .position(|x| is(x))
+                        .is_some_and(|i| t.get(i + 1).is_some_and(|y| y.text == "="))
+                {
+                    return Scan::Overwritten;
+                }
+                // SELECT @v = col FROM ... assigns only when a row qualifies:
+                // later reads may see either value.
+                if self.d == Dialect::Tsql
+                    && t.first().is_some_and(|x| x.up == "SELECT")
+                    && count == 1
+                    && t.iter().position(|x| is(x)).is_some_and(|i| {
+                        t.get(i + 1).is_some_and(|y| y.text == "=")
+                            && (i == 1 || t[i - 1].kind == K::Comma)
+                    })
+                {
+                    return Scan::Maybe(self.line(u));
+                }
+                // INTO targets: PL/pgSQL SELECT INTO always assigns, FETCH INTO may not.
+                if count == 1 {
+                    if let Some(i) = t.iter().position(|x| is(x)) {
+                        let mut j = i;
+                        while j >= 2 && t[j - 1].kind == K::Comma {
+                            j -= 2;
+                        }
+                        if j >= 1 && t[j - 1].up == "INTO" && t[0].up != "INSERT" {
+                            return if t[0].up == "SELECT" && self.d != Dialect::Tsql {
+                                Scan::Overwritten
+                            } else {
+                                Scan::Maybe(self.line(u))
+                            };
+                        }
+                    }
+                }
+                Scan::Read(self.line(u))
+            }
+            SyntaxKind::BLOCK
+            | SyntaxKind::TRY_CATCH
+            | SyntaxKind::TRY_BLOCK
+            | SyntaxKind::BRANCH
+            | SyntaxKind::ROUTINE_BODY => {
+                // Runs in order; a CATCH block may or may not run.
+                for c in u.children() {
+                    if c.kind() == SyntaxKind::CATCH_BLOCK
+                        || c.kind() == SyntaxKind::EXCEPTION_SECTION
+                    {
+                        if self.mentions(name, &c) {
+                            return Scan::Maybe(self.line(&c));
+                        }
+                        continue;
+                    }
+                    if !(c.kind().is_unit() || c.kind() == SyntaxKind::TRY_BLOCK) {
+                        continue;
+                    }
+                    match self.scan_var(name, &c) {
+                        Scan::Untouched => {}
+                        other => return other,
+                    }
+                }
+                Scan::Untouched
+            }
+            SyntaxKind::IF_STMT | SyntaxKind::LOOP_STMT => {
+                // The first condition always runs; the rest may.
+                if let Some(c) = u.children().find(|c| c.kind() == SyntaxKind::CONDITION) {
+                    if self.mentions(name, &c) {
+                        return Scan::Read(self.line(&c));
+                    }
+                }
+                if self.mentions(name, u) {
+                    // A branch that overwrites before reading still counts as a possible read.
+                    let mut first = None;
+                    for b in u
+                        .children()
+                        .filter(|c| matches!(c.kind(), SyntaxKind::BRANCH | SyntaxKind::CONDITION))
+                    {
+                        let s = if b.kind() == SyntaxKind::CONDITION {
+                            if self.mentions(name, &b) {
+                                Scan::Read(self.line(&b))
+                            } else {
+                                Scan::Untouched
+                            }
+                        } else {
+                            self.scan_var(name, &b)
+                        };
+                        if let Scan::Read(l) | Scan::Maybe(l) = s {
+                            first.get_or_insert(l);
+                        }
+                    }
+                    return first.map_or(Scan::Untouched, Scan::Maybe);
+                }
+                Scan::Untouched
+            }
+            _ => {
+                if self.mentions(name, u) {
+                    Scan::Maybe(self.line(u))
+                } else {
+                    Scan::Untouched
+                }
+            }
+        }
+    }
+}
+
+// ---- code that cannot be created --------------------------------------------------
+
+const CMP_OPS: &[&str] = &["<>", "!=", "<", ">", "<=", ">=", "!<", "!>"];
+
+fn is_cmp(t: &Tok) -> bool {
+    t.kind == K::Op && CMP_OPS.contains(&t.text.as_str())
+}
+
+/// Why the tokens of one statement (or routine header) are certainly
+/// rejected when the routine is created: a comparison operator where the
+/// grammar only allows `=` or `:=`, or a type size beyond its limit.
+fn invalid(t: &[Tok], d: Dialect, header: bool) -> Option<String> {
+    let first = t.first().map(|x| x.up.as_str()).unwrap_or("");
+    let at = |i: usize| t.get(i);
+    let cmp_at = |i: usize| at(i).is_some_and(is_cmp);
+    let bad = |i: usize, what: &str| Some(format!("`{}` where {what} needs `=`", t[i].text));
+    // An assignment target followed by a comparison.
+    if first == "SET"
+        && matches!(at(1).map(|x| x.kind), Some(K::Var | K::Word | K::Quoted))
+        && cmp_at(2)
+    {
+        return bad(2, "SET");
+    }
+    if d != Dialect::Tsql && !header {
+        // PL/pgSQL `v <> e;` / `v :<> e`.
+        if matches!(at(0).map(|x| x.kind), Some(K::Word | K::Quoted))
+            && !is_keyword_start(first)
+            && cmp_at(1)
+        {
+            return bad(1, "an assignment");
+        }
+    }
+    for i in 0..t.len().saturating_sub(1) {
+        if t[i].kind == K::Other && t[i].text == ":" && is_cmp(&t[i + 1]) {
+            return bad(i + 1, "`:=`");
+        }
+        // `SET name <> ...` (session settings, function SET clauses, UPDATE SET).
+        if t[i].up == "SET"
+            && t[i].kind == K::Word
+            && matches!(t[i + 1].kind, K::Word | K::Quoted | K::Var)
+            && cmp_at(i + 2)
+        {
+            return bad(i + 2, "SET");
+        }
+    }
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < t.len() {
+        match t[i].kind {
+            K::LParen => depth += 1,
+            K::RParen => depth -= 1,
+            _ => {}
+        }
+        // DECLARE @v type <> e / header `@p type <> default` / PL/pgSQL `v type <> e`.
+        let decl_name = t[i].kind == K::Var
+            && d == Dialect::Tsql
+            && (header
+                && depth <= 1
+                && (i == 0
+                    || matches!(t[i - 1].kind, K::Comma | K::LParen)
+                    || t[i - 1].kind == K::Word
+                        && matches!(t[i - 1].up.as_str(), "PROCEDURE" | "PROC" | "FUNCTION"))
+                || first == "DECLARE" && depth == 0 && (i == 1 || t[i - 1].kind == K::Comma));
+        if decl_name {
+            let mut j = i + 1;
+            if at(j).is_some_and(|x| x.up == "AS") {
+                j += 1;
+            }
+            let mut p = Parser::ext(&t[j.min(t.len())..], d);
+            if p.ty().is_ok() {
+                let k = j + p.i;
+                if cmp_at(k) {
+                    return bad(k, "a default value");
+                }
+            }
+        }
+        i += 1;
+    }
+    if d == Dialect::Tsql && !header {
+        // UPDATE ... SET col <> e, ...  and  EXEC proc @p <> v.
+        if first == "UPDATE" {
+            if let Some(s) = t.iter().position(|x| x.up == "SET") {
+                let mut depth = 0;
+                let mut item_start = s + 1;
+                for k in s + 1..t.len() {
+                    match t[k].kind {
+                        K::LParen => depth += 1,
+                        K::RParen => depth -= 1,
+                        K::Comma if depth == 0 => item_start = k + 1,
+                        K::Word
+                            if depth == 0
+                                && matches!(
+                                    t[k].up.as_str(),
+                                    "FROM" | "WHERE" | "OUTPUT" | "OPTION"
+                                ) =>
+                        {
+                            break
+                        }
+                        _ => {}
+                    }
+                    if depth == 0 && is_cmp(&t[k]) {
+                        // The target is a (qualified) column or a variable right before it.
+                        let target = &t[item_start..k];
+                        let plain = !target.is_empty()
+                            && target
+                                .iter()
+                                .all(|x| matches!(x.kind, K::Word | K::Quoted | K::Var | K::Dot));
+                        if plain {
+                            return bad(k, "UPDATE ... SET");
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(first, "EXEC" | "EXECUTE") {
+            // Arguments are constants, variables or `@p = v`: never comparisons.
+            let mut depth = 0;
+            for (k, x) in t.iter().enumerate() {
+                match x.kind {
+                    K::LParen => depth += 1,
+                    K::RParen => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 && is_cmp(x) {
+                    return bad(k, "a procedure argument");
+                }
+            }
+        }
+        // A comparison directly in a SELECT list (outside CASE and parentheses).
+        if let Some(r) = select_list_comparison(t) {
+            return Some(r);
+        }
+    }
+    type_limits(t, d)
+}
+
+/// Statements that start with a keyword rather than an assignment target.
+fn is_keyword_start(up: &str) -> bool {
+    matches!(
+        up,
+        "SELECT"
+            | "INSERT"
+            | "UPDATE"
+            | "DELETE"
+            | "MERGE"
+            | "WITH"
+            | "RETURN"
+            | "IF"
+            | "WHILE"
+            | "FOR"
+            | "LOOP"
+            | "PERFORM"
+            | "EXECUTE"
+            | "CALL"
+            | "RAISE"
+            | "EXIT"
+            | "CONTINUE"
+            | "OPEN"
+            | "FETCH"
+            | "CLOSE"
+            | "MOVE"
+            | "GET"
+            | "BEGIN"
+            | "END"
+            | "ELSE"
+            | "ELSIF"
+            | "WHEN"
+            | "CASE"
+            | "DECLARE"
+            | "NULL"
+            | "COMMIT"
+            | "ROLLBACK"
+            | "ASSERT"
+            | "SET"
+            | "RESET"
+            | "DROP"
+            | "CREATE"
+            | "ALTER"
+            | "TRUNCATE"
+            | "LOCK"
+            | "GRANT"
+            | "REVOKE"
+            | "COPY"
+            | "VALUES"
+            | "TABLE"
+            | "COMMENT"
+            | "ANALYZE"
+            | "VACUUM"
+            | "REFRESH"
+            | "NOTIFY"
+            | "LISTEN"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "DISCARD"
+            | "IMPORT"
+            | "SECURITY"
+            | "REINDEX"
+            | "CLUSTER"
+    )
+}
+
+/// T-SQL: a comparison operator at the top level of a select list item.
+fn select_list_comparison(t: &[Tok]) -> Option<String> {
+    for (s, x) in t.iter().enumerate() {
+        if x.up != "SELECT" {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut case = 0i32;
+        for k in s + 1..t.len() {
+            match t[k].kind {
+                K::LParen => depth += 1,
+                K::RParen => {
+                    depth -= 1;
+                    if depth < 0 {
+                        break;
+                    }
+                }
+                K::Semi => break,
+                K::Word if depth == 0 => match t[k].up.as_str() {
+                    "CASE" => case += 1,
+                    "END" => case -= 1,
+                    "FROM" | "INTO" | "WHERE" | "GROUP" | "ORDER" | "UNION" | "EXCEPT"
+                    | "INTERSECT" | "OPTION" | "FOR" => break,
+                    _ => {}
+                },
+                _ => {}
+            }
+            if depth == 0 && case == 0 && is_cmp(&t[k]) {
+                return Some(format!(
+                    "`{}` directly in a select list (T-SQL has no boolean values)",
+                    t[k].text
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Type sizes beyond what the engine accepts, in type positions.
+fn type_limits(t: &[Tok], d: Dialect) -> Option<String> {
+    for i in 0..t.len() {
+        let x = &t[i];
+        if x.kind != K::Word || !t.get(i + 1).is_some_and(|y| y.kind == K::LParen) {
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| &t[p]);
+        let type_pos = prev.is_some_and(|p| {
+            p.kind == K::Var
+                || p.up == "AS"
+                || (p.kind == K::LParen
+                    && i >= 2
+                    && matches!(t[i - 2].up.as_str(), "CONVERT" | "TRY_CONVERT"))
+        });
+        if !type_pos {
+            continue;
+        }
+        let num = |k: usize| {
+            t.get(k)
+                .filter(|y| y.kind == K::Num)
+                .and_then(|y| y.text.parse::<i64>().ok())
+        };
+        let Some(a) = num(i + 2) else { continue };
+        let b = if t.get(i + 3).is_some_and(|y| y.kind == K::Comma) {
+            num(i + 4)
+        } else {
+            None
+        };
+        let ty = x.up.as_str();
+        let limit = match (d, ty) {
+            (Dialect::Tsql, "DATETIME2" | "TIME" | "DATETIMEOFFSET") => Some(7),
+            (Dialect::Tsql, "DECIMAL" | "NUMERIC") => Some(38),
+            (Dialect::Tsql, "VARCHAR" | "CHAR" | "VARBINARY" | "BINARY") => Some(8000),
+            (Dialect::Tsql, "NVARCHAR" | "NCHAR") => Some(4000),
+            (Dialect::Tsql, "FLOAT") => Some(53),
+            (Dialect::Postgres, "TIMESTAMP" | "TIMESTAMPTZ" | "TIME" | "TIMETZ" | "INTERVAL") => {
+                Some(6)
+            }
+            (Dialect::Postgres, "NUMERIC" | "DECIMAL") => Some(1000),
+            _ => None,
+        };
+        let Some(limit) = limit else { continue };
+        if a > limit
+            || a < 1
+                && !matches!(
+                    ty,
+                    "DATETIME2"
+                        | "TIME"
+                        | "DATETIMEOFFSET"
+                        | "TIMESTAMP"
+                        | "TIMESTAMPTZ"
+                        | "TIMETZ"
+                        | "INTERVAL"
+                )
+        {
+            return Some(format!(
+                "{}({a}) is beyond the type's limit of {limit}",
+                x.text
+            ));
+        }
+        if let Some(b) = b {
+            if matches!(ty, "DECIMAL" | "NUMERIC") && d == Dialect::Tsql && b > a {
+                return Some(format!(
+                    "{}({a},{b}) has a scale larger than its precision",
+                    x.text
+                ));
+            }
+        }
+    }
+    None
+}
+
+// ---- probes ----------------------------------------------------------------------
+
+/// What a changed unit runs, and how its result is observed.
+struct Shape {
+    probe: Probe,
+    /// For conditions: the branch bodies (None: no branch taken).
+    branches: Vec<SyntaxNode>,
+    /// Statement following a CONTINUE/EXIT WHEN (the rest of the loop body).
+    rest: Vec<SyntaxNode>,
+    kind: ShapeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShapeKind {
+    Data,
+    If,
+    While,
+    ExitWhen,
+    ContinueWhen,
+    Raise,
+    Message,
+    /// The query of a cursor declaration (name of the cursor).
+    Cursor,
+    /// The query of a `FOR r IN query LOOP`.
+    ForQuery,
+}
+
+fn cond_expr(c: &SyntaxNode, d: Dialect) -> Result<Expr, String> {
+    let t = tokens(c);
+    let mut p = Parser::ext(&t, d);
+    let e = p.expr()?;
+    if !p.at_end() {
+        return Err(p.err("unexpected tokens after the condition"));
+    }
+    Ok(e)
+}
+
+fn shape(n: &SyntaxNode, d: Dialect) -> Result<Shape, String> {
+    match n.kind() {
+        SyntaxKind::IF_STMT => {
+            let mut conds = Vec::new();
+            let mut branches = Vec::new();
+            for c in n.children() {
+                match c.kind() {
+                    SyntaxKind::CONDITION => conds.push(cond_expr(&c, d)?),
+                    SyntaxKind::BRANCH => branches.push(c),
+                    _ => {}
+                }
+            }
+            Ok(Shape {
+                probe: Probe::Conds(conds),
+                branches,
+                rest: Vec::new(),
+                kind: ShapeKind::If,
+            })
+        }
+        SyntaxKind::LOOP_STMT => {
+            let words = cst::first_words(n, 1);
+            if words.first().map(String::as_str) == Some("FOR") {
+                // PL/pgSQL `FOR r IN query LOOP`: the rows the loop runs over.
+                let c = n
+                    .children()
+                    .find(|c| c.kind() == SyntaxKind::CONDITION)
+                    .ok_or("loop without a condition")?;
+                let t = tokens(&c);
+                if t.len() < 3 || t[1].up != "IN" || !matches!(t[2].up.as_str(), "SELECT" | "WITH")
+                {
+                    return Err("FOR loop over something other than a query".into());
+                }
+                let s = parse_stmt(&t[2..], d)?;
+                return Ok(Shape {
+                    probe: Probe::Stmt(s),
+                    branches: n
+                        .children()
+                        .filter(|c| c.kind() == SyntaxKind::BRANCH)
+                        .collect(),
+                    rest: Vec::new(),
+                    kind: ShapeKind::ForQuery,
+                });
+            }
+            if words.first().map(String::as_str) != Some("WHILE") {
+                return Err("only WHILE and FOR loops are compared".into());
+            }
+            let c = n
+                .children()
+                .find(|c| c.kind() == SyntaxKind::CONDITION)
+                .ok_or("loop without a condition")?;
+            Ok(Shape {
+                probe: Probe::Conds(vec![cond_expr(&c, d)?]),
+                branches: n
+                    .children()
+                    .filter(|c| c.kind() == SyntaxKind::BRANCH)
+                    .collect(),
+                rest: Vec::new(),
+                kind: ShapeKind::While,
+            })
+        }
+        SyntaxKind::STATEMENT => statement_shape(n, d),
+        _ => Err("not a statement or condition".into()),
+    }
+}
+
+fn statement_shape(n: &SyntaxNode, d: Dialect) -> Result<Shape, String> {
+    let mut t = tokens(n);
+    let first = t.first().map(|x| x.up.clone()).unwrap_or_default();
+    let data = |p: Probe| Shape {
+        probe: p,
+        branches: Vec::new(),
+        rest: Vec::new(),
+        kind: ShapeKind::Data,
+    };
+    match first.as_str() {
+        "THROW" | "RAISERROR" | "RAISE" | "SIGNAL" | "PRINT" => {
+            let kind = match first.as_str() {
+                "PRINT" => ShapeKind::Message,
+                "RAISE"
+                    if t.get(1).is_some_and(|x| {
+                        matches!(
+                            x.up.as_str(),
+                            "NOTICE" | "INFO" | "LOG" | "DEBUG" | "WARNING"
+                        )
+                    }) =>
+                {
+                    ShapeKind::Message
+                }
+                _ => ShapeKind::Raise,
+            };
+            let mut start = 1;
+            if first == "RAISE" {
+                while t
+                    .get(start)
+                    .is_some_and(|x| x.kind == K::Word && x.up != "USING")
+                {
+                    start += 1;
+                }
+            }
+            let inner: &[Tok] = if first == "RAISERROR"
+                && t.get(1).is_some_and(|x| x.kind == K::LParen)
+                && t.last().is_some_and(|x| x.kind == K::RParen)
+            {
+                &t[2..t.len() - 1]
+            } else {
+                &t[start.min(t.len())..]
+            };
+            if inner.iter().any(|x| x.up == "USING" || x.up == "WITH") {
+                return Err("RAISE USING / WITH options".into());
+            }
+            let mut p = Parser::ext(inner, d);
+            let es = if inner.is_empty() {
+                Vec::new()
+            } else {
+                p.expr_list()?
+            };
+            if !p.at_end() {
+                return Err(p.err("unexpected tokens"));
+            }
+            Ok(Shape {
+                probe: Probe::Values(es),
+                branches: Vec::new(),
+                rest: Vec::new(),
+                kind,
+            })
+        }
+        "CONTINUE" | "EXIT" if t.iter().any(|x| x.up == "WHEN") => {
+            let w = t.iter().position(|x| x.up == "WHEN").unwrap();
+            let mut p = Parser::ext(&t[w + 1..], d);
+            let e = p.expr()?;
+            if !p.at_end() {
+                return Err(p.err("unexpected tokens"));
+            }
+            let rest: Vec<SyntaxNode> = n
+                .siblings(rowan::Direction::Next)
+                .skip(1)
+                .filter(|s| s.kind().is_unit())
+                .collect();
+            Ok(Shape {
+                probe: Probe::Conds(vec![e]),
+                branches: Vec::new(),
+                rest,
+                kind: if first == "EXIT" {
+                    ShapeKind::ExitWhen
+                } else {
+                    ShapeKind::ContinueWhen
+                },
+            })
+        }
+        "RETURN" if t.get(1).is_some_and(|x| x.up == "QUERY") => {
+            t.remove(1);
+            let s = parse_stmt(&t[1..], d)?;
+            Ok(data(Probe::Stmt(s)))
+        }
+        "SET"
+            if d == Dialect::Tsql
+                && t.len() >= 3
+                && t[1].kind == K::Var
+                && compound_op(&t[2].text).is_some() =>
+        {
+            // SET @v += e  →  SET @v = @v + (e)
+            let op = compound_op(&t[2].text).unwrap();
+            let mut p = Parser::ext(&t[3..], d);
+            let e = p.expr()?;
+            if !p.at_end() {
+                return Err(p.err("unexpected tokens"));
+            }
+            let v = Expr::Var(t[1].text.clone());
+            Ok(data(Probe::Stmt(Stmt::Assign(
+                v.clone(),
+                Expr::Bin(op.to_string(), Box::new(v), Box::new(e)),
+            ))))
+        }
+        _ => {
+            let in_declare_section = n
+                .parent()
+                .is_some_and(|p| p.kind() == SyntaxKind::DECLARE_SECTION);
+            if in_declare_section {
+                // `name type := init`
+                let mut p = Parser::ext(&t[1..], d);
+                let ty = p.ty()?;
+                let at = 1 + p.i;
+                let default = if t
+                    .get(at)
+                    .is_some_and(|x| x.text == ":=" || x.text == "=" || x.up == "DEFAULT")
+                {
+                    let mut q = Parser::ext(&t[at + 1..], d);
+                    let e = q.expr()?;
+                    if !q.at_end() {
+                        return Err(q.err("unexpected tokens"));
+                    }
+                    Some(e)
+                } else {
+                    None
+                };
+                return Ok(data(Probe::Stmt(Stmt::Declare {
+                    name: t[0].text.clone(),
+                    ty: Some(ty),
+                    default,
+                })));
+            }
+            // PL/pgSQL `v = e` assignment.
+            if d != Dialect::Tsql
+                && t.len() >= 3
+                && t[1].text == "="
+                && matches!(t[0].kind, K::Word | K::Quoted)
+                && !matches!(first.as_str(), "SET" | "UPDATE")
+            {
+                let mut p = Parser::ext(&t[2..], d);
+                let e = p.expr()?;
+                if !p.at_end() {
+                    return Err(p.err("unexpected tokens"));
+                }
+                return Ok(data(Probe::Stmt(Stmt::Assign(
+                    Expr::Name(vec![t[0].text.clone()]),
+                    e,
+                ))));
+            }
+            // DECLARE c [options] CURSOR [options] FOR query
+            if first == "DECLARE"
+                && d == Dialect::Tsql
+                && t.get(1).is_some_and(|x| x.kind != K::Var)
+            {
+                if let Some(c) = t.iter().position(|x| x.up == "CURSOR") {
+                    if let Some(f) = t[c..].iter().position(|x| x.up == "FOR").map(|f| c + f) {
+                        let s = parse_stmt(&t[f + 1..], d)?;
+                        if !matches!(s, Stmt::Select(_)) {
+                            return Err("cursor over something other than a query".into());
+                        }
+                        return Ok(Shape {
+                            probe: Probe::Stmt(s),
+                            branches: Vec::new(),
+                            rest: Vec::new(),
+                            kind: ShapeKind::Cursor,
+                        });
+                    }
+                }
+            }
+            if first == "DECLARE" && d == Dialect::Tsql {
+                // Several variables in one DECLARE: compare the list of initial values.
+                let s = parse_stmt(&t, d);
+                if let Ok(s) = s {
+                    return Ok(data(Probe::Stmt(s)));
+                }
+                return Err("DECLARE of several variables or a table/cursor".into());
+            }
+            Ok(data(Probe::Stmt(parse_stmt(&t, d)?)))
+        }
+    }
+}
+
+fn compound_op(op: &str) -> Option<&'static str> {
+    Some(match op {
+        "+=" => "+",
+        "-=" => "-",
+        "*=" => "*",
+        "/=" => "/",
+        "%=" => "%",
+        _ => return None,
+    })
+}
+
+// ---- hints ----------------------------------------------------------------------
+
+fn name_key(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Var(v) => Some(eval::var_key(v)),
+        Expr::Name(p) => p.last().map(|s| s.to_lowercase()),
+        Expr::Cast(x, _) => name_key(x),
+        _ => None,
+    }
+}
+
+/// Key of a name in the hints: variables (T-SQL `@x`, or a PL/pgSQL name
+/// that is a variable) get a leading `@`, columns do not.
+fn hint_key(e: &Expr, facts: &HashMap<String, VarFact>, d: Dialect) -> Option<String> {
+    match e {
+        Expr::Var(v) => Some(format!("@{}", eval::var_key(v))),
+        Expr::Name(p)
+            if p.len() == 1 && d != Dialect::Tsql && facts.contains_key(&p[0].to_lowercase()) =>
+        {
+            Some(format!("@{}", p[0].to_lowercase()))
+        }
+        Expr::Name(p) => p.last().map(|s| s.to_lowercase()),
+        Expr::Cast(x, _) => hint_key(x, facts, d),
+        _ => None,
+    }
+}
+
+fn lit_value(e: &Expr) -> Option<V> {
+    match e {
+        Expr::Num(n) => Some(match n.parse::<i128>() {
+            Ok(i) => V::Int(i),
+            Err(_) => V::Num(n.parse().ok()?),
+        }),
+        Expr::Str(s) => Some(V::Str(s.clone())),
+        Expr::Special(s) if s == "TRUE" || s == "FALSE" => Some(V::Bool(s == "TRUE")),
+        Expr::Cast(x, _) => lit_value(x),
+        _ => None,
+    }
+}
+
+fn class_of(v: &V) -> Class {
+    match v {
+        V::Int(_) => Class::Int,
+        V::Num(_) => Class::Num,
+        V::Str(_) => Class::Str,
+        V::Bool(_) => Class::Bool,
+        _ => Class::Gen,
+    }
+}
+
+struct Hints<'f> {
+    map: HashMap<String, Hint>,
+    facts: &'f HashMap<String, VarFact>,
+    d: Dialect,
+}
+
+impl Hints<'_> {
+    fn note(&mut self, name: &str, class: Option<Class>, lit: Option<V>) {
+        let h = self.map.entry(name.to_string()).or_default();
+        if h.class.is_none() {
+            h.class = class;
+        }
+        if let Some(l) = lit {
+            if !h.lits.contains(&l) {
+                h.lits.push(l);
+            }
+        }
+    }
+
+    fn key(&self, e: &Expr) -> Option<String> {
+        hint_key(e, self.facts, self.d)
+    }
+
+    fn typed_class(&self, e: &Expr) -> Option<Class> {
+        let n = self.key(e)?;
+        let ty = self.facts.get(n.strip_prefix('@')?)?.ty?;
+        Some(match ty.fam {
+            super::schema::Fam::Int => Class::Int,
+            super::schema::Fam::Exact | super::schema::Fam::Float => Class::Num,
+            super::schema::Fam::Bool => Class::Bool,
+            super::schema::Fam::Date
+            | super::schema::Fam::Timestamp
+            | super::schema::Fam::TimestampTz => Class::Date,
+            _ if ty.is_string() => Class::Str,
+            _ => return None,
+        })
+    }
+
+    fn pair(&mut self, l: &Expr, r: &Expr) {
+        for (x, y) in [(l, r), (r, l)] {
+            if let Some(n) = self.key(x) {
+                if let Some(v) = lit_value(y) {
+                    self.note(&n, Some(class_of(&v)), Some(v));
+                } else if let Some(c) = self.typed_class(y) {
+                    self.note(&n, Some(c), None);
+                }
+            }
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        eval::walk_expr(e, &mut |x| match x {
+            Expr::Bin(op, l, r) => {
+                if matches!(
+                    op.as_str(),
+                    "=" | "<>" | "<" | ">" | "<=" | ">=" | "+" | "-" | "*" | "/"
+                ) {
+                    self.pair(l, r);
+                }
+                if op == "||" {
+                    for y in [l, r] {
+                        if let Some(n) = self.key(y) {
+                            self.note(&n, Some(Class::Str), None);
+                        }
+                    }
+                }
+            }
+            Expr::IsNull(y, _) => {
+                if let Some(n) = self.key(y) {
+                    self.map.entry(n).or_default().null_tested = true;
+                }
+            }
+            Expr::InList(y, list, _) => {
+                for z in list {
+                    self.pair(y, z);
+                }
+            }
+            Expr::Between(y, lo, hi, _) => {
+                self.pair(y, lo);
+                self.pair(y, hi);
+            }
+            Expr::Like(y, _, _, _) => {
+                if let Some(n) = self.key(y) {
+                    self.note(&n, Some(Class::Str), None);
+                }
+            }
+            Expr::Case(Some(o), whens, _) => {
+                for (w, _) in whens {
+                    self.pair(o, w);
+                }
+            }
+            Expr::Exists(q) | Expr::Subquery(q) | Expr::InQuery(_, q, _) => self.query(q),
+            Expr::Call(c) => {
+                let name = c.name.last().map(|s| s.to_uppercase()).unwrap_or_default();
+                if matches!(name.as_str(), "COALESCE" | "ISNULL" | "NULLIF") {
+                    for y in &c.args {
+                        if let Some(n) = self.key(y) {
+                            self.map.entry(n).or_default().null_tested = true;
+                        }
+                    }
+                    if c.args.len() >= 2 {
+                        self.pair(&c.args[0], &c.args[1]);
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+
+    fn query(&mut self, q: &super::ast::Select) {
+        for c in &q.ctes {
+            self.query(&c.query);
+        }
+        for (_, o) in &q.set_ops {
+            self.query(o);
+        }
+        for i in &q.items {
+            self.expr(&i.expr);
+        }
+        for e in q.where_.iter().chain(q.having.iter()) {
+            self.expr(e);
+        }
+        for f in &q.from {
+            self.from(f);
+        }
+    }
+
+    fn from(&mut self, f: &super::ast::From) {
+        match f {
+            super::ast::From::Join {
+                left, right, on, ..
+            } => {
+                self.from(left);
+                self.from(right);
+                if let Some(o) = on {
+                    self.expr(o);
+                }
+            }
+            super::ast::From::Sub { query, .. } => self.query(query),
+            _ => {}
+        }
+    }
+
+    fn probe(&mut self, p: &Probe) {
+        match p {
+            Probe::Conds(es) | Probe::Values(es) => {
+                for e in es {
+                    self.expr(e);
+                }
+            }
+            Probe::Stmt(s) => match s {
+                Stmt::Select(q) => self.query(q),
+                Stmt::Insert { source, .. } => match source {
+                    super::ast::InsertSource::Values(rows) => {
+                        for e in rows.iter().flatten() {
+                            self.expr(e);
+                        }
+                    }
+                    super::ast::InsertSource::Query(q) => self.query(q),
+                    _ => {}
+                },
+                Stmt::Update {
+                    sets, from, where_, ..
+                } => {
+                    for (c, e) in sets {
+                        self.expr(e);
+                        if let Some(c) = c.first() {
+                            self.pair(&Expr::Name(vec![c.clone()]), e);
+                        }
+                    }
+                    for f in from {
+                        self.from(f);
+                    }
+                    if let Some(w) = where_ {
+                        self.expr(w);
+                    }
+                }
+                Stmt::Delete { from, where_, .. } => {
+                    for f in from {
+                        self.from(f);
+                    }
+                    if let Some(w) = where_ {
+                        self.expr(w);
+                    }
+                }
+                Stmt::Assign(t, e) => {
+                    self.expr(e);
+                    self.pair(t, e);
+                }
+                Stmt::Return(Some(e)) => self.expr(e),
+                Stmt::Declare {
+                    default: Some(e), ..
+                } => self.expr(e),
+                _ => {}
+            },
+        }
+    }
+}
+
+// ---- examination ------------------------------------------------------------------
+
+fn examine(
+    ra: &Routine,
+    rb: &Routine,
+    na: &SyntaxNode,
+    nb: &SyntaxNode,
+    sa: &Schema,
+    sb: &Schema,
+) -> Result<Decided, String> {
+    let d = ra.d;
+    if na.kind() != nb.kind() {
+        return Err("different kinds of statement".into());
+    }
+    if let Some(dec) = validity(ra, rb, na, nb) {
+        return Ok(dec);
+    }
+    if na.kind() == SyntaxKind::ROUTINE {
+        return header_change(ra, rb, na, nb);
+    }
+    let xa = shape(na, d)?;
+    let xb = shape(nb, d)?;
+    if xa.kind != xb.kind {
+        return Err("different kinds of statement".into());
+    }
+    let at_a = cst::sig_range(na).0;
+    let at_b = cst::sig_range(nb).0;
+    let facts_a = ra.facts(at_a, na);
+    let facts_b = rb.facts(at_b, nb);
+    // Variables must mean the same on both sides.
+    for (k, fa) in &facts_a {
+        if let Some(fb) = facts_b.get(k) {
+            if fa.value != fb.value || fa.origin != fb.origin || fa.ty != fb.ty {
+                return Err(format!("variable {k} differs between the versions"));
+            }
+        }
+    }
+    let reach_a = ra.reach(na)?;
+    let reach_b = rb.reach(nb)?;
+    let mut hints = Hints {
+        map: HashMap::new(),
+        facts: &facts_a,
+        d,
+    };
+    hints.probe(&xa.probe);
+    hints.probe(&xb.probe);
+    for (g, _) in reach_a.guards.iter().chain(&reach_b.guards) {
+        hints.expr(g);
+    }
+    let hint_map = hints.map;
+    let records: Vec<String> = ra.records.iter().cloned().collect();
+    // The catalog of side A serves both (same dialect, same database).
+    let _ = sb;
+    let make = || {
+        let mut c = Ctx::new(d, sa);
+        c.vars = facts_a.clone();
+        c.records = records.clone();
+        c.hints = hint_map.clone();
+        c.guards = [reach_a.guards.clone(), reach_b.guards.clone()];
+        c
+    };
+    let found = eval::search(&make, &xa.probe, &xb.probe).map_err(|m| match m {
+        Miss::Unsupported(w) => format!("not evaluated: {w}"),
+        Miss::NoWitness => "no witness found".to_string(),
+    })?;
+    let (sa_, sa_e) = cst::sig_range(na);
+    let (effect, certain) = observable(ra, rb, na, nb, &xa, &xb, &found, sa_, sa_e)?;
+    let mut assumptions = Vec::new();
+    if found.assumed {
+        assumptions.push(local_values().id);
+    }
+    let mut untraced: Vec<usize> = reach_a.untraced.clone();
+    let path_assumed =
+        !untraced.is_empty() || !reach_b.untraced.is_empty() || found.unreached || !certain;
+    if path_assumed {
+        assumptions.push(witness_path().id);
+    }
+    untraced.sort_unstable();
+    untraced.dedup();
+    let line_a = ra.side.line_of(na);
+    let line_b = rb.side.line_of(nb);
+    let inputs = describe_inputs(&found, d);
+    let mut witness = format!(
+        "{} (A line {line_a}, B line {line_b}){}: {effect}",
+        what(&xa, na, d),
+        if inputs.is_empty() {
+            String::new()
+        } else {
+            format!(" when {inputs}")
+        }
+    );
+    if !untraced.is_empty() {
+        let lines: Vec<String> = untraced.iter().map(usize::to_string).collect();
+        witness.push_str(&format!(
+            " Reaching it with these inputs assumes the conditions or jumps at line{} {}.",
+            if lines.len() > 1 { "s" } else { "" },
+            lines.join(", ")
+        ));
+    }
+    Ok(Decided {
+        witness,
+        assumptions,
+    })
+}
+
+/// A routine header whose only change is one parameter's default value or
+/// decimal precision.
+fn header_change(
+    ra: &Routine,
+    rb: &Routine,
+    na: &SyntaxNode,
+    nb: &SyntaxNode,
+) -> Result<Decided, String> {
+    let d = ra.d;
+    let ta = checked_tokens(na).concat();
+    let tb = checked_tokens(nb).concat();
+    if ta.len() != tb.len() {
+        return Err("routine headers differ in shape".into());
+    }
+    let pa = header_params(na, d);
+    let pb = header_params(nb, d);
+    if pa.len() != pb.len()
+        || pa
+            .iter()
+            .zip(&pb)
+            .any(|(x, y)| x.name != y.name || x.out != y.out)
+    {
+        return Err("parameter lists differ".into());
+    }
+    let changed: Vec<(&lower::Param, &lower::Param)> = pa
+        .iter()
+        .zip(&pb)
+        .filter(|(x, y)| x.ty != y.ty || x.default != y.default)
+        .collect();
+    // Every differing header token must belong to that parameter's change.
+    let differing = ta.iter().zip(&tb).filter(|(x, y)| x.text != y.text).count();
+    let [(x, y)] = changed.as_slice() else {
+        return Err("routine headers are not compared".into());
+    };
+    let shown = if d == Dialect::Tsql {
+        format!("@{}", x.name)
+    } else {
+        x.name.clone()
+    };
+    if x.ty == y.ty && differing == 1 {
+        let parse = |s: &Option<String>| -> Option<V> {
+            let s = s.as_ref()?;
+            let toks =
+                super::ast::tokens(&sqldiff_syntax::parse(&format!("SELECT {s}"), d).syntax());
+            let mut p = Parser::ext(&toks[1..], d);
+            let e = p.expr().ok()?;
+            if !p.at_end() {
+                return None;
+            }
+            constant_value(&e)
+        };
+        let (Some(va), Some(vb)) = (parse(&x.default), parse(&y.default)) else {
+            return Err("parameter defaults that are not constants".into());
+        };
+        if eval::same(&va, &vb) != Some(false) {
+            return Err("parameter defaults that may be equal".into());
+        }
+        let r = ra.read_in_body(&x.name);
+        if r == Read::Never {
+            return Err(format!("{shown} is not read"));
+        }
+        let mut assumptions = Vec::new();
+        if !matches!(r, Read::Always(_)) {
+            assumptions.push(witness_path().id);
+        }
+        return Ok(Decided {
+            witness: format!(
+                "When the caller leaves out {shown} (A line {}, B line {}), A uses {} and B uses {} ({}).",
+                ra.side.line_of(na),
+                rb.side.line_of(nb),
+                va.show(&[]),
+                vb.show(&[]),
+                read_note(&x.name, r, d)
+            ),
+            assumptions,
+        });
+    }
+    // A decimal parameter whose precision grows at the same scale: a value
+    // that fits only the wider type fails the call in A.
+    if let (Some(a), Some(b)) = (x.ty, y.ty) {
+        use super::schema::Fam;
+        if a.fam == Fam::Exact
+            && b.fam == Fam::Exact
+            && a.scale == b.scale
+            && x.default == y.default
+        {
+            if let (Some(pa), Some(pb)) = (a.len, b.len) {
+                let scale = a.scale.unwrap_or(0);
+                let (lo, hi, narrow) = if pa < pb {
+                    (pa, pb, "A")
+                } else {
+                    (pb, pa, "B")
+                };
+                let _ = hi;
+                let digits = lo.saturating_sub(scale);
+                let value = format!("1{}", "0".repeat(digits as usize));
+                let wide = if narrow == "A" { "B" } else { "A" };
+                let r = ra.read_in_body(&x.name);
+                return Ok(Decided {
+                    witness: format!(
+                        "Passing {shown} = {value} (A line {}, B line {}): {narrow} fails converting the argument (arithmetic overflow) and {wide} accepts it ({}).",
+                        ra.side.line_of(na),
+                        rb.side.line_of(nb),
+                        read_note(&x.name, r, d)
+                    ),
+                    // Whether the accepting side then behaves visibly differently is not traced.
+                    assumptions: vec![witness_path().id],
+                });
+            }
+        }
+    }
+    Err("routine headers are not compared".into())
+}
+
+/// Token lists of a unit that are checked for validity: the statement, the
+/// conditions of a compound statement, or a routine header.
+fn checked_tokens(n: &SyntaxNode) -> Vec<Vec<Tok>> {
+    match n.kind() {
+        SyntaxKind::ROUTINE => vec![cst::header_tokens(n)
+            .iter()
+            .map(Tok::from_syntax)
+            .filter(|t| t.kind != K::Semi)
+            .collect()],
+        SyntaxKind::STATEMENT => vec![tokens(n)],
+        _ => n
+            .children()
+            .filter(|c| c.kind() == SyntaxKind::CONDITION)
+            .map(|c| tokens(&c))
+            .collect(),
+    }
+}
+
+/// One version certainly fails to be created at the changed unit and the other does not.
+fn validity(ra: &Routine, rb: &Routine, na: &SyntaxNode, nb: &SyntaxNode) -> Option<Decided> {
+    let d = ra.d;
+    let header = na.kind() == SyntaxKind::ROUTINE;
+    let check = |n: &SyntaxNode| {
+        let lists = checked_tokens(n);
+        lists.iter().find_map(|t| invalid(t, d, header))
+    };
+    // Parentheses that do not balance, in the statement and in the whole text.
+    let parens = |r: &Routine, n: &SyntaxNode| {
+        let count = |t: &[Tok]| {
+            (
+                t.iter().filter(|x| x.kind == K::LParen).count(),
+                t.iter().filter(|x| x.kind == K::RParen).count(),
+            )
+        };
+        let (fo, fc) = count(&r.toks);
+        let (open, close) = count(&tokens(n));
+        (fo != fc && open != close && n.kind() == SyntaxKind::STATEMENT)
+            .then(|| format!("{open} opening and {close} closing parentheses"))
+    };
+    let check = |r: &Routine, n: &SyntaxNode| check(n).or_else(|| parens(r, n));
+    let lang = match d {
+        Dialect::Tsql => "T-SQL",
+        Dialect::Postgres => "PL/pgSQL",
+        Dialect::Db2i => "SQL PL",
+    };
+    let (la, lb) = (ra.side.line_of(na), rb.side.line_of(nb));
+    match (check(ra, na), check(rb, nb)) {
+        (None, Some(why)) => Some(Decided {
+            witness: format!("B is not valid {lang} at line {lb}: {why}, so creating B fails; A line {la} is valid."),
+            assumptions: Vec::new(),
+        }),
+        (Some(why), None) => Some(Decided {
+            witness: format!("A is not valid {lang} at line {la}: {why}, so creating A fails; B line {lb} is valid."),
+            assumptions: Vec::new(),
+        }),
+        _ => None,
+    }
+}
+
+fn what(x: &Shape, n: &SyntaxNode, d: Dialect) -> String {
+    match x.kind {
+        ShapeKind::If => "The IF condition".into(),
+        ShapeKind::While => "The WHILE condition".into(),
+        ShapeKind::ExitWhen => "The EXIT WHEN condition".into(),
+        ShapeKind::ContinueWhen => "The CONTINUE WHEN condition".into(),
+        ShapeKind::Raise => "The raised error".into(),
+        ShapeKind::Message => "The message".into(),
+        ShapeKind::Cursor => "The cursor query".into(),
+        ShapeKind::ForQuery => "The FOR loop query".into(),
+        ShapeKind::Data => format!("The {}", stmt_kind(n, d).label()),
+    }
+}
+
+fn describe_inputs(f: &Found, d: Dialect) -> String {
+    let mut parts = Vec::new();
+    let mut tables: Vec<(String, usize, Vec<String>)> = Vec::new();
+    for (k, v) in &f.inputs {
+        let shown = v.show(&f.opaque);
+        match k {
+            Key::Var(n) if n.starts_with('@') => {
+                parts.push(format!("@{} is {shown}", n.to_uppercase()))
+            }
+            Key::Var(n) if d == Dialect::Tsql => parts.push(format!("@{n} is {shown}")),
+            Key::Var(n) => parts.push(format!("{n} is {shown}")),
+            Key::Field(r, c) => parts.push(format!("{r}.{c} is {shown}")),
+            Key::Col(t, row, c) => match tables.iter_mut().find(|(x, r, _)| x == t && r == row) {
+                Some(e) => e.2.push(format!("{c} = {shown}")),
+                None => tables.push((t.clone(), *row, vec![format!("{c} = {shown}")])),
+            },
+        }
+    }
+    for (t, n) in &f.shape {
+        if *n == 0 {
+            parts.push(format!("{t} has no rows"));
+        }
+    }
+    for (t, row, cols) in tables {
+        let n = f.shape.get(&t).copied().unwrap_or(1);
+        let which = if n > 1 {
+            format!(" (row {})", row + 1)
+        } else {
+            String::new()
+        };
+        parts.push(format!("{t} has a row{which} with {}", cols.join(", ")));
+    }
+    parts.join(", ")
+}
+
+fn show_vals(vals: &[V], opaque: &[String]) -> String {
+    vals.iter()
+        .map(|v| v.show(opaque))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn describe_obs(o: &Obs, opaque: &[String], kind: ShapeKind, branches: usize) -> String {
+    match o {
+        Obs::Error(e) => format!("raises an error ({e})"),
+        Obs::Value(v) => format!("yields {}", v.show(opaque)),
+        Obs::Assigned(vs) => {
+            if vs.iter().all(Option::is_none) {
+                "finds no row and leaves the variables unchanged".into()
+            } else {
+                format!(
+                    "assigns {}",
+                    vs.iter()
+                        .map(|v| v
+                            .as_ref()
+                            .map(|v| v.show(opaque))
+                            .unwrap_or_else(|| "nothing".into()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        Obs::Rows(rows, _) => {
+            if kind == ShapeKind::Raise || kind == ShapeKind::Message {
+                return format!(
+                    "uses {}",
+                    rows.first()
+                        .map(|r| show_vals(r, opaque))
+                        .unwrap_or_default()
+                );
+            }
+            match rows.len() {
+                0 => "produces no rows".into(),
+                1 => format!("produces one row ({})", show_vals(&rows[0], opaque)),
+                n => format!("produces {n} rows"),
+            }
+        }
+        Obs::Writes(w) => match w.len() {
+            0 => "changes no row".into(),
+            1 => "changes the row".into(),
+            n => format!("changes {n} rows"),
+        },
+        Obs::Branch(b) => match (kind, b) {
+            (ShapeKind::While, Some(_)) => "enters the loop".into(),
+            (ShapeKind::While, None) => "skips the loop".into(),
+            (ShapeKind::ExitWhen, Some(_)) => "leaves the loop".into(),
+            (ShapeKind::ExitWhen, None) => "stays in the loop".into(),
+            (ShapeKind::ContinueWhen, Some(_)) => "skips the rest of the iteration".into(),
+            (ShapeKind::ContinueWhen, None) => "runs the rest of the iteration".into(),
+            (_, Some(0)) => "takes the first branch".into(),
+            (_, Some(i)) if *i + 1 == branches => "takes the ELSE branch".into(),
+            (_, Some(i)) => format!("takes branch {}", i + 1),
+            (_, None) if branches > 0 => "takes no branch".into(),
+            (_, None) => "takes no branch".into(),
+        },
+    }
+}
+
+/// Whether the difference in results reaches something observable; the
+/// plain-language effect when it does.
+#[allow(clippy::too_many_arguments)]
+fn observable(
+    ra: &Routine,
+    rb: &Routine,
+    na: &SyntaxNode,
+    nb: &SyntaxNode,
+    xa: &Shape,
+    xb: &Shape,
+    f: &Found,
+    start: usize,
+    end: usize,
+) -> Result<(String, bool), String> {
+    let d = ra.d;
+    let _ = start;
+    let da = describe_obs(&f.a, &f.opaque, xa.kind, xa.branches.len());
+    let db = describe_obs(&f.b, &f.opaque, xb.kind, xb.branches.len());
+    let both = format!("A {da} and B {db}");
+    // An error on one side is always visible.
+    if matches!(f.a, Obs::Error(_)) || matches!(f.b, Obs::Error(_)) {
+        return Ok((format!("{both}."), true));
+    }
+    match xa.kind {
+        ShapeKind::Raise | ShapeKind::Message => Ok((format!("{both}."), true)),
+        ShapeKind::ForQuery => {
+            let body = xa.branches.first().ok_or("loop without body")?;
+            if effect(ra, body) == Eff::No {
+                return Err("the loop body has no observable effect".into());
+            }
+            // What the body does with each row is not traced.
+            Ok((format!("{both} (the loop body runs once per row)."), false))
+        }
+        ShapeKind::Cursor => {
+            let name = tokens(na).get(1).map(|x| x.up.clone()).unwrap_or_default();
+            let fetch = ra.toks.iter().enumerate().find(|(i, x)| {
+                x.up == "FETCH"
+                    && x.off >= end
+                    && ra.toks[i + 1..].iter().take(6).any(|y| y.up == name)
+            });
+            let Some((_, f)) = fetch else {
+                return Err("the cursor is not fetched".into());
+            };
+            let line = ra.side.lines.line_col(f.off).0;
+            // What the loop does with each fetched row is not traced.
+            Ok((
+                format!("{both} (the rows are fetched at line {line})."),
+                false,
+            ))
+        }
+        ShapeKind::If => {
+            let (Obs::Branch(ia), Obs::Branch(ib)) = (&f.a, &f.b) else {
+                return Err("unexpected observation".into());
+            };
+            // Without an explicit ELSE, "no branch" runs nothing.
+            let body =
+                |x: &Shape, r: &Routine, i: &Option<usize>, nconds: usize| -> Option<SyntaxNode> {
+                    match i {
+                        Some(i) => x.branches.get(*i).cloned(),
+                        None => (x.branches.len() > nconds).then(|| x.branches[nconds].clone()),
+                    }
+                    .filter(|_| r.d == d)
+                };
+            let nca = match &xa.probe {
+                Probe::Conds(c) => c.len(),
+                _ => 0,
+            };
+            let ncb = match &xb.probe {
+                Probe::Conds(c) => c.len(),
+                _ => 0,
+            };
+            let ba = body(xa, ra, ia, nca);
+            let bb = body(xb, rb, ib, ncb);
+            let text = |n: &Option<SyntaxNode>| {
+                n.as_ref()
+                    .map(|n| {
+                        tokens(n)
+                            .iter()
+                            .map(|t| t.up.clone())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default()
+            };
+            if text(&ba) == text(&bb) {
+                return Err("both versions run the same code".into());
+            }
+            let ea = ba.as_ref().map_or(Eff::No, |n| effect(ra, n));
+            let eb = bb.as_ref().map_or(Eff::No, |n| effect(rb, n));
+            if ea == Eff::No && eb == Eff::No {
+                return Err("the branches have no observable effect".into());
+            }
+            let certain = ea == Eff::Yes || eb == Eff::Yes;
+            let line = |r: &Routine, n: &Option<SyntaxNode>| {
+                n.as_ref()
+                    .map(|n| format!("the branch at line {}", r.side.line_of(n)))
+                    .unwrap_or_else(|| "no branch".into())
+            };
+            Ok((
+                format!("A runs {} and B runs {}.", line(ra, &ba), line(rb, &bb)),
+                certain,
+            ))
+        }
+        ShapeKind::While => {
+            let body = xa.branches.first().ok_or("loop without body")?;
+            let e = effect(ra, body);
+            if e == Eff::No {
+                return Err("the loop body has no observable effect".into());
+            }
+            Ok((format!("{both}."), e == Eff::Yes))
+        }
+        ShapeKind::ExitWhen | ShapeKind::ContinueWhen => {
+            let e = if xa.kind == ShapeKind::ContinueWhen {
+                xa.rest
+                    .iter()
+                    .map(|n| effect(ra, n))
+                    .max()
+                    .unwrap_or(Eff::No)
+            } else {
+                // Leaving the loop early skips the remaining iterations.
+                na.ancestors()
+                    .find(|p| p.kind() == SyntaxKind::LOOP_STMT)
+                    .map_or(Eff::No, |l| effect(ra, &l))
+            };
+            if e == Eff::No {
+                return Err("the loop has no observable effect".into());
+            }
+            // Whether there is a further iteration or statement is not traced.
+            Ok((format!("{both}."), false))
+        }
+        ShapeKind::Data => {
+            let Probe::Stmt(s) = &xa.probe else {
+                return Err("unexpected probe".into());
+            };
+            let kind = stmt_kind(na, d);
+            let _ = nb;
+            match s {
+                Stmt::Select(q) => {
+                    if q.items.iter().any(|i| i.assign.is_some()) || !q.into.is_empty() {
+                        let targets: Vec<String> = if q.into.is_empty() {
+                            q.items
+                                .iter()
+                                .filter_map(|i| {
+                                    i.assign
+                                        .as_ref()
+                                        .map(|v| v.trim_start_matches('@').to_lowercase())
+                                })
+                                .collect()
+                        } else {
+                            q.into.iter().filter_map(name_key).collect()
+                        };
+                        let (Obs::Assigned(x), Obs::Assigned(y)) = (&f.a, &f.b) else {
+                            return Err("unexpected observation".into());
+                        };
+                        let mut live = Vec::new();
+                        let mut certain = false;
+                        for (i, t) in targets.iter().enumerate() {
+                            let differs = match (x.get(i), y.get(i)) {
+                                (Some(Some(p)), Some(Some(q))) => eval::same(p, q) == Some(false),
+                                (Some(p), Some(q)) => p.is_some() != q.is_some(),
+                                _ => false,
+                            };
+                            if !differs {
+                                continue;
+                            }
+                            match ra.read_after(t, na) {
+                                Read::Never => {}
+                                r => {
+                                    certain |= matches!(r, Read::Always(_));
+                                    live.push(read_note(t, r, d));
+                                }
+                            }
+                        }
+                        if live.is_empty() {
+                            return Err("the assigned variables are not read afterwards".into());
+                        }
+                        return Ok((format!("{both} ({}).", live.join("; ")), certain));
+                    }
+                    if ra.result_sets
+                        || d != Dialect::Tsql && kind == StmtKind::Select && ra_is_query_result(na)
+                    {
+                        Ok((format!("{both} as its result set."), true))
+                    } else {
+                        Err("a query whose result is not returned".into())
+                    }
+                }
+                Stmt::Assign(t, _) => {
+                    let n = name_key(t).unwrap_or_default();
+                    let shown = shown_var(t, d);
+                    match ra.read_after(&n, na) {
+                        Read::Never => Err(format!("{n} is not read afterwards")),
+                        r => Ok((
+                            format!(
+                                "A sets {shown} to {} and B to {} ({}).",
+                                value_of(&f.a, &f.opaque),
+                                value_of(&f.b, &f.opaque),
+                                read_note(&n, r, d)
+                            ),
+                            matches!(r, Read::Always(_)),
+                        )),
+                    }
+                }
+                Stmt::Declare { name, .. } => {
+                    let n = name.trim_start_matches('@').to_lowercase();
+                    match ra.read_after(&n, na) {
+                        Read::Never => Err(format!("{n} is not read afterwards")),
+                        r => Ok((
+                            format!(
+                                "A initialises {name} to {} and B to {} ({}).",
+                                value_of(&f.a, &f.opaque),
+                                value_of(&f.b, &f.opaque),
+                                read_note(&n, r, d)
+                            ),
+                            matches!(r, Read::Always(_)),
+                        )),
+                    }
+                }
+                Stmt::Return(_) => Ok((
+                    format!(
+                        "A returns {} and B returns {}.",
+                        value_of(&f.a, &f.opaque),
+                        value_of(&f.b, &f.opaque)
+                    ),
+                    true,
+                )),
+                Stmt::Insert { target, .. }
+                | Stmt::Update { target, .. }
+                | Stmt::Delete { target, .. } => {
+                    let t = eval::table_key(target);
+                    if ra.dead_table(&t, end) {
+                        return Err(format!("{t} is not read afterwards"));
+                    }
+                    let verb = match s {
+                        Stmt::Insert { .. } => "inserts",
+                        Stmt::Update { .. } => "updates",
+                        _ => "deletes",
+                    };
+                    Ok((
+                        format!("{}.", write_effect(&f.a, &f.b, verb, &t, &f.opaque)),
+                        true,
+                    ))
+                }
+                Stmt::Merge { .. } => Err("MERGE".into()),
+            }
+        }
+    }
+}
+
+fn ra_is_query_result(n: &SyntaxNode) -> bool {
+    // PL/pgSQL `RETURN QUERY` statements are observable.
+    cst::first_words(n, 2).join(" ") == "RETURN QUERY"
+}
+
+fn value_of(o: &Obs, opaque: &[String]) -> String {
+    match o {
+        Obs::Value(v) => v.show(opaque),
+        other => describe_obs(other, opaque, ShapeKind::Data, 0),
+    }
+}
+
+fn write_effect(a: &Obs, b: &Obs, verb: &str, table: &str, opaque: &[String]) -> String {
+    match (a, b) {
+        (Obs::Writes(x), Obs::Writes(y)) => {
+            let rows = |w: &Vec<(usize, Vec<V>)>| match w.len() {
+                0 => "no row".to_string(),
+                1 => "the row".to_string(),
+                n => format!("{n} rows"),
+            };
+            if x.len() != y.len() || x.iter().map(|w| w.0).ne(y.iter().map(|w| w.0)) {
+                format!("A {verb} {} of {table} and B {verb} {}", rows(x), rows(y))
+            } else {
+                let vals = |w: &Vec<(usize, Vec<V>)>| {
+                    w.iter()
+                        .map(|r| format!("({})", show_vals(&r.1, opaque)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!("A {verb} {table} with {} and B with {}", vals(x), vals(y))
+            }
+        }
+        (Obs::Rows(x, _), Obs::Rows(y, _)) => {
+            let vals = |w: &Vec<Vec<V>>| {
+                if w.is_empty() {
+                    "no row".to_string()
+                } else {
+                    w.iter()
+                        .map(|r| format!("({})", show_vals(r, opaque)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            };
+            format!("A {verb} {} into {table} and B {verb} {}", vals(x), vals(y))
+        }
+        _ => format!("A and B write {table} differently"),
+    }
+}
+
+/// How surely running a unit can be observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Eff {
+    No,
+    /// Only on some paths or for some data (a query that may assign
+    /// nothing, an UPDATE that may match no row, a nested branch).
+    Maybe,
+    Yes,
+}
+
+fn read_eff(r: Read) -> Eff {
+    match r {
+        Read::Always(_) => Eff::Yes,
+        Read::Maybe(_) => Eff::Maybe,
+        Read::Never => Eff::No,
+    }
+}
+
+/// Whether running a unit can be observed: it writes a table, returns a
+/// result, raises an error, calls something, or sets a variable that is read
+/// after it.
+fn effect(r: &Routine, n: &SyntaxNode) -> Eff {
+    let nodes: Vec<SyntaxNode> = if n.kind() == SyntaxKind::STATEMENT {
+        vec![n.clone()]
+    } else {
+        n.descendants()
+            .filter(|x| x.kind() == SyntaxKind::STATEMENT)
+            .collect()
+    };
+    let mut out = Eff::No;
+    if n.kind() != SyntaxKind::STATEMENT
+        && n.descendants()
+            .any(|x| matches!(x.kind(), SyntaxKind::TRY_CATCH))
+    {
+        out = Eff::Maybe;
+    }
+    for s in &nodes {
+        let mut e = statement_effect(r, s);
+        // Statements under a nested condition or loop may not run.
+        let straight = s
+            .ancestors()
+            .skip(1)
+            .take_while(|a| a != n)
+            .all(|a| matches!(a.kind(), SyntaxKind::BLOCK | SyntaxKind::TRY_BLOCK));
+        if !straight {
+            e = e.min(Eff::Maybe);
+        }
+        out = out.max(e);
+    }
+    out
+}
+
+fn statement_effect(r: &Routine, s: &SyntaxNode) -> Eff {
+    let k = stmt_kind(s, r.d);
+    let t = tokens(s);
+    let var_name = |x: &Tok| x.text.trim_start_matches('@').to_lowercase();
+    match k {
+        StmtKind::Assign => {
+            let target = if t.first().is_some_and(|x| x.up == "SET") {
+                t.get(1)
+            } else {
+                t.first()
+            };
+            target.map_or(Eff::No, |x| read_eff(r.read_after(&var_name(x), s)))
+        }
+        StmtKind::Select => {
+            let assigns =
+                t.iter().any(|x| x.up == "INTO") || t.get(1).is_some_and(|x| x.kind == K::Var);
+            if !assigns {
+                return Eff::Yes;
+            }
+            let from = t.iter().any(|x| x.up == "FROM");
+            let e = t
+                .iter()
+                .filter(|x| x.kind == K::Var || x.kind == K::Word)
+                .map(var_name)
+                .filter(|v| r.locals.contains_key(v) || r.params.contains_key(v))
+                .map(|v| read_eff(r.read_after(&v, s)))
+                .max()
+                .unwrap_or(Eff::No);
+            if from {
+                e.min(Eff::Maybe)
+            } else {
+                e
+            }
+        }
+        StmtKind::Insert | StmtKind::Update | StmtKind::Delete | StmtKind::Merge => {
+            let target = t
+                .iter()
+                .skip(1)
+                .find(|x| !matches!(x.up.as_str(), "INTO" | "FROM" | "TOP" | "ONLY"))
+                .map(|x| x.text.to_lowercase())
+                .unwrap_or_default();
+            let (_, end) = cst::sig_range(s);
+            if r.dead_table(&target, end) {
+                Eff::No
+            } else if k == StmtKind::Insert
+                && t.iter().any(|x| x.up == "VALUES")
+                && !t.iter().any(|x| x.up == "SELECT")
+            {
+                Eff::Yes
+            } else {
+                Eff::Maybe
+            }
+        }
+        StmtKind::Declare | StmtKind::Label | StmtKind::Other => {
+            let w = cst::first_words(s, 1);
+            let w = w.first().map(String::as_str).unwrap_or("");
+            // A jump out of the iteration or the loop skips what the loop does.
+            if matches!(w, "CONTINUE" | "EXIT" | "BREAK" | "LEAVE" | "ITERATE") {
+                return s
+                    .ancestors()
+                    .find(|p| p.kind() == SyntaxKind::LOOP_STMT)
+                    .map_or(Eff::No, |lp| {
+                        let e = lp
+                            .descendants()
+                            .filter(|x| x.kind() == SyntaxKind::STATEMENT)
+                            .filter(|x| {
+                                let w = cst::first_words(x, 1);
+                                !matches!(
+                                    w.first().map(String::as_str),
+                                    Some("CONTINUE" | "EXIT" | "BREAK" | "LEAVE" | "ITERATE")
+                                )
+                            })
+                            .map(|x| statement_effect(r, &x))
+                            .max()
+                            .unwrap_or(Eff::No);
+                        e.min(Eff::Maybe)
+                    });
+            }
+            match w {
+                "PRINT" | "RAISE" | "THROW" | "RAISERROR" | "RETURN" | "SIGNAL" | "RESIGNAL"
+                | "TRUNCATE" | "ALTER" | "CREATE" | "DROP" => Eff::Yes,
+                "EXEC" | "EXECUTE" | "PERFORM" | "CALL" | "FETCH" | "OPEN" | "CLOSE"
+                | "DEALLOCATE" | "INSERT" | "UPDATE" | "DELETE" | "MERGE" => Eff::Maybe,
+                _ => Eff::No,
+            }
+        }
+        _ => {
+            if k.is_effectful() {
+                Eff::Yes
+            } else {
+                Eff::No
+            }
+        }
+    }
+}
+
+/// How a later read of `name` is described.
+fn read_note(name: &str, r: Read, d: Dialect) -> String {
+    let shown = if d == Dialect::Tsql {
+        format!("@{name}")
+    } else {
+        name.to_string()
+    };
+    match r {
+        Read::Always(0) => format!("{shown} is returned to the caller"),
+        Read::Always(l) => format!("{shown} is read at line {l}"),
+        Read::Maybe(l) => format!("{shown} may be read from line {l}"),
+        Read::Never => format!("{shown} is not read"),
+    }
+}
+
+fn shown_var(e: &Expr, d: Dialect) -> String {
+    match e {
+        Expr::Var(v) => v.clone(),
+        Expr::Name(p) => p.join("."),
+        _ => name_key(e)
+            .map(|n| {
+                if d == Dialect::Tsql {
+                    format!("@{n}")
+                } else {
+                    n
+                }
+            })
+            .unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_neighbours_keep_the_format() {
+        assert_eq!(
+            eval::date_neighbour("2013-01-01", -1).as_deref(),
+            Some("2012-12-31")
+        );
+        assert_eq!(
+            eval::date_neighbour("99991231 23:59:59.9999999", -1).as_deref(),
+            Some("99991230 23:59:59.9999999")
+        );
+        assert_eq!(eval::date_neighbour("99991231", 1), None);
+        assert_eq!(eval::date_neighbour("hello", 1), None);
+    }
+}

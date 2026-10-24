@@ -10,6 +10,8 @@
 pub mod ast;
 pub mod canon;
 pub mod compare;
+pub mod edit;
+pub mod eval;
 pub mod lower;
 pub mod schema;
 pub mod term;
@@ -538,6 +540,29 @@ pub fn refine_modified(
         };
         let mut sub = Outcome::default();
         compare_pair(a, b, &ia[i], &ib[j], &mut sub);
+        if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
+            eprintln!(
+                "A: {}{}",
+                ia[i].term,
+                ia[i]
+                    .err
+                    .as_ref()
+                    .map(|e| format!("  [{e}]"))
+                    .unwrap_or_default()
+            );
+            eprintln!(
+                "B: {}{}",
+                ib[j].term,
+                ib[j]
+                    .err
+                    .as_ref()
+                    .map(|e| format!("  [{e}]"))
+                    .unwrap_or_default()
+            );
+            for g in &sub.findings {
+                eprintln!("=> {} {:?} {}", g.rule, g.verdict, g.witness);
+            }
+        }
         if sub.findings.is_empty() {
             out.structural += 1;
             for s in sub.assumptions {
