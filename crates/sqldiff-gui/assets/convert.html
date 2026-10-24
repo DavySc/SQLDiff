@@ -34,8 +34,16 @@ body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-u
 header { min-height: 44px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; position: relative; z-index: 3; }
 header h1 { font-size: 13px; margin: 0; font-weight: 600; display: flex; align-items: center; gap: 10px; }
 header h1::before { content: ""; width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
-.pair { font-size: 13px; color: var(--muted); }
-.pair::before { content: "/"; color: var(--faint); margin-right: 8px; }
+/* Mode switch (segmented) and the source → target pickers. */
+.seg { display: inline-flex; padding: 2px; border-radius: 8px; background: var(--soft); border: 1px solid var(--line); }
+.seg button { padding: 2px 10px; border-radius: 6px; color: var(--muted); }
+.seg button.on { background: var(--panel); color: var(--fg); box-shadow: var(--shadow); }
+.pick { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.pick select { font: inherit; font-size: 12.5px; font-weight: 500; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; cursor: pointer; }
+.norules { font-size: 12px; color: var(--muted); }
+.norules:empty { display: none; }
+a.link { font-size: 12.5px; font-weight: 500; color: var(--muted); text-decoration: none; padding: 3px 8px; border-radius: 6px; }
+a.link:hover { background: var(--soft); color: var(--fg); }
 .verdict { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
 .verdict:empty { display: none; }
 .verdict::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
@@ -59,7 +67,10 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 .ph { padding: 6px 12px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
 .ph strong { color: var(--fg); font-weight: 600; }
 .ph.right { border-left: 1px solid var(--line); }
-#src { width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; background: var(--panel); color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; }
+#src, #b { width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; background: var(--panel); color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; }
+#b { grid-column: 2; grid-row: 2; border-left: 1px solid var(--line); }
+body.compare #out, body.compare #overview .m:not(.f), body.compare .conv-only { display: none !important; }
+body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; }
 #out { overflow: auto; background: var(--panel); border-left: 1px solid var(--line); font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; padding: 8px 0; }
 .ln { display: grid; grid-template-columns: 40px 16px minmax(0, 1fr); cursor: pointer; }
 .ln .no { color: var(--muted); text-align: right; padding-right: 6px; user-select: none; opacity: .7; }
@@ -89,6 +100,7 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 .note { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 8px; box-shadow: var(--shadow); }
 .note .r { font: 11px var(--mono); color: var(--muted); }
 .note.finding { border-left: 3px solid var(--transactional); }
+.note.sel { border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
 .note.accepted { opacity: .6; }
 .note .acc { float: right; margin-top: -2px; font: 500 11px/1.4 system-ui, sans-serif; padding: 1px 8px; }
 .empty { color: var(--muted); font-size: 13px; padding: 10px 14px; }
@@ -107,23 +119,32 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 </head>
 <body>
 <header>
-  <h1>SQLDiff convert</h1>
-  <span class="pair" id="pair">T-SQL → PostgreSQL</span>
+  <h1>SQLDiff</h1>
+  <div class="seg" role="tablist" aria-label="Mode">
+    <button id="m-convert" class="on" role="tab" title="Convert the left side into the target dialect">Convert</button>
+    <button id="m-compare" role="tab" title="Compare the left and right sides with SQLDiff">Compare</button>
+  </div>
+  <span class="pick"><select id="from" aria-label="Source dialect"></select><span>→</span><select id="to" aria-label="Target dialect"></select></span>
+  <span class="norules conv-only" id="norules"></span>
+  <span id="tpl" class="chip conv-only" style="display:none;cursor:default"></span>
   <span id="verdict" class="verdict"></span>
-  <span id="chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
+  <span id="chips" class="conv-only" style="display:flex;gap:4px;flex-wrap:wrap"></span>
+  <span id="fcount" class="chip cmp-only" style="cursor:default"></span>
   <span class="spacer"></span>
-  <button id="prev" title="Previous unit that needs attention (Alt+↑)">↑ Prev</button>
-  <button id="next" title="Next unit that needs attention (Alt+↓)">Next ↓</button>
-  <button id="copy" title="Copy the PostgreSQL output">Copy</button>
-  <button id="save" class="outline" title="Download the PostgreSQL output as .sql">Save .sql</button>
+  <a id="files" class="link" href="/" style="display:none" title="The review queue and pair view for the files this server was started with">Files ↗</a>
+  <button id="prev" title="Previous item that needs attention (Alt+↑)">↑ Prev</button>
+  <button id="next" title="Next item that needs attention (Alt+↓)">Next ↓</button>
+  <button id="copy" class="conv-only" title="Copy the converted output">Copy</button>
+  <button id="save" class="outline conv-only" title="Download the converted output as .sql">Save .sql</button>
   <button id="helpbtn" title="Keyboard shortcuts (?)">?</button>
 </header>
 <div id="err"></div>
 <main>
-  <div class="ph"><strong>T-SQL</strong><span id="srcname"></span><span class="spacer"></span><span>edit freely; nothing is saved</span></div>
-  <div class="ph right"><strong>PostgreSQL</strong><span>converted, checked by SQLDiff</span><span class="spacer"></span><span id="timing"></span></div>
-  <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="T-SQL input"></textarea>
-  <div id="out" role="listbox" aria-label="PostgreSQL output"></div>
+  <div class="ph"><strong id="srcdial">T-SQL</strong><span id="srcname"></span><span class="spacer"></span><span>edit freely; nothing is saved</span></div>
+  <div class="ph right"><strong id="outdial">PostgreSQL</strong><span id="outsub">converted, checked by SQLDiff</span><span class="spacer"></span><span id="timing"></span></div>
+  <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea>
+  <div id="out" role="listbox" aria-label="Converted output"></div>
+  <textarea id="b" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Right side to compare"></textarea>
   <div id="overview" title="Location pane: click to jump"></div>
 </main>
 <section id="detail">
@@ -132,8 +153,8 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
   <div id="notes"></div>
 </section>
 <div id="help"><div>
-  <h3 style="margin-top:0">Convert mode</h3>
-  <p class="muted">Each converted statement gets a badge. Only <em>converted</em> means no assumption was needed and SQLDiff found no difference.</p>
+  <h3 style="margin-top:0">Convert and compare</h3>
+  <p class="muted"><strong>Convert</strong> rewrites the left side into the target dialect; each converted statement gets a badge, and only <em>converted</em> means no assumption was needed and SQLDiff found no difference. A target without rules yet shows every statement as not converted. <strong>Compare</strong> diffs the left side against the right one (both editable; the right starts as the conversion), as <code>sqldiff diff</code> does. Pick the dialects at the top at any time.</p>
   <table>
     <tr><td><span class="dot" style="background:var(--s-converted)"></span> converted</td><td>Rules without assumptions; the engine found nothing.</td></tr>
     <tr><td><span class="dot" style="background:var(--s-assumptions)"></span> under assumptions</td><td>Equal if the listed facts hold.</td></tr>
@@ -155,7 +176,10 @@ const $ = (id) => document.getElementById(id);
 const LABEL = { converted: "converted", assumptions: "under assumptions", decision: "needs a decision", differs: "differs", not_converted: "not converted" };
 const SHORT = { converted: "converted", assumptions: "assumptions", decision: "decisions", differs: "differs", not_converted: "not converted" };
 const ORDER = ["not_converted", "differs", "decision", "assumptions", "converted"];
-const state = { data: null, sel: -1, lineUnit: [], seq: 0, shown: 0, syncing: false, st: [], accepted: new Set() };
+const state = { data: null, sel: -1, lineUnit: [], seq: 0, shown: 0, lead: null, anchors: [[1, 1]], st: [], accepted: new Set(),
+  mode: "convert", from: "tsql", to: "postgres", cmp: null, fsel: -1 };
+const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
+const hasRules = (f, t) => INITIAL.with_rules.some(([a, b]) => a === f && b === t);
 const ACCEPT_KEY = "sqldiff.convert.accepted";
 try { state.accepted = new Set(JSON.parse(localStorage.getItem(ACCEPT_KEY) || "[]")); } catch { /* storage unavailable */ }
 function saveAccepted() { try { localStorage.setItem(ACCEPT_KEY, JSON.stringify([...state.accepted])); } catch { /* ignore */ } }
@@ -195,9 +219,24 @@ function render(data, keepSel) {
   $("err").style.display = data.error ? "block" : "none";
   $("err").textContent = data.error || "";
   $("srcname").textContent = data.name ? `· ${data.name}` : "";
+  $("srcdial").textContent = dialectName(data.from);
+  $("outdial").textContent = dialectName(data.to);
+  $("norules").textContent = data.rules ? "" : `No ${dialectName(data.from)} → ${dialectName(data.to)} rules yet: every statement stays as a comment`;
+  if (state.mode !== "convert") return;
   $("timing").textContent = `converted and checked in ${data.ms.toFixed(1)} ms`;
   const c = data.conversion;
   if (!c) { $("out").innerHTML = ""; return; }
+  const t = c.template;
+  $("tpl").style.display = t ? "" : "none";
+  if (t) {
+    const n = t.parameters.length;
+    $("tpl").textContent = `template · ${n} placeholder${n === 1 ? "" : "s"}${t.unresolved.length ? ` · ${t.unresolved.length} unresolved` : ""}`;
+    $("tpl").title = [
+      `Placeholders (kept in the output): ${t.parameters.join(", ") || "none"}`,
+      t.unresolved.length ? `Not placeholders, kept as SQL: ${t.unresolved.join(", ")}` : "",
+      t.special_forms.length ? `Generator directives (kept): ${t.special_forms.join(", ")}` : "",
+    ].filter(Boolean).join("\n");
+  }
   const v = c.report.verdict;
   $("verdict").className = `verdict ${v}`;
   $("verdict").textContent = v.replace(/_/g, " ");
@@ -225,6 +264,7 @@ function render(data, keepSel) {
     const g = first ? `<span class="dot" style="background:var(--s-${st})" title="${LABEL[st]}"></span>` : "";
     return `<div class="ln${cls}" data-l="${i + 1}" data-u="${ui}"><span class="no">${i + 1}</span><span class="g">${g}</span><span class="tx">${hl(t) || " "}</span></div>`;
   }).join("");
+  state.anchors = anchors(c, $("src").value.split("\n").length, c.output.split("\n").length);
   overview();
   if (!keepSel || state.sel >= c.units.length) state.sel = -1;
   if (state.sel >= 0) select(state.sel, { scroll: false, caret: false });
@@ -272,6 +312,7 @@ function select(i, { scroll = true, caret = true } = {}) {
     const e = document.querySelector(`.ln[data-l="${l}"]`);
     if (e) e.classList.add("sel");
   }
+  state.lead = null;
   if (scroll) {
     const e = document.querySelector(`.ln[data-l="${u.out.line}"]`), o = $("out");
     if (e && (e.offsetTop < o.scrollTop || e.offsetTop > o.scrollTop + o.clientHeight - 40)) o.scrollTop = e.offsetTop - o.clientHeight / 3;
@@ -313,6 +354,7 @@ function showDetail(i) {
 function summary(c) {
   const a = (c.report.assumptions || []).map((x) => `<li><code>${esc(x.id)}</code> ${esc(x.text)}</li>`).join("");
   const r = (c.report.unknown_reasons || []).map((x) => `<li>${esc(x)}</li>`).join("");
+  if (!state.data.rules) return `<div class="empty">Nothing was converted: there are no ${esc(dialectName(state.data.from))} → ${esc(dialectName(state.data.to))} rules yet, so every statement is kept as a comment. Compare mode still diffs any two dialects.</div>`;
   return `<div class="empty">${c.units.length} statements converted and checked.${r ? `<br>Why the verdict is not stronger:<ul>${r}</ul>` : ""}${a ? `Engine assumptions:<ul>${a}</ul>` : ""}</div>`;
 }
 
@@ -323,6 +365,7 @@ function attention() {
   return c.units.map((u, i) => [u, i]).filter(([, i]) => state.st[i] !== "converted").sort((x, y) => x[0].out.line - y[0].out.line).map(([, i]) => i);
 }
 function step(dir, status) {
+  if (state.mode === "compare") return stepFinding(dir);
   const c = state.data.conversion;
   let list = attention();
   if (status) list = c.units.map((u, i) => [u, i]).filter(([, i]) => state.st[i] === status).sort((x, y) => x[0].out.line - y[0].out.line).map(([, i]) => i);
@@ -333,57 +376,145 @@ function step(dir, status) {
   select(pick);
 }
 
-// Live conversion: debounced, stale responses dropped.
+// Live conversion (or comparison): debounced, stale responses dropped.
 let timer = null;
-function schedule() {
+function schedule(delay = 150) {
   clearTimeout(timer);
   timer = setTimeout(async () => {
-    const seq = ++state.seq;
+    const seq = ++state.seq, mode = state.mode;
+    const body = mode === "convert"
+      ? { text: $("src").value, from: state.from, to: state.to }
+      : { a: $("src").value, b: $("b").value, from: state.from, to: state.to };
     try {
-      const r = await fetch("/api/convert", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: $("src").value }) });
+      const r = await fetch(mode === "convert" ? "/api/convert" : "/api/compare", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
-      if (seq < state.shown) return;
+      if (seq < state.shown || mode !== state.mode) return;
       state.shown = seq;
-      render(data, true);
-      followCaret();
+      if (mode === "convert") { render(data, true); followCaret(); }
+      else renderCompare(data);
     } catch (e) {
       $("err").style.display = "block";
-      $("err").textContent = `Conversion failed: ${e.message}`;
+      $("err").textContent = `${mode === "convert" ? "Conversion" : "Comparison"} failed: ${e.message}`;
     }
-  }, 150);
+  }, delay);
+}
+
+// Compare mode: the engine's diff of the left side against the right one.
+const where = (l) => l ? `${l.start_line}${l.end_line > l.start_line ? "–" + l.end_line : ""}` : "";
+function renderCompare(p) {
+  state.cmp = p;
+  $("err").style.display = "none";
+  const r = p.report, n = r.findings.length;
+  $("verdict").className = `verdict ${r.verdict}`;
+  $("verdict").textContent = r.verdict.replace(/_/g, " ");
+  $("verdict").title = (r.unknown_reasons || []).join("\n");
+  $("fcount").textContent = `${n} finding${n === 1 ? "" : "s"}`;
+  $("timing").textContent = `compared in ${p.ms.toFixed(1)} ms`;
+  const total = Math.max(1, $("b").value.split("\n").length);
+  $("overview").innerHTML = r.findings.map((f, i) => f.b ?
+    `<div class="m f" data-f="${i}" style="top:${(f.b.start_line - 1) / total * 100}%;height:${(f.b.end_line - f.b.start_line + 1) / total * 100}%;background:var(--${f.class === "transactional" ? "transactional" : "semantic"})" title="${esc(f.class)}"></div>` : "").join("") + `<div class="vp" id="vp"></div>`;
+  if (state.fsel >= n) state.fsel = -1;
+  showFinding(state.fsel);
+}
+function showFinding(i) {
+  const r = state.cmp?.report;
+  if (!r) return;
+  state.fsel = i;
+  $("dsrc").textContent = ""; $("dout").textContent = "";
+  if (i < 0) {
+    $("dh").innerHTML = `<span class="muted">${r.findings.length ? "Pick a finding, or press <kbd>Alt</kbd>+<kbd>↓</kbd> for the next one." : "SQLDiff found no difference between the two sides."}</span>`;
+  } else {
+    const f = r.findings[i];
+    $("dh").innerHTML = `<span class="badge">${esc(f.class)} · ${esc(f.verdict.replace(/_/g, " "))}</span><span class="muted">left line ${where(f.a) || "–"} · right line ${where(f.b) || "–"}</span>`;
+    $("dsrc").textContent = (f.a?.excerpt || []).join("\n");
+    $("dout").textContent = (f.b?.excerpt || []).join("\n");
+    pick($("src"), f.a); pick($("b"), f.b);
+  }
+  $("notes").innerHTML = r.findings.map((f, j) =>
+    `<div class="note finding${j === i ? " sel" : ""}" data-f="${j}" style="cursor:pointer"><span class="badge">${esc(f.class)} · ${esc(f.verdict.replace(/_/g, " "))}</span> ${esc(f.witness)}<div class="r">${esc(f.rule)} · left ${where(f.a) || "–"} · right ${where(f.b) || "–"}</div></div>`).join("")
+    || `<div class="empty">No findings: ${esc(r.verdict.replace(/_/g, " "))}.${(r.unknown_reasons || []).length ? "<br>" + r.unknown_reasons.map(esc).join("<br>") : ""}</div>`;
+}
+// Select a location's lines in a textarea and bring them into view.
+function pick(ta, loc) {
+  if (!loc) return;
+  const lines = ta.value.split("\n");
+  const off = (l) => lines.slice(0, l - 1).reduce((n, x) => n + x.length + 1, 0);
+  const end = Math.min(ta.value.length, off(loc.end_line) + (lines[loc.end_line - 1] || "").length);
+  ta.setSelectionRange(off(loc.start_line), end);
+  state.lead = null;
+  const top = (loc.start_line - 1) * lineHeight(ta);
+  if (top < ta.scrollTop || top > ta.scrollTop + ta.clientHeight - 40) ta.scrollTop = top - ta.clientHeight / 3;
+}
+function stepFinding(dir) {
+  const n = state.cmp?.report.findings.length || 0;
+  if (!n) return;
+  showFinding(state.fsel < 0 ? (dir > 0 ? 0 : n - 1) : (state.fsel + dir + n) % n);
+}
+function setMode(m) {
+  state.mode = m;
+  document.body.classList.toggle("compare", m === "compare");
+  $("m-convert").classList.toggle("on", m === "convert");
+  $("m-compare").classList.toggle("on", m === "compare");
+  $("outsub").textContent = m === "convert" ? "converted, checked by SQLDiff" : "edit freely; compared by SQLDiff";
+  if (m === "compare") {
+    if (!$("b").value) $("b").value = state.data.conversion?.output || "";
+    $("notes").innerHTML = "";
+    schedule(0);
+  } else {
+    render(state.data, true);
+    schedule(0);
+  }
 }
 function followCaret() {
   const i = unitAt($("src").selectionStart);
   if (i >= 0 && i !== state.sel) select(i, { caret: false });
 }
 
-// Scroll sync by unit: the unit at the top of one side brings its partner to the top of the other.
-function syncFrom(side) {
-  if (state.syncing || !state.data.conversion) return;
-  const c = state.data.conversion, ta = $("src"), o = $("out");
-  const lh = lineHeight(ta);
-  state.syncing = true;
-  if (side === "src") {
-    const top = ta.scrollTop / lh + 1;
-    const u = c.units.filter((u) => u.src.line <= top).sort((a, b) => b.src.line - a.src.line)[0];
-    if (u) o.scrollTop = (u.out.line - 1 + (top - u.src.line)) * lh;
-    else o.scrollTop = 0;
-  } else {
-    const top = o.scrollTop / lh + 1;
-    const u = c.units.filter((u) => u.out.line <= top).sort((a, b) => b.out.line - a.out.line)[0];
-    if (u) ta.scrollTop = (u.src.line - 1 + (top - u.out.line)) * lh;
-    else ta.scrollTop = 0;
+// Scroll sync. Only the pane the user is scrolling (wheel, touch, keys, a drag
+// of its scroll bar) moves the other one: the follower's own scroll events are
+// ignored, so the two panes never correct each other and the wheel keeps its
+// native, smooth feel. Lines map piecewise linearly between unit starts.
+function anchors(c, srcLines, outLines) {
+  const pts = c.units.map((u) => [u.src.line, u.out.line]).sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const m = [[1, 1]];
+  for (const p of pts.concat([[srcLines + 1, outLines + 1]])) {
+    const l = m[m.length - 1];
+    if (p[0] > l[0] && p[1] > l[1]) m.push(p);
   }
-  requestAnimationFrame(() => (state.syncing = false));
+  return m;
+}
+function mapLine(x, from) {
+  const m = state.anchors, to = 1 - from;
+  let i = 0;
+  while (i < m.length - 2 && m[i + 1][from] <= x) i++;
+  const a = m[i], b = m[i + 1] || a;
+  const t = b[from] > a[from] ? (x - a[from]) / (b[from] - a[from]) : 0;
+  return a[to] + Math.max(0, Math.min(1, t)) * (b[to] - a[to]);
+}
+function syncFrom(side) {
+  if (side !== state.lead) return;
+  if (state.mode === "compare") {
+    const [from, other] = side === "src" ? [$("src"), $("b")] : [$("b"), $("src")];
+    const f = from.scrollTop / Math.max(1, from.scrollHeight - from.clientHeight);
+    other.scrollTop = f * (other.scrollHeight - other.clientHeight);
+    return;
+  }
+  if (!state.data.conversion) return;
+  const ta = $("src"), o = $("out"), lh = lineHeight(ta);
+  const [from, other] = side === "src" ? [ta, o] : [o, ta];
+  const line = mapLine(from.scrollTop / lh + 1, side === "src" ? 0 : 1);
+  other.scrollTop = (line - 1) * lh;
   viewport();
 }
+function lead(side) { state.lead = side; }
 
 function download() {
   const blob = new Blob([state.data.conversion?.output || ""], { type: "application/sql" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = (state.data.name || "converted").replace(/\.[^.]*$/, "").replace(/^.*[\/\\]/, "") + ".pg.sql";
+  const ext = { postgres: "pg", tsql: "tsql", db2i: "db2" }[state.data.to] || state.data.to;
+  a.download = (state.data.name || "converted").replace(/\.[^.]*$/, "").replace(/^.*[\/\\]/, "") + `.${ext}.sql`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
@@ -391,20 +522,52 @@ function download() {
 function init() {
   const ta = $("src");
   ta.value = INITIAL.input;
+  state.from = INITIAL.from; state.to = INITIAL.to;
+  const opts = (sel, other) => INITIAL.dialects.map((d) => {
+    const note = other && !hasRules(other, d.id) ? " (no rules yet)" : "";
+    return `<option value="${d.id}"${d.id === sel ? " selected" : ""}>${esc(d.name)}${note}</option>`;
+  }).join("");
+  const fillPickers = () => { $("from").innerHTML = opts(state.from); $("to").innerHTML = opts(state.to, state.from); };
+  fillPickers();
+  for (const id of ["from", "to"]) {
+    $(id).addEventListener("change", () => {
+      state[id] = $(id).value;
+      fillPickers();
+      $("srcdial").textContent = dialectName(state.from);
+      $("outdial").textContent = dialectName(state.to);
+      schedule(0);
+    });
+  }
+  $("m-convert").onclick = () => setMode("convert");
+  $("m-compare").onclick = () => setMode("compare");
+  if (INITIAL.pair_view) $("files").style.display = "";
   render(INITIAL, false);
-  if (!INITIAL.live) { ta.readOnly = true; ta.title = "Editing needs sqldiff-gui convert"; }
-  ta.addEventListener("input", schedule);
+  if (!INITIAL.live) {
+    ta.readOnly = true; ta.title = "Editing needs sqldiff-gui convert";
+    for (const id of ["from", "to", "m-compare"]) $(id).disabled = true;
+  }
+  ta.addEventListener("input", () => schedule());
+  $("b").addEventListener("input", () => schedule());
+  $("b").addEventListener("scroll", () => syncFrom("out"));
   ["click", "keyup", "select"].forEach((ev) => ta.addEventListener(ev, followCaret));
   ta.addEventListener("scroll", () => syncFrom("src"));
   $("out").addEventListener("scroll", () => syncFrom("out"));
+  for (const [el, side] of [[ta, "src"], [$("out"), "out"], [$("b"), "out"]]) {
+    for (const ev of ["wheel", "touchstart", "pointerdown", "keydown"]) {
+      el.addEventListener(ev, () => lead(side), { passive: true });
+    }
+  }
   $("out").addEventListener("click", (e) => {
     const ln = e.target.closest(".ln");
     if (ln && +ln.dataset.u >= 0) select(+ln.dataset.u);
   });
   $("overview").addEventListener("click", (e) => {
     const m = e.target.closest(".m");
+    if (m && m.dataset.f) return showFinding(+m.dataset.f);
+    if (state.mode === "compare") return;
     if (m) return select(+m.dataset.u);
     const o = $("out"), r = $("overview").getBoundingClientRect();
+    lead("out");
     o.scrollTop = (e.clientY - r.top) / r.height * o.scrollHeight - o.clientHeight / 2;
   });
   $("chips").addEventListener("click", (e) => {
@@ -414,6 +577,8 @@ function init() {
     step(1, b.dataset.s);
   });
   $("notes").addEventListener("click", (e) => {
+    const f = e.target.closest(".note[data-f]");
+    if (f) return showFinding(+f.dataset.f);
     const b = e.target.closest(".acc");
     if (!b) return;
     const r = b.dataset.rule;
@@ -438,7 +603,7 @@ function init() {
     else if (e.altKey && e.key === "Home") { e.preventDefault(); const l = attention(); if (l.length) select(l[0]); }
     else if (e.altKey && e.key === "End") { e.preventDefault(); const l = attention(); if (l.length) select(l[l.length - 1]); }
     else if (e.key === "Escape") { $("help").classList.remove("open"); ta.focus(); }
-    else if (e.key === "?" && document.activeElement !== ta) $("help").classList.add("open");
+    else if (e.key === "?" && document.activeElement !== ta && document.activeElement !== $("b")) $("help").classList.add("open");
   });
 }
 init();

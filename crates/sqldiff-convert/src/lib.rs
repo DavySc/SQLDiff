@@ -16,8 +16,11 @@ use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
 mod out;
+mod template;
 mod tok;
 mod tsql;
+
+pub use template::{convert_template, TemplateInfo};
 
 /// How far a converted unit can be trusted, from best to worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -102,8 +105,11 @@ pub struct Conversion {
     pub output: String,
     pub units: Vec<Unit>,
     pub counts: Counts,
-    /// The engine's diff of input (side A) against output (side B).
+    /// The engine's diff of input (side A) against output (side B). For a
+    /// template, of its fragment against the converted fragment.
     pub report: Report,
+    /// Set when the input was a template.
+    pub template: Option<TemplateInfo>,
 }
 
 /// Dialect pairs with rules.
@@ -114,19 +120,14 @@ pub fn supported(from: Dialect, to: Dialect) -> bool {
     )
 }
 
-/// Convert `text` from one dialect to another and check the result.
+/// Convert `text` from one dialect to another and check the result. A pair
+/// without rules is not an error: every statement comes back not converted
+/// (kept as a comment), so a viewer can switch targets freely.
 pub fn convert(text: &str, from: Dialect, to: Dialect) -> Result<Conversion, String> {
+    let root = parse(text, from).syntax();
     let raw = match (from, to) {
-        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
-            tsql::convert(&parse(text, from).syntax(), text, to)
-        }
-        _ => {
-            return Err(format!(
-            "no conversion rules from {} to {} yet (supported: T-SQL to PostgreSQL or Db2 for i)",
-            from.display_name(),
-            to.display_name()
-        ))
-        }
+        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => tsql::convert(&root, text, to),
+        _ => no_rules(&root, text, from, to),
     };
     Ok(verify(text, from, to, raw))
 }
@@ -197,8 +198,22 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
         }
     }
 
+    let mut c = Conversion {
+        from: from.id().to_string(),
+        to: to.id().to_string(),
+        output: raw.text,
+        units,
+        counts: Counts::default(),
+        report,
+        template: None,
+    };
+    recount(&mut c);
+    c
+}
+
+fn recount(c: &mut Conversion) {
     let mut counts = Counts::default();
-    for u in &units {
+    for u in &c.units {
         *match u.status {
             Status::Converted => &mut counts.converted,
             Status::Assumptions => &mut counts.assumptions,
@@ -207,14 +222,50 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
             Status::NotConverted => &mut counts.not_converted,
         } += 1;
     }
-    Conversion {
-        from: from.id().to_string(),
-        to: to.id().to_string(),
-        output: raw.text,
-        units,
-        counts,
-        report,
+    c.counts = counts;
+}
+
+/// Every top-level unit kept as a comment, for a pair without rules.
+fn no_rules(root: &sqldiff_syntax::SyntaxNode, text: &str, from: Dialect, to: Dialect) -> out::Out {
+    let reason = if from == to {
+        format!("source and target are both {}", from.display_name())
+    } else {
+        format!(
+            "no conversion rules from {} to {} yet",
+            from.display_name(),
+            to.display_name()
+        )
+    };
+    let mut o = out::Out::default();
+    let units = root.children().flat_map(|c| {
+        if c.kind() == sqldiff_syntax::SyntaxKind::BATCH {
+            c.children().filter(|u| u.kind().is_unit()).collect()
+        } else if c.kind().is_unit() {
+            vec![c]
+        } else {
+            Vec::new()
+        }
+    });
+    for u in units {
+        let (s, e) = sqldiff_syntax::ast::sig_range(&u);
+        let mut t = format!("-- [not converted] {reason}\n");
+        for line in text[s..e].lines() {
+            t.push_str("-- ");
+            t.push_str(line);
+            t.push('\n');
+        }
+        o.unit(
+            (s, e),
+            0,
+            &t,
+            vec![Note {
+                status: Status::NotConverted,
+                rule: "no-rules".into(),
+                text: reason.clone(),
+            }],
+        );
     }
+    o
 }
 
 fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {

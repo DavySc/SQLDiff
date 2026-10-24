@@ -91,6 +91,15 @@ and these rules decide what it is.
 sqldiff diff --template a.tpl.sql b.tpl.sql -d tsql --pack gen-pack --parameter TAB --parameter COL
 ```
 
+The GUI takes the same flags: `sqldiff-gui serve --template` (and `export`,
+`report`) reads both files, or every pair of two trees, as templates; the
+scratchpad, assumption flips, what-if and overlay work on the fragments, and
+the provenance bar and session report show the mode.
+
+```sh
+sqldiff-gui serve --template a.tpl.sql b.tpl.sql -d tsql --pack gen-pack --parameter TAB
+```
+
 `pairs --diff`, the queue and the MCP `diff` compare a pair as templates when
 the source marks both sides as templates and the config has a `[template]`
 syntax; compositions (adapter or pack markers) apply to them as to any pair.

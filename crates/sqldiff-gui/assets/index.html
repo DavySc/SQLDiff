@@ -49,6 +49,8 @@ button.icon { padding: 3px 6px; }
 
 /* Header: one calm line. Where you are, the verdict, and the command bar. */
 header { height: 44px; flex: none; padding: 0 12px 0 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 10px; align-items: center; position: relative; z-index: 5; min-width: 0; }
+#to-convert { font-size: 12.5px; font-weight: 500; color: var(--muted); text-decoration: none; padding: 3px 8px; border-radius: 6px; white-space: nowrap; }
+#to-convert:hover { background: var(--soft); color: var(--fg); }
 .logo { width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); flex: none; }
 #nav { display: flex; gap: 2px; align-items: center; min-width: 0; font-size: 13px; }
 #nav .sep { color: var(--faint); padding: 0 4px; }
@@ -258,6 +260,7 @@ table.q .none { color: var(--faint); }
   <span id="verdict" class="verdict pair-only"></span>
   <span id="summary" class="pair-only"></span>
   <span class="spacer"></span>
+  <a id="to-convert" href="/convert" hidden title="Convert mode: rewrite SQL into another dialect live, or compare two scratch texts">Convert ↗</a>
   <span id="busy" aria-live="polite"></span>
   <button id="btn-palette" title="Command palette (Ctrl+K or :)"><span class="lbl">Search or run a command…</span><kbd>Ctrl K</kbd></button>
   <button id="btn-info" class="icon" aria-expanded="false" title="Sources, hashes, config and reports" aria-label="Details">
@@ -434,6 +437,7 @@ function renderProv() {
   const o = s.origin;
   const kv = (k, v) => `<div class="kv"><span class="k">${k}</span><span>${v}</span></div>`;
   const parts = [kv(o.kind === "trees" ? "Trees" : "Files", `<code>${esc(o.a)}</code><br><code>${esc(o.b)}</code>`)];
+  if (s.template) parts.push(kv("Mode", "templates" + (s.template.length ? ` · parameters <code>${s.template.map(esc).join("</code> <code>")}</code>` : " · pack rules")));
   parts.push(kv("Snapshot", esc(s.loaded_at.replace("T", " ").replace("Z", " UTC"))));
   if (state.view === "pair" && state.data) {
     const r = state.data.report;
@@ -1063,6 +1067,7 @@ function commands() {
     add("Re-read sources", refresh, "r");
     add("Open session report", () => window.open("/api/report", "_blank"));
     add("Open redacted session report", () => window.open("/api/report?redact=1", "_blank"));
+    add("Open convert mode", () => window.open("/convert", "_blank"));
   }
   add("Show details: sources, hashes, config", () => toggleInfo(true), "i");
   add(document.body.classList.contains("compact") ? "Comfortable density" : "Compact density", () => setDensity(!document.body.classList.contains("compact")), "d");
@@ -1095,6 +1100,7 @@ function init() {
   if (!INITIAL) { document.body.innerHTML = "<p style='padding:20px'>No data. Open this page through <code>sqldiff-gui serve</code> or <code>sqldiff-gui export</code>.</p>"; return; }
   state.page = INITIAL;
   state.live = INITIAL.live;
+  $("to-convert").hidden = !state.live;
   $("btn-reset").onclick = resetEdits;
   $("btn-fold").onclick = toggleFold;
   $("btn-accepted").onclick = toggleAccepted;
