@@ -90,7 +90,7 @@ pub mod asm {
     );
     pub const DB2_USRPRF_USER: (&str, &str) = (
         "ASM-DB2-USRPRF-USER",
-        "The Db2 for i routine has no SET OPTION USRPRF, so its authority comes from USRPRF *NAMING: assumed to be the caller's (system naming at creation; under SQL naming it runs with the owner's authority)",
+        "The Db2 for i routine has no SET OPTION USRPRF, so its authority comes from USRPRF *NAMING: assumed to be the caller's (system naming at creation; under SQL naming it runs with the owner's authority; fact V25, not checked on a real system)",
     );
     pub const DEFAULT_SCHEMA: (&str, &str) = (
         "ASM-DEFAULT-SCHEMA",
