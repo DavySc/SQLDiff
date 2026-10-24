@@ -28,8 +28,8 @@ use crate::artifact::{content_hash, location_in, Analyzed, Artifact};
 use crate::classify::{stmt_kind, StmtKind};
 use crate::facts;
 use crate::model::{
-    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Report,
-    Severity, Side, Verdict,
+    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Location,
+    Report, Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::Options;
@@ -760,6 +760,78 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
     }
 }
 
+/// The way back from a template's SQL fragment ([`Template::fragment`]) to
+/// the template: fragment offsets and lines to template ones, stand-in names
+/// (`TPL_T`) to the placeholders as the template spells them. Every analysis
+/// that reads the fragment maps its results through this, so they point at
+/// the template the author edits.
+pub struct TemplateSide<'a> {
+    pub template: &'a Template,
+    pub fragment: &'a Derived,
+    lines: sqldiff_syntax::LineIndex,
+    fragment_lines: sqldiff_syntax::LineIndex,
+    spelled: Vec<(String, String)>,
+}
+
+impl<'a> TemplateSide<'a> {
+    pub fn new(template: &'a Template, fragment: &'a Derived) -> TemplateSide<'a> {
+        let mut spelled: Vec<(String, String)> = template
+            .segments
+            .iter()
+            .filter_map(|s| match &s.kind {
+                SegmentKind::Placeholder { name } => {
+                    Some((stand_in(name), template.slice(s).to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        // Longest first, so `TPL_AB` is not respelled as `TPL_A` + `B`.
+        spelled.sort_by(|x, y| y.0.len().cmp(&x.0.len()).then(x.0.cmp(&y.0)));
+        spelled.dedup_by(|x, y| x.0 == y.0);
+        TemplateSide {
+            template,
+            fragment,
+            lines: sqldiff_syntax::LineIndex::new(&template.text),
+            fragment_lines: sqldiff_syntax::LineIndex::new(&fragment.text),
+            spelled,
+        }
+    }
+
+    /// Fragment text with placeholders as the template spells them.
+    pub fn respell(&self, s: &str) -> String {
+        self.spelled.iter().fold(s.to_string(), |acc, (from, to)| {
+            acc.replace(from.as_str(), to)
+        })
+    }
+
+    /// A location in the fragment, in the template.
+    pub fn location(&self, loc: &Location, excerpt_lines: usize) -> Location {
+        let span = self.fragment.map.src_range(loc.byte_start, loc.byte_end);
+        location_in(
+            loc.side,
+            &loc.path,
+            &self.template.text,
+            &self.lines,
+            span,
+            excerpt_lines,
+        )
+    }
+
+    /// A 1-based fragment line, as a template line.
+    pub fn line(&self, fragment_line: usize) -> usize {
+        let off = self.fragment_lines.line_start(fragment_line);
+        self.lines.line_col(self.fragment.map.to_src(off)).0
+    }
+
+    /// A 1-based template line, as a fragment line.
+    pub fn fragment_line(&self, template_line: usize) -> usize {
+        let off = self.lines.line_start(template_line);
+        self.fragment_lines
+            .line_col(self.fragment.map.to_dst(off))
+            .0
+    }
+}
+
 /// Template level: maps the locations and diagnostics of one side of a
 /// report on a template's SQL fragment ([`Template::fragment`]) back to the
 /// template, so findings point at the template the author edits.
@@ -771,29 +843,12 @@ pub fn remap_to_template(
     dialect: sqldiff_syntax::Dialect,
     excerpt_lines: usize,
 ) {
+    let ts = TemplateSide::new(template, fragment);
     let text = &template.text;
-    let lines = sqldiff_syntax::LineIndex::new(text);
     // Witnesses quote fragment text; show placeholders as the template spells them.
-    let mut spelled: Vec<(String, String)> = template
-        .segments
-        .iter()
-        .filter_map(|s| match &s.kind {
-            SegmentKind::Placeholder { name } => {
-                Some((stand_in(name), template.slice(s).to_string()))
-            }
-            _ => None,
-        })
-        .collect();
-    spelled.sort_by(|x, y| y.0.len().cmp(&x.0.len()).then(x.0.cmp(&y.0)));
-    spelled.dedup_by(|x, y| x.0 == y.0);
-    let respell = |s: &str| {
-        spelled.iter().fold(s.to_string(), |acc, (from, to)| {
-            acc.replace(from.as_str(), to)
-        })
-    };
     let mine = |f: &Finding| [&f.a, &f.b].into_iter().flatten().any(|l| l.side == side);
     for f in report.findings.iter_mut().filter(|f| mine(f)) {
-        f.witness = respell(&f.witness);
+        f.witness = ts.respell(&f.witness);
     }
     let info = if side == Side::A {
         Some(&mut report.a)
@@ -801,22 +856,20 @@ pub fn remap_to_template(
         report.b.as_mut()
     };
     if let Some(info) = info {
-        info.object = respell(&info.object);
+        info.object = ts.respell(&info.object);
         info.content_hash = content_hash(text);
     }
     for f in &mut report.findings {
         for loc in [&mut f.a, &mut f.b].into_iter().flatten() {
-            if loc.side != side {
-                continue;
+            if loc.side == side {
+                *loc = ts.location(loc, excerpt_lines);
             }
-            let span = fragment.map.src_range(loc.byte_start, loc.byte_end);
-            *loc = location_in(loc.side, &loc.path, text, &lines, span, excerpt_lines);
         }
     }
     report.diagnostics.retain(|d| d.side != side);
     let (_, diags) = fragment.parse(dialect);
     for d in diags {
-        let (line, col) = lines.line_col(d.offset);
+        let (line, col) = ts.lines.line_col(d.offset);
         report.diagnostics.push(crate::model::DiagnosticInfo {
             side,
             line,
@@ -827,6 +880,85 @@ pub fn remap_to_template(
     report.normalizations.push(format!(
         "side {side:?} is a template: placeholders read as identifiers, special forms as comments"
     ));
+}
+
+/// Template level for a what-if answer ([`crate::what_if`] on the
+/// fragments): lines, locations and names of `side` back in the template.
+pub fn remap_what_if(
+    w: &mut crate::ir::witness::WhatIf,
+    side: Side,
+    ts: &TemplateSide,
+    excerpt_lines: usize,
+) {
+    use crate::ir::witness::{ScenarioInfo, SideOutcome};
+    let scenario = |s: &mut ScenarioInfo| {
+        let line = if side == Side::A {
+            &mut s.line_a
+        } else {
+            &mut s.line_b
+        };
+        if let Some(l) = line {
+            *l = ts.line(*l);
+        }
+        // The scenario's statement may be on either side: both respell it.
+        s.statement = s.statement.as_deref().map(|x| ts.respell(x));
+        s.text = ts.respell(&s.text);
+        for p in &mut s.path {
+            p.condition = ts.respell(&p.condition);
+        }
+    };
+    let outcome = |o: &mut SideOutcome| {
+        for s in [
+            &mut o.control,
+            &mut o.exit,
+            &mut o.rollback,
+            &mut o.transaction,
+        ] {
+            *s = ts.respell(s);
+        }
+        for v in [
+            &mut o.durable,
+            &mut o.undone,
+            &mut o.partial,
+            &mut o.left_to_caller,
+            &mut o.not_proven,
+        ] {
+            for s in v.iter_mut() {
+                *s = ts.respell(s);
+            }
+        }
+        for l in &mut o.path {
+            *l = ts.line(*l);
+        }
+    };
+    scenario(&mut w.scenario);
+    for o in if side == Side::A { &mut w.a } else { &mut w.b } {
+        outcome(o);
+    }
+    for f in &mut w.findings {
+        f.witness = ts.respell(&f.witness);
+        for loc in [&mut f.a, &mut f.b].into_iter().flatten() {
+            if loc.side == side {
+                *loc = ts.location(loc, excerpt_lines);
+            }
+        }
+    }
+    for x in &mut w.witnesses {
+        scenario(&mut x.scenario);
+        outcome(if side == Side::A { &mut x.a } else { &mut x.b });
+    }
+    for n in &mut w.notes {
+        *n = ts.respell(n);
+    }
+}
+
+/// Template level for transaction brackets of `side`: template lines and spelling.
+pub fn remap_brackets(brackets: &mut [crate::ir::overlay::Bracket], ts: &TemplateSide) {
+    for b in brackets {
+        b.start_line = ts.line(b.start_line);
+        b.end_line = ts.line(b.end_line);
+        b.label = ts.respell(&b.label);
+    }
 }
 
 /// Whether the template delimiters also quote identifiers in `dialect`, so a
