@@ -193,3 +193,38 @@ fn tree_pairs_by_pack_rules() {
     assert_eq!(v["ambiguous"].as_array().unwrap().len(), 1);
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn template_and_diff_agree_on_known_parameters() {
+    let dir = scratch("template-known");
+    std::fs::write(
+        dir.join("pack.toml"),
+        "[pack]\nname = \"t\"\nversion = \"1\"\n\n[template]\nopen = \"[\"\nclose = \"]\"\n\
+         name_pattern = \"[A-Z][A-Z0-9_]*\"\nknown_parameters = [\"SCHEMA\"]\n",
+    )
+    .unwrap();
+    let tpl = dir.join("t.tsql.sql");
+    std::fs::write(&tpl, "select x from [SCHEMA].[TAB];\n").unwrap();
+    let pack = dir.join("pack.toml");
+    // `[SCHEMA]` comes from the pack, `[TAB]` from --param: neither is unresolved.
+    let out = sqldiff(&[
+        "template",
+        tpl.to_str().unwrap(),
+        "-d",
+        "tsql",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--param",
+        "TAB=t",
+        "--known-only",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("unresolved"), "{stdout}");
+    assert!(stdout.contains("placeholder SCHEMA"), "{stdout}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

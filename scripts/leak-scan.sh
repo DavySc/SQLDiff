@@ -59,15 +59,13 @@ if [[ -n "$hashes" ]]; then
   printf '%s\n' "$hashes" | tr -d '\r' > "$terms"
   bin="${SQLDIFF_BIN:-}"
   if [[ -z "$bin" ]]; then
-    bin="$(command -v sqldiff 2>/dev/null)" || bin=""
-  fi
-  if [[ -z "$bin" ]]; then
-    # The newer of the two builds: an old one may predate `pack scan`.
+    # The newest executable of sqldiff on PATH and the two builds: an old one
+    # may predate `pack scan`.
     root="$(git rev-parse --show-toplevel)"
-    for c in "$root/target/release/sqldiff" "$root/target/debug/sqldiff"; do
-      for f in "$c" "$c.exe"; do
-        if [[ -f "$f" && ( -z "$bin" || "$f" -nt "$bin" ) ]]; then bin="$f"; fi
-      done
+    for f in "$(command -v sqldiff 2>/dev/null)" \
+             "$root/target/release/sqldiff" "$root/target/release/sqldiff.exe" \
+             "$root/target/debug/sqldiff" "$root/target/debug/sqldiff.exe"; do
+      if [[ -n "$f" && -f "$f" && -x "$f" && ( -z "$bin" || "$f" -nt "$bin" ) ]]; then bin="$f"; fi
     done
   fi
   if [[ -z "$bin" ]]; then

@@ -24,12 +24,12 @@ use regex::Regex;
 use sqldiff_syntax::template::{stand_in, Compiled, Derived, SegmentKind, Template};
 use sqldiff_syntax::{ast, SyntaxNode};
 
-use crate::artifact::{content_hash, Analyzed, Artifact};
+use crate::artifact::{content_hash, location_in, Analyzed, Artifact};
 use crate::classify::{stmt_kind, StmtKind};
 use crate::facts;
 use crate::model::{
-    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Location,
-    Report, Severity, Side, Verdict,
+    fingerprint, Assumption, AssumptionSource, ChangeClass, Finding, FingerprintInput, Report,
+    Severity, Side, Verdict,
 };
 use crate::normalize::lcs_pairs;
 use crate::Options;
@@ -809,20 +809,8 @@ pub fn remap_to_template(
             if loc.side != side {
                 continue;
             }
-            let (s, e) = fragment.map.src_range(loc.byte_start, loc.byte_end);
-            let (sl, sc) = lines.line_col(s);
-            let (el, ec) = lines.line_col(e);
-            loc.byte_start = s;
-            loc.byte_end = e;
-            loc.start_line = sl;
-            loc.start_col = sc;
-            loc.end_line = el;
-            loc.end_col = ec;
-            loc.excerpt = text[s..e]
-                .lines()
-                .take(excerpt_lines.max(1))
-                .map(|l| l.trim_end().to_string())
-                .collect();
+            let span = fragment.map.src_range(loc.byte_start, loc.byte_end);
+            *loc = location_in(loc.side, &loc.path, text, &lines, span, excerpt_lines);
         }
     }
     report.diagnostics.retain(|d| d.side != side);
@@ -880,23 +868,8 @@ pub fn template_notes(
     let lines = sqldiff_syntax::LineIndex::new(text);
     for s in template.unresolved() {
         let spelled = template.slice(s);
-        let (sl, sc) = lines.line_col(s.start);
-        let (el, ec) = lines.line_col(s.end);
-        let loc = Location {
-            side,
-            path: path.to_string(),
-            start_line: sl,
-            start_col: sc,
-            end_line: el,
-            end_col: ec,
-            byte_start: s.start,
-            byte_end: s.end,
-            excerpt: text[s.start..s.end]
-                .lines()
-                .take(excerpt_lines.max(1))
-                .map(|l| l.trim_end().to_string())
-                .collect(),
-        };
+        let loc = location_in(side, path, text, &lines, (s.start, s.end), excerpt_lines);
+        let sl = loc.start_line;
         let class = ChangeClass::Structural;
         report.findings.push(Finding {
             fingerprint: fingerprint(&FingerprintInput {

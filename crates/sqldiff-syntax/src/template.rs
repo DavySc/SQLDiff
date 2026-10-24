@@ -50,10 +50,14 @@ impl Compiled {
         if s.open.is_empty() || s.close.is_empty() {
             return Err("template: open and close delimiters must be non-empty".into());
         }
+        // With ignore_case the generator resolves names in any case, so the
+        // name pattern matches in any case too (`[schema]` for SCHEMA).
         let placeholder = Regex::new(&format!(
-            "{}\\s*(?P<tplname>{})\\s*{}",
+            "{}\\s*(?P<tplname>{}{}){}\\s*{}",
             regex::escape(&s.open),
+            if s.ignore_case { "(?i:" } else { "(?:" },
             s.name_pattern,
+            ")",
             regex::escape(&s.close)
         ))
         .map_err(|e| format!("template.name_pattern: {e}"))?;
@@ -107,6 +111,12 @@ pub enum Decision {
     Unresolved,
     /// Plain SQL (for example a quoted name), not reported.
     Sql,
+}
+
+/// Whether `name` is one of the parameter names in `list`, in any letter case
+/// when `ignore_case` is set.
+pub fn listed(list: &BTreeSet<String>, name: &str, ignore_case: bool) -> bool {
+    list.contains(name) || (ignore_case && list.iter().any(|x| x.eq_ignore_ascii_case(name)))
 }
 
 /// One match of the name pattern, as [`Template::parse_with`] offers it.
@@ -288,12 +298,7 @@ impl Template {
     pub fn parse(text: &str, syntax: &Compiled, known: Option<&BTreeSet<String>>) -> Template {
         let ignore_case = syntax.ignore_case;
         Template::parse_with(text, syntax, &|c: &Candidate| match known {
-            Some(k)
-                if !k.contains(c.name)
-                    && !(ignore_case && k.iter().any(|x| x.eq_ignore_ascii_case(c.name))) =>
-            {
-                Decision::Unresolved
-            }
+            Some(k) if !listed(k, c.name, ignore_case) => Decision::Unresolved,
             _ => Decision::Placeholder,
         })
     }

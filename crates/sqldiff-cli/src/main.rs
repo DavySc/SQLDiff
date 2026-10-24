@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use sqldiff_core::{render, Artifact, Dialect, Report, Verdict};
-use sqldiff_syntax::template::{ExpandProblem, SegmentKind, Template};
+use sqldiff_syntax::template::{ExpandProblem, SegmentKind};
 
 use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
@@ -178,15 +178,6 @@ fn template_dir(
         .map_err(|e| e.0)
 }
 
-fn template_syntax(cfg: &Resolved) -> Result<sqldiff_syntax::template::Compiled, String> {
-    let t = cfg
-        .policy
-        .template
-        .as_ref()
-        .ok_or("no [template] syntax in the loaded packs or config")?;
-    compose::compile(t).map_err(|e| e.0)
-}
-
 fn template_cmd(
     art: &Artifact,
     params: &BTreeMap<String, String>,
@@ -194,9 +185,15 @@ fn template_cmd(
     render: bool,
     cfg: &Resolved,
 ) -> Result<ExitCode, String> {
-    let syntax = template_syntax(cfg)?;
+    // The same placeholder rules as `diff --template` and pair diffs.
+    let def = cfg
+        .policy
+        .template
+        .as_ref()
+        .ok_or("no [template] syntax in the loaded packs or config")?;
+    let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
     let known: BTreeSet<String> = params.keys().cloned().collect();
-    let t = Template::parse(&art.text, &syntax, known_only.then_some(&known));
+    let (t, _) = placeholders.parse(&art.text, art.dialect, known_only.then_some(&known));
     if t.print() != art.text {
         return Err("round trip failed: template segments differ from input".into());
     }

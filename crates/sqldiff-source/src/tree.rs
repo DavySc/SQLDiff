@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 
+use crate::compose::Placeholders;
 use crate::protocol::ObjectFilter;
 use crate::{pairing, policy, Error, FsSource, Resolved, Result, Source};
 
@@ -65,110 +66,32 @@ pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
 /// Template-level diff: the SQL fragments of two templates in the pack's
 /// `[template]` syntax, with locations and witnesses in the templates.
 ///
-/// `known` holds each side's parameter names when its source knows them; the
-/// pack's `known_parameters` are added to a given list. With a list, only its
-/// names are placeholders and any other delimited name stays SQL (reported
-/// as `template.unresolved`), since `[name]` is also a quoted identifier in
-/// T-SQL. Without one the name pattern decides, and where the delimiters can
-/// quote names the report says which names that made placeholders. A pack
-/// with `placeholders = "pattern"` declares the pattern as the generator's
-/// convention: lists are not used and the report records an assumption.
+/// `known` holds each side's parameter names when its source knows them.
+/// [`Placeholders`] decides what is a placeholder; where a name is SQL or
+/// only a placeholder by pattern, the report says so (`template.unresolved`,
+/// an unknown reason, or a declared assumption).
 pub fn template_report(
     a: &Artifact,
     b: &Artifact,
     known: [Option<&BTreeSet<String>>; 2],
-    cfg: &Resolved,
+    placeholders: &Placeholders,
     opts: &Options,
-) -> Result<Report> {
-    use sqldiff_core::composition::{
-        delimiters_quote_names, remap_to_template, template_notes, PlaceholderBasis,
-    };
+) -> Report {
+    use sqldiff_core::composition::{remap_to_template, template_notes};
     use sqldiff_core::model::Side;
-    use sqldiff_syntax::template::Template;
-    use sqldiff_syntax::template::{Candidate, Compiled, Decision};
 
-    let t = cfg
-        .policy
-        .template
-        .as_ref()
-        .ok_or_else(|| Error::new("no [template] syntax in the loaded packs or config"))?;
-    let syntax = crate::compose::compile(t)?;
-    // Where the delimiters are not SQL, a delimited name cannot be a quoted
-    // identifier, so the pack may allow a wider name pattern there.
-    let unquoted = match &t.unquoted_name_pattern {
-        Some(p) => {
-            let mut def = crate::compose::syntax_def(t);
-            def.name_pattern = p.clone();
-            Some(Compiled::new(&def).map_err(Error::new)?)
-        }
-        None => None,
-    };
-    let syntax_for = |d: Dialect| {
-        if delimiters_quote_names(&t.open, d) {
-            &syntax
-        } else {
-            unquoted.as_ref().unwrap_or(&syntax)
-        }
-    };
-    let by_pattern = t.placeholders.as_deref() == Some("pattern");
-    // A side's parameter list, with the generator-supplied names added.
-    let full = |k: Option<&BTreeSet<String>>| {
-        k.map(|k| {
-            k.iter()
-                .chain(t.known_parameters.iter())
-                .cloned()
-                .collect::<BTreeSet<String>>()
-        })
-    };
-    let (la, lb) = (full(known[0]), full(known[1]));
-    // Under a declared convention a name `name_pattern` matches (as written)
-    // is a placeholder, and so is a name the side's list holds even where the
-    // convention would not make it one (a lower-case parameter in T-SQL);
-    // any other delimited name is SQL.
-    let convention = regex::Regex::new(&format!("^(?:{})$", t.name_pattern))
-        .map_err(|e| Error::new(format!("template.name_pattern: {e}")))?;
-    let any_name = {
-        let mut def = crate::compose::syntax_def(t);
-        def.name_pattern = "[A-Za-z_][A-Za-z0-9_]*".into();
-        Compiled::new(&def).map_err(Error::new)?
-    };
-    let parse = |text: &str, d: Dialect, list: &Option<BTreeSet<String>>| -> Template {
-        if !by_pattern {
-            return Template::parse(text, syntax_for(d), list.as_ref());
-        }
-        if !delimiters_quote_names(&t.open, d) {
-            return Template::parse(text, syntax_for(d), None);
-        }
-        // Where the delimiters also quote names: the convention, the source's
-        // list, and placement decide. A glued name (`@[x]`, `a_[x]`, `[x][y]`)
-        // cannot be a quoted identifier, whatever its case.
-        let listed = |n: &str| {
-            list.as_ref().is_some_and(|l| {
-                l.contains(n) || (t.ignore_case && l.iter().any(|x| x.eq_ignore_ascii_case(n)))
-            })
-        };
-        Template::parse_with(text, &any_name, &|c: &Candidate| {
-            if convention.is_match(c.name) || listed(c.name) || c.glued(&t.open, &t.close) {
-                Decision::Placeholder
-            } else {
-                Decision::Sql
-            }
-        })
-    };
-    let basis = |k: &Option<BTreeSet<String>>| match (k, by_pattern) {
-        (_, true) => PlaceholderBasis::DeclaredPattern,
-        (Some(_), false) => PlaceholderBasis::Parameters,
-        (None, false) => PlaceholderBasis::Pattern,
-    };
-    let ta = parse(&a.text, a.dialect, &la);
-    let tb = parse(&b.text, b.dialect, &lb);
+    let (ta, basis_a) = placeholders.parse(&a.text, a.dialect, known[0]);
+    let (tb, basis_b) = placeholders.parse(&b.text, b.dialect, known[1]);
     let (fa, fb) = (ta.fragment(), tb.fragment());
     let mut xa = a.clone();
     xa.text = fa.text.clone();
     let mut xb = b.clone();
     xb.text = fb.text.clone();
     let mut r = sqldiff_core::diff(&xa, &xb, opts);
-    for (side, tpl, frag, art, k) in [(Side::A, &ta, &fa, a, &la), (Side::B, &tb, &fb, b, &lb)] {
+    for (side, tpl, frag, art, basis) in [
+        (Side::A, &ta, &fa, a, basis_a),
+        (Side::B, &tb, &fb, b, basis_b),
+    ] {
         remap_to_template(&mut r, side, tpl, frag, art.dialect, opts.excerpt_lines);
         template_notes(
             &mut r,
@@ -176,12 +99,12 @@ pub fn template_report(
             tpl,
             &art.path,
             art.dialect,
-            basis(k),
-            (&t.open, &t.close),
+            basis,
+            placeholders.delimiters(),
             opts.excerpt_lines,
         );
     }
-    Ok(r)
+    r
 }
 
 /// [`template_report`] with pack policy (limit rules, overrides, declared
@@ -193,8 +116,14 @@ pub fn template_diff(
     cfg: &Resolved,
     opts: &Options,
 ) -> Result<Report> {
+    let t = cfg
+        .policy
+        .template
+        .as_ref()
+        .ok_or_else(|| Error::new("no [template] syntax in the loaded packs or config"))?;
+    let placeholders = Placeholders::new(t)?;
     Ok(with_policy(
-        template_report(a, b, known, cfg, opts)?,
+        template_report(a, b, known, &placeholders, opts),
         a,
         Some(b),
         cfg,

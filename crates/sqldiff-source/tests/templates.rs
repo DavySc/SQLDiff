@@ -328,3 +328,148 @@ fn glued_names_are_placeholders_without_a_list() {
         assert!(!a.text.contains(q), "{q}: {}", a.text);
     }
 }
+
+fn placeholders(extra: &str) -> sqldiff_source::compose::Placeholders {
+    let cfg = cfg_with(&format!("{PACK}{extra}"), &format!("ph-{}", extra.len()));
+    sqldiff_source::compose::Placeholders::new(cfg.policy.template.as_ref().unwrap()).unwrap()
+}
+
+fn names(
+    ph: &sqldiff_source::compose::Placeholders,
+    text: &str,
+    d: Dialect,
+    list: &[&str],
+) -> Vec<String> {
+    let list: BTreeSet<String> = list.iter().map(|s| s.to_string()).collect();
+    let (t, _) = ph.parse(text, d, (!list.is_empty()).then_some(&list));
+    t.parameters()
+}
+
+#[test]
+fn a_listed_name_is_a_placeholder_even_where_the_pattern_does_not_match() {
+    // Parameters mode, upper-case pattern, `--parameter tab`.
+    let ph = placeholders("");
+    assert_eq!(
+        names(&ph, "select x from [tab];", Dialect::Tsql, &["tab"]),
+        ["tab"]
+    );
+    // Declared convention: a listed name also counts in a dialect whose
+    // brackets are not SQL.
+    let ph = placeholders("placeholders = \"pattern\"\n");
+    assert_eq!(
+        names(&ph, "select x from [tab];", Dialect::Postgres, &["tab"]),
+        ["tab"]
+    );
+}
+
+#[test]
+fn ignore_case_applies_to_the_name_pattern_but_not_the_convention() {
+    let ph = placeholders("ignore_case = true\n");
+    // `[schema]` matches the upper-case pattern in any case and is SCHEMA.
+    assert_eq!(
+        names(&ph, "select x from [schema].t;", Dialect::Tsql, &["SCHEMA"]),
+        ["SCHEMA"]
+    );
+    // A declared convention is about how names are written: `[read]` stays SQL.
+    let ph = placeholders("ignore_case = true\nplaceholders = \"pattern\"\n");
+    assert!(names(&ph, "select [read] from t;", Dialect::Tsql, &[]).is_empty());
+}
+
+#[test]
+fn the_pack_pattern_decides_not_a_built_in_scanner() {
+    let cfg = cfg_with(
+        &PACK
+            .replace("[A-Z][A-Z0-9_]*", "[A-Z][A-Z0-9_.]*")
+            .to_string()
+            .replace(
+                "known_parameters",
+                "placeholders = \"pattern\"\nknown_parameters",
+            ),
+        "dotted",
+    );
+    let ph =
+        sqldiff_source::compose::Placeholders::new(cfg.policy.template.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        names(&ph, "select x from [CFG.TABLE];", Dialect::Tsql, &[]),
+        ["CFG.TABLE"]
+    );
+}
+
+#[test]
+fn a_one_sided_template_marking_is_reported() {
+    let mut b = Bundle::new(
+        Describe {
+            name: "test".into(),
+            version: "1".into(),
+            protocol: 1,
+            capabilities: vec![],
+            source: String::new(),
+        },
+        vec![
+            object("a", "tsql", TSQL, Some(TemplateInfo::default())),
+            object("b", "db2i", DB2, None),
+        ],
+    );
+    b.pairs = vec![Pair {
+        a: "a".into(),
+        b: "b".into(),
+        key: "t".into(),
+        rule: "explicit".into(),
+    }];
+    b.seal();
+    let cfg = cfg("one-sided");
+    let run = queue::run(&BundleSource::new(b, &cfg), &cfg, &PairScope::default()).unwrap();
+    let r = &run.pairs[0].report;
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.starts_with("only side A is marked as a template")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn template_pairs_keep_their_composition() {
+    let pack = format!(
+        "{PACK}{}",
+        r#"
+[[composition]]
+name = "m"
+begin = '^-- \[part:(?P<part>[a-z]+)\]$'
+end = '^-- \[/part\]$'
+"#
+    );
+    let with_part = "-- [part:extra]\nupdate [TAB] set a = 1;\n-- [/part]\n\
+                     -- [part:base]\nupdate [TAB] set b = 2;\n-- [/part]\n";
+    let without = "-- [part:base]\nupdate [TAB] set b = 2;\n-- [/part]\n";
+    let marked = Some(TemplateInfo::default());
+    let mut b = Bundle::new(
+        Describe {
+            name: "test".into(),
+            version: "1".into(),
+            protocol: 1,
+            capabilities: vec![],
+            source: String::new(),
+        },
+        vec![
+            object("a", "tsql", with_part, marked.clone()),
+            object("b", "tsql", without, marked),
+        ],
+    );
+    b.pairs = vec![Pair {
+        a: "a".into(),
+        b: "b".into(),
+        key: "t".into(),
+        rule: "explicit".into(),
+    }];
+    b.seal();
+    let cfg = cfg_with(&pack, "composition");
+    let run = queue::run(&BundleSource::new(b, &cfg), &cfg, &PairScope::default()).unwrap();
+    let r = &run.pairs[0].report;
+    assert!(
+        rules(r).contains(&"composition.part-removed"),
+        "{:?}",
+        rules(r)
+    );
+}

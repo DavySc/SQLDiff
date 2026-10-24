@@ -70,42 +70,56 @@ pub fn run_with(
     }
     let info = |id: &str| objects.iter().find(|o| o.id == id);
     let opts = cfg.options();
+    // The template rules, compiled once for the whole run.
+    let placeholders = cfg
+        .policy
+        .template
+        .as_ref()
+        .map(crate::compose::Placeholders::new)
+        .transpose()?;
     let mut pairs = Vec::new();
     for x in &p.pairs {
         let (da, db) = (src.get_artifact(&x.a)?, src.get_artifact(&x.b)?);
         let (a, b) = (to_artifact(&da)?, to_artifact(&db)?);
-        let mut r = match (&da.template, &db.template, &cfg.policy.template) {
+        let mut r = match (&da.template, &db.template, &placeholders) {
             // Both sides are templates: compare them as templates, each with
             // the parameter names its source knows.
-            (Some(ta), Some(tb), Some(_)) => {
+            (Some(ta), Some(tb), Some(ph)) => {
                 let known = |t: &TemplateInfo| {
                     t.parameters
                         .as_ref()
                         .map(|p| p.iter().cloned().collect::<BTreeSet<String>>())
                 };
                 let (ka, kb) = (known(ta), known(tb));
-                crate::tree::template_report(&a, &b, [ka.as_ref(), kb.as_ref()], cfg, &opts)?
+                crate::tree::template_report(&a, &b, [ka.as_ref(), kb.as_ref()], ph, &opts)
             }
-            (ta, tb, syntax) => {
+            (ta, tb, ph) => {
                 let mut r = sqldiff_core::diff(&a, &b, &opts);
-                crate::compose::apply_source(
-                    &mut r,
-                    src,
-                    (&x.a, &a),
-                    (&x.b, &b),
-                    &cfg.policy,
-                    &opts,
-                );
-                if (ta.is_some() || tb.is_some()) && syntax.is_none() {
-                    r.unknown_reasons.push(
-                        "the source marks a template, but no [template] syntax is configured; compared as plain SQL"
-                            .to_string(),
-                    );
+                let why = match (ta.is_some(), tb.is_some(), ph.is_some()) {
+                    (false, false, _) => None,
+                    (_, _, false) => {
+                        Some("the source marks a template, but no [template] syntax is configured")
+                    }
+                    (true, false, true) => Some(
+                        "only side A is marked as a template, so its placeholders were not read",
+                    ),
+                    (false, true, true) => Some(
+                        "only side B is marked as a template, so its placeholders were not read",
+                    ),
+                    (true, true, true) => {
+                        unreachable!("both marked with a syntax is the template arm")
+                    }
+                };
+                if let Some(why) = why {
+                    r.unknown_reasons
+                        .push(format!("{why}; compared as plain SQL"));
                     r.verdict = sqldiff_core::session::derive_verdict(&r);
                 }
                 r
             }
         };
+        // Compositions (adapter or pack markers) apply to templates as well.
+        crate::compose::apply_source(&mut r, src, (&x.a, &a), (&x.b, &b), &cfg.policy, &opts);
         policy::add_limits(&mut r, &a, Some(&b), cfg);
         policy::apply(&mut r, cfg);
         post(&mut r, &a, &b);
