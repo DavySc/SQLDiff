@@ -562,6 +562,7 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
         "\"$user\", public",
         "pg_catalog, public",
         "'public'",
+        "PUBLIC",
     ] {
         let r = run(
             &ts_delete(""),
@@ -585,6 +586,7 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
         "pg_temp, public",
         "'other, public'",
         "app, pg_temp",
+        "\"PUBLIC\"",
     ] {
         let r = run(
             &ts_delete(""),

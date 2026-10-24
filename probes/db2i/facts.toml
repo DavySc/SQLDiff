@@ -103,3 +103,9 @@ facts = ["V19"]
 file = "crates/sqldiff-core/src/equiv/canon.rs"
 anchor = "(fact V19"
 hedge = "Db2 for i part not checked on a real system"
+
+[[link]]
+facts = ["V25"]
+file = "crates/sqldiff-core/src/equiv/canon.rs"
+anchor = "\"ASM-DB2-USRPRF-USER\","
+hedge = "fact V25, not checked on a real system"

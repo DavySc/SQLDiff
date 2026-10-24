@@ -486,7 +486,15 @@ fn search_path_is_public(values: &[String]) -> bool {
                 .and_then(|x| x.strip_suffix('\''))
                 .unwrap_or(v);
             v.split(',')
-                .map(|x| cst::unquote(x.trim()))
+                .map(|x| {
+                    // Unquoted names fold to lower case.
+                    let x = x.trim();
+                    if x.starts_with('"') {
+                        cst::unquote(x)
+                    } else {
+                        x.to_lowercase()
+                    }
+                })
                 .collect::<Vec<_>>()
         })
         .collect();
