@@ -8,7 +8,7 @@ use crate::protocol::{
     ArtifactData, Describe, ObjectFilter, ObjectInfo, Pair, PairScope, Provenance,
 };
 use crate::source::Source;
-use crate::walk::{is_candidate, object_info, object_text, objects};
+use crate::walk::{is_candidate, object_text, objects, whole_info};
 use crate::{pairing, Error, Resolved, Result};
 
 /// Directories never descended into.
@@ -106,7 +106,10 @@ impl FsSource {
         let text = self.file(rel)?;
         let changed = self.changed(rel);
         if frag.is_none() {
-            return Ok((object_info(rel, &text, &self.config, changed), text));
+            return Ok((
+                whole_info(rel, &text, &self.config, changed, self.dialect),
+                text,
+            ));
         }
         let (info, text) = object_text(id, &self.config, self.dialect, |_| Ok(text.clone()))
             .and_then(|(_, t)| {

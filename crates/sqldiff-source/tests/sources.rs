@@ -477,3 +477,82 @@ fn files_with_several_objects_pair_object_by_object() {
     assert_eq!(a.object.as_deref(), Some("dbo.get_film"));
     assert!(!b.text.contains("CREATE TABLE film"));
 }
+
+#[test]
+fn a_file_split_on_one_side_pairs_with_the_object_it_defines() {
+    use sqldiff_core::Dialect::{Postgres, Tsql};
+    let two = "CREATE PROCEDURE dbo.t @a int AS\nBEGIN\n  UPDATE dbo.x SET v = 1 WHERE id = @a;\nEND\nGO\nCREATE PROCEDURE dbo.u AS\nBEGIN\n  SELECT 1;\nEND\nGO\n";
+    let one_t = "CREATE PROCEDURE t(a int) LANGUAGE plpgsql AS $$\nBEGIN\n  UPDATE x SET v = 1 WHERE id = a;\nEND $$;\n";
+    let cfg = Resolved::builtin();
+    let tree_ids = |b_text: &str, b_file: &str| {
+        let root = tmp("split-one");
+        write(&root, "a/s.sql", two);
+        write(&root, &format!("b/{b_file}"), b_text);
+        let t = sqldiff_source::tree::pair_dirs(
+            &root.join("a"),
+            &root.join("b"),
+            Some(Tsql),
+            Some(Postgres),
+            &cfg,
+        )
+        .unwrap();
+        let pairs: Vec<(String, String)> = t
+            .pairs
+            .iter()
+            .map(|p| (p.id_a.clone(), p.id_b.clone()))
+            .collect();
+        let name = |p: &str| p.rsplit(['/', '\\']).next().unwrap().to_string();
+        let only: Vec<String> = t.only_a.iter().chain(&t.only_b).map(|p| name(p)).collect();
+        (t, pairs, only)
+    };
+    // The reviewer's case: `t` is compared, `u` is reported.
+    let (t, pairs, only) = tree_ids(one_t, "s.sql");
+    assert_eq!(pairs, [("s.sql#t".to_string(), "s.sql".to_string())]);
+    assert_eq!(only, ["s.sql#u"]);
+    let (a, b) = t.read(&t.pairs[0], &cfg).unwrap();
+    assert_eq!(a.object.as_deref(), Some("dbo.t"));
+    assert!(!a.text.contains("dbo.u") && b.text.contains("UPDATE x"));
+    // Not the same object, another schema, or another file: nothing pairs.
+    for (text, file) in [
+        (one_t.replace("PROCEDURE t", "PROCEDURE w"), "s.sql"),
+        (one_t.replace("PROCEDURE t", "PROCEDURE hr.t"), "s.sql"),
+        (one_t.to_string(), "other.sql"),
+    ] {
+        let (_, pairs, only) = tree_ids(&text, file);
+        assert!(pairs.is_empty(), "{text}: {pairs:?}");
+        assert_eq!(only.len(), 3, "{only:?}");
+    }
+    // Two candidates (overloads): neither pairs.
+    let root = tmp("split-overload");
+    write(&root, "a/f.sql", "CREATE FUNCTION f(a int) RETURNS int AS $$ SELECT a $$ LANGUAGE sql;\nCREATE FUNCTION f(a text) RETURNS text AS $$ SELECT a $$ LANGUAGE sql;\n");
+    write(
+        &root,
+        "b/f.sql",
+        "CREATE FUNCTION f(a int) RETURNS int AS $$ SELECT a $$ LANGUAGE sql;\n",
+    );
+    let t = sqldiff_source::tree::pair_dirs(
+        &root.join("a"),
+        &root.join("b"),
+        Some(Postgres),
+        Some(Postgres),
+        &cfg,
+    )
+    .unwrap();
+    assert!(t.pairs.is_empty(), "{:?}", t.pairs);
+    assert_eq!((t.ambiguous.len(), t.only_b.len()), (1, 1));
+
+    // Sources pair the same way across dialect folders.
+    let root = tmp("split-one-fs");
+    write(&root, "tsql/s.sql", two);
+    write(&root, "pg/s.sql", one_t);
+    let src = FsSource::new(&root, &cfg).unwrap();
+    let pairs = src.get_pairs(&PairScope::default()).unwrap();
+    let pairs: Vec<(&str, &str, &str)> = pairs
+        .iter()
+        .map(|p| (p.a.as_str(), p.b.as_str(), p.rule.as_str()))
+        .collect();
+    assert_eq!(pairs, [("tsql/s.sql#t", "pg/s.sql", "split-object")]);
+    let objects = src.list_objects(&ObjectFilter::default()).unwrap();
+    let p = sqldiff_source::pairing::pair(&objects, &cfg, &PairScope::default()).unwrap();
+    assert_eq!(p.unpaired, ["tsql/s.sql#u"]);
+}

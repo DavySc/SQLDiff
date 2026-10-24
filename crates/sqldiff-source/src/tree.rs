@@ -9,7 +9,7 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 
 use crate::compose::Placeholders;
-use crate::protocol::ObjectFilter;
+use crate::protocol::{ObjectFilter, ObjectInfo};
 use crate::{pairing, policy, Error, FsSource, Resolved, Result, Source};
 
 /// Builds an artifact. Dialect: the given one, else `dialect_map` or the path
@@ -286,6 +286,7 @@ struct Side {
     ambiguous: BTreeMap<String, Vec<String>>,
     no_dialect: Vec<String>,
     dialects: BTreeMap<String, Dialect>,
+    infos: BTreeMap<String, ObjectInfo>,
 }
 
 impl Side {
@@ -297,6 +298,7 @@ impl Side {
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut no_dialect = Vec::new();
         let mut dialects = BTreeMap::new();
+        let mut infos = BTreeMap::new();
         for o in objects {
             if cfg.is_shared(&o.id) {
                 continue;
@@ -311,7 +313,8 @@ impl Side {
             groups
                 .entry(pairing::key(&o.name, &rule))
                 .or_default()
-                .push(o.id);
+                .push(o.id.clone());
+            infos.insert(o.id.clone(), o);
         }
         let (unique, ambiguous): (BTreeMap<_, _>, BTreeMap<_, _>) =
             groups.into_iter().partition(|(_, ids)| ids.len() == 1);
@@ -324,6 +327,7 @@ impl Side {
             ambiguous,
             no_dialect,
             dialects,
+            infos,
         })
     }
 
@@ -422,16 +426,40 @@ pub fn pair_dirs(
             }
         }
     }
+    let mut left_a = Vec::new();
     for (k, ia) in &sa.by_key {
         match sb.by_key.get(k) {
             Some(ib) => ids.push((ia.clone(), ib.clone())),
-            None => only_a.push(sa.display(ia)),
+            None => left_a.push(&sa.infos[ia]),
         }
     }
-    for (k, ib) in &sb.by_key {
-        if !sa.by_key.contains_key(k) {
-            only_b.push(sb.display(ib));
-        }
+    let left_b: Vec<&ObjectInfo> = sb
+        .by_key
+        .iter()
+        .filter(|(k, _)| !sa.by_key.contains_key(*k))
+        .map(|(_, ib)| &sb.infos[ib])
+        .collect();
+    // A file split on one side only: its object pairs with the other
+    // side's whole file (see `pairing::split_matches`).
+    let rule = |o: &ObjectInfo, id: &str| {
+        cfg.pairing_rule(id, o.dialect.as_deref().and_then(|d| d.parse().ok()))
+    };
+    let split = pairing::split_matches(
+        &left_a,
+        &left_b,
+        |o| pairing::key(&o.name, &rule(o, &o.id)),
+        |o, rel| pairing::key(&crate::walk::object_name(rel), &rule(o, rel)),
+    );
+    let matched: BTreeSet<&str> = split
+        .iter()
+        .flat_map(|(a, b)| [a.id.as_str(), b.id.as_str()])
+        .collect();
+    ids.extend(split.iter().map(|(a, b)| (a.id.clone(), b.id.clone())));
+    for o in left_a.iter().filter(|o| !matched.contains(o.id.as_str())) {
+        only_a.push(sa.display(&o.id));
+    }
+    for o in left_b.iter().filter(|o| !matched.contains(o.id.as_str())) {
+        only_b.push(sb.display(&o.id));
     }
     let ambiguous = ambiguous_left
         .into_iter()

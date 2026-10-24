@@ -24,6 +24,26 @@ pub struct Part {
     pub ranges: Vec<(usize, usize)>,
 }
 
+impl Part {
+    /// The object in the form of [`crate::defined_name`], for tables, views
+    /// and routines.
+    pub fn defines(&self) -> Option<String> {
+        let ns = match self.kind.as_str() {
+            "table" | "view" => "relation",
+            "procedure" | "function" => "routine",
+            _ => return None,
+        };
+        let mut parts = self.qualified.rsplit('.');
+        let name = parts.next()?;
+        let schema = parts.next().unwrap_or("");
+        Some(format!(
+            "{ns}:{}.{}",
+            schema.to_lowercase(),
+            name.to_lowercase()
+        ))
+    }
+}
+
 /// What a top-level statement does to which object.
 enum Role {
     Creates { kind: String, parts: Vec<String> },
