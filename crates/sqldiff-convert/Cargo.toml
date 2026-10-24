@@ -11,6 +11,7 @@ sqldiff-syntax.workspace = true
 sqldiff-core.workspace = true
 rowan.workspace = true
 serde.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -16,8 +16,11 @@ use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
 mod out;
+mod template;
 mod tok;
 mod tsql_pg;
+
+pub use template::{convert_template, TemplateInfo};
 
 /// How far a converted unit can be trusted, from best to worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -102,8 +105,11 @@ pub struct Conversion {
     pub output: String,
     pub units: Vec<Unit>,
     pub counts: Counts,
-    /// The engine's diff of input (side A) against output (side B).
+    /// The engine's diff of input (side A) against output (side B). For a
+    /// template, of its fragment against the converted fragment.
     pub report: Report,
+    /// Set when the input was a template.
+    pub template: Option<TemplateInfo>,
 }
 
 /// Dialect pairs with rules.
@@ -191,8 +197,22 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
         }
     }
 
+    let mut c = Conversion {
+        from: from.id().to_string(),
+        to: to.id().to_string(),
+        output: raw.text,
+        units,
+        counts: Counts::default(),
+        report,
+        template: None,
+    };
+    recount(&mut c);
+    c
+}
+
+fn recount(c: &mut Conversion) {
     let mut counts = Counts::default();
-    for u in &units {
+    for u in &c.units {
         *match u.status {
             Status::Converted => &mut counts.converted,
             Status::Assumptions => &mut counts.assumptions,
@@ -201,14 +221,7 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
             Status::NotConverted => &mut counts.not_converted,
         } += 1;
     }
-    Conversion {
-        from: from.id().to_string(),
-        to: to.id().to_string(),
-        output: raw.text,
-        units,
-        counts,
-        report,
-    }
+    c.counts = counts;
 }
 
 fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {

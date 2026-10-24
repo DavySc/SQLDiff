@@ -6,6 +6,7 @@
 //! output). Nothing is written to disk. Own server (sharing the request handling in
 //! `server`) so it can run beside the pair view without sharing its state.
 
+use std::collections::BTreeSet;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,6 +14,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sqldiff_convert::Conversion;
 use sqldiff_core::Dialect;
+use sqldiff_source::compose::Placeholders;
 
 use crate::server::{allowed_hosts, bad, json, not_found, read_request, respond};
 
@@ -55,10 +57,20 @@ WHERE [Name] LIKE 'A%'
 ORDER BY Qty DESC;
 ";
 
+/// Template input: the pack's placeholder rules and, when given, the
+/// parameter names that decide what is a placeholder.
+#[derive(Debug, Clone)]
+pub struct TemplateSetup {
+    pub placeholders: Placeholders,
+    pub parameters: Option<BTreeSet<String>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Setup {
     pub from: Dialect,
     pub to: Dialect,
+    /// Set when the input is a template.
+    pub template: Option<TemplateSetup>,
     /// Initial input text.
     pub text: String,
     /// Display name of the input.
@@ -80,7 +92,16 @@ pub struct ConvertPayload {
 /// Convert and check `text`, timing it.
 pub fn run(setup: &Setup, text: &str, live: bool) -> ConvertPayload {
     let t = Instant::now();
-    let r = sqldiff_convert::convert(text, setup.from, setup.to);
+    let r = match &setup.template {
+        Some(ts) => {
+            let (t, basis) = ts
+                .placeholders
+                .parse(text, setup.from, ts.parameters.as_ref());
+            let delimiters = ts.placeholders.delimiters();
+            sqldiff_convert::convert_template(&t, setup.from, setup.to, basis, delimiters)
+        }
+        None => sqldiff_convert::convert(text, setup.from, setup.to),
+    };
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     let (conversion, error) = match r {
         Ok(c) => (Some(c), None),

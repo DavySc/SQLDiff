@@ -109,6 +109,7 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1
 <header>
   <h1>SQLDiff convert</h1>
   <span class="pair" id="pair">T-SQL → PostgreSQL</span>
+  <span id="tpl" class="chip" style="display:none;cursor:default"></span>
   <span id="verdict" class="verdict"></span>
   <span id="chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
   <span class="spacer"></span>
@@ -198,6 +199,17 @@ function render(data, keepSel) {
   $("timing").textContent = `converted and checked in ${data.ms.toFixed(1)} ms`;
   const c = data.conversion;
   if (!c) { $("out").innerHTML = ""; return; }
+  const t = c.template;
+  $("tpl").style.display = t ? "" : "none";
+  if (t) {
+    const n = t.parameters.length;
+    $("tpl").textContent = `template · ${n} placeholder${n === 1 ? "" : "s"}${t.unresolved.length ? ` · ${t.unresolved.length} unresolved` : ""}`;
+    $("tpl").title = [
+      `Placeholders (kept in the output): ${t.parameters.join(", ") || "none"}`,
+      t.unresolved.length ? `Not placeholders, kept as SQL: ${t.unresolved.join(", ")}` : "",
+      t.special_forms.length ? `Generator directives (kept): ${t.special_forms.join(", ")}` : "",
+    ].filter(Boolean).join("\n");
+  }
   const v = c.report.verdict;
   $("verdict").className = `verdict ${v}`;
   $("verdict").textContent = v.replace(/_/g, " ");
