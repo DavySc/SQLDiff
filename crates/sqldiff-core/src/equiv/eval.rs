@@ -446,7 +446,7 @@ pub struct Ctx<'s> {
     pub values: Vec<Option<V>>,
     /// Opaque values by identity.
     pub opaque: Vec<String>,
-    /// Opaque values known never to be NULL or an error.
+    /// Opaque values known never to be NULL.
     pub nonnull: Vec<bool>,
     opaque_ids: HashMap<String, usize>,
     /// Side tag mixed into nondeterministic opaque values (A and B never agree).
@@ -1102,17 +1102,16 @@ pub fn same(a: &V, b: &V) -> Option<bool> {
 }
 
 /// [`same`], where `nonnull[k]` says opaque value `k` is known not to be
-/// NULL or an error.
+/// NULL.
 pub fn same_nn(a: &V, b: &V, nonnull: &[bool]) -> Option<bool> {
     let known = |k: &usize| nonnull.get(*k).copied().unwrap_or(false);
     match (a, b) {
         (V::Null, V::Null) => Some(true),
         // An unmodelled function may return NULL or fail for the same
         // arguments, so its result is not known to differ from either,
-        // unless that function never does.
-        (V::Null | V::Err(_), V::Opq(k)) | (V::Opq(k), V::Null | V::Err(_)) if known(k) => {
-            Some(false)
-        }
+        // except from NULL for a function that never returns NULL. (Even
+        // those can fail: `format()` with a bad format string raises.)
+        (V::Null, V::Opq(k)) | (V::Opq(k), V::Null) if known(k) => Some(false),
         (V::Null | V::Err(_), V::Opq(_) | V::Ne(_))
         | (V::Opq(_) | V::Ne(_), V::Null | V::Err(_)) => None,
         (V::Null, _) | (_, V::Null) => Some(false),
@@ -1674,8 +1673,8 @@ impl Ctx<'_> {
         Ok(self.opaque_value(id, show, nonnull))
     }
 
-    /// Functions that return a value for any arguments of these values
-    /// (checked on PostgreSQL 18 and SQL Server 2022).
+    /// Functions that never return NULL for arguments of these values
+    /// (checked on PostgreSQL 18); they may still fail.
     fn never_null(&self, name: &str, args: &[V]) -> bool {
         let given = |i: usize| {
             args.get(i).is_some_and(|a| {
@@ -3860,7 +3859,7 @@ pub struct Found {
     /// Some input is a local value whose occurrence is assumed.
     pub assumed: bool,
     pub opaque: Vec<String>,
-    /// Opaque values known never to be NULL or an error.
+    /// Opaque values known never to be NULL.
     pub nonnull: Vec<bool>,
     pub shape: HashMap<String, usize>,
     /// Some guard on the way to the statement could not be evaluated.
