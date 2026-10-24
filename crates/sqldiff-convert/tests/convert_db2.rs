@@ -437,3 +437,25 @@ fn corpus_outputs_parse_and_carry_no_residue() {
         }
     }
 }
+
+#[test]
+fn trancount_guarded_rollback_becomes_rollback() {
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRY\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH\n    IF @@TRANCOUNT > 0 ROLLBACK TRAN;\n    INSERT INTO log (msg) VALUES (ERROR_MESSAGE());\n  END CATCH\nEND\n";
+    let c = db2(src);
+    let u = unit(&c, src, "@@TRANCOUNT");
+    assert_eq!(u.status, Status::Decision, "{}", c.output);
+    assert!(has_rule(u, "db2.proc-transaction"));
+    assert!(
+        c.output.contains("      ROLLBACK;\n      INSERT INTO log"),
+        "{}",
+        c.output
+    );
+    assert!(!c.output.contains("@@TRANCOUNT"), "{}", c.output);
+}
+
+#[test]
+fn result_cursor_over_a_temp_table_notes_runtime_resolution() {
+    let src =
+        "CREATE PROCEDURE p AS\nBEGIN\n  CREATE TABLE #r (id INT);\n  SELECT id FROM #r;\nEND\n";
+    assert!(any_rule(&db2(src), "ASM-DB2-SESSION-RUNTIME"));
+}

@@ -782,6 +782,17 @@ impl Cx<'_> {
                 }
             }
             BLOCK => self.body_elements(out, n, indent),
+            IF_STMT if self.db2() && trancount_guard(n).is_some() => {
+                // Under commitment control a unit of work is always open.
+                let kw = trancount_guard(n).unwrap();
+                match self.txn_db2(kw) {
+                    Ok(text) => {
+                        let notes = self.take_notes();
+                        out.unit(Self::range(n), indent, &format!("{text};"), notes)
+                    }
+                    Err(No(reason)) => self.refuse(out, n, indent, &reason),
+                }
+            }
             IF_STMT if self.mode != Mode::Top => self.if_stmt(out, n, indent, false),
             LOOP_STMT if self.mode != Mode::Top => self.while_stmt(out, n, indent),
             TRY_CATCH if self.mode != Mode::Top => self.try_catch(out, n, indent),
@@ -1307,6 +1318,9 @@ impl Cx<'_> {
             "ASM-DB2-RESULT-SET",
             "The result set becomes an INSENSITIVE cursor WITH RETURN TO CLIENT, opened here: its rows are fixed when it is opened, as T-SQL sends them here, and the procedure declares DYNAMIC RESULT SETS. Callers must read the result sets of the CALL; a caller that inserts them (INSERT … EXEC) has no Db2 equivalent.",
         );
+        if q.to_ascii_uppercase().contains("SESSION.") {
+            self.note(Status::Assumptions, "ASM-DB2-SESSION-RUNTIME", "The cursor reads a global temporary table that the procedure declares later on: assumes Db2 for i resolves SESSION tables when the cursor is opened, not when the procedure is created (not in the verified vendor facts).");
+        }
         let notes = self.take_notes();
         let q = dedent(q.trim_end(), column(self.src, Self::range(n).0));
         let q: String = q.lines().map(|l| format!("  {l}\n")).collect();
@@ -2905,6 +2919,20 @@ const UNDECLARED: &str =
 
 fn undeclared_name(v: &str) -> String {
     format!("v_{}", snake(v.trim_start_matches('@')))
+}
+
+/// `IF @@TRANCOUNT > 0 ROLLBACK|COMMIT [TRAN]`: the statement it guards.
+fn trancount_guard(n: &SyntaxNode) -> Option<&'static str> {
+    let words: Vec<String> = sqldiff_syntax::ast::sig_tokens(n)
+        .map(|t| t.text().to_ascii_uppercase())
+        .filter(|w| !matches!(w.as_str(), ";" | "TRAN" | "TRANSACTION" | "WORK"))
+        .collect();
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["IF", "@@TRANCOUNT", ">", "0", "ROLLBACK"] => Some("ROLLBACK"),
+        ["IF", "@@TRANCOUNT", ">", "0", "COMMIT"] => Some("COMMIT"),
+        _ => None,
+    }
 }
 
 /// Adds `BEGIN END;` to a statement list with no statement left in it.
