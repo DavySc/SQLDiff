@@ -475,6 +475,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqldiff-convert",
  "sqldiff-core",
  "sqldiff-review",
  "sqldiff-source",
