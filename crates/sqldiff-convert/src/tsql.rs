@@ -623,7 +623,7 @@ impl<'a> Cx<'a> {
             self.note(
                 Status::Assumptions,
                 "ASM-DB2-COMMIT-CS",
-                "The procedure is compiled with SET OPTION COMMIT = *CS: each statement is atomic and reads see only committed rows, as in T-SQL (READ COMMITTED). Without it the commit level is whatever the creating job uses (fact V5), and under *NONE nothing, not even a failed statement, is rolled back (facts V2, V4). The work stays in the caller's unit of work until it commits.",
+                "The procedure is compiled with SET OPTION COMMIT = *CS: each statement is atomic and reads see only committed rows, as in T-SQL (READ COMMITTED). Without it the commit level is whatever the creating job uses (fact V5), and under *NONE nothing, not even a failed statement, is rolled back (facts V2, V4; V4 not checked on a real system). The work stays in the caller's unit of work until it commits.",
             );
         }
         let header = format!(
@@ -1033,7 +1033,7 @@ impl<'a> Cx<'a> {
             self.note(
                 Status::Assumptions,
                 "idiom.rollback-rethrow",
-                "CATCH only rolls back and rethrows: the handler does ROLLBACK; RESIGNAL;, which undoes the whole unit of work (the caller's too, as T-SQL's ROLLBACK does) and raises the same error. Assumes the procedure runs under commitment control (it is compiled with *CS); under *NONE the ROLLBACK undoes nothing (fact V4).",
+                "CATCH only rolls back and rethrows: the handler does ROLLBACK; RESIGNAL;, which undoes the whole unit of work (the caller's too, as T-SQL's ROLLBACK does) and raises the same error. Assumes the procedure runs under commitment control (it is compiled with *CS); under *NONE the ROLLBACK undoes nothing (fact V4, not checked on a real system).",
             );
         } else {
             self.note(

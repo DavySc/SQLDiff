@@ -262,3 +262,5 @@ Sources: [Function volatility](https://www.postgresql.org/docs/18/xfunc-volatili
 ## Follow-up
 
 IBM Documentation refused most automated fetches, so V4, V9, V15 and parts of V3, V5, V7, V14 and V19 need either a manual read of the [7.5 SQL Reference PDF](https://www.ibm.com/docs/en/ssw_ibm_i_75/pdf/rbafzpdf.pdf) or, better, a small probe script run on an IBM i system. These probes belong in the per-dialect conformance tests (design doc section 12).
+
+The probe script and its expected outcomes are in [probes/db2i](../probes/db2i/README.md). Results submitted from a real IBM i are judged there, and `cargo test` keeps the hedged assumption texts in step with the result (`probes/db2i/facts.toml`). Until a run is submitted, every fact above keeps its status.

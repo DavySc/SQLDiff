@@ -15,6 +15,7 @@ use sqldiff_syntax::template::{ExpandProblem, SegmentKind};
 use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
 
+mod changes_cmd;
 mod convert_cmd;
 mod deny_hash;
 mod queue_cmd;
@@ -184,6 +185,12 @@ enum Command {
         #[arg(long)]
         no_catalog: bool,
     },
+    /// Review what a branch changed (the pull request workflow): diff every
+    /// SQL file changed between the merge base of --base and --head, base
+    /// against head. Files that did not change are not read. SARIF results
+    /// are located at the head revision; --markdown writes the pull request
+    /// comment.
+    Changes(changes_cmd::ChangesArgs),
     /// Review decisions: accept, reject or comment on findings by fingerprint.
     #[command(subcommand)]
     Review(review_cmd::ReviewCommand),
@@ -485,6 +492,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             overwrite,
             no_catalog,
         }),
+        Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),
         Command::Queue(cmd) => queue_cmd::run(cmd),

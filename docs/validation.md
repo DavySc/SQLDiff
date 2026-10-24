@@ -11,6 +11,7 @@ How the design §12 checks run, and how a work package proves its §14 gate.
 | Core passes with no pack loaded | empty `HOME`/XDG dirs, no config in the tree | `validation / golden` |
 | AI separation (placeholder) | no network client in engine crates; byte-identical runs | `validation / separation` |
 | Fixture format, creation on PG 18 / SQL Server 2022 | `corpus/tools/check_corpus.py` | `corpus` workflow |
+| Db2 for i vendor-fact probes (run by hand on IBM i) | `probes/db2i`, `crates/sqldiff-corpus/tests/db2i_probes.rs` | `cargo test`, `CI / test` |
 
 ## Corpus golden runner
 
@@ -70,4 +71,4 @@ returned rows, and durable state read in a fresh session.
 Limits: one error kind (constraint violation), one session (no concurrency, so m03,
 m04 and the lock parts of p02/p13 are not exercised), autocommit callers only, and
 time-dependent columns are left out of the observed state. Db2 for i has no container
-and is not covered.
+and is not covered; its vendor facts are probed by hand instead (`probes/db2i`).

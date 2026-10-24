@@ -1,0 +1,182 @@
+name: SQLDiff pull request review
+description: >-
+  Review the SQL a pull request changes: every changed file is diffed base
+  against head, results are uploaded as SARIF located at the head commit, and
+  a summary comment is kept up to date on the pull request.
+branding:
+  icon: git-pull-request
+  color: blue
+
+inputs:
+  base:
+    description: Base revision. Default the pull request's base commit.
+    default: ${{ github.event.pull_request.base.sha }}
+  head:
+    description: Head revision. Default the pull request's head commit.
+    default: ${{ github.event.pull_request.head.sha }}
+  working-directory:
+    description: The git repository to review (checked out with fetch-depth 0).
+    default: .
+  dialect:
+    description: Dialect of every changed file (tsql, postgres, db2i). Default per file, from dialect_map or the path convention.
+    default: ""
+  paths:
+    description: Git pathspecs to limit the review to, one per line.
+    default: ""
+  args:
+    description: Extra arguments for `sqldiff changes`, e.g. `--pack packs/ours --config sqldiff.toml`.
+    default: ""
+  fail-on:
+    description: >-
+      When the step fails: `unknown` (anything not proven equal, not compared,
+      or a config change), `different` (only proven differences) or `never`.
+    default: unknown
+  upload-sarif:
+    description: Upload the SARIF to code scanning (needs `security-events write`).
+    default: "true"
+  comment:
+    description: Create or update the summary comment on the pull request (needs `pull-requests write`).
+    default: "true"
+  category:
+    description: Code scanning category for the SARIF upload.
+    default: sqldiff
+  token:
+    description: Token for the pull request comment.
+    default: ${{ github.token }}
+  sqldiff:
+    description: Path to a prebuilt `sqldiff` binary. Default build it from this action's source (cached).
+    default: ""
+
+outputs:
+  verdict:
+    description: Overall verdict (equal, equal under assumptions, unknown, different).
+    value: ${{ steps.run.outputs.verdict }}
+  exit-code:
+    description: Exit code of `sqldiff changes` (0 pass, 1 fail per fail-on, 2 error).
+    value: ${{ steps.run.outputs.exit-code }}
+  sarif:
+    description: Path of the SARIF file.
+    value: ${{ steps.run.outputs.sarif }}
+  markdown:
+    description: Path of the Markdown summary.
+    value: ${{ steps.run.outputs.markdown }}
+  json:
+    description: Path of the JSON report.
+    value: ${{ steps.run.outputs.json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Source hash
+      id: src
+      if: inputs.sqldiff == ''
+      shell: bash
+      run: |
+        cd "$GITHUB_ACTION_PATH"
+        hash=$(find Cargo.toml Cargo.lock crates -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.json' -o -name '*.sql' \) -print0 | sort -z | xargs -0 sha256sum | sha256sum | cut -c1-32)
+        echo "hash=$hash" >> "$GITHUB_OUTPUT"
+
+    - name: Cache sqldiff
+      id: cache
+      if: inputs.sqldiff == ''
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/sqldiff-install
+        key: sqldiff-${{ runner.os }}-${{ runner.arch }}-${{ steps.src.outputs.hash }}
+
+    - name: Build sqldiff
+      if: inputs.sqldiff == '' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: cargo install --locked --path "$GITHUB_ACTION_PATH/crates/sqldiff-cli" --root "$RUNNER_TEMP/sqldiff-install"
+
+    - name: Review changes
+      id: run
+      shell: bash
+      env:
+        BIN: ${{ inputs.sqldiff }}
+        BASE: ${{ inputs.base }}
+        HEAD_REV: ${{ inputs.head }}
+        REPO_DIR: ${{ inputs.working-directory }}
+        DIALECT: ${{ inputs.dialect }}
+        PATHS: ${{ inputs.paths }}
+        ARGS: ${{ inputs.args }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        if [ -z "$BIN" ]; then BIN="$RUNNER_TEMP/sqldiff-install/bin/sqldiff"; fi
+        if [ -z "$BASE" ] || [ -z "$HEAD_REV" ]; then
+          echo "::error::sqldiff: no base or head revision; outside pull_request events pass both inputs"
+          exit 2
+        fi
+        out="$RUNNER_TEMP/sqldiff-out"
+        mkdir -p "$out"
+        args=(changes --repo "$REPO_DIR" --base "$BASE" --head "$HEAD_REV" --fail-on "$FAIL_ON"
+          --data-dir "$RUNNER_TEMP/sqldiff-data"
+          --sarif "$out/sqldiff.sarif" --markdown "$out/sqldiff.md" --json "$out/sqldiff.json")
+        if [ -n "$DIALECT" ]; then args+=(--dialect "$DIALECT"); fi
+        if [ -n "$ARGS" ]; then read -r -a extra <<< "$ARGS"; args+=("${extra[@]}"); fi
+        if [ -n "$PATHS" ]; then
+          args+=(--)
+          while IFS= read -r p; do if [ -n "$p" ]; then args+=("$p"); fi; done <<< "$PATHS"
+        fi
+        set +e
+        "$BIN" "${args[@]}"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        if [ "$code" -ge 2 ]; then
+          echo "::error::sqldiff changes failed (exit $code)"
+          exit "$code"
+        fi
+        verdict=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' "$out/sqldiff.json")
+        {
+          echo "verdict=$verdict"
+          echo "sarif=$out/sqldiff.sarif"
+          echo "markdown=$out/sqldiff.md"
+          echo "json=$out/sqldiff.json"
+        } >> "$GITHUB_OUTPUT"
+        cat "$out/sqldiff.md" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload SARIF
+      if: inputs.upload-sarif == 'true'
+      # A fork's token cannot upload; the comment and job summary still report.
+      continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ steps.run.outputs.sarif }}
+        category: ${{ inputs.category }}
+        # Results are located at the head commit, so they are uploaded for it.
+        ref: ${{ github.event.pull_request && format('refs/pull/{0}/head', github.event.pull_request.number) || '' }}
+        sha: ${{ github.event.pull_request && inputs.head || '' }}
+
+    - name: Comment on the pull request
+      if: inputs.comment == 'true' && github.event.pull_request
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PR: ${{ github.event.pull_request.number }}
+        REPOSITORY: ${{ github.repository }}
+        BODY: ${{ steps.run.outputs.markdown }}
+      run: |
+        marker='<!-- sqldiff:changes -->'
+        # Our own earlier comment: by login with a personal token, else by bot.
+        me=$(gh api user --jq .login 2>/dev/null) || me=""
+        if [ -n "$me" ]; then who=".user.login == \"$me\""; else who='.user.type == "Bot"'; fi
+        id=$(gh api "repos/$REPOSITORY/issues/$PR/comments" --paginate \
+          --jq ".[] | select(($who) and (.body | startswith(\"$marker\"))) | .id" | head -n 1) || id=""
+        if [ -n "$id" ] && gh api -X PATCH "repos/$REPOSITORY/issues/comments/$id" -F "body=@$BODY" > /dev/null; then
+          echo "Updated comment $id"
+        elif gh api -X POST "repos/$REPOSITORY/issues/$PR/comments" -F "body=@$BODY" > /dev/null; then
+          echo "Posted a comment"
+        else
+          echo "::warning::sqldiff: could not comment on the pull request (a fork's token is read-only); the summary is in the job summary"
+        fi
+
+    - name: Verdict
+      if: steps.run.outputs.exit-code == '1'
+      shell: bash
+      env:
+        VERDICT: ${{ steps.run.outputs.verdict }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        echo "::error::sqldiff: overall verdict is $VERDICT (fail-on: $FAIL_ON); see the summary"
+        exit 1
