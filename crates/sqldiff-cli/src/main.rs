@@ -16,6 +16,7 @@ use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
 
 mod changes_cmd;
+mod convert_cmd;
 mod deny_hash;
 mod queue_cmd;
 mod review_cmd;
@@ -154,6 +155,35 @@ enum Command {
         cfg: source_cmd::ConfigArgs,
         #[command(flatten)]
         review: ReviewArgs,
+    },
+    /// Convert a source tree (or one file) into another dialect: an output
+    /// tree with the same layout, checked statement by statement, and a
+    /// report (`conversion-report.json` and `.md` in the output directory).
+    ///
+    /// A unit counts as converted only when its rules needed no assumption
+    /// and neither the engine's diff nor the output's own check (binding,
+    /// leftover source syntax, target limits) finds anything in it. Every
+    /// other unit gets a `-- [sqldiff: <status>]` comment line in the output.
+    /// Exit code 0 when every file is converted or converted under
+    /// assumptions, 1 otherwise.
+    Convert {
+        src: PathBuf,
+        /// Output directory (created; must be empty unless --overwrite).
+        #[arg(short, long)]
+        out: PathBuf,
+        #[arg(long, default_value = "tsql")]
+        from: Dialect,
+        #[arg(long)]
+        to: Dialect,
+        /// Parallel jobs (default: available cores).
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// Replace files in a non-empty output directory.
+        #[arg(long)]
+        overwrite: bool,
+        /// Check each file alone, without catalogs built from the whole tree.
+        #[arg(long)]
+        no_catalog: bool,
     },
     /// Review what a branch changed (the pull request workflow): diff every
     /// SQL file changed between the merge base of --base and --head, base
@@ -445,6 +475,23 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             format,
             Pipeline::new(cfg.resolve()?, &review)?,
         ),
+        Command::Convert {
+            src,
+            out,
+            from,
+            to,
+            jobs,
+            overwrite,
+            no_catalog,
+        } => convert_cmd::run(convert_cmd::Args {
+            src,
+            out,
+            from,
+            to,
+            jobs,
+            overwrite,
+            no_catalog,
+        }),
         Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),
