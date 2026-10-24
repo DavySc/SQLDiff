@@ -143,9 +143,6 @@ pub(crate) struct Request {
     pub body: Vec<u8>,
 }
 
-/// Host names (without port) a request may address: loopback names, the
-/// address the listener is bound to (`0.0.0.0` included) and `extra`.
-/// A DNS name only passes when it is listed, which defeats DNS rebinding.
 /// Convert mode's start: T-SQL → PostgreSQL with the sample.
 fn convert_setup() -> &'static crate::convert::Setup {
     static SETUP: std::sync::OnceLock<crate::convert::Setup> = std::sync::OnceLock::new();
@@ -158,6 +155,9 @@ fn convert_setup() -> &'static crate::convert::Setup {
     })
 }
 
+/// Host names (without port) a request may address: loopback names, the
+/// address the listener is bound to (`0.0.0.0` included) and `extra`.
+/// A DNS name only passes when it is listed, which defeats DNS rebinding.
 pub(crate) fn allowed_hosts(
     listener: &TcpListener,
     extra: &[String],
