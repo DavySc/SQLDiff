@@ -377,9 +377,13 @@ impl Opts<'_> {
             self.i += 1;
         }
         // Values: one token each (a leading `-` aside), separated by commas.
+        let mut values: Vec<String> = Vec::new();
         loop {
             if self.t.get(self.i).is_some_and(|t| t.text == "-") {
                 self.i += 1;
+            }
+            if let Some(t) = self.t.get(self.i) {
+                values.push(t.text.clone());
             }
             self.i += 1;
             if self.t.get(self.i).is_some_and(|t| t.kind == K::Comma) {
@@ -390,10 +394,19 @@ impl Opts<'_> {
         }
         let text = self.text(at, self.i);
         if name == "search_path" {
-            self.note(&format!("{text} (unqualified names resolve through it)"));
-            let a = asm::make(asm::DEFAULT_SCHEMA);
-            if !self.u.assumptions.iter().any(|x| x.id == a.id) {
-                self.u.assumptions.push(a);
+            // Unqualified names then resolve in the first schema of the list
+            // (pg_catalog and `$user` aside). Only `public` is the default
+            // schema the comparison maps to the other side's.
+            if search_path_is_public(&values) {
+                self.note(&format!("{text} (unqualified names resolve in public)"));
+                let a = asm::make(asm::DEFAULT_SCHEMA);
+                if !self.u.assumptions.iter().any(|x| x.id == a.id) {
+                    self.u.assumptions.push(a);
+                }
+            } else {
+                self.uncovered(format!(
+                    "{text} (unqualified names resolve in a schema other than public)"
+                ));
             }
         } else if PG_PLAN_SETTINGS.contains(&name.as_str())
             || PG_PLAN_PREFIXES.iter().any(|p| name.starts_with(p))
@@ -460,6 +473,28 @@ impl Opts<'_> {
             }
         }
     }
+}
+
+/// A `search_path` whose first schema for unqualified names is `public`.
+fn search_path_is_public(values: &[String]) -> bool {
+    let schemas: Vec<String> = values
+        .iter()
+        .flat_map(|v| {
+            // `'a, b'` is a list in one string.
+            let v = v
+                .strip_prefix('\'')
+                .and_then(|x| x.strip_suffix('\''))
+                .unwrap_or(v);
+            v.split(',')
+                .map(|x| cst::unquote(x.trim()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let first = schemas
+        .iter()
+        .find(|x| !x.eq_ignore_ascii_case("pg_catalog") && x.as_str() != "$user");
+    // pg_temp before public would let temporary tables shadow the names.
+    first.is_some_and(|x| x == "public")
 }
 
 /// Options after the parameter list, from token `i` of the header.

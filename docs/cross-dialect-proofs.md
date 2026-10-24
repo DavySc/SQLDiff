@@ -18,7 +18,7 @@ uncovered, so the verdict stays unknown; nothing is skipped silently.
 | T-SQL `EXECUTE AS SELF` or `'user'`, `NATIVE_COMPILATION`, `FOR REPLICATION`, `INLINE = ON`, `RETURNS NULL ON NULL INPUT`; PostgreSQL `STRICT`, `PARALLEL SAFE`/`RESTRICTED`, `LEAKPROOF`, `SET x FROM CURRENT`, `SET` of a setting that can change results (`TimeZone`, `DateStyle`, `lock_timeout`, …), languages other than SQL and PL/pgSQL; Db2 for i `COMMIT ON RETURN YES`, `NEW SAVEPOINT LEVEL`, `DYNAMIC RESULT SETS n > 0`, `CONCURRENT ACCESS RESOLUTION`, `SET OPTION` entries other than those below | Not covered: unknown |
 | T-SQL `RECOMPILE`, `ENCRYPTION`, `SCHEMABINDING`, `VIEW_METADATA`, `INLINE = OFF`; PostgreSQL `COST`, `ROWS`, `VOLATILE`, `PARALLEL UNSAFE`, `SET` of planner, memory and logging settings; Db2 for i `SPECIFIC`, `FENCED`, `PROGRAM TYPE`, `NOT DETERMINISTIC`, `SET OPTION DBGVIEW`/`DBGENCKEY`/`OUTPUT`/`TGTRLS`/`COMPILEOPT`/`DLYPRP`, `SRTSEQ = *HEX` | No effect on results: listed as a normalization |
 | PostgreSQL `STABLE`/`IMMUTABLE`, Db2 for i `DETERMINISTIC` | `ASM-ROUTINE-LABEL`; a labelled routine that writes is not covered |
-| PostgreSQL `SET search_path` | `ASM-DEFAULT-SCHEMA` |
+| PostgreSQL `SET search_path` | `ASM-DEFAULT-SCHEMA` when `public` is the first schema (after `pg_catalog` and `"$user"`); any other path is not covered |
 | Db2 for i `SET OPTION COMMIT` | Read by the transaction model (`ir::interp`, `ASM-DB2-COMMIT-LEVEL`) |
 | PostgreSQL procedure with `SECURITY DEFINER` or a `SET` clause that runs `COMMIT`/`ROLLBACK` | Not covered: PostgreSQL raises invalid transaction termination (fact V17) |
 

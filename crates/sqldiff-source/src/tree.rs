@@ -205,6 +205,24 @@ pub struct TreePair {
     pub path_b: PathBuf,
 }
 
+impl TreePair {
+    /// The object fragments of the two ids, for ids that name one object of
+    /// a file with several.
+    pub fn fragments(&self) -> (Option<&str>, Option<&str>) {
+        (
+            fragment(&self.path_a, &self.id_a),
+            fragment(&self.path_b, &self.id_b),
+        )
+    }
+}
+
+fn fragment<'i>(path: &Path, id: &'i str) -> Option<&'i str> {
+    match crate::split::split_id(id) {
+        (_, Some(f)) if !path.ends_with(id) => Some(f),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Ambiguous {
     pub side: &'static str,
@@ -233,9 +251,11 @@ impl Tree {
             let mut text = std::fs::read_to_string(path)
                 .map_err(|e| Error(format!("{}: {e}", path.display())))?;
             // One object of a file with several (see `split`).
-            let (rel, frag) = match crate::split::split_id(id) {
-                (rel, Some(f)) if !path.ends_with(id) => (rel, Some(f)),
-                _ => (id, None),
+            let frag = fragment(path, id);
+            let rel = if frag.is_some() {
+                crate::split::split_id(id).0
+            } else {
+                id
             };
             let mut object = None;
             if let Some(frag) = frag {

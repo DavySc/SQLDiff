@@ -557,20 +557,44 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
         "{:?}",
         r.unknown_reasons
     );
-    let r = run(
-        &ts_delete(""),
-        T,
-        &pg_delete("SET search_path = app, pg_temp"),
-        P,
-        true,
-    );
-    assert_eq!(
-        r.verdict,
-        Verdict::EqualUnderAssumptions,
-        "{:?}",
-        r.unknown_reasons
-    );
-    assert!(assumption_ids(&r).contains(&"ASM-DEFAULT-SCHEMA"));
+    for path in [
+        "public, pg_temp",
+        "\"$user\", public",
+        "pg_catalog, public",
+        "'public'",
+    ] {
+        let r = run(
+            &ts_delete(""),
+            T,
+            &pg_delete(&format!("SET search_path = {path}")),
+            P,
+            true,
+        );
+        assert_eq!(
+            r.verdict,
+            Verdict::EqualUnderAssumptions,
+            "{path}: {:?}",
+            r.unknown_reasons
+        );
+        assert!(assumption_ids(&r).contains(&"ASM-DEFAULT-SCHEMA"));
+    }
+    // Unqualified names then resolve in another schema than dbo's counterpart.
+    for path in [
+        "other",
+        "other, public",
+        "pg_temp, public",
+        "'other, public'",
+        "app, pg_temp",
+    ] {
+        let r = run(
+            &ts_delete(""),
+            T,
+            &pg_delete(&format!("SET search_path TO {path}")),
+            P,
+            true,
+        );
+        assert!(not_equal(&r), "{path}: {:?}", r.verdict);
+    }
     let r = run(
         &ts_delete(""),
         T,
