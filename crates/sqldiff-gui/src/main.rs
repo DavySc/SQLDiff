@@ -99,14 +99,14 @@ enum Command {
         /// placeholders, as with `sqldiff diff --template --parameter`.
         #[arg(long = "parameter", value_name = "NAME", requires = "template")]
         parameters: Vec<String>,
-        /// Load a pack (directory with pack.toml, or a .toml file). Repeatable.
-        #[arg(long = "pack", value_name = "PATH")]
+        /// Load a pack for --template (directory with pack.toml, or a .toml file). Repeatable.
+        #[arg(long = "pack", value_name = "PATH", requires = "template")]
         packs: Vec<PathBuf>,
-        /// Project config file (default: sqldiff.toml here or in a parent directory).
-        #[arg(long, value_name = "FILE")]
+        /// Project config file for --template (default: sqldiff.toml here or in a parent directory).
+        #[arg(long, value_name = "FILE", requires = "template")]
         config: Option<PathBuf>,
         /// Ignore project and user config files not named on the command line.
-        #[arg(long)]
+        #[arg(long, requires = "template")]
         isolated: bool,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,

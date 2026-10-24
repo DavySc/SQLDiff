@@ -515,6 +515,18 @@ fn template(text: &str) -> sqldiff_syntax::template::Template {
     Template::parse(text, &syntax, None)
 }
 
+fn convert_template(t: &sqldiff_syntax::template::Template) -> Conversion {
+    use sqldiff_core::composition::PlaceholderBasis;
+    sqldiff_convert::convert_template(
+        t,
+        Dialect::Tsql,
+        Dialect::Postgres,
+        PlaceholderBasis::DeclaredPattern,
+        ("[", "]"),
+    )
+    .unwrap()
+}
+
 const TEMPLATE: &str = "<%@include header.sql %>
 CREATE PROCEDURE [SCHEMA].Save[ENTITY] @Id int, @[KEY]Name nvarchar(50) AS
 BEGIN
@@ -526,7 +538,7 @@ END
 #[test]
 fn templates_keep_their_placeholders() {
     let t = template(TEMPLATE);
-    let c = sqldiff_convert::convert_template(&t, Dialect::Tsql, Dialect::Postgres).unwrap();
+    let c = convert_template(&t);
     println!("{}", c.output);
     let info = c.template.as_ref().unwrap();
     assert_eq!(info.parameters, ["SCHEMA", "ENTITY", "KEY", "TABLE"]);
@@ -555,4 +567,133 @@ fn templates_keep_their_placeholders() {
     assert_eq!(&TEMPLATE[u.src.start..u.src.start + 6], "UPDATE");
     assert!(has_rule(u, "ASM-TEMPLATE-PLACEHOLDER"), "{:?}", u.notes);
     assert!(out_of(&c, u).contains("[TABLE]"), "{}", out_of(&c, u));
+}
+
+fn angle_template(text: &str) -> sqldiff_syntax::template::Template {
+    use sqldiff_syntax::template::{Compiled, Template, TemplateSyntax};
+    let syntax = Compiled::new(&TemplateSyntax {
+        open: "<%".into(),
+        close: "%>".into(),
+        name_pattern: "[A-Z][A-Z0-9_.]*".into(),
+        special_forms: vec![("include".into(), r"<%@include\s+(\S+)\s*%>".into())],
+        ignore_case: false,
+    })
+    .unwrap();
+    Template::parse(text, &syntax, None)
+}
+
+fn convert_angle(text: &str) -> Conversion {
+    use sqldiff_core::composition::PlaceholderBasis;
+    sqldiff_convert::convert_template(
+        &angle_template(text),
+        Dialect::Tsql,
+        Dialect::Postgres,
+        PlaceholderBasis::DeclaredPattern,
+        ("<%", "%>"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn template_restore_leaves_the_users_own_names_alone() {
+    // A placeholder named T next to the user's tpl_* names, variables and strings.
+    let src = "CREATE PROCEDURE p @tpl_total int AS\nBEGIN\n  UPDATE <%T%> SET tpl_type = 'TPL_TEST', n = @tpl_total FROM tpl_settings;\nEND\n";
+    let c = convert_angle(src);
+    let low = c.output.to_ascii_lowercase();
+    assert!(
+        c.output.contains("UPDATE <%T%> SET tpl_type = 'TPL_TEST'"),
+        "{}",
+        c.output
+    );
+    assert!(low.contains("p_tpl_total"), "{}", c.output);
+    assert!(!low.contains("sqldifftpl"), "{}", c.output);
+    // No false alarm for the user's own tpl_ names.
+    for u in &c.units {
+        assert!(!has_rule(u, "template.placeholder-lost"), "{:?}", u.notes);
+    }
+}
+
+#[test]
+fn similar_placeholder_names_stay_apart() {
+    let src = "UPDATE <%A.B%> SET x = 1;\nUPDATE <%A_B%> SET x = 2;\n";
+    let c = convert_angle(src);
+    assert!(
+        c.output.contains("UPDATE <%A.B%> SET x = 1;"),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output.contains("UPDATE <%A_B%> SET x = 2;"),
+        "{}",
+        c.output
+    );
+}
+
+#[test]
+fn template_findings_point_into_the_template() {
+    // A multi-line directive before the statements: fragment lines would drift.
+    let src = "<%@include\n   header.sql %>\nCREATE PROCEDURE <%S%>.p @Id int AS\nBEGIN\n  UPDATE <%S%>.t SET a = 1 WHERE id = @Id;\n  IF @@ERROR <> 0 RETURN 1;\nEND\n";
+    let c = convert_angle(src);
+    assert!(!c.report.findings.is_empty());
+    let lines: Vec<&str> = src.lines().collect();
+    for f in &c.report.findings {
+        assert!(
+            !f.witness.to_ascii_lowercase().contains("sqldifftpl"),
+            "{}",
+            f.witness
+        );
+        if let Some(a) = &f.a {
+            let first = a.excerpt.first().map(|s| s.trim()).unwrap_or_default();
+            assert!(lines[a.start_line - 1].contains(first), "{a:?}");
+        }
+        if let Some(b) = &f.b {
+            let out: Vec<&str> = c.output.lines().collect();
+            let first = b.excerpt.first().map(|s| s.trim()).unwrap_or_default();
+            assert!(out[b.start_line - 1].contains(first), "{b:?}");
+        }
+    }
+}
+
+#[test]
+fn a_lost_directive_is_reported() {
+    // The directive sits inside a statement the rules turn into a comment.
+    let src = "CREATE PROCEDURE p AS\nBEGIN\n  SET NOCOUNT ON <%@include x.sql %>;\n  UPDATE t SET a = 1;\nEND\n";
+    let c = convert_angle(src);
+    assert!(
+        !c.output.contains("<%@include x.sql %>"),
+        "precondition: {}",
+        c.output
+    );
+    let u = unit(&c, src, "SET NOCOUNT");
+    assert!(has_rule(u, "template.special-form-lost"), "{:?}", u.notes);
+    assert_eq!(u.status, Status::Differs);
+    assert!(
+        c.report
+            .unknown_reasons
+            .iter()
+            .any(|r| r.contains("include")),
+        "{:?}",
+        c.report.unknown_reasons
+    );
+    assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
+}
+
+#[test]
+fn a_placeholder_decided_by_pattern_is_an_open_question() {
+    use sqldiff_core::composition::PlaceholderBasis;
+    // [T] in T-SQL could be a quoted name; without a parameter list the report says so.
+    let c = sqldiff_convert::convert_template(
+        &template("UPDATE [T] SET a = 1;\n"),
+        Dialect::Tsql,
+        Dialect::Postgres,
+        PlaceholderBasis::Pattern,
+        ("[", "]"),
+    )
+    .unwrap();
+    assert!(
+        c.report.unknown_reasons.iter().any(|r| r.contains("[T]")),
+        "{:?}",
+        c.report.unknown_reasons
+    );
+    assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
 }

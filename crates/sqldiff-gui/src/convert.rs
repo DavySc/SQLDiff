@@ -94,10 +94,11 @@ pub fn run(setup: &Setup, text: &str, live: bool) -> ConvertPayload {
     let t = Instant::now();
     let r = match &setup.template {
         Some(ts) => {
-            let (t, _) = ts
+            let (t, basis) = ts
                 .placeholders
                 .parse(text, setup.from, ts.parameters.as_ref());
-            sqldiff_convert::convert_template(&t, setup.from, setup.to)
+            let delimiters = ts.placeholders.delimiters();
+            sqldiff_convert::convert_template(&t, setup.from, setup.to, basis, delimiters)
         }
         None => sqldiff_convert::convert(text, setup.from, setup.to),
     };
