@@ -50,10 +50,17 @@ fn probe_procedures_parse_as_db2_for_i() {
             format!("{params}, {out}")
         };
         let commit = str_of(p, "commit");
-        let option = if commit.is_empty() {
+        let mut items = Vec::new();
+        if !commit.is_empty() {
+            items.push(format!("COMMIT = {commit}"));
+        }
+        if !str_of(p, "options").is_empty() {
+            items.push(str_of(p, "options").to_string());
+        }
+        let option = if items.is_empty() {
             String::new()
         } else {
-            format!("SET OPTION COMMIT = {commit}\n")
+            format!("SET OPTION {}\n", items.join(", "))
         };
         let text = format!(
             "CREATE OR REPLACE PROCEDURE SQLDFPROBE.P_{} ({plist})\nLANGUAGE SQL\nMODIFIES SQL DATA\n{option}{};\n",

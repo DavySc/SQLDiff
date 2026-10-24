@@ -57,6 +57,11 @@ id = "V19"
 title = "Default NULL ordering and NULLS FIRST/LAST"
 review = ["corpus/oracle/m22-null-ordering-changed.toml"]
 
+[[fact]]
+id = "V25"
+title = "Default USRPRF (*NAMING) of a routine without SET OPTION USRPRF"
+review = ["docs/cross-dialect-proofs.md", "docs/convert-mode.md"]
+
 [[link]]
 facts = ["V4"]
 file = "crates/sqldiff-convert/src/tsql.rs"

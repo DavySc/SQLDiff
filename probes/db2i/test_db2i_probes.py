@@ -20,6 +20,8 @@ def value_for(pattern):
         return None
     if pattern.startswith("contains:"):
         return pattern[len("contains:"):]
+    if pattern.startswith("prefix:"):
+        return pattern[len("prefix:"):] + "*SQL"
     if pattern.startswith("!"):
         return "42999"
     for op, delta in ((">=", 0), ("<=", 0), (">", 1), ("<", -1), ("=", 0)):
@@ -115,7 +117,7 @@ class Results(unittest.TestCase):
         ev = dp.evaluate(defs, facts, rows_for(defs, first({"consistent"})))
         self.assertTrue(ev["harness_ok"])
         st = {k: v["status"] for k, v in ev["facts"].items()}
-        for fid in ("V4", "V9", "V14", "V15", "V16", "V19", "V3", "V7"):
+        for fid in ("V4", "V9", "V14", "V15", "V16", "V19", "V3", "V7", "V25"):
             self.assertEqual(st[fid], "confirmed", (fid, ev["facts"][fid]))
         self.assertEqual(st["V5"], "observed")
 
