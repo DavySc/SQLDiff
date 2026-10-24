@@ -316,7 +316,11 @@ fn security(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, touches: bool, out
             }
         }
         (Naming, Owner) | (Owner, Naming) => {
-            let (owner, oname) = if ua.security == Owner { (ua, &na) } else { (ub, &nb) };
+            let (owner, oname) = if ua.security == Owner {
+                (ua, &na)
+            } else {
+                (ub, &nb)
+            };
             out.unknown_reasons.push(format!(
                 "{oname} runs with the owner's privileges ({}) and the Db2 for i side states no SET OPTION USRPRF, so its authority depends on the naming convention it was created with",
                 cite(owner)

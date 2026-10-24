@@ -229,10 +229,27 @@ pub struct Tree {
 impl Tree {
     /// Reads both sides of a pair.
     pub fn read(&self, p: &TreePair, cfg: &Resolved) -> Result<(Artifact, Artifact)> {
-        let load = |path: &Path, id: &str, d| {
-            let text = std::fs::read_to_string(path)
+        let load = |path: &Path, id: &str, d: Option<Dialect>| {
+            let mut text = std::fs::read_to_string(path)
                 .map_err(|e| Error(format!("{}: {e}", path.display())))?;
-            artifact(path.display().to_string(), id, d, text, cfg)
+            // One object of a file with several (see `split`).
+            let (rel, frag) = match crate::split::split_id(id) {
+                (rel, Some(f)) if !path.ends_with(id) => (rel, Some(f)),
+                _ => (id, None),
+            };
+            let mut object = None;
+            if let Some(frag) = frag {
+                let dialect = d
+                    .or(crate::classify(rel, cfg).0)
+                    .ok_or_else(|| Error(format!("{}: dialect unknown", path.display())))?;
+                let (t, name) = crate::split::object(&text, dialect, frag)
+                    .ok_or_else(|| Error(format!("{}: no object `{frag}`", path.display())))?;
+                text = t;
+                object = Some(name);
+            }
+            let mut a = artifact(path.display().to_string(), rel, d, text, cfg)?;
+            a.object = object;
+            Ok::<_, Error>(a)
         };
         Ok((
             load(&p.path_a, &p.id_a, self.dialect_a)?,
@@ -254,7 +271,7 @@ impl Side {
     /// Lists a directory with pack `ignore` and `dialect_map`, skipping shared
     /// artifacts, and keys every object by its pairing rule.
     fn load(dir: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Side> {
-        let src = FsSource::new(dir, cfg)?;
+        let src = FsSource::new(dir, cfg)?.with_dialect(dialect);
         let objects = src.list_objects(&ObjectFilter::default())?;
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut no_dialect = Vec::new();
@@ -356,8 +373,8 @@ pub fn pair_dirs(
         pairs: ids
             .into_iter()
             .map(|(a, b)| TreePair {
-                path_a: sa.dir.join(&a),
-                path_b: sb.dir.join(&b),
+                path_a: crate::split::locate(&sa.dir, &a).0,
+                path_b: crate::split::locate(&sb.dir, &b).0,
                 id_a: a,
                 id_b: b,
             })

@@ -35,7 +35,14 @@ const PG_PLAN_SETTINGS: &[&str] = &[
 const PG_PLAN_PREFIXES: &[&str] = &["enable_", "max_parallel_", "parallel_", "geqo"];
 
 /// Db2 for i SET OPTION entries that only steer compilation and debugging.
-const DB2_BUILD_OPTIONS: &[&str] = &["DBGVIEW", "DBGENCKEY", "OUTPUT", "TGTRLS", "COMPILEOPT", "DLYPRP"];
+const DB2_BUILD_OPTIONS: &[&str] = &[
+    "DBGVIEW",
+    "DBGENCKEY",
+    "OUTPUT",
+    "TGTRLS",
+    "COMPILEOPT",
+    "DLYPRP",
+];
 
 struct Opts<'x> {
     r: &'x SyntaxNode,
@@ -102,8 +109,14 @@ impl Opts<'_> {
                 (_, "RETURNS") => self.returns(),
                 (_, "AS") => self.i += 1,
                 (_, "LANGUAGE") => {
-                    let lang = cst::unquote(&self.t.get(self.i + 1).map(|t| t.text.clone()).unwrap_or_default())
-                        .to_uppercase();
+                    let lang = cst::unquote(
+                        &self
+                            .t
+                            .get(self.i + 1)
+                            .map(|t| t.text.clone())
+                            .unwrap_or_default(),
+                    )
+                    .to_uppercase();
                     match (d, lang.as_str()) {
                         (Dialect::Postgres, "SQL") => self.u.sql_body = true,
                         (Dialect::Postgres, "PLPGSQL") | (Dialect::Db2i, "SQL") => {}
@@ -116,7 +129,8 @@ impl Opts<'_> {
                     self.uncovered("FOR REPLICATION".into());
                     self.i += 2;
                 }
-                (Dialect::Postgres | Dialect::Db2i, "CALLED") if self.phrase(&["CALLED", "ON", "NULL", "INPUT"]) => {}
+                (Dialect::Postgres | Dialect::Db2i, "CALLED")
+                    if self.phrase(&["CALLED", "ON", "NULL", "INPUT"]) => {}
                 (Dialect::Postgres, "STRICT") => {
                     self.uncovered("STRICT (returns NULL on NULL input without running)".into());
                     self.i += 1;
@@ -160,7 +174,11 @@ impl Opts<'_> {
                         self.i += p.i;
                     }
                 }
-                (Dialect::Db2i, "NOT") if matches!(self.up(1), "DETERMINISTIC" | "FENCED" | "SECURED") => self.i += 2,
+                (Dialect::Db2i, "NOT")
+                    if matches!(self.up(1), "DETERMINISTIC" | "FENCED" | "SECURED") =>
+                {
+                    self.i += 2
+                }
                 (Dialect::Db2i, "DETERMINISTIC") => {
                     self.u.non_volatile = Some(w.clone());
                     self.i += 1;
@@ -179,7 +197,8 @@ impl Opts<'_> {
                 }
                 (Dialect::Db2i, "NO") if self.up(1) == "EXTERNAL" => self.i += 3,
                 (Dialect::Db2i, "EXTERNAL") if self.up(1) == "ACTION" => self.i += 2,
-                (Dialect::Db2i, "INHERIT") if self.phrase(&["INHERIT", "SPECIAL", "REGISTERS"]) => {}
+                (Dialect::Db2i, "INHERIT") if self.phrase(&["INHERIT", "SPECIAL", "REGISTERS"]) => {
+                }
                 (Dialect::Db2i, "OLD") if self.phrase(&["OLD", "SAVEPOINT", "LEVEL"]) => {}
                 (Dialect::Db2i, "COMMIT") if self.phrase(&["COMMIT", "ON", "RETURN", "NO"]) => {}
                 (Dialect::Db2i, "PROGRAM") if self.up(1) == "TYPE" => {
@@ -187,9 +206,15 @@ impl Opts<'_> {
                     self.i += 3;
                 }
                 (Dialect::Db2i, "DYNAMIC") if self.up(1) == "RESULT" => {
-                    let n = self.t.get(self.i + 3).map(|t| t.text.clone()).unwrap_or_default();
+                    let n = self
+                        .t
+                        .get(self.i + 3)
+                        .map(|t| t.text.clone())
+                        .unwrap_or_default();
                     if n != "0" {
-                        self.uncovered(format!("DYNAMIC RESULT SETS {n} (result sets returned to the caller)"));
+                        self.uncovered(format!(
+                            "DYNAMIC RESULT SETS {n} (result sets returned to the caller)"
+                        ));
                     }
                     self.i += 4;
                 }
@@ -237,7 +262,10 @@ impl Opts<'_> {
             u.uncovered.push((r, "RETURNS SETOF".into()));
             i += 1;
         } else if toks.get(i).is_some_and(|t| t.kind == K::Var) {
-            u.uncovered.push((r, "RETURNS @table TABLE (a multi-statement table function)".into()));
+            u.uncovered.push((
+                r,
+                "RETURNS @table TABLE (a multi-statement table function)".into(),
+            ));
             i += 1;
             if toks.get(i).is_some_and(|t| t.up == "TABLE") {
                 i += 1;
@@ -256,7 +284,8 @@ impl Opts<'_> {
                     i += p.i;
                 }
                 Err(_) => {
-                    u.uncovered.push((r, "an unrecognised RETURNS clause".into()));
+                    u.uncovered
+                        .push((r, "an unrecognised RETURNS clause".into()));
                     i += 1;
                 }
             }
@@ -277,10 +306,15 @@ impl Opts<'_> {
                         "CALLER" => self.security(Security::Caller, at, at + 3),
                         "OWNER" => self.security(Security::Owner, at, at + 3),
                         "SELF" => self.uncovered(
-                            "EXECUTE AS SELF (runs as whoever last created or altered the routine)".into(),
+                            "EXECUTE AS SELF (runs as whoever last created or altered the routine)"
+                                .into(),
                         ),
                         _ => {
-                            let name = self.t.get(at + 2).map(|t| t.text.clone()).unwrap_or_default();
+                            let name = self
+                                .t
+                                .get(at + 2)
+                                .map(|t| t.text.clone())
+                                .unwrap_or_default();
                             self.uncovered(format!("EXECUTE AS {name} (runs as a named user)"));
                         }
                     }
@@ -291,7 +325,9 @@ impl Opts<'_> {
                     self.i += 1;
                 }
                 "ENCRYPTION" | "SCHEMABINDING" | "VIEW_METADATA" => {
-                    self.note("WITH ENCRYPTION / SCHEMABINDING / VIEW_METADATA (no effect on results)");
+                    self.note(
+                        "WITH ENCRYPTION / SCHEMABINDING / VIEW_METADATA (no effect on results)",
+                    );
                     self.i += 1;
                 }
                 "CALLED" if self.phrase(&["CALLED", "ON", "NULL", "INPUT"]) => {}
@@ -332,7 +368,9 @@ impl Opts<'_> {
         let at = self.i;
         self.i += 2;
         if self.phrase(&["FROM", "CURRENT"]) {
-            self.uncovered(format!("SET {name} FROM CURRENT (the value at creation time)"));
+            self.uncovered(format!(
+                "SET {name} FROM CURRENT (the value at creation time)"
+            ));
             return;
         }
         if matches!(self.up(0), "TO" | "=") {
@@ -362,7 +400,9 @@ impl Opts<'_> {
         {
             self.note(&format!("{text} (planning, memory or logging only)"));
         } else {
-            self.uncovered(format!("{text} (a setting in effect while the routine runs)"));
+            self.uncovered(format!(
+                "{text} (a setting in effect while the routine runs)"
+            ));
         }
     }
 
@@ -398,7 +438,10 @@ impl Opts<'_> {
                         "*USER" => self.security(Security::Caller, at, self.i),
                         _ => {
                             self.u.security = Security::Naming;
-                            self.u.security_cite = Some((format!("USRPRF = {value}"), (self.t[at].off, self.t[at].off)));
+                            self.u.security_cite = Some((
+                                format!("USRPRF = {value}"),
+                                (self.t[at].off, self.t[at].off),
+                            ));
                         }
                     }
                 }
@@ -431,7 +474,10 @@ pub(super) fn body_checks(r: &SyntaxNode, u: &mut Unit) {
         let writes = u.stmts.iter().any(|s| {
             matches!(
                 s.ast,
-                Ok(Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. } | Stmt::Merge { .. })
+                Ok(Stmt::Insert { .. }
+                    | Stmt::Update { .. }
+                    | Stmt::Delete { .. }
+                    | Stmt::Merge { .. })
             )
         });
         if writes {
@@ -450,7 +496,10 @@ pub(super) fn body_checks(r: &SyntaxNode, u: &mut Unit) {
         let d = u.dialect;
         let txn = r.descendants().any(|n| {
             n.kind() == SyntaxKind::STATEMENT
-                && matches!(stmt_kind(&n, d), StmtKind::TxnCommit | StmtKind::TxnRollback)
+                && matches!(
+                    stmt_kind(&n, d),
+                    StmtKind::TxnCommit | StmtKind::TxnRollback
+                )
         });
         if txn {
             u.uncovered.push((

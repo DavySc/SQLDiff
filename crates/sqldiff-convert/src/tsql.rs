@@ -50,6 +50,7 @@ pub(crate) fn convert(root: &SyntaxNode, src: &str, to: Dialect) -> Out {
         in_try: false,
         in_cast: false,
         return_code: false,
+        txn_control: false,
         decls: Vec::new(),
         context: false,
     };
@@ -135,6 +136,9 @@ struct Cx<'a> {
     in_cast: bool,
     /// A procedure returns a value somewhere: it gets an INOUT `return_code`.
     return_code: bool,
+    /// PostgreSQL: the procedure body COMMITs or ROLLs BACK, which a
+    /// SECURITY DEFINER procedure may not.
+    txn_control: bool,
     decls: Vec<Decl>,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
@@ -376,6 +380,7 @@ impl Cx<'_> {
     fn proc_or_func(&mut self, out: &mut Out, r: &SyntaxNode, func: bool) -> R<Option<String>> {
         self.reset();
         self.return_code = false;
+        self.txn_control = false;
         let all = tokens(r);
         let body_at = all.len()
             - r.children()
@@ -490,13 +495,7 @@ impl Cx<'_> {
             let (ty, _, _) = self.ty(rt)?;
             returns = format!(" RETURNS {ty}");
         }
-        if ts.iter().any(|t| t.is("WITH")) {
-            let text = self.pick(
-                "Routine options (WITH EXECUTE AS, RECOMPILE, ENCRYPTION, …) were dropped; use SECURITY DEFINER for EXECUTE AS OWNER.",
-                "Routine options (WITH EXECUTE AS, RECOMPILE, ENCRYPTION, …) were dropped; use SET OPTION USRPRF = *OWNER for EXECUTE AS OWNER.",
-            ).to_string();
-            self.note(Status::Decision, "tsql.routine-options", &text);
-        }
+        let owner = self.routine_options(&ts[stop..]);
         let header_notes = self.take_notes();
 
         // Body.
@@ -513,7 +512,9 @@ impl Cx<'_> {
         }
         self.notes = header_notes;
         if self.db2() {
-            return Ok(self.db2_routine(out, r, &body, b, func, &name, &params, &returns, kw));
+            return Ok(
+                self.db2_routine(out, r, &body, b, func, &name, &params, &returns, kw, owner)
+            );
         }
         if ts[..kw].iter().any(|t| t.is("ALTER")) {
             self.note(
@@ -529,8 +530,25 @@ impl Cx<'_> {
                 "PostgreSQL procedures cannot return a value: RETURN n becomes `return_code := n` on an INOUT parameter, so callers must read return_code.",
             );
         }
+        let mut security = "";
+        if owner {
+            if self.txn_control {
+                self.note(
+                    Status::Decision,
+                    "pg.security-definer-transaction",
+                    "EXECUTE AS OWNER would become SECURITY DEFINER, but a SECURITY DEFINER procedure cannot COMMIT or ROLLBACK in PostgreSQL (invalid transaction termination). The procedure runs with the caller's privileges: grant them, or move the transaction control to the caller and add SECURITY DEFINER.",
+                );
+            } else {
+                security = "\nSECURITY DEFINER";
+                self.note(
+                    Status::Assumptions,
+                    "ASM-OWNER-PRIVILEGES",
+                    "EXECUTE AS OWNER becomes SECURITY DEFINER: the statements run with the owner's privileges, so the PostgreSQL owner needs the privileges the T-SQL owner has. Unqualified names still resolve through the caller's search_path; consider SET search_path (PostgreSQL manual, \"Writing SECURITY DEFINER Functions Safely\").",
+                );
+            }
+        }
         let header = format!(
-            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql\nAS $$",
+            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS $$",
             if func { "FUNCTION" } else { "PROCEDURE" },
             params.join(", ")
         );
@@ -543,6 +561,65 @@ impl Cx<'_> {
         out.push("END;\n$$;\n");
         self.mode = Mode::Top;
         Ok(None)
+    }
+
+    /// T-SQL `WITH` routine options (header tokens after the parameters):
+    /// true for EXECUTE AS OWNER. Options without an effect on results are
+    /// dropped; any other one needs a decision.
+    fn routine_options(&mut self, ts: &[T]) -> bool {
+        let Some(w) = ts.iter().position(|t| t.is("WITH")) else {
+            if ts.iter().any(|t| t.is("REPLICATION")) {
+                self.note(
+                    Status::Decision,
+                    "tsql.routine-options",
+                    "FOR REPLICATION was dropped: it only matters to replication agents.",
+                );
+            }
+            return false;
+        };
+        // The body's AS, not the one in EXECUTE AS.
+        let si = sig(ts);
+        let end = si
+            .iter()
+            .enumerate()
+            .filter(|&(_, &j)| j > w)
+            .find(|&(k, &j)| {
+                let after_exec = k > 0 && (ts[si[k - 1]].is("EXECUTE") || ts[si[k - 1]].is("EXEC"));
+                ts[j].is("AS") && !after_exec || ts[j].is("FOR")
+            })
+            .map_or(ts.len(), |(_, &j)| j);
+        let mut owner = false;
+        for opt in split_commas(&ts[w + 1..end]) {
+            let words: Vec<String> = sig(opt)
+                .iter()
+                .map(|&j| opt[j].s.to_ascii_uppercase())
+                .collect();
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            match words.as_slice() {
+                ["EXECUTE" | "EXEC", "AS", "OWNER"] => owner = true,
+                ["EXECUTE" | "EXEC", "AS", "CALLER"] | ["CALLED", "ON", "NULL", "INPUT"] => {}
+                ["RECOMPILE"] | ["ENCRYPTION"] | ["SCHEMABINDING"] => self.note(
+                    Status::Converted,
+                    "tsql.routine-options-dropped",
+                    "WITH RECOMPILE, ENCRYPTION and SCHEMABINDING were dropped: they do not change results.",
+                ),
+                _ => {
+                    let text = format!(
+                        "The routine option WITH {} was dropped and has no equivalent here; check what it was for.",
+                        words.join(" ")
+                    );
+                    self.note(Status::Decision, "tsql.routine-options", &text);
+                }
+            }
+        }
+        if ts[end..].iter().any(|t| t.is("REPLICATION")) {
+            self.note(
+                Status::Decision,
+                "tsql.routine-options",
+                "FOR REPLICATION was dropped: it only matters to replication agents.",
+            );
+        }
+        owner
     }
 
     /// The Db2 for i routine around a converted body: SQL PL with the commit
@@ -560,6 +637,7 @@ impl Cx<'_> {
         params: &[String],
         returns: &str,
         kw: usize,
+        owner: bool,
     ) -> Option<String> {
         let ts = tokens(r);
         if ts[..kw].iter().any(|t| t.is("ALTER")) {
@@ -577,11 +655,24 @@ impl Cx<'_> {
             );
         }
         let mut options = String::from("LANGUAGE SQL");
-        if !func {
+        // The authority is written out too: without USRPRF it follows the
+        // naming convention the routine is created under (*NAMING).
+        let usrprf = if owner { "*OWNER" } else { "*USER" };
+        let usrprf = format!("USRPRF = {usrprf}, DYNUSRPRF = {usrprf}");
+        if owner {
+            self.note(
+                Status::Assumptions,
+                "ASM-OWNER-PRIVILEGES",
+                "EXECUTE AS OWNER becomes SET OPTION USRPRF = *OWNER: the statements run with the owner's authority added to the caller's, so the Db2 for i owner needs the privileges the T-SQL owner has.",
+            );
+        }
+        if func {
+            options.push_str(&format!("\nSET OPTION {usrprf}"));
+        } else {
             if !self.cursors.is_empty() {
                 options = format!("DYNAMIC RESULT SETS {}\n{options}", self.cursors.len());
             }
-            options.push_str("\nSET OPTION COMMIT = *CS");
+            options.push_str(&format!("\nSET OPTION COMMIT = *CS, {usrprf}"));
             self.note(
                 Status::Assumptions,
                 "ASM-DB2-COMMIT-CS",
@@ -1753,6 +1844,7 @@ impl Cx<'_> {
                     return Ok("-- BEGIN TRANSACTION: implicit in PostgreSQL".into());
                 }
                 self.note(Status::Decision, "pg.proc-transaction", "COMMIT/ROLLBACK in a procedure only works when it is CALLed outside an explicit transaction block. In T-SQL a COMMIT inside the caller's transaction only decrements @@TRANCOUNT; here it commits the caller's work too.");
+                self.txn_control = true;
                 Ok(kw.to_string())
             }
         }

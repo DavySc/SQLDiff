@@ -344,16 +344,16 @@ fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
             "OUTPUT" | "OUT" => out = true,
             "READONLY" => return None,
             "=" | "DEFAULT" if default.is_none() => default = Some(Vec::new()),
-            _ => match default.as_mut() {
-                Some(v) => v.push(if t.kind == K::Word {
+            _ => {
+                // Anything else after the type (VARYING, NOT NULL, a type
+                // modifier the type parser left over) is not understood.
+                let v = default.as_mut()?;
+                v.push(if t.kind == K::Word {
                     t.up.clone()
                 } else {
                     t.text.clone()
-                }),
-                // Anything else after the type (VARYING, NOT NULL, a type
-                // modifier the type parser left over) is not understood.
-                None => return None,
-            },
+                });
+            }
         }
     }
     Some(Param {

@@ -27,6 +27,7 @@ pub mod process;
 pub mod protocol;
 pub mod queue;
 mod source;
+pub mod split;
 pub mod tree;
 mod walk;
 

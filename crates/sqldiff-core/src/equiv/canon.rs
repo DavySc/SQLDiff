@@ -206,7 +206,10 @@ impl<'a> Canon<'a> {
                 .first()
                 .is_some_and(|p| p.eq_ignore_ascii_case("SESSION") && parts.len() > 1);
         if temp {
-            return (format!("temp:{}", last.trim_start_matches(['#', '@'])), None);
+            return (
+                format!("temp:{}", last.trim_start_matches(['#', '@'])),
+                None,
+            );
         }
         let quals: Vec<String> = parts[..parts.len().saturating_sub(1)]
             .iter()
