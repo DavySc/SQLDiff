@@ -276,6 +276,7 @@ impl Source for GitSource {
                 revision: revision.map(String::from),
             },
             metadata: BTreeMap::from([("commit".to_string(), commit)]),
+            template: None,
         })
     }
 

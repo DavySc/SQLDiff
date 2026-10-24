@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::LayerRef;
 use crate::protocol::{
     ArtifactData, Catalog, CatalogScope, Composition, Describe, HistoryEntry, ObjectFilter,
-    ObjectInfo, Pair, PairScope, Provenance, Settings,
+    ObjectInfo, Pair, PairScope, Provenance, Settings, TemplateInfo,
 };
 use crate::source::Source;
 use crate::walk::sha256_hex;
@@ -61,6 +61,8 @@ pub struct BundleObject {
     pub provenance: Provenance,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateInfo>,
     pub text: String,
 }
 
@@ -74,6 +76,7 @@ impl BundleObject {
             info,
             provenance: data.provenance,
             metadata: data.metadata,
+            template: data.template,
             text: data.text,
         }
     }
@@ -84,6 +87,7 @@ impl BundleObject {
             text: self.text.clone(),
             provenance: self.provenance.clone(),
             metadata: self.metadata.clone(),
+            template: self.template.clone(),
         }
     }
 }

@@ -28,6 +28,35 @@ impl Artifact {
 }
 
 /// Content hash with line endings, BOM and trailing whitespace normalized.
+/// The location of `text[start..end]`, with line and column and an excerpt
+/// of at most `excerpt_lines` lines, as findings carry it.
+pub fn location_in(
+    side: Side,
+    path: &str,
+    text: &str,
+    lines: &LineIndex,
+    (start, end): (usize, usize),
+    excerpt_lines: usize,
+) -> Location {
+    let (start_line, start_col) = lines.line_col(start);
+    let (end_line, end_col) = lines.line_col(end);
+    Location {
+        side,
+        path: path.to_string(),
+        start_line,
+        start_col,
+        end_line,
+        end_col,
+        byte_start: start,
+        byte_end: end,
+        excerpt: text[start..end]
+            .lines()
+            .take(excerpt_lines.max(1))
+            .map(|l| l.trim_end().to_string())
+            .collect(),
+    }
+}
+
 pub fn content_hash(text: &str) -> String {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut h = Sha256::new();
@@ -100,24 +129,14 @@ impl<'a> Analyzed<'a> {
     }
 
     pub fn location(&self, start: usize, end: usize) -> Location {
-        let (start_line, start_col) = self.lines.line_col(start);
-        let (end_line, end_col) = self.lines.line_col(end);
-        let excerpt = self.artifact.text[start..end]
-            .lines()
-            .take(self.excerpt_lines.max(1))
-            .map(|l| l.trim_end().to_string())
-            .collect();
-        Location {
-            side: self.side,
-            path: self.artifact.path.clone(),
-            start_line,
-            start_col,
-            end_line,
-            end_col,
-            byte_start: start,
-            byte_end: end,
-            excerpt,
-        }
+        location_in(
+            self.side,
+            &self.artifact.path,
+            &self.artifact.text,
+            &self.lines,
+            (start, end),
+            self.excerpt_lines,
+        )
     }
 
     pub fn node_location(&self, node: &SyntaxNode) -> Location {

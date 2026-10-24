@@ -173,6 +173,7 @@ impl Source for ProcessSource {
                     text,
                     provenance: c.provenance,
                     metadata: c.metadata,
+                    template: c.template,
                 });
             }
         }
@@ -228,6 +229,7 @@ pub fn chunk(data: &ArtifactData, offset: usize, max_bytes: usize) -> Result<Art
         info: data.info.clone(),
         provenance: data.provenance.clone(),
         metadata: data.metadata.clone(),
+        template: data.template.clone(),
         offset,
         data: text[offset..end].to_string(),
         total_bytes: text.len(),

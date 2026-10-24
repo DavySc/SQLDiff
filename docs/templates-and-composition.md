@@ -16,6 +16,10 @@ name_pattern = "[A-Z][A-Z0-9_]*"
 special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
 parameter_sources = ["composition", "cli"]   # lookup order
 collision = "error"                           # first | last | error
+known_parameters = ["SCHEMA"]                 # supplied by the generator itself
+ignore_case = false                           # true: [schema] is parameter SCHEMA
+placeholders = "parameters"                   # or "pattern": the generator's naming convention decides
+unquoted_name_pattern = "[A-Za-z_][A-Za-z0-9_]*"  # where the delimiters are not SQL (default: name_pattern)
 ```
 
 A template is split losslessly into SQL spans, placeholders, special forms
@@ -40,6 +44,58 @@ sqldiff template proc.tpl.sql -d tsql --pack gen-pack            # placeholders,
 sqldiff template proc.tpl.sql -d tsql --pack gen-pack --param SCHEMA=dbo --render
 sqldiff diff --template a.tpl.sql b.tpl.sql -d tsql --pack gen-pack   # template-level diff
 ```
+
+### Placeholder or quoted name?
+
+With `open = "["`, `[TAB]` can be a placeholder or, in T-SQL, a quoted
+identifier for an object named `TAB`. The delimiters alone cannot tell.
+`sqldiff template`, `diff --template` and pair diffs from a source all decide
+the same way (`compose::Placeholders`): every delimited token is a candidate,
+and these rules decide what it is.
+
+| Mode | Placeholder | Reported as `template.unresolved` | Plain SQL |
+|---|---|---|---|
+| `placeholders = "parameters"` (default), with a parameter list | a listed name | a name that matches the pattern, or is glued, but is not listed | anything else |
+| `placeholders = "parameters"`, no list | a name that matches the pattern, or is glued | none | anything else |
+| `placeholders = "pattern"` (a declared naming convention) | a name that matches the pattern as written, a listed name, or a glued name | none | anything else |
+
+- **The parameter list** comes from the source (`template.parameters` on the
+  artifact, see [adapter-protocol.md](adapter-protocol.md)) or from
+  `--parameter NAME` on `diff --template` (`--param` with `--known-only` on
+  `sqldiff template`). The pack's `known_parameters`, names the generator
+  always supplies itself, are added to a given list; on their own they do
+  not make one. A listed name counts in every dialect, even where the
+  pattern would not match it.
+- **The pattern** is `name_pattern`, or `unquoted_name_pattern` in dialects
+  where the delimiters are not SQL syntax (`[...]` outside T-SQL). A
+  delimited name there cannot be a quoted identifier, so a wider pattern
+  (for example with lower case) is safe.
+- **Glued**: a delimited name directly attached to `@`, to identifier
+  characters or to another delimited name (`@[x]`, `a_[x]_b`, `[x][y]`). A
+  quoted identifier always stands apart, so where the delimiters also quote
+  names a glued name can only be a placeholder, whatever its case.
+- **`ignore_case = true`** is for generators that resolve names in any letter
+  case: the pattern then matches in any case, `[comma]` is listed parameter
+  `COMMA`, a value given as `comma` fills `[COMMA]`, and names are kept in
+  upper case, so the same placeholder spelled differently on two sides
+  compares equal. A declared convention is about how names are written, so
+  under `placeholders = "pattern"` the convention check stays case-sensitive.
+- **What the report says.** Where the delimiters also quote names in that
+  dialect (`[...]` in T-SQL, `"..."` in any dialect) and the pattern decided:
+  without a list, an unknown reason names the placeholders it made, so such a
+  pair is never plain *equal*; under a declared convention, the convention is
+  recorded as a declared assumption (`ASM-TEMPLATE-PLACEHOLDER-PATTERN-<side>`),
+  so the pair can be *equal under assumptions*.
+
+```sh
+sqldiff diff --template a.tpl.sql b.tpl.sql -d tsql --pack gen-pack --parameter TAB --parameter COL
+```
+
+`pairs --diff`, the queue and the MCP `diff` compare a pair as templates when
+the source marks both sides as templates and the config has a `[template]`
+syntax; compositions (adapter or pack markers) apply to them as to any pair.
+If only one side is marked, or no syntax is configured, the pair is compared
+as plain SQL and the report says why.
 
 A template-level diff compares the two fragments; locations point into the
 templates and witnesses quote placeholders as the template spells them.

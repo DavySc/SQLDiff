@@ -2,12 +2,13 @@
 //! review queue): pack `ignore`, `shared`, `dialect_map`, pairing rules and
 //! explicit pairs, then one engine diff per pair with pack policy applied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 
+use crate::compose::Placeholders;
 use crate::protocol::ObjectFilter;
 use crate::{pairing, policy, Error, FsSource, Resolved, Result, Source};
 
@@ -60,6 +61,73 @@ pub fn read(path: &Path, dialect: Option<Dialect>, cfg: &Resolved) -> Result<Art
 /// rules, overrides, declared assumptions.
 pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
     diff_with(a, b, cfg, &cfg.options())
+}
+
+/// Template-level diff: the SQL fragments of two templates in the pack's
+/// `[template]` syntax, with locations and witnesses in the templates.
+///
+/// `known` holds each side's parameter names when its source knows them.
+/// [`Placeholders`] decides what is a placeholder; where a name is SQL or
+/// only a placeholder by pattern, the report says so (`template.unresolved`,
+/// an unknown reason, or a declared assumption).
+pub fn template_report(
+    a: &Artifact,
+    b: &Artifact,
+    known: [Option<&BTreeSet<String>>; 2],
+    placeholders: &Placeholders,
+    opts: &Options,
+) -> Report {
+    use sqldiff_core::composition::{remap_to_template, template_notes};
+    use sqldiff_core::model::Side;
+
+    let (ta, basis_a) = placeholders.parse(&a.text, a.dialect, known[0]);
+    let (tb, basis_b) = placeholders.parse(&b.text, b.dialect, known[1]);
+    let (fa, fb) = (ta.fragment(), tb.fragment());
+    let mut xa = a.clone();
+    xa.text = fa.text.clone();
+    let mut xb = b.clone();
+    xb.text = fb.text.clone();
+    let mut r = sqldiff_core::diff(&xa, &xb, opts);
+    for (side, tpl, frag, art, basis) in [
+        (Side::A, &ta, &fa, a, basis_a),
+        (Side::B, &tb, &fb, b, basis_b),
+    ] {
+        remap_to_template(&mut r, side, tpl, frag, art.dialect, opts.excerpt_lines);
+        template_notes(
+            &mut r,
+            side,
+            tpl,
+            &art.path,
+            art.dialect,
+            basis,
+            placeholders.delimiters(),
+            opts.excerpt_lines,
+        );
+    }
+    r
+}
+
+/// [`template_report`] with pack policy (limit rules, overrides, declared
+/// assumptions), as [`diff`] adds it to an engine diff.
+pub fn template_diff(
+    a: &Artifact,
+    b: &Artifact,
+    known: [Option<&BTreeSet<String>>; 2],
+    cfg: &Resolved,
+    opts: &Options,
+) -> Result<Report> {
+    let t = cfg
+        .policy
+        .template
+        .as_ref()
+        .ok_or_else(|| Error::new("no [template] syntax in the loaded packs or config"))?;
+    let placeholders = Placeholders::new(t)?;
+    Ok(with_policy(
+        template_report(a, b, known, &placeholders, opts),
+        a,
+        Some(b),
+        cfg,
+    ))
 }
 
 /// [`diff`] with explicit engine options (e.g. scenario flips).

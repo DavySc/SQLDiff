@@ -52,11 +52,19 @@ pairing), `content_hash` (normalized SHA-256, see the bundle format),
 inputs; verdicts that depend on it are capped at *unknown*).
 
 **ArtifactChunk**: `info`, `provenance` (`author_kind`: `human`,
-`generated` or `unknown`; `author`, `time`, `revision`), `metadata`,
-`offset`, `data`, `total_bytes`, `sha256`. Offsets count UTF-8 bytes and
+`generated` or `unknown`; `author`, `time`, `revision`), `metadata`, optional
+`template`, `offset`, `data`, `total_bytes`, `sha256`. Offsets count UTF-8 bytes and
 chunks end on character boundaries. The core requests chunks at increasing
 offsets until it holds `total_bytes` bytes, then checks the SHA-256 of the
 exact text and rejects the artifact on any mismatch.
+
+**template** marks the artifact as a template in the pack's `[template]`
+syntax: `{"parameters": ["TAB", "COL"]}`, or `{}` when the source does not know
+the names. With names, only those (and the pack's `known_parameters`) are
+placeholders, and any other delimited name is SQL, because `[name]` is also a
+quoted identifier in T-SQL. When both sides of a pair are templates and the
+config has a `[template]` syntax, the pair is compared as templates (see
+[templates-and-composition.md](templates-and-composition.md)).
 
 **Pair**: `a`, `b` (object ids), `key`, `rule` (what made the pair). An
 adapter that pairs by itself overrides pack pairing rules.

@@ -24,7 +24,7 @@ use regex::Regex;
 use sqldiff_syntax::template::{stand_in, Compiled, Derived, SegmentKind, Template};
 use sqldiff_syntax::{ast, SyntaxNode};
 
-use crate::artifact::{content_hash, Analyzed, Artifact};
+use crate::artifact::{content_hash, location_in, Analyzed, Artifact};
 use crate::classify::{stmt_kind, StmtKind};
 use crate::facts;
 use crate::model::{
@@ -809,20 +809,8 @@ pub fn remap_to_template(
             if loc.side != side {
                 continue;
             }
-            let (s, e) = fragment.map.src_range(loc.byte_start, loc.byte_end);
-            let (sl, sc) = lines.line_col(s);
-            let (el, ec) = lines.line_col(e);
-            loc.byte_start = s;
-            loc.byte_end = e;
-            loc.start_line = sl;
-            loc.start_col = sc;
-            loc.end_line = el;
-            loc.end_col = ec;
-            loc.excerpt = text[s..e]
-                .lines()
-                .take(excerpt_lines.max(1))
-                .map(|l| l.trim_end().to_string())
-                .collect();
+            let span = fragment.map.src_range(loc.byte_start, loc.byte_end);
+            *loc = location_in(loc.side, &loc.path, text, &lines, span, excerpt_lines);
         }
     }
     report.diagnostics.retain(|d| d.side != side);
@@ -839,6 +827,94 @@ pub fn remap_to_template(
     report.normalizations.push(format!(
         "side {side:?} is a template: placeholders read as identifiers, special forms as comments"
     ));
+}
+
+/// Whether the template delimiters also quote identifiers in `dialect`, so a
+/// delimited name may be SQL rather than a placeholder.
+pub fn delimiters_quote_names(open: &str, dialect: sqldiff_syntax::Dialect) -> bool {
+    open == "\"" || (open == "[" && dialect == sqldiff_syntax::Dialect::Tsql)
+}
+
+/// What decided which delimited names in a template are placeholders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderBasis {
+    /// The source's parameter list.
+    Parameters,
+    /// The name pattern, because no parameter list was given: an open question.
+    Pattern,
+    /// The name pattern, because the pack declares it as the generator's
+    /// naming convention: a declared assumption.
+    DeclaredPattern,
+}
+
+/// What the reader of a template diff must know about one side's
+/// placeholders: names that looked like placeholders but are not parameters
+/// (`template.unresolved`, read as SQL), and, when the name pattern decided,
+/// which names it made placeholders where the delimiters also quote names
+/// (an unknown reason, or a declared assumption when the pack declares the
+/// convention). Call after [`remap_to_template`].
+#[allow(clippy::too_many_arguments)]
+pub fn template_notes(
+    report: &mut Report,
+    side: Side,
+    template: &Template,
+    path: &str,
+    dialect: sqldiff_syntax::Dialect,
+    basis: PlaceholderBasis,
+    (open, close): (&str, &str),
+    excerpt_lines: usize,
+) {
+    let text = &template.text;
+    let lines = sqldiff_syntax::LineIndex::new(text);
+    for s in template.unresolved() {
+        let spelled = template.slice(s);
+        let loc = location_in(side, path, text, &lines, (s.start, s.end), excerpt_lines);
+        let sl = loc.start_line;
+        let class = ChangeClass::Structural;
+        report.findings.push(Finding {
+            fingerprint: fingerprint(&FingerprintInput {
+                object: &report.a.object,
+                class,
+                rule: "template.unresolved",
+                anchor_a: if side == Side::A { spelled } else { "" },
+                anchor_b: if side == Side::B { spelled } else { "" },
+            }),
+            rule: "template.unresolved".to_string(),
+            class,
+            severity: Severity::Medium,
+            verdict: Verdict::Unknown,
+            witness: format!(
+                "Side {side:?} line {sl}: `{spelled}` looks like a placeholder but is not one of the template's parameters; it was read as SQL."
+            ),
+            a: (side == Side::A).then(|| loc.clone()),
+            b: (side == Side::B).then_some(loc),
+            assumptions: Vec::new(),
+        });
+    }
+    let names = template.parameters();
+    if basis != PlaceholderBasis::Parameters
+        && delimiters_quote_names(open, dialect)
+        && !names.is_empty()
+    {
+        let shown: Vec<String> = names.iter().map(|n| format!("{open}{n}{close}")).collect();
+        let shown = shown.join(", ");
+        let dialect = dialect.display_name();
+        if basis == PlaceholderBasis::DeclaredPattern {
+            report.assumptions.push(Assumption {
+                id: format!("ASM-TEMPLATE-PLACEHOLDER-PATTERN-{side:?}"),
+                text: format!(
+                    "Side {side:?}: names matching the template's name pattern are placeholders, by the generator's convention declared in the pack ({shown}); in {dialect} they could otherwise be quoted names."
+                ),
+                source: AssumptionSource::Declared,
+                cite: None,
+            });
+        } else {
+            report.unknown_reasons.push(format!(
+                "side {side:?}: no parameter list for the template, so {shown} were taken as placeholders by the name pattern; in {dialect} they could also be quoted names"
+            ));
+        }
+    }
+    report.verdict = crate::session::derive_verdict(report);
 }
 
 #[cfg(test)]
@@ -913,6 +989,7 @@ mod tests {
             close: "}}".into(),
             name_pattern: "[A-Z][A-Z0-9_]*".into(),
             special_forms: vec![],
+            ignore_case: false,
         })
         .unwrap();
         let text = "-- [part:body template=b table=dbo.t]\nDELETE FROM dbo.t;  \r\n-- [/part]\n";

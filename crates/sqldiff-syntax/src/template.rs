@@ -32,6 +32,9 @@ pub struct TemplateSyntax {
     /// regex matches the whole form, delimiters included; capture groups
     /// are its arguments.
     pub special_forms: Vec<(String, String)>,
+    /// Placeholder names match parameter names in any letter case, as the
+    /// generator resolves them. Names are then kept in upper case.
+    pub ignore_case: bool,
 }
 
 /// A compiled [`TemplateSyntax`].
@@ -39,6 +42,7 @@ pub struct TemplateSyntax {
 pub struct Compiled {
     placeholder: Regex,
     specials: Vec<(String, Regex)>,
+    ignore_case: bool,
 }
 
 impl Compiled {
@@ -46,10 +50,14 @@ impl Compiled {
         if s.open.is_empty() || s.close.is_empty() {
             return Err("template: open and close delimiters must be non-empty".into());
         }
+        // With ignore_case the generator resolves names in any case, so the
+        // name pattern matches in any case too (`[schema]` for SCHEMA).
         let placeholder = Regex::new(&format!(
-            "{}\\s*(?P<tplname>{})\\s*{}",
+            "{}\\s*(?P<tplname>{}{}){}\\s*{}",
             regex::escape(&s.open),
+            if s.ignore_case { "(?i:" } else { "(?:" },
             s.name_pattern,
+            ")",
             regex::escape(&s.close)
         ))
         .map_err(|e| format!("template.name_pattern: {e}"))?;
@@ -65,6 +73,7 @@ impl Compiled {
         Ok(Compiled {
             placeholder,
             specials,
+            ignore_case: s.ignore_case,
         })
     }
 }
@@ -93,12 +102,56 @@ pub struct Segment {
     pub end: usize,
 }
 
+/// What a match of the name pattern is, as [`Template::parse_with`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// A placeholder.
+    Placeholder,
+    /// Looks like a placeholder but is not one: kept as SQL and reported.
+    Unresolved,
+    /// Plain SQL (for example a quoted name), not reported.
+    Sql,
+}
+
+/// Whether `name` is one of the parameter names in `list`, in any letter case
+/// when `ignore_case` is set.
+pub fn listed(list: &BTreeSet<String>, name: &str, ignore_case: bool) -> bool {
+    list.contains(name) || (ignore_case && list.iter().any(|x| x.eq_ignore_ascii_case(name)))
+}
+
+/// One match of the name pattern, as [`Template::parse_with`] offers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Candidate<'a> {
+    /// The name as written between the delimiters.
+    pub name: &'a str,
+    /// The character just before the opening delimiter.
+    pub prev: Option<char>,
+    /// The character just after the closing delimiter.
+    pub next: Option<char>,
+}
+
+impl Candidate<'_> {
+    /// Directly attached to a variable sigil, to identifier characters or to
+    /// another delimited name (`@[x]`, `a_[x]_b`, `[x][y]`). A quoted
+    /// identifier always stands apart (separated by space, punctuation or a
+    /// `.`), so a glued match can only be a placeholder.
+    pub fn glued(&self, open: &str, close: &str) -> bool {
+        let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$');
+        self.prev.is_some_and(|c| word(c) || close.ends_with(c))
+            || self
+                .next
+                .is_some_and(|c| (word(c) && c != '@') || open.starts_with(c))
+    }
+}
+
 /// A template split into segments. Segments are contiguous and cover every
 /// byte, so [`Template::print`] returns the input.
 #[derive(Debug, Clone)]
 pub struct Template {
     pub text: String,
     pub segments: Vec<Segment>,
+    /// Parameter values are looked up in any letter case.
+    pub ignore_case: bool,
 }
 
 /// One span of an [`OffsetMap`]: `src` in the template, `dst` in the
@@ -243,6 +296,21 @@ impl Template {
     /// parameter becomes [`SegmentKind::Unresolved`]; without, every match is
     /// a placeholder.
     pub fn parse(text: &str, syntax: &Compiled, known: Option<&BTreeSet<String>>) -> Template {
+        let ignore_case = syntax.ignore_case;
+        Template::parse_with(text, syntax, &|c: &Candidate| match known {
+            Some(k) if !listed(k, c.name, ignore_case) => Decision::Unresolved,
+            _ => Decision::Placeholder,
+        })
+    }
+
+    /// Splits `text`, deciding for each match of the name pattern (by its
+    /// name as written and the characters around it) whether it is a
+    /// placeholder, an unresolved candidate, or plain SQL.
+    pub fn parse_with(
+        text: &str,
+        syntax: &Compiled,
+        decide: &dyn Fn(&Candidate) -> Decision,
+    ) -> Template {
         let mut marks: Vec<Segment> = Vec::new();
         for (form, re) in &syntax.specials {
             for c in re.captures_iter(text) {
@@ -271,10 +339,21 @@ impl Template {
             if overlaps(&marks, all.start(), all.end()) {
                 continue;
             }
-            let name = c["tplname"].to_string();
-            let kind = match known {
-                Some(k) if !k.contains(&name) => SegmentKind::Unresolved { name },
-                _ => SegmentKind::Placeholder { name },
+            let raw = &c["tplname"];
+            let name = if syntax.ignore_case {
+                raw.to_ascii_uppercase()
+            } else {
+                raw.to_string()
+            };
+            let candidate = Candidate {
+                name: raw,
+                prev: text[..all.start()].chars().next_back(),
+                next: text[all.end()..].chars().next(),
+            };
+            let kind = match decide(&candidate) {
+                Decision::Sql => continue,
+                Decision::Unresolved => SegmentKind::Unresolved { name },
+                Decision::Placeholder => SegmentKind::Placeholder { name },
             };
             marks.push(Segment {
                 kind,
@@ -306,6 +385,7 @@ impl Template {
         Template {
             text: text.to_string(),
             segments,
+            ignore_case: syntax.ignore_case,
         }
     }
 
@@ -358,7 +438,12 @@ impl Template {
     ) -> Result<Derived, Vec<ExpandProblem>> {
         let mut problems = Vec::new();
         let out = self.derive(|s| match &s.kind {
-            SegmentKind::Placeholder { name } => match params.get(name) {
+            SegmentKind::Placeholder { name } => match params.get(name).or_else(|| {
+                self.ignore_case
+                    .then(|| params.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)))
+                    .flatten()
+                    .map(|(_, v)| v)
+            }) {
                 Some(v) => Some(v.clone()),
                 None => {
                     problems.push(ExpandProblem::MissingParameter {
@@ -496,6 +581,7 @@ mod tests {
             close: close.into(),
             name_pattern: "[A-Za-z_][A-Za-z0-9_]*".into(),
             special_forms: vec![("include".into(), r"<%@include\s+(\S+)\s*%>".into())],
+            ignore_case: false,
         })
         .unwrap()
     }
@@ -576,6 +662,50 @@ mod tests {
         let f = t.fragment();
         assert_eq!(f.text, "SELECT [qty] FROM TPL_TABLE;");
         assert_eq!(t.print(), text);
+    }
+
+    #[test]
+    fn glued_names_cannot_be_quoted_identifiers() {
+        let at = |text: &str, name: &str| {
+            let s = text.find(&format!("[{name}]")).unwrap();
+            Candidate {
+                name,
+                prev: text[..s].chars().next_back(),
+                next: text[s + name.len() + 2..].chars().next(),
+            }
+            .glued("[", "]")
+        };
+        let text = "set @[p][comma] = x_[k]_y; select [dbo].[t], ([c]) from [s] where a=[v];";
+        for glued in ["p", "comma", "k"] {
+            assert!(at(text, glued), "{glued}");
+        }
+        for apart in ["dbo", "t", "c", "s", "v"] {
+            assert!(!at(text, apart), "{apart}");
+        }
+    }
+
+    #[test]
+    fn ignore_case_matches_parameters_in_any_case() {
+        let def = |ignore_case| TemplateSyntax {
+            open: "[".into(),
+            close: "]".into(),
+            name_pattern: "[A-Za-z_][A-Za-z0-9_]*".into(),
+            special_forms: vec![],
+            ignore_case,
+        };
+        let text = "SELECT a[comma] b FROM [Tab];";
+        let known: BTreeSet<String> = ["COMMA".to_string(), "TAB".to_string()].into();
+        let t = Template::parse(text, &Compiled::new(&def(true)).unwrap(), Some(&known));
+        // One spelling per name, so `[comma]` and `[COMMA]` are the same stand-in.
+        assert_eq!(t.parameters(), vec!["COMMA", "TAB"]);
+        assert_eq!(t.unresolved().count(), 0);
+        assert_eq!(t.fragment().text, "SELECT aTPL_COMMA b FROM TPL_TAB;");
+        let values: BTreeMap<String, String> =
+            [("comma".into(), ",".into()), ("tab".into(), "t".into())].into();
+        assert_eq!(t.substitute(&values).unwrap().text, "SELECT a, b FROM t;");
+        // Case-sensitive by default: neither name is known.
+        let t = Template::parse(text, &Compiled::new(&def(false)).unwrap(), Some(&known));
+        assert_eq!(t.unresolved().count(), 2);
     }
 
     #[test]

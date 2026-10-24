@@ -4,9 +4,10 @@
 //! template lookup for check mode, and parameter sources merged by the
 //! pack's collision rule.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
 use sqldiff_core::composition::{self, Composed, Composition, Markers, Part, PartCheck, Problem};
 use sqldiff_core::{Artifact, Options, Report};
 use sqldiff_syntax::template::{self, Collision, Compiled};
@@ -39,11 +40,145 @@ pub fn syntax_def(t: &TemplateSyntax) -> template::TemplateSyntax {
             .iter()
             .map(|f| (f.name.clone(), f.pattern.clone()))
             .collect(),
+        ignore_case: t.ignore_case,
     }
 }
 
 pub fn compile(t: &TemplateSyntax) -> Result<Compiled> {
     Compiled::new(&syntax_def(t)).map_err(Error::new)
+}
+
+/// What decides whether a delimited name in a template is a placeholder:
+/// the pack's `[template]` rules, compiled once and shared by every command
+/// (templates-and-composition.md, "Placeholder or quoted name?").
+///
+/// A neutral scanner finds every delimited token, so no rule can miss a name
+/// because another rule's pattern did not capture it; the rules then decide:
+///
+/// | Mode | Placeholder | Unresolved (reported) | SQL |
+/// |---|---|---|---|
+/// | `parameters`, with a list | listed | matches the pattern, or glued | the rest |
+/// | `parameters`, no list | matches the pattern, or glued | — | the rest |
+/// | `pattern` (declared convention) | matches the pattern as written, listed, or glued | — | the rest |
+///
+/// "The pattern" is `unquoted_name_pattern` in dialects whose delimiters are
+/// not SQL, else `name_pattern`; it matches in any case with `ignore_case`,
+/// except under the declared convention, which is about how names are
+/// written. "Glued" ([`template::Candidate::glued`]) counts only where the
+/// delimiters also quote names. The pack's `known_parameters` join any list.
+#[derive(Debug, Clone)]
+pub struct Placeholders {
+    scanner: Compiled,
+    pattern: Regex,
+    convention: Regex,
+    unquoted: Option<Regex>,
+    by_convention: bool,
+    ignore_case: bool,
+    known_parameters: Vec<String>,
+    open: String,
+    close: String,
+}
+
+impl Placeholders {
+    pub fn new(t: &TemplateSyntax) -> Result<Placeholders> {
+        let anchored = |p: &str, ci: bool| {
+            Regex::new(&format!("^(?{}:{p})$", if ci { "i" } else { "" }))
+                .map_err(|e| Error::new(format!("template name pattern `{p}`: {e}")))
+        };
+        // Any run of characters other than white space and the delimiters'
+        // own characters.
+        let delims: String = t
+            .open
+            .chars()
+            .chain(t.close.chars())
+            .map(|c| regex::escape(&c.to_string()))
+            .collect();
+        let mut def = syntax_def(t);
+        def.name_pattern = format!("[^\\s{delims}]+");
+        Ok(Placeholders {
+            scanner: Compiled::new(&def).map_err(Error::new)?,
+            pattern: anchored(&t.name_pattern, t.ignore_case)?,
+            convention: anchored(&t.name_pattern, false)?,
+            unquoted: t
+                .unquoted_name_pattern
+                .as_deref()
+                .map(|p| anchored(p, t.ignore_case))
+                .transpose()?,
+            by_convention: t.placeholders.as_deref() == Some("pattern"),
+            ignore_case: t.ignore_case,
+            known_parameters: t.known_parameters.clone(),
+            open: t.open.clone(),
+            close: t.close.clone(),
+        })
+    }
+
+    pub fn delimiters(&self) -> (&str, &str) {
+        (&self.open, &self.close)
+    }
+
+    /// Splits a template written in `dialect`, with the source's parameter
+    /// names when it gives them, and says what decided.
+    pub fn parse(
+        &self,
+        text: &str,
+        dialect: sqldiff_core::Dialect,
+        list: Option<&BTreeSet<String>>,
+    ) -> (template::Template, composition::PlaceholderBasis) {
+        use composition::PlaceholderBasis as Basis;
+        use template::{Candidate, Decision};
+        let quoting = composition::delimiters_quote_names(&self.open, dialect);
+        let list: Option<BTreeSet<String>> = list.map(|l| {
+            l.iter()
+                .chain(self.known_parameters.iter())
+                .cloned()
+                .collect()
+        });
+        let listed = |n: &str| {
+            list.as_ref()
+                .is_some_and(|l| template::listed(l, n, self.ignore_case))
+        };
+        let pattern = |n: &str| match &self.unquoted {
+            Some(u) if !quoting => u.is_match(n),
+            _ => self.pattern.is_match(n),
+        };
+        let glued = |c: &Candidate| quoting && c.glued(&self.open, &self.close);
+        let decide = |c: &Candidate| {
+            let n = c.name;
+            let placeholder = if self.by_convention {
+                let by_name = if quoting {
+                    self.convention.is_match(n)
+                } else {
+                    pattern(n)
+                };
+                by_name || listed(n) || glued(c)
+            } else if list.is_some() {
+                if !listed(n) {
+                    return if pattern(n) || glued(c) {
+                        Decision::Unresolved
+                    } else {
+                        Decision::Sql
+                    };
+                }
+                true
+            } else {
+                pattern(n) || glued(c)
+            };
+            if placeholder {
+                Decision::Placeholder
+            } else {
+                Decision::Sql
+            }
+        };
+        let basis = match (self.by_convention, &list) {
+            (true, _) => Basis::DeclaredPattern,
+            (false, Some(_)) => Basis::Parameters,
+            (false, None) => Basis::Pattern,
+        };
+        (
+            template::Template::parse_with(text, &self.scanner, &decide),
+            basis,
+        )
+    }
 }
 
 /// An adapter's persisted composition. Its spans are the fragments; the
@@ -356,6 +491,10 @@ mod tests {
             special_forms: vec![],
             parameter_sources: vec!["composition".into(), "cli".into()],
             collision: Some("error".into()),
+            known_parameters: vec![],
+            ignore_case: false,
+            placeholders: None,
+            unquoted_name_pattern: None,
         };
         let mut c = Composition::from_spans(
             "x",
