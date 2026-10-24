@@ -12,6 +12,9 @@
 #                O_N2 INTEGER and O_TEXT VARCHAR(200), after any `params`.
 #                `commit` becomes SET OPTION COMMIT = <commit>; "" leaves SET OPTION
 #                out, so the routine takes the options of the creating interface.
+#                `options` adds SET OPTION items (not COMMIT or NAMING). `naming =
+#                "*SYS"` creates it under system naming (names qualified with /).
+#                `top_level = true` lets the interface create it directly.
 #                Bodies may not contain `--` comments (the body is sent as one line).
 # [[probe]]      one call of a procedure (or an `inline` compound run at top level,
 #                which sees the same O_ variables) and the outcomes it can have.
@@ -20,7 +23,9 @@
 # outcome.when   fields: create (SQLSTATE of creating the procedure), call (SQLSTATE
 #                of the CALL itself), state, code, n1, n2, text (the O_ values).
 #                Patterns: "00000" exact, "!00000" set and different, "null", "*",
-#                "=0", ">0", ">=1", "<3", "contains:UPDATE". First match wins.
+#                "=0", ">0", ">=1", "<3", "contains:UPDATE", "prefix:*USER/",
+#                "regex:..." (the whole value must match).
+#                First match wins.
 # outcome.verdict  consistent (the fact or assumption holds), refines (holds in
 #                substance, a detail is wrong), contradicts, open (an answer to an
 #                open question, no expectation was made).
@@ -1309,4 +1314,166 @@ outcome = [
   { label = "supported", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "NULLS FIRST is supported and honoured." },
   { label = "not supported", when = { create = "!00000" }, verdict = "refines", meaning = "NULLS FIRST is not accepted on this release (SQLSTATE in create)." },
   { label = "ignored", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "contradicts", meaning = "Accepted but NULL still sorted last." },
+]
+
+# ---------------------------------------------------------------- V25
+# Each procedure reads its own program attributes from QSYS2.PROGRAM_INFO; text
+# is USRPRF/DYNUSRPRF/naming, for example *OWNER/*OWNER/*SQL. The procedure names
+# fit 10 characters, so the program has the same name. It then reads
+# SQLDFPROBE.T: n2 = 1 if that read was refused (only meaningful when a user
+# without authority to T calls it by hand, see the README).
+
+[[procedure]]
+name = "V25SQL"
+commit = "*NONE"
+# Created by the interface (SQL naming, as the README asks), with no USRPRF.
+top_level = true
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2.PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25SQL'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-SQL-NAMING"
+fact = "V25"
+role = "decisive"
+procedure = "V25SQL"
+question = "Which USRPRF does a procedure get when it is created under SQL naming without SET OPTION USRPRF (the *NAMING default)?"
+source = "IBM i CREATE PROCEDURE (SQL), SET OPTION USRPRF *NAMING, as summarised in vendor-facts V25: *OWNER under SQL naming. QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "owner", when = { create = "00000", state = "00000", text = 'regex:\*OWNER/.*/\*SQL' }, verdict = "consistent", meaning = "Under SQL naming the default adopts the owner's authority (text also shows DYNUSRPRF)." },
+  { label = "user", when = { create = "00000", state = "00000", text = 'regex:\*USER/.*/\*SQL' }, verdict = "contradicts", meaning = "Under SQL naming the default is the caller's authority only." },
+  { label = "not SQL naming", when = { create = "00000", state = "00000", text = 'regex:\*(OWNER|USER)/.*/\*SYS' }, verdict = "open", meaning = "The interface created the routine under system naming, so this run does not answer the SQL naming case; rerun with SQL naming." },
+  { label = "view unreadable", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "QSYS2.PROGRAM_INFO could not be read (SQLSTATE in state)." },
+]
+
+[[procedure]]
+name = "V25SYS"
+commit = "*NONE"
+naming = "*SYS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2/PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25SYS'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE/T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-SYS-NAMING"
+fact = "V25"
+role = "decisive"
+procedure = "V25SYS"
+question = "Which USRPRF does a procedure get when it is created under system naming without SET OPTION USRPRF?"
+source = "IBM i CREATE PROCEDURE (SQL), SET OPTION USRPRF *NAMING, as summarised in vendor-facts V25: *USER under system naming. The procedure is created by RUN_DDL_SYS (SET OPTION NAMING = *SYS). QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "user", when = { create = "00000", state = "00000", text = 'regex:\*USER/.*/\*SYS' }, verdict = "consistent", meaning = "Under system naming the default is the caller's authority (text also shows DYNUSRPRF)." },
+  { label = "owner", when = { create = "00000", state = "00000", text = 'regex:\*OWNER/.*/\*SYS' }, verdict = "contradicts", meaning = "Under system naming the default still adopts the owner's authority." },
+  { label = "not system naming", when = { create = "00000", state = "00000", text = 'regex:\*(OWNER|USER)/.*/\*SQL' }, verdict = "open", meaning = "RUN_DDL_SYS did not create the routine under system naming, so this run does not answer the system naming case." },
+  { label = "view unreadable", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "QSYS2.PROGRAM_INFO could not be read (SQLSTATE in state)." },
+]
+
+[[procedure]]
+name = "V25USR"
+commit = "*NONE"
+options = "USRPRF = *USER, DYNUSRPRF = *USER"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2.PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25USR'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-EXPLICIT-USER"
+fact = "V25"
+role = "control"
+procedure = "V25USR"
+question = "Control: SET OPTION USRPRF = *USER, DYNUSRPRF = *USER (what the converter writes for EXECUTE AS CALLER) shows as *USER/*USER."
+source = "QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "user", when = { create = "00000", state = "00000", text = "prefix:*USER/*USER/" }, verdict = "consistent", meaning = "The attributes read back as written." },
+]
+
+[[procedure]]
+name = "V25OWN"
+commit = "*NONE"
+options = "USRPRF = *OWNER, DYNUSRPRF = *OWNER"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2.PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25OWN'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-EXPLICIT-OWNER"
+fact = "V25"
+role = "control"
+procedure = "V25OWN"
+question = "Control: SET OPTION USRPRF = *OWNER, DYNUSRPRF = *OWNER (what the converter writes for EXECUTE AS OWNER) shows as *OWNER/*OWNER."
+source = "QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "owner", when = { create = "00000", state = "00000", text = "prefix:*OWNER/*OWNER/" }, verdict = "consistent", meaning = "The attributes read back as written." },
 ]

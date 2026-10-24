@@ -20,6 +20,11 @@ def value_for(pattern):
         return None
     if pattern.startswith("contains:"):
         return pattern[len("contains:"):]
+    if pattern.startswith("regex:"):
+        body = pattern[len("regex:"):].replace("(OWNER|USER)", "USER")
+        return body.replace("\\*", "*").replace(".*", "X")
+    if pattern.startswith("prefix:"):
+        return pattern[len("prefix:"):] + "*SQL"
     if pattern.startswith("!"):
         return "42999"
     for op, delta in ((">=", 0), ("<=", 0), (">", 1), ("<", -1), ("=", 0)):
@@ -115,7 +120,7 @@ class Results(unittest.TestCase):
         ev = dp.evaluate(defs, facts, rows_for(defs, first({"consistent"})))
         self.assertTrue(ev["harness_ok"])
         st = {k: v["status"] for k, v in ev["facts"].items()}
-        for fid in ("V4", "V9", "V14", "V15", "V16", "V19", "V3", "V7"):
+        for fid in ("V4", "V9", "V14", "V15", "V16", "V19", "V3", "V7", "V25"):
             self.assertEqual(st[fid], "confirmed", (fid, ev["facts"][fid]))
         self.assertEqual(st["V5"], "observed")
 
@@ -136,6 +141,22 @@ class Results(unittest.TestCase):
         self.assertIn("V9-INT-EMPTY", ev["facts"]["V9"]["why"])
         self.assertEqual(ev["facts"]["V14"]["status"], "contradicted")
         self.assertEqual(ev["facts"]["V4"]["status"], "corrected")
+
+    def test_v25_needs_the_intended_naming(self):
+        defs, facts = dp.load_probes(), dp.load_facts()
+        rows = rows_for(defs, first({"consistent"}))
+        for r in rows:
+            if r["probe"] == "V25-SQL-NAMING":
+                r["text"] = "*USER/*USER/*SYS"
+        ev = dp.evaluate(defs, facts, rows)
+        j = next(j for j in ev["probes"] if j["id"] == "V25-SQL-NAMING")
+        self.assertEqual((j["outcome"], j["verdict"]), ("not SQL naming", "open"))
+        self.assertEqual(ev["facts"]["V25"]["status"], "confirmed")
+        for r in rows:
+            if r["probe"] == "V25-SQL-NAMING":
+                r["text"] = "*USER/*USER/*SQL"
+        ev = dp.evaluate(defs, facts, rows)
+        self.assertEqual(ev["facts"]["V25"]["status"], "contradicted")
 
     def test_failed_control_makes_the_fact_inconclusive(self):
         defs, facts = dp.load_probes(), dp.load_facts()

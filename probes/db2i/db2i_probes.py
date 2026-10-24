@@ -79,6 +79,14 @@ def validate(defs: dict, facts: dict) -> list[str]:
         procs[name] = p
         if p.get("commit", "") not in {"", "*NONE", "*CHG", "*CS", "*ALL", "*RR"}:
             errs.append(f"procedure {name}: commit {p.get('commit')!r}")
+        if p.get("naming", "") not in {"", "*SYS"}:
+            errs.append(f"procedure {name}: naming {p.get('naming')!r} (only \"*SYS\" may be given)")
+        if p.get("naming") and p.get("top_level"):
+            errs.append(f"procedure {name}: a top-level create always uses the interface's naming")
+        if "COMMIT" in p.get("options", "").upper() or "NAMING" in p.get("options", "").upper():
+            errs.append(f"procedure {name}: give COMMIT and naming through commit and naming, not options")
+        if f"'P_{name}'" in p.get("body", "") and len("P_" + name) > 10:
+            errs.append(f"procedure {name}: its body looks itself up by name, so P_{name} must fit a 10-character system name")
         body = p.get("body", "")
         if "--" in body:
             errs.append(f"procedure {name}: '--' in body (the body is sent as one line)")
@@ -128,6 +136,11 @@ def validate(defs: dict, facts: dict) -> list[str]:
                     errs.append(f"probe {pid}: outcome {o.get('label')!r} field {k!r}")
                 if not isinstance(pat, str):
                     errs.append(f"probe {pid}: outcome {o.get('label')!r} pattern for {k} must be a string")
+                elif pat.startswith("regex:"):
+                    try:
+                        re.compile(pat[len("regex:"):])
+                    except re.error as e:
+                        errs.append(f"probe {pid}: outcome {o.get('label')!r} bad regex: {e}")
             if not o.get("meaning"):
                 errs.append(f"probe {pid}: outcome {o.get('label')!r} has no meaning")
         if pr.get("role") == "control" and not any(o["verdict"] == "consistent" for o in outs):
@@ -178,13 +191,25 @@ def one_line(body: str) -> str:
     return " ".join(line.strip() for line in body.strip().splitlines() if line.strip())
 
 
+def qualifier(p: dict) -> str:
+    """`.` under SQL naming, `/` for a procedure created under system naming."""
+    return "/" if p.get("naming") == "*SYS" else "."
+
+
+def set_option(p: dict) -> str:
+    items = [f"COMMIT = {p['commit']}"] if p.get("commit") else []
+    if p.get("options"):
+        items.append(p["options"])
+    return "SET OPTION " + ", ".join(items) if items else ""
+
+
 def create_text(p: dict) -> str:
     params = p.get("params", "").strip()
     plist = f"{params}, {OUT_PARAMS}" if params else OUT_PARAMS
     opts = "LANGUAGE SQL MODIFIES SQL DATA"
-    if p.get("commit"):
-        opts += f" SET OPTION COMMIT = {p['commit']}"
-    return f"CREATE OR REPLACE PROCEDURE {SCHEMA}.P_{p['name']} ({plist}) {opts} {one_line(p['body'])}"
+    if set_option(p):
+        opts += " " + set_option(p)
+    return f"CREATE OR REPLACE PROCEDURE {SCHEMA}{qualifier(p)}P_{p['name']} ({plist}) {opts} {one_line(p['body'])}"
 
 
 def wrap_plain(text: str, indent: str = "", width: int = WIDTH) -> list[str]:
@@ -247,6 +272,54 @@ def call_block(pr: dict, procs: dict) -> list[str]:
         "",
     ]
     return lines
+
+
+def create_block(probe: str, drop: str, sql: str, helper: str) -> list[str]:
+    """Create through `helper`; if the CALL itself fails, log that as the create."""
+    out = [
+        "BEGIN",
+        "  DECLARE V_SQL VARCHAR(16000);",
+        "  DECLARE V_STATE CHAR(5) DEFAULT '00000';",
+        "  DECLARE V_CODE INTEGER DEFAULT 0;",
+        "  DECLARE V_MSG VARCHAR(2000) DEFAULT '';",
+        "  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION",
+        "    GET DIAGNOSTICS CONDITION 1 V_STATE = RETURNED_SQLSTATE,",
+        "      V_CODE = DB2_RETURNED_SQLCODE, V_MSG = MESSAGE_TEXT;",
+        "  SET V_SQL =",
+    ]
+    for i, piece in enumerate(sql_literal_pieces(sql, WIDTH - 8)):
+        out.append(("    || " if i else "       ") + piece)
+    out[-1] += ";"
+    out += [
+        f"  CALL {SCHEMA}.{helper}('{probe}',",
+        f"    '{drop}', V_SQL);",
+        "  IF V_STATE <> '00000' THEN",
+        f"    INSERT INTO {SCHEMA}.RESULTS (R_PROBE, R_STEP, R_STATE, R_CODE, R_MSG)",
+        f"      VALUES ('{probe}', 'create', V_STATE, V_CODE,",
+        f"        'CALL {helper} failed: ' || V_MSG) WITH NC;",
+        "  END IF;",
+        "END;",
+        "",
+    ]
+    return out
+
+
+# A RUN_DDL that runs its statements under system naming, for probes of what a
+# routine created under system naming gets. Created through RUN_DDL, so a refusal
+# is logged as HELPER:RUN_DDL_SYS.
+RUN_DDL_SYS = (
+    f"CREATE OR REPLACE PROCEDURE {SCHEMA}.RUN_DDL_SYS (IN P_PROBE VARCHAR(40), "
+    "IN P_DROP VARCHAR(200), IN P_SQL VARCHAR(16000)) LANGUAGE SQL MODIFIES SQL DATA "
+    "SET OPTION COMMIT = *NONE, NAMING = *SYS "
+    "BEGIN DECLARE V_STATE CHAR(5) DEFAULT '00000'; DECLARE V_CODE INTEGER DEFAULT 0; "
+    "DECLARE V_MSG VARCHAR(2000) DEFAULT ''; "
+    "BEGIN DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET V_CODE = 0; EXECUTE IMMEDIATE P_DROP; END; "
+    "BEGIN DECLARE EXIT HANDLER FOR SQLEXCEPTION GET DIAGNOSTICS CONDITION 1 "
+    "V_STATE = RETURNED_SQLSTATE, V_CODE = DB2_RETURNED_SQLCODE, V_MSG = MESSAGE_TEXT; "
+    "EXECUTE IMMEDIATE P_SQL; END; "
+    f"INSERT INTO {SCHEMA}/RESULTS (R_PROBE, R_STEP, R_STATE, R_CODE, R_MSG) "
+    "VALUES (P_PROBE, 'create', V_STATE, V_CODE, V_MSG) WITH NC; END"
+)
 
 
 HEADER = """\
@@ -371,13 +444,18 @@ def build_script(defs: dict) -> str:
         "so a procedure Db2 for i refuses is a result, not a stop."
     )
     out.append("")
+    if any(p.get("naming") == "*SYS" for p in procs.values()):
+        out += comment_block("RUN_DDL_SYS: RUN_DDL with SET OPTION NAMING = *SYS.")
+        out += create_block("HELPER:RUN_DDL_SYS", f"DROP PROCEDURE {SCHEMA}.RUN_DDL_SYS", RUN_DDL_SYS, "RUN_DDL")
     for name, p in procs.items():
         users = ", ".join(pr["id"] for pr in probes if pr.get("procedure") == name)
         out += comment_block(f"P_{name} (probes {users})")
-        out += comment_block(f"  SET OPTION COMMIT = {p['commit']}" if p.get("commit") else "  no SET OPTION: options of the creating interface")
+        out += comment_block(f"  {set_option(p)}" if set_option(p) else "  no SET OPTION: options of the creating interface")
+        if p.get("naming"):
+            out += comment_block(f"  created under {p['naming']} naming (through RUN_DDL_SYS)")
         for raw in p["body"].strip().splitlines():
             out.append(("-- | " + raw.rstrip()).rstrip())
-        drop = f"DROP PROCEDURE {SCHEMA}.P_{name}"
+        drop = f"DROP PROCEDURE {SCHEMA}{qualifier(p)}P_{name}"
         if p.get("top_level"):
             # Created by the interface itself, so the routine takes its options.
             out += [
@@ -410,17 +488,7 @@ def build_script(defs: dict) -> str:
                 "",
             ]
             continue
-        out += ["BEGIN", "  DECLARE V_SQL VARCHAR(16000);"]
-        out.append("  SET V_SQL =")
-        for i, piece in enumerate(sql_literal_pieces(create_text(p), WIDTH - 8)):
-            out.append(("    || " if i else "       ") + piece)
-        out[-1] += ";"
-        out += [
-            f"  CALL {SCHEMA}.RUN_DDL('PROC:{name}',",
-            f"    '{drop}', V_SQL);",
-            "END;",
-            "",
-        ]
+        out += create_block(f"PROC:{name}", drop, create_text(p), "RUN_DDL_SYS" if p.get("naming") else "RUN_DDL")
     out += commit_block()
 
     out += comment_block("3. Run the probes.")
@@ -494,6 +562,10 @@ def matches(pattern: str, value) -> bool:
         return False
     if pattern.startswith("contains:"):
         return pattern[len("contains:"):] in str(value)
+    if pattern.startswith("prefix:"):
+        return str(value).startswith(pattern[len("prefix:"):])
+    if pattern.startswith("regex:"):
+        return re.fullmatch(pattern[len("regex:"):], str(value)) is not None
     if pattern.startswith("!"):
         return str(value) != pattern[1:]
     m = re.fullmatch(r"(>=|<=|=|>|<)(-?\d+)", pattern)

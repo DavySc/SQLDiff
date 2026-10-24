@@ -49,6 +49,15 @@ through `RUNSQLSTM ... NAMING(*SQL)` should also work, but `RUNSQLSTM` cannot sh
 the final `SELECT`; run that one statement in Run SQL Scripts afterwards. This has
 not been tried.
 
+The V25 probes read each probe procedure's USRPRF, DYNUSRPRF and naming from
+`QSYS2.PROGRAM_INFO`: the attributes Db2 for i gave it, not yet a check that
+the authority really applies. To check the behaviour as well (optional; it
+needs a user profile with no authority to `SQLDFPROBE.T`): grant that user
+`*EXECUTE` on the library `SQLDFPROBE` and on its four `P_V25*` programs, sign on as that user, run
+`CALL SQLDFPROBE.P_V25SQL(?, ?, ?, ?, ?)` (and the same for `P_V25SYS`,
+`P_V25USR`, `P_V25OWN`), and note the fourth output (`O_N2`) of each: 0 means
+the read of `SQLDFPROBE.T` was allowed, 1 that it was refused. Say in your submission whether you did this.
+
 The result lines contain SQLSTATEs, SQLCODEs, counts, Db2 messages about
 `SQLDFPROBE` objects, the IBM i release and PTF group levels. No system name, user
 name or business data. Look through the file before you send it anyway.
