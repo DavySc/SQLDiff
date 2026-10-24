@@ -2396,11 +2396,13 @@ fn header_change(
             assumptions,
         });
     }
-    // A decimal parameter whose precision grows at the same scale: a value
-    // that fits only the wider type fails the call in A.
+    // A T-SQL decimal parameter whose precision grows at the same scale: a
+    // value that fits only the wider type fails the call on the narrower
+    // side. (PostgreSQL ignores the precision of a parameter's type.)
     if let (Some(a), Some(b)) = (x.ty, y.ty) {
         use super::schema::Fam;
-        if a.fam == Fam::Exact
+        if d == Dialect::Tsql
+            && a.fam == Fam::Exact
             && b.fam == Fam::Exact
             && a.scale == b.scale
             && x.default == y.default
@@ -2953,7 +2955,9 @@ fn observable(
                         let mut certain = false;
                         for (i, t) in targets.iter().enumerate() {
                             let differs = match (x.get(i), y.get(i)) {
-                                (Some(Some(p)), Some(Some(q))) => eval::same(p, q) == Some(false),
+                                (Some(Some(p)), Some(Some(q))) => {
+                                    eval::same_nn(p, q, &f.nonnull) == Some(false)
+                                }
                                 (Some(p), Some(q)) => p.is_some() != q.is_some(),
                                 _ => false,
                             };

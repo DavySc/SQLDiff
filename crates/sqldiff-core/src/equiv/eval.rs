@@ -37,7 +37,8 @@ pub enum V {
     /// A value of a type the evaluator does not know; values are ordered.
     Gen(u8),
     /// The result of a deterministic subexpression it does not model,
-    /// identified by function and argument values. Never NULL.
+    /// identified by function and argument values. It may stand for NULL
+    /// or an error, so it is never known to differ from either.
     Opq(usize),
     /// Some value of the same type that differs from opaque value `k`.
     Ne(usize),
@@ -445,6 +446,8 @@ pub struct Ctx<'s> {
     pub values: Vec<Option<V>>,
     /// Opaque values by identity.
     pub opaque: Vec<String>,
+    /// Opaque values known never to be NULL or an error.
+    pub nonnull: Vec<bool>,
     opaque_ids: HashMap<String, usize>,
     /// Side tag mixed into nondeterministic opaque values (A and B never agree).
     pub side: u8,
@@ -485,6 +488,7 @@ impl<'s> Ctx<'s> {
             index: HashMap::new(),
             values: Vec::new(),
             opaque: Vec::new(),
+            nonnull: Vec::new(),
             opaque_ids: HashMap::new(),
             side: 0,
             nondeterministic: false,
@@ -526,12 +530,13 @@ impl<'s> Ctx<'s> {
         Err(Stop::Need(i))
     }
 
-    fn opaque_value(&mut self, id: String, show: String) -> V {
+    fn opaque_value(&mut self, id: String, show: String, nonnull: bool) -> V {
         if let Some(&i) = self.opaque_ids.get(&id) {
             return V::Opq(i);
         }
         let i = self.opaque.len();
         self.opaque.push(show);
+        self.nonnull.push(nonnull);
         self.opaque_ids.insert(id, i);
         V::Opq(i)
     }
@@ -1093,8 +1098,23 @@ fn cmp_vals(a: &V, b: &V) -> Option<std::cmp::Ordering> {
 
 /// Whether two values are the same for an observer (NULL equals NULL).
 pub fn same(a: &V, b: &V) -> Option<bool> {
+    same_nn(a, b, &[])
+}
+
+/// [`same`], where `nonnull[k]` says opaque value `k` is known not to be
+/// NULL or an error.
+pub fn same_nn(a: &V, b: &V, nonnull: &[bool]) -> Option<bool> {
+    let known = |k: &usize| nonnull.get(*k).copied().unwrap_or(false);
     match (a, b) {
         (V::Null, V::Null) => Some(true),
+        // An unmodelled function may return NULL or fail for the same
+        // arguments, so its result is not known to differ from either,
+        // unless that function never does.
+        (V::Null | V::Err(_), V::Opq(k)) | (V::Opq(k), V::Null | V::Err(_)) if known(k) => {
+            Some(false)
+        }
+        (V::Null | V::Err(_), V::Opq(_) | V::Ne(_))
+        | (V::Opq(_) | V::Ne(_), V::Null | V::Err(_)) => None,
         (V::Null, _) | (_, V::Null) => Some(false),
         (V::Err(_), V::Err(_)) => Some(true),
         (V::Err(_), _) | (_, V::Err(_)) => Some(false),
@@ -1221,6 +1241,15 @@ impl Ctx<'_> {
                 if let V::Err(e) = v {
                     return Ok(V::Err(e));
                 }
+                // Whether an unmodelled function returns NULL is not known.
+                if let V::Opq(k) = v {
+                    if self.nonnull.get(k).copied().unwrap_or(false) {
+                        return Ok(V::Bool(*neg));
+                    }
+                }
+                if matches!(v, V::Opq(_) | V::Ne(_)) {
+                    return rej();
+                }
                 Ok(V::Bool(v.is_null() != *neg))
             }
             Expr::InList(x, list, neg) => {
@@ -1330,7 +1359,8 @@ impl Ctx<'_> {
     fn nondet(&mut self, what: &str) -> V {
         self.nondeterministic = true;
         let id = format!("{}#{}", what, self.side);
-        self.opaque_value(id, what.to_string())
+        // Clocks and NEWID() always return a value.
+        self.opaque_value(id, what.to_string(), true)
     }
 
     fn bin(&mut self, op: &str, l: &Expr, r: &Expr, scopes: &[Scope], g: Option<&Group>) -> R<V> {
@@ -1640,7 +1670,29 @@ impl Ctx<'_> {
         let show_args: Vec<String> = args.iter().map(|a| a.show(&self.opaque)).collect();
         let id = format!("{name}({:?})", args);
         let show = format!("{}({})", name.to_lowercase(), show_args.join(", "));
-        Ok(self.opaque_value(id, show))
+        let nonnull = self.never_null(name, &args);
+        Ok(self.opaque_value(id, show, nonnull))
+    }
+
+    /// Functions that return a value for any arguments of these values
+    /// (checked on PostgreSQL 18 and SQL Server 2022).
+    fn never_null(&self, name: &str, args: &[V]) -> bool {
+        let given = |i: usize| {
+            args.get(i).is_some_and(|a| {
+                !matches!(a, V::Null | V::Ne(_))
+                    && !matches!(a, V::Opq(k) if !self.nonnull.get(*k).copied().unwrap_or(false))
+            })
+        };
+        match (self.d, name.to_uppercase().as_str()) {
+            // format(NULL) is NULL; NULL arguments format as ''.
+            (Dialect::Postgres, "FORMAT") => given(0),
+            // An unknown role id gives 'unknown (OID=n)'.
+            (Dialect::Postgres, "PG_GET_USERBYID") => given(0),
+            (Dialect::Postgres, "QUOTE_IDENT" | "QUOTE_LITERAL") => given(0),
+            // An aggregate over one value that is not NULL.
+            (_, "STRING_AGG" | "ARRAY_AGG") => given(0),
+            _ => false,
+        }
     }
 
     fn call(&mut self, c: &Call, scopes: &[Scope], g: Option<&Group>) -> R<V> {
@@ -2155,6 +2207,13 @@ impl Ctx<'_> {
             let v = self.expr(arg, &sc, None)?;
             if let V::Err(e) = v {
                 return Ok(V::Err(e));
+            }
+            // Aggregates skip NULLs: an unmodelled value that may be NULL
+            // leaves the count of values unknown.
+            if let V::Opq(k) = v {
+                if !self.nonnull.get(k).copied().unwrap_or(false) {
+                    return rej();
+                }
             }
             if !v.is_null() {
                 vals.push(v);
@@ -3173,7 +3232,7 @@ fn from_names(f: &From) -> Vec<(Vec<String>, Option<String>)> {
 /// different states. Columns are matched by name, so `SET a = 1, b = 2` and
 /// `SET b = 2, a = 1` agree, and a column one side sets to the value it
 /// already has is no change.
-fn writes_differ(x: &[Write], y: &[Write]) -> Option<bool> {
+fn writes_differ(x: &[Write], y: &[Write], nonnull: &[bool]) -> Option<bool> {
     let deletes = |w: &[Write]| w.iter().all(|r| r.1.is_empty());
     if deletes(x) && deletes(y) {
         let xi: Vec<usize> = x.iter().map(|w| w.0).collect();
@@ -3205,7 +3264,7 @@ fn writes_differ(x: &[Write], y: &[Write]) -> Option<bool> {
                 .expect("column is set on one side");
             let ax = wx.iter().find(|c| c.0 == col).map_or(old, |c| &c.1);
             let ay = wy.iter().find(|c| c.0 == col).map_or(old, |c| &c.1);
-            match same(ax, ay) {
+            match same_nn(ax, ay, nonnull) {
                 Some(true) => {}
                 Some(false) => return Some(true),
                 None => unknown = true,
@@ -3223,12 +3282,22 @@ fn writes_differ(x: &[Write], y: &[Write]) -> Option<bool> {
 /// a column only one side names gets that table's default on the other
 /// side, which is not known, so then only the common columns can show a
 /// difference.
-fn inserts_differ(cx: &[String], x: &[Vec<V>], cy: &[String], y: &[Vec<V>]) -> Option<bool> {
+fn inserts_differ(
+    cx: &[String],
+    x: &[Vec<V>],
+    cy: &[String],
+    y: &[Vec<V>],
+    nonnull: &[bool],
+) -> Option<bool> {
     if x.len() != y.len() {
         return Some(true);
     }
     if cx == cy {
-        return differ(&Obs::Rows(x.to_vec(), false), &Obs::Rows(y.to_vec(), false));
+        return differ(
+            &Obs::Rows(x.to_vec(), false),
+            &Obs::Rows(y.to_vec(), false),
+            nonnull,
+        );
     }
     if cx.is_empty() || cy.is_empty() {
         return None;
@@ -3248,6 +3317,7 @@ fn inserts_differ(cx: &[String], x: &[Vec<V>], cy: &[String], y: &[Vec<V>]) -> O
     match differ(
         &Obs::Rows(project(cx, x), false),
         &Obs::Rows(project(cy, y), false),
+        nonnull,
     ) {
         Some(false) if !same_cols => None,
         r => r,
@@ -3255,12 +3325,16 @@ fn inserts_differ(cx: &[String], x: &[Vec<V>], cy: &[String], y: &[Vec<V>]) -> O
 }
 
 fn rows_same(a: &[V], b: &[V]) -> Option<bool> {
+    rows_same_nn(a, b, &[])
+}
+
+fn rows_same_nn(a: &[V], b: &[V], nonnull: &[bool]) -> Option<bool> {
     if a.len() != b.len() {
         return Some(false);
     }
     let mut all = true;
     for (x, y) in a.iter().zip(b) {
-        match same(x, y) {
+        match same_nn(x, y, nonnull) {
             Some(true) => {}
             Some(false) => return Some(false),
             None => all = false,
@@ -3275,18 +3349,18 @@ fn rows_same(a: &[V], b: &[V]) -> Option<bool> {
 
 /// Whether two observations certainly differ (Some(true)), certainly agree
 /// (Some(false)) or cannot be told apart (None).
-pub fn differ(a: &Obs, b: &Obs) -> Option<bool> {
+pub fn differ(a: &Obs, b: &Obs, nonnull: &[bool]) -> Option<bool> {
     match (a, b) {
         (Obs::Error(_), Obs::Error(_)) => Some(false),
         (Obs::Error(_), _) | (_, Obs::Error(_)) => Some(true),
-        (Obs::Value(x), Obs::Value(y)) => same(x, y).map(|s| !s),
+        (Obs::Value(x), Obs::Value(y)) => same_nn(x, y, nonnull).map(|s| !s),
         (Obs::Branch(x), Obs::Branch(y)) => Some(x != y),
         (Obs::Assigned(x), Obs::Assigned(y)) => {
             let mut unknown = false;
             for (p, q) in x.iter().zip(y) {
                 match (p, q) {
                     (None, None) => {}
-                    (Some(p), Some(q)) => match same(p, q) {
+                    (Some(p), Some(q)) => match same_nn(p, q, nonnull) {
                         Some(true) => {}
                         Some(false) => return Some(true),
                         None => unknown = true,
@@ -3301,8 +3375,8 @@ pub fn differ(a: &Obs, b: &Obs) -> Option<bool> {
                 Some(false)
             }
         }
-        (Obs::Writes(x), Obs::Writes(y)) => writes_differ(x, y),
-        (Obs::Inserted(cx, x), Obs::Inserted(cy, y)) => inserts_differ(cx, x, cy, y),
+        (Obs::Writes(x), Obs::Writes(y)) => writes_differ(x, y, nonnull),
+        (Obs::Inserted(cx, x), Obs::Inserted(cy, y)) => inserts_differ(cx, x, cy, y, nonnull),
         (Obs::Rows(x, ox), Obs::Rows(y, oy)) => {
             if x.len() != y.len() {
                 return Some(true);
@@ -3310,7 +3384,7 @@ pub fn differ(a: &Obs, b: &Obs) -> Option<bool> {
             if *ox && *oy {
                 let mut unknown = false;
                 for (p, q) in x.iter().zip(y) {
-                    match rows_same(p, q) {
+                    match rows_same_nn(p, q, nonnull) {
                         Some(true) => {}
                         Some(false) => return Some(true),
                         None => unknown = true,
@@ -3326,7 +3400,7 @@ pub fn differ(a: &Obs, b: &Obs) -> Option<bool> {
                     if used[j] {
                         continue;
                     }
-                    match rows_same(p, q) {
+                    match rows_same_nn(p, q, nonnull) {
                         Some(true) => {
                             used[j] = true;
                             found = true;
@@ -3786,6 +3860,8 @@ pub struct Found {
     /// Some input is a local value whose occurrence is assumed.
     pub assumed: bool,
     pub opaque: Vec<String>,
+    /// Opaque values known never to be NULL or an error.
+    pub nonnull: Vec<bool>,
     pub shape: HashMap<String, usize>,
     /// Some guard on the way to the statement could not be evaluated.
     pub unreached: bool,
@@ -3915,7 +3991,7 @@ fn dfs(
     }
     let need = match (&ra, &rb) {
         (Ok(x), Ok(y)) => {
-            return Ok(match differ(x, y) {
+            return Ok(match differ(x, y, &c.nonnull) {
                 Some(true) => Some(Found {
                     inputs: c
                         .inputs
@@ -3931,6 +4007,7 @@ fn dfs(
                         .zip(&c.values)
                         .any(|(i, v)| v.is_some() && i.origin == Origin::Assumed),
                     opaque: c.opaque.clone(),
+                    nonnull: c.nonnull.clone(),
                     shape: HashMap::new(),
                     unreached: c.guard_skipped,
                 }),

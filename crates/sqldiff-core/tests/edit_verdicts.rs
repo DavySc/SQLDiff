@@ -297,3 +297,77 @@ fn update_witness_names_the_columns() {
     let w = edit_witness(&r);
     assert!(w.contains("price = 1") && w.contains("price = 2"), "{w}");
 }
+
+#[test]
+fn unmodelled_function_may_return_null() {
+    // IIF is not modelled: its result may be NULL, as CASE's is.
+    let p = |e: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.flag @x int AS
+             BEGIN
+               SELECT {e} AS flag;
+             END"
+        )
+    };
+    let r = run(
+        &p("IIF(@x > 0, 1, NULL)"),
+        &p("CASE WHEN @x > 0 THEN 1 END"),
+        T,
+    );
+    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    // A function the evaluator does not know against a NULL: either may hold.
+    let r = run(&p("SOUNDEX(N'x')"), &p("NULL"), T);
+    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+}
+
+fn decimal_param(d: Dialect, precision: u32) -> String {
+    if d == T {
+        format!(
+            "CREATE PROCEDURE dbo.set_price @id int, @p decimal({precision},2) AS
+             BEGIN
+               UPDATE dbo.item SET price = @p WHERE item_id = @id;
+             END"
+        )
+    } else {
+        format!(
+            "CREATE FUNCTION set_price(p_id integer, p_p numeric({precision},2)) RETURNS void
+             LANGUAGE plpgsql AS $$
+             BEGIN
+               UPDATE item SET price = p_p WHERE item_id = p_id;
+             END; $$;"
+        )
+    }
+}
+
+#[test]
+fn decimal_parameter_precision_only_matters_in_tsql() {
+    // SQL Server rejects an argument that overflows decimal(p,s) (checked on
+    // SQL Server 2022); PostgreSQL ignores a parameter's typmod.
+    let r = run(&decimal_param(T, 8), &decimal_param(T, 10), T);
+    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    let r = run(&decimal_param(P, 8), &decimal_param(P, 10), P);
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.witness.contains("arithmetic overflow")),
+        "{:#?}",
+        r.findings
+    );
+}
+
+#[test]
+fn functions_that_never_return_null_still_differ_from_null() {
+    // format() with a format string returns text even for NULL arguments
+    // (checked on PostgreSQL 18), so it is told apart from NULL.
+    let f = |e: &str| {
+        format!(
+            "CREATE FUNCTION labels() RETURNS TABLE (item_id integer, label text)
+             LANGUAGE sql STABLE AS $$
+               SELECT item_id, {e} FROM item WHERE price > 0 ORDER BY item_id;
+             $$;"
+        )
+    };
+    let r = run(&f("format('item %s', name)"), &f("NULL::text"), P);
+    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert!(edit_witness(&r).contains("format("), "{}", edit_witness(&r));
+}
