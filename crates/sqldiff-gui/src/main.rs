@@ -15,6 +15,7 @@ use sqldiff_gui::convert;
 use sqldiff_gui::review::Store;
 use sqldiff_gui::server::serve_with_hosts;
 use sqldiff_gui::session::{Origin, Session, TemplateMode};
+use sqldiff_source::compose::Placeholders;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::Resolved;
 
@@ -97,6 +98,24 @@ enum Command {
         /// Print the conversion and the unit badges instead of serving the page.
         #[arg(long)]
         stdout: bool,
+        /// The input is a template: placeholders and special forms follow the
+        /// `[template]` syntax of the loaded packs or config, and are kept in
+        /// the output.
+        #[arg(long)]
+        template: bool,
+        /// A template parameter name (repeatable): only listed names are
+        /// placeholders, as with `sqldiff diff --template --parameter`.
+        #[arg(long = "parameter", value_name = "NAME", requires = "template")]
+        parameters: Vec<String>,
+        /// Load a pack for --template (directory with pack.toml, or a .toml file). Repeatable.
+        #[arg(long = "pack", value_name = "PATH", requires = "template")]
+        packs: Vec<PathBuf>,
+        /// Project config file for --template (default: sqldiff.toml here or in a parent directory).
+        #[arg(long, value_name = "FILE", requires = "template")]
+        config: Option<PathBuf>,
+        /// Ignore project and user config files not named on the command line.
+        #[arg(long, requires = "template")]
+        isolated: bool,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(short, long, default_value_t = 7879)]
@@ -216,6 +235,11 @@ fn run(cli: Cli) -> Result<(), String> {
             from,
             to,
             stdout,
+            template,
+            parameters,
+            packs,
+            config: project,
+            isolated,
             host,
             port,
             allow_hosts,
@@ -227,9 +251,30 @@ fn run(cli: Cli) -> Result<(), String> {
                 ),
                 None => (String::new(), convert::SAMPLE.to_string()),
             };
+            let template = if template {
+                let cfg = Resolved::load(&Sources {
+                    project,
+                    user: None,
+                    isolated,
+                    cwd: None,
+                    packs,
+                    cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+                })
+                .map_err(|e| e.0)?;
+                let def = cfg.policy.template.as_ref().ok_or(
+                    "--template needs a [template] syntax: give --pack or a sqldiff.toml with one",
+                )?;
+                Some(convert::TemplateSetup {
+                    placeholders: Placeholders::new(def).map_err(|e| e.0)?,
+                    parameters: (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                })
+            } else {
+                None
+            };
             let setup = convert::Setup {
                 from,
                 to,
+                template,
                 text,
                 name,
             };

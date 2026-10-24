@@ -26,6 +26,16 @@ Before a statement is commented out, it goes to the idiom rules (`sqldiff_core::
 
 Two limits keep this honest. Statements the token rules already convert keep their conversion (a plain `IF EXISTS … UPDATE … ELSE INSERT` stays an `IF`, with the race intact, rather than becoming an atomic `ON CONFLICT`). And a statement refused because of where it stands (a result set in a procedure, `COMMIT` inside a TRY block) is never handed to the rules, which see statements out of context. The rules never check themselves: their output goes through the same engine diff as everything else.
 
+## Templates
+
+`sqldiff-gui convert FILE --template --pack PACK` converts a generator template. The placeholders and special forms follow the pack's `[template]` syntax and the same placeholder rules as `sqldiff diff --template` ([templates-and-composition.md](templates-and-composition.md)); `--parameter NAME` (repeatable) lists the parameter names when the delimiters could also be SQL (`[...]` in T-SQL), so only those names are placeholders.
+
+The template's fragment (placeholders as `TPL_<NAME>` identifiers, special forms as comments) is converted and checked like any input, then the placeholders and special forms go back into the output as the template writes them, so the right pane is a PostgreSQL template for the same generator. Badges and spans point into the template. Each unit with a placeholder carries `ASM-TEMPLATE-PLACEHOLDER`: the placeholder was converted as a name, so every value the generator fills in must be a name PostgreSQL accepts there. A placeholder the rules renamed beyond recognition is flagged on its unit (`template.placeholder-lost`, differs), and a directive that did not survive in order is flagged too; neither is put back by guess. The header shows how many placeholders the template has.
+
+```sh
+sqldiff-gui convert docs/examples/templates/save-entity.tpl.sql --template --pack docs/examples/pack --isolated
+```
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.

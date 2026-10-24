@@ -54,6 +54,7 @@ target/release/sqldiff-gui export --report report.json -o pair.html   # static, 
 # Convert mode: type T-SQL on the left, checked PostgreSQL appears on the right as you type
 target/release/sqldiff-gui convert                       # starts with a sample
 target/release/sqldiff-gui convert my_proc.sql --stdout  # print the conversion and per-statement badges
+target/release/sqldiff-gui convert proc.tpl.sql --template --pack my-pack  # a generator template: placeholders kept
 ```
 
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
