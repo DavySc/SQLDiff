@@ -47,7 +47,7 @@ pub fn decide(
     b: &Analyzed,
     sa: &Schema,
     sb: &Schema,
-    findings: &mut Vec<Finding>,
+    findings: &mut [Finding],
     out: &mut Outcome,
 ) {
     if !findings.iter().any(candidate) {
@@ -148,6 +148,9 @@ struct Routine<'x, 'a> {
     toks: Vec<Tok>,
     /// T-SQL procedure or script (a bare SELECT returns a result set).
     result_sets: bool,
+    /// PostgreSQL `LANGUAGE sql` function returning a set: the rows of its
+    /// last statement are the result.
+    sql_set_result: bool,
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -179,6 +182,24 @@ impl<'x, 'a> Routine<'x, 'a> {
                         .iter()
                         .any(|t| t.text().eq_ignore_ascii_case("STRICT"))
                 });
+        let sql_set_result = d == Dialect::Postgres
+            && side
+                .root
+                .descendants()
+                .find(|n| n.kind() == SyntaxKind::ROUTINE)
+                .is_some_and(|r| {
+                    let words: Vec<String> = cst::header_tokens(&r)
+                        .iter()
+                        .filter(|t| cst::is_significant(t.kind()))
+                        .map(|t| t.text().to_ascii_uppercase())
+                        .collect();
+                    let pair = |a: &str, b: &[&str]| {
+                        words
+                            .windows(2)
+                            .any(|w| w[0] == a && b.contains(&w[1].as_str()))
+                    };
+                    pair("LANGUAGE", &["SQL", "'SQL'"]) && pair("RETURNS", &["TABLE", "SETOF"])
+                });
         let mut r = Routine {
             side,
             d,
@@ -191,6 +212,7 @@ impl<'x, 'a> Routine<'x, 'a> {
             toks: tokens(&side.root),
             result_sets: d == Dialect::Tsql
                 && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
+            sql_set_result,
         };
         r.scan();
         r
@@ -1082,6 +1104,46 @@ impl<'x, 'a> Routine<'x, 'a> {
         }
     }
 
+    /// Lines in the routine body that read variable `name` for its value:
+    /// any mention but an assignment target and an `IS [NOT] NULL` test.
+    fn value_reads(&self, name: &str) -> Vec<usize> {
+        let Some(body) = self
+            .side
+            .root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::ROUTINE_BODY)
+        else {
+            return Vec::new();
+        };
+        let toks = tokens(&body);
+        let mut lines = Vec::new();
+        for (i, t) in toks.iter().enumerate() {
+            let hit = match t.kind {
+                K::Var => t.text.trim_start_matches('@').eq_ignore_ascii_case(name),
+                _ => false,
+            };
+            if !hit {
+                continue;
+            }
+            let next = |k: usize| toks.get(i + k).map(|t| t.up.as_str()).unwrap_or("");
+            let prev = i.checked_sub(1).map(|j| toks[j].up.as_str()).unwrap_or("");
+            let null_test =
+                next(1) == "IS" && (next(2) == "NULL" || next(2) == "NOT" && next(3) == "NULL");
+            let target = matches!(prev, "SET" | "SELECT" | ",")
+                && toks
+                    .get(i + 1)
+                    .is_some_and(|n| n.kind == K::Op && n.text == "=");
+            if null_test || target {
+                continue;
+            }
+            let line = self.side.lines.line_col(t.off).0;
+            if !lines.contains(&line) {
+                lines.push(line);
+            }
+        }
+        lines
+    }
+
     fn mentions(&self, name: &str, n: &SyntaxNode) -> bool {
         tokens(n).iter().any(|t| match t.kind {
             K::Var => t.text.trim_start_matches('@').eq_ignore_ascii_case(name),
@@ -1124,7 +1186,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                     && !t.iter().any(|x| x.up == "FROM")
                     && count == 1
                     && t.iter()
-                        .position(|x| is(x))
+                        .position(&is)
                         .is_some_and(|i| t.get(i + 1).is_some_and(|y| y.text == "="))
                 {
                     return Scan::Overwritten;
@@ -1134,7 +1196,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                 if self.d == Dialect::Tsql
                     && t.first().is_some_and(|x| x.up == "SELECT")
                     && count == 1
-                    && t.iter().position(|x| is(x)).is_some_and(|i| {
+                    && t.iter().position(&is).is_some_and(|i| {
                         t.get(i + 1).is_some_and(|y| y.text == "=")
                             && (i == 1 || t[i - 1].kind == K::Comma)
                     })
@@ -1143,7 +1205,7 @@ impl<'x, 'a> Routine<'x, 'a> {
                 }
                 // INTO targets: PL/pgSQL SELECT INTO always assigns, FETCH INTO may not.
                 if count == 1 {
-                    if let Some(i) = t.iter().position(|x| is(x)) {
+                    if let Some(i) = t.iter().position(&is) {
                         let mut j = i;
                         while j >= 2 && t[j - 1].kind == K::Comma {
                             j -= 2;
@@ -1269,6 +1331,35 @@ fn invalid(t: &[Tok], d: Dialect, header: bool) -> Option<String> {
             && cmp_at(i + 2)
         {
             return bad(i + 2, "SET");
+        }
+    }
+    // Option lists hold `name = value` pairs, never comparisons:
+    // `WITH (FILLFACTOR = 80)`, `OPTION (LABEL = '...')`, `SET (SYSTEM_VERSIONING
+    // = ON (HISTORY_TABLE = ...))`, `MASKED WITH (FUNCTION = 'default()')`.
+    let mut options: Vec<bool> = Vec::new();
+    for i in 0..t.len() {
+        match t[i].kind {
+            K::LParen => {
+                let prev = i.checked_sub(1).map(|j| &t[j]);
+                let opens = prev.is_some_and(|p| {
+                    p.kind == K::Word
+                        && (matches!(p.up.as_str(), "WITH" | "OPTION" | "SET")
+                            || p.up == "ON" && options.last() == Some(&true))
+                });
+                options.push(opens);
+            }
+            K::RParen => {
+                options.pop();
+            }
+            _ if options.last() == Some(&true)
+                && is_cmp(&t[i])
+                && i >= 2
+                && matches!(t[i - 1].kind, K::Word)
+                && matches!(t[i - 2].kind, K::LParen | K::Comma) =>
+            {
+                return bad(i, "an option setting");
+            }
+            _ => {}
         }
     }
     let mut depth = 0i32;
@@ -1435,8 +1526,8 @@ fn select_list_comparison(t: &[Tok]) -> Option<String> {
         }
         let mut depth = 0i32;
         let mut case = 0i32;
-        for k in s + 1..t.len() {
-            match t[k].kind {
+        for tk in t.iter().skip(s + 1) {
+            match tk.kind {
                 K::LParen => depth += 1,
                 K::RParen => {
                     depth -= 1;
@@ -1445,7 +1536,7 @@ fn select_list_comparison(t: &[Tok]) -> Option<String> {
                     }
                 }
                 K::Semi => break,
-                K::Word if depth == 0 => match t[k].up.as_str() {
+                K::Word if depth == 0 => match tk.up.as_str() {
                     "CASE" => case += 1,
                     "END" => case -= 1,
                     "FROM" | "INTO" | "WHERE" | "GROUP" | "ORDER" | "UNION" | "EXCEPT"
@@ -1454,10 +1545,10 @@ fn select_list_comparison(t: &[Tok]) -> Option<String> {
                 },
                 _ => {}
             }
-            if depth == 0 && case == 0 && is_cmp(&t[k]) {
+            if depth == 0 && case == 0 && is_cmp(tk) {
                 return Some(format!(
                     "`{}` directly in a select list (T-SQL has no boolean values)",
-                    t[k].text
+                    tk.text
                 ));
             }
         }
@@ -1890,6 +1981,7 @@ fn class_of(v: &V) -> Class {
 struct Hints<'f> {
     map: HashMap<String, Hint>,
     facts: &'f HashMap<String, VarFact>,
+    schema: &'f Schema,
     d: Dialect,
 }
 
@@ -1912,8 +2004,28 @@ impl Hints<'_> {
 
     fn typed_class(&self, e: &Expr) -> Option<Class> {
         let n = self.key(e)?;
-        let ty = self.facts.get(n.strip_prefix('@')?)?.ty?;
+        let ty = match n.strip_prefix('@') {
+            Some(v) => self.facts.get(v)?.ty?,
+            // A column: its type, when every catalog table with a column of
+            // that name agrees on the class.
+            None => {
+                let Expr::Name(p) = e else { return None };
+                let col = p.last()?.to_lowercase();
+                let mut tys = self
+                    .schema
+                    .tables()
+                    .filter_map(|t| t.column(&col))
+                    .map(|c| c.ty);
+                let first = tys.next()?;
+                let class = |t: &super::schema::Ty| (t.fam, t.len == Some(1));
+                if !tys.all(|t| class(&t) == class(&first)) {
+                    return None;
+                }
+                first
+            }
+        };
         Some(match ty.fam {
+            super::schema::Fam::Int if ty.len == Some(1) => Class::Bit,
             super::schema::Fam::Int => Class::Int,
             super::schema::Fam::Exact | super::schema::Fam::Float => Class::Num,
             super::schema::Fam::Bool => Class::Bool,
@@ -1989,6 +2101,20 @@ impl Hints<'_> {
                     }
                     if c.args.len() >= 2 {
                         self.pair(&c.args[0], &c.args[1]);
+                    }
+                }
+                // A string that is split on a separator: try values with
+                // one and two separators, so that every part is non-empty
+                // for some candidate.
+                if name == "SPLIT_PART" && c.args.len() == 3 {
+                    if let (Some(n), Some(V::Str(sep))) =
+                        (self.key(&c.args[0]), lit_value(&c.args[1]))
+                    {
+                        if !sep.is_empty() {
+                            for v in [format!("x{sep}y"), format!("x{sep}y{sep}z")] {
+                                self.note(&n, Some(Class::Str), Some(V::Str(v)));
+                            }
+                        }
                     }
                 }
             }
@@ -2100,7 +2226,8 @@ fn examine(
     if na.kind() != nb.kind() {
         return Err("different kinds of statement".into());
     }
-    if let Some(dec) = validity(ra, rb, na, nb) {
+    learn_spelling(ra);
+    if let Some(dec) = validity(ra, rb, na, nb, sa) {
         return Ok(dec);
     }
     if na.kind() == SyntaxKind::ROUTINE {
@@ -2128,6 +2255,7 @@ fn examine(
     let mut hints = Hints {
         map: HashMap::new(),
         facts: &facts_a,
+        schema: sa,
         d,
     };
     hints.probe(&xa.probe);
@@ -2226,9 +2354,9 @@ fn header_change(
         return Err("routine headers are not compared".into());
     };
     let shown = if d == Dialect::Tsql {
-        format!("@{}", x.name)
+        format!("@{}", spell(&x.name))
     } else {
-        x.name.clone()
+        spell(&x.name)
     };
     if x.ty == y.ty && differing == 1 {
         let parse = |s: &Option<String>| -> Option<V> {
@@ -2302,6 +2430,48 @@ fn header_change(
             }
         }
     }
+    // A T-SQL string parameter of another length: SQL Server silently
+    // truncates an argument to the parameter's length, so a longer argument
+    // reaches the body cut short on the narrower side. (PostgreSQL ignores
+    // the length of a parameter's type.)
+    if let (Some(a), Some(b)) = (x.ty, y.ty) {
+        use super::schema::Fam;
+        if d == Dialect::Tsql
+            && a.fam == b.fam
+            && matches!(a.fam, Fam::VarChar | Fam::Char)
+            && x.default == y.default
+            && a.len != b.len
+        {
+            // None is MAX; the narrower length is known.
+            let narrow = match (a.len, b.len) {
+                (Some(p), Some(q)) => p.min(q),
+                (Some(p), None) | (None, Some(p)) => p,
+                _ => return Err("routine headers are not compared".into()),
+            };
+            let (cut, kept) = if a.len == Some(narrow) {
+                ("A", "B")
+            } else {
+                ("B", "A")
+            };
+            let reads = ra.value_reads(&x.name);
+            if reads.is_empty() {
+                return Err(format!("{shown} is not read for its value"));
+            }
+            let lines: Vec<String> = reads.iter().map(usize::to_string).collect();
+            return Ok(Decided {
+                witness: format!(
+                    "Passing {shown} with {} characters (A line {}, B line {}): {cut} truncates it to {narrow} characters and {kept} keeps all of them; {shown} is read at line{} {}.",
+                    narrow + 1,
+                    ra.side.line_of(na),
+                    rb.side.line_of(nb),
+                    if lines.len() > 1 { "s" } else { "" },
+                    lines.join(", ")
+                ),
+                // That the cut value then changes an effect is not traced.
+                assumptions: vec![witness_path().id],
+            });
+        }
+    }
     Err("routine headers are not compared".into())
 }
 
@@ -2324,7 +2494,13 @@ fn checked_tokens(n: &SyntaxNode) -> Vec<Vec<Tok>> {
 }
 
 /// One version certainly fails to be created at the changed unit and the other does not.
-fn validity(ra: &Routine, rb: &Routine, na: &SyntaxNode, nb: &SyntaxNode) -> Option<Decided> {
+fn validity(
+    ra: &Routine,
+    rb: &Routine,
+    na: &SyntaxNode,
+    nb: &SyntaxNode,
+    schema: &Schema,
+) -> Option<Decided> {
     let d = ra.d;
     let header = na.kind() == SyntaxKind::ROUTINE;
     let check = |n: &SyntaxNode| {
@@ -2344,7 +2520,11 @@ fn validity(ra: &Routine, rb: &Routine, na: &SyntaxNode, nb: &SyntaxNode) -> Opt
         (fo != fc && open != close && n.kind() == SyntaxKind::STATEMENT)
             .then(|| format!("{open} opening and {close} closing parentheses"))
     };
-    let check = |r: &Routine, n: &SyntaxNode| check(n).or_else(|| parens(r, n));
+    let check = |r: &Routine, n: &SyntaxNode| {
+        check(n)
+            .or_else(|| parens(r, n))
+            .or_else(|| type_error(r, n, schema))
+    };
     let lang = match d {
         Dialect::Tsql => "T-SQL",
         Dialect::Postgres => "PL/pgSQL",
@@ -2364,6 +2544,90 @@ fn validity(ra: &Routine, rb: &Routine, na: &SyntaxNode, nb: &SyntaxNode) -> Opt
     }
 }
 
+/// A T-SQL statement that SQL Server rejects when it compiles the routine:
+/// arithmetic other than `+` on two character strings ("The data types
+/// nvarchar and nvarchar are incompatible in the subtract operator"). A
+/// statement that reads a table may be compiled only when it runs (deferred
+/// name resolution), so only statements without tables, or reading `sys`
+/// catalog views alone, are judged.
+fn type_error(r: &Routine, n: &SyntaxNode, schema: &Schema) -> Option<String> {
+    if r.d != Dialect::Tsql {
+        return None;
+    }
+    let x = shape(n, r.d).ok()?;
+    if eval::probe_tables(&x.probe)
+        .iter()
+        .any(|t| !t.starts_with("sys."))
+    {
+        return None;
+    }
+    let mut roots: Vec<&Expr> = Vec::new();
+    // Tables by alias (or name), for the types of columns.
+    let mut tables: Vec<(String, String)> = Vec::new();
+    fn collect(f: &super::ast::From, out: &mut Vec<(String, String)>) {
+        match f {
+            super::ast::From::Table { name, alias, .. } => {
+                let key = eval::table_key(name);
+                let shown = alias
+                    .clone()
+                    .unwrap_or_else(|| name.last().cloned().unwrap_or_default())
+                    .to_lowercase();
+                out.push((shown, key));
+            }
+            super::ast::From::Join { left, right, .. } => {
+                collect(left, out);
+                collect(right, out);
+            }
+            _ => out.push((String::new(), String::new())),
+        }
+    }
+    if let Probe::Stmt(Stmt::Select(q)) = &x.probe {
+        for f in &q.from {
+            collect(f, &mut tables);
+        }
+    }
+    let col = |p: &[String]| -> Option<bool> {
+        let table = match p {
+            [c] if tables.len() == 1 => {
+                let t = schema.table(&tables[0].1)?;
+                return t.column(&c.to_lowercase()).map(|c| c.ty.is_string());
+            }
+            [a, _] => &tables.iter().find(|(s, _)| *s == a.to_lowercase())?.1,
+            _ => return None,
+        };
+        let c = p.last()?.to_lowercase();
+        schema.table(table)?.column(&c).map(|c| c.ty.is_string())
+    };
+    match &x.probe {
+        Probe::Conds(es) | Probe::Values(es) => roots.extend(es),
+        Probe::Stmt(Stmt::Assign(_, e)) | Probe::Stmt(Stmt::Return(Some(e))) => roots.push(e),
+        Probe::Stmt(Stmt::Declare {
+            default: Some(e), ..
+        }) => roots.push(e),
+        Probe::Stmt(Stmt::Select(q)) if q.set_ops.is_empty() && q.ctes.is_empty() => {
+            roots.extend(q.items.iter().map(|i| &i.expr));
+            roots.extend(q.where_.iter());
+        }
+        _ => return None,
+    }
+    let facts = r.facts(cst::sig_range(n).0, n);
+    let mut found = None;
+    for e in roots {
+        eval::walk_expr(e, &mut |x| {
+            if let Expr::Bin(op, a, b) = x {
+                if found.is_none()
+                    && matches!(op.as_str(), "-" | "*" | "/" | "%")
+                    && eval::static_string_with(a, &facts, r.d, &col) == Some(true)
+                    && eval::static_string_with(b, &facts, r.d, &col) == Some(true)
+                {
+                    found = Some(format!("`{op}` is applied to two character strings"));
+                }
+            }
+        });
+    }
+    found
+}
+
 fn what(x: &Shape, n: &SyntaxNode, d: Dialect) -> String {
     match x.kind {
         ShapeKind::If => "The IF condition".into(),
@@ -2378,27 +2642,74 @@ fn what(x: &Shape, n: &SyntaxNode, d: Dialect) -> String {
     }
 }
 
+thread_local! {
+    /// Original spelling of the names in the routine being examined, by
+    /// lower-cased name, so witnesses show `@MinPrice` rather than `@minprice`.
+    static SPELLING: std::cell::RefCell<HashMap<String, String>> = Default::default();
+}
+
+fn learn_spelling(r: &Routine) {
+    let mut map = HashMap::new();
+    for t in &r.toks {
+        let name = match t.kind {
+            K::Var => t.text.trim_start_matches('@').to_string(),
+            K::Word => t.text.clone(),
+            K::Quoted => cst::unquote(&t.text).to_string(),
+            _ => continue,
+        };
+        map.entry(name.to_lowercase()).or_insert(name);
+    }
+    SPELLING.with(|s| *s.borrow_mut() = map);
+}
+
+/// A lower-cased (possibly dotted) name in its original spelling.
+fn spell(name: &str) -> String {
+    SPELLING.with(|s| {
+        let s = s.borrow();
+        name.split('.')
+            .map(|p| {
+                let bare = p.trim_start_matches('@');
+                match s.get(bare) {
+                    Some(o) => format!("{}{o}", &p[..p.len() - bare.len()]),
+                    None => p.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(".")
+    })
+}
+
 fn describe_inputs(f: &Found, d: Dialect) -> String {
     let mut parts = Vec::new();
     let mut tables: Vec<(String, usize, Vec<String>)> = Vec::new();
     for (k, v) in &f.inputs {
         let shown = v.show(&f.opaque);
         match k {
+            Key::Var(n) if n.starts_with("@now:") => {
+                parts.push(format!("{}() returns {shown}", n[5..].to_uppercase()))
+            }
+            Key::Var(n) if n == "@@datefirst" => parts.push(format!("DATEFIRST is {shown}")),
+            Key::Var(n) if n.starts_with("@env:") => {
+                parts.push(format!("{} returns {shown}", &n[5..]))
+            }
             Key::Var(n) if n.starts_with('@') => {
                 parts.push(format!("@{} is {shown}", n.to_uppercase()))
             }
-            Key::Var(n) if d == Dialect::Tsql => parts.push(format!("@{n} is {shown}")),
-            Key::Var(n) => parts.push(format!("{n} is {shown}")),
-            Key::Field(r, c) => parts.push(format!("{r}.{c} is {shown}")),
-            Key::Col(t, row, c) => match tables.iter_mut().find(|(x, r, _)| x == t && r == row) {
-                Some(e) => e.2.push(format!("{c} = {shown}")),
-                None => tables.push((t.clone(), *row, vec![format!("{c} = {shown}")])),
-            },
+            Key::Var(n) if d == Dialect::Tsql => parts.push(format!("@{} is {shown}", spell(n))),
+            Key::Var(n) => parts.push(format!("{} is {shown}", spell(n))),
+            Key::Field(r, c) => parts.push(format!("{}.{} is {shown}", spell(r), spell(c))),
+            Key::Col(t, row, c) => {
+                let item = format!("{} = {shown}", spell(c));
+                match tables.iter_mut().find(|(x, r, _)| x == t && r == row) {
+                    Some(e) => e.2.push(item),
+                    None => tables.push((t.clone(), *row, vec![item])),
+                }
+            }
         }
     }
     for (t, n) in &f.shape {
         if *n == 0 {
-            parts.push(format!("{t} has no rows"));
+            parts.push(format!("{} has no rows", spell(t)));
         }
     }
     for (t, row, cols) in tables {
@@ -2408,7 +2719,11 @@ fn describe_inputs(f: &Found, d: Dialect) -> String {
         } else {
             String::new()
         };
-        parts.push(format!("{t} has a row{which} with {}", cols.join(", ")));
+        parts.push(format!(
+            "{} has a row{which} with {}",
+            spell(&t),
+            cols.join(", ")
+        ));
     }
     parts.join(", ")
 }
@@ -2459,6 +2774,11 @@ fn describe_obs(o: &Obs, opaque: &[String], kind: ShapeKind, branches: usize) ->
             0 => "changes no row".into(),
             1 => "changes the row".into(),
             n => format!("changes {n} rows"),
+        },
+        Obs::Inserted(_, rows) => match rows.len() {
+            0 => "inserts no row".into(),
+            1 => "inserts one row".into(),
+            n => format!("inserts {n} rows"),
         },
         Obs::Branch(b) => match (kind, b) {
             (ShapeKind::While, Some(_)) => "enters the loop".into(),
@@ -2610,7 +2930,6 @@ fn observable(
             let Probe::Stmt(s) = &xa.probe else {
                 return Err("unexpected probe".into());
             };
-            let kind = stmt_kind(na, d);
             let _ = nb;
             match s {
                 Stmt::Select(q) => {
@@ -2655,7 +2974,8 @@ fn observable(
                         return Ok((format!("{both} ({}).", live.join("; ")), certain));
                     }
                     if ra.result_sets
-                        || d != Dialect::Tsql && kind == StmtKind::Select && ra_is_query_result(na)
+                        || d != Dialect::Tsql && ra_is_query_result(na)
+                        || ra.sql_set_result && is_last_statement(&ra.side.root, na)
                     {
                         Ok((format!("{both} as its result set."), true))
                     } else {
@@ -2714,7 +3034,7 @@ fn observable(
                         _ => "deletes",
                     };
                     Ok((
-                        format!("{}.", write_effect(&f.a, &f.b, verb, &t, &f.opaque)),
+                        format!("{}.", write_effect(&f.a, &f.b, verb, &spell(&t), &f.opaque)),
                         true,
                     ))
                 }
@@ -2722,6 +3042,14 @@ fn observable(
             }
         }
     }
+}
+
+/// Whether no statement starts after `n` ends.
+fn is_last_statement(root: &SyntaxNode, n: &SyntaxNode) -> bool {
+    let end = cst::sig_range(n).1;
+    !root
+        .descendants()
+        .any(|m| m.kind() == SyntaxKind::STATEMENT && cst::sig_range(&m).0 >= end)
 }
 
 fn ra_is_query_result(n: &SyntaxNode) -> bool {
@@ -2739,22 +3067,63 @@ fn value_of(o: &Obs, opaque: &[String]) -> String {
 fn write_effect(a: &Obs, b: &Obs, verb: &str, table: &str, opaque: &[String]) -> String {
     match (a, b) {
         (Obs::Writes(x), Obs::Writes(y)) => {
-            let rows = |w: &Vec<(usize, Vec<V>)>| match w.len() {
+            let rows = |w: &Vec<eval::Write>| match w.len() {
                 0 => "no row".to_string(),
                 1 => "the row".to_string(),
                 n => format!("{n} rows"),
             };
-            if x.len() != y.len() || x.iter().map(|w| w.0).ne(y.iter().map(|w| w.0)) {
-                format!("A {verb} {} of {table} and B {verb} {}", rows(x), rows(y))
-            } else {
-                let vals = |w: &Vec<(usize, Vec<V>)>| {
-                    w.iter()
-                        .map(|r| format!("({})", show_vals(&r.1, opaque)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+            let sets = |w: &Vec<eval::Write>| {
+                w.iter()
+                    .map(|r| {
+                        let cols: Vec<String> =
+                            r.1.iter()
+                                .map(|(c, v, _)| format!("{} = {}", spell(c), v.show(opaque)))
+                                .collect();
+                        cols.join(", ")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let deletes = x.iter().chain(y).all(|w| w.1.is_empty());
+            if deletes || x.iter().map(|w| w.0).ne(y.iter().map(|w| w.0)) {
+                let one = |w: &Vec<eval::Write>| {
+                    if deletes || w.is_empty() {
+                        rows(w)
+                    } else {
+                        format!("{} (setting {})", rows(w), sets(w))
+                    }
                 };
-                format!("A {verb} {table} with {} and B with {}", vals(x), vals(y))
+                format!("A {verb} {} of {table} and B {verb} {}", one(x), one(y))
+            } else {
+                format!("A sets {} and B sets {} in {table}", sets(x), sets(y))
             }
+        }
+        (Obs::Inserted(cx, x), Obs::Inserted(cy, y)) => {
+            let vals = |cols: &Vec<String>, w: &Vec<Vec<V>>| {
+                if w.is_empty() {
+                    return "no row".to_string();
+                }
+                w.iter()
+                    .map(|r| {
+                        if cols.len() == r.len() {
+                            let named: Vec<String> = cols
+                                .iter()
+                                .zip(r)
+                                .map(|(c, v)| format!("{} = {}", spell(c), v.show(opaque)))
+                                .collect();
+                            format!("({})", named.join(", "))
+                        } else {
+                            format!("({})", show_vals(r, opaque))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            format!(
+                "A {verb} {} into {table} and B {verb} {}",
+                vals(cx, x),
+                vals(cy, y)
+            )
         }
         (Obs::Rows(x, _), Obs::Rows(y, _)) => {
             let vals = |w: &Vec<Vec<V>>| {
@@ -2923,10 +3292,11 @@ fn statement_effect(r: &Routine, s: &SyntaxNode) -> Eff {
 
 /// How a later read of `name` is described.
 fn read_note(name: &str, r: Read, d: Dialect) -> String {
+    let name = spell(name);
     let shown = if d == Dialect::Tsql {
         format!("@{name}")
     } else {
-        name.to_string()
+        name
     };
     match r {
         Read::Always(0) => format!("{shown} is returned to the caller"),

@@ -656,6 +656,16 @@ impl Session {
                             for name in t.template.parameters() {
                                 red.name(&name);
                             }
+                            // Witnesses name placeholders as the template
+                            // spells them (`$TAB$`).
+                            for seg in &t.template.segments {
+                                if matches!(
+                                    seg.kind,
+                                    sqldiff_syntax::template::SegmentKind::Placeholder { .. }
+                                ) {
+                                    red.name(t.template.slice(seg));
+                                }
+                            }
                         }
                     }
                     None => {

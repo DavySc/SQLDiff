@@ -45,6 +45,43 @@ pub enum V {
     Err(String),
 }
 
+/// A string literal; long runs of one character are counted.
+fn show_str(s: &str) -> String {
+    let quote = |t: &str| format!("'{}'", t.replace('\'', "''"));
+    let n = s.chars().count();
+    if n <= 20 {
+        return quote(s);
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut parts = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let mut j = i;
+        while j < chars.len() && chars[j] == chars[i] {
+            j += 1;
+        }
+        if j - i >= 4 {
+            if !plain.is_empty() {
+                parts.push(quote(&std::mem::take(&mut plain)));
+            }
+            let what = if chars[i] == ' ' {
+                "blanks".to_string()
+            } else {
+                quote(&chars[i].to_string())
+            };
+            parts.push(format!("{} {what}", j - i));
+        } else {
+            plain.extend(&chars[i..j]);
+        }
+        i = j;
+    }
+    if !plain.is_empty() {
+        parts.push(quote(&plain));
+    }
+    format!("{} ({n} characters)", parts.join(" + "))
+}
+
 impl V {
     fn is_null(&self) -> bool {
         matches!(self, V::Null)
@@ -63,7 +100,7 @@ impl V {
                     format!("{s}.0")
                 }
             }
-            V::Str(s) => format!("'{}'", s.replace('\'', "''")),
+            V::Str(s) => show_str(s),
             V::Bool(b) => if *b { "TRUE" } else { "FALSE" }.into(),
             V::Gen(g) => format!("value {}", (b'a' + g) as char),
             V::Opq(i) => opaque
@@ -102,7 +139,7 @@ fn truth(v: &V) -> R<Option<bool>> {
         V::Null => Ok(None),
         V::Bool(b) => Ok(Some(*b)),
         V::Err(_) => Ok(None),
-        _ => Err(Stop::Reject),
+        _ => rej(),
     }
 }
 
@@ -218,6 +255,12 @@ fn str_eq(a: &str, b: &str) -> Option<bool> {
     if a == b {
         return Some(true);
     }
+    // Dates written differently may be the same date and time.
+    if let (Some(x), Some(y)) = (parse_date(a), parse_date(b)) {
+        if x.sep != y.sep || x.rest != y.rest {
+            return if x.days != y.days { Some(false) } else { None };
+        }
+    }
     let fold = |s: &str| s.trim_end_matches(' ').to_lowercase();
     if fold(a) == fold(b) || !a.is_ascii() || !b.is_ascii() {
         return None;
@@ -295,6 +338,8 @@ pub enum Origin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
     Int,
+    /// T-SQL bit: 0 or 1.
+    Bit,
     Num,
     Str,
     Bool,
@@ -325,6 +370,10 @@ pub struct VarFact {
     pub cands: Vec<V>,
 }
 
+/// An updated or deleted row: its index, and (column, new value, old value)
+/// for each SET column.
+pub type Write = (usize, Vec<(String, V, V)>);
+
 /// What a statement shows its caller or the rest of the routine.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Obs {
@@ -335,8 +384,12 @@ pub enum Obs {
     /// Assignment from a query: the value, or None when no row qualifies
     /// (the variable keeps its value).
     Assigned(Vec<Option<V>>),
-    /// Rows written: (table row index, new values or None for a delete).
-    Writes(Vec<(usize, Vec<V>)>),
+    /// Rows updated or deleted: (table row index, (column, new value, old
+    /// value) for each SET column; empty for a delete).
+    Writes(Vec<Write>),
+    /// Rows inserted, with the column of each value (lower-cased; empty
+    /// when the table's columns are not known).
+    Inserted(Vec<String>, Vec<Vec<V>>),
     /// Which branch of a condition chain runs (None: no branch).
     Branch(Option<usize>),
     /// The statement fails.
@@ -410,7 +463,7 @@ pub struct Ctx<'s> {
     /// Common table expressions in scope, innermost last.
     ctes: Vec<Vec<Cte>>,
     /// Result columns of table functions by table key.
-    func_schema: HashMap<String, Vec<(String, Ty)>>,
+    func_schema: HashMap<String, Vec<(String, Type)>>,
     /// Origin of a table function's rows (that of the variable it reads).
     func_origin: HashMap<String, Origin>,
     /// Variables read only through a table function, and variables read
@@ -496,6 +549,10 @@ impl<'s> Ctx<'s> {
             }
         };
         match class {
+            Class::Bit => {
+                push(V::Int(0));
+                push(V::Int(1));
+            }
             Class::Int | Class::Num => {
                 for l in &hint.lits {
                     match l {
@@ -576,6 +633,8 @@ impl<'s> Ctx<'s> {
                 }
                 push(V::Str("2020-01-01".into()));
                 push(V::Str("2020-01-02".into()));
+                // Another year, for date parts and ranges.
+                push(V::Str("2019-12-31".into()));
             }
             Class::Gen => {
                 for l in &hint.lits {
@@ -599,6 +658,7 @@ impl<'s> Ctx<'s> {
 
     fn class_of_ty(ty: &Ty) -> Option<Class> {
         Some(match ty.fam {
+            Fam::Int if ty.len == Some(1) => Class::Bit,
             Fam::Int => Class::Int,
             Fam::Exact | Fam::Float => Class::Num,
             Fam::Char | Fam::VarChar => Class::Str,
@@ -644,22 +704,40 @@ impl<'s> Ctx<'s> {
         let hint = self.hint(&col);
         if let Some(schema) = self.func_schema.get(table) {
             // A table function's column: typed by its WITH schema, nullable.
-            let Some((_, ty)) = schema.iter().find(|(c, _)| *c == col) else {
+            // The document's value is the input; each version converts it to
+            // its own declared type (strings are truncated, decimals rounded
+            // or overflow), so values just beyond the type are candidates too.
+            let Some((_, decl)) = schema.iter().find(|(c, _)| *c == col).cloned() else {
                 return unsupported(format!("unknown column {col} of {table}"));
             };
-            let class = Self::class_of_ty(ty).or(hint.class).unwrap_or(Class::Gen);
+            let ty = Ty::from_type(&decl, self.d, false);
+            let class = Self::class_of_ty(&ty).or(hint.class).unwrap_or(Class::Gen);
             let mut cands = self.candidates(class, &hint, true, false);
-            if let (true, Some(len)) = (ty.is_string(), ty.len) {
-                cands.retain(|v| !matches!(v, V::Str(s) if s.chars().count() > len as usize));
+            match (ty.fam, ty.len, ty.scale) {
+                (Fam::VarChar | Fam::Char, Some(len), _) if len < 4000 => {
+                    let at = cands.len().saturating_sub(1);
+                    cands.insert(at, V::Str("x".repeat(len as usize + 1)));
+                    // Blanks before the cut: a narrower column keeps only them.
+                    if len > 1 {
+                        let spaced = format!("x{}x", " ".repeat(len as usize - 1));
+                        cands.insert(at + 1, V::Str(spaced));
+                    }
+                }
+                (Fam::Exact, Some(p), Some(sc)) if p <= 30 => {
+                    cands.push(V::Num(10f64.powi(-(sc as i32) - 1)));
+                    cands.push(V::Num(10f64.powi(p as i32 - sc as i32)));
+                }
+                _ => {}
             }
             let origin = self.func_origin.get(table).copied().unwrap_or(Origin::Free);
-            return self.input(Key::Col(table.to_string(), row, col), origin, cands);
+            let v = self.input(Key::Col(table.to_string(), row, col), origin, cands)?;
+            return self.cast(v, &decl);
         }
         // Temporal reads (`t FOR SYSTEM_TIME AS OF x`) use the catalog of `t`.
         let base = table.split(' ').next().unwrap_or(table);
         let cat = self
             .schema
-            .table(last_part(base))
+            .table(base)
             .and_then(|t| t.column(&col))
             .cloned();
         let class = match &cat {
@@ -745,7 +823,7 @@ fn for_json(r: &Rows) -> R<V> {
                 V::Gen(g) => format!("\"<value {}>\"", (b'a' + g) as char),
                 V::Err(e) => return Ok(V::Err(e.clone())),
                 // Opaque values may equal anything.
-                V::Opq(_) | V::Ne(_) => return Err(Stop::Reject),
+                V::Opq(_) | V::Ne(_) => return rej(),
             };
             props.push(format!("{n:?}:{s}"));
         }
@@ -1096,7 +1174,7 @@ impl Ctx<'_> {
         match &b.src {
             Src::Derived(cols) => Some(cols.iter().any(|(n, _)| n == col)),
             _ => {
-                let t = self.schema.table(last_part(b.table.as_deref()?))?;
+                let t = self.schema.table(b.table.as_deref()?)?;
                 Some(t.column(col).is_some())
             }
         }
@@ -1135,7 +1213,7 @@ impl Ctx<'_> {
                     ("-", V::Null) => Ok(V::Null),
                     ("-", V::Int(i)) => Ok(V::Int(-i)),
                     ("-", V::Num(f)) => Ok(V::Num(-f)),
-                    _ => Err(Stop::Reject),
+                    _ => rej(),
                 }
             }
             Expr::IsNull(x, neg) => {
@@ -1164,7 +1242,7 @@ impl Ctx<'_> {
                 let mut acc = Some(false);
                 for r in &rows.rows {
                     let Some(w) = r.first() else {
-                        return Err(Stop::Reject);
+                        return rej();
                     };
                     let t = self.compare("=", &v, w)?;
                     acc = or3(acc, truth(&t)?);
@@ -1184,12 +1262,14 @@ impl Ctx<'_> {
                 let v = self.expr(x, scopes, g)?;
                 let pat = self.expr(p, scopes, g)?;
                 match (&v, &pat) {
+                    (V::Err(_), _) => Ok(v.clone()),
+                    (_, V::Err(_)) => Ok(pat.clone()),
                     (V::Null, _) | (_, V::Null) => Ok(V::Null),
                     (V::Str(s), V::Str(pt)) => {
-                        let m = like(s, pt, *ci || self.d == Dialect::Tsql).ok_or(Stop::Reject)?;
+                        let m = like(s, pt, *ci).ok_or(Stop::Reject)?;
                         Ok(V::Bool(m != *neg))
                     }
-                    _ => Err(Stop::Reject),
+                    _ => rej(),
                 }
             }
             Expr::Cast(x, ty) => {
@@ -1234,7 +1314,7 @@ impl Ctx<'_> {
                 match rows.rows.as_slice() {
                     [] => Ok(V::Null),
                     [r] if r.len() == 1 => Ok(r[0].clone()),
-                    [_] => Err(Stop::Reject),
+                    [_] => rej(),
                     _ => Ok(V::Err("subquery returned more than one row".into())),
                 }
             }
@@ -1326,7 +1406,12 @@ impl Ctx<'_> {
         };
         match r {
             Some(x) => Ok(V::Bool(x)),
-            None => Err(Stop::Reject),
+            None => {
+                if std::env::var_os("SQLDIFF_DEBUG_SEARCH").is_some() {
+                    eprintln!("    undecided {a:?} {op} {b:?}");
+                }
+                rej()
+            }
         }
     }
 
@@ -1367,7 +1452,7 @@ impl Ctx<'_> {
                 (V::Opq(_) | V::Gen(_) | V::Ne(_), _) | (_, V::Opq(_) | V::Gen(_) | V::Ne(_)) => {
                     self.opaque_call(op, vec![a.clone(), b.clone()])
                 }
-                _ => Err(Stop::Reject),
+                _ => rej(),
             };
         }
         match (&a, &b) {
@@ -1376,7 +1461,7 @@ impl Ctx<'_> {
                     "+" => x.checked_add(*y),
                     "-" => x.checked_sub(*y),
                     "*" => x.checked_mul(*y),
-                    "/" | "%" if *y == 0 => return Err(Stop::Reject),
+                    "/" | "%" if *y == 0 => return rej(),
                     "/" => x.checked_div(*y),
                     "%" => x.checked_rem(*y),
                     _ => None,
@@ -1384,7 +1469,7 @@ impl Ctx<'_> {
                 // Stay well inside every integer type the values could have.
                 match r {
                     Some(v) if v.abs() < (1 << 30) => Ok(V::Int(v)),
-                    _ => Err(Stop::Reject),
+                    _ => rej(),
                 }
             }
             (V::Opq(_) | V::Gen(_) | V::Ne(_), _) | (_, V::Opq(_) | V::Gen(_) | V::Ne(_)) => {
@@ -1392,20 +1477,20 @@ impl Ctx<'_> {
             }
             _ => {
                 let (Some(x), Some(y)) = (num_of(&a), num_of(&b)) else {
-                    return Err(Stop::Reject);
+                    return rej();
                 };
                 let r = match op {
                     "+" => x + y,
                     "-" => x - y,
                     "*" => x * y,
-                    "/" if y == 0.0 => return Err(Stop::Reject),
+                    "/" if y == 0.0 => return rej(),
                     "/" => x / y,
-                    _ => return Err(Stop::Reject),
+                    _ => return rej(),
                 };
                 if r.is_finite() && r.abs() < 1e12 {
                     Ok(V::Num(r))
                 } else {
-                    Err(Stop::Reject)
+                    rej()
                 }
             }
         }
@@ -1414,32 +1499,7 @@ impl Ctx<'_> {
     /// Whether an expression is certainly a character string (Some(true)),
     /// certainly not (Some(false)), or unknown.
     fn static_string(&self, e: &Expr) -> Option<bool> {
-        match e {
-            Expr::Str(_) => Some(true),
-            Expr::Num(_) => Some(false),
-            Expr::Var(v) => {
-                let n = var_key(v);
-                self.vars.get(&n)?.ty.as_ref().map(|t| t.is_string())
-            }
-            Expr::Name(p) if p.len() == 1 && self.d != Dialect::Tsql => {
-                let n = p[0].to_lowercase();
-                self.vars.get(&n)?.ty.as_ref().map(|t| t.is_string())
-            }
-            Expr::Bin(op, l, r) if op == "+" || op == "||" => {
-                match (self.static_string(l), self.static_string(r)) {
-                    (Some(true), Some(true)) => Some(true),
-                    _ => None,
-                }
-            }
-            Expr::Cast(_, ty) => Some(Ty::from_type(ty, self.d, true).is_string()),
-            Expr::Call(c) => match call_name(c).as_str() {
-                "QUOTENAME" | "UPPER" | "LOWER" | "LTRIM" | "RTRIM" | "TRIM" | "REPLACE"
-                | "CONCAT" | "FORMAT" | "NCHAR" | "CHAR" | "LEFT" | "RIGHT" | "SUBSTRING"
-                | "STUFF" | "REPLICATE" => Some(true),
-                _ => None,
-            },
-            _ => None,
-        }
+        static_string(e, &self.vars, self.d)
     }
 
     fn cast(&mut self, v: V, ty: &Type) -> R<V> {
@@ -1447,23 +1507,114 @@ impl Ctx<'_> {
             return Ok(v);
         }
         let t = Ty::from_type(ty, self.d, true);
+        let tsql = self.d == Dialect::Tsql;
+        // An integer that does not fit the target integer type.
+        let int_fits = |i: i128| match t.len {
+            Some(bits @ (16 | 32 | 64)) => {
+                let lim = 1i128 << (bits - 1);
+                (-lim..lim).contains(&i)
+            }
+            _ => true,
+        };
+        let overflow = || {
+            V::Err(format!(
+                "arithmetic overflow converting to {}",
+                ty.name.to_lowercase()
+            ))
+        };
         match (t.fam, &v) {
-            (Fam::Int, V::Int(_)) => Ok(v),
+            // Any non-zero number converts to bit 1.
+            (Fam::Int, V::Int(i)) if t.len == Some(1) => Ok(V::Int(i128::from(*i != 0))),
+            (Fam::Int, _) if t.len == Some(1) => rej(),
+            (Fam::Int, V::Int(i)) => Ok(if int_fits(*i) { v } else { overflow() }),
             (Fam::Int, V::Str(s)) => match s.trim().parse::<i128>() {
-                Ok(i) => Ok(V::Int(i)),
-                Err(_) => Err(Stop::Reject),
+                Ok(i) if int_fits(i) => Ok(V::Int(i)),
+                _ => rej(),
             },
-            (Fam::Exact | Fam::Float, V::Int(i)) => Ok(V::Num(*i as f64)),
-            (Fam::Exact | Fam::Float, V::Num(_)) => Ok(v),
+            (Fam::Int, V::Num(f)) => {
+                // T-SQL truncates; PostgreSQL rounds (half away from zero for
+                // numeric, half to even for float, so halves are left out).
+                let r = if tsql {
+                    f.trunc()
+                } else if (f.fract().abs() - 0.5).abs() < 1e-9 {
+                    return rej();
+                } else {
+                    f.round()
+                };
+                if r.abs() >= (1u64 << 30) as f64 {
+                    return rej();
+                }
+                Ok(if int_fits(r as i128) {
+                    V::Int(r as i128)
+                } else {
+                    overflow()
+                })
+            }
+            (Fam::Exact, V::Int(_) | V::Num(_)) => {
+                let x = num_of(&v).ok_or(Stop::Reject)?;
+                let Some(scale) = t.scale else {
+                    return Ok(if let V::Int(i) = v {
+                        V::Num(i as f64)
+                    } else {
+                        v
+                    });
+                };
+                // Rounded half away from zero to the scale; a value at a half
+                // is left out (its binary approximation may round either way).
+                let m = x * 10f64.powi(scale as i32);
+                if (m.fract().abs() - 0.5).abs() < 1e-6 || m.abs() >= 1e15 {
+                    return rej();
+                }
+                let r = m.round();
+                if let Some(p) = t.len {
+                    if r.abs() >= 10f64.powi(p as i32) {
+                        return Ok(overflow());
+                    }
+                }
+                let r = r / 10f64.powi(scale as i32);
+                Ok(if r.fract() == 0.0 && scale == 0 {
+                    V::Int(r as i128)
+                } else {
+                    V::Num(r)
+                })
+            }
+            (Fam::Float, V::Int(i)) => Ok(V::Num(*i as f64)),
+            (Fam::Float, V::Num(_)) => Ok(v),
             (Fam::VarChar | Fam::Char, V::Str(s)) => {
+                // An explicit cast truncates silently in both dialects; a
+                // shorter value in a fixed-length type is blank-padded.
                 let n = s.chars().count() as u32;
                 match t.len {
-                    Some(l) if n > l => Err(Stop::Reject),
-                    _ if t.fam == Fam::Char => Err(Stop::Reject),
+                    Some(l) if n > l => Ok(V::Str(s.chars().take(l as usize).collect())),
+                    Some(l) if t.fam == Fam::Char && n < l => rej(),
                     _ => Ok(v),
                 }
             }
-            (Fam::VarChar, V::Int(i)) => Ok(V::Str(i.to_string())),
+            (Fam::VarChar | Fam::Char, V::Int(i)) => {
+                let text = i.to_string();
+                match t.len {
+                    // T-SQL shows `*` (varchar) or fails (nvarchar) when too short.
+                    Some(l) if text.len() as u32 > l => rej(),
+                    Some(l) if t.fam == Fam::Char && (text.len() as u32) < l => rej(),
+                    _ => Ok(V::Str(text)),
+                }
+            }
+            (Fam::Date, V::Str(s)) => match parse_date(s) {
+                Some(d) if d.rest.is_empty() || time_of(&d.rest).is_some() => {
+                    Ok(V::Str(format_date(&DateLit {
+                        sep: d.sep,
+                        days: d.days,
+                        rest: String::new(),
+                    })))
+                }
+                _ => rej(),
+            },
+            (Fam::Timestamp, V::Str(s))
+                if parse_date(s)
+                    .is_some_and(|d| d.rest.is_empty() || time_of(&d.rest).is_some()) =>
+            {
+                Ok(v)
+            }
             // PostgreSQL `name` and other string-like casts of strings.
             (Fam::Other, V::Str(_)) if matches!(ty.name.as_str(), "NAME" | "REGCLASS") => {
                 if ty.name == "NAME" {
@@ -1476,7 +1627,7 @@ impl Ctx<'_> {
             (_, V::Opq(_) | V::Gen(_) | V::Ne(_)) => {
                 self.opaque_call(&format!("CAST_{}", ty.name), vec![v])
             }
-            _ => Err(Stop::Reject),
+            _ => rej(),
         }
     }
 
@@ -1514,6 +1665,20 @@ impl Ctx<'_> {
                 Origin::Free,
                 cands,
             );
+        }
+        // Session and server state both versions share: an input.
+        if let Some(cands) = environment(&name, &c.args, self.d) {
+            let args: Vec<String> = c
+                .args
+                .iter()
+                .map(|a| match a {
+                    Expr::Str(s) => format!("N'{}'", s.replace('\'', "''")),
+                    Expr::Num(n) => n.clone(),
+                    _ => String::new(),
+                })
+                .collect();
+            let key = format!("@env:{name}({})", args.join(", "));
+            return self.input(Key::Var(key), Origin::Free, cands);
         }
         if NONDETERMINISTIC.contains(&name.as_str()) {
             return Ok(self.nondet(&name));
@@ -1582,7 +1747,7 @@ impl Ctx<'_> {
                                     .take(l as usize)
                                     .collect(),
                             )),
-                            _ => Err(Stop::Reject),
+                            _ => rej(),
                         }
                     })
                 }
@@ -1610,7 +1775,7 @@ impl Ctx<'_> {
             ("ISNULL", [a, b]) if tsql => {
                 // The replacement is converted to the first argument's type.
                 if a.is_null() && !matches!(b, V::Null | V::Int(_)) {
-                    return Err(Stop::Reject);
+                    return rej();
                 }
                 Ok(if a.is_null() { b.clone() } else { a.clone() })
             }
@@ -1649,6 +1814,186 @@ impl Ctx<'_> {
                 };
                 Ok(V::Bool(hit != name.starts_with("IS NOT")))
             }
+            ("SPLIT_PART", [V::Str(s), V::Str(sep), V::Int(n)]) if !tsql => {
+                if *n == 0 {
+                    return Ok(V::Err("field position must not be zero".into()));
+                }
+                let fields: Vec<&str> = if sep.is_empty() {
+                    vec![s.as_str()]
+                } else {
+                    s.split(sep.as_str()).collect()
+                };
+                let k = if *n > 0 {
+                    (*n - 1) as usize
+                } else {
+                    match fields.len().checked_sub(n.unsigned_abs() as usize) {
+                        Some(k) => k,
+                        None => return Ok(V::Str(String::new())),
+                    }
+                };
+                Ok(V::Str(fields.get(k).copied().unwrap_or("").to_string()))
+            }
+            ("SUBSTRING" | "SUBSTR", [V::Str(s), V::Int(start), rest @ ..])
+                if rest.len() <= 1 && (tsql == (rest.len() == 1)) =>
+            {
+                let chars: Vec<char> = s.chars().collect();
+                let end = match rest {
+                    [V::Int(l)] if *l < 0 => {
+                        return Ok(V::Err("negative substring length".into()));
+                    }
+                    [V::Int(l)] => start.saturating_add(*l),
+                    [] => chars.len() as i128 + 1,
+                    _ => return self.opaque_call(&name, args.clone()),
+                };
+                let from = (*start).max(1);
+                let to = end.min(chars.len() as i128 + 1);
+                Ok(V::Str(if from >= to {
+                    String::new()
+                } else {
+                    chars[(from - 1) as usize..(to - 1) as usize]
+                        .iter()
+                        .collect()
+                }))
+            }
+            ("LEFT" | "RIGHT", [V::Str(s), V::Int(n)]) => {
+                let chars: Vec<char> = s.chars().collect();
+                let len = chars.len() as i128;
+                // PostgreSQL counts a negative length from the other end.
+                let k = match *n {
+                    n if n < 0 && tsql => {
+                        return Ok(V::Err(format!(
+                            "invalid length passed to {}",
+                            name.to_lowercase()
+                        )));
+                    }
+                    n if n < 0 => (len + n).max(0),
+                    n => n.min(len),
+                } as usize;
+                Ok(V::Str(if name == "LEFT" {
+                    chars[..k].iter().collect()
+                } else {
+                    chars[chars.len() - k..].iter().collect()
+                }))
+            }
+            ("LTRIM" | "RTRIM" | "TRIM", [V::Str(s)]) => Ok(V::Str(match name.as_str() {
+                "LTRIM" => s.trim_start_matches(' ').to_string(),
+                "RTRIM" => s.trim_end_matches(' ').to_string(),
+                _ => s.trim_matches(' ').to_string(),
+            })),
+            ("REPLACE", [V::Str(s), V::Str(from), V::Str(to)]) => {
+                if from.is_empty() {
+                    return Ok(V::Str(s.clone()));
+                }
+                let exact = s.replace(from.as_str(), to);
+                // T-SQL matches under the collation, usually case-insensitive:
+                // keep only results that do not depend on it.
+                if tsql
+                    && (!s.is_ascii() || !from.is_ascii() || {
+                        let (ls, lf) = (s.to_ascii_lowercase(), from.to_ascii_lowercase());
+                        ls.matches(lf.as_str()).count() != s.matches(from.as_str()).count()
+                    })
+                {
+                    return rej();
+                }
+                Ok(V::Str(exact))
+            }
+            ("REVERSE", [V::Str(s)]) => Ok(V::Str(s.chars().rev().collect())),
+            ("REPLICATE" | "REPEAT", [V::Str(s), V::Int(n)]) => {
+                if *n < 0 {
+                    return Ok(if tsql { V::Null } else { V::Str(String::new()) });
+                }
+                if (*n as usize).saturating_mul(s.len()) > 4000 {
+                    return rej();
+                }
+                Ok(V::Str(s.repeat(*n as usize)))
+            }
+            ("LPAD" | "RPAD", [V::Str(s), V::Int(n), fill @ ..]) if !tsql && fill.len() <= 1 => {
+                let fill = match fill {
+                    [V::Str(f)] => f.clone(),
+                    [] => " ".to_string(),
+                    _ => return self.opaque_call(&name, args.clone()),
+                };
+                let chars: Vec<char> = s.chars().collect();
+                let n = (*n).max(0) as usize;
+                if n > 4000 {
+                    return rej();
+                }
+                if chars.len() >= n || fill.is_empty() {
+                    return Ok(V::Str(chars.iter().take(n).collect()));
+                }
+                let pad: String = fill.chars().cycle().take(n - chars.len()).collect();
+                Ok(V::Str(if name == "LPAD" {
+                    pad + s
+                } else {
+                    s.clone() + &pad
+                }))
+            }
+            ("STRPOS", [V::Str(s), V::Str(sub)]) if !tsql => {
+                Ok(V::Int(match s.find(sub.as_str()) {
+                    Some(i) => s[..i].chars().count() as i128 + 1,
+                    None => 0,
+                }))
+            }
+            ("CHARINDEX", [V::Str(sub), V::Str(s)]) if tsql => {
+                if sub.is_empty() {
+                    return Ok(V::Int(0));
+                }
+                let pos = |h: &str, n: &str| {
+                    h.find(n)
+                        .map(|i| h[..i].chars().count() as i128 + 1)
+                        .unwrap_or(0)
+                };
+                let exact = pos(s, sub);
+                if !s.is_ascii()
+                    || !sub.is_ascii()
+                    || pos(&s.to_ascii_lowercase(), &sub.to_ascii_lowercase()) != exact
+                {
+                    return rej();
+                }
+                Ok(V::Int(exact))
+            }
+            ("GREATEST" | "LEAST", _) if !args.is_empty() => {
+                // Both dialects skip NULL arguments.
+                let mut best: Option<V> = None;
+                for a in args.iter().filter(|a| !a.is_null()) {
+                    best = Some(match best {
+                        None => a.clone(),
+                        Some(b) => {
+                            let o = cmp_vals(a, &b).ok_or(Stop::Reject)?;
+                            let better = if name == "GREATEST" {
+                                o == std::cmp::Ordering::Greater
+                            } else {
+                                o == std::cmp::Ordering::Less
+                            };
+                            if better {
+                                a.clone()
+                            } else {
+                                b
+                            }
+                        }
+                    });
+                }
+                Ok(best.unwrap_or(V::Null))
+            }
+            ("ROUND", [x @ (V::Int(_) | V::Num(_)), V::Int(n)]) if (-9..=9).contains(n) => {
+                // Half away from zero (exact numerics); halves are left out
+                // because a float may sit just beside them.
+                let v = num_of(x).ok_or(Stop::Reject)?;
+                let m = v * 10f64.powi(*n as i32);
+                if (m.fract().abs() - 0.5).abs() < 1e-6 || m.abs() >= 1e12 {
+                    return rej();
+                }
+                let r = m.round() / 10f64.powi(*n as i32);
+                Ok(match x {
+                    V::Int(_) => V::Int(r as i128),
+                    _ => V::Num(r),
+                })
+            }
+            ("FLOOR" | "CEILING" | "CEIL", [V::Int(i)]) => Ok(V::Int(*i)),
+            ("FLOOR" | "CEILING" | "CEIL", [V::Num(f)]) if f.abs() < 1e12 => {
+                Ok(V::Num(if name == "FLOOR" { f.floor() } else { f.ceil() }))
+            }
+            ("SIGN", [V::Int(i)]) => Ok(V::Int(i.signum())),
             ("ABS", [V::Null]) => Ok(V::Null),
             ("ABS", [V::Int(i)]) => Ok(V::Int(i.abs())),
             ("ABS", [V::Num(f)]) => Ok(V::Num(f.abs())),
@@ -1694,6 +2039,27 @@ impl Ctx<'_> {
     fn date_call(&mut self, name: &str, part: &str, args: Vec<V>) -> R<V> {
         if args.iter().any(V::is_null) {
             return Ok(V::Null);
+        }
+        if name == "DATEPART" && matches!(part, "WEEKDAY" | "DW") && self.d == Dialect::Tsql {
+            let [V::Str(d)] = args.as_slice() else {
+                return self.opaque_call(name, args);
+            };
+            let Some(dl) = parse_date(d) else {
+                return self.opaque_call(name, args);
+            };
+            // The day number depends on SET DATEFIRST, a session setting both
+            // versions share: an input (7 is the us_english default).
+            let first = self.input(
+                Key::Var("@@datefirst".into()),
+                Origin::Free,
+                vec![V::Int(7), V::Int(1)],
+            )?;
+            let V::Int(first) = first else {
+                return rej();
+            };
+            // ISO day of the week, Monday 1 to Sunday 7 (1970-01-01 was a Thursday).
+            let iso = (dl.days + 3).rem_euclid(7) + 1;
+            return Ok(V::Int(((iso - first as i64 + 7).rem_euclid(7) + 1) as i128));
         }
         let unit = match part {
             "YEAR" | "YY" | "YYYY" => "year",
@@ -1802,7 +2168,7 @@ impl Ctx<'_> {
                     match eq_vals(x, &v) {
                         Some(true) => dup = true,
                         Some(false) => {}
-                        None => return Err(Stop::Reject),
+                        None => return rej(),
                     }
                 }
                 if !dup {
@@ -1840,9 +2206,120 @@ impl Ctx<'_> {
                 args.extend(extra);
                 self.opaque_call(name, args)
             }
-            // AVG of integers truncates in T-SQL; leave it out.
-            _ => Err(Stop::Reject),
+            // AVG of integers truncates in T-SQL and is exact in PostgreSQL;
+            // only averages that come out the same either way are kept.
+            "AVG" => {
+                if vals.iter().all(|v| matches!(v, V::Int(_))) {
+                    let sum: i128 = vals
+                        .iter()
+                        .map(|v| if let V::Int(i) = v { *i } else { 0 })
+                        .sum();
+                    let n = vals.len() as i128;
+                    return if sum % n == 0 {
+                        Ok(V::Int(sum / n))
+                    } else {
+                        rej()
+                    };
+                }
+                let mut sum = 0.0;
+                for v in &vals {
+                    sum += num_of(v).ok_or(Stop::Reject)?;
+                }
+                let avg = sum / vals.len() as f64;
+                if ((avg * 1e6).fract()).abs() > 1e-6 || avg.abs() >= 1e9 {
+                    return rej();
+                }
+                Ok(V::Num(avg))
+            }
+            _ => rej(),
         }
+    }
+}
+
+/// Whether an expression is certainly a character string (Some(true)),
+/// certainly not (Some(false)), or unknown, from literals, declared variable
+/// types, casts and string functions.
+pub fn static_string(e: &Expr, vars: &HashMap<String, VarFact>, d: Dialect) -> Option<bool> {
+    static_string_with(e, vars, d, &|_| None)
+}
+
+/// [`static_string`], with the types of columns (by their written name).
+pub fn static_string_with(
+    e: &Expr,
+    vars: &HashMap<String, VarFact>,
+    d: Dialect,
+    col: &dyn Fn(&[String]) -> Option<bool>,
+) -> Option<bool> {
+    let static_string =
+        |e: &Expr, vars: &HashMap<String, VarFact>, d: Dialect| static_string_with(e, vars, d, col);
+    match e {
+        Expr::Str(_) => Some(true),
+        Expr::Num(_) => Some(false),
+        Expr::Var(v) => {
+            let n = var_key(v);
+            vars.get(&n)?.ty.as_ref().map(|t| t.is_string())
+        }
+        Expr::Name(p) if p.len() == 1 && d != Dialect::Tsql => {
+            let n = p[0].to_lowercase();
+            vars.get(&n)?.ty.as_ref().map(|t| t.is_string())
+        }
+        Expr::Bin(op, l, r) if op == "+" || op == "||" => {
+            match (static_string(l, vars, d), static_string(r, vars, d)) {
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            }
+        }
+        Expr::Cast(_, ty) => Some(Ty::from_type(ty, d, true).is_string()),
+        // T-SQL types a CASE by its result expressions.
+        Expr::Case(_, whens, els) => {
+            let mut all = whens.iter().map(|(_, r)| r).chain(els.as_deref());
+            let mut typed = false;
+            let strings = all.all(|r| {
+                let null = matches!(r, Expr::Null);
+                typed |= !null;
+                null || static_string(r, vars, d) == Some(true)
+            });
+            (strings && typed).then_some(true)
+        }
+        Expr::Name(p) => col(p),
+        Expr::Call(c) => match call_name(c).as_str() {
+            "QUOTENAME" | "UPPER" | "LOWER" | "LTRIM" | "RTRIM" | "TRIM" | "REPLACE" | "CONCAT"
+            | "FORMAT" | "NCHAR" | "CHAR" | "LEFT" | "RIGHT" | "SUBSTRING" | "STUFF"
+            | "REPLICATE" => Some(true),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Candidate values of a function that reads session or server state, when
+/// its arguments are constants.
+fn environment(name: &str, args: &[Expr], d: Dialect) -> Option<Vec<V>> {
+    if !args
+        .iter()
+        .all(|a| matches!(a, Expr::Str(_) | Expr::Num(_)))
+    {
+        return None;
+    }
+    let ints = |v: &[i128]| v.iter().map(|i| V::Int(*i)).collect::<Vec<_>>();
+    match (d, name, args) {
+        (Dialect::Tsql, "IS_ROLEMEMBER" | "IS_MEMBER" | "IS_SRVROLEMEMBER", [_] | [_, _]) => {
+            let mut v = ints(&[1, 0]);
+            v.push(V::Null);
+            Some(v)
+        }
+        // The documented engine editions.
+        (Dialect::Tsql, "SERVERPROPERTY", [Expr::Str(p)])
+            if p.eq_ignore_ascii_case("EngineEdition") =>
+        {
+            Some(ints(&[2, 3, 4, 5, 6, 8, 9, 11, 12]))
+        }
+        // Values an application stores under a key, compared as strings.
+        (Dialect::Tsql, "SESSION_CONTEXT", [Expr::Str(_)]) => {
+            Some(vec![V::Str("x".into()), V::Str("y".into()), V::Null])
+        }
+        (Dialect::Postgres, "PG_IS_IN_RECOVERY", []) => Some(vec![V::Bool(false), V::Bool(true)]),
+        _ => None,
     }
 }
 
@@ -1942,7 +2419,7 @@ pub struct Rows {
 
 impl Ctx<'_> {
     /// Rows of one FROM item: each a list of bindings.
-    fn from_item(&mut self, f: &From, outer: &[Scope]) -> R<Vec<Scope>> {
+    fn scope_of(&mut self, f: &From, outer: &[Scope]) -> R<Vec<Scope>> {
         match f {
             From::Table { name, alias, hints } => {
                 if let [single] = name.as_slice() {
@@ -1957,7 +2434,7 @@ impl Ctx<'_> {
                             alias: Some(alias.clone().unwrap_or_else(|| single.clone())),
                             cols: cte.cols,
                         };
-                        let r = self.from_item(&sub, &[]);
+                        let r = self.scope_of(&sub, &[]);
                         self.ctes = saved;
                         return r;
                     }
@@ -2049,12 +2526,11 @@ impl Ctx<'_> {
                         _ => return unsupported(format!("{key} arguments")),
                     }
                 }
-                let d = self.d;
                 self.func_schema.insert(
                     key.clone(),
                     schema
                         .iter()
-                        .map(|(c, t)| (c.to_lowercase(), Ty::from_type(t, d, false)))
+                        .map(|(c, t)| (c.to_lowercase(), t.clone()))
                         .collect(),
                 );
                 self.func_origin.insert(key.clone(), origin);
@@ -2080,8 +2556,8 @@ impl Ctx<'_> {
                 right,
                 on,
             } => {
-                let ls = self.from_item(left, outer)?;
-                let rs = self.from_item(right, outer)?;
+                let ls = self.scope_of(left, outer)?;
+                let rs = self.scope_of(right, outer)?;
                 let mut out = Vec::new();
                 let mut right_matched = vec![false; rs.len()];
                 for l in &ls {
@@ -2096,7 +2572,7 @@ impl Ctx<'_> {
                                 sc.push(row.clone());
                                 let v = self.expr(c, &sc, None)?;
                                 if let V::Err(_) = v {
-                                    return Err(Stop::Reject);
+                                    return rej();
                                 }
                                 truth(&v)? == Some(true)
                             }
@@ -2178,7 +2654,7 @@ impl Ctx<'_> {
                 }
             }
             if unsure {
-                Err(Stop::Reject)
+                rej()
             } else {
                 Ok(false)
             }
@@ -2216,7 +2692,7 @@ impl Ctx<'_> {
                     }
                     out
                 }
-                _ => return unsupported(format!("{op}")),
+                _ => return unsupported(op.to_string()),
             };
         }
         let mut ordered = false;
@@ -2280,15 +2756,13 @@ impl Ctx<'_> {
                 let mut at = sorted.len();
                 for (j, x) in sorted.iter().enumerate() {
                     match cmp(&r, x) {
-                        None => return Err(Stop::Reject),
+                        None => return rej(),
                         Some(std::cmp::Ordering::Less) => {
                             at = j;
                             break;
                         }
-                        Some(std::cmp::Ordering::Equal) => {
-                            if rows_same(&r, x) != Some(true) {
-                                ordered = false;
-                            }
+                        Some(std::cmp::Ordering::Equal) if rows_same(&r, x) != Some(true) => {
+                            ordered = false;
                         }
                         _ => {}
                     }
@@ -2310,7 +2784,7 @@ impl Ctx<'_> {
         let limit = num(self, &q.limit)?;
         if offset > 0 || limit.is_some_and(|l| l < rows.len()) {
             if !ordered {
-                return Err(Stop::Reject);
+                return rej();
             }
             rows = rows
                 .into_iter()
@@ -2344,7 +2818,7 @@ impl Ctx<'_> {
         // FROM: cartesian product of the items.
         let mut product: Vec<Scope> = vec![Vec::new()];
         for f in &q.from {
-            let rows = self.from_item(f, outer)?;
+            let rows = self.scope_of(f, outer)?;
             let mut next = Vec::new();
             for p in &product {
                 for r in &rows {
@@ -2365,7 +2839,7 @@ impl Ctx<'_> {
                     sc.push(row.clone());
                     let v = self.expr(w, &sc, None)?;
                     if let V::Err(_) = v {
-                        return Err(Stop::Reject);
+                        return rej();
                     }
                     truth(&v)? == Some(true)
                 }
@@ -2426,7 +2900,7 @@ impl Ctx<'_> {
                             match same(x, y) {
                                 Some(true) => {}
                                 Some(false) => eq = false,
-                                None => return Err(Stop::Reject),
+                                None => return rej(),
                             }
                         }
                         if eq {
@@ -2552,7 +3026,7 @@ impl Ctx<'_> {
                 std::cmp::Ordering::Equal
             });
             if err {
-                return Err(Stop::Reject);
+                return rej();
             }
             for w in out.windows(2) {
                 let tie = w[0]
@@ -2571,7 +3045,7 @@ impl Ctx<'_> {
         let offset = match &q.offset {
             Some(e) => match self.expr(e, outer, None)? {
                 V::Int(i) if i >= 0 => i as usize,
-                _ => return Err(Stop::Reject),
+                _ => return rej(),
             },
             None => 0,
         };
@@ -2579,12 +3053,12 @@ impl Ctx<'_> {
             Some(e) => match self.expr(e, outer, None)? {
                 V::Int(i) if i >= 0 => Some(i as usize),
                 V::Null if q.limit.is_some() => None,
-                _ => return Err(Stop::Reject),
+                _ => return rej(),
             },
             None => None,
         };
         if ties && (offset > 0 || limit.is_some_and(|l| rows.len() > l)) {
-            return Err(Stop::Reject);
+            return rej();
         }
         if (limit.is_some() || offset > 0)
             && q.order_by.is_empty()
@@ -2596,7 +3070,7 @@ impl Ctx<'_> {
                 .iter()
                 .all(|r| first.as_ref().and_then(|f| rows_same(f, r)) == Some(true))
             {
-                return Err(Stop::Reject);
+                return rej();
             }
         }
         rows = rows.into_iter().skip(offset).collect();
@@ -2695,6 +3169,91 @@ fn from_names(f: &From) -> Vec<(Vec<String>, Option<String>)> {
     }
 }
 
+/// Whether two sets of updated (or deleted) rows leave the table in
+/// different states. Columns are matched by name, so `SET a = 1, b = 2` and
+/// `SET b = 2, a = 1` agree, and a column one side sets to the value it
+/// already has is no change.
+fn writes_differ(x: &[Write], y: &[Write]) -> Option<bool> {
+    let deletes = |w: &[Write]| w.iter().all(|r| r.1.is_empty());
+    if deletes(x) && deletes(y) {
+        let xi: Vec<usize> = x.iter().map(|w| w.0).collect();
+        let yi: Vec<usize> = y.iter().map(|w| w.0).collect();
+        return Some(xi != yi);
+    }
+    let mut rows: Vec<usize> = x.iter().chain(y).map(|w| w.0).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut unknown = false;
+    for i in rows {
+        let wx = x
+            .iter()
+            .find(|w| w.0 == i)
+            .map(|w| w.1.as_slice())
+            .unwrap_or(&[]);
+        let wy = y
+            .iter()
+            .find(|w| w.0 == i)
+            .map(|w| w.1.as_slice())
+            .unwrap_or(&[]);
+        let cols = wx.iter().chain(wy).map(|c| c.0.as_str());
+        for col in cols {
+            let old = wx
+                .iter()
+                .chain(wy)
+                .find(|c| c.0 == col)
+                .map(|c| &c.2)
+                .expect("column is set on one side");
+            let ax = wx.iter().find(|c| c.0 == col).map_or(old, |c| &c.1);
+            let ay = wy.iter().find(|c| c.0 == col).map_or(old, |c| &c.1);
+            match same(ax, ay) {
+                Some(true) => {}
+                Some(false) => return Some(true),
+                None => unknown = true,
+            }
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+/// Whether two INSERTs add different rows. Values are matched by column;
+/// a column only one side names gets that table's default on the other
+/// side, which is not known, so then only the common columns can show a
+/// difference.
+fn inserts_differ(cx: &[String], x: &[Vec<V>], cy: &[String], y: &[Vec<V>]) -> Option<bool> {
+    if x.len() != y.len() {
+        return Some(true);
+    }
+    if cx == cy {
+        return differ(&Obs::Rows(x.to_vec(), false), &Obs::Rows(y.to_vec(), false));
+    }
+    if cx.is_empty() || cy.is_empty() {
+        return None;
+    }
+    let common: Vec<&String> = cx.iter().filter(|c| cy.contains(c)).collect();
+    let project = |cols: &[String], rows: &[Vec<V>]| -> Vec<Vec<V>> {
+        rows.iter()
+            .map(|r| {
+                common
+                    .iter()
+                    .map(|c| r[cols.iter().position(|x| x == *c).unwrap()].clone())
+                    .collect()
+            })
+            .collect()
+    };
+    let same_cols = cx.len() == cy.len() && common.len() == cx.len();
+    match differ(
+        &Obs::Rows(project(cx, x), false),
+        &Obs::Rows(project(cy, y), false),
+    ) {
+        Some(false) if !same_cols => None,
+        r => r,
+    }
+}
+
 fn rows_same(a: &[V], b: &[V]) -> Option<bool> {
     if a.len() != b.len() {
         return Some(false);
@@ -2742,26 +3301,8 @@ pub fn differ(a: &Obs, b: &Obs) -> Option<bool> {
                 Some(false)
             }
         }
-        (Obs::Writes(x), Obs::Writes(y)) => {
-            let xi: Vec<usize> = x.iter().map(|w| w.0).collect();
-            let yi: Vec<usize> = y.iter().map(|w| w.0).collect();
-            if xi != yi {
-                return Some(true);
-            }
-            let mut unknown = false;
-            for (p, q) in x.iter().zip(y) {
-                match rows_same(&p.1, &q.1) {
-                    Some(true) => {}
-                    Some(false) => return Some(true),
-                    None => unknown = true,
-                }
-            }
-            if unknown {
-                None
-            } else {
-                Some(false)
-            }
-        }
+        (Obs::Writes(x), Obs::Writes(y)) => writes_differ(x, y),
+        (Obs::Inserted(cx, x), Obs::Inserted(cy, y)) => inserts_differ(cx, x, cy, y),
         (Obs::Rows(x, ox), Obs::Rows(y, oy)) => {
             if x.len() != y.len() {
                 return Some(true);
@@ -2809,6 +3350,7 @@ pub fn differ(a: &Obs, b: &Obs) -> Option<bool> {
 
 /// What to observe of a statement.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Probe {
     /// A data statement (SELECT, INSERT, UPDATE, DELETE, assignment, RETURN, DECLARE).
     Stmt(Stmt),
@@ -2830,7 +3372,7 @@ impl Ctx<'_> {
             // that fails or is decided the wrong way rejects the inputs.
             let t = match self.expr(e, &[], None) {
                 Ok(V::Err(_)) => {
-                    r = Err(Stop::Reject);
+                    r = rej();
                     break;
                 }
                 Ok(v) => truth(&v),
@@ -2839,7 +3381,7 @@ impl Ctx<'_> {
             match t {
                 Ok(t) if (t == Some(true)) == *must => {}
                 Ok(_) => {
-                    r = Err(Stop::Reject);
+                    r = rej();
                     break;
                 }
                 Err(Stop::Need(n)) => {
@@ -2913,7 +3455,7 @@ impl Ctx<'_> {
                                 };
                                 Ok(Obs::Assigned(pick.iter().cloned().map(Some).collect()))
                             } else {
-                                Err(Stop::Reject)
+                                rej()
                             }
                         }
                     };
@@ -2930,7 +3472,7 @@ impl Ctx<'_> {
                 };
                 if let (V::Str(s), Some(ty)) = (&v, name.and_then(|n| self.vars.get(&n)?.ty)) {
                     if ty.is_string() && ty.len.is_some_and(|l| s.chars().count() as u32 > l) {
-                        return Err(Stop::Reject);
+                        return rej();
                     }
                 }
                 Ok(match v {
@@ -2955,7 +3497,7 @@ impl Ctx<'_> {
                         let ty = Ty::from_type(t, self.d, false);
                         match ty.len {
                             Some(l) if ty.is_string() && s.chars().count() as u32 > l => {
-                                return Err(Stop::Reject)
+                                return rej()
                             }
                             _ => V::Str(s),
                         }
@@ -2969,6 +3511,8 @@ impl Ctx<'_> {
             }
             Stmt::Return(None) => Ok(Obs::Value(V::Null)),
             Stmt::Insert {
+                target,
+                cols,
                 source,
                 returning,
                 on_conflict,
@@ -2995,7 +3539,37 @@ impl Ctx<'_> {
                 if let Some(e) = first_error(&rows) {
                     return Ok(Obs::Error(e));
                 }
-                Ok(Obs::Rows(rows, false))
+                // Each value is converted to its column's type.
+                let key = table_key(target);
+                let names: Vec<String> = if cols.is_empty() {
+                    self.schema
+                        .table(&key)
+                        .map(|t| t.columns.iter().map(|c| c.name.clone()).collect())
+                        .unwrap_or_default()
+                } else {
+                    cols.iter().map(|c| c.to_lowercase()).collect()
+                };
+                let mut stored = Vec::new();
+                for r in rows {
+                    let mut out = Vec::new();
+                    for (j, v) in r.into_iter().enumerate() {
+                        let v = match names.get(j) {
+                            Some(c) => self.store(&key, c, v)?,
+                            None => v,
+                        };
+                        if let V::Err(e) = v {
+                            return Ok(Obs::Error(e));
+                        }
+                        out.push(v);
+                    }
+                    stored.push(out);
+                }
+                if names.len() < stored.iter().map(Vec::len).max().unwrap_or(0) {
+                    return Ok(Obs::Inserted(Vec::new(), stored));
+                }
+                let mut cols = names;
+                cols.truncate(stored.first().map_or(0, Vec::len));
+                Ok(Obs::Inserted(cols, stored))
             }
             Stmt::Update {
                 target,
@@ -3060,7 +3634,7 @@ impl Ctx<'_> {
             // FROM rows (T-SQL UPDATE ... FROM, PostgreSQL UPDATE ... FROM / DELETE ... USING).
             let mut product: Vec<Scope> = vec![Vec::new()];
             for f in from {
-                let rows = self.from_item(f, &[])?;
+                let rows = self.scope_of(f, &[])?;
                 let mut next = Vec::new();
                 for p in &product {
                     for r in &rows {
@@ -3117,20 +3691,80 @@ impl Ctx<'_> {
                             if cols.len() != 1 {
                                 return unsupported("multi-column SET");
                             }
-                            let v = self.expr(e, &[row.clone()], None)?;
+                            let col = cols[0].to_lowercase();
+                            let v = self.expr(e, std::slice::from_ref(row), None)?;
+                            let v = self.store(&key, &col, v)?;
                             if let V::Err(e) = v {
                                 return Ok(Obs::Error(e));
                             }
-                            vals.push(v);
+                            // The value before the update: a row set to the
+                            // value it already has does not change.
+                            let old = Expr::Name(vec![target_names[0].clone(), col.clone()]);
+                            let old = self.expr(&old, std::slice::from_ref(row), None)?;
+                            vals.push((col, v, old));
                         }
                     }
                     writes.push((i, vals));
                 }
                 // Several source rows for one target row: the value is unspecified.
-                _ => return Err(Stop::Reject),
+                _ => return rej(),
             }
         }
         Ok(Obs::Writes(writes))
+    }
+}
+
+impl Ctx<'_> {
+    /// A value stored into a table column, as both dialects convert it:
+    /// a string longer than the column fails (trailing blanks are dropped),
+    /// a decimal is rounded to the column's scale and fails when it does not
+    /// fit, an integer fails when out of range. Columns the catalog does not
+    /// type keep the value.
+    fn store(&mut self, table: &str, col: &str, v: V) -> R<V> {
+        let Some(ty) = self
+            .schema
+            .table(table)
+            .and_then(|t| t.column(col))
+            .map(|c| c.ty)
+        else {
+            return Ok(v);
+        };
+        let too_long = || V::Err(format!("value too long for column {col}"));
+        match (ty.fam, &v) {
+            (Fam::VarChar | Fam::Char, V::Str(s)) => match ty.len {
+                Some(l) if s.chars().count() > l as usize => {
+                    let kept: String = s.chars().take(l as usize).collect();
+                    if s.chars().skip(l as usize).all(|c| c == ' ') {
+                        Ok(V::Str(kept))
+                    } else {
+                        Ok(too_long())
+                    }
+                }
+                _ => Ok(v),
+            },
+            (Fam::Exact, V::Int(_) | V::Num(_)) | (Fam::Int, V::Int(_) | V::Num(_)) => {
+                let name = match (ty.fam, ty.len, ty.scale) {
+                    (Fam::Int, Some(1), _) => "BIT".to_string(),
+                    (Fam::Int, Some(16), _) => "SMALLINT".to_string(),
+                    (Fam::Int, Some(32), _) => "INT".to_string(),
+                    (Fam::Int, Some(64), _) => "BIGINT".to_string(),
+                    (Fam::Exact, Some(p), Some(sc)) => format!("DECIMAL({p},{sc})"),
+                    _ => return Ok(v),
+                };
+                let (name, args) = match name.split_once('(') {
+                    Some((n, a)) => (
+                        n.to_string(),
+                        a.trim_end_matches(')')
+                            .split(',')
+                            .map(str::to_string)
+                            .collect(),
+                    ),
+                    None => (name, Vec::new()),
+                };
+                self.cast(v, &Type { name, args })
+            }
+            _ => Ok(v),
+        }
     }
 }
 
@@ -3208,35 +3842,61 @@ pub fn search<'s>(make: &dyn Fn() -> Ctx<'s>, a: &Probe, b: &Probe) -> Result<Fo
     }
     let mut budget = BUDGET;
     let mut last_miss = Miss::NoWitness;
-    for shape in shapes {
-        let mut c = make();
-        c.shape = shape.clone();
-        match dfs(&mut c, a, b, &mut budget) {
-            Ok(Some(mut f)) => {
-                f.shape = shape;
-                return Ok(f);
+    // Limited discrepancy search: first every input at its first candidate,
+    // then with one input elsewhere, then two, and so on. Witnesses rarely
+    // need many inputs away from their first candidate, and most inputs
+    // (say, columns that are only selected) do not matter at all.
+    let mut done = vec![false; shapes.len()];
+    for limit in 0..=MAX_DISCREPANCIES {
+        for (k, shape) in shapes.iter().enumerate() {
+            if done[k] {
+                continue;
             }
-            Ok(None) => {}
-            Err(m) => {
-                last_miss = m;
-                if matches!(last_miss, Miss::Unsupported(_)) {
-                    return Err(last_miss);
+            let mut c = make();
+            c.shape = shape.clone();
+            let mut pruned = false;
+            match dfs(&mut c, a, b, &mut budget, limit, &mut pruned) {
+                Ok(Some(mut f)) => {
+                    f.shape = shape.clone();
+                    return Ok(f);
+                }
+                Ok(None) => {}
+                Err(m) => {
+                    last_miss = m;
+                    if matches!(last_miss, Miss::Unsupported(_)) {
+                        return Err(last_miss);
+                    }
                 }
             }
+            // Nothing was left out: this shape has no witness at all.
+            done[k] = !pruned;
+            if budget == 0 {
+                return Err(last_miss);
+            }
         }
-        if budget == 0 {
+        if done.iter().all(|d| *d) {
             break;
         }
     }
     Err(last_miss)
 }
 
+/// How many inputs may be away from their first candidate at most.
+const MAX_DISCREPANCIES: usize = 64;
+
 fn eval_side(c: &mut Ctx, p: &Probe, side: u8) -> R<Obs> {
     c.side = side;
     c.observe(p)
 }
 
-fn dfs(c: &mut Ctx, a: &Probe, b: &Probe, budget: &mut usize) -> Result<Option<Found>, Miss> {
+fn dfs(
+    c: &mut Ctx,
+    a: &Probe,
+    b: &Probe,
+    budget: &mut usize,
+    left: usize,
+    pruned: &mut bool,
+) -> Result<Option<Found>, Miss> {
     if *budget == 0 {
         return Ok(None);
     }
@@ -3284,10 +3944,15 @@ fn dfs(c: &mut Ctx, a: &Probe, b: &Probe, budget: &mut usize) -> Result<Option<F
         }
     };
     let cands = c.inputs[need].cands.clone();
-    for v in cands {
+    for (k, v) in cands.into_iter().enumerate() {
+        let cost = usize::from(k > 0);
+        if cost > left {
+            *pruned = true;
+            break;
+        }
         c.values[need] = Some(v);
         let n_inputs = c.inputs.len();
-        if let Some(f) = dfs(c, a, b, budget)? {
+        if let Some(f) = dfs(c, a, b, budget, left - cost, pruned)? {
             return Ok(Some(f));
         }
         // Forget inputs created below this choice.
@@ -3424,4 +4089,16 @@ fn expr_tables(e: &Expr, out: &mut Vec<String>) {
         Expr::Exists(q) | Expr::Subquery(q) | Expr::InQuery(_, q, _) => query_tables(q, out),
         _ => {}
     });
+}
+
+/// Rejects the current inputs; with SQLDIFF_DEBUG_SEARCH set, says where.
+#[track_caller]
+fn rej<T>() -> R<T> {
+    if std::env::var_os("SQLDIFF_DEBUG_SEARCH").is_some() {
+        eprintln!(
+            "    reject at line {}",
+            std::panic::Location::caller().line()
+        );
+    }
+    Err(Stop::Reject)
 }

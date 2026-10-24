@@ -5,10 +5,6 @@
 # then review the diff: only removals should appear unless you added cases.
 
 [[failing]]
-id = "m01-correlated-update-exists-removed:original~mutated"
-reason = "verdict unknown != different [WP10 idioms / cardinality]"
-
-[[failing]]
 id = "m04-lock-on-missing-row:original~mutated"
 reason = "no concurrency finding with verdict different [WP10 lock-intent analysis]"
 

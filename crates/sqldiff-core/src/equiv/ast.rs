@@ -454,6 +454,29 @@ impl<'a> Parser<'a> {
         self.peek().is_some_and(|t| t.kind == K::Op && t.text == op)
     }
 
+    /// The operator of a T-SQL compound assignment (`+=` ...) at the cursor.
+    fn compound_op(&self) -> Option<&'static str> {
+        self.peek_compound(0)
+    }
+
+    fn peek_compound(&self, at: usize) -> Option<&'static str> {
+        if self.d != Dialect::Tsql {
+            return None;
+        }
+        let t = self.peek_at(at)?;
+        if t.kind != K::Op {
+            return None;
+        }
+        Some(match t.text.as_str() {
+            "+=" => "+",
+            "-=" => "-",
+            "*=" => "*",
+            "/=" => "/",
+            "%=" => "%",
+            _ => return None,
+        })
+    }
+
     fn eat_op(&mut self, op: &str) -> bool {
         if self.is_op(op) {
             self.i += 1;
@@ -917,6 +940,8 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 Ok(Expr::Special(t.up.clone()))
             }
+            // LEFT(s, n) and RIGHT(s, n) are functions, not joins.
+            "LEFT" | "RIGHT" if self.is_kind_at(1, K::LParen) => self.name_or_call(),
             u if is_reserved(u) => Err(self.err("unexpected keyword in expression")),
             _ => self.name_or_call(),
         }
@@ -1294,6 +1319,18 @@ impl<'a> Parser<'a> {
                 assign: Some(v),
             });
         }
+        if self.is_kind(K::Var) && self.d == Dialect::Tsql {
+            if let Some(op) = self.peek_compound(1) {
+                let v = self.peek().unwrap().text.clone();
+                self.i += 2;
+                let e = self.expr()?;
+                return Ok(SelItem {
+                    expr: Expr::Bin(op.into(), Box::new(Expr::Var(v.clone())), Box::new(e)),
+                    alias: None,
+                    assign: Some(v),
+                });
+            }
+        }
         let expr = self.expr()?;
         let alias = self.alias()?;
         Ok(SelItem {
@@ -1482,16 +1519,29 @@ impl<'a> Parser<'a> {
     fn set_list(&mut self) -> PResult<Vec<(Vec<String>, Expr)>> {
         let mut sets = Vec::new();
         loop {
+            let mut target = None;
             let cols = if self.is_kind(K::LParen) {
                 self.col_list()?
             } else {
                 let n = self.qname()?;
-                vec![n.last().cloned().unwrap_or_default()]
+                let c = vec![n.last().cloned().unwrap_or_default()];
+                target = Some(n);
+                c
             };
-            if !self.eat_op("=") {
-                return Err(self.err("expected ="));
-            }
-            let e = self.expr()?;
+            // T-SQL `SET col += e` is `SET col = col + e`.
+            let e = match (self.compound_op(), target) {
+                (Some(op), Some(n)) => {
+                    self.i += 1;
+                    let e = self.expr()?;
+                    Expr::Bin(op.into(), Box::new(Expr::Name(n)), Box::new(e))
+                }
+                _ => {
+                    if !self.eat_op("=") {
+                        return Err(self.err("expected ="));
+                    }
+                    self.expr()?
+                }
+            };
             sets.push((cols, e));
             if !self.eat_kind(K::Comma) {
                 break;
@@ -1570,10 +1620,20 @@ impl<'a> Parser<'a> {
                     }
                     _ => Expr::Name(self.qname()?),
                 };
-                if !self.eat_op("=") {
-                    return Err(self.err("expected ="));
+                if let Some(op) = self.compound_op() {
+                    // T-SQL `SET @v += e` is `SET @v = @v + e`.
+                    self.i += 1;
+                    let e = self.expr()?;
+                    Stmt::Assign(
+                        target.clone(),
+                        Expr::Bin(op.into(), Box::new(target), Box::new(e)),
+                    )
+                } else {
+                    if !self.eat_op("=") {
+                        return Err(self.err("expected ="));
+                    }
+                    Stmt::Assign(target, self.expr()?)
                 }
-                Stmt::Assign(target, self.expr()?)
             }
             "DECLARE" => self.declare()?,
             _ if self.is_kind_at(1, K::Op) && self.peek_at(1).unwrap().text == ":=" => {
