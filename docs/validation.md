@@ -11,6 +11,7 @@ How the design §12 checks run, and how a work package proves its §14 gate.
 | Core passes with no pack loaded | empty `HOME`/XDG dirs, no config in the tree | `validation / golden` |
 | AI separation (placeholder) | no network client in engine crates; byte-identical runs | `validation / separation` |
 | Fixture format, creation on PG 18 / SQL Server 2022 | `corpus/tools/check_corpus.py` | `corpus` workflow |
+| No `different` on unmodified real code | `scripts/real-code-gate.py`, `corpus/real-code/sources.json` | `real-code` workflow |
 
 ## Corpus golden runner
 
@@ -40,6 +41,27 @@ cargo run -p sqldiff-corpus --bin corpus-report -- --write-known-failing
 Milestones M5a/M5b (behavioural diff) are proved by
 `crates/sqldiff-core/tests/witnesses.rs` together with the oracle run; see
 `docs/behavioural-diff.md`.
+
+## Real-code gate
+
+`scripts/real-code-gate.py` checks out pinned commits of public SQL that runs on its
+target database (pg_partman, pgmq, IBM i examples, sakila, Ola Hallengren's
+maintenance solution, WideWorldImporters) and runs `sqldiff check` on every `.sql`
+file. Any finding with verdict "different" fails the gate: on code that runs, it is a
+false positive. Files that are not UTF-8 are skipped and counted.
+
+```
+cargo build --release -p sqldiff-cli
+python3 scripts/real-code-gate.py                 # all sources
+python3 scripts/real-code-gate.py --only pgmq     # one source
+```
+
+Where the binder cannot read its input faithfully, binding errors are reported as
+"unknown" with an `ASM-BIND-UNREAD:*` assumption instead of "different": template
+placeholders and client directives (`@extschema@`, `${name}`, `$(name)`, `{{ }}`,
+psql `:name` and `\` commands, SQLCMD `:r` / `:setvar`), routine headers that do
+not parse, and statements with parse problems. `crates/sqldiff-core/tests/real_code.rs`
+pairs each fixed false positive with a twin that still has the error.
 
 ## Fuzzing
 

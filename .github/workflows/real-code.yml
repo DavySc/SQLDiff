@@ -1,0 +1,22 @@
+name: real-code
+
+# `sqldiff check` on pinned, unmodified public SQL (corpus/real-code/sources.json)
+# must report no `different` finding: each one is a false positive.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/real-code
+          key: real-code-${{ hashFiles('corpus/real-code/sources.json') }}
+      - run: cargo build --release -p sqldiff-cli
+      - run: python3 scripts/real-code-gate.py
