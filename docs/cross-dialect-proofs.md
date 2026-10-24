@@ -75,6 +75,14 @@ with the other objects blanked, so line numbers are those of the file.
 Same-named objects of one dialect (PostgreSQL triggers named per table) are
 reported as ambiguous and not paired.
 
+When only one side splits a file (A's `s.sql` holds `t` and `u`, B's `s.sql`
+only `t`), B's whole file pairs with `s.sql#t` (pairing rule `split-object`)
+under three conditions. First, the two files would pair by key unsplit.
+Second, B's file defines exactly one table, view or routine, and it has the
+same kind, name and schema as the object (`dbo`, `public` and no schema
+count as the same). Third, each is the only candidate for the other. `u`
+stays "only in A". Anything else stays unpaired and is reported as such.
+
 ## Benchmark
 
 `eval/cross-dialect/` in the project files: `bench.py` converts the

@@ -105,6 +105,7 @@ pub(crate) fn objects(
     whole.dialect = Some(d.id().to_string());
     let parts = crate::split::parts(text, d);
     if parts.is_empty() {
+        whole.defines = defined_name(text, d);
         return vec![whole];
     }
     parts
@@ -113,6 +114,7 @@ pub(crate) fn objects(
             let t = crate::split::blank_outside(text, &p.ranges);
             ObjectInfo {
                 id: format!("{rel}#{}", p.fragment),
+                defines: p.defines(),
                 kind: p.kind,
                 name: p.name,
                 content_hash: sqldiff_core::artifact::content_hash(&t),
@@ -120,6 +122,20 @@ pub(crate) fn objects(
             }
         })
         .collect()
+}
+
+/// The info [`objects`] lists for a file read whole.
+pub(crate) fn whole_info(
+    rel: &str,
+    text: &str,
+    config: &Resolved,
+    last_changed: Option<String>,
+    dialect: Option<Dialect>,
+) -> ObjectInfo {
+    objects(rel, text, config, last_changed.clone(), dialect)
+        .into_iter()
+        .find(|o| o.id == rel)
+        .unwrap_or_else(|| object_info(rel, text, config, last_changed))
 }
 
 /// Text of an object id read through `read` (relative path → file text):
@@ -191,6 +207,7 @@ pub(crate) fn object_info(
         bytes: text.len(),
         last_changed,
         stale: false,
+        defines: None,
     }
 }
 

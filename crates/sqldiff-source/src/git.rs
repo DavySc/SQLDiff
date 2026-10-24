@@ -14,7 +14,7 @@ use crate::protocol::{
     ArtifactData, Describe, HistoryEntry, ObjectFilter, ObjectInfo, Pair, PairScope, Provenance,
 };
 use crate::source::Source;
-use crate::walk::{is_candidate, object_info, objects};
+use crate::walk::{is_candidate, objects, whole_info};
 use crate::{pairing, Error, Resolved, Result};
 
 pub struct GitSource {
@@ -292,7 +292,7 @@ impl Source for GitSource {
         )?;
         let mut f = last.trim().split('\x1f');
         let (revision, time, author) = (f.next(), f.next(), f.next());
-        let mut info = object_info(&rel, &text, &self.config, time.map(String::from));
+        let mut info = whole_info(&rel, &text, &self.config, time.map(String::from), None);
         let mut text = text;
         if let Some(frag) = &frag {
             let want = format!("{rel}#{frag}");
