@@ -35,7 +35,8 @@ Base and head files are paired, in order:
 Each pair is diffed base (A) against head (B) with the same engine, packs,
 review store and markers as `sqldiff diff`. An added file has nothing to be
 compared with: it is checked on its own (lints, binding) and counts as
-`unknown`.
+`unknown`. So is a head file whose base side has no dialect or is
+unreadable; the base path is listed as not compared.
 
 ## Verdict and exit code
 
@@ -123,8 +124,8 @@ The Action builds `sqldiff` from its own source (cached by source hash; pass
 request's base commit to its head commit, writes the summary to the job
 summary, uploads the SARIF for `refs/pull/N/head` at the head commit (the
 lines it was computed on), and creates or updates the comment. On a pull
-request from a fork the token is read-only: the comment step warns and the
-job summary still has it. Inputs and outputs are listed in `action.yml`.
+request from a fork the token is read-only: the SARIF upload and the comment
+step warn instead of failing, and the job summary still has the report. Inputs and outputs are listed in `action.yml`.
 [`.github/workflows/action-selftest.yml`](../.github/workflows/action-selftest.yml)
 runs the Action on a scratch repository in CI.
 

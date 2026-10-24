@@ -481,3 +481,28 @@ fn tree_pairs_same_named_files_by_the_object_they_define() {
     assert_eq!(amb.len(), 2, "{r:#}");
     assert!(amb.iter().all(|a| a["key"] == "misc"));
 }
+
+#[test]
+fn a_rename_from_an_unknown_dialect_still_checks_the_head_file() {
+    let (root, repo) = new_repo("from-no-dialect");
+    put(&repo, "misc/p.sql", "CREATE PROCEDURE dbo.P AS SELECT 1;\n");
+    commit(&repo, "base");
+    git(&repo, &["branch", "base"]);
+    std::fs::create_dir_all(repo.join("tsql")).unwrap();
+    git(&repo, &["mv", "misc/p.sql", "tsql/p.sql"]);
+    put(
+        &repo,
+        "tsql/p.sql",
+        "CREATE PROCEDURE dbo.P AS SELECT 1;\n-- moved\n",
+    );
+    commit(&repo, "head");
+    let r = json(&changes(&root, &repo, &["--base", "base", "-f", "json"]));
+    assert_eq!(entry(&r, "tsql/p.sql")["change"], "added");
+    let not = r["not_compared"].as_array().unwrap();
+    assert!(
+        not.iter()
+            .any(|n| n["what"] == "no dialect" && n["path"] == "misc/p.sql"),
+        "{r:#}"
+    );
+    assert_eq!(r["verdict"], "unknown");
+}

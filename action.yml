@@ -138,6 +138,8 @@ runs:
 
     - name: Upload SARIF
       if: inputs.upload-sarif == 'true'
+      # A fork's token cannot upload; the comment and job summary still report.
+      continue-on-error: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
       uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: ${{ steps.run.outputs.sarif }}
@@ -156,8 +158,11 @@ runs:
         BODY: ${{ steps.run.outputs.markdown }}
       run: |
         marker='<!-- sqldiff:changes -->'
+        # Our own earlier comment: by login with a personal token, else by bot.
+        me=$(gh api user --jq .login 2>/dev/null) || me=""
+        if [ -n "$me" ]; then who=".user.login == \"$me\""; else who='.user.type == "Bot"'; fi
         id=$(gh api "repos/$REPOSITORY/issues/$PR/comments" --paginate \
-          --jq ".[] | select(.user.type == \"Bot\" and (.body | startswith(\"$marker\"))) | .id" | head -n 1) || id=""
+          --jq ".[] | select(($who) and (.body | startswith(\"$marker\"))) | .id" | head -n 1) || id=""
         if [ -n "$id" ] && gh api -X PATCH "repos/$REPOSITORY/issues/comments/$id" -F "body=@$BODY" > /dev/null; then
           echo "Updated comment $id"
         elif gh api -X POST "repos/$REPOSITORY/issues/$PR/comments" -F "body=@$BODY" > /dev/null; then

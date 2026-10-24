@@ -361,15 +361,14 @@ pub fn changes(scope: &ChangeScope<'_>, cfg: &Resolved) -> Result<ChangeSet> {
                     set.removed.push(base);
                 }
             }
-            (None, Some(head)) => {
-                if !a {
-                    set.added.push(head);
-                }
-            }
+            // A base side that has no dialect or is unreadable is listed
+            // there; the head file is still checked on its own.
+            (None, Some(head)) => set.added.push(head),
             (None, None) => {}
         }
     }
     pair_by_name(&mut set);
+    set.no_dialect.sort();
     set.no_dialect.dedup();
     Ok(set)
 }
@@ -443,12 +442,14 @@ pub struct LineMap {
     head_lines: usize,
 }
 
-/// Beyond this many inserted plus deleted lines the diff is not computed:
-/// a file rewritten this much has no meaningful line correspondence.
-const MAX_EDIT: usize = 20_000;
+/// The diff keeps `2d + 1` entries per edit step `d`, so memory grows with
+/// the square of the edit distance. Past this many entries (128 MB, about
+/// 2 800 inserted plus deleted lines) it stops: a file rewritten this much
+/// has no useful line correspondence, and the caller says so.
+const MAX_TRACE: usize = 16 << 20;
 
 impl LineMap {
-    /// `None` when the texts differ in more than [`MAX_EDIT`] lines.
+    /// `None` when the texts differ too much to map (see [`MAX_TRACE`]).
     pub fn new(base: &str, head: &str) -> Option<LineMap> {
         let a: Vec<&str> = base.lines().collect();
         let b: Vec<&str> = head.lines().collect();
@@ -509,9 +510,11 @@ fn myers(a: &[&str], b: &[&str]) -> Option<Vec<(usize, usize)>> {
     let mut v = vec![0isize; 2 * max + 3];
     // trace[d] holds v[k] for k in -d..=d as it was before step d.
     let mut trace: Vec<Vec<isize>> = Vec::new();
+    let mut kept = 0usize;
     let mut found = None;
     'outer: for d in 0..=max as isize {
-        if d as usize > MAX_EDIT {
+        kept += 2 * d as usize + 1;
+        if kept > MAX_TRACE {
             return None;
         }
         trace.push(v[(off - d) as usize..=(off + d) as usize].to_vec());
@@ -655,6 +658,21 @@ mod tests {
                 after: 0,
                 replaced: false
             }
+        );
+    }
+
+    #[test]
+    fn a_full_rewrite_gives_up_quickly() {
+        let a: String = (0..9_000).map(|i| format!("a{i}\n")).collect();
+        let b: String = (0..9_000).map(|i| format!("b{i}\n")).collect();
+        let t = std::time::Instant::now();
+        assert!(LineMap::new(&a, &b).is_none());
+        assert!(t.elapsed() < std::time::Duration::from_secs(5));
+        // Small edits in a large file still map.
+        let c = a.replacen("a4500\n", "", 1);
+        assert_eq!(
+            LineMap::new(&a, &c).unwrap().map(4502),
+            HeadLine::Same(4501)
         );
     }
 
