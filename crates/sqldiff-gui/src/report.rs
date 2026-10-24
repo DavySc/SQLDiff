@@ -128,6 +128,17 @@ pub fn markdown(
         info.loaded_at,
         if red.is_on() { " · redacted" } else { "" }
     );
+    if let Some(names) = &info.template {
+        let _ = writeln!(
+            o,
+            "- mode: templates, {}",
+            match (names.is_empty(), red.is_on()) {
+                (true, _) => "placeholders by pack rules".to_string(),
+                (false, true) => format!("{} given parameter(s)", names.len()),
+                (false, false) => format!("parameters {}", names.join(", ")),
+            }
+        );
+    }
     let layers: Vec<String> = info
         .layers
         .iter()

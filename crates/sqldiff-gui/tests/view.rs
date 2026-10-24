@@ -510,3 +510,115 @@ fn server_serves_page_and_rediffs_edits() {
     )
     .starts_with("HTTP/1.1 200"));
 }
+
+const TPL_A: &str = "update [TAB] set [qty] = 0;\n";
+const TPL_B: &str = "update [TAB] set qty = 0;\n";
+
+/// A pack with the `[template]` syntax and two template files: `[TAB]` is a
+/// parameter; in T-SQL `[qty]` is a quoted column.
+fn template_dir(name: &str) -> (Resolved, std::path::PathBuf) {
+    use sqldiff_source::config::Sources;
+    let dir = std::env::temp_dir().join(format!("sqldiff-gui-tpl-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("pack.toml"),
+        "[pack]\nname = \"t\"\nversion = \"1\"\n\n[template]\nopen = \"[\"\nclose = \"]\"\n\
+         name_pattern = \"[A-Z][A-Z0-9_]*\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("upd.tsql.sql"), TPL_A).unwrap();
+    std::fs::write(dir.join("upd.db2i.sql"), TPL_B).unwrap();
+    let mut c = Resolved::load(&Sources {
+        isolated: true,
+        packs: vec![dir.clone()],
+        ..Sources::default()
+    })
+    .unwrap();
+    c.data_dir = dir.join("data");
+    (c, dir)
+}
+
+fn template_session(name: &str, known: Option<&[&str]>) -> Session {
+    use sqldiff_gui::session::TemplateMode;
+    let (c, dir) = template_dir(name);
+    let template = TemplateMode {
+        placeholders: sqldiff_source::tree::placeholders(&c).unwrap(),
+        known: known.map(|k| k.iter().map(|s| s.to_string()).collect()),
+    };
+    Session::open_with(
+        Origin::detect(dir.join("upd.tsql.sql"), dir.join("upd.db2i.sql")),
+        None,
+        None,
+        c,
+        Some(template),
+        Store::in_memory(),
+    )
+    .unwrap()
+}
+
+fn rules(r: &sqldiff_core::Report) -> Vec<String> {
+    let mut v: Vec<String> = r.findings.iter().map(|f| f.rule.clone()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn template_mode_diffs_fragments_everywhere_in_the_session() {
+    let s = template_session("mode", Some(&["TAB"]));
+    let r = s.report(0).unwrap();
+    // As the CLI's template diff: the same SQL once `[TAB]` is a placeholder,
+    // and the T-SQL `[qty]` a quoted name, not a placeholder.
+    let (c, _) = template_dir("mode-cli");
+    let (a, b) = (
+        Artifact::new("a", Dialect::Tsql, TPL_A),
+        Artifact::new("b", Dialect::Db2i, TPL_B),
+    );
+    let tab = ["TAB".to_string()].into();
+    let cli = sqldiff_source::tree::template_diff(
+        &a,
+        &b,
+        [Some(&tab), Some(&tab)],
+        &c,
+        &Options::default(),
+    )
+    .unwrap();
+    assert_eq!(r.verdict, cli.verdict);
+    assert_eq!(rules(&r), rules(&cli));
+    // Read as plain SQL, the same pair reports otherwise.
+    let plain = sqldiff_source::tree::diff(&a, &b, &c);
+    assert!(
+        rules(&plain) != rules(&cli) || plain.verdict != cli.verdict,
+        "{:?}",
+        rules(&plain)
+    );
+    // Scratch edits re-diff as templates too.
+    let p = s.scratch(0, TPL_A.into(), TPL_B.into()).unwrap();
+    assert_eq!(rules(&p.report), rules(&cli));
+    // The page and the session report say which mode this is.
+    assert_eq!(s.info().template, Some(vec!["TAB".to_string()]));
+    let md = s.session_report(false).unwrap();
+    assert!(md.contains("- mode: templates, parameters TAB"), "{md}");
+    let md = s.session_report(true).unwrap();
+    assert!(
+        md.contains("- mode: templates, 1 given parameter(s)"),
+        "{md}"
+    );
+}
+
+#[test]
+fn template_mode_without_parameters_uses_the_pack_rules() {
+    let s = template_session("rules", None);
+    assert_eq!(s.info().template, Some(Vec::new()));
+    // Without a parameter list the pattern decides, and the report says so.
+    let r = s.report(0).unwrap();
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("taken as placeholders by the name pattern")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(s.overlay(0).is_some());
+    assert_eq!(pair_session().info().template, None);
+}

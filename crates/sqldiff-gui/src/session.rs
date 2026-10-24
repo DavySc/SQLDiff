@@ -46,6 +46,14 @@ pub enum Flip {
     Denied,
 }
 
+/// Template mode: both sides of every pair are templates in the pack's
+/// `[template]` syntax, read with the shared placeholder rules.
+pub struct TemplateMode {
+    pub placeholders: sqldiff_source::compose::Placeholders,
+    /// Parameter names given with `--parameter`, for both sides.
+    pub known: Option<BTreeSet<String>>,
+}
+
 struct Loaded {
     pair: TreePair,
     sides: Option<(Artifact, Artifact)>,
@@ -61,6 +69,7 @@ pub struct Session {
     dialect_a: Option<Dialect>,
     dialect_b: Option<Dialect>,
     cfg: Resolved,
+    template: Option<TemplateMode>,
     tree: Tree,
     pairs: Vec<Loaded>,
     flips: BTreeMap<String, Flip>,
@@ -120,6 +129,9 @@ pub struct SessionInfo {
     pub only_b: Vec<String>,
     pub ambiguous: Vec<Ambiguous>,
     pub no_dialect: Vec<String>,
+    /// In template mode, the parameter names given with `--parameter` (empty:
+    /// none, the pack's rules decide); absent outside template mode.
+    pub template: Option<Vec<String>>,
 }
 
 /// What the page embeds.
@@ -141,11 +153,24 @@ impl Session {
         cfg: Resolved,
         store: Store,
     ) -> Result<Session, String> {
+        Session::open_with(origin, dialect_a, dialect_b, cfg, None, store)
+    }
+
+    /// [`Session::open`], in template mode when `template` is given.
+    pub fn open_with(
+        origin: Origin,
+        dialect_a: Option<Dialect>,
+        dialect_b: Option<Dialect>,
+        cfg: Resolved,
+        template: Option<TemplateMode>,
+        store: Store,
+    ) -> Result<Session, String> {
         let mut s = Session {
             origin,
             dialect_a,
             dialect_b,
             cfg,
+            template,
             tree: Tree::default(),
             pairs: Vec::new(),
             flips: BTreeMap::new(),
@@ -182,7 +207,7 @@ impl Session {
             .map(|p| match tree.read(p, &self.cfg) {
                 Ok((a, b)) => Loaded {
                     pair: p.clone(),
-                    base: Some(tree::diff(&a, &b, &self.cfg)),
+                    base: Some(self.diff(&a, &b, &self.cfg.options())),
                     rerun: None,
                     sides: Some((a, b)),
                     error: None,
@@ -215,6 +240,38 @@ impl Session {
         self.pairs.len()
     }
 
+    /// The pair's report with pack config: as templates in template mode,
+    /// else as plain SQL. Every diff of the session goes through here.
+    fn diff(&self, a: &Artifact, b: &Artifact, opts: &sqldiff_core::Options) -> Report {
+        match &self.template {
+            Some(t) => tree::template_diff_with(
+                a,
+                b,
+                [t.known.as_ref(), t.known.as_ref()],
+                &t.placeholders,
+                &self.cfg,
+                opts,
+            ),
+            None => tree::diff_with(a, b, &self.cfg, opts),
+        }
+    }
+
+    /// The texts the analyses read: in template mode each side's SQL
+    /// fragment (placeholders as identifiers on the same lines), else the
+    /// sides as they are.
+    fn analysed(&self, a: &Artifact, b: &Artifact) -> (Artifact, Artifact) {
+        let fragment = |x: &Artifact| match &self.template {
+            Some(t) => {
+                let (tpl, _) = t.placeholders.parse(&x.text, x.dialect, t.known.as_ref());
+                let mut f = x.clone();
+                f.text = tpl.fragment().text;
+                f
+            }
+            None => x.clone(),
+        };
+        (fragment(a), fragment(b))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
     }
@@ -245,13 +302,16 @@ impl Session {
     /// the behavioural analysis), or drops the re-runs when there are none.
     fn rerun(&mut self) {
         let opts = self.scenario_options(&self.flip_map());
-        for l in &mut self.pairs {
-            l.rerun = match &l.sides {
-                Some((a, b)) if !opts.flips.is_empty() => {
-                    Some(tree::diff_with(a, b, &self.cfg, &opts))
-                }
+        let reruns: Vec<Option<Report>> = self
+            .pairs
+            .iter()
+            .map(|l| match &l.sides {
+                Some((a, b)) if !opts.flips.is_empty() => Some(self.diff(a, b, &opts)),
                 _ => None,
-            };
+            })
+            .collect();
+        for (l, r) in self.pairs.iter_mut().zip(reruns) {
+            l.rerun = r;
         }
     }
 
@@ -307,9 +367,10 @@ impl Session {
         kind: sqldiff_core::ir::ErrorKind,
     ) -> Option<sqldiff_core::ir::witness::WhatIf> {
         let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
+        let (a, b) = self.analysed(a, b);
         Some(sqldiff_core::what_if(
-            a,
-            b,
+            &a,
+            &b,
             &self.options(),
             side,
             line,
@@ -320,7 +381,8 @@ impl Session {
     /// Transaction brackets of both sides of pair `i`.
     pub fn overlay(&self, i: usize) -> Option<sqldiff_core::ir::overlay::Overlay> {
         let (a, b) = self.pairs.get(i)?.sides.as_ref()?;
-        Some(sqldiff_core::overlay(a, b))
+        let (a, b) = self.analysed(a, b);
+        Some(sqldiff_core::overlay(&a, &b))
     }
 
     /// Scratchpad texts diffed as pair `i` (same paths, dialects and versions).
@@ -330,12 +392,7 @@ impl Session {
         a.text = ta;
         b.text = tb;
         let opts = self.scenario_options(&self.flip_map());
-        let mut p = build_view(
-            &a,
-            &b,
-            self.flipped(tree::diff_with(&a, &b, &self.cfg, &opts)),
-            true,
-        );
+        let mut p = build_view(&a, &b, self.flipped(self.diff(&a, &b, &opts)), true);
         p.index = i;
         // Decisions belong to the files on disk: show them for the findings the edit still has.
         let disk = sqldiff_review::snapshot(self.pairs[i].base.as_ref()?);
@@ -478,7 +535,7 @@ impl Session {
                 deny.insert(id.clone(), false);
                 let denied = match &l.sides {
                     Some((a, b)) if RERUN_ASSUMPTIONS.contains(&id.as_str()) => {
-                        let mut r = tree::diff_with(a, b, &self.cfg, &self.scenario_options(&deny));
+                        let mut r = self.diff(a, b, &self.scenario_options(&deny));
                         sqldiff_core::ledger::relabel(&mut r, &deny);
                         r
                     }
@@ -528,6 +585,12 @@ impl Session {
             only_b: self.tree.only_b.clone(),
             ambiguous: self.tree.ambiguous.clone(),
             no_dialect: self.tree.no_dialect.clone(),
+            template: self.template.as_ref().map(|t| {
+                t.known
+                    .as_ref()
+                    .map(|k| k.iter().cloned().collect())
+                    .unwrap_or_default()
+            }),
         }
     }
 

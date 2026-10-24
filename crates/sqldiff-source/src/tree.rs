@@ -107,8 +107,10 @@ pub fn template_report(
     r
 }
 
-/// [`template_report`] with pack policy (limit rules, overrides, declared
-/// assumptions), as [`diff`] adds it to an engine diff.
+/// [`template_report`] with compositions and pack policy (limit rules,
+/// overrides, declared assumptions), as [`diff`] adds them to an engine diff.
+/// Compiles the placeholder rules for one call; use [`template_diff_with`]
+/// to reuse them.
 pub fn template_diff(
     a: &Artifact,
     b: &Artifact,
@@ -116,18 +118,33 @@ pub fn template_diff(
     cfg: &Resolved,
     opts: &Options,
 ) -> Result<Report> {
+    let placeholders = placeholders(cfg)?;
+    Ok(template_diff_with(a, b, known, &placeholders, cfg, opts))
+}
+
+/// The config's placeholder rules, compiled.
+pub fn placeholders(cfg: &Resolved) -> Result<Placeholders> {
     let t = cfg
         .policy
         .template
         .as_ref()
         .ok_or_else(|| Error::new("no [template] syntax in the loaded packs or config"))?;
-    let placeholders = Placeholders::new(t)?;
-    Ok(with_policy(
-        template_report(a, b, known, &placeholders, opts),
-        a,
-        Some(b),
-        cfg,
-    ))
+    Placeholders::new(t)
+}
+
+/// [`diff_with`] for two templates: [`template_report`], then compositions
+/// and pack policy.
+pub fn template_diff_with(
+    a: &Artifact,
+    b: &Artifact,
+    known: [Option<&BTreeSet<String>>; 2],
+    placeholders: &Placeholders,
+    cfg: &Resolved,
+    opts: &Options,
+) -> Report {
+    let mut r = template_report(a, b, known, placeholders, opts);
+    crate::compose::apply(&mut r, a, Some(b), &cfg.policy, None, opts);
+    with_policy(r, a, Some(b), cfg)
 }
 
 /// [`diff`] with explicit engine options (e.g. scenario flips).
