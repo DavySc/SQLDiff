@@ -269,3 +269,33 @@ fn where_brackets_are_not_sql_a_wider_name_pattern_applies() {
         rules(&r)
     );
 }
+
+#[test]
+fn a_convention_plus_the_item_list_decides_in_t_sql() {
+    let pack = format!("{PACK}placeholders = \"pattern\"\nignore_case = true\n");
+    let cfg = cfg_with(&pack, "convention-list");
+    let listed: BTreeSet<String> = ["COMMA".to_string()].into();
+    let text = "select a[comma] b from [TAB] where [read] = 1;\n";
+    let r = tree::template_diff(
+        &Artifact::new("a.sql", Dialect::Tsql, text),
+        &Artifact::new("b.sql", Dialect::Tsql, text),
+        [Some(&listed), Some(&listed)],
+        &cfg,
+        &Options::default(),
+    )
+    .unwrap();
+    assert!(
+        !rules(&r).contains(&"template.unresolved"),
+        "{:?}",
+        rules(&r)
+    );
+    let a = r
+        .assumptions
+        .iter()
+        .find(|a| a.id == "ASM-TEMPLATE-PLACEHOLDER-PATTERN-A")
+        .expect("declared convention");
+    // `[TAB]` by convention, `[comma]` because the items list it; `[read]`
+    // stays a quoted name.
+    assert!(a.text.contains("([COMMA], [TAB])"), "{}", a.text);
+    assert!(!a.text.contains("READ"), "{}", a.text);
+}

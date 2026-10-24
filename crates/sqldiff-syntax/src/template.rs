@@ -98,6 +98,17 @@ pub struct Segment {
     pub end: usize,
 }
 
+/// What a match of the name pattern is, as [`Template::parse_with`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// A placeholder.
+    Placeholder,
+    /// Looks like a placeholder but is not one: kept as SQL and reported.
+    Unresolved,
+    /// Plain SQL (for example a quoted name), not reported.
+    Sql,
+}
+
 /// A template split into segments. Segments are contiguous and cover every
 /// byte, so [`Template::print`] returns the input.
 #[derive(Debug, Clone)]
@@ -250,6 +261,26 @@ impl Template {
     /// parameter becomes [`SegmentKind::Unresolved`]; without, every match is
     /// a placeholder.
     pub fn parse(text: &str, syntax: &Compiled, known: Option<&BTreeSet<String>>) -> Template {
+        let ignore_case = syntax.ignore_case;
+        Template::parse_with(text, syntax, &|raw: &str| match known {
+            Some(k)
+                if !k.contains(raw)
+                    && !(ignore_case && k.iter().any(|x| x.eq_ignore_ascii_case(raw))) =>
+            {
+                Decision::Unresolved
+            }
+            _ => Decision::Placeholder,
+        })
+    }
+
+    /// Splits `text`, deciding for each match of the name pattern (by its
+    /// name as written) whether it is a placeholder, an unresolved candidate,
+    /// or plain SQL.
+    pub fn parse_with(
+        text: &str,
+        syntax: &Compiled,
+        decide: &dyn Fn(&str) -> Decision,
+    ) -> Template {
         let mut marks: Vec<Segment> = Vec::new();
         for (form, re) in &syntax.specials {
             for c in re.captures_iter(text) {
@@ -284,13 +315,10 @@ impl Template {
             } else {
                 raw.to_string()
             };
-            let is_known = |k: &BTreeSet<String>| {
-                k.contains(&name)
-                    || (syntax.ignore_case && k.iter().any(|x| x.eq_ignore_ascii_case(&name)))
-            };
-            let kind = match known {
-                Some(k) if !is_known(k) => SegmentKind::Unresolved { name },
-                _ => SegmentKind::Placeholder { name },
+            let kind = match decide(raw) {
+                Decision::Sql => continue,
+                Decision::Unresolved => SegmentKind::Unresolved { name },
+                Decision::Placeholder => SegmentKind::Placeholder { name },
             };
             marks.push(Segment {
                 kind,

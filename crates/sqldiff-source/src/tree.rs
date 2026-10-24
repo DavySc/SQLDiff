@@ -84,8 +84,8 @@ pub fn template_report(
         delimiters_quote_names, remap_to_template, template_notes, PlaceholderBasis,
     };
     use sqldiff_core::model::Side;
-    use sqldiff_syntax::template::Compiled;
     use sqldiff_syntax::template::Template;
+    use sqldiff_syntax::template::{Compiled, Decision};
 
     let t = cfg
         .policy
@@ -111,29 +111,59 @@ pub fn template_report(
         }
     };
     let by_pattern = t.placeholders.as_deref() == Some("pattern");
-    let with_pack = |k: Option<&BTreeSet<String>>| {
-        k.filter(|_| !by_pattern).map(|k| {
+    // A side's parameter list, with the generator-supplied names added.
+    let full = |k: Option<&BTreeSet<String>>| {
+        k.map(|k| {
             k.iter()
                 .chain(t.known_parameters.iter())
                 .cloned()
                 .collect::<BTreeSet<String>>()
         })
     };
+    let (la, lb) = (full(known[0]), full(known[1]));
+    // Under a declared convention a name `name_pattern` matches (as written)
+    // is a placeholder, and so is a name the side's list holds even where the
+    // convention would not make it one (a lower-case parameter in T-SQL);
+    // any other delimited name is SQL.
+    let convention = regex::Regex::new(&format!("^(?:{})$", t.name_pattern))
+        .map_err(|e| Error::new(format!("template.name_pattern: {e}")))?;
+    let any_name = {
+        let mut def = crate::compose::syntax_def(t);
+        def.name_pattern = "[A-Za-z_][A-Za-z0-9_]*".into();
+        Compiled::new(&def).map_err(Error::new)?
+    };
+    let parse = |text: &str, d: Dialect, list: &Option<BTreeSet<String>>| -> Template {
+        match list {
+            _ if !by_pattern => Template::parse(text, syntax_for(d), list.as_ref()),
+            Some(l) if delimiters_quote_names(&t.open, d) => {
+                let listed = |n: &str| {
+                    l.contains(n) || (t.ignore_case && l.iter().any(|x| x.eq_ignore_ascii_case(n)))
+                };
+                Template::parse_with(text, &any_name, &|raw| {
+                    if convention.is_match(raw) || listed(raw) {
+                        Decision::Placeholder
+                    } else {
+                        Decision::Sql
+                    }
+                })
+            }
+            _ => Template::parse(text, syntax_for(d), None),
+        }
+    };
     let basis = |k: &Option<BTreeSet<String>>| match (k, by_pattern) {
         (_, true) => PlaceholderBasis::DeclaredPattern,
         (Some(_), false) => PlaceholderBasis::Parameters,
         (None, false) => PlaceholderBasis::Pattern,
     };
-    let (ka, kb) = (with_pack(known[0]), with_pack(known[1]));
-    let ta = Template::parse(&a.text, syntax_for(a.dialect), ka.as_ref());
-    let tb = Template::parse(&b.text, syntax_for(b.dialect), kb.as_ref());
+    let ta = parse(&a.text, a.dialect, &la);
+    let tb = parse(&b.text, b.dialect, &lb);
     let (fa, fb) = (ta.fragment(), tb.fragment());
     let mut xa = a.clone();
     xa.text = fa.text.clone();
     let mut xb = b.clone();
     xb.text = fb.text.clone();
     let mut r = sqldiff_core::diff(&xa, &xb, opts);
-    for (side, tpl, frag, art, k) in [(Side::A, &ta, &fa, a, &ka), (Side::B, &tb, &fb, b, &kb)] {
+    for (side, tpl, frag, art, k) in [(Side::A, &ta, &fa, a, &la), (Side::B, &tb, &fb, b, &lb)] {
         remap_to_template(&mut r, side, tpl, frag, art.dialect, opts.excerpt_lines);
         template_notes(
             &mut r,
