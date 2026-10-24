@@ -30,8 +30,19 @@ fn has_rule(u: &Unit, rule: &str) -> bool {
 }
 
 #[test]
-fn unsupported_pairs_are_refused() {
-    assert!(convert("SELECT 1", Dialect::Postgres, Dialect::Tsql).is_err());
+fn pairs_without_rules_keep_every_statement_as_a_comment() {
+    let src = "SELECT 1;\nUPDATE t SET a = 2;\n";
+    let c = convert(src, Dialect::Tsql, Dialect::Db2i).unwrap();
+    assert_eq!(c.units.len(), 2);
+    assert_eq!(c.counts.not_converted, 2);
+    assert!(
+        c.output.lines().all(|l| l.starts_with("--")),
+        "{}",
+        c.output
+    );
+    assert!(c
+        .output
+        .contains("no conversion rules from T-SQL to Db2 for i yet"));
 }
 
 #[test]
