@@ -28,7 +28,7 @@ pub struct GitSource {
     last_changed: OnceLock<BTreeMap<String, String>>,
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -44,6 +44,52 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
         )));
     }
     String::from_utf8(out.stdout).map_err(|_| Error::new("git: output is not UTF-8"))
+}
+
+/// Reads many blobs with one `git cat-file --batch`.
+pub(crate) fn cat_blobs(repo: &Path, ids: &[&str]) -> Result<Vec<String>> {
+    cat_blob_bytes(repo, ids)?
+        .into_iter()
+        .zip(ids)
+        .map(|(b, id)| {
+            String::from_utf8(b).map_err(|_| Error::new(format!("{id}: not UTF-8 text")))
+        })
+        .collect()
+}
+
+/// [`cat_blobs`] without decoding.
+pub(crate) fn cat_blob_bytes(repo: &Path, ids: &[&str]) -> Result<Vec<Vec<u8>>> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::new(format!("git: {e}")))?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+    let mut out = BufReader::new(child.stdout.take().expect("piped"));
+    let mut texts = Vec::with_capacity(ids.len());
+    for id in ids {
+        let mut header = String::new();
+        out.read_line(&mut header)?;
+        let size: usize = header
+            .split(' ')
+            .nth(2)
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Error::new(format!("git cat-file: {id}: {}", header.trim())))?;
+        let mut buf = vec![0u8; size + 1];
+        out.read_exact(&mut buf)?;
+        buf.pop();
+        texts.push(buf);
+    }
+    writer
+        .join()
+        .map_err(|_| Error::new("git cat-file: writer panicked"))??;
+    child.wait()?;
+    Ok(texts)
 }
 
 impl GitSource {
@@ -115,41 +161,8 @@ impl GitSource {
         }
     }
 
-    /// Reads many blobs with one `git cat-file --batch`.
     fn blobs(&self, ids: &[&str]) -> Result<Vec<String>> {
-        let mut child = Command::new("git")
-            .arg("-C")
-            .arg(&self.repo)
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .map_err(|e| Error::new(format!("git: {e}")))?;
-        let mut stdin = child.stdin.take().expect("piped");
-        let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
-        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
-        let mut out = BufReader::new(child.stdout.take().expect("piped"));
-        let mut texts = Vec::with_capacity(ids.len());
-        for id in ids {
-            let mut header = String::new();
-            out.read_line(&mut header)?;
-            let size: usize = header
-                .split(' ')
-                .nth(2)
-                .and_then(|s| s.trim().parse().ok())
-                .ok_or_else(|| Error::new(format!("git cat-file: {id}: {}", header.trim())))?;
-            let mut buf = vec![0u8; size + 1];
-            out.read_exact(&mut buf)?;
-            buf.pop();
-            texts.push(
-                String::from_utf8(buf).map_err(|_| Error::new(format!("{id}: not UTF-8 text")))?,
-            );
-        }
-        writer
-            .join()
-            .map_err(|_| Error::new("git cat-file: writer panicked"))??;
-        child.wait()?;
-        Ok(texts)
+        cat_blobs(&self.repo, ids)
     }
 
     /// Time of the last commit touching each path, from one `git log` walk.

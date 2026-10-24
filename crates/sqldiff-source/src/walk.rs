@@ -143,6 +143,37 @@ pub(crate) fn object_text(
         .ok_or_else(|| crate::Error::new(format!("{id}: no object `{frag}` in {rel}")))
 }
 
+/// The one object a file defines, as `relation:schema.name` or
+/// `routine:schema.name` folded to lower case, from its top-level DDL.
+/// `None` when the file defines no object, or more than one: pairing by it
+/// is then not attempted. Tables and views share a namespace, as do
+/// procedures and functions (a T-SQL procedure is often a PostgreSQL
+/// function).
+pub fn defined_name(text: &str, dialect: Dialect) -> Option<String> {
+    use sqldiff_core::catalog::{ddl, TableKind};
+    let cat = ddl::load(text, dialect, "");
+    let key = |ns: &str, schema: &Option<String>, name: &str| {
+        format!(
+            "{ns}:{}.{}",
+            schema.as_deref().unwrap_or("").to_lowercase(),
+            name.to_lowercase()
+        )
+    };
+    let mut names: Vec<String> = cat
+        .tables
+        .iter()
+        .filter(|t| matches!(t.kind, TableKind::Table | TableKind::View))
+        .map(|t| key("relation", &t.schema, &t.name))
+        .chain(
+            cat.routines
+                .iter()
+                .map(|r| key("routine", &r.schema, &r.name)),
+        )
+        .collect();
+    names.dedup();
+    (names.len() == 1).then(|| names.remove(0))
+}
+
 pub(crate) fn object_info(
     rel: &str,
     text: &str,
@@ -187,5 +218,32 @@ mod tests {
         );
         assert_eq!(object_kind("create or replace function f()"), "function");
         assert_eq!(object_kind("select 1"), "script");
+    }
+
+    #[test]
+    fn defined_names() {
+        let t = Dialect::Tsql;
+        assert_eq!(
+            defined_name(
+                "\u{feff}CREATE VIEW [WebApi].[Cities]\nAS\nSELECT 1 AS x",
+                t
+            )
+            .as_deref(),
+            Some("relation:webapi.cities")
+        );
+        assert_eq!(
+            defined_name("CREATE TABLE Application.Cities (CityID int NOT NULL)", t).as_deref(),
+            Some("relation:application.cities")
+        );
+        assert_eq!(
+            defined_name("CREATE PROCEDURE dbo.p AS BEGIN SELECT 1; END", t).as_deref(),
+            Some("routine:dbo.p")
+        );
+        // Two objects, or none: no name.
+        assert_eq!(
+            defined_name("CREATE TABLE a (x int); CREATE TABLE b (y int);", t),
+            None
+        );
+        assert_eq!(defined_name("SELECT 1;", t), None);
     }
 }

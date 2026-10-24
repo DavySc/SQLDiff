@@ -1,0 +1,76 @@
+name: action self-test
+
+# Runs the SQLDiff pull request Action (action.yml) on a scratch repository
+# with a known change set, without uploading or commenting, and checks what
+# it reports.
+
+on:
+  push:
+    branches: [main]
+    paths: ["action.yml", "crates/**", ".github/workflows/action-selftest.yml"]
+  pull_request:
+    paths: ["action.yml", "crates/**", ".github/workflows/action-selftest.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scratch repository
+        id: fixture
+        run: |
+          repo="$RUNNER_TEMP/fixture"
+          mkdir -p "$repo/tsql/Application/Tables" "$repo/tsql/WebApi/Views"
+          cd "$repo"
+          git init -q
+          git config user.name ci
+          git config user.email ci@example.com
+          printf 'CREATE PROCEDURE dbo.MoveStock @id int AS\nBEGIN\n    BEGIN TRANSACTION;\n    UPDATE dbo.Stock SET qty = qty - 1 WHERE id = @id;\n    COMMIT;\nEND;\n' > tsql/MoveStock.sql
+          printf 'CREATE TABLE Application.Cities (CityID int NOT NULL);\n' > tsql/Application/Tables/Cities.sql
+          printf 'CREATE VIEW WebApi.Cities AS SELECT CityID FROM Application.Cities;\n' > tsql/WebApi/Views/Cities.sql
+          git add -A && git commit -qm base
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          sed -i '/COMMIT;/d' tsql/MoveStock.sql
+          printf 'CREATE VIEW WebApi.Cities\nAS\nSELECT CityID\nFROM Application.Cities;\n' > tsql/WebApi/Views/Cities.sql
+          git add -A && git commit -qm head
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "dir=$repo" >> "$GITHUB_OUTPUT"
+      - name: Run the action
+        id: sqldiff
+        uses: ./
+        with:
+          working-directory: ${{ steps.fixture.outputs.dir }}
+          base: ${{ steps.fixture.outputs.base }}
+          head: ${{ steps.fixture.outputs.head }}
+          upload-sarif: "false"
+          comment: "false"
+          fail-on: never
+      - name: Check the outputs
+        env:
+          VERDICT: ${{ steps.sqldiff.outputs.verdict }}
+          CODE: ${{ steps.sqldiff.outputs.exit-code }}
+          SARIF: ${{ steps.sqldiff.outputs.sarif }}
+          MD: ${{ steps.sqldiff.outputs.markdown }}
+          REPO_DIR: ${{ steps.fixture.outputs.dir }}
+        run: |
+          test "$CODE" = 0
+          test "$VERDICT" = different
+          grep -q '^<!-- sqldiff:changes -->' "$MD"
+          grep -q 'tsql/MoveStock.sql' "$MD"
+          python3 - "$SARIF" "$REPO_DIR" <<'EOF'
+          import json, subprocess, sys
+          doc = json.load(open(sys.argv[1]))
+          results = doc["runs"][0]["results"]
+          assert results, "no results"
+          for r in results:
+              (loc,) = r["locations"]
+              uri = loc["physicalLocation"]["artifactLocation"]["uri"]
+              region = loc["physicalLocation"]["region"]
+              text = subprocess.run(["git", "-C", sys.argv[2], "show", f"HEAD:{uri}"],
+                                    check=True, capture_output=True, text=True).stdout
+              assert 1 <= region["startLine"] <= region["endLine"] <= len(text.splitlines()), r
+          print(f"{len(results)} results, all located at head")
+          EOF

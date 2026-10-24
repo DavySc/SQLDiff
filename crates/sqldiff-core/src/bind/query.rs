@@ -33,8 +33,19 @@ struct Source {
     group: usize,
     /// INSERT targets are not in scope for the inserted expressions.
     in_scope: bool,
+    /// First token index the source is visible from (`ON CONFLICT`,
+    /// `RETURNING`: the INSERT target is visible there, not in `VALUES`).
+    from: usize,
     /// The relation itself failed to bind (issue index): its columns fail with it.
     failed: Option<usize>,
+    /// Query group of a derived table's own query, which does not see the derived table.
+    body: Option<usize>,
+}
+
+impl Source {
+    fn visible_at(&self, at: usize) -> bool {
+        self.in_scope && at >= self.from
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -148,11 +159,21 @@ fn shape(t: &[Tok]) -> Shape {
                         "ALL", "SOME", "RETURN", "IS", "LIKE", "BETWEEN", "INTO", "OVER", "FILTER",
                         "WITHIN", "LATERAL", "TABLE",
                     ]);
+                let join_ctx = i > 0
+                    && (t[i - 1].is_any_kw(&["FROM", "JOIN", "APPLY"])
+                        || t[i - 1].is(SyntaxKind::COMMA)
+                        || t[i - 1].is(SyntaxKind::L_PAREN));
                 if next_query {
                     parent.push(Some(cur));
                     let g = parent.len() - 1;
                     stack.push((Paren::Query, cur));
                     cur = g;
+                } else if join_ctx
+                    && stack.last().map_or(true, |s| s.0 == Paren::Query)
+                    && is_join_paren(t, i)
+                {
+                    // A parenthesized join stays at query level, in the same group.
+                    stack.push((Paren::Query, cur));
                 } else if prev_name {
                     stack.push((Paren::Call, cur));
                 } else {
@@ -215,6 +236,8 @@ struct Pending {
     col_list: Option<(usize, usize)>,
     /// Column aliases: `AS s (a, b)`.
     alias_cols: Option<Vec<Ident>>,
+    /// Query group of a derived table's own query.
+    body: Option<usize>,
 }
 
 enum PendingKind {
@@ -239,6 +262,16 @@ struct Analysis {
     isnull: Vec<(usize, Vec<(usize, usize)>)>,
     /// T-SQL `SELECT ... INTO #t`: the new table's name parts.
     select_into: Option<Vec<Ident>>,
+    /// Where the relation scan resumes after a FROM list that holds a derived
+    /// table or a parenthesized join: inside it, so the relations of the
+    /// inner query or join are read too.
+    resume: Option<usize>,
+}
+
+impl Analysis {
+    fn resume_at(&mut self, k: usize) {
+        self.resume = Some(self.resume.map_or(k, |r| r.min(k)));
+    }
 }
 
 impl<'a> Binder<'a> {
@@ -257,6 +290,7 @@ impl<'a> Binder<'a> {
             targets: Vec::new(),
             isnull: Vec::new(),
             select_into: None,
+            resume: None,
         };
         self.find_ctes(t, &sh, &mut an);
         let pending = self.find_relations(t, &sh, &mut an);
@@ -448,6 +482,9 @@ impl<'a> Binder<'a> {
                 }
                 _ => i += 1,
             }
+            if let Some(r) = an.resume.take() {
+                i = i.min(r);
+            }
         }
         out
     }
@@ -475,6 +512,7 @@ impl<'a> Binder<'a> {
             let kind;
             let mut parts = Vec::new();
             let mut span = (x.start, x.end);
+            let mut body = None;
             if x.is(SyntaxKind::L_PAREN) {
                 let c = close_paren(t, i);
                 let inner = &t[i + 1..c];
@@ -483,10 +521,62 @@ impl<'a> Binder<'a> {
                     .is_some_and(|y| y.is_any_kw(&["SELECT", "WITH"]))
                 {
                     kind = PendingKind::Derived(ddl::select_outputs(inner));
+                    body = sh.group.get(i + 1).copied();
+                    an.resume_at(i + 1);
                 } else if inner.first().is_some_and(|y| y.is_kw("VALUES")) {
                     kind = PendingKind::Derived(None);
+                    body = sh.group.get(i + 1).copied();
+                    an.resume_at(i + 1);
+                } else if is_join_paren(t, i) {
+                    // Parenthesized join (pg_dump writes `FROM ((a JOIN b ON ...) JOIN c ON ...)`):
+                    // its first item is read here, the JOINs inside by the scan that resumes after it.
+                    let after_first = self.read_items(
+                        t,
+                        sh,
+                        i + 1,
+                        group,
+                        false,
+                        head_target,
+                        insert_target,
+                        an,
+                        out,
+                    );
+                    an.resume_at(after_first);
+                    let mut k = c + 1;
+                    // `(a JOIN b) AS j` hides the inner names behind `j`, whose columns are not listed.
+                    let alias_at = if t.get(k).is_some_and(|y| y.is_kw("AS")) {
+                        an.consumed[k] = true;
+                        k + 1
+                    } else {
+                        k
+                    };
+                    if let Some(y) = t.get(alias_at).filter(|y| {
+                        y.kind == SyntaxKind::QUOTED_IDENT
+                            || (y.kind == SyntaxKind::IDENT && !y.is_any_kw(CLAUSE_WORDS))
+                    }) {
+                        an.consumed[alias_at] = true;
+                        out.push(Pending {
+                            parts: Vec::new(),
+                            span: (x.start, x.end),
+                            alias: Some(y.ident()),
+                            group,
+                            kind: PendingKind::Derived(None),
+                            head_target: false,
+                            col_list: None,
+                            alias_cols: None,
+                            body: None,
+                        });
+                        k = alias_at + 1;
+                    }
+                    if list
+                        && t.get(k).is_some_and(|y| y.is(SyntaxKind::COMMA))
+                        && sh.group.get(k) == Some(&group)
+                    {
+                        i = k + 1;
+                        continue;
+                    }
+                    return k;
                 } else {
-                    // Parenthesised join: its items are read by the JOIN/FROM keywords inside.
                     return c + 1;
                 }
                 i = c + 1;
@@ -521,6 +611,7 @@ impl<'a> Binder<'a> {
                     head_target: false,
                     col_list: None,
                     alias_cols: None,
+                    body: None,
                 });
                 return open + 1;
             } else if x.is_kw("TABLE") && t.get(i + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN)) {
@@ -638,6 +729,7 @@ impl<'a> Binder<'a> {
                 head_target,
                 col_list,
                 alias_cols,
+                body,
             });
             i = k;
             if list
@@ -744,7 +836,9 @@ impl<'a> Binder<'a> {
                         authoritative,
                         group: p.group,
                         in_scope: !insert_target,
+                        from: 0,
                         failed,
+                        body: None,
                     });
                     if p.head_target && !an.targets.iter().any(|(g, _)| *g == p.group) {
                         an.targets.push((p.group, idx));
@@ -767,7 +861,9 @@ impl<'a> Binder<'a> {
                         authoritative: known,
                         group: p.group,
                         in_scope: true,
+                        from: 0,
                         failed: None,
+                        body: p.body,
                     });
                 }
                 PendingKind::DataChange(inner) => {
@@ -781,7 +877,9 @@ impl<'a> Binder<'a> {
                         authoritative: false,
                         group: p.group,
                         in_scope: true,
+                        from: 0,
                         failed: None,
+                        body: None,
                     });
                 }
                 PendingKind::Function => {
@@ -794,7 +892,9 @@ impl<'a> Binder<'a> {
                         authoritative: false,
                         group: p.group,
                         in_scope: true,
+                        from: 0,
                         failed: None,
+                        body: None,
                     });
                 }
             }
@@ -997,7 +1097,9 @@ impl<'a> Binder<'a> {
                 authoritative: auth,
                 group: 0,
                 in_scope: false,
+                from: 0,
                 failed: None,
+                body: None,
             });
         };
         if d == Dialect::Tsql {
@@ -1021,17 +1123,31 @@ impl<'a> Binder<'a> {
                 add(an, "deleted", cols, auth);
             }
         }
-        if t.iter().any(|x| x.is_kw("RETURNING")) {
+        // An INSERT target becomes visible after its VALUES / query: in
+        // RETURNING and (PostgreSQL) from ON CONFLICT on. PostgreSQL rejects a
+        // target column in VALUES ("cannot be referenced from this part of the
+        // query"), so a PL/pgSQL variable of that name is not ambiguous there.
+        let reveal = |an: &mut Analysis, i: usize, at: usize| {
+            let s = &mut an.sources[i];
+            if !s.in_scope {
+                s.in_scope = true;
+                s.from = at;
+            } else if s.from > 0 {
+                s.from = s.from.min(at);
+            }
+        };
+        if let Some(r) = t.iter().position(|x| x.is_kw("RETURNING")) {
             for (_, i) in an.targets.clone() {
-                an.sources[i].in_scope = true;
+                reveal(an, i, r);
             }
         }
-        if d == Dialect::Postgres && t.iter().any(|x| x.is_kw("CONFLICT")) {
-            let (cols, auth) = target_cols.unwrap_or((None, false));
-            add(an, "excluded", cols, auth);
-            // The target is in scope in DO UPDATE.
-            if let Some(i) = first_target {
-                an.sources[i].in_scope = true;
+        if d == Dialect::Postgres {
+            if let Some(c) = t.iter().position(|x| x.is_kw("CONFLICT")) {
+                let (cols, auth) = target_cols.unwrap_or((None, false));
+                add(an, "excluded", cols, auth);
+                if let Some(i) = first_target {
+                    reveal(an, i, c);
+                }
             }
         }
     }
@@ -1386,6 +1502,11 @@ impl<'a> Binder<'a> {
                     self.variable_token(&x, stmt);
                     i += 1;
                 }
+                // T-SQL `geography::Point(...)`, `hierarchyid::GetRoot()`: a static
+                // method of a CLR type, not a PostgreSQL cast.
+                SyntaxKind::OP if x.text == "::" && self.d == Dialect::Tsql => {
+                    i += 2;
+                }
                 SyntaxKind::OP if x.text == "::" => {
                     i = self.type_after(t, i + 1, stmt, an);
                 }
@@ -1404,6 +1525,50 @@ impl<'a> Binder<'a> {
                 SyntaxKind::IDENT if x.is_kw("COLLATE") => {
                     i += 2;
                 }
+                // PostgreSQL `OPERATOR(schema.op)`: an operator name, not a call.
+                SyntaxKind::IDENT
+                    if self.d == Dialect::Postgres
+                        && x.is_kw("OPERATOR")
+                        && t.get(i + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN)) =>
+                {
+                    i = close_paren(t, i + 1) + 1;
+                }
+                // T-SQL query hints `OPTION (RECOMPILE, LABEL = '...', OPTIMIZE FOR (@p = 1))`:
+                // hint words, not references; only the variables in them are.
+                SyntaxKind::IDENT
+                    if self.d == Dialect::Tsql
+                        && x.is_kw("OPTION")
+                        && sh.clause[i]
+                        && t.get(i + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN)) =>
+                {
+                    let c = close_paren(t, i + 1);
+                    for v in t[i + 1..c.min(t.len())]
+                        .iter()
+                        .filter(|y| y.is(SyntaxKind::VARIABLE))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                    {
+                        self.variable_token(&v, stmt);
+                    }
+                    i = c + 1;
+                }
+                // Db2 `a CONCAT b`: the infix form of `||`.
+                SyntaxKind::IDENT
+                    if self.d == Dialect::Db2i
+                        && x.is_kw("CONCAT")
+                        && !t.get(i + 1).is_some_and(|y| y.is(SyntaxKind::L_PAREN)) =>
+                {
+                    i += 1;
+                }
+                // `ON CONFLICT ON CONSTRAINT name` names a constraint.
+                SyntaxKind::IDENT
+                    if x.is_kw("CONSTRAINT")
+                        && i >= 2
+                        && t[i - 1].is_kw("ON")
+                        && t[i - 2].is_kw("CONFLICT") =>
+                {
+                    i += 2;
+                }
                 SyntaxKind::IDENT
                     if x.is_kw("FOR")
                         && i >= 2
@@ -1413,6 +1578,12 @@ impl<'a> Binder<'a> {
                     // NEXT VALUE FOR seq
                     let (_, after) = tokens::qualified(t, i + 1);
                     i = after.max(i + 1);
+                }
+                SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT
+                    if self.d == Dialect::Tsql && t.get(i + 1).is_some_and(|y| y.is_op("::")) =>
+                {
+                    // The type of a static method call; the method follows `::`.
+                    i += 1;
                 }
                 SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT => {
                     i = self.name_at(t, sh, i, stmt, an);
@@ -1490,7 +1661,11 @@ impl<'a> Binder<'a> {
         stmt: (usize, usize),
         an: &mut Analysis,
     ) -> usize {
-        let (parts, after) = tokens::qualified(t, i);
+        let (parts, after) = if self.d == Dialect::Db2i {
+            tokens::qualified(t, i)
+        } else {
+            tokens::qualified_dot(t, i)
+        };
         let span = (t[i].start, t[after - 1].end);
         let next = t.get(after);
         // `t.*`
@@ -1512,8 +1687,10 @@ impl<'a> Binder<'a> {
             }
             return after;
         }
-        // PL/pgSQL named argument notation.
-        if next.is_some_and(|n| n.is_op("=>")) {
+        // Named argument notation (`name => v`, PostgreSQL's older `name := v`).
+        if next
+            .is_some_and(|n| n.is_op("=>") || (n.is_op(":=") && sh.inner[i] == Some(Paren::Call)))
+        {
             return after + 1;
         }
         let var_only = an.var_only[i];
@@ -1581,6 +1758,7 @@ impl<'a> Binder<'a> {
             if a.len() >= 2
                 && a[0].is_name()
                 && (a[1].is_op("=>")
+                    || a[1].is_op(":=")
                     || (a[1].is(SyntaxKind::COLON) && a.get(2).is_some_and(|y| y.is_op("="))))
             {
                 an.consumed[s] = true;
@@ -1638,6 +1816,8 @@ impl<'a> Binder<'a> {
                     stmt,
                     Resolution::Resolved(Target::Routine(r.display())),
                 );
+            } else if let Some(id) = self.defined_later(parts, &display, Some((args, style))) {
+                self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
             } else {
                 let given = describe_args(args);
                 let sigs: Vec<String> = overloads.iter().map(|r| r.signature()).collect();
@@ -1785,6 +1965,10 @@ impl<'a> Binder<'a> {
         } else {
             RoutineKind::Procedure
         };
+        if let Some(id) = self.defined_later(parts, &display, None) {
+            self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
+            return;
+        }
         if view.routines_authoritative(rkind) {
             let what = if style == CallStyle::Function {
                 "function"
@@ -1815,13 +1999,50 @@ impl<'a> Binder<'a> {
         self.add_ref(kind, display, span, stmt, Resolution::Assumed(id));
     }
 
+    /// Inside a routine body, a routine the artifact creates further down
+    /// (an overload that accepts the call, when `call` is given) may exist
+    /// by the time the body runs: an assumption, not a binding error.
+    fn defined_later(
+        &mut self,
+        parts: &[Ident],
+        display: &str,
+        call: Option<(&[CallArg], CallStyle)>,
+    ) -> Option<String> {
+        if !self.in_routine() {
+            return None;
+        }
+        let d = self.d;
+        let later = CatalogView::new(d, &[&self.later]);
+        let Lookup::Found(rs) = later.routines(parts) else {
+            return None;
+        };
+        let fits = match call {
+            Some((args, style)) => rs.iter().any(|r| signature_accepts(d, r, args, style)),
+            None => true,
+        };
+        if !fits {
+            return None;
+        }
+        Some(self.assume(
+            format!("ASM-BIND-ROUTINE-LATER:{}", display.to_lowercase()),
+            format!("Routine `{display}`, created later in this file, exists when this body runs"),
+        ))
+    }
+
     // ---- references -------------------------------------------------------
 
     /// Sources visible from group `g`, innermost level first.
     fn visible<'s>(&self, an: &'s Analysis, sh: &Shape, g: usize) -> Vec<Vec<&'s Source>> {
-        sh.chain(g)
-            .into_iter()
-            .map(|lvl| an.sources.iter().filter(|s| s.group == lvl).collect())
+        let chain = sh.chain(g);
+        chain
+            .iter()
+            .map(|&lvl| {
+                an.sources
+                    .iter()
+                    // A derived table is not visible inside its own query.
+                    .filter(|s| s.group == lvl && s.body.map_or(true, |b| !chain.contains(&b)))
+                    .collect()
+            })
             .collect()
     }
 
@@ -1958,7 +2179,9 @@ impl<'a> Binder<'a> {
                                     authoritative: tb.columns_known,
                                     group: 0,
                                     in_scope: true,
+                                    from: 0,
                                     failed: None,
+                                    body: None,
                                 };
                                 self.column_of(&src, n, &name, span, stmt);
                             }
@@ -2216,7 +2439,7 @@ impl<'a> Binder<'a> {
         stmt: (usize, usize),
         an: &Analysis,
         var_only: bool,
-        _at: usize,
+        at: usize,
     ) {
         let d = self.d;
         let key = x.key(d);
@@ -2252,7 +2475,7 @@ impl<'a> Binder<'a> {
         // Columns: innermost query level with a match wins.
         let mut matches: Vec<(Source, Col)> = Vec::new();
         for lvl in self.visible(an, sh, g) {
-            for s in lvl.iter().filter(|s| s.in_scope) {
+            for s in lvl.iter().filter(|s| s.visible_at(at)) {
                 if let Some(c) = s
                     .columns
                     .as_ref()
@@ -2363,10 +2586,11 @@ impl<'a> Binder<'a> {
                     Resolution::Resolved(target),
                 );
             }
-            (None, None) => self.unresolved_bare(x, span, g, sh, stmt, an),
+            (None, None) => self.unresolved_bare(x, span, g, sh, stmt, an, at),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn unresolved_bare(
         &mut self,
         x: &Ident,
@@ -2375,6 +2599,7 @@ impl<'a> Binder<'a> {
         sh: &Shape,
         stmt: (usize, usize),
         an: &Analysis,
+        at: usize,
     ) {
         let d = self.d;
         let key = x.key(d);
@@ -2459,7 +2684,7 @@ impl<'a> Binder<'a> {
             .visible(an, sh, g)
             .into_iter()
             .flatten()
-            .filter(|s| s.in_scope)
+            .filter(|s| s.visible_at(at))
             .collect();
         let tok = Tok {
             kind: SyntaxKind::IDENT,
@@ -2467,7 +2692,7 @@ impl<'a> Binder<'a> {
             start: span.0,
             end: span.1,
         };
-        if visible.is_empty() && an.sources.iter().all(|s| !s.in_scope || s.group != g) {
+        if visible.is_empty() && an.sources.iter().all(|s| !s.visible_at(at) || s.group != g) {
             if d == Dialect::Tsql {
                 let msg = format!("`{}` is not a column of any table in this statement; SQL Server fails with \"Invalid column name\".", x.text);
                 self.fail(
@@ -2680,6 +2905,36 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// A parenthesis that holds a join (`(a JOIN b ON ...)`, possibly nested)
+/// rather than a query, a call or an expression.
+fn is_join_paren(t: &[Tok], open: usize) -> bool {
+    if !t.get(open).is_some_and(|x| x.is(SyntaxKind::L_PAREN)) {
+        return false;
+    }
+    let c = close_paren(t, open);
+    let inner = &t[open + 1..c.min(t.len())];
+    if inner.first().map_or(true, |y| {
+        y.is_any_kw(&[
+            "SELECT", "WITH", "VALUES", "INSERT", "UPDATE", "DELETE", "MERGE",
+        ])
+    }) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for y in inner {
+        match y.kind {
+            SyntaxKind::L_PAREN => depth += 1,
+            SyntaxKind::R_PAREN => depth = depth.saturating_sub(1),
+            _ if depth == 0 && y.is_any_kw(&["JOIN", "APPLY"]) => return true,
+            _ => {}
+        }
+    }
+    // `((a JOIN b ON ...))`: one join wrapped in another pair.
+    inner.first().is_some_and(|y| y.is(SyntaxKind::L_PAREN))
+        && close_paren(t, open + 1) + 1 == c
+        && is_join_paren(t, open + 1)
+}
+
 fn cols_of(d: Dialect, tb: &Table) -> Vec<Col> {
     tb.columns
         .iter()
@@ -2734,7 +2989,11 @@ fn is_implicit(d: Dialect, key: &str, in_trigger: bool) -> bool {
             matches!(key, "found" | "sqlstate" | "sqlerrm")
                 || (in_trigger && (key.starts_with("tg_") || key == "new" || key == "old"))
         }
-        Dialect::Db2i => matches!(key, "SQLSTATE" | "SQLCODE"),
+        Dialect::Db2i => {
+            matches!(key, "SQLSTATE" | "SQLCODE")
+                // Trigger event predicates of a multiple-event trigger.
+                || (in_trigger && matches!(key, "INSERTING" | "UPDATING" | "DELETING"))
+        }
         Dialect::Tsql => false,
     }
 }

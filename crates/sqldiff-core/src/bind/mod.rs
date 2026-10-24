@@ -9,6 +9,7 @@
 //! binding error), or becomes an assumption.
 
 mod compare;
+mod doubt;
 mod query;
 
 use std::collections::HashMap;
@@ -207,6 +208,10 @@ pub(crate) struct Binder<'a> {
     pg_conflict_directive: bool,
     /// T-SQL GOTO labels of the current batch.
     goto_labels: Vec<String>,
+    /// Every routine the artifact creates, wherever it is: a call inside a
+    /// routine body is resolved when the body runs, possibly after a routine
+    /// defined further down was created.
+    later: Catalog,
 }
 
 /// Binds one parsed artifact.
@@ -225,13 +230,69 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
         trigger: None,
         pg_conflict_directive: a.artifact.text.contains("#variable_conflict"),
         goto_labels: Vec::new(),
+        later: Catalog::default(),
     };
+    for r in a
+        .root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ROUTINE)
+    {
+        if let Some(h) = ddl::routine_header(&r, b.d) {
+            if h.view.is_none() && h.routine.kind != RoutineKind::Trigger {
+                b.later.put_routine(b.d, h.routine);
+            }
+        }
+    }
     b.push_scope(ScopeKind::File, None);
     b.walk_children(&a.root);
+    b.degrade(&doubt::doubts(a));
     b.out
 }
 
+/// Whether an issue was demoted because the binder could not read its input.
+pub(crate) fn is_degraded(i: &Issue) -> bool {
+    i.assumptions.iter().any(|a| doubt::is_doubt(a))
+}
+
 impl<'a> Binder<'a> {
+    /// Demotes proven issues inside doubtful regions to assumptions, and the
+    /// references that failed with them.
+    fn degrade(&mut self, doubts: &[doubt::Doubt]) {
+        let mut demoted: HashMap<usize, String> = HashMap::new();
+        for (idx, i) in self.out.issues.iter_mut().enumerate() {
+            if !i.proven {
+                continue;
+            }
+            let Some(dt) = doubts
+                .iter()
+                .find(|dt| dt.start <= i.start && i.start < dt.end.max(dt.start + 1))
+            else {
+                continue;
+            };
+            i.proven = false;
+            i.message.push_str(&dt.note);
+            i.assumptions.push(dt.id.clone());
+            demoted.insert(idx, dt.id.clone());
+        }
+        for dt in doubts {
+            if demoted.values().any(|id| *id == dt.id) {
+                self.assume(dt.id.clone(), dt.text.clone());
+            }
+        }
+        for r in &mut self.out.refs {
+            if let Resolution::Failed(i) = r.resolution {
+                if let Some(id) = demoted.get(&i) {
+                    r.resolution = Resolution::Assumed(id.clone());
+                }
+            }
+        }
+    }
+
+    /// Whether the walk is inside a routine body.
+    fn in_routine(&self) -> bool {
+        self.scopes.iter().any(|s| s.kind == ScopeKind::Routine)
+    }
+
     // ---- scopes and declarations -------------------------------------------
 
     fn push_scope(&mut self, kind: ScopeKind, label: Option<String>) {
@@ -921,9 +982,27 @@ impl<'a> Binder<'a> {
             (Dialect::Tsql, "DECLARE") => self.tsql_declare(&t, stmt),
             (Dialect::Db2i, "DECLARE") => self.db2_declare(&t, stmt),
             (Dialect::Postgres, "DECLARE") => {}
+            // `SET [SESSION | LOCAL] name {= | TO} value`, `SET ROLE`, `SET TIME ZONE`, ...:
+            // configuration names and literal values, never variables or columns
+            // (PL/pgSQL does not substitute variables into utility commands).
+            (Dialect::Postgres, "SET") => {}
             (Dialect::Tsql, "SET") if !t.get(1).is_some_and(|x| x.is(SyntaxKind::VARIABLE)) => {}
             (Dialect::Db2i, "SET") if !self.db2_set_targets_variables(&t) => {}
             (_, "EXEC" | "EXECUTE") if self.d == Dialect::Tsql => self.tsql_exec(&t, stmt),
+            // `INSERT INTO t (cols) EXEC proc ...`: the rows come from a procedure call.
+            (Dialect::Tsql, "INSERT")
+                if tokens::find_kw(&t, 1, "EXEC")
+                    .or_else(|| tokens::find_kw(&t, 1, "EXECUTE"))
+                    .is_some() =>
+            {
+                let e = tokens::find_kw(&t, 1, "EXEC")
+                    .into_iter()
+                    .chain(tokens::find_kw(&t, 1, "EXECUTE"))
+                    .min()
+                    .unwrap_or(t.len());
+                self.analyze(&t[..e], stmt);
+                self.tsql_exec(&t[e..], stmt);
+            }
             (_, "CALL") => self.call_statement(&t, stmt),
             (Dialect::Tsql, "GOTO") => {
                 if let Some(l) = t.get(1) {
@@ -1498,7 +1577,7 @@ impl<'a> Binder<'a> {
         // `EXEC @proc ...`: a variable holding the procedure name is dynamic.
         if let Some(v) = t.get(k).filter(|x| x.is(SyntaxKind::VARIABLE)).cloned() {
             self.variable_token(&v, stmt);
-            self.analyze(&t[k + 1..], stmt);
+            self.exec_args(&t[k + 1..], stmt);
             return;
         }
         let (parts, after) = tokens::qualified(t, k);
@@ -1507,9 +1586,17 @@ impl<'a> Binder<'a> {
             return;
         }
         let name_span = (t[k].start, t[after - 1].end);
-        // Arguments: `@p = value [OUTPUT]` or `value [OUTPUT]`.
+        let args = self.exec_args(&t[after..], stmt);
+        self.resolve_call(&parts, name_span, stmt, &args, CallStyle::Exec);
+    }
+
+    /// T-SQL EXEC arguments: `@p = value [OUTPUT]` or `value [OUTPUT]`;
+    /// a parameter name is not a variable of the batch.
+    fn exec_args(&mut self, t: &[Tok], stmt: (usize, usize)) -> Vec<CallArg> {
         let mut args: Vec<CallArg> = Vec::new();
-        for item in split_commas(&t[after..]) {
+        // `WITH RECOMPILE`, `WITH RESULT SETS (...)`: options, not arguments.
+        let end = t.iter().position(|x| x.is_kw("WITH")).unwrap_or(t.len());
+        for item in split_commas(&t[..end]) {
             let item: Vec<Tok> = item
                 .iter()
                 .filter(|x| !x.is_any_kw(&["OUTPUT", "OUT", "READONLY"]))
@@ -1526,7 +1613,7 @@ impl<'a> Binder<'a> {
                 self.analyze(&item, stmt);
             }
         }
-        self.resolve_call(&parts, name_span, stmt, &args, CallStyle::Exec);
+        args
     }
 
     /// `CALL proc(args)` in all dialects.
@@ -1554,11 +1641,12 @@ impl<'a> Binder<'a> {
             let named = item.len() >= 2
                 && item[0].is_name()
                 && (item[1].is_op("=>")
+                    || item[1].is_op(":=")
                     || (item[1].is(SyntaxKind::COLON)
                         && item.get(2).is_some_and(|x| x.is_op("="))));
             if named {
                 args.push(CallArg::Named(item[0].ident().text));
-                let skip = if item[1].is_op("=>") { 2 } else { 3 };
+                let skip = if item[1].is(SyntaxKind::COLON) { 3 } else { 2 };
                 self.analyze(&item[skip.min(item.len())..], stmt);
             } else {
                 args.push(CallArg::Positional);
@@ -1792,10 +1880,13 @@ fn label_name(label: &SyntaxNode) -> Option<String> {
 fn goto_labels(node: &SyntaxNode, d: Dialect) -> Vec<String> {
     node.descendants()
         .filter(|n| {
+            // T-SQL has no labelled blocks or loops: every label is a GOTO target,
+            // also the ones the parser attaches to the BEGIN ... END that follows.
             n.kind() == SyntaxKind::LABEL
-                && n.parent().is_some_and(|p| {
-                    p.kind() != SyntaxKind::BLOCK && p.kind() != SyntaxKind::LOOP_STMT
-                })
+                && (d == Dialect::Tsql
+                    || n.parent().is_some_and(|p| {
+                        p.kind() != SyntaxKind::BLOCK && p.kind() != SyntaxKind::LOOP_STMT
+                    }))
         })
         .filter_map(|l| label_name(&l))
         .map(|n| Ident::plain(n).key(d))

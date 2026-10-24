@@ -265,6 +265,7 @@ struct Side {
     /// Keys held by several objects; none of them is paired.
     ambiguous: BTreeMap<String, Vec<String>>,
     no_dialect: Vec<String>,
+    dialects: BTreeMap<String, Dialect>,
 }
 
 impl Side {
@@ -275,6 +276,7 @@ impl Side {
         let objects = src.list_objects(&ObjectFilter::default())?;
         let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut no_dialect = Vec::new();
+        let mut dialects = BTreeMap::new();
         for o in objects {
             if cfg.is_shared(&o.id) {
                 continue;
@@ -284,6 +286,7 @@ impl Side {
                 no_dialect.push(o.id);
                 continue;
             };
+            dialects.insert(o.id.clone(), d);
             let rule = cfg.pairing_rule(&o.id, Some(d));
             groups
                 .entry(pairing::key(&o.name, &rule))
@@ -300,7 +303,21 @@ impl Side {
                 .collect(),
             ambiguous,
             no_dialect,
+            dialects,
         })
+    }
+
+    /// Takes every object with this key out, unique or ambiguous.
+    fn take_key(&mut self, key: &str) -> Vec<String> {
+        let mut ids = self.ambiguous.remove(key).unwrap_or_default();
+        ids.extend(self.by_key.remove(key));
+        ids
+    }
+
+    /// The one object the file defines (see [`crate::defined_name`]).
+    fn defined(&self, id: &str) -> Option<String> {
+        let text = std::fs::read_to_string(self.dir.join(id)).ok()?;
+        crate::defined_name(&text, *self.dialects.get(id)?)
     }
 
     fn display(&self, id: &str) -> String {
@@ -342,6 +359,49 @@ pub fn pair_dirs(
     }
     let mut only_a = Vec::new();
     let mut only_b = Vec::new();
+    // Keys several files share on a side (a table and a view both named
+    // `Cities.sql` in different schema folders): pair by the one
+    // schema-qualified object each file defines, where that is unique on
+    // both sides. The rest stay ambiguous, or unpaired when one is left.
+    let shared_keys: BTreeSet<String> = sa
+        .ambiguous
+        .keys()
+        .chain(sb.ambiguous.keys())
+        .cloned()
+        .collect();
+    let mut ambiguous_left: Vec<(&'static str, String, Vec<String>)> = Vec::new();
+    for k in shared_keys {
+        let (ca, cb) = (sa.take_key(&k), sb.take_key(&k));
+        let named = |side: &Side, ids: &[String]| -> BTreeMap<String, Vec<String>> {
+            let mut m: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for id in ids {
+                if let Some(n) = side.defined(id) {
+                    m.entry(n).or_default().push(id.clone());
+                }
+            }
+            m
+        };
+        let (na, nb) = (named(&sa, &ca), named(&sb, &cb));
+        let mut done: BTreeSet<String> = BTreeSet::new();
+        for (name, xs) in &na {
+            if let (1, Some(ys)) = (xs.len(), nb.get(name)) {
+                if ys.len() == 1 {
+                    ids.push((xs[0].clone(), ys[0].clone()));
+                    done.insert(xs[0].clone());
+                    done.insert(ys[0].clone());
+                }
+            }
+        }
+        let la: Vec<String> = ca.into_iter().filter(|i| !done.contains(i)).collect();
+        let lb: Vec<String> = cb.into_iter().filter(|i| !done.contains(i)).collect();
+        for (side, left, s, only) in [("A", la, &sa, &mut only_a), ("B", lb, &sb, &mut only_b)] {
+            match left.len() {
+                0 => {}
+                1 => only.push(s.display(&left[0])),
+                _ => ambiguous_left.push((side, k.clone(), left)),
+            }
+        }
+    }
     for (k, ia) in &sa.by_key {
         match sb.by_key.get(k) {
             Some(ib) => ids.push((ia.clone(), ib.clone())),
@@ -353,14 +413,15 @@ pub fn pair_dirs(
             only_b.push(sb.display(ib));
         }
     }
-    let ambiguous = [(&sa, "A"), (&sb, "B")]
-        .iter()
-        .flat_map(|(s, side)| {
-            s.ambiguous.iter().map(move |(k, ids)| Ambiguous {
+    let ambiguous = ambiguous_left
+        .into_iter()
+        .map(|(side, key, ids)| {
+            let s = if side == "A" { &sa } else { &sb };
+            Ambiguous {
                 side,
-                key: k.clone(),
+                key,
                 ids: ids.iter().map(|i| s.display(i)).collect(),
-            })
+            }
         })
         .collect();
     let no_dialect = sa

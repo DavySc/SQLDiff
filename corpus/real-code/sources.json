@@ -1,0 +1,52 @@
+{
+  "about": "Unmodified public SQL that runs on its target database. `sqldiff check` must report no `different` finding on any of it: each one would be a false positive a reviewer learns to ignore. Pinned commits keep the gate reproducible; bump them deliberately.",
+  "sources": [
+    {
+      "name": "pg_partman",
+      "repo": "https://github.com/pgpartman/pg_partman",
+      "commit": "63d0a6f04256efaa866f06c36c3b0cce07786146",
+      "license": "PostgreSQL",
+      "paths": [{"path": ".", "dialect": "postgres"}]
+    },
+    {
+      "name": "pgmq",
+      "repo": "https://github.com/tembo-io/pgmq",
+      "commit": "8efb078dbe7afe16c83be72e9fffefbb03ebd9e9",
+      "license": "PostgreSQL",
+      "paths": [{"path": ".", "dialect": "postgres"}]
+    },
+    {
+      "name": "ibmi-oss-examples",
+      "repo": "https://github.com/IBM/ibmi-oss-examples",
+      "commit": "37f17dc6527e1f28314e055c050bb426f5cfe0f1",
+      "license": "Apache-2.0",
+      "paths": [{"path": ".", "dialect": "db2i"}]
+    },
+    {
+      "name": "sakila",
+      "repo": "https://github.com/jOOQ/sakila",
+      "commit": "e089a5b1ec9af0df7a9c6a5d47d49fa1736a4e84",
+      "license": "BSD-2-Clause",
+      "paths": [
+        {"path": "postgres-sakila-db", "dialect": "postgres"},
+        {"path": "sql-server-sakila-db", "dialect": "tsql"},
+        {"path": "db2-sakila-db", "dialect": "db2i"}
+      ]
+    },
+    {
+      "name": "sql-server-maintenance-solution",
+      "repo": "https://github.com/olahallengren/sql-server-maintenance-solution",
+      "commit": "41617578643e722b790ea4d57ef80f8de38ae747",
+      "license": "MIT",
+      "paths": [{"path": ".", "dialect": "tsql"}]
+    },
+    {
+      "name": "wide-world-importers",
+      "repo": "https://github.com/microsoft/sql-server-samples",
+      "commit": "348bbbc25079785f93ea74be3dd0d6369a59358f",
+      "license": "MIT",
+      "sparse": "samples/databases/wide-world-importers",
+      "paths": [{"path": "samples/databases/wide-world-importers", "dialect": "tsql"}]
+    }
+  ]
+}
