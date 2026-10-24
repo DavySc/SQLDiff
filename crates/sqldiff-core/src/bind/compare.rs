@@ -62,8 +62,9 @@ pub fn binding_findings(x: &Bindings) -> (Vec<Finding>, Vec<Assumption>) {
                 if keys_b.contains(&key(i)) {
                     continue;
                 }
-                // Same dialect: a non-proven issue that B removed is not a difference.
-                if same && !i.proven {
+                // Same dialect: a non-proven issue that B removed is not a difference,
+                // unless it was only demoted because its input could not be read.
+                if same && !i.proven && !super::is_degraded(i) {
                     continue;
                 }
                 findings.push(to_finding(aa, i, verdict(i), Some(ab)));

@@ -112,14 +112,29 @@ pub fn split_commas(t: &[Tok]) -> Vec<&[Tok]> {
 
 /// Reads a qualified name (`a.b.c`, Db2 `lib/file`) at `i`; returns the parts
 /// and the index after the name.
-pub fn qualified(t: &[Tok], mut i: usize) -> (Vec<Ident>, usize) {
+pub fn qualified(t: &[Tok], i: usize) -> (Vec<Ident>, usize) {
+    qualified_with(t, i, true)
+}
+
+/// `qualified` without Db2 system naming: `a / b` and `a/b` are divisions.
+pub fn qualified_dot(t: &[Tok], i: usize) -> (Vec<Ident>, usize) {
+    qualified_with(t, i, false)
+}
+
+fn qualified_with(t: &[Tok], mut i: usize, slash: bool) -> (Vec<Ident>, usize) {
     let mut parts = Vec::new();
     while i < t.len() && t[i].is_name() {
         parts.push(t[i].ident());
         i += 1;
-        let sep = t
-            .get(i)
-            .is_some_and(|n| n.kind == SyntaxKind::DOT || n.is_op("/"));
+        // Db2 for i system naming `LIB/FILE` is written without spaces;
+        // `a / b` is a division.
+        let sep = t.get(i).is_some_and(|n| {
+            n.kind == SyntaxKind::DOT
+                || (slash
+                    && n.is_op("/")
+                    && n.start == t[i - 1].end
+                    && t.get(i + 1).is_some_and(|m| m.start == n.end))
+        });
         if sep && t.get(i + 1).is_some_and(Tok::is_name) {
             i += 1;
         } else {
