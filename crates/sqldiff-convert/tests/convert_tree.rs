@@ -144,12 +144,20 @@ fn temporal_tables_and_behavioural_options_are_not_storage() {
     let temporal = "CREATE TABLE t (a int, f DATETIME2 GENERATED ALWAYS AS ROW START NOT NULL, e DATETIME2 GENERATED ALWAYS AS ROW END NOT NULL, PERIOD FOR SYSTEM_TIME (f, e)) WITH (SYSTEM_VERSIONING = ON);\n";
     let memory = "CREATE TABLE t (a int) WITH (MEMORY_OPTIMIZED = ON, DURABILITY = SCHEMA_ONLY);\n";
     let dup = "CREATE UNIQUE INDEX ix ON t (a) WITH (IGNORE_DUP_KEY = ON);\n";
-    for src in [temporal, memory, dup] {
+    // DROP_EXISTING = ON replaces an existing index; a plain CREATE INDEX fails instead.
+    let replace = "CREATE INDEX ix ON t (a) WITH (DROP_EXISTING = ON);\n";
+    for src in [temporal, memory, dup, replace] {
         assert_eq!(pg(src).units[0].status, Status::NotConverted, "{src}");
         assert_eq!(db2(src).units[0].status, Status::NotConverted, "{src}");
     }
     let harmless = "CREATE TABLE t (a int) WITH (DATA_COMPRESSION = PAGE);\n";
     assert_eq!(pg(harmless).units[0].status, Status::Converted);
+    let off = "CREATE INDEX ix ON t (a) WITH (DROP_EXISTING = OFF, FILLFACTOR = 80);\n";
+    assert!(
+        pg(off).units[0].status < Status::NotConverted,
+        "{:?}",
+        pg(off).units[0].notes
+    );
 }
 
 #[test]

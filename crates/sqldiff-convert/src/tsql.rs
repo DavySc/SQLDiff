@@ -3683,8 +3683,8 @@ fn storage_option(opt: &[T]) -> R<()> {
             | "RESUMABLE"
             | "MAXDOP"
             | "OPTIMIZE_FOR_SEQUENTIAL_KEY"
-            | "DROP_EXISTING"
-    ) || name == "IGNORE_DUP_KEY" && value == "OFF";
+    ) || matches!(name.as_str(), "IGNORE_DUP_KEY" | "DROP_EXISTING")
+        && value == "OFF";
     if harmless {
         Ok(())
     } else {
