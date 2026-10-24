@@ -14,7 +14,7 @@ use sqldiff_core::Dialect;
 use sqldiff_gui::convert;
 use sqldiff_gui::review::Store;
 use sqldiff_gui::server::serve_with_hosts;
-use sqldiff_gui::session::{Origin, Session};
+use sqldiff_gui::session::{Origin, Session, TemplateMode};
 use sqldiff_source::compose::Placeholders;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::Resolved;
@@ -62,6 +62,14 @@ struct PairArgs {
     /// Data directory for the review store and redaction salt (default: configured).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+    /// Both sides are templates in the pack's `[template]` syntax: diff
+    /// their SQL fragments, located in the templates.
+    #[arg(long)]
+    template: bool,
+    /// A template parameter name, for both sides. Repeatable; when given,
+    /// only these are placeholders (with --template).
+    #[arg(long = "parameter", value_name = "NAME", requires = "template")]
+    parameters: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -169,12 +177,20 @@ fn open(p: PairArgs) -> Result<Session, String> {
     if let Some(d) = p.data_dir {
         cfg.data_dir = d;
     }
+    let template = match p.template {
+        true => Some(TemplateMode {
+            placeholders: sqldiff_source::tree::placeholders(&cfg).map_err(|e| e.0)?,
+            known: (!p.parameters.is_empty()).then(|| p.parameters.into_iter().collect()),
+        }),
+        false => None,
+    };
     let store = Store::from_config(&cfg).map_err(|e| e.0)?;
-    Session::open(
+    Session::open_with(
         Origin::detect(a, b),
         p.dialect_a.or(p.dialect).or(da),
         p.dialect_b.or(p.dialect).or(db),
         cfg,
+        template,
         store,
     )
 }

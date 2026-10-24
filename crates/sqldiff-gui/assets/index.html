@@ -434,6 +434,7 @@ function renderProv() {
   const o = s.origin;
   const kv = (k, v) => `<div class="kv"><span class="k">${k}</span><span>${v}</span></div>`;
   const parts = [kv(o.kind === "trees" ? "Trees" : "Files", `<code>${esc(o.a)}</code><br><code>${esc(o.b)}</code>`)];
+  if (s.template) parts.push(kv("Mode", "templates" + (s.template.length ? ` · parameters <code>${s.template.map(esc).join("</code> <code>")}</code>` : " · pack rules")));
   parts.push(kv("Snapshot", esc(s.loaded_at.replace("T", " ").replace("Z", " UTC"))));
   if (state.view === "pair" && state.data) {
     const r = state.data.report;

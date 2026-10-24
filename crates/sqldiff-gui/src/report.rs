@@ -84,6 +84,12 @@ impl Redactor {
         }
     }
 
+    /// A name that is not SQL, such as a template parameter.
+    pub fn name(&mut self, n: &str) {
+        let Some(r) = &mut self.inner else { return };
+        r.add(Kind::Object, n);
+    }
+
     pub fn apply(&mut self, s: &str) -> String {
         let Some(r) = &mut self.inner else {
             return s.to_string();
@@ -128,6 +134,17 @@ pub fn markdown(
         info.loaded_at,
         if red.is_on() { " · redacted" } else { "" }
     );
+    if let Some(names) = &info.template {
+        let _ = writeln!(
+            o,
+            "- mode: templates, {}",
+            match (names.is_empty(), red.is_on()) {
+                (true, _) => "placeholders by pack rules".to_string(),
+                (false, true) => format!("{} given parameter(s)", names.len()),
+                (false, false) => format!("parameters {}", names.join(", ")),
+            }
+        );
+    }
     let layers: Vec<String> = info
         .layers
         .iter()

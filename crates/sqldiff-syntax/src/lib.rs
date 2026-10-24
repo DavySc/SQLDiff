@@ -50,4 +50,11 @@ impl LineIndex {
         };
         (line + 1, offset - self.line_starts[line] + 1)
     }
+
+    /// Byte offset where 1-based `line` starts; past the last line, the
+    /// start of the last line.
+    pub fn line_start(&self, line: usize) -> usize {
+        let i = line.max(1) - 1;
+        self.line_starts[i.min(self.line_starts.len() - 1)]
+    }
 }
