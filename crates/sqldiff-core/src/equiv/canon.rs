@@ -969,7 +969,8 @@ impl<'a> Canon<'a> {
         for o in items {
             let (t, ty) = self.expr(&o.expr)?;
             let nulls_first = o.nulls_first.unwrap_or(match self.d {
-                // T-SQL: NULL is the lowest value. PostgreSQL and Db2 for i: the highest (fact V19).
+                // T-SQL: NULL is the lowest value. PostgreSQL and Db2 for i: the highest
+                // (fact V19, Db2 for i part not checked on a real system).
                 Dialect::Tsql => !o.desc,
                 Dialect::Postgres | Dialect::Db2i => o.desc,
             });
