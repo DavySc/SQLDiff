@@ -18,6 +18,8 @@ parameter_sources = ["composition", "cli"]   # lookup order
 collision = "error"                           # first | last | error
 known_parameters = ["SCHEMA"]                 # supplied by the generator itself
 ignore_case = false                           # true: [schema] is parameter SCHEMA
+placeholders = "parameters"                   # or "pattern": the generator's naming convention decides
+unquoted_name_pattern = "[A-Za-z_][A-Za-z0-9_]*"  # where the delimiters are not SQL (default: name_pattern)
 ```
 
 A template is split losslessly into SQL spans, placeholders, special forms
@@ -53,6 +55,8 @@ the parameter names decide:
 |---|---|
 | the source (`template.parameters` on the artifact, see [adapter-protocol.md](adapter-protocol.md)) or `--parameter NAME` on `diff --template` | Only those names, plus the pack's `known_parameters`, are placeholders. Any other name that matches the pattern is read as SQL and reported as `template.unresolved`, with its location in the template. |
 | nobody | The name pattern decides. Where the delimiters also quote names in that dialect (`[...]` in T-SQL, `"..."` in any dialect), the report says which names were taken as placeholders on that basis. This is an unknown reason, so such a pair is never reported as plain *equal*. |
+| the pack, as a convention (`placeholders = "pattern"`) | Every name the pattern matches is a placeholder, whether or not a source gives a list, for generators with a fixed naming convention (for example: upper-case names in brackets are parameters, anything else is SQL). Where the delimiters also quote names, the report records the convention as a declared assumption (`ASM-TEMPLATE-PLACEHOLDER-PATTERN-<side>`), so a pair can be *equal under assumptions*, not plain *equal*. |
+`unquoted_name_pattern` applies in dialects where the delimiters are not SQL syntax (`[...]` outside T-SQL): a delimited name there cannot be a quoted identifier, so a wider pattern (for example lower-case names) is safe, and no assumption is recorded for that side.
 
 `known_parameters` in `[template]` lists names the generator always supplies
 (for example an object id or a column list), which a source does not list

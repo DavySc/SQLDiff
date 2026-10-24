@@ -18,10 +18,14 @@ const PACK: &str = "[pack]\nname = \"t\"\nversion = \"1\"\n\n\
                     known_parameters = [\"OBJECT_ID\"]\n";
 
 fn cfg(name: &str) -> Resolved {
+    cfg_with(PACK, name)
+}
+
+fn cfg_with(pack: &str, name: &str) -> Resolved {
     let d = std::env::temp_dir().join(format!("sqldiff-templates-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    std::fs::write(d.join("pack.toml"), PACK).unwrap();
+    std::fs::write(d.join("pack.toml"), pack).unwrap();
     Resolved::load(&Sources {
         isolated: true,
         packs: vec![d],
@@ -173,4 +177,95 @@ fn pairs_from_a_source_are_compared_as_templates() {
     // `update [TAB]` is not readable as a write.
     let r = run(None, "queue-plain");
     assert!(rules(&r).contains(&"write.unpaired"), "{:?}", rules(&r));
+}
+
+#[test]
+fn a_declared_pattern_convention_decides_and_is_an_assumption() {
+    let pack = format!("{PACK}placeholders = \"pattern\"\n");
+    let tab: BTreeSet<String> = ["TAB".to_string()].into();
+    let r = tree::template_diff(
+        &Artifact::new("a.sql", Dialect::Tsql, TSQL),
+        &Artifact::new("b.sql", Dialect::Db2i, DB2),
+        [Some(&tab), Some(&tab)],
+        &cfg_with(&pack, "declared"),
+        &Options::default(),
+    )
+    .unwrap();
+    // Upper-case names are placeholders by convention, list or not; `[qty]`
+    // does not match the pattern and stays a quoted name.
+    assert!(
+        !rules(&r).contains(&"template.unresolved"),
+        "{:?}",
+        rules(&r)
+    );
+    assert!(pattern_reasons(&r).is_empty(), "{:?}", r.unknown_reasons);
+    let declared: Vec<&String> = r
+        .assumptions
+        .iter()
+        .filter(|a| a.id.starts_with("ASM-TEMPLATE-PLACEHOLDER-PATTERN"))
+        .map(|a| &a.id)
+        .collect();
+    // Only on the T-SQL side, where `[...]` also quotes names.
+    assert_eq!(
+        declared,
+        ["ASM-TEMPLATE-PLACEHOLDER-PATTERN-A"],
+        "{:?}",
+        r.assumptions
+    );
+    // An unknown setting is refused when the pack loads.
+    let bad = format!("{PACK}placeholders = \"guess\"\n");
+    let d = std::env::temp_dir().join(format!("sqldiff-templates-{}-bad", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("pack.toml"), bad).unwrap();
+    let e = sqldiff_source::Pack::load(&d).unwrap_err();
+    assert!(e.0.contains("template.placeholders"), "{e}");
+}
+
+#[test]
+fn where_brackets_are_not_sql_a_wider_name_pattern_applies() {
+    let pack = format!(
+        "{PACK}placeholders = \"pattern\"\nunquoted_name_pattern = \"[A-Za-z_][A-Za-z0-9_]*\"\n"
+    );
+    let cfg = cfg_with(&pack, "unquoted");
+    let side = |text: &str, d: Dialect| {
+        let r = tree::template_diff(
+            &Artifact::new("a.sql", d, text),
+            &Artifact::new("b.sql", d, text),
+            [None, None],
+            &cfg,
+            &Options::default(),
+        )
+        .unwrap();
+        r.assumptions
+            .iter()
+            .filter(|a| a.id.starts_with("ASM-TEMPLATE-PLACEHOLDER-PATTERN"))
+            .map(|a| a.text.clone())
+            .collect::<Vec<_>>()
+    };
+    let text = "update [TAB] set x = 1 where [pk_col] = 2;\n";
+    // T-SQL: only the upper-case name is a placeholder; `[pk_col]` is a quoted name.
+    let t = side(text, Dialect::Tsql);
+    assert!(t.iter().all(|x| x.contains("([TAB])")), "{t:?}");
+    // Db2 for i: brackets are not SQL, so `[pk_col]` is a placeholder too, and
+    // no assumption is needed.
+    assert!(side(text, Dialect::Db2i).is_empty());
+    let r = tree::template_diff(
+        &Artifact::new("a.sql", Dialect::Db2i, text),
+        &Artifact::new(
+            "b.sql",
+            Dialect::Db2i,
+            "update [TAB] set x = 1 where [PK_COL] = 2;\n",
+        ),
+        [None, None],
+        &cfg,
+        &Options::default(),
+    )
+    .unwrap();
+    // Different placeholders, not T-SQL bracket residue.
+    assert!(
+        !rules(&r).iter().any(|x| x.starts_with("residue.")),
+        "{:?}",
+        rules(&r)
+    );
 }

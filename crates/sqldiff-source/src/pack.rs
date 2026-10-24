@@ -188,6 +188,18 @@ pub struct TemplateSyntax {
     /// Placeholder names match parameter names in any letter case.
     #[serde(default)]
     pub ignore_case: bool,
+    /// What makes a delimited name a placeholder: `parameters` (default:
+    /// only the names in the source's parameter list, when it gives one) or
+    /// `pattern` (every match of `name_pattern`, the generator's naming
+    /// convention, e.g. upper-case names). With `pattern` the convention is a
+    /// declared assumption wherever the delimiters also quote names.
+    #[serde(default)]
+    pub placeholders: Option<String>,
+    /// Name pattern for dialects where the delimiters are not SQL syntax, so
+    /// a delimited name there cannot be a quoted identifier (`[...]` outside
+    /// T-SQL). Default: `name_pattern`.
+    #[serde(default)]
+    pub unquoted_name_pattern: Option<String>,
 }
 
 fn default_placeholder_name() -> String {
@@ -433,9 +445,20 @@ impl Policy {
             }
             Regex::new(&t.name_pattern)
                 .map_err(|e| Error::new(format!("template.name_pattern: {e}")))?;
+            if let Some(p) = &t.unquoted_name_pattern {
+                Regex::new(p)
+                    .map_err(|e| Error::new(format!("template.unquoted_name_pattern: {e}")))?;
+            }
             for f in &t.special_forms {
                 Regex::new(&f.pattern)
                     .map_err(|e| Error::new(format!("template special form `{}`: {e}", f.name)))?;
+            }
+            if let Some(p) = &t.placeholders {
+                if !matches!(p.as_str(), "parameters" | "pattern") {
+                    return Err(Error::new(format!(
+                        "template.placeholders `{p}`: expected parameters or pattern"
+                    )));
+                }
             }
             if let Some(c) = &t.collision {
                 if !matches!(c.as_str(), "first" | "last" | "error") {

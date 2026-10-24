@@ -847,11 +847,24 @@ pub fn delimiters_quote_names(open: &str, dialect: sqldiff_syntax::Dialect) -> b
     open == "\"" || (open == "[" && dialect == sqldiff_syntax::Dialect::Tsql)
 }
 
+/// What decided which delimited names in a template are placeholders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaceholderBasis {
+    /// The source's parameter list.
+    Parameters,
+    /// The name pattern, because no parameter list was given: an open question.
+    Pattern,
+    /// The name pattern, because the pack declares it as the generator's
+    /// naming convention: a declared assumption.
+    DeclaredPattern,
+}
+
 /// What the reader of a template diff must know about one side's
 /// placeholders: names that looked like placeholders but are not parameters
-/// (`template.unresolved`, read as SQL), and, without a parameter list,
-/// which names the pattern alone made placeholders where the delimiters also
-/// quote names. Call after [`remap_to_template`].
+/// (`template.unresolved`, read as SQL), and, when the name pattern decided,
+/// which names it made placeholders where the delimiters also quote names
+/// (an unknown reason, or a declared assumption when the pack declares the
+/// convention). Call after [`remap_to_template`].
 #[allow(clippy::too_many_arguments)]
 pub fn template_notes(
     report: &mut Report,
@@ -859,7 +872,7 @@ pub fn template_notes(
     template: &Template,
     path: &str,
     dialect: sqldiff_syntax::Dialect,
-    parameters_known: bool,
+    basis: PlaceholderBasis,
     (open, close): (&str, &str),
     excerpt_lines: usize,
 ) {
@@ -905,14 +918,26 @@ pub fn template_notes(
             assumptions: Vec::new(),
         });
     }
-    if !parameters_known && delimiters_quote_names(open, dialect) {
-        let names = template.parameters();
-        if !names.is_empty() {
-            let shown: Vec<String> = names.iter().map(|n| format!("{open}{n}{close}")).collect();
+    let names = template.parameters();
+    if basis != PlaceholderBasis::Parameters
+        && delimiters_quote_names(open, dialect)
+        && !names.is_empty()
+    {
+        let shown: Vec<String> = names.iter().map(|n| format!("{open}{n}{close}")).collect();
+        let shown = shown.join(", ");
+        let dialect = dialect.display_name();
+        if basis == PlaceholderBasis::DeclaredPattern {
+            report.assumptions.push(Assumption {
+                id: format!("ASM-TEMPLATE-PLACEHOLDER-PATTERN-{side:?}"),
+                text: format!(
+                    "Side {side:?}: names matching the template's name pattern are placeholders, by the generator's convention declared in the pack ({shown}); in {dialect} they could otherwise be quoted names."
+                ),
+                source: AssumptionSource::Declared,
+                cite: None,
+            });
+        } else {
             report.unknown_reasons.push(format!(
-                "side {side:?}: no parameter list for the template, so {} were taken as placeholders by the name pattern; in {} they could also be quoted names",
-                shown.join(", "),
-                dialect.display_name()
+                "side {side:?}: no parameter list for the template, so {shown} were taken as placeholders by the name pattern; in {dialect} they could also be quoted names"
             ));
         }
     }

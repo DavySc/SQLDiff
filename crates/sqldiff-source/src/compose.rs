@@ -359,6 +359,8 @@ mod tests {
             collision: Some("error".into()),
             known_parameters: vec![],
             ignore_case: false,
+            placeholders: None,
+            unquoted_name_pattern: None,
         };
         let mut c = Composition::from_spans(
             "x",

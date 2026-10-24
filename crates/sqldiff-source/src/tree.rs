@@ -70,7 +70,9 @@ pub fn diff(a: &Artifact, b: &Artifact, cfg: &Resolved) -> Report {
 /// names are placeholders and any other delimited name stays SQL (reported
 /// as `template.unresolved`), since `[name]` is also a quoted identifier in
 /// T-SQL. Without one the name pattern decides, and where the delimiters can
-/// quote names the report says which names that made placeholders.
+/// quote names the report says which names that made placeholders. A pack
+/// with `placeholders = "pattern"` declares the pattern as the generator's
+/// convention: lists are not used and the report records an assumption.
 pub fn template_report(
     a: &Artifact,
     b: &Artifact,
@@ -78,8 +80,11 @@ pub fn template_report(
     cfg: &Resolved,
     opts: &Options,
 ) -> Result<Report> {
-    use sqldiff_core::composition::{remap_to_template, template_notes};
+    use sqldiff_core::composition::{
+        delimiters_quote_names, remap_to_template, template_notes, PlaceholderBasis,
+    };
     use sqldiff_core::model::Side;
+    use sqldiff_syntax::template::Compiled;
     use sqldiff_syntax::template::Template;
 
     let t = cfg
@@ -88,17 +93,40 @@ pub fn template_report(
         .as_ref()
         .ok_or_else(|| Error::new("no [template] syntax in the loaded packs or config"))?;
     let syntax = crate::compose::compile(t)?;
+    // Where the delimiters are not SQL, a delimited name cannot be a quoted
+    // identifier, so the pack may allow a wider name pattern there.
+    let unquoted = match &t.unquoted_name_pattern {
+        Some(p) => {
+            let mut def = crate::compose::syntax_def(t);
+            def.name_pattern = p.clone();
+            Some(Compiled::new(&def).map_err(Error::new)?)
+        }
+        None => None,
+    };
+    let syntax_for = |d: Dialect| {
+        if delimiters_quote_names(&t.open, d) {
+            &syntax
+        } else {
+            unquoted.as_ref().unwrap_or(&syntax)
+        }
+    };
+    let by_pattern = t.placeholders.as_deref() == Some("pattern");
     let with_pack = |k: Option<&BTreeSet<String>>| {
-        k.map(|k| {
+        k.filter(|_| !by_pattern).map(|k| {
             k.iter()
                 .chain(t.known_parameters.iter())
                 .cloned()
                 .collect::<BTreeSet<String>>()
         })
     };
+    let basis = |k: &Option<BTreeSet<String>>| match (k, by_pattern) {
+        (_, true) => PlaceholderBasis::DeclaredPattern,
+        (Some(_), false) => PlaceholderBasis::Parameters,
+        (None, false) => PlaceholderBasis::Pattern,
+    };
     let (ka, kb) = (with_pack(known[0]), with_pack(known[1]));
-    let ta = Template::parse(&a.text, &syntax, ka.as_ref());
-    let tb = Template::parse(&b.text, &syntax, kb.as_ref());
+    let ta = Template::parse(&a.text, syntax_for(a.dialect), ka.as_ref());
+    let tb = Template::parse(&b.text, syntax_for(b.dialect), kb.as_ref());
     let (fa, fb) = (ta.fragment(), tb.fragment());
     let mut xa = a.clone();
     xa.text = fa.text.clone();
@@ -113,7 +141,7 @@ pub fn template_report(
             tpl,
             &art.path,
             art.dialect,
-            k.is_some(),
+            basis(k),
             (&t.open, &t.close),
             opts.excerpt_lines,
         );
