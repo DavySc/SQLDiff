@@ -14,6 +14,7 @@
   --transactional: #d92d20; --semantic: #dc6803;
   --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-differs: #d92d20; --s-not_converted: #98a2b3;
   --b-assumptions: #fff6dc; --b-decision: #eef0ff; --b-differs: #fde8e8; --b-not_converted: #f2f4f7;
+  --link: rgba(79,70,229,.14); --link-2: rgba(79,70,229,.06);
   --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
@@ -25,6 +26,7 @@
     --transactional: #f97066; --semantic: #fdb022;
     --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-differs: #f97066; --s-not_converted: #667085;
     --b-assumptions: #3a3218; --b-decision: #24254a; --b-differs: #3d2222; --b-not_converted: #1e232b;
+    --link: rgba(129,140,248,.2); --link-2: rgba(129,140,248,.08);
   }
 }
 * { box-sizing: border-box; }
@@ -63,16 +65,30 @@ button:disabled { opacity: .45; cursor: default; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--soft); }
 
-main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 14px; grid-template-rows: auto minmax(0, 1fr); min-height: 0; gap: 0; }
+main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 36px minmax(0, 1fr) 14px; grid-template-rows: auto minmax(0, 1fr); min-height: 0; gap: 0; }
 .ph { padding: 6px 12px; font-size: 12px; color: var(--muted); background: var(--panel); border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
 .ph strong { color: var(--fg); font-weight: 600; }
-.ph.right { border-left: 1px solid var(--line); }
-#src, #b { width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; background: var(--panel); color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; }
-#b { grid-column: 2; grid-row: 2; border-left: 1px solid var(--line); }
-body.compare #out, body.compare #overview .m:not(.f), body.compare .conv-only { display: none !important; }
+.ph { grid-row: 1; grid-column: 1; }
+.ph.right { grid-column: 3; border-left: 1px solid var(--line); }
+/* The source textarea sits on a layer that paints the selected and hovered statements, so they show without focus. */
+.srcwrap { grid-row: 2; grid-column: 1; position: relative; overflow: hidden; min-height: 0; background: var(--panel); }
+#srchl { position: absolute; left: 0; right: 0; top: 0; pointer-events: none; }
+#srchl .bar { position: absolute; left: 0; right: 0; }
+#srchl .bar.sel { background: var(--link); box-shadow: inset 3px 0 0 var(--focus); }
+#srchl .bar.hov { background: var(--link-2); }
+/* Gutter between the panes: one band joins the hovered or selected statement to its counterpart. */
+#gut { grid-row: 1 / 3; grid-column: 2; position: relative; background: var(--soft); border-left: 1px solid var(--line); overflow: hidden; }
+#gut svg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+#gut .edge { position: absolute; left: 2px; right: 2px; padding: 2px 0; font-size: 10px; font-weight: 600; line-height: 1.2; text-align: center; color: var(--focus); background: var(--panel); border: 1px solid var(--focus); border-radius: 999px; font-variant-numeric: tabular-nums; }
+#gut .edge:hover { background: var(--panel); color: var(--focus); }
+body.compare main { grid-template-columns: minmax(0, 1fr) 0 minmax(0, 1fr) 14px; }
+#src, #b { display: block; width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; background: var(--panel); color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; }
+#src { position: relative; z-index: 1; background: transparent; }
+#b { grid-column: 3; grid-row: 2; border-left: 1px solid var(--line); }
+body.compare #out, body.compare #gut, body.compare #overview .m:not(.f), body.compare .conv-only { display: none !important; }
 body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; }
-#out { overflow: auto; background: var(--panel); border-left: 1px solid var(--line); font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; padding: 8px 0; }
-.ln { display: grid; grid-template-columns: 40px 16px minmax(0, 1fr); cursor: pointer; }
+#out { grid-row: 2; grid-column: 3; overflow: auto; background: var(--panel); border-left: 1px solid var(--line); font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; padding: 8px 0; }
+.ln { display: grid; grid-template-columns: 40px 16px minmax(0, 1fr); cursor: pointer; position: relative; }
 .ln .no { color: var(--muted); text-align: right; padding-right: 6px; user-select: none; opacity: .7; }
 .ln .g { display: flex; align-items: center; justify-content: center; }
 .ln .g .dot { width: 7px; height: 7px; }
@@ -81,17 +97,28 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
 .ln.s-decision { background: var(--b-decision); }
 .ln.s-differs { background: var(--b-differs); }
 .ln.s-not_converted { background: var(--b-not_converted); }
-.ln.sel { box-shadow: inset 3px 0 0 var(--focus); }
+.ln.hov { background-image: linear-gradient(var(--link-2), var(--link-2)); }
+.ln.sel { box-shadow: inset 3px 0 0 var(--focus); background-image: linear-gradient(var(--link), var(--link)); }
+.ln.sib { outline: 1px dashed var(--focus); outline-offset: -1px; }
+.ln.hov .no { opacity: 1; color: var(--focus); }
+.ghost { font: 11.5px/1 "Inter", system-ui, sans-serif; color: var(--focus); margin-left: 14px; }
+.ghost u { cursor: pointer; text-underline-offset: 2px; }
+/* A short flash where the eye should land after a jump. */
+.ln.flash::after, #srchl .bar.flash::after { content: ""; position: absolute; inset: 0; background: var(--focus); opacity: 0; pointer-events: none; animation: flash .9s ease-out; }
+@keyframes flash { from { opacity: .28; } to { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .ln.flash::after, #srchl .bar.flash::after { animation: none; } }
 .ln.sel .no { color: var(--focus); opacity: 1; font-weight: 600; }
 .ln:hover .no { opacity: 1; }
-#overview { position: relative; background: var(--panel); border-left: 1px solid var(--line); cursor: pointer; grid-row: 1 / 3; grid-column: 3; }
+#overview { position: relative; background: var(--panel); border-left: 1px solid var(--line); cursor: pointer; grid-row: 1 / 3; grid-column: 4; }
 #overview .m { position: absolute; left: 3px; right: 3px; min-height: 2px; border-radius: 1px; }
+#overview .m.selmark { left: 0; right: 0; min-height: 3px; background: var(--focus); pointer-events: none; }
 #overview .vp { position: absolute; left: 0; right: 0; border: 1px solid var(--muted); border-radius: 2px; opacity: .5; pointer-events: none; }
 .t-kw { color: var(--kw); font-weight: 600; } .t-str { color: var(--str); } .t-num { color: var(--num); }
 .t-cmt { color: var(--cmt); font-style: italic; } .t-var { color: var(--var); }
 
 #detail { height: 34vh; min-height: 140px; border-top: 1px solid var(--line); background: var(--bg); display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
 #detail .dh { grid-column: 1 / -1; padding: 6px 14px; display: flex; gap: 10px; align-items: center; font-size: 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
+#dh .jump { padding: 0 2px; color: var(--focus); text-decoration: underline; text-underline-offset: 2px; }
 .badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--soft); }
 #detail pre { margin: 0; padding: 8px 14px; font: 12px/1.55 var(--mono); overflow: auto; white-space: pre; }
 #detail .code { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); min-height: 0; overflow: hidden; border-right: 1px solid var(--line); }
@@ -110,8 +137,10 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
 #help > div { background: var(--panel); border-radius: 12px; padding: 18px 22px; box-shadow: 0 10px 30px rgba(0,0,0,.25); max-width: 520px; font-size: 13px; }
 #help td { padding: 3px 10px 3px 0; vertical-align: top; }
 @media (max-width: 900px) {
-  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 40vh auto 40vh; }
-  #overview { display: none; }
+  main, body.compare main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 40vh auto 40vh; }
+  .ph, .ph.right, .srcwrap, #out, #b { grid-column: 1; }
+  .ph.right { grid-row: 3; } #out, #b { grid-row: 4; }
+  #overview, #gut { display: none; }
   .ph.right, #out { border-left: 0; }
   #detail { grid-template-columns: 1fr; height: auto; }
 }
@@ -142,8 +171,9 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
 <main>
   <div class="ph"><strong id="srcdial">T-SQL</strong><span id="srcname"></span><span class="spacer"></span><span>edit freely; nothing is saved</span></div>
   <div class="ph right"><strong id="outdial">PostgreSQL</strong><span id="outsub">converted, checked by SQLDiff</span><span class="spacer"></span><span id="timing"></span></div>
-  <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea>
-  <div id="out" role="listbox" aria-label="Converted output"></div>
+  <div class="srcwrap"><div id="srchl"></div><textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea></div>
+  <div id="gut" class="conv-only"><svg id="gsvg" aria-hidden="true"></svg></div>
+  <div id="out" role="listbox" tabindex="0" aria-label="Converted output"></div>
   <textarea id="b" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Right side to compare"></textarea>
   <div id="overview" title="Location pane: click to jump"></div>
 </main>
@@ -165,6 +195,8 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
   <table style="margin-top:10px">
     <tr><td><kbd>Alt</kbd>+<kbd>↓</kbd> / <kbd>Alt</kbd>+<kbd>↑</kbd></td><td>Next / previous unit that needs attention</td></tr>
     <tr><td><kbd>Alt</kbd>+<kbd>Home</kbd> / <kbd>Alt</kbd>+<kbd>End</kbd></td><td>First / last such unit</td></tr>
+    <tr><td><kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>Alt</kbd>+<kbd>→</kbd></td><td>Go to the selected statement's source / converted code</td></tr>
+    <tr><td>Hover, click</td><td>Hovering a statement on either side shows its counterpart, joined by a band in the gutter. Clicking keeps the side you clicked still and brings the counterpart level with it. A dashed outline marks the other part of a statement the conversion split, such as a DECLARE moved to the declare section.</td></tr>
     <tr><td>Accept everywhere</td><td>Mark an assumption as known to hold; statements that only needed it count as converted (remembered in this browser).</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>Back to the editor</td></tr>
     <tr><td><kbd>?</kbd></td><td>This help (outside the editor)</td></tr>
@@ -176,7 +208,7 @@ const $ = (id) => document.getElementById(id);
 const LABEL = { converted: "converted", assumptions: "under assumptions", decision: "needs a decision", differs: "differs", not_converted: "not converted" };
 const SHORT = { converted: "converted", assumptions: "assumptions", decision: "decisions", differs: "differs", not_converted: "not converted" };
 const ORDER = ["not_converted", "differs", "decision", "assumptions", "converted"];
-const state = { data: null, sel: -1, lineUnit: [], seq: 0, shown: 0, lead: null, anchors: [[1, 1]], st: [], accepted: new Set(),
+const state = { data: null, sel: -1, hov: -1, flash: new Set(), split: [], lineUnit: [], seq: 0, shown: 0, lead: null, anchors: [[1, 1]], st: [], accepted: new Set(),
   mode: "convert", from: "tsql", to: "postgres", cmp: null, fsel: -1 };
 const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
 const hasRules = (f, t) => INITIAL.with_rules.some(([a, b]) => a === f && b === t);
@@ -265,10 +297,15 @@ function render(data, keepSel) {
     return `<div class="ln${cls}" data-l="${i + 1}" data-u="${ui}"><span class="no">${i + 1}</span><span class="g">${g}</span><span class="tx">${hl(t) || " "}</span></div>`;
   }).join("");
   state.anchors = anchors(c, $("src").value.split("\n").length, c.output.split("\n").length);
+  // Units with the same source span are parts of one statement the conversion split (a DECLARE moved to the declare section).
+  const bySrc = new Map();
+  c.units.forEach((u, i) => { const k = `${u.src.start}:${u.src.end}`; bySrc.set(k, (bySrc.get(k) || []).concat(i)); });
+  state.split = c.units.map((u) => bySrc.get(`${u.src.start}:${u.src.end}`));
+  if (state.hov >= c.units.length) state.hov = -1;
   overview();
   if (!keepSel || state.sel >= c.units.length) state.sel = -1;
   if (state.sel >= 0) select(state.sel, { scroll: false, caret: false });
-  else showDetail(-1);
+  else { paint(); showDetail(-1); }
 }
 function isNarrower(a, b) {
   const u = state.data.conversion.units;
@@ -302,28 +339,165 @@ function unitAt(offset) {
 
 function lineHeight(el) { return parseFloat(getComputedStyle(el).lineHeight) || 20; }
 
-function select(i, { scroll = true, caret = true } = {}) {
+// Geometry of both panes, in px from the top of each pane's visible area.
+const padTop = (el) => parseFloat(getComputedStyle(el).paddingTop) || 0;
+const outLine = (l) => $("out").querySelector(`.ln[data-l="${l}"]`);
+function srcY(line) { const ta = $("src"); return padTop(ta) + (line - 1) * lineHeight(ta) - ta.scrollTop; }
+function outY(line) { const e = outLine(line); return e ? e.getBoundingClientRect().top - $("out").getBoundingClientRect().top : 0; }
+function scrollSrcTo(line, y) { const ta = $("src"); ta.scrollTop = padTop(ta) + (line - 1) * lineHeight(ta) - y; }
+function scrollOutTo(line, y) { $("out").scrollTop += outY(line) - y; }
+const shown = (y, el) => y >= 0 && y <= el.clientHeight - 40;
+const siblings = (i) => (state.split[i] || []).filter((j) => j !== i);
+
+// Select a unit. `from` is the pane the user acted in: that pane never moves,
+// and the other one brings the counterpart level with it (`align`, on a click)
+// or just into view. Without `from` (navigation keys, chips, the location
+// pane) the output brings the unit into view and the source lines up beside it.
+function select(i, { scroll = true, caret = true, from = null, align = true } = {}) {
   const c = state.data.conversion;
   state.sel = i;
-  document.querySelectorAll(".ln.sel").forEach((e) => e.classList.remove("sel"));
-  if (i < 0) return showDetail(-1);
-  const u = c.units[i];
-  for (let l = u.out.line; l <= u.out.end_line; l++) {
-    const e = document.querySelector(`.ln[data-l="${l}"]`);
-    if (e) e.classList.add("sel");
-  }
+  if (i < 0) { paint(); return showDetail(-1); }
+  const u = c.units[i], ta = $("src"), o = $("out");
   state.lead = null;
+  if (caret) ta.setSelectionRange(u.src.start_u16, u.src.end_u16);
   if (scroll) {
-    const e = document.querySelector(`.ln[data-l="${u.out.line}"]`), o = $("out");
-    if (e && (e.offsetTop < o.scrollTop || e.offsetTop > o.scrollTop + o.clientHeight - 40)) o.scrollTop = e.offsetTop - o.clientHeight / 3;
+    if (from === "out") {
+      scrollSrcTo(u.src.line, outY(u.out.line));
+      state.flash.add("src");
+    } else if (from === "src") {
+      if (align) { scrollOutTo(u.out.line, srcY(u.src.line)); state.flash.add("out"); }
+      else if (!shown(outY(u.out.line), o)) scrollOutTo(u.out.line, o.clientHeight / 3);
+    } else {
+      if (!shown(outY(u.out.line), o)) scrollOutTo(u.out.line, o.clientHeight / 3);
+      scrollSrcTo(u.src.line, outY(u.out.line));
+      state.flash.add("out").add("src");
+    }
   }
-  if (caret) {
-    const ta = $("src");
-    ta.setSelectionRange(u.src.start_u16, u.src.end_u16);
-    const top = (u.src.line - 1) * lineHeight(ta);
-    if (top < ta.scrollTop || top > ta.scrollTop + ta.clientHeight - 40) ta.scrollTop = top - ta.clientHeight / 3;
-  }
+  paint();
   showDetail(i);
+}
+
+// Go to one side of the selected unit (Alt+← / Alt+→, the gutter's edge chips).
+function reveal(side, i = state.sel) {
+  const c = state.data.conversion;
+  if (!c || i < 0) return;
+  const u = c.units[i], ta = $("src"), o = $("out");
+  state.lead = null;
+  if (side === "src") {
+    ta.focus({ preventScroll: true });
+    ta.setSelectionRange(u.src.start_u16, u.src.end_u16);
+    if (!shown(srcY(u.src.line), ta)) scrollSrcTo(u.src.line, ta.clientHeight / 3);
+  } else {
+    o.focus({ preventScroll: true });
+    if (!shown(outY(u.out.line), o)) scrollOutTo(u.out.line, o.clientHeight / 3);
+  }
+  state.flash.add(side);
+  paint();
+}
+
+// Paint the selection, the hovered unit and the other parts of a split
+// statement on both sides, then the band between them.
+function paint() {
+  const c = state.data?.conversion, live = c && state.mode === "convert";
+  document.querySelectorAll("#out .ln.sel, #out .ln.hov, #out .ln.sib, #out .ln.flash").forEach((e) => e.classList.remove("sel", "hov", "sib", "flash"));
+  document.querySelectorAll("#out .ghost, #overview .selmark").forEach((e) => e.remove());
+  const bars = [], marks = [];
+  const mark = (i, cls, src = true) => {
+    const u = c.units[i];
+    for (let l = u.out.line; l <= u.out.end_line; l++) outLine(l)?.classList.add(cls);
+    if (src) bars.push([u.src.line, u.src.end_line, cls]);
+    if (cls !== "hov") marks.push(u);
+  };
+  if (live) {
+    if (state.hov >= 0 && state.hov !== state.sel) mark(state.hov, "hov");
+    if (state.sel >= 0) {
+      const sel = state.sel, sib = siblings(sel);
+      sib.forEach((j) => mark(j, "sib", false));
+      mark(sel, "sel");
+      if (state.flash.has("out")) {
+        const u = c.units[sel];
+        for (let l = u.out.line; l <= u.out.end_line; l++) { const e = outLine(l); if (e) { void e.offsetWidth; e.classList.add("flash"); } }
+      }
+      const first = outLine(c.units[sel].out.line)?.querySelector(".tx");
+      if (first && sib.length) first.insertAdjacentHTML("beforeend", `<span class="ghost">← split from one ${esc(dialectName(state.data.from))} statement · also at ${
+        sib.map((j) => `<u data-go="${j}">line ${c.units[j].out.line}</u>`).join(", ")}</span>`);
+    }
+  }
+  const ta = $("src"), lh = lineHeight(ta), pt = padTop(ta), fl = state.flash.has("src");
+  $("srchl").innerHTML = bars.map(([a, b, cls]) =>
+    `<div class="bar ${cls}${fl && cls === "sel" ? " flash" : ""}" style="top:${pt + (a - 1) * lh}px;height:${(b - a + 1) * lh}px"></div>`).join("");
+  state.flash.clear();
+  backdrop();
+  if (live) {
+    const total = Math.max(1, state.lineUnit.length);
+    $("overview").insertAdjacentHTML("afterbegin", marks.map((u) =>
+      `<div class="m selmark" style="top:${(u.out.line - 1) / total * 100}%;height:${(u.out.end_line - u.out.line + 1) / total * 100}%"></div>`).join(""));
+  }
+  links();
+}
+function backdrop() { $("srchl").style.transform = `translateY(${-$("src").scrollTop}px)`; }
+function hover(i) { if (i !== state.hov) { state.hov = i; paint(); } }
+// The narrowest unit whose source lines contain a line of the textarea.
+function unitAtLine(line) {
+  const units = state.data.conversion?.units || [];
+  let best = -1;
+  units.forEach((u, i) => {
+    if (u.src.line <= line && line <= u.src.end_line &&
+        (best < 0 || (u.src.end_u16 - u.src.start_u16) < (units[best].src.end_u16 - units[best].src.start_u16))) best = i;
+  });
+  return best;
+}
+
+// The gutter band: the hovered or selected unit's source lines joined to its
+// output lines. An end that is off screen stops at the pane's edge in a chip
+// with its line number; the chip goes there.
+let linkFrame = 0;
+function links() { if (!linkFrame) linkFrame = requestAnimationFrame(() => { linkFrame = 0; drawLinks(); }); }
+function drawLinks() {
+  const g = $("gut"), svg = $("gsvg"), c = state.data?.conversion;
+  svg.innerHTML = "";
+  g.querySelectorAll(".edge").forEach((e) => e.remove());
+  if (!c || state.mode !== "convert" || !g.offsetWidth) return;
+  const gr = g.getBoundingClientRect(), W = gr.width, ta = $("src"), lh = lineHeight(ta);
+  const tr = ta.getBoundingClientRect(), or = $("out").getBoundingClientRect();
+  const top = Math.max(tr.top, or.top) - gr.top, bot = Math.min(tr.bottom, or.bottom) - gr.top;
+  const show = [];
+  if (state.hov >= 0 && state.hov !== state.sel) show.push([state.hov, "hov"]);
+  if (state.sel >= 0) siblings(state.sel).forEach((j) => show.push([j, "sib"]));
+  if (state.sel >= 0) show.push([state.sel, "sel"]);
+  const chips = { "-1": 0, 1: 0 };
+  for (const [i, kind] of show) {
+    const u = c.units[i], f = outLine(u.out.line), e = outLine(u.out.end_line);
+    if (!f || !e) continue;
+    const l0 = tr.top - gr.top + srcY(u.src.line);
+    const ends = [
+      [l0, l0 + (u.src.end_line - u.src.line + 1) * lh, "src", u.src.line],
+      [f.getBoundingClientRect().top - gr.top, e.getBoundingClientRect().bottom - gr.top, "out", u.out.line],
+    ].map(([t, b, side, line]) =>
+      b <= top ? { t: top, b: top + 3, off: -1, side, line }
+      : t >= bot ? { t: bot - 3, b: bot, off: 1, side, line }
+      : { t: Math.max(top, t), b: Math.min(bot, b), off: 0, side, line });
+    const [l, r] = ends, m = W / 2;
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M0 ${l.t} C${m} ${l.t} ${m} ${r.t} ${W} ${r.t} L${W} ${r.b} C${m} ${r.b} ${m} ${l.b} 0 ${l.b} Z`);
+    path.setAttribute("fill", "var(--focus)");
+    path.setAttribute("fill-opacity", kind === "sel" ? ".2" : ".08");
+    path.setAttribute("stroke", "var(--focus)");
+    path.setAttribute("stroke-opacity", kind === "sel" ? ".7" : ".35");
+    if (kind === "sib") path.setAttribute("stroke-dasharray", "3 3");
+    svg.appendChild(path);
+    if (kind !== "sel") continue;
+    for (const end of ends) {
+      if (!end.off) continue;
+      const b = document.createElement("button"), k = chips[end.off]++;
+      b.className = "edge";
+      b.textContent = `${end.off < 0 ? "↑" : "↓"}${end.line}`;
+      b.title = `${end.side === "src" ? dialectName(state.data.from) : dialectName(state.data.to)} line ${end.line} is off screen: show it`;
+      b.style.top = `${end.off < 0 ? top + 4 + k * 20 : bot - 22 - k * 20}px`;
+      b.onclick = () => reveal(end.side, i);
+      g.appendChild(b);
+    }
+  }
 }
 
 function showDetail(i) {
@@ -336,7 +510,8 @@ function showDetail(i) {
   }
   const u = c.units[i], st = state.st[i];
   $("dh").innerHTML = `<span class="badge"><span class="dot" style="background:var(--s-${st})"></span>${LABEL[st]}</span>
-    <span class="muted">T-SQL line ${u.src.line}${u.src.end_line > u.src.line ? "–" + u.src.end_line : ""} → PostgreSQL line ${u.out.line}${u.out.end_line > u.out.line ? "–" + u.out.end_line : ""}</span>`;
+    <span class="muted">${esc(dialectName(d.from))} line ${u.src.line}${u.src.end_line > u.src.line ? "–" + u.src.end_line : ""} → ${esc(dialectName(d.to))} line ${u.out.line}${u.out.end_line > u.out.line ? "–" + u.out.end_line : ""}</span>${
+    siblings(i).length ? `<span class="muted">· split statement, other part at ${siblings(i).map((j) => `<button class="jump" data-go="${j}">line ${c.units[j].out.line}</button>`).join(", ")}</span>` : ""}`;
   $("dsrc").textContent = d.input.slice(u.src.start_u16, u.src.end_u16);
   $("dout").textContent = c.output.split("\n").slice(u.out.line - 1, u.out.end_line).join("\n");
   const notes = u.notes.map((n) => {
@@ -460,15 +635,20 @@ function setMode(m) {
   if (m === "compare") {
     if (!$("b").value) $("b").value = state.data.conversion?.output || "";
     $("notes").innerHTML = "";
+    state.hov = -1;
+    paint();
     schedule(0);
   } else {
     render(state.data, true);
     schedule(0);
   }
 }
-function followCaret() {
-  const i = unitAt($("src").selectionStart);
-  if (i >= 0 && i !== state.sel) select(i, { caret: false });
+function followCaret(e) {
+  const off = $("src").selectionStart, cur = state.data.conversion?.units[state.sel];
+  // Keep the selection while the caret is inside it: a split statement's parts share one source span.
+  if (cur && cur.src.start_u16 <= off && off <= cur.src.end_u16) return;
+  const i = unitAt(off);
+  if (i >= 0 && i !== state.sel) select(i, { caret: false, from: "src", align: e?.type === "click" });
 }
 
 // Scroll sync. Only the pane the user is scrolling (wheel, touch, keys, a drag
@@ -550,16 +730,29 @@ function init() {
   $("b").addEventListener("input", () => schedule());
   $("b").addEventListener("scroll", () => syncFrom("out"));
   ["click", "keyup", "select"].forEach((ev) => ta.addEventListener(ev, followCaret));
-  ta.addEventListener("scroll", () => syncFrom("src"));
-  $("out").addEventListener("scroll", () => syncFrom("out"));
+  ta.addEventListener("scroll", () => { syncFrom("src"); backdrop(); links(); });
+  $("out").addEventListener("scroll", () => { syncFrom("out"); links(); });
+  ta.addEventListener("mousemove", (e) => {
+    if (state.mode !== "convert" || !state.data.conversion) return;
+    const line = Math.floor((e.clientY - ta.getBoundingClientRect().top - padTop(ta) + ta.scrollTop) / lineHeight(ta)) + 1;
+    hover(unitAtLine(line));
+  });
+  $("out").addEventListener("mousemove", (e) => { const ln = e.target.closest(".ln"); hover(ln ? +ln.dataset.u : -1); });
+  for (const el of [ta, $("out")]) el.addEventListener("mouseleave", () => hover(-1));
   for (const [el, side] of [[ta, "src"], [$("out"), "out"], [$("b"), "out"]]) {
     for (const ev of ["wheel", "touchstart", "pointerdown", "keydown"]) {
       el.addEventListener(ev, () => lead(side), { passive: true });
     }
   }
   $("out").addEventListener("click", (e) => {
+    const go = e.target.closest("[data-go]");
+    if (go) return select(+go.dataset.go);
     const ln = e.target.closest(".ln");
-    if (ln && +ln.dataset.u >= 0) select(+ln.dataset.u);
+    if (ln && +ln.dataset.u >= 0) select(+ln.dataset.u, { from: "out" });
+  });
+  $("dh").addEventListener("click", (e) => {
+    const go = e.target.closest("[data-go]");
+    if (go) select(+go.dataset.go);
   });
   $("overview").addEventListener("click", (e) => {
     const m = e.target.closest(".m");
@@ -596,12 +789,16 @@ function init() {
   $("save").onclick = download;
   $("helpbtn").onclick = () => $("help").classList.add("open");
   $("help").onclick = () => $("help").classList.remove("open");
-  window.addEventListener("resize", viewport);
+  window.addEventListener("resize", () => { viewport(); links(); });
   document.addEventListener("keydown", (e) => {
     if (e.altKey && e.key === "ArrowDown") { e.preventDefault(); step(1); }
     else if (e.altKey && e.key === "ArrowUp") { e.preventDefault(); step(-1); }
     else if (e.altKey && e.key === "Home") { e.preventDefault(); const l = attention(); if (l.length) select(l[0]); }
     else if (e.altKey && e.key === "End") { e.preventDefault(); const l = attention(); if (l.length) select(l[l.length - 1]); }
+    else if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight") && state.mode === "convert" && state.sel >= 0) {
+      e.preventDefault();
+      reveal(e.key === "ArrowLeft" ? "src" : "out");
+    }
     else if (e.key === "Escape") { $("help").classList.remove("open"); ta.focus(); }
     else if (e.key === "?" && document.activeElement !== ta && document.activeElement !== $("b")) $("help").classList.add("open");
   });
