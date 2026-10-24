@@ -501,3 +501,58 @@ fn only_the_refused_statement_goes_to_the_idiom_rules() {
     );
     assert!(!has_rule(unit(&c, src, "RETURN 1"), "idiom-rules"));
 }
+
+fn template(text: &str) -> sqldiff_syntax::template::Template {
+    use sqldiff_syntax::template::{Compiled, Template, TemplateSyntax};
+    let syntax = Compiled::new(&TemplateSyntax {
+        open: "[".into(),
+        close: "]".into(),
+        name_pattern: "[A-Z][A-Z0-9_]*".into(),
+        special_forms: vec![("include".into(), r"<%@include\s+(\S+)\s*%>".into())],
+        ignore_case: false,
+    })
+    .unwrap();
+    Template::parse(text, &syntax, None)
+}
+
+const TEMPLATE: &str = "<%@include header.sql %>
+CREATE PROCEDURE [SCHEMA].Save[ENTITY] @Id int, @[KEY]Name nvarchar(50) AS
+BEGIN
+  SET NOCOUNT ON;
+  UPDATE [SCHEMA].[TABLE] SET [Name] = @[KEY]Name WHERE Id = @Id;
+END
+";
+
+#[test]
+fn templates_keep_their_placeholders() {
+    let t = template(TEMPLATE);
+    let c = sqldiff_convert::convert_template(&t, Dialect::Tsql, Dialect::Postgres).unwrap();
+    println!("{}", c.output);
+    let info = c.template.as_ref().unwrap();
+    assert_eq!(info.parameters, ["SCHEMA", "ENTITY", "KEY", "TABLE"]);
+    assert!(
+        c.output.contains("<%@include header.sql %>"),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output.contains("PROCEDURE [SCHEMA].Save[ENTITY]("),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output.contains("UPDATE [SCHEMA].[TABLE] SET Name = "),
+        "{}",
+        c.output
+    );
+    assert!(
+        !c.output.to_ascii_lowercase().contains("tpl_"),
+        "{}",
+        c.output
+    );
+    // Spans point into the template, and units with placeholders say what they assume.
+    let u = unit(&c, TEMPLATE, "UPDATE");
+    assert_eq!(&TEMPLATE[u.src.start..u.src.start + 6], "UPDATE");
+    assert!(has_rule(u, "ASM-TEMPLATE-PLACEHOLDER"), "{:?}", u.notes);
+    assert!(out_of(&c, u).contains("[TABLE]"), "{}", out_of(&c, u));
+}

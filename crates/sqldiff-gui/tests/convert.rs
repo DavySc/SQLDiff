@@ -2,12 +2,16 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use sqldiff_core::Dialect;
-use sqldiff_gui::convert::{page, run, serve, Setup, SAMPLE};
+use sqldiff_gui::convert::{page, run, serve, Setup, TemplateSetup, SAMPLE};
+use sqldiff_source::compose::Placeholders;
+use sqldiff_source::config::{self, Sources};
+use sqldiff_source::Resolved;
 
 fn setup(text: &str) -> Setup {
     Setup {
         from: Dialect::Tsql,
         to: Dialect::Postgres,
+        template: None,
         text: text.to_string(),
         name: "sample.sql".into(),
     }
@@ -89,4 +93,51 @@ fn cross_origin_posts_are_refused() {
     };
     assert!(post("https://evil.example").starts_with("HTTP/1.1 403"));
     assert!(post(&format!("http://{addr}")).starts_with("HTTP/1.1 200"));
+}
+
+fn root(p: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(p)
+}
+
+#[test]
+fn the_example_template_converts_with_the_example_pack() {
+    let cfg = Resolved::load(&Sources {
+        project: None,
+        user: None,
+        isolated: true,
+        cwd: None,
+        packs: vec![root("docs/examples/pack")],
+        cli: config::cli_layer(&[], &[], None).unwrap(),
+    })
+    .unwrap();
+    let text =
+        std::fs::read_to_string(root("docs/examples/templates/save-entity.tpl.sql")).unwrap();
+    let s = Setup {
+        template: Some(TemplateSetup {
+            placeholders: Placeholders::new(cfg.policy.template.as_ref().unwrap()).unwrap(),
+            parameters: None,
+        }),
+        ..setup(&text)
+    };
+    let p = run(&s, &text, false);
+    let c = p.conversion.expect("converts");
+    let info = c.template.as_ref().unwrap();
+    assert_eq!(info.parameters, ["NAME", "SCHEMA", "ENTITY", "TABLE"]);
+    assert_eq!(info.special_forms, ["include"]);
+    for want in [
+        "<%@include header.sql %>",
+        "CREATE OR REPLACE PROCEDURE <%SCHEMA%>.Save<%ENTITY%>(",
+        "UPDATE <%SCHEMA%>.<%TABLE%>",
+        "INSERT INTO <%SCHEMA%>.<%TABLE%>_log",
+    ] {
+        assert!(c.output.contains(want), "{want}:\n{}", c.output);
+    }
+    assert_eq!(c.counts.not_converted, 0, "{}", c.output);
+    assert!(
+        !c.output.to_ascii_lowercase().contains("tpl_"),
+        "{}",
+        c.output
+    );
 }

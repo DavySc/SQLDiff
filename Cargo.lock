@@ -485,6 +485,7 @@ dependencies = [
 name = "sqldiff-convert"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "rowan",
  "serde",
  "serde_json",
