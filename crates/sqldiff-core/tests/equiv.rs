@@ -43,7 +43,10 @@ fn isnull_equals_coalesce_only_when_the_replacement_fits() {
     let pg = "CREATE VIEW v AS SELECT customer_id, COALESCE(first_name, '') AS n FROM customer;";
     let ok =
         "CREATE VIEW dbo.v AS SELECT customer_id, ISNULL(first_name, '') AS n FROM dbo.customer;";
-    assert_eq!(run(ok, T, pg, P, true).verdict, Verdict::Equal);
+    assert_eq!(
+        run(ok, T, pg, P, true).verdict,
+        Verdict::EqualUnderAssumptions
+    );
     let pg2 = "CREATE VIEW v AS SELECT customer_id, COALESCE(nick, email) AS n FROM customer;";
     let narrow =
         "CREATE VIEW dbo.v AS SELECT customer_id, ISNULL(nick, email) AS n FROM dbo.customer;";
@@ -70,7 +73,7 @@ fn upsert_spellings_and_the_missing_lock_hint() {
     };
     assert_eq!(
         run(&merge("WITH (HOLDLOCK)"), T, pg, P, true).verdict,
-        Verdict::Equal
+        Verdict::EqualUnderAssumptions
     );
     let r = run(&merge(""), T, pg, P, true);
     assert_eq!(r.verdict, Verdict::Different);
@@ -90,7 +93,10 @@ fn anti_join_delete_needs_the_null_test_on_a_join_column() {
              END"
         )
     };
-    assert_eq!(run(&ts("item_id"), T, pg, P, true).verdict, Verdict::Equal);
+    assert_eq!(
+        run(&ts("item_id"), T, pg, P, true).verdict,
+        Verdict::EqualUnderAssumptions
+    );
     // `i.name IS NULL` also keeps matched rows whose name is NULL: not the same rewrite.
     assert!(!matches!(
         run(&ts("name"), T, pg, P, false).verdict,
@@ -131,7 +137,7 @@ fn null_ordering_needs_a_not_null_key() {
     };
     assert_eq!(
         run(&page(T, "created_at"), T, &page(P, "created_at"), P, true).verdict,
-        Verdict::Equal
+        Verdict::EqualUnderAssumptions
     );
     let r = run(&page(T, "shipped_at"), T, &page(P, "shipped_at"), P, true);
     assert_eq!(r.verdict, Verdict::Different);
@@ -152,7 +158,10 @@ fn quoted_names_keep_their_case() {
         Verdict::Equal | Verdict::EqualUnderAssumptions
     ));
     let a = "CREATE VIEW v AS SELECT name FROM item;";
-    assert_eq!(run(a, P, b, D, false).verdict, Verdict::Equal);
+    assert_eq!(
+        run(a, P, b, D, false).verdict,
+        Verdict::EqualUnderAssumptions
+    );
 }
 
 #[test]
@@ -160,7 +169,10 @@ fn integer_to_string_casts() {
     let pg = "CREATE VIEW v AS SELECT item_id::text AS k FROM item;";
     let ok = "CREATE VIEW dbo.v AS SELECT CAST(item_id AS varchar(11)) AS k FROM dbo.item;";
     let short = "CREATE VIEW dbo.v AS SELECT CAST(item_id AS varchar(5)) AS k FROM dbo.item;";
-    assert_eq!(run(ok, T, pg, P, true).verdict, Verdict::Equal);
+    assert_eq!(
+        run(ok, T, pg, P, true).verdict,
+        Verdict::EqualUnderAssumptions
+    );
     assert_eq!(run(short, T, pg, P, true).verdict, Verdict::Unknown);
 }
 
@@ -238,7 +250,10 @@ fn different_parameter_defaults_are_not_equal() {
     };
     let pg = "CREATE FUNCTION top_items(p_take integer DEFAULT 50) RETURNS TABLE (item_id integer)
               LANGUAGE sql AS $$ SELECT item_id FROM item ORDER BY item_id LIMIT p_take; $$;";
-    assert_eq!(run(&ts(50), T, pg, P, true).verdict, Verdict::Equal);
+    assert_eq!(
+        run(&ts(50), T, pg, P, true).verdict,
+        Verdict::EqualUnderAssumptions
+    );
     let r = run(&ts(10), T, pg, P, true);
     assert!(not_equal(&r), "{:?}", r.verdict);
 }
@@ -302,7 +317,7 @@ fn anti_join_delete_keeps_joined_table_columns_apart() {
     // A target column is fine once the catalog shows it.
     assert_eq!(
         with(&ts("unit_price > 0"), &pg("unit_price > 0")).verdict,
-        Verdict::Equal
+        Verdict::EqualUnderAssumptions
     );
 }
 
@@ -365,4 +380,310 @@ fn large_character_columns_are_strings() {
         },
     );
     assert!(not_equal(&r), "{:?} {:?}", r.verdict, rules(&r));
+}
+
+fn assumption_ids(r: &Report) -> Vec<&str> {
+    r.assumptions.iter().map(|a| a.id.as_str()).collect()
+}
+
+const TS_DELETE: &str = "CREATE PROCEDURE dbo.purge_item @Id int {opts} AS
+  BEGIN
+    DELETE FROM dbo.item_price WHERE item_id = @Id;
+  END";
+
+fn ts_delete(opts: &str) -> String {
+    TS_DELETE.replace("{opts}", opts)
+}
+
+fn pg_delete(opts: &str) -> String {
+    format!(
+        "CREATE PROCEDURE purge_item(p_id integer) LANGUAGE plpgsql {opts} AS $$
+         BEGIN DELETE FROM item_price WHERE item_id = p_id; END; $$;"
+    )
+}
+
+fn db2_delete(opts: &str) -> String {
+    format!(
+        "CREATE PROCEDURE purge_item (IN p_id INTEGER) LANGUAGE SQL MODIFIES SQL DATA {opts}
+         BEGIN DELETE FROM item_price WHERE item_id = p_id; END;"
+    )
+}
+
+#[test]
+fn execute_as_owner_matches_security_definer() {
+    let r = run(
+        &ts_delete("WITH EXECUTE AS OWNER"),
+        T,
+        &pg_delete("SECURITY DEFINER"),
+        P,
+        true,
+    );
+    assert_eq!(
+        r.verdict,
+        Verdict::EqualUnderAssumptions,
+        "{:?} {:?}",
+        r.findings,
+        r.unknown_reasons
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-OWNER-PRIVILEGES"));
+    assert!(assumption_ids(&r).contains(&"ASM-IDENT-FOLD"));
+    // Options after a comma count too.
+    let r = run(
+        &ts_delete("WITH RECOMPILE, EXECUTE AS OWNER"),
+        T,
+        &pg_delete("SECURITY DEFINER"),
+        P,
+        true,
+    );
+    assert_eq!(
+        r.verdict,
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.unknown_reasons
+    );
+    let r = run(
+        &ts_delete("WITH EXECUTE AS OWNER"),
+        T,
+        &db2_delete("SET OPTION COMMIT = *CS, USRPRF = *OWNER"),
+        D,
+        true,
+    );
+    assert_eq!(
+        r.verdict,
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn owner_against_caller_privileges_is_a_difference() {
+    // The converter used to drop EXECUTE AS OWNER: callers holding only
+    // EXECUTE then fail on PostgreSQL.
+    let r = run(
+        &ts_delete("WITH EXECUTE AS OWNER"),
+        T,
+        &pg_delete(""),
+        P,
+        true,
+    );
+    assert_eq!(r.verdict, Verdict::Different);
+    assert!(rules(&r).contains(&"equiv.security-context"));
+    let r = run(
+        &ts_delete("WITH ENCRYPTION, EXECUTE AS OWNER"),
+        T,
+        &pg_delete(""),
+        P,
+        true,
+    );
+    assert_eq!(r.verdict, Verdict::Different);
+    let r = run(
+        &pg_delete("SECURITY DEFINER"),
+        P,
+        &db2_delete("SET OPTION USRPRF = *USER"),
+        D,
+        true,
+    );
+    assert_eq!(r.verdict, Verdict::Different);
+    // T-SQL's default context can still skip checks along ownership chains:
+    // against an owner's context the outcome depends on object ownership.
+    let r = run(&ts_delete(""), T, &pg_delete("SECURITY DEFINER"), P, true);
+    assert_eq!(r.verdict, Verdict::Unknown);
+    // Db2 without USRPRF: caller's authority only as a named assumption.
+    let r = run(&ts_delete(""), T, &db2_delete(""), D, true);
+    assert_eq!(
+        r.verdict,
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(assumption_ids(&r).contains(&"ASM-DB2-USRPRF-USER"));
+    assert!(assumption_ids(&r).contains(&"ASM-TSQL-OWNERSHIP-CHAIN"));
+    let r = run(
+        &ts_delete("WITH EXECUTE AS OWNER"),
+        T,
+        &db2_delete(""),
+        D,
+        true,
+    );
+    assert_eq!(r.verdict, Verdict::Unknown);
+}
+
+#[test]
+fn routine_options_outside_the_comparison_stay_unknown() {
+    let pg = pg_delete("");
+    for opts in [
+        "WITH EXECUTE AS SELF",
+        "WITH EXECUTE AS 'app_user'",
+        "WITH NATIVE_COMPILATION, SCHEMABINDING",
+        "FOR REPLICATION",
+    ] {
+        let r = run(&ts_delete(opts), T, &pg, P, true);
+        assert!(not_equal(&r), "{opts}: {:?}", r.verdict);
+    }
+    for opts in [
+        "SET TimeZone = 'UTC'",
+        "SET lock_timeout TO '1s'",
+        "PARALLEL SAFE",
+        "SET search_path FROM CURRENT",
+    ] {
+        let r = run(&ts_delete(""), T, &pg_delete(opts), P, true);
+        assert!(not_equal(&r), "{opts}: {:?}", r.verdict);
+    }
+    for opts in [
+        "SET OPTION DATFMT = *MDY",
+        "COMMIT ON RETURN YES",
+        "NEW SAVEPOINT LEVEL",
+        "DYNAMIC RESULT SETS 1",
+        "CONCURRENT ACCESS RESOLUTION SKIP LOCKED DATA",
+    ] {
+        let r = run(&ts_delete(""), T, &db2_delete(opts), D, true);
+        assert!(not_equal(&r), "{opts}: {:?}", r.verdict);
+    }
+}
+
+#[test]
+fn routine_options_without_effect_or_with_a_named_assumption() {
+    let r = run(
+        &ts_delete("WITH RECOMPILE"),
+        T,
+        &pg_delete("SET work_mem = '64MB' COST 10"),
+        P,
+        true,
+    );
+    assert_eq!(
+        r.verdict,
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.unknown_reasons
+    );
+    for path in [
+        "public, pg_temp",
+        "\"$user\", public",
+        "pg_catalog, public",
+        "'public'",
+        "PUBLIC",
+    ] {
+        let r = run(
+            &ts_delete(""),
+            T,
+            &pg_delete(&format!("SET search_path = {path}")),
+            P,
+            true,
+        );
+        assert_eq!(
+            r.verdict,
+            Verdict::EqualUnderAssumptions,
+            "{path}: {:?}",
+            r.unknown_reasons
+        );
+        assert!(assumption_ids(&r).contains(&"ASM-DEFAULT-SCHEMA"));
+    }
+    // Unqualified names then resolve in another schema than dbo's counterpart.
+    for path in [
+        "other",
+        "other, public",
+        "pg_temp, public",
+        "'other, public'",
+        "app, pg_temp",
+        "\"PUBLIC\"",
+    ] {
+        let r = run(
+            &ts_delete(""),
+            T,
+            &pg_delete(&format!("SET search_path TO {path}")),
+            P,
+            true,
+        );
+        assert!(not_equal(&r), "{path}: {:?}", r.verdict);
+    }
+    let r = run(
+        &ts_delete(""),
+        T,
+        &db2_delete("SPECIFIC purge_item1 NOT DETERMINISTIC SET OPTION COMMIT = *CS, USRPRF = *USER, DBGVIEW = *SOURCE"),
+        D,
+        true,
+    );
+    assert_eq!(
+        r.verdict,
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(!assumption_ids(&r).contains(&"ASM-DB2-USRPRF-USER"));
+}
+
+#[test]
+fn volatility_labels_and_restricted_procedures() {
+    // A STABLE function that writes fails in PostgreSQL.
+    let pg = "CREATE FUNCTION f(p_id integer) RETURNS integer LANGUAGE plpgsql STABLE AS $$
+      BEGIN DELETE FROM item_price WHERE item_id = p_id; RETURN 1; END; $$;";
+    let ts = "CREATE FUNCTION dbo.f (@Id int) RETURNS int AS BEGIN RETURN 1; END";
+    let r = run(ts, T, pg, P, true);
+    assert!(not_equal(&r));
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("labelled STABLE")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // SECURITY DEFINER procedures cannot COMMIT.
+    let pg = "CREATE PROCEDURE purge_item(p_id integer) LANGUAGE plpgsql SECURITY DEFINER AS $$
+      BEGIN DELETE FROM item_price WHERE item_id = p_id; COMMIT; END; $$;";
+    let ts = "CREATE PROCEDURE dbo.purge_item @Id int WITH EXECUTE AS OWNER AS
+      BEGIN BEGIN TRAN; DELETE FROM dbo.item_price WHERE item_id = @Id; COMMIT; END";
+    let r = run(ts, T, pg, P, true);
+    assert!(not_equal(&r));
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("invalid transaction termination")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn schema_names_are_compared() {
+    let pg = |schema: &str| {
+        format!(
+            "CREATE PROCEDURE purge_item(p_id integer) LANGUAGE plpgsql AS $$
+             BEGIN DELETE FROM {schema}item_price WHERE item_id = p_id; END; $$;"
+        )
+    };
+    // dbo and public are the default schemas.
+    for s in ["", "public."] {
+        let r = run(&ts_delete(""), T, &pg(s), P, true);
+        assert_eq!(r.verdict, Verdict::EqualUnderAssumptions, "{s}");
+        assert!(assumption_ids(&r).contains(&"ASM-DEFAULT-SCHEMA"));
+    }
+    assert!(not_equal(&run(&ts_delete(""), T, &pg("archive."), P, true)));
+    let sales = TS_DELETE
+        .replace("{opts}", "")
+        .replace("dbo.item_price", "Sales.item_price");
+    assert_eq!(
+        run(&sales, T, &pg("sales."), P, true).verdict,
+        Verdict::EqualUnderAssumptions
+    );
+    assert!(not_equal(&run(&sales, T, &pg(""), P, true)));
+    // Same dialect: moving a statement to another schema is a change.
+    let archive = TS_DELETE
+        .replace("{opts}", "")
+        .replace("dbo.item_price", "Archive.item_price");
+    assert!(not_equal(&run(&sales, T, &archive, T, true)));
+    let r = run(
+        &ts_delete(""),
+        T,
+        &TS_DELETE
+            .replace("{opts}", "")
+            .replace("dbo.item_price", "item_price"),
+        T,
+        true,
+    );
+    assert!(
+        matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
 }

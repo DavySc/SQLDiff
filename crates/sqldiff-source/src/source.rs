@@ -51,6 +51,10 @@ pub fn to_artifact(data: &ArtifactData) -> Result<Artifact> {
     if let Some(v) = &data.info.version {
         a.version = v.clone();
     }
+    // One object of a file with several: its own identity.
+    if crate::split::split_id(&data.info.id).1.is_some() {
+        a.object = crate::split::created(&a.text, dialect);
+    }
     Ok(a)
 }
 

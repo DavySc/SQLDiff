@@ -69,7 +69,7 @@
     (tsql "MERGE dbo.item_price WITH (HOLDLOCK) AS t USING (SELECT @Item AS item_id, @Price AS unit_price) AS s ON t.item_id = s.item_id WHEN MATCHED THEN UPDATE SET unit_price = s.unit_price WHEN NOT MATCHED THEN INSERT (item_id, unit_price) VALUES (s.item_id, s.unit_price);")
     (postgres "INSERT INTO item_price (item_id, unit_price) VALUES (p_item, p_price) ON CONFLICT (item_id) DO UPDATE SET unit_price = p_price;")
     (params (Item int) (Price "decimal(12,2)"))
-    (expect equal)))
+    (expect equal-under-assumptions)))
 
 (idiom upsert/on-conflict
   (doc "PostgreSQL INSERT ... ON CONFLICT (key) DO UPDATE: an atomic upsert.")
@@ -125,7 +125,7 @@
   (example
     (tsql "DELETE pf FROM dbo.price_feed AS pf LEFT JOIN dbo.item AS i ON i.item_id = pf.item_id WHERE i.item_id IS NULL;")
     (postgres "DELETE FROM price_feed WHERE NOT EXISTS (SELECT 1 FROM item WHERE item.item_id = price_feed.item_id);")
-    (expect equal)))
+    (expect equal-under-assumptions)))
 
 ; ------------------------------------------------------------- generated keys
 

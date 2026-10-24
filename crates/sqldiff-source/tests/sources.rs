@@ -404,3 +404,76 @@ fn example_pack_is_valid() {
     let m = policy::markers("SELECT 1; -- SYNC-OK: rounding differs on purpose\n", &cfg);
     assert_eq!(m[0].value, "rounding differs on purpose");
 }
+
+#[test]
+fn files_with_several_objects_pair_object_by_object() {
+    let root = tmp("split");
+    write(
+        &root,
+        "tsql/schema.sql",
+        "CREATE TABLE dbo.film (film_id int PRIMARY KEY);\nGO\nCREATE INDEX ix_film ON dbo.film (film_id);\nGO\nCREATE PROCEDURE dbo.get_film @id int AS\nBEGIN\n  SELECT film_id FROM dbo.film WHERE film_id = @id;\nEND\nGO\n",
+    );
+    write(
+        &root,
+        "pg/schema.sql",
+        "SET client_min_messages = warning;\nCREATE TABLE film (film_id integer PRIMARY KEY);\nCREATE FUNCTION get_film(p_id integer) RETURNS SETOF integer LANGUAGE sql AS $$\n  SELECT film_id FROM film WHERE film_id = p_id;\n$$;\n",
+    );
+    let cfg = Resolved::builtin();
+    let src = FsSource::new(&root, &cfg).unwrap();
+    let objs = src.list_objects(&ObjectFilter::default()).unwrap();
+    let ids: Vec<(&str, &str, &str)> = objs
+        .iter()
+        .map(|o| (o.id.as_str(), o.kind.as_str(), o.name.as_str()))
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            ("pg/schema.sql#film", "table", "film"),
+            ("pg/schema.sql#get_film", "function", "get_film"),
+            ("tsql/schema.sql#film", "table", "film"),
+            ("tsql/schema.sql#get_film", "procedure", "get_film"),
+        ]
+    );
+    let pairs = src.get_pairs(&PairScope::default()).unwrap();
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|p| (p.a.as_str(), p.b.as_str())).collect();
+    assert_eq!(
+        pairs,
+        [
+            ("tsql/schema.sql#film", "pg/schema.sql#film"),
+            ("tsql/schema.sql#get_film", "pg/schema.sql#get_film"),
+        ]
+    );
+    // An object's text keeps the file's line numbers and only its statements.
+    let film = src.get_artifact("tsql/schema.sql#film").unwrap();
+    assert!(film.text.contains("CREATE INDEX ix_film"));
+    assert!(!film.text.contains("get_film"));
+    assert_eq!(film.text.lines().count(), 9);
+    let a = src.load_artifact("tsql/schema.sql#get_film").unwrap();
+    assert_eq!(
+        sqldiff_core::artifact::Analyzed::new(&a, sqldiff_core::model::Side::A, 3).object,
+        "dbo.get_film"
+    );
+    assert!(src.get_artifact("tsql/schema.sql#nope").is_err());
+    // The tree command pairs the same way, reading the file at its path.
+    let t = sqldiff_source::tree::pair_dirs(&root.join("tsql"), &root.join("pg"), None, None, &cfg)
+        .unwrap();
+    assert_eq!(
+        t.pairs.len(),
+        0,
+        "dialects come from the directory names here"
+    );
+    let t = sqldiff_source::tree::pair_dirs(
+        &root.join("tsql"),
+        &root.join("pg"),
+        Some(sqldiff_core::Dialect::Tsql),
+        Some(sqldiff_core::Dialect::Postgres),
+        &cfg,
+    )
+    .unwrap();
+    let ids: Vec<&str> = t.pairs.iter().map(|p| p.id_a.as_str()).collect();
+    assert_eq!(ids, ["schema.sql#film", "schema.sql#get_film"]);
+    let (a, b) = t.read(&t.pairs[1], &cfg).unwrap();
+    assert!(a.path.ends_with("schema.sql") && b.path.ends_with("schema.sql"));
+    assert_eq!(a.object.as_deref(), Some("dbo.get_film"));
+    assert!(!b.text.contains("CREATE TABLE film"));
+}

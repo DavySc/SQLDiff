@@ -88,6 +88,61 @@ pub(crate) fn object_kind(text: &str) -> String {
     }
 }
 
+/// The objects of a file: one per CREATE when it holds several (ids
+/// `path#name`, see [`crate::split`]), else the file itself. `dialect`
+/// overrides the configured one.
+pub(crate) fn objects(
+    rel: &str,
+    text: &str,
+    config: &Resolved,
+    last_changed: Option<String>,
+    dialect: Option<Dialect>,
+) -> Vec<ObjectInfo> {
+    let mut whole = object_info(rel, text, config, last_changed);
+    let Some(d) = dialect.or_else(|| whole.dialect.as_deref().and_then(|d| d.parse().ok())) else {
+        return vec![whole];
+    };
+    whole.dialect = Some(d.id().to_string());
+    let parts = crate::split::parts(text, d);
+    if parts.is_empty() {
+        return vec![whole];
+    }
+    parts
+        .into_iter()
+        .map(|p| {
+            let t = crate::split::blank_outside(text, &p.ranges);
+            ObjectInfo {
+                id: format!("{rel}#{}", p.fragment),
+                kind: p.kind,
+                name: p.name,
+                content_hash: sqldiff_core::artifact::content_hash(&t),
+                ..whole.clone()
+            }
+        })
+        .collect()
+}
+
+/// Text of an object id read through `read` (relative path → file text):
+/// a whole file, or one object of it for `path#name`.
+pub(crate) fn object_text(
+    id: &str,
+    config: &Resolved,
+    dialect: Option<Dialect>,
+    read: impl Fn(&str) -> crate::Result<String>,
+) -> crate::Result<(String, String)> {
+    let (rel, frag) = crate::split::split_id(id);
+    let Some(frag) = frag else {
+        return Ok((id.to_string(), read(id)?));
+    };
+    let text = read(rel)?;
+    let d = dialect.or(classify(rel, config).0).ok_or_else(|| {
+        crate::Error::new(format!("{id}: dialect unknown, cannot find the object"))
+    })?;
+    crate::split::object_text(&text, d, frag)
+        .map(|t| (rel.to_string(), t))
+        .ok_or_else(|| crate::Error::new(format!("{id}: no object `{frag}` in {rel}")))
+}
+
 /// The one object a file defines, as `relation:schema.name` or
 /// `routine:schema.name` folded to lower case, from its top-level DDL.
 /// `None` when the file defines no object, or more than one: pairing by it

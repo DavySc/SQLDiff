@@ -14,7 +14,7 @@ use crate::protocol::{
     ArtifactData, Describe, HistoryEntry, ObjectFilter, ObjectInfo, Pair, PairScope, Provenance,
 };
 use crate::source::Source;
-use crate::walk::{is_candidate, object_info};
+use crate::walk::{is_candidate, object_info, objects};
 use crate::{pairing, Error, Resolved, Result};
 
 pub struct GitSource {
@@ -196,12 +196,25 @@ impl GitSource {
     }
 
     /// Splits `PATH@REV`; plain ids read at the source revision.
-    fn locate(&self, id: &str) -> Result<(String, Option<String>)> {
-        if self.tree.contains_key(id) {
-            return Ok((id.to_string(), None));
+    /// The file of an object id (`path`, `path#object`, either `@rev`), the
+    /// object fragment and the revision.
+    fn locate(&self, id: &str) -> Result<(String, Option<String>, Option<String>)> {
+        let file = |p: &str| -> (String, Option<String>) {
+            if self.tree.contains_key(p) {
+                return (p.to_string(), None);
+            }
+            let (rel, frag) = crate::split::split_id(p);
+            (rel.to_string(), frag.map(String::from))
+        };
+        let (rel, frag) = file(id);
+        if self.tree.contains_key(&rel) {
+            return Ok((rel, frag, None));
         }
         match id.rsplit_once('@') {
-            Some((path, rev)) if !rev.is_empty() => Ok((path.to_string(), Some(rev.to_string()))),
+            Some((path, rev)) if !rev.is_empty() => {
+                let (rel, frag) = file(path);
+                Ok((rel, frag, Some(rev.to_string())))
+            }
             _ => Err(Error::new(format!("{id}: no such object at {}", self.rev))),
         }
     }
@@ -237,13 +250,15 @@ impl Source for GitSource {
             .tree
             .keys()
             .zip(texts)
-            .map(|(rel, text)| object_info(rel, &text, &self.config, changed.get(rel).cloned()))
+            .flat_map(|(rel, text)| {
+                objects(rel, &text, &self.config, changed.get(rel).cloned(), None)
+            })
             .filter(|o| filter.matches(o))
             .collect())
     }
 
     fn get_artifact(&self, id: &str) -> Result<ArtifactData> {
-        let (rel, rev) = self.locate(id)?;
+        let (rel, frag, rev) = self.locate(id)?;
         let commit = match &rev {
             Some(r) => git(
                 &self.repo,
@@ -278,6 +293,19 @@ impl Source for GitSource {
         let mut f = last.trim().split('\x1f');
         let (revision, time, author) = (f.next(), f.next(), f.next());
         let mut info = object_info(&rel, &text, &self.config, time.map(String::from));
+        let mut text = text;
+        if let Some(frag) = &frag {
+            let want = format!("{rel}#{frag}");
+            let o = objects(&rel, &text, &self.config, info.last_changed.clone(), None)
+                .into_iter()
+                .find(|o| o.id == want)
+                .ok_or_else(|| Error::new(format!("{id}: no object `{frag}` in {rel}")))?;
+            let d = o.dialect.as_deref().and_then(|d| d.parse().ok());
+            text = d
+                .and_then(|d| crate::split::object_text(&text, d, frag))
+                .ok_or_else(|| Error::new(format!("{id}: no object `{frag}` in {rel}")))?;
+            info = o;
+        }
         info.id = id.to_string();
         Ok(ArtifactData {
             info,
@@ -299,7 +327,7 @@ impl Source for GitSource {
     }
 
     fn get_history(&self, id: &str) -> Result<Vec<HistoryEntry>> {
-        let (rel, rev) = self.locate(id)?;
+        let (rel, _, rev) = self.locate(id)?;
         let start = rev.unwrap_or_else(|| self.commit.clone());
         let log = git(
             &self.repo,

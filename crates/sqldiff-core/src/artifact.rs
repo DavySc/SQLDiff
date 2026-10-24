@@ -14,6 +14,9 @@ pub struct Artifact {
     /// Target engine version; defaults to the dialect's default version.
     pub version: String,
     pub text: String,
+    /// Object identity when the text is one object of a larger file (see
+    /// `sqldiff_source::split`); otherwise derived from the text or path.
+    pub object: Option<String>,
 }
 
 impl Artifact {
@@ -23,6 +26,7 @@ impl Artifact {
             dialect,
             version: dialect.default_version().to_string(),
             text: text.into(),
+            object: None,
         }
     }
 }
@@ -82,10 +86,14 @@ impl<'a> Analyzed<'a> {
     pub fn new(artifact: &'a Artifact, side: Side, excerpt_lines: usize) -> Self {
         let parse = parse(&artifact.text, artifact.dialect);
         let root = parse.syntax();
-        let object = root
-            .descendants()
-            .find(|n| n.kind() == SyntaxKind::ROUTINE)
-            .and_then(|r| ast::routine_name(&r))
+        let object = artifact
+            .object
+            .clone()
+            .or_else(|| {
+                root.descendants()
+                    .find(|n| n.kind() == SyntaxKind::ROUTINE)
+                    .and_then(|r| ast::routine_name(&r))
+            })
             .unwrap_or_else(|| file_stem(&artifact.path));
         Analyzed {
             artifact,

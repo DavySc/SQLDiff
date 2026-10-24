@@ -208,6 +208,52 @@ fn tree_text_redacts_unpaired_paths() {
 }
 
 #[test]
+fn tree_text_rows_name_the_object_of_a_split_file() {
+    let data = scratch("tree-frag");
+    let t = scratch("tree-frag-src");
+    let file = "CREATE PROCEDURE dbo.first_proc AS BEGIN SELECT 1; END\nGO\n\
+                CREATE PROCEDURE dbo.second_proc AS BEGIN SELECT 2; END\nGO\n";
+    for side in ["a", "b"] {
+        std::fs::create_dir_all(t.join(side)).unwrap();
+        std::fs::write(t.join(side).join("s.sql"), file).unwrap();
+    }
+    let args = |redact: bool| {
+        let mut v = vec![
+            "tree".to_string(),
+            t.join("a").display().to_string(),
+            t.join("b").display().to_string(),
+            "--dialect-a".to_string(),
+            "tsql".to_string(),
+            "--dialect-b".to_string(),
+            "tsql".to_string(),
+        ];
+        if redact {
+            v.push("--redact".to_string());
+        }
+        v
+    };
+    let run = |redact: bool| {
+        let a = args(redact);
+        let out = sqldiff(&data, &a.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_ne!(
+            out.status.code(),
+            Some(2),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_lowercase()
+    };
+    let s = run(false);
+    for name in ["first_proc", "second_proc"] {
+        assert!(s.contains(&format!("s.sql#{name} ↔ ")), "{s}");
+    }
+    let s = run(true);
+    for name in ["first_proc", "second_proc"] {
+        assert!(!s.contains(name), "{name} in {s}");
+    }
+}
+
+#[test]
 fn redact_survives_names_that_are_json_keys() {
     let data = scratch("keys");
     let d = scratch("keys-src");

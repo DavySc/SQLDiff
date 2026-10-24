@@ -8,6 +8,7 @@ use super::ast::{parse_stmt, tokens, Parser, Stmt, Tok, Type, K};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
 use crate::classify::{stmt_kind, StmtKind};
+use crate::model::Assumption;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnitKind {
@@ -26,6 +27,30 @@ impl UnitKind {
             UnitKind::TableFn => "table function",
             UnitKind::Proc => "procedure",
             UnitKind::Script => "script",
+        }
+    }
+}
+
+/// Whose privileges the routine's statements are checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Security {
+    /// The caller's: T-SQL `EXECUTE AS CALLER` (the default), PostgreSQL
+    /// `SECURITY INVOKER` (the default), Db2 for i `USRPRF = *USER`.
+    Caller,
+    /// The routine owner's: T-SQL `EXECUTE AS OWNER`, PostgreSQL
+    /// `SECURITY DEFINER`, Db2 for i `USRPRF = *OWNER`.
+    Owner,
+    /// Db2 for i without `SET OPTION USRPRF`: `*NAMING`, decided by the naming
+    /// convention the routine was created with.
+    Naming,
+}
+
+impl Security {
+    pub fn label(self) -> &'static str {
+        match self {
+            Security::Caller => "the caller's privileges",
+            Security::Owner => "the owner's privileges",
+            Security::Naming => "the privileges its naming convention picks",
         }
     }
 }
@@ -78,6 +103,19 @@ pub struct Unit {
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
     pub notes: Vec<String>,
+    /// Security context of a routine (scripts and views: the caller's).
+    pub security: Security,
+    /// The header text that sets it and its byte range; `None` for the default.
+    pub security_cite: Option<(String, (usize, usize))>,
+    /// Assumptions the routine options need whatever the other side is.
+    pub assumptions: Vec<Assumption>,
+    /// PostgreSQL routine-level `SET` clause, which (like SECURITY DEFINER)
+    /// forbids transaction control in a procedure.
+    pub sets_config: bool,
+    /// PostgreSQL STABLE/IMMUTABLE, Db2 for i DETERMINISTIC.
+    pub non_volatile: Option<String>,
+    /// Byte range of the routine header up to its name, for findings.
+    pub header_at: (usize, usize),
 }
 
 pub fn lower(a: &Analyzed) -> Unit {
@@ -96,6 +134,12 @@ pub fn lower(a: &Analyzed) -> Unit {
         stops_on_error: false,
         txn_stmts: Vec::new(),
         notes: Vec::new(),
+        security: Security::Caller,
+        security_cite: None,
+        assumptions: Vec::new(),
+        sets_config: false,
+        non_volatile: None,
+        header_at: (0, 0),
     };
     let routines: Vec<SyntaxNode> = a
         .root
@@ -125,6 +169,9 @@ pub fn lower(a: &Analyzed) -> Unit {
             u.uncovered
                 .push((first.clone(), "several routines in one artifact".into()));
         }
+    }
+    if let [r] = routines.as_slice() {
+        super::options::body_checks(r, &mut u);
     }
     // The transaction protocol is understood only as BEGIN before the first
     // data statement and COMMIT after the last one (RETURN aside).
@@ -176,6 +223,9 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
         return;
     }
     let mut i = kw + 1 + p.i;
+    if let (Some(first), Some(last)) = (toks.first(), toks.get(i - 1)) {
+        u.header_at = (first.off, last.off + last.text.len());
+    }
     u.kind = match toks[kw].up.as_str() {
         "VIEW" => UnitKind::View,
         "FUNCTION" => UnitKind::ScalarFn,
@@ -200,7 +250,9 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
     } else if d == Dialect::Tsql {
         let end = toks[i..]
             .iter()
-            .position(|t| t.kind == K::Word && matches!(t.up.as_str(), "AS" | "WITH" | "RETURNS"))
+            .position(|t| {
+                t.kind == K::Word && matches!(t.up.as_str(), "AS" | "WITH" | "RETURNS" | "FOR")
+            })
             .map(|x| i + x)
             .unwrap_or(toks.len());
         let s = &toks[i..end];
@@ -219,82 +271,10 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
             }
         }
     }
-    // Options and RETURNS.
-    while i < toks.len() {
-        let t = &toks[i];
-        match t.up.as_str() {
-            "RETURNS" => {
-                i += 1;
-                if toks.get(i).is_some_and(|t| t.up == "TABLE") {
-                    u.kind = UnitKind::TableFn;
-                    i += 1;
-                    if toks.get(i).is_some_and(|t| t.kind == K::LParen) {
-                        let close = matching(&toks, i);
-                        for c in split_commas(&toks[i + 1..close]) {
-                            if let Some(n) = c.first() {
-                                let mut p = Parser::new(&c[1..], d);
-                                let ty = p.ty().ok().map(|t| Ty::from_type(&t, d, false));
-                                u.ret_cols.push((cst::unquote(&n.text).to_lowercase(), ty));
-                            }
-                        }
-                        i = close + 1;
-                    }
-                } else if toks
-                    .get(i)
-                    .is_some_and(|t| t.up == "SETOF" || t.up == "NULL")
-                {
-                    u.uncovered
-                        .push((r.clone(), format!("RETURNS {}", toks[i].up)));
-                    i += 1;
-                } else {
-                    let mut p = Parser::new(&toks[i..], d);
-                    match p.ty() {
-                        Ok(ty) => {
-                            if ty.name == "TRIGGER" || ty.name == "VOID" || ty.name == "RECORD" {
-                                u.uncovered
-                                    .push((r.clone(), format!("RETURNS {}", ty.name)));
-                            }
-                            u.returns = Some(Ty::from_type(&ty, d, false));
-                            i += p.i;
-                        }
-                        Err(_) => i += 1,
-                    }
-                }
-            }
-            "LANGUAGE" => {
-                if toks.get(i + 1).is_some_and(|t| t.up == "SQL") && d == Dialect::Postgres {
-                    u.sql_body = true;
-                }
-                i += 2;
-            }
-            "STRICT" if d == Dialect::Postgres => {
-                u.uncovered.push((
-                    r.clone(),
-                    "STRICT (returns NULL on NULL input without running)".into(),
-                ));
-                i += 1;
-            }
-            "ON" if toks.get(i - 1).is_some_and(|t| t.up == "NULL")
-                && toks.get(i - 2).is_some_and(|t| t.up == "RETURNS") =>
-            {
-                u.uncovered
-                    .push((r.clone(), "RETURNS NULL ON NULL INPUT".into()));
-                i += 1;
-            }
-            "WITH" if d == Dialect::Tsql => {
-                let opt = toks.get(i + 1).map(|t| t.up.clone()).unwrap_or_default();
-                if !matches!(opt.as_str(), "SCHEMABINDING" | "ENCRYPTION") {
-                    u.uncovered
-                        .push((r.clone(), format!("routine option WITH {opt}")));
-                }
-                i += 2;
-            }
-            _ => i += 1,
-        }
-    }
+    super::options::options(r, &toks, i, u);
 }
 
-fn matching(toks: &[Tok], open: usize) -> usize {
+pub(super) fn matching(toks: &[Tok], open: usize) -> usize {
     let mut depth = 0;
     for (j, t) in toks.iter().enumerate().skip(open) {
         match t.kind {
@@ -311,7 +291,7 @@ fn matching(toks: &[Tok], open: usize) -> usize {
     toks.len()
 }
 
-fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
+pub(super) fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
     let mut out = Vec::new();
     let mut depth = 0;
     let mut start = 0;
@@ -365,13 +345,14 @@ fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
             "READONLY" => return None,
             "=" | "DEFAULT" if default.is_none() => default = Some(Vec::new()),
             _ => {
-                if let Some(v) = default.as_mut() {
-                    v.push(if t.kind == K::Word {
-                        t.up.clone()
-                    } else {
-                        t.text.clone()
-                    });
-                }
+                // Anything else after the type (VARYING, NOT NULL, a type
+                // modifier the type parser left over) is not understood.
+                let v = default.as_mut()?;
+                v.push(if t.kind == K::Word {
+                    t.up.clone()
+                } else {
+                    t.text.clone()
+                });
             }
         }
     }
