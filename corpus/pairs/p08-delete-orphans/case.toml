@@ -22,19 +22,22 @@ file = "db2i.sql"
 [[expect]]
 a = "tsql"
 b = "pg"
-verdict = "equal"
+verdict = "equal-under-assumptions"
+assumptions = ["callers hold the privileges themselves (no T-SQL ownership chain needed)", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
 classes = ["structural"]
 discharged = ["item.item_id is the primary key (catalog)"]
 
 [[expect]]
 a = "tsql"
 b = "db2i"
-verdict = "equal"
+verdict = "equal-under-assumptions"
+assumptions = ["the Db2 for i routine without USRPRF runs with the caller's authority", "callers hold the privileges themselves (no T-SQL ownership chain needed)", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
 classes = ["structural"]
 discharged = ["item.item_id is the primary key (catalog)"]
 
 [[expect]]
 a = "pg"
 b = "db2i"
-verdict = "equal"
+verdict = "equal-under-assumptions"
+assumptions = ["the Db2 for i routine without USRPRF runs with the caller's authority", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
 classes = ["cosmetic"]
