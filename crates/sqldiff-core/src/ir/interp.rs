@@ -11,6 +11,7 @@
 //! can inject a fault of one error kind at one statement.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 use sqldiff_syntax::Dialect;
 
@@ -28,7 +29,7 @@ pub struct Fault {
 }
 
 /// The environment a run starts in, and the faults to inject.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Scenario {
     /// The caller already holds an open transaction.
     pub caller_txn: bool,
@@ -93,16 +94,16 @@ pub struct Outcome {
     /// Fate of each durable effect that ran, by effect key. In
     /// caller-transaction scenarios the key `caller` stands for the caller's
     /// own pending work.
-    pub effects: BTreeMap<String, Fate>,
+    pub effects: BTreeMap<Rc<str>, Fate>,
     /// Effects still uncommitted when the routine returns, left to the
     /// caller (including those the caller is assumed to commit).
-    pub open: BTreeSet<String>,
+    pub open: BTreeSet<Rc<str>>,
     /// Effects whose statement failed part-way and kept some rows.
     pub partial: BTreeSet<String>,
     /// The statement node that produced each effect.
-    pub effect_nodes: BTreeMap<String, NodeId>,
+    pub effect_nodes: BTreeMap<Rc<str>, NodeId>,
     /// Effects that had already run when the first fault hit.
-    pub before_fault: BTreeSet<String>,
+    pub before_fault: BTreeSet<Rc<str>>,
     /// Effect key of the statement the fault was injected into.
     pub faulted: Option<String>,
     /// The path reached a statement with an injected fault.
@@ -183,7 +184,8 @@ enum Owner {
 
 #[derive(Debug, Clone)]
 enum Log {
-    Effect(String),
+    /// Id of the effect key (see [`Keys`]).
+    Effect(usize),
     Temp(String, TempState),
 }
 
@@ -197,8 +199,9 @@ struct State {
     xact_abort: bool,
     xact_abort_local: bool,
     implicit: bool,
-    live: BTreeMap<String, Live>,
-    effect_nodes: BTreeMap<String, NodeId>,
+    /// State of each effect that ran, by key id (see [`Keys`]).
+    live: Vec<Option<Live>>,
+    effect_nodes: BTreeMap<Rc<str>, NodeId>,
     log: Vec<Log>,
     temp: BTreeMap<String, TempState>,
     scopes: Vec<(ScopeId, usize)>,
@@ -211,7 +214,7 @@ struct State {
     partial: BTreeSet<String>,
     entry_depth: u32,
     faults_done: BTreeSet<NodeId>,
-    before_fault: Option<BTreeSet<String>>,
+    before_fault: Option<BTreeSet<Rc<str>>>,
     faulted: Option<String>,
     temp_reads: BTreeSet<(NodeId, String, TempState)>,
     raised: bool,
@@ -242,20 +245,215 @@ enum Step {
     Done(Box<Outcome>),
 }
 
+/// The whole exploration between two steps: the path being run, the forked
+/// paths still to run, and the outcomes so far.
+#[derive(Clone)]
+struct Machine {
+    cur: Option<(NodeId, Box<State>)>,
+    work: Vec<(NodeId, Box<State>)>,
+    outs: Vec<Outcome>,
+}
+
+impl Machine {
+    /// The node the next step runs, taking the next forked path when the
+    /// current one has ended.
+    fn next_node(&mut self) -> Option<NodeId> {
+        if self.cur.is_none() {
+            self.cur = self.work.pop();
+        }
+        self.cur.as_ref().map(|(n, _)| *n)
+    }
+}
+
+/// Checkpoints kept by an [`Explorer`]; when full, every other one is dropped.
+const MAX_CHECKPOINTS: usize = 64;
+
 struct Interp<'c> {
     cfg: &'c Cfg,
+    keys: &'c Keys,
     prof: &'static Profile,
     sc: &'c Scenario,
 }
 
+/// The effect keys of a CFG and the caller's pseudo-effect, numbered in key
+/// order: a state holds them in a vector and still lists them in the order
+/// of a map keyed by name.
+struct Keys {
+    names: Vec<Rc<str>>,
+    ids: HashMap<Rc<str>, usize>,
+}
+
+impl Keys {
+    fn of(cfg: &Cfg) -> Keys {
+        let mut all: BTreeSet<&str> = BTreeSet::from([CALLER]);
+        for n in &cfg.nodes {
+            if let Some(s) = n.stmt() {
+                all.extend(
+                    s.effects
+                        .iter()
+                        .filter(|e| e.temp.is_none())
+                        .map(|e| e.key.as_str()),
+                );
+            }
+        }
+        let names: Vec<Rc<str>> = all.into_iter().map(Rc::from).collect();
+        let ids = names
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), i))
+            .collect();
+        Keys { names, ids }
+    }
+
+    fn id(&self, key: &str) -> usize {
+        self.ids[key]
+    }
+}
+
+/// Live effects formatted as the map from key to state they stand for.
+struct LiveByName<'a>(&'a [Option<Live>], &'a [Rc<str>]);
+
+impl std::fmt::Debug for LiveByName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, l)| Some((&self.1[i], l.as_ref()?))),
+            )
+            .finish()
+    }
+}
+
 /// Explores every path of `cfg` under `sc` and returns one outcome per path.
 pub fn explore(cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
+    let keys = Keys::of(cfg);
     let it = Interp {
         cfg,
+        keys: &keys,
         prof: Profile::of(cfg.dialect),
         sc,
     };
     it.run()
+}
+
+/// Runs fault scenarios without repeating the work before the fault.
+///
+/// A scenario that injects one fault runs exactly like the same scenario
+/// without it until the exploration first reaches the faulting statement:
+/// the scenario's faults are consulted only there. The explorer runs the
+/// fault-free exploration once, remembers at which step each statement is
+/// first reached and keeps checkpoints of the whole exploration (current
+/// path, forked paths, outcomes so far). A fault scenario resumes from the
+/// checkpoint before its statement, so its outcomes are the ones
+/// [`explore`] returns, in the same order.
+pub struct Explorer {
+    keys: Keys,
+    base: Scenario,
+    outs: Vec<Outcome>,
+    /// Step at which each statement is first about to run.
+    first: HashMap<NodeId, usize>,
+    /// (step, exploration before that step), in step order.
+    checkpoints: Vec<(usize, Machine)>,
+}
+
+impl Explorer {
+    /// Runs `base` (which must inject no fault) and indexes the run.
+    pub fn new(cfg: &Cfg, base: &Scenario) -> Explorer {
+        let base = Scenario {
+            faults: Vec::new(),
+            ..base.clone()
+        };
+        let keys = Keys::of(cfg);
+        let it = Interp {
+            cfg,
+            keys: &keys,
+            prof: Profile::of(cfg.dialect),
+            sc: &base,
+        };
+        let mut m = it.start();
+        let mut first = HashMap::new();
+        let mut checkpoints = Vec::new();
+        let mut every = 1;
+        let mut t = 0;
+        while let Some(n) = m.next_node() {
+            if t % every == 0 {
+                if checkpoints.len() == MAX_CHECKPOINTS {
+                    let mut i = 0;
+                    checkpoints.retain(|_| {
+                        i += 1;
+                        i % 2 == 1
+                    });
+                    every *= 2;
+                }
+                if t % every == 0 {
+                    checkpoints.push((t, m.clone()));
+                }
+            }
+            first.entry(n).or_insert(t);
+            it.tick(&mut m);
+            t += 1;
+        }
+        Explorer {
+            keys,
+            base,
+            outs: m.outs,
+            first,
+            checkpoints,
+        }
+    }
+
+    /// The outcomes of the fault-free scenario.
+    pub fn base(&self) -> &[Outcome] {
+        &self.outs
+    }
+
+    /// [`explore`] of `sc`, reusing the fault-free run when `sc` differs from
+    /// the base scenario only by at most one injected fault.
+    pub fn explore(&self, cfg: &Cfg, sc: &Scenario) -> Vec<Outcome> {
+        let same_env = Scenario {
+            faults: Vec::new(),
+            ..sc.clone()
+        } == self.base;
+        if !same_env || sc.faults.len() > 1 {
+            return explore(cfg, sc);
+        }
+        let Some(fault) = sc.faults.first() else {
+            return self.outs.clone();
+        };
+        // Never reached: the run is the fault-free one.
+        let Some(&t) = self.first.get(&fault.node) else {
+            return self.outs.clone();
+        };
+        let Some((mut at, m)) = self.checkpoints.iter().rev().find(|(c, _)| *c <= t) else {
+            return explore(cfg, sc);
+        };
+        let mut m = m.clone();
+        let base = Interp {
+            cfg,
+            keys: &self.keys,
+            prof: Profile::of(cfg.dialect),
+            sc: &self.base,
+        };
+        while at < t {
+            if m.next_node().is_none() {
+                return explore(cfg, sc);
+            }
+            base.tick(&mut m);
+            at += 1;
+        }
+        if m.next_node() != Some(fault.node) {
+            return explore(cfg, sc);
+        }
+        let it = Interp {
+            cfg,
+            keys: &self.keys,
+            prof: Profile::of(cfg.dialect),
+            sc,
+        };
+        it.finish_run(m)
+    }
 }
 
 /// Id of the assumption recorded when a profile row that is not confirmed is used.
@@ -268,49 +466,54 @@ pub fn row_assumption_id(fact: Option<&str>, row: &str) -> String {
 
 impl Interp<'_> {
     fn run(&self) -> Vec<Outcome> {
+        self.finish_run(self.start())
+    }
+
+    fn start(&self) -> Machine {
         let init = self.initial();
         let first = self
             .cfg
             .node(self.cfg.entry)
             .next(Edge::Next)
             .unwrap_or(EXIT_OK);
-        let mut work: Vec<(NodeId, Box<State>)> = vec![(first, Box::new(init))];
-        let mut outs = Vec::new();
-        while let Some((mut node, mut st)) = work.pop() {
-            loop {
-                st.steps += 1;
-                if st.steps > MAX_STEPS {
-                    st.imprecise.push("step budget exhausted".into());
-                    outs.push(self.finish(Exit::Normal, *st));
-                    break;
-                }
-                match self.step(node, st) {
-                    Step::Go(n, s) => {
-                        node = n;
-                        st = s;
-                    }
-                    Step::Fork(mut v) => {
-                        let (n, s) = v.remove(0);
-                        if work.len() + outs.len() + v.len() < MAX_PATHS {
-                            work.extend(v);
-                        } else {
-                            let mut s = s;
-                            s.imprecise.push("path budget exhausted".into());
-                            node = n;
-                            st = s;
-                            continue;
-                        }
-                        node = n;
-                        st = s;
-                    }
-                    Step::Done(o) => {
-                        outs.push(*o);
-                        break;
-                    }
-                }
-            }
+        Machine {
+            cur: None,
+            work: vec![(first, Box::new(init))],
+            outs: Vec::new(),
         }
-        outs
+    }
+
+    fn finish_run(&self, mut m: Machine) -> Vec<Outcome> {
+        while m.next_node().is_some() {
+            self.tick(&mut m);
+        }
+        m.outs
+    }
+
+    /// One step of the current path (see [`Machine::next_node`]).
+    fn tick(&self, m: &mut Machine) {
+        let Some((node, mut st)) = m.cur.take() else {
+            return;
+        };
+        st.steps += 1;
+        if st.steps > MAX_STEPS {
+            st.imprecise.push("step budget exhausted".into());
+            m.outs.push(self.finish(Exit::Normal, *st));
+            return;
+        }
+        match self.step(node, st) {
+            Step::Go(n, s) => m.cur = Some((n, s)),
+            Step::Fork(mut v) => {
+                let (n, mut s) = v.remove(0);
+                if m.work.len() + m.outs.len() + v.len() < MAX_PATHS {
+                    m.work.extend(v);
+                } else {
+                    s.imprecise.push("path budget exhausted".into());
+                }
+                m.cur = Some((n, s));
+            }
+            Step::Done(o) => m.outs.push(*o),
+        }
     }
 
     fn row(&self, st: &mut State, id: &str, fact: Option<&str>, status: Status) {
@@ -338,7 +541,7 @@ impl Interp<'_> {
             xact_abort: sc.xact_abort,
             xact_abort_local: false,
             implicit: sc.implicit_transactions,
-            live: BTreeMap::new(),
+            live: vec![None; self.keys.names.len()],
             effect_nodes: BTreeMap::new(),
             log: Vec::new(),
             temp: BTreeMap::new(),
@@ -455,8 +658,9 @@ impl Interp<'_> {
         }
         if sc.caller_txn && st.depth > 0 {
             // The caller's own uncommitted work, so its fate can be followed.
-            st.live.insert(CALLER.into(), Live::Pending);
-            st.log.push(Log::Effect(CALLER.into()));
+            let c = self.keys.id(CALLER);
+            st.live[c] = Some(Live::Pending);
+            st.log.push(Log::Effect(c));
         }
         st.entry_depth = st.depth;
         st
@@ -542,7 +746,7 @@ impl Interp<'_> {
                     _ => String::new(),
                 };
                 if *is_loop {
-                    let digest = Self::digest(&st);
+                    let digest = self.digest(&st);
                     let seen = st.loop_seen.entry(id).or_default();
                     seen.push(digest);
                     let n = seen.len();
@@ -564,12 +768,12 @@ impl Interp<'_> {
         }
     }
 
-    fn digest(st: &State) -> String {
+    fn digest(&self, st: &State) -> String {
         format!(
             "{}|{}|{:?}|{:?}|{}",
             st.depth,
             st.doomed,
-            st.live,
+            LiveByName(&st.live, &self.keys.names),
             st.temp,
             st.log.len()
         )
@@ -605,7 +809,14 @@ impl Interp<'_> {
                     st.fault_index = Some(st.trace.len() - 1);
                 }
                 if st.before_fault.is_none() {
-                    st.before_fault = Some(st.live.keys().cloned().collect());
+                    st.before_fault = Some(
+                        st.live
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, l)| l.is_some())
+                            .map(|(i, _)| self.keys.names[i].clone())
+                            .collect(),
+                    );
                     st.faulted = s.durable_effect().map(|e| e.key.clone());
                 }
                 if matches!(s.action, Action::Commit) {
@@ -726,24 +937,25 @@ impl Interp<'_> {
             match &e.temp {
                 Some(t) => self.write_temp(&mut st, t),
                 None => {
-                    st.effect_nodes.insert(e.key.clone(), id);
-                    self.write(&mut st, &e.key);
+                    let k = self.keys.id(&e.key);
+                    st.effect_nodes.insert(self.keys.names[k].clone(), id);
+                    self.write(&mut st, k);
                 }
             }
         }
         self.next(id, st)
     }
 
-    fn write(&self, st: &mut State, key: &str) {
+    fn write(&self, st: &mut State, key: usize) {
         if st.no_commit {
-            st.live.insert(key.to_string(), Live::Durable);
+            st.live[key] = Some(Live::Durable);
             return;
         }
         if st.depth > 0 {
-            st.live.insert(key.to_string(), Live::Pending);
-            st.log.push(Log::Effect(key.to_string()));
+            st.live[key] = Some(Live::Pending);
+            st.log.push(Log::Effect(key));
         } else {
-            st.live.insert(key.to_string(), Live::Durable);
+            st.live[key] = Some(Live::Durable);
         }
     }
 
@@ -765,8 +977,8 @@ impl Interp<'_> {
     fn make_durable(&self, st: &mut State) {
         for l in st.log.drain(..) {
             if let Log::Effect(k) = l {
-                if st.live.get(&k) == Some(&Live::Pending) {
-                    st.live.insert(k, Live::Durable);
+                if let Some(v @ Live::Pending) = &mut st.live[k] {
+                    *v = Live::Durable;
                 }
             }
         }
@@ -785,8 +997,8 @@ impl Interp<'_> {
         while st.log.len() > marker {
             match st.log.pop() {
                 Some(Log::Effect(k)) => {
-                    if st.live.get(&k) == Some(&Live::Pending) {
-                        st.live.insert(k, Live::Undone);
+                    if let Some(v @ Live::Pending) = &mut st.live[k] {
+                        *v = Live::Undone;
                     }
                 }
                 Some(Log::Temp(t, prev)) => {
@@ -1126,8 +1338,9 @@ impl Interp<'_> {
             };
             if partial {
                 if let Some(e) = s.durable_effect() {
-                    st.effect_nodes.insert(e.key.clone(), id);
-                    self.write(&mut st, &e.key);
+                    let k = self.keys.id(&e.key);
+                    st.effect_nodes.insert(self.keys.names[k].clone(), id);
+                    self.write(&mut st, k);
                     st.partial.insert(e.key.clone());
                     st.assumptions.insert("ASM-MULTI-ROW".into());
                 }
@@ -1186,7 +1399,7 @@ impl Interp<'_> {
     fn finish(&self, exit: Exit, st: State) -> Outcome {
         let mut st = st;
         let raised_exit = matches!(exit, Exit::Raised(_));
-        let mut effects = BTreeMap::new();
+        let mut effects = Vec::new();
         let left_open = st.owner == Owner::Autocommit && st.depth > st.caller_depth;
         let mut caller_commits = false;
         let mut open = BTreeSet::new();
@@ -1205,7 +1418,12 @@ impl Interp<'_> {
                 st.raised = true;
             }
         }
-        for (k, l) in &st.live {
+        let live = st
+            .live
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| Some((&self.keys.names[i], l.as_ref()?)));
+        for (k, l) in live {
             let fate = match l {
                 Live::Durable => Fate::Durable,
                 Live::Undone => Fate::Undone,
@@ -1234,13 +1452,14 @@ impl Interp<'_> {
             if fate == Fate::Caller {
                 open.insert(k.clone());
             }
-            let fate = if fate == Fate::Durable && st.partial.contains(k) {
+            let fate = if fate == Fate::Durable && st.partial.contains(&**k) {
                 Fate::Partial
             } else {
                 fate
             };
-            effects.insert(k.clone(), fate);
+            effects.push((k.clone(), fate));
         }
+        let effects: BTreeMap<_, _> = effects.into_iter().collect();
         if caller_commits {
             st.assumptions.insert("ASM-CALLER-COMMITS".into());
         }

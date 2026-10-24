@@ -24,12 +24,29 @@ struct Unit {
 
 fn build_unit(node: SyntaxNode, a: &Analyzed) -> Unit {
     let d = a.dialect();
-    let toks = norm_tokens(&node, d);
     let header = norm_of(ast::header_tokens(&node).into_iter(), d);
     let children: Vec<Unit> = ast::structural_children(&node)
         .into_iter()
         .map(|c| build_unit(c, a))
         .collect();
+    // The same tokens as `norm_tokens(&node, d)`, reusing the children's:
+    // normalizing every subtree again at each level made deep nesting slow.
+    let mut toks = Vec::new();
+    let mut child = children.iter();
+    for el in node.children_with_tokens() {
+        match el {
+            rowan::NodeOrToken::Token(t) => toks.extend(norm_of(
+                std::iter::once(t).filter(|t| ast::is_significant(t.kind())),
+                d,
+            )),
+            rowan::NodeOrToken::Node(n) if n.kind().is_unit() || n.kind().is_container() => {
+                let c = child.next().expect("structural child");
+                debug_assert!(c.node == n);
+                toks.extend(c.toks.iter().cloned());
+            }
+            rowan::NodeOrToken::Node(n) => toks.extend(norm_tokens(&n, d)),
+        }
+    }
     let kind = stmt_kind(&node, d);
     let effectful = kind.is_effectful() || children.iter().any(|c| c.effectful);
     Unit {
