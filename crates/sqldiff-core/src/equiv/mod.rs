@@ -10,6 +10,8 @@
 pub mod ast;
 pub mod canon;
 pub mod compare;
+pub mod edit;
+pub mod eval;
 pub mod lower;
 pub mod options;
 pub mod schema;
@@ -630,6 +632,20 @@ fn compare_pair(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item, out: &mut Outcom
     );
 }
 
+/// Declared types of the `DECLARE` statements behind an item, in order.
+fn declared_types(it: &Item, side: &Analyzed) -> Vec<Option<ast::Type>> {
+    it.nodes
+        .iter()
+        .filter_map(|n| match ast::parse_stmt(&ast::tokens(n), side.dialect()) {
+            Ok(ast::Stmt::Declare { ty, .. }) => Some(ty.map(|t| ast::Type {
+                name: t.name.to_ascii_uppercase(),
+                args: t.args,
+            })),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Same dialect: re-examines statements the structural diff could only call
 /// "modified". Equal ones are dropped (counted as structural), and ones with a
 /// known behavioural difference become "different" with a witness.
@@ -673,8 +689,36 @@ pub fn refine_modified(
             keep.push(f);
             continue;
         };
+        if declared_types(&ia[i], a) != declared_types(&ib[j], b) {
+            // The terms leave out the declared type, which converts the value.
+            keep.push(f);
+            continue;
+        }
         let mut sub = Outcome::default();
         compare_pair(a, b, &ia[i], &ib[j], &mut sub);
+        if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
+            eprintln!(
+                "A: {}{}",
+                ia[i].term,
+                ia[i]
+                    .err
+                    .as_ref()
+                    .map(|e| format!("  [{e}]"))
+                    .unwrap_or_default()
+            );
+            eprintln!(
+                "B: {}{}",
+                ib[j].term,
+                ib[j]
+                    .err
+                    .as_ref()
+                    .map(|e| format!("  [{e}]"))
+                    .unwrap_or_default()
+            );
+            for g in &sub.findings {
+                eprintln!("=> {} {:?} {}", g.rule, g.verdict, g.witness);
+            }
+        }
         if sub.findings.is_empty() {
             out.structural += 1;
             for s in sub.assumptions {

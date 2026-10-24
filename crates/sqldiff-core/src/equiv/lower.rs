@@ -274,7 +274,7 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
     super::options::options(r, &toks, i, u);
 }
 
-pub(super) fn matching(toks: &[Tok], open: usize) -> usize {
+pub(crate) fn matching(toks: &[Tok], open: usize) -> usize {
     let mut depth = 0;
     for (j, t) in toks.iter().enumerate().skip(open) {
         match t.kind {
@@ -291,7 +291,7 @@ pub(super) fn matching(toks: &[Tok], open: usize) -> usize {
     toks.len()
 }
 
-pub(super) fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
+pub(crate) fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
     let mut out = Vec::new();
     let mut depth = 0;
     let mut start = 0;
@@ -312,7 +312,7 @@ pub(super) fn split_commas(toks: &[Tok]) -> Vec<&[Tok]> {
     out
 }
 
-fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
+pub(crate) fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
     let mut i = 0;
     let mut out = false;
     while let Some(t) = toks.get(i) {

@@ -226,7 +226,12 @@ fn literal_case_in_unlowered_statements_is_a_change() {
     };
     let r = run(&ts("abc"), T, &ts("ABC"), T, false);
     assert!(not_equal(&r), "{:?}", r.findings);
-    assert!(rules(&r).contains(&"stmt.modified"), "{:?}", rules(&r));
+    // The stored value keeps its case even under a case-insensitive collation.
+    assert!(
+        rules(&r).contains(&"stmt.modified") || rules(&r).contains(&"equiv.edit"),
+        "{:?}",
+        rules(&r)
+    );
 }
 
 #[test]

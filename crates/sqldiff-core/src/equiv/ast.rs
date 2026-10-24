@@ -152,6 +152,15 @@ pub enum From {
         alias: Option<String>,
         cols: Vec<String>,
     },
+    /// A table-valued function call (`OPENJSON(@j) WITH (...)`); parsed
+    /// only by the extended parser.
+    Func {
+        name: Vec<String>,
+        args: Vec<Expr>,
+        /// T-SQL `WITH (col type ['path'], ...)` result schema.
+        schema: Vec<(String, Type)>,
+        alias: Option<String>,
+    },
     /// Db2 `FINAL TABLE (INSERT ...)` and friends.
     DataChange {
         kind: String,
@@ -166,8 +175,23 @@ pub enum From {
     },
 }
 
+/// A common table expression (extended parser only).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub cols: Vec<String>,
+    pub query: Select,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Select {
+    /// `WITH name AS (...)` (extended parser only).
+    pub ctes: Vec<Cte>,
+    /// T-SQL `FOR JSON ...` (extended parser only): the rows are returned as JSON text.
+    pub for_json: bool,
+    /// `UNION [ALL]` / `EXCEPT` / `INTERSECT` operands that follow (extended
+    /// parser only); ORDER BY and paging of the select apply to the whole.
+    pub set_ops: Vec<(String, Select)>,
     pub distinct: bool,
     pub top: Option<Expr>,
     pub items: Vec<SelItem>,
@@ -333,11 +357,29 @@ pub struct Parser<'a> {
     t: &'a [Tok],
     pub i: usize,
     pub d: Dialect,
+    /// Extended syntax for the evaluator: CTEs, table functions, OUTPUT
+    /// clauses, FOR JSON and FOR SYSTEM_TIME. The canonical lowering never
+    /// sees these.
+    pub ext: bool,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(t: &'a [Tok], d: Dialect) -> Self {
-        Parser { t, i: 0, d }
+        Parser {
+            t,
+            i: 0,
+            d,
+            ext: false,
+        }
+    }
+
+    pub fn ext(t: &'a [Tok], d: Dialect) -> Self {
+        Parser {
+            t,
+            i: 0,
+            d,
+            ext: true,
+        }
     }
 
     pub fn at_end(&self) -> bool {
@@ -412,6 +454,29 @@ impl<'a> Parser<'a> {
         self.peek().is_some_and(|t| t.kind == K::Op && t.text == op)
     }
 
+    /// The operator of a T-SQL compound assignment (`+=` ...) at the cursor.
+    fn compound_op(&self) -> Option<&'static str> {
+        self.peek_compound(0)
+    }
+
+    fn peek_compound(&self, at: usize) -> Option<&'static str> {
+        if self.d != Dialect::Tsql {
+            return None;
+        }
+        let t = self.peek_at(at)?;
+        if t.kind != K::Op {
+            return None;
+        }
+        Some(match t.text.as_str() {
+            "+=" => "+",
+            "-=" => "-",
+            "*=" => "*",
+            "/=" => "/",
+            "%=" => "%",
+            _ => return None,
+        })
+    }
+
     fn eat_op(&mut self, op: &str) -> bool {
         if self.is_op(op) {
             self.i += 1;
@@ -476,7 +541,19 @@ impl<'a> Parser<'a> {
             parts.push(format!("#{n}"));
             return Ok(parts);
         }
-        parts.push(self.ident()?);
+        // Template placeholders such as `@extschema@` stand for a schema name.
+        if self.ext
+            && self.is_op("@")
+            && self.is_kind_at(1, K::Word)
+            && self
+                .peek_at(2)
+                .is_some_and(|t| t.kind == K::Op && t.text == "@")
+        {
+            parts.push(format!("@{}@", self.peek_at(1).unwrap().text));
+            self.i += 3;
+        } else {
+            parts.push(self.ident()?);
+        }
         while self.is_kind(K::Dot) || (self.d == Dialect::Db2i && self.is_op("/")) {
             if self.is_kind(K::Dot)
                 && self
@@ -615,6 +692,21 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("IS") {
             let neg = self.eat_kw("NOT");
+            // x IS [NOT] TRUE / FALSE / UNKNOWN (extended parser): a call.
+            if self.ext && (self.is_kw("TRUE") || self.is_kw("FALSE") || self.is_kw("UNKNOWN")) {
+                let what = self.peek().unwrap().up.clone();
+                self.i += 1;
+                let name = format!("IS {}{what}", if neg { "NOT " } else { "" });
+                return Ok(Expr::Call(Box::new(Call {
+                    name: vec![name],
+                    args: vec![l],
+                    distinct: false,
+                    order: Vec::new(),
+                    within_group: false,
+                    over: false,
+                    star: false,
+                })));
+            }
             self.expect_kw("NULL")?;
             return Ok(Expr::IsNull(Box::new(l), neg));
         }
@@ -777,6 +869,20 @@ impl<'a> Parser<'a> {
 
     fn word_primary(&mut self, t: &Tok) -> PResult<Expr> {
         match t.up.as_str() {
+            // T-SQL `NEXT VALUE FOR seq` (extended parser): a call.
+            "NEXT" if self.ext && self.is_kw_at(1, "VALUE") && self.is_kw_at(2, "FOR") => {
+                self.i += 3;
+                let seq = self.qname()?;
+                Ok(Expr::Call(Box::new(Call {
+                    name: vec!["NEXT VALUE FOR".into()],
+                    args: vec![Expr::Name(seq)],
+                    distinct: false,
+                    order: Vec::new(),
+                    within_group: false,
+                    over: false,
+                    star: false,
+                })))
+            }
             "NULL" => {
                 self.i += 1;
                 Ok(Expr::Null)
@@ -834,6 +940,8 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 Ok(Expr::Special(t.up.clone()))
             }
+            // LEFT(s, n) and RIGHT(s, n) are functions, not joins.
+            "LEFT" | "RIGHT" if self.is_kind_at(1, K::LParen) => self.name_or_call(),
             u if is_reserved(u) => Err(self.err("unexpected keyword in expression")),
             _ => self.name_or_call(),
         }
@@ -956,7 +1064,39 @@ impl<'a> Parser<'a> {
 
     pub fn select(&mut self) -> PResult<Select> {
         if self.is_kw("WITH") {
-            return Err("common table expressions are not supported".into());
+            if !self.ext {
+                return Err("common table expressions are not supported".into());
+            }
+            self.i += 1;
+            if self.is_kw("RECURSIVE") {
+                return Err("recursive common table expressions are not supported".into());
+            }
+            let mut ctes = Vec::new();
+            loop {
+                let name = self.ident()?;
+                let cols = if self.is_kind(K::LParen) {
+                    self.col_list()?
+                } else {
+                    Vec::new()
+                };
+                self.expect_kw("AS")?;
+                if self.is_kw("MATERIALIZED") || self.is_kw("NOT") {
+                    return Err("MATERIALIZED common table expressions are not supported".into());
+                }
+                self.expect_kind(K::LParen)?;
+                let query = self.select()?;
+                self.expect_kind(K::RParen)?;
+                ctes.push(Cte { name, cols, query });
+                if !self.eat_kind(K::Comma) {
+                    break;
+                }
+            }
+            let mut s = self.select()?;
+            if !s.ctes.is_empty() {
+                return Err("nested WITH".into());
+            }
+            s.ctes = ctes;
+            return Ok(s);
         }
         if self.eat_kw("VALUES") {
             let rows = self.values_rows()?;
@@ -1013,7 +1153,46 @@ impl<'a> Parser<'a> {
             s.having = Some(self.expr()?);
         }
         if self.is_kw("UNION") || self.is_kw("EXCEPT") || self.is_kw("INTERSECT") {
-            return Err("set operations are not supported".into());
+            if !self.ext {
+                return Err("set operations are not supported".into());
+            }
+            let mut op = self.peek().unwrap().up.clone();
+            self.i += 1;
+            if self.eat_kw("ALL") {
+                op.push_str(" ALL");
+            } else {
+                self.eat_kw("DISTINCT");
+            }
+            let paren = self.eat_kind(K::LParen);
+            let mut operand = self.select()?;
+            if paren {
+                self.expect_kind(K::RParen)?;
+                if self.is_kw("UNION")
+                    || self.is_kw("EXCEPT")
+                    || self.is_kw("INTERSECT")
+                    || self.is_kw("ORDER")
+                {
+                    return Err("set operation after a parenthesised operand".into());
+                }
+            } else {
+                // The operand parsed the rest of the chain and its ORDER BY
+                // and paging, which belong to the whole.
+                s.order_by = std::mem::take(&mut operand.order_by);
+                s.offset = operand.offset.take();
+                s.limit = operand.limit.take();
+                s.locking = std::mem::take(&mut operand.locking);
+                s.for_json = std::mem::take(&mut operand.for_json);
+            }
+            let rest = std::mem::take(&mut operand.set_ops);
+            s.set_ops.push((op, operand));
+            s.set_ops.extend(rest);
+            let ops: Vec<&str> = s.set_ops.iter().map(|(o, _)| o.as_str()).collect();
+            if ops.iter().any(|o| o.starts_with("INTERSECT"))
+                && ops.iter().any(|o| !o.starts_with("INTERSECT"))
+            {
+                return Err("INTERSECT mixed with other set operations".into());
+            }
+            return Ok(s);
         }
         if self.eat_kws(&["ORDER", "BY"]) {
             s.order_by = self.order_list()?;
@@ -1050,6 +1229,27 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+        }
+        // T-SQL FOR JSON PATH / AUTO [, options].
+        if self.ext && self.d == Dialect::Tsql && self.is_kw("FOR") && self.is_kw_at(1, "JSON") {
+            self.i += 2;
+            if !(self.eat_kw("PATH") || self.eat_kw("AUTO")) {
+                return Err(self.err("expected PATH or AUTO"));
+            }
+            while self.eat_kind(K::Comma) {
+                if self.eat_kw("ROOT") {
+                    if self.eat_kind(K::LParen) {
+                        self.i += 1;
+                        self.expect_kind(K::RParen)?;
+                    }
+                } else if self.eat_kw("INCLUDE_NULL_VALUES") || self.eat_kw("WITHOUT_ARRAY_WRAPPER")
+                {
+                } else {
+                    return Err(self.err("unsupported FOR JSON option"));
+                }
+            }
+            s.for_json = true;
+            return Ok(s);
         }
         // Locking and isolation clauses are kept as words; anything else
         // (FOR XML, FOR JSON, FOR BROWSE, ...) is refused.
@@ -1118,6 +1318,18 @@ impl<'a> Parser<'a> {
                 alias: None,
                 assign: Some(v),
             });
+        }
+        if self.is_kind(K::Var) && self.d == Dialect::Tsql {
+            if let Some(op) = self.peek_compound(1) {
+                let v = self.peek().unwrap().text.clone();
+                self.i += 2;
+                let e = self.expr()?;
+                return Ok(SelItem {
+                    expr: Expr::Bin(op.into(), Box::new(Expr::Var(v.clone())), Box::new(e)),
+                    alias: None,
+                    assign: Some(v),
+                });
+            }
         }
         let expr = self.expr()?;
         let alias = self.alias()?;
@@ -1219,9 +1431,57 @@ impl<'a> Parser<'a> {
         self.eat_kw("ONLY");
         let name = self.qname()?;
         if self.is_kind(K::LParen) {
-            return Err("table functions in FROM are not supported".into());
+            if !self.ext {
+                return Err("table functions in FROM are not supported".into());
+            }
+            self.i += 1;
+            let args = if self.is_kind(K::RParen) {
+                Vec::new()
+            } else {
+                self.expr_list()?
+            };
+            self.expect_kind(K::RParen)?;
+            let mut schema = Vec::new();
+            if self.d == Dialect::Tsql && self.is_kw("WITH") && self.is_kind_at(1, K::LParen) {
+                self.i += 2;
+                loop {
+                    let col = self.ident()?;
+                    let ty = self.ty()?;
+                    if self.is_kind(K::Str) {
+                        self.i += 1;
+                    }
+                    if self.eat_kw("AS") {
+                        self.expect_kw("JSON")?;
+                    }
+                    schema.push((col, ty));
+                    if !self.eat_kind(K::Comma) {
+                        break;
+                    }
+                }
+                self.expect_kind(K::RParen)?;
+            }
+            let alias = self.alias()?;
+            return Ok(From::Func {
+                name,
+                args,
+                schema,
+                alias,
+            });
+        }
+        // T-SQL temporal tables: FOR SYSTEM_TIME AS OF x reads another
+        // (arbitrary) state of the table, kept as a hint naming the point.
+        let mut asof = None;
+        if self.ext && self.is_kw("FOR") && self.is_kw_at(1, "SYSTEM_TIME") {
+            self.i += 2;
+            self.expect_kw("AS")?;
+            self.expect_kw("OF")?;
+            let start = self.i;
+            self.primary()?;
+            let text: Vec<String> = self.t[start..self.i].iter().map(|t| t.up.clone()).collect();
+            asof = Some(format!("SYSTEM_TIME AS OF {}", text.join(" ")));
         }
         let mut hints = self.table_hints()?;
+        hints.extend(asof);
         let alias = self.alias()?;
         hints.extend(self.table_hints()?);
         Ok(From::Table { name, alias, hints })
@@ -1259,16 +1519,29 @@ impl<'a> Parser<'a> {
     fn set_list(&mut self) -> PResult<Vec<(Vec<String>, Expr)>> {
         let mut sets = Vec::new();
         loop {
+            let mut target = None;
             let cols = if self.is_kind(K::LParen) {
                 self.col_list()?
             } else {
                 let n = self.qname()?;
-                vec![n.last().cloned().unwrap_or_default()]
+                let c = vec![n.last().cloned().unwrap_or_default()];
+                target = Some(n);
+                c
             };
-            if !self.eat_op("=") {
-                return Err(self.err("expected ="));
-            }
-            let e = self.expr()?;
+            // T-SQL `SET col += e` is `SET col = col + e`.
+            let e = match (self.compound_op(), target) {
+                (Some(op), Some(n)) => {
+                    self.i += 1;
+                    let e = self.expr()?;
+                    Expr::Bin(op.into(), Box::new(Expr::Name(n)), Box::new(e))
+                }
+                _ => {
+                    if !self.eat_op("=") {
+                        return Err(self.err("expected ="));
+                    }
+                    self.expr()?
+                }
+            };
             sets.push((cols, e));
             if !self.eat_kind(K::Comma) {
                 break;
@@ -1279,12 +1552,49 @@ impl<'a> Parser<'a> {
 
     // ---- statements ----------------------------------------------------
 
+    /// T-SQL `OUTPUT inserted.x, ... [INTO target [(cols)]]`: skipped by
+    /// the extended parser (the evaluator compares the write itself).
+    fn output(&mut self) -> PResult<()> {
+        if !self.is_kw("OUTPUT") {
+            return Ok(());
+        }
+        if !self.ext {
+            return Err("OUTPUT clauses are not supported".into());
+        }
+        self.i += 1;
+        loop {
+            self.sel_item()?;
+            if !self.eat_kind(K::Comma) {
+                break;
+            }
+        }
+        if self.eat_kw("INTO") {
+            self.qname_or_var()?;
+            if self.is_kind(K::LParen) {
+                self.col_list()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn qname_or_var(&mut self) -> PResult<Vec<String>> {
+        match self.peek() {
+            Some(t) if t.kind == K::Var => {
+                let v = t.text.clone();
+                self.i += 1;
+                Ok(vec![v])
+            }
+            _ => self.qname(),
+        }
+    }
+
     pub fn stmt(&mut self) -> PResult<Stmt> {
         let Some(t) = self.peek().cloned() else {
             return Err("empty statement".into());
         };
         let s = match t.up.as_str() {
             "SELECT" | "VALUES" => Stmt::Select(Box::new(self.select()?)),
+            "WITH" if self.ext => Stmt::Select(Box::new(self.select()?)),
             "WITH" => return Err("common table expressions are not supported".into()),
             "INSERT" => self.insert()?,
             "UPDATE" => self.update()?,
@@ -1310,10 +1620,20 @@ impl<'a> Parser<'a> {
                     }
                     _ => Expr::Name(self.qname()?),
                 };
-                if !self.eat_op("=") {
-                    return Err(self.err("expected ="));
+                if let Some(op) = self.compound_op() {
+                    // T-SQL `SET @v += e` is `SET @v = @v + e`.
+                    self.i += 1;
+                    let e = self.expr()?;
+                    Stmt::Assign(
+                        target.clone(),
+                        Expr::Bin(op.into(), Box::new(target), Box::new(e)),
+                    )
+                } else {
+                    if !self.eat_op("=") {
+                        return Err(self.err("expected ="));
+                    }
+                    Stmt::Assign(target, self.expr()?)
                 }
-                Stmt::Assign(target, self.expr()?)
             }
             "DECLARE" => self.declare()?,
             _ if self.is_kind_at(1, K::Op) && self.peek_at(1).unwrap().text == ":=" => {
@@ -1370,6 +1690,10 @@ impl<'a> Parser<'a> {
         self.expect_kw("INSERT")?;
         self.eat_kw("INTO");
         let target = self.qname()?;
+        // Table hints on the target do not change what is written.
+        if self.ext {
+            self.table_hints()?;
+        }
         if self.is_kw("AS")
             || (self.is_kind(K::Word)
                 && !self.is_kw("VALUES")
@@ -1384,9 +1708,7 @@ impl<'a> Parser<'a> {
         } else {
             Vec::new()
         };
-        if self.is_kw("OUTPUT") {
-            return Err("OUTPUT clauses are not supported".into());
-        }
+        self.output()?;
         let source = if self.eat_kw("VALUES") {
             InsertSource::Values(self.values_rows()?)
         } else if self.eat_kws(&["DEFAULT", "VALUES"]) {
@@ -1477,9 +1799,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw("SET")?;
         let sets = self.set_list()?;
-        if self.is_kw("OUTPUT") {
-            return Err("OUTPUT clauses are not supported".into());
-        }
+        self.output()?;
         let from = if self.eat_kw("FROM") {
             self.table_list()?
         } else {
@@ -1677,6 +1997,16 @@ fn string_value(raw: &str) -> PResult<String> {
 }
 
 /// Parses a whole statement token list.
+/// Parses a statement with the extended syntax of the evaluator.
+pub fn parse_stmt_ext(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
+    let mut p = Parser::ext(toks, d);
+    let s = p.stmt()?;
+    if !p.at_end() {
+        return Err(p.err("unexpected trailing tokens"));
+    }
+    Ok(s)
+}
+
 pub fn parse_stmt(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
     let mut p = Parser::new(toks, d);
     let s = p.stmt()?;

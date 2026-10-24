@@ -1098,9 +1098,9 @@ impl<'a> Canon<'a> {
                 });
                 Ok(n("sub", vec![q.0]))
             }
-            From::Values { .. } | From::DataChange { .. } => {
-                Err("VALUES or data-change table in FROM is not supported here".into())
-            }
+            From::Values { .. } | From::DataChange { .. } | From::Func { .. } => Err(
+                "VALUES, table function or data-change table in FROM is not supported here".into(),
+            ),
         }
     }
 

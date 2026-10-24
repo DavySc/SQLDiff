@@ -452,6 +452,7 @@ impl Scope {
                 n("values-src", k)
             }
             From::DataChange { .. } => return Err("data-change table references".into()),
+            From::Func { .. } => return Err("table functions".into()),
             From::Join {
                 kind,
                 left,

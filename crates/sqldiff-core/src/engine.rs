@@ -144,6 +144,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     if same {
         let mut td = treediff::diff(&aa, &ab);
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
+        equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
         noise.cosmetic = td.cosmetic;
         noise.structural = td.structural + eq.structural;
