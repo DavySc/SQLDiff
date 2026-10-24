@@ -1,4 +1,9 @@
-//! T-SQL → PostgreSQL rules (P0: token level over the lossless CST).
+//! T-SQL → PostgreSQL and T-SQL → Db2 for i rules (token level over the
+//! lossless CST). One walk serves both targets: statements, expressions and
+//! refusals are shared, and the target decides the spelling (PL/pgSQL or SQL
+//! PL) and the notes. Db2 for i output relies on the corrected vendor facts
+//! in docs/vendor-facts-verification.md; facts that were never checked on a
+//! real system (V4, V9, V15, parts of V14) only ever appear as assumptions.
 //!
 //! Each rule either converts faithfully, converts and records the assumption
 //! it needs (a note), or refuses, in which case the unit is kept as a comment
@@ -27,9 +32,17 @@ mod rules {
     pub use sqldiff_core::rules::rule::{RuleSet, Status};
 }
 
-pub(crate) fn convert(root: &SyntaxNode, src: &str) -> Out {
+pub(crate) fn convert(root: &SyntaxNode, src: &str, to: Dialect) -> Out {
     let mut cx = Cx {
         src,
+        to,
+        loops: Vec::new(),
+        labels: 0,
+        cursors: Vec::new(),
+        xact_abort: false,
+        seen_work: false,
+        tables: HashMap::new(),
+        savepoints: Vec::new(),
         vars: HashMap::new(),
         notes: Vec::new(),
         mode: Mode::Top,
@@ -94,6 +107,23 @@ struct Decl {
 
 struct Cx<'a> {
     src: &'a str,
+    /// Target dialect: PostgreSQL or Db2 for i.
+    to: Dialect,
+    /// Db2: labels of the enclosing WHILE loops (LEAVE/ITERATE need one).
+    loops: Vec<String>,
+    /// Db2: loop labels handed out in this routine or script.
+    labels: usize,
+    /// Db2: result-set cursors of the routine, declared after the variables.
+    cursors: Vec<Decl>,
+    /// Db2: `SET XACT_ABORT ON` seen; the routine gets an EXIT handler that
+    /// rolls back and resignals.
+    xact_abort: bool,
+    /// A statement that does work ran before (XACT_ABORT ON must come first).
+    seen_work: bool,
+    /// Db2: table variables (lower-case name without `@`) → `SESSION.t_name`.
+    tables: HashMap<String, String>,
+    /// Savepoint names set with SAVE TRANSACTION in this routine or script.
+    savepoints: Vec<String>,
     vars: HashMap<String, Var>,
     /// Notes of the unit being converted.
     notes: Vec<Note>,
@@ -122,6 +152,19 @@ fn no<T>(reason: impl Into<String>) -> R<T> {
 }
 
 impl Cx<'_> {
+    fn db2(&self) -> bool {
+        self.to == Dialect::Db2i
+    }
+
+    /// The target's wording: PostgreSQL or Db2 for i.
+    fn pick<'s>(&self, pg: &'s str, db2: &'s str) -> &'s str {
+        if self.db2() {
+            db2
+        } else {
+            pg
+        }
+    }
+
     fn note(&mut self, status: Status, rule: &str, text: &str) {
         if !self.notes.iter().any(|n| n.rule == rule) {
             self.notes.push(Note {
@@ -197,21 +240,58 @@ impl Cx<'_> {
         self.body_elements(out, b, 0);
     }
 
-    fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
-        self.mode = Mode::Do;
+    /// Forgets what the previous routine or script declared.
+    fn reset(&mut self) {
         self.vars.clear();
         self.decls.clear();
+        self.cursors.clear();
+        self.loops.clear();
+        self.labels = 0;
+        self.xact_abort = false;
+        self.seen_work = false;
+        self.tables.clear();
+        self.savepoints.clear();
+    }
+
+    fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
+        self.mode = Mode::Do;
+        self.reset();
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
-        out.push("DO $$\n");
-        self.write_decls(out);
-        out.push("BEGIN\n");
-        out.append(body);
-        out.push("END\n$$;\n");
+        if self.db2() {
+            // A dynamic compound statement; its commit level is the job's.
+            out.push("BEGIN\n");
+            self.write_decls(out);
+            out.append(body);
+            out.push("END;\n");
+        } else {
+            out.push("DO $$\n");
+            self.write_decls(out);
+            out.push("BEGIN\n");
+            out.append(body);
+            out.push("END\n$$;\n");
+        }
         self.mode = Mode::Top;
     }
 
+    /// The hoisted declarations. PostgreSQL: a DECLARE section before BEGIN.
+    /// Db2: inside BEGIN, variables first, then cursors, then handlers.
     fn write_decls(&mut self, out: &mut Out) {
+        if self.db2() {
+            for d in std::mem::take(&mut self.decls)
+                .into_iter()
+                .chain(std::mem::take(&mut self.cursors))
+            {
+                out.unit(d.src, INDENT, &d.lines.join("\n"), d.notes);
+            }
+            if self.xact_abort {
+                out.lines(
+                    INDENT,
+                    "DECLARE EXIT HANDLER FOR SQLEXCEPTION\nBEGIN\n  ROLLBACK;\n  RESIGNAL;\nEND;",
+                );
+            }
+            return;
+        }
         if self.decls.is_empty() {
             return;
         }
@@ -234,6 +314,7 @@ impl Cx<'_> {
             "PROC" | "PROCEDURE" => self.proc_or_func(out, r, false),
             "FUNCTION" => self.proc_or_func(out, r, true),
             "VIEW" => self.view(r),
+            "TRIGGER" if self.db2() => no("triggers: Db2 for i triggers are row or statement triggers with REFERENCING NEW/OLD (TABLE); inserted/deleted need a rewrite"),
             "TRIGGER" => no("triggers: PostgreSQL needs a trigger function plus CREATE TRIGGER, and inserted/deleted become NEW/OLD or transition tables"),
             _ => no("unrecognised routine"),
         };
@@ -268,15 +349,15 @@ impl Cx<'_> {
         let head = &ts[name_at + 1..as_at];
         if let Some(w) = head.iter().find(|t| t.is("WITH")) {
             let _ = w;
-            self.note(
-                Status::Converted,
-                "tsql.view-options",
-                "View options such as SCHEMABINDING have no PostgreSQL equivalent and were dropped; they do not change results.",
+            let text = format!(
+                "View options such as SCHEMABINDING have no {} equivalent and were dropped; they do not change results.",
+                self.to.display_name()
             );
+            self.note(Status::Converted, "tsql.view-options", &text);
         }
         let name_end = head.iter().position(|t| t.is("WITH")).unwrap_or(head.len());
         let name = self.expr(&head[..name_end]).trim().to_string();
-        if ts.iter().take(name_at).any(|t| t.is("ALTER")) {
+        if ts.iter().take(name_at).any(|t| t.is("ALTER")) && !self.db2() {
             self.note(
                 Status::Assumptions,
                 "ASM-VIEW-REPLACE",
@@ -293,8 +374,7 @@ impl Cx<'_> {
     }
 
     fn proc_or_func(&mut self, out: &mut Out, r: &SyntaxNode, func: bool) -> R<Option<String>> {
-        self.vars.clear();
-        self.decls.clear();
+        self.reset();
         self.return_code = false;
         let all = tokens(r);
         let body_at = all.len()
@@ -347,7 +427,14 @@ impl Cx<'_> {
                 })
                 .unwrap_or(p.len());
             if p.iter().any(|t| t.is("READONLY")) {
-                return no("table-valued parameters (READONLY) have no PostgreSQL equivalent; pass an array or a temp table");
+                return no(format!(
+                    "table-valued parameters (READONLY) have no {} equivalent; {}",
+                    self.to.display_name(),
+                    self.pick(
+                        "pass an array or a temp table",
+                        "pass the rows in a global temporary table"
+                    )
+                ));
             }
             let (ty, string, numeric) = self.ty(&p[1..ty_end])?;
             let pname = format!("p_{}", snake(&v.s[1..]));
@@ -363,14 +450,19 @@ impl Cx<'_> {
             if output && func {
                 return self.misplaced("OUTPUT parameters on a function");
             }
-            let mut text = format!("{}{pname} {ty}", if output { "INOUT " } else { "" });
+            let mode = match (output, self.db2() && !func) {
+                (true, _) => "INOUT ",
+                (false, true) => "IN ",
+                (false, false) => "",
+            };
+            let mut text = format!("{mode}{pname} {ty}");
             if let Some(eq) = p[..].iter().position(|t| t.k == OP && t.s == "=") {
                 let end = (eq + 1..p.len())
                     .find(|&j| p[j].is("OUTPUT") || p[j].is("OUT"))
                     .unwrap_or(p.len());
                 text.push_str(&format!(" DEFAULT {}", self.expr(&p[eq + 1..end]).trim()));
                 seen_default = true;
-            } else if seen_default {
+            } else if seen_default && !self.db2() {
                 self.note(
                     Status::Decision,
                     "pg.param-default-order",
@@ -390,19 +482,20 @@ impl Cx<'_> {
                 .unwrap_or(ts.len());
             let rt = trimmed(&ts[ret + 1..rend]);
             if rt.first().is_some_and(|t| t.is("TABLE") || t.k == VARIABLE) {
-                return no(
+                return no(self.pick(
                     "table-valued functions: convert to RETURNS TABLE (…) with RETURN QUERY",
-                );
+                    "table-valued functions: convert to RETURNS TABLE (…) with RETURN followed by the query",
+                ));
             }
             let (ty, _, _) = self.ty(rt)?;
             returns = format!(" RETURNS {ty}");
         }
         if ts.iter().any(|t| t.is("WITH")) {
-            self.note(
-                Status::Decision,
-                "tsql.routine-options",
+            let text = self.pick(
                 "Routine options (WITH EXECUTE AS, RECOMPILE, ENCRYPTION, …) were dropped; use SECURITY DEFINER for EXECUTE AS OWNER.",
-            );
+                "Routine options (WITH EXECUTE AS, RECOMPILE, ENCRYPTION, …) were dropped; use SET OPTION USRPRF = *OWNER for EXECUTE AS OWNER.",
+            ).to_string();
+            self.note(Status::Decision, "tsql.routine-options", &text);
         }
         let header_notes = self.take_notes();
 
@@ -415,10 +508,13 @@ impl Cx<'_> {
             Some(blk) if body.children().count() == 1 => self.body_elements(&mut b, &blk, INDENT),
             _ => self.body_elements(&mut b, &body, INDENT),
         }
-        if self.return_code {
+        if self.return_code && !self.db2() {
             params.push("INOUT return_code integer DEFAULT NULL".into());
         }
         self.notes = header_notes;
+        if self.db2() {
+            return Ok(self.db2_routine(out, r, &body, b, func, &name, &params, &returns, kw));
+        }
         if ts[..kw].iter().any(|t| t.is("ALTER")) {
             self.note(
                 Status::Assumptions,
@@ -447,6 +543,77 @@ impl Cx<'_> {
         out.push("END;\n$$;\n");
         self.mode = Mode::Top;
         Ok(None)
+    }
+
+    /// The Db2 for i routine around a converted body: SQL PL with the commit
+    /// level written out, since without it the level comes from whoever
+    /// creates the routine (fact V5).
+    #[allow(clippy::too_many_arguments)]
+    fn db2_routine(
+        &mut self,
+        out: &mut Out,
+        r: &SyntaxNode,
+        body: &SyntaxNode,
+        b: Out,
+        func: bool,
+        name: &str,
+        params: &[String],
+        returns: &str,
+        kw: usize,
+    ) -> Option<String> {
+        let ts = tokens(r);
+        if ts[..kw].iter().any(|t| t.is("ALTER")) {
+            self.note(
+                Status::Assumptions,
+                "ASM-ROUTINE-REPLACE",
+                "ALTER becomes CREATE OR REPLACE, which replaces the routine with the same name and number of parameters. With a different number of parameters Db2 for i adds a second routine beside the old one: drop the old one first.",
+            );
+        }
+        if self.return_code {
+            self.note(
+                Status::Assumptions,
+                "ASM-RETURN-STATUS",
+                "RETURN n is kept: callers read it with GET DIAGNOSTICS v = DB2_RETURN_STATUS (or the return value of the CALL in JDBC/ODBC), not as T-SQL's EXEC @rc = ….",
+            );
+        }
+        let mut options = String::from("LANGUAGE SQL");
+        if !func {
+            if !self.cursors.is_empty() {
+                options = format!("DYNAMIC RESULT SETS {}\n{options}", self.cursors.len());
+            }
+            options.push_str("\nSET OPTION COMMIT = *CS");
+            self.note(
+                Status::Assumptions,
+                "ASM-DB2-COMMIT-CS",
+                "The procedure is compiled with SET OPTION COMMIT = *CS: each statement is atomic and reads see only committed rows, as in T-SQL (READ COMMITTED). Without it the commit level is whatever the creating job uses (fact V5), and under *NONE nothing, not even a failed statement, is rolled back (facts V2, V4). The work stays in the caller's unit of work until it commits.",
+            );
+        }
+        let header = format!(
+            "CREATE OR REPLACE {} {name} ({}){returns}\n{options}\nBEGIN",
+            if func { "FUNCTION" } else { "PROCEDURE" },
+            params.join(", ")
+        );
+        let (s, _) = Self::range(r);
+        let notes = self.take_notes();
+        out.unit((s, body.text_range().start().into()), 0, &header, notes);
+        self.write_decls(out);
+        out.append(b);
+        out.push("END;\n");
+        self.mode = Mode::Top;
+        None
+    }
+
+    /// A statement list of IF, WHILE or a handler. Db2 wants at least one
+    /// statement there, so a list left with only comments (a dropped PRINT,
+    /// a refused statement) gets an empty compound statement.
+    fn stmts(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
+        if !self.db2() {
+            return self.body_elements(out, n, indent);
+        }
+        let mut b = Out::default();
+        self.body_elements(&mut b, n, indent);
+        fill_empty(&mut b, indent);
+        out.append(b);
     }
 
     /// Writes the units and comments directly inside `n`, skipping its own keywords.
@@ -508,7 +675,7 @@ impl Cx<'_> {
             facts: &rules::NoFacts,
             vars: &vars,
         };
-        let pieces = rules::convert_nodes(nodes, Dialect::Tsql, Dialect::Postgres, &opts);
+        let pieces = rules::convert_nodes(nodes, Dialect::Tsql, self.to, &opts);
         (pieces, undeclared.get())
     }
 
@@ -597,6 +764,9 @@ impl Cx<'_> {
     fn unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
         self.notes.clear();
         self.context = false;
+        if matches!(n.kind(), IF_STMT | LOOP_STMT | TRY_CATCH) {
+            self.seen_work = true;
+        }
         match n.kind() {
             STATEMENT => {
                 let reason = match self.stmt(n) {
@@ -612,6 +782,17 @@ impl Cx<'_> {
                 }
             }
             BLOCK => self.body_elements(out, n, indent),
+            IF_STMT if self.db2() && trancount_guard(n).is_some() => {
+                // Under commitment control a unit of work is always open.
+                let kw = trancount_guard(n).unwrap();
+                match self.txn_db2(kw) {
+                    Ok(text) => {
+                        let notes = self.take_notes();
+                        out.unit(Self::range(n), indent, &format!("{text};"), notes)
+                    }
+                    Err(No(reason)) => self.refuse(out, n, indent, &reason),
+                }
+            }
             IF_STMT if self.mode != Mode::Top => self.if_stmt(out, n, indent, false),
             LOOP_STMT if self.mode != Mode::Top => self.while_stmt(out, n, indent),
             TRY_CATCH if self.mode != Mode::Top => self.try_catch(out, n, indent),
@@ -623,7 +804,13 @@ impl Cx<'_> {
     fn condition(&mut self, n: &SyntaxNode) -> String {
         n.children()
             .find(|c| c.kind() == CONDITION)
-            .map(|c| self.expr(&tokens(&c)).trim().to_string())
+            .map(|c| {
+                let mut ts = tokens(&c);
+                if self.db2() {
+                    ts = dummy_from(&ts, false);
+                }
+                self.expr(&ts).trim().to_string()
+            })
             .unwrap_or_default()
     }
 
@@ -654,11 +841,15 @@ impl Cx<'_> {
             }
             return self.refuse(out, n, indent, &reason);
         }
-        let kw = if elsif { "ELSIF" } else { "IF" };
+        let kw = match (elsif, self.db2()) {
+            (false, _) => "IF",
+            (true, false) => "ELSIF",
+            (true, true) => "ELSEIF",
+        };
         self.header_unit(out, n, indent, &format!("{kw} {cond} THEN"));
         let branches: Vec<SyntaxNode> = n.children().filter(|c| c.kind() == BRANCH).collect();
         if let Some(b) = branches.first() {
-            self.body_elements(out, b, indent + INDENT);
+            self.stmts(out, b, indent + INDENT);
         }
         if let Some(e) = branches.get(1) {
             let inner: Vec<SyntaxNode> = e.children().filter(|c| c.kind().is_unit()).collect();
@@ -666,7 +857,7 @@ impl Cx<'_> {
                 self.if_stmt(out, &inner[0], indent, true);
             } else {
                 out.lines(indent, "ELSE");
-                self.body_elements(out, e, indent + INDENT);
+                self.stmts(out, e, indent + INDENT);
             }
         }
         if !elsif {
@@ -683,6 +874,22 @@ impl Cx<'_> {
         if let Some(reason) = self.blocked() {
             return self.refuse(out, n, indent, &reason);
         }
+        if self.db2() {
+            // LEAVE and ITERATE name the loop they act on.
+            self.labels += 1;
+            let label = format!("loop_{}", self.labels);
+            self.header_unit(out, n, indent, &format!("{label}: WHILE {cond} DO"));
+            self.loops.push(label.clone());
+            let mut body = Out::default();
+            for b in n.children().filter(|c| c.kind() == BRANCH) {
+                self.body_elements(&mut body, &b, indent + INDENT);
+            }
+            self.loops.pop();
+            fill_empty(&mut body, indent + INDENT);
+            out.append(body);
+            out.lines(indent, &format!("END WHILE {label};"));
+            return;
+        }
         self.header_unit(out, n, indent, &format!("WHILE {cond} LOOP"));
         for b in n.children().filter(|c| c.kind() == BRANCH) {
             self.body_elements(out, &b, indent + INDENT);
@@ -697,6 +904,9 @@ impl Cx<'_> {
             return self.refuse(out, n, indent, "TRY without CATCH");
         };
         let s = Self::range(n).0;
+        if self.db2() {
+            return self.db2_try_catch(out, n, &try_b, &catch_b, indent);
+        }
         // Idiom: CATCH that only rolls back and rethrows = let the error propagate.
         if rollback_rethrow(&catch_b) {
             self.note(
@@ -738,52 +948,174 @@ impl Cx<'_> {
         out.lines(indent, "END;");
     }
 
+    /// Db2: TRY/CATCH becomes a compound statement whose EXIT handler is the
+    /// CATCH part. Unlike PostgreSQL's EXCEPTION block nothing the TRY part
+    /// completed is undone, which is T-SQL's behaviour with XACT_ABORT OFF.
+    fn db2_try_catch(
+        &mut self,
+        out: &mut Out,
+        n: &SyntaxNode,
+        try_b: &SyntaxNode,
+        catch_b: &SyntaxNode,
+        indent: usize,
+    ) {
+        let s = Self::range(n).0;
+        let rethrow = rollback_rethrow(catch_b);
+        if rethrow {
+            self.note(
+                Status::Assumptions,
+                "idiom.rollback-rethrow",
+                "CATCH only rolls back and rethrows: the handler does ROLLBACK; RESIGNAL;, which undoes the whole unit of work (the caller's too, as T-SQL's ROLLBACK does) and raises the same error. Assumes the procedure runs under commitment control (it is compiled with *CS); under *NONE the ROLLBACK undoes nothing (fact V4).",
+            );
+        } else {
+            self.note(
+                Status::Assumptions,
+                "ASM-TRY-HANDLER",
+                "CATCH becomes an EXIT handler for SQLEXCEPTION: what the TRY part completed stays, as in T-SQL with XACT_ABORT OFF, and the failed statement is rolled back under commitment control. SQLEXCEPTION covers every error SQLSTATE; T-SQL's CATCH skips compile and name-resolution errors at the same level.",
+            );
+        }
+        let notes = self.take_notes();
+        out.unit((s, s + 9), indent, "BEGIN", notes);
+        let inner = indent + INDENT;
+        out.lines(inner, "DECLARE EXIT HANDLER FOR SQLEXCEPTION");
+        out.lines(inner, "BEGIN");
+        let was = std::mem::replace(&mut self.in_catch, true);
+        if rethrow {
+            let (cs, ce) = Self::range(catch_b);
+            out.unit((cs, ce), inner + INDENT, "ROLLBACK;\nRESIGNAL;", Vec::new());
+        } else {
+            // What ERROR_MESSAGE() and ERROR_NUMBER() read, captured first:
+            // any statement in the handler resets the diagnostics area.
+            let words: Vec<String> = sqldiff_syntax::ast::sig_tokens(catch_b)
+                .map(|t| t.text().to_ascii_uppercase())
+                .collect();
+            let msg = words.iter().any(|w| w == "ERROR_MESSAGE");
+            let num = words.iter().any(|w| w == "ERROR_NUMBER");
+            let mut items = Vec::new();
+            if msg {
+                out.lines(inner + INDENT, "DECLARE v_error_message VARCHAR(32740);");
+                items.push("v_error_message = MESSAGE_TEXT");
+            }
+            if num {
+                out.lines(inner + INDENT, "DECLARE v_error_number INTEGER;");
+                items.push("v_error_number = DB2_RETURNED_SQLCODE");
+            }
+            if !items.is_empty() {
+                out.lines(
+                    inner + INDENT,
+                    &format!("GET DIAGNOSTICS CONDITION 1 {};", items.join(", ")),
+                );
+            }
+            self.stmts(out, catch_b, inner + INDENT);
+        }
+        self.in_catch = was;
+        out.lines(inner, "END;");
+        let was_try = std::mem::replace(&mut self.in_try, true);
+        self.stmts(out, try_b, inner);
+        self.in_try = was_try;
+        out.lines(indent, "END;");
+    }
+
     // ----- statements -----------------------------------------------------------
 
     fn stmt(&mut self, n: &SyntaxNode) -> R<String> {
-        let ts = tokens(n);
+        let mut ts = tokens(n);
+        if self.db2() {
+            // A query's own FROM-less SELECT is handled in `select`.
+            let top = !matches!(
+                ts.iter().find(|t| t.sig()).map(T::up).as_deref(),
+                Some("SELECT" | "WITH")
+            );
+            ts = dummy_from(&ts, top);
+        }
         let s = sig(&ts);
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
         if self.mode == Mode::Top && procedural(n) {
-            return self.misplaced("uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block");
+            return self.misplaced(self.pick(
+                "uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a DO block",
+                "uses variables or procedural statements next to a routine in one batch; put it in its own batch so it becomes a compound (BEGIN … END) statement",
+            ));
         }
-        let text = match w(0).as_str() {
+        let first = w(0);
+        if !matches!(first.as_str(), "SET" | "DECLARE" | "PRINT") {
+            // XACT_ABORT ON after this cannot become a routine-wide handler.
+            self.seen_work = true;
+        }
+        let text = match first.as_str() {
             "SELECT" | "WITH" => {
                 let (q, assigns) = self.select(&ts)?;
                 if self.mode != Mode::Top && !assigns {
-                    return self.misplaced("returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed");
+                    if self.db2() && self.mode == Mode::Proc {
+                        return Ok(self.result_set(n, &q));
+                    }
+                    return self.misplaced(self.pick(
+                        "returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed",
+                        "returns a result set: only a procedure can (through a cursor WITH RETURN), not a function or a compound statement",
+                    ));
                 }
                 q
             }
             "INSERT" | "UPDATE" | "DELETE" => self.dml(&ts)?,
-            "MERGE" => return no("MERGE: T-SQL and PostgreSQL MERGE differ (OUTPUT, BY SOURCE, concurrency); planned with the upsert canonical form"),
+            "MERGE" if self.db2() => self.merge_db2(&ts)?,
+            "MERGE" => return no(self.pick(
+                "MERGE: T-SQL and PostgreSQL MERGE differ (OUTPUT, BY SOURCE, concurrency); planned with the upsert canonical form",
+                "MERGE: T-SQL and Db2 for i MERGE differ (OUTPUT, BY SOURCE, atomicity under *NONE); planned with the upsert canonical form",
+            )),
             "SET" => self.set(&ts)?,
             "DECLARE" => self.declare(&ts, n)?,
+            "PRINT" if self.db2() => {
+                self.note(Status::Decision, "db2.print", "PRINT was dropped: Db2 for i has no message channel for SQL PL. Use SIGNAL with a warning SQLSTATE ('01xxx'), or write the text to a log table if callers rely on it.");
+                let body = Self::body_toks(&ts);
+                format!("-- PRINT {}: dropped", self.expr(&body[s[1]..]).trim())
+            }
             "PRINT" => {
                 let e = self.expr(&ts[s[1]..]);
                 format!("RAISE NOTICE '%', {}", e.trim())
             }
             "RETURN" => self.ret(&ts)?,
+            "BREAK" | "CONTINUE" if self.db2() => {
+                let Some(label) = self.loops.last() else {
+                    return self.misplaced("BREAK/CONTINUE outside a WHILE loop");
+                };
+                format!("{} {label}", if first == "BREAK" { "LEAVE" } else { "ITERATE" })
+            }
             "BREAK" => "EXIT".into(),
             "CONTINUE" => "CONTINUE".into(),
             "THROW" => self.throw(&ts)?,
-            "RAISERROR" => return no("RAISERROR: severity decides whether it is an error at all; rewrite as RAISE EXCEPTION or RAISE NOTICE"),
-            "BEGIN" if matches!(w(1).as_str(), "TRAN" | "TRANSACTION") => self.txn("BEGIN")?,
-            "COMMIT" => self.txn("COMMIT")?,
-            "ROLLBACK" => self.txn("ROLLBACK")?,
+            "RAISERROR" => return no(self.pick(
+                "RAISERROR: severity decides whether it is an error at all; rewrite as RAISE EXCEPTION or RAISE NOTICE",
+                "RAISERROR: severity decides whether it is an error at all; rewrite as SIGNAL (an error or a warning SQLSTATE)",
+            )),
+            "BEGIN" if matches!(w(1).as_str(), "TRAN" | "TRANSACTION") => self.txn("BEGIN", &ts)?,
+            "COMMIT" => self.txn("COMMIT", &ts)?,
+            "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
+            "SAVE" if self.db2() => self.save(&ts)?,
             "SAVE" => return no("SAVE TRANSACTION: use SAVEPOINT, but a PL/pgSQL body cannot; use a nested BEGIN … EXCEPTION block"),
             "EXEC" | "EXECUTE" => self.exec(&ts)?,
             "CREATE" => self.create(&ts)?,
             "ALTER" if w(1) == "TABLE" => self.alter_table(&ts)?,
             "DROP" => {
                 if w(1) == "INDEX" && find_word(&ts, s[1], "ON").is_some() {
-                    return no("DROP INDEX … ON table: PostgreSQL index names are per schema; drop by name");
+                    return no(self.pick(
+                        "DROP INDEX … ON table: PostgreSQL index names are per schema; drop by name",
+                        "DROP INDEX … ON table: Db2 for i index names are per schema; drop by name",
+                    ));
+                }
+                if self.db2() && w(2) == "IF" {
+                    return no("DROP … IF EXISTS: not checked for Db2 for i; test for the object in QSYS2 (for example QSYS2.SYSTABLES) first");
                 }
                 self.expr(&ts)
             }
+            "TRUNCATE" if self.db2() => {
+                self.note(Status::Assumptions, "ASM-DB2-TRUNCATE", "TRUNCATE TABLE gets RESTART IDENTITY, since T-SQL resets the identity seed. Not checked on a real system: whether Db2 for i can roll a TRUNCATE back as T-SQL can (IMMEDIATE certainly cannot).");
+                format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
+            }
             "TRUNCATE" => self.expr(&ts),
-            "USE" => return no("USE: connect to the other database instead; PostgreSQL cannot switch databases in a session"),
+            "USE" => return no(self.pick(
+                "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
+                "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
+            )),
             _ => return no("no rule for this statement yet"),
         };
         let text = dedent(text.trim_end(), ind);
@@ -829,7 +1161,16 @@ impl Cx<'_> {
             let arg = *s.get(i + 1).ok_or(No("TOP without a count".into()))?;
             let (end, lim) = if ts[arg].k == L_PAREN {
                 let r = matching(&ts, arg).ok_or(No("unbalanced TOP".into()))?;
-                (r, format!("({})", self.expr(&ts[arg + 1..r]).trim()))
+                let inner = trimmed(&ts[arg + 1..r]);
+                if self.db2() {
+                    // FETCH FIRST takes a constant or a variable, not an expression.
+                    if inner.len() != 1 || !matches!(inner[0].k, NUMBER | VARIABLE) {
+                        return no("TOP (expression): Db2 for i FETCH FIRST takes a number or a variable; compute the count into a variable first");
+                    }
+                    (r, self.expr(inner).trim().to_string())
+                } else {
+                    (r, format!("({})", self.expr(inner).trim()))
+                }
             } else {
                 (arg, self.expr(&ts[arg..=arg]))
             };
@@ -874,7 +1215,10 @@ impl Cx<'_> {
         // INTO a new table.
         if let Some(into) = find_word(&ts, 0, "INTO") {
             if !ts[next_sig(&ts, into).unwrap_or(into)].s.starts_with('@') {
-                return no("SELECT … INTO new_table: use CREATE TABLE … AS SELECT");
+                return no(self.pick(
+                    "SELECT … INTO new_table: use CREATE TABLE … AS SELECT",
+                    "SELECT … INTO new_table: use CREATE TABLE … AS (SELECT …) WITH DATA",
+                ));
             }
         }
         // Assignment: SELECT @a = e, @b = f [FROM …]
@@ -901,21 +1245,28 @@ impl Cx<'_> {
                 exprs.push(self.expr(&t[eq + 1..]).trim().to_string());
             }
             if from.is_none() && limit.is_none() {
+                let db2 = self.db2();
                 return Ok((
                     targets
                         .iter()
                         .zip(&exprs)
-                        .map(|(t, e)| format!("{t} := {e};"))
+                        .map(|(t, e)| {
+                            if db2 {
+                                format!("SET {t} = {e};")
+                            } else {
+                                format!("{t} := {e};")
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join("\n"),
                     true,
                 ));
             }
-            self.note(
-                Status::Assumptions,
-                "ASM-SELECT-ASSIGN-CARDINALITY",
+            let text = self.pick(
                 "The query returns at most one row. With several rows T-SQL keeps the last row's values and PostgreSQL the first; with none T-SQL keeps the old values and PostgreSQL sets NULL.",
-            );
+                "The query returns at most one row. With several rows T-SQL keeps the last row's values and Db2 for i raises SQLSTATE 21000; with none both keep the old values (Db2 signals NOT FOUND, a warning that does not stop the routine).",
+            ).to_string();
+            self.note(Status::Assumptions, "ASM-SELECT-ASSIGN-CARDINALITY", &text);
             let rest: Vec<T> = ts[list_end..]
                 .iter()
                 .enumerate()
@@ -929,35 +1280,75 @@ impl Cx<'_> {
                 self.expr(&rest).trim()
             );
             if let Some(l) = limit {
-                q.push_str(&format!(" LIMIT {l}"));
+                q.push_str(&self.limit(&l, " "));
             }
             return Ok((q.trim_end().to_string(), true));
         }
-        let kept: Vec<T> = ts
+        let mut kept: Vec<T> = ts
             .iter()
             .enumerate()
             .filter(|(k, _)| !cut.contains(k))
             .map(|(_, t)| t.clone())
             .collect();
+        if self.db2() {
+            kept = dummy_from(&kept, true);
+        }
         let mut q = self.expr(&kept).trim_end().to_string();
         if let Some(l) = limit {
-            q.push_str(&format!("\nLIMIT {l}"));
+            q.push_str(&self.limit(&l, "\n"));
         }
         Ok((q, false))
+    }
+
+    /// The row limit clause that replaces TOP.
+    fn limit(&self, n: &str, sep: &str) -> String {
+        if self.db2() {
+            format!("{sep}FETCH FIRST {n} ROWS ONLY")
+        } else {
+            format!("{sep}LIMIT {n}")
+        }
+    }
+
+    /// Db2: a result set of a procedure becomes a cursor WITH RETURN, declared
+    /// with the variables and opened where the query stood.
+    fn result_set(&mut self, n: &SyntaxNode, q: &str) -> String {
+        let name = format!("result_{}", self.cursors.len() + 1);
+        self.note(
+            Status::Assumptions,
+            "ASM-DB2-RESULT-SET",
+            "The result set becomes an INSENSITIVE cursor WITH RETURN TO CLIENT, opened here: its rows are fixed when it is opened, as T-SQL sends them here, and the procedure declares DYNAMIC RESULT SETS. Callers must read the result sets of the CALL; a caller that inserts them (INSERT … EXEC) has no Db2 equivalent.",
+        );
+        if q.to_ascii_uppercase().contains("SESSION.") {
+            self.note(Status::Assumptions, "ASM-DB2-SESSION-RUNTIME", "The cursor reads a global temporary table that the procedure declares later on: assumes Db2 for i resolves SESSION tables when the cursor is opened, not when the procedure is created (not in the verified vendor facts).");
+        }
+        let notes = self.take_notes();
+        let q = dedent(q.trim_end(), column(self.src, Self::range(n).0));
+        let q: String = q.lines().map(|l| format!("  {l}\n")).collect();
+        self.cursors.push(Decl {
+            src: Self::range(n),
+            lines: vec![format!(
+                "DECLARE {name} INSENSITIVE CURSOR WITH RETURN TO CLIENT FOR\n{};",
+                q.trim_end()
+            )],
+            notes,
+        });
+        format!("OPEN {name};")
     }
 
     fn dml(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
         if find_word(&ts, 0, "OUTPUT").is_some() {
-            return no(
+            return no(self.pick(
                 "OUTPUT clause: use RETURNING (inserted.x → the new row, deleted.x needs a CTE)",
-            );
+                "OUTPUT clause: use SELECT … FROM FINAL TABLE (INSERT …) or OLD TABLE (DELETE …)",
+            ));
         }
         if ts[s[1]].is("TOP") {
-            return no(
+            return no(self.pick(
                 "TOP in INSERT/UPDATE/DELETE: restrict the rows with a key subquery and LIMIT",
-            );
+                "TOP in INSERT/UPDATE/DELETE: restrict the rows with a key subquery and FETCH FIRST",
+            ));
         }
         if find_word(&ts, 0, "EXEC").is_some() || find_word(&ts, 0, "EXECUTE").is_some() {
             return no("INSERT … EXEC");
@@ -969,22 +1360,29 @@ impl Cx<'_> {
             "UPDATE" => {
                 let set = find_word(&ts, 0, "SET").unwrap_or(0);
                 if find_word(&ts, set, "FROM").is_some() {
-                    return no("UPDATE … FROM with a join: PostgreSQL's UPDATE … FROM must not repeat the target, and with several matching rows both pick one unpredictably; needs a rewrite");
+                    return no(self.pick(
+                        "UPDATE … FROM with a join: PostgreSQL's UPDATE … FROM must not repeat the target, and with several matching rows both pick one unpredictably; needs a rewrite",
+                        "UPDATE … FROM with a join: Db2 for i needs a correlated subquery or MERGE, and with several matching rows T-SQL picks one unpredictably; needs a rewrite",
+                    ));
                 }
                 from = s[0];
             }
             "DELETE" => {
                 if !ts[s[1]].is("FROM") {
                     if find_word(&ts, s[1], "FROM").is_some() {
-                        return no("DELETE t FROM … JOIN: rewrite with USING or a key subquery");
+                        return no(self.pick(
+                            "DELETE t FROM … JOIN: rewrite with USING or a key subquery",
+                            "DELETE t FROM … JOIN: rewrite with EXISTS or a key subquery",
+                        ));
                     }
                     pre = "DELETE FROM ".into();
                 } else {
                     let first_from = s[1];
                     if find_word(&ts, first_from + 1, "FROM").is_some() {
-                        return no(
+                        return no(self.pick(
                             "DELETE FROM t FROM … JOIN: rewrite with USING or a key subquery",
-                        );
+                            "DELETE FROM t FROM … JOIN: rewrite with EXISTS or a key subquery",
+                        ));
                     }
                     from = s[0];
                 }
@@ -1005,21 +1403,31 @@ impl Cx<'_> {
             let op = &ts[*s.get(2).ok_or(No("SET without a value".into()))?];
             let target = self.var_ref(&a.s);
             let rhs = self.expr(&ts[s[3]..]).trim().to_string();
+            let assign = |v: String| {
+                if self.db2() {
+                    format!("SET {target} = {v}")
+                } else {
+                    format!("{target} := {v}")
+                }
+            };
             return match op.s.as_str() {
-                "=" => Ok(format!("{target} := {rhs}")),
+                "=" => Ok(assign(rhs)),
                 "+=" | "-=" | "*=" | "/=" => {
                     let o = if op.s == "+=" && self.is_string_var(&a.s) {
                         "||".to_string()
                     } else {
                         op.s[..1].to_string()
                     };
-                    Ok(format!("{target} := {target} {o} {rhs}"))
+                    Ok(assign(format!("{target} {o} {rhs}")))
                 }
                 _ => no("compound assignment operator"),
             };
         }
         let opt = a.up();
         let val = s.get(2).map(|&j| ts[j].up()).unwrap_or_default();
+        if self.db2() {
+            return self.set_option_db2(&ts, &opt, &val);
+        }
         match (opt.as_str(), val.as_str()) {
             ("NOCOUNT", _) => Ok(format!("-- SET NOCOUNT {val}: no PostgreSQL equivalent needed")),
             ("XACT_ABORT", "ON") => {
@@ -1040,11 +1448,108 @@ impl Cx<'_> {
         }
     }
 
+    /// Db2: T-SQL's MERGE is close to Db2 for i's; what Db2 lacks is refused.
+    fn merge_db2(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        if ts
+            .iter()
+            .any(|t| t.is("OUTPUT") || t.s.eq_ignore_ascii_case("$action"))
+        {
+            return no("MERGE … OUTPUT: use SELECT … FROM FINAL TABLE around separate statements; Db2 for i MERGE has no OUTPUT");
+        }
+        if s.get(1).is_some_and(|&j| ts[j].is("TOP")) {
+            return no("MERGE TOP (n): restrict the source rows instead");
+        }
+        let mut kept = Vec::new();
+        let mut k = 0;
+        while k < ts.len() {
+            let t = &ts[k];
+            if t.is("BY") {
+                match next_sig(&ts, k).map(|j| ts[j].up()).as_deref() {
+                    Some("SOURCE") => return no("WHEN NOT MATCHED BY SOURCE: Db2 for i MERGE has only WHEN NOT MATCHED (fact V1); delete the unmatched target rows in a separate DELETE … WHERE NOT EXISTS, which is no longer atomic with the MERGE"),
+                    Some("TARGET") => {
+                        // WHEN NOT MATCHED BY TARGET = WHEN NOT MATCHED; drop "BY TARGET".
+                        let j = next_sig(&ts, k).unwrap();
+                        while kept.last().is_some_and(|x: &T| !x.sig()) {
+                            kept.pop();
+                        }
+                        k = j + 1;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            kept.push(t.clone());
+            if k == s[0] && !s.get(1).is_some_and(|&j| ts[j].is("INTO")) {
+                kept.push(T {
+                    k: WHITESPACE,
+                    s: " ".into(),
+                });
+                kept.push(T {
+                    k: IDENT,
+                    s: "INTO".into(),
+                });
+            }
+            k += 1;
+        }
+        if self.mode == Mode::Proc {
+            self.note(Status::Converted, "db2.merge", "MERGE is kept: in the procedure (compiled with *CS) it is atomic, as in T-SQL. Db2 for i honours ATOMIC only under commitment control (fact V2).");
+        } else {
+            self.note(Status::Assumptions, "ASM-FACT-V2", "MERGE is atomic only under commitment control: under *NONE, rows changed before an error stay changed (fact V2). Assumes the script runs with a commit level other than *NONE.");
+        }
+        Ok(self.expr(&kept))
+    }
+
+    /// Db2: T-SQL session options.
+    fn set_option_db2(&mut self, ts: &[T], opt: &str, val: &str) -> R<String> {
+        match (opt, val) {
+            ("NOCOUNT", _) => Ok(format!("-- SET NOCOUNT {val}: no Db2 for i equivalent needed")),
+            ("XACT_ABORT", "ON") if self.mode == Mode::Top => self.misplaced("SET XACT_ABORT ON in a plain script: Db2 for i has no session switch for it; put the statements in a procedure or compound statement, where it becomes an EXIT handler"),
+            ("XACT_ABORT", "ON") if self.seen_work => no("SET XACT_ABORT ON after other statements: a Db2 handler covers the whole compound statement; move the SET to the top, or wrap the statements after it in their own BEGIN … END"),
+            ("XACT_ABORT", "ON") => {
+                self.xact_abort = true;
+                self.note(Status::Converted, "db2.xact-abort", "SET XACT_ABORT ON becomes an EXIT handler at the top (ROLLBACK; RESIGNAL;): any error rolls back the unit of work and ends the routine with that error, as XACT_ABORT ON does.");
+                if self.mode == Mode::Do {
+                    self.script_commit_note();
+                }
+                Ok("-- SET XACT_ABORT ON: see the EXIT handler at the top".into())
+            }
+            ("XACT_ABORT", _) => no("XACT_ABORT OFF: a Db2 for i routine stops at an unhandled error; continuing after it needs a CONTINUE handler around the statements that may fail"),
+            ("ANSI_NULLS" | "QUOTED_IDENTIFIER" | "ANSI_PADDING" | "ANSI_WARNINGS" | "ARITHABORT" | "CONCAT_NULL_YIELDS_NULL", "ON") => {
+                Ok(format!("-- SET {opt} ON: Db2 for i always behaves this way"))
+            }
+            ("TRANSACTION", _) if self.mode == Mode::Top => {
+                if ts.iter().any(|t| t.is("SNAPSHOT")) {
+                    return no("SNAPSHOT isolation: Db2 for i has no row versioning; readers wait for writers (or use *CHG to read uncommitted rows)");
+                }
+                self.note(Status::Assumptions, "ASM-DB2-ISOLATION", "Db2 for i maps the ISO level names to its commit levels: READ UNCOMMITTED = *CHG, READ COMMITTED = *CS, REPEATABLE READ = *ALL, SERIALIZABLE = *RR. Readers and writers block each other at slightly different points than in T-SQL.");
+                Ok(self.expr(ts))
+            }
+            _ => no(format!("SET {opt}: no rule for this session option")),
+        }
+    }
+
+    /// Db2: transaction statements in a script depend on the job's commit level.
+    fn script_commit_note(&mut self) {
+        self.note(Status::Assumptions, "ASM-DB2-SCRIPT-COMMIT", "The script runs under commitment control (for example RUNSQLSTM COMMIT(*CS), or a connection with autocommit off). Under *NONE COMMIT and ROLLBACK do nothing and every statement is final at once (facts V4, V5; V4 not checked on a real system).");
+    }
+
     fn declare(&mut self, ts: &[T], n: &SyntaxNode) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
         if s.len() > 2 && (ts[s[2]].is("CURSOR") || ts[s[1]].is("CURSOR")) {
-            return no("cursors: declare a PL/pgSQL cursor (or use a FOR loop over the query)");
+            return no(self.pick(
+                "cursors: declare a PL/pgSQL cursor (or use a FOR loop over the query)",
+                "cursors: declare an SQL PL cursor (or use a FOR loop over the query)",
+            ));
+        }
+        if self.db2()
+            && s.len() > 2
+            && (ts[s[2]].is("TABLE")
+                || ts[s[2]].is("AS") && s.get(3).is_some_and(|&j| ts[j].is("TABLE")))
+        {
+            return self.table_variable(&ts);
         }
         let mut lines = Vec::new();
         let mut pending = Vec::new(); // (variable, initialiser tokens)
@@ -1059,7 +1564,10 @@ impl Cx<'_> {
             }
             let it2: Vec<T> = it[j..].iter().filter(|t| t.sig()).cloned().collect();
             if it2.first().is_some_and(|t| t.is("TABLE")) {
-                return no("table variables: use a temporary table (note: it does not survive ROLLBACK the way a table variable does)");
+                return no(self.pick(
+                    "table variables: use a temporary table (note: it does not survive ROLLBACK the way a table variable does)",
+                    "table variables: declare one table variable per DECLARE",
+                ));
             }
             let eq = it.iter().position(|t| t.k == OP && t.s == "=");
             let (ty, string, numeric) = self.ty(&it[j..eq.unwrap_or(it.len())])?;
@@ -1072,7 +1580,11 @@ impl Cx<'_> {
                     numeric,
                 },
             );
-            lines.push(format!("{name} {ty};"));
+            lines.push(if self.db2() {
+                format!("DECLARE {name} {ty};")
+            } else {
+                format!("{name} {ty};")
+            });
             if let Some(eq) = eq {
                 pending.push((name, it[eq + 1..].to_vec()));
             }
@@ -1085,22 +1597,61 @@ impl Cx<'_> {
             lines,
             notes,
         });
+        let db2 = self.db2();
         let inits: Vec<String> = pending
             .iter()
-            .map(|(name, init)| format!("{name} := {};", self.expr(init).trim()))
+            .map(|(name, init)| {
+                let v = self.expr(init).trim().to_string();
+                if db2 {
+                    format!("SET {name} = {v};")
+                } else {
+                    format!("{name} := {v};")
+                }
+            })
             .collect();
         if inits.is_empty() {
             Ok(format!(
-                "-- DECLARE {}: moved to the DECLARE section",
+                "-- DECLARE {}: moved to the {}",
                 split_commas(&ts[s[1]..])
                     .iter()
                     .filter_map(|it| trimmed(it).first().map(|t| t.s.clone()))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                self.pick("DECLARE section", "top of the block")
             ))
         } else {
             Ok(inits.join("\n"))
         }
+    }
+
+    /// Db2: `DECLARE @t TABLE (…)` becomes a NOT LOGGED global temporary
+    /// table that keeps its rows on rollback, as a table variable does (V16).
+    fn table_variable(&mut self, ts: &[T]) -> R<String> {
+        let s = sig(ts);
+        let v = &ts[s[1]];
+        if v.k != VARIABLE || split_commas(&ts[s[1]..]).len() != 1 {
+            return no("DECLARE form not understood");
+        }
+        let open = (s[2]..ts.len())
+            .find(|&j| ts[j].k == L_PAREN)
+            .ok_or(No("table variable without columns".into()))?;
+        let close = matching(ts, open).ok_or(No("unbalanced parentheses".into()))?;
+        if trimmed(&ts[close + 1..]).iter().any(|t| t.sig()) {
+            return no("table variable options after the column list");
+        }
+        let name = format!("tv_{}", snake(&v.s[1..]));
+        let mut cols = Vec::new();
+        let pk = primary_key_columns(&ts[open + 1..close]);
+        for item in split_commas(&ts[open + 1..close]) {
+            cols.push(self.table_item(item, &pk)?);
+        }
+        self.tables
+            .insert(v.s[1..].to_ascii_lowercase(), format!("SESSION.{name}"));
+        self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again.");
+        Ok(format!(
+            "DECLARE GLOBAL TEMPORARY TABLE SESSION.{name} ({}\n) ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE",
+            cols.join(",")
+        ))
     }
 
     fn ret(&mut self, ts: &[T]) -> R<String> {
@@ -1109,6 +1660,11 @@ impl Cx<'_> {
         let val = s.get(1).map(|&j| self.expr(&ts[j..]).trim().to_string());
         match (self.mode, val) {
             (Mode::Func, Some(v)) => Ok(format!("RETURN {v}")),
+            (Mode::Proc, Some(v)) if self.db2() => {
+                self.return_code = true;
+                Ok(format!("RETURN {v}"))
+            }
+            (Mode::Do, _) if self.db2() => self.misplaced("RETURN in a script: a Db2 for i compound statement cannot return; put a label on the block and LEAVE it"),
             (Mode::Proc, Some(v)) => {
                 self.return_code = true;
                 Ok(format!("return_code := {v};\nRETURN;"))
@@ -1124,7 +1680,7 @@ impl Cx<'_> {
         let s = sig(&ts);
         if s.len() == 1 {
             if self.in_catch {
-                return Ok("RAISE".into());
+                return Ok(self.pick("RAISE", "RESIGNAL").into());
             }
             return self.misplaced("THROW without arguments outside CATCH");
         }
@@ -1133,6 +1689,14 @@ impl Cx<'_> {
             return no("THROW form not understood");
         }
         let msg = self.expr(args[1]).trim().to_string();
+        if self.db2() {
+            self.note(
+                Status::Assumptions,
+                "ASM-THROW-ERRCODE",
+                "The T-SQL error number is not carried over: callers see SQLSTATE 75000 with the same message text.",
+            );
+            return Ok(format!("SIGNAL SQLSTATE '75000' SET MESSAGE_TEXT = {msg}"));
+        }
         self.note(
             Status::Assumptions,
             "ASM-THROW-ERRCODE",
@@ -1143,7 +1707,30 @@ impl Cx<'_> {
         ))
     }
 
-    fn txn(&mut self, kw: &str) -> R<String> {
+    fn txn(&mut self, kw: &str, ts: &[T]) -> R<String> {
+        // A name after TRAN/TRANSACTION/WORK: a transaction or savepoint name.
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let name = s
+            .iter()
+            .position(|&j| ts[j].is("TRAN") || ts[j].is("TRANSACTION") || ts[j].is("WORK"))
+            .and_then(|k| s.get(k + 1))
+            .map(|&j| ts[j].s.to_ascii_lowercase());
+        if kw == "ROLLBACK" {
+            if let Some(n) = &name {
+                if !self.db2() || !self.savepoints.contains(n) {
+                    return no("ROLLBACK TRANSACTION name: rolls back to a savepoint or the named outer transaction; needs a rewrite");
+                }
+                if self.mode == Mode::Func {
+                    return self.misplaced("transaction control inside a function");
+                }
+                self.savepoint_note();
+                return Ok(format!("ROLLBACK TO SAVEPOINT {n}"));
+            }
+        }
+        if self.db2() {
+            return self.txn_db2(kw);
+        }
         match self.mode {
             Mode::Top => {
                 if kw == "BEGIN" {
@@ -1171,6 +1758,59 @@ impl Cx<'_> {
         }
     }
 
+    /// Db2: transaction control. Under commitment control a unit of work is
+    /// always open, so BEGIN TRAN has no statement of its own.
+    fn txn_db2(&mut self, kw: &str) -> R<String> {
+        match self.mode {
+            Mode::Func => {
+                self.misplaced("transaction control inside a function is not allowed in Db2 for i")
+            }
+            Mode::Top => {
+                self.script_commit_note();
+                if kw == "BEGIN" {
+                    return Ok("-- BEGIN TRANSACTION: a unit of work is always open under commitment control".into());
+                }
+                Ok(kw.to_string())
+            }
+            Mode::Proc | Mode::Do => {
+                if self.mode == Mode::Do {
+                    self.script_commit_note();
+                }
+                self.note(Status::Decision, "db2.proc-transaction", "Under commitment control a unit of work is always open: BEGIN TRAN is dropped, and transactions do not nest (no @@TRANCOUNT). A COMMIT or ROLLBACK here ends the caller's unit of work too, where T-SQL's inner COMMIT only decrements @@TRANCOUNT.");
+                if kw == "BEGIN" {
+                    return Ok("-- BEGIN TRANSACTION: implicit under commitment control".into());
+                }
+                Ok(kw.to_string())
+            }
+        }
+    }
+
+    fn savepoint_note(&mut self) {
+        self.note(Status::Assumptions, "ASM-FACT-V14", "Savepoints need commitment control (procedures are compiled with *CS) and cannot be reached across the boundary of an ATOMIC block (fact V14, only partly verified).");
+    }
+
+    /// Db2: `SAVE TRAN name` → `SAVEPOINT name`.
+    fn save(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let Some(&j) = s.get(2) else {
+            return no("SAVE TRANSACTION without a name");
+        };
+        if s.len() != 3 || ts[j].k == VARIABLE {
+            return no("SAVE TRANSACTION with a variable name");
+        }
+        if self.mode == Mode::Func {
+            return self.misplaced("transaction control inside a function");
+        }
+        if self.mode == Mode::Top {
+            self.script_commit_note();
+        }
+        let name = ts[j].s.to_ascii_lowercase();
+        self.savepoints.push(name.clone());
+        self.savepoint_note();
+        Ok(format!("SAVEPOINT {name} ON ROLLBACK RETAIN CURSORS"))
+    }
+
     fn exec(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
@@ -1194,7 +1834,10 @@ impl Cx<'_> {
         if raw_name.rsplit('.').next().is_some_and(|n| {
             n.to_ascii_lowercase().starts_with("sp_") || n.to_ascii_lowercase().starts_with("xp_")
         }) {
-            return no("system procedures have no PostgreSQL equivalent");
+            return no(format!(
+                "system procedures have no {} equivalent",
+                self.to.display_name()
+            ));
         }
         let name = self.expr(&ts[s[1]..name_end]).trim().to_string();
         let mut args = Vec::new();
@@ -1226,13 +1869,22 @@ impl Cx<'_> {
             "TABLE" => self.create_table(&ts),
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => {
                 let ts = self.strip_storage(&ts);
+                if self.db2() {
+                    if let Some(w) = ts.iter().find(|t| t.is("INCLUDE") || t.is("WHERE")) {
+                        return no(format!("index with {}: not checked for Db2 for i; create a plain index (or an encoded vector or derived-key index) after review", w.up()));
+                    }
+                }
                 let kept: Vec<T> = ts
                     .iter()
                     .filter(|t| !(t.is("CLUSTERED") || t.is("NONCLUSTERED")))
                     .cloned()
                     .collect();
                 if ts.iter().any(|t| t.is("CLUSTERED")) {
-                    self.note(Status::Assumptions, "ASM-CLUSTERED", "PostgreSQL has no clustered indexes: this becomes a plain index (CLUSTER can reorder the table once). Results are the same; performance may differ.");
+                    let text = self.pick(
+                        "PostgreSQL has no clustered indexes: this becomes a plain index (CLUSTER can reorder the table once). Results are the same; performance may differ.",
+                        "Db2 for i has no clustered indexes: this becomes a plain index. Results are the same; performance may differ.",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-CLUSTERED", &text);
                 }
                 Ok(collapse_spaces(&self.expr(&kept)))
             }
@@ -1292,10 +1944,23 @@ impl Cx<'_> {
         let temp = name_t.iter().any(|t| t.s.starts_with('#'));
         let name = self.expr(&name_t).trim().to_string();
         let mut cols = Vec::new();
+        let pk = if self.db2() {
+            primary_key_columns(&ts[open + 1..close])
+        } else {
+            Vec::new()
+        };
         for item in split_commas(&ts[open + 1..close]) {
-            cols.push(self.table_item(item)?);
+            cols.push(self.table_item(item, &pk)?);
         }
         let tail = self.expr(&ts[close + 1..]);
+        if temp && self.db2() {
+            // LOGGED: a rollback undoes the rows, as for a #temp table.
+            return Ok(format!(
+                "DECLARE GLOBAL TEMPORARY TABLE {name} ({}\n) ON COMMIT PRESERVE ROWS LOGGED WITH REPLACE{}",
+                cols.join(","),
+                tail.trim_end()
+            ));
+        }
         Ok(format!(
             "CREATE {}TABLE {name} ({}\n){}",
             if temp { "TEMP " } else { "" },
@@ -1305,7 +1970,8 @@ impl Cx<'_> {
     }
 
     /// One column definition or table constraint, keeping its leading layout.
-    fn table_item(&mut self, item: &[T]) -> R<String> {
+    /// `pk`: (Db2) columns of a table-level PRIMARY KEY, which Db2 wants NOT NULL.
+    fn table_item(&mut self, item: &[T], pk: &[String]) -> R<String> {
         let lead: String = item
             .iter()
             .take_while(|t| !t.sig())
@@ -1334,19 +2000,22 @@ impl Cx<'_> {
                 "inline INDEX in CREATE TABLE: create the index with a separate CREATE INDEX",
             );
         }
-        Ok(format!("{lead}{}", self.column_def(it)?))
+        let pk_col = pk.contains(&tsql_unquote(&first.s).to_ascii_lowercase());
+        Ok(format!("{lead}{}", self.column_def(it, pk_col)?))
     }
 
-    fn column_def(&mut self, it: &[T]) -> R<String> {
+    /// `pk_col`: (Db2) the column is in a table-level PRIMARY KEY.
+    fn column_def(&mut self, it: &[T], pk_col: bool) -> R<String> {
         let s = sig(it);
         let name = self.expr(&it[s[0]..=s[0]]);
         let Some(&ty_at) = s.get(1) else {
             return no("column without a type");
         };
         if it[ty_at].is("AS") {
-            return no(
+            return no(self.pick(
                 "computed column: use GENERATED ALWAYS AS (…) STORED after checking the expression",
-            );
+                "computed column: Db2 for i has no generated expression columns; use a view or a trigger",
+            ));
         }
         let ty_end = if next_sig(it, ty_at).is_some_and(|j| it[j].k == L_PAREN) {
             matching(it, next_sig(it, ty_at).unwrap()).ok_or(No("unbalanced type".into()))?
@@ -1383,12 +2052,57 @@ impl Cx<'_> {
                 continue;
             }
             if t.is("COLLATE") {
-                return no("column COLLATE: choose a PostgreSQL collation (a nondeterministic ICU collation for case-insensitive)");
+                return no(self.pick(
+                    "column COLLATE: choose a PostgreSQL collation (a nondeterministic ICU collation for case-insensitive)",
+                    "column COLLATE: Db2 for i compares by the program's sort sequence (SRTSEQ), not per column",
+                ));
+            }
+            if t.is("DEFAULT") && self.db2() {
+                // Db2 defaults are constants or special registers, unparenthesised.
+                let v = next_sig(it, j).ok_or(No("DEFAULT without a value".into()))?;
+                let call = next_sig(it, v).filter(|&p| it[v].k == IDENT && it[p].k == L_PAREN);
+                let end = match call {
+                    Some(p) => matching(it, p).ok_or(No("unbalanced DEFAULT".into()))?,
+                    None if it[v].k == L_PAREN => {
+                        matching(it, v).ok_or(No("unbalanced DEFAULT".into()))?
+                    }
+                    None => v,
+                };
+                let mut inner = trimmed(&it[v..=end]);
+                while inner.len() > 2
+                    && inner[0].k == L_PAREN
+                    && matching(inner, 0) == Some(inner.len() - 1)
+                {
+                    inner = trimmed(&inner[1..inner.len() - 1]);
+                }
+                let val = self.expr(inner).trim().to_string();
+                let constant = match inner {
+                    [x] => matches!(x.k, NUMBER | STRING) || x.is("NULL"),
+                    [m, x] => m.k == OP && m.s == "-" && x.k == NUMBER,
+                    _ => false,
+                };
+                if !constant && val != "CURRENT TIMESTAMP" {
+                    return no(format!("column DEFAULT {val}: Db2 for i defaults must be constants or special registers such as CURRENT TIMESTAMP; set the value in the INSERT or with a trigger"));
+                }
+                // Already converted: a token the expression walk copies as is.
+                rest.push(T {
+                    s: format!("DEFAULT {val}"),
+                    k: NUMBER,
+                });
+                j = end + 1;
+                continue;
             }
             rest.push(t.clone());
             j += 1;
         }
         let mut rest = collapse_spaces(&self.expr(&rest));
+        if self.db2()
+            && (pk_col || rest.to_ascii_uppercase().contains("PRIMARY KEY"))
+            && !rest.to_ascii_uppercase().contains("NOT NULL")
+        {
+            // T-SQL makes primary key columns NOT NULL; Db2 wants it written.
+            rest = format!("NOT NULL {}", rest.trim());
+        }
         if ty == "boolean" {
             for (from, to) in [
                 ("((1))", "TRUE"),
@@ -1412,7 +2126,10 @@ impl Cx<'_> {
         let ts = Self::body_toks(ts);
         let first = sig(&ts)[0];
         if find_word(&ts, first + 1, "ALTER").is_some() {
-            return no("ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions");
+            return no(self.pick(
+                "ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions",
+                "ALTER COLUMN: Db2 for i uses ALTER COLUMN … SET DATA TYPE / SET NOT NULL as separate actions",
+            ));
         }
         if let Some(add) = find_word(&ts, 0, "ADD") {
             let nx = next_sig(&ts, add).ok_or(No("ADD without a column".into()))?;
@@ -1426,15 +2143,17 @@ impl Cx<'_> {
             let cols: R<Vec<String>> = split_commas(&ts[nx..])
                 .iter()
                 .map(|c| {
-                    self.column_def(trimmed(c))
+                    self.column_def(trimmed(c), false)
                         .map(|d| format!("ADD COLUMN {d}"))
                 })
                 .collect();
+            // Db2 lists several alterations without commas.
+            let sep = self.pick(", ", " ");
             let head = head
                 .trim_end()
                 .trim_end_matches(|c: char| c.is_ascii_alphabetic())
                 .trim_end();
-            return Ok(format!("{head} {}", cols?.join(", ")));
+            return Ok(format!("{head} {}", cols?.join(sep)));
         }
         Ok(self.expr(&ts))
     }
@@ -1450,12 +2169,17 @@ impl Cx<'_> {
     fn var_ref(&mut self, v: &str) -> String {
         if v.starts_with("@@") {
             let up = v.to_ascii_uppercase();
-            let reason = match up.as_str() {
-                "@@ROWCOUNT" => "@@ROWCOUNT: use GET DIAGNOSTICS n = ROW_COUNT right after the statement (or FOUND)",
-                "@@ERROR" => "@@ERROR: PostgreSQL stops at the error instead; use BEGIN … EXCEPTION",
-                "@@TRANCOUNT" => "@@TRANCOUNT: PostgreSQL transactions do not nest",
-                "@@IDENTITY" => "@@IDENTITY: use INSERT … RETURNING",
-                _ => "T-SQL global variable with no PostgreSQL equivalent",
+            let reason = match (up.as_str(), self.db2()) {
+                ("@@ROWCOUNT", false) => "@@ROWCOUNT: use GET DIAGNOSTICS n = ROW_COUNT right after the statement (or FOUND)",
+                ("@@ROWCOUNT", true) => "@@ROWCOUNT: use GET DIAGNOSTICS n = ROW_COUNT right after the statement",
+                ("@@ERROR", false) => "@@ERROR: PostgreSQL stops at the error instead; use BEGIN … EXCEPTION",
+                ("@@ERROR", true) => "@@ERROR: a Db2 for i routine stops at the error instead; use a handler",
+                ("@@TRANCOUNT", false) => "@@TRANCOUNT: PostgreSQL transactions do not nest",
+                ("@@TRANCOUNT", true) => "@@TRANCOUNT: Db2 for i transactions do not nest",
+                ("@@IDENTITY", false) => "@@IDENTITY: use INSERT … RETURNING",
+                ("@@IDENTITY", true) => "@@IDENTITY: use IDENTITY_VAL_LOCAL() or SELECT … FROM FINAL TABLE (INSERT …)",
+                (_, false) => "T-SQL global variable with no PostgreSQL equivalent",
+                (_, true) => "T-SQL global variable with no Db2 for i equivalent",
             };
             self.note(
                 Status::NotConverted,
@@ -1466,6 +2190,12 @@ impl Cx<'_> {
         }
         if let Some(name) = self.declared(v) {
             return name;
+        }
+        if let Some(t) = self
+            .tables
+            .get(&v.trim_start_matches('@').to_ascii_lowercase())
+        {
+            return t.clone();
         }
         self.note(Status::Assumptions, "ASM-UNDECLARED-VAR", UNDECLARED);
         undeclared_name(v)
@@ -1527,7 +2257,11 @@ impl Cx<'_> {
                     let up = t.up();
                     let nx = next_sig(ts, i);
                     if up == "DBO" && nx.is_some_and(|d| ts[d].k == DOT) {
-                        self.note(Status::Assumptions, "ASM-DBO-SCHEMA", "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).");
+                        let text = self.pick(
+                            "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+                            "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+                        ).to_string();
+                        self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
                         i = nx.unwrap() + 1;
                         continue;
                     }
@@ -1564,12 +2298,16 @@ impl Cx<'_> {
                         self.string_compare(ts, i);
                     } else if let Some(rest) = t.s.strip_prefix('#') {
                         if rest.starts_with('#') {
-                            self.note(
-                                Status::NotConverted,
-                                "tsql.global-temp",
-                                "Global temporary tables (##t) have no PostgreSQL equivalent.",
+                            let text = format!(
+                                "Global temporary tables (##t) have no {} equivalent.",
+                                self.to.display_name()
                             );
+                            self.note(Status::NotConverted, "tsql.global-temp", &text);
                             o.push_str(&t.s);
+                        } else if self.db2() {
+                            self.note(Status::Assumptions, "ASM-TEMP-TABLE", "#temp tables become declared global temporary tables (SESSION.name, in QTEMP), LOGGED so a rollback undoes their changes as for #temp, with ON COMMIT PRESERVE ROWS. They live until the job ends (T-SQL drops them when the creating procedure ends); WITH REPLACE lets a second run in the same job recreate them.");
+                            o.push_str("SESSION.");
+                            o.push_str(rest);
                         } else {
                             self.note(Status::Assumptions, "ASM-TEMP-TABLE", "#temp tables become TEMP tables: they live until the session ends (T-SQL drops them when the creating procedure ends), so a second CREATE in the same session fails.");
                             o.push_str(rest);
@@ -1595,14 +2333,23 @@ impl Cx<'_> {
         }
         let x = self.expr(a[0]).trim().to_string();
         let sep = self.expr(a[1]).trim().to_string();
+        if self.db2() {
+            self.note(Status::Assumptions, "ASM-LISTAGG", "STRING_AGG becomes LISTAGG, whose result has a maximum length (it raises an error when the list is longer) where STRING_AGG over (N)VARCHAR(MAX) has none. Equal while the lists stay short; the Db2 for i limit was not checked.");
+        }
         let w = next_sig(ts, close).filter(|&j| ts[j].is("WITHIN"));
         let Some(w) = w else {
-            return Some((format!("string_agg({x}, {sep})"), close));
+            return Some((
+                format!("{}({x}, {sep})", self.pick("string_agg", "LISTAGG")),
+                close,
+            ));
         };
         let g = next_sig(ts, w).filter(|&j| ts[j].is("GROUP"))?;
         let p = next_sig(ts, g).filter(|&j| ts[j].k == L_PAREN)?;
         let r = matching(ts, p)?;
         let order = self.expr(&ts[p + 1..r]).trim().to_string();
+        if self.db2() {
+            return Some((format!("LISTAGG({x}, {sep}) WITHIN GROUP ({order})"), r));
+        }
         Some((format!("string_agg({x}, {sep} {order})"), r))
     }
 
@@ -1622,8 +2369,16 @@ impl Cx<'_> {
                 || next_sig(ts, i).is_some_and(|n| is_cmp(&ts[n]))
         };
         if hit {
-            self.note(Status::Assumptions, "ASM-CI-COLLATION", "String comparison: T-SQL's default collation is case-insensitive and ignores trailing spaces; PostgreSQL compares case-sensitively. Equal only if the data's case is consistent (or use a case-insensitive collation).");
+            self.ci_note();
         }
+    }
+
+    fn ci_note(&mut self) {
+        let text = self.pick(
+            "String comparison: T-SQL's default collation is case-insensitive and ignores trailing spaces; PostgreSQL compares case-sensitively. Equal only if the data's case is consistent (or use a case-insensitive collation).",
+            "String comparison: T-SQL's default collation is case-insensitive; Db2 for i compares by the sort sequence, case-sensitively with the default *HEX. Both ignore trailing blanks (fact V8). Equal only if the data's case is consistent (or the routine uses SRTSEQ(*LANGIDSHR)).",
+        ).to_string();
+        self.note(Status::Assumptions, "ASM-CI-COLLATION", &text);
     }
 
     /// `WITH (NOLOCK)` and friends after a table name. Returns the closing paren.
@@ -1663,12 +2418,20 @@ impl Cx<'_> {
             return None;
         }
         if words.iter().any(|w| LOCKS.contains(&w.as_str())) {
-            self.note(Status::Decision, "tsql.lock-hint", "Lock hints were dropped. To keep the locking, add FOR UPDATE (UPDLOCK), FOR UPDATE SKIP LOCKED (READPAST) or a stricter isolation level (HOLDLOCK/SERIALIZABLE).");
+            let text = self.pick(
+                "Lock hints were dropped. To keep the locking, add FOR UPDATE (UPDLOCK), FOR UPDATE SKIP LOCKED (READPAST) or a stricter isolation level (HOLDLOCK/SERIALIZABLE).",
+                "Lock hints were dropped. To keep the locking, add FOR UPDATE (UPDLOCK), SKIP LOCKED DATA (READPAST), an isolation clause such as WITH RR (HOLDLOCK/SERIALIZABLE), or USE AND KEEP EXCLUSIVE LOCKS (its rules on SELECT INTO were not checked, fact V15).",
+            ).to_string();
+            self.note(Status::Decision, "tsql.lock-hint", &text);
         } else if words
             .iter()
             .any(|w| w == "NOLOCK" || w == "READUNCOMMITTED")
         {
-            self.note(Status::Assumptions, "ASM-NOLOCK", "NOLOCK was dropped: PostgreSQL never reads uncommitted rows. Results differ only while other transactions are writing.");
+            let text = self.pick(
+                "NOLOCK was dropped: PostgreSQL never reads uncommitted rows. Results differ only while other transactions are writing.",
+                "NOLOCK was dropped: under *CS only committed rows are read; add WITH UR to the query to read uncommitted rows as NOLOCK does. Results differ only while other transactions are writing.",
+            ).to_string();
+            self.note(Status::Assumptions, "ASM-NOLOCK", &text);
         } else {
             self.note(
                 Status::Converted,
@@ -1680,12 +2443,19 @@ impl Cx<'_> {
     }
 
     fn now(&mut self) -> String {
+        if self.db2() {
+            self.note(Status::Assumptions, "ASM-TIME-SOURCE", "Current time: both evaluate once per statement (fact V20), but Db2 for i uses the job's time zone where T-SQL uses the server clock. Equal if the job runs in the server's time zone. CURRENT TIMESTAMP has 6 fractional digits.");
+            return "CURRENT TIMESTAMP".into();
+        }
         self.note(Status::Assumptions, "ASM-TIME-SOURCE", "Current time: both use the statement start, but PostgreSQL uses the session time zone where T-SQL uses the server clock. Equal if the session time zone is the server's.");
         "statement_timestamp()::timestamp".into()
     }
 
     /// Built-in function rewrites. `None` keeps the call as written.
     fn func(&mut self, name: &str, args: &[T]) -> Option<String> {
+        if self.db2() {
+            return self.func_db2(name, args);
+        }
         let a = split_commas(args);
         let n = a.len();
         let e = |cx: &mut Self, k: usize| cx.expr(a[k]).trim().to_string();
@@ -1705,7 +2475,7 @@ impl Cx<'_> {
                 format!("octet_length({})", e(self, 0))
             }
             ("CHARINDEX", 2) => {
-                self.note(Status::Assumptions, "ASM-CI-COLLATION", "String comparison: T-SQL's default collation is case-insensitive and ignores trailing spaces; PostgreSQL compares case-sensitively. Equal only if the data's case is consistent (or use a case-insensitive collation).");
+                self.ci_note();
                 let (x, y) = (e(self, 0), e(self, 1));
                 format!("strpos({y}, {x})")
             }
@@ -1790,6 +2560,142 @@ impl Cx<'_> {
         })
     }
 
+    /// Db2 for i built-in rewrites. `None` keeps the call as written.
+    fn func_db2(&mut self, name: &str, args: &[T]) -> Option<String> {
+        let a = split_commas(args);
+        let n = a.len();
+        let e = |cx: &mut Self, k: usize| cx.expr(a[k]).trim().to_string();
+        Some(match (name, n) {
+            ("GETDATE" | "SYSDATETIME", 0) => self.now(),
+            ("GETUTCDATE" | "SYSUTCDATETIME", 0) => {
+                self.note(Status::Assumptions, "ASM-DB2-UTC", "UTC time becomes CURRENT TIMESTAMP - CURRENT TIMEZONE, using the job's current UTC offset; around a daylight-saving change the result can be off by the change. Db2 for i UTC helpers were not checked (fact V13).");
+                "(CURRENT TIMESTAMP - CURRENT TIMEZONE)".into()
+            }
+            ("ISNULL", 2) => {
+                self.note(Status::Assumptions, "ASM-ISNULL-TYPE", "ISNULL becomes COALESCE: ISNULL takes the type of its first argument (it can truncate), COALESCE the widest type. Equal unless the fallback is longer or wider than the first argument.");
+                let (x, y) = (e(self, 0), e(self, 1));
+                format!("COALESCE({x}, {y})")
+            }
+            ("LEN", 1) => {
+                self.note(Status::Assumptions, "ASM-DB2-LENGTH", "LEN becomes LENGTH(RTRIM(…)), which counts characters for single-byte and NVARCHAR (UTF-16) data but bytes for UTF-8 (CCSID 1208) columns.");
+                format!("LENGTH(RTRIM({}))", e(self, 0))
+            }
+            ("CHARINDEX", 2) => {
+                self.ci_note();
+                let (x, y) = (e(self, 0), e(self, 1));
+                format!("LOCATE({x}, {y})")
+            }
+            ("NEWID", 0) => {
+                self.note(Status::Assumptions, "ASM-UUID-TEXT", "NEWID() becomes GENERATE_UUID(): a version 4 UUID as CHAR(36) in upper case, as a uniqueidentifier reads when converted to text (fact V13). It is a string, so it compares case-sensitively. Needs IBM i 7.6, or 7.4/7.5 with the Technology Refresh that added it.");
+                "GENERATE_UUID()".into()
+            }
+            ("IIF", 3) => {
+                let (c, x, y) = (e(self, 0), e(self, 1), e(self, 2));
+                format!("(CASE WHEN {c} THEN {x} ELSE {y} END)")
+            }
+            ("REPLICATE", 2) => {
+                let (x, y) = (e(self, 0), e(self, 1));
+                format!("REPEAT({x}, {y})")
+            }
+            ("SCOPE_IDENTITY", 0) => {
+                self.note(Status::Assumptions, "ASM-IDENTITY-VAL-LOCAL", "SCOPE_IDENTITY() becomes IDENTITY_VAL_LOCAL(): both give the last identity value assigned at the same nesting level. Assumes the INSERT before it is a single-row INSERT … VALUES; after a multi-row INSERT the two may differ (not checked).");
+                "IDENTITY_VAL_LOCAL()".into()
+            }
+            ("ERROR_MESSAGE", 0) if self.in_catch => "v_error_message".into(),
+            ("ERROR_NUMBER", 0) if self.in_catch => {
+                self.note(Status::Decision, "db2.sqlcode", "ERROR_NUMBER() becomes the SQLCODE of the error (DB2_RETURNED_SQLCODE): a Db2 number, not T-SQL's, so comparisons against T-SQL error numbers must be rewritten.");
+                "v_error_number".into()
+            }
+            ("CAST", 1) => {
+                let at = crate::tok::find_word(a[0], 0, "AS")?;
+                let x = self.expr(&a[0][..at]).trim().to_string();
+                self.in_cast = true;
+                let ty = self.ty(&a[0][at + 1..]);
+                self.in_cast = false;
+                let (ty, _, numeric) = ty.ok()?;
+                if numeric {
+                    self.cast_note(&a[0][..at]);
+                }
+                format!("CAST({x} AS {ty})")
+            }
+            ("CONVERT", 2) => {
+                self.in_cast = true;
+                let ty = self.ty(a[0]);
+                self.in_cast = false;
+                let (ty, _, numeric) = ty.ok()?;
+                if numeric {
+                    self.cast_note(a[1]);
+                }
+                format!("CAST({} AS {ty})", e(self, 1))
+            }
+            ("CONVERT", 3) => {
+                self.note(Status::NotConverted, "tsql.convert-style", "CONVERT with a style code: use VARCHAR_FORMAT / TIMESTAMP_FORMAT with the matching format.");
+                return None;
+            }
+            ("DATEADD", 3) => {
+                let part = date_part(&self.expr(a[0]))?;
+                let (k, d) = (e(self, 1), e(self, 2));
+                if matches!(part, "month" | "year") {
+                    self.note(Status::Assumptions, "ASM-DB2-MONTH-END", "Adding months or years: both move the day to the end of a shorter month (Jan 31 + 1 month = Feb 28 or 29); Db2 also returns warning 01506, which does not stop the routine. Not in the verified vendor facts.");
+                }
+                format!("({d} + ({k}) {}S)", part.to_ascii_uppercase())
+            }
+            ("DATEPART", 2) => {
+                let part = date_part(&self.expr(a[0]))?;
+                format!("{}({})", part.to_ascii_uppercase(), e(self, 1))
+            }
+            ("DATEDIFF", 3)
+                if matches!(date_part(&self.expr(a[0])), Some("day" | "month" | "year")) =>
+            {
+                // Boundary counts, exactly as T-SQL defines them.
+                let part = date_part(&self.expr(a[0])).unwrap();
+                let (x, y) = (e(self, 1), e(self, 2));
+                match part {
+                    "day" => format!("(DAYS({y}) - DAYS({x}))"),
+                    "year" => format!("(YEAR({y}) - YEAR({x}))"),
+                    _ => format!("((YEAR({y}) - YEAR({x})) * 12 + MONTH({y}) - MONTH({x}))"),
+                }
+            }
+            ("DATEDIFF", 3) => {
+                self.note(Status::NotConverted, "tsql.datediff", "DATEDIFF counts boundaries crossed (DATEDIFF(year, '2024-12-31', '2025-01-01') = 1); Db2 date subtraction gives elapsed durations. Needs a per-unit rewrite.");
+                return None;
+            }
+            ("DATALENGTH", 1) => {
+                self.note(
+                    Status::NotConverted,
+                    "tsql.datalength",
+                    "DATALENGTH: byte counts depend on the column's CCSID; no rule yet.",
+                );
+                return None;
+            }
+            (
+                "OBJECT_ID" | "FORMAT" | "STR" | "STUFF" | "PATINDEX" | "DATENAME" | "SUSER_SNAME"
+                | "XACT_STATE" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE"
+                | "ERROR_PROCEDURE" | "ERROR_MESSAGE" | "ERROR_NUMBER",
+                _,
+            ) => {
+                self.note(
+                    Status::NotConverted,
+                    &format!("tsql.{}", name.to_ascii_lowercase()),
+                    &format!("{name}() has no rule yet."),
+                );
+                return None;
+            }
+            _ => return None,
+        })
+    }
+
+    /// Db2: a cast to a number of something that may be a string (fact V9).
+    fn cast_note(&mut self, operand: &[T]) {
+        let op = trimmed(operand);
+        if let [t] = op {
+            if t.k == NUMBER || self.operand_kind(op, Some(0)).1 {
+                return;
+            }
+        }
+        self.note(Status::Assumptions, "ASM-FACT-V9", "Cast to a number: T-SQL turns '' into 0, Db2 for i is expected to raise SQLSTATE 22018 (fact V9, not checked on a real system). Equal if the value is never an empty or blank string.");
+    }
+
     /// Maps a T-SQL type to PostgreSQL: (type, is string, is numeric).
     fn ty(&mut self, ts: &[T]) -> R<(String, bool, bool)> {
         let ts = trimmed(ts);
@@ -1816,6 +2722,9 @@ impl Cx<'_> {
             }
         };
         let max = args.first().is_some_and(|a| a.eq_ignore_ascii_case("MAX"));
+        if self.db2() {
+            return self.ty_db2(&up, &args, max, ts);
+        }
         // T-SQL defaults when the length or precision is left out.
         let len_default = if self.in_cast { "30" } else { "1" };
         let sized = |a: &[String]| {
@@ -1894,6 +2803,110 @@ impl Cx<'_> {
         })
     }
 
+    /// Maps a T-SQL type to Db2 for i: (type, is string, is numeric).
+    fn ty_db2(
+        &mut self,
+        up: &str,
+        args: &[String],
+        max: bool,
+        ts: &[T],
+    ) -> R<(String, bool, bool)> {
+        let len_default = if self.in_cast { "30" } else { "1" };
+        let sized = |a: &[String]| {
+            if a.is_empty() {
+                format!("({len_default})")
+            } else {
+                format!("({})", a.join(", "))
+            }
+        };
+        let num = |t: &str| (t.to_string(), false, true);
+        let txt = |t: String| (t, true, false);
+        let other = |t: String| (t, false, false);
+        let lob = |cx: &mut Self| {
+            cx.note(Status::Decision, "db2.lob", "(N)VARCHAR(MAX) and (N)TEXT become CLOB/NCLOB, which cannot be compared, grouped or indexed directly. If the values stay short, choose VARCHAR(n) (up to 32739 bytes) instead.");
+        };
+        Ok(match up {
+            "INT" | "INTEGER" => num("INTEGER"),
+            "BIGINT" => num("BIGINT"),
+            "SMALLINT" => num("SMALLINT"),
+            "TINYINT" => {
+                self.note(Status::Assumptions, "ASM-TINYINT", "TINYINT becomes SMALLINT: values outside 0–255 are no longer rejected.");
+                num("SMALLINT")
+            }
+            "BIT" => {
+                self.note(Status::Assumptions, "ASM-BIT-SMALLINT", "BIT becomes SMALLINT, which keeps comparisons with 1 and 0: T-SQL stores any non-zero value as 1, SMALLINT stores it as given. Equal if only 0, 1 and NULL are written.");
+                num("SMALLINT")
+            }
+            "DECIMAL" | "NUMERIC" | "DEC" if args.is_empty() => num("DECIMAL(18, 0)"),
+            "DECIMAL" | "NUMERIC" | "DEC" => (format!("DECIMAL({})", args.join(", ")), false, true),
+            "MONEY" => num("DECIMAL(19, 4)"),
+            "SMALLMONEY" => num("DECIMAL(10, 4)"),
+            "FLOAT" => {
+                if args.first().and_then(|a| a.parse::<u32>().ok()).is_some_and(|p| p <= 24) {
+                    num("REAL")
+                } else {
+                    num("DOUBLE")
+                }
+            }
+            "REAL" => num("REAL"),
+            "DATETIME" => {
+                self.note(Status::Assumptions, "ASM-DATETIME-PRECISION", "DATETIME becomes TIMESTAMP(3): T-SQL rounds DATETIME to 1/300 s, Db2 for i keeps milliseconds exactly.");
+                other("TIMESTAMP(3)".into())
+            }
+            "DATETIME2" => other(format!(
+                "TIMESTAMP({})",
+                args.first().map_or("7", String::as_str)
+            )),
+            "SMALLDATETIME" => {
+                self.note(Status::Assumptions, "ASM-SMALLDATETIME", "SMALLDATETIME becomes TIMESTAMP(0): T-SQL rounds to the minute, TIMESTAMP(0) keeps the seconds.");
+                other("TIMESTAMP(0)".into())
+            }
+            "DATE" => other("DATE".into()),
+            "TIME" => {
+                if args.first().map_or(true, |p| p != "0") {
+                    self.note(Status::Assumptions, "ASM-DB2-TIME-FRACTION", "Db2 for i TIME has no fractional seconds, so they are dropped. Use TIMESTAMP where they matter.");
+                }
+                other("TIME".into())
+            }
+            "DATETIMEOFFSET" => return no("DATETIMEOFFSET: Db2 for i has no type with a time zone; store a UTC TIMESTAMP and the offset"),
+            "CHAR" => txt(format!("CHAR{}", sized(args))),
+            "NCHAR" => txt(format!("NCHAR{}", sized(args))),
+            "VARCHAR" if max => {
+                lob(self);
+                txt("CLOB(2G)".into())
+            }
+            "NVARCHAR" if max => {
+                lob(self);
+                txt("NCLOB(1G)".into())
+            }
+            "VARCHAR" => txt(format!("VARCHAR{}", sized(args))),
+            "NVARCHAR" => txt(format!("NVARCHAR{}", sized(args))),
+            "TEXT" => {
+                lob(self);
+                txt("CLOB(2G)".into())
+            }
+            "NTEXT" => {
+                lob(self);
+                txt("NCLOB(1G)".into())
+            }
+            "SYSNAME" => txt("NVARCHAR(128)".into()),
+            "VARBINARY" | "BINARY" if !max => other(format!("{up}{}", sized(args))),
+            "VARBINARY" | "IMAGE" => other("BLOB(2G)".into()),
+            "UNIQUEIDENTIFIER" => {
+                self.note(Status::Assumptions, "ASM-UUID-CHAR", "UNIQUEIDENTIFIER becomes CHAR(36): comparisons are case-sensitive and ordering is textual (T-SQL orders GUIDs by byte groups). GENERATE_UUID() and T-SQL's text form are both upper case (fact V13).");
+                txt("CHAR(36)".into())
+            }
+            "XML" => other("XML".into()),
+            "ROWVERSION" | "TIMESTAMP" => return no("ROWVERSION/TIMESTAMP: use a row change timestamp column (TIMESTAMP GENERATED ALWAYS FOR EACH ROW ON UPDATE AS ROW CHANGE TIMESTAMP)"),
+            "SQL_VARIANT" | "HIERARCHYID" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no Db2 for i equivalent rule yet")),
+            _ => {
+                self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in Db2 for i under that name.");
+                let t: String = ts.iter().map(|t| t.s.clone()).collect();
+                other(self.expr_plain(&t))
+            }
+        })
+    }
+
     fn expr_plain(&self, s: &str) -> String {
         s.replace("dbo.", "")
     }
@@ -1906,6 +2919,121 @@ const UNDECLARED: &str =
 
 fn undeclared_name(v: &str) -> String {
     format!("v_{}", snake(v.trim_start_matches('@')))
+}
+
+/// `IF @@TRANCOUNT > 0 ROLLBACK|COMMIT [TRAN]`: the statement it guards.
+fn trancount_guard(n: &SyntaxNode) -> Option<&'static str> {
+    let words: Vec<String> = sqldiff_syntax::ast::sig_tokens(n)
+        .map(|t| t.text().to_ascii_uppercase())
+        .filter(|w| !matches!(w.as_str(), ";" | "TRAN" | "TRANSACTION" | "WORK"))
+        .collect();
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    match w.as_slice() {
+        ["IF", "@@TRANCOUNT", ">", "0", "ROLLBACK"] => Some("ROLLBACK"),
+        ["IF", "@@TRANCOUNT", ">", "0", "COMMIT"] => Some("COMMIT"),
+        _ => None,
+    }
+}
+
+/// Adds `BEGIN END;` to a statement list with no statement left in it.
+fn fill_empty(b: &mut Out, indent: usize) {
+    let live = b.text.lines().any(|l| {
+        let l = l.trim();
+        !l.is_empty() && !l.starts_with("--")
+    });
+    if !live {
+        b.lines(indent, "BEGIN END;");
+    }
+}
+
+/// Db2 for i needs a FROM: a SELECT without one (`(SELECT @id AS id)`) gets
+/// `FROM SYSIBM.SYSDUMMY1`, the one-row table. Only nested SELECTs unless
+/// `top`.
+fn dummy_from(ts: &[T], top: bool) -> Vec<T> {
+    let ds = crate::tok::depths(ts);
+    let mut at = Vec::new(); // insertion points
+    for (i, t) in ts.iter().enumerate() {
+        let d = ds[i];
+        if !t.is("SELECT") || d == 0 && !top {
+            continue;
+        }
+        let mut end = ts.len();
+        let mut from = false;
+        let mut clause = None;
+        for j in i + 1..ts.len() {
+            if ds[j] < d || ts[j].k == R_PAREN && ds[j] == d - 1 || ts[j].k == SEMICOLON {
+                end = j;
+                break;
+            }
+            if ds[j] != d {
+                continue;
+            }
+            let w = ts[j].up();
+            if ts[j].k == IDENT && matches!(w.as_str(), "UNION" | "EXCEPT" | "INTERSECT") {
+                end = j;
+                break;
+            }
+            if ts[j].is("FROM") || ts[j].is("INTO") {
+                from = true;
+                break;
+            }
+            if clause.is_none()
+                && ts[j].k == IDENT
+                && matches!(w.as_str(), "WHERE" | "GROUP" | "HAVING" | "ORDER")
+            {
+                clause = Some(j);
+            }
+        }
+        if !from {
+            let mut p = clause.unwrap_or(end);
+            while p > i + 1 && !ts[p - 1].sig() {
+                p -= 1;
+            }
+            at.push(p);
+        }
+    }
+    let mut out = Vec::with_capacity(ts.len() + at.len());
+    for (i, t) in ts.iter().enumerate() {
+        if at.contains(&i) {
+            out.push(T {
+                k: NUMBER, // copied as is by the expression walk
+                s: " FROM SYSIBM.SYSDUMMY1".into(),
+            });
+        }
+        out.push(t.clone());
+    }
+    if at.contains(&ts.len()) {
+        out.push(T {
+            k: NUMBER,
+            s: " FROM SYSIBM.SYSDUMMY1".into(),
+        });
+    }
+    out
+}
+
+/// Lower-case column names of a table-level `PRIMARY KEY (…)` in a column list.
+fn primary_key_columns(items: &[T]) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in split_commas(items) {
+        let it = trimmed(item);
+        let s = sig(it);
+        let Some(p) = s.iter().position(|&j| it[j].is("PRIMARY")) else {
+            continue;
+        };
+        if !matches!(it[s[0]].up().as_str(), "CONSTRAINT" | "PRIMARY") {
+            continue; // a column's own PRIMARY KEY
+        }
+        let Some(open) = (s[p]..it.len()).find(|&j| it[j].k == L_PAREN) else {
+            continue;
+        };
+        let close = matching(it, open).unwrap_or(it.len());
+        for c in split_commas(&it[open + 1..close]) {
+            if let Some(t) = trimmed(c).first() {
+                out.push(tsql_unquote(&t.s).to_ascii_lowercase());
+            }
+        }
+    }
+    out
 }
 
 /// The first keyword of a unit, upper case.

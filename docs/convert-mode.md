@@ -2,7 +2,7 @@
 
 `sqldiff-gui convert [FILE]` opens a two-pane page: T-SQL you can edit on the left, PostgreSQL on the right. The right side is regenerated about 150 ms after you stop typing (debounced; stale responses are dropped). A sample is shown when no file is given; nothing is ever written to disk. `--stdout` prints the conversion and the per-statement badges instead of serving the page.
 
-Only T-SQL → PostgreSQL has rules so far. The feasibility study that led here is the "Live conversion feasibility" doc in the project; this is its phase P0.
+T-SQL → PostgreSQL and T-SQL → Db2 for i have rules (`--to db2i`; see [Db2 for i](#db2-for-i) below). The feasibility study that led here is the "Live conversion feasibility" doc in the project; this is its phase P0.
 
 ## What "correct" means here
 
@@ -57,6 +57,28 @@ Token-level rules over the lossless CST; expressions are still flat, so nothing 
 
 The tests in `crates/sqldiff-convert/tests/convert.rs` convert every T-SQL file in the corpus and require that the output parses as PostgreSQL and carries no T-SQL residue outside commented-out units.
 
+## Db2 for i
+
+`sqldiff-gui convert --to db2i` (or `convert(text, Tsql, Db2i)`) converts T-SQL to Db2 for i SQL PL with the same walk as PostgreSQL: the statements, refusals and engine check are shared, and the target decides the spelling and the notes. The output is diffed against the input by the engine (whose Db2 lowering does not use these rules) and must parse as Db2 for i.
+
+Vendor facts come from [vendor-facts-verification.md](vendor-facts-verification.md). Facts that were never checked on a real IBM i (V4, V9, V15, part of V14) never decide a conversion silently: every unit that depends on one carries an assumption naming the fact (`ASM-FACT-V9`, `ASM-FACT-V14`, `ASM-DB2-SCRIPT-COMMIT` for V4/V5) or the lock-hint note points at V15.
+
+What differs from the PostgreSQL output:
+
+- **Commit level.** Procedures get `SET OPTION COMMIT = *CS` (`ASM-DB2-COMMIT-CS`): each statement is atomic and reads see committed rows, as in T-SQL. Without it the level comes from the creating job (V5), and under `*NONE` nothing is rolled back, not even a failed statement or an ATOMIC MERGE (V2, V4). Scripts run at the job's level, so their transaction statements, `SAVEPOINT` and MERGE note it.
+- **Routines.** `CREATE OR REPLACE PROCEDURE … (IN p_x …, INOUT p_y …) LANGUAGE SQL … BEGIN … END;`; declarations are hoisted to the top of the block (variables, then cursors, then handlers, as Db2 requires). `RETURN n` stays (`ASM-RETURN-STATUS`: callers read `DB2_RETURN_STATUS`). Scripts with variables become a compound statement `BEGIN … END;`.
+- **Result sets.** A query that returns rows from a procedure becomes `DECLARE result_n INSENSITIVE CURSOR WITH RETURN TO CLIENT FOR …` plus `OPEN result_n;` where it stood, and the procedure declares `DYNAMIC RESULT SETS n`. Functions and scripts still cannot return rows.
+- **Control flow.** `ELSEIF`, `WHILE … DO … END WHILE`, with a label on every loop so `BREAK`/`CONTINUE` become `LEAVE`/`ITERATE label`. A statement list left without a statement (a dropped `PRINT`) gets `BEGIN END;`.
+- **Errors.** `SET XACT_ABORT ON` (before any other work) becomes an EXIT handler `ROLLBACK; RESIGNAL;` for the whole routine. `TRY/CATCH` becomes a compound statement whose EXIT handler is the CATCH part: unlike PostgreSQL nothing the TRY part completed is undone, which is T-SQL's behaviour. `ERROR_MESSAGE()`/`ERROR_NUMBER()` read variables filled by `GET DIAGNOSTICS` at the start of the handler. The `ROLLBACK; THROW;` idiom becomes `ROLLBACK; RESIGNAL;`. `THROW n, msg, s` → `SIGNAL SQLSTATE '75000' SET MESSAGE_TEXT = msg`; `PRINT` is dropped (needs a decision).
+- **Transactions.** `BEGIN TRAN` is dropped (a unit of work is always open under commitment control); `COMMIT`/`ROLLBACK` stay, also inside TRY and CATCH. `SAVE TRAN x` → `SAVEPOINT x ON ROLLBACK RETAIN CURSORS` and `ROLLBACK TRAN x` → `ROLLBACK TO SAVEPOINT x` (V14). A `ROLLBACK TRAN name` that names no savepoint is refused for both targets.
+- **MERGE** is kept (`MERGE INTO`, `WHEN NOT MATCHED BY TARGET` → `WHEN NOT MATCHED`); `NOT MATCHED BY SOURCE` (V1) and `OUTPUT` are refused.
+- **Temporary data.** `#t` → `DECLARE GLOBAL TEMPORARY TABLE SESSION.t … ON COMMIT PRESERVE ROWS LOGGED WITH REPLACE`; a table variable `@t` → `SESSION.tv_t … NOT LOGGED ON ROLLBACK PRESERVE ROWS`, the only form that keeps its rows on rollback (V16).
+- **Queries.** `TOP n` → `FETCH FIRST n ROWS ONLY`; a `SELECT` without `FROM` gets `FROM SYSIBM.SYSDUMMY1`; `SELECT @a = … FROM` → `SELECT … INTO` (Db2 raises 21000 on several rows).
+- **DDL.** Types map to Db2 (`BIT` → `SMALLINT`, `MONEY` → `DECIMAL(19, 4)`, `DATETIME2(n)` → `TIMESTAMP(n)`, `UNIQUEIDENTIFIER` → `CHAR(36)`, `(N)VARCHAR(MAX)` → `CLOB`/`NCLOB` as a decision, `DATETIMEOFFSET` refused). Column defaults must be constants or `CURRENT TIMESTAMP`, so `DEFAULT NEWID()` or `SYSUTCDATETIME()` is refused. Primary key columns get `NOT NULL`. Several `ADD COLUMN`s are written without commas.
+- **Built-ins.** `GETDATE()` → `CURRENT TIMESTAMP` (per statement, V20), `GETUTCDATE()` → `CURRENT TIMESTAMP - CURRENT TIMEZONE`, `NEWID()` → `GENERATE_UUID()` (upper case, V13), `LEN` → `LENGTH(RTRIM(…))`, `CHARINDEX` → `LOCATE`, `SCOPE_IDENTITY()` → `IDENTITY_VAL_LOCAL()`, `STRING_AGG` → `LISTAGG`, `DATEADD` → labelled durations (`d + (n) DAYS`), `DATEPART` → `YEAR()`…`SECOND()`, `DATEDIFF` day/month/year → `DAYS(b) - DAYS(a)` and year/month arithmetic. A cast to a number notes V9 unless the operand is a number.
+
+The engine still reports what the rules cannot change: a T-SQL procedure without `XACT_ABORT ON` goes on after a failed statement while Db2 stops (`equiv.error-continues`), and the time source and case sensitivity findings land on their units. `tests/convert_db2.rs` converts the whole T-SQL corpus to Db2 for i and requires that it parses and leaves no T-SQL residue.
+
 ## Next (P1 and later)
 
-Expression trees (from the equivalence work) and binding let rules see types, so `+`, comparisons and `ISNULL` stop needing assumptions; the behavioural IR (WP3) and more idiom rules bring `@@ERROR`/`@@ROWCOUNT` checks and transaction structure into scope, and a catalog (`Facts`) lets the idiom rules prove key uniqueness and identity columns instead of assuming them. Db2 for i output follows the same pattern once the PostgreSQL rules are proven against the oracle containers.
+Expression trees (from the equivalence work) and binding let rules see types, so `+`, comparisons and `ISNULL` stop needing assumptions; the behavioural IR (WP3) and more idiom rules bring `@@ERROR`/`@@ROWCOUNT` checks and transaction structure into scope, and a catalog (`Facts`) lets the idiom rules prove key uniqueness and identity columns instead of assuming them. For Db2 for i, the unverified vendor facts (V4, V9, V15) need a real IBM i before their assumptions can be dropped, and the idiom rules have no Db2 forms yet (MERGE and upserts are converted by the token rules instead).

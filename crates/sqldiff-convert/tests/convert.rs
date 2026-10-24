@@ -32,7 +32,7 @@ fn has_rule(u: &Unit, rule: &str) -> bool {
 #[test]
 fn pairs_without_rules_keep_every_statement_as_a_comment() {
     let src = "SELECT 1;\nUPDATE t SET a = 2;\n";
-    let c = convert(src, Dialect::Tsql, Dialect::Db2i).unwrap();
+    let c = convert(src, Dialect::Postgres, Dialect::Db2i).unwrap();
     assert_eq!(c.units.len(), 2);
     assert_eq!(c.counts.not_converted, 2);
     assert!(
@@ -42,7 +42,7 @@ fn pairs_without_rules_keep_every_statement_as_a_comment() {
     );
     assert!(c
         .output
-        .contains("no conversion rules from T-SQL to Db2 for i yet"));
+        .contains("no conversion rules from PostgreSQL to Db2 for i yet"));
 }
 
 #[test]

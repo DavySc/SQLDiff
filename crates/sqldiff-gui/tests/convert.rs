@@ -69,11 +69,11 @@ fn the_target_and_the_mode_are_chosen_per_request() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || serve(listener, setup("SELECT 1;"), &[]));
-    // Another target: no rules yet, every statement not converted.
+    // A pair without rules yet: every statement not converted.
     let v = post(
         addr,
         "/api/convert",
-        &serde_json::json!({ "text": "SELECT 1;\nSELECT 2;", "to": "db2i" }),
+        &serde_json::json!({ "text": "SELECT 1;\nSELECT 2;", "from": "postgres", "to": "db2i" }),
     );
     assert_eq!(v["to"], "db2i");
     assert_eq!(v["rules"], false);
