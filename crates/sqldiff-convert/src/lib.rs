@@ -82,6 +82,9 @@ pub struct Unit {
     pub out: Span,
     /// Indices into `report.findings` that point into this unit.
     pub findings: Vec<usize>,
+    /// Indices into `output_check.findings` (the output checked on its own:
+    /// binding, residue, limits) that point into this unit.
+    pub output_findings: Vec<usize>,
     /// The engine's part of the status: `differs` when a finding or a parse
     /// problem lands here, else `converted`. Lets a viewer accept assumptions
     /// (dropping their notes) without hiding what the engine found.
@@ -108,6 +111,13 @@ pub struct Conversion {
     /// The engine's diff of input (side A) against output (side B). For a
     /// template, of its fragment against the converted fragment.
     pub report: Report,
+    /// The output checked on its own as the target dialect (`sqldiff check`):
+    /// a unit is only `converted` when nothing here points into it.
+    pub output_check: Report,
+    /// Indices into `output_check.findings` that gate units but point into
+    /// no unit (text the rules wrote around units). Any entry here means the
+    /// file as a whole cannot count as converted.
+    pub unplaced: Vec<usize>,
     /// Set when the input was a template.
     pub template: Option<TemplateInfo>,
 }
@@ -124,18 +134,86 @@ pub fn supported(from: Dialect, to: Dialect) -> bool {
 /// without rules is not an error: every statement comes back not converted
 /// (kept as a comment), so a viewer can switch targets freely.
 pub fn convert(text: &str, from: Dialect, to: Dialect) -> Result<Conversion, String> {
-    let root = parse(text, from).syntax();
-    let raw = match (from, to) {
-        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => tsql::convert(&root, text, to),
-        _ => no_rules(&root, text, from, to),
-    };
-    Ok(verify(text, from, to, raw))
+    Ok(check(text, rewrite(text, from, to), &Options::default()))
 }
 
-fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion {
+/// Like `convert`, with engine options for the check: catalogs for both
+/// sides (`catalog_a` in the source dialect, `catalog_b` in the target),
+/// helpers and declared facts.
+pub fn convert_with(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    opts: &Options,
+) -> Result<Conversion, String> {
+    Ok(check(text, rewrite(text, from, to), opts))
+}
+
+/// The rules' output before it is checked. Lets a caller convert many files
+/// first and then check each one against catalogs built from all of them.
+#[derive(Debug)]
+pub struct Draft {
+    from: Dialect,
+    to: Dialect,
+    raw: out::Out,
+}
+
+impl Draft {
+    pub fn output(&self) -> &str {
+        &self.raw.text
+    }
+}
+
+/// Apply the rules only. Nothing in a draft has been checked yet.
+pub fn rewrite(text: &str, from: Dialect, to: Dialect) -> Draft {
+    rewrite_in(text, from, to, None)
+}
+
+/// Apply the rules with the source catalog of the whole tree being
+/// converted (`sqldiff_core::catalog::ddl` over every input file), so a
+/// rule can rely on what other files define: a call with OUTPUT arguments
+/// converts only when the called procedure's parameters are known.
+pub fn rewrite_in(
+    text: &str,
+    from: Dialect,
+    to: Dialect,
+    source: Option<&sqldiff_core::catalog::Catalog>,
+) -> Draft {
+    let root = parse(text, from).syntax();
+    let raw = match (from, to) {
+        (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
+            tsql::convert(&root, text, to, source)
+        }
+        _ => no_rules(&root, text, from, to),
+    };
+    Draft { from, to, raw }
+}
+
+/// Engine findings on the output alone that gate a unit: it does not bind
+/// (unknown built-in, column, variable, type, ...), still holds source-dialect
+/// syntax, breaks a target limit, or is a known hazard. Findings about the
+/// code's own quality (analysis hits) are not about the conversion and do not.
+fn gates(f: &sqldiff_core::Finding) -> bool {
+    use sqldiff_core::ChangeClass as C;
+    matches!(f.class, C::Binding | C::Residue | C::Limit) || f.rule.starts_with("hazard.")
+}
+
+/// Check a draft: diff the input against the output, check the output on
+/// its own, and give every unit the worst of its rule notes and findings.
+pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
+    let Draft { from, to, raw } = draft;
     let a = Artifact::new("input.sql", from, input);
     let b = Artifact::new("converted.sql", to, raw.text.as_str());
-    let report = sqldiff_core::diff(&a, &b, &Options::default());
+    let report = sqldiff_core::diff(&a, &b, opts);
+    // The output on its own, bound against the target catalog.
+    let own = Options {
+        catalog_a: opts.catalog_b.clone(),
+        facts_a: opts.facts_b.clone(),
+        catalog_b: Vec::new(),
+        facts_b: Vec::new(),
+        ..opts.clone()
+    };
+    let output_check = sqldiff_core::check(&b, &own);
     let (li, lo) = (LineIndex::new(input), LineIndex::new(&raw.text));
     let mut units: Vec<Unit> = raw
         .units
@@ -149,6 +227,7 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
                 src: span(input, &li, u.src),
                 out: span(&raw.text, &lo, u.out),
                 findings: Vec::new(),
+                output_findings: Vec::new(),
                 checked: Status::Converted,
             }
         })
@@ -173,6 +252,43 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
                 u.status = u.status.max(Status::Differs);
                 u.checked = Status::Differs;
             }
+        }
+    }
+    // The output's own check: anything that does not bind, or still reads as
+    // the source dialect, keeps its unit from counting as converted, whether
+    // the finding is proven or rests on an assumption.
+    let mut unplaced = Vec::new();
+    for (fi, f) in output_check.findings.iter().enumerate() {
+        if !gates(f) {
+            continue;
+        }
+        let Some(loc) = f.a.as_ref() else {
+            unplaced.push(fi);
+            continue;
+        };
+        let Some(u) = units
+            .iter_mut()
+            .find(|u| overlaps((u.out.start, u.out.end + 1), (loc.byte_start, loc.byte_end)))
+        else {
+            unplaced.push(fi);
+            continue;
+        };
+        u.output_findings.push(fi);
+        u.status = u.status.max(Status::Differs);
+        u.checked = Status::Differs;
+        if !u.notes.iter().any(|n| n.rule == f.rule) {
+            u.notes.insert(
+                0,
+                Note {
+                    status: Status::Differs,
+                    rule: f.rule.clone(),
+                    text: format!(
+                        "The output does not check as {}: {}",
+                        to.display_name(),
+                        without_side(&f.witness)
+                    ),
+                },
+            );
         }
     }
     // The output must parse as the target dialect.
@@ -205,6 +321,8 @@ fn verify(input: &str, from: Dialect, to: Dialect, raw: out::Out) -> Conversion 
         units,
         counts: Counts::default(),
         report,
+        output_check,
+        unplaced,
         template: None,
     };
     recount(&mut c);
@@ -266,6 +384,14 @@ fn no_rules(root: &sqldiff_syntax::SyntaxNode, text: &str, from: Dialect, to: Di
         );
     }
     o
+}
+
+/// A one-sided check's witness without its `Side A line N: ` prefix (the
+/// unit already says where).
+fn without_side(w: &str) -> &str {
+    w.strip_prefix("Side A line ")
+        .and_then(|r| r.split_once(": "))
+        .map_or(w, |(_, rest)| rest)
 }
 
 fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {

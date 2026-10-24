@@ -25,7 +25,7 @@
   (assume tsql ASM-ISNULL-TYPE "The replacement fits the type of the first argument (ISNULL converts it to that type; COALESCE takes the wider type)")
   (example (tsql "SELECT ISNULL(first_name, '') AS n FROM dbo.customer;")
            (postgres "SELECT coalesce(first_name, '') AS n FROM customer;")
-           (expect equal)))
+           (expect equal-under-assumptions)))
 
 (translate len/length
   (doc "LEN ignores trailing spaces.")
@@ -76,7 +76,7 @@
 (translate top/limit
   (example (tsql "SELECT TOP (10) order_id FROM dbo.orders ORDER BY created_at DESC, order_id DESC;")
            (postgres "SELECT order_id FROM orders ORDER BY created_at DESC, order_id DESC LIMIT 10;")
-           (expect equal))
+           (expect equal-under-assumptions))
   (form tsql (select (top ?n) ?rest...) (lift-only))
   (form postgres (select ?rest... (limit ?n))))
 

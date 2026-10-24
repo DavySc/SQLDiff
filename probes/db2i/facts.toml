@@ -1,0 +1,111 @@
+# Db2 for i facts that the probes settle, and the places in the code that depend on
+# them. Hand-maintained; the status of each fact lives in status.json, which
+# `db2i_probes.py ingest` writes from the runs in runs/.
+#
+# [[fact]]  a vendor fact from docs/vendor-facts-verification.md (Db2 for i only).
+#           review: files a person should reread once the fact is answered.
+# [[link]]  text that hedges on a fact. While any of its facts is unverified (or
+#           inconclusive, mixed, observed), the hedge must stay within the anchor's
+#           line and the two lines after it. Once all of its facts are confirmed,
+#           corrected or contradicted, the hedge must be gone, so the text is
+#           rewritten from the evidence. crates/sqldiff-corpus/tests/db2i_probes.rs
+#           checks both, and that the summary row of a resolved fact in
+#           vendor-facts-verification.md mentions the probe run.
+
+[[fact]]
+id = "V3"
+title = "MERGE with several source rows per target row"
+review = ["docs/vendor-facts-verification.md"]
+
+[[fact]]
+id = "V4"
+title = "ATOMIC, UNDO, failed statements and ROLLBACK under *NONE"
+review = ["docs/convert-mode.md", "crates/sqldiff-convert/tests/convert_db2.rs"]
+
+[[fact]]
+id = "V5"
+title = "Commit level of scripts and of routines without SET OPTION COMMIT"
+review = ["docs/convert-mode.md"]
+
+[[fact]]
+id = "V7"
+title = "DGTT logging default and LOGGED rollback"
+review = ["docs/vendor-facts-verification.md"]
+
+[[fact]]
+id = "V9"
+title = "CAST of empty, blank and padded strings to numbers"
+review = ["docs/convert-mode.md", "crates/sqldiff-convert/tests/convert_db2.rs"]
+
+[[fact]]
+id = "V14"
+title = "SAVEPOINT under *NONE and across ATOMIC blocks"
+review = ["docs/convert-mode.md"]
+
+[[fact]]
+id = "V15"
+title = "WITH RS USE AND KEEP EXCLUSIVE LOCKS on SELECT INTO"
+review = ["docs/convert-mode.md", "crates/sqldiff-convert/tests/convert_db2.rs"]
+
+[[fact]]
+id = "V16"
+title = "NOT LOGGED DGTT and ROLLBACK"
+review = ["docs/vendor-facts-verification.md"]
+
+[[fact]]
+id = "V19"
+title = "Default NULL ordering and NULLS FIRST/LAST"
+review = ["corpus/oracle/m22-null-ordering-changed.toml"]
+
+[[fact]]
+id = "V25"
+title = "Default USRPRF (*NAMING) of a routine without SET OPTION USRPRF"
+review = ["docs/cross-dialect-proofs.md", "docs/convert-mode.md"]
+
+[[link]]
+facts = ["V4"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "ASM-DB2-SCRIPT-COMMIT"
+hedge = "V4 not checked on a real system"
+
+[[link]]
+facts = ["V4"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-DB2-COMMIT-CS\","
+hedge = "V4 not checked on a real system"
+
+[[link]]
+facts = ["V4"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "under *NONE the ROLLBACK undoes nothing"
+hedge = "fact V4, not checked on a real system"
+
+[[link]]
+facts = ["V9"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-FACT-V9\""
+hedge = "not checked on a real system"
+
+[[link]]
+facts = ["V14"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-FACT-V14\""
+hedge = "only partly verified"
+
+[[link]]
+facts = ["V15"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "USE AND KEEP EXCLUSIVE LOCKS (its rules"
+hedge = "were not checked, fact V15"
+
+[[link]]
+facts = ["V19"]
+file = "crates/sqldiff-core/src/equiv/canon.rs"
+anchor = "(fact V19"
+hedge = "Db2 for i part not checked on a real system"
+
+[[link]]
+facts = ["V25"]
+file = "crates/sqldiff-core/src/equiv/canon.rs"
+anchor = "\"ASM-DB2-USRPRF-USER\","
+hedge = "fact V25, not checked on a real system"

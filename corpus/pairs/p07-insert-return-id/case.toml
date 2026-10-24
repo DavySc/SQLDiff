@@ -45,5 +45,6 @@ witnesses = [
 [[expect]]
 a = "pg"
 b = "db2i"
-verdict = "equal"
+verdict = "equal-under-assumptions"
+assumptions = ["the Db2 for i routine without USRPRF runs with the caller's authority", "unquoted names name the same objects after case folding", "unqualified names, dbo and public resolve to the same schema"]
 classes = ["structural"]

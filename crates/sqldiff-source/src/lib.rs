@@ -14,6 +14,7 @@
 //!   session-local assumption flips and GUI deep links.
 
 pub mod bundle;
+pub mod changes;
 pub mod compose;
 pub mod config;
 mod error;
@@ -27,8 +28,10 @@ pub mod process;
 pub mod protocol;
 pub mod queue;
 mod source;
+pub mod split;
 pub mod tree;
 mod walk;
+pub use walk::defined_name;
 
 pub use bundle::{Bundle, BundleSource};
 pub use config::{LayerKind, LayerRef, Resolved};

@@ -1,0 +1,1479 @@
+# Db2 for i probes: the source of truth for sqldiff-db2i-probes.sql.
+#
+# Strictly Db2 for i (IBM i 7.x). Nothing here is about Db2 for z/OS or Db2 for
+# Linux, UNIX and Windows, and their documentation is not evidence for anything
+# below. Every expectation names the IBM i source it rests on, or says that it is
+# only the assumption the code currently makes.
+#
+# After editing, regenerate the script:  python3 probes/db2i/db2i_probes.py build
+#
+# [[procedure]]  one SQL procedure, created as SQLDFPROBE.P_<name>. Every procedure
+#                has the OUT parameters O_STATE CHAR(5), O_CODE INTEGER, O_N1 INTEGER,
+#                O_N2 INTEGER and O_TEXT VARCHAR(200), after any `params`.
+#                `commit` becomes SET OPTION COMMIT = <commit>; "" leaves SET OPTION
+#                out, so the routine takes the options of the creating interface.
+#                `options` adds SET OPTION items (not COMMIT or NAMING). `naming =
+#                "*SYS"` creates it under system naming (names qualified with /).
+#                `top_level = true` lets the interface create it directly.
+#                Bodies may not contain `--` comments (the body is sent as one line).
+# [[probe]]      one call of a procedure (or an `inline` compound run at top level,
+#                which sees the same O_ variables) and the outcomes it can have.
+#                role: decisive (settles the fact), control (must come out as
+#                expected or the decisive probes of the fact are inconclusive), info.
+# outcome.when   fields: create (SQLSTATE of creating the procedure), call (SQLSTATE
+#                of the CALL itself), state, code, n1, n2, text (the O_ values).
+#                Patterns: "00000" exact, "!00000" set and different, "null", "*",
+#                "=0", ">0", ">=1", "<3", "contains:UPDATE", "prefix:*USER/",
+#                "regex:..." (the whole value must match).
+#                First match wins.
+# outcome.verdict  consistent (the fact or assumption holds), refines (holds in
+#                substance, a detail is wrong), contradicts, open (an answer to an
+#                open question, no expectation was made).
+#
+# Test data: table SQLDFPROBE.T (PRB, K, V); each probe uses its own PRB number.
+
+# ---------------------------------------------------------------- harness
+
+[[procedure]]
+name = "HARNESS_NC"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 1 WITH NC;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (1, 1) WITH NC;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (1, 2);
+    ROLLBACK;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 1 AND K = 1;
+  SELECT COUNT(*) INTO O_N2 FROM SQLDFPROBE.T WHERE PRB = 1 AND K = 2;
+  COMMIT;
+END
+"""
+
+[[probe]]
+id = "H-COMMIT-CONTROL"
+fact = "HARNESS"
+role = "control"
+procedure = "HARNESS_NC"
+question = "Does a procedure compiled with *CS run under commitment control here, and does a WITH NC insert survive its ROLLBACK? Every *CS control below relies on the first; the result log relies on the second."
+source = "Isolation clause on INSERT and NC semantics: IBM i 7.3 'Isolation level' (rbafzisol.htm). WITH NC rows surviving ROLLBACK: IBM i community thread, quoting the IBM i commitment control topic."
+outcome = [
+  { label = "as designed", when = { create = "00000", state = "00000", n1 = "=1", n2 = "=0" }, verdict = "consistent", meaning = "Commitment control is active in *CS routines and the NC row survived the rollback." },
+  { label = "no commitment control", when = { state = "00000", n2 = "=1" }, verdict = "contradicts", meaning = "The ROLLBACK undid nothing: *CS routines are not under commitment control here (are the SQLDFPROBE tables journaled?). All *CS controls are inconclusive." },
+  { label = "harness error", when = { state = "!00000" }, verdict = "contradicts", meaning = "The harness statements failed; see the SQLSTATE. Often SQL7008 / 55019: the table is not journaled because the schema was not made with CREATE SCHEMA." },
+]
+
+[[probe]]
+id = "ENV-OS"
+fact = "ENV"
+role = "info"
+question = "Which IBM i release ran the probes?"
+source = "SYSIBMADM.ENV_SYS_INFO."
+inline = """
+SELECT TRIM(CHAR(OS_VERSION)) || '.' || TRIM(CHAR(OS_RELEASE))
+  INTO O_TEXT FROM SYSIBMADM.ENV_SYS_INFO;
+"""
+outcome = [
+  { label = "recorded", when = { call = "00000" }, verdict = "open", meaning = "The release is in text." },
+  { label = "not available", when = { call = "!00000" }, verdict = "open", meaning = "The view could not be read; give the release by hand when submitting." },
+]
+
+[[probe]]
+id = "ENV-DB2-GROUP"
+fact = "ENV"
+role = "info"
+question = "Which Db2 for IBM i PTF group level and Technology Refresh level are installed?"
+source = "QSYS2.GROUP_PTF_INFO."
+inline = """
+SELECT MAX(PTF_GROUP_LEVEL) INTO O_N1 FROM QSYS2.GROUP_PTF_INFO
+  WHERE PTF_GROUP_DESCRIPTION LIKE 'DB2 FOR IBM I%'
+    AND PTF_GROUP_STATUS = 'INSTALLED';
+SELECT MAX(PTF_GROUP_LEVEL) INTO O_N2 FROM QSYS2.GROUP_PTF_INFO
+  WHERE PTF_GROUP_DESCRIPTION LIKE '%TECHNOLOGY REFRESH%'
+    AND PTF_GROUP_STATUS = 'INSTALLED';
+"""
+outcome = [
+  { label = "recorded", when = { call = "00000" }, verdict = "open", meaning = "n1 is the Db2 for IBM i group level, n2 the TR group level (null when not found)." },
+  { label = "not available", when = { call = "!00000" }, verdict = "open", meaning = "The view could not be read; give the levels by hand when submitting." },
+]
+
+# ---------------------------------------------------------------- V5
+
+[[probe]]
+id = "V5-INTERFACE-COMMIT"
+fact = "V5"
+role = "info"
+question = "Does the interface that runs this script (ACS Run SQL Scripts, RUNSQLSTM, ...) run top-level statements under commitment control?"
+source = "IBM i 7.4 'Commitment control' (rbafydicomm.htm): the commit level comes from the interface; ASM-DB2-SCRIPT-COMMIT."
+inline = """
+DELETE FROM SQLDFPROBE.T WHERE PRB = 52 WITH NC;
+INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (52, 1);
+ROLLBACK;
+SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 52;
+DELETE FROM SQLDFPROBE.T WHERE PRB = 52 WITH NC;
+"""
+outcome = [
+  { label = "commitment control", when = { call = "00000", n1 = "=0" }, verdict = "open", meaning = "The ROLLBACK undid the insert: this interface runs scripts under commitment control." },
+  { label = "no commitment control", when = { call = "00000", n1 = "=1" }, verdict = "open", meaning = "The insert stayed: this interface runs scripts under *NONE or autocommit, so script COMMIT/ROLLBACK do nothing." },
+  { label = "failed", when = { call = "!00000" }, verdict = "open", meaning = "See the SQLSTATE." },
+]
+
+[[procedure]]
+name = "V5_DEFAULT_LEVEL"
+commit = ""
+# Created by the interface itself (not through RUN_DDL), so it takes the
+# interface's options.
+top_level = true
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 51 WITH NC;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (51, 1);
+    ROLLBACK;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 51;
+END
+"""
+
+[[probe]]
+id = "V5-ROUTINE-DEFAULT"
+fact = "V5"
+role = "info"
+procedure = "V5_DEFAULT_LEVEL"
+question = "Which commit level does a procedure without SET OPTION COMMIT get when created through this interface?"
+source = "IBM i 7.5 CREATE PROCEDURE (SQL): 'The default values for the options depend on the options in effect at create time.'"
+outcome = [
+  { label = "commitment control", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "The ROLLBACK undid the insert: routines created here get a commit level other than *NONE." },
+  { label = "*NONE", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "The insert stayed: routines created here without SET OPTION run under *NONE." },
+  { label = "failed", when = { state = "!00000" }, verdict = "open", meaning = "See the SQLSTATE." },
+]
+
+# ---------------------------------------------------------------- V4
+
+[[procedure]]
+name = "V4_ATOMIC_CS"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 41;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    BEGIN ATOMIC
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (41, 1);
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (41, 1);
+    END;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 41;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V4-ATOMIC-CS"
+fact = "V4"
+role = "control"
+procedure = "V4_ATOMIC_CS"
+question = "Under *CS, is an ATOMIC block whose second insert fails rolled back?"
+source = "IBM i 7.3 compound (dynamic): 'an unhandled exception condition within the compound statement causes the compound statement to be rolled back.'"
+outcome = [
+  { label = "rolled back", when = { create = "00000", state = "23505", n1 = "=0" }, verdict = "consistent", meaning = "The duplicate key error rolled the ATOMIC block back." },
+]
+
+[[procedure]]
+name = "V4_ATOMIC_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 42;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    BEGIN ATOMIC
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (42, 1);
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (42, 1);
+    END;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 42;
+END
+"""
+
+[[probe]]
+id = "V4-ATOMIC-NONE"
+fact = "V4"
+role = "decisive"
+procedure = "V4_ATOMIC_NONE"
+question = "Under *NONE, what does an ATOMIC block do when its second insert fails?"
+source = "Inference in vendor-facts V4 (changes without commitment control cannot be rolled back; MERGE ignores ATOMIC under No Commit, IBM i 7.5 MERGE). Not documented for compound statements."
+outcome = [
+  { label = "create rejected", when = { create = "!00000" }, verdict = "consistent", meaning = "Db2 for i refuses an ATOMIC block in a *NONE routine; the create SQLSTATE is the rule." },
+  { label = "call rejected", when = { call = "!00000" }, verdict = "consistent", meaning = "The routine is created but refuses to run ATOMIC under *NONE." },
+  { label = "first insert stays", when = { state = "23505", n1 = "=1" }, verdict = "consistent", meaning = "ATOMIC is not honoured under *NONE: the first insert stayed." },
+  { label = "rolled back", when = { state = "23505", n1 = "=0" }, verdict = "contradicts", meaning = "The block was rolled back even under *NONE." },
+]
+
+[[procedure]]
+name = "V4_UNDO_CS"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE V_UNDONE INTEGER DEFAULT 0;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 43;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    BEGIN ATOMIC
+      DECLARE UNDO HANDLER FOR SQLEXCEPTION SET V_UNDONE = 1;
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (43, 1);
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (43, 1);
+    END;
+  END;
+  SET O_N2 = V_UNDONE;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 43;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V4-UNDO-CS"
+fact = "V4"
+role = "control"
+procedure = "V4_UNDO_CS"
+question = "Under *CS, does an UNDO handler roll the ATOMIC block back and then continue?"
+source = "IBM i 7.3 compound (dynamic): UNDO 'changes made by the compound statement are rolled back'; 'If UNDO is specified, then ATOMIC must be specified.'"
+outcome = [
+  { label = "undone", when = { create = "00000", state = "00000", n1 = "=0", n2 = "=1" }, verdict = "consistent", meaning = "The handler ran, the block's insert was undone, and no error escaped." },
+]
+
+[[procedure]]
+name = "V4_UNDO_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE V_UNDONE INTEGER DEFAULT 0;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 44;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    BEGIN ATOMIC
+      DECLARE UNDO HANDLER FOR SQLEXCEPTION SET V_UNDONE = 1;
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (44, 1);
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (44, 1);
+    END;
+  END;
+  SET O_N2 = V_UNDONE;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 44;
+END
+"""
+
+[[probe]]
+id = "V4-UNDO-NONE"
+fact = "V4"
+role = "decisive"
+procedure = "V4_UNDO_NONE"
+question = "Under *NONE, does an UNDO handler undo anything?"
+source = "Inference in vendor-facts V4; not documented."
+outcome = [
+  { label = "create rejected", when = { create = "!00000" }, verdict = "consistent", meaning = "Db2 for i refuses UNDO/ATOMIC in a *NONE routine; the create SQLSTATE is the rule." },
+  { label = "call rejected", when = { call = "!00000" }, verdict = "consistent", meaning = "The routine is created but refuses to run." },
+  { label = "handler error", when = { state = "!00000" }, verdict = "consistent", meaning = "The UNDO could not be carried out and raised an error (see the SQLSTATE)." },
+  { label = "nothing undone", when = { state = "00000", n1 = "=1", n2 = "=1" }, verdict = "consistent", meaning = "The UNDO handler ran but the first insert stayed." },
+  { label = "undone", when = { state = "00000", n1 = "=0", n2 = "=1" }, verdict = "contradicts", meaning = "The UNDO handler rolled the block back even under *NONE." },
+]
+
+[[procedure]]
+name = "V4_STMT_CS"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 45;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (45, 1), (45, 2), (45, 2);
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 45;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V4-STMT-CS"
+fact = "V4"
+role = "control"
+procedure = "V4_STMT_CS"
+question = "Under *CS, is a multi-row INSERT that fails on its third row undone as a whole?"
+source = "Statement atomicity under commitment control; ASM-DB2-COMMIT-CS ('each statement is atomic')."
+outcome = [
+  { label = "statement undone", when = { create = "00000", state = "23505", n1 = "=0" }, verdict = "consistent", meaning = "The failed statement left no rows." },
+]
+
+[[procedure]]
+name = "V4_STMT_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 46;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (46, 1), (46, 2), (46, 2);
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 46;
+END
+"""
+
+[[probe]]
+id = "V4-STMT-NONE"
+fact = "V4"
+role = "decisive"
+procedure = "V4_STMT_NONE"
+question = "Under *NONE, does a multi-row INSERT that fails on its third row keep the first two rows?"
+source = "ASM-DB2-COMMIT-CS: 'under *NONE nothing, not even a failed statement, is rolled back'. Not documented on the readable pages."
+outcome = [
+  { label = "rows stay", when = { create = "00000", state = "23505", n1 = "=2" }, verdict = "consistent", meaning = "The rows before the failing one stayed: a failed statement is not undone under *NONE." },
+  { label = "statement undone", when = { create = "00000", state = "23505", n1 = "=0" }, verdict = "contradicts", meaning = "Db2 for i undid the failed statement even under *NONE." },
+]
+
+[[procedure]]
+name = "V4_ROLLBACK_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 47;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (47, 1);
+    ROLLBACK;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 47;
+END
+"""
+
+[[probe]]
+id = "V4-ROLLBACK-NONE"
+fact = "V4"
+role = "decisive"
+procedure = "V4_ROLLBACK_NONE"
+question = "Under *NONE, is ROLLBACK accepted, and does it undo anything?"
+source = "IBM i 7.4 'Commitment control': changes made without commitment control cannot be rolled back. ASM-DB2-SCRIPT-COMMIT, ASM-TRY-HANDLER."
+outcome = [
+  { label = "accepted, nothing undone", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "ROLLBACK is accepted and does nothing under *NONE." },
+  { label = "rejected, nothing undone", when = { create = "00000", state = "!00000", n1 = "=1" }, verdict = "refines", meaning = "ROLLBACK raises an error under *NONE (see the SQLSTATE) instead of doing nothing; a converted CATCH would then fail." },
+  { label = "undone", when = { create = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "The insert was undone under *NONE." },
+]
+
+# ---------------------------------------------------------------- V9
+
+[[procedure]]
+name = "V9_CAST_INT"
+commit = "*NONE"
+params = "IN S VARCHAR(20)"
+body = """
+BEGIN
+  DECLARE V INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = CAST(S AS INTEGER);
+    SET O_N1 = V;
+  END;
+END
+"""
+
+[[procedure]]
+name = "V9_CAST_DEC"
+commit = "*NONE"
+params = "IN S VARCHAR(20)"
+body = """
+BEGIN
+  DECLARE V DECIMAL(9, 2);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = CAST(S AS DECIMAL(9, 2));
+    SET O_TEXT = TRIM(CHAR(V));
+  END;
+END
+"""
+
+[[procedure]]
+name = "V9_CAST_LITERAL"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE V INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = CAST('' AS INTEGER);
+    SET O_N1 = V;
+  END;
+END
+"""
+
+[[probe]]
+id = "V9-INT-PLAIN"
+fact = "V9"
+role = "control"
+procedure = "V9_CAST_INT"
+args = ["'12'"]
+question = "Control: CAST('12' AS INTEGER) gives 12."
+source = "IBM i casting rules (character to numeric)."
+outcome = [
+  { label = "12", when = { create = "00000", state = "00000", n1 = "=12" }, verdict = "consistent", meaning = "Plain digits cast." },
+]
+
+[[probe]]
+id = "V9-INT-ALPHA"
+fact = "V9"
+role = "control"
+procedure = "V9_CAST_INT"
+args = ["'abc'"]
+question = "Control: CAST('abc' AS INTEGER) raises an error; its SQLSTATE is the one an invalid string gives."
+source = "IBM i casting rules (character to numeric)."
+outcome = [
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Non-numeric text is rejected; the SQLSTATE recorded is the invalid-string state on this system." },
+]
+
+[[probe]]
+id = "V9-INT-EMPTY"
+fact = "V9"
+role = "decisive"
+procedure = "V9_CAST_INT"
+args = ["''"]
+question = "What does CAST('' AS INTEGER) do at run time? T-SQL gives 0."
+source = "ASM-FACT-V9: 'Db2 for i is expected to raise SQLSTATE 22018'. The IBM i casting page could not be read."
+outcome = [
+  { label = "22018", when = { state = "22018" }, verdict = "consistent", meaning = "Empty string raises 22018, as assumed." },
+  { label = "other error", when = { state = "!00000" }, verdict = "refines", meaning = "Empty string raises an error, but not 22018: correct the SQLSTATE in ASM-FACT-V9 and V9." },
+  { label = "zero", when = { state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "Db2 for i turns '' into 0, like T-SQL." },
+  { label = "null", when = { state = "00000", n1 = "null" }, verdict = "contradicts", meaning = "Db2 for i turns '' into NULL." },
+]
+
+[[probe]]
+id = "V9-INT-BLANK"
+fact = "V9"
+role = "decisive"
+procedure = "V9_CAST_INT"
+args = ["'   '"]
+question = "What does CAST('   ' AS INTEGER) (blanks only, as a CHAR column holds an empty value) do?"
+source = "ASM-FACT-V9: 'Equal if the value is never an empty or blank string'."
+outcome = [
+  { label = "22018", when = { state = "22018" }, verdict = "consistent", meaning = "Blanks raise 22018, as assumed." },
+  { label = "other error", when = { state = "!00000" }, verdict = "refines", meaning = "Blanks raise an error, but not 22018." },
+  { label = "zero", when = { state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "Db2 for i turns blanks into 0, like T-SQL." },
+  { label = "null", when = { state = "00000", n1 = "null" }, verdict = "contradicts", meaning = "Db2 for i turns blanks into NULL." },
+]
+
+[[probe]]
+id = "V9-INT-PADDED"
+fact = "V9"
+role = "decisive"
+procedure = "V9_CAST_INT"
+args = ["'  12  '"]
+question = "Does CAST('  12  ' AS INTEGER) ignore the blanks, as T-SQL does?"
+source = "ASM-FACT-V9 treats only empty and blank strings as different, so padded digits must give the same number."
+outcome = [
+  { label = "12", when = { state = "00000", n1 = "=12" }, verdict = "consistent", meaning = "Leading and trailing blanks are ignored." },
+  { label = "error", when = { state = "!00000" }, verdict = "contradicts", meaning = "Padded digits are rejected: ASM-FACT-V9 must cover them too." },
+]
+
+[[probe]]
+id = "V9-INT-DECIMAL-TEXT"
+fact = "V9"
+role = "info"
+procedure = "V9_CAST_INT"
+args = ["'1.5'"]
+question = "What does CAST('1.5' AS INTEGER) do? T-SQL raises a conversion error."
+source = "Open question; no expectation."
+outcome = [
+  { label = "error", when = { state = "!00000" }, verdict = "open", meaning = "Rejected, like T-SQL." },
+  { label = "truncated", when = { state = "00000", n1 = "=1" }, verdict = "open", meaning = "Accepted and truncated to 1, where T-SQL raises an error: a new conversion difference." },
+  { label = "rounded", when = { state = "00000", n1 = "=2" }, verdict = "open", meaning = "Accepted and rounded to 2, where T-SQL raises an error: a new conversion difference." },
+]
+
+[[probe]]
+id = "V9-DEC-EMPTY"
+fact = "V9"
+role = "decisive"
+procedure = "V9_CAST_DEC"
+args = ["''"]
+question = "What does CAST('' AS DECIMAL(9, 2)) do? T-SQL raises an error for DECIMAL (unlike INT)."
+source = "ASM-FACT-V9 speaks of a cast 'to a number'."
+outcome = [
+  { label = "22018", when = { state = "22018" }, verdict = "consistent", meaning = "Empty string raises 22018 for DECIMAL too." },
+  { label = "other error", when = { state = "!00000" }, verdict = "refines", meaning = "Raises an error, but not 22018." },
+  { label = "accepted", when = { state = "00000" }, verdict = "contradicts", meaning = "Accepted (value in text)." },
+]
+
+[[probe]]
+id = "V9-DEC-PADDED"
+fact = "V9"
+role = "control"
+procedure = "V9_CAST_DEC"
+args = ["' 1.5 '"]
+question = "Control: CAST(' 1.5 ' AS DECIMAL(9, 2)) gives 1.50."
+source = "Same rule as V9-INT-PADDED."
+outcome = [
+  { label = "1.50", when = { create = "00000", state = "00000", text = "contains:50" }, verdict = "consistent", meaning = "Padded decimal text casts (value in text)." },
+]
+
+[[probe]]
+id = "V9-LITERAL"
+fact = "V9"
+role = "decisive"
+procedure = "V9_CAST_LITERAL"
+question = "Is CAST('' AS INTEGER) with a constant rejected when the routine is created, or when it runs?"
+source = "ASM-FACT-V9."
+outcome = [
+  { label = "create rejected", when = { create = "!00000" }, verdict = "consistent", meaning = "The constant cast is rejected at create time (SQLSTATE in create)." },
+  { label = "22018 at run", when = { state = "22018" }, verdict = "consistent", meaning = "Rejected when it runs, with 22018." },
+  { label = "other error at run", when = { state = "!00000" }, verdict = "refines", meaning = "Rejected when it runs, but not with 22018." },
+  { label = "zero", when = { state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "The constant cast gives 0." },
+]
+
+# ---------------------------------------------------------------- V14
+
+[[procedure]]
+name = "V14_SAVEPOINT_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SAVEPOINT SP1 ON ROLLBACK RETAIN CURSORS;
+  END;
+END
+"""
+
+[[probe]]
+id = "V14-SAVEPOINT-NONE"
+fact = "V14"
+role = "decisive"
+procedure = "V14_SAVEPOINT_NONE"
+question = "Is SAVEPOINT refused when the routine runs under *NONE?"
+source = "IBM i 7.5 RELEASE SAVEPOINT: 'not allowed if commitment control is not active for the activation group'; the SAVEPOINT page could not be read. ASM-FACT-V14."
+outcome = [
+  { label = "create rejected", when = { create = "!00000" }, verdict = "consistent", meaning = "Refused when the routine is created." },
+  { label = "error", when = { state = "!00000" }, verdict = "consistent", meaning = "SAVEPOINT raises an error under *NONE (SQLSTATE recorded)." },
+  { label = "accepted", when = { state = "00000" }, verdict = "contradicts", meaning = "SAVEPOINT is accepted under *NONE." },
+]
+
+[[procedure]]
+name = "V14_SAVEPOINT_CS"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 142;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (142, 1);
+    SAVEPOINT SP1 ON ROLLBACK RETAIN CURSORS;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (142, 2);
+    ROLLBACK TO SAVEPOINT SP1;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 142;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V14-SAVEPOINT-CS"
+fact = "V14"
+role = "control"
+procedure = "V14_SAVEPOINT_CS"
+question = "Control: under *CS, ROLLBACK TO SAVEPOINT undoes only the work after the savepoint."
+source = "IBM i 7.1 'Savepoints' (SQL programming)."
+outcome = [
+  { label = "partial rollback", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "One row stayed." },
+]
+
+[[procedure]]
+name = "V14_ATOMIC_REACH"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 143;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (143, 1);
+    SAVEPOINT SP1 ON ROLLBACK RETAIN CURSORS;
+    BEGIN ATOMIC
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (143, 2);
+      ROLLBACK TO SAVEPOINT SP1;
+    END;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 143;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V14-ATOMIC-REACH"
+fact = "V14"
+role = "decisive"
+procedure = "V14_ATOMIC_REACH"
+question = "Can ROLLBACK TO SAVEPOINT inside an ATOMIC block reach a savepoint set outside it?"
+source = "IBM i 7.1 'Savepoints': an ATOMIC compound starts a new savepoint level and savepoints can only be referenced in their own level. ASM-FACT-V14."
+outcome = [
+  { label = "create rejected", when = { create = "!00000" }, verdict = "consistent", meaning = "Refused when the routine is created." },
+  { label = "error", when = { state = "!00000" }, verdict = "consistent", meaning = "The savepoint is not found from inside the ATOMIC block (SQLSTATE recorded)." },
+  { label = "reached", when = { state = "00000", n1 = "=1" }, verdict = "contradicts", meaning = "The outer savepoint was reached from inside the ATOMIC block." },
+]
+
+[[procedure]]
+name = "V14_ATOMIC_INNER"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 144;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    BEGIN ATOMIC
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (144, 1);
+      SAVEPOINT SP2 ON ROLLBACK RETAIN CURSORS;
+      INSERT INTO SQLDFPROBE.T (PRB, K) VALUES (144, 2);
+      ROLLBACK TO SAVEPOINT SP2;
+    END;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 144;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V14-ATOMIC-INNER"
+fact = "V14"
+role = "control"
+procedure = "V14_ATOMIC_INNER"
+question = "Control: a savepoint set inside an ATOMIC block can be rolled back to inside it."
+source = "IBM i 7.3 compound (dynamic): ROLLBACK TO SAVEPOINT may be specified in an ATOMIC compound."
+outcome = [
+  { label = "partial rollback", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "One row stayed." },
+]
+
+# ---------------------------------------------------------------- V15
+
+[[procedure]]
+name = "V15_KEEP_CS"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 151;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V) VALUES (151, 1, 7);
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT V INTO X FROM SQLDFPROBE.T WHERE PRB = 151 AND K = 1
+      WITH RS USE AND KEEP EXCLUSIVE LOCKS;
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_TEXT = 'lock view failed';
+    SELECT COUNT(*), COALESCE(MIN(LOCK_STATE), '') || '/'
+        || COALESCE(MAX(LOCK_STATE), '')
+      INTO O_N1, O_TEXT FROM QSYS2.RECORD_LOCK_INFO
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'T';
+  END;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = -1;
+    SELECT COUNT(*) INTO O_N2 FROM QSYS2.RECORD_LOCK_INFO
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'T';
+  END;
+END
+"""
+
+[[probe]]
+id = "V15-KEEP-CS"
+fact = "V15"
+role = "decisive"
+procedure = "V15_KEEP_CS"
+question = "In a *CS routine (what the converter emits), is SELECT INTO ... WITH RS USE AND KEEP EXCLUSIVE LOCKS accepted, and does it hold an exclusive record lock until COMMIT?"
+source = "IBM i 7.3 'Isolation level': the isolation clause is allowed on SELECT INTO. Lock-request rules unreadable. Lock-hint note in tsql.rs. QSYS2.RECORD_LOCK_INFO (IBM i 7.3) reports LOCK_STATE, for example 'UPDATE'."
+outcome = [
+  { label = "exclusive lock held", when = { create = "00000", state = "00000", n1 = ">=1", text = "contains:UPDATE", n2 = "=0" }, verdict = "consistent", meaning = "Accepted; an UPDATE record lock is held until COMMIT and released by it." },
+  { label = "read lock only", when = { create = "00000", state = "00000", n1 = ">=1", n2 = "=0" }, verdict = "refines", meaning = "Accepted, but the lock held is not an UPDATE lock (states in text)." },
+  { label = "no lock", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "Accepted, but no record lock is held after the SELECT INTO." },
+  { label = "lock view unreadable", when = { create = "00000", state = "00000", text = "contains:lock view failed" }, verdict = "open", meaning = "QSYS2.RECORD_LOCK_INFO could not be read; only acceptance is known." },
+  { label = "create rejected", when = { create = "!00000" }, verdict = "contradicts", meaning = "The clause is not allowed on SELECT INTO in a routine (SQLSTATE in create)." },
+  { label = "run error", when = { state = "!00000" }, verdict = "contradicts", meaning = "The statement fails when it runs." },
+]
+
+[[procedure]]
+name = "V15_KEEP_CHG"
+commit = "*CHG"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 153;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V) VALUES (153, 1, 7);
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT V INTO X FROM SQLDFPROBE.T WHERE PRB = 153 AND K = 1
+      WITH RS USE AND KEEP EXCLUSIVE LOCKS;
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_TEXT = 'lock view failed';
+    SELECT COUNT(*), COALESCE(MIN(LOCK_STATE), '') || '/'
+        || COALESCE(MAX(LOCK_STATE), '')
+      INTO O_N1, O_TEXT FROM QSYS2.RECORD_LOCK_INFO
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'T';
+  END;
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = -1;
+    SELECT COUNT(*) INTO O_N2 FROM QSYS2.RECORD_LOCK_INFO
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'T';
+  END;
+END
+"""
+
+[[probe]]
+id = "V15-KEEP-CHG"
+fact = "V15"
+role = "decisive"
+procedure = "V15_KEEP_CHG"
+question = "The same under *CHG, the level vendor-facts V15 asks to test."
+source = "As V15-KEEP-CS."
+outcome = [
+  { label = "exclusive lock held", when = { create = "00000", state = "00000", n1 = ">=1", text = "contains:UPDATE", n2 = "=0" }, verdict = "consistent", meaning = "Accepted; an UPDATE record lock is held until COMMIT and released by it." },
+  { label = "read lock only", when = { create = "00000", state = "00000", n1 = ">=1", n2 = "=0" }, verdict = "refines", meaning = "Accepted, but the lock held is not an UPDATE lock (states in text)." },
+  { label = "no lock", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "Accepted, but no record lock is held after the SELECT INTO." },
+  { label = "lock view unreadable", when = { create = "00000", state = "00000", text = "contains:lock view failed" }, verdict = "open", meaning = "QSYS2.RECORD_LOCK_INFO could not be read; only acceptance is known." },
+  { label = "create rejected", when = { create = "!00000" }, verdict = "contradicts", meaning = "The clause is not allowed on SELECT INTO in a routine (SQLSTATE in create)." },
+  { label = "run error", when = { state = "!00000" }, verdict = "contradicts", meaning = "The statement fails when it runs." },
+]
+
+[[procedure]]
+name = "V15_RS_PLAIN"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 152;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V) VALUES (152, 1, 7);
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT V INTO X FROM SQLDFPROBE.T WHERE PRB = 152 AND K = 1 WITH RS;
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_TEXT = 'lock view failed';
+    SELECT COUNT(*), COALESCE(MIN(LOCK_STATE), '') || '/'
+        || COALESCE(MAX(LOCK_STATE), '')
+      INTO O_N1, O_TEXT FROM QSYS2.RECORD_LOCK_INFO
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'T';
+  END;
+  COMMIT;
+END
+"""
+
+[[probe]]
+id = "V15-RS-PLAIN"
+fact = "V15"
+role = "info"
+procedure = "V15_RS_PLAIN"
+question = "For comparison: which record lock does plain WITH RS hold after a SELECT INTO?"
+source = "Open question; shows what the lock clause adds."
+outcome = [
+  { label = "lock held", when = { create = "00000", state = "00000", n1 = ">=1" }, verdict = "open", meaning = "Lock states in text." },
+  { label = "no lock", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "No record lock after the SELECT INTO." },
+  { label = "lock view unreadable", when = { text = "contains:lock view failed" }, verdict = "open", meaning = "QSYS2.RECORD_LOCK_INFO could not be read." },
+  { label = "error", when = { state = "!00000" }, verdict = "open", meaning = "See the SQLSTATE." },
+]
+
+[[procedure]]
+name = "V15_KEEP_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 154;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V) VALUES (154, 1, 7);
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT V INTO X FROM SQLDFPROBE.T WHERE PRB = 154 AND K = 1
+      WITH RS USE AND KEEP EXCLUSIVE LOCKS;
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_TEXT = 'lock view failed';
+    SELECT COUNT(*), COALESCE(MIN(LOCK_STATE), '') || '/'
+        || COALESCE(MAX(LOCK_STATE), '')
+      INTO O_N1, O_TEXT FROM QSYS2.RECORD_LOCK_INFO
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'T';
+  END;
+END
+"""
+
+[[probe]]
+id = "V15-KEEP-NONE"
+fact = "V15"
+role = "info"
+procedure = "V15_KEEP_NONE"
+question = "In a *NONE routine, is the statement-level WITH RS USE AND KEEP EXCLUSIVE LOCKS accepted, and does it lock?"
+source = "Vendor-facts V15 asks whether it is a no-op or an error under *NONE; no expectation."
+outcome = [
+  { label = "create rejected", when = { create = "!00000" }, verdict = "open", meaning = "Refused at create (SQLSTATE in create)." },
+  { label = "run error", when = { state = "!00000" }, verdict = "open", meaning = "Fails when it runs." },
+  { label = "lock held", when = { state = "00000", n1 = ">=1" }, verdict = "open", meaning = "The statement-level RS still locks the row (states in text); the lock lasts until the next commit boundary." },
+  { label = "no lock", when = { state = "00000", n1 = "=0" }, verdict = "open", meaning = "Accepted and no lock is held: a no-op under *NONE." },
+  { label = "lock view unreadable", when = { text = "contains:lock view failed" }, verdict = "open", meaning = "QSYS2.RECORD_LOCK_INFO could not be read." },
+]
+
+# ---------------------------------------------------------------- V3
+
+[[procedure]]
+name = "V3_MERGE_DUP_CS"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 31;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V)
+    VALUES (31, 1, 0), (31, 2, 0), (31, 3, 0);
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    MERGE INTO SQLDFPROBE.T AS TGT
+      USING (VALUES (1, 10), (2, 20), (2, 21), (3, 30)) AS SRC (K, V)
+      ON TGT.PRB = 31 AND TGT.K = SRC.K
+      WHEN MATCHED THEN UPDATE SET V = SRC.V;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 31 AND V <> 0;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V3-MERGE-DUP-CS"
+fact = "V3"
+role = "decisive"
+procedure = "V3_MERGE_DUP_CS"
+question = "Under *CS, which SQLSTATE does a MERGE raise when two source rows match one target row, and is the whole MERGE undone?"
+source = "IBM i 7.5 MERGE: 'Each row in the target can only be operated on once'; ATOMIC is the default. The SQLSTATE is not on the page."
+outcome = [
+  { label = "error, nothing changed", when = { create = "00000", state = "!00000", n1 = "=0" }, verdict = "consistent", meaning = "Rejected (the SQLSTATE recorded is the one to put in V3) and no row changed." },
+  { label = "error, rows changed", when = { create = "00000", state = "!00000", n1 = ">0" }, verdict = "contradicts", meaning = "Rejected, but some rows stayed changed under *CS: the ATOMIC default did not hold." },
+  { label = "accepted", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "The MERGE ran without error (n1 rows changed)." },
+]
+
+[[procedure]]
+name = "V3_MERGE_DUP_NONE"
+commit = "*NONE"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 32;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V)
+    VALUES (32, 1, 0), (32, 2, 0), (32, 3, 0);
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    MERGE INTO SQLDFPROBE.T AS TGT
+      USING (VALUES (1, 10), (2, 20), (2, 21), (3, 30)) AS SRC (K, V)
+      ON TGT.PRB = 32 AND TGT.K = SRC.K
+      WHEN MATCHED THEN UPDATE SET V = SRC.V;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 32 AND V <> 0;
+END
+"""
+
+[[probe]]
+id = "V3-MERGE-DUP-NONE"
+fact = "V3"
+role = "decisive"
+procedure = "V3_MERGE_DUP_NONE"
+question = "Under *NONE, is the duplicate detected before any row changes, or do earlier rows stay changed?"
+source = "IBM i 7.5 MERGE: 'ATOMIC is only honored when the statement is run with an isolation level other than No Commit' (V2). When the duplicate is detected is not documented."
+outcome = [
+  { label = "detected first", when = { create = "00000", state = "!00000", n1 = "=0" }, verdict = "open", meaning = "Rejected before any row changed." },
+  { label = "partial", when = { create = "00000", state = "!00000", n1 = ">0" }, verdict = "open", meaning = "Rejected after some rows changed; they stay changed (n1 rows)." },
+  { label = "accepted", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "The MERGE ran without error." },
+]
+
+[[procedure]]
+name = "V3_MERGE_DUP_NOT_ATOMIC"
+commit = "*CS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  DELETE FROM SQLDFPROBE.T WHERE PRB = 33;
+  INSERT INTO SQLDFPROBE.T (PRB, K, V)
+    VALUES (33, 1, 0), (33, 2, 0), (33, 3, 0);
+  COMMIT;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    MERGE INTO SQLDFPROBE.T AS TGT
+      USING (VALUES (1, 10), (2, 20), (2, 21), (3, 30)) AS SRC (K, V)
+      ON TGT.PRB = 33 AND TGT.K = SRC.K
+      WHEN MATCHED THEN UPDATE SET V = SRC.V
+      NOT ATOMIC CONTINUE ON SQLEXCEPTION;
+  END;
+  SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T WHERE PRB = 33 AND V <> 0;
+  ROLLBACK;
+END
+"""
+
+[[probe]]
+id = "V3-MERGE-DUP-NOT-ATOMIC"
+fact = "V3"
+role = "info"
+procedure = "V3_MERGE_DUP_NOT_ATOMIC"
+question = "With NOT ATOMIC CONTINUE ON SQLEXCEPTION, how many target rows end up changed when one has two source rows?"
+source = "IBM i 7.5 MERGE: NOT ATOMIC keeps the changes made before the failing row. No expectation for the count."
+outcome = [
+  { label = "error raised", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "An error still reached the caller (n1 rows changed)." },
+  { label = "continued", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "No error reached the caller; n1 rows changed (a warning may have been returned)." },
+]
+
+# ---------------------------------------------------------------- V7 / V16
+
+[[procedure]]
+name = "V7_DGTT_DEFAULT"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE V_SQL VARCHAR(500);
+  DECLARE C1 CURSOR FOR S1;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V_SQL = 'DECLARE GLOBAL TEMPORARY TABLE SESSION.SQLDFP71 '
+      || '(K INTEGER) ON COMMIT PRESERVE ROWS WITH REPLACE';
+    EXECUTE IMMEDIATE V_SQL;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP71 (K) VALUES (1)';
+    EXECUTE IMMEDIATE V_SQL;
+    COMMIT;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP71 (K) VALUES (2)';
+    EXECUTE IMMEDIATE V_SQL;
+    ROLLBACK;
+    SET V_SQL = 'SELECT COUNT(*) FROM SESSION.SQLDFP71';
+    PREPARE S1 FROM V_SQL;
+    OPEN C1;
+    FETCH C1 INTO O_N1;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V7-DGTT-DEFAULT"
+fact = "V7"
+role = "info"
+procedure = "V7_DGTT_DEFAULT"
+question = "Is a DGTT declared without LOGGED or NOT LOGGED logged? (Insert 1, COMMIT, insert 2, ROLLBACK, count.)"
+source = "IBM i 7.5 DECLARE GLOBAL TEMPORARY TABLE: the default of LOGGED/NOT LOGGED was not in the section read. The converter always writes one of them."
+outcome = [
+  { label = "LOGGED", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "The rollback undid only the second insert: the default is LOGGED." },
+  { label = "NOT LOGGED", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "The rollback emptied the table: the default is NOT LOGGED (with ON ROLLBACK DELETE ROWS)." },
+  { label = "error", when = { state = "!00000" }, verdict = "open", meaning = "See the SQLSTATE." },
+]
+
+[[procedure]]
+name = "V7_DGTT_LOGGED"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE V_SQL VARCHAR(500);
+  DECLARE C1 CURSOR FOR S1;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V_SQL = 'DECLARE GLOBAL TEMPORARY TABLE SESSION.SQLDFP72 '
+      || '(K INTEGER) ON COMMIT PRESERVE ROWS LOGGED WITH REPLACE';
+    EXECUTE IMMEDIATE V_SQL;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP72 (K) VALUES (1)';
+    EXECUTE IMMEDIATE V_SQL;
+    COMMIT;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP72 (K) VALUES (2)';
+    EXECUTE IMMEDIATE V_SQL;
+    ROLLBACK;
+    SET V_SQL = 'SELECT COUNT(*) FROM SESSION.SQLDFP72';
+    PREPARE S1 FROM V_SQL;
+    OPEN C1;
+    FETCH C1 INTO O_N1;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V7-DGTT-LOGGED"
+fact = "V7"
+role = "decisive"
+procedure = "V7_DGTT_LOGGED"
+question = "Does the converter's #temp lowering (ON COMMIT PRESERVE ROWS LOGGED WITH REPLACE) undo only the rolled-back insert?"
+source = "IBM i 7.5 DECLARE GLOBAL TEMPORARY TABLE; ASM-TEMP-TABLE."
+outcome = [
+  { label = "rolled back", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "The committed row stayed, the rolled-back one is gone, as for a T-SQL #temp table." },
+  { label = "not rolled back", when = { create = "00000", state = "00000", n1 = "=2" }, verdict = "contradicts", meaning = "LOGGED did not make the DGTT transactional." },
+  { label = "emptied", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "The rollback emptied the table." },
+]
+
+[[procedure]]
+name = "V16_DGTT_NL_PRESERVE"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE V_SQL VARCHAR(500);
+  DECLARE C1 CURSOR FOR S1;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V_SQL = 'DECLARE GLOBAL TEMPORARY TABLE SESSION.SQLDFP73 '
+      || '(K INTEGER) ON COMMIT PRESERVE ROWS NOT LOGGED '
+      || 'ON ROLLBACK PRESERVE ROWS WITH REPLACE';
+    EXECUTE IMMEDIATE V_SQL;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP73 (K) VALUES (1)';
+    EXECUTE IMMEDIATE V_SQL;
+    COMMIT;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP73 (K) VALUES (2)';
+    EXECUTE IMMEDIATE V_SQL;
+    ROLLBACK;
+    SET V_SQL = 'SELECT COUNT(*) FROM SESSION.SQLDFP73';
+    PREPARE S1 FROM V_SQL;
+    OPEN C1;
+    FETCH C1 INTO O_N1;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V16-DGTT-NL-PRESERVE"
+fact = "V16"
+role = "decisive"
+procedure = "V16_DGTT_NL_PRESERVE"
+question = "Does the converter's table-variable lowering (NOT LOGGED ON ROLLBACK PRESERVE ROWS) keep both rows through a ROLLBACK, as a T-SQL table variable does?"
+source = "IBM i 7.5 DECLARE GLOBAL TEMPORARY TABLE; ASM-TABLE-VARIABLE."
+outcome = [
+  { label = "kept", when = { create = "00000", state = "00000", n1 = "=2" }, verdict = "consistent", meaning = "Both rows survived the rollback." },
+  { label = "rolled back", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "contradicts", meaning = "The rolled-back insert was undone." },
+  { label = "emptied", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "The rollback emptied the table." },
+]
+
+[[procedure]]
+name = "V16_DGTT_NL_DEFAULT"
+commit = "*CS"
+body = """
+BEGIN
+  DECLARE V_SQL VARCHAR(500);
+  DECLARE C1 CURSOR FOR S1;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V_SQL = 'DECLARE GLOBAL TEMPORARY TABLE SESSION.SQLDFP74 '
+      || '(K INTEGER) ON COMMIT PRESERVE ROWS NOT LOGGED WITH REPLACE';
+    EXECUTE IMMEDIATE V_SQL;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP74 (K) VALUES (1)';
+    EXECUTE IMMEDIATE V_SQL;
+    COMMIT;
+    SET V_SQL = 'INSERT INTO SESSION.SQLDFP74 (K) VALUES (2)';
+    EXECUTE IMMEDIATE V_SQL;
+    ROLLBACK;
+    SET V_SQL = 'SELECT COUNT(*) FROM SESSION.SQLDFP74';
+    PREPARE S1 FROM V_SQL;
+    OPEN C1;
+    FETCH C1 INTO O_N1;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V16-DGTT-NL-DEFAULT"
+fact = "V16"
+role = "decisive"
+procedure = "V16_DGTT_NL_DEFAULT"
+question = "Does a NOT LOGGED DGTT without an ON ROLLBACK clause lose all rows on ROLLBACK (the documented default ON ROLLBACK DELETE ROWS)?"
+source = "IBM i 7.5 DECLARE GLOBAL TEMPORARY TABLE: ON ROLLBACK DELETE ROWS is the default; 'All rows of the table will be deleted.'"
+outcome = [
+  { label = "emptied", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "consistent", meaning = "The rollback deleted all rows, as documented." },
+  { label = "kept", when = { create = "00000", state = "00000", n1 = "=2" }, verdict = "contradicts", meaning = "Rows survived: the default is not DELETE ROWS here." },
+  { label = "rolled back", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "contradicts", meaning = "Behaved like a logged table." },
+]
+
+# ---------------------------------------------------------------- V19
+
+[[procedure]]
+name = "V19_ASC"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  DECLARE C1 CURSOR FOR
+    SELECT K FROM (VALUES (1), (CAST(NULL AS INTEGER)), (2)) AS Q (K)
+    ORDER BY K ASC;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    OPEN C1;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 1; END IF;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 2; END IF;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 3; END IF;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V19-ORDER-ASC"
+fact = "V19"
+role = "decisive"
+procedure = "V19_ASC"
+question = "Where does NULL sort in ORDER BY ... ASC? (n1 is its position among 1, NULL, 2.)"
+source = "The engine assumes Db2 for i sorts NULL as the highest value (sqldiff-core equiv/canon.rs). The IBM i ORDER BY page could not be read."
+outcome = [
+  { label = "last", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "consistent", meaning = "NULL is the highest value in ascending order." },
+  { label = "first", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "contradicts", meaning = "NULL is the lowest value in ascending order." },
+]
+
+[[procedure]]
+name = "V19_DESC"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  DECLARE C1 CURSOR FOR
+    SELECT K FROM (VALUES (1), (CAST(NULL AS INTEGER)), (2)) AS Q (K)
+    ORDER BY K DESC;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    OPEN C1;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 1; END IF;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 2; END IF;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 3; END IF;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V19-ORDER-DESC"
+fact = "V19"
+role = "decisive"
+procedure = "V19_DESC"
+question = "Where does NULL sort in ORDER BY ... DESC?"
+source = "As V19-ORDER-ASC."
+outcome = [
+  { label = "first", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "NULL is the highest value, so it comes first in descending order." },
+  { label = "last", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "contradicts", meaning = "NULL comes last in descending order." },
+]
+
+[[procedure]]
+name = "V19_NULLS_FIRST"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE X INTEGER;
+  DECLARE C1 CURSOR FOR
+    SELECT K FROM (VALUES (1), (CAST(NULL AS INTEGER)), (2)) AS Q (K)
+    ORDER BY K ASC NULLS FIRST;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    OPEN C1;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 1; END IF;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 2; END IF;
+    FETCH C1 INTO X;
+    IF X IS NULL THEN SET O_N1 = 3; END IF;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V19-NULLS-FIRST"
+fact = "V19"
+role = "decisive"
+procedure = "V19_NULLS_FIRST"
+question = "Is ORDER BY ... ASC NULLS FIRST accepted, and does it put NULL first?"
+source = "The engine reads NULLS FIRST/LAST in Db2 for i code; vendor-facts V19 lists it as available, unconfirmed for IBM i."
+outcome = [
+  { label = "supported", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "NULLS FIRST is supported and honoured." },
+  { label = "not supported", when = { create = "!00000" }, verdict = "refines", meaning = "NULLS FIRST is not accepted on this release (SQLSTATE in create)." },
+  { label = "ignored", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "contradicts", meaning = "Accepted but NULL still sorted last." },
+]
+
+# ---------------------------------------------------------------- V25
+# Each procedure reads its own program attributes from QSYS2.PROGRAM_INFO; text
+# is USRPRF/DYNUSRPRF/naming, for example *OWNER/*OWNER/*SQL. The procedure names
+# fit 10 characters, so the program has the same name. It then reads
+# SQLDFPROBE.T: n2 = 1 if that read was refused (only meaningful when a user
+# without authority to T calls it by hand, see the README).
+
+[[procedure]]
+name = "V25SQL"
+commit = "*NONE"
+# Created by the interface (SQL naming, as the README asks), with no USRPRF.
+top_level = true
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2.PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25SQL'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-SQL-NAMING"
+fact = "V25"
+role = "decisive"
+procedure = "V25SQL"
+question = "Which USRPRF does a procedure get when it is created under SQL naming without SET OPTION USRPRF (the *NAMING default)?"
+source = "IBM i CREATE PROCEDURE (SQL), SET OPTION USRPRF *NAMING, as summarised in vendor-facts V25: *OWNER under SQL naming. QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "owner", when = { create = "00000", state = "00000", text = 'regex:\*OWNER/.*/\*SQL' }, verdict = "consistent", meaning = "Under SQL naming the default adopts the owner's authority (text also shows DYNUSRPRF)." },
+  { label = "user", when = { create = "00000", state = "00000", text = 'regex:\*USER/.*/\*SQL' }, verdict = "contradicts", meaning = "Under SQL naming the default is the caller's authority only." },
+  { label = "not SQL naming", when = { create = "00000", state = "00000", text = 'regex:\*(OWNER|USER)/.*/\*SYS' }, verdict = "open", meaning = "The interface created the routine under system naming, so this run does not answer the SQL naming case; rerun with SQL naming." },
+  { label = "view unreadable", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "QSYS2.PROGRAM_INFO could not be read (SQLSTATE in state)." },
+]
+
+[[procedure]]
+name = "V25SYS"
+commit = "*NONE"
+naming = "*SYS"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2/PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25SYS'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE/T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-SYS-NAMING"
+fact = "V25"
+role = "decisive"
+procedure = "V25SYS"
+question = "Which USRPRF does a procedure get when it is created under system naming without SET OPTION USRPRF?"
+source = "IBM i CREATE PROCEDURE (SQL), SET OPTION USRPRF *NAMING, as summarised in vendor-facts V25: *USER under system naming. The procedure is created by RUN_DDL_SYS (SET OPTION NAMING = *SYS). QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "user", when = { create = "00000", state = "00000", text = 'regex:\*USER/.*/\*SYS' }, verdict = "consistent", meaning = "Under system naming the default is the caller's authority (text also shows DYNUSRPRF)." },
+  { label = "owner", when = { create = "00000", state = "00000", text = 'regex:\*OWNER/.*/\*SYS' }, verdict = "contradicts", meaning = "Under system naming the default still adopts the owner's authority." },
+  { label = "not system naming", when = { create = "00000", state = "00000", text = 'regex:\*(OWNER|USER)/.*/\*SQL' }, verdict = "open", meaning = "RUN_DDL_SYS did not create the routine under system naming, so this run does not answer the system naming case." },
+  { label = "view unreadable", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "QSYS2.PROGRAM_INFO could not be read (SQLSTATE in state)." },
+]
+
+[[procedure]]
+name = "V25USR"
+commit = "*NONE"
+options = "USRPRF = *USER, DYNUSRPRF = *USER"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2.PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25USR'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-EXPLICIT-USER"
+fact = "V25"
+role = "control"
+procedure = "V25USR"
+question = "Control: SET OPTION USRPRF = *USER, DYNUSRPRF = *USER (what the converter writes for EXECUTE AS CALLER) shows as *USER/*USER."
+source = "QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "user", when = { create = "00000", state = "00000", text = "prefix:*USER/*USER/" }, verdict = "consistent", meaning = "The attributes read back as written." },
+]
+
+[[procedure]]
+name = "V25OWN"
+commit = "*NONE"
+options = "USRPRF = *OWNER, DYNUSRPRF = *OWNER"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SELECT USER_PROFILE || '/' || COALESCE(SQL_DYNAMIC_USER_PROFILE, '-')
+        || '/' || COALESCE(SQL_NAMING, '-')
+      INTO O_TEXT FROM QSYS2.PROGRAM_INFO
+      WHERE PROGRAM_LIBRARY = 'SQLDFPROBE' AND PROGRAM_NAME = 'P_V25OWN'
+        AND OBJECT_TYPE = '*PGM';
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION SET O_N2 = 1;
+    SET O_N2 = 0;
+    SELECT COUNT(*) INTO O_N1 FROM SQLDFPROBE.T;
+  END;
+END
+"""
+
+[[probe]]
+id = "V25-EXPLICIT-OWNER"
+fact = "V25"
+role = "control"
+procedure = "V25OWN"
+question = "Control: SET OPTION USRPRF = *OWNER, DYNUSRPRF = *OWNER (what the converter writes for EXECUTE AS OWNER) shows as *OWNER/*OWNER."
+source = "QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program was created with (*OWNER adds the owner's authority to the current user's, *USER uses the current user's), SQL_DYNAMIC_USER_PROFILE the DYNUSRPRF, SQL_NAMING the naming."
+outcome = [
+  { label = "owner", when = { create = "00000", state = "00000", text = "prefix:*OWNER/*OWNER/" }, verdict = "consistent", meaning = "The attributes read back as written." },
+]

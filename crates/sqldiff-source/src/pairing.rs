@@ -61,6 +61,63 @@ pub fn key(name: &str, rule: &PairingRule) -> String {
         .collect()
 }
 
+/// `ns:schema.name` with the default schemas (`dbo`, `public`) as none.
+fn object_identity(defines: &str) -> Option<(&str, &str, &str)> {
+    let (ns, rest) = defines.split_once(':')?;
+    let (schema, name) = rest.rsplit_once('.')?;
+    let schema = match schema {
+        "dbo" | "public" => "",
+        s => s,
+    };
+    Some((ns, schema, name))
+}
+
+/// Pairs left over after pairing by key, where one side holds a file with
+/// one object and the other the same file split into several (ids
+/// `path#name`): the whole file pairs with the object it defines when the
+/// file would have paired by key unsplit, and both are the only candidates
+/// for each other. `key` is the key of an object, `file_key` the key the
+/// file of a split object has as a whole.
+pub(crate) fn split_matches<'o>(
+    a: &[&'o ObjectInfo],
+    b: &[&'o ObjectInfo],
+    key: impl Fn(&ObjectInfo) -> String,
+    file_key: impl Fn(&ObjectInfo, &str) -> String,
+) -> Vec<(&'o ObjectInfo, &'o ObjectInfo)> {
+    let mut found: Vec<(&ObjectInfo, &ObjectInfo)> = Vec::new();
+    for (wholes, parts, whole_is_a) in [(a, b, true), (b, a, false)] {
+        for w in wholes {
+            if crate::split::split_id(&w.id).1.is_some() {
+                continue;
+            }
+            let Some(wd) = w.defines.as_deref().and_then(object_identity) else {
+                continue;
+            };
+            let wk = key(w);
+            for p in parts {
+                let (rel, Some(_)) = crate::split::split_id(&p.id) else {
+                    continue;
+                };
+                let same = p.defines.as_deref().and_then(object_identity) == Some(wd);
+                if same && file_key(p, rel) == wk {
+                    found.push(if whole_is_a { (w, p) } else { (p, w) });
+                }
+            }
+        }
+    }
+    let count = |id: &str| {
+        found
+            .iter()
+            .filter(|(x, y)| x.id == id || y.id == id)
+            .count()
+    };
+    found
+        .iter()
+        .filter(|(x, y)| count(&x.id) == 1 && count(&y.id) == 1)
+        .copied()
+        .collect()
+}
+
 fn dialect_of(o: &ObjectInfo) -> Option<Dialect> {
     o.dialect.as_deref().and_then(|d| d.parse().ok())
 }
@@ -173,7 +230,7 @@ pub fn pair(objects: &[ObjectInfo], config: &Resolved, scope: &PairScope) -> Res
         }
     };
     let mut paired: BTreeSet<&str> = BTreeSet::new();
-    for (da, db) in combos {
+    for &(da, db) in &combos {
         for ((d, k), a) in unique.range((da, String::new())..) {
             if *d != da {
                 break;
@@ -188,6 +245,33 @@ pub fn pair(objects: &[ObjectInfo], config: &Resolved, scope: &PairScope) -> Res
                     rule: rule_of.get(a.id.as_str()).cloned().unwrap_or_default(),
                 });
             }
+        }
+    }
+    // One object of a file split on one side only.
+    for (da, db) in combos {
+        let left = |d: Dialect| -> Vec<&ObjectInfo> {
+            unique
+                .iter()
+                .filter(|((x, _), o)| *x == d && !paired.contains(o.id.as_str()))
+                .map(|(_, o)| *o)
+                .collect()
+        };
+        let (la, lb) = (left(da), left(db));
+        let rule = |o: &ObjectInfo, id: &str| config.pairing_rule(id, dialect_of(o));
+        for (a, b) in split_matches(
+            &la,
+            &lb,
+            |o| key(&o.name, &rule(o, &o.id)),
+            |o, rel| key(&crate::walk::object_name(rel), &rule(o, rel)),
+        ) {
+            paired.insert(&a.id);
+            paired.insert(&b.id);
+            out.pairs.push(Pair {
+                a: a.id.clone(),
+                b: b.id.clone(),
+                key: format!("{} = {}", a.id, b.id),
+                rule: "split-object".to_string(),
+            });
         }
     }
     out.unpaired = unique
@@ -222,6 +306,43 @@ pub fn pair_versions(a: &[ObjectInfo], b: &[ObjectInfo]) -> (Vec<Pair>, Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(id: &str, name: &str, defines: &str) -> ObjectInfo {
+        ObjectInfo {
+            id: id.into(),
+            kind: "procedure".into(),
+            dialect: None,
+            version: None,
+            name: name.into(),
+            content_hash: String::new(),
+            bytes: 0,
+            last_changed: None,
+            stale: false,
+            defines: Some(defines.into()),
+        }
+    }
+
+    #[test]
+    fn split_matches_need_one_candidate_each() {
+        let whole = info("s.sql", "s", "routine:.t");
+        let t = info("s.sql#t", "t", "routine:dbo.t");
+        let t2 = info("s.sql#t~2", "t", "routine:dbo.t");
+        let other = info("s.sql#t", "t", "routine:sales.t");
+        let k = |o: &ObjectInfo| o.name.clone();
+        let fk = |_: &ObjectInfo, rel: &str| crate::walk::object_name(rel);
+        let ids = |m: Vec<(&ObjectInfo, &ObjectInfo)>| -> Vec<(String, String)> {
+            m.iter()
+                .map(|(a, b)| (a.id.clone(), b.id.clone()))
+                .collect()
+        };
+        assert_eq!(
+            ids(split_matches(&[&t], &[&whole], k, fk)),
+            [("s.sql#t".to_string(), "s.sql".to_string())]
+        );
+        assert!(split_matches(&[&t, &t2], &[&whole], k, fk).is_empty());
+        assert!(split_matches(&[&other], &[&whole], k, fk).is_empty());
+        assert!(split_matches(&[&t], &[&t2], k, fk).is_empty());
+    }
 
     #[test]
     fn keys() {

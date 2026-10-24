@@ -1,4 +1,4 @@
-# Vendor facts verification (design doc section 13, V1 to V24)
+# Vendor facts verification (design doc section 13, V1 to V25)
 
 Checked against official vendor documentation on 2026-10-23. Target versions are **SQL Server 2022** and **PostgreSQL 18**. Db2 for i was checked against the IBM i 7.4 to 7.6 docs.
 
@@ -44,6 +44,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V22 | Deferrable constraints | Confirmed | When each error surfaces, below. |
 | V23 | `plpgsql.variable_conflict` | Confirmed | Default `error`. |
 | V24 | Volatility and strictness | Confirmed | Defaults `VOLATILE` and `CALLED ON NULL INPUT`. |
+| V25 | Routine security context | Confirmed (T-SQL, PG), Unverified (Db2 i) | Owner vs caller privileges per dialect; Db2 i default `USRPRF *NAMING` needs a test. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -189,7 +190,7 @@ The lowering of table variables to DGTTs must emit `NOT LOGGED ON ROLLBACK PRESE
 - Not inside a block with an `EXCEPTION` clause (it is a subtransaction). PL/pgSQL has no `SAVEPOINT` statements.
 - Not in cursor loops driven by non-read-only commands; read-only cursor loops are converted to holdable cursors at the first COMMIT, and their locks are released.
 - `COMMIT AND CHAIN` / `ROLLBACK AND CHAIN` keep transaction characteristics.
-- Not on these pages: `SECURITY DEFINER` and `SET` clauses on the procedure (also block transaction control; check [CREATE PROCEDURE](https://www.postgresql.org/docs/18/sql-createprocedure.html) by hand).
+- `SECURITY DEFINER` and `SET` clauses on the procedure block transaction control: "A `SECURITY DEFINER` procedure cannot execute transaction control statements (for example, `COMMIT` and `ROLLBACK`, depending on the language)", and the same sentence for a `SET` clause ([CREATE PROCEDURE](https://www.postgresql.org/docs/18/sql-createprocedure.html), checked 2026-10-24).
 
 Sources: [PL/pgSQL transaction management](https://www.postgresql.org/docs/18/plpgsql-transactions.html), [CALL](https://www.postgresql.org/docs/18/sql-call.html)
 
@@ -259,6 +260,16 @@ Source: [PL/pgSQL under the hood](https://www.postgresql.org/docs/18/plpgsql-imp
 
 Sources: [Function volatility](https://www.postgresql.org/docs/18/xfunc-volatility.html), [CREATE FUNCTION](https://www.postgresql.org/docs/18/sql-createfunction.html)
 
+### V25. Routine security context — Confirmed (SQL Server, PostgreSQL), Unverified (Db2 for i)
+
+- T-SQL: `EXECUTE AS CALLER` is the default; `OWNER` runs the module's statements as its owner, `SELF` as whoever created or last altered it, `'user'` as that user. Under `CALLER`, permission checks are skipped along an ownership chain (module and objects with the same owner, static SQL only), so a caller with only `EXECUTE` can still use the tables.
+- PostgreSQL: `SECURITY INVOKER` is the default; `SECURITY DEFINER` runs "with the privileges of the user that owns it". There is no ownership chaining. Unqualified names still resolve through the caller's `search_path` unless the routine has `SET search_path`.
+- Db2 for i (to verify on a system): `SET OPTION USRPRF = *OWNER` adopts the owner's authority in addition to the caller's, `*USER` uses the caller's; the default `*NAMING` is documented as `*OWNER` under SQL naming and `*USER` under system naming. `DYNUSRPRF` applies the same choice to dynamic SQL. The engine never relies on the default: a Db2 routine without `USRPRF` compares as the caller's authority only under `ASM-DB2-USRPRF-USER`, and against an owner's context it stays unknown. The converter writes `USRPRF` and `DYNUSRPRF` out.
+
+Probe for Davy's IBM i: create a procedure without `SET OPTION USRPRF` under SQL naming and one under system naming, both reading a table the caller has no authority to; call each as a user that holds only `*EXECUTE` on the program.
+
 ## Follow-up
 
 IBM Documentation refused most automated fetches, so V4, V9, V15 and parts of V3, V5, V7, V14 and V19 need either a manual read of the [7.5 SQL Reference PDF](https://www.ibm.com/docs/en/ssw_ibm_i_75/pdf/rbafzpdf.pdf) or, better, a small probe script run on an IBM i system. These probes belong in the per-dialect conformance tests (design doc section 12).
+
+The probe script and its expected outcomes are in [probes/db2i](../probes/db2i/README.md). Results submitted from a real IBM i are judged there, and `cargo test` keeps the hedged assumption texts in step with the result (`probes/db2i/facts.toml`). Until a run is submitted, every fact above keeps its status.

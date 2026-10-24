@@ -45,27 +45,11 @@ id = "m22-null-ordering-changed:original~mutated"
 reason = "verdict unknown != different [cross-dialect equivalence]"
 
 [[failing]]
-id = "p02-upsert-price:tsql~pg"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p03-lookup-by-key:tsql~pg"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
 id = "p03-lookup-by-key:tsql~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
 id = "p03-lookup-by-key:pg~db2i"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p04-display-name:tsql~pg"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p04-display-name:tsql~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
@@ -82,22 +66,6 @@ reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing
 
 [[failing]]
 id = "p06-paged-orders:tsql~db2i"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p06-paged-orders:pg~db2i"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p08-delete-orphans:tsql~pg"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p08-delete-orphans:tsql~db2i"
-reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
-
-[[failing]]
-id = "p08-delete-orphans:pg~db2i"
 reason = "verdict unknown != equal [cross-dialect equivalence (statement pairing) and WP9]"
 
 [[failing]]
