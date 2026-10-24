@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
+use sqldiff_core::catalog::ParamMode;
+
 use crate::out::Out;
 use crate::tok::{
     find_word, matching, next_sig, prev_sig, sig, snake, split_commas, tokens, trimmed, T,
@@ -32,10 +34,16 @@ mod rules {
     pub use sqldiff_core::rules::rule::{RuleSet, Status};
 }
 
-pub(crate) fn convert(root: &SyntaxNode, src: &str, to: Dialect) -> Out {
+pub(crate) fn convert(
+    root: &SyntaxNode,
+    src: &str,
+    to: Dialect,
+    catalog: Option<&sqldiff_core::catalog::Catalog>,
+) -> Out {
     let mut cx = Cx {
         src,
         to,
+        catalog,
         loops: Vec::new(),
         labels: 0,
         cursors: Vec::new(),
@@ -53,6 +61,7 @@ pub(crate) fn convert(root: &SyntaxNode, src: &str, to: Dialect) -> Out {
         txn_control: false,
         decls: Vec::new(),
         context: false,
+        dynamic: Vec::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -110,6 +119,8 @@ struct Cx<'a> {
     src: &'a str,
     /// Target dialect: PostgreSQL or Db2 for i.
     to: Dialect,
+    /// The source catalog of the whole tree being converted, when there is one.
+    catalog: Option<&'a sqldiff_core::catalog::Catalog>,
     /// Db2: labels of the enclosing WHILE loops (LEAVE/ITERATE need one).
     loops: Vec<String>,
     /// Db2: loop labels handed out in this routine or script.
@@ -144,6 +155,9 @@ struct Cx<'a> {
     /// for want of a rule: the idiom rules, which see statements out of
     /// context, must not take it either.
     context: bool,
+    /// Variables (lower case, without `@`) whose value is run as dynamic SQL
+    /// in this routine or script: `EXEC (@sql)`, `sp_executesql @sql`.
+    dynamic: Vec<String>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -155,7 +169,7 @@ fn no<T>(reason: impl Into<String>) -> R<T> {
     Err(No(reason.into()))
 }
 
-impl Cx<'_> {
+impl<'a> Cx<'a> {
     fn db2(&self) -> bool {
         self.to == Dialect::Db2i
     }
@@ -206,7 +220,18 @@ impl Cx<'_> {
     }
 
     fn refuse(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, reason: &str) {
-        let text = self.commented(n, reason);
+        let mut text = self.commented(n, reason);
+        if self.mode != Mode::Top {
+            // Inside a routine or block the rest still runs: stop there
+            // rather than skip the statement and carry on.
+            let line = self.src[..Self::range(n).0].matches('\n').count() + 1;
+            let msg = format!("sqldiff: statement at source line {line} was not converted");
+            text.push_str(&if self.db2() {
+                format!("SIGNAL SQLSTATE '75001' SET MESSAGE_TEXT = '{msg}';\n")
+            } else {
+                format!("RAISE EXCEPTION '{msg}';\n")
+            });
+        }
         self.notes.clear();
         let rule = if std::mem::take(&mut self.context) {
             CONTEXT
@@ -255,11 +280,13 @@ impl Cx<'_> {
         self.seen_work = false;
         self.tables.clear();
         self.savepoints.clear();
+        self.dynamic.clear();
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
         self.mode = Mode::Do;
         self.reset();
+        self.dynamic = dynamic_sql_vars(&tokens(b));
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
         if self.db2() {
@@ -382,6 +409,7 @@ impl Cx<'_> {
         self.return_code = false;
         self.txn_control = false;
         let all = tokens(r);
+        self.dynamic = dynamic_sql_vars(&all);
         let body_at = all.len()
             - r.children()
                 .find(|c| c.kind() == ROUTINE_BODY)
@@ -407,7 +435,12 @@ impl Cx<'_> {
         let ds = crate::tok::depths(&ts[i..]);
         let stop = (i..ts.len())
             .find(|&j| {
-                ds[j - i] == 0 && (ts[j].is("RETURNS") || ts[j].is("AS") || ts[j].is("WITH"))
+                ds[j - i] == 0
+                    && (ts[j].is("RETURNS")
+                        || ts[j].is("WITH")
+                        // `@p AS int` declares a parameter; the body's AS follows something else.
+                        || ts[j].is("AS")
+                            && !prev_sig(ts, j).is_some_and(|q| ts[q].k == VARIABLE))
             })
             .unwrap_or(ts.len());
         let mut ptoks = trimmed(&ts[i..stop]).to_vec();
@@ -441,7 +474,12 @@ impl Cx<'_> {
                     )
                 ));
             }
-            let (ty, string, numeric) = self.ty(&p[1..ty_end])?;
+            // `@p AS int` is `@p int`.
+            let ty_at = next_sig(p, 0)
+                .filter(|&j| p[j].is("AS"))
+                .map_or(1, |j| j + 1)
+                .min(ty_end);
+            let (ty, string, numeric) = self.ty(&p[ty_at..ty_end])?;
             let pname = format!("p_{}", snake(&v.s[1..]));
             self.vars.insert(
                 v.s[1..].to_ascii_lowercase(),
@@ -863,6 +901,7 @@ impl Cx<'_> {
                 let reason = match self.stmt(n) {
                     Ok(_) if self.blocked().is_some() => self.blocked().unwrap(),
                     Ok(text) => {
+                        self.dynamic_text(n);
                         let notes = self.take_notes();
                         return out.unit(Self::range(n), indent, &text, notes);
                     }
@@ -889,6 +928,35 @@ impl Cx<'_> {
             TRY_CATCH if self.mode != Mode::Top => self.try_catch(out, n, indent),
             ROUTINE => self.routine(out, n),
             _ => self.refuse(out, n, indent, "no rule for this construct yet"),
+        }
+    }
+
+    /// A statement that assigns a variable later run as dynamic SQL builds
+    /// T-SQL text: the rules convert the statement, not the SQL in the string,
+    /// so the unit cannot count as converted.
+    fn dynamic_text(&mut self, n: &SyntaxNode) {
+        if self.dynamic.is_empty() {
+            return;
+        }
+        let ts = tokens(n);
+        let s = sig(&ts);
+        let assigns = s.windows(2).any(|w| {
+            ts[w[0]].k == VARIABLE
+                && self.dynamic.contains(&ts[w[0]].s[1..].to_ascii_lowercase())
+                && ts[w[1]].k == OP
+                && matches!(ts[w[1]].s.as_str(), "=" | "+=")
+                && s.first()
+                    .is_some_and(|&f| ts[f].is("SET") || ts[f].is("SELECT") || ts[f].is("DECLARE"))
+        }) || s.first().is_some_and(|&f| ts[f].is("DECLARE"))
+            && s.windows(2).any(|w| {
+                ts[w[0]].k == VARIABLE
+                    && self.dynamic.contains(&ts[w[0]].s[1..].to_ascii_lowercase())
+                    && ts[w[1]].k != COMMA
+                    && s.iter()
+                        .any(|&j| j > w[0] && ts[j].k == OP && ts[j].s == "=")
+            });
+        if assigns {
+            self.note(Status::Differs, "dynamic-sql.text", "This builds the text of dynamic SQL that the routine runs with EXEC or sp_executesql. The statement was converted, the SQL inside the string was not: it is still T-SQL.");
         }
     }
 
@@ -1444,6 +1512,9 @@ impl Cx<'_> {
         if find_word(&ts, 0, "EXEC").is_some() || find_word(&ts, 0, "EXECUTE").is_some() {
             return no("INSERT … EXEC");
         }
+        if find_word(&ts, 0, "TOP").is_some() {
+            return no("TOP in a query inside INSERT/UPDATE/DELETE: no rule yet");
+        }
         let mut pre = String::new();
         let mut from = s[1];
         match ts[s[0]].up().as_str() {
@@ -1912,9 +1983,6 @@ impl Cx<'_> {
         if first.k == L_PAREN || first.k == VARIABLE {
             return no("dynamic SQL / EXEC @rc = …: use EXECUTE format(…) after review; dynamic SQL is opaque to the checker");
         }
-        if ts.iter().any(|t| t.is("OUTPUT") || t.is("OUT")) {
-            return no("EXEC with OUTPUT arguments: CALL with INOUT parameters into variables");
-        }
         // name: dotted run of identifiers
         let mut j = s[1];
         let mut name_end = j + 1;
@@ -1923,6 +1991,13 @@ impl Cx<'_> {
             name_end = j + 1;
         }
         let raw_name: String = ts[s[1]..name_end].iter().map(|t| t.s.clone()).collect();
+        if raw_name
+            .rsplit('.')
+            .next()
+            .is_some_and(|n| tsql_unquote(n).eq_ignore_ascii_case("sp_addextendedproperty"))
+        {
+            return self.extended_property(&ts[name_end..]);
+        }
         if raw_name.rsplit('.').next().is_some_and(|n| {
             n.to_ascii_lowercase().starts_with("sp_") || n.to_ascii_lowercase().starts_with("xp_")
         }) {
@@ -1932,25 +2007,204 @@ impl Cx<'_> {
             ));
         }
         let name = self.expr(&ts[s[1]..name_end]).trim().to_string();
+        let output = ts.iter().any(|t| t.is("OUTPUT") || t.is("OUT"));
+        let callee = self.callee(&raw_name);
+        if output && callee.is_none() {
+            return no("EXEC with OUTPUT arguments: the called procedure is not in the converted tree, so its parameters are unknown; CALL with INOUT parameters into variables");
+        }
+        let params = callee.map(|r| r.params.as_slice());
         let mut args = Vec::new();
-        for a in split_commas(&ts[name_end..]) {
-            let a = trimmed(a);
+        let mut passed: Vec<usize> = Vec::new();
+        for (k, a) in split_commas(&ts[name_end..]).into_iter().enumerate() {
+            let mut a = trimmed(a);
+            if a.is_empty() {
+                continue;
+            }
+            let marked = a.last().is_some_and(|t| t.is("OUTPUT") || t.is("OUT"));
+            if marked {
+                a = trimmed(&a[..a.len() - 1]);
+            }
             let eq = a.iter().position(|x| x.k == OP && x.s == "=");
             let named = a.first().is_some_and(|x| x.k == VARIABLE)
                 && eq.is_some_and(|e| a[1..e].iter().all(|x| !x.sig()));
+            let value = if named {
+                trimmed(&a[eq.unwrap() + 1..])
+            } else {
+                a
+            };
+            // The parameter this argument binds to, when the callee is known.
+            if let Some(ps) = params {
+                let at = if named {
+                    ps.iter().position(|p| p.name.eq_ignore_ascii_case(&a[0].s))
+                } else {
+                    (k < ps.len()).then_some(k)
+                };
+                let Some(at) = at else {
+                    return no(format!(
+                        "EXEC: argument {} matches no parameter of {raw_name}",
+                        k + 1
+                    ));
+                };
+                passed.push(at);
+                let out_param = matches!(ps[at].mode, ParamMode::Out | ParamMode::InOut);
+                if out_param != marked {
+                    return no(if out_param {
+                        format!("EXEC: {} of {raw_name} is an OUTPUT parameter but the call does not pass OUTPUT; a CALL would assign the argument back", ps[at].name)
+                    } else {
+                        format!(
+                            "EXEC: OUTPUT passed for {}, which {raw_name} does not declare OUTPUT",
+                            ps[at].name
+                        )
+                    });
+                }
+                if marked
+                    && !(value.len() == 1
+                        && value[0].k == VARIABLE
+                        && self.declared(&value[0].s).is_some())
+                {
+                    return no("EXEC: an OUTPUT argument that is not a declared variable");
+                }
+            }
             if named {
-                let eq = eq.unwrap();
-                self.note(Status::Assumptions, "ASM-PARAM-NAMES", "Named arguments assume the called procedure was converted with the same p_ parameter names.");
+                if callee.is_none() {
+                    self.note(Status::Assumptions, "ASM-PARAM-NAMES", "Named arguments assume the called procedure was converted with the same p_ parameter names.");
+                }
                 args.push(format!(
                     "p_{} => {}",
                     snake(&a[0].s[1..]),
-                    self.expr(&a[eq + 1..]).trim()
+                    self.expr(value).trim()
                 ));
             } else {
-                args.push(self.expr(a).trim().to_string());
+                args.push(self.expr(value).trim().to_string());
+            }
+        }
+        if let Some(ps) = params {
+            if let Some(p) = ps.iter().enumerate().find(|(i, p)| {
+                matches!(p.mode, ParamMode::Out | ParamMode::InOut) && !passed.contains(i)
+            }) {
+                return no(format!(
+                    "EXEC: the OUTPUT parameter {} of {raw_name} is not passed; the target needs a variable for it",
+                    p.1.name
+                ));
             }
         }
         Ok(format!("CALL {name}({})", args.join(", ")))
+    }
+
+    /// The procedure `name` (as written, possibly qualified) in the source
+    /// catalog, when exactly one matches. `dbo` and no schema are the same.
+    fn callee(&self, name: &str) -> Option<&'a sqldiff_core::catalog::Routine> {
+        let cat = self.catalog?;
+        let parts: Vec<String> = name.split('.').map(tsql_unquote).collect();
+        let (schema, proc) = match parts.as_slice() {
+            [p] => (None, p.clone()),
+            [.., s, p] => (Some(s.clone()), p.clone()),
+            [] => return None,
+        };
+        let norm = |s: Option<&str>| {
+            s.filter(|s| !s.eq_ignore_ascii_case("dbo"))
+                .map(str::to_ascii_lowercase)
+        };
+        let mut hits = cat.routines.iter().filter(|r| {
+            r.kind == sqldiff_core::catalog::RoutineKind::Procedure
+                && r.name.eq_ignore_ascii_case(&proc)
+                && norm(r.schema.as_deref()) == norm(schema.as_deref())
+        });
+        let hit = hits.next()?;
+        hits.next().is_none().then_some(hit)
+    }
+
+    /// `sp_addextendedproperty` with literal arguments → `COMMENT ON`. Only
+    /// objects whose target name is certain: schemas, tables, views, routines
+    /// and columns (PostgreSQL also indexes and constraints, which live in
+    /// the table's schema there but not on Db2 for i).
+    fn extended_property(&mut self, args: &[T]) -> R<String> {
+        const NAMES: [&str; 8] = [
+            "name",
+            "value",
+            "level0type",
+            "level0name",
+            "level1type",
+            "level1name",
+            "level2type",
+            "level2name",
+        ];
+        let mut val: HashMap<&str, T> = HashMap::new();
+        for (k, a) in split_commas(args).into_iter().enumerate() {
+            let a = trimmed(a);
+            let (key, v) = match a.iter().position(|x| x.k == OP && x.s == "=") {
+                Some(eq) if a.first().is_some_and(|x| x.k == VARIABLE) => {
+                    let key = a[0].s[1..].to_ascii_lowercase();
+                    let key = NAMES.iter().find(|n| **n == key).ok_or(No(format!(
+                        "sp_addextendedproperty: unknown argument {}",
+                        a[0].s
+                    )))?;
+                    (*key, trimmed(&a[eq + 1..]))
+                }
+                _ => (
+                    *NAMES
+                        .get(k)
+                        .ok_or(No("sp_addextendedproperty: too many arguments".into()))?,
+                    a,
+                ),
+            };
+            match v {
+                [t] if t.k == STRING => {
+                    val.insert(key, t.clone());
+                }
+                [t] if t.is("NULL") => {}
+                _ => return no("sp_addextendedproperty with a non-literal argument: no rule yet"),
+            }
+        }
+        let text = |k: &str| val.get(k).map(|t| string_value(&t.s));
+        let ident = |k: &str| text(k).map(|n| quoted(&n));
+        let kind = |k: &str| text(k).map(|t| t.to_ascii_uppercase());
+        let value = val
+            .get("value")
+            .ok_or(No("sp_addextendedproperty without a value".into()))?
+            .clone();
+        let target = match (kind("level0type"), kind("level1type"), kind("level2type")) {
+            (Some(s), None, None) if s == "SCHEMA" => {
+                format!("SCHEMA {}", ident("level0name").unwrap_or_default())
+            }
+            (Some(s), Some(o), l2) if s == "SCHEMA" => {
+                let schema = ident("level0name")
+                    .ok_or(No("sp_addextendedproperty without a schema name".into()))?;
+                let obj = format!(
+                    "{schema}.{}",
+                    ident("level1name")
+                        .ok_or(No("sp_addextendedproperty without an object name".into()))?
+                );
+                let sub = ident("level2name");
+                match (o.as_str(), l2.as_deref(), sub) {
+                    ("TABLE" | "VIEW", None, _) if self.db2() => format!("TABLE {obj}"),
+                    ("TABLE" | "VIEW", None, _) => format!("{o} {obj}"),
+                    ("PROCEDURE" | "FUNCTION", None, _) => format!("{o} {obj}"),
+                    ("TABLE" | "VIEW", Some("COLUMN"), Some(c)) => format!("COLUMN {obj}.{c}"),
+                    ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
+                        format!("INDEX {schema}.{i}")
+                    }
+                    ("TABLE", Some("CONSTRAINT"), Some(c)) if !self.db2() => {
+                        format!("CONSTRAINT {c} ON {obj}")
+                    }
+                    _ => {
+                        return no(format!(
+                            "sp_addextendedproperty on {o}{}: no rule for this object kind yet",
+                            l2.map(|l| format!(" {l}")).unwrap_or_default()
+                        ))
+                    }
+                }
+            }
+            _ => return no("sp_addextendedproperty outside a schema: no rule yet"),
+        };
+        let pname = text("name").unwrap_or_default();
+        let ttext = format!(
+            "The extended property `{pname}` becomes the object's comment. {} keeps one unnamed comment per object, so the property name is dropped and a second property on the same object replaces the first.",
+            self.to.display_name()
+        );
+        self.note(Status::Assumptions, "ASM-EXTPROP-COMMENT", &ttext);
+        let v = self.expr(std::slice::from_ref(&value)).trim().to_string();
+        Ok(format!("COMMENT ON {target} IS {v}"))
     }
 
     fn create(&mut self, ts: &[T]) -> R<String> {
@@ -1960,7 +2214,7 @@ impl Cx<'_> {
         match w1.as_str() {
             "TABLE" => self.create_table(&ts),
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => {
-                let ts = self.strip_storage(&ts);
+                let ts = self.strip_storage(&ts)?;
                 if self.db2() {
                     if let Some(w) = ts.iter().find(|t| t.is("INCLUDE") || t.is("WHERE")) {
                         return no(format!("index with {}: not checked for Db2 for i; create a plain index (or an encoded vector or derived-key index) after review", w.up()));
@@ -1981,12 +2235,13 @@ impl Cx<'_> {
                 Ok(collapse_spaces(&self.expr(&kept)))
             }
             "SCHEMA" => Ok(self.expr(&ts)),
+            "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
             _ => no(format!("CREATE {w1}: no rule yet")),
         }
     }
 
     /// Removes `ON [PRIMARY]`, `TEXTIMAGE_ON x` and `WITH (…)` after the main column list.
-    fn strip_storage(&mut self, ts: &[T]) -> Vec<T> {
+    fn strip_storage(&mut self, ts: &[T]) -> R<Vec<T>> {
         let ds = crate::tok::depths(ts);
         let mut cut = vec![false; ts.len()];
         let mut i = 0;
@@ -2002,6 +2257,10 @@ impl Cx<'_> {
             }
             if ds[i] == 0 && after_paren && ts[i].is("WITH") {
                 if let Some(r) = next_sig(ts, i).and_then(|p| matching(ts, p)) {
+                    let open = next_sig(ts, i).unwrap();
+                    for opt in split_commas(&ts[open + 1..r]) {
+                        storage_option(opt)?;
+                    }
                     cut[i..=r].iter_mut().for_each(|c| *c = true);
                     dropped = true;
                     i = r + 1;
@@ -2013,15 +2272,139 @@ impl Cx<'_> {
         if dropped {
             self.note(Status::Converted, "tsql.storage-options", "Filegroup and storage options (ON [PRIMARY], WITH (…)) were dropped; they do not change results.");
         }
-        ts.iter()
+        Ok(ts
+            .iter()
             .zip(cut)
             .filter(|(_, c)| !c)
             .map(|(t, _)| t.clone())
-            .collect()
+            .collect())
+    }
+
+    /// `CREATE SEQUENCE` with every bound written out: T-SQL starts an
+    /// ascending sequence at the type's minimum (-2147483648 for INT), the
+    /// targets at 1, so nothing is left to the target's defaults.
+    fn create_sequence(&mut self, ts: &[T], rest: Vec<usize>) -> R<String> {
+        let Some((&first, rest)) = rest.split_first() else {
+            return no("CREATE SEQUENCE without a name");
+        };
+        // Name: a dotted run.
+        let mut k = 0;
+        let mut name_end = first;
+        while rest.get(k).is_some_and(|&j| ts[j].k == DOT) {
+            name_end = *rest
+                .get(k + 1)
+                .ok_or(No("unfinished sequence name".into()))?;
+            k += 2;
+        }
+        let name = self.expr(&ts[first..=name_end]).trim().to_string();
+        let words: Vec<&T> = rest[k..].iter().map(|&j| &ts[j]).collect();
+        let mut ty = "BIGINT".to_string();
+        let (mut start, mut inc, mut min, mut max) = (None, None, None, None);
+        let mut cycle = false;
+        let number = |w: &[&T], at: usize| -> R<(String, usize)> {
+            match w.get(at..) {
+                Some([op, n, ..]) if op.k == OP && op.s == "-" && n.k == NUMBER => {
+                    Ok((format!("-{}", n.s), at + 2))
+                }
+                Some([n, ..]) if n.k == NUMBER => Ok((n.s.clone(), at + 1)),
+                _ => no("CREATE SEQUENCE option without a number"),
+            }
+        };
+        let mut i = 0;
+        while i < words.len() {
+            let w = words[i].up();
+            match w.as_str() {
+                "AS" => {
+                    ty = words
+                        .get(i + 1)
+                        .map(|t| tsql_unquote(&t.s).to_ascii_uppercase())
+                        .unwrap_or_default();
+                    i += 2;
+                }
+                "START" | "INCREMENT" => {
+                    let (n, next) = number(&words, i + 2)?;
+                    if w == "START" {
+                        start = Some(n)
+                    } else {
+                        inc = Some(n)
+                    }
+                    i = next;
+                }
+                "MINVALUE" | "MAXVALUE" => {
+                    let (n, next) = number(&words, i + 1)?;
+                    if w == "MINVALUE" {
+                        min = Some(n)
+                    } else {
+                        max = Some(n)
+                    }
+                    i = next;
+                }
+                "NO" if words.get(i + 1).is_some_and(|t| {
+                    t.is("MINVALUE") || t.is("MAXVALUE") || t.is("CYCLE") || t.is("CACHE")
+                }) =>
+                {
+                    i += 2
+                }
+                "CYCLE" => {
+                    cycle = true;
+                    i += 1;
+                }
+                "CACHE" => {
+                    i += 1;
+                    if words.get(i).is_some_and(|t| t.k == NUMBER) {
+                        i += 1;
+                    }
+                }
+                _ if words[i].k == SEMICOLON => i += 1,
+                _ => {
+                    return no(format!(
+                        "CREATE SEQUENCE option {}: no rule yet",
+                        words[i].s
+                    ))
+                }
+            }
+        }
+        let (target, lo, hi) = match ty.as_str() {
+            "INT" | "INTEGER" => ("INTEGER", "-2147483648", "2147483647"),
+            "BIGINT" => ("BIGINT", "-9223372036854775808", "9223372036854775807"),
+            "SMALLINT" => ("SMALLINT", "-32768", "32767"),
+            "TINYINT" => ("SMALLINT", "0", "255"),
+            _ => return no(format!("CREATE SEQUENCE AS {ty}: no rule yet")),
+        };
+        let inc = inc.unwrap_or_else(|| "1".into());
+        let min = min.unwrap_or_else(|| lo.into());
+        let max = max.unwrap_or_else(|| hi.into());
+        let start = start.unwrap_or_else(|| {
+            if inc.starts_with('-') {
+                max.clone()
+            } else {
+                min.clone()
+            }
+        });
+        let text = self.pick(
+            "The cache setting is left to PostgreSQL's default (CACHE 1): a larger PostgreSQL cache is per session, so values would no longer be handed out in order across sessions.",
+            "NO CACHE: Db2 for i hands out values in order, as T-SQL's server-wide cache does.",
+        ).to_string();
+        self.note(Status::Converted, "tsql.sequence-cache", &text);
+        Ok(format!(
+            "CREATE SEQUENCE {name}\n    AS {}\n    START WITH {start}\n    INCREMENT BY {inc}\n    MINVALUE {min}\n    MAXVALUE {max}\n    {}{}",
+            if self.db2() { target.to_string() } else { target.to_ascii_lowercase() },
+            if cycle { "CYCLE" } else { "NO CYCLE" },
+            if self.db2() { "\n    NO CACHE" } else { "" }
+        ))
     }
 
     fn create_table(&mut self, ts: &[T]) -> R<String> {
-        let ts = self.strip_storage(ts);
+        if ts
+            .iter()
+            .any(|t| t.is("SYSTEM_TIME") || t.is("SYSTEM_VERSIONING"))
+        {
+            return no(self.pick(
+                "system-versioned (temporal) table: PostgreSQL has no system versioning; keep history with a trigger and a history table",
+                "system-versioned (temporal) table: Db2 for i spells it PERIOD SYSTEM_TIME with ROW BEGIN/END and a separate ALTER TABLE … ADD VERSIONING; no rule yet",
+            ));
+        }
+        let ts = self.strip_storage(ts)?;
         let open = ts
             .iter()
             .position(|t| t.k == L_PAREN)
@@ -2109,10 +2492,15 @@ impl Cx<'_> {
                 "computed column: Db2 for i has no generated expression columns; use a view or a trigger",
             ));
         }
-        let ty_end = if next_sig(it, ty_at).is_some_and(|j| it[j].k == L_PAREN) {
-            matching(it, next_sig(it, ty_at).unwrap()).ok_or(No("unbalanced type".into()))?
+        // A qualified type name (`sys.geography`, `dbo.Phone`) is one type.
+        let mut name_end = ty_at;
+        while let Some(d) = next_sig(it, name_end).filter(|&d| it[d].k == DOT) {
+            name_end = next_sig(it, d).ok_or(No("unfinished type name".into()))?;
+        }
+        let ty_end = if next_sig(it, name_end).is_some_and(|j| it[j].k == L_PAREN) {
+            matching(it, next_sig(it, name_end).unwrap()).ok_or(No("unbalanced type".into()))?
         } else {
-            ty_at
+            name_end
         };
         let (ty, _, _) = self.ty(&it[ty_at..=ty_end])?;
         let mut rest: Vec<T> = Vec::new();
@@ -2319,6 +2707,23 @@ impl Cx<'_> {
                     o.push_str(&r)
                 }
                 QUOTED_IDENT => o.push_str(&quoted(&t.s)),
+                NUMBER if t.s.len() >= 2 && t.s[..2].eq_ignore_ascii_case("0x") => {
+                    // A binary constant. PostgreSQL 16+ reads 0x… as an integer.
+                    let mut hex = t.s[2..].to_ascii_uppercase();
+                    if hex.len() % 2 == 1 {
+                        hex.insert(0, '0');
+                    }
+                    let text = self.pick(
+                        "0x… is a binary constant and becomes a bytea literal. T-SQL also converts it to a number where one is expected (`flags & 0x01`); there the output fails instead.",
+                        "0x… is a binary constant and becomes BX'…'. T-SQL also converts it to a number where one is expected (`flags & 0x01`); there the output fails instead.",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-HEX-BINARY", &text);
+                    if self.db2() {
+                        o.push_str(&format!("BX'{hex}'"));
+                    } else {
+                        o.push_str(&format!("'\\x{hex}'::bytea"));
+                    }
+                }
                 STRING => {
                     let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
                     o.push_str(lit);
@@ -2357,6 +2762,13 @@ impl Cx<'_> {
                         i = nx.unwrap() + 1;
                         continue;
                     }
+                    if up == "NEXT" && !self.db2() {
+                        if let Some((text, end)) = self.next_value(ts, i) {
+                            o.push_str(&text);
+                            i = end + 1;
+                            continue;
+                        }
+                    }
                     if up == "WITH" && nx.is_some_and(|p| ts[p].k == L_PAREN) {
                         if let Some(r) = self.table_hint(ts, nx.unwrap()) {
                             // drop trailing whitespace before WITH
@@ -2380,6 +2792,38 @@ impl Cx<'_> {
                                 o.push_str(&s);
                                 i = r + 1;
                                 continue;
+                            }
+                            // Only a call: not a qualified name, an object
+                            // name before its column list (`INSERT INTO log (…)`)
+                            // or a CTE (`x (a) AS (…)`).
+                            const OBJECT: [&str; 18] = [
+                                "INTO",
+                                "INSERT",
+                                "UPDATE",
+                                "TABLE",
+                                "JOIN",
+                                "FROM",
+                                "REFERENCES",
+                                "ON",
+                                "VIEW",
+                                "PROCEDURE",
+                                "PROC",
+                                "FUNCTION",
+                                "EXEC",
+                                "EXECUTE",
+                                "MERGE",
+                                "USING",
+                                "AS",
+                                "WITH",
+                            ];
+                            let call = prev_sig(ts, i).map_or(true, |q| {
+                                ts[q].k != DOT && !OBJECT.iter().any(|w| ts[q].is(w))
+                            }) && !next_sig(ts, r).is_some_and(|q| {
+                                ts[q].is("AS")
+                                    && next_sig(ts, q).is_some_and(|p| ts[p].k == L_PAREN)
+                            });
+                            if call {
+                                self.unmapped_builtin(&t.s);
                             }
                         }
                     }
@@ -2572,6 +3016,18 @@ impl Cx<'_> {
                 format!("strpos({y}, {x})")
             }
             ("NEWID", 0) => "gen_random_uuid()".into(),
+            ("QUOTENAME", 1) => {
+                self.note(Status::Assumptions, "ASM-QUOTENAME-IDENT", "QUOTENAME becomes quote_ident: both make the value usable as one identifier, but quote_ident adds double quotes only when needed and QUOTENAME returns NULL for more than 128 characters. Equal only where the result is used as a PostgreSQL identifier, never as text.");
+                format!("quote_ident({})", e(self, 0))
+            }
+            ("RAND", 0) => {
+                self.note(Status::Assumptions, "ASM-RAND-PER-QUERY", "RAND() becomes random(): T-SQL evaluates RAND() once per query, random() once per row. Equal where the statement produces a single value (an assignment or a query returning one row).");
+                "random()".into()
+            }
+            ("DATEFROMPARTS", 3) => {
+                let (y, m, d) = (e(self, 0), e(self, 1), e(self, 2));
+                format!("make_date({y}, {m}, {d})")
+            }
             ("IIF", 3) => {
                 let (c, x, y) = (e(self, 0), e(self, 1), e(self, 2));
                 format!("(CASE WHEN {c} THEN {x} ELSE {y} END)")
@@ -2689,6 +3145,15 @@ impl Cx<'_> {
                 let (x, y) = (e(self, 0), e(self, 1));
                 format!("REPEAT({x}, {y})")
             }
+            ("QUOTENAME", 1) => {
+                self.note(Status::Assumptions, "ASM-QUOTENAME-IDENT", "QUOTENAME becomes a double-quoted identifier with embedded quotes doubled; QUOTENAME returns NULL for more than 128 characters. Equal only where the result is used as a Db2 for i identifier, never as text.");
+                let x = e(self, 0);
+                format!("('\"' || REPLACE({x}, '\"', '\"\"') || '\"')")
+            }
+            ("RAND", 0) => {
+                self.note(Status::Assumptions, "ASM-RAND-PER-QUERY", "RAND() stays RAND(): T-SQL evaluates RAND() once per query, Db2 once per row. Equal where the statement produces a single value (an assignment or a query returning one row).");
+                "RAND()".into()
+            }
             ("SCOPE_IDENTITY", 0) => {
                 self.note(Status::Assumptions, "ASM-IDENTITY-VAL-LOCAL", "SCOPE_IDENTITY() becomes IDENTITY_VAL_LOCAL(): both give the last identity value assigned at the same nesting level. Assumes the INSERT before it is a single-row INSERT … VALUES; after a multi-row INSERT the two may differ (not checked).");
                 "IDENTITY_VAL_LOCAL()".into()
@@ -2777,6 +3242,42 @@ impl Cx<'_> {
         })
     }
 
+    /// PostgreSQL: `NEXT VALUE FOR seq` at `ts[i]` → `nextval('seq')`, and
+    /// the index of the name's last token.
+    fn next_value(&mut self, ts: &[T], i: usize) -> Option<(String, usize)> {
+        let v = next_sig(ts, i).filter(|&j| ts[j].is("VALUE"))?;
+        let f = next_sig(ts, v).filter(|&j| ts[j].is("FOR"))?;
+        let first = next_sig(ts, f)?;
+        let mut end = first;
+        while let Some(d) = next_sig(ts, end).filter(|&d| ts[d].k == DOT) {
+            end = next_sig(ts, d)?;
+        }
+        let name = self.expr(&ts[first..=end]).trim().to_string();
+        if ts.iter().filter(|t| t.is("NEXT")).count() > 1 {
+            self.note(Status::Assumptions, "ASM-NEXT-VALUE-ONCE", "T-SQL gives every NEXT VALUE FOR of one sequence in a row the same value; PostgreSQL's nextval() advances on each call. Equal unless one statement asks for the same sequence twice.");
+        }
+        Some((format!("nextval('{}')", name.replace('\'', "''")), end))
+    }
+
+    /// A call kept as written must exist in the target: a T-SQL built-in the
+    /// target does not have refuses the unit instead of passing through.
+    fn unmapped_builtin(&mut self, name: &str) {
+        use sqldiff_core::catalog::builtins::{self, Availability};
+        let tsql = builtins::of(Dialect::Tsql).function(name, "9999") != Availability::Unknown;
+        let target = builtins::of(self.to).function(name, "9999") != Availability::Unknown;
+        if tsql && !target {
+            self.note(
+                Status::NotConverted,
+                "tsql.builtin",
+                &format!(
+                    "{}() is a T-SQL built-in that {} does not have; no rule yet.",
+                    name.to_ascii_uppercase(),
+                    self.to.display_name()
+                ),
+            );
+        }
+    }
+
     /// Db2: a cast to a number of something that may be a string (fact V9).
     fn cast_note(&mut self, operand: &[T]) {
         let op = trimmed(operand);
@@ -2794,6 +3295,14 @@ impl Cx<'_> {
         let Some(first) = ts.first() else {
             return no("missing type");
         };
+        if let Some(d) = next_sig(ts, 0).filter(|&d| ts[d].k == DOT) {
+            // `sys.geography` is the built-in type; any other schema holds a
+            // user-defined type, which has no rule.
+            if tsql_unquote(&first.s).eq_ignore_ascii_case("sys") && d + 1 < ts.len() {
+                return self.ty(&ts[d + 1..]);
+            }
+            return no("user-defined type (schema-qualified): no rule yet");
+        }
         let name = crate::tok::T {
             s: tsql_unquote(&first.s),
             ..first.clone()
@@ -3172,7 +3681,16 @@ fn procedural(n: &SyntaxNode) -> bool {
         ["DECLARE", "PRINT", "RETURN", "THROW", "BREAK", "CONTINUE"]
             .iter()
             .any(|w| t.is(w))
-    }) || ts.iter().any(|t| t.k == VARIABLE && !t.s.starts_with("@@"))
+    }) || {
+        // `EXEC p @name = 'x'` names a parameter; only a variable as a value
+        // needs a block.
+        let exec = first.is_some_and(|t| t.is("EXEC") || t.is("EXECUTE"));
+        ts.iter().enumerate().any(|(i, t)| {
+            t.k == VARIABLE
+                && !t.s.starts_with("@@")
+                && !(exec && next_sig(&ts, i).is_some_and(|j| ts[j].k == OP && ts[j].s == "="))
+        })
+    }
 }
 
 /// CATCH body that is only `IF @@TRANCOUNT > 0 ROLLBACK [TRAN]` and `THROW;`.
@@ -3227,6 +3745,93 @@ fn quoted(s: &str) -> String {
     } else {
         format!("\"{}\"", inner.replace('"', "\"\""))
     }
+}
+
+/// One `WITH (…)` option of a table or index. Only options that change
+/// performance, never results, may be dropped.
+fn storage_option(opt: &[T]) -> R<()> {
+    let opt = trimmed(opt);
+    let Some(name) = opt.first().map(|t| t.up()) else {
+        return Ok(());
+    };
+    let value = opt
+        .iter()
+        .rev()
+        .find(|t| t.sig())
+        .map(|t| t.up())
+        .unwrap_or_default();
+    let harmless = matches!(
+        name.as_str(),
+        "DATA_COMPRESSION"
+            | "XML_COMPRESSION"
+            | "FILLFACTOR"
+            | "PAD_INDEX"
+            | "STATISTICS_NORECOMPUTE"
+            | "STATISTICS_INCREMENTAL"
+            | "ALLOW_ROW_LOCKS"
+            | "ALLOW_PAGE_LOCKS"
+            | "SORT_IN_TEMPDB"
+            | "ONLINE"
+            | "RESUMABLE"
+            | "MAXDOP"
+            | "OPTIMIZE_FOR_SEQUENTIAL_KEY"
+    ) || matches!(name.as_str(), "IGNORE_DUP_KEY" | "DROP_EXISTING")
+        && value == "OFF";
+    if harmless {
+        Ok(())
+    } else {
+        no(format!(
+            "table or index option {name}: it changes behaviour, not just storage; no rule yet"
+        ))
+    }
+}
+
+/// Variables run as dynamic SQL: every variable inside `EXEC (…)` /
+/// `EXECUTE (…)`, and the statement argument of `sp_executesql`.
+fn dynamic_sql_vars(ts: &[T]) -> Vec<String> {
+    let s = sig(ts);
+    let mut vars = Vec::new();
+    for (k, &i) in s.iter().enumerate() {
+        let next = |n: usize| s.get(k + n).map(|&j| &ts[j]);
+        if (ts[i].is("EXEC") || ts[i].is("EXECUTE")) && next(1).is_some_and(|t| t.k == L_PAREN) {
+            let open = s[k + 1];
+            let close = matching(ts, open).unwrap_or(ts.len() - 1);
+            vars.extend(
+                ts[open..close]
+                    .iter()
+                    .filter(|t| t.k == VARIABLE)
+                    .map(|t| t.s[1..].to_ascii_lowercase()),
+            );
+        }
+        if tsql_unquote(&ts[i].s).eq_ignore_ascii_case("sp_executesql") {
+            // First argument, positional or `@stmt = @v`.
+            let (a, b, c) = (next(1), next(2), next(3));
+            match (a, b, c) {
+                (Some(x), Some(eq), Some(v))
+                    if x.k == VARIABLE
+                        && x.s.eq_ignore_ascii_case("@stmt")
+                        && eq.s == "="
+                        && v.k == VARIABLE =>
+                {
+                    vars.push(v.s[1..].to_ascii_lowercase())
+                }
+                (Some(v), _, _) if v.k == VARIABLE => vars.push(v.s[1..].to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+    }
+    vars.sort();
+    vars.dedup();
+    vars
+}
+
+/// The text of a T-SQL string literal (`N'it''s'` → `it's`).
+fn string_value(s: &str) -> String {
+    let s = s.strip_prefix(['N', 'n']).unwrap_or(s);
+    s.strip_prefix('\'')
+        .and_then(|x| x.strip_suffix('\''))
+        .unwrap_or(s)
+        .replace("''", "'")
 }
 
 fn tsql_unquote(s: &str) -> String {
