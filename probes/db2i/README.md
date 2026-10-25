@@ -24,7 +24,7 @@ submitted.
 ## Running it (Davy, on IBM i)
 
 The script creates the schema `SQLDFPROBE` with `CREATE SCHEMA` (so its tables are
-journaled), two tables and about 30 small procedures in it, and declares a few
+journaled), two tables and about 35 small procedures in it, and declares a few
 temporary tables in QTEMP. It reads `SYSIBMADM.ENV_SYS_INFO`, `QSYS2.GROUP_PTF_INFO`,
 `QSYS2.SYSROUTINES` and `QSYS2.RECORD_LOCK_INFO`. It changes nothing outside
 `SQLDFPROBE` and QTEMP. You need authority to create a schema (a library).

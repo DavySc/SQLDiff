@@ -1477,3 +1477,122 @@ source = "QSYS2.PROGRAM_INFO (IBM i 7.4): USER_PROFILE is the USRPRF the program
 outcome = [
   { label = "owner", when = { create = "00000", state = "00000", text = "prefix:*OWNER/*OWNER/" }, verdict = "consistent", meaning = "The attributes read back as written." },
 ]
+
+# ---------------------------------------------------------------- V26
+# Common table expressions, run as dynamic queries (as in a script). The
+# procedure makes the table SQLDFPROBE.CTEB (X = 7), sets the current schema to
+# SQLDFPROBE so an unqualified CTEB can mean that table, runs the query Q, and
+# reports the first value of its first column (n1) and the number of rows (n2).
+
+[[procedure]]
+name = "V26_QUERY"
+commit = "*NONE"
+# Cursors close when the procedure ends, so a failed run cannot leave C1 open
+# for the next call.
+options = "CLOSQLCSR = *ENDMOD"
+params = "IN Q VARCHAR(4000)"
+body = """
+BEGIN
+  DECLARE V_SQL VARCHAR(4000);
+  DECLARE V_OLD VARCHAR(128);
+  DECLARE V_EOF INTEGER DEFAULT 0;
+  DECLARE V_N INTEGER DEFAULT 0;
+  DECLARE X INTEGER;
+  DECLARE C1 CURSOR FOR S1;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET V_OLD = CURRENT SCHEMA;
+  BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET V_N = 0;
+    SET V_SQL = 'CREATE TABLE SQLDFPROBE.CTEB (X INTEGER)';
+    EXECUTE IMMEDIATE V_SQL;
+  END;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET V_EOF = 1;
+    SET V_SQL = 'DELETE FROM SQLDFPROBE.CTEB';
+    EXECUTE IMMEDIATE V_SQL;
+    SET V_SQL = 'INSERT INTO SQLDFPROBE.CTEB (X) VALUES (7)';
+    EXECUTE IMMEDIATE V_SQL;
+    SET SCHEMA SQLDFPROBE;
+    PREPARE S1 FROM Q;
+    OPEN C1;
+    FETCH C1 INTO X;
+    WHILE V_EOF = 0 AND V_N < 1000 DO
+      SET V_N = V_N + 1;
+      IF V_N = 1 THEN SET O_N1 = X; END IF;
+      FETCH C1 INTO X;
+    END WHILE;
+    CLOSE C1;
+    SET O_N2 = V_N;
+  END;
+  SET SCHEMA = V_OLD;
+END
+"""
+
+[[probe]]
+id = "V26-CTE-BACKWARD"
+fact = "V26"
+role = "control"
+procedure = "V26_QUERY"
+args = ["'WITH CTEB AS (SELECT 5 AS X FROM SYSIBM.SYSDUMMY1), A AS (SELECT X FROM CTEB) SELECT X FROM A'"]
+question = "Control: a CTE that reads an earlier CTE named like an existing table (CTEB) reads the CTE (5, not the table's 7)."
+source = "Standard SQL scoping: a CTE name hides a table of the same name in what follows it. Assumed; not read on an IBM i page, which is why it is only a control."
+outcome = [
+  { label = "reads the CTE", when = { create = "00000", state = "00000", n1 = "=5", n2 = "=1" }, verdict = "consistent", meaning = "The earlier CTE hides the table." },
+]
+
+[[probe]]
+id = "V26-CTE-FORWARD"
+fact = "V26"
+role = "decisive"
+procedure = "V26_QUERY"
+args = ["'WITH R (N) AS (SELECT 1 FROM SYSIBM.SYSDUMMY1 UNION ALL SELECT N + 1 FROM R WHERE N < 10), A AS (SELECT X FROM CTEB), CTEB AS (SELECT 5 AS X FROM SYSIBM.SYSDUMMY1) SELECT X FROM A'"]
+question = "With a recursive CTE in the list, does A read the later CTE CTEB, the table CTEB, or fail? (Asked by the CTE conversion review; the converter passes this form through unchanged.)"
+source = "Open question; no expectation. Not on a readable IBM i page."
+outcome = [
+  { label = "later CTE", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "open", meaning = "A reads the CTE defined after it (forward reference allowed)." },
+  { label = "table", when = { create = "00000", state = "00000", n1 = "=7" }, verdict = "open", meaning = "A reads the table SQLDFPROBE.CTEB: the later CTE is not in scope for A." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V26-CTE-FORWARD-PLAIN"
+fact = "V26"
+role = "info"
+procedure = "V26_QUERY"
+args = ["'WITH A AS (SELECT X FROM CTEB), CTEB AS (SELECT 5 AS X FROM SYSIBM.SYSDUMMY1) SELECT X FROM A'"]
+question = "The same forward reference without the recursive CTE: does the answer depend on recursion being present?"
+source = "Open question; no expectation."
+outcome = [
+  { label = "later CTE", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "open", meaning = "A reads the CTE defined after it." },
+  { label = "table", when = { create = "00000", state = "00000", n1 = "=7" }, verdict = "open", meaning = "A reads the table SQLDFPROBE.CTEB." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V26-RECURSIVE-COLUMNS"
+fact = "V26"
+role = "control"
+procedure = "V26_QUERY"
+args = ["'WITH R (N) AS (SELECT 1 FROM SYSIBM.SYSDUMMY1 UNION ALL SELECT N + 1 FROM R WHERE N < 10) SELECT N FROM R'"]
+question = "Control: a recursive CTE with a column list gives 10 rows starting at 1."
+source = "Recursive CTEs with a column list are the documented Db2 for i form (SQL programming, recursive queries); assumed from that, not read on a page here."
+outcome = [
+  { label = "10 rows", when = { create = "00000", state = "00000", n1 = "=1", n2 = "=10" }, verdict = "consistent", meaning = "Recursion works with a column list." },
+]
+
+[[probe]]
+id = "V26-RECURSIVE-NO-COLUMNS"
+fact = "V26"
+role = "decisive"
+procedure = "V26_QUERY"
+args = ["'WITH R AS (SELECT 1 AS N FROM SYSIBM.SYSDUMMY1 UNION ALL SELECT N + 1 FROM R WHERE N < 10) SELECT N FROM R'"]
+question = "Is a recursive CTE without a column list accepted, or must the column list be given? (The converter passes this form through unchanged.)"
+source = "Open question; no expectation. Not on a readable IBM i page."
+outcome = [
+  { label = "accepted", when = { create = "00000", state = "00000", n1 = "=1", n2 = "=10" }, verdict = "open", meaning = "Accepted and gives the same 10 rows: the column list may be left out." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected: a recursive CTE needs a column list on this release (SQLSTATE recorded); the converter must add one." },
+]

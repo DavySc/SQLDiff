@@ -123,6 +123,7 @@ class Results(unittest.TestCase):
         for fid in ("V4", "V9", "V14", "V15", "V16", "V19", "V3", "V7", "V25"):
             self.assertEqual(st[fid], "confirmed", (fid, ev["facts"][fid]))
         self.assertEqual(st["V5"], "observed")
+        self.assertEqual(st["V26"], "observed")
 
     def test_contradiction_and_correction(self):
         defs, facts = dp.load_probes(), dp.load_facts()

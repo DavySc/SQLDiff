@@ -62,6 +62,11 @@ id = "V25"
 title = "Default USRPRF (*NAMING) of a routine without SET OPTION USRPRF"
 review = ["docs/cross-dialect-proofs.md", "docs/convert-mode.md"]
 
+[[fact]]
+id = "V26"
+title = "Common table expressions: forward references and recursion without a column list"
+review = ["docs/convert-mode.md"]
+
 [[link]]
 facts = ["V4"]
 file = "crates/sqldiff-convert/src/tsql.rs"
