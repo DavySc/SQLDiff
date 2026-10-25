@@ -152,6 +152,28 @@ fn delete_join_is_a_semi_join_in_every_spelling() {
             "{a}\n{b}"
         );
     }
+    // An unqualified name moves into the EXISTS subquery, where it resolves
+    // to the inner table first. `name` is only in item: still the same.
+    // `item_id` is in both tables, which T-SQL rejects (Msg 209): never equal.
+    let bare = |col: &str| {
+        let t = format!(
+            "CREATE PROCEDURE dbo.purge AS
+             BEGIN
+               DELETE pf FROM dbo.price_feed AS pf JOIN dbo.item AS i ON i.item_id = pf.item_id
+                WHERE {col} IS NULL;
+             END"
+        );
+        (t, db2(&format!("i.item_id = pf.item_id AND {col} IS NULL")))
+    };
+    let (t, d) = bare("name");
+    equal(run(&t, T, &d, D, true));
+    let (t, d) = bare("item_id");
+    let r = run(&t, T, &d, D, true);
+    assert!(
+        !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.findings
+    );
 }
 
 #[test]

@@ -1599,6 +1599,24 @@ impl<'a> Cx<'a> {
         if end < ts.len() {
             conds.push(&ts[end + 1..]);
         }
+        if self.db2() && leaves.len() > 1 {
+            // Inside EXISTS an unqualified name resolves to the inner tables
+            // first, while T-SQL rejects a name that two FROM tables have. So
+            // every unqualified name must be in exactly one table by the
+            // catalog; without one, it has to be qualified.
+            for c in &conds {
+                if c.iter().any(|t| t.is("SELECT")) {
+                    return Err(why("a subquery in the conditions"));
+                }
+                for name in bare_columns(c) {
+                    if self.column_owners(&leaves, &name) != Some(1) {
+                        return Err(why(&format!(
+                            "the unqualified column `{name}` could belong to more than one table (qualify it with its table alias)"
+                        )));
+                    }
+                }
+            }
+        }
         let tgt = self.expr(trimmed(leaves[hit].toks)).trim().to_string();
         let others: Vec<String> = (0..leaves.len())
             .filter(|&i| i != hit)
@@ -1621,6 +1639,27 @@ impl<'a> Cx<'a> {
                 others.join(", ")
             ),
         })
+    }
+
+    /// How many of the DELETE's FROM tables have column `name`, by the
+    /// source catalog; `None` without a catalog entry for every table.
+    fn column_owners(&self, leaves: &[Leaf], name: &str) -> Option<usize> {
+        use sqldiff_core::catalog::{table_position, Ident};
+        let cat = self.catalog?;
+        let mut n = 0;
+        for l in leaves {
+            if !l.table {
+                return None;
+            }
+            let parts: Vec<Ident> = match l.name.as_slice() {
+                [.., s, t] if s != "dbo" => vec![Ident::plain(s.clone()), Ident::plain(t.clone())],
+                [.., t] => vec![Ident::plain(t.clone())],
+                [] => return None,
+            };
+            let t = &cat.tables[table_position(Dialect::Tsql, cat, &parts)?];
+            n += usize::from(t.column(Dialect::Tsql, &Ident::plain(name)).is_some());
+        }
+        Some(n)
     }
 
     fn set(&mut self, ts: &[T]) -> R<String> {
@@ -3800,6 +3839,28 @@ impl Leaf<'_> {
     }
 }
 
+/// Unqualified column names in a condition: words that are not keywords,
+/// not part of a dotted name, not a function name and not a type after AS.
+fn bare_columns(ts: &[T]) -> Vec<String> {
+    let mut out = Vec::new();
+    for i in sig(ts) {
+        let t = &ts[i];
+        let quoted = t.k == QUOTED_IDENT;
+        if !(t.k == IDENT || quoted) || !quoted && sqldiff_core::normalize::is_keyword(&t.up()) {
+            continue;
+        }
+        let prev = prev_sig(ts, i).map(|j| &ts[j]);
+        let next = next_sig(ts, i).map(|j| &ts[j]);
+        if prev.is_some_and(|p| p.k == DOT || p.is("AS"))
+            || next.is_some_and(|n| n.k == DOT || n.k == L_PAREN)
+        {
+            continue;
+        }
+        out.push(tsql_unquote(&t.s).to_ascii_lowercase());
+    }
+    out
+}
+
 /// Unquoted, lowercased parts of a dotted name; `None` if the tokens are
 /// anything else.
 fn name_parts(ts: &[T]) -> Option<Vec<String>> {
@@ -3859,6 +3920,8 @@ fn join_chain<'a>(
         } else if ["LEFT", "RIGHT", "FULL", "OUTER", "INNER", "CROSS", "APPLY"]
             .iter()
             .any(|w| t.is(w))
+            // LEFT(…) and RIGHT(…) are string functions.
+            && !next_sig(ts, i).is_some_and(|j| ts[j].k == L_PAREN)
         {
             return Err("an outer join, APPLY or a join hint".into());
         } else {

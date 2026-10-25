@@ -514,6 +514,22 @@ fn delete_with_inner_joins_becomes_delete_where_exists() {
             c.report.findings
         );
     }
+    // Inside EXISTS an unqualified name would resolve to the joined table
+    // first; T-SQL rejects one that both tables have (Msg 209). Without a
+    // catalog to show which table owns it, it is refused.
+    for src in [
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE nick IS NULL;",
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON customer_id = o.customer_id;",
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.nick IN (SELECT nick FROM dbo.item);",
+    ] {
+        assert_eq!(db2(src).units[0].status, Status::NotConverted, "{src}");
+    }
+    // Without other tables nothing moves into a subquery.
+    let one = "DELETE o FROM dbo.orders o WHERE order_id = 1;";
+    assert_eq!(
+        db2(one).output.trim(),
+        "DELETE FROM orders o WHERE (order_id = 1);"
+    );
     let left = "DELETE o FROM dbo.orders o LEFT JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.nick = 'a';";
     assert_eq!(db2(left).units[0].status, Status::NotConverted);
 }

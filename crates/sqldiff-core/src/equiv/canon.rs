@@ -2049,6 +2049,52 @@ impl<'a> Canon<'a> {
             return None;
         }
         conds.extend(where_.iter().cloned());
+        if !others.is_empty() {
+            // The conditions move into the EXISTS subquery, where an
+            // unqualified name resolves to the inner tables first. In the
+            // source all tables share one scope, so a name in two of them is
+            // an error there; accept a name only when the catalog shows it in
+            // exactly one table (or in none, for a parameter or variable).
+            if conds.iter().any(has_query) {
+                return Some(Err(
+                    "DELETE semi-join: a subquery or CASE in the conditions may use unqualified names".into(),
+                ));
+            }
+            let mut bare = Vec::new();
+            for c in &conds {
+                unqualified(c, &mut bare);
+            }
+            let mut tables = vec![tname.clone()];
+            for f in &others {
+                match f {
+                    From::Table { name, .. } => tables.push(name.clone()),
+                    _ if bare.is_empty() => {}
+                    _ => {
+                        return Some(Err(
+                            "DELETE semi-join: unqualified names next to a derived table".into(),
+                        ))
+                    }
+                }
+            }
+            for name in &bare {
+                let mut hits = 0;
+                for t in &tables {
+                    match self.schema.table(t.last().unwrap()) {
+                        Some(tab) => hits += usize::from(tab.column(name).is_some()),
+                        None => {
+                            return Some(Err(format!(
+                            "DELETE semi-join: `{name}` may name a column of more than one table"
+                        )))
+                        }
+                    }
+                }
+                if !(hits == 1 || hits == 0 && self.sym(name).is_some()) {
+                    return Some(Err(format!(
+                        "DELETE semi-join: `{name}` may name a column of more than one table"
+                    )));
+                }
+            }
+        }
         let cond = conds
             .into_iter()
             .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)));
@@ -2394,6 +2440,22 @@ fn order_operands(op: &str, x: Term, y: Term) -> (Term, Term, String) {
 
 fn l_or_r_is_str(l: &Expr, r: &Expr) -> bool {
     matches!(l, Expr::Str(_)) || matches!(r, Expr::Str(_))
+}
+
+/// Whether an expression holds a subquery or CASE anywhere.
+fn has_query(e: &Expr) -> bool {
+    match e {
+        Expr::Exists(_) | Expr::Subquery(_) | Expr::InQuery(..) | Expr::Case(..) => true,
+        Expr::Bin(_, l, r) | Expr::Like(l, r, _, _) => has_query(l) || has_query(r),
+        Expr::Unary(_, x) | Expr::IsNull(x, _) | Expr::Cast(x, _) | Expr::Extract(_, x) => {
+            has_query(x)
+        }
+        Expr::Call(c) => c.args.iter().any(has_query) || c.order.iter().any(|o| has_query(&o.expr)),
+        Expr::InList(x, l, _) => has_query(x) || l.iter().any(has_query),
+        Expr::Between(x, y, z, _) => has_query(x) || has_query(y) || has_query(z),
+        Expr::Tuple(l) => l.iter().any(has_query),
+        _ => false,
+    }
 }
 
 /// The tables of a tree of inner and cross joins, and its ON conditions;

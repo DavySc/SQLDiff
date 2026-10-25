@@ -766,6 +766,10 @@ fn delete_with_inner_joins_becomes_delete_using() {
             "DELETE FROM orders o USING orders o2 WHERE (o2.customer_id = o.customer_id AND o2.order_id > o.order_id);",
         ),
         (
+            "DELETE o FROM dbo.orders o JOIN dbo.customer c ON LEFT(c.nick, 1) IS NOT NULL AND c.customer_id = o.customer_id;",
+            "DELETE FROM orders o USING customer c WHERE (LEFT(c.nick, 1) IS NOT NULL AND c.customer_id = o.customer_id);",
+        ),
+        (
             "DELETE o FROM dbo.orders o WHERE o.order_id = 1;",
             "DELETE FROM orders o WHERE (o.order_id = 1);",
         ),
