@@ -1533,6 +1533,18 @@ END
 """
 
 [[probe]]
+id = "V26-TABLE-PLAIN"
+fact = "V26"
+role = "control"
+procedure = "V26_QUERY"
+args = ["'SELECT X FROM CTEB'"]
+question = "Control: with the current schema set to SQLDFPROBE, an unqualified CTEB reads the table (7), so an error on the forward-reference probes is about the CTE, not the table."
+source = "SET SCHEMA sets the default schema for unqualified names in dynamic SQL under SQL naming. Assumed; not read on an IBM i page, which is why it is only a control."
+outcome = [
+  { label = "reads the table", when = { create = "00000", state = "00000", n1 = "=7", n2 = "=1" }, verdict = "consistent", meaning = "The table is reachable unqualified." },
+]
+
+[[probe]]
 id = "V26-CTE-BACKWARD"
 fact = "V26"
 role = "control"
