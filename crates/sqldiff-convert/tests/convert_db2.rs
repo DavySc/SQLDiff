@@ -576,6 +576,13 @@ fn table_function_in_from_becomes_table_reference() {
             c.output_check.findings
         );
     }
+    // An old-style table hint is not a call; the hint itself stays residue.
+    let c = db2("SELECT o.order_id FROM dbo.orders o JOIN dbo.customer (NOLOCK) ON 1 = 1;");
+    assert_eq!(
+        c.output.trim(),
+        "SELECT o.order_id FROM orders o JOIN customer (NOLOCK) ON 1 = 1;"
+    );
+    assert!(c.units[0].status >= Status::Differs);
     // T-SQL's rowset built-ins and sys functions have no rule.
     for src in [
         "SELECT value FROM STRING_SPLIT('a,b', ',');",
