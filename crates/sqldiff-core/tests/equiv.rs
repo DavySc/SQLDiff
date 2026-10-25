@@ -764,3 +764,42 @@ fn schema_names_are_compared() {
         r.findings
     );
 }
+
+/// Db2 for i's `FROM SYSIBM.SYSDUMMY1` is the one-row FROM the others leave out.
+#[test]
+fn db2_sysdummy1_is_no_from() {
+    let r = run(
+        "SELECT 1 AS x;",
+        T,
+        "SELECT 1 AS x FROM SYSIBM.SYSDUMMY1;",
+        D,
+        false,
+    );
+    assert_eq!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    let r = run(
+        "SELECT 1 AS x;",
+        T,
+        "SELECT 2 AS x FROM SYSIBM.SYSDUMMY1;",
+        D,
+        false,
+    );
+    assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    // Its column is not an empty FROM's.
+    let r = run(
+        "SELECT 'Y' AS x;",
+        T,
+        "SELECT IBMREQD AS x FROM SYSIBM.SYSDUMMY1;",
+        D,
+        false,
+    );
+    assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    // Only Db2 for i has it.
+    let r = run(
+        "SELECT 1 AS x;",
+        T,
+        "SELECT 1 AS x FROM sysibm.sysdummy1;",
+        P,
+        false,
+    );
+    assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+}

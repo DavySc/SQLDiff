@@ -445,7 +445,8 @@ fn server_serves_page_and_rediffs_edits() {
     let (res, json) = post(
         port,
         "/api/diff",
-        &serde_json::json!({ "pair": 0, "a": "SELECT 1;", "b": "SELECT 1;" }),
+        // Side B is Db2 for i, where a subselect needs FROM.
+        &serde_json::json!({ "pair": 0, "a": "SELECT 1;", "b": "SELECT 1 FROM SYSIBM.SYSDUMMY1;" }),
     );
     assert!(res.starts_with("HTTP/1.1 200"), "{res}");
     assert_eq!(json["report"]["findings"].as_array().unwrap().len(), 0);

@@ -729,3 +729,24 @@ fn db2_table_function_needs_table() {
         rules(&r)
     );
 }
+
+/// Db2 for i: a subselect needs FROM, and SYSIBM.SYSDUMMY1 always exists,
+/// also against a catalog that lists every table.
+#[test]
+fn db2_select_needs_from_and_sysdummy1_binds() {
+    let src = "SELECT 1 AS one;\nSELECT a FROM t WHERE a IN (SELECT 2);\nGRANT SELECT, INSERT ON t TO u;\nSELECT TRIM(' ' FROM a) FROM t;\nSELECT 1 FROM SYSIBM.SYSDUMMY1;\n";
+    let r = check_rules(Dialect::Db2i, src, Some("CREATE TABLE t (a INTEGER);"));
+    let hits: Vec<_> = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "residue.db2i.select-without-from")
+        .collect();
+    assert_eq!(hits.len(), 2, "{:?}", rules(&r));
+    assert!(
+        !r.findings.iter().any(|f| f.rule == "bind.unknown-table"),
+        "{:?}",
+        rules(&r)
+    );
+    let r = check_rules(Dialect::Postgres, "SELECT 1;", None);
+    assert!(rules(&r).is_empty(), "{:?}", rules(&r));
+}

@@ -1142,6 +1142,17 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("FROM") {
             s.from = self.table_list()?;
+            // Db2 for i: `FROM SYSIBM.SYSDUMMY1` is the one-row FROM that
+            // T-SQL and PostgreSQL leave out.
+            if self.d == Dialect::Db2i
+                && matches!(&s.from[..], [From::Table { name, alias: None, hints }]
+                    if hints.is_empty()
+                        && name.len() == 2
+                        && name[0].eq_ignore_ascii_case("SYSIBM")
+                        && name[1].eq_ignore_ascii_case("SYSDUMMY1"))
+            {
+                s.from.clear();
+            }
         }
         if self.eat_kw("WHERE") {
             s.where_ = Some(self.expr()?);

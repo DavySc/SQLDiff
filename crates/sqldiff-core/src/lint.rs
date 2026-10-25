@@ -266,8 +266,86 @@ fn last_statement(node: &SyntaxNode) -> Option<SyntaxNode> {
         .last()
 }
 
+/// Db2 for i: a subselect needs a FROM clause (`FROM SYSIBM.SYSDUMMY1`, or
+/// VALUES), so `SELECT 1` without one, the T-SQL and PostgreSQL form, does
+/// not run. `GRANT SELECT` and privilege lists are not queries.
+pub fn db2_select_without_from_hits(root: &SyntaxNode, dialect: Dialect) -> Vec<Hit> {
+    if dialect != Dialect::Db2i {
+        return Vec::new();
+    }
+    let toks: Vec<SyntaxToken> = ast::sig_tokens(root).collect();
+    let mut depth = Vec::with_capacity(toks.len());
+    let mut d = 0i32;
+    for t in &toks {
+        if t.kind() == SyntaxKind::R_PAREN {
+            d -= 1;
+        }
+        depth.push(d);
+        if t.kind() == SyntaxKind::L_PAREN {
+            d += 1;
+        }
+    }
+    let word = |i: usize, w: &str| {
+        toks.get(i)
+            .is_some_and(|t| t.kind() == SyntaxKind::IDENT && t.text().eq_ignore_ascii_case(w))
+    };
+    let mut hits = Vec::new();
+    for i in 0..toks.len() {
+        if !word(i, "SELECT") {
+            continue;
+        }
+        let privilege = i > 0
+            && (word(i - 1, "GRANT")
+                || word(i - 1, "REVOKE")
+                || toks[i - 1].kind() == SyntaxKind::COMMA)
+            || word(i + 1, "ON")
+            || toks
+                .get(i + 1)
+                .is_some_and(|t| t.kind() == SyntaxKind::COMMA);
+        if privilege {
+            continue;
+        }
+        let mut end = toks.len();
+        let mut from = false;
+        for j in i + 1..toks.len() {
+            let t = &toks[j];
+            if depth[j] < depth[i] || t.kind() == SyntaxKind::SEMICOLON {
+                end = j;
+                break;
+            }
+            if depth[j] != depth[i] || t.kind() == SyntaxKind::L_PAREN {
+                continue;
+            }
+            if ["UNION", "EXCEPT", "INTERSECT"].iter().any(|w| word(j, w)) {
+                end = j;
+                break;
+            }
+            if word(j, "FROM") {
+                from = true;
+                break;
+            }
+        }
+        if from {
+            continue;
+        }
+        let last = &toks[end.max(i + 1) - 1];
+        let text: Vec<&str> = toks[i..end.max(i + 1)].iter().map(|t| t.text()).collect();
+        hits.push(Hit {
+            rule: "residue.db2i.select-without-from".to_string(),
+            class: ChangeClass::Residue,
+            severity: Severity::Medium,
+            message: "A SELECT without FROM: Db2 for i requires a FROM clause in a subselect (use FROM SYSIBM.SYSDUMMY1, or VALUES).".to_string(),
+            start: toks[i].text_range().start().into(),
+            end: last.text_range().end().into(),
+            key: text.join(" ").to_ascii_uppercase(),
+        });
+    }
+    hits
+}
+
 pub fn all_hits(a: &Analyzed) -> Vec<Hit> {
     let mut hits = residue_hits(&a.root, a.dialect());
+    hits.extend(db2_select_without_from_hits(&a.root, a.dialect()));
     hits.extend(terminator_hits(&a.root, a.dialect()));
     hits.extend(insert_arity_hits(&a.root, a.dialect()));
     hits.sort_by_key(|h| h.start);
