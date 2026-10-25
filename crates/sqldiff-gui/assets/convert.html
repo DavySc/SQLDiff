@@ -92,6 +92,9 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 36px minmax
 .dl .gap { height: 2px; padding: 0; margin-top: -1px; background: var(--chg-tok); }
 .dl .cur { padding: 0; box-shadow: inset 0 0 0 1px var(--focus); border-radius: 2px; }
 .dl mark { color: transparent; background: color-mix(in srgb, var(--chg-tok) 70%, transparent); border-radius: 3px; }
+/* .sx draws the editor's text, syntax coloured, under the transparent textarea (only the lines in view). */
+.sx { position: absolute; left: 0; top: 0; min-width: 100%; pointer-events: none; }
+.sx pre { position: absolute; left: 0; margin: 0; padding: 0 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; tab-size: 4; white-space: pre; color: var(--fg); }
 #srchl { position: absolute; left: 0; right: 0; top: 0; pointer-events: none; }
 #srchl .bar { position: absolute; left: 0; right: 0; }
 #srchl .bar.sel { background: var(--link); box-shadow: inset 3px 0 0 var(--focus); }
@@ -102,7 +105,8 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 36px minmax
 #gut .edge { position: absolute; left: 2px; right: 2px; padding: 2px 0; font-size: 10px; font-weight: 600; line-height: 1.2; text-align: center; color: var(--focus); background: var(--panel); border: 1px solid var(--focus); border-radius: 999px; font-variant-numeric: tabular-nums; }
 #gut .edge:hover { background: var(--panel); color: var(--focus); }
 body.compare main { grid-template-columns: minmax(0, 1fr) 0 minmax(0, 1fr) 14px; }
-#src, #b { display: block; width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; position: relative; z-index: 1; background: transparent; }
+#src, #b { display: block; width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; color: transparent; caret-color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; position: relative; z-index: 1; background: transparent; }
+#src::selection, #b::selection { color: transparent; background: color-mix(in srgb, var(--focus) 24%, transparent); }
 body.compare #out, body.compare #gut, body.compare #overview .m:not(.f):not(.d), body.compare .conv-only { display: none !important; }
 body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !important; }
 #out { grid-row: 2; grid-column: 3; overflow: auto; background: var(--panel); border-left: 1px solid var(--line); font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; padding: 8px 0; }
@@ -190,10 +194,10 @@ body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !importa
 <main>
   <div class="ph"><strong id="srcdial">T-SQL</strong><span id="srcname"></span><span class="spacer"></span><span>edit freely; nothing is saved</span></div>
   <div class="ph right"><strong id="outdial">PostgreSQL</strong><span id="outsub">converted, checked by SQLDiff</span><span class="spacer"></span><span id="timing"></span></div>
-  <div class="srcwrap edwrap"><div class="lnum" id="srcno" aria-hidden="true"><div class="in"></div></div><div class="edarea"><div class="dl" id="srcdl"></div><div id="srchl"></div><textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea></div></div>
+  <div class="srcwrap edwrap"><div class="lnum" id="srcno" aria-hidden="true"><div class="in"></div></div><div class="edarea"><div class="dl" id="srcdl"></div><div id="srchl"></div><div class="sx" id="srcsx" aria-hidden="true"></div><textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea></div></div>
   <div id="gut" class="conv-only"><svg id="gsvg" aria-hidden="true"></svg></div>
   <div id="out" role="listbox" tabindex="0" aria-label="Converted output"></div>
-  <div class="edwrap" id="bwrap"><div class="lnum" id="bno" aria-hidden="true"><div class="in"></div></div><div class="edarea"><div class="dl" id="bdl"></div><textarea id="b" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Right side to compare"></textarea></div></div>
+  <div class="edwrap" id="bwrap"><div class="lnum" id="bno" aria-hidden="true"><div class="in"></div></div><div class="edarea"><div class="dl" id="bdl"></div><div class="sx" id="bsx" aria-hidden="true"></div><textarea id="b" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Right side to compare"></textarea></div></div>
   <div id="overview" title="Location pane: click to jump"></div>
 </main>
 <section id="detail">
@@ -245,25 +249,162 @@ function effective(u) {
 }
 
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-const KW = new Set(("select from where and or not null is in exists insert into values update set delete create replace procedure function " +
-  "returns return language as begin end if then else elsif while loop exit continue declare table view index unique primary key " +
-  "foreign references default generated always identity start with increment by order group having limit offset fetch next rows only " +
-  "join left right inner outer full cross on case when distinct union all except intersect call raise notice exception others using " +
-  "commit rollback temp cast coalesce like true false do inout include check constraint").split(" "));
-function hl(line) {
-  const re = /(--.*$)|('(?:[^']|'')*'?)|(\$\$)|(\b\d+(?:\.\d+)?\b)|(@@?\w+)|([A-Za-z_][A-Za-z0-9_]*)|([^A-Za-z0-9_'@$-]+|.)/g;
-  let out = "", m;
-  while ((m = re.exec(line))) {
-    const [t, c, s, d, n, v, w] = m;
-    if (c) out += `<span class="t-cmt">${esc(c)}</span>`;
-    else if (s) out += `<span class="t-str">${esc(s)}</span>`;
-    else if (d) out += `<span class="t-kw">$$</span>`;
-    else if (n) out += `<span class="t-num">${n}</span>`;
-    else if (v) out += `<span class="t-var">${esc(v)}</span>`;
-    else if (w) out += KW.has(w.toLowerCase()) ? `<span class="t-kw">${w}</span>` : esc(w);
-    else out += esc(t);
+// Syntax highlighting that lexes the way the engine does (sqldiff-syntax's
+// lexer, driven by each dialect's lexical profile from the server): comments,
+// strings and quoted identifiers may span lines, so the whole text is lexed
+// and then cut into lines. Styles match the pair view's. As in the parser, a
+// PostgreSQL routine body (`CREATE FUNCTION ... AS $$ ... $$`, `DO $$ ... $$`)
+// is code, unless the routine's first LANGUAGE is neither plpgsql nor sql.
+const KEYWORDS = new Set(INITIAL.keywords);
+const LEX = Object.fromEntries(INITIAL.dialects.map((d) => [d.id, d.lex]));
+const ALPHA = /^\p{Alphabetic}$/u, ALNUM = /^[\p{Alphabetic}\p{N}]$/u, SPACE = /^\p{White_Space}$/u;
+// ASCII letters and `_` (1: start an identifier, 2: continue one), digits (2).
+const ASCII_WORD = new Uint8Array(128).map((_, k) => /[A-Za-z_]/.test(String.fromCharCode(k)) ? 3 : /[0-9]/.test(String.fromCharCode(k)) ? 2 : 0);
+const isDigit = (c) => c >= "0" && c <= "9";
+const asciiUpper = (w) => w.replace(/[a-z]+/g, (x) => x.toUpperCase());
+// Style runs [start, end, style] of a text; the text between runs is plain.
+function lexSql(text, dialect, base = 0) {
+  const p = LEX[dialect] || LEX.tsql, n = text.length;
+  const cp = (k) => (k >= n ? "" : text.charCodeAt(k) < 128 ? text[k] : String.fromCodePoint(text.codePointAt(k)));
+  const identStart = (c) => c !== "" && ((c.charCodeAt(0) < 128 ? ASCII_WORD[c.charCodeAt(0)] & 1 : ALPHA.test(c)) || p.extra_ident_start.includes(c));
+  const identCont = (c) => c !== "" && ((c.charCodeAt(0) < 128 ? ASCII_WORD[c.charCodeAt(0)] : ALNUM.test(c)) || p.extra_ident_continue.includes(c));
+  const out = [];
+  // Per statement: its first tokens' words, the first LANGUAGE it names, and
+  // its dollar strings that may be routine bodies (decided at its end). A
+  // routine ends at a `;` outside parentheses, other statements at any `;`.
+  let i = 0, word_ = "", prev = "", stmt = [], depth = 0, lang = null, isDo = false, atomic = false, bodies = [];
+  const creates = () => stmt[0] === "CREATE" && /^(FUNCTION|PROCEDURE)$/.test(stmt[1] === "OR" ? stmt[3] : stmt[1]);
+  const endStatement = () => {
+    for (const b of bodies) b.code = lang === null || lang === "plpgsql" || lang === "sql";
+    stmt = []; lang = null; isDo = false; atomic = false; bodies = [];
+  };
+  const quoted = (q, backslash) => {
+    i++;
+    while (i < n) {
+      const c = text[i++];
+      if (backslash && c === "\\") i++;
+      else if (c === q) { if (text[i] === q) i++; else break; }
+    }
+    i = Math.min(i, n);
+  };
+  const number = () => {
+    if ((dialect === "tsql" || dialect === "postgres") && text[i] === "0" && (text[i + 1] === "x" || text[i + 1] === "X")) {
+      for (i += 2; i < n && /[0-9a-fA-F_]/.test(text[i]); i++);
+      return;
+    }
+    const digits = () => { while (i < n && (isDigit(text[i]) || (dialect === "postgres" && text[i] === "_"))) i++; };
+    digits();
+    if (text[i] === "." && text[i + 1] !== ".") { i++; digits(); }
+    if (text[i] === "e" || text[i] === "E") {
+      const k = text[i + 1] === "+" || text[i + 1] === "-" ? 2 : 1;
+      if (isDigit(text[i + k] || "")) { i += k; digits(); }
+    }
+  };
+  // `GO` alone on its line (with an optional count and comment) ends a batch.
+  const goEnd = (s) => {
+    for (let k = s - 1; k >= 0 && text[k] !== "\n"; k--) if (!SPACE.test(text[k])) return -1;
+    let k = i;
+    while (text[k] === " " || text[k] === "\t") k++;
+    const d = k;
+    while (isDigit(text[k] || "")) k++;
+    const end = k > d ? k : i;
+    while (text[k] === " " || text[k] === "\t") k++;
+    return k >= n || text[k] === "\n" || text.startsWith("\r\n", k) || text.startsWith("--", k) ? end : -1;
+  };
+  const word = (s) => {
+    for (let c = cp(i); c && identCont(c); c = cp(i)) i += c.length;
+    const w = text.slice(s, i), up = (word_ = /^[\x00-\x7f]*$/.test(w) ? w.toUpperCase() : asciiUpper(w));
+    if (text[i] === "'" && p.string_prefixes.includes(up)) { word_ = ""; quoted("'", dialect === "postgres" && up === "E"); return "str"; }
+    if (dialect === "postgres" && up === "U" && text.startsWith("&'", i)) { word_ = ""; i++; quoted("'", false); return "str"; }
+    if (dialect === "postgres" && up === "U" && text.startsWith('&"', i)) { word_ = ""; i++; quoted('"', false); return ""; }
+    if (p.go_batches && up === "GO") { const e = goEnd(s); if (e >= 0) { i = e; return "kw"; } }
+    return KEYWORDS.has(up) ? "kw" : "";
+  };
+  const dollar = () => {
+    if (isDigit(text[i + 1] || "")) { for (i++; isDigit(text[i] || ""); i++); return "var"; }
+    let k = i + 1;
+    for (let c = cp(k); c !== "$"; c = cp(k)) {
+      if (!c || !(c === "_" || (k === i + 1 ? ALPHA.test(c) : ALNUM.test(c)))) { i++; return ""; }
+      k += c.length;
+    }
+    const s = i, delim = text.slice(i, k + 1), end = text.indexOf(delim, k + 1);
+    i = end < 0 ? n : end + delim.length;
+    if (stmt.length === 1 && stmt[0] === "DO") isDo = true;
+    if (end < 0 || !((creates() && prev === "AS" && !atomic) || isDo)) return "str";
+    const body = { s, open: k + 1, close: end, e: i, code: false };
+    bodies.push(body);
+    out.push(body);
+    return "";
+  };
+  while (i < n) {
+    const s = i, c = text[i];
+    if (c === " " || c === "\n" || c === "\t" || c === "\r") { i++; continue; }
+    let st = "";
+    word_ = "";
+    if (text.startsWith("--", i)) { const e = text.indexOf("\n", i); i = e < 0 ? n : e; st = "cmt"; }
+    else if (text.startsWith("/*", i)) {
+      i += 2;
+      for (let depth = 1; i < n;) {
+        if (p.nested_block_comments && text.startsWith("/*", i)) { i += 2; depth++; }
+        else if (text.startsWith("*/", i)) { i += 2; if (!--depth) break; }
+        else i++;
+      }
+      i = Math.min(i, n);
+      st = "cmt";
+    }
+    else if (c === "'") { quoted("'", false); st = "str"; }
+    else if (c === '"') quoted('"', false);
+    else if (c === "[" && p.bracket_identifiers) quoted("]", false);
+    else if (c === "." && isDigit(text[i + 1] || "")) { number(); st = "num"; }
+    else if (c === "$" && p.dollar_quoting) st = dollar();
+    else if (c === "@" && p.at_variables && (text[i + 1] === "@" || identCont(cp(i + 1)))) {
+      for (i++; i < n && (text[i] === "@" || identCont(cp(i))); i += cp(i).length);
+      st = "var";
+    }
+    else if (c === "?" && p.question_param) { i++; st = "var"; }
+    else if (isDigit(c)) { number(); st = "num"; }
+    else if (identStart(cp(i))) st = word(s);
+    else i += cp(i).length;
+    if (st) out.push([base + s, base + i, st]);
+    // The statement's first words and the LANGUAGE it named so far, and the
+    // word before a dollar string.
+    if (st !== "cmt" && !SPACE.test(c)) {
+      if (prev === "LANGUAGE" && lang === null) lang = text.slice(s, i).replace(/^'+|'+$/g, "").toLowerCase();
+      if (c === "(") depth++;
+      else if (c === ")") depth = Math.max(0, depth - 1);
+      if (c === ";" && (!depth || !(isDo || creates()))) { endStatement(); depth = 0; }
+      else {
+        if (stmt.length === 1 && stmt[0] === "DO" && word_ === "LANGUAGE") isDo = true;
+        // A `BEGIN ATOMIC ... END` body holds SQL statements, not a dollar-quoted body.
+        if (prev === "BEGIN" && word_ === "ATOMIC" && !depth) atomic = true;
+        if (stmt.length < 4) stmt.push(word_);
+      }
+      prev = word_;
+    }
   }
-  return out;
+  endStatement();
+  // A routine body's dollar quotes are keywords and its inside PL/pgSQL or SQL.
+  return out.flatMap((r) => Array.isArray(r) ? [r]
+    : !r.code ? [[base + r.s, base + r.e, "str"]]
+    : [[base + r.s, base + r.open, "kw"], ...lexSql(text.slice(r.open, r.close), "postgres", base + r.open), [base + r.close, base + r.e, "kw"]]);
+}
+// The lines of text[from, to) as HTML, coloured by the style runs (all of
+// them when there are none).
+function hlLines(text, runs, from = 0, to = text.length) {
+  const lines = [""];
+  const emit = (a, b, st) => text.slice(a, b).split("\n").forEach((part, k) => {
+    if (k) lines.push("");
+    if (part) lines[lines.length - 1] += st ? `<span class="t-${st}">${esc(part)}</span>` : esc(part);
+  });
+  let lo = 0, hi = runs.length;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (runs[m][1] <= from) lo = m + 1; else hi = m; }
+  let at = from;
+  for (let k = lo; k < runs.length && runs[k][0] < to; k++) {
+    const a = Math.max(from, runs[k][0]), b = Math.min(to, runs[k][1]);
+    emit(at, a, ""); emit(a, b, runs[k][2]); at = b;
+  }
+  emit(at, to, "");
+  return lines;
 }
 
 function render(data, keepSel) {
@@ -307,6 +448,7 @@ function render(data, keepSel) {
   c.units.forEach((u, i) => {
     for (let l = u.out.line; l <= u.out.end_line; l++) if (state.lineUnit[l - 1] === -1 || isNarrower(i, state.lineUnit[l - 1])) state.lineUnit[l - 1] = i;
   });
+  const shown = hlLines(c.output, lexSql(c.output, data.to));
   $("out").innerHTML = lines.map((t, i) => {
     const ui = state.lineUnit[i];
     const u = ui >= 0 ? c.units[ui] : null;
@@ -314,7 +456,7 @@ function render(data, keepSel) {
     const first = u && u.out.line === i + 1;
     const cls = u ? ` s-${st}` : "";
     const g = first ? `<span class="dot" style="background:var(--s-${st})" title="${LABEL[st]}"></span>` : "";
-    return `<div class="ln${cls}" data-l="${i + 1}" data-u="${ui}"><span class="no">${i + 1}</span><span class="g">${g}</span><span class="tx">${hl(t) || " "}</span></div>`;
+    return `<div class="ln${cls}" data-l="${i + 1}" data-u="${ui}"><span class="no">${i + 1}</span><span class="g">${g}</span><span class="tx">${shown[i] || " "}</span></div>`;
   }).join("");
   state.anchors = anchors(c, $("src").value.split("\n").length, c.output.split("\n").length);
   // Units with the same source span are parts of one statement the conversion split (a DECLARE moved to the declare section).
@@ -659,8 +801,32 @@ function compareOverview() {
 // Editor gutters and the compare highlights. The text diff runs in the page on
 // every edit, so the highlights follow typing at once; the engine's findings
 // arrive with the debounced /api/compare call.
-const EDITORS = [["src", "srcno", "srcdl"], ["b", "bno", "bdl"]];
-function editorOf(ta) { const [, no, dl] = EDITORS.find(([t]) => t === ta.id); return { no: $(no), dl: $(dl) }; }
+const EDITORS = [["src", "srcno", "srcdl", "srcsx"], ["b", "bno", "bdl", "bsx"]];
+function editorOf(ta) { const [, no, dl, sx] = EDITORS.find(([t]) => t === ta.id); return { no: $(no), dl: $(dl), sx: $(sx) }; }
+// The editor's syntax layer: the left side is in the source dialect, the
+// right one in the target. Only the lines in view (and a margin) are drawn,
+// again when scrolling leaves them. The layer shows the editor's text, so it
+// follows every edit at once; when lexing a long text is slow, the colours
+// catch up after a pause in typing and the new text shows uncoloured meanwhile.
+const SX = { src: { text: null, ms: 0 }, b: { text: null, ms: 0 } };
+function syntax(ta, relex) {
+  const s = SX[ta.id], d = ta.id === "src" ? state.from : state.to;
+  if (relex || s.text !== ta.value || s.d !== d) {
+    const t = ta.value, starts = [0];
+    for (let k = t.indexOf("\n"); k >= 0; k = t.indexOf("\n", k + 1)) starts.push(k + 1);
+    clearTimeout(s.timer);
+    let runs = [];
+    if (relex || s.ms <= 30 || s.d !== d) { const t0 = performance.now(); runs = lexSql(t, d); s.ms = performance.now() - t0; }
+    else s.timer = setTimeout(() => syntax(ta, true), Math.min(600, 2 * s.ms));
+    Object.assign(s, { text: t, d, runs, starts, from: 0, to: -1 });
+  }
+  const lh = lineHeight(ta), pt = padTop(ta), n = s.starts.length;
+  const top = Math.max(0, Math.floor((ta.scrollTop - pt) / lh)), bottom = Math.min(n, Math.ceil((ta.scrollTop + ta.clientHeight) / lh));
+  if (top >= s.from && bottom <= s.to) return;
+  s.from = Math.max(0, top - 100); s.to = Math.min(n, bottom + 100);
+  const end = s.to < n ? s.starts[s.to] - 1 : s.text.length;
+  editorOf(ta).sx.innerHTML = `<pre style="top:${pt + s.from * lh}px">${hlLines(s.text, s.runs, s.starts[s.from], end).join("\n")}\n</pre>`;
+}
 function numbers(ta) {
   const pre = editorOf(ta).no.querySelector("pre") || editorOf(ta).no.firstChild.appendChild(document.createElement("pre"));
   let n = 1;
@@ -670,7 +836,8 @@ function numbers(ta) {
 function layers(ta) {
   const e = editorOf(ta);
   e.no.firstChild.style.transform = `translateY(${-ta.scrollTop}px)`;
-  e.dl.style.transform = `translate(${-ta.scrollLeft}px, ${-ta.scrollTop}px)`;
+  e.dl.style.transform = e.sx.style.transform = `translate(${-ta.scrollLeft}px, ${-ta.scrollTop}px)`;
+  syntax(ta);
 }
 // A slow diff (thousands of unlike lines) waits for a pause in typing instead of every key.
 let diffTimer = null, diffMs = 0;
@@ -948,6 +1115,7 @@ function init() {
       fillPickers();
       $("srcdial").textContent = dialectName(state.from);
       $("outdial").textContent = dialectName(state.to);
+      syntax(ta); syntax($("b"));
       schedule(0);
     });
   }
@@ -960,7 +1128,8 @@ function init() {
     for (const id of ["from", "to", "m-compare"]) $(id).disabled = true;
   }
   numbers(ta);
-  for (const el of [ta, $("b")]) el.addEventListener("input", () => { numbers(el); if (state.mode === "compare") rediff(); schedule(); });
+  syntax(ta);
+  for (const el of [ta, $("b")]) el.addEventListener("input", () => { numbers(el); syntax(el); if (state.mode === "compare") rediff(); schedule(); });
   $("b").addEventListener("scroll", () => { syncFrom("out"); layers($("b")); });
   ["click", "keyup", "select"].forEach((ev) => ta.addEventListener(ev, followCaret));
   for (const el of [ta, $("b")]) ["click", "keyup"].forEach((ev) => el.addEventListener(ev, counterpart));
@@ -1029,7 +1198,7 @@ function init() {
   $("save").onclick = download;
   $("helpbtn").onclick = () => $("help").classList.add("open");
   $("help").onclick = () => $("help").classList.remove("open");
-  window.addEventListener("resize", () => { viewport(); links(); });
+  window.addEventListener("resize", () => { viewport(); links(); syntax(ta); syntax($("b")); });
   document.addEventListener("keydown", (e) => {
     if (e.altKey && e.key === "ArrowDown") { e.preventDefault(); step(1); }
     else if (e.altKey && e.key === "ArrowUp") { e.preventDefault(); step(-1); }

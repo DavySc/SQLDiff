@@ -86,6 +86,41 @@ pub struct Setup {
 pub struct DialectInfo {
     pub id: &'static str,
     pub name: &'static str,
+    /// What the page's syntax highlighter needs from the dialect's lexer.
+    pub lex: LexInfo,
+}
+
+/// The parts of a dialect's [`sqldiff_syntax::dialect::LexicalProfile`] that
+/// decide where comments, strings, identifiers and variables start and end,
+/// so the editors highlight the way the engine lexes.
+#[derive(Debug, Clone, Serialize)]
+pub struct LexInfo {
+    pub nested_block_comments: bool,
+    pub bracket_identifiers: bool,
+    pub at_variables: bool,
+    pub dollar_quoting: bool,
+    pub go_batches: bool,
+    pub question_param: bool,
+    pub string_prefixes: &'static [&'static str],
+    pub extra_ident_start: String,
+    pub extra_ident_continue: String,
+}
+
+impl LexInfo {
+    fn of(d: Dialect) -> Self {
+        let p = d.lexical();
+        LexInfo {
+            nested_block_comments: p.nested_block_comments,
+            bracket_identifiers: p.bracket_identifiers,
+            at_variables: p.at_variables,
+            dollar_quoting: p.dollar_quoting,
+            go_batches: p.go_batches,
+            question_param: p.question_param,
+            string_prefixes: p.string_prefixes,
+            extra_ident_start: p.extra_ident_start.iter().collect(),
+            extra_ident_continue: p.extra_ident_continue.iter().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +137,8 @@ pub struct ConvertPayload {
     pub dialects: Vec<DialectInfo>,
     /// The (from, to) pairs that have conversion rules.
     pub with_rules: Vec<(&'static str, &'static str)>,
+    /// Words the editors style as keywords (upper case).
+    pub keywords: Vec<&'static str>,
     pub conversion: Option<Conversion>,
     pub error: Option<String>,
     /// Conversion plus checking time, milliseconds.
@@ -157,6 +194,7 @@ pub fn run_for(
             .map(|d| DialectInfo {
                 id: d.id(),
                 name: d.display_name(),
+                lex: LexInfo::of(*d),
             })
             .collect(),
         with_rules: Dialect::ALL
@@ -165,6 +203,7 @@ pub fn run_for(
             .filter(|&(f, t)| sqldiff_convert::supported(f, t))
             .map(|(f, t)| (f.id(), t.id()))
             .collect(),
+        keywords: crate::styled_keywords(),
         conversion,
         error,
         ms,

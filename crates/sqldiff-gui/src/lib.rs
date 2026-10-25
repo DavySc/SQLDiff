@@ -135,6 +135,26 @@ pub fn page<T: Serialize>(payload: &T) -> String {
     )
 }
 
+/// Each token of `text` as parsed (routine bodies lexed as code) with the
+/// style the views give it: `(start, end, style)`, byte offsets. The page-side
+/// highlighter in convert mode must agree with it (see tests/highlight.rs).
+pub fn token_styles(
+    text: &str,
+    dialect: sqldiff_syntax::Dialect,
+) -> Vec<(usize, usize, &'static str)> {
+    let mut at = 0;
+    parse(text, dialect)
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(SyntaxElement::into_token)
+        .map(|t| {
+            let s = at;
+            at += t.text().len();
+            (s, at, style(t.kind(), t.text()))
+        })
+        .collect()
+}
+
 fn style(kind: SyntaxKind, text: &str) -> &'static str {
     use SyntaxKind::*;
     match kind {
@@ -159,112 +179,126 @@ fn style(kind: SyntaxKind, text: &str) -> &'static str {
 
 /// Keywords the normalizer does not need (their case already folds) but that read better styled.
 pub(crate) fn is_extra_keyword(text: &str) -> bool {
-    const EXTRA: &[&str] = &[
-        "SELECT",
-        "FROM",
-        "WHERE",
-        "INSERT",
-        "INTO",
-        "VALUES",
-        "UPDATE",
-        "SET",
-        "IF",
-        "THEN",
-        "RETURN",
-        "RETURNS",
-        "PROCEDURE",
-        "FUNCTION",
-        "LANGUAGE",
-        "OPTION",
-        "TRAN",
-        "TRANSACTION",
-        "ROLLBACK",
-        "TRY",
-        "THROW",
-        "RAISE",
-        "EXCEPTION",
-        "WHEN",
-        "OR",
-        "REPLACE",
-        "NOT",
-        "NULL",
-        "IS",
-        "ON",
-        "JOIN",
-        "LEFT",
-        "INNER",
-        "OUTER",
-        "GROUP",
-        "ORDER",
-        "HAVING",
-        "UNION",
-        "EXISTS",
-        "WHILE",
-        "LOOP",
-        "FOR",
-        "EXIT",
-        "HANDLER",
-        "SIGNAL",
-        "RESIGNAL",
-        "SQLSTATE",
-        "SQLEXCEPTION",
-        "MERGE",
-        "USING",
-        "MATCHED",
-        "OUT",
-        "OUTPUT",
-        "NOCOUNT",
-        "XACT_ABORT",
-        "INT",
-        "INTEGER",
-        "VARCHAR",
-        "NVARCHAR",
-        "CHAR",
-        "DECIMAL",
-        "NUMERIC",
-        "BIGINT",
-        "SMALLINT",
-        "DATE",
-        "PERFORM",
-        "CONFLICT",
-        "NOTHING",
-        "TOP",
-        "LIMIT",
-        "OFFSET",
-        "FETCH",
-        "WITH",
-        "TABLE",
-        "VIEW",
-        "TRIGGER",
-        "INDEX",
-        "PRIMARY",
-        "KEY",
-        "FOREIGN",
-        "REFERENCES",
-        "UNIQUE",
-        "PLPGSQL",
-        "SQL",
-        "GET",
-        "DIAGNOSTICS",
-        "STACKED",
-        "FOUND",
-        "SAVEPOINT",
-        "RELEASE",
-        "WORK",
-        "SAVE",
-        "ITERATE",
-        "LEAVE",
-        "REPEAT",
-        "UNTIL",
-        "ATOMIC",
-        "GOTO",
-        "PRINT",
-        "EXEC",
-        "EXECUTE",
-        "OPEN",
-    ];
-    EXTRA.iter().any(|k| k.eq_ignore_ascii_case(text))
+    EXTRA_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(text))
 }
+
+/// Every word the views style as a keyword, upper case: the normalizer's
+/// keywords and [`EXTRA_KEYWORDS`]. Convert mode's editors highlight with it.
+pub fn styled_keywords() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = sqldiff_core::normalize::keywords()
+        .iter()
+        .chain(EXTRA_KEYWORDS)
+        .copied()
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+const EXTRA_KEYWORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "INSERT",
+    "INTO",
+    "VALUES",
+    "UPDATE",
+    "SET",
+    "IF",
+    "THEN",
+    "RETURN",
+    "RETURNS",
+    "PROCEDURE",
+    "FUNCTION",
+    "LANGUAGE",
+    "OPTION",
+    "TRAN",
+    "TRANSACTION",
+    "ROLLBACK",
+    "TRY",
+    "THROW",
+    "RAISE",
+    "EXCEPTION",
+    "WHEN",
+    "OR",
+    "REPLACE",
+    "NOT",
+    "NULL",
+    "IS",
+    "ON",
+    "JOIN",
+    "LEFT",
+    "INNER",
+    "OUTER",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "UNION",
+    "EXISTS",
+    "WHILE",
+    "LOOP",
+    "FOR",
+    "EXIT",
+    "HANDLER",
+    "SIGNAL",
+    "RESIGNAL",
+    "SQLSTATE",
+    "SQLEXCEPTION",
+    "MERGE",
+    "USING",
+    "MATCHED",
+    "OUT",
+    "OUTPUT",
+    "NOCOUNT",
+    "XACT_ABORT",
+    "INT",
+    "INTEGER",
+    "VARCHAR",
+    "NVARCHAR",
+    "CHAR",
+    "DECIMAL",
+    "NUMERIC",
+    "BIGINT",
+    "SMALLINT",
+    "DATE",
+    "PERFORM",
+    "CONFLICT",
+    "NOTHING",
+    "TOP",
+    "LIMIT",
+    "OFFSET",
+    "FETCH",
+    "WITH",
+    "TABLE",
+    "VIEW",
+    "TRIGGER",
+    "INDEX",
+    "PRIMARY",
+    "KEY",
+    "FOREIGN",
+    "REFERENCES",
+    "UNIQUE",
+    "PLPGSQL",
+    "SQL",
+    "GET",
+    "DIAGNOSTICS",
+    "STACKED",
+    "FOUND",
+    "SAVEPOINT",
+    "RELEASE",
+    "WORK",
+    "SAVE",
+    "ITERATE",
+    "LEAVE",
+    "REPEAT",
+    "UNTIL",
+    "ATOMIC",
+    "GOTO",
+    "PRINT",
+    "EXEC",
+    "EXECUTE",
+    "OPEN",
+];
 
 /// Comparison key of a token across dialects: case-folded, unquoted, with
 /// variable sigils (`@x`), conventional parameter prefixes (`p_x`, `v_x`)
