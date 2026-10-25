@@ -363,7 +363,20 @@ fn merge_is_kept_without_by_target() {
     assert!(o.contains("WHEN NOT MATCHED THEN INSERT"), "{o}");
     let u = unit(&c, src, "MERGE");
     assert!(has_rule(u, "db2.merge"), "{:?}", u.notes);
-    assert_ne!(u.checked, Status::Differs, "{:#?}", c.report.findings);
+    // With FROM SYSIBM.SYSDUMMY1 read as no FROM, the engine compares the
+    // MERGEs and finds only the race of a T-SQL MERGE without HOLDLOCK.
+    let different: Vec<&str> = u
+        .findings
+        .iter()
+        .map(|&i| &c.report.findings[i])
+        .filter(|f| f.verdict == sqldiff_core::Verdict::Different)
+        .map(|f| f.rule.as_str())
+        .collect();
+    assert!(
+        different.iter().all(|r| *r == "equiv.upsert-race"),
+        "{:#?}",
+        c.report.findings
+    );
     // Outside a procedure the commit level is the job's: fact V2 is assumed.
     let script = "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE;\n";
     assert!(any_rule(&db2(script), "ASM-FACT-V2"));
@@ -662,4 +675,28 @@ fn delete_join_with_a_table_function_uses_table() {
         "{}",
         c.output
     );
+}
+
+/// A view's query, CTEs included, gets the dummy table like a procedure's.
+#[test]
+fn view_select_without_from_gets_the_dummy_table() {
+    let src = "CREATE VIEW dbo.v AS\nWITH r (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r;\n";
+    let c = db2(src);
+    assert!(
+        c.output.contains("WITH r (n) AS (SELECT 1 FROM SYSIBM.SYSDUMMY1 UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r;"),
+        "{}",
+        c.output
+    );
+    assert!(
+        !c.output_check
+            .findings
+            .iter()
+            .any(|f| f.rule == "residue.db2i.select-without-from"),
+        "{:?}",
+        c.output_check.findings
+    );
+    // Run twice over the same tokens (statement, then query), it adds one FROM.
+    let c =
+        db2("CREATE PROCEDURE p AS\nBEGIN\n  WITH c AS (SELECT 1 AS a) SELECT a FROM c;\nEND\n");
+    assert_eq!(c.output.matches("SYSDUMMY1").count(), 1, "{}", c.output);
 }

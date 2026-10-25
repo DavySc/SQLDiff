@@ -1032,6 +1032,30 @@ impl<'a> Binder<'a> {
             self.add_ref(RefKind::Table, display, span, stmt, Resolution::Assumed(id));
             return None;
         }
+        if d == Dialect::Db2i
+            && parts.len() == 2
+            && parts[0].key(d) == "SYSIBM"
+            && parts[1].key(d) == "SYSDUMMY1"
+        {
+            // Every Db2 for i system has it: one row, column IBMREQD CHAR(1).
+            let mut tb = Table::new(Some("SYSIBM".into()), "SYSDUMMY1", TableKind::View);
+            tb.columns.push(crate::catalog::Column {
+                name: "IBMREQD".into(),
+                data_type: DataType::parse_str("CHAR(1)"),
+                nullable: false,
+                identity: false,
+                has_default: false,
+                collation: None,
+            });
+            self.add_ref(
+                RefKind::Table,
+                display,
+                span,
+                stmt,
+                Resolution::Resolved(Target::Table(tb.display())),
+            );
+            return Some(tb);
+        }
         let view = self.input.view;
         match view.table(parts) {
             Lookup::Found(tb) => {

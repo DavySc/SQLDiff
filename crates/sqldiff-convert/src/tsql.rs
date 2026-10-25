@@ -1308,6 +1308,12 @@ impl<'a> Cx<'a> {
             if ts.iter().any(|t| t.is("TOP")) {
                 return no("TOP inside a CTE query");
             }
+            // A view's query comes here without `stmt`'s FROM-less SELECTs fixed.
+            let ts = if self.db2() {
+                dummy_from(&ts, true)
+            } else {
+                ts
+            };
             return Ok((self.with_list(&ts, ts.len())?, false));
         }
         let mut i = 1; // index into s
@@ -3817,6 +3823,9 @@ fn fill_empty(b: &mut Out, indent: usize) {
 /// Db2 for i needs a FROM: a SELECT without one (`(SELECT @id AS id)`) gets
 /// `FROM SYSIBM.SYSDUMMY1`, the one-row table. Only nested SELECTs unless
 /// `top`.
+/// The FROM clause `dummy_from` adds; seen as a FROM when it runs again.
+const DUMMY_FROM: &str = " FROM SYSIBM.SYSDUMMY1";
+
 fn dummy_from(ts: &[T], top: bool) -> Vec<T> {
     let ds = crate::tok::depths(ts);
     let mut at = Vec::new(); // insertion points
@@ -3841,7 +3850,7 @@ fn dummy_from(ts: &[T], top: bool) -> Vec<T> {
                 end = j;
                 break;
             }
-            if ts[j].is("FROM") || ts[j].is("INTO") {
+            if ts[j].is("FROM") || ts[j].is("INTO") || ts[j].s == DUMMY_FROM {
                 from = true;
                 break;
             }
@@ -3865,7 +3874,7 @@ fn dummy_from(ts: &[T], top: bool) -> Vec<T> {
         if at.contains(&i) {
             out.push(T {
                 k: NUMBER, // copied as is by the expression walk
-                s: " FROM SYSIBM.SYSDUMMY1".into(),
+                s: DUMMY_FROM.into(),
             });
         }
         out.push(t.clone());
@@ -3873,7 +3882,7 @@ fn dummy_from(ts: &[T], top: bool) -> Vec<T> {
     if at.contains(&ts.len()) {
         out.push(T {
             k: NUMBER,
-            s: " FROM SYSIBM.SYSDUMMY1".into(),
+            s: DUMMY_FROM.into(),
         });
     }
     out
