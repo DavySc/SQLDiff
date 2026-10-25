@@ -1,7 +1,7 @@
 -- SQLDiff probes for Db2 for i (IBM i 7.x only).
 --
 -- GENERATED from probes/db2i/probes.toml by probes/db2i/db2i_probes.py build.
--- Do not edit by hand. Probe set 48f9703e0591.
+-- Do not edit by hand. Probe set d618de4e7b86.
 --
 -- What it does: creates the schema SQLDFPROBE (CREATE SCHEMA, so its tables are
 -- journaled), two tables and about 35 small procedures in it, runs them, and
@@ -108,7 +108,7 @@ BEGIN
   DECLARE V_NO_STATE CHAR(5);
   DECLARE V_NO_N INTEGER;
   CALL SQLDFPROBE.LOG_CALL('META-FORMAT', '00000', 1, 'probe set',
-    V_NO_STATE, V_NO_N, V_NO_N, V_NO_N, '48f9703e0591');
+    V_NO_STATE, V_NO_N, V_NO_N, V_NO_N, 'd618de4e7b86');
 END;
 
 -- 2. Create the probe procedures. Each create is logged with its SQLSTATE,
@@ -1884,7 +1884,7 @@ BEGIN
   END IF;
 END;
 
--- P_V26_QUERY (probes V26-CTE-BACKWARD, V26-CTE-FORWARD,
+-- P_V26_QUERY (probes V26-TABLE-PLAIN, V26-CTE-BACKWARD, V26-CTE-FORWARD,
 --     V26-CTE-FORWARD-PLAIN, V26-RECURSIVE-COLUMNS, V26-RECURSIVE-NO-COLUMNS)
 -- SET OPTION COMMIT = *NONE, CLOSQLCSR = *ENDMOD
 -- | BEGIN
@@ -2803,6 +2803,27 @@ BEGIN
       V_CODE = DB2_RETURNED_SQLCODE, V_MSG = MESSAGE_TEXT;
   CALL SQLDFPROBE.P_V25OWN(O_STATE, O_CODE, O_N1, O_N2, O_TEXT);
   CALL SQLDFPROBE.LOG_CALL('V25-EXPLICIT-OWNER', V_STATE, V_CODE, V_MSG,
+    O_STATE, O_CODE, O_N1, O_N2, O_TEXT);
+END;
+
+-- V26-TABLE-PLAIN (V26, control): Control: with the current schema set to
+--     SQLDFPROBE, an unqualified CTEB reads the table (7), so an error on the
+--     forward-reference probes is about the CTE, not the table.
+BEGIN
+  DECLARE V_STATE CHAR(5) DEFAULT '00000';
+  DECLARE V_CODE INTEGER DEFAULT 0;
+  DECLARE V_MSG VARCHAR(2000) DEFAULT '';
+  DECLARE O_STATE CHAR(5);
+  DECLARE O_CODE INTEGER;
+  DECLARE O_N1 INTEGER;
+  DECLARE O_N2 INTEGER;
+  DECLARE O_TEXT VARCHAR(200);
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+    GET DIAGNOSTICS CONDITION 1 V_STATE = RETURNED_SQLSTATE,
+      V_CODE = DB2_RETURNED_SQLCODE, V_MSG = MESSAGE_TEXT;
+  CALL SQLDFPROBE.P_V26_QUERY('SELECT X FROM CTEB', O_STATE, O_CODE, O_N1,
+      O_N2, O_TEXT);
+  CALL SQLDFPROBE.LOG_CALL('V26-TABLE-PLAIN', V_STATE, V_CODE, V_MSG,
     O_STATE, O_CODE, O_N1, O_N2, O_TEXT);
 END;
 
