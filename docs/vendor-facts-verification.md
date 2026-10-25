@@ -1,4 +1,4 @@
-# Vendor facts verification (design doc section 13, V1 to V25)
+# Vendor facts verification (design doc section 13, V1 to V26)
 
 Checked against official vendor documentation on 2026-10-23. Target versions are **SQL Server 2022** and **PostgreSQL 18**. Db2 for i was checked against the IBM i 7.4 to 7.6 docs.
 
@@ -45,6 +45,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V23 | `plpgsql.variable_conflict` | Confirmed | Default `error`. |
 | V24 | Volatility and strictness | Confirmed | Defaults `VOLATILE` and `CALLED ON NULL INPUT`. |
 | V25 | Routine security context | Confirmed (T-SQL, PG), Unverified (Db2 i) | Owner vs caller privileges per dialect; Db2 i default `USRPRF *NAMING` needs a test. |
+| V26 | Db2 i CTE scoping and recursion | Unverified | Forward reference to a later CTE, and a recursive CTE without a column list: probes in `probes/db2i`. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -267,6 +268,15 @@ Sources: [Function volatility](https://www.postgresql.org/docs/18/xfunc-volatili
 - Db2 for i (to verify on a system): `SET OPTION USRPRF = *OWNER` adopts the owner's authority in addition to the caller's, `*USER` uses the caller's; the default `*NAMING` is documented as `*OWNER` under SQL naming and `*USER` under system naming. `DYNUSRPRF` applies the same choice to dynamic SQL. The engine never relies on the default: a Db2 routine without `USRPRF` compares as the caller's authority only under `ASM-DB2-USRPRF-USER`, and against an owner's context it stays unknown. The converter writes `USRPRF` and `DYNUSRPRF` out.
 
 Probe for Davy's IBM i: create a procedure without `SET OPTION USRPRF` under SQL naming and one under system naming, both reading a table the caller has no authority to; call each as a user that holds only `*EXECUTE` on the program.
+
+### V26. Common table expressions on Db2 for i — Unverified
+
+Two forms that the T-SQL to Db2 for i converter passes through unchanged, raised in the CTE conversion review:
+
+- A CTE that names a later CTE of the same `WITH` list (`A AS (SELECT x FROM b), b AS (...)`) when a table `b` also exists: does `A` read the later CTE, the table, or is it an error? Asked with and without a recursive CTE earlier in the list.
+- A recursive CTE without a column list (`WITH r AS (SELECT 1 AS n ... UNION ALL SELECT n + 1 FROM r ...)`): accepted, or is the column list required?
+
+No readable IBM i page settles either, so both are open questions with no expectation (probes `V26-*` in [probes/db2i](../probes/db2i/README.md)).
 
 ## Follow-up
 

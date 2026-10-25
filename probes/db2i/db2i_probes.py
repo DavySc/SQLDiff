@@ -260,7 +260,20 @@ def call_block(pr: dict, procs: dict) -> list[str]:
         "      V_CODE = DB2_RETURNED_SQLCODE, V_MSG = MESSAGE_TEXT;",
     ]
     if "procedure" in pr:
-        args = ", ".join(list(pr.get("args", [])) + ["O_STATE", "O_CODE", "O_N1", "O_N2", "O_TEXT"])
+        args, sets = [], []
+        for i, arg in enumerate(pr.get("args", []), 1):
+            if len(arg) > 40 and arg.startswith("'") and arg.endswith("'"):
+                # A long string goes through a variable, so no literal is wrapped.
+                lines.insert(9 + i - 1, f"  DECLARE V_ARG{i} VARCHAR(4000);")
+                sets.append(f"  SET V_ARG{i} =")
+                for j, piece in enumerate(sql_literal_pieces(arg[1:-1].replace("''", "'"), WIDTH - 8)):
+                    sets.append(("    || " if j else "       ") + piece)
+                sets[-1] += ";"
+                args.append(f"V_ARG{i}")
+            else:
+                args.append(arg)
+        lines += sets
+        args = ", ".join(args + ["O_STATE", "O_CODE", "O_N1", "O_N2", "O_TEXT"])
         lines += wrap_plain(f"CALL {SCHEMA}.P_{pr['procedure']}({args});", "  ")
     else:
         for raw in pr["inline"].strip().splitlines():
@@ -329,7 +342,7 @@ GENERATED from probes/db2i/probes.toml by probes/db2i/db2i_probes.py build.
 Do not edit by hand. Probe set {hash}.
 
 What it does: creates the schema SQLDFPROBE (CREATE SCHEMA, so its tables are
-journaled), two tables and about 30 small procedures in it, runs them, and
+journaled), two tables and about 35 small procedures in it, runs them, and
 prints one line per result. It touches nothing outside SQLDFPROBE, apart from
 reading SYSIBMADM.ENV_SYS_INFO, QSYS2.GROUP_PTF_INFO, QSYS2.SYSROUTINES and
 QSYS2.RECORD_LOCK_INFO, and declaring temporary tables in QTEMP.
