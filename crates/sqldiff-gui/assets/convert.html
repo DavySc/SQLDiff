@@ -9,7 +9,7 @@
 :root {
   --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
   --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5;
-  --chg-bg: #fff8e1; --chg-tok: #f9e08f; --del-bg: #fdecec; --add-bg: #e8f6ec; --focus: #4f46e5;
+  --chg-bg: #fff8e1; --chg-tok: #f9e08f; --del-bg: #fdecec; --del-tok: #f6c1c1; --add-bg: #e8f6ec; --add-tok: #b5e3c1; --focus: #4f46e5;
   --kw: #7c3aad; --id: #1d1f21; --var: #a8521c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828;
   --transactional: #d92d20; --semantic: #dc6803;
   --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-differs: #d92d20; --s-not_converted: #98a2b3;
@@ -21,7 +21,7 @@
   :root {
     --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
     --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8;
-    --chg-bg: #2a2614; --chg-tok: #5a4c1c; --del-bg: #2f1c1c; --add-bg: #17291d; --focus: #818cf8;
+    --chg-bg: #2a2614; --chg-tok: #5a4c1c; --del-bg: #2f1c1c; --del-tok: #5e2a2a; --add-bg: #17291d; --add-tok: #24543a; --focus: #818cf8;
     --kw: #c4a1f0; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #6b717b; --err: #ff6b6b;
     --transactional: #f97066; --semantic: #fdb022;
     --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-differs: #f97066; --s-not_converted: #667085;
@@ -70,8 +70,28 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 36px minmax
 .ph strong { color: var(--fg); font-weight: 600; }
 .ph { grid-row: 1; grid-column: 1; }
 .ph.right { grid-column: 3; border-left: 1px solid var(--line); }
-/* The source textarea sits on a layer that paints the selected and hovered statements, so they show without focus. */
-.srcwrap { grid-row: 2; grid-column: 1; position: relative; overflow: hidden; min-height: 0; background: var(--panel); }
+/* An editor: a line-number gutter, then the textarea over layers that move with its scroll.
+   #srchl paints the selected and hovered statements (convert mode) so they show without focus;
+   .dl paints the compare diff behind the text, WinMerge style: changed, removed and added lines,
+   and within a changed line the changed words. */
+.edwrap { display: flex; min-height: 0; overflow: hidden; background: var(--panel); }
+.srcwrap { grid-row: 2; grid-column: 1; }
+#bwrap { grid-row: 2; grid-column: 3; border-left: 1px solid var(--line); }
+.edarea { flex: 1; min-width: 0; position: relative; overflow: hidden; }
+.lnum { flex: none; width: 44px; position: relative; overflow: hidden; user-select: none; }
+.lnum .in { position: absolute; left: 0; right: 0; top: 0; }
+.lnum pre { position: relative; margin: 0; padding: 8px 8px 8px 0; text-align: right; font: 12.5px/1.6 var(--mono); color: var(--muted); opacity: .7; }
+.lnum .g { position: absolute; left: 0; right: 0; }
+.dl { position: absolute; left: 0; top: 0; min-width: 100%; pointer-events: none; }
+.dl > div { position: absolute; left: 0; right: 0; padding-left: 12px; white-space: pre; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; tab-size: 4; color: transparent; }
+.dl .chg { background: color-mix(in srgb, var(--chg-bg) 55%, var(--panel)); }
+.dl .del { background: color-mix(in srgb, var(--del-bg) 70%, var(--panel)); }
+.dl .add { background: color-mix(in srgb, var(--add-bg) 70%, var(--panel)); }
+.lnum .chg { background: var(--chg-bg); } .lnum .del { background: var(--del-bg); } .lnum .add { background: var(--add-bg); }
+/* Where the other side has lines this one lacks: a thin rule between two lines. */
+.dl .gap { height: 2px; padding: 0; margin-top: -1px; background: var(--chg-tok); }
+.dl .cur { padding: 0; box-shadow: inset 0 0 0 1px var(--focus); border-radius: 2px; }
+.dl mark { color: transparent; background: color-mix(in srgb, var(--chg-tok) 70%, transparent); border-radius: 3px; }
 #srchl { position: absolute; left: 0; right: 0; top: 0; pointer-events: none; }
 #srchl .bar { position: absolute; left: 0; right: 0; }
 #srchl .bar.sel { background: var(--link); box-shadow: inset 3px 0 0 var(--focus); }
@@ -82,11 +102,9 @@ main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 36px minmax
 #gut .edge { position: absolute; left: 2px; right: 2px; padding: 2px 0; font-size: 10px; font-weight: 600; line-height: 1.2; text-align: center; color: var(--focus); background: var(--panel); border: 1px solid var(--focus); border-radius: 999px; font-variant-numeric: tabular-nums; }
 #gut .edge:hover { background: var(--panel); color: var(--focus); }
 body.compare main { grid-template-columns: minmax(0, 1fr) 0 minmax(0, 1fr) 14px; }
-#src, #b { display: block; width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; background: var(--panel); color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; }
-#src { position: relative; z-index: 1; background: transparent; }
-#b { grid-column: 3; grid-row: 2; border-left: 1px solid var(--line); }
-body.compare #out, body.compare #gut, body.compare #overview .m:not(.f), body.compare .conv-only { display: none !important; }
-body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; }
+#src, #b { display: block; width: 100%; height: 100%; resize: none; border: 0; outline: none; padding: 8px 12px; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; color: var(--fg); tab-size: 4; white-space: pre; overflow: auto; position: relative; z-index: 1; background: transparent; }
+body.compare #out, body.compare #gut, body.compare #overview .m:not(.f):not(.d), body.compare .conv-only { display: none !important; }
+body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !important; }
 #out { grid-row: 2; grid-column: 3; overflow: auto; background: var(--panel); border-left: 1px solid var(--line); font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; padding: 8px 0; }
 .ln { display: grid; grid-template-columns: 40px 16px minmax(0, 1fr); cursor: pointer; position: relative; }
 .ln .no { color: var(--muted); text-align: right; padding-right: 6px; user-select: none; opacity: .7; }
@@ -111,6 +129,7 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
 .ln:hover .no { opacity: 1; }
 #overview { position: relative; background: var(--panel); border-left: 1px solid var(--line); cursor: pointer; grid-row: 1 / 3; grid-column: 4; }
 #overview .m { position: absolute; left: 3px; right: 3px; min-height: 2px; border-radius: 1px; }
+#overview .m.d { left: 4px; right: 4px; }
 #overview .m.selmark { left: 0; right: 0; min-height: 3px; background: var(--focus); pointer-events: none; }
 #overview .vp { position: absolute; left: 0; right: 0; border: 1px solid var(--muted); border-radius: 2px; opacity: .5; pointer-events: none; }
 .t-kw { color: var(--kw); font-weight: 600; } .t-str { color: var(--str); } .t-num { color: var(--num); }
@@ -138,10 +157,10 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
 #help td { padding: 3px 10px 3px 0; vertical-align: top; }
 @media (max-width: 900px) {
   main, body.compare main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto 40vh auto 40vh; }
-  .ph, .ph.right, .srcwrap, #out, #b { grid-column: 1; }
-  .ph.right { grid-row: 3; } #out, #b { grid-row: 4; }
+  .ph, .ph.right, .srcwrap, #out, #bwrap { grid-column: 1; }
+  .ph.right { grid-row: 3; } #out, #bwrap { grid-row: 4; }
   #overview, #gut { display: none; }
-  .ph.right, #out { border-left: 0; }
+  .ph.right, #out, #bwrap { border-left: 0; }
   #detail { grid-template-columns: 1fr; height: auto; }
 }
 </style>
@@ -171,10 +190,10 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
 <main>
   <div class="ph"><strong id="srcdial">T-SQL</strong><span id="srcname"></span><span class="spacer"></span><span>edit freely; nothing is saved</span></div>
   <div class="ph right"><strong id="outdial">PostgreSQL</strong><span id="outsub">converted, checked by SQLDiff</span><span class="spacer"></span><span id="timing"></span></div>
-  <div class="srcwrap"><div id="srchl"></div><textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea></div>
+  <div class="srcwrap edwrap"><div class="lnum" id="srcno" aria-hidden="true"><div class="in"></div></div><div class="edarea"><div class="dl" id="srcdl"></div><div id="srchl"></div><textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Source input"></textarea></div></div>
   <div id="gut" class="conv-only"><svg id="gsvg" aria-hidden="true"></svg></div>
   <div id="out" role="listbox" tabindex="0" aria-label="Converted output"></div>
-  <textarea id="b" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Right side to compare"></textarea>
+  <div class="edwrap" id="bwrap"><div class="lnum" id="bno" aria-hidden="true"><div class="in"></div></div><div class="edarea"><div class="dl" id="bdl"></div><textarea id="b" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Right side to compare"></textarea></div></div>
   <div id="overview" title="Location pane: click to jump"></div>
 </main>
 <section id="detail">
@@ -197,6 +216,7 @@ body:not(.compare) #b, body:not(.compare) .cmp-only { display: none !important; 
     <tr><td><kbd>Alt</kbd>+<kbd>Home</kbd> / <kbd>Alt</kbd>+<kbd>End</kbd></td><td>First / last such unit</td></tr>
     <tr><td><kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>Alt</kbd>+<kbd>→</kbd></td><td>Go to the selected statement's source / converted code</td></tr>
     <tr><td>Hover, click</td><td>Hovering a statement on either side shows its counterpart, joined by a band in the gutter. Clicking keeps the side you clicked still and brings the counterpart level with it. A dashed outline marks the other part of a statement the conversion split, such as a DECLARE moved to the declare section.</td></tr>
+    <tr><td>Compare colours</td><td>As in WinMerge: yellow lines changed (the changed words darker), red only on the left, green only on the right; a thin rule marks where the other side has lines this one lacks. This is a text diff that follows your typing; SQLDiff's findings are listed below. The caret's changed line and its counterpart are outlined, and a click brings them level.</td></tr>
     <tr><td>Accept everywhere</td><td>Mark an assumption as known to hold; statements that only needed it count as converted (remembered in this browser).</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>Back to the editor</td></tr>
     <tr><td><kbd>?</kbd></td><td>This help (outside the editor)</td></tr>
@@ -209,7 +229,7 @@ const LABEL = { converted: "converted", assumptions: "under assumptions", decisi
 const SHORT = { converted: "converted", assumptions: "assumptions", decision: "decisions", differs: "differs", not_converted: "not converted" };
 const ORDER = ["not_converted", "differs", "decision", "assumptions", "converted"];
 const state = { data: null, sel: -1, hov: -1, flash: new Set(), split: [], lineUnit: [], seq: 0, shown: 0, lead: null, anchors: [[1, 1]], st: [], accepted: new Set(),
-  mode: "convert", from: "tsql", to: "postgres", cmp: null, fsel: -1 };
+  mode: "convert", from: "tsql", to: "postgres", cmp: null, fsel: -1, diff: null };
 const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
 const hasRules = (f, t) => INITIAL.with_rules.some(([a, b]) => a === f && b === t);
 const ACCEPT_KEY = "sqldiff.convert.accepted";
@@ -320,7 +340,7 @@ function overview() {
   viewport();
 }
 function viewport() {
-  const o = $("out"), vp = $("vp");
+  const o = state.mode === "compare" ? $("b") : $("out"), vp = $("vp");
   if (!vp || !o.scrollHeight) return;
   vp.style.top = `${o.scrollTop / o.scrollHeight * 100}%`;
   vp.style.height = `${o.clientHeight / o.scrollHeight * 100}%`;
@@ -586,9 +606,7 @@ function renderCompare(p) {
   $("verdict").title = (r.unknown_reasons || []).join("\n");
   $("fcount").textContent = `${n} finding${n === 1 ? "" : "s"}`;
   $("timing").textContent = `compared in ${p.ms.toFixed(1)} ms`;
-  const total = Math.max(1, $("b").value.split("\n").length);
-  $("overview").innerHTML = r.findings.map((f, i) => f.b ?
-    `<div class="m f" data-f="${i}" style="top:${(f.b.start_line - 1) / total * 100}%;height:${(f.b.end_line - f.b.start_line + 1) / total * 100}%;background:var(--${f.class === "transactional" ? "transactional" : "semantic"})" title="${esc(f.class)}"></div>` : "").join("") + `<div class="vp" id="vp"></div>`;
+  compareOverview();
   if (state.fsel >= n) state.fsel = -1;
   showFinding(state.fsel);
 }
@@ -626,6 +644,209 @@ function stepFinding(dir) {
   if (!n) return;
   showFinding(state.fsel < 0 ? (dir > 0 ? 0 : n - 1) : (state.fsel + dir + n) % n);
 }
+// The location pane in compare mode: the text diff's blocks (on the right
+// side's lines), with the engine's findings drawn over them.
+function compareOverview() {
+  const total = Math.max(1, $("b").value.split("\n").length), pct = (l) => `${l / total * 100}%`;
+  const blocks = (state.diff?.hunks || []).map((h) =>
+    `<div class="m d" data-l="${h.b + 1}" style="top:${pct(h.b)};height:${pct(Math.max(h.bn, 0.3))};background:var(--${!h.an ? "add" : !h.bn ? "del" : "chg"}-tok)" title="${!h.an ? "only on the right" : !h.bn ? "only on the left" : "changed"}"></div>`).join("");
+  const finds = (state.cmp?.report.findings || []).map((f, i) => f.b ?
+    `<div class="m f" data-f="${i}" style="top:${pct(f.b.start_line - 1)};height:${pct(f.b.end_line - f.b.start_line + 1)};background:var(--${f.class === "transactional" ? "transactional" : "semantic"})" title="${esc(f.class)}"></div>` : "").join("");
+  $("overview").innerHTML = blocks + finds + `<div class="vp" id="vp"></div>`;
+  viewport();
+}
+
+// Editor gutters and the compare highlights. The text diff runs in the page on
+// every edit, so the highlights follow typing at once; the engine's findings
+// arrive with the debounced /api/compare call.
+const EDITORS = [["src", "srcno", "srcdl"], ["b", "bno", "bdl"]];
+function editorOf(ta) { const [, no, dl] = EDITORS.find(([t]) => t === ta.id); return { no: $(no), dl: $(dl) }; }
+function numbers(ta) {
+  const pre = editorOf(ta).no.querySelector("pre") || editorOf(ta).no.firstChild.appendChild(document.createElement("pre"));
+  let n = 1;
+  for (let i = ta.value.indexOf("\n"); i >= 0; i = ta.value.indexOf("\n", i + 1)) n++;
+  if (+pre.dataset.n !== n) { pre.dataset.n = n; pre.textContent = Array.from({ length: n }, (_, i) => i + 1).join("\n"); }
+}
+function layers(ta) {
+  const e = editorOf(ta);
+  e.no.firstChild.style.transform = `translateY(${-ta.scrollTop}px)`;
+  e.dl.style.transform = `translate(${-ta.scrollLeft}px, ${-ta.scrollTop}px)`;
+}
+// A slow diff (thousands of unlike lines) waits for a pause in typing instead of every key.
+let diffTimer = null, diffMs = 0;
+function rediff() { clearTimeout(diffTimer); diffTimer = setTimeout(drawDiff, diffMs > 40 ? Math.min(600, 2 * diffMs) : 20); }
+function drawDiff() {
+  const on = state.mode === "compare", t0 = performance.now();
+  const A = $("src").value.split("\n"), B = $("b").value.split("\n");
+  state.diff = on ? lineDiff(A, B) : null;
+  paintDiff($("src"), on ? state.diff.a : [], A);
+  paintDiff($("b"), on ? state.diff.b : [], B);
+  if (on) { compareOverview(); counterpart(); }
+  diffMs = performance.now() - t0;
+}
+// The changed line under the caret and the line it pairs with on the other
+// side get an outline; a click also brings the pair level, since the panes
+// have no filler lines to keep them so.
+let caretIn = null;
+function counterpart(e) {
+  if (e) caretIn = e.currentTarget;
+  for (const [, , dl] of EDITORS) $(dl).querySelector(".cur")?.remove();
+  const ta = caretIn;
+  if (state.mode !== "compare" || !state.diff || !ta) return;
+  const line = ta.value.slice(0, ta.selectionStart).split("\n").length - 1;
+  const other = ta.id === "src" ? $("b") : $("src"), p = (ta.id === "src" ? state.diff.toB : state.diff.toA).get(line);
+  if (p === undefined) return;
+  const lh = lineHeight(ta), pt = padTop(ta);
+  for (const [t, l] of [[ta, line], [other, p]]) editorOf(t).dl.insertAdjacentHTML("beforeend", `<div class="cur" style="top:${pt + l * lh}px;height:${lh}px"></div>`);
+  if (e?.type === "click") { state.lead = null; other.scrollTop = ta.scrollTop + (p - line) * lh; }
+}
+function paintDiff(ta, rows, lines) {
+  const e = editorOf(ta), lh = lineHeight(ta), pt = padTop(ta);
+  const html = [], gut = [];
+  for (const r of rows) {
+    const top = pt + r.l * lh;
+    if (r.kind === "gap") { html.push(`<div class="gap" style="top:${top}px"></div>`); continue; }
+    let t = lines[r.l], h = "";
+    if (r.marks?.length) {
+      let at = 0;
+      for (const [a, b] of r.marks) { h += esc(t.slice(at, a)) + `<mark>${esc(t.slice(a, b))}</mark>`; at = b; }
+      h += esc(t.slice(at));
+    }
+    html.push(`<div class="${r.kind}" style="top:${top}px;height:${lh}px">${h}</div>`);
+    gut.push(`<div class="g ${r.kind}" style="top:${top}px;height:${lh}px"></div>`);
+  }
+  e.dl.innerHTML = html.join("");
+  e.dl.style.width = `${ta.scrollWidth}px`;
+  e.no.firstChild.querySelectorAll(".g").forEach((g) => g.remove());
+  e.no.firstChild.insertAdjacentHTML("afterbegin", gut.join(""));
+  layers(ta);
+}
+
+// Line diff, WinMerge style: lines match exactly; inside a block of changes
+// similar left and right lines pair up (in order) and their words are
+// compared. Unpaired lines were removed (left) or added (right).
+function lineDiff(A, B) {
+  const ids = new Map(), id = (s) => { let v = ids.get(s); if (v === undefined) ids.set(s, (v = ids.size)); return v; };
+  const pairs = lcs(A.map(id), B.map(id));
+  const a = [], b = [], hunks = [], anchors = [[1, 1]], toB = new Map(), toA = new Map();
+  let i = 0, j = 0;
+  for (const [x, y] of pairs.concat([[A.length, B.length]])) {
+    if (x > i || y > j) {
+      hunks.push({ a: i, an: x - i, b: j, bn: y - j });
+      anchors.push([i + 1, j + 1]);
+      const pa = new Map(), pb = new Set();
+      for (const [ka, kb] of pairUp(A.slice(i, x), B.slice(j, y))) { pa.set(i + ka, j + kb); pb.add(j + kb); toB.set(i + ka, j + kb); toA.set(j + kb, i + ka); anchors.push([i + ka + 1, j + kb + 1]); }
+      const marks = new Map();
+      for (let l = i; l < x; l++) {
+        if (!pa.has(l)) { a.push({ l, kind: "del" }); continue; }
+        const [ma, mb] = words(A[l], B[pa.get(l)]);
+        a.push({ l, kind: "chg", marks: ma });
+        marks.set(pa.get(l), mb);
+      }
+      for (let l = j; l < y; l++) b.push(pb.has(l) ? { l, kind: "chg", marks: marks.get(l) } : { l, kind: "add" });
+      if (x === i) a.push({ l: i, kind: "gap" });
+      if (y === j) b.push({ l: j, kind: "gap" });
+      anchors.push([x + 1, y + 1]);
+    }
+    i = x + 1; j = y + 1;
+  }
+  anchors.push([A.length + 1, B.length + 1]);
+  return { a, b, hunks, toA, toB, anchors: anchors.filter((p, k) => !k || p[0] !== anchors[k - 1][0] || p[1] !== anchors[k - 1][1]) };
+}
+// Pair the lines of a block of changes: an order-keeping alignment that
+// maximises the summed similarity of its pairs, where only lines that share at
+// least 40% of their text may pair. Big blocks pair in order instead.
+function pairUp(A, B) {
+  const p = A.length, q = B.length;
+  if (!p || !q) return [];
+  if (p * q > 4000) return Array.from({ length: Math.min(p, q) }, (_, k) => [k, k]);
+  const sim = A.map((la) => B.map((lb) => similarity(la, lb)));
+  const S = Array.from({ length: p + 1 }, () => new Float64Array(q + 1));
+  for (let x = 1; x <= p; x++) for (let y = 1; y <= q; y++) {
+    const m = sim[x - 1][y - 1];
+    S[x][y] = Math.max(S[x - 1][y], S[x][y - 1], m >= 0.4 ? S[x - 1][y - 1] + m : 0);
+  }
+  const out = [];
+  for (let x = p, y = q; x > 0 && y > 0;) {
+    if (S[x][y] === S[x - 1][y]) x--;
+    else if (S[x][y] === S[x][y - 1]) y--;
+    else { out.push([x - 1, y - 1]); x--; y--; }
+  }
+  return out.reverse();
+}
+// Share of two lines' non-blank text in common words, from 0 to 1.
+function similarity(la, lb) {
+  const ta = (la.match(TOKEN) || []).filter((t) => t.trim()), tb = (lb.match(TOKEN) || []).filter((t) => t.trim());
+  const len = (ts) => ts.reduce((n, t) => n + t.length, 0), total = len(ta) + len(tb);
+  if (!total) return 1;
+  const ids = new Map(), id = (s) => { let v = ids.get(s); if (v === undefined) ids.set(s, (v = ids.size)); return v; };
+  return 2 * lcs(ta.map(id), tb.map(id)).reduce((n, [k]) => n + ta[k].length, 0) / total;
+}
+// The changed character ranges of two paired lines, by words. When most of a
+// line changed the marks carry no information and the line tint says it all
+// (the pair view's "dense" rule).
+const TOKEN = /\w+|\s+|[^\w\s]/g;
+function words(la, lb) {
+  const ta = la.match(TOKEN) || [], tb = lb.match(TOKEN) || [];
+  const ids = new Map(), id = (s) => { let v = ids.get(s); if (v === undefined) ids.set(s, (v = ids.size)); return v; };
+  const pairs = lcs(ta.map(id), tb.map(id));
+  const spans = (toks, side) => {
+    const kept = new Set(pairs.map((p) => p[side])), out = [];
+    let at = 0, marked = 0, total = 0;
+    toks.forEach((t, k) => {
+      const solid = t.trim().length;
+      total += solid;
+      if (!kept.has(k)) {
+        marked += solid;
+        const last = out[out.length - 1];
+        if (last && last[1] === at) last[1] = at + t.length; else out.push([at, at + t.length]);
+      }
+      at += t.length;
+    });
+    return total && marked / total > 0.5 ? [] : out;
+  };
+  return [spans(ta, 0), spans(tb, 1)];
+}
+// Longest common subsequence of two integer arrays as matched index pairs, in
+// order: Myers' O((N+M)D) algorithm in linear space (middle snake, recursive).
+function lcs(a, b) {
+  const out = [], size = a.length + b.length + 2, vf = new Int32Array(2 * size + 1), vb = new Int32Array(2 * size + 1);
+  const middle = (a0, a1, b0, b1) => {
+    const n = a1 - a0, m = b1 - b0, delta = n - m, odd = (delta & 1) !== 0, o = size;
+    vf[o + 1] = 0; vb[o + 1] = 0;
+    for (let d = 0, dmax = Math.ceil((n + m) / 2); d <= dmax; d++) {
+      for (let k = -d; k <= d; k += 2) {
+        let x = k === -d || (k !== d && vf[o + k - 1] < vf[o + k + 1]) ? vf[o + k + 1] : vf[o + k - 1] + 1, y = x - k;
+        while (x < n && y < m && a[a0 + x] === b[b0 + y]) { x++; y++; }
+        vf[o + k] = x;
+        const c = delta - k;
+        if (odd && c >= -(d - 1) && c <= d - 1 && x + vb[o + c] >= n) return [a0 + x, b0 + y];
+      }
+      for (let k = -d; k <= d; k += 2) {
+        let x = k === -d || (k !== d && vb[o + k - 1] < vb[o + k + 1]) ? vb[o + k + 1] : vb[o + k - 1] + 1, y = x - k;
+        while (x < n && y < m && a[a1 - 1 - x] === b[b1 - 1 - y]) { x++; y++; }
+        vb[o + k] = x;
+        const c = delta - k;
+        if (!odd && c >= -d && c <= d && x + vf[o + c] >= n) return [a1 - x, b1 - y];
+      }
+    }
+    return null;
+  };
+  const rec = (a0, a1, b0, b1) => {
+    while (a0 < a1 && b0 < b1 && a[a0] === b[b0]) { out.push([a0++, b0++]); }
+    let tail = 0;
+    while (a1 > a0 && b1 > b0 && a[a1 - 1] === b[b1 - 1]) { a1--; b1--; tail++; }
+    if (a0 < a1 && b0 < b1) {
+      const s = middle(a0, a1, b0, b1);
+      // The split is strictly inside once the ends differ; anything else would loop.
+      if (s && (s[0] > a0 || s[1] > b0) && (s[0] < a1 || s[1] < b1)) { rec(a0, s[0], b0, s[1]); rec(s[0], a1, s[1], b1); }
+    }
+    for (let k = 0; k < tail; k++) out.push([a1 + k, b1 + k]);
+  };
+  rec(0, a.length, 0, b.length);
+  return out;
+}
+
 function setMode(m) {
   state.mode = m;
   document.body.classList.toggle("compare", m === "compare");
@@ -637,13 +858,17 @@ function setMode(m) {
     $("notes").innerHTML = "";
     state.hov = -1;
     paint();
+    numbers($("b"));
+    drawDiff();
     schedule(0);
   } else {
+    drawDiff();
     render(state.data, true);
     schedule(0);
   }
 }
 function followCaret(e) {
+  if (state.mode !== "convert") return;
   const off = $("src").selectionStart, cur = state.data.conversion?.units[state.sel];
   // Keep the selection while the caret is inside it: a split statement's parts share one source span.
   if (cur && cur.src.start_u16 <= off && off <= cur.src.end_u16) return;
@@ -664,8 +889,8 @@ function anchors(c, srcLines, outLines) {
   }
   return m;
 }
-function mapLine(x, from) {
-  const m = state.anchors, to = 1 - from;
+function mapLine(x, from, m = state.anchors) {
+  const to = 1 - from;
   let i = 0;
   while (i < m.length - 2 && m[i + 1][from] <= x) i++;
   const a = m[i], b = m[i + 1] || a;
@@ -675,9 +900,17 @@ function mapLine(x, from) {
 function syncFrom(side) {
   if (side !== state.lead) return;
   if (state.mode === "compare") {
+    // Matching lines of the text diff stay level; a block only one side has
+    // lets that side scroll on while the other waits.
     const [from, other] = side === "src" ? [$("src"), $("b")] : [$("b"), $("src")];
-    const f = from.scrollTop / Math.max(1, from.scrollHeight - from.clientHeight);
-    other.scrollTop = f * (other.scrollHeight - other.clientHeight);
+    if (state.diff) {
+      const lh = lineHeight(from);
+      other.scrollTop = (mapLine(from.scrollTop / lh + 1, side === "src" ? 0 : 1, state.diff.anchors) - 1) * lh;
+    } else {
+      const f = from.scrollTop / Math.max(1, from.scrollHeight - from.clientHeight);
+      other.scrollTop = f * (other.scrollHeight - other.clientHeight);
+    }
+    viewport();
     return;
   }
   if (!state.data.conversion) return;
@@ -726,11 +959,12 @@ function init() {
     ta.readOnly = true; ta.title = "Editing needs sqldiff-gui convert";
     for (const id of ["from", "to", "m-compare"]) $(id).disabled = true;
   }
-  ta.addEventListener("input", () => schedule());
-  $("b").addEventListener("input", () => schedule());
-  $("b").addEventListener("scroll", () => syncFrom("out"));
+  numbers(ta);
+  for (const el of [ta, $("b")]) el.addEventListener("input", () => { numbers(el); if (state.mode === "compare") rediff(); schedule(); });
+  $("b").addEventListener("scroll", () => { syncFrom("out"); layers($("b")); });
   ["click", "keyup", "select"].forEach((ev) => ta.addEventListener(ev, followCaret));
-  ta.addEventListener("scroll", () => { syncFrom("src"); backdrop(); links(); });
+  for (const el of [ta, $("b")]) ["click", "keyup"].forEach((ev) => el.addEventListener(ev, counterpart));
+  ta.addEventListener("scroll", () => { syncFrom("src"); backdrop(); layers(ta); links(); });
   $("out").addEventListener("scroll", () => { syncFrom("out"); links(); });
   ta.addEventListener("mousemove", (e) => {
     if (state.mode !== "convert" || !state.data.conversion) return;
@@ -757,7 +991,13 @@ function init() {
   $("overview").addEventListener("click", (e) => {
     const m = e.target.closest(".m");
     if (m && m.dataset.f) return showFinding(+m.dataset.f);
-    if (state.mode === "compare") return;
+    if (state.mode === "compare") {
+      // A diff block or a spot on the bar: the right side goes there and the left follows.
+      const b = $("b"), r = $("overview").getBoundingClientRect(), lh = lineHeight(b);
+      lead("out");
+      b.scrollTop = m && m.dataset.l ? (+m.dataset.l - 1) * lh - b.clientHeight / 3 : (e.clientY - r.top) / r.height * b.scrollHeight - b.clientHeight / 2;
+      return;
+    }
     if (m) return select(+m.dataset.u);
     const o = $("out"), r = $("overview").getBoundingClientRect();
     lead("out");
