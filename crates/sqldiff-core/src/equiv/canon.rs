@@ -1978,10 +1978,150 @@ impl<'a> Canon<'a> {
                 };
                 return Ok(n("delete", vec![a(table), w]));
             }
+            if let Some(r) = self.semi_join_delete(target, alias, from, where_) {
+                return r;
+            }
             self.anti_join_delete(target, from, where_)
         })();
         self.scopes.pop();
         r
+    }
+
+    /// A DELETE whose FROM/USING list only filters the target rows:
+    /// `DELETE FROM t WHERE EXISTS (SELECT 1 FROM <others> WHERE <conds>)`.
+    /// PostgreSQL `DELETE FROM t USING u WHERE w`: the USING tables are
+    /// the others and `w` the condition. T-SQL `DELETE t FROM <tables>`:
+    /// `t` names exactly one FROM table (by its alias, or by a one-part name
+    /// of an unaliased table), all joins are inner or cross joins, and the
+    /// others are the remaining tables with every ON condition and WHERE as
+    /// the condition. In both a target row is deleted once if at least one
+    /// row of the others satisfies the condition. `None` when the shape is
+    /// not one of these (outer joins, APPLY, hints, a target not in FROM).
+    fn semi_join_delete(
+        &mut self,
+        target: &[String],
+        alias: &Option<String>,
+        from: &[From],
+        where_: &Option<Expr>,
+    ) -> Option<R<Term>> {
+        let mut leaves = Vec::new();
+        let mut conds = Vec::new();
+        for f in from {
+            if !inner_leaves(f, &mut leaves, &mut conds) {
+                return None;
+            }
+        }
+        let (tname, talias, others) = match self.d {
+            Dialect::Postgres => (target.to_vec(), alias.clone(), leaves),
+            Dialect::Tsql => {
+                if alias.is_some() || target.len() != 1 {
+                    return None;
+                }
+                let key = lc(&target[0]);
+                let hits: Vec<usize> = (0..leaves.len())
+                    .filter(|&i| match &leaves[i] {
+                        From::Table { name, alias, .. } => match alias {
+                            Some(a) => lc(a) == key,
+                            None => lc(name.last().unwrap()) == key,
+                        },
+                        From::Sub { alias, .. } | From::Values { alias, .. } => {
+                            alias.as_ref().is_some_and(|a| lc(a) == key)
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                let [hit] = hits[..] else { return None };
+                let From::Table { name, alias, hints } = leaves.remove(hit) else {
+                    return None;
+                };
+                if !hints.is_empty() {
+                    return None;
+                }
+                (name, alias, leaves)
+            }
+            Dialect::Db2i => return None,
+        };
+        if others.iter().any(|f| match f {
+            From::Table { hints, .. } => !hints.is_empty(),
+            From::Sub { .. } | From::Values { .. } => false,
+            _ => true,
+        }) {
+            return None;
+        }
+        conds.extend(where_.iter().cloned());
+        if !others.is_empty() {
+            // The conditions move into the EXISTS subquery, where an
+            // unqualified name resolves to the inner tables first. In the
+            // source all tables share one scope, so a name in two of them is
+            // an error there; accept a name only when the catalog shows it in
+            // exactly one table (or in none, for a parameter or variable).
+            if conds.iter().any(has_query) {
+                return Some(Err(
+                    "DELETE semi-join: a subquery or CASE in the conditions may use unqualified names".into(),
+                ));
+            }
+            let mut bare = Vec::new();
+            for c in &conds {
+                unqualified(c, &mut bare);
+            }
+            let mut tables = vec![tname.clone()];
+            for f in &others {
+                match f {
+                    From::Table { name, .. } => tables.push(name.clone()),
+                    _ if bare.is_empty() => {}
+                    _ => {
+                        return Some(Err(
+                            "DELETE semi-join: unqualified names next to a derived table".into(),
+                        ))
+                    }
+                }
+            }
+            for name in &bare {
+                let mut hits = 0;
+                for t in &tables {
+                    match self.schema.table(t.last().unwrap()) {
+                        Some(tab) => hits += usize::from(tab.column(name).is_some()),
+                        None => {
+                            return Some(Err(format!(
+                            "DELETE semi-join: `{name}` may name a column of more than one table"
+                        )))
+                        }
+                    }
+                }
+                if !(hits == 1 || hits == 0 && self.sym(name).is_some()) {
+                    return Some(Err(format!(
+                        "DELETE semi-join: `{name}` may name a column of more than one table"
+                    )));
+                }
+            }
+        }
+        let cond = conds
+            .into_iter()
+            .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)));
+        let pred = if others.is_empty() {
+            cond
+        } else {
+            Some(Expr::Exists(Box::new(Select {
+                items: vec![SelItem {
+                    expr: Expr::Num("1".into()),
+                    alias: None,
+                    assign: None,
+                }],
+                from: others,
+                where_: cond,
+                ..Select::default()
+            })))
+        };
+        let b = self.bind_table(&tname, &talias);
+        let table = b.table.clone();
+        self.scopes.last_mut().unwrap().push(b);
+        Some((|| {
+            let w = match &pred {
+                Some(p) => self.expr(p)?.0,
+                None => a("-"),
+            };
+            Ok(n("delete", vec![a(table), w]))
+        })())
     }
 
     /// `DELETE t FROM t LEFT JOIN u ON <eqs> WHERE u.c IS NULL [AND rest]`
@@ -2300,6 +2440,47 @@ fn order_operands(op: &str, x: Term, y: Term) -> (Term, Term, String) {
 
 fn l_or_r_is_str(l: &Expr, r: &Expr) -> bool {
     matches!(l, Expr::Str(_)) || matches!(r, Expr::Str(_))
+}
+
+/// Whether an expression holds a subquery or CASE anywhere.
+fn has_query(e: &Expr) -> bool {
+    match e {
+        Expr::Exists(_) | Expr::Subquery(_) | Expr::InQuery(..) | Expr::Case(..) => true,
+        Expr::Bin(_, l, r) | Expr::Like(l, r, _, _) => has_query(l) || has_query(r),
+        Expr::Unary(_, x) | Expr::IsNull(x, _) | Expr::Cast(x, _) | Expr::Extract(_, x) => {
+            has_query(x)
+        }
+        Expr::Call(c) => c.args.iter().any(has_query) || c.order.iter().any(|o| has_query(&o.expr)),
+        Expr::InList(x, l, _) => has_query(x) || l.iter().any(has_query),
+        Expr::Between(x, y, z, _) => has_query(x) || has_query(y) || has_query(z),
+        Expr::Tuple(l) => l.iter().any(has_query),
+        _ => false,
+    }
+}
+
+/// The tables of a tree of inner and cross joins, and its ON conditions;
+/// false when the tree has an outer join.
+fn inner_leaves(f: &From, leaves: &mut Vec<From>, conds: &mut Vec<Expr>) -> bool {
+    match f {
+        From::Join {
+            kind,
+            left,
+            right,
+            on,
+        } => {
+            matches!(kind.as_str(), "INNER" | "CROSS")
+                && inner_leaves(left, leaves, conds)
+                && inner_leaves(right, leaves, conds)
+                && {
+                    conds.extend(on.iter().cloned());
+                    true
+                }
+        }
+        _ => {
+            leaves.push(f.clone());
+            true
+        }
+    }
 }
 
 fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {

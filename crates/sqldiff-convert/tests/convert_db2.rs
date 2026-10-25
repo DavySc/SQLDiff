@@ -482,6 +482,59 @@ fn execute_as_owner_becomes_usrprf_owner() {
 }
 
 #[test]
+fn delete_with_inner_joins_becomes_delete_where_exists() {
+    let cases = [
+        (
+            "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.customer_id > 10 OR c.nick IS NULL;",
+            "DELETE FROM orders o WHERE EXISTS (SELECT 1 FROM customer c WHERE (c.customer_id = o.customer_id) AND (c.customer_id > 10 OR c.nick IS NULL));",
+        ),
+        (
+            "DELETE orders FROM dbo.orders JOIN dbo.customer c ON c.customer_id = orders.customer_id, dbo.item i WHERE i.item_id = c.customer_id;",
+            "DELETE FROM orders WHERE EXISTS (SELECT 1 FROM customer c, item i WHERE (c.customer_id = orders.customer_id) AND (i.item_id = c.customer_id));",
+        ),
+        (
+            "DELETE o FROM dbo.orders o JOIN dbo.orders o2 ON o2.customer_id = o.customer_id AND o2.order_id > o.order_id;",
+            "DELETE FROM orders o WHERE EXISTS (SELECT 1 FROM orders o2 WHERE (o2.customer_id = o.customer_id AND o2.order_id > o.order_id));",
+        ),
+    ];
+    for (src, want) in cases {
+        let c = db2(src);
+        assert_eq!(c.output.trim(), want, "{src}");
+        assert!(
+            c.units[0].status < Status::Differs,
+            "{src}: {:?}",
+            c.units[0].notes
+        );
+        assert!(
+            !c.report
+                .findings
+                .iter()
+                .any(|f| f.rule == "equiv.unsupported"),
+            "{src}: {:?}",
+            c.report.findings
+        );
+    }
+    // Inside EXISTS an unqualified name would resolve to the joined table
+    // first; T-SQL rejects one that both tables have (Msg 209). Without a
+    // catalog to show which table owns it, it is refused.
+    for src in [
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE nick IS NULL;",
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON customer_id = o.customer_id;",
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.nick IN (SELECT nick FROM dbo.item);",
+    ] {
+        assert_eq!(db2(src).units[0].status, Status::NotConverted, "{src}");
+    }
+    // Without other tables nothing moves into a subquery.
+    let one = "DELETE o FROM dbo.orders o WHERE order_id = 1;";
+    assert_eq!(
+        db2(one).output.trim(),
+        "DELETE FROM orders o WHERE (order_id = 1);"
+    );
+    let left = "DELETE o FROM dbo.orders o LEFT JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.nick = 'a';";
+    assert_eq!(db2(left).units[0].status, Status::NotConverted);
+}
+
+#[test]
 fn table_function_in_from_becomes_table_reference() {
     let cases = [
         (
@@ -579,4 +632,27 @@ fn with_data_change_is_refused() {
     assert!(c.output.contains("SIGNAL SQLSTATE '75001'"), "{}", c.output);
     let u = unit(&c, src, "WITH c");
     assert_eq!(u.status, Status::NotConverted);
+}
+
+#[test]
+fn delete_join_with_a_table_function_uses_table() {
+    let c = db2("DELETE o FROM dbo.orders o JOIN dbo.f(1) x ON x.order_id = o.order_id;");
+    assert_eq!(
+        c.output.trim(),
+        "DELETE FROM orders o WHERE EXISTS (SELECT 1 FROM TABLE(f(1)) x WHERE (x.order_id = o.order_id));"
+    );
+    assert!(
+        !c.output_check
+            .findings
+            .iter()
+            .any(|f| f.rule == "bind.table-function-form"),
+        "{:?}",
+        c.output_check.findings
+    );
+    let c = db2("DELETE o FROM dbo.orders o, dbo.f(1) WHERE f.order_id = o.order_id;");
+    assert!(
+        c.output.contains("FROM TABLE(f(1)) AS f WHERE"),
+        "{}",
+        c.output
+    );
 }

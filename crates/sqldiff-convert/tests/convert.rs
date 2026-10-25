@@ -742,6 +742,80 @@ fn security_definer_procedures_cannot_commit() {
         .any(|u| has_rule(u, "pg.security-definer-transaction")));
 }
 
+#[test]
+fn delete_with_inner_joins_becomes_delete_using() {
+    let cases = [
+        (
+            "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.customer_id > 10 OR c.nick IS NULL;",
+            "DELETE FROM orders o USING customer c WHERE (c.customer_id = o.customer_id) AND (c.customer_id > 10 OR c.nick IS NULL);",
+        ),
+        (
+            "DELETE FROM o FROM dbo.orders AS o INNER JOIN dbo.customer AS c ON c.customer_id = o.customer_id;",
+            "DELETE FROM orders AS o USING customer AS c WHERE (c.customer_id = o.customer_id);",
+        ),
+        (
+            "DELETE orders FROM dbo.orders JOIN dbo.customer c ON c.customer_id = orders.customer_id, dbo.item i WHERE i.item_id = c.customer_id;",
+            "DELETE FROM orders USING customer c, item i WHERE (c.customer_id = orders.customer_id) AND (i.item_id = c.customer_id);",
+        ),
+        (
+            "DELETE o FROM dbo.orders o CROSS JOIN (SELECT MAX(order_id) AS m FROM dbo.orders) x WHERE o.order_id < x.m;",
+            "DELETE FROM orders o USING (SELECT MAX(order_id) AS m FROM orders) x WHERE (o.order_id < x.m);",
+        ),
+        (
+            "DELETE o FROM dbo.orders o JOIN dbo.orders o2 ON o2.customer_id = o.customer_id AND o2.order_id > o.order_id;",
+            "DELETE FROM orders o USING orders o2 WHERE (o2.customer_id = o.customer_id AND o2.order_id > o.order_id);",
+        ),
+        (
+            "DELETE o FROM dbo.orders o JOIN dbo.customer c ON LEFT(c.nick, 1) IS NOT NULL AND c.customer_id = o.customer_id;",
+            "DELETE FROM orders o USING customer c WHERE (LEFT(c.nick, 1) IS NOT NULL AND c.customer_id = o.customer_id);",
+        ),
+        (
+            "DELETE o FROM dbo.orders o WHERE o.order_id = 1;",
+            "DELETE FROM orders o WHERE (o.order_id = 1);",
+        ),
+    ];
+    for (src, want) in cases {
+        let c = tsql(src);
+        assert_eq!(c.output.trim(), want, "{src}");
+        assert!(
+            c.units[0].status < Status::Differs,
+            "{src}: {:?}",
+            c.units[0].notes
+        );
+        // The engine checks the rewrite itself, not only the output's binding.
+        assert!(
+            !c.report
+                .findings
+                .iter()
+                .any(|f| f.rule == "equiv.unsupported"),
+            "{src}: {:?}",
+            c.report.findings
+        );
+    }
+}
+
+#[test]
+fn delete_joins_that_do_not_only_filter_are_refused() {
+    for src in [
+        // An outer join that is not the anti-join idiom.
+        "DELETE o FROM dbo.orders o LEFT JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.nick = 'a';",
+        "DELETE o FROM dbo.orders o CROSS APPLY dbo.f(o.order_id) f;",
+        "DELETE o FROM dbo.orders o INNER HASH JOIN dbo.customer c ON c.customer_id = o.customer_id;",
+        // Nested ON clauses.
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c JOIN dbo.item i ON i.item_id = c.customer_id ON c.customer_id = o.customer_id;",
+        // The target binds to no FROM table, or by a rule that is not modelled.
+        "DELETE FROM dbo.orders FROM dbo.customer c WHERE c.customer_id = orders.customer_id;",
+        "DELETE FROM dbo.orders FROM dbo.orders o WHERE o.order_id = 1;",
+        "DELETE orders FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id;",
+        "DELETE o FROM dbo.orders o JOIN dbo.customer c ON c.customer_id = o.customer_id OPTION (MAXDOP 1);",
+        "DELETE TOP (10) FROM dbo.orders WHERE order_id < 5;",
+        "DELETE FROM dbo.orders OUTPUT deleted.order_id WHERE order_id = 5;",
+    ] {
+        let c = tsql(src);
+        assert_eq!(c.units[0].status, Status::NotConverted, "{src}: {}", c.output);
+    }
+}
+
 /// PostgreSQL takes a WITH list in front of INSERT, UPDATE and DELETE with the
 /// same meaning, unless the statement changes a CTE (T-SQL then changes the
 /// CTE's base table).
