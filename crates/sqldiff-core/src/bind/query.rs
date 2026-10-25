@@ -638,6 +638,27 @@ impl<'a> Binder<'a> {
                     for m in i..after {
                         an.consumed[m] = false;
                     }
+                    if self.d == Dialect::Db2i
+                        && !(after == i + 1 && x.is_any_kw(&["UNNEST", "XMLTABLE", "JSON_TABLE"]))
+                    {
+                        let call = t[i..after]
+                            .iter()
+                            .map(|y| y.text.as_str())
+                            .collect::<String>();
+                        self.issue(Issue {
+                            rule: "bind.table-function-form",
+                            class: ChangeClass::Binding,
+                            severity: Severity::Medium,
+                            proven: false,
+                            message: format!(
+                                "`{call}(…)` is called in FROM without TABLE: IBM i documents a table function reference as `TABLE({call}(…)) AS name`."
+                            ),
+                            start: x.start,
+                            end: t[close_paren(t, after).min(t.len() - 1)].end,
+                            key: format!("table function {}", call.to_lowercase()),
+                            assumptions: Vec::new(),
+                        });
+                    }
                     i = close_paren(t, after) + 1;
                     kind = PendingKind::Function;
                 } else {

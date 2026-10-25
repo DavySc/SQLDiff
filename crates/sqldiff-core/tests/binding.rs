@@ -698,3 +698,34 @@ fn view_nullability() {
     assert!(nullable("v2"));
     assert!(nullable("v3"));
 }
+
+/// Db2 for i: a table function in FROM is written `TABLE(f(…)) AS x`. A bare
+/// call (the T-SQL and PostgreSQL form) does not bind as one.
+#[test]
+fn db2_table_function_needs_table() {
+    let bare = "SELECT x.a FROM f(1) x;\nSELECT * FROM t, lib.g(2) AS y;\n";
+    let r = check_rules(Dialect::Db2i, bare, None);
+    let hits = r
+        .findings
+        .iter()
+        .filter(|f| f.rule == "bind.table-function-form" && f.class == ChangeClass::Binding)
+        .count();
+    assert_eq!(hits, 2, "{:?}", rules(&r));
+    let ok = "SELECT x.a FROM TABLE(f(1)) AS x;\nSELECT * FROM t JOIN TABLE(lib.g(2)) y ON 1 = 1;\nSELECT u.a FROM UNNEST(ARRAY[1, 2]) AS u (a);\n";
+    let r = check_rules(Dialect::Db2i, ok, None);
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.rule == "bind.table-function-form"),
+        "{:?}",
+        rules(&r)
+    );
+    let r = check_rules(Dialect::Postgres, "SELECT x.a FROM f(1) x;", None);
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.rule == "bind.table-function-form"),
+        "{:?}",
+        rules(&r)
+    );
+}

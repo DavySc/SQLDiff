@@ -741,3 +741,70 @@ fn security_definer_procedures_cannot_commit() {
         .iter()
         .any(|u| has_rule(u, "pg.security-definer-transaction")));
 }
+
+/// PostgreSQL takes a WITH list in front of INSERT, UPDATE and DELETE with the
+/// same meaning, unless the statement changes a CTE (T-SQL then changes the
+/// CTE's base table).
+#[test]
+fn with_data_change() {
+    let kept = [
+        (
+            "WITH c AS (SELECT order_id FROM dbo.orders) INSERT INTO dbo.orders (order_id) SELECT order_id + 100 FROM c;",
+            "WITH c AS (SELECT order_id FROM orders) INSERT INTO orders (order_id) SELECT order_id + 100 FROM c;",
+        ),
+        (
+            "WITH c (k) AS (SELECT order_id FROM dbo.orders), d AS (SELECT k FROM c) UPDATE dbo.orders SET nick = 0 WHERE order_id IN (SELECT k FROM d);",
+            "WITH c (k) AS (SELECT order_id FROM orders), d AS (SELECT k FROM c) UPDATE orders SET nick = 0 WHERE order_id IN (SELECT k FROM d);",
+        ),
+        (
+            "WITH c AS (SELECT order_id FROM dbo.orders WHERE nick = 1) DELETE FROM dbo.orders WHERE order_id IN (SELECT order_id FROM c);",
+            "WITH c AS (SELECT order_id FROM orders WHERE nick = 1) DELETE FROM orders WHERE order_id IN (SELECT order_id FROM c);",
+        ),
+    ];
+    for (src, want) in kept {
+        let c = tsql(src);
+        assert_eq!(c.units.len(), 1, "{src}");
+        assert_eq!(c.output.trim(), want, "{src}");
+        assert!(
+            c.units[0].status < Status::Differs,
+            "{src}: {:?}",
+            c.units[0].notes
+        );
+    }
+    for src in [
+        "WITH c AS (SELECT order_id FROM dbo.orders) DELETE c FROM c JOIN dbo.orders o ON o.order_id = c.order_id;",
+        "WITH c AS (SELECT order_id FROM dbo.orders) DELETE FROM c WHERE order_id > 1;",
+        "WITH [c] AS (SELECT order_id FROM dbo.orders) UPDATE dbo.c SET order_id = 2;",
+        "WITH c AS (SELECT order_id FROM dbo.orders) DELETE o FROM dbo.orders o JOIN c ON c.order_id = o.order_id;",
+        "WITH c AS (SELECT order_id FROM dbo.orders) MERGE dbo.orders AS t USING c ON t.order_id = c.order_id WHEN MATCHED THEN DELETE;",
+    ] {
+        let c = tsql(src);
+        assert_eq!(c.units.len(), 1, "{src}");
+        assert_eq!(c.units[0].status, Status::NotConverted, "{src}");
+    }
+    // In a procedure it is a data change, not a result set.
+    let src = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  WITH c AS (SELECT order_id FROM dbo.orders) INSERT INTO dbo.orders (order_id) SELECT order_id + 100 FROM c;\nEND\n";
+    let c = tsql(src);
+    assert!(
+        c.output.contains("  WITH c AS (SELECT order_id FROM orders) INSERT INTO orders (order_id) SELECT order_id + 100 FROM c;"),
+        "{}",
+        c.output
+    );
+    assert!(unit(&c, src, "WITH c").status < Status::Differs);
+}
+
+/// A recursive CTE needs WITH RECURSIVE, and T-SQL's recursion limit is noted.
+#[test]
+fn recursive_cte_gets_recursive() {
+    let src =
+        "WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r;";
+    let c = tsql(src);
+    assert_eq!(
+        c.output.trim(),
+        "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r;"
+    );
+    assert!(has_rule(&c.units[0], "ASM-CTE-MAXRECURSION"));
+    let plain = tsql("WITH c AS (SELECT 1 AS n) SELECT n FROM c;");
+    assert!(plain.output.starts_with("WITH c AS"), "{}", plain.output);
+    assert!(!has_rule(&plain.units[0], "ASM-CTE-MAXRECURSION"));
+}
