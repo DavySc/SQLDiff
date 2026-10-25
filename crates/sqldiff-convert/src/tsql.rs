@@ -1530,23 +1530,14 @@ impl<'a> Cx<'a> {
                 from = s[0];
             }
             "DELETE" => {
-                if !ts[s[1]].is("FROM") {
-                    if find_word(&ts, s[1], "FROM").is_some() {
-                        return no(self.pick(
-                            "DELETE t FROM … JOIN: rewrite with USING or a key subquery",
-                            "DELETE t FROM … JOIN: rewrite with EXISTS or a key subquery",
-                        ));
-                    }
-                    pre = "DELETE FROM ".into();
-                } else {
-                    let first_from = s[1];
-                    if find_word(&ts, first_from + 1, "FROM").is_some() {
-                        return no(self.pick(
-                            "DELETE FROM t FROM … JOIN: rewrite with USING or a key subquery",
-                            "DELETE FROM t FROM … JOIN: rewrite with EXISTS or a key subquery",
-                        ));
-                    }
+                let start = if ts[s[1]].is("FROM") { s[1] + 1 } else { s[1] };
+                if let Some(f) = find_word(&ts, start, "FROM") {
+                    return self.delete_join(&ts, start, f);
+                }
+                if ts[s[1]].is("FROM") {
                     from = s[0];
+                } else {
+                    pre = "DELETE FROM ".into();
                 }
             }
             _ => from = s[0],
@@ -1555,6 +1546,81 @@ impl<'a> Cx<'a> {
             return Ok(self.expr(&ts));
         }
         Ok(format!("{pre}{}", self.expr(&ts[from..]).trim_start()))
+    }
+
+    /// `DELETE t FROM <tables> WHERE w` (or `DELETE FROM t FROM …`): T-SQL
+    /// deletes each row of `t` for which the FROM list has at least one row
+    /// that satisfies the join and WHERE conditions, once however many rows
+    /// match. When the FROM tables are joined by inner and cross joins alone
+    /// (and commas) and `t` names exactly one of them, the joins flatten to
+    /// the other tables and the conjunction of all conditions, which is
+    /// exactly PostgreSQL's `DELETE FROM t USING <others> WHERE …` and Db2
+    /// for i's `DELETE FROM t WHERE EXISTS (SELECT 1 FROM <others> WHERE …)`.
+    /// Outer joins, APPLY, join hints, nested ON and a target that is not
+    /// named by one FROM table are refused.
+    fn delete_join(&mut self, ts: &[T], start: usize, from: usize) -> R<String> {
+        let why = |w: &str| {
+            No(format!(
+                "DELETE … FROM … JOIN: {w}; {}",
+                self.pick(
+                    "rewrite with USING or a key subquery",
+                    "rewrite with EXISTS or a key subquery",
+                )
+            ))
+        };
+        let target = name_parts(trimmed(&ts[start..from]))
+            .ok_or_else(|| why("the target is not a plain table name or alias"))?;
+        let end = ["WHERE", "OPTION"]
+            .iter()
+            .filter_map(|w| find_word(ts, from + 1, w))
+            .min()
+            .unwrap_or(ts.len());
+        if find_word(ts, from + 1, "OPTION").is_some() {
+            return Err(why("query hints (OPTION) are not converted"));
+        }
+        let mut leaves: Vec<Leaf> = Vec::new();
+        let mut conds: Vec<&[T]> = Vec::new();
+        for item in split_commas(&ts[from + 1..end]) {
+            join_chain(item, &mut leaves, &mut conds).map_err(|w| why(&w))?;
+        }
+        let hits: Vec<usize> = (0..leaves.len())
+            .filter(|&i| leaves[i].binds(&target))
+            .collect();
+        let [hit] = hits[..] else {
+            return Err(why(if hits.is_empty() {
+                "the target is not one of the FROM tables by alias or one-part name"
+            } else {
+                "the target matches more than one FROM table"
+            }));
+        };
+        if !leaves[hit].table {
+            return Err(why("the target is not a table"));
+        }
+        if end < ts.len() {
+            conds.push(&ts[end + 1..]);
+        }
+        let tgt = self.expr(trimmed(leaves[hit].toks)).trim().to_string();
+        let others: Vec<String> = (0..leaves.len())
+            .filter(|&i| i != hit)
+            .map(|i| self.expr(trimmed(leaves[i].toks)).trim().to_string())
+            .collect();
+        let conds: Vec<String> = conds
+            .iter()
+            .map(|c| format!("({})", self.expr(trimmed(c)).trim()))
+            .collect();
+        let filter = if conds.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conds.join(" AND "))
+        };
+        Ok(match (others.is_empty(), self.db2()) {
+            (true, _) => format!("DELETE FROM {tgt}{filter}"),
+            (false, false) => format!("DELETE FROM {tgt} USING {}{filter}", others.join(", ")),
+            (false, true) => format!(
+                "DELETE FROM {tgt} WHERE EXISTS (SELECT 1 FROM {}{filter})",
+                others.join(", ")
+            ),
+        })
     }
 
     fn set(&mut self, ts: &[T]) -> R<String> {
@@ -3709,6 +3775,179 @@ fn rollback_rethrow(catch: &SyntaxNode) -> bool {
         w.as_slice(),
         ["IF", "@@TRANCOUNT", ">", "0", "ROLLBACK", "THROW"] | ["ROLLBACK", "THROW"]
     )
+}
+
+/// One table of a DELETE's FROM list.
+struct Leaf<'a> {
+    toks: &'a [T],
+    /// Name parts, unquoted and lowercased.
+    name: Vec<String>,
+    alias: Option<String>,
+    /// A named table (not a derived table or a function).
+    table: bool,
+}
+
+impl Leaf<'_> {
+    /// Whether the DELETE target `t` names this table: by its alias, or by
+    /// a one-part name equal to the last part of an unaliased table.
+    fn binds(&self, t: &[String]) -> bool {
+        match (&self.alias, t) {
+            (Some(a), [x]) => a == x,
+            (Some(_), _) => false,
+            (None, [x]) => self.table && self.name.last() == Some(x),
+            (None, _) => false,
+        }
+    }
+}
+
+/// Unquoted, lowercased parts of a dotted name; `None` if the tokens are
+/// anything else.
+fn name_parts(ts: &[T]) -> Option<Vec<String>> {
+    let s = sig(ts);
+    let mut parts = Vec::new();
+    for (n, &i) in s.iter().enumerate() {
+        let t = &ts[i];
+        match (n % 2, t.k) {
+            (0, IDENT) if !t.s.starts_with('@') => parts.push(t.s.to_ascii_lowercase()),
+            (0, QUOTED_IDENT) => parts.push(tsql_unquote(&t.s).to_ascii_lowercase()),
+            (1, DOT) => {}
+            _ => return None,
+        }
+    }
+    (!parts.is_empty() && s.len() % 2 == 1).then_some(parts)
+}
+
+/// Splits one comma item of a FROM list, a chain of inner and cross joins,
+/// into its tables and ON conditions. Anything else is an error.
+fn join_chain<'a>(
+    ts: &'a [T],
+    leaves: &mut Vec<Leaf<'a>>,
+    conds: &mut Vec<&'a [T]>,
+) -> Result<(), String> {
+    let ds = crate::tok::depths(ts);
+    let s: Vec<usize> = sig(ts).into_iter().filter(|&i| ds[i] == 0).collect();
+    // (start, end) of each table, and of each ON condition.
+    let mut start = 0;
+    let mut on: Option<usize> = None;
+    let mut need_on = false;
+    let mut close = |a: usize, b: usize, on: Option<usize>, need_on: bool| -> Result<(), String> {
+        match (on, need_on) {
+            (Some(o), true) => {
+                if find_word(&ts[o + 1..b], 0, "ON").is_some() {
+                    return Err("nested ON clauses".into());
+                }
+                leaves.push(leaf(&ts[a..o])?);
+                conds.push(&ts[o + 1..b]);
+            }
+            (None, false) => leaves.push(leaf(&ts[a..b])?),
+            (None, true) => return Err("a JOIN without its ON".into()),
+            (Some(_), false) => return Err("ON after a cross join or a comma".into()),
+        }
+        Ok(())
+    };
+    let mut k = 0;
+    while k < s.len() {
+        let i = s[k];
+        let t = &ts[i];
+        let word = |j: usize| s.get(j).is_some_and(|&x| ts[x].is("JOIN"));
+        let (kind_on, width) = if t.is("JOIN") {
+            (true, 1)
+        } else if t.is("INNER") && word(k + 1) {
+            (true, 2)
+        } else if t.is("CROSS") && word(k + 1) {
+            (false, 2)
+        } else if ["LEFT", "RIGHT", "FULL", "OUTER", "INNER", "CROSS", "APPLY"]
+            .iter()
+            .any(|w| t.is(w))
+        {
+            return Err("an outer join, APPLY or a join hint".into());
+        } else {
+            if t.is("ON") && on.is_none() {
+                on = Some(i);
+            }
+            k += 1;
+            continue;
+        };
+        close(start, i, on, need_on)?;
+        start = s[k + width - 1] + 1;
+        on = None;
+        need_on = kind_on;
+        k += width;
+    }
+    close(start, ts.len(), on, need_on)
+}
+
+/// One FROM table: `name [[AS] alias] [WITH (hints)]` or a derived table
+/// `(SELECT …) [AS] alias`.
+fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
+    let bad =
+        || Err("a FROM item that is not a table, a derived table or a table function".to_string());
+    let s = sig(ts);
+    let Some(&first) = s.first() else {
+        return bad();
+    };
+    // Where the name (or the parenthesised query) ends.
+    let (name, table, mut k) = if ts[first].k == L_PAREN {
+        let close = matching(ts, first).ok_or("unbalanced parentheses")?;
+        if !next_sig(ts, first).is_some_and(|j| ts[j].is("SELECT")) {
+            return bad();
+        }
+        (
+            Vec::new(),
+            false,
+            s.iter().position(|&i| i > close).unwrap_or(s.len()),
+        )
+    } else {
+        let mut k = 1;
+        while k + 1 < s.len() && ts[s[k]].k == DOT {
+            k += 2;
+        }
+        let Some(name) = name_parts(&ts[first..s[k - 1] + 1]) else {
+            return bad();
+        };
+        if s.get(k).is_some_and(|&i| ts[i].k == L_PAREN) {
+            // A table-valued function call.
+            let close = matching(ts, s[k]).ok_or("unbalanced parentheses")?;
+            (
+                name,
+                false,
+                s.iter().position(|&i| i > close).unwrap_or(s.len()),
+            )
+        } else {
+            (name, true, k)
+        }
+    };
+    if s.get(k).is_some_and(|&i| ts[i].is("AS")) {
+        k += 1;
+    }
+    let mut alias = None;
+    if let Some(&i) = s.get(k) {
+        match ts[i].k {
+            IDENT if !ts[i].is("WITH") => alias = Some(ts[i].s.to_ascii_lowercase()),
+            QUOTED_IDENT => alias = Some(tsql_unquote(&ts[i].s).to_ascii_lowercase()),
+            _ => {}
+        }
+        if alias.is_some() {
+            k += 1;
+        }
+    }
+    if table && s.get(k).is_some_and(|&i| ts[i].is("WITH")) {
+        let open = s
+            .get(k + 1)
+            .filter(|&&i| ts[i].k == L_PAREN)
+            .ok_or("WITH without hints")?;
+        let close = matching(ts, *open).ok_or("unbalanced parentheses")?;
+        k = s.iter().position(|&i| i > close).unwrap_or(s.len());
+    }
+    if k != s.len() || (!table && alias.is_none() && ts[first].k == L_PAREN) {
+        return bad();
+    }
+    Ok(Leaf {
+        toks: ts,
+        name,
+        alias,
+        table,
+    })
 }
 
 fn is_clause_word(s: &str) -> bool {

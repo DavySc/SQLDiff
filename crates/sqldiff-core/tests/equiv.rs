@@ -105,6 +105,56 @@ fn anti_join_delete_needs_the_null_test_on_a_join_column() {
 }
 
 #[test]
+fn delete_join_is_a_semi_join_in_every_spelling() {
+    let ts = |join: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.purge AS
+             BEGIN
+               DELETE pf FROM dbo.price_feed AS pf {join} dbo.item AS i ON i.item_id = pf.item_id
+                WHERE i.item_id > 100;
+             END"
+        )
+    };
+    let pg = |pred: &str| {
+        format!(
+            "CREATE PROCEDURE purge() LANGUAGE sql AS $$
+             DELETE FROM price_feed AS pf USING item AS i WHERE {pred}; $$;"
+        )
+    };
+    let db2 = |pred: &str| {
+        format!(
+            "CREATE PROCEDURE purge () LANGUAGE SQL
+             BEGIN
+               DELETE FROM price_feed AS pf WHERE EXISTS (SELECT 1 FROM item AS i WHERE {pred});
+             END"
+        )
+    };
+    let both = "i.item_id = pf.item_id AND i.item_id > 100";
+    let equal = |r: Report| {
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{:?}",
+            r.findings
+        )
+    };
+    equal(run(&ts("JOIN"), T, &pg(both), P, true));
+    equal(run(&ts("INNER JOIN"), T, &db2(both), D, true));
+    equal(run(&pg(both), P, &db2(both), D, true));
+    // A dropped condition, or an outer join, is not the same delete.
+    for (a, da, b, db) in [
+        (ts("JOIN"), T, pg("i.item_id > 100"), P),
+        (ts("JOIN"), T, db2("i.item_id = pf.item_id"), D),
+        (ts("LEFT JOIN"), T, pg(both), P),
+    ] {
+        let r = run(&a, da, &b, db, true);
+        assert!(
+            !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{a}\n{b}"
+        );
+    }
+}
+
+#[test]
 fn string_comparison_collation_is_explicit() {
     let ts = "CREATE FUNCTION dbo.f (@Email varchar(254)) RETURNS int AS
       BEGIN RETURN (SELECT customer_id FROM dbo.customer WHERE email = @Email); END";
