@@ -175,6 +175,11 @@ const KEYWORDS: &[&str] = &[
     "INOUT",
 ];
 
+/// The keywords [`is_keyword`] knows, upper case.
+pub fn keywords() -> &'static [&'static str] {
+    KEYWORDS
+}
+
 pub fn is_keyword(upper: &str) -> bool {
     KEYWORDS.contains(&upper)
 }
