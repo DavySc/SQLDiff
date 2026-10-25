@@ -533,3 +533,133 @@ fn delete_with_inner_joins_becomes_delete_where_exists() {
     let left = "DELETE o FROM dbo.orders o LEFT JOIN dbo.customer c ON c.customer_id = o.customer_id WHERE c.nick = 'a';";
     assert_eq!(db2(left).units[0].status, Status::NotConverted);
 }
+
+#[test]
+fn table_function_in_from_becomes_table_reference() {
+    let cases = [
+        (
+            "SELECT f.order_id FROM dbo.f(1) f;",
+            "SELECT f.order_id FROM TABLE(f(1)) f;",
+        ),
+        ("SELECT * FROM dbo.f(1);", "SELECT * FROM TABLE(f(1)) AS f;"),
+        (
+            "SELECT x.order_id FROM dbo.f(1) AS x JOIN dbo.orders o ON o.order_id = x.order_id;",
+            "SELECT x.order_id FROM TABLE(f(1)) AS x JOIN orders o ON o.order_id = x.order_id;",
+        ),
+        (
+            "SELECT a.order_id FROM dbo.orders a, dbo.f(2) g WHERE a.order_id = g.order_id;",
+            "SELECT a.order_id FROM orders a, TABLE(f(2)) g WHERE a.order_id = g.order_id;",
+        ),
+        (
+            "SELECT o.order_id FROM dbo.orders o WHERE EXISTS (SELECT 1 FROM dbo.f(o.order_id) z);",
+            "SELECT o.order_id FROM orders o WHERE EXISTS (SELECT 1 FROM TABLE(f(o.order_id)) z);",
+        ),
+        (
+            "DELETE FROM dbo.orders WHERE order_id IN (SELECT order_id FROM dbo.f(3));",
+            "DELETE FROM orders WHERE order_id IN (SELECT order_id FROM TABLE(f(3)) AS f);",
+        ),
+        // Not a FROM item: a call in the select list, and TRIM's FROM.
+        (
+            "SELECT TRIM('x' FROM LEFT(nick, 2)), COALESCE(a, b) FROM dbo.orders;",
+            "SELECT TRIM('x' FROM LEFT(nick, 2)), COALESCE(a, b) FROM orders;",
+        ),
+    ];
+    for (src, want) in cases {
+        let c = db2(src);
+        assert_eq!(c.output.trim(), want, "{src}");
+        assert!(
+            !c.output_check
+                .findings
+                .iter()
+                .any(|f| f.rule == "bind.table-function-form"),
+            "{src}: {:?}",
+            c.output_check.findings
+        );
+    }
+    // An old-style table hint is not a call; the hint itself stays residue.
+    let c = db2("SELECT o.order_id FROM dbo.orders o JOIN dbo.customer (NOLOCK) ON 1 = 1;");
+    assert_eq!(
+        c.output.trim(),
+        "SELECT o.order_id FROM orders o JOIN customer (NOLOCK) ON 1 = 1;"
+    );
+    assert!(c.units[0].status >= Status::Differs);
+    // T-SQL's rowset built-ins and sys functions have no rule.
+    for src in [
+        "SELECT value FROM STRING_SPLIT('a,b', ',');",
+        "SELECT * FROM sys.fn_foo(1);",
+    ] {
+        let c = db2(src);
+        assert_eq!(c.units[0].status, Status::NotConverted, "{src}");
+        assert!(
+            c.units[0]
+                .notes
+                .iter()
+                .any(|n| n.text.contains("table function; no Db2 for i rule")),
+            "{src}: {:?}",
+            c.units[0].notes
+        );
+    }
+}
+
+#[test]
+fn with_data_change_is_refused() {
+    for (src, verb) in [
+        (
+            "WITH c AS (SELECT order_id FROM dbo.orders) DELETE c FROM c JOIN dbo.orders o ON o.order_id = c.order_id;",
+            "DELETE",
+        ),
+        (
+            "WITH c AS (SELECT order_id FROM dbo.orders) DELETE FROM dbo.orders WHERE order_id IN (SELECT order_id FROM c);",
+            "DELETE",
+        ),
+        ("WITH c AS (SELECT order_id FROM dbo.orders) UPDATE c SET order_id = 2;", "UPDATE"),
+        (
+            "WITH c AS (SELECT order_id FROM dbo.orders) INSERT INTO dbo.orders (order_id) SELECT order_id + 100 FROM c;",
+            "INSERT",
+        ),
+    ] {
+        let c = db2(src);
+        assert_eq!(c.units.len(), 1, "{src}: {:?}", c.units);
+        assert_eq!(c.units[0].status, Status::NotConverted, "{src}");
+        assert!(
+            c.units[0].notes[0].text.starts_with(&format!("WITH … {verb}")),
+            "{src}: {:?}",
+            c.units[0].notes
+        );
+        assert!(
+            c.output.lines().all(|l| l.trim_start().starts_with("--")),
+            "{src}: {}",
+            c.output
+        );
+    }
+    // In a procedure the statement is not turned into a result set.
+    let src = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  WITH c AS (SELECT order_id FROM dbo.orders) DELETE c FROM c JOIN dbo.orders o ON o.order_id = c.order_id;\nEND\n";
+    let c = db2(src);
+    assert!(!c.output.contains("CURSOR"), "{}", c.output);
+    assert!(c.output.contains("SIGNAL SQLSTATE '75001'"), "{}", c.output);
+    let u = unit(&c, src, "WITH c");
+    assert_eq!(u.status, Status::NotConverted);
+}
+
+#[test]
+fn delete_join_with_a_table_function_uses_table() {
+    let c = db2("DELETE o FROM dbo.orders o JOIN dbo.f(1) x ON x.order_id = o.order_id;");
+    assert_eq!(
+        c.output.trim(),
+        "DELETE FROM orders o WHERE EXISTS (SELECT 1 FROM TABLE(f(1)) x WHERE (x.order_id = o.order_id));"
+    );
+    assert!(
+        !c.output_check
+            .findings
+            .iter()
+            .any(|f| f.rule == "bind.table-function-form"),
+        "{:?}",
+        c.output_check.findings
+    );
+    let c = db2("DELETE o FROM dbo.orders o, dbo.f(1) WHERE f.order_id = o.order_id;");
+    assert!(
+        c.output.contains("FROM TABLE(f(1)) AS f WHERE"),
+        "{}",
+        c.output
+    );
+}

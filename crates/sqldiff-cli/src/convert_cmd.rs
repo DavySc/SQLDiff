@@ -341,8 +341,13 @@ fn annotate(c: &Conversion) -> (String, Vec<usize>) {
         .collect();
     let mut marks: Vec<(usize, String)> = Vec::new();
     for (u, &at) in c.units.iter().zip(&starts) {
-        if u.status == Status::Converted || u.status == Status::NotConverted {
-            // Not converted units already open with their own comment.
+        // A refused unit already opens with its own comment; a not
+        // converted unit whose code was still written out (a construct with
+        // no rule inside it) gets a status line like any other.
+        let refused = c.output[at..]
+            .trim_start()
+            .starts_with("-- [not converted]");
+        if u.status == Status::Converted || u.status == Status::NotConverted && refused {
             continue;
         }
         let indent: String = c.output[at..]

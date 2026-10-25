@@ -1202,6 +1202,9 @@ impl<'a> Cx<'a> {
             self.seen_work = true;
         }
         let text = match first.as_str() {
+            "WITH" if cte_list(&ts).is_some_and(|(_, v)| !ts[v].is("SELECT")) => {
+                self.with_dml(&ts)?
+            }
             "SELECT" | "WITH" => {
                 let (q, assigns) = self.select(&ts)?;
                 if self.mode != Mode::Top && !assigns {
@@ -1305,7 +1308,7 @@ impl<'a> Cx<'a> {
             if ts.iter().any(|t| t.is("TOP")) {
                 return no("TOP inside a CTE query");
             }
-            return Ok((self.expr(&ts), false));
+            return Ok((self.with_list(&ts, ts.len())?, false));
         }
         let mut i = 1; // index into s
         let mut limit = None;
@@ -1494,6 +1497,92 @@ impl<'a> Cx<'a> {
         format!("OPEN {name};")
     }
 
+    /// `WITH cte AS (…) INSERT/UPDATE/DELETE/MERGE …`. In T-SQL an UPDATE,
+    /// DELETE or MERGE whose target is a CTE changes the CTE's base table;
+    /// neither target can say that, so those are refused. PostgreSQL takes
+    /// the WITH list in front of INSERT, and of UPDATE and DELETE on a real
+    /// table, with the same meaning: the statement is converted as without
+    /// it and the converted list goes in front. A FROM clause in UPDATE or
+    /// DELETE is refused, since its tables may be CTEs bound as the target.
+    /// Db2 for i: whether a data change statement takes a WITH list was not
+    /// checked, so all of them are refused.
+    fn with_dml(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let (names, verb) = cte_list(&ts).ok_or(No("unreadable WITH list".into()))?;
+        let what = ts[verb].up();
+        if self.db2() {
+            return no(format!(
+                "WITH … {what}: not converted for Db2 for i (whether a data change statement takes a WITH list was not checked); rewrite with the CTE as a subquery, or against its base table"
+            ));
+        }
+        if what == "MERGE" {
+            return no("WITH … MERGE: MERGE has no PostgreSQL rule yet");
+        }
+        let s: Vec<usize> = sig(&ts).into_iter().filter(|&i| i >= verb).collect();
+        let target = s
+            .get(1)
+            .map(|&j| {
+                if ts[j].is("FROM") || ts[j].is("INTO") {
+                    s.get(2).copied()
+                } else {
+                    Some(j)
+                }
+            })
+            .unwrap_or(None);
+        let base = target.and_then(|j| name_last(&ts, j));
+        if base.as_ref().is_some_and(|b| names.contains(b)) {
+            return no(format!(
+                "WITH … {what} through a CTE: T-SQL changes the CTE's base table; rewrite the statement against that table"
+            ));
+        }
+        if what != "INSERT" {
+            let after = if what == "UPDATE" {
+                find_word(&ts, verb, "SET").unwrap_or(verb)
+            } else {
+                s.get(1)
+                    .map_or(verb, |&j| if ts[j].is("FROM") { j } else { verb })
+            };
+            if find_word(&ts, after + 1, "FROM").is_some() {
+                return no(format!(
+                    "WITH … {what} … FROM: not converted yet; the FROM tables may be CTEs, and the target one of them"
+                ));
+            }
+        }
+        let prefix = self.with_list(&ts, verb)?.trim().to_string();
+        let body = self.dml(&ts[verb..])?;
+        Ok(format!("{prefix} {}", body.trim_start()))
+    }
+
+    /// `ts[..end]` of a statement that starts with WITH. A recursive CTE
+    /// needs WITH RECURSIVE in PostgreSQL (Db2 for i has no such keyword).
+    /// T-SQL ends a recursion past MAXRECURSION (100 by default) with an
+    /// error, which neither target does.
+    /// RECURSIVE also lets every CTE see the ones after it, which T-SQL
+    /// does not, so a list where a query names a later CTE is refused.
+    fn with_list(&mut self, ts: &[T], end: usize) -> R<String> {
+        let Some((_, _, true, forward)) = cte_list_rec(ts) else {
+            return Ok(self.expr(&ts[..end]));
+        };
+        if forward && !self.db2() {
+            return no("a recursive CTE list where a query names a CTE defined after it: WITH RECURSIVE would make that name the later CTE, where T-SQL reads the table; rename or reorder the CTEs");
+        }
+        self.note(
+            Status::Assumptions,
+            "ASM-CTE-MAXRECURSION",
+            &format!(
+                "A recursive CTE: T-SQL stops it with an error past its recursion limit (MAXRECURSION, 100 levels by default), {} has no such limit. Equal while the recursion stays within the limit.",
+                self.to.display_name()
+            ),
+        );
+        let w = sig(ts)[0];
+        let rest = self.expr(&ts[w + 1..end]);
+        Ok(if self.db2() {
+            format!("WITH{rest}")
+        } else {
+            format!("WITH RECURSIVE{rest}")
+        })
+    }
+
     fn dml(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
@@ -1620,7 +1709,7 @@ impl<'a> Cx<'a> {
         let tgt = self.expr(trimmed(leaves[hit].toks)).trim().to_string();
         let others: Vec<String> = (0..leaves.len())
             .filter(|&i| i != hit)
-            .map(|i| self.expr(trimmed(leaves[i].toks)).trim().to_string())
+            .map(|i| self.leaf_text(&leaves[i]))
             .collect();
         let conds: Vec<String> = conds
             .iter()
@@ -2805,6 +2894,13 @@ impl<'a> Cx<'a> {
         let mut i = 0;
         while i < ts.len() {
             let t = &ts[i];
+            if self.db2() && matches!(t.k, IDENT | QUOTED_IDENT) && from_item_start(ts, i) {
+                if let Some((text, end)) = self.table_function_db2(ts, i) {
+                    o.push_str(&text);
+                    i = end;
+                    continue;
+                }
+            }
             match t.k {
                 INFERRED_TERMINATOR => {}
                 VARIABLE => {
@@ -2962,6 +3058,72 @@ impl<'a> Cx<'a> {
             i += 1;
         }
         o
+    }
+
+    /// A FROM table of a DELETE join; a table function gets Db2's TABLE().
+    fn leaf_text(&mut self, leaf: &Leaf) -> String {
+        let ts = trimmed(leaf.toks);
+        if self.db2() && !leaf.table && !leaf.name.is_empty() {
+            if let Some((call, end)) = self.table_function_db2(ts, 0) {
+                return format!("{call}{}", self.expr(&ts[end..]))
+                    .trim()
+                    .to_string();
+            }
+        }
+        self.expr(ts).trim().to_string()
+    }
+
+    /// Db2: a table-valued function in FROM, `f(args) [AS] x`, becomes
+    /// `TABLE(f(args)) [AS] x`, the form IBM i documents for a table function
+    /// reference. An unaliased call gets `AS f`, the name T-SQL exposes for
+    /// it. T-SQL's own rowset built-ins (OPENJSON, STRING_SPLIT, …) and `sys`
+    /// functions have no rule and are left as they are, with a note. Returns
+    /// the text and the index after the call.
+    fn table_function_db2(&mut self, ts: &[T], i: usize) -> Option<(String, usize)> {
+        let mut last = i;
+        while let Some(d) = next_sig(ts, last).filter(|&d| ts[d].k == DOT) {
+            last = next_sig(ts, d).filter(|&n| matches!(ts[n].k, IDENT | QUOTED_IDENT))?;
+        }
+        let open = next_sig(ts, last).filter(|&p| ts[p].k == L_PAREN)?;
+        let close = matching(ts, open)?;
+        // `t (NOLOCK)`: an old-style table hint, not a call.
+        let inner: Vec<&T> = ts[open + 1..close].iter().filter(|t| t.sig()).collect();
+        if !inner.is_empty()
+            && inner
+                .iter()
+                .all(|t| t.k == COMMA || t.k == IDENT && OLD_STYLE_HINTS.iter().any(|w| t.is(w)))
+        {
+            return None;
+        }
+        let part = |j: usize| match ts[j].k {
+            QUOTED_IDENT => tsql_unquote(&ts[j].s),
+            _ => ts[j].s.clone(),
+        };
+        let builtin = last == i && {
+            use sqldiff_core::catalog::builtins::{self, Availability};
+            builtins::of(Dialect::Tsql).function(&part(i), "9999") != Availability::Unknown
+        };
+        if builtin || last != i && part(i).eq_ignore_ascii_case("sys") {
+            let text = format!(
+                "{}() in FROM is a T-SQL {} table function; no Db2 for i rule yet.",
+                part(last).to_ascii_uppercase(),
+                if builtin { "built-in" } else { "system" }
+            );
+            self.note(Status::NotConverted, "tsql.table-builtin", &text);
+            return None;
+        }
+        let call = self.expr(&ts[i..=close]).trim().to_string();
+        let aliased = next_sig(ts, close).is_some_and(|k| match ts[k].k {
+            QUOTED_IDENT => true,
+            IDENT => !NOT_AN_ALIAS.iter().any(|w| ts[k].is(w)),
+            _ => false,
+        });
+        let mut text = format!("TABLE({call})");
+        if !aliased {
+            text.push_str(" AS ");
+            text.push_str(self.expr(&ts[last..=last]).trim());
+        }
+        Some((text, close + 1))
     }
 
     /// `STRING_AGG(x, sep) [WITHIN GROUP (ORDER BY …)]` → `string_agg(x, sep [ORDER BY …])`.
@@ -4011,6 +4173,217 @@ fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
         alias,
         table,
     })
+}
+
+/// The CTE names of a statement that starts with WITH (unquoted,
+/// lowercased), and the index of the statement word after the list.
+fn cte_list(ts: &[T]) -> Option<(Vec<String>, usize)> {
+    cte_list_rec(ts).map(|(n, v, ..)| (n, v))
+}
+
+/// `cte_list`, whether a CTE names itself in its own query (recursion; a
+/// column of the same name counts too, which only costs a note), and
+/// whether a CTE's query names a CTE defined after it (qualified or not,
+/// again counting columns).
+fn cte_list_rec(ts: &[T]) -> Option<(Vec<String>, usize, bool, bool)> {
+    let mut recursive = false;
+    let mut bodies = Vec::new();
+    let s = sig(ts);
+    let ds = crate::tok::depths(ts);
+    let s: Vec<usize> = s.into_iter().filter(|&i| ds[i] == 0).collect();
+    if !ts[*s.first()?].is("WITH") {
+        return None;
+    }
+    let mut names = Vec::new();
+    let mut k = 1;
+    loop {
+        let name = *s.get(k)?;
+        names.push(match ts[name].k {
+            IDENT => ts[name].s.to_ascii_lowercase(),
+            QUOTED_IDENT => tsql_unquote(&ts[name].s).to_ascii_lowercase(),
+            _ => return None,
+        });
+        k += 1;
+        if ts[*s.get(k)?].k == L_PAREN {
+            k += 2; // the column list, `(` and `)` at depth 0
+        }
+        if !ts[*s.get(k)?].is("AS") || ts[*s.get(k + 1)?].k != L_PAREN {
+            return None;
+        }
+        let (open, close) = (*s.get(k + 1)?, *s.get(k + 2)?);
+        bodies.push(open..close);
+        if names_in(&ts[open..close], names.last()?) {
+            recursive = true;
+        }
+        k += 3;
+        let next = *s.get(k)?;
+        if ts[next].k != COMMA {
+            let forward = bodies
+                .iter()
+                .enumerate()
+                .any(|(i, b)| names[i + 1..].iter().any(|n| names_in(&ts[b.clone()], n)));
+            return Some((names, next, recursive, forward));
+        }
+        k += 1;
+    }
+}
+
+/// Whether a word of `ts` is `name` (unquoted, case-insensitively).
+fn names_in(ts: &[T], name: &str) -> bool {
+    ts.iter().any(|t| match t.k {
+        IDENT => t.s.eq_ignore_ascii_case(name),
+        QUOTED_IDENT => tsql_unquote(&t.s).eq_ignore_ascii_case(name),
+        _ => false,
+    })
+}
+
+/// The last part of the dotted name that starts at `i`, unquoted and
+/// lowercased.
+fn name_last(ts: &[T], i: usize) -> Option<String> {
+    let mut last = i;
+    while let Some(d) = next_sig(ts, last).filter(|&d| ts[d].k == DOT) {
+        last = next_sig(ts, d)?;
+    }
+    match ts[last].k {
+        IDENT => Some(ts[last].s.to_ascii_lowercase()),
+        QUOTED_IDENT => Some(tsql_unquote(&ts[last].s).to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Table hints T-SQL also takes without WITH: `FROM t (NOLOCK)`.
+const OLD_STYLE_HINTS: &[&str] = &[
+    "NOLOCK",
+    "READUNCOMMITTED",
+    "READCOMMITTED",
+    "READCOMMITTEDLOCK",
+    "NOWAIT",
+    "UPDLOCK",
+    "HOLDLOCK",
+    "ROWLOCK",
+    "PAGLOCK",
+    "TABLOCK",
+    "TABLOCKX",
+    "XLOCK",
+    "SERIALIZABLE",
+    "READPAST",
+    "REPEATABLEREAD",
+    "NOEXPAND",
+    "FORCESEEK",
+    "FORCESCAN",
+];
+
+/// Words that can follow a FROM item without being its alias.
+const NOT_AN_ALIAS: &[&str] = &[
+    "WHERE",
+    "GROUP",
+    "ORDER",
+    "HAVING",
+    "JOIN",
+    "INNER",
+    "LEFT",
+    "RIGHT",
+    "FULL",
+    "CROSS",
+    "OUTER",
+    "ON",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "OPTION",
+    "FOR",
+    "WINDOW",
+    "PIVOT",
+    "UNPIVOT",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "MERGE",
+    "SET",
+    "IF",
+    "ELSE",
+    "END",
+    "BEGIN",
+    "RETURN",
+    "DECLARE",
+    "EXEC",
+    "EXECUTE",
+    "WITH",
+    "WHILE",
+    "COMMIT",
+    "ROLLBACK",
+    "PRINT",
+    "THROW",
+    "TRUNCATE",
+    "CREATE",
+    "ALTER",
+    "DROP",
+    "OUTPUT",
+    "INTO",
+];
+
+/// Whether the name at `i` begins an item of a FROM list: it follows FROM
+/// (not `DELETE FROM`, whose target is not a FROM item), JOIN, or a comma
+/// of a FROM list at the same parenthesis depth.
+fn from_item_start(ts: &[T], i: usize) -> bool {
+    let Some(p) = prev_sig(ts, i) else {
+        return false;
+    };
+    if ts[p].is("JOIN") {
+        return true;
+    }
+    let ds = crate::tok::depths(ts);
+    // A query's FROM: not `DELETE FROM`, nor `TRIM(' ' FROM s)` inside a call.
+    let query_from = |f: usize| {
+        !prev_sig(ts, f).is_some_and(|q| ts[q].is("DELETE"))
+            && (ds[f] == 0
+                || (0..f)
+                    .rev()
+                    .find(|&j| ts[j].k == L_PAREN && ds[j] == ds[f] - 1)
+                    .and_then(|o| next_sig(ts, o))
+                    .is_some_and(|n| ts[n].is("SELECT")))
+    };
+    if ts[p].is("FROM") {
+        return query_from(p);
+    }
+    if ts[p].k != COMMA {
+        return false;
+    }
+    for j in (0..p).rev() {
+        if !ts[j].sig() || ds[j] > ds[p] {
+            continue;
+        }
+        if ds[j] < ds[p] {
+            return false;
+        }
+        if ts[j].is("FROM") {
+            return query_from(j);
+        }
+        const ENDS: [&str; 17] = [
+            "SELECT",
+            "WHERE",
+            "GROUP",
+            "HAVING",
+            "ORDER",
+            "SET",
+            "VALUES",
+            "INTO",
+            "UPDATE",
+            "INSERT",
+            "DELETE",
+            "MERGE",
+            "UNION",
+            "EXCEPT",
+            "INTERSECT",
+            "OUTPUT",
+            "BY",
+        ];
+        if ENDS.iter().any(|w| ts[j].is(w)) {
+            return false;
+        }
+    }
+    false
 }
 
 fn is_clause_word(s: &str) -> bool {

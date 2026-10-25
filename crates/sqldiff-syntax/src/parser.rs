@@ -1020,7 +1020,15 @@ impl<'a> Parser<'a> {
                     case -= 1;
                 }
                 if depth == 0 {
-                    if head.is_empty() {
+                    // `WITH cte AS (…) UPDATE …` continues as an UPDATE does.
+                    if head.is_empty()
+                        || tsql
+                            && head == "WITH"
+                            && matches!(
+                                w.as_str(),
+                                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "MERGE"
+                            )
+                    {
                         head = w.clone();
                     }
                     seen.insert(w.clone());
@@ -1149,6 +1157,30 @@ mod tests {
         assert_eq!(u.len(), 2);
         let u = units("UPDATE t SET a = 1 WHERE b = 2 SET @x = 1", Dialect::Tsql);
         assert_eq!(u.len(), 2);
+    }
+
+    #[test]
+    fn tsql_with_data_change_is_one_statement() {
+        for (text, n) in [
+            (
+                "WITH c AS (SELECT a FROM s) UPDATE c SET a = 2 SET @x = 1",
+                2,
+            ),
+            (
+                "WITH c AS (SELECT a FROM s) INSERT INTO t (a) SELECT a FROM c SELECT 2",
+                2,
+            ),
+            (
+                "WITH c AS (SELECT a FROM s) DELETE c FROM c JOIN t ON t.a = c.a",
+                1,
+            ),
+            (
+                "WITH c (a) AS (SELECT 1), d AS (SELECT a FROM c) INSERT t SELECT a FROM d",
+                1,
+            ),
+        ] {
+            assert_eq!(units(text, Dialect::Tsql).len(), n, "{text}");
+        }
     }
 
     #[test]
