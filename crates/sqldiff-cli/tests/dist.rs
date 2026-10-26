@@ -3,11 +3,28 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-fn scratch(name: &str) -> PathBuf {
+/// A scratch folder, removed when the test ends, also when it fails: each
+/// one holds copies of the executables (hundreds of MB in a debug build).
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn scratch(name: &str) -> Scratch {
     let d = std::env::temp_dir().join(format!("sqldiff-dist-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
-    d
+    Scratch(d)
 }
 
 /// Runs `bin` with no user config of its own: an empty home, no $SQLDIFF_CONFIG.
