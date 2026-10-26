@@ -371,3 +371,176 @@ fn functions_that_never_return_null_still_differ_from_null() {
     assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
     assert!(edit_witness(&r).contains("format("), "{}", edit_witness(&r));
 }
+
+fn edit_differents(r: &Report) -> Vec<String> {
+    r.findings
+        .iter()
+        .filter(|f| f.rule == "equiv.edit" && f.verdict == Verdict::Different)
+        .map(|f| f.witness.clone())
+        .collect()
+}
+
+fn tsql_out(body: &str) -> String {
+    format!("CREATE PROCEDURE dbo.O @p INT, @x INT OUTPUT AS BEGIN {body} END")
+}
+
+// Two edits that make up for each other: each one alone has a witness, but
+// the witness gives the second statement the same @x on both sides although
+// the first changed statement set it differently. Both return (p+1)*2.
+#[test]
+fn compensating_edits_are_not_different() {
+    let a = tsql_out("SET @x = @p + 1; SET @x = @x * 2;");
+    let b = tsql_out("SET @x = @p + 2; SET @x = (@x - 1) * 2;");
+    let r = run(&a, &b, T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
+// The same two edits, but they do not make up for each other: (p+1)*2 vs
+// (p+1)*3. The edits are only judged together, so the pair stays unknown
+// rather than being called different from a per-statement witness; it is
+// never equal.
+#[test]
+fn dependent_edits_that_really_differ_are_never_equal() {
+    let a = tsql_out("SET @x = @p + 1; SET @x = @x * 2;");
+    let b = tsql_out("SET @x = @p + 2; SET @x = (@x - 1) * 3;");
+    let r = run(&a, &b, T);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+}
+
+// Edits that do not feed each other keep their witnesses.
+#[test]
+fn independent_edits_keep_their_witnesses() {
+    let p = |k: u32, m: u32| {
+        format!(
+            "CREATE PROCEDURE dbo.O @p INT, @q INT, @x INT OUTPUT, @y INT OUTPUT AS
+             BEGIN
+               SET @x = @p + {k};
+               SET @y = @q * {m};
+             END"
+        )
+    };
+    let r = run(&p(1, 2), &p(2, 3), T);
+    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(edit_differents(&r).len(), 2, "{:#?}", r.findings);
+}
+
+// One edit after an unchanged assignment still has a witness.
+#[test]
+fn edit_after_unchanged_code_keeps_its_witness() {
+    let a = tsql_out("SET @x = @p + 1; SET @x = @x * 2;");
+    let b = tsql_out("SET @x = @p + 1; SET @x = @x * 3;");
+    let r = run(&a, &b, T);
+    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(edit_differents(&r).len(), 1, "{:#?}", r.findings);
+}
+
+// A changed condition on the way to the edit reads a value an earlier
+// change set.
+#[test]
+fn guard_fed_by_an_earlier_change_is_not_a_witness() {
+    let a = tsql_out("SET @x = @p + 1; IF @x > 3 SET @x = @x * 2;");
+    let b = tsql_out("SET @x = @p + 2; IF @x > 3 SET @x = (@x - 1) * 2;");
+    let r = run(&a, &b, T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
+// The earlier change reaches the edit through an unchanged statement.
+#[test]
+fn change_reaching_the_edit_through_unchanged_code() {
+    let a = tsql_out("DECLARE @t INT; SET @t = @p + 1; SET @x = @t; SET @x = @x * 2;");
+    let b = tsql_out("DECLARE @t INT; SET @t = @p + 2; SET @x = @t; SET @x = (@x - 1) * 2;");
+    let r = run(&a, &b, T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
+// Compensation through a table: the first change writes the rows the
+// second one reads.
+#[test]
+fn compensating_edits_through_a_table() {
+    let p = |k: u32, sel: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.bump @id INT AS
+             BEGIN
+               UPDATE dbo.item SET price = price + {k} WHERE item_id = @id;
+               SELECT {sel} FROM dbo.item WHERE item_id = @id;
+             END"
+        )
+    };
+    let r = run(&p(1, "price"), &p(2, "price - 1"), T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
+// The same through a T-SQL table variable.
+#[test]
+fn compensating_edits_through_a_table_variable() {
+    let a = tsql_out(
+        "DECLARE @t TABLE (v INT); INSERT INTO @t VALUES (@p + 1); SELECT @x = v * 2 FROM @t;",
+    );
+    let b = tsql_out(
+        "DECLARE @t TABLE (v INT); INSERT INTO @t VALUES (@p + 2); SELECT @x = (v - 1) * 2 FROM @t;",
+    );
+    let r = run(&a, &b, T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
+// Inside a loop, a change later in the body feeds an edit earlier in the
+// body on the next iteration.
+#[test]
+fn compensating_edits_in_a_loop() {
+    let a = tsql_out(
+        "DECLARE @i INT = 0; SET @x = 0;
+         WHILE @i < @p BEGIN SET @x = @x + 2; SET @i = @i + 1; END",
+    );
+    let b = tsql_out(
+        "DECLARE @i INT = 0; SET @x = 0;
+         WHILE @i < @p BEGIN SET @x = @x + 1; SET @i = @i + 1; SET @x = @x + 1; END",
+    );
+    let r = run(&a, &b, T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
+// PL/pgSQL: the same compensating pair.
+#[test]
+fn compensating_edits_plpgsql() {
+    let f = |first: &str, second: &str| {
+        format!(
+            "CREATE FUNCTION o(p integer) RETURNS integer LANGUAGE plpgsql AS $$
+             DECLARE x integer;
+             BEGIN
+               x := {first};
+               x := {second};
+               RETURN x;
+             END $$;"
+        )
+    };
+    let r = run(&f("p + 1", "x * 2"), &f("p + 2", "(x - 1) * 2"), P);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    let r = run(&f("p + 1", "x * 2"), &f("p + 1", "x * 3"), P);
+    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+}
+
+// A parameter default that changes together with the body code that reads
+// the parameter: the "caller leaves it out" witness does not hold.
+#[test]
+fn default_change_with_compensating_body_change() {
+    let a = "CREATE PROCEDURE dbo.D @p INT = 1, @x INT OUTPUT AS BEGIN SET @x = @p + 1; END";
+    let b = "CREATE PROCEDURE dbo.D @p INT = 2, @x INT OUTPUT AS BEGIN SET @x = @p; END";
+    let r = run(a, b, T);
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.verdict == Verdict::Different && f.witness.contains("leaves out")),
+        "{:#?}",
+        r.findings
+    );
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
