@@ -318,6 +318,23 @@ fn type_defaults_follow_tsql() {
     assert!(has_rule(&c.units[0], "ASM-FRACTIONAL-SECONDS"));
 }
 
+/// PostgreSQL rounds a seventh fractional digit of a date and time literal
+/// (the SQL Server period end becomes 10000-01-01 00:00:00); six are kept.
+#[test]
+fn seven_digit_time_literals_are_noted() {
+    let c = tsql("SELECT k FROM t WHERE e = '9999-12-31 23:59:59.9999999';");
+    assert!(has_rule(&c.units[0], "ASM-LITERAL-FRACTION"));
+    for src in [
+        "SELECT k FROM t WHERE e = '9999-12-31 23:59:59.999999';",
+        "SELECT k FROM t WHERE e = 'abc.1234567';",
+    ] {
+        assert!(
+            !has_rule(&tsql(src).units[0], "ASM-LITERAL-FRACTION"),
+            "{src}"
+        );
+    }
+}
+
 #[test]
 fn alter_procedure_notes_the_overload_risk() {
     let src = "ALTER PROCEDURE dbo.q @a int AS\nBEGIN\n  DELETE FROM t WHERE id = @a;\nEND\n";
