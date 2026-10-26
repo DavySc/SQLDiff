@@ -1,0 +1,878 @@
+//! Review mode: a converted tree's review queue, one item at a time, with
+//! the decisions people make recorded in the tree's ledger.
+//!
+//! `sqldiff-gui review SRC OUT --to D` converts SRC in memory the way
+//! `sqldiff convert` does (`sqldiff_convert::tree`), applies
+//! `OUT/review-decisions.jsonl` and ranks what is left (`queue::build`). The
+//! page shows the queue by tier and, per item, the source and the converted
+//! output side by side with the rules' notes and the engine's findings.
+//!
+//! Its actions append records to the ledger and nothing else: OUT's
+//! converted files are never written. Every record is built here: `by` is
+//! always `human` (the page cannot say otherwise; unknown fields are
+//! refused), the author is the name the page sends, and the hashes are those
+//! of the input and of the conversion's output (`Conversion::output`, before
+//! the status lines are added), which is what `review::review_file` compares
+//! against. A record is only written when it applies to the unit as the
+//! server sees it now: the page sends the hashes it showed, and when the
+//! file changed since, nothing is written.
+//!
+//! After every action the sources are read again and the ledger applied
+//! again, so the queue always reflects the files and the ledger as they are.
+//! The tree is converted again whenever a source file changed; while none
+//! did, the previous conversion is kept, since converting the same files with
+//! the same options gives the same conversion.
+//!
+//! - `GET /`: the page
+//! - `GET /api/state[?all=1]`: queue, ledger summary, warnings (`all` adds tier 6)
+//! - `GET /api/item?key=K[&all=1]`: one queue item in detail
+//! - `GET /api/unit?path=P&unit=U`: one unit in detail (also reviewed ones)
+//! - `GET /api/file?path=P&side=in|out`: a whole input, or its conversion
+//! - `POST /api/record`: append records (see [`RecordRequest`])
+//! - `POST /api/refresh`: read the sources and the ledger again
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+use sqldiff_convert::queue::{self, Instances, Item, Kind};
+use sqldiff_convert::review::{self, By, Record, State};
+use sqldiff_convert::tree::{self, Input, Tree, UnitReviewReport};
+use sqldiff_convert::{Status, Unit};
+
+use crate::server::{
+    allowed_hosts, bad, json, not_found, read_request, respond, Request, Response,
+};
+
+/// The review page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`
+/// and convert mode's highlighter at `/*__SQLDIFF_LEXER__*/`.
+pub const REVIEW_HTML: &str = include_str!("../assets/review.html");
+
+/// What to review.
+pub struct Setup {
+    pub tree: tree::Args,
+    /// The converted tree: where the ledger is, and what `sqldiff convert` wrote.
+    pub out: PathBuf,
+    /// `instance-report.json`, or the directory holding it.
+    pub instances: Option<PathBuf>,
+}
+
+/// The tree as last read and converted, with the ledger applied.
+struct Loaded {
+    inputs: Vec<Input>,
+    unreadable: Vec<String>,
+    tree: Tree,
+    /// Per file (report order): unit ids, in the conversion's unit order.
+    ids: Vec<Vec<String>>,
+    instances: Option<Instances>,
+    /// Ledger lines that were not applied, with why.
+    not_applied: Vec<String>,
+    /// Files in OUT that differ from what this conversion writes (or are missing).
+    out_differs: Vec<String>,
+    /// Milliseconds the last conversion took, and whether this read converted.
+    convert_ms: f64,
+    converted: bool,
+}
+
+pub struct Review {
+    setup: Setup,
+    loaded: Loaded,
+}
+
+/// A queue item as the page lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListedItem {
+    #[serde(flatten)]
+    pub item: Item,
+    /// For a unit: the assumptions still open on it (bulk accept offers these).
+    pub open_assumptions: Vec<String>,
+}
+
+/// A unit the ledger says is reviewed: accepted in review, never "converted".
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewedUnit {
+    pub path: String,
+    pub unit: String,
+    pub status: Status,
+    pub src_line: usize,
+    /// People whose current approval, acceptance or pick is on it.
+    pub by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StateView {
+    pub from: String,
+    pub to: String,
+    pub src: String,
+    pub out: String,
+    pub ledger_path: String,
+    pub templates: bool,
+    pub files: usize,
+    pub units: usize,
+    pub items: Vec<ListedItem>,
+    pub tiers: BTreeMap<u8, usize>,
+    pub tier_labels: BTreeMap<u8, &'static str>,
+    /// Units reviewed by people (not in the queue).
+    pub reviewed: Vec<ReviewedUnit>,
+    /// Whether an instance report was read.
+    pub instances: bool,
+    /// Whether tier 6 (plainly converted units nobody approved) is listed.
+    pub all: bool,
+    pub records: usize,
+    pub not_applied: Vec<String>,
+    /// Decisions on units that no longer exist, per file.
+    pub orphaned: usize,
+    /// Units with a decision that no longer applies.
+    pub outdated: usize,
+    pub out_differs: Vec<String>,
+    pub unreadable: Vec<String>,
+    pub convert_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteView {
+    pub status: Status,
+    pub rule: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FindingView {
+    /// `diff` (the engine's diff of input against output) or `output` (the
+    /// output checked on its own).
+    pub from: &'static str,
+    pub rule: String,
+    pub verdict: sqldiff_core::Verdict,
+    pub severity: sqldiff_core::Severity,
+    pub witness: String,
+    pub assumptions: Vec<String>,
+}
+
+/// One unit, everything the page shows about it and what it may record.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnitView {
+    pub path: String,
+    pub unit: String,
+    pub status: Status,
+    /// The engine's part of the status.
+    pub checked: Status,
+    /// 1-based lines of the unit in the input and in the conversion's output
+    /// (without status lines), and its first line in the file OUT holds.
+    pub src: (usize, usize),
+    pub out: (usize, usize),
+    pub written_line: usize,
+    pub notes: Vec<NoteView>,
+    pub findings: Vec<FindingView>,
+    pub review: Option<UnitReviewReport>,
+    /// What the page sends back with an action.
+    pub input_hash: String,
+    pub output_hash: String,
+    /// Rules that `accept` / `pick` may name.
+    pub assumptions: Vec<String>,
+    pub decisions: Vec<String>,
+    /// Why `approve` is refused, when it is.
+    pub approve_blocked: Option<String>,
+    /// Instances woven from this file's template, and those not converted.
+    pub instances: usize,
+    pub failing_instances: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ItemView {
+    pub item: Item,
+    /// The unit itself (kind `unit`), or each unit a missing object stands for.
+    pub units: Vec<UnitView>,
+    /// For a template item, or a unit in a template file: its failing instances.
+    pub failing_instances: Vec<(String, String)>,
+}
+
+/// One unit an action is about, as the page showed it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    pub path: String,
+    pub unit: String,
+    pub input_hash: String,
+    pub output_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    Accept,
+    Pick,
+    Approve,
+    Reject,
+    Comment,
+}
+
+/// `POST /api/record`. There is no `by`: every record is a person's, and a
+/// body that tries to say otherwise is refused.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordRequest {
+    pub action: Action,
+    /// The assumption (`accept`) or decision (`pick`); for `reject` and
+    /// `comment`, optionally the note it is about.
+    #[serde(default)]
+    pub rule: String,
+    /// Why; the comment's text for `comment`.
+    pub reason: String,
+    pub author: String,
+    pub targets: Vec<Target>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordOutcome {
+    /// Records appended.
+    pub written: usize,
+    pub state: StateView,
+}
+
+impl Review {
+    pub fn open(setup: Setup) -> Result<Review, String> {
+        if !setup.out.is_dir() {
+            return Err(format!(
+                "{}: not a directory; give the converted tree `sqldiff convert -o` wrote",
+                setup.out.display()
+            ));
+        }
+        let loaded = load(&setup, None)?;
+        Ok(Review { setup, loaded })
+    }
+
+    pub fn ledger_path(&self) -> PathBuf {
+        self.setup.out.join(review::LEDGER_FILE)
+    }
+
+    /// Reads the sources, the instance report and the ledger again.
+    pub fn refresh(&mut self) -> Result<(), String> {
+        let prev = std::mem::replace(&mut self.loaded, empty());
+        match load(&self.setup, Some(prev)) {
+            Ok(l) => {
+                self.loaded = l;
+                Ok(())
+            }
+            Err(e) => {
+                // Keep nothing stale: the next read starts over.
+                self.loaded = load(&self.setup, None).unwrap_or_else(|_| empty());
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the last refresh converted the tree (else it reused the
+    /// conversion of unchanged sources).
+    pub fn converted_last(&self) -> bool {
+        self.loaded.converted
+    }
+
+    /// The report as `sqldiff convert` would write it now (for tests).
+    pub fn report_json(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(&self.loaded.tree.report).unwrap();
+        if let Some(t) = v.get_mut("totals") {
+            t["seconds"] = serde_json::Value::Null;
+        }
+        if let Some(fs) = v.get_mut("files").and_then(|f| f.as_array_mut()) {
+            for f in fs {
+                f["seconds"] = serde_json::Value::Null;
+            }
+        }
+        v
+    }
+
+    pub fn queue(&self, all: bool) -> queue::Queue {
+        queue::build(
+            &self.loaded.tree.report,
+            self.loaded.instances.as_ref(),
+            all,
+        )
+    }
+
+    pub fn state(&self, all: bool) -> StateView {
+        let l = &self.loaded;
+        let r = &l.tree.report;
+        let q = self.queue(all);
+        let items = q
+            .items
+            .into_iter()
+            .map(|item| {
+                let open_assumptions = match (&item.kind, &item.unit) {
+                    (Kind::Unit, Some(id)) => self
+                        .find(&item.path, id)
+                        .map(|(f, k)| {
+                            open_assumptions(
+                                &l.tree.conversions[f].units[k],
+                                self.unit_review(f, id),
+                            )
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                ListedItem {
+                    item,
+                    open_assumptions,
+                }
+            })
+            .collect();
+        let mut reviewed = Vec::new();
+        let (mut orphaned, mut outdated, mut units) = (0, 0, 0);
+        for f in &r.files {
+            if let Some(fr) = &f.review {
+                orphaned += fr.orphaned.len();
+                outdated += fr.units_outdated;
+            }
+            for u in f.units.iter().chain(&f.converted_units) {
+                units += 1;
+                let Some(rv) = u.review.as_ref().filter(|rv| rv.reviewed) else {
+                    continue;
+                };
+                let mut by: Vec<String> = rv
+                    .decisions
+                    .iter()
+                    .filter(|d| d.current && d.record.by == By::Human)
+                    .filter(|d| {
+                        matches!(
+                            d.record.state,
+                            State::Accepted | State::Picked | State::Approved
+                        )
+                    })
+                    .map(|d| d.record.author.trim().to_string())
+                    .collect();
+                by.sort();
+                by.dedup();
+                reviewed.push(ReviewedUnit {
+                    path: f.path.clone(),
+                    unit: u.id.clone(),
+                    status: u.status,
+                    src_line: u.src_line,
+                    by,
+                });
+            }
+        }
+        reviewed.sort_by(|a, b| a.path.cmp(&b.path).then(a.src_line.cmp(&b.src_line)));
+        StateView {
+            from: r.from.clone(),
+            to: r.to.clone(),
+            src: r.src.clone(),
+            out: self.setup.out.display().to_string(),
+            ledger_path: self.ledger_path().display().to_string(),
+            templates: r.templates,
+            files: r.files.len(),
+            units,
+            items,
+            tiers: q.tiers,
+            tier_labels: (1..=6u8).map(|t| (t, queue::tier_label(t))).collect(),
+            reviewed,
+            instances: q.instances,
+            all,
+            records: r.ledger.as_ref().map_or(0, |x| x.records),
+            not_applied: l.not_applied.clone(),
+            orphaned,
+            outdated,
+            out_differs: l.out_differs.clone(),
+            unreadable: l.unreadable.clone(),
+            convert_ms: l.convert_ms,
+        }
+    }
+
+    /// File index and unit index of a unit, by path and id.
+    fn find(&self, path: &str, unit: &str) -> Option<(usize, usize)> {
+        let f = self.loaded.inputs.iter().position(|i| i.rel == path)?;
+        let k = self.loaded.ids[f].iter().position(|id| id == unit)?;
+        Some((f, k))
+    }
+
+    fn unit_review(&self, f: usize, id: &str) -> Option<&UnitReviewReport> {
+        let fr = &self.loaded.tree.report.files[f];
+        fr.units
+            .iter()
+            .chain(&fr.converted_units)
+            .find(|u| u.id == id)
+            .and_then(|u| u.review.as_ref())
+    }
+
+    /// Instances woven from `path`'s template, and those not converted.
+    fn instances_of(&self, path: &str) -> (usize, Vec<(String, String)>) {
+        let Some(i) = &self.loaded.instances else {
+            return (0, Vec::new());
+        };
+        let n = i
+            .templates
+            .iter()
+            .find(|t| t.path == path)
+            .map_or(0, |t| t.instances);
+        let failing = i
+            .instances
+            .iter()
+            .filter(|x| x.status != "converted" && x.templates.iter().any(|t| t == path))
+            .map(|x| (x.name.clone(), x.status.clone()))
+            .collect();
+        (n, failing)
+    }
+
+    pub fn unit(&self, path: &str, unit: &str) -> Option<UnitView> {
+        let (f, k) = self.find(path, unit)?;
+        let l = &self.loaded;
+        let c = &l.tree.conversions[f];
+        let u = &c.units[k];
+        let fr = &l.tree.report.files[f];
+        let ur = fr
+            .units
+            .iter()
+            .chain(&fr.converted_units)
+            .find(|x| x.id == unit)?;
+        let review = ur.review.clone();
+        let findings = u
+            .findings
+            .iter()
+            .filter_map(|&i| c.report.findings.get(i).map(|x| ("diff", x)))
+            .chain(
+                u.output_findings
+                    .iter()
+                    .filter_map(|&i| c.output_check.findings.get(i).map(|x| ("output", x))),
+            )
+            .map(|(from, x)| FindingView {
+                from,
+                rule: x.rule.clone(),
+                verdict: x.verdict,
+                severity: x.severity,
+                witness: x.witness.clone(),
+                assumptions: x.assumptions.clone(),
+            })
+            .collect();
+        let rules = |s: Status| -> Vec<String> {
+            let mut v: Vec<String> = u
+                .notes
+                .iter()
+                .filter(|n| n.status == s)
+                .map(|n| n.rule.clone())
+                .collect();
+            v.dedup();
+            v
+        };
+        let (instances, failing_instances) = self.instances_of(path);
+        Some(UnitView {
+            path: path.to_string(),
+            unit: unit.to_string(),
+            status: u.status,
+            checked: u.checked,
+            src: (u.src.line, u.src.end_line),
+            out: (u.out.line, u.out.end_line),
+            written_line: ur.out_line,
+            notes: u
+                .notes
+                .iter()
+                .map(|n| NoteView {
+                    status: n.status,
+                    rule: n.rule.clone(),
+                    text: n.text.clone(),
+                })
+                .collect(),
+            findings,
+            approve_blocked: approve_blocked(review.as_ref(), u),
+            review,
+            input_hash: review::file_hash(&l.inputs[f].text),
+            output_hash: review::file_hash(&c.output),
+            assumptions: rules(Status::Assumptions),
+            decisions: rules(Status::Decision),
+            instances,
+            failing_instances,
+        })
+    }
+
+    pub fn item(&self, key: &str, all: bool) -> Option<ItemView> {
+        let item = self.queue(all).items.into_iter().find(|i| i.key == key)?;
+        let units = match (&item.kind, &item.unit) {
+            (Kind::Unit, Some(id)) => self.unit(&item.path, id).into_iter().collect(),
+            (Kind::MissingObject, _) => item
+                .units
+                .iter()
+                .filter_map(|id| {
+                    // The ids are unique per file; the item names only its first file.
+                    self.loaded
+                        .inputs
+                        .iter()
+                        .enumerate()
+                        .find(|(f, _)| self.loaded.ids[*f].iter().any(|x| x == id))
+                        .and_then(|(_, i)| self.unit(&i.rel, id))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let failing_instances = if item.kind == Kind::Template {
+            item.failing_instances.clone()
+        } else {
+            self.instances_of(&item.path).1
+        };
+        Some(ItemView {
+            item,
+            units,
+            failing_instances,
+        })
+    }
+
+    /// A whole input file (`side` `in`) or its conversion (`out`), as the
+    /// unit lines count them.
+    pub fn file(&self, path: &str, side: &str) -> Option<String> {
+        let f = self.loaded.inputs.iter().position(|i| i.rel == path)?;
+        match side {
+            "in" => Some(self.loaded.inputs[f].text.clone()),
+            "out" => Some(self.loaded.tree.conversions[f].output.clone()),
+            _ => None,
+        }
+    }
+
+    /// Checks a request against the tree as it is now and appends its
+    /// records, all or none. Reads everything again first and after.
+    pub fn record(&mut self, req: RecordRequest, at: &str) -> Result<usize, String> {
+        self.refresh()?;
+        let records = self.build(&req, at)?;
+        let path = self.ledger_path();
+        let mut text = String::new();
+        // A ledger written by hand may lack its final newline.
+        if let Ok(old) = std::fs::read(&path) {
+            if !old.is_empty() && !old.ends_with(b"\n") {
+                text.push('\n');
+            }
+        }
+        for r in &records {
+            text.push_str(&serde_json::to_string(r).map_err(|e| e.to_string())?);
+            text.push('\n');
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        file.write_all(text.as_bytes())
+            .and_then(|_| file.flush())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        self.refresh()?;
+        Ok(records.len())
+    }
+
+    fn build(&self, req: &RecordRequest, at: &str) -> Result<Vec<Record>, String> {
+        let author = req.author.trim();
+        if author.is_empty() {
+            return Err("give your name first: every decision says who made it".into());
+        }
+        if req.reason.trim().is_empty() {
+            return Err(match req.action {
+                Action::Comment => "a comment needs text".into(),
+                _ => "say why: every decision needs a reason".into(),
+            });
+        }
+        if req.targets.is_empty() {
+            return Err("no unit selected".into());
+        }
+        if req.targets.len() > 1 && req.action != Action::Accept {
+            return Err(
+                "only accepting an assumption can be done for several units at once".into(),
+            );
+        }
+        let state = match req.action {
+            Action::Accept => State::Accepted,
+            Action::Pick => State::Picked,
+            Action::Approve => State::Approved,
+            Action::Reject => State::Rejected,
+            Action::Comment => State::Commented,
+        };
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for t in &req.targets {
+            if !seen.insert((t.path.as_str(), t.unit.as_str())) {
+                return Err(format!("{} {}: listed twice", t.path, t.unit));
+            }
+            let where_ = format!("{} ({})", t.path, t.unit);
+            let (f, k) = self.find(&t.path, &t.unit).ok_or_else(|| {
+                format!("{where_}: no such unit now; the file changed since the page showed it")
+            })?;
+            let input = &self.loaded.inputs[f].text;
+            let c = &self.loaded.tree.conversions[f];
+            let (ih, oh) = (review::file_hash(input), review::file_hash(&c.output));
+            if ih != t.input_hash || oh != t.output_hash {
+                return Err(format!(
+                    "{where_}: the file changed since the page showed it; look at it again"
+                ));
+            }
+            let u = &c.units[k];
+            let rule = req.rule.trim();
+            let note = |s: Status| u.notes.iter().any(|n| n.rule == rule && n.status == s);
+            match req.action {
+                Action::Accept if !note(Status::Assumptions) => {
+                    return Err(format!(
+                        "{where_}: `{rule}` is not an assumption of this unit"
+                    ))
+                }
+                Action::Pick if !note(Status::Decision) => {
+                    return Err(format!("{where_}: `{rule}` is not a decision of this unit"))
+                }
+                Action::Approve => {
+                    if !rule.is_empty() {
+                        return Err("an approval is about the whole unit and names no rule".into());
+                    }
+                    if let Some(why) = approve_blocked(self.unit_review(f, &t.unit), u) {
+                        return Err(format!("{where_}: {why}"));
+                    }
+                }
+                Action::Reject | Action::Comment
+                    if !rule.is_empty() && !u.notes.iter().any(|n| n.rule == rule) =>
+                {
+                    return Err(format!("{where_}: the unit has no note `{rule}`"))
+                }
+                _ => {}
+            }
+            // Built from JSON so fields the ledger gains later keep their defaults.
+            let r: Record = serde_json::from_value(serde_json::json!({
+                "unit": t.unit,
+                "path": t.path,
+                "rule": rule,
+                "state": state,
+                "by": By::Human,
+                "author": author,
+                "reason": req.reason.trim(),
+                "at": at,
+                "input_hash": ih,
+                "output_hash": oh,
+            }))
+            .map_err(|e| e.to_string())?;
+            review::allowed(&r).map_err(|e| format!("{where_}: {e}"))?;
+            out.push(r);
+        }
+        Ok(out)
+    }
+}
+
+/// Assumptions of a unit nobody accepted yet (all of them without a review).
+fn open_assumptions(u: &Unit, rv: Option<&UnitReviewReport>) -> Vec<String> {
+    let mut v: Vec<String> = u
+        .notes
+        .iter()
+        .filter(|n| n.status == Status::Assumptions)
+        .map(|n| n.rule.clone())
+        .filter(|r| rv.map_or(true, |rv| rv.open.contains(r)))
+        .collect();
+    v.dedup();
+    v
+}
+
+/// An approval says the output is right as written; it cannot stand in for
+/// fixing what the engine found, so it is refused while anything
+/// undischargeable is on the unit.
+fn approve_blocked(rv: Option<&UnitReviewReport>, u: &Unit) -> Option<String> {
+    let left: Vec<String> = match rv {
+        Some(rv) => rv.undischargeable.clone(),
+        None if u.status >= Status::Unproven || u.checked != Status::Converted => {
+            vec![u.status.label().to_string()]
+        }
+        None => Vec::new(),
+    };
+    (!left.is_empty()).then(|| {
+        format!(
+            "cannot be approved while {} is on it: an approval never discharges a difference, a refusal or what the engine could not prove; fix the output and convert again",
+            left.join(", ")
+        )
+    })
+}
+
+fn empty() -> Loaded {
+    Loaded {
+        inputs: Vec::new(),
+        unreadable: Vec::new(),
+        tree: Tree {
+            report: tree::Report {
+                from: String::new(),
+                to: String::new(),
+                src: String::new(),
+                out: None,
+                catalogs: false,
+                templates: false,
+                files: Vec::new(),
+                unreadable: Vec::new(),
+                totals: Default::default(),
+                ledger: None,
+            },
+            outputs: Vec::new(),
+            conversions: Vec::new(),
+        },
+        ids: Vec::new(),
+        instances: None,
+        not_applied: Vec::new(),
+        out_differs: Vec::new(),
+        convert_ms: 0.0,
+        converted: false,
+    }
+}
+
+/// Reads and converts the tree (reusing `prev`'s conversion when no source
+/// changed), applies the ledger in OUT and reads the instance report.
+fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
+    let instances = match &s.instances {
+        Some(p) => Some(queue::read_instances(p)?),
+        None => None,
+    };
+    let (inputs, unreadable) = tree::read(&s.tree)?;
+    let same = prev.as_ref().is_some_and(|p| {
+        p.unreadable == unreadable
+            && p.inputs.len() == inputs.len()
+            && p.inputs
+                .iter()
+                .zip(&inputs)
+                .all(|(a, b)| a.rel == b.rel && a.text == b.text)
+    });
+    let (mut t, convert_ms, converted) = match prev {
+        Some(p) if same => {
+            let mut t = p.tree;
+            // Back to the conversion as it came from the engine.
+            for f in &mut t.report.files {
+                f.review = None;
+                for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
+                    u.review = None;
+                }
+            }
+            t.report.ledger = None;
+            (t, p.convert_ms, false)
+        }
+        _ => {
+            let started = Instant::now();
+            let t = tree::convert(&s.tree, &inputs, unreadable.clone(), Some(&s.out))?;
+            (t, started.elapsed().as_secs_f64() * 1000.0, true)
+        }
+    };
+    let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
+    let ids = inputs
+        .iter()
+        .zip(&t.conversions)
+        .map(|(i, c)| review::unit_ids(&i.rel, &i.text, c))
+        .collect();
+    let out_differs = t
+        .report
+        .files
+        .iter()
+        .zip(&t.outputs)
+        .filter(|(f, text)| {
+            std::fs::read_to_string(s.out.join(&f.path)).map_or(true, |on_disk| on_disk != **text)
+        })
+        .map(|(f, _)| f.path.clone())
+        .collect();
+    Ok(Loaded {
+        inputs,
+        unreadable,
+        tree: t,
+        ids,
+        instances,
+        not_applied,
+        out_differs,
+        convert_ms,
+        converted,
+    })
+}
+
+/// The page with a payload embedded.
+pub fn page(state: &StateView) -> String {
+    let payload = serde_json::json!({
+        "state": state,
+        "dialects": sqldiff_core::Dialect::ALL.iter().map(|d| serde_json::json!({
+            "id": d.id(), "name": d.display_name(), "lex": crate::convert::LexInfo::of(*d),
+        })).collect::<Vec<_>>(),
+        "keywords": crate::styled_keywords(),
+    });
+    let json = serde_json::to_string(&payload)
+        .unwrap()
+        .replace("</", "<\\/");
+    REVIEW_HTML
+        .replace("/*__SQLDIFF_LEXER__*/", lexer())
+        .replace(
+            "/*__SQLDIFF_PAYLOAD__*/null",
+            &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
+        )
+}
+
+/// Convert mode's highlighter (`lexSql`, `hlLines` and what they need), so
+/// both pages colour SQL the same way; `tests/highlight.rs` checks it
+/// against the engine.
+fn lexer() -> &'static str {
+    let page = crate::convert::CONVERT_HTML;
+    let start = page
+        .find("const KEYWORDS = ")
+        .expect("lexer in convert.html");
+    let end = page[start..]
+        .find("\nfunction render(")
+        .map(|e| start + e)
+        .expect("end of the lexer in convert.html");
+    &page[start..end]
+}
+
+fn param(query: &str, key: &str) -> Option<String> {
+    crate::server::param(query, key)
+}
+
+fn route(r: &Mutex<Review>, req: &Request) -> Response {
+    let all = param(&req.query, "all").is_some_and(|v| v != "0");
+    let mut s = r.lock().unwrap_or_else(|e| e.into_inner());
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => ("200 OK", "text/html; charset=utf-8", page(&s.state(all))),
+        ("GET", "/api/state") => json(&s.state(all)),
+        ("GET", "/api/item") => match param(&req.query, "key").and_then(|k| s.item(&k, all)) {
+            Some(v) => json(&v),
+            None => not_found(),
+        },
+        ("GET", "/api/unit") => match (param(&req.query, "path"), param(&req.query, "unit")) {
+            (Some(p), Some(u)) => match s.unit(&p, &u) {
+                Some(v) => json(&v),
+                None => not_found(),
+            },
+            _ => bad("give path and unit"),
+        },
+        ("GET", "/api/file") => match (param(&req.query, "path"), param(&req.query, "side")) {
+            (Some(p), Some(side)) => match s.file(&p, &side) {
+                Some(t) => ("200 OK", "text/plain; charset=utf-8", t),
+                None => not_found(),
+            },
+            _ => bad("give path and side=in|out"),
+        },
+        ("POST", "/api/record") => match serde_json::from_slice::<RecordRequest>(&req.body) {
+            Ok(rq) => match s.record(rq, &sqldiff_review::time::now()) {
+                Ok(written) => json(&RecordOutcome {
+                    written,
+                    state: s.state(all),
+                }),
+                Err(e) => ("409 Conflict", "text/plain", e),
+            },
+            Err(e) => bad(e),
+        },
+        ("POST", "/api/refresh") => match s.refresh() {
+            Ok(()) => json(&s.state(all)),
+            Err(e) => ("500 Internal Server Error", "text/plain", e),
+        },
+        _ => not_found(),
+    }
+}
+
+pub fn serve(listener: TcpListener, review: Review, extra_hosts: &[String]) -> std::io::Result<()> {
+    let review = Arc::new(Mutex::new(review));
+    let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let review = Arc::clone(&review);
+        let hosts = Arc::clone(&hosts);
+        std::thread::spawn(move || {
+            let _ = handle(stream, &review, &hosts);
+        });
+    }
+    Ok(())
+}
+
+fn handle(mut stream: TcpStream, review: &Mutex<Review>, hosts: &[String]) -> std::io::Result<()> {
+    let req = match read_request(&stream, hosts)? {
+        Ok(r) => r,
+        Err(res) => return respond(&mut stream, res),
+    };
+    let res = route(review, &req);
+    respond(&mut stream, res)
+}

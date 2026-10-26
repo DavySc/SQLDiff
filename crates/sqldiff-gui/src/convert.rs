@@ -107,7 +107,7 @@ pub struct LexInfo {
 }
 
 impl LexInfo {
-    fn of(d: Dialect) -> Self {
+    pub(crate) fn of(d: Dialect) -> Self {
         let p = d.lexical();
         LexInfo {
             nested_block_comments: p.nested_block_comments,
