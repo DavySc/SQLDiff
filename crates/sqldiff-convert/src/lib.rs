@@ -20,7 +20,10 @@ mod template;
 mod tok;
 mod tsql;
 
-pub use template::{convert_template, TemplateInfo};
+pub use template::{
+    check_template, convert_template, rewrite_template, template_fragment, StandIns, TemplateDraft,
+    TemplateInfo,
+};
 
 /// How far a converted unit can be trusted, from best to worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]

@@ -10,6 +10,11 @@
 //! converted gets a `-- [sqldiff: <status>]` comment line above it, so a
 //! reviewer reading only the output still sees it. The report
 //! (`conversion-report.json` and `.md`) points into the annotated files.
+//!
+//! With a template mode every file is a generator template: each is
+//! converted through its fragment (`sqldiff_convert::rewrite_template`),
+//! with one set of stand-in names for the whole tree so the catalogs bind
+//! across files, and the output tree holds templates for the target.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -19,9 +24,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use sqldiff_convert::{Conversion, Status};
+use sqldiff_convert::{Conversion, StandIns, Status};
 use sqldiff_core::catalog::{ddl, Catalog};
 use sqldiff_core::{Dialect, Options};
+use sqldiff_source::compose;
+use sqldiff_syntax::template::Template;
 
 pub struct Args {
     pub src: PathBuf,
@@ -31,7 +38,23 @@ pub struct Args {
     pub jobs: Option<usize>,
     pub overwrite: bool,
     pub no_catalog: bool,
+    /// Every file is a template.
+    pub template: Option<TemplateMode>,
+    /// File extensions to read, without the dot, any letter case.
+    pub extensions: Vec<String>,
 }
+
+/// How templates are read: the placeholder rules of `diff --template`.
+pub struct TemplateMode {
+    pub placeholders: compose::Placeholders,
+    /// `--parameter` names; when given, only these (and the pack's
+    /// `known_parameters`) are placeholders.
+    pub parameters: Option<std::collections::BTreeSet<String>>,
+}
+
+/// The rule id of the assumption every unit of a template with generator
+/// directives carries (`sqldiff_convert::check_template`).
+const DIRECTIVE: &str = "ASM-TEMPLATE-DIRECTIVE";
 
 /// One input file.
 struct Input {
@@ -51,6 +74,9 @@ struct FileReport {
     units: Vec<UnitReport>,
     /// Output findings that point into no unit.
     unplaced: Vec<String>,
+    /// For a template: what it holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<sqldiff_convert::TemplateInfo>,
 }
 
 #[derive(Serialize)]
@@ -70,6 +96,8 @@ struct Report {
     src: String,
     out: String,
     catalogs: bool,
+    /// Whether the files were read as templates.
+    templates: bool,
     files: Vec<FileReport>,
     /// Files that could not be read as text.
     unreadable: Vec<String>,
@@ -95,56 +123,23 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
             a.to.display_name()
         ));
     }
-    let (inputs, unreadable) = collect(&a.src)?;
+    let (inputs, unreadable) = collect(&a.src, &a.extensions)?;
     if inputs.is_empty() {
-        return Err(format!("{}: no .sql files", a.src.display()));
+        return Err(format!(
+            "{}: no files with extension {}",
+            a.src.display(),
+            a.extensions.join(", ")
+        ));
     }
     prepare_out(&a)?;
     let jobs = a
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
         .max(1);
-
-    // Catalogs from the whole tree, so names defined in other files bind:
-    // the source catalog also lets the rules see other files' procedures.
-    let source = (!a.no_catalog).then(|| {
-        Arc::new(catalog(
-            inputs.iter().map(|i| i.text.as_str()),
-            a.from,
-            &a.src,
-        ))
-    });
-    // Pass 1: rules only.
-    let drafts = parallel(jobs, &inputs, |i| {
-        sqldiff_convert::rewrite_in(&i.text, a.from, a.to, source.as_deref())
-    });
-    let mut opts = Options::default();
-    if let Some(source) = source {
-        opts.facts_a = vec![source];
-        opts.facts_b = vec![Arc::new(catalog(
-            drafts.iter().map(|d| d.output()),
-            a.to,
-            &a.out,
-        ))];
-    }
-    // Pass 2: check every draft.
-    let work: Vec<(&Input, sqldiff_convert::Draft)> = inputs.iter().zip(drafts).collect();
-    let work: Vec<std::sync::Mutex<Option<(&Input, sqldiff_convert::Draft)>>> = work
-        .into_iter()
-        .map(|w| std::sync::Mutex::new(Some(w)))
-        .collect();
-    let done = AtomicUsize::new(0);
-    let total = work.len();
-    let results = parallel(jobs, &work, |w| {
-        let (input, draft) = w.lock().unwrap().take().unwrap();
-        let t = Instant::now();
-        let c = sqldiff_convert::check(&input.text, draft, &opts);
-        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 50 == 0 || n == total {
-            eprintln!("checked {n}/{total}");
-        }
-        (c, t.elapsed().as_secs_f64())
-    });
+    let results = match &a.template {
+        None => convert_files(&a, &inputs, jobs),
+        Some(tm) => convert_templates(&a, tm, &inputs, jobs)?,
+    };
 
     let mut files = Vec::new();
     for (input, (c, secs)) in inputs.iter().zip(results) {
@@ -163,6 +158,7 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
         src: a.src.display().to_string(),
         out: a.out.display().to_string(),
         catalogs: !a.no_catalog,
+        templates: a.template.is_some(),
         totals: totals(&files, started.elapsed().as_secs_f64()),
         files,
         unreadable,
@@ -189,13 +185,140 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     ))
 }
 
-/// Every `.sql` file under `src` (or `src` itself), sorted by path.
-fn collect(src: &Path) -> Result<(Vec<Input>, Vec<String>), String> {
+/// Converts plain SQL files: rules with the source catalog of the whole
+/// tree, then a check of every draft against both trees' catalogs.
+fn convert_files(a: &Args, inputs: &[Input], jobs: usize) -> Vec<(Conversion, f64)> {
+    // Catalogs from the whole tree, so names defined in other files bind:
+    // the source catalog also lets the rules see other files' procedures.
+    let source = (!a.no_catalog).then(|| {
+        Arc::new(catalog(
+            inputs.iter().map(|i| i.text.as_str()),
+            a.from,
+            &a.src,
+            None,
+        ))
+    });
+    // Pass 1: rules only.
+    let drafts = parallel(jobs, inputs, |i| {
+        sqldiff_convert::rewrite_in(&i.text, a.from, a.to, source.as_deref())
+    });
+    let mut opts = Options::default();
+    if let Some(source) = source {
+        opts.facts_a = vec![source];
+        opts.facts_b = vec![Arc::new(catalog(
+            drafts.iter().map(|d| d.output()),
+            a.to,
+            &a.out,
+            None,
+        ))];
+    }
+    // Pass 2: check every draft.
+    let work = slots(inputs.iter().zip(drafts));
+    let progress = Progress::new(work.len());
+    parallel(jobs, &work, |w| {
+        let (input, draft) = w.lock().unwrap().take().unwrap();
+        let t = Instant::now();
+        let c = sqldiff_convert::check(&input.text, draft, &opts);
+        progress.tick();
+        (c, t.elapsed().as_secs_f64())
+    })
+}
+
+/// Converts templates: every file is split by the placeholder rules, and
+/// all fragments share one set of stand-in names, so a table a template
+/// creates as `<%SCHEMA%>.<%TABLE%>` binds in the templates that use it.
+fn convert_templates(
+    a: &Args,
+    tm: &TemplateMode,
+    inputs: &[Input],
+    jobs: usize,
+) -> Result<Vec<(Conversion, f64)>, String> {
+    let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
+    for i in inputs {
+        let (t, basis) = tm
+            .placeholders
+            .parse(&i.text, a.from, tm.parameters.as_ref());
+        if t.print() != i.text {
+            return Err(format!(
+                "{}: round trip failed: template segments differ from the file",
+                i.rel
+            ));
+        }
+        parsed.push((t, basis));
+    }
+    let stand = StandIns::new(parsed.iter().map(|(t, _)| t));
+    let stem = Some(stand.stem());
+    let source = (!a.no_catalog).then(|| {
+        let frags: Vec<String> = parsed
+            .iter()
+            .map(|(t, _)| sqldiff_convert::template_fragment(t, &stand))
+            .collect();
+        Arc::new(catalog(
+            frags.iter().map(String::as_str),
+            a.from,
+            &a.src,
+            stem,
+        ))
+    });
+    let drafts = parallel(jobs, &parsed, |(t, _)| {
+        sqldiff_convert::rewrite_template(t, a.from, a.to, &stand, source.as_deref())
+    });
+    let mut opts = Options::default();
+    if let Some(source) = source {
+        opts.facts_a = vec![source];
+        opts.facts_b = vec![Arc::new(catalog(
+            drafts.iter().map(|d| d.output()),
+            a.to,
+            &a.out,
+            stem,
+        ))];
+    }
+    let work = slots(parsed.iter().zip(drafts));
+    let progress = Progress::new(work.len());
+    let delimiters = tm.placeholders.delimiters();
+    Ok(parallel(jobs, &work, |w| {
+        let ((t, basis), draft) = w.lock().unwrap().take().unwrap();
+        let t0 = Instant::now();
+        let c = sqldiff_convert::check_template(t, draft, &stand, &opts, *basis, delimiters);
+        progress.tick();
+        (c, t0.elapsed().as_secs_f64())
+    }))
+}
+
+/// Items handed out once each to the worker threads.
+fn slots<T>(items: impl Iterator<Item = T>) -> Vec<std::sync::Mutex<Option<T>>> {
+    items.map(|w| std::sync::Mutex::new(Some(w))).collect()
+}
+
+struct Progress {
+    done: AtomicUsize,
+    total: usize,
+}
+
+impl Progress {
+    fn new(total: usize) -> Progress {
+        Progress {
+            done: AtomicUsize::new(0),
+            total,
+        }
+    }
+
+    fn tick(&self) {
+        let n = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % 50 == 0 || n == self.total {
+            eprintln!("checked {n}/{}", self.total);
+        }
+    }
+}
+
+/// Every file with one of `extensions` under `src` (or `src` itself),
+/// sorted by path.
+fn collect(src: &Path, extensions: &[String]) -> Result<(Vec<Input>, Vec<String>), String> {
     let mut paths = Vec::new();
     if src.is_file() {
         paths.push(src.to_path_buf());
     } else {
-        walk(src, &mut paths).map_err(|e| format!("{}: {e}", src.display()))?;
+        walk(src, extensions, &mut paths).map_err(|e| format!("{}: {e}", src.display()))?;
     }
     paths.sort();
     let base = if src.is_file() {
@@ -220,7 +343,7 @@ fn collect(src: &Path) -> Result<(Vec<Input>, Vec<String>), String> {
     Ok((inputs, unreadable))
 }
 
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+fn walk(dir: &Path, extensions: &[String], out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let name = e.file_name();
@@ -229,11 +352,13 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         }
         let ty = e.file_type()?;
         if ty.is_dir() {
-            walk(&e.path(), out)?;
+            walk(&e.path(), extensions, out)?;
         } else if ty.is_file()
-            && Path::new(&name)
-                .extension()
-                .is_some_and(|x| x.eq_ignore_ascii_case("sql"))
+            && Path::new(&name).extension().is_some_and(|x| {
+                extensions
+                    .iter()
+                    .any(|e| x.eq_ignore_ascii_case(e.as_str()))
+            })
         {
             out.push(e.path());
         }
@@ -319,14 +444,72 @@ fn parallel<T: Sync, R: Send>(jobs: usize, items: &[T], f: impl Fn(&T) -> R + Sy
         .collect()
 }
 
-fn catalog<'a>(texts: impl Iterator<Item = &'a str>, dialect: Dialect, origin: &Path) -> Catalog {
+/// The objects every text defines. With a stand-in `stem` (templates), an
+/// object whose name holds a stand-in and that more than one file defines
+/// is left out: those files are different instances' tables or routines,
+/// and binding against one of them would be a guess.
+fn catalog<'a>(
+    texts: impl Iterator<Item = &'a str>,
+    dialect: Dialect,
+    origin: &Path,
+    stem: Option<&str>,
+) -> Catalog {
     let mut cat = Catalog {
         origin: origin.display().to_string(),
         ..Catalog::default()
     };
+    let Some(stem) = stem else {
+        for t in texts {
+            let root = sqldiff_syntax::parse(t, dialect).syntax();
+            ddl::load_tree(&mut cat, &root, dialect);
+        }
+        return cat;
+    };
+    let mut per_file: Vec<Catalog> = Vec::new();
     for t in texts {
+        let mut c = Catalog::default();
         let root = sqldiff_syntax::parse(t, dialect).syntax();
-        ddl::load_tree(&mut cat, &root, dialect);
+        ddl::load_tree(&mut c, &root, dialect);
+        per_file.push(c);
+    }
+    let templated = |schema: &Option<String>, name: &str| {
+        let full = format!("{}.{name}", schema.as_deref().unwrap_or("")).to_ascii_lowercase();
+        full.contains(stem).then_some(full)
+    };
+    let mut files: std::collections::HashMap<String, usize> = Default::default();
+    for c in &per_file {
+        let mut names: std::collections::BTreeSet<String> = Default::default();
+        names.extend(
+            c.tables
+                .iter()
+                .filter_map(|t| templated(&t.schema, &t.name)),
+        );
+        names.extend(
+            c.routines
+                .iter()
+                .filter_map(|r| templated(&r.schema, &r.name).map(|n| format!("routine {n}"))),
+        );
+        for n in names {
+            *files.entry(n).or_default() += 1;
+        }
+    }
+    let shared = |key: Option<String>| key.is_some_and(|k| files.get(&k).copied().unwrap_or(0) > 1);
+    for c in per_file {
+        for t in c.tables {
+            if !shared(templated(&t.schema, &t.name)) {
+                cat.put_table(dialect, t);
+            }
+        }
+        for r in c.routines {
+            if !shared(templated(&r.schema, &r.name).map(|n| format!("routine {n}"))) {
+                cat.put_routine(dialect, r);
+            }
+        }
+        for sc in c.schemas {
+            if !cat.schemas.contains(&sc) {
+                cat.schemas.push(sc);
+            }
+        }
     }
     cat
 }
@@ -350,6 +533,12 @@ fn annotate(c: &Conversion) -> (String, Vec<usize>) {
         if u.status == Status::Converted || u.status == Status::NotConverted && refused {
             continue;
         }
+        // The directive assumption is on every unit of the template; it is
+        // said once, at the top of the file.
+        let worst = u.notes.iter().filter(|n| n.status == u.status);
+        if u.status == Status::Assumptions && worst.clone().all(|n| n.rule == DIRECTIVE) {
+            continue;
+        }
         let indent: String = c.output[at..]
             .chars()
             .take_while(|ch| *ch == ' ' || *ch == '\t')
@@ -357,7 +546,7 @@ fn annotate(c: &Conversion) -> (String, Vec<usize>) {
         let why = u
             .notes
             .iter()
-            .filter(|n| n.status == u.status)
+            .filter(|n| n.status == u.status && n.rule != DIRECTIVE)
             .map(|n| n.rule.as_str())
             .collect::<Vec<_>>()
             .join(", ");
@@ -374,6 +563,30 @@ fn annotate(c: &Conversion) -> (String, Vec<usize>) {
     marks.sort_by_key(|m| m.0);
     marks.dedup_by_key(|m| m.0);
     let mut text = String::with_capacity(c.output.len() + marks.len() * 60);
+    let directives = c
+        .template
+        .as_ref()
+        .map(|t| {
+            let mut d: Vec<&str> = Vec::new();
+            for f in &t.special_forms {
+                if !d.contains(&f.as_str()) {
+                    d.push(f);
+                }
+            }
+            d
+        })
+        .unwrap_or_default();
+    let header = !directives.is_empty()
+        && c.units
+            .iter()
+            .any(|u| u.notes.iter().any(|n| n.rule == DIRECTIVE));
+    if header {
+        let _ = writeln!(
+            text,
+            "-- [sqldiff: under assumptions] {DIRECTIVE}: converted without the text of its directives ({}); check the woven instances",
+            directives.join(", ")
+        );
+    }
     let mut last = 0;
     for (at, m) in &marks {
         text.push_str(&c.output[last..*at]);
@@ -386,7 +599,9 @@ fn annotate(c: &Conversion) -> (String, Vec<usize>) {
         .units
         .iter()
         .zip(&starts)
-        .map(|(u, &at)| u.out.line + marks.iter().filter(|m| m.0 <= at).count())
+        .map(|(u, &at)| {
+            u.out.line + usize::from(header) + marks.iter().filter(|m| m.0 <= at).count()
+        })
         .collect();
     (text, lines)
 }
@@ -449,6 +664,7 @@ fn file_report(rel: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileRep
             .filter_map(|&i| c.output_check.findings.get(i))
             .map(|f| format!("{}: {}", f.rule, f.witness))
             .collect(),
+        template: c.template.clone(),
     }
 }
 

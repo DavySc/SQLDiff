@@ -184,6 +184,22 @@ enum Command {
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
+        /// Every file is a template in the `[template]` syntax of the loaded
+        /// packs or config: the output tree holds templates for the target,
+        /// with the placeholders and generator directives kept.
+        #[arg(long)]
+        template: bool,
+        /// With --template: a parameter name (repeatable). Then only these
+        /// and the pack's `known_parameters` are placeholders; any other
+        /// delimited name is SQL, e.g. a quoted `[name]` in T-SQL.
+        #[arg(long = "parameter", value_name = "NAME", requires = "template")]
+        parameters: Vec<String>,
+        /// File extension to convert (repeatable; default: sql). Matched in
+        /// any letter case, without the dot: `--extension sql --extension tpl`.
+        #[arg(long = "extension", value_name = "EXT")]
+        extensions: Vec<String>,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
     },
     /// Review what a branch changed (the pull request workflow): diff every
     /// SQL file changed between the merge base of --base and --head, base
@@ -483,15 +499,43 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             jobs,
             overwrite,
             no_catalog,
-        } => convert_cmd::run(convert_cmd::Args {
-            src,
-            out,
-            from,
-            to,
-            jobs,
-            overwrite,
-            no_catalog,
-        }),
+            template,
+            parameters,
+            extensions,
+            cfg,
+        } => {
+            let template = if template {
+                // The same placeholder rules as `diff --template`.
+                let cfg = cfg.resolve()?;
+                let def = cfg.policy.template.as_ref().ok_or(
+                    "--template needs a [template] syntax: give --pack or a sqldiff.toml with one",
+                )?;
+                Some(convert_cmd::TemplateMode {
+                    placeholders: compose::Placeholders::new(def).map_err(|e| e.0)?,
+                    parameters: (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                })
+            } else {
+                None
+            };
+            convert_cmd::run(convert_cmd::Args {
+                src,
+                out,
+                from,
+                to,
+                jobs,
+                overwrite,
+                no_catalog,
+                template,
+                extensions: if extensions.is_empty() {
+                    vec!["sql".to_string()]
+                } else {
+                    extensions
+                        .into_iter()
+                        .map(|e| e.trim_start_matches('.').to_string())
+                        .collect()
+                },
+            })
+        }
         Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Source(cmd) => source_cmd::run(cmd),

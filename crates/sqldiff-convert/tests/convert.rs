@@ -578,6 +578,88 @@ fn templates_keep_their_placeholders() {
     assert_eq!(&TEMPLATE[u.src.start..u.src.start + 6], "UPDATE");
     assert!(has_rule(u, "ASM-TEMPLATE-PLACEHOLDER"), "{:?}", u.notes);
     assert!(out_of(&c, u).contains("[TABLE]"), "{}", out_of(&c, u));
+    // The include's text was not converted with it: no unit counts as converted.
+    for u in c.units.iter().filter(|u| u.status != Status::NotConverted) {
+        assert!(has_rule(u, "ASM-TEMPLATE-DIRECTIVE"), "{:?}", u.notes);
+        assert_ne!(u.status, Status::Converted);
+    }
+}
+
+#[test]
+fn a_template_without_directives_needs_no_directive_assumption() {
+    let c = convert_angle("UPDATE t SET a = 1;\n");
+    assert!(c
+        .units
+        .iter()
+        .all(|u| !has_rule(u, "ASM-TEMPLATE-DIRECTIVE")));
+    assert_eq!(
+        c.units[0].status,
+        Status::Converted,
+        "{:?}",
+        c.units[0].notes
+    );
+}
+
+#[test]
+fn templates_converted_together_share_stand_ins() {
+    use sqldiff_convert::{template_fragment, StandIns};
+    let a = angle_template("CREATE TABLE <%S%>.<%T%> (id int);\n");
+    let b = angle_template("UPDATE <%T%> SET id = 1; UPDATE <%S%>.<%T%> SET id = 2;\n");
+    let stand = StandIns::new([&a, &b]);
+    let (fa, fb) = (template_fragment(&a, &stand), template_fragment(&b, &stand));
+    let stem = stand.stem();
+    assert_eq!(fa, format!("CREATE TABLE {stem}0z.{stem}1z (id int);\n"));
+    assert_eq!(
+        fb,
+        format!("UPDATE {stem}1z SET id = 1; UPDATE {stem}0z.{stem}1z SET id = 2;\n")
+    );
+}
+
+#[test]
+fn output_check_findings_quote_the_template() {
+    use sqldiff_convert::{check_template, rewrite_template, template_fragment, StandIns};
+    use sqldiff_core::catalog::{ddl, Catalog};
+    use sqldiff_core::composition::PlaceholderBasis;
+    let table = angle_template("CREATE TABLE <%S%>.<%T%> (id int);\n");
+    let proc = angle_template("UPDATE <%S%>.<%T%> SET cost = 1;\n");
+    let stand = StandIns::new([&table, &proc]);
+    let catalog = |text: &str, d: Dialect| {
+        let mut c = Catalog::default();
+        ddl::load_tree(&mut c, &sqldiff_syntax::parse(text, d).syntax(), d);
+        std::sync::Arc::new(c)
+    };
+    let tdraft = rewrite_template(&table, Dialect::Tsql, Dialect::Postgres, &stand, None);
+    let opts = sqldiff_core::Options {
+        facts_a: vec![catalog(&template_fragment(&table, &stand), Dialect::Tsql)],
+        facts_b: vec![catalog(tdraft.output(), Dialect::Postgres)],
+        ..Default::default()
+    };
+    let d = rewrite_template(&proc, Dialect::Tsql, Dialect::Postgres, &stand, None);
+    let c = check_template(
+        &proc,
+        d,
+        &stand,
+        &opts,
+        PlaceholderBasis::DeclaredPattern,
+        ("<%", "%>"),
+    );
+    let u = &c.units[0];
+    assert_eq!(u.status, Status::Differs, "{:?}", u.notes);
+    let note = u
+        .notes
+        .iter()
+        .find(|n| n.rule == "bind.unknown-column")
+        .unwrap();
+    assert!(note.text.contains("<%S%>.<%T%>"), "{}", note.text);
+    let f = &c.output_check.findings[u.output_findings[0]];
+    assert!(
+        !f.witness.to_ascii_lowercase().contains("sqldifftpl"),
+        "{}",
+        f.witness
+    );
+    let at = f.a.as_ref().unwrap();
+    // Located in the restored output, where the stand-ins are gone.
+    assert_eq!(&c.output[at.byte_start..at.byte_end], "cost", "{at:?}");
 }
 
 fn angle_template(text: &str) -> sqldiff_syntax::template::Template {
