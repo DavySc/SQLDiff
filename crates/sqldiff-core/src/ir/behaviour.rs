@@ -81,6 +81,10 @@ struct SideIr<'x, 'a> {
     reads: HashMap<String, Vec<NodeId>>,
     /// Number of effects per key without its `#n` occurrence suffix.
     bases: HashMap<String, usize>,
+    /// Line of each node, found once: every outcome of every scenario names
+    /// its effects with their lines, and finding a line walks the whole
+    /// statement, so long scripts went cubic.
+    line_nos: Vec<OnceCell<Option<usize>>>,
 }
 
 impl<'x, 'a> SideIr<'x, 'a> {
@@ -116,6 +120,7 @@ impl<'x, 'a> SideIr<'x, 'a> {
         }
         SideIr {
             a,
+            line_nos: (0..cfg.nodes.len()).map(|_| OnceCell::new()).collect(),
             cfg,
             at,
             reads,
@@ -170,8 +175,8 @@ impl SideIr<'_, '_> {
     }
 
     fn line(&self, n: NodeId) -> String {
-        self.syntax(n)
-            .map(|s| format!("{:?} line {}", self.a.side, self.a.line_of(s)))
+        self.line_no(n)
+            .map(|l| format!("{:?} line {l}", self.a.side))
             .unwrap_or_default()
     }
 
@@ -1420,7 +1425,7 @@ impl SideIr<'_, '_> {
     }
 
     fn line_no(&self, n: NodeId) -> Option<usize> {
-        self.syntax(n).map(|s| self.a.line_of(s))
+        *self.line_nos[n].get_or_init(|| self.syntax(n).map(|s| self.a.line_of(s)))
     }
 
     fn stmt_phrase(&self, n: NodeId) -> String {

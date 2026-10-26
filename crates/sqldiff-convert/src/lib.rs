@@ -348,6 +348,7 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     };
     let output_check = sqldiff_core::check(&b, &own);
     let (li, lo) = (LineIndex::new(input), LineIndex::new(&raw.text));
+    let (ui, uo) = (U16Index::new(input), U16Index::new(&raw.text));
     let mut units: Vec<Unit> = raw
         .units
         .into_iter()
@@ -357,8 +358,8 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
             Unit {
                 status: notes.first().map_or(Status::Converted, |n| n.status),
                 notes,
-                src: span(input, &li, u.src),
-                out: span(&raw.text, &lo, u.out),
+                src: span(input, &li, &ui, u.src),
+                out: span(&raw.text, &lo, &uo, u.out),
                 findings: Vec::new(),
                 output_findings: Vec::new(),
                 checked: Status::Converted,
@@ -520,13 +521,14 @@ pub fn splice_unit(
     c.output.replace_range(s..e, text);
     let shift = |x: usize| if x >= e { x + text.len() - (e - s) } else { x };
     let lo = LineIndex::new(&c.output);
+    let uo = U16Index::new(&c.output);
     for (k, u) in c.units.iter_mut().enumerate() {
         let (a, b) = if k == i {
             (s, s + text.len())
         } else {
             (shift(u.out.start), shift(u.out.end))
         };
-        u.out = span(&c.output, &lo, (a, b));
+        u.out = span(&c.output, &lo, &uo, (a, b));
         if k == i {
             u.notes = kept_notes(&note, &u.notes);
             u.findings.clear();
@@ -615,8 +617,43 @@ fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1.max(b.0 + 1) && b.0 < a.1
 }
 
-fn span(text: &str, li: &LineIndex, (start, end): (usize, usize)) -> Span {
-    let u16 = |b: usize| text[..b].encode_utf16().count();
+/// Byte offset to UTF-16 offset in `text` without re-encoding the text from
+/// its start for every span: the counts at char boundaries every
+/// [`U16Index::STEP`] bytes, then the rest of the way encoded.
+pub(crate) struct U16Index {
+    /// (byte offset at a char boundary, UTF-16 units before it), ascending.
+    marks: Vec<(usize, usize)>,
+}
+
+impl U16Index {
+    const STEP: usize = 4096;
+
+    pub(crate) fn new(text: &str) -> Self {
+        let mut marks = vec![(0, 0)];
+        let mut units = 0;
+        for (i, c) in text.char_indices() {
+            if i >= marks.last().unwrap().0 + Self::STEP {
+                marks.push((i, units));
+            }
+            units += c.len_utf16();
+        }
+        U16Index { marks }
+    }
+
+    /// The same as `text[..b].encode_utf16().count()`.
+    fn at(&self, text: &str, b: usize) -> usize {
+        let (at, units) = self.marks[self.marks.partition_point(|m| m.0 <= b) - 1];
+        units + text[at..b].encode_utf16().count()
+    }
+}
+
+pub(crate) fn span(
+    text: &str,
+    li: &LineIndex,
+    ui: &U16Index,
+    (start, end): (usize, usize),
+) -> Span {
+    let u16 = |b: usize| ui.at(text, b);
     Span {
         start,
         end,
@@ -651,5 +688,24 @@ mod tests {
         let root = parse(text, Dialect::Tsql).syntax();
         let o = guarded(&root, text, out::Out::default);
         assert!(o.text.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod u16_index {
+    use super::U16Index;
+
+    #[test]
+    fn matches_encoding_from_the_start() {
+        let mut text = String::new();
+        for i in 0..3000 {
+            text.push_str(["a", "é", "€", "𝄞", "\n", "SELECT 1;"][i % 6]);
+        }
+        let ui = U16Index::new(&text);
+        for b in (0..=text.len()).filter(|&b| text.is_char_boundary(b)) {
+            assert_eq!(ui.at(&text, b), text[..b].encode_utf16().count(), "at {b}");
+        }
+        let empty = U16Index::new("");
+        assert_eq!(empty.at("", 0), 0);
     }
 }

@@ -2425,16 +2425,22 @@ impl<'a> Canon<'a> {
                 })
                 .cloned();
             if let Some(sym) = local {
-                let returns_it = y.is("return") && y.kid(0) == Some(&sym);
-                let uses = out
-                    .iter()
-                    .map(|s| s.term.count(&|t| t == &sym))
-                    .sum::<usize>();
+                // Cheapest test first: the use count and the scan for an
+                // earlier definition walk every statement, so they only run
+                // in front of a `return` of the local.
+                let returns_it = || y.is("return") && y.kid(0) == Some(&sym);
+                let uses = || {
+                    out.iter()
+                        .map(|s| s.term.count(&|t| t == &sym))
+                        .sum::<usize>()
+                };
                 // A statement that was not lowered may assign the local too.
-                let first_def = !out[..i]
-                    .iter()
-                    .any(|s| s.err.is_some() || s.term.any(&|t| t == &sym));
-                if returns_it && uses == 2 && first_def {
+                let first_def = || {
+                    !out[..i]
+                        .iter()
+                        .any(|s| s.err.is_some() || s.term.any(&|t| t == &sym))
+                };
+                if returns_it() && uses() == 2 && first_def() {
                     let v = x.kids()[1].map(&|t| {
                         (t.is("scalar") && t.kid(2).and_then(Term::atom) == Some("unchanged")).then(
                             || {
