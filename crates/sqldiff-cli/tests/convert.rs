@@ -547,3 +547,66 @@ fn a_template_unit_written_by_hand_is_spliced_in_unchecked() {
         "{u:#}"
     );
 }
+
+/// A source file name with backslashes reads as a path that climbs out of
+/// the output directory: it is reported unreadable and nothing is written
+/// outside the output directory.
+#[cfg(unix)]
+#[test]
+fn a_file_name_cannot_climb_out_of_the_output_directory() {
+    let d = scratch("climb");
+    let src = d.join("w/x/src");
+    let out = d.join("w/x/out");
+    write(&src.join("ok.sql"), b"SELECT 1;\n");
+    write(&src.join("sub/a\\..\\..\\..\\..\\evil.sql"), b"SELECT 1;\n");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--to",
+        "postgres",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!d.join("w/evil.sql").exists());
+    assert!(!d.join("w/x/evil.sql").exists());
+    assert!(out.join("ok.sql").exists());
+    let report = std::fs::read_to_string(out.join("conversion-report.json")).unwrap();
+    assert!(report.contains("evil.sql"), "{report}");
+}
+
+/// `--overwrite` does not write through a symbolic link in the output
+/// directory, which could point at the source file itself.
+#[cfg(unix)]
+#[test]
+fn overwrite_does_not_follow_links_in_the_output_directory() {
+    let d = scratch("symlink");
+    let src = d.join("src");
+    let out = d.join("out");
+    let source = b"SELECT TOP 1 a FROM t;\n";
+    write(&src.join("x.sql"), source);
+    std::fs::create_dir_all(&out).unwrap();
+    std::os::unix::fs::symlink(src.join("x.sql"), out.join("x.sql")).unwrap();
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--overwrite",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("symbolic link"));
+    assert_eq!(std::fs::read(src.join("x.sql")).unwrap(), source);
+}

@@ -583,10 +583,9 @@ pub fn write(
     q: &Queue,
     out: &std::path::Path,
 ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    let (json, md) = (out.join(QUEUE_JSON), out.join(QUEUE_MD));
     let text = serde_json::to_string_pretty(q).map_err(|e| e.to_string())? + "\n";
-    std::fs::write(&json, text).map_err(|e| format!("{}: {e}", json.display()))?;
-    std::fs::write(&md, markdown(q)).map_err(|e| format!("{}: {e}", md.display()))?;
+    let json = crate::tree::write_under(out, QUEUE_JSON, text.as_bytes())?;
+    let md = crate::tree::write_under(out, QUEUE_MD, markdown(q).as_bytes())?;
     Ok((json, md))
 }
 
