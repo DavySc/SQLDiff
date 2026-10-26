@@ -599,3 +599,344 @@ fn a_table_in_another_schema_is_not_decided() {
         "{t}"
     );
 }
+
+/// Customer and TouchCustomer only: both convert.
+const TWO: &str = r#"
+[params]
+SCHEMA = "dbo"
+[params_for.postgres]
+SCHEMA = "public"
+
+[[instance]]
+name = "tables/Customer"
+template = "tables/entity.sql"
+params = { TABLE = "Customer" }
+
+[[instance]]
+name = "procs/TouchCustomer"
+template = "procs/touch.sql"
+params = { TABLE = "Customer" }
+"#;
+
+/// Generator output equal to SQLDiff's weave on both sides, in `gens/` and
+/// `gent/`, as a generator weaving the converted templates unchanged writes.
+fn generator_output(d: &Path) -> (String, String) {
+    setup(d);
+    write(&d.join("instances.toml"), TWO);
+    let (o, _) = instances(d, &[]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let (gens, gent) = (d.join("gens"), d.join("gent"));
+    for (from, to) in [("source", &gens), ("target", &gent)] {
+        for f in ["tables/Customer.sql", "procs/TouchCustomer.sql"] {
+            let text = std::fs::read_to_string(d.join("out").join(from).join(f)).unwrap();
+            write(&to.join(f), &text);
+        }
+    }
+    (
+        gens.to_str().unwrap().to_string(),
+        gent.to_str().unwrap().to_string(),
+    )
+}
+
+/// Mutations of the generator's target output: (file, old, new).
+const MUTATIONS: [(&str, &str, &str); 11] = [
+    ("procs/TouchCustomer.sql", "SET Price = 0", "SET Price = 1"),
+    (
+        "procs/TouchCustomer.sql",
+        "WHERE Id = p_id",
+        "WHERE Id <> p_id",
+    ),
+    ("procs/TouchCustomer.sql", " WHERE Id = p_id", ""),
+    (
+        "procs/TouchCustomer.sql",
+        "WHERE Id = p_id;",
+        "WHERE Id = p_id;\n  UPDATE public.Customer SET Price = 0;",
+    ),
+    ("procs/TouchCustomer.sql", "p_id integer", "p_id text"),
+    ("procs/TouchCustomer.sql", "END;", "EN;"),
+    (
+        "procs/TouchCustomer.sql",
+        "UPDATE public.Customer",
+        "UPDATE public.Client",
+    ),
+    ("tables/Customer.sql", "numeric(12, 2)", "numeric(12, 3)"),
+    (
+        "tables/Customer.sql",
+        "Price numeric(12, 2) NOT NULL",
+        "Price numeric(12, 2)",
+    ),
+    (
+        "tables/Customer.sql",
+        ",\n    Price numeric(12, 2) NOT NULL",
+        "",
+    ),
+    ("tables/Customer.sql", "public.Customer", "public.Client"),
+];
+
+fn mutate(dir: &Path, file: &str, old: &str, new: &str) -> String {
+    let p = dir.join(file);
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(text.contains(old), "{file}: no `{old}` in {text}");
+    std::fs::write(&p, text.replacen(old, new, 1)).unwrap();
+    text
+}
+
+fn name_of(file: &str) -> &str {
+    file.trim_end_matches(".sql")
+}
+
+#[test]
+fn the_generators_target_output_must_be_the_target_weave() {
+    let d = scratch("woven-target");
+    let (gens, gent) = generator_output(&d);
+    let (o, r) = instances(&d, &["--woven", &gens, "--woven-target", &gent]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for i in r["instances"].as_array().unwrap() {
+        assert_eq!(i["done"], true, "{i}");
+        assert!(i["weave_only"].as_array().unwrap().is_empty(), "{i}");
+    }
+    assert_eq!(r["done"], 2);
+    assert_eq!(r["complete"], true, "{r}");
+
+    // Any change to the generator's target output is not the weave.
+    let gent = PathBuf::from(gent);
+    for (file, old, new) in MUTATIONS {
+        let text = mutate(&gent, file, old, new);
+        let (o, r) = instances(
+            &d,
+            &["--woven", &gens, "--woven-target", gent.to_str().unwrap()],
+        );
+        assert_eq!(o.status.code(), Some(1), "{file}: {new}");
+        let i = instance(&r, name_of(file));
+        assert_eq!(i["status"], "not_woven", "{file}: {new}: {i}");
+        assert_eq!(i["done"], false);
+        assert_eq!(
+            i["items"][0]["rule"], "weave.generator-target-mismatch",
+            "{i}"
+        );
+        assert_eq!(r["complete"], false);
+        std::fs::write(gent.join(file), text).unwrap();
+    }
+
+    // Trailing white space is not a difference.
+    let p = gent.join("tables/Customer.sql");
+    let text = std::fs::read_to_string(&p).unwrap();
+    std::fs::write(&p, text.replace(");", ");   ") + "\n\n").unwrap();
+    let (o, r) = instances(
+        &d,
+        &["--woven", &gens, "--woven-target", gent.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(instance(&r, "tables/Customer")["done"], true);
+
+    // No target output: checked on SQLDiff's weave only, never done.
+    std::fs::remove_file(&p).unwrap();
+    write(&gent.join("extra/Unlisted.sql"), "SELECT 1;\n");
+    let (o, r) = instances(
+        &d,
+        &["--woven", &gens, "--woven-target", gent.to_str().unwrap()],
+    );
+    assert_eq!(o.status.code(), Some(1));
+    let c = instance(&r, "tables/Customer");
+    assert_eq!(c["status"], "converted", "{c}");
+    assert_eq!(c["done"], false);
+    assert_eq!(c["weave_only"], serde_json::json!(["target"]));
+    assert_eq!(r["not_in_manifest_target"][0], "extra/Unlisted.sql");
+    let t = r["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["path"] == "tables/entity.sql")
+        .unwrap();
+    assert_eq!(t["weave_only"], 1);
+    assert_eq!(t["done"], false);
+    let md = std::fs::read_to_string(d.join("out/instance-report.md")).unwrap();
+    assert!(
+        md.contains("`tables/Customer`: converted, checked on SQLDiff's weave only (no generator target output)"),
+        "{md}"
+    );
+
+    // Without generator output nothing is done, and the exit code is as
+    // before.
+    let (o, r) = instances(&d, &[]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(r["done"], 0);
+    assert_eq!(r["weave_only"], 2);
+    assert_eq!(r["complete"], false);
+    assert_eq!(
+        instance(&r, "procs/TouchCustomer")["weave_only"],
+        serde_json::json!(["source", "target"])
+    );
+}
+
+fn generator_only(d: &Path, gens: &str, gent: &str) -> (std::process::Output, serde_json::Value) {
+    let (manifest, out) = (d.join("instances.toml"), d.join("gout"));
+    let pack = pack();
+    let o = run(&[
+        "instances",
+        manifest.to_str().unwrap(),
+        "--generator-only",
+        "--woven",
+        gens,
+        "--woven-target",
+        gent,
+        "--to",
+        "postgres",
+        "-o",
+        out.to_str().unwrap(),
+        "--overwrite",
+        "--pack",
+        &pack,
+        "--isolated",
+    ]);
+    let r = std::fs::read_to_string(out.join("instance-report.json"))
+        .map(|t| serde_json::from_str(&t).unwrap())
+        .unwrap_or(serde_json::Value::Null);
+    (o, r)
+}
+
+#[test]
+fn the_generators_own_output_is_checked_alone() {
+    let d = scratch("generator-only");
+    let (gens, gent) = generator_output(&d);
+    let (o, r) = generator_only(&d, &gens, &gent);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(r["generator_only"], true);
+    for i in r["instances"].as_array().unwrap() {
+        assert_eq!(i["status"], "converted", "{i}");
+        assert_eq!(i["done"], true, "{i}");
+    }
+    // Mapped to the templates the manifest names.
+    let paths: Vec<&str> = r["templates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["procs/touch.sql", "tables/entity.sql"]);
+
+    // Every mutation of the target output is caught by the checks.
+    let gent_dir = PathBuf::from(&gent);
+    for (file, old, new) in MUTATIONS {
+        let text = mutate(&gent_dir, file, old, new);
+        let (o, r) = generator_only(&d, &gens, &gent);
+        assert_eq!(o.status.code(), Some(1), "{file}: {new}");
+        let i = instance(&r, name_of(file));
+        let status = i["status"].as_str().unwrap();
+        assert!(
+            ["differs", "unknown"].contains(&status),
+            "{file}: {new}: {i}"
+        );
+        assert_eq!(i["done"], false);
+        // The template inherits the worst instance.
+        let t = r["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| i["templates"][0] == t["path"])
+            .unwrap();
+        assert_eq!(t["status"], status);
+        std::fs::write(gent_dir.join(file), text).unwrap();
+    }
+
+    // A wider parameter type is equal only under an assumption, which counts.
+    let text = mutate(
+        &gent_dir,
+        "procs/TouchCustomer.sql",
+        "p_id integer",
+        "p_id bigint",
+    );
+    let (_, r) = generator_only(&d, &gens, &gent);
+    let i = instance(&r, "procs/TouchCustomer");
+    assert_eq!(i["status"], "assumptions", "{i}");
+    assert!(
+        rules(i).contains(&"ASM-ARGUMENT-LENGTHS".to_string()),
+        "{i}"
+    );
+    std::fs::write(gent_dir.join("procs/TouchCustomer.sql"), text).unwrap();
+
+    // No target output: nothing to check.
+    std::fs::remove_file(gent_dir.join("tables/Customer.sql")).unwrap();
+    let (o, r) = generator_only(&d, &gens, &gent);
+    assert_eq!(o.status.code(), Some(1));
+    let c = instance(&r, "tables/Customer");
+    assert_eq!(c["status"], "not_woven", "{c}");
+    assert_eq!(c["done"], false);
+
+    // The mode takes no templates and needs both outputs.
+    let o = run(&[
+        "instances",
+        d.join("instances.toml").to_str().unwrap(),
+        "--generator-only",
+        "--woven",
+        &gens,
+        "--to",
+        "postgres",
+        "-o",
+        d.join("x").to_str().unwrap(),
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[test]
+fn the_generators_names_are_checked_where_values_are() {
+    let d = scratch("generator-names");
+    let (gens, gent) = (d.join("gens"), d.join("gent"));
+    let long = format!("Customer{}", "X".repeat(60));
+    write(
+        &d.join("instances.toml"),
+        &format!(
+            r#"
+[[instance]]
+name = "tables/Order"
+template = "tables/entity.sql"
+params = {{ TABLE = "Order" }}
+
+[[instance]]
+name = "tables/Quoted"
+template = "tables/entity.sql"
+params = {{ TABLE = "Order" }}
+
+[[instance]]
+name = "tables/Long"
+template = "tables/entity.sql"
+params = {{ TABLE = "{long}" }}
+"#
+        ),
+    );
+    let table = |name: &str| format!("CREATE TABLE {name} (Id int NOT NULL);\n");
+    let pg = |name: &str| format!("CREATE TABLE {name} (\n    Id integer NOT NULL\n);\n");
+    write(&gens.join("tables/Order.sql"), &table("[Order]"));
+    write(&gent.join("tables/Order.sql"), &pg("Order"));
+    write(&gens.join("tables/Quoted.sql"), &table("[Order]"));
+    write(&gent.join("tables/Quoted.sql"), &pg("\"Order\""));
+    write(&gens.join("tables/Long.sql"), &table(&long));
+    write(&gent.join("tables/Long.sql"), &pg(&long));
+    let (_, r) = generator_only(&d, gens.to_str().unwrap(), gent.to_str().unwrap());
+    let o = instance(&r, "tables/Order");
+    assert_eq!(o["status"], "differs", "{o}");
+    assert!(rules(o).contains(&"pg.reserved-name".to_string()), "{o}");
+    // A keyword is not a name, a quoted name is not reserved.
+    let q = instance(&r, "tables/Quoted");
+    assert!(!rules(q).contains(&"pg.reserved-name".to_string()), "{q}");
+    let l = instance(&r, "tables/Long");
+    assert!(
+        rules(l).contains(&"ASM-PG-NAME-TRUNCATED".to_string()),
+        "{l}"
+    );
+}
