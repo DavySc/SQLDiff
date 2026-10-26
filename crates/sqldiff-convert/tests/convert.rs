@@ -128,7 +128,8 @@ fn script_with_variables_becomes_a_do_block() {
         c.output,
         "DO $$\nDECLARE\n  v_n integer;\nBEGIN\n  -- DECLARE @n: moved to the DECLARE section\n  SELECT COUNT(*) INTO v_n FROM t;\n  RAISE NOTICE '%', v_n;\nEND\n$$;\n"
     );
-    assert!(has_rule(
+    // An aggregate without grouping returns exactly one row: nothing to assume.
+    assert!(!has_rule(
         unit(&c, src, "SELECT"),
         "ASM-SELECT-ASSIGN-CARDINALITY"
     ));
@@ -303,8 +304,9 @@ fn top_in_parentheses_with_assignment() {
     let src = "DECLARE @n nvarchar(10);\nSELECT TOP (1) @n = Name FROM t ORDER BY Name;\n";
     let c = tsql(src);
     assert!(
-        c.output
-            .contains("SELECT Name INTO v_n FROM t ORDER BY Name LIMIT (1);"),
+        c.output.contains(
+            "FOR sqldiff_r IN SELECT Name AS sqldiff_c1 FROM t ORDER BY Name LIMIT (1) LOOP\n      v_n := sqldiff_r.sqldiff_c1;\n    END LOOP;"
+        ),
         "{}",
         c.output
     );
