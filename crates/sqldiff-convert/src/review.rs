@@ -223,9 +223,23 @@ pub fn allowed(r: &Record) -> Result<(), String> {
 
 /// The hash a record keeps of a whole file: SHA-256 of its exact bytes, so
 /// any change at all (trailing blanks inside a string literal included)
-/// outdates the decisions made on it.
+/// outdates the decisions made on it. The one exception is the line ending:
+/// CRLF is hashed as LF, because git rewrites line endings on checkout
+/// (`core.autocrlf`), and the same commit must keep its decisions on Windows
+/// and elsewhere. Whatever a CR inside a string literal means is still
+/// checked: every run converts and checks the file again, and a decision
+/// only discharges assumptions and decisions.
 pub fn file_hash(text: &str) -> String {
-    hex(&Sha256::digest(text.as_bytes()))
+    hex(&Sha256::digest(lf(text).as_bytes()))
+}
+
+/// `text` with every CRLF as LF (a lone CR is kept).
+fn lf(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains("\r\n") {
+        text.replace("\r\n", "\n").into()
+    } else {
+        text.into()
+    }
 }
 
 /// A unit's id: its file, its input text and its output text. Units with the
@@ -242,7 +256,8 @@ pub fn unit_ids(path: &str, input: &str, c: &Conversion) -> Vec<String> {
     )
 }
 
-/// [`unit_ids`] from each unit's input and output text.
+/// [`unit_ids`] from each unit's input and output text, with CRLF hashed as
+/// LF (see [`file_hash`]).
 pub fn ids_of<'a>(path: &str, units: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<String> {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     units
@@ -250,9 +265,9 @@ pub fn ids_of<'a>(path: &str, units: impl Iterator<Item = (&'a str, &'a str)>) -
             let mut h = Sha256::new();
             h.update(path.as_bytes());
             h.update([0u8]);
-            h.update(src.as_bytes());
+            h.update(lf(src).as_bytes());
             h.update([0u8]);
-            h.update(out.as_bytes());
+            h.update(lf(out).as_bytes());
             let base = format!("u{}", hex(&h.finalize()[..8]));
             let n = seen.entry(base.clone()).or_insert(0);
             *n += 1;

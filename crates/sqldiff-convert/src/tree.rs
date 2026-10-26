@@ -1467,7 +1467,8 @@ pub fn is_report(rel: &str) -> bool {
 }
 
 /// SHA-256 over every file of a tree (or one file): its path and the hash
-/// of its exact bytes, in path order. Names starting with a dot and, at the
+/// of its exact bytes, CRLF read as LF (a git checkout on Windows rewrites
+/// line endings; see `review::file_hash`), in path order. Names starting with a dot and, at the
 /// top, the reports and the ledger (`is_report`) are left out, so recording
 /// a review decision does not change it.
 pub fn dir_hash(dir: &Path) -> Result<String, String> {
@@ -1503,7 +1504,16 @@ pub fn dir_hash(dir: &Path) -> Result<String, String> {
     list.sort();
     let mut h = Sha256::new();
     for (rel, p) in list {
-        let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let mut bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if bytes.windows(2).any(|w| w == b"\r\n") {
+            let mut lf = Vec::with_capacity(bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                if !(b == b'\r' && bytes.get(i + 1) == Some(&b'\n')) {
+                    lf.push(b);
+                }
+            }
+            bytes = lf;
+        }
         h.update(rel.as_bytes());
         h.update([0]);
         h.update(Sha256::digest(&bytes));

@@ -40,3 +40,15 @@ jobs:
           # Every commit, so a leak added and removed again is still caught.
           if git cat-file -e "$BASE^{commit}" 2>/dev/null; then range="$BASE..$HEAD"; else range="$HEAD"; fi
           scripts/leak-scan.sh --commits "$range"
+
+  # Colleagues run SQLDiff on Windows, where git checks out with
+  # core.autocrlf=true: sources, the corpus and the test code have CRLF line
+  # endings here (except what .gitattributes pins to LF).
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf true
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace

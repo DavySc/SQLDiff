@@ -275,7 +275,12 @@ fn missing_terminator_before_throw() {
         "{}",
         f.witness
     );
-    let fixed = fixture("catch_rethrow.tsql.sql").replace("ROLLBACK\n", "ROLLBACK;\n");
+    let original = fixture("catch_rethrow.tsql.sql");
+    // Either line ending: a CRLF checkout must get the fix too.
+    let fixed = original
+        .replace("ROLLBACK\r\n", "ROLLBACK;\r\n")
+        .replace("ROLLBACK\n", "ROLLBACK;\n");
+    assert_ne!(fixed, original, "the fixture has a bare ROLLBACK line");
     let r = check(
         &Artifact::new("c.sql", Dialect::Tsql, fixed),
         &Options::default(),

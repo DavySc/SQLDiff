@@ -123,8 +123,11 @@ impl<'a> Lexer<'a> {
             return WHITESPACE;
         }
         if self.starts_with("--") {
+            // The comment ends before its line ending, LF or CRLF: the CR
+            // of a CRLF is whitespace, so a comment's text is the same in an
+            // LF and a CRLF checkout.
             while let Some(c) = self.peek() {
-                if c == '\n' {
+                if c == '\n' || self.starts_with("\r\n") {
                     break;
                 }
                 self.bump();
@@ -494,6 +497,25 @@ mod tests {
             .filter(|t| !t.kind.is_trivia())
             .map(|t| (t.kind, &text[t.start..t.end]))
             .collect()
+    }
+
+    #[test]
+    fn line_comment_ends_before_crlf() {
+        for d in [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i] {
+            for nl in ["\n", "\r\n"] {
+                let text = format!("-- note{nl}SELECT 1;{nl}-- last\r");
+                let toks = tokenize(&text, d).tokens;
+                let comments: Vec<&str> = toks
+                    .iter()
+                    .filter(|t| t.kind == LINE_COMMENT)
+                    .map(|t| &text[t.start..t.end])
+                    .collect();
+                // A lone CR is not a line ending: it stays in the comment.
+                assert_eq!(comments, ["-- note", "-- last\r"], "{d:?} {nl:?}");
+                let all: String = toks.iter().map(|t| &text[t.start..t.end]).collect();
+                assert_eq!(all, text, "{d:?} {nl:?}: lossless");
+            }
+        }
     }
 
     #[test]
