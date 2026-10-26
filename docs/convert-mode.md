@@ -247,6 +247,20 @@ Editing a converted file directly is not a review step: the next conversion woul
 
 Inside a tier, items with the most instances woven from their template come first, then the most units, then path and line. With `--instances PATH` (`instance-report.json` from `sqldiff instances`, or its directory) each template is also judged by its woven instances and listed with the ones that fail. The MCP tool `conversion_queue` converts the tree again in memory, applies the ledger in `out` and returns the same queue; it writes nothing, and no MCP tool records a verdict.
 
+### The done gate
+
+`sqldiff review-status SRC OUT --to TO [--template] [--instances PATH] --require-complete` is the check for CI. It converts SRC again in memory with the ledger in OUT, writes nothing, and exits with 1 unless the review is complete:
+
+- every unit is converted or converted under assumptions: nothing differs, is not converted or is not proven, and no output finding is outside a unit;
+- every assumption is accepted and every decision picked by a person, by name;
+- no current rejection stands, and every unit an agent wrote is approved by a person;
+- no decision was made on other bytes of its file (outdated decisions block until their author confirms them again);
+- no ledger line fails to parse or is not allowed (it may be someone's rejection), and every source file could be read;
+- OUT holds exactly what converting SRC gives now, so a hand edit or a stale tree fails;
+- for templates (`--template`), an instance report is given, is `complete` (every instance converted and checked on the generator's own output on both sides, every template exercised, all generator output accounted for), and was made on these trees: `sqldiff instances` records a hash of its source, target, manifest and generator output trees, and the gate hashes them again (the manifest and generator output at the paths the report names).
+
+Plainly converted units need no decision: they are counted as "nothing found", never as reviewed. The gate lists every assumption accepted and decision picked, with the number of units and who. `--json` prints the whole gate.
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.

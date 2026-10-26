@@ -323,7 +323,7 @@ pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> 
             .filter(|r| r.path == path && &r.unit == id && r.text.is_none())
             .map(|r| {
                 let why_not = if r.input_hash != ih || r.output_hash != oh {
-                    Some("the file changed since: confirm it again".to_string())
+                    Some(FILE_CHANGED.to_string())
                 } else {
                     fits(u, r).err()
                 };
@@ -497,6 +497,9 @@ impl Ledger {
         (texts, conflicts)
     }
 }
+
+/// `Applied::why_not` of a decision made on other bytes of the file.
+pub const FILE_CHANGED: &str = "the file changed since: confirm it again";
 
 /// Appends a record to the ledger in `out` after checking it is allowed.
 /// The caller sets `by` from who it is, never from its own caller.

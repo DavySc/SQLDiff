@@ -1432,3 +1432,61 @@ pub fn markdown(r: &Report) -> String {
     }
     s
 }
+
+/// Files `sqldiff convert` writes into the converted tree besides the
+/// converted files, and the review ledger kept there.
+pub fn is_report(rel: &str) -> bool {
+    matches!(
+        rel,
+        "conversion-report.json"
+            | "conversion-report.md"
+            | crate::queue::QUEUE_JSON
+            | crate::queue::QUEUE_MD
+            | crate::review::LEDGER_FILE
+    )
+}
+
+/// SHA-256 over every file of a tree (or one file): its path and the hash
+/// of its exact bytes, in path order. Names starting with a dot and, at the
+/// top, the reports and the ledger (`is_report`) are left out, so recording
+/// a review decision does not change it.
+pub fn dir_hash(dir: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    fn files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let ty = e.file_type()?;
+            let p = e.path();
+            if ty.is_dir() {
+                files(root, &p, out)?;
+            } else if ty.is_file() {
+                let rel = p.strip_prefix(root).unwrap_or(&p);
+                out.push((rel.to_string_lossy().replace('\\', "/"), p));
+            }
+        }
+        Ok(())
+    }
+    let mut list = Vec::new();
+    if dir.is_file() {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        list.push((name, dir.to_path_buf()));
+    } else {
+        files(dir, dir, &mut list).map_err(|e| format!("{}: {e}", dir.display()))?;
+        list.retain(|(rel, _)| !is_report(rel));
+    }
+    list.sort();
+    let mut h = Sha256::new();
+    for (rel, p) in list {
+        let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        h.update(rel.as_bytes());
+        h.update([0]);
+        h.update(Sha256::digest(&bytes));
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}

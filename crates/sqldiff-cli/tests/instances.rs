@@ -1065,3 +1065,68 @@ fn a_rerun_since_a_report_checks_only_what_changed_and_agrees_with_a_full_run() 
     let inc = instances_to(&d, &prev, &["--accept", "ASM-X", "--since", &p]);
     assert_eq!(inc["reused"], 5);
 }
+
+#[test]
+fn the_done_gate_reads_the_instance_check_of_these_trees() {
+    let d = scratch("gate");
+    let (src, conv, _) = setup(&d);
+    let (o, r) = instances(&d, &[]);
+    assert!(
+        o.status.code().is_some(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // No generator output given: checked on SQLDiff's weave only.
+    assert_eq!(r["complete"], false, "{r:#}");
+    let pack = pack();
+    let gate = |extra: &[&str]| {
+        let mut args = vec![
+            "review-status",
+            src.to_str().unwrap(),
+            conv.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "--template",
+            "--pack",
+            &pack,
+            "--isolated",
+        ];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    let report = d.join("out");
+    let o = gate(&[
+        "--instances",
+        report.to_str().unwrap(),
+        "--require-complete",
+    ]);
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("Review not complete"), "{text}");
+    assert!(
+        text.contains("the instance check is not complete"),
+        "{text}"
+    );
+    // The report was made on these very trees.
+    assert!(!text.contains("changed since the instance check"), "{text}");
+    assert!(!text.contains("stale-output"), "{text}");
+    // Templates without the instance check are never complete.
+    let o = gate(&["--json"]);
+    assert_eq!(o.status.code(), Some(0));
+    let g: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(g["complete"], false);
+    assert!(g["counts"]["instances"].as_u64().unwrap() >= 1, "{g:#}");
+    // A converted template changed after the check: the report is stale.
+    let f = conv.join("tables/entity.sql");
+    let t = std::fs::read_to_string(&f).unwrap();
+    std::fs::write(&f, t + "\n").unwrap();
+    let o = gate(&["--instances", report.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(text.contains("changed since the instance check"), "{text}");
+    assert!(text.contains("stale-output"), "{text}");
+}

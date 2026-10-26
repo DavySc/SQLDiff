@@ -229,6 +229,10 @@ struct Report {
     fingerprint: String,
     /// Instances whose results were reused from `--since`.
     reused: usize,
+    /// `tree::dir_hash` of each input this check read (source, target,
+    /// woven, woven_target, manifest), so a later gate can tell the report
+    /// still describes them.
+    hashes: BTreeMap<&'static str, String>,
 }
 
 pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
@@ -592,6 +596,18 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
         && not_in_manifest_target.is_empty()
         && not_exercised.is_empty();
     let shown = |p: &Option<PathBuf>| p.as_ref().map(|w| w.display().to_string());
+    let mut hashes = BTreeMap::new();
+    for (k, p) in [
+        ("source", &a.source),
+        ("target", &a.target),
+        ("woven", &a.woven),
+        ("woven_target", &a.woven_target),
+        ("manifest", &Some(a.manifest.clone())),
+    ] {
+        if let Some(p) = p {
+            hashes.insert(k, sqldiff_convert::tree::dir_hash(p)?);
+        }
+    }
     let report = Report {
         from: a.from.id().to_string(),
         to: a.to.id().to_string(),
@@ -613,6 +629,7 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
         complete,
         fingerprint,
         reused,
+        hashes,
     };
     let json = a.out.join("instance-report.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report).unwrap() + "\n")
@@ -1427,14 +1444,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
 
 /// `sqldiff convert` writes its reports into the converted tree.
 fn is_report(rel: &str) -> bool {
-    matches!(
-        rel,
-        "conversion-report.json"
-            | "conversion-report.md"
-            | sqldiff_convert::queue::QUEUE_JSON
-            | sqldiff_convert::queue::QUEUE_MD
-            | sqldiff_convert::review::LEDGER_FILE
-    )
+    sqldiff_convert::tree::is_report(rel)
 }
 
 fn prepare_out(a: &InstancesArgs) -> Result<(), String> {
