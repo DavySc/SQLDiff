@@ -398,6 +398,7 @@ pub fn run(a: DriftArgs) -> Result<ExitCode, String> {
                 woven: None,
                 woven_target: None,
                 generator_only: false,
+                since: None,
                 parameters: a.parameters.clone(),
                 accept: a.accept.clone(),
                 jobs: a.jobs,

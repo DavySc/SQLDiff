@@ -110,7 +110,7 @@ A converted template tree is never the last word: a template is right only when 
 
 ```sh
 sqldiff instances instances.toml --source templates/ --target out/ --to postgres -o check/ --pack PACK \
-    [--woven generated/] [--woven-target generated-pg/] [--accept ASM-…] [--catalog schema.sql]
+    [--woven generated/] [--woven-target generated-pg/] [--accept ASM-…] [--catalog schema.sql] [--since check/]
 sqldiff instances instances.toml --generator-only --woven generated/ --woven-target generated-pg/ \
     --to postgres -o check/ [--pack PACK]
 ```
@@ -169,6 +169,10 @@ Behaviour is best guaranteed on the generator's own output, so an instance is **
 - **No target output yet.** An instance with no file under `--woven-target` (or no `--woven-target` at all), or no source output under `--woven`, is checked on SQLDiff's weave only: its status is reported as usual, but the report lists the sides in `weave_only`, says "checked on SQLDiff's weave only", and it never counts as done.
 
 The report gives `done` per instance and per template, totals of `done` and `weave_only`, and `complete`: every instance done, every converted template exercised and all generator output accounted for. With `--woven-target` the exit code is 1 when an instance has no target output there.
+
+#### Re-running after an edit
+
+`--since PATH` (a previous `instance-report.json`, or its output directory, which may be `-o` itself with `--overwrite`) checks again only the instances whose own inputs changed: every instance is still woven (that is cheap, and the catalogs need every instance), and an instance reuses the earlier result only when its woven source and target text, its values, its generator output and its name are what they were. Everything else every check reads must be unchanged too, or every instance is checked: the sqldiff build (the executable's hash), the dialects, the mode, `--accept`, the pack's value kinds, the catalogs (`--catalog` and the ones built from all woven instances, so changing a table or a routine's parameters re-checks everything; changing a body does not). The checks across instances (names PostgreSQL truncates to the same name, an object two instances create) are always worked out again over every instance. The report says how many results were `reused`; apart from that it is the same report a full run writes (tested on the test trees, and over 80 random edits of a tree of 78–84 instances).
 
 This is a stricter bar than `sqldiff convert`'s, where only a proven difference holds a unit back: an instance is converted only when no finding of the diff is left open. The assumptions the diff makes about every pair (name folding, the default schema, T-SQL's ownership chain) are listed per instance as `engine_assumptions` and do not count, as in `convert`; any other assumption the diff makes about the pair (`ASM-ARGUMENT-LENGTHS`, say) counts, unless accepted with `--accept`.
 
