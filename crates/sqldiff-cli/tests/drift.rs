@@ -279,5 +279,5 @@ fn checks_every_instance_against_the_reference() {
     write(&p, &text.replace("SET Price = 0", "SET Price = 1"));
     let (o, _) = drift(&d, &["--manifest", m.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(status("TouchCustomer"), "unknown");
+    assert_eq!(status("TouchCustomer"), "differs");
 }
