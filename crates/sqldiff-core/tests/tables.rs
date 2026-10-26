@@ -447,3 +447,45 @@ fn tables_beside_a_routine_are_compared_too() {
     let r = run(&t, &replace(&p, "numeric(10, 2)", "numeric(8, 2)"));
     assert!(rules(&r).contains(&"equiv.column-type"), "{r:#?}");
 }
+
+#[test]
+fn a_default_the_column_converts_is_not_compared() {
+    // The column stores its default converted to the column's type, and the
+    // dialects convert differently: T-SQL truncates 1.5 into an int, PostgreSQL
+    // rounds it to 2; 1234567e0 is a float in T-SQL and numeric in PostgreSQL.
+    for (t, p) in [
+        ("q INT DEFAULT 1.5", "q integer DEFAULT 1.5"),
+        ("q TINYINT DEFAULT 3.7", "q smallint DEFAULT 3.7"),
+        (
+            "q VARCHAR(20) DEFAULT 1234567e0",
+            "q varchar(20) DEFAULT 1234567e0",
+        ),
+        (
+            "q DECIMAL(5,2) DEFAULT 1.005",
+            "q numeric(5, 2) DEFAULT 1.005",
+        ),
+        ("q INT DEFAULT '7'", "q integer DEFAULT '7'"),
+        ("q DATE DEFAULT '20200101'", "q date DEFAULT '20200101'"),
+        ("q INT DEFAULT (1 + 1)", "q integer DEFAULT (1 + 1)"),
+        ("q VARCHAR(3) DEFAULT 'abcd'", "q varchar(3) DEFAULT 'abcd'"),
+    ] {
+        unknown(
+            &format!("CREATE TABLE dbo.D (id INT NOT NULL PRIMARY KEY, {t});"),
+            &format!("CREATE TABLE D (id integer NOT NULL PRIMARY KEY, {p});"),
+            "converted to the column's type",
+        );
+    }
+    // Values the column holds as written are compared.
+    for (t, p) in [
+        ("q INT DEFAULT ((-5))", "q integer DEFAULT -5"),
+        ("q TINYINT DEFAULT 255", "q smallint DEFAULT 255"),
+        ("q DECIMAL(5,2) DEFAULT 1.5", "q numeric(5, 2) DEFAULT 1.5"),
+        ("q VARCHAR(3) DEFAULT 'abc'", "q varchar(3) DEFAULT 'abc'"),
+        ("q INT DEFAULT NULL", "q integer DEFAULT NULL"),
+    ] {
+        equal(
+            &format!("CREATE TABLE dbo.D (id INT NOT NULL PRIMARY KEY, {t});"),
+            &format!("CREATE TABLE D (id integer NOT NULL PRIMARY KEY, {p});"),
+        );
+    }
+}
