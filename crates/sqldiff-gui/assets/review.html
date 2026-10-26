@@ -426,6 +426,7 @@ function nothingToDecide(it) {
     case "template": return "A template is judged by its woven instances: open its units, and fix the instances that fail.";
     case "not_exercised": return "No instance uses this template, so it was never checked: add an instance to the manifest.";
     case "not_in_manifest": return "The manifest does not describe this generator output: add the instance that produces it.";
+    case "unreadable": return "This file could not be read, so nothing in it was converted or checked: make it readable and refresh.";
     default: return "";
   }
 }
