@@ -1052,7 +1052,7 @@ pub mod asm {
     );
     pub const TSQL_CODE_PAGE: (&str, &str) = (
         "ASM-TSQL-CODE-PAGE",
-        "T-SQL char and varchar values hold only characters of the column collation's code page (SQL Server stores any other character as '?'), so a length counts characters on both sides",
+        "T-SQL char and varchar values hold only characters of the column collation's code page (SQL Server stores any other character as '?'), and that code page is single-byte, so a length counts characters on both sides (with a double-byte code page such as 932 or 936, or a UTF-8 collation, T-SQL counts bytes and PostgreSQL accepts more)",
     );
     pub const VALUE_SIZE: (&str, &str) = (
         "ASM-VALUE-SIZE-1GB",
