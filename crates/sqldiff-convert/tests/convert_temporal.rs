@@ -260,3 +260,39 @@ fn altering_versioning_is_refused() {
         assert_eq!(c.counts.not_converted, 2, "{}", c.output);
     }
 }
+
+#[test]
+fn the_end_of_time_literal_differs_on_postgresql() {
+    let src = "SELECT GroupID FROM Sales.Groups WHERE ValidTo = '9999-12-31 23:59:59.9999999';\n";
+    let c = pg(src);
+    assert_eq!(c.units[0].status, Status::Differs, "{:?}", c.units[0].notes);
+    assert!(
+        rules(&c).contains(&"tsql.end-of-time-literal"),
+        "{:?}",
+        rules(&c)
+    );
+    // Six digits are PostgreSQL's own end of time, and Db2 keeps seven.
+    let six = src.replace(".9999999", ".999999");
+    assert!(!rules(&pg(&six)).contains(&"tsql.end-of-time-literal"));
+    let c = convert(src, Dialect::Tsql, Dialect::Db2i).unwrap();
+    assert!(
+        !rules(&c).contains(&"tsql.end-of-time-literal"),
+        "{:?}",
+        rules(&c)
+    );
+}
+
+#[test]
+fn temporal_queries_are_refused() {
+    let src =
+        "SELECT GroupID FROM Sales.Groups FOR SYSTEM_TIME AS OF '2020-01-01' WHERE GroupID = 1;\n";
+    for to in [Dialect::Postgres, Dialect::Db2i] {
+        let c = convert(src, Dialect::Tsql, to).unwrap();
+        assert_eq!(c.units[0].status, Status::NotConverted, "{}", c.output);
+        assert!(
+            c.units[0].notes[0].text.contains("FOR SYSTEM_TIME"),
+            "{:?}",
+            c.units[0].notes
+        );
+    }
+}

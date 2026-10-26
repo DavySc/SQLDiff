@@ -1190,6 +1190,15 @@ impl<'a> Cx<'a> {
             ts = dummy_from(&ts, top);
         }
         let s = sig(&ts);
+        // `PERIOD FOR SYSTEM_TIME` declares the period; `t FOR SYSTEM_TIME …` queries it.
+        if s.windows(3)
+            .any(|p| !ts[p[0]].is("PERIOD") && ts[p[1]].is("FOR") && ts[p[2]].is("SYSTEM_TIME"))
+        {
+            return no(self.pick(
+                "FOR SYSTEM_TIME reads the history of a system-versioned table: PostgreSQL has no temporal queries; a UNION ALL of the table and its history filtered on the period columns would do it; no rule yet",
+                "FOR SYSTEM_TIME: system-versioned tables are not converted for Db2 for i yet; no rule yet",
+            ));
+        }
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
         if self.mode == Mode::Top && procedural(n) {
@@ -2973,6 +2982,9 @@ impl<'a> Cx<'a> {
                 }
                 STRING => {
                     let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+                    if !self.db2() && rounds_past_year_9999(&string_value(lit)) {
+                        self.note(Status::Differs, "tsql.end-of-time-literal", "This literal is the end of time at 100 ns precision (DATETIME2(7)). PostgreSQL keeps microseconds and rounds it up to 10000-01-01 00:00:00, so it no longer equals the largest stored value (a system-versioned table's current rows end at 9999-12-31 23:59:59.999999). Write '9999-12-31 23:59:59.999999' if it means the end of time.");
+                    }
                     o.push_str(lit);
                     self.string_compare(ts, i);
                 }
@@ -4453,6 +4465,22 @@ fn date_part(p: &str) -> Option<&'static str> {
         "second" | "ss" | "s" => "second",
         _ => return None,
     })
+}
+
+/// A date-time text whose fractional seconds PostgreSQL's microseconds
+/// round into the year 10000: `9999-12-31 23:59:59.9999995` and above.
+fn rounds_past_year_9999(v: &str) -> bool {
+    let v = v.trim();
+    let Some(frac) = ["9999-12-31 23:59:59.", "9999-12-31T23:59:59."]
+        .iter()
+        .find_map(|p| v.strip_prefix(p))
+    else {
+        return false;
+    };
+    frac.len() > 6
+        && frac.chars().all(|c| c.is_ascii_digit())
+        && frac.starts_with("999999")
+        && frac.as_bytes()[6] >= b'5'
 }
 
 /// A CREATE TABLE item that is a table constraint, not a column.
