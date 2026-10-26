@@ -235,6 +235,68 @@ index named like another index or a table of the schema, rejects `WITH` after
 `sys.sequences` and `pg_sequences`; both restart a cycling sequence at its
 minimum.
 
+## Scripts
+
+A conversion turns each T-SQL batch that needs variables or control flow
+(a `DECLARE`, `PRINT`, `IF`, `WHILE`, `TRY`, `BEGIN … END`, or any `@variable`)
+into one PostgreSQL `DO` block or one Db2 for i compound statement, and keeps
+the statements of other batches as plain statements. The engine splits both
+scripts the same way (`equiv/script.rs`) and compares each batch with its
+block, with only that batch's variables: they end at `GO` as a block's end at
+its `END`. Consecutive plain batches are one part, as are consecutive plain
+statements on the other side. When the parts do not line up (a block for a
+batch the split calls plain, or the reverse), the scripts are compared whole
+and the blocks stay not compared.
+
+Inside a part, statements are compared as inside a routine, with these
+additions:
+
+| What | Equal when | Otherwise |
+|---|---|---|
+| Message | `PRINT 'text'` against `RAISE NOTICE '%', 'text'` or `RAISE NOTICE 'text'` (no `%`), a constant of at most 4000 characters | not proven: NULL prints as an empty line in T-SQL and as `<NULL>` in PostgreSQL, numbers and dates in each engine's own format |
+| Multi-row `VALUES` | Same rows in the same order; a table whose columns are not all listed (or not in the catalog) adds `ASM-VALUES-ROW-ORDER` for generated values | the engine's difference, or not proven |
+| Binary constant | `0xAB01` against `'\xAB01'::bytea` | not proven |
+| `+` | Numbers only; on any other type (binary strings, unknown types) it stays per dialect | not proven |
+| Generated column | Never written | a statement that writes a computed, `GENERATED ALWAYS` or period column is not proven: one side rejects or replaces the value depending on settings and triggers the statement does not show |
+
+### Variables
+
+Statement terms leave a variable's declared type out, but the type converts
+every value assigned to it. Checked on SQL Server 2022 and PostgreSQL 18:
+an assignment rounds like a `CAST` (`datetime2(0)` and `timestamp(0)` take
+`'2020-01-01 10:00:00.6'` to 10:00:01; `timestamp` takes
+`'9999-12-31 23:59:59.9999999'` to 10000-01-01 00:00:00, `datetime2(7)` keeps
+it), a T-SQL string or binary variable cuts a longer value off silently where
+PostgreSQL raises "value too long", and an overflowing literal
+(`DECLARE @i tinyint = 300`) fails while the batch goes on.
+
+So the variables the statements identify (by declaration order, or by name
+when a dropped declaration shifts the order: `@CurrentDateTime` and
+`v_current_date_time`) are compared by type, with the column type rules
+above:
+
+- same values stored: compared; a bounded string adds `ASM-VARIABLE-LENGTH`,
+  a wider PostgreSQL type `ASM-VARIABLE-RANGE`, unless every write is a
+  literal that fits;
+- otherwise compared only when every write to the variable, on both sides,
+  is a literal that converts to the same known value (`'20200101'` into
+  `datetime2(7)` and into `timestamp`); any other write (`SELECT … INTO`,
+  `SET @v = @v + 1`, an `OUTPUT` argument, a write inside an `IF`) leaves the
+  variable not proven, with the reason on its declaration;
+- Db2 for i variables are not compared (no verified type facts; questions
+  queued for the IBM i probes).
+
+### Errors
+
+`equiv.error-continues` (a T-SQL statement fails and the batch goes on, the
+other side stops) applies when the other side's statements run as one unit:
+a routine, a `DO` block, a compound statement. Plain statements run one by
+one on both sides, and whether the script goes on is the client's choice
+(sqlcmd `-b`, psql `ON_ERROR_STOP`); the behavioural diff models them. A
+literal assignment that cannot fail (NULL, a string or binary constant into a
+variable of that kind, a literal whose conversion is modelled and succeeds)
+is not taken as the failing statement.
+
 ## Witnesses for changed statements
 
 When two paired statements lower to terms that differ in a way no rule
