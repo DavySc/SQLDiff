@@ -248,6 +248,20 @@ fn local_pair(ua: &Unit, ub: &Unit, x: &Local, y: &Local) -> Result<Asms, String
     };
     match by_type {
         Ok(mut v) => {
+            // The types agree, but a literal assigned may still convert
+            // differently (T-SQL truncates 1.5 into an int, PostgreSQL rounds)
+            // or not fit (T-SQL cuts a string off, PostgreSQL raises).
+            match (assigned_literals(ua, x), assigned_literals(ub, y)) {
+                (Some(lx), Some(ly)) if lx == ly => {}
+                (Some(_), Some(_)) => {
+                    return Err("the literals assigned do not convert to the same values".into())
+                }
+                _ => {
+                    return Err(
+                        "a literal assigned to it may be cut off, rounded or rejected".into(),
+                    )
+                }
+            }
             // Only literals that both types hold unchanged are written: nothing
             // is cut off or out of range.
             let (t_unit, t_local) = if ua.dialect == Dialect::Tsql {
@@ -274,6 +288,95 @@ fn local_pair(ua: &Unit, ub: &Unit, x: &Local, y: &Local) -> Result<Asms, String
             )),
             _ => Err(why),
         },
+    }
+}
+
+/// The values of the literals the unit assigns to the variable, in order, as
+/// the declared type stores them; NULL is NULL on every side. None when one
+/// of them is not modelled exactly: a string that does not fit a bounded
+/// string type, a number into a type other than an integer or decimal, or a
+/// conversion that rounds, overflows or fails.
+fn assigned_literals(u: &Unit, l: &Local) -> Option<Vec<Term>> {
+    let decl = l.decl.as_ref()?;
+    let ty = match u.dialect {
+        Dialect::Tsql => tsql_type(decl).ok(),
+        Dialect::Postgres => table::pg_type(decl).ok(),
+        Dialect::Db2i => None,
+    };
+    let target = Target::of_type(decl, u.dialect);
+    let mut out = Vec::new();
+    for s in &u.stmts {
+        let Ok(Stmt::Assign(t, e)) = &s.ast else {
+            continue;
+        };
+        if !names(u.dialect, t, &l.name) {
+            continue;
+        }
+        out.push(match (e, &ty) {
+            (Expr::Null, _) => a("null"),
+            (Expr::Str(v), Some(table::Ty::Str { len, .. })) => {
+                if len.is_some_and(|n| v.chars().count() > n as usize) {
+                    return None;
+                }
+                n("str", vec![a(v.clone())])
+            }
+            // T-SQL 0xAB01 and PostgreSQL '\xAB01'::bytea: the bytes, when
+            // they fill a fixed type or fit a bounded one.
+            (Expr::Num(v), Some(table::Ty::Binary { fixed, len }))
+                if v.len() >= 2 && v[..2].eq_ignore_ascii_case("0x") =>
+            {
+                bytes(&v[2..], *fixed, *len)?
+            }
+            (Expr::Cast(x, cty), Some(table::Ty::Binary { fixed, len }))
+                if u.dialect == Dialect::Postgres && cty.name.eq_ignore_ascii_case("BYTEA") =>
+            {
+                match x.as_ref() {
+                    Expr::Str(v) => bytes(v.strip_prefix("\\x")?, *fixed, *len)?,
+                    _ => continue,
+                }
+            }
+            (Expr::Str(v), _) => {
+                literal::convert(v, target?, u.dialect, true)
+                    .filter(|(_, asm)| asm.is_none())?
+                    .0
+            }
+            (Expr::Num(v), _) => match target? {
+                t @ (Target::Int { .. } | Target::Exact { .. } | Target::Bit | Target::Bool) => {
+                    literal::convert(v, t, u.dialect, true)?.0
+                }
+                _ => return None,
+            },
+            (Expr::Special(w), Some(table::Ty::Bool)) if w == "TRUE" || w == "FALSE" => {
+                literal::convert(w, Target::Bool, u.dialect, true)?.0
+            }
+            _ => continue,
+        });
+    }
+    // bit 1 and boolean TRUE are the same value: the declared types were
+    // already matched.
+    let t = n("bool", vec![a("TRUE")]);
+    let f = n("bool", vec![a("FALSE")]);
+    Some(
+        out.into_iter()
+            .map(|x| {
+                if x == t {
+                    n("num", vec![a("1")])
+                } else if x == f {
+                    n("num", vec![a("0")])
+                } else {
+                    x
+                }
+            })
+            .collect(),
+    )
+}
+
+fn bytes(hex: &str, fixed: bool, len: Option<u32>) -> Option<Term> {
+    let h = super::canon::hex_bytes(hex)?;
+    let count = h.len() / 2;
+    match len {
+        Some(max) if count > max as usize || (fixed && count != max as usize) => None,
+        _ => Some(n("bytes", vec![a(h)])),
     }
 }
 

@@ -193,6 +193,45 @@ fn variable_types_that_hold_the_same_values() {
 }
 
 #[test]
+fn literals_assigned_to_same_types() {
+    // Checked on SQL Server 2022 and PostgreSQL 18: decimal to int truncates
+    // in T-SQL (1) and rounds in PostgreSQL (2).
+    for (t, p) in [
+        ("DECLARE @x int = 1.5;", "v_x := 1.5;"),
+        ("DECLARE @x int;\nSET @x = 2.5;", "v_x := 2.5;"),
+    ] {
+        not_equal(
+            run(
+                &format!("SET XACT_ABORT ON;\n{t}\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, 'a', '20200101');"),
+                &format!("DO $$\nDECLARE\n  v_x integer;\nBEGIN\n  {p}\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, 'a', '20200101');\nEND\n$$;"),
+            ),
+            "cut off, rounded or rejected",
+        );
+    }
+    // T-SQL stores 'abc', PostgreSQL raises "value too long".
+    not_equal(
+        run(
+            "SET XACT_ABORT ON;\nDECLARE @s varchar(3) = 'abcdef';\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, '20200101');",
+            "DO $$\nDECLARE\n  v_s varchar(3);\nBEGIN\n  v_s := 'abcdef';\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, '20200101');\nEND\n$$;",
+        ),
+        "cut off, rounded or rejected",
+    );
+    // Also when the variable is written by a query too.
+    not_equal(
+        run(
+            "SET XACT_ABORT ON;\nDECLARE @s varchar(3) = 'abcdef';\nSELECT @s = MethodName FROM dbo.Methods WHERE MethodID = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, '20200101');",
+            "DO $$\nDECLARE\n  v_s varchar(3);\nBEGIN\n  v_s := 'abcdef';\n  SELECT MethodName INTO v_s FROM Methods WHERE MethodID = 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, '20200101');\nEND\n$$;",
+        ),
+        "cut off, rounded or rejected",
+    );
+    // Literals both types hold unchanged.
+    equal(
+        "SET XACT_ABORT ON;\nDECLARE @x int = 2;\nDECLARE @s varchar(3) = 'abc';\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, @s, '20200101');",
+        "DO $$\nDECLARE\n  v_x integer;\n  v_s varchar(3);\nBEGIN\n  v_x := 2;\n  v_s := 'abc';\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, v_s, '20200101');\nEND\n$$;",
+    );
+}
+
+#[test]
 fn variables_match_by_name_when_a_declaration_is_dropped() {
     equal(
         "DECLARE @Unused int;\nDECLARE @Id int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@Id, 'x', '20200101');",

@@ -150,7 +150,7 @@ pub struct Canon<'a> {
 
 /// Lower-case hex digits of a byte string written in hex, `None` unless
 /// every character is a hex digit and they make whole bytes.
-fn hex_bytes(s: &str) -> Option<String> {
+pub(super) fn hex_bytes(s: &str) -> Option<String> {
     (s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
 }
 
