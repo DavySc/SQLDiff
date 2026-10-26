@@ -154,6 +154,33 @@ This is a stricter bar than `sqldiff convert`'s, where only a proven difference 
 
 `check/instance-report.json` and `.md` give each instance's status and items (side, line in the woven file, rule), each converted template's status (the worst instance that uses it, includes too) and the converted templates no instance uses ("not exercised", never checked). The woven files are written to `check/source/` and `check/target/`. Exit code 0 when every instance is converted or converted under assumptions and all generator output is accounted for, 1 otherwise.
 
+### Keeping dialect trees in step
+
+Once the generator keeps one template set per dialect, the sets drift: a template is added, changed or rewired in one tree and not in the others. `sqldiff drift` finds that, in CI or before a commit:
+
+```sh
+sqldiff drift --tree tsql=templates/mssql --tree postgres=templates/pg --tree db2i=templates/ibmi -o drift/ --pack PACK \
+    [--reference tsql] [--base origin/main] [--manifest instances.toml] [--accept ASM-…] [--extension tpl …]
+```
+
+| Check | Rule |
+|---|---|
+| Every template (same relative path) is in every tree | `drift.missing` |
+| A template has the same placeholder names in every tree, so one set of values weaves all of them | `drift.placeholders` |
+| A template has the same directives (the pack's special forms, with their arguments) in the same order in every tree | `drift.directives` |
+| With `--base REV`: a template changed between the merge base of `REV` and `HEAD` and the working tree in some trees and not in all | `drift.changed-alone` |
+
+A change made in one tree on purpose carries the pack's `intentional_difference` author marker in that template (`-- SYNC-OK: why`, say); the report lists it with its reason instead of failing. With `--manifest`, every instance is also woven from the reference tree (the first `--tree` unless `--reference` says otherwise) and from each other tree and checked exactly like `sqldiff instances`, each into `drift/instances/<dialect>/`; a hand edit that changes what a template means then fails as differs or unknown there.
+
+`drift/drift-report.json` and `.md` list every finding by template and tree. Exit code 0 when nothing drifted and every instance check passed, 1 otherwise, so a CI step is the command itself:
+
+```yaml
+- run: sqldiff drift --tree tsql=templates/mssql --tree postgres=templates/pg --tree db2i=templates/ibmi
+         --base origin/${{ github.base_ref }} --manifest instances.toml --pack .sqldiff/pack -o drift/
+```
+
+`--base` needs the base branch's history in the checkout (`fetch-depth: 0`).
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.

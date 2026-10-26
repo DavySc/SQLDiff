@@ -101,9 +101,9 @@ impl TemplateMode {
 const DIRECTIVE: &str = "ASM-TEMPLATE-DIRECTIVE";
 
 /// One input file.
-struct Input {
-    rel: String,
-    text: String,
+pub(crate) struct Input {
+    pub(crate) rel: String,
+    pub(crate) text: String,
 }
 
 #[derive(Serialize)]
@@ -447,7 +447,10 @@ impl Progress {
 
 /// Every file with one of `extensions` under `src` (or `src` itself),
 /// sorted by path.
-fn collect(src: &Path, extensions: &[String]) -> Result<(Vec<Input>, Vec<String>), String> {
+pub(crate) fn collect(
+    src: &Path,
+    extensions: &[String],
+) -> Result<(Vec<Input>, Vec<String>), String> {
     let mut paths = Vec::new();
     if src.is_file() {
         paths.push(src.to_path_buf());

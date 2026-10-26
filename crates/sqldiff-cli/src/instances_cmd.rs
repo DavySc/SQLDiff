@@ -30,50 +30,50 @@ use sqldiff_source::weave::{Instance, Manifest, Weaver, Woven};
 use crate::convert_cmd::{catalog, decode, parallel};
 use crate::source_cmd;
 
-#[derive(ClapArgs)]
+#[derive(ClapArgs, Clone)]
 pub struct InstancesArgs {
     /// The instance manifest (TOML): every result the generator produces,
     /// with its templates and parameter values.
-    manifest: PathBuf,
+    pub(crate) manifest: PathBuf,
     /// The source templates (the tree the generator reads today).
     #[arg(long, value_name = "DIR")]
-    source: PathBuf,
+    pub(crate) source: PathBuf,
     /// The converted templates (`sqldiff convert --template` output, or
     /// templates written by hand), with the same layout.
     #[arg(long, value_name = "DIR")]
-    target: PathBuf,
+    pub(crate) target: PathBuf,
     #[arg(long, default_value = "tsql")]
-    from: Dialect,
+    pub(crate) from: Dialect,
     #[arg(long)]
-    to: Dialect,
+    pub(crate) to: Dialect,
     /// Output directory for the woven instances and the report.
     #[arg(short, long)]
-    out: PathBuf,
+    pub(crate) out: PathBuf,
     /// The generator's own output: each instance's source weave must equal
     /// its `output` file there, and every file there must belong to an
     /// instance.
     #[arg(long, value_name = "DIR")]
-    woven: Option<PathBuf>,
+    pub(crate) woven: Option<PathBuf>,
     /// A parameter name (repeatable), added to the names the manifest gives
     /// values for; under `placeholders = "parameters"` only these are
     /// placeholders.
     #[arg(long = "parameter", value_name = "NAME")]
-    parameters: Vec<String>,
+    pub(crate) parameters: Vec<String>,
     /// An assumption you know holds (repeatable), e.g. ASM-DBO-SCHEMA: a
     /// status line in the converted templates that lists only accepted
     /// assumptions no longer holds an instance back. Listed in the report.
     #[arg(long = "accept", value_name = "ID")]
-    accept: Vec<String>,
+    pub(crate) accept: Vec<String>,
     /// Parallel jobs (default: available cores).
     #[arg(short, long)]
-    jobs: Option<usize>,
+    pub(crate) jobs: Option<usize>,
     /// Replace files in a non-empty output directory.
     #[arg(long)]
-    overwrite: bool,
+    pub(crate) overwrite: bool,
     #[command(flatten)]
-    catalogs: source_cmd::CatalogArgs,
+    pub(crate) catalogs: source_cmd::CatalogArgs,
     #[command(flatten)]
-    cfg: source_cmd::ConfigArgs,
+    pub(crate) cfg: source_cmd::ConfigArgs,
 }
 
 /// How far an instance can be trusted, best first.
@@ -173,6 +173,14 @@ struct Report {
 }
 
 pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
+    let ok = check(a)?.0;
+    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+}
+
+/// Runs the check and writes the report: whether every instance is
+/// converted (under assumptions at worst) and all generator output is
+/// accounted for, and the count of instances per status.
+pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, usize>), String> {
     let cfg = a.cfg.resolve()?;
     let def = cfg
         .policy
@@ -399,7 +407,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
         .iter()
         .all(|r| r.status <= Outcome::Assumptions)
         && report.not_in_manifest.is_empty();
-    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+    Ok((ok, report.totals))
 }
 
 /// An instance's items, the engine's assumptions about the whole pair, and
