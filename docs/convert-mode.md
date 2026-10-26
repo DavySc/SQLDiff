@@ -224,8 +224,8 @@ A decision applies only while both files are unchanged since it was made, to the
 
 | Tier | Items |
 |---|---|
-| 1 | Differs, not converted, rejected in review; a table, routine or type several units fail to bind on and nothing else is wrong with, as one item (convert or create it first); gating output findings outside any unit; templates whose instances differ |
-| 2 | Not proven; templates whose instances are unknown or not woven, or have a status the queue does not know; templates no instance uses; generator output no instance accounts for |
+| 1 | Differs, not converted, rejected in review; source files that could not be read as text; a table, routine or type several units fail to bind on and nothing else is wrong with, as one item (convert or create it first); gating output findings outside any unit; templates whose instances differ |
+| 2 | Not proven; templates whose instances are unknown or not woven, or have a status the queue does not know; templates with an instance checked on SQLDiff's weave only, not on the generator's output (whatever its status, and every template of a report that predates the generator check); templates no instance uses; generator source or target output no instance accounts for |
 | 3 | Output an agent wrote that no person approved |
 | 4 | Open decisions |
 | 5 | Open assumptions, unverified vendor facts (`ASM-FACT-*`) and template premises (`ASM-TEMPLATE-*`) first |

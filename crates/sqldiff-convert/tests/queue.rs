@@ -244,7 +244,7 @@ fn templates_are_judged_by_their_instances() {
         r#"{
           "instances": [
             {"name": "I1", "status": "differs", "templates": ["c.sql"]},
-            {"name": "I2", "status": "converted", "templates": ["c.sql"]},
+            {"name": "I2", "status": "converted", "templates": ["c.sql"], "done": true},
             {"name": "I3", "status": "something-new", "templates": ["a.sql"]}
           ],
           "templates": [
@@ -285,4 +285,67 @@ fn templates_are_judged_by_their_instances() {
         .items
         .iter()
         .any(|i| i.path == "a.sql" && i.kind == Kind::Unit && i.instances == 1));
+}
+
+#[test]
+fn templates_checked_on_sqldiffs_weave_only_are_never_better_than_nothing_claimed() {
+    let fx = Fixture::new(
+        "weave-only",
+        &[
+            ("a.sql", ASSUMING),
+            ("c.sql", "SELECT 1 AS x;\n"),
+            ("d.sql", "SELECT 2 AS y;\n"),
+        ],
+    );
+    let (t, _) = fx.convert();
+    let inst: Instances = serde_json::from_str(
+        r#"{
+          "instances": [
+            {"name": "W", "status": "converted", "templates": ["c.sql"], "done": false, "weave_only": ["target"]},
+            {"name": "A", "status": "assumptions", "templates": ["a.sql"], "done": false, "weave_only": ["source", "target"]},
+            {"name": "D", "status": "converted", "templates": ["d.sql"], "done": true, "weave_only": []},
+            {"name": "Old", "status": "converted", "templates": ["e.sql"]}
+          ],
+          "templates": [
+            {"path": "c.sql", "status": "converted", "done": false, "instances": 1, "weave_only": 1},
+            {"path": "a.sql", "status": "assumptions", "done": false, "instances": 1, "weave_only": 1},
+            {"path": "d.sql", "status": "converted", "done": true, "instances": 1, "weave_only": 0},
+            {"path": "e.sql", "status": "converted", "instances": 1}
+          ],
+          "not_in_manifest_target": ["gen/pg/extra.sql"]
+        }"#,
+    )
+    .unwrap();
+    let q = build(&t.report, Some(&inst), false);
+    let item = |k: &str| q.items.iter().find(|i| i.key == k);
+    let c = item("template:c.sql").expect("a converted template checked on the weave only");
+    assert_eq!(c.tier, 2);
+    assert!(c.failing_instances[0].1.contains("weave only"), "{c:#?}");
+    assert_eq!(item("template:a.sql").unwrap().tier, 2);
+    // Done: checked on the generator's output.
+    assert!(item("template:d.sql").is_none());
+    // A report from before the generator check claims nothing about it.
+    assert_eq!(item("template:e.sql").unwrap().tier, 2);
+    let n = item("not-in-manifest-target:gen/pg/extra.sql").unwrap();
+    assert_eq!((n.tier, n.kind), (2, Kind::NotInManifest));
+}
+
+#[test]
+fn unreadable_files_are_wrong_or_missing() {
+    let fx = Fixture::new("unreadable", &[("c.sql", "SELECT 1 AS x;\n")]);
+    std::fs::write(
+        fx.dir.join("src").join("bad.sql"),
+        [0xC3u8, 0x28, 0xFF, 0x00],
+    )
+    .unwrap();
+    let (t, _) = fx.convert();
+    assert_eq!(t.report.unreadable, vec!["bad.sql".to_string()]);
+    let q = build(&t.report, None, false);
+    let i = q
+        .items
+        .iter()
+        .find(|i| i.key == "unreadable:bad.sql")
+        .unwrap();
+    assert_eq!((i.tier, i.kind), (1, Kind::Unreadable));
+    assert_eq!(q.items[0].tier, 1);
 }

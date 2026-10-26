@@ -39,6 +39,9 @@ pub struct Instances {
     pub not_exercised: Vec<String>,
     #[serde(default)]
     pub not_in_manifest: Vec<String>,
+    /// Generator target output no instance accounts for.
+    #[serde(default)]
+    pub not_in_manifest_target: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -47,6 +50,13 @@ pub struct Instance {
     pub status: String,
     #[serde(default)]
     pub templates: Vec<String>,
+    /// Converted and checked on the generator's output. A report without it
+    /// checked nothing on the generator's output, so it defaults to false.
+    #[serde(default)]
+    pub done: bool,
+    /// Sides checked on SQLDiff's weave only.
+    #[serde(default)]
+    pub weave_only: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -55,6 +65,12 @@ pub struct TemplateStatus {
     pub status: String,
     #[serde(default)]
     pub instances: usize,
+    /// Every instance that uses it is done (false when the report predates it).
+    #[serde(default)]
+    pub done: bool,
+    /// Instances that use it checked on SQLDiff's weave only.
+    #[serde(default)]
+    pub weave_only: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -72,6 +88,8 @@ pub enum Kind {
     NotExercised,
     /// Generator output no instance in the manifest accounts for.
     NotInManifest,
+    /// A source file that could not be read as text: not converted.
+    Unreadable,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,13 +171,21 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
             per_template.entry(t.path.as_str()).or_default().0 = t.instances;
         }
         for x in &i.instances {
-            if x.status != "converted" {
+            // Not done: not converted, or checked on SQLDiff's weave only.
+            let why = if x.status != "converted" {
+                Some(x.status.clone())
+            } else if !x.done {
+                Some(weave_only_label(&x.status, &x.weave_only))
+            } else {
+                None
+            };
+            if let Some(why) = why {
                 for t in &x.templates {
                     per_template
                         .entry(t.as_str())
                         .or_default()
                         .1
-                        .push((x.name.clone(), x.status.clone()));
+                        .push((x.name.clone(), why.clone()));
                 }
             }
         }
@@ -250,12 +276,15 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
     if let Some(i) = inst {
         for t in &i.templates {
             let tier = match t.status.as_str() {
-                "converted" => continue,
+                "converted" if t.done => continue,
                 "assumptions" => 5,
                 "decision" => 4,
                 "differs" => 1,
                 _ => 2,
             };
+            // Instances checked on SQLDiff's weave only say nothing about
+            // the generator's output: never better than nothing claimed.
+            let tier = if t.done { tier } else { tier.min(2) };
             items.push(Item {
                 key: format!("template:{}", t.path),
                 tier,
@@ -266,11 +295,20 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                 out_line: 0,
                 status: t.status.clone(),
                 rules: Vec::new(),
-                reason: format!(
-                    "{} of {} instance(s) woven from it are not converted",
-                    per_template.get(t.path.as_str()).map_or(0, |e| e.1.len()),
-                    t.instances
-                ),
+                reason: if t.status == "converted" || t.weave_only > 0 {
+                    format!(
+                        "{} of {} instance(s) woven from it are not done; {} checked on SQLDiff's weave only, not on the generator's output",
+                        per_template.get(t.path.as_str()).map_or(0, |e| e.1.len()),
+                        t.instances,
+                        t.weave_only
+                    )
+                } else {
+                    format!(
+                        "{} of {} instance(s) woven from it are not converted",
+                        per_template.get(t.path.as_str()).map_or(0, |e| e.1.len()),
+                        t.instances
+                    )
+                },
                 units: Vec::new(),
                 instances: t.instances,
                 failing_instances: per_template
@@ -282,21 +320,29 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                 outdated: false,
             });
         }
-        for (paths, kind, reason) in [
+        for (paths, kind, prefix, reason) in [
             (
                 &i.not_exercised,
                 Kind::NotExercised,
+                "not-exercised",
                 "no instance uses this template: it was never checked; add an instance",
             ),
             (
                 &i.not_in_manifest,
                 Kind::NotInManifest,
+                "not-in-manifest",
                 "generator output no instance accounts for: the manifest does not describe the generator",
+            ),
+            (
+                &i.not_in_manifest_target,
+                Kind::NotInManifest,
+                "not-in-manifest-target",
+                "generator target output no instance accounts for: the manifest does not describe the generator",
             ),
         ] {
             for p in paths {
                 items.push(Item {
-                    key: format!("{}:{p}", if kind == Kind::NotExercised { "not-exercised" } else { "not-in-manifest" }),
+                    key: format!("{prefix}:{p}"),
                     tier: 2,
                     kind,
                     path: p.clone(),
@@ -315,6 +361,26 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                 });
             }
         }
+    }
+    for p in &r.unreadable {
+        items.push(Item {
+            key: format!("unreadable:{p}"),
+            tier: 1,
+            kind: Kind::Unreadable,
+            path: p.clone(),
+            unit: None,
+            src_line: 0,
+            out_line: 0,
+            status: Status::NotConverted.label().to_string(),
+            rules: Vec::new(),
+            reason: "the source file could not be read as text: it was not converted".into(),
+            units: Vec::new(),
+            instances: blast(p),
+            failing_instances: Vec::new(),
+            open: Vec::new(),
+            written_by: None,
+            outdated: false,
+        });
     }
     items.sort_by(|a, b| {
         a.tier
@@ -524,4 +590,15 @@ pub fn summary(q: &Queue) -> String {
         }
     }
     s
+}
+
+fn weave_only_label(status: &str, sides: &[String]) -> String {
+    if sides.is_empty() {
+        format!("{status}, not checked on the generator's output")
+    } else {
+        format!(
+            "{status} on SQLDiff's weave only (no generator output for the {} side)",
+            sides.join(" and ")
+        )
+    }
 }
