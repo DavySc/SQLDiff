@@ -861,9 +861,11 @@ pub fn serve(listener: TcpListener, review: Review, extra_hosts: &[String]) -> s
         let Ok(stream) = stream else { continue };
         let review = Arc::clone(&review);
         let hosts = Arc::clone(&hosts);
-        std::thread::spawn(move || {
-            let _ = handle(stream, &review, &hosts);
-        });
+        std::thread::Builder::new()
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || {
+                let _ = handle(stream, &review, &hosts);
+            })?;
     }
     Ok(())
 }

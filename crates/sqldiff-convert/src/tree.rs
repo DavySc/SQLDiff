@@ -849,12 +849,15 @@ pub fn parallel<T: Sync, R: Send>(jobs: usize, items: &[T], f: impl Fn(&T) -> R 
         items.iter().map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|s| {
         for _ in 0..jobs.min(items.len()) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(item) = items.get(i) else { break };
-                let r = f(item);
-                *slots[i].lock().unwrap() = Some(r);
-            });
+            std::thread::Builder::new()
+                .stack_size(sqldiff_core::ENGINE_STACK)
+                .spawn_scoped(s, || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = f(item);
+                    *slots[i].lock().unwrap() = Some(r);
+                })
+                .expect("start a worker thread");
         }
     });
     slots
