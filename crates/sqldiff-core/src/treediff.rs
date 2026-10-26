@@ -1,5 +1,7 @@
 //! Same-dialect structural diff: statements aligned by content, not by line.
 
+use std::collections::HashSet;
+
 use sqldiff_syntax::{ast, SyntaxKind, SyntaxNode};
 
 use crate::artifact::{snippet_of, Analyzed};
@@ -90,6 +92,8 @@ pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
         },
         removed: Vec::new(),
         added: Vec::new(),
+        hashes_a: all_hashes(&ua),
+        hashes_b: all_hashes(&ub),
     };
     ctx.diff_lists(&ua, &ub);
     ctx.resolve_unpaired();
@@ -102,6 +106,20 @@ struct Ctx<'x, 'a> {
     out: TreeDiff,
     removed: Vec<Unit>,
     added: Vec<Unit>,
+    /// Content hashes of every unit at any depth, per side: a unit whose
+    /// twin exists on the other side may have moved.
+    hashes_a: HashSet<String>,
+    hashes_b: HashSet<String>,
+}
+
+fn all_hashes(units: &[Unit]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut stack: Vec<&Unit> = units.iter().collect();
+    while let Some(u) = stack.pop() {
+        out.insert(u.full.clone());
+        stack.extend(u.children.iter());
+    }
+    out
 }
 
 impl Ctx<'_, '_> {
@@ -179,6 +197,11 @@ impl Ctx<'_, '_> {
                 next = yj + 1;
             }
         }
+        pairs.extend(self.pair_by_kind(ga, gb, &pairs));
+        pairs.sort_unstable();
+        for &(_, yj) in &pairs {
+            paired_b[yj] = true;
+        }
         let paired_a: Vec<usize> = pairs.iter().map(|p| p.0).collect();
         for (xi, x) in ga.iter().enumerate() {
             if !paired_a.contains(&xi) {
@@ -193,6 +216,70 @@ impl Ctx<'_, '_> {
         for (xi, yj) in pairs {
             self.modified(&ga[xi], &gb[yj]);
         }
+    }
+
+    /// Statements the similarity score left unpaired, paired in order by
+    /// kind within each stretch between two scored pairs. Two SELECTs with
+    /// rewritten expressions (`SELECT FLOOR(RAND())` against `SELECT 0e0`)
+    /// share few tokens, yet each side still runs one SELECT there: calling
+    /// them removed and added would claim a result set without counterpart.
+    /// As a pair they are "modified" (unknown) and statement equivalence
+    /// gets to decide them. Only effectful leaf statements are paired, never
+    /// transaction control, and never one whose exact text appears on the
+    /// other side (that one may have moved).
+    fn pair_by_kind(
+        &self,
+        ga: &[Unit],
+        gb: &[Unit],
+        pairs: &[(usize, usize)],
+    ) -> Vec<(usize, usize)> {
+        let eligible = |u: &Unit, other: &HashSet<String>| {
+            u.children.is_empty()
+                && u.kind.is_effectful()
+                && !u.kind.is_txn_control()
+                && !other.contains(&u.full)
+        };
+        let key = |u: &Unit| {
+            // DDL of different verbs or object kinds (`CREATE TABLE` against
+            // `DROP INDEX`) are not edits of one another.
+            let lead = if u.kind == StmtKind::Ddl {
+                u.toks
+                    .iter()
+                    .take(2)
+                    .map(|t| t.loose.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                String::new()
+            };
+            (u.node.kind(), u.kind, lead)
+        };
+        let mut out = Vec::new();
+        let (mut ai, mut bj) = (0, 0);
+        for (i, j) in pairs
+            .iter()
+            .copied()
+            .chain(std::iter::once((ga.len(), gb.len())))
+        {
+            let xs: Vec<usize> = (ai..i)
+                .filter(|&k| eligible(&ga[k], &self.hashes_b))
+                .collect();
+            let ys: Vec<usize> = (bj..j)
+                .filter(|&k| eligible(&gb[k], &self.hashes_a))
+                .collect();
+            if !xs.is_empty() && !ys.is_empty() {
+                let ka: Vec<_> = xs.iter().map(|&k| key(&ga[k])).collect();
+                let kb: Vec<_> = ys.iter().map(|&k| key(&gb[k])).collect();
+                out.extend(
+                    crate::normalize::lcs_pairs(&ka, &kb)
+                        .into_iter()
+                        .map(|(p, q)| (xs[p], ys[q])),
+                );
+            }
+            ai = i + 1;
+            bj = j + 1;
+        }
+        out
     }
 
     fn modified(&mut self, x: &Unit, y: &Unit) {

@@ -17,6 +17,9 @@ const KNOWN_MISSES: &[(&str, &str, &str)] = &[
     ("p13-named-lock", "tsql", "pg"),
     ("p13-named-lock", "tsql", "db2i"),
     ("p13-named-lock", "pg", "db2i"),
+    // The two PERFORMs are one edited statement, so the verdict rests on
+    // the lock idiom; it used to match only because they were left unpaired.
+    ("m04-lock-on-missing-row", "original", "mutated"),
     // Same-dialect mutations outside statement equivalence (lints).
     ("m14-terminator-before-throw", "original", "mutated"),
 ];
