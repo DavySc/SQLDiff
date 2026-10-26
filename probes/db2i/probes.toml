@@ -2367,3 +2367,148 @@ outcome = [
   { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected as too long (SQLSTATE and SQLCODE recorded)." },
   { label = "other", when = { create = "00000" }, verdict = "open", meaning = "Stored differently; N1 is the stored length." },
 ]
+
+# ---------------------------------------------------------------- V31 casts and literal types
+# The engine compares Db2 for i conversions only between integers, to wider
+# decimals and for strings that fit (crates/sqldiff-core/src/equiv/canon.rs,
+# "casts and implicit conversions"); every other Db2 for i cast is unproven.
+# These answers would let it model more. SQL Server truncates a decimal or
+# float to an integer and PostgreSQL rounds; see eval/casts.
+
+[[probe]]
+id = "V31-DEC-TO-INT"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST(1.5 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "CAST(1.5 AS INTEGER): 1 (fraction dropped, as SQL Server) or 2 (rounded, as PostgreSQL)?"
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "Drops the fraction, as SQL Server." },
+  { label = "rounds", when = { create = "00000", state = "00000", n1 = "=2" }, verdict = "open", meaning = "Rounds, as PostgreSQL." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-NEG-DEC-TO-INT"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST(-1.5 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "CAST(-1.5 AS INTEGER): -1 (toward zero) or -2 (half away from zero)?"
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "toward zero", when = { create = "00000", state = "00000", n1 = "=-1" }, verdict = "open", meaning = "Toward zero, as SQL Server." },
+  { label = "away from zero", when = { create = "00000", state = "00000", n1 = "=-2" }, verdict = "open", meaning = "Half away from zero, as PostgreSQL." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-DOUBLE-TO-INT"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST(CAST(2.5 AS DOUBLE) AS INTEGER) * 10 + CAST(CAST(1.5 AS DOUBLE) AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "DOUBLE 2.5 and 1.5 to INTEGER, as 10 * first + second: 21 truncates (SQL Server), 22 rounds half to even (PostgreSQL), 32 rounds half away from zero."
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=21" }, verdict = "open", meaning = "Drops the fraction, as SQL Server." },
+  { label = "half to even", when = { create = "00000", state = "00000", n1 = "=22" }, verdict = "open", meaning = "Rounds half to even, as PostgreSQL." },
+  { label = "half away", when = { create = "00000", state = "00000", n1 = "=32" }, verdict = "open", meaning = "Rounds half away from zero." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-DEC-SCALE"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST(CAST(1.555 AS DECIMAL(5,2)) * 100 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "CAST(1.555 AS DECIMAL(5,2)): 1.56 (rounded, as SQL Server and PostgreSQL) or 1.55 (truncated)? N1 is the value times 100."
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "rounds", when = { create = "00000", state = "00000", n1 = "=156" }, verdict = "open", meaning = "Rounds, as SQL Server and PostgreSQL." },
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=155" }, verdict = "open", meaning = "Truncates the extra digits." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-DOUBLE-TO-DEC"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST(CAST(CAST(2.675 AS DOUBLE) AS DECIMAL(5,2)) * 100 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "DOUBLE 2.675 to DECIMAL(5,2) (N1 is the value times 100): 267 (from the binary value, as SQL Server) or 268 (from the shortest decimal form, as PostgreSQL)?"
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "binary", when = { create = "00000", state = "00000", n1 = "=267" }, verdict = "open", meaning = "From the binary value, as SQL Server." },
+  { label = "decimal form", when = { create = "00000", state = "00000", n1 = "=268" }, verdict = "open", meaning = "From the shortest decimal form, as PostgreSQL." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-FLOAT-LITERAL-TEXT"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CASE VARCHAR(1234567E0) WHEN ''1234567'' THEN 1 WHEN ''1.234567E6'' THEN 2 WHEN ''1.234567E+06'' THEN 3 WHEN ''1.23457e+006'' THEN 4 ELSE 5 END FROM SYSIBM.SYSDUMMY1'"]
+question = "How does VARCHAR() write the floating-point constant 1234567E0? 1 = '1234567' (PostgreSQL, where it is numeric), 4 = '1.23457e+006' (SQL Server), 2 or 3 other exponent forms, 5 something else."
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "plain", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "'1234567'." },
+  { label = "E6", when = { create = "00000", state = "00000", n1 = "=2" }, verdict = "open", meaning = "'1.234567E6'." },
+  { label = "E+06", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "open", meaning = "'1.234567E+06'." },
+  { label = "sql server", when = { create = "00000", state = "00000", n1 = "=4" }, verdict = "open", meaning = "'1.23457e+006', as SQL Server." },
+  { label = "other", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "open", meaning = "Another text." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-BIG-INT-LITERAL"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST((2147483648 / 7 - 306783378) * 1000000 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "Is 2147483648 a BIGINT constant (integer division gives 0 here, as PostgreSQL) or a DECIMAL (285714 or similar, as SQL Server's numeric(10,0))?"
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "bigint", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "BIGINT: integer division, as PostgreSQL." },
+  { label = "decimal", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "DECIMAL: the division keeps a fraction (N1 has it in millionths)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-DECIMAL-DEFAULT"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CAST(CAST(1.5 AS DECIMAL) * 10 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "CAST(1.5 AS DECIMAL) without precision is DECIMAL(5,0): N1 is 20 if it rounds, 10 if it truncates (SQL Server's DECIMAL(18,0) gives 2; PostgreSQL keeps 1.5)."
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "rounds", when = { create = "00000", state = "00000", n1 = "=20" }, verdict = "open", meaning = "Rounded to 2." },
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=10" }, verdict = "open", meaning = "Truncated to 1." },
+  { label = "keeps", when = { create = "00000", state = "00000", n1 = "=15" }, verdict = "open", meaning = "Keeps 1.5: not DECIMAL(5,0)." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V31-TIMESTAMP-ROUND"
+fact = "V31"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT SECOND(CAST(TIMESTAMP(''1999-12-31-23.59.59.500000'') AS TIMESTAMP(0))) FROM SYSIBM.SYSDUMMY1'"]
+question = "TIMESTAMP 1999-12-31-23.59.59.5 to TIMESTAMP(0): second 0 (rounded up into 2000, as SQL Server), 59 (truncated, or rounded toward 2000-01-01 as PostgreSQL does before 2000)?"
+source = "Open question for the engine's cast model; SQL Server 2022 and PostgreSQL 18 were run (eval/casts), no IBM i documentation was read for it."
+outcome = [
+  { label = "rounds up", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "Rounded up to 2000-01-01-00.00.00, as SQL Server." },
+  { label = "down", when = { create = "00000", state = "00000", n1 = "=59" }, verdict = "open", meaning = "Stays at 23.59.59: truncated, or rounded as PostgreSQL." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]

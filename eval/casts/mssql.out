@@ -1,0 +1,139 @@
+dec2int 1.5|1
+dec2int -1.5|-1
+dec2int 2.5|2
+dec2int 1.99|1
+dec2bigint 1.5|1
+dec2smallint 1.5|1
+dec2tinyint 1.5|1
+col dec2int 2.50|2
+flt2int 1.5|1
+flt2int 2.5|2
+flt2int -2.5|-2
+real2int 2.5|2
+dec0 2int|7
+convert dec2int|1
+Msg 8115, Level 16, State 2, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error converting expression to data type int.
+Msg 220, Level 16, State 1, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error for data type smallint, value = 40000.
+dec2dec 1.555|1.56
+dec2dec -1.555|-1.56
+dec2dec 1.545|1.55
+dec2dec 2.5 s0|3
+dec2dec -2.5 s0|-3
+flt2dec 2.675|2.67
+flt2dec 1.5 s0|3
+flt2dec 0.1|.1000000000000000055511151
+dec2numeric default|2
+dec2decimal default|123
+Msg 8115, Level 16, State 8, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error converting numeric to data type numeric.
+lit 1234567e0 type|float
+lit 1.5 type|numeric|2|1
+lit 2147483647 type|int
+lit 2147483648 type|numeric|10
+lit -2147483648 type|int
+lit 9223372036854775808 type|numeric
+lit $12.34 type|money
+lit 0x1F type|varbinary
+lit N type|nvarchar
+lit .5 type|numeric
+lit 1e3 type|float
+lit 1.e3|1000.0
+cast 1234567e0 varchar|1.23457e+006
+cast 1.5e0 varchar|1.5
+cast 0.1e0 varchar|0.1
+flt sum 0.1e0+0.2e0 = 0.3e0|0
+dec sum 0.1+0.2 = 0.3|1
+big lit div|306783378.285714
+int lit div|306783378
+big lit 3e9 div 2|1500000000.000000
+hex plus|31
+int2vc|123
+neg int2vc|-123
+dec2vc 1.50|1.50
+dec2vc 0.50|0.50
+dec2vc -0.50|-0.50
+col dec2vc|1.50
+Msg 8115, Level 16, State 5, Server 1dd6adccaf60, Line 8
+Arithmetic overflow error converting numeric to data type varchar.
+int2vc short|*
+flt2vc 1234567|1.23457e+006
+flt2vc 0.1|0.1
+flt2vc 100000|100000
+real2vc|1.1
+money2vc|1234.50
+nvc int|123
+char int|123  |
+vc default len|30
+bigint2vc|-9223372036854775808
+str2int ' 12 '|12
+str2int '+12'|12
+str2int empty|0
+Msg 8114, Level 16, State 5, Server 1dd6adccaf60, Line 5
+Error converting data type varchar to numeric.
+Msg 245, Level 16, State 1, Server 1dd6adccaf60, Line 1
+Conversion failed when converting the varchar value '1.5' to data type int.
+Msg 245, Level 16, State 1, Server 1dd6adccaf60, Line 1
+Conversion failed when converting the varchar value '1e3' to data type int.
+Msg 8114, Level 16, State 5, Server 1dd6adccaf60, Line 1
+Error converting data type varchar to numeric.
+str2dec 1.555|1.56
+str2flt 1e3|1000.0
+str2dec ' 1.5 '|1.50
+var str2int|7
+var str2int|0
+dt2 to date|2026-01-01
+dt2 to datetime|2026-01-02 00:00:00.000
+dt2 to datetime2|2026-01-02 00:00:00
+dt2(7) to time(0)|10:00:01
+date to dt2|2026-01-01 00:00:00.0000000
+dt2 to vc|2026-01-02 03:04:05.5000000
+dt to vc|Jan  2 2026  3:04AM
+date to vc|2026-01-02
+time to vc|03:04:05.0000000
+dto to dt2|2026-01-02 03:04:05.0000000
+dto to vc|2026-01-02 03:04:05.0000000 +02:00
+dt2 cast smalldt|2026-01-02 03:05:00
+dt2 to datetime2 default|2026-01-01 23:59:59.1234568
+int div|3|-3|1|-1
+smallint add type|smallint
+tinyint add type|tinyint
+Msg 8115, Level 16, State 2, Server 1dd6adccaf60, Line 5
+Arithmetic overflow error converting expression to data type smallint.
+int+bigint type|bigint
+dec div|.333333|.333333
+dec div type|8|6
+int*dec|4.5
+dec add|2.375
+int/float|0.33333333333333331
+Msg 8115, Level 16, State 2, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error converting expression to data type int.
+Msg 8115, Level 16, State 2, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error converting expression to data type int.
+Msg 8134, Level 16, State 1, Server 1dd6adccaf60, Line 1
+Divide by zero error encountered.
+Msg 8115, Level 16, State 2, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error converting expression to data type smallint.
+int = 1.5|1|1
+int col = 1.5|0
+flt = dec|1
+real = dec|1
+real = float|0
+dec(5,2) = 1.005|0
+big int = 1e0|1
+bigint = dec|0
+vc trunc|abc
+char pad|ab  |
+nvc trunc|abc
+vc bytes|ééé
+vc default 30|30
+real 1.1 to float|1.1000000238418579
+float(24) type|real
+dec to float|0.10000000000000001
+dec to real|0.1
+int to real|1.6777216E+7
+bigint to float|9007199254740992.0
+float to bigint|9007199254740992
+money cast|1.2346|-1.2346|2.5000
+money to int|3|2|-3

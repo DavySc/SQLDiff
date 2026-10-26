@@ -1,0 +1,52 @@
+Field separator is "|".
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ins dec->int|2
+ins dec->int|-3
+ins dec->int|2
+DELETE 3
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ins dec->dec(5,1)|1.3
+ins dec->dec(5,1)|-1.3
+ins dec->dec(5,1)|2.7
+DELETE 3
+INSERT 0 1
+ins ts->ts0|2026-01-01 10:00:01
+DELETE 1
+INSERT 0 1
+ins ts->date|2026-01-01
+DELETE 1
+INSERT 0 1
+ins dec->real|0.10000000149011612
+ERROR:  value too long for type character varying(3)
+ERROR:  invalid input syntax for type integer: ""
+LINE 1: INSERT INTO a (i) VALUES ('');
+                                  ^
+NOTICE:  var 2 1.3 2
+DO
+ERROR:  value too long for type character varying(3)
+CONTEXT:  PL/pgSQL function inline_code_block line 1 during statement block local variable initialization
+NOTICE:  set var 3
+DO
+CREATE TABLE
+INSERT 0 1
+UPDATE 1
+upd|3
+CREATE FUNCTION
+ERROR:  function pg_temp.p(numeric) does not exist
+LINE 1: SELECT 'param', pg_temp.p(2.7);
+                        ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+CREATE PROCEDURE
+ERROR:  procedure pg_temp.q(numeric) does not exist
+LINE 1: CALL pg_temp.q(2.7);
+             ^
+HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  procedure pg_temp.q(numeric) does not exist
+LINE 1: CALL pg_temp.q(CAST(2.7 AS numeric));
+             ^
+HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.

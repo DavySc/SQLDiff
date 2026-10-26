@@ -77,7 +77,7 @@ pub enum Expr {
     /// T-SQL `@x` / `@@x`.
     Var(String),
     Num(String),
-    /// String literal value (quotes removed, `''` unescaped); `n` marks N'..'.
+    /// String literal value (quotes removed, `''` unescaped).
     Str(String),
     Null,
     Star(Option<String>),
@@ -839,6 +839,14 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Num(t.text.to_lowercase()))
             }
             K::Str => {
+                // PostgreSQL reads N'..' as character(n): blank-padded, so it
+                // compares and concatenates without trailing blanks
+                // (eval/casts: N'ab ' = 'ab' is true). Not modelled.
+                if self.d == Dialect::Postgres && t.text.starts_with(['N', 'n']) {
+                    return Err(
+                        "PostgreSQL N'..' literals (type character) are not supported".into(),
+                    );
+                }
                 self.i += 1;
                 Ok(Expr::Str(string_value(&t.text)?))
             }

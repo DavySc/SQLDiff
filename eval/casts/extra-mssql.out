@@ -1,0 +1,28 @@
+dec38 add|1.0000000001
+dec38 add type|10
+dec add type|7|3
+int + dec type|3|1
+ts round pre2000|2000-01-01 00:00:00
+ts round 1970|1970-01-01 00:00:01
+ts round post2000|2026-01-01 00:00:01
+ts round 0.25|1999-12-31 23:59:59.3
+time round|10:00:01
+time round 23:59:59.5|23:59:59
+dt2 to time|10:00:00.1234567
+flt2vc 123456.7|123457
+flt2vc 1e-5|1e-005
+flt2vc 1234567 nvc|1.23457e+006
+flt2vc concat|1.23457e+006
+str2flt empty|0.0
+str2flt space|1.5
+tinyint add|201
+tinyint+int type|int
+date to dt|2026-01-02 00:00:00.000
+dec2int neg trunc|0
+round 3arg|1.00|-1.00
+round 3arg type|2
+float trunc to int via round|2
+Msg 8115, Level 16, State 2, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error converting expression to data type tinyint.
+Msg 220, Level 16, State 2, Server 1dd6adccaf60, Line 1
+Arithmetic overflow error for data type tinyint, value = -1.

@@ -1,0 +1,125 @@
+Field separator is "|".
+dec2int 1.5|2
+dec2int -1.5|-2
+dec2int 2.5|3
+dec2int 1.99|2
+dec2bigint 1.5|2
+dec2smallint 1.5|2
+col dec2int 2.50|3
+flt2int 1.5|2
+flt2int 2.5|2
+flt2int -2.5|-2
+real2int 2.5|2
+dec0 2int|7
+trunc dec2int|1|-1|2|-2
+trunc bigint type|double precision|9.007199254740992e+15
+ERROR:  integer out of range
+ERROR:  smallint out of range
+dec2dec 1.555|1.56
+dec2dec -1.555|-1.56
+dec2dec 1.545|1.55
+dec2dec 2.5 s0|3
+dec2dec -2.5 s0|-3
+flt2dec 2.675|2.68
+flt2dec 1.5 s0|3
+flt2dec 0.1|0.1000000000000000000000000
+dec2numeric default|1.5
+dec2decimal default|123.456
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 4, scale 1 must round to an absolute value less than 10^3.
+lit 1234567e0 type|numeric
+lit 1.5 type|numeric
+lit 2147483647 type|integer
+lit 2147483648 type|bigint
+lit -2147483648 type|integer
+lit 9223372036854775808 type|numeric
+lit N type|character
+lit N pad|t
+lit 0x1F|31
+lit 0x1F type|integer
+lit 1e3 type|numeric|1000
+lit 1.e3|1000
+cast 1234567e0 varchar|1234567
+cast 1.5e0 varchar|1.5
+cast 0.1e0 varchar|0.1
+flt sum 0.1e0+0.2e0 = 0.3e0|1
+dec sum 0.1+0.2 = 0.3|1
+big lit div|306783378
+int lit div|306783378
+big lit 3e9 div 2|1500000000
+int2vc|123
+neg int2vc|-123
+dec2vc 1.50|1.50
+dec2vc 0.50|0.50
+dec2vc -0.50|-0.50
+col dec2vc|1.50
+dec2vc short|123
+int2vc short|123
+flt2vc 1234567|1234567
+flt2vc 0.1|0.1
+flt2vc 100000|100000
+real2vc|1.1
+char int|123|
+bigint2vc|-9223372036854775808
+str2int ' 12 '|12
+str2int '+12'|12
+ERROR:  invalid input syntax for type integer: ""
+LINE 1: SELECT 'str2int empty', CAST('' AS int);
+                                     ^
+ERROR:  invalid input syntax for type numeric: ""
+LINE 1: SELECT 'str2dec empty', CAST('' AS decimal(5,2));
+                                     ^
+ERROR:  invalid input syntax for type integer: "1.5"
+LINE 1: SELECT 'str2int 1.5', CAST('1.5' AS int);
+                                   ^
+ERROR:  invalid input syntax for type integer: "1e3"
+LINE 1: SELECT 'str2int 1e3', CAST('1e3' AS int);
+                                   ^
+str2dec 1e3|1000.00
+str2dec 1.555|1.56
+str2flt 1e3|1000
+str2dec ' 1.5 '|1.50
+ERROR:  invalid input syntax for type integer: ""
+str2int 1_000|1000
+str2int 0x1F|31
+ts to date|2026-01-01
+ts to ts0|2026-01-02 00:00:00
+ts to time0|10:00:01
+date to ts|2026-01-01 00:00:00
+ts to vc|2026-01-02 03:04:05.5
+date to vc|2026-01-02
+time to vc|03:04:05
+tstz to ts|2026-01-02 01:04:05
+int div|3|-3|1|-1
+smallint add type|smallint
+ERROR:  smallint out of range
+int+bigint type|bigint
+dec div|0.33333333333333333333|0.33333333333333333333
+int*dec|4.5
+dec add|2.375
+int/float|0.33333333333333333333
+ERROR:  integer out of range
+ERROR:  integer out of range
+ERROR:  division by zero
+ERROR:  smallint out of range
+int = 1.5|1|1
+int col = 1.5|0
+flt = dec|1
+real = dec|0
+real = float|0
+dec(5,2) = 1.005|0
+big int = 1e0|0
+bigint = float|1
+bigint = dec|0
+vc trunc|abc
+char pad|ab|
+vc bytes|ééé
+real 1.1 to float|1.100000023841858
+float(24) type|real
+float type|double precision
+dec to float|0.1
+dec to real|0.1
+int to real|1.6777216e+07
+bigint to float|9.007199254740992e+15
+float to bigint|9007199254740992
+money cast|$1.23|-$1.23|$2.50
