@@ -11,7 +11,7 @@
 //! rules over the lossless CST; see `tsql`). Expression-level and behavioural conversion follow
 //! once expression trees and the semantic IR land.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
@@ -20,6 +20,7 @@ mod out;
 pub mod review;
 mod template;
 mod tok;
+pub mod tree;
 mod tsql;
 
 pub use template::{
@@ -28,7 +29,7 @@ pub use template::{
 };
 
 /// How far a converted unit can be trusted, from best to worst.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Converted by rules that need no assumption, and the engine found nothing.

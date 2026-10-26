@@ -494,6 +494,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sqldiff-core",
+ "sqldiff-source",
  "sqldiff-syntax",
 ]
 
@@ -543,6 +544,7 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sqldiff-convert",
  "sqldiff-core",
  "sqldiff-review",
  "sqldiff-source",
