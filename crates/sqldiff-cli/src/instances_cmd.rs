@@ -979,7 +979,14 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
 
 /// `sqldiff convert` writes its reports into the converted tree.
 fn is_report(rel: &str) -> bool {
-    matches!(rel, "conversion-report.json" | "conversion-report.md")
+    matches!(
+        rel,
+        "conversion-report.json"
+            | "conversion-report.md"
+            | sqldiff_convert::queue::QUEUE_JSON
+            | sqldiff_convert::queue::QUEUE_MD
+            | sqldiff_convert::review::LEDGER_FILE
+    )
 }
 
 fn prepare_out(a: &InstancesArgs) -> Result<(), String> {

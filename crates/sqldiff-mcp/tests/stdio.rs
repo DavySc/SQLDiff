@@ -84,6 +84,7 @@ fn handshake_list_and_conversion_review() {
             "open_in_gui",
             "convert",
             "convert_tree",
+            "conversion_queue",
             "converted_file"
         ]
     );

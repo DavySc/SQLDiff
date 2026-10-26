@@ -206,6 +206,21 @@ A decision applies only while both files are unchanged since it was made, to the
 
 `sqldiff convert` and the MCP `convert_tree` tool apply the ledger they find in the output directory. `conversion-report.json` then gives every unit its `id`, the rules of the engine's findings on it (`findings`) and its `review` (reviewed, open assumptions and decisions, what cannot be discharged, who wrote the output, and every decision with whether it still applies and why not); each file its `review` (reviewed, units reviewed and outdated, orphaned records); and the report a `ledger` summary. Plainly converted units are listed under `converted_units` (nothing found, not proven), the rest under `units` as before. Statuses, counts and the exit code are the same with or without a ledger.
 
+### The review queue
+
+`sqldiff convert` also writes `review-queue.json` and `review-queue.md`: what a person should look at, worst first, ranked by tier and never by a score (a score would let many clean units average away one that nothing was claimed about). Units the ledger says are reviewed are not listed; nothing is ever listed as safe.
+
+| Tier | Items |
+|---|---|
+| 1 | Differs, not converted, rejected in review; a table, routine or type several units fail to bind on and nothing else is wrong with, as one item (convert or create it first); gating output findings outside any unit; templates whose instances differ |
+| 2 | Not proven; templates whose instances are unknown or not woven, or have a status the queue does not know; templates no instance uses; generator output no instance accounts for |
+| 3 | Output an agent wrote that no person approved |
+| 4 | Open decisions |
+| 5 | Open assumptions, unverified vendor facts (`ASM-FACT-*`) and template premises (`ASM-TEMPLATE-*`) first |
+| 6 | Only with `--queue-all`: plainly converted units nobody approved (nothing found, not proven) |
+
+Inside a tier, items with the most instances woven from their template come first, then the most units, then path and line. With `--instances PATH` (`instance-report.json` from `sqldiff instances`, or its directory) each template is also judged by its woven instances and listed with the ones that fail. The MCP tool `conversion_queue` converts the tree again in memory, applies the ledger in `out` and returns the same queue; it writes nothing, and no MCP tool records a review decision.
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.
