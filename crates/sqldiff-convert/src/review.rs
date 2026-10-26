@@ -100,6 +100,12 @@ pub struct Record {
     /// was made on.
     pub input_hash: String,
     pub output_hash: String,
+    /// With `written`: the unit's output as written by hand. `unit` is then
+    /// the id of the unit as the rules wrote it, and the text replaces the
+    /// rules' output on every later conversion (and is checked like it)
+    /// while that unit exists; the hashes are not compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 /// The decisions read from a ledger, last record per (unit, rule, state
@@ -191,6 +197,12 @@ pub fn allowed(r: &Record) -> Result<(), String> {
                 r.state.label()
             ))
         }
+        _ if r.text.is_some() && r.state != State::Written => {
+            return Err(format!(
+                "only `written` carries text, not `{}`",
+                r.state.label()
+            ))
+        }
         State::Approved | State::Written if !r.rule.is_empty() => {
             return Err(format!(
                 "`{}` is about the whole unit and names no rule",
@@ -219,21 +231,28 @@ pub fn file_hash(text: &str) -> String {
 /// A unit's id: its file, its input text and its output text. Units with the
 /// same file and texts are told apart by their order (`~2`, `~3`, ...).
 pub fn unit_ids(path: &str, input: &str, c: &Conversion) -> Vec<String> {
+    ids_of(
+        path,
+        c.units.iter().map(|u| {
+            (
+                input.get(u.src.start..u.src.end).unwrap_or(""),
+                c.output.get(u.out.start..u.out.end).unwrap_or(""),
+            )
+        }),
+    )
+}
+
+/// [`unit_ids`] from each unit's input and output text.
+pub fn ids_of<'a>(path: &str, units: impl Iterator<Item = (&'a str, &'a str)>) -> Vec<String> {
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
-    c.units
-        .iter()
-        .map(|u| {
+    units
+        .map(|(src, out)| {
             let mut h = Sha256::new();
             h.update(path.as_bytes());
             h.update([0u8]);
-            h.update(input.get(u.src.start..u.src.end).unwrap_or("").as_bytes());
+            h.update(src.as_bytes());
             h.update([0u8]);
-            h.update(
-                c.output
-                    .get(u.out.start..u.out.end)
-                    .unwrap_or("")
-                    .as_bytes(),
-            );
+            h.update(out.as_bytes());
             let base = format!("u{}", hex(&h.finalize()[..8]));
             let n = seen.entry(base.clone()).or_insert(0);
             *n += 1;
@@ -301,7 +320,7 @@ pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> 
     for (u, id) in c.units.iter().zip(&ids) {
         let mut decisions: Vec<Applied> = ledger
             .records()
-            .filter(|r| r.path == path && &r.unit == id)
+            .filter(|r| r.path == path && &r.unit == id && r.text.is_none())
             .map(|r| {
                 let why_not = if r.input_hash != ih || r.output_hash != oh {
                     Some("the file changed since: confirm it again".to_string())
@@ -315,12 +334,41 @@ pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> 
                 }
             })
             .collect();
+        // Texts key to the rules' unit. The one the conversion put in place
+        // is current whatever the file's hashes (it changed the file); one
+        // a person's text replaced is left out; one that was not put in
+        // place (the unit's notes say why) never applies.
+        decisions.extend(
+            ledger
+                .records()
+                .filter(|r| r.path == path && r.text.is_some())
+                .filter_map(|r| match &u.written {
+                    Some(w) if r.unit == w.origin => {
+                        (r.by == w.by && r.author == w.author).then(|| Applied {
+                            record: r.clone(),
+                            current: true,
+                            why_not: None,
+                        })
+                    }
+                    None if &r.unit == id => Some(Applied {
+                        record: r.clone(),
+                        current: false,
+                        why_not: Some("the text was not put in place: see the unit's notes".into()),
+                    }),
+                    _ => None,
+                }),
+        );
         decisions.sort_by(|a, b| a.record.at.cmp(&b.record.at));
         units.push(judge(id, u, decisions));
     }
+    let origins: Vec<&str> = c
+        .units
+        .iter()
+        .filter_map(|u| u.written.as_ref().map(|w| w.origin.as_str()))
+        .collect();
     let orphaned = ledger
         .records()
-        .filter(|r| r.path == path && !ids.contains(&r.unit))
+        .filter(|r| r.path == path && !ids.contains(&r.unit) && !origins.contains(&r.unit.as_str()))
         .cloned()
         .collect();
     let unplaced = c
@@ -384,10 +432,13 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
     if u.status >= Status::Unproven && undischargeable.is_empty() {
         undischargeable.push(format!("status: {}", u.status.label()));
     }
+    // Hand-written output (applied by the conversion), or a record that the
+    // output as it stands was written by hand.
     let written_by = decisions
         .iter()
         .filter(|a| a.current && a.record.state == State::Written)
         .map(|a| a.record.by)
+        .chain(u.written.as_ref().map(|w| w.by))
         .max();
     let rejected = decisions
         .iter()
@@ -418,4 +469,53 @@ impl FileReview {
     pub fn reviewed(&self) -> bool {
         !self.units.is_empty() && self.unplaced.is_empty() && self.units.iter().all(|u| u.reviewed)
     }
+}
+
+impl Ledger {
+    /// Hand-written output for a file: the unit id as the rules wrote it,
+    /// and the record. A person's text replaces an agent's draft; two
+    /// different texts at the same level (two people, or agents only) are a
+    /// conflict and listed separately: neither applies.
+    pub fn texts(&self, path: &str) -> (BTreeMap<String, &Record>, Vec<String>) {
+        let mut by_unit: BTreeMap<String, Vec<&Record>> = BTreeMap::new();
+        for r in self.records() {
+            if r.path == path && r.state == State::Written && r.text.is_some() {
+                by_unit.entry(r.unit.clone()).or_default().push(r);
+            }
+        }
+        let (mut texts, mut conflicts) = (BTreeMap::new(), Vec::new());
+        for (unit, mut rs) in by_unit {
+            if rs.iter().any(|r| r.by == By::Human) {
+                rs.retain(|r| r.by == By::Human);
+            }
+            if rs.iter().all(|r| r.text == rs[0].text) {
+                texts.insert(unit, rs[0]);
+            } else {
+                conflicts.push(unit);
+            }
+        }
+        (texts, conflicts)
+    }
+}
+
+/// Appends a record to the ledger in `out` after checking it is allowed.
+/// The caller sets `by` from who it is, never from its own caller.
+pub fn append(out: &std::path::Path, r: &Record) -> Result<(), String> {
+    use std::io::Write;
+    allowed(r)?;
+    let path = out.join(LEDGER_FILE);
+    let line = serde_json::to_string(r).map_err(|e| e.to_string())?;
+    // A file that does not end in a newline gets one first, so the record
+    // starts its own line.
+    let needs_nl = std::fs::read(&path)
+        .ok()
+        .is_some_and(|b| !b.is_empty() && !b.ends_with(b"\n"));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let text = format!("{}{line}\n", if needs_nl { "\n" } else { "" });
+    f.write_all(text.as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }

@@ -184,6 +184,10 @@ enum Command {
         /// Replace files in a non-empty output directory.
         #[arg(long)]
         overwrite: bool,
+        /// With --overwrite: also replace files edited by hand since the last
+        /// run (refused otherwise; record such edits in the review ledger).
+        #[arg(long, requires = "overwrite")]
+        discard_edits: bool,
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
@@ -532,6 +536,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             to,
             jobs,
             overwrite,
+            discard_edits,
             no_catalog,
             template,
             parameters,
@@ -560,6 +565,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 },
                 out,
                 overwrite,
+                discard_edits,
                 instances,
                 queue_all,
             })

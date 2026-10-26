@@ -56,6 +56,7 @@ fn record(input: &str, c: &Conversion, unit: &str, rule: &str, state: State, by:
         at: "2026-10-26T10:00:00Z".into(),
         input_hash: file_hash(input),
         output_hash: file_hash(&c.output),
+        text: None,
     }
 }
 

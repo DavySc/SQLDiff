@@ -222,6 +222,16 @@ A decision applies only while both files are unchanged since it was made, to the
 
 `sqldiff convert` and the MCP `convert_tree` tool apply the ledger they find in the output directory. `conversion-report.json` then gives every unit its `id`, the rules of the engine's findings on it (`findings`) and its `review` (reviewed, open assumptions and decisions, what cannot be discharged, who wrote the output, and every decision with whether it still applies and why not); each file its `review` (reviewed, units reviewed and outdated, orphaned records); and the report a `ledger` summary. Plainly converted units are listed under `converted_units` (nothing found, not proven), the rest under `units` as before. Statuses, counts and the exit code are the same with or without a ledger.
 
+### Output written by hand
+
+A `written` record with a `text` replaces a unit's output on every later conversion: the conversion writes the rules' output, then puts the text in place of the unit it names. The record names the unit as the rules wrote it, so it keeps applying while that unit's input and the rules' output for it are unchanged, whatever changes around it; when either changes, the record is orphaned and listed. In a plain file the text replaces the unit's output before the check, so it is checked against the source like the rules' output and can come out differing or not proven. It is never better than the rules' output was: the rules' assumptions and decisions on the unit stay, and the text itself carries `ASM-HAND-WRITTEN`, since the check allows the same dialect mappings it allows the rules (a dropped `dbo` schema, mapped types) and a text written by hand may lean on them without saying so. In a template the check of the template's text does not apply to the text, so it is spliced in after the check and the unit is not proven (`hand-written.unchecked`) until the woven instances are checked by `sqldiff instances`.
+
+A person's text replaces an agent's draft for the same unit, and a newer text by the same author replaces their older one. Two different texts from two people (or only from agents) are a conflict: neither applies, and the unit is marked differs (`review.conflicting-texts`) until one is removed. Output an agent wrote is never reviewed until a person approves it (tier 3 of the queue).
+
+The MCP tool `write_unit` is how an agent drafts a unit: it takes the unit's id from `conversion_queue` or `convert_tree`, records the text as `by: agent` whatever its caller says, converts the tree again, rewrites `out` and the queue, and returns the unit's new id, status, notes and findings. It is refused, and records nothing, when a file in `out` was edited since the last conversion.
+
+Editing a converted file directly is not a review step: the next conversion would overwrite the edit. `conversion-report.json` keeps the SHA-256 of every file it wrote (`output_hash`), and `sqldiff convert --overwrite` refuses to replace a file edited since, naming it, unless `--discard-edits` is given (the MCP `convert_tree` takes `discard_edits`). Record the edit as a `written` text instead, so every later conversion applies and checks it.
+
 ### The review queue
 
 `sqldiff convert` also writes `review-queue.json` and `review-queue.md`: what a person should look at, worst first, ranked by tier and never by a score (a score would let many clean units average away one that nothing was claimed about). Units the ledger says are reviewed are not listed; nothing is ever listed as safe.
@@ -235,7 +245,7 @@ A decision applies only while both files are unchanged since it was made, to the
 | 5 | Open assumptions, unverified vendor facts (`ASM-FACT-*`) and template premises (`ASM-TEMPLATE-*`) first |
 | 6 | Only with `--queue-all`: plainly converted units nobody approved (nothing found, not proven) |
 
-Inside a tier, items with the most instances woven from their template come first, then the most units, then path and line. With `--instances PATH` (`instance-report.json` from `sqldiff instances`, or its directory) each template is also judged by its woven instances and listed with the ones that fail. The MCP tool `conversion_queue` converts the tree again in memory, applies the ledger in `out` and returns the same queue; it writes nothing, and no MCP tool records a review decision.
+Inside a tier, items with the most instances woven from their template come first, then the most units, then path and line. With `--instances PATH` (`instance-report.json` from `sqldiff instances`, or its directory) each template is also judged by its woven instances and listed with the ones that fail. The MCP tool `conversion_queue` converts the tree again in memory, applies the ledger in `out` and returns the same queue; it writes nothing, and no MCP tool records a verdict.
 
 ## The page
 

@@ -102,6 +102,19 @@ pub struct Unit {
     /// it (see [`undecided`]), else `converted`. Lets a viewer accept assumptions
     /// (dropping their notes) without hiding what the engine found.
     pub checked: Status,
+    /// Set when the output was written by hand (a `written` record with
+    /// text in the review ledger), not by the rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written: Option<Written>,
+}
+
+/// Who wrote a unit's output by hand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Written {
+    pub by: review::By,
+    pub author: String,
+    /// The unit's id as the rules wrote it, which the ledger record names.
+    pub origin: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -175,6 +188,66 @@ pub struct Draft {
 impl Draft {
     pub fn output(&self) -> &str {
         &self.raw.text
+    }
+
+    /// Unit ids as [`review::unit_ids`] gives them for the checked
+    /// conversion: the same while no unit was replaced.
+    pub fn unit_ids(&self, path: &str, input: &str) -> Vec<String> {
+        review::ids_of(
+            path,
+            self.raw.units.iter().map(|u| {
+                (
+                    input.get(u.src.0..u.src.1).unwrap_or(""),
+                    self.raw.text.get(u.out.0..u.out.1).unwrap_or(""),
+                )
+            }),
+        )
+    }
+
+    /// Adds a note to unit `i` (a hand-written text that could not be applied).
+    pub fn note_unit(&mut self, i: usize, note: Note) {
+        if let Some(u) = self.raw.units.get_mut(i) {
+            u.notes.push(note);
+        }
+    }
+
+    /// Replaces unit `i`'s output with `text`, written by hand; `note` says
+    /// who wrote it. The rules' assumptions and decisions on the unit are
+    /// kept (`kept_notes`): the check compares under the same dialect
+    /// mappings they name, so a hand-written text never claims fewer. Their
+    /// other notes were about the rules' output and go; the check that
+    /// follows judges the new text like any other. Fails when another
+    /// unit's output overlaps unit `i`'s.
+    pub fn replace_unit(
+        &mut self,
+        i: usize,
+        text: &str,
+        written: Written,
+        note: Note,
+    ) -> Result<(), String> {
+        let (s, e) = self.raw.units.get(i).ok_or("no such unit")?.out;
+        if self
+            .raw
+            .units
+            .iter()
+            .enumerate()
+            .any(|(k, u)| k != i && u.out.0 < e.max(s + 1) && s < u.out.1.max(u.out.0 + 1))
+        {
+            return Err("another unit's output overlaps this one".into());
+        }
+        let text = text.trim_end_matches('\n');
+        self.raw.text.replace_range(s..e, text);
+        let shift = |x: usize| if x >= e { x + text.len() - (e - s) } else { x };
+        for (k, u) in self.raw.units.iter_mut().enumerate() {
+            if k == i {
+                u.out = (s, s + text.len());
+                u.notes = kept_notes(&note, &u.notes);
+                u.written = Some(written.clone());
+            } else {
+                u.out = (shift(u.out.0), shift(u.out.1));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -260,6 +333,7 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                 findings: Vec::new(),
                 output_findings: Vec::new(),
                 checked: Status::Converted,
+                written: u.written,
             }
         })
         .collect();
@@ -376,6 +450,65 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     };
     recount(&mut c);
     c
+}
+
+/// A hand-written unit's notes: `note`, then the rules' assumptions and
+/// decisions from `old`.
+fn kept_notes(note: &Note, old: &[Note]) -> Vec<Note> {
+    let mut v = vec![note.clone()];
+    v.extend(
+        old.iter()
+            .filter(|n| matches!(n.status, Status::Assumptions | Status::Decision))
+            .cloned(),
+    );
+    v
+}
+
+/// Replaces unit `i`'s output in a checked conversion with `text`, written
+/// by hand, without checking it again: the unit becomes `unproven` with
+/// `note` and the rules' assumptions and decisions (for templates, whose
+/// hand-written units the instance check judges). Fails when another
+/// unit's output overlaps unit `i`'s.
+pub fn splice_unit(
+    c: &mut Conversion,
+    i: usize,
+    text: &str,
+    written: Written,
+    note: Note,
+) -> Result<(), String> {
+    let (s, e) = {
+        let u = c.units.get(i).ok_or("no such unit")?;
+        (u.out.start, u.out.end)
+    };
+    if c.units
+        .iter()
+        .enumerate()
+        .any(|(k, u)| k != i && u.out.start < e.max(s + 1) && s < u.out.end.max(u.out.start + 1))
+    {
+        return Err("another unit's output overlaps this one".into());
+    }
+    let text = text.trim_end_matches('\n');
+    c.output.replace_range(s..e, text);
+    let shift = |x: usize| if x >= e { x + text.len() - (e - s) } else { x };
+    let lo = LineIndex::new(&c.output);
+    for (k, u) in c.units.iter_mut().enumerate() {
+        let (a, b) = if k == i {
+            (s, s + text.len())
+        } else {
+            (shift(u.out.start), shift(u.out.end))
+        };
+        u.out = span(&c.output, &lo, (a, b));
+        if k == i {
+            u.notes = kept_notes(&note, &u.notes);
+            u.findings.clear();
+            u.output_findings.clear();
+            u.checked = Status::Unproven;
+            u.status = note.status.max(Status::Unproven);
+            u.written = Some(written.clone());
+        }
+    }
+    recount(c);
+    Ok(())
 }
 
 fn recount(c: &mut Conversion) {
