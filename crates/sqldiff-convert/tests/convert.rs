@@ -29,6 +29,16 @@ fn has_rule(u: &Unit, rule: &str) -> bool {
     u.notes.iter().any(|n| n.rule == rule)
 }
 
+/// The status the rules alone gave the unit, without the engine's notes.
+fn rule_status(u: &Unit) -> Status {
+    u.notes
+        .iter()
+        .filter(|n| n.status != Status::Unproven)
+        .map(|n| n.status)
+        .max()
+        .unwrap_or(Status::Converted)
+}
+
 #[test]
 fn pairs_without_rules_keep_every_statement_as_a_comment() {
     let src = "SELECT 1;\nUPDATE t SET a = 2;\n";
@@ -59,7 +69,12 @@ fn select_rewrites() {
     );
     assert!(out.contains("FROM Items\nWHERE c = 1"), "{out}");
     assert!(out.trim_end().ends_with("ORDER BY n\nLIMIT 10;"), "{out}");
-    assert_eq!(u.status, Status::Assumptions);
+    // The rules need assumptions; the engine does not check table hints, so
+    // it cannot confirm them either.
+    assert_eq!(rule_status(u), Status::Assumptions);
+    assert_eq!(u.status, Status::Unproven, "{:?}", u.notes);
+    assert_eq!(u.checked, Status::Unproven);
+    assert!(has_rule(u, "equiv.unsupported"), "{:?}", u.notes);
     for r in [
         "ASM-CONCAT-NULL",
         "ASM-ISNULL-TYPE",
@@ -76,11 +91,14 @@ fn exact_rules_need_no_assumption() {
     let c = tsql(src);
     assert_eq!(c.units.len(), 1);
     assert_eq!(
-        c.units[0].status,
+        rule_status(&c.units[0]),
         Status::Converted,
         "{:?}",
         c.units[0].notes
     );
+    // The engine does not model LEN, NEWID or IIF yet: exact rules it
+    // cannot confirm are not proven, not converted.
+    assert_eq!(c.units[0].status, Status::Unproven);
     assert!(c.output.contains("(CASE WHEN a > 1 THEN 'x' ELSE 'y' END)"));
 }
 
@@ -240,6 +258,7 @@ fn corpus_outputs_parse_and_carry_no_residue() {
         let total = c.counts.converted
             + c.counts.assumptions
             + c.counts.decision
+            + c.counts.unproven
             + c.counts.differs
             + c.counts.not_converted;
         assert_eq!(total, c.units.len());

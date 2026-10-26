@@ -30,6 +30,20 @@ fn last_status(c: &Conversion) -> Status {
     c.units.last().unwrap().status
 }
 
+/// The status the rules alone gave the SELECT: the engine does not model
+/// DATEADD or the targets' interval arithmetic yet, so it cannot confirm
+/// these conversions and the unit itself is not proven.
+fn rule_status(c: &Conversion) -> Status {
+    let u = c.units.last().unwrap();
+    assert_eq!(u.checked, Status::Unproven, "{:?}", u.notes);
+    u.notes
+        .iter()
+        .filter(|n| n.status != Status::Unproven)
+        .map(|n| n.status)
+        .max()
+        .unwrap_or(Status::Converted)
+}
+
 fn notes(c: &Conversion) -> Vec<String> {
     let u = c.units.last().unwrap();
     u.notes
@@ -257,7 +271,7 @@ fn variables_carry_their_declared_type() {
 fn every_conversion_states_the_range_assumption() {
     for to in [Dialect::Postgres, Dialect::Db2i] {
         let (c, _) = run("DATEADD(day, 5, d)", to);
-        assert_eq!(last_status(&c), Status::Assumptions);
+        assert_eq!(rule_status(&c), Status::Assumptions);
         assert!(notes(&c).iter().any(|n| n.starts_with("ASM-DATEADD-RANGE")));
         // A time wraps around midnight instead: no range to leave.
         let (c, _) = run("DATEADD(hour, 5, tm)", to);
@@ -276,7 +290,7 @@ fn every_conversion_states_the_range_assumption() {
             .iter()
             .any(|n| n.starts_with("ASM-DATEADD-YEAR-END")));
         let (c, _) = run("DATEADD(hour, 1, tm)", to);
-        assert_eq!(last_status(&c), Status::Assumptions);
+        assert_eq!(rule_status(&c), Status::Assumptions);
         assert!(notes(&c)
             .iter()
             .any(|n| n.starts_with("ASM-DATEADD-TIME-WRAP")));

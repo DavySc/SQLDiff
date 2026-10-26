@@ -663,6 +663,7 @@ fn check_instance(
                 sqldiff_convert::Status::Converted => Outcome::Converted,
                 sqldiff_convert::Status::Assumptions => Outcome::Assumptions,
                 sqldiff_convert::Status::Decision => Outcome::Decision,
+                sqldiff_convert::Status::Unproven => Outcome::Unknown,
                 _ => Outcome::Differs,
             },
             rule: n.rule.to_string(),
@@ -715,6 +716,10 @@ fn markers(text: &str, accepted: &[String]) -> Vec<Item> {
         let status = match status {
             "under assumptions" => Outcome::Assumptions,
             "needs a decision" => Outcome::Decision,
+            // The engine's diff of the template could not decide the unit;
+            // the diff of each woven instance below decides it again, and
+            // counts every unknown it finds.
+            "not proven" => continue,
             "differs" | "not converted" => Outcome::Differs,
             _ => continue,
         };

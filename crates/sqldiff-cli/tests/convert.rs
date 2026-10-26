@@ -192,6 +192,65 @@ fn a_file_is_only_converted_when_every_unit_is() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[test]
+fn a_unit_the_engine_cannot_decide_is_marked_not_proven() {
+    // SQL Server rounds '1.005' to decimal(10,2) (1.01); PostgreSQL does not.
+    let d = scratch("unproven");
+    let (src, out) = (d.join("src"), d.join("out"));
+    write(
+        &src.join("orders.sql"),
+        b"CREATE TABLE dbo.Orders (id int NOT NULL PRIMARY KEY, amt decimal(10,2) NOT NULL);\nGO\n",
+    );
+    write(
+        &src.join("del.sql"),
+        b"CREATE PROCEDURE dbo.DelOrders AS\nBEGIN\n  DELETE FROM dbo.Orders WHERE amt = '1.005';\nEND;\nGO\n",
+    );
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--to",
+        "postgres",
+    ]);
+    // Not converted or under assumptions: the exit code says so.
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let text = std::fs::read_to_string(out.join("del.sql")).unwrap();
+    assert!(
+        text.contains("-- [sqldiff: not proven] equiv.unproven\n  DELETE FROM Orders"),
+        "{text}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("conversion-report.json")).unwrap())
+            .unwrap();
+    let f = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "del.sql")
+        .unwrap();
+    assert_eq!(f["status"], "unproven", "{f}");
+    assert_eq!(f["counts"]["unproven"], 1, "{f}");
+    assert_eq!(f["counts"]["differs"], 0, "{f}");
+    let u = f["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["status"] == "unproven")
+        .unwrap();
+    assert_eq!(u["rules"][0], "equiv.unproven", "{u}");
+    assert!(u["reason"].as_str().unwrap().contains("'1.005'"), "{u}");
+    assert_eq!(report["totals"]["units"]["not proven"], 1, "{report}");
+    let md = std::fs::read_to_string(out.join("conversion-report.md")).unwrap();
+    assert!(md.contains("### `del.sql`: not proven"), "{md}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 fn example_pack() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/examples/pack")

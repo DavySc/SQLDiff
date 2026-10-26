@@ -809,10 +809,11 @@ fn file_report(rel: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileRep
     }
 }
 
-const ORDER: [Status; 5] = [
+const ORDER: [Status; 6] = [
     Status::Converted,
     Status::Assumptions,
     Status::Decision,
+    Status::Unproven,
     Status::Differs,
     Status::NotConverted,
 ];
@@ -834,13 +835,14 @@ fn totals(files: &[FileReport], seconds: f64) -> Totals {
             (Status::Converted, f.counts.converted),
             (Status::Assumptions, f.counts.assumptions),
             (Status::Decision, f.counts.decision),
+            (Status::Unproven, f.counts.unproven),
             (Status::Differs, f.counts.differs),
             (Status::NotConverted, f.counts.not_converted),
         ] {
             *t.units.entry(s.label()).or_default() += n;
         }
         for u in &f.units {
-            if u.status >= Status::Differs {
+            if u.status >= Status::Unproven {
                 let key = format!(
                     "{} | {}",
                     u.status.label(),
