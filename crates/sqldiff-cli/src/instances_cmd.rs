@@ -73,6 +73,12 @@ pub struct InstancesArgs {
         conflicts_with_all = ["source", "target"]
     )]
     pub(crate) generator_only: bool,
+    /// A previous run's `instance-report.json` (or its output directory):
+    /// instances whose woven text, generator output and values are what
+    /// they were then reuse its results, when everything else the checks
+    /// read (catalogs, options, the sqldiff build) is the same too.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) since: Option<PathBuf>,
     /// A parameter name (repeatable), added to the names the manifest gives
     /// values for; under `placeholders = "parameters"` only these are
     /// placeholders.
@@ -169,6 +175,11 @@ struct InstanceReport {
     /// folding, default schema): the same ones `sqldiff convert` makes for
     /// every file, listed here and not counted in the status.
     engine_assumptions: Vec<String>,
+    /// PostgreSQL names its values make that are over the limit, as
+    /// (truncated, full), for the collision check across instances.
+    names_over_limit: Vec<(String, String)>,
+    /// Hash of everything the instance's own checks read (`--since`).
+    fingerprint: String,
 }
 
 #[derive(Serialize)]
@@ -212,6 +223,12 @@ struct Report {
     /// Every instance done, every converted template exercised and all
     /// generator output accounted for.
     complete: bool,
+    /// Hash of everything every instance's checks read besides the
+    /// instance: the sqldiff build, dialects, options, catalogs, accepted
+    /// assumptions (`--since`).
+    fingerprint: String,
+    /// Instances whose results were reused from `--since`.
+    reused: usize,
 }
 
 pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
@@ -359,7 +376,30 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
             (gen_source.get(k), gen_target.get(k))
         }
     };
-    let mut results: Vec<Checked> = parallel(jobs, &work, |&(k, i)| {
+    // What each check reads besides its own instance, and the instance's
+    // own inputs: a result is reused only when both are unchanged.
+    let fingerprint = run_fingerprint(&a, &kinds, &opts)?;
+    let keys: Vec<String> = work
+        .iter()
+        .map(|&(k, i)| {
+            let (s, t) = &woven[k];
+            hash(&format!(
+                "{:?}",
+                (&i.name, &i.output, s, t, generated(k), &name_values[k])
+            ))
+        })
+        .collect();
+    let mut earlier: Vec<Option<Checked>> = match &a.since {
+        Some(p) => previous(p, &fingerprint, &manifest, &keys)?,
+        None => vec![None; work.len()],
+    };
+    let todo: Vec<(usize, &Instance)> = work
+        .iter()
+        .copied()
+        .filter(|&(k, _)| earlier[k].is_none())
+        .collect();
+    let reused = work.len() - todo.len();
+    let fresh: Vec<Checked> = parallel(jobs, &todo, |&(k, i)| {
         let (s, t) = &woven[k];
         let (gs, gt) = generated(k);
         check_instance(
@@ -377,6 +417,10 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
             &name_values[k],
         )
     });
+    for (&(k, _), c) in todo.iter().zip(fresh) {
+        earlier[k] = Some(c);
+    }
+    let mut results: Vec<Checked> = earlier.into_iter().map(|c| c.unwrap()).collect();
 
     // Two values that PostgreSQL truncates to the same name.
     let mut truncated: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -395,7 +439,7 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
             if let Some(all) = clashes.get(cut) {
                 items.push(Item {
                     status: Outcome::Differs,
-                    rule: "pg.name-collision".into(),
+                    rule: NAME_COLLISION.into(),
                     side: "target",
                     line: 0,
                     text: format!(
@@ -443,7 +487,7 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
         for &k in ks {
             results[k].0.push(Item {
                 status: Outcome::Unknown,
-                rule: "weave.object-twice".into(),
+                rule: OBJECT_TWICE.into(),
                 side: "target",
                 line: 0,
                 text: format!(
@@ -457,7 +501,7 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
 
     // Woven files and the per-instance report.
     let mut instances = Vec::new();
-    for (k, ((i, (s, t)), (items, engine, _))) in manifest
+    for (k, ((i, (s, t)), (items, engine, names))) in manifest
         .instances
         .iter()
         .zip(&woven)
@@ -498,6 +542,8 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
             templates: t.templates.iter().cloned().collect(),
             items,
             engine_assumptions: engine,
+            names_over_limit: names,
+            fingerprint: keys[k].clone(),
         });
     }
 
@@ -565,6 +611,8 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
         done,
         weave_only,
         complete,
+        fingerprint,
+        reused,
     };
     let json = a.out.join("instance-report.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report).unwrap() + "\n")
@@ -605,6 +653,130 @@ fn value_tokens(text: &str, d: Dialect, values: &[String]) -> Vec<(usize, usize)
             (usize::from(r.start()), usize::from(r.end()))
         })
         .collect()
+}
+
+/// Items added across instances, after each instance's own checks.
+const NAME_COLLISION: &str = "pg.name-collision";
+const OBJECT_TWICE: &str = "weave.object-twice";
+
+/// Bumped whenever what a reused result means changes.
+const CACHE_VERSION: &str = "instances-cache-1";
+
+fn hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(text.as_bytes());
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The running executable's hash: another build may check differently.
+fn build_hash() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    static HASH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
+    HASH.get_or_init(|| {
+        let exe = std::env::current_exe().map_err(|e| format!("the sqldiff executable: {e}"))?;
+        let mut f = std::fs::File::open(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        let mut h = Sha256::new();
+        std::io::copy(&mut f, &mut h).map_err(|e| format!("{}: {e}", exe.display()))?;
+        Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    })
+    .clone()
+}
+
+/// Everything an instance's checks read besides the instance itself.
+fn run_fingerprint(
+    a: &InstancesArgs,
+    kinds: &BTreeMap<String, sqldiff_convert::ValueKind>,
+    opts: &Options,
+) -> Result<String, String> {
+    Ok(hash(&format!(
+        "{CACHE_VERSION}\n{}\n{:?}",
+        build_hash()?,
+        (a.from, a.to, a.generator_only, &a.accept, kinds, opts)
+    )))
+}
+
+/// The results of a previous run to reuse, per instance: only for an
+/// instance with the same name and fingerprint in a run with the same
+/// fingerprint. Items added across instances are dropped; they are worked
+/// out again over every instance.
+fn previous(
+    path: &Path,
+    fingerprint: &str,
+    manifest: &Manifest,
+    keys: &[String],
+) -> Result<Vec<Option<Checked>>, String> {
+    let none = vec![None; keys.len()];
+    let file = if path.is_dir() {
+        path.join("instance-report.json")
+    } else {
+        path.to_path_buf()
+    };
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let r: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+    if r["fingerprint"].as_str() != Some(fingerprint) {
+        eprintln!(
+            "{}: another sqldiff build, options, catalogs or tables: every instance is checked",
+            file.display()
+        );
+        return Ok(none);
+    }
+    let mut by_name: BTreeMap<&str, &serde_json::Value> = BTreeMap::new();
+    for i in r["instances"].as_array().into_iter().flatten() {
+        if let Some(n) = i["name"].as_str() {
+            by_name.insert(n, i);
+        }
+    }
+    Ok(manifest
+        .instances
+        .iter()
+        .zip(keys)
+        .map(|(i, key)| {
+            let p = by_name.get(i.name.as_str())?;
+            if p["fingerprint"].as_str() != Some(key.as_str()) {
+                return None;
+            }
+            cached(p)
+        })
+        .collect())
+}
+
+/// One instance's own results from a previous report; `None` when any
+/// part of it is not what this build writes.
+fn cached(p: &serde_json::Value) -> Option<Checked> {
+    let mut items = Vec::new();
+    for x in p["items"].as_array()? {
+        let rule = x["rule"].as_str()?;
+        if rule == NAME_COLLISION || rule == OBJECT_TWICE {
+            continue;
+        }
+        let status = ORDER
+            .into_iter()
+            .find(|o| serde_json::to_value(o).ok().as_ref() == Some(&x["status"]))?;
+        let side = ["source", "target", "manifest", "pair"]
+            .into_iter()
+            .find(|s| x["side"].as_str() == Some(s))?;
+        items.push(Item {
+            status,
+            rule: rule.to_string(),
+            side,
+            line: usize::try_from(x["line"].as_u64()?).ok()?,
+            text: x["text"].as_str()?.to_string(),
+        });
+    }
+    let strings = |v: &serde_json::Value| -> Option<Vec<String>> {
+        v.as_array()?
+            .iter()
+            .map(|s| s.as_str().map(String::from))
+            .collect()
+    };
+    let engine = strings(&p["engine_assumptions"])?;
+    let names = p["names_over_limit"]
+        .as_array()?
+        .iter()
+        .map(|n| Some((n[0].as_str()?.to_string(), n[1].as_str()?.to_string())))
+        .collect::<Option<Vec<_>>>()?;
+    Some((items, engine, names))
 }
 
 /// A generator output file of one instance.
@@ -1327,6 +1499,15 @@ fn summary(r: &Report) -> String {
             "{:<20} {:>6} target files",
             "not in manifest",
             r.not_in_manifest_target.len()
+        );
+    }
+    if r.reused > 0 {
+        let _ = writeln!(
+            s,
+            "{:<20} {:>6} of {} instance checks (unchanged since --since)",
+            "reused",
+            r.reused,
+            r.instances.len()
         );
     }
     let _ = writeln!(

@@ -940,3 +940,128 @@ params = {{ TABLE = "{long}" }}
         "{l}"
     );
 }
+
+fn instances_to(d: &Path, out: &str, extra: &[&str]) -> serde_json::Value {
+    let (src, conv, manifest) = (d.join("src"), d.join("conv"), d.join("instances.toml"));
+    let out = d.join(out);
+    let pack = pack();
+    let mut args = vec![
+        "instances",
+        manifest.to_str().unwrap(),
+        "--source",
+        src.to_str().unwrap(),
+        "--target",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "-o",
+        out.to_str().unwrap(),
+        "--overwrite",
+        "--pack",
+        &pack,
+        "--isolated",
+    ];
+    args.extend_from_slice(extra);
+    let o = run(&args);
+    assert!(
+        o.status.code().is_some_and(|c| c < 2),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    serde_json::from_str(&std::fs::read_to_string(out.join("instance-report.json")).unwrap())
+        .unwrap()
+}
+
+/// A report without the count of reused results.
+fn results(mut r: serde_json::Value) -> serde_json::Value {
+    r.as_object_mut().unwrap().remove("reused");
+    r
+}
+
+#[test]
+fn a_rerun_since_a_report_checks_only_what_changed_and_agrees_with_a_full_run() {
+    let d = scratch("since");
+    setup(&d);
+    // Two long values PostgreSQL truncates to one name: the collision is
+    // worked out across instances, reused or not.
+    let long = "X".repeat(64);
+    let mut m = MANIFEST.to_string();
+    for n in ["A", "B"] {
+        m.push_str(&format!(
+            "\n[[instance]]\nname = \"tables/Long{n}\"\ntemplate = \"tables/entity.sql\"\nparams = {{ TABLE = \"{long}{n}\" }}\n"
+        ));
+    }
+    write(&d.join("instances.toml"), &m);
+    let first = instances_to(&d, "run0", &[]);
+    assert_eq!(first["reused"], 0);
+    assert!(
+        rules(instance(&first, "tables/LongA")).contains(&"pg.name-collision".to_string()),
+        "{first}"
+    );
+
+    // Nothing changed: everything reused, the same results.
+    let again = instances_to(&d, "run1", &["--since", d.join("run0").to_str().unwrap()]);
+    assert_eq!(again["reused"], 5);
+    assert_eq!(results(again), results(first.clone()));
+
+    let since = |prev: &str| d.join(prev).to_str().unwrap().to_string();
+    let edit = |file: &str, old: &str, new: &str| {
+        let p = d.join(file);
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(t.contains(old), "{file}: {t}");
+        std::fs::write(&p, t.replacen(old, new, 1)).unwrap();
+    };
+    // Each step: a full run and a run since the previous step's report
+    // agree, and only the instances named were checked again.
+    let steps: [(&str, &str, &str, &[&str], usize); 4] = [
+        // A converted template.
+        (
+            "conv/procs/touch.sql",
+            "SET Price = 0",
+            "SET Price = 1",
+            &[],
+            4,
+        ),
+        // An include of the source templates.
+        (
+            "src/procs/header.sql",
+            "-- generated",
+            "SET NOCOUNT ON;",
+            &[],
+            4,
+        ),
+        // A table: the catalog changes, so every instance is checked.
+        (
+            "conv/tables/entity.sql",
+            "Price numeric(12, 2)",
+            "Price numeric(12, 3)",
+            &[],
+            0,
+        ),
+        // An accepted assumption changes what every check counts.
+        (
+            "conv/procs/touch.sql",
+            "SET Price = 1",
+            "SET Price = 0",
+            &["--accept", "ASM-X"],
+            0,
+        ),
+    ];
+    let mut prev = "run1".to_string();
+    for (n, (file, old, new, extra, reused)) in steps.into_iter().enumerate() {
+        edit(file, old, new);
+        let full = instances_to(&d, &format!("full{n}"), extra);
+        let mut args = extra.to_vec();
+        let p = since(&prev);
+        args.extend(["--since", p.as_str()]);
+        let inc = instances_to(&d, &format!("inc{n}"), &args);
+        assert_eq!(inc["reused"], reused, "step {n}: {file}");
+        assert_eq!(results(inc), results(full), "step {n}: {file}");
+        prev = format!("inc{n}");
+    }
+
+    // In place: the output directory is its own previous run.
+    let p = since(&prev);
+    let inc = instances_to(&d, &prev, &["--accept", "ASM-X", "--since", &p]);
+    assert_eq!(inc["reused"], 5);
+}
