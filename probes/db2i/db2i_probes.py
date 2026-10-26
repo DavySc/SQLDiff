@@ -63,7 +63,8 @@ def load_facts() -> dict:
 
 
 def probes_hash() -> str:
-    return hashlib.sha256(PROBES.read_bytes()).hexdigest()[:12]
+    # CRLF as LF: a Windows checkout (core.autocrlf) is the same probe set.
+    return hashlib.sha256(PROBES.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:12]
 
 
 def validate(defs: dict, facts: dict) -> list[str]:

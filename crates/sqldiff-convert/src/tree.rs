@@ -586,6 +586,104 @@ fn hand_written_template(l: &crate::review::Ledger, i: &Input, c: &mut Conversio
     }
 }
 
+/// The file at the root of a template tree that lists the parameters of the
+/// routine each routine body is woven into.
+pub const ROUTINE_PARAMETERS_FILE: &str = "template-parameters.toml";
+
+/// Reads [`ROUTINE_PARAMETERS_FILE`] from a template tree: for a template (its
+/// path from the tree root, with `/`), the parameters of the routine its body
+/// goes into, as T-SQL declarations. A generator wraps a bare body in a
+/// routine whose header it writes itself; this is how a conversion learns what
+/// that header declares. A tree without the file, or a single file, has none.
+///
+/// ```toml
+/// ["procs/update_item.sql"]
+/// parameters = ["@mode int", "@item_name varchar(100) output"]
+/// ```
+pub fn read_routine_parameters(
+    src: &Path,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let path = src.join(ROUTINE_PARAMETERS_FILE);
+    if !src.is_dir() || !path.is_file() {
+        return Ok(Default::default());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    parse_routine_parameters(&text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn parse_routine_parameters(
+    text: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+    let table: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
+    let mut out = std::collections::BTreeMap::new();
+    for (key, value) in table {
+        let rel = key.replace('\\', "/");
+        let toml::Value::Table(entry) = value else {
+            return Err(format!("`{key}`: expected a table with `parameters`"));
+        };
+        if let Some(other) = entry.keys().find(|k| k.as_str() != "parameters") {
+            return Err(format!(
+                "`{key}`: unknown key `{other}`; only `parameters` is read"
+            ));
+        }
+        let list = match entry.get("parameters") {
+            Some(toml::Value::Array(a)) => a,
+            _ => return Err(format!("`{key}`: `parameters` must be a list of strings")),
+        };
+        let mut decls = Vec::new();
+        let mut names = Vec::new();
+        for item in list {
+            let toml::Value::String(d) = item else {
+                return Err(format!("`{key}`: `parameters` must be a list of strings"));
+            };
+            let d = d.trim();
+            let Some(name) = declared_name(d) else {
+                return Err(format!(
+                    "`{key}`: `{d}` is not a parameter declaration (`@name type [OUTPUT]`, one line, no comment)"
+                ));
+            };
+            // T-SQL names are case-insensitive: `@a` and `@A` are one parameter.
+            if names.contains(&name) {
+                return Err(format!("`{key}`: `{d}` declares a parameter listed before"));
+            }
+            names.push(name);
+            decls.push(d.to_string());
+        }
+        out.insert(rel, decls);
+    }
+    Ok(out)
+}
+
+/// The name (upper case) a single T-SQL parameter declaration declares, or
+/// `None` when the text is not one: it must start with a variable, lex
+/// cleanly on one line, and hold no comment, `;`, comma or unbalanced
+/// parenthesis outside its own parentheses. The declaration is pasted into a
+/// stand-in header, so anything else could end the header early or hide the
+/// body that follows it.
+fn declared_name(d: &str) -> Option<String> {
+    use sqldiff_syntax::SyntaxKind as K;
+    if d.contains('\n') || d.contains('\r') {
+        return None;
+    }
+    let lexed = sqldiff_syntax::lexer::tokenize(d, Dialect::Tsql);
+    if !lexed.diagnostics.is_empty() {
+        return None;
+    }
+    let mut toks = lexed.tokens.iter().filter(|t| t.kind != K::WHITESPACE);
+    let first = toks.next().filter(|t| t.kind == K::VARIABLE)?;
+    let mut depth = 0usize;
+    for t in toks {
+        match t.kind {
+            K::LINE_COMMENT | K::BLOCK_COMMENT | K::SEMICOLON | K::ERROR_TOKEN => return None,
+            K::L_PAREN => depth += 1,
+            K::R_PAREN => depth = depth.checked_sub(1)?,
+            K::COMMA if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| d[first.start..first.end].to_uppercase())
+}
+
 /// Converts templates: every file is split by the placeholder rules, and
 /// all fragments share one set of stand-in names, so a table a template
 /// creates as `<%SCHEMA%>.<%TABLE%>` binds in the templates that use it.
@@ -610,6 +708,7 @@ fn convert_templates(
         }
         parsed.push((t, basis));
     }
+    let routine_parameters = read_routine_parameters(&a.src)?;
     let mut stand = StandIns::new(parsed.iter().map(|(t, _)| t)).with_kinds(tm.kinds.clone());
     if !a.no_catalog {
         stand = stand.bound_across();
@@ -657,6 +756,7 @@ fn convert_templates(
             template: t,
             basis,
             kind: FragmentKind::Statements,
+            parameters: Vec::new(),
             target: Target::Pair(h, f),
         });
     }
@@ -664,21 +764,43 @@ fn convert_templates(
         if paired[k] {
             continue;
         }
+        // A body with listed parameters is a routine body, unless the pack
+        // says it is another kind of fragment.
+        let parameters = routine_parameters
+            .get(&inputs[k].rel)
+            .cloned()
+            .unwrap_or_default();
         let kind = tm
             .fragments
             .iter()
             .find(|(g, _)| g.is_match(&inputs[k].rel))
-            .map_or(FragmentKind::Statements, |(_, kind)| *kind);
+            .map_or(
+                if parameters.is_empty() {
+                    FragmentKind::Statements
+                } else {
+                    FragmentKind::RoutineBody
+                },
+                |(_, kind)| *kind,
+            );
         jobs_list.push(Job {
             template: t,
             basis,
             kind,
+            parameters,
             target: Target::File(k),
         });
     }
 
     let drafts = parallel(jobs, &jobs_list, |j| {
-        crate::rewrite_template_as(&j.template, j.kind, a.from, a.to, &stand, source.as_deref())
+        crate::rewrite_template_with(
+            &j.template,
+            j.kind,
+            &j.parameters,
+            a.from,
+            a.to,
+            &stand,
+            source.as_deref(),
+        )
     });
     let mut opts = Options::default();
     if let Some(source) = source {
@@ -728,6 +850,8 @@ struct Job {
     template: Template,
     basis: sqldiff_core::composition::PlaceholderBasis,
     kind: FragmentKind,
+    /// Parameters of the routine a routine body is woven into.
+    parameters: Vec<String>,
     target: Target,
 }
 
@@ -1529,7 +1653,8 @@ pub fn is_report(rel: &str) -> bool {
 }
 
 /// SHA-256 over every file of a tree (or one file): its path and the hash
-/// of its exact bytes, in path order. Names starting with a dot and, at the
+/// of its exact bytes, CRLF read as LF (a git checkout on Windows rewrites
+/// line endings; see `review::file_hash`), in path order. Names starting with a dot and, at the
 /// top, the reports and the ledger (`is_report`) are left out, so recording
 /// a review decision does not change it.
 pub fn dir_hash(dir: &Path) -> Result<String, String> {
@@ -1565,7 +1690,16 @@ pub fn dir_hash(dir: &Path) -> Result<String, String> {
     list.sort();
     let mut h = Sha256::new();
     for (rel, p) in list {
-        let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let mut bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if bytes.windows(2).any(|w| w == b"\r\n") {
+            let mut lf = Vec::with_capacity(bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                if !(b == b'\r' && bytes.get(i + 1) == Some(&b'\n')) {
+                    lf.push(b);
+                }
+            }
+            bytes = lf;
+        }
         h.update(rel.as_bytes());
         h.update([0]);
         h.update(Sha256::digest(&bytes));

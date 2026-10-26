@@ -480,10 +480,12 @@ mod tests {
             ["proc-header", "session-options", "body", "proc-footer"]
         );
         assert_eq!(c.parts[1].template.as_deref(), Some("xact-abort"));
-        assert_eq!(
-            &text[c.parts[1].body_start..c.parts[1].body_end],
-            "  SET XACT_ABORT ON;\n"
-        );
+        // The body is the whole line with its own line ending, LF or CRLF.
+        let body = &text[c.parts[1].body_start..c.parts[1].body_end];
+        let line = body
+            .strip_suffix("\r\n")
+            .or_else(|| body.strip_suffix('\n'));
+        assert_eq!(line, Some("  SET XACT_ABORT ON;"), "{body:?}");
         compile(pack.policy.template.as_ref().unwrap()).unwrap();
     }
 

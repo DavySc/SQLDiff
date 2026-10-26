@@ -242,10 +242,14 @@ fn generator_logic_is_never_guessed() {
     // A directive the pack does not name as its include form.
     let p = pack();
     let custom = d.join("pack.toml");
-    let text = std::fs::read_to_string(Path::new(&p).join("pack.toml"))
-        .unwrap()
-        .replace("include = \"include\"\n", "");
-    std::fs::write(&custom, text).unwrap();
+    let text = std::fs::read_to_string(Path::new(&p).join("pack.toml")).unwrap();
+    // Line by line, so a CRLF checkout drops the line too.
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| l.trim() != "include = \"include\"")
+        .collect();
+    assert_eq!(kept.len() + 1, text.lines().count(), "one include line");
+    std::fs::write(&custom, kept.join("\n") + "\n").unwrap();
     let (src, conv, manifest) = (d.join("src"), d.join("conv"), d.join("instances.toml"));
     let out = d.join("out");
     let o = run(&[

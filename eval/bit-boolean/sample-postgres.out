@@ -1,0 +1,72 @@
+NOTICE:  schema "bitbool" does not exist, skipping
+DROP SCHEMA
+CREATE SCHEMA
+SET
+CREATE TABLE
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE VIEW
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+INSERT 0 4
+v1|1|t
+v1|3|t
+v2|1|1
+v2|2|0
+v2|3|0
+v2|4|0
+v3|1|f|f
+v3|2|f|f
+v3|3|t|t
+v3|4|f|f
+v4|1|1|0|t
+v4|2|0||t
+v4|3|1|1|t
+v4|4|0|0|t
+v6|1
+v6|3
+v6|4
+v7|1|f|f|1|t
+v7|2|t||1|
+v7|3|f|t|1|f
+v7|4|t|f|1|f
+v8|1|1|t|1
+v8|2|0|f|0
+v8|3|0||1
+v8|4|0|t|0
+v9|1
+v9|3
+v9|4
+v11|1
+v11|2
+v11|2
+v11|3
+v11|4
+v11|4
+v13|1|t
+v13|2|f
+v13|3|f
+v13|4|f
+v14|1|t|t
+v14|2|f|
+v14|3|f|t
+v14|4|f|f
+w|1|f|t|t|0|1|f|3
+w|2||||1|0|t|2
+w|3|t|t|f|0|1|f|3
+w|4|f|f|f|1|0|t|2
+v10|1|1
+f|t|f|10|20|20|f|t||f|f

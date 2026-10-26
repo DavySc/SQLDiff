@@ -104,6 +104,8 @@ fn texts() -> Vec<String> {
             "DO $$ DECLARE x int := 1; BEGIN RAISE NOTICE '%', x; END $$;",
             "SELECT $1, E'a\\'b', U&'d\\0061', x::int FROM t WHERE a ~* 'b' AND c?d",
             "SELECT ? FROM SYSIBM.SYSDUMMY1 WHERE X'0F' <> GX'00' AND @a#$ = 1",
+            // CRLF line endings (a Windows checkout); a lone CR is no line end.
+            "-- note\r\nSELECT 1; -- tail\r\n--\r\n-- lone\r",
         ]
         .map(String::from),
     );
