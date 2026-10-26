@@ -805,6 +805,15 @@ fn not_null_in(filter: &[Tok], d: Dialect) -> Vec<String> {
     out
 }
 
+/// Whether a predicate names the column `c` anywhere.
+fn mentions(filter: Option<&[Tok]>, c: &str, d: Dialect) -> bool {
+    filter.is_some_and(|f| {
+        f.iter()
+            .filter_map(name_of)
+            .any(|n| fold(&n, d).is_ok_and(|k| k == c))
+    })
+}
+
 fn indexes(
     x: &Index,
     y: &Index,
@@ -1016,6 +1025,16 @@ fn indexes(
             return Ok(());
         };
         if ft.nullable && fo.nullable && !skip_t.contains(c) && !skip_o.contains(c) {
+            if mentions(t.filter.as_deref(), c, t.dialect)
+                || mentions(o.filter.as_deref(), c, o.dialect)
+            {
+                // `c > 0` leaves NULLs out like `c IS NOT NULL`, `c > 0 OR c
+                // IS NULL` keeps them: which, the model does not decide.
+                ev.push(Event::Unknown(format!(
+                    "the unique index's filter names its nullable column {c} in a way other than `{c} IS NOT NULL`, so whether rows with NULL in {c} are in the index is not decided"
+                )));
+                return Ok(());
+            }
             null_cols.push(c.clone());
         }
         if ft.string.is_some() {
@@ -1167,43 +1186,64 @@ fn sequences(x: &Sequence, y: &Sequence, na: &str, nb: &str, ev: &mut Vec<Event>
                 vy.start + vy.inc
             ),
         );
-    } else if vx.min != vy.min || vx.max != vy.max || vx.cycle != vy.cycle {
+    } else {
+        // The values handed out depend on the last value reached from a
+        // point (not on a bound the step never reaches), on what happens
+        // after it, and when both cycle, on the restart point and the last
+        // value of the following rounds. The near bound matters only then.
         let up = vx.inc > 0;
-        let end = |v: &Values| if up { v.max } else { v.min };
+        let restart = |v: &Values| if up { v.min } else { v.max };
+        let last = |v: &Values, from: i128| {
+            if up {
+                from + (v.max - from) / v.inc * v.inc
+            } else {
+                from - (from - v.min) / -v.inc * -v.inc
+            }
+        };
         let after = |v: &Values, n: &str| {
             if v.cycle {
-                format!("{n} restarts at {}", if up { v.min } else { v.max })
+                format!("{n} restarts at {}", restart(v))
             } else {
                 format!("{n} fails (the sequence is exhausted)")
             }
         };
-        let w = if end(&vx) != end(&vy) {
-            let (first, v, n) = if (end(&vx) < end(&vy)) == up {
-                (end(&vx), &vx, na)
+        let (lx, ly) = (last(&vx, vx.start), last(&vy, vy.start));
+        let w = if lx != ly {
+            let (first, v, n) = if (lx < ly) == up {
+                (lx, &vx, na)
             } else {
-                (end(&vy), &vy, nb)
+                (ly, &vy, nb)
             };
             let other = if n == na { nb } else { na };
-            format!(
+            Some(format!(
                 "after the value {first}, {} and {other} goes on",
                 after(v, n)
-            )
+            ))
         } else if vx.cycle != vy.cycle {
-            format!(
-                "after the last value {}, {} and {}",
-                end(&vx),
+            Some(format!(
+                "after the last value {lx}, {} and {}",
                 after(&vx, na),
                 after(&vy, nb)
-            )
+            ))
+        } else if vx.cycle && restart(&vx) != restart(&vy) {
+            Some(format!(
+                "after the last value {lx}, {na} restarts at {} and {nb} at {}",
+                restart(&vx),
+                restart(&vy)
+            ))
+        } else if vx.cycle && last(&vx, restart(&vx)) != last(&vy, restart(&vy)) {
+            Some(format!(
+                "after restarting at {}, the last value is {} on {na} and {} on {nb}",
+                restart(&vx),
+                last(&vx, restart(&vx)),
+                last(&vy, restart(&vy))
+            ))
         } else {
-            format!(
-                "after the last value {}, {na} restarts at {} and {nb} at {}",
-                end(&vx),
-                if up { vx.min } else { vx.max },
-                if up { vy.min } else { vy.max }
-            )
+            None
         };
-        diff(ev, w);
+        if let Some(w) = w {
+            diff(ev, w);
+        }
     }
     if vx.ty != vy.ty {
         let (vt, vo) = if tsql_a { (&vx, &vy) } else { (&vy, &vx) };

@@ -183,7 +183,7 @@ engine does not judge speed), never equal and never different.
 | Shape | Same key columns in order, same ASC/DESC, same included columns | not proven |
 | NULL position | Passed over: T-SQL sorts NULLs first, PostgreSQL and Db2 for i last in ascending keys; ORDER BY statements are compared on their own | |
 | Filter | Neither, or both, compared by the engine as `SELECT 1 FROM t WHERE filter`, the rows the index covers; a T-SQL filter adds `ASM-TSQL-FILTERED-INDEX-SET-OPTIONS` | one side only: not proven; different rows: the engine's difference for a unique index, not proven for a plain one |
-| NULLs in a unique key | T-SQL holds one row with NULL per key; PostgreSQL needs `NULLS NOT DISTINCT`, unless the column is NOT NULL on a side or a filter's `c IS NOT NULL` leaves NULLs out | `equiv.unique-nulls` |
+| NULLs in a unique key | T-SQL holds one row with NULL per key; PostgreSQL needs `NULLS NOT DISTINCT`, unless the column is NOT NULL on a side or a filter's `c IS NOT NULL` leaves NULLs out; a filter naming the column any other way (`c > 0`) is not proven | `equiv.unique-nulls` |
 | String unique key | T-SQL compares case-insensitively and ignores trailing spaces (`ASM-TSQL-CI-COLLATION`) | `equiv.case-sensitivity`, `equiv.trailing-spaces` (fixed-length PostgreSQL char ignores trailing spaces too) |
 | Db2 for i unique | Not compared: NULL handling, case and trailing blanks are probes `V29-UNIQUE-*` | not proven |
 
@@ -202,8 +202,10 @@ in:
 | Start | the minimum going up, the maximum going down | the same | |
 | Cycle | NO CYCLE; restarts at the minimum going up | the same | |
 
-A different start, step, bound or cycling is `equiv.sequence` with the first
-value that differs. A T-SQL tinyint sequence against a smallint one with the
+A different start, step, last value reached or cycling is `equiv.sequence`
+with the first value that differs. A bound the step never reaches is not a
+difference, and the near bound (the minimum going up) counts only when both
+sides cycle, as their restart point. A T-SQL tinyint sequence against a smallint one with the
 same bounds is equal under `ASM-SEQUENCE-TYPE`; other types are not proven. The
 cache is passed over: values are handed out in call order on both sides, and
 values a crash or rollback skips are gaps on both. A PostgreSQL `CACHE` above 1

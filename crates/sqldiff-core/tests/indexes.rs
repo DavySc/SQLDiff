@@ -213,6 +213,19 @@ fn unique_indexes_and_nulls() {
         &p("CREATE UNIQUE INDEX UX_Qty ON Items (Qty) WHERE Qty IS NOT NULL;"),
     );
     assert!(asms(&r).contains(&"ASM-TSQL-FILTERED-INDEX-SET-OPTIONS"));
+    // `Qty > 0` leaves NULLs out too, but only IS NOT NULL is decided.
+    unknown(
+        &t("CREATE UNIQUE INDEX UX_Qty ON dbo.Items (Qty) WHERE Qty > 0;"),
+        &p("CREATE UNIQUE INDEX UX_Qty ON Items (Qty) WHERE Qty > 0;"),
+        "other than `qty IS NOT NULL`",
+    );
+    // A filter that does not name the column keeps its NULLs.
+    differs(
+        &t("CREATE UNIQUE INDEX UX_Qty ON dbo.Items (Qty) WHERE Bin > 0;"),
+        &p("CREATE UNIQUE INDEX UX_Qty ON Items (Qty) WHERE Bin > 0;"),
+        "equiv.unique-nulls",
+        "NULL in qty",
+    );
     differs(
         &t("CREATE UNIQUE INDEX UX_Bin ON dbo.Items (Bin);"),
         &p("CREATE INDEX UX_Bin ON Items (Bin);"),
@@ -347,11 +360,45 @@ fn sequences() {
         "equiv.sequence",
         "after the value 9",
     );
+    // Neither cycles: the near bound is never used.
+    equal(
+        "CREATE SEQUENCE dbo.S AS int START WITH 1 INCREMENT BY 1;",
+        "CREATE SEQUENCE S AS integer START WITH 1 INCREMENT BY 1;",
+    );
+    equal(
+        "CREATE SEQUENCE dbo.S AS int START WITH 1 INCREMENT BY 10 MAXVALUE 25;",
+        "CREATE SEQUENCE S AS integer START WITH 1 INCREMENT BY 10 MAXVALUE 29;",
+    );
+    equal(
+        "CREATE SEQUENCE dbo.S AS int START WITH -1 INCREMENT BY -1;",
+        "CREATE SEQUENCE S AS integer START WITH -1 INCREMENT BY -1 MINVALUE -2147483648 MAXVALUE 5;",
+    );
+    // Both cycle: the restart point and the later rounds count.
+    differs(
+        "CREATE SEQUENCE dbo.S AS int START WITH 1 MAXVALUE 9 CYCLE;",
+        "CREATE SEQUENCE S AS integer START WITH 1 MAXVALUE 9 CYCLE;",
+        "equiv.sequence",
+        "restarts at -2147483648",
+    );
+    differs(
+        "CREATE SEQUENCE dbo.S AS int START WITH 1 INCREMENT BY 2 MINVALUE 0 MAXVALUE 9 CYCLE;",
+        "CREATE SEQUENCE S AS integer START WITH 1 INCREMENT BY 2 MINVALUE 0 MAXVALUE 10 CYCLE;",
+        "equiv.sequence",
+        "the last value is 8",
+    );
+    equal(
+        "CREATE SEQUENCE dbo.S AS int START WITH 1 MINVALUE 1 MAXVALUE 9 CYCLE;",
+        "CREATE SEQUENCE S AS integer START WITH 1 MAXVALUE 9 CYCLE;",
+    );
     differs(
         "CREATE SEQUENCE dbo.S AS int START WITH 5 MINVALUE 5 MAXVALUE 7 CYCLE;",
         "CREATE SEQUENCE S AS integer START WITH 5 MINVALUE 5 MAXVALUE 7;",
         "equiv.sequence",
         "restarts at 5",
+    );
+    equal(
+        "CREATE SEQUENCE dbo.S AS tinyint START WITH 1;",
+        "CREATE SEQUENCE S AS smallint START WITH 1 MAXVALUE 255;",
     );
     let r = equal(
         "CREATE SEQUENCE dbo.S AS tinyint;",
