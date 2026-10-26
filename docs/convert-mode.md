@@ -139,7 +139,8 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | The output check: binding, leftover source syntax, target limits, hazards | differs |
 | The engine's diff of the source weave against the target weave: a proven difference, or source syntax left in the target | differs |
 | The engine's diff: a finding it could neither prove nor rule out (`equiv.unproven`, …) | unknown |
-| The engine's diff could not compare a statement at all (`equiv.not-covered`): today every DDL statement, such as `CREATE TABLE`, so a table instance is never converted, whatever its column types | unknown |
+| The engine's diff could not compare a statement at all (`equiv.not-covered`): today every DDL statement other than a table below | unknown |
+| A `CREATE TABLE` (which the engine does not compare) that is not, token for token, the table the conversion rules write from the source instance's table (`ddl.not-as-converted`); the schema may differ only where both sides use their default (`dbo`, `public`) | unknown |
 | The engine's diff: a finding equal only under assumptions (listed with the rule) | under assumptions |
 | A name a value is part of is a PostgreSQL reserved word unquoted (`Order`, `user`), or longer than 128 characters on Db2 for i | differs |
 | A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
@@ -149,6 +150,8 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | The source weave does not parse | unknown |
 
 The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE`, `ASM-TEMPLATE-SHARED-VALUES`, `ASM-TEMPLATE-FRAGMENT` and `template.value-per-dialect`: the values are known, the includes and fragments woven in, and each instance woven with its own values. Name checks apply only to `name` values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
+
+Tables get the same bar as `sqldiff convert`'s own output: the woven target's tables, in order, must equal what the conversion rules write from the woven source's tables, ignoring layout, comments and the letter case of unquoted names, and the rules must convert them (their assumptions are listed, `ASM-DBO-SCHEMA` with the engine's). A table written another faithful way (`int` for `integer`, a constraint in another place) is unknown, never converted: rewrite it as the rules do or check it by hand.
 
 With `--woven DIR` (the generator's real output) each source weave must equal its `output` file, ignoring trailing white space, or the instance is not woven (`weave.generator-mismatch`, with the first line that differs), and every file there that no instance names is listed under "not in manifest". That is what shows the manifest describes the generator completely.
 
