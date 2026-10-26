@@ -146,6 +146,10 @@ pub struct Conversion {
     /// no unit (text the rules wrote around units). Any entry here means the
     /// file as a whole cannot count as converted.
     pub unplaced: Vec<usize>,
+    /// The engine's "not proven" reasons (`report.unknown_reasons`) that name
+    /// no line inside a unit. Any entry keeps the file from counting as
+    /// converted: something in it was not compared.
+    pub unproven: Vec<String>,
     /// Set when the input was a template.
     pub template: Option<TemplateInfo>,
 }
@@ -407,6 +411,72 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
             }
         }
     }
+    // What the engine says it did not compare: a unit is converted only
+    // when its input and output were compared, so every such statement
+    // (DDL, calls, statements with no counterpart, ...) is not proven. A
+    // reason that names no unit's line keeps the whole file from counting.
+    let mut unproven = Vec::new();
+    for reason in &report.unknown_reasons {
+        let hits: Vec<usize> = match reason_line(reason) {
+            Some((out_side, line)) => units
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| {
+                    let s = if out_side { u.out } else { u.src };
+                    s.line <= line && line <= s.end_line
+                })
+                .map(|(i, _)| i)
+                .collect(),
+            None => Vec::new(),
+        };
+        if hits.is_empty() {
+            unproven.push(reason.clone());
+            continue;
+        }
+        // The innermost units: a routine's header unit spans its body, and
+        // the reason is about the statement, not the routine.
+        let span = |i: usize| {
+            let u = &units[i];
+            let s = if reason_line(reason).is_some_and(|(o, _)| o) {
+                u.out
+            } else {
+                u.src
+            };
+            (s.start, s.end)
+        };
+        let inner: Vec<usize> = hits
+            .iter()
+            .copied()
+            .filter(|&i| {
+                let (a, b) = span(i);
+                !hits.iter().any(|&j| {
+                    let (c, d) = span(j);
+                    j != i && a <= c && d <= b && (c, d) != (a, b)
+                })
+            })
+            .collect();
+        let hits = inner;
+        let text = format!(
+            "The engine did not compare this with its conversion: {}",
+            reason_text(reason)
+        );
+        for i in hits {
+            let u = &mut units[i];
+            u.status = u.status.max(Status::Unproven);
+            u.checked = u.checked.max(Status::Unproven);
+            if !u.notes.iter().any(|n| n.text == text) {
+                let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
+                u.notes.insert(
+                    at,
+                    Note {
+                        status: Status::Unproven,
+                        rule: NOT_COMPARED.into(),
+                        text: text.clone(),
+                    },
+                );
+            }
+        }
+    }
     // The output's own check: anything that does not bind, or still reads as
     // the source dialect, keeps its unit from counting as converted, whether
     // the finding is proven or rests on an assumption.
@@ -476,10 +546,36 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
         report,
         output_check,
         unplaced,
+        unproven,
         template: None,
     };
     recount(&mut c);
     c
+}
+
+/// Rule of the note on a unit the engine did not compare.
+pub const NOT_COMPARED: &str = "equiv.not-compared";
+
+/// `(output side, line)` of an engine reason `side A (T-SQL) line 12: ...`.
+fn reason_line(reason: &str) -> Option<(bool, usize)> {
+    let rest = reason.strip_prefix("side ")?;
+    let out_side = match rest.as_bytes().first()? {
+        b'A' => false,
+        b'B' => true,
+        _ => return None,
+    };
+    let (_, after) = rest.split_once(") line ")?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    after[digits.len()..].starts_with(':').then_some(())?;
+    Some((out_side, digits.parse().ok()?))
+}
+
+/// A reason without its `side A (T-SQL) line 12: ` prefix.
+fn reason_text(reason: &str) -> &str {
+    match reason_line(reason) {
+        Some(_) => reason.split_once(": ").map_or(reason, |(_, rest)| rest),
+        None => reason,
+    }
 }
 
 /// A hand-written unit's notes: `note`, then the rules' assumptions and

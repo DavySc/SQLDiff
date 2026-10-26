@@ -386,6 +386,11 @@ impl<'a> Parser<'a> {
         self.i >= self.t.len()
     }
 
+    /// How many tokens have been read.
+    pub fn pos(&self) -> usize {
+        self.i
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.t.get(self.i)
     }
@@ -2014,7 +2019,7 @@ pub fn quoted_name(raw: &str, d: Dialect) -> String {
 }
 
 /// Value of a string literal token; rejects prefixes other than N.
-fn string_value(raw: &str) -> PResult<String> {
+pub(crate) fn string_value(raw: &str) -> PResult<String> {
     let q = raw.find('\'').ok_or("bad string literal")?;
     let prefix = raw[..q].to_ascii_uppercase();
     if !(prefix.is_empty() || prefix == "N") {

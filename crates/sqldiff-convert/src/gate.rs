@@ -153,6 +153,16 @@ pub fn check(
                 ),
             );
         }
+        if !f.unproven.is_empty() {
+            block(
+                &mut b,
+                Status::Unproven.label(),
+                &f.path,
+                None,
+                0,
+                format!("not compared, outside any unit: {}", f.unproven.join("; ")),
+            );
+        }
         for u in f.units.iter().chain(&f.converted_units) {
             units += 1;
             let id = Some(u.id.as_str());

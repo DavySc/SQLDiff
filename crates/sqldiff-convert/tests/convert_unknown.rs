@@ -69,7 +69,10 @@ fn a_literal_the_engines_convert_differently_is_not_proven() {
         assert_eq!(u.notes[0].status, Status::Unproven, "{:?}", u.notes);
         // Unknown is not a difference.
         assert_eq!(c.counts.differs, 0, "{to:?}: {}", c.output);
-        assert_eq!(c.counts.unproven, 1, "{to:?}");
+        // Db2 for i tables are not compared yet: the CREATE TABLE is not
+        // proven there either.
+        let tables = usize::from(to == Dialect::Db2i);
+        assert_eq!(c.counts.unproven, 1 + tables, "{to:?}");
     }
 }
 
@@ -141,4 +144,30 @@ fn only_findings_about_the_pair_leave_a_unit_undecided() {
             "{rule}"
         );
     }
+}
+
+#[test]
+fn a_statement_the_engine_never_compared_is_not_converted() {
+    // The engine does not model CREATE INDEX: the rules' output for it may
+    // be right, but nothing compared it with the original.
+    let src = format!("{ORDERS}CREATE INDEX IX_Orders_Amt ON dbo.Orders (amt);\nGO\n");
+    let c = convert(&src, Dialect::Postgres);
+    let at = src.find("CREATE INDEX").unwrap();
+    let u = c
+        .units
+        .iter()
+        .find(|u| u.src.start <= at && at < u.src.end)
+        .unwrap();
+    assert_eq!(u.status, Status::Unproven, "{:?}", u.notes);
+    assert_eq!(u.checked, Status::Unproven);
+    let n = u
+        .notes
+        .iter()
+        .find(|n| n.rule == sqldiff_convert::NOT_COMPARED)
+        .unwrap_or_else(|| panic!("{:?}", u.notes));
+    assert!(n.text.contains("CREATE"), "{}", n.text);
+    // The table itself is compared, and converts.
+    let t = c.units.iter().find(|u| u.src.start == 0).unwrap();
+    assert!(t.status <= Status::Assumptions, "{:?}", t.notes);
+    assert!(!has_rule(t, sqldiff_convert::NOT_COMPARED));
 }

@@ -321,6 +321,8 @@ pub struct FileReview {
     /// rules). While there is any, the file is not reviewed, whatever its
     /// units say.
     pub unplaced: Vec<String>,
+    /// What the engine did not compare, outside any unit: the same.
+    pub unproven: Vec<String>,
     /// Records for this file whose unit no longer exists (its text changed).
     pub orphaned: Vec<Record>,
 }
@@ -396,6 +398,7 @@ pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> 
         path: path.to_string(),
         units,
         unplaced,
+        unproven: c.unproven.clone(),
         orphaned,
     }
 }
@@ -482,7 +485,10 @@ impl FileReview {
     /// Every unit reviewed and nothing unplaced. A file without units has
     /// nothing anyone accepted, so it is never reviewed.
     pub fn reviewed(&self) -> bool {
-        !self.units.is_empty() && self.unplaced.is_empty() && self.units.iter().all(|u| u.reviewed)
+        !self.units.is_empty()
+            && self.unplaced.is_empty()
+            && self.unproven.is_empty()
+            && self.units.iter().all(|u| u.reviewed)
     }
 }
 

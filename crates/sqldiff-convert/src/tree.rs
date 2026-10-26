@@ -150,6 +150,10 @@ pub struct FileReport {
     pub output_hash: String,
     /// Output findings that point into no unit.
     pub unplaced: Vec<String>,
+    /// What the engine says it did not compare, at no unit's line: the file
+    /// is then at best `not proven`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unproven: Vec<String>,
     /// For a template: what it holds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<crate::TemplateInfo>,
@@ -1225,6 +1229,9 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
     if !c.unplaced.is_empty() {
         status = status.max(Status::Differs);
     }
+    if !c.unproven.is_empty() {
+        status = status.max(Status::Unproven);
+    }
     let ids = crate::review::unit_ids(rel, input, c);
     let (mut units, mut converted_units) = (Vec::new(), Vec::new());
     for ((u, &l), id) in c.units.iter().zip(lines).zip(ids) {
@@ -1287,6 +1294,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
             .filter_map(|&i| c.output_check.findings.get(i))
             .map(|f| format!("{}: {}", f.rule, f.witness))
             .collect(),
+        unproven: c.unproven.clone(),
         template: c.template.clone(),
         review: None,
     }
@@ -1439,8 +1447,10 @@ pub fn review(t: &mut Tree, inputs: &[Input], ledger: &crate::review::Ledger, pa
             .chain(&f.converted_units)
             .all(|u| u.review.as_ref().is_some_and(|r| r.reviewed));
         // A file without units has nothing a person accepted: never reviewed.
-        let reviewed =
-            all && fr.unplaced.is_empty() && !(f.units.is_empty() && f.converted_units.is_empty());
+        let reviewed = all
+            && fr.unplaced.is_empty()
+            && f.unproven.is_empty()
+            && !(f.units.is_empty() && f.converted_units.is_empty());
         files_reviewed += usize::from(reviewed);
         f.review = Some(FileReviewReport {
             reviewed,
@@ -1622,6 +1632,9 @@ pub fn markdown(r: &Report) -> String {
         }
         for p in &f.unplaced {
             let _ = writeln!(s, "- outside any unit: **differs** {p}");
+        }
+        for p in &f.unproven {
+            let _ = writeln!(s, "- outside any unit: **not proven** {p}");
         }
         let assumed = f
             .units

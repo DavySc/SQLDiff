@@ -934,6 +934,7 @@ fn leaked(
     c.report.verdict = sqldiff_core::session::derive_verdict(&c.report);
     c.output_check.findings.clear();
     c.unplaced.clear();
+    c.unproven.clear();
     c.output = t.text.clone();
     c.template = Some(TemplateInfo {
         parameters: t.parameters(),

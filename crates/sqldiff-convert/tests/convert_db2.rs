@@ -221,7 +221,13 @@ fn create_table_types_and_defaults() {
     assert!(o.contains("CONSTRAINT PK_Item PRIMARY KEY (Id)"), "{o}");
     assert!(!o.contains("PRIMARY]"), "{o}");
     let u = &c.units[0];
-    assert_eq!(u.status, Status::Decision, "{:?}", u.notes); // NVARCHAR(MAX)
+    // Db2 for i column types are not compared by the engine yet (no verified
+    // facts): not proven, and NVARCHAR(MAX) is a decision besides.
+    assert_eq!(u.status, Status::Unproven, "{:?}", u.notes);
+    assert!(u
+        .notes
+        .iter()
+        .any(|n| n.status == Status::Decision && n.rule == "db2.lob"));
     for r in [
         "ASM-IDENTITY",
         "ASM-BIT-SMALLINT",

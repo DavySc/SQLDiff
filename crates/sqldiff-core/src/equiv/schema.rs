@@ -275,6 +275,17 @@ impl Schema {
         })
     }
 
+    /// This schema with the tables `ddl` creates added; they replace tables
+    /// of the same name.
+    pub fn with_ddl(&self, ddl: &str, d: Dialect) -> Schema {
+        let mut cat = Catalog::default();
+        ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);
+        let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
+        let mut s = self.clone();
+        s.tables.extend(extra.tables);
+        s
+    }
+
     /// Reads DDL artifacts through the shared catalog loader; files fold in order.
     pub fn load(artifacts: &[Artifact]) -> Schema {
         let Some(first) = artifacts.first() else {

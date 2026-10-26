@@ -26,6 +26,25 @@ fn unit<'a>(c: &'a Conversion, input: &str, needle: &str) -> &'a Unit {
         .unwrap_or_else(|| panic!("no unit for {needle}"))
 }
 
+/// The rules' own verdict on a unit the engine did not compare: the unit is
+/// not proven, and this is the worst of its other notes.
+fn rules_only(u: &sqldiff_convert::Unit) -> Status {
+    assert_eq!(u.status, Status::Unproven, "{:?}", u.notes);
+    assert!(
+        u.notes
+            .iter()
+            .any(|n| n.rule == sqldiff_convert::NOT_COMPARED),
+        "{:?}",
+        u.notes
+    );
+    u.notes
+        .iter()
+        .filter(|n| n.rule != sqldiff_convert::NOT_COMPARED)
+        .map(|n| n.status)
+        .max()
+        .unwrap_or(Status::Converted)
+}
+
 fn has_rule(u: &Unit, rule: &str) -> bool {
     u.notes.iter().any(|n| n.rule == rule)
 }
@@ -93,8 +112,10 @@ fn extended_properties_become_comments() {
         "named arguments need no block:\n{}",
         c.output
     );
+    // The engine does not compare EXEC sp_addextendedproperty with COMMENT
+    // ON yet: not proven, and under assumptions by the rules.
     for u in &c.units {
-        assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
+        assert_eq!(rules_only(u), Status::Assumptions, "{:?}", u.notes);
         assert!(has_rule(u, "ASM-EXTPROP-COMMENT"));
     }
     let idx = "EXEC sp_addextendedproperty @name = N'Description', @value = N'x', @level0type = N'SCHEMA', @level0name = N'Sales', @level1type = N'TABLE', @level1name = N'Orders', @level2type = N'INDEX', @level2name = N'IX_1';\n";
