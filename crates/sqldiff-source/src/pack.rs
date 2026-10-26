@@ -200,6 +200,11 @@ pub struct TemplateSyntax {
     /// T-SQL). Default: `name_pattern`.
     #[serde(default)]
     pub unquoted_name_pattern: Option<String>,
+    /// The special form that pulls another template in (`sqldiff instances`
+    /// weaves it): its first capture group is the included file's path,
+    /// relative to the including template, else to the template tree.
+    #[serde(default)]
+    pub include: Option<String>,
 }
 
 fn default_placeholder_name() -> String {
@@ -452,6 +457,13 @@ impl Policy {
             for f in &t.special_forms {
                 Regex::new(&f.pattern)
                     .map_err(|e| Error::new(format!("template special form `{}`: {e}", f.name)))?;
+            }
+            if let Some(i) = &t.include {
+                if !t.special_forms.iter().any(|f| &f.name == i) {
+                    return Err(Error::new(format!(
+                        "template.include `{i}`: no special form has that name"
+                    )));
+                }
             }
             if let Some(p) = &t.placeholders {
                 if !matches!(p.as_str(), "parameters" | "pattern") {

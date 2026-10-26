@@ -73,11 +73,58 @@ sqldiff convert templates/ -o out/ --to postgres --template --pack PACK [--param
 `sqldiff convert --template` converts a whole tree of templates the same way, with the same two passes, catalogs and report as plain files. The output tree holds templates for the target. Every file is read as a template; files without placeholders (an included header, say) come through as plain SQL. `--extension` (repeatable, default `sql`) picks the files when the generator uses another extension.
 
 - **One set of stand-ins for the tree.** All fragments use the same stand-in name for the same placeholder, so a table that `tables/entity.tpl.sql` creates as `<%SCHEMA%>.<%TABLE%>` binds in every template that uses `<%SCHEMA%>.<%TABLE%>`, and a misspelt column there is `bind.unknown-column`.
+- **The premise is stated.** Binding across templates assumes one weave fills each placeholder with the same value in every template; two templates woven with different values would bind to the wrong instance's object. So in a tree with catalogs every unit with a placeholder also carries `ASM-TEMPLATE-SHARED-VALUES`, discharged only by checking the woven instances (`sqldiff instances`). `--no-catalog` binds nothing across files and needs no such assumption.
 - **No binding by guess.** An object whose name holds a placeholder and that more than one file creates (two templates both creating `<%SCHEMA%>.<%TABLE%>`, for different instances) is left out of the catalogs, so nothing binds against the wrong one; the units that use it still carry `ASM-TEMPLATE-PLACEHOLDER`.
 - **The output.** `ASM-TEMPLATE-DIRECTIVE` is written once, as the file's first line, instead of above every unit; every other status line is written as for plain files. Findings, notes and reasons quote placeholders as the template writes them.
 - **The report** says `"templates": true`, and each file lists its placeholders, unresolved candidates and directives under `template`.
 
 A converted template tree is never the last word: a template is right only when every instance the generator weaves from it is, which the instance check verifies.
+
+### Checking every woven instance
+
+```sh
+sqldiff instances instances.toml --source templates/ --target out/ --to postgres -o check/ --pack PACK \
+    [--woven generated/] [--accept ASM-…] [--catalog schema.sql]
+```
+
+`sqldiff instances` weaves every instance the generator produces twice, from the source templates and from the converted ones, with the same values, and checks each pair. The manifest lists the instances (a template, or several parts in order), their parameter values, and values per dialect where a value differs between dialects:
+
+```toml
+[params]                        # every instance
+SCHEMA = "dbo"
+[params_for.postgres]           # every instance, PostgreSQL side only
+SCHEMA = "public"
+
+[[instance]]
+name = "Sales/SaveCustomer"     # unique; also the woven files' name
+template = "procs/save-entity.tpl.sql"
+output = "Sales/SaveCustomer.sql"   # the generator's own output under --woven (default: name + .sql)
+params = { ENTITY = "Customer", TABLE = "Customer" }
+
+[[instance]]
+name = "Sales/Composed"
+parts = ["header.sql", { template = "body.tpl.sql", params = { X = "1" } }]
+```
+
+Values merge manifest, then instance, then part; at each level a dialect's own values win. The names the manifest gives values for are the parameter list for the placeholder rules (`--parameter` adds more). The pack's `[template] include` names the special form that pulls another file in: its first capture is the path, next to the including file first, else from the tree root, never outside it. Any other special form is generator logic the weaver cannot run, and so is a missing value or an include cycle: that instance is **not woven** and nothing about it is claimed.
+
+Each target instance is checked the way `sqldiff convert` checks its output, with the catalog of every woven instance on its side (and any `--catalog`):
+
+| Check | Fails as |
+|---|---|
+| The target weave parses as the target dialect | differs |
+| The output check: binding, leftover source syntax, target limits, hazards | differs |
+| The engine's diff of the source weave against the target weave: a proven difference, or source syntax left in the target | differs |
+| A name a value is part of is a PostgreSQL reserved word unquoted (`Order`, `user`), or longer than 128 characters on Db2 for i | differs |
+| A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
+| A Db2 for i name from a value: no verified reserved-word list is built in (`ASM-DB2I-RESERVED-UNCHECKED`) | under assumptions |
+| The source weave does not parse | unknown |
+
+The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE` and `ASM-TEMPLATE-SHARED-VALUES`: the values are known, the includes woven in, and each instance woven with its own values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
+
+With `--woven DIR` (the generator's real output) each source weave must equal its `output` file, ignoring trailing white space, or the instance is not woven (`weave.generator-mismatch`, with the first line that differs), and every file there that no instance names is listed under "not in manifest". That is what shows the manifest describes the generator completely.
+
+`check/instance-report.json` and `.md` give each instance's status and items (side, line in the woven file, rule), each converted template's status (the worst instance that uses it, includes too) and the converted templates no instance uses ("not exercised", never checked). The woven files are written to `check/source/` and `check/target/`. Exit code 0 when every instance is converted or converted under assumptions and all generator output is accounted for, 1 otherwise.
 
 ## The page
 
