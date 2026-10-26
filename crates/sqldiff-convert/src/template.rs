@@ -868,6 +868,7 @@ fn leaked(
         findings: Vec::new(),
         output_findings: Vec::new(),
         checked: Status::Differs,
+        written: None,
     }];
     c.report.findings.clear();
     c.report
@@ -943,6 +944,7 @@ pub fn split_pair(c: Conversion, head: &str, foot: &str, marker: &str) -> (Conve
                 findings: Vec::new(),
                 output_findings: Vec::new(),
                 checked: Status::Differs,
+                written: None,
             }];
             recount(&mut p);
             p

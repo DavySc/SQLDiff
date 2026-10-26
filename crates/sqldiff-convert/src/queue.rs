@@ -42,6 +42,19 @@ pub struct Instances {
     /// Generator target output no instance accounts for.
     #[serde(default)]
     pub not_in_manifest_target: Vec<String>,
+    /// Every instance done, every template exercised, all generator output
+    /// accounted for (absent in reports from before the generator check).
+    #[serde(default)]
+    pub complete: Option<bool>,
+    /// The inputs as given to `sqldiff instances`, and their `tree::dir_hash`.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    #[serde(default)]
+    pub woven: Option<String>,
+    #[serde(default)]
+    pub woven_target: Option<String>,
+    #[serde(default)]
+    pub hashes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

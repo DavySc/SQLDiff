@@ -8,6 +8,8 @@ pub(crate) struct RawUnit {
     pub src: (usize, usize),
     pub out: (usize, usize),
     pub notes: Vec<Note>,
+    /// Set when a person or an agent wrote this unit's output by hand.
+    pub written: Option<crate::Written>,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +33,7 @@ impl Out {
             src,
             out: (start, end),
             notes,
+            written: None,
         });
     }
 

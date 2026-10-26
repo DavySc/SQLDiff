@@ -166,6 +166,7 @@ fn record(input: &str, out: &str, unit: &str, rule: &str, state: State, by: By) 
         at: "2026-10-26T11:00:00Z".into(),
         input_hash: file_hash(input),
         output_hash: file_hash(out),
+        text: None,
     }
 }
 

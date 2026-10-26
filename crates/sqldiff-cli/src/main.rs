@@ -23,6 +23,7 @@ mod drift_cmd;
 mod instances_cmd;
 mod queue_cmd;
 mod review_cmd;
+mod review_status_cmd;
 mod source_cmd;
 
 use review_cmd::{Pipeline, ReviewArgs};
@@ -184,6 +185,10 @@ enum Command {
         /// Replace files in a non-empty output directory.
         #[arg(long)]
         overwrite: bool,
+        /// With --overwrite: also replace files edited by hand since the last
+        /// run (refused otherwise; record such edits in the review ledger).
+        #[arg(long, requires = "overwrite")]
+        discard_edits: bool,
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
@@ -210,6 +215,49 @@ enum Command {
         /// too (tier 6: nothing found, not proven).
         #[arg(long)]
         queue_all: bool,
+        #[command(flatten)]
+        cfg: source_cmd::ConfigArgs,
+    },
+    /// The done gate for a converted tree, for CI: converts SRC again with
+    /// the review ledger in OUT and says whether the review is complete.
+    ///
+    /// Complete: every unit converted or converted under assumptions; every
+    /// assumption accepted and every decision picked by a person, by name;
+    /// no rejection standing; every unit an agent wrote approved by a
+    /// person; no decision made on other bytes of its file; OUT holding
+    /// exactly what converting SRC gives now; and, for templates, an
+    /// instance check that is complete and was run on these trees. Lists
+    /// what was accepted by name. With --require-complete the exit code is
+    /// 1 when the review is not complete.
+    ReviewStatus {
+        src: PathBuf,
+        /// The converted tree, with its review-decisions.jsonl.
+        out: PathBuf,
+        #[arg(long, default_value = "tsql")]
+        from: Dialect,
+        #[arg(long)]
+        to: Dialect,
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// As given to `sqldiff convert`.
+        #[arg(long)]
+        no_catalog: bool,
+        /// As given to `sqldiff convert`; then --instances is required.
+        #[arg(long)]
+        template: bool,
+        #[arg(long = "parameter", value_name = "NAME", requires = "template")]
+        parameters: Vec<String>,
+        #[arg(long = "extension", value_name = "EXT")]
+        extensions: Vec<String>,
+        /// `instance-report.json` from `sqldiff instances`, or its directory.
+        #[arg(long, value_name = "PATH")]
+        instances: Option<PathBuf>,
+        /// Exit with 1 unless the review is complete.
+        #[arg(long)]
+        require_complete: bool,
+        /// Print the gate as JSON.
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -525,6 +573,45 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             format,
             Pipeline::new(cfg.resolve()?, &review)?,
         ),
+        Command::ReviewStatus {
+            src,
+            out,
+            from,
+            to,
+            jobs,
+            no_catalog,
+            template,
+            parameters,
+            extensions,
+            instances,
+            require_complete,
+            json,
+            cfg,
+        } => {
+            let template = if template {
+                Some(convert_cmd::TemplateMode::configured(
+                    &cfg.resolve()?,
+                    (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                )?)
+            } else {
+                None
+            };
+            review_status_cmd::run(review_status_cmd::Args {
+                tree: sqldiff_convert::tree::Args {
+                    src,
+                    from,
+                    to,
+                    jobs,
+                    no_catalog,
+                    template,
+                    extensions: sqldiff_convert::tree::extensions(extensions),
+                },
+                out,
+                instances,
+                require_complete,
+                json,
+            })
+        }
         Command::Convert {
             src,
             out,
@@ -532,6 +619,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             to,
             jobs,
             overwrite,
+            discard_edits,
             no_catalog,
             template,
             parameters,
@@ -560,6 +648,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 },
                 out,
                 overwrite,
+                discard_edits,
                 instances,
                 queue_all,
             })

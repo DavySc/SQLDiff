@@ -85,6 +85,7 @@ fn handshake_list_and_conversion_review() {
             "convert",
             "convert_tree",
             "conversion_queue",
+            "write_unit",
             "converted_file"
         ]
     );

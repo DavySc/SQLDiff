@@ -15,6 +15,8 @@ pub struct Args {
     pub tree: tree::Args,
     pub out: PathBuf,
     pub overwrite: bool,
+    /// Overwrite files edited by hand since the last run.
+    pub discard_edits: bool,
     /// `instance-report.json`, or the directory holding it.
     pub instances: Option<PathBuf>,
     /// Tier 6 in the queue too.
@@ -29,6 +31,7 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     };
     let (inputs, unreadable) = tree::read(&a.tree)?;
     tree::prepare_out(&a.tree.src, &a.out, a.overwrite)?;
+    tree::guard_hand_edits(&a.out, a.discard_edits)?;
     let mut t = tree::convert(&a.tree, &inputs, unreadable, Some(&a.out))?;
     // Review decisions committed next to the converted tree.
     for w in tree::review_in(&mut t, &inputs, &a.out)? {

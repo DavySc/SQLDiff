@@ -227,6 +227,7 @@ impl Server {
             "convert" => self.convert(args),
             "convert_tree" => self.convert_tree(args),
             "conversion_queue" => self.conversion_queue(args),
+            "write_unit" => self.write_unit(args),
             "converted_file" => self.converted_file(args),
             _ => return None,
         })
@@ -1230,6 +1231,108 @@ impl Server {
         Ok((text, structured))
     }
 
+    /// Records hand-written output for one unit as the agent's draft, then
+    /// converts and writes the tree again so the text is checked like rule
+    /// output. The record is always `by: agent`: this server never speaks
+    /// for a person, and a person approves the result in the GUI or CLI.
+    fn write_unit(&mut self, args: &Value) -> Result<(String, Value), String> {
+        use sqldiff_convert::{queue, review};
+        let a = self.tree_args(args)?;
+        let out = std::path::PathBuf::from(
+            str_arg(args, "out").ok_or("`out` is required: the converted tree to write into")?,
+        );
+        let path = str_arg(args, "path").ok_or("`path` is required")?;
+        let unit = str_arg(args, "unit")
+            .ok_or("`unit` is required (a unit id from `conversion_queue` or `convert_tree`)")?;
+        let text = str_arg(args, "text").ok_or("`text` is required")?;
+        let reason = str_arg(args, "reason")
+            .ok_or("`reason` is required: why this text does what the source does")?;
+        let author = str_arg(args, "author").unwrap_or_else(|| "agent".to_string());
+        if !out.join("conversion-report.json").exists() {
+            return Err(format!(
+                "{} holds no converted tree: run `convert_tree` with `out` first",
+                out.display()
+            ));
+        }
+        // Refused before anything is recorded, so a refusal changes nothing.
+        tree::prepare_out(&a.src, &out, true)?;
+        tree::guard_hand_edits(&out, false)?;
+        let (inputs, unreadable) = tree::read(&a)?;
+        let t = tree::convert(&a, &inputs, unreadable.clone(), Some(&out))?;
+        let r = tree::written_record(
+            &t,
+            &inputs,
+            &path,
+            &unit,
+            &text,
+            review::By::Agent,
+            &author,
+            &reason,
+            &sqldiff_review::time::now(),
+        )?;
+        review::append(&out, &r)?;
+        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out))?;
+        tree::review_in(&mut t, &inputs, &out)?;
+        tree::write(&t, &out)?;
+        queue::write(&queue::build(&t.report, None, false), &out)?;
+
+        let f = t
+            .report
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or_else(|| format!("`{path}` left the tree"))?;
+        let k = t
+            .report
+            .files
+            .iter()
+            .position(|f| f.path == path)
+            .unwrap_or(0);
+        let c = &t.conversions[k];
+        let ids = review::unit_ids(&path, &inputs[k].text, c);
+        let now = c
+            .units
+            .iter()
+            .zip(&ids)
+            .find(|(u, _)| u.written.as_ref().is_some_and(|w| w.origin == r.unit));
+        let structured = match now {
+            Some((u, id)) => {
+                let rep = f.units.iter().find(|x| &x.id == id);
+                json!({
+                    "recorded": r,
+                    "applied": true,
+                    "unit": id,
+                    "status": u.status.label(),
+                    "notes": u.notes.iter().map(|n| json!({"status": n.status.label(), "rule": n.rule, "text": n.text})).collect::<Vec<_>>(),
+                    "findings": rep.map(|x| x.findings.clone()).unwrap_or_default(),
+                    "file_status": f.status.label(),
+                })
+            }
+            None => json!({
+                "recorded": r,
+                "applied": false,
+                "file_status": f.status.label(),
+            }),
+        };
+        let text = match now {
+            Some((u, id)) => format!(
+                "Recorded the text for {path} unit {} as an agent draft and converted again: the unit is now `{id}`, {}{}. It stays in the review queue at tier 3 or worse until a person approves it.\n",
+                r.unit,
+                u.status.label(),
+                u.notes
+                    .first()
+                    .map(|n| format!(" ({}: {})", n.rule, n.text))
+                    .unwrap_or_default()
+            ),
+            None => format!(
+                "Recorded the text for {path} unit {}, but it did not apply on the new conversion (another author's text for the unit may conflict); the file is {}.\n",
+                r.unit,
+                f.status.label()
+            ),
+        };
+        Ok((text, structured))
+    }
+
     fn convert_tree(&mut self, args: &Value) -> Result<(String, Value), String> {
         let a = self.tree_args(args)?;
         let out = str_arg(args, "out").map(std::path::PathBuf::from);
@@ -1241,6 +1344,11 @@ impl Server {
         let (inputs, unreadable) = tree::read(&a)?;
         if let Some(o) = &out {
             tree::prepare_out(&a.src, o, overwrite)?;
+            let discard = args
+                .get("discard_edits")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            tree::guard_hand_edits(o, discard)?;
         }
         let mut t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
         // Review decisions committed next to the converted tree.
@@ -1728,6 +1836,7 @@ fn tools() -> Value {
                     "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
                     "out": { "type": "string", "description": "Output directory to write, as `sqldiff convert -o`; default: write nothing" },
                     "overwrite": { "type": "boolean", "description": "Replace files in a non-empty `out` (default false)" },
+                    "discard_edits": { "type": "boolean", "description": "With `overwrite`: also replace files edited by hand since the last run (refused otherwise)" },
                     "no_catalog": { "type": "boolean", "description": "Check each file alone, without catalogs built from the whole tree" },
                     "template": { "type": "boolean", "description": "Every file is a template in the loaded packs' [template] syntax (as `sqldiff convert --template`)" },
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
@@ -1745,7 +1854,7 @@ fn tools() -> Value {
         {
             "name": "conversion_queue",
             "title": "Review queue of a converted tree",
-            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again in memory with the same arguments as `convert_tree` and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing. Reviewed units are not listed. Review decisions are recorded by people in the GUI or CLI, never by this server.",
+            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again in memory with the same arguments as `convert_tree` and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing. Reviewed units are not listed. Verdicts are recorded by people in the GUI or CLI, never by this server; `write_unit` only records an agent's draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1765,6 +1874,31 @@ fn tools() -> Value {
                 "required": ["src", "to", "out"],
             },
             "annotations": ro,
+        },
+        {
+            "name": "write_unit",
+            "title": "Draft one unit's output by hand",
+            "description": "Replace the output of one unit of a converted tree with your own text, as an agent's draft. Records a `written` record (always `by: agent`) with the text in OUT/review-decisions.jsonl, then converts `src` again and rewrites `out`, so the text is checked against the source like rule output in a plain file; in a template it is spliced in unchecked and marked not proven until the woven instances are checked. Returns the unit's new id, status, notes and findings. The draft is never reviewed: it stays in the queue (tier 3 or worse) until a person approves it, and a person's own text for the unit replaces it. Refused if a file in `out` was edited by hand since the last conversion. Unit ids change with the text: take the id from a fresh `conversion_queue` or `convert_tree`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "src": { "type": "string", "description": "Source directory, or one file, as given to `convert_tree`" },
+                    "from": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Source dialect (default tsql)" },
+                    "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
+                    "out": { "type": "string", "description": "The converted tree, written earlier by `convert_tree`" },
+                    "no_catalog": { "type": "boolean" },
+                    "template": { "type": "boolean" },
+                    "parameters": { "type": "array", "items": { "type": "string" } },
+                    "extensions": { "type": "array", "items": { "type": "string" } },
+                    "path": { "type": "string", "description": "File path as the report lists it" },
+                    "unit": { "type": "string", "description": "The unit's id in the current conversion" },
+                    "text": { "type": "string", "description": "The unit's full output text, replacing what the rules wrote" },
+                    "reason": { "type": "string", "description": "Why this text does what the source does" },
+                    "author": { "type": "string", "description": "Name to record (default \"agent\")" },
+                },
+                "required": ["src", "to", "out", "path", "unit", "text", "reason"],
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": false },
         },
         {
             "name": "converted_file",

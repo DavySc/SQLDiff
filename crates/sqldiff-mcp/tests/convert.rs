@@ -87,6 +87,7 @@ fn tools_are_listed() {
         "convert",
         "convert_tree",
         "conversion_queue",
+        "write_unit",
         "converted_file",
     ] {
         assert!(names.contains(&n), "{names:?}");
@@ -367,4 +368,100 @@ fn the_queue_reads_the_tree_again_and_writes_nothing() {
     assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "{tiers:?}");
     assert_eq!(walk(&out), before, "the queue writes nothing");
     assert_eq!(r[1]["result"]["isError"], true);
+}
+
+#[test]
+fn an_agent_writes_a_unit_and_it_is_checked_and_waits_for_a_person() {
+    let (d, src) = tree("write-unit");
+    let out = d.join("out");
+    let caller = "Sales/Procs/Caller.sql";
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": out }),
+        ),
+        call(
+            2,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": out, "all": true, "limit": 100 }),
+        ),
+    ]);
+    result(&r[0]);
+    let output = std::fs::read_to_string(out.join(caller)).unwrap();
+    let (n, line) = output
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.trim_start().starts_with("UPDATE"))
+        .unwrap();
+    let item = result(&r[1])["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["path"] == caller && i["out_line"] == n as u64 + 1)
+        .unwrap_or_else(|| panic!("no item for line {} in {:#}", n + 1, result(&r[1])))
+        .clone();
+    // Same rows, written differently; `by` from the caller is ignored.
+    let text = format!("{} WHERE 1 = 1;", line.trim_end().trim_end_matches(';'));
+    let args = json!({
+        "src": src, "to": "postgres", "out": out, "path": caller,
+        "unit": item["unit"], "text": text, "reason": "a test", "by": "human",
+    });
+    let r = session(&[
+        call(3, "write_unit", args.clone()),
+        call(
+            4,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": out, "all": true, "limit": 100 }),
+        ),
+        // The id is gone now: the unit has the text's id.
+        call(5, "write_unit", args),
+    ]);
+    let w = result(&r[0]);
+    assert_eq!(w["applied"], true, "{w:#}");
+    assert_eq!(w["recorded"]["by"], "agent");
+    assert_ne!(w["unit"], item["unit"]);
+    // Checked like the rules' output, and never plainly converted.
+    assert_ne!(w["status"], "converted", "{w:#}");
+    assert!(
+        w["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n["rule"] == "ASM-HAND-WRITTEN"),
+        "{w:#}"
+    );
+    assert!(std::fs::read_to_string(out.join(caller))
+        .unwrap()
+        .contains(&text));
+    let now = result(&r[1])["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["unit"] == w["unit"])
+        .unwrap()
+        .clone();
+    assert!(now["tier"].as_u64().unwrap() <= 3, "{now:#}");
+    assert_eq!(r[2]["result"]["isError"], true, "{}", r[2]);
+
+    // A file edited by hand since the last run refuses the write, and
+    // nothing is recorded.
+    let ledger = std::fs::read_to_string(out.join("review-decisions.jsonl")).unwrap();
+    let f = out.join("Sales/Procs/NextOrder.sql");
+    let t = std::fs::read_to_string(&f).unwrap();
+    std::fs::write(&f, t + "-- edited\n").unwrap();
+    let r = session(&[call(
+        6,
+        "write_unit",
+        json!({
+            "src": src, "to": "postgres", "out": out, "path": caller,
+            "unit": w["unit"], "text": text, "reason": "again",
+        }),
+    )]);
+    assert_eq!(r[0]["result"]["isError"], true, "{}", r[0]);
+    assert!(r[0].to_string().contains("NextOrder.sql"), "{}", r[0]);
+    assert_eq!(
+        std::fs::read_to_string(out.join("review-decisions.jsonl")).unwrap(),
+        ledger
+    );
 }

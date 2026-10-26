@@ -1065,3 +1065,198 @@ fn a_rerun_since_a_report_checks_only_what_changed_and_agrees_with_a_full_run() 
     let inc = instances_to(&d, &prev, &["--accept", "ASM-X", "--since", &p]);
     assert_eq!(inc["reused"], 5);
 }
+
+#[test]
+fn the_done_gate_reads_the_instance_check_of_these_trees() {
+    let d = scratch("gate");
+    let (src, conv, _) = setup(&d);
+    let (o, r) = instances(&d, &[]);
+    assert!(
+        o.status.code().is_some(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    // No generator output given: checked on SQLDiff's weave only.
+    assert_eq!(r["complete"], false, "{r:#}");
+    let pack = pack();
+    let gate = |extra: &[&str]| {
+        let mut args = vec![
+            "review-status",
+            src.to_str().unwrap(),
+            conv.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "--template",
+            "--pack",
+            &pack,
+            "--isolated",
+        ];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    let report = d.join("out");
+    let o = gate(&[
+        "--instances",
+        report.to_str().unwrap(),
+        "--require-complete",
+    ]);
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{text}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(text.contains("Review not complete"), "{text}");
+    assert!(
+        text.contains("the instance check is not complete"),
+        "{text}"
+    );
+    // The report was made on these very trees.
+    assert!(!text.contains("changed since the instance check"), "{text}");
+    assert!(!text.contains("stale-output"), "{text}");
+    // Templates without the instance check are never complete.
+    let o = gate(&["--json"]);
+    assert_eq!(o.status.code(), Some(0));
+    let g: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(g["complete"], false);
+    assert!(g["counts"]["instances"].as_u64().unwrap() >= 1, "{g:#}");
+    // A converted template changed after the check: the report is stale.
+    let f = conv.join("tables/entity.sql");
+    let t = std::fs::read_to_string(&f).unwrap();
+    std::fs::write(&f, t + "\n").unwrap();
+    let o = gate(&["--instances", report.to_str().unwrap()]);
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(text.contains("changed since the instance check"), "{text}");
+    assert!(text.contains("stale-output"), "{text}");
+}
+
+#[test]
+fn a_template_unit_written_by_hand_passes_the_gate_only_on_a_complete_instance_check() {
+    use sqldiff_convert::review::{By, Record, State, LEDGER_FILE};
+    let d = scratch("gate-hand");
+    generator_output(&d);
+    let (src, conv) = (d.join("src"), d.join("conv"));
+    let pack = pack();
+    let report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(conv.join("conversion-report.json")).unwrap(),
+    )
+    .unwrap();
+    let f = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "procs/touch.sql")
+        .unwrap();
+    let u = f["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(f["converted_units"].as_array().unwrap())
+        .find(|u| u["src_line"] == 3)
+        .unwrap_or_else(|| panic!("{f:#}"));
+    let out = std::fs::read_to_string(conv.join("procs/touch.sql")).unwrap();
+    let line = out.lines().find(|l| l.contains("SET Price = 0")).unwrap();
+    let text = line.replace("WHERE Id = p_id", "WHERE p_id = Id");
+    let r = Record {
+        unit: u["id"].as_str().unwrap().into(),
+        path: "procs/touch.sql".into(),
+        rule: String::new(),
+        state: State::Written,
+        by: By::Human,
+        author: "Davy".into(),
+        reason: "operands swapped".into(),
+        at: "2026-10-26T12:00:00Z".into(),
+        input_hash: String::new(),
+        output_hash: String::new(),
+        text: Some(text.clone()),
+    };
+    std::fs::write(
+        conv.join(LEDGER_FILE),
+        serde_json::to_string(&r).unwrap() + "\n",
+    )
+    .unwrap();
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--overwrite",
+        "--pack",
+        &pack,
+        "--isolated",
+    ]);
+    assert!(
+        o.status.code().is_some(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(std::fs::read_to_string(conv.join("procs/touch.sql"))
+        .unwrap()
+        .contains(&text));
+    // The generator weaves the new template: its target output follows.
+    let (o, _) = instances(&d, &[]);
+    assert!(o.status.code().is_some());
+    let gent = d.join("gent/procs/TouchCustomer.sql");
+    std::fs::copy(d.join("out/target/procs/TouchCustomer.sql"), &gent).unwrap();
+    assert!(std::fs::read_to_string(&gent)
+        .unwrap()
+        .contains("WHERE p_id = Id"));
+    let gens = d.join("gens");
+    let (o, r) = instances(
+        &d,
+        &[
+            "--woven",
+            gens.to_str().unwrap(),
+            "--woven-target",
+            d.join("gent").to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        r["complete"],
+        true,
+        "{r:#}{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    let gate = |extra: &[&str]| -> serde_json::Value {
+        let mut args = vec![
+            "review-status",
+            src.to_str().unwrap(),
+            conv.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "--template",
+            "--pack",
+            &pack,
+            "--isolated",
+            "--json",
+        ];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        serde_json::from_slice(&o.stdout).unwrap()
+    };
+    let unchecked = |g: &serde_json::Value| {
+        g["blockers"].as_array().unwrap().iter().any(|b| {
+            b["what"]
+                .as_str()
+                .unwrap()
+                .contains("hand-written.unchecked")
+        })
+    };
+    let instances_dir = d.join("out");
+    let with = gate(&["--instances", instances_dir.to_str().unwrap()]);
+    assert_eq!(with["instances"], true, "{with:#}");
+    assert!(!unchecked(&with), "{with:#}");
+    let without = gate(&[]);
+    assert!(unchecked(&without), "{without:#}");
+}

@@ -145,6 +145,9 @@ pub struct FileReport {
     pub units: Vec<UnitReport>,
     /// Plainly converted units, in output order: nothing found, not proven.
     pub converted_units: Vec<UnitReport>,
+    /// `review::file_hash` of the file as written (with its status lines):
+    /// a later run with `--overwrite` refuses to replace a file edited since.
+    pub output_hash: String,
     /// Output findings that point into no unit.
     pub unplaced: Vec<String>,
     /// For a template: what it holds.
@@ -309,16 +312,24 @@ pub fn convert(
         Path::to_path_buf,
     );
     let label = label.as_path();
+    // Output written by hand, kept in the ledger next to the converted tree.
+    let ledger = match out {
+        Some(o) => read_ledger(o)?,
+        None => None,
+    };
+    let ledger = ledger.as_ref();
     let results = match &a.template {
-        None => convert_files(a, label, inputs, jobs),
-        Some(tm) => convert_templates(a, label, tm, inputs, jobs)?,
+        None => convert_files(a, label, inputs, jobs, ledger),
+        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger)?,
     };
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
     for (input, (c, secs)) in inputs.iter().zip(results) {
         let (text, lines) = annotate(&c);
-        files.push(file_report(&input.rel, &input.text, &c, &lines, secs));
+        let mut f = file_report(&input.rel, &input.text, &c, &lines, secs);
+        f.output_hash = crate::review::file_hash(&text);
+        files.push(f);
         outputs.push(text);
         conversions.push(c);
     }
@@ -365,7 +376,13 @@ pub fn write(tree: &Tree, out: &Path) -> Result<(PathBuf, PathBuf), String> {
 
 /// Converts plain SQL files: rules with the source catalog of the whole
 /// tree, then a check of every draft against both trees' catalogs.
-fn convert_files(a: &Args, out: &Path, inputs: &[Input], jobs: usize) -> Vec<(Conversion, f64)> {
+fn convert_files(
+    a: &Args,
+    out: &Path,
+    inputs: &[Input],
+    jobs: usize,
+    ledger: Option<&crate::review::Ledger>,
+) -> Vec<(Conversion, f64)> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
     let source = (!a.no_catalog).then(|| {
@@ -377,9 +394,16 @@ fn convert_files(a: &Args, out: &Path, inputs: &[Input], jobs: usize) -> Vec<(Co
         ))
     });
     // Pass 1: rules only.
-    let drafts = parallel(jobs, inputs, |i| {
+    let mut drafts = parallel(jobs, inputs, |i| {
         crate::rewrite_in(&i.text, a.from, a.to, source.as_deref())
     });
+    // Hand-written output replaces the rules' before anything is checked,
+    // so it is checked like theirs and the target catalog has it.
+    if let Some(l) = ledger {
+        for (i, d) in inputs.iter().zip(drafts.iter_mut()) {
+            hand_written_draft(l, i, d);
+        }
+    }
     let mut opts = Options::default();
     if let Some(source) = source {
         opts.facts_a = vec![source];
@@ -402,6 +426,113 @@ fn convert_files(a: &Args, out: &Path, inputs: &[Input], jobs: usize) -> Vec<(Co
     })
 }
 
+/// Reads the review ledger in `out`, if there is one.
+fn read_ledger(out: &Path) -> Result<Option<crate::review::Ledger>, String> {
+    let path = out.join(crate::review::LEDGER_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(crate::review::Ledger::parse(&text))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn hand_note(r: &crate::review::Record, unchecked: bool) -> crate::Note {
+    let who = format!(
+        "{} ({})",
+        r.author,
+        match r.by {
+            crate::review::By::Human => "a person",
+            crate::review::By::Agent => "an agent",
+        }
+    );
+    if unchecked {
+        crate::Note {
+            status: Status::Unproven,
+            rule: "hand-written.unchecked".into(),
+            text: format!("Written by hand by {who}. A template unit written by hand is not checked by convert: the instance check (`sqldiff instances`) judges it."),
+        }
+    } else {
+        crate::Note {
+            status: Status::Assumptions,
+            rule: "ASM-HAND-WRITTEN".into(),
+            text: format!("Written by hand by {who}; checked like the rules' output. The check allows the same dialect mappings it allows the rules (a dropped `dbo` schema, mapped types), which a text written by hand may lean on without saying so; the rules' assumptions and decisions for this unit are kept. Accept this once the text has been read against the source."),
+        }
+    }
+}
+
+fn conflict_note() -> crate::Note {
+    crate::Note {
+        status: Status::Differs,
+        rule: "review.conflicting-texts".into(),
+        text: "The review ledger holds different hand-written texts for this unit from different authors; neither is applied. Keep one.".into(),
+    }
+}
+
+/// Applies the ledger's hand-written texts for one file to its draft.
+fn hand_written_draft(l: &crate::review::Ledger, i: &Input, d: &mut crate::Draft) {
+    let (texts, conflicts) = l.texts(&i.rel);
+    if texts.is_empty() && conflicts.is_empty() {
+        return;
+    }
+    for (k, id) in d.unit_ids(&i.rel, &i.text).into_iter().enumerate() {
+        if conflicts.contains(&id) {
+            d.note_unit(k, conflict_note());
+        } else if let Some(r) = texts.get(&id) {
+            let w = crate::Written {
+                by: r.by,
+                author: r.author.clone(),
+                origin: id.clone(),
+            };
+            let text = r.text.as_deref().unwrap_or("");
+            if let Err(e) = d.replace_unit(k, text, w, hand_note(r, false)) {
+                d.note_unit(
+                    k,
+                    crate::Note {
+                        status: Status::Differs,
+                        rule: "review.text-not-applied".into(),
+                        text: format!("The hand-written text for this unit was not applied: {e}."),
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Applies the ledger's hand-written texts to a checked template, unchecked.
+fn hand_written_template(l: &crate::review::Ledger, i: &Input, c: &mut Conversion) {
+    let (texts, conflicts) = l.texts(&i.rel);
+    if texts.is_empty() && conflicts.is_empty() {
+        return;
+    }
+    let ids = crate::review::unit_ids(&i.rel, &i.text, c);
+    for (k, id) in ids.iter().enumerate() {
+        let note = if conflicts.contains(id) {
+            Some(conflict_note())
+        } else if let Some(r) = texts.get(id) {
+            let w = crate::Written {
+                by: r.by,
+                author: r.author.clone(),
+                origin: id.clone(),
+            };
+            let text = r.text.as_deref().unwrap_or("");
+            crate::splice_unit(c, k, text, w, hand_note(r, true))
+                .err()
+                .map(|e| crate::Note {
+                    status: Status::Differs,
+                    rule: "review.text-not-applied".into(),
+                    text: format!("The hand-written text for this unit was not applied: {e}."),
+                })
+        } else {
+            None
+        };
+        if let Some(n) = note {
+            let u = &mut c.units[k];
+            u.status = u.status.max(n.status);
+            u.notes.insert(0, n);
+        }
+    }
+}
+
 /// Converts templates: every file is split by the placeholder rules, and
 /// all fragments share one set of stand-in names, so a table a template
 /// creates as `<%SCHEMA%>.<%TABLE%>` binds in the templates that use it.
@@ -411,6 +542,7 @@ fn convert_templates(
     tm: &TemplateMode,
     inputs: &[Input],
     jobs: usize,
+    ledger: Option<&crate::review::Ledger>,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
     for i in inputs {
@@ -526,10 +658,16 @@ fn convert_templates(
             }
         }
     }
-    Ok(out
+    let mut out: Vec<(Conversion, f64)> = out
         .into_iter()
         .map(|c| c.expect("every file is converted"))
-        .collect())
+        .collect();
+    if let Some(l) = ledger {
+        for (i, (c, _)) in inputs.iter().zip(out.iter_mut()) {
+            hand_written_template(l, i, c);
+        }
+    }
+    Ok(out)
 }
 
 /// One conversion: a file, or a routine's opening and closing templates.
@@ -601,6 +739,26 @@ pub fn collect(src: &Path, extensions: &[String]) -> Result<(Vec<Input>, Vec<Str
         }
     }
     Ok((inputs, unreadable))
+}
+
+/// Paths, relative to `dir` and with `/`, of the files `collect` would read
+/// there, in order. An absent directory has none.
+pub fn collect_paths(dir: &Path, extensions: &[String]) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    if dir.is_dir() {
+        walk(dir, extensions, &mut paths).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let mut rels: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    rels.sort();
+    Ok(rels)
 }
 
 fn walk(dir: &Path, extensions: &[String], out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -936,6 +1094,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
         seconds: (secs * 1000.0).round() / 1000.0,
         units,
         converted_units,
+        output_hash: String::new(),
         unplaced: c
             .unplaced
             .iter()
@@ -945,6 +1104,105 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
         template: c.template.clone(),
         review: None,
     }
+}
+
+/// A `written` record that replaces the output of unit `unit` (its id in
+/// this conversion, as the report and the queue give it) in file `path`
+/// with `text`. Keyed to the unit as the rules wrote it, so it applies on
+/// every later conversion while that unit exists. `by` is who calls: the
+/// caller decides it, never its own caller.
+#[allow(clippy::too_many_arguments)]
+pub fn written_record(
+    t: &Tree,
+    inputs: &[Input],
+    path: &str,
+    unit: &str,
+    text: &str,
+    by: crate::review::By,
+    author: &str,
+    reason: &str,
+    at: &str,
+) -> Result<crate::review::Record, String> {
+    let k = t
+        .report
+        .files
+        .iter()
+        .position(|f| f.path == path)
+        .ok_or_else(|| format!("no file `{path}` in the converted tree"))?;
+    let (c, input) = (&t.conversions[k], &inputs[k].text);
+    let ids = crate::review::unit_ids(path, input, c);
+    let i = ids.iter().position(|id| id == unit).ok_or_else(|| {
+        format!("no unit `{unit}` in `{path}` (convert again: ids change with the text)")
+    })?;
+    let origin = c.units[i]
+        .written
+        .as_ref()
+        .map_or_else(|| unit.to_string(), |w| w.origin.clone());
+    if text.trim().is_empty() {
+        return Err("the text is empty".into());
+    }
+    let r = crate::review::Record {
+        unit: origin,
+        path: path.to_string(),
+        rule: String::new(),
+        state: crate::review::State::Written,
+        by,
+        author: author.to_string(),
+        reason: reason.to_string(),
+        at: at.to_string(),
+        input_hash: crate::review::file_hash(input),
+        output_hash: crate::review::file_hash(&c.output),
+        text: Some(text.to_string()),
+    };
+    crate::review::allowed(&r)?;
+    Ok(r)
+}
+
+/// Files in `out` edited by hand since `sqldiff convert` wrote them, by the
+/// `output_hash` the last report recorded: an `--overwrite` run would lose
+/// those edits. Empty when there is no earlier report.
+pub fn hand_edits(out: &Path) -> Result<Vec<String>, String> {
+    let report = out.join("conversion-report.json");
+    let text = match std::fs::read_to_string(&report) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", report.display())),
+    };
+    let v: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {e}", report.display()))?;
+    let mut edited = Vec::new();
+    for f in v["files"].as_array().into_iter().flatten() {
+        let Some(path) = f["path"].as_str() else {
+            continue;
+        };
+        let now = std::fs::read(out.join(path)).ok();
+        let now = now.map(|b| crate::review::file_hash(&String::from_utf8_lossy(&b)));
+        match (f["output_hash"].as_str(), now) {
+            // A report from before output hashes: nothing to compare with.
+            (None, _) => {}
+            // Deleted since: nothing to lose.
+            (_, None) => {}
+            (Some(h), Some(n)) if h == n => {}
+            _ => edited.push(path.to_string()),
+        }
+    }
+    Ok(edited)
+}
+
+/// Refuses to overwrite files edited by hand since the last run, unless
+/// `discard` says to.
+pub fn guard_hand_edits(out: &Path, discard: bool) -> Result<(), String> {
+    let edited = hand_edits(out)?;
+    if edited.is_empty() || discard {
+        return Ok(());
+    }
+    Err(format!(
+        "{} file(s) in {} were edited by hand since the last conversion and would be overwritten: {}. Record each edit as a `written` record with its text in {} (the GUI's or the MCP server's edit does that), so every later conversion applies and checks it, or pass --discard-edits to drop them",
+        edited.len(),
+        out.display(),
+        edited.join(", "),
+        crate::review::LEDGER_FILE
+    ))
 }
 
 /// Applies the ledger committed in the output directory, if there is one
@@ -1193,4 +1451,62 @@ pub fn markdown(r: &Report) -> String {
         s.push('\n');
     }
     s
+}
+
+/// Files `sqldiff convert` writes into the converted tree besides the
+/// converted files, and the review ledger kept there.
+pub fn is_report(rel: &str) -> bool {
+    matches!(
+        rel,
+        "conversion-report.json"
+            | "conversion-report.md"
+            | crate::queue::QUEUE_JSON
+            | crate::queue::QUEUE_MD
+            | crate::review::LEDGER_FILE
+    )
+}
+
+/// SHA-256 over every file of a tree (or one file): its path and the hash
+/// of its exact bytes, in path order. Names starting with a dot and, at the
+/// top, the reports and the ledger (`is_report`) are left out, so recording
+/// a review decision does not change it.
+pub fn dir_hash(dir: &Path) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    fn files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
+        for e in std::fs::read_dir(dir)? {
+            let e = e?;
+            if e.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let ty = e.file_type()?;
+            let p = e.path();
+            if ty.is_dir() {
+                files(root, &p, out)?;
+            } else if ty.is_file() {
+                let rel = p.strip_prefix(root).unwrap_or(&p);
+                out.push((rel.to_string_lossy().replace('\\', "/"), p));
+            }
+        }
+        Ok(())
+    }
+    let mut list = Vec::new();
+    if dir.is_file() {
+        let name = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        list.push((name, dir.to_path_buf()));
+    } else {
+        files(dir, dir, &mut list).map_err(|e| format!("{}: {e}", dir.display()))?;
+        list.retain(|(rel, _)| !is_report(rel));
+    }
+    list.sort();
+    let mut h = Sha256::new();
+    for (rel, p) in list {
+        let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        h.update(rel.as_bytes());
+        h.update([0]);
+        h.update(Sha256::digest(&bytes));
+    }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }

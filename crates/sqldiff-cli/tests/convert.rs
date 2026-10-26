@@ -461,3 +461,89 @@ fn template_mode_needs_a_template_syntax() {
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+#[test]
+fn a_template_unit_written_by_hand_is_spliced_in_unchecked() {
+    use sqldiff_convert::review::{file_hash, By, Record, State, LEDGER_FILE};
+    let d = scratch("template-written");
+    let (src, out) = (d.join("src"), d.join("out"));
+    let proc = "CREATE PROCEDURE <%SCHEMA%>.Touch @Id int AS\nBEGIN\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Id = @Id;\nEND\n";
+    write(&src.join("touch.sql"), proc.as_bytes());
+    let pack = example_pack();
+    let convert = |extra: &[&str]| {
+        let mut args = vec![
+            "convert",
+            src.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "--template",
+            "--pack",
+            &pack,
+            "--isolated",
+        ];
+        args.extend_from_slice(extra);
+        let o = run(&args);
+        assert!(
+            o.status.code().is_some(),
+            "{}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let r: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("conversion-report.json")).unwrap(),
+        )
+        .unwrap();
+        r["files"][0].clone()
+    };
+    let f = convert(&[]);
+    let before = std::fs::read_to_string(out.join("touch.sql")).unwrap();
+    // The UPDATE carries the template's assumptions, so the report lists it.
+    let id = f["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["src_line"] == 3)
+        .unwrap_or_else(|| panic!("no unit on line 3 in {f:#}"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let text = "  UPDATE <%SCHEMA%>.<%TABLE%> SET price = 0 WHERE id = p_id;";
+    let r = Record {
+        unit: id,
+        path: "touch.sql".into(),
+        rule: String::new(),
+        state: State::Written,
+        by: By::Human,
+        author: "Davy".into(),
+        reason: "lower-case columns".into(),
+        at: "2026-10-26T12:00:00Z".into(),
+        input_hash: file_hash(proc),
+        output_hash: file_hash(&before),
+        text: Some(text.into()),
+    };
+    std::fs::write(
+        out.join(LEDGER_FILE),
+        serde_json::to_string(&r).unwrap() + "\n",
+    )
+    .unwrap();
+    let f = convert(&["--overwrite"]);
+    let after = std::fs::read_to_string(out.join("touch.sql")).unwrap();
+    assert!(after.contains(text), "{after}");
+    let u = f["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["src_line"] == 3)
+        .unwrap_or_else(|| panic!("{f:#}"));
+    // Not checked by convert: never better than not proven.
+    assert_eq!(u["status"], "unproven", "{u:#}");
+    assert!(
+        u["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "hand-written.unchecked"),
+        "{u:#}"
+    );
+}
