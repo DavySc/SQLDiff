@@ -356,6 +356,13 @@ pub fn convert(
 /// every output file at its source path, `conversion-report.json` and
 /// `conversion-report.md`. Returns the two report paths.
 pub fn write(tree: &Tree, out: &Path) -> Result<(PathBuf, PathBuf), String> {
+    // Every destination first, so a refused one leaves nothing half written.
+    for f in &tree.report.files {
+        dest_under(out, &f.path)?;
+    }
+    for name in ["conversion-report.json", "conversion-report.md"] {
+        dest_under(out, name)?;
+    }
     for (f, text) in tree.report.files.iter().zip(&tree.outputs) {
         write_under(out, &f.path, text.as_bytes())?;
     }
@@ -388,6 +395,16 @@ pub fn inside(rel: &str) -> bool {
 /// committed into the output tree would otherwise redirect the write, e.g.
 /// onto the source file it was converted from.
 pub(crate) fn write_under(out: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dest = dest_under(out, rel)?;
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    std::fs::write(&dest, bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
+/// `out/rel`, or why [`write_under`] would refuse it.
+pub(crate) fn dest_under(out: &Path, rel: &str) -> Result<PathBuf, String> {
     if !inside(rel) {
         return Err(format!(
             "{}: `{rel}` is not a path inside the output directory",
@@ -407,10 +424,6 @@ pub(crate) fn write_under(out: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf
             _ => {}
         }
     }
-    if let Some(p) = dest.parent() {
-        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
-    }
-    std::fs::write(&dest, bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
     Ok(dest)
 }
 
