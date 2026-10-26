@@ -54,6 +54,8 @@ pub struct Index {
     /// Byte offsets of the statement and of its filter.
     pub off: usize,
     pub filter_off: usize,
+    /// The index name has a schema part.
+    pub qualified: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -455,9 +457,6 @@ fn index(ts: &[Tok], d: Dialect) -> R<Index> {
             _ => return Err(format!("the index clause `{}`", text(&ts[i..]))),
         };
     }
-    if unique && clustered && keys.is_empty() {
-        return Err("an index without key columns".into());
-    }
     Ok(Index {
         dialect: d,
         name,
@@ -472,6 +471,7 @@ fn index(ts: &[Tok], d: Dialect) -> R<Index> {
         storage,
         off: ts[0].off,
         filter_off,
+        qualified: iname.len() == 2,
     })
 }
 
@@ -715,6 +715,10 @@ pub mod asm {
         "ASM-INDEX-NAME-SCHEMA",
         "No other index, table, view or sequence in the schema has the index's name on the target (T-SQL index names are only unique per table; PostgreSQL and Db2 for i index names are schema objects)",
     );
+    pub const DB2_INDEX_SCHEMA: (&str, &str) = (
+        "ASM-DB2-INDEX-SCHEMA",
+        "Db2 for i creates an unqualified index name in the default schema, not in its table's: statements that name the index (DROP INDEX) run with the same default schema",
+    );
     pub const FILTERED_SET_OPTIONS: (&str, &str) = (
         "ASM-TSQL-FILTERED-INDEX-SET-OPTIONS",
         "Sessions that change the table run with ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT and CONCAT_NULL_YIELDS_NULL ON and NUMERIC_ROUNDABORT OFF; otherwise T-SQL rejects the change (Msg 1934) because of the filtered index",
@@ -847,6 +851,11 @@ fn indexes(
         ));
     }
     ev.push(Event::Asm(asm::INDEX_NAMESPACE));
+    // Db2 for i puts an unqualified index in the default schema, which need
+    // not be its table's.
+    if o.dialect == Dialect::Db2i && !o.qualified && o.table.len() == 2 {
+        ev.push(Event::Asm(asm::DB2_INDEX_SCHEMA));
+    }
     for (ix, n) in [(x, na), (y, nb)] {
         for s in &ix.storage {
             ev.push(Event::Note(format!(

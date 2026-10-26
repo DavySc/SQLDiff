@@ -120,3 +120,21 @@ fn a_partition_scheme_is_dropped_and_a_columnstore_index_refused() {
         assert_eq!(u.status, Status::NotConverted, "{to:?} {:?}", u.notes);
     }
 }
+
+#[test]
+fn a_db2_for_i_index_stays_in_its_tables_schema() {
+    let src = "CREATE TABLE Sales.Items (ItemID int NOT NULL PRIMARY KEY, Bin int NOT NULL);\nGO\nCREATE INDEX IX_Bin ON Sales.Items (Bin);\nGO\n";
+    let c = convert(src, Dialect::Db2i);
+    let u = unit(&c, src, "CREATE INDEX");
+    assert_eq!(
+        out(&c, u).trim(),
+        "CREATE INDEX Sales.IX_Bin ON Sales.Items (Bin);"
+    );
+    assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
+    let c = convert(src, Dialect::Postgres);
+    let u = unit(&c, src, "CREATE INDEX");
+    assert_eq!(
+        out(&c, u).trim(),
+        "CREATE INDEX IX_Bin ON Sales.Items (Bin);"
+    );
+}

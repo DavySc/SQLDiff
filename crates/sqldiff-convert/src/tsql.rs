@@ -2656,6 +2656,13 @@ impl<'a> Cx<'a> {
                 if find_word(&kept, 0, "WHERE").is_some() {
                     self.note(Status::Assumptions, "ASM-TSQL-FILTERED-INDEX-SET-OPTIONS", "SQL Server rejects changes to a table with a filtered index from sessions with ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT or CONCAT_NULL_YIELDS_NULL OFF (or NUMERIC_ROUNDABORT ON); the target does not, so such sessions are assumed not to exist.");
                 }
+                // Db2 for i creates an unqualified index name in the default
+                // schema; T-SQL's index belongs to its table.
+                let kept = if self.db2() {
+                    qualify_index(kept)
+                } else {
+                    kept
+                };
                 // T-SQL's unique index holds one NULL (NULLs are equal keys);
                 // PostgreSQL's holds any number unless NULLS NOT DISTINCT.
                 let kept = if !self.db2() && w1 == "UNIQUE" {
@@ -4896,6 +4903,39 @@ fn quoted(s: &str) -> String {
 
 /// One `WITH (…)` option of a table or index. Only options that change
 /// performance, never results, may be dropped.
+/// `CREATE INDEX name ON s.t`: the name gets the table's schema `s`,
+/// unless that is dbo (dropped) or the name is qualified already.
+fn qualify_index(ts: Vec<T>) -> Vec<T> {
+    let Some(ix) = find_word(&ts, 0, "INDEX") else {
+        return ts;
+    };
+    let Some(name) = next_sig(&ts, ix) else {
+        return ts;
+    };
+    let Some(on) = next_sig(&ts, name).filter(|&j| ts[j].is("ON")) else {
+        return ts;
+    };
+    let (Some(schema), Some(dot)) = (
+        next_sig(&ts, on),
+        next_sig(&ts, on).and_then(|j| next_sig(&ts, j)),
+    ) else {
+        return ts;
+    };
+    if ts[dot].k != DOT
+        || next_sig(&ts, dot)
+            .and_then(|j| next_sig(&ts, j))
+            .is_some_and(|j| ts[j].k == DOT)
+        || tsql_unquote(&ts[schema].s).eq_ignore_ascii_case("dbo")
+    {
+        return ts;
+    }
+    let mut out = ts[..name].to_vec();
+    out.push(ts[schema].clone());
+    out.push(ts[dot].clone());
+    out.extend(ts[name..].iter().cloned());
+    out
+}
+
 /// `NULLS NOT DISTINCT` put in a PostgreSQL unique index: before its
 /// filter, or at its end.
 fn nulls_not_distinct(ts: Vec<T>) -> Vec<T> {
