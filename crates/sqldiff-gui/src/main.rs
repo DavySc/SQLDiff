@@ -3,7 +3,8 @@
 //!
 //! `serve` runs a local server (scratchpad edits re-diff, assumption flips
 //! and review decisions apply live); `export` writes a self-contained,
-//! read-only HTML file. Without a command (a double-click in a distribution)
+//! read-only HTML file; `review` serves a converted tree's review queue and
+//! records decisions in its ledger. Without a command (a double-click in a distribution)
 //! it serves convert mode and opens the browser.
 
 use std::net::TcpListener;
@@ -12,10 +13,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use sqldiff_core::Dialect;
-use sqldiff_gui::convert;
 use sqldiff_gui::review::Store;
 use sqldiff_gui::server::serve_with_hosts;
 use sqldiff_gui::session::{Origin, Session, TemplateMode};
+use sqldiff_gui::{convert, convert_review};
 use sqldiff_source::compose::Placeholders;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::Resolved;
@@ -121,6 +122,54 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(short, long, default_value_t = 7879)]
+        port: u16,
+        /// Also answer requests addressed to this host name or address. Repeatable.
+        #[arg(long = "allow-host", value_name = "HOST")]
+        allow_hosts: Vec<String>,
+    },
+    /// Review a converted tree: its review queue by tier, each item's source
+    /// and output side by side, and decisions recorded in
+    /// OUT/review-decisions.jsonl (the converted files are never written).
+    Review {
+        /// The source tree that was converted (or one file).
+        src: PathBuf,
+        /// The converted tree `sqldiff convert -o` wrote; its ledger is read and appended to.
+        out: PathBuf,
+        #[arg(long, default_value = "tsql")]
+        from: Dialect,
+        #[arg(long)]
+        to: Dialect,
+        /// Every file is a template, as with `sqldiff convert --template`.
+        #[arg(long)]
+        template: bool,
+        /// A template parameter name (repeatable), as with `sqldiff convert --template --parameter`.
+        #[arg(long = "parameter", value_name = "NAME", requires = "template")]
+        parameters: Vec<String>,
+        /// Load a pack (directory with pack.toml, or a .toml file). Repeatable.
+        #[arg(long = "pack", value_name = "PATH")]
+        packs: Vec<PathBuf>,
+        /// Project config file (default: sqldiff.toml here or in a parent directory).
+        #[arg(long, value_name = "FILE")]
+        config: Option<PathBuf>,
+        /// Ignore project and user config files not named on the command line.
+        #[arg(long)]
+        isolated: bool,
+        /// File extension to convert (repeatable; default: sql), as with `sqldiff convert`.
+        #[arg(long = "extension", value_name = "EXT")]
+        extensions: Vec<String>,
+        /// Check each file alone, as with `sqldiff convert --no-catalog`.
+        #[arg(long)]
+        no_catalog: bool,
+        /// Parallel jobs (default: available cores).
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// `instance-report.json` from `sqldiff instances`, or its directory:
+        /// templates are then judged by their woven instances.
+        #[arg(long, value_name = "PATH")]
+        instances: Option<PathBuf>,
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        #[arg(short, long, default_value_t = 7880)]
         port: u16,
         /// Also answer requests addressed to this host name or address. Repeatable.
         #[arg(long = "allow-host", value_name = "HOST")]
@@ -365,6 +414,59 @@ fn run(cli: Cli) -> Result<(), String> {
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
             println!("SQLDiff convert: {}", url(&listener)?);
             convert::serve(listener, setup, &allow_hosts).map_err(|e| e.to_string())
+        }
+        Command::Review {
+            src,
+            out,
+            from,
+            to,
+            template,
+            parameters,
+            packs,
+            config: project,
+            isolated,
+            extensions,
+            no_catalog,
+            jobs,
+            instances,
+            host,
+            port,
+            allow_hosts,
+        } => {
+            let template = if template {
+                let cfg = Resolved::load(&Sources {
+                    project,
+                    user: None,
+                    isolated,
+                    cwd: None,
+                    packs,
+                    cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+                })
+                .map_err(|e| e.0)?;
+                Some(sqldiff_convert::tree::TemplateMode::configured(
+                    &cfg,
+                    (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                )?)
+            } else {
+                None
+            };
+            let review = convert_review::Review::open(convert_review::Setup {
+                tree: sqldiff_convert::tree::Args {
+                    src,
+                    from,
+                    to,
+                    jobs,
+                    no_catalog,
+                    template,
+                    extensions: sqldiff_convert::tree::extensions(extensions),
+                },
+                out,
+                instances,
+            })?;
+            let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
+            println!("SQLDiff review: {}", url(&listener)?);
+            println!("decisions go to {}", review.ledger_path().display());
+            convert_review::serve(listener, review, &allow_hosts).map_err(|e| e.to_string())
         }
         Command::Export { pair, output } => {
             let session = open(pair)?;

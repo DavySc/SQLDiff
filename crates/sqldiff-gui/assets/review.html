@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLDiff review</title>
+<style>
+/* Palette shared with index.html and convert.html; keep them in sync. */
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5; --focus: #4f46e5;
+  --chg-bg: #fff8e1; --del-bg: #fdecec; --add-bg: #e8f6ec;
+  --kw: #7c3aad; --var: #a8521c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98;
+  --transactional: #d92d20; --semantic: #dc6803;
+  --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-unproven: #e8590c; --s-differs: #d92d20; --s-not_converted: #98a2b3;
+  --b-assumptions: #fff6dc; --b-decision: #eef0ff; --b-unproven: #fff0e6; --b-differs: #fde8e8; --b-not_converted: #f2f4f7;
+  --link: rgba(79,70,229,.14); --link-2: rgba(79,70,229,.06);
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8; --focus: #818cf8;
+    --chg-bg: #2a2614; --del-bg: #2f1c1c; --add-bg: #17291d;
+    --kw: #c4a1f0; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #6b717b;
+    --transactional: #f97066; --semantic: #fdb022;
+    --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-unproven: #fd853a; --s-differs: #f97066; --s-not_converted: #667085;
+    --b-assumptions: #3a3218; --b-decision: #24254a; --b-unproven: #3d2a1e; --b-differs: #3d2222; --b-not_converted: #1e232b;
+    --link: rgba(129,140,248,.2); --link-2: rgba(129,140,248,.08);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+header { min-height: 44px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
+header h1 { font-size: 13px; margin: 0; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+header h1::before { content: ""; width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+.mono { font-family: var(--mono); font-size: 12px; }
+button, .chip { font: inherit; font-size: 12.5px; font-weight: 500; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 3px 8px; cursor: pointer; transition: background .12s, color .12s; }
+button:hover:not(:disabled) { background: var(--soft); color: var(--fg); }
+button.outline { border-color: var(--line); background: var(--panel); color: var(--fg); }
+button.primary { border-color: var(--focus); color: var(--focus); background: var(--panel); }
+button.primary:hover:not(:disabled) { background: var(--link-2); color: var(--focus); }
+button:disabled { opacity: .45; cursor: default; }
+.chip { border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; border-color: var(--line); color: var(--fg); cursor: default; }
+.chip b { font-variant-numeric: tabular-nums; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: none; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+kbd { font: 11px var(--mono); border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; background: var(--soft); }
+input[type=text], textarea, select { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+input[type=text]:focus, textarea:focus, select:focus { outline: none; border-color: var(--focus); box-shadow: 0 0 0 2px var(--link); }
+#author { width: 150px; }
+#author.need { border-color: var(--semantic); }
+label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+
+#banners:empty { display: none; }
+#banners { display: flex; flex-direction: column; gap: 1px; }
+.banner { padding: 6px 16px; font-size: 12.5px; background: var(--chg-bg); border-bottom: 1px solid var(--line); }
+.banner.bad { background: var(--del-bg); }
+.banner details summary { cursor: pointer; }
+.banner ul { margin: 4px 0; padding-left: 18px; font: 12px/1.5 var(--mono); }
+
+main { flex: 1; display: grid; grid-template-columns: 380px minmax(0, 1fr); min-height: 0; }
+/* The queue: worst tier first, one row per item. */
+#side { border-right: 1px solid var(--line); background: var(--panel); display: flex; flex-direction: column; min-height: 0; }
+#queue { flex: 1; overflow: auto; padding-bottom: 12px; }
+.tier { position: sticky; top: 0; z-index: 1; background: var(--panel); padding: 10px 14px 4px; font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); display: flex; gap: 8px; align-items: center; border-bottom: 1px solid var(--line); }
+.tier b { color: var(--fg); font-variant-numeric: tabular-nums; }
+.row { display: grid; grid-template-columns: 18px 10px minmax(0, 1fr); gap: 2px 8px; align-items: start; padding: 7px 14px 7px 10px; cursor: pointer; border-left: 3px solid transparent; }
+.row:hover { background: var(--soft); }
+.row.sel { background: var(--link); border-left-color: var(--focus); }
+.row input { margin: 3px 0 0; }
+.row .dot { margin-top: 6px; }
+.row .p { font: 12.5px/1.45 var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row .r { grid-column: 3; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.flag { display: inline-block; font: 600 10.5px/1.6 "Inter", system-ui, sans-serif; padding: 0 6px; border-radius: 999px; background: var(--soft); color: var(--muted); margin-left: 4px; vertical-align: 1px; }
+.flag.warn { background: var(--chg-bg); color: var(--semantic); }
+.flag.bad { background: var(--del-bg); color: var(--transactional); }
+#done { border-top: 1px solid var(--line); font-size: 12.5px; }
+#done summary { padding: 8px 14px; cursor: pointer; color: var(--muted); }
+#done .list { max-height: 30vh; overflow: auto; }
+#bulk { display: none; border-top: 1px solid var(--line); padding: 10px 14px; background: var(--soft); gap: 6px; flex-direction: column; font-size: 12.5px; }
+#bulk.on { display: flex; }
+#bulk .line { display: flex; gap: 6px; align-items: center; }
+#bulk select, #bulk input { flex: 1; min-width: 0; }
+
+/* The item: header, code side by side, then why and decide. */
+#item { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+#ih { padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; font-size: 12.5px; }
+#ih .path { font: 600 13px var(--mono); }
+.badge { display: inline-flex; align-items: center; gap: 6px; padding: 1px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600; background: var(--soft); white-space: nowrap; }
+/* Accepted in review is people's call, not the rules': never the green of converted. */
+.badge.rev { background: var(--link); color: var(--focus); }
+/* A plainly converted unit is "nothing found", not safe: grey, not green. */
+.dot.s-converted { background: var(--faint) !important; }
+.tabs { display: flex; gap: 2px; padding: 6px 16px 0; background: var(--panel); border-bottom: 1px solid var(--line); }
+.tabs:empty { display: none; }
+.tabs button { border-radius: 6px 6px 0 0; border-bottom: 2px solid transparent; }
+.tabs button.on { color: var(--fg); border-bottom-color: var(--focus); }
+#code { flex: 1 1 55%; min-height: 120px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); background: var(--panel); border-bottom: 1px solid var(--line); }
+.ph { padding: 5px 12px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); display: flex; gap: 8px; }
+.ph strong { color: var(--fg); font-weight: 600; }
+.ph + .ph, .pane + .pane { border-left: 1px solid var(--line); }
+.pane { position: relative; overflow: auto; font: 12.5px/1.6 var(--mono); font-variant-ligatures: none; tab-size: 4; padding: 6px 0; }
+.ln { display: grid; grid-template-columns: 48px minmax(0, 1fr); }
+.ln .no { color: var(--muted); text-align: right; padding-right: 10px; user-select: none; opacity: .7; }
+.ln .tx { white-space: pre; padding-right: 12px; }
+.ln.u { background: var(--link-2); box-shadow: inset 3px 0 0 var(--focus); }
+.ln.u .no { color: var(--focus); opacity: 1; }
+.more { padding: 2px 0 2px 58px; font: 11.5px "Inter", system-ui, sans-serif; color: var(--muted); }
+.t-kw { color: var(--kw); font-weight: 600; } .t-str { color: var(--str); } .t-num { color: var(--num); }
+.t-cmt { color: var(--cmt); font-style: italic; } .t-var { color: var(--var); }
+#lower { flex: 1 1 45%; min-height: 160px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, 420px); overflow: hidden; }
+#why { overflow: auto; padding: 12px 16px; }
+#decide { overflow: auto; padding: 12px 16px; border-left: 1px solid var(--line); background: var(--panel); }
+h3 { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+h3:not(:first-child) { margin-top: 16px; }
+.note { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; margin-bottom: 8px; box-shadow: var(--shadow); font-size: 13px; }
+.note .r { font: 11px var(--mono); color: var(--muted); margin-top: 2px; }
+.note.finding { border-left: 3px solid var(--transactional); }
+.note.done { opacity: .65; }
+.note.done .r::after { content: " · accepted in review"; font-family: "Inter", system-ui, sans-serif; color: var(--focus); }
+.dec { font-size: 12.5px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+.dec:last-child { border-bottom: 0; }
+.dec.old { opacity: .7; }
+.dec .meta { color: var(--muted); font-size: 11.5px; }
+.seg { display: inline-flex; flex-wrap: wrap; padding: 2px; border-radius: 8px; background: var(--soft); border: 1px solid var(--line); gap: 2px; }
+.seg button { padding: 2px 9px; border-radius: 6px; color: var(--muted); }
+.seg button.on { background: var(--panel); color: var(--fg); box-shadow: var(--shadow); }
+#form { display: flex; flex-direction: column; gap: 8px; }
+#form textarea { min-height: 70px; resize: vertical; }
+#form .hint { font-size: 12px; color: var(--muted); }
+#form .hint.warn { color: var(--semantic); }
+#form .act { display: flex; gap: 8px; align-items: center; }
+.empty { color: var(--muted); font-size: 13px; padding: 24px 16px; }
+#toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 8px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.2); display: none; max-width: 70vw; z-index: 20; }
+#toast.bad { background: var(--transactional); color: #fff; }
+#help { position: fixed; inset: 0; background: rgba(0,0,0,.35); display: none; align-items: center; justify-content: center; z-index: 10; }
+#help.open { display: flex; }
+#help > div { background: var(--panel); border-radius: 12px; padding: 18px 22px; box-shadow: 0 10px 30px rgba(0,0,0,.25); max-width: 600px; font-size: 13px; max-height: 85vh; overflow: auto; }
+#help td { padding: 3px 10px 3px 0; vertical-align: top; }
+@media (max-width: 1000px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 40vh minmax(0, 1fr); }
+  #side { border-right: 0; border-bottom: 1px solid var(--line); }
+  #lower { grid-template-columns: 1fr; }
+  #decide { border-left: 0; border-top: 1px solid var(--line); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>SQLDiff review</h1>
+  <span class="muted" id="pairname"></span>
+  <span id="chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
+  <span class="spacer"></span>
+  <label class="tog" title="Also list plainly converted units nobody approved (tier 6): nothing found, not proven"><input type="checkbox" id="all"> Nothing found too</label>
+  <input type="text" id="author" placeholder="Your name" aria-label="Your name, recorded with every decision" title="Recorded as the author of every decision you make here (remembered in this browser)">
+  <button id="refresh" title="Read the sources and the ledger again (R)">Refresh</button>
+  <button id="helpbtn" title="How review works (?)">?</button>
+</header>
+<div id="banners"></div>
+<main>
+  <aside id="side">
+    <div id="queue" role="listbox" aria-label="Review queue"></div>
+    <div id="bulk">
+      <div class="line"><strong id="bulkn"></strong><span class="spacer"></span><button id="bulkclear">Clear</button></div>
+      <div class="line"><select id="bulkrule" aria-label="Assumption to accept"></select></div>
+      <div class="line"><input type="text" id="bulkreason" placeholder="Why it holds for all of them" aria-label="Reason"></div>
+      <div class="line"><span class="muted" id="bulkhint"></span><span class="spacer"></span><button class="primary" id="bulkgo">Accept</button></div>
+    </div>
+    <details id="done"><summary></summary><div class="list"></div></details>
+  </aside>
+  <section id="item"><div class="empty">Loading…</div></section>
+</main>
+<div id="toast" role="status"></div>
+<div id="help"><div>
+  <h3 style="margin-top:0">Reviewing a converted tree</h3>
+  <p>The queue lists what a person should look at, worst first, by tier (never by a score). Each decision you make is appended to <code>review-decisions.jsonl</code> in the converted tree, with your name, your reason and the hashes of both files; the converted files are never changed. After every decision the sources are read again, the ledger applied again and the queue rebuilt.</p>
+  <table>
+    <tr><td><strong>Accept</strong></td><td>An assumption holds here. Bulk accept records one decision per selected unit.</td></tr>
+    <tr><td><strong>Pick</strong></td><td>The target the conversion chose is the right one.</td></tr>
+    <tr><td><strong>Approve</strong></td><td>The output is right as written. Needed for output an agent wrote and for plainly converted units. Never discharges a difference, a refusal or what the engine could not prove, and does not accept assumptions.</td></tr>
+    <tr><td><strong>Reject</strong></td><td>The unit is wrong and must be fixed; it stays open, whoever approved it.</td></tr>
+    <tr><td><strong>Comment</strong></td><td>A remark only; it discharges nothing.</td></tr>
+  </table>
+  <p class="muted"><span class="badge rev">accepted in review</span> means people accepted everything that was open; it is never the same as converted. <em>Nothing found, not proven</em> is a plainly converted unit: the rules needed no assumption and SQLDiff found no difference, which is not a proof. A decision made on other file contents is <em>outdated</em> and must be confirmed again.</p>
+  <table>
+    <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>Next / previous item</td></tr>
+    <tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>Record the decision being written</td></tr>
+    <tr><td><kbd>X</kbd></td><td>Select the item for bulk accept</td></tr>
+    <tr><td><kbd>R</kbd></td><td>Refresh</td></tr>
+    <tr><td><kbd>?</kbd></td><td>This help</td></tr>
+  </table>
+</div></div>
+<script>
+const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// Convert mode's highlighter, shared so both pages colour SQL alike.
+/*__SQLDIFF_LEXER__*/
+
+// A plainly converted unit is never shown as "converted": nothing was found, nothing was proven.
+const LABEL = { converted: "nothing found, not proven", assumptions: "under assumptions", decision: "needs a decision", unproven: "not proven", differs: "differs", not_converted: "not converted" };
+const KEYOF = { "converted": "converted", "under assumptions": "assumptions", "needs a decision": "decision", "not proven": "unproven", "differs": "differs", "not converted": "not_converted" };
+const statusKey = (s) => KEYOF[s] || (LABEL[s] ? s : "unproven");
+const statusLabel = (s) => LABEL[statusKey(s)] || s;
+const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
+const AUTHOR_KEY = "sqldiff.review.author", ALL_KEY = "sqldiff.review.all";
+const S = { st: INITIAL.state, sel: null, view: null, unit: 0, picked: new Set(), files: new Map(), action: null, rule: "" };
+try { $("author").value = localStorage.getItem(AUTHOR_KEY) || ""; $("all").checked = localStorage.getItem(ALL_KEY) === "1"; } catch { /* storage unavailable */ }
+const author = () => $("author").value.trim();
+const allQ = () => ($("all").checked ? "&all=1" : "");
+
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg; t.className = bad ? "bad" : ""; t.style.display = "block";
+  clearTimeout(toast.t); toast.t = setTimeout(() => (t.style.display = "none"), bad ? 7000 : 2500);
+}
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const text = await r.text();
+  if (!r.ok) throw new Error(text || r.statusText);
+  return r.headers.get("Content-Type").startsWith("application/json") ? JSON.parse(text) : text;
+}
+
+function renderHeader() {
+  const st = S.st;
+  const base = (p) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+  $("pairname").innerHTML = `${esc(dialectName(st.from))} → ${esc(dialectName(st.to))} · <span class="mono">${esc(base(st.src))}</span> → <span class="mono">${esc(base(st.out))}</span>${st.templates ? " · templates" : ""}`;
+  $("pairname").title = `Source: ${st.src}\nConverted tree: ${st.out}\nDecisions: ${st.ledger_path}`;
+  const tiers = Object.entries(st.tiers).filter(([, n]) => n > 0);
+  $("chips").innerHTML = `<span class="chip" title="Items left in the queue"><b>${st.items.length}</b> to review</span><span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>`;
+  const b = [];
+  if (st.not_applied.length) b.push(`<div class="banner bad"><details><summary>${st.not_applied.length} line(s) of the ledger were not applied</summary><ul>${st.not_applied.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details></div>`);
+  if (st.outdated) b.push(`<div class="banner">${st.outdated} unit(s) have a decision made on other file contents: it no longer applies until someone confirms it again (marked <span class="flag warn">outdated</span>).</div>`);
+  if (st.orphaned) b.push(`<div class="banner">${st.orphaned} decision(s) are about units whose text changed; they apply to nothing now.</div>`);
+  if (st.out_differs.length) b.push(`<div class="banner"><details><summary>${st.out_differs.length} file(s) in the converted tree differ from what this conversion writes (converted with other options, or edited by hand). Decisions here are made on this conversion.</summary><ul>${st.out_differs.slice(0, 50).map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details></div>`);
+  if (st.unreadable.length) b.push(`<div class="banner bad">${st.unreadable.length} source file(s) could not be read: ${esc(st.unreadable.slice(0, 5).join(", "))}</div>`);
+  if (!st.instances && st.templates) b.push(`<div class="banner">No instance report was given (<code>--instances</code>): templates are judged on their own text only.</div>`);
+  $("banners").innerHTML = b.join("");
+}
+
+function itemRow(it) {
+  const k = statusKey(it.status);
+  const at = it.out_line ? `:${it.out_line}` : it.src_line ? ` (source ${it.src_line})` : "";
+  const flags = [];
+  if (it.outdated) flags.push(`<span class="flag warn" title="A decision here no longer applies: the file changed since">outdated</span>`);
+  if (it.written_by === "agent") flags.push(`<span class="flag warn">agent wrote it</span>`);
+  if (it.instances) flags.push(`<span class="flag" title="Instances woven from this template">${it.instances} inst.</span>`);
+  if (it.failing_instances && it.failing_instances.length) flags.push(`<span class="flag bad">${it.failing_instances.length} failing</span>`);
+  if (it.units && it.units.length) flags.push(`<span class="flag">${it.units.length} units</span>`);
+  const box = it.open_assumptions.length ? `<input type="checkbox" data-pick="${esc(it.key)}" ${S.picked.has(it.key) ? "checked" : ""} title="Select for bulk accept (X)" aria-label="Select">` : "<span></span>";
+  // A unit lists what is still open on it, else why it is here.
+  const what = it.kind === "unit" ? ((it.open || []).join(", ") || it.rules.join(", ") || statusLabel(it.status)) : it.reason;
+  return `<div class="row${S.sel === it.key ? " sel" : ""}" data-key="${esc(it.key)}" role="option">${box}<span class="dot s-${k}" style="background:var(--s-${k})" title="${esc(statusLabel(it.status))}"></span><span class="p" title="${esc(it.path + at)}">${esc(it.path)}${esc(at)}${flags.join("")}</span><span class="r" title="${esc(it.reason)}">${esc(what)}</span></div>`;
+}
+
+function renderQueue() {
+  const st = S.st, by = {};
+  st.items.forEach((it) => (by[it.tier] = by[it.tier] || []).push(it));
+  const html = [];
+  for (let t = 1; t <= 6; t++) {
+    if (!by[t]) continue;
+    html.push(`<div class="tier">Tier ${t} · ${esc(st.tier_labels[t])}<span class="spacer"></span><b>${by[t].length}</b></div>`);
+    html.push(by[t].map(itemRow).join(""));
+  }
+  $("queue").innerHTML = html.join("") || `<div class="empty">Nothing left to review${st.all ? "" : " in tiers 1 to 5. Plainly converted units nobody approved are not listed: tick “Nothing found too” to see them"}. Nothing is ever listed as safe.</div>`;
+  const d = $("done");
+  d.querySelector("summary").textContent = `Accepted in review (${st.reviewed.length})`;
+  d.querySelector(".list").innerHTML = st.reviewed.map((r) => `<div class="row" data-path="${esc(r.path)}" data-unit="${esc(r.unit)}"><span></span><span class="dot" style="background:var(--focus)"></span><span class="p">${esc(r.path)} (source ${r.src_line})</span><span class="r">accepted in review by ${esc(r.by.join(", ") || "?")} · status ${esc(LABEL[r.status])}</span></div>`).join("") || `<div class="empty">None yet.</div>`;
+  renderBulk();
+}
+
+function renderBulk() {
+  const items = S.st.items.filter((i) => S.picked.has(i.key));
+  $("bulk").classList.toggle("on", items.length > 0);
+  if (!items.length) return;
+  const count = {};
+  items.forEach((i) => i.open_assumptions.forEach((r) => (count[r] = (count[r] || 0) + 1)));
+  const rules = Object.keys(count).sort((a, b) => count[b] - count[a] || a.localeCompare(b));
+  const prev = $("bulkrule").value;
+  $("bulkrule").innerHTML = rules.map((r) => `<option value="${esc(r)}">${esc(r)} (${count[r]} of ${items.length})</option>`).join("");
+  if (rules.includes(prev)) $("bulkrule").value = prev;
+  $("bulkn").textContent = `${items.length} selected`;
+  const r = $("bulkrule").value, n = count[r] || 0;
+  $("bulkhint").textContent = n < items.length ? `${items.length - n} without it are left out` : "one decision per unit";
+}
+
+async function bulkAccept() {
+  const rule = $("bulkrule").value, reason = $("bulkreason").value.trim();
+  if (!author()) { needAuthor(); return; }
+  if (!reason) { toast("Say why it holds: every decision needs a reason.", true); $("bulkreason").focus(); return; }
+  const items = S.st.items.filter((i) => S.picked.has(i.key) && i.open_assumptions.includes(rule));
+  const targets = [];
+  for (const it of items) {
+    // The hashes the server checks are those of the unit as it is shown now.
+    const v = await api(`/api/unit?path=${encodeURIComponent(it.path)}&unit=${encodeURIComponent(it.unit)}`);
+    targets.push({ path: v.path, unit: v.unit, input_hash: v.input_hash, output_hash: v.output_hash });
+  }
+  await submit({ action: "accept", rule, reason, author: author(), targets }, () => { S.picked.clear(); $("bulkreason").value = ""; });
+}
+
+function needAuthor() {
+  $("author").classList.add("need"); $("author").focus();
+  toast("Give your name first: every decision records who made it.", true);
+}
+
+async function submit(body, after) {
+  try {
+    const r = await api(`/api/record?${allQ().slice(1)}`, body);
+    toast(`Recorded ${r.written} decision${r.written === 1 ? "" : "s"} in review-decisions.jsonl`);
+    if (after) after();
+    await apply(r.state, true);
+  } catch (e) {
+    toast(e.message, true);
+    // The files may have changed: show them as they are now.
+    await reload();
+  }
+}
+
+async function apply(st, advance) {
+  const before = S.st.items.map((i) => i.key), idx = before.indexOf(S.sel);
+  S.st = st;
+  for (const k of [...S.picked]) if (!st.items.some((i) => i.key === k && i.open_assumptions.length)) S.picked.delete(k);
+  renderHeader(); renderQueue();
+  if (S.sel && st.items.some((i) => i.key === S.sel)) await open(S.sel, { keepUnit: true });
+  else if (S.sel && !S.sel.startsWith("@") && advance) {
+    // The item left the queue: go on with the one that took its place.
+    const next = st.items[Math.min(Math.max(idx, 0), st.items.length - 1)];
+    if (next) await open(next.key); else showNone();
+  } else if (S.sel && S.sel.startsWith("@")) await openUnit(S.view.units[0].path, S.view.units[0].unit);
+  else if (st.items.length) await open(st.items[0].key);
+  else showNone();
+}
+
+async function reload() { await apply(await api(`/api/state?${allQ().slice(1)}`), false); }
+
+function showNone() {
+  S.sel = null; S.view = null;
+  $("item").innerHTML = `<div class="empty">Nothing selected. ${S.st.items.length ? "Pick an item on the left." : "The queue is empty."}</div>`;
+}
+
+async function open(key, { keepUnit = false } = {}) {
+  let v;
+  try { v = await api(`/api/item?key=${encodeURIComponent(key)}${allQ()}`); }
+  catch { showNone(); return; }
+  S.sel = key; S.view = v;
+  if (!keepUnit || S.unit >= v.units.length) S.unit = 0;
+  document.querySelectorAll("#queue .row").forEach((r) => r.classList.toggle("sel", r.dataset.key === key));
+  const row = document.querySelector(`#queue .row[data-key="${CSS.escape(key)}"]`);
+  if (row) row.scrollIntoView({ block: "nearest" });
+  await renderItem();
+}
+
+async function openUnit(path, unit) {
+  const u = await api(`/api/unit?path=${encodeURIComponent(path)}&unit=${encodeURIComponent(unit)}`);
+  S.sel = `@${path}#${unit}`;
+  S.view = { item: { kind: "unit", key: S.sel, path, tier: 0, status: u.status, reason: "", rules: [], units: [], instances: u.instances }, units: [u], failing_instances: u.failing_instances };
+  S.unit = 0;
+  document.querySelectorAll("#queue .row").forEach((r) => r.classList.remove("sel"));
+  await renderItem();
+}
+
+async function fileText(path, side, hash) {
+  const k = `${side}:${path}:${hash}`;
+  if (!S.files.has(k)) {
+    const text = await api(`/api/file?path=${encodeURIComponent(path)}&side=${side}`);
+    const runs = lexSql(text, side === "in" ? S.st.from : S.st.to);
+    const starts = [0];
+    for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) starts.push(i + 1);
+    S.files.set(k, { text, runs, starts });
+  }
+  return S.files.get(k);
+}
+
+// The unit's lines with some context, highlighted as the whole file lexes.
+const CONTEXT = 30;
+function pane(f, from, to) {
+  const n = f.starts.length, a = Math.max(1, from - CONTEXT), b = Math.min(n, to + CONTEXT);
+  const end = b < n ? f.starts[b] - 1 : f.text.length;
+  const lines = hlLines(f.text, f.runs, f.starts[a - 1], end);
+  const html = lines.map((t, k) => {
+    const l = a + k;
+    return `<div class="ln${l >= from && l <= to ? " u" : ""}" data-l="${l}"><span class="no">${l}</span><span class="tx">${t || " "}</span></div>`;
+  });
+  if (a > 1) html.unshift(`<div class="more">${a - 1} line(s) above</div>`);
+  if (b < n) html.push(`<div class="more">${n - b} line(s) below</div>`);
+  return html.join("");
+}
+
+function badge(s) { const k = statusKey(s); return `<span class="badge"><span class="dot s-${k}" style="background:var(--s-${k})"></span>${esc(statusLabel(s))}</span>`; }
+
+async function renderItem() {
+  const v = S.view, it = v.item, u = v.units[S.unit];
+  const head = [];
+  head.push(badge(it.status));
+  if (u && u.review && u.review.reviewed) head.push(`<span class="badge rev">accepted in review</span>`);
+  head.push(`<span class="path">${esc(it.path)}</span>`);
+  if (it.tier) head.push(`<span class="muted">tier ${it.tier} · ${esc(S.st.tier_labels[it.tier])}</span>`);
+  if (u) head.push(`<span class="muted">source line ${u.src[0]}${u.src[1] > u.src[0] ? "–" + u.src[1] : ""} · line ${u.written_line} in the converted file</span><span class="mono muted" title="Unit id in the ledger">${esc(u.unit)}</span>`);
+  if (u && u.review && u.review.decisions.some((d) => !d.current)) head.push(`<span class="flag warn">outdated decision</span>`);
+  if (u && u.review && u.review.written_by) head.push(`<span class="flag${u.review.written_by === "agent" ? " warn" : ""}">written by ${u.review.written_by === "agent" ? "an agent" : "a person"}</span>`);
+  if (it.instances) head.push(`<span class="flag">${it.instances} instance(s) woven from it</span>`);
+  const tabs = v.units.length > 1 ? v.units.map((x, k) => `<button data-tab="${k}" class="${k === S.unit ? "on" : ""}">${esc(x.path)}:${x.written_line}</button>`).join("") : "";
+  let code = "";
+  if (u) {
+    const [fi, fo] = await Promise.all([fileText(u.path, "in", u.input_hash), fileText(u.path, "out", u.output_hash)]);
+    code = `<div id="code"><div class="ph"><strong>${esc(dialectName(S.st.from))}</strong><span>source</span></div><div class="ph"><strong>${esc(dialectName(S.st.to))}</strong><span>converted, as checked (status lines not shown)</span></div><div class="pane" id="pin">${pane(fi, u.src[0], u.src[1])}</div><div class="pane" id="pout">${pane(fo, u.out[0], u.out[1])}</div></div>`;
+  }
+  $("item").innerHTML = `<div id="ih">${head.join("")}</div><div class="tabs">${tabs}</div>${code}<div id="lower"><div id="why">${why(v, u)}</div><div id="decide">${u ? decide(u) : `<h3>Decide</h3><div class="muted">${esc(nothingToDecide(it))}</div>`}</div></div>`;
+  if (!u) { $("lower").style.flex = "1"; }
+  for (const id of ["pin", "pout"]) {
+    const p = $(id); if (!p) continue;
+    const first = p.querySelector(".ln.u");
+    if (first) p.scrollTop = Math.max(0, first.offsetTop - 3 * first.offsetHeight);
+  }
+  if (u) wireForm(u);
+}
+
+function nothingToDecide(it) {
+  switch (it.kind) {
+    case "missing_object": return "Convert or create the missing object first; then its units are checked again.";
+    case "unplaced": return "These findings point into no unit, so nothing can be decided about them here: fix the output and convert again.";
+    case "template": return "A template is judged by its woven instances: open its units, and fix the instances that fail.";
+    case "not_exercised": return "No instance uses this template, so it was never checked: add an instance to the manifest.";
+    case "not_in_manifest": return "The manifest does not describe this generator output: add the instance that produces it.";
+    case "unreadable": return "This file could not be read, so nothing in it was converted or checked: make it readable and refresh.";
+    default: return "";
+  }
+}
+
+function why(v, u) {
+  const it = v.item, out = [];
+  if (!u) {
+    out.push(`<h3>Why it is listed</h3><div class="note">${esc(it.reason)}${it.rules.length ? `<div class="r">${esc(it.rules.join(", "))}</div>` : ""}</div>`);
+  } else {
+    const rv = u.review;
+    out.push(`<h3>Notes</h3>`);
+    if (!u.notes.length) out.push(`<div class="note">The rules needed no assumption here${u.checked === "converted" ? ", and SQLDiff found no difference. That is not a proof: nothing found, not proven." : "."}</div>`);
+    for (const n of u.notes) {
+      const done = rv && n.status !== "converted" && (n.status === "assumptions" || n.status === "decision") && !rv.open.includes(n.rule);
+      out.push(`<div class="note${done ? " done" : ""}">${badge(n.status)} ${esc(n.text)}<div class="r">${esc(n.rule)}</div></div>`);
+    }
+    if (u.findings.length) {
+      out.push(`<h3>Engine findings</h3>`);
+      for (const f of u.findings) out.push(`<div class="note finding"><span class="badge">${f.from === "diff" ? "SQLDiff diff" : "output check"} · ${esc(f.verdict.replace(/_/g, " "))} · ${esc(f.severity)}</span> ${esc(f.witness)}<div class="r">${esc(f.rule)}${f.assumptions.length ? " · under " + esc(f.assumptions.join(", ")) : ""}</div></div>`);
+    } else if (u.checked !== "converted") {
+      out.push(`<h3>Engine</h3><div class="note finding">The engine's part of the status is <strong>${esc(LABEL[u.checked])}</strong>.</div>`);
+    }
+    if (rv && rv.undischargeable.length) out.push(`<div class="note finding"><strong>No decision can discharge:</strong> ${esc(rv.undischargeable.join(", "))}. Fix the output and convert again.</div>`);
+  }
+  const fails = v.failing_instances || [];
+  if (fails.length) out.push(`<h3>Failing instances</h3>${fails.map(([n, s]) => `<div class="note">${badge(s)} <span class="mono">${esc(n)}</span></div>`).join("")}`);
+  else if ((u ? u.instances : it.instances) && S.st.instances) out.push(`<h3>Instances</h3><div class="muted">All ${u ? u.instances : it.instances} instance(s) woven from this template are converted.</div>`);
+  if (u && u.review && u.review.decisions.length) {
+    out.push(`<h3>Decisions</h3>`);
+    for (const d of u.review.decisions.slice().reverse()) {
+      const r = d.record;
+      out.push(`<div class="dec${d.current ? "" : " old"}"><strong>${esc(r.state)}</strong>${r.rule ? ` <span class="mono">${esc(r.rule)}</span>` : ""} · ${esc(r.author)} <span class="flag${r.by === "agent" ? " warn" : ""}">${esc(r.by)}</span>${d.current ? "" : ` <span class="flag warn" title="${esc(d.why_not || "")}">outdated</span>`}<div>${esc(r.reason)}</div><div class="meta">${esc(r.at)}${d.why_not ? " · " + esc(d.why_not) : ""}</div></div>`);
+    }
+  }
+  return out.join("");
+}
+
+const ACTIONS = [
+  ["accept", "Accept", "An assumption holds here"], ["pick", "Pick", "The target the conversion chose is right"], ["approve", "Approve", "The output is right as written"], ["reject", "Reject", "The unit is wrong and must be fixed"], ["comment", "Comment", "A remark; discharges nothing"],
+];
+function decide(u) {
+  const rv = u.review;
+  const openA = u.assumptions.filter((r) => !rv || rv.open.includes(r)), openD = u.decisions.filter((r) => !rv || rv.open.includes(r));
+  const can = { accept: u.assumptions.length > 0, pick: u.decisions.length > 0, approve: !u.approve_blocked, reject: true, comment: true };
+  if (!S.action || !can[S.action]) S.action = openD.length ? "pick" : openA.length ? "accept" : can.approve ? "approve" : "comment";
+  return `<h3>Decide</h3><div id="form">
+    <div class="seg" role="tablist">${ACTIONS.map(([a, l, t]) => `<button data-act="${a}" class="${a === S.action ? "on" : ""}" ${can[a] ? "" : "disabled"} title="${esc(a === "approve" && u.approve_blocked ? u.approve_blocked : !can[a] ? "Nothing of this kind on the unit" : t)}">${l}</button>`).join("")}</div>
+    <select id="rule" aria-label="Rule"></select>
+    <textarea id="reason" placeholder="Why" aria-label="Reason"></textarea>
+    <div class="hint" id="hint"></div>
+    <div class="act"><button class="primary" id="go">Record</button><span class="muted">as <strong id="as">${esc(author() || "?")}</strong> · <kbd>Ctrl</kbd>+<kbd>Enter</kbd></span></div>
+  </div>`;
+}
+
+function wireForm(u) {
+  const rv = u.review;
+  const set = () => {
+    document.querySelectorAll("#form .seg button").forEach((b) => b.classList.toggle("on", b.dataset.act === S.action));
+    const sel = $("rule"), a = S.action;
+    let rules = [];
+    if (a === "accept") rules = u.assumptions;
+    else if (a === "pick") rules = u.decisions;
+    else if (a === "reject" || a === "comment") rules = ["", ...new Set(u.notes.map((n) => n.rule))];
+    sel.style.display = rules.length ? "" : "none";
+    const isOpen = (r) => !rv || rv.open.includes(r);
+    sel.innerHTML = rules.map((r) => `<option value="${esc(r)}">${r ? esc(r) + (a === "accept" || a === "pick" ? (isOpen(r) ? "" : " (accepted already)") : "") : "the whole unit"}</option>`).join("");
+    const firstOpen = rules.find((r) => r && isOpen(r));
+    if (firstOpen && (a === "accept" || a === "pick")) sel.value = firstOpen;
+    $("reason").placeholder = a === "comment" ? "Your comment (discharges nothing)" : a === "accept" ? "Why the assumption holds here" : a === "pick" ? "Why this target is the right one" : a === "approve" ? "Why the output is right as written" : "What is wrong";
+    const hint = $("hint");
+    hint.className = "hint";
+    if (a === "approve") {
+      const open = rv ? rv.open : u.assumptions.concat(u.decisions);
+      hint.textContent = open.length ? `Approving does not accept the ${open.length} open assumption(s) or decision(s): accept or pick them too.` : rv && rv.written_by === "agent" ? "An agent wrote this output: your approval is what makes it reviewed." : "Says the output is right as written.";
+      if (open.length) hint.className = "hint warn";
+    } else if (a === "reject") hint.textContent = "The unit stays open, whoever approved it, until it is fixed.";
+    else if (a === "comment") hint.textContent = "A comment is kept in the ledger and discharges nothing.";
+    else hint.textContent = "Recorded for this unit only, on these exact file contents.";
+  };
+  document.querySelectorAll("#form .seg button").forEach((b) => b.addEventListener("click", () => { S.action = b.dataset.act; set(); }));
+  set();
+  $("go").addEventListener("click", () => record(u));
+  $("reason").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); record(u); } });
+}
+
+function record(u) {
+  if (!author()) { needAuthor(); return; }
+  const reason = $("reason").value.trim();
+  if (!reason) { toast(S.action === "comment" ? "Write the comment first." : "Say why: every decision needs a reason.", true); $("reason").focus(); return; }
+  const rule = $("rule").style.display === "none" ? "" : $("rule").value;
+  submit({ action: S.action, rule, reason, author: author(), targets: [{ path: u.path, unit: u.unit, input_hash: u.input_hash, output_hash: u.output_hash }] });
+}
+
+function step(d) {
+  const keys = S.st.items.map((i) => i.key);
+  if (!keys.length) return;
+  const i = keys.indexOf(S.sel);
+  open(keys[Math.max(0, Math.min(keys.length - 1, i < 0 ? 0 : i + d))]);
+}
+
+$("queue").addEventListener("click", (e) => {
+  const box = e.target.closest("input[data-pick]");
+  if (box) { box.checked ? S.picked.add(box.dataset.pick) : S.picked.delete(box.dataset.pick); renderBulk(); return; }
+  const row = e.target.closest(".row"); if (row) open(row.dataset.key);
+});
+$("done").addEventListener("click", (e) => { const row = e.target.closest(".row[data-unit]"); if (row) openUnit(row.dataset.path, row.dataset.unit); });
+$("item").addEventListener("click", (e) => { const t = e.target.closest("[data-tab]"); if (t) { S.unit = +t.dataset.tab; renderItem(); } });
+$("bulkrule").addEventListener("change", renderBulk);
+$("bulkclear").addEventListener("click", () => { S.picked.clear(); renderQueue(); });
+$("bulkgo").addEventListener("click", bulkAccept);
+$("bulkreason").addEventListener("keydown", (e) => { if (e.key === "Enter") bulkAccept(); });
+$("author").addEventListener("input", () => {
+  $("author").classList.remove("need");
+  try { localStorage.setItem(AUTHOR_KEY, author()); } catch { /* ignore */ }
+  if ($("as")) $("as").textContent = author() || "?";
+});
+$("all").addEventListener("change", () => { try { localStorage.setItem(ALL_KEY, $("all").checked ? "1" : "0"); } catch { /* ignore */ } reload(); });
+$("refresh").addEventListener("click", async () => { try { await apply(await api(`/api/refresh?${allQ().slice(1)}`, {}), false); toast("Read the sources and the ledger again"); } catch (e) { toast(e.message, true); } });
+$("helpbtn").addEventListener("click", () => $("help").classList.add("open"));
+$("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help").classList.remove("open"); });
+document.addEventListener("keydown", (e) => {
+  if (e.target.closest("input, textarea, select") || e.ctrlKey || e.metaKey || e.altKey) { if (e.key === "Escape") e.target.blur(); return; }
+  if (e.key === "?") $("help").classList.toggle("open");
+  else if (e.key === "Escape") $("help").classList.remove("open");
+  else if (e.key === "j") step(1);
+  else if (e.key === "k") step(-1);
+  else if (e.key === "r") $("refresh").click();
+  else if (e.key === "x" && S.sel) {
+    const it = S.st.items.find((i) => i.key === S.sel);
+    if (it && it.open_assumptions.length) { S.picked.has(it.key) ? S.picked.delete(it.key) : S.picked.add(it.key); renderQueue(); }
+  }
+});
+
+renderHeader(); renderQueue();
+if ($("all").checked && !S.st.all) reload();
+else if (S.st.items.length) open(S.st.items[0].key); else showNone();
+</script>
+</body>
+</html>

@@ -169,7 +169,7 @@ pub struct FileReviewReport {
 }
 
 /// The ledger applied to one unit (`review::UnitReview`, without the unit).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct UnitReviewReport {
     /// Reviewed by people: shown as "accepted in review", never as converted.
     pub reviewed: bool,

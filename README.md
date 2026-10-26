@@ -62,6 +62,8 @@ target/release/sqldiff-gui convert proc.tpl.sql --template --pack my-pack  # a g
 
 # Convert a whole tree: mirrored output tree, every statement checked, report in OUT
 $B convert src/tsql -o out/pg --to postgres        # or --to db2i; -j N parallel jobs
+# Review it in the browser: the queue by tier, decisions appended to out/pg/review-decisions.jsonl
+target/release/sqldiff-gui review src/tsql out/pg --to postgres
 ```
 
 Ready-to-run builds for Windows, macOS and Linux come from the Release workflow; `sqldiff dist` adds a private config for colleagues on your own machine ([docs/distribution.md](docs/distribution.md)).

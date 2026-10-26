@@ -16,6 +16,7 @@ use sqldiff_syntax::template::Derived;
 use sqldiff_syntax::{ast, parse, LineIndex, SyntaxElement, SyntaxKind, SyntaxNode};
 
 pub mod convert;
+pub mod convert_review;
 pub mod report;
 pub mod review;
 pub mod server;

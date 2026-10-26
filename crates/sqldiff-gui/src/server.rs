@@ -104,7 +104,7 @@ pub(crate) fn not_found() -> Response {
 }
 
 /// Query parameter, percent-decoded.
-fn param(query: &str, key: &str) -> Option<String> {
+pub(crate) fn param(query: &str, key: &str) -> Option<String> {
     query.split('&').find_map(|kv| {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         (k == key).then(|| decode(v))
