@@ -218,9 +218,13 @@ enum Command {
     /// from the converted ones, and check the target weave as `convert`
     /// checks its output (parse, binding, residue, limits, the engine's diff
     /// against the source weave, and the names the values make). Writes the
-    /// woven instances and `instance-report.json` / `.md`. Exit code 0 when
+    /// woven instances and `instance-report.json` / `.md`. With
+    /// --woven-target the generator's target output must equal the target
+    /// weave; with --generator-only the generator's source output is checked
+    /// against its target output, no templates woven. Exit code 0 when
     /// every instance is converted or converted under assumptions (and,
-    /// with --woven, all generator output is accounted for), 1 otherwise.
+    /// with --woven or --woven-target, all generator output is accounted
+    /// for), 1 otherwise.
     Instances(instances_cmd::InstancesArgs),
     /// Keep the template trees of several dialects in step: every template
     /// in every tree, with the same placeholders and directives; with --base,

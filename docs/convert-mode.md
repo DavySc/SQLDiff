@@ -110,7 +110,9 @@ A converted template tree is never the last word: a template is right only when 
 
 ```sh
 sqldiff instances instances.toml --source templates/ --target out/ --to postgres -o check/ --pack PACK \
-    [--woven generated/] [--accept ASM-…] [--catalog schema.sql]
+    [--woven generated/] [--woven-target generated-pg/] [--accept ASM-…] [--catalog schema.sql]
+sqldiff instances instances.toml --generator-only --woven generated/ --woven-target generated-pg/ \
+    --to postgres -o check/ [--pack PACK]
 ```
 
 `sqldiff instances` weaves every instance the generator produces twice, from the source templates and from the converted ones, with the same values, and checks each pair. The manifest lists the instances (a template, or several parts in order), their parameter values, and values per dialect where a value differs between dialects:
@@ -144,7 +146,7 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | The engine's diff: a finding it could neither prove nor rule out (`equiv.unproven`, …) | unknown |
 | The engine's diff could not compare a statement at all (`equiv.not-covered`): today every DDL statement other than a table below | unknown |
 | A `CREATE TABLE` (which the engine does not compare) that is not, token for token, the table the conversion rules write from the source instance's table (`ddl.not-as-converted`); the schema may differ only where both sides use their default (`dbo`, `public`) | unknown |
-| The engine's diff: a finding equal only under assumptions (listed with the rule) | under assumptions |
+| The engine's diff: a finding equal only under assumptions (listed with the rule), or an assumption about this pair (`ASM-ARGUMENT-LENGTHS` when a parameter's type differs) | under assumptions |
 | A name a value is part of is a PostgreSQL reserved word unquoted (`Order`, `user`), or longer than 128 characters on Db2 for i | differs |
 | A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
 | A Db2 for i name from a value: no verified reserved-word list is built in (`ASM-DB2I-RESERVED-UNCHECKED`) | under assumptions |
@@ -158,7 +160,17 @@ Tables get the same bar as `sqldiff convert`'s own output: the woven target's ta
 
 With `--woven DIR` (the generator's real output) each source weave must equal its `output` file, ignoring trailing white space, or the instance is not woven (`weave.generator-mismatch`, with the first line that differs), and every file there that no instance names is listed under "not in manifest". That is what shows the manifest describes the generator completely.
 
-This is a stricter bar than `sqldiff convert`'s, where only a proven difference holds a unit back: an instance is converted only when no finding of the diff is left open. The assumptions the diff makes about every pair (name folding, the default schema) are listed per instance as `engine_assumptions` and do not count, as in `convert`.
+#### Checking what the generator really writes
+
+Behaviour is best guaranteed on the generator's own output, so an instance is **done** only when both of its sides were checked on it; SQLDiff's weave alone is evidence about the templates, not about what the generator writes.
+
+- **The generator weaves the converted templates unchanged.** Give its output for the target with `--woven-target DIR` (same `output` paths as under `--woven`). Each target weave must equal its file there, ignoring trailing white space, or the instance is not woven (`weave.generator-target-mismatch`, with the first line that differs): the generator does something the weaver does not, and nothing is claimed. Files there that no instance names are listed as "not in manifest" too.
+- **The generator was changed for the target** (dialect logic, other includes), so its target output is not a weave of the converted templates. Check its output alone with `--generator-only --woven DIR --woven-target DIR`: each instance's source output against its target output, with the same checks as above (the target parses, the output check, the engine's diff, tables as the rules write them, the names the values make). Nothing is woven, so no `--source` or `--target`. Results map back to the templates the manifest names for each instance (a template's status is the worst instance), not to the generator's includes, which it does not know; there is no "not exercised" list. The values' names are found as the name tokens of the target output that hold a `name` value, ignoring letter case; a keyword that holds one is checked too, which can only make an instance worse. A missing or unreadable output on either side leaves the instance not woven.
+- **No target output yet.** An instance with no file under `--woven-target` (or no `--woven-target` at all), or no source output under `--woven`, is checked on SQLDiff's weave only: its status is reported as usual, but the report lists the sides in `weave_only`, says "checked on SQLDiff's weave only", and it never counts as done.
+
+The report gives `done` per instance and per template, totals of `done` and `weave_only`, and `complete`: every instance done, every converted template exercised and all generator output accounted for. With `--woven-target` the exit code is 1 when an instance has no target output there.
+
+This is a stricter bar than `sqldiff convert`'s, where only a proven difference holds a unit back: an instance is converted only when no finding of the diff is left open. The assumptions the diff makes about every pair (name folding, the default schema, T-SQL's ownership chain) are listed per instance as `engine_assumptions` and do not count, as in `convert`; any other assumption the diff makes about the pair (`ASM-ARGUMENT-LENGTHS`, say) counts, unless accepted with `--accept`.
 
 `check/instance-report.json` and `.md` give each instance's status and items (side, line in the woven file, rule), each converted template's status (the worst instance that uses it, includes too) and the converted templates no instance uses ("not exercised", never checked). The woven files are written to `check/source/` and `check/target/`. Exit code 0 when every instance is converted or converted under assumptions and all generator output is accounted for, 1 otherwise.
 
