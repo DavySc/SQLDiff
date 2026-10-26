@@ -11,6 +11,13 @@
 //! nullability), constants the routine sets, and local variables whose
 //! earlier assignments are not traced; a witness that needs the latter
 //! carries an assumption that names them.
+//!
+//! The search runs one changed statement and gives both versions the same
+//! inputs at it, so it holds only while no other change is involved: when
+//! a value the statement reads (or a condition on the way to it) may come
+//! from another changed statement, or what it writes reaches one, two
+//! edits that make up for each other would look like two differences, and
+//! the finding stays unknown.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +31,7 @@ use super::Outcome;
 use crate::artifact::Analyzed;
 use crate::classify::{stmt_kind, StmtKind};
 use crate::model::{fingerprint, Assumption, ChangeClass, Finding, FingerprintInput, Verdict};
+use crate::normalize;
 
 const RULE: &str = "equiv.edit";
 
@@ -55,7 +63,19 @@ pub fn decide(
     }
     let ra = Routine::new(a);
     let rb = Routine::new(b);
-    for f in findings.iter_mut() {
+    // What every finding marks as changed, on each side.
+    let spans: Vec<(Option<Span>, Option<Span>)> = findings
+        .iter()
+        .map(|f| {
+            if f.verdict == Verdict::Equal {
+                return (None, None);
+            }
+            let span =
+                |l: &Option<crate::model::Location>| l.as_ref().map(|l| (l.byte_start, l.byte_end));
+            (span(&f.a), span(&f.b))
+        })
+        .collect();
+    for (i, f) in findings.iter_mut().enumerate() {
         if !candidate(f) {
             continue;
         }
@@ -68,7 +88,12 @@ pub fn decide(
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             eprintln!("edit: {} at A line {}", f.rule, la.start_line);
         }
-        let r = examine(&ra, &rb, &na, &nb, sa, sb);
+        let others = spans.iter().enumerate().filter(|(j, _)| *j != i);
+        let changed = (
+            others.clone().filter_map(|(_, s)| s.0).collect(),
+            others.filter_map(|(_, s)| s.1).collect(),
+        );
+        let r = examine(&ra, &rb, &na, &nb, sa, sb, &changed);
         if std::env::var_os("SQLDIFF_DEBUG_EDIT").is_some() {
             match &r {
                 Ok(g) => eprintln!("  => different: {}", g.witness),
@@ -151,6 +176,8 @@ struct Routine<'x, 'a> {
     /// PostgreSQL `LANGUAGE sql` function returning a set: the rows of its
     /// last statement are the result.
     sql_set_result: bool,
+    /// Statements and conditions with what they read and write, built on first use.
+    units: std::cell::OnceCell<Vec<Unit>>,
 }
 
 impl<'x, 'a> Routine<'x, 'a> {
@@ -213,6 +240,7 @@ impl<'x, 'a> Routine<'x, 'a> {
             result_sets: d == Dialect::Tsql
                 && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
             sql_set_result,
+            units: std::cell::OnceCell::new(),
         };
         r.scan();
         r
@@ -1288,6 +1316,331 @@ impl<'x, 'a> Routine<'x, 'a> {
     }
 }
 
+// ---- other changes around the changed statement ------------------------------------
+
+/// A byte range of one side that another finding marks as changed.
+type Span = (usize, usize);
+
+/// Something every statement sets: a later read of it sees the statement before.
+const STATUS: &[&str] = &[
+    "rowcount",
+    "error",
+    "fetch_status",
+    "identity",
+    "scope_identity",
+    "trancount",
+    "found",
+    "row_count",
+    "sqlstate",
+    "sqlcode",
+    "sqlerrm",
+];
+
+/// Stands for every name: the unit may write anything (a call, DDL, dynamic SQL).
+const ANY: &str = "*";
+
+/// A statement or a condition, with the names it reads and writes.
+struct Unit {
+    start: usize,
+    end: usize,
+    reads: HashSet<String>,
+    writes: HashSet<String>,
+    /// It may leave the sequence it is in (RETURN, BREAK, THROW, ...).
+    jumps: bool,
+}
+
+fn unit_name(t: &Tok) -> Option<String> {
+    matches!(t.kind, K::Var | K::Word | K::Quoted).then(|| {
+        t.text
+            .trim_start_matches('@')
+            .trim_matches(|c| matches!(c, '[' | ']' | '"' | '`'))
+            .to_lowercase()
+    })
+}
+
+fn overlaps(a: Span, b: Span) -> bool {
+    a.0 < b.1 && b.0 < a.1
+}
+
+fn meets(a: &HashSet<String>, b: &HashSet<String>) -> bool {
+    !a.is_empty() && !b.is_empty() && (a.contains(ANY) || b.contains(ANY) || !a.is_disjoint(b))
+}
+
+impl<'x, 'a> Routine<'x, 'a> {
+    /// Names unit `n` (a statement) writes: assigned variables, written
+    /// tables and everything a statement sets as a side effect.
+    fn statement_writes(&self, n: &SyntaxNode) -> HashSet<String> {
+        let (s, e) = cst::sig_range(n);
+        let mut w: HashSet<String> = STATUS.iter().map(|x| x.to_string()).collect();
+        for (name, sites) in &self.sites {
+            if sites.iter().any(|x| s <= x.start && x.start < e) {
+                w.insert(name.trim_start_matches('@').to_string());
+            }
+        }
+        let k = stmt_kind(n, self.d);
+        let first = cst::first_words(n, 1);
+        let first = first.first().map(String::as_str).unwrap_or("");
+        let calls = matches!(k, StmtKind::Call | StmtKind::Ddl)
+            || matches!(
+                first,
+                "EXEC" | "EXECUTE" | "PERFORM" | "CALL" | "CREATE" | "ALTER" | "DROP"
+            );
+        if calls {
+            w.insert(ANY.to_string());
+        }
+        let dml = matches!(
+            k,
+            StmtKind::Insert | StmtKind::Update | StmtKind::Delete | StmtKind::Merge
+        ) || matches!(first, "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "TRUNCATE");
+        if dml {
+            // Every name that is not a keyword or a variable: the target,
+            // its alias and the tables it is joined with.
+            let t = tokens(n);
+            for (i, x) in t.iter().enumerate() {
+                // Schema qualifiers are no table.
+                let qualifier = t.get(i + 1).is_some_and(|y| y.kind == K::Dot);
+                if x.kind == K::Var || qualifier || normalize::is_keyword(&x.up) {
+                    continue;
+                }
+                if let Some(x) = unit_name(x) {
+                    if !(self.d != Dialect::Tsql
+                        && (self.params.contains_key(&x) || self.locals.contains_key(&x)))
+                    {
+                        w.insert(x);
+                    }
+                }
+            }
+        }
+        w
+    }
+
+    /// Every statement and condition of the routine.
+    fn units(&self) -> &[Unit] {
+        self.units.get_or_init(|| self.build_units())
+    }
+
+    fn build_units(&self) -> Vec<Unit> {
+        let mut out = Vec::new();
+        for n in self.side.root.descendants() {
+            match n.kind() {
+                SyntaxKind::STATEMENT => {
+                    let (start, end) = cst::sig_range(&n);
+                    let w = cst::first_words(&n, 2);
+                    let first = w.first().map(String::as_str).unwrap_or("");
+                    let jumps = match first {
+                        "RETURN" => !matches!(w.get(1).map(String::as_str), Some("NEXT" | "QUERY")),
+                        "GOTO" | "THROW" | "RAISE" | "RAISERROR" | "SIGNAL" | "RESIGNAL"
+                        | "BREAK" | "CONTINUE" | "EXIT" | "LEAVE" | "ITERATE" => true,
+                        _ => false,
+                    };
+                    out.push(Unit {
+                        start,
+                        end,
+                        reads: tokens(&n).iter().filter_map(unit_name).collect(),
+                        writes: self.statement_writes(&n),
+                        jumps,
+                    });
+                }
+                SyntaxKind::CONDITION => {
+                    let (start, end) = cst::sig_range(&n);
+                    // What the condition decides: the writes of its compound statement.
+                    let mut writes = HashSet::new();
+                    if let Some(p) = n.parent() {
+                        for s in p
+                            .descendants()
+                            .filter(|x| x.kind() == SyntaxKind::STATEMENT)
+                        {
+                            writes.extend(self.statement_writes(&s));
+                        }
+                        let (ps, pe) = cst::sig_range(&p);
+                        for (name, sites) in &self.sites {
+                            if sites.iter().any(|x| ps <= x.start && x.start < pe) {
+                                writes.insert(name.trim_start_matches('@').to_string());
+                            }
+                        }
+                    }
+                    out.push(Unit {
+                        start,
+                        end,
+                        reads: tokens(&n).iter().filter_map(unit_name).collect(),
+                        writes,
+                        jumps: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Conditions that decide whether `n` runs: those of the IF and WHILE
+    /// statements around it, and those of earlier IF statements that may jump.
+    fn deciding_conditions(&self, n: &SyntaxNode) -> Vec<Span> {
+        let mut out = Vec::new();
+        let mut cur = n.clone();
+        while let Some(p) = cur.parent() {
+            for s in cur
+                .siblings(rowan::Direction::Prev)
+                .skip(1)
+                .filter(|s| s.kind().is_unit() && self.has_jump(s, n))
+            {
+                for c in s
+                    .descendants()
+                    .filter(|c| c.kind() == SyntaxKind::CONDITION)
+                {
+                    out.push(cst::sig_range(&c));
+                }
+            }
+            for c in p.children().filter(|c| c.kind() == SyntaxKind::CONDITION) {
+                out.push(cst::sig_range(&c));
+            }
+            cur = p;
+        }
+        out
+    }
+
+    /// Why a witness for `n` alone cannot be trusted when the code at
+    /// `changed` differs between the versions too: a value `n` reads, or a
+    /// condition on the way to it, may come from changed code, or what `n`
+    /// writes reaches changed code. The witness gives both versions the same
+    /// inputs at `n` and runs the same code after it, so two edits that
+    /// make up for each other would look like two differences.
+    fn interacts(&self, n: &SyntaxNode, changed: &[Span], reach: &Reach) -> Option<String> {
+        if changed.is_empty() {
+            return None;
+        }
+        let here = cst::sig_range(n);
+        let units = self.units();
+        let changed_unit = |u: &Unit| changed.iter().any(|c| overlaps(*c, (u.start, u.end)));
+        let in_loop_with_n = |u: &Unit| {
+            self.loops
+                .iter()
+                .any(|(ls, le)| *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le)
+        };
+        let others: Vec<&Unit> = units
+            .iter()
+            .filter(|u| !overlaps((u.start, u.end), here))
+            .collect();
+        let before = |u: &Unit| u.end <= here.0 || in_loop_with_n(u);
+        let line = |off: usize| self.side.lines.line_col(off).0;
+
+        // Values at `n` that changed code may have set.
+        let mut tainted: HashSet<String> = HashSet::new();
+        let mut first_change: Option<usize> = None;
+        for u in others.iter().filter(|u| before(u) && changed_unit(u)) {
+            tainted.extend(u.writes.iter().cloned());
+            first_change = Some(first_change.map_or(u.start, |f| f.min(u.start)));
+            // A changed jump on the way that is not evaluated as a guard.
+            if u.jumps && !reach.untraced.is_empty() {
+                return Some(format!(
+                    "the changed jump at line {} may decide whether it runs",
+                    line(u.start)
+                ));
+            }
+        }
+        if let Some(first) = first_change {
+            loop {
+                let mut grew = false;
+                for u in others.iter().filter(|u| before(u) && !changed_unit(u)) {
+                    if meets(&u.reads, &tainted) && !u.writes.is_subset(&tainted) {
+                        tainted.extend(u.writes.iter().cloned());
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            let deciding = self.deciding_conditions(n);
+            let needed: HashSet<String> = units
+                .iter()
+                .filter(|u| {
+                    overlaps((u.start, u.end), here)
+                        || deciding.iter().any(|c| overlaps(*c, (u.start, u.end)))
+                })
+                .flat_map(|u| u.reads.iter().cloned())
+                .collect();
+            if meets(&needed, &tainted) {
+                let mut names: Vec<&String> = needed
+                    .intersection(&tainted)
+                    .filter(|x| x.as_str() != ANY)
+                    .collect();
+                names.sort();
+                return Some(match names.first() {
+                    Some(x) => format!(
+                        "{} may hold a value set by the changed code at line {}",
+                        spell(x),
+                        line(first)
+                    ),
+                    None => format!(
+                        "it reads what the changed code at line {} may write",
+                        line(first)
+                    ),
+                });
+            }
+        }
+
+        // What `n` writes that changed code later reads or overwrites.
+        let seed: HashSet<String> = units
+            .iter()
+            .filter(|u| overlaps((u.start, u.end), here))
+            .flat_map(|u| u.writes.iter().cloned())
+            .collect();
+        self.reaches_change(seed, here, units, changed)
+            .map(|l| format!("its result reaches the changed code at line {l}"))
+    }
+
+    /// The line of the first changed unit after `here` (or in a loop with
+    /// it) that reads or overwrites one of `seed`, directly or through
+    /// unchanged units in between.
+    fn reaches_change(
+        &self,
+        seed: HashSet<String>,
+        here: Span,
+        units: &[Unit],
+        changed: &[Span],
+    ) -> Option<usize> {
+        let changed_unit = |u: &Unit| changed.iter().any(|c| overlaps(*c, (u.start, u.end)));
+        let after = |u: &Unit| {
+            !overlaps((u.start, u.end), here)
+                && (u.start >= here.1
+                    || self.loops.iter().any(|(ls, le)| {
+                        *ls <= u.start && u.end <= *le && *ls <= here.0 && here.1 <= *le
+                    }))
+        };
+        let mut reached: HashSet<String> = seed
+            .into_iter()
+            .filter(|x| !STATUS.contains(&x.as_str()))
+            .collect();
+        if reached.is_empty() {
+            return None;
+        }
+        loop {
+            let mut grew = false;
+            for u in units.iter().filter(|u| after(u) && !changed_unit(u)) {
+                if meets(&u.reads, &reached) {
+                    for w in &u.writes {
+                        if !STATUS.contains(&w.as_str()) && reached.insert(w.clone()) {
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        units
+            .iter()
+            .filter(|u| after(u) && changed_unit(u))
+            .find(|u| {
+                let touched: HashSet<String> = u.reads.union(&u.writes).cloned().collect();
+                u.jumps || meets(&touched, &reached)
+            })
+            .map(|u| self.side.lines.line_col(u.start).0)
+    }
+}
+
 // ---- code that cannot be created --------------------------------------------------
 
 const CMP_OPS: &[&str] = &["<>", "!=", "<", ">", "<=", ">=", "!<", "!>"];
@@ -2221,6 +2574,7 @@ fn examine(
     nb: &SyntaxNode,
     sa: &Schema,
     sb: &Schema,
+    changed: &(Vec<Span>, Vec<Span>),
 ) -> Result<Decided, String> {
     let d = ra.d;
     if na.kind() != nb.kind() {
@@ -2231,7 +2585,7 @@ fn examine(
         return Ok(dec);
     }
     if na.kind() == SyntaxKind::ROUTINE {
-        return header_change(ra, rb, na, nb);
+        return header_change(ra, rb, na, nb, changed);
     }
     let xa = shape(na, d)?;
     let xb = shape(nb, d)?;
@@ -2252,6 +2606,16 @@ fn examine(
     }
     let reach_a = ra.reach(na)?;
     let reach_b = rb.reach(nb)?;
+    // The witness runs this statement alone: other changes must not feed it
+    // or consume what it writes.
+    for (r, n, ch, reach) in [
+        (ra, na, &changed.0, &reach_a),
+        (rb, nb, &changed.1, &reach_b),
+    ] {
+        if let Some(why) = r.interacts(n, ch, reach) {
+            return Err(format!("another change interacts with it: {why}"));
+        }
+    }
     let mut hints = Hints {
         map: HashMap::new(),
         facts: &facts_a,
@@ -2326,6 +2690,7 @@ fn header_change(
     rb: &Routine,
     na: &SyntaxNode,
     nb: &SyntaxNode,
+    others: &(Vec<Span>, Vec<Span>),
 ) -> Result<Decided, String> {
     let d = ra.d;
     let ta = checked_tokens(na).concat();
@@ -2358,6 +2723,19 @@ fn header_change(
     } else {
         spell(&x.name)
     };
+    // The parameter's value must not reach a body change that could make up for it.
+    for (r, n, ch) in [(ra, na, &others.0), (rb, nb, &others.1)] {
+        let body = n
+            .descendants()
+            .find(|b| b.kind() == SyntaxKind::ROUTINE_BODY)
+            .map_or((0, 0), |b| cst::sig_range(&b));
+        let seed = HashSet::from([x.name.trim_start_matches('@').to_lowercase()]);
+        if let Some(l) = r.reaches_change(seed, (body.0, body.0), r.units(), ch) {
+            return Err(format!(
+                "another change interacts with it: {shown} reaches the changed code at line {l}"
+            ));
+        }
+    }
     if x.ty == y.ty && differing == 1 {
         let parse = |s: &Option<String>| -> Option<V> {
             let s = s.as_ref()?;
