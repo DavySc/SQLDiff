@@ -95,6 +95,9 @@ pub struct Unit {
     pub stmts: Vec<LStmt>,
     /// Constructs outside the comparison: (node, description).
     pub uncovered: Vec<(SyntaxNode, String)>,
+    /// A script's top-level `CREATE TABLE` statements, with the number of
+    /// data statements before each.
+    pub tables: Vec<(SyntaxNode, usize)>,
     /// Explicit transaction control or a recognised rollback-and-rethrow protocol.
     pub txn_control: bool,
     /// T-SQL: SET XACT_ABORT ON or a CATCH that rethrows, so a failing
@@ -130,6 +133,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         locals: Vec::new(),
         stmts: Vec::new(),
         uncovered: Vec::new(),
+        tables: Vec::new(),
         txn_control: false,
         stops_on_error: false,
         txn_stmts: Vec::new(),
@@ -150,13 +154,20 @@ pub fn lower(a: &Analyzed) -> Unit {
         [] => walk(&a.root, &mut u),
         [r] => {
             header(r, &mut u);
-            // Statements outside the routine (other than batch separators) are not covered.
+            // Statements outside the routine (other than batch separators) are
+            // not covered, except the tables it creates, compared table against
+            // table before (0) or after (1) the routine.
             for n in a.root.descendants() {
                 if n.kind() == SyntaxKind::STATEMENT
                     && !r.text_range().contains_range(n.text_range())
                 {
-                    u.uncovered
-                        .push((n.clone(), "a statement outside the routine".into()));
+                    if is_create_table(&n, d) {
+                        let after = n.text_range().start() >= r.text_range().end();
+                        u.tables.push((n.clone(), usize::from(after)));
+                    } else {
+                        u.uncovered
+                            .push((n.clone(), "a statement outside the routine".into()));
+                    }
                 }
             }
             for c in r.children() {
@@ -487,6 +498,11 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 from_declare,
             });
         }
+        // A script's own `CREATE TABLE`: compared table against table
+        // (`table.rs`), in its place among the data statements.
+        StmtKind::Ddl if u.kind == UnitKind::Script && is_create_table(c, d) => {
+            u.tables.push((c.clone(), u.stmts.len()));
+        }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
             // `CREATE [OR REPLACE] VIEW name AS query` parsed as one statement.
             let toks = tokens(c);
@@ -547,6 +563,17 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             u.uncovered.push((c.clone(), what));
         }
     }
+}
+
+/// A top-level `CREATE [prefix] TABLE` statement.
+fn is_create_table(c: &SyntaxNode, d: Dialect) -> bool {
+    let words = cst::first_words(c, 3);
+    stmt_kind(c, d) == StmtKind::Ddl
+        && words.first().is_some_and(|w| w == "CREATE")
+        && (words.get(1).is_some_and(|w| w == "TABLE")
+            || words.get(2).is_some_and(|w| w == "TABLE"))
+        && c.parent()
+            .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }
 
 fn note(u: &mut Unit, s: &str) {

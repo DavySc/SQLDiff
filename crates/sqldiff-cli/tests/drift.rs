@@ -277,13 +277,19 @@ fn checks_every_instance_against_the_reference() {
     );
     assert_eq!(r["instances"][0]["ok"], true);
 
-    // A table edited by hand is not decided: the engine cannot compare it.
+    // A table edited by hand is compared column by column: a narrower
+    // column rejects values the original stores.
     let p = d.join("pg/tables/entity.sql");
     let table = std::fs::read_to_string(&p).unwrap();
-    write(&p, &table.replace("Price integer", "Price bigint"));
+    write(&p, &table.replace("Price integer", "Price smallint"));
     let (o, _) = drift(&d, &["--manifest", m.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(status("Customer"), "unknown");
+    assert_eq!(status("Customer"), "differs");
+    // A wider one holds every value, under an assumption about the data.
+    write(&p, &table.replace("Price integer", "Price bigint"));
+    let (o, _) = drift(&d, &["--manifest", m.to_str().unwrap()]);
+    assert_eq!(o.status.code(), Some(0));
+    assert_eq!(status("Customer"), "assumptions");
     write(&p, &table);
 
     // A hand edit that changes what a template means fails the check.

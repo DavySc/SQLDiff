@@ -533,10 +533,12 @@ fn a_table_counts_only_as_the_rules_write_it() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
+    // The engine compares the tables column by column: another type is a
+    // difference.
     for (value, want) in [
-        ("boolean", "unknown"),
-        ("varchar(5)", "unknown"),
-        ("smallint", "unknown"),
+        ("boolean", "differs"),
+        ("varchar(5)", "differs"),
+        ("smallint", "differs"),
         // What the rules write for INT.
         ("integer", "converted"),
     ] {
@@ -574,17 +576,14 @@ fn a_table_counts_only_as_the_rules_write_it() {
         .unwrap();
         let t = instance(&r, "t");
         assert_eq!(t["status"], want, "{value}: {t}");
-        if want == "unknown" {
-            assert!(
-                rules(t).contains(&"ddl.not-as-converted".to_string()),
-                "{t}"
-            );
+        if want == "differs" {
+            assert!(rules(t).contains(&"equiv.column-type".to_string()), "{t}");
         }
     }
 }
 
 #[test]
-fn a_table_in_another_schema_is_not_decided() {
+fn a_table_in_another_schema_differs() {
     let d = scratch("ddl-schema");
     setup(&d);
     // The target names a schema the source table is not in.
@@ -597,11 +596,8 @@ fn a_table_in_another_schema_is_not_decided() {
     .unwrap();
     let (_, r) = instances(&d, &[]);
     let t = instance(&r, "tables/Customer");
-    assert_eq!(t["status"], "unknown", "{t}");
-    assert!(
-        rules(t).contains(&"ddl.not-as-converted".to_string()),
-        "{t}"
-    );
+    assert_eq!(t["status"], "differs", "{t}");
+    assert!(rules(t).contains(&"equiv.table-name".to_string()), "{t}");
 }
 
 /// Customer and TouchCustomer only: both convert.

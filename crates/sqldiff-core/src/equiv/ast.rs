@@ -386,6 +386,11 @@ impl<'a> Parser<'a> {
         self.i >= self.t.len()
     }
 
+    /// How many tokens have been read.
+    pub fn pos(&self) -> usize {
+        self.i
+    }
+
     fn peek(&self) -> Option<&Tok> {
         self.t.get(self.i)
     }

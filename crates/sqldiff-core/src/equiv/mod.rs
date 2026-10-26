@@ -16,6 +16,7 @@ pub mod literal;
 pub mod lower;
 pub mod options;
 pub mod schema;
+pub mod table;
 pub mod term;
 pub mod xwit;
 
@@ -151,6 +152,7 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         }
     }
     signature(&ua, &ub, &na, &nb, &mut out);
+    tables(a, b, &ua, &ub, sa, sb, &mut out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
         out.assume(x.clone());
     }
@@ -200,6 +202,301 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     pair_items(a, b, &ia, &ib, wit.as_ref(), &mut out);
     error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
     out
+}
+
+/// A token made up for a statement built around a table's parts.
+fn synth(kind: ast::K, text: &str) -> ast::Tok {
+    ast::Tok {
+        kind,
+        text: text.to_string(),
+        up: text.to_uppercase(),
+        off: 0,
+    }
+}
+
+/// How two expressions built into statements compare.
+enum Same {
+    Yes(Vec<Assumption>),
+    /// A difference the engine explains: class, rule, witness.
+    No(ChangeClass, &'static str, String),
+    Unknown(String),
+}
+
+/// Compares statement `x` (side A) with `y` (side B) term by term.
+#[allow(clippy::too_many_arguments)]
+fn same_stmt(
+    x: &[ast::Tok],
+    y: &[ast::Tok],
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    na: &str,
+    nb: &str,
+) -> Same {
+    let lowered =
+        |toks: &[ast::Tok], u: &Unit, s: &Schema| -> Result<(Term, Vec<Assumption>), String> {
+            let st = ast::parse_stmt(toks, u.dialect)?;
+            let mut c = Canon::new(u, s);
+            let t = c.stmt(&st)?;
+            Ok((t, std::mem::take(&mut c.asm)))
+        };
+    let (tx, mut asms) = match lowered(x, ua, sa) {
+        Ok(v) => v,
+        Err(e) => return Same::Unknown(format!("{na}: {e}")),
+    };
+    let (ty, by) = match lowered(y, ub, sb) {
+        Ok(v) => v,
+        Err(e) => return Same::Unknown(format!("{nb}: {e}")),
+    };
+    let c = compare::compare(&tx, &ty);
+    for s in by.into_iter().chain(c.assumptions) {
+        if !asms.iter().any(|z| z.id == s.id) {
+            asms.push(s);
+        }
+    }
+    if c.mismatches.is_empty() {
+        return Same::Yes(asms);
+    }
+    for m in &c.mismatches {
+        if let Some((class, rule, witness)) = compare::explain(m, na, nb) {
+            return Same::No(class, rule, witness);
+        }
+    }
+    let m = &c.mismatches[0];
+    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| {
+        format!(
+            "A has `{}` where B has `{}`",
+            compare::render(&m.a),
+            compare::render(&m.b)
+        )
+    }))
+}
+
+/// The rest of the line from byte `off`, white space trimmed.
+fn line_at(side: &Analyzed, off: usize) -> crate::model::Location {
+    let text = &side.artifact.text;
+    let off = off.min(text.len());
+    let end = text[off..].find('\n').map_or(text.len(), |i| off + i);
+    let end = off + text[off..end].trim_end().len();
+    side.location(off, end.max(off + 1).min(text.len().max(off)))
+}
+
+/// Compares the scripts' `CREATE TABLE` statements, in order (`table.rs`).
+#[allow(clippy::too_many_arguments)]
+fn tables(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) {
+    use ast::K;
+    if ua.tables.is_empty() && ub.tables.is_empty() {
+        return;
+    }
+    let (na, nb) = (side_name(a), side_name(b));
+    if ua.tables.len() != ub.tables.len() {
+        for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
+            for (node, _) in &u.tables {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: a CREATE TABLE is not compared: the sides create {} and {} tables",
+                    side.line_of(node),
+                    ua.tables.len(),
+                    ub.tables.len()
+                ));
+            }
+        }
+        return;
+    }
+    for ((xa, pa), (xb, pb)) in ua.tables.iter().zip(&ub.tables) {
+        let (la, lb) = (a.line_of(xa), b.line_of(xb));
+        let unknown = |out: &mut Outcome, why: String| {
+            out.unknown_reasons.push(format!(
+                "{na} line {la}: the CREATE TABLE (and {nb} line {lb}) is not compared: {why}"
+            ));
+        };
+        if pa != pb {
+            unknown(
+                out,
+                format!("it comes after {pa} data statement(s) on one side and {pb} on the other"),
+            );
+            continue;
+        }
+        let (ta, tb) = match (
+            table::parse(&ast::tokens(xa), a.dialect()),
+            table::parse(&ast::tokens(xb), b.dialect()),
+        ) {
+            (Ok(x), Ok(y)) => (x, y),
+            (Err(e), _) => {
+                unknown(out, format!("{na}: {e}"));
+                continue;
+            }
+            (_, Err(e)) => {
+                unknown(out, format!("{nb}: {e}"));
+                continue;
+            }
+        };
+        let anchor = |n: &SyntaxNode| {
+            crate::normalize::hash_strs(std::iter::once(n.text().to_string().as_str()))
+        };
+        let mut decided = true;
+        let finding = |out: &mut Outcome,
+                       rule: &str,
+                       class: ChangeClass,
+                       witness: String,
+                       at: (usize, usize),
+                       asms: Vec<String>| {
+            out.findings.push(Finding {
+                fingerprint: fingerprint(&FingerprintInput {
+                    object: &a.object,
+                    class,
+                    rule,
+                    anchor_a: &format!("{}:{}", anchor(xa), at.0),
+                    anchor_b: &format!("{}:{}", anchor(xb), at.1),
+                }),
+                rule: rule.to_string(),
+                class,
+                severity: class.default_severity(),
+                verdict: Verdict::Different,
+                witness,
+                a: Some(line_at(a, at.0)),
+                b: Some(line_at(b, at.1)),
+                assumptions: asms,
+            });
+        };
+        let mut asms: Vec<Assumption> = Vec::new();
+        let add = |asms: &mut Vec<Assumption>, x: Assumption| {
+            if !asms.iter().any(|y| y.id == x.id) {
+                asms.push(x);
+            }
+        };
+        let mut found = false;
+        let sch = std::cell::OnceCell::new();
+        for e in table::compare(&ta, &tb, &na, &nb) {
+            match e {
+                table::Event::Asm(x) => add(&mut asms, asm::make(x)),
+                table::Event::Note(s) => out.normalize(s),
+                table::Event::Unknown(s) => {
+                    decided = false;
+                    unknown(out, s);
+                }
+                table::Event::Diff { rule, witness, at } => {
+                    found = true;
+                    let ids = asms.iter().map(|x| x.id.clone()).collect();
+                    finding(
+                        out,
+                        rule,
+                        ChangeClass::Semantic,
+                        format!("Tables (A line {la}, B line {lb}) differ: {witness}."),
+                        at,
+                        ids,
+                    );
+                }
+                table::Event::Default {
+                    col,
+                    a: ea,
+                    b: eb,
+                    at,
+                } => {
+                    let select = |e: &[ast::Tok]| {
+                        let mut v = vec![synth(K::Word, "SELECT")];
+                        v.extend(e.iter().cloned());
+                        v
+                    };
+                    match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                        Same::No(class, rule, w) => {
+                            found = true;
+                            finding(
+                                out,
+                                rule,
+                                class,
+                                format!("Tables (A line {la}, B line {lb}) differ in the default of column {col}: {w}"),
+                                at,
+                                Vec::new(),
+                            );
+                        }
+                        Same::Unknown(w) => {
+                            decided = false;
+                            unknown(
+                                out,
+                                format!("the defaults of column {col} were not shown equal: {w}"),
+                            );
+                        }
+                    }
+                }
+                table::Event::Check {
+                    what,
+                    a: ea,
+                    b: eb,
+                    at,
+                } => {
+                    let (sa2, sb2) = sch.get_or_init(|| {
+                        (
+                            sa.with_ddl(&xa.text().to_string(), a.dialect()),
+                            sb.with_ddl(&xb.text().to_string(), b.dialect()),
+                        )
+                    });
+                    // A check rejects the rows its predicate makes false:
+                    // those `WHERE NOT (predicate)` selects.
+                    let rejected = |e: &[ast::Tok], name: &[ast::Tok]| {
+                        let mut v = vec![
+                            synth(K::Word, "SELECT"),
+                            synth(K::Num, "1"),
+                            synth(K::Word, "FROM"),
+                        ];
+                        v.extend(name.iter().cloned());
+                        v.push(synth(K::Word, "WHERE"));
+                        v.push(synth(K::Word, "NOT"));
+                        v.push(synth(K::LParen, "("));
+                        v.extend(e.iter().cloned());
+                        v.push(synth(K::RParen, ")"));
+                        v
+                    };
+                    match same_stmt(
+                        &rejected(&ea, &ta.name_toks),
+                        &rejected(&eb, &tb.name_toks),
+                        ua,
+                        ub,
+                        sa2,
+                        sb2,
+                        &na,
+                        &nb,
+                    ) {
+                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                        Same::No(class, rule, w) => {
+                            found = true;
+                            finding(
+                                out,
+                                rule,
+                                class,
+                                format!("Tables (A line {la}, B line {lb}) differ in the CHECK constraint `{what}`: {w}"),
+                                at,
+                                Vec::new(),
+                            );
+                        }
+                        Same::Unknown(w) => {
+                            decided = false;
+                            unknown(
+                                out,
+                                format!("the CHECK constraint `{what}` was not shown equal: {w}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for x in asms {
+            out.assume(x);
+        }
+        if decided && !found {
+            out.equal += 1;
+            out.structural += 1;
+        }
+    }
 }
 
 /// T-SQL keeps executing a procedure after a statement fails (unless
