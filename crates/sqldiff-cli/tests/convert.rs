@@ -191,3 +191,190 @@ fn a_file_is_only_converted_when_every_unit_is() {
     assert_eq!(status("mixed.sql"), "not_converted");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+fn example_pack() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/examples/pack")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+const ENTITY_TABLE: &[u8] =
+    b"CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL, Price decimal(12, 2) NOT NULL);\n";
+
+#[test]
+fn converts_a_template_tree() {
+    let d = scratch("templates");
+    let src = d.join("src");
+    let out = d.join("out");
+    write(&src.join("tables/entity.tpl"), ENTITY_TABLE);
+    write(
+        &src.join("procs/touch.tpl"),
+        b"<%@include header.sql %>\nCREATE PROCEDURE <%SCHEMA%>.Touch<%ENTITY%> @Id int AS\nBEGIN\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Id = @Id;\nEND\n",
+    );
+    write(
+        &src.join("procs/cost.tpl"),
+        b"CREATE PROCEDURE <%SCHEMA%>.Cost @Id int AS\nBEGIN\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Cost = 0 WHERE Id = @Id;\nEND\n",
+    );
+    write(&src.join("plain.sql"), b"not read: wrong extension\n");
+    let pack = example_pack();
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--extension",
+        ".tpl",
+        "--pack",
+        &pack,
+        "--isolated",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(!out.join("plain.sql").exists());
+
+    let proc = std::fs::read_to_string(out.join("procs/touch.tpl")).unwrap();
+    // A template for the target: placeholders and directives kept.
+    assert!(proc.contains("<%@include header.sql %>"), "{proc}");
+    assert!(
+        proc.contains("PROCEDURE <%SCHEMA%>.Touch<%ENTITY%>(p_id integer)"),
+        "{proc}"
+    );
+    assert!(!proc.to_ascii_lowercase().contains("sqldifftpl"), "{proc}");
+    // The directive assumption is said once, at the top.
+    assert!(
+        proc.starts_with("-- [sqldiff: under assumptions] ASM-TEMPLATE-DIRECTIVE"),
+        "{proc}"
+    );
+    assert_eq!(proc.matches("ASM-TEMPLATE-DIRECTIVE").count(), 1, "{proc}");
+    // The table another template creates binds: Price exists, Cost does not.
+    let lines: Vec<&str> = proc.lines().collect();
+    let at = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap();
+    assert!(!lines[at("SET Price") - 1].contains("differs"), "{proc}");
+    let cost = std::fs::read_to_string(out.join("procs/cost.tpl")).unwrap();
+    assert!(
+        cost.contains(
+            "-- [sqldiff: differs] bind.unknown-column\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Cost"
+        ),
+        "{cost}"
+    );
+
+    let table = std::fs::read_to_string(out.join("tables/entity.tpl")).unwrap();
+    assert!(
+        table.contains("CREATE TABLE <%SCHEMA%>.<%TABLE%> (\n    Id integer NOT NULL,\n    Price numeric(12, 2) NOT NULL\n);"),
+        "{table}"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("conversion-report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["templates"], true);
+    let file = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "procs/touch.tpl")
+        .unwrap();
+    assert_eq!(file["status"], "assumptions");
+    assert_eq!(file["template"]["special_forms"][0], "include");
+    let params: Vec<&str> = file["template"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(params, ["SCHEMA", "ENTITY", "TABLE"]);
+    // Every reported line points at the unit in the annotated output.
+    for u in file["units"].as_array().unwrap() {
+        let l = u["out_line"].as_u64().unwrap() as usize;
+        assert!(
+            !lines[l - 1].trim_start().starts_with("-- [sqldiff:"),
+            "{u}"
+        );
+    }
+    // Reasons quote placeholders as the template writes them.
+    let cost = report["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "procs/cost.tpl")
+        .unwrap();
+    assert_eq!(cost["status"], "differs");
+    let reason = cost["units"][1]["reason"].as_str().unwrap();
+    assert!(reason.contains("<%SCHEMA%>.<%TABLE%>"), "{reason}");
+    assert!(
+        !reason.to_ascii_lowercase().contains("sqldifftpl"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_template_object_two_files_create_is_not_bound() {
+    // Two templates create a table under the same placeholder names: which
+    // one an instance gets is the generator's business, so neither binds.
+    let d = scratch("templates-shared");
+    let src = d.join("src");
+    let out = d.join("out");
+    write(&src.join("a.sql"), ENTITY_TABLE);
+    write(
+        &src.join("b.sql"),
+        b"CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL, Cost decimal(12, 2) NOT NULL);\n",
+    );
+    write(
+        &src.join("p.sql"),
+        b"CREATE PROCEDURE <%SCHEMA%>.P @Id int AS\nBEGIN\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Cost = 0 WHERE Id = @Id;\nEND\n",
+    );
+    let pack = example_pack();
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--pack",
+        &pack,
+        "--isolated",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let p = std::fs::read_to_string(out.join("p.sql")).unwrap();
+    assert!(!p.contains("bind.unknown-column"), "{p}");
+    assert!(p.contains("ASM-TEMPLATE-PLACEHOLDER"), "{p}");
+}
+
+#[test]
+fn template_mode_needs_a_template_syntax() {
+    let d = scratch("templates-nosyntax");
+    let src = d.join("src");
+    write(&src.join("a.sql"), b"SELECT 1;\n");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        d.join("out").to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--isolated",
+    ]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("[template]"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

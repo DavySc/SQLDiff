@@ -62,6 +62,23 @@ The template's fragment (placeholders as `TPL_<NAME>` identifiers, special forms
 sqldiff-gui convert docs/examples/templates/save-entity.tpl.sql --template --pack docs/examples/pack --isolated
 ```
 
+A template with generator directives (special forms such as an include) has them converted as comments, without the text they add, and the text they add can change what the rest means (a header's `SET XACT_ABORT ON`, a declaration, the end of a block). So every unit of such a template carries `ASM-TEMPLATE-DIRECTIVE`: it holds only if the woven output does, and no unit of it counts as converted until the woven instances are checked.
+
+### Template trees
+
+```sh
+sqldiff convert templates/ -o out/ --to postgres --template --pack PACK [--parameter NAME …] [--extension tpl …]
+```
+
+`sqldiff convert --template` converts a whole tree of templates the same way, with the same two passes, catalogs and report as plain files. The output tree holds templates for the target. Every file is read as a template; files without placeholders (an included header, say) come through as plain SQL. `--extension` (repeatable, default `sql`) picks the files when the generator uses another extension.
+
+- **One set of stand-ins for the tree.** All fragments use the same stand-in name for the same placeholder, so a table that `tables/entity.tpl.sql` creates as `<%SCHEMA%>.<%TABLE%>` binds in every template that uses `<%SCHEMA%>.<%TABLE%>`, and a misspelt column there is `bind.unknown-column`.
+- **No binding by guess.** An object whose name holds a placeholder and that more than one file creates (two templates both creating `<%SCHEMA%>.<%TABLE%>`, for different instances) is left out of the catalogs, so nothing binds against the wrong one; the units that use it still carry `ASM-TEMPLATE-PLACEHOLDER`.
+- **The output.** `ASM-TEMPLATE-DIRECTIVE` is written once, as the file's first line, instead of above every unit; every other status line is written as for plain files. Findings, notes and reasons quote placeholders as the template writes them.
+- **The report** says `"templates": true`, and each file lists its placeholders, unresolved candidates and directives under `template`.
+
+A converted template tree is never the last word: a template is right only when every instance the generator weaves from it is, which the instance check verifies.
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.
