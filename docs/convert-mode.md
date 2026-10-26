@@ -78,6 +78,29 @@ sqldiff convert templates/ -o out/ --to postgres --template --pack PACK [--param
 - **The output.** `ASM-TEMPLATE-DIRECTIVE` is written once, as the file's first line, instead of above every unit; every other status line is written as for plain files. Findings, notes and reasons quote placeholders as the template writes them.
 - **The report** says `"templates": true`, and each file lists its placeholders, unresolved candidates and directives under `template`.
 
+### Fragments, routine halves and value kinds
+
+Not every template is whole statements. The pack's `[template]` section says what the rest are, so each converts as what it is:
+
+```toml
+[template]
+# What a placeholder's values are. Default: name.
+values = { KEYTYPE = "type", NOTE = "text", LIMIT = "number", FILTER = "expression" }
+# Templates that hold part of a statement (first match wins). Default: statements.
+fragments = [
+  { glob = "where/**", kind = "predicate" },
+  { glob = "columns/**", kind = "select-list" },
+  { glob = "parts/body*.sql", kind = "routine-body" },
+]
+# A routine's opening and closing templates, converted as one routine.
+pairs = [{ head = "parts/head.sql", foot = "parts/foot.sql" }]
+```
+
+- **Fragment kinds** are `statements`, `predicate` (what follows `WHERE`), `expression` (one value, also `select-list`), `set-list` (what follows `UPDATE … SET`) and `routine-body` (statements inside `BEGIN … END`). A fragment is converted inside a stand-in statement of that kind, from T-SQL only, and cut out again with the template's own leading and trailing white space. If converting it changed the stand-in around it (a declaration hoisted, a parameter added, code moved across its edge), the template is kept as it is and flagged `template.context-leak` (differs): it cannot be converted on its own. Otherwise every unit carries `ASM-TEMPLATE-FRAGMENT`: its names were not bound and its meaning in the woven statement was not checked. The stand-in's table is in the catalogs with unknown columns, so binding against it is never a finding.
+- **A routine-body fragment knows no parameters.** Converted on its own, the T-SQL parameter `@Id` in a body reads as a local variable and becomes `v_id`, while the opening template turns the same parameter into `p_id`. The unit then fails binding (differs), and so do the woven instances: nothing is claimed. Convert such a body by hand, or weave it into its routine before converting.
+- **Pairs** are converted together, as one routine, with a marker between them, and split again at the marker. If the conversion moved code across the marker, both templates are kept as they are and flagged `template.pair-split` (differs). A template is in at most one pair; the bodies woven between the halves are converted on their own, as fragments.
+- **Value kinds**: only `name` values are converted as names (`ASM-TEMPLATE-PLACEHOLDER`, checked against the target's name rules per instance). A `text` or `number` value means the same in every dialect. A `type`, `expression` or `sql` value is dialect code the rules cannot convert, so its unit is a decision (`template.value-per-dialect`): give the target's value in the instance manifest under `params_for`. The instance check discharges that decision, and a dialect-code value given only once, for every dialect, stays an assumption there (`ASM-TEMPLATE-VALUE-SAME`).
+
 A converted template tree is never the last word: a template is right only when every instance the generator weaves from it is, which the instance check verifies.
 
 ### Checking every woven instance
@@ -120,9 +143,10 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | A name a value is part of is a PostgreSQL reserved word unquoted (`Order`, `user`), or longer than 128 characters on Db2 for i | differs |
 | A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
 | A Db2 for i name from a value: no verified reserved-word list is built in (`ASM-DB2I-RESERVED-UNCHECKED`) | under assumptions |
+| A `type`, `expression` or `sql` value with no value of its own for the target (`params_for`) (`ASM-TEMPLATE-VALUE-SAME`) | under assumptions |
 | The source weave does not parse | unknown |
 
-The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE` and `ASM-TEMPLATE-SHARED-VALUES`: the values are known, the includes woven in, and each instance woven with its own values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
+The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE`, `ASM-TEMPLATE-SHARED-VALUES`, `ASM-TEMPLATE-FRAGMENT` and `template.value-per-dialect`: the values are known, the includes and fragments woven in, and each instance woven with its own values. Name checks apply only to `name` values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
 
 With `--woven DIR` (the generator's real output) each source weave must equal its `output` file, ignoring trailing white space, or the instance is not woven (`weave.generator-mismatch`, with the first line that differs), and every file there that no instance names is listed under "not in manifest". That is what shows the manifest describes the generator completely.
 

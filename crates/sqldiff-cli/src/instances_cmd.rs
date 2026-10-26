@@ -181,6 +181,18 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
         .ok_or("instances needs a [template] syntax: give --pack or a sqldiff.toml with one")?;
     let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
     let manifest = Manifest::load(&a.manifest).map_err(|e| e.0)?;
+    let kinds: BTreeMap<String, sqldiff_convert::ValueKind> = def
+        .values
+        .iter()
+        .filter_map(|(n, k)| {
+            let n = if def.ignore_case {
+                n.to_uppercase()
+            } else {
+                n.clone()
+            };
+            Some((n, sqldiff_convert::ValueKind::parse(k)?))
+        })
+        .collect();
     if manifest.instances.is_empty() {
         return Err(format!("{}: no [[instance]]", a.manifest.display()));
     }
@@ -265,6 +277,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
             a.to,
             &opts,
             &a.accept,
+            &kinds,
         )
     });
 
@@ -405,6 +418,7 @@ fn check_instance(
     to: Dialect,
     opts: &Options,
     accepted: &[String],
+    kinds: &BTreeMap<String, sqldiff_convert::ValueKind>,
 ) -> Checked {
     let mut items = Vec::new();
     let weave = |side, w: &Woven, items: &mut Vec<Item>| {
@@ -532,7 +546,40 @@ fn check_instance(
         });
     }
     let engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
-    let spans: Vec<(usize, usize)> = t.values.iter().map(|v| (v.start, v.end)).collect();
+    // Names: only values that are names. Dialect code given once for every
+    // dialect is used unchanged in the target.
+    let kind = |n: &str| {
+        kinds
+            .get(n)
+            .copied()
+            .unwrap_or(sqldiff_convert::ValueKind::Name)
+    };
+    let spans: Vec<(usize, usize)> = t
+        .values
+        .iter()
+        .filter(|v| kind(&v.name) == sqldiff_convert::ValueKind::Name)
+        .map(|v| (v.start, v.end))
+        .collect();
+    let mut reported = BTreeSet::new();
+    for v in &t.values {
+        if kind(&v.name).per_dialect() && !v.per_dialect && reported.insert(&v.name) {
+            items.push(Item {
+                status: Outcome::Assumptions,
+                rule: "ASM-TEMPLATE-VALUE-SAME".into(),
+                side: "target",
+                line: lines_t.line_col(v.start).0,
+                text: format!(
+                    "{}'s value `{}` is {} code given once for every dialect and used unchanged in {}; give it in params_for.{} if {} needs another",
+                    v.name,
+                    &t.text[v.start..v.end],
+                    kind(&v.name).label(),
+                    to.display_name(),
+                    to.id(),
+                    to.display_name()
+                ),
+            });
+        }
+    }
     let mut names = Vec::new();
     for n in sqldiff_convert::names::check_values(&t.text, to, &spans) {
         if let Some(cut) = &n.truncated {
@@ -557,10 +604,14 @@ fn check_instance(
 
 /// Assumptions the woven instances discharge: the values are known, the
 /// includes are woven in, and each instance is woven with its own values.
-const DISCHARGED: [&str; 3] = [
+/// A value for dialect code is checked per instance below, and a fragment
+/// is checked in the woven statement.
+const DISCHARGED: [&str; 5] = [
     "ASM-TEMPLATE-PLACEHOLDER",
     "ASM-TEMPLATE-DIRECTIVE",
     "ASM-TEMPLATE-SHARED-VALUES",
+    "ASM-TEMPLATE-FRAGMENT",
+    "template.value-per-dialect",
 ];
 
 /// What `sqldiff convert` left in the converted templates: its status lines

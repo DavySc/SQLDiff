@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use sqldiff_convert::{Conversion, StandIns, Status};
+use sqldiff_convert::{Conversion, FragmentKind, StandIns, Status, ValueKind};
 use sqldiff_core::catalog::{ddl, Catalog};
 use sqldiff_core::{Dialect, Options};
 use sqldiff_source::compose;
@@ -50,6 +50,50 @@ pub struct TemplateMode {
     /// `--parameter` names; when given, only these (and the pack's
     /// `known_parameters`) are placeholders.
     pub parameters: Option<std::collections::BTreeSet<String>>,
+    /// The pack's value kinds, by placeholder name.
+    pub kinds: Vec<(String, ValueKind)>,
+    /// The pack's fragment kinds, by path glob; the first match wins.
+    pub fragments: Vec<(sqldiff_source::glob::Glob, FragmentKind)>,
+    /// A routine's opening and closing templates, by path.
+    pub pairs: Vec<(String, String)>,
+}
+
+impl TemplateMode {
+    /// The template mode a pack's `[template]` section describes.
+    pub fn new(
+        def: &sqldiff_source::pack::TemplateSyntax,
+        parameters: Option<std::collections::BTreeSet<String>>,
+    ) -> Result<TemplateMode, String> {
+        let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
+        let upper = def.ignore_case;
+        Ok(TemplateMode {
+            kinds: def
+                .values
+                .iter()
+                .map(|(n, k)| {
+                    let n = if upper { n.to_uppercase() } else { n.clone() };
+                    (n, ValueKind::parse(k).expect("the pack checks value kinds"))
+                })
+                .collect(),
+            fragments: def
+                .fragments
+                .iter()
+                .map(|f| {
+                    Ok((
+                        sqldiff_source::glob::Glob::new(&f.glob).map_err(|e| e.0)?,
+                        FragmentKind::parse(&f.kind).expect("the pack checks fragment kinds"),
+                    ))
+                })
+                .collect::<Result<_, String>>()?,
+            pairs: def
+                .pairs
+                .iter()
+                .map(|p| (p.head.clone(), p.foot.clone()))
+                .collect(),
+            placeholders,
+            parameters,
+        })
+    }
 }
 
 /// The rule id of the assumption every unit of a template with generator
@@ -246,7 +290,7 @@ fn convert_templates(
         }
         parsed.push((t, basis));
     }
-    let mut stand = StandIns::new(parsed.iter().map(|(t, _)| t));
+    let mut stand = StandIns::new(parsed.iter().map(|(t, _)| t)).with_kinds(tm.kinds.clone());
     if !a.no_catalog {
         stand = stand.bound_across();
     }
@@ -263,8 +307,65 @@ fn convert_templates(
             stem,
         ))
     });
-    let drafts = parallel(jobs, &parsed, |(t, _)| {
-        sqldiff_convert::rewrite_template(t, a.from, a.to, &stand, source.as_deref())
+
+    // What to convert: each file alone, as its fragment kind, except a
+    // routine's opening and closing templates, which go together with a
+    // marker line between them.
+    let index = |rel: &str| inputs.iter().position(|i| i.rel == rel);
+    let mut marker = String::from("sqldiffpair");
+    while inputs
+        .iter()
+        .any(|i| i.text.to_ascii_lowercase().contains(&marker))
+    {
+        marker.push('x');
+    }
+    let marker = format!("/*{marker}*/");
+    let mut paired = vec![false; inputs.len()];
+    let mut jobs_list: Vec<Job> = Vec::new();
+    for (head, foot) in &tm.pairs {
+        let (Some(h), Some(f)) = (index(head), index(foot)) else {
+            return Err(format!(
+                "template pair {head} + {foot}: both must be files in {}",
+                a.src.display()
+            ));
+        };
+        paired[h] = true;
+        paired[f] = true;
+        let text = format!("{}\n{marker}\n{}", inputs[h].text, inputs[f].text);
+        let (t, basis) = tm.placeholders.parse(&text, a.from, tm.parameters.as_ref());
+        jobs_list.push(Job {
+            template: t,
+            basis,
+            kind: FragmentKind::Statements,
+            target: Target::Pair(h, f),
+        });
+    }
+    for (k, (t, basis)) in parsed.into_iter().enumerate() {
+        if paired[k] {
+            continue;
+        }
+        let kind = tm
+            .fragments
+            .iter()
+            .find(|(g, _)| g.is_match(&inputs[k].rel))
+            .map_or(FragmentKind::Statements, |(_, kind)| *kind);
+        jobs_list.push(Job {
+            template: t,
+            basis,
+            kind,
+            target: Target::File(k),
+        });
+    }
+
+    let drafts = parallel(jobs, &jobs_list, |j| {
+        sqldiff_convert::rewrite_template_as(
+            &j.template,
+            j.kind,
+            a.from,
+            a.to,
+            &stand,
+            source.as_deref(),
+        )
     });
     let mut opts = Options::default();
     if let Some(source) = source {
@@ -276,16 +377,46 @@ fn convert_templates(
             stem,
         ))];
     }
-    let work = slots(parsed.iter().zip(drafts));
+    let work = slots(jobs_list.iter().zip(drafts));
     let progress = Progress::new(work.len());
     let delimiters = tm.placeholders.delimiters();
-    Ok(parallel(jobs, &work, |w| {
-        let ((t, basis), draft) = w.lock().unwrap().take().unwrap();
+    let done = parallel(jobs, &work, |w| {
+        let (j, draft) = w.lock().unwrap().take().unwrap();
         let t0 = Instant::now();
-        let c = sqldiff_convert::check_template(t, draft, &stand, &opts, *basis, delimiters);
+        let c =
+            sqldiff_convert::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
         progress.tick();
         (c, t0.elapsed().as_secs_f64())
-    }))
+    });
+    let mut out: Vec<Option<(Conversion, f64)>> = (0..inputs.len()).map(|_| None).collect();
+    for (j, (c, secs)) in jobs_list.iter().zip(done) {
+        match j.target {
+            Target::File(k) => out[k] = Some((c, secs)),
+            Target::Pair(h, f) => {
+                let (ch, cf) =
+                    sqldiff_convert::split_pair(c, &inputs[h].text, &inputs[f].text, &marker);
+                out[h] = Some((ch, secs / 2.0));
+                out[f] = Some((cf, secs / 2.0));
+            }
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|c| c.expect("every file is converted"))
+        .collect())
+}
+
+/// One conversion: a file, or a routine's opening and closing templates.
+struct Job {
+    template: Template,
+    basis: sqldiff_core::composition::PlaceholderBasis,
+    kind: FragmentKind,
+    target: Target,
+}
+
+enum Target {
+    File(usize),
+    Pair(usize, usize),
 }
 
 /// Items handed out once each to the worker threads.

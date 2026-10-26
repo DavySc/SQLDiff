@@ -1317,10 +1317,15 @@ impl<'a> Cx<'a> {
         )
     }
 
-    /// The statement without its terminator.
+    /// The statement without its terminator. A block comment just before
+    /// it stays (a template's directive stands in as one); a line comment
+    /// there cannot, since the terminator would end up inside it.
     fn body_toks(ts: &[T]) -> Vec<T> {
         let mut v: Vec<T> = trimmed(ts).to_vec();
-        while v.last().is_some_and(|t| t.k == SEMICOLON || !t.sig()) {
+        while v
+            .last()
+            .is_some_and(|t| t.k == SEMICOLON || !t.sig() && t.k != BLOCK_COMMENT)
+        {
             v.pop();
         }
         v

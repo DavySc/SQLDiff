@@ -320,3 +320,146 @@ fn what_the_diff_cannot_decide_holds_an_instance_back() {
     assert_ne!(t["status"], "converted", "{t}");
     assert_ne!(t["status"], "assumptions", "{t}");
 }
+
+/// A pack that declares value kinds, fragment kinds and a head/foot pair.
+const KINDS_PACK: &str = r#"
+[pack]
+name = "kinds"
+version = "0.1.0"
+schema = 1
+
+[template]
+open = "<%"
+close = "%>"
+name_pattern = "[A-Z_][A-Z0-9_]*"
+special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
+include = "include"
+values = { KEYTYPE = "type" }
+fragments = [{ glob = "where/**", kind = "predicate" }, { glob = "parts/body*.sql", kind = "routine-body" }]
+pairs = [{ head = "parts/head.sql", foot = "parts/foot.sql" }]
+"#;
+
+const KINDS_MANIFEST: &str = r#"
+[params]
+SCHEMA = "dbo"
+TABLE = "Item"
+[params_for.postgres]
+SCHEMA = "public"
+
+[[instance]]
+name = "table"
+template = "q/table.sql"
+
+[[instance]]
+name = "list"
+template = "q/list.sql"
+
+[[instance]]
+name = "save"
+parts = ["parts/head.sql", "parts/body.sql", "parts/foot.sql"]
+params = { KEYTYPE = "int" }
+params_for.postgres = { KEYTYPE = "integer" }
+
+[[instance]]
+name = "save-same"
+parts = ["parts/head.sql", "parts/body.sql", "parts/foot.sql"]
+params = { KEYTYPE = "int" }
+"#;
+
+#[test]
+fn fragments_pairs_and_value_kinds() {
+    let d = scratch("kinds");
+    let (src, conv) = (d.join("src"), d.join("conv"));
+    let pack = d.join("pack.toml");
+    write(&pack, KINDS_PACK);
+    write(&d.join("instances.toml"), KINDS_MANIFEST);
+    write(
+        &src.join("q/table.sql"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL, Price int NOT NULL);\n",
+    );
+    write(
+        &src.join("q/list.sql"),
+        "SELECT Id FROM <%SCHEMA%>.<%TABLE%> WHERE Id > 0 AND <%@include where/positive.sql %>;\n",
+    );
+    write(&src.join("where/positive.sql"), "Price > 0\n");
+    write(
+        &src.join("parts/head.sql"),
+        "CREATE PROCEDURE <%SCHEMA%>.Save<%TABLE%> @Key <%KEYTYPE%> AS\nBEGIN\n",
+    );
+    write(
+        &src.join("parts/body.sql"),
+        "  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Price < 0;\n",
+    );
+    write(&src.join("parts/foot.sql"), "END\n");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--isolated",
+    ]);
+    assert!(
+        o.status.code().is_some(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let read = |p: &str| std::fs::read_to_string(conv.join(p)).unwrap();
+    // A predicate converts as a predicate, with the template's own edges.
+    assert_eq!(read("where/positive.sql").lines().last(), Some("Price > 0"));
+    // A routine body converts inside a stand-in routine.
+    let body = read("parts/body.sql");
+    assert!(
+        body.ends_with("  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Price < 0;\n"),
+        "{body}"
+    );
+    // Head and foot convert as one routine, split again.
+    let head = read("parts/head.sql");
+    assert!(
+        head.contains("PROCEDURE <%SCHEMA%>.Save<%TABLE%>(p_key <%KEYTYPE%>)"),
+        "{head}"
+    );
+    // A type value cannot be converted by the rules: a decision.
+    assert!(head.contains("template.value-per-dialect"), "{head}");
+    assert!(
+        read("parts/foot.sql").contains("$$"),
+        "{}",
+        read("parts/foot.sql")
+    );
+
+    let (manifest, out) = (d.join("instances.toml"), d.join("out"));
+    let args = [
+        "instances",
+        manifest.to_str().unwrap(),
+        "--source",
+        src.to_str().unwrap(),
+        "--target",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "-o",
+        out.to_str().unwrap(),
+        "--pack",
+        pack.to_str().unwrap(),
+        "--isolated",
+    ];
+    let o = run(&args);
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/instance-report.json")).unwrap())
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
+    // The woven instances discharge the fragment and decision notes.
+    for name in ["table", "list", "save"] {
+        let i = instance(&r, name);
+        assert_eq!(i["status"], "converted", "{name}: {i}");
+    }
+    let woven = std::fs::read_to_string(d.join("out/target/save.sql")).unwrap();
+    assert!(woven.contains("(p_key integer)"), "{woven}");
+    // A type given once for every dialect is an assumption.
+    let same = instance(&r, "save-same");
+    assert_eq!(same["status"], "assumptions", "{same}");
+    assert_eq!(rules(same), ["ASM-TEMPLATE-VALUE-SAME"]);
+}

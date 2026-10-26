@@ -94,6 +94,16 @@ impl Params {
         Ok(Params { all, by_dialect })
     }
 
+    fn dialect_names(&self, d: Dialect, ignore_case: bool, into: &mut BTreeSet<String>) {
+        for k in self.by_dialect.get(&d).into_iter().flat_map(|v| v.keys()) {
+            into.insert(if ignore_case {
+                k.to_uppercase()
+            } else {
+                k.clone()
+            });
+        }
+    }
+
     fn names(&self) -> impl Iterator<Item = &String> {
         self.all
             .keys()
@@ -228,6 +238,21 @@ impl Manifest {
         }
         v
     }
+
+    /// The names given a value for dialect `d` itself, at any level.
+    pub fn dialect_names(
+        &self,
+        i: &Instance,
+        p: &Part,
+        d: Dialect,
+        ignore_case: bool,
+    ) -> BTreeSet<String> {
+        let mut n = BTreeSet::new();
+        for level in [&self.params, &i.params, &p.params] {
+            level.dialect_names(d, ignore_case, &mut n);
+        }
+        n
+    }
 }
 
 /// A relative path that stays inside its root, with `/` separators. A `\`
@@ -255,6 +280,8 @@ pub struct Value {
     pub start: usize,
     pub end: usize,
     pub name: String,
+    /// The value was given for this dialect itself (`params_for`).
+    pub per_dialect: bool,
 }
 
 /// One woven instance in one dialect.
@@ -289,8 +316,9 @@ impl Weaver<'_> {
         let ci = self.placeholders.ignore_case();
         for p in &i.parts {
             let values = m.values(i, p, self.dialect, ci);
+            let own = m.dialect_names(i, p, self.dialect, ci);
             let mut stack = Vec::new();
-            self.file(&p.template, None, &values, &mut w, &mut stack);
+            self.file(&p.template, None, (&values, &own), &mut w, &mut stack);
         }
         w
     }
@@ -300,7 +328,7 @@ impl Weaver<'_> {
         &self,
         rel: &str,
         from: Option<&str>,
-        values: &Values,
+        values: (&Values, &BTreeSet<String>),
         w: &mut Woven,
         stack: &mut Vec<String>,
     ) {
@@ -341,7 +369,7 @@ impl Weaver<'_> {
                     w.unresolved.push(format!("{rel}: `{}`", t.slice(s)));
                     w.text.push_str(t.slice(s));
                 }
-                SegmentKind::Placeholder { name } => match values.get(name) {
+                SegmentKind::Placeholder { name } => match values.0.get(name) {
                     Some(v) => {
                         let start = w.text.len();
                         w.text.push_str(v);
@@ -349,6 +377,7 @@ impl Weaver<'_> {
                             start,
                             end: w.text.len(),
                             name: name.clone(),
+                            per_dialect: values.1.contains(name),
                         });
                     }
                     None => {
@@ -427,6 +456,9 @@ mod tests {
             placeholders: Some("pattern".into()),
             unquoted_name_pattern: None,
             include: Some("include".into()),
+            values: Default::default(),
+            fragments: vec![],
+            pairs: vec![],
         })
         .unwrap()
     }

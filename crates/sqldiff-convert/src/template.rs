@@ -39,6 +39,137 @@ pub struct TemplateInfo {
     pub special_forms: Vec<String>,
 }
 
+/// What a parameter's values are (`[template] values` in the pack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueKind {
+    /// A name (the default): converted as one, so every value must be a
+    /// name the target accepts there (`ASM-TEMPLATE-PLACEHOLDER`).
+    Name,
+    /// Text inside a string, or a number: the same in every dialect, no
+    /// name rules apply.
+    Text,
+    Number,
+    /// Dialect code the rules cannot convert: its value must be given per
+    /// dialect (`template.value-per-dialect`).
+    Type,
+    Expression,
+    Sql,
+}
+
+impl ValueKind {
+    pub fn parse(s: &str) -> Option<ValueKind> {
+        Some(match s {
+            "name" => ValueKind::Name,
+            "text" => ValueKind::Text,
+            "number" => ValueKind::Number,
+            "type" => ValueKind::Type,
+            "expression" => ValueKind::Expression,
+            "sql" => ValueKind::Sql,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ValueKind::Name => "name",
+            ValueKind::Text => "text",
+            ValueKind::Number => "number",
+            ValueKind::Type => "type",
+            ValueKind::Expression => "expression",
+            ValueKind::Sql => "sql",
+        }
+    }
+
+    /// Dialect code: the same value cannot be assumed to work in another
+    /// dialect.
+    pub fn per_dialect(self) -> bool {
+        matches!(
+            self,
+            ValueKind::Type | ValueKind::Expression | ValueKind::Sql
+        )
+    }
+}
+
+/// What a template holds when it is not whole statements
+/// (`[[template.fragments]]` in the pack). Such a fragment is converted
+/// inside a fixed stand-in statement; the converted stand-in must come out
+/// exactly as it does around a neutral fragment, or the conversion reached
+/// across the fragment's edge (hoisted a declaration, added a parameter)
+/// and the fragment cannot be converted on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FragmentKind {
+    Statements,
+    /// A search condition, as after WHERE.
+    Predicate,
+    /// An expression or a select list.
+    Expression,
+    /// Assignments, as after UPDATE … SET.
+    SetList,
+    /// Statements inside a procedure body.
+    RoutineBody,
+}
+
+impl FragmentKind {
+    pub fn parse(s: &str) -> Option<FragmentKind> {
+        Some(match s {
+            "statements" => FragmentKind::Statements,
+            "predicate" => FragmentKind::Predicate,
+            "expression" | "select-list" => FragmentKind::Expression,
+            "set-list" => FragmentKind::SetList,
+            "routine-body" => FragmentKind::RoutineBody,
+            _ => return None,
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FragmentKind::Statements => "statements",
+            FragmentKind::Predicate => "predicate",
+            FragmentKind::Expression => "expression",
+            FragmentKind::SetList => "set-list",
+            FragmentKind::RoutineBody => "routine-body",
+        }
+    }
+
+    /// The stand-in statement in T-SQL: text before the fragment (ending in
+    /// the start marker, on one line so the fragment keeps its line numbers),
+    /// a neutral fragment that converts as written, and the text after. The
+    /// table is in a schema nothing defines, so names in the fragment are
+    /// not bound against anything.
+    fn harness(self, stem: &str) -> Option<(String, &'static str, String)> {
+        let (t, m) = (format!("{stem}hs.{stem}h"), format!("/*{stem}hb*/"));
+        Some(match self {
+            FragmentKind::Statements => return None,
+            FragmentKind::Predicate => (
+                format!("SELECT 1 FROM {t} WHERE {m} "),
+                "1 = 1",
+                ";\n".into(),
+            ),
+            FragmentKind::Expression => (format!("SELECT {m} "), "1", format!(" FROM {t};\n")),
+            FragmentKind::SetList => (format!("UPDATE {t} SET {m} "), "x = 1", ";\n".into()),
+            FragmentKind::RoutineBody => (
+                format!("CREATE PROCEDURE {t} AS BEGIN {m} "),
+                "UPDATE x SET x = 1;",
+                "\nEND\n".into(),
+            ),
+        })
+    }
+}
+
+/// The stand-in statement around a fragment, and what the same statement
+/// converts to around the neutral fragment.
+#[derive(Debug, Clone)]
+struct Harness {
+    kind: FragmentKind,
+    /// The fragment's byte range in the harnessed fragment text.
+    frag: (usize, usize),
+    /// The converted stand-in before and after the neutral fragment; `None`
+    /// when the stand-in itself did not convert as expected.
+    around: Option<(String, String)>,
+}
+
 /// One replacement in the output: old byte range, new text.
 struct Swap {
     old: (usize, usize),
@@ -56,6 +187,8 @@ pub struct StandIns {
     names: Vec<String>,
     /// The catalogs bind stand-in names across templates.
     across: bool,
+    /// Value kinds by placeholder name; a name not here is a name.
+    kinds: std::collections::BTreeMap<String, ValueKind>,
 }
 
 impl StandIns {
@@ -78,7 +211,19 @@ impl StandIns {
             stem,
             names,
             across: false,
+            kinds: Default::default(),
         }
+    }
+
+    /// The pack's value kinds, by placeholder name as the templates' parse
+    /// keeps it (upper case under `ignore_case`).
+    pub fn with_kinds(mut self, kinds: impl IntoIterator<Item = (String, ValueKind)>) -> StandIns {
+        self.kinds.extend(kinds);
+        self
+    }
+
+    fn kind(&self, name: &str) -> ValueKind {
+        self.kinds.get(name).copied().unwrap_or(ValueKind::Name)
     }
 
     /// Says that the catalogs given to [`check_template`] were built from
@@ -108,6 +253,7 @@ pub struct TemplateDraft {
     written: Vec<String>,
     /// Special forms: template byte range and form name.
     specials: Vec<(usize, usize, String)>,
+    harness: Option<Harness>,
 }
 
 impl TemplateDraft {
@@ -193,13 +339,66 @@ pub fn rewrite_template(
     stand: &StandIns,
     source: Option<&Catalog>,
 ) -> TemplateDraft {
-    let (frag, written, specials) = fragment(t, stand);
+    rewrite_template_as(t, FragmentKind::Statements, from, to, stand, source)
+}
+
+/// [`rewrite_template`] for a template that holds a `kind` of fragment: it
+/// is converted inside a stand-in statement (T-SQL sources only, the only
+/// ones with rules).
+pub fn rewrite_template_as(
+    t: &Template,
+    kind: FragmentKind,
+    from: Dialect,
+    to: Dialect,
+    stand: &StandIns,
+    source: Option<&Catalog>,
+) -> TemplateDraft {
+    let (mut frag, written, specials) = fragment(t, stand);
+    let harness = match kind.harness(&stand.stem) {
+        Some((pre, neutral, post)) if from == Dialect::Tsql => {
+            let marker = format!("/*{}hb*/", stand.stem);
+            let base = rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source);
+            let base = base.output();
+            let around = base.find(&marker).and_then(|m| {
+                let m = m + marker.len();
+                let n = m + base[m..].find(neutral)?;
+                Some((base[..m].to_string(), base[n + neutral.len()..].to_string()))
+            });
+            let (p, f) = (pre.len(), frag.text.len());
+            let mut spans = vec![MapSpan {
+                src: (0, 0),
+                dst: (0, p),
+                exact: false,
+            }];
+            spans.extend(frag.map.spans.iter().map(|m| MapSpan {
+                src: m.src,
+                dst: (m.dst.0 + p, m.dst.1 + p),
+                exact: m.exact,
+            }));
+            spans.push(MapSpan {
+                src: (t.text.len(), t.text.len()),
+                dst: (p + f, p + f + post.len()),
+                exact: false,
+            });
+            frag = Derived {
+                text: format!("{pre}{}{post}", frag.text),
+                map: OffsetMap { spans },
+            };
+            Some(Harness {
+                kind,
+                frag: (p, p + f),
+                around,
+            })
+        }
+        _ => None,
+    };
     let draft = rewrite_in(&frag.text, from, to, source);
     TemplateDraft {
         frag,
         draft,
         written,
         specials,
+        harness,
     }
 }
 
@@ -220,11 +419,59 @@ pub fn check_template(
         draft,
         written,
         specials,
+        harness,
     } = d;
     let (from, to) = (draft.from, draft.to);
     let stem = &stand.stem;
     let names = t.parameters();
+    // The stand-in statement's table exists, with columns nobody knows, on
+    // a side that binds against a catalog: it is not the fragment's problem.
+    let mut with_harness;
+    let opts = if harness.is_some() {
+        with_harness = opts.clone();
+        let table = |d: Dialect| {
+            let mut c = Catalog::default();
+            let ident = |n: String| sqldiff_core::catalog::Ident::plain(n).stored(d);
+            let mut tb = sqldiff_core::catalog::Table::new(
+                Some(ident(format!("{stem}hs"))),
+                ident(format!("{stem}h")),
+                sqldiff_core::catalog::TableKind::Table,
+            );
+            tb.columns_known = false;
+            c.put_table(d, tb);
+            std::sync::Arc::new(c)
+        };
+        if !opts.facts_a.is_empty() || !opts.catalog_a.is_empty() {
+            with_harness.facts_a.push(table(from));
+        }
+        if !opts.facts_b.is_empty() || !opts.catalog_b.is_empty() {
+            with_harness.facts_b.push(table(to));
+        }
+        &with_harness
+    } else {
+        opts
+    };
     let mut c = check(&frag.text, draft, opts);
+    if let Some(h) = &harness {
+        let mid = h.around.as_ref().and_then(|(pre, post)| {
+            let o = &c.output;
+            (o.len() >= pre.len() + post.len()
+                && o.starts_with(pre.as_str())
+                && o.ends_with(post.as_str()))
+            .then(|| (pre.len(), o.len() - post.len()))
+        });
+        match mid {
+            Some(mid) => {
+                // The converted statement's layout around the fragment is
+                // not the fragment's: keep the template's own edges.
+                let body = t.text.trim();
+                let lead = &t.text[..t.text.len() - t.text.trim_start().len()];
+                let trail = &t.text[lead.len() + body.len()..];
+                strip(&mut c, mid, h.frag, (lead, trail))
+            }
+            None => return leaked(t, c, h.kind, &specials),
+        }
+    }
 
     // Put the placeholders and special forms back.
     let re = Regex::new(&format!(r"(?i-u)/\*{stem}s(\d+)z\*/|{stem}(\d+)z"))
@@ -280,11 +527,11 @@ pub fn check_template(
 
     let (li, lo) = (LineIndex::new(&t.text), LineIndex::new(&out));
     let out_lower = out.to_ascii_lowercase();
-    let placeholder_spans: Vec<(usize, usize, &str)> = t
+    let placeholder_spans: Vec<(usize, usize, &str, &str)> = t
         .segments
         .iter()
         .filter_map(|s| match &s.kind {
-            SegmentKind::Placeholder { .. } => Some((s.start, s.end, t.slice(s))),
+            SegmentKind::Placeholder { name } => Some((s.start, s.end, t.slice(s), name.as_str())),
             _ => None,
         })
         .collect();
@@ -313,11 +560,41 @@ pub fn check_template(
                 ),
             });
         }
+        if let Some(h) = &harness {
+            u.notes.push(Note {
+                status: Status::Assumptions,
+                rule: "ASM-TEMPLATE-FRAGMENT".into(),
+                text: format!(
+                    "This {} was converted inside a stand-in statement: its names were not bound and its meaning in the woven statement was not checked, so check the woven instances.",
+                    h.kind.label()
+                ),
+            });
+        }
         let mut used: Vec<&str> = Vec::new();
-        for (s, e, p) in &placeholder_spans {
-            if *s < se && ss < *e && !used.contains(p) {
-                used.push(p);
+        let mut per_dialect: Vec<(&str, ValueKind)> = Vec::new();
+        for (s, e, p, name) in &placeholder_spans {
+            if !(*s < se && ss < *e) {
+                continue;
             }
+            match stand.kind(name) {
+                ValueKind::Name if !used.contains(p) => used.push(p),
+                k if k.per_dialect() && !per_dialect.iter().any(|(q, _)| q == p) => {
+                    per_dialect.push((p, k))
+                }
+                _ => {}
+            }
+        }
+        for (p, k) in &per_dialect {
+            u.notes.push(Note {
+                status: Status::Decision,
+                rule: "template.value-per-dialect".into(),
+                text: format!(
+                    "{p} holds {} {}, which the rules cannot convert: give its {} value per dialect in the instance manifest (params_for) and check the woven instances.",
+                    if k.label().starts_with('e') { "an" } else { "a" },
+                    k.label(),
+                    to.display_name()
+                ),
+            });
         }
         if !used.is_empty() {
             u.notes.push(Note {
@@ -401,7 +678,8 @@ pub fn check_template(
             }
             .unwrap_or_else(|| m[0].to_string())
         })
-        .into_owned()
+        .replace(&format!("{stem}hs.{stem}h."), "")
+        .replace(&format!("{stem}hs.{stem}h"), "the woven statement's table")
     };
     for u in &mut c.units {
         for n in &mut u.notes {
@@ -446,4 +724,220 @@ pub fn check_template(
     });
     recount(&mut c);
     c
+}
+
+/// Cuts a harnessed conversion down to the fragment: the output to `mid`,
+/// the units and findings to those about the fragment (`frag` in the
+/// harnessed input). A finding attached to a unit that stays, stays, even
+/// if it points into the stand-in, so nothing that gated a unit is lost.
+/// The white space at the output's edges becomes `edges`, the template's.
+fn strip(c: &mut Conversion, mid: (usize, usize), frag: (usize, usize), edges: (&str, &str)) {
+    let inner = &c.output[mid.0..mid.1];
+    let b = mid.0 + (inner.len() - inner.trim_start().len());
+    let e = (mid.1 - (inner.len() - inner.trim_end().len())).max(b);
+    let moved = |off: usize| off.clamp(b, e) - b + edges.0.len();
+    let hits = |s: usize, t: usize, r: (usize, usize)| s < r.1 && r.0 < t.max(s + 1);
+    let keep: Vec<bool> = c
+        .units
+        .iter()
+        .map(|u| hits(u.out.start, u.out.end, mid) || hits(u.src.start, u.src.end, frag))
+        .collect();
+    let mut attached = std::collections::BTreeSet::new();
+    let mut attached_own = std::collections::BTreeSet::new();
+    for (u, k) in c.units.iter().zip(&keep) {
+        if *k {
+            attached.extend(u.findings.iter().copied());
+            attached_own.extend(u.output_findings.iter().copied());
+        }
+    }
+    let clamp = |loc: &mut sqldiff_core::model::Location| {
+        loc.byte_start = moved(loc.byte_start);
+        loc.byte_end = moved(loc.byte_end);
+    };
+    // The engine's diff.
+    let mut new_index = vec![None; c.report.findings.len()];
+    let mut findings = Vec::new();
+    for (i, mut f) in std::mem::take(&mut c.report.findings)
+        .into_iter()
+        .enumerate()
+    {
+        let in_frag =
+            f.a.as_ref()
+                .is_some_and(|l| hits(l.byte_start, l.byte_end, frag));
+        let in_mid =
+            f.b.as_ref()
+                .is_some_and(|l| hits(l.byte_start, l.byte_end, mid));
+        if !(attached.contains(&i) || in_frag || in_mid) {
+            continue;
+        }
+        if let Some(l) = f.b.as_mut() {
+            clamp(l);
+        }
+        new_index[i] = Some(findings.len());
+        findings.push(f);
+    }
+    c.report.findings = findings;
+    // The output's own check.
+    let mut new_own = vec![None; c.output_check.findings.len()];
+    let mut own = Vec::new();
+    for (i, mut f) in std::mem::take(&mut c.output_check.findings)
+        .into_iter()
+        .enumerate()
+    {
+        let located = f.a.as_ref().map(|l| hits(l.byte_start, l.byte_end, mid));
+        if !(attached_own.contains(&i) || located != Some(false)) {
+            continue;
+        }
+        if let Some(l) = f.a.as_mut() {
+            clamp(l);
+        }
+        new_own[i] = Some(own.len());
+        own.push(f);
+    }
+    c.output_check.findings = own;
+    c.unplaced = c.unplaced.iter().filter_map(|&i| new_own[i]).collect();
+    let units = std::mem::take(&mut c.units);
+    c.units = units
+        .into_iter()
+        .zip(keep)
+        .filter(|(_, k)| *k)
+        .map(|(mut u, _)| {
+            u.out.start = moved(u.out.start);
+            u.out.end = moved(u.out.end);
+            u.findings = u.findings.iter().filter_map(|&i| new_index[i]).collect();
+            u.output_findings = u
+                .output_findings
+                .iter()
+                .filter_map(|&i| new_own[i])
+                .collect();
+            u
+        })
+        .collect();
+    c.output = format!("{}{}{}", edges.0, &c.output[b..e], edges.1);
+}
+
+/// A fragment whose conversion reached across its edges: the template is
+/// kept as it is, one unit that differs, and nothing else is claimed.
+fn leaked(
+    t: &Template,
+    mut c: Conversion,
+    kind: FragmentKind,
+    specials: &[(usize, usize, String)],
+) -> Conversion {
+    let why = format!(
+        "Converting this {} changed the stand-in statement around it (a declaration hoisted, a parameter added, or code moved across its edge), so it cannot be converted on its own: convert it by hand and check the woven instances.",
+        kind.label()
+    );
+    let li = LineIndex::new(&t.text);
+    let all = span(&t.text, &li, (0, t.text.len()));
+    c.units = vec![crate::Unit {
+        status: Status::Differs,
+        notes: vec![Note {
+            status: Status::Differs,
+            rule: "template.context-leak".into(),
+            text: why.clone(),
+        }],
+        src: all,
+        out: all,
+        findings: Vec::new(),
+        output_findings: Vec::new(),
+        checked: Status::Differs,
+    }];
+    c.report.findings.clear();
+    c.report
+        .unknown_reasons
+        .push(format!("converted template: {why}"));
+    c.report.verdict = sqldiff_core::session::derive_verdict(&c.report);
+    c.output_check.findings.clear();
+    c.unplaced.clear();
+    c.output = t.text.clone();
+    c.template = Some(TemplateInfo {
+        parameters: t.parameters(),
+        unresolved: t.unresolved().map(|s| t.slice(s).to_string()).collect(),
+        special_forms: specials.iter().map(|(_, _, f)| f.clone()).collect(),
+    });
+    recount(&mut c);
+    c
+}
+
+/// Splits the conversion of a routine's opening and closing templates,
+/// converted together as `head`, a line holding only `marker` (a comment
+/// that occurs nowhere else), and `foot`, into one conversion per template.
+/// A unit that reaches across the marker, or a marker that did not come
+/// through exactly once, leaves both templates unconverted and differing.
+pub fn split_pair(c: Conversion, head: &str, foot: &str, marker: &str) -> (Conversion, Conversion) {
+    let foot_in = head.len() + 1 + marker.len() + 1;
+    let found = (c.output.matches(marker).count() == 1)
+        .then(|| c.output.find(marker))
+        .flatten();
+    let crosses = |s: usize, e: usize, cut: (usize, usize)| s < cut.0 && e > cut.1;
+    let cut = found.map(|m| {
+        let line = c.output[..m].rfind('\n').map_or(0, |i| i + 1);
+        let next = c.output[m..]
+            .find('\n')
+            .map_or(c.output.len(), |i| m + i + 1);
+        (line, next)
+    });
+    let ok = cut.is_some_and(|(line, next)| {
+        !c.units.iter().any(|u| {
+            crosses(u.src.start, u.src.end, (head.len(), foot_in))
+                || crosses(u.out.start, u.out.end, (line, next))
+        })
+    });
+    let part = |text: &str, out: String, units: Vec<crate::Unit>| {
+        let mut p = c.clone();
+        p.output = out;
+        let (li, lo) = (LineIndex::new(text), LineIndex::new(&p.output));
+        p.units = units
+            .into_iter()
+            .map(|mut u| {
+                u.src = span(text, &li, (u.src.start, u.src.end));
+                u.out = span(&p.output, &lo, (u.out.start, u.out.end));
+                u
+            })
+            .collect();
+        recount(&mut p);
+        p
+    };
+    let Some((line, next)) = cut.filter(|_| ok) else {
+        let broken = |text: &str| {
+            let li = LineIndex::new(text);
+            let all = span(text, &li, (0, text.len()));
+            let mut p = c.clone();
+            p.output = text.to_string();
+            p.units = vec![crate::Unit {
+                status: Status::Differs,
+                notes: vec![Note {
+                    status: Status::Differs,
+                    rule: "template.pair-split".into(),
+                    text: "This routine's opening and closing templates were converted together, and the conversion moved code across the line between them, so neither can be converted on its own: convert them by hand and check the woven instances.".into(),
+                }],
+                src: all,
+                out: all,
+                findings: Vec::new(),
+                output_findings: Vec::new(),
+                checked: Status::Differs,
+            }];
+            recount(&mut p);
+            p
+        };
+        return (broken(head), broken(foot));
+    };
+    let (mut h, mut f) = (Vec::new(), Vec::new());
+    for mut u in c.units.clone() {
+        if u.src.start < head.len() {
+            u.src.end = u.src.end.min(head.len());
+            u.out.end = u.out.end.min(line);
+            h.push(u);
+        } else {
+            u.src.start = u.src.start.max(foot_in) - foot_in;
+            u.src.end = u.src.end.max(foot_in) - foot_in;
+            u.out.start = u.out.start.max(next) - next;
+            u.out.end = u.out.end.max(next) - next;
+            f.push(u);
+        }
+    }
+    let head_out = c.output[..line].to_string();
+    let foot_out = c.output[next..].to_string();
+    (part(head, head_out, h), part(foot, foot_out, f))
 }

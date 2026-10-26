@@ -525,10 +525,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 let def = cfg.policy.template.as_ref().ok_or(
                     "--template needs a [template] syntax: give --pack or a sqldiff.toml with one",
                 )?;
-                Some(convert_cmd::TemplateMode {
-                    placeholders: compose::Placeholders::new(def).map_err(|e| e.0)?,
-                    parameters: (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
-                })
+                Some(convert_cmd::TemplateMode::new(
+                    def,
+                    (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                )?)
             } else {
                 None
             };

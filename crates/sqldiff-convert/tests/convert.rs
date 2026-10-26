@@ -975,3 +975,155 @@ fn recursive_cte_gets_recursive() {
     assert!(plain.output.starts_with("WITH c AS"), "{}", plain.output);
     assert!(!has_rule(&plain.units[0], "ASM-CTE-MAXRECURSION"));
 }
+
+fn convert_kind(text: &str, kind: &str) -> Conversion {
+    convert_kind_with(text, kind, |t| sqldiff_convert::StandIns::new(t))
+}
+
+fn convert_kind_with(
+    text: &str,
+    kind: &str,
+    stand: impl Fn([&sqldiff_syntax::template::Template; 1]) -> sqldiff_convert::StandIns,
+) -> Conversion {
+    use sqldiff_convert::{check_template, rewrite_template_as, FragmentKind};
+    use sqldiff_core::composition::PlaceholderBasis;
+    let t = angle_template(text);
+    let stand = stand([&t]);
+    let kind = FragmentKind::parse(kind).unwrap();
+    let d = rewrite_template_as(&t, kind, Dialect::Tsql, Dialect::Postgres, &stand, None);
+    check_template(
+        &t,
+        d,
+        &stand,
+        &sqldiff_core::Options::default(),
+        PlaceholderBasis::DeclaredPattern,
+        ("<%", "%>"),
+    )
+}
+
+#[test]
+fn fragments_convert_inside_a_stand_in_statement() {
+    for (kind, src, out) in [
+        (
+            "predicate",
+            "ISNULL(<%T%>.qty, 0) > 1 AND name + 'x' = N'y'",
+            "COALESCE(<%T%>.qty, 0) > 1 AND name || 'x' = 'y'",
+        ),
+        (
+            "expression",
+            "LEN(a), GETDATE()",
+            "length(rtrim(a)), statement_timestamp()::timestamp",
+        ),
+        (
+            "set-list",
+            "a = ISNULL(b, 1), [c] = 2",
+            "a = COALESCE(b, 1), c = 2",
+        ),
+        (
+            "routine-body",
+            "UPDATE <%T%> SET a = ISNULL(b, 0);\nDELETE FROM <%T%> WHERE a = 1;",
+            "UPDATE <%T%> SET a = COALESCE(b, 0);\n  DELETE FROM <%T%> WHERE a = 1;",
+        ),
+    ] {
+        let c = convert_kind(src, kind);
+        assert_eq!(c.output.trim(), out, "{kind}");
+        assert!(!c.units.is_empty(), "{kind}");
+        for u in &c.units {
+            assert!(
+                has_rule(u, "ASM-TEMPLATE-FRAGMENT"),
+                "{kind}: {:?}",
+                u.notes
+            );
+            assert_ne!(u.status, Status::Converted, "{kind}");
+            assert!(u.out.end <= c.output.len(), "{kind}");
+            assert!(u.src.end <= src.len(), "{kind}");
+        }
+    }
+}
+
+#[test]
+fn a_fragment_whose_conversion_crosses_its_edge_is_not_converted() {
+    // PL/pgSQL declares variables before BEGIN: the declaration leaves the body.
+    let src = "DECLARE @x int = 1;\nUPDATE t SET a = @x;\n";
+    let c = convert_kind(src, "routine-body");
+    assert_eq!(c.output, src);
+    assert_eq!(c.units.len(), 1);
+    assert!(
+        has_rule(&c.units[0], "template.context-leak"),
+        "{:?}",
+        c.units[0].notes
+    );
+    assert_eq!(c.units[0].status, Status::Differs);
+    assert!(c
+        .report
+        .unknown_reasons
+        .iter()
+        .any(|r| r.contains("routine-body")));
+}
+
+#[test]
+fn dialect_code_values_need_a_value_per_dialect() {
+    use sqldiff_convert::ValueKind;
+    let c = convert_kind_with(
+        "CREATE TABLE <%T%> (id <%TYPE%>, note varchar(10) DEFAULT '<%NOTE%>');\n",
+        "statements",
+        |t| {
+            sqldiff_convert::StandIns::new(t).with_kinds([
+                ("TYPE".to_string(), ValueKind::Type),
+                ("NOTE".to_string(), ValueKind::Text),
+            ])
+        },
+    );
+    let u = &c.units[0];
+    assert_eq!(u.status, Status::Decision, "{:?}", u.notes);
+    let n = u
+        .notes
+        .iter()
+        .find(|n| n.rule == "template.value-per-dialect")
+        .unwrap();
+    assert!(n.text.contains("<%TYPE%> holds a type"), "{}", n.text);
+    // Only the name is converted as a name.
+    let asm = u
+        .notes
+        .iter()
+        .find(|n| n.rule == "ASM-TEMPLATE-PLACEHOLDER")
+        .unwrap();
+    assert!(asm.text.starts_with("<%T%> converted"), "{}", asm.text);
+}
+
+#[test]
+fn fragments_convert_for_db2i_too() {
+    use sqldiff_convert::{check_template, rewrite_template_as, FragmentKind, StandIns};
+    use sqldiff_core::composition::PlaceholderBasis;
+    for (kind, src) in [
+        ("predicate", "ISNULL(a, 0) > 1"),
+        ("expression", "LEN(a)"),
+        ("set-list", "a = ISNULL(b, 1)"),
+        ("routine-body", "UPDATE <%T%> SET a = ISNULL(b, 0);"),
+    ] {
+        let t = angle_template(src);
+        let stand = StandIns::new([&t]);
+        let k = FragmentKind::parse(kind).unwrap();
+        let d = rewrite_template_as(&t, k, Dialect::Tsql, Dialect::Db2i, &stand, None);
+        let c = check_template(
+            &t,
+            d,
+            &stand,
+            &sqldiff_core::Options::default(),
+            PlaceholderBasis::DeclaredPattern,
+            ("<%", "%>"),
+        );
+        assert!(
+            c.units
+                .iter()
+                .all(|u| !has_rule(u, "template.context-leak")),
+            "{kind}: {}",
+            c.output
+        );
+        assert!(
+            c.output.contains("COALESCE") || c.output.contains("LENGTH"),
+            "{kind}: {}",
+            c.output
+        );
+    }
+}
