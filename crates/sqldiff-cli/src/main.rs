@@ -431,7 +431,8 @@ fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), Strin
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    match sqldiff_core::with_engine_stack(|| run(cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("sqldiff: {e}");

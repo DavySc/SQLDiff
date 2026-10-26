@@ -403,7 +403,10 @@ impl<'a> Cx<'a> {
             .children()
             .find(|c| c.kind() == ROUTINE_BODY)
             .ok_or(No("view without a body".into()))?;
-        let name_at = ts.iter().position(|t| t.is("VIEW")).unwrap();
+        let name_at = ts
+            .iter()
+            .position(|t| t.is("VIEW"))
+            .ok_or(No("view without VIEW".into()))?;
         let as_at = (name_at..ts.len())
             .find(|&i| ts[i].is("AS"))
             .ok_or(No("view without AS".into()))?;
@@ -456,7 +459,7 @@ impl<'a> Cx<'a> {
         let kw = ts
             .iter()
             .position(|t| t.is("PROC") || t.is("PROCEDURE") || t.is("FUNCTION"))
-            .unwrap();
+            .ok_or(No("routine without PROCEDURE or FUNCTION".into()))?;
         // Name: up to the parameters, RETURNS, WITH or AS.
         let mut i = kw + 1;
         let mut name_toks = Vec::new();
@@ -1306,10 +1309,12 @@ impl<'a> Cx<'a> {
             "PRINT" if self.db2() => {
                 self.note(Status::Decision, "db2.print", "PRINT was dropped: Db2 for i has no message channel for SQL PL. Use SIGNAL with a warning SQLSTATE ('01xxx'), or write the text to a log table if callers rely on it.");
                 let body = Self::body_toks(&ts);
-                format!("-- PRINT {}: dropped", self.expr(&body[s[1]..]).trim())
+                let at = *s.get(1).ok_or(No("PRINT without a value".into()))?;
+                format!("-- PRINT {}: dropped", self.expr(&body[at..]).trim())
             }
             "PRINT" => {
-                let e = self.expr(&ts[s[1]..]);
+                let at = *s.get(1).ok_or(No("PRINT without a value".into()))?;
+                let e = self.expr(&ts[at..]);
                 format!("RAISE NOTICE '%', {}", e.trim())
             }
             "RETURN" => self.ret(&ts)?,
@@ -1688,7 +1693,7 @@ impl<'a> Cx<'a> {
                 "OUTPUT clause: use SELECT … FROM FINAL TABLE (INSERT …) or OLD TABLE (DELETE …)",
             ));
         }
-        if ts[s[1]].is("TOP") {
+        if ts[*s.get(1).ok_or(No("incomplete statement".into()))?].is("TOP") {
             return no(self.pick(
                 "TOP in INSERT/UPDATE/DELETE: restrict the rows with a key subquery and LIMIT",
                 "TOP in INSERT/UPDATE/DELETE: restrict the rows with a key subquery and FETCH FIRST",
@@ -1850,18 +1855,19 @@ impl<'a> Cx<'a> {
     fn set(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
-        let a = &ts[s[1]];
+        let a = &ts[*s.get(1).ok_or(No("SET without a target".into()))?];
         if a.k == VARIABLE && !a.s.starts_with("@@") {
             let op = &ts[*s.get(2).ok_or(No("SET without a value".into()))?];
             let target = self.var_ref(&a.s);
+            let value = *s.get(3).ok_or(No("SET without a value".into()))?;
             let bit = self
                 .vars
                 .get(&a.s[1..].to_ascii_lowercase())
                 .is_some_and(|v| v.dt == Dt::Bit);
             let rhs = if bit && op.s == "=" {
-                self.bit_store_text(&ts[s[3]..])
+                self.bit_store_text(&ts[value..])
             } else {
-                self.expr(&ts[s[3]..]).trim().to_string()
+                self.expr(&ts[value..]).trim().to_string()
             };
             let assign = |v: String| {
                 if self.db2() {
@@ -2013,7 +2019,7 @@ impl<'a> Cx<'a> {
         }
         let mut lines = Vec::new();
         let mut pending = Vec::new(); // (variable, initialiser tokens, BIT)
-        for item in split_commas(&ts[s[1]..]) {
+        for item in split_commas(&ts[*s.get(1).ok_or(No("DECLARE without a name".into()))?..]) {
             let it = trimmed(item);
             let Some(v) = it.first().filter(|t| t.k == VARIABLE) else {
                 return no("DECLARE form not understood");
@@ -2525,7 +2531,7 @@ impl<'a> Cx<'a> {
     fn create(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
-        let w1 = ts[s[1]].up();
+        let w1 = ts[*s.get(1).ok_or(No("incomplete CREATE".into()))?].up();
         match w1.as_str() {
             "TABLE" => {
                 // The table's own BIT columns, for its CHECK constraints.

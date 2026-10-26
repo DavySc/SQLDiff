@@ -1179,3 +1179,39 @@ fn trailing_comma_in_a_column_list_is_refused_not_a_crash() {
         );
     }
 }
+
+/// Incomplete statements (a file cut short, or typed half-way in the GUI)
+/// are refused, not a crash of the whole run.
+#[test]
+fn incomplete_statements_are_not_converted() {
+    for text in [
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "SET",
+        "SET @a =",
+        "DECLARE",
+        "CREATE",
+        "PRINT",
+        "CREATE PROCEDURE p",
+        "SELECT '",
+        "SELECT 'é",
+    ] {
+        for to in [Dialect::Postgres, Dialect::Db2i] {
+            let c = convert(text, Dialect::Tsql, to).unwrap();
+            assert!(
+                c.units.iter().all(|u| u.status != Status::Converted),
+                "{text:?} to {to:?}: {:#?}",
+                c.units
+            );
+        }
+    }
+}
+
+/// Deep nesting runs on the engine's stack instead of aborting the process.
+#[test]
+fn deep_nesting_does_not_overflow_the_engine_stack() {
+    let text = format!("SELECT {}1{};", "(".repeat(5000), ")".repeat(5000));
+    let c = sqldiff_core::with_engine_stack(|| tsql(&text));
+    assert!(!c.units.is_empty());
+}

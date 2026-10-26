@@ -5,7 +5,7 @@ name: Release
 # it by hand. The archives never hold a config: they are staged by
 # `sqldiff dist --no-config`, and the check below fails on anything else.
 # A private config is added on a trusted machine with `sqldiff dist`
-# (docs/distribution.md), never here.
+# outside any git work tree, never here.
 
 on:
   push:

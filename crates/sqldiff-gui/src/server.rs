@@ -78,9 +78,11 @@ pub fn serve_with_hosts(
         let Ok(stream) = stream else { continue };
         let session = Arc::clone(&session);
         let hosts = Arc::clone(&hosts);
-        std::thread::spawn(move || {
-            let _ = handle(stream, &session, &hosts);
-        });
+        std::thread::Builder::new()
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || {
+                let _ = handle(stream, &session, &hosts);
+            })?;
     }
     Ok(())
 }

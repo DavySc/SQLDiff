@@ -2020,8 +2020,24 @@ fn string_value(raw: &str) -> PResult<String> {
     if !(prefix.is_empty() || prefix == "N") {
         return Err(format!("string literal prefix `{prefix}` is not supported"));
     }
-    let inner = &raw[q + 1..raw.len().saturating_sub(1)];
-    Ok(inner.replace("''", "'"))
+    // The token must close: an unterminated literal (`'abc` at the end of
+    // the text) has no value to read.
+    let mut value = String::new();
+    let mut chars = raw[q + 1..].chars();
+    loop {
+        match chars.next() {
+            None => return Err("unterminated string literal".into()),
+            Some('\'') => match chars.clone().next() {
+                Some('\'') => {
+                    chars.next();
+                    value.push('\'');
+                }
+                None => return Ok(value),
+                Some(_) => return Err("bad string literal".into()),
+            },
+            Some(c) => value.push(c),
+        }
+    }
 }
 
 /// Parses a whole statement token list.

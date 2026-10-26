@@ -32,10 +32,13 @@ Three properties define it:
 When the code under review is *generated*, every use case can be run at two levels: the **template or source fragment** and the **composed output**. Both are first-class.
 
 ### Non-goals
-- Three-way merge; non-SQL content; dialects beyond the three; Oracle.
+- Three-way merge; non-SQL content.
 - A general plugin system for analysis. Extensibility is through profiles, packs, rules and adapters (section 5).
 - Executing against live databases in the product itself. Execution is used only in the validation harness.
 - Writing to any source system.
+
+### Future work
+- **Other RDBMS types.** The first release covers only the three dialects above. Supporting another database system later would mean a new dialect profile (section 4) with its own parser and semantics catalog entries. The Db2 scope stays Db2 for i only: Db2 for z/OS and Db2 LUW are not candidates.
 
 ## 2. Verdicts and change classes
 

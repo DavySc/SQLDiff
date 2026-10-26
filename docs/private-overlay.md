@@ -43,7 +43,7 @@ the clone can still be staged by `git add -f`, copied by a tool, or picked up by
 a glob. A folder elsewhere cannot.
 
 To hand the app with your private config to colleagues, build the bundle
-with `sqldiff dist` outside the clone; see [distribution.md](distribution.md).
+with `sqldiff dist` outside the clone (`sqldiff dist --help`).
 
 ## One-time setup
 
