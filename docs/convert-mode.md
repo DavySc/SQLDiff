@@ -115,6 +115,8 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | The target weave parses as the target dialect | differs |
 | The output check: binding, leftover source syntax, target limits, hazards | differs |
 | The engine's diff of the source weave against the target weave: a proven difference, or source syntax left in the target | differs |
+| The engine's diff: a finding it could neither prove nor rule out (`equiv.unproven`, …) | unknown |
+| The engine's diff: a finding equal only under assumptions (listed with the rule) | under assumptions |
 | A name a value is part of is a PostgreSQL reserved word unquoted (`Order`, `user`), or longer than 128 characters on Db2 for i | differs |
 | A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
 | A Db2 for i name from a value: no verified reserved-word list is built in (`ASM-DB2I-RESERVED-UNCHECKED`) | under assumptions |
@@ -123,6 +125,8 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE` and `ASM-TEMPLATE-SHARED-VALUES`: the values are known, the includes woven in, and each instance woven with its own values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
 
 With `--woven DIR` (the generator's real output) each source weave must equal its `output` file, ignoring trailing white space, or the instance is not woven (`weave.generator-mismatch`, with the first line that differs), and every file there that no instance names is listed under "not in manifest". That is what shows the manifest describes the generator completely.
+
+This is a stricter bar than `sqldiff convert`'s, where only a proven difference holds a unit back: an instance is converted only when no finding of the diff is left open. The assumptions the diff makes about every pair (name folding, the default schema) are listed per instance as `engine_assumptions` and do not count, as in `convert`.
 
 `check/instance-report.json` and `.md` give each instance's status and items (side, line in the woven file, rule), each converted template's status (the worst instance that uses it, includes too) and the converted templates no instance uses ("not exercised", never checked). The woven files are written to `check/source/` and `check/target/`. Exit code 0 when every instance is converted or converted under assumptions and all generator output is accounted for, 1 otherwise.
 

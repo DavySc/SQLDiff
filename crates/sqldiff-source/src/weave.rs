@@ -230,10 +230,14 @@ impl Manifest {
     }
 }
 
-/// A relative path that stays inside its root, with `/` separators.
+/// A relative path that stays inside its root, with `/` separators. A `\`
+/// is a separator too (templates written on Windows), so it becomes `/`
+/// before the parts are checked; a drive (`C:`) is not relative.
 fn relative(p: &str) -> Result<String> {
-    let path = Path::new(p);
-    if p.is_empty()
+    let norm = p.replace('\\', "/");
+    let path = Path::new(&norm);
+    if norm.is_empty()
+        || norm.contains(':')
         || path
             .components()
             .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
@@ -242,7 +246,7 @@ fn relative(p: &str) -> Result<String> {
             "`{p}`: expected a relative path inside the tree"
         )));
     }
-    Ok(p.replace('\\', "/"))
+    Ok(norm)
 }
 
 /// A placeholder value in woven text.
@@ -484,6 +488,11 @@ output = "gen/b.sql"
             ),
             ("[params_for.oracle]\nX = \"1\"\n", "oracle"),
             ("[[instance]]\nname = \"x\"\ntemplate = \"/etc/t\"\n", "relative path"),
+            (
+                "[[instance]]\nname = \"x\"\ntemplate = '..\\..\\outside.sql'\n",
+                "relative path",
+            ),
+            ("[[instance]]\nname = \"x\"\ntemplate = 'C:\\t.sql'\n", "relative path"),
         ] {
             let e = Manifest::parse(bad).unwrap_err();
             assert!(e.0.contains(why), "{bad}: {e}");
@@ -573,6 +582,33 @@ output = "gen/b.sql"
             n.problems[0].contains("not in the template tree"),
             "{:?}",
             n.problems
+        );
+    }
+
+    #[test]
+    fn an_include_never_leaves_the_tree() {
+        // A file next to the tree, reached with Windows separators.
+        let outside =
+            std::env::temp_dir().join(format!("sqldiff-weave-outside-{}.sql", std::process::id()));
+        std::fs::write(&outside, "SELECT 'secret';\n").unwrap();
+        let name = outside.file_name().unwrap().to_string_lossy().to_string();
+        let text = format!("<%@include ..\\{name} %>SELECT 1;\n");
+        let root = tree("escape", &[("t.sql", text.as_str())]);
+        let m = Manifest::parse("[[instance]]\nname = \"t\"\ntemplate = \"t.sql\"\n").unwrap();
+        let p = placeholders();
+        let w = Weaver {
+            root,
+            dialect: Dialect::Tsql,
+            placeholders: &p,
+            include: Some("include".into()),
+            list: None,
+        };
+        let r = w.weave(&m, &m.instances[0]);
+        assert!(!r.text.contains("secret"), "{}", r.text);
+        assert!(
+            r.problems[0].contains("is not in the template tree"),
+            "{:?}",
+            r.problems
         );
     }
 }

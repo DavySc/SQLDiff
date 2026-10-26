@@ -304,3 +304,19 @@ fn two_values_postgres_truncates_to_one_name_differ() {
     assert_eq!(c["status"], "assumptions", "{c}");
     assert_eq!(rules(c), ["ASM-PG-NAME-TRUNCATED"]);
 }
+
+#[test]
+fn what_the_diff_cannot_decide_holds_an_instance_back() {
+    let d = scratch("unknown");
+    setup(&d);
+    // A hand edit that changes what the procedure updates.
+    let conv = d.join("conv/procs/touch.sql");
+    let text = std::fs::read_to_string(&conv).unwrap();
+    assert!(text.contains("WHERE Id = p_id"), "{text}");
+    std::fs::write(&conv, text.replace("WHERE Id = p_id", "WHERE Id <> p_id")).unwrap();
+    let (o, r) = instances(&d, &[]);
+    assert_eq!(o.status.code(), Some(1));
+    let t = instance(&r, "procs/TouchCustomer");
+    assert_ne!(t["status"], "converted", "{t}");
+    assert_ne!(t["status"], "assumptions", "{t}");
+}

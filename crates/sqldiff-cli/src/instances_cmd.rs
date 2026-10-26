@@ -80,15 +80,15 @@ pub struct InstancesArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Outcome {
-    /// Nothing found: the bar `sqldiff convert` sets for "converted".
+    /// Nothing found by any check.
     Converted,
-    /// Nothing found, but a check rests on a listed assumption.
+    /// Equal only under the assumptions listed.
     Assumptions,
     /// The conversion chose one of several faithful targets and someone
     /// should confirm it (a `needs a decision` line in the template).
     Decision,
-    /// Not checkable as far as needed (the source instance does not parse,
-    /// or the generator's output was not given where it was asked for).
+    /// Not decided: the engine's diff could neither prove nor rule out a
+    /// difference, or the source instance does not parse.
     Unknown,
     /// One side could not be woven, or the source weave is not what the
     /// generator writes: nothing was checked.
@@ -139,8 +139,10 @@ struct InstanceReport {
     target_file: String,
     templates: Vec<String>,
     items: Vec<Item>,
-    /// Engine findings the diff could neither prove nor rule out.
-    unknown_findings: usize,
+    /// Assumptions the engine's diff makes about the whole pair, by id (name
+    /// folding, default schema): the same ones `sqldiff convert` makes for
+    /// every file, listed here and not counted in the status.
+    engine_assumptions: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -301,7 +303,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
 
     // Woven files and the per-instance report.
     let mut instances = Vec::new();
-    for ((i, (s, t)), (items, unknown, _)) in manifest.instances.iter().zip(&woven).zip(results) {
+    for ((i, (s, t)), (items, engine, _)) in manifest.instances.iter().zip(&woven).zip(results) {
         let (sf, tf) = (
             format!("source/{}.sql", i.name),
             format!("target/{}.sql", i.name),
@@ -325,7 +327,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
             target_file: tf,
             templates: t.templates.iter().cloned().collect(),
             items,
-            unknown_findings: unknown,
+            engine_assumptions: engine,
         });
     }
 
@@ -387,9 +389,9 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::from(if ok { 0 } else { 1 }))
 }
 
-/// An instance's items, its count of unknown engine findings, and the
-/// PostgreSQL names over the limit, as (truncated, full).
-type Checked = (Vec<Item>, usize, Vec<(String, String)>);
+/// An instance's items, the engine's assumptions about the whole pair, and
+/// the PostgreSQL names over the limit, as (truncated, full).
+type Checked = (Vec<Item>, Vec<String>, Vec<(String, String)>);
 
 /// Checks one instance; also returns the PostgreSQL names its values make
 /// that are over the limit, as (truncated, full), for the collision check.
@@ -443,7 +445,7 @@ fn check_instance(
         None => {}
     }
     if !items.is_empty() {
-        return (items, 0, Vec::new());
+        return (items, Vec::new(), Vec::new());
     }
 
     items.extend(markers(&t.text, accepted));
@@ -495,29 +497,41 @@ fn check_instance(
             });
         }
     }
+    // Every finding of the diff counts: proven different, not decided
+    // (unknown), or equal only under the assumptions it names.
     let report = sqldiff_core::diff(&sa, &ta, opts);
-    let mut unknown = 0;
     for f in &report.findings {
-        let differs =
-            f.verdict == Verdict::Different || f.class == ChangeClass::Residue && f.b.is_some();
-        if !differs {
-            if f.verdict == Verdict::Unknown {
-                unknown += 1;
+        let (status, rule) = if f.verdict == Verdict::Different
+            || f.class == ChangeClass::Residue && f.b.is_some()
+        {
+            (Outcome::Differs, f.rule.clone())
+        } else {
+            match f.verdict {
+                Verdict::Unknown => (Outcome::Unknown, f.rule.clone()),
+                Verdict::EqualUnderAssumptions => (
+                    Outcome::Assumptions,
+                    if f.assumptions.is_empty() {
+                        f.rule.clone()
+                    } else {
+                        format!("{}: {}", f.rule, f.assumptions.join(", "))
+                    },
+                ),
+                _ => continue,
             }
-            continue;
-        }
+        };
         let (side, loc) = match (&f.b, &f.a) {
             (Some(b), _) => ("target", Some(b)),
             (None, a) => ("source", a.as_ref()),
         };
         items.push(Item {
-            status: Outcome::Differs,
-            rule: f.rule.clone(),
+            status,
+            rule,
             side,
             line: loc.map_or(0, |l| l.start_line),
             text: f.witness.clone(),
         });
     }
+    let engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
     let spans: Vec<(usize, usize)> = t.values.iter().map(|v| (v.start, v.end)).collect();
     let mut names = Vec::new();
     for n in sqldiff_convert::names::check_values(&t.text, to, &spans) {
@@ -538,7 +552,7 @@ fn check_instance(
         });
     }
     items.sort_by(|x, y| y.status.cmp(&x.status).then(x.line.cmp(&y.line)));
-    (items, unknown, names)
+    (items, engine, names)
 }
 
 /// Assumptions the woven instances discharge: the values are known, the
