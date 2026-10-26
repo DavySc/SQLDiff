@@ -77,6 +77,7 @@ pub struct InstancesArgs {
     /// instances whose woven text, generator output and values are what
     /// they were then reuse its results, when everything else the checks
     /// read (catalogs, options, the sqldiff build) is the same too.
+    /// The report is trusted as a cache: give only one your own run wrote.
     #[arg(long, value_name = "PATH")]
     pub(crate) since: Option<PathBuf>,
     /// A parameter name (repeatable), added to the names the manifest gives
@@ -1622,4 +1623,208 @@ fn markdown(r: &Report) -> String {
         s.push('\n');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    //! `--since` reuses a result when the Debug text of everything a check
+    //! reads hashes the same. These tests break when a field is added to
+    //! what is hashed (the struct patterns below name every field, so a new
+    //! one fails to compile until it is added here), and when a change to
+    //! any field fails to change the hash.
+    use super::*;
+    use sqldiff_core::catalog::Catalog;
+
+    /// A named change to a value.
+    type Change<T> = (&'static str, Box<dyn Fn(&mut T)>);
+
+    fn key(x: &impl std::fmt::Debug) -> String {
+        hash(&format!("{x:?}"))
+    }
+
+    fn facts(ddl: &str) -> Catalog {
+        catalog(
+            std::iter::once(ddl),
+            Dialect::Postgres,
+            Path::new("conv"),
+            None,
+        )
+    }
+
+    const DDL: &str =
+        "CREATE TABLE public.t (id integer NOT NULL PRIMARY KEY, price numeric(12, 2) NULL);\n\
+        CREATE INDEX t_price ON public.t (price);\n\
+        CREATE FUNCTION public.f(p_id integer) RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;\n";
+
+    #[test]
+    fn every_option_is_in_the_run_fingerprint() {
+        let Options {
+            excerpt_lines,
+            catalog_a,
+            catalog_b,
+            facts_a,
+            facts_b: _,
+            helpers,
+            flips,
+            declared,
+        } = Options::default();
+        let base = Options {
+            excerpt_lines,
+            catalog_a,
+            catalog_b,
+            facts_a,
+            facts_b: vec![Arc::new(facts(DDL))],
+            helpers,
+            flips,
+            declared,
+        };
+        let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
+        let changes: Vec<Change<Options>> = vec![
+            ("excerpt_lines", Box::new(|o| o.excerpt_lines += 1)),
+            ("catalog_a", Box::new(move |o| o.catalog_a.push(artifact()))),
+            ("catalog_b", Box::new(move |o| o.catalog_b.push(artifact()))),
+            (
+                "facts_a",
+                Box::new(|o| o.facts_a.push(Arc::new(facts("CREATE TABLE u (id int);")))),
+            ),
+            (
+                "facts_b",
+                Box::new(|o| o.facts_b = vec![Arc::new(facts(&DDL.replace("(12, 2)", "(12, 3)")))]),
+            ),
+            (
+                "helpers",
+                Box::new(|o| {
+                    o.helpers.push(sqldiff_core::catalog::builtins::Helper {
+                        name: "h".into(),
+                        dialect: Dialect::Postgres,
+                        returns: None,
+                    })
+                }),
+            ),
+            (
+                "flips",
+                Box::new(|o| {
+                    o.flips.insert("ASM-X".into(), false);
+                }),
+            ),
+            (
+                "declared",
+                Box::new(|o| {
+                    o.declared.insert("ASM-X".into(), "holds".into());
+                }),
+            ),
+        ];
+        for (field, change) in changes {
+            let mut o = base.clone();
+            change(&mut o);
+            assert_ne!(key(&o), key(&base), "{field}");
+        }
+    }
+
+    #[test]
+    fn every_catalog_fact_is_in_the_run_fingerprint() {
+        let Catalog {
+            origin: _,
+            tables: _,
+            routines: _,
+            schemas: _,
+        } = Catalog::default();
+        let base = key(&facts(DDL));
+        for (what, old, new) in [
+            ("column type", "numeric(12, 2)", "numeric(12, 3)"),
+            ("column name", "price numeric", "cost numeric"),
+            ("nullability", "(12, 2) NULL", "(12, 2) NOT NULL"),
+            ("key", " PRIMARY KEY", ""),
+            ("index", "CREATE INDEX t_price ON public.t (price);", ""),
+            ("table name", "public.t (", "public.t2 ("),
+            ("parameter type", "p_id integer", "p_id bigint"),
+            ("return type", "RETURNS integer", "RETURNS bigint"),
+            ("routine name", "public.f(", "public.g("),
+        ] {
+            assert!(DDL.contains(old), "{what}");
+            assert_ne!(key(&facts(&DDL.replacen(old, new, 1))), base, "{what}");
+        }
+        // A routine body is not a catalog fact: changing it keeps reuse.
+        assert_eq!(key(&facts(&DDL.replace("SELECT 1", "SELECT 2"))), base);
+        let c = facts(DDL);
+        assert!(!c.tables.is_empty() && !c.routines.is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn every_part_of_a_weave_is_in_the_instance_key() {
+        let Woven {
+            text,
+            values,
+            templates,
+            problems,
+            unresolved,
+        } = Woven::default();
+        let base = Woven {
+            text: text + "SELECT 1;",
+            values,
+            templates,
+            problems,
+            unresolved,
+        };
+        let changes: Vec<Change<Woven>> = vec![
+            ("text", Box::new(|w| w.text.push(' '))),
+            (
+                "values",
+                Box::new(|w| {
+                    w.values.push(sqldiff_source::weave::Value {
+                        start: 0,
+                        end: 1,
+                        name: "X".into(),
+                        per_dialect: false,
+                    })
+                }),
+            ),
+            (
+                "templates",
+                Box::new(|w| {
+                    w.templates.insert("a.sql".into());
+                }),
+            ),
+            ("problems", Box::new(|w| w.problems.push("p".into()))),
+            ("unresolved", Box::new(|w| w.unresolved.push("u".into()))),
+        ];
+        for (field, change) in changes {
+            let mut w = base.clone();
+            change(&mut w);
+            assert_ne!(key(&w), key(&base), "{field}");
+        }
+        // And a value's every field.
+        let v = sqldiff_source::weave::Value {
+            start: 0,
+            end: 1,
+            name: "X".into(),
+            per_dialect: false,
+        };
+        let sqldiff_source::weave::Value {
+            start,
+            end,
+            name,
+            per_dialect,
+        } = v.clone();
+        for w in [
+            sqldiff_source::weave::Value {
+                start: start + 1,
+                ..v.clone()
+            },
+            sqldiff_source::weave::Value {
+                end: end + 1,
+                ..v.clone()
+            },
+            sqldiff_source::weave::Value {
+                name: name + "Y",
+                ..v.clone()
+            },
+            sqldiff_source::weave::Value {
+                per_dialect: !per_dialect,
+                ..v.clone()
+            },
+        ] {
+            assert_ne!(key(&w), key(&v));
+        }
+    }
 }
