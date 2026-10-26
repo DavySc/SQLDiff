@@ -476,6 +476,20 @@ fn compensating_edits_through_a_table() {
     assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
 }
 
+// The same through a T-SQL table variable.
+#[test]
+fn compensating_edits_through_a_table_variable() {
+    let a = tsql_out(
+        "DECLARE @t TABLE (v INT); INSERT INTO @t VALUES (@p + 1); SELECT @x = v * 2 FROM @t;",
+    );
+    let b = tsql_out(
+        "DECLARE @t TABLE (v INT); INSERT INTO @t VALUES (@p + 2); SELECT @x = (v - 1) * 2 FROM @t;",
+    );
+    let r = run(&a, &b, T);
+    assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
+    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+}
+
 // Inside a loop, a change later in the body feeds an edit earlier in the
 // body on the next iteration.
 #[test]

@@ -1399,13 +1399,15 @@ impl<'x, 'a> Routine<'x, 'a> {
             for (i, x) in t.iter().enumerate() {
                 // Schema qualifiers are no table.
                 let qualifier = t.get(i + 1).is_some_and(|y| y.kind == K::Dot);
-                if x.kind == K::Var || qualifier || normalize::is_keyword(&x.up) {
+                if qualifier || (x.kind != K::Var && normalize::is_keyword(&x.up)) {
                     continue;
                 }
+                // Scalar variables are read here, not written; a T-SQL table
+                // variable (`@t`, never a scalar local) is a written table.
+                let scalar_name = x.kind == K::Var || self.d != Dialect::Tsql;
                 if let Some(x) = unit_name(x) {
-                    if !(self.d != Dialect::Tsql
-                        && (self.params.contains_key(&x) || self.locals.contains_key(&x)))
-                    {
+                    let scalar = self.params.contains_key(&x) || self.locals.contains_key(&x);
+                    if !(scalar_name && scalar) {
                         w.insert(x);
                     }
                 }
