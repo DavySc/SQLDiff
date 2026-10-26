@@ -138,7 +138,6 @@ struct Shape {
     placeholders: BTreeSet<String>,
     /// Special forms in order, with their arguments.
     directives: Vec<(String, Vec<String>)>,
-    text: String,
 }
 
 pub fn run(a: DriftArgs) -> Result<ExitCode, String> {
@@ -207,7 +206,6 @@ pub fn run(a: DriftArgs) -> Result<ExitCode, String> {
             let mut shape = Shape {
                 placeholders: BTreeSet::new(),
                 directives: Vec::new(),
-                text: i.text.clone(),
             };
             for s in &t.segments {
                 match &s.kind {
@@ -234,7 +232,7 @@ pub fn run(a: DriftArgs) -> Result<ExitCode, String> {
         .collect();
 
     // Changed since the merge base, per tree.
-    let changed: Option<BTreeMap<Dialect, BTreeSet<String>>> = match &a.base {
+    let changed: Option<BTreeMap<Dialect, Changed>> = match &a.base {
         Some(base) => Some(
             a.trees
                 .iter()
@@ -334,15 +332,20 @@ pub fn run(a: DriftArgs) -> Result<ExitCode, String> {
             let touched: Vec<Dialect> = present
                 .iter()
                 .copied()
-                .filter(|d| changed[d].contains(*path))
+                .filter(|d| changed[d].paths.contains(*path))
                 .collect();
             if !touched.is_empty() && touched.len() < present.len() {
                 for d in &touched {
+                    // Only a marker this change adds explains it: one
+                    // committed long ago says nothing about this change.
+                    let added = changed[d].added_lines(path)?;
                     let reason = intentional.iter().find_map(|re| {
-                        re.captures(&shapes[d][*path].text).map(|c| {
-                            c.get(1)
-                                .or_else(|| c.get(0))
-                                .map_or(String::new(), |m| m.as_str().trim().to_string())
+                        added.iter().find_map(|l| {
+                            re.captures(l).map(|c| {
+                                c.get(1)
+                                    .or_else(|| c.get(0))
+                                    .map_or(String::new(), |m| m.as_str().trim().to_string())
+                            })
                         })
                     });
                     match reason {
@@ -440,26 +443,61 @@ fn names(ds: &[Dialect]) -> String {
         .join(", ")
 }
 
+/// What changed in one tree since the merge base.
+struct Changed {
+    dir: PathBuf,
+    merge_base: String,
+    /// Paths relative to the tree.
+    paths: BTreeSet<String>,
+}
+
+impl Changed {
+    /// The lines the change adds to `path`.
+    fn added_lines(&self, path: &str) -> Result<Vec<String>, String> {
+        let diff = git(
+            &self.dir,
+            &[
+                "diff",
+                "-U0",
+                "--relative",
+                "--no-ext-diff",
+                "--no-renames",
+                "--no-color",
+                &self.merge_base,
+                "--",
+                path,
+            ],
+        )?;
+        Ok(diff
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .map(|l| l[1..].to_string())
+            .collect())
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout).map_err(|_| "git: output is not UTF-8".to_string())
+}
+
 /// Template paths under `dir`, relative to it, that differ between the
 /// merge base of `base` and HEAD and the working tree.
-fn changed_since(dir: &Path, base: &str) -> Result<BTreeSet<String>, String> {
-    let git = |args: &[&str]| -> Result<String, String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("git: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "git {}: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        String::from_utf8(out.stdout).map_err(|_| "git: output is not UTF-8".to_string())
-    };
+fn changed_since(dir: &Path, base: &str) -> Result<Changed, String> {
+    let git = |args: &[&str]| git(dir, args);
     let mb = git(&["merge-base", base, "HEAD"])?;
     let list = git(&[
         "diff",
@@ -472,11 +510,15 @@ fn changed_since(dir: &Path, base: &str) -> Result<BTreeSet<String>, String> {
         "--",
         ".",
     ])?;
-    Ok(list
-        .split('\0')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect())
+    Ok(Changed {
+        dir: dir.to_path_buf(),
+        merge_base: mb.trim().to_string(),
+        paths: list
+            .split('\0')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    })
 }
 
 fn prepare_out(a: &DriftArgs) -> Result<(), String> {

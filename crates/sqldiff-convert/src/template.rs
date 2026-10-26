@@ -469,7 +469,7 @@ pub fn check_template(
                 let trail = &t.text[lead.len() + body.len()..];
                 strip(&mut c, mid, h.frag, (lead, trail))
             }
-            None => return leaked(t, c, h.kind, &specials),
+            None => return leaked(t, c, h.kind, stem, &written, &specials),
         }
     }
 
@@ -668,19 +668,7 @@ pub fn check_template(
     }
 
     // Stand-ins in finding and note text, as the template writes them.
-    let respell = |text: &str| -> String {
-        re.replace_all(text, |m: &regex::Captures| {
-            let pick = |g: usize| m.get(g).and_then(|x| x.as_str().parse::<usize>().ok());
-            match (pick(1), pick(2)) {
-                (Some(k), _) => specials.get(k).map(|(s, e, _)| t.text[*s..*e].to_string()),
-                (_, Some(i)) => written.get(i).filter(|w| !w.is_empty()).cloned(),
-                _ => None,
-            }
-            .unwrap_or_else(|| m[0].to_string())
-        })
-        .replace(&format!("{stem}hs.{stem}h."), "")
-        .replace(&format!("{stem}hs.{stem}h"), "the woven statement's table")
-    };
+    let respell = |text: &str| respell(text, t, stem, &written, &specials);
     for u in &mut c.units {
         for n in &mut u.notes {
             n.text = respell(&n.text);
@@ -816,18 +804,56 @@ fn strip(c: &mut Conversion, mid: (usize, usize), frag: (usize, usize), edges: (
     c.output = format!("{}{}{}", edges.0, &c.output[b..e], edges.1);
 }
 
+/// `text` with stand-ins spelt as the template writes them.
+fn respell(
+    text: &str,
+    t: &Template,
+    stem: &str,
+    written: &[String],
+    specials: &[(usize, usize, String)],
+) -> String {
+    let re = Regex::new(&format!(r"(?i-u)/\*{stem}s(\d+)z\*/|{stem}(\d+)z"))
+        .expect("stem is alphanumeric");
+    re.replace_all(text, |m: &regex::Captures| {
+        let pick = |g: usize| m.get(g).and_then(|x| x.as_str().parse::<usize>().ok());
+        match (pick(1), pick(2)) {
+            (Some(k), _) => specials.get(k).map(|(s, e, _)| t.text[*s..*e].to_string()),
+            (_, Some(i)) => written.get(i).filter(|w| !w.is_empty()).cloned(),
+            _ => None,
+        }
+        .unwrap_or_else(|| m[0].to_string())
+    })
+    .replace(&format!("{stem}hs.{stem}h."), "")
+    .replace(&format!("{stem}hs.{stem}h"), "the woven statement's table")
+}
+
 /// A fragment whose conversion reached across its edges: the template is
 /// kept as it is, one unit that differs, and nothing else is claimed.
 fn leaked(
     t: &Template,
     mut c: Conversion,
     kind: FragmentKind,
+    stem: &str,
+    written: &[String],
     specials: &[(usize, usize, String)],
 ) -> Conversion {
-    let why = format!(
-        "Converting this {} changed the stand-in statement around it (a declaration hoisted, a parameter added, or code moved across its edge), so it cannot be converted on its own: convert it by hand and check the woven instances.",
+    // The stand-in may not have converted at all; then say why.
+    let mut inner: Vec<String> = Vec::new();
+    for u in c.units.iter().filter(|u| u.status > Status::Assumptions) {
+        for n in u.notes.iter().filter(|n| n.status > Status::Assumptions) {
+            if !inner.contains(&n.text) {
+                inner.push(n.text.clone());
+            }
+        }
+    }
+    let mut why = format!(
+        "Converting this {} changed the stand-in statement around it (a declaration hoisted, a parameter added, code moved across its edge, or a rule that did not apply), so it cannot be converted on its own: convert it by hand and check the woven instances.",
         kind.label()
     );
+    if !inner.is_empty() {
+        why.push_str(&format!(" The conversion said: {}", inner.join(" ")));
+    }
+    let why = respell(&why, t, stem, written, specials);
     let li = LineIndex::new(&t.text);
     let all = span(&t.text, &li, (0, t.text.len()));
     c.units = vec![crate::Unit {

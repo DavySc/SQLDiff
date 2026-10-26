@@ -123,7 +123,8 @@ const ORDER: [Outcome; 6] = [
 struct Item {
     status: Outcome,
     rule: String,
-    /// `source` or `target` instance; `manifest` for weaving.
+    /// `source` or `target` instance; `manifest` for weaving; `pair` for
+    /// the diff of the two as a whole.
     side: &'static str,
     /// 1-based line in the woven file, 0 when it has none.
     line: usize,
@@ -595,6 +596,26 @@ fn check_instance(
             side,
             line: loc.map_or(0, |l| l.start_line),
             text: f.witness.clone(),
+        });
+    }
+    // What the diff could not compare at all (DDL, say) is not decided
+    // either: no finding about it is no evidence.
+    for r in &report.unknown_reasons {
+        items.push(Item {
+            status: Outcome::Unknown,
+            rule: "equiv.not-covered".into(),
+            side: "pair",
+            line: 0,
+            text: r.clone(),
+        });
+    }
+    if report.verdict == Verdict::Unknown && !items.iter().any(|x| x.status >= Outcome::Unknown) {
+        items.push(Item {
+            status: Outcome::Unknown,
+            rule: "equiv.unknown".into(),
+            side: "pair",
+            line: 0,
+            text: "the engine's diff of the source and target instances is UNKNOWN".into(),
         });
     }
     let engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();

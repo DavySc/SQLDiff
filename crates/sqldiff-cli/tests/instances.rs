@@ -301,8 +301,11 @@ fn two_values_postgres_truncates_to_one_name_differ() {
     }
     // Truncated, but no other name becomes the same.
     let c = instance(&r, "c");
-    assert_eq!(c["status"], "assumptions", "{c}");
-    assert_eq!(rules(c), ["ASM-PG-NAME-TRUNCATED"]);
+    assert!(
+        rules(c).contains(&"ASM-PG-NAME-TRUNCATED".to_string()),
+        "{c}"
+    );
+    assert!(!rules(c).contains(&"pg.name-collision".to_string()), "{c}");
 }
 
 #[test]
@@ -457,10 +460,17 @@ fn fragments_pairs_and_value_kinds() {
         serde_json::from_str(&std::fs::read_to_string(d.join("out/instance-report.json")).unwrap())
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
     // The woven instances discharge the fragment and decision notes.
-    for name in ["table", "list", "save"] {
+    for name in ["list", "save"] {
         let i = instance(&r, name);
         assert_eq!(i["status"], "converted", "{name}: {i}");
     }
+    // The engine does not compare DDL: not decided, never converted.
+    let table = instance(&r, "table");
+    assert_eq!(table["status"], "unknown", "{table}");
+    assert!(
+        rules(table).iter().all(|r| r == "equiv.not-covered"),
+        "{table}"
+    );
     let woven = std::fs::read_to_string(d.join("out/target/save.sql")).unwrap();
     assert!(woven.contains("(p_key integer)"), "{woven}");
     // A type given once for every dialect is an assumption.
@@ -487,4 +497,74 @@ fn an_object_two_instances_create_is_not_decided() {
         assert!(rules(i).contains(&"weave.object-twice".to_string()), "{i}");
     }
     assert_eq!(instance(&r, "procs/TouchCustomer")["status"], "converted");
+}
+
+#[test]
+fn a_type_value_per_dialect_in_ddl_is_not_decided() {
+    // A wrong per-dialect type is never checked by the diff: the table
+    // instance must not come out converted (cross-review on #66).
+    let d = scratch("ddl-type");
+    let (src, conv) = (d.join("src"), d.join("conv"));
+    // No pairs: this tree has no routine halves.
+    let pack_text: String = KINDS_PACK
+        .lines()
+        .filter(|l| !l.starts_with("pairs"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    write(&d.join("pack.toml"), &pack_text);
+    write(
+        &src.join("q/table.sql"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id <%KEYTYPE%> NOT NULL, Price int NOT NULL);\n",
+    );
+    let pack = d.join("pack.toml");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--isolated",
+    ]);
+    assert!(
+        conv.join("q/table.sql").is_file(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for wrong in ["boolean", "varchar(5)", "smallint"] {
+        write(
+            &d.join("instances.toml"),
+            &format!(
+                "[params]\nSCHEMA = \"dbo\"\nTABLE = \"Item\"\nKEYTYPE = \"INT\"\n[params_for.postgres]\nSCHEMA = \"public\"\nKEYTYPE = \"{wrong}\"\n\n[[instance]]\nname = \"t\"\ntemplate = \"q/table.sql\"\n"
+            ),
+        );
+        let (manifest, out) = (d.join("instances.toml"), d.join("out"));
+        let o = run(&[
+            "instances",
+            manifest.to_str().unwrap(),
+            "--source",
+            src.to_str().unwrap(),
+            "--target",
+            conv.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "-o",
+            out.to_str().unwrap(),
+            "--overwrite",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--isolated",
+        ]);
+        assert_eq!(o.status.code(), Some(1), "{wrong}");
+        let r: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("instance-report.json")).unwrap(),
+        )
+        .unwrap();
+        let t = instance(&r, "t");
+        assert_eq!(t["status"], "unknown", "{wrong}: {t}");
+        assert!(rules(t).contains(&"equiv.not-covered".to_string()), "{t}");
+    }
 }
