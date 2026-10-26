@@ -85,6 +85,9 @@ User config, first match wins (see [packs-and-config.md](packs-and-config.md)):
 3. `config/config.toml` beside the executable (symlinks are followed to the real install)
 4. `%APPDATA%\sqldiff\config.toml`, else `~/.config/sqldiff/config.toml`
 
+Only one user config is loaded. With a bundle present, a colleague's own
+`~/.config/sqldiff/config.toml` (or `%APPDATA%` file) is read only when
+`$SQLDIFF_CONFIG` points at it, and then the bundle is not read.
 `--isolated` skips all of these. `sqldiff config` lists the loaded file and
 packs under `layers`. Review decisions and the cache stay in each user's own
 data directory, never in the distribution folder.
