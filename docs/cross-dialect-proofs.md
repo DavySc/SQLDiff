@@ -83,6 +83,53 @@ same kind, name and schema as the object (`dbo`, `public` and no schema
 count as the same). Third, each is the only candidate for the other. `u`
 stays "only in A". Anything else stays unpaired and is reported as such.
 
+## Witnesses for changed statements
+
+When two paired statements lower to terms that differ in a way no rule
+explains (a changed comparison operator, `AND` against `OR`, a dropped or
+changed WHERE, another parameter, literal or column, a changed SET or INSERT
+value), `equiv::xwit` looks for a witness on the canonical terms: one table
+of one or two rows plus parameter values, under which both statements finish
+and their results differ. A witness makes the pair "different" (rule
+`equiv.witness`) and says what happens, for example: "When parameter 1
+(cityid / p_city_id) is 0 and application.cities holds the row (cityid = 0),
+side A (T-SQL) deletes 1 row and side B (PostgreSQL) deletes no row."
+
+The terms are dialect-neutral, so one evaluator serves every pair of
+dialects. It only evaluates what means the same everywhere for the values it
+uses: integers within the parameter and catalog types (no decimals), NULL,
+short ASCII words (no blanks, so case-insensitive and blank-padded
+comparisons agree with the others), and opaque values that are only copied.
+Results it compares: the rows a DELETE or UPDATE leaves, the row an INSERT
+adds, the rows a query returns (TOP / LIMIT only with fewer qualifying rows),
+a returned value (a function's looked-up value, single row or none), and an
+OUT parameter that nothing reads or sets later. Anything else (joins,
+subqueries next to a table, grouping, string ordering, casts to non-numbers,
+local variables, temporary tables) stays "unknown". Two-row worlds differ in
+every column and hold no NULL in the first row, so no unique key over those
+columns is broken; worlds without NULL columns are tried first.
+
+A witness is only searched for the one statement pair of a routine that is
+not proven equal, with every statement lowered and no control flow outside
+the comparison, and only when no other statement uses its table or assigns
+a parameter it reads. Two changed statements can compensate each other
+(`x := p + 1; x := x * 2` against `x := p + 2; x := (x - 1) * 2`), and
+another statement can make the witness rows unreachable or undo them.
+
+Every witness that reads or writes a table states `ASM-WITNESS-DATA`: the
+columns hold the values it gives them, and no constraint or trigger rejects
+or replaces the write (column types, constraints and triggers are not known
+from the routine). Parameters are matched by position, so a witness is only
+searched when both routines are the same kind with the same number of
+parameters. Unless each side is that one statement with nothing around it
+(no transaction control), the witness also states
+`ASM-WITNESS-PATH`: the inputs reach the statement and its result is not
+undone or overwritten later.
+
+A search finds nothing for rewrites that keep the meaning (`x > p` against
+`x >= p + 1` on integers, `x = p OR x <> p` against `x IS NOT NULL`), so they
+stay "unknown"; the search never makes a verdict "equal".
+
 ## Benchmark
 
 `eval/cross-dialect/` in the project files: `bench.py` converts the
@@ -91,3 +138,12 @@ PostgreSQL and diffs each pair; `mutate.py` applies behaviour-changing edits to
 the pairs proven equal. On 2026-10-24: 15 of 15 fully converted procedures
 equal under `ASM-OWNER-PRIVILEGES` and `ASM-IDENT-FOLD` (0 of 15 before), and
 255 mutations with no false equal.
+
+On 2026-10-26 (`eval/cross-dialect-witness/`): the same 255 mutations give 120
+"different" (45 before) and still no false equal; every WHERE operator,
+dropped WHERE, parameter, literal and column mutation is now "different". The
+token-aware `xwmut.py` over every converted WWI routine (PostgreSQL and Db2
+for i) turns all 60 behaviour-changing mutants of the equal pairs into
+"different" (none before), with no false equal and no witness on a
+meaning-preserving edit.
+
