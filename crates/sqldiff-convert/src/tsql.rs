@@ -1525,17 +1525,66 @@ impl<'a> Cx<'a> {
                     true,
                 ));
             }
-            let text = self.pick(
-                "The query returns at most one row. With several rows T-SQL keeps the last row's values and PostgreSQL the first; with none T-SQL keeps the old values and PostgreSQL sets NULL.",
-                "The query returns at most one row. With several rows T-SQL keeps the last row's values and Db2 for i raises SQLSTATE 21000; with none both keep the old values (Db2 signals NOT FOUND, a warning that does not stop the routine).",
-            ).to_string();
-            self.note(Status::Assumptions, "ASM-SELECT-ASSIGN-CARDINALITY", &text);
+            // T-SQL assigns row by row: with no row the variables keep their
+            // values, with several the last row's values win, and an expression
+            // that uses an assigned variable (`@s = @s + x`) accumulates.
+            let assigned: Vec<String> = items
+                .iter()
+                .map(|it| trimmed(it)[0].s.to_ascii_lowercase())
+                .collect();
+            let accumulates = items.iter().any(|it| {
+                let t = trimmed(it);
+                let eq = t.iter().position(|x| x.k == OP && x.s == "=").unwrap();
+                t[eq + 1..]
+                    .iter()
+                    .any(|x| x.k == VARIABLE && assigned.contains(&x.s.to_ascii_lowercase()))
+            });
+            let one_row = from.is_some()
+                && find_word(&ts, 0, "GROUP").is_none()
+                && find_word(&ts, 0, "HAVING").is_none()
+                && find_word(&ts, 0, "UNION").is_none()
+                && find_word(&ts, 0, "EXCEPT").is_none()
+                && find_word(&ts, 0, "INTERSECT").is_none()
+                && items.iter().any(|it| has_aggregate(it));
             let rest: Vec<T> = ts[list_end..]
                 .iter()
                 .enumerate()
                 .filter(|(k, _)| !cut.contains(&(k + list_end)))
                 .map(|(_, t)| t.clone())
                 .collect();
+            if !self.db2() && !one_row && !accumulates {
+                // A loop over the query that assigns inside its body does exactly
+                // that. The variables cannot be the loop's own targets: PL/pgSQL sets
+                // the target of a loop over rows to NULL when the query returns no
+                // row. The loop needs a declared record, so the statement is a block
+                // of its own: the declaration stays inside it and nothing is hoisted.
+                let cols: Vec<String> = exprs
+                    .iter()
+                    .enumerate()
+                    .map(|(k, e)| format!("{e} AS sqldiff_c{}", k + 1))
+                    .collect();
+                let mut q = format!(
+                    "DECLARE\n  sqldiff_r record;\nBEGIN\n  FOR sqldiff_r IN SELECT {} {}",
+                    cols.join(", "),
+                    self.expr(&rest).trim()
+                );
+                if let Some(l) = limit {
+                    q.push_str(&self.limit(&l, " "));
+                }
+                q.push_str(" LOOP");
+                for (k, t) in targets.iter().enumerate() {
+                    q.push_str(&format!("\n    {t} := sqldiff_r.sqldiff_c{};", k + 1));
+                }
+                q.push_str("\n  END LOOP;\nEND;");
+                return Ok((q, true));
+            }
+            if !one_row {
+                let text = self.pick(
+                    "The query returns at most one row. With several rows T-SQL keeps the last row's values and PostgreSQL the first; with none T-SQL keeps the old values and PostgreSQL sets NULL. An expression that uses a variable it assigns accumulates row by row in T-SQL; here it is evaluated once.",
+                    "The query returns at most one row. With several rows T-SQL keeps the last row's values and Db2 for i raises SQLSTATE 21000; with none both keep the old values (Db2 signals NOT FOUND, a warning that does not stop the routine).",
+                ).to_string();
+                self.note(Status::Assumptions, "ASM-SELECT-ASSIGN-CARDINALITY", &text);
+            }
             let mut q = format!(
                 "SELECT {} INTO {} {}",
                 exprs.join(", "),
@@ -5393,4 +5442,31 @@ impl Cx<'_> {
             }
         })
     }
+}
+
+/// Whether a select-list item holds an aggregate call of its own, possibly
+/// inside other function calls (`NULLIF(COUNT(*), 0)`) but not inside a
+/// subquery, and no window function: a query whose items are like that and has
+/// no grouping returns exactly one row.
+fn has_aggregate(item: &[T]) -> bool {
+    // For every open parenthesis: whether it opens a subquery.
+    let mut subquery: Vec<bool> = Vec::new();
+    let mut found = false;
+    for (j, t) in item.iter().enumerate() {
+        if t.k == L_PAREN {
+            subquery.push(next_sig(item, j).is_some_and(|n| item[n].is("SELECT")));
+        } else if t.k == R_PAREN {
+            subquery.pop();
+        } else if t.is("OVER") {
+            return false;
+        } else if ["COUNT", "COUNT_BIG", "SUM", "MIN", "MAX", "AVG"]
+            .iter()
+            .any(|f| t.is(f))
+            && next_sig(item, j).is_some_and(|n| item[n].k == L_PAREN)
+            && !subquery.iter().any(|&q| q)
+        {
+            found = true;
+        }
+    }
+    found
 }
