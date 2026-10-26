@@ -307,6 +307,41 @@ fn explain_terms(
             ),
         ));
     }
+    // A PostgreSQL boolean meeting a number: the statement fails there.
+    if x.is("type-error") && x.kid(0).and_then(Term::atom) == Some("postgres") {
+        let why = match x.kid(1).and_then(Term::atom)? {
+            "cmp" | "in" => format!("PostgreSQL has no comparison between boolean and a number (operator does not exist: boolean = integer), while {sy} compares the bit as 0 or 1. Compare the boolean with TRUE or FALSE"),
+            "arith" => format!("PostgreSQL has no arithmetic on boolean (operator does not exist: boolean + integer), while {sy} computes with the bit as 0 or 1. Cast the boolean to integer first"),
+            "mix" => format!("PostgreSQL cannot give one CASE or COALESCE both boolean and numeric values (types boolean and integer cannot be matched), while {sy} returns the bit as a number"),
+            "assign" => format!("PostgreSQL does not store a number in a boolean (column is of type boolean but expression is of type integer), while {sy} stores 0 as 0 and any other number as 1. Write TRUE or FALSE, or (value <> 0)"),
+            "cast" => format!("PostgreSQL casts boolean only to integer and text, and only integer to boolean (cannot cast type), while {sy} converts the bit"),
+            _ => return None,
+        };
+        return Some((
+            ChangeClass::Semantic,
+            "equiv.bool-type-error",
+            format!("{sx} fails here: {why}."),
+        ));
+    }
+    // SQL Server rejects arithmetic between two bits.
+    if x.is("type-error") && x.kid(0).and_then(Term::atom) == Some("tsql") {
+        return Some((
+            ChangeClass::Semantic,
+            "equiv.bool-type-error",
+            format!("{sx} fails here: SQL Server has no arithmetic between two bits (Msg 402 / 8117), while {sy} computes it."),
+        ));
+    }
+    // A boolean written as text: 'true' / 'false' against a bit's '1' / '0'.
+    if x.is("booltext")
+        && ((y.is("cast") && y.kid(1) == x.kid(1)) || (y.is("tostr") && y.kid(0) == x.kid(1)))
+    {
+        let v = render(x.kid(1)?);
+        return Some((
+            ChangeClass::Semantic,
+            "equiv.bool-text",
+            format!("When {v} is set, {sx} writes it as 'true' or 'false' (a boolean as text) and {sy} as '1' or '0' (a bit as text)."),
+        ));
+    }
     // ISNULL truncating the replacement to the first argument's type.
     if x.is("isnull-narrow") && y.is("fn") && y.kid(0).and_then(Term::atom) == Some("coalesce") {
         let first = render(x.kid(1)?);

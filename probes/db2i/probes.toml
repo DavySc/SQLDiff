@@ -1885,3 +1885,78 @@ outcome = [
   { label = "error", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Raises an error, as T-SQL does (ASM-DATEADD-RANGE) (SQLSTATE and SQLCODE recorded)" },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Returns a value instead of an error (the value is in N1)" },
 ]
+
+# ---------------------------------------------------------------- V28 bit and boolean
+# T-SQL BIT becomes SMALLINT on Db2 for i (ASM-BIT-SMALLINT). These are open
+# questions for a later choice of BOOLEAN instead, and for what unconverted code
+# would do. No expectation is made: nothing the converter does depends on them.
+
+[[probe]]
+id = "V28-BOOLEAN-TYPE"
+fact = "V28"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CASE WHEN B THEN 1 ELSE 0 END FROM (SELECT CAST(''true'' AS BOOLEAN) AS B FROM SYSIBM.SYSDUMMY1) X'"]
+question = "Does this Db2 for i release have a BOOLEAN type that a CAST from 'true' produces and a CASE WHEN tests?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "boolean", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "BOOLEAN exists: CAST('true' AS BOOLEAN) is true." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "BOOLEAN exists but 'true' did not test true (the value is in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "No BOOLEAN type here (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V28-BOOLEAN-EQ-INT"
+fact = "V28"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CASE WHEN CAST(''true'' AS BOOLEAN) = 1 THEN 1 ELSE 0 END FROM SYSIBM.SYSDUMMY1'"]
+question = "Does a BOOLEAN compare with the integer 1 (PostgreSQL rejects boolean = integer; T-SQL bit = 1 is the usual test)?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "equal", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "TRUE = 1 holds: a BOOLEAN keeps T-SQL's bit = 1 tests." },
+  { label = "unequal", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "Compares, but TRUE = 1 is not true." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "BOOLEAN does not compare with an integer, or there is no BOOLEAN (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V28-BOOLEAN-FROM-INT"
+fact = "V28"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CASE WHEN CAST(2 AS BOOLEAN) THEN 1 ELSE 0 END FROM SYSIBM.SYSDUMMY1'"]
+question = "Does CAST(2 AS BOOLEAN) give true, as T-SQL stores any non-zero number in a bit as 1?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "true", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "Non-zero is true, as in T-SQL." },
+  { label = "false", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "2 casts to false." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "No cast from integer to BOOLEAN, or no BOOLEAN (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V28-SMALLINT-EQ-STRING"
+fact = "V28"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT CASE WHEN CAST(1 AS SMALLINT) = ''true'' THEN 1 ELSE 0 END FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL reads bit = 'true' as bit = 1 (the converter writes 1). What does Db2 for i do with SMALLINT = 'true' when it is left as written?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "true", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "open", meaning = "'true' compares as 1." },
+  { label = "false", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "Compares, but not as 1." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V28-BITAND-NULL"
+fact = "V28"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT COALESCE(BITAND(CAST(NULL AS SMALLINT), CAST(1 AS SMALLINT)), -1) FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL's bit & bit is NULL when an operand is NULL. Is BITAND(NULL, 1) NULL on Db2 for i (N1 = -1), so & could become BITAND?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "null", when = { create = "00000", state = "00000", n1 = "=-1" }, verdict = "open", meaning = "NULL, as T-SQL." },
+  { label = "value", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Not NULL (the value is in N1)." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+]

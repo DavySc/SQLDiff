@@ -419,6 +419,9 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
     }
     for (i, (x, y)) in ua.params.iter().zip(&ub.params).enumerate() {
         match (x.ty, y.ty) {
+            // A T-SQL bit becomes a PostgreSQL boolean: the converter's
+            // pg.bit-boolean decision, and the terms treat them alike.
+            (Some(tx), Some(ty)) if bit_bool(tx, ty) => {}
             (Some(tx), Some(ty)) if tx.fam != ty.fam => out.unknown_reasons.push(format!(
                 "parameter {} is {:?} on {na} and {:?} on {nb}",
                 i + 1,
@@ -431,7 +434,10 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
             )),
             _ => {}
         }
+        let bits = matches!((x.ty, y.ty), (Some(tx), Some(ty)) if bit_bool(tx, ty));
         match (&x.default, &y.default) {
+            (Some(dx), Some(dy))
+                if bits && bool_default(dx).is_some_and(|v| Some(v) == bool_default(dy)) => {}
             (Some(dx), Some(dy)) if dx != dy => out.unknown_reasons.push(format!(
                 "parameter {} defaults to {dx} on {na} and {dy} on {nb}",
                 i + 1
@@ -453,6 +459,7 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
         }
     }
     match (ua.returns, ub.returns) {
+        (Some(x), Some(y)) if bit_bool(x, y) => {}
         (Some(x), Some(y)) if x.fam != y.fam => out.unknown_reasons.push(format!(
             "the return type is {:?} on {na} and {:?} on {nb}",
             x.fam, y.fam
@@ -462,6 +469,26 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
             "Returned values fit the shorter of the declared return types",
         )),
         _ => {}
+    }
+}
+
+/// A bit (an integer of one bit, only T-SQL has one) against a boolean.
+fn bit_bool(x: schema::Ty, y: schema::Ty) -> bool {
+    let bit = |t: schema::Ty| t.fam == schema::Fam::Int && t.len == Some(1);
+    let bool = |t: schema::Ty| t.fam == schema::Fam::Bool;
+    (bit(x) && bool(y)) || (bool(x) && bit(y))
+}
+
+/// A bit or boolean parameter default as true or false: 1 / 0 or TRUE / FALSE.
+fn bool_default(s: &str) -> Option<bool> {
+    match s
+        .trim_matches(|c: char| c == '(' || c == ')' || c.is_whitespace())
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "1" | "TRUE" => Some(true),
+        "0" | "FALSE" => Some(false),
+        _ => None,
     }
 }
 
