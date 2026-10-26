@@ -1,0 +1,105 @@
+castlit|true|1
+castlit|TRUE|1
+castlit|True|1
+castlit|false|0
+castlit|FALSE|0
+castlit|1|1
+castlit|0|0
+castlit|2|1
+castlit|-1|1
+castlit| true|1
+castlit|true |1
+castlit| 1 |1
+castlit|yes|N
+castlit|t|N
+castlit|on|N
+castlit||0
+castlit|1.5|N
+castlit|0.0|N
+castlit|01|1
+castint|1|1|0|1|1|0|1
+stored|1|1|0
+stored|2|0|1
+stored|3|N|1
+stored|4|1|1
+eqtrue|1
+eqtrue|4
+eqTRUE|1
+eqTRUE|4
+eq1str|1
+eq1str|4
+eqfalse|2
+Msg 245, Level 16, State 1, Server 3e161e651a67, Line 1
+Conversion failed when converting the varchar value 'yes' to data type bit.
+eq2str|1
+eq2str|4
+ops|1|0|0|1|0|1|1
+ops|2|1|0|1|1|1|0
+ops|3|NU|NU|NULL|NULL|NUL|NULL
+ops|4|0|1|1|0|0|1
+types|bit|bit|int|int|bit|int|int|bit
+isnull|1|1|1|1|1
+isnull|2|0|0|0|0
+isnull|3|1|5|0|0
+isnull|4|1|1|1|1
+order|3
+order|2
+order|1
+order|4
+Msg 8117, Level 16, State 1, Server 3e161e651a67, Line 1
+Operand data type bit is invalid for minus operator.
+Msg 8117, Level 16, State 1, Server 3e161e651a67, Line 1
+Operand data type bit is invalid for sum operator.
+Msg 8117, Level 16, State 1, Server 3e161e651a67, Line 1
+Operand data type bit is invalid for max operator.
+Msg 8117, Level 16, State 1, Server 3e161e651a67, Line 1
+Operand data type bit is invalid for min operator.
+Msg 8117, Level 16, State 1, Server 3e161e651a67, Line 1
+Operand data type bit is invalid for avg operator.
+sumcast|2|1
+cnt|3|2
+decl|1|1|1|1
+Msg 245, Level 16, State 1, Server 3e161e651a67, Line 1
+Conversion failed when converting the varchar value 'yes' to data type bit.
+in|1
+in|2
+in|4
+not|2
+ne0|1
+ne0|4
+gt0|1
+gt0|4
+deflt|1|1|1
+ops|1|0|0|1|0|1|1|0|-2
+ops|2|1|0|1|1|0|0|0|-2
+ops|3|NU|NU|NULL|NULL|NUL|NULL|NULL|-2
+ops|4|0|1|1|0|0|1|0|-2
+types|bit|bit|int|int|bit|int|int|bit|bit
+isnull|1|1|1|1|1
+isnull|2|0|0|0|0
+isnull|3|1|5|0|0
+isnull|4|1|1|1|1
+order|3
+order|2
+order|1
+order|4
+case|1|1
+case|2|0
+case|3|0
+case|4|1
+concat|x1|x1|1
+concat|x0|x0|0
+Msg 402, Level 16, State 1, Server 3e161e651a67, Line 2
+The data types bit and varchar are incompatible in the add operator.
+bitcmpstr|y
+between|1
+between|2
+between|4
+Msg 402, Level 16, State 1, Server 3e161e651a67, Line 1
+The data types bit and bit are incompatible in the add operator.
+Msg 402, Level 16, State 1, Server 3e161e651a67, Line 1
+The data types bit and bit are incompatible in the subtract operator.
+Msg 8117, Level 16, State 1, Server 3e161e651a67, Line 1
+Operand data type bit is invalid for multiply operator.
+derived|1
+derived|4

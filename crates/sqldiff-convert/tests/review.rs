@@ -424,3 +424,29 @@ mod empty_files {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Appending to a ledger that is a symbolic link would write the decisions
+/// wherever it points.
+#[cfg(unix)]
+#[test]
+fn the_ledger_is_not_appended_through_a_link() {
+    let dir = std::env::temp_dir().join(format!("sqldiff-ledger-link-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::write(dir.join("elsewhere.txt"), "keep\n").unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("elsewhere.txt"),
+        dir.join("out").join(sqldiff_convert::review::LEDGER_FILE),
+    )
+    .unwrap();
+    let input = "SELECT 1;\n";
+    let c = pg(input);
+    let (_, id, _) = first(input, &c, c.units[0].status);
+    let r = record(input, &c, &id, "", State::Commented, By::Human);
+    let e = sqldiff_convert::review::append(&dir.join("out"), &r).unwrap_err();
+    assert!(e.contains("symbolic link"), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("elsewhere.txt")).unwrap(),
+        "keep\n"
+    );
+}

@@ -803,3 +803,17 @@ fn db2_sysdummy1_is_no_from() {
     );
     assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
 }
+
+/// An unterminated string literal has no value: it used to panic (or, for
+/// `'abc`, read as `ab`).
+#[test]
+fn unterminated_string_literal_is_not_read() {
+    for text in ["SELECT '", "SELECT 'é", "SELECT 'abc", "SELECT 'it''"] {
+        for d in [Dialect::Tsql, Dialect::Postgres, Dialect::Db2i] {
+            let a = sqldiff_core::Artifact::new("a.sql", d, text);
+            let b = sqldiff_core::Artifact::new("b.sql", d, "SELECT 'ab'");
+            let r = sqldiff_core::diff(&a, &b, &sqldiff_core::Options::default());
+            assert_ne!(r.verdict, sqldiff_core::Verdict::Equal, "{text:?} ({d:?})");
+        }
+    }
+}

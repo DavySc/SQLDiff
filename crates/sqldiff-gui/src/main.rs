@@ -259,7 +259,8 @@ fn url(listener: &TcpListener) -> Result<String, String> {
 }
 
 fn main() -> ExitCode {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    match sqldiff_core::with_engine_stack(|| run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("sqldiff-gui: {e}");

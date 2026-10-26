@@ -39,6 +39,10 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    sqldiff_core::with_engine_stack(|| serve(cli))
+}
+
+fn serve(cli: Cli) -> ExitCode {
     let cfg = config::cli_layer(&[], &[], None).and_then(|layer| {
         Resolved::load(&Sources {
             project: cli.config,

@@ -72,6 +72,11 @@ id = "V26"
 title = "Common table expressions: forward references and recursion without a column list"
 review = ["docs/convert-mode.md"]
 
+[[fact]]
+id = "V28"
+title = "BIT as SMALLINT, and BOOLEAN: open questions for a later BIT mapping"
+review = ["crates/sqldiff-convert/src/tsql/bits.rs"]
+
 [[link]]
 facts = ["V4"]
 file = "crates/sqldiff-convert/src/tsql.rs"
