@@ -76,6 +76,9 @@ struct Loaded {
     /// Milliseconds the last conversion took, and whether this read converted.
     convert_ms: f64,
     converted: bool,
+    /// The hand-written texts in the ledger the conversion used: they go
+    /// into the conversion itself, so a new one means converting again.
+    written: Vec<String>,
 }
 
 pub struct Review {
@@ -706,6 +709,7 @@ fn empty() -> Loaded {
         out_differs: Vec::new(),
         convert_ms: 0.0,
         converted: false,
+        written: Vec::new(),
     }
 }
 
@@ -717,8 +721,10 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         None => None,
     };
     let (inputs, unreadable) = tree::read(&s.tree)?;
+    let written = written_texts(&s.out)?;
     let same = prev.as_ref().is_some_and(|p| {
-        p.unreadable == unreadable
+        p.written == written
+            && p.unreadable == unreadable
             && p.inputs.len() == inputs.len()
             && p.inputs
                 .iter()
@@ -770,7 +776,26 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         out_differs,
         convert_ms,
         converted,
+        written,
     })
+}
+
+/// The ledger's hand-written texts (every `written` record with a text),
+/// in a fixed order: what `tree::convert` reads from the ledger.
+fn written_texts(out: &std::path::Path) -> Result<Vec<String>, String> {
+    let path = out.join(review::LEDGER_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut v: Vec<String> = review::Ledger::parse(&text)
+        .records()
+        .filter(|r| r.state == State::Written && r.text.is_some())
+        .map(|r| serde_json::to_string(r).unwrap_or_default())
+        .collect();
+    v.sort();
+    Ok(v)
 }
 
 /// The page with a payload embedded.
