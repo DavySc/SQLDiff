@@ -6,7 +6,7 @@
 //! config files carry the same sections (see [`crate::config`]). The format
 //! is documented in `docs/packs-and-config.md`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -205,6 +205,48 @@ pub struct TemplateSyntax {
     /// relative to the including template, else to the template tree.
     #[serde(default)]
     pub include: Option<String>,
+    /// What a parameter's values are, by name: `name` (the default),
+    /// `text` or `number` (no name rules apply), or `type`, `expression` or
+    /// `sql` (dialect code the rules cannot convert: give the value per
+    /// dialect in the instance manifest).
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+    /// Templates that are not whole statements, by path glob (first match
+    /// wins): `statements` (the default), `predicate`, `expression` (also a
+    /// select list), `set-list` or `routine-body`. They are converted inside
+    /// a fixed statement around them.
+    #[serde(default)]
+    pub fragments: Vec<FragmentRule>,
+    /// A routine's opening and closing templates, converted together.
+    #[serde(default)]
+    pub pairs: Vec<PairRule>,
+}
+
+/// Value kinds `[template] values` takes.
+pub const VALUE_KINDS: [&str; 6] = ["name", "text", "number", "type", "expression", "sql"];
+/// Fragment kinds `[[template.fragments]]` takes.
+pub const FRAGMENT_KINDS: [&str; 6] = [
+    "statements",
+    "predicate",
+    "expression",
+    "select-list",
+    "set-list",
+    "routine-body",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FragmentRule {
+    pub glob: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairRule {
+    /// Paths relative to the template tree.
+    pub head: String,
+    pub foot: String,
 }
 
 fn default_placeholder_name() -> String {
@@ -457,6 +499,35 @@ impl Policy {
             for f in &t.special_forms {
                 Regex::new(&f.pattern)
                     .map_err(|e| Error::new(format!("template special form `{}`: {e}", f.name)))?;
+            }
+            for (name, kind) in &t.values {
+                if !VALUE_KINDS.contains(&kind.as_str()) {
+                    return Err(Error::new(format!(
+                        "template.values `{name}` = `{kind}`: expected one of {}",
+                        VALUE_KINDS.join(", ")
+                    )));
+                }
+            }
+            for f in &t.fragments {
+                Glob::new(&f.glob)?;
+                if !FRAGMENT_KINDS.contains(&f.kind.as_str()) {
+                    return Err(Error::new(format!(
+                        "template.fragments `{}`: kind `{}`: expected one of {}",
+                        f.glob,
+                        f.kind,
+                        FRAGMENT_KINDS.join(", ")
+                    )));
+                }
+            }
+            let mut paired = BTreeSet::new();
+            for p in &t.pairs {
+                for f in [&p.head, &p.foot] {
+                    if !paired.insert(f) {
+                        return Err(Error::new(format!(
+                            "template.pairs: `{f}` is in more than one pair"
+                        )));
+                    }
+                }
             }
             if let Some(i) = &t.include {
                 if !t.special_forms.iter().any(|f| &f.name == i) {

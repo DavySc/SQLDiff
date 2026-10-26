@@ -30,50 +30,50 @@ use sqldiff_source::weave::{Instance, Manifest, Weaver, Woven};
 use crate::convert_cmd::{catalog, decode, parallel};
 use crate::source_cmd;
 
-#[derive(ClapArgs)]
+#[derive(ClapArgs, Clone)]
 pub struct InstancesArgs {
     /// The instance manifest (TOML): every result the generator produces,
     /// with its templates and parameter values.
-    manifest: PathBuf,
+    pub(crate) manifest: PathBuf,
     /// The source templates (the tree the generator reads today).
     #[arg(long, value_name = "DIR")]
-    source: PathBuf,
+    pub(crate) source: PathBuf,
     /// The converted templates (`sqldiff convert --template` output, or
     /// templates written by hand), with the same layout.
     #[arg(long, value_name = "DIR")]
-    target: PathBuf,
+    pub(crate) target: PathBuf,
     #[arg(long, default_value = "tsql")]
-    from: Dialect,
+    pub(crate) from: Dialect,
     #[arg(long)]
-    to: Dialect,
+    pub(crate) to: Dialect,
     /// Output directory for the woven instances and the report.
     #[arg(short, long)]
-    out: PathBuf,
+    pub(crate) out: PathBuf,
     /// The generator's own output: each instance's source weave must equal
     /// its `output` file there, and every file there must belong to an
     /// instance.
     #[arg(long, value_name = "DIR")]
-    woven: Option<PathBuf>,
+    pub(crate) woven: Option<PathBuf>,
     /// A parameter name (repeatable), added to the names the manifest gives
     /// values for; under `placeholders = "parameters"` only these are
     /// placeholders.
     #[arg(long = "parameter", value_name = "NAME")]
-    parameters: Vec<String>,
+    pub(crate) parameters: Vec<String>,
     /// An assumption you know holds (repeatable), e.g. ASM-DBO-SCHEMA: a
     /// status line in the converted templates that lists only accepted
     /// assumptions no longer holds an instance back. Listed in the report.
     #[arg(long = "accept", value_name = "ID")]
-    accept: Vec<String>,
+    pub(crate) accept: Vec<String>,
     /// Parallel jobs (default: available cores).
     #[arg(short, long)]
-    jobs: Option<usize>,
+    pub(crate) jobs: Option<usize>,
     /// Replace files in a non-empty output directory.
     #[arg(long)]
-    overwrite: bool,
+    pub(crate) overwrite: bool,
     #[command(flatten)]
-    catalogs: source_cmd::CatalogArgs,
+    pub(crate) catalogs: source_cmd::CatalogArgs,
     #[command(flatten)]
-    cfg: source_cmd::ConfigArgs,
+    pub(crate) cfg: source_cmd::ConfigArgs,
 }
 
 /// How far an instance can be trusted, best first.
@@ -123,7 +123,8 @@ const ORDER: [Outcome; 6] = [
 struct Item {
     status: Outcome,
     rule: String,
-    /// `source` or `target` instance; `manifest` for weaving.
+    /// `source` or `target` instance; `manifest` for weaving; `pair` for
+    /// the diff of the two as a whole.
     side: &'static str,
     /// 1-based line in the woven file, 0 when it has none.
     line: usize,
@@ -173,6 +174,14 @@ struct Report {
 }
 
 pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
+    let ok = check(a)?.0;
+    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+}
+
+/// Runs the check and writes the report: whether every instance is
+/// converted (under assumptions at worst) and all generator output is
+/// accounted for, and the count of instances per status.
+pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, usize>), String> {
     let cfg = a.cfg.resolve()?;
     let def = cfg
         .policy
@@ -181,6 +190,18 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
         .ok_or("instances needs a [template] syntax: give --pack or a sqldiff.toml with one")?;
     let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
     let manifest = Manifest::load(&a.manifest).map_err(|e| e.0)?;
+    let kinds: BTreeMap<String, sqldiff_convert::ValueKind> = def
+        .values
+        .iter()
+        .filter_map(|(n, k)| {
+            let n = if def.ignore_case {
+                n.to_uppercase()
+            } else {
+                n.clone()
+            };
+            Some((n, sqldiff_convert::ValueKind::parse(k)?))
+        })
+        .collect();
     if manifest.instances.is_empty() {
         return Err(format!("{}: no [[instance]]", a.manifest.display()));
     }
@@ -265,6 +286,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
             a.to,
             &opts,
             &a.accept,
+            &kinds,
         )
     });
 
@@ -298,6 +320,50 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
                     ),
                 });
             }
+        }
+    }
+
+    // An object two target instances create: the catalog holds one of the
+    // definitions, so what binds against it is not decided.
+    let mut creators: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (k, (_, t)) in woven.iter().enumerate() {
+        if !t.problems.is_empty() {
+            continue;
+        }
+        let mut c = sqldiff_core::catalog::Catalog::default();
+        let root = sqldiff_syntax::parse(&t.text, a.to).syntax();
+        sqldiff_core::catalog::ddl::load_tree(&mut c, &root, a.to);
+        let full = |schema: &Option<String>, name: &str| {
+            format!("{}.{name}", schema.as_deref().unwrap_or("")).to_ascii_lowercase()
+        };
+        let mut mine: BTreeSet<String> = BTreeSet::new();
+        mine.extend(c.tables.iter().map(|t| full(&t.schema, &t.name)));
+        mine.extend(
+            c.routines
+                .iter()
+                .map(|r| format!("routine {}", full(&r.schema, &r.name))),
+        );
+        for n in mine {
+            creators.entry(n).or_default().push(k);
+        }
+    }
+    for (name, ks) in creators.iter().filter(|(_, ks)| ks.len() > 1) {
+        let all: Vec<String> = ks
+            .iter()
+            .map(|&k| format!("`{}`", manifest.instances[k].name))
+            .collect();
+        for &k in ks {
+            results[k].0.push(Item {
+                status: Outcome::Unknown,
+                rule: "weave.object-twice".into(),
+                side: "target",
+                line: 0,
+                text: format!(
+                    "`{}` is created by instances {}: the later one fails or replaces the other, and binding against it used one of the definitions",
+                    name.trim_start_matches("routine ").trim_start_matches('.'),
+                    all.join(", ")
+                ),
+            });
         }
     }
 
@@ -386,7 +452,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
         .iter()
         .all(|r| r.status <= Outcome::Assumptions)
         && report.not_in_manifest.is_empty();
-    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+    Ok((ok, report.totals))
 }
 
 /// An instance's items, the engine's assumptions about the whole pair, and
@@ -405,6 +471,7 @@ fn check_instance(
     to: Dialect,
     opts: &Options,
     accepted: &[String],
+    kinds: &BTreeMap<String, sqldiff_convert::ValueKind>,
 ) -> Checked {
     let mut items = Vec::new();
     let weave = |side, w: &Woven, items: &mut Vec<Item>| {
@@ -531,8 +598,61 @@ fn check_instance(
             text: f.witness.clone(),
         });
     }
+    // What the diff could not compare at all (DDL, say) is not decided
+    // either: no finding about it is no evidence.
+    for r in &report.unknown_reasons {
+        items.push(Item {
+            status: Outcome::Unknown,
+            rule: "equiv.not-covered".into(),
+            side: "pair",
+            line: 0,
+            text: r.clone(),
+        });
+    }
+    if report.verdict == Verdict::Unknown && !items.iter().any(|x| x.status >= Outcome::Unknown) {
+        items.push(Item {
+            status: Outcome::Unknown,
+            rule: "equiv.unknown".into(),
+            side: "pair",
+            line: 0,
+            text: "the engine's diff of the source and target instances is UNKNOWN".into(),
+        });
+    }
     let engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
-    let spans: Vec<(usize, usize)> = t.values.iter().map(|v| (v.start, v.end)).collect();
+    // Names: only values that are names. Dialect code given once for every
+    // dialect is used unchanged in the target.
+    let kind = |n: &str| {
+        kinds
+            .get(n)
+            .copied()
+            .unwrap_or(sqldiff_convert::ValueKind::Name)
+    };
+    let spans: Vec<(usize, usize)> = t
+        .values
+        .iter()
+        .filter(|v| kind(&v.name) == sqldiff_convert::ValueKind::Name)
+        .map(|v| (v.start, v.end))
+        .collect();
+    let mut reported = BTreeSet::new();
+    for v in &t.values {
+        if kind(&v.name).per_dialect() && !v.per_dialect && reported.insert(&v.name) {
+            items.push(Item {
+                status: Outcome::Assumptions,
+                rule: "ASM-TEMPLATE-VALUE-SAME".into(),
+                side: "target",
+                line: lines_t.line_col(v.start).0,
+                text: format!(
+                    "{}'s value `{}` is {} code given once for every dialect and used unchanged in {}; give it in params_for.{} if {} needs another",
+                    v.name,
+                    &t.text[v.start..v.end],
+                    kind(&v.name).label(),
+                    to.display_name(),
+                    to.id(),
+                    to.display_name()
+                ),
+            });
+        }
+    }
     let mut names = Vec::new();
     for n in sqldiff_convert::names::check_values(&t.text, to, &spans) {
         if let Some(cut) = &n.truncated {
@@ -557,10 +677,14 @@ fn check_instance(
 
 /// Assumptions the woven instances discharge: the values are known, the
 /// includes are woven in, and each instance is woven with its own values.
-const DISCHARGED: [&str; 3] = [
+/// A value for dialect code is checked per instance below, and a fragment
+/// is checked in the woven statement.
+const DISCHARGED: [&str; 5] = [
     "ASM-TEMPLATE-PLACEHOLDER",
     "ASM-TEMPLATE-DIRECTIVE",
     "ASM-TEMPLATE-SHARED-VALUES",
+    "ASM-TEMPLATE-FRAGMENT",
+    "template.value-per-dialect",
 ];
 
 /// What `sqldiff convert` left in the converted templates: its status lines

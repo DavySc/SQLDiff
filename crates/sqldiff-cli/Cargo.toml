@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 sqldiff-syntax.workspace = true
+regex.workspace = true
 sqldiff-core.workspace = true
 sqldiff-source.workspace = true
 sqldiff-convert.workspace = true

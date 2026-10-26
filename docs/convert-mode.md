@@ -78,6 +78,29 @@ sqldiff convert templates/ -o out/ --to postgres --template --pack PACK [--param
 - **The output.** `ASM-TEMPLATE-DIRECTIVE` is written once, as the file's first line, instead of above every unit; every other status line is written as for plain files. Findings, notes and reasons quote placeholders as the template writes them.
 - **The report** says `"templates": true`, and each file lists its placeholders, unresolved candidates and directives under `template`.
 
+### Fragments, routine halves and value kinds
+
+Not every template is whole statements. The pack's `[template]` section says what the rest are, so each converts as what it is:
+
+```toml
+[template]
+# What a placeholder's values are. Default: name.
+values = { KEYTYPE = "type", NOTE = "text", LIMIT = "number", FILTER = "expression" }
+# Templates that hold part of a statement (first match wins). Default: statements.
+fragments = [
+  { glob = "where/**", kind = "predicate" },
+  { glob = "columns/**", kind = "select-list" },
+  { glob = "parts/body*.sql", kind = "routine-body" },
+]
+# A routine's opening and closing templates, converted as one routine.
+pairs = [{ head = "parts/head.sql", foot = "parts/foot.sql" }]
+```
+
+- **Fragment kinds** are `statements`, `predicate` (what follows `WHERE`), `expression` (one value, also `select-list`), `set-list` (what follows `UPDATE … SET`) and `routine-body` (statements inside `BEGIN … END`). A fragment is converted inside a stand-in statement of that kind, from T-SQL only, and cut out again with the template's own leading and trailing white space. If converting it changed the stand-in around it (a declaration hoisted, a parameter added, code moved across its edge, or a rule that did not apply), the template is kept as it is and flagged `template.context-leak` (differs), with the conversion's own reason when it gave one: it cannot be converted on its own. Otherwise every unit carries `ASM-TEMPLATE-FRAGMENT`: its names were not bound and its meaning in the woven statement was not checked. The stand-in's table is in the catalogs with unknown columns, so binding against it is never a finding.
+- **A routine-body fragment knows no parameters.** Converted on its own, the T-SQL parameter `@Id` in a body reads as a local variable and becomes `v_id`, while the opening template turns the same parameter into `p_id`. The unit then fails binding (differs), and so do the woven instances: nothing is claimed. Convert such a body by hand, or weave it into its routine before converting.
+- **Pairs** are converted together, as one routine, with a marker between them, and split again at the marker. If the conversion moved code across the marker, both templates are kept as they are and flagged `template.pair-split` (differs). A template is in at most one pair; the bodies woven between the halves are converted on their own, as fragments.
+- **Value kinds**: only `name` values are converted as names (`ASM-TEMPLATE-PLACEHOLDER`, checked against the target's name rules per instance). A `text` or `number` value means the same in every dialect. A `type`, `expression` or `sql` value is dialect code the rules cannot convert, so its unit is a decision (`template.value-per-dialect`): give the target's value in the instance manifest under `params_for`. The instance check discharges that decision, and a dialect-code value given only once, for every dialect, stays an assumption there (`ASM-TEMPLATE-VALUE-SAME`).
+
 A converted template tree is never the last word: a template is right only when every instance the generator weaves from it is, which the instance check verifies.
 
 ### Checking every woven instance
@@ -106,7 +129,7 @@ name = "Sales/Composed"
 parts = ["header.sql", { template = "body.tpl.sql", params = { X = "1" } }]
 ```
 
-Values merge manifest, then instance, then part; at each level a dialect's own values win. The names the manifest gives values for are the parameter list for the placeholder rules (`--parameter` adds more). The pack's `[template] include` names the special form that pulls another file in: its first capture is the path, next to the including file first, else from the tree root, never outside it. Any other special form is generator logic the weaver cannot run, and so is a missing value or an include cycle: that instance is **not woven** and nothing about it is claimed.
+Values merge manifest, then instance, then part; at each level a dialect's own values win. The names the manifest gives values for are the parameter list for the placeholder rules (`--parameter` adds more). The pack's `[template] include` names the special form that pulls another file in: its first capture is the path, next to the including file first, else from the tree root, never outside it (a symbolic link that points out of the tree is not followed). Any other special form is generator logic the weaver cannot run, and so is a missing value or an include cycle: that instance is **not woven** and nothing about it is claimed.
 
 Each target instance is checked the way `sqldiff convert` checks its output, with the catalog of every woven instance on its side (and any `--catalog`):
 
@@ -116,19 +139,49 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | The output check: binding, leftover source syntax, target limits, hazards | differs |
 | The engine's diff of the source weave against the target weave: a proven difference, or source syntax left in the target | differs |
 | The engine's diff: a finding it could neither prove nor rule out (`equiv.unproven`, …) | unknown |
+| The engine's diff could not compare a statement at all (`equiv.not-covered`): today every DDL statement, such as `CREATE TABLE`, so a table instance is never converted, whatever its column types | unknown |
 | The engine's diff: a finding equal only under assumptions (listed with the rule) | under assumptions |
 | A name a value is part of is a PostgreSQL reserved word unquoted (`Order`, `user`), or longer than 128 characters on Db2 for i | differs |
 | A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
 | A Db2 for i name from a value: no verified reserved-word list is built in (`ASM-DB2I-RESERVED-UNCHECKED`) | under assumptions |
+| A `type`, `expression` or `sql` value with no value of its own for the target (`params_for`) (`ASM-TEMPLATE-VALUE-SAME`) | under assumptions |
+| Two instances create the same table or routine (the later one fails or replaces the other; binding used one definition) (`weave.object-twice`) | unknown |
 | The source weave does not parse | unknown |
 
-The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE` and `ASM-TEMPLATE-SHARED-VALUES`: the values are known, the includes woven in, and each instance woven with its own values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
+The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE`, `ASM-TEMPLATE-SHARED-VALUES`, `ASM-TEMPLATE-FRAGMENT` and `template.value-per-dialect`: the values are known, the includes and fragments woven in, and each instance woven with its own values. Name checks apply only to `name` values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.
 
 With `--woven DIR` (the generator's real output) each source weave must equal its `output` file, ignoring trailing white space, or the instance is not woven (`weave.generator-mismatch`, with the first line that differs), and every file there that no instance names is listed under "not in manifest". That is what shows the manifest describes the generator completely.
 
 This is a stricter bar than `sqldiff convert`'s, where only a proven difference holds a unit back: an instance is converted only when no finding of the diff is left open. The assumptions the diff makes about every pair (name folding, the default schema) are listed per instance as `engine_assumptions` and do not count, as in `convert`.
 
 `check/instance-report.json` and `.md` give each instance's status and items (side, line in the woven file, rule), each converted template's status (the worst instance that uses it, includes too) and the converted templates no instance uses ("not exercised", never checked). The woven files are written to `check/source/` and `check/target/`. Exit code 0 when every instance is converted or converted under assumptions and all generator output is accounted for, 1 otherwise.
+
+### Keeping dialect trees in step
+
+Once the generator keeps one template set per dialect, the sets drift: a template is added, changed or rewired in one tree and not in the others. `sqldiff drift` finds that, in CI or before a commit:
+
+```sh
+sqldiff drift --tree tsql=templates/mssql --tree postgres=templates/pg --tree db2i=templates/ibmi -o drift/ --pack PACK \
+    [--reference tsql] [--base origin/main] [--manifest instances.toml] [--accept ASM-…] [--extension tpl …]
+```
+
+| Check | Rule |
+|---|---|
+| Every template (same relative path) is in every tree | `drift.missing` |
+| A template has the same placeholder names in every tree, so one set of values weaves all of them | `drift.placeholders` |
+| A template has the same directives (the pack's special forms, with their arguments) in the same order in every tree | `drift.directives` |
+| With `--base REV`: a template changed between the merge base of `REV` and `HEAD` and the working tree in some trees and not in all | `drift.changed-alone` |
+
+A change made in one tree on purpose adds the pack's `intentional_difference` author marker to that template (`-- SYNC-OK: why`, say) in the same change; the report lists it with its reason instead of failing. Only a marker on a line the change adds counts: one committed earlier explains no later change. With `--manifest`, every instance is also woven from the reference tree (the first `--tree` unless `--reference` says otherwise) and from each other tree and checked exactly like `sqldiff instances`, each into `drift/instances/<dialect>/`; a hand edit that changes what a template means then fails as differs or unknown there.
+
+`drift/drift-report.json` and `.md` list every finding by template and tree. Exit code 0 when nothing drifted and every instance check passed, 1 otherwise, so a CI step is the command itself:
+
+```yaml
+- run: sqldiff drift --tree tsql=templates/mssql --tree postgres=templates/pg --tree db2i=templates/ibmi
+         --base origin/${{ github.base_ref }} --manifest instances.toml --pack .sqldiff/pack -o drift/
+```
+
+`--base` needs the base branch's history in the checkout (`fetch-depth: 0`).
 
 ## The page
 

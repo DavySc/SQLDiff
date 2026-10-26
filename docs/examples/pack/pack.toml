@@ -65,6 +65,11 @@ collision = "error"
 special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
 # The special form that pulls another template in; `sqldiff instances` weaves it.
 include = "include"
+# What values are (default name), which templates hold part of a statement,
+# and a routine's opening and closing halves (see docs/convert-mode.md):
+# values = { KEYTYPE = "type", NOTE = "text" }
+# fragments = [{ glob = "where/**", kind = "predicate" }]
+# pairs = [{ head = "parts/head.sql", foot = "parts/foot.sql" }]
 
 [[composition]]
 name = "part markers"

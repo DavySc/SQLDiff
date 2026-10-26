@@ -19,6 +19,7 @@ mod changes_cmd;
 mod convert_cmd;
 mod deny_hash;
 mod dist_cmd;
+mod drift_cmd;
 mod instances_cmd;
 mod queue_cmd;
 mod review_cmd;
@@ -212,6 +213,11 @@ enum Command {
     /// every instance is converted or converted under assumptions (and,
     /// with --woven, all generator output is accounted for), 1 otherwise.
     Instances(instances_cmd::InstancesArgs),
+    /// Keep the template trees of several dialects in step: every template
+    /// in every tree, with the same placeholders and directives; with --base,
+    /// no template changed in one tree only; with --manifest, every instance
+    /// checked between the reference tree and each other tree.
+    Drift(drift_cmd::DriftArgs),
     /// Review what a branch changed (the pull request workflow): diff every
     /// SQL file changed between the merge base of --base and --head, base
     /// against head. Files that did not change are not read. SARIF results
@@ -525,10 +531,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 let def = cfg.policy.template.as_ref().ok_or(
                     "--template needs a [template] syntax: give --pack or a sqldiff.toml with one",
                 )?;
-                Some(convert_cmd::TemplateMode {
-                    placeholders: compose::Placeholders::new(def).map_err(|e| e.0)?,
-                    parameters: (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
-                })
+                Some(convert_cmd::TemplateMode::new(
+                    def,
+                    (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                )?)
             } else {
                 None
             };
@@ -552,6 +558,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             })
         }
         Command::Instances(args) => instances_cmd::run(args),
+        Command::Drift(args) => drift_cmd::run(args),
         Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Dist(args) => dist_cmd::run(args),

@@ -22,8 +22,8 @@ mod tok;
 mod tsql;
 
 pub use template::{
-    check_template, convert_template, rewrite_template, template_fragment, StandIns, TemplateDraft,
-    TemplateInfo,
+    check_template, convert_template, rewrite_template, rewrite_template_as, split_pair,
+    template_fragment, FragmentKind, StandIns, TemplateDraft, TemplateInfo, ValueKind,
 };
 
 /// How far a converted unit can be trusted, from best to worst.
