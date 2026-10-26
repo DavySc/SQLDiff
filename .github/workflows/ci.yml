@@ -52,3 +52,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Db2 for i probes (script up to date, ingest tests)
+        run: |
+          python probes/db2i/db2i_probes.py check
+          python -m unittest discover -s probes/db2i

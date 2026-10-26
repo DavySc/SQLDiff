@@ -85,6 +85,21 @@ class Definitions(unittest.TestCase):
     def test_check_passes(self):
         self.assertEqual(dp.cmd_check(None), 0)
 
+    def test_probe_set_is_the_same_in_a_crlf_checkout(self):
+        lf = dp.PROBES.read_bytes().replace(b"\r\n", b"\n")
+        want = dp.probes_hash()
+        saved = dp.PROBES
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                for name, text in (("lf", lf), ("crlf", lf.replace(b"\n", b"\r\n"))):
+                    dp.PROBES = Path(d) / f"{name}.toml"
+                    dp.PROBES.write_bytes(text)
+                    self.assertEqual(dp.probes_hash(), want, name)
+                dp.PROBES.write_bytes(lf + b"\n")
+                self.assertNotEqual(dp.probes_hash(), want)
+            finally:
+                dp.PROBES = saved
+
     def test_every_consistent_outcome_is_reachable(self):
         # An earlier outcome must not shadow a later one for the values it names.
         defs = dp.load_probes()
