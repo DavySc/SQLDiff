@@ -63,6 +63,11 @@ title = "Default USRPRF (*NAMING) of a routine without SET OPTION USRPRF"
 review = ["docs/cross-dialect-proofs.md", "docs/convert-mode.md"]
 
 [[fact]]
+id = "V27"
+title = "Labeled-duration arithmetic as the rewrite of DATEADD: month end, time wrap, number truncation, range"
+review = ["docs/convert-mode.md", "crates/sqldiff-convert/tests/dateadd.rs"]
+
+[[fact]]
 id = "V26"
 title = "Common table expressions: forward references and recursion without a column list"
 review = ["docs/convert-mode.md"]
@@ -114,3 +119,27 @@ facts = ["V25"]
 file = "crates/sqldiff-core/src/equiv/canon.rs"
 anchor = "\"ASM-DB2-USRPRF-USER\","
 hedge = "fact V25, not checked on a real system"
+
+[[link]]
+facts = ["V27"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-DB2-DATEADD-NUMBER\","
+hedge = "fact V27, not checked on a real system"
+
+[[link]]
+facts = ["V27"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-DB2-MONTH-END\","
+hedge = "fact V27, not checked on a real system"
+
+[[link]]
+facts = ["V27"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-DB2-TIME-WRAP\","
+hedge = "fact V27, not checked on a real system"
+
+[[link]]
+facts = ["V27"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "Db2 for i dates and timestamps also end at 0001 and 9999"
+hedge = "fact V27, not checked on a real system"

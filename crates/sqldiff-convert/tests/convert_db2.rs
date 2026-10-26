@@ -273,20 +273,20 @@ fn temp_tables_and_table_variables_are_global_temporary_tables() {
 
 #[test]
 fn date_functions() {
-    let src = "SELECT DATEADD(day, 3, d), DATEADD(month, 1, d), DATEPART(hour, d), DATEDIFF(day, a, b), DATEDIFF(month, a, b) FROM t;\nSELECT DATEDIFF(week, a, b) FROM t;\n";
+    let src = "CREATE TABLE t (d date, a date, b date);\nGO\nSELECT DATEADD(day, 3, d), DATEADD(month, 1, d), DATEPART(hour, d), DATEDIFF(day, a, b), DATEDIFF(month, a, b) FROM t;\nSELECT DATEDIFF(week, a, b) FROM t;\n";
     let c = db2(src);
     let o = &c.output;
-    assert!(o.contains("(d + (3) DAYS)"), "{o}");
-    assert!(o.contains("(d + (1) MONTHS)"), "{o}");
+    assert!(o.contains("(d + 3 DAYS)"), "{o}");
+    assert!(o.contains("(d + 1 MONTHS)"), "{o}");
     assert!(o.contains("HOUR(d)"), "{o}");
     assert!(o.contains("(DAYS(b) - DAYS(a))"), "{o}");
     assert!(
         o.contains("((YEAR(b) - YEAR(a)) * 12 + MONTH(b) - MONTH(a))"),
         "{o}"
     );
-    assert_ne!(c.units[0].status, Status::NotConverted, "{o}");
+    assert_ne!(c.units[1].status, Status::NotConverted, "{o}");
     // Week boundaries are not guessed.
-    assert_eq!(c.units[1].status, Status::NotConverted, "{o}");
+    assert_eq!(c.units[2].status, Status::NotConverted, "{o}");
 }
 
 #[test]
