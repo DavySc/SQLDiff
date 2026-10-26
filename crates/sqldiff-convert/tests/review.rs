@@ -372,3 +372,54 @@ mod tree_report {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn a_file_without_units_is_never_reviewed() {
+    for text in ["", "-- only a comment\n", "GO\n", "/* a block */\nGO\n"] {
+        let c = pg(text);
+        assert!(c.units.is_empty(), "{text:?} has units");
+        let f = review_file(PATH, text, &c, &Ledger::default());
+        assert!(!f.reviewed(), "{text:?}");
+    }
+}
+
+mod empty_files {
+    use super::*;
+    use sqldiff_convert::tree;
+
+    #[test]
+    fn the_tree_report_never_counts_a_file_without_units_as_reviewed() {
+        let dir = std::env::temp_dir().join(format!("sqldiff-review-empty-{}", std::process::id()));
+        let (src, out) = (dir.join("src"), dir.join("out"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        for (p, t) in [
+            ("empty.sql", ""),
+            ("comment.sql", "-- nothing\n"),
+            ("go.sql", "GO\n"),
+        ] {
+            std::fs::write(src.join(p), t).unwrap();
+        }
+        // An empty ledger is still a ledger.
+        std::fs::write(out.join(LEDGER_FILE), "").unwrap();
+        let a = tree::Args {
+            src: src.clone(),
+            from: Dialect::Tsql,
+            to: Dialect::Postgres,
+            jobs: Some(1),
+            no_catalog: false,
+            template: None,
+            extensions: tree::extensions(Vec::new()),
+        };
+        let (inputs, unreadable) = tree::read(&a).unwrap();
+        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out)).unwrap();
+        tree::review_in(&mut t, &inputs, &out).unwrap();
+        for f in &t.report.files {
+            assert!(!f.review.as_ref().unwrap().reviewed, "{}", f.path);
+        }
+        assert_eq!(t.report.ledger.as_ref().unwrap().files_reviewed, 0);
+        assert!(!tree::markdown(&t.report).contains("accepted in review"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

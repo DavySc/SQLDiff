@@ -169,7 +169,7 @@ pub struct FileReviewReport {
 }
 
 /// The ledger applied to one unit (`review::UnitReview`, without the unit).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct UnitReviewReport {
     /// Reviewed by people: shown as "accepted in review", never as converted.
     pub reviewed: bool,
@@ -182,7 +182,7 @@ pub struct UnitReviewReport {
     pub decisions: Vec<crate::review::Applied>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct UnitReport {
     /// Stable id (`review::unit_ids`): what review decisions are keyed to.
     pub id: String,
@@ -994,7 +994,9 @@ pub fn review(t: &mut Tree, inputs: &[Input], ledger: &crate::review::Ledger, pa
             .iter()
             .chain(&f.converted_units)
             .all(|u| u.review.as_ref().is_some_and(|r| r.reviewed));
-        let reviewed = all && fr.unplaced.is_empty();
+        // A file without units has nothing a person accepted: never reviewed.
+        let reviewed =
+            all && fr.unplaced.is_empty() && !(f.units.is_empty() && f.converted_units.is_empty());
         files_reviewed += usize::from(reviewed);
         f.review = Some(FileReviewReport {
             reviewed,

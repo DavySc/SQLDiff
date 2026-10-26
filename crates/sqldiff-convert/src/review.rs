@@ -413,8 +413,9 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
 }
 
 impl FileReview {
-    /// Every unit reviewed and nothing unplaced.
+    /// Every unit reviewed and nothing unplaced. A file without units has
+    /// nothing anyone accepted, so it is never reviewed.
     pub fn reviewed(&self) -> bool {
-        self.unplaced.is_empty() && self.units.iter().all(|u| u.reviewed)
+        !self.units.is_empty() && self.unplaced.is_empty() && self.units.iter().all(|u| u.reviewed)
     }
 }
