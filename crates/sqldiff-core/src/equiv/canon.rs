@@ -42,7 +42,15 @@ pub mod asm {
     );
     pub const UNTYPED: (&str, &str) = (
         "ASM-UNTYPED-NONCHAR",
-        "Values whose type is unknown (no catalog) are not character strings, so comparison and `+` mean the same on both sides",
+        "Values whose type is unknown (no catalog) are not character strings, real (single precision), T-SQL tinyint or decimals of 38 digits, so comparison and arithmetic mean the same on both sides",
+    );
+    pub const UNTYPED_CAST: (&str, &str) = (
+        "ASM-UNTYPED-CAST",
+        "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
+    );
+    pub const UNTYPED_STORE: (&str, &str) = (
+        "ASM-UNTYPED-STORE",
+        "Values stored in columns or variables of unknown type (no catalog) convert the same on both sides: no fraction goes into an integer, no number into a bit or boolean, no string longer than the column, and no text into a number",
     );
     pub const TSQL_PLUS_STRING: (&str, &str) = (
         "ASM-TSQL-PLUS-IS-CONCAT",
@@ -109,6 +117,36 @@ pub mod asm {
     pub fn make(x: (&str, &str)) -> crate::model::Assumption {
         crate::model::Assumption::default(x.0, x.1)
     }
+}
+
+/// How a value is converted to a type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum How {
+    /// CAST / CONVERT / `::`.
+    Cast,
+    /// Stored in a column.
+    Store,
+    /// Assigned to a variable, parameter or return value.
+    Var,
+}
+
+impl How {
+    fn name(self) -> &'static str {
+        match self {
+            How::Cast => "cast",
+            How::Store => "store",
+            How::Var => "assign",
+        }
+    }
+}
+
+/// Whether a conversion means the same in every dialect.
+enum Rule {
+    Same,
+    /// T-SQL drops the fraction first.
+    Trunc,
+    /// Dialect-specific (or not checked).
+    Dialect,
 }
 
 #[derive(Debug, Clone)]
@@ -427,6 +465,14 @@ impl<'a> Canon<'a> {
                 dst.len.is_none()
                     || (src.len.is_some() && dst.len >= src.len && dst.scale == src.scale)
             }
+            Fam::Float => dst.len >= src.len,
+            // Fewer fractional digits (or other ticks) round the value. A time
+            // of unknown precision (SYSDATETIME(), now()) is the time source's
+            // question, not this one.
+            Fam::Timestamp | Fam::TimestampTz | Fam::Time => {
+                src.len.is_none()
+                    || (dst.scale == src.scale && dst.len.zip(src.len).is_some_and(|(d, s)| d >= s))
+            }
             _ => true,
         }
     }
@@ -449,7 +495,12 @@ impl<'a> Canon<'a> {
         v: (Term, Option<Ty>),
         var: bool,
     ) -> (Term, Option<Ty>) {
-        let Some(d) = dst else { return v };
+        let Some(d) = dst else {
+            if !matches!(v.0.head(), "null") {
+                self.assume(asm::UNTYPED_STORE);
+            }
+            return v;
+        };
         if let Some(b) = self.bool_conv(d, &v, var) {
             return b;
         }
@@ -459,17 +510,19 @@ impl<'a> Canon<'a> {
                 v.0.kid(0)
                     .and_then(Term::atom)
                     .and_then(|x| x.parse::<i128>().ok());
-            if bits > 1
-                && bits <= 64
-                && lit.is_some_and(|x| (-(1i128 << (bits - 1))..(1i128 << (bits - 1))).contains(&x))
-            {
+            // T-SQL tinyint holds 0 to 255.
+            let range = match bits {
+                8 => 0..256,
+                _ => -(1i128 << (bits - 1).min(127))..(1i128 << (bits - 1).min(127)),
+            };
+            if bits > 1 && bits <= 64 && lit.is_some_and(|x| range.contains(&x)) {
                 return (v.0, Some(*d));
             }
         }
         match &v.1 {
             Some(s) if Self::fits(d, s) => v,
             None if matches!(v.0.head(), "null") => v,
-            _ => (n("conv", vec![Self::ty_term(dst), v.0]), Some(*d)),
+            _ => self.convert(*d, v, if var { How::Var } else { How::Store }),
         }
     }
 
@@ -642,18 +695,7 @@ impl<'a> Canon<'a> {
                         .unwrap_or_else(|| (n("sym", vec![a(lc(v))]), None))
                 }
             }
-            Expr::Num(s) => {
-                let ty = if s.contains(['.', 'e']) {
-                    Ty::of(Fam::Exact)
-                } else {
-                    Ty {
-                        fam: Fam::Int,
-                        len: Some(32),
-                        scale: None,
-                    }
-                };
-                (n("num", vec![a(s.clone())]), Some(ty))
-            }
+            Expr::Num(s) => self.num_lit(s),
             Expr::Str(s) => (
                 n("str", vec![a(s.clone())]),
                 Some(Ty {
@@ -893,7 +935,14 @@ impl<'a> Canon<'a> {
             // to text ('true' / 'false'), and to no other type.
             return match dst.fam {
                 Fam::Bool => (Self::bit_value(v.0), to),
-                Fam::Int if dst.len == Some(32) => (Self::bit_value(v.0), to),
+                // 0 or 1: typed as a bit value, so its text is one digit.
+                Fam::Int if dst.len == Some(32) => (
+                    Self::bit_value(v.0),
+                    Some(Ty {
+                        len: Some(1),
+                        ..dst
+                    }),
+                ),
                 _ if dst.is_string() => (n("booltext", vec![Self::ty_term(&to), v.0]), to),
                 _ => (self.type_error("cast", vec![Self::ty_term(&to), v.0]), to),
             };
@@ -927,11 +976,15 @@ impl<'a> Canon<'a> {
         // Integer to string: every dialect prints the plain decimal form.
         if dst.is_string() && dst.fam == Fam::VarChar {
             if let Some(src) = v.1 {
-                if src.fam == Fam::Int
-                    && dst
-                        .len
-                        .map_or(true, |l| l >= 20 || (l >= 11 && src.len <= Some(32)))
-                {
+                // The longest text of the type: -32768 for smallint.
+                let width = match src.len {
+                    Some(1) => 1,
+                    Some(2..=8) => 3,
+                    Some(9..=16) => 6,
+                    Some(17..=32) => 11,
+                    _ => 20,
+                };
+                if src.fam == Fam::Int && dst.len.map_or(true, |l| l >= width) {
                     let len = None;
                     return (
                         n("tostr", vec![v.0]),
@@ -950,12 +1003,230 @@ impl<'a> Canon<'a> {
         {
             return (n("todate", vec![v.0]), Some(dst));
         }
+        // A decimal of known precision and scale to a string long enough:
+        // every dialect prints the digits with exactly `scale` decimals.
+        if let (Fam::VarChar, Some(src)) = (dst.fam, v.1) {
+            if let (Fam::Exact, Some(p), Some(s)) = (src.fam, src.len, src.scale) {
+                let width = 1 + p.saturating_sub(s).max(1) + if s > 0 { s + 1 } else { 0 };
+                if self.d != Dialect::Db2i && dst.len.map_or(true, |l| l >= width) {
+                    return (
+                        n("numstr", vec![a(s.to_string()), v.0]),
+                        Some(Ty::of(Fam::VarChar)),
+                    );
+                }
+            }
+        }
         if let Some(src) = v.1 {
-            if src == dst {
+            if src == dst && src.fam != Fam::Other {
                 return v;
             }
         }
-        (n("cast", vec![Self::ty_term(&Some(dst)), v.0]), Some(dst))
+        self.convert(dst, v, How::Cast)
+    }
+
+    // ---- casts and implicit conversions ----------------------------------
+    //
+    // A conversion keeps one term in every dialect only where SQL Server 2022
+    // and PostgreSQL 18 give the same value or the same error (eval/casts).
+    // T-SQL truncates a decimal or float converted to an integer, so that
+    // conversion is written with `trunc`, which PostgreSQL's `trunc(x)` also
+    // lowers to. Any other conversion keeps the dialect and the source type
+    // (`dcast`), so it equals only itself. Db2 for i conversions are kept only
+    // between integers, to wider decimals and for strings that fit; the open
+    // questions are probes V30 (probes/db2i).
+
+    /// The type of a numeric literal as each dialect reads it: an integer in
+    /// int range is int; a larger one is decimal in T-SQL and bigint (then
+    /// numeric) elsewhere; one with a decimal point is decimal(p, s); one with
+    /// an exponent is float in T-SQL and Db2 for i but numeric in PostgreSQL;
+    /// `0x1F` is varbinary in T-SQL and an integer in PostgreSQL.
+    fn num_lit(&self, s: &str) -> (Term, Option<Ty>) {
+        let d = self.d;
+        let (neg, body) = match s.strip_prefix('-') {
+            Some(b) => (true, b),
+            None => (false, s),
+        };
+        let int = |bits: u32| Ty {
+            fam: Fam::Int,
+            len: Some(bits),
+            scale: None,
+        };
+        let exact = |p: Option<u32>, s: u32| Ty {
+            fam: Fam::Exact,
+            len: p,
+            scale: Some(s),
+        };
+        if let Some(hex) = body.strip_prefix("0x") {
+            let value = (d == Dialect::Postgres)
+                .then(|| i128::from_str_radix(&hex.replace('_', ""), 16).ok())
+                .flatten();
+            return match value {
+                Some(v) => self.num_lit(&format!("{}{v}", if neg { "-" } else { "" })),
+                None => (
+                    n("hexlit", vec![self.dtag(), a(s)]),
+                    Some(Ty::of(Fam::Other)),
+                ),
+            };
+        }
+        let text = if d == Dialect::Postgres {
+            s.replace('_', "")
+        } else {
+            s.to_string()
+        };
+        let body = text.trim_start_matches('-');
+        if body.contains('e') {
+            if d == Dialect::Postgres {
+                return (n("num", vec![a(text)]), Some(Ty::of(Fam::Exact)));
+            }
+            let ty = Ty {
+                fam: Fam::Float,
+                len: Some(53),
+                scale: None,
+            };
+            return (n("flt", vec![a(text)]), Some(ty));
+        }
+        let ty = if let Some((i, f)) = body.split_once('.') {
+            let digits = i.trim_start_matches('0').len() as u32 + f.len() as u32;
+            exact(Some(digits.max(f.len() as u32).max(1)), f.len() as u32)
+        } else {
+            match text.parse::<i128>() {
+                Ok(v) if i32::try_from(v).is_ok() => int(32),
+                Ok(v) if d != Dialect::Tsql && i64::try_from(v).is_ok() => int(64),
+                _ => exact(Some(body.trim_start_matches('0').len().max(1) as u32), 0),
+            }
+        };
+        (n("num", vec![a(text)]), Some(ty))
+    }
+
+    /// `v` converted to `dst`: by CAST, by storing it in a column, or by
+    /// assigning it to a variable, parameter or return value.
+    fn convert(&mut self, dst: Ty, v: (Term, Option<Ty>), how: How) -> (Term, Option<Ty>) {
+        let to = Some(dst);
+        let head = if how == How::Cast { "cast" } else { "conv" };
+        // A decimal literal without a fraction (2.0) converts to an integer
+        // the same everywhere.
+        let whole = v.0.is("num")
+            && v.0.kid(0).and_then(Term::atom).is_some_and(|x| {
+                x.split_once('.')
+                    .is_some_and(|(_, f)| !f.contains('e') && f.bytes().all(|b| b == b'0'))
+            });
+        // Without a catalog most values have no type: storing or assigning
+        // one, or casting it to a number or string, is assumed to convert
+        // alike.
+        if matches!(v.0.head(), "null") {
+            return (n(head, vec![Self::ty_term(&to), v.0]), to);
+        }
+        if v.1.is_none() {
+            let castable = matches!(
+                dst.fam,
+                Fam::Int | Fam::Exact | Fam::Float | Fam::VarChar | Fam::Char
+            );
+            if how != How::Cast || castable {
+                self.assume(if how == How::Cast {
+                    asm::UNTYPED_CAST
+                } else {
+                    asm::UNTYPED_STORE
+                });
+                return (n(head, vec![Self::ty_term(&to), v.0]), to);
+            }
+        }
+        let rule = match self.conv_rule(v.1, dst, how) {
+            Rule::Trunc | Rule::Dialect
+                if whole && dst.fam == Fam::Int && self.d != Dialect::Db2i =>
+            {
+                Rule::Same
+            }
+            r => r,
+        };
+        match rule {
+            Rule::Same => (n(head, vec![Self::ty_term(&to), v.0]), to),
+            Rule::Trunc => (
+                n(
+                    head,
+                    vec![Self::ty_term(&to), n("fn", vec![a("trunc"), v.0])],
+                ),
+                to,
+            ),
+            Rule::Dialect => (
+                n(
+                    "dcast",
+                    vec![
+                        self.dtag(),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&v.1),
+                        v.0,
+                    ],
+                ),
+                to,
+            ),
+        }
+    }
+
+    /// Whether converting a `src` value to `dst` gives the same result in
+    /// every dialect (eval/casts has the runs behind each line).
+    fn conv_rule(&self, src: Option<Ty>, dst: Ty, how: How) -> Rule {
+        use Fam::*;
+        let Some(src) = src else { return Rule::Dialect };
+        if src.fam == Other || dst.fam == Other {
+            return Rule::Dialect;
+        }
+        // A value without a fraction: an integer, a decimal of scale 0, or
+        // the result of trunc().
+        let integral = src.fam == Int || (matches!(src.fam, Exact | Float) && src.scale == Some(0));
+        if self.d == Dialect::Db2i {
+            return match (src.fam, dst.fam) {
+                (Int, Int | Exact) => Rule::Same,
+                // A string no longer than the column is stored as it is
+                // (blank-padded in CHAR).
+                (Char | VarChar, Char | VarChar)
+                    if how == How::Store && src.len.zip(dst.len).is_some_and(|(s, d)| s <= d) =>
+                {
+                    Rule::Same
+                }
+                (Exact, Exact)
+                    if dst.len.is_none()
+                        || (src.len.is_some()
+                            && src.scale.is_some()
+                            && dst.scale >= src.scale
+                            && dst.len.zip(src.len).is_some_and(|(d, s)| {
+                                d - dst.scale.unwrap_or(0) >= s - src.scale.unwrap_or(0)
+                            })) =>
+                {
+                    Rule::Same
+                }
+                _ => Rule::Dialect,
+            };
+        }
+        match (src.fam, dst.fam) {
+            // Out of range is an error on both sides.
+            (Int, Int | Exact | Float) => Rule::Same,
+            // Both round half away from zero (1.555 → 1.56, -2.5 → -3).
+            (Exact, Exact) => Rule::Same,
+            (Exact | Float, Int) if integral => Rule::Same,
+            // T-SQL truncates (1.5 → 1, -1.5 → -1); PostgreSQL rounds,
+            // numeric half away from zero and float half to even.
+            (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
+            (Float, Float) => Rule::Same,
+            // Explicit casts truncate silently on both sides, and storing too
+            // long a string fails on both; a T-SQL variable truncates where a
+            // PL/pgSQL one fails. CHAR pads on both; what differs is how
+            // padded values compare and concatenate, which those terms keep.
+            (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
+            (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
+            // Fewer fractional digits round differently: PostgreSQL rounds a
+            // half away from 2000-01-01 and to 24:00:00.
+            (Timestamp, Timestamp | Time) | (Time, Time)
+                if src.scale == dst.scale
+                    && src
+                        .len
+                        .zip(dst.len)
+                        .map_or(src.len.is_none(), |(s, d)| d >= s) =>
+            {
+                Rule::Same
+            }
+            _ => Rule::Dialect,
+        }
     }
 
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
@@ -1004,6 +1275,32 @@ impl<'a> Canon<'a> {
                     n("stringagg", vec![x, sep, n("order", order)]),
                     Some(Ty::of(Fam::VarChar)),
                 ));
+            }
+            // CONVERT(type, x) without a style is CAST(x AS type).
+            (Dialect::Tsql, "convert") if argc == 2 && plain => {
+                let ty = match &c.args[0] {
+                    Expr::Name(p) if p.len() == 1 => Some(super::ast::Type {
+                        name: p[0].to_uppercase(),
+                        args: Vec::new(),
+                    }),
+                    Expr::Call(t) if t.name.len() == 1 && t.args.iter().all(type_arg) => {
+                        Some(super::ast::Type {
+                            name: t.name[0].to_uppercase(),
+                            args: t
+                                .args
+                                .iter()
+                                .map(|x| match x {
+                                    Expr::Num(v) => v.clone(),
+                                    _ => "MAX".to_string(),
+                                })
+                                .collect(),
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(ty) = ty {
+                    return self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty));
+                }
             }
             // IIF is shorthand for this CASE; SQL Server rewrites it so.
             (Dialect::Tsql, "iif") if argc == 3 && plain => {
@@ -1132,6 +1429,23 @@ impl<'a> Canon<'a> {
                     )
                 }
             }
+            // trunc drops the fraction. Of anything but numeric it is
+            // trunc(double precision), which loses digits past 2^53.
+            (Dialect::Postgres, "trunc", 1) if first_ty.is_some_and(|t| t.is_numeric()) => {
+                let t = first_ty.unwrap();
+                let ty = match t.fam {
+                    Fam::Exact => Ty {
+                        scale: Some(0),
+                        ..t
+                    },
+                    _ => Ty {
+                        fam: Fam::Float,
+                        len: Some(53),
+                        scale: Some(0),
+                    },
+                };
+                portable("trunc", args, Some(ty))
+            }
             (Dialect::Db2i, "days", 1) => {
                 (n("days", vec![args[0].0.clone()]), Some(Ty::of(Fam::Int)))
             }
@@ -1146,11 +1460,7 @@ impl<'a> Canon<'a> {
                     scale: None,
                 };
                 let v = args.into_iter().next().unwrap();
-                if v.1.is_some_and(|t| t.fam == Fam::Int) && name == "varchar" {
-                    (n("tostr", vec![v.0]), Some(Ty::of(Fam::VarChar)))
-                } else {
-                    (n("cast", vec![Self::ty_term(&Some(dst)), v.0]), Some(dst))
-                }
+                self.cast(dst, v)
             }
             _ => {
                 let ty = None;
@@ -1250,8 +1560,24 @@ impl<'a> Canon<'a> {
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
-                if !known {
+                // A number against a value of unknown type, which may be real.
+                let maybe_real = |t: &Option<Ty>, other: (&Term, Option<Ty>)| {
+                    t.is_none()
+                        && other.1.is_some_and(|x| x.is_numeric())
+                        && !Self::small_int(other.0)
+                };
+                if !known || maybe_real(&lty, (&rt, rty)) || maybe_real(&rty, (&lt, lty)) {
                     self.assume(asm::UNTYPED);
+                }
+                if self.real_mix((&lt, lty), (&rt, rty)) {
+                    // T-SQL converts the other value to real, PostgreSQL both
+                    // to double precision: CAST(0.1 AS real) = 0.1 is true
+                    // only in T-SQL.
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-real", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
                 }
                 let (x, y, op) = order_operands(op, lt, rt);
                 Ok((n("cmp", vec![a(op), x, y]), Some(Ty::of(Fam::Bool))))
@@ -1324,14 +1650,16 @@ impl<'a> Canon<'a> {
                 }
                 let both_int = lty.is_some_and(|t| t.fam == Fam::Int)
                     && rty.is_some_and(|t| t.fam == Fam::Int);
-                if lty.is_none() && rty.is_none() {
+                if lty.is_none() || rty.is_none() {
                     self.assume(asm::UNTYPED);
                 }
                 if matches!(op, "*" | "/" | "%") && !both_int {
                     // Decimal precision and scale rules differ per dialect.
                     return Ok((n("arith", vec![self.dtag(), a(op), lt, rt]), None));
                 }
-                let ty = if both_int { lty } else { lty.or(rty) };
+                let Some(ty) = self.arith_ty(lty, rty) else {
+                    return Ok((n("arith", vec![self.dtag(), a(op), lt, rt]), None));
+                };
                 let h = match op {
                     "+" => "add",
                     "-" => "sub",
@@ -1347,6 +1675,87 @@ impl<'a> Canon<'a> {
                 Ok((n(h, vec![lt, rt]), ty))
             }
             _ => Ok((n("dfn", vec![self.dtag(), a(op), lt, rt]), None)),
+        }
+    }
+
+    /// Whether a real (single precision) meets a number of another type,
+    /// other than a small integer literal.
+    fn real_mix(&self, l: (&Term, Option<Ty>), r: (&Term, Option<Ty>)) -> bool {
+        let real = |t: &Option<Ty>| t.is_some_and(|t| t.fam == Fam::Float && t.len == Some(24));
+        let other = |(t, ty): (&Term, Option<Ty>)| {
+            ty.is_some_and(|x| x.is_numeric()) && !real(&ty) && !Self::small_int(t)
+        };
+        (real(&l.1) && other(r)) || (real(&r.1) && other(l))
+    }
+
+    /// An integer literal that a real holds exactly.
+    fn small_int(t: &Term) -> bool {
+        t.is("num")
+            && t.kid(0)
+                .and_then(Term::atom)
+                .and_then(|x| x.parse::<i64>().ok())
+                .is_some_and(|x| x.abs() <= 1 << 24)
+    }
+
+    /// The type of `+` or `-` of two numbers, or None where the dialects
+    /// differ: T-SQL tinyint arithmetic (PostgreSQL has no tinyint), a real
+    /// with another number (real in T-SQL, double precision in PostgreSQL),
+    /// and a T-SQL decimal sum of known types that needs more than 38 digits
+    /// (it overflows where PostgreSQL's numeric does not).
+    fn arith_ty(&self, l: Option<Ty>, r: Option<Ty>) -> Option<Option<Ty>> {
+        let (Some(x), Some(y)) = (l, r) else {
+            return Some(l.or(r));
+        };
+        if !x.is_numeric() || !y.is_numeric() {
+            return Some(l.or(r));
+        }
+        let small = |t: &Ty| t.fam == Fam::Int && matches!(t.len, Some(1..=8));
+        if self.d == Dialect::Tsql && small(&x) && small(&y) {
+            return None;
+        }
+        let real = |t: &Ty| t.fam == Fam::Float && t.len == Some(24);
+        if real(&x) != real(&y) {
+            return None;
+        }
+        if x.fam == Fam::Int && y.fam == Fam::Int {
+            let len = x.len.zip(y.len).map(|(a, b)| a.max(b));
+            return Some(Some(Ty { len, ..x }));
+        }
+        if x.fam == Fam::Float || y.fam == Fam::Float {
+            let len = if real(&x) { Some(24) } else { Some(53) };
+            return Some(Some(Ty {
+                fam: Fam::Float,
+                len,
+                scale: None,
+            }));
+        }
+        // Decimal digits before and after the point.
+        let digits = |t: &Ty| match t.fam {
+            Fam::Int => t.len.map(|b| {
+                let p = match b {
+                    0..=1 => 1,
+                    2..=8 => 3,
+                    9..=16 => 5,
+                    17..=32 => 10,
+                    _ => 19,
+                };
+                (p, 0)
+            }),
+            _ => t.len.zip(t.scale).map(|(p, s)| (p.saturating_sub(s), s)),
+        };
+        match (digits(&x), digits(&y)) {
+            (Some((i1, s1)), Some((i2, s2))) => {
+                let (i, s) = (i1.max(i2) + 1, s1.max(s2));
+                if self.d == Dialect::Tsql && i + s > 38 {
+                    return None;
+                }
+                Some(Some(Ty {
+                    fam: Fam::Exact,
+                    len: Some(i + s),
+                    scale: Some(s),
+                }))
+            }
+            _ => Some(Some(Ty::of(Fam::Exact))),
         }
     }
 
@@ -2995,6 +3404,15 @@ fn mentions(e: &Expr, alias: &str) -> bool {
         Expr::Tuple(l) => l.iter().any(|y| mentions(y, alias)),
         // Subqueries could reference the alias; treat as mentioning it.
         Expr::Exists(_) | Expr::Subquery(_) | Expr::InQuery(..) | Expr::Case(..) => true,
+        _ => false,
+    }
+}
+
+/// A type argument written in CONVERT: a length or MAX.
+fn type_arg(e: &Expr) -> bool {
+    match e {
+        Expr::Num(v) => v.bytes().all(|b| b.is_ascii_digit()),
+        Expr::Name(p) => p.len() == 1 && p[0].eq_ignore_ascii_case("max"),
         _ => false,
     }
 }

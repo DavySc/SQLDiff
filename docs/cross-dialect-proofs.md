@@ -282,6 +282,48 @@ A search finds nothing for rewrites that keep the meaning (`x > p` against
 `x >= p + 1` on integers, `x = p OR x <> p` against `x IS NOT NULL`), so they
 stay "unknown"; the search never makes a verdict "equal".
 
+## Casts and literal types
+
+A conversion (CAST, CONVERT, `::`, storing a value in a column, assigning it
+to a variable, parameter or return value) has one term in every dialect only
+where SQL Server 2022 and PostgreSQL 18 give the same value or the same error
+for it. The runs are in `eval/casts/`. Any other conversion keeps the dialect
+and the source type (`dcast`) and equals nothing in another dialect, so the
+pair is "unknown" or, where a value shows the difference, "different":
+
+| Conversion | T-SQL | PostgreSQL | Rule |
+|---|---|---|---|
+| decimal or float to an integer | drops the fraction (1.5 → 1, -2.5 → -2) | rounds (numeric half away from zero, float half to even) | `equiv.cast-rounding`; `trunc(x)` makes it equal |
+| float to decimal(p,2) | from the binary value (2.675 → 2.67) | from the shortest decimal form (2.68) | `equiv.cast-rounding` |
+| float to text | 6 significant digits (1234567 → '1.23457e+006') | shortest exact form ('1234567') | `equiv.float-text` |
+| text to a number | '' is 0; '1e3' is no decimal | '' fails; '1e3' is 1000 | `equiv.cast-string-number` |
+| timestamp or time to fewer fractional digits | rounds a half up; time stays below 24:00 | rounds a half away from 2000-01-01; time can reach 24:00:00 | `equiv.time-rounding` |
+| datetime2(p), datetime, time(p) to text | every fractional digit ('03:04:00.000'), datetime as 'Jan  2 2026  3:04AM' | no trailing zero fraction ('03:04:00') | `equiv.time-text` |
+| a real against another number | the other value becomes real | both become double precision | unknown |
+| tinyint arithmetic; a decimal sum past 38 digits | tinyint overflows at 255; decimal(38) overflows | no tinyint; numeric is exact | unknown |
+| datetimeoffset to datetime2, date to text, decimal to float, money | | | unknown |
+
+Integers to integers, decimals and floats, decimals to decimals (both round
+half away from zero), a decimal of scale 0 to an integer, integers and
+decimals of known precision to text long enough for them, strings to strings
+(explicit casts truncate silently on both sides, a stored string that is too
+long fails on both), dates and timestamps to dates, and timestamps to at
+least as many fractional digits are the same everywhere. A T-SQL variable
+truncates a string that is too long where a PL/pgSQL one fails, so that
+assignment is dialect-specific.
+
+Literals take each dialect's type: `1.5e0` is float in T-SQL and Db2 for i
+but numeric in PostgreSQL, `2147483648` is decimal(10,0) in T-SQL but bigint
+in PostgreSQL, `0x1F` is varbinary in T-SQL and the integer 31 in
+PostgreSQL, and PostgreSQL reads `N'..'` as character(n), which is not
+compared. Db2 for i conversions are compared only between integers, to wider
+decimals and for strings that fit; the open questions are probes V30 in
+`probes/db2i`.
+
+Without catalogs a value's type is mostly unknown. Storing or assigning it
+states `ASM-UNTYPED-STORE`, and casting it to a number or string states
+`ASM-UNTYPED-CAST`; a cast of it to anything else is unknown.
+
 ## Benchmark
 
 `eval/cross-dialect/` in the project files: `bench.py` converts the

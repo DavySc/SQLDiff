@@ -205,6 +205,11 @@ impl Need {
                 conv_max(&kids[0]).ok_or("conversion to a non-numeric type")?;
                 self.value(&kids[1], Kind::Num)
             }
+            // A dialect's conversion of a number: the same for the integers
+            // the search uses (see `dcast_int`).
+            ("dcast", Term::N(_, kids)) if k != Kind::Str && dcast_int(t).is_some() => {
+                self.value(&kids[4], Kind::Num)
+            }
             // A subquery value, only where no other table is in scope.
             ("scalar", Term::N(_, kids)) if kids.len() == 3 && self.scalar_ok => {
                 if !matches!(kids[2].atom(), Some("null" | "error" | "unchanged")) {
@@ -430,6 +435,24 @@ fn query(t: &Term, named_items: bool) -> R<Query<'_>> {
     })
 }
 
+/// For a dialect's conversion (`dcast`) of a number, or of a value of
+/// unknown type, to a number: the largest integer it keeps. An integer in
+/// range converts unchanged in every dialect (the dialects differ only on
+/// fractions, text and out-of-range values), and the search only uses
+/// integers.
+fn dcast_int(t: &Term) -> Option<i64> {
+    let src = t.kid(3)?;
+    let numeric_src = src.atom() == Some("?")
+        || matches!(
+            src.kid(0).and_then(Term::atom),
+            Some("Int" | "Exact" | "Float")
+        );
+    if !numeric_src {
+        return None;
+    }
+    conv_max(t.kid(2)?)
+}
+
 /// Largest value of a numeric conversion target `(ty Fam len scale)`.
 fn conv_max(t: &Term) -> Option<i64> {
     if !t.is("ty") {
@@ -566,6 +589,12 @@ impl World<'_> {
                 V::Int(x) if x.abs() <= conv_max(&t.kids()[0]).unwrap_or(0) => Ok(V::Int(x)),
                 V::Int(_) => Err(Stop::Fail),
                 V::Null => Ok(V::Null),
+                _ => unsupported("conversion"),
+            },
+            "dcast" => match (dcast_int(t), self.value(&t.kids()[4], row)?) {
+                (Some(max), V::Int(x)) if x.abs() <= max => Ok(V::Int(x)),
+                (Some(_), V::Int(_)) => Err(Stop::Fail),
+                (Some(_), V::Null) => Ok(V::Null),
                 _ => unsupported("conversion"),
             },
             "scalar" => {
@@ -804,6 +833,8 @@ fn int_max(t: &Ty) -> Option<i64> {
     match t.fam {
         Fam::Int => Some(match t.len {
             Some(1) => 1,
+            // T-SQL tinyint holds no negative values.
+            Some(8) => return None,
             Some(b) if b <= 8 => 127,
             Some(b) if b <= 16 => 32767,
             _ => LIMIT - 1,

@@ -141,6 +141,10 @@ pub fn explain(
                 format!("Rows where {key} is NULL sort first on {first} and last on {last}, so the order (and any page of it) differs."),
             ))
         }
+        ("dcast", 0) => {
+            let (pa, pb) = (m.parent_a.as_ref()?, m.parent_b.as_ref()?);
+            explain_conv(pa, pb, side_a, side_b).or_else(|| explain_conv(pb, pa, side_b, side_a))
+        }
         ("scalar", 1) if x?.ends_with('?') || y?.ends_with('?') => None,
         ("scalar", 1) => {
             let (x, y) = (x?.trim_end_matches('?'), y?.trim_end_matches('?'));
@@ -307,6 +311,9 @@ fn explain_terms(
             ),
         ));
     }
+    if let Some(e) = explain_conv(x, y, sx, sy) {
+        return Some(e);
+    }
     // A PostgreSQL boolean meeting a number: the statement fails there.
     if x.is("type-error") && x.kid(0).and_then(Term::atom) == Some("postgres") {
         let why = match x.kid(1).and_then(Term::atom)? {
@@ -333,7 +340,9 @@ fn explain_terms(
     }
     // A boolean written as text: 'true' / 'false' against a bit's '1' / '0'.
     if x.is("booltext")
-        && ((y.is("cast") && y.kid(1) == x.kid(1)) || (y.is("tostr") && y.kid(0) == x.kid(1)))
+        && ((y.is("cast") && y.kid(1) == x.kid(1))
+            || (y.is("dcast") && y.kid(4) == x.kid(1))
+            || (y.is("tostr") && y.kid(0) == x.kid(1)))
     {
         let v = render(x.kid(1)?);
         return Some((
@@ -355,6 +364,301 @@ fn explain_terms(
         ));
     }
     None
+}
+
+/// A conversion term: `cast` / `conv` (the same in every dialect, `trunc`
+/// marking T-SQL's dropped fraction) or `dcast` (one dialect's).
+struct ConvView<'a> {
+    dialect: Option<&'a str>,
+    dst: &'a Term,
+    src: Option<TyParts<'a>>,
+    v: &'a Term,
+    trunc: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TyParts<'a> {
+    fam: &'a str,
+    len: Option<u32>,
+    scale: Option<u32>,
+}
+
+fn ty_parts(t: &Term) -> Option<TyParts<'_>> {
+    if !t.is("ty") {
+        return None;
+    }
+    let num = |i: usize| t.kid(i).and_then(Term::atom).and_then(|s| s.parse().ok());
+    Some(TyParts {
+        fam: t.kid(0)?.atom()?,
+        len: num(1),
+        scale: num(2),
+    })
+}
+
+fn conv_view(t: &Term) -> Option<ConvView<'_>> {
+    match t.head() {
+        "cast" | "conv" => {
+            let v = t.kid(1)?;
+            let inner = (v.is("fn") && v.kid(0).and_then(Term::atom) == Some("trunc"))
+                .then(|| v.kid(1))
+                .flatten();
+            Some(ConvView {
+                dialect: None,
+                dst: t.kid(0)?,
+                src: None,
+                v: inner.unwrap_or(v),
+                trunc: inner.is_some(),
+            })
+        }
+        "dcast" => Some(ConvView {
+            dialect: t.kid(0)?.atom(),
+            dst: t.kid(2)?,
+            src: ty_parts(t.kid(3)?),
+            v: t.kid(4)?,
+            trunc: false,
+        }),
+        _ => None,
+    }
+}
+
+/// A conversion that gives different results in T-SQL and PostgreSQL, with
+/// a value that shows it (each checked on SQL Server 2022 and PostgreSQL 18,
+/// eval/casts). Only for the same operand converted to the same type.
+fn explain_conv(
+    x: &Term,
+    y: &Term,
+    sx: &str,
+    sy: &str,
+) -> Option<(ChangeClass, &'static str, String)> {
+    let (a, b) = (conv_view(x)?, conv_view(y)?);
+    if a.dst != b.dst {
+        return None;
+    }
+    let dst = ty_parts(a.dst)?;
+    let what = render(a.v);
+    let fits = |n: u32| dst.len.map_or(true, |l| l >= n);
+    let diff = |rule, text: String| Some((ChangeClass::Semantic, rule, text));
+    // T-SQL truncates to an integer, PostgreSQL rounds.
+    if a.trunc && b.dialect == Some("postgres") && dst.fam == "Int" && a.v == b.v {
+        let src = b.src?;
+        if let Some(lit) = num_literal(a.v) {
+            let (t, r) = (trunc_text(lit)?, round_text(lit)?);
+            if t == r {
+                return None;
+            }
+            return diff("equiv.cast-rounding", format!("{sx} converts {lit} to an integer as {t} (it drops the fraction) and {sy} as {r} (it rounds)."));
+        }
+        let (v, t, r) = match (src.fam, src.len, src.scale) {
+            ("Float", _, None) => ("1.5", "1", "2"),
+            ("Exact", Some(p), Some(s)) if s > 0 && p > s => ("1.5", "1", "2"),
+            ("Exact", Some(_), Some(s)) if s > 0 => ("0.5", "0", "1"),
+            _ => return None,
+        };
+        return diff("equiv.cast-rounding", format!("For {what} = {v}, {sx} converts it to an integer as {t} (it drops the fraction) and {sy} as {r} (it rounds)."));
+    }
+    let (tsql, pg) = match (a.dialect?, b.dialect?) {
+        ("tsql", "postgres") => (&a, &b),
+        _ => return None,
+    };
+    let (src_t, src_p) = (tsql.src?, pg.src?);
+    let string = |f: &str| matches!(f, "VarChar" | "Char");
+    // Float as text: T-SQL keeps 6 significant digits.
+    if string(dst.fam) && src_t.fam == "Float" && fits(12) {
+        if let (Some(lt), Some(lp)) = (literal(tsql.v, "flt"), literal(pg.v, "num")) {
+            if lt != lp {
+                return None;
+            }
+            let (t, p) = (tsql_float_text(lt.parse().ok()?), pg_numeric_text(lp)?);
+            if t == p {
+                return None;
+            }
+            return diff("equiv.float-text", format!("{sx} reads {lt} as float and writes it as '{t}', and {sy} reads it as numeric and writes '{p}'."));
+        }
+        if src_p.fam == "Float" && tsql.v == pg.v {
+            return diff("equiv.float-text", format!("For {what} = 1234567, {sx} writes '1.23457e+006' (float as text keeps 6 significant digits) and {sy} writes '1234567'."));
+        }
+        return None;
+    }
+    if tsql.v != pg.v {
+        return None;
+    }
+    // A string converted to a number.
+    if string(src_t.fam) && string(src_p.fam) {
+        let long = |t: TyParts| t.len.map_or(true, |l| l >= 3);
+        return match dst.fam {
+            "Int" | "Float" => diff("equiv.cast-string-number", format!("For {what} = '' (an empty string), {sx} converts it to 0 and {sy} fails (invalid input syntax).")),
+            "Exact" if long(src_t) && long(src_p) => diff("equiv.cast-string-number", format!("For {what} = '1e3', {sx} fails (error converting to numeric) and {sy} converts it to 1000.")),
+            _ => None,
+        };
+    }
+    // Fewer fractional digits.
+    let same_src = src_t.fam == src_p.fam && src_t.scale.is_none() && src_p.scale.is_none();
+    if same_src && src_t.fam == dst.fam && dst.scale.is_none() {
+        let (dl, sl) = (dst.len?, src_t.len?.min(src_p.len?));
+        if dl < sl && dst.fam == "Timestamp" {
+            let (v, t, p) = if dl == 0 {
+                (
+                    "1999-12-31 23:59:59.5".to_string(),
+                    "2000-01-01 00:00:00".to_string(),
+                    "1999-12-31 23:59:59".to_string(),
+                )
+            } else {
+                let z = "0".repeat(dl as usize - 1);
+                (
+                    format!("1999-12-31 23:59:59.{z}15"),
+                    format!("1999-12-31 23:59:59.{z}2"),
+                    format!("1999-12-31 23:59:59.{z}1"),
+                )
+            };
+            return diff("equiv.time-rounding", format!("For {what} = '{v}', {sx} rounds it to '{t}' and {sy} to '{p}' (PostgreSQL rounds a half away from 2000-01-01)."));
+        }
+        if dl == 0 && sl > 0 && dst.fam == "Time" {
+            return diff(
+                "equiv.time-rounding",
+                format!("For {what} = '23:59:59.5', {sx} gives '23:59:59' and {sy} '24:00:00'."),
+            );
+        }
+        return None;
+    }
+    // Float to a decimal with 2 decimals: PostgreSQL rounds the shortest
+    // decimal form, T-SQL the binary value.
+    if dst.fam == "Exact"
+        && dst.scale == Some(2)
+        && dst.len.is_some_and(|p| p >= 3)
+        && src_t.fam == "Float"
+        && src_p.fam == "Float"
+        && src_t.len == Some(53)
+        && src_p.len == Some(53)
+    {
+        return diff(
+            "equiv.cast-rounding",
+            format!("For {what} = 2.675 (a float), {sx} converts it to 2.67 and {sy} to 2.68."),
+        );
+    }
+    // Times as text.
+    if string(dst.fam) && matches!(src_p.fam, "Timestamp" | "Time") && src_t.fam == src_p.fam {
+        let pg_text = if src_t.fam == "Time" {
+            "03:04:00"
+        } else {
+            "2026-01-02 03:04:00"
+        };
+        let t = match (src_t.fam, src_t.len, src_t.scale) {
+            ("Timestamp", Some(_), Some(_)) if fits(19) => "Jan  2 2026  3:04AM".to_string(),
+            (_, Some(p), None) if p > 0 && fits(pg_text.len() as u32 + 1 + p) => {
+                format!("{pg_text}.{}", "0".repeat(p as usize))
+            }
+            _ => return None,
+        };
+        return diff(
+            "equiv.time-text",
+            format!("For {what} = '{pg_text}', {sx} writes '{t}' and {sy} writes '{pg_text}'."),
+        );
+    }
+    None
+}
+
+/// The text of a numeric literal term with a decimal point.
+fn num_literal(t: &Term) -> Option<&str> {
+    literal(t, "num").filter(|s| s.contains('.') && !s.contains('e'))
+}
+
+fn literal<'a>(t: &'a Term, head: &str) -> Option<&'a str> {
+    t.is(head).then(|| t.kid(0).and_then(Term::atom)).flatten()
+}
+
+/// A decimal literal with its fraction dropped.
+fn trunc_text(lit: &str) -> Option<String> {
+    let (i, _) = lit.split_once('.')?;
+    let neg = i.starts_with('-');
+    let digits = i.trim_start_matches('-').trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    Some(if neg && digits != "0" {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    })
+}
+
+/// A decimal literal rounded half away from zero, as PostgreSQL's numeric.
+fn round_text(lit: &str) -> Option<String> {
+    let (i, f) = lit.split_once('.')?;
+    let neg = i.starts_with('-');
+    let mut v: u128 = i.trim_start_matches('-').parse().unwrap_or(0);
+    if f.bytes().next().is_some_and(|b| b >= b'5') {
+        v += 1;
+    }
+    Some(if neg && v != 0 {
+        format!("-{v}")
+    } else {
+        v.to_string()
+    })
+}
+
+/// A float as T-SQL writes it with CAST to varchar (style 0): like C's
+/// `%g` with 6 significant digits and a three-digit exponent.
+pub fn tsql_float_text(v: f64) -> String {
+    if v == 0.0 {
+        return "0".into();
+    }
+    let sci = format!("{:.5e}", v);
+    let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let exp: i32 = exp.parse().unwrap_or(0);
+    let trim = |s: String| {
+        if s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
+    };
+    if !(-4..6).contains(&exp) {
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{}e{sign}{:03}", trim(mant.to_string()), exp.abs())
+    } else {
+        let decimals = (5 - exp).max(0) as usize;
+        trim(format!("{v:.decimals$}"))
+    }
+}
+
+/// A numeric literal written with an exponent as PostgreSQL prints it: the
+/// value with max(0, decimals - exponent) decimals.
+pub fn pg_numeric_text(lit: &str) -> Option<String> {
+    let (m, e) = lit.split_once('e')?;
+    let e: i64 = e.parse().ok()?;
+    let neg = m.starts_with('-');
+    let m = m.trim_start_matches(['-', '+']);
+    let (i, f) = m.split_once('.').unwrap_or((m, ""));
+    let digits = format!("{i}{f}");
+    let point = i.len() as i64 + e;
+    let scale = (f.len() as i64 - e).max(0) as usize;
+    let (int, frac) = if point <= 0 {
+        (
+            String::new(),
+            format!("{}{digits}", "0".repeat((-point) as usize)),
+        )
+    } else if point as usize >= digits.len() {
+        (
+            format!("{digits}{}", "0".repeat(point as usize - digits.len())),
+            String::new(),
+        )
+    } else {
+        (
+            digits[..point as usize].to_string(),
+            digits[point as usize..].to_string(),
+        )
+    };
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let mut frac: String = frac.chars().take(scale).collect();
+    while frac.len() < scale {
+        frac.push('0');
+    }
+    let zero = int == "0" && frac.bytes().all(|b| b == b'0');
+    let sign = if neg && !zero { "-" } else { "" };
+    Some(if scale == 0 {
+        format!("{sign}{int}")
+    } else {
+        format!("{sign}{int}.{frac}")
+    })
 }
 
 fn operands(strcmp: &Term) -> String {
@@ -395,7 +699,10 @@ fn render_inner(t: &Term) -> String {
                 _ => s,
             }
         }
-        "num" => r(0),
+        "num" | "flt" => r(0),
+        "cast" | "conv" => format!("CAST({} AS {})", r(1), render_ty(k.first())),
+        "dcast" => format!("CAST({} AS {})", r(4), render_ty(k.get(2))),
+        "numstr" | "tostr" => format!("CAST({} AS varchar)", r(k.len() - 1)),
         "str" => format!("'{}'", r(0)),
         "tval" | "uuid" | "lit-conv" => format!("'{}'", r(k.len().saturating_sub(1))),
         "fn" => format!(
@@ -422,5 +729,33 @@ fn render_inner(t: &Term) -> String {
         "daydiff" => format!("days between {} and {}", r(0), r(1)),
         "time" => format!("time({})", r(0)),
         _ => t.to_string(),
+    }
+}
+
+fn render_ty(t: Option<&Term>) -> String {
+    let Some(p) = t.and_then(ty_parts) else {
+        return "?".into();
+    };
+    let base = match (p.fam, p.len) {
+        ("Int", Some(8)) => "tinyint",
+        ("Int", Some(16)) => "smallint",
+        ("Int", Some(64)) => "bigint",
+        ("Int", _) => "int",
+        ("Exact", _) => "decimal",
+        ("Float", Some(24)) => "real",
+        ("Float", _) => "float",
+        ("VarChar", _) => "varchar",
+        ("Char", _) => "char",
+        ("Date", _) => "date",
+        ("Timestamp", _) => "timestamp",
+        ("TimestampTz", _) => "timestamp with time zone",
+        ("Time", _) => "time",
+        ("Bool", _) => "boolean",
+        _ => return "?".into(),
+    };
+    match (p.fam, p.len, p.scale) {
+        ("Exact", Some(l), Some(s)) => format!("{base}({l},{s})"),
+        ("VarChar" | "Char" | "Timestamp" | "Time", Some(l), None) => format!("{base}({l})"),
+        _ => base.into(),
     }
 }
