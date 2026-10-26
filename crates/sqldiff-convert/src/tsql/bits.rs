@@ -318,7 +318,10 @@ impl Cx<'_> {
     }
 
     fn is_numeric(&self, ts: &[T]) -> bool {
-        matches!(self.expr_dt(ts), Some(Dt::Int | Dt::BigInt | Dt::Fraction))
+        matches!(
+            self.expr_dt(ts),
+            Some(Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money)
+        )
     }
 
     fn unhandled(&mut self, ts: &[T]) {
@@ -942,6 +945,25 @@ impl Cx<'_> {
             }
         } else if self.is_bit(x) && !matches!(base.as_str(), "INT" | "INTEGER") {
             return Some(format!("CAST({}::integer AS {name})", self.expr(x).trim()));
+        }
+        // To an integer, T-SQL drops a decimal's or float's fraction and
+        // PostgreSQL rounds it (eval/casts); money rounds on both sides.
+        let int = matches!(
+            base.as_str(),
+            "INT" | "INTEGER" | "SMALLINT" | "BIGINT" | "TINYINT"
+        );
+        let number = int
+            || matches!(
+                base.as_str(),
+                "DECIMAL" | "NUMERIC" | "DEC" | "FLOAT" | "REAL"
+            );
+        match self.expr_dt(x) {
+            Some(Dt::Fraction) if int => {
+                return Some(format!("CAST(trunc({}) AS {name})", self.expr(x).trim()));
+            }
+            Some(Dt::Text) if number => self.note(Status::Assumptions, "ASM-CAST-TEXT-NUMBER", "Cast of a string to a number: T-SQL turns '' into 0 (and rejects '1e3' as a decimal), PostgreSQL rejects '' (and reads '1e3'). Equal if the value is never an empty string or written with an exponent."),
+            None | Some(Dt::Other) if int => self.note(Status::Assumptions, "ASM-CAST-INT-FRACTION", "Cast to an integer of a value whose type is not known: T-SQL drops a fraction (1.5 becomes 1), PostgreSQL rounds it (2). Equal if the value has no fraction; otherwise write trunc(…)."),
+            _ => {}
         }
         Some(format!("CAST({} AS {name})", self.expr(x).trim()))
     }

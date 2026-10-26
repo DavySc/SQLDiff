@@ -66,6 +66,21 @@ impl Ty {
 
     /// Type from a declared SQL type in a dialect. `in_cast` matters for the
     /// T-SQL default length of `varchar` (30 in CAST, 1 elsewhere).
+    /// A time type with `p` fractional digits, or the dialect's default:
+    /// 7 in T-SQL, 6 in PostgreSQL and in Db2 for i (whose TIME has none).
+    fn time_ty(fam: Fam, p: Option<u32>, d: Dialect) -> Ty {
+        let default = match (d, fam) {
+            (Dialect::Tsql, _) => 7,
+            (Dialect::Db2i, Fam::Time) => 0,
+            _ => 6,
+        };
+        Ty {
+            fam,
+            len: Some(p.unwrap_or(default)),
+            scale: None,
+        }
+    }
+
     pub fn from_type(t: &Type, d: Dialect, in_cast: bool) -> Ty {
         let n = |i: usize| t.args.get(i).and_then(|a| a.parse::<u32>().ok());
         let max = t.args.first().is_some_and(|a| a == "MAX");
@@ -89,6 +104,12 @@ impl Ty {
             "BIT" if d == Dialect::Tsql => Ty {
                 fam: Fam::Int,
                 len: Some(1),
+                scale: None,
+            },
+            // T-SQL tinyint: unsigned, 0 to 255.
+            "TINYINT" if d == Dialect::Tsql => Ty {
+                fam: Fam::Int,
+                len: Some(8),
                 scale: None,
             },
             "SMALLINT" | "INT2" => Ty {
@@ -115,9 +136,23 @@ impl Ty {
                     scale: n(1).or(len.map(|_| 0)),
                 }
             }
-            "REAL" | "FLOAT" | "DOUBLE PRECISION" | "DOUBLE" | "FLOAT8" | "FLOAT4" => {
-                Ty::of(Fam::Float)
-            }
+            // Floating point: `len` is the significand in bits, 24 (single)
+            // or 53 (double). FLOAT(n) is single up to 24 in every dialect.
+            "REAL" | "FLOAT4" => Ty {
+                fam: Fam::Float,
+                len: Some(24),
+                scale: None,
+            },
+            "FLOAT" if n(0).is_some_and(|p| p <= 24) => Ty {
+                fam: Fam::Float,
+                len: Some(24),
+                scale: None,
+            },
+            "FLOAT" | "DOUBLE PRECISION" | "DOUBLE" | "FLOAT8" => Ty {
+                fam: Fam::Float,
+                len: Some(53),
+                scale: None,
+            },
             "VARCHAR" | "NVARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" | "VARCHAR2" => {
                 fam_len(Fam::VarChar, tsql_default)
             }
@@ -147,15 +182,26 @@ impl Ty {
                 scale: None,
             },
             "DATE" => Ty::of(Fam::Date),
-            "DATETIME2"
-            | "DATETIME"
-            | "SMALLDATETIME"
-            | "TIMESTAMP"
-            | "TIMESTAMP WITHOUT TIME ZONE" => Ty::of(Fam::Timestamp),
-            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIMEOFFSET" => {
-                Ty::of(Fam::TimestampTz)
+            // Times: `len` is the number of fractional second digits. T-SQL
+            // datetime counts 1/300 s and smalldatetime whole minutes; `scale`
+            // marks those ticks (300, 60), so they equal no other type.
+            "DATETIME" if d == Dialect::Tsql => Ty {
+                fam: Fam::Timestamp,
+                len: Some(3),
+                scale: Some(300),
+            },
+            "SMALLDATETIME" if d == Dialect::Tsql => Ty {
+                fam: Fam::Timestamp,
+                len: Some(0),
+                scale: Some(60),
+            },
+            "DATETIME2" | "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => {
+                Self::time_ty(Fam::Timestamp, n(0), d)
             }
-            "TIME" => Ty::of(Fam::Time),
+            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" | "DATETIMEOFFSET" => {
+                Self::time_ty(Fam::TimestampTz, n(0), d)
+            }
+            "TIME" => Self::time_ty(Fam::Time, n(0), d),
             "INTERVAL" if d == Dialect::Postgres => Ty::of(Fam::Interval),
             "BOOLEAN" | "BOOL" => Ty::of(Fam::Bool),
             _ => Ty::of(Fam::Other),

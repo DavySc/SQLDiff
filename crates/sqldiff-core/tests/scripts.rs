@@ -8,12 +8,12 @@ const T: Dialect = Dialect::Tsql;
 const P: Dialect = Dialect::Postgres;
 const D: Dialect = Dialect::Db2i;
 
-const CATALOG_T: &str = "CREATE TABLE dbo.Methods (MethodID int NOT NULL PRIMARY KEY, MethodName nvarchar(50) NOT NULL, ValidFrom datetime2(7) NOT NULL);
+const CATALOG_T: &str = "CREATE TABLE dbo.Methods (MethodID int NOT NULL PRIMARY KEY, MethodName nvarchar(50) NOT NULL, ValidFrom datetime2(7) NULL);
 CREATE TABLE dbo.Hist (ID int NOT NULL PRIMARY KEY, Name nvarchar(50) NOT NULL,
   ValidFrom datetime2(7) GENERATED ALWAYS AS ROW START NOT NULL,
   ValidTo datetime2(7) GENERATED ALWAYS AS ROW END NOT NULL,
   PERIOD FOR SYSTEM_TIME (ValidFrom, ValidTo));";
-const CATALOG_P: &str = "CREATE TABLE Methods (MethodID integer NOT NULL PRIMARY KEY, MethodName varchar(50) NOT NULL, ValidFrom timestamp NOT NULL);
+const CATALOG_P: &str = "CREATE TABLE Methods (MethodID integer NOT NULL PRIMARY KEY, MethodName varchar(50) NOT NULL, ValidFrom timestamp NULL);
 CREATE TABLE Hist (ID integer NOT NULL PRIMARY KEY, Name varchar(50) NOT NULL, ValidFrom timestamp NOT NULL, ValidTo timestamp NOT NULL);";
 
 fn run_in(da: Dialect, db: Dialect, a: &str, b: &str) -> Report {
@@ -182,8 +182,8 @@ fn variable_types_that_hold_the_same_values() {
     );
     // A string variable: T-SQL cuts a longer value off, PostgreSQL raises.
     let r = run(
-        "DECLARE @s varchar(10);\nSELECT @s = MethodName FROM dbo.Methods WHERE MethodID = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, @s, '20200101');",
-        "DO $$\nDECLARE\n  v_s varchar(10);\nBEGIN\n  SELECT MethodName INTO v_s FROM Methods WHERE MethodID = 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, v_s, '20200101');\nEND\n$$;",
+        "DECLARE @s varchar(10);\nSELECT @s = MethodName FROM dbo.Methods WHERE MethodID = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, @s, NULL);",
+        "DO $$\nDECLARE\n  v_s varchar(10);\nBEGIN\n  SELECT MethodName INTO v_s FROM Methods WHERE MethodID = 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, v_s, NULL);\nEND\n$$;",
     );
     assert!(
         r.assumptions.iter().any(|a| a.id == "ASM-VARIABLE-LENGTH"),
@@ -202,8 +202,8 @@ fn literals_assigned_to_same_types() {
     ] {
         not_equal(
             run(
-                &format!("SET XACT_ABORT ON;\n{t}\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, 'a', '20200101');"),
-                &format!("DO $$\nDECLARE\n  v_x integer;\nBEGIN\n  {p}\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, 'a', '20200101');\nEND\n$$;"),
+                &format!("SET XACT_ABORT ON;\n{t}\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, 'a', NULL);"),
+                &format!("DO $$\nDECLARE\n  v_x integer;\nBEGIN\n  {p}\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, 'a', NULL);\nEND\n$$;"),
             ),
             "cut off, rounded or rejected",
         );
@@ -211,31 +211,31 @@ fn literals_assigned_to_same_types() {
     // T-SQL stores 'abc', PostgreSQL raises "value too long".
     not_equal(
         run(
-            "SET XACT_ABORT ON;\nDECLARE @s varchar(3) = 'abcdef';\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, '20200101');",
-            "DO $$\nDECLARE\n  v_s varchar(3);\nBEGIN\n  v_s := 'abcdef';\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, '20200101');\nEND\n$$;",
+            "SET XACT_ABORT ON;\nDECLARE @s varchar(3) = 'abcdef';\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, NULL);",
+            "DO $$\nDECLARE\n  v_s varchar(3);\nBEGIN\n  v_s := 'abcdef';\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, NULL);\nEND\n$$;",
         ),
         "cut off, rounded or rejected",
     );
     // Also when the variable is written by a query too.
     not_equal(
         run(
-            "SET XACT_ABORT ON;\nDECLARE @s varchar(3) = 'abcdef';\nSELECT @s = MethodName FROM dbo.Methods WHERE MethodID = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, '20200101');",
-            "DO $$\nDECLARE\n  v_s varchar(3);\nBEGIN\n  v_s := 'abcdef';\n  SELECT MethodName INTO v_s FROM Methods WHERE MethodID = 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, '20200101');\nEND\n$$;",
+            "SET XACT_ABORT ON;\nDECLARE @s varchar(3) = 'abcdef';\nSELECT @s = MethodName FROM dbo.Methods WHERE MethodID = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, NULL);",
+            "DO $$\nDECLARE\n  v_s varchar(3);\nBEGIN\n  v_s := 'abcdef';\n  SELECT MethodName INTO v_s FROM Methods WHERE MethodID = 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, NULL);\nEND\n$$;",
         ),
         "cut off, rounded or rejected",
     );
     // Literals both types hold unchanged.
     equal(
-        "SET XACT_ABORT ON;\nDECLARE @x int = 2;\nDECLARE @s varchar(3) = 'abc';\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, @s, '20200101');",
-        "DO $$\nDECLARE\n  v_x integer;\n  v_s varchar(3);\nBEGIN\n  v_x := 2;\n  v_s := 'abc';\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, v_s, '20200101');\nEND\n$$;",
+        "SET XACT_ABORT ON;\nDECLARE @x int = 2;\nDECLARE @s varchar(3) = 'abc';\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, @s, NULL);",
+        "DO $$\nDECLARE\n  v_x integer;\n  v_s varchar(3);\nBEGIN\n  v_x := 2;\n  v_s := 'abc';\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, v_s, NULL);\nEND\n$$;",
     );
 }
 
 #[test]
 fn variables_match_by_name_when_a_declaration_is_dropped() {
     equal(
-        "DECLARE @Unused int;\nDECLARE @Id int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@Id, 'x', '20200101');",
-        "DO $$\nDECLARE\n  v_id integer;\nBEGIN\n  v_id := 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_id, 'x', '20200101');\nEND\n$$;",
+        "DECLARE @Unused int;\nDECLARE @Id int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@Id, 'x', NULL);",
+        "DO $$\nDECLARE\n  v_id integer;\nBEGIN\n  v_id := 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_id, 'x', NULL);\nEND\n$$;",
     );
 }
 
@@ -271,8 +271,8 @@ fn error_continuation() {
     // In a block, T-SQL runs the second INSERT after the first fails; the
     // DO block stops (and undoes the first).
     let r = run(
-        "DECLARE @x int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, 'a', '20200101');\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', '20200101');",
-        "DO $$\nDECLARE\n  v_x integer;\nBEGIN\n  v_x := 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, 'a', '20200101');\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', '20200101');\nEND\n$$;",
+        "DECLARE @x int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, 'a', NULL);\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', NULL);",
+        "DO $$\nDECLARE\n  v_x integer;\nBEGIN\n  v_x := 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, 'a', NULL);\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', NULL);\nEND\n$$;",
     );
     assert_eq!(r.verdict, Verdict::Different, "{:?}", rules(&r));
     let f = r
@@ -284,8 +284,8 @@ fn error_continuation() {
     assert!(f.witness.contains("line 2 fails"), "{}", f.witness);
     // Plain statements run one by one on both sides: no such claim.
     let r = run(
-        "INSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, 'a', '20200101');\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', '20200101');",
-        "INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, 'a', '20200101');\nINSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', '20200101');",
+        "INSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, 'a', NULL);\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', NULL);",
+        "INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, 'a', NULL);\nINSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', NULL);",
     );
     assert!(
         !rules(&r).contains(&"equiv.error-continues"),

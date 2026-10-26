@@ -5117,8 +5117,10 @@ enum Dt {
     /// INT, SMALLINT, TINYINT, or an integer literal.
     Int,
     BigInt,
-    /// DECIMAL, NUMERIC, FLOAT, REAL, MONEY, SMALLMONEY, or a literal with a fraction.
+    /// DECIMAL, NUMERIC, FLOAT, REAL, or a literal with a fraction.
     Fraction,
+    /// MONEY, SMALLMONEY: a fraction that T-SQL rounds (not truncates) to an integer.
+    Money,
     /// A string (a literal, or a CHAR/VARCHAR value).
     Text,
     Bit,
@@ -5138,8 +5140,8 @@ impl Dt {
             "DATETIMEOFFSET" => Dt::Offset(p),
             "INT" | "INTEGER" | "SMALLINT" | "TINYINT" => Dt::Int,
             "BIGINT" => Dt::BigInt,
-            "DECIMAL" | "NUMERIC" | "DEC" | "FLOAT" | "REAL" | "MONEY" | "SMALLMONEY"
-            | "DOUBLE PRECISION" => Dt::Fraction,
+            "DECIMAL" | "NUMERIC" | "DEC" | "FLOAT" | "REAL" | "DOUBLE PRECISION" => Dt::Fraction,
+            "MONEY" | "SMALLMONEY" => Dt::Money,
             "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "CHARACTER" | "CHARACTER VARYING"
             | "TEXT" | "NTEXT" | "SYSNAME" => Dt::Text,
             "BIT" => Dt::Bit,
@@ -5517,7 +5519,7 @@ impl Cx<'_> {
             },
             [_, n, ..] if t.k == OP && t.s == "-" => {
                 let d = self.expr_dt(&ts[*n..])?;
-                matches!(d, Dt::Int | Dt::BigInt | Dt::Fraction).then_some(d)
+                matches!(d, Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money).then_some(d)
             }
             [_, p, ..] if t.k == IDENT && ts[*p].k == L_PAREN && matching(ts, *p) == Some(last) => {
                 let a = split_commas(&ts[p + 1..last]);

@@ -73,6 +73,11 @@ title = "Common table expressions: forward references and recursion without a co
 review = ["docs/convert-mode.md"]
 
 [[fact]]
+id = "V31"
+title = "Casts and literal types: decimal and float to integer, scale, float text, constant types, timestamp precision"
+review = ["crates/sqldiff-core/src/equiv/canon.rs", "eval/casts/README.md"]
+
+[[fact]]
 id = "V28"
 title = "BIT as SMALLINT, and BOOLEAN: open questions for a later BIT mapping"
 review = ["crates/sqldiff-convert/src/tsql/bits.rs"]

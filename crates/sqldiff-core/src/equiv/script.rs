@@ -486,7 +486,7 @@ fn writes(u: &Unit, l: &Local) -> Option<Vec<Expr>> {
     Some(vals)
 }
 
-fn names(d: Dialect, e: &Expr, name: &str) -> bool {
+pub(super) fn names(d: Dialect, e: &Expr, name: &str) -> bool {
     match e {
         Expr::Var(v) => d == Dialect::Tsql && v.trim_start_matches('@').eq_ignore_ascii_case(name),
         Expr::Name(parts) => {
