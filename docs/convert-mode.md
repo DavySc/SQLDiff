@@ -187,6 +187,21 @@ A change made in one tree on purpose adds the pack's `intentional_difference` au
 
 `--base` needs the base branch's history in the checkout (`fetch-depth: 0`).
 
+### Review decisions
+
+What people decide about converted units is kept in `review-decisions.jsonl` at the root of the converted tree, committed with it (`sqldiff_convert::review`). Each line names a unit by its id (a hash of its file path, input text and output text, `~2`, `~3` for repeats), the rule it is about, the state, `by` (`human` or `agent`), the author, a reason, the time, and the SHA-256 of the exact bytes of the whole input and output file it was made on. `by` is whatever the line says, so the CLI, GUI and MCP writers set it themselves and never take it from their caller.
+
+| State | Means | Allowed |
+|---|---|---|
+| `accepted` | The named assumption holds here | People only; the rule must be an assumption of the unit; a reason |
+| `picked` | The target the conversion chose is right | People only; the rule must be a decision of the unit; a reason |
+| `approved` | The unit's output is right as written | People only; a reason |
+| `rejected` | The unit is wrong; it stays open | People only; a reason |
+| `written` | The output was written by hand, not by the rules | People and agents |
+| `commented` | A remark | People and agents; discharges nothing |
+
+A decision applies only while both files are unchanged since it was made, to the byte: text around a unit can change what it means, so any change outdates it and someone confirms it again. A decision never changes a unit's status. It can discharge assumptions and decisions; a difference, a refusal or what the engine could not prove is fixed only by changing the output and checking again. A unit is *reviewed* when nothing undischargeable is left, every assumption and decision is accepted or picked, no one's current rejection stands (records are kept per author, so one person's approval never replaces another's rejection), and output an agent wrote is approved by a person. A file is reviewed when every unit is and no gating finding is unplaced. A plainly converted unit nobody approved is not reviewed: it shows as "nothing found", and a reviewed unit as "accepted in review", never as converted. Lines that do not parse or are not allowed (an agent accepting an assumption, a verdict without a reason) are listed and never applied.
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.
