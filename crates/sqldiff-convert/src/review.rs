@@ -518,10 +518,16 @@ pub const FILE_CHANGED: &str = "the file changed since: confirm it again";
 
 /// Appends a record to the ledger in `out` after checking it is allowed.
 /// The caller sets `by` from who it is, never from its own caller.
+/// The ledger in `out` for appending; refused when it is a symbolic link,
+/// which would carry the decisions wherever it points.
+pub fn ledger_file(out: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    crate::tree::dest_under(out, LEDGER_FILE)
+}
+
 pub fn append(out: &std::path::Path, r: &Record) -> Result<(), String> {
     use std::io::Write;
     allowed(r)?;
-    let path = out.join(LEDGER_FILE);
+    let path = ledger_file(out)?;
     let line = serde_json::to_string(r).map_err(|e| e.to_string())?;
     // A file that does not end in a newline gets one first, so the record
     // starts its own line.

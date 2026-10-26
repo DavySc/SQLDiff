@@ -356,22 +356,75 @@ pub fn convert(
 /// every output file at its source path, `conversion-report.json` and
 /// `conversion-report.md`. Returns the two report paths.
 pub fn write(tree: &Tree, out: &Path) -> Result<(PathBuf, PathBuf), String> {
-    for (f, text) in tree.report.files.iter().zip(&tree.outputs) {
-        let dest = out.join(&f.path);
-        if let Some(p) = dest.parent() {
-            std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
-        }
-        std::fs::write(&dest, text).map_err(|e| format!("{}: {e}", dest.display()))?;
+    // Every destination first, so a refused one leaves nothing half written.
+    for f in &tree.report.files {
+        dest_under(out, &f.path)?;
     }
-    let json = out.join("conversion-report.json");
-    std::fs::write(
-        &json,
-        serde_json::to_string_pretty(&tree.report).unwrap() + "\n",
-    )
-    .map_err(|e| format!("{}: {e}", json.display()))?;
-    let md = out.join("conversion-report.md");
-    std::fs::write(&md, markdown(&tree.report)).map_err(|e| format!("{}: {e}", md.display()))?;
+    for name in ["conversion-report.json", "conversion-report.md"] {
+        dest_under(out, name)?;
+    }
+    for (f, text) in tree.report.files.iter().zip(&tree.outputs) {
+        write_under(out, &f.path, text.as_bytes())?;
+    }
+    let json = write_under(
+        out,
+        "conversion-report.json",
+        (serde_json::to_string_pretty(&tree.report).unwrap() + "\n").as_bytes(),
+    )?;
+    let md = write_under(
+        out,
+        "conversion-report.md",
+        markdown(&tree.report).as_bytes(),
+    )?;
     Ok((json, md))
+}
+
+/// Whether `rel` (with `/`) names a path inside a tree: only plain names,
+/// no `..`, `.`, root, drive or empty part. A source file name holding a
+/// backslash becomes a separator here, so `a\..\..\x.sql` would climb out.
+pub fn inside(rel: &str) -> bool {
+    !rel.is_empty()
+        && !rel.contains(':')
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Writes `bytes` to `out/rel`, creating the directories between. Refuses a
+/// path that leaves `out` and a symbolic link anywhere below `out`: a link
+/// committed into the output tree would otherwise redirect the write, e.g.
+/// onto the source file it was converted from.
+pub(crate) fn write_under(out: &Path, rel: &str, bytes: &[u8]) -> Result<PathBuf, String> {
+    let dest = dest_under(out, rel)?;
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    std::fs::write(&dest, bytes).map_err(|e| format!("{}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
+/// `out/rel`, or why [`write_under`] would refuse it.
+pub(crate) fn dest_under(out: &Path, rel: &str) -> Result<PathBuf, String> {
+    if !inside(rel) {
+        return Err(format!(
+            "{}: `{rel}` is not a path inside the output directory",
+            out.display()
+        ));
+    }
+    let mut dest = out.to_path_buf();
+    for part in rel.split('/') {
+        dest.push(part);
+        match std::fs::symlink_metadata(&dest) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(format!(
+                    "{}: a symbolic link in the output directory; not writing through it",
+                    dest.display()
+                ))
+            }
+            _ => {}
+        }
+    }
+    Ok(dest)
 }
 
 /// Converts plain SQL files: rules with the source catalog of the whole
@@ -732,6 +785,12 @@ pub fn collect(src: &Path, extensions: &[String]) -> Result<(Vec<Input>, Vec<Str
             .unwrap_or(&p)
             .to_string_lossy()
             .replace('\\', "/");
+        // A name that climbs out of the tree once `\` reads as a separator
+        // is not converted (and never written).
+        if !inside(&rel) {
+            unreadable.push(rel);
+            continue;
+        }
         let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         match decode(&bytes) {
             Some(text) => inputs.push(Input { rel, text }),
@@ -849,12 +908,15 @@ pub fn parallel<T: Sync, R: Send>(jobs: usize, items: &[T], f: impl Fn(&T) -> R 
         items.iter().map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|s| {
         for _ in 0..jobs.min(items.len()) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(item) = items.get(i) else { break };
-                let r = f(item);
-                *slots[i].lock().unwrap() = Some(r);
-            });
+            std::thread::Builder::new()
+                .stack_size(sqldiff_core::ENGINE_STACK)
+                .spawn_scoped(s, || loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = f(item);
+                    *slots[i].lock().unwrap() = Some(r);
+                })
+                .expect("start a worker thread");
         }
     });
     slots

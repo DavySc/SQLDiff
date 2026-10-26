@@ -532,7 +532,7 @@ impl Review {
     pub fn record(&mut self, req: RecordRequest, at: &str) -> Result<usize, String> {
         self.refresh()?;
         let records = self.build(&req, at)?;
-        let path = self.ledger_path();
+        let path = review::ledger_file(&self.setup.out)?;
         let mut text = String::new();
         // A ledger written by hand may lack its final newline.
         if let Ok(old) = std::fs::read(&path) {
@@ -861,9 +861,11 @@ pub fn serve(listener: TcpListener, review: Review, extra_hosts: &[String]) -> s
         let Ok(stream) = stream else { continue };
         let review = Arc::clone(&review);
         let hosts = Arc::clone(&hosts);
-        std::thread::spawn(move || {
-            let _ = handle(stream, &review, &hosts);
-        });
+        std::thread::Builder::new()
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || {
+                let _ = handle(stream, &review, &hosts);
+            })?;
     }
     Ok(())
 }
