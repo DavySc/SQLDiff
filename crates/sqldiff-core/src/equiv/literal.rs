@@ -17,9 +17,13 @@
 //!   even (`'… 23:59:59.9999999'` becomes 10000-01-01 00:00:00).
 //! - SQL Server converts to `datetime` and `smalldatetime` themselves:
 //!   milliseconds round to 1/300 s, seconds round to minutes, more than three
-//!   fractional digits fail. A `yyyy-mm-dd` literal is read as year-day-month
-//!   for them under DATEFORMAT dmy, ydm and dym (date and datetime2 are not
-//!   affected; `yyyymmdd` and `yyyy-mm-ddThh:mm:ss` never are).
+//!   fractional digits fail. A `yyyy-mm-dd` literal (also with one-digit
+//!   month, day or hour, and with a time after a space) is read as
+//!   year-day-month for them under DATEFORMAT dmy, ydm and dym. Every
+//!   accepted form of date and datetime2, one-digit fields included, reads
+//!   the same under all six DATEFORMATs, and so do `yyyymmdd[ h:mm]` and
+//!   `yyyy-mm-ddThh:mm:ss` for every type (`…T9:00:00` fails).
+//!   eval/literal/dateformat.sql is the probe.
 //! - SQL Server converts to the column's decimal(p, s), rounding (`'1.005'`
 //!   equals 1.01 in decimal(10,2)); PostgreSQL compares the exact numeric
 //!   value, so there it does not.
@@ -266,7 +270,7 @@ pub fn convert(
 
 pub const DATEFORMAT: (&str, &str) = (
     "ASM-TSQL-DATEFORMAT-YMD",
-    "The session's DATEFORMAT is mdy (the us_english default), ymd or myd, so a 'yyyy-mm-dd' literal compared with or converted to datetime or smalldatetime reads as year-month-day (under dmy, ydm or dym SQL Server reads it as year-day-month)",
+    "The session's DATEFORMAT is mdy (the us_english default), ymd or myd, so a 'yyyy-mm-dd' literal (one-digit month or day included, with or without a time after a space) compared with or converted to datetime or smalldatetime reads as year-month-day (under dmy, ydm or dym SQL Server reads it as year-day-month)",
 );
 
 /// Fractional-second digits of a literal written as a date and time or a
@@ -423,7 +427,11 @@ fn datetime(s: &str, d: Dialect) -> Option<Dt> {
         None => None,
         Some(r) => {
             let t = time(r)?;
-            if form == Form::Iso && d == Dialect::Tsql && r.matches(':').count() < 2 {
+            let two_digit_hour = r.find(':') == Some(2);
+            if form == Form::Iso
+                && d == Dialect::Tsql
+                && (r.matches(':').count() < 2 || !two_digit_hour)
+            {
                 return None;
             }
             Some(t)
@@ -493,6 +501,16 @@ mod tests {
         assert!(v("2020-01-01 10:01", Target::Smalldatetime, T).is_some());
         let dash = convert("2020-01-02", Target::Datetime, T, false).unwrap();
         assert_eq!(dash.1, Some(DATEFORMAT));
+        // One-digit fields: date and datetime2 read them as ymd under every
+        // DATEFORMAT; datetime needs the assumption (eval/literal/dateformat.sql).
+        let one = convert("2020-1-2 9:00", Target::Datetime, T, false).unwrap();
+        assert_eq!(one.1, Some(DATEFORMAT));
+        let d2 = convert("2020-1-2 9:00", Target::Timestamp { digits: 7 }, T, false).unwrap();
+        assert_eq!(d2.1, None);
+        assert_eq!(
+            v("2020-01-02T9:00:00", Target::Timestamp { digits: 7 }, T),
+            None
+        );
         let compact = convert("20200102", Target::Datetime, T, false).unwrap();
         assert_eq!(compact.1, None);
         assert_eq!(dash.0, compact.0);
