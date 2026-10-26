@@ -549,7 +549,10 @@ impl<'a> Cx<'a> {
 
         // Body.
         self.mode = if func { Mode::Func } else { Mode::Proc };
-        let body = r.children().find(|c| c.kind() == ROUTINE_BODY).unwrap();
+        // No body: the parser found nothing after the header (it reports why).
+        let body = r.children().find(|c| c.kind() == ROUTINE_BODY).ok_or(No(
+            "routine without a body: the statement is cut short or malformed".into(),
+        ))?;
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
         match block {

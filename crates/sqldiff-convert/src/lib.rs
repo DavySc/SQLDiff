@@ -268,13 +268,41 @@ pub fn rewrite_in(
     source: Option<&sqldiff_core::catalog::Catalog>,
 ) -> Draft {
     let root = parse(text, from).syntax();
-    let raw = match (from, to) {
+    let raw = guarded(&root, text, || match (from, to) {
         (Dialect::Tsql, Dialect::Postgres | Dialect::Db2i) => {
             tsql::convert(&root, text, to, source)
         }
         _ => no_rules(&root, text, from, to),
-    };
+    });
     Draft { from, to, raw }
+}
+
+/// Runs the rules over one file. A panic in them must not take the other files
+/// of a tree with it: the file becomes "not converted", every unit with the
+/// reason, and the run goes on.
+fn guarded(
+    root: &sqldiff_syntax::SyntaxNode,
+    text: &str,
+    rules: impl FnOnce() -> out::Out,
+) -> out::Out {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(rules)) {
+        Ok(o) => o,
+        Err(e) => {
+            let what = e
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown".into());
+            refuse_all(
+                root,
+                text,
+                &format!(
+                    "the conversion rules stopped on this file with an internal error ({what});                      nothing in it was converted. This is a bug: report it with a reduced example"
+                ),
+                "internal-error",
+            )
+        }
+    }
 }
 
 /// Engine findings on the output alone that gate a unit: it does not bind
@@ -538,6 +566,11 @@ fn no_rules(root: &sqldiff_syntax::SyntaxNode, text: &str, from: Dialect, to: Di
             to.display_name()
         )
     };
+    refuse_all(root, text, &reason, "no-rules")
+}
+
+/// Every unit of the file kept as a comment, "not converted" for `reason`.
+fn refuse_all(root: &sqldiff_syntax::SyntaxNode, text: &str, reason: &str, rule: &str) -> out::Out {
     let mut o = out::Out::default();
     let units = root.children().flat_map(|c| {
         if c.kind() == sqldiff_syntax::SyntaxKind::BATCH {
@@ -562,8 +595,8 @@ fn no_rules(root: &sqldiff_syntax::SyntaxNode, text: &str, from: Dialect, to: Di
             &t,
             vec![Note {
                 status: Status::NotConverted,
-                rule: "no-rules".into(),
-                text: reason.clone(),
+                rule: rule.into(),
+                text: reason.to_string(),
             }],
         );
     }
@@ -591,5 +624,32 @@ fn span(text: &str, li: &LineIndex, (start, end): (usize, usize)) -> Span {
         end_u16: u16(end),
         line: li.line_col(start).0,
         end_line: li.line_col(end.saturating_sub(1).max(start)).0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panic_in_the_rules_makes_the_file_not_converted_not_a_crash() {
+        let text = "CREATE PROCEDURE a AS SELECT 1\nGO\nCREATE PROCEDURE b AS SELECT 2\nGO\n";
+        let root = parse(text, Dialect::Tsql).syntax();
+        let o = guarded(&root, text, || panic!("the rules lost their place"));
+        assert!(o.text.contains("[not converted]"), "{}", o.text);
+        assert!(o.text.contains("the rules lost their place"), "{}", o.text);
+        assert_eq!(o.units.len(), 2, "every unit is accounted for");
+        assert!(o.units.iter().all(|u| u
+            .notes
+            .iter()
+            .any(|n| n.rule == "internal-error" && n.status == Status::NotConverted)));
+    }
+
+    #[test]
+    fn rules_that_do_not_panic_are_untouched() {
+        let text = "CREATE PROCEDURE a AS SELECT 1\nGO\n";
+        let root = parse(text, Dialect::Tsql).syntax();
+        let o = guarded(&root, text, || out::Out::default());
+        assert!(o.text.is_empty());
     }
 }
