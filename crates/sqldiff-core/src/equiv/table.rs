@@ -908,7 +908,7 @@ fn max_arg(ty: &ast::Type) -> bool {
     ty.args.first().is_some_and(|a| a == "MAX")
 }
 
-pub(super) fn tsql_type(ty: &ast::Type) -> R<Ty> {
+pub(crate) fn tsql_type(ty: &ast::Type) -> R<Ty> {
     let n = ty.args.len();
     let len = |default: u32| -> R<Option<u32>> {
         if max_arg(ty) {
@@ -985,7 +985,7 @@ pub(super) fn tsql_type(ty: &ast::Type) -> R<Ty> {
     }
 }
 
-pub(super) fn pg_type(ty: &ast::Type) -> R<Ty> {
+pub(crate) fn pg_type(ty: &ast::Type) -> R<Ty> {
     let n = ty.args.len();
     let none = |t: Ty| {
         if n == 0 {

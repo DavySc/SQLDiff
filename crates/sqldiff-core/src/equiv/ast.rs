@@ -282,6 +282,10 @@ pub enum Stmt {
         ty: Option<Type>,
         default: Option<Expr>,
     },
+    /// An informational message to the client: T-SQL `PRINT e`, PostgreSQL
+    /// `RAISE NOTICE '%', e` (or a format string without placeholders).
+    /// Only built by `lower` for scripts' statements.
+    Message(Expr),
 }
 
 /// Words that end an expression or a name (clause keywords).

@@ -2086,9 +2086,15 @@ impl<'a> Cx<'a> {
             let Some(v) = it.first().filter(|t| t.k == VARIABLE) else {
                 return no("DECLARE form not understood");
             };
+            // `@v AS int`: the AS is the first significant token after the name.
             let mut j = 1;
+            while it.get(j).is_some_and(|t| !t.sig()) {
+                j += 1;
+            }
             if it.get(j).is_some_and(|t| t.is("AS")) {
                 j += 1;
+            } else {
+                j = 1;
             }
             let it2: Vec<T> = it[j..].iter().filter(|t| t.sig()).cloned().collect();
             if it2.first().is_some_and(|t| t.is("TABLE")) {

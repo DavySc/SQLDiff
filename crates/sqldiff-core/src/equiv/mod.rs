@@ -18,6 +18,7 @@ pub mod literal;
 pub mod lower;
 pub mod options;
 pub mod schema;
+pub mod script;
 pub mod table;
 pub mod term;
 pub mod xwit;
@@ -136,13 +137,30 @@ fn line(side: &Analyzed, nodes: &[SyntaxNode]) -> usize {
     nodes.first().map(|n| side.line_of(n)).unwrap_or(0)
 }
 
-/// Cross-dialect comparison of two artifacts.
+/// Cross-dialect comparison of two artifacts. Scripts are compared segment
+/// by segment (`script.rs`): a T-SQL batch against the block it became.
 pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome {
     let mut out = Outcome::default();
-    let ua = lower::lower(a);
-    let ub = lower::lower(b);
+    let pairs =
+        script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
+    for (mut ua, mut ub) in pairs {
+        script::name_locals(&mut ua, &mut ub);
+        compare_units(a, b, &ua, &ub, sa, sb, &mut out);
+    }
+    out
+}
+
+fn compare_units(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) {
     let (na, nb) = (side_name(a), side_name(b));
-    for (side, u, name) in [(a, &ua, &na), (b, &ub, &nb)] {
+    for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
             out.unknown_reasons.push(format!(
                 "{name} line {}: {what} is not covered by statement-level equivalence",
@@ -153,18 +171,19 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
             out.normalize(note.clone());
         }
     }
-    signature(&ua, &ub, &na, &nb, &mut out);
-    tables(a, b, &ua, &ub, sa, sb, &mut out);
-    calls(a, b, &ua, &ub, sa, sb, &mut out);
-    ddl_stmts(a, b, &ua, &ub, sa, sb, &mut out);
+    signature(ua, ub, &na, &nb, out);
+    script::locals(a, b, ua, ub, &na, &nb, out);
+    tables(a, b, ua, ub, sa, sb, out);
+    calls(a, b, ua, ub, sa, sb, out);
+    ddl_stmts(a, b, ua, ub, sa, sb, out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
         out.assume(x.clone());
     }
     if ua.txn_control || ub.txn_control {
         out.assume(asm::make(asm::NO_CALLER_TXN));
     }
-    let ia = items(&ua, sa, false);
-    let ib = items(&ub, sb, false);
+    let ia = items(ua, sa, false);
+    let ib = items(ub, sb, false);
     if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
         for (name, items) in [("A", &ia), ("B", &ib)] {
             for it in items.iter() {
@@ -180,7 +199,7 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         }
     }
     let touches = ia.iter().chain(&ib).any(|it| !it.names.is_empty());
-    security(a, b, &ua, &ub, touches, &mut out);
+    security(a, b, ua, ub, touches, out);
     // Witnesses across dialects compare parameters by position, so the
     // routines must take the same parameters.
     // Statements outside the comparison could change or undo the witness.
@@ -193,12 +212,12 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         && ub.calls.is_empty())
     .then(|| Witnessing {
         a: xwit::Side {
-            unit: &ua,
+            unit: ua,
             schema: sa,
             name: na.clone(),
         },
         b: xwit::Side {
-            unit: &ub,
+            unit: ub,
             schema: sb,
             name: nb.clone(),
         },
@@ -206,9 +225,8 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         // inputs reach it and its result is the routine's.
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
-    pair_items(a, b, &ia, &ib, wit.as_ref(), &mut out);
-    error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
-    out
+    pair_items(a, b, &ia, &ib, wit.as_ref(), out);
+    error_continues(a, b, ua, ub, &ia, &ib, out);
 }
 
 /// Compares the procedure calls and object comments of both sides
@@ -1158,7 +1176,10 @@ fn error_continues(
     // Error handlers on either side (uncovered) and statements that were not
     // lowered leave the error path to other checks.
     let o = if t_is_a { ub } else { ua };
-    if t.stops_on_error
+    // Plain script statements on the other side run one by one: the client
+    // decides whether the script goes on (the behaviour model's business).
+    if !o.in_block
+        || t.stops_on_error
         || !matches!(t.kind, UnitKind::Proc | UnitKind::Script)
         || !t.uncovered.is_empty()
         || !o.uncovered.is_empty()
@@ -1228,6 +1249,11 @@ fn error_continues(
         if let E::Item(k) = seq[i].1 {
             if inner(&items[k]) {
                 return Some((i, i));
+            }
+        }
+        if let E::Item(k) = seq[i].1 {
+            if items[k].nodes.len() == 1 && script::cannot_fail(t, &items[k].nodes[0]) {
+                return None;
             }
         }
         (i + 1..seq.len())

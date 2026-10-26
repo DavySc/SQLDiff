@@ -84,6 +84,10 @@ pub mod asm {
         "ASM-RESULT-TYPES",
         "Declared result column types hold the selected values without conversion",
     );
+    pub const VALUES_ORDER: (&str, &str) = (
+        "ASM-VALUES-ROW-ORDER",
+        "A multi-row VALUES list gets the values the table generates (identity, sequence defaults) in the order its rows are written on both sides",
+    );
     pub const NO_CALLER_TXN: (&str, &str) = (
         "ASM-NO-CALLER-TXN",
         "The caller does not hold an open transaction",
@@ -180,6 +184,12 @@ pub struct Canon<'a> {
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
     /// bit read through a derived table still meets numbers as a bit.
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
+}
+
+/// Lower-case hex digits of a byte string written in hex, `None` unless
+/// every character is a hex digit and they make whole bytes.
+pub(super) fn hex_bytes(s: &str) -> Option<String> {
+    (s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
 }
 
 /// Folded name; names whose quoting is significant (leading `"`) keep their case.
@@ -326,6 +336,22 @@ impl<'a> Canon<'a> {
         }
     }
 
+    /// A statement writes `col`: refused for a column the database computes
+    /// (period, computed, GENERATED ALWAYS), whose explicit values one side
+    /// rejects or replaces depending on settings and triggers the statement
+    /// does not show.
+    fn written(&self, table: &str, col: &str) -> R<()> {
+        let generated = self
+            .schema
+            .table(Self::base_table(table))
+            .and_then(|t| t.column(col))
+            .is_some_and(|c| c.generated);
+        if generated {
+            return Err(format!("writes the generated column {col}"));
+        }
+        Ok(())
+    }
+
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
         let n0 = lc(name.trim_start_matches('@'));
         if let Some(i) = self.unit.params.iter().position(|p| p.name == n0) {
@@ -339,6 +365,8 @@ impl<'a> Canon<'a> {
         if let Some(i) = self.unit.locals.iter().position(|l| l.name == n0) {
             let id = if self.by_name {
                 format!("l:{n0}")
+            } else if let Some(ids) = &self.unit.local_ids {
+                ids[i].clone()
             } else {
                 format!("l{}", i + 1)
             };
@@ -695,6 +723,17 @@ impl<'a> Canon<'a> {
                         .unwrap_or_else(|| (n("sym", vec![a(lc(v))]), None))
                 }
             }
+            Expr::Num(s)
+                if self.d == Dialect::Tsql
+                    && s.len() >= 2
+                    && s[..2].eq_ignore_ascii_case("0x")
+                    && hex_bytes(&s[2..]).is_some() =>
+            {
+                (
+                    n("bytes", vec![a(hex_bytes(&s[2..]).unwrap_or_default())]),
+                    None,
+                )
+            }
             Expr::Num(s) => self.num_lit(s),
             Expr::Str(s) => (
                 n("str", vec![a(s.clone())]),
@@ -821,6 +860,19 @@ impl<'a> Canon<'a> {
                     ),
                     None,
                 )
+            }
+            // PostgreSQL `'\xAB01'::bytea` (hex input format): the bytes T-SQL
+            // writes 0xAB01.
+            Expr::Cast(x, ty)
+                if self.d == Dialect::Postgres
+                    && ty.name.eq_ignore_ascii_case("BYTEA")
+                    && matches!(x.as_ref(), Expr::Str(s) if hex_bytes(s.strip_prefix("\\x").unwrap_or("-")).is_some()) =>
+            {
+                let Expr::Str(s) = x.as_ref() else {
+                    unreachable!()
+                };
+                let hex = hex_bytes(&s[2..]).unwrap_or_default();
+                (n("bytes", vec![a(hex)]), None)
             }
             Expr::Cast(x, ty) => {
                 let dst = Ty::from_type(ty, self.d, true);
@@ -1648,7 +1700,9 @@ impl<'a> Canon<'a> {
                 }),
             )),
             "+" | "-" | "*" | "/" | "%" => {
-                if any(&|t| t.is_temporal()) || any(&|t| t.is_string()) {
+                // Only numbers add alike everywhere: T-SQL `+` concatenates
+                // binary strings, PostgreSQL has no bytea `+`.
+                if any(&|t| !t.is_numeric()) || lt.is("bytes") || rt.is("bytes") {
                     return Ok((n("arith", vec![self.dtag(), a(op), lt, rt]), None));
                 }
                 let both_int = lty.is_some_and(|t| t.fam == Fam::Int)
@@ -2293,6 +2347,9 @@ impl<'a> Canon<'a> {
                 let r = (|| {
                     let mut kv = Vec::new();
                     for (cols, e) in sets {
+                        for c in cols {
+                            self.written(&table, &lc(c))?;
+                        }
                         let (v, vty) = self.expr(e)?;
                         if cols.len() == 1 {
                             let col = lc(&cols[0]);
@@ -2339,6 +2396,25 @@ impl<'a> Canon<'a> {
             Stmt::Assign(t, v) => {
                 let (sym, ty) = self.target_sym(t)?;
                 self.single_row = true;
+                // A string literal into a variable whose type's conversion is
+                // modelled: the value it converts to, as a CAST gives it (an
+                // assignment rounds like one on both engines).
+                let decl = self
+                    .unit
+                    .locals
+                    .iter()
+                    .find(|l| super::script::names(self.d, t, &l.name))
+                    .and_then(|l| l.decl.as_ref());
+                if let (Expr::Str(s), Some(target)) =
+                    (v, decl.and_then(|d| Target::of_type(d, self.d)))
+                {
+                    if let Some((term, asm)) = literal::convert(s, target, self.d, true) {
+                        if let Some(x) = asm {
+                            self.assume(x);
+                        }
+                        return Ok(n("assign", vec![sym, term]));
+                    }
+                }
                 let val = match v {
                     Expr::Subquery(q) => {
                         let (q, qty) = self.query(q, QCtx::Scalar)?;
@@ -2371,6 +2447,15 @@ impl<'a> Canon<'a> {
                 }
             }
             Stmt::Declare { .. } => Err("declaration".into()),
+            // A constant string only: PRINT shows NULL as an empty line and a
+            // number or date in its own format, RAISE NOTICE as <NULL> and in
+            // PostgreSQL's text form.
+            // PRINT cuts a message off after 8000 bytes (4000 characters for
+            // nvarchar); shorter constants show the same on both sides.
+            Stmt::Message(Expr::Str(s)) if s.chars().count() <= 4000 => {
+                Ok(n("message", vec![n("str", vec![a(s.clone())])]))
+            }
+            Stmt::Message(_) => Err("a message that is not a string literal".into()),
         }
     }
 
@@ -2467,11 +2552,38 @@ impl<'a> Canon<'a> {
                     ],
                 ))
             }
-            InsertSource::Values(_) => Err("multi-row VALUES is not supported".into()),
+            InsertSource::Values(rows) => {
+                // One statement: every row goes in or none does, on every side.
+                self.single_row = true;
+                let mut sets = Vec::new();
+                for r in rows {
+                    let kv = self.insert_row(table, cols, r)?;
+                    sets.push(n(
+                        "set",
+                        kv.into_iter()
+                            .map(|(c, v, _)| n("kv", vec![a(c), v]))
+                            .collect(),
+                    ));
+                }
+                // Values the table generates (identity, sequence defaults) go
+                // to the rows in some order; only listing every column rules
+                // them out.
+                let all_listed = self
+                    .schema
+                    .table(Self::base_table(table))
+                    .is_some_and(|t| t.columns.iter().all(|c| cols.contains(&lc(&c.name))));
+                if !all_listed {
+                    self.assume(asm::VALUES_ORDER);
+                }
+                Ok(n("insertn", vec![a(table), n("rows", sets)]))
+            }
             InsertSource::Query(q) => {
                 let (parts, items) = self.query_parts(q, QCtx::Scalar)?;
                 if items.len() != cols.len() {
                     return Err("INSERT column count does not match the query".into());
+                }
+                for c in cols {
+                    self.written(table, c)?;
                 }
                 let mut kv: Vec<Term> = cols
                     .iter()
@@ -2499,6 +2611,7 @@ impl<'a> Canon<'a> {
         }
         let mut kv = Vec::new();
         for (c, e) in cols.iter().zip(row) {
+            self.written(table, c)?;
             let v = self.expr(e)?;
             let (cty, _) = self.col_ty(table, c);
             let (t, ty) = self.conv(&cty, v);
@@ -2607,8 +2720,9 @@ impl<'a> Canon<'a> {
         let upd: R<Vec<Term>> = sets
             .iter()
             .map(|(c, e)| {
-                let v = self.expr(e)?;
                 let c = lc(c);
+                self.written(table, &c)?;
+                let v = self.expr(e)?;
                 let (cty, _) = self.col_ty(table, &c);
                 Ok(n("kv", vec![a(c), self.conv(&cty, v).0]))
             })
@@ -2768,8 +2882,9 @@ impl<'a> Canon<'a> {
                 (MergeAction::Update(sets), true) if upd.is_none() => {
                     let mut kv = Vec::new();
                     for (c, e) in sets {
-                        let v = self.expr(e)?;
                         let c = lc(c);
+                        self.written(table, &c)?;
+                        let v = self.expr(e)?;
                         let (cty, _) = self.col_ty(table, &c);
                         kv.push(n("kv", vec![a(c), self.conv(&cty, v).0]));
                     }

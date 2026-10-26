@@ -215,6 +215,8 @@ pub struct Column {
     pub ty: Ty,
     pub not_null: bool,
     pub identity: bool,
+    /// Computed by the database (see `catalog::Column::generated`).
+    pub generated: bool,
     /// What a string literal compared with this column converts to.
     pub target: Option<Target>,
     /// A collation the column states.
@@ -417,6 +419,7 @@ impl Schema {
                     ty: ty_of(&c.data_type, d),
                     not_null: !c.nullable,
                     identity: c.identity,
+                    generated: c.generated,
                     target: Target::of(&c.data_type.base, &c.data_type.args, d),
                     collation: c.collation.clone(),
                 })

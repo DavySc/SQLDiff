@@ -261,6 +261,7 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
             nullable: true,
             identity: false,
             has_default: false,
+            generated: false,
             collation: None,
         };
         let opts = &el[ty_end..];
@@ -295,6 +296,8 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                         col.nullable = false;
                     } else {
                         col.has_default = true;
+                        // GENERATED ALWAYS AS ROW START / END, AS (expr) STORED.
+                        col.generated = opts.get(k + 1).is_some_and(|x| x.is_kw("ALWAYS"));
                     }
                 }
                 "DEFAULT" => col.has_default = true,
@@ -305,6 +308,7 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                 "AS" if k == 0 => {
                     // T-SQL computed column: `c AS (expr)`.
                     col.has_default = true;
+                    col.generated = true;
                 }
                 _ => {}
             }
@@ -748,6 +752,7 @@ fn view_table(
                     nullable: !keeps_not_null || src.map(|c| c.nullable).unwrap_or(true),
                     identity: false,
                     has_default: false,
+                    generated: false,
                     collation: src.and_then(|c| c.collation.clone()),
                 });
             }
@@ -760,6 +765,7 @@ fn view_table(
                     nullable: true,
                     identity: false,
                     has_default: false,
+                    generated: false,
                     collation: None,
                 });
             }

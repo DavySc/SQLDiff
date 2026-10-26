@@ -768,6 +768,7 @@ impl Scope {
             Stmt::Assign(t, e) => n("assign", vec![self.expr(t)?, self.expr(e)?]),
             Stmt::Return(None) => n("return", vec![]),
             Stmt::Return(Some(e)) => n("return", vec![self.expr(e)?]),
+            Stmt::Message(e) => n("message", vec![self.expr(e)?]),
             Stmt::Declare { name, ty, default } => {
                 let mut k = vec![n("var", vec![a(name.clone())])];
                 if let Some(t) = ty {

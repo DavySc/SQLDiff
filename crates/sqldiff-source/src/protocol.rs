@@ -283,6 +283,7 @@ impl Catalog {
                         nullable: c.nullable,
                         identity: false,
                         has_default: false,
+                        generated: false,
                         collation: c.collation.clone(),
                     })
                     .collect();
