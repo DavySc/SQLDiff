@@ -390,12 +390,14 @@ pub fn run(a: DriftArgs) -> Result<ExitCode, String> {
             println!("instances {} → {}:", reference.id(), d.id());
             let (ok, totals) = instances_cmd::check(InstancesArgs {
                 manifest: m.clone(),
-                source: ref_tree.clone(),
-                target: dir.clone(),
+                source: Some(ref_tree.clone()),
+                target: Some(dir.clone()),
                 from: reference,
                 to: *d,
                 out: a.out.join(&rel),
                 woven: None,
+                woven_target: None,
+                generator_only: false,
                 parameters: a.parameters.clone(),
                 accept: a.accept.clone(),
                 jobs: a.jobs,

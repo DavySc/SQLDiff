@@ -13,7 +13,11 @@
 //!
 //! With `--woven`, the source weave is compared with the generator's own
 //! output first, and generator output no instance accounts for is listed:
-//! that is what makes the manifest complete.
+//! that is what makes the manifest complete. `--woven-target` does the same
+//! for the target weave. `--generator-only` checks the generator's source
+//! output against its target output, for a generator changed for the
+//! target. An instance is done only when both sides were checked on the
+//! generator's output.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -37,12 +41,12 @@ pub struct InstancesArgs {
     /// with its templates and parameter values.
     pub(crate) manifest: PathBuf,
     /// The source templates (the tree the generator reads today).
-    #[arg(long, value_name = "DIR")]
-    pub(crate) source: PathBuf,
+    #[arg(long, value_name = "DIR", required_unless_present = "generator_only")]
+    pub(crate) source: Option<PathBuf>,
     /// The converted templates (`sqldiff convert --template` output, or
     /// templates written by hand), with the same layout.
-    #[arg(long, value_name = "DIR")]
-    pub(crate) target: PathBuf,
+    #[arg(long, value_name = "DIR", required_unless_present = "generator_only")]
+    pub(crate) target: Option<PathBuf>,
     #[arg(long, default_value = "tsql")]
     pub(crate) from: Dialect,
     #[arg(long)]
@@ -55,6 +59,20 @@ pub struct InstancesArgs {
     /// instance.
     #[arg(long, value_name = "DIR")]
     pub(crate) woven: Option<PathBuf>,
+    /// The generator's own output for the target dialect: each instance's
+    /// target weave must equal its `output` file there. An instance with no
+    /// file there is checked on SQLDiff's weave only and never done.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) woven_target: Option<PathBuf>,
+    /// Check the generator's output alone, when the generator was changed
+    /// for the target: each instance's `output` under --woven against the
+    /// same file under --woven-target. No templates are woven.
+    #[arg(
+        long,
+        requires_all = ["woven", "woven_target"],
+        conflicts_with_all = ["source", "target"]
+    )]
+    pub(crate) generator_only: bool,
     /// A parameter name (repeatable), added to the names the manifest gives
     /// values for; under `placeholders = "parameters"` only these are
     /// placeholders.
@@ -136,6 +154,12 @@ struct Item {
 struct InstanceReport {
     name: String,
     status: Outcome,
+    /// Converted (under assumptions at worst) and checked on the
+    /// generator's own output on both sides.
+    done: bool,
+    /// Sides checked on SQLDiff's weave only, because no generator output
+    /// was given for them (`--woven`, `--woven-target`): never done.
+    weave_only: Vec<&'static str>,
     /// Woven files, relative to the output directory.
     source_file: String,
     target_file: String,
@@ -151,7 +175,11 @@ struct InstanceReport {
 struct TemplateReport {
     path: String,
     status: Outcome,
+    /// Every instance that uses it is done.
+    done: bool,
     instances: usize,
+    /// Instances that use it checked on SQLDiff's weave only.
+    weave_only: usize,
 }
 
 #[derive(Serialize)]
@@ -159,9 +187,12 @@ struct Report {
     from: String,
     to: String,
     manifest: String,
-    source: String,
-    target: String,
+    /// The generator's output checked alone (`--generator-only`).
+    generator_only: bool,
+    source: Option<String>,
+    target: Option<String>,
     woven: Option<String>,
+    woven_target: Option<String>,
     /// Assumptions accepted with --accept.
     accepted: Vec<String>,
     instances: Vec<InstanceReport>,
@@ -171,7 +202,16 @@ struct Report {
     not_exercised: Vec<String>,
     /// Generator output no instance accounts for.
     not_in_manifest: Vec<String>,
+    /// Generator target output no instance accounts for.
+    not_in_manifest_target: Vec<String>,
     totals: BTreeMap<&'static str, usize>,
+    /// Instances done: converted and checked on the generator's output.
+    done: usize,
+    /// Instances checked on SQLDiff's weave only.
+    weave_only: usize,
+    /// Every instance done, every converted template exercised and all
+    /// generator output accounted for.
+    complete: bool,
 }
 
 pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
@@ -184,80 +224,93 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
 /// accounted for, and the count of instances per status.
 pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, usize>), String> {
     let cfg = a.cfg.resolve()?;
-    let def = cfg
-        .policy
-        .template
-        .as_ref()
-        .ok_or("instances needs a [template] syntax: give --pack or a sqldiff.toml with one")?;
-    let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
+    let def = cfg.policy.template.as_ref();
+    if def.is_none() && !a.generator_only {
+        return Err(
+            "instances needs a [template] syntax: give --pack or a sqldiff.toml with one".into(),
+        );
+    }
     let manifest = Manifest::load(&a.manifest).map_err(|e| e.0)?;
     let kinds: BTreeMap<String, sqldiff_convert::ValueKind> = def
-        .values
-        .iter()
-        .filter_map(|(n, k)| {
-            let n = if def.ignore_case {
-                n.to_uppercase()
-            } else {
-                n.clone()
-            };
-            Some((n, sqldiff_convert::ValueKind::parse(k)?))
+        .map(|def| {
+            def.values
+                .iter()
+                .filter_map(|(n, k)| {
+                    let n = if def.ignore_case {
+                        n.to_uppercase()
+                    } else {
+                        n.clone()
+                    };
+                    Some((n, sqldiff_convert::ValueKind::parse(k)?))
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     if manifest.instances.is_empty() {
         return Err(format!("{}: no [[instance]]", a.manifest.display()));
     }
-    for d in [&a.source, &a.target] {
+    for d in [&a.source, &a.target, &a.woven, &a.woven_target]
+        .into_iter()
+        .flatten()
+    {
         if !d.is_dir() {
             return Err(format!("{}: not a directory", d.display()));
         }
     }
+    // The trees each side's catalog comes from: the templates, or the
+    // generator's output when no templates are woven.
+    let (source_root, target_root) = match (&a.source, &a.target, &a.woven, &a.woven_target) {
+        (Some(s), Some(t), _, _) => (s.clone(), t.clone()),
+        (_, _, Some(s), Some(t)) if a.generator_only => (s.clone(), t.clone()),
+        _ => return Err("give --source and --target, or --generator-only".into()),
+    };
     prepare_out(&a)?;
     let jobs = a
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
         .max(1);
-    let mut list = manifest.names();
-    list.extend(a.parameters.iter().cloned());
-    if placeholders.ignore_case() {
-        list = list.into_iter().map(|n| n.to_uppercase()).collect();
-    }
-    let weaver = |root: &Path, dialect| Weaver {
-        root: root.to_path_buf(),
-        dialect,
-        placeholders: &placeholders,
-        include: def.include.clone(),
-        list: Some(list.clone()),
-    };
-    let (ws, wt) = (weaver(&a.source, a.from), weaver(&a.target, a.to));
-    let woven: Vec<(Woven, Woven)> = parallel(jobs, &manifest.instances, |i| {
-        (ws.weave(&manifest, i), wt.weave(&manifest, i))
-    });
 
     // The generator's own output, when given.
-    let mut not_in_manifest = Vec::new();
-    let mut generated: Vec<Option<Result<String, String>>> = vec![None; woven.len()];
-    if let Some(dir) = &a.woven {
-        let wanted: BTreeSet<&str> = manifest
+    let read = |dir: &Option<PathBuf>| match dir {
+        Some(d) => read_generated(d, &manifest),
+        None => Ok((Vec::new(), Vec::new())),
+    };
+    let (gen_source, not_in_manifest) = read(&a.woven)?;
+    let (gen_target, not_in_manifest_target) = read(&a.woven_target)?;
+
+    let woven: Vec<(Woven, Woven)> = match def {
+        Some(def) if !a.generator_only => {
+            let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
+            let mut list = manifest.names();
+            list.extend(a.parameters.iter().cloned());
+            if placeholders.ignore_case() {
+                list = list.into_iter().map(|n| n.to_uppercase()).collect();
+            }
+            let weaver = |root: &Path, dialect| Weaver {
+                root: root.to_path_buf(),
+                dialect,
+                placeholders: &placeholders,
+                include: def.include.clone(),
+                list: Some(list.clone()),
+            };
+            let (ws, wt) = (weaver(&source_root, a.from), weaver(&target_root, a.to));
+            parallel(jobs, &manifest.instances, |i| {
+                (ws.weave(&manifest, i), wt.weave(&manifest, i))
+            })
+        }
+        // The generator's output is the instance itself.
+        _ => manifest
             .instances
             .iter()
-            .map(|i| i.output.as_str())
-            .collect();
-        let mut files = Vec::new();
-        walk(dir, dir, &mut files).map_err(|e| format!("{}: {e}", dir.display()))?;
-        not_in_manifest = files
-            .into_iter()
-            .filter(|f| !wanted.contains(f.as_str()))
-            .collect();
-        for (k, i) in manifest.instances.iter().enumerate() {
-            let p = dir.join(&i.output);
-            generated[k] = Some(match std::fs::read(&p) {
-                Ok(b) => {
-                    decode(&b).ok_or_else(|| format!("{}: not UTF-8 or UTF-16 text", i.output))
-                }
-                Err(e) => Err(format!("{}: {e}", i.output)),
-            });
-        }
-    }
+            .enumerate()
+            .map(|(k, i)| {
+                (
+                    from_generator(i, &gen_source[k], "source"),
+                    from_generator(i, &gen_target[k], "target"),
+                )
+            })
+            .collect(),
+    };
 
     // Catalogs: every woven instance on its side, plus any given.
     let mut opts = Options::default();
@@ -265,29 +318,63 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
     opts.facts_a.push(Arc::new(catalog(
         woven.iter().map(|(s, _)| s.text.as_str()),
         a.from,
-        &a.source,
+        &source_root,
         None,
     )));
     opts.facts_b.push(Arc::new(catalog(
         woven.iter().map(|(_, t)| t.text.as_str()),
         a.to,
-        &a.target,
+        &target_root,
         None,
     )));
 
+    // The name values each instance gives the target, for the name checks
+    // of the generator's own output.
+    let ci = def.is_some_and(|d| d.ignore_case);
+    let name_values: Vec<Vec<String>> = manifest
+        .instances
+        .iter()
+        .map(|i| {
+            let mut v: BTreeSet<String> = BTreeSet::new();
+            for p in &i.parts {
+                for (n, x) in manifest.values(i, p, a.to, ci) {
+                    let kind = kinds
+                        .get(&n)
+                        .copied()
+                        .unwrap_or(sqldiff_convert::ValueKind::Name);
+                    if kind == sqldiff_convert::ValueKind::Name && !x.is_empty() {
+                        v.insert(x);
+                    }
+                }
+            }
+            v.into_iter().collect()
+        })
+        .collect();
     let work: Vec<(usize, &Instance)> = manifest.instances.iter().enumerate().collect();
+    let generated = |k: usize| {
+        if a.generator_only {
+            // Nothing to compare with: the checked text is the generator's.
+            (None, None)
+        } else {
+            (gen_source.get(k), gen_target.get(k))
+        }
+    };
     let mut results: Vec<Checked> = parallel(jobs, &work, |&(k, i)| {
         let (s, t) = &woven[k];
+        let (gs, gt) = generated(k);
         check_instance(
             i,
             s,
             t,
-            generated[k].as_ref(),
+            gs,
+            gt,
             a.from,
             a.to,
             &opts,
             &a.accept,
             &kinds,
+            a.generator_only,
+            &name_values[k],
         )
     });
 
@@ -370,7 +457,13 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
 
     // Woven files and the per-instance report.
     let mut instances = Vec::new();
-    for ((i, (s, t)), (items, engine, _)) in manifest.instances.iter().zip(&woven).zip(results) {
+    for (k, ((i, (s, t)), (items, engine, _))) in manifest
+        .instances
+        .iter()
+        .zip(&woven)
+        .zip(results)
+        .enumerate()
+    {
         let (sf, tf) = (
             format!("source/{}.sql", i.name),
             format!("target/{}.sql", i.name),
@@ -387,9 +480,19 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
             .map(|x| x.status)
             .max()
             .unwrap_or(Outcome::Converted);
+        // A side counts as the generator's only when its text is the
+        // generator's output (equal to it, or read from it).
+        let has = |g: &[Generated]| matches!(g.get(k), Some(Generated::Text(_)));
+        let weave_only: Vec<&'static str> = [("source", &gen_source), ("target", &gen_target)]
+            .into_iter()
+            .filter(|(_, g)| !has(g))
+            .map(|(side, _)| side)
+            .collect();
         instances.push(InstanceReport {
             name: i.name.clone(),
             status,
+            done: status <= Outcome::Assumptions && weave_only.is_empty(),
+            weave_only,
             source_file: sf,
             target_file: tf,
             templates: t.templates.iter().cloned().collect(),
@@ -399,26 +502,32 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
     }
 
     // Templates: the worst instance that uses them.
-    let mut by_template: BTreeMap<&str, (Outcome, usize)> = BTreeMap::new();
+    let mut by_template: BTreeMap<&str, (Outcome, usize, usize)> = BTreeMap::new();
     for r in &instances {
         for t in &r.templates {
-            let e = by_template.entry(t).or_insert((Outcome::Converted, 0));
+            let e = by_template.entry(t).or_insert((Outcome::Converted, 0, 0));
             e.0 = e.0.max(r.status);
             e.1 += 1;
+            e.2 += usize::from(!r.weave_only.is_empty());
         }
     }
+    // Without a converted tree there is nothing to list as not exercised.
     let mut targets = Vec::new();
-    walk(&a.target, &a.target, &mut targets).map_err(|e| format!("{}: {e}", a.target.display()))?;
+    if let Some(dir) = &a.target {
+        walk(dir, dir, &mut targets).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     let not_exercised: Vec<String> = targets
         .into_iter()
         .filter(|f| !by_template.contains_key(f.as_str()) && !is_report(f))
         .collect();
     let mut templates: Vec<TemplateReport> = by_template
         .into_iter()
-        .map(|(p, (status, n))| TemplateReport {
+        .map(|(p, (status, n, weave_only))| TemplateReport {
             path: p.to_string(),
             status,
+            done: status <= Outcome::Assumptions && weave_only == 0,
             instances: n,
+            weave_only,
         })
         .collect();
     templates.sort_by(|x, y| y.status.cmp(&x.status).then(x.path.cmp(&y.path)));
@@ -427,19 +536,35 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
     for r in &instances {
         *totals.entry(r.status.label()).or_default() += 1;
     }
+    let done = instances.iter().filter(|r| r.done).count();
+    let weave_only = instances
+        .iter()
+        .filter(|r| !r.weave_only.is_empty())
+        .count();
+    let complete = done == instances.len()
+        && not_in_manifest.is_empty()
+        && not_in_manifest_target.is_empty()
+        && not_exercised.is_empty();
+    let shown = |p: &Option<PathBuf>| p.as_ref().map(|w| w.display().to_string());
     let report = Report {
         from: a.from.id().to_string(),
         to: a.to.id().to_string(),
         manifest: a.manifest.display().to_string(),
-        source: a.source.display().to_string(),
-        target: a.target.display().to_string(),
-        woven: a.woven.as_ref().map(|w| w.display().to_string()),
+        generator_only: a.generator_only,
+        source: shown(&a.source),
+        target: shown(&a.target),
+        woven: shown(&a.woven),
+        woven_target: shown(&a.woven_target),
         accepted: a.accept.clone(),
         instances,
         templates,
         not_exercised,
         not_in_manifest,
+        not_in_manifest_target,
         totals,
+        done,
+        weave_only,
+        complete,
     };
     let json = a.out.join("instance-report.json");
     std::fs::write(&json, serde_json::to_string_pretty(&report).unwrap() + "\n")
@@ -448,17 +573,109 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
     std::fs::write(&md, markdown(&report)).map_err(|e| format!("{}: {e}", md.display()))?;
     print!("{}", summary(&report));
     eprintln!("wrote {} and {}", json.display(), md.display());
+    // Generator output given for the target must cover every instance.
     let ok = report
         .instances
         .iter()
         .all(|r| r.status <= Outcome::Assumptions)
-        && report.not_in_manifest.is_empty();
+        && report.not_in_manifest.is_empty()
+        && report.not_in_manifest_target.is_empty()
+        && (a.woven_target.is_none()
+            || report
+                .instances
+                .iter()
+                .all(|r| !r.weave_only.contains(&"target")));
     Ok((ok, report.totals))
+}
+
+/// The name tokens of `text` that hold one of `values`, ignoring letter
+/// case (the generator may fold names).
+fn value_tokens(text: &str, d: Dialect, values: &[String]) -> Vec<(usize, usize)> {
+    let values: Vec<String> = values.iter().map(|v| v.to_lowercase()).collect();
+    let root = sqldiff_syntax::parse(text, d).syntax();
+    root.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| matches!(t.kind(), SyntaxKind::IDENT | SyntaxKind::QUOTED_IDENT))
+        .filter(|t| {
+            let low = t.text().to_lowercase();
+            values.iter().any(|v| low.contains(v.as_str()))
+        })
+        .map(|t| {
+            let r = t.text_range();
+            (usize::from(r.start()), usize::from(r.end()))
+        })
+        .collect()
+}
+
+/// A generator output file of one instance.
+#[derive(Debug, Clone)]
+enum Generated {
+    /// No file at the instance's `output` path.
+    Missing,
+    /// The file could not be read, or is not text.
+    Unreadable(String),
+    Text(String),
+}
+
+/// Every instance's `output` file under `dir`, and the files there no
+/// instance names.
+fn read_generated(dir: &Path, m: &Manifest) -> Result<(Vec<Generated>, Vec<String>), String> {
+    let wanted: BTreeSet<&str> = m.instances.iter().map(|i| i.output.as_str()).collect();
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let extra = files
+        .into_iter()
+        .filter(|f| !wanted.contains(f.as_str()))
+        .collect();
+    let read = m
+        .instances
+        .iter()
+        .map(|i| match std::fs::read(dir.join(&i.output)) {
+            Ok(b) => decode(&b).map_or_else(
+                || Generated::Unreadable(format!("{}: not UTF-8 or UTF-16 text", i.output)),
+                Generated::Text,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Generated::Missing,
+            Err(e) => Generated::Unreadable(format!("{}: {e}", i.output)),
+        })
+        .collect();
+    Ok((read, extra))
+}
+
+/// An instance as the generator wrote it, for `--generator-only`: its
+/// templates are the ones the manifest names (the generator's includes are
+/// not known).
+fn from_generator(i: &Instance, g: &Generated, side: &str) -> Woven {
+    let mut w = Woven {
+        templates: i.parts.iter().map(|p| p.template.clone()).collect(),
+        ..Woven::default()
+    };
+    match g {
+        Generated::Text(t) => w.text = t.clone(),
+        Generated::Missing => w.problems.push(format!(
+            "the generator's {side} output `{}` does not exist",
+            i.output
+        )),
+        Generated::Unreadable(e) => w.problems.push(format!(
+            "the generator's {side} output could not be read: {e}"
+        )),
+    }
+    w
 }
 
 /// An instance's items, the engine's assumptions about the whole pair, and
 /// the PostgreSQL names over the limit, as (truncated, full).
 type Checked = (Vec<Item>, Vec<String>, Vec<(String, String)>);
+
+/// Assumptions the engine's diff makes about every pair of a conversion:
+/// names fold the same way, the default schemas are the same one, T-SQL's
+/// ownership chain. Listed per instance, not counted.
+const EVERY_PAIR: [&str; 4] = [
+    "ASM-IDENT-FOLD",
+    "ASM-DEFAULT-SCHEMA",
+    "ASM-DBO-SCHEMA",
+    "ASM-TSQL-OWNERSHIP-CHAIN",
+];
 
 /// How the engine's diff says it skipped a `CREATE TABLE`.
 const DDL_TABLE: &str = "a DDL statement `CREATE TABLE";
@@ -618,12 +835,15 @@ fn check_instance(
     i: &Instance,
     s: &Woven,
     t: &Woven,
-    generated: Option<&Result<String, String>>,
+    gen_source: Option<&Generated>,
+    gen_target: Option<&Generated>,
     from: Dialect,
     to: Dialect,
     opts: &Options,
     accepted: &[String],
     kinds: &BTreeMap<String, sqldiff_convert::ValueKind>,
+    generator_only: bool,
+    name_values: &[String],
 ) -> Checked {
     let mut items = Vec::new();
     let weave = |side, w: &Woven, items: &mut Vec<Item>| {
@@ -639,29 +859,58 @@ fn check_instance(
     };
     weave("source", s, &mut items);
     weave("target", t, &mut items);
-    match generated {
-        Some(Ok(g)) => {
-            if let Some(line) = first_difference(&s.text, g) {
-                items.push(Item {
-                    status: Outcome::NotWoven,
-                    rule: "weave.generator-mismatch".into(),
-                    side: "source",
-                    line,
-                    text: format!(
-                        "the source weave differs from the generator's output `{}` from line {line}: the manifest or the weaver does not match the generator",
-                        i.output
-                    ),
-                });
+    // Each weave against the generator's own output for its side. No
+    // source output is a missing file of the manifest; no target output
+    // leaves the instance checked on SQLDiff's weave only.
+    for (side, woven, g, dir) in [
+        ("source", s, gen_source, "--woven"),
+        ("target", t, gen_target, "--woven-target"),
+    ] {
+        match g {
+            Some(Generated::Text(g)) => {
+                if let Some(line) = first_difference(&woven.text, g) {
+                    items.push(Item {
+                        status: Outcome::NotWoven,
+                        rule: if side == "source" {
+                            "weave.generator-mismatch".into()
+                        } else {
+                            "weave.generator-target-mismatch".into()
+                        },
+                        side,
+                        line,
+                        text: format!(
+                            "the {side} weave differs from the generator's output `{}` ({dir}) from line {line}: {}",
+                            i.output,
+                            if side == "source" {
+                                "the manifest or the weaver does not match the generator"
+                            } else {
+                                "the generator does not weave the converted templates as SQLDiff does; check its output alone with --generator-only"
+                            }
+                        ),
+                    });
+                }
             }
+            Some(Generated::Unreadable(e)) => items.push(Item {
+                status: Outcome::NotWoven,
+                rule: "weave.generator-output".into(),
+                side,
+                line: 0,
+                text: format!(
+                    "the generator's {side} output for this instance could not be read: {e}"
+                ),
+            }),
+            Some(Generated::Missing) if side == "source" => items.push(Item {
+                status: Outcome::NotWoven,
+                rule: "weave.generator-output".into(),
+                side,
+                line: 0,
+                text: format!(
+                    "the generator's output for this instance could not be read: {}: no such file",
+                    i.output
+                ),
+            }),
+            Some(Generated::Missing) | None => {}
         }
-        Some(Err(e)) => items.push(Item {
-            status: Outcome::NotWoven,
-            rule: "weave.generator-output".into(),
-            side: "source",
-            line: 0,
-            text: format!("the generator's output for this instance could not be read: {e}"),
-        }),
-        None => {}
     }
     if !items.is_empty() {
         return (items, Vec::new(), Vec::new());
@@ -754,7 +1003,22 @@ fn check_instance(
     // either: no finding about it is no evidence.
     // Tables the engine cannot compare count only when the target table is
     // the one the conversion rules write from the source table.
-    let mut engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
+    // The assumptions the diff makes about every pair do not count, as in
+    // `convert`; one about this pair (argument lengths, say) does.
+    let mut engine: Vec<String> = Vec::new();
+    for x in &report.assumptions {
+        if EVERY_PAIR.contains(&x.id.as_str()) {
+            engine.push(x.id.clone());
+        } else if !accepted.contains(&x.id) {
+            items.push(Item {
+                status: Outcome::Assumptions,
+                rule: x.id.clone(),
+                side: "pair",
+                line: 0,
+                text: x.text.clone(),
+            });
+        }
+    }
     let tables = report
         .unknown_reasons
         .iter()
@@ -810,12 +1074,18 @@ fn check_instance(
             .copied()
             .unwrap_or(sqldiff_convert::ValueKind::Name)
     };
-    let spans: Vec<(usize, usize)> = t
-        .values
-        .iter()
-        .filter(|v| kind(&v.name) == sqldiff_convert::ValueKind::Name)
-        .map(|v| (v.start, v.end))
-        .collect();
+    // The generator's own output has no value positions: every name token
+    // that holds a name value is checked (a keyword that holds one, too,
+    // which can only make an instance worse, never better).
+    let spans: Vec<(usize, usize)> = if generator_only {
+        value_tokens(&t.text, to, name_values)
+    } else {
+        t.values
+            .iter()
+            .filter(|v| kind(&v.name) == sqldiff_convert::ValueKind::Name)
+            .map(|v| (v.start, v.end))
+            .collect()
+    };
     let mut reported = BTreeSet::new();
     for v in &t.values {
         if kind(&v.name).per_dialect() && !v.per_dialect && reported.insert(&v.name) {
@@ -837,9 +1107,15 @@ fn check_instance(
         }
     }
     let mut names = Vec::new();
+    let mut said = BTreeSet::new();
     for n in sqldiff_convert::names::check_values(&t.text, to, &spans) {
         if let Some(cut) = &n.truncated {
             names.push(cut.clone());
+        }
+        // Every name in the generator's output: each finding once, at its
+        // first line.
+        if generator_only && !said.insert((n.rule, n.text.clone())) {
+            continue;
         }
         items.push(Item {
             status: match n.status {
@@ -985,7 +1261,7 @@ fn is_report(rel: &str) -> bool {
 fn prepare_out(a: &InstancesArgs) -> Result<(), String> {
     std::fs::create_dir_all(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
     let out = std::fs::canonicalize(&a.out).map_err(|e| format!("{}: {e}", a.out.display()))?;
-    for d in [Some(&a.source), Some(&a.target), a.woven.as_ref()]
+    for d in [&a.source, &a.target, &a.woven, &a.woven_target]
         .into_iter()
         .flatten()
     {
@@ -1045,28 +1321,53 @@ fn summary(r: &Report) -> String {
             r.not_in_manifest.len()
         );
     }
+    if !r.not_in_manifest_target.is_empty() {
+        let _ = writeln!(
+            s,
+            "{:<20} {:>6} target files",
+            "not in manifest",
+            r.not_in_manifest_target.len()
+        );
+    }
+    let _ = writeln!(
+        s,
+        "{:<20} {:>6} of {} (checked on the generator's output; {} on SQLDiff's weave only)",
+        "done",
+        r.done,
+        r.instances.len(),
+        r.weave_only
+    );
     s
 }
 
 fn markdown(r: &Report) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# Instance report\n");
-    let _ = writeln!(
-        s,
-        "Manifest `{}`: source templates `{}` ({}), converted templates `{}` ({}){}.\n",
-        r.manifest,
-        r.source,
-        r.from,
-        r.target,
-        r.to,
-        r.woven
-            .as_ref()
-            .map(|w| format!(", generator output `{w}`"))
+    let given = |what: &str, p: &Option<String>| {
+        p.as_ref()
+            .map(|p| format!(", {what} `{p}`"))
             .unwrap_or_default()
-    );
+    };
     let _ = writeln!(
         s,
-        "An instance counts as converted only when its target weave parses, nothing in it fails the output check, the engine's diff against the source weave finds no difference, and every name a value is part of is one the target accepts. A template is as good as the worst instance that uses it.\n"
+        "Manifest `{}`{}{}{}{}, {} → {}.\n",
+        r.manifest,
+        given("source templates", &r.source),
+        given("converted templates", &r.target),
+        given("generator output", &r.woven),
+        given("generator target output", &r.woven_target),
+        r.from,
+        r.to
+    );
+    if r.generator_only {
+        let _ = writeln!(
+            s,
+            "Generator only: each instance is the generator's source output against its target output; no template was woven, and a template is known only where the manifest names it (not the generator's includes).\n"
+        );
+    }
+    let _ = writeln!(
+        s,
+        "An instance counts as converted only when its target weave parses, nothing in it fails the output check, the engine's diff against the source weave finds no difference, and every name a value is part of is one the target accepts. It is done only when both sides were also checked on the generator's own output: one checked on SQLDiff's weave only is never done. A template is as good as the worst instance that uses it.\n"
     );
     let _ = writeln!(s, "```\n{}```\n", summary(r));
     if !r.accepted.is_empty() {
@@ -1079,27 +1380,43 @@ fn markdown(r: &Report) -> String {
         }
         s.push('\n');
     }
+    if !r.not_in_manifest_target.is_empty() {
+        let _ = writeln!(s, "## Generator target output no instance accounts for\n");
+        for f in &r.not_in_manifest_target {
+            let _ = writeln!(s, "- `{f}`");
+        }
+        s.push('\n');
+    }
     let _ = writeln!(
         s,
-        "## Templates\n\n| status | instances | template |\n|---|---:|---|"
+        "## Templates\n\n| status | instances | on SQLDiff's weave only | template |\n|---|---:|---:|---|"
     );
     for t in &r.templates {
         let _ = writeln!(
             s,
-            "| {} | {} | `{}` |",
+            "| {} | {} | {} | `{}` |",
             t.status.label(),
             t.instances,
+            t.weave_only,
             t.path
         );
     }
     for t in &r.not_exercised {
-        let _ = writeln!(s, "| not exercised | 0 | `{t}` |");
+        let _ = writeln!(s, "| not exercised | 0 | 0 | `{t}` |");
     }
     let _ = writeln!(s, "\n## Instances\n");
     let mut inst: Vec<&InstanceReport> = r.instances.iter().collect();
     inst.sort_by(|x, y| y.status.cmp(&x.status).then(x.name.cmp(&y.name)));
     for i in inst {
-        let _ = writeln!(s, "### `{}`: {}\n", i.name, i.status.label());
+        let only = if i.weave_only.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", checked on SQLDiff's weave only (no generator {} output)",
+                i.weave_only.join(" or ")
+            )
+        };
+        let _ = writeln!(s, "### `{}`: {}{only}\n", i.name, i.status.label());
         for it in &i.items {
             let at = if it.line > 0 {
                 format!("{} line {}", it.side, it.line)
