@@ -457,6 +457,72 @@ fn instant(rest: &str) -> Option<i128> {
     Some((((h * 60 + m) * 60 + s) as i128) * 10_000_000 + f)
 }
 
+/// The order of two date and time values that holds whatever date or time
+/// type stores or converts them, or None when they may be equal. A column
+/// rounds what it stores (smalldatetime to the minute, datetime to 1/300 s,
+/// datetime2(p) and timestamp(p) to p digits) and a literal compared with it
+/// is converted to its type first: a time moves by at most 30 seconds, so
+/// whole minutes, and times two minutes or more apart, keep their order. A
+/// date column drops the time of what it is compared with.
+fn date_order(x: &DateLit, y: &DateLit) -> Option<std::cmp::Ordering> {
+    const MINUTE: i128 = 60 * 10_000_000;
+    const LAST_MINUTE: i128 = (23 * 60 + 59) * MINUTE;
+    if x.days != y.days {
+        let (early, late) = if x.days < y.days { (x, y) } else { (y, x) };
+        // Rounding into the next day: a time after 23:59 that is not a whole
+        // minute, or one not read here.
+        let may_round = !early.rest.is_empty()
+            && instant(&early.rest).map_or(true, |p| p > LAST_MINUTE && p % MINUTE != 0);
+        if late.days - early.days == 1 && x.rest != y.rest && may_round {
+            return None;
+        }
+        return Some(x.days.cmp(&y.days));
+    }
+    if x.rest.is_empty() || y.rest.is_empty() {
+        return None;
+    }
+    let (p, q) = (instant(&x.rest)?, instant(&y.rest)?);
+    let whole = p % MINUTE == 0 && q % MINUTE == 0;
+    (p != q && (whole || (p - q).abs() >= 2 * MINUTE)).then(|| p.cmp(&q))
+}
+
+/// Whether a column of type `t` stores `v` as it is: in range, within its
+/// length and precision, and (for times) a whole minute. False when unsure.
+pub fn fits_type(v: &V, t: &Ty) -> bool {
+    match (t.fam, v) {
+        (_, V::Null) => true,
+        (Fam::Int, V::Int(i)) => match t.len {
+            Some(1) => *i == 0 || *i == 1,
+            Some(bits @ (16 | 32 | 64)) => {
+                let lim = 1i128 << (bits - 1);
+                (-lim..lim).contains(i)
+            }
+            _ => false,
+        },
+        (Fam::Exact, V::Int(_) | V::Num(_)) => {
+            let Some(x) = num_of(v) else { return false };
+            match (t.len, t.scale) {
+                (Some(p), Some(s)) => {
+                    let m = x * 10f64.powi(s as i32);
+                    m.fract() == 0.0 && m.abs() < 10f64.powi(p as i32) && m.abs() < 1e15
+                }
+                _ => false,
+            }
+        }
+        (Fam::Float, V::Int(i)) => i.abs() < 1 << 50,
+        (Fam::Float, V::Num(_)) => true,
+        (Fam::VarChar | Fam::Char, V::Str(s)) => {
+            s.is_ascii() && t.len.map_or(true, |l| s.len() as u32 <= l)
+        }
+        (Fam::Date, V::Str(s)) => parse_date(s).is_some_and(|d| d.rest.is_empty()),
+        (Fam::Timestamp, V::Str(s)) => parse_date(s).is_some_and(|d| {
+            d.rest.is_empty() || instant(&d.rest).is_some_and(|p| p % (60 * 10_000_000) == 0)
+        }),
+        (Fam::Bool, V::Bool(_)) => true,
+        _ => false,
+    }
+}
+
 /// Same date literal one day later or earlier.
 pub fn date_neighbour(s: &str, delta: i64) -> Option<String> {
     let mut d = parse_date(s)?;
@@ -479,14 +545,7 @@ fn str_eq(a: &str, b: &str) -> Option<bool> {
     // Dates written differently may be the same date and time.
     if let (Some(x), Some(y)) = (parse_date(a), parse_date(b)) {
         if x.sep != y.sep || x.rest != y.rest {
-            if x.days != y.days {
-                return Some(false);
-            }
-            // The same day at different times differs as a time and as text.
-            return match (instant(&x.rest), instant(&y.rest)) {
-                (Some(p), Some(q)) if p != q => Some(false),
-                _ => None,
-            };
+            return date_order(&x, &y).map(|_| false);
         }
     }
     let fold = |s: &str| s.trim_end_matches(' ').to_lowercase();
@@ -502,28 +561,11 @@ fn str_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     if a == b {
         return Some(Equal);
     }
-    // Two dates in the same format order by date in every type and collation.
+    // Two dates in the same format order by date and time in every type
+    // and collation.
     if let (Some(x), Some(y)) = (parse_date(a), parse_date(b)) {
-        if x.sep == y.sep && x.rest.len() == y.rest.len() {
-            if x.days != y.days {
-                return Some(x.days.cmp(&y.days));
-            }
-            if x.rest
-                .bytes()
-                .zip(y.rest.bytes())
-                .all(|(p, q)| p == q || (p.is_ascii_digit() && q.is_ascii_digit()))
-            {
-                return Some(x.rest.cmp(&y.rest));
-            }
-            return None;
-        }
-        // The same day with times written to different precision: the time
-        // and the text order alike unless the times are equal.
-        if x.sep == y.sep && x.days == y.days {
-            return match (instant(&x.rest), instant(&y.rest)) {
-                (Some(p), Some(q)) if p != q => Some(p.cmp(&q)),
-                _ => None,
-            };
+        if x.sep == y.sep {
+            return date_order(&x, &y);
         }
     }
     let (ab, bb) = (a.as_bytes(), b.as_bytes());
@@ -568,6 +610,8 @@ pub enum Origin {
     Assumed,
     /// Fixed by the routine (a constant), never chosen.
     Fixed,
+    /// Assigned a random draw: each version reads its own unknown number.
+    Random,
 }
 
 /// Value class of an input, from its declared type or how it is compared.
@@ -877,6 +921,23 @@ impl<'s> Ctx<'s> {
                 for l in &hint.lits {
                     match l {
                         V::Str(s) if parse_date(s).is_some() => {
+                            let d = parse_date(s).unwrap();
+                            // A value the column can store: a date holds no
+                            // time, and only whole minutes survive every
+                            // timestamp type.
+                            if class == Class::Date && !d.rest.is_empty() {
+                                push(V::Str(format_date(&DateLit {
+                                    sep: d.sep,
+                                    days: d.days,
+                                    rest: String::new(),
+                                })));
+                                continue;
+                            }
+                            if !d.rest.is_empty()
+                                && !instant(&d.rest).is_some_and(|p| p % (60 * 10_000_000) == 0)
+                            {
+                                continue;
+                            }
                             push(V::Str(s.clone()));
                             for delta in [1, -1] {
                                 if let Some(n) = date_neighbour(s, delta) {
@@ -973,6 +1034,13 @@ impl<'s> Ctx<'s> {
         };
         if let Some(v) = &f.value {
             return Ok(v.clone());
+        }
+        if f.origin == Origin::Random {
+            // Each version draws its own number: values of the two versions
+            // never agree, and none is chosen (not even NULL).
+            self.nondeterministic = true;
+            let id = format!("@{n}#random#{}", self.side);
+            return Ok(self.opaque_value(id, format!("{name} (a random number)"), false));
         }
         let hint = self.hint(&format!("@{n}"));
         // A declared type the evaluator does not model (interval, xml, ...)

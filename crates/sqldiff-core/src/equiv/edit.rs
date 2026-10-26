@@ -157,6 +157,8 @@ struct Site {
     count: bool,
     /// A declaration (its position fixes the variable's initial value).
     declare: bool,
+    /// The statement draws a random number (`RAND()`, `random()`).
+    random: bool,
 }
 
 struct Routine<'x, 'a> {
@@ -292,12 +294,19 @@ impl<'x, 'a> Routine<'x, 'a> {
         declare: bool,
     ) {
         let (start, end) = cst::sig_range(node);
+        let t = tokens(node);
+        let random = t.windows(2).any(|w| {
+            w[0].kind == K::Word
+                && matches!(w[0].up.as_str(), "RAND" | "RANDOM")
+                && w[1].kind == K::LParen
+        });
         self.sites.entry(name.to_string()).or_default().push(Site {
             start,
             end,
             constant,
             count,
             declare,
+            random,
         });
     }
 
@@ -605,6 +614,15 @@ impl<'x, 'a> Routine<'x, 'a> {
                     f.non_negative = true;
                     f.nullable = false;
                 }
+            }
+            // A random draw is neither chosen nor NULL, and reading it twice
+            // gives the same number: not an input.
+            if sites.iter().any(|s| {
+                s.random
+                    && (s.start < at || lp.is_some_and(|(ls, le)| ls <= s.start && s.end <= le))
+            }) {
+                f.origin = Origin::Random;
+                f.value = None;
             }
             out.insert(name.clone(), f);
         }
@@ -2924,6 +2942,41 @@ fn table_change(
     let [i] = changed.as_slice() else {
         return Err("several table elements changed".into());
     };
+    // A foreign key bounds its columns by the parent's types (a longer value
+    // or a larger number than the parent holds is rejected in both).
+    let mut fk_cols: HashSet<String> = HashSet::new();
+    for x in ea.iter().chain(eb) {
+        let name = |y: &Tok| eval::var_key(&sqldiff_syntax::ast::unquote(&y.text));
+        if let Some(f) = x
+            .iter()
+            .position(|y| y.kind == K::Word && y.up == "FOREIGN")
+        {
+            let end = x
+                .iter()
+                .position(|y| y.up == "REFERENCES")
+                .unwrap_or(x.len());
+            fk_cols.extend(
+                x[f..end]
+                    .iter()
+                    .filter(|y| {
+                        matches!(y.kind, K::Word | K::Quoted) && y.up != "FOREIGN" && y.up != "KEY"
+                    })
+                    .map(name),
+            );
+        } else if x.iter().any(|y| y.kind == K::Word && y.up == "REFERENCES") {
+            fk_cols.insert(name(&x[0]));
+        }
+    }
+    // A computed column can fail on a value too: both versions could reject
+    // the witness row.
+    for x in ea.iter().chain(eb) {
+        if x.windows(2)
+            .any(|w| w[0].kind == K::Word && w[0].up == "AS" && w[1].kind == K::LParen)
+            || x.iter().any(|y| y.kind == K::Word && y.up == "GENERATED")
+        {
+            return Err("the table has a computed column".into());
+        }
+    }
     let (xa, xb) = (&ea[*i], &eb[*i]);
     let (la, lb) = (
         ra.side.lines.line_col(xa.first().map_or(0, |x| x.off)).0,
@@ -3029,6 +3082,25 @@ fn table_change(
             Obs::Rows(r, _) => r.first().and_then(|r| r.first()).cloned(),
             _ => None,
         };
+        // Every value of the row must be one its column can hold; otherwise
+        // both versions reject the row (overflow, truncation) before any CHECK.
+        for (k, v) in &found.inputs {
+            let eval::Key::Var(n) = k else {
+                return Err("the witness reads more than the row".into());
+            };
+            let Some((_, ty, _)) = cols.iter().find(|(c, _, _)| c == n) else {
+                return Err("the witness reads more than the row".into());
+            };
+            if fk_cols.contains(n) {
+                return Err(format!("a foreign key bounds column {n}"));
+            }
+            if !ty.is_some_and(|t| eval::fits_type(v, &t)) {
+                return Err(format!(
+                    "the witness value {} may not fit column {n}",
+                    v.show(&[])
+                ));
+            }
+        }
         let (va, vb) = (first(&found.a), first(&found.b));
         let accepted = |v: &Option<V>| matches!(v, Some(V::Int(1)));
         let rejected = |v: &Option<V>| matches!(v, Some(V::Int(0)));
@@ -3085,10 +3157,24 @@ fn table_change(
     {
         return Err("a CHECK constraint reads the column".into());
     }
+    // A key, index or other constraint on the column may limit what it
+    // stores (index key size) or reject the witness row in both versions.
+    if ea.iter().enumerate().any(|(k, x)| {
+        k != *i
+            && x.iter().any(|y| {
+                matches!(y.kind, K::Word | K::Quoted)
+                    && eval::var_key(&sqldiff_syntax::ast::unquote(&y.text)) == key
+            })
+    }) {
+        return Err("another table element names the column".into());
+    }
     let (mut pa, mut pb) = (Parser::ext(&xa[1..], d), Parser::ext(&xb[1..], d));
     let (ta, tb) = (pa.ty()?, pb.ty()?);
     let (ra_, rb_) = (&xa[1 + pa.i..], &xb[1 + pb.i..]);
     if ta != tb {
+        if fk_cols.contains(&key) {
+            return Err("a foreign key bounds the column".into());
+        }
         // Only the type changed, by length, precision or scale.
         if !same(ra_, rb_) || ta.name != tb.name {
             return Err("the column type and its options changed".into());
@@ -3103,6 +3189,12 @@ fn table_change(
             };
             let (short, long) = if a < b { ("A", "B") } else { ("B", "A") };
             let n = a.min(b) + 1;
+            // Within any index key and row size limit (900 bytes in SQL
+            // Server), so that only the column length can reject it.
+            let bytes = if ta.name.starts_with('N') { 2 * n } else { n };
+            if bytes > 900 {
+                return Err("a witness value too long for an index key".into());
+            }
             return witness(format!(
                 "column {name} holds {} characters in A and {} in B, so storing a value of {n} characters (none of them blanks) in it fails in {short} and succeeds in {long}.",
                 a, b

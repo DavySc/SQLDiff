@@ -165,3 +165,88 @@ fn arithmetic_on_a_text_literal_fails_when_compiled() {
     let w = different(&p("+"), &p("-"), T);
     assert!(w.contains("fails"), "{w}");
 }
+
+const TSQL_TYPES: &str = "
+CREATE TABLE dbo.P (Code VARCHAR(10) NOT NULL PRIMARY KEY);
+CREATE TABLE dbo.T (Id INT NOT NULL PRIMARY KEY, Q INT NULL, SD SMALLDATETIME NULL, DT DATETIME NULL);
+";
+
+fn run_types(a: &str, b: &str) -> Report {
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", T, TSQL_TYPES)],
+        catalog_b: vec![Artifact::new("catalog.sql", T, TSQL_TYPES)],
+        ..Options::default()
+    };
+    diff(
+        &Artifact::new("a.sql", T, a),
+        &Artifact::new("b.sql", T, b),
+        &opts,
+    )
+}
+
+#[test]
+fn times_a_column_rounds_alike_are_not_different() {
+    // smalldatetime stores whole minutes, datetime 1/300 s: both literals
+    // convert to the same stored value.
+    for (col, x, y) in [
+        ("SD", "2020-01-01 10:00:20", "2020-01-01 10:00:00"),
+        ("DT", "2020-01-01 10:00:00.001", "2020-01-01 10:00:00"),
+        ("DT", "2020-01-01 23:59:59.999", "2020-01-02"),
+    ] {
+        for op in ["=", ">"] {
+            let u = |v: &str| format!("UPDATE dbo.T SET Q = 1 WHERE {col} {op} '{v}';");
+            let r = run_types(&u(x), &u(y));
+            assert_ne!(
+                r.verdict,
+                Verdict::Different,
+                "{col} {op}: {:#?}",
+                r.findings
+            );
+        }
+    }
+    let u = |op: &str| format!("UPDATE dbo.T SET Q = 1 WHERE DT {op} '2020-01-01 10:00';");
+    assert_eq!(run_types(&u(">"), &u(">=")).verdict, Verdict::Different);
+}
+
+#[test]
+fn check_witness_fits_the_column_type() {
+    // No tinyint holds 300: both versions reject that row before the CHECK.
+    let t =
+        |n: u32| format!("CREATE TABLE dbo.X (Id int NOT NULL, Q tinyint NULL, CHECK (Q < {n}));");
+    not_different(&t(300), &t(400), T);
+}
+
+#[test]
+fn foreign_key_bounds_a_column_length() {
+    let inline = |n: u32| {
+        format!("CREATE TABLE dbo.C (Id int NOT NULL, Code varchar({n}) NOT NULL REFERENCES dbo.P (Code));")
+    };
+    let r = run_types(&inline(10), &inline(20));
+    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    let named = |n: u32| {
+        format!("CREATE TABLE dbo.C (Id int NOT NULL, Code varchar({n}) NOT NULL, CONSTRAINT FK_C FOREIGN KEY (Code) REFERENCES dbo.P (Code));")
+    };
+    let r = run_types(&named(10), &named(20));
+    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+}
+
+#[test]
+fn a_variable_holding_a_random_draw_is_not_an_input() {
+    // RAND() is never NULL, and @r - @r is 0 whatever it drew.
+    for set in [
+        "DECLARE @r float = RAND();",
+        "DECLARE @r float; SET @r = RAND();",
+    ] {
+        let p = |e: &str| format!("CREATE PROCEDURE dbo.r AS BEGIN {set} SELECT {e} AS x; END");
+        not_different(&p("@r - @r"), &p("0e0"), T);
+    }
+}
+
+#[test]
+fn foreign_key_on_another_column_keeps_a_default_witness() {
+    let t = |v: u32| {
+        format!("CREATE TABLE dbo.C (Code varchar(10) NOT NULL REFERENCES dbo.P (Code), tries int NOT NULL DEFAULT (({v})));")
+    };
+    let r = run_types(&t(3), &t(4));
+    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+}
