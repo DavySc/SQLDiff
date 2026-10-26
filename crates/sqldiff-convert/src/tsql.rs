@@ -22,6 +22,8 @@ use crate::tok::{
 };
 use crate::{Note, Status};
 
+mod temporal;
+
 const INDENT: usize = 2;
 
 /// Rule id of a refusal because of where the unit stands.
@@ -62,6 +64,8 @@ pub(crate) fn convert(
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
+        scope: None,
+        local: std::cell::OnceCell::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -106,6 +110,8 @@ struct Var {
     name: String,
     string: bool,
     numeric: bool,
+    /// The T-SQL type, for DATEADD.
+    dt: Dt,
 }
 
 /// A hoisted declaration: the DECLARE statement's span and the lines it adds.
@@ -158,6 +164,10 @@ struct Cx<'a> {
     /// Variables (lower case, without `@`) whose value is run as dynamic SQL
     /// in this routine or script: `EXEC (@sql)`, `sp_executesql @sql`.
     dynamic: Vec<String>,
+    /// The tables of the statement being converted, for column types.
+    scope: Option<Scope>,
+    /// Without a tree catalog: one read from this input, made when needed.
+    local: std::cell::OnceCell<sqldiff_core::catalog::Catalog>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -487,6 +497,7 @@ impl<'a> Cx<'a> {
                     name: pname.clone(),
                     string,
                     numeric,
+                    dt: Dt::of_tokens(&p[ty_at..ty_end]),
                 },
             );
             let output = p.iter().any(|t| t.is("OUTPUT") || t.is("OUT"));
@@ -1178,6 +1189,13 @@ impl<'a> Cx<'a> {
     // ----- statements -----------------------------------------------------------
 
     fn stmt(&mut self, n: &SyntaxNode) -> R<String> {
+        let outer = std::mem::replace(&mut self.scope, scope_of(&tokens(n)));
+        let r = self.stmt_in_scope(n);
+        self.scope = outer;
+        r
+    }
+
+    fn stmt_in_scope(&mut self, n: &SyntaxNode) -> R<String> {
         let mut ts = tokens(n);
         if self.db2() {
             // A query's own FROM-less SELECT is handled in `select`.
@@ -1188,6 +1206,15 @@ impl<'a> Cx<'a> {
             ts = dummy_from(&ts, top);
         }
         let s = sig(&ts);
+        // `PERIOD FOR SYSTEM_TIME` declares the period; `t FOR SYSTEM_TIME …` queries it.
+        if s.windows(3)
+            .any(|p| !ts[p[0]].is("PERIOD") && ts[p[1]].is("FOR") && ts[p[2]].is("SYSTEM_TIME"))
+        {
+            return no(self.pick(
+                "FOR SYSTEM_TIME reads the history of a system-versioned table: PostgreSQL has no temporal queries; a UNION ALL of the table and its history filtered on the period columns would do it; no rule yet",
+                "FOR SYSTEM_TIME: system-versioned tables are not converted for Db2 for i yet; no rule yet",
+            ));
+        }
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
         if self.mode == Mode::Top && procedural(n) {
@@ -1940,6 +1967,7 @@ impl<'a> Cx<'a> {
                     name: name.clone(),
                     string,
                     numeric,
+                    dt: Dt::of_tokens(&it[j..eq.unwrap_or(it.len())]),
                 },
             );
             lines.push(if self.db2() {
@@ -2595,16 +2623,16 @@ impl<'a> Cx<'a> {
     }
 
     fn create_table(&mut self, ts: &[T]) -> R<String> {
-        if ts
+        let (temporal, ts) = if ts
             .iter()
             .any(|t| t.is("SYSTEM_TIME") || t.is("SYSTEM_VERSIONING"))
         {
-            return no(self.pick(
-                "system-versioned (temporal) table: PostgreSQL has no system versioning; keep history with a trigger and a history table",
-                "system-versioned (temporal) table: Db2 for i spells it PERIOD SYSTEM_TIME with ROW BEGIN/END and a separate ALTER TABLE … ADD VERSIONING; no rule yet",
-            ));
-        }
-        let ts = self.strip_storage(ts)?;
+            let (t, ts) = self.temporal(ts)?;
+            (Some(t), ts)
+        } else {
+            (None, ts.to_vec())
+        };
+        let ts = self.strip_storage(&ts)?;
         let open = ts
             .iter()
             .position(|t| t.k == L_PAREN)
@@ -2624,10 +2652,27 @@ impl<'a> Cx<'a> {
         } else {
             Vec::new()
         };
+        let mut names = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
-            cols.push(self.table_item(item, &pk)?);
+            let col = self.table_item(item, &pk)?;
+            if let Some(&f) = sig(item).first().filter(|&&f| !constraint_item(&item[f])) {
+                names.push((
+                    tsql_unquote(&item[f].s),
+                    self.expr(&item[f..=f]).trim().to_string(),
+                ));
+            }
+            cols.push(col);
         }
         let tail = self.expr(&ts[close + 1..]);
+        if let Some(t) = temporal {
+            let table = Ok(format!(
+                "CREATE TABLE {name} ({}\n){}",
+                cols.join(","),
+                tail.trim_end()
+            ));
+            let versioning = self.versioning(&t, &name, &name_t, &names)?;
+            return table.map(|t| format!("{t};\n\n{versioning}"));
+        }
         if temp && self.db2() {
             // LOGGED: a rollback undoes the rows, as for a #temp table.
             return Ok(format!(
@@ -2659,14 +2704,26 @@ impl<'a> Cx<'a> {
         };
         let it = trimmed(item);
         let first = &it[0];
-        if ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
-            .iter()
-            .any(|w| first.is(w))
-        {
-            let kept: Vec<T> = it
-                .iter()
-                .filter(|t| !(t.is("CLUSTERED") || t.is("NONCLUSTERED")))
-                .cloned()
+        if constraint_item(first) {
+            // PRIMARY KEY (a ASC): the targets take no sort order in a key's
+            // column list. The order only shapes the key's index.
+            let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
+            let ds = crate::tok::depths(it);
+            let order = |j: usize| key && ds[j] == 1 && (it[j].is("ASC") || it[j].is("DESC"));
+            if (0..it.len()).any(|j| order(j) && it[j].is("DESC")) {
+                let text = self.pick(
+                    "DESC in a key's column list was dropped: PostgreSQL keys take no sort order. Results are the same; only the key's index is built ascending.",
+                    "DESC in a key's column list was dropped: Db2 for i keys take no sort order. Results are the same; only the key's index is built ascending.",
+                ).to_string();
+                self.note(Status::Converted, "tsql.key-order", &text);
+            }
+            let kept: Vec<T> = (0..it.len())
+                .filter(|&j| {
+                    let t = &it[j];
+                    let before_order = !t.sig() && next_sig(it, j).is_some_and(order);
+                    !(t.is("CLUSTERED") || t.is("NONCLUSTERED") || order(j) || before_order)
+                })
+                .map(|j| it[j].clone())
                 .collect();
             return Ok(format!("{lead}{}", collapse_spaces(&self.expr(&kept))));
         }
@@ -2804,6 +2861,15 @@ impl<'a> Cx<'a> {
 
     fn alter_table(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
+        if ts
+            .iter()
+            .any(|t| t.is("SYSTEM_VERSIONING") || t.is("SYSTEM_TIME"))
+        {
+            return no(self.pick(
+                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: in PostgreSQL versioning is the history trigger of the converted CREATE TABLE; turning it off, dropping the period or adding it later needs those triggers changed to match; no rule yet",
+                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: Db2 for i system-period tables are not converted yet (their facts are not verified on IBM i); no rule yet",
+            ));
+        }
         let first = sig(&ts)[0];
         if find_word(&ts, first + 1, "ALTER").is_some() {
             return no(self.pick(
@@ -2933,6 +2999,9 @@ impl<'a> Cx<'a> {
                 }
                 STRING => {
                     let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+                    if !self.db2() && rounds_past_year_9999(&string_value(lit)) {
+                        self.note(Status::Differs, "tsql.end-of-time-literal", "This literal is the end of time at 100 ns precision (DATETIME2(7)). PostgreSQL keeps microseconds and rounds it up to 10000-01-01 00:00:00, so it no longer equals the largest stored value (a system-versioned table's current rows end at 9999-12-31 23:59:59.999999). Write '9999-12-31 23:59:59.999999' if it means the end of time.");
+                    }
                     o.push_str(lit);
                     self.string_compare(ts, i);
                     self.fraction_note(lit);
@@ -3355,11 +3424,7 @@ impl<'a> Cx<'a> {
                 self.note(Status::NotConverted, "tsql.convert-style", "CONVERT with a style code: use to_char / to_timestamp with the matching format.");
                 return None;
             }
-            ("DATEADD", 3) => {
-                let part = date_part(&self.expr(a[0]))?;
-                let (k, d) = (e(self, 1), e(self, 2));
-                format!("({d} + ({k}) * interval '1 {part}')")
-            }
+            ("DATEADD", 3) => return self.dateadd(&a),
             ("DATEPART", 2) => {
                 let part = date_part(&self.expr(a[0]))?;
                 format!("EXTRACT({part} FROM {})::int", e(self, 1))
@@ -3479,14 +3544,7 @@ impl<'a> Cx<'a> {
                 self.note(Status::NotConverted, "tsql.convert-style", "CONVERT with a style code: use VARCHAR_FORMAT / TIMESTAMP_FORMAT with the matching format.");
                 return None;
             }
-            ("DATEADD", 3) => {
-                let part = date_part(&self.expr(a[0]))?;
-                let (k, d) = (e(self, 1), e(self, 2));
-                if matches!(part, "month" | "year") {
-                    self.note(Status::Assumptions, "ASM-DB2-MONTH-END", "Adding months or years: both move the day to the end of a shorter month (Jan 31 + 1 month = Feb 28 or 29); Db2 also returns warning 01506, which does not stop the routine. Not in the verified vendor facts.");
-                }
-                format!("({d} + ({k}) {}S)", part.to_ascii_uppercase())
-            }
+            ("DATEADD", 3) => return self.dateadd(&a),
             ("DATEPART", 2) => {
                 let part = date_part(&self.expr(a[0]))?;
                 format!("{}({})", part.to_ascii_uppercase(), e(self, 1))
@@ -4432,6 +4490,29 @@ fn date_part(p: &str) -> Option<&'static str> {
     })
 }
 
+/// A date-time text whose fractional seconds PostgreSQL's microseconds
+/// round into the year 10000: `9999-12-31 23:59:59.9999995` and above.
+fn rounds_past_year_9999(v: &str) -> bool {
+    let v = v.trim();
+    let Some(frac) = ["9999-12-31 23:59:59.", "9999-12-31T23:59:59."]
+        .iter()
+        .find_map(|p| v.strip_prefix(p))
+    else {
+        return false;
+    };
+    frac.len() > 6
+        && frac.chars().all(|c| c.is_ascii_digit())
+        && frac.starts_with("999999")
+        && frac.as_bytes()[6] >= b'5'
+}
+
+/// A CREATE TABLE item that is a table constraint, not a column.
+fn constraint_item(first: &T) -> bool {
+    ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+        .iter()
+        .any(|w| first.is(w))
+}
+
 /// `[Name]` → `Name` when it is a plain identifier, else `"Name"`.
 fn quoted(s: &str) -> String {
     let inner = tsql_unquote(s);
@@ -4594,4 +4675,585 @@ fn replace_word(s: &str, from: &str, to: &str) -> String {
         return s.to_string();
     }
     format!("{}{to}{}", &s[..i], &s[end..])
+}
+
+/// A T-SQL type, as far as DATEADD needs it: the date argument decides the
+/// result type, and the number must become an integer the way T-SQL makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dt {
+    Date,
+    /// TIME(p), DATETIME2(p), DATETIMEOFFSET(p): p fractional digits (7 by default).
+    Time(u32),
+    DateTime,
+    SmallDateTime,
+    DateTime2(u32),
+    Offset(u32),
+    /// INT, SMALLINT, TINYINT, or an integer literal.
+    Int,
+    BigInt,
+    /// DECIMAL, NUMERIC, FLOAT, REAL, MONEY, SMALLMONEY, or a literal with a fraction.
+    Fraction,
+    /// A string (a literal, or a CHAR/VARCHAR value).
+    Text,
+    Other,
+}
+
+impl Dt {
+    /// From a type's base name (unquoted, any case) and its arguments.
+    fn of(base: &str, args: &[u32]) -> Dt {
+        let p = args.first().copied().unwrap_or(7);
+        match base.to_ascii_uppercase().as_str() {
+            "DATE" => Dt::Date,
+            "TIME" => Dt::Time(p),
+            "DATETIME" => Dt::DateTime,
+            "SMALLDATETIME" => Dt::SmallDateTime,
+            "DATETIME2" => Dt::DateTime2(p),
+            "DATETIMEOFFSET" => Dt::Offset(p),
+            "INT" | "INTEGER" | "SMALLINT" | "TINYINT" => Dt::Int,
+            "BIGINT" => Dt::BigInt,
+            "DECIMAL" | "NUMERIC" | "DEC" | "FLOAT" | "REAL" | "MONEY" | "SMALLMONEY"
+            | "DOUBLE PRECISION" => Dt::Fraction,
+            "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "CHARACTER" | "CHARACTER VARYING"
+            | "TEXT" | "NTEXT" | "SYSNAME" => Dt::Text,
+            _ => Dt::Other,
+        }
+    }
+
+    /// From the tokens of a type as written (`datetime2(3)`, `[date]`).
+    fn of_tokens(ts: &[T]) -> Dt {
+        let ts = trimmed(ts);
+        let Some(first) = ts.first() else {
+            return Dt::Other;
+        };
+        if next_sig(ts, 0).is_some_and(|d| ts[d].k == DOT) {
+            return Dt::Other;
+        }
+        let args: Vec<u32> = match ts.iter().position(|t| t.k == L_PAREN) {
+            Some(p) => split_commas(&ts[p + 1..matching(ts, p).unwrap_or(ts.len())])
+                .iter()
+                .map(|a| trimmed(a).iter().map(|t| t.s.as_str()).collect::<String>())
+                .map(|a| a.parse().unwrap_or(u32::MAX))
+                .collect(),
+            None => Vec::new(),
+        };
+        Dt::of(&tsql_unquote(&first.s), &args)
+    }
+
+    fn is_date(self) -> bool {
+        matches!(
+            self,
+            Dt::Date
+                | Dt::Time(_)
+                | Dt::DateTime
+                | Dt::SmallDateTime
+                | Dt::DateTime2(_)
+                | Dt::Offset(_)
+        )
+    }
+
+    /// The fractional digits a value of this type keeps, for the date types.
+    fn scale(self) -> u32 {
+        match self {
+            Dt::Time(p) | Dt::DateTime2(p) | Dt::Offset(p) => p,
+            Dt::DateTime => 3,
+            _ => 0,
+        }
+    }
+
+    fn name(self) -> String {
+        match self {
+            Dt::Date => "date".into(),
+            Dt::Time(p) => format!("time({p})"),
+            Dt::DateTime => "datetime".into(),
+            Dt::SmallDateTime => "smalldatetime".into(),
+            Dt::DateTime2(p) => format!("datetime2({p})"),
+            Dt::Offset(p) => format!("datetimeoffset({p})"),
+            _ => "a non-date type".into(),
+        }
+    }
+}
+
+/// A DATEADD datepart, aliases folded as T-SQL documents them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Year,
+    Quarter,
+    Month,
+    /// day, dayofyear and weekday all add days.
+    Day,
+    Week,
+    Hour,
+    Minute,
+    Second,
+    Milli,
+    Micro,
+    Nano,
+}
+
+impl Unit {
+    fn of(p: &str) -> Option<Unit> {
+        Some(match p.trim().to_ascii_lowercase().as_str() {
+            "year" | "yy" | "yyyy" => Unit::Year,
+            "quarter" | "qq" | "q" => Unit::Quarter,
+            "month" | "mm" | "m" => Unit::Month,
+            "dayofyear" | "dy" | "y" | "day" | "dd" | "d" | "weekday" | "dw" | "w" => Unit::Day,
+            "week" | "wk" | "ww" => Unit::Week,
+            "hour" | "hh" => Unit::Hour,
+            "minute" | "mi" | "n" => Unit::Minute,
+            "second" | "ss" | "s" => Unit::Second,
+            "millisecond" | "ms" => Unit::Milli,
+            "microsecond" | "mcs" => Unit::Micro,
+            "nanosecond" | "ns" => Unit::Nano,
+            _ => return None,
+        })
+    }
+
+    /// Year down to week: the parts that move the calendar date.
+    fn calendar(self) -> bool {
+        matches!(
+            self,
+            Unit::Year | Unit::Quarter | Unit::Month | Unit::Day | Unit::Week
+        )
+    }
+
+    fn months(self) -> bool {
+        matches!(self, Unit::Year | Unit::Quarter | Unit::Month)
+    }
+}
+
+/// The tables a statement reads, for the types of its column references.
+struct Scope {
+    entries: Vec<ScopeEntry>,
+}
+
+struct ScopeEntry {
+    /// Name parts, unquoted and lowercased.
+    name: Vec<String>,
+    alias: Option<String>,
+    /// A plain name: not a derived table, function or table variable.
+    named: bool,
+}
+
+/// The FROM, JOIN, UPDATE, MERGE and USING items of a statement, at any
+/// depth. `None` when the statement has CTEs, whose names would hide tables.
+fn scope_of(ts: &[T]) -> Option<Scope> {
+    if cte_list(ts).is_some() {
+        return None;
+    }
+    let s = sig(ts);
+    let mut entries = Vec::new();
+    let mut updates = Vec::new();
+    let mut k = 0;
+    while k < s.len() {
+        let w = ts[s[k]].up();
+        let starts = match w.as_str() {
+            "FROM" | "JOIN" | "USING" | "APPLY" => true,
+            "UPDATE" => {
+                updates.push(entries.len());
+                true
+            }
+            "MERGE" => {
+                if s.get(k + 1).is_some_and(|&j| ts[j].is("INTO")) {
+                    k += 1;
+                }
+                true
+            }
+            _ => false,
+        };
+        k += 1;
+        if !starts {
+            continue;
+        }
+        // One item, then more after commas.
+        while let Some(&first) = s.get(k) {
+            let mut name = Vec::new();
+            let mut named = matches!(ts[first].k, IDENT | QUOTED_IDENT);
+            if named {
+                name.push(tsql_unquote(&ts[first].s).to_ascii_lowercase());
+                k += 1;
+                while s.get(k).is_some_and(|&j| ts[j].k == DOT) {
+                    match s.get(k + 1) {
+                        Some(&j) if matches!(ts[j].k, IDENT | QUOTED_IDENT) => {
+                            name.push(tsql_unquote(&ts[j].s).to_ascii_lowercase());
+                            k += 2;
+                        }
+                        _ => {
+                            named = false;
+                            k += 1;
+                        }
+                    }
+                }
+                if s.get(k).is_some_and(|&j| ts[j].k == L_PAREN) {
+                    // A function call.
+                    named = false;
+                }
+            }
+            if !named {
+                // A derived table, VALUES, a function or a table variable:
+                // skip to its end.
+                if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == L_PAREN) {
+                    let end = matching(ts, j).unwrap_or(ts.len() - 1);
+                    k = s.partition_point(|&x| x <= end);
+                } else if s.get(k).is_some_and(|&j| ts[j].k == VARIABLE) {
+                    k += 1;
+                }
+            }
+            if s.get(k).is_some_and(|&j| ts[j].is("AS")) {
+                k += 1;
+            }
+            let alias = s.get(k).and_then(|&j| {
+                let t = &ts[j];
+                (t.k == QUOTED_IDENT
+                    || t.k == IDENT && !sqldiff_core::normalize::is_keyword(&t.up()))
+                .then(|| tsql_unquote(&t.s).to_ascii_lowercase())
+            });
+            if alias.is_some() {
+                k += 1;
+            }
+            entries.push(ScopeEntry { name, alias, named });
+            if s.get(k).is_some_and(|&j| ts[j].k == COMMA) && w != "UPDATE" {
+                k += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    // `UPDATE x SET … FROM t x`: the UPDATE item names an alias.
+    for &u in updates.iter().rev() {
+        let alias_of_other = entries.get(u).is_some_and(|e| {
+            e.alias.is_none()
+                && matches!(e.name.as_slice(), [n] if entries.iter().any(|o| o.alias.as_deref() == Some(n.as_str())))
+        });
+        if alias_of_other {
+            entries.remove(u);
+        }
+    }
+    Some(Scope { entries })
+}
+
+/// The type of a numeric literal as T-SQL reads it.
+fn number_dt(s: &str) -> Dt {
+    if s.len() >= 2 && s[..2].eq_ignore_ascii_case("0x") {
+        return Dt::Other;
+    }
+    if s.contains(['.', 'e', 'E']) {
+        return Dt::Fraction;
+    }
+    match s.parse::<i64>() {
+        Ok(n) if i32::try_from(n).is_ok() => Dt::Int,
+        _ => Dt::BigInt,
+    }
+}
+
+/// Why DATEADD of `u` on a `dt` value has no exact rewrite, if it has none.
+fn dateadd_refusal(dt: Dt, u: Unit, db2: bool) -> Option<String> {
+    use Unit::*;
+    let rejects = || {
+        Some(format!(
+            "T-SQL rejects this datepart on {} (the source fails as written)",
+            dt.name()
+        ))
+    };
+    let target = if db2 { "Db2 for i" } else { "PostgreSQL" };
+    match (dt, u) {
+        (Dt::Date, _) if !u.calendar() => rejects(),
+        (Dt::Time(_), _) if u.calendar() => rejects(),
+        (Dt::Date | Dt::DateTime | Dt::SmallDateTime, Micro | Nano) => rejects(),
+        (_, Nano) => Some(format!("nanoseconds: T-SQL rounds the number to steps of 100 ns (49 adds nothing, 50 adds 100 ns), and {target} keeps microseconds")),
+        (Dt::SmallDateTime, Second | Milli) => Some("seconds or milliseconds on smalldatetime: T-SQL adds nothing for small numbers (seconds from -30 to 29) and otherwise starts from a whole minute; no exact equivalent".into()),
+        (Dt::DateTime, Milli) => Some("milliseconds on datetime: T-SQL rounds the result to 1/300 s (.000, .003, .007); no exact equivalent".into()),
+        (Dt::Offset(_), _) if db2 => Some("datetimeoffset has no Db2 for i type".into()),
+        (Dt::Offset(_), _) if u.calendar() => Some("days or longer on datetimeoffset: T-SQL keeps the value's own offset, while PostgreSQL timestamptz adds calendar days in the session time zone, so a daylight-saving change moves the hour".into()),
+        (Dt::Time(_), Milli | Micro) if db2 => Some("fractions of a second on time: Db2 for i TIME has no fractional seconds".into()),
+        (_, Milli) if dt.scale() < 3 => Some(format!("milliseconds on {}: T-SQL rounds the result to the type's fractional digits; not checked", dt.name())),
+        (_, Micro) if dt.scale() < 6 => Some(format!("microseconds on {}: T-SQL rounds the result to the type's fractional digits; not checked", dt.name())),
+        _ => None,
+    }
+}
+
+/// A DATEADD number made an integer: its text, and whether it is one token
+/// (or a negative literal) that needs no parentheses.
+struct Num {
+    text: String,
+    simple: bool,
+}
+
+impl Num {
+    fn paren(&self) -> String {
+        if self.simple {
+            self.text.clone()
+        } else {
+            format!("({})", self.text)
+        }
+    }
+
+    /// `5` for the literal `-5`.
+    fn negated_literal(&self) -> Option<&str> {
+        let n = self.text.strip_prefix('-')?.trim_start();
+        n.bytes().all(|b| b.is_ascii_digit()).then_some(n)
+    }
+
+    /// The number times `m`: folded for a literal.
+    fn times(&self, m: i64) -> String {
+        let lit = self.text.replace(' ', "").parse::<i64>().ok();
+        match lit {
+            Some(n) => (n * m).to_string(),
+            None => format!("{m} * {}", self.paren()),
+        }
+    }
+}
+
+impl Cx<'_> {
+    /// The catalog column types come from: the tree's, or else one read
+    /// from this input's own CREATE TABLE statements.
+    fn type_catalog(&self) -> Option<&sqldiff_core::catalog::Catalog> {
+        if let Some(c) = self.catalog {
+            return Some(c);
+        }
+        self.local
+            .get_or_init(|| sqldiff_core::catalog::ddl::load(self.src, Dialect::Tsql, "input"))
+            .into()
+    }
+
+    /// The catalog table of a scope entry whose columns are known.
+    fn entry_table(&self, e: &ScopeEntry) -> Option<&sqldiff_core::catalog::Table> {
+        use sqldiff_core::catalog::{table_position, Ident};
+        if !e.named {
+            return None;
+        }
+        let cat = self.type_catalog()?;
+        let parts: Vec<Ident> = match e.name.as_slice() {
+            [.., s, t] if s != "dbo" => vec![Ident::plain(s.clone()), Ident::plain(t.clone())],
+            [.., t] => vec![Ident::plain(t.clone())],
+            [] => return None,
+        };
+        let t = &cat.tables[table_position(Dialect::Tsql, cat, &parts)?];
+        t.columns_known.then_some(t)
+    }
+
+    /// The type of a column reference, by the statement's tables. A bare
+    /// name needs every table of the statement known, and every table that
+    /// has the column to agree on its type.
+    fn column_dt(&self, ts: &[T]) -> Option<Dt> {
+        use sqldiff_core::catalog::Ident;
+        let parts = name_parts(ts)?;
+        let scope = self.scope.as_ref()?;
+        let (q, col) = match parts.as_slice() {
+            [c] => (None, c),
+            [.., q, c] => (Some(q), c),
+            [] => return None,
+        };
+        let mut found = None;
+        for e in &scope.entries {
+            let here = q.map_or(true, |q| match &e.alias {
+                Some(a) => a == q,
+                None => e.name.last() == Some(q),
+            });
+            if !here {
+                continue;
+            }
+            let t = self.entry_table(e)?;
+            if let Some(c) = t.column(Dialect::Tsql, &Ident::plain(col.clone())) {
+                let dt = Dt::of(&c.data_type.base, &c.data_type.args);
+                if found.is_some_and(|f| f != dt) {
+                    return None;
+                }
+                found = Some(dt);
+            }
+        }
+        found
+    }
+
+    /// The T-SQL type of a plain expression: a variable, a column, a
+    /// literal, a cast or a date function. `None` when it is not known.
+    fn expr_dt(&self, ts: &[T]) -> Option<Dt> {
+        let ts = trimmed(ts);
+        let s = sig(ts);
+        let &first = s.first()?;
+        let t = &ts[first];
+        let last = ts.len() - 1;
+        if t.k == L_PAREN && matching(ts, first) == Some(last) {
+            return self.expr_dt(&ts[first + 1..last]);
+        }
+        match s.as_slice() {
+            [_] => match t.k {
+                VARIABLE => self
+                    .vars
+                    .get(&t.s.trim_start_matches('@').to_ascii_lowercase())
+                    .map(|v| v.dt),
+                STRING => Some(Dt::Text),
+                NUMBER => Some(number_dt(&t.s)),
+                IDENT if t.is("CURRENT_TIMESTAMP") => Some(Dt::DateTime),
+                IDENT | QUOTED_IDENT => self.column_dt(ts),
+                _ => None,
+            },
+            [_, n, ..] if t.k == OP && t.s == "-" => {
+                let d = self.expr_dt(&ts[*n..])?;
+                matches!(d, Dt::Int | Dt::BigInt | Dt::Fraction).then_some(d)
+            }
+            [_, p, ..] if t.k == IDENT && ts[*p].k == L_PAREN && matching(ts, *p) == Some(last) => {
+                let a = split_commas(&ts[p + 1..last]);
+                match (t.up().as_str(), a.len()) {
+                    ("CAST", 1) => {
+                        let at = crate::tok::find_word(a[0], 0, "AS")?;
+                        Some(Dt::of_tokens(&a[0][at + 1..]))
+                    }
+                    ("CONVERT", 2 | 3) => Some(Dt::of_tokens(a[0])),
+                    ("DATEADD", 3) => Some(match self.expr_dt(a[2])? {
+                        Dt::Text => Dt::DateTime,
+                        d => d,
+                    }),
+                    ("GETDATE" | "GETUTCDATE", 0) => Some(Dt::DateTime),
+                    ("SYSDATETIME" | "SYSUTCDATETIME", 0) => Some(Dt::DateTime2(7)),
+                    ("SYSDATETIMEOFFSET", 0) => Some(Dt::Offset(7)),
+                    _ => None,
+                }
+            }
+            _ => self.column_dt(ts),
+        }
+    }
+
+    /// The DATEADD number as an integer, made the way T-SQL makes it: a
+    /// fraction is truncated toward zero, a value outside int is an error.
+    fn dateadd_number(&mut self, ts: &[T]) -> Result<Num, String> {
+        let x = self.expr(ts).trim().to_string();
+        let one = sig(trimmed(ts)).len() == 1;
+        let ty = self.expr_dt(ts);
+        match ty {
+            Some(Dt::Int) => Ok(Num {
+                simple: one || number_dt(x.trim_start_matches('-').trim()) == Dt::Int,
+                text: x,
+            }),
+            Some(Dt::Text) => Err("the number is a string; CAST it to int".into()),
+            Some(Dt::Other) => Err("the number is not a number".into()),
+            Some(d) if d.is_date() => Err("the number is a date or time value".into()),
+            _ if self.db2() => {
+                if ty != Some(Dt::BigInt) {
+                    self.note(Status::Assumptions, "ASM-DB2-DATEADD-NUMBER", "T-SQL truncates a DATEADD number with a fraction toward zero (1.9 → 1, -1.9 → -1); CAST(… AS INTEGER) on Db2 for i is assumed to truncate the same way (fact V27, not checked on a real system).");
+                }
+                Ok(Num {
+                    text: format!("CAST({x} AS INTEGER)"),
+                    simple: false,
+                })
+            }
+            Some(Dt::BigInt) => Ok(Num {
+                text: format!("({x})::integer"),
+                simple: true,
+            }),
+            _ => Ok(Num {
+                text: format!("trunc({x})::integer"),
+                simple: true,
+            }),
+        }
+    }
+
+    /// DATEADD: the result keeps the type of the date argument, as in
+    /// T-SQL. `None` (with a note) where there is no exact rewrite.
+    fn dateadd(&mut self, a: &[&[T]]) -> Option<String> {
+        let refuse = |cx: &mut Self, why: &str| {
+            cx.note(
+                Status::NotConverted,
+                "tsql.dateadd",
+                &format!("DATEADD: {why}."),
+            );
+            None
+        };
+        let part = self.expr(a[0]).trim().to_string();
+        let Some(u) = Unit::of(&part) else {
+            return refuse(self, &format!("`{part}` is not a datepart"));
+        };
+        let dt = match self.expr_dt(a[2]) {
+            Some(Dt::Text) => return refuse(self, "the date is a string, which T-SQL reads as datetime by the session's DATEFORMAT and language; write CAST('…' AS date) or CAST('…' AS datetime2) so its type is explicit"),
+            Some(d) if d.is_date() => d,
+            Some(_) => return refuse(self, "the date argument is not a date or time value"),
+            None => return refuse(self, "the type of the date argument is not known, and the result takes that type (a date stays a date); use a declared variable, a column of a table defined in the converted files, or CAST(… AS date)"),
+        };
+        if let Some(why) = dateadd_refusal(dt, u, self.db2()) {
+            return refuse(self, &why);
+        }
+        let k = match self.dateadd_number(a[1]) {
+            Ok(k) => k,
+            Err(why) => return refuse(self, &why),
+        };
+        let d = self.expr(a[2]).trim().to_string();
+        if !matches!(dt, Dt::Time(_)) {
+            let text = self.pick(
+                "DATEADD raises an error when the result leaves the range of its type (date and datetime2 0001–9999, datetime 1753–9999, smalldatetime 1900 to 2079-06-06); PostgreSQL returns the value instead. Equal while results stay in range.",
+                "DATEADD raises an error when the result leaves the range of its type (date and datetime2 0001–9999, datetime 1753–9999, smalldatetime 1900 to 2079-06-06). Db2 for i dates and timestamps also end at 0001 and 9999 and are assumed to raise an error there too (fact V27, not checked on a real system); inside 0001–9999 but outside the datetime or smalldatetime range Db2 returns the value instead. Equal while results stay in range.",
+            ).to_string();
+            self.note(Status::Assumptions, "ASM-DATEADD-RANGE", &text);
+        }
+        if matches!(u, Unit::Year | Unit::Quarter) {
+            self.note(Status::Assumptions, "ASM-DATEADD-YEAR-END", "Microsoft documents the month-end rule for month only (Jan 31 + 1 month = the last day of February); years and quarters are assumed to clamp the same way (2024-02-29 + 1 year = 2025-02-28), as they do in the target. Not checked on SQL Server.");
+        }
+        if matches!(dt, Dt::Time(_)) {
+            self.note(Status::Assumptions, "ASM-DATEADD-TIME-WRAP", "On time, T-SQL DATEADD is assumed to wrap around midnight (23:00 + 2 hours = 01:00); Microsoft's page does not say. Not checked on SQL Server.");
+        }
+        if self.db2() {
+            if u.months() {
+                self.note(Status::Assumptions, "ASM-DB2-MONTH-END", "Adding months, quarters or years: T-SQL moves a day that the result month lacks to that month's last day (Jan 31 + 1 month = Feb 29 in 2024). Db2 for i is assumed to do the same and to return warning 01506, which does not stop the routine (fact V27, not checked on a real system).");
+            }
+            if matches!(dt, Dt::Time(_)) {
+                self.note(Status::Assumptions, "ASM-DB2-TIME-WRAP", "On time, Db2 for i TIME arithmetic is assumed to wrap around midnight as T-SQL does (23:00 + 2 hours = 01:00; fact V27, not checked on a real system).");
+            }
+            let (n, unit) = match u {
+                Unit::Year => (k.paren(), "YEARS"),
+                Unit::Quarter => (format!("({})", k.times(3)), "MONTHS"),
+                Unit::Month => (k.paren(), "MONTHS"),
+                Unit::Day => (k.paren(), "DAYS"),
+                Unit::Week => (format!("({})", k.times(7)), "DAYS"),
+                Unit::Hour => (k.paren(), "HOURS"),
+                Unit::Minute => (k.paren(), "MINUTES"),
+                Unit::Second => (k.paren(), "SECONDS"),
+                // BIGINT: a million milliseconds overflows INTEGER as microseconds.
+                Unit::Milli if k.negated_literal().is_some() || k.text.parse::<i64>().is_ok() => {
+                    (format!("({})", k.times(1000)), "MICROSECONDS")
+                }
+                Unit::Milli => (
+                    format!("(CAST({} AS BIGINT) * 1000)", k.text),
+                    "MICROSECONDS",
+                ),
+                Unit::Micro | Unit::Nano => (k.paren(), "MICROSECONDS"),
+            };
+            // `d - 5 DAYS` for a negative literal (folded or not).
+            let lit = n.trim_start_matches('(').trim_end_matches(')');
+            return Some(match lit.parse::<i64>() {
+                Ok(m) if m < 0 => format!("({d} - {} {unit})", -m),
+                Ok(m) => format!("({d} + {m} {unit})"),
+                Err(_) => format!("({d} + {n} {unit})"),
+            });
+        }
+        Some(match (dt, u) {
+            (Dt::Date, Unit::Day) => match k.negated_literal() {
+                Some(m) => format!("({d} - {m})"),
+                None => format!("({d} + {})", k.paren()),
+            },
+            (Dt::Date, Unit::Week) => match k.text.replace(' ', "").parse::<i64>() {
+                Ok(n) if n < 0 => format!("({d} - {})", -7 * n),
+                Ok(n) => format!("({d} + {})", 7 * n),
+                Err(_) => format!("({d} + {})", k.times(7)),
+            },
+            (_, Unit::Milli) => format!("({d} + {} * interval '1 millisecond')", k.paren()),
+            (_, Unit::Micro) => format!("({d} + {} * interval '1 microsecond')", k.paren()),
+            _ => {
+                let (field, n) = match u {
+                    Unit::Year => ("years", k.text.clone()),
+                    Unit::Quarter => ("months", k.times(3)),
+                    Unit::Month => ("months", k.text.clone()),
+                    Unit::Day => ("days", k.text.clone()),
+                    Unit::Week => ("weeks", k.text.clone()),
+                    Unit::Hour => ("hours", k.text.clone()),
+                    Unit::Minute => ("mins", k.text.clone()),
+                    _ => ("secs", k.text.clone()),
+                };
+                let sum = format!("({d} + make_interval({field} => {n}))");
+                // date + interval is a timestamp in PostgreSQL.
+                if dt == Dt::Date {
+                    format!("{sum}::date")
+                } else {
+                    sum
+                }
+            }
+        })
+    }
 }

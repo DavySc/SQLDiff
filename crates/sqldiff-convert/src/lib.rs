@@ -15,6 +15,7 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
+pub mod names;
 mod out;
 mod template;
 mod tok;
@@ -196,7 +197,7 @@ pub fn rewrite_in(
 /// (unknown built-in, column, variable, type, ...), still holds source-dialect
 /// syntax, breaks a target limit, or is a known hazard. Findings about the
 /// code's own quality (analysis hits) are not about the conversion and do not.
-fn gates(f: &sqldiff_core::Finding) -> bool {
+pub fn gates(f: &sqldiff_core::Finding) -> bool {
     use sqldiff_core::ChangeClass as C;
     matches!(f.class, C::Binding | C::Residue | C::Limit) || f.rule.starts_with("hazard.")
 }

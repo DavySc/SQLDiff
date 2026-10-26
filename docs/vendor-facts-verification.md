@@ -46,6 +46,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V24 | Volatility and strictness | Confirmed | Defaults `VOLATILE` and `CALLED ON NULL INPUT`. |
 | V25 | Routine security context | Confirmed (T-SQL, PG), Unverified (Db2 i) | Owner vs caller privileges per dialect; Db2 i default `USRPRF *NAMING` needs a test. |
 | V26 | Db2 i CTE scoping and recursion | Unverified | Forward reference to a later CTE, and a recursive CTE without a column list: probes in `probes/db2i`. |
+| V27 | Db2 i labeled durations as the DATEADD rewrite | Unverified | Month-end clamping and warning 01506, TIME wrap-around, `CAST(… AS INTEGER)` truncation, BIGINT microsecond durations, the 9999 range error: probes `V27-*` in `probes/db2i`. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -277,6 +278,17 @@ Two forms that the T-SQL to Db2 for i converter passes through unchanged, raised
 - A recursive CTE without a column list (`WITH r AS (SELECT 1 AS n ... UNION ALL SELECT n + 1 FROM r ...)`): accepted, or is the column list required?
 
 No readable IBM i page settles either, so both are open questions with no expectation (probes `V26-*` in [probes/db2i](../probes/db2i/README.md)).
+
+### V27. Labeled durations as the rewrite of DATEADD — Unverified
+
+T-SQL `DATEADD` becomes Db2 for i labeled-duration arithmetic (`d + n DAYS`, `(3 * n) MONTHS`, `(CAST(n AS BIGINT) * 1000) MICROSECONDS`). The IBM i date, time and timestamp arithmetic pages could not be read (IBM Documentation refused the automated fetches), so what the converter relies on is held as assumptions until a run answers the `V27-*` probes in [probes/db2i](../probes/db2i/README.md):
+
+- Adding or subtracting months or years moves a day the result month lacks to its last day (2024-01-31 + 1 MONTHS = 2024-02-29; 2024-02-29 + 1 MONTHS = 2024-03-29, not 03-31), with warning 01506 (`ASM-DB2-MONTH-END`).
+- TIME arithmetic wraps around midnight (`ASM-DB2-TIME-WRAP`).
+- `CAST(1.9 AS INTEGER)` is 1 and `CAST(-1.9 AS INTEGER)` is -1, for decimals and floats (`ASM-DB2-DATEADD-NUMBER`); out of INTEGER range is an error.
+- A BIGINT microsecond duration is accepted and exact; `DATE('9999-12-31') + 1 DAYS` is an error (`ASM-DATEADD-RANGE`).
+
+The T-SQL side was checked on Microsoft's [DATEADD page](https://learn.microsoft.com/sql/t-sql/functions/dateadd-transact-sql): dateparts and abbreviations, truncation of a fractional number, the int range, the string-literal and same-type return rules, the month-end rule for `month`, the smalldatetime and nanosecond rounding rules, and the range error. The page does not cover years or quarters at month end, or `time` wrapping around midnight; the converter states both as assumptions (`ASM-DATEADD-YEAR-END`, `ASM-DATEADD-TIME-WRAP`).
 
 ## Follow-up
 

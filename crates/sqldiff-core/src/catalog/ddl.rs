@@ -242,6 +242,10 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
     for el in split_commas(inner) {
         let Some(first) = el.first() else { continue };
         if is_constraint(el, dialect) {
+            if first.is_kw("LIKE") {
+                // PostgreSQL `(LIKE other)`: the columns come from another table.
+                tb.columns_known = false;
+            }
             table_constraint(tb, el, dialect);
             continue;
         }

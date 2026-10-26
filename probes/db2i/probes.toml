@@ -1608,3 +1608,280 @@ outcome = [
   { label = "accepted", when = { create = "00000", state = "00000", n1 = "=1", n2 = "=10" }, verdict = "open", meaning = "Accepted and gives the same 10 rows: the column list may be left out." },
   { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected: a recursive CTE needs a column list on this release (SQLSTATE recorded); the converter must add one." },
 ]
+
+# ---------------------------------------------------------------- V27
+# DATEADD becomes labeled-duration arithmetic. The procedure runs the query Q,
+# fetches its first column (an INTEGER) into n1, counts SQL warnings in n2 and
+# keeps the last warning's SQLSTATE in text. Dates are compared as yyyymmdd and
+# times as hhmmss numbers, so the job's date and time formats do not matter.
+
+[[procedure]]
+name = "V27_INT"
+commit = "*NONE"
+options = "CLOSQLCSR = *ENDMOD"
+params = "IN Q VARCHAR(4000)"
+body = """
+BEGIN
+  DECLARE V_W CHAR(5) DEFAULT '00000';
+  DECLARE V_X INTEGER;
+  DECLARE C1 CURSOR FOR S1;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_N2 = 0;
+  SET O_TEXT = '';
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    DECLARE CONTINUE HANDLER FOR SQLWARNING
+      BEGIN
+        GET DIAGNOSTICS CONDITION 1 V_W = RETURNED_SQLSTATE;
+        SET O_N2 = O_N2 + 1;
+        SET O_TEXT = V_W;
+      END;
+    PREPARE S1 FROM Q;
+    OPEN C1;
+    FETCH C1 INTO V_X;
+    SET O_N1 = V_X;
+    CLOSE C1;
+  END;
+END
+"""
+
+[[probe]]
+id = "V27-MONTH-END"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''2024-01-31'') + 1 MONTHS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "DATEADD(month, 1, '2024-01-31') is 2024-02-29 in T-SQL. Does DATE + 1 MONTHS clamp to the last day of February the same way, and does it raise warning 01506?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "clamped, warning 01506", when = { create = "00000", state = "00000", n1 = "=20240229", text = "01506" }, verdict = "consistent", meaning = "Clamped to Feb 29 with warning 01506, as ASM-DB2-MONTH-END says." },
+  { label = "clamped, no 01506", when = { create = "00000", state = "00000", n1 = "=20240229" }, verdict = "refines", meaning = "Clamped to Feb 29, but warning 01506 was not seen (TEXT has the last warning, if any); the note's warning part is wrong." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Not clamped to Feb 29: the month conversion is wrong (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-MONTH-END-BACK"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''2024-03-31'') - 1 MONTHS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "Subtracting: 2024-03-31 - 1 month is 2024-02-29 in T-SQL. Same on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "clamped", when = { create = "00000", state = "00000", n1 = "=20240229" }, verdict = "consistent", meaning = "Clamped to Feb 29." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-MONTH-NOT-STICKY"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''2024-02-29'') + 1 MONTHS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "T-SQL keeps the day number: 2024-02-29 + 1 month is 2024-03-29, not the last day of March. Is that so for labeled durations (unlike a last-day-stays-last-day rule)?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "keeps the day", when = { create = "00000", state = "00000", n1 = "=20240329" }, verdict = "consistent", meaning = "Gives March 29." },
+  { label = "last day", when = { create = "00000", state = "00000", n1 = "=20240331" }, verdict = "contradicts", meaning = "Gives March 31: a month-end date stays at month end, unlike T-SQL." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-YEAR-LEAP"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''2024-02-29'') + 1 YEARS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "DATEADD(year, 1, '2024-02-29') is 2025-02-28 in T-SQL. Same for + 1 YEARS?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "clamped", when = { create = "00000", state = "00000", n1 = "=20250228" }, verdict = "consistent", meaning = "Gives 2025-02-28." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-QUARTER"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''2024-11-30'') + (3 * 1) MONTHS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "A quarter becomes (3 * n) MONTHS: 2024-11-30 + 1 quarter is 2025-02-28 in T-SQL. Is a parenthesized expression accepted as the duration, with the same result?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "clamped", when = { create = "00000", state = "00000", n1 = "=20250228" }, verdict = "consistent", meaning = "Accepted; gives 2025-02-28." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "The parenthesized expression is rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-NEGATIVE-DAYS"
+fact = "V27"
+role = "control"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''2024-01-31'') - 5 DAYS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "Control: DATE - 5 DAYS is 2024-01-26."
+source = "Labeled durations of days on a date; the common form."
+outcome = [
+  { label = "as expected", when = { create = "00000", state = "00000", n1 = "=20240126" }, verdict = "consistent", meaning = "Gives 2024-01-26." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-CAST-TRUNC"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT CAST(1.9 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL truncates a DATEADD number with a fraction toward zero. Does CAST(1.9 AS INTEGER) give 1 (truncation) on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "Gives 1: truncation toward zero, as ASM-DB2-DATEADD-NUMBER assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Rounds or truncates differently: the number conversion is wrong (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-CAST-TRUNC-NEG"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT CAST(-1.9 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL truncates a DATEADD number with a fraction toward zero. Does CAST(-1.9 AS INTEGER) give -1 (truncation) on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=-1" }, verdict = "consistent", meaning = "Gives -1: truncation toward zero, as ASM-DB2-DATEADD-NUMBER assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Rounds or truncates differently: the number conversion is wrong (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-CAST-TRUNC-FLOAT"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT CAST(1.9E0 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL truncates a DATEADD number with a fraction toward zero. Does CAST(the float 1.9 AS INTEGER) give 1 (truncation) on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "Gives 1: truncation toward zero, as ASM-DB2-DATEADD-NUMBER assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Rounds or truncates differently: the number conversion is wrong (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-CAST-TRUNC-FLOAT-NEG"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT CAST(-1.9E0 AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL truncates a DATEADD number with a fraction toward zero. Does CAST(the float -1.9 AS INTEGER) give -1 (truncation) on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "truncates", when = { create = "00000", state = "00000", n1 = "=-1" }, verdict = "consistent", meaning = "Gives -1: truncation toward zero, as ASM-DB2-DATEADD-NUMBER assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Rounds or truncates differently: the number conversion is wrong (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-CAST-OVERFLOW"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT CAST(CAST(2147483648 AS BIGINT) AS INTEGER) FROM SYSIBM.SYSDUMMY1'"]
+question = "T-SQL raises an error for a DATEADD number outside int. Does CAST(2147483648 AS INTEGER) raise an error on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Raises an error, as T-SQL does (SQLSTATE and SQLCODE recorded)" },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Returns a value instead of an error (the value is in N1)" },
+]
+
+[[probe]]
+id = "V27-TIME-WRAP"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT HOUR(D) * 10000 + MINUTE(D) * 100 + SECOND(D) FROM (SELECT TIME(''23:00:00'') + 2 HOURS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "T-SQL and PostgreSQL wrap time around midnight (23:00 + 2 hours is 01:00). Does Db2 for i TIME arithmetic wrap the same way?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "wraps", when = { create = "00000", state = "00000", n1 = "=10000" }, verdict = "consistent", meaning = "Wraps around midnight, as ASM-DB2-TIME-WRAP assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (no wrap) (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-TIME-WRAP-NEG"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT HOUR(D) * 10000 + MINUTE(D) * 100 + SECOND(D) FROM (SELECT TIME(''23:00:00'') - 25 HOURS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "T-SQL and PostgreSQL wrap time around midnight (23:00 - 25 hours is 22:00). Does Db2 for i TIME arithmetic wrap the same way?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "wraps", when = { create = "00000", state = "00000", n1 = "=220000" }, verdict = "consistent", meaning = "Wraps around midnight, as ASM-DB2-TIME-WRAP assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (no wrap) (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-TIME-WRAP-MINUTES"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT HOUR(D) * 10000 + MINUTE(D) * 100 + SECOND(D) FROM (SELECT TIME(''23:00:00'') + 90 MINUTES AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "T-SQL and PostgreSQL wrap time around midnight (23:00 + 90 minutes is 00:30). Does Db2 for i TIME arithmetic wrap the same way?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "wraps", when = { create = "00000", state = "00000", n1 = "=3000" }, verdict = "consistent", meaning = "Wraps around midnight, as ASM-DB2-TIME-WRAP assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (no wrap) (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-TIME-WRAP-SECONDS"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT HOUR(D) * 10000 + MINUTE(D) * 100 + SECOND(D) FROM (SELECT TIME(''23:00:00'') + 86401 SECONDS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "T-SQL and PostgreSQL wrap time around midnight (23:00 + 86401 seconds is 23:00:01). Does Db2 for i TIME arithmetic wrap the same way?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "wraps", when = { create = "00000", state = "00000", n1 = "=230001" }, verdict = "consistent", meaning = "Wraps around midnight, as ASM-DB2-TIME-WRAP assumes." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Different result (the value is in N1)" },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected (no wrap) (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-MILLIS-BIGINT"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT CASE WHEN TIMESTAMP(''2024-01-31-10.00.00.123000'') + (CAST(2147483647 AS BIGINT) * 1000) MICROSECONDS = TIMESTAMP(''2024-02-25-06.31.23.770000'') THEN 1 ELSE 0 END FROM SYSIBM.SYSDUMMY1'"]
+question = "Milliseconds become (CAST(n AS BIGINT) * 1000) MICROSECONDS. Is a BIGINT duration of 2147483647000 microseconds accepted and exact (PostgreSQL gives 2024-02-25 06:31:23.770)?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "exact", when = { create = "00000", state = "00000", n1 = "=1" }, verdict = "consistent", meaning = "Accepted and exact." },
+  { label = "different", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "contradicts", meaning = "Accepted but gives another timestamp." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Rejected: the BIGINT duration does not fit (SQLSTATE and SQLCODE recorded)" },
+]
+
+[[probe]]
+id = "V27-DATE-OVERFLOW"
+fact = "V27"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT YEAR(D) * 10000 + MONTH(D) * 100 + DAY(D) FROM (SELECT DATE(''9999-12-31'') + 1 DAYS AS D FROM SYSIBM.SYSDUMMY1) X'"]
+question = "T-SQL raises an error when DATEADD leaves 0001-9999. Does DATE('9999-12-31') + 1 DAYS raise an error on Db2 for i?"
+source = "Only the assumption the converter makes (T-SQL behaviour, checked against SQL Server); the IBM i date arithmetic page could not be read."
+outcome = [
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Raises an error, as T-SQL does (ASM-DATEADD-RANGE) (SQLSTATE and SQLCODE recorded)" },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Returns a value instead of an error (the value is in N1)" },
+]

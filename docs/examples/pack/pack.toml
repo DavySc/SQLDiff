@@ -63,6 +63,8 @@ name_pattern = "[A-Z_][A-Z0-9_]*"
 parameter_sources = ["environment", "object"]
 collision = "error"
 special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
+# The special form that pulls another template in; `sqldiff instances` weaves it.
+include = "include"
 
 [[composition]]
 name = "part markers"

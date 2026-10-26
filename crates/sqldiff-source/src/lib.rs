@@ -31,6 +31,7 @@ mod source;
 pub mod split;
 pub mod tree;
 mod walk;
+pub mod weave;
 pub use walk::defined_name;
 
 pub use bundle::{Bundle, BundleSource};

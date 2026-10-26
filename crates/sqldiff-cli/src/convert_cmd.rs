@@ -246,7 +246,10 @@ fn convert_templates(
         }
         parsed.push((t, basis));
     }
-    let stand = StandIns::new(parsed.iter().map(|(t, _)| t));
+    let mut stand = StandIns::new(parsed.iter().map(|(t, _)| t));
+    if !a.no_catalog {
+        stand = stand.bound_across();
+    }
     let stem = Some(stand.stem());
     let source = (!a.no_catalog).then(|| {
         let frags: Vec<String> = parsed
@@ -368,7 +371,7 @@ fn walk(dir: &Path, extensions: &[String], out: &mut Vec<PathBuf>) -> std::io::R
 
 /// UTF-8 (with or without BOM) or UTF-16 with a BOM, as SSDT projects save
 /// some files. Anything else is not guessed.
-fn decode(bytes: &[u8]) -> Option<String> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<String> {
     let utf16 = |b: &[u8], le: bool| {
         if b.len() % 2 != 0 {
             return None;
@@ -424,7 +427,11 @@ fn prepare_out(a: &Args) -> Result<(), String> {
 }
 
 /// Runs `f` over `items` on `jobs` threads; results in input order.
-fn parallel<T: Sync, R: Send>(jobs: usize, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn parallel<T: Sync, R: Send>(
+    jobs: usize,
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     let next = AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<R>>> =
         items.iter().map(|_| std::sync::Mutex::new(None)).collect();
@@ -448,7 +455,7 @@ fn parallel<T: Sync, R: Send>(jobs: usize, items: &[T], f: impl Fn(&T) -> R + Sy
 /// object whose name holds a stand-in and that more than one file defines
 /// is left out: those files are different instances' tables or routines,
 /// and binding against one of them would be a guess.
-fn catalog<'a>(
+pub(crate) fn catalog<'a>(
     texts: impl Iterator<Item = &'a str>,
     dialect: Dialect,
     origin: &Path,

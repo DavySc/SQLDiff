@@ -354,6 +354,30 @@ fn a_template_object_two_files_create_is_not_bound() {
     let p = std::fs::read_to_string(out.join("p.sql")).unwrap();
     assert!(!p.contains("bind.unknown-column"), "{p}");
     assert!(p.contains("ASM-TEMPLATE-PLACEHOLDER"), "{p}");
+    // Binding across templates rests on one value per placeholder per weave.
+    assert!(p.contains("ASM-TEMPLATE-SHARED-VALUES"), "{p}");
+    let alone = d.join("alone");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        alone.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--no-catalog",
+        "--pack",
+        &pack,
+        "--isolated",
+    ]);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let p = std::fs::read_to_string(alone.join("p.sql")).unwrap();
+    assert!(!p.contains("ASM-TEMPLATE-SHARED-VALUES"), "{p}");
 }
 
 #[test]
