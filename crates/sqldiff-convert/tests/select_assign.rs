@@ -125,3 +125,45 @@ fn the_engine_no_longer_finds_a_no_row_difference() {
     let rules: Vec<&str> = c.report.findings.iter().map(|f| f.rule.as_str()).collect();
     assert!(!rules.contains(&"equiv.no-rows"), "{rules:?}");
 }
+
+#[test]
+fn reading_an_assigned_variable_outside_the_select_list_keeps_into() {
+    for src in [
+        "DECLARE @n int = 5;\nSELECT @n = c FROM t WHERE c > @n;\n",
+        "DECLARE @n int = 5, @m int;\nSELECT @m = c FROM t ORDER BY ABS(c - @m);\n",
+    ] {
+        let c = convert(src, Dialect::Postgres);
+        assert!(!c.output.contains("FOR sqldiff_r"), "{}", c.output);
+        let n = select_unit(&c, src)
+            .notes
+            .iter()
+            .find(|n| n.rule == CARDINALITY)
+            .unwrap_or_else(|| panic!("{src}"));
+        assert!(n.text.contains("row by row"), "{}", n.text);
+    }
+}
+
+#[test]
+fn top_zero_or_offset_can_drop_the_aggregate_row() {
+    for src in [
+        "DECLARE @n int = 5;\nSELECT TOP 0 @n = COUNT(*) FROM t;\n",
+        "DECLARE @n int = 5;\nSELECT @n = COUNT(*) FROM t ORDER BY 1 OFFSET 1 ROWS;\n",
+    ] {
+        let c = convert(src, Dialect::Postgres);
+        assert!(c.output.contains("FOR sqldiff_r"), "{}", c.output);
+        assert!(!c.output.contains("INTO"), "{}", c.output);
+    }
+}
+
+#[test]
+fn names_of_the_loop_in_the_statement_keep_into() {
+    for src in [
+        "DECLARE @n int;\nSELECT @n = sqldiff_r FROM t;\n",
+        "DECLARE @n int;\nSELECT @n = c FROM t ORDER BY [SQLDIFF_C1];\n",
+        "DECLARE @n int;\nSELECT @n = c FROM sqldiff_c2;\n",
+    ] {
+        let c = convert(src, Dialect::Postgres);
+        assert!(!c.output.contains("FOR sqldiff_r"), "{}", c.output);
+        assert!(has_rule(select_unit(&c, src), CARDINALITY), "{src}");
+    }
+}

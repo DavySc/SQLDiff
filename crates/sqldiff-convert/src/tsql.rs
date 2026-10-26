@@ -1532,14 +1532,27 @@ impl<'a> Cx<'a> {
                 .iter()
                 .map(|it| trimmed(it)[0].s.to_ascii_lowercase())
                 .collect();
-            let accumulates = items.iter().any(|it| {
-                let t = trimmed(it);
-                let eq = t.iter().position(|x| x.k == OP && x.s == "=").unwrap();
-                t[eq + 1..]
-                    .iter()
-                    .any(|x| x.k == VARIABLE && assigned.contains(&x.s.to_ascii_lowercase()))
+            // Each item names its target once; any other use of an assigned
+            // variable (in an expression, WHERE, ORDER BY, TOP, ...) may see the
+            // values of earlier rows in T-SQL, while the loop's query reads it once.
+            let accumulates = ts
+                .iter()
+                .filter(|x| x.k == VARIABLE && assigned.contains(&x.s.to_ascii_lowercase()))
+                .count()
+                > items.len();
+            // The loop's own names must not meet a name of the statement: a
+            // column `sqldiff_r` would be ambiguous with the record, and a column
+            // `sqldiff_c1` in ORDER BY would read the loop's alias.
+            let captured = ts.iter().any(|x| {
+                x.s.trim_start_matches(['@', '[', '"'])
+                    .to_ascii_lowercase()
+                    .starts_with("sqldiff_")
             });
+            // TOP 0 or OFFSET can drop the one row an aggregate returns.
             let one_row = from.is_some()
+                && limit.is_none()
+                && find_word(&ts, 0, "OFFSET").is_none()
+                && find_word(&ts, 0, "FETCH").is_none()
                 && find_word(&ts, 0, "GROUP").is_none()
                 && find_word(&ts, 0, "HAVING").is_none()
                 && find_word(&ts, 0, "UNION").is_none()
@@ -1552,7 +1565,7 @@ impl<'a> Cx<'a> {
                 .filter(|(k, _)| !cut.contains(&(k + list_end)))
                 .map(|(_, t)| t.clone())
                 .collect();
-            if !self.db2() && !one_row && !accumulates {
+            if !self.db2() && !one_row && !accumulates && !captured {
                 // A loop over the query that assigns inside its body does exactly
                 // that. The variables cannot be the loop's own targets: PL/pgSQL sets
                 // the target of a loop over rows to NULL when the query returns no
@@ -1580,7 +1593,7 @@ impl<'a> Cx<'a> {
             }
             if !one_row {
                 let text = self.pick(
-                    "The query returns at most one row. With several rows T-SQL keeps the last row's values and PostgreSQL the first; with none T-SQL keeps the old values and PostgreSQL sets NULL. An expression that uses a variable it assigns accumulates row by row in T-SQL; here it is evaluated once.",
+                    "The query returns at most one row. With several rows T-SQL keeps the last row's values and PostgreSQL the first; with none T-SQL keeps the old values and PostgreSQL sets NULL. A statement that reads a variable it assigns (in an expression, WHERE, ORDER BY or TOP) accumulates or filters row by row in T-SQL; here it is read once.",
                     "The query returns at most one row. With several rows T-SQL keeps the last row's values and Db2 for i raises SQLSTATE 21000; with none both keep the old values (Db2 signals NOT FOUND, a warning that does not stop the routine).",
                 ).to_string();
                 self.note(Status::Assumptions, "ASM-SELECT-ASSIGN-CARDINALITY", &text);
