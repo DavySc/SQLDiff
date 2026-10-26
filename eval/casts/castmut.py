@@ -67,6 +67,9 @@ CASES = [
     # Text as numbers.
     ("text-int", "CAST(S AS int)", [], ["CAST(S AS integer)"]),
     ("text-dec", "CAST(S AS decimal(10,2))", [], ["CAST(S AS numeric(10,2))"]),
+    ("text-literal-int", "CAST('12' AS int)", ["CAST('12' AS integer)", "12"], ["CAST('13' AS integer)"]),
+    ("text-literal-dec", "CAST('1.5' AS decimal(5,1))", ["CAST('1.5' AS numeric(5,1))"],
+     ["CAST('1.6' AS numeric(5,1))"]),
     # Literal types.
     ("dec-plus", "Q + 1.5", ["Q + 1.5"], ["Q + 1.4", "Q + 1"]),
     ("int-div", "Q / 2", ["Q / 2"], ["Q / 2.0", "Q / 3"]),

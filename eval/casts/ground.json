@@ -1056,6 +1056,171 @@
   ]
  },
  {
+  "case": "text-literal-int",
+  "tsql": "CAST('12' AS int)",
+  "pg": "CAST('12' AS integer)",
+  "kind": "eq",
+  "rows": [
+   {
+    "id": 1,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 2,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 3,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 4,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 5,
+    "tsql": "12",
+    "pg": "12"
+   }
+  ]
+ },
+ {
+  "case": "text-literal-int",
+  "tsql": "CAST('12' AS int)",
+  "pg": "12",
+  "kind": "eq",
+  "rows": [
+   {
+    "id": 1,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 2,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 3,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 4,
+    "tsql": "12",
+    "pg": "12"
+   },
+   {
+    "id": 5,
+    "tsql": "12",
+    "pg": "12"
+   }
+  ]
+ },
+ {
+  "case": "text-literal-int",
+  "tsql": "CAST('12' AS int)",
+  "pg": "CAST('13' AS integer)",
+  "kind": "ne",
+  "rows": [
+   {
+    "id": 1,
+    "tsql": "12",
+    "pg": "13"
+   },
+   {
+    "id": 2,
+    "tsql": "12",
+    "pg": "13"
+   },
+   {
+    "id": 3,
+    "tsql": "12",
+    "pg": "13"
+   },
+   {
+    "id": 4,
+    "tsql": "12",
+    "pg": "13"
+   },
+   {
+    "id": 5,
+    "tsql": "12",
+    "pg": "13"
+   }
+  ]
+ },
+ {
+  "case": "text-literal-dec",
+  "tsql": "CAST('1.5' AS decimal(5,1))",
+  "pg": "CAST('1.5' AS numeric(5,1))",
+  "kind": "eq",
+  "rows": [
+   {
+    "id": 1,
+    "tsql": "1.5",
+    "pg": "1.5"
+   },
+   {
+    "id": 2,
+    "tsql": "1.5",
+    "pg": "1.5"
+   },
+   {
+    "id": 3,
+    "tsql": "1.5",
+    "pg": "1.5"
+   },
+   {
+    "id": 4,
+    "tsql": "1.5",
+    "pg": "1.5"
+   },
+   {
+    "id": 5,
+    "tsql": "1.5",
+    "pg": "1.5"
+   }
+  ]
+ },
+ {
+  "case": "text-literal-dec",
+  "tsql": "CAST('1.5' AS decimal(5,1))",
+  "pg": "CAST('1.6' AS numeric(5,1))",
+  "kind": "ne",
+  "rows": [
+   {
+    "id": 1,
+    "tsql": "1.5",
+    "pg": "1.6"
+   },
+   {
+    "id": 2,
+    "tsql": "1.5",
+    "pg": "1.6"
+   },
+   {
+    "id": 3,
+    "tsql": "1.5",
+    "pg": "1.6"
+   },
+   {
+    "id": 4,
+    "tsql": "1.5",
+    "pg": "1.6"
+   },
+   {
+    "id": 5,
+    "tsql": "1.5",
+    "pg": "1.6"
+   }
+  ]
+ },
+ {
   "case": "dec-plus",
   "tsql": "Q + 1.5",
   "pg": "Q + 1.5",

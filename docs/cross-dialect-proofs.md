@@ -371,7 +371,7 @@ pair is "unknown" or, where a value shows the difference, "different":
 | decimal or float to an integer | drops the fraction (1.5 → 1, -2.5 → -2) | rounds (numeric half away from zero, float half to even) | `equiv.cast-rounding`; `trunc(x)` makes it equal |
 | float to decimal(p,2) | from the binary value (2.675 → 2.67) | from the shortest decimal form (2.68) | `equiv.cast-rounding` |
 | float to text | 6 significant digits (1234567 → '1.23457e+006') | shortest exact form ('1234567') | `equiv.float-text` |
-| text to a number | '' is 0; '1e3' is no decimal | '' fails; '1e3' is 1000 | `equiv.cast-string-number` |
+| text to a number | '' is 0; '1e3' is no decimal | '' fails; '1e3' is 1000 | `equiv.cast-string-number`; a string literal compares by the value it converts to ('12' as int is 12), not compared where that may round, fail or pad |
 | timestamp or time to fewer fractional digits | rounds a half up; time stays below 24:00 | rounds a half away from 2000-01-01; time can reach 24:00:00 | `equiv.time-rounding` |
 | datetime2(p), datetime, time(p) to text | every fractional digit ('03:04:00.000'), datetime as 'Jan  2 2026  3:04AM' | no trailing zero fraction ('03:04:00') | `equiv.time-text` |
 | a real against another number | the other value becomes real | both become double precision | unknown |

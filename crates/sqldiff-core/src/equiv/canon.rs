@@ -824,14 +824,17 @@ impl<'a> Canon<'a> {
             }
             Expr::Cast(x, ty) => {
                 let dst = Ty::from_type(ty, self.d, true);
-                // A string literal cast to a type whose conversion is modelled:
-                // the cast is kept only when the value converts unchanged.
+                // A string literal cast to a type whose conversion is modelled
+                // stands for the value it converts to ('12' as int is 12 on
+                // every engine); one that may round, fail or depend on
+                // settings is not compared.
                 if let (Expr::Str(s), Some(target)) = (x.as_ref(), Target::of_type(ty, self.d)) {
                     match literal::convert(s, target, self.d, true) {
-                        Some((_, asm)) => {
+                        Some((t, asm)) => {
                             if let Some(x) = asm {
                                 self.assume(x);
                             }
+                            return Ok((t, Some(dst)));
                         }
                         None => {
                             return Ok((

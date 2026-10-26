@@ -21,7 +21,7 @@ What the runs show:
 - tinyint + tinyint is tinyint in SQL Server (200 + 100 overflows). smallint + smallint is smallint on both sides.
 - Storing too long a string fails on both sides; an explicit cast truncates silently on both; a SQL Server variable truncates where a PL/pgSQL variable fails.
 
-`castmut.py` is the mutation set: 25 T-SQL expressions with 54 PostgreSQL forms, each labelled equal or different and checked row by row on both engines (`ground`, results in `ground.json`), then diffed with sqldiff (`run`). No different form may be reported equal and no equal form different.
+`castmut.py` is the mutation set: 27 T-SQL expressions with 59 PostgreSQL forms, each labelled equal or different and checked row by row on both engines (`ground`, results in `ground.json`), then diffed with sqldiff (`run`). No different form may be reported equal and no equal form different.
 
 ```sh
 python3 eval/casts/castmut.py ground eval/casts/ground.json
@@ -30,7 +30,7 @@ python3 eval/casts/castmut.py run target/release/sqldiff eval/casts/ground.json 
 
 | | equal forms: equal | equal forms: unknown | different forms: different | different forms: unknown | false equal | false different |
 |---|---|---|---|---|---|---|
-| main before (6af78ea) | 12 | 9 | 1 | 17 | 15 | 0 |
-| this change | 17 | 4 | 14 | 19 | 0 | 0 |
+| main before (6af78ea), first 54 forms | 12 | 9 | 1 | 17 | 15 | 0 |
+| this change, 59 forms | 20 | 4 | 15 | 20 | 0 | 0 |
 
 If you change a cast rule, add the probe here and run it on both engines first. The Db2 for i questions are in `probes/db2i` (fact V31).

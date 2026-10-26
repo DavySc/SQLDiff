@@ -261,6 +261,28 @@ const TEXT: &[(&str, &str, Want)] = &[
         "CAST(S AS double precision)",
         Diff("equiv.cast-string-number"),
     ),
+    // A string literal converts by its value: equal where both engines read
+    // the same number, not compared where one may round, fail or pad.
+    ("CAST('12' AS int)", "CAST('12' AS integer)", Eq),
+    ("CAST('-007' AS bigint)", "CAST('-007' AS bigint)", Eq),
+    (
+        "CAST('1.5' AS decimal(5,1))",
+        "CAST('1.5' AS numeric(5,1))",
+        Eq,
+    ),
+    (
+        "CAST('12' AS int)",
+        "CAST('13' AS integer)",
+        Diff("equiv.witness"),
+    ),
+    ("CAST('' AS int)", "CAST('' AS integer)", Unknown),
+    ("CAST(' 12 ' AS int)", "CAST(' 12 ' AS integer)", Unknown),
+    (
+        "CAST('1.55' AS decimal(5,1))",
+        "CAST('1.55' AS numeric(5,1))",
+        Unknown,
+    ),
+    ("CAST('1.5' AS int)", "CAST('1.5' AS integer)", Unknown),
     (
         "CAST(T AS varchar(40))",
         "CAST(T AS varchar(40))",
