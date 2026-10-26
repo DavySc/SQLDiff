@@ -2708,7 +2708,11 @@ impl<'a> Cx<'a> {
             "\n    ".to_string()
         };
         let it = trimmed(item);
-        let first = &it[0];
+        let Some(first) = it.first() else {
+            // `(a INT, b INT,)`: SQL Server takes the trailing comma; refuse
+            // rather than guess what the targets make of an empty item.
+            return no("empty item in the column list (a trailing comma)");
+        };
         if constraint_item(first) {
             // PRIMARY KEY (a ASC): the targets take no sort order in a key's
             // column list. The order only shapes the key's index.

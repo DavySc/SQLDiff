@@ -81,7 +81,10 @@ fn handshake_list_and_conversion_review() {
             "comment_text",
             "what_if",
             "overlay",
-            "open_in_gui"
+            "open_in_gui",
+            "convert",
+            "convert_tree",
+            "converted_file"
         ]
     );
 

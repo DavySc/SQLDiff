@@ -50,6 +50,8 @@ Every unit that is not plainly converted gets a comment line above it in the out
 
 `OUT/conversion-report.json` has, per file, its status (the worst unit status), unit counts, time, and every unit that is not plainly converted with its input and output line (in the annotated file), rules and reason; totals by status and the most frequent blockers. `OUT/conversion-report.md` is the same for reading. Exit code 0 when every file is converted or converted under assumptions, 1 otherwise, 2 on usage or I/O errors.
 
+The MCP server runs the same engine (`sqldiff_convert::tree`): `convert_tree` takes the same options and, given `out`, writes the same tree and reports; without `out` it writes nothing and `converted_file` returns one file's annotated output. `convert` converts one file or inline text as a tree of one. Statuses, rules and reasons are those of the report; only the output directory named in a binding reason differs when nothing is written (`SRC (converted, not written)`).
+
 On WideWorldImporters (336 files, 58,610 lines, 4 cores): PostgreSQL in 9 s, Db2 for i in 25 s. 33 files convert completely for each target; most of the rest carry assumptions, dynamic SQL or tables that need types without a rule (`geography`), whose dependants then do not bind.
 
 ## Templates

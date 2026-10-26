@@ -14,6 +14,7 @@ path = "src/main.rs"
 sqldiff-core.workspace = true
 sqldiff-source.workspace = true
 sqldiff-review.workspace = true
+sqldiff-convert.workspace = true
 serde.workspace = true
 clap.workspace = true
 serde_json.workspace = true

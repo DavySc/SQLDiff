@@ -7,13 +7,17 @@
 //! `assumptions` and `set_assumption` show and flip the assumption ledger
 //! (session-local, verdicts are re-derived); `comment_text` drafts a review
 //! comment from the deterministic phrase grammar; `open_in_gui` gives a deep
-//! link. Findings accepted in the review store, or marked as deliberate in
-//! source, are suppressed and counted. The server only reads files and the
-//! review store, and never writes anywhere.
+//! link. `convert`, `convert_tree` and `converted_file` run the conversion
+//! engine of `sqldiff convert` (`sqldiff_convert::tree`), so statuses and
+//! reasons are the CLI's. Findings accepted in the review store, or marked
+//! as deliberate in source, are suppressed and counted. The server only
+//! reads files and the review store; it writes only when `convert_tree` is
+//! given an output directory, exactly what `sqldiff convert -o` writes.
 
 use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Map, Value};
+use sqldiff_convert::tree;
 use sqldiff_core::ir::behaviour::RERUN_ASSUMPTIONS;
 use sqldiff_core::ir::witness::{SideOutcome, WhatIf};
 use sqldiff_core::ir::ErrorKind;
@@ -34,13 +38,22 @@ const DEFAULT_MAX_FINDINGS: usize = 20;
 const DEFAULT_QUEUE_LIMIT: usize = 25;
 /// Pairs kept for later lookups before the session cache is reset.
 const CACHE_LIMIT: usize = 5_000;
+/// Default cap on `convert_tree` file rows.
+const DEFAULT_TREE_LIMIT: usize = 25;
+/// Default cap on unit rows per file in `convert_tree`.
+const DEFAULT_TREE_UNITS: usize = 5;
+/// Converted trees kept for `converted_file`; the oldest goes first.
+const TREE_LIMIT: usize = 4;
 
 const INSTRUCTIONS: &str = "SQLDiff compares SQL artifacts in T-SQL (SQL Server 2022), \
 PostgreSQL 18 and Db2 for i. Verdicts are deterministic and never a false \"equal\": \
 \"equal_under_assumptions\" lists the assumptions it relies on, and \"unknown\" says why \
 equivalence could not be shown. Use `queue` to rank every pair of a source for review, `diff` \
 for two versions of one object or one object in two dialects, `check` to lint a single file and \
-`finding` to expand a card by fingerprint. `assumptions` lists what a verdict relies on and \
+`finding` to expand a card by fingerprint. `convert` converts one file or inline text (T-SQL to \
+PostgreSQL or Db2 for i) and `convert_tree` a whole tree, exactly as `sqldiff convert`: each unit \
+is converted, under assumptions, needs a decision, differs or not converted, with the rules and \
+reason; `converted_file` shows one file of a converted tree. `assumptions` lists what a verdict relies on and \
 `set_assumption` flips one for this session only. `comment_text` drafts a plain-text review \
 comment and `open_in_gui` gives a deep link for a human. `what_if` shows both sides' outcome \
 when one statement fails, and `overlay` the transaction brackets of both sides.";
@@ -71,6 +84,10 @@ pub struct Server {
     /// Read-only; re-read before each analysis so decisions made in the CLI
     /// or GUI show up.
     store: Store,
+    /// Converted trees by id, oldest first.
+    trees: Vec<(String, tree::Tree)>,
+    /// Trees converted in this session, for ids.
+    tree_count: usize,
 }
 
 impl Default for Server {
@@ -101,6 +118,8 @@ impl Server {
             pairs: BTreeMap::new(),
             findings: HashMap::new(),
             store,
+            trees: Vec::new(),
+            tree_count: 0,
         }
     }
 
@@ -164,19 +183,20 @@ impl Server {
             .ok_or((-32602, "tools/call needs a tool name".to_string()))?;
         let empty = Value::Object(Map::new());
         let args = params.get("arguments").unwrap_or(&empty);
-        let out = match name {
-            "diff" => self.diff(args),
-            "check" => self.check(args),
-            "finding" => self.finding(args),
-            "queue" => self.queue(args),
-            "assumptions" => self.assumptions(args),
-            "set_assumption" => self.set_assumption(args),
-            "comment_text" => self.comment_text(args),
-            "what_if" => self.what_if(args),
-            "overlay" => self.overlay(args),
-            "open_in_gui" => self.open_in_gui(args),
-            other => return Err((-32602, format!("unknown tool: {other}"))),
-        };
+        // An engine panic is reported as a tool error instead of ending the
+        // server and every session result with it.
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tool(name, args)))
+            .unwrap_or_else(|p| {
+                let what = p
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| p.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown cause".to_string());
+                Some(Err(format!(
+                    "internal error in `{name}`: {what}; please report it"
+                )))
+            })
+            .ok_or_else(|| (-32602, format!("unknown tool: {name}")))?;
         // Bad tool input is reported in-band so the model can correct it.
         Ok(match out {
             Ok((text, structured)) => json!({
@@ -188,6 +208,26 @@ impl Server {
                 "content": [{ "type": "text", "text": e }],
                 "isError": true,
             }),
+        })
+    }
+
+    /// Runs a tool; `None` when there is no tool of that name.
+    fn tool(&mut self, name: &str, args: &Value) -> Option<Result<(String, Value), String>> {
+        Some(match name {
+            "diff" => self.diff(args),
+            "check" => self.check(args),
+            "finding" => self.finding(args),
+            "queue" => self.queue(args),
+            "assumptions" => self.assumptions(args),
+            "set_assumption" => self.set_assumption(args),
+            "comment_text" => self.comment_text(args),
+            "what_if" => self.what_if(args),
+            "overlay" => self.overlay(args),
+            "open_in_gui" => self.open_in_gui(args),
+            "convert" => self.convert(args),
+            "convert_tree" => self.convert_tree(args),
+            "converted_file" => self.converted_file(args),
+            _ => return None,
         })
     }
 
@@ -988,6 +1028,301 @@ impl Server {
     }
 }
 
+/// Conversion: the engine of `sqldiff convert`, with its statuses, rules
+/// and reasons passed through unchanged.
+impl Server {
+    /// `template: true` reads every file as a template in the loaded
+    /// `[template]` syntax, as `sqldiff convert --template` does.
+    fn template_mode(&self, args: &Value) -> Result<Option<tree::TemplateMode>, String> {
+        if !args
+            .get("template")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            if args.get("parameters").is_some() {
+                return Err("`parameters` needs `template: true`".to_string());
+            }
+            return Ok(None);
+        }
+        if self.config.policy.template.is_none() {
+            return Err("`template` needs a [template] syntax: start the server with --pack or a sqldiff.toml that has one".to_string());
+        }
+        let parameters: Vec<String> = list_arg(args, "parameters")?;
+        tree::TemplateMode::configured(
+            &self.config,
+            (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+        )
+        .map(Some)
+    }
+
+    fn convert(&mut self, args: &Value) -> Result<(String, Value), String> {
+        let v = args.get("artifact").and_then(Value::as_object).ok_or(
+            "`artifact` must be an object with `dialect` (the source dialect) and `path` or `text`",
+        )?;
+        let from: Dialect = v
+            .get("dialect")
+            .and_then(Value::as_str)
+            .ok_or("`artifact.dialect` is required (the source dialect: tsql, postgres or db2i)")?
+            .parse()?;
+        let to = target(args)?;
+        let template = self.template_mode(args)?;
+        let name = v.get("name").and_then(Value::as_str);
+        let (src, inputs) = match (
+            v.get("path").and_then(Value::as_str),
+            v.get("text").and_then(Value::as_str),
+        ) {
+            (Some(p), None) => {
+                // As `sqldiff convert FILE`: read (and decode) like a tree of one.
+                let path = std::path::PathBuf::from(p);
+                if !path.is_file() {
+                    return Err(format!(
+                        "artifact: {p}: not a file; use `convert_tree` for a directory"
+                    ));
+                }
+                let (inputs, unreadable) = tree::collect(&path, &[])?;
+                if let Some(u) = unreadable.first() {
+                    return Err(format!("artifact: {u}: not UTF-8 or UTF-16 text"));
+                }
+                (path, inputs)
+            }
+            (None, Some(t)) => {
+                let rel = name.unwrap_or("input.sql").to_string();
+                let input = tree::Input {
+                    rel: rel.clone(),
+                    text: t.to_string(),
+                };
+                (
+                    std::path::PathBuf::from(format!("{rel} (inline)")),
+                    vec![input],
+                )
+            }
+            _ => return Err("`artifact` needs exactly one of `path` or `text`".to_string()),
+        };
+        let a = tree::Args {
+            src,
+            from,
+            to,
+            jobs: Some(1),
+            no_catalog: false,
+            template,
+            extensions: Vec::new(),
+        };
+        let t = tree::convert(&a, &inputs, Vec::new(), None)?;
+        let f = &t.report.files[0];
+        let output = &t.outputs[0];
+        let mut text = format!(
+            "{}: {} → {}: {}\n",
+            f.path,
+            t.report.from,
+            t.report.to,
+            f.status.label().to_uppercase()
+        );
+        text.push_str(&counts_line(&f.counts));
+        text.push_str(&units_text(f, usize::MAX));
+        text.push_str(&format!("\nOutput:\n{output}"));
+        if !output.ends_with('\n') {
+            text.push('\n');
+        }
+        let structured = json!({
+            "from": t.report.from,
+            "to": t.report.to,
+            "ok": t.report.ok(),
+            "file": f,
+            "output": output,
+        });
+        Ok((text, structured))
+    }
+
+    fn convert_tree(&mut self, args: &Value) -> Result<(String, Value), String> {
+        let src = str_arg(args, "src").ok_or("`src` is required (a directory or one file)")?;
+        let from: Dialect = match args.get("from").and_then(Value::as_str) {
+            Some(d) => d.parse()?,
+            None => Dialect::Tsql,
+        };
+        let a = tree::Args {
+            src: src.into(),
+            from,
+            to: target(args)?,
+            jobs: args.get("jobs").and_then(Value::as_u64).map(|n| n as usize),
+            no_catalog: args
+                .get("no_catalog")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            template: self.template_mode(args)?,
+            extensions: tree::extensions(list_arg(args, "extensions")?),
+        };
+        let out = str_arg(args, "out").map(std::path::PathBuf::from);
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // The same steps as `sqldiff convert`, in the same order.
+        let (inputs, unreadable) = tree::read(&a)?;
+        if let Some(o) = &out {
+            tree::prepare_out(&a.src, o, overwrite)?;
+        }
+        let t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
+        let written = match &out {
+            Some(o) => Some(tree::write(&t, o)?),
+            None => None,
+        };
+
+        let statuses: Vec<sqldiff_convert::Status> = list_arg(args, "statuses")?;
+        let folder = str_arg(args, "folder");
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_TREE_LIMIT);
+        let max_units = args
+            .get("max_units")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_TREE_UNITS);
+        // Worst first, as in conversion-report.md.
+        let mut rows: Vec<&tree::FileReport> = t
+            .report
+            .files
+            .iter()
+            .filter(|f| statuses.is_empty() || statuses.contains(&f.status))
+            .filter(|f| folder.as_deref().map_or(true, |p| f.path.starts_with(p)))
+            .collect();
+        rows.sort_by(|x, y| y.status.cmp(&x.status).then(x.path.cmp(&y.path)));
+        let matched = rows.len();
+        rows.truncate(limit);
+
+        self.tree_count += 1;
+        let id = format!("tree-{}", self.tree_count);
+        let mut text = format!("[{id}] {}", tree::summary(&t.report));
+        text.push_str(if t.report.ok() {
+            "Every file is converted or converted under assumptions.\n"
+        } else {
+            "Not every file is converted or converted under assumptions.\n"
+        });
+        if let Some((json, md)) = &written {
+            text.push_str(&format!("Wrote {} and {}\n", json.display(), md.display()));
+        } else {
+            text.push_str("Nothing written (no `out`); `converted_file` shows a file's output.\n");
+        }
+        if !t.report.totals.top_reasons.is_empty() {
+            text.push_str("\nMost frequent blockers:\n");
+            for (k, n) in t.report.totals.top_reasons.iter().take(10) {
+                text.push_str(&format!("  {n:>5}  {k}\n"));
+            }
+        }
+        for u in &t.report.unreadable {
+            text.push_str(&format!("unreadable (not converted): {u}\n"));
+        }
+        let files: Vec<Value> = rows
+            .iter()
+            .map(|f| {
+                let mut v = serde_json::to_value(f).expect("a file report serializes");
+                let shown = f.units.len().min(max_units);
+                v["units"] = serde_json::to_value(&f.units[..shown]).expect("units serialize");
+                v["omitted_units"] = json!(f.units.len() - shown);
+                v
+            })
+            .collect();
+        text.push('\n');
+        for f in &rows {
+            text.push_str(&format!("{}: {}\n", f.path, f.status.label()));
+            text.push_str(&units_text(f, max_units));
+        }
+        if matched > rows.len() {
+            text.push_str(&format!(
+                "\n{} more file(s) omitted; raise `limit` or narrow with `statuses` or `folder`.\n",
+                matched - rows.len()
+            ));
+        }
+        let structured = json!({
+            "tree": id,
+            "from": t.report.from,
+            "to": t.report.to,
+            "src": t.report.src,
+            "out": t.report.out,
+            "catalogs": t.report.catalogs,
+            "templates": t.report.templates,
+            "ok": t.report.ok(),
+            "totals": t.report.totals,
+            "unreadable": t.report.unreadable,
+            "file_count": matched,
+            "files": files,
+            "omitted_files": matched - rows.len(),
+        });
+        if self.trees.len() >= TREE_LIMIT {
+            self.trees.remove(0);
+        }
+        self.trees.push((id, t));
+        Ok((text, structured))
+    }
+
+    fn converted_file(&self, args: &Value) -> Result<(String, Value), String> {
+        let id = str_arg(args, "tree").ok_or("`tree` is required (an id from `convert_tree`)")?;
+        let path =
+            str_arg(args, "path").ok_or("`path` is required (as `convert_tree` lists it)")?;
+        let (_, t) = self.trees.iter().find(|(k, _)| *k == id).ok_or_else(|| {
+            format!("no tree `{id}` in this session (the last {TREE_LIMIT} are kept); run `convert_tree` first")
+        })?;
+        let k = t
+            .report
+            .files
+            .iter()
+            .position(|f| f.path == path)
+            .ok_or_else(|| format!("{id} has no file `{path}`"))?;
+        let f = &t.report.files[k];
+        let output = &t.outputs[k];
+        let mut text = format!("[{id}] {}: {}\n", f.path, f.status.label().to_uppercase());
+        text.push_str(&counts_line(&f.counts));
+        text.push_str(&units_text(f, usize::MAX));
+        text.push_str(&format!("\nOutput:\n{output}"));
+        if !output.ends_with('\n') {
+            text.push('\n');
+        }
+        Ok((text, json!({ "tree": id, "file": f, "output": output })))
+    }
+}
+
+/// The target dialect: `to`, required.
+fn target(args: &Value) -> Result<Dialect, String> {
+    args.get("to")
+        .and_then(Value::as_str)
+        .ok_or("`to` is required (postgres or db2i)")?
+        .parse()
+}
+
+fn counts_line(c: &sqldiff_convert::Counts) -> String {
+    format!(
+        "units: {} converted, {} under assumptions, {} needs a decision, {} differs, {} not converted\n",
+        c.converted, c.assumptions, c.decision, c.differs, c.not_converted
+    )
+}
+
+/// A file's units that are not plainly converted, with rules and reason,
+/// and output findings outside any unit; at most `max` units.
+fn units_text(f: &tree::FileReport, max: usize) -> String {
+    let mut t = String::new();
+    for u in f.units.iter().take(max) {
+        t.push_str(&format!(
+            "  line {} → {}: {} ({}) {}\n",
+            u.src_line,
+            u.out_line,
+            u.status.label(),
+            u.rules.join(", "),
+            u.reason
+        ));
+    }
+    if f.units.len() > max {
+        t.push_str(&format!(
+            "  {} more unit(s); raise `max_units` or use `converted_file`\n",
+            f.units.len() - max
+        ));
+    }
+    for p in &f.unplaced {
+        t.push_str(&format!("  outside any unit: differs {p}\n"));
+    }
+    t
+}
+
 fn status_label(s: queue::Status) -> &'static str {
     match s {
         queue::Status::Open => "open (tool default, nobody declared it)",
@@ -1269,6 +1604,62 @@ fn tools() -> Value {
                     "pair": { "type": "string", "description": "Pair id, when no finding is to be selected" },
                     "gui_url": { "type": "string", "description": "GUI address (default: --gui-url, $SQLDIFF_GUI_URL or http://127.0.0.1:7878)" },
                 },
+            },
+            "annotations": ro,
+        },
+        {
+            "name": "convert",
+            "title": "Convert one file",
+            "description": "Convert one SQL file or inline text into another dialect with the engine of `sqldiff convert` (rules: T-SQL to PostgreSQL 18 or Db2 for i). Every unit is converted, under assumptions, needs a decision, differs or not converted; a unit counts as converted only when its rules needed no assumption and neither the engine's diff nor the output's own check (parse, binding, leftover source syntax, target limits) finds anything in it. Returns the file's status, unit counts, every unit that is not plainly converted with its rules and reason, and the output as `sqldiff convert` writes it (with `-- [sqldiff: <status>]` lines). Names defined in other files do not bind; use `convert_tree` for those. Writes nothing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "artifact": artifact_schema("The source; `dialect` is the source dialect"),
+                    "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
+                    "template": { "type": "boolean", "description": "Read the input as a template in the loaded packs' [template] syntax (as `sqldiff convert --template`)" },
+                    "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
+                },
+                "required": ["artifact", "to"],
+            },
+            "annotations": ro,
+        },
+        {
+            "name": "convert_tree",
+            "title": "Convert a whole tree",
+            "description": "Convert every file of a source tree into another dialect, exactly as `sqldiff convert SRC -o OUT --to TO`: rules with the source catalog of the whole tree, then each file checked against catalogs from both trees, so names defined in other files bind. A file's status is its worst unit's. Returns totals, the most frequent blockers and files worst first, each with its units that are not plainly converted (rules, reason, source and output line). With `out`, also writes the annotated output tree and conversion-report.json/.md there (the directory must be empty unless `overwrite`, and not inside the source tree); without it nothing is written and `converted_file` shows any file's output. `ok` is true when every file is converted or converted under assumptions (the CLI's exit code 0).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "src": { "type": "string", "description": "Source directory, or one file" },
+                    "from": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Source dialect (default tsql)" },
+                    "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
+                    "out": { "type": "string", "description": "Output directory to write, as `sqldiff convert -o`; default: write nothing" },
+                    "overwrite": { "type": "boolean", "description": "Replace files in a non-empty `out` (default false)" },
+                    "no_catalog": { "type": "boolean", "description": "Check each file alone, without catalogs built from the whole tree" },
+                    "template": { "type": "boolean", "description": "Every file is a template in the loaded packs' [template] syntax (as `sqldiff convert --template`)" },
+                    "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
+                    "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
+                    "jobs": { "type": "integer", "minimum": 1, "description": "Parallel jobs (default: available cores)" },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["converted", "assumptions", "decision", "differs", "not_converted"] }, "description": "List only files with one of these statuses (totals always cover the whole tree)" },
+                    "folder": { "type": "string", "description": "List only files whose path starts with this" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Cap on files listed (default 25); the rest are counted" },
+                    "max_units": { "type": "integer", "minimum": 0, "description": "Cap on units listed per file (default 5); the rest are counted" },
+                },
+                "required": ["src", "to"],
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "converted_file",
+            "title": "One file of a converted tree",
+            "description": "One file from an earlier `convert_tree` in this session: its status, every unit that is not plainly converted with rules and reason, and its output as `sqldiff convert` writes it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tree": { "type": "string", "description": "Tree id from `convert_tree`" },
+                    "path": { "type": "string", "description": "File path as `convert_tree` lists it" },
+                },
+                "required": ["tree", "path"],
             },
             "annotations": ro,
         },

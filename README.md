@@ -104,7 +104,7 @@ Not yet built: the CFG-level equivalence across control flow (loops, branches, e
 
 ## MCP server
 
-`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files, never writes, and sends nothing over the network. It resolves packs and config like the CLI (`--pack`, `--config`, `--user-config`, `--isolated`); `--gui-url` (or `$SQLDIFF_GUI_URL`) sets where `open_in_gui` links point.
+`sqldiff-mcp` exposes the same engine to agents as a local stdio MCP server (design §6.1). It reads files and sends nothing over the network; it writes only when `convert_tree` is given an output directory, and then exactly what `sqldiff convert -o` writes. It resolves packs and config like the CLI (`--pack`, `--config`, `--user-config`, `--isolated`); `--gui-url` (or `$SQLDIFF_GUI_URL`) sets where `open_in_gui` links point.
 
 ```sh
 cargo build --release
@@ -123,6 +123,9 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 | `set_assumption` | `id`, `holds` (true, false or null to reset) | Session-local flip; every held pair's verdict is re-derived and changes are listed. A denied assumption makes the findings relying on it unknown |
 | `comment_text` | `finding_ids`, `excerpt_lines` (1), `fingerprints` (true) | A plain-text review comment from the phrase grammar: same findings, same text |
 | `open_in_gui` | `finding_id` or `pair`, `gui_url` | `{gui}/?a=<path>&b=<path>#f=<fingerprint>` and the `sqldiff-gui serve` command for the pair |
+| `convert` | `artifact`: `{dialect (source), path \| text, name?}`; `to`; `template`, `parameters` | One file or text converted as `sqldiff convert FILE` converts it: the file's status, unit counts, every unit that is not plainly converted with its rules and reason, and the annotated output |
+| `convert_tree` | `src`, `from` (tsql), `to`; `out`, `overwrite`, `no_catalog`, `template`, `parameters`, `extensions`, `jobs`; listing: `statuses`, `folder`, `limit` (25), `max_units` (5) | A whole tree converted as `sqldiff convert SRC -o OUT`: totals, most frequent blockers, files worst first with their units (the entries of `conversion-report.json`), `ok` (the CLI's exit code 0) and a tree id. With `out` it writes the output tree and the reports; without it nothing is written |
+| `converted_file` | `tree` id, `path` | One file of a converted tree: status, every unit that is not plainly converted, and its annotated output |
 
 The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store: accepted findings (and in-source deliberate-difference markers) are suppressed and counted, and a pair still needs review while it has an undecided finding or a verdict short of equal.
 
