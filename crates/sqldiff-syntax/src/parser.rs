@@ -770,6 +770,11 @@ impl<'a> Parser<'a> {
         let mut depth = 0usize;
         let mut prev_word = String::new();
         let mut prev_kind = None;
+        // `AS` is optional in a function, before the body of a scalar or
+        // multi-statement table-valued one (`RETURNS … BEGIN`) and of an inline
+        // one (`RETURNS TABLE RETURN …`). Procedures and triggers need it.
+        let mut is_function = false;
+        let mut saw_returns = false;
         while let Some(k) = self.nth_kind(0) {
             if k == BATCH_SEP {
                 break;
@@ -780,6 +785,15 @@ impl<'a> Parser<'a> {
                 && prev_kind != Some(VARIABLE)
             {
                 break;
+            }
+            if depth == 0 && k == IDENT {
+                if self.at_kw("FUNCTION") {
+                    is_function = true;
+                } else if self.at_kw("RETURNS") {
+                    saw_returns = true;
+                } else if is_function && saw_returns && self.at_any_kw(&["BEGIN", "RETURN"]) {
+                    break;
+                }
             }
             match k {
                 L_PAREN => depth += 1,
@@ -796,6 +810,11 @@ impl<'a> Parser<'a> {
         }
         if self.at_kw("AS") {
             self.bump();
+            self.bump_trivia();
+            self.start(ROUTINE_BODY);
+            self.parse_list();
+            self.finish();
+        } else if is_function && saw_returns && self.at_any_kw(&["BEGIN", "RETURN"]) {
             self.bump_trivia();
             self.start(ROUTINE_BODY);
             self.parse_list();
