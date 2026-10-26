@@ -297,7 +297,7 @@ fn guarded(
                 root,
                 text,
                 &format!(
-                    "the conversion rules stopped on this file with an internal error ({what});                      nothing in it was converted. This is a bug: report it with a reduced example"
+                    "the conversion rules stopped on this file with an internal error ({what}); nothing in it was converted. This is a bug: report it with a reduced example"
                 ),
                 "internal-error",
             )
@@ -649,7 +649,7 @@ mod tests {
     fn rules_that_do_not_panic_are_untouched() {
         let text = "CREATE PROCEDURE a AS SELECT 1\nGO\n";
         let root = parse(text, Dialect::Tsql).syntax();
-        let o = guarded(&root, text, || out::Out::default());
+        let o = guarded(&root, text, out::Out::default);
         assert!(o.text.is_empty());
     }
 }
