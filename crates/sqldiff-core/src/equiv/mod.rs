@@ -16,6 +16,7 @@ pub mod lower;
 pub mod options;
 pub mod schema;
 pub mod term;
+pub mod xwit;
 
 use sqldiff_syntax::{ast as cst, SyntaxNode};
 
@@ -173,7 +174,29 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     }
     let touches = ia.iter().chain(&ib).any(|it| !it.names.is_empty());
     security(a, b, &ua, &ub, touches, &mut out);
-    pair_items(a, b, &ia, &ib, &mut out);
+    // Witnesses across dialects compare parameters by position, so the
+    // routines must take the same parameters.
+    let wit = (ua.kind == ub.kind && ua.params.len() == ub.params.len()).then(|| Witnessing {
+        a: xwit::Side {
+            unit: &ua,
+            schema: sa,
+            name: na.clone(),
+        },
+        b: xwit::Side {
+            unit: &ub,
+            schema: sb,
+            name: nb.clone(),
+        },
+        // One statement on each side and nothing around it: the witness
+        // inputs reach it and its result is the routine's.
+        certain: ia.len() == 1
+            && ib.len() == 1
+            && ua.uncovered.is_empty()
+            && ub.uncovered.is_empty()
+            && !ua.txn_control
+            && !ub.txn_control,
+    });
+    pair_items(a, b, &ia, &ib, wit.as_ref(), &mut out);
     error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
     out
 }
@@ -449,7 +472,21 @@ fn key(t: &Term) -> String {
     )
 }
 
-fn pair_items(a: &Analyzed, b: &Analyzed, ia: &[Item], ib: &[Item], out: &mut Outcome) {
+/// What a cross-dialect witness search needs beyond the statement pair.
+struct Witnessing<'u> {
+    a: xwit::Side<'u>,
+    b: xwit::Side<'u>,
+    certain: bool,
+}
+
+fn pair_items(
+    a: &Analyzed,
+    b: &Analyzed,
+    ia: &[Item],
+    ib: &[Item],
+    wit: Option<&Witnessing>,
+    out: &mut Outcome,
+) {
     let pairs: Vec<(usize, usize)> = if ia.len() == ib.len() {
         (0..ia.len()).map(|i| (i, i)).collect()
     } else {
@@ -470,7 +507,16 @@ fn pair_items(a: &Analyzed, b: &Analyzed, ia: &[Item], ib: &[Item], out: &mut Ou
         }
     }
     for (i, j) in pairs {
-        compare_pair(a, b, &ia[i], &ib[j], out);
+        let later_a: Vec<&Term> = ia[i + 1..].iter().map(|x| &x.term).collect();
+        let later_b: Vec<&Term> = ib[j + 1..].iter().map(|x| &x.term).collect();
+        compare_pair(
+            a,
+            b,
+            &ia[i],
+            &ib[j],
+            wit.map(|w| (w, [&later_a[..], &later_b[..]])),
+            out,
+        );
     }
 }
 
@@ -503,7 +549,14 @@ fn name_assumptions(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item) -> Vec<Assum
     v
 }
 
-fn compare_pair(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item, out: &mut Outcome) {
+fn compare_pair(
+    a: &Analyzed,
+    b: &Analyzed,
+    x: &Item,
+    y: &Item,
+    wit: Option<(&Witnessing, [&[&Term]; 2])>,
+    out: &mut Outcome,
+) {
     let (na, nb) = (side_name(a), side_name(b));
     let la = location(a, &x.nodes);
     let lb = location(b, &y.nodes);
@@ -605,6 +658,42 @@ fn compare_pair(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item, out: &mut Outcom
         }
         return;
     }
+    if let Some((w, later)) = wit {
+        match xwit::search(&x.term, &y.term, &w.a, &w.b, later) {
+            Ok(found) => {
+                let mut extra = found.assumptions;
+                if !w.certain {
+                    extra.push(edit::witness_path());
+                }
+                for s in extra {
+                    if !asms.iter().any(|z| z.id == s.id) {
+                        asms.push(s);
+                    }
+                }
+                for s in &asms {
+                    out.assume(s.clone());
+                }
+                let ids = asms.iter().map(|s| s.id.clone()).collect();
+                push(
+                    out,
+                    "equiv.witness",
+                    ChangeClass::Semantic,
+                    Verdict::Different,
+                    format!(
+                        "Statements (A line {}, B line {}) differ. {}.",
+                        la.start_line, lb.start_line, found.witness
+                    ),
+                    ids,
+                );
+                return;
+            }
+            Err(e) => {
+                if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
+                    eprintln!("witness: {e}");
+                }
+            }
+        }
+    }
     let m = unexplained[0];
     let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| {
         format!(
@@ -695,7 +784,7 @@ pub fn refine_modified(
             continue;
         }
         let mut sub = Outcome::default();
-        compare_pair(a, b, &ia[i], &ib[j], &mut sub);
+        compare_pair(a, b, &ia[i], &ib[j], None, &mut sub);
         if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
             eprintln!(
                 "A: {}{}",

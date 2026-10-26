@@ -644,14 +644,7 @@ fn header_params(r: &SyntaxNode, d: Dialect) -> Vec<lower::Param> {
             let close = lower::matching(&toks, start);
             &toks[start + 1..close.min(toks.len())]
         } else {
-            let end = toks[start..]
-                .iter()
-                .position(|t| {
-                    t.kind == K::Word && matches!(t.up.as_str(), "AS" | "WITH" | "RETURNS")
-                })
-                .map(|x| start + x)
-                .unwrap_or(toks.len());
-            &toks[start..end]
+            &toks[start..lower::tsql_params_end(&toks, start)]
         }
     } else {
         let Some(open) = toks[kw..].iter().position(|t| t.kind == K::LParen) else {

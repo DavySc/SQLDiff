@@ -248,13 +248,7 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
         i = close + 1;
         s
     } else if d == Dialect::Tsql {
-        let end = toks[i..]
-            .iter()
-            .position(|t| {
-                t.kind == K::Word && matches!(t.up.as_str(), "AS" | "WITH" | "RETURNS" | "FOR")
-            })
-            .map(|x| i + x)
-            .unwrap_or(toks.len());
+        let end = tsql_params_end(&toks, i);
         let s = &toks[i..end];
         i = end;
         s
@@ -272,6 +266,28 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
         }
     }
     super::options::options(r, &toks, i, u);
+}
+
+/// End of a T-SQL parameter list written without parentheses, starting at
+/// `start`: the `AS`, `WITH`, `RETURNS` or `FOR` that ends the header part.
+/// The `AS` in `@x AS int` belongs to the parameter.
+pub(crate) fn tsql_params_end(toks: &[Tok], start: usize) -> usize {
+    let mut depth = 0;
+    for (j, t) in toks.iter().enumerate().skip(start) {
+        match t.kind {
+            K::LParen => depth += 1,
+            K::RParen => depth -= 1,
+            K::Word
+                if depth == 0
+                    && matches!(t.up.as_str(), "AS" | "WITH" | "RETURNS" | "FOR")
+                    && !(t.up == "AS" && j > 0 && toks[j - 1].kind == K::Var) =>
+            {
+                return j;
+            }
+            _ => {}
+        }
+    }
+    toks.len()
 }
 
 pub(crate) fn matching(toks: &[Tok], open: usize) -> usize {
