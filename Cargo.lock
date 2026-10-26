@@ -492,6 +492,7 @@ dependencies = [
  "rowan",
  "serde",
  "serde_json",
+ "sha2",
  "sqldiff-core",
  "sqldiff-source",
  "sqldiff-syntax",
