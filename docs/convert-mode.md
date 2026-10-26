@@ -220,6 +220,23 @@ What people decide about converted units is kept in `review-decisions.jsonl` at 
 
 A decision applies only while both files are unchanged since it was made, to the byte: text around a unit can change what it means, so any change outdates it and someone confirms it again. A decision never changes a unit's status. It can discharge assumptions and decisions; a difference, a refusal or what the engine could not prove is fixed only by changing the output and checking again. A unit is *reviewed* when nothing undischargeable is left, every assumption and decision is accepted or picked, no one's current rejection stands (records are kept per author, so one person's approval never replaces another's rejection), and output an agent wrote is approved by a person. A file is reviewed when every unit is and no gating finding is unplaced. A plainly converted unit nobody approved is not reviewed: it shows as "nothing found", and a reviewed unit as "accepted in review", never as converted. Lines that do not parse or are not allowed (an agent accepting an assumption, a verdict without a reason) are listed and never applied.
 
+`sqldiff convert` and the MCP `convert_tree` tool apply the ledger they find in the output directory. `conversion-report.json` then gives every unit its `id`, the rules of the engine's findings on it (`findings`) and its `review` (reviewed, open assumptions and decisions, what cannot be discharged, who wrote the output, and every decision with whether it still applies and why not); each file its `review` (reviewed, units reviewed and outdated, orphaned records); and the report a `ledger` summary. Plainly converted units are listed under `converted_units` (nothing found, not proven), the rest under `units` as before. Statuses, counts and the exit code are the same with or without a ledger.
+
+### The review queue
+
+`sqldiff convert` also writes `review-queue.json` and `review-queue.md`: what a person should look at, worst first, ranked by tier and never by a score (a score would let many clean units average away one that nothing was claimed about). Units the ledger says are reviewed are not listed; nothing is ever listed as safe.
+
+| Tier | Items |
+|---|---|
+| 1 | Differs, not converted, rejected in review; source files that could not be read as text; a table, routine or type several units fail to bind on and nothing else is wrong with, as one item (convert or create it first); gating output findings outside any unit; templates whose instances differ |
+| 2 | Not proven; templates whose instances are unknown or not woven, or have a status the queue does not know; templates with an instance checked on SQLDiff's weave only, not on the generator's output (whatever its status, and every template of a report that predates the generator check); templates no instance uses; generator source or target output no instance accounts for |
+| 3 | Output an agent wrote that no person approved |
+| 4 | Open decisions |
+| 5 | Open assumptions, unverified vendor facts (`ASM-FACT-*`) and template premises (`ASM-TEMPLATE-*`) first |
+| 6 | Only with `--queue-all`: plainly converted units nobody approved (nothing found, not proven) |
+
+Inside a tier, items with the most instances woven from their template come first, then the most units, then path and line. With `--instances PATH` (`instance-report.json` from `sqldiff instances`, or its directory) each template is also judged by its woven instances and listed with the ones that fail. The MCP tool `conversion_queue` converts the tree again in memory, applies the ledger in `out` and returns the same queue; it writes nothing, and no MCP tool records a review decision.
+
 ## The page
 
 - **Location pane** (the strip at the right edge): every unit that is not plain "converted", at its position in the output; click to jump. The box shows the visible part.

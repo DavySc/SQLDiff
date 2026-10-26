@@ -201,6 +201,15 @@ enum Command {
         /// any letter case, without the dot: `--extension sql --extension tpl`.
         #[arg(long = "extension", value_name = "EXT")]
         extensions: Vec<String>,
+        /// The instance check of these templates (`instance-report.json`, or
+        /// the directory `sqldiff instances -o` wrote): the review queue then
+        /// judges each template by its woven instances.
+        #[arg(long, value_name = "PATH")]
+        instances: Option<PathBuf>,
+        /// List plainly converted units nobody approved in the review queue
+        /// too (tier 6: nothing found, not proven).
+        #[arg(long)]
+        queue_all: bool,
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
@@ -527,6 +536,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             template,
             parameters,
             extensions,
+            instances,
+            queue_all,
             cfg,
         } => {
             let template = if template {
@@ -549,6 +560,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 },
                 out,
                 overwrite,
+                instances,
+                queue_all,
             })
         }
         Command::Instances(args) => instances_cmd::run(args),

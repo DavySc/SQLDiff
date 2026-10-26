@@ -83,7 +83,12 @@ fn tools_are_listed() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    for n in ["convert", "convert_tree", "converted_file"] {
+    for n in [
+        "convert",
+        "convert_tree",
+        "conversion_queue",
+        "converted_file",
+    ] {
         assert!(names.contains(&n), "{names:?}");
     }
 }
@@ -277,6 +282,15 @@ fn one_file_or_text_converts_like_a_tree_of_one() {
     for v in [&mut tf, &mut of] {
         v.as_object_mut().unwrap().remove("seconds");
     }
+    // The tree listing counts plainly converted units; the file lists them.
+    assert_eq!(
+        tf.as_object_mut()
+            .unwrap()
+            .remove("converted_units")
+            .unwrap(),
+        of["converted_units"].as_array().unwrap().len()
+    );
+    of.as_object_mut().unwrap().remove("converted_units");
     assert_eq!(of, tf);
     let inline = result(&r[2]);
     assert_eq!(inline["output"], one["output"]);
@@ -309,4 +323,48 @@ fn walk(d: &Path) -> Vec<PathBuf> {
     }
     v.sort();
     v
+}
+
+#[test]
+fn the_queue_reads_the_tree_again_and_writes_nothing() {
+    let (d, src) = tree("queue");
+    let out = d.join("out");
+    let r = session(&[call(
+        1,
+        "convert_tree",
+        json!({ "src": src, "to": "postgres", "out": out }),
+    )]);
+    result(&r[0]);
+    // convert_tree writes the queue next to the report, as the CLI does.
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("review-queue.json")).unwrap())
+            .unwrap();
+    let before = walk(&out);
+    let r = session(&[
+        call(
+            2,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres", "out": out }),
+        ),
+        call(
+            3,
+            "conversion_queue",
+            json!({ "src": src, "to": "postgres" }),
+        ),
+    ]);
+    let q = result(&r[0]);
+    assert_eq!(q["tiers"], written["tiers"]);
+    assert_eq!(
+        q["items"].as_array().unwrap().len() as u64 + q["omitted_items"].as_u64().unwrap(),
+        written["items"].as_array().unwrap().len() as u64
+    );
+    let tiers: Vec<u64> = q["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["tier"].as_u64().unwrap())
+        .collect();
+    assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "{tiers:?}");
+    assert_eq!(walk(&out), before, "the queue writes nothing");
+    assert_eq!(r[1]["result"]["isError"], true);
 }

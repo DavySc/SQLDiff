@@ -226,6 +226,7 @@ impl Server {
             "open_in_gui" => self.open_in_gui(args),
             "convert" => self.convert(args),
             "convert_tree" => self.convert_tree(args),
+            "conversion_queue" => self.conversion_queue(args),
             "converted_file" => self.converted_file(args),
             _ => return None,
         })
@@ -1133,13 +1134,14 @@ impl Server {
         Ok((text, structured))
     }
 
-    fn convert_tree(&mut self, args: &Value) -> Result<(String, Value), String> {
+    /// The tree arguments `convert_tree` and `conversion_queue` share.
+    fn tree_args(&self, args: &Value) -> Result<tree::Args, String> {
         let src = str_arg(args, "src").ok_or("`src` is required (a directory or one file)")?;
         let from: Dialect = match args.get("from").and_then(Value::as_str) {
             Some(d) => d.parse()?,
             None => Dialect::Tsql,
         };
-        let a = tree::Args {
+        Ok(tree::Args {
             src: src.into(),
             from,
             to: target(args)?,
@@ -1150,7 +1152,86 @@ impl Server {
                 .unwrap_or(false),
             template: self.template_mode(args)?,
             extensions: tree::extensions(list_arg(args, "extensions")?),
+        })
+    }
+
+    fn conversion_queue(&mut self, args: &Value) -> Result<(String, Value), String> {
+        use sqldiff_convert::queue;
+        let a = self.tree_args(args)?;
+        let out = str_arg(args, "out")
+            .ok_or("`out` is required: the converted tree, where review-decisions.jsonl lives")?;
+        let out = std::path::PathBuf::from(out);
+        let inst = match str_arg(args, "instances") {
+            Some(p) => Some(queue::read_instances(std::path::Path::new(&p))?),
+            None => None,
         };
+        let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+        let max_tier = args
+            .get("max_tier")
+            .and_then(Value::as_u64)
+            .map_or(6, |n| n.clamp(1, 6) as u8);
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(DEFAULT_TREE_LIMIT);
+        // Converted again in memory, so decisions recorded since count; nothing is written.
+        let (inputs, unreadable) = tree::read(&a)?;
+        let mut t = tree::convert(&a, &inputs, unreadable, Some(&out))?;
+        tree::review_in(&mut t, &inputs, &out)?;
+        let q = queue::build(&t.report, inst.as_ref(), all);
+        let listed: Vec<&queue::Item> = q
+            .items
+            .iter()
+            .filter(|i| i.tier <= max_tier)
+            .take(limit)
+            .collect();
+        let matched = q.items.iter().filter(|i| i.tier <= max_tier).count();
+        let mut text = queue::summary(&q);
+        if inst.is_none() {
+            text.push_str(
+                "No instance report given: templates are judged on their own text only.\n",
+            );
+        }
+        for i in &listed {
+            text.push_str(&format!(
+                "[{}] tier {} {}{} {}{}: {}\n",
+                i.key,
+                i.tier,
+                i.path,
+                if i.out_line > 0 {
+                    format!(":{}", i.out_line)
+                } else {
+                    String::new()
+                },
+                i.status,
+                if i.rules.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", i.rules.join(", "))
+                },
+                i.reason.lines().next().unwrap_or("")
+            ));
+        }
+        if matched > listed.len() {
+            text.push_str(&format!(
+                "{} more item(s); raise `limit` or lower `max_tier`.\n",
+                matched - listed.len()
+            ));
+        }
+        let structured = json!({
+            "tiers": q.tiers,
+            "reviewed": q.reviewed,
+            "instances": q.instances,
+            "items": listed,
+            "omitted_items": matched - listed.len(),
+            "ledger": t.report.ledger,
+        });
+        Ok((text, structured))
+    }
+
+    fn convert_tree(&mut self, args: &Value) -> Result<(String, Value), String> {
+        let a = self.tree_args(args)?;
         let out = str_arg(args, "out").map(std::path::PathBuf::from);
         let overwrite = args
             .get("overwrite")
@@ -1161,9 +1242,18 @@ impl Server {
         if let Some(o) = &out {
             tree::prepare_out(&a.src, o, overwrite)?;
         }
-        let t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
+        let mut t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
+        // Review decisions committed next to the converted tree.
+        if let Some(o) = &out {
+            tree::review_in(&mut t, &inputs, o)?;
+        }
         let written = match &out {
-            Some(o) => Some(tree::write(&t, o)?),
+            Some(o) => {
+                let w = tree::write(&t, o)?;
+                let q = sqldiff_convert::queue::build(&t.report, None, false);
+                sqldiff_convert::queue::write(&q, o)?;
+                Some(w)
+            }
             None => None,
         };
 
@@ -1220,6 +1310,9 @@ impl Server {
                 let shown = f.units.len().min(max_units);
                 v["units"] = serde_json::to_value(&f.units[..shown]).expect("units serialize");
                 v["omitted_units"] = json!(f.units.len() - shown);
+                // Plainly converted units are only counted here; the report
+                // file lists them.
+                v["converted_units"] = json!(f.converted_units.len());
                 v
             })
             .collect();
@@ -1648,6 +1741,30 @@ fn tools() -> Value {
                 "required": ["src", "to"],
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": true, "idempotentHint": true, "openWorldHint": false },
+        },
+        {
+            "name": "conversion_queue",
+            "title": "Review queue of a converted tree",
+            "description": "What a person should review in a converted tree, worst first, by tier (never a score): 1 differs, not converted, rejected, a missing object many units fail to bind on (one item), templates whose instances differ; 2 not proven, instances unknown or not woven, templates no instance uses; 3 output an agent wrote that no person approved; 4 open decisions; 5 open assumptions (unverified vendor facts and template premises first); 6 (with `all`) plainly converted units nobody approved. Converts `src` again in memory with the same arguments as `convert_tree` and applies the review-decisions.jsonl in `out`, so decisions recorded since count; writes nothing. Reviewed units are not listed. Review decisions are recorded by people in the GUI or CLI, never by this server.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "src": { "type": "string", "description": "Source directory, or one file, as given to `convert_tree`" },
+                    "from": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Source dialect (default tsql)" },
+                    "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
+                    "out": { "type": "string", "description": "The converted tree (where review-decisions.jsonl lives)" },
+                    "no_catalog": { "type": "boolean" },
+                    "template": { "type": "boolean" },
+                    "parameters": { "type": "array", "items": { "type": "string" } },
+                    "extensions": { "type": "array", "items": { "type": "string" } },
+                    "instances": { "type": "string", "description": "instance-report.json from `sqldiff instances`, or its directory: templates are then judged by their woven instances" },
+                    "all": { "type": "boolean", "description": "Also list plainly converted units nobody approved (tier 6)" },
+                    "max_tier": { "type": "integer", "minimum": 1, "maximum": 6, "description": "List items up to this tier (default 6)" },
+                    "limit": { "type": "integer", "minimum": 0, "description": "Cap on items listed (default 25); the rest are counted" },
+                },
+                "required": ["src", "to", "out"],
+            },
+            "annotations": ro,
         },
         {
             "name": "converted_file",

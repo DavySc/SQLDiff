@@ -17,6 +17,7 @@ use sqldiff_syntax::{parse, LineIndex};
 
 pub mod names;
 mod out;
+pub mod queue;
 pub mod review;
 mod template;
 mod tok;
