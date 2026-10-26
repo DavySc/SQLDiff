@@ -34,13 +34,7 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     if t.report.ledger.is_none() {
         tree::review(&mut t, &inputs, &review::Ledger::default(), "(none)");
     }
-    let g = gate::check(
-        &t,
-        &a.tree.src,
-        &a.out,
-        a.tree.template.is_some(),
-        inst.as_ref(),
-    )?;
+    let g = gate::check(&t, &a.tree, &a.out, inst.as_ref())?;
     if a.json {
         println!("{}", serde_json::to_string_pretty(&g).unwrap());
     } else {

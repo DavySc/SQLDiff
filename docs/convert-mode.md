@@ -256,10 +256,10 @@ Inside a tier, items with the most instances woven from their template come firs
 - no current rejection stands, and every unit an agent wrote is approved by a person;
 - no decision was made on other bytes of its file (outdated decisions block until their author confirms them again);
 - no ledger line fails to parse or is not allowed (it may be someone's rejection), and every source file could be read;
-- OUT holds exactly what converting SRC gives now, so a hand edit or a stale tree fails;
+- OUT holds exactly what converting SRC gives now, so a hand edit or a stale tree fails, and no file with a converted extension that no source file converts to (a source deleted since);
 - for templates (`--template`), an instance report is given, is `complete` (every instance converted and checked on the generator's own output on both sides, every template exercised, all generator output accounted for), and was made on these trees: `sqldiff instances` records a hash of its source, target, manifest and generator output trees, and the gate hashes them again (the manifest and generator output at the paths the report names).
 
-Plainly converted units need no decision: they are counted as "nothing found", never as reviewed. The gate lists every assumption accepted and decision picked, with the number of units and who. `--json` prints the whole gate.
+A template unit written by hand is not proven by `convert` (`hand-written.unchecked`); it passes only when that complete, current instance check is given, since only the woven instances check it. Plainly converted units need no decision: they are counted as "nothing found", never as reviewed. The gate lists every assumption accepted and decision picked, with the number of units and who. `--json` prints the whole gate.
 
 ## The page
 

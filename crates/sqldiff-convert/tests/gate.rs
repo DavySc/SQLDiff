@@ -38,8 +38,17 @@ impl Fixture {
     }
 
     /// Converts with the ledger applied; `write` as `sqldiff convert`.
-    fn convert(&self, write: bool) -> (Tree, Vec<tree::Input>) {
-        let a = tree::Args {
+    fn args(&self, templates: bool) -> tree::Args {
+        let mut a = self.plain_args();
+        if templates {
+            // Only `template.is_some()` matters to the gate's own checks.
+            a.template = Some(template_mode());
+        }
+        a
+    }
+
+    fn plain_args(&self) -> tree::Args {
+        tree::Args {
             src: self.src(),
             from: Dialect::Tsql,
             to: Dialect::Postgres,
@@ -47,7 +56,11 @@ impl Fixture {
             no_catalog: false,
             template: None,
             extensions: tree::extensions(Vec::new()),
-        };
+        }
+    }
+
+    fn convert(&self, write: bool) -> (Tree, Vec<tree::Input>) {
+        let a = self.plain_args();
         let (inputs, unreadable) = tree::read(&a).unwrap();
         let mut t = tree::convert(&a, &inputs, unreadable, Some(&self.out())).unwrap();
         tree::review_in(&mut t, &inputs, &self.out()).unwrap();
@@ -62,7 +75,7 @@ impl Fixture {
 
     fn gate(&self, templates: bool, inst: Option<&Instances>) -> Gate {
         let (t, _) = self.convert(false);
-        check(&t, &self.src(), &self.out(), templates, inst).unwrap()
+        check(&t, &self.args(templates), &self.out(), inst).unwrap()
     }
 
     /// A person accepts every open assumption and picks every open decision.
@@ -311,4 +324,27 @@ fn templates_need_a_complete_instance_check_of_these_trees() {
         g.blockers.iter().any(|b| b.what.contains("manifest")),
         "{g:#?}"
     );
+}
+
+fn template_mode() -> tree::TemplateMode {
+    let def: sqldiff_source::pack::TemplateSyntax =
+        serde_json::from_value(serde_json::json!({ "open": "<%", "close": "%>" })).unwrap();
+    tree::TemplateMode::new(&def, None).unwrap()
+}
+
+#[test]
+fn an_output_file_no_source_converts_to_fails() {
+    let fx = complete("orphan");
+    std::fs::remove_file(fx.src().join("c.sql")).unwrap();
+    let g = fx.gate(false, None);
+    assert!(
+        g.blockers
+            .iter()
+            .any(|b| b.kind == "stale-output" && b.path == "c.sql"),
+        "{g:#?}"
+    );
+    // Files the conversion does not read are not its business.
+    std::fs::remove_file(fx.out().join("c.sql")).unwrap();
+    std::fs::write(fx.out().join("README.txt"), "notes\n").unwrap();
+    assert!(fx.gate(false, None).complete);
 }

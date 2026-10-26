@@ -741,6 +741,26 @@ pub fn collect(src: &Path, extensions: &[String]) -> Result<(Vec<Input>, Vec<Str
     Ok((inputs, unreadable))
 }
 
+/// Paths, relative to `dir` and with `/`, of the files `collect` would read
+/// there, in order. An absent directory has none.
+pub fn collect_paths(dir: &Path, extensions: &[String]) -> Result<Vec<String>, String> {
+    let mut paths = Vec::new();
+    if dir.is_dir() {
+        walk(dir, extensions, &mut paths).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let mut rels: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            p.strip_prefix(dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    rels.sort();
+    Ok(rels)
+}
+
 fn walk(dir: &Path, extensions: &[String], out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for e in std::fs::read_dir(dir)? {
         let e = e?;

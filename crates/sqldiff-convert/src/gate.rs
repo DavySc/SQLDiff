@@ -59,20 +59,20 @@ pub struct Gate {
     pub instances: Option<bool>,
 }
 
-/// Judges a converted tree. `t` is a fresh conversion of `src` with the
-/// ledger in `out` applied (`tree::review_in`, or `tree::review` with an
-/// empty ledger); `templates` whether the tree was converted as templates;
-/// `inst` the instance check's report.
+/// Judges a converted tree. `t` is a fresh conversion with `a` of its
+/// source, with the ledger in `out` applied (`tree::review_in`, or
+/// `tree::review` with an empty ledger); `inst` the instance check's report.
 pub fn check(
     t: &Tree,
-    src: &Path,
+    a: &crate::tree::Args,
     out: &Path,
-    templates: bool,
     inst: Option<&Instances>,
 ) -> Result<Gate, String> {
+    let (src, templates) = (a.src.as_path(), a.template.is_some());
     let mut b = Vec::new();
     let mut accepted: BTreeMap<(String, State), (usize, BTreeSet<String>)> = BTreeMap::new();
     let (mut units, mut nothing_found) = (0, 0);
+    let mut unchecked = Vec::new();
     let block = |b: &mut Vec<Blocker>, kind: &str, path: &str, unit: Option<&str>, line, what| {
         b.push(Blocker {
             kind: kind.to_string(),
@@ -103,6 +103,21 @@ pub fn check(
             0,
             "could not be read as text: not converted".into(),
         );
+    }
+    // Nothing in OUT this conversion does not write: a converted file whose
+    // source is gone would otherwise stay, unchecked.
+    let written: BTreeSet<&str> = t.report.files.iter().map(|f| f.path.as_str()).collect();
+    for rel in crate::tree::collect_paths(out, &a.extensions)? {
+        if !written.contains(rel.as_str()) && !crate::tree::is_report(&rel) {
+            block(
+                &mut b,
+                "stale-output",
+                &rel,
+                None,
+                0,
+                "no source file converts to it: remove it, or restore its source".into(),
+            );
+        }
     }
     for (f, text) in t.report.files.iter().zip(&t.outputs) {
         // The committed output must be what converting the source gives now.
@@ -147,7 +162,11 @@ pub fn check(
                     f.path, u.id
                 ));
             };
-            if u.status >= Status::Unproven {
+            // A template unit written by hand is judged by the instance
+            // check alone: it passes once that check is complete and current.
+            if u.status == Status::Unproven && r.undischargeable == ["hand-written.unchecked"] {
+                unchecked.push((f.path.clone(), u.id.clone(), u.out_line));
+            } else if u.status >= Status::Unproven {
                 block(
                     &mut b,
                     u.status.label(),
@@ -252,6 +271,18 @@ pub fn check(
         None => None,
         Some(i) => Some(instances_current(i, src, out, &mut b)?),
     };
+    if instances != Some(true) {
+        for (path, unit, line) in unchecked {
+            block(
+                &mut b,
+                Status::Unproven.label(),
+                &path,
+                Some(&unit),
+                line,
+                "hand-written.unchecked: written by hand in a template; only a complete, current instance check proves it".into(),
+            );
+        }
+    }
 
     let mut counts = BTreeMap::new();
     for x in &b {
