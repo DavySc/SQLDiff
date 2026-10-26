@@ -940,6 +940,23 @@ impl<'a> Parser<'a> {
                 self.i += 1;
                 Ok(Expr::Special(t.up.clone()))
             }
+            // PostgreSQL typed literal `interval '1 day'`: a cast of the string.
+            "INTERVAL" | "DATE" | "TIMESTAMP" | "TIMESTAMPTZ"
+                if self.d == Dialect::Postgres && self.is_kind_at(1, K::Str) =>
+            {
+                let ty = self.ty()?;
+                let s = self.primary()?;
+                // `interval '1' day` restricts the fields: not supported.
+                if self.peek().is_some_and(|n| {
+                    matches!(
+                        n.up.as_str(),
+                        "YEAR" | "MONTH" | "DAY" | "HOUR" | "MINUTE" | "SECOND"
+                    )
+                }) {
+                    return Err("interval literal with a field restriction".into());
+                }
+                Ok(Expr::Cast(Box::new(s), ty))
+            }
             // LEFT(s, n) and RIGHT(s, n) are functions, not joins.
             "LEFT" | "RIGHT" if self.is_kind_at(1, K::LParen) => self.name_or_call(),
             u if is_reserved(u) => Err(self.err("unexpected keyword in expression")),
