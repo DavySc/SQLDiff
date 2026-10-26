@@ -77,6 +77,11 @@ id = "V28"
 title = "BIT as SMALLINT, and BOOLEAN: open questions for a later BIT mapping"
 review = ["crates/sqldiff-convert/src/tsql/bits.rs"]
 
+[[fact]]
+id = "V29"
+title = "Procedure calls and COMMENT ON: open questions for comparing Db2 for i calls"
+review = ["crates/sqldiff-core/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]
+
 [[link]]
 facts = ["V4"]
 file = "crates/sqldiff-convert/src/tsql.rs"

@@ -208,6 +208,9 @@ pub struct Schema {
     pg_system: bool,
     /// T-SQL: the `sys` catalog views are known too.
     tsql_system: bool,
+    /// The whole catalog the schema was read from, when one was supplied:
+    /// routines, schemas, indexes and constraint names for calls and comments.
+    view: Option<std::sync::Arc<CatalogView>>,
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -245,6 +248,11 @@ fn pg_system() -> &'static Schema {
 }
 
 impl Schema {
+    /// The supplied catalog, if any.
+    pub fn catalog(&self) -> Option<&CatalogView> {
+        self.view.as_deref()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
@@ -310,6 +318,7 @@ impl Schema {
             sources: view.origins.clone(),
             pg_system: d == Dialect::Postgres,
             tsql_system: d == Dialect::Tsql,
+            view: view.supplied.then(|| std::sync::Arc::new(view.clone())),
             ..Schema::default()
         };
         // Base and temporary tables only: view columns are derived, and their

@@ -144,6 +144,80 @@ chapter 8 (data types), `CREATE TABLE` (identity columns, `NULLS NOT
 DISTINCT`, referential actions, `MATCH SIMPLE`) and appendix K (limits:
 1 GB per field).
 
+## Calls and comments
+
+T-SQL `EXEC` against PostgreSQL `CALL`, and T-SQL `sp_addextendedproperty`
+against PostgreSQL `COMMENT ON` (`equiv/call.rs`). Each statement is read
+completely or not compared. The two sides' calls and comments are paired in
+order by what they call or comment on; one without a counterpart is not
+compared. A call must sit in the same place among the data statements on both
+sides. A comment reads and writes no data, so its place does not matter, as
+long as only comments follow it on each side (nothing after it can create,
+change or drop the object again). Db2 for i calls and comments are not
+compared yet.
+
+**Calls.** The called procedure is looked up in both sides' catalogs (in a
+tree conversion: the source tree and the converted tree). It must be found
+once on each side (PostgreSQL overloads with the same number of parameters are
+kept apart by their types), take as many parameters, and have the same modes:
+T-SQL OUTPUT against PostgreSQL INOUT, input against IN. Arguments are bound to
+parameters by position or by name on each side, an omitted one (or T-SQL
+`DEFAULT`) takes the parameter's default from the catalog, and each parameter,
+by position, must then receive the same value:
+
+| Value | Same when | Otherwise |
+|---|---|---|
+| Literals | Converted to the parameter type as each side does (strings as typed literals for dates, times, numbers, uuid; bit `0`/`1` against `FALSE`/`TRUE`), and the results are equal | different (`equiv.call-argument`); not compared where the conversion is not modelled: a string longer than the T-SQL parameter (SQL Server truncates it), more decimals than its scale (SQL Server rounds), `char` parameters (SQL Server pads), an integer for a boolean (PostgreSQL finds no procedure) |
+| Variables | The statement engine shows them to be the same variable, their declared types do not differ, and each passes to the parameter unchanged (T-SQL: no truncation, rounding or overflow; PostgreSQL: an implicit cast that keeps the value, no bigint into int); an OUTPUT variable must also take the result back unchanged, and on PostgreSQL be of the INOUT parameter's own type (length aside) | not compared |
+| NULL | NULL on both sides | not compared |
+
+Every proven call rests on `ASM-CALLEE-CONVERTED` (the procedure on side B is
+the conversion of the one on side A; its own body is compared in the file that
+creates it), `ASM-IDENT-FOLD`, and `ASM-DEFAULT-SCHEMA` for unqualified names.
+A parameter whose PostgreSQL type has a length, precision or scale adds
+`ASM-PG-PARAMETER-TYPMOD`: PostgreSQL ignores them in a parameter's type, so
+nothing is truncated, rounded or padded there.
+
+Not compared: the return code (`EXEC @rc = …`, not read as a call at all),
+dynamic SQL, a procedure named by a variable, `WITH RECOMPILE` and other
+`WITH` or `AT` options, system procedures (`sp_`, `xp_`), arguments T-SQL
+does not accept (expressions; only constants, variables and `DEFAULT`),
+PostgreSQL's `name := value` form, a positional argument after a named one, an
+unknown parameter name, an OUTPUT result that T-SQL does not copy back (no
+`OUTPUT` on the argument), PostgreSQL OUT parameters (they receive no value,
+T-SQL's OUTPUT does), INOUT outside PL/pgSQL (the values come back as a row),
+names with more than two parts.
+
+A failed call is a failed statement: in a procedure without `SET XACT_ABORT
+ON` or a rethrowing CATCH, T-SQL goes on with the next statement and
+PostgreSQL stops (`equiv.error-continues`).
+
+**Comments.** The extended property's levels name the object: a schema; a
+table, view, procedure or function; a table's or view's column; a table's
+index or constraint. The PostgreSQL comment must name the same object, which
+must exist in both catalogs (an index or a key constraint on that table; check
+and foreign key constraints are not recorded, so those are not compared). The
+text must be equal; a T-SQL literal without `N` that holds non-ASCII
+characters adds `ASM-TSQL-CODE-PAGE`. Every proven comment rests on
+`ASM-EXTPROP-COMMENT`: the property name is dropped and an object has one
+comment. Not compared: an object commented twice in one file (PostgreSQL keeps
+the last comment; T-SQL keeps both properties or fails on the same name), a
+value that is not a string literal, an escape string (`E'…'`) or a backslash
+(read differently without `standard_conforming_strings`), `COMMENT ON … IS
+NULL`, a quoted PostgreSQL name with capitals, other object kinds.
+
+Facts (SQL Server 2022 and PostgreSQL 18, run 2026-10-26; scripts in the
+project files, `eval/calls/2026-10-26/`): SQL Server passes 'abcdefgh' to an
+`nvarchar(5)` parameter as 'abcde', 1.005 to `decimal(5,2)` as 1.01, 'ab' to
+`char(5)` padded, 1.7 to `int` as 1, and fails a bigint beyond the int range;
+an OUTPUT parameter receives the argument's value, and its result is truncated
+into a shorter variable. PostgreSQL passes 'abcdefgh' whole to
+`varchar(5)`, 1.005 unrounded to `numeric(5,2)` and 'ab' unpadded to
+`char(5)` (`CREATE PROCEDURE`: type modifiers are discarded); finds no
+procedure for a bigint argument to an int parameter nor for 1 to a boolean;
+gives an OUT parameter NULL whatever is passed; an INOUT parameter receives the
+value; copying back into a shorter `varchar` variable fails; an INOUT argument that needs any cast (a `varchar(10)` variable for a `text` parameter, `int` for `bigint`) fails the call as not writable.
+
 ## Witnesses for changed statements
 
 When two paired statements lower to terms that differ in a way no rule

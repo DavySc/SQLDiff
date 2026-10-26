@@ -334,6 +334,7 @@ impl Catalog {
                             _ => core::ParamMode::In,
                         },
                         has_default: p.has_default,
+                        default: None,
                     })
                     .collect(),
                 returns: r.returns.as_deref().map(DataType::parse_str),
