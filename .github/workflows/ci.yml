@@ -51,7 +51,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # Every Windows-only failure at once, not only the first test binary's.
+      - run: cargo test --workspace --no-fail-fast
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
