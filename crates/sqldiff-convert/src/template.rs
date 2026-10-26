@@ -500,7 +500,13 @@ pub fn check_template(
                 let body = t.text.trim();
                 let lead = &t.text[..t.text.len() - t.text.trim_start().len()];
                 let trail = &t.text[lead.len() + body.len()..];
-                strip(&mut c, mid, h.frag, (lead, trail))
+                strip(&mut c, mid, h.frag, (lead, trail));
+                // A fragment with code that leaves no unit was swallowed by
+                // the stand-in (a parameter declaration that opens a
+                // comment, say): nothing in it was converted.
+                if c.units.is_empty() && has_code(&t.text, from) {
+                    return leaked(t, c, h.kind, stem, &written, &specials);
+                }
             }
             None => return leaked(t, c, h.kind, stem, &written, &specials),
         }
@@ -867,6 +873,14 @@ fn respell(
     })
     .replace(&format!("{stem}hs.{stem}h."), "")
     .replace(&format!("{stem}hs.{stem}h"), "the woven statement's table")
+}
+
+/// Whether `text` holds anything but white space and comments.
+fn has_code(text: &str, d: Dialect) -> bool {
+    sqldiff_syntax::lexer::tokenize(text, d)
+        .tokens
+        .iter()
+        .any(|t| !t.kind.is_trivia())
 }
 
 /// A fragment whose conversion reached across its edges: the template is
