@@ -343,7 +343,12 @@ function lexSql(text, dialect, base = 0) {
     if (c === " " || c === "\n" || c === "\t" || c === "\r") { i++; continue; }
     let st = "";
     word_ = "";
-    if (text.startsWith("--", i)) { const e = text.indexOf("\n", i); i = e < 0 ? n : e; st = "cmt"; }
+    if (text.startsWith("--", i)) {
+      // Up to the line ending, LF or CRLF, as the engine's lexer.
+      const e = text.indexOf("\n", i);
+      i = e < 0 ? n : text[e - 1] === "\r" ? e - 1 : e;
+      st = "cmt";
+    }
     else if (text.startsWith("/*", i)) {
       i += 2;
       for (let depth = 1; i < n;) {
