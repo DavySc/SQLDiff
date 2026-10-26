@@ -154,7 +154,8 @@ compared. A call must sit in the same place among the data statements on both
 sides. A comment reads and writes no data, so its place does not matter, as
 long as only comments follow it on each side (nothing after it can create,
 change or drop the object again). Db2 for i calls and comments are not
-compared yet.
+compared yet; the open questions are probes `V30-*` in
+[probes/db2i](../probes/db2i/README.md).
 
 **Calls.** The called procedure is looked up in both sides' catalogs (in a
 tree conversion: the source tree and the converted tree). It must be found
@@ -217,6 +218,97 @@ into a shorter variable. PostgreSQL passes 'abcdefgh' whole to
 procedure for a bigint argument to an int parameter nor for 1 to a boolean;
 gives an OUT parameter NULL whatever is passed; an INOUT parameter receives the
 value; copying back into a shorter `varchar` variable fails; an INOUT argument that needs any cast (a `varchar(10)` variable for a `text` parameter, `int` for `bigint`) fails the call as not writable.
+
+## Indexes, sequences and schemas
+
+A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE SCHEMA`
+statements, and those beside a file's one routine, are compared statement
+against statement (`equiv/ddl.rs`). They are paired by kind and name (an index
+also by its table, since T-SQL index names are per table); a statement whose
+name has no counterpart is paired in order with the one other unnamed statement
+of its kind (and table), so a rename is a difference. Each must come after as
+many data statements on both sides, and an index after its table when the file
+creates the table. T-SQL is compared against PostgreSQL and against Db2 for i.
+
+Each statement is read completely. What the model does not read leaves the
+statement not compared: columnstore, full-text, XML and spatial indexes,
+expression keys, a key collation or operator class, PostgreSQL `USING` other
+than btree, `CONCURRENTLY`, `IF NOT EXISTS`, `ON ONLY`, an unnamed index,
+`IGNORE_DUP_KEY = ON`, `DROP_EXISTING = ON`, `FILESTREAM_ON`, `CREATE OR
+REPLACE`, a sequence of a type other than smallint, int, bigint and tinyint,
+`RESTART`, PostgreSQL `OWNED BY`, schema elements inside `CREATE SCHEMA`, and
+Db2 for i `UNIQUE WHERE NOT NULL`, `WHERE` and `INCLUDE`. Clauses that shape
+only storage or how the index is built are listed as normalizations: `CLUSTERED`
+/ `NONCLUSTERED` (with `ASM-CLUSTERED` for a clustered one), filegroups and
+partition schemes (`ON …`), `WITH (FILLFACTOR, PAD_INDEX, ONLINE, MAXDOP,
+SORT_IN_TEMPDB, DATA_COMPRESSION, …)`, PostgreSQL `WITH (fillfactor,
+deduplicate_items)`, `TABLESPACE` and `USING btree`.
+
+What an index changes in results is only which rows a unique index rejects.
+Column order, sort directions, included columns and a plain index's filter
+shape how fast statements run: when they differ the pair is not proven (the
+engine does not judge speed), never equal and never different.
+
+| What | Equal when | Otherwise |
+|---|---|---|
+| Table and name | Same table; same index name after folding (`ASM-INDEX-NAME-SCHEMA`: on the target, index names are schema objects) | `equiv.index-table`, `equiv.index-name` (DROP INDEX, ALTER INDEX and hints name it) |
+| Name clash | No two indexes, or an index and a table, of one name in one schema of the file on the target side | `equiv.index-name-clash` (the second CREATE fails: relation already exists) |
+| Unique | Both or neither | `equiv.index-unique` |
+| Unique key | Same column set (order is shape) | `equiv.index-key` |
+| Shape | Same key columns in order, same ASC/DESC, same included columns | not proven |
+| NULL position | Passed over: T-SQL sorts NULLs first, PostgreSQL and Db2 for i last in ascending keys; ORDER BY statements are compared on their own | |
+| Filter | Neither, or both, compared by the engine as `SELECT 1 FROM t WHERE filter`, the rows the index covers; a T-SQL filter adds `ASM-TSQL-FILTERED-INDEX-SET-OPTIONS` | one side only: not proven; different rows: the engine's difference for a unique index, not proven for a plain one |
+| NULLs in a unique key | T-SQL holds one row with NULL per key; PostgreSQL needs `NULLS NOT DISTINCT`, unless the column is NOT NULL on a side or a filter's `c IS NOT NULL` leaves NULLs out; a filter naming the column any other way (`c > 0`) is not proven | `equiv.unique-nulls` |
+| String unique key | T-SQL compares case-insensitively and ignores trailing spaces (`ASM-TSQL-CI-COLLATION`) | `equiv.case-sensitivity`, `equiv.trailing-spaces` (fixed-length PostgreSQL char ignores trailing spaces too) |
+| Db2 for i unique | Not compared: NULL handling, case and trailing blanks are probes `V29-UNIQUE-*` | not proven |
+
+Key column facts come from a `CREATE TABLE` of the same file, else the catalog
+(only when no other schema has a table of that name, and the column states no
+collation); otherwise a unique index is not proven.
+
+Sequences are compared by the values they hand out, with every default filled
+in:
+
+| | T-SQL (SQL Server 2022) | PostgreSQL 18 | Db2 for i |
+|---|---|---|---|
+| Type | bigint | bigint | not relied on: every value must be written (fact V29) |
+| Bounds going up | the type's range | 1 to the type's maximum | |
+| Bounds going down | the type's range | the type's minimum to -1 | |
+| Start | the minimum going up, the maximum going down | the same | |
+| Cycle | NO CYCLE; restarts at the minimum going up | the same | |
+
+A different start, step, last value reached or cycling is `equiv.sequence`
+with the first value that differs. A bound the step never reaches is not a
+difference, and the near bound (the minimum going up) counts only when both
+sides cycle, as their restart point. A T-SQL tinyint sequence against a smallint one with the
+same bounds is equal under `ASM-SEQUENCE-TYPE`; other types are not proven. The
+cache is passed over: values are handed out in call order on both sides, and
+values a crash or rollback skips are gaps on both. A PostgreSQL `CACHE` above 1
+is per session, so values are no longer in call order across sessions: not
+proven. A Db2 for i sequence must say `NO CACHE`.
+
+Schemas: same name after folding (`equiv.schema-name`), and the same owner, or
+T-SQL `dbo` against no `AUTHORIZATION` (`ASM-SCHEMA-OWNER`); other owners are
+not proven. A Db2 for i schema name longer than 10 characters gets another,
+generated system name for its library: not proven.
+
+The converter writes what the proof needs: `NULLS NOT DISTINCT` on a
+PostgreSQL unique index, `WITH (…)` and filegroups after a filter dropped
+(PostgreSQL rejects `WITH` after `WHERE`), partition schemes dropped,
+columnstore, XML and spatial indexes not converted, `AUTHORIZATION dbo` dropped
+under `ASM-SCHEMA-OWNER`, and `ASM-INDEX-NAME-SCHEMA` on every index.
+
+Facts checked on SQL Server 2022 and PostgreSQL 18 (2026-10-26): a T-SQL
+unique index rejects a second NULL, `('x', NULL)` twice, `'A'` after `'a'` and
+`'a '` after `'a'`; a filtered unique index on `IS NOT NULL` holds any number
+of NULLs; an INSERT under `SET ANSI_NULLS OFF` into a table with a filtered
+index fails (Msg 1934); two tables may each have an index `IX_1`. PostgreSQL
+accepts two NULLs in a unique index, rejects them with `NULLS NOT DISTINCT`
+(also for `('x', NULL)`), accepts `'A'` and `'a '` next to `'a'`, rejects an
+index named like another index or a table of the schema, rejects `WITH` after
+`WHERE`, and has no role `dbo`. Sequence defaults as in the table, read from
+`sys.sequences` and `pg_sequences`; both restart a cycling sequence at its
+minimum.
 
 ## Witnesses for changed statements
 

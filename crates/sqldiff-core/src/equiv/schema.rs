@@ -171,10 +171,14 @@ pub struct Column {
     pub identity: bool,
     /// What a string literal compared with this column converts to.
     pub target: Option<Target>,
+    /// A collation the column states.
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Table {
+    /// Lower case; `None` for no schema or the default one (dbo, public).
+    pub schema: Option<String>,
     pub name: String,
     pub columns: Vec<Column>,
     /// Primary key and unique constraints or indexes, column names lower-cased.
@@ -211,6 +215,8 @@ pub struct Schema {
     /// The whole catalog the schema was read from, when one was supplied:
     /// routines, schemas, indexes and constraint names for calls and comments.
     view: Option<std::sync::Arc<CatalogView>>,
+    /// Unqualified names of user tables in more than one schema.
+    ambiguous: std::collections::HashSet<String>,
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -283,6 +289,17 @@ impl Schema {
         })
     }
 
+    /// A user table by schema (`None` for the default one) and name, when
+    /// no other schema has a table of that name.
+    pub fn table_exact(&self, schema: Option<&str>, name: &str) -> Option<&Table> {
+        let name = name.to_lowercase();
+        if self.ambiguous.contains(&name) {
+            return None;
+        }
+        let t = self.tables.get(&name)?;
+        (t.schema.as_deref() == schema.map(str::to_lowercase).as_deref()).then_some(t)
+    }
+
     /// This schema with the tables `ddl` creates added; they replace tables
     /// of the same name.
     pub fn with_ddl(&self, ddl: &str, d: Dialect) -> Schema {
@@ -290,6 +307,15 @@ impl Schema {
         ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);
         let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
         let mut s = self.clone();
+        for n in extra.tables.keys() {
+            if s.tables
+                .get(n)
+                .is_some_and(|t| t.schema != extra.tables[n].schema)
+            {
+                s.ambiguous.insert(n.clone());
+            }
+        }
+        s.ambiguous.extend(extra.ambiguous);
         s.tables.extend(extra.tables);
         s
     }
@@ -346,12 +372,22 @@ impl Schema {
                     not_null: !c.nullable,
                     identity: c.identity,
                     target: Target::of(&c.data_type.base, &c.data_type.args, d),
+                    collation: c.collation.clone(),
                 })
                 .collect();
             let name = t.name.to_lowercase();
+            let schema = t
+                .schema
+                .as_ref()
+                .map(|x| x.to_lowercase())
+                .filter(|x| x != "dbo" && x != "public");
+            if s.tables.get(&name).is_some_and(|o| o.schema != schema) {
+                s.ambiguous.insert(name.clone());
+            }
             s.tables.insert(
                 name.clone(),
                 Table {
+                    schema,
                     name,
                     columns,
                     keys,

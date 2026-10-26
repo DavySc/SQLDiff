@@ -11,6 +11,7 @@ pub mod ast;
 mod call;
 pub mod canon;
 pub mod compare;
+pub mod ddl;
 pub mod edit;
 pub mod eval;
 pub mod literal;
@@ -155,6 +156,7 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     signature(&ua, &ub, &na, &nb, &mut out);
     tables(a, b, &ua, &ub, sa, sb, &mut out);
     calls(a, b, &ua, &ub, sa, sb, &mut out);
+    ddl_stmts(a, b, &ua, &ub, sa, sb, &mut out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
         out.assume(x.clone());
     }
@@ -705,6 +707,421 @@ fn tables(
                                 out,
                                 format!("the CHECK constraint `{what}` was not shown equal: {w}"),
                             );
+                        }
+                    }
+                }
+            }
+        }
+        for x in asms {
+            out.assume(x);
+        }
+        if decided && !found {
+            out.equal += 1;
+            out.structural += 1;
+        }
+    }
+}
+
+/// The facts of a key column from its table: a `CREATE TABLE` in the
+/// file, else the catalog (when its name is not ambiguous there).
+fn col_facts(
+    side: &Analyzed,
+    u: &Unit,
+    schema: &Schema,
+    table: &[table::Name],
+    col: &str,
+) -> Option<ddl::ColFacts> {
+    let d = side.dialect();
+    let want = ddl::object_key(table, d).ok()?;
+    for (node, _) in &u.tables {
+        let Ok(t) = table::parse(&ast::tokens(node), d) else {
+            continue;
+        };
+        if ddl::object_key(&t.name, d).ok().as_ref() != Some(&want) {
+            continue;
+        }
+        let c = table::column_by_key(&t, col)?;
+        return Some(ddl::ColFacts {
+            nullable: table::nullable(&t, c).ok()?,
+            string: match c.ty {
+                table::Ty::Str { fixed, .. } => Some(fixed),
+                _ => None,
+            },
+        });
+    }
+    let t = schema.table_exact(want.0.as_deref(), &want.1)?;
+    let c = t.column(col)?;
+    if c.collation.is_some() || c.ty.fam == schema::Fam::Other {
+        return None;
+    }
+    Some(ddl::ColFacts {
+        nullable: !c.not_null,
+        string: match c.ty.fam {
+            schema::Fam::Char => Some(true),
+            schema::Fam::VarChar => Some(false),
+            _ => None,
+        },
+    })
+}
+
+/// Compares the scripts' `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE
+/// SCHEMA` statements (`ddl.rs`), paired by kind and name.
+#[allow(clippy::too_many_arguments)]
+fn ddl_stmts(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) {
+    use ast::K;
+    if ua.ddl.is_empty() && ub.ddl.is_empty() {
+        return;
+    }
+    let (na, nb) = (side_name(a), side_name(b));
+    struct Stmt<'n> {
+        node: &'n SyntaxNode,
+        pos: usize,
+        ddl: Result<ddl::Ddl, String>,
+        key: Option<String>,
+    }
+    fn read<'n>(side: &Analyzed, u: &'n Unit) -> Vec<Stmt<'n>> {
+        u.ddl
+            .iter()
+            .map(|(node, pos)| {
+                let ddl = ddl::parse(&ast::tokens(node), side.dialect());
+                let key = ddl.as_ref().ok().and_then(|x| ddl::pair_key(x).ok());
+                Stmt {
+                    node,
+                    pos: *pos,
+                    ddl,
+                    key,
+                }
+            })
+            .collect()
+    }
+    let (xs, ys) = (read(a, ua), read(b, ub));
+    // What a statement whose name has no counterpart is paired by: its kind
+    // (and an index's table), in order, when both sides have as many such.
+    let group = |s: &Stmt| -> Option<String> {
+        match s.ddl.as_ref().ok()? {
+            ddl::Ddl::Index(i) => {
+                let (sc, t) = ddl::object_key(&i.table, i.dialect).ok()?;
+                Some(format!("index {}.{t}", sc.unwrap_or_default()))
+            }
+            x => Some(x.what().to_string()),
+        }
+    };
+    let named = |s: &Stmt, other: &[Stmt]| {
+        s.key
+            .as_ref()
+            .is_some_and(|k| other.iter().any(|o| o.key.as_ref() == Some(k)))
+    };
+    let mut renamed: Vec<(usize, usize)> = Vec::new();
+    {
+        let lx: Vec<usize> = (0..xs.len())
+            .filter(|&i| xs[i].key.is_some() && !named(&xs[i], &ys))
+            .collect();
+        let ly: Vec<usize> = (0..ys.len())
+            .filter(|&j| ys[j].key.is_some() && !named(&ys[j], &xs))
+            .collect();
+        let groups: std::collections::BTreeSet<String> =
+            lx.iter().filter_map(|&i| group(&xs[i])).collect();
+        for g in groups {
+            let gx: Vec<usize> = lx
+                .iter()
+                .copied()
+                .filter(|&i| group(&xs[i]).as_ref() == Some(&g))
+                .collect();
+            let gy: Vec<usize> = ly
+                .iter()
+                .copied()
+                .filter(|&j| group(&ys[j]).as_ref() == Some(&g))
+                .collect();
+            if gx.len() == gy.len() {
+                renamed.extend(gx.into_iter().zip(gy));
+            }
+        }
+    }
+    let is_renamed = |is_a: bool, i: usize| {
+        renamed
+            .iter()
+            .any(|&(x, y)| if is_a { x == i } else { y == i })
+    };
+    let what_of = |s: &Stmt| -> String {
+        match &s.ddl {
+            Ok(x) => x.what().to_string(),
+            Err(_) => cst::first_words(s.node, 2).join(" "),
+        }
+    };
+    // Statements that cannot be paired: unread, or a name used twice.
+    let count = |v: &[Stmt], k: &str| v.iter().filter(|s| s.key.as_deref() == Some(k)).count();
+    for (side, v, other, name, is_a) in [(a, &xs, &ys, &na, true), (b, &ys, &xs, &nb, false)] {
+        for (i, s) in v.iter().enumerate() {
+            if is_renamed(is_a, i) {
+                continue;
+            }
+            let why = match (&s.ddl, &s.key) {
+                (Err(e), _) => e.clone(),
+                (Ok(_), None) => "its name is not read".to_string(),
+                (Ok(_), Some(k)) if count(v, k) > 1 => {
+                    "the same object is created twice on this side".to_string()
+                }
+                (Ok(_), Some(k)) if count(other, k) == 0 => {
+                    if other.iter().any(|o| o.key.is_none()) {
+                        "it has no counterpart among the other side's statements that were read"
+                            .to_string()
+                    } else {
+                        "it has no counterpart on the other side".to_string()
+                    }
+                }
+                _ => continue,
+            };
+            out.unknown_reasons.push(format!(
+                "{name} line {}: the {} is not compared: {why}",
+                side.line_of(s.node),
+                what_of(s)
+            ));
+        }
+    }
+    // Index names are schema objects outside T-SQL: two indexes of one
+    // name, or an index named like a table of the file, fail there.
+    for (side, v, u, name) in [(a, &xs, ua, &na), (b, &ys, ub, &nb)] {
+        let d = side.dialect();
+        if d == sqldiff_syntax::Dialect::Tsql {
+            continue;
+        }
+        let mut seen: Vec<(Option<String>, String)> = u
+            .tables
+            .iter()
+            .filter_map(|(n, _)| {
+                let toks = ast::tokens(n);
+                let t = table::parse(&toks, d).ok()?;
+                ddl::object_key(&t.name, d).ok()
+            })
+            .collect();
+        for s in v.iter() {
+            let Ok(ddl::Ddl::Index(ix)) = &s.ddl else {
+                continue;
+            };
+            let Ok((schema, _)) = ddl::object_key(&ix.table, d) else {
+                continue;
+            };
+            let Ok(n) = table::key(&ix.name, d) else {
+                continue;
+            };
+            let k = (schema, n);
+            if seen.contains(&k) {
+                let loc = line_at(side, ix.off);
+                let rule = "equiv.index-name-clash";
+                let class = ChangeClass::Semantic;
+                out.findings.push(Finding {
+                    fingerprint: fingerprint(&FingerprintInput {
+                        object: &a.object,
+                        class,
+                        rule,
+                        anchor_a: &k.1,
+                        anchor_b: &format!("{}", ix.off),
+                    }),
+                    rule: rule.to_string(),
+                    class,
+                    severity: class.default_severity(),
+                    verdict: Verdict::Different,
+                    witness: format!(
+                        "{name} already has a table or index named {} in this schema, so its CREATE INDEX at line {} fails (relation already exists); T-SQL index names are only unique per table",
+                        ix.name.text, loc.start_line
+                    ),
+                    a: (side.side == Side::A).then(|| loc.clone()),
+                    b: (side.side == Side::B).then(|| loc.clone()),
+                    assumptions: Vec::new(),
+                });
+            } else {
+                seen.push(k);
+            }
+        }
+    }
+    let file_schemas = std::cell::OnceCell::new();
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (i, x) in xs.iter().enumerate() {
+        let Some(k) = &x.key else { continue };
+        if count(&xs, k) != 1 || count(&ys, k) != 1 {
+            continue;
+        }
+        let j = ys.iter().position(|y| y.key.as_ref() == Some(k)).unwrap();
+        pairs.push((i, j));
+    }
+    pairs.extend(renamed.iter().copied());
+    pairs.sort();
+    for (i, j) in pairs {
+        let (x, y) = (&xs[i], &ys[j]);
+        let (Ok(dx), Ok(dy)) = (&x.ddl, &y.ddl) else {
+            continue;
+        };
+        let (la, lb) = (a.line_of(x.node), b.line_of(y.node));
+        let what = dx.what();
+        let unknown = |out: &mut Outcome, why: String| {
+            out.unknown_reasons.push(format!(
+                "{na} line {la}: the {what} (and {nb} line {lb}) is not compared: {why}"
+            ));
+        };
+        if x.pos != y.pos {
+            unknown(
+                out,
+                format!(
+                    "it comes after {} data statement(s) on one side and {} on the other",
+                    x.pos, y.pos
+                ),
+            );
+            continue;
+        }
+        // An index must follow its table on both sides when the file creates it.
+        if let (ddl::Ddl::Index(ix), ddl::Ddl::Index(iy)) = (dx, dy) {
+            let before = |side: &Analyzed, u: &Unit, ix: &ddl::Index, at: &SyntaxNode| {
+                let d = side.dialect();
+                let want = ddl::object_key(&ix.table, d).ok();
+                u.tables.iter().any(|(n, _)| {
+                    table::parse(&ast::tokens(n), d)
+                        .ok()
+                        .and_then(|t| ddl::object_key(&t.name, d).ok())
+                        == want
+                        && n.text_range().start() > at.text_range().start()
+                })
+            };
+            if before(a, ua, ix, x.node) || before(b, ub, iy, y.node) {
+                unknown(
+                    out,
+                    "the file creates the index's table after the index on one side".into(),
+                );
+                continue;
+            }
+        }
+        let table_of = |d: &ddl::Ddl| match d {
+            ddl::Ddl::Index(i) => Some((i.table.clone(), i.table_toks.clone())),
+            _ => None,
+        };
+        let (tx, ty) = (table_of(dx), table_of(dy));
+        let facts = |is_a: bool, col: &str| -> Option<ddl::ColFacts> {
+            if is_a {
+                col_facts(a, ua, sa, &tx.as_ref()?.0, col)
+            } else {
+                col_facts(b, ub, sb, &ty.as_ref()?.0, col)
+            }
+        };
+        let anchor = |n: &SyntaxNode| {
+            crate::normalize::hash_strs(std::iter::once(n.text().to_string().as_str()))
+        };
+        let finding = |out: &mut Outcome,
+                       rule: &str,
+                       class: ChangeClass,
+                       witness: String,
+                       at: (usize, usize),
+                       asms: Vec<String>| {
+            out.findings.push(Finding {
+                fingerprint: fingerprint(&FingerprintInput {
+                    object: &a.object,
+                    class,
+                    rule,
+                    anchor_a: &format!("{}:{}", anchor(x.node), at.0),
+                    anchor_b: &format!("{}:{}", anchor(y.node), at.1),
+                }),
+                rule: rule.to_string(),
+                class,
+                severity: class.default_severity(),
+                verdict: Verdict::Different,
+                witness,
+                a: Some(line_at(a, at.0)),
+                b: Some(line_at(b, at.1)),
+                assumptions: asms,
+            });
+        };
+        let mut asms: Vec<Assumption> = Vec::new();
+        let add = |asms: &mut Vec<Assumption>, x: Assumption| {
+            if !asms.iter().any(|y| y.id == x.id) {
+                asms.push(x);
+            }
+        };
+        let (mut decided, mut found) = (true, false);
+        for e in ddl::compare(dx, dy, &na, &nb, &facts) {
+            match e {
+                ddl::Event::Asm(x) => add(&mut asms, asm::make(x)),
+                ddl::Event::Note(s) => out.normalize(s),
+                ddl::Event::Unknown(s) => {
+                    decided = false;
+                    unknown(out, s);
+                }
+                ddl::Event::Diff { rule, witness, at } => {
+                    found = true;
+                    let ids = asms.iter().map(|x| x.id.clone()).collect();
+                    finding(
+                        out,
+                        rule,
+                        ChangeClass::Semantic,
+                        format!("Statements (A line {la}, B line {lb}) differ: {witness}."),
+                        at,
+                        ids,
+                    );
+                }
+                ddl::Event::Filter {
+                    unique,
+                    a: fa,
+                    b: fb,
+                    at,
+                } => {
+                    let (sa2, sb2) = file_schemas.get_or_init(|| {
+                        (
+                            sa.with_ddl(&a.artifact.text, a.dialect()),
+                            sb.with_ddl(&b.artifact.text, b.dialect()),
+                        )
+                    });
+                    // The rows an index covers: those its filter selects.
+                    let covered = |e: &[ast::Tok], name: &[ast::Tok]| {
+                        let mut v = vec![
+                            synth(K::Word, "SELECT"),
+                            synth(K::Num, "1"),
+                            synth(K::Word, "FROM"),
+                        ];
+                        v.extend(name.iter().cloned());
+                        v.push(synth(K::Word, "WHERE"));
+                        v.extend(e.iter().cloned());
+                        v
+                    };
+                    let (Some(tx), Some(ty)) = (&tx, &ty) else {
+                        continue;
+                    };
+                    match same_stmt(
+                        &covered(&fa, &tx.1),
+                        &covered(&fb, &ty.1),
+                        ua,
+                        ub,
+                        sa2,
+                        sb2,
+                        &na,
+                        &nb,
+                    ) {
+                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                        Same::No(class, rule, w) if unique => {
+                            found = true;
+                            finding(
+                                out,
+                                rule,
+                                class,
+                                format!("Unique indexes (A line {la}, B line {lb}) cover different rows, so they reject different rows: {w}"),
+                                at,
+                                Vec::new(),
+                            );
+                        }
+                        Same::No(_, _, w) => {
+                            decided = false;
+                            unknown(
+                                out,
+                                format!("the index filters cover different rows ({w}): this changes how fast statements run, not their results, and is not judged"),
+                            );
+                        }
+                        Same::Unknown(w) => {
+                            decided = false;
+                            unknown(out, format!("the index filters were not shown equal: {w}"));
                         }
                     }
                 }

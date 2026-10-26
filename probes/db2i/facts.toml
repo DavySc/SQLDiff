@@ -77,11 +77,6 @@ id = "V28"
 title = "BIT as SMALLINT, and BOOLEAN: open questions for a later BIT mapping"
 review = ["crates/sqldiff-convert/src/tsql/bits.rs"]
 
-[[fact]]
-id = "V29"
-title = "Procedure calls and COMMENT ON: open questions for comparing Db2 for i calls"
-review = ["crates/sqldiff-core/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]
-
 [[link]]
 facts = ["V4"]
 file = "crates/sqldiff-convert/src/tsql.rs"
@@ -153,3 +148,13 @@ facts = ["V27"]
 file = "crates/sqldiff-convert/src/tsql.rs"
 anchor = "Db2 for i dates and timestamps also end at 0001 and 9999"
 hedge = "fact V27, not checked on a real system"
+
+[[fact]]
+id = "V29"
+title = "UNIQUE indexes (NULLs, case, trailing blanks), index names and sequence defaults"
+review = ["crates/sqldiff-core/src/equiv/ddl.rs", "docs/cross-dialect-proofs.md"]
+
+[[fact]]
+id = "V30"
+title = "Procedure calls and COMMENT ON: open questions for comparing Db2 for i calls"
+review = ["crates/sqldiff-core/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]
