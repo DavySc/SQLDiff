@@ -98,6 +98,9 @@ pub struct Unit {
     /// A script's top-level `CREATE TABLE` statements, with the number of
     /// data statements before each.
     pub tables: Vec<(SyntaxNode, usize)>,
+    /// A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE
+    /// SCHEMA` statements (`ddl.rs`), placed like `tables`.
+    pub ddl: Vec<(SyntaxNode, usize)>,
     /// Explicit transaction control or a recognised rollback-and-rethrow protocol.
     pub txn_control: bool,
     /// T-SQL: SET XACT_ABORT ON or a CATCH that rethrows, so a failing
@@ -134,6 +137,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         stmts: Vec::new(),
         uncovered: Vec::new(),
         tables: Vec::new(),
+        ddl: Vec::new(),
         txn_control: false,
         stops_on_error: false,
         txn_stmts: Vec::new(),
@@ -161,9 +165,11 @@ pub fn lower(a: &Analyzed) -> Unit {
                 if n.kind() == SyntaxKind::STATEMENT
                     && !r.text_range().contains_range(n.text_range())
                 {
+                    let after = n.text_range().start() >= r.text_range().end();
                     if is_create_table(&n, d) {
-                        let after = n.text_range().start() >= r.text_range().end();
                         u.tables.push((n.clone(), usize::from(after)));
+                    } else if is_create_ddl(&n, d) {
+                        u.ddl.push((n.clone(), usize::from(after)));
                     } else {
                         u.uncovered
                             .push((n.clone(), "a statement outside the routine".into()));
@@ -179,6 +185,30 @@ pub fn lower(a: &Analyzed) -> Unit {
         [first, ..] => {
             u.uncovered
                 .push((first.clone(), "several routines in one artifact".into()));
+            // Every statement outside the routines is reported on its own
+            // line (or compared, for tables, indexes, sequences and schemas),
+            // so none counts as compared because the routines were not.
+            for n in a.root.descendants() {
+                if n.kind() != SyntaxKind::STATEMENT
+                    || routines
+                        .iter()
+                        .any(|r| r.text_range().contains_range(n.text_range()))
+                {
+                    continue;
+                }
+                let before = routines
+                    .iter()
+                    .filter(|r| r.text_range().end() <= n.text_range().start())
+                    .count();
+                if is_create_table(&n, d) {
+                    u.tables.push((n.clone(), before));
+                } else if is_create_ddl(&n, d) {
+                    u.ddl.push((n.clone(), before));
+                } else {
+                    u.uncovered
+                        .push((n.clone(), "a statement outside the routines".into()));
+                }
+            }
         }
     }
     if let [r] = routines.as_slice() {
@@ -503,6 +533,11 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         StmtKind::Ddl if u.kind == UnitKind::Script && is_create_table(c, d) => {
             u.tables.push((c.clone(), u.stmts.len()));
         }
+        // Indexes, sequences and schemas: compared statement against
+        // statement (`ddl.rs`).
+        StmtKind::Ddl if u.kind == UnitKind::Script && is_create_ddl(c, d) => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
             // `CREATE [OR REPLACE] VIEW name AS query` parsed as one statement.
             let toks = tokens(c);
@@ -572,6 +607,14 @@ fn is_create_table(c: &SyntaxNode, d: Dialect) -> bool {
         && words.first().is_some_and(|w| w == "CREATE")
         && (words.get(1).is_some_and(|w| w == "TABLE")
             || words.get(2).is_some_and(|w| w == "TABLE"))
+        && c.parent()
+            .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
+}
+
+/// A top-level `CREATE … INDEX`, `CREATE SEQUENCE` or `CREATE SCHEMA`.
+fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
+    stmt_kind(c, d) == StmtKind::Ddl
+        && super::ddl::is_ddl(&cst::first_words(c, 7))
         && c.parent()
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }

@@ -148,11 +148,11 @@ fn only_findings_about_the_pair_leave_a_unit_undecided() {
 
 #[test]
 fn a_statement_the_engine_never_compared_is_not_converted() {
-    // The engine does not model CREATE INDEX: the rules' output for it may
+    // The engine does not model DROP TABLE: the rules' output for it may
     // be right, but nothing compared it with the original.
-    let src = format!("{ORDERS}CREATE INDEX IX_Orders_Amt ON dbo.Orders (amt);\nGO\n");
+    let src = format!("{ORDERS}DROP TABLE dbo.OldOrders;\nGO\n");
     let c = convert(&src, Dialect::Postgres);
-    let at = src.find("CREATE INDEX").unwrap();
+    let at = src.find("DROP TABLE").unwrap();
     let u = c
         .units
         .iter()
@@ -165,7 +165,7 @@ fn a_statement_the_engine_never_compared_is_not_converted() {
         .iter()
         .find(|n| n.rule == sqldiff_convert::NOT_COMPARED)
         .unwrap_or_else(|| panic!("{:?}", u.notes));
-    assert!(n.text.contains("CREATE"), "{}", n.text);
+    assert!(n.text.contains("DROP"), "{}", n.text);
     // The table itself is compared, and converts.
     let t = c.units.iter().find(|u| u.src.start == 0).unwrap();
     assert!(t.status <= Status::Assumptions, "{:?}", t.notes);

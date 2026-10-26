@@ -1960,3 +1960,181 @@ outcome = [
   { label = "value", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Not NULL (the value is in N1)." },
   { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
 ]
+
+# ---------------------------------------------------------------- V29 indexes and sequences
+# What a converted CREATE INDEX or CREATE SEQUENCE relies on. The engine
+# (crates/sqldiff-core/src/equiv/ddl.rs) leaves a Db2 for i UNIQUE index and a
+# sequence that leaves values to Db2's defaults not proven until these are
+# answered. Each probe runs up to six statements in order; O_TEXT has one letter
+# per statement (Y it worked, N it failed, - not given), O_N1 the rows of
+# SQLDFPROBE.UX afterwards and O_N2 its smallest K. O_STATE and O_CODE are the
+# first failure's.
+
+[[procedure]]
+name = "V29_DDL"
+commit = "*NONE"
+params = "IN P1 VARCHAR(1000), IN P2 VARCHAR(1000), IN P3 VARCHAR(1000), IN P4 VARCHAR(1000), IN P5 VARCHAR(1000), IN P6 VARCHAR(1000)"
+body = """
+BEGIN
+  DECLARE V_I INTEGER DEFAULT 0;
+  DECLARE V_Q VARCHAR(1000);
+  DECLARE V_OK CHAR(1);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_TEXT = '';
+  SET O_N1 = -1;
+  BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET V_OK = 'N';
+    EXECUTE IMMEDIATE 'DROP TABLE SQLDFPROBE.UX';
+    EXECUTE IMMEDIATE 'DROP SEQUENCE SQLDFPROBE.SQ';
+  END;
+  WHILE V_I < 6 DO
+    SET V_I = V_I + 1;
+    SET V_Q = CASE V_I WHEN 1 THEN P1 WHEN 2 THEN P2 WHEN 3 THEN P3
+      WHEN 4 THEN P4 WHEN 5 THEN P5 ELSE P6 END;
+    IF V_Q = '' THEN
+      SET O_TEXT = O_TEXT || '-';
+    ELSE
+      SET V_OK = 'Y';
+      BEGIN
+        DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+          BEGIN
+            SET V_OK = 'N';
+            IF O_STATE = '00000' THEN
+              GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+                O_CODE = DB2_RETURNED_SQLCODE;
+            END IF;
+          END;
+        EXECUTE IMMEDIATE V_Q;
+      END;
+      SET O_TEXT = O_TEXT || V_OK;
+    END IF;
+  END WHILE;
+  BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLEXCEPTION SET O_N1 = -1;
+    SELECT COUNT(*), MIN(K) INTO O_N1, O_N2 FROM SQLDFPROBE.UX;
+  END;
+END
+"""
+
+[[probe]]
+id = "V29-UNIQUE-NULL"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE UNIQUE INDEX SQLDFPROBE.UXI ON SQLDFPROBE.UX (K)'", "'INSERT INTO SQLDFPROBE.UX VALUES (NULL, ''a'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (NULL, ''b'')'", "''", "''"]
+question = "Does a UNIQUE index hold only one row with a NULL key (as T-SQL's does; PostgreSQL's holds any number unless NULLS NOT DISTINCT)?"
+source = "No IBM i page was read for this probe; the engine makes no assumption and keeps such indexes not proven."
+outcome = [
+  { label = "one NULL", when = { text = "YYYN--", n1 = "=1" }, verdict = "open", meaning = "NULLs are equal keys, as in T-SQL: a UNIQUE index converts as it is." },
+  { label = "many NULLs", when = { text = "YYYY--", n1 = "=2" }, verdict = "open", meaning = "NULLs are distinct keys, as in PostgreSQL: a T-SQL unique index on a nullable column holds more rows on Db2 for i." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something else failed (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-UNIQUE-WHERE-NOT-NULL"
+fact = "V29"
+role = "info"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE UNIQUE WHERE NOT NULL INDEX SQLDFPROBE.UXI ON SQLDFPROBE.UX (K)'", "'INSERT INTO SQLDFPROBE.UX VALUES (NULL, ''a'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (NULL, ''b'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (1, ''c'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (1, ''d'')'"]
+question = "Does UNIQUE WHERE NOT NULL accept any number of NULL keys and still reject a second 1 (the counterpart of a T-SQL unique index filtered on IS NOT NULL)?"
+source = "No IBM i page was read for this probe."
+outcome = [
+  { label = "many NULLs, one 1", when = { text = "YYYYYN", n1 = "=3" }, verdict = "open", meaning = "As a T-SQL unique index WHERE k IS NOT NULL." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Different (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-UNIQUE-CASE"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE UNIQUE INDEX SQLDFPROBE.UXI ON SQLDFPROBE.UX (S)'", "'INSERT INTO SQLDFPROBE.UX VALUES (1, ''a'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (2, ''A'')'", "''", "''"]
+question = "Does a UNIQUE index on a VARCHAR column accept 'A' next to 'a' (case-sensitive keys) under this job's sort sequence? T-SQL with a case-insensitive collation rejects it. Say which sort sequence (SRTSEQ) the job had."
+source = "No IBM i page was read for this probe; the index's sort sequence comes from the job or the creating interface."
+outcome = [
+  { label = "case-sensitive", when = { text = "YYYY--" }, verdict = "open", meaning = "'A' and 'a' are different keys: a T-SQL case-insensitive unique key accepts fewer rows." },
+  { label = "case-insensitive", when = { text = "YYYN--" }, verdict = "open", meaning = "'A' duplicates 'a', as in T-SQL with a case-insensitive collation." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something else failed (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-UNIQUE-TRAILING-BLANKS"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE UNIQUE INDEX SQLDFPROBE.UXI ON SQLDFPROBE.UX (S)'", "'INSERT INTO SQLDFPROBE.UX VALUES (1, ''a'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (2, ''a '')'", "''", "''"]
+question = "Does a UNIQUE index on a VARCHAR column treat 'a ' as a duplicate of 'a' (trailing blanks ignored), as T-SQL does?"
+source = "No IBM i page was read for this probe."
+outcome = [
+  { label = "blanks ignored", when = { text = "YYYN--" }, verdict = "open", meaning = "As T-SQL." },
+  { label = "blanks count", when = { text = "YYYY--" }, verdict = "open", meaning = "As PostgreSQL varchar: 'a ' is another key." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something else failed (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-INDEX-NAME-TABLE"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE INDEX SQLDFPROBE.UX ON SQLDFPROBE.UX (K)'", "''", "''", "''", "''"]
+question = "Is an index named like a table of its schema rejected (index names are schema objects, as ASM-INDEX-NAME-SCHEMA says; T-SQL index names are per table)?"
+source = "The assumption the converter states (ASM-INDEX-NAME-SCHEMA); no IBM i page was read for it."
+outcome = [
+  { label = "rejected", when = { text = "YN----" }, verdict = "consistent", meaning = "Index and table names share the schema, as ASM-INDEX-NAME-SCHEMA says." },
+  { label = "accepted", when = { text = "YY----" }, verdict = "refines", meaning = "The names do not clash: the assumption is stronger than needed." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something else failed (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-INDEX-DESC"
+fact = "V29"
+role = "control"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE INDEX SQLDFPROBE.UXI ON SQLDFPROBE.UX (K DESC, S ASC)'", "'INSERT INTO SQLDFPROBE.UX VALUES (1, ''a'')'", "''", "''", "''"]
+question = "Control: a plain index with DESC and ASC keys is accepted (the form the converter writes)."
+source = "IBM i 7.x SQL reference, CREATE INDEX (ASC and DESC keys). Assumed; not re-read for this probe."
+outcome = [
+  { label = "accepted", when = { text = "YYY---", n1 = "=1" }, verdict = "consistent", meaning = "The converted index runs." },
+]
+
+[[probe]]
+id = "V29-SEQUENCE-DEFAULT-START"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX VALUES (NEXT VALUE FOR SQLDFPROBE.SQ, ''a'')'", "''", "''", "''"]
+question = "Which value does a sequence created with no options hand out first (N2)? T-SQL starts at the type's minimum, PostgreSQL at 1. The converter writes every value out, so only unconverted code depends on it."
+source = "No IBM i page was read for this probe."
+outcome = [
+  { label = "starts at 1", when = { text = "YYY---", n2 = "=1" }, verdict = "open", meaning = "Starts at 1, as PostgreSQL." },
+  { label = "other start", when = { text = "YYY---" }, verdict = "open", meaning = "Another first value (in N2)." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something failed (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-SEQUENCE-DEFAULT-TYPE"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ START WITH 2147483647'", "'INSERT INTO SQLDFPROBE.UX VALUES (NEXT VALUE FOR SQLDFPROBE.SQ, ''a'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (NEXT VALUE FOR SQLDFPROBE.SQ, ''b'')'", "''", "''"]
+question = "Is a sequence without AS an INTEGER sequence (the second value, 2147483648, fails) or a BIGINT one (T-SQL's and PostgreSQL's default)?"
+source = "No IBM i page was read for this probe."
+outcome = [
+  { label = "integer", when = { text = "YYYN--" }, verdict = "open", meaning = "The default type is INTEGER: a sequence converted without AS would end early." },
+  { label = "bigint", when = { text = "YYYY--" }, verdict = "open", meaning = "The default type is BIGINT, as T-SQL." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something failed (see O_TEXT and the SQLSTATE)." },
+]
+
+[[probe]]
+id = "V29-SEQUENCE-CYCLE"
+fact = "V29"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS INTEGER START WITH 6 INCREMENT BY 1 MINVALUE 5 MAXVALUE 7 CYCLE NO CACHE'", "'INSERT INTO SQLDFPROBE.UX VALUES (NEXT VALUE FOR SQLDFPROBE.SQ, ''a'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (NEXT VALUE FOR SQLDFPROBE.SQ, ''b'')'", "'INSERT INTO SQLDFPROBE.UX VALUES (NEXT VALUE FOR SQLDFPROBE.SQ, ''c'')'", "''"]
+question = "A sequence written out in full, as the converter writes it, hands out 6, 7 and then restarts at MINVALUE 5 (N2 = 5), as T-SQL and PostgreSQL do?"
+source = "The converter's output and the engine's comparison of it (T-SQL and PostgreSQL checked on real systems); no IBM i page was read for this probe."
+outcome = [
+  { label = "restarts at MINVALUE", when = { text = "YYYYY-", n1 = "=3", n2 = "=5" }, verdict = "consistent", meaning = "As T-SQL: the converted sequence hands out the same values." },
+  { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "The converted sequence hands out other values (see O_TEXT, N1, N2 and the SQLSTATE)." },
+]

@@ -2617,7 +2617,20 @@ impl<'a> Cx<'a> {
                 self.with_bit_cols(cols, |cx| cx.create_table(&ts))
             }
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => {
+                if let Some(t) = ts
+                    .iter()
+                    .take_while(|t| !t.is("INDEX"))
+                    .find(|t| t.is("COLUMNSTORE") || t.is("XML") || t.is("SPATIAL"))
+                {
+                    return no(format!(
+                        "{} index: {} has no counterpart; create a plain index (or none) after review",
+                        t.up(),
+                        self.to.display_name()
+                    ));
+                }
+                let ts = self.strip_partition_scheme(&ts);
                 let ts = self.strip_storage(&ts)?;
+                let ts = self.strip_after_filter(&ts)?;
                 if self.db2() {
                     if let Some(w) = ts.iter().find(|t| t.is("INCLUDE") || t.is("WHERE")) {
                         return no(format!("index with {}: not checked for Db2 for i; create a plain index (or an encoded vector or derived-key index) after review", w.up()));
@@ -2635,6 +2648,22 @@ impl<'a> Cx<'a> {
                     ).to_string();
                     self.note(Status::Assumptions, "ASM-CLUSTERED", &text);
                 }
+                let text = self.pick(
+                    "PostgreSQL index names are schema objects (T-SQL's are per table): no other index, table, view or sequence in the schema may have this name.",
+                    "Db2 for i index names are schema objects (T-SQL's are per table): no other index, table, view or sequence in the schema may have this name.",
+                ).to_string();
+                self.note(Status::Assumptions, "ASM-INDEX-NAME-SCHEMA", &text);
+                if find_word(&kept, 0, "WHERE").is_some() {
+                    self.note(Status::Assumptions, "ASM-TSQL-FILTERED-INDEX-SET-OPTIONS", "SQL Server rejects changes to a table with a filtered index from sessions with ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT or CONCAT_NULL_YIELDS_NULL OFF (or NUMERIC_ROUNDABORT ON); the target does not, so such sessions are assumed not to exist.");
+                }
+                // T-SQL's unique index holds one NULL (NULLs are equal keys);
+                // PostgreSQL's holds any number unless NULLS NOT DISTINCT.
+                let kept = if !self.db2() && w1 == "UNIQUE" {
+                    self.note(Status::Converted, "tsql.unique-nulls", "UNIQUE index gets NULLS NOT DISTINCT: in T-SQL a unique index treats NULLs as equal keys, so it holds one row with NULL, as NULLS NOT DISTINCT does.");
+                    nulls_not_distinct(kept)
+                } else {
+                    kept
+                };
                 // A filtered index's WHERE on BIT columns of the ON table.
                 let cols = find_word(&kept, 0, "ON")
                     .map(|on| {
@@ -2646,10 +2675,132 @@ impl<'a> Cx<'a> {
                     .unwrap_or_default();
                 self.with_bit_cols(cols, |cx| Ok(collapse_spaces(&cx.expr(&kept))))
             }
-            "SCHEMA" => Ok(self.expr(&ts)),
+            "SCHEMA" => self.create_schema(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
             _ => no(format!("CREATE {w1}: no rule yet")),
         }
+    }
+
+    /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
+    /// database owner, a principal the target has no counterpart of by that
+    /// name: the target schema goes to the user running the script.
+    fn create_schema(&mut self, ts: &[T]) -> R<String> {
+        let s = sig(ts);
+        let body: Vec<usize> = s
+            .iter()
+            .copied()
+            .filter(|&j| ts[j].k != SEMICOLON)
+            .collect();
+        match body.as_slice() {
+            [_, _, name] => Ok(self.expr(&ts[..=*name])),
+            [_, _, name, auth, owner] if ts[*auth].is("AUTHORIZATION") => {
+                if tsql_unquote(&ts[*owner].s).eq_ignore_ascii_case("dbo") {
+                    let text = self.pick(
+                        "AUTHORIZATION dbo is dropped: PostgreSQL has no role dbo, so the schema is owned by the user running the script, which should be the database owner.",
+                        "AUTHORIZATION dbo is dropped: Db2 for i has no user profile DBO, so the schema (library) is owned as the user running the script creates it.",
+                    ).to_string();
+                    self.note(Status::Assumptions, "ASM-SCHEMA-OWNER", &text);
+                    Ok(self.expr(&ts[..=*name]))
+                } else {
+                    let text = format!(
+                        "The schema owner {} must exist on {} and hold the privileges it holds in SQL Server.",
+                        tsql_unquote(&ts[*owner].s),
+                        self.to.display_name()
+                    );
+                    self.note(Status::Assumptions, "ASM-SCHEMA-OWNER", &text);
+                    Ok(self.expr(&ts[..=*owner]))
+                }
+            }
+            _ => no("CREATE SCHEMA with schema elements or options: no rule yet"),
+        }
+    }
+
+    /// An index's `ON scheme (column)` after its column list: partitioning
+    /// places rows, it does not change which rows an index holds or rejects.
+    fn strip_partition_scheme(&mut self, ts: &[T]) -> Vec<T> {
+        let ds = crate::tok::depths(ts);
+        let mut cut = vec![false; ts.len()];
+        let mut dropped = false;
+        for i in 0..ts.len() {
+            if ds[i] != 0 || !ts[i].is("ON") || !prev_sig(ts, i).is_some_and(|p| ts[p].k == R_PAREN)
+            {
+                continue;
+            }
+            let Some(name) = next_sig(ts, i) else {
+                continue;
+            };
+            let Some(open) = next_sig(ts, name).filter(|&p| ts[p].k == L_PAREN) else {
+                continue;
+            };
+            let Some(close) = matching(ts, open) else {
+                continue;
+            };
+            cut[i..=close].iter_mut().for_each(|c| *c = true);
+            dropped = true;
+        }
+        if dropped {
+            self.note(Status::Converted, "tsql.partition-scheme", "The index's partition scheme (ON scheme (column)) was dropped: partitioning places rows, it does not change which rows the index holds or rejects.");
+        }
+        ts.iter()
+            .zip(cut)
+            .filter(|(_, c)| !c)
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
+    /// An index's `WITH (…)` and `ON filegroup` after its filter: removed
+    /// like `strip_storage` does after the column list (PostgreSQL wants
+    /// WITH before WHERE, and a filegroup has no counterpart).
+    fn strip_after_filter(&mut self, ts: &[T]) -> R<Vec<T>> {
+        let Some(w) = find_word(ts, 0, "WHERE") else {
+            return Ok(ts.to_vec());
+        };
+        let ds = crate::tok::depths(ts);
+        let mut cut = vec![false; ts.len()];
+        let mut i = w + 1;
+        let mut dropped = false;
+        while i < ts.len() {
+            if ds[i] == 0 && ts[i].is("WITH") {
+                let Some(open) = next_sig(ts, i).filter(|&p| ts[p].k == L_PAREN) else {
+                    return no("index WITH option without parentheses: no rule yet");
+                };
+                let r = matching(ts, open).ok_or(No("unbalanced parentheses".into()))?;
+                for opt in split_commas(&ts[open + 1..r]) {
+                    storage_option(opt)?;
+                }
+                cut[i..=r].iter_mut().for_each(|c| *c = true);
+                dropped = true;
+                i = r + 1;
+                continue;
+            }
+            if ds[i] == 0 && (ts[i].is("ON") || ts[i].is("FILESTREAM_ON")) {
+                let nx = next_sig(ts, i).unwrap_or(i);
+                if let Some(open) = next_sig(ts, nx).filter(|&p| ts[p].k == L_PAREN) {
+                    let r = matching(ts, open).ok_or(No("unbalanced parentheses".into()))?;
+                    cut[i..=r].iter_mut().for_each(|c| *c = true);
+                    dropped = true;
+                    i = r + 1;
+                    continue;
+                }
+                if ts[i].is("FILESTREAM_ON") {
+                    return no("FILESTREAM_ON: no rule yet");
+                }
+                cut[i..=nx].iter_mut().for_each(|c| *c = true);
+                dropped = true;
+                i = nx + 1;
+                continue;
+            }
+            i += 1;
+        }
+        if dropped {
+            self.note(Status::Converted, "tsql.storage-options", "Filegroup and storage options (ON [PRIMARY], WITH (…)) were dropped; they do not change results.");
+        }
+        Ok(ts
+            .iter()
+            .zip(cut)
+            .filter(|(_, c)| !c)
+            .map(|(t, _)| t.clone())
+            .collect())
     }
 
     /// Removes `ON [PRIMARY]`, `TEXTIMAGE_ON x` and `WITH (…)` after the main column list.
@@ -4745,6 +4896,38 @@ fn quoted(s: &str) -> String {
 
 /// One `WITH (…)` option of a table or index. Only options that change
 /// performance, never results, may be dropped.
+/// `NULLS NOT DISTINCT` put in a PostgreSQL unique index: before its
+/// filter, or at its end.
+fn nulls_not_distinct(ts: Vec<T>) -> Vec<T> {
+    let at = find_word(&ts, 0, "WHERE").unwrap_or_else(|| {
+        let last = (0..ts.len())
+            .rev()
+            .find(|&j| ts[j].sig() && ts[j].k != SEMICOLON);
+        last.map_or(ts.len(), |j| j + 1)
+    });
+    let mut out = ts[..at].to_vec();
+    let word = |s: &str| T {
+        k: IDENT,
+        s: s.into(),
+    };
+    let space = || T {
+        k: WHITESPACE,
+        s: " ".into(),
+    };
+    if !out.last().is_some_and(|t| t.k == WHITESPACE) {
+        out.push(space());
+    }
+    for w in ["NULLS", "NOT", "DISTINCT"] {
+        out.push(word(w));
+        out.push(space());
+    }
+    if !ts[at..].iter().any(|t| t.sig() && t.k != SEMICOLON) {
+        out.pop();
+    }
+    out.extend(ts[at..].iter().cloned());
+    out
+}
+
 fn storage_option(opt: &[T]) -> R<()> {
     let opt = trimmed(opt);
     let Some(name) = opt.first().map(|t| t.up()) else {

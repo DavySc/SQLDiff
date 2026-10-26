@@ -139,11 +139,11 @@ pub struct Table {
 
 type R<T> = Result<T, String>;
 
-fn word(t: Option<&Tok>, w: &str) -> bool {
+pub(super) fn word(t: Option<&Tok>, w: &str) -> bool {
     t.is_some_and(|t| t.kind == K::Word && t.up == w)
 }
 
-fn name_of(t: &Tok) -> Option<Name> {
+pub(super) fn name_of(t: &Tok) -> Option<Name> {
     match t.kind {
         K::Word => Some(Name {
             text: t.text.clone(),
@@ -157,7 +157,7 @@ fn name_of(t: &Tok) -> Option<Name> {
     }
 }
 
-fn text(ts: &[Tok]) -> String {
+pub(super) fn text(ts: &[Tok]) -> String {
     let mut s = String::new();
     for (i, t) in ts.iter().enumerate() {
         let glue = i == 0
@@ -172,7 +172,7 @@ fn text(ts: &[Tok]) -> String {
 }
 
 /// The index of the parenthesis closing the one at `open`.
-fn close(ts: &[Tok], open: usize) -> R<usize> {
+pub(super) fn close(ts: &[Tok], open: usize) -> R<usize> {
     let mut depth = 0usize;
     for (i, t) in ts.iter().enumerate().skip(open) {
         match t.kind {
@@ -190,7 +190,7 @@ fn close(ts: &[Tok], open: usize) -> R<usize> {
 }
 
 /// Splits at commas outside parentheses.
-fn split(ts: &[Tok]) -> Vec<&[Tok]> {
+pub(super) fn split(ts: &[Tok]) -> Vec<&[Tok]> {
     let mut out = Vec::new();
     let (mut depth, mut start) = (0usize, 0);
     for (i, t) in ts.iter().enumerate() {
@@ -209,7 +209,7 @@ fn split(ts: &[Tok]) -> Vec<&[Tok]> {
 }
 
 /// A dotted name starting at `i`: its parts and the index after it.
-fn dotted(ts: &[Tok], mut i: usize) -> R<(Vec<Name>, usize)> {
+pub(super) fn dotted(ts: &[Tok], mut i: usize) -> R<(Vec<Name>, usize)> {
     let mut parts = Vec::new();
     loop {
         let n = ts
@@ -246,7 +246,7 @@ fn col_list(ts: &[Tok], i: usize, sorted: bool) -> R<(Vec<Name>, usize)> {
 }
 
 /// A signed whole number at `i`, and the index after it.
-fn number(ts: &[Tok], i: usize) -> R<(i128, usize)> {
+pub(super) fn number(ts: &[Tok], i: usize) -> R<(i128, usize)> {
     let (neg, j) = match ts.get(i) {
         Some(t) if t.kind == K::Op && (t.text == "-" || t.text == "+") => (t.text == "-", i + 1),
         _ => (false, i),
@@ -264,7 +264,7 @@ fn number(ts: &[Tok], i: usize) -> R<(i128, usize)> {
 
 /// Index options of a T-SQL key that only shape its index. IGNORE_DUP_KEY
 /// = ON changes what an INSERT does, so it is not among them.
-const TSQL_INDEX_STORAGE: &[&str] = &[
+pub(super) const TSQL_INDEX_STORAGE: &[&str] = &[
     "PAD_INDEX",
     "FILLFACTOR",
     "STATISTICS_NORECOMPUTE",
@@ -279,7 +279,12 @@ const TSQL_INDEX_STORAGE: &[&str] = &[
 
 /// `WITH ( name = value, ... )` at `i` whose names are all `allowed`
 /// (`IGNORE_DUP_KEY = OFF` too, the default): the index after it.
-fn storage_options(ts: &[Tok], i: usize, allowed: &[&str], storage: &mut Vec<String>) -> R<usize> {
+pub(super) fn storage_options(
+    ts: &[Tok],
+    i: usize,
+    allowed: &[&str],
+    storage: &mut Vec<String>,
+) -> R<usize> {
     let open = i + 1;
     if !ts.get(open).is_some_and(|t| t.kind == K::LParen) {
         return Err("WITH without an option list".into());
@@ -302,7 +307,7 @@ fn storage_options(ts: &[Tok], i: usize, allowed: &[&str], storage: &mut Vec<Str
 }
 
 /// T-SQL `ON filegroup` / `ON "default"` after a key or the table.
-fn filegroup(ts: &[Tok], i: usize, storage: &mut Vec<String>) -> R<usize> {
+pub(super) fn filegroup(ts: &[Tok], i: usize, storage: &mut Vec<String>) -> R<usize> {
     let n = ts.get(i + 1).ok_or("ON without a filegroup")?;
     if !matches!(n.kind, K::Word | K::Quoted | K::Str) {
         return Err(format!("ON `{}`", n.text));
@@ -1256,7 +1261,7 @@ pub enum Event {
 /// catalog collation, `ASM-IDENT-FOLD`), PostgreSQL folds unquoted names to
 /// lower case. A quoted PostgreSQL name with capitals matches no unquoted
 /// name the rest of the converted code writes.
-fn key(n: &Name, d: Dialect) -> R<String> {
+pub(super) fn key(n: &Name, d: Dialect) -> R<String> {
     match d {
         Dialect::Postgres if n.quoted && n.text != n.text.to_lowercase() => Err(format!(
             "the quoted name \"{}\" keeps its capitals in PostgreSQL",
@@ -1288,7 +1293,7 @@ fn table_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
 
 /// A column is nullable when it says NULL, or says nothing and is neither
 /// in the primary key nor an identity column.
-fn nullable(t: &Table, c: &Column) -> R<bool> {
+pub(super) fn nullable(t: &Table, c: &Column) -> R<bool> {
     let k = key(&c.name, t.dialect)?;
     let in_pk = t.keys.iter().filter(|x| x.primary).any(|x| {
         x.cols
@@ -1298,7 +1303,7 @@ fn nullable(t: &Table, c: &Column) -> R<bool> {
     Ok(c.null.unwrap_or(!(in_pk || c.identity.is_some())))
 }
 
-fn column_by_key<'t>(t: &'t Table, k: &str) -> Option<&'t Column> {
+pub(super) fn column_by_key<'t>(t: &'t Table, k: &str) -> Option<&'t Column> {
     t.columns
         .iter()
         .find(|c| key(&c.name, t.dialect).is_ok_and(|n| n == k))
@@ -1940,7 +1945,7 @@ fn compare_into(x: &Table, y: &Table, na: &str, nb: &str, ev: &mut Vec<Event>) -
     Ok(())
 }
 
-fn text_name(ns: &[Name]) -> String {
+pub(super) fn text_name(ns: &[Name]) -> String {
     ns.iter()
         .map(|n| n.text.as_str())
         .collect::<Vec<_>>()
