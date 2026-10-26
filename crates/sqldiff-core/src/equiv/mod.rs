@@ -12,6 +12,7 @@ pub mod canon;
 pub mod compare;
 pub mod edit;
 pub mod eval;
+pub mod literal;
 pub mod lower;
 pub mod options;
 pub mod schema;

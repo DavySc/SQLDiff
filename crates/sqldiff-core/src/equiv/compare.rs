@@ -232,6 +232,34 @@ pub fn explain(
 /// specific reason; otherwise None.
 pub fn describe_unknown(m: &Mismatch, side_a: &str, side_b: &str) -> Option<String> {
     let parent = m.parent_a.as_ref()?;
+    // A string literal whose conversion to the compared type is not modelled
+    // on one side: it may round, fail or depend on session settings.
+    for (t, side) in [(&m.a, side_a), (&m.b, side_b)] {
+        if t.is("lit-conv") {
+            let ty = t.kid(1).and_then(Term::atom).unwrap_or("?");
+            let lit = t.kid(2).and_then(Term::atom).unwrap_or("");
+            return Some(if ty == "?" {
+                format!("on {side}, the type the literal '{lit}' converts to is unknown")
+            } else {
+                format!(
+                    "on {side}, the literal '{lit}' converts to {ty} in a way that is not modelled for certain (it may round, fail or depend on session settings)"
+                )
+            });
+        }
+    }
+    if parent.is("cmp-untyped") && m.index == 0 {
+        let x = parent.kid(2).map(render).unwrap_or_default();
+        let y = parent.kid(3).map(render).unwrap_or_default();
+        return Some(format!(
+            "the type of the value compared in {x} {} {y} is unknown (no catalog facts): a character string compares under each side's collation, any other type converts the literal",
+            parent.kid(1).and_then(Term::atom).unwrap_or("=")
+        ));
+    }
+    if parent.is("cmp-conv") && m.index == 0 {
+        return Some(
+            "a character string is compared with a value of another type: T-SQL converts the string, PostgreSQL has no such comparison for a typed string, and Db2 for i is not checked".to_string(),
+        );
+    }
     let (x, y) = (m.a.atom()?, m.b.atom()?);
     match (parent.head(), m.index) {
         ("ord", 2) => Some(format!(
@@ -334,6 +362,7 @@ fn render_inner(t: &Term) -> String {
         }
         "num" => r(0),
         "str" => format!("'{}'", r(0)),
+        "tval" | "uuid" | "lit-conv" => format!("'{}'", r(k.len().saturating_sub(1))),
         "fn" => format!(
             "{}({})",
             r(0),

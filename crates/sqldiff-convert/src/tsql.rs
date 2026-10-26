@@ -2935,6 +2935,7 @@ impl<'a> Cx<'a> {
                     let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
                     o.push_str(lit);
                     self.string_compare(ts, i);
+                    self.fraction_note(lit);
                 }
                 OP if t.s == "+" => {
                     let l = self.operand_kind(ts, prev_sig(ts, i));
@@ -3179,6 +3180,22 @@ impl<'a> Cx<'a> {
         };
         if hit {
             self.ci_note();
+        }
+    }
+
+    /// A date and time literal with a seventh fractional digit: compared with
+    /// or converted to a date and time, PostgreSQL rounds it to microseconds
+    /// (checked on PostgreSQL 18: '9999-12-31 23:59:59.9999999' becomes
+    /// 10000-01-01 00:00:00), where T-SQL keeps it.
+    fn fraction_note(&mut self, lit: &str) {
+        if self.db2() {
+            return;
+        }
+        let Some(body) = lit.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')) else {
+            return;
+        };
+        if sqldiff_core::equiv::literal::fraction_digits(body).is_some_and(|n| n > 6) {
+            self.note(Status::Assumptions, "ASM-LITERAL-FRACTION", "A date and time literal with 7 fractional digits: where it meets a date and time value, T-SQL keeps the 100 ns digit and PostgreSQL rounds it to microseconds ('9999-12-31 23:59:59.9999999' becomes 10000-01-01 00:00:00). Equal only if no stored value lies within half a microsecond of the literal without being equal to it (data moved with the same rounding).");
         }
     }
 

@@ -15,6 +15,7 @@ use sqldiff_syntax::Dialect;
 use super::ast::{
     Call, ConflictAction, Expr, From, InsertSource, MergeAction, OrderItem, SelItem, Select, Stmt,
 };
+use super::literal::{self, Target};
 use super::lower::{Unit, UnitKind};
 use super::schema::{Fam, Schema, Ty};
 use super::term::{a, n, Term};
@@ -489,7 +490,15 @@ impl<'a> Canon<'a> {
                 let (t, ty) = self.expr(x)?;
                 let mut items = Vec::new();
                 let (mut string, mut known) = (ty.is_some_and(|t| t.is_string()), ty.is_some());
+                // String literals convert to the type of a non-string operand, as in `=`.
+                let target = ty
+                    .is_some_and(|t| !t.is_string())
+                    .then(|| self.target_of(&t, ty));
                 for l in list {
+                    if let (Expr::Str(s), Some(target)) = (l, target) {
+                        items.push(self.lit_as(s, target, false));
+                        continue;
+                    }
                     let (it, ity) = self.expr(l)?;
                     string |= ity.is_some_and(|t| t.is_string());
                     known |= ity.is_some();
@@ -518,8 +527,18 @@ impl<'a> Canon<'a> {
             }
             Expr::Between(x, lo, hi, neg) => {
                 let (t, ty) = self.expr(x)?;
-                let lo = self.expr(lo)?.0;
-                let hi = self.expr(hi)?.0;
+                // String literal bounds convert to the type of a non-string operand.
+                let target = ty
+                    .is_some_and(|t| !t.is_string())
+                    .then(|| self.target_of(&t, ty));
+                let bound = |e: &Expr, c: &mut Self| -> R<Term> {
+                    Ok(match (e, target) {
+                        (Expr::Str(s), Some(target)) => c.lit_as(s, target, true),
+                        _ => c.expr(e)?.0,
+                    })
+                };
+                let lo = bound(lo, self)?;
+                let hi = bound(hi, self)?;
                 let mut kids = vec![t, lo, hi, a(neg.to_string())];
                 if ty.map_or(true, |t| t.is_string()) {
                     kids.push(self.dtag());
@@ -540,6 +559,26 @@ impl<'a> Canon<'a> {
             }
             Expr::Cast(x, ty) => {
                 let dst = Ty::from_type(ty, self.d, true);
+                // A string literal cast to a type whose conversion is modelled:
+                // the cast is kept only when the value converts unchanged.
+                if let (Expr::Str(s), Some(target)) = (x.as_ref(), Target::of_type(ty, self.d)) {
+                    match literal::convert(s, target, self.d, true) {
+                        Some((_, asm)) => {
+                            if let Some(x) = asm {
+                                self.assume(x);
+                            }
+                        }
+                        None => {
+                            return Ok((
+                                n(
+                                    "lit-conv",
+                                    vec![self.dtag(), a(target.name()), a(s.clone())],
+                                ),
+                                Some(dst),
+                            ))
+                        }
+                    }
+                }
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
@@ -850,14 +889,49 @@ impl<'a> Canon<'a> {
             parts.sort();
             return Ok((n(&op.to_lowercase(), parts), Some(Ty::of(Fam::Bool))));
         }
-        let (lt, lty) = self.expr(l)?;
-        let (rt, rty) = self.expr(r)?;
+        let (mut lt, mut lty) = self.expr(l)?;
+        let (mut rt, mut rty) = self.expr(r)?;
+        let cmp_op = matches!(op, "=" | "<>" | "<" | ">" | "<=" | ">=");
+        if cmp_op {
+            // A string literal against a value of another type converts to
+            // that type: it compares as a value, not under a collation.
+            let ordered = !matches!(op, "=" | "<>");
+            let non_string = |t: &Option<Ty>| t.is_some_and(|t| !t.is_string());
+            match (l, r) {
+                (Expr::Str(s), _) if non_string(&rty) => {
+                    let target = self.target_of(&rt, rty);
+                    lt = self.lit_as(s, target, ordered);
+                    lty = rty;
+                }
+                (_, Expr::Str(s)) if non_string(&lty) => {
+                    let target = self.target_of(&lt, lty);
+                    rt = self.lit_as(s, target, ordered);
+                    rty = lty;
+                }
+                (Expr::Str(_), _) if rty.is_none() => {
+                    return Ok((self.untyped_lit_cmp(op, lt, rt), Some(Ty::of(Fam::Bool))));
+                }
+                (_, Expr::Str(_)) if lty.is_none() => {
+                    return Ok((self.untyped_lit_cmp(op, lt, rt), Some(Ty::of(Fam::Bool))));
+                }
+                _ => {}
+            }
+        }
         let any =
             |f: &dyn Fn(&Ty) -> bool| lty.as_ref().is_some_and(f) || rty.as_ref().is_some_and(f);
         match op {
             "=" | "<>" | "<" | ">" | "<=" | ">=" => {
                 let string = any(&|t| t.is_string());
                 let known = lty.is_some() || rty.is_some();
+                if string && any(&|t| !t.is_string()) {
+                    // T-SQL converts the string to the other type; PostgreSQL
+                    // has no such operator for a typed string.
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-conv", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
                 if string {
                     return Ok((
                         self.strcmp(op, (lt, lty), (rt, rty)),
@@ -962,6 +1036,54 @@ impl<'a> Canon<'a> {
             }
             _ => Ok((n("dfn", vec![self.dtag(), a(op), lt, rt]), None)),
         }
+    }
+
+    /// What a string literal converts to when it meets this operand: the
+    /// declared type of a column, or what the operand's type says alone.
+    fn target_of(&self, t: &Term, ty: Option<Ty>) -> Option<Target> {
+        if t.is("col") {
+            let (table, col) = (t.kid(0)?.atom()?, t.kid(1)?.atom()?);
+            return self
+                .schema
+                .table(Self::base_table(table))?
+                .column(col)?
+                .target;
+        }
+        match ty?.fam {
+            Fam::Date => Target::of("DATE", &[], self.d),
+            Fam::Bool => Target::of("BOOLEAN", &[], self.d),
+            _ => None,
+        }
+    }
+
+    /// The value a string literal converts to, or, when the conversion is not
+    /// modelled for certain, a term that only equals the same literal in the
+    /// same dialect. uniqueidentifier and uuid sort differently, so their
+    /// order comparisons stay dialect-specific.
+    fn lit_as(&mut self, s: &str, target: Option<Target>, ordered: bool) -> Term {
+        let conv = target
+            .filter(|t| !(ordered && *t == Target::Uuid))
+            .and_then(|t| literal::convert(s, t, self.d, false));
+        match conv {
+            Some((t, asm)) => {
+                if let Some(x) = asm {
+                    self.assume(x);
+                }
+                t
+            }
+            None => n(
+                "lit-conv",
+                vec![self.dtag(), a(target.map_or("?", |t| t.name())), a(s)],
+            ),
+        }
+    }
+
+    /// A string literal against a value of unknown type (no catalog facts):
+    /// a string comparison under each side's collation if the value is a
+    /// string, a conversion of the literal otherwise.
+    fn untyped_lit_cmp(&mut self, op: &str, l: Term, r: Term) -> Term {
+        let (x, y, op) = order_operands(op, l, r);
+        n("cmp-untyped", vec![self.dtag(), a(op), x, y])
     }
 
     /// String comparison with its collation behaviour made explicit:
