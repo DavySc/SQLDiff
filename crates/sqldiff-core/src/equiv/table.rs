@@ -1323,6 +1323,124 @@ fn bool_literal(ts: &[Tok]) -> Option<bool> {
     }
 }
 
+/// Whether a default already has its column's type, so storing it converts
+/// nothing. The engine compares a default as `SELECT default`, but the column
+/// stores it converted to the column's type, and the dialects convert
+/// differently (`int DEFAULT 1.5`: T-SQL truncates to 1, PostgreSQL rounds to
+/// 2). Only NULL, literals the type holds exactly, and argument-free calls on
+/// date, time and uuid columns pass; anything else is not compared.
+fn default_fits(ts: &[Tok], ty: &Ty) -> R<()> {
+    let mut ts = ts;
+    while ts.len() >= 2
+        && ts[0].kind == K::LParen
+        && ts[ts.len() - 1].kind == K::RParen
+        && close(ts, 0).ok() == Some(ts.len() - 1)
+    {
+        ts = &ts[1..ts.len() - 1];
+    }
+    let not = |why: &str| Err(format!("{} for a {ty:?} column {why}", text(ts)));
+    let (neg, num) = match ts {
+        [t] if t.kind == K::Word && t.up == "NULL" => return Ok(()),
+        [m, t] if m.kind == K::Op && (m.text == "-" || m.text == "+") && t.kind == K::Num => {
+            (m.text == "-", Some(t))
+        }
+        [t] if t.kind == K::Num => (false, Some(t)),
+        _ => (false, None),
+    };
+    if let Some(n) = num {
+        // Digits before and after the point; an exponent makes T-SQL a float.
+        let s = n.text.as_str();
+        if !s.bytes().all(|b| b.is_ascii_digit() || b == b'.') || s.matches('.').count() > 1 {
+            return not("(not a plain decimal number)");
+        }
+        let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+        let int = int.trim_start_matches('0');
+        let frac = frac.trim_end_matches('0');
+        let fits_dec = |p: u32, sc: u32| int.len() as u32 <= p - sc && frac.len() as u32 <= sc;
+        let fits_int = |lo: i128, hi: i128| {
+            let v = match int {
+                "" => Some(0),
+                _ if int.len() <= 38 => int.parse::<i128>().ok(),
+                _ => None,
+            };
+            frac.is_empty()
+                && v.is_some_and(|v| {
+                    let v = if neg { -v } else { v };
+                    lo <= v && v <= hi
+                })
+        };
+        let ok = match ty {
+            Ty::Int(bits) => {
+                let hi = (1i128 << (bits - 1)) - 1;
+                fits_int(-hi - 1, hi)
+            }
+            Ty::TinyInt => fits_int(0, 255),
+            Ty::Dec(Some((p, sc))) => fits_dec(*p, *sc),
+            Ty::Money => fits_dec(15 + 4, 4),
+            Ty::SmallMoney => fits_dec(6 + 4, 4),
+            _ => false,
+        };
+        return if ok {
+            Ok(())
+        } else {
+            not("(converted on storing)")
+        };
+    }
+    match ts {
+        [t] if t.kind == K::Str => {
+            let Ty::Str { len, .. } = ty else {
+                return not("(a string read as another type)");
+            };
+            let v = ast::string_value(&t.text)?;
+            if !v.is_ascii() {
+                return not("(characters outside ASCII)");
+            }
+            if len.is_some_and(|l| v.chars().count() as u32 > l) {
+                return not("(longer than the column)");
+            }
+            Ok(())
+        }
+        // A call with no arguments: GETDATE(), SYSDATETIME(), NEWID(), now().
+        [f, o, c] if f.kind == K::Word && o.kind == K::LParen && c.kind == K::RParen => match ty {
+            Ty::Date
+            | Ty::Time(_)
+            | Ty::DateTime
+            | Ty::SmallDateTime
+            | Ty::DateTime2(_)
+            | Ty::Timestamp(_)
+            | Ty::TimestampTz(_)
+            | Ty::DateTimeOffset(_)
+            | Ty::Uuid => Ok(()),
+            _ => not("(a call's result converted on storing)"),
+        },
+        // PostgreSQL niladic forms: CURRENT_TIMESTAMP, LOCALTIMESTAMP, ...
+        [f] if f.kind == K::Word
+            && matches!(
+                f.up.as_str(),
+                "CURRENT_TIMESTAMP"
+                    | "CURRENT_DATE"
+                    | "CURRENT_TIME"
+                    | "LOCALTIMESTAMP"
+                    | "LOCALTIME"
+            )
+            && matches!(
+                ty,
+                Ty::Date
+                    | Ty::Time(_)
+                    | Ty::DateTime
+                    | Ty::SmallDateTime
+                    | Ty::DateTime2(_)
+                    | Ty::Timestamp(_)
+                    | Ty::TimestampTz(_)
+                    | Ty::DateTimeOffset(_)
+            ) =>
+        {
+            Ok(())
+        }
+        _ => not("(an expression whose type the table proof does not check)"),
+    }
+}
+
 /// The sequence a default takes its next value from: T-SQL `NEXT VALUE
 /// FOR s`, PostgreSQL `nextval('s')` (the text read as a name: unquoted
 /// parts fold, `"…"` parts keep their case).
@@ -1637,6 +1755,13 @@ fn compare_into(x: &Table, y: &Table, na: &str, nb: &str, ev: &mut Vec<Event>) -
                             at,
                         ));
                     }
+                } else if let Err(w) = default_fits(if tsql_a { a } else { b }, &ct.ty)
+                    .and_then(|_| default_fits(if tsql_a { b } else { a }, &cp.ty))
+                {
+                    ev.push(Event::Unknown(format!(
+                        "the default of column {} is converted to the column's type on storing, which the dialects do differently: {w}",
+                        cx.name.text
+                    )));
                 } else {
                     ev.push(Event::Default {
                         col: cx.name.text.clone(),
