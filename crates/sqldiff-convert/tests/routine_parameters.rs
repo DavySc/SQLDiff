@@ -179,6 +179,35 @@ fn a_bad_file_is_an_error_naming_the_entry() {
             "[\"a.sql\"]\nparameters = [\"@a int -- note\"]\n",
             "not a parameter declaration",
         ),
+        // Text that would end the stand-in header early or hide the body.
+        (
+            "[\"a.sql\"]\nparameters = [\"@a int /*\"]\n",
+            "not a parameter declaration",
+        ),
+        (
+            "[\"a.sql\"]\nparameters = [\"@a int /* note */\"]\n",
+            "not a parameter declaration",
+        ),
+        (
+            "[\"a.sql\"]\nparameters = [\"@a int) AS BEGIN SELECT 1 END /*\"]\n",
+            "not a parameter declaration",
+        ),
+        (
+            "[\"a.sql\"]\nparameters = [\"@a varchar(20\"]\n",
+            "not a parameter declaration",
+        ),
+        (
+            "[\"a.sql\"]\nparameters = [\"@a varchar(5) = 'x\"]\n",
+            "not a parameter declaration",
+        ),
+        (
+            "[\"a.sql\"]\nparameters = [\"@a int, @b int\"]\n",
+            "not a parameter declaration",
+        ),
+        (
+            "[\"a.sql\"]\nparameters = [\"@a int\", \"@A bigint\"]\n",
+            "listed before",
+        ),
         ("[\"a.sql\"]\nparameters = \"@a int\"\n", "list of strings"),
         ("[\"a.sql\"]\nparameter = [\"@a int\"]\n", "unknown key"),
         ("\"a.sql\" = 3\n", "expected a table"),
@@ -210,4 +239,73 @@ fn a_windows_path_in_the_file_still_finds_the_template() {
         "{}",
         t.conversions[0].output
     );
+}
+
+#[test]
+fn declarations_with_defaults_and_inner_commas_are_read() {
+    let fx = Fixture::new(
+        "forms",
+        &[
+            ("procs/body.sql", BODY),
+            (
+                "template-parameters.toml",
+                "[\"procs/body.sql\"]\nparameters = [\"@mode AS decimal(10, 2) = -1\", \"@code varchar(20) = 'a,b;c' OUTPUT\"]\n",
+            ),
+        ],
+    );
+    let t = fx.convert().unwrap();
+    let c = &t.conversions[0];
+    assert!(
+        c.output.contains("p_mode") && c.output.contains("p_code"),
+        "{}",
+        c.output
+    );
+}
+
+/// A stand-in that swallows the body (here a declaration that opens a
+/// comment, which the file check refuses before it gets here) leaves the
+/// template not converted, never a "converted" file of unchanged T-SQL.
+#[test]
+fn a_body_the_stand_in_swallows_is_not_converted() {
+    use sqldiff_convert::{check_template, rewrite_template_with, FragmentKind, StandIns};
+    use sqldiff_core::composition::PlaceholderBasis;
+    use sqldiff_syntax::template::{Compiled, Template, TemplateSyntax};
+    let syntax = Compiled::new(&TemplateSyntax {
+        open: "<%".into(),
+        close: "%>".into(),
+        name_pattern: "[A-Z][A-Z0-9_.]*".into(),
+        special_forms: Vec::new(),
+        ignore_case: false,
+    })
+    .unwrap();
+    let t = Template::parse(BODY, &syntax, None);
+    let stand = StandIns::new([&t]);
+    for parameters in [
+        vec!["@mode int /*".to_string(), "@code varchar(20)".to_string()],
+        vec!["@mode int) AS BEGIN SELECT 1 END /*".to_string()],
+    ] {
+        let d = rewrite_template_with(
+            &t,
+            FragmentKind::RoutineBody,
+            &parameters,
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &stand,
+            None,
+        );
+        let c = check_template(
+            &t,
+            d,
+            &stand,
+            &sqldiff_core::Options::default(),
+            PlaceholderBasis::DeclaredPattern,
+            ("<%", "%>"),
+        );
+        assert!(!c.units.is_empty(), "{parameters:?}: {}", c.output);
+        assert!(
+            c.units.iter().all(|u| u.status > Status::Assumptions),
+            "{parameters:?}: {:#?}",
+            c.units
+        );
+    }
 }

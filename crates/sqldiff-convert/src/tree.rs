@@ -578,21 +578,57 @@ fn parse_routine_parameters(
             _ => return Err(format!("`{key}`: `parameters` must be a list of strings")),
         };
         let mut decls = Vec::new();
+        let mut names = Vec::new();
         for item in list {
             let toml::Value::String(d) = item else {
                 return Err(format!("`{key}`: `parameters` must be a list of strings"));
             };
             let d = d.trim();
-            if !d.starts_with('@') || d.contains('\n') || d.contains(';') || d.contains("--") {
+            let Some(name) = declared_name(d) else {
                 return Err(format!(
-                    "`{key}`: `{d}` is not a parameter declaration (`@name type [OUTPUT]`, one line)"
+                    "`{key}`: `{d}` is not a parameter declaration (`@name type [OUTPUT]`, one line, no comment)"
                 ));
+            };
+            // T-SQL names are case-insensitive: `@a` and `@A` are one parameter.
+            if names.contains(&name) {
+                return Err(format!("`{key}`: `{d}` declares a parameter listed before"));
             }
+            names.push(name);
             decls.push(d.to_string());
         }
         out.insert(rel, decls);
     }
     Ok(out)
+}
+
+/// The name (upper case) a single T-SQL parameter declaration declares, or
+/// `None` when the text is not one: it must start with a variable, lex
+/// cleanly on one line, and hold no comment, `;`, comma or unbalanced
+/// parenthesis outside its own parentheses. The declaration is pasted into a
+/// stand-in header, so anything else could end the header early or hide the
+/// body that follows it.
+fn declared_name(d: &str) -> Option<String> {
+    use sqldiff_syntax::SyntaxKind as K;
+    if d.contains('\n') || d.contains('\r') {
+        return None;
+    }
+    let lexed = sqldiff_syntax::lexer::tokenize(d, Dialect::Tsql);
+    if !lexed.diagnostics.is_empty() {
+        return None;
+    }
+    let mut toks = lexed.tokens.iter().filter(|t| t.kind != K::WHITESPACE);
+    let first = toks.next().filter(|t| t.kind == K::VARIABLE)?;
+    let mut depth = 0usize;
+    for t in toks {
+        match t.kind {
+            K::LINE_COMMENT | K::BLOCK_COMMENT | K::SEMICOLON | K::ERROR_TOKEN => return None,
+            K::L_PAREN => depth += 1,
+            K::R_PAREN => depth = depth.checked_sub(1)?,
+            K::COMMA if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    (depth == 0).then(|| d[first.start..first.end].to_uppercase())
 }
 
 /// Converts templates: every file is split by the placeholder rules, and
