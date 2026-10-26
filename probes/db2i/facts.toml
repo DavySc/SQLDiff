@@ -73,7 +73,7 @@ title = "Common table expressions: forward references and recursion without a co
 review = ["docs/convert-mode.md"]
 
 [[fact]]
-id = "V30"
+id = "V31"
 title = "Casts and literal types: decimal and float to integer, scale, float text, constant types, timestamp precision"
 review = ["crates/sqldiff-core/src/equiv/canon.rs", "eval/casts/README.md"]
 
@@ -158,3 +158,8 @@ hedge = "fact V27, not checked on a real system"
 id = "V29"
 title = "UNIQUE indexes (NULLs, case, trailing blanks), index names and sequence defaults"
 review = ["crates/sqldiff-core/src/equiv/ddl.rs", "docs/cross-dialect-proofs.md"]
+
+[[fact]]
+id = "V30"
+title = "Procedure calls and COMMENT ON: open questions for comparing Db2 for i calls"
+review = ["crates/sqldiff-core/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]

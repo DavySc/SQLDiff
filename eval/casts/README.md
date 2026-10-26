@@ -33,4 +33,4 @@ python3 eval/casts/castmut.py run target/release/sqldiff eval/casts/ground.json 
 | main before (6af78ea) | 12 | 9 | 1 | 17 | 15 | 0 |
 | this change | 17 | 4 | 14 | 19 | 0 | 0 |
 
-If you change a cast rule, add the probe here and run it on both engines first. The Db2 for i questions are in `probes/db2i` (fact V30).
+If you change a cast rule, add the probe here and run it on both engines first. The Db2 for i questions are in `probes/db2i` (fact V31).

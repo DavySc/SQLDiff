@@ -1033,7 +1033,7 @@ impl<'a> Canon<'a> {
     // lowers to. Any other conversion keeps the dialect and the source type
     // (`dcast`), so it equals only itself. Db2 for i conversions are kept only
     // between integers, to wider decimals and for strings that fit; the open
-    // questions are probes V30 (probes/db2i).
+    // questions are probes V31 (probes/db2i).
 
     /// The type of a numeric literal as each dialect reads it: an integer in
     /// int range is int; a larger one is decimal in T-SQL and bigint (then
