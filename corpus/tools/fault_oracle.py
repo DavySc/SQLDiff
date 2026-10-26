@@ -414,6 +414,10 @@ def main():
     for f in failures:
         print(f"FAIL: {f}", file=sys.stderr)
     print(f"{len(report)} pair(s) checked, {len(failures)} failure(s)")
+    if not report:
+        # Nothing checked is not a pass: a moved corpus or a bad filter.
+        print("FAIL: no pair checked", file=sys.stderr)
+        return 1
     return 1 if failures else 0
 
 
