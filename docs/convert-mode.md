@@ -129,7 +129,7 @@ name = "Sales/Composed"
 parts = ["header.sql", { template = "body.tpl.sql", params = { X = "1" } }]
 ```
 
-Values merge manifest, then instance, then part; at each level a dialect's own values win. The names the manifest gives values for are the parameter list for the placeholder rules (`--parameter` adds more). The pack's `[template] include` names the special form that pulls another file in: its first capture is the path, next to the including file first, else from the tree root, never outside it. Any other special form is generator logic the weaver cannot run, and so is a missing value or an include cycle: that instance is **not woven** and nothing about it is claimed.
+Values merge manifest, then instance, then part; at each level a dialect's own values win. The names the manifest gives values for are the parameter list for the placeholder rules (`--parameter` adds more). The pack's `[template] include` names the special form that pulls another file in: its first capture is the path, next to the including file first, else from the tree root, never outside it (a symbolic link that points out of the tree is not followed). Any other special form is generator logic the weaver cannot run, and so is a missing value or an include cycle: that instance is **not woven** and nothing about it is claimed.
 
 Each target instance is checked the way `sqldiff convert` checks its output, with the catalog of every woven instance on its side (and any `--catalog`):
 
@@ -144,6 +144,7 @@ Each target instance is checked the way `sqldiff convert` checks its output, wit
 | A PostgreSQL name over 63 bytes is truncated (`ASM-PG-NAME-TRUNCATED`); two values that truncate to the same name | under assumptions; differs |
 | A Db2 for i name from a value: no verified reserved-word list is built in (`ASM-DB2I-RESERVED-UNCHECKED`) | under assumptions |
 | A `type`, `expression` or `sql` value with no value of its own for the target (`params_for`) (`ASM-TEMPLATE-VALUE-SAME`) | under assumptions |
+| Two instances create the same table or routine (the later one fails or replaces the other; binding used one definition) (`weave.object-twice`) | unknown |
 | The source weave does not parse | unknown |
 
 The woven instances discharge `ASM-TEMPLATE-PLACEHOLDER`, `ASM-TEMPLATE-DIRECTIVE`, `ASM-TEMPLATE-SHARED-VALUES`, `ASM-TEMPLATE-FRAGMENT` and `template.value-per-dialect`: the values are known, the includes and fragments woven in, and each instance woven with its own values. Name checks apply only to `name` values. The status lines `sqldiff convert` wrote into the converted templates are read from the woven target, and the rule assumptions and decisions on them stand, because no instance can check them: an assumption you know holds is accepted with `--accept ID` (listed in the report); a decision or a difference is resolved by hand and its line deleted.

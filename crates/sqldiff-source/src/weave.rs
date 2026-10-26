@@ -425,7 +425,12 @@ impl Weaver<'_> {
             }
         }
         candidates.push(rel);
-        candidates.into_iter().find(|c| self.root.join(c).is_file())
+        // A symbolic link inside the tree may point outside it.
+        let root = std::fs::canonicalize(&self.root).ok()?;
+        candidates.into_iter().find(|c| {
+            std::fs::canonicalize(self.root.join(c))
+                .is_ok_and(|p| p.is_file() && p.starts_with(&root))
+        })
     }
 }
 
@@ -642,5 +647,28 @@ output = "gen/b.sql"
             "{:?}",
             r.problems
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_out_of_the_tree_is_not_followed() {
+        let outside =
+            std::env::temp_dir().join(format!("sqldiff-weave-link-{}.sql", std::process::id()));
+        std::fs::write(&outside, "SELECT 'secret';\n").unwrap();
+        let root = tree("link", &[("t.sql", "<%@include l.sql %>SELECT 1;\n")]);
+        let _ = std::fs::remove_file(root.join("l.sql"));
+        std::os::unix::fs::symlink(&outside, root.join("l.sql")).unwrap();
+        let m = Manifest::parse("[[instance]]\nname = \"t\"\ntemplate = \"t.sql\"\n").unwrap();
+        let p = placeholders();
+        let w = Weaver {
+            root,
+            dialect: Dialect::Tsql,
+            placeholders: &p,
+            include: Some("include".into()),
+            list: None,
+        };
+        let r = w.weave(&m, &m.instances[0]);
+        assert!(!r.text.contains("secret"), "{}", r.text);
+        assert!(!r.problems.is_empty());
     }
 }

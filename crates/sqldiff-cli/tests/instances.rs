@@ -361,9 +361,14 @@ params = { KEYTYPE = "int" }
 params_for.postgres = { KEYTYPE = "integer" }
 
 [[instance]]
+name = "table-other"
+template = "q/table.sql"
+params = { TABLE = "Other" }
+
+[[instance]]
 name = "save-same"
 parts = ["parts/head.sql", "parts/body.sql", "parts/foot.sql"]
-params = { KEYTYPE = "int" }
+params = { KEYTYPE = "int", TABLE = "Other" }
 "#;
 
 #[test]
@@ -462,4 +467,24 @@ fn fragments_pairs_and_value_kinds() {
     let same = instance(&r, "save-same");
     assert_eq!(same["status"], "assumptions", "{same}");
     assert_eq!(rules(same), ["ASM-TEMPLATE-VALUE-SAME"]);
+}
+
+#[test]
+fn an_object_two_instances_create_is_not_decided() {
+    let d = scratch("twice");
+    setup(&d);
+    let m = d.join("instances.toml");
+    let text = std::fs::read_to_string(&m).unwrap();
+    std::fs::write(
+        &m,
+        format!("{text}\n[[instance]]\nname = \"tables/Customer2\"\ntemplate = \"tables/entity.sql\"\nparams = {{ TABLE = \"Customer\" }}\n"),
+    )
+    .unwrap();
+    let (_, r) = instances(&d, &[]);
+    for name in ["tables/Customer", "tables/Customer2"] {
+        let i = instance(&r, name);
+        assert_eq!(i["status"], "unknown", "{i}");
+        assert!(rules(i).contains(&"weave.object-twice".to_string()), "{i}");
+    }
+    assert_eq!(instance(&r, "procs/TouchCustomer")["status"], "converted");
 }

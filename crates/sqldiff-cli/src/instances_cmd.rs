@@ -322,6 +322,50 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
         }
     }
 
+    // An object two target instances create: the catalog holds one of the
+    // definitions, so what binds against it is not decided.
+    let mut creators: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (k, (_, t)) in woven.iter().enumerate() {
+        if !t.problems.is_empty() {
+            continue;
+        }
+        let mut c = sqldiff_core::catalog::Catalog::default();
+        let root = sqldiff_syntax::parse(&t.text, a.to).syntax();
+        sqldiff_core::catalog::ddl::load_tree(&mut c, &root, a.to);
+        let full = |schema: &Option<String>, name: &str| {
+            format!("{}.{name}", schema.as_deref().unwrap_or("")).to_ascii_lowercase()
+        };
+        let mut mine: BTreeSet<String> = BTreeSet::new();
+        mine.extend(c.tables.iter().map(|t| full(&t.schema, &t.name)));
+        mine.extend(
+            c.routines
+                .iter()
+                .map(|r| format!("routine {}", full(&r.schema, &r.name))),
+        );
+        for n in mine {
+            creators.entry(n).or_default().push(k);
+        }
+    }
+    for (name, ks) in creators.iter().filter(|(_, ks)| ks.len() > 1) {
+        let all: Vec<String> = ks
+            .iter()
+            .map(|&k| format!("`{}`", manifest.instances[k].name))
+            .collect();
+        for &k in ks {
+            results[k].0.push(Item {
+                status: Outcome::Unknown,
+                rule: "weave.object-twice".into(),
+                side: "target",
+                line: 0,
+                text: format!(
+                    "`{}` is created by instances {}: the later one fails or replaces the other, and binding against it used one of the definitions",
+                    name.trim_start_matches("routine ").trim_start_matches('.'),
+                    all.join(", ")
+                ),
+            });
+        }
+    }
+
     // Woven files and the per-instance report.
     let mut instances = Vec::new();
     for ((i, (s, t)), (items, engine, _)) in manifest.instances.iter().zip(&woven).zip(results) {

@@ -174,10 +174,12 @@ pub fn check_values(text: &str, dialect: Dialect, values: &[(usize, usize)]) -> 
         };
         match dialect {
             Dialect::Postgres => {
+                // PostgreSQL folds only ASCII letters in a multibyte
+                // encoding (UTF-8): `Ä` stays `Ä`.
                 let folded = if quoted {
                     name.clone()
                 } else {
-                    name.to_lowercase()
+                    name.to_ascii_lowercase()
                 };
                 if !quoted && PG_RESERVED.contains(&folded.as_str()) {
                     out.push(issue(
@@ -275,6 +277,21 @@ mod tests {
         assert_eq!(
             i[0].truncated,
             Some((format!("{v}_lo"), format!("{v}_log")))
+        );
+    }
+
+    #[test]
+    fn only_ascii_letters_fold() {
+        // 31 two-byte letters and `_X`: 64 bytes, kept as written.
+        let v = format!("{}_X", "Ä".repeat(31));
+        let t = format!("CREATE TABLE {v} (id integer);");
+        let i = check_values(&t, Dialect::Postgres, &[at(&t, &v)]);
+        assert_eq!(
+            i[0].truncated,
+            Some((
+                format!("{}_", "Ä".repeat(31)),
+                format!("{}_x", "Ä".repeat(31))
+            ))
         );
     }
 
