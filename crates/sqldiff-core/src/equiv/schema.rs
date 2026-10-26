@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use sqldiff_syntax::{parse, Dialect};
 
 use super::ast::Type;
+use super::literal::Target;
 use crate::artifact::Artifact;
 use crate::catalog::{ddl, Catalog, CatalogView, DataType, TableKind};
 
@@ -168,6 +169,8 @@ pub struct Column {
     pub ty: Ty,
     pub not_null: bool,
     pub identity: bool,
+    /// What a string literal compared with this column converts to.
+    pub target: Option<Target>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -322,6 +325,7 @@ impl Schema {
                     ty: ty_of(&c.data_type, d),
                     not_null: !c.nullable,
                     identity: c.identity,
+                    target: Target::of(&c.data_type.base, &c.data_type.args, d),
                 })
                 .collect();
             let name = t.name.to_lowercase();

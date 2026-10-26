@@ -12,8 +12,8 @@
   --chg-bg: #fff8e1; --chg-tok: #f9e08f; --del-bg: #fdecec; --del-tok: #f6c1c1; --add-bg: #e8f6ec; --add-tok: #b5e3c1; --focus: #4f46e5;
   --kw: #7c3aad; --id: #1d1f21; --var: #a8521c; --num: #0f7a6b; --str: #2f7d1e; --cmt: #8a8f98; --err: #c62828;
   --transactional: #d92d20; --semantic: #dc6803;
-  --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-differs: #d92d20; --s-not_converted: #98a2b3;
-  --b-assumptions: #fff6dc; --b-decision: #eef0ff; --b-differs: #fde8e8; --b-not_converted: #f2f4f7;
+  --s-converted: #12b76a; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-unproven: #e8590c; --s-differs: #d92d20; --s-not_converted: #98a2b3;
+  --b-assumptions: #fff6dc; --b-decision: #eef0ff; --b-unproven: #fff0e6; --b-differs: #fde8e8; --b-not_converted: #f2f4f7;
   --link: rgba(79,70,229,.14); --link-2: rgba(79,70,229,.06);
   --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
 }
@@ -24,8 +24,8 @@
     --chg-bg: #2a2614; --chg-tok: #5a4c1c; --del-bg: #2f1c1c; --del-tok: #5e2a2a; --add-bg: #17291d; --add-tok: #24543a; --focus: #818cf8;
     --kw: #c4a1f0; --id: #e4e6e9; --var: #f0a46a; --num: #5fd3c0; --str: #9bd27a; --cmt: #6b717b; --err: #ff6b6b;
     --transactional: #f97066; --semantic: #fdb022;
-    --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-differs: #f97066; --s-not_converted: #667085;
-    --b-assumptions: #3a3218; --b-decision: #24254a; --b-differs: #3d2222; --b-not_converted: #1e232b;
+    --s-converted: #32d583; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-unproven: #fd853a; --s-differs: #f97066; --s-not_converted: #667085;
+    --b-assumptions: #3a3218; --b-decision: #24254a; --b-unproven: #3d2a1e; --b-differs: #3d2222; --b-not_converted: #1e232b;
     --link: rgba(129,140,248,.2); --link-2: rgba(129,140,248,.08);
   }
 }
@@ -117,6 +117,7 @@ body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !importa
 .ln .tx { white-space: pre; padding-right: 12px; }
 .ln.s-assumptions { background: var(--b-assumptions); }
 .ln.s-decision { background: var(--b-decision); }
+.ln.s-unproven { background: var(--b-unproven); }
 .ln.s-differs { background: var(--b-differs); }
 .ln.s-not_converted { background: var(--b-not_converted); }
 .ln.hov { background-image: linear-gradient(var(--link-2), var(--link-2)); }
@@ -212,6 +213,7 @@ body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !importa
     <tr><td><span class="dot" style="background:var(--s-converted)"></span> converted</td><td>Rules without assumptions; the engine found nothing.</td></tr>
     <tr><td><span class="dot" style="background:var(--s-assumptions)"></span> under assumptions</td><td>Equal if the listed facts hold.</td></tr>
     <tr><td><span class="dot" style="background:var(--s-decision)"></span> needs a decision</td><td>Several faithful targets exist; check the note.</td></tr>
+    <tr><td><span class="dot" style="background:var(--s-unproven)"></span> not proven</td><td>The engine could neither show it equal nor find a difference; check it by hand.</td></tr>
     <tr><td><span class="dot" style="background:var(--s-differs)"></span> differs</td><td>The engine found a difference or leftover T-SQL.</td></tr>
     <tr><td><span class="dot" style="background:var(--s-not_converted)"></span> not converted</td><td>No rule yet; kept as a comment.</td></tr>
   </table>
@@ -229,9 +231,9 @@ body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !importa
 <script>
 const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
 const $ = (id) => document.getElementById(id);
-const LABEL = { converted: "converted", assumptions: "under assumptions", decision: "needs a decision", differs: "differs", not_converted: "not converted" };
-const SHORT = { converted: "converted", assumptions: "assumptions", decision: "decisions", differs: "differs", not_converted: "not converted" };
-const ORDER = ["not_converted", "differs", "decision", "assumptions", "converted"];
+const LABEL = { converted: "converted", assumptions: "under assumptions", decision: "needs a decision", unproven: "not proven", differs: "differs", not_converted: "not converted" };
+const SHORT = { converted: "converted", assumptions: "assumptions", decision: "decisions", unproven: "not proven", differs: "differs", not_converted: "not converted" };
+const ORDER = ["not_converted", "differs", "unproven", "decision", "assumptions", "converted"];
 const state = { data: null, sel: -1, hov: -1, flash: new Set(), split: [], lineUnit: [], seq: 0, shown: 0, lead: null, anchors: [[1, 1]], st: [], accepted: new Set(),
   mode: "convert", from: "tsql", to: "postgres", cmp: null, fsel: -1, diff: null };
 const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
@@ -239,7 +241,7 @@ const hasRules = (f, t) => INITIAL.with_rules.some(([a, b]) => a === f && b === 
 const ACCEPT_KEY = "sqldiff.convert.accepted";
 try { state.accepted = new Set(JSON.parse(localStorage.getItem(ACCEPT_KEY) || "[]")); } catch { /* storage unavailable */ }
 function saveAccepted() { try { localStorage.setItem(ACCEPT_KEY, JSON.stringify([...state.accepted])); } catch { /* ignore */ } }
-const RANK = { converted: 0, assumptions: 1, decision: 2, differs: 3, not_converted: 4 };
+const RANK = { converted: 0, assumptions: 1, decision: 2, unproven: 3, differs: 4, not_converted: 5 };
 const acceptable = (n) => n.status === "assumptions" || n.status === "decision";
 // A unit's status once the viewer has accepted some assumptions: the engine's part always stays.
 function effective(u) {

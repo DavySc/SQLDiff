@@ -26,54 +26,55 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, ChangeClass, Dialect, Options, Verdict};
 use sqldiff_source::compose;
 use sqldiff_source::weave::{Instance, Manifest, Weaver, Woven};
+use sqldiff_syntax::SyntaxKind;
 
 use crate::convert_cmd::{catalog, decode, parallel};
 use crate::source_cmd;
 
-#[derive(ClapArgs)]
+#[derive(ClapArgs, Clone)]
 pub struct InstancesArgs {
     /// The instance manifest (TOML): every result the generator produces,
     /// with its templates and parameter values.
-    manifest: PathBuf,
+    pub(crate) manifest: PathBuf,
     /// The source templates (the tree the generator reads today).
     #[arg(long, value_name = "DIR")]
-    source: PathBuf,
+    pub(crate) source: PathBuf,
     /// The converted templates (`sqldiff convert --template` output, or
     /// templates written by hand), with the same layout.
     #[arg(long, value_name = "DIR")]
-    target: PathBuf,
+    pub(crate) target: PathBuf,
     #[arg(long, default_value = "tsql")]
-    from: Dialect,
+    pub(crate) from: Dialect,
     #[arg(long)]
-    to: Dialect,
+    pub(crate) to: Dialect,
     /// Output directory for the woven instances and the report.
     #[arg(short, long)]
-    out: PathBuf,
+    pub(crate) out: PathBuf,
     /// The generator's own output: each instance's source weave must equal
     /// its `output` file there, and every file there must belong to an
     /// instance.
     #[arg(long, value_name = "DIR")]
-    woven: Option<PathBuf>,
+    pub(crate) woven: Option<PathBuf>,
     /// A parameter name (repeatable), added to the names the manifest gives
     /// values for; under `placeholders = "parameters"` only these are
     /// placeholders.
     #[arg(long = "parameter", value_name = "NAME")]
-    parameters: Vec<String>,
+    pub(crate) parameters: Vec<String>,
     /// An assumption you know holds (repeatable), e.g. ASM-DBO-SCHEMA: a
     /// status line in the converted templates that lists only accepted
     /// assumptions no longer holds an instance back. Listed in the report.
     #[arg(long = "accept", value_name = "ID")]
-    accept: Vec<String>,
+    pub(crate) accept: Vec<String>,
     /// Parallel jobs (default: available cores).
     #[arg(short, long)]
-    jobs: Option<usize>,
+    pub(crate) jobs: Option<usize>,
     /// Replace files in a non-empty output directory.
     #[arg(long)]
-    overwrite: bool,
+    pub(crate) overwrite: bool,
     #[command(flatten)]
-    catalogs: source_cmd::CatalogArgs,
+    pub(crate) catalogs: source_cmd::CatalogArgs,
     #[command(flatten)]
-    cfg: source_cmd::ConfigArgs,
+    pub(crate) cfg: source_cmd::ConfigArgs,
 }
 
 /// How far an instance can be trusted, best first.
@@ -123,7 +124,8 @@ const ORDER: [Outcome; 6] = [
 struct Item {
     status: Outcome,
     rule: String,
-    /// `source` or `target` instance; `manifest` for weaving.
+    /// `source` or `target` instance; `manifest` for weaving; `pair` for
+    /// the diff of the two as a whole.
     side: &'static str,
     /// 1-based line in the woven file, 0 when it has none.
     line: usize,
@@ -173,6 +175,14 @@ struct Report {
 }
 
 pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
+    let ok = check(a)?.0;
+    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+}
+
+/// Runs the check and writes the report: whether every instance is
+/// converted (under assumptions at worst) and all generator output is
+/// accounted for, and the count of instances per status.
+pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, usize>), String> {
     let cfg = a.cfg.resolve()?;
     let def = cfg
         .policy
@@ -181,6 +191,18 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
         .ok_or("instances needs a [template] syntax: give --pack or a sqldiff.toml with one")?;
     let placeholders = compose::Placeholders::new(def).map_err(|e| e.0)?;
     let manifest = Manifest::load(&a.manifest).map_err(|e| e.0)?;
+    let kinds: BTreeMap<String, sqldiff_convert::ValueKind> = def
+        .values
+        .iter()
+        .filter_map(|(n, k)| {
+            let n = if def.ignore_case {
+                n.to_uppercase()
+            } else {
+                n.clone()
+            };
+            Some((n, sqldiff_convert::ValueKind::parse(k)?))
+        })
+        .collect();
     if manifest.instances.is_empty() {
         return Err(format!("{}: no [[instance]]", a.manifest.display()));
     }
@@ -265,6 +287,7 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
             a.to,
             &opts,
             &a.accept,
+            &kinds,
         )
     });
 
@@ -298,6 +321,50 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
                     ),
                 });
             }
+        }
+    }
+
+    // An object two target instances create: the catalog holds one of the
+    // definitions, so what binds against it is not decided.
+    let mut creators: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (k, (_, t)) in woven.iter().enumerate() {
+        if !t.problems.is_empty() {
+            continue;
+        }
+        let mut c = sqldiff_core::catalog::Catalog::default();
+        let root = sqldiff_syntax::parse(&t.text, a.to).syntax();
+        sqldiff_core::catalog::ddl::load_tree(&mut c, &root, a.to);
+        let full = |schema: &Option<String>, name: &str| {
+            format!("{}.{name}", schema.as_deref().unwrap_or("")).to_ascii_lowercase()
+        };
+        let mut mine: BTreeSet<String> = BTreeSet::new();
+        mine.extend(c.tables.iter().map(|t| full(&t.schema, &t.name)));
+        mine.extend(
+            c.routines
+                .iter()
+                .map(|r| format!("routine {}", full(&r.schema, &r.name))),
+        );
+        for n in mine {
+            creators.entry(n).or_default().push(k);
+        }
+    }
+    for (name, ks) in creators.iter().filter(|(_, ks)| ks.len() > 1) {
+        let all: Vec<String> = ks
+            .iter()
+            .map(|&k| format!("`{}`", manifest.instances[k].name))
+            .collect();
+        for &k in ks {
+            results[k].0.push(Item {
+                status: Outcome::Unknown,
+                rule: "weave.object-twice".into(),
+                side: "target",
+                line: 0,
+                text: format!(
+                    "`{}` is created by instances {}: the later one fails or replaces the other, and binding against it used one of the definitions",
+                    name.trim_start_matches("routine ").trim_start_matches('.'),
+                    all.join(", ")
+                ),
+            });
         }
     }
 
@@ -386,12 +453,163 @@ pub fn run(a: InstancesArgs) -> Result<ExitCode, String> {
         .iter()
         .all(|r| r.status <= Outcome::Assumptions)
         && report.not_in_manifest.is_empty();
-    Ok(ExitCode::from(if ok { 0 } else { 1 }))
+    Ok((ok, report.totals))
 }
 
 /// An instance's items, the engine's assumptions about the whole pair, and
 /// the PostgreSQL names over the limit, as (truncated, full).
 type Checked = (Vec<Item>, Vec<String>, Vec<(String, String)>);
+
+/// How the engine's diff says it skipped a `CREATE TABLE`.
+const DDL_TABLE: &str = "a DDL statement `CREATE TABLE";
+
+/// Schemas a dialect resolves an unqualified name in by default, as the
+/// engine's own default-schema assumptions read them: `dbo` on SQL Server,
+/// `public` on PostgreSQL. Db2 for i has none fixed (the current schema).
+fn default_schema(d: Dialect) -> Option<&'static str> {
+    match d {
+        Dialect::Tsql => Some("dbo"),
+        Dialect::Postgres => Some("public"),
+        Dialect::Db2i => None,
+    }
+}
+
+/// A significant token: its kind and its text as compared.
+type Token = (SyntaxKind, String);
+
+/// The significant tokens of `text`: identifiers and keywords in lower
+/// case (unquoted names fold), quoted names as written, no `;`.
+fn tokens(text: &str, d: Dialect) -> Vec<Token> {
+    let root = sqldiff_syntax::parse(text, d).syntax();
+    root.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::SEMICOLON)
+        .map(|t| {
+            let text = if t.kind() == SyntaxKind::QUOTED_IDENT || t.kind() == SyntaxKind::STRING {
+                t.text().to_string()
+            } else {
+                t.text().to_ascii_lowercase()
+            };
+            (t.kind(), text)
+        })
+        .collect()
+}
+
+/// Top-level `CREATE TABLE` statements of `text`, as byte ranges.
+fn create_tables(text: &str, d: Dialect) -> Vec<(usize, usize)> {
+    let root = sqldiff_syntax::parse(text, d).syntax();
+    root.children()
+        .filter(|n| {
+            let mut sig = n
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| !t.kind().is_trivia());
+            let first = sig.next().map(|t| t.text().to_ascii_uppercase());
+            let second = sig.next().map(|t| t.text().to_ascii_uppercase());
+            first.as_deref() == Some("CREATE") && second.as_deref() == Some("TABLE")
+        })
+        .map(|n| {
+            let r = n.text_range();
+            (usize::from(r.start()), usize::from(r.end()))
+        })
+        .collect()
+}
+
+/// A table statement split into its name (schema dropped when it is the
+/// dialect's default) and everything after it.
+fn table_shape(toks: &[Token], d: Dialect) -> Option<(Vec<String>, &[Token])> {
+    // CREATE TABLE name ( ...
+    let open = toks.iter().position(|(k, _)| *k == SyntaxKind::L_PAREN)?;
+    let mut name: Vec<String> = toks[2..open]
+        .iter()
+        .filter(|(k, _)| *k != SyntaxKind::DOT)
+        .map(|(_, t)| t.clone())
+        .collect();
+    if name.len() == 2 && default_schema(d).is_some_and(|s| name[0] == s) {
+        name.remove(0);
+    }
+    Some((name, &toks[open..]))
+}
+
+/// The woven target's tables against what the conversion rules write from
+/// the woven source's tables, in order. Equal tables are as good as
+/// `sqldiff convert`'s own output: the conversion's assumptions become
+/// items (default-schema ones go with the engine's), anything worse than an
+/// assumption keeps the tables undecided. `Err` says why they are not
+/// decided.
+fn tables_by_rules(
+    source: &str,
+    target: &str,
+    from: Dialect,
+    to: Dialect,
+    accepted: &[String],
+) -> Result<(Vec<Item>, Vec<String>), String> {
+    let (st, tt) = (create_tables(source, from), create_tables(target, to));
+    if st.len() != tt.len() {
+        return Err(format!(
+            "the source instance creates {} tables and the target {}",
+            st.len(),
+            tt.len()
+        ));
+    }
+    let conv = sqldiff_convert::convert(source, from, to)?;
+    let mut items = Vec::new();
+    let mut engine = Vec::new();
+    let lines = sqldiff_syntax::LineIndex::new(target);
+    for (k, (&(ss, se), &(ts, te))) in st.iter().zip(&tt).enumerate() {
+        let line = lines.line_col(ts).0;
+        let units: Vec<&sqldiff_convert::Unit> = conv
+            .units
+            .iter()
+            .filter(|u| u.src.start < se && ss < u.src.end)
+            .collect();
+        let [u] = units.as_slice() else {
+            return Err(format!(
+                "table {} (target line {line}): the conversion does not give it as one statement",
+                k + 1
+            ));
+        };
+        if u.status > sqldiff_convert::Status::Assumptions {
+            return Err(format!(
+                "table {} (target line {line}): the conversion rules do not convert the source table ({})",
+                k + 1,
+                u.status.label()
+            ));
+        }
+        let want = tokens(&conv.output[u.out.start..u.out.end], to);
+        let have = tokens(&target[ts..te], to);
+        let same = match (table_shape(&want, to), table_shape(&have, to)) {
+            (Some((wn, wb)), Some((hn, hb))) => wn == hn && wb == hb,
+            _ => false,
+        };
+        if !same {
+            return Err(format!(
+                "table {} (target line {line}) is not the table the conversion rules write from the source table: `{}`",
+                k + 1,
+                conv.output[u.out.start..u.out.end].trim()
+            ));
+        }
+        for n in &u.notes {
+            if n.status != sqldiff_convert::Status::Assumptions {
+                continue;
+            }
+            if n.rule == "ASM-DBO-SCHEMA" {
+                if !engine.contains(&n.rule) {
+                    engine.push(n.rule.clone());
+                }
+            } else if !accepted.contains(&n.rule) {
+                items.push(Item {
+                    status: Outcome::Assumptions,
+                    rule: n.rule.clone(),
+                    side: "target",
+                    line,
+                    text: n.text.clone(),
+                });
+            }
+        }
+    }
+    Ok((items, engine))
+}
 
 /// Checks one instance; also returns the PostgreSQL names its values make
 /// that are over the limit, as (truncated, full), for the collision check.
@@ -405,6 +623,7 @@ fn check_instance(
     to: Dialect,
     opts: &Options,
     accepted: &[String],
+    kinds: &BTreeMap<String, sqldiff_convert::ValueKind>,
 ) -> Checked {
     let mut items = Vec::new();
     let weave = |side, w: &Woven, items: &mut Vec<Item>| {
@@ -531,8 +750,92 @@ fn check_instance(
             text: f.witness.clone(),
         });
     }
-    let engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
-    let spans: Vec<(usize, usize)> = t.values.iter().map(|v| (v.start, v.end)).collect();
+    // What the diff could not compare at all (DDL, say) is not decided
+    // either: no finding about it is no evidence.
+    // Tables the engine cannot compare count only when the target table is
+    // the one the conversion rules write from the source table.
+    let mut engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
+    let tables = report
+        .unknown_reasons
+        .iter()
+        .any(|r| r.contains(DDL_TABLE))
+        .then(|| tables_by_rules(&s.text, &t.text, from, to, accepted));
+    match &tables {
+        Some(Ok((found, asm))) => {
+            items.extend(found.iter().cloned());
+            for a in asm {
+                if !engine.contains(a) {
+                    engine.push(a.clone());
+                }
+            }
+        }
+        Some(Err(why)) => items.push(Item {
+            status: Outcome::Unknown,
+            rule: "ddl.not-as-converted".into(),
+            side: "target",
+            line: 0,
+            text: why.clone(),
+        }),
+        None => {}
+    }
+    for r in &report.unknown_reasons {
+        if r.contains(DDL_TABLE) && matches!(tables, Some(Ok(_))) {
+            continue;
+        }
+        items.push(Item {
+            status: Outcome::Unknown,
+            rule: "equiv.not-covered".into(),
+            side: "pair",
+            line: 0,
+            text: r.clone(),
+        });
+    }
+    if report.verdict == Verdict::Unknown
+        && report.unknown_reasons.is_empty()
+        && !items.iter().any(|x| x.status >= Outcome::Unknown)
+    {
+        items.push(Item {
+            status: Outcome::Unknown,
+            rule: "equiv.unknown".into(),
+            side: "pair",
+            line: 0,
+            text: "the engine's diff of the source and target instances is UNKNOWN".into(),
+        });
+    }
+    // Names: only values that are names. Dialect code given once for every
+    // dialect is used unchanged in the target.
+    let kind = |n: &str| {
+        kinds
+            .get(n)
+            .copied()
+            .unwrap_or(sqldiff_convert::ValueKind::Name)
+    };
+    let spans: Vec<(usize, usize)> = t
+        .values
+        .iter()
+        .filter(|v| kind(&v.name) == sqldiff_convert::ValueKind::Name)
+        .map(|v| (v.start, v.end))
+        .collect();
+    let mut reported = BTreeSet::new();
+    for v in &t.values {
+        if kind(&v.name).per_dialect() && !v.per_dialect && reported.insert(&v.name) {
+            items.push(Item {
+                status: Outcome::Assumptions,
+                rule: "ASM-TEMPLATE-VALUE-SAME".into(),
+                side: "target",
+                line: lines_t.line_col(v.start).0,
+                text: format!(
+                    "{}'s value `{}` is {} code given once for every dialect and used unchanged in {}; give it in params_for.{} if {} needs another",
+                    v.name,
+                    &t.text[v.start..v.end],
+                    kind(&v.name).label(),
+                    to.display_name(),
+                    to.id(),
+                    to.display_name()
+                ),
+            });
+        }
+    }
     let mut names = Vec::new();
     for n in sqldiff_convert::names::check_values(&t.text, to, &spans) {
         if let Some(cut) = &n.truncated {
@@ -543,6 +846,7 @@ fn check_instance(
                 sqldiff_convert::Status::Converted => Outcome::Converted,
                 sqldiff_convert::Status::Assumptions => Outcome::Assumptions,
                 sqldiff_convert::Status::Decision => Outcome::Decision,
+                sqldiff_convert::Status::Unproven => Outcome::Unknown,
                 _ => Outcome::Differs,
             },
             rule: n.rule.to_string(),
@@ -557,10 +861,14 @@ fn check_instance(
 
 /// Assumptions the woven instances discharge: the values are known, the
 /// includes are woven in, and each instance is woven with its own values.
-const DISCHARGED: [&str; 3] = [
+/// A value for dialect code is checked per instance below, and a fragment
+/// is checked in the woven statement.
+const DISCHARGED: [&str; 5] = [
     "ASM-TEMPLATE-PLACEHOLDER",
     "ASM-TEMPLATE-DIRECTIVE",
     "ASM-TEMPLATE-SHARED-VALUES",
+    "ASM-TEMPLATE-FRAGMENT",
+    "template.value-per-dialect",
 ];
 
 /// What `sqldiff convert` left in the converted templates: its status lines
@@ -591,6 +899,10 @@ fn markers(text: &str, accepted: &[String]) -> Vec<Item> {
         let status = match status {
             "under assumptions" => Outcome::Assumptions,
             "needs a decision" => Outcome::Decision,
+            // The engine's diff of the template could not decide the unit;
+            // the diff of each woven instance below decides it again, and
+            // counts every unknown it finds.
+            "not proven" => continue,
             "differs" | "not converted" => Outcome::Differs,
             _ => continue,
         };

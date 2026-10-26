@@ -49,7 +49,7 @@ schema = 1                  # packs newer than the build are rejected
 | `[[dialect_map]]` | `glob`, `dialect`, optional `version`; first match wins |
 | `[dialect_versions]` | Target version per dialect |
 | `ignore` | Globs a tree source skips |
-| `[template]` | Placeholder delimiters, name pattern, special forms, the `include` form, parameter sources, collision rule, generator-supplied `known_parameters` ([templates-and-composition.md](templates-and-composition.md)) |
+| `[template]` | Placeholder delimiters, name pattern, special forms, the `include` form, value kinds (`values`), fragment kinds (`fragments`), routine halves (`pairs`), parameter sources, collision rule, generator-supplied `known_parameters` ([templates-and-composition.md](templates-and-composition.md), [convert-mode.md](convert-mode.md#fragments-routine-halves-and-value-kinds)) |
 | `[[composition]]` | Begin and end line markers of composed parts; named groups `part`, `template`, others become parameters |
 | `[[helpers]]` | Organisation functions for the built-in catalog |
 | `[[author_markers]]` | `kind` (`review_note`, `intentional_difference`, `sync_partner`, `assumption`) and a `pattern` whose first group is the value; see [review-and-export.md](review-and-export.md) |

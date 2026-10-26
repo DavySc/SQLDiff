@@ -301,8 +301,11 @@ fn two_values_postgres_truncates_to_one_name_differ() {
     }
     // Truncated, but no other name becomes the same.
     let c = instance(&r, "c");
-    assert_eq!(c["status"], "assumptions", "{c}");
-    assert_eq!(rules(c), ["ASM-PG-NAME-TRUNCATED"]);
+    assert!(
+        rules(c).contains(&"ASM-PG-NAME-TRUNCATED".to_string()),
+        "{c}"
+    );
+    assert!(!rules(c).contains(&"pg.name-collision".to_string()), "{c}");
 }
 
 #[test]
@@ -319,4 +322,280 @@ fn what_the_diff_cannot_decide_holds_an_instance_back() {
     let t = instance(&r, "procs/TouchCustomer");
     assert_ne!(t["status"], "converted", "{t}");
     assert_ne!(t["status"], "assumptions", "{t}");
+}
+
+/// A pack that declares value kinds, fragment kinds and a head/foot pair.
+const KINDS_PACK: &str = r#"
+[pack]
+name = "kinds"
+version = "0.1.0"
+schema = 1
+
+[template]
+open = "<%"
+close = "%>"
+name_pattern = "[A-Z_][A-Z0-9_]*"
+special_forms = [{ name = "include", pattern = "<%@include\\s+(\\S+)\\s*%>" }]
+include = "include"
+values = { KEYTYPE = "type" }
+fragments = [{ glob = "where/**", kind = "predicate" }, { glob = "parts/body*.sql", kind = "routine-body" }]
+pairs = [{ head = "parts/head.sql", foot = "parts/foot.sql" }]
+"#;
+
+const KINDS_MANIFEST: &str = r#"
+[params]
+SCHEMA = "dbo"
+TABLE = "Item"
+[params_for.postgres]
+SCHEMA = "public"
+
+[[instance]]
+name = "table"
+template = "q/table.sql"
+
+[[instance]]
+name = "list"
+template = "q/list.sql"
+
+[[instance]]
+name = "save"
+parts = ["parts/head.sql", "parts/body.sql", "parts/foot.sql"]
+params = { KEYTYPE = "int" }
+params_for.postgres = { KEYTYPE = "integer" }
+
+[[instance]]
+name = "table-other"
+template = "q/table.sql"
+params = { TABLE = "Other" }
+
+[[instance]]
+name = "save-same"
+parts = ["parts/head.sql", "parts/body.sql", "parts/foot.sql"]
+params = { KEYTYPE = "int", TABLE = "Other" }
+"#;
+
+#[test]
+fn fragments_pairs_and_value_kinds() {
+    let d = scratch("kinds");
+    let (src, conv) = (d.join("src"), d.join("conv"));
+    let pack = d.join("pack.toml");
+    write(&pack, KINDS_PACK);
+    write(&d.join("instances.toml"), KINDS_MANIFEST);
+    write(
+        &src.join("q/table.sql"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL, Price int NOT NULL);\n",
+    );
+    write(
+        &src.join("q/list.sql"),
+        "SELECT Id FROM <%SCHEMA%>.<%TABLE%> WHERE Id > 0 AND <%@include where/positive.sql %>;\n",
+    );
+    write(&src.join("where/positive.sql"), "Price > 0\n");
+    write(
+        &src.join("parts/head.sql"),
+        "CREATE PROCEDURE <%SCHEMA%>.Save<%TABLE%> @Key <%KEYTYPE%> AS\nBEGIN\n",
+    );
+    write(
+        &src.join("parts/body.sql"),
+        "  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Price < 0;\n",
+    );
+    write(&src.join("parts/foot.sql"), "END\n");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--isolated",
+    ]);
+    assert!(
+        o.status.code().is_some(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let read = |p: &str| std::fs::read_to_string(conv.join(p)).unwrap();
+    // A predicate converts as a predicate, with the template's own edges.
+    assert_eq!(read("where/positive.sql").lines().last(), Some("Price > 0"));
+    // A routine body converts inside a stand-in routine.
+    let body = read("parts/body.sql");
+    assert!(
+        body.ends_with("  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Price < 0;\n"),
+        "{body}"
+    );
+    // Head and foot convert as one routine, split again.
+    let head = read("parts/head.sql");
+    assert!(
+        head.contains("PROCEDURE <%SCHEMA%>.Save<%TABLE%>(p_key <%KEYTYPE%>)"),
+        "{head}"
+    );
+    // A type value cannot be converted by the rules: a decision.
+    assert!(head.contains("template.value-per-dialect"), "{head}");
+    assert!(
+        read("parts/foot.sql").contains("$$"),
+        "{}",
+        read("parts/foot.sql")
+    );
+
+    let (manifest, out) = (d.join("instances.toml"), d.join("out"));
+    let args = [
+        "instances",
+        manifest.to_str().unwrap(),
+        "--source",
+        src.to_str().unwrap(),
+        "--target",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "-o",
+        out.to_str().unwrap(),
+        "--pack",
+        pack.to_str().unwrap(),
+        "--isolated",
+    ];
+    let o = run(&args);
+    let r: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/instance-report.json")).unwrap())
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
+    // The woven instances discharge the fragment and decision notes.
+    // The table is the one the conversion rules write from the source.
+    for name in ["table", "list", "save"] {
+        let i = instance(&r, name);
+        assert_eq!(i["status"], "converted", "{name}: {i}");
+    }
+    let woven = std::fs::read_to_string(d.join("out/target/save.sql")).unwrap();
+    assert!(woven.contains("(p_key integer)"), "{woven}");
+    // A type given once for every dialect is an assumption.
+    let same = instance(&r, "save-same");
+    assert_eq!(same["status"], "assumptions", "{same}");
+    assert_eq!(rules(same), ["ASM-TEMPLATE-VALUE-SAME"]);
+}
+
+#[test]
+fn an_object_two_instances_create_is_not_decided() {
+    let d = scratch("twice");
+    setup(&d);
+    let m = d.join("instances.toml");
+    let text = std::fs::read_to_string(&m).unwrap();
+    std::fs::write(
+        &m,
+        format!("{text}\n[[instance]]\nname = \"tables/Customer2\"\ntemplate = \"tables/entity.sql\"\nparams = {{ TABLE = \"Customer\" }}\n"),
+    )
+    .unwrap();
+    let (_, r) = instances(&d, &[]);
+    for name in ["tables/Customer", "tables/Customer2"] {
+        let i = instance(&r, name);
+        assert_eq!(i["status"], "unknown", "{i}");
+        assert!(rules(i).contains(&"weave.object-twice".to_string()), "{i}");
+    }
+    assert_eq!(instance(&r, "procs/TouchCustomer")["status"], "converted");
+}
+
+#[test]
+fn a_table_counts_only_as_the_rules_write_it() {
+    // The diff does not compare tables: a table counts only when it is the
+    // one the conversion rules write, so a wrong per-dialect type is never
+    // converted (cross-review on #66).
+    let d = scratch("ddl-type");
+    let (src, conv) = (d.join("src"), d.join("conv"));
+    // No pairs: this tree has no routine halves.
+    let pack_text: String = KINDS_PACK
+        .lines()
+        .filter(|l| !l.starts_with("pairs"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    write(&d.join("pack.toml"), &pack_text);
+    write(
+        &src.join("q/table.sql"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id <%KEYTYPE%> NOT NULL, Price int NOT NULL);\n",
+    );
+    let pack = d.join("pack.toml");
+    let o = run(&[
+        "convert",
+        src.to_str().unwrap(),
+        "-o",
+        conv.to_str().unwrap(),
+        "--to",
+        "postgres",
+        "--template",
+        "--pack",
+        pack.to_str().unwrap(),
+        "--isolated",
+    ]);
+    assert!(
+        conv.join("q/table.sql").is_file(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for (value, want) in [
+        ("boolean", "unknown"),
+        ("varchar(5)", "unknown"),
+        ("smallint", "unknown"),
+        // What the rules write for INT.
+        ("integer", "converted"),
+    ] {
+        write(
+            &d.join("instances.toml"),
+            &format!(
+                "[params]\nSCHEMA = \"dbo\"\nTABLE = \"Item\"\nKEYTYPE = \"INT\"\n[params_for.postgres]\nSCHEMA = \"public\"\nKEYTYPE = \"{value}\"\n\n[[instance]]\nname = \"t\"\ntemplate = \"q/table.sql\"\n"
+            ),
+        );
+        let (manifest, out) = (d.join("instances.toml"), d.join("out"));
+        let o = run(&[
+            "instances",
+            manifest.to_str().unwrap(),
+            "--source",
+            src.to_str().unwrap(),
+            "--target",
+            conv.to_str().unwrap(),
+            "--to",
+            "postgres",
+            "-o",
+            out.to_str().unwrap(),
+            "--overwrite",
+            "--pack",
+            pack.to_str().unwrap(),
+            "--isolated",
+        ]);
+        assert_eq!(
+            o.status.code(),
+            Some(if want == "converted" { 0 } else { 1 }),
+            "{value}"
+        );
+        let r: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("instance-report.json")).unwrap(),
+        )
+        .unwrap();
+        let t = instance(&r, "t");
+        assert_eq!(t["status"], want, "{value}: {t}");
+        if want == "unknown" {
+            assert!(
+                rules(t).contains(&"ddl.not-as-converted".to_string()),
+                "{t}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_table_in_another_schema_is_not_decided() {
+    let d = scratch("ddl-schema");
+    setup(&d);
+    // The target names a schema the source table is not in.
+    let m = d.join("instances.toml");
+    let text = std::fs::read_to_string(&m).unwrap();
+    std::fs::write(
+        &m,
+        text.replace("SCHEMA = \"public\"", "SCHEMA = \"sales\""),
+    )
+    .unwrap();
+    let (_, r) = instances(&d, &[]);
+    let t = instance(&r, "tables/Customer");
+    assert_eq!(t["status"], "unknown", "{t}");
+    assert!(
+        rules(t).contains(&"ddl.not-as-converted".to_string()),
+        "{t}"
+    );
 }

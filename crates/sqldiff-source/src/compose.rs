@@ -501,6 +501,9 @@ mod tests {
             placeholders: None,
             unquoted_name_pattern: None,
             include: None,
+            values: Default::default(),
+            fragments: vec![],
+            pairs: vec![],
         };
         let mut c = Composition::from_spans(
             "x",
