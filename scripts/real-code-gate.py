@@ -50,11 +50,13 @@ def main():
         counts = collections.Counter()
         for p in src["paths"]:
             base = os.path.join(dest, p["path"])
+            seen = 0
             for dp, dirs, fs in os.walk(base):
                 dirs[:] = sorted(d for d in dirs if d != ".git")
                 for f in sorted(fs):
                     if not f.lower().endswith(".sql"):
                         continue
+                    seen += 1
                     path = os.path.join(dp, f)
                     rel = os.path.relpath(path, dest)
                     try:
@@ -76,11 +78,14 @@ def main():
                         if x["verdict"] == "different":
                             line = (x.get("a") or {}).get("start_line")
                             failures.append(f"{src['name']}/{rel}:{line}: {x['rule']}: {x['witness']}")
+            # A moved or emptied path must not pass by checking nothing.
+            if seen == 0:
+                failures.append(f"{src['name']}/{p['path']}: no .sql files found")
         totals.update(counts)
         print(f"{src['name']}: {dict(sorted(counts.items()))}")
     print(f"total: {dict(sorted(totals.items()))}")
     if failures:
-        print(f"\n{len(failures)} `different` finding(s) on unmodified real code:")
+        print(f"\n{len(failures)} failure(s): `different` findings on unmodified real code, or sources with nothing to check:")
         for f in failures:
             print("  " + f)
         sys.exit(1)
