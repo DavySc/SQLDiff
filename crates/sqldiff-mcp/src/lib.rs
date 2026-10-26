@@ -1521,6 +1521,9 @@ fn units_text(f: &tree::FileReport, max: usize) -> String {
     for p in &f.unplaced {
         t.push_str(&format!("  outside any unit: differs {p}\n"));
     }
+    for p in &f.unproven {
+        t.push_str(&format!("  outside any unit: not proven {p}\n"));
+    }
     t
 }
 

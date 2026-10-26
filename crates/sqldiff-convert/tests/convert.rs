@@ -1113,7 +1113,9 @@ fn dialect_code_values_need_a_value_per_dialect() {
         },
     );
     let u = &c.units[0];
-    assert_eq!(u.status, Status::Decision, "{:?}", u.notes);
+    // A placeholder type is no type the engine can compare: not proven, and
+    // a decision besides.
+    assert_eq!(u.status, Status::Unproven, "{:?}", u.notes);
     let n = u
         .notes
         .iter()

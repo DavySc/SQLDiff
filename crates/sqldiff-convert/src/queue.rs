@@ -93,7 +93,8 @@ pub enum Kind {
     Unit,
     /// An object several units fail to bind on (`units` lists them).
     MissingObject,
-    /// A gating output finding outside any unit of a file.
+    /// A gating output finding, or something the engine did not compare,
+    /// outside any unit of a file.
     Unplaced,
     /// A template judged by its woven instances.
     Template,
@@ -241,6 +242,30 @@ pub fn build(r: &Report, inst: Option<&Instances>, all: bool) -> Queue {
                 reason: format!(
                     "{} output finding(s) outside any unit: the file cannot count as converted",
                     f.unplaced.len()
+                ),
+                units: Vec::new(),
+                instances: blast(&f.path),
+                failing_instances: Vec::new(),
+                open: Vec::new(),
+                written_by: None,
+                outdated: false,
+            });
+        }
+        if !f.unproven.is_empty() {
+            items.push(Item {
+                key: format!("unproven:{}", f.path),
+                tier: 2,
+                kind: Kind::Unplaced,
+                path: f.path.clone(),
+                unit: None,
+                src_line: 0,
+                out_line: 0,
+                status: Status::Unproven.label().to_string(),
+                rules: vec![crate::NOT_COMPARED.to_string()],
+                reason: format!(
+                    "the engine did not compare {} thing(s) outside any unit: {}",
+                    f.unproven.len(),
+                    f.unproven.join("; ")
                 ),
                 units: Vec::new(),
                 instances: blast(&f.path),

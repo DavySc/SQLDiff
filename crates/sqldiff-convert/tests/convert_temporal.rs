@@ -40,9 +40,32 @@ fn in_tree(text: &str, files: &[&str]) -> Conversion {
     check(text, d, &Options::default())
 }
 
+/// The rules' own verdict on a unit the engine did not compare: the unit is
+/// not proven, and this is the worst of its other notes.
+fn rules_only(u: &sqldiff_convert::Unit) -> Status {
+    assert_eq!(u.status, Status::Unproven, "{:?}", u.notes);
+    assert!(
+        u.notes
+            .iter()
+            .any(|n| n.rule == sqldiff_convert::NOT_COMPARED),
+        "{:?}",
+        u.notes
+    );
+    u.notes
+        .iter()
+        .filter(|n| n.rule != sqldiff_convert::NOT_COMPARED)
+        .map(|n| n.status)
+        .max()
+        .unwrap_or(Status::Converted)
+}
+
 fn rules(c: &Conversion) -> Vec<&str> {
     c.units[0].notes.iter().map(|n| n.rule.as_str()).collect()
 }
+
+// The engine does not compare a system-versioned table and its history
+// triggers with the original yet: these units are not proven, and the tests
+// check the rules' own verdict.
 
 #[test]
 fn a_system_versioned_table_gets_a_history_trigger() {
@@ -50,7 +73,7 @@ fn a_system_versioned_table_gets_a_history_trigger() {
     let o = &c.output;
     assert_eq!(c.units.len(), 1, "{o}");
     assert_eq!(
-        c.units[0].status,
+        rules_only(&c.units[0]),
         Status::Assumptions,
         "{:?}",
         c.units[0].notes
@@ -105,7 +128,7 @@ fn the_history_table_is_checked_against_the_tree() {
     // Same columns, same order: nothing to assume.
     let c = in_tree(MAIN, &[MAIN, ARCHIVE]);
     assert_eq!(
-        c.units[0].status,
+        rules_only(&c.units[0]),
         Status::Assumptions,
         "{:?}",
         c.units[0].notes
@@ -215,7 +238,7 @@ fn what_has_no_exact_equivalent_is_refused() {
         "SYSTEM_VERSIONING = ON (HISTORY_TABLE = s.h, HISTORY_RETENTION_PERIOD = INFINITE)",
     ));
     assert_eq!(
-        c.units[0].status,
+        rules_only(&c.units[0]),
         Status::Assumptions,
         "{:?}",
         c.units[0].notes
