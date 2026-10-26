@@ -1,8 +1,7 @@
 use sqldiff_convert::review::{
-    review_file, unit_ids, By, Ledger, Record, State, UnitReview, LEDGER_FILE,
+    file_hash, review_file, unit_ids, By, Ledger, Record, State, UnitReview, LEDGER_FILE,
 };
 use sqldiff_convert::{convert, Conversion, Status};
-use sqldiff_core::artifact::content_hash;
 use sqldiff_core::Dialect;
 
 const PATH: &str = "procs/p.sql";
@@ -55,8 +54,8 @@ fn record(input: &str, c: &Conversion, unit: &str, rule: &str, state: State, by:
         author: "Davy".into(),
         reason: "checked against the schema".into(),
         at: "2026-10-26T10:00:00Z".into(),
-        input_hash: content_hash(input),
-        output_hash: content_hash(&c.output),
+        input_hash: file_hash(input),
+        output_hash: file_hash(&c.output),
     }
 }
 
@@ -228,4 +227,65 @@ fn identical_units_in_one_file_get_distinct_ids() {
     assert_eq!(ids.len(), 2);
     assert_ne!(ids[0], ids[1]);
     assert_eq!(ids[1], format!("{}~2", ids[0]));
+}
+
+#[test]
+fn one_persons_rejection_is_never_replaced_by_anothers_approval() {
+    let c = pg(ASSUMING);
+    let (i, id, _) = at(ASSUMING, &c, "UPDATE");
+    let accept_all = |author: &str| -> Vec<Record> {
+        c.units[i]
+            .notes
+            .iter()
+            .filter_map(|n| {
+                match n.status {
+                    Status::Assumptions => Some(State::Accepted),
+                    Status::Decision => Some(State::Picked),
+                    _ => None,
+                }
+                .map(|s| {
+                    let mut r = record(ASSUMING, &c, &id, &n.rule, s, By::Human);
+                    r.author = author.into();
+                    r
+                })
+            })
+            .collect()
+    };
+    let mut ann_ok = record(ASSUMING, &c, &id, "", State::Approved, By::Human);
+    ann_ok.author = "Ann".into();
+    let mut bob_no = record(ASSUMING, &c, &id, "", State::Rejected, By::Human);
+    bob_no.author = "Bob".into();
+    bob_no.at = "2026-10-26T12:00:00Z".into();
+
+    // Bob's rejection, then Ann's approval appended later: still open.
+    let mut recs = accept_all("Ann");
+    recs.push(bob_no.clone());
+    recs.push(ann_ok.clone());
+    let r = review(ASSUMING, &c, recs);
+    assert!(!r[i].reviewed, "{:?}", r[i]);
+    assert!(r[i]
+        .decisions
+        .iter()
+        .any(|a| a.current && a.record.author == "Bob" && a.record.state == State::Rejected));
+
+    // Bob changing his own verdict clears his rejection.
+    let mut bob_ok = ann_ok.clone();
+    bob_ok.author = "Bob".into();
+    let mut recs = accept_all("Ann");
+    recs.extend([bob_no, ann_ok, bob_ok]);
+    let r = review(ASSUMING, &c, recs);
+    assert_eq!(r[i].reviewed, r[i].undischargeable.is_empty(), "{:?}", r[i]);
+}
+
+#[test]
+fn trailing_blanks_outdate_decisions_and_unplaced_findings_hold_the_file() {
+    assert_ne!(file_hash("SELECT 'a  ';\n"), file_hash("SELECT 'a';\n"));
+    let src = "SELECT 1 AS x;\n";
+    let c = pg(src);
+    let f = review_file(PATH, src, &c, &Ledger::default());
+    assert!(f.unplaced.is_empty());
+    assert!(
+        !f.reviewed(),
+        "a converted unit nobody approved is not reviewed"
+    );
 }

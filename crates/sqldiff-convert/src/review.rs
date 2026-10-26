@@ -17,14 +17,18 @@
 //! until a person approves it.
 //!
 //! The file is JSON lines, one [`Record`] per line, appended; for a unit,
-//! rule and author kind the last record wins, so concurrent appends merge
-//! like any text file.
+//! rule and author the last record wins, so concurrent appends merge like
+//! any text file. One person's verdict never replaces another's: a current
+//! rejection by anyone keeps the unit open, whoever approved it.
+//!
+//! `by` is whatever the line says, so the guarantees about agents hold only
+//! where records are built: a writer (CLI, GUI, MCP) sets `by` itself and
+//! never takes it from its caller.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqldiff_core::artifact::content_hash;
 use sqldiff_core::model::hex;
 
 use crate::{Conversion, Status, Unit};
@@ -92,17 +96,17 @@ pub struct Record {
     pub reason: String,
     /// When (RFC 3339), as the caller gives it.
     pub at: String,
-    /// [`content_hash`] of the whole input file and output file the decision
+    /// [`file_hash`] of the whole input file and output file the decision
     /// was made on.
     pub input_hash: String,
     pub output_hash: String,
 }
 
 /// The decisions read from a ledger, last record per (unit, rule, state
-/// family, author kind) winning.
+/// family, author kind, author) winning.
 #[derive(Debug, Clone, Default)]
 pub struct Ledger {
-    records: BTreeMap<(String, String, Family, By), Record>,
+    records: BTreeMap<(String, String, Family, By, String), Record>,
     /// Lines that did not parse, or records that are not allowed (an agent
     /// accepting an assumption, a decision without a reason), with why.
     pub rejected_lines: Vec<String>,
@@ -150,7 +154,13 @@ impl Ledger {
     /// fits the unit is decided when it is applied).
     pub fn insert(&mut self, r: Record) -> Result<(), String> {
         allowed(&r)?;
-        let key = (r.unit.clone(), r.rule.clone(), family(r.state), r.by);
+        let key = (
+            r.unit.clone(),
+            r.rule.clone(),
+            family(r.state),
+            r.by,
+            r.author.trim().to_string(),
+        );
         self.records.insert(key, r);
         Ok(())
     }
@@ -197,6 +207,13 @@ pub fn allowed(r: &Record) -> Result<(), String> {
         return Err(format!("`{}` needs a reason", r.state.label()));
     }
     Ok(())
+}
+
+/// The hash a record keeps of a whole file: SHA-256 of its exact bytes, so
+/// any change at all (trailing blanks inside a string literal included)
+/// outdates the decisions made on it.
+pub fn file_hash(text: &str) -> String {
+    hex(&Sha256::digest(text.as_bytes()))
 }
 
 /// A unit's id: its file, its input text and its output text. Units with the
@@ -266,6 +283,10 @@ pub struct UnitReview {
 pub struct FileReview {
     pub path: String,
     pub units: Vec<UnitReview>,
+    /// Gating findings of the output check that point into no unit (their
+    /// rules). While there is any, the file is not reviewed, whatever its
+    /// units say.
+    pub unplaced: Vec<String>,
     /// Records for this file whose unit no longer exists (its text changed).
     pub orphaned: Vec<Record>,
 }
@@ -275,7 +296,7 @@ pub struct FileReview {
 /// checked.
 pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> FileReview {
     let ids = unit_ids(path, input, c);
-    let (ih, oh) = (content_hash(input), content_hash(&c.output));
+    let (ih, oh) = (file_hash(input), file_hash(&c.output));
     let mut units = Vec::new();
     for (u, id) in c.units.iter().zip(&ids) {
         let mut decisions: Vec<Applied> = ledger
@@ -302,9 +323,16 @@ pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> 
         .filter(|r| r.path == path && !ids.contains(&r.unit))
         .cloned()
         .collect();
+    let unplaced = c
+        .unplaced
+        .iter()
+        .filter_map(|&i| c.output_check.findings.get(i))
+        .map(|f| f.rule.clone())
+        .collect();
     FileReview {
         path: path.to_string(),
         units,
+        unplaced,
         orphaned,
     }
 }
@@ -348,8 +376,13 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
             }
         }
     }
+    // The status and the engine's part as backstops: a raised status is never
+    // discharged, whatever notes it came with.
     if u.checked != Status::Converted && undischargeable.is_empty() {
         undischargeable.push(format!("engine: {}", u.checked.label()));
+    }
+    if u.status >= Status::Unproven && undischargeable.is_empty() {
+        undischargeable.push(format!("status: {}", u.status.label()));
     }
     let written_by = decisions
         .iter()
@@ -376,5 +409,12 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
         written_by,
         reviewed,
         decisions,
+    }
+}
+
+impl FileReview {
+    /// Every unit reviewed and nothing unplaced.
+    pub fn reviewed(&self) -> bool {
+        self.unplaced.is_empty() && self.units.iter().all(|u| u.reviewed)
     }
 }
