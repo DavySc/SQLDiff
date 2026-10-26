@@ -22,6 +22,10 @@ const KNOWN_MISSES: &[(&str, &str, &str)] = &[
     ("m04-lock-on-missing-row", "original", "mutated"),
     // Same-dialect mutations outside statement equivalence (lints).
     ("m14-terminator-before-throw", "original", "mutated"),
+    // Db2 for i variable types are not compared until the IBM i probes
+    // verify how a VARCHAR variable takes a longer value (equiv/script.rs).
+    ("p03-lookup-by-key", "tsql", "db2i"),
+    ("p03-lookup-by-key", "pg", "db2i"),
 ];
 
 fn corpus() -> Option<PathBuf> {

@@ -4208,6 +4208,7 @@ impl Ctx<'_> {
                     v => Obs::Value(v),
                 })
             }
+            Stmt::Message(_) => unsupported("a message"),
             Stmt::Return(None) => Ok(Obs::Value(V::Null)),
             Stmt::Insert {
                 target,

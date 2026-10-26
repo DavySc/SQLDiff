@@ -112,6 +112,11 @@ pub struct Column {
     pub identity: bool,
     #[serde(default)]
     pub has_default: bool,
+    /// The database computes the value and rejects one written by a
+    /// statement: T-SQL computed and GENERATED ALWAYS AS ROW START / END
+    /// columns, PostgreSQL GENERATED ALWAYS AS (expr).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collation: Option<String>,
 }

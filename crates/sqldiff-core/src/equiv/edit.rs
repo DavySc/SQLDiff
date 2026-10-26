@@ -4166,6 +4166,7 @@ fn observable(
                         )),
                     }
                 }
+                Stmt::Message(_) => Err("a message is not compared by value".into()),
                 Stmt::Return(_) => Ok((
                     format!(
                         "A returns {} and B returns {}.",

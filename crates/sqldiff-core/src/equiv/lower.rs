@@ -69,6 +69,10 @@ pub struct Param {
 pub struct Local {
     pub name: String,
     pub ty: Option<Ty>,
+    /// The type as declared (`ty` folds precisions and lengths away).
+    pub decl: Option<Type>,
+    /// The declaring statement.
+    pub node: SyntaxNode,
 }
 
 /// One data statement of the body.
@@ -122,11 +126,18 @@ pub struct Unit {
     pub non_volatile: Option<String>,
     /// Byte range of the routine header up to its name, for findings.
     pub header_at: (usize, usize),
+    /// The statements run as one unit that stops at the first unhandled
+    /// error: a routine, a PostgreSQL DO block, a Db2 for i compound
+    /// statement. Plain script statements run one by one, and the client
+    /// decides whether a failed one stops the script.
+    pub in_block: bool,
+    /// Identities of `locals` across the two sides, when they are matched by
+    /// name instead of declaration order (`script::name_locals`).
+    pub local_ids: Option<Vec<String>>,
 }
 
-pub fn lower(a: &Analyzed) -> Unit {
-    let d = a.dialect();
-    let mut u = Unit {
+fn empty(d: Dialect) -> Unit {
+    Unit {
         dialect: d,
         kind: UnitKind::Script,
         params: Vec::new(),
@@ -148,7 +159,14 @@ pub fn lower(a: &Analyzed) -> Unit {
         sets_config: false,
         non_volatile: None,
         header_at: (0, 0),
-    };
+        in_block: false,
+        local_ids: None,
+    }
+}
+
+pub fn lower(a: &Analyzed) -> Unit {
+    let d = a.dialect();
+    let mut u = empty(d);
     let routines: Vec<SyntaxNode> = a
         .root
         .descendants()
@@ -157,6 +175,7 @@ pub fn lower(a: &Analyzed) -> Unit {
     match routines.as_slice() {
         [] => walk(&a.root, &mut u),
         [r] => {
+            u.in_block = true;
             header(r, &mut u);
             // Statements outside the routine (other than batch separators) are
             // not covered, except the tables it creates, compared table against
@@ -214,6 +233,134 @@ pub fn lower(a: &Analyzed) -> Unit {
     if let [r] = routines.as_slice() {
         super::options::body_checks(r, &mut u);
     }
+    place_txn(&mut u);
+    u
+}
+
+/// One part of a script that runs as a whole: a T-SQL batch that needs
+/// variables or control flow, a PostgreSQL DO block, a Db2 for i compound
+/// statement (`block`), or the plain statements between them.
+#[derive(Debug, Clone)]
+pub struct Segment {
+    pub nodes: Vec<SyntaxNode>,
+    pub block: bool,
+}
+
+/// A script's segments in order; `None` when the artifact holds a routine
+/// (other than a DO block) or a PostgreSQL DO block in another language.
+/// Consecutive plain T-SQL batches form one segment, as do consecutive plain
+/// statements on the other side: a conversion turns a T-SQL batch with
+/// variables or control flow into one block and leaves the others' statements
+/// as they are.
+pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
+    let d = a.dialect();
+    let mut out: Vec<Segment> = Vec::new();
+    let mut push = |nodes: Vec<SyntaxNode>, block: bool| {
+        if nodes.is_empty() {
+            return;
+        }
+        match out.last_mut() {
+            Some(last) if !block && !last.block => last.nodes.extend(nodes),
+            _ => out.push(Segment { nodes, block }),
+        }
+    };
+    let top: Vec<SyntaxNode> = cst::structural_children(&a.root);
+    if d == Dialect::Tsql {
+        if a.root
+            .descendants()
+            .any(|n| n.kind() == SyntaxKind::ROUTINE)
+        {
+            return None;
+        }
+        let batches: Vec<SyntaxNode> = if top.iter().any(|n| n.kind() == SyntaxKind::BATCH) {
+            top
+        } else {
+            vec![a.root.clone()]
+        };
+        for b in batches {
+            let nodes = cst::structural_children(&b);
+            let block = nodes.iter().any(tsql_block);
+            push(nodes, block);
+        }
+        return Some(out);
+    }
+    for n in top.into_iter().flat_map(|n| {
+        if n.kind() == SyntaxKind::BATCH {
+            cst::structural_children(&n)
+        } else {
+            vec![n]
+        }
+    }) {
+        match n.kind() {
+            SyntaxKind::ROUTINE if d == Dialect::Postgres => {
+                let words: Vec<String> = cst::header_tokens(&n)
+                    .iter()
+                    .map(|t| t.text().to_ascii_uppercase())
+                    .filter(|w| w != ";")
+                    .collect();
+                let plpgsql = match words.as_slice() {
+                    [w] => w == "DO",
+                    [w, l, x] | [w, x, l] if l == "LANGUAGE" => w == "DO" && x == "PLPGSQL",
+                    _ => false,
+                };
+                if !plpgsql {
+                    return None;
+                }
+                let body: Vec<SyntaxNode> = n
+                    .children()
+                    .filter(|c| c.kind() == SyntaxKind::ROUTINE_BODY)
+                    .collect();
+                if body.len() != 1 {
+                    return None;
+                }
+                push(body, true);
+            }
+            SyntaxKind::ROUTINE => return None,
+            SyntaxKind::BLOCK if d == Dialect::Db2i => push(vec![n], true),
+            _ => push(vec![n], false),
+        }
+    }
+    Some(out)
+}
+
+/// Whether a T-SQL statement needs a block to run elsewhere: control flow,
+/// a declaration, a message or a variable (not `@@` functions, not
+/// `EXEC p @name = …` parameter names).
+fn tsql_block(n: &SyntaxNode) -> bool {
+    if matches!(
+        n.kind(),
+        SyntaxKind::IF_STMT | SyntaxKind::LOOP_STMT | SyntaxKind::TRY_CATCH | SyntaxKind::BLOCK
+    ) {
+        return true;
+    }
+    let ts = tokens(n);
+    let first = ts.first().map(|t| t.up.as_str()).unwrap_or("");
+    if matches!(
+        first,
+        "DECLARE" | "PRINT" | "RETURN" | "THROW" | "BREAK" | "CONTINUE"
+    ) {
+        return true;
+    }
+    let exec = matches!(first, "EXEC" | "EXECUTE");
+    ts.iter().enumerate().any(|(i, t)| {
+        t.kind == K::Var
+            && !t.text.starts_with("@@")
+            && !(exec && ts.get(i + 1).is_some_and(|x| x.text == "="))
+    })
+}
+
+/// Lowers one segment of a script.
+pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
+    let mut u = empty(d);
+    u.in_block = seg.block && d != Dialect::Tsql;
+    for n in &seg.nodes {
+        unit(n, &mut u);
+    }
+    place_txn(&mut u);
+    u
+}
+
+fn place_txn(u: &mut Unit) {
     // The transaction protocol is understood only as BEGIN before the first
     // data statement and COMMIT after the last one (RETURN aside).
     let data: Vec<(usize, bool)> = u
@@ -237,7 +384,6 @@ pub fn lower(a: &Analyzed) -> Unit {
                 .push((node, format!("{} between data statements", kind.label())));
         }
     }
-    u
 }
 
 fn header(r: &SyntaxNode, u: &mut Unit) {
@@ -494,6 +640,15 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     let kind = stmt_kind(c, d);
     let words = cst::first_words(c, 3);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    if let Some(ast) = message(c, d) {
+        u.stmts.push(LStmt {
+            node: c.clone(),
+            toks: tokens(c),
+            ast,
+            from_declare: false,
+        });
+        return;
+    }
     match kind {
         StmtKind::Select
         | StmtKind::Insert
@@ -510,6 +665,8 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 u.locals.push(Local {
                     name: name.trim_start_matches('@').to_lowercase(),
                     ty: ty.as_ref().map(|t| Ty::from_type(t, d, false)),
+                    decl: ty.clone(),
+                    node: c.clone(),
                 });
                 let Some(init) = default else { return };
                 // `DECLARE @x T = v` is an assignment of the initial value.
@@ -619,6 +776,47 @@ fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }
 
+/// T-SQL `PRINT e`; PostgreSQL `RAISE NOTICE '%', e` or `RAISE NOTICE 'text'`
+/// (no placeholder). `None` for any other statement; an error for a message
+/// whose form is not read.
+fn message(c: &SyntaxNode, d: Dialect) -> Option<Result<Stmt, String>> {
+    let toks: Vec<Tok> = tokens(c)
+        .into_iter()
+        .filter(|t| t.kind != K::Semi)
+        .collect();
+    let rest = match (d, toks.first().map(|t| t.up.as_str())) {
+        (Dialect::Tsql, Some("PRINT")) => &toks[1..],
+        (Dialect::Postgres, Some("RAISE")) if toks.get(1).is_some_and(|t| t.up == "NOTICE") => {
+            &toks[2..]
+        }
+        _ => return None,
+    };
+    let expr = |ts: &[Tok]| -> Result<super::ast::Expr, String> {
+        let mut p = Parser::new(ts, d);
+        let e = p.expr()?;
+        if p.at_end() {
+            Ok(e)
+        } else {
+            Err("trailing tokens after the message".into())
+        }
+    };
+    Some((|| {
+        if d == Dialect::Tsql {
+            return Ok(Stmt::Message(expr(rest)?));
+        }
+        let parts = split_commas(rest);
+        let fmt = match parts.first().map(|p| expr(p)) {
+            Some(Ok(super::ast::Expr::Str(f))) => f,
+            _ => return Err("RAISE NOTICE without a format string".into()),
+        };
+        match parts.as_slice() {
+            [_] if !fmt.contains('%') => Ok(Stmt::Message(super::ast::Expr::Str(fmt))),
+            [_, arg] if fmt == "%" => Ok(Stmt::Message(expr(arg)?)),
+            _ => Err("a RAISE NOTICE format other than '%' with one value".into()),
+        }
+    })())
+}
+
 fn note(u: &mut Unit, s: &str) {
     if !u.notes.iter().any(|x| x == s) {
         u.notes.push(s.to_string());
@@ -649,6 +847,8 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
     u.locals.push(Local {
         name: name.clone(),
         ty: Some(Ty::from_type(&ty, d, false)),
+        decl: Some(ty.clone()),
+        node: s.clone(),
     });
     let rest = &toks[at..];
     if rest.is_empty() {
