@@ -15,7 +15,7 @@ that were loaded, with content hashes (`sqldiff config` shows them).
 | Shared packs | `packs = [...]` in project or user config |
 | Private packs | `private_packs = [...]` in config, then `--pack PATH` |
 | Project config | `--config FILE`, else `sqldiff.toml` in the working directory or a parent |
-| User config | `--user-config FILE`, else `$SQLDIFF_CONFIG`, else `~/.config/sqldiff/config.toml` (`%APPDATA%\sqldiff\config.toml`) |
+| User config | `--user-config FILE`, else `$SQLDIFF_CONFIG`, else `config/config.toml` beside the executable (a colleague bundle, [distribution.md](distribution.md)), else `~/.config/sqldiff/config.toml` (`%APPDATA%\sqldiff\config.toml`) |
 | Command line | `--assume ID=TEXT`, `--dialect-version DIALECT=VERSION` |
 
 `--isolated` skips project and user files not named on the command line.

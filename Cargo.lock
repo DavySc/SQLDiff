@@ -480,6 +480,7 @@ dependencies = [
  "sqldiff-review",
  "sqldiff-source",
  "sqldiff-syntax",
+ "toml",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ use sqldiff_syntax::ast;
 mod changes_cmd;
 mod convert_cmd;
 mod deny_hash;
+mod dist_cmd;
 mod instances_cmd;
 mod queue_cmd;
 mod review_cmd;
@@ -220,6 +221,10 @@ enum Command {
     /// Review decisions: accept, reject or comment on findings by fingerprint.
     #[command(subcommand)]
     Review(review_cmd::ReviewCommand),
+    /// Assemble a ready-to-run folder for colleagues: the executables, a
+    /// README and the private config with its packs in `config/`, which the
+    /// executables load without setup. Never inside a git work tree.
+    Dist(dist_cmd::DistArgs),
     #[command(flatten)]
     Source(source_cmd::SourceCommand),
     #[command(flatten)]
@@ -549,6 +554,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::Instances(args) => instances_cmd::run(args),
         Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
+        Command::Dist(args) => dist_cmd::run(args),
         Command::Source(cmd) => source_cmd::run(cmd),
         Command::Queue(cmd) => queue_cmd::run(cmd),
     }

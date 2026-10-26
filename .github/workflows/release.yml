@@ -1,0 +1,131 @@
+name: Release
+
+# Ready-to-run archives of sqldiff, sqldiff-gui and sqldiff-mcp for Windows,
+# macOS and Linux. A tag v* also drafts a GitHub release with them; publish
+# it by hand. The archives never hold a config: they are staged by
+# `sqldiff dist --no-config`, and the check below fails on anything else.
+# A private config is added on a trusted machine with `sqldiff dist`
+# (docs/distribution.md), never here.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Leak scan of the released tree
+        env:
+          SQLDIFF_DENYHASHES: ${{ secrets.SQLDIFF_DENYHASHES }}
+          SQLDIFF_REQUIRE_DENYLIST: "true"
+        run: |
+          cargo build -p sqldiff-cli
+          scripts/leak-scan.sh
+
+  build:
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, label: windows-x64, runs: true }
+          - { os: macos-latest, target: aarch64-apple-darwin, label: macos-arm64, runs: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, label: macos-x64, runs: false }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, label: linux-x64, runs: true }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Windows: no Visual C++ runtime needed on the colleague's machine.
+      RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p sqldiff-cli -p sqldiff-gui -p sqldiff-mcp
+      - name: Name
+        id: name
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then v="$GITHUB_REF_NAME"; else v="dev-${GITHUB_SHA::8}"; fi
+          echo "dir=sqldiff-$v-${{ matrix.label }}" >> "$GITHUB_OUTPUT"
+      - name: Stage with sqldiff dist --no-config
+        run: |
+          bin="target/${{ matrix.target }}/release"
+          if [[ "${{ matrix.runs }}" == "true" ]]; then
+            dist="$bin/sqldiff"
+          else
+            # This runner cannot run the target's binaries: stage with a host build.
+            cargo build --release --locked -p sqldiff-cli
+            dist="target/release/sqldiff"
+          fi
+          "$dist" dist --no-config --from "$bin" -o "stage/${{ steps.name.outputs.dir }}"
+      - name: Check the archive holds exactly the programs and README
+        run: |
+          cd "stage/${{ steps.name.outputs.dir }}"
+          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
+          expected="$(printf '%s\n' README.md "sqldiff$ext" "sqldiff-gui$ext" "sqldiff-mcp$ext" | sort)"
+          actual="$(find . -mindepth 1 | sed 's|^\./||' | sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "unexpected archive contents:"; diff <(echo "$expected") <(echo "$actual") || true
+            exit 1
+          fi
+      - name: Smoke test
+        if: matrix.runs
+        run: |
+          d="stage/${{ steps.name.outputs.dir }}"
+          "$d/sqldiff" --version
+          "$d/sqldiff-gui" --version
+          "$d/sqldiff" config --isolated
+          "$d/sqldiff" diff tests/fixtures/movestock.tsql.sql tests/fixtures/movestock_reformatted.tsql.sql -d tsql --isolated
+      - name: Archive
+        run: |
+          cd stage
+          d="${{ steps.name.outputs.dir }}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip "$d.zip" "$d" > /dev/null
+          else
+            tar -czf "$d.tar.gz" "$d"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.dir }}
+          path: |
+            stage/*.zip
+            stage/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft \
+            --title "SQLDiff $GITHUB_REF_NAME" --generate-notes ./*
