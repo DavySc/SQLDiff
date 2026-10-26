@@ -526,35 +526,25 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             cfg,
         } => {
             let template = if template {
-                // The same placeholder rules as `diff --template`.
-                let cfg = cfg.resolve()?;
-                let def = cfg.policy.template.as_ref().ok_or(
-                    "--template needs a [template] syntax: give --pack or a sqldiff.toml with one",
-                )?;
-                Some(convert_cmd::TemplateMode::new(
-                    def,
+                Some(convert_cmd::TemplateMode::configured(
+                    &cfg.resolve()?,
                     (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
                 )?)
             } else {
                 None
             };
             convert_cmd::run(convert_cmd::Args {
-                src,
-                out,
-                from,
-                to,
-                jobs,
-                overwrite,
-                no_catalog,
-                template,
-                extensions: if extensions.is_empty() {
-                    vec!["sql".to_string()]
-                } else {
-                    extensions
-                        .into_iter()
-                        .map(|e| e.trim_start_matches('.').to_string())
-                        .collect()
+                tree: sqldiff_convert::tree::Args {
+                    src,
+                    from,
+                    to,
+                    jobs,
+                    no_catalog,
+                    template,
+                    extensions: sqldiff_convert::tree::extensions(extensions),
                 },
+                out,
+                overwrite,
             })
         }
         Command::Instances(args) => instances_cmd::run(args),

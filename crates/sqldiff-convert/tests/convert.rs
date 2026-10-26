@@ -1163,3 +1163,19 @@ fn fragments_convert_for_db2i_too() {
         );
     }
 }
+
+#[test]
+fn trailing_comma_in_a_column_list_is_refused_not_a_crash() {
+    // sakila's SQL Server schema has `PRIMARY KEY NONCLUSTERED (film_id),\n)`.
+    let src = "CREATE TABLE film_text (\n  film_id SMALLINT NOT NULL,\n  title VARCHAR(255) NOT NULL,\n  PRIMARY KEY NONCLUSTERED (film_id),\n);\n";
+    for to in [Dialect::Postgres, Dialect::Db2i] {
+        let c = convert(src, Dialect::Tsql, to).unwrap();
+        let u = unit(&c, src, "CREATE TABLE");
+        assert_eq!(u.status, Status::NotConverted, "{}", c.output);
+        assert!(
+            u.notes.iter().any(|n| n.text.contains("trailing comma")),
+            "{:?}",
+            u.notes
+        );
+    }
+}
