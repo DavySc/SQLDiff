@@ -22,6 +22,8 @@ use crate::tok::{
 };
 use crate::{Note, Status};
 
+mod temporal;
+
 const INDENT: usize = 2;
 
 /// Rule id of a refusal because of where the unit stands.
@@ -1188,6 +1190,15 @@ impl<'a> Cx<'a> {
             ts = dummy_from(&ts, top);
         }
         let s = sig(&ts);
+        // `PERIOD FOR SYSTEM_TIME` declares the period; `t FOR SYSTEM_TIME …` queries it.
+        if s.windows(3)
+            .any(|p| !ts[p[0]].is("PERIOD") && ts[p[1]].is("FOR") && ts[p[2]].is("SYSTEM_TIME"))
+        {
+            return no(self.pick(
+                "FOR SYSTEM_TIME reads the history of a system-versioned table: PostgreSQL has no temporal queries; a UNION ALL of the table and its history filtered on the period columns would do it; no rule yet",
+                "FOR SYSTEM_TIME: system-versioned tables are not converted for Db2 for i yet; no rule yet",
+            ));
+        }
         let w = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
         let ind = column(self.src, Self::range(n).0);
         if self.mode == Mode::Top && procedural(n) {
@@ -2595,16 +2606,16 @@ impl<'a> Cx<'a> {
     }
 
     fn create_table(&mut self, ts: &[T]) -> R<String> {
-        if ts
+        let (temporal, ts) = if ts
             .iter()
             .any(|t| t.is("SYSTEM_TIME") || t.is("SYSTEM_VERSIONING"))
         {
-            return no(self.pick(
-                "system-versioned (temporal) table: PostgreSQL has no system versioning; keep history with a trigger and a history table",
-                "system-versioned (temporal) table: Db2 for i spells it PERIOD SYSTEM_TIME with ROW BEGIN/END and a separate ALTER TABLE … ADD VERSIONING; no rule yet",
-            ));
-        }
-        let ts = self.strip_storage(ts)?;
+            let (t, ts) = self.temporal(ts)?;
+            (Some(t), ts)
+        } else {
+            (None, ts.to_vec())
+        };
+        let ts = self.strip_storage(&ts)?;
         let open = ts
             .iter()
             .position(|t| t.k == L_PAREN)
@@ -2624,10 +2635,27 @@ impl<'a> Cx<'a> {
         } else {
             Vec::new()
         };
+        let mut names = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
-            cols.push(self.table_item(item, &pk)?);
+            let col = self.table_item(item, &pk)?;
+            if let Some(&f) = sig(item).first().filter(|&&f| !constraint_item(&item[f])) {
+                names.push((
+                    tsql_unquote(&item[f].s),
+                    self.expr(&item[f..=f]).trim().to_string(),
+                ));
+            }
+            cols.push(col);
         }
         let tail = self.expr(&ts[close + 1..]);
+        if let Some(t) = temporal {
+            let table = Ok(format!(
+                "CREATE TABLE {name} ({}\n){}",
+                cols.join(","),
+                tail.trim_end()
+            ));
+            let versioning = self.versioning(&t, &name, &name_t, &names)?;
+            return table.map(|t| format!("{t};\n\n{versioning}"));
+        }
         if temp && self.db2() {
             // LOGGED: a rollback undoes the rows, as for a #temp table.
             return Ok(format!(
@@ -2659,14 +2687,26 @@ impl<'a> Cx<'a> {
         };
         let it = trimmed(item);
         let first = &it[0];
-        if ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
-            .iter()
-            .any(|w| first.is(w))
-        {
-            let kept: Vec<T> = it
-                .iter()
-                .filter(|t| !(t.is("CLUSTERED") || t.is("NONCLUSTERED")))
-                .cloned()
+        if constraint_item(first) {
+            // PRIMARY KEY (a ASC): the targets take no sort order in a key's
+            // column list. The order only shapes the key's index.
+            let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
+            let ds = crate::tok::depths(it);
+            let order = |j: usize| key && ds[j] == 1 && (it[j].is("ASC") || it[j].is("DESC"));
+            if (0..it.len()).any(|j| order(j) && it[j].is("DESC")) {
+                let text = self.pick(
+                    "DESC in a key's column list was dropped: PostgreSQL keys take no sort order. Results are the same; only the key's index is built ascending.",
+                    "DESC in a key's column list was dropped: Db2 for i keys take no sort order. Results are the same; only the key's index is built ascending.",
+                ).to_string();
+                self.note(Status::Converted, "tsql.key-order", &text);
+            }
+            let kept: Vec<T> = (0..it.len())
+                .filter(|&j| {
+                    let t = &it[j];
+                    let before_order = !t.sig() && next_sig(it, j).is_some_and(order);
+                    !(t.is("CLUSTERED") || t.is("NONCLUSTERED") || order(j) || before_order)
+                })
+                .map(|j| it[j].clone())
                 .collect();
             return Ok(format!("{lead}{}", collapse_spaces(&self.expr(&kept))));
         }
@@ -2804,6 +2844,15 @@ impl<'a> Cx<'a> {
 
     fn alter_table(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
+        if ts
+            .iter()
+            .any(|t| t.is("SYSTEM_VERSIONING") || t.is("SYSTEM_TIME"))
+        {
+            return no(self.pick(
+                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: in PostgreSQL versioning is the history trigger of the converted CREATE TABLE; turning it off, dropping the period or adding it later needs those triggers changed to match; no rule yet",
+                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: Db2 for i system-period tables are not converted yet (their facts are not verified on IBM i); no rule yet",
+            ));
+        }
         let first = sig(&ts)[0];
         if find_word(&ts, first + 1, "ALTER").is_some() {
             return no(self.pick(
@@ -2933,6 +2982,9 @@ impl<'a> Cx<'a> {
                 }
                 STRING => {
                     let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+                    if !self.db2() && rounds_past_year_9999(&string_value(lit)) {
+                        self.note(Status::Differs, "tsql.end-of-time-literal", "This literal is the end of time at 100 ns precision (DATETIME2(7)). PostgreSQL keeps microseconds and rounds it up to 10000-01-01 00:00:00, so it no longer equals the largest stored value (a system-versioned table's current rows end at 9999-12-31 23:59:59.999999). Write '9999-12-31 23:59:59.999999' if it means the end of time.");
+                    }
                     o.push_str(lit);
                     self.string_compare(ts, i);
                 }
@@ -4413,6 +4465,29 @@ fn date_part(p: &str) -> Option<&'static str> {
         "second" | "ss" | "s" => "second",
         _ => return None,
     })
+}
+
+/// A date-time text whose fractional seconds PostgreSQL's microseconds
+/// round into the year 10000: `9999-12-31 23:59:59.9999995` and above.
+fn rounds_past_year_9999(v: &str) -> bool {
+    let v = v.trim();
+    let Some(frac) = ["9999-12-31 23:59:59.", "9999-12-31T23:59:59."]
+        .iter()
+        .find_map(|p| v.strip_prefix(p))
+    else {
+        return false;
+    };
+    frac.len() > 6
+        && frac.chars().all(|c| c.is_ascii_digit())
+        && frac.starts_with("999999")
+        && frac.as_bytes()[6] >= b'5'
+}
+
+/// A CREATE TABLE item that is a table constraint, not a column.
+fn constraint_item(first: &T) -> bool {
+    ["CONSTRAINT", "PRIMARY", "UNIQUE", "FOREIGN", "CHECK"]
+        .iter()
+        .any(|w| first.is(w))
 }
 
 /// `[Name]` → `Name` when it is a plain identifier, else `"Name"`.

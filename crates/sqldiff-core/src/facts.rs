@@ -27,6 +27,17 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
             continue;
         }
         let kind = stmt_kind(&node, d);
+        if d == sqldiff_syntax::Dialect::Tsql {
+            if let Some(target) = history_table(&node) {
+                out.push(Write {
+                    node,
+                    kind: StmtKind::Insert,
+                    target,
+                    upsert: false,
+                });
+                continue;
+            }
+        }
         let direct = kind.is_write();
         let (kind, parts) = if direct {
             match write_target(&node) {
@@ -52,6 +63,23 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
         });
     }
     out
+}
+
+/// T-SQL `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))`:
+/// every UPDATE and DELETE of the table writes the old row into `h`. That
+/// write is declared here, where the converted table's history trigger
+/// writes it, so the two pair up.
+fn history_table(node: &SyntaxNode) -> Option<String> {
+    let toks: Vec<_> = ast::sig_tokens(node).collect();
+    let up = |i: usize| toks.get(i).map(|t| t.text().to_ascii_uppercase());
+    if up(0).as_deref() != Some("CREATE") || up(1).as_deref() != Some("TABLE") {
+        return None;
+    }
+    let at = (0..toks.len()).find(|&i| up(i).as_deref() == Some("HISTORY_TABLE"))?;
+    if toks.get(at + 1).map(|t| t.text()) != Some("=") {
+        return None;
+    }
+    ast::qualified_name_at(&toks, at + 2).pop()
 }
 
 /// `BEGIN ATOMIC` (Db2 compound, SQL-standard function body).
