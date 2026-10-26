@@ -22,9 +22,12 @@ use crate::tok::{
 };
 use crate::{Note, Status};
 
+mod bits;
 mod temporal;
 
 const INDENT: usize = 2;
+
+const BIT_SMALLINT: &str = "BIT becomes SMALLINT, which keeps comparisons with 1 and 0: T-SQL stores any non-zero value as 1, SMALLINT stores it as given (literals are written as 0 or 1). Equal if only 0, 1 and NULL are written.";
 
 /// Rule id of a refusal because of where the unit stands.
 const CONTEXT: &str = "not-converted.context";
@@ -66,6 +69,9 @@ pub(crate) fn convert(
         dynamic: Vec::new(),
         scope: None,
         local: std::cell::OnceCell::new(),
+        bit_cols: Vec::new(),
+        bit_unhandled: Vec::new(),
+        ret_bit: false,
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -168,6 +174,12 @@ struct Cx<'a> {
     scope: Option<Scope>,
     /// Without a tree catalog: one read from this input, made when needed.
     local: std::cell::OnceCell<sqldiff_core::catalog::Catalog>,
+    /// The BIT columns of the table being created or altered (lower case).
+    bit_cols: Vec<String>,
+    /// PostgreSQL: places where a bit meets a number with no exact rewrite.
+    bit_unhandled: Vec<String>,
+    /// The function being converted returns BIT.
+    ret_bit: bool,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -351,14 +363,14 @@ impl<'a> Cx<'a> {
             .find(|w| ["PROC", "PROCEDURE", "FUNCTION", "VIEW", "TRIGGER"].contains(&w.as_str()))
             .cloned()
             .unwrap_or_default();
-        let res = match kind.as_str() {
-            "PROC" | "PROCEDURE" => self.proc_or_func(out, r, false),
-            "FUNCTION" => self.proc_or_func(out, r, true),
-            "VIEW" => self.view(r),
-            "TRIGGER" if self.db2() => no("triggers: Db2 for i triggers are row or statement triggers with REFERENCING NEW/OLD (TABLE); inserted/deleted need a rewrite"),
+        let res = self.guard_bits(|cx| match kind.as_str() {
+            "PROC" | "PROCEDURE" => cx.proc_or_func(out, r, false),
+            "FUNCTION" => cx.proc_or_func(out, r, true),
+            "VIEW" => cx.view(r),
+            "TRIGGER" if cx.db2() => no("triggers: Db2 for i triggers are row or statement triggers with REFERENCING NEW/OLD (TABLE); inserted/deleted need a rewrite"),
             "TRIGGER" => no("triggers: PostgreSQL needs a trigger function plus CREATE TRIGGER, and inserted/deleted become NEW/OLD or transition tables"),
             _ => no("unrecognised routine"),
-        };
+        });
         match res {
             Ok(Some(_)) if self.blocked().is_some() => {
                 let reason = self.blocked().unwrap();
@@ -410,12 +422,17 @@ impl<'a> Cx<'a> {
             .children()
             .find(|c| c.kind() == STATEMENT)
             .ok_or(No("view body is not a query".into()))?;
-        let (q, _) = self.select(&tokens(&stmt))?;
+        let qt = tokens(&stmt);
+        let outer = std::mem::replace(&mut self.scope, scope_of(&qt));
+        let q = self.select(&qt);
+        self.scope = outer;
+        let (q, _) = q?;
         Ok(Some(format!("CREATE OR REPLACE VIEW {name} AS\n{q};")))
     }
 
     fn proc_or_func(&mut self, out: &mut Out, r: &SyntaxNode, func: bool) -> R<Option<String>> {
         self.reset();
+        self.ret_bit = false;
         self.return_code = false;
         self.txn_control = false;
         let all = tokens(r);
@@ -514,7 +531,12 @@ impl<'a> Cx<'a> {
                 let end = (eq + 1..p.len())
                     .find(|&j| p[j].is("OUTPUT") || p[j].is("OUT"))
                     .unwrap_or(p.len());
-                text.push_str(&format!(" DEFAULT {}", self.expr(&p[eq + 1..end]).trim()));
+                let v = if Dt::of_tokens(&p[ty_at..ty_end]) == Dt::Bit {
+                    self.bit_store_text(&p[eq + 1..end])
+                } else {
+                    self.expr(&p[eq + 1..end]).trim().to_string()
+                };
+                text.push_str(&format!(" DEFAULT {v}"));
                 seen_default = true;
             } else if seen_default && !self.db2() {
                 self.note(
@@ -542,6 +564,7 @@ impl<'a> Cx<'a> {
                 ));
             }
             let (ty, _, _) = self.ty(rt)?;
+            self.ret_bit = Dt::of_tokens(rt) == Dt::Bit;
             returns = format!(" RETURNS {ty}");
         }
         let owner = self.routine_options(&ts[stop..]);
@@ -975,7 +998,9 @@ impl<'a> Cx<'a> {
     }
 
     fn condition(&mut self, n: &SyntaxNode) -> String {
-        n.children()
+        self.take_bit_unhandled();
+        let cond = n
+            .children()
             .find(|c| c.kind() == CONDITION)
             .map(|c| {
                 let mut ts = tokens(&c);
@@ -984,7 +1009,12 @@ impl<'a> Cx<'a> {
                 }
                 self.expr(&ts).trim().to_string()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The engine does not compare conditions: what has no exact rewrite is refused.
+        if let Some(reason) = self.bit_refusal() {
+            self.note(Status::NotConverted, "pg.bit-number", &reason);
+        }
+        cond
     }
 
     fn header_unit(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, text: &str) {
@@ -1193,7 +1223,7 @@ impl<'a> Cx<'a> {
 
     fn stmt(&mut self, n: &SyntaxNode) -> R<String> {
         let outer = std::mem::replace(&mut self.scope, scope_of(&tokens(n)));
-        let r = self.stmt_in_scope(n);
+        let r = self.guard_bits(|cx| cx.stmt_in_scope(n));
         self.scope = outer;
         r
     }
@@ -1445,7 +1475,15 @@ impl<'a> Cx<'a> {
                 let t = trimmed(it);
                 let eq = t.iter().position(|x| x.k == OP && x.s == "=").unwrap();
                 targets.push(self.var_ref(&t[0].s));
-                exprs.push(self.expr(&t[eq + 1..]).trim().to_string());
+                let bit = self
+                    .vars
+                    .get(&t[0].s.trim_start_matches('@').to_ascii_lowercase())
+                    .is_some_and(|v| v.dt == Dt::Bit);
+                exprs.push(if bit {
+                    self.bit_store_text(&t[eq + 1..])
+                } else {
+                    self.expr(&t[eq + 1..]).trim().to_string()
+                });
             }
             if from.is_none() && limit.is_none() {
                 let db2 = self.db2();
@@ -1799,7 +1837,15 @@ impl<'a> Cx<'a> {
         if a.k == VARIABLE && !a.s.starts_with("@@") {
             let op = &ts[*s.get(2).ok_or(No("SET without a value".into()))?];
             let target = self.var_ref(&a.s);
-            let rhs = self.expr(&ts[s[3]..]).trim().to_string();
+            let bit = self
+                .vars
+                .get(&a.s[1..].to_ascii_lowercase())
+                .is_some_and(|v| v.dt == Dt::Bit);
+            let rhs = if bit && op.s == "=" {
+                self.bit_store_text(&ts[s[3]..])
+            } else {
+                self.expr(&ts[s[3]..]).trim().to_string()
+            };
             let assign = |v: String| {
                 if self.db2() {
                     format!("SET {target} = {v}")
@@ -1949,7 +1995,7 @@ impl<'a> Cx<'a> {
             return self.table_variable(&ts);
         }
         let mut lines = Vec::new();
-        let mut pending = Vec::new(); // (variable, initialiser tokens)
+        let mut pending = Vec::new(); // (variable, initialiser tokens, BIT)
         for item in split_commas(&ts[s[1]..]) {
             let it = trimmed(item);
             let Some(v) = it.first().filter(|t| t.k == VARIABLE) else {
@@ -1984,7 +2030,8 @@ impl<'a> Cx<'a> {
                 format!("{name} {ty};")
             });
             if let Some(eq) = eq {
-                pending.push((name, it[eq + 1..].to_vec()));
+                let bit = Dt::of_tokens(&it[j..eq]) == Dt::Bit;
+                pending.push((name, it[eq + 1..].to_vec(), bit));
             }
         }
         // Type notes belong to the hoisted declaration; initialiser notes to
@@ -1998,8 +2045,12 @@ impl<'a> Cx<'a> {
         let db2 = self.db2();
         let inits: Vec<String> = pending
             .iter()
-            .map(|(name, init)| {
-                let v = self.expr(init).trim().to_string();
+            .map(|(name, init, bit)| {
+                let v = if *bit {
+                    self.bit_store_text(init)
+                } else {
+                    self.expr(init).trim().to_string()
+                };
                 if db2 {
                     format!("SET {name} = {v};")
                 } else {
@@ -2055,7 +2106,13 @@ impl<'a> Cx<'a> {
     fn ret(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
-        let val = s.get(1).map(|&j| self.expr(&ts[j..]).trim().to_string());
+        let val = s.get(1).map(|&j| {
+            if self.mode == Mode::Func && self.ret_bit {
+                self.bit_store_text(&ts[j..])
+            } else {
+                self.expr(&ts[j..]).trim().to_string()
+            }
+        });
         match (self.mode, val) {
             (Mode::Func, Some(v)) => Ok(format!("RETURN {v}")),
             (Mode::Proc, Some(v)) if self.db2() => {
@@ -2269,6 +2326,7 @@ impl<'a> Cx<'a> {
                 a
             };
             // The parameter this argument binds to, when the callee is known.
+            let mut bit_param = false;
             if let Some(ps) = params {
                 let at = if named {
                     ps.iter().position(|p| p.name.eq_ignore_ascii_case(&a[0].s))
@@ -2282,6 +2340,7 @@ impl<'a> Cx<'a> {
                     ));
                 };
                 passed.push(at);
+                bit_param = ps[at].data_type.base == "BIT" && !marked;
                 let out_param = matches!(ps[at].mode, ParamMode::Out | ParamMode::InOut);
                 if out_param != marked {
                     return no(if out_param {
@@ -2305,11 +2364,14 @@ impl<'a> Cx<'a> {
                 if callee.is_none() {
                     self.note(Status::Assumptions, "ASM-PARAM-NAMES", "Named arguments assume the called procedure was converted with the same p_ parameter names.");
                 }
-                args.push(format!(
-                    "p_{} => {}",
-                    snake(&a[0].s[1..]),
-                    self.expr(value).trim()
-                ));
+                let v = if bit_param {
+                    self.bit_store_text(value)
+                } else {
+                    self.expr(value).trim().to_string()
+                };
+                args.push(format!("p_{} => {v}", snake(&a[0].s[1..])));
+            } else if bit_param {
+                args.push(self.bit_store_text(value));
             } else {
                 args.push(self.expr(value).trim().to_string());
             }
@@ -2448,7 +2510,27 @@ impl<'a> Cx<'a> {
         let s = sig(&ts);
         let w1 = ts[s[1]].up();
         match w1.as_str() {
-            "TABLE" => self.create_table(&ts),
+            "TABLE" => {
+                // The table's own BIT columns, for its CHECK constraints.
+                let cols = ts
+                    .iter()
+                    .position(|t| t.k == L_PAREN)
+                    .and_then(|o| Some((o, matching(&ts, o)?)))
+                    .map(|(o, c)| {
+                        split_commas(&ts[o + 1..c])
+                            .iter()
+                            .filter_map(|item| {
+                                let s = sig(item);
+                                let (&n, &t) = (s.first()?, s.get(1)?);
+                                (!constraint_item(&item[n])
+                                    && tsql_unquote(&item[t].s).eq_ignore_ascii_case("bit"))
+                                .then(|| tsql_unquote(&item[n].s).to_ascii_lowercase())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.with_bit_cols(cols, |cx| cx.create_table(&ts))
+            }
             "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => {
                 let ts = self.strip_storage(&ts)?;
                 if self.db2() {
@@ -2468,7 +2550,16 @@ impl<'a> Cx<'a> {
                     ).to_string();
                     self.note(Status::Assumptions, "ASM-CLUSTERED", &text);
                 }
-                Ok(collapse_spaces(&self.expr(&kept)))
+                // A filtered index's WHERE on BIT columns of the ON table.
+                let cols = find_word(&kept, 0, "ON")
+                    .map(|on| {
+                        let end = (on + 1..kept.len())
+                            .find(|&j| kept[j].k == L_PAREN)
+                            .unwrap_or(kept.len());
+                        self.table_bit_cols(&kept[on + 1..end])
+                    })
+                    .unwrap_or_default();
+                self.with_bit_cols(cols, |cx| Ok(collapse_spaces(&cx.expr(&kept))))
             }
             "SCHEMA" => Ok(self.expr(&ts)),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
@@ -2853,16 +2944,7 @@ impl<'a> Cx<'a> {
             rest = format!("NOT NULL {}", rest.trim());
         }
         if ty == "boolean" {
-            for (from, to) in [
-                ("((1))", "TRUE"),
-                ("((0))", "FALSE"),
-                ("(1)", "TRUE"),
-                ("(0)", "FALSE"),
-                ("1", "TRUE"),
-                ("0", "FALSE"),
-            ] {
-                rest = replace_word(&rest, &format!("DEFAULT {from}"), &format!("DEFAULT {to}"));
-            }
+            rest = bits::bool_default(&rest);
         }
         let rest = rest.trim();
         Ok(format!(
@@ -2895,7 +2977,11 @@ impl<'a> Cx<'a> {
                 .iter()
                 .any(|w| ts[nx].is(w))
             {
-                return Ok(self.expr(&ts));
+                let name_end = find_word(&ts, 0, "ADD").unwrap_or(ts.len());
+                let cols = find_word(&ts, 0, "TABLE")
+                    .map(|t| self.table_bit_cols(&ts[t + 1..name_end]))
+                    .unwrap_or_default();
+                return self.with_bit_cols(cols, |cx| Ok(cx.expr(&ts)));
             }
             let head = self.expr(&ts[..nx]);
             let cols: R<Vec<String>> = split_commas(&ts[nx..])
@@ -2974,9 +3060,26 @@ impl<'a> Cx<'a> {
     }
 
     fn expr(&mut self, ts: &[T]) -> String {
+        let edits = self.bit_edits(ts);
         let mut o = String::new();
         let mut i = 0;
+        let mut done = 0;
         while i < ts.len() {
+            // After the tokens output since the last step, before this one.
+            for k in done..i {
+                if let Some(p) = edits.post.get(&k) {
+                    o.push_str(p);
+                }
+            }
+            done = i;
+            if let Some(p) = edits.pre.get(&i) {
+                o.push_str(p);
+            }
+            if let Some(r) = edits.rep.get(&i) {
+                o.push_str(r);
+                i += 1;
+                continue;
+            }
             let t = &ts[i];
             if self.db2() && matches!(t.k, IDENT | QUOTED_IDENT) && from_item_start(ts, i) {
                 if let Some((text, end)) = self.table_function_db2(ts, i) {
@@ -3144,6 +3247,11 @@ impl<'a> Cx<'a> {
                 _ => o.push_str(&t.s),
             }
             i += 1;
+        }
+        for k in done..ts.len() {
+            if let Some(p) = edits.post.get(&k) {
+                o.push_str(p);
+            }
         }
         o
     }
@@ -3373,7 +3481,13 @@ impl<'a> Cx<'a> {
             }
             ("ISNULL", 2) => {
                 self.note(Status::Assumptions, "ASM-ISNULL-TYPE", "ISNULL becomes COALESCE: ISNULL takes the type of its first argument (it can truncate), COALESCE the widest type. Equal unless the fallback is longer or wider than the first argument.");
-                let (x, y) = (e(self, 0), e(self, 1));
+                let x = e(self, 0);
+                // ISNULL converts the fallback to the first argument's type.
+                let y = if self.is_bit(a[0]) {
+                    self.bit_store_text(a[1])
+                } else {
+                    e(self, 1)
+                };
                 format!("COALESCE({x}, {y})")
             }
             ("LEN", 1) => format!("length(rtrim({}))", e(self, 0)),
@@ -3400,7 +3514,12 @@ impl<'a> Cx<'a> {
                 format!("make_date({y}, {m}, {d})")
             }
             ("IIF", 3) => {
-                let (c, x, y) = (e(self, 0), e(self, 1), e(self, 2));
+                let bits = self.bit_results(&[a[1], a[2]]);
+                let r = |cx: &mut Self, k: usize| match bits[k - 1] {
+                    Some(b) => b.to_string(),
+                    None => e(cx, k),
+                };
+                let (c, x, y) = (e(self, 0), r(self, 1), r(self, 2));
                 format!("(CASE WHEN {c} THEN {x} ELSE {y} END)")
             }
             ("REPLICATE", 2) => {
@@ -3418,20 +3537,9 @@ impl<'a> Cx<'a> {
             }
             ("CAST", 1) => {
                 let at = crate::tok::find_word(a[0], 0, "AS")?;
-                let x = self.expr(&a[0][..at]).trim().to_string();
-                self.in_cast = true;
-                let ty = self.ty(&a[0][at + 1..]);
-                self.in_cast = false;
-                let (ty, _, _) = ty.ok()?;
-                format!("CAST({x} AS {ty})")
+                return self.cast_pg(&a[0][..at], &a[0][at + 1..]);
             }
-            ("CONVERT", 2) => {
-                self.in_cast = true;
-                let ty = self.ty(a[0]);
-                self.in_cast = false;
-                let (ty, _, _) = ty.ok()?;
-                format!("CAST({} AS {ty})", e(self, 1))
-            }
+            ("CONVERT", 2) => return self.cast_pg(a[1], a[0]),
             ("CONVERT", 3) => {
                 self.note(Status::NotConverted, "tsql.convert-style", "CONVERT with a style code: use to_char / to_timestamp with the matching format.");
                 return None;
@@ -3488,7 +3596,13 @@ impl<'a> Cx<'a> {
             }
             ("ISNULL", 2) => {
                 self.note(Status::Assumptions, "ASM-ISNULL-TYPE", "ISNULL becomes COALESCE: ISNULL takes the type of its first argument (it can truncate), COALESCE the widest type. Equal unless the fallback is longer or wider than the first argument.");
-                let (x, y) = (e(self, 0), e(self, 1));
+                let x = e(self, 0);
+                // ISNULL converts the fallback to the first argument's type.
+                let y = if self.is_bit(a[0]) {
+                    self.bit_store_text(a[1])
+                } else {
+                    e(self, 1)
+                };
                 format!("COALESCE({x}, {y})")
             }
             ("LEN", 1) => {
@@ -3795,7 +3909,7 @@ impl<'a> Cx<'a> {
                 num("SMALLINT")
             }
             "BIT" => {
-                self.note(Status::Assumptions, "ASM-BIT-SMALLINT", "BIT becomes SMALLINT, which keeps comparisons with 1 and 0: T-SQL stores any non-zero value as 1, SMALLINT stores it as given. Equal if only 0, 1 and NULL are written.");
+                self.note(Status::Assumptions, "ASM-BIT-SMALLINT", BIT_SMALLINT);
                 num("SMALLINT")
             }
             "DECIMAL" | "NUMERIC" | "DEC" if args.is_empty() => num("DECIMAL(18, 0)"),
@@ -4672,23 +4786,6 @@ fn collapse_spaces(s: &str) -> String {
     out
 }
 
-/// Replaces `from` when it ends at a word boundary (case-insensitive on the keyword).
-fn replace_word(s: &str, from: &str, to: &str) -> String {
-    let up = s.to_ascii_uppercase();
-    let Some(i) = up.find(&from.to_ascii_uppercase()) else {
-        return s.to_string();
-    };
-    let end = i + from.len();
-    if s[end..]
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return s.to_string();
-    }
-    format!("{}{to}{}", &s[..i], &s[end..])
-}
-
 /// A T-SQL type, as far as DATEADD needs it: the date argument decides the
 /// result type, and the number must become an integer the way T-SQL makes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4707,6 +4804,7 @@ enum Dt {
     Fraction,
     /// A string (a literal, or a CHAR/VARCHAR value).
     Text,
+    Bit,
     Other,
 }
 
@@ -4727,6 +4825,7 @@ impl Dt {
             | "DOUBLE PRECISION" => Dt::Fraction,
             "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "CHARACTER" | "CHARACTER VARYING"
             | "TEXT" | "NTEXT" | "SYSNAME" => Dt::Text,
+            "BIT" => Dt::Bit,
             _ => Dt::Other,
         }
     }
@@ -5137,7 +5236,7 @@ impl Cx<'_> {
                 text: x,
             }),
             Some(Dt::Text) => Err("the number is a string; CAST it to int".into()),
-            Some(Dt::Other) => Err("the number is not a number".into()),
+            Some(Dt::Other | Dt::Bit) => Err("the number is not a number".into()),
             Some(d) if d.is_date() => Err("the number is a date or time value".into()),
             _ if self.db2() => {
                 if ty != Some(Dt::BigInt) {

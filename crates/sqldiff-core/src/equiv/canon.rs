@@ -423,12 +423,182 @@ impl<'a> Canon<'a> {
     /// Implicit conversion of a value to a declared type: dropped when it is
     /// provably a no-op.
     fn conv(&mut self, dst: &Option<Ty>, v: (Term, Option<Ty>)) -> (Term, Option<Ty>) {
+        self.conv_in(dst, v, false)
+    }
+
+    /// `conv` for a PL/pgSQL variable, parameter or return value, which
+    /// PostgreSQL converts through text where no assignment cast exists.
+    fn conv_var(&mut self, dst: &Option<Ty>, v: (Term, Option<Ty>)) -> (Term, Option<Ty>) {
+        self.conv_in(dst, v, true)
+    }
+
+    fn conv_in(
+        &mut self,
+        dst: &Option<Ty>,
+        v: (Term, Option<Ty>),
+        var: bool,
+    ) -> (Term, Option<Ty>) {
         let Some(d) = dst else { return v };
+        if let Some(b) = self.bool_conv(d, &v, var) {
+            return b;
+        }
+        // An integer literal in the range of an integer type is stored as is.
+        if let (Fam::Int, Some(bits), true) = (d.fam, d.len, v.0.is("num")) {
+            let lit =
+                v.0.kid(0)
+                    .and_then(Term::atom)
+                    .and_then(|x| x.parse::<i128>().ok());
+            if bits > 1
+                && bits <= 64
+                && lit.is_some_and(|x| (-(1i128 << (bits - 1))..(1i128 << (bits - 1))).contains(&x))
+            {
+                return (v.0, Some(*d));
+            }
+        }
         match &v.1 {
             Some(s) if Self::fits(d, s) => v,
             None if matches!(v.0.head(), "null") => v,
             _ => (n("conv", vec![Self::ty_term(dst), v.0]), Some(*d)),
         }
+    }
+
+    // ---- bit and boolean ------------------------------------------------
+    //
+    // A T-SQL bit holds 0 or 1 and a PostgreSQL boolean false or true, so
+    // the terms write both as the bit values: a boolean literal compared
+    // with, stored in or combined with a boolean becomes `num 1` / `num 0`.
+    // PostgreSQL has no operator, cast or assignment between boolean and the
+    // numbers; where it would need one, the term is `type-error` (the
+    // statement fails there). Checked on SQL Server 2022 and PostgreSQL 18
+    // (eval/bit-boolean).
+
+    /// T-SQL bit.
+    fn is_bit(&self, t: &Option<Ty>) -> bool {
+        self.d == Dialect::Tsql && t.is_some_and(|t| t.fam == Fam::Int && t.len == Some(1))
+    }
+
+    /// PostgreSQL boolean.
+    fn is_bool(&self, t: &Option<Ty>) -> bool {
+        self.d == Dialect::Postgres && t.is_some_and(|t| t.fam == Fam::Bool)
+    }
+
+    /// TRUE / FALSE as the bit value 1 / 0.
+    fn bit_value(t: Term) -> Term {
+        match (t.head(), t.kid(0).and_then(Term::atom)) {
+            ("bool", Some("TRUE")) => n("num", vec![a("1")]),
+            ("bool", Some("FALSE")) => n("num", vec![a("0")]),
+            _ => t,
+        }
+    }
+
+    /// A PostgreSQL statement that fails on a boolean meeting a number.
+    fn type_error(&self, kind: &str, kids: Vec<Term>) -> Term {
+        let mut v = vec![a("postgres"), a(kind)];
+        v.extend(kids);
+        n("type-error", v)
+    }
+
+    /// Whether a numeric literal term is zero, nonzero, or not a literal.
+    fn literal_zero(t: &Term) -> Option<bool> {
+        if !t.is("num") {
+            return None;
+        }
+        let s = t.kid(0)?.atom()?;
+        let digits = s.trim_start_matches(['-', '+']);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            return None;
+        }
+        Some(digits.bytes().all(|b| b == b'0' || b == b'.'))
+    }
+
+    /// `x <> 0`: a number as a bit or boolean (NULL stays NULL).
+    fn nonzero(t: Term) -> Term {
+        let (x, y, op) = order_operands("<>", t, n("num", vec![a("0")]));
+        n("cmp", vec![a(op), x, y])
+    }
+
+    /// Storing a value in a bit or boolean, when one of them is involved.
+    fn bool_conv(
+        &mut self,
+        d: &Ty,
+        v: &(Term, Option<Ty>),
+        var: bool,
+    ) -> Option<(Term, Option<Ty>)> {
+        let dst = Some(*d);
+        if self.is_bit(&dst) {
+            if self.is_bit(&v.1) {
+                return None;
+            }
+            // T-SQL stores 0 as 0 and any other number as 1.
+            if let Some(zero) = Self::literal_zero(&v.0) {
+                return Some((n("num", vec![a(if zero { "0" } else { "1" })]), dst));
+            }
+            if v.0.is("str") {
+                let s = v.0.kid(0)?.atom()?;
+                let (t, _) = literal::convert(s, Target::Bit, self.d, false)?;
+                return Some((t, dst));
+            }
+            if v.1.is_some_and(|t| t.is_numeric()) {
+                return Some((Self::nonzero(v.0.clone()), dst));
+            }
+            return None;
+        }
+        if !self.is_bool(&dst) {
+            return None;
+        }
+        if self.is_bool(&v.1) {
+            return Some((Self::bit_value(v.0.clone()), dst));
+        }
+        if v.0.is("str") {
+            let s = v.0.kid(0)?.atom()?;
+            let (t, _) = literal::convert(s, Target::Bool, self.d, false)?;
+            return Some((Self::bit_value(t), dst));
+        }
+        if v.1.is_some_and(|t| t.is_numeric()) {
+            if !var {
+                // column "c" is of type boolean but expression is of type integer
+                return Some((self.type_error("assign", vec![v.0.clone()]), dst));
+            }
+            // PL/pgSQL converts through text: '0' and '1' are read, any other
+            // number fails.
+            return Some(match Self::literal_zero(&v.0) {
+                Some(zero) if matches!(v.0.kid(0).and_then(Term::atom), Some("0" | "1")) => {
+                    (n("num", vec![a(if zero { "0" } else { "1" })]), dst)
+                }
+                _ => (n("dfn", vec![self.dtag(), a("bool-io"), v.0.clone()]), dst),
+            });
+        }
+        None
+    }
+
+    /// A condition: in PostgreSQL a bare boolean column or variable is the
+    /// same test as T-SQL's `bit = 1`, and `NOT` of one as `bit = 0`.
+    fn cond(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        let (t, ty) = self.expr(e)?;
+        Ok((self.bare_bool(t, ty), ty))
+    }
+
+    fn bare_bool(&self, t: Term, ty: Option<Ty>) -> Term {
+        if self.is_bool(&ty) && matches!(t.head(), "col" | "sym") {
+            let (x, y, op) = order_operands("=", t, n("num", vec![a("1")]));
+            return n("cmp", vec![a(op), x, y]);
+        }
+        t
+    }
+
+    /// PostgreSQL: values of one CASE or COALESCE must share a type; a
+    /// boolean among numbers fails, TRUE / FALSE among booleans are bit values.
+    fn bool_mix(&self, vals: &mut [(Term, Option<Ty>)]) -> Option<Term> {
+        if !vals.iter().any(|v| self.is_bool(&v.1)) {
+            return None;
+        }
+        if vals.iter().any(|v| v.1.is_some_and(|t| t.is_numeric())) {
+            return Some(self.type_error("mix", vals.iter().map(|v| v.0.clone()).collect()));
+        }
+        for v in vals.iter_mut() {
+            v.0 = Self::bit_value(v.0.clone());
+        }
+        None
     }
 
     // ---- expressions ----------------------------------------------------
@@ -477,7 +647,12 @@ impl<'a> Canon<'a> {
             Expr::Unary(op, x) => {
                 let (t, ty) = self.expr(x)?;
                 if op == "NOT" {
-                    (n("not", vec![t]), None)
+                    if self.is_bool(&ty) && matches!(t.head(), "col" | "sym") {
+                        let (x, y, op) = order_operands("=", t, n("num", vec![a("0")]));
+                        (n("cmp", vec![a(op), x, y]), Some(Ty::of(Fam::Bool)))
+                    } else {
+                        (n("not", vec![self.bare_bool(t, ty)]), None)
+                    }
                 } else {
                     (n("neg", vec![t]), ty)
                 }
@@ -489,6 +664,7 @@ impl<'a> Canon<'a> {
             Expr::InList(x, list, neg) => {
                 let (t, ty) = self.expr(x)?;
                 let mut items = Vec::new();
+                let mut item_tys = Vec::new();
                 let (mut string, mut known) = (ty.is_some_and(|t| t.is_string()), ty.is_some());
                 // String literals convert to the type of a non-string operand, as in `=`.
                 let target = ty
@@ -500,9 +676,18 @@ impl<'a> Canon<'a> {
                         continue;
                     }
                     let (it, ity) = self.expr(l)?;
+                    item_tys.push(ity);
                     string |= ity.is_some_and(|t| t.is_string());
                     known |= ity.is_some();
                     items.push(it);
+                }
+                if self.is_bool(&ty) {
+                    if item_tys.iter().any(|t| t.is_some_and(|t| t.is_numeric())) {
+                        let mut kids = vec![t, a(neg.to_string())];
+                        kids.extend(items);
+                        return Ok((self.type_error("in", kids), None));
+                    }
+                    items = items.into_iter().map(Self::bit_value).collect();
                 }
                 items.sort();
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
@@ -595,14 +780,30 @@ impl<'a> Canon<'a> {
                     None => kids.push(a("-")),
                 }
                 let mut ty = None;
+                let mut conds = Vec::new();
+                let mut vals = Vec::new();
                 for (w, t) in whens {
-                    let w = self.expr(w)?.0;
+                    conds.push(if op.is_some() {
+                        self.expr(w)?.0
+                    } else {
+                        self.cond(w)?.0
+                    });
                     let (t, tty) = self.expr(t)?;
                     ty = ty.or(tty);
-                    kids.push(n("when", vec![w, t]));
+                    vals.push((t, tty));
+                }
+                if let Some(e) = els {
+                    vals.push(self.expr(e)?);
+                }
+                if let Some(err) = self.bool_mix(&mut vals) {
+                    return Ok((err, None));
+                }
+                let mut vals = vals.into_iter().map(|v| v.0);
+                for w in conds {
+                    kids.push(n("when", vec![w, vals.next().unwrap()]));
                 }
                 kids.push(match els {
-                    Some(e) => self.expr(e)?.0,
+                    Some(_) => vals.next().unwrap(),
                     None => a("null"),
                 });
                 (n("case", kids), ty)
@@ -648,6 +849,47 @@ impl<'a> Canon<'a> {
     }
 
     fn cast(&mut self, dst: Ty, v: (Term, Option<Ty>)) -> (Term, Option<Ty>) {
+        let to = Some(dst);
+        if self.is_bool(&v.1) {
+            // PostgreSQL casts boolean to integer (0 / 1, the bit value) and
+            // to text ('true' / 'false'), and to no other type.
+            return match dst.fam {
+                Fam::Bool => (Self::bit_value(v.0), to),
+                Fam::Int if dst.len == Some(32) => (Self::bit_value(v.0), to),
+                _ if dst.is_string() => (n("booltext", vec![Self::ty_term(&to), v.0]), to),
+                _ => (self.type_error("cast", vec![Self::ty_term(&to), v.0]), to),
+            };
+        }
+        if self.is_bool(&to) {
+            // Only integer casts to boolean: nonzero is true.
+            match v.1 {
+                Some(t) if t.fam == Fam::Int && t.len == Some(32) => {
+                    return (Self::nonzero(v.0), to)
+                }
+                Some(t) if t.is_numeric() => {
+                    return (self.type_error("cast", vec![Self::ty_term(&to), v.0]), to)
+                }
+                _ => {}
+            }
+        }
+        if self.is_bit(&to) && !self.is_bit(&v.1) {
+            // T-SQL: 0 is 0, any other number 1.
+            if let Some(zero) = Self::literal_zero(&v.0) {
+                return (n("num", vec![a(if zero { "0" } else { "1" })]), to);
+            }
+            if v.1.is_some_and(|t| t.is_numeric()) {
+                return (Self::nonzero(v.0), to);
+            }
+        }
+        // A wider integer type holds every value unchanged.
+        if let Some(src) = v.1 {
+            if src.fam == Fam::Int
+                && dst.fam == Fam::Int
+                && matches!((src.len, dst.len), (Some(s), Some(d)) if d >= s)
+            {
+                return (v.0, to);
+            }
+        }
         // Integer to string: every dialect prints the plain decimal form.
         if dst.is_string() && dst.fam == Fam::VarChar {
             if let Some(src) = v.1 {
@@ -729,6 +971,11 @@ impl<'a> Canon<'a> {
                     Some(Ty::of(Fam::VarChar)),
                 ));
             }
+            // IIF is shorthand for this CASE; SQL Server rewrites it so.
+            (Dialect::Tsql, "iif") if argc == 3 && plain => {
+                let [c0, x, y] = [0, 1, 2].map(|k| c.args[k].clone());
+                return self.expr(&Expr::Case(None, vec![(c0, x)], Some(Box::new(y))));
+            }
             _ => {}
         }
         if !plain {
@@ -754,12 +1001,24 @@ impl<'a> Canon<'a> {
         };
         Ok(match (d, name.as_str(), argc) {
             (_, "coalesce", _) => {
+                let mut args = args;
+                if let Some(err) = self.bool_mix(&mut args) {
+                    return Ok((err, None));
+                }
                 let ty = args.iter().find_map(|x| x.1);
                 portable("coalesce", args, ty)
             }
             (Dialect::Tsql, "isnull", 2) => {
                 // ISNULL takes the type of its first argument; it equals COALESCE
                 // when the replacement is stored in that type unchanged.
+                if self.is_bit(&first_ty) {
+                    // The replacement is converted to bit: 0 stays 0, any other number is 1.
+                    if let Some((t, _)) = self.bool_conv(&first_ty.unwrap(), &args[1], false) {
+                        let mut args = args;
+                        args[1] = (t, first_ty);
+                        return Ok(portable("coalesce", args, first_ty));
+                    }
+                }
                 let (b, bty) = (&args[1].0, args[1].1);
                 let fits = matches!(b.head(), "null")
                     || (b.is("str")
@@ -879,7 +1138,7 @@ impl<'a> Canon<'a> {
         if op == "AND" || op == "OR" {
             let mut parts = Vec::new();
             for side in [l, r] {
-                let (t, _) = self.expr(side)?;
+                let (t, _) = self.cond(side)?;
                 if t.is(&op.to_lowercase()) {
                     parts.extend(t.kids().iter().cloned());
                 } else {
@@ -915,6 +1174,18 @@ impl<'a> Canon<'a> {
                     return Ok((self.untyped_lit_cmp(op, lt, rt), Some(Ty::of(Fam::Bool))));
                 }
                 _ => {}
+            }
+        }
+        if self.is_bool(&lty) || self.is_bool(&rty) {
+            let numeric = |t: &Option<Ty>| t.is_some_and(|t| t.is_numeric());
+            if numeric(&lty) || numeric(&rty) {
+                // operator does not exist: boolean = integer (or + - * / %)
+                let kind = if cmp_op { "cmp" } else { "arith" };
+                return Ok((self.type_error(kind, vec![a(op), lt, rt]), None));
+            }
+            if cmp_op {
+                lt = Self::bit_value(lt);
+                rt = Self::bit_value(rt);
             }
         }
         let any =
@@ -1199,7 +1470,7 @@ impl<'a> Canon<'a> {
                 let l = self.table_ref(left)?;
                 let r = self.table_ref(right)?;
                 let on = match on {
-                    Some(e) => self.expr(e)?.0,
+                    Some(e) => self.cond(e)?.0,
                     None => a("-"),
                 };
                 Ok(n("join", vec![a(kind.to_lowercase()), l, r, on]))
@@ -1284,7 +1555,7 @@ impl<'a> Canon<'a> {
             items.clear();
         }
         let where_ = match &s.where_ {
-            Some(w) => self.expr(w)?.0,
+            Some(w) => self.cond(w)?.0,
             None => a("-"),
         };
         let mut group = Vec::new();
@@ -1311,7 +1582,7 @@ impl<'a> Canon<'a> {
             a("distinct")
         };
         let having = match &s.having {
-            Some(h) => self.expr(h)?.0,
+            Some(h) => self.cond(h)?.0,
             None => a("-"),
         };
         let order = self.order_terms(&s.order_by, None)?;
@@ -1567,7 +1838,7 @@ impl<'a> Canon<'a> {
                     }
                     kv.sort();
                     let w = match where_ {
-                        Some(w) => self.expr(w)?.0,
+                        Some(w) => self.cond(w)?.0,
                         None => a("-"),
                     };
                     Ok(n("update", vec![a(table.clone()), n("set", kv), w]))
@@ -1602,7 +1873,7 @@ impl<'a> Canon<'a> {
                 if val.0.is("scope_identity") {
                     return Ok(n("assign", vec![sym, val.0]));
                 }
-                let val = self.conv(&ty, val).0;
+                let val = self.conv_var(&ty, val).0;
                 Ok(n("assign", vec![sym, val]))
             }
             Stmt::Return(None) => Ok(n("return", vec![])),
@@ -1614,12 +1885,12 @@ impl<'a> Canon<'a> {
                         let (q, qty) = self.query(q, QCtx::Scalar)?;
                         let v = (self.scalar(q, "error", "null"), qty);
                         let ret = self.unit.returns;
-                        Ok(n("return", vec![self.conv(&ret, v).0]))
+                        Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
                     _ => {
                         let v = self.expr(e)?;
                         let ret = self.unit.returns;
-                        Ok(n("return", vec![self.conv(&ret, v).0]))
+                        Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
                 }
             }
@@ -1664,7 +1935,7 @@ impl<'a> Canon<'a> {
             let (sym, ty) = self.target_sym(&Expr::Var(assigns[0].assign.clone().unwrap()))?;
             let (q, qty) = self.query(sel, QCtx::Into)?;
             let v = (self.scalar(q, "last", "unchanged"), qty);
-            return Ok(n("assign", vec![sym, self.conv(&ty, v).0]));
+            return Ok(n("assign", vec![sym, self.conv_var(&ty, v).0]));
         }
         if !sel.into.is_empty() {
             if let [From::DataChange {
@@ -1686,7 +1957,7 @@ impl<'a> Canon<'a> {
                 _ => ("error", "unchanged"),
             };
             let v = (self.scalar(q, many, zero), qty);
-            return Ok(n("assign", vec![sym, self.conv(&ty, v).0]));
+            return Ok(n("assign", vec![sym, self.conv_var(&ty, v).0]));
         }
         match (self.d, self.unit.kind, self.unit.sql_body) {
             (Dialect::Postgres, UnitKind::ScalarFn, true) => {
@@ -1987,7 +2258,7 @@ impl<'a> Canon<'a> {
         whens: &[super::ast::When],
     ) -> R<Term> {
         // ON: conjunction of target.col = source value.
-        let on_t = self.expr(on)?.0;
+        let on_t = self.cond(on)?.0;
         let conj: Vec<Term> = if on_t.is("and") {
             on_t.kids().to_vec()
         } else {
@@ -2095,7 +2366,7 @@ impl<'a> Canon<'a> {
                 let table = b.table.clone();
                 self.scopes.last_mut().unwrap().push(b);
                 let w = match where_ {
-                    Some(w) => self.expr(w)?.0,
+                    Some(w) => self.cond(w)?.0,
                     None => a("-"),
                 };
                 return Ok(n("delete", vec![a(table), w]));
@@ -2453,7 +2724,7 @@ impl<'a> Canon<'a> {
                         .and_then(|k| self.unit.locals.get(k - 1))
                         .and_then(|l| l.ty);
                     let ty = ret_ty_of(&v).or(local_ty);
-                    let v = self.conv(&ret, (v, ty)).0;
+                    let v = self.conv_var(&ret, (v, ty)).0;
                     let next = out.remove(i + 1);
                     out[i].term = n("return", vec![v]);
                     out[i].absorb(next);
