@@ -143,21 +143,60 @@ pub struct FileReport {
     pub seconds: f64,
     /// Units that are not plainly converted, in output order.
     pub units: Vec<UnitReport>,
+    /// Plainly converted units, in output order: nothing found, not proven.
+    pub converted_units: Vec<UnitReport>,
     /// Output findings that point into no unit.
     pub unplaced: Vec<String>,
     /// For a template: what it holds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<crate::TemplateInfo>,
+    /// What the review ledger says about the file, when one was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<FileReviewReport>,
+}
+
+/// The ledger applied to one file.
+#[derive(Serialize)]
+pub struct FileReviewReport {
+    /// Every unit reviewed and nothing unplaced.
+    pub reviewed: bool,
+    pub units_reviewed: usize,
+    /// Units with a decision that no longer applies (the file changed, or the
+    /// unit no longer has the rule).
+    pub units_outdated: usize,
+    /// Records whose unit no longer exists (its text changed): unit ids.
+    pub orphaned: Vec<String>,
+}
+
+/// The ledger applied to one unit (`review::UnitReview`, without the unit).
+#[derive(Serialize)]
+pub struct UnitReviewReport {
+    /// Reviewed by people: shown as "accepted in review", never as converted.
+    pub reviewed: bool,
+    /// Assumptions and decisions nobody accepted or picked yet.
+    pub open: Vec<String>,
+    /// What no decision can discharge.
+    pub undischargeable: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<crate::review::By>,
+    pub decisions: Vec<crate::review::Applied>,
 }
 
 #[derive(Serialize)]
 pub struct UnitReport {
+    /// Stable id (`review::unit_ids`): what review decisions are keyed to.
+    pub id: String,
     pub status: Status,
     /// 1-based lines in the input file and in the written output file.
     pub src_line: usize,
     pub out_line: usize,
     pub rules: Vec<String>,
     pub reason: String,
+    /// Rules of the engine's findings (diff and output check) on this unit,
+    /// gating or not.
+    pub findings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review: Option<UnitReviewReport>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +214,19 @@ pub struct Report {
     /// Files that could not be read as text.
     pub unreadable: Vec<String>,
     pub totals: Totals,
+    /// The review ledger that was applied, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger: Option<LedgerReport>,
+}
+
+#[derive(Serialize)]
+pub struct LedgerReport {
+    pub path: String,
+    pub records: usize,
+    /// Lines that did not parse or are not allowed; never applied.
+    pub rejected_lines: Vec<String>,
+    pub units_reviewed: usize,
+    pub files_reviewed: usize,
 }
 
 impl Report {
@@ -266,7 +318,7 @@ pub fn convert(
     let mut conversions = Vec::new();
     for (input, (c, secs)) in inputs.iter().zip(results) {
         let (text, lines) = annotate(&c);
-        files.push(file_report(&input.rel, &c, &lines, secs));
+        files.push(file_report(&input.rel, &input.text, &c, &lines, secs));
         outputs.push(text);
         conversions.push(c);
     }
@@ -280,6 +332,7 @@ pub fn convert(
         totals: totals(&files, started.elapsed().as_secs_f64()),
         files,
         unreadable,
+        ledger: None,
     };
     Ok(Tree {
         report,
@@ -818,7 +871,7 @@ fn line_start(s: &str, at: usize) -> usize {
     s[..at.min(s.len())].rfind('\n').map_or(0, |i| i + 1)
 }
 
-fn file_report(rel: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileReport {
+fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileReport {
     let mut status = c
         .units
         .iter()
@@ -828,44 +881,61 @@ fn file_report(rel: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileRep
     if !c.unplaced.is_empty() {
         status = status.max(Status::Differs);
     }
-    let units = c
-        .units
-        .iter()
-        .zip(lines)
-        .filter(|(u, _)| u.status != Status::Converted)
-        .map(|(u, &l)| {
-            let worst: Vec<&crate::Note> =
-                u.notes.iter().filter(|n| n.status == u.status).collect();
-            let mut reason = worst.first().map(|n| n.text.clone()).unwrap_or_default();
-            if reason.is_empty() && u.status == Status::Differs {
-                // The engine's diff found it: say what.
-                reason = u
-                    .findings
+    let ids = crate::review::unit_ids(rel, input, c);
+    let (mut units, mut converted_units) = (Vec::new(), Vec::new());
+    for ((u, &l), id) in c.units.iter().zip(lines).zip(ids) {
+        let worst: Vec<&crate::Note> = u.notes.iter().filter(|n| n.status == u.status).collect();
+        let mut reason = worst.first().map(|n| n.text.clone()).unwrap_or_default();
+        if reason.is_empty() && u.status == Status::Differs {
+            // The engine's diff found it: say what.
+            reason = u
+                .findings
+                .iter()
+                .filter_map(|&i| c.report.findings.get(i))
+                .find(|f| f.verdict == sqldiff_core::Verdict::Different)
+                .map(|f| format!("{}: {}", f.rule, f.witness))
+                .unwrap_or_default();
+        }
+        let findings = u
+            .findings
+            .iter()
+            .filter_map(|&i| c.report.findings.get(i))
+            .chain(
+                u.output_findings
                     .iter()
-                    .filter_map(|&i| c.report.findings.get(i))
-                    .find(|f| f.verdict == sqldiff_core::Verdict::Different)
-                    .map(|f| format!("{}: {}", f.rule, f.witness))
-                    .unwrap_or_default();
-            }
-            UnitReport {
-                status: u.status,
-                src_line: u.src.line,
-                out_line: l,
-                rules: if worst.is_empty() {
-                    vec!["engine".to_string()]
-                } else {
-                    worst.iter().map(|n| n.rule.clone()).collect()
-                },
-                reason,
-            }
-        })
-        .collect();
+                    .filter_map(|&i| c.output_check.findings.get(i)),
+            )
+            .map(|f| f.rule.clone())
+            .collect();
+        let r = UnitReport {
+            id,
+            status: u.status,
+            src_line: u.src.line,
+            out_line: l,
+            rules: if u.status == Status::Converted {
+                Vec::new()
+            } else if worst.is_empty() {
+                vec!["engine".to_string()]
+            } else {
+                worst.iter().map(|n| n.rule.clone()).collect()
+            },
+            reason,
+            findings,
+            review: None,
+        };
+        if u.status == Status::Converted {
+            converted_units.push(r);
+        } else {
+            units.push(r);
+        }
+    }
     FileReport {
         path: rel.to_string(),
         status,
         counts: c.counts.clone(),
         seconds: (secs * 1000.0).round() / 1000.0,
         units,
+        converted_units,
         unplaced: c
             .unplaced
             .iter()
@@ -873,7 +943,83 @@ fn file_report(rel: &str, c: &Conversion, lines: &[usize], secs: f64) -> FileRep
             .map(|f| format!("{}: {}", f.rule, f.witness))
             .collect(),
         template: c.template.clone(),
+        review: None,
     }
+}
+
+/// Applies the ledger committed in the output directory, if there is one
+/// (`review::LEDGER_FILE`). Returns the lines it did not apply.
+pub fn review_in(t: &mut Tree, inputs: &[Input], out: &Path) -> Result<Vec<String>, String> {
+    let path = out.join(crate::review::LEDGER_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let l = crate::review::Ledger::parse(&text);
+            review(t, inputs, &l, &path.display().to_string());
+            Ok(l.rejected_lines)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Applies a review ledger to a converted tree: every unit and file gets
+/// what the ledger says about it, and the report says which ledger it was.
+/// `inputs` are the texts the tree was converted from, in report order.
+/// Statuses are never changed.
+pub fn review(t: &mut Tree, inputs: &[Input], ledger: &crate::review::Ledger, path: &str) {
+    let (mut units_reviewed, mut files_reviewed) = (0, 0);
+    for ((f, c), input) in t.report.files.iter_mut().zip(&t.conversions).zip(inputs) {
+        let fr = crate::review::review_file(&f.path, &input.text, c, ledger);
+        let mut by_id: std::collections::HashMap<String, crate::review::UnitReview> =
+            fr.units.into_iter().map(|u| (u.id.clone(), u)).collect();
+        let mut outdated = 0;
+        for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
+            let Some(r) = by_id.remove(&u.id) else {
+                continue;
+            };
+            if r.decisions.iter().any(|d| !d.current) {
+                outdated += 1;
+            }
+            units_reviewed += usize::from(r.reviewed);
+            u.review = Some(UnitReviewReport {
+                reviewed: r.reviewed,
+                open: r.open,
+                undischargeable: r.undischargeable,
+                written_by: r.written_by,
+                decisions: r.decisions,
+            });
+        }
+        let all = f
+            .units
+            .iter()
+            .chain(&f.converted_units)
+            .all(|u| u.review.as_ref().is_some_and(|r| r.reviewed));
+        let reviewed = all && fr.unplaced.is_empty();
+        files_reviewed += usize::from(reviewed);
+        f.review = Some(FileReviewReport {
+            reviewed,
+            units_reviewed: f
+                .units
+                .iter()
+                .chain(&f.converted_units)
+                .filter(|u| u.review.as_ref().is_some_and(|r| r.reviewed))
+                .count(),
+            units_outdated: outdated,
+            orphaned: {
+                let mut o: Vec<String> = fr.orphaned.into_iter().map(|r| r.unit).collect();
+                o.sort();
+                o.dedup();
+                o
+            },
+        });
+    }
+    t.report.ledger = Some(LedgerReport {
+        path: path.to_string(),
+        records: ledger.records().count(),
+        rejected_lines: ledger.rejected_lines.clone(),
+        units_reviewed,
+        files_reviewed,
+    });
 }
 
 const ORDER: [Status; 6] = [
@@ -950,6 +1096,27 @@ pub fn summary(r: &Report) -> String {
     if !r.unreadable.is_empty() {
         let _ = writeln!(s, "{:<20} {:>6}", "unreadable", r.unreadable.len());
     }
+    if let Some(l) = &r.ledger {
+        let units: usize = r
+            .files
+            .iter()
+            .map(|f| f.units.len() + f.converted_units.len())
+            .sum();
+        let _ = writeln!(
+            s,
+            "review: {} of {} files and {} of {} units reviewed ({} records{})",
+            l.files_reviewed,
+            r.files.len(),
+            l.units_reviewed,
+            units,
+            l.records,
+            if l.rejected_lines.is_empty() {
+                String::new()
+            } else {
+                format!(", {} lines not applied", l.rejected_lines.len())
+            }
+        );
+    }
     s
 }
 
@@ -991,7 +1158,11 @@ pub fn markdown(r: &Report) -> String {
     let mut files: Vec<&FileReport> = r.files.iter().collect();
     files.sort_by(|a, b| b.status.cmp(&a.status).then(a.path.cmp(&b.path)));
     for f in files {
-        let _ = writeln!(s, "### `{}`: {}\n", f.path, f.status.label());
+        let reviewed = match &f.review {
+            Some(r) if r.reviewed => ", accepted in review",
+            _ => "",
+        };
+        let _ = writeln!(s, "### `{}`: {}{reviewed}\n", f.path, f.status.label());
         for u in f.units.iter().filter(|u| u.status >= Status::Decision) {
             let _ = writeln!(
                 s,

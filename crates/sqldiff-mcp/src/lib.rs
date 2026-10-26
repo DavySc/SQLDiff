@@ -1161,7 +1161,11 @@ impl Server {
         if let Some(o) = &out {
             tree::prepare_out(&a.src, o, overwrite)?;
         }
-        let t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
+        let mut t = tree::convert(&a, &inputs, unreadable, out.as_deref())?;
+        // Review decisions committed next to the converted tree.
+        if let Some(o) = &out {
+            tree::review_in(&mut t, &inputs, o)?;
+        }
         let written = match &out {
             Some(o) => Some(tree::write(&t, o)?),
             None => None,

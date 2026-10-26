@@ -20,7 +20,11 @@ pub struct Args {
 pub fn run(a: Args) -> Result<ExitCode, String> {
     let (inputs, unreadable) = tree::read(&a.tree)?;
     tree::prepare_out(&a.tree.src, &a.out, a.overwrite)?;
-    let t = tree::convert(&a.tree, &inputs, unreadable, Some(&a.out))?;
+    let mut t = tree::convert(&a.tree, &inputs, unreadable, Some(&a.out))?;
+    // Review decisions committed next to the converted tree.
+    for w in tree::review_in(&mut t, &inputs, &a.out)? {
+        eprintln!("{}: not applied: {w}", sqldiff_convert::review::LEDGER_FILE);
+    }
     let (json, md) = tree::write(&t, &a.out)?;
     print!("{}", tree::summary(&t.report));
     eprintln!("wrote {} and {}", json.display(), md.display());

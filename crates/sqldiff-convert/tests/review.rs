@@ -289,3 +289,86 @@ fn trailing_blanks_outdate_decisions_and_unplaced_findings_hold_the_file() {
         "a converted unit nobody approved is not reviewed"
     );
 }
+
+mod tree_report {
+    use super::*;
+    use sqldiff_convert::tree;
+
+    fn args(src: &std::path::Path) -> tree::Args {
+        tree::Args {
+            src: src.to_path_buf(),
+            from: Dialect::Tsql,
+            to: Dialect::Postgres,
+            jobs: Some(1),
+            no_catalog: false,
+            template: None,
+            extensions: tree::extensions(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn the_tree_report_lists_every_unit_by_id_and_applies_the_committed_ledger() {
+        let dir = std::env::temp_dir().join(format!("sqldiff-review-tree-{}", std::process::id()));
+        let (src, out) = (dir.join("src"), dir.join("out"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(src.join("procs")).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let text = format!("SELECT 1 AS x;\n{ASSUMING}");
+        std::fs::write(src.join("procs/p.sql"), &text).unwrap();
+
+        let a = args(&src);
+        let (inputs, unreadable) = tree::read(&a).unwrap();
+        let t = tree::convert(&a, &inputs, unreadable, Some(&out)).unwrap();
+        let f = &t.report.files[0];
+        assert_eq!(f.path, PATH);
+        let c = &t.conversions[0];
+        assert_eq!(f.units.len() + f.converted_units.len(), c.units.len());
+        assert!(f.converted_units.iter().all(|u| u.rules.is_empty()));
+        let ids = unit_ids(PATH, &text, c);
+        let mut listed: Vec<&str> = f
+            .units
+            .iter()
+            .chain(&f.converted_units)
+            .map(|u| u.id.as_str())
+            .collect();
+        listed.sort();
+        let mut want: Vec<&str> = ids.iter().map(String::as_str).collect();
+        want.sort();
+        assert_eq!(listed, want);
+        assert!(t.report.ledger.is_none());
+
+        // A ledger next to the converted tree: accept everything on the UPDATE.
+        let (i, id, _) = at(&text, c, "UPDATE");
+        let lines: Vec<String> = c.units[i]
+            .notes
+            .iter()
+            .filter_map(|n| {
+                match n.status {
+                    Status::Assumptions => Some(State::Accepted),
+                    Status::Decision => Some(State::Picked),
+                    _ => None,
+                }
+                .map(|s| record(&text, c, &id, &n.rule, s, By::Human))
+            })
+            .map(|r| serde_json::to_string(&r).unwrap())
+            .chain(["not json".to_string()])
+            .collect();
+        std::fs::write(out.join(LEDGER_FILE), lines.join("\n")).unwrap();
+        let mut t = tree::convert(&a, &inputs, Vec::new(), Some(&out)).unwrap();
+        let bad = tree::review_in(&mut t, &inputs, &out).unwrap();
+        assert_eq!(bad.len(), 1);
+        let f = &t.report.files[0];
+        let u = f.units.iter().find(|u| u.id == id).unwrap();
+        let r = u.review.as_ref().unwrap();
+        assert!(r.open.is_empty(), "{:?}", r.open);
+        assert_eq!(r.reviewed, r.undischargeable.is_empty());
+        assert_eq!(u.status, c.units[i].status, "statuses never change");
+        // The plainly converted SELECT nobody approved keeps the file open.
+        let fr = f.review.as_ref().unwrap();
+        assert!(!fr.reviewed);
+        let l = t.report.ledger.as_ref().unwrap();
+        assert_eq!(l.rejected_lines.len(), 1);
+        assert!(tree::summary(&t.report).contains("units reviewed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
