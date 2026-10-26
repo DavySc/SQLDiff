@@ -396,3 +396,53 @@ fn looked_up_values_and_out_parameters() {
     );
     assert!(witness(&r).is_none(), "{:#?}", r.findings);
 }
+
+#[test]
+fn changes_that_compensate_each_other_have_no_witness() {
+    // Review of #64: each pair differs, the routines do not.
+    let cases = [
+        (
+            "CREATE PROCEDURE dbo.p @p int, @x int OUTPUT AS BEGIN SET @x = @p + 1; SET @x = @x * 2; END",
+            "CREATE PROCEDURE p(p_p integer, INOUT p_x integer) LANGUAGE plpgsql AS $$
+             BEGIN p_x := p_p + 2; p_x := (p_x - 1) * 2; END; $$;",
+        ),
+        (
+            &*ts("UPDATE dbo.item SET qty = @Qty WHERE item_id = @Id; UPDATE dbo.item SET qty = qty + 1 WHERE item_id = @Id;"),
+            &*pg("UPDATE item SET qty = p_qty + 1 WHERE item_id = p_id; UPDATE item SET qty = qty WHERE item_id = p_id;"),
+        ),
+        (
+            &*ts("DELETE FROM dbo.item WHERE item_id = @Id; DELETE FROM dbo.item WHERE item_id <> @Id;"),
+            &*pg("DELETE FROM item WHERE item_id <> p_id; DELETE FROM item WHERE item_id = p_id;"),
+        ),
+        (
+            &*ts("INSERT INTO dbo.item (item_id, qty) VALUES (@Id, @Qty); UPDATE dbo.item SET qty = @Qty WHERE item_id = @Id;"),
+            &*pg("INSERT INTO item (item_id, qty) VALUES (p_id, 0); UPDATE item SET qty = p_qty WHERE item_id = p_id;"),
+        ),
+    ];
+    for (a, b) in cases {
+        for catalog in [false, true] {
+            let r = run(a, T, b, P, catalog);
+            assert!(witness(&r).is_none(), "{a}\n{b}\n{:#?}", r.findings);
+            assert!(!r.verdict.label().starts_with("equal"), "{a}");
+        }
+    }
+    // One changed statement, but another statement writes its table first.
+    let r = run(
+        &ts("DELETE FROM dbo.item WHERE qty > @Qty; DELETE FROM dbo.item WHERE item_id = @Id;"),
+        T,
+        &pg("DELETE FROM item WHERE qty > p_qty; DELETE FROM item WHERE item_id <> p_id;"),
+        P,
+        true,
+    );
+    assert!(witness(&r).is_none(), "{:#?}", r.findings);
+    // Or assigns a parameter it reads.
+    let r = run(
+        "CREATE PROCEDURE dbo.p @Id int, @Qty int AS BEGIN SET @Id = 5; DELETE FROM dbo.item WHERE item_id = @Id; END",
+        T,
+        "CREATE PROCEDURE p(p_id integer, p_qty integer) LANGUAGE plpgsql AS $$
+         BEGIN p_id := 5; DELETE FROM item WHERE item_id <> p_id; END; $$;",
+        P,
+        true,
+    );
+    assert!(witness(&r).is_none(), "{:#?}", r.findings);
+}

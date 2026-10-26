@@ -109,13 +109,20 @@ local variables, temporary tables) stays "unknown". Two-row worlds differ in
 every column and hold no NULL in the first row, so no unique key over those
 columns is broken; worlds without NULL columns are tried first.
 
+A witness is only searched for the one statement pair of a routine that is
+not proven equal, with every statement lowered and no control flow outside
+the comparison, and only when no other statement uses its table or assigns
+a parameter it reads. Two changed statements can compensate each other
+(`x := p + 1; x := x * 2` against `x := p + 2; x := (x - 1) * 2`), and
+another statement can make the witness rows unreachable or undo them.
+
 Every witness that reads or writes a table states `ASM-WITNESS-DATA`: the
 columns hold the values it gives them, and no constraint or trigger rejects
 or replaces the write (column types, constraints and triggers are not known
 from the routine). Parameters are matched by position, so a witness is only
 searched when both routines are the same kind with the same number of
 parameters. Unless each side is that one statement with nothing around it
-(no uncovered control flow, no transaction control), the witness also states
+(no transaction control), the witness also states
 `ASM-WITNESS-PATH`: the inputs reach the statement and its result is not
 undone or overwritten later.
 

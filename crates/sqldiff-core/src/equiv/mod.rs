@@ -176,7 +176,12 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     security(a, b, &ua, &ub, touches, &mut out);
     // Witnesses across dialects compare parameters by position, so the
     // routines must take the same parameters.
-    let wit = (ua.kind == ub.kind && ua.params.len() == ub.params.len()).then(|| Witnessing {
+    // Statements outside the comparison could change or undo the witness.
+    let wit = (ua.kind == ub.kind
+        && ua.params.len() == ub.params.len()
+        && ua.uncovered.is_empty()
+        && ub.uncovered.is_empty())
+    .then(|| Witnessing {
         a: xwit::Side {
             unit: &ua,
             schema: sa,
@@ -189,12 +194,7 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         },
         // One statement on each side and nothing around it: the witness
         // inputs reach it and its result is the routine's.
-        certain: ia.len() == 1
-            && ib.len() == 1
-            && ua.uncovered.is_empty()
-            && ub.uncovered.is_empty()
-            && !ua.txn_control
-            && !ub.txn_control,
+        certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
     pair_items(a, b, &ia, &ib, wit.as_ref(), &mut out);
     error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
@@ -479,6 +479,15 @@ struct Witnessing<'u> {
     certain: bool,
 }
 
+fn other_terms(items: &[Item], k: usize) -> Vec<&Term> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(n, _)| *n != k)
+        .map(|(_, x)| &x.term)
+        .collect()
+}
+
 fn pair_items(
     a: &Analyzed,
     b: &Analyzed,
@@ -506,15 +515,29 @@ fn pair_items(
             }
         }
     }
-    for (i, j) in pairs {
-        let later_a: Vec<&Term> = ia[i + 1..].iter().map(|x| &x.term).collect();
-        let later_b: Vec<&Term> = ib[j + 1..].iter().map(|x| &x.term).collect();
+    // A witness is searched only for the one pair that is not proven
+    // equal: two changed statements can compensate each other (`x := p + 1;
+    // x := x * 2` against `x := p + 2; x := (x - 1) * 2`).
+    let all_paired = pairs.len() == ia.len() && pairs.len() == ib.len();
+    let unequal = pairs
+        .iter()
+        .filter(|&&(i, j)| {
+            ia[i].err.is_some()
+                || ib[j].err.is_some()
+                || !compare::compare(&ia[i].term, &ib[j].term)
+                    .mismatches
+                    .is_empty()
+        })
+        .count();
+    let wit = wit.filter(|_| all_paired && unequal == 1);
+    for &(i, j) in &pairs {
+        let (oa, ob) = (other_terms(ia, i), other_terms(ib, j));
         compare_pair(
             a,
             b,
             &ia[i],
             &ib[j],
-            wit.map(|w| (w, [&later_a[..], &later_b[..]])),
+            wit.map(|w| (w, [&oa[..], &ob[..]])),
             out,
         );
     }

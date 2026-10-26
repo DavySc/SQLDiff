@@ -908,13 +908,57 @@ fn domain(need: &Need, s: &Slot, kind: Kind, tys: &[Option<Ty>; 2], nullable: bo
     Ok(v)
 }
 
+/// The witness's world is the state at the statement and its result is the
+/// routine's: no other statement touches its table (writes before it would
+/// make the chosen rows unreachable, writes after it could undo or repeat
+/// the difference) or assigns a parameter it reads, and every other
+/// statement was lowered.
+fn isolated(need: &Need, others: [&[&Term]; 2]) -> R<()> {
+    let table = need.table.as_deref();
+    let params: Vec<String> = need
+        .kinds
+        .keys()
+        .filter_map(|s| match s {
+            Slot::Param(i) => Some(format!("p{i}")),
+            Slot::Col(_) => None,
+        })
+        .collect();
+    for t in others.iter().flat_map(|l| l.iter()) {
+        if t.is("raw") {
+            return Err("another statement was not lowered".into());
+        }
+        if let Some(tab) = table {
+            let prefix = format!("{tab}#");
+            if t.any(&|x| x.atom().is_some_and(|s| s == tab || s.starts_with(&prefix))) {
+                return Err(format!("another statement uses {tab}"));
+            }
+        }
+        if t.any(&|x| {
+            x.is("assign")
+                && x.kid(0).is_some_and(|v| {
+                    v.is("sym")
+                        && v.kid(0)
+                            .and_then(Term::atom)
+                            .is_some_and(|id| params.iter().any(|p| p == id))
+                })
+        }) {
+            return Err("another statement assigns a parameter the witness reads".into());
+        }
+    }
+    Ok(())
+}
+
 // ---- search -------------------------------------------------------------
+
+/// Candidate values per column.
+type Domains = Vec<(String, Vec<V>)>;
 
 const MAX_WORLDS: usize = 400_000;
 
 /// Looks for inputs under which the two statements' results differ.
-/// `later` holds the statements after each one.
-pub fn search(x: &Term, y: &Term, sa: &Side, sb: &Side, later: [&[&Term]; 2]) -> R<Found> {
+/// `others` holds every other statement of each routine; the caller only
+/// searches when all of them are proven equal to their counterparts.
+pub fn search(x: &Term, y: &Term, sa: &Side, sb: &Side, others: [&[&Term]; 2]) -> R<Found> {
     let a = statement(x)?;
     let b = statement(y)?;
     if a.what != b.what {
@@ -935,12 +979,12 @@ pub fn search(x: &Term, y: &Term, sa: &Side, sb: &Side, later: [&[&Term]; 2]) ->
             return Err("assignment to other than an OUT parameter".into());
         }
         let sym = super::term::n("sym", vec![super::term::a(t.clone())]);
-        if later
+        if others
             .iter()
             .flat_map(|l| l.iter())
             .any(|x| x.any(&|y| *y == sym))
         {
-            return Err(format!("{t} is used after the assignment"));
+            return Err(format!("{t} is used by another statement"));
         }
     }
     if a.table != b.table {
@@ -981,6 +1025,7 @@ pub fn search(x: &Term, y: &Term, sa: &Side, sb: &Side, later: [&[&Term]; 2]) ->
         }
     }
     need.propagate()?;
+    isolated(&need, others)?;
     let sides = [sa, sb];
     let table = need.table.clone();
     let mut params: Vec<(usize, Vec<V>)> = Vec::new();
@@ -1018,7 +1063,7 @@ pub fn search(x: &Term, y: &Term, sa: &Side, sb: &Side, later: [&[&Term]; 2]) ->
         })
         .collect();
     let with_nulls = cols.iter().any(|(_, d)| d.contains(&V::Null));
-    let passes: Vec<(usize, &Vec<(String, Vec<V>)>)> = row_counts
+    let passes: Vec<(usize, &Domains)> = row_counts
         .iter()
         .map(|&n| (n, &non_null))
         .chain(
