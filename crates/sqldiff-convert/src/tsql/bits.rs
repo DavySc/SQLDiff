@@ -220,13 +220,101 @@ impl Cx<'_> {
         if self.expr_dt(ts) == Some(Dt::Bit) {
             return true;
         }
-        // A column of the table being created or altered.
+        let name = |t: &T| tsql_unquote(&t.s).to_ascii_lowercase();
         match sig(ts).as_slice() {
-            [i] if matches!(ts[*i].k, IDENT | QUOTED_IDENT) => self
-                .bit_cols
-                .contains(&tsql_unquote(&ts[*i].s).to_ascii_lowercase()),
+            // A column of the table being created or altered, or a name the
+            // statement gave a bit.
+            [i] if matches!(ts[*i].k, IDENT | QUOTED_IDENT) => {
+                self.bit_cols.contains(&name(&ts[*i]))
+                    || self.expr_dt(ts).is_none() && self.bit_aliases.contains(&name(&ts[*i]))
+            }
+            // `d.a`, a derived table's column.
+            [q, d, i]
+                if matches!(ts[*q].k, IDENT | QUOTED_IDENT)
+                    && ts[*d].k == DOT
+                    && matches!(ts[*i].k, IDENT | QUOTED_IDENT) =>
+            {
+                self.expr_dt(ts).is_none() && self.bit_aliases.contains(&name(&ts[*i]))
+            }
             _ => false,
         }
+    }
+
+    /// The bit columns of every table `ts` names, by column name.
+    fn named_bit_cols(&self, ts: &[T]) -> Vec<String> {
+        let s = sig(ts);
+        let mut cols: Vec<String> = Vec::new();
+        let mut k = 0;
+        while k < s.len() {
+            let mut e = k;
+            while e + 2 < s.len()
+                && ts[s[e + 1]].k == DOT
+                && matches!(ts[s[e + 2]].k, IDENT | QUOTED_IDENT)
+            {
+                e += 2;
+            }
+            if matches!(ts[s[k]].k, IDENT | QUOTED_IDENT) {
+                cols.extend(self.table_bit_cols(&ts[s[k]..=s[e]]));
+            }
+            k = e + 1;
+        }
+        cols
+    }
+
+    /// The names a select list in `ts` gives a bit: `x AS a`, `x a`.
+    pub(super) fn bit_aliases_of(&self, ts: &[T]) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.bits_possible() || self.db2() {
+            return out;
+        }
+        let cols = self.named_bit_cols(ts);
+        let s = sig(ts);
+        let lower = |t: &T| tsql_unquote(&t.s).to_ascii_lowercase();
+        for (k, &i) in s.iter().enumerate() {
+            // A bit column selected under its own name (`SELECT Id, IsActive FROM`).
+            if matches!(ts[i].k, IDENT | QUOTED_IDENT)
+                && cols.contains(&lower(&ts[i]))
+                && k > 0
+                && (ts[s[k - 1]].k == COMMA || ts[s[k - 1]].is("SELECT"))
+                && s.get(k + 1)
+                    .is_some_and(|&n| ts[n].k == COMMA || ts[n].is("FROM"))
+            {
+                out.push(lower(&ts[i]));
+                continue;
+            }
+            let (alias, before) = if ts[i].is("AS") {
+                match (s.get(k + 1), k.checked_sub(1).map(|p| s[p])) {
+                    (Some(&a), Some(b)) => (a, b),
+                    _ => continue,
+                }
+            } else if matches!(ts[i].k, IDENT | QUOTED_IDENT)
+                && !sqldiff_core::normalize::is_keyword(&ts[i].up())
+                && s.get(k + 1)
+                    .is_some_and(|&n| ts[n].k == COMMA || ts[n].is("FROM"))
+                && k > 0
+                && matches!(ts[s[k - 1]].k, IDENT | QUOTED_IDENT | R_PAREN)
+                && !ts[s[k - 1]].is("SELECT")
+            {
+                (i, s[k - 1])
+            } else {
+                continue;
+            };
+            if !matches!(ts[alias].k, IDENT | QUOTED_IDENT) {
+                continue;
+            }
+            if let Some(st) = operand_start(ts, before) {
+                let x = &ts[st..=before];
+                // A column named like a bit column of a table here, or a typed bit.
+                let named = x
+                    .last()
+                    .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+                    .is_some_and(|t| cols.contains(&tsql_unquote(&t.s).to_ascii_lowercase()));
+                if named || self.expr_dt(x) == Some(Dt::Bit) {
+                    out.push(tsql_unquote(&ts[alias].s).to_ascii_lowercase());
+                }
+            }
+        }
+        out
     }
 
     fn is_numeric(&self, ts: &[T]) -> bool {
@@ -369,10 +457,18 @@ impl Cx<'_> {
                     {
                         continue;
                     }
-                    for (st, en) in [
+                    let spans = [
                         (operand_start(ts, lp), Some(lp)),
                         (Some(rn), operand_end(ts, rn)),
-                    ] {
+                    ];
+                    // SQL Server rejects arithmetic between two bits: no output claims it.
+                    if let [(Some(a), Some(b)), (Some(c), Some(d))] = spans {
+                        if self.is_bit(&ts[a..=b]) && self.is_bit(&ts[c..=d]) {
+                            self.unhandled(&ts[a..=d]);
+                            continue;
+                        }
+                    }
+                    for (st, en) in spans {
                         if let (Some(st), Some(en)) = (st, en) {
                             if self.is_bit(&ts[st..=en]) {
                                 e.post.insert(en, "::integer".into());
@@ -432,6 +528,7 @@ impl Cx<'_> {
                         }
                     }
                 }
+                IDENT if t.is("BETWEEN") => self.bit_between(ts, i, &mut e),
                 IDENT if t.is("IN") => self.bit_in(ts, i, &mut e),
                 IDENT if t.is("VALUES") => self.bit_values(ts, i, &mut e),
                 IDENT if t.is("COALESCE") || t.is("CONCAT") => {
@@ -555,6 +652,55 @@ impl Cx<'_> {
             }
         }
         self.unhandled(&ts[ls..=re]);
+    }
+
+    /// `b BETWEEN lo AND hi` on a bit: bounds of 0 and 1 are FALSE and TRUE.
+    fn bit_between(&mut self, ts: &[T], i: usize, e: &mut BitEdits) {
+        let Some(lp) = prev_sig(ts, i)
+            .filter(|&p| !ts[p].is("NOT"))
+            .or_else(|| prev_sig(ts, i).and_then(|p| prev_sig(ts, p)))
+        else {
+            return;
+        };
+        let Some(ls) = operand_start(ts, lp) else {
+            return;
+        };
+        let lo = next_sig(ts, i).and_then(|f| operand_end(ts, f).map(|l| (f, l)));
+        let and = lo
+            .and_then(|(_, l)| next_sig(ts, l))
+            .filter(|&a| ts[a].is("AND"));
+        let hi = and
+            .and_then(|a| next_sig(ts, a))
+            .and_then(|f| operand_end(ts, f).map(|l| (f, l)));
+        let x = &ts[ls..=lp];
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            if self.is_bit(x) {
+                self.unhandled(&ts[ls..=i]);
+            }
+            return;
+        };
+        let bounds = [lo, hi];
+        if !self.is_bit(x) {
+            if bounds.iter().any(|&(f, l)| self.is_bit(&ts[f..=l])) {
+                self.unhandled(&ts[ls..=hi.1]);
+            }
+            return;
+        }
+        for (f, l) in bounds {
+            let b = &ts[f..=l];
+            match int_literal(b) {
+                Some(0) => {
+                    e.rep.insert(f, "FALSE".into());
+                }
+                Some(1) => {
+                    e.rep.insert(f, "TRUE".into());
+                }
+                _ if self.is_bit(b)
+                    || f == l
+                        && (ts[f].is("NULL") || ts[f].k == STRING && bool_string(&ts[f].s)) => {}
+                _ => self.unhandled(&ts[ls..=hi.1]),
+            }
+        }
     }
 
     fn bit_in(&mut self, ts: &[T], i: usize, e: &mut BitEdits) {
@@ -736,23 +882,10 @@ impl Cx<'_> {
             if !self.db2() && ts.iter().any(bit_var) {
                 return true;
             }
-            // Every dotted name that is a table: its bit columns, by name.
-            let s = sig(&ts);
-            let mut cols: Vec<String> = Vec::new();
-            let mut k = 0;
-            while k < s.len() && !self.db2() {
-                let mut e = k;
-                while e + 2 < s.len()
-                    && ts[s[e + 1]].k == DOT
-                    && matches!(ts[s[e + 2]].k, IDENT | QUOTED_IDENT)
-                {
-                    e += 2;
-                }
-                if matches!(ts[s[k]].k, IDENT | QUOTED_IDENT) {
-                    cols.extend(self.table_bit_cols(&ts[s[k]..=s[e]]));
-                }
-                k = e + 1;
-            }
+            let cols = match self.db2() {
+                true => Vec::new(),
+                false => self.named_bit_cols(&ts),
+            };
             if !self.db2()
                 && ts.iter().any(|t| {
                     matches!(t.k, IDENT | QUOTED_IDENT)

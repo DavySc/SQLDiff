@@ -323,6 +323,14 @@ fn explain_terms(
             format!("{sx} fails here: {why}."),
         ));
     }
+    // SQL Server rejects arithmetic between two bits.
+    if x.is("type-error") && x.kid(0).and_then(Term::atom) == Some("tsql") {
+        return Some((
+            ChangeClass::Semantic,
+            "equiv.bool-type-error",
+            format!("{sx} fails here: SQL Server has no arithmetic between two bits (Msg 402 / 8117), while {sy} computes it."),
+        ));
+    }
     // A boolean written as text: 'true' / 'false' against a bit's '1' / '0'.
     if x.is("booltext")
         && ((y.is("cast") && y.kid(1) == x.kid(1)) || (y.is("tostr") && y.kid(0) == x.kid(1)))

@@ -498,3 +498,57 @@ fn iif_is_a_case() {
         Dialect::Postgres,
     );
 }
+
+/// From the cross-review of the first version.
+#[test]
+fn review_cases() {
+    check(
+        &[
+            // A widening integer cast stays: bigint arithmetic overflows elsewhere.
+            (
+                "Id, CAST(Score AS bigint) * 2147483647 AS s FROM dbo.Flags",
+                "Id, Score * 2147483647 AS s FROM Flags",
+                NotEq,
+            ),
+            (
+                "Id, CAST(Score AS bigint) + 2147483647 AS s FROM dbo.Flags",
+                "Id, Score + 2147483647 AS s FROM Flags",
+                NotEq,
+            ),
+            // BETWEEN on a boolean.
+            (
+                "Id FROM dbo.Flags WHERE IsActive BETWEEN 0 AND 1",
+                "Id FROM Flags WHERE IsActive BETWEEN 0 AND 1",
+                Diff,
+            ),
+            (
+                "Id FROM dbo.Flags WHERE IsActive BETWEEN 0 AND 1",
+                "Id FROM Flags WHERE IsActive BETWEEN FALSE AND TRUE",
+                Eq,
+            ),
+            // A bit read through a derived table.
+            (
+                "d.Id FROM (SELECT Id, IsActive AS a FROM dbo.Flags) d WHERE d.a = 1",
+                "d.Id FROM (SELECT Id, IsActive AS a FROM Flags) d WHERE d.a = 1",
+                Diff,
+            ),
+            (
+                "d.Id FROM (SELECT Id, IsActive AS a FROM dbo.Flags) d WHERE d.a = 1",
+                "d.Id FROM (SELECT Id, IsActive AS a FROM Flags) d WHERE d.a = TRUE",
+                Eq,
+            ),
+            (
+                "d.Id FROM (SELECT Id, IsActive FROM dbo.Flags) d WHERE IsActive = 1",
+                "d.Id FROM (SELECT Id, IsActive FROM Flags) d WHERE IsActive = 1",
+                Diff,
+            ),
+            // SQL Server rejects arithmetic between two bits.
+            (
+                "Id, IsActive + IsDeleted AS s FROM dbo.Flags",
+                "Id, IsActive::integer + IsDeleted::integer AS s FROM Flags",
+                Diff,
+            ),
+        ],
+        Dialect::Postgres,
+    );
+}

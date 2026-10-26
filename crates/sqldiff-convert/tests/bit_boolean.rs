@@ -236,6 +236,8 @@ fn without_catalogs_a_bit_meeting_a_number_is_not_equal() {
     for view in [
         "CREATE VIEW dbo.V AS SELECT Id FROM dbo.Flags WHERE IsActive = Score;\n",
         "CREATE VIEW dbo.V AS SELECT Id, COALESCE(IsDeleted, 5) AS f FROM dbo.Flags;\n",
+        "CREATE VIEW dbo.V AS SELECT d.Id FROM (SELECT Id, IsActive AS a FROM dbo.Flags) d WHERE d.a = 2;\n",
+        "CREATE VIEW dbo.V AS SELECT Id FROM dbo.Flags WHERE IsActive BETWEEN 0 AND 2;\n",
         "CREATE VIEW dbo.V AS SELECT Id, CASE WHEN Score > 1 THEN IsActive ELSE 2 END AS g FROM dbo.Flags;\n",
         "CREATE VIEW dbo.V AS SELECT Id, IIF(Score > 1, Score, IsActive) AS g FROM dbo.Flags;\n",
     ] {
@@ -308,4 +310,36 @@ fn idiom_rules_leave_bits_to_the_bit_rules() {
         u.notes,
         c.output
     );
+}
+
+/// From the cross-review of the first version.
+#[test]
+fn between_derived_tables_and_bit_arithmetic() {
+    let src = "CREATE VIEW dbo.V AS SELECT Id FROM dbo.Flags WHERE IsActive BETWEEN 0 AND 1 AND IsDeleted NOT BETWEEN 0 AND 0;\n";
+    let c = pg(src);
+    has(
+        &c,
+        "IsActive BETWEEN FALSE AND TRUE AND IsDeleted NOT BETWEEN FALSE AND FALSE",
+    );
+    assert!(unit(&c, src, "VIEW").status < Status::Unproven, "{c:?}");
+    // A bit read through a derived table is still a bit.
+    let src = "CREATE VIEW dbo.V AS SELECT d.Id FROM (SELECT Id, IsActive AS a, IsDeleted FROM dbo.Flags) d WHERE d.a = 1 AND IsDeleted = 0;\n";
+    let c = pg(src);
+    has(&c, "WHERE d.a = TRUE AND IsDeleted = FALSE");
+    assert!(unit(&c, src, "VIEW").status < Status::Unproven, "{c:?}");
+    for (src, catalogs) in [
+        ("CREATE VIEW dbo.V AS SELECT Id FROM dbo.Flags WHERE IsActive BETWEEN 0 AND 2;\n", true),
+        ("CREATE VIEW dbo.V AS SELECT d.Id FROM (SELECT Id, IsActive AS a FROM dbo.Flags) d WHERE d.a = Score;\n", true),
+        ("CREATE VIEW dbo.V AS SELECT Id, IsActive + IsDeleted AS s FROM dbo.Flags;\n", false),
+    ] {
+        let c = if catalogs {
+            pg(src)
+        } else {
+            let text = format!("{TABLE}GO\n{src}");
+            sqldiff_convert::convert(&text, Dialect::Tsql, Dialect::Postgres).unwrap()
+        };
+        let text = if catalogs { src.to_string() } else { format!("{TABLE}GO\n{src}") };
+        let u = unit(&c, &text, "VIEW");
+        assert!(u.status >= Status::Unproven, "{src}\n{:?}\n{}", u.notes, c.output);
+    }
 }

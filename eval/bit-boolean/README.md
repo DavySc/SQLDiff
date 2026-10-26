@@ -12,6 +12,7 @@ What the runs show, and what the rules rely on:
 - PL/pgSQL assigns an integer to a boolean variable through text, so 1 and 0 work and 2 fails.
 - SQL Server stores any non-zero number in a bit as 1, so `CAST(0.4 AS bit)` is 1 and `bit = 2` is never true. It reads `'true'`, `'1'`, `' 1 '`, `'2'` and `'01'` as 1, and `'false'`, `'0'` and `''` as 0, but rejects `'yes'`, `'t'` and `'on'`. PostgreSQL rejects `'2'` and `''` as booleans, and accepts `'yes'` and `' true '`.
 - In SQL Server, `~b` returns a bit (NOT). `b & c`, `b | c` and `b ^ c` of two bits return bits, `b | 1` returns an int, and NULL propagates through all of them. `ISNULL(b, 5)` is 1, while `COALESCE(b, 5)` is 5.
+- SQL Server rejects arithmetic between two bits (`b + c` is Msg 402, `b * c` Msg 8117), but takes `b + 0`. `b BETWEEN 0 AND 1` works on a bit, and on a boolean only as `BETWEEN FALSE AND TRUE`. A bit read through a derived table (`d.a = 1`) is still a boolean in PostgreSQL.
 - A bit cast to text is `'1'` in SQL Server, while a boolean cast to text is `'true'` (and `'t'` in `concat`). False sorts before true, as 0 before 1.
 
 If you change a bit rule, add the probe here and run it on both engines first. The Db2 for i questions are in `probes/db2i` (fact V28).

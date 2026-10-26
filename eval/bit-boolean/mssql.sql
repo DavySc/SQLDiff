@@ -17,10 +17,11 @@ SELECT 'eqyes', id FROM #f WHERE b = 'yes';
 GO
 SELECT 'eq2str', id FROM #f WHERE b = '2';
 GO
-SELECT 'ops', id, ~b AS nb, b & c AS bc, b | 1 AS b1, b ^ 1 AS bx, b ^ c AS bxc, b + 0 AS plus, -b AS neg FROM #f ORDER BY id;
+SELECT 'ops', id, ~b AS nb, b & c AS bc, b | 1 AS b1, b ^ 1 AS bx, b ^ c AS bxc, b + 0 AS plus FROM #f ORDER BY id;
 SELECT 'types', SQL_VARIANT_PROPERTY(~b,'BaseType'), SQL_VARIANT_PROPERTY(b & c,'BaseType'), SQL_VARIANT_PROPERTY(b | 1,'BaseType'), SQL_VARIANT_PROPERTY(b+0,'BaseType'), SQL_VARIANT_PROPERTY(ISNULL(b,5),'BaseType'), SQL_VARIANT_PROPERTY(COALESCE(b,5),'BaseType'), SQL_VARIANT_PROPERTY(CASE WHEN id>1 THEN b ELSE 0 END,'BaseType'), SQL_VARIANT_PROPERTY(IIF(id>1,b,c),'BaseType') FROM #f WHERE id = 1;
 SELECT 'isnull', id, ISNULL(b, 5), COALESCE(b, 5), ISNULL(b, 0), COALESCE(b, 0) FROM #f ORDER BY id;
 SELECT 'order', id FROM #f ORDER BY b, id;
+GO
 SELECT 'neg', -CAST(1 AS bit);
 GO
 SELECT 'sum', SUM(b) FROM #f;
@@ -49,6 +50,7 @@ CREATE TABLE #c (b bit CHECK (b IN (0,1)), d bit DEFAULT 'true', e bit DEFAULT 2
 INSERT INTO #c (b) VALUES (1);
 SELECT 'deflt', b, d, e FROM #c;
 GO
+DROP TABLE #f;
 CREATE TABLE #f (id int, b bit NULL, c bit NULL);
 INSERT INTO #f VALUES (1, 1, 0), (2, 0, 0), (3, NULL, 1), (4, 1, 1);
 SELECT 'ops', id, ~b AS nb, b & c AS bc, b | 1 AS b1, b ^ 1 AS bx, b ^ c AS bxc, b + 0 AS plus, b & 2 AS b2, ~CAST(1 AS int) AS ni FROM #f ORDER BY id;
@@ -62,4 +64,14 @@ DECLARE @v varchar(10) = 'x';
 SELECT 'bitplusstr', CAST(1 AS bit) + '1';
 GO
 SELECT 'bitcmpstr', CASE WHEN CAST(1 AS bit) = 'true' THEN 'y' ELSE 'n' END;
+GO
+SELECT 'between', id FROM #f WHERE b BETWEEN 0 AND 1 ORDER BY id;
+GO
+SELECT 'bitplusbit', b + c FROM #f;
+GO
+SELECT 'bitminusbit', b - c FROM #f;
+GO
+SELECT 'bittimesbit', b * c FROM #f;
+GO
+SELECT 'derived', d.id FROM (SELECT id, b AS a FROM #f) d WHERE d.a = 1 ORDER BY d.id;
 GO

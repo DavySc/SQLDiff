@@ -49,3 +49,7 @@ select 'iif', case when true then 1 else 0 end;
 select 'bitops', true & false;
 select 'bnot', ~true;
 select 'xor', true <> false, true # false;
+select 'between', id from f where b between 0 and 1;
+select 'betweenb', id from f where b between false and true order by id;
+select 'derived', d.id from (select id, b as a from f) d where d.a = 1;
+select 'derivedb', d.id from (select id, b as a from f) d where d.a = true order by d.id;

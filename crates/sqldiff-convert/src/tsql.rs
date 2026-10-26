@@ -72,6 +72,7 @@ pub(crate) fn convert(
         bit_cols: Vec::new(),
         bit_unhandled: Vec::new(),
         bit_outer: None,
+        bit_aliases: Vec::new(),
         ret_bit: false,
     };
     let mut out = Out::default();
@@ -182,6 +183,9 @@ struct Cx<'a> {
     /// Edits the next `expr` call applies to its slice, around its own
     /// (a value stored in a bit, from `bit_store_text`).
     bit_outer: Option<bits::BitEdits>,
+    /// Names the statement gives a bit in a select list (`IsActive AS a`),
+    /// lower case: a derived table's bit column, read outside it.
+    bit_aliases: Vec<String>,
     /// The function being converted returns BIT.
     ret_bit: bool,
 }
@@ -428,8 +432,11 @@ impl<'a> Cx<'a> {
             .ok_or(No("view body is not a query".into()))?;
         let qt = tokens(&stmt);
         let outer = std::mem::replace(&mut self.scope, scope_of(&qt));
+        let aliases = self.bit_aliases_of(&qt);
+        let outer_aliases = std::mem::replace(&mut self.bit_aliases, aliases);
         let q = self.select(&qt);
         self.scope = outer;
+        self.bit_aliases = outer_aliases;
         let (q, _) = q?;
         Ok(Some(format!("CREATE OR REPLACE VIEW {name} AS\n{q};")))
     }
@@ -1228,9 +1235,13 @@ impl<'a> Cx<'a> {
     // ----- statements -----------------------------------------------------------
 
     fn stmt(&mut self, n: &SyntaxNode) -> R<String> {
-        let outer = std::mem::replace(&mut self.scope, scope_of(&tokens(n)));
+        let ts = tokens(n);
+        let outer = std::mem::replace(&mut self.scope, scope_of(&ts));
+        let aliases = self.bit_aliases_of(&ts);
+        let outer_aliases = std::mem::replace(&mut self.bit_aliases, aliases);
         let r = self.guard_bits(|cx| cx.stmt_in_scope(n));
         self.scope = outer;
+        self.bit_aliases = outer_aliases;
         r
     }
 

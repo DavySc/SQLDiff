@@ -139,6 +139,9 @@ pub struct Canon<'a> {
     pub by_name: bool,
     /// Table names of the statement being lowered (see `Item::names`).
     pub names: Vec<(String, Option<String>)>,
+    /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
+    /// bit read through a derived table still meets numbers as a bit.
+    sub_bits: HashMap<String, Vec<(String, Ty)>>,
 }
 
 /// Folded name; names whose quoting is significant (leading `"`) keep their case.
@@ -162,6 +165,7 @@ impl<'a> Canon<'a> {
             single_row: false,
             seen_tables: HashMap::new(),
             excluded: None,
+            sub_bits: HashMap::new(),
             by_name: false,
             names: Vec::new(),
         }
@@ -267,6 +271,13 @@ impl<'a> Canon<'a> {
     }
 
     fn col_ty(&self, table: &str, col: &str) -> (Option<Ty>, Option<bool>) {
+        if let Some((_, ty)) = self
+            .sub_bits
+            .get(table)
+            .and_then(|cs| cs.iter().find(|(c, _)| c == col))
+        {
+            return (Some(*ty), None);
+        }
         match self
             .schema
             .table(Self::base_table(table))
@@ -733,14 +744,24 @@ impl<'a> Canon<'a> {
                 let target = ty
                     .is_some_and(|t| !t.is_string())
                     .then(|| self.target_of(&t, ty));
-                let bound = |e: &Expr, c: &mut Self| -> R<Term> {
+                let bound = |e: &Expr, c: &mut Self| -> R<(Term, Option<Ty>)> {
                     Ok(match (e, target) {
-                        (Expr::Str(s), Some(target)) => c.lit_as(s, target, true),
-                        _ => c.expr(e)?.0,
+                        (Expr::Str(s), Some(target)) => (c.lit_as(s, target, true), ty),
+                        _ => c.expr(e)?,
                     })
                 };
-                let lo = bound(lo, self)?;
-                let hi = bound(hi, self)?;
+                let (lo, lty) = bound(lo, self)?;
+                let (hi, hty) = bound(hi, self)?;
+                // A boolean between numbers (or a number between booleans).
+                let tys = [ty, lty, hty];
+                let numeric = |t: &Option<Ty>| t.is_some_and(|t| t.is_numeric());
+                if tys.iter().any(|t| self.is_bool(t)) && tys.iter().any(numeric) {
+                    return Ok((self.type_error("cmp", vec![t, lo, hi]), None));
+                }
+                let (t, lo, hi) = match tys.iter().any(|t| self.is_bool(t)) {
+                    true => (Self::bit_value(t), Self::bit_value(lo), Self::bit_value(hi)),
+                    false => (t, lo, hi),
+                };
                 let mut kids = vec![t, lo, hi, a(neg.to_string())];
                 if ty.map_or(true, |t| t.is_string()) {
                     kids.push(self.dtag());
@@ -898,14 +919,10 @@ impl<'a> Canon<'a> {
                 return (Self::nonzero(v.0), to);
             }
         }
-        // A wider integer type holds every value unchanged.
-        if let Some(src) = v.1 {
-            if src.fam == Fam::Int
-                && dst.fam == Fam::Int
-                && matches!((src.len, dst.len), (Some(s), Some(d)) if d >= s)
-            {
-                return (v.0, to);
-            }
+        // A bit is 0 or 1 in int, as boolean::integer is. Only to int: in a
+        // wider type the arithmetic that follows overflows elsewhere.
+        if self.is_bit(&v.1) && dst.fam == Fam::Int && dst.len == Some(32) {
+            return (v.0, to);
         }
         // Integer to string: every dialect prints the plain decimal form.
         if dst.is_string() && dst.fam == Fam::VarChar {
@@ -1192,6 +1209,13 @@ impl<'a> Canon<'a> {
                 }
                 _ => {}
             }
+        }
+        // SQL Server: no arithmetic between two bits (Msg 402, 8117).
+        if self.is_bit(&lty) && self.is_bit(&rty) && matches!(op, "+" | "-" | "*" | "/" | "%") {
+            return Ok((
+                n("type-error", vec![a("tsql"), a("bit-arith"), a(op), lt, rt]),
+                None,
+            ));
         }
         if self.is_bool(&lty) || self.is_bool(&rty) {
             let numeric = |t: &Option<Ty>| t.is_some_and(|t| t.is_numeric());
@@ -1497,10 +1521,33 @@ impl<'a> Canon<'a> {
                     return Err("derived column lists are not supported".into());
                 }
                 let saved = std::mem::take(&mut self.scopes);
-                let q = self.query(query, QCtx::Set);
+                let q = self.query_parts(query, QCtx::Set);
                 self.scopes = saved;
-                let q = q?;
+                let (mut parts, items) = q?;
                 let key = alias.clone().map(|x| lc(&x)).unwrap_or_default();
+                // The bit and boolean columns, by the name the item gives them.
+                if query.set_ops.is_empty() && query.items.len() == items.len() {
+                    let bits: Vec<(String, Ty)> = query
+                        .items
+                        .iter()
+                        .zip(&items)
+                        .filter_map(|(it, (_, ty))| {
+                            let ty = ty.filter(|_| self.is_bit(ty) || self.is_bool(ty))?;
+                            let name = match (&it.alias, &it.expr) {
+                                (Some(a), _) => a.clone(),
+                                (None, Expr::Name(p)) => p.last()?.clone(),
+                                _ => return None,
+                            };
+                            Some((lc(name.trim_matches(['[', ']', '"'])), ty))
+                        })
+                        .collect();
+                    if !bits.is_empty() {
+                        self.sub_bits.insert(format!("sub:{key}"), bits);
+                    }
+                }
+                let item_terms: Vec<Term> = items.into_iter().map(|x| x.0).collect();
+                parts.insert(1, n("items", item_terms));
+                let q = (n("q", parts), None::<Ty>);
                 self.scopes.last_mut().unwrap().push(Binding {
                     key: key.clone(),
                     table: format!("sub:{key}"),

@@ -1,4 +1,6 @@
 PostgreSQL 18.6 (Debian 18.6-1.pgdg13+2) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit
+CREATE TABLE
+INSERT 0 4
 ERROR:  operator does not exist: boolean = integer
 LINE 1: select 'eq1', id from f where b = 1;
                                         ^
@@ -15,16 +17,32 @@ ERROR:  column "b" is of type boolean but expression is of type integer
 LINE 1: insert into f values (5, 1, 0);
                                  ^
 HINT:  You will need to rewrite or cast the expression.
+INSERT 0 1
 ERROR:  column "c" is of type boolean but expression is of type integer
 LINE 1: update f set c = 1 where id = 5;
                          ^
 HINT:  You will need to rewrite or cast the expression.
+eqstr|1
+eqstr|4
+eqstr|5
+eqstr1|1
+eqstr1|4
+eqstr1|5
+eqstrTRUE|1
+eqstrTRUE|4
+eqstrTRUE|5
+eqstrsp|1
+eqstrsp|4
+eqstrsp|5
 ERROR:  invalid input syntax for type boolean: "2"
 LINE 1: select 'eqstr2', id from f where b = '2' order by id;
                                              ^
 ERROR:  invalid input syntax for type boolean: ""
 LINE 1: select 'eqempty', id from f where b = '' order by id;
                                               ^
+eqyes|1
+eqyes|4
+eqyes|5
 ERROR:  cannot cast type bigint to boolean
 LINE 1: ...olean, 0::boolean, (null::int)::boolean, 5::bigint::boolean,...
                                                              ^
@@ -44,32 +62,6 @@ LINE 1: select 'coalesce', coalesce(b, 0) from f;
 ERROR:  CASE types integer and boolean cannot be matched
 LINE 1: select 'case', case when id > 1 then b else 0 end from f;
                                              ^
-ERROR:  function max(boolean) does not exist
-LINE 1: select 'max', max(b) from f;
-                      ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-ERROR:  function sum(boolean) does not exist
-LINE 1: select 'sum', sum(b) from f;
-                      ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-CREATE TABLE
-INSERT 0 4
-INSERT 0 1
-eqstr|1
-eqstr|4
-eqstr|5
-eqstr1|1
-eqstr1|4
-eqstr1|5
-eqstrTRUE|1
-eqstrTRUE|4
-eqstrTRUE|5
-eqstrsp|1
-eqstrsp|4
-eqstrsp|5
-eqyes|1
-eqyes|4
-eqyes|5
 notb|1|f
 notb|2|t
 notb|3|
@@ -90,6 +82,14 @@ orderdesc|1
 orderdesc|4
 orderdesc|5
 orderdesc|2
+ERROR:  function max(boolean) does not exist
+LINE 1: select 'max', max(b) from f;
+                      ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  function sum(boolean) does not exist
+LINE 1: select 'sum', sum(b) from f;
+                      ^
+HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
 boolagg|f|t
 sumint|3|1
 CREATE FUNCTION
@@ -105,29 +105,29 @@ ERROR:  invalid input syntax for type boolean: "2"
 CONTEXT:  PL/pgSQL function inline_code_block line 1 during statement block local variable initialization
 NOTICE:  v t
 NOTICE:  v t
+DO
 ERROR:  argument of DEFAULT must be type boolean, not type integer
 LINE 1: create or replace procedure pd(p boolean default 0) language...
                                                          ^
-DO
 CREATE PROCEDURE
 ERROR:  procedure pd2(integer) does not exist
 LINE 1: call pd2(1);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
-CALL
 ERROR:  procedure pd2(p => integer) does not exist
 LINE 1: call pd2(p => 1);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
 NOTICE:  pd2 t
 NOTICE:  pd2 t
+CALL
+CALL
 ERROR:  operator does not exist: boolean = integer
 LINE 1: b = 1
           ^
 HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
 QUERY:  b = 1
 CONTEXT:  PL/pgSQL function inline_code_block line 1 at IF
-CALL
 concat|xtrue|xt|true|true
 iif|1
 ERROR:  operator does not exist: boolean & boolean
@@ -142,3 +142,18 @@ ERROR:  operator does not exist: boolean # boolean
 LINE 1: select 'xor', true <> false, true # false;
                                           ^
 HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+ERROR:  operator does not exist: boolean >= integer
+LINE 1: select 'between', id from f where b between 0 and 1;
+                                            ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+betweenb|1
+betweenb|2
+betweenb|4
+betweenb|5
+ERROR:  operator does not exist: boolean = integer
+LINE 1: ...ived', d.id from (select id, b as a from f) d where d.a = 1;
+                                                                   ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
+derivedb|1
+derivedb|4
+derivedb|5
