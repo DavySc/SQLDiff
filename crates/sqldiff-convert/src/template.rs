@@ -54,6 +54,8 @@ struct Swap {
 pub struct StandIns {
     stem: String,
     names: Vec<String>,
+    /// The catalogs bind stand-in names across templates.
+    across: bool,
 }
 
 impl StandIns {
@@ -72,7 +74,22 @@ impl StandIns {
         while texts.iter().any(|t| t.contains(&stem)) {
             stem.push('x');
         }
-        StandIns { stem, names }
+        StandIns {
+            stem,
+            names,
+            across: false,
+        }
+    }
+
+    /// Says that the catalogs given to [`check_template`] were built from
+    /// several templates under these stand-ins, so a name with a placeholder
+    /// binds to an object another template defines. That holds only when
+    /// one weave fills each placeholder with the same value everywhere, and
+    /// every unit with a placeholder then says so
+    /// (`ASM-TEMPLATE-SHARED-VALUES`).
+    pub fn bound_across(mut self) -> StandIns {
+        self.across = true;
+        self
     }
 
     /// The stem, in lower case: any output still holding it has a stand-in
@@ -312,6 +329,16 @@ pub fn check_template(
                     to.display_name()
                 ),
             });
+            if stand.across {
+                u.notes.push(Note {
+                    status: Status::Assumptions,
+                    rule: "ASM-TEMPLATE-SHARED-VALUES".into(),
+                    text: format!(
+                        "Names with {} were bound against what other templates define, as if one weave fills each placeholder with the same value in every template; an instance woven with other values binds elsewhere, so check the woven instances.",
+                        used.join(", ")
+                    ),
+                });
+            }
         }
         if out_lower[u.out.start..u.out.end].contains(stem.as_str()) {
             u.notes.push(Note {

@@ -19,6 +19,7 @@ mod changes_cmd;
 mod convert_cmd;
 mod deny_hash;
 mod dist_cmd;
+mod instances_cmd;
 mod queue_cmd;
 mod review_cmd;
 mod source_cmd;
@@ -202,6 +203,15 @@ enum Command {
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
+    /// Check converted templates on every instance the generator produces:
+    /// weave each instance in the manifest from the source templates and
+    /// from the converted ones, and check the target weave as `convert`
+    /// checks its output (parse, binding, residue, limits, the engine's diff
+    /// against the source weave, and the names the values make). Writes the
+    /// woven instances and `instance-report.json` / `.md`. Exit code 0 when
+    /// every instance is converted or converted under assumptions (and,
+    /// with --woven, all generator output is accounted for), 1 otherwise.
+    Instances(instances_cmd::InstancesArgs),
     /// Review what a branch changed (the pull request workflow): diff every
     /// SQL file changed between the merge base of --base and --head, base
     /// against head. Files that did not change are not read. SARIF results
@@ -541,6 +551,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 },
             })
         }
+        Command::Instances(args) => instances_cmd::run(args),
         Command::Changes(args) => changes_cmd::run(args),
         Command::Review(cmd) => review_cmd::run(cmd),
         Command::Dist(args) => dist_cmd::run(args),

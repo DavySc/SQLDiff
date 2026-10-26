@@ -112,6 +112,11 @@ impl Placeholders {
         })
     }
 
+    /// Whether names match parameters in any letter case (kept in upper case).
+    pub fn ignore_case(&self) -> bool {
+        self.ignore_case
+    }
+
     pub fn delimiters(&self) -> (&str, &str) {
         (&self.open, &self.close)
     }
@@ -495,6 +500,7 @@ mod tests {
             ignore_case: false,
             placeholders: None,
             unquoted_name_pattern: None,
+            include: None,
         };
         let mut c = Composition::from_spans(
             "x",

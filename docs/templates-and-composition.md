@@ -20,6 +20,7 @@ known_parameters = ["SCHEMA"]                 # supplied by the generator itself
 ignore_case = false                           # true: [schema] is parameter SCHEMA
 placeholders = "parameters"                   # or "pattern": the generator's naming convention decides
 unquoted_name_pattern = "[A-Za-z_][A-Za-z0-9_]*"  # where the delimiters are not SQL (default: name_pattern)
+include = "include"                           # the special form that pulls a file in (sqldiff instances weaves it)
 ```
 
 A template is split losslessly into SQL spans, placeholders, special forms
