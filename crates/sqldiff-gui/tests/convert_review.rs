@@ -418,3 +418,38 @@ fn out_must_be_the_converted_tree() {
     });
     assert!(r.is_err());
 }
+
+#[test]
+fn a_text_written_into_the_ledger_is_converted_in_on_refresh() {
+    let f = Fixture::new("written", &[("p.sql", PLAIN)]);
+    let mut r = f.open();
+    let p = unit_with(&r, "p.sql", Status::Converted, true);
+    // An agent writes the unit by hand (as MCP `write_unit` does) while
+    // the page is open; no source file changes.
+    let rec = sqldiff_convert::review::Record {
+        unit: p.unit.clone(),
+        path: "p.sql".into(),
+        rule: String::new(),
+        state: State::Written,
+        by: By::Agent,
+        author: "bot".into(),
+        reason: String::new(),
+        at: AT.into(),
+        input_hash: String::new(),
+        output_hash: String::new(),
+        text: Some("CREATE TABLE t (a integer NOT NULL);".into()),
+    };
+    let mut ledger = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(f.out().join(LEDGER_FILE))
+        .unwrap();
+    std::io::Write::write_all(
+        &mut ledger,
+        (serde_json::to_string(&rec).unwrap() + "\n").as_bytes(),
+    )
+    .unwrap();
+    r.refresh().unwrap();
+    assert!(r.converted_last(), "the ledger's texts changed");
+    assert_eq!(r.report_json(), f.open().report_json());
+}

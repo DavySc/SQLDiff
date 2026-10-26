@@ -21,7 +21,7 @@ use sqldiff_core::Dialect;
 use sqldiff_syntax::template::{Derived, MapSpan, OffsetMap, SegmentKind, Template};
 use sqldiff_syntax::LineIndex;
 
-use crate::{check, recount, rewrite_in, span, Conversion, Draft, Note, Status};
+use crate::{check, recount, rewrite_in, span, Conversion, Draft, Note, Status, U16Index};
 use sqldiff_core::catalog::Catalog;
 use sqldiff_core::Options;
 
@@ -565,6 +565,7 @@ pub fn check_template(
     };
 
     let (li, lo) = (LineIndex::new(&t.text), LineIndex::new(&out));
+    let (ui, uo) = (U16Index::new(&t.text), U16Index::new(&out));
     let out_lower = out.to_ascii_lowercase();
     let placeholder_spans: Vec<(usize, usize, &str, &str)> = t
         .segments
@@ -583,9 +584,9 @@ pub fn check_template(
     }
     for u in &mut c.units {
         let (ss, se) = frag.map.src_range(u.src.start, u.src.end);
-        u.src = span(&t.text, &li, (ss, se));
+        u.src = span(&t.text, &li, &ui, (ss, se));
         let (os, oe) = (shift(u.out.start), shift(u.out.end));
-        u.out = span(&out, &lo, (os, oe.max(os)));
+        u.out = span(&out, &lo, &uo, (os, oe.max(os)));
         if u.status == Status::NotConverted {
             continue;
         }
@@ -911,7 +912,7 @@ fn leaked(
     }
     let why = respell(&why, t, stem, written, specials);
     let li = LineIndex::new(&t.text);
-    let all = span(&t.text, &li, (0, t.text.len()));
+    let all = span(&t.text, &li, &U16Index::new(&t.text), (0, t.text.len()));
     c.units = vec![crate::Unit {
         status: Status::Differs,
         notes: vec![Note {
@@ -971,11 +972,12 @@ pub fn split_pair(c: Conversion, head: &str, foot: &str, marker: &str) -> (Conve
         let mut p = c.clone();
         p.output = out;
         let (li, lo) = (LineIndex::new(text), LineIndex::new(&p.output));
+        let (ui, uo) = (U16Index::new(text), U16Index::new(&p.output));
         p.units = units
             .into_iter()
             .map(|mut u| {
-                u.src = span(text, &li, (u.src.start, u.src.end));
-                u.out = span(&p.output, &lo, (u.out.start, u.out.end));
+                u.src = span(text, &li, &ui, (u.src.start, u.src.end));
+                u.out = span(&p.output, &lo, &uo, (u.out.start, u.out.end));
                 u
             })
             .collect();
@@ -985,7 +987,7 @@ pub fn split_pair(c: Conversion, head: &str, foot: &str, marker: &str) -> (Conve
     let Some((line, next)) = cut.filter(|_| ok) else {
         let broken = |text: &str| {
             let li = LineIndex::new(text);
-            let all = span(text, &li, (0, text.len()));
+            let all = span(text, &li, &U16Index::new(text), (0, text.len()));
             let mut p = c.clone();
             p.output = text.to_string();
             p.units = vec![crate::Unit {
