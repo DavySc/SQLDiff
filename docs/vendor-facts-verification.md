@@ -47,6 +47,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V25 | Routine security context | Confirmed (T-SQL, PG), Unverified (Db2 i) | Owner vs caller privileges per dialect; Db2 i default `USRPRF *NAMING` needs a test. |
 | V26 | Db2 i CTE scoping and recursion | Unverified | Forward reference to a later CTE, and a recursive CTE without a column list: probes in `probes/db2i`. |
 | V27 | Db2 i labeled durations as the DATEADD rewrite | Unverified | Month-end clamping and warning 01506, TIME wrap-around, `CAST(… AS INTEGER)` truncation, BIGINT microsecond durations, the 9999 range error: probes `V27-*` in `probes/db2i`. |
+| V29 | Db2 i unique indexes, index names, sequence defaults | Unverified | NULLs, case and trailing blanks in a UNIQUE index; an index named like a table; the default type and first value of a sequence: probes `V29-*` in `probes/db2i`. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -289,6 +290,18 @@ T-SQL `DATEADD` becomes Db2 for i labeled-duration arithmetic (`d + n DAYS`, `(3
 - A BIGINT microsecond duration is accepted and exact; `DATE('9999-12-31') + 1 DAYS` is an error (`ASM-DATEADD-RANGE`).
 
 The T-SQL side was checked on Microsoft's [DATEADD page](https://learn.microsoft.com/sql/t-sql/functions/dateadd-transact-sql): dateparts and abbreviations, truncation of a fractional number, the int range, the string-literal and same-type return rules, the month-end rule for `month`, the smalldatetime and nanosecond rounding rules, and the range error. The page does not cover years or quarters at month end, or `time` wrapping around midnight; the converter states both as assumptions (`ASM-DATEADD-YEAR-END`, `ASM-DATEADD-TIME-WRAP`).
+
+### V29. Unique indexes, index names and sequence defaults on Db2 for i — Unverified
+
+What converted indexes and sequences rely on (`equiv/ddl.rs`, "Indexes, sequences and schemas" in [cross-dialect-proofs.md](cross-dialect-proofs.md)). SQL Server 2022 and PostgreSQL 18 were checked on real systems; Db2 for i was not, and no IBM i page was read for these, so the engine relies on none of them:
+
+- Does a `UNIQUE` index hold only one row with a NULL key, as T-SQL's does, and does `UNIQUE WHERE NOT NULL` hold any number? Until answered, a Db2 for i unique index is not proven.
+- Does a unique `VARCHAR` key accept `'A'` next to `'a'` under the job's sort sequence, and `'a '` next to `'a'`?
+- Is an index named like a table of its schema rejected (`ASM-INDEX-NAME-SCHEMA`)?
+- Which type and first value does a sequence without options have? The converter writes every value out and `NO CACHE`, and the engine compares a Db2 for i sequence only when it does.
+- A schema name longer than 10 characters: its library gets a generated system name (not probed, since the probes create nothing outside `SQLDFPROBE`); such schemas are not proven.
+
+Probes `V29-*` in [probes/db2i](../probes/db2i/README.md).
 
 ## Follow-up
 

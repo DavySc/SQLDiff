@@ -148,3 +148,8 @@ facts = ["V27"]
 file = "crates/sqldiff-convert/src/tsql.rs"
 anchor = "Db2 for i dates and timestamps also end at 0001 and 9999"
 hedge = "fact V27, not checked on a real system"
+
+[[fact]]
+id = "V29"
+title = "UNIQUE indexes (NULLs, case, trailing blanks), index names and sequence defaults"
+review = ["crates/sqldiff-core/src/equiv/ddl.rs", "docs/cross-dialect-proofs.md"]
