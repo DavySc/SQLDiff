@@ -147,7 +147,7 @@ def validate(defs: dict, facts: dict) -> list[str]:
         if pr.get("role") == "control" and not any(o["verdict"] == "consistent" for o in outs):
             errs.append(f"probe {pid}: a control needs a consistent outcome")
     for name in procs:
-        if name not in used:
+        if name not in used and not procs[name].get("helper"):
             errs.append(f"procedure {name} is not used by any probe")
     for f in facts.get("fact", []):
         probes_of = [p for p in defs.get("probe", []) if p.get("fact") == f["id"]]

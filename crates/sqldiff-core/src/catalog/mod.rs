@@ -220,6 +220,9 @@ pub struct Param {
     pub data_type: DataType,
     pub mode: ParamMode,
     pub has_default: bool,
+    /// The default expression as written, when the DDL was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,17 +313,30 @@ impl Catalog {
     }
 
     pub fn put_routine(&mut self, dialect: Dialect, r: Routine) {
-        // Overloads are kept apart by parameter count.
+        // Overloads are kept apart by parameter count, and in PostgreSQL by
+        // the parameter types too (its routines are identified by them).
+        let types = |r: &Routine| -> Vec<String> {
+            if dialect != Dialect::Postgres {
+                return Vec::new();
+            }
+            r.call_params(dialect)
+                .iter()
+                // Lengths, precision and scale are not part of it.
+                .map(|p| p.data_type.base.clone())
+                .collect()
+        };
         let k = (
             r.schema.as_deref().map(|s| key(dialect, s)),
             key(dialect, &r.name),
             r.params.len(),
+            types(&r),
         );
         self.routines.retain(|x| {
             (
                 x.schema.as_deref().map(|s| key(dialect, s)),
                 key(dialect, &x.name),
                 x.params.len(),
+                types(x),
             ) != k
         });
         self.routines.push(r);
