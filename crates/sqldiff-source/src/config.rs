@@ -3,7 +3,9 @@
 //! overrides, command line.
 //!
 //! Project config is `sqldiff.toml` in the working directory or an ancestor.
-//! User config is `$SQLDIFF_CONFIG` or `<config dir>/sqldiff/config.toml`.
+//! User config is `$SQLDIFF_CONFIG`, else `config/config.toml` beside the
+//! executable (a distribution's bundled config), else
+//! `<config dir>/sqldiff/config.toml`.
 //! Both hold the [`Policy`] sections plus the keys of [`ConfigFile`]. Pack
 //! paths are relative to the file that lists them.
 
@@ -537,9 +539,26 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// `$SQLDIFF_CONFIG`, else the platform config directory.
+/// Folder beside the executables that holds a distribution's bundled config
+/// (`sqldiff dist`); never part of a build or a release archive.
+pub const BUNDLED_DIR: &str = "config";
+
+/// `config/config.toml` beside the running executable, if it exists.
+pub fn bundled_config_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // A symlink on PATH points at the real install; look beside that.
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let p = exe.parent()?.join(BUNDLED_DIR).join("config.toml");
+    p.is_file().then_some(p)
+}
+
+/// `$SQLDIFF_CONFIG`, else the bundled config beside the executable, else
+/// the platform config directory.
 pub fn user_config_path() -> Option<PathBuf> {
     if let Some(p) = env_path("SQLDIFF_CONFIG") {
+        return Some(p);
+    }
+    if let Some(p) = bundled_config_path() {
         return Some(p);
     }
     let dir = if cfg!(windows) {

@@ -3,3 +3,6 @@
 __pycache__/
 .claude/worktrees/
 .claude/settings.local.json
+# A colleague bundle (sqldiff dist) never belongs in the repository.
+/config/
+/dist/
