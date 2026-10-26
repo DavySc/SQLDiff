@@ -66,7 +66,7 @@ $B convert src/tsql -o out/pg --to postgres        # or --to db2i; -j N parallel
 target/release/sqldiff-gui review src/tsql out/pg --to postgres
 ```
 
-Ready-to-run builds for Windows, macOS and Linux come from the Release workflow; `sqldiff dist` adds a private config for colleagues on your own machine ([docs/distribution.md](docs/distribution.md)).
+Ready-to-run builds for Windows, macOS and Linux come from the Release workflow; `sqldiff dist` adds a private config for colleagues on your own machine.
 
 Exit codes: `0` equal or equal under assumptions, `1` different or unknown, `2` usage or I/O error.
 
