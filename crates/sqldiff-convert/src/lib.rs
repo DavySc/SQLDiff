@@ -37,6 +37,10 @@ pub enum Status {
     Assumptions,
     /// Converted to one of several faithful targets; someone should choose.
     Decision,
+    /// The engine could neither show the output equivalent to the input nor
+    /// find a difference: the rules' claim is not confirmed, so someone must
+    /// check it (or the engine learn the construct).
+    Unproven,
     /// The engine found a difference or leftover syntax in the output.
     Differs,
     /// No rule applies; the original is kept as a comment.
@@ -49,6 +53,7 @@ impl Status {
             Status::Converted => "converted",
             Status::Assumptions => "under assumptions",
             Status::Decision => "needs a decision",
+            Status::Unproven => "not proven",
             Status::Differs => "differs",
             Status::NotConverted => "not converted",
         }
@@ -91,7 +96,8 @@ pub struct Unit {
     /// binding, residue, limits) that point into this unit.
     pub output_findings: Vec<usize>,
     /// The engine's part of the status: `differs` when a finding or a parse
-    /// problem lands here, else `converted`. Lets a viewer accept assumptions
+    /// problem lands here, `unproven` when the engine's diff could not decide
+    /// it (see [`undecided`]), else `converted`. Lets a viewer accept assumptions
     /// (dropping their notes) without hiding what the engine found.
     pub checked: Status,
 }
@@ -101,6 +107,7 @@ pub struct Counts {
     pub converted: usize,
     pub assumptions: usize,
     pub decision: usize,
+    pub unproven: usize,
     pub differs: usize,
     pub not_converted: usize,
 }
@@ -203,6 +210,23 @@ pub fn gates(f: &sqldiff_core::Finding) -> bool {
     matches!(f.class, C::Binding | C::Residue | C::Limit) || f.rule.starts_with("hazard.")
 }
 
+/// Engine findings of the input-against-output diff that leave the
+/// conversion undecided: the engine compared the two sides and could neither
+/// show them equivalent nor find a witness (`equiv.unproven`, statements it
+/// could not check, transaction or error behaviour it could not prove). A
+/// unit holding one is not `converted` or `under assumptions`, whatever its
+/// rules assumed. Not counted: findings that describe one side's code on its
+/// own (analysis hits, lints and hazards, which `gates` handles for the
+/// output), and binding, residue and limit findings, which the output's own
+/// check decides.
+pub fn undecided(f: &sqldiff_core::Finding) -> bool {
+    use sqldiff_core::ChangeClass as C;
+    f.verdict == sqldiff_core::Verdict::Unknown
+        && !matches!(f.class, C::Binding | C::Residue | C::Limit | C::Cosmetic)
+        && !f.rule.starts_with("rules.")
+        && !f.rule.starts_with("hazard.")
+}
+
 /// Check a draft: diff the input against the output, check the output on
 /// its own, and give every unit the worst of its rule notes and findings.
 pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
@@ -256,6 +280,24 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
             {
                 u.status = u.status.max(Status::Differs);
                 u.checked = Status::Differs;
+            } else if undecided(f) {
+                u.status = u.status.max(Status::Unproven);
+                u.checked = u.checked.max(Status::Unproven);
+                if !u.notes.iter().any(|n| n.rule == f.rule) {
+                    // Notes stay worst first.
+                    let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
+                    u.notes.insert(
+                        at,
+                        Note {
+                            status: Status::Unproven,
+                            rule: f.rule.clone(),
+                            text: format!(
+                                "The engine could not show the output equivalent to the input: {}",
+                                f.witness
+                            ),
+                        },
+                    );
+                }
             }
         }
     }
@@ -341,6 +383,7 @@ fn recount(c: &mut Conversion) {
             Status::Converted => &mut counts.converted,
             Status::Assumptions => &mut counts.assumptions,
             Status::Decision => &mut counts.decision,
+            Status::Unproven => &mut counts.unproven,
             Status::Differs => &mut counts.differs,
             Status::NotConverted => &mut counts.not_converted,
         } += 1;

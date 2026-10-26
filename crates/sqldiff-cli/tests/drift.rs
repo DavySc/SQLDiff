@@ -267,11 +267,24 @@ fn checks_every_instance_against_the_reference() {
             .to_string()
     };
     assert_eq!(status("TouchCustomer"), "converted");
-    // The engine does not compare DDL: the table instance is not decided,
-    // so the run is not ok.
-    assert_eq!(status("Customer"), "unknown");
+    // The table is the one the conversion rules write.
+    assert_eq!(status("Customer"), "converted");
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(r["instances"][0]["ok"], true);
+
+    // A table edited by hand is not decided: the engine cannot compare it.
+    let p = d.join("pg/tables/entity.sql");
+    let table = std::fs::read_to_string(&p).unwrap();
+    write(&p, &table.replace("Price integer", "Price bigint"));
+    let (o, _) = drift(&d, &["--manifest", m.to_str().unwrap()]);
     assert_eq!(o.status.code(), Some(1));
-    assert_eq!(r["instances"][0]["ok"], false);
+    assert_eq!(status("Customer"), "unknown");
+    write(&p, &table);
 
     // A hand edit that changes what a template means fails the check.
     let p = d.join("pg/procs/touch.sql");

@@ -460,17 +460,11 @@ fn fragments_pairs_and_value_kinds() {
         serde_json::from_str(&std::fs::read_to_string(d.join("out/instance-report.json")).unwrap())
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
     // The woven instances discharge the fragment and decision notes.
-    for name in ["list", "save"] {
+    // The table is the one the conversion rules write from the source.
+    for name in ["table", "list", "save"] {
         let i = instance(&r, name);
         assert_eq!(i["status"], "converted", "{name}: {i}");
     }
-    // The engine does not compare DDL: not decided, never converted.
-    let table = instance(&r, "table");
-    assert_eq!(table["status"], "unknown", "{table}");
-    assert!(
-        rules(table).iter().all(|r| r == "equiv.not-covered"),
-        "{table}"
-    );
     let woven = std::fs::read_to_string(d.join("out/target/save.sql")).unwrap();
     assert!(woven.contains("(p_key integer)"), "{woven}");
     // A type given once for every dialect is an assumption.
@@ -500,9 +494,10 @@ fn an_object_two_instances_create_is_not_decided() {
 }
 
 #[test]
-fn a_type_value_per_dialect_in_ddl_is_not_decided() {
-    // A wrong per-dialect type is never checked by the diff: the table
-    // instance must not come out converted (cross-review on #66).
+fn a_table_counts_only_as_the_rules_write_it() {
+    // The diff does not compare tables: a table counts only when it is the
+    // one the conversion rules write, so a wrong per-dialect type is never
+    // converted (cross-review on #66).
     let d = scratch("ddl-type");
     let (src, conv) = (d.join("src"), d.join("conv"));
     // No pairs: this tree has no routine halves.
@@ -534,11 +529,17 @@ fn a_type_value_per_dialect_in_ddl_is_not_decided() {
         "{}",
         String::from_utf8_lossy(&o.stderr)
     );
-    for wrong in ["boolean", "varchar(5)", "smallint"] {
+    for (value, want) in [
+        ("boolean", "unknown"),
+        ("varchar(5)", "unknown"),
+        ("smallint", "unknown"),
+        // What the rules write for INT.
+        ("integer", "converted"),
+    ] {
         write(
             &d.join("instances.toml"),
             &format!(
-                "[params]\nSCHEMA = \"dbo\"\nTABLE = \"Item\"\nKEYTYPE = \"INT\"\n[params_for.postgres]\nSCHEMA = \"public\"\nKEYTYPE = \"{wrong}\"\n\n[[instance]]\nname = \"t\"\ntemplate = \"q/table.sql\"\n"
+                "[params]\nSCHEMA = \"dbo\"\nTABLE = \"Item\"\nKEYTYPE = \"INT\"\n[params_for.postgres]\nSCHEMA = \"public\"\nKEYTYPE = \"{value}\"\n\n[[instance]]\nname = \"t\"\ntemplate = \"q/table.sql\"\n"
             ),
         );
         let (manifest, out) = (d.join("instances.toml"), d.join("out"));
@@ -558,13 +559,43 @@ fn a_type_value_per_dialect_in_ddl_is_not_decided() {
             pack.to_str().unwrap(),
             "--isolated",
         ]);
-        assert_eq!(o.status.code(), Some(1), "{wrong}");
+        assert_eq!(
+            o.status.code(),
+            Some(if want == "converted" { 0 } else { 1 }),
+            "{value}"
+        );
         let r: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(out.join("instance-report.json")).unwrap(),
         )
         .unwrap();
         let t = instance(&r, "t");
-        assert_eq!(t["status"], "unknown", "{wrong}: {t}");
-        assert!(rules(t).contains(&"equiv.not-covered".to_string()), "{t}");
+        assert_eq!(t["status"], want, "{value}: {t}");
+        if want == "unknown" {
+            assert!(
+                rules(t).contains(&"ddl.not-as-converted".to_string()),
+                "{t}"
+            );
+        }
     }
+}
+
+#[test]
+fn a_table_in_another_schema_is_not_decided() {
+    let d = scratch("ddl-schema");
+    setup(&d);
+    // The target names a schema the source table is not in.
+    let m = d.join("instances.toml");
+    let text = std::fs::read_to_string(&m).unwrap();
+    std::fs::write(
+        &m,
+        text.replace("SCHEMA = \"public\"", "SCHEMA = \"sales\""),
+    )
+    .unwrap();
+    let (_, r) = instances(&d, &[]);
+    let t = instance(&r, "tables/Customer");
+    assert_eq!(t["status"], "unknown", "{t}");
+    assert!(
+        rules(t).contains(&"ddl.not-as-converted".to_string()),
+        "{t}"
+    );
 }

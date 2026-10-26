@@ -52,7 +52,7 @@ equivalence could not be shown. Use `queue` to rank every pair of a source for r
 for two versions of one object or one object in two dialects, `check` to lint a single file and \
 `finding` to expand a card by fingerprint. `convert` converts one file or inline text (T-SQL to \
 PostgreSQL or Db2 for i) and `convert_tree` a whole tree, exactly as `sqldiff convert`: each unit \
-is converted, under assumptions, needs a decision, differs or not converted, with the rules and \
+is converted, under assumptions, needs a decision, not proven, differs or not converted, with the rules and \
 reason; `converted_file` shows one file of a converted tree. `assumptions` lists what a verdict relies on and \
 `set_assumption` flips one for this session only. `comment_text` drafts a plain-text review \
 comment and `open_in_gui` gives a deep link for a human. `what_if` shows both sides' outcome \
@@ -1292,8 +1292,8 @@ fn target(args: &Value) -> Result<Dialect, String> {
 
 fn counts_line(c: &sqldiff_convert::Counts) -> String {
     format!(
-        "units: {} converted, {} under assumptions, {} needs a decision, {} differs, {} not converted\n",
-        c.converted, c.assumptions, c.decision, c.differs, c.not_converted
+        "units: {} converted, {} under assumptions, {} needs a decision, {} not proven, {} differs, {} not converted\n",
+        c.converted, c.assumptions, c.decision, c.unproven, c.differs, c.not_converted
     )
 }
 
@@ -1610,7 +1610,7 @@ fn tools() -> Value {
         {
             "name": "convert",
             "title": "Convert one file",
-            "description": "Convert one SQL file or inline text into another dialect with the engine of `sqldiff convert` (rules: T-SQL to PostgreSQL 18 or Db2 for i). Every unit is converted, under assumptions, needs a decision, differs or not converted; a unit counts as converted only when its rules needed no assumption and neither the engine's diff nor the output's own check (parse, binding, leftover source syntax, target limits) finds anything in it. Returns the file's status, unit counts, every unit that is not plainly converted with its rules and reason, and the output as `sqldiff convert` writes it (with `-- [sqldiff: <status>]` lines). Names defined in other files do not bind; use `convert_tree` for those. Writes nothing.",
+            "description": "Convert one SQL file or inline text into another dialect with the engine of `sqldiff convert` (rules: T-SQL to PostgreSQL 18 or Db2 for i). Every unit is converted, under assumptions, needs a decision, not proven, differs or not converted; a unit counts as converted only when its rules needed no assumption and neither the engine's diff nor the output's own check (parse, binding, leftover source syntax, target limits) finds anything in it. Returns the file's status, unit counts, every unit that is not plainly converted with its rules and reason, and the output as `sqldiff convert` writes it (with `-- [sqldiff: <status>]` lines). Names defined in other files do not bind; use `convert_tree` for those. Writes nothing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1640,7 +1640,7 @@ fn tools() -> Value {
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
                     "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
                     "jobs": { "type": "integer", "minimum": 1, "description": "Parallel jobs (default: available cores)" },
-                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["converted", "assumptions", "decision", "differs", "not_converted"] }, "description": "List only files with one of these statuses (totals always cover the whole tree)" },
+                    "statuses": { "type": "array", "items": { "type": "string", "enum": ["converted", "assumptions", "decision", "unproven", "differs", "not_converted"] }, "description": "List only files with one of these statuses (totals always cover the whole tree)" },
                     "folder": { "type": "string", "description": "List only files whose path starts with this" },
                     "limit": { "type": "integer", "minimum": 0, "description": "Cap on files listed (default 25); the rest are counted" },
                     "max_units": { "type": "integer", "minimum": 0, "description": "Cap on units listed per file (default 5); the rest are counted" },

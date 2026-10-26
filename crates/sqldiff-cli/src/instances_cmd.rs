@@ -26,6 +26,7 @@ use serde::Serialize;
 use sqldiff_core::{Artifact, ChangeClass, Dialect, Options, Verdict};
 use sqldiff_source::compose;
 use sqldiff_source::weave::{Instance, Manifest, Weaver, Woven};
+use sqldiff_syntax::SyntaxKind;
 
 use crate::convert_cmd::{catalog, decode, parallel};
 use crate::source_cmd;
@@ -459,6 +460,157 @@ pub(crate) fn check(a: InstancesArgs) -> Result<(bool, BTreeMap<&'static str, us
 /// the PostgreSQL names over the limit, as (truncated, full).
 type Checked = (Vec<Item>, Vec<String>, Vec<(String, String)>);
 
+/// How the engine's diff says it skipped a `CREATE TABLE`.
+const DDL_TABLE: &str = "a DDL statement `CREATE TABLE";
+
+/// Schemas a dialect resolves an unqualified name in by default, as the
+/// engine's own default-schema assumptions read them: `dbo` on SQL Server,
+/// `public` on PostgreSQL. Db2 for i has none fixed (the current schema).
+fn default_schema(d: Dialect) -> Option<&'static str> {
+    match d {
+        Dialect::Tsql => Some("dbo"),
+        Dialect::Postgres => Some("public"),
+        Dialect::Db2i => None,
+    }
+}
+
+/// A significant token: its kind and its text as compared.
+type Token = (SyntaxKind, String);
+
+/// The significant tokens of `text`: identifiers and keywords in lower
+/// case (unquoted names fold), quoted names as written, no `;`.
+fn tokens(text: &str, d: Dialect) -> Vec<Token> {
+    let root = sqldiff_syntax::parse(text, d).syntax();
+    root.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !t.kind().is_trivia() && t.kind() != SyntaxKind::SEMICOLON)
+        .map(|t| {
+            let text = if t.kind() == SyntaxKind::QUOTED_IDENT || t.kind() == SyntaxKind::STRING {
+                t.text().to_string()
+            } else {
+                t.text().to_ascii_lowercase()
+            };
+            (t.kind(), text)
+        })
+        .collect()
+}
+
+/// Top-level `CREATE TABLE` statements of `text`, as byte ranges.
+fn create_tables(text: &str, d: Dialect) -> Vec<(usize, usize)> {
+    let root = sqldiff_syntax::parse(text, d).syntax();
+    root.children()
+        .filter(|n| {
+            let mut sig = n
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| !t.kind().is_trivia());
+            let first = sig.next().map(|t| t.text().to_ascii_uppercase());
+            let second = sig.next().map(|t| t.text().to_ascii_uppercase());
+            first.as_deref() == Some("CREATE") && second.as_deref() == Some("TABLE")
+        })
+        .map(|n| {
+            let r = n.text_range();
+            (usize::from(r.start()), usize::from(r.end()))
+        })
+        .collect()
+}
+
+/// A table statement split into its name (schema dropped when it is the
+/// dialect's default) and everything after it.
+fn table_shape(toks: &[Token], d: Dialect) -> Option<(Vec<String>, &[Token])> {
+    // CREATE TABLE name ( ...
+    let open = toks.iter().position(|(k, _)| *k == SyntaxKind::L_PAREN)?;
+    let mut name: Vec<String> = toks[2..open]
+        .iter()
+        .filter(|(k, _)| *k != SyntaxKind::DOT)
+        .map(|(_, t)| t.clone())
+        .collect();
+    if name.len() == 2 && default_schema(d).is_some_and(|s| name[0] == s) {
+        name.remove(0);
+    }
+    Some((name, &toks[open..]))
+}
+
+/// The woven target's tables against what the conversion rules write from
+/// the woven source's tables, in order. Equal tables are as good as
+/// `sqldiff convert`'s own output: the conversion's assumptions become
+/// items (default-schema ones go with the engine's), anything worse than an
+/// assumption keeps the tables undecided. `Err` says why they are not
+/// decided.
+fn tables_by_rules(
+    source: &str,
+    target: &str,
+    from: Dialect,
+    to: Dialect,
+    accepted: &[String],
+) -> Result<(Vec<Item>, Vec<String>), String> {
+    let (st, tt) = (create_tables(source, from), create_tables(target, to));
+    if st.len() != tt.len() {
+        return Err(format!(
+            "the source instance creates {} tables and the target {}",
+            st.len(),
+            tt.len()
+        ));
+    }
+    let conv = sqldiff_convert::convert(source, from, to)?;
+    let mut items = Vec::new();
+    let mut engine = Vec::new();
+    let lines = sqldiff_syntax::LineIndex::new(target);
+    for (k, (&(ss, se), &(ts, te))) in st.iter().zip(&tt).enumerate() {
+        let line = lines.line_col(ts).0;
+        let units: Vec<&sqldiff_convert::Unit> = conv
+            .units
+            .iter()
+            .filter(|u| u.src.start < se && ss < u.src.end)
+            .collect();
+        let [u] = units.as_slice() else {
+            return Err(format!(
+                "table {} (target line {line}): the conversion does not give it as one statement",
+                k + 1
+            ));
+        };
+        if u.status > sqldiff_convert::Status::Assumptions {
+            return Err(format!(
+                "table {} (target line {line}): the conversion rules do not convert the source table ({})",
+                k + 1,
+                u.status.label()
+            ));
+        }
+        let want = tokens(&conv.output[u.out.start..u.out.end], to);
+        let have = tokens(&target[ts..te], to);
+        let same = match (table_shape(&want, to), table_shape(&have, to)) {
+            (Some((wn, wb)), Some((hn, hb))) => wn == hn && wb == hb,
+            _ => false,
+        };
+        if !same {
+            return Err(format!(
+                "table {} (target line {line}) is not the table the conversion rules write from the source table: `{}`",
+                k + 1,
+                conv.output[u.out.start..u.out.end].trim()
+            ));
+        }
+        for n in &u.notes {
+            if n.status != sqldiff_convert::Status::Assumptions {
+                continue;
+            }
+            if n.rule == "ASM-DBO-SCHEMA" {
+                if !engine.contains(&n.rule) {
+                    engine.push(n.rule.clone());
+                }
+            } else if !accepted.contains(&n.rule) {
+                items.push(Item {
+                    status: Outcome::Assumptions,
+                    rule: n.rule.clone(),
+                    side: "target",
+                    line,
+                    text: n.text.clone(),
+                });
+            }
+        }
+    }
+    Ok((items, engine))
+}
+
 /// Checks one instance; also returns the PostgreSQL names its values make
 /// that are over the limit, as (truncated, full), for the collision check.
 #[allow(clippy::too_many_arguments)]
@@ -600,7 +752,36 @@ fn check_instance(
     }
     // What the diff could not compare at all (DDL, say) is not decided
     // either: no finding about it is no evidence.
+    // Tables the engine cannot compare count only when the target table is
+    // the one the conversion rules write from the source table.
+    let mut engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
+    let tables = report
+        .unknown_reasons
+        .iter()
+        .any(|r| r.contains(DDL_TABLE))
+        .then(|| tables_by_rules(&s.text, &t.text, from, to, accepted));
+    match &tables {
+        Some(Ok((found, asm))) => {
+            items.extend(found.iter().cloned());
+            for a in asm {
+                if !engine.contains(a) {
+                    engine.push(a.clone());
+                }
+            }
+        }
+        Some(Err(why)) => items.push(Item {
+            status: Outcome::Unknown,
+            rule: "ddl.not-as-converted".into(),
+            side: "target",
+            line: 0,
+            text: why.clone(),
+        }),
+        None => {}
+    }
     for r in &report.unknown_reasons {
+        if r.contains(DDL_TABLE) && matches!(tables, Some(Ok(_))) {
+            continue;
+        }
         items.push(Item {
             status: Outcome::Unknown,
             rule: "equiv.not-covered".into(),
@@ -609,7 +790,10 @@ fn check_instance(
             text: r.clone(),
         });
     }
-    if report.verdict == Verdict::Unknown && !items.iter().any(|x| x.status >= Outcome::Unknown) {
+    if report.verdict == Verdict::Unknown
+        && report.unknown_reasons.is_empty()
+        && !items.iter().any(|x| x.status >= Outcome::Unknown)
+    {
         items.push(Item {
             status: Outcome::Unknown,
             rule: "equiv.unknown".into(),
@@ -618,7 +802,6 @@ fn check_instance(
             text: "the engine's diff of the source and target instances is UNKNOWN".into(),
         });
     }
-    let engine: Vec<String> = report.assumptions.iter().map(|x| x.id.clone()).collect();
     // Names: only values that are names. Dialect code given once for every
     // dialect is used unchanged in the target.
     let kind = |n: &str| {
@@ -663,6 +846,7 @@ fn check_instance(
                 sqldiff_convert::Status::Converted => Outcome::Converted,
                 sqldiff_convert::Status::Assumptions => Outcome::Assumptions,
                 sqldiff_convert::Status::Decision => Outcome::Decision,
+                sqldiff_convert::Status::Unproven => Outcome::Unknown,
                 _ => Outcome::Differs,
             },
             rule: n.rule.to_string(),
@@ -715,6 +899,10 @@ fn markers(text: &str, accepted: &[String]) -> Vec<Item> {
         let status = match status {
             "under assumptions" => Outcome::Assumptions,
             "needs a decision" => Outcome::Decision,
+            // The engine's diff of the template could not decide the unit;
+            // the diff of each woven instance below decides it again, and
+            // counts every unknown it finds.
+            "not proven" => continue,
             "differs" | "not converted" => Outcome::Differs,
             _ => continue,
         };
