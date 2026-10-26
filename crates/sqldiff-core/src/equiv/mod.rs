@@ -8,6 +8,7 @@
 //! verdict never claims more than was compared.
 
 pub mod ast;
+mod call;
 pub mod canon;
 pub mod compare;
 pub mod ddl;
@@ -154,6 +155,7 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     }
     signature(&ua, &ub, &na, &nb, &mut out);
     tables(a, b, &ua, &ub, sa, sb, &mut out);
+    calls(a, b, &ua, &ub, sa, sb, &mut out);
     ddl_stmts(a, b, &ua, &ub, sa, sb, &mut out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
         out.assume(x.clone());
@@ -185,7 +187,10 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     let wit = (ua.kind == ub.kind
         && ua.params.len() == ub.params.len()
         && ua.uncovered.is_empty()
-        && ub.uncovered.is_empty())
+        && ub.uncovered.is_empty()
+        // A called procedure can touch the witness's table.
+        && ua.calls.is_empty()
+        && ub.calls.is_empty())
     .then(|| Witnessing {
         a: xwit::Side {
             unit: &ua,
@@ -204,6 +209,222 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
     pair_items(a, b, &ia, &ib, wit.as_ref(), &mut out);
     error_continues(a, b, &ua, &ub, &ia, &ib, &mut out);
     out
+}
+
+/// Compares the procedure calls and object comments of both sides
+/// (`call.rs`), paired in order by what they call or comment on.
+#[allow(clippy::too_many_arguments)]
+fn calls(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) {
+    use sqldiff_syntax::Dialect;
+    if ua.calls.is_empty() && ub.calls.is_empty() {
+        return;
+    }
+    let (na, nb) = (side_name(a), side_name(b));
+    let shown = |n: &SyntaxNode| {
+        let text = n.text().to_string();
+        let w: Vec<&str> = text.split_whitespace().collect();
+        let mut s = w.join(" ");
+        if s.chars().count() > 60 {
+            s = s.chars().take(57).collect::<String>() + "…";
+        }
+        format!("`{s}`")
+    };
+    let t_is_a = match (a.dialect(), b.dialect()) {
+        (Dialect::Tsql, Dialect::Postgres) => true,
+        (Dialect::Postgres, Dialect::Tsql) => false,
+        _ => {
+            for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
+                for (node, _) in &u.calls {
+                    out.unknown_reasons.push(format!(
+                        "{name} line {}: the call {} is not compared: only T-SQL against PostgreSQL is",
+                        side.line_of(node),
+                        shown(node)
+                    ));
+                }
+            }
+            return;
+        }
+    };
+    let read = |side: &Analyzed, u: &Unit, name: &str, out: &mut Outcome| {
+        let mut stmts = Vec::new();
+        let mut keys = Vec::new();
+        for (node, _) in &u.calls {
+            match call::parse(&ast::tokens(node), side.dialect())
+                .and_then(|s| call::pair_key(&s, side.dialect()).map(|k| (s, k)))
+            {
+                Ok((s, k)) => {
+                    stmts.push(Some(s));
+                    keys.push(Some(k));
+                }
+                Err(e) => {
+                    out.unknown_reasons.push(format!(
+                        "{name} line {}: the call {} is not compared: {e}",
+                        side.line_of(node),
+                        shown(node)
+                    ));
+                    stmts.push(None);
+                    keys.push(None);
+                }
+            }
+        }
+        // The same object commented twice: T-SQL keeps two properties (or
+        // fails on the same name), PostgreSQL keeps the last comment.
+        for i in 0..keys.len() {
+            let dup = keys[i].as_ref().is_some_and(|k| {
+                k.starts_with("comment ")
+                    && keys.iter().filter(|x| x.as_ref() == Some(k)).count() > 1
+            });
+            if dup {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: the comment {} is not compared: the same object is commented more than once",
+                    side.line_of(&u.calls[i].0),
+                    shown(&u.calls[i].0)
+                ));
+                keys[i] = None;
+            }
+        }
+        (stmts, keys)
+    };
+    let (xa, ka) = read(a, ua, &na, out);
+    let (xb, kb) = read(b, ub, &nb, out);
+    let pairs = call::align(&ka, &kb);
+    for (side, u, name, keys, mine) in [
+        (
+            a,
+            ua,
+            &na,
+            &ka,
+            pairs.iter().map(|p| p.0).collect::<Vec<_>>(),
+        ),
+        (
+            b,
+            ub,
+            &nb,
+            &kb,
+            pairs.iter().map(|p| p.1).collect::<Vec<_>>(),
+        ),
+    ] {
+        for (i, (node, _)) in u.calls.iter().enumerate() {
+            if keys[i].is_some() && !mine.contains(&i) {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: the call {} is not compared: it has no counterpart on the other side",
+                    side.line_of(node),
+                    shown(node)
+                ));
+            }
+        }
+    }
+    for (i, j) in pairs {
+        let (xn, at_a) = (&ua.calls[i].0, ua.calls[i].1);
+        let (yn, at_b) = (&ub.calls[j].0, ub.calls[j].1);
+        let (la, lb) = (a.line_of(xn), b.line_of(yn));
+        let unknown = |out: &mut Outcome, why: String| {
+            out.unknown_reasons.push(format!(
+                "{na} line {la}: the call {} (and {nb} line {lb}) is not compared: {why}",
+                shown(xn)
+            ));
+        };
+        // A comment reads and writes no data, so where it sits among the
+        // data statements does not matter, as long as nothing after it can
+        // create, change or drop the object again: only comments follow.
+        let comment = lower::is_comment(xn, a.dialect()) && lower::is_comment(yn, b.dialect());
+        if comment {
+            if !only_comments_after(a, xn) || !only_comments_after(b, yn) {
+                unknown(
+                    out,
+                    "statements other than comments follow it, so it is not the object's last change".into(),
+                );
+                continue;
+            }
+        } else if at_a != at_b {
+            unknown(
+                out,
+                "it does not sit in the same place among the data statements".into(),
+            );
+            continue;
+        }
+        let (Some(sx), Some(sy)) = (&xa[i], &xb[j]) else {
+            continue;
+        };
+        let side_a = call::Side {
+            d: a.dialect(),
+            unit: ua,
+            schema: sa,
+            name: &na,
+        };
+        let side_b = call::Side {
+            d: b.dialect(),
+            unit: ub,
+            schema: sb,
+            name: &nb,
+        };
+        let verdict = if t_is_a {
+            call::compare((sx, &side_a), (sy, &side_b))
+        } else {
+            call::compare((sy, &side_b), (sx, &side_a))
+        };
+        match verdict {
+            call::Verdict::Equal(asms) => {
+                for x in asms {
+                    out.assume(x);
+                }
+                out.equal += 1;
+                out.structural += 1;
+            }
+            call::Verdict::Unknown(why) => unknown(out, why),
+            call::Verdict::Diff(rule, witness, (ot, op)) => {
+                let (oa, ob) = if t_is_a { (ot, op) } else { (op, ot) };
+                let oa = if oa == 0 { cst::sig_range(xn).0 } else { oa };
+                let ob = if ob == 0 { cst::sig_range(yn).0 } else { ob };
+                let class = ChangeClass::Semantic;
+                let anchor = |n: &SyntaxNode| {
+                    crate::normalize::hash_strs(std::iter::once(n.text().to_string().as_str()))
+                };
+                out.findings.push(Finding {
+                    fingerprint: fingerprint(&FingerprintInput {
+                        object: &a.object,
+                        class,
+                        rule,
+                        anchor_a: &anchor(xn),
+                        anchor_b: &anchor(yn),
+                    }),
+                    rule: rule.to_string(),
+                    class,
+                    severity: class.default_severity(),
+                    verdict: Verdict::Different,
+                    witness: format!("Statements (A line {la}, B line {lb}) differ: {witness}."),
+                    a: Some(line_at(a, oa)),
+                    b: Some(line_at(b, ob)),
+                    assumptions: Vec::new(),
+                });
+            }
+        }
+    }
+}
+
+/// Every statement after `node` in the artifact is an object comment.
+fn only_comments_after(side: &Analyzed, node: &SyntaxNode) -> bool {
+    let end = node.text_range().end();
+    side.root
+        .descendants()
+        .filter(|n| {
+            matches!(
+                n.kind(),
+                sqldiff_syntax::SyntaxKind::STATEMENT | sqldiff_syntax::SyntaxKind::ROUTINE
+            ) && n.text_range().start() >= end
+        })
+        .all(|n| {
+            n.kind() == sqldiff_syntax::SyntaxKind::STATEMENT
+                && lower::is_comment(&n, side.dialect())
+        })
 }
 
 /// A token made up for a statement built around a table's parts.
@@ -972,19 +1193,58 @@ fn error_continues(
                     .kid(2)
                     .is_some_and(|k| k.is("into") && k.kid(0).is_some_and(out_param)))
     };
-    let Some((i, j)) = (0..items.len()).find_map(|i| {
-        if inner(&items[i]) {
-            return Some((i, i));
+    // Data statements and calls in text order: a call can fail, and it
+    // has an effect (the procedure's, or the comment).
+    #[derive(Clone, Copy)]
+    enum E {
+        Item(usize),
+        Call(usize),
+    }
+    let mut seq: Vec<(usize, E)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            (
+                it.nodes.first().map_or(0, |n| cst::sig_range(n).0),
+                E::Item(i),
+            )
+        })
+        .chain(
+            t.calls
+                .iter()
+                .enumerate()
+                // Inside a procedure; how a script goes on after a failed
+                // statement depends on the client running it.
+                .filter(|(_, (_, at))| at.outside.is_none() && t.kind == UnitKind::Proc)
+                .map(|(i, (n, _))| (cst::sig_range(n).0, E::Call(i))),
+        )
+        .collect();
+    seq.sort_by_key(|x| x.0);
+    let is_effect = |e: E| match e {
+        E::Item(i) => effect(&items[i].term),
+        E::Call(_) => true,
+    };
+    let Some((i, j)) = (0..seq.len()).find_map(|i| {
+        if let E::Item(k) = seq[i].1 {
+            if inner(&items[k]) {
+                return Some((i, i));
+            }
         }
-        (i + 1..items.len())
-            .find(|&j| effect(&items[j].term))
+        (i + 1..seq.len())
+            .find(|&j| is_effect(seq[j].1))
             .map(|j| (i, j))
     }) else {
         return;
     };
-    let (x, y) = (&items[i], &items[j]);
-    let lx = location(tside, &x.nodes[..1]);
-    let ly = location(tside, &y.nodes[y.nodes.len() - 1..]);
+    let nodes = |e: E| -> Vec<SyntaxNode> {
+        match e {
+            E::Item(k) => items[k].nodes.clone(),
+            E::Call(k) => vec![t.calls[k].0.clone()],
+        }
+    };
+    let (xn, yn) = (nodes(seq[i].1), nodes(seq[j].1));
+    let lx = location(tside, &xn[..1]);
+    let ly = location(tside, &yn[yn.len() - 1..]);
     let tname = side_name(tside);
     let oname = side_name(oside);
     let witness = format!(
@@ -997,7 +1257,11 @@ fn error_continues(
     );
     let rule = "equiv.error-continues";
     let class = ChangeClass::Transactional;
-    let anchor = crate::normalize::hash_strs(std::iter::once(x.term.to_string().as_str()));
+    let anchor_text = match seq[i].1 {
+        E::Item(k) => items[k].term.to_string(),
+        E::Call(_) => xn[0].text().to_string(),
+    };
+    let anchor = crate::normalize::hash_strs(std::iter::once(anchor_text.as_str()));
     out.findings.push(Finding {
         fingerprint: fingerprint(&FingerprintInput {
             object: &a.object,

@@ -15,6 +15,7 @@
 #                `options` adds SET OPTION items (not COMMIT or NAMING). `naming =
 #                "*SYS"` creates it under system naming (names qualified with /).
 #                `top_level = true` lets the interface create it directly.
+#                `helper = true` marks one that only other procedures call.
 #                Bodies may not contain `--` comments (the body is sent as one line).
 # [[probe]]      one call of a procedure (or an `inline` compound run at top level,
 #                which sees the same O_ variables) and the outcomes it can have.
@@ -2137,4 +2138,232 @@ source = "The converter's output and the engine's comparison of it (T-SQL and Po
 outcome = [
   { label = "restarts at MINVALUE", when = { text = "YYYYY-", n1 = "=3", n2 = "=5" }, verdict = "consistent", meaning = "As T-SQL: the converted sequence hands out the same values." },
   { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "The converted sequence hands out other values (see O_TEXT, N1, N2 and the SQLSTATE)." },
+]
+
+# ---------------------------------------------------------------- V30 calls and comments
+# The engine proves T-SQL EXEC against PostgreSQL CALL, and sp_addextendedproperty
+# against COMMENT ON (docs/cross-dialect-proofs.md, "Calls and comments"). Db2 for i
+# calls and comments are not compared yet; these are the open questions a Db2 for i
+# rule would rest on. No expectation is made: nothing the code does depends on them.
+
+[[procedure]]
+name = "V30_CALLEE"
+helper = true
+commit = "*NONE"
+params = "IN A VARCHAR(5), INOUT B VARCHAR(10), OUT C INTEGER"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_N1 = LENGTH(A);
+  SET O_N2 = 0;
+  SET O_TEXT = A || '|' || COALESCE(B, 'null') || '|'
+    || COALESCE(TRIM(CHAR(C)), 'null');
+  SET B = 'out';
+  SET C = 9;
+END
+"""
+
+[[procedure]]
+name = "V30_CALLEE_DEF"
+helper = true
+commit = "*NONE"
+params = "IN A VARCHAR(5), INOUT B VARCHAR(10), OUT C INTEGER, IN D INTEGER DEFAULT 7"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_N1 = LENGTH(A);
+  SET O_N2 = D;
+  SET O_TEXT = A;
+  SET B = 'out';
+  SET C = 9;
+END
+"""
+
+[[procedure]]
+name = "V30_POS"
+commit = "*NONE"
+params = "IN S VARCHAR(20)"
+body = """
+BEGIN
+  DECLARE V_B VARCHAR(10) DEFAULT 'in';
+  DECLARE V_C INTEGER DEFAULT 5;
+  DECLARE V_S CHAR(5);
+  DECLARE V_K INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    CALL SQLDFPROBE.P_V30_CALLEE(S, V_B, V_C, V_S, V_K,
+      O_N1, O_N2, O_TEXT);
+    SET O_TEXT = O_TEXT || '>' || COALESCE(V_B, 'null') || '|'
+      || COALESCE(TRIM(CHAR(V_C)), 'null');
+  END;
+END
+"""
+
+[[procedure]]
+name = "V30_NAMED"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE V_B VARCHAR(10) DEFAULT 'in';
+  DECLARE V_C INTEGER DEFAULT 5;
+  DECLARE V_S CHAR(5);
+  DECLARE V_K INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    CALL SQLDFPROBE.P_V30_CALLEE_DEF(A => 'ab', B => V_B, C => V_C,
+      O_STATE => V_S, O_CODE => V_K, O_N1 => O_N1, O_N2 => O_N2,
+      O_TEXT => O_TEXT);
+  END;
+END
+"""
+
+[[procedure]]
+name = "V30_DEFAULT_KW"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE V_B VARCHAR(10) DEFAULT 'in';
+  DECLARE V_C INTEGER DEFAULT 5;
+  DECLARE V_S CHAR(5);
+  DECLARE V_K INTEGER;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    CALL SQLDFPROBE.P_V30_CALLEE_DEF('ab', V_B, V_C, DEFAULT, V_S, V_K,
+      O_N1, O_N2, O_TEXT);
+  END;
+END
+"""
+
+[[procedure]]
+name = "V30_COMMENT"
+commit = "*NONE"
+params = "IN Q VARCHAR(4000)"
+body = """
+BEGIN
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  SET O_N1 = -1;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    EXECUTE IMMEDIATE 'CREATE OR REPLACE VIEW SQLDFPROBE.V30V AS '
+      || 'SELECT PRB FROM SQLDFPROBE.T';
+    EXECUTE IMMEDIATE Q;
+    SELECT LENGTH(LONG_COMMENT), SUBSTR(LONG_COMMENT, 1, 200)
+      INTO O_N1, O_TEXT FROM QSYS2.SYSTABLES
+      WHERE TABLE_SCHEMA = 'SQLDFPROBE' AND TABLE_NAME = 'V30V';
+  END;
+END
+"""
+
+[[probe]]
+id = "V30-CALL-VARCHAR-LONGER"
+fact = "V30"
+role = "info"
+procedure = "V30_POS"
+args = ["'abcdefgh'"]
+question = "A CALL passes 'abcdefgh' to a VARCHAR(5) parameter. Does Db2 for i fail the call, truncate the value (SQL Server), or pass it whole (PostgreSQL)?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "The call fails (SQLSTATE and SQLCODE recorded)." },
+  { label = "truncated", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "open", meaning = "Truncated to 5 characters, as SQL Server does." },
+  { label = "whole", when = { create = "00000", state = "00000", n1 = "=8" }, verdict = "open", meaning = "Passed whole, as PostgreSQL does." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "See N1 and the text." },
+]
+
+[[probe]]
+id = "V30-CALL-OUT-INOUT"
+fact = "V30"
+role = "info"
+procedure = "V30_POS"
+args = ["'ab'"]
+question = "What do an INOUT and an OUT parameter receive when the caller's variables hold 'in' and 5, and do both take the results back? (SQL Server OUTPUT receives the value; PostgreSQL OUT receives NULL.)"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "out is null", when = { create = "00000", state = "00000", text = "ab|in|null>out|9" }, verdict = "open", meaning = "INOUT receives the value, OUT receives NULL, both come back: PostgreSQL's INOUT and OUT." },
+  { label = "out gets input", when = { create = "00000", state = "00000", text = "ab|in|5>out|9" }, verdict = "open", meaning = "OUT also receives the caller's value, as SQL Server's OUTPUT does." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "See the text (callee's view|after the call) and the SQLSTATE." },
+]
+
+[[probe]]
+id = "V30-CALL-NAMED-DEFAULT"
+fact = "V30"
+role = "info"
+procedure = "V30_NAMED"
+question = "Does a CALL with named arguments (name => value) that leaves out a parameter with a DEFAULT work, and does the parameter get its default (N2 = 7)? Creating the callee also shows whether a parameter with a default may come before ones without."
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "default used", when = { create = "00000", state = "00000", n2 = "=7" }, verdict = "open", meaning = "Named arguments work and the omitted parameter takes its default." },
+  { label = "rejected", when = { create = "!00000" }, verdict = "open", meaning = "The caller (or the callee with its default before the O_ parameters) could not be created (SQLSTATE recorded)." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "See N2 and the SQLSTATE." },
+]
+
+[[probe]]
+id = "V30-CALL-DEFAULT-KEYWORD"
+fact = "V30"
+role = "info"
+procedure = "V30_DEFAULT_KW"
+question = "Does the DEFAULT keyword as a positional CALL argument give the parameter its default (N2 = 7), as T-SQL's EXEC p 'ab', DEFAULT does?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "default used", when = { create = "00000", state = "00000", n2 = "=7" }, verdict = "open", meaning = "DEFAULT gives the parameter its default." },
+  { label = "rejected", when = { create = "!00000" }, verdict = "open", meaning = "The caller could not be created (SQLSTATE recorded)." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "See N2 and the SQLSTATE." },
+]
+
+[[probe]]
+id = "V30-COMMENT-ON-TABLE-VIEW"
+fact = "V30"
+role = "info"
+procedure = "V30_COMMENT"
+args = ["'COMMENT ON TABLE SQLDFPROBE.V30V IS ''probe'''"]
+question = "Does COMMENT ON TABLE accept a view, and does QSYS2.SYSTABLES.LONG_COMMENT then hold the text?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "stored", when = { create = "00000", state = "00000", text = "probe" }, verdict = "open", meaning = "The view's comment is 'probe'." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "See N1 (length, -1 when not found) and the text." },
+]
+
+[[probe]]
+id = "V30-COMMENT-ON-VIEW"
+fact = "V30"
+role = "info"
+procedure = "V30_COMMENT"
+args = ["'COMMENT ON VIEW SQLDFPROBE.V30V IS ''probe'''"]
+question = "Is COMMENT ON VIEW accepted (PostgreSQL's form for a view)?"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "stored", when = { create = "00000", state = "00000", text = "probe" }, verdict = "open", meaning = "Accepted; the view's comment is 'probe'." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded): views take COMMENT ON TABLE." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "See N1 and the text." },
+]
+
+[[probe]]
+id = "V30-COMMENT-LENGTH"
+fact = "V30"
+role = "info"
+procedure = "V30_COMMENT"
+args = ["'COMMENT ON TABLE SQLDFPROBE.V30V IS ''' || REPEAT('x', 3000) || ''''"]
+question = "How long may a comment be? A 3000-character comment: kept whole (N1 = 3000), cut, or rejected? (PostgreSQL keeps it; an extended property holds up to 7500 bytes.)"
+source = "Open question; no IBM i documentation was read for it."
+outcome = [
+  { label = "kept", when = { create = "00000", state = "00000", n1 = "=3000" }, verdict = "open", meaning = "Kept whole." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected as too long (SQLSTATE and SQLCODE recorded)." },
+  { label = "other", when = { create = "00000" }, verdict = "open", meaning = "Stored differently; N1 is the stored length." },
 ]

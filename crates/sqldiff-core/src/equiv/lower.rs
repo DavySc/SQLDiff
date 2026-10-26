@@ -60,6 +60,8 @@ pub struct Param {
     /// Lower case, without `@`.
     pub name: String,
     pub ty: Option<Ty>,
+    /// The type as declared.
+    pub decl: Option<Type>,
     pub out: bool,
     /// Default value tokens (keywords upper-cased), when declared.
     pub default: Option<String>,
@@ -69,6 +71,8 @@ pub struct Param {
 pub struct Local {
     pub name: String,
     pub ty: Option<Ty>,
+    /// The type as declared.
+    pub decl: Option<Type>,
 }
 
 /// One data statement of the body.
@@ -79,6 +83,14 @@ pub struct LStmt {
     pub ast: Result<Stmt, String>,
     /// PostgreSQL declaration-section initializers are lowered as assignments.
     pub from_declare: bool,
+}
+
+/// Where a call sits: after this many data statements of the body, or
+/// before (`Some(false)`) or after (`Some(true)`) the file's one routine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallAt {
+    pub outside: Option<bool>,
+    pub after: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +110,10 @@ pub struct Unit {
     /// A script's top-level `CREATE TABLE` statements, with the number of
     /// data statements before each.
     pub tables: Vec<(SyntaxNode, usize)>,
+    /// Procedure calls (`EXEC`, `CALL`) and object comments
+    /// (`sp_addextendedproperty`, `COMMENT ON`), compared call against call
+    /// (`call.rs`), with where each one sits.
+    pub calls: Vec<(SyntaxNode, CallAt)>,
     /// A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE
     /// SCHEMA` statements (`ddl.rs`), placed like `tables`.
     pub ddl: Vec<(SyntaxNode, usize)>,
@@ -137,6 +153,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         stmts: Vec::new(),
         uncovered: Vec::new(),
         tables: Vec::new(),
+        calls: Vec::new(),
         ddl: Vec::new(),
         txn_control: false,
         stops_on_error: false,
@@ -168,6 +185,14 @@ pub fn lower(a: &Analyzed) -> Unit {
                     let after = n.text_range().start() >= r.text_range().end();
                     if is_create_table(&n, d) {
                         u.tables.push((n.clone(), usize::from(after)));
+                    } else if is_call(&n, d) {
+                        u.calls.push((
+                            n.clone(),
+                            CallAt {
+                                outside: Some(after),
+                                after: 0,
+                            },
+                        ));
                     } else if is_create_ddl(&n, d) {
                         u.ddl.push((n.clone(), usize::from(after)));
                     } else {
@@ -204,6 +229,13 @@ pub fn lower(a: &Analyzed) -> Unit {
                     u.tables.push((n.clone(), before));
                 } else if is_create_ddl(&n, d) {
                     u.ddl.push((n.clone(), before));
+                } else if is_comment(&n, d) {
+                    // Object comments around the routines are still compared.
+                    let at = CallAt {
+                        outside: Some(true),
+                        after: 0,
+                    };
+                    u.calls.push((n.clone(), at));
                 } else {
                     u.uncovered
                         .push((n.clone(), "a statement outside the routines".into()));
@@ -416,6 +448,7 @@ pub(crate) fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
     Some(Param {
         name,
         ty: Some(Ty::from_type(&ty, d, false)),
+        decl: Some(ty),
         out,
         default: default.map(|v| v.join(" ")),
     })
@@ -495,6 +528,14 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     let words = cst::first_words(c, 3);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
     match kind {
+        // Calls and comments: compared call against call (`call.rs`).
+        _ if is_call(c, d) => {
+            let at = CallAt {
+                outside: None,
+                after: u.stmts.len(),
+            };
+            u.calls.push((c.clone(), at));
+        }
         StmtKind::Select
         | StmtKind::Insert
         | StmtKind::Update
@@ -510,6 +551,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 u.locals.push(Local {
                     name: name.trim_start_matches('@').to_lowercase(),
                     ty: ty.as_ref().map(|t| Ty::from_type(t, d, false)),
+                    decl: ty.clone(),
                 });
                 let Some(init) = default else { return };
                 // `DECLARE @x T = v` is an assignment of the initial value.
@@ -611,6 +653,42 @@ fn is_create_table(c: &SyntaxNode, d: Dialect) -> bool {
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }
 
+/// A procedure call or an object comment: T-SQL `EXEC name …` (dynamic
+/// SQL aside), PostgreSQL and Db2 for i `CALL` and `COMMENT ON`.
+fn is_call(c: &SyntaxNode, d: Dialect) -> bool {
+    let words = cst::first_words(c, 2);
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    match stmt_kind(c, d) {
+        StmtKind::Call => match d {
+            Dialect::Tsql => {
+                matches!(w(0), "EXEC" | "EXECUTE")
+                    && tokens(c)
+                        .get(1)
+                        .is_some_and(|t| matches!(t.kind, K::Word | K::Quoted))
+            }
+            _ => w(0) == "CALL",
+        },
+        StmtKind::Ddl => d != Dialect::Tsql && w(0) == "COMMENT" && w(1) == "ON",
+        _ => false,
+    }
+}
+
+/// An object comment: T-SQL `EXEC sp_addextendedproperty`, `COMMENT ON`.
+pub fn is_comment(c: &SyntaxNode, d: Dialect) -> bool {
+    if !is_call(c, d) {
+        return false;
+    }
+    match d {
+        Dialect::Tsql => tokens(c).iter().take(6).any(|t| {
+            matches!(t.kind, K::Word | K::Quoted)
+                && cst::unquote(&t.text).eq_ignore_ascii_case("sp_addextendedproperty")
+        }),
+        _ => cst::first_words(c, 1)
+            .first()
+            .is_some_and(|w| w == "COMMENT"),
+    }
+}
+
 /// A top-level `CREATE … INDEX`, `CREATE SEQUENCE` or `CREATE SCHEMA`.
 fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
     stmt_kind(c, d) == StmtKind::Ddl
@@ -649,6 +727,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
     u.locals.push(Local {
         name: name.clone(),
         ty: Some(Ty::from_type(&ty, d, false)),
+        decl: Some(ty.clone()),
     });
     let rest = &toks[at..];
     if rest.is_empty() {

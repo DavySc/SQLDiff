@@ -954,6 +954,14 @@ fn param(el: &[Tok], dialect: Dialect, kind: RoutineKind) -> Option<(Param, (usi
     let def_at = rest.iter().position(|x| x.is_kw("DEFAULT") || x.is_op("="));
     let body = &rest[..def_at.unwrap_or(rest.len())];
     let has_default = def_at.is_some();
+    // The default's text, without a trailing T-SQL OUTPUT or READONLY.
+    let default = def_at.map(|at| {
+        let mut end = rest.len();
+        while end > at + 1 && rest[end - 1].is_any_kw(&["OUTPUT", "OUT", "READONLY"]) {
+            end -= 1;
+        }
+        tokens::texts(&rest[at + 1..end]).join(" ")
+    });
     let named = match dialect {
         Dialect::Tsql => first.kind == SyntaxKind::VARIABLE,
         _ => first.kind == SyntaxKind::QUOTED_IDENT || (body.len() >= 2 && !is_type_start(body)),
@@ -986,6 +994,7 @@ fn param(el: &[Tok], dialect: Dialect, kind: RoutineKind) -> Option<(Param, (usi
             data_type,
             mode,
             has_default,
+            default,
         },
         span,
     ))
