@@ -138,7 +138,7 @@ impl FragmentKind {
     /// a neutral fragment that converts as written, and the text after. The
     /// table is in a schema nothing defines, so names in the fragment are
     /// not bound against anything.
-    fn harness(self, stem: &str) -> Option<(String, &'static str, String)> {
+    fn harness(self, stem: &str, parameters: &[String]) -> Option<(String, &'static str, String)> {
         let (t, m) = (format!("{stem}hs.{stem}h"), format!("/*{stem}hb*/"));
         Some(match self {
             FragmentKind::Statements => return None,
@@ -150,7 +150,14 @@ impl FragmentKind {
             FragmentKind::Expression => (format!("SELECT {m} "), "1", format!(" FROM {t};\n")),
             FragmentKind::SetList => (format!("UPDATE {t} SET {m} "), "x = 1", ";\n".into()),
             FragmentKind::RoutineBody => (
-                format!("CREATE PROCEDURE {t} AS BEGIN {m} "),
+                if parameters.is_empty() {
+                    format!("CREATE PROCEDURE {t} AS BEGIN {m} ")
+                } else {
+                    format!(
+                        "CREATE PROCEDURE {t} ({}) AS BEGIN {m} ",
+                        parameters.join(", ")
+                    )
+                },
                 "UPDATE x SET x = 1;",
                 "\nEND\n".into(),
             ),
@@ -168,6 +175,8 @@ struct Harness {
     /// The converted stand-in before and after the neutral fragment; `None`
     /// when the stand-in itself did not convert as expected.
     around: Option<(String, String)>,
+    /// How many parameters the stand-in procedure declares (routine bodies).
+    parameters: usize,
 }
 
 /// One replacement in the output: old byte range, new text.
@@ -353,8 +362,31 @@ pub fn rewrite_template_as(
     stand: &StandIns,
     source: Option<&Catalog>,
 ) -> TemplateDraft {
+    rewrite_template_with(t, kind, &[], from, to, stand, source)
+}
+
+/// [`rewrite_template_as`] for a routine body whose routine declares
+/// `parameters` (T-SQL declarations, `@name type [OUTPUT]`, as a generator's
+/// wrapper writes them). The body is converted inside a stand-in procedure
+/// that declares them, so the names the body uses bind and read as the
+/// target's parameters. They only matter for a routine body; any other kind
+/// ignores them.
+pub fn rewrite_template_with(
+    t: &Template,
+    kind: FragmentKind,
+    parameters: &[String],
+    from: Dialect,
+    to: Dialect,
+    stand: &StandIns,
+    source: Option<&Catalog>,
+) -> TemplateDraft {
     let (mut frag, written, specials) = fragment(t, stand);
-    let harness = match kind.harness(&stand.stem) {
+    let parameters = if kind == FragmentKind::RoutineBody {
+        parameters
+    } else {
+        &[]
+    };
+    let harness = match kind.harness(&stand.stem, parameters) {
         Some((pre, neutral, post)) if from == Dialect::Tsql => {
             let marker = format!("/*{}hb*/", stand.stem);
             let base = rewrite_in(&format!("{pre}{neutral}{post}"), from, to, source);
@@ -388,6 +420,7 @@ pub fn rewrite_template_as(
                 kind,
                 frag: (p, p + f),
                 around,
+                parameters: parameters.len(),
             })
         }
         _ => None,
@@ -561,13 +594,22 @@ pub fn check_template(
             });
         }
         if let Some(h) = &harness {
+            let text = if h.parameters > 0 {
+                format!(
+                    "This {} was converted inside a stand-in procedure that declares the {} parameters listed for it: a name it uses that is not listed is unknown, and its meaning in the woven routine was not checked, so check the woven instances.",
+                    h.kind.label(),
+                    h.parameters
+                )
+            } else {
+                format!(
+                    "This {} was converted inside a stand-in statement: its names were not bound and its meaning in the woven statement was not checked, so check the woven instances.",
+                    h.kind.label()
+                )
+            };
             u.notes.push(Note {
                 status: Status::Assumptions,
                 rule: "ASM-TEMPLATE-FRAGMENT".into(),
-                text: format!(
-                    "This {} was converted inside a stand-in statement: its names were not bound and its meaning in the woven statement was not checked, so check the woven instances.",
-                    h.kind.label()
-                ),
+                text,
             });
         }
         let mut used: Vec<&str> = Vec::new();

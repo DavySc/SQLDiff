@@ -100,7 +100,22 @@ pairs = [{ head = "parts/head.sql", foot = "parts/foot.sql" }]
 ```
 
 - **Fragment kinds** are `statements`, `predicate` (what follows `WHERE`), `expression` (one value, also `select-list`), `set-list` (what follows `UPDATE … SET`) and `routine-body` (statements inside `BEGIN … END`). A fragment is converted inside a stand-in statement of that kind, from T-SQL only, and cut out again with the template's own leading and trailing white space. If converting it changed the stand-in around it (a declaration hoisted, a parameter added, code moved across its edge, or a rule that did not apply), the template is kept as it is and flagged `template.context-leak` (differs), with the conversion's own reason when it gave one: it cannot be converted on its own. Otherwise every unit carries `ASM-TEMPLATE-FRAGMENT`: its names were not bound and its meaning in the woven statement was not checked. The stand-in's table is in the catalogs with unknown columns, so binding against it is never a finding.
-- **A routine-body fragment knows no parameters.** Converted on its own, the T-SQL parameter `@Id` in a body reads as a local variable and becomes `v_id`, while the opening template turns the same parameter into `p_id`. The unit then fails binding (differs), and so do the woven instances: nothing is claimed. Convert such a body by hand, or weave it into its routine before converting.
+- **A routine-body fragment knows no parameters, unless the tree lists them.** Converted on its own, the T-SQL parameter `@Id` in a body reads as a local variable and becomes `v_id`, while the opening template turns the same parameter into `p_id`. The unit then fails binding (differs), and so do the woven instances: nothing is claimed. List the routine's parameters in `template-parameters.toml` (below), or convert such a body by hand, or weave it into its routine before converting.
+
+#### Parameters of the routine a body is woven into
+
+A generator often writes the routine header itself and weaves only the body from a template; the parameters the body uses are declared in that header, not in the template. A file `template-parameters.toml` at the root of the template tree lists them, per template, as T-SQL declarations:
+
+```toml
+["procs/update_item.sql"]   # path from the tree root, with / (a \ is read as /)
+parameters = ["@mode int", "@item_name varchar(100) output"]
+```
+
+- A template with an entry is converted as a `routine-body` unless a `[[template.fragments]]` rule gives its path another kind (then the entry is ignored). A `routine-body` rule without an entry converts as before, with no parameters.
+- The body is converted inside `CREATE PROCEDURE … (declarations) AS BEGIN … END`, so its names bind against the list and read as the target's parameters (`@code` becomes `p_code` in PostgreSQL). A name the body uses that the list leaves out is still `bind.unknown-variable`: the list is never completed by guess.
+- Each unit still carries `ASM-TEMPLATE-FRAGMENT`, now saying how many parameters were declared: the weave itself is checked only by the instance check.
+- Each declaration is one `@name type [OUTPUT]` on one line, with no `;` or comment. A file that does not read, or an entry that is not a table with a `parameters` list of such strings, stops the conversion and names the entry.
+- Only a source tree (a directory) is read for it; `--template` conversions of a single file have none.
 - **Pairs** are converted together, as one routine, with a marker between them, and split again at the marker. If the conversion moved code across the marker, both templates are kept as they are and flagged `template.pair-split` (differs). A template is in at most one pair; the bodies woven between the halves are converted on their own, as fragments.
 - **Value kinds**: only `name` values are converted as names (`ASM-TEMPLATE-PLACEHOLDER`, checked against the target's name rules per instance). A `text` or `number` value means the same in every dialect. A `type`, `expression` or `sql` value is dialect code the rules cannot convert, so its unit is a decision (`template.value-per-dialect`): give the target's value in the instance manifest under `params_for`. The instance check discharges that decision, and a dialect-code value given only once, for every dialect, stays an assumption there (`ASM-TEMPLATE-VALUE-SAME`).
 
