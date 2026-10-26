@@ -157,6 +157,8 @@ struct Site {
     count: bool,
     /// A declaration (its position fixes the variable's initial value).
     declare: bool,
+    /// The statement draws a random number (`RAND()`, `random()`).
+    random: bool,
 }
 
 struct Routine<'x, 'a> {
@@ -171,7 +173,8 @@ struct Routine<'x, 'a> {
     loops: Vec<(usize, usize)>,
     /// Significant tokens of the routine body, in order: (offset, upper text, kind).
     toks: Vec<Tok>,
-    /// T-SQL procedure or script (a bare SELECT returns a result set).
+    /// A view, or a T-SQL procedure or script (a bare SELECT returns a
+    /// result set).
     result_sets: bool,
     /// PostgreSQL `LANGUAGE sql` function returning a set: the rows of its
     /// last statement are the result.
@@ -237,8 +240,9 @@ impl<'x, 'a> Routine<'x, 'a> {
             strict,
             loops: Vec::new(),
             toks: tokens(&side.root),
-            result_sets: d == Dialect::Tsql
-                && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
+            result_sets: u.kind == lower::UnitKind::View
+                || d == Dialect::Tsql
+                    && matches!(u.kind, lower::UnitKind::Proc | lower::UnitKind::Script),
             sql_set_result,
             units: std::cell::OnceCell::new(),
         };
@@ -290,12 +294,19 @@ impl<'x, 'a> Routine<'x, 'a> {
         declare: bool,
     ) {
         let (start, end) = cst::sig_range(node);
+        let t = tokens(node);
+        let random = t.windows(2).any(|w| {
+            w[0].kind == K::Word
+                && matches!(w[0].up.as_str(), "RAND" | "RANDOM")
+                && w[1].kind == K::LParen
+        });
         self.sites.entry(name.to_string()).or_default().push(Site {
             start,
             end,
             constant,
             count,
             declare,
+            random,
         });
     }
 
@@ -412,14 +423,47 @@ impl<'x, 'a> Routine<'x, 'a> {
                 self.site(&name, n, c, false, false);
             }
             "SELECT" if d == Dialect::Tsql => {
-                // SELECT @a = x, @b = y FROM ...
+                // SELECT [ALL | DISTINCT] [TOP n | TOP (n) [PERCENT] [WITH TIES]] @a = x, @b = y FROM ...
+                let mut list = 1;
+                if t.get(list)
+                    .is_some_and(|x| x.up == "ALL" || x.up == "DISTINCT")
+                {
+                    list += 1;
+                }
+                if t.get(list).is_some_and(|x| x.up == "TOP") {
+                    list += 1;
+                    if t.get(list).is_some_and(|x| x.kind == K::LParen) {
+                        let mut depth = 0;
+                        while let Some(x) = t.get(list) {
+                            match x.kind {
+                                K::LParen => depth += 1,
+                                K::RParen => depth -= 1,
+                                _ => {}
+                            }
+                            list += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                    } else {
+                        list += 1;
+                    }
+                    if t.get(list).is_some_and(|x| x.up == "PERCENT") {
+                        list += 1;
+                    }
+                    if t.get(list).is_some_and(|x| x.up == "WITH")
+                        && t.get(list + 1).is_some_and(|x| x.up == "TIES")
+                    {
+                        list += 2;
+                    }
+                }
                 let mut depth = 0;
                 for (i, x) in t.iter().enumerate() {
                     match x.kind {
                         K::LParen => depth += 1,
                         K::RParen => depth -= 1,
                         K::Var if depth == 0 && t.get(i + 1).is_some_and(|y| y.text == "=") => {
-                            let prev_ok = i == 1 || t[i - 1].kind == K::Comma;
+                            let prev_ok = i == list || t[i - 1].kind == K::Comma;
                             if prev_ok {
                                 let name = x.text.trim_start_matches('@').to_lowercase();
                                 let count = is_count(&t[i + 2..]);
@@ -570,6 +614,15 @@ impl<'x, 'a> Routine<'x, 'a> {
                     f.non_negative = true;
                     f.nullable = false;
                 }
+            }
+            // A random draw is neither chosen nor NULL, and reading it twice
+            // gives the same number: not an input.
+            if sites.iter().any(|s| {
+                s.random
+                    && (s.start < at || lp.is_some_and(|(ls, le)| ls <= s.start && s.end <= le))
+            }) {
+                f.origin = Origin::Random;
+                f.value = None;
             }
             out.insert(name.clone(), f);
         }
@@ -2002,6 +2055,8 @@ enum ShapeKind {
     Cursor,
     /// The query of a `FOR r IN query LOOP`.
     ForQuery,
+    /// The query of a view definition: its rows are what the view returns.
+    View,
 }
 
 fn cond_expr(c: &SyntaxNode, d: Dialect) -> Result<Expr, String> {
@@ -2163,6 +2218,19 @@ fn statement_shape(n: &SyntaxNode, d: Dialect) -> Result<Shape, String> {
                 },
             })
         }
+        "CREATE" | "ALTER" if view_query(&t).is_some() => {
+            let q = view_query(&t).unwrap();
+            let s = parse_stmt(&t[q.0..q.1], d)?;
+            if !matches!(s, Stmt::Select(_)) {
+                return Err("view over something other than a query".into());
+            }
+            Ok(Shape {
+                probe: Probe::Stmt(s),
+                branches: Vec::new(),
+                rest: Vec::new(),
+                kind: ShapeKind::View,
+            })
+        }
         "RETURN" if t.get(1).is_some_and(|x| x.up == "QUERY") => {
             t.remove(1);
             let s = parse_stmt(&t[1..], d)?;
@@ -2263,6 +2331,48 @@ fn statement_shape(n: &SyntaxNode, d: Dialect) -> Result<Shape, String> {
             Ok(data(Probe::Stmt(parse_stmt(&t, d)?)))
         }
     }
+}
+
+/// The query of `CREATE [OR REPLACE | OR ALTER] VIEW name [(columns)]
+/// [WITH options] AS query [WITH [CASCADED | LOCAL] CHECK OPTION]` (or
+/// T-SQL `ALTER VIEW`): its token range. Temporary, recursive and
+/// materialized views are left out.
+fn view_query(t: &[Tok]) -> Option<(usize, usize)> {
+    let v = t.iter().position(|x| x.kind == K::Word && x.up == "VIEW")?;
+    let lead: Vec<&str> = t[..v].iter().map(|x| x.up.as_str()).collect();
+    if !matches!(
+        lead.as_slice(),
+        ["CREATE"] | ["ALTER"] | ["CREATE", "OR", "REPLACE"] | ["CREATE", "OR", "ALTER"]
+    ) {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut start = None;
+    for (i, x) in t.iter().enumerate().skip(v + 1) {
+        match x.kind {
+            K::LParen => depth += 1,
+            K::RParen => depth -= 1,
+            K::Word if depth == 0 && x.up == "AS" => {
+                start = Some(i + 1);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let start = start?;
+    let mut end = t.len();
+    // A trailing `WITH [CASCADED | LOCAL] CHECK OPTION`.
+    if end >= start + 3 && t[end - 1].up == "OPTION" && t[end - 2].up == "CHECK" {
+        end -= 2;
+        if matches!(t[end - 1].up.as_str(), "CASCADED" | "LOCAL") {
+            end -= 1;
+        }
+        if t[end - 1].up != "WITH" {
+            return None;
+        }
+        end -= 1;
+    }
+    (start < end && matches!(t[start].up.as_str(), "SELECT" | "WITH" | "(")).then_some((start, end))
 }
 
 fn compound_op(op: &str) -> Option<&'static str> {
@@ -2377,9 +2487,8 @@ impl Hints<'_> {
             super::schema::Fam::Int => Class::Int,
             super::schema::Fam::Exact | super::schema::Fam::Float => Class::Num,
             super::schema::Fam::Bool => Class::Bool,
-            super::schema::Fam::Date
-            | super::schema::Fam::Timestamp
-            | super::schema::Fam::TimestampTz => Class::Date,
+            super::schema::Fam::Date => Class::Date,
+            super::schema::Fam::Timestamp | super::schema::Fam::TimestampTz => Class::Stamp,
             _ if ty.is_string() => Class::Str,
             _ => return None,
         })
@@ -2387,6 +2496,39 @@ impl Hints<'_> {
 
     fn pair(&mut self, l: &Expr, r: &Expr) {
         for (x, y) in [(l, r), (r, l)] {
+            // `v::interval > '1 week'::interval`: the literal is a candidate for v.
+            let x = match x {
+                Expr::Cast(inner, _) if self.d == Dialect::Postgres => &**inner,
+                _ => x,
+            };
+            // `DAY(d) = 1`, `MONTH(d) = 7`, `YEAR(d) = 2019`: a date with that part.
+            if let (Expr::Call(c), Some(V::Int(k))) = (x, lit_value(y)) {
+                let name = c.name.last().map(|s| s.to_uppercase()).unwrap_or_default();
+                let part_arg = match (name.as_str(), c.args.as_slice()) {
+                    ("DAY" | "MONTH" | "YEAR", [a]) => Some((name.clone(), a)),
+                    ("DATEPART", [Expr::Name(p), a]) if p.len() == 1 => {
+                        Some((p[0].to_uppercase(), a))
+                    }
+                    _ => None,
+                };
+                if let Some((part, n)) = part_arg.and_then(|(p, a)| Some((p, self.key(a)?))) {
+                    let date = match part.as_str() {
+                        "DAY" | "DD" | "D" if (1..=28).contains(&k) => {
+                            Some(format!("2020-01-{k:02}"))
+                        }
+                        "MONTH" | "MM" | "M" if (1..=12).contains(&k) => {
+                            Some(format!("2020-{k:02}-01"))
+                        }
+                        "YEAR" | "YY" | "YYYY" if (1900..=2100).contains(&k) => {
+                            Some(format!("{k:04}-01-01"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(dt) = date {
+                        self.note(&n, None, Some(V::Str(dt)));
+                    }
+                }
+            }
             if let Some(n) = self.key(x) {
                 if let Some(v) = lit_value(y) {
                     self.note(&n, Some(class_of(&v)), Some(v));
@@ -2433,6 +2575,14 @@ impl Hints<'_> {
                     self.note(&n, Some(Class::Str), None);
                 }
             }
+            // Text read as an interval: try interval text.
+            Expr::Cast(y, ty) if self.d == Dialect::Postgres && ty.name == "INTERVAL" => {
+                if let Some(n) = self.key(y) {
+                    for t in ["1 day", "01:00:00"] {
+                        self.note(&n, None, Some(V::Str(t.into())));
+                    }
+                }
+            }
             Expr::Case(Some(o), whens, _) => {
                 for (w, _) in whens {
                     self.pair(o, w);
@@ -2449,6 +2599,16 @@ impl Hints<'_> {
                     }
                     if c.args.len() >= 2 {
                         self.pair(&c.args[0], &c.args[1]);
+                    }
+                }
+                // The length of a string: try the empty string.
+                if matches!(
+                    name.as_str(),
+                    "LEN" | "LENGTH" | "CHAR_LENGTH" | "DATALENGTH"
+                ) && c.args.len() == 1
+                {
+                    if let Some(n) = self.key(&c.args[0]) {
+                        self.note(&n, Some(Class::Str), Some(V::Str(String::new())));
                     }
                 }
                 // A string that is split on a separator: try values with
@@ -2582,6 +2742,9 @@ fn examine(
     if na.kind() == SyntaxKind::ROUTINE {
         return header_change(ra, rb, na, nb, changed);
     }
+    if let (Some(ta), Some(tb)) = (table_elements(na), table_elements(nb)) {
+        return table_change(ra, rb, na, &ta, &tb, sa);
+    }
     let xa = shape(na, d)?;
     let xb = shape(nb, d)?;
     if xa.kind != xb.kind {
@@ -2623,6 +2786,7 @@ fn examine(
         hints.expr(g);
     }
     let hint_map = hints.map;
+    let focus = focus_tables(&tokens(na), &tokens(nb));
     let records: Vec<String> = ra.records.iter().cloned().collect();
     // The catalog of side A serves both (same dialect, same database).
     let _ = sb;
@@ -2632,12 +2796,22 @@ fn examine(
         c.records = records.clone();
         c.hints = hint_map.clone();
         c.guards = [reach_a.guards.clone(), reach_b.guards.clone()];
+        c.focus = focus.clone();
         c
     };
-    let found = eval::search(&make, &xa.probe, &xb.probe).map_err(|m| match m {
-        Miss::Unsupported(w) => format!("not evaluated: {w}"),
-        Miss::NoWitness => "no witness found".to_string(),
-    })?;
+    let found = match eval::search(&make, &xa.probe, &xb.probe) {
+        Ok(f) => f,
+        Err(m) => {
+            // One version fails whenever it runs the statement.
+            if let Some(dec) = run_error(ra, rb, na, nb, sa, &reach_a, &reach_b) {
+                return Ok(dec);
+            }
+            return Err(match m {
+                Miss::Unsupported(w) => format!("not evaluated: {w}"),
+                Miss::NoWitness => "no witness found".to_string(),
+            });
+        }
+    };
     let (sa_, sa_e) = cst::sig_range(na);
     let (effect, certain) = observable(ra, rb, na, nb, &xa, &xb, &found, sa_, sa_e)?;
     let mut assumptions = Vec::new();
@@ -2675,6 +2849,585 @@ fn examine(
     Ok(Decided {
         witness,
         assumptions,
+    })
+}
+
+/// A string no conversion to a number, money or date and time accepts.
+fn never_number_or_date(t: &str) -> bool {
+    t.chars().any(|c| {
+        matches!(
+            c,
+            '[' | ']' | '=' | ';' | '(' | ')' | '{' | '}' | '%' | '\'' | '"'
+        )
+    })
+}
+
+// ---- table definitions ----------------------------------------------------
+
+/// The elements (columns and constraints) of `CREATE TABLE name (...)`, a
+/// permanent table, as token lists.
+fn table_elements(n: &SyntaxNode) -> Option<Vec<Vec<Tok>>> {
+    if n.kind() != SyntaxKind::STATEMENT {
+        return None;
+    }
+    let t = tokens(n);
+    let at = t
+        .iter()
+        .position(|x| x.kind == K::Word && x.up == "TABLE")?;
+    if t.first()?.up != "CREATE" || at > 1 {
+        return None;
+    }
+    let open = t.iter().position(|x| x.kind == K::LParen)?;
+    // Only the name stands between TABLE and the parenthesis.
+    if t[at + 1..open].iter().any(|x| {
+        !matches!(x.kind, K::Word | K::Quoted | K::Dot | K::Param)
+                // pg_partman's `@extschema@` placeholder.
+                && !(x.kind == K::Op && x.text == "@")
+    }) || t[at + 1..open].iter().any(|x| x.text.starts_with('#'))
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut depth = 0i32;
+    for x in &t[open..] {
+        match x.kind {
+            K::LParen => {
+                depth += 1;
+                if depth == 1 {
+                    continue;
+                }
+            }
+            K::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    out.push(std::mem::take(&mut cur));
+                    break;
+                }
+            }
+            K::Comma if depth == 1 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(x.clone());
+    }
+    (depth == 0 && !out.is_empty()).then_some(out)
+}
+
+/// A table definition whose only change is one element: a column's length,
+/// precision or scale, its constant DEFAULT, or a CHECK constraint. The
+/// witness is a row stored differently or accepted by one version only.
+#[allow(clippy::too_many_arguments)]
+fn table_change(
+    ra: &Routine,
+    rb: &Routine,
+    na: &SyntaxNode,
+    ea: &[Vec<Tok>],
+    eb: &[Vec<Tok>],
+    schema: &Schema,
+) -> Result<Decided, String> {
+    let d = ra.d;
+    let same = |x: &[Tok], y: &[Tok]| {
+        x.len() == y.len()
+            && x.iter()
+                .zip(y)
+                .all(|(p, q)| p.kind == q.kind && p.up == q.up)
+    };
+    if ea.len() != eb.len() {
+        return Err("columns or constraints added or removed".into());
+    }
+    let changed: Vec<usize> = (0..ea.len()).filter(|&i| !same(&ea[i], &eb[i])).collect();
+    let [i] = changed.as_slice() else {
+        return Err("several table elements changed".into());
+    };
+    // A foreign key bounds its columns by the parent's types (a longer value
+    // or a larger number than the parent holds is rejected in both).
+    let mut fk_cols: HashSet<String> = HashSet::new();
+    for x in ea.iter().chain(eb) {
+        let name = |y: &Tok| eval::var_key(&sqldiff_syntax::ast::unquote(&y.text));
+        if let Some(f) = x
+            .iter()
+            .position(|y| y.kind == K::Word && y.up == "FOREIGN")
+        {
+            let end = x
+                .iter()
+                .position(|y| y.up == "REFERENCES")
+                .unwrap_or(x.len());
+            fk_cols.extend(
+                x[f..end]
+                    .iter()
+                    .filter(|y| {
+                        matches!(y.kind, K::Word | K::Quoted) && y.up != "FOREIGN" && y.up != "KEY"
+                    })
+                    .map(name),
+            );
+        } else if x.iter().any(|y| y.kind == K::Word && y.up == "REFERENCES") {
+            fk_cols.insert(name(&x[0]));
+        }
+    }
+    // A computed column can fail on a value too: both versions could reject
+    // the witness row.
+    for x in ea.iter().chain(eb) {
+        if x.windows(2)
+            .any(|w| w[0].kind == K::Word && w[0].up == "AS" && w[1].kind == K::LParen)
+            || x.iter().any(|y| y.kind == K::Word && y.up == "GENERATED")
+        {
+            return Err("the table has a computed column".into());
+        }
+    }
+    let (xa, xb) = (&ea[*i], &eb[*i]);
+    let (la, lb) = (
+        ra.side.lines.line_col(xa.first().map_or(0, |x| x.off)).0,
+        rb.side.lines.line_col(xb.first().map_or(0, |x| x.off)).0,
+    );
+    let table = {
+        let t = tokens(na);
+        let at = t.iter().position(|x| x.up == "TABLE").unwrap_or(0);
+        let open = t
+            .iter()
+            .position(|x| x.kind == K::LParen)
+            .unwrap_or(t.len());
+        t[at + 1..open]
+            .iter()
+            .map(|x| x.text.as_str())
+            .collect::<String>()
+    };
+    let witness = |text: String| {
+        Ok(Decided {
+            witness: format!("The definition of table {table} (A line {la}, B line {lb}): {text}"),
+            assumptions: Vec::new(),
+        })
+    };
+    let check = |x: &[Tok]| -> Option<(usize, usize)> {
+        let c = x
+            .iter()
+            .position(|y| y.kind == K::Word && y.up == "CHECK")?;
+        let lead_ok = c == 0 || (c == 2 && x[0].up == "CONSTRAINT");
+        (lead_ok && x.get(c + 1).is_some_and(|y| y.kind == K::LParen))
+            .then_some((c + 2, close_of(x, c + 1)?))
+    };
+    // A CHECK constraint.
+    if let (Some((sa_, ea_)), Some((sb_, eb_))) = (check(xa), check(xb)) {
+        if ea_ + 1 != xa.len() || eb_ + 1 != xb.len() {
+            return Err("CHECK constraint options".into());
+        }
+        let cols = column_types(ea, d);
+        let parse = |t: &[Tok]| -> Result<Expr, String> {
+            let mut p = Parser::ext(t, d);
+            let e = p.expr()?;
+            if !p.at_end() {
+                return Err(p.err("unexpected tokens"));
+            }
+            Ok(e)
+        };
+        let ca = as_row_vars(parse(&xa[sa_..ea_])?, &cols);
+        let cb = as_row_vars(parse(&xb[sb_..eb_])?, &cols);
+        // The other CHECK constraints, the same in both versions, must accept the row too.
+        let mut others = Vec::new();
+        for (k, x) in ea.iter().enumerate() {
+            if k == *i {
+                continue;
+            }
+            if let Some((s0, e0)) = check(x) {
+                others.push(as_row_vars(parse(&x[s0..e0])?, &cols));
+            } else if x.iter().any(|y| y.up == "CHECK") {
+                return Err("a column CHECK constraint is not read".into());
+            }
+        }
+        // 1 when every constraint accepts the row (TRUE or NULL), 0 when one rejects it.
+        let accept = |e: Expr| {
+            let whens = std::iter::once(e)
+                .chain(others.iter().cloned())
+                .map(|c| {
+                    (
+                        Expr::Unary("NOT".into(), Box::new(c)),
+                        Expr::Num("0".into()),
+                    )
+                })
+                .collect();
+            Expr::Case(None, whens, Some(Box::new(Expr::Num("1".into()))))
+        };
+        let (pa, pb) = (
+            Probe::Values(vec![accept(ca)]),
+            Probe::Values(vec![accept(cb)]),
+        );
+        let facts: HashMap<String, VarFact> = cols
+            .iter()
+            .map(|(n, ty, nullable)| {
+                (
+                    n.clone(),
+                    VarFact {
+                        ty: *ty,
+                        origin: Origin::Free,
+                        value: None,
+                        nullable: *nullable,
+                        non_negative: false,
+                        cands: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let make = || {
+            let mut c = Ctx::new(d, schema);
+            c.vars = facts.clone();
+            c
+        };
+        let found = eval::search(&make, &pa, &pb).map_err(|m| match m {
+            Miss::Unsupported(w) => format!("not evaluated: {w}"),
+            Miss::NoWitness => "no witness found".to_string(),
+        })?;
+        let first = |o: &Obs| match o {
+            Obs::Rows(r, _) => r.first().and_then(|r| r.first()).cloned(),
+            _ => None,
+        };
+        // Every value of the row must be one its column can hold; otherwise
+        // both versions reject the row (overflow, truncation) before any CHECK.
+        for (k, v) in &found.inputs {
+            let eval::Key::Var(n) = k else {
+                return Err("the witness reads more than the row".into());
+            };
+            let Some((_, ty, _)) = cols.iter().find(|(c, _, _)| c == n) else {
+                return Err("the witness reads more than the row".into());
+            };
+            if fk_cols.contains(n) {
+                return Err(format!("a foreign key bounds column {n}"));
+            }
+            if !ty.is_some_and(|t| eval::fits_type(v, &t)) {
+                return Err(format!(
+                    "the witness value {} may not fit column {n}",
+                    v.show(&[])
+                ));
+            }
+        }
+        let (va, vb) = (first(&found.a), first(&found.b));
+        let accepted = |v: &Option<V>| matches!(v, Some(V::Int(1)));
+        let rejected = |v: &Option<V>| matches!(v, Some(V::Int(0)));
+        let who = if accepted(&va) && rejected(&vb) {
+            "A accepts it and B rejects it"
+        } else if rejected(&va) && accepted(&vb) {
+            "A rejects it and B accepts it"
+        } else {
+            return Err("no witness found".into());
+        };
+        return witness(format!(
+            "storing a row with {} violates the CHECK constraint of one version only: {who}.",
+            describe_inputs(&found, d)
+        ));
+    }
+    // A column: the same name, then a type or DEFAULT change.
+    let (Some(na_), Some(nb_)) = (xa.first(), xb.first()) else {
+        return Err("empty table element".into());
+    };
+    if !matches!(na_.kind, K::Word | K::Quoted) || na_.up != nb_.up || na_.kind != nb_.kind {
+        return Err("a different column".into());
+    }
+    if matches!(
+        na_.up.as_str(),
+        "CONSTRAINT"
+            | "PRIMARY"
+            | "UNIQUE"
+            | "FOREIGN"
+            | "CHECK"
+            | "INDEX"
+            | "EXCLUDE"
+            | "PERIOD"
+            | "LIKE"
+    ) {
+        return Err("a changed table constraint".into());
+    }
+    let name = na_.text.clone();
+    // A CHECK constraint on the column could reject the witness value in both.
+    let key = eval::var_key(&sqldiff_syntax::ast::unquote(&name));
+    if ea.iter().flatten().any(|y| y.up == "CHECK")
+        && ea.iter().flatten().any(|y| {
+            matches!(y.kind, K::Word | K::Quoted)
+                && eval::var_key(&sqldiff_syntax::ast::unquote(&y.text)) == key
+        })
+        && ea
+            .iter()
+            .filter(|x| x.iter().any(|y| y.up == "CHECK"))
+            .any(|x| {
+                x.iter().any(|y| {
+                    matches!(y.kind, K::Word | K::Quoted)
+                        && eval::var_key(&sqldiff_syntax::ast::unquote(&y.text)) == key
+                })
+            })
+    {
+        return Err("a CHECK constraint reads the column".into());
+    }
+    // A key, index or other constraint on the column may limit what it
+    // stores (index key size) or reject the witness row in both versions.
+    if ea.iter().enumerate().any(|(k, x)| {
+        k != *i
+            && x.iter().any(|y| {
+                matches!(y.kind, K::Word | K::Quoted)
+                    && eval::var_key(&sqldiff_syntax::ast::unquote(&y.text)) == key
+            })
+    }) {
+        return Err("another table element names the column".into());
+    }
+    let (mut pa, mut pb) = (Parser::ext(&xa[1..], d), Parser::ext(&xb[1..], d));
+    let (ta, tb) = (pa.ty()?, pb.ty()?);
+    let (ra_, rb_) = (&xa[1 + pa.i..], &xb[1 + pb.i..]);
+    if ta != tb {
+        if fk_cols.contains(&key) {
+            return Err("a foreign key bounds the column".into());
+        }
+        // Only the type changed, by length, precision or scale.
+        if !same(ra_, rb_) || ta.name != tb.name {
+            return Err("the column type and its options changed".into());
+        }
+        let (ya, yb) = (Ty::from_type(&ta, d, false), Ty::from_type(&tb, d, false));
+        if ya.fam != yb.fam {
+            return Err("a different type family".into());
+        }
+        if ya.is_string() {
+            let (Some(a), Some(b)) = (ya.len, yb.len) else {
+                return Err("an unbounded string column".into());
+            };
+            let (short, long) = if a < b { ("A", "B") } else { ("B", "A") };
+            let n = a.min(b) + 1;
+            // Within any index key and row size limit (900 bytes in SQL
+            // Server), so that only the column length can reject it.
+            let bytes = if ta.name.starts_with('N') { 2 * n } else { n };
+            if bytes > 900 {
+                return Err("a witness value too long for an index key".into());
+            }
+            return witness(format!(
+                "column {name} holds {} characters in A and {} in B, so storing a value of {n} characters (none of them blanks) in it fails in {short} and succeeds in {long}.",
+                a, b
+            ));
+        }
+        if ya.fam == super::schema::Fam::Exact {
+            let (Some(pa_), Some(pb_), Some(sa_), Some(sb_)) = (ya.len, yb.len, ya.scale, yb.scale)
+            else {
+                return Err("a decimal without precision".into());
+            };
+            if sa_ == sb_ && pa_ != pb_ {
+                let digits = pa_.min(pb_) - sa_;
+                let (short, long) = if pa_ < pb_ { ("A", "B") } else { ("B", "A") };
+                let value = format!("1{}", "0".repeat(digits as usize));
+                return witness(format!(
+                    "column {name} is decimal({pa_},{sa_}) in A and decimal({pb_},{sb_}) in B, so storing {value} in it overflows in {short} and succeeds in {long}."
+                ));
+            }
+            if pa_ == pb_ && sa_ != sb_ {
+                let s = sa_.max(sb_);
+                let value = format!("0.{}5", "0".repeat(s as usize - 1));
+                let (fewer, more) = if sa_ < sb_ { ("A", "B") } else { ("B", "A") };
+                return witness(format!(
+                    "column {name} is decimal({pa_},{sa_}) in A and decimal({pb_},{sb_}) in B, so {value} is stored as it is in {more} and as a value with fewer decimals in {fewer}."
+                ));
+            }
+            return Err("precision and scale both changed".into());
+        }
+        return Err("a type change other than length, precision or scale".into());
+    }
+    // The same type: a constant DEFAULT that changed.
+    let default = |r: &[Tok]| -> Option<V> {
+        let k = r
+            .iter()
+            .position(|x| x.kind == K::Word && x.up == "DEFAULT")?;
+        let mut p = Parser::ext(&r[k + 1..], d);
+        // T-SQL writes `DEFAULT ((30))` and `DEFAULT ((-1))`.
+        fn bare(mut e: &Expr) -> Option<&Expr> {
+            while let Expr::Tuple(v) = e {
+                let [x] = v.as_slice() else { return None };
+                e = x;
+            }
+            Some(e)
+        }
+        let e = p.expr().ok()?;
+        match bare(&e)? {
+            Expr::Unary(op, x) if op == "-" => match constant_value(bare(x)?)? {
+                V::Int(i) => Some(V::Int(-i)),
+                V::Num(f) => Some(V::Num(-f)),
+                _ => None,
+            },
+            Expr::Unary(..) => None,
+            e => constant_value(e),
+        }
+    };
+    let (Some(da), Some(db)) = (default(ra_), default(rb_)) else {
+        return Err("a column change other than its type or a constant DEFAULT".into());
+    };
+    let mut c = Ctx::new(d, schema);
+    let (Ok(va), Ok(vb)) = (c.cast_value(da, &ta), c.cast_value(db, &tb)) else {
+        return Err("the defaults are not evaluated".into());
+    };
+    if matches!(va, V::Err(_)) || matches!(vb, V::Err(_)) || eval::same(&va, &vb) != Some(false) {
+        return Err("the defaults may store the same value".into());
+    }
+    witness(format!(
+        "a row stored without a value for column {name} gets {} in A and {} in B.",
+        va.show(&[]),
+        vb.show(&[])
+    ))
+}
+
+/// Index of the parenthesis closing the one at `open`.
+fn close_of(t: &[Tok], open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, x) in t.iter().enumerate().skip(open) {
+        match x.kind {
+            K::LParen => depth += 1,
+            K::RParen => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Column names (lower case), declared types and nullability of a table's elements.
+fn column_types(els: &[Vec<Tok>], d: Dialect) -> Vec<(String, Option<Ty>, bool)> {
+    els.iter()
+        .filter(|x| {
+            x.first().is_some_and(|y| {
+                matches!(y.kind, K::Word | K::Quoted)
+                    && !matches!(
+                        y.up.as_str(),
+                        "CONSTRAINT"
+                            | "PRIMARY"
+                            | "UNIQUE"
+                            | "FOREIGN"
+                            | "CHECK"
+                            | "INDEX"
+                            | "EXCLUDE"
+                            | "PERIOD"
+                            | "LIKE"
+                    )
+            })
+        })
+        .map(|x| {
+            let ty = Parser::ext(&x[1..], d)
+                .ty()
+                .ok()
+                .map(|t| Ty::from_type(&t, d, false));
+            let not_null = x.windows(2).any(|w| w[0].up == "NOT" && w[1].up == "NULL")
+                || x.iter().any(|y| y.up == "PRIMARY");
+            (
+                eval::var_key(&sqldiff_syntax::ast::unquote(&x[0].text)),
+                ty,
+                !not_null,
+            )
+        })
+        .collect()
+}
+
+/// A CHECK condition with the table's columns read as variables (the row
+/// being stored).
+fn as_row_vars(e: Expr, cols: &[(String, Option<Ty>, bool)]) -> Expr {
+    eval::map_expr(e, &|x| match x {
+        Expr::Name(p)
+            if p.len() == 1 && cols.iter().any(|(n, _, _)| *n == eval::var_key(&p[0])) =>
+        {
+            Some(Expr::Var(p[0].clone()))
+        }
+        _ => None,
+    })
+}
+
+/// Tables named in the innermost parenthesised query around the first token
+/// where the two versions differ (or in the whole statement when there is
+/// no such query).
+fn focus_tables(ta: &[Tok], tb: &[Tok]) -> Vec<String> {
+    let at = ta
+        .iter()
+        .zip(tb)
+        .position(|(x, y)| x.kind != y.kind || x.up != y.up)
+        .unwrap_or(ta.len().min(tb.len()));
+    // The innermost `( SELECT` that is still open at `at`.
+    let mut opens: Vec<usize> = Vec::new();
+    for (i, x) in ta.iter().enumerate().take(at.min(ta.len())) {
+        match x.kind {
+            K::LParen => opens.push(i),
+            K::RParen => {
+                opens.pop();
+            }
+            _ => {}
+        }
+    }
+    let (start, end) = match opens
+        .iter()
+        .rev()
+        .find(|&&o| ta.get(o + 1).is_some_and(|x| x.up == "SELECT"))
+    {
+        Some(&o) => (o + 1, close_of(ta, o).unwrap_or(ta.len())),
+        None => (0, ta.len()),
+    };
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut i = start;
+    while i < end {
+        let x = &ta[i];
+        match x.kind {
+            K::LParen => depth += 1,
+            K::RParen => depth -= 1,
+            K::Word if depth == 0 && (x.up == "FROM" || x.up == "JOIN") => {
+                let mut parts = Vec::new();
+                let mut j = i + 1;
+                while let Some(y) = ta.get(j) {
+                    if !matches!(y.kind, K::Word | K::Quoted) {
+                        break;
+                    }
+                    parts.push(sqldiff_syntax::ast::unquote(&y.text));
+                    if ta.get(j + 1).is_some_and(|z| z.kind == K::Dot) {
+                        j += 2;
+                    } else {
+                        break;
+                    }
+                }
+                if !parts.is_empty() {
+                    let key = eval::table_key(&parts);
+                    if !out.contains(&key) {
+                        out.push(key);
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+/// One version's statement fails whenever it runs (a type error SQL Server
+/// raises when it compiles the statement) and the other's does not have that
+/// error. Running the statement, and the other version running it without
+/// error, are assumed.
+fn run_error(
+    ra: &Routine,
+    rb: &Routine,
+    na: &SyntaxNode,
+    nb: &SyntaxNode,
+    schema: &Schema,
+    reach_a: &Reach,
+    reach_b: &Reach,
+) -> Option<Decided> {
+    let (la, lb) = (ra.side.line_of(na), rb.side.line_of(nb));
+    let witness = match (
+        type_error_at(ra, na, schema, true),
+        type_error_at(rb, nb, schema, true),
+    ) {
+        (None, Some(why)) => format!(
+            "B fails whenever it runs line {lb}: {why}, which SQL Server rejects when it compiles the statement; A line {la} does not have this error."
+        ),
+        (Some(why), None) => format!(
+            "A fails whenever it runs line {la}: {why}, which SQL Server rejects when it compiles the statement; B line {lb} does not have this error."
+        ),
+        _ => return None,
+    };
+    let _ = (reach_a, reach_b);
+    Some(Decided {
+        witness,
+        assumptions: vec![witness_path().id],
     })
 }
 
@@ -2926,13 +3679,20 @@ fn validity(
 /// name resolution), so only statements without tables, or reading `sys`
 /// catalog views alone, are judged.
 fn type_error(r: &Routine, n: &SyntaxNode, schema: &Schema) -> Option<String> {
+    type_error_at(r, n, schema, false)
+}
+
+/// The same error in any statement, tables or not: SQL Server raises it
+/// when it compiles the statement, at the latest when the statement runs.
+fn type_error_at(r: &Routine, n: &SyntaxNode, schema: &Schema, run: bool) -> Option<String> {
     if r.d != Dialect::Tsql {
         return None;
     }
     let x = shape(n, r.d).ok()?;
-    if eval::probe_tables(&x.probe)
-        .iter()
-        .any(|t| !t.starts_with("sys."))
+    if !run
+        && eval::probe_tables(&x.probe)
+            .iter()
+            .any(|t| !t.starts_with("sys."))
     {
         return None;
     }
@@ -2997,6 +3757,19 @@ fn type_error(r: &Routine, n: &SyntaxNode, schema: &Schema) -> Option<String> {
                 {
                     found = Some(format!("`{op}` is applied to two character strings"));
                 }
+                // Whatever the other operand's type, the string must be
+                // converted to it: a number or a date it can never be.
+                if found.is_none() && run && matches!(op.as_str(), "-" | "*" | "/" | "%") {
+                    for side in [a, b] {
+                        if let Expr::Str(t) = &**side {
+                            if never_number_or_date(t) {
+                                found = Some(format!(
+                                    "`{op}` needs '{t}' as a number or date, which it is not"
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         });
     }
@@ -3013,6 +3786,7 @@ fn what(x: &Shape, n: &SyntaxNode, d: Dialect) -> String {
         ShapeKind::Message => "The message".into(),
         ShapeKind::Cursor => "The cursor query".into(),
         ShapeKind::ForQuery => "The FOR loop query".into(),
+        ShapeKind::View => "The view query".into(),
         ShapeKind::Data => format!("The {}", stmt_kind(n, d).label()),
     }
 }
@@ -3196,6 +3970,8 @@ fn observable(
     }
     match xa.kind {
         ShapeKind::Raise | ShapeKind::Message => Ok((format!("{both}."), true)),
+        // Whoever selects from the view sees its rows.
+        ShapeKind::View => Ok((format!("{both}."), true)),
         ShapeKind::ForQuery => {
             let body = xa.branches.first().ok_or("loop without body")?;
             if effect(ra, body) == Eff::No {

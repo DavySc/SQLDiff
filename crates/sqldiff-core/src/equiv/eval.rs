@@ -42,6 +42,12 @@ pub enum V {
     Opq(usize),
     /// Some value of the same type that differs from opaque value `k`.
     Ne(usize),
+    /// A PostgreSQL interval: months, days and microseconds.
+    Ivl(i64, i64, i128),
+    /// A number computed from random values (RAND()): the hull of every
+    /// value it can take (lo, hi), and a range (lo, hi) whose ends it
+    /// certainly gets arbitrarily close to. Never NULL.
+    Rng(f64, f64, f64, f64),
     /// The statement raises an error.
     Err(String),
 }
@@ -113,8 +119,210 @@ impl V {
                 .map(|s| format!("a value other than {s}"))
                 .unwrap_or_else(|| "another value".into()),
             V::Err(e) => format!("an error ({e})"),
+            V::Ivl(m, d, us) => format!("interval '{}'", show_interval(*m, *d, *us)),
+            V::Rng(lo, hi, _, _) => {
+                format!("a random value between {} and {}", show_f(*lo), show_f(*hi))
+            }
         }
     }
+}
+
+fn show_f(f: f64) -> String {
+    let r = (f * 1e6).round() / 1e6;
+    if r.fract() == 0.0 {
+        format!("{r:.0}")
+    } else {
+        format!("{r}")
+    }
+}
+
+/// The range of RAND(): the hull [0, 1], and values certainly produced
+/// near 0 and near 1 (it returns many values in any interval this wide).
+const RAND_RANGE: V = V::Rng(0.0, 1.0, 1e-6, 1.0 - 1e-6);
+
+/// Interval arithmetic on random ranges: `f` applied to both hulls. `f`
+/// must be monotone in each argument or the hull must be recomputed from
+/// all corner values, which this does.
+fn rng_op(
+    a: (f64, f64, f64, f64),
+    b: (f64, f64, f64, f64),
+    f: impl Fn(f64, f64) -> f64,
+) -> Option<V> {
+    let hull = |x: (f64, f64), y: (f64, f64)| {
+        let c = [f(x.0, y.0), f(x.0, y.1), f(x.1, y.0), f(x.1, y.1)];
+        let lo = c.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = c.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        (lo.is_finite() && hi.is_finite() && lo.abs() < 1e12 && hi.abs() < 1e12).then_some((lo, hi))
+    };
+    let (lo, hi) = hull((a.0, a.1), (b.0, b.1))?;
+    let (ilo, ihi) = hull((a.2, a.3), (b.2, b.3))?;
+    Some(V::Rng(lo, hi, ilo, ihi))
+}
+
+fn rng_parts(v: &V) -> Option<(f64, f64, f64, f64)> {
+    match v {
+        V::Rng(a, b, c, d) => Some((*a, *b, *c, *d)),
+        V::Int(i) => Some((*i as f64, *i as f64, *i as f64, *i as f64)),
+        V::Num(f) => Some((*f, *f, *f, *f)),
+        _ => None,
+    }
+}
+
+/// Whether a random range and another value certainly differ as outcomes:
+/// one side gets values the other never takes.
+fn rng_differs(a: &V, b: &V) -> Option<bool> {
+    let (x, y) = (rng_parts(a)?, rng_parts(b)?);
+    let eps = |v: f64| 1e-9 * v.abs().max(1.0);
+    // x reaches below y's lowest value or above its highest, or the reverse.
+    let beyond = |x: (f64, f64, f64, f64), y: (f64, f64, f64, f64)| {
+        x.2 < y.0 - eps(y.0) || x.3 > y.1 + eps(y.1)
+    };
+    (beyond(x, y) || beyond(y, x)).then_some(true)
+}
+
+/// An interval as PostgreSQL shows it (IntervalStyle postgres).
+fn show_interval(months: i64, days: i64, us: i128) -> String {
+    let mut parts = Vec::new();
+    let unit =
+        |n: i64, one: &str, many: &str| format!("{n} {}", if n.abs() == 1 { one } else { many });
+    let (y, mo) = (months / 12, months % 12);
+    if y != 0 {
+        parts.push(unit(y, "year", "years"));
+    }
+    if mo != 0 {
+        parts.push(unit(mo, "mon", "mons"));
+    }
+    if days != 0 {
+        parts.push(unit(days, "day", "days"));
+    }
+    if us != 0 || parts.is_empty() {
+        let sign = if us < 0 { "-" } else { "" };
+        let a = us.abs();
+        let (secs, frac) = (a / 1_000_000, a % 1_000_000);
+        let mut t = format!(
+            "{sign}{:02}:{:02}:{:02}",
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        );
+        if frac != 0 {
+            t.push_str(format!(".{frac:06}").trim_end_matches('0'));
+        }
+        parts.push(t);
+    }
+    parts.join(" ")
+}
+
+const DAY_US: i128 = 86_400_000_000;
+
+/// The PostgreSQL interval input forms with whole amounts: `N unit ...`
+/// (year, month, week, day, hour, minute, second and their abbreviations),
+/// `HH:MM[:SS]`, an `@` prefix and an `ago` suffix. None for anything else.
+fn parse_interval(s: &str) -> Option<(i64, i64, i128)> {
+    let mut words: Vec<String> = s.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.first().is_some_and(|w| w == "@") {
+        words.remove(0);
+    }
+    let ago = words.last().is_some_and(|w| w == "ago");
+    if ago {
+        words.pop();
+    }
+    if words.is_empty() {
+        return None;
+    }
+    let (mut mo, mut d, mut us) = (0i64, 0i64, 0i128);
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        if w.contains(':') {
+            let (neg, t) = match w.strip_prefix('-') {
+                Some(t) => (true, t),
+                None => (false, w.strip_prefix('+').unwrap_or(w)),
+            };
+            let f: Vec<i128> = t
+                .split(':')
+                .map(|x| {
+                    (!x.is_empty() && x.bytes().all(|c| c.is_ascii_digit()))
+                        .then(|| x.parse().ok())
+                        .flatten()
+                })
+                .collect::<Option<_>>()?;
+            let secs = match f.as_slice() {
+                [h, m] => h * 3600 + m * 60,
+                [h, m, s] if *m < 60 && *s < 60 => h * 3600 + m * 60 + s,
+                _ => return None,
+            };
+            us += if neg { -secs } else { secs } * 1_000_000;
+            i += 1;
+            continue;
+        }
+        // A number and its unit, written apart or together (`1day`).
+        let digits_end = w
+            .char_indices()
+            .find(|(k, c)| !(c.is_ascii_digit() || (*k == 0 && (*c == '-' || *c == '+'))))
+            .map(|(k, _)| k)
+            .unwrap_or(w.len());
+        let (num, unit) = if digits_end == w.len() {
+            i += 1;
+            (w.as_str(), words.get(i)?.as_str())
+        } else {
+            (&w[..digits_end], &w[digits_end..])
+        };
+        let n: i64 = num.parse().ok()?;
+        match unit.trim_end_matches(',') {
+            "year" | "years" | "y" | "yr" | "yrs" => mo += n.checked_mul(12)?,
+            "month" | "months" | "mon" | "mons" => mo += n,
+            "week" | "weeks" | "w" => d += n.checked_mul(7)?,
+            "day" | "days" | "d" => d += n,
+            "hour" | "hours" | "h" | "hr" | "hrs" => us += n as i128 * 3_600_000_000,
+            "minute" | "minutes" | "min" | "mins" | "m" => us += n as i128 * 60_000_000,
+            "second" | "seconds" | "sec" | "secs" | "s" => us += n as i128 * 1_000_000,
+            _ => return None,
+        }
+        i += 1;
+    }
+    Some(if ago { (-mo, -d, -us) } else { (mo, d, us) })
+}
+
+/// Interval ordering key: PostgreSQL compares intervals as if a month had
+/// 30 days and a day 24 hours.
+fn interval_key(m: i64, d: i64, us: i128) -> i128 {
+    (m as i128 * 30 + d as i128) * DAY_US + us
+}
+
+/// A timestamp (or a date, at midnight) plus an interval, as PostgreSQL
+/// adds them: months first (the day clamped to the month's end), then days,
+/// then time. None when the value is not a date or the result leaves years
+/// 1 to 9999.
+fn add_interval(ts: &str, m: i64, d: i64, us: i128) -> Option<String> {
+    let dl = parse_date(ts)?;
+    let t = instant(&dl.rest)?;
+    let (y, mo, dd) = civil_from_days(dl.days);
+    let months = y * 12 + (mo - 1) + m;
+    let (ny, nm) = (months.div_euclid(12), months.rem_euclid(12) + 1);
+    let mut nd = dd;
+    while civil_from_days(days_from_civil(ny, nm, nd)) != (ny, nm, nd) {
+        nd -= 1;
+    }
+    let days = days_from_civil(ny, nm, nd) + d;
+    // `instant` counts 100 ns.
+    let total = days as i128 * DAY_US + t / 10 + us;
+    let (days, rem) = (total.div_euclid(DAY_US), total.rem_euclid(DAY_US));
+    let (y, _, _) = civil_from_days(days as i64);
+    if !(1..=9999).contains(&y) {
+        return None;
+    }
+    let secs = rem / 1_000_000;
+    let frac = rem % 1_000_000;
+    let mut out = format_date(&DateLit {
+        sep: true,
+        days: days as i64,
+        rest: format!(" {:02}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60),
+    });
+    if frac != 0 {
+        out.push_str(format!(".{frac:06}").trim_end_matches('0'));
+    }
+    Some(out)
 }
 
 /// Why an evaluation did not produce a value.
@@ -237,6 +445,84 @@ fn format_date(d: &DateLit) -> String {
     }
 }
 
+/// Time of day in units of 100 ns, from a date literal's time part
+/// (midnight when there is none).
+fn instant(rest: &str) -> Option<i128> {
+    let (h, m, s, frac) = time_of(rest)?;
+    let digits = frac.trim_start_matches('.');
+    if digits.len() > 7 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let f: i128 = format!("{digits:0<7}").parse().ok()?;
+    Some((((h * 60 + m) * 60 + s) as i128) * 10_000_000 + f)
+}
+
+/// The order of two date and time values that holds whatever date or time
+/// type stores or converts them, or None when they may be equal. A column
+/// rounds what it stores (smalldatetime to the minute, datetime to 1/300 s,
+/// datetime2(p) and timestamp(p) to p digits) and a literal compared with it
+/// is converted to its type first: a time moves by at most 30 seconds, so
+/// whole minutes, and times two minutes or more apart, keep their order. A
+/// date column drops the time of what it is compared with.
+fn date_order(x: &DateLit, y: &DateLit) -> Option<std::cmp::Ordering> {
+    const MINUTE: i128 = 60 * 10_000_000;
+    const LAST_MINUTE: i128 = (23 * 60 + 59) * MINUTE;
+    if x.days != y.days {
+        let (early, late) = if x.days < y.days { (x, y) } else { (y, x) };
+        // Rounding into the next day: a time after 23:59 that is not a whole
+        // minute, or one not read here.
+        let may_round = !early.rest.is_empty()
+            && instant(&early.rest).map_or(true, |p| p > LAST_MINUTE && p % MINUTE != 0);
+        if late.days - early.days == 1 && x.rest != y.rest && may_round {
+            return None;
+        }
+        return Some(x.days.cmp(&y.days));
+    }
+    if x.rest.is_empty() || y.rest.is_empty() {
+        return None;
+    }
+    let (p, q) = (instant(&x.rest)?, instant(&y.rest)?);
+    let whole = p % MINUTE == 0 && q % MINUTE == 0;
+    (p != q && (whole || (p - q).abs() >= 2 * MINUTE)).then(|| p.cmp(&q))
+}
+
+/// Whether a column of type `t` stores `v` as it is: in range, within its
+/// length and precision, and (for times) a whole minute. False when unsure.
+pub fn fits_type(v: &V, t: &Ty) -> bool {
+    match (t.fam, v) {
+        (_, V::Null) => true,
+        (Fam::Int, V::Int(i)) => match t.len {
+            Some(1) => *i == 0 || *i == 1,
+            Some(bits @ (16 | 32 | 64)) => {
+                let lim = 1i128 << (bits - 1);
+                (-lim..lim).contains(i)
+            }
+            _ => false,
+        },
+        (Fam::Exact, V::Int(_) | V::Num(_)) => {
+            let Some(x) = num_of(v) else { return false };
+            match (t.len, t.scale) {
+                (Some(p), Some(s)) => {
+                    let m = x * 10f64.powi(s as i32);
+                    m.fract() == 0.0 && m.abs() < 10f64.powi(p as i32) && m.abs() < 1e15
+                }
+                _ => false,
+            }
+        }
+        (Fam::Float, V::Int(i)) => i.abs() < 1 << 50,
+        (Fam::Float, V::Num(_)) => true,
+        (Fam::VarChar | Fam::Char, V::Str(s)) => {
+            s.is_ascii() && t.len.map_or(true, |l| s.len() as u32 <= l)
+        }
+        (Fam::Date, V::Str(s)) => parse_date(s).is_some_and(|d| d.rest.is_empty()),
+        (Fam::Timestamp, V::Str(s)) => parse_date(s).is_some_and(|d| {
+            d.rest.is_empty() || instant(&d.rest).is_some_and(|p| p % (60 * 10_000_000) == 0)
+        }),
+        (Fam::Bool, V::Bool(_)) => true,
+        _ => false,
+    }
+}
+
 /// Same date literal one day later or earlier.
 pub fn date_neighbour(s: &str, delta: i64) -> Option<String> {
     let mut d = parse_date(s)?;
@@ -259,7 +545,7 @@ fn str_eq(a: &str, b: &str) -> Option<bool> {
     // Dates written differently may be the same date and time.
     if let (Some(x), Some(y)) = (parse_date(a), parse_date(b)) {
         if x.sep != y.sep || x.rest != y.rest {
-            return if x.days != y.days { Some(false) } else { None };
+            return date_order(&x, &y).map(|_| false);
         }
     }
     let fold = |s: &str| s.trim_end_matches(' ').to_lowercase();
@@ -275,20 +561,11 @@ fn str_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     if a == b {
         return Some(Equal);
     }
-    // Two dates in the same format order by date in every type and collation.
+    // Two dates in the same format order by date and time in every type
+    // and collation.
     if let (Some(x), Some(y)) = (parse_date(a), parse_date(b)) {
-        if x.sep == y.sep && x.rest.len() == y.rest.len() {
-            if x.days != y.days {
-                return Some(x.days.cmp(&y.days));
-            }
-            if x.rest
-                .bytes()
-                .zip(y.rest.bytes())
-                .all(|(p, q)| p == q || (p.is_ascii_digit() && q.is_ascii_digit()))
-            {
-                return Some(x.rest.cmp(&y.rest));
-            }
-            return None;
+        if x.sep == y.sep {
+            return date_order(&x, &y);
         }
     }
     let (ab, bb) = (a.as_bytes(), b.as_bytes());
@@ -333,6 +610,8 @@ pub enum Origin {
     Assumed,
     /// Fixed by the routine (a constant), never chosen.
     Fixed,
+    /// Assigned a random draw: each version reads its own unknown number.
+    Random,
 }
 
 /// Value class of an input, from its declared type or how it is compared.
@@ -344,8 +623,12 @@ pub enum Class {
     Num,
     Str,
     Bool,
-    /// Dates and timestamps, as ISO strings.
+    /// Dates, as ISO strings.
     Date,
+    /// Timestamps, as ISO strings with a time of day.
+    Stamp,
+    /// PostgreSQL intervals.
+    Ivl,
     /// Unknown type: only ordered, distinct values.
     Gen,
 }
@@ -460,6 +743,8 @@ pub struct Ctx<'s> {
     /// Conditions each side's statement is only reached under: (condition,
     /// whether it must be true or must not be true), for side A and side B.
     pub guards: [Vec<(Expr, bool)>; 2],
+    /// Tables read near the change: their two-row worlds are tried first.
+    pub focus: Vec<String>,
     /// A guard could not be evaluated in the last run (reaching the
     /// statement with the witness inputs is then assumed).
     pub guard_skipped: bool,
@@ -495,6 +780,7 @@ impl<'s> Ctx<'s> {
             tables: Vec::new(),
             extra: None,
             guards: [Vec::new(), Vec::new()],
+            focus: Vec::new(),
             guard_skipped: false,
             ctes: Vec::new(),
             func_schema: HashMap::new(),
@@ -517,6 +803,19 @@ impl<'s> Ctx<'s> {
                     cands.insert(0, V::Ne(k));
                 }
                 cands.insert(0, x);
+            }
+        }
+        // A further row of a table starts as a copy of the row before it, so
+        // that one change to a qualifying row makes both rows qualify.
+        if let Key::Col(t, row, c) = &key {
+            if *row > 0 {
+                let prev = Key::Col(t.clone(), row - 1, c.clone());
+                if let Some(Some(v)) = self.index.get(&prev).map(|&j| self.values[j].clone()) {
+                    if let Some(at) = cands.iter().position(|x| *x == v) {
+                        let v = cands.remove(at);
+                        cands.insert(0, v);
+                    }
+                }
             }
         }
         let i = self.inputs.len();
@@ -618,10 +917,27 @@ impl<'s> Ctx<'s> {
                 push(V::Bool(true));
                 push(V::Bool(false));
             }
-            Class::Date => {
+            Class::Date | Class::Stamp => {
                 for l in &hint.lits {
                     match l {
                         V::Str(s) if parse_date(s).is_some() => {
+                            let d = parse_date(s).unwrap();
+                            // A value the column can store: a date holds no
+                            // time, and only whole minutes survive every
+                            // timestamp type.
+                            if class == Class::Date && !d.rest.is_empty() {
+                                push(V::Str(format_date(&DateLit {
+                                    sep: d.sep,
+                                    days: d.days,
+                                    rest: String::new(),
+                                })));
+                                continue;
+                            }
+                            if !d.rest.is_empty()
+                                && !instant(&d.rest).is_some_and(|p| p % (60 * 10_000_000) == 0)
+                            {
+                                continue;
+                            }
                             push(V::Str(s.clone()));
                             for delta in [1, -1] {
                                 if let Some(n) = date_neighbour(s, delta) {
@@ -636,10 +952,39 @@ impl<'s> Ctx<'s> {
                         _ => {}
                     }
                 }
-                push(V::Str("2020-01-01".into()));
-                push(V::Str("2020-01-02".into()));
-                // Another year, for date parts and ranges.
-                push(V::Str("2019-12-31".into()));
+                if class == Class::Stamp {
+                    // A time of day, for time units and the format of the clock;
+                    // a month apart, so that intervals fit between them.
+                    push(V::Str("2020-01-01 10:00:00".into()));
+                    push(V::Str("2020-02-01 10:00:00".into()));
+                    // Another year, for date parts and ranges.
+                    push(V::Str("2019-12-01 10:00:00".into()));
+                } else {
+                    push(V::Str("2020-01-01".into()));
+                    push(V::Str("2020-01-02".into()));
+                    // Another year, for date parts and ranges.
+                    push(V::Str("2019-12-31".into()));
+                }
+            }
+            Class::Ivl => {
+                for l in &hint.lits {
+                    match l {
+                        V::Ivl(..) => push(l.clone()),
+                        V::Str(t) => {
+                            if let Some((m, d, us)) = parse_interval(t) {
+                                push(V::Ivl(m, d, us));
+                            }
+                        }
+                        V::Opq(k) => {
+                            push(l.clone());
+                            push(V::Ne(*k));
+                        }
+                        _ => {}
+                    }
+                }
+                push(V::Ivl(0, 1, 0));
+                push(V::Ivl(0, 0, 3_600_000_000));
+                push(V::Ivl(1, 0, 0));
             }
             Class::Gen => {
                 for l in &hint.lits {
@@ -668,7 +1013,9 @@ impl<'s> Ctx<'s> {
             Fam::Exact | Fam::Float => Class::Num,
             Fam::Char | Fam::VarChar => Class::Str,
             Fam::Bool => Class::Bool,
-            Fam::Date | Fam::Timestamp | Fam::TimestampTz => Class::Date,
+            Fam::Date => Class::Date,
+            Fam::Timestamp | Fam::TimestampTz => Class::Stamp,
+            Fam::Interval => Class::Ivl,
             Fam::Time => return None,
             Fam::Other => return None,
         })
@@ -687,6 +1034,13 @@ impl<'s> Ctx<'s> {
         };
         if let Some(v) = &f.value {
             return Ok(v.clone());
+        }
+        if f.origin == Origin::Random {
+            // Each version draws its own number: values of the two versions
+            // never agree, and none is chosen (not even NULL).
+            self.nondeterministic = true;
+            let id = format!("@{n}#random#{}", self.side);
+            return Ok(self.opaque_value(id, format!("{name} (a random number)"), false));
         }
         let hint = self.hint(&format!("@{n}"));
         // A declared type the evaluator does not model (interval, xml, ...)
@@ -828,7 +1182,7 @@ fn for_json(r: &Rows) -> R<V> {
                 V::Gen(g) => format!("\"<value {}>\"", (b'a' + g) as char),
                 V::Err(e) => return Ok(V::Err(e.clone())),
                 // Opaque values may equal anything.
-                V::Opq(_) | V::Ne(_) => return rej(),
+                V::Opq(_) | V::Ne(_) | V::Ivl(..) | V::Rng(..) => return rej(),
             };
             props.push(format!("{n:?}:{s}"));
         }
@@ -983,6 +1337,40 @@ fn has_aggregate(e: &Expr) -> bool {
 }
 
 /// Visits an expression and its subexpressions (not into subqueries).
+/// Rebuilds an expression bottom-up where `f` returns a replacement
+/// (subqueries are left as they are).
+pub fn map_expr(e: Expr, f: &dyn Fn(&Expr) -> Option<Expr>) -> Expr {
+    if let Some(r) = f(&e) {
+        return r;
+    }
+    let m = |x: Box<Expr>| Box::new(map_expr(*x, f));
+    let ml = |l: Vec<Expr>| l.into_iter().map(|y| map_expr(y, f)).collect::<Vec<_>>();
+    match e {
+        Expr::Call(mut c) => {
+            c.args = ml(std::mem::take(&mut c.args));
+            Expr::Call(c)
+        }
+        Expr::Bin(op, l, r) => Expr::Bin(op, m(l), m(r)),
+        Expr::Unary(op, x) => Expr::Unary(op, m(x)),
+        Expr::IsNull(x, n) => Expr::IsNull(m(x), n),
+        Expr::Cast(x, t) => Expr::Cast(m(x), t),
+        Expr::Extract(p, x) => Expr::Extract(p, m(x)),
+        Expr::InList(x, l, n) => Expr::InList(m(x), ml(l), n),
+        Expr::InQuery(x, q, n) => Expr::InQuery(m(x), q, n),
+        Expr::Between(x, l, h, n) => Expr::Between(m(x), m(l), m(h), n),
+        Expr::Like(x, p, a, b) => Expr::Like(m(x), m(p), a, b),
+        Expr::Case(o, w, e2) => Expr::Case(
+            o.map(m),
+            w.into_iter()
+                .map(|(a, b)| (map_expr(a, f), map_expr(b, f)))
+                .collect(),
+            e2.map(m),
+        ),
+        Expr::Tuple(l) => Expr::Tuple(ml(l)),
+        other => other,
+    }
+}
+
 pub fn walk_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match e {
@@ -1060,6 +1448,14 @@ fn eq_vals(a: &V, b: &V) -> Option<bool> {
         (V::Str(x), V::Str(y)) => str_eq(x, y),
         (V::Bool(x), V::Bool(y)) => Some(x == y),
         (V::Gen(x), V::Gen(y)) => Some(x == y),
+        (V::Ivl(..), _) | (_, V::Ivl(..)) => {
+            let (x, y) = (ivl_key(a)?, ivl_key(b)?);
+            Some(x == y)
+        }
+        (V::Rng(..), _) | (_, V::Rng(..)) => {
+            let (x, y) = (rng_parts(a)?, rng_parts(b)?);
+            (x.1 < y.0 || y.1 < x.0).then_some(false)
+        }
         (V::Opq(x), V::Opq(y)) if x == y => Some(true),
         (V::Ne(x), V::Ne(y)) if x == y => Some(true),
         (V::Opq(x), V::Ne(y)) | (V::Ne(y), V::Opq(x)) if x == y => Some(false),
@@ -1078,11 +1474,49 @@ fn eq_vals(a: &V, b: &V) -> Option<bool> {
     }
 }
 
+/// PostgreSQL boolean input: a unique prefix of true, false, yes, no, on,
+/// off, or 1 and 0, in any case and surrounded by blanks.
+fn pg_bool(t: &str) -> Option<bool> {
+    let w = t.trim().to_lowercase();
+    if w.is_empty() {
+        return None;
+    }
+    let pre = |full: &str, min: usize| w.len() >= min && full.starts_with(w.as_str());
+    if pre("true", 1) || pre("yes", 1) || w == "on" || w == "1" {
+        Some(true)
+    } else if pre("false", 1) || pre("no", 1) || pre("off", 2) || w == "0" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Ordering key of an interval, or of a string compared with one (PostgreSQL
+/// reads the literal as an interval).
+fn ivl_key(v: &V) -> Option<i128> {
+    match v {
+        V::Ivl(m, d, us) => Some(interval_key(*m, *d, *us)),
+        V::Str(t) => parse_interval(t).map(|(m, d, us)| interval_key(m, d, us)),
+        _ => None,
+    }
+}
+
 fn cmp_vals(a: &V, b: &V) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (V::Int(x), V::Int(y)) => Some(x.cmp(y)),
         (V::Str(x), V::Str(y)) => str_cmp(x, y),
         (V::Gen(x), V::Gen(y)) => Some(x.cmp(y)),
+        (V::Ivl(..), _) | (_, V::Ivl(..)) => Some(ivl_key(a)?.cmp(&ivl_key(b)?)),
+        (V::Rng(..), _) | (_, V::Rng(..)) => {
+            let (x, y) = (rng_parts(a)?, rng_parts(b)?);
+            if x.1 < y.0 {
+                Some(std::cmp::Ordering::Less)
+            } else if x.0 > y.1 {
+                Some(std::cmp::Ordering::Greater)
+            } else {
+                None
+            }
+        }
         (V::Bool(x), V::Bool(y)) => Some(x.cmp(y)),
         (V::Opq(x), V::Opq(y)) if x == y => Some(std::cmp::Ordering::Equal),
         _ => match (num_of(a), num_of(b)) {
@@ -1107,6 +1541,8 @@ pub fn same_nn(a: &V, b: &V, nonnull: &[bool]) -> Option<bool> {
     let known = |k: &usize| nonnull.get(*k).copied().unwrap_or(false);
     match (a, b) {
         (V::Null, V::Null) => Some(true),
+        (V::Rng(..), V::Null | V::Err(_)) | (V::Null | V::Err(_), V::Rng(..)) => Some(false),
+        (V::Rng(..), _) | (_, V::Rng(..)) => rng_differs(a, b).map(|d| !d),
         // An unmodelled function may return NULL or fail for the same
         // arguments, so its result is not known to differ from either,
         // except from NULL for a function that never returns NULL. (Even
@@ -1423,6 +1859,27 @@ impl Ctx<'_> {
             (V::Null, _) | (_, V::Null) => return Ok(V::Null),
             _ => {}
         }
+        // PostgreSQL reads a string compared with a boolean as a boolean
+        // (only a literal can be: text = boolean has no operator).
+        if self.d == Dialect::Postgres {
+            let as_bool = |v: &V| match v {
+                V::Str(t) => pg_bool(t).map(V::Bool),
+                _ => None,
+            };
+            match (a, b) {
+                (V::Bool(_), V::Str(_)) => {
+                    if let Some(y) = as_bool(b) {
+                        return self.compare(op, a, &y);
+                    }
+                }
+                (V::Str(_), V::Bool(_)) => {
+                    if let Some(x) = as_bool(a) {
+                        return self.compare(op, &x, b);
+                    }
+                }
+                _ => {}
+            }
+        }
         let r = match op {
             "=" => eq_vals(a, b),
             "<>" => eq_vals(a, b).map(|x| !x),
@@ -1484,6 +1941,25 @@ impl Ctx<'_> {
                 _ => rej(),
             };
         }
+        if matches!(a, V::Ivl(..)) || matches!(b, V::Ivl(..)) {
+            return self.interval_arith(op, a, b, le, re);
+        }
+        if matches!(a, V::Rng(..)) || matches!(b, V::Rng(..)) {
+            let r = match (rng_parts(&a), rng_parts(&b), op) {
+                (Some(x), Some(y), "+") => rng_op(x, y, |p, q| p + q),
+                (Some(x), Some(y), "-") => rng_op(x, y, |p, q| p - q),
+                (Some(x), Some(y), "*") => rng_op(x, y, |p, q| p * q),
+                // Division by a constant that is not zero.
+                (Some(x), Some(y), "/") if y.0 == y.1 && y.0 != 0.0 && !matches!(b, V::Rng(..)) => {
+                    rng_op(x, y, |p, q| p / q)
+                }
+                _ => None,
+            };
+            return match r {
+                Some(v) => Ok(v),
+                None => self.opaque_call(op, vec![a, b]),
+            };
+        }
         match (&a, &b) {
             (V::Int(x), V::Int(y)) => {
                 let r = match op {
@@ -1525,10 +2001,57 @@ impl Ctx<'_> {
         }
     }
 
+    /// PostgreSQL interval arithmetic: interval plus or minus interval,
+    /// interval times an integer, and a date or timestamp plus or minus an
+    /// interval. The date operand must not be a bare literal (its type would
+    /// be ambiguous) nor a character string (text has no such operator).
+    fn interval_arith(&mut self, op: &str, a: V, b: V, le: &Expr, re: &Expr) -> R<V> {
+        let opaque = |c: &mut Self, a: V, b: V| c.opaque_call(op, vec![a, b]);
+        let stamp = |c: &Self, e: &Expr, v: &V| {
+            matches!(v, V::Str(_)) && !matches!(e, Expr::Str(_)) && c.static_string(e) != Some(true)
+        };
+        let out_of_range = || V::Err("interval out of range".into());
+        match (&a, &b, op) {
+            (V::Ivl(m1, d1, u1), V::Ivl(m2, d2, u2), "+" | "-") => {
+                let s = if op == "+" { 1 } else { -1 };
+                match (m1.checked_add(s * m2), d1.checked_add(s * d2)) {
+                    (Some(m), Some(d)) => Ok(V::Ivl(m, d, u1 + s as i128 * u2)),
+                    _ => Ok(out_of_range()),
+                }
+            }
+            (V::Ivl(m, d, u), V::Int(n), "*") | (V::Int(n), V::Ivl(m, d, u), "*") => {
+                let n = i64::try_from(*n).ok();
+                match n.and_then(|n| Some((m.checked_mul(n)?, d.checked_mul(n)?, n))) {
+                    Some((m, d, n)) => Ok(V::Ivl(m, d, u * n as i128)),
+                    None => Ok(out_of_range()),
+                }
+            }
+            (V::Str(t), V::Ivl(m, d, u), "+" | "-") if stamp(self, le, &a) => {
+                let s = if op == "+" { 1 } else { -1 };
+                match add_interval(t, s * m, s * d, s as i128 * u) {
+                    Some(r) => Ok(V::Str(r)),
+                    None => opaque(self, a.clone(), b.clone()),
+                }
+            }
+            (V::Ivl(m, d, u), V::Str(t), "+") if stamp(self, re, &b) => {
+                match add_interval(t, *m, *d, *u) {
+                    Some(r) => Ok(V::Str(r)),
+                    None => opaque(self, a.clone(), b.clone()),
+                }
+            }
+            _ => opaque(self, a, b),
+        }
+    }
+
     /// Whether an expression is certainly a character string (Some(true)),
     /// certainly not (Some(false)), or unknown.
     fn static_string(&self, e: &Expr) -> Option<bool> {
         static_string(e, &self.vars, self.d)
+    }
+
+    /// A value converted to a declared type, as a cast does.
+    pub fn cast_value(&mut self, v: V, ty: &Type) -> R<V> {
+        self.cast(v, ty)
     }
 
     fn cast(&mut self, v: V, ty: &Type) -> R<V> {
@@ -1653,6 +2176,35 @@ impl Ctx<'_> {
                 }
             }
             (Fam::Bool, V::Bool(_)) => Ok(v),
+            (Fam::Interval, V::Ivl(..)) => Ok(v),
+            (Fam::Float, V::Rng(..)) => Ok(v),
+            // Float to integer: T-SQL and Db2 truncate, PostgreSQL rounds;
+            // both are monotone, so the ranges map end to end.
+            (Fam::Int, V::Rng(lo, hi, ilo, ihi)) if t.len != Some(1) => {
+                let f = |x: f64| {
+                    if self.d == Dialect::Postgres {
+                        // Halves go to the even neighbour.
+                        if (x - x.trunc()).abs() == 0.5 {
+                            2.0 * (x / 2.0).round()
+                        } else {
+                            x.round()
+                        }
+                    } else {
+                        x.trunc()
+                    }
+                };
+                if lo.abs() < 2e9 && hi.abs() < 2e9 {
+                    Ok(V::Rng(f(*lo), f(*hi), f(*ilo), f(*ihi)))
+                } else {
+                    self.opaque_call(&format!("CAST_{}", ty.name), vec![v])
+                }
+            }
+            (_, V::Rng(..)) => self.opaque_call(&format!("CAST_{}", ty.name), vec![v]),
+            // Interval text in the forms it reads exactly; others stay opaque.
+            (Fam::Interval, V::Str(s)) => match parse_interval(s) {
+                Some((m, d, us)) => Ok(V::Ivl(m, d, us)),
+                None => self.opaque_call("CAST_INTERVAL", vec![v]),
+            },
             (_, V::Opq(_) | V::Gen(_) | V::Ne(_)) => {
                 self.opaque_call(&format!("CAST_{}", ty.name), vec![v])
             }
@@ -1667,7 +2219,12 @@ impl Ctx<'_> {
             return Ok(args.into_iter().find(|a| matches!(a, V::Err(_))).unwrap());
         }
         let show_args: Vec<String> = args.iter().map(|a| a.show(&self.opaque)).collect();
-        let id = format!("{name}({:?})", args);
+        let mut id = format!("{name}({:?})", args);
+        // A function of a random value: the two versions draw their own.
+        if args.iter().any(|a| matches!(a, V::Rng(..))) {
+            self.nondeterministic = true;
+            id = format!("{id}#{}", self.side);
+        }
         let show = format!("{}({})", name.to_lowercase(), show_args.join(", "));
         let nonnull = self.never_null(name, &args);
         Ok(self.opaque_value(id, show, nonnull))
@@ -1723,13 +2280,24 @@ impl Ctx<'_> {
                 .args
                 .iter()
                 .map(|a| match a {
-                    Expr::Str(s) => format!("N'{}'", s.replace('\'', "''")),
+                    Expr::Str(s) if self.d == Dialect::Tsql => {
+                        format!("N'{}'", s.replace('\'', "''"))
+                    }
+                    Expr::Str(s) => format!("'{}'", s.replace('\'', "''")),
                     Expr::Num(n) => n.clone(),
                     _ => String::new(),
                 })
                 .collect();
             let key = format!("@env:{name}({})", args.join(", "));
             return self.input(Key::Var(key), Origin::Free, cands);
+        }
+        // RAND() / random() without a seed: a random range.
+        if c.args.is_empty()
+            && ((self.d != Dialect::Postgres && name == "RAND")
+                || (self.d == Dialect::Postgres && name == "RANDOM"))
+        {
+            self.nondeterministic = true;
+            return Ok(RAND_RANGE);
         }
         if NONDETERMINISTIC.contains(&name.as_str()) {
             return Ok(self.nondet(&name));
@@ -2041,6 +2609,28 @@ impl Ctx<'_> {
                 })
             }
             ("FLOOR" | "CEILING" | "CEIL", [V::Int(i)]) => Ok(V::Int(*i)),
+            ("FLOOR" | "CEILING" | "CEIL", [V::Rng(..)]) => {
+                let x = rng_parts(&args[0]).unwrap();
+                let f = |v: f64| if name == "FLOOR" { v.floor() } else { v.ceil() };
+                Ok(rng_op(x, (0.0, 0.0, 0.0, 0.0), |p, _| f(p)).ok_or(Stop::Reject)?)
+            }
+            ("ABS", [V::Rng(..)]) => {
+                let (lo, hi, ilo, ihi) = rng_parts(&args[0]).unwrap();
+                let abs = |l: f64, h: f64, inner: bool| {
+                    if l >= 0.0 {
+                        (l, h)
+                    } else if h <= 0.0 {
+                        (-h, -l)
+                    } else if inner {
+                        // Values near both ends occur; whether values near 0 do is not known.
+                        ((-l).min(h), (-l).max(h))
+                    } else {
+                        (0.0, h.max(-l))
+                    }
+                };
+                let ((a, b), (c, d)) = (abs(lo, hi, false), abs(ilo, ihi, true));
+                Ok(V::Rng(a, b, c, d))
+            }
             ("FLOOR" | "CEILING" | "CEIL", [V::Num(f)]) if f.abs() < 1e12 => {
                 Ok(V::Num(if name == "FLOOR" { f.floor() } else { f.ceil() }))
             }
@@ -2344,6 +2934,14 @@ pub fn static_string_with(
             "QUOTENAME" | "UPPER" | "LOWER" | "LTRIM" | "RTRIM" | "TRIM" | "REPLACE" | "CONCAT"
             | "FORMAT" | "NCHAR" | "CHAR" | "LEFT" | "RIGHT" | "SUBSTRING" | "STUFF"
             | "REPLICATE" => Some(true),
+            // Names of catalog objects (sysname or nvarchar).
+            "SCHEMA_NAME" | "OBJECT_NAME" | "OBJECT_SCHEMA_NAME" | "DB_NAME" | "TYPE_NAME"
+            | "COL_NAME" | "USER_NAME" | "SUSER_SNAME" | "SUSER_NAME" | "APP_NAME"
+            | "HOST_NAME"
+                if d == Dialect::Tsql =>
+            {
+                Some(true)
+            }
             _ => None,
         },
         _ => None,
@@ -2376,7 +2974,35 @@ fn environment(name: &str, args: &[Expr], d: Dialect) -> Option<Vec<V>> {
         (Dialect::Tsql, "SESSION_CONTEXT", [Expr::Str(_)]) => {
             Some(vec![V::Str("x".into()), V::Str("y".into()), V::Null])
         }
+        // Yes/no server properties (1 or 0 for a valid property name).
+        (Dialect::Tsql, "SERVERPROPERTY", [Expr::Str(p)])
+            if matches!(
+                p.to_ascii_uppercase().as_str(),
+                "ISXTPSUPPORTED"
+                    | "ISFULLTEXTINSTALLED"
+                    | "ISHADRENABLED"
+                    | "ISCLUSTERED"
+                    | "ISINTEGRATEDSECURITYONLY"
+                    | "ISSINGLEUSER"
+                    | "ISPOLYBASEINSTALLED"
+                    | "ISADVANCEDANALYTICSINSTALLED"
+            ) =>
+        {
+            Some(ints(&[1, 0]))
+        }
         (Dialect::Postgres, "PG_IS_IN_RECOVERY", []) => Some(vec![V::Bool(false), V::Bool(true)]),
+        // The server version as text: the first release of each major
+        // version still met in practice.
+        (Dialect::Postgres, "CURRENT_SETTING", [Expr::Str(p)])
+            if p.eq_ignore_ascii_case("server_version_num") =>
+        {
+            Some(
+                [180000, 170000, 160000, 150000, 140000, 130000, 120000]
+                    .iter()
+                    .map(|v: &i32| V::Str(v.to_string()))
+                    .collect(),
+            )
+        }
         _ => None,
     }
 }
@@ -3906,10 +4532,16 @@ pub fn search<'s>(make: &dyn Fn() -> Ctx<'s>, a: &Probe, b: &Probe) -> Result<Fo
         }
     }
     let mut shapes: Vec<HashMap<String, usize>> = vec![HashMap::new()];
+    let focus = make().focus;
+    // Two rows of a table read near the change first: subqueries that
+    // return more rows, joins that match more.
+    for t in tables.iter().filter(|t| focus.contains(t)) {
+        shapes.push(HashMap::from([(t.clone(), 2)]));
+    }
     for t in &tables {
         shapes.push(HashMap::from([(t.clone(), 0)]));
     }
-    for t in &tables {
+    for t in tables.iter().filter(|t| !focus.contains(t)) {
         shapes.push(HashMap::from([(t.clone(), 2)]));
     }
     if tables.len() >= 2 {

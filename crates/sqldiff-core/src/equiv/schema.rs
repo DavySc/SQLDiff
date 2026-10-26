@@ -26,6 +26,8 @@ pub enum Fam {
     Timestamp,
     TimestampTz,
     Time,
+    /// PostgreSQL interval.
+    Interval,
     Bool,
     Other,
 }
@@ -154,6 +156,7 @@ impl Ty {
                 Ty::of(Fam::TimestampTz)
             }
             "TIME" => Ty::of(Fam::Time),
+            "INTERVAL" if d == Dialect::Postgres => Ty::of(Fam::Interval),
             "BOOLEAN" | "BOOL" => Ty::of(Fam::Bool),
             _ => Ty::of(Fam::Other),
         }
