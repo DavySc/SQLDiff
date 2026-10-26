@@ -3,7 +3,8 @@
 //!
 //! `serve` runs a local server (scratchpad edits re-diff, assumption flips
 //! and review decisions apply live); `export` writes a self-contained,
-//! read-only HTML file.
+//! read-only HTML file. Without a command (a double-click in a distribution)
+//! it serves convert mode and opens the browser.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -27,7 +28,7 @@ use sqldiff_source::Resolved;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(clap::Args)]
@@ -218,8 +219,56 @@ fn main() -> ExitCode {
     }
 }
 
+/// Serves convert mode on the default port (or any free one) and opens it
+/// in the browser.
+fn launch() -> Result<(), String> {
+    let listener = TcpListener::bind(("127.0.0.1", 7878))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .map_err(|e| e.to_string())?;
+    let url = url(&listener)?;
+    println!("SQLDiff: {url}");
+    println!("Keep this window open while you work; closing it stops SQLDiff.");
+    if let Err(e) = open_browser(&url) {
+        println!("Could not open a browser ({e}); open {url} yourself.");
+    }
+    let setup = convert::Setup {
+        from: Dialect::Tsql,
+        to: Dialect::Postgres,
+        template: None,
+        text: convert::SAMPLE.to_string(),
+        name: String::new(),
+    };
+    convert::serve(listener, setup, &[]).map_err(|e| e.to_string())
+}
+
+fn open_browser(url: &str) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd");
+        // `start` takes its first quoted argument as the window title.
+        c.args(["/C", "start", "", url]);
+        c
+    } else if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+}
+
 fn run(cli: Cli) -> Result<(), String> {
-    match cli.command {
+    let Some(command) = cli.command else {
+        return launch();
+    };
+    match command {
         Command::Serve {
             pair,
             host,

@@ -25,7 +25,8 @@ struct Cli {
     /// Project config file (default: sqldiff.toml here or in a parent directory).
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
-    /// User config file (default: $SQLDIFF_CONFIG or ~/.config/sqldiff/config.toml).
+    /// User config file (default: $SQLDIFF_CONFIG, else config/config.toml beside
+    /// the executable, else ~/.config/sqldiff/config.toml).
     #[arg(long, value_name = "FILE")]
     user_config: Option<PathBuf>,
     /// Ignore project and user config files not named on the command line.
