@@ -10,7 +10,8 @@
 //!   orders false before true, as 0 before 1);
 //! - storing a number in a bit (SET, VALUES, DEFAULT, a variable, RETURN, a
 //!   procedure argument): 0 is FALSE and any other number TRUE, as T-SQL
-//!   stores it; a numeric value `v` becomes `(v <> 0)`;
+//!   stores it; a numeric value `v` becomes `(v <> 0)`; a CASE stores each
+//!   result so;
 //! - a bit in arithmetic, CONCAT, or a cast to a type other than bit and int:
 //!   `::integer`, the 0 or 1 T-SQL computes with;
 //! - a CASE or IIF result of 0 or 1 next to a bit result: FALSE / TRUE;
@@ -34,6 +35,20 @@ pub(super) struct BitEdits {
     pub pre: HashMap<usize, String>,
     /// Output after the token.
     pub post: HashMap<usize, String>,
+}
+
+impl BitEdits {
+    /// Adds the edits of an enclosing rewrite: its text goes outside ours.
+    pub fn wrap(&mut self, outer: BitEdits) {
+        self.rep.extend(outer.rep);
+        for (k, p) in outer.pre {
+            let inner = self.pre.remove(&k).unwrap_or_default();
+            self.pre.insert(k, p + &inner);
+        }
+        for (k, p) in outer.post {
+            self.post.entry(k).or_default().push_str(&p);
+        }
+    }
 }
 
 /// `(` matching the `)` at `close`.
@@ -146,6 +161,23 @@ fn bool_string(s: &str) -> bool {
 const ARITH: [&str; 5] = ["+", "-", "*", "/", "%"];
 const CMP: [&str; 7] = ["=", "<>", "!=", "<", ">", "<=", ">="];
 
+/// The END of the CASE at `i`.
+fn case_end(ts: &[T], i: usize) -> Option<usize> {
+    let ds = crate::tok::depths(ts);
+    let mut nested = 0;
+    for j in sig(ts).into_iter().filter(|&j| j > i && ds[j] == ds[i]) {
+        if ts[j].is("CASE") {
+            nested += 1;
+        } else if ts[j].is("END") {
+            if nested == 0 {
+                return Some(j);
+            }
+            nested -= 1;
+        }
+    }
+    None
+}
+
 /// The result expressions (first and last significant token) of the CASE at
 /// `i`: what follows each THEN and the ELSE.
 fn case_results(ts: &[T], i: usize) -> Vec<(usize, usize)> {
@@ -213,6 +245,16 @@ impl Cx<'_> {
     /// `at..=end`, or false when there is no exact one.
     fn store(&mut self, ts: &[T], at: usize, end: usize, e: &mut BitEdits) -> bool {
         let v = &ts[at..=end];
+        // A CASE stores the value of the branch taken: each result is stored
+        // on its own. A string result would be converted to the CASE's type
+        // first when another result is a number, so none may be a string.
+        if ts[at].is("CASE") && ts[end].is("END") && case_end(ts, at) == Some(end) {
+            let rs = case_results(ts, at);
+            if rs.iter().any(|&(f, l)| f == l && ts[f].k == STRING) {
+                return false;
+            }
+            return rs.into_iter().all(|(f, l)| self.store(ts, f, l, e));
+        }
         if self.db2() {
             // SMALLINT: the 0 or 1 T-SQL stores.
             if let Some(n) = int_literal(v) {
@@ -467,8 +509,11 @@ impl Cx<'_> {
         if ts[i].s == "=" && l && self.assigns(ts, ls) {
             // The value runs to the next comma or clause at this depth.
             let ds = crate::tok::depths(ts);
-            let mut end = re;
-            let mut j = re;
+            let mut end = match ts[rn].is("CASE") {
+                true => case_end(ts, rn).unwrap_or(re),
+                false => re,
+            };
+            let mut j = end;
             while let Some(n) = next_sig(ts, j) {
                 if ds[n] < ds[rn]
                     || ds[n] == ds[rn]
@@ -479,8 +524,12 @@ impl Cx<'_> {
                 {
                     break;
                 }
-                end = n;
-                j = n;
+                // A CASE's own WHEN is not a MERGE clause.
+                end = match ts[n].is("CASE") {
+                    true => case_end(ts, n).unwrap_or(n),
+                    false => n,
+                };
+                j = end;
             }
             if !self.store(ts, rn, end, e) {
                 self.unhandled(&ts[ls..=end]);
@@ -638,18 +687,12 @@ impl Cx<'_> {
             (Some(&f), Some(&l)) => (f, l),
             _ => return self.expr(v).trim().to_string(),
         };
-        if !self.store(v, f, l, &mut e) {
+        if self.store(v, f, l, &mut e) {
+            self.bit_outer = Some(e);
+        } else {
             self.unhandled(v);
-            return self.expr(v).trim().to_string();
         }
-        if let Some(r) = e.rep.get(&f) {
-            return r.clone();
-        }
-        let x = self.expr(v).trim().to_string();
-        match (e.pre.get(&f), e.post.get(&l)) {
-            (Some(p), Some(q)) => format!("{p}{x}{q}"),
-            _ => x,
-        }
+        self.expr(v).trim().to_string()
     }
 
     /// Bit uses with no exact rewrite seen since the last call.
@@ -670,6 +713,65 @@ impl Cx<'_> {
             (Ok(_), Some(reason)) => no(reason),
             (r, _) => r,
         }
+    }
+
+    /// Whether the statements may involve a bit: a bit variable, a bit
+    /// column of a table they name, or a rewrite the bit rules would make.
+    /// The idiom rules know nothing of bits, so these are left to the token
+    /// rules (and their refusals).
+    pub(super) fn bits_in(&mut self, nodes: &[SyntaxNode]) -> bool {
+        if !self.bits_possible() {
+            return false;
+        }
+        nodes.iter().any(|n| {
+            let ts = tokens(n);
+            let bit_var = |t: &T| {
+                t.k == VARIABLE
+                    && self
+                        .vars
+                        .get(&t.s.trim_start_matches('@').to_ascii_lowercase())
+                        .is_some_and(|v| v.dt == Dt::Bit)
+            };
+            // Db2 for i keeps SMALLINT, which takes the numbers as written.
+            if !self.db2() && ts.iter().any(bit_var) {
+                return true;
+            }
+            // Every dotted name that is a table: its bit columns, by name.
+            let s = sig(&ts);
+            let mut cols: Vec<String> = Vec::new();
+            let mut k = 0;
+            while k < s.len() && !self.db2() {
+                let mut e = k;
+                while e + 2 < s.len()
+                    && ts[s[e + 1]].k == DOT
+                    && matches!(ts[s[e + 2]].k, IDENT | QUOTED_IDENT)
+                {
+                    e += 2;
+                }
+                if matches!(ts[s[k]].k, IDENT | QUOTED_IDENT) {
+                    cols.extend(self.table_bit_cols(&ts[s[k]..=s[e]]));
+                }
+                k = e + 1;
+            }
+            if !self.db2()
+                && ts.iter().any(|t| {
+                    matches!(t.k, IDENT | QUOTED_IDENT)
+                        && cols.contains(&tsql_unquote(&t.s).to_ascii_lowercase())
+                })
+            {
+                return true;
+            }
+            let scope = std::mem::replace(&mut self.scope, scope_of(&ts));
+            let open = self.take_bit_unhandled();
+            let e = self.bit_edits(&ts);
+            let hit = !(e.rep.is_empty()
+                && e.pre.is_empty()
+                && e.post.is_empty()
+                && self.bit_unhandled.is_empty());
+            self.bit_unhandled = open;
+            self.scope = scope;
+            hit
+        })
     }
 
     /// Refuses a construct the engine does not check (an IF or WHILE

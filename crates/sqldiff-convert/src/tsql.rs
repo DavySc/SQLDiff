@@ -71,6 +71,7 @@ pub(crate) fn convert(
         local: std::cell::OnceCell::new(),
         bit_cols: Vec::new(),
         bit_unhandled: Vec::new(),
+        bit_outer: None,
         ret_bit: false,
     };
     let mut out = Out::default();
@@ -178,6 +179,9 @@ struct Cx<'a> {
     bit_cols: Vec<String>,
     /// PostgreSQL: places where a bit meets a number with no exact rewrite.
     bit_unhandled: Vec<String>,
+    /// Edits the next `expr` call applies to its slice, around its own
+    /// (a value stored in a bit, from `bit_store_text`).
+    bit_outer: Option<bits::BitEdits>,
     /// The function being converted returns BIT.
     ret_bit: bool,
 }
@@ -855,6 +859,7 @@ impl<'a> Cx<'a> {
             || self.in_catch
             || a.kind() != STATEMENT
             || !matches!(first_word(a).as_str(), "INSERT" | "EXEC" | "EXECUTE")
+            || self.bits_in(&[a.clone(), b.clone()])
         {
             return false;
         }
@@ -879,6 +884,7 @@ impl<'a> Cx<'a> {
                 "INSERT" | "UPDATE" | "DELETE" | "MERGE"
             )
             || self.mode == Mode::Top && procedural(n)
+            || self.bits_in(std::slice::from_ref(n))
         {
             return false;
         }
@@ -3060,7 +3066,10 @@ impl<'a> Cx<'a> {
     }
 
     fn expr(&mut self, ts: &[T]) -> String {
-        let edits = self.bit_edits(ts);
+        let mut edits = self.bit_edits(ts);
+        if let Some(outer) = self.bit_outer.take() {
+            edits.wrap(outer);
+        }
         let mut o = String::new();
         let mut i = 0;
         let mut done = 0;

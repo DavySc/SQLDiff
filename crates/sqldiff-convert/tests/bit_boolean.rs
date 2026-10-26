@@ -259,3 +259,53 @@ fn case_and_iif_results_of_zero_and_one_next_to_a_bit() {
     has(&c, "CASE WHEN Score > 1 THEN 1 ELSE 0 END AS k");
     assert!(unit(&c, src, "VIEW").status < Status::Unproven, "{c:?}");
 }
+
+/// A CASE stored in a bit stores the branch taken (WideWorldImporters'
+/// RecordDeliveryVanTemperatures sets a bit from CASE … THEN 1 ELSE 0 END).
+#[test]
+fn a_case_stored_in_a_bit() {
+    let src = "CREATE PROCEDURE dbo.Q @Id int, @N int\nAS\nBEGIN\n    SET XACT_ABORT ON;\n    DECLARE @done bit;\n    SET @done = CASE WHEN @N > 1 THEN 1 ELSE 0 END;\n    UPDATE dbo.Flags SET IsActive = CASE WHEN Score > 2 THEN 2 ELSE Score END WHERE Id = @Id;\nEND\n";
+    let c = pg(src);
+    has(&c, "v_done := CASE WHEN p_n > 1 THEN TRUE ELSE FALSE END;");
+    has(
+        &c,
+        "SET IsActive = CASE WHEN Score > 2 THEN TRUE ELSE (Score <> 0) END",
+    );
+    for needle in ["SET @done", "UPDATE"] {
+        let u = unit(&c, src, needle);
+        assert!(
+            u.status < Status::Differs,
+            "{needle}: {:?} {:?}\n{}",
+            u.status,
+            c.report.findings,
+            c.output
+        );
+    }
+    // A string result is converted to the CASE's number type first.
+    let bad = "CREATE PROCEDURE dbo.Q @Id int\nAS\nBEGIN\n    UPDATE dbo.Flags SET IsActive = CASE WHEN Score > 2 THEN 'true' ELSE 0 END WHERE Id = @Id;\nEND\n";
+    let c = pg(bad);
+    assert_eq!(
+        unit(&c, bad, "UPDATE").status,
+        Status::NotConverted,
+        "{}",
+        c.output
+    );
+}
+
+/// The idiom rules (MERGE, INSERT + SCOPE_IDENTITY) know nothing of bits: a
+/// statement where a bit meets a number is left to the bit rules.
+#[test]
+fn idiom_rules_leave_bits_to_the_bit_rules() {
+    let src = "CREATE PROCEDURE dbo.Q @Id int, @NewId int OUTPUT\nAS\nBEGIN\n    SET XACT_ABORT ON;\n    INSERT INTO dbo.Flags (Id, IsActive) VALUES (@Id, 1);\n    SET @NewId = SCOPE_IDENTITY();\nEND\n";
+    let c = pg(src);
+    has(&c, "VALUES (p_id, TRUE)");
+    let merge = "CREATE PROCEDURE dbo.Q @Id int\nAS\nBEGIN\n    MERGE dbo.Flags AS t USING (SELECT @Id AS Id) AS s ON t.Id = s.Id\n    WHEN MATCHED THEN UPDATE SET IsActive = 2\n    WHEN NOT MATCHED THEN INSERT (Id, IsActive) VALUES (s.Id, 1);\nEND\n";
+    let c = pg(merge);
+    let u = unit(&c, merge, "MERGE");
+    assert!(
+        u.status == Status::NotConverted || !c.output.contains("IsActive = 2"),
+        "{:?}\n{}",
+        u.notes,
+        c.output
+    );
+}

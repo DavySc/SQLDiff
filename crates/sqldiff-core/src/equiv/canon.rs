@@ -513,6 +513,23 @@ impl<'a> Canon<'a> {
 
     /// `x <> 0`: a number as a bit or boolean (NULL stays NULL).
     fn nonzero(t: Term) -> Term {
+        // Of a CASE, the branch taken: a literal result is 0 or 1.
+        if t.is("case") {
+            let branch = |v: &Term| match Self::literal_zero(v) {
+                Some(z) => n("num", vec![a(if z { "0" } else { "1" })]),
+                None if v.atom() == Some("null") => v.clone(),
+                None => Self::nonzero(v.clone()),
+            };
+            let ks = t.kids();
+            let mut kids = vec![ks[0].clone()];
+            for k in &ks[1..] {
+                kids.push(match (k.is("when"), k.kid(0), k.kid(1)) {
+                    (true, Some(c), Some(v)) => n("when", vec![c.clone(), branch(v)]),
+                    _ => branch(k),
+                });
+            }
+            return n("case", kids);
+        }
         let (x, y, op) = order_operands("<>", t, n("num", vec![a("0")]));
         n("cmp", vec![a(op), x, y])
     }
