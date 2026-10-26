@@ -277,7 +277,10 @@ above:
 
 - same values stored: compared; a bounded string adds `ASM-VARIABLE-LENGTH`,
   a wider PostgreSQL type `ASM-VARIABLE-RANGE`, unless every write is a
-  literal that fits;
+  literal that fits. Every literal the code assigns must still convert to the
+  same value on both sides (T-SQL truncates `1.5` into an `int` to 1,
+  PostgreSQL rounds it to 2; `'abcdef'` into `varchar(3)` is cut off in
+  T-SQL and raises in PostgreSQL), else the variable is not proven;
 - otherwise compared only when every write to the variable, on both sides,
   is a literal that converts to the same known value (`'20200101'` into
   `datetime2(7)` and into `timestamp`); any other write (`SELECT … INTO`,
