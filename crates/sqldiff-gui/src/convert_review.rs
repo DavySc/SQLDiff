@@ -24,7 +24,8 @@
 //! the same options gives the same conversion.
 //!
 //! - `GET /`: the page
-//! - `GET /api/state[?all=1]`: queue, ledger summary, warnings (`all` adds tier 6)
+//! - `GET /api/state[?all=1]`: queue, ledger summary, warnings, the done
+//!   gate (`all` adds tier 6)
 //! - `GET /api/item?key=K[&all=1]`: one queue item in detail
 //! - `GET /api/unit?path=P&unit=U`: one unit in detail (also reviewed ones)
 //! - `GET /api/file?path=P&side=in|out`: a whole input, or its conversion
@@ -39,6 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sqldiff_convert::gate::{self, Gate};
 use sqldiff_convert::queue::{self, Instances, Item, Kind};
 use sqldiff_convert::review::{self, By, Record, State};
 use sqldiff_convert::tree::{self, Input, Tree, UnitReviewReport};
@@ -79,6 +81,9 @@ struct Loaded {
     /// The hand-written texts in the ledger the conversion used: they go
     /// into the conversion itself, so a new one means converting again.
     written: Vec<String>,
+    /// The done gate as `sqldiff review-status` judges the tree now, or why
+    /// it could not be judged.
+    gate: Result<Gate, String>,
 }
 
 pub struct Review {
@@ -134,6 +139,10 @@ pub struct StateView {
     pub out_differs: Vec<String>,
     pub unreadable: Vec<String>,
     pub convert_ms: f64,
+    /// The done gate (`sqldiff review-status`): the only place "done" comes
+    /// from. `gate_error` says why it could not be judged.
+    pub gate: Option<Gate>,
+    pub gate_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,6 +328,11 @@ impl Review {
         )
     }
 
+    /// The done gate as it stands, or why it could not be judged.
+    pub fn gate(&self) -> &Result<Gate, String> {
+        &self.loaded.gate
+    }
+
     pub fn state(&self, all: bool) -> StateView {
         let l = &self.loaded;
         let r = &l.tree.report;
@@ -403,6 +417,8 @@ impl Review {
             out_differs: l.out_differs.clone(),
             unreadable: l.unreadable.clone(),
             convert_ms: l.convert_ms,
+            gate: l.gate.as_ref().ok().cloned(),
+            gate_error: l.gate.as_ref().err().cloned(),
         }
     }
 
@@ -733,6 +749,7 @@ fn empty() -> Loaded {
         convert_ms: 0.0,
         converted: false,
         written: Vec::new(),
+        gate: Err("not judged yet".into()),
     }
 }
 
@@ -774,6 +791,7 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         }
     };
     let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
+    let gate = judge(&mut t, &inputs, s, instances.as_ref());
     let ids = inputs
         .iter()
         .zip(&t.conversions)
@@ -800,7 +818,34 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         convert_ms,
         converted,
         written,
+        gate,
     })
+}
+
+/// The done gate of `t` (the ledger in OUT applied by `tree::review_in`),
+/// judged as `sqldiff review-status` judges it: without a ledger, with an
+/// empty one, which is taken off again afterwards.
+fn judge(
+    t: &mut Tree,
+    inputs: &[Input],
+    s: &Setup,
+    inst: Option<&Instances>,
+) -> Result<Gate, String> {
+    let none = t.report.ledger.is_none();
+    if none {
+        tree::review(t, inputs, &review::Ledger::default(), "(none)");
+    }
+    let g = gate::check(t, &s.tree, &s.out, inst);
+    if none {
+        for f in &mut t.report.files {
+            f.review = None;
+            for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
+                u.review = None;
+            }
+        }
+        t.report.ledger = None;
+    }
+    g
 }
 
 /// The ledger's hand-written texts (every `written` record with a text),

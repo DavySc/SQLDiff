@@ -186,6 +186,7 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
             sheet.sh
         );
         assert_eq!(masked(&gui), masked(&cli), "{name}: {}", sheet.sh);
+        assert_gate_is_review_status(&run);
         let c = &run.command;
         match name {
             "project" | "overwrite" => {
@@ -372,6 +373,8 @@ fn a_template_run_and_its_command_write_the_same() {
             sheet.args.contains(&"--instances".to_string()),
             instances.is_some()
         );
+        // The done gate the run shows is `sqldiff review-status`'s.
+        assert_gate_is_review_status(&run);
     }
     // The instance check changes what the review queue says.
     assert_ne!(
@@ -380,4 +383,29 @@ fn a_template_run_and_its_command_write_the_same() {
         "the instance check was not read"
     );
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The run's done gate is what `sqldiff review-status` says of its output,
+/// given the run's own arguments.
+fn assert_gate_is_review_status(run: &Run) {
+    let mut args = run.command.args.clone();
+    assert_eq!((args[0].as_str(), args[2].as_str()), ("convert", "-o"));
+    args[0] = "review-status".into();
+    args.remove(2);
+    args.retain(|a| a != "--overwrite");
+    args.push("--json".into());
+    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args(&args)
+        .output()
+        .unwrap();
+    let cli: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stderr)));
+    let gui = run.view().gate.expect("a done run shows its gate");
+    assert_eq!(gui.error, None);
+    assert_eq!(serde_json::json!(gui.complete), cli["complete"]);
+    assert_eq!(serde_json::json!(gui.counts), cli["counts"]);
+    assert_eq!(
+        serde_json::json!(gui.blockers),
+        serde_json::json!(cli["blockers"].as_array().unwrap().len())
+    );
 }

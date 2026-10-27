@@ -340,6 +340,19 @@ pub struct Run {
     state: Mutex<State>,
     /// The review of what the run wrote, once it is done.
     review: Mutex<Option<Arc<Mutex<Review>>>>,
+    /// The done gate as last read from the review, for when it is busy.
+    gate: Mutex<Option<GateView>>,
+}
+
+/// A converted tree's done gate as the runs list shows it.
+#[derive(Debug, Clone, Serialize)]
+pub struct GateView {
+    pub complete: bool,
+    /// Blockers per kind, and in all.
+    pub counts: std::collections::BTreeMap<String, usize>,
+    pub blockers: usize,
+    /// Why the gate could not be judged.
+    pub error: Option<String>,
 }
 
 /// A run as the page lists it.
@@ -355,6 +368,9 @@ pub struct RunView {
     pub cancelling: bool,
     #[serde(flatten)]
     pub state: State,
+    /// A conversion's done gate (`sqldiff review-status`), once its review
+    /// is open: it follows the decisions recorded there.
+    pub gate: Option<GateView>,
 }
 
 impl Run {
@@ -368,7 +384,32 @@ impl Run {
             total: self.total.load(Ordering::Relaxed),
             cancelling: self.cancel.load(Ordering::Relaxed),
             state: self.state(),
+            gate: self.gate(),
         }
+    }
+
+    /// The done gate of the run's review: read now unless the review is busy
+    /// (reading the tree again), else as last read.
+    fn gate(&self) -> Option<GateView> {
+        let review = self.review()?;
+        let mut seen = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if let Ok(r) = review.try_lock() {
+            *seen = Some(match r.gate() {
+                Ok(g) => GateView {
+                    complete: g.complete,
+                    counts: g.counts.clone(),
+                    blockers: g.blockers.len(),
+                    error: None,
+                },
+                Err(e) => GateView {
+                    complete: false,
+                    counts: Default::default(),
+                    blockers: 0,
+                    error: Some(e.clone()),
+                },
+            });
+        }
+        seen.clone()
     }
 
     pub fn state(&self) -> State {
@@ -498,6 +539,7 @@ impl Runs {
                 cancel: Arc::new(AtomicBool::new(false)),
                 state: Mutex::new(State::Running),
                 review: Mutex::new(None),
+                gate: Mutex::new(None),
             });
             l.push(Arc::clone(&run));
             run
