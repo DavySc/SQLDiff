@@ -296,3 +296,50 @@ fn cancel_stops_every_run_of_a_batch_that_has_not_finished() {
     assert_eq!(runs.batch(view.id).unwrap().running, 0);
     assert!(runs.cancel_batch(999).is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn a_source_name_cannot_add_a_line_to_the_sheet() {
+    let d = Dir::new("sheet");
+    d.write("x\necho pwned/a.sql", "CREATE TABLE t (a int);\n");
+    let runs = Runs::default();
+    let v = runs
+        .start_batch(&batch(&d, "out", &["x\necho pwned"], &["postgres"]), true)
+        .unwrap();
+    for sheet in [&v.sheet.sh, &v.sheet.powershell] {
+        // One comment line, then the command, whose path stays quoted.
+        let lines: Vec<&str> = sheet.lines().collect();
+        assert!(
+            lines[0].starts_with("# ") && !lines[0].contains("pwned/a"),
+            "{sheet}"
+        );
+        assert!(lines[1].starts_with("sqldiff convert "), "{sheet}");
+    }
+    finish(&runs.get(v.cells[0][0].as_ref().unwrap().id).unwrap());
+}
+
+#[test]
+fn concurrent_batches_get_ids_of_their_own() {
+    let d = Dir::new("ids");
+    sources(&d);
+    let runs = std::sync::Arc::new(Runs::default());
+    let ids: Vec<u64> = (0..2)
+        .map(|n| {
+            let (runs, spec) = (
+                runs.clone(),
+                batch(&d, &format!("out{n}"), &["one", "two"], &["postgres"]),
+            );
+            std::thread::spawn(move || runs.start_batch(&spec, true).unwrap().id)
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    for b in runs.batches() {
+        assert_eq!(b.cells.iter().flatten().flatten().count(), 2);
+        for c in b.cells.iter().flatten().flatten() {
+            finish(&runs.get(c.id).unwrap());
+        }
+    }
+}

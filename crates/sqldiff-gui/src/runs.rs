@@ -837,15 +837,14 @@ impl Runs {
                 }
             }
         }
-        let id = self.next_batch.load(Ordering::Relaxed) + 1;
-        let runs = {
+        let (id, runs) = {
             let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
             for w in &work {
                 if let Some(e) = conflict(&l, &w.5, &w.6) {
                     return Err(format!("{}: {e}", w.2));
                 }
             }
-            self.next_batch.store(id, Ordering::Relaxed);
+            let id = self.next_batch.fetch_add(1, Ordering::Relaxed) + 1;
             let runs: Vec<(Arc<Run>, Work)> = work
                 .into_iter()
                 .map(|(row, col, _, spec, job, out, reads, command)| {
@@ -858,7 +857,7 @@ impl Runs {
             if let Some(f) = &self.history {
                 save(f, &l);
             }
-            runs
+            (id, runs)
         };
         // A run that cannot get a thread is listed as failed in its cell.
         for (run, work) in runs {
@@ -875,7 +874,6 @@ impl Runs {
             .iter()
             .filter_map(|r| r.batch.map(|b| b.id))
             .collect();
-        ids.dedup();
         ids.sort_unstable_by(|a, b| b.cmp(a));
         ids.dedup();
         ids.into_iter().filter_map(|id| self.batch(id)).collect()
@@ -1082,7 +1080,9 @@ impl BatchView {
             sources[t.row] = s.src.clone();
             targets[t.col] = s.to.clone();
             from = s.from.clone();
-            let line = format!("# {} -> {}\n", s.src, s.to);
+            // One line of comment whatever the path holds.
+            let flat = |t: &str| t.replace(|c: char| c.is_control(), " ");
+            let line = format!("# {} -> {}\n", flat(&s.src), flat(&s.to));
             sh.push_str(&format!("{line}{}\n", r.command.sh));
             ps.push_str(&format!("{line}{}\n", r.command.powershell));
             cells[t.row][t.col] = Some(r.view());

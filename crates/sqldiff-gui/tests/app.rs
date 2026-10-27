@@ -391,6 +391,12 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         request(addr, "POST", "/api/runs/instances", &run.to_string()).0,
         "HTTP/1.1 403 Forbidden"
     );
+    let batch = serde_json::json!({ "sources": [d.0], "from": "tsql", "targets": ["postgres"], "out": d.0.join("out") });
+    assert_eq!(
+        request(addr, "POST", "/api/batches", &batch.to_string()).0,
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert!(!d.0.join("out").exists());
     // On loopback the same requests are answered.
     let addr = start(app(None, None));
     assert_eq!(
@@ -789,4 +795,95 @@ fn a_run_the_app_stopped_during_is_listed_as_failed() {
         .unwrap()
         .contains("may be incomplete"));
     assert_eq!(get(addr, "/runs/7/review").0, "HTTP/1.1 404 Not Found");
+}
+
+#[test]
+fn a_batch_is_started_listed_and_cancelled_through_the_app() {
+    let d = Dir::new("batch");
+    d.write("one/a.sql", "CREATE TABLE t (a int NOT NULL);\n");
+    d.write("two/q.sql", "CREATE TABLE u (b varchar(10) NULL);\n");
+    let addr = start(app(None, None));
+    assert_eq!(get(addr, "/api/batches").1, "[]");
+    assert!(get(addr, "/runs").1.contains(r#""batches":[]"#));
+    let spec = serde_json::json!({
+        "sources": [d.0.join("one"), d.0.join("two")],
+        "from": "tsql",
+        "targets": ["postgres", "db2i"],
+        "out": d.0.join("out"),
+    });
+    // Refused as a whole: nothing is listed or written.
+    let bad = serde_json::json!({ "sources": [d.0.join("one"), d.0.join("none")], "from": "tsql", "targets": ["postgres"], "out": d.0.join("out") });
+    let (status, text) = request(addr, "POST", "/api/batches", &bad.to_string());
+    assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
+    assert!(text.contains("not found"), "{text}");
+    assert_eq!(get(addr, "/api/runs").1, "[]");
+    assert!(!d.0.join("out").exists());
+    assert_eq!(
+        request(
+            addr,
+            "POST",
+            "/api/batches",
+            r#"{"sources":[],"from":"tsql","targets":["postgres"],"out":"x","bogus":1}"#
+        )
+        .0,
+        "HTTP/1.1 400 Bad Request"
+    );
+
+    let (status, body) = request(addr, "POST", "/api/batches", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let b: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let id = b["id"].as_u64().unwrap();
+    assert_eq!(b["targets"], serde_json::json!(["postgres", "db2i"]));
+    let ids: Vec<u64> = b["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r.as_array().unwrap())
+        .map(|c| c["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4);
+    for run in &ids {
+        let r = finished(addr, *run);
+        assert_eq!(r["state"], "done", "{r}");
+        assert_eq!(r["batch"]["id"], id);
+    }
+    // Each cell is the run /api/runs lists, gate included.
+    let (_, listed) = get(addr, "/api/batches");
+    let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed[0]["running"], 0);
+    for (n, run) in ids.iter().enumerate() {
+        assert_eq!(listed[0]["cells"][n / 2][n % 2], finished(addr, *run));
+        assert!(listed[0]["cells"][n / 2][n % 2]["gate"]["complete"].is_boolean());
+    }
+    // Cancel of a finished batch changes nothing; an unknown one is not found.
+    let (status, body) = request(addr, "POST", &format!("/batches/{id}/cancel"), "{}");
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    assert_eq!(
+        request(addr, "POST", "/batches/99/cancel", "{}").0,
+        "HTTP/1.1 404 Not Found"
+    );
+    assert_eq!(
+        get(addr, &format!("/batches/{id}/cancel")).0,
+        "HTTP/1.1 404 Not Found"
+    );
+    // The same batch again: as for a single run, a folder that is no longer
+    // empty fails its run, and what is there is left alone.
+    let before = std::fs::read_to_string(d.0.join("out/one/postgres/a.sql")).unwrap();
+    let (status, body) = request(addr, "POST", "/api/batches", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let again: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for c in again["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|r| r.as_array().unwrap())
+    {
+        let r = finished(addr, c["id"].as_u64().unwrap());
+        assert_eq!(r["state"], "failed", "{r}");
+        assert_eq!(r["batch"]["id"], again["id"]);
+    }
+    assert_eq!(
+        std::fs::read_to_string(d.0.join("out/one/postgres/a.sql")).unwrap(),
+        before
+    );
 }
