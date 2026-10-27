@@ -176,6 +176,110 @@ fn delete_join_is_a_semi_join_in_every_spelling() {
     );
 }
 
+/// T-SQL `UPDATE … FROM` with the target among the joined tables against
+/// PostgreSQL `UPDATE … FROM` without it (rule T4): equal when the condition
+/// that joined the target is in WHERE and the catalog shows a target row
+/// meets at most one row; with several, both pick one unpredictably.
+#[test]
+fn update_from_join_moves_the_target_condition_to_where() {
+    let ts = |join: &str, on: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.reprice AS
+             BEGIN
+               UPDATE f SET unit_price = p.unit_price
+               FROM dbo.item_price AS p {join} dbo.price_feed AS f ON {on}
+               LEFT JOIN dbo.item AS i ON i.item_id = p.item_id
+               WHERE i.name IS NOT NULL;
+             END"
+        )
+    };
+    let pg = |join: &str, pred: &str| {
+        format!(
+            "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE price_feed AS f SET unit_price = p.unit_price
+             FROM item_price AS p {join} item AS i ON i.item_id = p.item_id
+             WHERE {pred}; $$;"
+        )
+    };
+    let key = "f.item_id = p.item_id";
+    let both = "f.item_id = p.item_id AND i.name IS NOT NULL";
+    let equal = |r: Report| {
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{:?}",
+            r.findings
+        )
+    };
+    let not_equal = |r: Report, why: &str| {
+        assert!(
+            !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    equal(run(&ts("JOIN", key), T, &pg("LEFT JOIN", both), P, true));
+    equal(run(
+        &ts("INNER JOIN", key),
+        T,
+        &pg("LEFT OUTER JOIN", both),
+        P,
+        true,
+    ));
+    // A dropped condition, a LEFT JOIN that became inner, another key.
+    not_equal(
+        run(
+            &ts("JOIN", key),
+            T,
+            &pg("LEFT JOIN", "i.name IS NOT NULL"),
+            P,
+            true,
+        ),
+        "dropped",
+    );
+    not_equal(
+        run(&ts("JOIN", key), T, &pg("JOIN", both), P, true),
+        "inner",
+    );
+    not_equal(
+        run(
+            &ts("JOIN", "f.item_id = p.item_id + 1"),
+            T,
+            &pg("LEFT JOIN", both),
+            P,
+            true,
+        ),
+        "key",
+    );
+    // Without the catalog no key is known.
+    not_equal(
+        run(&ts("JOIN", key), T, &pg("LEFT JOIN", both), P, false),
+        "no catalog",
+    );
+    // price_feed has no key: an item price may meet several feed rows.
+    let several = |d: Dialect| match d {
+        Dialect::Tsql => "CREATE PROCEDURE dbo.reprice AS
+             BEGIN
+               UPDATE p SET unit_price = f.unit_price
+               FROM dbo.item_price AS p JOIN dbo.price_feed AS f ON f.item_id = p.item_id;
+             END"
+        .to_string(),
+        _ => "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE item_price AS p SET unit_price = f.unit_price
+             FROM price_feed AS f WHERE f.item_id = p.item_id; $$;"
+            .to_string(),
+    };
+    not_equal(
+        run(&several(T), T, &several(P), P, true),
+        "several feed rows",
+    );
+    // PostgreSQL rejects the target in a join condition; T-SQL does not.
+    let named = "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE price_feed AS f SET unit_price = p.unit_price
+             FROM item_price AS p LEFT JOIN item AS i ON i.item_id = f.item_id
+             WHERE f.item_id = p.item_id AND i.name IS NOT NULL; $$;";
+    not_equal(run(&ts("JOIN", key), T, named, P, true), "target in ON");
+}
+
 #[test]
 fn string_comparison_collation_is_explicit() {
     let ts = "CREATE FUNCTION dbo.f (@Email varchar(254)) RETURNS int AS
