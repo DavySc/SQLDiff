@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sqldiff_gui::runs::{
-    self, Command as Sheet, ConvertSpec, DriftSpec, DriftTree, InstancesSpec, Run, Runs, State,
+    self, ChangesSpec, Command as Sheet, ConvertSpec, DriftSpec, DriftTree, InstancesSpec, Run,
+    Runs, State,
 };
 
 fn write(p: &Path, text: &str) {
@@ -563,4 +564,106 @@ fn a_drift_run_and_its_command_write_the_same() {
 
 fn manifest_path(d: &Path) -> String {
     d.join("instances.toml").display().to_string()
+}
+
+#[test]
+fn a_branch_review_run_and_its_command_write_the_same() {
+    let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-chg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let elsewhere = d.join("elsewhere");
+    write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    // A repository with a branch that changes, reformats and adds SQL; the
+    // folder has a space in its name, as the pathspec case needs.
+    let repo = d.join("my repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    write(&repo.join("a.tsql.sql"), "SELECT a FROM t WHERE b = 1;\n");
+    write(
+        &repo.join("sub dir/b.tsql.sql"),
+        "SELECT a FROM t WHERE b = 1;\n",
+    );
+    write(
+        &repo.join("sub dir/c.tsql.sql"),
+        "SELECT a FROM t WHERE b = 1;\n",
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    git(&repo, &["checkout", "-q", "-b", "topic"]);
+    write(&repo.join("a.tsql.sql"), "SELECT a FROM t WHERE b = 2;\n");
+    write(
+        &repo.join("sub dir/b.tsql.sql"),
+        "SELECT   a   FROM t WHERE b = 1;\n",
+    );
+    write(&repo.join("sub dir/new.tsql.sql"), "SELECT 1;\n");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "change"]);
+    let spec = |out: &Path, dialect: Option<&str>, paths: &[&str]| ChangesSpec {
+        repo: repo.display().to_string(),
+        base: "main".into(),
+        head: None,
+        dialect: dialect.map(str::to_string),
+        paths: paths.iter().map(|p| p.to_string()).collect(),
+        out: out.display().to_string(),
+        packs: vec![pack()],
+        overwrite: false,
+    };
+    let runs = Runs::default();
+    // The second keeps only `sub dir`: a reformatting (equal) and an added
+    // file, which was compared with nothing, so at best unknown.
+    for (name, dialect, paths, verdict) in [
+        ("all", None, &[][..], "different"),
+        (
+            "one dialect and a path",
+            Some("tsql"),
+            &["sub dir"][..],
+            "unknown",
+        ),
+    ] {
+        let (gui, cli) = (d.join(format!("gui {name}")), d.join(format!("cli {name}")));
+        let run = runs
+            .start_changes(spec(&gui, dialect, paths), true, |_| {})
+            .unwrap();
+        let state = finish(&run);
+        let State::Done {
+            complete, totals, ..
+        } = &state
+        else {
+            panic!("{name}: {state:?}");
+        };
+        let sheet = runs::changes_command(&spec(&cli, dialect, paths), true).unwrap();
+        for flag in [
+            "--repo",
+            "--base",
+            "--head",
+            "--json",
+            "--no-cache",
+            "--pack",
+            "--isolated",
+        ] {
+            assert!(
+                sheet.args.contains(&flag.to_string()),
+                "{flag}: {}",
+                sheet.sh
+            );
+        }
+        assert_eq!(sheet.args.contains(&"--".to_string()), !paths.is_empty());
+        let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            o.status.code().is_some_and(|c| c <= 1),
+            "{name}: {}\n{err}",
+            sheet.sh
+        );
+        // The verdict is the command's exit code; there is no gate here.
+        assert_eq!(*complete, o.status.code() == Some(0), "{name}");
+        assert_eq!(totals["verdict"], verdict, "{name}: {totals}");
+        let (g, c) = (masked(&gui), masked(&cli));
+        assert_eq!(
+            g.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+            ["changes.json", "changes.md", "changes.sarif"],
+            "{name}"
+        );
+        assert_eq!(g, c, "{name}: {}", sheet.sh);
+    }
+    let _ = std::fs::remove_dir_all(&d);
 }
