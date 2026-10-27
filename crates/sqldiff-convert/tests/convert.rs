@@ -1228,6 +1228,44 @@ fn char_of_an_ascii_code_becomes_chr() {
     let out = out_of(&c, u);
     assert!(out.contains("chr(13)") && out.contains("chr(10)"), "{out}");
     assert!(!out.to_uppercase().contains("CHAR("), "{out}");
+    // `+` between two calls is concatenation: PostgreSQL has no text + text.
+    assert!(out.contains("chr(13) || chr(10)"), "{out}");
+    assert!(!out.contains('+'), "{out}");
+}
+
+#[test]
+fn plus_next_to_a_string_builtin_is_concatenation() {
+    let src = "DECLARE @s varchar(200) = DB_NAME() + CHAR(9);";
+    let c = tsql(src);
+    let out = c.output.clone();
+    assert!(out.contains("current_database() || chr(9)"), "{out}");
+}
+
+#[test]
+fn plus_with_a_number_stays_addition() {
+    // T-SQL converts the string side to a number: `CHAR(49) + 1` is 2 and
+    // `'1' + 1` is 2. `||` would give '11'.
+    for (src, keep) in [
+        ("UPDATE t SET a = CHAR(49) + 1;", "chr(49) + 1"),
+        ("UPDATE t SET a = '1' + 1;", "'1' + 1"),
+        ("UPDATE t SET a = 1 + CHAR(49);", "1 + chr(49)"),
+    ] {
+        let c = tsql(src);
+        let out = c.output.clone();
+        assert!(out.contains(keep), "{src}: {out}");
+        assert!(!out.contains("||"), "{src}: {out}");
+    }
+}
+
+#[test]
+fn qualified_char_is_a_user_function() {
+    // `x.CHAR(5)` is a user function, so it is neither rewritten nor taken as
+    // a string for `+`.
+    let src = "UPDATE t SET a = x.CHAR(5) + x.CHAR(6);";
+    let c = tsql(src);
+    let out = c.output.clone();
+    assert!(!out.contains("chr("), "{out}");
+    assert!(!out.contains("||"), "{out}");
 }
 
 #[test]
