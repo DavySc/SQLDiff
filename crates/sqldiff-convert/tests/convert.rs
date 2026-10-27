@@ -1242,6 +1242,33 @@ fn plus_next_to_a_string_builtin_is_concatenation() {
 }
 
 #[test]
+fn plus_with_a_number_stays_addition() {
+    // T-SQL converts the string side to a number: `CHAR(49) + 1` is 2 and
+    // `'1' + 1` is 2. `||` would give '11'.
+    for (src, keep) in [
+        ("UPDATE t SET a = CHAR(49) + 1;", "chr(49) + 1"),
+        ("UPDATE t SET a = '1' + 1;", "'1' + 1"),
+        ("UPDATE t SET a = 1 + CHAR(49);", "1 + chr(49)"),
+    ] {
+        let c = tsql(src);
+        let out = c.output.clone();
+        assert!(out.contains(keep), "{src}: {out}");
+        assert!(!out.contains("||"), "{src}: {out}");
+    }
+}
+
+#[test]
+fn qualified_char_is_a_user_function() {
+    // `x.CHAR(5)` is a user function, so it is neither rewritten nor taken as
+    // a string for `+`.
+    let src = "UPDATE t SET a = x.CHAR(5) + x.CHAR(6);";
+    let c = tsql(src);
+    let out = c.output.clone();
+    assert!(!out.contains("chr("), "{out}");
+    assert!(!out.contains("||"), "{out}");
+}
+
+#[test]
 fn char_of_other_codes_is_not_converted() {
     // 0 is an error in chr(), 128 to 255 depend on the code page, and a value
     // known only at run time may be either.

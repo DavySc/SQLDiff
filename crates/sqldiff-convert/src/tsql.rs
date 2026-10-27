@@ -3641,14 +3641,14 @@ impl<'a> Cx<'a> {
                 .map_or((false, false), |v| (v.string, v.numeric)),
             // A call to a built-in that returns a string: `CHAR(13) + CHAR(10)`.
             IDENT if next_sig(ts, j).is_some_and(|n| ts[n].k == L_PAREN) => {
-                (string_builtin(t), false)
+                (string_builtin(ts, j), false)
             }
             R_PAREN => {
                 let open = (0..j)
                     .rev()
                     .find(|&o| ts[o].k == L_PAREN && matching(ts, o) == Some(j));
                 let name = open.and_then(|o| prev_sig(ts, o));
-                (name.is_some_and(|n| string_builtin(&ts[n])), false)
+                (name.is_some_and(|n| string_builtin(ts, n)), false)
             }
             _ => (false, false),
         }
@@ -3726,7 +3726,11 @@ impl<'a> Cx<'a> {
                         matches!(ts[p].k, OP | L_PAREN | COMMA)
                             || ts[p].k == IDENT && is_clause_word(&ts[p].s)
                     });
-                    if !unary && (l.0 || r.0) {
+                    // `+` with a number is addition in T-SQL even next to a
+                    // string (int has the higher precedence: `'1' + 1` is 2), so
+                    // it stays `+` and fails on the target instead of becoming
+                    // a different value.
+                    if !unary && (l.0 || r.0) && !(l.1 || r.1) {
                         self.note(Status::Assumptions, "ASM-CONCAT-NULL", "String + becomes ||; both give NULL when an operand is NULL (CONCAT_NULL_YIELDS_NULL ON, the default).");
                         o.push_str("||");
                     } else {
@@ -3782,7 +3786,14 @@ impl<'a> Cx<'a> {
                     }
                     if let Some(p) = nx.filter(|&p| ts[p].k == L_PAREN) {
                         if let Some(r) = matching(ts, p) {
-                            if let Some(s) = self.func(&up, &ts[p + 1..r]) {
+                            // `dbo.CHAR(5)` is a user function, not the built-in.
+                            let qualified = prev_sig(ts, i).is_some_and(|d| ts[d].k == DOT);
+                            let rewritten = if qualified {
+                                None
+                            } else {
+                                self.func(&up, &ts[p + 1..r])
+                            };
+                            if let Some(s) = rewritten {
                                 o.push_str(&s);
                                 i = r + 1;
                                 continue;
@@ -5388,8 +5399,9 @@ fn date_part(p: &str) -> Option<&'static str> {
 
 /// A T-SQL built-in whose result is always a string, so `+` next to a call
 /// to it is concatenation.
-fn string_builtin(t: &T) -> bool {
-    ["CHAR", "NCHAR", "DB_NAME"].iter().any(|w| t.is(w))
+fn string_builtin(ts: &[T], i: usize) -> bool {
+    let qualified = prev_sig(ts, i).is_some_and(|d| ts[d].k == DOT);
+    !qualified && ["CHAR", "NCHAR", "DB_NAME"].iter().any(|w| ts[i].is(w))
 }
 
 /// A date-time text whose fractional seconds PostgreSQL's microseconds
