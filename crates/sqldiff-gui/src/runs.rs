@@ -33,6 +33,23 @@ pub struct ConvertSpec {
     /// hand since the last run).
     #[serde(default)]
     pub overwrite: bool,
+    /// Every file is a template in the `[template]` syntax of the loaded
+    /// packs or config (`--template`).
+    #[serde(default)]
+    pub template: bool,
+    /// Template parameter names (`--parameter`); none means the syntax decides.
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    /// File extensions to convert (`--extension`); none means `sql`.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Packs to load besides the config's (`--pack`), by path.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    /// An instance check of these templates (`--instances`): the review
+    /// then judges each template by its woven instances.
+    #[serde(default)]
+    pub instances: Option<String>,
 }
 
 /// Where a run is.
@@ -77,8 +94,9 @@ pub struct Command {
 }
 
 impl Command {
-    /// The command for `job`, with config found from `dir` as the run finds it.
-    pub fn new(program: &str, job: &Job, dir: &Path, isolated: bool) -> Command {
+    /// The command for `job` with `packs`, with config found from `dir` as
+    /// the run finds it.
+    pub fn new(program: &str, job: &Job, packs: &[PathBuf], dir: &Path, isolated: bool) -> Command {
         let t = &job.tree;
         let mut args = vec![
             "convert".into(),
@@ -92,6 +110,23 @@ impl Command {
         ];
         if job.overwrite {
             args.push("--overwrite".into());
+        }
+        if let Some(m) = &t.template {
+            args.push("--template".into());
+            for p in m.parameters.iter().flatten() {
+                args.extend(["--parameter".into(), p.clone()]);
+            }
+        }
+        if t.extensions != tree::extensions(Vec::new()) {
+            for e in &t.extensions {
+                args.extend(["--extension".into(), e.clone()]);
+            }
+        }
+        if let Some(p) = &job.instances {
+            args.extend(["--instances".into(), path(p)]);
+        }
+        for p in packs {
+            args.extend(["--pack".into(), path(p)]);
         }
         let (project, user) = match isolated {
             true => (None, None),
@@ -331,6 +366,33 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
     if !src.exists() {
         return Err(format!("{}: not found", src.display()));
     }
+    let given = |p: &String| -> Result<PathBuf, String> {
+        let p = browse::absolute(Path::new(p.trim()));
+        match p.exists() {
+            true => Ok(p),
+            false => Err(format!("{}: not found", p.display())),
+        }
+    };
+    let packs = spec
+        .packs
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(given)
+        .collect::<Result<Vec<_>, _>>()?;
+    let instances = match spec.instances.as_ref().filter(|p| !p.trim().is_empty()) {
+        Some(p) => Some(given(p)?),
+        None => None,
+    };
+    let names = |v: &[String]| -> Vec<String> {
+        v.iter()
+            .map(|n| n.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect()
+    };
+    let parameters = names(&spec.parameters);
+    if !spec.template && !parameters.is_empty() {
+        return Err("parameters are for template runs".into());
+    }
     let dir = match src.is_dir() {
         true => src.clone(),
         false => src.parent().map(Path::to_path_buf).unwrap_or_default(),
@@ -340,10 +402,17 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
         user: None,
         isolated,
         cwd: Some(dir.clone()),
-        packs: Vec::new(),
+        packs: packs.clone(),
         cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
     })
     .map_err(|e| e.0)?;
+    let template = match spec.template {
+        true => Some(tree::TemplateMode::configured(
+            &cfg,
+            (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+        )?),
+        false => None,
+    };
     let job = Job {
         tree: tree::Args {
             src,
@@ -351,17 +420,17 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
             to,
             jobs: None,
             no_catalog: false,
-            template: None,
-            extensions: tree::extensions(Vec::new()),
+            template,
+            extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,
         },
         out: out.clone(),
         overwrite: spec.overwrite,
         discard_edits: false,
-        instances: None,
+        instances,
         queue_all: false,
     };
-    let command = Command::new(&program(), &job, &dir, isolated);
+    let command = Command::new(&program(), &job, &packs, &dir, isolated);
     Ok((job, out, command))
 }
 
@@ -396,7 +465,7 @@ fn execute(run: &Arc<Run>, job: Job) -> State {
     let setup = convert_review::Setup {
         tree: job.tree,
         out: job.out,
-        instances: None,
+        instances: job.instances,
     };
     match Review::open_converted(setup, w) {
         Ok(review) => {

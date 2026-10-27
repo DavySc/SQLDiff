@@ -65,6 +65,12 @@ input[type=text]:focus, select:focus { outline: none; border-color: var(--focus)
 
 .field { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
 .field > span { color: var(--muted); font-size: 12.5px; }
+details.more { display: grid; gap: 8px; }
+details.more > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; width: max-content; }
+details.more > summary:hover { color: var(--fg); }
+details.more[open] > summary { margin-bottom: 8px; }
+details.more .field + .field, details.more .acts + .field { margin-top: 8px; }
+.hint { grid-column: 2 / -1; color: var(--faint); font-size: 12px; margin-top: -4px; }
 .pick { display: flex; gap: 6px; align-items: center; color: var(--muted); }
 label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
 .err { color: var(--bad); font-size: 12.5px; flex: 1; overflow-wrap: anywhere; }
@@ -114,6 +120,14 @@ a.btn:hover { background: var(--link-2); }
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
     <div class="field"><span>Dialects</span><span class="pick"><select id="from" aria-label="Source dialect"></select>→<select id="to" aria-label="Target dialect"></select></span><span></span></div>
     <div class="acts"><label class="tog" title="Files edited by hand since the last run are never replaced"><input type="checkbox" id="overwrite"> Replace files in a non-empty output folder</label></div>
+    <details class="more" id="more"><summary>Templates, extensions and packs</summary>
+      <div class="acts"><label class="tog"><input type="checkbox" id="template"> Every file is a template in the <code>[template]</code> syntax of the config or a pack</label></div>
+      <div class="field"><span>Parameters</span><input type="text" id="params" placeholder="Names, comma-separated; empty: the template syntax decides" aria-label="Template parameter names" spellcheck="false"><span></span></div>
+      <div class="field"><span>Extensions</span><input type="text" id="exts" placeholder="sql" aria-label="File extensions, comma-separated" spellcheck="false"><span></span></div>
+      <div class="field"><span>Pack</span><input type="text" id="pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="pack" data-near="src">Browse…</button></div>
+      <div class="field"><span>Instances</span><input type="text" id="inst" placeholder="An instance check of these templates (instance-report.json or its folder)" aria-label="Instance report" spellcheck="false"><button type="button" class="outline" data-browse="inst" data-near="out">Browse…</button></div>
+      <div class="hint">With an instance check, the review judges each template by the instances woven from it.</div>
+    </details>
     <div class="acts"><span class="err" id="err" role="alert"></span><button type="submit" class="primary" id="go">Convert</button></div>
   </form>
   <h2 style="margin-top:8px">Runs</h2>
@@ -156,7 +170,7 @@ function ladder(units) {
 }
 
 function row(r) {
-  const title = `Convert ${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
+  const title = `Convert ${r.template ? "templates " : ""}${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
   const sub = `<span class="path">${esc(r.src)}</span> into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}`;
   let right = "", act = "", extra = "", dot = r.state;
   if (r.state === "running") {
@@ -253,7 +267,12 @@ $("conv").addEventListener("submit", async (e) => {
   if (!src || !out) { $("err").textContent = "Give a source and an output folder."; return; }
   $("err").textContent = ""; $("go").disabled = true;
   try {
-    await post("/api/runs", { src, out, from: $("from").value, to: $("to").value, overwrite: $("overwrite").checked });
+    const list = (id) => $(id).value.split(",").map((x) => x.trim()).filter(Boolean);
+    await post("/api/runs", {
+      src, out, from: $("from").value, to: $("to").value, overwrite: $("overwrite").checked,
+      template: $("template").checked, parameters: list("params"), extensions: list("exts"),
+      packs: $("pack").value.trim() ? [$("pack").value.trim()] : [], instances: $("inst").value.trim() || null,
+    });
     $("overwrite").checked = false;
   } catch (e) { $("err").textContent = e.message; }
   $("go").disabled = false;
