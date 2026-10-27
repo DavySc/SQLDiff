@@ -4095,6 +4095,21 @@ impl<'a> Cx<'a> {
                 format!("strpos({y}, {x})")
             }
             ("NEWID", 0) => "gen_random_uuid()".into(),
+            ("DB_NAME", 0) => "current_database()".into(),
+            // Code points 1 to 127 are the same character in every code page and in
+            // Unicode. 0 (`chr(0)` is an error), 128 to 255 (the database's code
+            // page decides) and a value only known at run time stay unconverted.
+            ("CHAR", 1) => {
+                let text: String = a[0]
+                    .iter()
+                    .filter(|t| t.sig())
+                    .map(|t| t.s.as_str())
+                    .collect();
+                match text.parse::<u8>() {
+                    Ok(code @ 1..=127) => format!("chr({code})"),
+                    _ => return None,
+                }
+            }
             ("QUOTENAME", 1) => {
                 self.note(Status::Assumptions, "ASM-QUOTENAME-IDENT", "QUOTENAME becomes quote_ident: both make the value usable as one identifier, but quote_ident adds double quotes only when needed and QUOTENAME returns NULL for more than 128 characters. Equal only where the result is used as a PostgreSQL identifier, never as text.");
                 format!("quote_ident({})", e(self, 0))

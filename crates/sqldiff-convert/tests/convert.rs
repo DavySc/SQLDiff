@@ -1219,3 +1219,49 @@ fn deep_nesting_does_not_overflow_the_engine_stack() {
     let c = sqldiff_core::with_engine_stack(|| tsql(&text));
     assert!(!c.units.is_empty());
 }
+
+#[test]
+fn char_of_an_ascii_code_becomes_chr() {
+    let src = "SELECT 'a' + CHAR(13) + CHAR(10) + 'b' AS s;";
+    let c = tsql(src);
+    let u = unit(&c, src, "SELECT");
+    let out = out_of(&c, u);
+    assert!(out.contains("chr(13)") && out.contains("chr(10)"), "{out}");
+    assert!(!out.to_uppercase().contains("CHAR("), "{out}");
+}
+
+#[test]
+fn char_of_other_codes_is_not_converted() {
+    // 0 is an error in chr(), 128 to 255 depend on the code page, and a value
+    // known only at run time may be either.
+    for arg in ["0", "128", "200", "256", "@code"] {
+        let src = format!("SELECT CHAR({arg}) AS c;");
+        let c = tsql(&src);
+        let u = unit(&c, &src, "SELECT");
+        let out = out_of(&c, u);
+        assert!(!out.contains("chr("), "CHAR({arg}): {out}");
+        assert_ne!(u.status, Status::Converted, "CHAR({arg}): {out}");
+    }
+}
+
+#[test]
+fn db_name_without_an_argument_becomes_current_database() {
+    let src = "SELECT DB_NAME() AS n;";
+    let c = tsql(src);
+    let u = unit(&c, src, "SELECT");
+    assert!(
+        out_of(&c, u).contains("current_database()"),
+        "{}",
+        out_of(&c, u)
+    );
+}
+
+#[test]
+fn db_name_of_an_id_is_not_converted() {
+    let src = "SELECT DB_NAME(5) AS n;";
+    let c = tsql(src);
+    let u = unit(&c, src, "SELECT");
+    let out = out_of(&c, u);
+    assert!(!out.contains("current_database"), "{out}");
+    assert_ne!(u.status, Status::Converted, "{out}");
+}
