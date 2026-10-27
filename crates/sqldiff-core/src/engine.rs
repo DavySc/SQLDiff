@@ -412,6 +412,28 @@ fn in_error_handler(node: &sqldiff_syntax::SyntaxNode) -> bool {
 /// each record it, so how often and in what order they occur is not compared
 /// here (the behavioural diff compares the error paths themselves).
 fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
+    // A T-SQL trigger for several events became one PostgreSQL function per
+    // event, each with the trigger's writes: pair them per function.
+    if let Some(fns) = crate::equiv::trigger_functions(a, b) {
+        let mut out: Vec<Finding> = Vec::new();
+        for f in &fns {
+            for x in pair_writes_in(a, b, Some(f)) {
+                if !out.iter().any(|y| y.fingerprint == x.fingerprint) {
+                    out.push(x);
+                }
+            }
+        }
+        return out;
+    }
+    pair_writes_in(a, b, None)
+}
+
+/// `pair_writes` with side B's writes limited to those inside `within`.
+fn pair_writes_in(
+    a: &Analyzed,
+    b: &Analyzed,
+    within: Option<&sqldiff_syntax::SyntaxNode>,
+) -> Vec<Finding> {
     // MERGE and INSERT ... ON CONFLICT are both upserts.
     let key = |w: &facts::Write| {
         let kind = if w.upsert {
@@ -429,6 +451,10 @@ fn pair_writes(a: &Analyzed, b: &Analyzed) -> Vec<Finding> {
     let split = |x: &Analyzed| -> (Vec<facts::Write>, Vec<facts::Write>) {
         facts::writes(x)
             .into_iter()
+            .filter(|w| {
+                x.side == Side::A
+                    || within.map_or(true, |f| f.text_range().contains_range(w.node.text_range()))
+            })
             .partition(|w| !in_error_handler(&w.node))
     };
     let (wa, ha) = split(a);

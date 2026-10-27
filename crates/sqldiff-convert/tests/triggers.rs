@@ -2,8 +2,9 @@
 //! one function and one `FOR EACH STATEMENT` trigger per event, transition
 //! tables named `inserted` and `deleted`, an image the event lacks as an
 //! empty query of the table, and the row-count guard as a test for rows.
-//! The engine does not compare trigger bodies yet, so no converted trigger
-//! may count as converted.
+//! The engine compares each event's function with the T-SQL body for that
+//! event (rule T5), so a converted trigger counts as converted under
+//! assumptions only when the engine showed it equal.
 
 use sqldiff_convert::{check, rewrite_in, Conversion, Status, Unit};
 use sqldiff_core::catalog::{ddl, Catalog};
@@ -44,12 +45,18 @@ fn has_note(u: &Unit, rule: &str) -> bool {
     u.notes.iter().any(|n| n.rule == rule)
 }
 
-/// A converted trigger: never "converted", never "differs".
-fn assert_not_proven(stmt: &str, c: &Conversion) {
+/// A converted trigger the engine showed equal: under assumptions (the
+/// trigger's own ones at least).
+fn assert_proven(stmt: &str, c: &Conversion) {
     let u = unit(c);
+    assert!(
+        c.report.unknown_reasons.is_empty(),
+        "{stmt}\n{:#?}",
+        c.report.unknown_reasons
+    );
     assert_eq!(
         u.status,
-        Status::Unproven,
+        Status::Assumptions,
         "{stmt}\n{:?}\n{:#?}\n{}",
         u.notes,
         c.report.findings,
@@ -89,7 +96,7 @@ FOR EACH STATEMENT
 EXECUTE FUNCTION orders_tu();
 ";
     assert!(c.output.contains(want), "{}", c.output);
-    assert_not_proven(stmt, &c);
+    assert_proven(stmt, &c);
     let u = unit(&c);
     for rule in [
         "ASM-TRIGGER-ROWCOUNT",
@@ -98,8 +105,16 @@ EXECUTE FUNCTION orders_tu();
     ] {
         assert!(has_note(u, rule), "{rule}: {:?}", u.notes);
     }
-    // The body changes its own table: PostgreSQL fires the trigger again.
-    assert!(has_note(u, "pg.trigger-reentry"), "{:?}", u.notes);
+    // The body changes its own table: PostgreSQL fires the trigger again,
+    // which the engine shows does nothing.
+    assert!(
+        c.report
+            .assumptions
+            .iter()
+            .any(|a| a.id == "ASM-TRIGGER-REENTRY-OTHERS"),
+        "{:?}",
+        c.report.assumptions
+    );
 }
 
 #[test]
@@ -125,10 +140,9 @@ INSERT INTO audit_log (order_id, action, qty) SELECT order_id, 'del', qty FROM d
         assert!(c.output.contains(want), "{want}\n---\n{}", c.output);
     }
     assert!(!c.output.contains("orders_audit_update"), "{}", c.output);
-    assert_not_proven(stmt, &c);
+    assert_proven(stmt, &c);
     let u = unit(&c);
     assert!(has_note(u, "pg.trigger-per-event"), "{:?}", u.notes);
-    assert!(!has_note(u, "pg.trigger-reentry"), "{:?}", u.notes);
 }
 
 #[test]
@@ -145,7 +159,7 @@ END";
         "{}",
         c.output
     );
-    assert_not_proven(stmt, &c);
+    assert_proven(stmt, &c);
 }
 
 #[test]
@@ -157,7 +171,7 @@ fn the_row_count_guard_tests_the_events_rows() {
         let c = tsql(stmt);
         let want = format!("IF NOT EXISTS (SELECT 1 FROM {image}) THEN\n    RETURN NULL;\n  END IF;");
         assert!(c.output.contains(&want), "{stmt}\n{}", c.output);
-        assert_not_proven(stmt, &c);
+        assert_proven(stmt, &c);
     }
 }
 
@@ -201,7 +215,7 @@ fn alter_trigger_replaces_the_triggers() {
         c.output
     );
     assert!(c.output.contains("CREATE OR REPLACE TRIGGER t_update\nAFTER UPDATE ON orders\nREFERENCING NEW TABLE AS inserted OLD TABLE AS deleted"), "{}", c.output);
-    assert_not_proven(stmt, &c);
+    assert_proven(stmt, &c);
     assert!(
         has_note(unit(&c), "ASM-TRIGGER-REPLACE"),
         "{:?}",
@@ -216,4 +230,30 @@ fn db2_refuses_triggers() {
         Dialect::Db2i,
     );
     assert_eq!(unit(&c).status, Status::NotConverted);
+}
+
+/// An UPDATE trigger that updates its own table without a test that the row
+/// changed: PostgreSQL fires it again and updates again, T-SQL does not.
+#[test]
+fn unproven_reentry_is_not_proven() {
+    let stmt = "CREATE TRIGGER t ON orders AFTER UPDATE AS
+IF @@ROWCOUNT = 0 RETURN;
+UPDATE orders SET total = qty * price WHERE order_id IN (SELECT order_id FROM inserted);";
+    let c = tsql(stmt);
+    assert_eq!(
+        unit(&c).status,
+        Status::Unproven,
+        "{}\n{:?}\n{:#?}",
+        c.output,
+        unit(&c).notes,
+        c.report.unknown_reasons
+    );
+    assert!(
+        c.report
+            .unknown_reasons
+            .iter()
+            .any(|r| r.contains("updates its own table")),
+        "{:#?}",
+        c.report.unknown_reasons
+    );
 }
