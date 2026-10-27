@@ -118,6 +118,20 @@ pub fn review(scope: &ChangeScope, pipe: &Pipeline, hooks: &Hooks) -> Result<Rev
     Ok(Reviewed { set, entries })
 }
 
+/// The changed files of a branch by how they came out. `added` files were
+/// checked on their own, not compared with anything; `not_compared` counts
+/// what could not be compared (removed, ambiguous, no dialect, unreadable,
+/// config changed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Counts {
+    pub different: usize,
+    pub not_proven: usize,
+    pub equal_under_assumptions: usize,
+    pub equal: usize,
+    pub added: usize,
+    pub not_compared: usize,
+}
+
 /// A reviewed branch: what changed, and the engine's report for each changed
 /// file. Rendered as text, JSON, SARIF or the pull request comment.
 pub struct Reviewed {
@@ -194,30 +208,44 @@ impl Reviewed {
         }
     }
 
-    fn counts(&self) -> String {
+    /// How many changed files came out each way.
+    pub fn counts(&self) -> Counts {
         let n = |v: Verdict| {
             self.entries
                 .iter()
                 .filter(|e| e.status != Status::Added && e.report.open_verdict() == v)
                 .count()
         };
-        let mut parts = vec![
-            format!("{} different", n(Verdict::Different)),
-            format!("{} not proven", n(Verdict::Unknown)),
-            format!(
-                "{} equal under assumptions",
-                n(Verdict::EqualUnderAssumptions)
-            ),
-            format!("{} equal", n(Verdict::Equal)),
-        ];
-        let added = self
-            .entries
-            .iter()
-            .filter(|e| e.status == Status::Added)
-            .count();
-        parts.push(format!("{added} added"));
-        parts.push(format!("{} not compared", self.not_compared().len()));
-        parts.join(" · ")
+        Counts {
+            different: n(Verdict::Different),
+            not_proven: n(Verdict::Unknown),
+            equal_under_assumptions: n(Verdict::EqualUnderAssumptions),
+            equal: n(Verdict::Equal),
+            added: self
+                .entries
+                .iter()
+                .filter(|e| e.status == Status::Added)
+                .count(),
+            not_compared: self.not_compared().len(),
+        }
+    }
+
+    /// Changed files in all: the ones read and the ones removed.
+    pub fn files(&self) -> usize {
+        self.entries.len() + self.set.removed.len()
+    }
+
+    fn counts_line(&self) -> String {
+        let c = self.counts();
+        [
+            format!("{} different", c.different),
+            format!("{} not proven", c.not_proven),
+            format!("{} equal under assumptions", c.equal_under_assumptions),
+            format!("{} equal", c.equal),
+            format!("{} added", c.added),
+            format!("{} not compared", c.not_compared),
+        ]
+        .join(" · ")
     }
 
     /// The primary location of a finding at head.
@@ -362,7 +390,7 @@ impl Reviewed {
             self.entries.len() + self.set.removed.len(),
             short(&self.set.merge_base),
             short(&self.set.head),
-            self.counts()
+            self.counts_line()
         );
         let _ = writeln!(
             out,
@@ -450,7 +478,7 @@ fn markdown(r: &Reviewed) -> String {
         out,
         "{files} changed SQL file{}: {}.\n",
         if files == 1 { "" } else { "s" },
-        r.counts()
+        r.counts_line()
     );
     if r.verdict() == Verdict::Unknown {
         let _ = writeln!(

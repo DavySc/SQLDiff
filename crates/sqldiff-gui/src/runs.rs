@@ -6,8 +6,9 @@
 //! the instances of converted templates through
 //! `sqldiff_convert::instances` (what `sqldiff instances` runs), or checks
 //! the template trees of several dialects for drift through
-//! `sqldiff_convert::drift` (what `sqldiff drift` runs), so a run
-//! writes what the command writes. Each run carries that command
+//! `sqldiff_convert::drift` (what `sqldiff drift` runs), or reviews the SQL
+//! a branch changed through `sqldiff_review::branch` (what `sqldiff
+//! changes` runs), so a run writes what the command writes. Each run carries that command
 //! (`Command`), for scripts and pipelines.
 
 use std::path::{Path, PathBuf};
@@ -20,6 +21,9 @@ use sqldiff_convert::instances;
 use sqldiff_convert::job::{self, Job};
 use sqldiff_convert::tree::{self, Hooks};
 use sqldiff_core::Dialect;
+use sqldiff_review::branch;
+use sqldiff_review::pipeline::{Pipeline, Settings};
+use sqldiff_source::changes::ChangeScope;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::Resolved;
 
@@ -141,6 +145,38 @@ pub struct DriftSpec {
     pub overwrite: bool,
 }
 
+/// A branch review as the page asks for it: the arguments of `sqldiff changes`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangesSpec {
+    /// The git repository (`--repo`).
+    pub repo: String,
+    /// The revision the change is reviewed against (`--base`); the diff
+    /// starts at its merge base with the head.
+    pub base: String,
+    /// The head revision (`--head`); none means `HEAD`.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// Dialect of every changed file (`--dialect`); none: per file, from
+    /// `dialect_map` or the path convention.
+    #[serde(default)]
+    pub dialect: Option<String>,
+    /// Only these paths (git pathspecs).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// The output folder for `changes.json`, `changes.md` and `changes.sarif`.
+    pub out: String,
+    /// Packs to load besides the config's (`--pack`), by path.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    /// Replace the files a review writes in a non-empty output folder.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// What a branch review writes into its output folder.
+pub const CHANGES_FILES: [&str; 3] = ["changes.json", "changes.md", "changes.sarif"];
+
 /// What a run was asked to do.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -148,6 +184,7 @@ pub enum Spec {
     Convert(ConvertSpec),
     Instances(InstancesSpec),
     Drift(DriftSpec),
+    Changes(ChangesSpec),
 }
 
 impl Spec {
@@ -157,6 +194,7 @@ impl Spec {
             Spec::Convert(s) => &s.out,
             Spec::Instances(s) => &s.out,
             Spec::Drift(s) => &s.out,
+            Spec::Changes(s) => &s.out,
         }
     }
 }
@@ -166,6 +204,18 @@ enum Work {
     Convert(Box<Job>),
     Instances(Box<instances::Args>),
     Drift(Box<drift::Args>),
+    Changes(Box<ChangesWork>),
+}
+
+/// A branch review, checked and ready to run.
+struct ChangesWork {
+    repo: PathBuf,
+    base: String,
+    head: String,
+    dialect: Option<Dialect>,
+    paths: Vec<String>,
+    out: PathBuf,
+    pipe: Pipeline,
 }
 
 /// Where a run is.
@@ -330,14 +380,65 @@ impl Command {
         Command::with_config(program, args, packs, dir, isolated)
     }
 
+    /// The `sqldiff changes` command for `w` with `packs`, with config found
+    /// from `dir` as the run finds it. It writes the files a run writes, and
+    /// does not use the result cache, as a run does not.
+    fn changes(
+        program: &str,
+        w: &ChangesWork,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        let mut args = vec![
+            "changes".into(),
+            "--repo".into(),
+            path(&w.repo),
+            "--base".into(),
+            w.base.clone(),
+            "--head".into(),
+            w.head.clone(),
+        ];
+        if let Some(d) = w.dialect {
+            args.extend(["--dialect".into(), d.id().into()]);
+        }
+        for (flag, file) in ["--json", "--markdown", "--sarif"]
+            .into_iter()
+            .zip(CHANGES_FILES)
+        {
+            args.extend([flag.into(), path(&w.out.join(file))]);
+        }
+        args.push("--no-cache".into());
+        let tail = match w.paths.is_empty() {
+            true => Vec::new(),
+            false => std::iter::once("--".to_string())
+                .chain(w.paths.iter().cloned())
+                .collect(),
+        };
+        Command::with_config_then(program, args, packs, dir, isolated, tail)
+    }
+
     /// `args` with the packs and every config file the run loaded named,
     /// and no other found (`--isolated`).
     fn with_config(
+        program: &str,
+        args: Vec<String>,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        Command::with_config_then(program, args, packs, dir, isolated, Vec::new())
+    }
+
+    /// [`Command::with_config`], then `tail` (arguments that must come last,
+    /// such as paths after `--`).
+    fn with_config_then(
         program: &str,
         mut args: Vec<String>,
         packs: &[PathBuf],
         dir: &Path,
         isolated: bool,
+        tail: Vec<String>,
     ) -> Command {
         for p in packs {
             args.extend(["--pack".into(), path(p)]);
@@ -356,6 +457,7 @@ impl Command {
         if let Some(p) = &user {
             args.extend(["--user-config".into(), path(p)]);
         }
+        args.extend(tail);
         let line = |program: String, quote: fn(&str) -> String| {
             let mut l = program;
             for a in &args {
@@ -805,6 +907,25 @@ impl Runs {
         )
     }
 
+    /// Starts a branch review on its own thread. Config is what a command
+    /// run in the repository loads (unless `isolated`).
+    pub fn start_changes(
+        &self,
+        spec: ChangesSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (w, command) = prepare_changes(&spec, isolated)?;
+        let (out, reads) = (w.out.clone(), vec![w.repo.clone()]);
+        self.launch(
+            Spec::Changes(spec),
+            Work::Changes(Box::new(w)),
+            (out, reads),
+            command,
+            done,
+        )
+    }
+
     fn launch(
         &self,
         spec: Spec,
@@ -907,6 +1028,11 @@ pub fn drift_command(spec: &DriftSpec, isolated: bool) -> Result<Command, String
     prepare_drift(spec, isolated).map(|(_, c)| c)
 }
 
+/// The command a branch review of `spec` would carry, without starting one.
+pub fn changes_command(spec: &ChangesSpec, isolated: bool) -> Result<Command, String> {
+    prepare_changes(spec, isolated).map(|(_, c)| c)
+}
+
 fn dialects(from: &str, to: &str) -> Result<(Dialect, Dialect), String> {
     let dialect = |id: &str| -> Result<Dialect, String> {
         id.parse().map_err(|_| format!("unknown dialect `{id}`"))
@@ -1004,6 +1130,70 @@ fn prepare_instances(
     };
     let command = Command::instances(&program(), &a, &packs, &dir, isolated);
     Ok((a, command))
+}
+
+/// The branch review a spec asks for, checked before a thread is started,
+/// and the command that runs it. The review store is read (decisions suppress
+/// findings, as for the command) and the result cache is not used, so a run
+/// writes nothing but its output folder.
+fn prepare_changes(spec: &ChangesSpec, isolated: bool) -> Result<(ChangesWork, Command), String> {
+    let repo = existing(&spec.repo)?;
+    if !repo.is_dir() {
+        return Err(format!("{}: not a folder", repo.display()));
+    }
+    let base = spec.base.trim().to_string();
+    if base.is_empty() || spec.out.trim().is_empty() {
+        return Err("give a base revision and an output folder".into());
+    }
+    let head = spec
+        .head
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("HEAD")
+        .to_string();
+    let dialect = match spec
+        .dialect
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(d) => Some(
+            d.parse::<Dialect>()
+                .map_err(|_| format!("unknown dialect `{d}`"))?,
+        ),
+        None => None,
+    };
+    let out = browse::absolute(Path::new(spec.out.trim()));
+    let occupied = std::fs::read_dir(&out)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if occupied && !spec.overwrite {
+        return Err(format!(
+            "{}: not empty; replace the files a review writes to use it",
+            out.display()
+        ));
+    }
+    let packs = existing_all(&spec.packs)?;
+    let cfg = load_config(&repo, &packs, isolated)?;
+    let pipe = Pipeline::new(
+        cfg,
+        &Settings {
+            no_cache: true,
+            ..Settings::default()
+        },
+    )?;
+    let w = ChangesWork {
+        repo: repo.clone(),
+        base,
+        head,
+        dialect,
+        paths: names(&spec.paths),
+        out,
+        pipe,
+    };
+    let command = Command::changes(&program(), &w, &packs, &repo, isolated);
+    Ok((w, command))
 }
 
 /// The drift check a spec asks for, checked before a thread is started, and
@@ -1168,6 +1358,21 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
     };
     let job = match work {
         Work::Convert(job) => job,
+        Work::Changes(w) => {
+            return match review_changes(&w, &hooks) {
+                Ok(mut state) => {
+                    if let State::Done {
+                        notes, finished: f, ..
+                    } = &mut state
+                    {
+                        notes.extend(w.pipe.warnings.iter().cloned());
+                        *f = finished();
+                    }
+                    state
+                }
+                Err(e) => stopped(e),
+            }
+        }
         Work::Drift(a) => {
             return match drift::check(&a, &hooks) {
                 Ok(c) => State::Done {
@@ -1242,4 +1447,46 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
         notes: Vec::new(),
         finished: finished(),
     }
+}
+
+/// Reviews the branch, then writes the three files. Everything is read and
+/// judged first and the files are written last, after the last cancel point.
+fn review_changes(w: &ChangesWork, hooks: &Hooks) -> Result<State, String> {
+    let r = branch::review(
+        &ChangeScope {
+            repo: &w.repo,
+            base: &w.base,
+            head: &w.head,
+            dialect: w.dialect,
+            paths: &w.paths,
+        },
+        &w.pipe,
+        hooks,
+    )?;
+    hooks.stop_if_cancelled()?;
+    std::fs::create_dir_all(&w.out).map_err(|e| format!("{}: {e}", w.out.display()))?;
+    for (file, text) in CHANGES_FILES
+        .iter()
+        .zip([r.json(), r.markdown(), r.sarif()])
+    {
+        let p = w.out.join(file);
+        std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    let verdict = r.verdict();
+    let c = r.counts();
+    Ok(State::Done {
+        totals: serde_json::json!({
+            "verdict": verdict.label(),
+            "files": r.files(),
+            "counts": c,
+            "base": w.base,
+            "head": w.head,
+        }),
+        // The command's exit code: nothing differs and nothing is unproven.
+        complete: verdict < sqldiff_core::Verdict::Unknown,
+        queue: c.different + c.not_proven + c.not_compared,
+        not_applied: Vec::new(),
+        notes: Vec::new(),
+        finished: String::new(),
+    })
 }
