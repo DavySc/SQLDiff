@@ -42,7 +42,7 @@ Two limits keep this honest. Statements the token rules already convert keep the
 sqldiff convert SRC -o OUT --to postgres   # or --to db2i; --from tsql is the default
 ```
 
-`SRC` is a directory (every `.sql` file below it, hidden directories skipped) or one file. `OUT` mirrors the layout with the same file names, so `sqldiff tree SRC OUT --dialect-a tsql --dialect-b postgres` pairs them again. `OUT` must be empty (or pass `--overwrite`) and may not be inside `SRC`. Files are read as UTF-8 (with or without BOM) or UTF-16 with a BOM, as SSDT saves some; anything else is listed as unreadable and not converted.
+`SRC` is a directory (every `.sql` file below it, hidden directories skipped) or one file. `OUT` mirrors the layout with the same file names, so `sqldiff tree SRC OUT --dialect-a tsql --dialect-b postgres` pairs them again. `OUT` must be empty (or pass `--overwrite`) and may not be inside `SRC`. Files are read as UTF-8 (with or without BOM) or UTF-16 with a BOM, as SSDT saves some; anything else is listed as unreadable and not converted. The pack's `[[helpers]]` reach the output's check: a call to a function a helper declares for the target dialect resolves, and is not reported as a routine missing from the catalog.
 
 Two passes, each over `-j N` threads (default: all cores):
 

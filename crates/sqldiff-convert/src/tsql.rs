@@ -1802,11 +1802,14 @@ impl<'a> Cx<'a> {
         match ts[s[0]].up().as_str() {
             "INSERT" if !ts[s[1]].is("INTO") => pre = "INSERT INTO ".into(),
             "UPDATE" => {
-                let set = find_word(&ts, 0, "SET").unwrap_or(0);
-                if let Some(f) = find_word(&ts, set, "FROM") {
+                let set = find_word(&ts, 0, "SET");
+                if let Some(f) = find_word(&ts, set.unwrap_or(0), "FROM") {
                     if self.db2() {
                         return no("UPDATE … FROM with a join: Db2 for i needs a correlated subquery or MERGE, and with several matching rows T-SQL picks one unpredictably; needs a rewrite");
                     }
+                    let Some(set) = set else {
+                        return no("UPDATE … FROM without a SET clause the rules can read (the assignments may be a placeholder a generator fills); convert it by hand");
+                    };
                     return self.update_join(&ts, set, f);
                 }
                 from = s[0];
@@ -3636,6 +3639,17 @@ impl<'a> Cx<'a> {
                 .vars
                 .get(&t.s.trim_start_matches('@').to_ascii_lowercase())
                 .map_or((false, false), |v| (v.string, v.numeric)),
+            // A call to a built-in that returns a string: `CHAR(13) + CHAR(10)`.
+            IDENT if next_sig(ts, j).is_some_and(|n| ts[n].k == L_PAREN) => {
+                (string_builtin(ts, j), false)
+            }
+            R_PAREN => {
+                let open = (0..j)
+                    .rev()
+                    .find(|&o| ts[o].k == L_PAREN && matching(ts, o) == Some(j));
+                let name = open.and_then(|o| prev_sig(ts, o));
+                (name.is_some_and(|n| string_builtin(ts, n)), false)
+            }
             _ => (false, false),
         }
     }
@@ -3712,7 +3726,11 @@ impl<'a> Cx<'a> {
                         matches!(ts[p].k, OP | L_PAREN | COMMA)
                             || ts[p].k == IDENT && is_clause_word(&ts[p].s)
                     });
-                    if !unary && (l.0 || r.0) {
+                    // `+` with a number is addition in T-SQL even next to a
+                    // string (int has the higher precedence: `'1' + 1` is 2), so
+                    // it stays `+` and fails on the target instead of becoming
+                    // a different value.
+                    if !unary && (l.0 || r.0) && !(l.1 || r.1) {
                         self.note(Status::Assumptions, "ASM-CONCAT-NULL", "String + becomes ||; both give NULL when an operand is NULL (CONCAT_NULL_YIELDS_NULL ON, the default).");
                         o.push_str("||");
                     } else {
@@ -3768,7 +3786,14 @@ impl<'a> Cx<'a> {
                     }
                     if let Some(p) = nx.filter(|&p| ts[p].k == L_PAREN) {
                         if let Some(r) = matching(ts, p) {
-                            if let Some(s) = self.func(&up, &ts[p + 1..r]) {
+                            // `dbo.CHAR(5)` is a user function, not the built-in.
+                            let qualified = prev_sig(ts, i).is_some_and(|d| ts[d].k == DOT);
+                            let rewritten = if qualified {
+                                None
+                            } else {
+                                self.func(&up, &ts[p + 1..r])
+                            };
+                            if let Some(s) = rewritten {
                                 o.push_str(&s);
                                 i = r + 1;
                                 continue;
@@ -4092,6 +4117,21 @@ impl<'a> Cx<'a> {
                 format!("strpos({y}, {x})")
             }
             ("NEWID", 0) => "gen_random_uuid()".into(),
+            ("DB_NAME", 0) => "current_database()".into(),
+            // Code points 1 to 127 are the same character in every code page and in
+            // Unicode. 0 (`chr(0)` is an error), 128 to 255 (the database's code
+            // page decides) and a value only known at run time stay unconverted.
+            ("CHAR", 1) => {
+                let text: String = a[0]
+                    .iter()
+                    .filter(|t| t.sig())
+                    .map(|t| t.s.as_str())
+                    .collect();
+                match text.parse::<u8>() {
+                    Ok(code @ 1..=127) => format!("chr({code})"),
+                    _ => return None,
+                }
+            }
             ("QUOTENAME", 1) => {
                 self.note(Status::Assumptions, "ASM-QUOTENAME-IDENT", "QUOTENAME becomes quote_ident: both make the value usable as one identifier, but quote_ident adds double quotes only when needed and QUOTENAME returns NULL for more than 128 characters. Equal only where the result is used as a PostgreSQL identifier, never as text.");
                 format!("quote_ident({})", e(self, 0))
@@ -5355,6 +5395,13 @@ fn date_part(p: &str) -> Option<&'static str> {
         "second" | "ss" | "s" => "second",
         _ => return None,
     })
+}
+
+/// A T-SQL built-in whose result is always a string, so `+` next to a call
+/// to it is concatenation.
+fn string_builtin(ts: &[T], i: usize) -> bool {
+    let qualified = prev_sig(ts, i).is_some_and(|d| ts[d].k == DOT);
+    !qualified && ["CHAR", "NCHAR", "DB_NAME"].iter().any(|w| ts[i].is(w))
 }
 
 /// A date-time text whose fractional seconds PostgreSQL's microseconds

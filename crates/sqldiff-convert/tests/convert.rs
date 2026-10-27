@@ -1219,3 +1219,87 @@ fn deep_nesting_does_not_overflow_the_engine_stack() {
     let c = sqldiff_core::with_engine_stack(|| tsql(&text));
     assert!(!c.units.is_empty());
 }
+
+#[test]
+fn char_of_an_ascii_code_becomes_chr() {
+    let src = "SELECT 'a' + CHAR(13) + CHAR(10) + 'b' AS s;";
+    let c = tsql(src);
+    let u = unit(&c, src, "SELECT");
+    let out = out_of(&c, u);
+    assert!(out.contains("chr(13)") && out.contains("chr(10)"), "{out}");
+    assert!(!out.to_uppercase().contains("CHAR("), "{out}");
+    // `+` between two calls is concatenation: PostgreSQL has no text + text.
+    assert!(out.contains("chr(13) || chr(10)"), "{out}");
+    assert!(!out.contains('+'), "{out}");
+}
+
+#[test]
+fn plus_next_to_a_string_builtin_is_concatenation() {
+    let src = "DECLARE @s varchar(200) = DB_NAME() + CHAR(9);";
+    let c = tsql(src);
+    let out = c.output.clone();
+    assert!(out.contains("current_database() || chr(9)"), "{out}");
+}
+
+#[test]
+fn plus_with_a_number_stays_addition() {
+    // T-SQL converts the string side to a number: `CHAR(49) + 1` is 2 and
+    // `'1' + 1` is 2. `||` would give '11'.
+    for (src, keep) in [
+        ("UPDATE t SET a = CHAR(49) + 1;", "chr(49) + 1"),
+        ("UPDATE t SET a = '1' + 1;", "'1' + 1"),
+        ("UPDATE t SET a = 1 + CHAR(49);", "1 + chr(49)"),
+    ] {
+        let c = tsql(src);
+        let out = c.output.clone();
+        assert!(out.contains(keep), "{src}: {out}");
+        assert!(!out.contains("||"), "{src}: {out}");
+    }
+}
+
+#[test]
+fn qualified_char_is_a_user_function() {
+    // `x.CHAR(5)` is a user function, so it is neither rewritten nor taken as
+    // a string for `+`.
+    let src = "UPDATE t SET a = x.CHAR(5) + x.CHAR(6);";
+    let c = tsql(src);
+    let out = c.output.clone();
+    assert!(!out.contains("chr("), "{out}");
+    assert!(!out.contains("||"), "{out}");
+}
+
+#[test]
+fn char_of_other_codes_is_not_converted() {
+    // 0 is an error in chr(), 128 to 255 depend on the code page, and a value
+    // known only at run time may be either.
+    for arg in ["0", "128", "200", "256", "@code"] {
+        let src = format!("SELECT CHAR({arg}) AS c;");
+        let c = tsql(&src);
+        let u = unit(&c, &src, "SELECT");
+        let out = out_of(&c, u);
+        assert!(!out.contains("chr("), "CHAR({arg}): {out}");
+        assert_ne!(u.status, Status::Converted, "CHAR({arg}): {out}");
+    }
+}
+
+#[test]
+fn db_name_without_an_argument_becomes_current_database() {
+    let src = "SELECT DB_NAME() AS n;";
+    let c = tsql(src);
+    let u = unit(&c, src, "SELECT");
+    assert!(
+        out_of(&c, u).contains("current_database()"),
+        "{}",
+        out_of(&c, u)
+    );
+}
+
+#[test]
+fn db_name_of_an_id_is_not_converted() {
+    let src = "SELECT DB_NAME(5) AS n;";
+    let c = tsql(src);
+    let u = unit(&c, src, "SELECT");
+    let out = out_of(&c, u);
+    assert!(!out.contains("current_database"), "{out}");
+    assert_ne!(u.status, Status::Converted, "{out}");
+}

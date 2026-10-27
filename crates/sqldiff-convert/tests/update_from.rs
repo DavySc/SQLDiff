@@ -163,3 +163,46 @@ fn db2_keeps_refusing_update_from() {
     );
     assert_eq!(c.units.last().unwrap().status, Status::NotConverted);
 }
+
+/// The assignments of an `UPDATE` can be a placeholder a generator fills, so
+/// the template has no `SET` word. The rules cannot see what is assigned and
+/// refuse the statement; they must not stop on the file.
+#[test]
+fn update_from_with_placeholder_assignments_is_refused_not_a_panic() {
+    use sqldiff_convert::tree::{self, TemplateMode};
+
+    let dir = std::env::temp_dir().join(format!("sqldiff-uf-set-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("body.sql"),
+        "update t1\n<%ASSIGNMENTS%>\nfrom some_table t1\n",
+    )
+    .unwrap();
+    let def: sqldiff_source::pack::TemplateSyntax =
+        serde_json::from_value(serde_json::json!({ "open": "<%", "close": "%>" })).unwrap();
+    let a = tree::Args {
+        src: dir.clone(),
+        from: Dialect::Tsql,
+        to: Dialect::Postgres,
+        jobs: Some(1),
+        no_catalog: true,
+        template: Some(TemplateMode::new(&def, None).unwrap()),
+        extensions: tree::extensions(Vec::new()),
+        helpers: Vec::new(),
+    };
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let t = tree::convert(&a, &inputs, unreadable, None).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let rules: Vec<&str> = t.conversions[0]
+        .units
+        .iter()
+        .flat_map(|u| u.notes.iter().map(|n| n.rule.as_str()))
+        .collect();
+    assert!(!rules.contains(&"internal-error"), "{rules:?}");
+    assert_eq!(
+        t.conversions[0].units.last().unwrap().status,
+        Status::NotConverted,
+        "{rules:?}"
+    );
+}

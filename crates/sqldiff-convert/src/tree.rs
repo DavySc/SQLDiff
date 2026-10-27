@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use crate::{Conversion, FragmentKind, StandIns, Status, ValueKind};
 use serde::Serialize;
+use sqldiff_core::catalog::builtins::Helper;
 use sqldiff_core::catalog::{ddl, Catalog};
 use sqldiff_core::{Dialect, Options};
 use sqldiff_source::compose;
@@ -44,6 +45,9 @@ pub struct Args {
     pub template: Option<TemplateMode>,
     /// File extensions to read, without the dot, any letter case.
     pub extensions: Vec<String>,
+    /// Pack helper functions: routines the dialects provide that no file in
+    /// the tree defines. The output's check resolves calls to them.
+    pub helpers: Vec<Helper>,
 }
 
 /// How templates are read: the placeholder rules of `diff --template`.
@@ -461,7 +465,10 @@ fn convert_files(
             hand_written_draft(l, i, d);
         }
     }
-    let mut opts = Options::default();
+    let mut opts = Options {
+        helpers: a.helpers.clone(),
+        ..Options::default()
+    };
     if let Some(source) = source {
         opts.facts_a = vec![source];
         opts.facts_b = vec![Arc::new(catalog(
@@ -806,7 +813,10 @@ fn convert_templates(
             source.as_deref(),
         )
     });
-    let mut opts = Options::default();
+    let mut opts = Options {
+        helpers: a.helpers.clone(),
+        ..Options::default()
+    };
     if let Some(source) = source {
         opts.facts_a = vec![source];
         opts.facts_b = vec![Arc::new(catalog(
