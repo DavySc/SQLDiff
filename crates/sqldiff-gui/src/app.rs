@@ -4,6 +4,10 @@
 //! - `GET /api/fs?path=`: a folder listing for the file picker (see `browse`)
 //! - `POST /api/open/compare` `{"a", "b", "dialect_a"?, "dialect_b"?}`: open
 //!   (or replace) the compare session on two files or two folders
+//!
+//! The last two answer only when the server is bound to a loopback address:
+//! bound to a network address (`--host`), anyone who can reach it could
+//! otherwise browse the disk and read any file through a comparison.
 //! - `GET /convert`, `POST /api/convert`, `POST /api/compare`: convert mode
 //!   (see `convert`)
 //! - `GET /compare`, `/compare/api/...`: the pair view or tree queue of a
@@ -80,7 +84,13 @@ struct Shared {
     review: Option<Mutex<Review>>,
     data_dir: Option<PathBuf>,
     isolated: bool,
+    /// Bound to a loopback address: only then can files be picked.
+    local: bool,
 }
+
+/// Why picking files is refused on a server bound to a network address.
+const NOT_LOCAL: &str = "picking files works only when the app listens on this computer alone \
+(127.0.0.1); start it without --host, or open comparisons with `sqldiff-gui serve A B`";
 
 impl Shared {
     fn compare(&self) -> Option<Arc<Mutex<Session>>> {
@@ -100,12 +110,14 @@ impl Shared {
 }
 
 pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io::Result<()> {
+    let local = listener.local_addr()?.ip().is_loopback();
     let shared = Arc::new(Shared {
         convert: app.convert,
         compare: Mutex::new(app.compare.map(|s| Arc::new(Mutex::new(s)))),
         review: app.review.map(Mutex::new),
         data_dir: app.data_dir,
         isolated: app.isolated,
+        local,
     });
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
@@ -133,6 +145,9 @@ fn handle(mut stream: TcpStream, app: &Shared, hosts: &[String]) -> std::io::Res
 fn route(app: &Shared, req: Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => return page(app, View::Home, home(app)),
+        ("GET", "/api/fs") | ("POST", "/api/open/compare") if !app.local => {
+            return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string())
+        }
         ("GET", "/api/fs") => {
             return match browse::list(&param(&req.query, "path").unwrap_or_default()) {
                 Ok(l) => json(&l),
@@ -294,6 +309,8 @@ struct Home {
     recent: Vec<Recent>,
     /// Every dialect, for the compare form: `(id, name)`.
     dialects: Vec<(&'static str, &'static str)>,
+    /// Why files cannot be picked here, if they cannot.
+    no_picking: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -359,6 +376,7 @@ fn home(app: &Shared) -> String {
             .iter()
             .map(|d| (d.id(), d.display_name()))
             .collect(),
+        no_picking: (!app.local).then_some(NOT_LOCAL),
     };
     let json = serde_json::to_string(&payload)
         .unwrap()

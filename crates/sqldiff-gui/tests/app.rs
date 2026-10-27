@@ -339,3 +339,36 @@ fn a_comparison_opened_from_home_replaces_the_session_and_is_remembered() {
     assert_eq!(recent[1].dialect_b.as_deref(), Some("tsql"));
     assert!(home.contains(r#""recent":[{"a":"#), "{home}");
 }
+
+#[test]
+fn files_cannot_be_picked_or_opened_on_a_network_address() {
+    let d = Dir::new("lan");
+    let a = d.write("a.sql", "SELECT 1;\n");
+    // Bound to every interface: reachable from other machines.
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
+        .parse()
+        .unwrap();
+    std::thread::spawn(move || serve(listener, app(None, None), &[]));
+    let (status, body) = get(addr, &format!("/api/fs?path={}", d.0.display()));
+    assert_eq!(status, "HTTP/1.1 403 Forbidden", "{body}");
+    assert!(!body.contains("a.sql"));
+    let open = serde_json::json!({ "a": a, "b": a }).to_string();
+    assert_eq!(
+        request(addr, "POST", "/api/open/compare", &open).0,
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/convert"]);
+    let (_, home) = get(addr, "/");
+    assert!(
+        home.contains(r#""no_picking":"picking files works only"#),
+        "{home}"
+    );
+    // On loopback the same requests are answered.
+    let addr = start(app(None, None));
+    assert_eq!(
+        get(addr, &format!("/api/fs?path={}", d.0.display())).0,
+        "HTTP/1.1 200 OK"
+    );
+    assert!(get(addr, "/").1.contains(r#""no_picking":null"#));
+}

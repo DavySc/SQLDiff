@@ -131,6 +131,10 @@ function render(d) {
     (c.name ? path(c.name) : "Type or paste SQL and see it converted and checked as you type") + (c.template ? " · template" : ""), "Open"));
   $("opened").innerHTML = `<div style="display:grid;gap:10px"><h2>Open</h2>${open.join("")}</div>`;
   $("cmp-h").textContent = cmp ? "Compare something else" : "Compare files or folders";
+  if (d.no_picking) {
+    $("cmp").hidden = true;
+    $("cmp-h").insertAdjacentHTML("afterend", closed("Not available on a network address", esc(d.no_picking.charAt(0).toUpperCase() + d.no_picking.slice(1)) + "."));
+  }
   const opts = `<option value="">Dialect: auto</option>` + d.dialects.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join("");
   $("cmp-da").innerHTML = opts; $("cmp-db").innerHTML = opts;
   const rec = $("recent");
