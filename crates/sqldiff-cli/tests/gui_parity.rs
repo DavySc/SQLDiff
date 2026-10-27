@@ -73,8 +73,8 @@ fn finish(run: &Run) -> State {
 }
 
 /// Runs the sheet's command for this platform's shell from `elsewhere`,
-/// with `sqldiff` on the PATH.
-fn run_sheet(sheet: &Sheet, elsewhere: &Path) -> std::process::Output {
+/// with `sqldiff` on the PATH and `$SQLDIFF_CONFIG` naming another file.
+fn run_sheet(sheet: &Sheet, elsewhere: &Path, other_user: &Path) -> std::process::Output {
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_sqldiff"));
     let mut path = vec![bin.parent().unwrap().to_path_buf()];
     path.extend(std::env::split_paths(
@@ -96,23 +96,26 @@ fn run_sheet(sheet: &Sheet, elsewhere: &Path) -> std::process::Output {
     };
     c.current_dir(elsewhere)
         .env("PATH", std::env::join_paths(path).unwrap())
+        .env("SQLDIFF_CONFIG", other_user)
         .output()
         .unwrap()
 }
 
 #[test]
 fn the_run_sheet_command_writes_what_the_run_wrote() {
-    // One test: the user config is named by the environment, for the app
-    // (this process) and the command alike.
+    // One test: the app's user config is named by the environment (of this
+    // process); the commands run with another, broken one in theirs.
     let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     let user = d.join("user config.toml");
     write(&user, "");
     std::env::set_var("SQLDIFF_CONFIG", &user);
-    // The commands run from a folder whose config would break them, so a
-    // command that read config from where it is run fails.
+    // The commands run from a folder and an environment whose config would
+    // break them, so a command that found config where it is run fails.
     let elsewhere = d.join("elsewhere");
     write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    let other_user = d.join("other user.toml");
+    write(&other_user, "not a config [\n");
 
     // A tree with a project config that changes the conversion, in a folder
     // whose name needs quoting in either shell.
@@ -165,7 +168,7 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
         let o = args.iter().position(|a| a == "-o").unwrap() + 1;
         args[o] = cli.display().to_string();
         assert_eq!(sheet.args, args);
-        let o = run_sheet(&sheet, &elsewhere);
+        let o = run_sheet(&sheet, &elsewhere, &other_user);
         let err = String::from_utf8_lossy(&o.stderr);
         assert!(
             o.status.code().is_some_and(|c| c <= 1),
@@ -181,30 +184,38 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
                     Some(root.join("sqldiff.toml").display().to_string())
                 );
                 assert!(c.args.contains(&"--config".to_string()));
-                assert_eq!(c.cwd, None);
             }
             "isolated" => {
                 assert_eq!((&c.project_config, &c.user_config), (&None, &None));
-                assert!(c.args.contains(&"--isolated".to_string()));
+                assert!(!c.args.contains(&"--user-config".to_string()));
             }
             _ => {
                 assert_eq!(c.project_config, None);
-                assert_eq!(c.cwd, Some(bare.display().to_string()));
+                assert!(!c.args.contains(&"--config".to_string()));
             }
         }
         if name != "isolated" {
             assert_eq!(c.user_config, Some(user.display().to_string()));
+            assert!(c.args.contains(&"--user-config".to_string()));
         }
         assert_eq!(c.args.contains(&"--overwrite".to_string()), overwrite);
+        assert!(c.args.contains(&"--isolated".to_string()));
         sheets.push(sheet);
     }
     // The project config the sheet names is the one the command reads.
     write(&root.join("sqldiff.toml"), "not a config [\n");
     std::fs::remove_dir_all(d.join("cli project")).unwrap();
-    let o = run_sheet(&sheets[0], &elsewhere);
+    let o = run_sheet(&sheets[0], &elsewhere, &other_user);
     let err = String::from_utf8_lossy(&o.stderr);
     assert_eq!(o.status.code(), Some(2), "{err}");
     assert!(err.contains("sqldiff.toml"), "{err}");
+    // So is the user config, though the environment names another.
+    write(&user, "not a config [\n");
+    std::fs::remove_dir_all(d.join("cli no-project")).unwrap();
+    let o = run_sheet(&sheets[2], &elsewhere, &d.join("absent.toml"));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(2), "{err}");
+    assert!(err.contains("user config.toml"), "{err}");
     std::env::remove_var("SQLDIFF_CONFIG");
     let _ = std::fs::remove_dir_all(&d);
 }

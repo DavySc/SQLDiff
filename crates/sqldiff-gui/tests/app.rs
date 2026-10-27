@@ -451,7 +451,7 @@ fn a_run_converts_a_tree_and_opens_its_own_review() {
         "{c}"
     );
     assert_eq!(
-        (&c["cwd"], &c["project_config"]),
+        (&c["user_config"], &c["project_config"]),
         (&serde_json::Value::Null, &serde_json::Value::Null)
     );
     assert!(

@@ -186,8 +186,8 @@ function sheet(r) {
   const cfg = [
     c.project_config ? `<li>Project config <span class="path">${esc(c.project_config)}</span></li>` : "",
     c.user_config ? `<li>User config <span class="path">${esc(c.user_config)}</span></li>` : "",
-    c.cwd ? `<li>No project config was found; run it in <span class="path">${esc(c.cwd)}</span> (the command does), or a <code>sqldiff.toml</code> found from elsewhere changes the result</li>` : "",
-    c.args.includes("--isolated") ? `<li>Config files ignored, as the app was started with <code>--isolated</code></li>` : "",
+    !c.project_config && !c.user_config ? `<li>No config files were loaded</li>` : "",
+    `<li><code>--isolated</code> keeps the command to these files, wherever and however it is run</li>`,
   ].join("");
   return `<details class="cmd" data-run="${r.id}"${shown.has(r.id) ? " open" : ""}><summary>Command line</summary>`
     + `<div class="shells" role="group" aria-label="Shell">${[["powershell", "PowerShell"], ["sh", "sh / bash"]].map(([k, l]) => `<button type="button" data-shell="${k}" class="${k === shell ? "on" : ""}" aria-pressed="${k === shell}">${l}</button>`).join("")}<button type="button" class="copy outline" data-copy="${r.id}">Copy</button></div>`

@@ -60,14 +60,14 @@ pub enum State {
     },
 }
 
-/// The `sqldiff convert` command that writes what a run writes.
+/// The `sqldiff convert` command that writes what a run writes. It names
+/// every config file the run loaded and finds no other (`--isolated`), so
+/// it loads the same config whatever folder, environment or `sqldiff` on
+/// the PATH it is run with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Command {
     /// The arguments after the program.
     pub args: Vec<String>,
-    /// Where to run it when no project config pins the config: the folder
-    /// the run looked for `sqldiff.toml` from.
-    pub cwd: Option<String>,
     /// The config files the run loaded, by path.
     pub project_config: Option<String>,
     pub user_config: Option<String>,
@@ -100,22 +100,15 @@ impl Command {
                 config::user_config_path().filter(|p| p.is_file()),
             ),
         };
-        // With the project file named, the command loads the same config
-        // from any folder; without one it must find none either.
-        let cwd = match (isolated, &project) {
-            (true, _) => {
-                args.push("--isolated".into());
-                None
-            }
-            (false, Some(p)) => {
-                args.extend(["--config".into(), path(p)]);
-                None
-            }
-            (false, None) => Some(path(dir)),
-        };
-        let line = |cd: String, program: String, quote: fn(&str) -> String| {
-            let mut l = cd;
-            l.push_str(&program);
+        args.push("--isolated".into());
+        if let Some(p) = &project {
+            args.extend(["--config".into(), path(p)]);
+        }
+        if let Some(p) = &user {
+            args.extend(["--user-config".into(), path(p)]);
+        }
+        let line = |program: String, quote: fn(&str) -> String| {
+            let mut l = program;
             for a in &args {
                 l.push(' ');
                 l.push_str(&quote(a));
@@ -127,27 +120,9 @@ impl Command {
             p => format!("& {p}"),
         };
         Command {
-            powershell: line(
-                cwd.as_deref()
-                    .map(|d| {
-                        format!(
-                            "Set-Location -LiteralPath {} -ErrorAction Stop; ",
-                            powershell_quote(d)
-                        )
-                    })
-                    .unwrap_or_default(),
-                ps_program,
-                powershell_quote,
-            ),
-            sh: line(
-                cwd.as_deref()
-                    .map(|d| format!("cd {} && ", sh_quote(d)))
-                    .unwrap_or_default(),
-                sh_quote(program),
-                sh_quote,
-            ),
+            powershell: line(ps_program, powershell_quote),
+            sh: line(sh_quote(program), sh_quote),
             args,
-            cwd,
             project_config: project.as_deref().map(path),
             user_config: user.as_deref().map(path),
         }

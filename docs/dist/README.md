@@ -38,7 +38,8 @@ lists how many units landed on each status and Review opens what it wrote. A
 run writes exactly what `sqldiff convert src/ out/ --from … --to …` writes,
 with the project config found from the source folder upward. Each run's Command line shows that
 command for PowerShell and for sh, ready to copy into a script or pipeline,
-with the config files it loaded by path. Runs are listed until the app is
+naming the config files it loaded (and, with `--isolated`, no others), so
+it writes the same from any folder or terminal. Runs are listed until the app is
 closed; the output folder and its review ledger stay.
 
 The rail on the left switches between Home, Runs, Compare, Convert and Review
