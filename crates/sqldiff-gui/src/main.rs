@@ -6,6 +6,9 @@
 //! read-only HTML file; `review` serves a converted tree's review queue and
 //! records decisions in its ledger. Without a command (a double-click in a distribution)
 //! it serves convert mode and opens the browser.
+//!
+//! `serve`, `convert` and `review` all start the app (see `app`): one
+//! server with every view behind a rail, the one the command opened shown first.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -13,8 +16,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use sqldiff_core::Dialect;
+use sqldiff_gui::app::{self, App, View};
 use sqldiff_gui::review::Store;
-use sqldiff_gui::server::serve_with_hosts;
 use sqldiff_gui::session::{Origin, Session, TemplateMode};
 use sqldiff_gui::{convert, convert_review};
 use sqldiff_source::compose::Placeholders;
@@ -275,20 +278,40 @@ fn launch() -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", 7878))
         .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
         .map_err(|e| e.to_string())?;
-    let url = url(&listener)?;
+    let url = url(&listener)? + "convert";
     println!("SQLDiff: {url}");
     println!("Keep this window open while you work; closing it stops SQLDiff.");
     if let Err(e) = open_browser(&url) {
         println!("Could not open a browser ({e}); open {url} yourself.");
     }
-    let setup = convert::Setup {
+    let app = App {
+        convert: sample(),
+        compare: None,
+        review: None,
+    };
+    app::serve(listener, app, &[]).map_err(|e| e.to_string())
+}
+
+/// Serves the app, its address printed with `view` open.
+fn start(
+    listener: TcpListener,
+    app: App,
+    view: View,
+    allow_hosts: &[String],
+) -> Result<(), String> {
+    println!("SQLDiff: {}{}", url(&listener)?, &view.path()[1..]);
+    app::serve(listener, app, allow_hosts).map_err(|e| e.to_string())
+}
+
+/// Convert mode's start without a file: T-SQL → PostgreSQL with the sample.
+fn sample() -> convert::Setup {
+    convert::Setup {
         from: Dialect::Tsql,
         to: Dialect::Postgres,
         template: None,
         text: convert::SAMPLE.to_string(),
         name: String::new(),
-    };
-    convert::serve(listener, setup, &[]).map_err(|e| e.to_string())
+    }
 }
 
 fn open_browser(url: &str) -> std::io::Result<()> {
@@ -329,19 +352,19 @@ fn run(cli: Cli) -> Result<(), String> {
             if pair.a.is_none() && pair.report.is_none() {
                 // Nothing to compare yet: open convert mode, whose Compare
                 // switch diffs scratch texts.
-                println!("SQLDiff: {}", url(&listener)?);
-                let setup = convert::Setup {
-                    from: Dialect::Tsql,
-                    to: Dialect::Postgres,
-                    template: None,
-                    text: convert::SAMPLE.to_string(),
-                    name: String::new(),
+                let app = App {
+                    convert: sample(),
+                    compare: None,
+                    review: None,
                 };
-                return convert::serve(listener, setup, &allow_hosts).map_err(|e| e.to_string());
+                return start(listener, app, View::Convert, &allow_hosts);
             }
-            let session = open(pair)?;
-            println!("SQLDiff: {}", url(&listener)?);
-            serve_with_hosts(listener, session, &allow_hosts).map_err(|e| e.to_string())
+            let app = App {
+                convert: sample(),
+                compare: Some(open(pair)?),
+                review: None,
+            };
+            start(listener, app, View::Compare, &allow_hosts)
         }
         Command::Convert {
             file,
@@ -413,8 +436,12 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Err(format!("no conversion rules from {from} to {to} yet"));
             }
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-            println!("SQLDiff convert: {}", url(&listener)?);
-            convert::serve(listener, setup, &allow_hosts).map_err(|e| e.to_string())
+            let app = App {
+                convert: setup,
+                compare: None,
+                review: None,
+            };
+            start(listener, app, View::Convert, &allow_hosts)
         }
         Command::Review {
             src,
@@ -465,9 +492,13 @@ fn run(cli: Cli) -> Result<(), String> {
                 instances,
             })?;
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-            println!("SQLDiff review: {}", url(&listener)?);
             println!("decisions go to {}", review.ledger_path().display());
-            convert_review::serve(listener, review, &allow_hosts).map_err(|e| e.to_string())
+            let app = App {
+                convert: sample(),
+                compare: None,
+                review: Some(review),
+            };
+            start(listener, app, View::Review, &allow_hosts)
         }
         Command::Export { pair, output } => {
             let session = open(pair)?;

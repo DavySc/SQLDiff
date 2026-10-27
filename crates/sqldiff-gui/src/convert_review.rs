@@ -248,6 +248,11 @@ impl Review {
         Ok(Review { setup, loaded })
     }
 
+    /// What the review was opened on.
+    pub fn setup(&self) -> &Setup {
+        &self.setup
+    }
+
     pub fn ledger_path(&self) -> PathBuf {
         self.setup.out.join(review::LEDGER_FILE)
     }
@@ -837,7 +842,7 @@ fn param(query: &str, key: &str) -> Option<String> {
     crate::server::param(query, key)
 }
 
-fn route(r: &Mutex<Review>, req: &Request) -> Response {
+pub(crate) fn route(r: &Mutex<Review>, req: &Request) -> Response {
     let all = param(&req.query, "all").is_some_and(|v| v != "0");
     let mut s = r.lock().unwrap_or_else(|e| e.into_inner());
     match (req.method.as_str(), req.path.as_str()) {
