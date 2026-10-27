@@ -532,14 +532,18 @@ impl Interp<'_> {
     fn initial(&self) -> State {
         let mode = self.prof.routine_mode(self.cfg.routine.key());
         let sc = self.sc;
+        // An error inside a T-SQL trigger aborts the batch and dooms the
+        // transaction whatever the caller set: the body runs as XACT_ABORT ON
+        // until it sets the option itself.
+        let trigger = self.cfg.dialect == Dialect::Tsql && self.cfg.routine == RoutineKind::Trigger;
         let mut st = State {
             depth: 0,
             caller_depth: 0,
             owner: Owner::Autocommit,
             no_commit: false,
             doomed: false,
-            xact_abort: sc.xact_abort,
-            xact_abort_local: false,
+            xact_abort: sc.xact_abort || trigger,
+            xact_abort_local: trigger,
             implicit: sc.implicit_transactions,
             live: vec![None; self.keys.names.len()],
             effect_nodes: BTreeMap::new(),

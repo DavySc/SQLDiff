@@ -24,6 +24,7 @@ use crate::{Note, Status};
 
 mod bits;
 mod temporal;
+mod trigger;
 
 const INDENT: usize = 2;
 
@@ -74,6 +75,7 @@ pub(crate) fn convert(
         bit_outer: None,
         bit_aliases: Vec::new(),
         ret_bit: false,
+        trigger: None,
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -188,6 +190,8 @@ struct Cx<'a> {
     bit_aliases: Vec<String>,
     /// The function being converted returns BIT.
     ret_bit: bool,
+    /// The trigger whose body is being converted, for one of its events.
+    trigger: Option<trigger::Trig>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -376,7 +380,7 @@ impl<'a> Cx<'a> {
             "FUNCTION" => cx.proc_or_func(out, r, true),
             "VIEW" => cx.view(r),
             "TRIGGER" if cx.db2() => no("triggers: Db2 for i triggers are row or statement triggers with REFERENCING NEW/OLD (TABLE); inserted/deleted need a rewrite"),
-            "TRIGGER" => no("triggers: PostgreSQL needs a trigger function plus CREATE TRIGGER, and inserted/deleted become NEW/OLD or transition tables"),
+            "TRIGGER" => cx.trigger(r),
             _ => no("unrecognised routine"),
         });
         match res {
@@ -830,6 +834,9 @@ impl<'a> Cx<'a> {
         if Self::range(n).0 < *joined {
             return;
         }
+        if self.trigger_guard(out, n, indent) {
+            return;
+        }
         if let Some(next) = adjacent_unit(els, i) {
             if self.idiom_pair(out, n, &next, indent) {
                 *joined = Self::range(&next).1;
@@ -865,6 +872,7 @@ impl<'a> Cx<'a> {
     /// TRY/CATCH, where the rules' plain statements mean what they say.
     fn idiom_pair(&mut self, out: &mut Out, a: &SyntaxNode, b: &SyntaxNode, indent: usize) -> bool {
         if !matches!(self.mode, Mode::Proc | Mode::Do)
+            || self.trigger.is_some()
             || self.in_try
             || self.in_catch
             || a.kind() != STATEMENT
@@ -889,6 +897,7 @@ impl<'a> Cx<'a> {
     /// (RETURN, THROW, transaction control, result sets), never a compound.
     fn idiom_single(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) -> bool {
         if self.context
+            || self.trigger.is_some()
             || !matches!(
                 first_word(n).as_str(),
                 "INSERT" | "UPDATE" | "DELETE" | "MERGE"
@@ -2197,6 +2206,7 @@ impl<'a> Cx<'a> {
     fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         let cat = self.type_catalog()?;
+        let name = self.image_table(name);
         let parts: Vec<Ident> = match name {
             [.., s, t] if s != "dbo" => vec![Ident::plain(s.clone()), Ident::plain(t.clone())],
             [.., t] => vec![Ident::plain(t.clone())],
@@ -2517,6 +2527,10 @@ impl<'a> Cx<'a> {
             }
         });
         match (self.mode, val) {
+            (Mode::Func, None) if self.trigger.is_some() => Ok("RETURN NULL".into()),
+            (Mode::Func, Some(_)) if self.trigger.is_some() => {
+                self.misplaced("RETURN with a value in a trigger")
+            }
             (Mode::Func, Some(v)) => Ok(format!("RETURN {v}")),
             (Mode::Proc, Some(v)) if self.db2() => {
                 self.return_code = true;
@@ -2566,6 +2580,9 @@ impl<'a> Cx<'a> {
     }
 
     fn txn(&mut self, kw: &str, ts: &[T]) -> R<String> {
+        if self.trigger.is_some() {
+            return self.misplaced(trigger::TXN);
+        }
         // A name after TRAN/TRANSACTION/WORK: a transaction or savepoint name.
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
@@ -2657,6 +2674,9 @@ impl<'a> Cx<'a> {
         };
         if s.len() != 3 || ts[j].k == VARIABLE {
             return no("SAVE TRANSACTION with a variable name");
+        }
+        if self.trigger.is_some() {
+            return self.misplaced(trigger::TXN);
         }
         if self.mode == Mode::Func {
             return self.misplaced("transaction control inside a function");
@@ -3706,6 +3726,10 @@ impl<'a> Cx<'a> {
                     o.push_str(&t.s);
                     self.string_compare(ts, i);
                 }
+                IDENT if from_item_start(ts, i) && self.missing_image(ts, i).is_some() => {
+                    let r = self.missing_image(ts, i).unwrap();
+                    o.push_str(&r);
+                }
                 IDENT => {
                     let up = t.up();
                     let nx = next_sig(ts, i);
@@ -3823,6 +3847,9 @@ impl<'a> Cx<'a> {
     /// A FROM table of a DELETE join; a table function gets Db2's TABLE().
     fn leaf_text(&mut self, leaf: &Leaf) -> String {
         let ts = trimmed(leaf.toks);
+        if let Some(r) = self.missing_image(ts, 0) {
+            return format!("{r}{}", self.expr(&ts[1..])).trim().to_string();
+        }
         if self.db2() && !leaf.table && !leaf.name.is_empty() {
             if let Some((call, end)) = self.table_function_db2(ts, 0) {
                 return format!("{call}{}", self.expr(&ts[end..]))
@@ -5914,7 +5941,7 @@ impl Cx<'_> {
             return None;
         }
         let cat = self.type_catalog()?;
-        let parts: Vec<Ident> = match e.name.as_slice() {
+        let parts: Vec<Ident> = match self.image_table(&e.name) {
             [.., s, t] if s != "dbo" => vec![Ident::plain(s.clone()), Ident::plain(t.clone())],
             [.., t] => vec![Ident::plain(t.clone())],
             [] => return None,
