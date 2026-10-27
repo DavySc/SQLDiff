@@ -12,6 +12,8 @@
 //!   `sqldiff instances` does
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
+//! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
+//!   editor (see `settings`)
 //! - `GET /convert`, `POST /api/convert`, `POST /api/compare`: convert mode
 //!   (see `convert`)
 //! - `GET /compare`, `/compare/api/...`: the pair view or tree queue of a
@@ -48,6 +50,7 @@ use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
 use crate::session::{Origin, Session};
+use crate::settings;
 use crate::{browse, server};
 
 /// The home page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
@@ -55,6 +58,9 @@ pub const HOME_HTML: &str = include_str!("../assets/home.html");
 
 /// The runs page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
 pub const RUNS_HTML: &str = include_str!("../assets/runs.html");
+
+/// The settings page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
+pub const SETTINGS_HTML: &str = include_str!("../assets/settings.html");
 
 /// The file picker, put into home and the runs page at `<!--__SQLDIFF_PICKER__-->`.
 const PICKER_HTML: &str = include_str!("../assets/picker.html");
@@ -80,6 +86,7 @@ pub enum View {
     Compare,
     Convert,
     Review,
+    Settings,
 }
 
 impl View {
@@ -92,6 +99,7 @@ impl View {
             View::Compare => "/compare",
             View::Convert => "/convert",
             View::Review => "/review",
+            View::Settings => "/settings",
         }
     }
 }
@@ -106,6 +114,8 @@ struct Shared {
     isolated: bool,
     /// Bound to a loopback address: only then can files be picked.
     local: bool,
+    /// This launch's token, which the settings page sends with its POSTs.
+    token: String,
 }
 
 /// Why picking files is refused on a server bound to a network address.
@@ -125,7 +135,7 @@ impl Shared {
     /// run's.
     fn href(&self, v: View) -> Option<String> {
         match v {
-            View::Home | View::Runs | View::Convert => Some(v.path().to_string()),
+            View::Home | View::Runs | View::Convert | View::Settings => Some(v.path().to_string()),
             View::Compare => self.compare().map(|_| v.path().to_string()),
             View::Review if self.review.is_some() => Some(v.path().to_string()),
             View::Review => self
@@ -148,6 +158,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         data_dir: app.data_dir,
         isolated: app.isolated,
         local,
+        token: settings::new_token(),
     });
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
@@ -183,10 +194,14 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         ("GET", "/api/runs") => {
             return json(&app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>())
         }
+        ("GET", "/settings") => return page(app, View::Settings, settings_page(app), ""),
         ("GET", "/api/fs")
         | ("POST", "/api/open/compare")
         | ("POST", "/api/runs")
         | ("POST", "/api/runs/instances")
+        | ("GET", "/api/settings")
+        | ("POST", "/api/settings/preview")
+        | ("POST", "/api/settings/save")
             if !app.local =>
         {
             return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string())
@@ -225,6 +240,13 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             }
         }
         _ => {}
+    }
+    let ctx = settings::Ctx {
+        isolated: app.isolated,
+        token: &app.token,
+    };
+    if let Some(res) = settings::route(&req, &ctx) {
+        return res;
     }
     if let Some(rest) = req.path.strip_prefix("/runs/") {
         let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -314,7 +336,7 @@ fn page(app: &Shared, view: View, html: String, base: &str) -> Response {
 /// The rail: one link per view, the current one marked; a view with nothing
 /// open is shown but not a link.
 fn rail(app: &Shared, current: View, here: &str) -> String {
-    const ITEMS: [(View, &str, &str, &str); 5] = [
+    const ITEMS: [(View, &str, &str, &str); 6] = [
         (
             View::Home,
             "Home",
@@ -344,6 +366,12 @@ fn rail(app: &Shared, current: View, here: &str) -> String {
             "Review",
             "Review a converted tree",
             r#"<path d="M10 7h10M10 12h10M10 17h10M4 7l1.2 1.2L7.5 6M4 12l1.2 1.2 2.3-2.2M4 17l1.2 1.2 2.3-2.2"/>"#,
+        ),
+        (
+            View::Settings,
+            "Settings",
+            "Config layers and the formatter's settings",
+            r#"<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>"#,
         ),
     ];
     let mut s = String::from(RAIL_STYLE);
@@ -603,6 +631,21 @@ fn runs_page(app: &Shared) -> String {
         .unwrap()
         .replace("</", "<\\/");
     RUNS_HTML
+        .replace(
+            "/*__SQLDIFF_PAYLOAD__*/null",
+            &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
+        )
+        .replace("<!--__SQLDIFF_PICKER__-->", PICKER_HTML)
+}
+
+fn settings_page(app: &Shared) -> String {
+    let json = serde_json::to_string(&settings::payload(
+        (!app.local).then_some(NOT_LOCAL),
+        &app.token,
+    ))
+    .unwrap()
+    .replace("</", "<\\/");
+    SETTINGS_HTML
         .replace(
             "/*__SQLDIFF_PAYLOAD__*/null",
             &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
