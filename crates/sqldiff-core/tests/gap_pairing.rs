@@ -1,0 +1,188 @@
+//! Statement pairing across dialects when one side holds a construct the
+//! comparison leaves out (a loop block, a not-converted placeholder): the
+//! statements after it are compared with their own counterparts, never one
+//! position off.
+
+use sqldiff_core::{diff, Artifact, Dialect, Options, Report};
+
+fn run(a: &str, b: &str) -> Report {
+    diff(
+        &Artifact::new("a.sql", Dialect::Tsql, a),
+        &Artifact::new("b.sql", Dialect::Postgres, b),
+        &Options::default(),
+    )
+}
+
+/// `(A line, B line)` of every statement pair the engine reported on.
+fn compared(r: &Report) -> Vec<(usize, usize)> {
+    r.findings
+        .iter()
+        .filter(|f| f.rule.starts_with("equiv."))
+        .filter_map(|f| Some((f.a.as_ref()?.start_line, f.b.as_ref()?.start_line)))
+        .collect()
+}
+
+const TSQL: &str = "CREATE PROCEDURE dbo.p @id int
+AS
+BEGIN
+    DECLARE @x int = 5;
+    SELECT @x = v FROM dbo.t WHERE id = @id GROUP BY v;
+    SET @x = @x + 1;
+    SET @x = @x * 2;
+    UPDATE dbo.t SET v = @x WHERE id = @id;
+END;
+";
+
+/// The converter's output for `TSQL`: the grouped assignment became a loop
+/// block (lines 8 to 14).
+const PG: &str = "CREATE OR REPLACE PROCEDURE p(p_id integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_x integer;
+BEGIN
+  v_x := 5;
+  DECLARE
+  sqldiff_r record;
+  BEGIN
+  FOR sqldiff_r IN SELECT v AS sqldiff_c1 FROM t WHERE id = p_id GROUP BY v LOOP
+  v_x := sqldiff_r.sqldiff_c1;
+  END LOOP;
+  END;
+  v_x := v_x + 1;
+  v_x := v_x * 2;
+  UPDATE t SET v = v_x WHERE id = p_id;
+END;
+$$;
+";
+
+#[test]
+fn statements_after_a_loop_block_meet_their_own_counterparts() {
+    let r = run(TSQL, PG);
+    // Before: A line 5 was compared with B line 15 and A line 6 with B line
+    // 16, two spurious findings.
+    assert_eq!(
+        compared(&r),
+        Vec::<(usize, usize)>::new(),
+        "{:#?}",
+        r.findings
+    );
+    assert!(
+        r.unknown_reasons.iter().any(|x| x.starts_with(
+            "side A (T-SQL) line 5: statement is not paired: its counterpart may be in a loop at side B (PostgreSQL) line 11"
+        )),
+        "{:#?}",
+        r.unknown_reasons
+    );
+    // Nothing else is left without a counterpart.
+    assert!(
+        !r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("no counterpart") || x.contains("more than one way")),
+        "{:#?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn a_real_difference_after_a_loop_block_names_the_right_lines() {
+    let r = run(TSQL, &PG.replace("v_x := v_x * 2;", "v_x := v_x * 3;"));
+    assert_eq!(compared(&r), vec![(7, 16)], "{:#?}", r.findings);
+    let f = r
+        .findings
+        .iter()
+        .find(|f| f.rule.starts_with("equiv."))
+        .unwrap();
+    assert!(
+        f.witness.contains("A has `2` where B has `3`"),
+        "{}",
+        f.witness
+    );
+}
+
+#[test]
+fn a_not_converted_placeholder_stands_for_its_statement() {
+    let tsql = "CREATE PROCEDURE dbo.p @id int
+AS
+BEGIN
+    DECLARE @x int = 1;
+    UPDATE dbo.t SET v = SUSER_SNAME() WHERE id = @id;
+    SET @x = @x + 1;
+    SET @x = @x * 2;
+END;
+";
+    let pg = "CREATE OR REPLACE PROCEDURE p(p_id integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_x integer;
+BEGIN
+  v_x := 1;
+  RAISE EXCEPTION 'sqldiff: statement at source line 5 was not converted';
+  v_x := v_x + 1;
+  v_x := v_x * 2;
+END;
+$$;
+";
+    let r = run(tsql, pg);
+    assert_eq!(
+        compared(&r),
+        Vec::<(usize, usize)>::new(),
+        "{:#?}",
+        r.findings
+    );
+    assert!(
+        r.unknown_reasons.iter().any(|x| x.starts_with(
+            "side A (T-SQL) line 5: statement is not paired: its counterpart may be in an error raise"
+        )),
+        "{:#?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn statements_that_line_up_in_two_ways_are_not_paired() {
+    // `SET @x = 1` could be the first loop and `SET @x = 2` the assignment,
+    // or the other way round: neither is compared.
+    let tsql = "CREATE PROCEDURE dbo.p
+AS
+BEGIN
+    DECLARE @x int;
+    SET @x = 1;
+    SET @x = 2;
+END;
+";
+    let pg = "CREATE OR REPLACE PROCEDURE p()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_x integer;
+BEGIN
+  WHILE v_x < 3 LOOP
+    v_x := v_x + 1;
+  END LOOP;
+  v_x := 2;
+  WHILE v_x < 5 LOOP
+    v_x := v_x + 1;
+  END LOOP;
+END;
+$$;
+";
+    let r = run(tsql, pg);
+    assert_eq!(
+        compared(&r),
+        Vec::<(usize, usize)>::new(),
+        "{:#?}",
+        r.findings
+    );
+    for line in [5, 6] {
+        let want = format!(
+            "side A (T-SQL) line {line}: statement is not paired: the statements around it line up with the other side in more than one way"
+        );
+        assert!(
+            r.unknown_reasons.contains(&want),
+            "{want}\n{:#?}",
+            r.unknown_reasons
+        );
+    }
+}
