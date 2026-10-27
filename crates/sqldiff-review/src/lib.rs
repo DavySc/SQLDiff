@@ -12,10 +12,12 @@
 //! - [`cache`]: per-content-hash cache of analysis results in the data directory.
 //! - [`crypto`]: optional encryption at rest for the store and the cache.
 
+pub mod branch;
 pub mod cache;
 pub mod crypto;
 pub mod history;
 pub mod markers;
+pub mod pipeline;
 pub mod redact;
 pub mod store;
 pub mod suppress;

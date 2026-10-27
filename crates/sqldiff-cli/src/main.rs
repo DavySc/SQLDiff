@@ -474,7 +474,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             opts.excerpt_lines = excerpt_lines.unwrap_or(cfg.excerpt_lines);
             opts.flips = flips.flips();
             catalogs.apply(&mut opts, a.dialect, Some(b.dialect))?;
-            let mut pipe = Pipeline::new(cfg, &review)?;
+            let mut pipe = review_cmd::pipeline(cfg, &review)?;
             if template {
                 let known: Option<BTreeSet<String>> =
                     (!parameters.is_empty()).then(|| parameters.into_iter().collect());
@@ -503,7 +503,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         } => {
             let cfg = cfg.resolve()?;
             let art = read(&file, dialect, &cfg)?;
-            let mut pipe = Pipeline::new(cfg, &review)?;
+            let mut pipe = review_cmd::pipeline(cfg, &review)?;
             pipe.templates = template_dir(templates.as_deref(), params)?;
             let mut opts = pipe.options();
             catalogs.apply(&mut opts, art.dialect, None)?;
@@ -580,7 +580,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             dialect_a,
             dialect_b,
             format,
-            Pipeline::new(cfg.resolve()?, &review)?,
+            review_cmd::pipeline(cfg.resolve()?, &review)?,
         ),
         Command::ReviewStatus {
             src,

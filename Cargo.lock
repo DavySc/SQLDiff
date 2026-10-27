@@ -564,6 +564,7 @@ dependencies = [
  "sha2",
  "sqldiff-core",
  "sqldiff-source",
+ "sqldiff-syntax",
 ]
 
 [[package]]

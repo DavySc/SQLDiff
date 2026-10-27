@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 sqldiff-core.workspace = true
+sqldiff-syntax.workspace = true
 sqldiff-source.workspace = true
 serde.workspace = true
 serde_json.workspace = true
