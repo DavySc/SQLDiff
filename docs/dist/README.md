@@ -23,10 +23,16 @@ Double-click `sqldiff-gui` (or run it from a terminal). It starts a local
 server on `127.0.0.1` and opens your browser at it. Keep the window that
 appears open while you work; closing it stops SQLDiff.
 
-The app opens in convert mode: type or paste T-SQL on the left, checked
-PostgreSQL or Db2 for i appears on the right as you type, with a badge on each
-statement. Switch to Compare to diff two texts. To compare files or folders
-directly, or review a converted tree:
+The app opens on Home. To compare two files or two folders, pick them with
+Browse (or type their paths) and press Compare; the dialect of each side comes
+from the path convention unless you choose one. Comparisons you opened before
+are listed under Recent. Convert opens convert mode: type or paste T-SQL on the
+left, checked PostgreSQL or Db2 for i appears on the right as you type, with a
+badge on each statement.
+
+The rail on the left switches between Home, Compare, Convert and Review in the
+same window. From a terminal the app can also start on files, folders or a
+converted tree:
 
 ```sh
 sqldiff-gui serve old.sql new.sql            # two versions of one object
@@ -34,9 +40,11 @@ sqldiff-gui serve tsql/ db2i/                # two trees as a review queue
 sqldiff-gui review src/ out/ --to postgres   # review what `sqldiff convert` wrote
 ```
 
-The rail on the left switches between Home, Compare, Convert and Review in
-the same window. Home lists what is open; Compare and Review are available
-when the app was started on files or on a converted tree.
+A comparison opened from Home reads the project config (`sqldiff.toml`) found
+from side A's folder upward, plus your user config and the private config in
+`config/`, as a command run in that folder would. The Recent list keeps paths
+only, in SQLDiff's data folder; it is not kept when the data folder is
+encrypted.
 
 ### First run on macOS
 

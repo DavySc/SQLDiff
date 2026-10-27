@@ -88,6 +88,16 @@ fn review(d: &Dir) -> Review {
     .unwrap()
 }
 
+fn app(compare: Option<Session>, review: Option<Review>) -> App {
+    App {
+        convert: sample(),
+        compare,
+        review,
+        data_dir: None,
+        isolated: true,
+    }
+}
+
 fn start(app: App) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -135,11 +145,7 @@ fn rail(html: &str) -> (Vec<String>, String) {
 #[test]
 fn every_view_is_served_by_one_server_behind_the_rail() {
     let d = Dir::new("all");
-    let addr = start(App {
-        convert: sample(),
-        compare: Some(session(&d)),
-        review: Some(review(&d)),
-    });
+    let addr = start(app(Some(session(&d)), Some(review(&d))));
     for (path, base) in [
         ("/", None),
         ("/convert", None),
@@ -168,11 +174,7 @@ fn every_view_is_served_by_one_server_behind_the_rail() {
 #[test]
 fn each_view_answers_its_api_under_its_own_path() {
     let d = Dir::new("api");
-    let addr = start(App {
-        convert: sample(),
-        compare: Some(session(&d)),
-        review: Some(review(&d)),
-    });
+    let addr = start(app(Some(session(&d)), Some(review(&d))));
     // The pair view and the review both have /api/refresh; each answers its own.
     let (status, body) = request(addr, "POST", "/compare/api/refresh", "{}");
     assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
@@ -197,11 +199,7 @@ fn each_view_answers_its_api_under_its_own_path() {
 
 #[test]
 fn a_view_with_nothing_open_is_not_a_link_and_shows_home() {
-    let addr = start(App {
-        convert: sample(),
-        compare: None,
-        review: None,
-    });
+    let addr = start(app(None, None));
     let (_, html) = get(addr, "/convert");
     let (links, on) = rail(&html);
     assert_eq!(links, ["/", "/convert"]);
@@ -220,11 +218,7 @@ fn a_view_with_nothing_open_is_not_a_link_and_shows_home() {
 #[test]
 fn cross_origin_posts_are_refused_on_every_view() {
     let d = Dir::new("csrf");
-    let addr = start(App {
-        convert: sample(),
-        compare: Some(session(&d)),
-        review: Some(review(&d)),
-    });
+    let addr = start(app(Some(session(&d)), Some(review(&d))));
     for path in [
         "/api/convert",
         "/compare/api/refresh",
@@ -248,4 +242,133 @@ fn the_static_pages_keep_their_own_api_paths() {
     let html = sqldiff_gui::page(&serde_json::Value::Null);
     assert!(html.contains(r#"const BASE = /*__SQLDIFF_BASE__*/"";"#));
     assert!(!html.contains("app-rail"));
+}
+
+#[test]
+fn the_picker_lists_folders_first_without_hidden_names() {
+    let d = Dir::new("fs");
+    d.write("b.sql", "");
+    d.write("A.txt", "");
+    d.write(".hidden", "");
+    d.write("zeta/x.sql", "");
+    d.write("Alpha/y.sql", "");
+    let addr = start(app(None, None));
+    let q = |p: &std::path::Path| {
+        format!(
+            "/api/fs?path={}",
+            p.display().to_string().replace('%', "%25")
+        )
+    };
+    let (status, body) = get(addr, &q(&d.0));
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let names: Vec<(&str, bool)> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["name"].as_str().unwrap(), e["dir"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            ("Alpha", true),
+            ("zeta", true),
+            ("A.txt", false),
+            ("b.sql", false)
+        ]
+    );
+    assert_eq!(v["path"], d.0.display().to_string());
+    assert_eq!(v["parent"], d.0.parent().unwrap().display().to_string());
+    // A file lists the folder holding it.
+    let (_, body) = get(addr, &q(&d.0.join("zeta").join("x.sql")));
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["path"], d.0.join("zeta").display().to_string());
+    assert_eq!(
+        get(addr, &q(&d.0.join("missing"))).0,
+        "HTTP/1.1 400 Bad Request"
+    );
+}
+
+#[test]
+fn a_comparison_opened_from_home_replaces_the_session_and_is_remembered() {
+    let d = Dir::new("open");
+    let a = d.write("a.sql", "SELECT a FROM t WHERE b = 1;\n");
+    let b = d.write("b.sql", "SELECT a FROM t WHERE b = 2;\n");
+    d.write("ta/x.sql", "SELECT 1;\n");
+    d.write("tb/x.sql", "SELECT 2;\n");
+    let mut with_dir = app(None, None);
+    with_dir.data_dir = Some(d.0.join("data"));
+    let addr = start(with_dir);
+    let open =
+        |body: serde_json::Value| request(addr, "POST", "/api/open/compare", &body.to_string());
+
+    // Refused, and nothing opened: one file and one folder, a missing path,
+    // an unknown dialect, an unknown field.
+    for body in [
+        serde_json::json!({ "a": a, "b": d.0.join("tb") }),
+        serde_json::json!({ "a": a, "b": d.0.join("nope.sql") }),
+        serde_json::json!({ "a": a, "b": b, "dialect_a": "oracle" }),
+        serde_json::json!({ "a": a, "b": b, "by": "agent" }),
+    ] {
+        assert_eq!(open(body.clone()).0, "HTTP/1.1 400 Bad Request", "{body}");
+    }
+    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/convert"]);
+
+    let (status, body) =
+        open(serde_json::json!({ "a": a, "b": b, "dialect_a": "tsql", "dialect_b": "tsql" }));
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    assert_eq!(body, r#"{"open":"/compare"}"#);
+    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/compare", "/convert"]);
+    let (_, pair) = get(addr, "/compare/api/pair/0");
+    assert!(pair.contains(r#""verdict":"different""#), "{pair}");
+
+    // Two folders replace the two files.
+    let (status, _) = open(
+        serde_json::json!({ "a": d.0.join("ta"), "b": d.0.join("tb"), "dialect_a": "", "dialect_b": null }),
+    );
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    let (_, home) = get(addr, "/");
+    assert!(home.contains(r#""kind":"folders""#), "{home}");
+
+    // Newest first, paths and dialects only.
+    let recent = sqldiff_gui::app::recent(&d.0.join("data"));
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0].a, d.0.join("ta").display().to_string());
+    assert_eq!(recent[0].dialect_a, None);
+    assert_eq!(recent[1].a, a.display().to_string());
+    assert_eq!(recent[1].dialect_b.as_deref(), Some("tsql"));
+    assert!(home.contains(r#""recent":[{"a":"#), "{home}");
+}
+
+#[test]
+fn files_cannot_be_picked_or_opened_on_a_network_address() {
+    let d = Dir::new("lan");
+    let a = d.write("a.sql", "SELECT 1;\n");
+    // Bound to every interface: reachable from other machines.
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port())
+        .parse()
+        .unwrap();
+    std::thread::spawn(move || serve(listener, app(None, None), &[]));
+    let (status, body) = get(addr, &format!("/api/fs?path={}", d.0.display()));
+    assert_eq!(status, "HTTP/1.1 403 Forbidden", "{body}");
+    assert!(!body.contains("a.sql"));
+    let open = serde_json::json!({ "a": a, "b": a }).to_string();
+    assert_eq!(
+        request(addr, "POST", "/api/open/compare", &open).0,
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/convert"]);
+    let (_, home) = get(addr, "/");
+    assert!(
+        home.contains(r#""no_picking":"picking files works only"#),
+        "{home}"
+    );
+    // On loopback the same requests are answered.
+    let addr = start(app(None, None));
+    assert_eq!(
+        get(addr, &format!("/api/fs?path={}", d.0.display())).0,
+        "HTTP/1.1 200 OK"
+    );
+    assert!(get(addr, "/").1.contains(r#""no_picking":null"#));
 }
