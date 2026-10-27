@@ -380,6 +380,10 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         "HTTP/1.1 403 Forbidden"
     );
     assert!(!d.0.join("out").exists());
+    assert_eq!(
+        request(addr, "POST", "/api/runs/instances", &run.to_string()).0,
+        "HTTP/1.1 403 Forbidden"
+    );
     // On loopback the same requests are answered.
     let addr = start(app(None, None));
     assert_eq!(
@@ -522,6 +526,26 @@ fn runs_that_cannot_start_are_refused() {
         (spec(serde_json::json!(d.0.join("gone")), "tsql", "postgres"), "not found"),
         (spec(serde_json::json!(" "), "tsql", "postgres"), "give a source"),
         (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "template": true })
+                .to_string(),
+            "[template] syntax",
+        ),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "parameters": ["A"] })
+                .to_string(),
+            "template runs",
+        ),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "packs": [d.0.join("no-pack")] })
+                .to_string(),
+            "no-pack: not found",
+        ),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "instances": d.0.join("no-report") })
+                .to_string(),
+            "no-report: not found",
+        ),
+        (
             serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "jobs": 2 })
                 .to_string(),
             "jobs",
@@ -531,10 +555,114 @@ fn runs_that_cannot_start_are_refused() {
         assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
         assert!(text.contains(says), "{body}: {text}");
     }
+    // Instance checks: the manifest, and the templates or the generator's
+    // output, must be given and exist.
+    let manifest = d.write("instances.toml", "");
+    let check = |extra: serde_json::Value| {
+        let mut b = serde_json::json!({ "manifest": manifest, "out": out, "from": "tsql", "to": "postgres" });
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b.to_string()
+    };
+    for (body, says) in [
+        (
+            check(serde_json::json!({ "manifest": d.0.join("none.toml") })),
+            "none.toml: not found",
+        ),
+        (check(serde_json::json!({})), "give the source templates"),
+        (
+            check(serde_json::json!({ "source": d.0.join("src") })),
+            "give the source templates",
+        ),
+        (
+            check(serde_json::json!({ "generator_only": true })),
+            "needs both of its outputs",
+        ),
+        (
+            check(
+                serde_json::json!({ "generator_only": true, "woven": d.0.join("src"), "woven_target": d.0.join("src"), "source": d.0.join("src") }),
+            ),
+            "takes no templates",
+        ),
+        (
+            check(serde_json::json!({ "target": d.0.join("gone"), "source": d.0.join("src") })),
+            "gone: not found",
+        ),
+        (
+            check(serde_json::json!({ "from": "oracle" })),
+            "unknown dialect",
+        ),
+        (check(serde_json::json!({ "since": "x" })), "since"),
+    ] {
+        let (status, text) = request(addr, "POST", "/api/runs/instances", &body);
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
+        assert!(text.contains(says), "{body}: {text}");
+    }
     assert_eq!(get(addr, "/api/runs").1, "[]");
     assert!(!out.exists());
     assert_eq!(
         request(addr, "POST", "/runs/7/cancel", "{}").0,
         "HTTP/1.1 404 Not Found"
     );
+}
+
+#[test]
+fn a_run_never_reads_or_writes_where_a_running_run_writes() {
+    let d = Dir::new("overlap");
+    // Enough files that the first run is still converting.
+    for k in 0..300 {
+        d.write(
+            &format!("src/p{k}.sql"),
+            &format!("CREATE PROCEDURE dbo.p{k} AS\nBEGIN\n  UPDATE dbo.t SET a = {k};\nEND\n"),
+        );
+    }
+    let manifest = d.write("instances.toml", "");
+    let addr = start(app(None, None));
+    let out = d.0.join("out");
+    let spec =
+        serde_json::json!({ "src": d.0.join("src"), "out": out, "from": "tsql", "to": "postgres" });
+    let (status, body) = request(addr, "POST", "/api/runs", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let refused = [
+        // Into the same folder, or one inside it.
+        (
+            "/api/runs",
+            serde_json::json!({ "src": d.0.join("src"), "out": out.join("sub"), "from": "tsql", "to": "postgres" }),
+            "another run is writing there",
+        ),
+        // Reading the folder being written.
+        (
+            "/api/runs/instances",
+            serde_json::json!({ "manifest": manifest, "source": d.0.join("src"), "target": out, "from": "tsql", "to": "postgres", "out": d.0.join("inst") }),
+            "half-written",
+        ),
+        // Writing into the folder being read.
+        (
+            "/api/runs",
+            serde_json::json!({ "src": d.0.join("src"), "out": d.0.join("src/x"), "from": "tsql", "to": "postgres" }),
+            "another run is reading there",
+        ),
+    ];
+    let still = |addr| {
+        let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+        runs.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == id && r["state"] == "running")
+    };
+    for (path, body, says) in refused {
+        // `out` exists once the first run prepared it: the instance check's
+        // target must exist to get as far as the overlap.
+        std::fs::create_dir_all(&out).unwrap();
+        let (status, text) = request(addr, "POST", path, &body.to_string());
+        assert!(still(addr), "the first run finished too soon for this test");
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
+        assert!(text.contains(says), "{body}: {text}");
+    }
+    request(addr, "POST", &format!("/runs/{id}/cancel"), "{}");
+    assert_eq!(finished(addr, id)["state"], "cancelled");
 }

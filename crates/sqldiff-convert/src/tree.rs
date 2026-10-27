@@ -310,7 +310,7 @@ pub struct Hooks {
 pub const CANCELLED: &str = "cancelled";
 
 impl Hooks {
-    fn cancelled(&self) -> bool {
+    pub(crate) fn cancelled(&self) -> bool {
         self.cancel
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed))

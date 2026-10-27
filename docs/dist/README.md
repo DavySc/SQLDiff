@@ -32,7 +32,13 @@ badge on each statement.
 
 To convert a whole tree, open Runs (or Convert a tree on Home): pick the source
 folder and an empty or new output folder, choose the dialects and press
-Convert. The run shows how many files are checked and can be cancelled; a
+Convert. Under Templates, extensions and packs, a run can convert templates
+(`--template`, with their parameter names), other file extensions, load a
+pack, and take an instance check (`sqldiff instances`) so the review judges
+each template by the instances woven from it. Check template instances
+runs that check (`sqldiff instances`) from the app: give the manifest, the
+source and converted templates and an output folder; "Use in a template
+run" then converts the templates again into the checked folder with it. The run shows how many files are checked and can be cancelled; a
 cancelled run writes nothing into the output folder. When it finishes, the run
 lists how many units landed on each status and Review opens what it wrote. A
 run writes exactly what `sqldiff convert src/ out/ --from … --to …` writes,
