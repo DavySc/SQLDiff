@@ -207,7 +207,11 @@ const LITERALS: &[(&str, &str, Want)] = &[
         Unknown,
     ),
     ("Q + 1e0", "Q + 1e0", Unknown),
-    ("Q * 1.5", "Q * 1.5", Unknown),
+    // int * decimal(2,1): decimal(13,1) in T-SQL, exact numeric in
+    // PostgreSQL; both give 4.5 for 3 * 1.5 (eval/casts).
+    ("Q * 1.5", "Q * 1.5", Eq),
+    // decimal(38,10) * int needs 49 digits: T-SQL cuts the scale.
+    ("Big * Q", "Big * Q", Unknown),
     ("Q + 1.5", "Q + 1.5", Eq),
     ("Q + 1", "Q + 1", Eq),
     // int in T-SQL range only; bigint in PostgreSQL, numeric(10,0) in T-SQL.

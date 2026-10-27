@@ -1743,6 +1743,11 @@ impl<'a> Canon<'a> {
                     self.assume(asm::UNTYPED);
                 }
                 if matches!(op, "*" | "/" | "%") && !both_int {
+                    if let Some(ty) = (op == "*").then(|| self.mul_ty(lty, rty)).flatten() {
+                        let mut v = vec![lt, rt];
+                        v.sort();
+                        return Ok((n("mul", v), ty));
+                    }
                     // Decimal precision and scale rules differ per dialect.
                     return Ok((n("arith", vec![self.dtag(), a(op), lt, rt]), None));
                 }
@@ -1784,6 +1789,48 @@ impl<'a> Canon<'a> {
                 .and_then(Term::atom)
                 .and_then(|x| x.parse::<i64>().ok())
                 .is_some_and(|x| x.abs() <= 1 << 24)
+    }
+
+    /// The type of an exact product of two exact numbers (integers or
+    /// decimals), or None where it may not be exact. PostgreSQL multiplies
+    /// numerics exactly. T-SQL gives decimal(p1 + p2 + 1, s1 + s2), exact
+    /// when that precision is at most 38; above, it cuts the scale and
+    /// rounds. An integer counts as decimal(3, 0), (5, 0), (10, 0) or
+    /// (19, 0) by its width.
+    fn mul_ty(&self, l: Option<Ty>, r: Option<Ty>) -> Option<Option<Ty>> {
+        let (x, y) = (l?, r?);
+        let exact = |t: &Ty| matches!(t.fam, Fam::Int | Fam::Exact);
+        if !exact(&x) || !exact(&y) {
+            return None;
+        }
+        let digits = |t: &Ty| match t.fam {
+            Fam::Int => t.len.map(|b| {
+                let p = match b {
+                    0..=1 => 1,
+                    2..=8 => 3,
+                    9..=16 => 5,
+                    17..=32 => 10,
+                    _ => 19,
+                };
+                (p, 0)
+            }),
+            _ => t.len.zip(t.scale),
+        };
+        match (digits(&x), digits(&y)) {
+            (Some((p1, s1)), Some((p2, s2))) => {
+                let (p, s) = (p1 + p2 + 1, s1 + s2);
+                if self.d == Dialect::Tsql && p > 38 {
+                    return None;
+                }
+                Some(Some(Ty {
+                    fam: Fam::Exact,
+                    len: Some(p.min(38)),
+                    scale: Some(s),
+                }))
+            }
+            _ if self.d == Dialect::Postgres => Some(Some(Ty::of(Fam::Exact))),
+            _ => None,
+        }
     }
 
     /// The type of `+` or `-` of two numbers, or None where the dialects
@@ -1995,6 +2042,16 @@ impl<'a> Canon<'a> {
                 if !hints.is_empty() {
                     return Err("table hints in FROM are not supported".into());
                 }
+                // The image a T-SQL trigger's event has no rows for.
+                if let Some(tr) = &self.unit.trigger {
+                    if let ([x], Some(m)) = (name.as_slice(), tr.missing) {
+                        if x.trim_matches(['[', ']', '"']).eq_ignore_ascii_case(m) {
+                            let table = tr.table.clone();
+                            let alias = Some(alias.clone().unwrap_or_else(|| m.to_string()));
+                            return Ok(self.empty_image(&table, &alias));
+                        }
+                    }
+                }
                 let b = self.bind_table(name, alias);
                 let t = n("t", vec![a(b.table.clone())]);
                 self.scopes.last_mut().unwrap().push(b);
@@ -2017,6 +2074,11 @@ impl<'a> Canon<'a> {
             From::Sub { query, alias, cols } => {
                 if !cols.is_empty() {
                     return Err("derived column lists are not supported".into());
+                }
+                // `(SELECT * FROM t WHERE false)`: the conversion of an image
+                // the trigger's event has no rows for.
+                if let (Some(_), Some(table)) = (&self.unit.trigger, empty_query(query)) {
+                    return Ok(self.empty_image(&table, alias));
                 }
                 let saved = std::mem::take(&mut self.scopes);
                 let q = self.query_parts(query, QCtx::Set);
@@ -2057,6 +2119,14 @@ impl<'a> Canon<'a> {
                 "VALUES, table function or data-change table in FROM is not supported here".into(),
             ),
         }
+    }
+
+    /// A relation with the columns of `table` and no rows, under `alias`.
+    fn empty_image(&mut self, table: &[String], alias: &Option<String>) -> Term {
+        let b = self.bind_table(table, alias);
+        let t = n("empty", vec![a(b.table.clone())]);
+        self.scopes.last_mut().unwrap().push(b);
+        t
     }
 
     /// Lowers a query; returns the term and the type of its first column.
@@ -2541,9 +2611,11 @@ impl<'a> Canon<'a> {
                 let ret = self.unit.returns;
                 Ok(n("return", vec![self.conv(&ret, v).0]))
             }
-            (Dialect::Postgres, UnitKind::ScalarFn | UnitKind::TableFn | UnitKind::Proc, false) => {
-                Err("SELECT without INTO in PL/pgSQL".into())
-            }
+            (
+                Dialect::Postgres,
+                UnitKind::ScalarFn | UnitKind::TableFn | UnitKind::Proc | UnitKind::Trigger,
+                false,
+            ) => Err("SELECT without INTO in PL/pgSQL".into()),
             _ => self.resultset(sel),
         }
     }
@@ -3969,5 +4041,43 @@ fn type_arg(e: &Expr) -> bool {
         Expr::Num(v) => v.bytes().all(|b| b.is_ascii_digit()),
         Expr::Name(p) => p.len() == 1 && p[0].eq_ignore_ascii_case("max"),
         _ => false,
+    }
+}
+
+/// The table of `SELECT * FROM t WHERE false` and nothing else.
+fn empty_query(q: &Select) -> Option<Vec<String>> {
+    let plain = q.ctes.is_empty()
+        && !q.for_json
+        && q.set_ops.is_empty()
+        && !q.distinct
+        && q.top.is_none()
+        && q.into.is_empty()
+        && q.group_by.is_empty()
+        && q.having.is_none()
+        && q.order_by.is_empty()
+        && q.offset.is_none()
+        && q.limit.is_none()
+        && q.locking.is_empty()
+        && q.values.is_none()
+        && matches!(
+            q.items.as_slice(),
+            [SelItem {
+                expr: Expr::Star(None),
+                alias: None,
+                assign: None
+            }]
+        );
+    let is_false = match &q.where_ {
+        Some(Expr::Special(s)) => s.eq_ignore_ascii_case("FALSE"),
+        Some(Expr::Name(p)) => matches!(p.as_slice(), [x] if x.eq_ignore_ascii_case("false")),
+        _ => false,
+    };
+    match q.from.as_slice() {
+        [From::Table {
+            name,
+            alias: None,
+            hints,
+        }] if plain && is_false && hints.is_empty() => Some(name.clone()),
+        _ => None,
     }
 }

@@ -21,8 +21,9 @@
 //! that changes its own table does not fire itself again (RECURSIVE_TRIGGERS
 //! is OFF by default), a PostgreSQL one does, also for zero rows.
 //!
-//! The engine does not compare triggers yet, so every converted trigger is
-//! "not proven" until it does.
+//! The engine compares each event's function with the T-SQL body for that
+//! event, and proves PostgreSQL's re-entry for the trigger's own UPDATE
+//! harmless or reports the trigger as not proven.
 
 use super::*;
 
@@ -187,14 +188,6 @@ impl Cx<'_> {
                 ev.word(),
                 h.table_out,
             ));
-            if self.writes_own_table(&body, &h)
-                && !notes.iter().any(|x| x.rule == "pg.trigger-reentry")
-            {
-                notes.push(Note { status: Status::Decision, rule: "pg.trigger-reentry".into(), text: format!(
-                    "The trigger changes its own table {}: PostgreSQL fires it again for that statement (and for every statement that changes no rows), where T-SQL does not with RECURSIVE_TRIGGERS OFF, the default. Unless the trigger stops when it has nothing to do, it fires until the stack depth limit. Make sure the second firing does nothing, or add `IF pg_trigger_depth() > 1 THEN RETURN NULL; END IF;` first, which also stops it when another trigger's statement fires it.",
-                    h.table_out
-                ) });
-            }
         }
         self.notes = header_notes;
         for n in notes {
@@ -392,68 +385,6 @@ impl Cx<'_> {
             (Some(t), [n]) if n == "inserted" || n == "deleted" => &t.table,
             _ => name,
         }
-    }
-
-    /// Whether a statement of the body changes the trigger's own table by an
-    /// event the T-SQL trigger has: T-SQL does not fire the trigger again,
-    /// PostgreSQL fires the trigger of that event.
-    fn writes_own_table(&self, body: &SyntaxNode, h: &Header) -> bool {
-        let own = |parts: &[String]| {
-            parts.last() == h.table.last()
-                && (parts.len() == 1
-                    || h.table.len() == 1 && parts.len() == 2 && parts[0] == "dbo"
-                    || parts.len() >= 2
-                        && h.table.len() >= 2
-                        && parts[parts.len() - 2] == h.table[h.table.len() - 2])
-        };
-        for st in body.descendants().filter(|n| n.kind() == STATEMENT) {
-            let ts = tokens(&st);
-            let s = sig(&ts);
-            let Some(&first) = s.first() else { continue };
-            let verb = ts[first].up();
-            let fires: &[Event] = match verb.as_str() {
-                "INSERT" => &[Event::Insert],
-                "UPDATE" => &[Event::Update],
-                "DELETE" => &[Event::Delete],
-                "MERGE" => &[Event::Insert, Event::Update, Event::Delete],
-                _ => continue,
-            };
-            if !fires.iter().any(|e| h.events.contains(e)) {
-                continue;
-            }
-            // The target: after the verb (and INTO / FROM).
-            let mut k = 1;
-            if s.get(k)
-                .is_some_and(|&j| ts[j].is("INTO") || ts[j].is("FROM"))
-            {
-                k += 1;
-            }
-            let Some(&at) = s.get(k) else { continue };
-            let mut end = at;
-            while let Some(d) = next_sig(&ts, end).filter(|&d| ts[d].k == DOT) {
-                match next_sig(&ts, d) {
-                    Some(x) => end = x,
-                    None => break,
-                }
-            }
-            let Some(target) = name_parts(&ts[at..=end]) else {
-                continue;
-            };
-            if own(&target) {
-                return true;
-            }
-            // `UPDATE x … FROM t x`: the alias of a FROM table.
-            if target.len() == 1 {
-                if let Some(scope) = scope_of(&ts) {
-                    if scope.entries.iter().any(|e| {
-                        e.named && e.alias.as_deref() == Some(target[0].as_str()) && own(&e.name)
-                    }) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
     }
 }
 

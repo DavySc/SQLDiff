@@ -21,6 +21,7 @@ pub mod schema;
 pub mod script;
 pub mod table;
 pub mod term;
+mod trigger;
 pub mod xwit;
 
 use sqldiff_syntax::{ast as cst, SyntaxNode};
@@ -137,10 +138,18 @@ fn line(side: &Analyzed, nodes: &[SyntaxNode]) -> usize {
     nodes.first().map(|n| side.line_of(n)).unwrap_or(0)
 }
 
+pub use trigger::functions as trigger_functions;
+
 /// Cross-dialect comparison of two artifacts. Scripts are compared segment
 /// by segment (`script.rs`): a T-SQL batch against the block it became.
 pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome {
     let mut out = Outcome::default();
+    if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
+        for (ua, ub, sa, sb) in &pairs {
+            compare_units(a, b, ua, ub, sa, sb, &mut out);
+        }
+        return out;
+    }
     let pairs =
         script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
     for (mut ua, mut ub) in pairs {
@@ -203,7 +212,10 @@ fn compare_units(
     // Witnesses across dialects compare parameters by position, so the
     // routines must take the same parameters.
     // Statements outside the comparison could change or undo the witness.
+    // A trigger's images are rows of its table, which witnesses (tables
+    // filled independently) do not keep.
     let wit = (ua.kind == ub.kind
+        && ua.kind != UnitKind::Trigger
         && ua.params.len() == ub.params.len()
         && ua.uncovered.is_empty()
         && ub.uncovered.is_empty()

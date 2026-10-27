@@ -348,6 +348,32 @@ impl Schema {
         (t.schema.as_deref() == schema.map(str::to_lowercase).as_deref()).then_some(t)
     }
 
+    /// This schema with `images` (a trigger's `inserted` and `deleted`)
+    /// as copies of `table`: the same columns and keys. A key holds in an
+    /// image because its rows are rows of the table after (`inserted`) or
+    /// before (`deleted`) the statement. `None` when the table is unknown.
+    pub fn with_images(&self, table: &[String], images: &[&str]) -> Option<Schema> {
+        let last = table.last()?;
+        let schema = match table {
+            [.., s, _] => Some(s.to_lowercase()).filter(|s| s != "dbo" && s != "public"),
+            _ => None,
+        };
+        let t = match schema {
+            Some(s) => self.table_exact(Some(&s), last)?,
+            None => self.table(last)?,
+        }
+        .clone();
+        let mut out = self.clone();
+        for &name in images {
+            let mut copy = t.clone();
+            copy.schema = None;
+            copy.name = name.to_string();
+            out.ambiguous.remove(name);
+            out.tables.insert(name.to_string(), copy);
+        }
+        Some(out)
+    }
+
     /// This schema with the tables `ddl` creates added; they replace tables
     /// of the same name.
     pub fn with_ddl(&self, ddl: &str, d: Dialect) -> Schema {
