@@ -120,7 +120,7 @@ a.btn:hover { background: var(--link-2); }
   <span class="muted">Runs are kept while the app is open</span>
 </header>
 <main><div class="col">
-  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button></div>
+  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button><button type="button" role="tab" data-tab="chgf" aria-selected="false">Review a branch</button></div>
   <form class="form" id="conv" autocomplete="off">
     <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
@@ -172,6 +172,21 @@ a.btn:hover { background: var(--link-2); }
       <div class="hint">Drift is not a review: the result is the command's, no drift and instance checks ok, and nothing here is called done.</div>
     </details>
     <div class="acts"><span class="err" id="d-err" role="alert"></span><button type="submit" class="primary" id="d-go">Check</button></div>
+  </form>
+  <form class="form" id="chgf" autocomplete="off" hidden>
+    <div class="field"><span>Repository</span><input type="text" id="c-repo" placeholder="The git repository" aria-label="Git repository" spellcheck="false"><button type="button" class="outline" data-browse="c-repo" data-next="c-base">Browse…</button></div>
+    <div class="field"><span>Base</span><input type="text" id="c-base" placeholder="The branch or commit the change is reviewed against, e.g. main" aria-label="Base revision" spellcheck="false"><span></span></div>
+    <div class="field"><span>Output</span><input type="text" id="c-out" placeholder="Empty or new folder for changes.md, changes.json and changes.sarif" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="c-out" data-near="c-repo" data-next="c-go">Browse…</button></div>
+    <div class="hint">The diff starts at the base's merge base with the head, as a pull request does. Only the SQL files that changed are read.</div>
+    <div class="acts"><label class="tog"><input type="checkbox" id="c-overwrite"> Replace the files a review writes in a non-empty output folder</label></div>
+    <details class="more"><summary>Head, dialect, paths and packs</summary>
+      <div class="field"><span>Head</span><input type="text" id="c-head" placeholder="HEAD" aria-label="Head revision" spellcheck="false"><span></span></div>
+      <div class="field"><span>Dialect</span><select id="c-dialect" aria-label="Dialect of every changed file"><option value="">Per file, from the config or the path</option></select><span></span></div>
+      <div class="field"><span>Paths</span><input type="text" id="c-paths" placeholder="Only these git pathspecs, comma-separated" aria-label="Paths" spellcheck="false"><span></span></div>
+      <div class="field"><span>Pack</span><input type="text" id="c-pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="c-pack" data-near="c-repo">Browse…</button></div>
+      <div class="hint">A branch review is not a conversion review: its result is the command's, and nothing here is called done.</div>
+    </details>
+    <div class="acts"><span class="err" id="c-err" role="alert"></span><button type="submit" class="primary" id="c-go">Review</button></div>
   </form>
   <h2 style="margin-top:8px">Runs</h2>
   <div class="list" id="runs"></div>
@@ -249,7 +264,31 @@ function driftRow(r, sub) {
   return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">${title}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
 }
 
+// A branch review: the command's verdict and the counts, never "done".
+function changesRow(r) {
+  const t = r.totals || {};
+  const c = t.counts || {};
+  const range = `${esc(r.base)}…${esc(r.head || "HEAD")}`;
+  const sub = `<span class="path">${esc(r.repo)}</span> into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`;
+  let right = "", act = "", extra = "";
+  if (r.state === "running") {
+    const pct = r.total ? r.checked / r.total * 100 : 0;
+    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Checked ${r.checked} of ${r.total}` : "Reading the changes…"}</div>`;
+    act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
+  } else if (r.state === "done") {
+    const parts = [["different", c.different], ["not proven", c.not_proven], ["equal under assumptions", c.equal_under_assumptions], ["equal", c.equal], ["added", c.added], ["not compared", c.not_compared]].filter(([, n]) => n);
+    right = `<div class="meta"><b class="${r.complete ? "done" : ""}">${esc(t.verdict)}</b> · ${t.files} changed file${t.files === 1 ? "" : "s"}${parts.length ? ` · ${parts.map(([k, n]) => `${n} ${k}`).join(", ")}` : ""}</div>`;
+    extra = `<div class="legend"><span>Wrote <code>changes.md</code>, <code>changes.json</code> and <code>changes.sarif</code> into the output folder</span></div>` + r.notes.map((n) => `<div class="failed-msg">${esc(n)}</div>`).join("");
+  } else if (r.state === "cancelled") {
+    right = `<div class="meta">Cancelled; nothing was written</div>`;
+  } else {
+    extra = `<div class="failed-msg">${esc(r.error)}</div>`;
+  }
+  return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">Review branch ${range}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
+}
+
 function row(r) {
+  if (r.kind === "changes") return changesRow(r);
   if (r.kind === "drift") return driftRow(r, `into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`);
   const pair = `${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
   const inst = r.kind === "instances";
@@ -421,6 +460,23 @@ $("instf").addEventListener("submit", async (e) => {
   $("i-go").disabled = false;
   refresh();
 });
+$("chgf").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const v = (id) => $(id).value.trim();
+  const list = (id) => v(id).split(",").map((x) => x.trim()).filter(Boolean);
+  if (!v("c-repo") || !v("c-base") || !v("c-out")) { $("c-err").textContent = "Give a repository, a base revision and an output folder."; return; }
+  $("c-err").textContent = ""; $("c-go").disabled = true;
+  try {
+    await post("/api/runs/changes", {
+      repo: v("c-repo"), base: v("c-base"), head: v("c-head") || null, dialect: v("c-dialect") || null,
+      paths: list("c-paths"), out: v("c-out"), packs: v("c-pack") ? [v("c-pack")] : [], overwrite: $("c-overwrite").checked,
+    });
+    $("c-overwrite").checked = false;
+  } catch (e) { $("c-err").textContent = e.message; }
+  $("c-go").disabled = false;
+  refresh();
+});
+$("c-dialect").innerHTML += INITIAL.dialects.map(([id, n]) => `<option value="${esc(id)}">${esc(n)}</option>`).join("");
 $("driftf").addEventListener("submit", async (e) => {
   e.preventDefault();
   const v = (id) => $(id).value.trim();
@@ -445,6 +501,7 @@ if (INITIAL.no_picking) {
   $("conv").hidden = true;
   $("instf").hidden = true;
   $("driftf").hidden = true;
+  $("chgf").hidden = true;
   $("conv").insertAdjacentHTML("beforebegin", `<div class="card closed"><span class="t">Not available on a network address</span><span class="s">${esc(INITIAL.no_picking.charAt(0).toUpperCase() + INITIAL.no_picking.slice(1))}.</span></div>`);
 }
 render(INITIAL.runs);

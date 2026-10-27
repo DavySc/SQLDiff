@@ -506,3 +506,34 @@ fn a_rename_from_an_unknown_dialect_still_checks_the_head_file() {
     );
     assert_eq!(r["verdict"], "unknown");
 }
+
+#[test]
+fn the_folders_of_the_files_it_writes_are_made() {
+    let (root, repo) = new_repo("outdirs");
+    put(&repo, "a.tsql.sql", "SELECT a FROM t WHERE b = 1;\n");
+    commit(&repo, "base");
+    git(&repo, &["checkout", "-q", "-b", "topic"]);
+    put(&repo, "a.tsql.sql", "SELECT a FROM t WHERE b = 2;\n");
+    commit(&repo, "change");
+    let (json, md, sarif) = (
+        root.join("new/one/c.json"),
+        root.join("new/two/c.md"),
+        root.join("new/c.sarif"),
+    );
+    let out = changes(
+        &root,
+        &repo,
+        &[
+            "--base",
+            "main",
+            "--json",
+            json.to_str().unwrap(),
+            "--markdown",
+            md.to_str().unwrap(),
+            "--sarif",
+            sarif.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.code().is_some_and(|c| c <= 1));
+    assert!(json.is_file() && md.is_file() && sarif.is_file());
+}
