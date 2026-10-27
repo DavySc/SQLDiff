@@ -1,0 +1,294 @@
+//! Runs: long work started from the app, with progress, cancel and a list
+//! kept while the app runs. The one kind so far converts a tree into an
+//! output folder through `sqldiff_convert::job`, the code `sqldiff convert`
+//! runs, so a run writes what the command writes.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use serde::{Deserialize, Serialize};
+use sqldiff_convert::job::{self, Job};
+use sqldiff_convert::tree::{self, Hooks};
+use sqldiff_core::Dialect;
+use sqldiff_source::config::{self, Sources};
+use sqldiff_source::Resolved;
+
+use crate::browse;
+use crate::convert_review::{self, Review};
+
+/// A tree conversion as the page asks for it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConvertSpec {
+    /// The source tree, or one file.
+    pub src: String,
+    /// The output folder: created, and empty unless `overwrite`.
+    pub out: String,
+    /// Dialect ids.
+    pub from: String,
+    pub to: String,
+    /// Replace the files in a non-empty output folder (never files edited by
+    /// hand since the last run).
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// Where a run is.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum State {
+    Running,
+    /// Written. `totals` as in `conversion-report.json`; `complete` when
+    /// every file is converted or converted under assumptions (the CLI's
+    /// exit code 0), which is not the review's done gate.
+    Done {
+        totals: serde_json::Value,
+        complete: bool,
+        queue: usize,
+        not_applied: Vec<String>,
+        finished: String,
+    },
+    /// Stopped before anything was written into the output folder.
+    Cancelled {
+        finished: String,
+    },
+    Failed {
+        error: String,
+        finished: String,
+    },
+}
+
+pub struct Run {
+    pub id: u64,
+    pub spec: ConvertSpec,
+    /// Absolute output folder, for the one-run-per-folder rule.
+    out: PathBuf,
+    started: String,
+    checked: AtomicUsize,
+    total: AtomicUsize,
+    cancel: Arc<AtomicBool>,
+    state: Mutex<State>,
+    /// The review of what the run wrote, once it is done.
+    review: Mutex<Option<Arc<Mutex<Review>>>>,
+}
+
+/// A run as the page lists it.
+#[derive(Debug, Serialize)]
+pub struct RunView {
+    pub id: u64,
+    pub kind: &'static str,
+    #[serde(flatten)]
+    pub spec: ConvertSpec,
+    pub started: String,
+    pub checked: usize,
+    pub total: usize,
+    pub cancelling: bool,
+    #[serde(flatten)]
+    pub state: State,
+}
+
+impl Run {
+    pub fn view(&self) -> RunView {
+        RunView {
+            id: self.id,
+            kind: "convert",
+            spec: self.spec.clone(),
+            started: self.started.clone(),
+            checked: self.checked.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+            cancelling: self.cancel.load(Ordering::Relaxed),
+            state: self.state(),
+        }
+    }
+
+    pub fn state(&self) -> State {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Asks a running run to stop; it stops before writing anything.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    pub fn review(&self) -> Option<Arc<Mutex<Review>>> {
+        self.review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+#[derive(Default)]
+pub struct Runs {
+    next: AtomicU64,
+    list: Mutex<Vec<Arc<Run>>>,
+}
+
+impl Runs {
+    /// Newest first.
+    pub fn list(&self) -> Vec<Arc<Run>> {
+        let l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+        l.iter().rev().cloned().collect()
+    }
+
+    pub fn get(&self, id: u64) -> Option<Arc<Run>> {
+        let l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+        l.iter().find(|r| r.id == id).cloned()
+    }
+
+    /// Starts a tree conversion on its own thread. Config is what a command
+    /// run in the source's folder loads (unless `isolated`); `done` gets the
+    /// run once its review is open.
+    pub fn start(
+        &self,
+        spec: ConvertSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (job, out) = prepare(&spec, isolated)?;
+        let run = {
+            let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+            if l.iter()
+                .any(|r| r.out == out && matches!(r.state(), State::Running))
+            {
+                return Err(format!(
+                    "{}: another run is writing there; wait for it or cancel it",
+                    out.display()
+                ));
+            }
+            let run = Arc::new(Run {
+                id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
+                spec,
+                out,
+                started: sqldiff_review::time::now(),
+                checked: AtomicUsize::new(0),
+                total: AtomicUsize::new(0),
+                cancel: Arc::new(AtomicBool::new(false)),
+                state: Mutex::new(State::Running),
+                review: Mutex::new(None),
+            });
+            l.push(Arc::clone(&run));
+            run
+        };
+        let r = Arc::clone(&run);
+        std::thread::Builder::new()
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || {
+                let state = execute(&r, job);
+                *r.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+                done(&r);
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(run)
+    }
+}
+
+/// The job a spec asks for, checked before a thread is started, and its
+/// absolute output folder.
+fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf), String> {
+    let dialect = |id: &str| -> Result<Dialect, String> {
+        id.parse().map_err(|_| format!("unknown dialect `{id}`"))
+    };
+    let (from, to) = (dialect(&spec.from)?, dialect(&spec.to)?);
+    if !sqldiff_convert::supported(from, to) {
+        return Err(format!(
+            "no conversion rules from {} to {} yet",
+            from.display_name(),
+            to.display_name()
+        ));
+    }
+    if spec.src.trim().is_empty() || spec.out.trim().is_empty() {
+        return Err("give a source and an output folder".into());
+    }
+    let src = browse::absolute(Path::new(spec.src.trim()));
+    let out = browse::absolute(Path::new(spec.out.trim()));
+    if !src.exists() {
+        return Err(format!("{}: not found", src.display()));
+    }
+    let cfg = Resolved::load(&Sources {
+        project: None,
+        user: None,
+        isolated,
+        cwd: Some(match src.is_dir() {
+            true => src.clone(),
+            false => src.parent().map(Path::to_path_buf).unwrap_or_default(),
+        }),
+        packs: Vec::new(),
+        cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+    })
+    .map_err(|e| e.0)?;
+    let job = Job {
+        tree: tree::Args {
+            src,
+            from,
+            to,
+            jobs: None,
+            no_catalog: false,
+            template: None,
+            extensions: tree::extensions(Vec::new()),
+            helpers: cfg.options().helpers,
+        },
+        out: out.clone(),
+        overwrite: spec.overwrite,
+        discard_edits: false,
+        instances: None,
+        queue_all: false,
+    };
+    Ok((job, out))
+}
+
+fn execute(run: &Arc<Run>, job: Job) -> State {
+    let r = Arc::clone(run);
+    let hooks = Hooks {
+        progress: Some(Box::new(move |checked, total| {
+            r.total.store(total, Ordering::Relaxed);
+            r.checked.store(checked, Ordering::Relaxed);
+        })),
+        cancel: Some(Arc::clone(&run.cancel)),
+    };
+    let finished = sqldiff_review::time::now;
+    let w = match job::convert_into(&job, &hooks) {
+        Ok(w) => w,
+        Err(e) if e == tree::CANCELLED => {
+            return State::Cancelled {
+                finished: finished(),
+            }
+        }
+        Err(error) => {
+            return State::Failed {
+                error,
+                finished: finished(),
+            }
+        }
+    };
+    let totals = serde_json::to_value(&w.tree.report.totals).unwrap_or_default();
+    let complete = w.tree.report.ok();
+    let queue = w.queue.items.len();
+    let not_applied = w.not_applied.clone();
+    let setup = convert_review::Setup {
+        tree: job.tree,
+        out: job.out,
+        instances: None,
+    };
+    match Review::open_converted(setup, w) {
+        Ok(review) => {
+            *run.review.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Arc::new(Mutex::new(review)));
+        }
+        // Written all the same: the review can be opened from the command line.
+        Err(e) => {
+            return State::Failed {
+                error: format!("converted, but the review could not be opened: {e}"),
+                finished: finished(),
+            }
+        }
+    }
+    State::Done {
+        totals,
+        complete,
+        queue,
+        not_applied,
+        finished: finished(),
+    }
+}

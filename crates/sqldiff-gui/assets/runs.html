@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLDiff runs</title>
+<style>
+/* Palette shared with index.html, convert.html and review.html; keep them in sync. */
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5; --focus: #4f46e5;
+  --link-2: rgba(79,70,229,.06);
+  --s-converted: #98a2b3; --s-assumptions: #dc9b04; --s-decision: #4f46e5; --s-unproven: #e8590c; --s-differs: #d92d20; --s-not_converted: #667085; --bad: #d92d20;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8; --focus: #818cf8;
+    --link-2: rgba(129,140,248,.08);
+    --s-converted: #667085; --s-assumptions: #fdb022; --s-decision: #818cf8; --s-unproven: #fd853a; --s-differs: #f97066; --s-not_converted: #98a2b3; --bad: #f97066;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+header { min-height: 44px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 10px; align-items: center; }
+header h1 { font-size: 13px; margin: 0; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+header h1::before { content: ""; width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+main { flex: 1; overflow: auto; padding: 32px 20px; }
+.col { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 2px; }
+.card { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; align-items: center; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); color: inherit; text-decoration: none; }
+a.card:hover { border-color: var(--focus); background: var(--link-2); }
+a.card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.card .t { font-weight: 600; }
+.card .s { grid-column: 1; color: var(--muted); font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
+.card .go { grid-row: 1 / span 2; grid-column: 2; color: var(--accent); font-size: 12.5px; font-weight: 500; }
+.card.closed { box-shadow: none; background: transparent; border-style: dashed; }
+.path { font-family: var(--mono); font-size: 12px; color: var(--fg); }
+code { font-family: var(--mono); font-size: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; user-select: all; }
+button { font: inherit; font-size: 12.5px; font-weight: 500; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover:not(:disabled) { background: var(--soft); color: var(--fg); }
+button.outline { border-color: var(--line); background: var(--panel); color: var(--fg); }
+button.primary { border-color: var(--focus); color: var(--focus); background: var(--panel); }
+button.primary:hover:not(:disabled) { background: var(--link-2); color: var(--focus); }
+button:disabled { opacity: .45; cursor: default; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+input[type=text], select { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; min-width: 0; }
+input[type=text] { font-family: var(--mono); font-size: 12px; }
+input[type=text]:focus, select:focus { outline: none; border-color: var(--focus); }
+.form { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); display: grid; gap: 8px; }
+.side { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto 130px; gap: 8px; align-items: center; }
+.side b { color: var(--muted); font-size: 12px; text-align: center; }
+.acts { display: flex; align-items: center; gap: 10px; }
+#cmp-err { color: #d92d20; font-size: 12.5px; flex: 1; overflow-wrap: anywhere; }
+#cmp-err:empty { visibility: hidden; }
+.recent { display: grid; gap: 2px; margin-top: 4px; border-top: 1px solid var(--line); padding-top: 8px; }
+.recent .lbl { font-size: 11.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; }
+.recent button { text-align: left; font-family: var(--mono); font-size: 12px; font-weight: 400; color: var(--fg); padding: 4px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent button span { color: var(--faint); font-family: inherit; }
+
+.field { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.field > span { color: var(--muted); font-size: 12.5px; }
+.pick { display: flex; gap: 6px; align-items: center; color: var(--muted); }
+label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.err { color: var(--bad); font-size: 12.5px; flex: 1; overflow-wrap: anywhere; }
+.err:empty { visibility: hidden; }
+.list { display: grid; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.run { display: grid; grid-template-columns: 12px minmax(0, 1fr) minmax(180px, 260px) auto; gap: 6px 14px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.run:last-child { border-bottom: 0; }
+.run .t { font-weight: 600; }
+.run .s { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); }
+.dot.running { background: var(--accent); box-shadow: 0 0 0 4px var(--link-2); }
+.dot.failed { background: var(--bad); }
+.bar { height: 6px; border-radius: 3px; background: var(--soft); overflow: hidden; display: flex; }
+.bar i { display: block; height: 100%; }
+.bar .p { background: var(--accent); transition: width .3s; }
+.meta { font-size: 12px; color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.legend { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
+.legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; background: var(--c); }
+.legend b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+.failed-msg { grid-column: 2 / -1; color: var(--bad); font-size: 12.5px; overflow-wrap: anywhere; }
+.empty { padding: 16px; color: var(--muted); font-size: 13px; }
+a.btn { font-size: 12.5px; font-weight: 500; border: 1px solid var(--focus); color: var(--focus); border-radius: 6px; padding: 4px 10px; text-decoration: none; white-space: nowrap; }
+a.btn:hover { background: var(--link-2); }
+</style>
+</head>
+<body>
+<!--__SQLDIFF_SHELL__-->
+<header>
+  <h1>SQLDiff runs</h1>
+  <span class="spacer"></span>
+  <span class="muted">Runs are kept while the app is open</span>
+</header>
+<main><div class="col">
+  <h2>Convert a tree</h2>
+  <form class="form" id="conv" autocomplete="off">
+    <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
+    <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
+    <div class="field"><span>Dialects</span><span class="pick"><select id="from" aria-label="Source dialect"></select>→<select id="to" aria-label="Target dialect"></select></span><span></span></div>
+    <div class="acts"><label class="tog" title="Files edited by hand since the last run are never replaced"><input type="checkbox" id="overwrite"> Replace files in a non-empty output folder</label></div>
+    <div class="acts"><span class="err" id="err" role="alert"></span><button type="submit" class="primary" id="go">Convert</button></div>
+  </form>
+  <h2 style="margin-top:8px">Runs</h2>
+  <div class="list" id="runs"></div>
+</div></main>
+<!--__SQLDIFF_PICKER__-->
+<script>
+const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const NAME = Object.fromEntries(INITIAL.dialects);
+// Unit statuses, best first, as conversion-report.json counts them. Plainly
+// converted means nothing was found, which is not a proof.
+const LADDER = [
+  ["converted", "converted, nothing found, not proven", "--s-converted"],
+  ["under assumptions", "under assumptions", "--s-assumptions"],
+  ["needs a decision", "needs a decision", "--s-decision"],
+  ["not proven", "not proven", "--s-unproven"],
+  ["differs", "differs", "--s-differs"],
+  ["not converted", "not converted", "--s-not_converted"],
+];
+const time = (t) => (t || "").replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC");
+
+function pickers() {
+  const froms = [...new Set(INITIAL.with_rules.map(([f]) => f))];
+  $("from").innerHTML = froms.map((f) => `<option value="${esc(f)}">${esc(NAME[f])}</option>`).join("");
+  const tos = () => {
+    const keep = $("to").value;
+    const ts = INITIAL.with_rules.filter(([f]) => f === $("from").value).map(([, t]) => t);
+    $("to").innerHTML = ts.map((t) => `<option value="${esc(t)}">${esc(NAME[t])}</option>`).join("");
+    if (ts.includes(keep)) $("to").value = keep;
+  };
+  $("from").addEventListener("change", tos);
+  tos();
+}
+
+function ladder(units) {
+  const total = LADDER.reduce((n, [k]) => n + (units[k] || 0), 0) || 1;
+  return `<div class="bar">${LADDER.map(([k, , c]) => units[k] ? `<i style="width:${units[k] / total * 100}%;background:var(${c})"></i>` : "").join("")}</div>`;
+}
+
+function row(r) {
+  const title = `Convert ${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
+  const sub = `<span class="path">${esc(r.src)}</span> into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}`;
+  let right = "", act = "", extra = "", dot = r.state;
+  if (r.state === "running") {
+    const pct = r.total ? r.checked / r.total * 100 : 0;
+    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Checked ${r.checked} of ${r.total}` : "Reading and converting…"}</div>`;
+    act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
+  } else if (r.state === "done") {
+    const u = r.totals.units || {};
+    right = ladder(u) + `<div class="meta">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${r.complete ? "" : " · not every file converted"}</div>`;
+    act = `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`;
+    extra = `<div class="legend">${LADDER.filter(([k]) => u[k]).map(([k, l, c]) => `<span style="--c:var(${c})"><b>${u[k]}</b> ${esc(l)}</span>`).join("")}</div>`
+      + (r.not_applied.length ? `<div class="failed-msg">${r.not_applied.length} review decision${r.not_applied.length === 1 ? " was" : "s were"} not applied: ${esc(r.not_applied[0])}${r.not_applied.length > 1 ? " …" : ""}</div>` : "");
+  } else if (r.state === "cancelled") {
+    right = `<div class="meta">Cancelled; nothing was written into the output folder</div>`;
+  } else {
+    extra = `<div class="failed-msg">${esc(r.error)}</div>`;
+  }
+  return `<div class="run"><span class="dot ${dot}"></span><div><div class="t">${title}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}</div>`;
+}
+
+let timer = null;
+function render(runs) {
+  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, and open for review when they finish.</div>`;
+  $("runs").querySelectorAll("[data-cancel]").forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try { await post(`/runs/${b.dataset.cancel}/cancel`, {}); } catch (e) { $("err").textContent = e.message; }
+    refresh();
+  }));
+  clearTimeout(timer);
+  if (runs.some((r) => r.state === "running")) timer = setTimeout(refresh, 700);
+  railReview(runs.find((r) => r.state === "done"));
+}
+// The rail's Review leads to the newest finished run, as the server draws it
+// on the next page load (unless the app was started on a review).
+function railReview(run) {
+  const item = document.querySelector('#app-rail [title^="Review a converted tree"]');
+  if (!run || !item) return;
+  const href = `/runs/${run.id}/review`;
+  if (item.tagName === "A") {
+    if (/^\/runs\/\d+\/review$/.test(item.getAttribute("href"))) item.setAttribute("href", href);
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = href;
+  a.title = "Review a converted tree";
+  a.innerHTML = item.innerHTML;
+  item.replaceWith(a);
+}
+async function refresh() {
+  try {
+    const res = await fetch("/api/runs");
+    if (res.ok) render(await res.json());
+  } catch (e) { timer = setTimeout(refresh, 3000); }
+}
+async function post(url, body) {
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || res.statusText);
+  return JSON.parse(text);
+}
+$("conv").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const src = $("src").value.trim(), out = $("out").value.trim();
+  if (!src || !out) { $("err").textContent = "Give a source and an output folder."; return; }
+  $("err").textContent = ""; $("go").disabled = true;
+  try {
+    await post("/api/runs", { src, out, from: $("from").value, to: $("to").value, overwrite: $("overwrite").checked });
+    $("overwrite").checked = false;
+  } catch (e) { $("err").textContent = e.message; }
+  $("go").disabled = false;
+  refresh();
+});
+
+pickers();
+if (INITIAL.no_picking) {
+  $("conv").hidden = true;
+  $("conv").insertAdjacentHTML("beforebegin", `<div class="card closed"><span class="t">Not available on a network address</span><span class="s">${esc(INITIAL.no_picking.charAt(0).toUpperCase() + INITIAL.no_picking.slice(1))}.</span></div>`);
+}
+render(INITIAL.runs);
+</script>
+</body>
+</html>
