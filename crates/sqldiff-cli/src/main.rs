@@ -20,6 +20,7 @@ mod convert_cmd;
 mod deny_hash;
 mod dist_cmd;
 mod drift_cmd;
+mod fmt_cmd;
 mod instances_cmd;
 mod queue_cmd;
 mod review_cmd;
@@ -135,6 +136,12 @@ enum Command {
         #[command(flatten)]
         cfg: source_cmd::ConfigArgs,
     },
+    /// Lay out SQL files: indentation, clause breaks, keyword case. Only
+    /// whitespace and keyword case change, and each result is checked: it
+    /// must read as the same tokens and tree, and the engine must find it
+    /// equal; a statement that fails stays as written. Exit 1 with --check
+    /// if a file is not formatted.
+    Fmt(fmt_cmd::Args),
     /// Parse one artifact, verify the lossless round trip and optionally dump the tree.
     Parse {
         file: PathBuf,
@@ -523,6 +530,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 &cfg,
             )
         }
+        Command::Fmt(args) => fmt_cmd::run(args),
         Command::Parse {
             file,
             dialect,

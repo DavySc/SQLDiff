@@ -458,6 +458,8 @@ fn merge(acc: &mut Policy, hi: &Policy) {
     if hi.template.is_some() {
         acc.template = hi.template.clone();
     }
+    // Format keys: the higher layer replaces key by key.
+    acc.format.merge(&hi.format);
 }
 
 fn prepend<T: Clone>(acc: &mut Vec<T>, hi: &[T]) {

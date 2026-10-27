@@ -80,6 +80,13 @@ pub struct Policy {
     /// Terms that must never appear in the core repository, fixtures or exports.
     #[serde(default)]
     pub deny_list: Vec<String>,
+    /// Formatter layout (`sqldiff fmt`), with per-dialect tables.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub format: sqldiff_core::format::FormatConfig,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
