@@ -126,8 +126,11 @@ case "$mode:${hashes:+hashed}" in
   commits:*)
     for c in $(git rev-list "$arg"); do
       short="$(git rev-parse --short "$c")"
-      # The patch includes file names; the format adds message and identities.
-      git show --no-color --format='%an%n%ae%n%cn%n%ce%n%B' "$c" -- . ':!target' > "$out.commit"
+      # Message and identities come from git log: git show prints nothing at all,
+      # header included, for a commit whose patch the pathspec filters out (an
+      # empty commit, or one touching only target/). The patch includes file names.
+      git log -1 --no-color --format='%an%n%ae%n%cn%n%ce%n%B' "$c" > "$out.commit"
+      git show --no-color --format= "$c" -- . ':!target' >> "$out.commit"
       if [[ -n "$hashes" ]]; then
         run "$bin" pack scan --hashes "$terms" --label "commit $short" < "$out.commit" || found=1
       else
