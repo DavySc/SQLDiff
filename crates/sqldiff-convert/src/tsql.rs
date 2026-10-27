@@ -1507,6 +1507,27 @@ impl<'a> Cx<'a> {
                     self.expr(&t[eq + 1..]).trim().to_string()
                 });
             }
+            // Without FROM the list runs to the end of the statement, so a
+            // clause there would end up inside the last expression.
+            // `SELECT @v = 1 WHERE <false>` keeps @v (SQL Server 2022), while
+            // PL/pgSQL `v := 1 WHERE <false>` sets NULL.
+            if from.is_none()
+                && [
+                    "WHERE",
+                    "GROUP",
+                    "HAVING",
+                    "ORDER",
+                    "UNION",
+                    "EXCEPT",
+                    "INTERSECT",
+                ]
+                .iter()
+                .any(|w| find_word(&ts, list_start, w).is_some())
+            {
+                return no(
+                    "SELECT @v = … with WHERE (or another clause) and no FROM: a false condition keeps the variables in T-SQL; rewrite as IF … SET",
+                );
+            }
             if from.is_none() && limit.is_none() {
                 let db2 = self.db2();
                 return Ok((

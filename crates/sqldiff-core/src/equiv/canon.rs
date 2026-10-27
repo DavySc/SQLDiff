@@ -2297,6 +2297,9 @@ impl<'a> Canon<'a> {
 
     /// `scalar(query, on-several-rows, on-zero-rows)`.
     fn scalar(&mut self, q: Term, many: &str, zero: &str) -> Term {
+        if exactly_one(&q) {
+            return n("scalar", vec![q, a("n/a"), a("n/a")]);
+        }
         let many = if self.at_most_one(&q) {
             "n/a".to_string()
         } else if self.uniqueness_known(&q) {
@@ -2521,6 +2524,25 @@ impl<'a> Canon<'a> {
             // T-SQL `SELECT @v = col FROM ...`: keeps the last row; zero rows leave @v unchanged.
             if assigns.len() != sel.items.len() || assigns.len() != 1 {
                 return Err("SELECT assigning several variables is not supported".into());
+            }
+            // Without FROM, WHERE, grouping or paging the query returns exactly
+            // one row: the statement is `SET @v = expr` (SQL Server 2022: a
+            // scalar subquery in it gives NULL on no row, as in SET).
+            let bare = sel.from.is_empty()
+                && sel.where_.is_none()
+                && sel.group_by.is_empty()
+                && sel.having.is_none()
+                && sel.top.is_none()
+                && sel.limit.is_none()
+                && sel.offset.is_none()
+                && sel.set_ops.is_empty()
+                && sel.ctes.is_empty()
+                && sel.values.is_none()
+                && !sel.for_json
+                && !sel.distinct;
+            if bare {
+                let var = Expr::Var(assigns[0].assign.clone().unwrap());
+                return self.stmt(&Stmt::Assign(var, assigns[0].expr.clone()));
             }
             let (sym, ty) = self.target_sym(&Expr::Var(assigns[0].assign.clone().unwrap()))?;
             let (q, qty) = self.query(sel, QCtx::Into)?;
@@ -3400,6 +3422,41 @@ impl Item {
 }
 
 /// Best-effort type of a lowered value, for dropping no-op conversions.
+/// The query returns exactly one row: an aggregate query without GROUP BY,
+/// HAVING or paging (`q(distinct, items, from, where, group, having, order,
+/// page, lock)`). It aggregates even when WHERE matches no row; HAVING, TOP 0
+/// or OFFSET can drop that row. Only an aggregate in the select list itself
+/// counts, not one inside a subquery.
+fn exactly_one(q: &Term) -> bool {
+    if !q.is("q") {
+        return false;
+    }
+    let none = |k: usize| q.kid(k).and_then(Term::atom) == Some("-");
+    let ungrouped = q
+        .kid(4)
+        .is_some_and(|g| g.is("group") && g.kids().is_empty());
+    let items = q
+        .kid(1)
+        .filter(|i| i.is("items"))
+        .map(Term::kids)
+        .unwrap_or(&[]);
+    ungrouped && none(5) && none(7) && items.iter().any(aggregates)
+}
+
+/// An aggregate call in this expression, outside any subquery.
+fn aggregates(t: &Term) -> bool {
+    if t.is("q") {
+        return false;
+    }
+    // MIN and MAX of one argument; a string's comparison is the dialect's.
+    let min_max = |name: Option<&Term>| matches!(name.and_then(Term::atom), Some("min" | "max"));
+    t.is("count")
+        || t.is("stringagg")
+        || (t.is("fn") && t.kids().len() == 2 && min_max(t.kid(0)))
+        || (t.is("dfn") && t.kids().len() == 3 && min_max(t.kid(1)))
+        || t.kids().iter().any(aggregates)
+}
+
 fn ret_ty_of(t: &Term) -> Option<Ty> {
     if t.is("conv") {
         // conv(ty(fam, len, scale), v)
