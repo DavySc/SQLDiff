@@ -253,6 +253,14 @@ fn workspace_file(dir: &str) -> Result<PathBuf, String> {
 
 fn load(dir: &str, isolated: bool) -> Result<Workspace, String> {
     let file = workspace_file(dir)?;
+    // A `sqldiff.toml` that is also the user config or a private pack would
+    // otherwise be read, shown and quoted in errors as the workspace file.
+    if is_private_file(&file, isolated) {
+        return Err(format!(
+            "{}: this file is also the user config or a private pack, whose contents are not shown; choose another folder",
+            file.display()
+        ));
+    }
     let text = match std::fs::read_to_string(&file) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -283,6 +291,37 @@ fn load(dir: &str, isolated: bool) -> Result<Workspace, String> {
         cfg,
         pack_names,
     })
+}
+
+/// `file` is the user config or a private pack the app would load.
+fn is_private_file(file: &Path, isolated: bool) -> bool {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| browse::absolute(p));
+    let me = canon(file);
+    if config::user_config_path().is_some_and(|p| canon(&p) == me) {
+        return true;
+    }
+    // The packs the other layers load, without any workspace file.
+    let Ok(cli) = config::cli_layer(&[], &[], None) else {
+        return true;
+    };
+    let others = Resolved::load_without_search(&Sources {
+        project: None,
+        user: None,
+        isolated,
+        cwd: file.parent().map(Path::to_path_buf),
+        packs: Vec::new(),
+        cli,
+    });
+    match others {
+        Ok(cfg) => cfg
+            .format_layers
+            .iter()
+            .filter(|l| l.kind == LayerKind::PrivatePack)
+            .filter_map(|l| l.path.as_deref())
+            .any(|p| canon(p) == me),
+        // Not loadable: `load` says so without quoting it.
+        Err(_) => false,
+    }
 }
 
 /// A layer whose contents the page never gets.

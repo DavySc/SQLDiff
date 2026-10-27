@@ -402,14 +402,31 @@ fn user_config_scenario(d: &Dir) {
         json!({"value": null, "hidden": true, "layer": 2, "dialect_table": false})
     );
     assert!(!v.to_string().contains("preserve"), "{v}");
-    // A save into the same file is refused.
+    // As the workspace, the same file is neither shown nor saved to.
+    let (status, v) = settings(addr, &d.0.join("home"));
+    assert_eq!(status, "400 Bad Request", "{v}");
+    assert!(!v.to_string().contains("preserve"), "{v}");
     let (status, body) = post(
         addr,
         "/api/settings/save",
         json!({"dir": d.0.join("home"), "draft": {"indent": 4}, "hash": null}),
     );
-    assert_eq!(status, "403 Forbidden", "{body}");
+    assert_eq!(status, "400 Bad Request", "{body}");
+    assert!(!body.to_string().contains("preserve"), "{body}");
     assert_eq!(d.read("home/sqldiff.toml"), USER_CONFIG);
+    // Nor is a private pack the user config loads that is itself a
+    // `sqldiff.toml`.
+    d.write(
+        "packdir/sqldiff.toml",
+        "[pack]\nname = \"zz-private-file\"\nversion = \"1\"\n[format]\nindent = 5\n",
+    );
+    d.write(
+        "home/sqldiff.toml",
+        "private_packs = [\"../packdir/sqldiff.toml\"]\n",
+    );
+    let (status, v) = settings(addr, &d.0.join("packdir"));
+    assert_eq!(status, "400 Bad Request", "{v}");
+    assert!(!v.to_string().contains("zz-"), "{v}");
 }
 
 #[test]
