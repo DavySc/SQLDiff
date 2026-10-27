@@ -86,7 +86,10 @@ fn run_sheet(sheet: &Sheet, elsewhere: &Path, other_user: &Path) -> std::process
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            &sheet.powershell,
+            // `-Command` reports only 0 or 1; pass on sqldiff's own code.
+            // (Not part of the sheet: pasted into a console, `exit` would
+            // close it.)
+            &format!("{}; exit $LASTEXITCODE", sheet.powershell),
         ]);
         c
     } else {
