@@ -397,7 +397,7 @@ impl Run {
             *seen = Some(match r.gate() {
                 Ok(g) => GateView {
                     complete: g.complete,
-                    counts: g.counts.clone(),
+                    counts: g.counts,
                     blockers: g.blockers.len(),
                     error: None,
                 },
@@ -405,7 +405,7 @@ impl Run {
                     complete: false,
                     counts: Default::default(),
                     blockers: 0,
-                    error: Some(e.clone()),
+                    error: Some(e),
                 },
             });
         }

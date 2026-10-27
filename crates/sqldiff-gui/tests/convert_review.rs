@@ -7,7 +7,9 @@ use sqldiff_convert::review::{file_hash, By, Ledger, State, LEDGER_FILE};
 use sqldiff_convert::tree;
 use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
-use sqldiff_gui::convert_review::{Action, RecordRequest, Review, Setup, Target, UnitView};
+use sqldiff_gui::convert_review::{
+    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_STALE,
+};
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
 const ASSUMING_2: &str = "CREATE PROCEDURE dbo.p2 AS\nBEGIN\n  UPDATE dbo.t SET a = 2;\nEND\n";
@@ -475,8 +477,20 @@ fn the_done_gate_follows_the_decisions_and_the_files() {
     assert_eq!(g.nothing_found, 1, "the table: nothing found, not reviewed");
     r.refresh().unwrap();
     assert!(r.state(false).gate.unwrap().complete);
-    // The converted tree no longer what converting gives: not done.
+    // The converted tree no longer what converting gives. Before anything
+    // reads it again, the verdict on the old files no longer stands.
     std::fs::write(f.out().join("t.sql"), "-- edited\n").unwrap();
+    let st = r.state(false);
+    assert!(st.gate.is_none(), "a Done on files that changed since");
+    assert_eq!(st.gate_error.as_deref(), Some(GATE_STALE));
+    assert_eq!(r.gate().unwrap_err(), GATE_STALE);
+    // A new source file makes it stale too.
+    r.refresh().unwrap();
+    assert!(r.state(false).gate.is_some());
+    std::fs::write(f.dir.join("src").join("new.sql"), PLAIN).unwrap();
+    assert_eq!(r.gate().unwrap_err(), GATE_STALE);
+    std::fs::remove_file(f.dir.join("src").join("new.sql")).unwrap();
+    // Read again: judged on the files as they are.
     r.refresh().unwrap();
     let st = r.state(false);
     let g = st.gate.unwrap();
