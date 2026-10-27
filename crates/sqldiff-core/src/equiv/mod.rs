@@ -21,6 +21,7 @@ pub mod schema;
 pub mod script;
 pub mod table;
 pub mod term;
+mod trigger;
 pub mod xwit;
 
 use sqldiff_syntax::{ast as cst, SyntaxNode};
@@ -137,10 +138,18 @@ fn line(side: &Analyzed, nodes: &[SyntaxNode]) -> usize {
     nodes.first().map(|n| side.line_of(n)).unwrap_or(0)
 }
 
+pub use trigger::functions as trigger_functions;
+
 /// Cross-dialect comparison of two artifacts. Scripts are compared segment
 /// by segment (`script.rs`): a T-SQL batch against the block it became.
 pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome {
     let mut out = Outcome::default();
+    if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
+        for (ua, ub, sa, sb) in &pairs {
+            compare_units(a, b, ua, ub, sa, sb, &mut out);
+        }
+        return out;
+    }
     let pairs =
         script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
     for (mut ua, mut ub) in pairs {
@@ -203,7 +212,10 @@ fn compare_units(
     // Witnesses across dialects compare parameters by position, so the
     // routines must take the same parameters.
     // Statements outside the comparison could change or undo the witness.
+    // A trigger's images are rows of its table, which witnesses (tables
+    // filled independently) do not keep.
     let wit = (ua.kind == ub.kind
+        && ua.kind != UnitKind::Trigger
         && ua.params.len() == ub.params.len()
         && ua.uncovered.is_empty()
         && ub.uncovered.is_empty()
@@ -225,7 +237,8 @@ fn compare_units(
         // inputs reach it and its result is the routine's.
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
-    pair_items(a, b, &ia, &ib, wit.as_ref(), out);
+    let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
+    pair_items(a, b, &ia, &ib, &gaps, wit.as_ref(), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
 }
 
@@ -1520,31 +1533,273 @@ fn other_terms(items: &[Item], k: usize) -> Vec<&Term> {
         .collect()
 }
 
+/// A stretch of a unit's body that statement-level equivalence leaves out
+/// (an IF, a loop, an uncovered statement, a CATCH or EXCEPTION section):
+/// the item index it sits before, its line and what it is. Declarations,
+/// handlers, labels and routine options are not gaps: they do not take a
+/// statement's place.
+struct Gap {
+    before: usize,
+    line: usize,
+    what: String,
+}
+
+fn gaps(side: &Analyzed, u: &Unit, items: &[Item]) -> Vec<Gap> {
+    use sqldiff_syntax::SyntaxKind as SK;
+    let starts: Vec<usize> = items
+        .iter()
+        .map(|it| {
+            it.nodes
+                .iter()
+                .map(|n| cst::sig_range(n).0)
+                .min()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut found: Vec<(usize, Gap)> = Vec::new();
+    for (node, what) in &u.uncovered {
+        let takes_place = match node.kind() {
+            SK::IF_STMT
+            | SK::LOOP_STMT
+            | SK::CASE_STMT
+            | SK::CATCH_BLOCK
+            | SK::EXCEPTION_SECTION
+            | SK::ERROR => true,
+            SK::STATEMENT => !node
+                .parent()
+                .is_some_and(|p| p.kind() == SK::DECLARE_SECTION),
+            _ => false,
+        };
+        let (s, e) = cst::sig_range(node);
+        // A construct around compared statements (a routine's option) is
+        // not in their sequence.
+        if !takes_place || starts.iter().any(|&x| s <= x && x < e) {
+            continue;
+        }
+        found.push((
+            s,
+            Gap {
+                before: starts.iter().filter(|&&x| x < s).count(),
+                line: side.line_of(node),
+                what: what.clone(),
+            },
+        ));
+    }
+    found.sort_by_key(|g| g.0);
+    found.into_iter().map(|(_, g)| g).collect()
+}
+
+/// One position in a side's sequence: a statement (its index, pairing key
+/// and whether it could not be read) or a gap.
+#[derive(Clone, Copy, Debug)]
+enum Slot<'k> {
+    Item(usize, &'k str, bool),
+    Gap(usize),
+}
+
+impl<'k> Slot<'k> {
+    fn key(&self) -> Option<&'k str> {
+        match self {
+            Slot::Item(_, k, _) => Some(k),
+            Slot::Gap(_) => None,
+        }
+    }
+}
+
+/// A statement (of side A or B) that lines up with a gap on the other side.
+#[derive(Clone, Copy, Debug)]
+struct Beside {
+    item_a: bool,
+    item: usize,
+    gap: usize,
+}
+
+/// The slots of a side: its items in order, with each gap before the item
+/// it precedes.
+fn slots<'k>(keys: &'k [String], items: &[Item], gaps: &[Gap]) -> Vec<Slot<'k>> {
+    let mut out = Vec::new();
+    let mut g = gaps.iter().enumerate().peekable();
+    for (i, k) in keys.iter().enumerate() {
+        while let Some((gi, _)) = g.next_if(|(_, x)| x.before <= i) {
+            out.push(Slot::Gap(gi));
+        }
+        out.push(Slot::Item(i, k, items[i].err.is_some()));
+    }
+    out.extend(g.map(|(gi, _)| Slot::Gap(gi)));
+    out
+}
+
+/// Pairs the statements of two sides whose numbers differ. Without gaps:
+/// the longest common subsequence of pairing keys. With gaps: an alignment
+/// of the slots with the most matches of two statements with the same key,
+/// then the most matches of two gaps, then the most matches of a gap against
+/// one statement (a T-SQL statement converted into a PostgreSQL loop block,
+/// or replaced by a not-converted placeholder) or of a statement that could
+/// not be read against any statement. Only what every best alignment agrees
+/// on is kept: two statements are paired, or a statement is put beside a
+/// gap, when every best alignment does so. A statement that best alignments
+/// place differently is left unpaired and reported, never compared with a
+/// neighbour of its counterpart.
+fn align(a: &[Slot], b: &[Slot]) -> Alignment {
+    let gap = |s: &[Slot]| s.iter().any(|x| matches!(x, Slot::Gap(_)));
+    if !gap(a) && !gap(b) {
+        let ka: Vec<&str> = a.iter().filter_map(Slot::key).collect();
+        let kb: Vec<&str> = b.iter().filter_map(Slot::key).collect();
+        return Alignment {
+            pairs: crate::normalize::lcs_pairs(&ka, &kb),
+            ..Alignment::default()
+        };
+    }
+    let (n, m) = (a.len(), b.len());
+    if n.saturating_mul(m) > ALIGN_CELLS {
+        return Alignment::default();
+    }
+    // A match of keys outweighs any number of gap matches, and a gap
+    // against a gap any number of the others. With `ALIGN_CELLS` the
+    // scores stay far below `u64::MAX`.
+    let tier = (n + m + 1) as u64;
+    let w = |x: &Slot, y: &Slot| match (x, y) {
+        (Slot::Item(_, k, r), Slot::Item(_, l, q)) => match () {
+            _ if k == l => Some(tier * tier),
+            _ if *r || *q => Some(1),
+            _ => None,
+        },
+        (Slot::Gap(_), Slot::Gap(_)) => Some(tier),
+        _ => Some(1),
+    };
+    // f: best score of a[..i] against b[..j]; g: of a[i..] against b[j..].
+    let mut f = vec![vec![0u64; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            let d = w(&a[i - 1], &b[j - 1]).map_or(0, |x| f[i - 1][j - 1] + x);
+            f[i][j] = d.max(f[i - 1][j]).max(f[i][j - 1]);
+        }
+    }
+    let mut g = vec![vec![0u64; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            let d = w(&a[i], &b[j]).map_or(0, |x| g[i + 1][j + 1] + x);
+            g[i][j] = d.max(g[i + 1][j]).max(g[i][j + 1]);
+        }
+    }
+    let best = f[n][m];
+    let usable =
+        |i: usize, j: usize| w(&a[i], &b[j]).is_some_and(|x| f[i][j] + x + g[i + 1][j + 1] == best);
+    let mut out = Alignment::default();
+    // Every best alignment matches slot `i` of a side, and with one partner.
+    for is_a in [true, false] {
+        let (len, other) = if is_a { (n, m) } else { (m, n) };
+        for i in 0..len {
+            let at = |k: usize| if is_a { (i, k) } else { (k, i) };
+            let skipped = (0..=other).any(|k| {
+                let (x, y) = at(k);
+                if is_a {
+                    f[x][y] + g[x + 1][y] == best
+                } else {
+                    f[x][y] + g[x][y + 1] == best
+                }
+            });
+            let partners: Vec<usize> = (0..other)
+                .filter(|&k| {
+                    let (x, y) = at(k);
+                    usable(x, y)
+                })
+                .collect();
+            let mine = if is_a { &a[i] } else { &b[i] };
+            let Slot::Item(item, ..) = *mine else {
+                continue;
+            };
+            let theirs = |k: usize| if is_a { b[k] } else { a[k] };
+            match (skipped, partners.as_slice()) {
+                (false, &[k]) => match theirs(k) {
+                    Slot::Item(j, ..) => {
+                        if is_a {
+                            out.pairs.push((item, j));
+                        }
+                    }
+                    Slot::Gap(gi) => out.beside.push(Beside {
+                        item_a: is_a,
+                        item,
+                        gap: gi,
+                    }),
+                },
+                (_, []) => {}
+                _ => out.ambiguous.push((is_a, item)),
+            }
+        }
+    }
+    out
+}
+
+/// Above this many cells the alignment is not searched and nothing is
+/// paired.
+const ALIGN_CELLS: usize = 16_000_000;
+
+/// How two sides' statements were paired (`align`).
+#[derive(Debug, Default)]
+struct Alignment {
+    pairs: Vec<(usize, usize)>,
+    /// Statements every best alignment puts against a gap.
+    beside: Vec<Beside>,
+    /// Statements best alignments place differently: (side A, index).
+    ambiguous: Vec<(bool, usize)>,
+}
+
 fn pair_items(
     a: &Analyzed,
     b: &Analyzed,
     ia: &[Item],
     ib: &[Item],
+    gaps: &[Vec<Gap>; 2],
     wit: Option<&Witnessing>,
     out: &mut Outcome,
 ) {
-    let pairs: Vec<(usize, usize)> = if ia.len() == ib.len() {
-        (0..ia.len()).map(|i| (i, i)).collect()
+    let ka: Vec<String> = ia.iter().map(|x| key(&x.term)).collect();
+    let kb: Vec<String> = ib.iter().map(|x| key(&x.term)).collect();
+    let Alignment {
+        pairs,
+        beside,
+        ambiguous,
+    } = if ia.len() == ib.len() {
+        Alignment {
+            pairs: (0..ia.len()).map(|i| (i, i)).collect(),
+            ..Alignment::default()
+        }
     } else {
-        let ka: Vec<String> = ia.iter().map(|x| key(&x.term)).collect();
-        let kb: Vec<String> = ib.iter().map(|x| key(&x.term)).collect();
-        crate::normalize::lcs_pairs(&ka, &kb)
+        let (sa, sb) = (slots(&ka, ia, &gaps[0]), slots(&kb, ib, &gaps[1]));
+        align(&sa, &sb)
     };
     let (na, nb) = (side_name(a), side_name(b));
     for (side, items, name, is_a) in [(a, ia, &na, true), (b, ib, &nb, false)] {
         for (i, it) in items.iter().enumerate() {
             let paired = pairs.iter().any(|p| if is_a { p.0 == i } else { p.1 == i });
-            if !paired {
-                out.unknown_reasons.push(format!(
+            if paired {
+                continue;
+            }
+            let gap = beside.iter().find(|x| x.item_a == is_a && x.item == i);
+            out.unknown_reasons.push(match gap {
+                Some(x) => {
+                    let (gname, g) = if is_a {
+                        (&nb, &gaps[1][x.gap])
+                    } else {
+                        (&na, &gaps[0][x.gap])
+                    };
+                    format!(
+                        "{name} line {}: statement is not paired: its counterpart may be in {} at {gname} line {}, which is not compared",
+                        line(side, &it.nodes),
+                        g.what,
+                        g.line
+                    )
+                }
+                None if ambiguous.contains(&(is_a, i)) => format!(
+                    "{name} line {}: statement is not paired: the statements around it line up with the other side in more than one way",
+                    line(side, &it.nodes)
+                ),
+                None => format!(
                     "{name} line {}: statement has no counterpart on the other side",
                     line(side, &it.nodes)
-                ));
-            }
+                ),
+            });
         }
     }
     // A witness is searched only for the one pair that is not proven

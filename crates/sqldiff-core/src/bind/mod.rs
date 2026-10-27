@@ -629,9 +629,50 @@ impl<'a> Binder<'a> {
                     .as_ref()
                     .is_some_and(|r| r.base == "TRIGGER");
             if pg_trigger_fn {
-                self.trigger = Some(TriggerCtx {
-                    pg_function: true,
-                    ..TriggerCtx::default()
+                // The transition tables of the triggers that run this
+                // function, when they all name the same table and tables.
+                let key = |v: &[Ident]| v.iter().map(|p| p.key(self.d)).collect::<Vec<_>>();
+                let fname = key(&h.name);
+                let root = node.ancestors().last().unwrap_or_else(|| node.clone());
+                let mut seen: Vec<ddl::TriggerInfo> = Vec::new();
+                for st in root
+                    .descendants()
+                    .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+                {
+                    let t = tokens::of_node(&st);
+                    if let Some((f, info)) = ddl::pg_trigger_statement(&t) {
+                        let f = key(&f);
+                        if f.last() == fname.last()
+                            && (f.len() == 1 || fname.len() == 1 || f == fname)
+                        {
+                            seen.push(info);
+                        }
+                    }
+                }
+                let agreed = seen.first().filter(|first| {
+                    seen.iter().all(|x| {
+                        key(&x.table) == key(&first.table)
+                            && x.referencing.len() == first.referencing.len()
+                            && x.referencing
+                                .iter()
+                                .zip(&first.referencing)
+                                .all(|(a, b)| a.0 == b.0 && a.1.key(self.d) == b.1.key(self.d))
+                    })
+                });
+                self.trigger = Some(match agreed {
+                    Some(info) => TriggerCtx {
+                        table: info.table.clone(),
+                        referencing: info
+                            .referencing
+                            .iter()
+                            .map(|(w, a)| (a.key(self.d), w.ends_with("TABLE")))
+                            .collect(),
+                        pg_function: true,
+                    },
+                    None => TriggerCtx {
+                        pg_function: true,
+                        ..TriggerCtx::default()
+                    },
                 });
             }
         }

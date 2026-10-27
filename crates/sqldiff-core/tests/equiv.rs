@@ -1039,3 +1039,44 @@ fn select_assign_without_from_is_a_plain_assignment() {
     let r = select_assign("SELECT @r = 1 WHERE @id = 0", "r := 1");
     assert!(not_equal(&r), "{:?}", r.verdict);
 }
+
+#[test]
+fn ungrouped_sum_and_avg_return_one_row_but_stay_the_dialects_own() {
+    // Verified on SQL Server 2022 and PostgreSQL 18: on an empty table SUM and
+    // AVG give one NULL row on both, so no side keeps the old value; AVG of
+    // ints is 1 in T-SQL and 1.5 in PostgreSQL, so they are not equal either.
+    for (ts, pg) in [
+        (
+            "SELECT @r = SUM(customer_id) FROM dbo.customer",
+            "SELECT sum(customer_id) INTO r FROM customer",
+        ),
+        (
+            "SELECT @r = AVG(customer_id) FROM dbo.customer WHERE customer_id > @id",
+            "SELECT avg(customer_id) INTO r FROM customer WHERE customer_id > p_id",
+        ),
+    ] {
+        let r = select_assign(ts, pg);
+        assert!(not_equal(&r), "{ts}: {:?}", r.verdict);
+        assert!(
+            !rules(&r).contains(&"equiv.no-rows"),
+            "{ts}: {:?}",
+            r.findings
+        );
+    }
+    let r = select_assign(
+        "SELECT @r = SUM(customer_id) FROM dbo.customer GROUP BY last_name",
+        "SELECT sum(customer_id) INTO r FROM customer GROUP BY last_name",
+    );
+    assert!(rules(&r).contains(&"equiv.no-rows"), "{:?}", r.findings);
+}
+
+#[test]
+fn a_qualified_call_is_a_user_function_not_the_built_in() {
+    // SQL Server 2022: `dbo.max` is a user scalar function, called once per
+    // row; on an empty table the variable keeps its value.
+    let r = select_assign(
+        "SELECT @r = dbo.max(customer_id) FROM dbo.customer",
+        "SELECT max(customer_id) INTO r FROM customer",
+    );
+    assert!(not_equal(&r), "{:?} {:?}", r.verdict, r.findings);
+}

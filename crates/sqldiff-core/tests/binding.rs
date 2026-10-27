@@ -750,3 +750,73 @@ fn db2_select_needs_from_and_sysdummy1_binds() {
     let r = check_rules(Dialect::Postgres, "SELECT 1;", None);
     assert!(rules(&r).is_empty(), "{:?}", rules(&r));
 }
+
+/// A PL/pgSQL option line before DECLARE is not a statement: the variables declared after it
+/// stay in scope. `#` is still an operator inside an expression.
+#[test]
+fn pg_option_line_before_declare_keeps_variables_in_scope() {
+    let body = "declare\n    v_qty integer := 1;\n    v_total integer;\nbegin\n    v_total := v_qty + 1;\n    perform v_total;\nend\n";
+    for option in [
+        "",
+        "#variable_conflict use_column\n",
+        "-- note\n#print_strict_params on\n#variable_conflict error\n",
+    ] {
+        let src =
+            format!("create function f() returns void language plpgsql as $$\n{option}{body}$$;\n");
+        let r = check_rules(Dialect::Postgres, &src, None);
+        assert!(
+            !rules(&r).iter().any(|x| x.0.starts_with("bind.")),
+            "option {option:?}: {:?}",
+            rules(&r)
+        );
+    }
+    let xor = "create function g(a integer, b integer) returns integer language sql as $$ select a # b $$;";
+    let r = check_rules(Dialect::Postgres, xor, None);
+    assert!(
+        !rules(&r).iter().any(|x| x.0.starts_with("bind.")),
+        "{:?}",
+        rules(&r)
+    );
+}
+
+/// T-SQL `inserted`/`deleted` as FROM tables of a trigger, and the transition
+/// tables a PostgreSQL trigger function gets from its CREATE TRIGGER, bind to
+/// the trigger's table; outside a trigger they do not.
+#[test]
+fn trigger_images_bind_to_the_trigger_table() {
+    let tables = |d| {
+        Artifact::new(
+            "t.sql",
+            d,
+            "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, qty int NOT NULL);",
+        )
+    };
+    let check = |d, sql: &str| {
+        let o = Options {
+            catalog_a: vec![tables(d)],
+            ..Options::default()
+        };
+        rules(&sqldiff_core::check(&Artifact::new("x.sql", d, sql), &o))
+    };
+    let tsql = "CREATE TRIGGER tu ON orders AFTER UPDATE AS
+UPDATE o SET qty = i.qty FROM orders o JOIN inserted i ON i.order_id = o.order_id LEFT JOIN deleted AS d ON d.order_id = i.order_id;";
+    assert!(
+        check(Dialect::Tsql, tsql).is_empty(),
+        "{:?}",
+        check(Dialect::Tsql, tsql)
+    );
+    let pg = "CREATE FUNCTION tu() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE orders o SET qty = i.qty FROM inserted i WHERE i.order_id = o.order_id AND EXISTS (SELECT 1 FROM deleted d WHERE d.order_id = i.order_id);
+  RETURN NULL;
+END;
+$$;
+CREATE TRIGGER tu AFTER UPDATE ON orders REFERENCING NEW TABLE AS inserted OLD TABLE AS deleted FOR EACH STATEMENT EXECUTE FUNCTION tu();";
+    assert!(
+        check(Dialect::Postgres, pg).is_empty(),
+        "{:?}",
+        check(Dialect::Postgres, pg)
+    );
+    let outside = "CREATE PROCEDURE p AS SELECT order_id FROM inserted;";
+    assert!(!check(Dialect::Tsql, outside).is_empty());
+}

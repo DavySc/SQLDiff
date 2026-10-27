@@ -17,6 +17,9 @@ pub enum UnitKind {
     TableFn,
     Proc,
     Script,
+    /// A T-SQL AFTER trigger's body for one event, or the PostgreSQL
+    /// statement-trigger function that event runs (`trigger.rs`).
+    Trigger,
 }
 
 impl UnitKind {
@@ -27,6 +30,7 @@ impl UnitKind {
             UnitKind::TableFn => "table function",
             UnitKind::Proc => "procedure",
             UnitKind::Script => "script",
+            UnitKind::Trigger => "trigger",
         }
     }
 }
@@ -148,6 +152,43 @@ pub struct Unit {
     /// Identities of `locals` across the two sides, when they are matched by
     /// name instead of declaration order (`script::name_locals`).
     pub local_ids: Option<Vec<String>>,
+    /// A trigger body lowered for one event (`trigger.rs`).
+    pub trigger: Option<TrigCtx>,
+}
+
+/// The event a trigger body is lowered for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrigCtx {
+    /// The trigger's table, as written (parts unquoted).
+    pub table: Vec<String>,
+    /// The image the statement's rows are in: `inserted` (INSERT, UPDATE) or
+    /// `deleted` (DELETE).
+    pub rows: &'static str,
+    /// The image the event has no rows for: T-SQL gives it empty, the
+    /// PostgreSQL conversion writes `(SELECT * FROM t WHERE false)`.
+    pub missing: Option<&'static str>,
+    /// The body starts with the empty-image guard: T-SQL `IF @@ROWCOUNT = 0
+    /// RETURN`, PostgreSQL `IF NOT EXISTS (SELECT 1 FROM rows) THEN RETURN
+    /// NULL; END IF;`, or either dialect's test for rows. Only the first
+    /// statement can be the guard.
+    pub guard: bool,
+    /// The guard reads T-SQL `@@ROWCOUNT`, which counts a MERGE's rows of
+    /// every action.
+    pub rowcount: bool,
+    started: bool,
+}
+
+impl TrigCtx {
+    pub fn new(table: Vec<String>, rows: &'static str, missing: Option<&'static str>) -> Self {
+        TrigCtx {
+            table,
+            rows,
+            missing,
+            guard: false,
+            rowcount: false,
+            started: false,
+        }
+    }
 }
 
 fn empty(d: Dialect) -> Unit {
@@ -176,6 +217,7 @@ fn empty(d: Dialect) -> Unit {
         header_at: (0, 0),
         in_block: false,
         local_ids: None,
+        trigger: None,
     }
 }
 
@@ -388,6 +430,53 @@ pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
     }
     place_txn(&mut u);
     u
+}
+
+/// A trigger body lowered for one event: a T-SQL trigger's `ROUTINE_BODY`,
+/// or the body of the PostgreSQL function its trigger for that event runs.
+/// Both run inside the firing statement and stop at the first error (a T-SQL
+/// trigger as with XACT_ABORT ON). `RETURN NULL` (PostgreSQL ignores an AFTER
+/// statement trigger's result) is a plain `RETURN`, and the closing `RETURN`
+/// is left out: T-SQL falls off the end, PostgreSQL must return (falling off
+/// is an error, reported as not covered).
+pub fn lower_trigger(d: Dialect, body: &SyntaxNode, ctx: TrigCtx) -> Unit {
+    let mut u = empty(d);
+    u.kind = UnitKind::Trigger;
+    u.in_block = true;
+    u.stops_on_error = true;
+    u.trigger = Some(ctx);
+    walk(body, &mut u);
+    for s in &mut u.stmts {
+        if matches!(s.ast, Ok(Stmt::Return(Some(super::ast::Expr::Null)))) {
+            s.ast = Ok(Stmt::Return(None));
+        }
+    }
+    let last = last_leaf(body);
+    let returns_last = |u: &Unit| {
+        u.stmts.last().is_some_and(|s| {
+            matches!(s.ast, Ok(Stmt::Return(None))) && last.as_ref().is_some_and(|l| *l == s.node)
+        })
+    };
+    if returns_last(&u) {
+        u.stmts.pop();
+    } else if d == Dialect::Postgres {
+        u.uncovered.push((
+            body.clone(),
+            "a trigger function that does not end with RETURN NULL (falling off its end is an error)".into(),
+        ));
+    }
+    place_txn(&mut u);
+    u
+}
+
+/// The last statement-level node of a body, through its blocks.
+fn last_leaf(n: &SyntaxNode) -> Option<SyntaxNode> {
+    let kids = cst::structural_children(n);
+    let last = kids.last()?.clone();
+    match last.kind() {
+        SyntaxKind::BLOCK | SyntaxKind::ROUTINE_BODY => last_leaf(&last),
+        _ => Some(last),
+    }
 }
 
 fn place_txn(u: &mut Unit) {
@@ -606,6 +695,25 @@ fn walk(node: &SyntaxNode, u: &mut Unit) {
 
 fn unit(c: &SyntaxNode, u: &mut Unit) {
     let d = u.dialect;
+    let container = matches!(
+        c.kind(),
+        SyntaxKind::SOURCE_FILE
+            | SyntaxKind::BATCH
+            | SyntaxKind::ROUTINE_BODY
+            | SyntaxKind::BLOCK
+            | SyntaxKind::DECLARE_SECTION
+    );
+    if let Some(t) = u.trigger.as_mut().filter(|t| !container && !t.started) {
+        t.started = true;
+        if let Some(rowcount) = (c.kind() == SyntaxKind::IF_STMT)
+            .then(|| guard(c, d, t.rows))
+            .flatten()
+        {
+            t.guard = true;
+            t.rowcount = rowcount;
+            return;
+        }
+    }
     match c.kind() {
         SyntaxKind::SOURCE_FILE
         | SyntaxKind::BATCH
@@ -794,6 +902,38 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             u.uncovered.push((c.clone(), what));
         }
     }
+}
+
+/// The empty-image guard of a trigger body: T-SQL `IF @@ROWCOUNT = 0
+/// RETURN` (or `< 1`, or `BEGIN RETURN END`), PostgreSQL `IF NOT EXISTS
+/// (SELECT 1 FROM rows) THEN RETURN [NULL]; END IF;`.
+/// Some(true) when it reads `@@ROWCOUNT`.
+fn guard(c: &SyntaxNode, d: Dialect, rows: &str) -> Option<bool> {
+    let words: Vec<String> = tokens(c)
+        .iter()
+        .filter(|t| !matches!(t.kind, K::LParen | K::RParen | K::Semi))
+        .map(|t| match t.kind {
+            K::Word | K::Quoted => cst::unquote(&t.text).to_uppercase(),
+            _ => t.text.to_uppercase(),
+        })
+        .collect();
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let rows = rows.to_uppercase();
+    let ret = |rest: &[&str]| matches!(rest, ["RETURN"] | ["BEGIN", "RETURN", "END"]);
+    let ok = match (d, w.as_slice()) {
+        (Dialect::Tsql, ["IF", "@@ROWCOUNT", op, n, rest @ ..]) => {
+            return (matches!((*op, *n), ("=", "0") | ("<", "1")) && ret(rest)).then_some(true);
+        }
+        (Dialect::Tsql, ["IF", "NOT", "EXISTS", "SELECT", "1" | "*", "FROM", t, rest @ ..]) => {
+            *t == rows && ret(rest)
+        }
+        (
+            Dialect::Postgres,
+            ["IF", "NOT", "EXISTS", "SELECT", "1" | "*", "FROM", t, "THEN", "RETURN", rest @ ..],
+        ) => *t == rows && matches!(rest, ["END", "IF"] | ["NULL", "END", "IF"]),
+        _ => false,
+    };
+    ok.then_some(false)
 }
 
 /// A top-level `CREATE [prefix] TABLE` statement.

@@ -49,6 +49,14 @@ git push -q origin t >/dev/null 2>&1; [[ "$(remote_branches)" == 0 ]] && ok "lea
 git reset -q --hard HEAD~2
 git push -q origin t >/dev/null 2>&1; [[ "$(remote_branches)" == 1 ]] && ok "clean history pushes" || bad "clean push failed"
 
+# A commit whose patch the scan's pathspec filters out still has its message and identities scanned.
+git commit -q --no-verify --allow-empty -m "names zq-secret-term-1" >/dev/null 2>&1
+bash scripts/leak-scan.sh --commits HEAD~1..HEAD >/dev/null 2>&1 && bad "empty commit message not scanned" || ok "empty commit message scanned"
+git reset -q --hard HEAD~1
+git -c user.email=me@zq-corp.example commit -q --no-verify --allow-empty -m plain >/dev/null 2>&1
+bash scripts/leak-scan.sh --commits HEAD~1..HEAD >/dev/null 2>&1 && bad "empty commit identity not scanned" || ok "empty commit identity scanned"
+git reset -q --hard HEAD~1
+
 unset SQLDIFF_DENYLIST_FILE
 git config sqldiff.requireDenylist true
 echo q >> ok.txt; git add ok.txt
@@ -87,6 +95,13 @@ else
   scan --commits "$base..HEAD" && bad "hashed: leak buried in history not found" || ok "hashed: leak buried in history found"
   git commit -q --no-verify --allow-empty -m "names zq-secret-term-1"
   scan --commits HEAD~1..HEAD && bad "hashed: message term not found" || ok "hashed: message term found"
+  git reset -q --hard "$base"
+  git -c user.email=me@zq-corp.example commit -q --no-verify --allow-empty -m plain
+  scan --commits HEAD~1..HEAD && bad "hashed: identity term not found" || ok "hashed: identity term found"
+  git reset -q --hard "$base"
+  mkdir -p target; echo "t zq-secret-term-1" > target/x.txt; git add -f target/x.txt
+  git commit -q --no-verify -m "names zq-secret-term-1"
+  scan --commits HEAD~1..HEAD && bad "hashed: message of a target-only commit not found" || ok "hashed: message of a target-only commit found"
   git reset -q --hard "$base"
   scan --commits "$base" && ok "hashed: clean history passes" || bad "hashed: clean history blocked"
 
