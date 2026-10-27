@@ -239,6 +239,47 @@ pub struct When {
     pub action: MergeAction,
 }
 
+impl Select {
+    /// T-SQL `SELECT @v = expr` with no FROM, WHERE, grouping or paging: the
+    /// query returns exactly one row, so the statement is `SET @v = expr`
+    /// (SQL Server 2022: a scalar subquery in it gives NULL on no row, as in
+    /// SET). The target and the value.
+    pub fn bare_assign(&self) -> Option<(Expr, &Expr)> {
+        let [item] = self.items.as_slice() else {
+            return None;
+        };
+        let var = item.assign.as_ref()?;
+        let bare = self.from.is_empty()
+            && self.where_.is_none()
+            && self.group_by.is_empty()
+            && self.having.is_none()
+            && self.top.is_none()
+            && self.limit.is_none()
+            && self.offset.is_none()
+            && self.set_ops.is_empty()
+            && self.ctes.is_empty()
+            && self.values.is_none()
+            && self.into.is_empty()
+            && !self.for_json
+            && !self.distinct;
+        bare.then(|| (Expr::Var(var.clone()), &item.expr))
+    }
+}
+
+impl Stmt {
+    /// The target and value of an assignment: `SET`, `:=`, or a bare T-SQL
+    /// `SELECT @v = expr` (see [`Select::bare_assign`]).
+    pub fn assignment(&self) -> Option<(std::borrow::Cow<'_, Expr>, &Expr)> {
+        match self {
+            Stmt::Assign(t, v) => Some((std::borrow::Cow::Borrowed(t), v)),
+            Stmt::Select(q) => q
+                .bare_assign()
+                .map(|(t, v)| (std::borrow::Cow::Owned(t), v)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Select(Box<Select>),

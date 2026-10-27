@@ -300,6 +300,15 @@ const CASES: &[Case] = &[
         NoFault,
         "normal durable=[a]",
     ),
+    // An error in a T-SQL trigger dooms the transaction whatever the
+    // caller set (verified on SQL Server 2022): XACT_ABORT ON.
+    case(
+        &["tsql.transactions.routine_mode.trigger", "tsql.unhandled.xact-abort-on"],
+        Tsql,
+        "CREATE TRIGGER tr ON x AFTER INSERT AS BEGIN INSERT INTO a VALUES (1); INSERT INTO b VALUES (1); END",
+        Write("b", Constraint),
+        "raised undone=[a]",
+    ),
     case(
         &["tsql.transactions.routine_mode.function"],
         Tsql,

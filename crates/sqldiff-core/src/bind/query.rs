@@ -1009,6 +1009,27 @@ impl<'a> Binder<'a> {
             .map(|p| p.text.clone())
             .collect::<Vec<_>>()
             .join(".");
+        // A PostgreSQL trigger function's transition table, or `inserted` /
+        // `deleted` in a T-SQL trigger: the rows of the trigger's table.
+        if let (Some(tr), [p]) = (&self.trigger, parts) {
+            let key = p.key(d);
+            let image = if tr.pg_function {
+                tr.referencing.iter().any(|(a, t)| *t && *a == key)
+            } else {
+                d == Dialect::Tsql
+                    && !tr.table.is_empty()
+                    && (key == "inserted" || key == "deleted")
+            };
+            if image {
+                let tb = self.lookup_table_silent(&tr.table.clone());
+                let res = match &tb {
+                    Some(tb) => Resolution::Resolved(Target::Table(tb.display())),
+                    None => Resolution::Resolved(Target::Implicit),
+                };
+                self.add_ref(RefKind::Table, display, span, stmt, res);
+                return tb;
+            }
+        }
         let local = CatalogView::new(d, &[&self.local]);
         if let Lookup::Found(tb) = local.table(parts) {
             let tb = tb.clone();
