@@ -337,6 +337,8 @@ pub struct Run {
     out: PathBuf,
     reads: Vec<PathBuf>,
     started: String,
+    /// The batch that started the run, and its place in the matrix.
+    batch: Option<BatchTag>,
     /// Kept from an earlier session of the app.
     past: bool,
     checked: AtomicUsize,
@@ -371,6 +373,7 @@ pub struct RunView {
     pub spec: Spec,
     pub command: Command,
     pub started: String,
+    pub batch: Option<BatchTag>,
     /// From an earlier session of the app: its review opens again from the
     /// tree on disk.
     pub past: bool,
@@ -391,6 +394,7 @@ impl Run {
             spec: self.spec.clone(),
             command: self.command.clone(),
             started: self.started.clone(),
+            batch: self.batch,
             past: self.past,
             checked: self.checked.load(Ordering::Relaxed),
             total: self.total.load(Ordering::Relaxed),
@@ -451,6 +455,7 @@ impl Run {
 #[derive(Default)]
 pub struct Runs {
     next: AtomicU64,
+    next_batch: AtomicU64,
     list: Arc<Mutex<Vec<Arc<Run>>>>,
     /// Where the list is kept; `None` keeps it while the app runs only.
     history: Option<PathBuf>,
@@ -463,6 +468,8 @@ struct Record {
     spec: Spec,
     command: Command,
     started: String,
+    #[serde(default)]
+    batch: Option<BatchTag>,
     checked: usize,
     total: usize,
     state: State,
@@ -489,6 +496,7 @@ fn save(file: &Path, list: &[Arc<Run>]) {
             spec: r.spec.clone(),
             command: r.command.clone(),
             started: r.started.clone(),
+            batch: r.batch,
             checked: r.checked.load(Ordering::Relaxed),
             total: r.total.load(Ordering::Relaxed),
             state: r.state(),
@@ -557,6 +565,7 @@ impl Runs {
                     spec: r.spec,
                     command: r.command,
                     started: r.started,
+                    batch: r.batch,
                     past: true,
                     checked: AtomicUsize::new(r.checked),
                     total: AtomicUsize::new(r.total),
@@ -569,6 +578,12 @@ impl Runs {
             .collect();
         Runs {
             next: AtomicU64::new(list.iter().map(|r| r.id).max().unwrap_or(0)),
+            next_batch: AtomicU64::new(
+                list.iter()
+                    .filter_map(|r| r.batch.map(|b| b.id))
+                    .max()
+                    .unwrap_or(0),
+            ),
             list: Arc::new(Mutex::new(list)),
             history: Some(file),
         }
@@ -694,53 +709,60 @@ impl Runs {
         command: Command,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let out = canonical(&out);
-        let reads: Vec<PathBuf> = reads.iter().map(|p| canonical(p)).collect();
+        let (out, reads) = (canonical(&out), canonical_all(&reads));
         let run = {
             let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
-            let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-            for r in l.iter().filter(|r| matches!(r.state(), State::Running)) {
-                if overlap(&r.out, &out) {
-                    return Err(format!(
-                        "{}: another run is writing there; wait for it or cancel it",
-                        out.display()
-                    ));
-                }
-                if let Some(p) = reads.iter().find(|p| overlap(&r.out, p)) {
-                    return Err(format!(
-                        "{}: another run is writing there, so this run would read a half-written tree; wait for it or cancel it",
-                        p.display()
-                    ));
-                }
-                if r.reads.iter().any(|p| overlap(p, &out)) {
-                    return Err(format!(
-                        "{}: another run is reading there; wait for it or cancel it",
-                        out.display()
-                    ));
-                }
+            if let Some(e) = conflict(&l, &out, &reads) {
+                return Err(e);
             }
-            let run = Arc::new(Run {
-                id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
-                spec,
-                command,
-                out,
-                reads,
-                started: sqldiff_review::time::now(),
-                past: false,
-                checked: AtomicUsize::new(0),
-                total: AtomicUsize::new(0),
-                cancel: Arc::new(AtomicBool::new(false)),
-                state: Mutex::new(State::Running),
-                review: Mutex::new(None),
-                gate: Mutex::new(None),
-            });
-            l.push(Arc::clone(&run));
+            let run = self.register(&mut l, spec, command, out, reads, None);
             if let Some(f) = &self.history {
                 save(f, &l);
             }
             run
         };
-        let r = Arc::clone(&run);
+        self.spawn(&run, work, done)?;
+        Ok(run)
+    }
+
+    /// Lists a new run, running; the caller has checked its folders.
+    fn register(
+        &self,
+        l: &mut Vec<Arc<Run>>,
+        spec: Spec,
+        command: Command,
+        out: PathBuf,
+        reads: Vec<PathBuf>,
+        batch: Option<BatchTag>,
+    ) -> Arc<Run> {
+        let run = Arc::new(Run {
+            id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
+            spec,
+            command,
+            out,
+            reads,
+            started: sqldiff_review::time::now(),
+            batch,
+            past: false,
+            checked: AtomicUsize::new(0),
+            total: AtomicUsize::new(0),
+            cancel: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(State::Running),
+            review: Mutex::new(None),
+            gate: Mutex::new(None),
+        });
+        l.push(Arc::clone(&run));
+        run
+    }
+
+    /// Runs `work` for a listed run on its own thread.
+    fn spawn(
+        &self,
+        run: &Arc<Run>,
+        work: Work,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<(), String> {
+        let r = Arc::clone(run);
         let (list, history) = (Arc::clone(&self.list), self.history.clone());
         let finish = move |r: &Arc<Run>, state: State| {
             let l = list.lock().unwrap_or_else(|e| e.into_inner());
@@ -761,7 +783,7 @@ impl Runs {
             // Never left running: that would hold its folder until a restart.
             let error = format!("the run could not be started: {e}");
             fail(
-                &run,
+                run,
                 State::Failed {
                     error: error.clone(),
                     finished: sqldiff_review::time::now(),
@@ -769,7 +791,319 @@ impl Runs {
             );
             return Err(error);
         }
-        Ok(run)
+        Ok(())
+    }
+
+    /// Starts every run of `batch` as one batch of ordinary runs, or none:
+    /// each cell is checked as a run of its own would be, against the
+    /// running runs and against the other cells of the batch.
+    pub fn start_batch(&self, batch: &BatchSpec, isolated: bool) -> Result<BatchView, String> {
+        let cells = batch.cells()?;
+        let mut work = Vec::new();
+        for (row, col, label, spec) in cells {
+            let (job, out, command) =
+                prepare(&spec, isolated).map_err(|e| format!("{label}: {e}"))?;
+            let reads: Vec<PathBuf> = [Some(&job.tree.src), job.instances.as_ref()]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect();
+            work.push((
+                row,
+                col,
+                label,
+                spec,
+                job,
+                canonical(&out),
+                canonical_all(&reads),
+                command,
+            ));
+        }
+        for (i, a) in work.iter().enumerate() {
+            for b in &work[..i] {
+                if overlap(&a.5, &b.5) {
+                    return Err(format!(
+                        "{} and {} would write into one folder ({}); one run per output folder",
+                        a.2,
+                        b.2,
+                        a.5.display()
+                    ));
+                }
+                if a.6.iter().any(|p| overlap(p, &b.5)) || b.6.iter().any(|p| overlap(p, &a.5)) {
+                    return Err(format!(
+                        "{} and {}: one reads where the other writes; choose output folders outside the sources",
+                        a.2, b.2
+                    ));
+                }
+            }
+        }
+        let id = self.next_batch.load(Ordering::Relaxed) + 1;
+        let runs = {
+            let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+            for w in &work {
+                if let Some(e) = conflict(&l, &w.5, &w.6) {
+                    return Err(format!("{}: {e}", w.2));
+                }
+            }
+            self.next_batch.store(id, Ordering::Relaxed);
+            let runs: Vec<(Arc<Run>, Work)> = work
+                .into_iter()
+                .map(|(row, col, _, spec, job, out, reads, command)| {
+                    let tag = BatchTag { id, row, col };
+                    let run =
+                        self.register(&mut l, Spec::Convert(spec), command, out, reads, Some(tag));
+                    (run, Work::Convert(Box::new(job)))
+                })
+                .collect();
+            if let Some(f) = &self.history {
+                save(f, &l);
+            }
+            runs
+        };
+        // A run that cannot get a thread is listed as failed in its cell.
+        for (run, work) in runs {
+            let _ = self.spawn(&run, work, |_| {});
+        }
+        self.batch(id)
+            .ok_or_else(|| "the batch is not listed".into())
+    }
+
+    /// The batches, newest first, each as its runs stand now.
+    pub fn batches(&self) -> Vec<BatchView> {
+        let mut ids: Vec<u64> = self
+            .list()
+            .iter()
+            .filter_map(|r| r.batch.map(|b| b.id))
+            .collect();
+        ids.dedup();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        ids.dedup();
+        ids.into_iter().filter_map(|id| self.batch(id)).collect()
+    }
+
+    /// Batch `id`: its matrix is its runs' own views.
+    pub fn batch(&self, id: u64) -> Option<BatchView> {
+        let mut runs: Vec<Arc<Run>> = self
+            .list()
+            .into_iter()
+            .filter(|r| r.batch.is_some_and(|b| b.id == id))
+            .collect();
+        if runs.is_empty() {
+            return None;
+        }
+        runs.sort_by_key(|r| r.batch.map(|b| (b.row, b.col)));
+        Some(BatchView::new(id, &runs))
+    }
+
+    /// Stops every run of batch `id` that has not finished.
+    pub fn cancel_batch(&self, id: u64) -> Option<BatchView> {
+        let runs: Vec<Arc<Run>> = self
+            .list()
+            .into_iter()
+            .filter(|r| r.batch.is_some_and(|b| b.id == id))
+            .collect();
+        if runs.is_empty() {
+            return None;
+        }
+        for r in runs.iter().filter(|r| matches!(r.state(), State::Running)) {
+            r.cancel();
+        }
+        self.batch(id)
+    }
+}
+
+fn overlap(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+fn canonical_all(v: &[PathBuf]) -> Vec<PathBuf> {
+    v.iter().map(|p| canonical(p)).collect()
+}
+
+/// Why a run writing `out` and reading `reads` may not start beside the
+/// running runs of `l`: one folder, one writer, and nobody reads what is
+/// being written.
+fn conflict(l: &[Arc<Run>], out: &Path, reads: &[PathBuf]) -> Option<String> {
+    for r in l.iter().filter(|r| matches!(r.state(), State::Running)) {
+        if overlap(&r.out, out) {
+            return Some(format!(
+                "{}: another run is writing there; wait for it or cancel it",
+                out.display()
+            ));
+        }
+        if let Some(p) = reads.iter().find(|p| overlap(&r.out, p)) {
+            return Some(format!(
+                "{}: another run is writing there, so this run would read a half-written tree; wait for it or cancel it",
+                p.display()
+            ));
+        }
+        if r.reads.iter().any(|p| overlap(p, out)) {
+            return Some(format!(
+                "{}: another run is reading there; wait for it or cancel it",
+                out.display()
+            ));
+        }
+    }
+    None
+}
+
+/// A run's place in its batch's matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BatchTag {
+    pub id: u64,
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Most runs one batch starts.
+pub const BATCH_MAX: usize = 50;
+
+/// Several sources converted into several targets: one ordinary run per
+/// pair, each writing the folder `<out>/<source name>/<target dialect>`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSpec {
+    /// The source trees (or files), by path; each needs a name of its own.
+    pub sources: Vec<String>,
+    /// The dialect of every source.
+    pub from: String,
+    /// Target dialect ids.
+    pub targets: Vec<String>,
+    /// The folder the runs' output folders go under.
+    pub out: String,
+    #[serde(default)]
+    pub overwrite: bool,
+    #[serde(default)]
+    pub template: bool,
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub packs: Vec<String>,
+}
+
+impl BatchSpec {
+    /// The run each pair comes to: row, column, a label and the spec.
+    fn cells(&self) -> Result<Vec<(usize, usize, String, ConvertSpec)>, String> {
+        let sources = names(&self.sources);
+        let mut targets = names(&self.targets);
+        if sources.is_empty() || targets.is_empty() || self.out.trim().is_empty() {
+            return Err("give sources, targets and an output folder".into());
+        }
+        if sources.len() * targets.len() > BATCH_MAX {
+            return Err(format!("a batch starts at most {BATCH_MAX} runs"));
+        }
+        let before = targets.len();
+        targets.sort();
+        targets.dedup();
+        if targets.len() != before {
+            return Err("a target is listed twice".into());
+        }
+        let targets = names(&self.targets);
+        let root = browse::absolute(Path::new(self.out.trim()));
+        let mut labels: Vec<String> = Vec::new();
+        for s in &sources {
+            let label = browse::absolute(Path::new(s))
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("{s}: a source needs a folder or file name of its own"))?;
+            if labels.contains(&label) {
+                return Err(format!(
+                    "two sources are both called `{label}`; their output folders would be one"
+                ));
+            }
+            labels.push(label);
+        }
+        let mut cells = Vec::new();
+        for (row, (src, label)) in sources.iter().zip(&labels).enumerate() {
+            for (col, to) in targets.iter().enumerate() {
+                cells.push((
+                    row,
+                    col,
+                    format!("{label} → {to}"),
+                    ConvertSpec {
+                        src: src.clone(),
+                        out: path(&root.join(label).join(to)),
+                        from: self.from.clone(),
+                        to: to.clone(),
+                        overwrite: self.overwrite,
+                        template: self.template,
+                        parameters: self.parameters.clone(),
+                        extensions: self.extensions.clone(),
+                        packs: self.packs.clone(),
+                        instances: None,
+                    },
+                ));
+            }
+        }
+        Ok(cells)
+    }
+}
+
+/// The script of a batch's runs: each run's own command, in matrix order.
+#[derive(Debug, Serialize)]
+pub struct BatchSheet {
+    pub powershell: String,
+    pub sh: String,
+}
+
+/// A batch as the page draws it.
+#[derive(Debug, Serialize)]
+pub struct BatchView {
+    pub id: u64,
+    pub started: String,
+    pub from: String,
+    /// Row labels (the sources) and column labels (target dialects).
+    pub sources: Vec<String>,
+    pub targets: Vec<String>,
+    /// `cells[row][col]`: the run itself, with its totals and its done gate
+    /// as the runs list shows them; `None` when the run is no longer listed.
+    pub cells: Vec<Vec<Option<RunView>>>,
+    pub running: usize,
+    pub sheet: BatchSheet,
+}
+
+impl BatchView {
+    fn new(id: u64, runs: &[Arc<Run>]) -> BatchView {
+        let tag = |r: &Arc<Run>| r.batch.expect("a run of the batch");
+        let rows = runs.iter().map(|r| tag(r).row + 1).max().unwrap_or(0);
+        let cols = runs.iter().map(|r| tag(r).col + 1).max().unwrap_or(0);
+        let mut sources = vec![String::new(); rows];
+        let mut targets = vec![String::new(); cols];
+        let mut cells: Vec<Vec<Option<RunView>>> = (0..rows)
+            .map(|_| (0..cols).map(|_| None).collect())
+            .collect();
+        let (mut sh, mut ps) = (String::new(), String::new());
+        let mut from = String::new();
+        for r in runs {
+            let t = tag(r);
+            let Spec::Convert(s) = &r.spec else { continue };
+            sources[t.row] = s.src.clone();
+            targets[t.col] = s.to.clone();
+            from = s.from.clone();
+            let line = format!("# {} -> {}\n", s.src, s.to);
+            sh.push_str(&format!("{line}{}\n", r.command.sh));
+            ps.push_str(&format!("{line}{}\n", r.command.powershell));
+            cells[t.row][t.col] = Some(r.view());
+        }
+        BatchView {
+            id,
+            started: runs
+                .iter()
+                .map(|r| r.started.clone())
+                .min()
+                .unwrap_or_default(),
+            from,
+            sources,
+            targets,
+            running: runs
+                .iter()
+                .filter(|r| matches!(r.state(), State::Running))
+                .count(),
+            cells,
+            sheet: BatchSheet { powershell: ps, sh },
+        }
     }
 }
 

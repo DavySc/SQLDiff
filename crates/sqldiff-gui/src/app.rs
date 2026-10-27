@@ -11,6 +11,10 @@
 //!   "to", "out", ...}`: check the instances of converted templates, as
 //!   `sqldiff instances` does
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
+//! - `GET /api/batches`, `POST /api/batches` `{"sources", "from", "targets",
+//!   "out", ...}`: several sources converted into several targets as one
+//!   batch of ordinary runs, with one matrix of their totals and done gates
+//! - `POST /batches/N/cancel`: stop every run of batch N that has not finished
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
 //!   editor (see `settings`)
@@ -45,7 +49,7 @@ use sqldiff_source::Resolved;
 use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::review::Store;
-use crate::runs::{ConvertSpec, InstancesSpec, Runs};
+use crate::runs::{BatchSpec, ConvertSpec, InstancesSpec, Runs};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -194,11 +198,13 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         ("GET", "/api/runs") => {
             return json(&app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>())
         }
+        ("GET", "/api/batches") => return json(&app.runs.batches()),
         ("GET", "/settings") => return page(app, View::Settings, settings_page(app), ""),
         ("GET", "/api/fs")
         | ("POST", "/api/open/compare")
         | ("POST", "/api/runs")
         | ("POST", "/api/runs/instances")
+        | ("POST", "/api/batches")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
@@ -239,7 +245,29 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 Err(e) => bad(e),
             }
         }
+        ("POST", "/api/batches") => {
+            return match serde_json::from_slice::<BatchSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start_batch(&spec, app.isolated))
+            {
+                Ok(batch) => json(&batch),
+                Err(e) => bad(e),
+            }
+        }
         _ => {}
+    }
+    if let Some(id) = req
+        .path
+        .strip_prefix("/batches/")
+        .and_then(|r| r.strip_suffix("/cancel"))
+    {
+        return match (req.method.as_str(), id.parse().ok()) {
+            ("POST", Some(id)) => match app.runs.cancel_batch(id) {
+                Some(b) => json(&b),
+                None => not_found(),
+            },
+            _ => not_found(),
+        };
     }
     let ctx = settings::Ctx {
         isolated: app.isolated,
@@ -628,6 +656,7 @@ fn remember(data_dir: &Path, r: Recent) {
 fn runs_page(app: &Shared) -> String {
     let payload = serde_json::json!({
         "runs": app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>(),
+        "batches": app.runs.batches(),
         "dialects": Dialect::ALL.iter().map(|d| (d.id(), d.display_name())).collect::<Vec<_>>(),
         "with_rules": Dialect::ALL
             .iter()
