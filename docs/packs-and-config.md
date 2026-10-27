@@ -58,6 +58,7 @@ schema = 1                  # packs newer than the build are rejected
 | `[assumptions]` | Declared facts by assumption id; matching report assumptions become *declared* |
 | `[[overrides]]` | `rule` glob over finding rules, new `class` and/or `severity`; first match wins |
 | `[[adapters]]` | Out-of-process adapters: `name`, `command`, `env`, `credential` |
+| `[format]` | Formatter layout for `sqldiff fmt`, with `[format.tsql]`, `[format.postgres]`, `[format.db2i]` overrides; merged key by key ([formatter.md](formatter.md)) |
 | `deny_list` | Terms the leak scan rejects (top-level key, before `[pack]`) |
 
 Globs use `/`, `*` within a segment, `**` across segments, `?`; prefix

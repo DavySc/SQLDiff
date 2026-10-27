@@ -12,6 +12,7 @@ pub mod composition;
 mod engine;
 pub mod equiv;
 pub mod facts;
+pub mod format;
 pub mod ir;
 pub mod ledger;
 pub mod lint;
