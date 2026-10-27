@@ -921,3 +921,110 @@ fn unterminated_string_literal_is_not_read() {
         }
     }
 }
+
+/// `SELECT @r = <expr> FROM ...` against `SELECT <expr> INTO r FROM ...`,
+/// with `r` declared as -1 on both sides and returned.
+fn select_assign(ts_query: &str, pg_query: &str) -> Report {
+    let ts = format!(
+        "CREATE FUNCTION dbo.f (@id int) RETURNS int AS
+         BEGIN
+           DECLARE @r int = -1;
+           {ts_query};
+           RETURN @r;
+         END"
+    );
+    let pg = format!(
+        "CREATE FUNCTION f(p_id integer) RETURNS integer LANGUAGE plpgsql AS $$
+         DECLARE r integer := -1;
+         BEGIN
+           {pg_query};
+           RETURN r;
+         END; $$;"
+    );
+    run(&ts, T, &pg, P, true)
+}
+
+#[test]
+fn ungrouped_aggregate_assign_always_returns_one_row() {
+    // Verified on SQL Server 2022 and PostgreSQL 18: on an empty table (or a
+    // WHERE no row meets) both assign 0 for COUNT and NULL for MAX; neither
+    // keeps the old value.
+    for (ts, pg) in [
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer",
+            "SELECT count(*) INTO r FROM customer",
+        ),
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer WHERE customer_id = @id",
+            "SELECT count(*) INTO r FROM customer WHERE customer_id = p_id",
+        ),
+        (
+            "SELECT @r = MAX(customer_id) FROM dbo.customer WHERE customer_id > @id",
+            "SELECT max(customer_id) INTO r FROM customer WHERE customer_id > p_id",
+        ),
+        (
+            "SELECT @r = ISNULL(MAX(customer_id), 0) FROM dbo.customer",
+            "SELECT COALESCE(max(customer_id), 0) INTO r FROM customer",
+        ),
+    ] {
+        let r = select_assign(ts, pg);
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{ts}: {:?} {:?}",
+            r.verdict,
+            r.findings
+        );
+    }
+}
+
+#[test]
+fn aggregate_assign_that_can_return_no_row_keeps_the_finding() {
+    // Verified on SQL Server 2022 and PostgreSQL 18: on an empty table each
+    // returns no row, so T-SQL keeps -1 and SELECT INTO sets NULL.
+    for (ts, pg) in [
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer GROUP BY last_name",
+            "SELECT count(*) INTO r FROM customer GROUP BY last_name",
+        ),
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer HAVING COUNT(*) > 1",
+            "SELECT count(*) INTO r FROM customer HAVING count(*) > 1",
+        ),
+        (
+            "SELECT TOP 0 @r = COUNT(*) FROM dbo.customer",
+            "SELECT count(*) INTO r FROM customer LIMIT 0",
+        ),
+        // The aggregate is in a subquery: one row per customer, none when empty.
+        (
+            "SELECT @r = (SELECT MAX(item_id) FROM dbo.item) FROM dbo.customer",
+            "SELECT (SELECT max(item_id) FROM item) INTO r FROM customer",
+        ),
+    ] {
+        let r = select_assign(ts, pg);
+        assert_eq!(r.verdict, Verdict::Different, "{ts}: {:?}", r.findings);
+        assert!(
+            rules(&r).contains(&"equiv.no-rows"),
+            "{ts}: {:?}",
+            r.findings
+        );
+    }
+}
+
+#[test]
+fn select_assign_without_from_is_a_plain_assignment() {
+    // SQL Server 2022: `SELECT @r = (subquery)` assigns NULL when the subquery
+    // has no row, as `SET` and PL/pgSQL `:=` do.
+    let r = select_assign(
+        "SELECT @r = (SELECT COUNT(*) FROM dbo.customer)",
+        "r := (SELECT count(*) FROM customer)",
+    );
+    assert!(
+        matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?} {:?}",
+        r.verdict,
+        r.findings
+    );
+    // With a WHERE the query can return no row: T-SQL then keeps -1.
+    let r = select_assign("SELECT @r = 1 WHERE @id = 0", "r := 1");
+    assert!(not_equal(&r), "{:?}", r.verdict);
+}
