@@ -1316,7 +1316,9 @@ impl<'a> Canon<'a> {
 
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
-        if c.name.len() > 1 && !(c.name.len() == 2 && c.name[0].eq_ignore_ascii_case("dbo")) {
+        // A qualified name is a user function, even `dbo.max`: T-SQL calls a
+        // built-in unqualified only.
+        if c.name.len() > 1 {
             let mut args = vec![
                 self.dtag(),
                 a(c.name.iter().map(|x| lc(x)).collect::<Vec<_>>().join(".")),
@@ -3718,11 +3720,16 @@ fn aggregates(t: &Term) -> bool {
         return false;
     }
     // MIN and MAX of one argument; a string's comparison is the dialect's.
-    let min_max = |name: Option<&Term>| matches!(name.and_then(Term::atom), Some("min" | "max"));
+    // SUM and AVG stay the dialect's own (result types differ), but they
+    // aggregate all the same (an empty input gives one NULL row).
+    let named = |name: Option<&Term>, names: &[&str]| {
+        name.and_then(Term::atom)
+            .is_some_and(|x| names.contains(&x))
+    };
     t.is("count")
         || t.is("stringagg")
-        || (t.is("fn") && t.kids().len() == 2 && min_max(t.kid(0)))
-        || (t.is("dfn") && t.kids().len() == 3 && min_max(t.kid(1)))
+        || (t.is("fn") && t.kids().len() == 2 && named(t.kid(0), &["min", "max"]))
+        || (t.is("dfn") && t.kids().len() == 3 && named(t.kid(1), &["min", "max", "sum", "avg"]))
         || t.kids().iter().any(aggregates)
 }
 
