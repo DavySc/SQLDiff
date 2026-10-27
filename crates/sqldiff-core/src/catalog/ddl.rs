@@ -1036,6 +1036,30 @@ fn is_type_start(body: &[Tok]) -> bool {
         ])
 }
 
+/// PostgreSQL `CREATE [OR REPLACE] [CONSTRAINT] TRIGGER … ON table …
+/// [REFERENCING …] … EXECUTE {FUNCTION|PROCEDURE} f(…)`: the function's
+/// name parts and the trigger's table and transition tables.
+pub fn pg_trigger_statement(t: &[Tok]) -> Option<(Vec<Ident>, TriggerInfo)> {
+    let kw = t.iter().position(|x| x.is_kw("TRIGGER"))?;
+    if !t[..kw]
+        .iter()
+        .all(|x| x.is_any_kw(&["CREATE", "OR", "REPLACE", "CONSTRAINT"]))
+        || !t.first()?.is_kw("CREATE")
+    {
+        return None;
+    }
+    let ex = (kw..t.len()).find(|&i| {
+        t[i].is_kw("EXECUTE")
+            && t.get(i + 1)
+                .is_some_and(|x| x.is_any_kw(&["FUNCTION", "PROCEDURE"]))
+    })?;
+    let (name, _) = qualified(t, ex + 2);
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, trigger_info(&t[..ex], kw)))
+}
+
 fn trigger_info(t: &[Tok], from: usize) -> TriggerInfo {
     let mut info = TriggerInfo::default();
     if let Some(on) = find_kw(t, from, "ON") {

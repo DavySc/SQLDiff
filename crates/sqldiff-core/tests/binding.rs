@@ -750,3 +750,45 @@ fn db2_select_needs_from_and_sysdummy1_binds() {
     let r = check_rules(Dialect::Postgres, "SELECT 1;", None);
     assert!(rules(&r).is_empty(), "{:?}", rules(&r));
 }
+
+/// T-SQL `inserted`/`deleted` as FROM tables of a trigger, and the transition
+/// tables a PostgreSQL trigger function gets from its CREATE TRIGGER, bind to
+/// the trigger's table; outside a trigger they do not.
+#[test]
+fn trigger_images_bind_to_the_trigger_table() {
+    let tables = |d| {
+        Artifact::new(
+            "t.sql",
+            d,
+            "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, qty int NOT NULL);",
+        )
+    };
+    let check = |d, sql: &str| {
+        let o = Options {
+            catalog_a: vec![tables(d)],
+            ..Options::default()
+        };
+        rules(&sqldiff_core::check(&Artifact::new("x.sql", d, sql), &o))
+    };
+    let tsql = "CREATE TRIGGER tu ON orders AFTER UPDATE AS
+UPDATE o SET qty = i.qty FROM orders o JOIN inserted i ON i.order_id = o.order_id LEFT JOIN deleted AS d ON d.order_id = i.order_id;";
+    assert!(
+        check(Dialect::Tsql, tsql).is_empty(),
+        "{:?}",
+        check(Dialect::Tsql, tsql)
+    );
+    let pg = "CREATE FUNCTION tu() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE orders o SET qty = i.qty FROM inserted i WHERE i.order_id = o.order_id AND EXISTS (SELECT 1 FROM deleted d WHERE d.order_id = i.order_id);
+  RETURN NULL;
+END;
+$$;
+CREATE TRIGGER tu AFTER UPDATE ON orders REFERENCING NEW TABLE AS inserted OLD TABLE AS deleted FOR EACH STATEMENT EXECUTE FUNCTION tu();";
+    assert!(
+        check(Dialect::Postgres, pg).is_empty(),
+        "{:?}",
+        check(Dialect::Postgres, pg)
+    );
+    let outside = "CREATE PROCEDURE p AS SELECT order_id FROM inserted;";
+    assert!(!check(Dialect::Tsql, outside).is_empty());
+}
