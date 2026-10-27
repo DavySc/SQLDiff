@@ -441,6 +441,26 @@ fn a_run_converts_a_tree_and_opens_its_own_review() {
         "{run}"
     );
     assert_eq!(run["totals"]["files"], 2, "{run}");
+    // The run sheet: the command that writes the same, config ignored as the
+    // app (started isolated) ignores it.
+    let c = &run["command"];
+    assert_eq!(c["args"][0], "convert");
+    assert_eq!(c["args"][1], d.0.join("src").display().to_string());
+    assert!(
+        c["args"].as_array().unwrap().contains(&"--isolated".into()),
+        "{c}"
+    );
+    assert_eq!(
+        (&c["user_config"], &c["project_config"]),
+        (&serde_json::Value::Null, &serde_json::Value::Null)
+    );
+    assert!(
+        c["powershell"]
+            .as_str()
+            .unwrap()
+            .ends_with("--from tsql --to postgres --isolated"),
+        "{c}"
+    );
     // What was written is what the command writes: the files and the reports.
     for f in [
         "a.sql",

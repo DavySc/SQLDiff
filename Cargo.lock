@@ -478,6 +478,7 @@ dependencies = [
  "sha2",
  "sqldiff-convert",
  "sqldiff-core",
+ "sqldiff-gui",
  "sqldiff-review",
  "sqldiff-source",
  "sqldiff-syntax",
