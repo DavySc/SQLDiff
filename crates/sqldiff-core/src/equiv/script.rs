@@ -306,10 +306,10 @@ fn assigned_literals(u: &Unit, l: &Local) -> Option<Vec<Term>> {
     let target = Target::of_type(decl, u.dialect);
     let mut out = Vec::new();
     for s in &u.stmts {
-        let Ok(Stmt::Assign(t, e)) = &s.ast else {
+        let Some((t, e)) = s.ast.as_ref().ok().and_then(Stmt::assignment) else {
             continue;
         };
-        if !names(u.dialect, t, &l.name) {
+        if !names(u.dialect, &t, &l.name) {
             continue;
         }
         out.push(match (e, &ty) {
@@ -447,8 +447,8 @@ fn writes(u: &Unit, l: &Local) -> Option<Vec<Expr>> {
     let mut vals = Vec::new();
     let mut seen: Vec<SyntaxNode> = Vec::new();
     for s in &u.stmts {
-        if let Ok(Stmt::Assign(target, v)) = &s.ast {
-            if names(u.dialect, target, &l.name) {
+        if let Some((target, v)) = s.ast.as_ref().ok().and_then(Stmt::assignment) {
+            if names(u.dialect, &target, &l.name) {
                 vals.push(v.clone());
                 seen.push(s.node.clone());
                 continue;
@@ -563,10 +563,10 @@ pub(super) fn cannot_fail(u: &Unit, node: &SyntaxNode) -> bool {
     let Some(s) = u.stmts.iter().find(|s| &s.node == node) else {
         return false;
     };
-    let Ok(Stmt::Assign(target, v)) = &s.ast else {
+    let Some((target, v)) = s.ast.as_ref().ok().and_then(Stmt::assignment) else {
         return false;
     };
-    let Some(l) = u.locals.iter().find(|l| names(u.dialect, target, &l.name)) else {
+    let Some(l) = u.locals.iter().find(|l| names(u.dialect, &target, &l.name)) else {
         return false;
     };
     let Some(decl) = &l.decl else { return false };
