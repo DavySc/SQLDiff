@@ -25,15 +25,21 @@ impl Dir {
         Dir(d)
     }
 
+    /// `rel` (written with `/`) below the folder, joined by component so the
+    /// path has the separators the server prints on every platform.
+    fn p(&self, rel: &str) -> PathBuf {
+        rel.split('/').fold(self.0.clone(), |p, c| p.join(c))
+    }
+
     fn write(&self, rel: &str, text: &str) -> PathBuf {
-        let p = self.0.join(rel);
+        let p = self.p(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, text).unwrap();
         p
     }
 
     fn read(&self, rel: &str) -> String {
-        std::fs::read_to_string(self.0.join(rel)).unwrap()
+        std::fs::read_to_string(self.p(rel)).unwrap()
     }
 }
 
@@ -216,7 +222,7 @@ fn layers_and_the_source_of_each_key() {
     assert_eq!(v["layers"][1]["format_keys"], 3);
     assert_eq!(
         v["layers"][2]["path"],
-        d.0.join("ws/sqldiff.toml").display().to_string()
+        d.p("ws/sqldiff.toml").display().to_string()
     );
     assert_eq!(v["exists"], true);
     assert_eq!(v["draft"]["indent"], 2);
@@ -247,7 +253,7 @@ fn layers_and_the_source_of_each_key() {
     // Each effective value is what the library computes for the dialect.
     let cfg = Resolved::load(&Sources {
         isolated: true,
-        project: Some(d.0.join("ws/sqldiff.toml")),
+        project: Some(d.p("ws/sqldiff.toml")),
         ..Sources::default()
     })
     .unwrap();
@@ -310,10 +316,7 @@ fn private_config_is_shown_by_path_and_never_read_into_the_page() {
     assert_eq!(l["kind"], "private_pack");
     assert_eq!(l["shown"], false);
     assert_eq!(l["format_keys"], Value::Null);
-    assert_eq!(
-        l["path"],
-        d.0.join("secret/pack.toml").display().to_string()
-    );
+    assert_eq!(l["path"], d.p("secret/pack.toml").display().to_string());
     // The key it sets is marked as set by it, with no value.
     assert_eq!(
         v["effective"]["all"]["keyword_case"],
@@ -378,7 +381,7 @@ fn the_user_config_is_path_only_and_is_never_a_save_target() {
 const USER_CONFIG: &str = "[format]\nkeyword_case = \"preserve\"\nindent = 9\n";
 
 fn user_config_scenario(d: &Dir) {
-    let cfg = d.0.join("home/sqldiff.toml");
+    let cfg = d.p("home/sqldiff.toml");
     // Not isolated: the user config is read, here named by SQLDIFF_CONFIG.
     let addr = start(false);
     let (status, v) = settings(addr, &d.0.join("ws"));
@@ -547,7 +550,7 @@ fn saving_changes_the_format_keys_and_keeps_the_rest() {
     // The file reads back as a config.
     let cfg = Resolved::load(&Sources {
         isolated: true,
-        project: Some(d.0.join("ws/sqldiff.toml")),
+        project: Some(d.p("ws/sqldiff.toml")),
         ..Sources::default()
     })
     .unwrap();
@@ -627,8 +630,8 @@ fn saving_writes_only_a_file_named_sqldiff_toml() {
     let addr = start(true);
     for target in [
         user.clone(),
-        d.0.join("ws/notes.txt"),
-        d.0.join("ws/sqldiff.toml.bak"),
+        d.p("ws/notes.txt"),
+        d.p("ws/sqldiff.toml.bak"),
     ] {
         let (status, body) = post(
             addr,
@@ -648,11 +651,11 @@ fn saving_writes_only_a_file_named_sqldiff_toml() {
     {
         std::os::unix::fs::symlink(
             &user,
-            d.0.join("ln/sqldiff.toml")
+            d.p("ln/sqldiff.toml")
                 .parent()
                 .map(|p| {
                     std::fs::create_dir_all(p).unwrap();
-                    d.0.join("ln/sqldiff.toml")
+                    d.p("ln/sqldiff.toml")
                 })
                 .unwrap(),
         )
