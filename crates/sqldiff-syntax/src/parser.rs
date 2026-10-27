@@ -980,7 +980,12 @@ impl<'a> Parser<'a> {
         self.builder.token(DOLLAR_QUOTE.into(), &text[..dl]);
         let inner = tokenize_range(self.src, t.start + dl, t.end - dl, Dialect::Postgres);
         self.diags.extend(inner.diagnostics);
-        let saved_tokens = mem::replace(&mut self.tokens, inner.tokens);
+        let tokens = if mode == Mode::PlPgSql {
+            option_lines_as_comments(self.src, t.end - dl, inner.tokens)
+        } else {
+            inner.tokens
+        };
+        let saved_tokens = mem::replace(&mut self.tokens, tokens);
         let saved_pos = mem::replace(&mut self.pos, 0);
         let saved_mode = mem::replace(&mut self.mode, mode);
         let saved_stops = mem::take(&mut self.stops);
@@ -1062,6 +1067,42 @@ impl<'a> Parser<'a> {
         }
         self.finish();
     }
+}
+
+/// PL/pgSQL option lines (`#variable_conflict use_column`, `#print_strict_params on`)
+/// may open a function body, before `DECLARE` or `BEGIN`. They are not statements;
+/// lex each one as a line comment, or it swallows the `DECLARE` section after it.
+/// Only the leading position counts: `#` is also an operator inside expressions.
+fn option_lines_as_comments(src: &str, body_end: usize, tokens: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    let mut leading = true;
+    while i < tokens.len() {
+        let t = tokens[i];
+        if leading && !t.kind.is_trivia() {
+            if t.kind == OP && src[t.start..t.end].starts_with('#') {
+                let mut end = src[t.start..body_end]
+                    .find('\n')
+                    .map_or(body_end, |n| t.start + n);
+                let mut j = i;
+                while j < tokens.len() && tokens[j].start < end {
+                    end = end.max(tokens[j].end);
+                    j += 1;
+                }
+                out.push(Token {
+                    kind: LINE_COMMENT,
+                    start: t.start,
+                    end,
+                });
+                i = j;
+                continue;
+            }
+            leading = false;
+        }
+        out.push(t);
+        i += 1;
+    }
+    out
 }
 
 /// Whether `w` begins a new T-SQL statement, given the current statement so far.
