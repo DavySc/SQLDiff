@@ -59,6 +59,10 @@ label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5
 #banners { display: flex; flex-direction: column; gap: 1px; }
 .banner { padding: 6px 16px; font-size: 12.5px; background: var(--chg-bg); border-bottom: 1px solid var(--line); }
 .banner.bad { background: var(--del-bg); }
+.banner.gate { background: var(--soft); }
+.chip.gate { cursor: pointer; }
+.chip.gate.ok { border-color: var(--s-converted); }
+.chip.gate:hover { background: var(--soft); }
 .banner details summary { cursor: pointer; }
 .banner ul { margin: 4px 0; padding-left: 18px; font: 12px/1.5 var(--mono); }
 
@@ -211,7 +215,8 @@ const statusKey = (s) => KEYOF[s] || (LABEL[s] ? s : "unproven");
 const statusLabel = (s) => LABEL[statusKey(s)] || s;
 const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
 const AUTHOR_KEY = "sqldiff.review.author", ALL_KEY = "sqldiff.review.all";
-const S = { st: INITIAL.state, sel: null, view: null, unit: 0, picked: new Set(), files: new Map(), action: null, rule: "" };
+const time = (t) => (t || "").replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC");
+const S = { st: INITIAL.state, sel: null, view: null, unit: 0, picked: new Set(), files: new Map(), action: null, rule: "", gateOpen: false };
 try { $("author").value = localStorage.getItem(AUTHOR_KEY) || ""; $("all").checked = localStorage.getItem(ALL_KEY) === "1"; } catch { /* storage unavailable */ }
 const author = () => $("author").value.trim();
 const allQ = () => ($("all").checked ? "&all=1" : "");
@@ -234,8 +239,20 @@ function renderHeader() {
   $("pairname").innerHTML = `${esc(dialectName(st.from))} → ${esc(dialectName(st.to))} · <span class="mono">${esc(base(st.src))}</span> → <span class="mono">${esc(base(st.out))}</span>${st.templates ? " · templates" : ""}`;
   $("pairname").title = `Source: ${st.src}\nConverted tree: ${st.out}\nDecisions: ${st.ledger_path}`;
   const tiers = Object.entries(st.tiers).filter(([, n]) => n > 0);
-  $("chips").innerHTML = `<span class="chip" title="Items left in the queue"><b>${st.items.length}</b> to review</span><span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>`;
+  const g = st.gate;
+  const gate = g
+    ? `<button class="chip gate${g.complete ? " ok" : ""}" id="gatechip" aria-expanded="${S.gateOpen}" title="${g.complete ? "Done" : `Not done: ${g.blockers.length} blocker(s)`}, as the done gate (sqldiff review-status) judges it. Click for why.">${g.complete ? `<span class="dot" style="background:var(--s-converted)"></span>Done` : `<span class="dot" style="background:var(--s-unproven)"></span>Not done · <b>${g.blockers.length}</b>`}</button>`
+    : `<span class="chip" title="${esc(st.gate_error || "")}">Done gate not judged</span>`;
+  $("chips").innerHTML = `<span class="chip" title="Items left in the queue"><b>${st.items.length}</b> to review</span><span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>${gate}`;
+  if ($("gatechip")) $("gatechip").onclick = () => { S.gateOpen = !S.gateOpen; renderHeader(); };
   const b = [];
+  if (g && S.gateOpen) {
+    const kinds = Object.entries(g.counts).map(([k, n]) => `${n} ${esc(k)}`).join(", ");
+    b.push(`<div class="banner gate">${g.complete
+      ? `Done: every unit is converted, or its assumptions are accepted and its decisions picked by a person; no rejection stands; what an agent wrote is approved by a person; and the converted tree is what converting the source gives (judged ${esc(time(st.gate_judged))}, files unchanged since)${g.instances === true ? ", with a current, complete instance check" : ""}. ${g.nothing_found} of ${g.units} unit(s) are converted with nothing found: not proven, and not reviewed.`
+      : `Not done (${kinds}):<ul>${g.blockers.slice(0, 100).map((x) => `<li>${esc(x.path)}${x.out_line ? `:${x.out_line}` : ""}${x.unit ? ` ${esc(x.unit)}` : ""} · ${esc(x.kind)}: ${esc(x.what)}</li>`).join("")}${g.blockers.length > 100 ? `<li>… and ${g.blockers.length - 100} more</li>` : ""}</ul>`}</div>`);
+  }
+  if (!g && st.gate_error) b.push(`<div class="banner">Done gate not judged: ${esc(st.gate_error)}</div>`);
   if (st.not_applied.length) b.push(`<div class="banner bad"><details><summary>${st.not_applied.length} line(s) of the ledger were not applied</summary><ul>${st.not_applied.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details></div>`);
   if (st.outdated) b.push(`<div class="banner">${st.outdated} unit(s) have a decision made on other file contents: it no longer applies until someone confirms it again (marked <span class="flag warn">outdated</span>).</div>`);
   if (st.orphaned) b.push(`<div class="banner">${st.orphaned} decision(s) are about units whose text changed; they apply to nothing now.</div>`);
@@ -547,6 +564,16 @@ $("author").addEventListener("input", () => {
   if ($("as")) $("as").textContent = author() || "?";
 });
 $("all").addEventListener("change", () => { try { localStorage.setItem(ALL_KEY, $("all").checked ? "1" : "0"); } catch { /* ignore */ } reload(); });
+// Files may have changed while the page was away: a done gate on them no
+// longer stands, and the state says so.
+// Only the gate is taken over, so nothing being picked or typed is lost.
+window.addEventListener("focus", async () => {
+  try {
+    const st = await api(`/api/state?${allQ().slice(1)}`);
+    Object.assign(S.st, { gate: st.gate, gate_error: st.gate_error, gate_judged: st.gate_judged });
+    renderHeader();
+  } catch (e) { /* the next action shows the error */ }
+});
 $("refresh").addEventListener("click", async () => { try { await apply(await api(`/api/refresh?${allQ().slice(1)}`, {}), false); toast("Read the sources and the ledger again"); } catch (e) { toast(e.message, true); } });
 $("helpbtn").addEventListener("click", () => $("help").classList.add("open"));
 $("help").addEventListener("click", (e) => { if (e.target === $("help")) $("help").classList.remove("open"); });

@@ -7,7 +7,9 @@ use sqldiff_convert::review::{file_hash, By, Ledger, State, LEDGER_FILE};
 use sqldiff_convert::tree;
 use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
-use sqldiff_gui::convert_review::{Action, RecordRequest, Review, Setup, Target, UnitView};
+use sqldiff_gui::convert_review::{
+    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_STALE,
+};
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
 const ASSUMING_2: &str = "CREATE PROCEDURE dbo.p2 AS\nBEGIN\n  UPDATE dbo.t SET a = 2;\nEND\n";
@@ -453,4 +455,60 @@ fn a_text_written_into_the_ledger_is_converted_in_on_refresh() {
     r.refresh().unwrap();
     assert!(r.converted_last(), "the ledger's texts changed");
     assert_eq!(r.report_json(), f.open().report_json());
+}
+
+#[test]
+fn the_done_gate_follows_the_decisions_and_the_files() {
+    let f = Fixture::new("gate", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
+    let mut r = f.open();
+    let g = r.state(false).gate.expect("judged");
+    assert!(!g.complete);
+    assert!(g.counts.keys().all(|k| k == "open"), "{:?}", g.counts);
+    // Every assumption accepted by a person: done, and still so after a refresh.
+    for id in unit_items(&r, "a.sql", false) {
+        let u = r.unit("a.sql", &id).unwrap();
+        for rule in u.assumptions.clone() {
+            r.record(req(Action::Accept, &rule, vec![target(&u)]), AT)
+                .unwrap();
+        }
+    }
+    let g = r.state(false).gate.expect("judged");
+    assert!(g.complete, "{:?}", g.blockers);
+    assert_eq!(g.nothing_found, 1, "the table: nothing found, not reviewed");
+    r.refresh().unwrap();
+    assert!(r.state(false).gate.unwrap().complete);
+    // The converted tree no longer what converting gives. Before anything
+    // reads it again, the verdict on the old files no longer stands.
+    std::fs::write(f.out().join("t.sql"), "-- edited\n").unwrap();
+    let st = r.state(false);
+    assert!(st.gate.is_none(), "a Done on files that changed since");
+    assert_eq!(st.gate_error.as_deref(), Some(GATE_STALE));
+    assert_eq!(r.gate().unwrap_err(), GATE_STALE);
+    // A new source file makes it stale too.
+    r.refresh().unwrap();
+    assert!(r.state(false).gate.is_some());
+    std::fs::write(f.dir.join("src").join("new.sql"), PLAIN).unwrap();
+    assert_eq!(r.gate().unwrap_err(), GATE_STALE);
+    std::fs::remove_file(f.dir.join("src").join("new.sql")).unwrap();
+    // Read again: judged on the files as they are.
+    r.refresh().unwrap();
+    let st = r.state(false);
+    let g = st.gate.unwrap();
+    assert!(!g.complete);
+    assert!(g.counts.contains_key("stale-output"), "{:?}", g.counts);
+    // Judging never leaves a ledger behind on the page's state.
+    assert_eq!(st.gate_error, None);
+}
+
+#[test]
+fn without_a_ledger_the_gate_is_judged_and_the_state_keeps_no_ledger() {
+    let f = Fixture::new("gate-none", &[("t.sql", PLAIN)]);
+    let r = f.open();
+    assert!(!f.out().join(LEDGER_FILE).exists());
+    let st = r.state(false);
+    assert_eq!(st.records, 0);
+    let g = st.gate.unwrap();
+    // A plainly converted table needs no decision.
+    assert!(g.complete, "{:?}", g.blockers);
+    assert!(r.state(false).reviewed.is_empty());
 }

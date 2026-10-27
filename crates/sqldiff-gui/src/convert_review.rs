@@ -24,7 +24,8 @@
 //! the same options gives the same conversion.
 //!
 //! - `GET /`: the page
-//! - `GET /api/state[?all=1]`: queue, ledger summary, warnings (`all` adds tier 6)
+//! - `GET /api/state[?all=1]`: queue, ledger summary, warnings, the done
+//!   gate (`all` adds tier 6)
 //! - `GET /api/item?key=K[&all=1]`: one queue item in detail
 //! - `GET /api/unit?path=P&unit=U`: one unit in detail (also reviewed ones)
 //! - `GET /api/file?path=P&side=in|out`: a whole input, or its conversion
@@ -34,11 +35,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sqldiff_convert::gate::{self, Gate};
 use sqldiff_convert::queue::{self, Instances, Item, Kind};
 use sqldiff_convert::review::{self, By, Record, State};
 use sqldiff_convert::tree::{self, Input, Tree, UnitReviewReport};
@@ -79,7 +81,55 @@ struct Loaded {
     /// The hand-written texts in the ledger the conversion used: they go
     /// into the conversion itself, so a new one means converting again.
     written: Vec<String>,
+    /// The done gate as `sqldiff review-status` judged the tree on this
+    /// read, or why it could not be judged; when, and the files it judged
+    /// (`stamp`): once they change, the verdict no longer stands.
+    gate: Result<Gate, String>,
+    judged: String,
+    stamp: Stamp,
 }
+
+/// Every file under the source, OUT and the instance report, with its size
+/// and modification time: what a gate verdict was judged on. Names starting
+/// with a dot are skipped and links not followed below the given paths, as
+/// the engine reads a tree.
+type Stamp = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
+
+fn stamp(s: &Setup) -> Stamp {
+    fn dir(p: &Path, out: &mut Stamp) {
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(p)
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        entries.retain(|e| !e.file_name().to_string_lossy().starts_with('.'));
+        entries.sort_by_key(|e| e.file_name());
+        out.push((p.to_path_buf(), entries.len() as u64, None));
+        for e in entries {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => dir(&e.path(), out),
+                _ => file(&e.path(), std::fs::symlink_metadata(e.path()), out),
+            }
+        }
+    }
+    fn file(p: &Path, m: std::io::Result<std::fs::Metadata>, out: &mut Stamp) {
+        match m {
+            Ok(m) => out.push((p.to_path_buf(), m.len(), m.modified().ok())),
+            Err(_) => out.push((p.to_path_buf(), u64::MAX, None)),
+        }
+    }
+    let mut out = Vec::new();
+    let given = [Some(&s.tree.src), Some(&s.out), s.instances.as_ref()];
+    for p in given.into_iter().flatten() {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => dir(p, &mut out),
+            m => file(p, m, &mut out),
+        }
+    }
+    out
+}
+
+/// Why a verdict is not shown once its files changed.
+pub const GATE_STALE: &str =
+    "files changed on disk since the done gate was judged; Refresh to judge it again";
 
 pub struct Review {
     setup: Setup,
@@ -134,6 +184,11 @@ pub struct StateView {
     pub out_differs: Vec<String>,
     pub unreadable: Vec<String>,
     pub convert_ms: f64,
+    /// The done gate (`sqldiff review-status`): the only place "done" comes
+    /// from. `gate_error` says why it could not be judged.
+    pub gate: Option<Gate>,
+    pub gate_error: Option<String>,
+    pub gate_judged: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -319,7 +374,22 @@ impl Review {
         )
     }
 
+    /// The done gate as last judged, or why it could not be judged; never
+    /// a verdict on files that changed since (`GATE_STALE`).
+    pub fn gate(&self) -> Result<Gate, String> {
+        match stamp(&self.setup) == self.loaded.stamp {
+            true => self.loaded.gate.clone(),
+            false => Err(GATE_STALE.into()),
+        }
+    }
+
+    /// When the done gate was last judged.
+    pub fn judged(&self) -> &str {
+        &self.loaded.judged
+    }
+
     pub fn state(&self, all: bool) -> StateView {
+        let gate = self.gate();
         let l = &self.loaded;
         let r = &l.tree.report;
         let q = self.queue(all);
@@ -403,6 +473,9 @@ impl Review {
             out_differs: l.out_differs.clone(),
             unreadable: l.unreadable.clone(),
             convert_ms: l.convert_ms,
+            gate: gate.as_ref().ok().cloned(),
+            gate_error: gate.err(),
+            gate_judged: l.judged.clone(),
         }
     }
 
@@ -733,12 +806,18 @@ fn empty() -> Loaded {
         convert_ms: 0.0,
         converted: false,
         written: Vec::new(),
+        gate: Err("not judged yet".into()),
+        judged: String::new(),
+        stamp: Vec::new(),
     }
 }
 
 /// Reads and converts the tree (reusing `prev`'s conversion when no source
 /// changed), applies the ledger in OUT and reads the instance report.
 fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
+    // Taken before anything is read: a file that changes while this read
+    // judges makes the verdict stale.
+    let stamp = stamp(s);
     let instances = match &s.instances {
         Some(p) => Some(queue::read_instances(p)?),
         None => None,
@@ -757,14 +836,7 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
     let (mut t, convert_ms, converted) = match prev {
         Some(p) if same => {
             let mut t = p.tree;
-            // Back to the conversion as it came from the engine.
-            for f in &mut t.report.files {
-                f.review = None;
-                for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
-                    u.review = None;
-                }
-            }
-            t.report.ledger = None;
+            clear_review(&mut t);
             (t, p.convert_ms, false)
         }
         _ => {
@@ -774,6 +846,7 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         }
     };
     let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
+    let gate = judge(&mut t, &inputs, s, instances.as_ref());
     let ids = inputs
         .iter()
         .zip(&t.conversions)
@@ -800,7 +873,41 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         convert_ms,
         converted,
         written,
+        gate,
+        judged: sqldiff_review::time::now(),
+        stamp,
     })
+}
+
+/// Back to the conversion as it came from the engine: no ledger applied.
+fn clear_review(t: &mut Tree) {
+    for f in &mut t.report.files {
+        f.review = None;
+        for u in f.units.iter_mut().chain(f.converted_units.iter_mut()) {
+            u.review = None;
+        }
+    }
+    t.report.ledger = None;
+}
+
+/// The done gate of `t` (the ledger in OUT applied by `tree::review_in`),
+/// judged as `sqldiff review-status` judges it: without a ledger, with an
+/// empty one, which is taken off again afterwards.
+fn judge(
+    t: &mut Tree,
+    inputs: &[Input],
+    s: &Setup,
+    inst: Option<&Instances>,
+) -> Result<Gate, String> {
+    let none = t.report.ledger.is_none();
+    if none {
+        tree::review(t, inputs, &review::Ledger::default(), "(none)");
+    }
+    let g = gate::check(t, &s.tree, &s.out, inst);
+    if none {
+        clear_review(t);
+    }
+    g
 }
 
 /// The ledger's hand-written texts (every `written` record with a text),
