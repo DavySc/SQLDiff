@@ -11,9 +11,13 @@ CREATE TABLE audit_log (order_id int NULL, action varchar(10) NULL, qty int NULL
 ";
 
 fn run(tsql: &str, pg: &str) -> Report {
+    run_with(tsql, pg, DDL, DDL)
+}
+
+fn run_with(tsql: &str, pg: &str, ddl_a: &str, ddl_b: &str) -> Report {
     let opts = Options {
-        catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, DDL)],
-        catalog_b: vec![Artifact::new("catalog.sql", Dialect::Postgres, DDL)],
+        catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, ddl_a)],
+        catalog_b: vec![Artifact::new("catalog.sql", Dialect::Postgres, ddl_b)],
         ..Options::default()
     };
     diff(
@@ -351,4 +355,82 @@ fn exact_products_compare_equal() {
         &p("qty * CAST(price AS float)"),
     );
     assert!(!equal(&r));
+}
+
+/// From the review of the re-entry proof: a change test on a computed column
+/// changes with the column the trigger assigns, so PostgreSQL re-fires the
+/// trigger until the stack depth limit.
+#[test]
+fn a_change_test_on_a_computed_column_is_no_proof() {
+    let ddl_a = "CREATE TABLE dbo.orders (order_id int NOT NULL PRIMARY KEY, qty int NOT NULL, price decimal(10,2) NOT NULL, total AS (qty * price) PERSISTED);";
+    let ddl_b = "CREATE TABLE orders (order_id integer NOT NULL PRIMARY KEY, qty integer NOT NULL, price numeric(10,2) NOT NULL, total numeric(21,2) GENERATED ALWAYS AS (qty * price) STORED);";
+    let tsql = "CREATE TRIGGER dbo.tr ON dbo.orders FOR UPDATE AS BEGIN IF @@ROWCOUNT = 0 RETURN;
+  UPDATE o SET qty = i.qty + 1 FROM dbo.orders o JOIN inserted i ON o.order_id = i.order_id
+  JOIN deleted d ON d.order_id = i.order_id WHERE i.total <> d.total; END";
+    let pg = |cond: &str| {
+        format!(
+            "CREATE OR REPLACE FUNCTION tr() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+{GUARD}
+  UPDATE orders o SET qty = i.qty + 1 FROM inserted i JOIN deleted d ON d.order_id = i.order_id WHERE o.order_id = i.order_id AND {cond};
+  RETURN NULL;
+END;
+$$;
+CREATE OR REPLACE TRIGGER tr AFTER UPDATE ON orders REFERENCING NEW TABLE AS inserted OLD TABLE AS deleted FOR EACH STATEMENT EXECUTE FUNCTION tr();"
+        )
+    };
+    let r = run_with(tsql, &pg("i.total <> d.total"), ddl_a, ddl_b);
+    assert!(!equal(&r), "{:?}", r.assumptions);
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("updates its own table")),
+        "{:#?}",
+        r.unknown_reasons
+    );
+    // The same test on a stored column the trigger does not assign is one.
+    let r = run_with(
+        &tsql.replace("i.total <> d.total", "i.price <> d.price"),
+        &pg("i.price <> d.price"),
+        ddl_a,
+        ddl_b,
+    );
+    assert!(equal(&r), "{:#?}\n{:#?}", r.findings, r.unknown_reasons);
+}
+
+/// From the review of the re-entry proof: a routine the trigger calls may
+/// update the trigger's table, which the proof does not see.
+#[test]
+fn a_call_in_the_trigger_is_no_proof() {
+    let ddl_a = format!("{DDL}CREATE PROCEDURE dbo.touch AS UPDATE dbo.orders SET total = 0;");
+    let ddl_b = format!(
+        "{DDL}CREATE PROCEDURE touch() LANGUAGE sql AS $$ UPDATE orders SET total = 0; $$;"
+    );
+    let tsql = "CREATE TRIGGER dbo.tr ON dbo.orders AFTER INSERT, UPDATE AS EXEC dbo.touch;";
+    let f = |ev: &str| {
+        format!(
+            "CREATE OR REPLACE FUNCTION tr_{ev}() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  CALL touch();
+  RETURN NULL;
+END;
+$$;
+"
+        )
+    };
+    let pg = format!(
+        "{}{}CREATE OR REPLACE TRIGGER tr_insert AFTER INSERT ON orders REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION tr_insert();
+CREATE OR REPLACE TRIGGER tr_update AFTER UPDATE ON orders REFERENCING NEW TABLE AS inserted OLD TABLE AS deleted FOR EACH STATEMENT EXECUTE FUNCTION tr_update();",
+        f("insert"),
+        f("update")
+    );
+    let r = run_with(tsql, &pg, &ddl_a, &ddl_b);
+    assert!(!equal(&r), "{:?}", r.assumptions);
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("calls a routine")),
+        "{:#?}",
+        r.unknown_reasons
+    );
 }

@@ -47,7 +47,7 @@ pub const REPLICATION: (&str, &str) = (
 );
 pub const REENTRY_OTHERS: (&str, &str) = (
     "ASM-TRIGGER-REENTRY-OTHERS",
-    "The other UPDATE triggers on the table do nothing when their images are empty: PostgreSQL fires this trigger again for its own UPDATE, which then changes no rows, and that UPDATE fires every UPDATE trigger on the table once more",
+    "The other UPDATE triggers on the table do nothing when their images are empty, and no BEFORE trigger changes the columns the trigger tests for a change: PostgreSQL fires this trigger again for its own UPDATE, which then changes no rows only because those columns did not change, and that UPDATE fires every UPDATE trigger on the table once more",
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -572,13 +572,24 @@ impl EqIgnoreCase for [String] {
 /// fire, starts with the empty-image guard and holds nothing but UPDATEs of
 /// the table that each require a column none of the writes assigns to differ
 /// between a row of `inserted` and its own row of `deleted` (matched on a
-/// whole key no write assigns). Fired by such a write, the images hold the
+/// whole key no write assigns). These columns are stored ones on both sides:
+/// a computed or generated column changes with the columns it reads. A call
+/// in any of the functions may write the table out of sight: not proven. Fired by such a write, the images hold the
 /// rows it changed, whose other columns did not change, so every UPDATE
 /// matches no row; the UPDATE that changes no row fires the trigger once
 /// more, with empty images, and the guard returns.
 fn reentry(b: &Analyzed, table: &[String], events: &[Event], pairs: &[Pair], out: &mut Outcome) {
     let own = |target: &[String]| same_table(table, target);
     let fires = |e: Event| events.contains(&e);
+    // A called routine may write the table, which this proof cannot see.
+    if let Some((node, _)) = pairs.iter().find_map(|(_, ub, _, _)| ub.calls.first()) {
+        out.unknown_reasons.push(format!(
+            "{}the trigger calls a routine, which may write its table {}: PostgreSQL fires the table's trigger again for that statement and T-SQL does not (RECURSIVE_TRIGGERS OFF); no proof covers it",
+            place(b, node),
+            table.join(".")
+        ));
+        return;
+    }
     let mut writes: Vec<&Stmt> = Vec::new();
     let mut first: Option<&SyntaxNode> = None;
     let mut other: Option<&SyntaxNode> = None;
@@ -625,7 +636,7 @@ fn reentry(b: &Analyzed, table: &[String], events: &[Event], pairs: &[Pair], out
             _ => Vec::new(),
         })
         .collect();
-    let Some((ua, ub, _, sb)) = pairs
+    let Some((ua, ub, sa, sb)) = pairs
         .iter()
         .find(|(u, _, _, _)| u.trigger.as_ref().is_some_and(|t| t.missing.is_none()))
     else {
@@ -635,6 +646,24 @@ fn reentry(b: &Analyzed, table: &[String], events: &[Event], pairs: &[Pair], out
         .table("inserted")
         .map(|t| t.keys.clone())
         .unwrap_or_default();
+    // Columns the database does not compute on either side: a computed or
+    // generated column changes when the columns it reads are assigned.
+    let stored = |s: &Schema| -> Vec<String> {
+        s.table("inserted")
+            .map(|t| {
+                t.columns
+                    .iter()
+                    .filter(|c| !c.generated)
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (stored_a, stored_b) = (stored(sa), stored(sb));
+    let stored: Vec<String> = stored_b
+        .into_iter()
+        .filter(|c| stored_a.contains(c))
+        .collect();
     let proven = guarded(ub)
         && guarded(ua)
         && ub.uncovered.is_empty()
@@ -646,7 +675,7 @@ fn reentry(b: &Analyzed, table: &[String], events: &[Event], pairs: &[Pair], out
                 from,
                 where_: Some(w),
                 ..
-            }) if own(target) => inert(from, w, &assigned, &keys),
+            }) if own(target) => inert(from, w, &assigned, &keys, &stored),
             _ => false,
         });
     if proven {
@@ -669,7 +698,13 @@ fn name_key(s: &str) -> String {
 /// `i.c <> d.c` (or `IS DISTINCT FROM`, or `NOT (i.c = d.c)`) for columns
 /// `c` no write assigns, where `i` reads `inserted` and `d` reads `deleted`,
 /// matched on every column of a key that no write assigns.
-fn inert(from: &[From], w: &Expr, assigned: &[String], keys: &[Vec<String>]) -> bool {
+fn inert(
+    from: &[From],
+    w: &Expr,
+    assigned: &[String],
+    keys: &[Vec<String>],
+    stored: &[String],
+) -> bool {
     let mut tables: Vec<(String, String)> = Vec::new();
     let mut ons: Vec<&Expr> = Vec::new();
     fn walk<'e>(f: &'e From, t: &mut Vec<(String, String)>, ons: &mut Vec<&'e Expr>) -> bool {
@@ -755,6 +790,7 @@ fn inert(from: &[From], w: &Expr, assigned: &[String], keys: &[Vec<String>]) -> 
             !k.is_empty()
                 && k.iter().all(|c| {
                     !assigned.contains(c)
+                        && stored.contains(c)
                         && eqs.iter().any(|(ei, ed, ec)| ei == i && ed == d && ec == c)
                 })
         })
@@ -768,7 +804,11 @@ fn inert(from: &[From], w: &Expr, assigned: &[String], keys: &[Vec<String>]) -> 
                     let pair = |x: &Expr, y: &Expr| {
                         let (i, c1) = col(x, "inserted")?;
                         let (d, c2) = col(y, "deleted")?;
-                        (c1 == c2 && !assigned.contains(&c1) && keyed(&i, &d)).then_some(())
+                        (c1 == c2
+                            && !assigned.contains(&c1)
+                            && stored.contains(&c1)
+                            && keyed(&i, &d))
+                        .then_some(())
                     };
                     pair(x, y).or_else(|| pair(y, x)).is_some()
                 };
