@@ -36,6 +36,7 @@ pub fn set_format(text: &str, format: &FormatConfig, crlf_if_empty: bool) -> Res
         ("db2i", &format.db2i),
     ];
     let any = sections.iter().any(|(_, k)| **k != FormatKeys::default());
+    let mut empty = false;
     if let Some(root) = table_in(doc.as_table_mut(), "format", any)? {
         for (name, keys) in sections {
             let table = match name {
@@ -49,7 +50,18 @@ pub fn set_format(text: &str, format: &FormatConfig, crlf_if_empty: bool) -> Res
                     t.set_implicit(false);
                 }
             }
+            if !name.is_empty() && root.get(name).and_then(Item::as_table).is_some_and(bare) {
+                root.remove(name);
+            }
         }
+        empty = bare(root);
+        // Only sub-tables left: they carry their own headers.
+        if !empty && !noted(root) && root.iter().all(|(_, v)| v.is_table()) {
+            root.set_implicit(true);
+        }
+    }
+    if empty {
+        doc.as_table_mut().remove("format");
     }
 
     // The document drops a carriage return when it reads, so the file's line
@@ -68,6 +80,20 @@ pub fn set_format(text: &str, format: &FormatConfig, crlf_if_empty: bool) -> Res
         ));
     }
     Ok(if bom { format!("{BOM}{out}") } else { out })
+}
+
+/// A comment on the table's header line or the lines before it.
+fn noted(t: &Table) -> bool {
+    let note = |r: Option<&toml_edit::RawString>| {
+        r.and_then(toml_edit::RawString::as_str)
+            .is_some_and(|s| s.contains('#'))
+    };
+    note(t.decor().prefix()) || note(t.decor().suffix())
+}
+
+/// A table with nothing in it and no comment on its header: not worth keeping.
+fn bare(t: &Table) -> bool {
+    t.is_empty() && !noted(t)
 }
 
 /// The table `name` in `parent`, made if absent and `create`; an inline

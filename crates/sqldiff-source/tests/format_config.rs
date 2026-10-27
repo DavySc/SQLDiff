@@ -317,3 +317,18 @@ fn saving_refuses_what_would_not_read_back() {
     let e = set_format("format = 3\n", &draft("[format]\nindent = 2\n"), false).unwrap_err();
     assert!(e.0.contains("format"), "{e}");
 }
+
+#[test]
+fn saving_drops_a_table_it_emptied_unless_it_has_a_comment() {
+    let text = "excerpt_lines = 4\n\n[format]\nindent = 2\n\n# the tsql house style\n[format.tsql]\nindent = 8\n\n[format.postgres]\nindent = 3\n";
+    let out = set_format(text, &FormatConfig::default(), false).unwrap();
+    // [format.postgres] had no comment and goes; [format.tsql] keeps its header
+    // and comment, and so [format] stays as the parent of what is left.
+    assert_eq!(
+        out,
+        "excerpt_lines = 4\n\n# the tsql house style\n[format.tsql]\n"
+    );
+    let bare = set_format("[format]\nindent = 2\n", &FormatConfig::default(), false).unwrap();
+    assert_eq!(bare, "");
+    assert_eq!(parse(&out), FormatConfig::default());
+}
