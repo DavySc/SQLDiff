@@ -62,7 +62,7 @@ pub struct FormatLayer {
 /// Where the effective value of one format key comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeySource {
-    /// Index into [`Resolved::format_layers`]; `None`: the built-in default.
+    /// Index into the layers; `None`: the built-in default.
     pub layer: Option<usize>,
     /// Set in the dialect's own table (`[format.postgres]`), not in `[format]`.
     pub dialect_table: bool,
@@ -390,78 +390,29 @@ impl Resolved {
         })
     }
 
-    /// `[format]` as it merges when the project layer's keys are `draft`
-    /// instead: they replace that layer, or become one (above the packs,
-    /// below the user config) when no project config was read.
-    pub fn format_with_project(&self, draft: &FormatConfig) -> FormatConfig {
-        let mut layers: Vec<&FormatConfig> = self.format_layers.iter().map(|l| &l.format).collect();
-        match self
-            .format_layers
-            .iter()
-            .position(|l| l.kind == LayerKind::Project)
-        {
-            Some(i) => layers[i] = draft,
+    /// The `[format]` layers with the project layer's keys replaced by
+    /// `draft`, or, when no project config was read, with `draft` added as
+    /// that layer (above the packs, below the user config).
+    pub fn format_layers_with_project(&self, draft: &FormatConfig) -> Vec<FormatLayer> {
+        let mut layers = self.format_layers.clone();
+        match layers.iter_mut().find(|l| l.kind == LayerKind::Project) {
+            Some(l) => l.format = draft.clone(),
             None => {
-                let at = self
-                    .format_layers
+                let at = layers
                     .iter()
                     .position(|l| l.kind > LayerKind::Project)
                     .unwrap_or(layers.len());
-                layers.insert(at, draft);
-            }
-        }
-        let mut merged = FormatConfig::default();
-        for l in layers {
-            merged.merge(l);
-        }
-        merged
-    }
-
-    /// Where each format key of `dialect` gets its value, by key name: the
-    /// last layer that set it in the dialect's own table, else the last that
-    /// set it in `[format]`, else the built-in default. Keys are named as the
-    /// config file spells them; the merge is the one [`FormatConfig::options`]
-    /// makes of [`Resolved::policy`].
-    pub fn format_sources(&self, dialect: Dialect) -> BTreeMap<String, KeySource> {
-        let mut out: BTreeMap<String, KeySource> = FormatKeys::from_options(&Default::default())
-            .names()
-            .into_iter()
-            .map(|k| {
-                let s = KeySource {
-                    layer: None,
-                    dialect_table: false,
-                };
-                (k, s)
-            })
-            .collect();
-        for (i, l) in self.format_layers.iter().enumerate() {
-            for k in l.format.all.names() {
-                out.insert(
-                    k,
-                    KeySource {
-                        layer: Some(i),
-                        dialect_table: false,
+                layers.insert(
+                    at,
+                    FormatLayer {
+                        kind: LayerKind::Project,
+                        path: None,
+                        format: draft.clone(),
                     },
                 );
             }
         }
-        for (i, l) in self.format_layers.iter().enumerate() {
-            let own = match dialect {
-                Dialect::Tsql => &l.format.tsql,
-                Dialect::Postgres => &l.format.postgres,
-                Dialect::Db2i => &l.format.db2i,
-            };
-            for k in own.names() {
-                out.insert(
-                    k,
-                    KeySource {
-                        layer: Some(i),
-                        dialect_table: true,
-                    },
-                );
-            }
-        }
-        out
+        layers
     }
 
     /// True if a filesystem or git source should skip this path.
@@ -536,6 +487,63 @@ impl Resolved {
     pub fn adapter(&self, name: &str) -> Option<&AdapterSpec> {
         self.policy.adapters.iter().find(|a| a.name == name)
     }
+}
+
+/// `[format]` of `layers` merged, lowest layer first, as [`Resolved::policy`]
+/// has it.
+pub fn merge_format(layers: &[FormatLayer]) -> FormatConfig {
+    let mut merged = FormatConfig::default();
+    for l in layers {
+        merged.merge(&l.format);
+    }
+    merged
+}
+
+/// Where each format key gets its value, by key name as the config file
+/// spells it. For a dialect: the last layer that set the key in the dialect's
+/// own table, else the last that set it in `[format]`, else the built-in
+/// default, which is the merge [`FormatConfig::options`] makes. With `None`,
+/// only `[format]` counts.
+pub fn format_sources(
+    layers: &[FormatLayer],
+    dialect: Option<Dialect>,
+) -> BTreeMap<String, KeySource> {
+    let mut out: BTreeMap<String, KeySource> = FormatKeys::from_options(&Default::default())
+        .names()
+        .into_iter()
+        .map(|k| {
+            let s = KeySource {
+                layer: None,
+                dialect_table: false,
+            };
+            (k, s)
+        })
+        .collect();
+    for (i, l) in layers.iter().enumerate() {
+        for k in l.format.all.names() {
+            let s = KeySource {
+                layer: Some(i),
+                dialect_table: false,
+            };
+            out.insert(k, s);
+        }
+    }
+    for (i, l) in layers.iter().enumerate() {
+        let own = match dialect {
+            None => continue,
+            Some(Dialect::Tsql) => &l.format.tsql,
+            Some(Dialect::Postgres) => &l.format.postgres,
+            Some(Dialect::Db2i) => &l.format.db2i,
+        };
+        for k in own.names() {
+            let s = KeySource {
+                layer: Some(i),
+                dialect_table: true,
+            };
+            out.insert(k, s);
+        }
+    }
+    out
 }
 
 /// Merges `hi` (higher precedence) into `acc`.

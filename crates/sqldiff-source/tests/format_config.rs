@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use sqldiff_core::format::{FormatConfig, FormatKeys, IndentStyle, KeywordCase, LineEnding};
 use sqldiff_core::Dialect;
-use sqldiff_source::config::{LayerKind, Sources};
+use sqldiff_source::config::{format_sources, merge_format, LayerKind, Sources};
 use sqldiff_source::format_file::set_format;
 use sqldiff_source::Resolved;
 
@@ -72,10 +72,9 @@ fn layers_are_kept_in_merge_order() {
     assert_eq!(cfg.format_layers[1].path.as_deref(), Some(ws.as_path()));
     // Merging the layers as read gives the policy's format; replacing the
     // project layer by itself changes nothing.
-    assert_eq!(
-        cfg.format_with_project(&cfg.format_layers[1].format.clone()),
-        cfg.policy.format
-    );
+    assert_eq!(merge_format(&cfg.format_layers), cfg.policy.format);
+    let same = cfg.format_layers_with_project(&cfg.format_layers[1].format);
+    assert_eq!(same, cfg.format_layers);
 }
 
 #[test]
@@ -90,7 +89,7 @@ fn sources_say_which_layer_set_each_key() {
         // The pack's [format.postgres] outranks the project's [format].
         (Dialect::Postgres, (pack, true), (project, false)),
     ] {
-        let s = cfg.format_sources(d);
+        let s = format_sources(&cfg.format_layers, Some(d));
         assert_eq!((s["indent"].layer, s["indent"].dialect_table), indent);
         assert_eq!(
             (s["keyword_case"].layer, s["keyword_case"].dialect_table),
@@ -98,7 +97,14 @@ fn sources_say_which_layer_set_each_key() {
         );
         assert_eq!(s["final_newline"].layer, None);
     }
-    let s = cfg.format_sources(Dialect::Tsql);
+    // Without a dialect only [format] counts.
+    let s = format_sources(&cfg.format_layers, None);
+    assert_eq!(
+        (s["indent"].layer, s["indent"].dialect_table),
+        (pack, false)
+    );
+    assert_eq!(s["indent_style"].layer, None);
+    let s = format_sources(&cfg.format_layers, Some(Dialect::Tsql));
     assert_eq!(
         (s["indent_style"].layer, s["indent_style"].dialect_table),
         (project, true)
@@ -107,7 +113,7 @@ fn sources_say_which_layer_set_each_key() {
     for d in Dialect::ALL {
         let options =
             serde_json::to_value(FormatKeys::from_options(&cfg.policy.format.options(d))).unwrap();
-        for (key, src) in cfg.format_sources(d) {
+        for (key, src) in format_sources(&cfg.format_layers, Some(d)) {
             let Some(i) = src.layer else { continue };
             let f = &cfg.format_layers[i].format;
             let own = match d {
@@ -131,7 +137,7 @@ fn a_draft_replaces_the_project_layer_or_becomes_one() {
     write(&root, "pack.toml", PACK);
     let ws = write(&root, "ws/sqldiff.toml", WORKSPACE);
     let draft = parse("[format]\nindent = 8\n");
-    let with = load(&root, Some(&ws)).format_with_project(&draft);
+    let with = merge_format(&load(&root, Some(&ws)).format_layers_with_project(&draft));
     // The pack's indent is overridden, the workspace's keyword_case is gone.
     assert_eq!(with.all.indent, Some(8));
     assert_eq!(with.all.keyword_case, Some(KeywordCase::Lower));
@@ -148,7 +154,7 @@ fn a_draft_replaces_the_project_layer_or_becomes_one() {
         .format_layers
         .iter()
         .all(|l| l.kind != LayerKind::Project));
-    let with = without.format_with_project(&draft);
+    let with = merge_format(&without.format_layers_with_project(&draft));
     assert_eq!(with.all.indent, Some(8));
     assert_eq!(with.postgres.indent, Some(3));
 }
