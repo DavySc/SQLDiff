@@ -284,6 +284,11 @@ const TEXT: &[(&str, &str, Want)] = &[
     ),
     ("CAST('1.5' AS int)", "CAST('1.5' AS integer)", Unknown),
     (
+        "CAST('abc' AS float)",
+        "CAST('abc' AS double precision)",
+        Unknown,
+    ),
+    (
         "CAST(T AS varchar(40))",
         "CAST(T AS varchar(40))",
         Diff("equiv.time-text"),
@@ -380,6 +385,71 @@ const TIMES: &[(&str, &str, Want)] = &[
 #[test]
 fn time_conversions() {
     check(TIMES, Dialect::Postgres);
+}
+
+/// A string literal stored in a column stands for the value it converts to,
+/// kept to the column's precision and scale; one that may round, fail or
+/// depend on settings is not compared.
+const STORES: &[(&str, &str, Want)] = &[
+    (
+        "!INSERT INTO dbo.M (Id, T) VALUES (1, '20200101');",
+        "!INSERT INTO M (Id, T) VALUES (1, '20200101');",
+        Eq,
+    ),
+    (
+        "!INSERT INTO dbo.M (Id, T) VALUES (1, '2020-01-01 10:00:00.123');",
+        "!INSERT INTO M (Id, T) VALUES (1, '2020-01-01 10:00:00.123');",
+        Eq,
+    ),
+    // More digits than the column keeps: each engine rounds its own way.
+    (
+        "!INSERT INTO dbo.M (Id, T) VALUES (1, '2020-01-01 10:00:00.1235');",
+        "!INSERT INTO M (Id, T) VALUES (1, '2020-01-01 10:00:00.1235');",
+        Unknown,
+    ),
+    (
+        "!INSERT INTO dbo.M (Id, Q) VALUES (1, '12');",
+        "!INSERT INTO M (Id, Q) VALUES (1, '13');",
+        Diff("equiv.witness"),
+    ),
+    // Different dates are not explained yet, never equal.
+    (
+        "!INSERT INTO dbo.M (Id, T) VALUES (1, '20200101');",
+        "!INSERT INTO M (Id, T) VALUES (1, '20200102');",
+        Unknown,
+    ),
+    (
+        "!INSERT INTO dbo.M (Id, Day, Q, D) VALUES (1, '20200101', '12', '1.5');",
+        "!INSERT INTO M (Id, Day, Q, D) VALUES (1, '20200101', '12', '1.5');",
+        Eq,
+    ),
+    (
+        "!UPDATE dbo.M SET Q = '12', D = '-0.50' WHERE Id = 1;",
+        "!UPDATE M SET Q = '12', D = '-0.50' WHERE Id = 1;",
+        Eq,
+    ),
+    // SQL Server rounds 1.555 into decimal(10,2); not modelled.
+    (
+        "!UPDATE dbo.M SET D = '1.555' WHERE Id = 1;",
+        "!UPDATE M SET D = '1.555' WHERE Id = 1;",
+        Unknown,
+    ),
+    (
+        "!UPDATE dbo.M SET Q = ' 12 ' WHERE Id = 1;",
+        "!UPDATE M SET Q = ' 12 ' WHERE Id = 1;",
+        Unknown,
+    ),
+    // A string column keeps the string.
+    (
+        "!UPDATE dbo.M SET S = '12' WHERE Id = 1;",
+        "!UPDATE M SET S = '12' WHERE Id = 1;",
+        Eq,
+    ),
+];
+
+#[test]
+fn string_literal_stores() {
+    check(STORES, Dialect::Postgres);
 }
 
 /// Db2 for i: only integer and widening decimal conversions are compared.
