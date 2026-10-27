@@ -1,14 +1,17 @@
 //! Runs: long work started from the app, with progress, cancel and a list
-//! kept while the app runs. The one kind so far converts a tree into an
-//! output folder through `sqldiff_convert::job`, the code `sqldiff convert`
-//! runs, so a run writes what the command writes. Each run carries that
-//! command (`Command`), for scripts and pipelines.
+//! kept while the app runs. A run converts a tree into an output folder
+//! through `sqldiff_convert::job` (what `sqldiff convert` runs), or checks
+//! the instances of converted templates through
+//! `sqldiff_convert::instances` (what `sqldiff instances` runs), so a run
+//! writes what the command writes. Each run carries that command
+//! (`Command`), for scripts and pipelines.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use sqldiff_convert::instances;
 use sqldiff_convert::job::{self, Job};
 use sqldiff_convert::tree::{self, Hooks};
 use sqldiff_core::Dialect;
@@ -52,19 +55,76 @@ pub struct ConvertSpec {
     pub instances: Option<String>,
 }
 
+/// An instance check as the page asks for it: the arguments of
+/// `sqldiff instances`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstancesSpec {
+    /// The instance manifest (TOML).
+    pub manifest: String,
+    /// The source templates and the converted templates (`--source`,
+    /// `--target`); not with `generator_only`.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    pub from: String,
+    pub to: String,
+    /// The output folder for the woven instances and the report.
+    pub out: String,
+    /// The generator's own output for the source and for the target dialect
+    /// (`--woven`, `--woven-target`).
+    #[serde(default)]
+    pub woven: Option<String>,
+    #[serde(default)]
+    pub woven_target: Option<String>,
+    /// Check the generator's output alone (`--generator-only`).
+    #[serde(default)]
+    pub generator_only: bool,
+    /// Parameter names (`--parameter`) and accepted assumptions (`--accept`).
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// Packs to load besides the config's (`--pack`), by path.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// What a run was asked to do.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Spec {
+    Convert(ConvertSpec),
+    Instances(InstancesSpec),
+}
+
+/// The work a spec comes to, checked before a thread starts.
+enum Work {
+    Convert(Box<Job>),
+    Instances(Box<instances::Args>),
+}
+
 /// Where a run is.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum State {
     Running,
-    /// Written. `totals` as in `conversion-report.json`; `complete` when
-    /// every file is converted or converted under assumptions (the CLI's
-    /// exit code 0), which is not the review's done gate.
+    /// Written. For a conversion `totals` is as in `conversion-report.json`,
+    /// `complete` says every file is converted or converted under
+    /// assumptions (the CLI's exit code 0, not the review's done gate) and
+    /// `queue` counts the review queue. For an instance check `totals` holds
+    /// the instances per status, the count done and the count in all,
+    /// `complete` is the report's and `queue` counts the instances not done.
     Done {
         totals: serde_json::Value,
         complete: bool,
         queue: usize,
         not_applied: Vec<String>,
+        /// Notes on the run, such as a `--since` report not reused.
+        notes: Vec<String>,
         finished: String,
     },
     /// Stopped before anything was written into the output folder.
@@ -125,6 +185,61 @@ impl Command {
         if let Some(p) = &job.instances {
             args.extend(["--instances".into(), path(p)]);
         }
+        Command::with_config(program, args, packs, dir, isolated)
+    }
+
+    /// The `sqldiff instances` command for `a` with `packs`, with config
+    /// found from `dir` as the run finds it.
+    pub fn instances(
+        program: &str,
+        a: &instances::Args,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        let mut args = vec!["instances".into(), path(&a.manifest)];
+        for (flag, p) in [("--source", &a.source), ("--target", &a.target)] {
+            if let Some(p) = p {
+                args.extend([flag.into(), path(p)]);
+            }
+        }
+        args.extend([
+            "--from".into(),
+            a.from.id().into(),
+            "--to".into(),
+            a.to.id().into(),
+            "-o".into(),
+            path(&a.out),
+        ]);
+        for (flag, p) in [("--woven", &a.woven), ("--woven-target", &a.woven_target)] {
+            if let Some(p) = p {
+                args.extend([flag.into(), path(p)]);
+            }
+        }
+        if a.generator_only {
+            args.push("--generator-only".into());
+        }
+        for p in &a.parameters {
+            args.extend(["--parameter".into(), p.clone()]);
+        }
+        for id in &a.accept {
+            args.extend(["--accept".into(), id.clone()]);
+        }
+        if a.overwrite {
+            args.push("--overwrite".into());
+        }
+        Command::with_config(program, args, packs, dir, isolated)
+    }
+
+    /// `args` with the packs and every config file the run loaded named,
+    /// and no other found (`--isolated`).
+    fn with_config(
+        program: &str,
+        mut args: Vec<String>,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
         for p in packs {
             args.extend(["--pack".into(), path(p)]);
         }
@@ -212,10 +327,12 @@ pub fn program() -> String {
 
 pub struct Run {
     pub id: u64,
-    pub spec: ConvertSpec,
+    pub spec: Spec,
     pub command: Command,
-    /// Absolute output folder, for the one-run-per-folder rule.
+    /// Absolute output folder, and what the run reads: no two running runs
+    /// write into one folder, and none reads where another writes.
     out: PathBuf,
+    reads: Vec<PathBuf>,
     started: String,
     checked: AtomicUsize,
     total: AtomicUsize,
@@ -229,9 +346,8 @@ pub struct Run {
 #[derive(Debug, Serialize)]
 pub struct RunView {
     pub id: u64,
-    pub kind: &'static str,
     #[serde(flatten)]
-    pub spec: ConvertSpec,
+    pub spec: Spec,
     pub command: Command,
     pub started: String,
     pub checked: usize,
@@ -245,7 +361,6 @@ impl Run {
     pub fn view(&self) -> RunView {
         RunView {
             id: self.id,
-            kind: "convert",
             spec: self.spec.clone(),
             command: self.command.clone(),
             started: self.started.clone(),
@@ -301,21 +416,82 @@ impl Runs {
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
         let (job, out, command) = prepare(&spec, isolated)?;
+        let reads = [Some(&job.tree.src), job.instances.as_ref()]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        self.launch(
+            Spec::Convert(spec),
+            Work::Convert(Box::new(job)),
+            (out, reads),
+            command,
+            done,
+        )
+    }
+
+    /// Starts an instance check on its own thread. Config is what a command
+    /// run in the manifest's folder loads (unless `isolated`).
+    pub fn start_instances(
+        &self,
+        spec: InstancesSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (a, command) = prepare_instances(&spec, isolated)?;
+        let out = a.out.clone();
+        let reads = [Some(&a.manifest), a.source.as_ref(), a.target.as_ref()]
+            .into_iter()
+            .chain([a.woven.as_ref(), a.woven_target.as_ref()])
+            .flatten()
+            .cloned()
+            .collect();
+        self.launch(
+            Spec::Instances(spec),
+            Work::Instances(Box::new(a)),
+            (out, reads),
+            command,
+            done,
+        )
+    }
+
+    fn launch(
+        &self,
+        spec: Spec,
+        work: Work,
+        (out, reads): (PathBuf, Vec<PathBuf>),
+        command: Command,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
         let run = {
             let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
-            if l.iter()
-                .any(|r| r.out == out && matches!(r.state(), State::Running))
-            {
-                return Err(format!(
-                    "{}: another run is writing there; wait for it or cancel it",
-                    out.display()
-                ));
+            let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+            for r in l.iter().filter(|r| matches!(r.state(), State::Running)) {
+                if overlap(&r.out, &out) {
+                    return Err(format!(
+                        "{}: another run is writing there; wait for it or cancel it",
+                        out.display()
+                    ));
+                }
+                if let Some(p) = reads.iter().find(|p| overlap(&r.out, p)) {
+                    return Err(format!(
+                        "{}: another run is writing there, so this run would read a half-written tree; wait for it or cancel it",
+                        p.display()
+                    ));
+                }
+                if r.reads.iter().any(|p| overlap(p, &out)) {
+                    return Err(format!(
+                        "{}: another run is reading there; wait for it or cancel it",
+                        out.display()
+                    ));
+                }
             }
             let run = Arc::new(Run {
                 id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
                 spec,
                 command,
                 out,
+                reads,
                 started: sqldiff_review::time::now(),
                 checked: AtomicUsize::new(0),
                 total: AtomicUsize::new(0),
@@ -330,7 +506,7 @@ impl Runs {
         std::thread::Builder::new()
             .stack_size(sqldiff_core::ENGINE_STACK)
             .spawn(move || {
-                let state = execute(&r, job);
+                let state = execute(&r, work);
                 *r.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
                 done(&r);
             })
@@ -344,13 +520,114 @@ pub fn command(spec: &ConvertSpec, isolated: bool) -> Result<Command, String> {
     prepare(spec, isolated).map(|(_, _, c)| c)
 }
 
-/// The job a spec asks for, checked before a thread is started, its
-/// absolute output folder and the command that runs it.
-fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command), String> {
+/// The command an instance check of `spec` would carry, without starting one.
+pub fn instances_command(spec: &InstancesSpec, isolated: bool) -> Result<Command, String> {
+    prepare_instances(spec, isolated).map(|(_, c)| c)
+}
+
+fn dialects(from: &str, to: &str) -> Result<(Dialect, Dialect), String> {
     let dialect = |id: &str| -> Result<Dialect, String> {
         id.parse().map_err(|_| format!("unknown dialect `{id}`"))
     };
-    let (from, to) = (dialect(&spec.from)?, dialect(&spec.to)?);
+    Ok((dialect(from)?, dialect(to)?))
+}
+
+/// `p`, absolute; it must exist.
+fn existing(p: &str) -> Result<PathBuf, String> {
+    let p = browse::absolute(Path::new(p.trim()));
+    match p.exists() {
+        true => Ok(p),
+        false => Err(format!("{}: not found", p.display())),
+    }
+}
+
+/// The given paths, absolute; each must exist. Blank ones are left out.
+fn existing_all(v: &[String]) -> Result<Vec<PathBuf>, String> {
+    v.iter()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| existing(p))
+        .collect()
+}
+
+/// The given names, trimmed; blank ones are left out.
+fn names(v: &[String]) -> Vec<String> {
+    v.iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
+}
+
+/// Config as a command run in `dir` with `packs` loads it.
+fn load_config(dir: &Path, packs: &[PathBuf], isolated: bool) -> Result<Resolved, String> {
+    Resolved::load(&Sources {
+        project: None,
+        user: None,
+        isolated,
+        cwd: Some(dir.to_path_buf()),
+        packs: packs.to_vec(),
+        cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+    })
+    .map_err(|e| e.0)
+}
+
+/// The instance check a spec asks for, checked before a thread is started,
+/// and the command that runs it.
+fn prepare_instances(
+    spec: &InstancesSpec,
+    isolated: bool,
+) -> Result<(instances::Args, Command), String> {
+    let (from, to) = dialects(&spec.from, &spec.to)?;
+    if spec.manifest.trim().is_empty() || spec.out.trim().is_empty() {
+        return Err("give a manifest and an output folder".into());
+    }
+    let opt = |p: &Option<String>| -> Result<Option<PathBuf>, String> {
+        match p.as_deref().filter(|p| !p.trim().is_empty()) {
+            Some(p) => existing(p).map(Some),
+            None => Ok(None),
+        }
+    };
+    let manifest = existing(&spec.manifest)?;
+    let (source, target) = (opt(&spec.source)?, opt(&spec.target)?);
+    let (woven, woven_target) = (opt(&spec.woven)?, opt(&spec.woven_target)?);
+    if spec.generator_only {
+        if woven.is_none() || woven_target.is_none() {
+            return Err("checking the generator's output alone needs both of its outputs".into());
+        }
+        if source.is_some() || target.is_some() {
+            return Err("checking the generator's output alone takes no templates".into());
+        }
+    } else if source.is_none() || target.is_none() {
+        return Err("give the source templates and the converted templates".into());
+    }
+    let packs = existing_all(&spec.packs)?;
+    let dir = manifest.parent().map(Path::to_path_buf).unwrap_or_default();
+    let cfg = load_config(&dir, &packs, isolated)?;
+    let a = instances::Args {
+        manifest,
+        source,
+        target,
+        from,
+        to,
+        out: browse::absolute(Path::new(spec.out.trim())),
+        woven,
+        woven_target,
+        generator_only: spec.generator_only,
+        since: None,
+        parameters: names(&spec.parameters),
+        accept: names(&spec.accept),
+        jobs: None,
+        overwrite: spec.overwrite,
+        options: sqldiff_core::Options::default(),
+        cfg,
+    };
+    let command = Command::instances(&program(), &a, &packs, &dir, isolated);
+    Ok((a, command))
+}
+
+/// The job a spec asks for, checked before a thread is started, its
+/// absolute output folder and the command that runs it.
+fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command), String> {
+    let (from, to) = dialects(&spec.from, &spec.to)?;
     if !sqldiff_convert::supported(from, to) {
         return Err(format!(
             "no conversion rules from {} to {} yet",
@@ -366,28 +643,10 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
     if !src.exists() {
         return Err(format!("{}: not found", src.display()));
     }
-    let given = |p: &String| -> Result<PathBuf, String> {
-        let p = browse::absolute(Path::new(p.trim()));
-        match p.exists() {
-            true => Ok(p),
-            false => Err(format!("{}: not found", p.display())),
-        }
-    };
-    let packs = spec
-        .packs
-        .iter()
-        .filter(|p| !p.trim().is_empty())
-        .map(given)
-        .collect::<Result<Vec<_>, _>>()?;
-    let instances = match spec.instances.as_ref().filter(|p| !p.trim().is_empty()) {
-        Some(p) => Some(given(p)?),
+    let packs = existing_all(&spec.packs)?;
+    let instances = match spec.instances.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(p) => Some(existing(p)?),
         None => None,
-    };
-    let names = |v: &[String]| -> Vec<String> {
-        v.iter()
-            .map(|n| n.trim().to_string())
-            .filter(|n| !n.is_empty())
-            .collect()
     };
     let parameters = names(&spec.parameters);
     if !spec.template && !parameters.is_empty() {
@@ -397,15 +656,7 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
         true => src.clone(),
         false => src.parent().map(Path::to_path_buf).unwrap_or_default(),
     };
-    let cfg = Resolved::load(&Sources {
-        project: None,
-        user: None,
-        isolated,
-        cwd: Some(dir.clone()),
-        packs: packs.clone(),
-        cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
-    })
-    .map_err(|e| e.0)?;
+    let cfg = load_config(&dir, &packs, isolated)?;
     let template = match spec.template {
         true => Some(tree::TemplateMode::configured(
             &cfg,
@@ -434,7 +685,7 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
     Ok((job, out, command))
 }
 
-fn execute(run: &Arc<Run>, job: Job) -> State {
+fn execute(run: &Arc<Run>, work: Work) -> State {
     let r = Arc::clone(run);
     let hooks = Hooks {
         progress: Some(Box::new(move |checked, total| {
@@ -444,19 +695,38 @@ fn execute(run: &Arc<Run>, job: Job) -> State {
         cancel: Some(Arc::clone(&run.cancel)),
     };
     let finished = sqldiff_review::time::now;
+    let stopped = |e: String| match e == tree::CANCELLED {
+        true => State::Cancelled {
+            finished: finished(),
+        },
+        false => State::Failed {
+            error: e,
+            finished: finished(),
+        },
+    };
+    let job = match work {
+        Work::Convert(job) => job,
+        Work::Instances(a) => {
+            return match instances::check(&a, &hooks) {
+                Ok(c) => State::Done {
+                    totals: serde_json::json!({
+                        "statuses": c.totals,
+                        "done": c.done,
+                        "instances": c.instances,
+                    }),
+                    complete: c.complete,
+                    queue: c.instances - c.done,
+                    not_applied: Vec::new(),
+                    notes: c.notes,
+                    finished: finished(),
+                },
+                Err(e) => stopped(e),
+            }
+        }
+    };
     let w = match job::convert_into(&job, &hooks) {
         Ok(w) => w,
-        Err(e) if e == tree::CANCELLED => {
-            return State::Cancelled {
-                finished: finished(),
-            }
-        }
-        Err(error) => {
-            return State::Failed {
-                error,
-                finished: finished(),
-            }
-        }
+        Err(e) => return stopped(e),
     };
     let totals = serde_json::to_value(&w.tree.report.totals).unwrap_or_default();
     let complete = w.tree.report.ok();
@@ -485,6 +755,7 @@ fn execute(run: &Arc<Run>, job: Job) -> State {
         complete,
         queue,
         not_applied,
+        notes: Vec::new(),
         finished: finished(),
     }
 }

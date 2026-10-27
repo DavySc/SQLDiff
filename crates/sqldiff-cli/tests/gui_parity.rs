@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sqldiff_gui::runs::{self, Command as Sheet, ConvertSpec, Run, Runs, State};
+use sqldiff_gui::runs::{self, Command as Sheet, ConvertSpec, InstancesSpec, Run, Runs, State};
 
 fn write(p: &Path, text: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -34,7 +34,8 @@ fn files(dir: &Path) -> Vec<(String, String)> {
     v
 }
 
-/// `files`, with the output folder's name and the timings masked.
+/// `files`, with the output folder's name, the timings and the build masked
+/// (an instance report's run fingerprint hashes the running program).
 fn masked(dir: &Path) -> Vec<(String, String)> {
     let name = dir.display().to_string();
     let json = serde_json::to_string(&name).unwrap();
@@ -49,6 +50,7 @@ fn masked(dir: &Path) -> Vec<(String, String)> {
                     let s = l.trim_start();
                     if s.starts_with("\"seconds\":")
                         || (s.contains(" files, ") && s.ends_with(" s"))
+                        || l.starts_with("  \"fingerprint\":")
                     {
                         "(time)"
                     } else {
@@ -292,27 +294,61 @@ fn a_template_run_and_its_command_write_the_same() {
     }
     assert!(!d.join("conv/plain.sql").exists());
     assert!(d.join("conv/procs/touch.tpl").is_file());
-    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
-        .arg("instances")
-        .arg(&manifest)
-        .args(["--source", &src.display().to_string()])
-        .args(["--target", &d.join("conv").display().to_string()])
-        .args([
-            "--to",
-            "postgres",
-            "-o",
-            &d.join("inst").display().to_string(),
-        ])
-        .args(["--pack", &pack(), "--isolated"])
-        .output()
+    // The instance check, from the app and by its command.
+    let check = |out: &Path| InstancesSpec {
+        manifest: manifest.display().to_string(),
+        source: Some(src.display().to_string()),
+        target: Some(d.join("conv").display().to_string()),
+        from: "tsql".into(),
+        to: "postgres".into(),
+        out: out.display().to_string(),
+        woven: None,
+        woven_target: None,
+        generator_only: false,
+        parameters: vec!["TABLE".into()],
+        accept: vec!["ASM-DBO-SCHEMA".into()],
+        packs: vec![pack()],
+        overwrite: false,
+    };
+    let run = runs
+        .start_instances(check(&d.join("inst gui")), true, |_| {})
         .unwrap();
     assert!(
-        d.join("inst/instance-report.json").is_file(),
+        matches!(finish(&run), State::Done { .. }),
+        "{:?}",
+        run.state()
+    );
+    assert!(d.join("inst gui/instance-report.json").is_file());
+    let sheet = runs::instances_command(&check(&d.join("inst cli")), true).unwrap();
+    for flag in [
+        "--source",
+        "--target",
+        "--parameter",
+        "--accept",
+        "--pack",
+        "--isolated",
+    ] {
+        assert!(
+            sheet.args.contains(&flag.to_string()),
+            "{flag}: {}",
+            sheet.sh
+        );
+    }
+    let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        o.status.code().is_some_and(|c| c <= 1),
+        "{}\n{err}",
+        sheet.sh
+    );
+    assert_eq!(
+        masked(&d.join("inst gui")),
+        masked(&d.join("inst cli")),
         "{}",
-        String::from_utf8_lossy(&o.stderr)
+        sheet.sh
     );
 
-    for (name, instances) in [("plain", None), ("instances", Some(d.join("inst")))] {
+    for (name, instances) in [("plain", None), ("instances", Some(d.join("inst gui")))] {
         let gui = d.join(format!("gui {name}"));
         let cli = d.join(format!("cli {name}"));
         let run = runs
