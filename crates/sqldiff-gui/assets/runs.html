@@ -209,7 +209,7 @@ function row(r) {
   const inst = r.kind === "instances";
   const title = inst ? `Check instances ${pair}` : `Convert ${r.template ? "templates " : ""}${pair}`;
   const what = inst ? (r.generator_only ? `the generator's output in <span class="path">${esc(r.woven)}</span>` : `<span class="path">${esc(r.target)}</span>`) : `<span class="path">${esc(r.src)}</span>`;
-  const sub = `${what} into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}`;
+  const sub = `${what} into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? ` · <span title="Kept from an earlier session of the app; its review opens again from the tree on disk">earlier session</span>` : ""}`;
   let right = "", act = "", extra = "", dot = r.state;
   if (r.state === "running") {
     const pct = r.total ? r.checked / r.total * 100 : 0;
@@ -224,7 +224,7 @@ function row(r) {
   } else if (r.state === "done") {
     const u = r.totals.units || {};
     const g = r.gate;
-    const gate = !g ? "" : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
+    const gate = !g ? (r.past ? " · done gate judged when the review opens" : "") : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
     right = ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>`;
     act = `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`;
     extra = legend(u)
@@ -256,7 +256,7 @@ function sheet(r) {
 
 let timer = null;
 function render(runs) {
-  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, and open for review when they finish.</div>`;
+  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, open for review when they finish, and stay listed after the app restarts.</div>`;
   $("runs").querySelectorAll("[data-cancel]").forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
     try { await post(`/runs/${b.dataset.cancel}/cancel`, {}); } catch (e) { $("err").textContent = e.message; }
