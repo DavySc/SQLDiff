@@ -505,6 +505,36 @@ impl<'a> Canon<'a> {
         }
     }
 
+    /// A value stored in a table column. A string literal stored in a
+    /// non-string column stands for the value it converts to, as in a cast:
+    /// SQL Server converts it to the column's type and PostgreSQL resolves
+    /// the untyped literal to it, both keeping the column's precision and
+    /// scale. One whose conversion may round, fail or depend on settings
+    /// goes through `conv` and is not compared across dialects.
+    fn conv_col(&mut self, table: &str, col: &str, v: (Term, Option<Ty>)) -> (Term, Option<Ty>) {
+        let (cty, _) = self.col_ty(table, col);
+        if let (Some(d), Some(s)) = (cty, v.0.is("str").then(|| v.0.kid(0)).flatten()) {
+            let target = self
+                .schema
+                .table(Self::base_table(table))
+                .and_then(|t| t.column(col))
+                .and_then(|c| c.target)
+                .filter(|t| !matches!(t, Target::Bit | Target::Bool));
+            if let Some(target) = target.filter(|_| !d.is_string()) {
+                if let Some((t, asm)) = s
+                    .atom()
+                    .and_then(|s| literal::convert(s, target, self.d, true))
+                {
+                    if let Some(x) = asm {
+                        self.assume(x);
+                    }
+                    return (t, Some(d));
+                }
+            }
+        }
+        self.conv(&cty, v)
+    }
+
     /// Implicit conversion of a value to a declared type: dropped when it is
     /// provably a no-op.
     fn conv(&mut self, dst: &Option<Ty>, v: (Term, Option<Ty>)) -> (Term, Option<Ty>) {
@@ -2589,8 +2619,7 @@ impl<'a> Canon<'a> {
         for (c, e) in cols.iter().zip(row) {
             self.written(table, c)?;
             let v = self.expr(e)?;
-            let (cty, _) = self.col_ty(table, c);
-            let (t, ty) = self.conv(&cty, v);
+            let (t, ty) = self.conv_col(table, c, v);
             kv.push((c.clone(), t, ty));
         }
         kv.sort_by(|x, y| x.0.cmp(&y.0));
@@ -2699,8 +2728,8 @@ impl<'a> Canon<'a> {
                 let c = lc(c);
                 self.written(table, &c)?;
                 let v = self.expr(e)?;
-                let (cty, _) = self.col_ty(table, &c);
-                Ok(n("kv", vec![a(c), self.conv(&cty, v).0]))
+                let v = self.conv_col(table, &c, v).0;
+                Ok(n("kv", vec![a(c), v]))
             })
             .collect();
         self.scopes.pop();
@@ -2861,8 +2890,8 @@ impl<'a> Canon<'a> {
                         let c = lc(c);
                         self.written(table, &c)?;
                         let v = self.expr(e)?;
-                        let (cty, _) = self.col_ty(table, &c);
-                        kv.push(n("kv", vec![a(c), self.conv(&cty, v).0]));
+                        let v = self.conv_col(table, &c, v).0;
+                        kv.push(n("kv", vec![a(c), v]));
                     }
                     kv.sort();
                     upd = Some(kv);
@@ -2929,8 +2958,7 @@ impl<'a> Canon<'a> {
             let (v, vty) = self.expr(e)?;
             if cols.len() == 1 {
                 let col = lc(&cols[0]);
-                let (cty, _) = self.col_ty(table, &col);
-                let v = self.conv(&cty, (v, vty)).0;
+                let v = self.conv_col(table, &col, (v, vty)).0;
                 kv.push(n("kv", vec![a(col), v]));
             } else {
                 // `SET (a, b) = (subquery)`: errors on several rows, NULLs on none.

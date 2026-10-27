@@ -482,8 +482,13 @@ fn explain_conv(
     if tsql.v != pg.v {
         return None;
     }
-    // A string converted to a number.
+    // A string converted to a number. Only for a value that is not a
+    // literal: a literal converts to one known value (or none) on each side,
+    // so '' and '1e3' are no witnesses for it.
     if string(src_t.fam) && string(src_p.fam) {
+        if tsql.v.is("str") {
+            return None;
+        }
         let long = |t: TyParts| t.len.map_or(true, |l| l >= 3);
         return match dst.fam {
             "Int" | "Float" => diff("equiv.cast-string-number", format!("For {what} = '' (an empty string), {sx} converts it to 0 and {sy} fails (invalid input syntax).")),
