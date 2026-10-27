@@ -176,6 +176,110 @@ fn delete_join_is_a_semi_join_in_every_spelling() {
     );
 }
 
+/// T-SQL `UPDATE … FROM` with the target among the joined tables against
+/// PostgreSQL `UPDATE … FROM` without it (rule T4): equal when the condition
+/// that joined the target is in WHERE and the catalog shows a target row
+/// meets at most one row; with several, both pick one unpredictably.
+#[test]
+fn update_from_join_moves_the_target_condition_to_where() {
+    let ts = |join: &str, on: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.reprice AS
+             BEGIN
+               UPDATE f SET unit_price = p.unit_price
+               FROM dbo.item_price AS p {join} dbo.price_feed AS f ON {on}
+               LEFT JOIN dbo.item AS i ON i.item_id = p.item_id
+               WHERE i.name IS NOT NULL;
+             END"
+        )
+    };
+    let pg = |join: &str, pred: &str| {
+        format!(
+            "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE price_feed AS f SET unit_price = p.unit_price
+             FROM item_price AS p {join} item AS i ON i.item_id = p.item_id
+             WHERE {pred}; $$;"
+        )
+    };
+    let key = "f.item_id = p.item_id";
+    let both = "f.item_id = p.item_id AND i.name IS NOT NULL";
+    let equal = |r: Report| {
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{:?}",
+            r.findings
+        )
+    };
+    let not_equal = |r: Report, why: &str| {
+        assert!(
+            !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    equal(run(&ts("JOIN", key), T, &pg("LEFT JOIN", both), P, true));
+    equal(run(
+        &ts("INNER JOIN", key),
+        T,
+        &pg("LEFT OUTER JOIN", both),
+        P,
+        true,
+    ));
+    // A dropped condition, a LEFT JOIN that became inner, another key.
+    not_equal(
+        run(
+            &ts("JOIN", key),
+            T,
+            &pg("LEFT JOIN", "i.name IS NOT NULL"),
+            P,
+            true,
+        ),
+        "dropped",
+    );
+    not_equal(
+        run(&ts("JOIN", key), T, &pg("JOIN", both), P, true),
+        "inner",
+    );
+    not_equal(
+        run(
+            &ts("JOIN", "f.item_id = p.item_id + 1"),
+            T,
+            &pg("LEFT JOIN", both),
+            P,
+            true,
+        ),
+        "key",
+    );
+    // Without the catalog no key is known.
+    not_equal(
+        run(&ts("JOIN", key), T, &pg("LEFT JOIN", both), P, false),
+        "no catalog",
+    );
+    // price_feed has no key: an item price may meet several feed rows.
+    let several = |d: Dialect| match d {
+        Dialect::Tsql => "CREATE PROCEDURE dbo.reprice AS
+             BEGIN
+               UPDATE p SET unit_price = f.unit_price
+               FROM dbo.item_price AS p JOIN dbo.price_feed AS f ON f.item_id = p.item_id;
+             END"
+        .to_string(),
+        _ => "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE item_price AS p SET unit_price = f.unit_price
+             FROM price_feed AS f WHERE f.item_id = p.item_id; $$;"
+            .to_string(),
+    };
+    not_equal(
+        run(&several(T), T, &several(P), P, true),
+        "several feed rows",
+    );
+    // PostgreSQL rejects the target in a join condition; T-SQL does not.
+    let named = "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE price_feed AS f SET unit_price = p.unit_price
+             FROM item_price AS p LEFT JOIN item AS i ON i.item_id = f.item_id
+             WHERE f.item_id = p.item_id AND i.name IS NOT NULL; $$;";
+    not_equal(run(&ts("JOIN", key), T, named, P, true), "target in ON");
+}
+
 #[test]
 fn string_comparison_collation_is_explicit() {
     let ts = "CREATE FUNCTION dbo.f (@Email varchar(254)) RETURNS int AS
@@ -816,4 +920,122 @@ fn unterminated_string_literal_is_not_read() {
             assert_ne!(r.verdict, sqldiff_core::Verdict::Equal, "{text:?} ({d:?})");
         }
     }
+}
+
+/// `SELECT @r = <expr> FROM ...` against `SELECT <expr> INTO r FROM ...`,
+/// with `r` declared as -1 on both sides and returned.
+fn select_assign(ts_query: &str, pg_query: &str) -> Report {
+    let ts = format!(
+        "CREATE FUNCTION dbo.f (@id int) RETURNS int AS
+         BEGIN
+           DECLARE @r int = -1;
+           {ts_query};
+           RETURN @r;
+         END"
+    );
+    let pg = format!(
+        "CREATE FUNCTION f(p_id integer) RETURNS integer LANGUAGE plpgsql AS $$
+         DECLARE r integer := -1;
+         BEGIN
+           {pg_query};
+           RETURN r;
+         END; $$;"
+    );
+    run(&ts, T, &pg, P, true)
+}
+
+#[test]
+fn ungrouped_aggregate_assign_always_returns_one_row() {
+    // Verified on SQL Server 2022 and PostgreSQL 18: on an empty table (or a
+    // WHERE no row meets) both assign 0 for COUNT and NULL for MAX; neither
+    // keeps the old value.
+    for (ts, pg) in [
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer",
+            "SELECT count(*) INTO r FROM customer",
+        ),
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer WHERE customer_id = @id",
+            "SELECT count(*) INTO r FROM customer WHERE customer_id = p_id",
+        ),
+        (
+            "SELECT @r = MAX(customer_id) FROM dbo.customer WHERE customer_id > @id",
+            "SELECT max(customer_id) INTO r FROM customer WHERE customer_id > p_id",
+        ),
+        (
+            "SELECT @r = ISNULL(MAX(customer_id), 0) FROM dbo.customer",
+            "SELECT COALESCE(max(customer_id), 0) INTO r FROM customer",
+        ),
+    ] {
+        let r = select_assign(ts, pg);
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{ts}: {:?} {:?}",
+            r.verdict,
+            r.findings
+        );
+    }
+}
+
+#[test]
+fn aggregate_assign_that_can_return_no_row_keeps_the_finding() {
+    // Verified on SQL Server 2022 and PostgreSQL 18: on an empty table each
+    // returns no row, so T-SQL keeps -1 and SELECT INTO sets NULL.
+    for (ts, pg) in [
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer GROUP BY last_name",
+            "SELECT count(*) INTO r FROM customer GROUP BY last_name",
+        ),
+        (
+            "SELECT @r = COUNT(*) FROM dbo.customer HAVING COUNT(*) > 1",
+            "SELECT count(*) INTO r FROM customer HAVING count(*) > 1",
+        ),
+        (
+            "SELECT TOP 0 @r = COUNT(*) FROM dbo.customer",
+            "SELECT count(*) INTO r FROM customer LIMIT 0",
+        ),
+        // The aggregate is in a subquery: one row per customer, none when empty.
+        (
+            "SELECT @r = (SELECT MAX(item_id) FROM dbo.item) FROM dbo.customer",
+            "SELECT (SELECT max(item_id) FROM item) INTO r FROM customer",
+        ),
+    ] {
+        let r = select_assign(ts, pg);
+        assert_eq!(r.verdict, Verdict::Different, "{ts}: {:?}", r.findings);
+        assert!(
+            rules(&r).contains(&"equiv.no-rows"),
+            "{ts}: {:?}",
+            r.findings
+        );
+    }
+}
+
+#[test]
+fn select_assign_without_from_is_a_plain_assignment() {
+    // SQL Server 2022: `SELECT @r = (subquery)` assigns NULL when the subquery
+    // has no row, as `SET` and PL/pgSQL `:=` do.
+    let r = select_assign(
+        "SELECT @r = (SELECT COUNT(*) FROM dbo.customer)",
+        "r := (SELECT count(*) FROM customer)",
+    );
+    assert!(
+        matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?} {:?}",
+        r.verdict,
+        r.findings
+    );
+    // The literal checks read it as the assignment it is, as for `SET @r = 1`
+    // (SQL Server 2022: SELECT and SET assign, round, cut off and overflow alike).
+    for ts in ["SET @r = 1", "SELECT @r = 1"] {
+        let r = select_assign(ts, "r := 1");
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{ts}: {:?} {:?}",
+            r.verdict,
+            r.findings
+        );
+    }
+    // With a WHERE the query can return no row: T-SQL then keeps -1.
+    let r = select_assign("SELECT @r = 1 WHERE @id = 0", "r := 1");
+    assert!(not_equal(&r), "{:?}", r.verdict);
 }
