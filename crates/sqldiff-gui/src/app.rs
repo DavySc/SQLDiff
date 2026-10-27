@@ -7,6 +7,9 @@
 //! - `GET /runs`, `GET /api/runs`: runs started from the app (see `runs`)
 //! - `POST /api/runs` `{"src", "out", "from", "to", "overwrite"?}`: convert a
 //!   tree into an output folder, as `sqldiff convert` does
+//! - `POST /api/runs/instances` `{"manifest", "source"?, "target"?, "from",
+//!   "to", "out", ...}`: check the instances of converted templates, as
+//!   `sqldiff instances` does
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
@@ -42,7 +45,7 @@ use sqldiff_source::Resolved;
 use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::review::Store;
-use crate::runs::{ConvertSpec, Runs};
+use crate::runs::{ConvertSpec, InstancesSpec, Runs};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -195,6 +198,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         ("GET", "/api/fs")
         | ("POST", "/api/open/compare")
         | ("POST", "/api/runs")
+        | ("POST", "/api/runs/instances")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
@@ -221,6 +225,15 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             return match serde_json::from_slice::<ConvertSpec>(&req.body)
                 .map_err(|e| e.to_string())
                 .and_then(|spec| app.runs.start(spec, app.isolated, |_| {}))
+            {
+                Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            }
+        }
+        ("POST", "/api/runs/instances") => {
+            return match serde_json::from_slice::<InstancesSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start_instances(spec, app.isolated, |_| {}))
             {
                 Ok(run) => json(&run.view()),
                 Err(e) => bad(e),
