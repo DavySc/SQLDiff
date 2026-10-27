@@ -506,3 +506,22 @@ fn a_statement_kept_as_written_keeps_its_first_word() {
     let (out, _) = layout::render(src, &lay, &o, &kw, &BTreeSet::from([1]));
     assert_eq!(out, "SELECT a\nFROM t;\nselect b from u;\n");
 }
+
+#[test]
+fn keys_from_options_invert_apply() {
+    let o = FormatOptions {
+        indent_width: 2,
+        keyword_case: KeywordCase::Lower,
+        line_ending: LineEnding::Crlf,
+        join_lines: true,
+        ..FormatOptions::default()
+    };
+    let keys = FormatKeys::from_options(&o);
+    let mut back = FormatOptions::default();
+    keys.apply(&mut back);
+    assert_eq!(back, o);
+    // Every key is named, spelled as in the config file.
+    assert_eq!(keys.names().len(), 12);
+    assert!(keys.names().contains(&"indent".to_string()));
+    assert!(FormatKeys::default().names().is_empty());
+}

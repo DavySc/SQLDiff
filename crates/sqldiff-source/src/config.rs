@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sqldiff_core::format::{FormatConfig, FormatKeys};
 use sqldiff_core::Dialect;
 
 use crate::glob::Glob;
@@ -46,6 +47,25 @@ pub struct LayerRef {
     pub version: Option<String>,
     /// Content hash of the file, or of the tool version for built-ins.
     pub hash: String,
+}
+
+/// The `[format]` keys one layer set; layers merge in the order of
+/// [`Resolved::format_layers`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FormatLayer {
+    pub kind: LayerKind,
+    /// The file the layer was read from; `None` for the command line.
+    pub path: Option<PathBuf>,
+    pub format: FormatConfig,
+}
+
+/// Where the effective value of one format key comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeySource {
+    /// Index into the layers; `None`: the built-in default.
+    pub layer: Option<usize>,
+    /// Set in the dialect's own table (`[format.postgres]`), not in `[format]`.
+    pub dialect_table: bool,
 }
 
 /// Keys a config file has beyond the policy sections.
@@ -183,6 +203,8 @@ pub struct Resolved {
     pub excerpt_lines: usize,
     /// Reference to the data key, if the data directory is encrypted.
     pub data_key: Option<String>,
+    /// `[format]` of each layer that was read, in merge order (lowest first).
+    pub format_layers: Vec<FormatLayer>,
     compiled: Compiled,
 }
 
@@ -227,6 +249,17 @@ impl Resolved {
 
     /// Loads and merges every layer.
     pub fn load(sources: &Sources) -> Result<Resolved> {
+        Resolved::load_with(sources, true)
+    }
+
+    /// [`Resolved::load`], but the project config is only read when
+    /// `sources.project` names it: no search upward from the working
+    /// directory. For a folder that has no `sqldiff.toml` yet.
+    pub fn load_without_search(sources: &Sources) -> Result<Resolved> {
+        Resolved::load_with(sources, false)
+    }
+
+    fn load_with(sources: &Sources, search_project: bool) -> Result<Resolved> {
         let cwd = match &sources.cwd {
             Some(c) => c.clone(),
             None => std::env::current_dir()?,
@@ -234,7 +267,7 @@ impl Resolved {
         let mut configs: Vec<(LayerKind, ConfigLayer)> = Vec::new();
         if let Some(p) = &sources.project {
             configs.push((LayerKind::Project, ConfigLayer::load(p)?));
-        } else if !sources.isolated {
+        } else if !sources.isolated && search_project {
             if let Some(p) = find_project(&cwd) {
                 configs.push((LayerKind::Project, ConfigLayer::load(&p)?));
             }
@@ -292,7 +325,13 @@ impl Resolved {
             )),
         }];
         let mut policy = Policy::default();
+        let mut format_layers = Vec::new();
         for (kind, p) in &packs {
+            format_layers.push(FormatLayer {
+                kind: *kind,
+                path: Some(p.path.clone()),
+                format: p.policy.format.clone(),
+            });
             layers.push(LayerRef {
                 kind: *kind,
                 name: p.meta.name.clone(),
@@ -319,6 +358,11 @@ impl Resolved {
                 hash: c.hash.clone(),
             });
             merge(&mut policy, &c.policy);
+            format_layers.push(FormatLayer {
+                kind: *kind,
+                path: c.path.clone(),
+                format: c.policy.format.clone(),
+            });
             if c.file.data_dir.is_some() {
                 file.data_dir = c.file.data_dir.clone();
             }
@@ -341,8 +385,34 @@ impl Resolved {
             source: file.source,
             excerpt_lines: file.excerpt_lines.unwrap_or(3),
             data_key: file.data_key,
+            format_layers,
             compiled,
         })
+    }
+
+    /// The `[format]` layers with the project layer's keys replaced by
+    /// `draft`, or, when no project config was read, with `draft` added as
+    /// that layer (above the packs, below the user config).
+    pub fn format_layers_with_project(&self, draft: &FormatConfig) -> Vec<FormatLayer> {
+        let mut layers = self.format_layers.clone();
+        match layers.iter_mut().find(|l| l.kind == LayerKind::Project) {
+            Some(l) => l.format = draft.clone(),
+            None => {
+                let at = layers
+                    .iter()
+                    .position(|l| l.kind > LayerKind::Project)
+                    .unwrap_or(layers.len());
+                layers.insert(
+                    at,
+                    FormatLayer {
+                        kind: LayerKind::Project,
+                        path: None,
+                        format: draft.clone(),
+                    },
+                );
+            }
+        }
+        layers
     }
 
     /// True if a filesystem or git source should skip this path.
@@ -417,6 +487,63 @@ impl Resolved {
     pub fn adapter(&self, name: &str) -> Option<&AdapterSpec> {
         self.policy.adapters.iter().find(|a| a.name == name)
     }
+}
+
+/// `[format]` of `layers` merged, lowest layer first, as [`Resolved::policy`]
+/// has it.
+pub fn merge_format(layers: &[FormatLayer]) -> FormatConfig {
+    let mut merged = FormatConfig::default();
+    for l in layers {
+        merged.merge(&l.format);
+    }
+    merged
+}
+
+/// Where each format key gets its value, by key name as the config file
+/// spells it. For a dialect: the last layer that set the key in the dialect's
+/// own table, else the last that set it in `[format]`, else the built-in
+/// default, which is the merge [`FormatConfig::options`] makes. With `None`,
+/// only `[format]` counts.
+pub fn format_sources(
+    layers: &[FormatLayer],
+    dialect: Option<Dialect>,
+) -> BTreeMap<String, KeySource> {
+    let mut out: BTreeMap<String, KeySource> = FormatKeys::from_options(&Default::default())
+        .names()
+        .into_iter()
+        .map(|k| {
+            let s = KeySource {
+                layer: None,
+                dialect_table: false,
+            };
+            (k, s)
+        })
+        .collect();
+    for (i, l) in layers.iter().enumerate() {
+        for k in l.format.all.names() {
+            let s = KeySource {
+                layer: Some(i),
+                dialect_table: false,
+            };
+            out.insert(k, s);
+        }
+    }
+    for (i, l) in layers.iter().enumerate() {
+        let own = match dialect {
+            None => continue,
+            Some(Dialect::Tsql) => &l.format.tsql,
+            Some(Dialect::Postgres) => &l.format.postgres,
+            Some(Dialect::Db2i) => &l.format.db2i,
+        };
+        for k in own.names() {
+            let s = KeySource {
+                layer: Some(i),
+                dialect_table: true,
+            };
+            out.insert(k, s);
+        }
+    }
+    out
 }
 
 /// Merges `hi` (higher precedence) into `acc`.
