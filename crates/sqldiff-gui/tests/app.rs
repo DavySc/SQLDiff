@@ -522,6 +522,26 @@ fn runs_that_cannot_start_are_refused() {
         (spec(serde_json::json!(d.0.join("gone")), "tsql", "postgres"), "not found"),
         (spec(serde_json::json!(" "), "tsql", "postgres"), "give a source"),
         (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "template": true })
+                .to_string(),
+            "[template] syntax",
+        ),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "parameters": ["A"] })
+                .to_string(),
+            "template runs",
+        ),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "packs": [d.0.join("no-pack")] })
+                .to_string(),
+            "no-pack: not found",
+        ),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "instances": d.0.join("no-report") })
+                .to_string(),
+            "no-report: not found",
+        ),
+        (
             serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "jobs": 2 })
                 .to_string(),
             "jobs",
