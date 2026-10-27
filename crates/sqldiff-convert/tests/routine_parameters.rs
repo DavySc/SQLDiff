@@ -38,6 +38,7 @@ impl Fixture {
             no_catalog: true,
             template: Some(TemplateMode::new(&def, None).unwrap()),
             extensions: tree::extensions(Vec::new()),
+            helpers: Vec::new(),
         };
         let (inputs, unreadable) = tree::read(&a).unwrap();
         tree::convert(&a, &inputs, unreadable, None)

@@ -597,9 +597,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             json,
             cfg,
         } => {
+            let resolved = cfg.resolve()?;
+            let helpers = resolved.options().helpers;
             let template = if template {
                 Some(convert_cmd::TemplateMode::configured(
-                    &cfg.resolve()?,
+                    &resolved,
                     (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
                 )?)
             } else {
@@ -614,6 +616,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     no_catalog,
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
+                    helpers,
                 },
                 out,
                 instances,
@@ -637,9 +640,11 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             queue_all,
             cfg,
         } => {
+            let resolved = cfg.resolve()?;
+            let helpers = resolved.options().helpers;
             let template = if template {
                 Some(convert_cmd::TemplateMode::configured(
-                    &cfg.resolve()?,
+                    &resolved,
                     (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
                 )?)
             } else {
@@ -654,6 +659,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     no_catalog,
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
+                    helpers,
                 },
                 out,
                 overwrite,

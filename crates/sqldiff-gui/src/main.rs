@@ -480,16 +480,16 @@ fn run(cli: Cli) -> Result<(), String> {
             port,
             allow_hosts,
         } => {
+            let cfg = Resolved::load(&Sources {
+                project,
+                user: None,
+                isolated,
+                cwd: None,
+                packs,
+                cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+            })
+            .map_err(|e| e.0)?;
             let template = if template {
-                let cfg = Resolved::load(&Sources {
-                    project,
-                    user: None,
-                    isolated,
-                    cwd: None,
-                    packs,
-                    cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
-                })
-                .map_err(|e| e.0)?;
                 Some(sqldiff_convert::tree::TemplateMode::configured(
                     &cfg,
                     (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
@@ -506,6 +506,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     no_catalog,
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
+                    helpers: cfg.options().helpers,
                 },
                 out,
                 instances,

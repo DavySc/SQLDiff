@@ -1108,6 +1108,7 @@ impl Server {
             no_catalog: false,
             template,
             extensions: Vec::new(),
+            helpers: self.config.options().helpers,
         };
         let t = tree::convert(&a, &inputs, Vec::new(), None)?;
         let f = &t.report.files[0];
@@ -1153,6 +1154,7 @@ impl Server {
                 .unwrap_or(false),
             template: self.template_mode(args)?,
             extensions: tree::extensions(list_arg(args, "extensions")?),
+            helpers: self.config.options().helpers,
         })
     }
 
