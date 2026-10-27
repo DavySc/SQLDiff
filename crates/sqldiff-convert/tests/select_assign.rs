@@ -4,7 +4,7 @@
 //! other number of rows than one converts to a loop over it; a query that
 //! always returns one row stays a plain `SELECT … INTO`.
 
-use sqldiff_convert::{check, rewrite, Conversion, Unit};
+use sqldiff_convert::{check, rewrite, Conversion, Status, Unit};
 use sqldiff_core::{Dialect, Options};
 
 fn convert(src: &str, to: Dialect) -> Conversion {
@@ -165,5 +165,29 @@ fn names_of_the_loop_in_the_statement_keep_into() {
         let c = convert(src, Dialect::Postgres);
         assert!(!c.output.contains("FOR sqldiff_r"), "{}", c.output);
         assert!(has_rule(select_unit(&c, src), CARDINALITY), "{src}");
+    }
+}
+
+#[test]
+fn the_engine_finds_no_no_row_difference_for_an_ungrouped_aggregate() {
+    // The aggregate always returns one row, so INTO is exact (SQL Server 2022
+    // and PostgreSQL 18 both assign 0 on an empty table).
+    let src = "DECLARE @n int = 5;\nSELECT @n = COUNT(*) FROM t;\n";
+    let c = convert(src, Dialect::Postgres);
+    assert!(c.output.contains("INTO v_n"), "{}", c.output);
+    let rules: Vec<&str> = c.report.findings.iter().map(|f| f.rule.as_str()).collect();
+    assert!(!rules.contains(&"equiv.no-rows"), "{rules:?}");
+}
+
+#[test]
+fn a_where_without_from_is_refused() {
+    // SQL Server 2022 keeps @n when the condition is false; PL/pgSQL
+    // `v_n := 1 WHERE …` would set NULL.
+    for to in [Dialect::Postgres, Dialect::Db2i] {
+        let src = "DECLARE @n int = 5, @id int = 1;\nSELECT @n = 1 WHERE @id = 0;\n";
+        let c = convert(src, to);
+        let u = select_unit(&c, src);
+        assert_eq!(u.status, Status::NotConverted, "{to:?}: {}", c.output);
+        assert!(!c.output.contains(":= 1 WHERE"), "{}", c.output);
     }
 }

@@ -183,6 +183,7 @@ pub fn explain(
                 "null" => "sets NULL",
                 "unchanged" => "leaves the previous value",
                 "error" => "raises a no-data error",
+                "n/a" => "always reads one row (an aggregate without GROUP BY)",
                 _ => "behaves differently",
             };
             Some((
