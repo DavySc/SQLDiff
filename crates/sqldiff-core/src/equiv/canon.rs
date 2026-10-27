@@ -2371,37 +2371,14 @@ impl<'a> Canon<'a> {
                 where_,
             } => {
                 if !from.is_empty() {
-                    return Err("UPDATE ... FROM is not supported".into());
+                    return self.update_from(target, alias, sets, from, where_);
                 }
                 self.scopes.push(Vec::new());
                 let b = self.bind_table(target, alias);
                 let table = b.table.clone();
                 self.scopes.last_mut().unwrap().push(b);
                 let r = (|| {
-                    let mut kv = Vec::new();
-                    for (cols, e) in sets {
-                        for c in cols {
-                            self.written(&table, &lc(c))?;
-                        }
-                        let (v, vty) = self.expr(e)?;
-                        if cols.len() == 1 {
-                            let col = lc(&cols[0]);
-                            let v = self.conv_col(&table, &col, (v, vty)).0;
-                            kv.push(n("kv", vec![a(col), v]));
-                        } else {
-                            // `SET (a, b) = (subquery)`: errors on several rows, NULLs on none.
-                            let v = if v.is("subq") {
-                                self.scalar(v.kids()[0].clone(), "error", "null")
-                            } else {
-                                v
-                            };
-                            kv.push(n(
-                                "kvs",
-                                vec![n("cols", cols.iter().map(|c| a(lc(c))).collect()), v],
-                            ));
-                        }
-                    }
-                    kv.sort();
+                    let kv = self.update_sets(&table, sets)?;
                     let w = match where_ {
                         Some(w) => self.cond(w)?.0,
                         None => a("-"),
@@ -2993,6 +2970,242 @@ impl<'a> Canon<'a> {
         Ok(self.upsert(table, keyvals, ins, upd, conc))
     }
 
+    /// The SET list of an UPDATE of `table`, sorted.
+    fn update_sets(&mut self, table: &str, sets: &[(Vec<String>, Expr)]) -> R<Vec<Term>> {
+        let mut kv = Vec::new();
+        for (cols, e) in sets {
+            for c in cols {
+                self.written(table, &lc(c))?;
+            }
+            let (v, vty) = self.expr(e)?;
+            if cols.len() == 1 {
+                let col = lc(&cols[0]);
+                let v = self.conv_col(table, &col, (v, vty)).0;
+                kv.push(n("kv", vec![a(col), v]));
+            } else {
+                // `SET (a, b) = (subquery)`: errors on several rows, NULLs on none.
+                let v = if v.is("subq") {
+                    self.scalar(v.kids()[0].clone(), "error", "null")
+                } else {
+                    v
+                };
+                kv.push(n(
+                    "kvs",
+                    vec![n("cols", cols.iter().map(|c| a(lc(c))).collect()), v],
+                ));
+            }
+        }
+        kv.sort();
+        Ok(kv)
+    }
+
+    /// `UPDATE … FROM`. T-SQL `UPDATE a SET … FROM <tables> WHERE w`, where
+    /// `a` names one of the FROM tables, and PostgreSQL `UPDATE t [AS] a SET
+    /// … FROM <others> WHERE w` both change a target row when the other
+    /// tables have a row that satisfies the conditions, with values from
+    /// that row. With several such rows each picks one unpredictably, so the
+    /// statement is lowered only when the catalog shows there is at most one
+    /// (`unique_match`). T-SQL is brought to PostgreSQL's shape: the target
+    /// leaves the FROM list, and the ON condition of the inner join that tied
+    /// it to its neighbour moves to WHERE (`tsql_update_target`). Both
+    /// sides then need every other ON condition to stay clear of the target:
+    /// PostgreSQL rejects a reference to it there, and a LEFT JOIN's
+    /// condition cannot move.
+    fn update_from(
+        &mut self,
+        target: &[String],
+        alias: &Option<String>,
+        sets: &[(Vec<String>, Expr)],
+        from: &[From],
+        where_: &Option<Expr>,
+    ) -> R<Term> {
+        let (tname, talias, others, mut conds) = match self.d {
+            Dialect::Postgres => (target.to_vec(), alias.clone(), from.to_vec(), Vec::new()),
+            Dialect::Tsql => tsql_update_target(target, alias, from)?,
+            Dialect::Db2i => return Err("UPDATE ... FROM is not supported".into()),
+        };
+        conds.extend(where_.iter().cloned());
+        let tkey = talias
+            .as_ref()
+            .map(|x| lc(x))
+            .unwrap_or_else(|| lc(tname.last().map(String::as_str).unwrap_or("")));
+        let mut ons = Vec::new();
+        for f in &others {
+            join_conditions(f, &mut ons)?;
+        }
+        if !ons.is_empty() {
+            let ttab = self
+                .schema
+                .table(tname.last().map(String::as_str).unwrap_or(""));
+            for on in &ons {
+                if mentions(on, &tkey) {
+                    return Err(format!(
+                        "UPDATE ... FROM: a join condition other than the target's own names the target `{tkey}`"
+                    ));
+                }
+                let mut bare = Vec::new();
+                unqualified(on, &mut bare);
+                for name in bare {
+                    if ttab.map_or(true, |t| t.column(&name).is_some()) {
+                        return Err(format!(
+                            "UPDATE ... FROM: `{name}` in a join condition may name a column of the target"
+                        ));
+                    }
+                }
+            }
+        }
+        self.scopes.push(Vec::new());
+        let r = (|| {
+            let b = self.bind_table(&tname, &talias);
+            let table = b.table.clone();
+            self.scopes.last_mut().unwrap().push(b);
+            let from_t = self.push_from(&others)?;
+            let w = match conds
+                .into_iter()
+                .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)))
+            {
+                Some(w) => self.cond(&w)?.0,
+                None => a("-"),
+            };
+            self.unique_match(&table, &from_t, &w)?;
+            let kv = self.update_sets(&table, sets)?;
+            Ok(n(
+                "update-from",
+                vec![a(table), n("set", kv), n("from", from_t), w],
+            ))
+        })();
+        self.scopes.pop();
+        r
+    }
+
+    /// Every row of `target` matches at most one row of the FROM tables
+    /// under the WHERE condition `w`. A table is settled once the target or
+    /// tables already settled fix a value for each column of one of its
+    /// unique keys (catalog), by an equality: in its own ON condition for a
+    /// LEFT JOIN, else in WHERE or any inner join's ON condition. String keys
+    /// count only under the dialect's own comparison, which its unique keys
+    /// follow.
+    fn unique_match(&mut self, target: &str, from: &[Term], w: &Term) -> R<()> {
+        fn conj(t: &Term) -> Vec<Term> {
+            if t.is("and") {
+                t.kids().to_vec()
+            } else if t.atom() == Some("-") {
+                Vec::new()
+            } else {
+                vec![t.clone()]
+            }
+        }
+        // (table, own ON condition of a LEFT JOIN)
+        fn leaves(t: &Term, out: &mut Vec<(String, Option<Term>)>, all: &mut Vec<Term>) -> bool {
+            match t.head() {
+                "t" => {
+                    out.push((
+                        t.kid(0).and_then(Term::atom).unwrap_or("").to_string(),
+                        None,
+                    ));
+                    true
+                }
+                "join" => {
+                    let (Some(kind), Some(l), Some(r), Some(on)) =
+                        (t.kid(0).and_then(Term::atom), t.kid(1), t.kid(2), t.kid(3))
+                    else {
+                        return false;
+                    };
+                    if !leaves(l, out, all) || !r.is("t") {
+                        return false;
+                    }
+                    let name = r.kid(0).and_then(Term::atom).unwrap_or("").to_string();
+                    match kind {
+                        "inner" | "cross" => {
+                            all.extend(conj(on));
+                            out.push((name, None));
+                        }
+                        "left" => out.push((name, Some(on.clone()))),
+                        _ => return false,
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        let fail = || {
+            Err("UPDATE ... FROM: the catalog does not show that a target row matches at most one row of the other tables; with several, both dialects pick one unpredictably".to_string())
+        };
+        let mut ls = Vec::new();
+        let mut all = conj(w);
+        for f in from {
+            if !leaves(f, &mut ls, &mut all) {
+                return fail();
+            }
+        }
+        let own = if self.d == Dialect::Tsql { "ci" } else { "cs" };
+        let mut bound = vec![target.to_string()];
+        loop {
+            let mut progress = false;
+            for (t, on) in &ls {
+                if bound.contains(t) {
+                    continue;
+                }
+                let cs = match on {
+                    Some(on) => conj(on),
+                    None => all.clone(),
+                };
+                let mut cols = Vec::new();
+                for c in &cs {
+                    let (x, y) = match c.head() {
+                        "cmp" if c.kid(0).and_then(Term::atom) == Some("=") => (c.kid(1), c.kid(2)),
+                        "strcmp"
+                            if c.kid(0).and_then(Term::atom) == Some("=")
+                                && c.kid(1).and_then(Term::atom) == Some(own) =>
+                        {
+                            (c.kid(3), c.kid(4))
+                        }
+                        _ => continue,
+                    };
+                    let (Some(x), Some(y)) = (x, y) else { continue };
+                    let fixed = |e: &Term| {
+                        !e.any(&|s| {
+                            s.is("col")
+                                && !s
+                                    .kid(0)
+                                    .and_then(Term::atom)
+                                    .is_some_and(|tb| bound.iter().any(|b| b == tb))
+                        })
+                    };
+                    for (col, other) in [(x, y), (y, x)] {
+                        if col.is("col")
+                            && col.kid(0).and_then(Term::atom) == Some(t.as_str())
+                            && fixed(other)
+                        {
+                            if let Some(c) = col.kid(1).and_then(Term::atom) {
+                                cols.push(c.to_string());
+                            }
+                        }
+                    }
+                }
+                let key = self.schema.table(Self::base_table(t)).and_then(|tab| {
+                    tab.keys
+                        .iter()
+                        .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                        .cloned()
+                });
+                if let Some(key) = key {
+                    self.discharge(format!("{t}.{} is a unique key (catalog)", key.join(", ")));
+                    bound.push(t.clone());
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        if ls.iter().all(|(t, _)| bound.contains(t)) {
+            Ok(())
+        } else {
+            fail()
+        }
+    }
+
     fn delete(
         &mut self,
         target: &[String],
@@ -3556,6 +3769,154 @@ fn inner_leaves(f: &From, leaves: &mut Vec<From>, conds: &mut Vec<Expr>) -> bool
             true
         }
     }
+}
+
+/// T-SQL `UPDATE x … FROM <tables>`: the FROM table `x` names (by its
+/// alias, or by the one-part name of an unaliased table), the FROM list
+/// without it, and the ON condition that joined it, now a WHERE condition.
+/// The target must head a comma item or a join chain, or follow its head,
+/// joined by an inner or cross join: `(t ⋈k s) ⟕ u = t ⋈k (s ⟕ u)` when
+/// the LEFT JOIN's condition does not name `t`, which `update_from` checks.
+#[allow(clippy::type_complexity)]
+fn tsql_update_target(
+    target: &[String],
+    alias: &Option<String>,
+    from: &[From],
+) -> R<(Vec<String>, Option<String>, Vec<From>, Vec<Expr>)> {
+    let unsupported = |why: &str| Err(format!("UPDATE ... FROM: {why}"));
+    let [t] = target else {
+        return unsupported("the target is not a one-part name");
+    };
+    if alias.is_some() {
+        return unsupported("the target has an alias");
+    }
+    let key = lc(t);
+    let binds = |f: &From| match f {
+        From::Table { name, alias, .. } => match alias {
+            Some(a) => lc(a) == key,
+            None => name.last().is_some_and(|x| lc(x) == key),
+        },
+        From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
+            alias.as_ref().is_some_and(|a| lc(a) == key)
+        }
+        _ => false,
+    };
+    let mut chains = Vec::new();
+    for f in from {
+        let mut c = Vec::new();
+        if !chain(f, &mut c) {
+            return unsupported("a join that is not a chain of inner, left and cross joins");
+        }
+        chains.push(c);
+    }
+    let hits: Vec<(usize, usize)> = chains
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            c.iter()
+                .enumerate()
+                .filter(|(_, s)| binds(&s.1))
+                .map(move |(j, _)| (i, j))
+        })
+        .collect();
+    let [(ci, li)] = hits[..] else {
+        return unsupported(if hits.is_empty() {
+            "the target is not one of the FROM tables by alias or one-part name"
+        } else {
+            "the target matches more than one FROM table"
+        });
+    };
+    let c = &mut chains[ci];
+    let From::Table { name, alias, hints } = c[li].1.clone() else {
+        return unsupported("the target is not a table");
+    };
+    if !hints.is_empty() {
+        return unsupported("table hints on the target");
+    }
+    let inner = |k: &Option<String>| matches!(k.as_deref(), Some("INNER" | "CROSS"));
+    let mut conds = Vec::new();
+    match li {
+        0 if c.len() == 1 => {
+            chains.remove(ci);
+        }
+        0 if inner(&c[1].0) => {
+            conds.extend(c[1].2.take());
+            c.remove(0);
+            c[0].0 = None;
+        }
+        1 if inner(&c[1].0) => {
+            conds.extend(c[1].2.take());
+            c.remove(1);
+        }
+        _ => return unsupported("the target is not joined first, by an inner or cross join"),
+    }
+    let others = chains
+        .into_iter()
+        .filter_map(|c| {
+            c.into_iter().reduce(|l, r| {
+                let (kind, right, on) = (r.0, r.1, r.2);
+                (
+                    None,
+                    From::Join {
+                        kind: kind.unwrap_or_default(),
+                        left: Box::new(l.1),
+                        right: Box::new(right),
+                        on,
+                    },
+                    None,
+                )
+            })
+        })
+        .map(|x| x.1)
+        .collect();
+    Ok((name, alias, others, conds))
+}
+
+/// A left-deep chain of inner, left and cross joins as its tables, each
+/// with the join kind (none for the first) and ON condition that adds it.
+fn chain(f: &From, out: &mut Vec<(Option<String>, From, Option<Expr>)>) -> bool {
+    match f {
+        From::Join {
+            kind,
+            left,
+            right,
+            on,
+        } => {
+            matches!(kind.as_str(), "INNER" | "LEFT" | "CROSS")
+                && !matches!(right.as_ref(), From::Join { .. })
+                && chain(left, out)
+                && {
+                    out.push((Some(kind.clone()), right.as_ref().clone(), on.clone()));
+                    true
+                }
+        }
+        _ => {
+            out.push((None, f.clone(), None));
+            true
+        }
+    }
+}
+
+/// The ON conditions of a FROM item; an error for joins other than inner,
+/// left and cross ones.
+fn join_conditions(f: &From, out: &mut Vec<Expr>) -> R<()> {
+    if let From::Join {
+        kind,
+        left,
+        right,
+        on,
+    } = f
+    {
+        if !matches!(kind.as_str(), "INNER" | "LEFT" | "CROSS") {
+            return Err(format!(
+                "UPDATE ... FROM with a {kind} JOIN is not supported"
+            ));
+        }
+        join_conditions(left, out)?;
+        join_conditions(right, out)?;
+        out.extend(on.iter().cloned());
+    }
+    Ok(())
 }
 
 fn flatten_and(e: &Expr, out: &mut Vec<Expr>) {
