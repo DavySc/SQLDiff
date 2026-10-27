@@ -581,7 +581,9 @@ pub(super) fn render(
         }
         starts.push(out.len());
         let word = &text[t.start..t.end];
-        let recase = keywords.contains(&i) && !kept(i);
+        // A statement kept as written keeps the case of its first word too.
+        let recase =
+            keywords.contains(&i) && !kept(i) && !t.top.is_some_and(|u| reverted.contains(&u));
         match (recase, opts.keyword_case) {
             (true, KeywordCase::Upper) => out.push_str(&word.to_ascii_uppercase()),
             (true, KeywordCase::Lower) => out.push_str(&word.to_ascii_lowercase()),
