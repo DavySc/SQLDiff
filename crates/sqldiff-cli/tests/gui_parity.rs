@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sqldiff_gui::runs::{self, Command as Sheet, ConvertSpec, Run, Runs, State};
+use sqldiff_gui::runs::{self, Command as Sheet, ConvertSpec, InstancesSpec, Run, Runs, State};
 
 fn write(p: &Path, text: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -34,7 +34,8 @@ fn files(dir: &Path) -> Vec<(String, String)> {
     v
 }
 
-/// `files`, with the output folder's name and the timings masked.
+/// `files`, with the output folder's name, the timings and the build masked
+/// (an instance report's run fingerprint hashes the running program).
 fn masked(dir: &Path) -> Vec<(String, String)> {
     let name = dir.display().to_string();
     let json = serde_json::to_string(&name).unwrap();
@@ -49,6 +50,7 @@ fn masked(dir: &Path) -> Vec<(String, String)> {
                     let s = l.trim_start();
                     if s.starts_with("\"seconds\":")
                         || (s.contains(" files, ") && s.ends_with(" s"))
+                        || l.starts_with("  \"fingerprint\":")
                     {
                         "(time)"
                     } else {
@@ -158,6 +160,11 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
             from: "tsql".into(),
             to: "postgres".into(),
             overwrite,
+            template: false,
+            parameters: Vec::new(),
+            extensions: Vec::new(),
+            packs: Vec::new(),
+            instances: None,
         };
         let run = runs.start(spec(&gui), isolated, |_| {}).unwrap();
         assert!(
@@ -220,5 +227,157 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
     assert_eq!(o.status.code(), Some(2), "{err}");
     assert!(err.contains("user config.toml"), "{err}");
     std::env::remove_var("SQLDIFF_CONFIG");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The example pack, with the `<%NAME%>` template syntax.
+fn pack() -> String {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/examples/pack")
+        .display()
+        .to_string()
+}
+
+#[test]
+fn a_template_run_and_its_command_write_the_same() {
+    let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-tpl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let elsewhere = d.join("elsewhere");
+    write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    let src = d.join("src");
+    write(
+        &src.join("tables/entity.tpl"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL, Price decimal(12, 2) NOT NULL);\n",
+    );
+    write(
+        &src.join("procs/touch.tpl"),
+        "<%@include header.tpl %>CREATE PROCEDURE <%SCHEMA%>.Touch<%TABLE%> @Id int AS\nBEGIN\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Price = 0 WHERE Id = @Id;\nEND\n",
+    );
+    write(&src.join("procs/header.tpl"), "-- generated\n");
+    write(&src.join("plain.sql"), "not read: wrong extension\n");
+    let manifest = d.join("instances.toml");
+    write(
+        &manifest,
+        "[params]\nSCHEMA = \"dbo\"\n[params_for.postgres]\nSCHEMA = \"public\"\n\n[[instance]]\nname = \"tables/Customer\"\ntemplate = \"tables/entity.tpl\"\nparams = { TABLE = \"Customer\" }\n\n[[instance]]\nname = \"procs/TouchCustomer\"\ntemplate = \"procs/touch.tpl\"\nparams = { TABLE = \"Customer\" }\n",
+    );
+    let spec = |out: &Path, instances: Option<&Path>| ConvertSpec {
+        src: src.display().to_string(),
+        out: out.display().to_string(),
+        from: "tsql".into(),
+        to: "postgres".into(),
+        overwrite: false,
+        template: true,
+        parameters: vec!["SCHEMA".into(), "TABLE".into()],
+        extensions: vec![".tpl".into()],
+        packs: vec![pack()],
+        instances: instances.map(|p| p.display().to_string()),
+    };
+    let runs = Runs::default();
+    // Converted templates, then their instance check by the command line.
+    let first = runs
+        .start(spec(&d.join("conv"), None), true, |_| {})
+        .unwrap();
+    assert!(
+        matches!(finish(&first), State::Done { .. }),
+        "{:?}",
+        first.state()
+    );
+    let c = &first.command;
+    for flag in [
+        "--template",
+        "--parameter",
+        "--extension",
+        "--pack",
+        "--isolated",
+    ] {
+        assert!(c.args.contains(&flag.to_string()), "{flag}: {}", c.sh);
+    }
+    assert!(!d.join("conv/plain.sql").exists());
+    assert!(d.join("conv/procs/touch.tpl").is_file());
+    // The instance check, from the app and by its command.
+    let check = |out: &Path| InstancesSpec {
+        manifest: manifest.display().to_string(),
+        source: Some(src.display().to_string()),
+        target: Some(d.join("conv").display().to_string()),
+        from: "tsql".into(),
+        to: "postgres".into(),
+        out: out.display().to_string(),
+        woven: None,
+        woven_target: None,
+        generator_only: false,
+        parameters: vec!["TABLE".into()],
+        accept: vec!["ASM-DBO-SCHEMA".into()],
+        packs: vec![pack()],
+        overwrite: false,
+    };
+    let run = runs
+        .start_instances(check(&d.join("inst gui")), true, |_| {})
+        .unwrap();
+    assert!(
+        matches!(finish(&run), State::Done { .. }),
+        "{:?}",
+        run.state()
+    );
+    assert!(d.join("inst gui/instance-report.json").is_file());
+    let sheet = runs::instances_command(&check(&d.join("inst cli")), true).unwrap();
+    for flag in [
+        "--source",
+        "--target",
+        "--parameter",
+        "--accept",
+        "--pack",
+        "--isolated",
+    ] {
+        assert!(
+            sheet.args.contains(&flag.to_string()),
+            "{flag}: {}",
+            sheet.sh
+        );
+    }
+    let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        o.status.code().is_some_and(|c| c <= 1),
+        "{}\n{err}",
+        sheet.sh
+    );
+    assert_eq!(
+        masked(&d.join("inst gui")),
+        masked(&d.join("inst cli")),
+        "{}",
+        sheet.sh
+    );
+
+    for (name, instances) in [("plain", None), ("instances", Some(d.join("inst gui")))] {
+        let gui = d.join(format!("gui {name}"));
+        let cli = d.join(format!("cli {name}"));
+        let run = runs
+            .start(spec(&gui, instances.as_deref()), true, |_| {})
+            .unwrap();
+        assert!(
+            matches!(finish(&run), State::Done { .. }),
+            "{name}: {:?}",
+            run.state()
+        );
+        let sheet = runs::command(&spec(&cli, instances.as_deref()), true).unwrap();
+        let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            o.status.code().is_some_and(|c| c <= 1),
+            "{name}: {}\n{err}",
+            sheet.sh
+        );
+        assert_eq!(masked(&gui), masked(&cli), "{name}: {}", sheet.sh);
+        assert_eq!(
+            sheet.args.contains(&"--instances".to_string()),
+            instances.is_some()
+        );
+    }
+    // The instance check changes what the review queue says.
+    assert_ne!(
+        masked(&d.join("gui plain")),
+        masked(&d.join("gui instances")),
+        "the instance check was not read"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
