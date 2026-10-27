@@ -477,3 +477,32 @@ fn statements_with_parse_problems_stay_as_written() {
     assert!(r.text.starts_with("SELECT 1;\n"), "{}", r.text);
     assert!(r.text.contains("select   'open from t;"), "{}", r.text);
 }
+
+#[test]
+fn tsql_recases_only_what_the_engine_confirms() {
+    // IDENTITY is reserved, but the engine compares it as a name: recasing
+    // it would only be equal under a collation assumption.
+    let src = "CREATE TABLE t (id int IDENTITY(1,1) PRIMARY KEY)\n";
+    let r = format(
+        src,
+        Dialect::Tsql,
+        &with(|o| o.keyword_case = KeywordCase::Lower),
+    );
+    assert!(r.kept.is_empty(), "{:?}", r.kept);
+    assert_eq!(
+        r.text,
+        "create table t (id int IDENTITY(1, 1) primary KEY)\n"
+    );
+}
+
+#[test]
+fn a_statement_kept_as_written_keeps_its_first_word() {
+    let src = "select a from t;\nselect b from u;\n";
+    let parsed = parse(src, Dialect::Postgres);
+    let root = parsed.syntax();
+    let o = FormatOptions::default();
+    let lay = layout::collect(src, &root, &parsed.diagnostics, Dialect::Postgres, &o);
+    let kw = layout::keyword_set(src, &lay.toks, Dialect::Postgres);
+    let (out, _) = layout::render(src, &lay, &o, &kw, &BTreeSet::from([1]));
+    assert_eq!(out, "SELECT a\nFROM t;\nselect b from u;\n");
+}

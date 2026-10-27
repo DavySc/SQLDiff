@@ -25,7 +25,9 @@ Keyword case is changed only where it cannot change a name:
 
 - T-SQL compares identifiers under the database collation, which can be
   case sensitive, so only reserved keywords are recased (`SELECT`, `FROM`,
-  `BEGIN`, ...). A word that is not reserved, such as `Name`, `Date`, `int`
+  `BEGIN`, ...), and only those the engine also compares without regard to
+  case (so not `IDENTITY` or `CLUSTERED`: there the check could only show
+  the change harmless under a collation assumption). A word that is not reserved, such as `Name`, `Date`, `int`
   or `NOCOUNT`, keeps its case.
 - PostgreSQL and Db2 for i fold unquoted words before looking them up, so
   their keyword list also covers type names and procedural keywords.
