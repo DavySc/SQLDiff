@@ -257,7 +257,7 @@ fn load(dir: &str, isolated: bool) -> Result<Workspace, String> {
     // otherwise be read, shown and quoted in errors as the workspace file.
     if is_private_file(&file, isolated) {
         return Err(format!(
-            "{}: this file is also the user config or a private pack, whose contents are not shown; choose another folder",
+            "{}: this file is also the user config or a private pack (or the configuration that would tell cannot be loaded), whose contents are not shown; choose another folder",
             file.display()
         ));
     }
@@ -319,8 +319,8 @@ fn is_private_file(file: &Path, isolated: bool) -> bool {
             .filter(|l| l.kind == LayerKind::PrivatePack)
             .filter_map(|l| l.path.as_deref())
             .any(|p| canon(p) == me),
-        // Not loadable: `load` says so without quoting it.
-        Err(_) => false,
+        // Not loadable: the file may be one of them, so it is not read.
+        Err(_) => true,
     }
 }
 

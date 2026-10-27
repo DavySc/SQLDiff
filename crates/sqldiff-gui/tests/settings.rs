@@ -427,6 +427,16 @@ fn user_config_scenario(d: &Dir) {
     let (status, v) = settings(addr, &d.0.join("packdir"));
     assert_eq!(status, "400 Bad Request", "{v}");
     assert!(!v.to_string().contains("zz-"), "{v}");
+    // When the other layers cannot be loaded, the file may still be one of
+    // their packs, so it is not read either.
+    d.write(
+        "home/sqldiff.toml",
+        "private_packs = [\"../packdir/sqldiff.toml\", \"../missing.toml\"]\n",
+    );
+    let (status, v) = settings(addr, &d.0.join("packdir"));
+    assert_eq!(status, "400 Bad Request", "{v}");
+    assert!(!v.to_string().contains("zz-"), "{v}");
+    assert!(!v.to_string().contains("unknown field"), "{v}");
 }
 
 #[test]
