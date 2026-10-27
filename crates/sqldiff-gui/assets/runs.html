@@ -93,6 +93,8 @@ label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5
 .legend { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
 .legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; background: var(--c); }
 .legend b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+details.accepted { grid-column: 2 / -1; font-size: 12.5px; color: var(--muted); }
+details.accepted ul { margin: 4px 0 0; padding-left: 18px; }
 .failed-msg { grid-column: 2 / -1; color: var(--bad); font-size: 12.5px; overflow-wrap: anywhere; }
 .empty { padding: 16px; color: var(--muted); font-size: 13px; }
 a.btn { font-size: 12.5px; font-weight: 500; border: 1px solid var(--focus); color: var(--focus); border-radius: 6px; padding: 4px 10px; text-decoration: none; white-space: nowrap; }
@@ -228,6 +230,7 @@ function row(r) {
     right = ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>`;
     act = `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`;
     extra = legend(u)
+      + (g && g.accepted.length ? `<details class="accepted"><summary>Accepted by name: ${g.accepted.length} rule${g.accepted.length === 1 ? "" : "s"}</summary><ul>${g.accepted.map((x) => `<li>${esc(x.state)} <code>${esc(x.rule)}</code> on ${x.units} unit${x.units === 1 ? "" : "s"} by ${esc(x.authors.join(", "))}</li>`).join("")}</ul></details>` : "")
       + (r.not_applied.length ? `<div class="failed-msg">${r.not_applied.length} review decision${r.not_applied.length === 1 ? " was" : "s were"} not applied: ${esc(r.not_applied[0])}${r.not_applied.length > 1 ? " …" : ""}</div>` : "");
   } else if (r.state === "cancelled") {
     right = `<div class="meta">Cancelled; nothing was written into the output folder</div>`;

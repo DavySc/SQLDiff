@@ -356,6 +356,9 @@ pub struct GateView {
     /// Blockers per kind, and in all.
     pub counts: std::collections::BTreeMap<String, usize>,
     pub blockers: usize,
+    /// Assumptions accepted and decisions picked, by name, as
+    /// `sqldiff review-status` lists them.
+    pub accepted: Vec<sqldiff_convert::gate::Accepted>,
     /// Why the gate could not be judged.
     pub error: Option<String>,
 }
@@ -408,12 +411,14 @@ impl Run {
                     complete: g.complete,
                     counts: g.counts,
                     blockers: g.blockers.len(),
+                    accepted: g.accepted,
                     error: None,
                 },
                 Err(e) => GateView {
                     complete: false,
                     counts: Default::default(),
                     blockers: 0,
+                    accepted: Vec::new(),
                     error: Some(e),
                 },
             });

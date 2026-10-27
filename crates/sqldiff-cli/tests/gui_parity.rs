@@ -404,6 +404,7 @@ fn assert_gate_is_review_status(run: &Run) {
     assert_eq!(gui.error, None);
     assert_eq!(serde_json::json!(gui.complete), cli["complete"]);
     assert_eq!(serde_json::json!(gui.counts), cli["counts"]);
+    assert_eq!(serde_json::json!(gui.accepted), cli["accepted"]);
     assert_eq!(
         serde_json::json!(gui.blockers),
         serde_json::json!(cli["blockers"].as_array().unwrap().len())
