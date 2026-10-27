@@ -303,9 +303,21 @@ fn handle(
     if let Some(res) = crate::convert::route(convert_setup(), &req, "/convert") {
         return respond(&mut stream, res);
     }
-    let (method, path, query, body) = (req.method, req.path.as_str(), req.query.as_str(), req.body);
     let mut s = session.lock().unwrap_or_else(|e| e.into_inner());
-    let res: Response = match (method.as_str(), path) {
+    let res = route(&mut s, &req);
+    drop(s);
+    respond(&mut stream, res)
+}
+
+/// The pair view's page and API (paths as in the module docs).
+pub(crate) fn route(s: &mut Session, req: &Request) -> Response {
+    let (method, path, query, body) = (
+        &req.method,
+        req.path.as_str(),
+        req.query.as_str(),
+        &req.body,
+    );
+    match (method.as_str(), path) {
         ("GET", "/") => {
             let open = match (param(query, "a"), param(query, "b"), param(query, "pair")) {
                 (Some(a), Some(b), _) => s.find(&a, &b),
@@ -368,21 +380,21 @@ fn handle(
                 None => not_found(),
             }
         }
-        ("POST", "/api/diff") => match serde_json::from_slice::<Edit>(&body) {
+        ("POST", "/api/diff") => match serde_json::from_slice::<Edit>(body) {
             Ok(e) => match s.scratch(e.pair, e.a, e.b) {
                 Some(pl) => json(&pl),
                 None => bad("no such pair"),
             },
             Err(e) => bad(e),
         },
-        ("POST", "/api/assumption") => match serde_json::from_slice::<SetFlip>(&body) {
+        ("POST", "/api/assumption") => match serde_json::from_slice::<SetFlip>(body) {
             Ok(f) => {
                 s.set_flip(&f.id, f.flip);
                 json(&serde_json::json!({ "session": s.info(), "queue": s.queue() }))
             }
             Err(e) => bad(e),
         },
-        ("POST", "/api/review") => match serde_json::from_slice::<Review>(&body)
+        ("POST", "/api/review") => match serde_json::from_slice::<Review>(body)
             .map_err(|e| e.to_string())
             .and_then(|r| s.review(&r.fingerprint, &r.snapshot, r.state, r.comment))
         {
@@ -394,9 +406,7 @@ fn handle(
             Err(e) => ("500 Internal Server Error", "text/plain", e),
         },
         _ => not_found(),
-    };
-    drop(s);
-    respond(&mut stream, res)
+    }
 }
 
 pub(crate) fn respond(

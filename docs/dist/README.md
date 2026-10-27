@@ -26,12 +26,17 @@ appears open while you work; closing it stops SQLDiff.
 The app opens in convert mode: type or paste T-SQL on the left, checked
 PostgreSQL or Db2 for i appears on the right as you type, with a badge on each
 statement. Switch to Compare to diff two texts. To compare files or folders
-directly:
+directly, or review a converted tree:
 
 ```sh
 sqldiff-gui serve old.sql new.sql            # two versions of one object
 sqldiff-gui serve tsql/ db2i/                # two trees as a review queue
+sqldiff-gui review src/ out/ --to postgres   # review what `sqldiff convert` wrote
 ```
+
+The rail on the left switches between Home, Compare, Convert and Review in
+the same window. Home lists what is open; Compare and Review are available
+when the app was started on files or on a converted tree.
 
 ### First run on macOS
 
