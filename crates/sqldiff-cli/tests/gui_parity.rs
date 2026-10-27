@@ -4,7 +4,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sqldiff_gui::runs::{self, Command as Sheet, ConvertSpec, InstancesSpec, Run, Runs, State};
+use sqldiff_gui::runs::{
+    self, Command as Sheet, ConvertSpec, DriftSpec, DriftTree, InstancesSpec, Run, Runs, State,
+};
 
 fn write(p: &Path, text: &str) {
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -409,4 +411,156 @@ fn assert_gate_is_review_status(run: &Run) {
         serde_json::json!(gui.blockers),
         serde_json::json!(cli["blockers"].as_array().unwrap().len())
     );
+}
+
+/// Runs `git` in `dir`.
+fn git(dir: &Path, args: &[&str]) {
+    let o = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+#[test]
+fn a_drift_run_and_its_command_write_the_same() {
+    let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-drift-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let elsewhere = d.join("elsewhere");
+    write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    // Two trees of one repository: the templates the generator reads for
+    // T-SQL and for PostgreSQL. `touch` is not in the PostgreSQL tree and
+    // `entity` has other placeholders there.
+    let repo = d.join("repo");
+    git(
+        &{
+            std::fs::create_dir_all(&repo).unwrap();
+            repo.clone()
+        },
+        &["init", "-q"],
+    );
+    let (ms, pg) = (repo.join("mssql tpl"), repo.join("pg"));
+    write(
+        &ms.join("tables/entity.tpl"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL);\n",
+    );
+    write(
+        &ms.join("procs/touch.tpl"),
+        "CREATE PROCEDURE <%SCHEMA%>.Touch<%TABLE%> @Id int AS\nBEGIN\n  UPDATE <%SCHEMA%>.<%TABLE%> SET Id = 0 WHERE Id = @Id;\nEND\n",
+    );
+    write(
+        &pg.join("tables/entity.tpl"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id integer NOT NULL, Extra <%KIND%>);\n",
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    git(&repo, &["checkout", "-q", "-b", "topic"]);
+    // Changed in one tree only, since the base.
+    write(
+        &ms.join("tables/entity.tpl"),
+        "CREATE TABLE <%SCHEMA%>.<%TABLE%> (Id int NOT NULL, Price int);\n",
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "change"]);
+    let manifest = d.join("instances.toml");
+    write(
+        &manifest,
+        "[params]\nSCHEMA = \"dbo\"\nKIND = \"text\"\n[params_for.postgres]\nSCHEMA = \"public\"\n\n[[instance]]\nname = \"tables/Customer\"\ntemplate = \"tables/entity.tpl\"\nparams = { TABLE = \"Customer\" }\n",
+    );
+    let spec = |out: &Path, base: Option<&str>, manifest: bool| DriftSpec {
+        trees: vec![
+            DriftTree {
+                dialect: "tsql".into(),
+                dir: ms.display().to_string(),
+            },
+            DriftTree {
+                dialect: "postgres".into(),
+                dir: pg.display().to_string(),
+            },
+        ],
+        reference: None,
+        out: out.display().to_string(),
+        extensions: vec![".tpl".into()],
+        parameters: vec!["TABLE".into()],
+        accept: vec!["ASM-DBO-SCHEMA".into()],
+        base: base.map(str::to_string),
+        manifest: manifest.then(|| manifest_path(&d)),
+        packs: vec![pack()],
+        overwrite: false,
+    };
+    let runs = Runs::default();
+    for (name, base, with_manifest) in [
+        ("trees", None, false),
+        ("base", Some("main"), false),
+        ("instances", None, true),
+    ] {
+        let (gui, cli) = (d.join(format!("gui {name}")), d.join(format!("cli {name}")));
+        let run = runs
+            .start_drift(spec(&gui, base, with_manifest), true, |_| {})
+            .unwrap();
+        let state = finish(&run);
+        let State::Done {
+            complete, totals, ..
+        } = &state
+        else {
+            panic!("{name}: {state:?}");
+        };
+        let sheet = runs::drift_command(&spec(&cli, base, with_manifest), true).unwrap();
+        for flag in [
+            "--tree",
+            "--extension",
+            "--parameter",
+            "--pack",
+            "--isolated",
+        ] {
+            assert!(
+                sheet.args.contains(&flag.to_string()),
+                "{flag}: {}",
+                sheet.sh
+            );
+        }
+        assert_eq!(sheet.args.contains(&"--base".to_string()), base.is_some());
+        assert_eq!(
+            sheet.args.contains(&"--manifest".to_string()),
+            with_manifest
+        );
+        let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            o.status.code().is_some_and(|c| c <= 1),
+            "{name}: {}\n{err}",
+            sheet.sh
+        );
+        // The run's verdict is the command's exit code, and it is not a
+        // review gate: there is nothing here to review or to call done.
+        assert_eq!(*complete, o.status.code() == Some(0), "{name}");
+        assert!(totals["drifting"].as_u64().unwrap() > 0, "{name}: {totals}");
+        assert_eq!(masked(&gui), masked(&cli), "{name}: {}", sheet.sh);
+        let report = std::fs::read_to_string(gui.join("drift-report.json")).unwrap();
+        assert!(report.contains("drift.missing"), "{name}");
+        assert_eq!(
+            report.contains("drift.changed-alone"),
+            base.is_some(),
+            "{name}"
+        );
+        assert_eq!(
+            gui.join("instances/postgres/instance-report.json")
+                .is_file(),
+            with_manifest
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+fn manifest_path(d: &Path) -> String {
+    d.join("instances.toml").display().to_string()
 }

@@ -10,6 +10,9 @@
 //! - `POST /api/runs/instances` `{"manifest", "source"?, "target"?, "from",
 //!   "to", "out", ...}`: check the instances of converted templates, as
 //!   `sqldiff instances` does
+//! - `POST /api/runs/drift` `{"trees": [{"dialect", "dir"}, ...], "out", ...}`:
+//!   check the template trees of several dialects for drift, as `sqldiff
+//!   drift` does
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
@@ -45,7 +48,7 @@ use sqldiff_source::Resolved;
 use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::review::Store;
-use crate::runs::{ConvertSpec, InstancesSpec, Runs};
+use crate::runs::{ConvertSpec, DriftSpec, InstancesSpec, Runs};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -199,6 +202,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         | ("POST", "/api/open/compare")
         | ("POST", "/api/runs")
         | ("POST", "/api/runs/instances")
+        | ("POST", "/api/runs/drift")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
@@ -234,6 +238,15 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             return match serde_json::from_slice::<InstancesSpec>(&req.body)
                 .map_err(|e| e.to_string())
                 .and_then(|spec| app.runs.start_instances(spec, app.isolated, |_| {}))
+            {
+                Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            }
+        }
+        ("POST", "/api/runs/drift") => {
+            return match serde_json::from_slice::<DriftSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start_drift(spec, app.isolated, |_| {}))
             {
                 Ok(run) => json(&run.view()),
                 Err(e) => bad(e),

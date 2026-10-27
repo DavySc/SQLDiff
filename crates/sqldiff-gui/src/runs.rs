@@ -2,9 +2,11 @@
 //! kept in the data directory (`gui/runs.json`: paths, settings, totals and
 //! errors, never SQL text), so finished runs, and their reviews, are there
 //! again after a restart. A run converts a tree into an output folder
-//! through `sqldiff_convert::job` (what `sqldiff convert` runs), or checks
+//! through `sqldiff_convert::job` (what `sqldiff convert` runs), checks
 //! the instances of converted templates through
-//! `sqldiff_convert::instances` (what `sqldiff instances` runs), so a run
+//! `sqldiff_convert::instances` (what `sqldiff instances` runs), or checks
+//! the template trees of several dialects for drift through
+//! `sqldiff_convert::drift` (what `sqldiff drift` runs), so a run
 //! writes what the command writes. Each run carries that command
 //! (`Command`), for scripts and pipelines.
 
@@ -13,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use sqldiff_convert::drift;
 use sqldiff_convert::instances;
 use sqldiff_convert::job::{self, Job};
 use sqldiff_convert::tree::{self, Hooks};
@@ -95,18 +98,74 @@ pub struct InstancesSpec {
     pub overwrite: bool,
 }
 
+/// A template tree of one dialect.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftTree {
+    /// A dialect id.
+    pub dialect: String,
+    pub dir: String,
+}
+
+/// A drift check as the page asks for it: the arguments of `sqldiff drift`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftSpec {
+    /// The template trees, one per dialect (`--tree`); at least two.
+    pub trees: Vec<DriftTree>,
+    /// The tree the others are checked against (`--reference`); none: the first.
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// The output folder for the report and the instance checks.
+    pub out: String,
+    /// Template file extensions (`--extension`); none means `sql`.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Parameter names (`--parameter`) and accepted assumptions (`--accept`).
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// A template changed since the merge base with this revision in some
+    /// trees and not in all is drift (`--base`).
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The instance manifest (`--manifest`): every instance is also woven in
+    /// each tree and checked as `sqldiff instances` does.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// Packs to load besides the config's (`--pack`), by path.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 /// What a run was asked to do.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Spec {
     Convert(ConvertSpec),
     Instances(InstancesSpec),
+    Drift(DriftSpec),
+}
+
+impl Spec {
+    /// The output folder as given.
+    fn out(&self) -> &str {
+        match self {
+            Spec::Convert(s) => &s.out,
+            Spec::Instances(s) => &s.out,
+            Spec::Drift(s) => &s.out,
+        }
+    }
 }
 
 /// The work a spec comes to, checked before a thread starts.
 enum Work {
     Convert(Box<Job>),
     Instances(Box<instances::Args>),
+    Drift(Box<drift::Args>),
 }
 
 /// Where a run is.
@@ -223,6 +282,44 @@ impl Command {
         }
         for p in &a.parameters {
             args.extend(["--parameter".into(), p.clone()]);
+        }
+        for id in &a.accept {
+            args.extend(["--accept".into(), id.clone()]);
+        }
+        if a.overwrite {
+            args.push("--overwrite".into());
+        }
+        Command::with_config(program, args, packs, dir, isolated)
+    }
+
+    /// The `sqldiff drift` command for `a` with `packs`, with config found
+    /// from `dir` as the run finds it.
+    pub fn drift(
+        program: &str,
+        a: &drift::Args,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        let mut args = vec!["drift".into()];
+        for (d, p) in &a.trees {
+            args.extend(["--tree".into(), format!("{}={}", d.id(), path(p))]);
+        }
+        if let Some(d) = a.reference {
+            args.extend(["--reference".into(), d.id().into()]);
+        }
+        args.extend(["-o".into(), path(&a.out)]);
+        for e in &a.extensions {
+            args.extend(["--extension".into(), e.clone()]);
+        }
+        for p in &a.parameters {
+            args.extend(["--parameter".into(), p.clone()]);
+        }
+        if let Some(b) = &a.base {
+            args.extend(["--base".into(), b.clone()]);
+        }
+        if let Some(m) = &a.manifest {
+            args.extend(["--manifest".into(), path(m)]);
         }
         for id in &a.accept {
             args.extend(["--accept".into(), id.clone()]);
@@ -546,13 +643,9 @@ impl Runs {
                     },
                     s => s,
                 };
-                let out = match &r.spec {
-                    Spec::Convert(s) => &s.out,
-                    Spec::Instances(s) => &s.out,
-                };
                 Arc::new(Run {
                     id: r.id,
-                    out: canonical(&browse::absolute(Path::new(out.trim()))),
+                    out: canonical(&browse::absolute(Path::new(r.spec.out().trim()))),
                     reads: Vec::new(),
                     spec: r.spec,
                     command: r.command,
@@ -686,6 +779,32 @@ impl Runs {
         )
     }
 
+    /// Starts a drift check on its own thread. Config is what a command run
+    /// in the reference tree loads (unless `isolated`).
+    pub fn start_drift(
+        &self,
+        spec: DriftSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (a, command) = prepare_drift(&spec, isolated)?;
+        let out = a.out.clone();
+        let reads = a
+            .trees
+            .iter()
+            .map(|(_, p)| p)
+            .chain(a.manifest.as_ref())
+            .cloned()
+            .collect();
+        self.launch(
+            Spec::Drift(spec),
+            Work::Drift(Box::new(a)),
+            (out, reads),
+            command,
+            done,
+        )
+    }
+
     fn launch(
         &self,
         spec: Spec,
@@ -781,6 +900,11 @@ pub fn command(spec: &ConvertSpec, isolated: bool) -> Result<Command, String> {
 /// The command an instance check of `spec` would carry, without starting one.
 pub fn instances_command(spec: &InstancesSpec, isolated: bool) -> Result<Command, String> {
     prepare_instances(spec, isolated).map(|(_, c)| c)
+}
+
+/// The command a drift check of `spec` would carry, without starting one.
+pub fn drift_command(spec: &DriftSpec, isolated: bool) -> Result<Command, String> {
+    prepare_drift(spec, isolated).map(|(_, c)| c)
 }
 
 fn dialects(from: &str, to: &str) -> Result<(Dialect, Dialect), String> {
@@ -882,6 +1006,86 @@ fn prepare_instances(
     Ok((a, command))
 }
 
+/// The drift check a spec asks for, checked before a thread is started, and
+/// the command that runs it.
+fn prepare_drift(spec: &DriftSpec, isolated: bool) -> Result<(drift::Args, Command), String> {
+    let dialect = |id: &str| -> Result<Dialect, String> {
+        id.trim()
+            .parse()
+            .map_err(|_| format!("unknown dialect `{id}`"))
+    };
+    if spec.out.trim().is_empty() {
+        return Err("give an output folder".into());
+    }
+    let mut trees: Vec<(Dialect, PathBuf)> = Vec::new();
+    for t in &spec.trees {
+        let d = dialect(&t.dialect)?;
+        if trees.iter().any(|(x, _)| *x == d) {
+            return Err(format!("{}: given twice", d.display_name()));
+        }
+        let dir = existing(&t.dir)?;
+        if !dir.is_dir() {
+            return Err(format!("{}: not a folder", dir.display()));
+        }
+        trees.push((d, dir));
+    }
+    if trees.len() < 2 {
+        return Err("give the template trees of at least two dialects".into());
+    }
+    let reference = match spec.reference.as_deref().filter(|r| !r.trim().is_empty()) {
+        Some(r) => {
+            let d = dialect(r)?;
+            if !trees.iter().any(|(x, _)| *x == d) {
+                return Err(format!(
+                    "{}: has no tree to check against",
+                    d.display_name()
+                ));
+            }
+            Some(d)
+        }
+        None => None,
+    };
+    let manifest = match spec.manifest.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(p) => Some(existing(p)?),
+        None => None,
+    };
+    let base = spec
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+    let packs = existing_all(&spec.packs)?;
+    let ref_tree = reference.unwrap_or(trees[0].0);
+    let dir = trees
+        .iter()
+        .find(|(d, _)| *d == ref_tree)
+        .map(|(_, p)| p.clone())
+        .unwrap_or_default();
+    let cfg = load_config(&dir, &packs, isolated)?;
+    if cfg.policy.template.is_none() {
+        return Err(
+            "drift needs a [template] syntax: load a pack or a sqldiff.toml that has one".into(),
+        );
+    }
+    let a = drift::Args {
+        trees,
+        reference,
+        out: browse::absolute(Path::new(spec.out.trim())),
+        extensions: names(&spec.extensions),
+        parameters: names(&spec.parameters),
+        base,
+        manifest,
+        accept: names(&spec.accept),
+        jobs: None,
+        overwrite: spec.overwrite,
+        options: Box::new(|_, _| Ok(sqldiff_core::Options::default())),
+        cfg,
+    };
+    let command = Command::drift(&program(), &a, &packs, &dir, isolated);
+    Ok((a, command))
+}
+
 /// The job a spec asks for, checked before a thread is started, its
 /// absolute output folder and the command that runs it.
 fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command), String> {
@@ -964,6 +1168,28 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
     };
     let job = match work {
         Work::Convert(job) => job,
+        Work::Drift(a) => {
+            return match drift::check(&a, &hooks) {
+                Ok(c) => State::Done {
+                    totals: serde_json::json!({
+                        "templates": c.templates,
+                        "drifting": c.drifting,
+                        "items": c.items,
+                        "waived": c.waived,
+                        "instances": c.instance_ok
+                            .iter()
+                            .map(|(d, ok)| serde_json::json!({ "dialect": d, "ok": ok }))
+                            .collect::<Vec<_>>(),
+                    }),
+                    complete: c.ok,
+                    queue: c.drifting,
+                    not_applied: Vec::new(),
+                    notes: c.instance_runs.into_iter().flat_map(|r| r.notes).collect(),
+                    finished: finished(),
+                },
+                Err(e) => stopped(e),
+            }
+        }
         Work::Instances(a) => {
             return match instances::check(&a, &hooks) {
                 Ok(c) => State::Done {
