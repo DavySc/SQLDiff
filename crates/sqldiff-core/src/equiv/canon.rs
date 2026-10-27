@@ -2525,24 +2525,8 @@ impl<'a> Canon<'a> {
             if assigns.len() != sel.items.len() || assigns.len() != 1 {
                 return Err("SELECT assigning several variables is not supported".into());
             }
-            // Without FROM, WHERE, grouping or paging the query returns exactly
-            // one row: the statement is `SET @v = expr` (SQL Server 2022: a
-            // scalar subquery in it gives NULL on no row, as in SET).
-            let bare = sel.from.is_empty()
-                && sel.where_.is_none()
-                && sel.group_by.is_empty()
-                && sel.having.is_none()
-                && sel.top.is_none()
-                && sel.limit.is_none()
-                && sel.offset.is_none()
-                && sel.set_ops.is_empty()
-                && sel.ctes.is_empty()
-                && sel.values.is_none()
-                && !sel.for_json
-                && !sel.distinct;
-            if bare {
-                let var = Expr::Var(assigns[0].assign.clone().unwrap());
-                return self.stmt(&Stmt::Assign(var, assigns[0].expr.clone()));
+            if let Some((var, v)) = sel.bare_assign() {
+                return self.stmt(&Stmt::Assign(var, v.clone()));
             }
             let (sym, ty) = self.target_sym(&Expr::Var(assigns[0].assign.clone().unwrap()))?;
             let (q, qty) = self.query(sel, QCtx::Into)?;

@@ -920,6 +920,17 @@ fn select_assign_without_from_is_a_plain_assignment() {
         r.verdict,
         r.findings
     );
+    // The literal checks read it as the assignment it is, as for `SET @r = 1`
+    // (SQL Server 2022: SELECT and SET assign, round, cut off and overflow alike).
+    for ts in ["SET @r = 1", "SELECT @r = 1"] {
+        let r = select_assign(ts, "r := 1");
+        assert!(
+            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{ts}: {:?} {:?}",
+            r.verdict,
+            r.findings
+        );
+    }
     // With a WHERE the query can return no row: T-SQL then keeps -1.
     let r = select_assign("SELECT @r = 1 WHERE @id = 0", "r := 1");
     assert!(not_equal(&r), "{:?}", r.verdict);
