@@ -329,8 +329,10 @@ pub struct Run {
     pub id: u64,
     pub spec: Spec,
     pub command: Command,
-    /// Absolute output folder, for the one-run-per-folder rule.
+    /// Absolute output folder, and what the run reads: no two running runs
+    /// write into one folder, and none reads where another writes.
     out: PathBuf,
+    reads: Vec<PathBuf>,
     started: String,
     checked: AtomicUsize,
     total: AtomicUsize,
@@ -414,7 +416,18 @@ impl Runs {
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
         let (job, out, command) = prepare(&spec, isolated)?;
-        self.launch(Spec::Convert(spec), Work::Convert(Box::new(job)), out, command, done)
+        let reads = [Some(&job.tree.src), job.instances.as_ref()]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        self.launch(
+            Spec::Convert(spec),
+            Work::Convert(Box::new(job)),
+            (out, reads),
+            command,
+            done,
+        )
     }
 
     /// Starts an instance check on its own thread. Config is what a command
@@ -427,10 +440,16 @@ impl Runs {
     ) -> Result<Arc<Run>, String> {
         let (a, command) = prepare_instances(&spec, isolated)?;
         let out = a.out.clone();
+        let reads = [Some(&a.manifest), a.source.as_ref(), a.target.as_ref()]
+            .into_iter()
+            .chain([a.woven.as_ref(), a.woven_target.as_ref()])
+            .flatten()
+            .cloned()
+            .collect();
         self.launch(
             Spec::Instances(spec),
             Work::Instances(Box::new(a)),
-            out,
+            (out, reads),
             command,
             done,
         )
@@ -440,25 +459,39 @@ impl Runs {
         &self,
         spec: Spec,
         work: Work,
-        out: PathBuf,
+        (out, reads): (PathBuf, Vec<PathBuf>),
         command: Command,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
         let run = {
             let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
-            if l.iter()
-                .any(|r| r.out == out && matches!(r.state(), State::Running))
-            {
-                return Err(format!(
-                    "{}: another run is writing there; wait for it or cancel it",
-                    out.display()
-                ));
+            let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+            for r in l.iter().filter(|r| matches!(r.state(), State::Running)) {
+                if overlap(&r.out, &out) {
+                    return Err(format!(
+                        "{}: another run is writing there; wait for it or cancel it",
+                        out.display()
+                    ));
+                }
+                if let Some(p) = reads.iter().find(|p| overlap(&r.out, p)) {
+                    return Err(format!(
+                        "{}: another run is writing there, so this run would read a half-written tree; wait for it or cancel it",
+                        p.display()
+                    ));
+                }
+                if r.reads.iter().any(|p| overlap(p, &out)) {
+                    return Err(format!(
+                        "{}: another run is reading there; wait for it or cancel it",
+                        out.display()
+                    ));
+                }
             }
             let run = Arc::new(Run {
                 id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
                 spec,
                 command,
                 out,
+                reads,
                 started: sqldiff_review::time::now(),
                 checked: AtomicUsize::new(0),
                 total: AtomicUsize::new(0),

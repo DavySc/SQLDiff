@@ -606,3 +606,63 @@ fn runs_that_cannot_start_are_refused() {
         "HTTP/1.1 404 Not Found"
     );
 }
+
+#[test]
+fn a_run_never_reads_or_writes_where_a_running_run_writes() {
+    let d = Dir::new("overlap");
+    // Enough files that the first run is still converting.
+    for k in 0..300 {
+        d.write(
+            &format!("src/p{k}.sql"),
+            &format!("CREATE PROCEDURE dbo.p{k} AS\nBEGIN\n  UPDATE dbo.t SET a = {k};\nEND\n"),
+        );
+    }
+    let manifest = d.write("instances.toml", "");
+    let addr = start(app(None, None));
+    let out = d.0.join("out");
+    let spec =
+        serde_json::json!({ "src": d.0.join("src"), "out": out, "from": "tsql", "to": "postgres" });
+    let (status, body) = request(addr, "POST", "/api/runs", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let refused = [
+        // Into the same folder, or one inside it.
+        (
+            "/api/runs",
+            serde_json::json!({ "src": d.0.join("src"), "out": out.join("sub"), "from": "tsql", "to": "postgres" }),
+            "another run is writing there",
+        ),
+        // Reading the folder being written.
+        (
+            "/api/runs/instances",
+            serde_json::json!({ "manifest": manifest, "source": d.0.join("src"), "target": out, "from": "tsql", "to": "postgres", "out": d.0.join("inst") }),
+            "half-written",
+        ),
+        // Writing into the folder being read.
+        (
+            "/api/runs",
+            serde_json::json!({ "src": d.0.join("src"), "out": d.0.join("src/x"), "from": "tsql", "to": "postgres" }),
+            "another run is reading there",
+        ),
+    ];
+    let still = |addr| {
+        let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+        runs.as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == id && r["state"] == "running")
+    };
+    for (path, body, says) in refused {
+        // `out` exists once the first run prepared it: the instance check's
+        // target must exist to get as far as the overlap.
+        std::fs::create_dir_all(&out).unwrap();
+        let (status, text) = request(addr, "POST", path, &body.to_string());
+        assert!(still(addr), "the first run finished too soon for this test");
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
+        assert!(text.contains(says), "{body}: {text}");
+    }
+    request(addr, "POST", &format!("/runs/{id}/cancel"), "{}");
+    assert_eq!(finished(addr, id)["state"], "cancelled");
+}
