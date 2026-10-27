@@ -89,9 +89,28 @@ fn token(addr: SocketAddr) -> String {
     page[at..at + page[at..].find('"').unwrap()].to_string()
 }
 
+/// `p` as a query value: everything but unreserved characters percent-encoded
+/// (Windows paths have backslashes, colons and often spaces).
+fn encode(p: &std::path::Path) -> String {
+    p.display()
+        .to_string()
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            b => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 fn settings(addr: SocketAddr, dir: &std::path::Path) -> (String, Value) {
-    let q = dir.display().to_string().replace('\\', "%5C");
-    let (status, body) = request(addr, "GET", &format!("/api/settings?dir={q}"), "");
+    let (status, body) = request(
+        addr,
+        "GET",
+        &format!("/api/settings?dir={}", encode(dir)),
+        "",
+    );
     let v = serde_json::from_str(&body).unwrap_or(Value::String(body));
     (status, v)
 }
@@ -323,16 +342,44 @@ fn private_config_is_shown_by_path_and_never_read_into_the_page() {
     assert!(v.to_string().contains("sqldiff.toml"), "{v}");
 }
 
+/// Set in the child process that runs the user-config scenario.
+const CHILD: &str = "SQLDIFF_SETTINGS_TEST_DIR";
+
 #[test]
 fn the_user_config_is_path_only_and_is_never_a_save_target() {
+    // The user config is found through the environment, which a test cannot
+    // change for itself while the other tests read it: run in a child process.
+    if let Some(dir) = std::env::var_os(CHILD) {
+        return user_config_scenario(&Dir(PathBuf::from(dir)));
+    }
     let d = Dir::new("user");
-    let cfg = d.write(
-        "home/sqldiff.toml",
-        "[format]\nkeyword_case = \"preserve\"\nindent = 9\n",
-    );
+    let cfg = d.write("home/sqldiff.toml", USER_CONFIG);
     d.write("ws/sqldiff.toml", "[format]\nindent = 2\n");
-    // Not isolated: the user config is read, here named by the environment.
-    std::env::set_var("SQLDIFF_CONFIG", &cfg);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "the_user_config_is_path_only_and_is_never_a_save_target",
+            "--test-threads=1",
+        ])
+        .env(CHILD, &d.0)
+        .env("SQLDIFF_CONFIG", &cfg)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The child really ran the scenario (a filtered-out test also succeeds).
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+}
+
+const USER_CONFIG: &str = "[format]\nkeyword_case = \"preserve\"\nindent = 9\n";
+
+fn user_config_scenario(d: &Dir) {
+    let cfg = d.0.join("home/sqldiff.toml");
+    // Not isolated: the user config is read, here named by SQLDIFF_CONFIG.
     let addr = start(false);
     let (status, v) = settings(addr, &d.0.join("ws"));
     assert_eq!(status, "200 OK", "{v}");
@@ -344,28 +391,22 @@ fn the_user_config_is_path_only_and_is_never_a_save_target() {
         .collect();
     assert_eq!(kinds, ["builtin", "project", "user"]);
     let user = &v["layers"][2];
-    assert_eq!(
-        (user["shown"].clone(), user["path"].clone()),
-        (json!(false), json!(cfg.display().to_string()))
-    );
+    assert_eq!(user["shown"], false);
+    assert_eq!(user["path"], cfg.display().to_string());
     // It outranks the workspace, so the workspace's indent is not in effect.
     assert_eq!(
         v["effective"]["all"]["indent"],
         json!({"value": null, "hidden": true, "layer": 2, "dialect_table": false})
     );
     assert!(!v.to_string().contains("preserve"), "{v}");
-    // A save into the same file is refused, however the folder is spelled.
+    // A save into the same file is refused.
     let (status, body) = post(
         addr,
         "/api/settings/save",
         json!({"dir": d.0.join("home"), "draft": {"indent": 4}, "hash": null}),
     );
     assert_eq!(status, "403 Forbidden", "{body}");
-    assert_eq!(
-        d.read("home/sqldiff.toml"),
-        "[format]\nkeyword_case = \"preserve\"\nindent = 9\n"
-    );
-    std::env::remove_var("SQLDIFF_CONFIG");
+    assert_eq!(d.read("home/sqldiff.toml"), USER_CONFIG);
 }
 
 #[test]
@@ -636,8 +677,12 @@ fn settings_answer_only_on_loopback() {
         .parse()
         .unwrap();
     std::thread::spawn(move || serve(listener, app(true), &[]));
-    let q = d.0.join("ws").display().to_string();
-    let (status, body) = request(addr, "GET", &format!("/api/settings?dir={q}"), "");
+    let (status, body) = request(
+        addr,
+        "GET",
+        &format!("/api/settings?dir={}", encode(&d.0.join("ws"))),
+        "",
+    );
     assert_eq!(status, "403 Forbidden", "{body}");
     assert!(!body.contains("indent"));
     let t = token(addr);
