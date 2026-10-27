@@ -70,6 +70,9 @@ details.more > summary { cursor: pointer; color: var(--muted); font-size: 12.5px
 details.more > summary:hover { color: var(--fg); }
 details.more[open] > summary { margin-bottom: 8px; }
 details.more .field + .field, details.more .acts + .field { margin-top: 8px; }
+.tabs { display: flex; gap: 2px; margin-bottom: 2px; }
+.tabs button { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; padding: 4px 10px; }
+.tabs button.on { background: var(--soft); color: var(--fg); }
 .hint { grid-column: 2 / -1; color: var(--faint); font-size: 12px; margin-top: -4px; }
 .pick { display: flex; gap: 6px; align-items: center; color: var(--muted); }
 label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
@@ -114,7 +117,7 @@ a.btn:hover { background: var(--link-2); }
   <span class="muted">Runs are kept while the app is open</span>
 </header>
 <main><div class="col">
-  <h2>Convert a tree</h2>
+  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button></div>
   <form class="form" id="conv" autocomplete="off">
     <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
@@ -129,6 +132,24 @@ a.btn:hover { background: var(--link-2); }
       <div class="hint">With an instance check, the review judges each template by the instances woven from it.</div>
     </details>
     <div class="acts"><span class="err" id="err" role="alert"></span><button type="submit" class="primary" id="go">Convert</button></div>
+  </form>
+  <form class="form" id="instf" autocomplete="off" hidden>
+    <div class="field"><span>Manifest</span><input type="text" id="i-manifest" placeholder="The instance manifest (TOML): every result the generator produces" aria-label="Instance manifest" spellcheck="false"><button type="button" class="outline" data-browse="i-manifest" data-next="i-source">Browse…</button></div>
+    <div class="field"><span>Source</span><input type="text" id="i-source" placeholder="The source templates (the tree the generator reads today)" aria-label="Source templates" spellcheck="false"><button type="button" class="outline" data-browse="i-source" data-near="i-manifest" data-next="i-target">Browse…</button></div>
+    <div class="field"><span>Converted</span><input type="text" id="i-target" placeholder="The converted templates, with the same layout" aria-label="Converted templates" spellcheck="false"><button type="button" class="outline" data-browse="i-target" data-near="i-source" data-next="i-out">Browse…</button></div>
+    <div class="field"><span>Output</span><input type="text" id="i-out" placeholder="Empty or new folder for the woven instances and the report" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="i-out" data-near="i-target" data-next="i-go">Browse…</button></div>
+    <div class="field"><span>Dialects</span><span class="pick"><select id="i-from" aria-label="Source dialect"></select>→<select id="i-to" aria-label="Target dialect"></select></span><span></span></div>
+    <div class="acts"><label class="tog"><input type="checkbox" id="i-overwrite"> Replace the files a check writes in a non-empty output folder</label></div>
+    <details class="more"><summary>Generator output, parameters and packs</summary>
+      <div class="field"><span>Generated</span><input type="text" id="i-woven" placeholder="The generator's own output: each source weave must equal it" aria-label="Generator output" spellcheck="false"><button type="button" class="outline" data-browse="i-woven" data-near="i-manifest">Browse…</button></div>
+      <div class="field"><span>For target</span><input type="text" id="i-woven-target" placeholder="The generator's own output for the target dialect" aria-label="Generator output for the target" spellcheck="false"><button type="button" class="outline" data-browse="i-woven-target" data-near="i-woven">Browse…</button></div>
+      <div class="acts"><label class="tog"><input type="checkbox" id="i-genonly"> Check the generator's output alone (no templates woven)</label></div>
+      <div class="field"><span>Parameters</span><input type="text" id="i-params" placeholder="Names besides the manifest's, comma-separated" aria-label="Parameter names" spellcheck="false"><span></span></div>
+      <div class="field"><span>Accept</span><input type="text" id="i-accept" placeholder="Assumptions you know hold, comma-separated, e.g. ASM-DBO-SCHEMA" aria-label="Accepted assumptions" spellcheck="false"><span></span></div>
+      <div class="field"><span>Pack</span><input type="text" id="i-pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="i-pack" data-near="i-manifest">Browse…</button></div>
+      <div class="hint">An instance is done only when both sides were checked on the generator's own output.</div>
+    </details>
+    <div class="acts"><span class="err" id="i-err" role="alert"></span><button type="submit" class="primary" id="i-go">Check</button></div>
   </form>
   <h2 style="margin-top:8px">Runs</h2>
   <div class="list" id="runs"></div>
@@ -151,37 +172,59 @@ const LADDER = [
 ];
 const time = (t) => (t || "").replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC");
 
-function pickers() {
+// An instance's status, best first, as `sqldiff instances` reports it.
+const INSTANCE_LADDER = [
+  ["converted", "converted", "--s-converted"],
+  ["under assumptions", "under assumptions", "--s-assumptions"],
+  ["needs a decision", "needs a decision", "--s-decision"],
+  ["unknown", "unknown", "--s-unproven"],
+  ["not woven", "not woven", "--s-not_converted"],
+  ["differs", "differs", "--s-differs"],
+];
+
+function pickers(from, to) {
   const froms = [...new Set(INITIAL.with_rules.map(([f]) => f))];
-  $("from").innerHTML = froms.map((f) => `<option value="${esc(f)}">${esc(NAME[f])}</option>`).join("");
+  $(from).innerHTML = froms.map((f) => `<option value="${esc(f)}">${esc(NAME[f])}</option>`).join("");
   const tos = () => {
-    const keep = $("to").value;
-    const ts = INITIAL.with_rules.filter(([f]) => f === $("from").value).map(([, t]) => t);
-    $("to").innerHTML = ts.map((t) => `<option value="${esc(t)}">${esc(NAME[t])}</option>`).join("");
-    if (ts.includes(keep)) $("to").value = keep;
+    const keep = $(to).value;
+    const ts = INITIAL.with_rules.filter(([f]) => f === $(from).value).map(([, t]) => t);
+    $(to).innerHTML = ts.map((t) => `<option value="${esc(t)}">${esc(NAME[t])}</option>`).join("");
+    if (ts.includes(keep)) $(to).value = keep;
   };
-  $("from").addEventListener("change", tos);
+  $(from).addEventListener("change", tos);
   tos();
 }
 
-function ladder(units) {
-  const total = LADDER.reduce((n, [k]) => n + (units[k] || 0), 0) || 1;
-  return `<div class="bar">${LADDER.map(([k, , c]) => units[k] ? `<i style="width:${units[k] / total * 100}%;background:var(${c})"></i>` : "").join("")}</div>`;
+function ladder(units, steps = LADDER) {
+  const total = steps.reduce((n, [k]) => n + (units[k] || 0), 0) || 1;
+  return `<div class="bar">${steps.map(([k, , c]) => units[k] ? `<i style="width:${units[k] / total * 100}%;background:var(${c})"></i>` : "").join("")}</div>`;
+}
+function legend(units, steps = LADDER) {
+  return `<div class="legend">${steps.filter(([k]) => units[k]).map(([k, l, c]) => `<span style="--c:var(${c})"><b>${units[k]}</b> ${esc(l)}</span>`).join("")}</div>`;
 }
 
 function row(r) {
-  const title = `Convert ${r.template ? "templates " : ""}${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
-  const sub = `<span class="path">${esc(r.src)}</span> into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}`;
+  const pair = `${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
+  const inst = r.kind === "instances";
+  const title = inst ? `Check instances ${pair}` : `Convert ${r.template ? "templates " : ""}${pair}`;
+  const what = inst ? (r.generator_only ? `the generator's output in <span class="path">${esc(r.woven)}</span>` : `<span class="path">${esc(r.target)}</span>`) : `<span class="path">${esc(r.src)}</span>`;
+  const sub = `${what} into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}`;
   let right = "", act = "", extra = "", dot = r.state;
   if (r.state === "running") {
     const pct = r.total ? r.checked / r.total * 100 : 0;
-    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Checked ${r.checked} of ${r.total}` : "Reading and converting…"}</div>`;
+    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Checked ${r.checked} of ${r.total}` : inst ? "Weaving…" : "Reading and converting…"}</div>`;
     act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
+  } else if (r.state === "done" && inst) {
+    const u = r.totals.statuses || {};
+    const n = r.totals.instances;
+    right = ladder(u, INSTANCE_LADDER) + `<div class="meta">${n} instance${n === 1 ? "" : "s"} · ${r.totals.done} done${r.complete ? "" : " · not complete"}</div>`;
+    act = r.generator_only ? "" : `<button type="button" class="outline" data-use="${r.id}" title="Convert the templates again into the checked folder with this check, so their review judges each template by its instances">Use in a template run</button>`;
+    extra = legend(u, INSTANCE_LADDER) + r.notes.map((n) => `<div class="failed-msg">${esc(n)}</div>`).join("");
   } else if (r.state === "done") {
     const u = r.totals.units || {};
     right = ladder(u) + `<div class="meta">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${r.complete ? "" : " · not every file converted"}</div>`;
     act = `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`;
-    extra = `<div class="legend">${LADDER.filter(([k]) => u[k]).map(([k, l, c]) => `<span style="--c:var(${c})"><b>${u[k]}</b> ${esc(l)}</span>`).join("")}</div>`
+    extra = legend(u)
       + (r.not_applied.length ? `<div class="failed-msg">${r.not_applied.length} review decision${r.not_applied.length === 1 ? " was" : "s were"} not applied: ${esc(r.not_applied[0])}${r.not_applied.length > 1 ? " …" : ""}</div>` : "");
   } else if (r.state === "cancelled") {
     right = `<div class="meta">Cancelled; nothing was written into the output folder</div>`;
@@ -222,6 +265,22 @@ function render(runs) {
   $("runs").querySelectorAll("[data-shell]").forEach((b) => b.addEventListener("click", () => {
     shell = b.dataset.shell;
     render(runs);
+  }));
+  $("runs").querySelectorAll("[data-use]").forEach((b) => b.addEventListener("click", () => {
+    // Convert the checked templates again, into the folder that was checked
+    // (files edited by hand there are kept), judged by this check.
+    const r = runs.find((x) => x.id === +b.dataset.use);
+    $("src").value = r.source || "";
+    $("out").value = r.target || "";
+    $("overwrite").checked = true;
+    $("inst").value = r.out;
+    $("template").checked = true;
+    $("params").value = (r.parameters || []).join(", ");
+    $("pack").value = (r.packs || [])[0] || "";
+    $("from").value = r.from; $("from").dispatchEvent(new Event("change")); $("to").value = r.to;
+    $("more").open = true;
+    tab("conv");
+    $("go").focus();
   }));
   $("runs").querySelectorAll("[data-copy]").forEach((b) => b.addEventListener("click", async () => {
     const r = runs.find((x) => x.id === +b.dataset.copy);
@@ -279,9 +338,40 @@ $("conv").addEventListener("submit", async (e) => {
   refresh();
 });
 
-pickers();
+pickers("from", "to");
+pickers("i-from", "i-to");
+function tab(id) {
+  document.querySelectorAll("[data-tab]").forEach((b) => {
+    const on = b.dataset.tab === id;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-selected", on);
+    $(b.dataset.tab).hidden = !on || !!INITIAL.no_picking;
+  });
+}
+document.querySelectorAll("[data-tab]").forEach((b) => b.addEventListener("click", () => tab(b.dataset.tab)));
+$("instf").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const v = (id) => $(id).value.trim();
+  const list = (id) => v(id).split(",").map((x) => x.trim()).filter(Boolean);
+  const genonly = $("i-genonly").checked;
+  if (!v("i-manifest") || !v("i-out")) { $("i-err").textContent = "Give a manifest and an output folder."; return; }
+  $("i-err").textContent = ""; $("i-go").disabled = true;
+  try {
+    await post("/api/runs/instances", {
+      manifest: v("i-manifest"), out: v("i-out"), from: $("i-from").value, to: $("i-to").value,
+      source: genonly ? null : v("i-source") || null, target: genonly ? null : v("i-target") || null,
+      woven: v("i-woven") || null, woven_target: v("i-woven-target") || null, generator_only: genonly,
+      parameters: list("i-params"), accept: list("i-accept"), packs: v("i-pack") ? [v("i-pack")] : [],
+      overwrite: $("i-overwrite").checked,
+    });
+    $("i-overwrite").checked = false;
+  } catch (e) { $("i-err").textContent = e.message; }
+  $("i-go").disabled = false;
+  refresh();
+});
 if (INITIAL.no_picking) {
   $("conv").hidden = true;
+  $("instf").hidden = true;
   $("conv").insertAdjacentHTML("beforebegin", `<div class="card closed"><span class="t">Not available on a network address</span><span class="s">${esc(INITIAL.no_picking.charAt(0).toUpperCase() + INITIAL.no_picking.slice(1))}.</span></div>`);
 }
 render(INITIAL.runs);

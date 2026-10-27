@@ -380,6 +380,10 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         "HTTP/1.1 403 Forbidden"
     );
     assert!(!d.0.join("out").exists());
+    assert_eq!(
+        request(addr, "POST", "/api/runs/instances", &run.to_string()).0,
+        "HTTP/1.1 403 Forbidden"
+    );
     // On loopback the same requests are answered.
     let addr = start(app(None, None));
     assert_eq!(
@@ -548,6 +552,50 @@ fn runs_that_cannot_start_are_refused() {
         ),
     ] {
         let (status, text) = request(addr, "POST", "/api/runs", &body);
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
+        assert!(text.contains(says), "{body}: {text}");
+    }
+    // Instance checks: the manifest, and the templates or the generator's
+    // output, must be given and exist.
+    let manifest = d.write("instances.toml", "");
+    let check = |extra: serde_json::Value| {
+        let mut b = serde_json::json!({ "manifest": manifest, "out": out, "from": "tsql", "to": "postgres" });
+        b.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        b.to_string()
+    };
+    for (body, says) in [
+        (
+            check(serde_json::json!({ "manifest": d.0.join("none.toml") })),
+            "none.toml: not found",
+        ),
+        (check(serde_json::json!({})), "give the source templates"),
+        (
+            check(serde_json::json!({ "source": d.0.join("src") })),
+            "give the source templates",
+        ),
+        (
+            check(serde_json::json!({ "generator_only": true })),
+            "needs both of its outputs",
+        ),
+        (
+            check(
+                serde_json::json!({ "generator_only": true, "woven": d.0.join("src"), "woven_target": d.0.join("src"), "source": d.0.join("src") }),
+            ),
+            "takes no templates",
+        ),
+        (
+            check(serde_json::json!({ "target": d.0.join("gone"), "source": d.0.join("src") })),
+            "gone: not found",
+        ),
+        (
+            check(serde_json::json!({ "from": "oracle" })),
+            "unknown dialect",
+        ),
+        (check(serde_json::json!({ "since": "x" })), "since"),
+    ] {
+        let (status, text) = request(addr, "POST", "/api/runs/instances", &body);
         assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
         assert!(text.contains(says), "{body}: {text}");
     }
