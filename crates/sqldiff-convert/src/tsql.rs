@@ -1773,11 +1773,11 @@ impl<'a> Cx<'a> {
             "INSERT" if !ts[s[1]].is("INTO") => pre = "INSERT INTO ".into(),
             "UPDATE" => {
                 let set = find_word(&ts, 0, "SET").unwrap_or(0);
-                if find_word(&ts, set, "FROM").is_some() {
-                    return no(self.pick(
-                        "UPDATE … FROM with a join: PostgreSQL's UPDATE … FROM must not repeat the target, and with several matching rows both pick one unpredictably; needs a rewrite",
-                        "UPDATE … FROM with a join: Db2 for i needs a correlated subquery or MERGE, and with several matching rows T-SQL picks one unpredictably; needs a rewrite",
-                    ));
+                if let Some(f) = find_word(&ts, set, "FROM") {
+                    if self.db2() {
+                        return no("UPDATE … FROM with a join: Db2 for i needs a correlated subquery or MERGE, and with several matching rows T-SQL picks one unpredictably; needs a rewrite");
+                    }
+                    return self.update_join(&ts, set, f);
                 }
                 from = s[0];
             }
@@ -1891,6 +1891,297 @@ impl<'a> Cx<'a> {
                 others.join(", ")
             ),
         })
+    }
+
+    /// `UPDATE x SET … FROM <tables> [WHERE w]` (rule T4): T-SQL changes
+    /// the rows of the FROM table `x` names that the joins and WHERE keep,
+    /// with values from the row they meet. PostgreSQL's `UPDATE t [AS] x SET
+    /// … FROM <others> WHERE …` must not repeat the target in FROM, so the
+    /// target leaves the FROM list and the condition of the inner join that
+    /// tied it to its neighbour moves to WHERE: `(t ⋈k s) ⟕ u` is `t ⋈k (s ⟕
+    /// u)` as long as no other join condition names `t`, which PostgreSQL
+    /// rejects anyway. The target must head a comma item or a join chain, or
+    /// follow its head through an inner or cross join; only inner, LEFT and
+    /// cross joins are taken. When a target row meets several rows, both
+    /// dialects pick one unpredictably, so the source catalog must show that
+    /// every table is fixed by a unique key matched in full (`unique_join`).
+    fn update_join(&mut self, ts: &[T], set: usize, from: usize) -> R<String> {
+        let why = |w: &str| {
+            No(format!(
+                "UPDATE … FROM with a join: {w}; rewrite with the target alone in UPDATE and the other tables in FROM"
+            ))
+        };
+        let upd = sig(ts)[0];
+        let target = name_parts(trimmed(&ts[upd + 1..set]))
+            .filter(|p| p.len() == 1)
+            .ok_or_else(|| why("the target is not a one-part table name or alias"))?;
+        if find_word(ts, from + 1, "OPTION").is_some() {
+            return Err(why("query hints (OPTION) are not converted"));
+        }
+        let end = find_word(ts, from + 1, "WHERE").unwrap_or(ts.len());
+        let mut chains: Vec<Vec<Step>> = Vec::new();
+        for item in split_commas(&ts[from + 1..end]) {
+            chains.push(join_steps(item).map_err(|w| why(&w))?);
+        }
+        let hits: Vec<(usize, usize)> = chains
+            .iter()
+            .enumerate()
+            .flat_map(|(i, c)| {
+                c.iter()
+                    .enumerate()
+                    .filter(|(_, st)| st.leaf.binds(&target))
+                    .map(move |(j, _)| (i, j))
+            })
+            .collect();
+        let [(ci, li)] = hits[..] else {
+            return Err(why(if hits.is_empty() {
+                "the target is not one of the FROM tables by alias or one-part name"
+            } else {
+                "the target matches more than one FROM table"
+            }));
+        };
+        if chains
+            .iter()
+            .flatten()
+            .any(|st| find_word(st.leaf.toks, 0, "WITH").is_some() || hinted(st.leaf.toks))
+        {
+            return Err(why("table hints are not converted"));
+        }
+        let c = &mut chains[ci];
+        if !c[li].leaf.table {
+            return Err(why("the target is not a table"));
+        }
+        let inner = |k: Join| matches!(k, Join::Inner | Join::Cross);
+        let mut moved: Vec<&[T]> = Vec::new();
+        let tleaf = match li {
+            0 if c.len() == 1 => chains.remove(ci).remove(0).leaf,
+            0 if inner(c[1].kind) => {
+                moved.extend(c[1].on);
+                let t = c.remove(0).leaf;
+                c[0].kind = Join::First;
+                c[0].on = None;
+                t
+            }
+            1 if inner(c[1].kind) => {
+                moved.extend(c[1].on);
+                c.remove(1).leaf
+            }
+            _ => {
+                return Err(why(
+                    "the target is not joined first, by an inner or cross join",
+                ))
+            }
+        };
+        let tkey = tleaf
+            .alias
+            .clone()
+            .or_else(|| tleaf.name.last().cloned())
+            .unwrap_or_default();
+        // The conditions left in FROM must not name the target.
+        let target_cols = self.table_columns(&tleaf.name);
+        for st in chains.iter().flatten() {
+            let Some(on) = st.on else { continue };
+            if qualifies(on, &tkey) {
+                return Err(why(&format!(
+                    "a join condition other than the target's own names the target `{tkey}`"
+                )));
+            }
+            for name in bare_columns(on) {
+                if target_cols
+                    .as_ref()
+                    .map_or(true, |cols| cols.contains(&name))
+                {
+                    return Err(why(&format!(
+                        "`{name}` in a join condition may be a column of the target (qualify it with its table alias)"
+                    )));
+                }
+            }
+        }
+        let wh: Option<&[T]> = (end < ts.len()).then(|| &ts[end + 1..]);
+        self.unique_join(&tkey, &chains, &moved, wh)
+            .map_err(|w| why(&w))?;
+
+        // SET list: PostgreSQL takes no table name before a column.
+        let mut set_toks: Vec<T> = Vec::new();
+        for (k, item) in split_commas(&ts[set + 1..from]).into_iter().enumerate() {
+            if k > 0 {
+                set_toks.push(T {
+                    k: COMMA,
+                    s: ",".into(),
+                });
+            }
+            let s = sig(item);
+            let lhs_end = s
+                .iter()
+                .position(|&j| item[j].k == OP)
+                .ok_or_else(|| why("a SET item that is not `column = value`"))?;
+            let lhs: Vec<usize> = s[..lhs_end].to_vec();
+            let skip = match name_parts(trimmed(&item[..s[lhs_end]])) {
+                Some(p) if p.len() == 1 => 0,
+                Some(p) if p.len() == 2 && p[0] == tkey => 2,
+                _ => return Err(why("a SET column that is not a column of the target")),
+            };
+            for (j, t) in item.iter().enumerate() {
+                if skip > 0 && lhs[..skip].contains(&j) {
+                    continue;
+                }
+                set_toks.push(t.clone());
+            }
+        }
+        let sets = self.expr(&set_toks).trim().to_string();
+        let tgt = self.expr(trimmed(tleaf.toks)).trim().to_string();
+        let mut text = format!("UPDATE {tgt} SET {sets}");
+        let others: Vec<String> = chains
+            .iter()
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                let mut o = String::new();
+                for st in c {
+                    o.push_str(match st.kind {
+                        Join::First => "",
+                        Join::Inner => " JOIN ",
+                        Join::Left => " LEFT JOIN ",
+                        Join::Cross => " CROSS JOIN ",
+                    });
+                    o.push_str(&self.leaf_text(&st.leaf));
+                    if let Some(on) = st.on {
+                        o.push_str(" ON ");
+                        o.push_str(self.expr(trimmed(on)).trim());
+                    }
+                }
+                o
+            })
+            .collect();
+        if !others.is_empty() {
+            text.push_str(&format!(" FROM {}", others.join(", ")));
+        }
+        let mut conds: Vec<String> = moved
+            .iter()
+            .map(|c| self.expr(trimmed(c)).trim().to_string())
+            .collect();
+        if let Some(w) = wh {
+            conds.push(self.expr(trimmed(w)).trim().to_string());
+        }
+        match conds.len() {
+            0 => {}
+            1 => text.push_str(&format!(" WHERE {}", conds[0])),
+            _ => {
+                let c: Vec<String> = conds.iter().map(|c| format!("({c})")).collect();
+                text.push_str(&format!(" WHERE {}", c.join(" AND ")));
+            }
+        }
+        Ok(text)
+    }
+
+    /// Whether every table of an UPDATE … FROM meets at most one row per
+    /// target row: walking out from the target, a table is settled once
+    /// equalities fix every column of one of its unique keys (by the source
+    /// catalog) to columns of settled tables, variables or literals. A LEFT
+    /// JOIN's table counts only the equalities of its own ON condition; an
+    /// inner-joined one those of WHERE and every inner join's ON condition.
+    fn unique_join(
+        &self,
+        target: &str,
+        chains: &[Vec<Step>],
+        moved: &[&[T]],
+        wh: Option<&[T]>,
+    ) -> Result<(), String> {
+        let mut all: Vec<&[T]> = moved.to_vec();
+        all.extend(wh);
+        for st in chains.iter().flatten() {
+            if matches!(st.kind, Join::Inner) {
+                all.extend(st.on);
+            }
+        }
+        let all_eqs: Vec<(Vec<String>, Vec<String>)> =
+            all.iter().flat_map(|c| equalities(c)).collect();
+        let leaves: Vec<&Step> = chains.iter().flatten().collect();
+        let key_of = |l: &Leaf| {
+            l.alias
+                .clone()
+                .or_else(|| l.name.last().cloned())
+                .unwrap_or_default()
+        };
+        let mut bound = vec![target.to_string()];
+        loop {
+            let mut progress = false;
+            for st in &leaves {
+                let k = key_of(&st.leaf);
+                if bound.contains(&k) {
+                    continue;
+                }
+                let own;
+                let eqs = match (st.kind, st.on) {
+                    (Join::Left, Some(on)) => {
+                        own = equalities(on);
+                        &own
+                    }
+                    _ => &all_eqs,
+                };
+                let fixed = |side: &[String]| match side {
+                    [] => true,
+                    [q, _] => bound.contains(q),
+                    _ => false,
+                };
+                let mut cols = Vec::new();
+                for (x, y) in eqs {
+                    for (col, other) in [(x, y), (y, x)] {
+                        if matches!(col.as_slice(), [q, _] if *q == k) && fixed(other) {
+                            cols.push(col[1].clone());
+                        }
+                    }
+                }
+                if st.leaf.table && self.has_unique_key(&st.leaf.name, &cols) {
+                    bound.push(k);
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        match leaves.iter().find(|st| !bound.contains(&key_of(&st.leaf))) {
+            None => Ok(()),
+            Some(st) => Err(format!(
+                "the source catalog does not show that a target row meets at most one row of `{}` (a unique key matched in full by equalities); with several, T-SQL and PostgreSQL each pick one unpredictably",
+                key_of(&st.leaf)
+            )),
+        }
+    }
+
+    /// The source catalog's columns of a table (lower case).
+    fn table_columns(&self, name: &[String]) -> Option<Vec<String>> {
+        let t = self.catalog_table(name)?;
+        t.columns_known.then(|| {
+            t.columns
+                .iter()
+                .map(|c| c.name.to_ascii_lowercase())
+                .collect()
+        })
+    }
+
+    /// Whether `cols` include every column of a primary key, a UNIQUE
+    /// constraint or an unfiltered unique index of the table.
+    fn has_unique_key(&self, name: &[String], cols: &[String]) -> bool {
+        let Some(t) = self.catalog_table(name) else {
+            return false;
+        };
+        t.keys
+            .iter()
+            .map(|k| &k.columns)
+            .chain(t.indexes.iter().filter(|i| i.unique).map(|i| &i.columns))
+            .any(|k| !k.is_empty() && k.iter().all(|c| cols.contains(&c.to_ascii_lowercase())))
+    }
+
+    fn catalog_table(&self, name: &[String]) -> Option<&sqldiff_core::catalog::Table> {
+        use sqldiff_core::catalog::{table_position, Ident};
+        let cat = self.type_catalog()?;
+        let parts: Vec<Ident> = match name {
+            [.., s, t] if s != "dbo" => vec![Ident::plain(s.clone()), Ident::plain(t.clone())],
+            [.., t] => vec![Ident::plain(t.clone())],
+            [] => return None,
+        };
+        Some(&cat.tables[table_position(Dialect::Tsql, cat, &parts)?])
     }
 
     /// How many of the DELETE's FROM tables have column `name`, by the
@@ -4461,6 +4752,156 @@ impl Leaf<'_> {
             (None, _) => false,
         }
     }
+}
+
+/// How a table joins its chain in an UPDATE's FROM list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Join {
+    /// The first table of a comma item.
+    First,
+    Inner,
+    Left,
+    Cross,
+}
+
+/// One table of an UPDATE's FROM list, with the join that adds it.
+struct Step<'a> {
+    kind: Join,
+    leaf: Leaf<'a>,
+    on: Option<&'a [T]>,
+}
+
+/// Splits one comma item of a FROM list, a chain of inner, LEFT and cross
+/// joins, into its tables. Anything else is an error.
+fn join_steps(ts: &[T]) -> Result<Vec<Step<'_>>, String> {
+    let ds = crate::tok::depths(ts);
+    let s: Vec<usize> = sig(ts).into_iter().filter(|&i| ds[i] == 0).collect();
+    let mut steps = Vec::new();
+    let (mut start, mut kind, mut on): (usize, Join, Option<usize>) = (0, Join::First, None);
+    let mut close = |a: usize, b: usize, kind: Join, on: Option<usize>| -> Result<(), String> {
+        let needs_on = matches!(kind, Join::Inner | Join::Left);
+        match (on, needs_on) {
+            (Some(o), true) => {
+                if find_word(&ts[o + 1..b], 0, "ON").is_some() {
+                    return Err("nested ON clauses".into());
+                }
+                steps.push(Step {
+                    kind,
+                    leaf: leaf(&ts[a..o])?,
+                    on: Some(&ts[o + 1..b]),
+                });
+            }
+            (None, false) => steps.push(Step {
+                kind,
+                leaf: leaf(&ts[a..b])?,
+                on: None,
+            }),
+            (None, true) => return Err("a JOIN without its ON".into()),
+            (Some(_), false) => return Err("ON after a cross join or a comma".into()),
+        }
+        Ok(())
+    };
+    let mut k = 0;
+    while k < s.len() {
+        let i = s[k];
+        let t = &ts[i];
+        let at = |j: usize, w: &str| s.get(j).is_some_and(|&x| ts[x].is(w));
+        let (next, width) = if t.is("JOIN") {
+            (Join::Inner, 1)
+        } else if t.is("INNER") && at(k + 1, "JOIN") {
+            (Join::Inner, 2)
+        } else if t.is("CROSS") && at(k + 1, "JOIN") {
+            (Join::Cross, 2)
+        } else if t.is("LEFT") && at(k + 1, "JOIN") {
+            (Join::Left, 2)
+        } else if t.is("LEFT") && at(k + 1, "OUTER") && at(k + 2, "JOIN") {
+            (Join::Left, 3)
+        } else if [
+            "LEFT", "RIGHT", "FULL", "OUTER", "INNER", "CROSS", "APPLY", "LOOP", "HASH", "MERGE",
+            "REMOTE",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            && !next_sig(ts, i).is_some_and(|j| ts[j].k == L_PAREN)
+        {
+            return Err("a RIGHT or FULL join, APPLY or a join hint".into());
+        } else {
+            if t.is("ON") && on.is_none() {
+                on = Some(i);
+            }
+            k += 1;
+            continue;
+        };
+        close(start, i, kind, on)?;
+        start = s[k + width - 1] + 1;
+        on = None;
+        kind = next;
+        k += width;
+    }
+    close(start, ts.len(), kind, on)?;
+    Ok(steps)
+}
+
+/// A table written with old-style hints, `t (NOLOCK)`.
+fn hinted(ts: &[T]) -> bool {
+    let s = sig(ts);
+    s.windows(2).any(|w| {
+        ts[w[1]].k == L_PAREN
+            && ts[w[0]].k != DOT
+            && next_sig(ts, w[1]).is_some_and(|j| OLD_STYLE_HINTS.iter().any(|h| ts[j].is(h)))
+    })
+}
+
+/// Whether a condition names `alias.` (or a subquery, which might).
+fn qualifies(ts: &[T], alias: &str) -> bool {
+    sig(ts).into_iter().any(|i| {
+        let t = &ts[i];
+        t.is("SELECT")
+            || matches!(t.k, IDENT | QUOTED_IDENT)
+                && tsql_unquote(&t.s).eq_ignore_ascii_case(alias)
+                && next_sig(ts, i).is_some_and(|j| ts[j].k == DOT)
+    })
+}
+
+/// The equalities among the top-level AND terms of a condition, each side
+/// as a two-part name `[table, column]` (lower case), or empty for a
+/// variable or a literal. Other terms are left out.
+fn equalities(ts: &[T]) -> Vec<(Vec<String>, Vec<String>)> {
+    let ds = crate::tok::depths(ts);
+    let mut terms = Vec::new();
+    let mut start = 0;
+    for i in 0..ts.len() {
+        if ds[i] == 0 && (ts[i].is("AND") || ts[i].is("OR")) {
+            if ts[i].is("OR") {
+                return Vec::new();
+            }
+            terms.push(&ts[start..i]);
+            start = i + 1;
+        }
+    }
+    terms.push(&ts[start..]);
+    let side = |x: &[T]| -> Option<Vec<String>> {
+        let x = trimmed(x);
+        match x {
+            [t] if matches!(t.k, VARIABLE | NUMBER | STRING) => Some(Vec::new()),
+            _ => name_parts(x).filter(|p| p.len() == 2),
+        }
+    };
+    let mut out = Vec::new();
+    for t in terms {
+        let t = trimmed(t);
+        let ops: Vec<usize> = (0..t.len()).filter(|&i| t[i].k == OP).collect();
+        let [op] = ops[..] else { continue };
+        if t[op].s != "=" {
+            continue;
+        }
+        if let (Some(l), Some(r)) = (side(&t[..op]), side(&t[op + 1..])) {
+            if !(l.is_empty() && r.is_empty()) {
+                out.push((l, r));
+            }
+        }
+    }
+    out
 }
 
 /// Unqualified column names in a condition: words that are not keywords,
