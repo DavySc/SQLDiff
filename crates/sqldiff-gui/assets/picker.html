@@ -1,0 +1,90 @@
+<!-- File picker, shared by home and runs: folder listings from GET /api/fs. -->
+<style>
+#picker { display: none; position: fixed; inset: 0; z-index: 10; background: rgba(15,17,21,.32); align-items: flex-start; justify-content: center; padding-top: 10vh; }
+#picker.on { display: flex; }
+#picker .box { width: min(640px, calc(100vw - 32px)); max-height: 76vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 16px 48px rgba(0,0,0,.25); overflow: hidden; }
+#picker .top { display: flex; gap: 6px; padding: 10px; border-bottom: 1px solid var(--line); }
+#picker .top input { flex: 1; }
+#pk-list { flex: 1; overflow: auto; padding: 4px; min-height: 160px; }
+#pk-list button { display: flex; width: 100%; gap: 8px; align-items: center; text-align: left; color: var(--fg); font-weight: 400; font-size: 13px; padding: 4px 8px; }
+#pk-list button svg { flex: none; color: var(--muted); }
+#pk-list button.file { color: var(--muted); }
+#pk-list button.file.sql { color: var(--fg); }
+#pk-list .note { padding: 8px; color: var(--muted); font-size: 12.5px; }
+#picker .bottom { display: flex; gap: 8px; align-items: center; padding: 10px; border-top: 1px solid var(--line); }
+#pk-roots { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
+#pk-roots button { font-family: var(--mono); font-size: 11.5px; }
+</style>
+<div id="picker" role="dialog" aria-modal="true" aria-label="Pick a file or folder"><div class="box">
+  <div class="top"><button type="button" id="pk-up" title="Parent folder (Backspace)" aria-label="Parent folder">↑</button><input type="text" id="pk-path" aria-label="Folder" spellcheck="false"></div>
+  <div id="pk-list" role="listbox" aria-label="Folder contents"></div>
+  <div class="bottom"><span id="pk-roots"></span><button type="button" id="pk-cancel">Cancel</button><button type="button" class="primary" id="pk-use">Use this folder</button></div>
+</div></div>
+<script>
+(() => {
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const ICON_DIR = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5a1 1 0 0 1 1-1h4.6l2 2h8.4a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/></svg>`;
+const ICON_FILE = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 3.5h7l4 4v13h-11z M13.5 3.5v4h4"/></svg>`;
+const pk = { target: null, next: null, path: "", parent: null };
+async function browse(p) {
+  let l;
+  try {
+    const res = await fetch("/api/fs?path=" + encodeURIComponent(p));
+    if (!res.ok) throw new Error(await res.text());
+    l = await res.json();
+  } catch (e) {
+    $("pk-list").innerHTML = `<div class="note">${esc(e.message)}</div>`;
+    return;
+  }
+  pk.path = l.path; pk.parent = l.parent;
+  $("pk-path").value = l.path;
+  $("pk-up").disabled = !l.parent;
+  $("pk-roots").innerHTML = l.roots.map((r) => `<button type="button" data-go="${esc(r.path)}" title="${esc(r.path)}">${esc(r.label)}</button>`).join("");
+  const sql = (n) => /\.sql$/i.test(n);
+  $("pk-list").innerHTML = (l.entries.length ? l.entries.map((e, i) =>
+    `<button type="button" role="option" class="${e.dir ? "dir" : "file" + (sql(e.name) ? " sql" : "")}" data-i="${i}">${e.dir ? ICON_DIR : ICON_FILE}${esc(e.name)}</button>`).join("")
+    : `<div class="note">This folder is empty.</div>`) + (l.truncated ? `<div class="note">Only the first ${l.entries.length} entries are listed.</div>` : "");
+  $("pk-list").querySelectorAll("[data-i]").forEach((b) => b.addEventListener("click", () => {
+    const e = l.entries[+b.dataset.i];
+    const full = join(l.path, e.name);
+    if (e.dir) browse(full); else choose(full);
+  }));
+  $("pk-roots").querySelectorAll("[data-go]").forEach((b) => b.addEventListener("click", () => browse(b.dataset.go)));
+  $("pk-list").scrollTop = 0;
+}
+function join(dir, name) {
+  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir.endsWith(sep) ? dir + name : dir + sep + name;
+}
+function choose(p) {
+  const t = $(pk.target);
+  t.value = p;
+  t.dispatchEvent(new Event("change", { bubbles: true }));
+  closePicker();
+  const next = pk.next && $(pk.next);
+  if (next) next.focus();
+}
+// A Browse button names its input (data-browse), where to start when that
+// input is empty (data-near: another input) and what to focus after (data-next).
+function openPicker(b) {
+  pk.target = b.dataset.browse; pk.next = b.dataset.next || null;
+  $("picker").classList.add("on");
+  const near = b.dataset.near && $(b.dataset.near);
+  browse($(pk.target).value.trim() || (near ? near.value.trim() : ""));
+  $("pk-path").focus();
+}
+function closePicker() { $("picker").classList.remove("on"); if (pk.target) $(pk.target).focus(); }
+document.querySelectorAll("[data-browse]").forEach((b) => b.addEventListener("click", () => openPicker(b)));
+$("pk-up").addEventListener("click", () => pk.parent && browse(pk.parent));
+$("pk-use").addEventListener("click", () => choose(pk.path));
+$("pk-cancel").addEventListener("click", closePicker);
+$("pk-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); browse($("pk-path").value); } });
+$("picker").addEventListener("click", (e) => { if (e.target === $("picker")) closePicker(); });
+document.addEventListener("keydown", (e) => {
+  if (!$("picker").classList.contains("on")) return;
+  if (e.key === "Escape") { e.preventDefault(); closePicker(); }
+  if (e.key === "Backspace" && document.activeElement !== $("pk-path") && pk.parent) { e.preventDefault(); browse(pk.parent); }
+});
+})();
+</script>

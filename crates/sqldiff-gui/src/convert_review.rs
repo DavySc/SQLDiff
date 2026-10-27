@@ -248,6 +248,24 @@ impl Review {
         Ok(Review { setup, loaded })
     }
 
+    /// A review of what `job::convert_into` just wrote: its conversion is
+    /// used again, unless a source or the ledger changed since.
+    pub fn open_converted(
+        setup: Setup,
+        written: sqldiff_convert::job::Written,
+    ) -> Result<Review, String> {
+        let prev = Loaded {
+            convert_ms: written.tree.report.totals.seconds * 1000.0,
+            unreadable: written.tree.report.unreadable.clone(),
+            inputs: written.inputs,
+            tree: written.tree,
+            written: written_texts(&setup.out)?,
+            ..empty()
+        };
+        let loaded = load(&setup, Some(prev))?;
+        Ok(Review { setup, loaded })
+    }
+
     /// What the review was opened on.
     pub fn setup(&self) -> &Setup {
         &self.setup

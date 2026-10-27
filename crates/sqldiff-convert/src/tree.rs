@@ -20,7 +20,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -294,6 +294,36 @@ pub fn read(a: &Args) -> Result<(Vec<Input>, Vec<String>), String> {
     Ok((inputs, unreadable))
 }
 
+/// What a caller watching a conversion gets: progress, and a way to stop it.
+/// The default prints progress to stderr every 50 files, as the CLI shows it.
+#[derive(Default)]
+pub struct Hooks {
+    /// Called after each check (a file, or a routine's paired templates)
+    /// with the number checked so far and the total.
+    pub progress: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    /// Once set, checks not yet started are skipped and the conversion
+    /// fails with [`CANCELLED`]: a cancelled conversion has no report.
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+/// The error of a conversion stopped through [`Hooks::cancel`].
+pub const CANCELLED: &str = "cancelled";
+
+impl Hooks {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn stop_if_cancelled(&self) -> Result<(), String> {
+        match self.cancelled() {
+            true => Err(CANCELLED.to_string()),
+            false => Ok(()),
+        }
+    }
+}
+
 /// Converts and checks `inputs` (read by `read`, or given directly) and
 /// builds the report. Writes nothing; `out` only labels the report.
 pub fn convert(
@@ -301,6 +331,17 @@ pub fn convert(
     inputs: &[Input],
     unreadable: Vec<String>,
     out: Option<&Path>,
+) -> Result<Tree, String> {
+    convert_with(a, inputs, unreadable, out, &Hooks::default())
+}
+
+/// [`convert`], reporting progress to `hooks` and stopping when they say so.
+pub fn convert_with(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: Option<&Path>,
+    hooks: &Hooks,
 ) -> Result<Tree, String> {
     let started = Instant::now();
     if !crate::supported(a.from, a.to) {
@@ -327,8 +368,8 @@ pub fn convert(
     };
     let ledger = ledger.as_ref();
     let results = match &a.template {
-        None => convert_files(a, label, inputs, jobs, ledger),
-        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger)?,
+        None => convert_files(a, label, inputs, jobs, ledger, hooks)?,
+        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger, hooks)?,
     };
     let mut files = Vec::new();
     let mut outputs = Vec::new();
@@ -443,7 +484,8 @@ fn convert_files(
     inputs: &[Input],
     jobs: usize,
     ledger: Option<&crate::review::Ledger>,
-) -> Vec<(Conversion, f64)> {
+    hooks: &Hooks,
+) -> Result<Vec<(Conversion, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
     let source = (!a.no_catalog).then(|| {
@@ -479,15 +521,22 @@ fn convert_files(
         ))];
     }
     // Pass 2: check every draft.
+    hooks.stop_if_cancelled()?;
     let work = slots(inputs.iter().zip(drafts));
-    let progress = Progress::new(work.len());
-    parallel(jobs, &work, |w| {
+    let progress = Progress::new(work.len(), hooks);
+    let done = parallel(jobs, &work, |w| {
         let (input, draft) = w.lock().unwrap().take().unwrap();
+        if hooks.cancelled() {
+            return None;
+        }
         let t = Instant::now();
         let c = crate::check(&input.text, draft, &opts);
         progress.tick();
-        (c, t.elapsed().as_secs_f64())
-    })
+        Some((c, t.elapsed().as_secs_f64()))
+    });
+    done.into_iter()
+        .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
+        .collect()
 }
 
 /// Reads the review ledger in `out`, if there is one.
@@ -705,6 +754,7 @@ fn convert_templates(
     inputs: &[Input],
     jobs: usize,
     ledger: Option<&crate::review::Ledger>,
+    hooks: &Hooks,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
     for i in inputs {
@@ -826,16 +876,24 @@ fn convert_templates(
             stem,
         ))];
     }
+    hooks.stop_if_cancelled()?;
     let work = slots(jobs_list.iter().zip(drafts));
-    let progress = Progress::new(work.len());
+    let progress = Progress::new(work.len(), hooks);
     let delimiters = tm.placeholders.delimiters();
     let done = parallel(jobs, &work, |w| {
         let (j, draft) = w.lock().unwrap().take().unwrap();
+        if hooks.cancelled() {
+            return None;
+        }
         let t0 = Instant::now();
         let c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
         progress.tick();
-        (c, t0.elapsed().as_secs_f64())
+        Some((c, t0.elapsed().as_secs_f64()))
     });
+    let done: Vec<(Conversion, f64)> = done
+        .into_iter()
+        .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
+        .collect::<Result<_, _>>()?;
     let mut out: Vec<Option<(Conversion, f64)>> = (0..inputs.len()).map(|_| None).collect();
     for (j, (c, secs)) in jobs_list.iter().zip(done) {
         match j.target {
@@ -879,23 +937,27 @@ fn slots<T>(items: impl Iterator<Item = T>) -> Vec<std::sync::Mutex<Option<T>>> 
     items.map(|w| std::sync::Mutex::new(Some(w))).collect()
 }
 
-struct Progress {
+struct Progress<'h> {
     done: AtomicUsize,
     total: usize,
+    hooks: &'h Hooks,
 }
 
-impl Progress {
-    fn new(total: usize) -> Progress {
+impl<'h> Progress<'h> {
+    fn new(total: usize, hooks: &'h Hooks) -> Progress<'h> {
         Progress {
             done: AtomicUsize::new(0),
             total,
+            hooks,
         }
     }
 
     fn tick(&self) {
         let n = self.done.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % 50 == 0 || n == self.total {
-            eprintln!("checked {n}/{}", self.total);
+        match &self.hooks.progress {
+            Some(f) => f(n, self.total),
+            None if n % 50 == 0 || n == self.total => eprintln!("checked {n}/{}", self.total),
+            None => {}
         }
     }
 }

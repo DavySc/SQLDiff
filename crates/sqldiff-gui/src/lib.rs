@@ -21,6 +21,7 @@ pub mod convert;
 pub mod convert_review;
 pub mod report;
 pub mod review;
+pub mod runs;
 pub mod server;
 pub mod session;
 

@@ -61,20 +61,6 @@ input[type=text]:focus, select:focus { outline: none; border-color: var(--focus)
 .recent button { text-align: left; font-family: var(--mono); font-size: 12px; font-weight: 400; color: var(--fg); padding: 4px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recent button span { color: var(--faint); font-family: inherit; }
 
-#picker { display: none; position: fixed; inset: 0; z-index: 10; background: rgba(15,17,21,.32); align-items: flex-start; justify-content: center; padding-top: 10vh; }
-#picker.on { display: flex; }
-#picker .box { width: min(640px, calc(100vw - 32px)); max-height: 76vh; display: flex; flex-direction: column; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 16px 48px rgba(0,0,0,.25); overflow: hidden; }
-#picker .top { display: flex; gap: 6px; padding: 10px; border-bottom: 1px solid var(--line); }
-#picker .top input { flex: 1; }
-#pk-list { flex: 1; overflow: auto; padding: 4px; min-height: 160px; }
-#pk-list button { display: flex; width: 100%; gap: 8px; align-items: center; text-align: left; color: var(--fg); font-weight: 400; font-size: 13px; padding: 4px 8px; }
-#pk-list button svg { flex: none; color: var(--muted); }
-#pk-list button.file { color: var(--muted); }
-#pk-list button.file.sql { color: var(--fg); }
-#pk-list .note { padding: 8px; color: var(--muted); font-size: 12.5px; }
-#picker .bottom { display: flex; gap: 8px; align-items: center; padding: 10px; border-top: 1px solid var(--line); }
-#pk-roots { display: flex; gap: 4px; flex-wrap: wrap; flex: 1; }
-#pk-roots button { font-family: var(--mono); font-size: 11.5px; }
 </style>
 </head>
 <body>
@@ -88,18 +74,13 @@ input[type=text]:focus, select:focus { outline: none; border-color: var(--focus)
   <div id="opened"></div>
   <h2 style="margin-top:8px" id="cmp-h">Compare files or folders</h2>
   <form class="form" id="cmp" autocomplete="off">
-    <div class="side"><b>A</b><input type="text" id="cmp-a" placeholder="Old version, or the source dialect" aria-label="Side A: a file or folder" spellcheck="false"><button type="button" class="outline" data-browse="cmp-a">Browse…</button><select id="cmp-da" aria-label="Dialect of side A"></select></div>
-    <div class="side"><b>B</b><input type="text" id="cmp-b" placeholder="New version, or the target dialect" aria-label="Side B: a file or folder" spellcheck="false"><button type="button" class="outline" data-browse="cmp-b">Browse…</button><select id="cmp-db" aria-label="Dialect of side B"></select></div>
+    <div class="side"><b>A</b><input type="text" id="cmp-a" placeholder="Old version, or the source dialect" aria-label="Side A: a file or folder" spellcheck="false"><button type="button" class="outline" data-browse="cmp-a" data-near="cmp-b" data-next="cmp-b">Browse…</button><select id="cmp-da" aria-label="Dialect of side A"></select></div>
+    <div class="side"><b>B</b><input type="text" id="cmp-b" placeholder="New version, or the target dialect" aria-label="Side B: a file or folder" spellcheck="false"><button type="button" class="outline" data-browse="cmp-b" data-near="cmp-a" data-next="cmp-go">Browse…</button><select id="cmp-db" aria-label="Dialect of side B"></select></div>
     <div class="acts"><span id="cmp-err" role="alert"></span><button type="submit" class="primary" id="cmp-go">Compare</button></div>
     <div class="recent" id="recent" hidden></div>
   </form>
   <div id="more"></div>
 </div></main>
-<div id="picker" role="dialog" aria-modal="true" aria-label="Pick a file or folder"><div class="box">
-  <div class="top"><button type="button" id="pk-up" title="Parent folder (Backspace)" aria-label="Parent folder">↑</button><input type="text" id="pk-path" aria-label="Folder" spellcheck="false"></div>
-  <div id="pk-list" role="listbox" aria-label="Folder contents"></div>
-  <div class="bottom"><span id="pk-roots"></span><button type="button" id="pk-cancel">Cancel</button><button type="button" class="primary" id="pk-use">Use this folder</button></div>
-</div></div>
 <script>
 const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -108,8 +89,6 @@ const short = (p) => { const parts = p.split(/[\\/]/).filter(Boolean); return pa
 const path = (p) => `<span class="path">${esc(p)}</span>`;
 
 const $ = (id) => document.getElementById(id);
-const ICON_DIR = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5a1 1 0 0 1 1-1h4.6l2 2h8.4a1 1 0 0 1 1 1v9.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/></svg>`;
-const ICON_FILE = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><path d="M6.5 3.5h7l4 4v13h-11z M13.5 3.5v4h4"/></svg>`;
 
 function card(href, title, sub, go) {
   return `<a class="card" href="${href}"><span class="t">${title}</span><span class="go">${go} →</span><span class="s">${sub}</span></a>`;
@@ -129,6 +108,7 @@ function render(d) {
   if (r) open.push(card("/review", `Review ${esc(r.from)} → ${esc(r.to)}`, `${path(r.src)} converted into ${path(r.out)}`, "Open"));
   open.push(card("/convert", `Convert ${esc(c.from)} → ${esc(c.to)}`,
     (c.name ? path(c.name) : "Type or paste SQL and see it converted and checked as you type") + (c.template ? " · template" : ""), "Open"));
+  open.push(card("/runs", "Convert a tree", "Into an output folder, checked file by file, then review what needs a person", "Start"));
   $("opened").innerHTML = `<div style="display:grid;gap:10px"><h2>Open</h2>${open.join("")}</div>`;
   $("cmp-h").textContent = cmp ? "Compare something else" : "Compare files or folders";
   if (d.no_picking) {
@@ -171,64 +151,8 @@ async function openCompare() {
 }
 $("cmp").addEventListener("submit", (e) => { e.preventDefault(); openCompare(); });
 
-// ---------- picker ----------
-const pk = { target: null, path: "", parent: null };
-async function browse(p) {
-  let l;
-  try {
-    const res = await fetch("/api/fs?path=" + encodeURIComponent(p));
-    if (!res.ok) throw new Error(await res.text());
-    l = await res.json();
-  } catch (e) {
-    $("pk-list").innerHTML = `<div class="note">${esc(e.message)}</div>`;
-    return;
-  }
-  pk.path = l.path; pk.parent = l.parent;
-  $("pk-path").value = l.path;
-  $("pk-up").disabled = !l.parent;
-  $("pk-roots").innerHTML = l.roots.map((r) => `<button type="button" data-go="${esc(r.path)}" title="${esc(r.path)}">${esc(r.label)}</button>`).join("");
-  const sql = (n) => /\.sql$/i.test(n);
-  $("pk-list").innerHTML = (l.entries.length ? l.entries.map((e, i) =>
-    `<button type="button" role="option" class="${e.dir ? "dir" : "file" + (sql(e.name) ? " sql" : "")}" data-i="${i}">${e.dir ? ICON_DIR : ICON_FILE}${esc(e.name)}</button>`).join("")
-    : `<div class="note">This folder is empty.</div>`) + (l.truncated ? `<div class="note">Only the first ${l.entries.length} entries are listed.</div>` : "");
-  $("pk-list").querySelectorAll("[data-i]").forEach((b) => b.addEventListener("click", () => {
-    const e = l.entries[+b.dataset.i];
-    const full = join(l.path, e.name);
-    if (e.dir) browse(full); else choose(full);
-  }));
-  $("pk-roots").querySelectorAll("[data-go]").forEach((b) => b.addEventListener("click", () => browse(b.dataset.go)));
-  $("pk-list").scrollTop = 0;
-}
-function join(dir, name) {
-  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
-  return dir.endsWith(sep) ? dir + name : dir + sep + name;
-}
-function choose(p) {
-  $(pk.target).value = p;
-  closePicker();
-  const other = pk.target === "cmp-a" ? "cmp-b" : "cmp-a";
-  $(other).value ? $("cmp-go").focus() : $(other).focus();
-}
-function openPicker(target) {
-  pk.target = target;
-  $("picker").classList.add("on");
-  const cur = $(target).value.trim() || $(target === "cmp-a" ? "cmp-b" : "cmp-a").value.trim();
-  browse(cur);
-  $("pk-path").focus();
-}
-function closePicker() { $("picker").classList.remove("on"); if (pk.target) $(pk.target).focus(); }
-document.querySelectorAll("[data-browse]").forEach((b) => b.addEventListener("click", () => openPicker(b.dataset.browse)));
-$("pk-up").addEventListener("click", () => pk.parent && browse(pk.parent));
-$("pk-use").addEventListener("click", () => choose(pk.path));
-$("pk-cancel").addEventListener("click", closePicker);
-$("pk-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); browse($("pk-path").value); } });
-$("picker").addEventListener("click", (e) => { if (e.target === $("picker")) closePicker(); });
-document.addEventListener("keydown", (e) => {
-  if (!$("picker").classList.contains("on")) return;
-  if (e.key === "Escape") { e.preventDefault(); closePicker(); }
-  if (e.key === "Backspace" && document.activeElement !== $("pk-path") && pk.parent) { e.preventDefault(); browse(pk.parent); }
-});
 render(INITIAL);
 </script>
+<!--__SQLDIFF_PICKER__-->
 </body>
 </html>

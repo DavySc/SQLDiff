@@ -149,6 +149,7 @@ fn every_view_is_served_by_one_server_behind_the_rail() {
     let addr = start(app(Some(session(&d)), Some(review(&d))));
     for (path, base) in [
         ("/", None),
+        ("/runs", None),
         ("/convert", None),
         ("/compare", Some("/compare")),
         ("/review", Some("/review")),
@@ -156,7 +157,11 @@ fn every_view_is_served_by_one_server_behind_the_rail() {
         let (status, html) = get(addr, path);
         assert_eq!(status, "HTTP/1.1 200 OK", "{path}");
         let (links, on) = rail(&html);
-        assert_eq!(links, ["/", "/compare", "/convert", "/review"], "{path}");
+        assert_eq!(
+            links,
+            ["/", "/runs", "/compare", "/convert", "/review"],
+            "{path}"
+        );
         assert_eq!(on, path);
         assert!(!html.contains("<!--__SQLDIFF_SHELL__-->"), "{path}");
         if let Some(base) = base {
@@ -203,7 +208,7 @@ fn a_view_with_nothing_open_is_not_a_link_and_shows_home() {
     let addr = start(app(None, None));
     let (_, html) = get(addr, "/convert");
     let (links, on) = rail(&html);
-    assert_eq!(links, ["/", "/convert"]);
+    assert_eq!(links, ["/", "/runs", "/convert"]);
     assert_eq!(on, "/convert");
     assert!(html.contains(r#"<span class="off" title="Compare two files or folders: nothing open"#));
     let (status, html) = get(addr, "/review");
@@ -313,13 +318,16 @@ fn a_comparison_opened_from_home_replaces_the_session_and_is_remembered() {
     ] {
         assert_eq!(open(body.clone()).0, "HTTP/1.1 400 Bad Request", "{body}");
     }
-    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/convert"]);
+    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/runs", "/convert"]);
 
     let (status, body) =
         open(serde_json::json!({ "a": a, "b": b, "dialect_a": "tsql", "dialect_b": "tsql" }));
     assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
     assert_eq!(body, r#"{"open":"/compare"}"#);
-    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/compare", "/convert"]);
+    assert_eq!(
+        rail(&get(addr, "/").1).0,
+        ["/", "/runs", "/compare", "/convert"]
+    );
     let (_, pair) = get(addr, "/compare/api/pair/0");
     assert!(pair.contains(r#""verdict":"different""#), "{pair}");
 
@@ -359,12 +367,19 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         request(addr, "POST", "/api/open/compare", &open).0,
         "HTTP/1.1 403 Forbidden"
     );
-    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/convert"]);
+    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/runs", "/convert"]);
     let (_, home) = get(addr, "/");
     assert!(
-        home.contains(r#""no_picking":"picking files works only"#),
+        home.contains(r#""no_picking":"picking files and starting runs work only"#),
         "{home}"
     );
+    let run =
+        serde_json::json!({ "src": d.0, "out": d.0.join("out"), "from": "tsql", "to": "postgres" });
+    assert_eq!(
+        request(addr, "POST", "/api/runs", &run.to_string()).0,
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert!(!d.0.join("out").exists());
     // On loopback the same requests are answered.
     let addr = start(app(None, None));
     assert_eq!(
@@ -372,4 +387,134 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         "HTTP/1.1 200 OK"
     );
     assert!(get(addr, "/").1.contains(r#""no_picking":null"#));
+}
+
+/// Run `id` as `/api/runs` lists it, once it has stopped running.
+fn finished(addr: SocketAddr, id: u64) -> serde_json::Value {
+    for _ in 0..600 {
+        let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+        let run = runs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .cloned()
+            .expect("listed");
+        if run["state"] != "running" {
+            return run;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("run {id} still running after a minute");
+}
+
+#[test]
+fn a_run_converts_a_tree_and_opens_its_own_review() {
+    let d = Dir::new("run");
+    d.write("src/a.sql", "CREATE TABLE t (a int NOT NULL);\n");
+    d.write(
+        "src/sub/p.sql",
+        "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n",
+    );
+    let addr = start(app(None, None));
+    let (status, html) = get(addr, "/runs");
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(html.contains(r#""runs":[]"#), "{html}");
+    assert!(!html.contains("<!--__SQLDIFF_PICKER__-->"));
+    let spec = serde_json::json!({
+        "src": d.0.join("src"),
+        "out": d.0.join("out"),
+        "from": "tsql",
+        "to": "postgres",
+    });
+    let (status, body) = request(addr, "POST", "/api/runs", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let run = finished(addr, id);
+    assert_eq!(run["state"], "done", "{run}");
+    assert_eq!(run["kind"], "convert");
+    assert_eq!(
+        (run["checked"].as_u64(), run["total"].as_u64()),
+        (Some(2), Some(2)),
+        "{run}"
+    );
+    assert_eq!(run["totals"]["files"], 2, "{run}");
+    // What was written is what the command writes: the files and the reports.
+    for f in [
+        "a.sql",
+        "sub/p.sql",
+        "conversion-report.json",
+        "review-queue.json",
+    ] {
+        assert!(d.0.join("out").join(f).is_file(), "{f}");
+    }
+
+    // The run's review is mounted under the run and is where Review leads.
+    let review = format!("/runs/{id}/review");
+    let (status, html) = get(addr, &review);
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert_eq!(rail(&html).1, review);
+    assert!(html.contains(&format!(r#"const BASE = /*__SQLDIFF_BASE__*/"{review}";"#)));
+    let (status, state) = get(addr, &format!("{review}/api/state"));
+    assert_eq!(status, "HTTP/1.1 200 OK", "{state}");
+    assert!(state.contains(r#""ledger_path""#), "{state}");
+    assert!(rail(&get(addr, "/").1).0.contains(&review));
+
+    // A second run into the folder that is no longer empty fails and changes nothing.
+    let before = std::fs::read(d.0.join("out/a.sql")).unwrap();
+    let (status, body) = request(addr, "POST", "/api/runs", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let id2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let run = finished(addr, id2);
+    assert_eq!(run["state"], "failed", "{run}");
+    assert!(
+        run["error"].as_str().unwrap().contains("not empty"),
+        "{run}"
+    );
+    assert_eq!(std::fs::read(d.0.join("out/a.sql")).unwrap(), before);
+    assert_eq!(
+        get(addr, &format!("/runs/{id2}/review")).0,
+        "HTTP/1.1 404 Not Found"
+    );
+    // Newest first.
+    let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+    assert_eq!(runs[0]["id"], id2);
+    assert_eq!(runs[1]["id"], id);
+}
+
+#[test]
+fn runs_that_cannot_start_are_refused() {
+    let d = Dir::new("refused");
+    d.write("src/a.sql", "SELECT 1;\n");
+    let addr = start(app(None, None));
+    let out = d.0.join("out");
+    let spec = |src: serde_json::Value, from: &str, to: &str| {
+        serde_json::json!({ "src": src, "out": out, "from": from, "to": to }).to_string()
+    };
+    let src = serde_json::json!(d.0.join("src"));
+    for (body, says) in [
+        (spec(src.clone(), "oracle", "postgres"), "unknown dialect"),
+        (spec(src.clone(), "postgres", "tsql"), "no conversion rules"),
+        (spec(serde_json::json!(d.0.join("gone")), "tsql", "postgres"), "not found"),
+        (spec(serde_json::json!(" "), "tsql", "postgres"), "give a source"),
+        (
+            serde_json::json!({ "src": src, "out": out, "from": "tsql", "to": "postgres", "jobs": 2 })
+                .to_string(),
+            "jobs",
+        ),
+    ] {
+        let (status, text) = request(addr, "POST", "/api/runs", &body);
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
+        assert!(text.contains(says), "{body}: {text}");
+    }
+    assert_eq!(get(addr, "/api/runs").1, "[]");
+    assert!(!out.exists());
+    assert_eq!(
+        request(addr, "POST", "/runs/7/cancel", "{}").0,
+        "HTTP/1.1 404 Not Found"
+    );
 }

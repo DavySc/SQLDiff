@@ -4,22 +4,29 @@
 //! - `GET /api/fs?path=`: a folder listing for the file picker (see `browse`)
 //! - `POST /api/open/compare` `{"a", "b", "dialect_a"?, "dialect_b"?}`: open
 //!   (or replace) the compare session on two files or two folders
-//!
-//! The last two answer only when the server is bound to a loopback address:
-//! bound to a network address (`--host`), anyone who can reach it could
-//! otherwise browse the disk and read any file through a comparison.
+//! - `GET /runs`, `GET /api/runs`: runs started from the app (see `runs`)
+//! - `POST /api/runs` `{"src", "out", "from", "to", "overwrite"?}`: convert a
+//!   tree into an output folder, as `sqldiff convert` does
+//! - `POST /runs/N/cancel`: stop run N before it writes anything
+//! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /convert`, `POST /api/convert`, `POST /api/compare`: convert mode
 //!   (see `convert`)
 //! - `GET /compare`, `/compare/api/...`: the pair view or tree queue of a
 //!   session (see `server`)
-//! - `GET /review`, `/review/api/...`: a converted tree's review queue (see
+//! - `GET /review`, `/review/api/...`: the review the app was started on (see
 //!   `convert_review`)
+//!
+//! Picking files, opening a comparison and starting a run answer only when
+//! the server is bound to a loopback address: bound to a network address
+//! (`--host`), anyone who can reach it could otherwise browse the disk, read
+//! any file through a comparison or write a conversion anywhere.
 //!
 //! Each view keeps its own page and API. The app mounts the API under the
 //! view's path, tells the page where (`BASE` in the page) and puts the rail in
 //! front of it. Requests pass the same checks as the single-view servers
 //! ([`crate::server::read_request`]): a loopback `Host`, and JSON POSTs from
-//! this server's own origin.
+//! this server's own origin. Every review has its own path, so a page never
+//! records a decision into another tree's ledger.
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -33,6 +40,7 @@ use sqldiff_source::Resolved;
 use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::review::Store;
+use crate::runs::{ConvertSpec, Runs};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -41,6 +49,12 @@ use crate::{browse, server};
 
 /// The home page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
 pub const HOME_HTML: &str = include_str!("../assets/home.html");
+
+/// The runs page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
+pub const RUNS_HTML: &str = include_str!("../assets/runs.html");
+
+/// The file picker, put into home and the runs page at `<!--__SQLDIFF_PICKER__-->`.
+const PICKER_HTML: &str = include_str!("../assets/picker.html");
 
 /// What the app serves: convert mode always, a compare session and a review
 /// when they were opened.
@@ -59,6 +73,7 @@ pub struct App {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Home,
+    Runs,
     Compare,
     Convert,
     Review,
@@ -70,6 +85,7 @@ impl View {
     pub fn path(self) -> &'static str {
         match self {
             View::Home => "/",
+            View::Runs => "/runs",
             View::Compare => "/compare",
             View::Convert => "/convert",
             View::Review => "/review",
@@ -82,6 +98,7 @@ struct Shared {
     /// Replaced when a comparison is opened from home.
     compare: Mutex<Option<Arc<Mutex<Session>>>>,
     review: Option<Mutex<Review>>,
+    runs: Runs,
     data_dir: Option<PathBuf>,
     isolated: bool,
     /// Bound to a loopback address: only then can files be picked.
@@ -89,8 +106,8 @@ struct Shared {
 }
 
 /// Why picking files is refused on a server bound to a network address.
-const NOT_LOCAL: &str = "picking files works only when the app listens on this computer alone \
-(127.0.0.1); start it without --host, or open comparisons with `sqldiff-gui serve A B`";
+const NOT_LOCAL: &str = "picking files and starting runs work only when the app listens on this \
+computer alone (127.0.0.1); start it without --host, or use the command line";
 
 impl Shared {
     fn compare(&self) -> Option<Arc<Mutex<Session>>> {
@@ -100,11 +117,20 @@ impl Shared {
             .clone()
     }
 
-    fn is_open(&self, v: View) -> bool {
+    /// Where the rail links a view to; `None` when nothing is open there.
+    /// Review goes to the review the app was started on, else to the latest
+    /// run's.
+    fn href(&self, v: View) -> Option<String> {
         match v {
-            View::Home | View::Convert => true,
-            View::Compare => self.compare().is_some(),
-            View::Review => self.review.is_some(),
+            View::Home | View::Runs | View::Convert => Some(v.path().to_string()),
+            View::Compare => self.compare().map(|_| v.path().to_string()),
+            View::Review if self.review.is_some() => Some(v.path().to_string()),
+            View::Review => self
+                .runs
+                .list()
+                .iter()
+                .find(|r| r.review().is_some())
+                .map(|r| run_review_path(r.id)),
         }
     }
 }
@@ -115,6 +141,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         convert: app.convert,
         compare: Mutex::new(app.compare.map(|s| Arc::new(Mutex::new(s)))),
         review: app.review.map(Mutex::new),
+        runs: Runs::default(),
         data_dir: app.data_dir,
         isolated: app.isolated,
         local,
@@ -133,7 +160,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
     Ok(())
 }
 
-fn handle(mut stream: TcpStream, app: &Shared, hosts: &[String]) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, app: &Arc<Shared>, hosts: &[String]) -> std::io::Result<()> {
     let req = match read_request(&stream, hosts)? {
         Ok(r) => r,
         Err(res) => return respond(&mut stream, res),
@@ -142,10 +169,20 @@ fn handle(mut stream: TcpStream, app: &Shared, hosts: &[String]) -> std::io::Res
     respond(&mut stream, res)
 }
 
-fn route(app: &Shared, req: Request) -> Response {
+fn run_review_path(id: u64) -> String {
+    format!("/runs/{id}/review")
+}
+
+fn route(app: &Arc<Shared>, req: Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => return page(app, View::Home, home(app)),
-        ("GET", "/api/fs") | ("POST", "/api/open/compare") if !app.local => {
+        ("GET", "/") => return page(app, View::Home, home(app), ""),
+        ("GET", "/runs") => return page(app, View::Runs, runs_page(app), ""),
+        ("GET", "/api/runs") => {
+            return json(&app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>())
+        }
+        ("GET", "/api/fs") | ("POST", "/api/open/compare") | ("POST", "/api/runs")
+            if !app.local =>
+        {
             return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string())
         }
         ("GET", "/api/fs") => {
@@ -163,10 +200,38 @@ fn route(app: &Shared, req: Request) -> Response {
                 Err(e) => bad(e),
             }
         }
+        ("POST", "/api/runs") => {
+            return match serde_json::from_slice::<ConvertSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start(spec, app.isolated, |_| {}))
+            {
+                Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            }
+        }
         _ => {}
     }
+    if let Some(rest) = req.path.strip_prefix("/runs/") {
+        let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let Some(run) = id.parse().ok().and_then(|id| app.runs.get(id)) else {
+            return not_found();
+        };
+        if req.method == "POST" && tail == "cancel" {
+            run.cancel();
+            return json(&run.view());
+        }
+        let prefix = run_review_path(run.id);
+        let (Some(sub), Some(review)) = (mount(&req, &prefix), run.review()) else {
+            return not_found();
+        };
+        let res = convert_review::route(&review, &sub);
+        return match sub.path == "/" {
+            true => framed(app, View::Review, res, &prefix),
+            false => res,
+        };
+    }
     if let Some(res) = convert::route(&app.convert, &req, View::Convert.path()) {
-        return framed(app, View::Convert, res);
+        return framed(app, View::Convert, res, "");
     }
     for view in [View::Compare, View::Review] {
         let Some(req) = mount(&req, view.path()) else {
@@ -180,10 +245,10 @@ fn route(app: &Shared, req: Request) -> Response {
             _ => app.review.as_ref().map(|r| convert_review::route(r, &req)),
         };
         return match res {
-            Some(res) if req.path == "/" => framed(app, view, res),
+            Some(res) if req.path == "/" => framed(app, view, res, view.path()),
             Some(res) => res,
             // Nothing open there: the page shows home, which says how to open it.
-            None if req.path == "/" && req.method == "GET" => page(app, View::Home, home(app)),
+            None if req.path == "/" && req.method == "GET" => page(app, View::Home, home(app), ""),
             None => not_found(),
         };
     }
@@ -207,39 +272,45 @@ fn mount(req: &Request, prefix: &str) -> Option<Request> {
     })
 }
 
-/// A view's page response with the rail in front and `BASE` set; other
-/// responses (API, errors) pass unchanged.
-fn framed(app: &Shared, view: View, res: Response) -> Response {
+/// A view's page response with the rail in front and `BASE` (where its API
+/// is mounted) set; other responses (API, errors) pass unchanged.
+fn framed(app: &Shared, view: View, res: Response, base: &str) -> Response {
     match res {
-        ("200 OK", ctype, html) if ctype.starts_with("text/html") => page(app, view, html),
+        ("200 OK", ctype, html) if ctype.starts_with("text/html") => page(app, view, html, base),
         other => other,
     }
 }
 
-fn page(app: &Shared, view: View, html: String) -> Response {
-    let base = match view {
-        View::Compare | View::Review => view.path(),
-        View::Home | View::Convert => "",
-    };
+fn page(app: &Shared, view: View, html: String, base: &str) -> Response {
     let html = html
         .replacen(
             "/*__SQLDIFF_BASE__*/\"\"",
             &format!("/*__SQLDIFF_BASE__*/\"{base}\""),
             1,
         )
-        .replacen("<!--__SQLDIFF_SHELL__-->", &rail(app, view), 1);
+        .replacen(
+            "<!--__SQLDIFF_SHELL__-->",
+            &rail(app, view, if base.is_empty() { view.path() } else { base }),
+            1,
+        );
     ("200 OK", "text/html; charset=utf-8", html)
 }
 
 /// The rail: one link per view, the current one marked; a view with nothing
 /// open is shown but not a link.
-fn rail(app: &Shared, current: View) -> String {
-    const ITEMS: [(View, &str, &str, &str); 4] = [
+fn rail(app: &Shared, current: View, here: &str) -> String {
+    const ITEMS: [(View, &str, &str, &str); 5] = [
         (
             View::Home,
             "Home",
             "What is open",
             r#"<path d="M4 10.5 12 4l8 6.5V19a1 1 0 0 1-1 1h-4.5v-5.5h-5V20H5a1 1 0 0 1-1-1z"/>"#,
+        ),
+        (
+            View::Runs,
+            "Runs",
+            "Convert a tree into an output folder; runs and their progress",
+            r#"<circle cx="12" cy="12" r="8"/><path d="M10.5 9v6l5-3z"/>"#,
         ),
         (
             View::Compare,
@@ -268,14 +339,10 @@ fn rail(app: &Shared, current: View) -> String {
         );
         if view == current {
             s.push_str(&format!(
-                r#"<a class="on" href="{}" aria-current="page" title="{title}">{svg}</a>"#,
-                view.path()
+                r#"<a class="on" href="{here}" aria-current="page" title="{title}">{svg}</a>"#
             ));
-        } else if app.is_open(view) {
-            s.push_str(&format!(
-                r#"<a href="{}" title="{title}">{svg}</a>"#,
-                view.path()
-            ));
+        } else if let Some(href) = app.href(view) {
+            s.push_str(&format!(r#"<a href="{href}" title="{title}">{svg}</a>"#));
         } else {
             s.push_str(&format!(
                 r#"<span class="off" title="{title}: nothing open, see Home" aria-disabled="true">{svg}</span>"#
@@ -381,10 +448,12 @@ fn home(app: &Shared) -> String {
     let json = serde_json::to_string(&payload)
         .unwrap()
         .replace("</", "<\\/");
-    HOME_HTML.replace(
-        "/*__SQLDIFF_PAYLOAD__*/null",
-        &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
-    )
+    HOME_HTML
+        .replace(
+            "/*__SQLDIFF_PAYLOAD__*/null",
+            &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
+        )
+        .replace("<!--__SQLDIFF_PICKER__-->", PICKER_HTML)
 }
 
 #[derive(Deserialize)]
@@ -501,4 +570,27 @@ fn remember(data_dir: &Path, r: Recent) {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(file, serde_json::to_string_pretty(&list).unwrap() + "\n");
+}
+
+fn runs_page(app: &Shared) -> String {
+    let payload = serde_json::json!({
+        "runs": app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>(),
+        "dialects": Dialect::ALL.iter().map(|d| (d.id(), d.display_name())).collect::<Vec<_>>(),
+        "with_rules": Dialect::ALL
+            .iter()
+            .flat_map(|&f| Dialect::ALL.iter().map(move |&t| (f, t)))
+            .filter(|&(f, t)| sqldiff_convert::supported(f, t))
+            .map(|(f, t)| (f.id(), t.id()))
+            .collect::<Vec<_>>(),
+        "no_picking": (!app.local).then_some(NOT_LOCAL),
+    });
+    let json = serde_json::to_string(&payload)
+        .unwrap()
+        .replace("</", "<\\/");
+    RUNS_HTML
+        .replace(
+            "/*__SQLDIFF_PAYLOAD__*/null",
+            &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
+        )
+        .replace("<!--__SQLDIFF_PICKER__-->", PICKER_HTML)
 }
