@@ -40,7 +40,13 @@ Some gaps keep their exact shape:
 - the gap between two string literals: PostgreSQL joins `'a'` and `'b'`
   into one constant when a line break separates them;
 - gaps that hold anything other than spaces, tabs and line breaks;
-- statements the parser could not read;
+- every top-level statement the parser reports a problem in;
+- script-client lines: a line starting with `\` (psql meta-commands such
+  as `\set`, `\if`, `\echo ... \quit`, which psql reads case sensitively
+  to the end of the line) and, in T-SQL, a line starting with `:` (sqlcmd
+  `:setvar`, `:r`);
+- the data rows after `COPY ... FROM STDIN;`, up to the line holding only
+  `\.` (tab-separated values, as pg_dump writes them);
 - PostgreSQL routine bodies between dollar quotes, unless `postgres_bodies`
   is on: the server stores the body text exactly as written.
 

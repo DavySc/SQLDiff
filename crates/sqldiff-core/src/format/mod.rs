@@ -320,7 +320,7 @@ const ROUNDS: usize = 8;
 pub fn format(text: &str, dialect: Dialect, opts: &FormatOptions) -> Formatted {
     let parsed = parse(text, dialect);
     let root = parsed.syntax();
-    let lay = layout::collect(text, &root, opts);
+    let lay = layout::collect(text, &root, &parsed.diagnostics, dialect, opts);
     let keywords = layout::keyword_set(text, &lay.toks, dialect);
     let lines = LineIndex::new(text);
     let mut reverted: BTreeMap<usize, String> = BTreeMap::new();
@@ -376,7 +376,7 @@ fn unchanged(text: &str, lines: &LineIndex, reason: String) -> Formatted {
         kept: vec![Kept {
             start_line: 1,
             end_line: lines.line_col(text.len().saturating_sub(1)).0,
-            reason: format!("whole file kept as written: {reason}"),
+            reason: format!("the whole file, because {reason}"),
         }],
     }
 }

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxKind::*, SyntaxNode};
+use sqldiff_syntax::{Diagnostic, Dialect, SyntaxElement, SyntaxKind, SyntaxKind::*, SyntaxNode};
 
 use super::keywords::recasable;
 use super::{FormatOptions, IndentStyle, KeywordCase};
@@ -39,6 +39,8 @@ pub(super) struct Tok {
     pub brk: Brk,
     /// The whitespace before the token and its text are kept as written.
     pub verbatim: bool,
+    /// Only the whitespace before the token is kept as written.
+    pub gap_kept: bool,
     /// Index of the top-level statement the token belongs to.
     pub top: Option<usize>,
 }
@@ -65,7 +67,13 @@ struct Collector<'a> {
     bases: Vec<usize>,
 }
 
-pub(super) fn collect(text: &str, root: &SyntaxNode, opts: &FormatOptions) -> Layout {
+pub(super) fn collect(
+    text: &str,
+    root: &SyntaxNode,
+    diagnostics: &[Diagnostic],
+    dialect: Dialect,
+    opts: &FormatOptions,
+) -> Layout {
     let mut c = Collector {
         opts,
         text,
@@ -76,6 +84,7 @@ pub(super) fn collect(text: &str, root: &SyntaxNode, opts: &FormatOptions) -> La
         bases: vec![0],
     };
     c.file(root);
+    protect(text, &mut c.toks, &c.tops, diagnostics, dialect);
     Layout {
         toks: c.toks,
         tops: c.tops,
@@ -116,6 +125,7 @@ impl Collector<'_> {
             depth: self.depth.saturating_sub(base),
             brk: Brk::None,
             verbatim: false,
+            gap_kept: false,
             top: self.top,
         });
         if kind == L_PAREN {
@@ -388,6 +398,94 @@ impl Collector<'_> {
     }
 }
 
+/// Text the lexer reads as SQL but that is not: script-client lines and
+/// inline data. These regions, and the line break that ends them, stay
+/// exactly as written; so does every top-level statement the parser
+/// reported a problem in.
+///
+/// - A line starting with `\` is a psql meta-command (`\set`, `\if`,
+///   `\echo ... \quit`); psql reads it to the end of the line, case
+///   sensitively.
+/// - In T-SQL a line starting with `:` is a sqlcmd command (`:setvar`, `:r`).
+/// - After `COPY ... FROM STDIN;` the lines up to one holding only `\.` are
+///   data rows, with tabs between the columns.
+fn protect(
+    text: &str,
+    toks: &mut [Tok],
+    tops: &[(usize, usize)],
+    diagnostics: &[Diagnostic],
+    dialect: Dialect,
+) {
+    let line_start = |off: usize| text[..off].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = |off: usize| text[off..].find('\n').map_or(text.len(), |i| off + i);
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    for (i, t) in toks.iter().enumerate() {
+        let at_line_start = text[line_start(t.start)..t.start]
+            .chars()
+            .all(|c| c == ' ' || c == '\t');
+        let rest = &text[t.start..];
+        if at_line_start
+            && (rest.starts_with('\\') || (dialect == Dialect::Tsql && rest.starts_with(':')))
+        {
+            regions.push((t.start, line_end(t.start)));
+        }
+        if t.kind == IDENT && text[t.start..t.end].eq_ignore_ascii_case("COPY") {
+            if let Some(end) = copy_data(text, toks, i) {
+                regions.push(end);
+            }
+        }
+    }
+    for d in diagnostics {
+        if let Some(&(s, e)) = tops.iter().find(|(s, e)| *s <= d.offset && d.offset < *e) {
+            regions.push((s, e));
+        }
+    }
+    for (s, e) in regions {
+        for t in toks.iter_mut() {
+            if t.start >= s && t.start < e {
+                t.verbatim = true;
+            }
+        }
+        // The line break that ends the region.
+        if let Some(t) = toks.iter_mut().find(|t| t.start >= e) {
+            t.gap_kept = true;
+        }
+    }
+}
+
+/// The data rows after `COPY ... FROM STDIN;` starting at token `i`: from
+/// the end of the statement through the `\.` line, or to the end of the
+/// input without one.
+fn copy_data(text: &str, toks: &[Tok], i: usize) -> Option<(usize, usize)> {
+    let mut stdin = false;
+    let mut prev_from = false;
+    for t in &toks[i + 1..] {
+        if t.kind == SEMICOLON {
+            if !stdin {
+                return None;
+            }
+            let start = t.end;
+            let mut off = text[start..].find('\n').map(|k| start + k + 1)?;
+            while off < text.len() {
+                let end = text[off..].find('\n').map_or(text.len(), |k| off + k);
+                if text[off..end].trim_end_matches('\r') == "\\." {
+                    return Some((start, end));
+                }
+                off = end + 1;
+            }
+            return Some((start, text.len()));
+        }
+        let w = &text[t.start..t.end];
+        if t.kind == IDENT {
+            stdin |= prev_from && w.eq_ignore_ascii_case("STDIN");
+            prev_from = w.eq_ignore_ascii_case("FROM");
+        } else if !t.is_comment() {
+            prev_from = false;
+        }
+    }
+    None
+}
+
 /// Tokens whose case the formatter changes.
 pub(super) fn keyword_set(text: &str, toks: &[Tok], dialect: Dialect) -> BTreeSet<usize> {
     let sig: Vec<usize> = (0..toks.len()).filter(|&i| !toks[i].is_comment()).collect();
@@ -450,7 +548,7 @@ pub(super) fn render(
             if !plain {
                 out.push_str(gap);
             }
-        } else if kept(i) || !plain || verbatim_pair(&toks[i - 1], t) {
+        } else if kept(i) || t.gap_kept || !plain || verbatim_pair(&toks[i - 1], t) {
             out.push_str(gap);
         } else {
             let a = &toks[i - 1];
@@ -492,7 +590,9 @@ pub(super) fn render(
     }
     let tail = &text[toks.last().map_or(0, |t| t.end)..];
     let plain = tail.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
-    if !plain || toks.is_empty() || !opts.final_newline {
+    // A token kept as written may run to the end of the input (an
+    // unterminated string): a line ending after it would land inside it.
+    if !plain || toks.is_empty() || !opts.final_newline || toks.last().is_some_and(|t| t.verbatim) {
         out.push_str(tail);
     } else {
         out.push_str(nl);

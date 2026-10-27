@@ -21,8 +21,10 @@ fn fixture(name: &str) -> String {
 fn lays_out_a_procedure() {
     let r = fmt(&fixture("movestock.tsql.sql"), Dialect::Tsql);
     assert!(r.kept.is_empty(), "{:?}", r.kept);
+    // CI also runs the tests on CRLF copies of the fixtures; the line
+    // ending is kept.
     assert_eq!(
-        r.text,
+        r.text.replace("\r\n", "\n"),
         "CREATE PROCEDURE dbo.MoveStock @Item int, @Qty int AS
 BEGIN
     SET NOCOUNT ON;
@@ -311,7 +313,7 @@ fn the_check_pins_a_failure_to_its_statement() {
     let parsed = parse(src, Dialect::Postgres);
     let root = parsed.syntax();
     let o = FormatOptions::default();
-    let lay = layout::collect(src, &root, &o);
+    let lay = layout::collect(src, &root, &parsed.diagnostics, Dialect::Postgres, &o);
     let kw = layout::keyword_set(src, &lay.toks, Dialect::Postgres);
     let (out, starts) = layout::render(src, &lay, &o, &kw, &BTreeSet::new());
     let mut base = BTreeSet::new();
@@ -344,7 +346,7 @@ fn the_check_pins_a_failure_to_its_statement() {
     let src = "SELECT 1 WHERE a <> b;";
     let parsed = parse(src, Dialect::Tsql);
     let root = parsed.syntax();
-    let lay = layout::collect(src, &root, &o);
+    let lay = layout::collect(src, &root, &parsed.diagnostics, Dialect::Tsql, &o);
     let f = verify(
         src,
         "SELECT 1\nWHERE a < > b;\n",
@@ -429,4 +431,49 @@ fn config_tables_override_by_dialect() {
     assert!(FormatConfig::try_from(bad)
         .unwrap_err()
         .contains("format.postgres.indent"));
+}
+
+#[test]
+fn psql_and_sqlcmd_script_lines_stay_as_written() {
+    // COPY data rows: tab separators and values are data, not SQL.
+    let src = "COPY t (a, b) FROM stdin;\n1\tselect   from\n2\tx=1\n\\.\nselect 1;\n";
+    assert_eq!(
+        fmt(src, Dialect::Postgres).text,
+        "COPY t (a, b) FROM stdin;\n1\tselect   from\n2\tx=1\n\\.\nselect 1;\n"
+    );
+    // (The parser reads `\.` and what follows to the next `;` as one statement
+    // with a problem, so that statement stays as written too.)
+    // Without a `\.` line the rows run to the end of the input.
+    let open = "copy t from STDIN;\nselect\tfrom\n";
+    assert_eq!(
+        fmt(open, Dialect::Postgres).text,
+        "copy t FROM STDIN;\nselect\tfrom\n"
+    );
+    // COPY from a file has no inline data.
+    assert_eq!(
+        fmt("copy t from '/x';\nselect 1", Dialect::Postgres).text,
+        "copy t FROM '/x';\nSELECT 1\n"
+    );
+    // psql meta-commands are case sensitive and read to the end of the line.
+    let src = "\\if :flag\nselect 1;\n\\else\nselect 2;\n\\endif\n\\set x 'a  b'\n\\echo Use \"CREATE EXTENSION x\" to load this file. \\quit\n";
+    // The parser reads each meta-command line and the statement after it as
+    // one statement with a problem, so those stay as written as well.
+    assert_eq!(fmt(src, Dialect::Postgres).text, src);
+    // sqlcmd commands in T-SQL.
+    let src = ":setvar db  Sales\nuse $(db)\n:r  .\\x.sql\nselect 1 from t\n";
+    let r = fmt(src, Dialect::Tsql);
+    assert!(r.text.starts_with(":setvar db  Sales\n"), "{}", r.text);
+    assert!(r.text.contains("\n:r  .\\x.sql\n"), "{}", r.text);
+    for o in [FormatOptions::default(), with(|o| o.join_lines = true)] {
+        let twice = format(&format(src, Dialect::Tsql, &o).text, Dialect::Tsql, &o);
+        assert!(twice.text.contains("\n:r  .\\x.sql\n"), "{}", twice.text);
+    }
+}
+
+#[test]
+fn statements_with_parse_problems_stay_as_written() {
+    let src = "select 1;\nselect   'open from t;\n";
+    let r = fmt(src, Dialect::Postgres);
+    assert!(r.text.starts_with("SELECT 1;\n"), "{}", r.text);
+    assert!(r.text.contains("select   'open from t;"), "{}", r.text);
 }
