@@ -153,13 +153,14 @@ fn every_view_is_served_by_one_server_behind_the_rail() {
         ("/convert", None),
         ("/compare", Some("/compare")),
         ("/review", Some("/review")),
+        ("/settings", None),
     ] {
         let (status, html) = get(addr, path);
         assert_eq!(status, "HTTP/1.1 200 OK", "{path}");
         let (links, on) = rail(&html);
         assert_eq!(
             links,
-            ["/", "/runs", "/compare", "/convert", "/review"],
+            ["/", "/runs", "/compare", "/convert", "/review", "/settings"],
             "{path}"
         );
         assert_eq!(on, path);
@@ -208,7 +209,7 @@ fn a_view_with_nothing_open_is_not_a_link_and_shows_home() {
     let addr = start(app(None, None));
     let (_, html) = get(addr, "/convert");
     let (links, on) = rail(&html);
-    assert_eq!(links, ["/", "/runs", "/convert"]);
+    assert_eq!(links, ["/", "/runs", "/convert", "/settings"]);
     assert_eq!(on, "/convert");
     assert!(html.contains(r#"<span class="off" title="Compare two files or folders: nothing open"#));
     let (status, html) = get(addr, "/review");
@@ -318,7 +319,10 @@ fn a_comparison_opened_from_home_replaces_the_session_and_is_remembered() {
     ] {
         assert_eq!(open(body.clone()).0, "HTTP/1.1 400 Bad Request", "{body}");
     }
-    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/runs", "/convert"]);
+    assert_eq!(
+        rail(&get(addr, "/").1).0,
+        ["/", "/runs", "/convert", "/settings"]
+    );
 
     let (status, body) =
         open(serde_json::json!({ "a": a, "b": b, "dialect_a": "tsql", "dialect_b": "tsql" }));
@@ -326,7 +330,7 @@ fn a_comparison_opened_from_home_replaces_the_session_and_is_remembered() {
     assert_eq!(body, r#"{"open":"/compare"}"#);
     assert_eq!(
         rail(&get(addr, "/").1).0,
-        ["/", "/runs", "/compare", "/convert"]
+        ["/", "/runs", "/compare", "/convert", "/settings"]
     );
     let (_, pair) = get(addr, "/compare/api/pair/0");
     assert!(pair.contains(r#""verdict":"different""#), "{pair}");
@@ -367,7 +371,10 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         request(addr, "POST", "/api/open/compare", &open).0,
         "HTTP/1.1 403 Forbidden"
     );
-    assert_eq!(rail(&get(addr, "/").1).0, ["/", "/runs", "/convert"]);
+    assert_eq!(
+        rail(&get(addr, "/").1).0,
+        ["/", "/runs", "/convert", "/settings"]
+    );
     let (_, home) = get(addr, "/");
     assert!(
         home.contains(r#""no_picking":"picking files and starting runs work only"#),

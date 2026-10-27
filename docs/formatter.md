@@ -112,6 +112,14 @@ keyword_case = "lower"
 | `--line-ending keep\|lf\|crlf` | `line_ending` |
 | `--max-blank-lines N` | `max_blank_lines` |
 
+The GUI's Settings page shows these layers (built-in defaults, packs, the
+workspace `sqldiff.toml`, the user config) and the effective value of each
+key with the layer it comes from, and edits the workspace `sqldiff.toml`'s
+`[format]` sections with a live preview from the same code as `sqldiff fmt`.
+It writes only that file, keeps its comments, other keys and line endings,
+and shows the user config and private packs by path only: their contents are
+never read into the page.
+
 Generator templates (files containing the pack's `[template]` open
 delimiter) are not formatted: their placeholders are outside what the check
 can prove.
@@ -120,8 +128,8 @@ can prove.
 
 Expressions are a flat row of tokens in the tree, so long `CASE`
 expressions, nested subqueries and long argument lists keep the line breaks
-they were written with. The GUI and the MCP server do not offer formatting
-yet, and conversion output is not formatted.
+they were written with. The GUI only previews formatting (Settings) and the
+MCP server does not offer it yet, and conversion output is not formatted.
 
 The engine already ignores layout when it compares (a reformatted file
 gives no findings), so the diff does not format first.

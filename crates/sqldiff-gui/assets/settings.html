@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLDiff settings</title>
+<style>
+/* Palette shared with index.html, convert.html and review.html; keep them in sync. */
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5; --focus: #4f46e5;
+  --link-2: rgba(79,70,229,.06);
+  --s-assumptions: #dc9b04; --bad: #d92d20; --warn: #b54708;
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8; --focus: #818cf8;
+    --link-2: rgba(129,140,248,.08);
+    --s-assumptions: #fdb022; --bad: #f97066; --warn: #fdb022;
+  }
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+header { min-height: 44px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 10px; align-items: center; }
+header h1 { font-size: 13px; margin: 0; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+header h1::before { content: ""; width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+main { flex: 1; overflow: auto; padding: 32px 20px; }
+.col { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 14px 0 2px; }
+h2:first-child { margin-top: 0; }
+.card { display: grid; gap: 4px; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.card.closed { box-shadow: none; background: transparent; border-style: dashed; }
+.card .t { font-weight: 600; }
+.card .s { color: var(--muted); font-size: 12.5px; }
+.path { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+code { font-family: var(--mono); font-size: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+button { font: inherit; font-size: 12.5px; font-weight: 500; border: 1px solid transparent; background: transparent; color: var(--muted); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover:not(:disabled) { background: var(--soft); color: var(--fg); }
+button.outline { border-color: var(--line); background: var(--panel); color: var(--fg); }
+button.primary { border-color: var(--focus); color: var(--focus); background: var(--panel); }
+button.primary:hover:not(:disabled) { background: var(--link-2); color: var(--focus); }
+button:disabled { opacity: .45; cursor: default; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+input[type=text], input[type=number], select, textarea { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; min-width: 0; }
+input[type=text], textarea { font-family: var(--mono); font-size: 12px; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--focus); }
+.form { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); display: grid; gap: 10px; }
+.field { display: grid; grid-template-columns: 70px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.field > span { color: var(--muted); font-size: 12.5px; }
+.acts { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.msg { flex: 1; font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; min-width: 160px; }
+.msg.err { color: var(--bad); }
+.list { display: grid; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.layer { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 2px 12px; align-items: baseline; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.layer:last-child { border-bottom: 0; }
+.layer .n { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; }
+.layer .t { font-weight: 600; }
+.layer .p { grid-column: 2; }
+.layer .r { grid-column: 3; grid-row: 1 / span 2; color: var(--muted); font-size: 12px; text-align: right; align-self: center; }
+.layer.ws .t { color: var(--accent); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; align-self: start; flex-wrap: wrap; }
+.seg button { border-radius: 0; border-right: 1px solid var(--line); color: var(--muted); }
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed=true] { background: var(--link-2); color: var(--accent); font-weight: 600; }
+.krow { display: grid; grid-template-columns: minmax(0, 1.3fr) 150px minmax(0, 1.4fr); gap: 4px 14px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line); }
+.krow:first-child { border-top: 0; }
+.kn { display: grid; gap: 1px; min-width: 0; }
+.kn .muted { font-size: 11.5px; }
+.kn code { justify-self: start; }
+.kc select, .kc input { width: 100%; }
+.ke { font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
+.ke .v { font-family: var(--mono); font-size: 12px; }
+.ke .v.hid { color: var(--faint); font-family: inherit; font-style: italic; }
+.ke .s { color: var(--muted); }
+.ke .s::before { content: "· "; }
+.ke .warn { display: block; color: var(--warn); font-size: 11.5px; }
+.ke .also { display: block; color: var(--faint); font-size: 11.5px; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.lbl { font-size: 11.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+textarea, pre.out { width: 100%; height: 260px; margin: 0; resize: vertical; overflow: auto; tab-size: 4; line-height: 1.5; white-space: pre; }
+pre.out { font-family: var(--mono); font-size: 12px; color: var(--fg); background: var(--soft); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
+.kept { font-size: 12px; color: var(--warn); display: grid; gap: 2px; }
+.kept:empty { display: none; }
+@media (max-width: 720px) {
+  .split { grid-template-columns: 1fr; }
+  .krow { grid-template-columns: 1fr 140px; }
+  .krow .ke { grid-column: 1 / -1; }
+  .field { grid-template-columns: 1fr auto; }
+  .field > span { grid-column: 1 / -1; }
+}
+</style>
+</head>
+<body>
+<!--__SQLDIFF_SHELL__-->
+<header>
+  <h1>SQLDiff settings</h1>
+  <span class="spacer"></span>
+  <span class="muted">Saved to the workspace's sqldiff.toml only</span>
+</header>
+<main><div class="col">
+  <div class="card closed" id="closed" hidden><span class="t">Not available on a network address</span><span class="s" id="closed-why"></span></div>
+  <h2>Workspace</h2>
+  <form class="form" id="ws" autocomplete="off">
+    <div class="field"><span>Folder</span><input type="text" id="dir" placeholder="Folder that holds, or will hold, sqldiff.toml" aria-label="Workspace folder" spellcheck="false"><button type="button" class="outline" data-browse="dir" data-next="dir">Browse…</button></div>
+    <div class="acts"><span class="msg" id="ws-msg" role="status">Choose the folder of the workspace. Its sqldiff.toml is the only file the app writes here.</span><button type="submit" class="outline">Load</button></div>
+  </form>
+  <div id="editor" hidden>
+    <h2>Config layers</h2>
+    <div class="list" id="layers"></div>
+    <div class="muted" style="margin-top:6px">Lowest first. A later layer replaces an earlier one key by key; <code>[format.tsql]</code>, <code>[format.postgres]</code> and <code>[format.db2i]</code> win over <code>[format]</code> for their dialect. A private config is listed by path only: nothing in it is read into this page.</div>
+    <h2>Format</h2>
+    <div class="form">
+      <div class="seg" id="scopes" role="group" aria-label="Dialect"></div>
+      <div id="rows"></div>
+      <div class="acts"><span class="msg" id="msg" role="status"></span><button type="button" id="revert">Revert</button><button type="button" class="primary" id="save">Save to sqldiff.toml</button></div>
+    </div>
+    <h2>Preview</h2>
+    <div class="form">
+      <div class="acts"><label class="muted" for="pdialect">Dialect</label><select id="pdialect"></select><span class="muted">Formatted by the code <code>sqldiff fmt</code> runs, with the settings above</span></div>
+      <div class="split">
+        <div><div class="lbl">As written</div><textarea id="src" spellcheck="false" aria-label="SQL to format"></textarea></div>
+        <div><div class="lbl" id="out-lbl">Formatted</div><pre class="out" id="out" tabindex="0" aria-label="Formatted SQL"></pre></div>
+      </div>
+      <div class="kept" id="kept"></div>
+    </div>
+  </div>
+</div></main>
+<!--__SQLDIFF_PICKER__-->
+<script>
+const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const NAME = Object.fromEntries(INITIAL.dialects);
+const DIALECTS = INITIAL.dialects.map(([id]) => id);
+const SCOPES = ["all", ...DIALECTS];
+const SCOPE_LABEL = { all: "All dialects", ...NAME };
+// What the page knows of the workspace file: as loaded from the server, and as edited.
+let st = null;
+let draft = {};
+let scope = "all";
+let seq = 0, timer = null;
+
+const clone = (o) => JSON.parse(JSON.stringify(o));
+const table = (d, sc) => (sc === "all" ? d : d[sc]) || {};
+// The draft in the shape the config file has: only non-empty dialect tables.
+function tidy(d) {
+  const out = {};
+  for (const [k, v] of Object.entries(d)) {
+    if (DIALECTS.includes(k)) { if (v && Object.keys(v).length) out[k] = v; } else out[k] = v;
+  }
+  return out;
+}
+const dirty = () => JSON.stringify(tidy(draft)) !== JSON.stringify(tidy(st.draft));
+
+async function call(method, url, body) {
+  const res = await fetch(url, method === "GET" ? {} : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: INITIAL.token, ...body }) });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text || res.statusText);
+  return JSON.parse(text);
+}
+
+function say(id, text, err) { const e = $(id); e.textContent = text; e.classList.toggle("err", !!err); }
+
+async function load() {
+  const dir = $("dir").value.trim();
+  if (st && dirty() && !confirm("Discard the edits that are not saved?")) return;
+  say("ws-msg", "Loading…");
+  try {
+    adopt(await call("GET", "/api/settings?dir=" + encodeURIComponent(dir)));
+  } catch (e) {
+    $("editor").hidden = true; st = null;
+    say("ws-msg", e.message, true);
+  }
+}
+
+function adopt(v) {
+  st = v;
+  draft = clone(v.draft);
+  $("dir").value = v.dir || $("dir").value;
+  say("ws-msg", v.exists ? v.file : v.file + " does not exist yet; saving creates it.");
+  $("editor").hidden = false;
+  renderLayers();
+  renderScopes();
+  renderRows();
+  paint();
+  preview();
+}
+
+function renderLayers() {
+  $("layers").innerHTML = st.layers.map((l, i) => {
+    const right = l.kind === "builtin" ? "" : l.kind === "project" && !st.exists ? "not created yet"
+      : !l.shown ? "path only, contents not shown"
+      : l.format_keys == null ? "" : `${l.format_keys} format key${l.format_keys === 1 ? "" : "s"}`;
+    return `<div class="layer${l.kind === "project" ? " ws" : ""}"><span class="n">${i + 1}</span><span class="t">${esc(l.label)}</span><span class="p path">${l.path ? esc(l.path) : "<span class=\"muted\">built into SQLDiff</span>"}</span><span class="r">${esc(right)}</span></div>`;
+  }).join("");
+}
+
+function renderScopes() {
+  $("scopes").innerHTML = SCOPES.map((s) => `<button type="button" data-scope="${esc(s)}" aria-pressed="${s === scope}">${esc(SCOPE_LABEL[s])}</button>`).join("");
+  $("scopes").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { scope = b.dataset.scope; renderScopes(); renderRows(); paint(); }));
+}
+
+function control(k) {
+  const cur = table(draft, scope)[k.name];
+  const label = `aria-label="${esc(k.name)}"`;
+  if (k.kind === "int") return `<input type="number" ${label} min="${k.min}" max="${k.max}" step="1" placeholder="inherit" value="${cur == null ? "" : cur}" data-key="${esc(k.name)}">`;
+  const opts = k.kind === "bool" ? [["true", "on"], ["false", "off"]] : k.options.map((o) => [o, o]);
+  const sel = cur == null ? "" : String(cur);
+  return `<select ${label} data-key="${esc(k.name)}"><option value=""${sel === "" ? " selected" : ""}>inherit</option>${opts.map(([v, t]) => `<option value="${esc(v)}"${sel === v ? " selected" : ""}>${esc(t)}</option>`).join("")}</select>`;
+}
+
+function renderRows() {
+  $("rows").innerHTML = INITIAL.keys.map((k) => `<div class="krow" data-row="${esc(k.name)}"><div class="kn"><code>${esc(k.name)}</code><span class="muted">${esc(k.help)}</span></div><div class="kc">${control(k)}</div><div class="ke"></div></div>`).join("");
+  $("rows").querySelectorAll("[data-key]").forEach((c) => c.addEventListener(c.tagName === "SELECT" ? "change" : "input", () => edit(c)));
+}
+
+function edit(c) {
+  const k = INITIAL.keys.find((x) => x.name === c.dataset.key);
+  let v = c.value;
+  if (v !== "") {
+    if (k.kind === "int") { v = Number(v); if (!Number.isInteger(v)) v = undefined; }
+    else if (k.kind === "bool") v = v === "true";
+  } else v = undefined;
+  let t = scope === "all" ? draft : (draft[scope] = draft[scope] || {});
+  if (v === undefined) delete t[k.name]; else t[k.name] = v;
+  if (scope !== "all" && !Object.keys(t).length) delete draft[scope];
+  paint();
+  schedule();
+}
+
+const show = (v) => (v === true ? "on" : v === false ? "off" : String(v));
+
+function source(e) {
+  const l = st.layers[e.layer];
+  if (e.layer === 0) return "built-in default";
+  const sec = e.dialect_table ? ` · [format.${scope}]` : "";
+  return `${l.label}${sec}`;
+}
+
+// The effective column, the save bar and the messages; the controls stay as they are.
+function paint() {
+  const wsIdx = st.layers.findIndex((l) => l.kind === "project");
+  const eff = st.effective;
+  $("rows").querySelectorAll("[data-row]").forEach((row) => {
+    const key = row.dataset.row;
+    const e = eff[scope][key];
+    const set = table(draft, scope)[key] !== undefined;
+    let h = e.hidden ? `<span class="v hid">value not shown</span> <span class="s">set by ${esc(source(e))}</span>`
+      : `<span class="v">${esc(show(e.value))}</span> <span class="s">${esc(source(e))}</span>`;
+    const mine = e.layer === wsIdx && (scope === "all" || e.dialect_table);
+    if (set && !mine) h += `<span class="warn">Not in effect: ${esc(source(e))} sets it${e.hidden ? "" : ` to ${esc(show(e.value))}`}</span>`;
+    if (scope === "all") {
+      const other = DIALECTS.filter((d) => { const x = eff[d][key]; return x.layer !== e.layer || x.dialect_table !== e.dialect_table; });
+      if (other.length) h += `<span class="also">Differs for ${other.map((d) => esc(NAME[d])).join(", ")}</span>`;
+    }
+    row.querySelector(".ke").innerHTML = h;
+  });
+  const d = dirty();
+  $("save").disabled = !d || !!st.writable;
+  $("revert").disabled = !d;
+  if (st.writable) say("msg", st.writable, true);
+  else if (!$("msg").dataset.keep) say("msg", d ? "Unsaved edits" : "");
+}
+
+function schedule() { clearTimeout(timer); delete $("msg").dataset.keep; timer = setTimeout(preview, 200); }
+
+async function preview() {
+  if (!st) return;
+  const mine = ++seq;
+  try {
+    const r = await call("POST", "/api/settings/preview", { dir: st.file, draft: tidy(draft), dialect: $("pdialect").value, text: $("src").value });
+    if (mine !== seq) return;
+    st.effective = r.effective;
+    $("out").textContent = r.text;
+    $("out-lbl").textContent = r.changed ? "Formatted" : "Formatted · same as written";
+    $("kept").innerHTML = r.kept.map((k) => `<div>Lines ${k.start_line}–${k.end_line} kept as written: ${esc(k.reason)}</div>`).join("");
+    paint();
+  } catch (e) {
+    if (mine !== seq) return;
+    $("out").textContent = "";
+    $("kept").innerHTML = `<div>${esc(e.message)}</div>`;
+  }
+}
+
+$("save").addEventListener("click", async () => {
+  $("save").disabled = true;
+  try {
+    const v = await call("POST", "/api/settings/save", { dir: st.file, draft: tidy(draft), hash: st.hash });
+    adopt(v);
+    $("msg").dataset.keep = "1";
+    say("msg", "Saved to " + v.file);
+  } catch (e) {
+    say("msg", e.message, true);
+    $("msg").dataset.keep = "1";
+    $("save").disabled = false;
+  }
+});
+$("revert").addEventListener("click", () => { draft = clone(st.draft); delete $("msg").dataset.keep; renderRows(); paint(); preview(); });
+$("ws").addEventListener("submit", (e) => { e.preventDefault(); load(); });
+$("dir").addEventListener("change", load);
+window.addEventListener("beforeunload", (e) => { if (st && dirty()) { e.preventDefault(); e.returnValue = ""; } });
+
+// The preview starts with a sample for the dialect, until the text is edited.
+let sampleOf = null;
+function useSample() {
+  if ($("src").value === "" || $("src").value === sampleOf) {
+    sampleOf = INITIAL.samples[$("pdialect").value];
+    $("src").value = sampleOf;
+  }
+}
+$("pdialect").innerHTML = INITIAL.dialects.map(([id, n]) => `<option value="${esc(id)}">${esc(n)}</option>`).join("");
+$("pdialect").addEventListener("change", () => { useSample(); preview(); });
+$("src").addEventListener("input", schedule);
+useSample();
+
+if (INITIAL.no_picking) {
+  $("ws").hidden = true;
+  $("closed").hidden = false;
+  $("closed-why").textContent = INITIAL.no_picking.charAt(0).toUpperCase() + INITIAL.no_picking.slice(1) + ".";
+} else if (INITIAL.initial_dir) {
+  $("dir").value = INITIAL.initial_dir;
+  load();
+}
+</script>
+</body>
+</html>
