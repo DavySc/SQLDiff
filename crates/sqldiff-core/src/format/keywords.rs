@@ -127,8 +127,17 @@ const RESERVED: &[&str] = &[
 
 /// Whether the formatter may change the case of the unquoted word `upper`
 /// (already upper case) in `dialect`.
+///
+/// In T-SQL the word must also be one the engine compares without regard to
+/// case ([`crate::normalize::is_keyword`]): for any other word the engine
+/// can only show the change harmless under a collation assumption, so the
+/// check would reject the statement and keep it as written.
 pub fn recasable(upper: &str, dialect: Dialect) -> bool {
-    RESERVED.contains(&upper) || (dialect != Dialect::Tsql && crate::normalize::is_keyword(upper))
+    let engine = crate::normalize::is_keyword(upper);
+    match dialect {
+        Dialect::Tsql => RESERVED.contains(&upper) && engine,
+        _ => RESERVED.contains(&upper) || engine,
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +153,9 @@ mod tests {
             assert!(!recasable(w, Dialect::Tsql), "{w}");
         }
         assert!(recasable("SELECT", Dialect::Tsql));
+        // Reserved, but the engine compares it as a name in T-SQL.
+        assert!(!recasable("IDENTITY", Dialect::Tsql));
+        assert!(recasable("IDENTITY", Dialect::Postgres));
         assert!(recasable("INT", Dialect::Postgres));
         assert!(recasable("INT", Dialect::Db2i));
     }
