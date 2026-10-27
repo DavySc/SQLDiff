@@ -170,11 +170,14 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         let Ok(stream) = stream else { continue };
         let shared = Arc::clone(&shared);
         let hosts = Arc::clone(&hosts);
-        std::thread::Builder::new()
+        // A thread that cannot be made (each reserves the engine's large
+        // stack) fails that one request, whose connection closes; it must not
+        // end the server, which would reset every connection still waiting.
+        let _ = std::thread::Builder::new()
             .stack_size(sqldiff_core::ENGINE_STACK)
             .spawn(move || {
                 let _ = handle(stream, &shared, &hosts);
-            })?;
+            });
     }
     Ok(())
 }
