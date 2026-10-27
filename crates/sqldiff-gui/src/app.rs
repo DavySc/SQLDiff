@@ -280,7 +280,7 @@ body { padding-left: 60px; box-sizing: border-box; }
 #app-rail span.off { opacity: .45; cursor: default; }
 #app-rail a:focus-visible { outline: 2px solid var(--focus, var(--accent)); outline-offset: -2px; }
 /* The rail replaces the views' own links to each other. */
-#to-convert, #files { display: none !important; }
+.standalone-only { display: none !important; }
 </style>
 ";
 
