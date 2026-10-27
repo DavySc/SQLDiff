@@ -5,7 +5,7 @@
 //! and review decisions apply live); `export` writes a self-contained,
 //! read-only HTML file; `review` serves a converted tree's review queue and
 //! records decisions in its ledger. Without a command (a double-click in a distribution)
-//! it serves convert mode and opens the browser.
+//! it serves the app and opens home in the browser.
 //!
 //! `serve`, `convert` and `review` all start the app (see `app`): one
 //! server with every view behind a rail, the one the command opened shown first.
@@ -80,7 +80,7 @@ struct PairArgs {
 #[derive(Subcommand)]
 enum Command {
     /// Serve the GUI on a local port and print its URL. Without files it opens
-    /// convert mode (with its scratch compare).
+    /// home, where files or folders to compare are picked.
     Serve {
         #[command(flatten)]
         pair: PairArgs,
@@ -272,24 +272,55 @@ fn main() -> ExitCode {
     }
 }
 
-/// Serves convert mode on the default port (or any free one) and opens it
+/// Serves the app on the default port (or any free one) and opens home
 /// in the browser.
 fn launch() -> Result<(), String> {
     let listener = TcpListener::bind(("127.0.0.1", 7878))
         .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
         .map_err(|e| e.to_string())?;
-    let url = url(&listener)? + "convert";
+    let url = url(&listener)?;
     println!("SQLDiff: {url}");
     println!("Keep this window open while you work; closing it stops SQLDiff.");
     if let Err(e) = open_browser(&url) {
         println!("Could not open a browser ({e}); open {url} yourself.");
     }
-    let app = App {
-        convert: sample(),
-        compare: None,
-        review: None,
-    };
-    app::serve(listener, app, &[]).map_err(|e| e.to_string())
+    app::serve(listener, app(sample(), None, None, false), &[]).map_err(|e| e.to_string())
+}
+
+/// The app with what a command opened; sessions opened from home load
+/// config as `isolated` says.
+fn app(
+    convert: convert::Setup,
+    compare: Option<Session>,
+    review: Option<convert_review::Review>,
+    isolated: bool,
+) -> App {
+    App {
+        convert,
+        compare,
+        review,
+        data_dir: recent_dir(isolated),
+        isolated,
+    }
+}
+
+/// Where home keeps its recent comparisons: the configured data directory,
+/// unless it is encrypted at rest (the list is kept in plain text) or
+/// config is ignored.
+fn recent_dir(isolated: bool) -> Option<PathBuf> {
+    if isolated {
+        return None;
+    }
+    let cfg = Resolved::load(&Sources {
+        project: None,
+        user: None,
+        isolated: false,
+        cwd: None,
+        packs: Vec::new(),
+        cli: config::cli_layer(&[], &[], None).ok()?,
+    })
+    .ok()?;
+    cfg.data_key.is_none().then_some(cfg.data_dir)
 }
 
 /// Serves the app, its address printed with `view` open.
@@ -350,20 +381,12 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
             if pair.a.is_none() && pair.report.is_none() {
-                // Nothing to compare yet: open convert mode, whose Compare
-                // switch diffs scratch texts.
-                let app = App {
-                    convert: sample(),
-                    compare: None,
-                    review: None,
-                };
-                return start(listener, app, View::Convert, &allow_hosts);
+                // Nothing to compare yet: home picks what to compare.
+                let app = app(sample(), None, None, pair.isolated);
+                return start(listener, app, View::Home, &allow_hosts);
             }
-            let app = App {
-                convert: sample(),
-                compare: Some(open(pair)?),
-                review: None,
-            };
+            let isolated = pair.isolated;
+            let app = app(sample(), Some(open(pair)?), None, isolated);
             start(listener, app, View::Compare, &allow_hosts)
         }
         Command::Convert {
@@ -436,11 +459,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Err(format!("no conversion rules from {from} to {to} yet"));
             }
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-            let app = App {
-                convert: setup,
-                compare: None,
-                review: None,
-            };
+            let app = app(setup, None, None, isolated);
             start(listener, app, View::Convert, &allow_hosts)
         }
         Command::Review {
@@ -493,11 +512,7 @@ fn run(cli: Cli) -> Result<(), String> {
             })?;
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
             println!("decisions go to {}", review.ledger_path().display());
-            let app = App {
-                convert: sample(),
-                compare: None,
-                review: Some(review),
-            };
+            let app = app(sample(), None, Some(review), isolated);
             start(listener, app, View::Review, &allow_hosts)
         }
         Command::Export { pair, output } => {

@@ -1,6 +1,9 @@
 //! The app: one local server for every view, with a rail to switch between them.
 //!
-//! - `GET /`: home, what is open
+//! - `GET /`: home, what is open, and the forms that open more
+//! - `GET /api/fs?path=`: a folder listing for the file picker (see `browse`)
+//! - `POST /api/open/compare` `{"a", "b", "dialect_a"?, "dialect_b"?}`: open
+//!   (or replace) the compare session on two files or two folders
 //! - `GET /convert`, `POST /api/convert`, `POST /api/compare`: convert mode
 //!   (see `convert`)
 //! - `GET /compare`, `/compare/api/...`: the pair view or tree queue of a
@@ -15,14 +18,22 @@
 //! this server's own origin.
 
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sqldiff_core::Dialect;
+use sqldiff_source::config::{self, Sources};
+use sqldiff_source::Resolved;
 
 use crate::convert;
 use crate::convert_review::{self, Review};
-use crate::server::{allowed_hosts, not_found, read_request, respond, Request, Response};
+use crate::review::Store;
+use crate::server::{
+    allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
+};
 use crate::session::{Origin, Session};
+use crate::{browse, server};
 
 /// The home page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`.
 pub const HOME_HTML: &str = include_str!("../assets/home.html");
@@ -33,6 +44,11 @@ pub struct App {
     pub convert: convert::Setup,
     pub compare: Option<Session>,
     pub review: Option<Review>,
+    /// Where the list of recent comparisons is kept (paths only); `None`
+    /// keeps none.
+    pub data_dir: Option<PathBuf>,
+    /// Sessions opened from the app ignore project and user config files.
+    pub isolated: bool,
 }
 
 /// A view of the app, in rail order.
@@ -59,15 +75,25 @@ impl View {
 
 struct Shared {
     convert: convert::Setup,
-    compare: Option<Mutex<Session>>,
+    /// Replaced when a comparison is opened from home.
+    compare: Mutex<Option<Arc<Mutex<Session>>>>,
     review: Option<Mutex<Review>>,
+    data_dir: Option<PathBuf>,
+    isolated: bool,
 }
 
 impl Shared {
+    fn compare(&self) -> Option<Arc<Mutex<Session>>> {
+        self.compare
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     fn is_open(&self, v: View) -> bool {
         match v {
             View::Home | View::Convert => true,
-            View::Compare => self.compare.is_some(),
+            View::Compare => self.compare().is_some(),
             View::Review => self.review.is_some(),
         }
     }
@@ -76,8 +102,10 @@ impl Shared {
 pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io::Result<()> {
     let shared = Arc::new(Shared {
         convert: app.convert,
-        compare: app.compare.map(Mutex::new),
+        compare: Mutex::new(app.compare.map(|s| Arc::new(Mutex::new(s)))),
         review: app.review.map(Mutex::new),
+        data_dir: app.data_dir,
+        isolated: app.isolated,
     });
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
@@ -103,8 +131,24 @@ fn handle(mut stream: TcpStream, app: &Shared, hosts: &[String]) -> std::io::Res
 }
 
 fn route(app: &Shared, req: Request) -> Response {
-    if req.method == "GET" && req.path == "/" {
-        return page(app, View::Home, home(app));
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/") => return page(app, View::Home, home(app)),
+        ("GET", "/api/fs") => {
+            return match browse::list(&param(&req.query, "path").unwrap_or_default()) {
+                Ok(l) => json(&l),
+                Err(e) => bad(e),
+            }
+        }
+        ("POST", "/api/open/compare") => {
+            return match serde_json::from_slice::<OpenCompare>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|o| open_from_home(app, o))
+            {
+                Ok(()) => json(&serde_json::json!({ "open": View::Compare.path() })),
+                Err(e) => bad(e),
+            }
+        }
+        _ => {}
     }
     if let Some(res) = convert::route(&app.convert, &req, View::Convert.path()) {
         return framed(app, View::Convert, res);
@@ -114,9 +158,9 @@ fn route(app: &Shared, req: Request) -> Response {
             continue;
         };
         let res = match view {
-            View::Compare => app.compare.as_ref().map(|s| {
+            View::Compare => app.compare().map(|s| {
                 let mut s = s.lock().unwrap_or_else(|e| e.into_inner());
-                crate::server::route(&mut s, &req)
+                server::route(&mut s, &req)
             }),
             _ => app.review.as_ref().map(|r| convert_review::route(r, &req)),
         };
@@ -246,6 +290,10 @@ struct Home {
     convert: ConvertCard,
     compare: Option<CompareCard>,
     review: Option<ReviewCard>,
+    /// Comparisons opened before, newest first.
+    recent: Vec<Recent>,
+    /// Every dialect, for the compare form: `(id, name)`.
+    dialects: Vec<(&'static str, &'static str)>,
 }
 
 #[derive(Serialize)]
@@ -283,7 +331,7 @@ fn home(app: &Shared) -> String {
             name: c.name.clone(),
             template: c.template.is_some(),
         },
-        compare: app.compare.as_ref().map(|s| {
+        compare: app.compare().map(|s| {
             let s = s.lock().unwrap_or_else(|e| e.into_inner());
             let (kind, a, b) = match s.origin() {
                 Origin::Files { a, b } => ("files", a, b),
@@ -306,6 +354,11 @@ fn home(app: &Shared) -> String {
                 to: s.tree.to.display_name(),
             }
         }),
+        recent: app.data_dir.as_deref().map(recent).unwrap_or_default(),
+        dialects: Dialect::ALL
+            .iter()
+            .map(|d| (d.id(), d.display_name()))
+            .collect(),
     };
     let json = serde_json::to_string(&payload)
         .unwrap()
@@ -314,4 +367,120 @@ fn home(app: &Shared) -> String {
         "/*__SQLDIFF_PAYLOAD__*/null",
         &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCompare {
+    a: String,
+    b: String,
+    /// Dialect ids; absent: from `dialect_map` or the path convention.
+    #[serde(default)]
+    dialect_a: Option<String>,
+    #[serde(default)]
+    dialect_b: Option<String>,
+}
+
+fn open_from_home(app: &Shared, o: OpenCompare) -> Result<(), String> {
+    let dialect = |id: &Option<String>| -> Result<Option<Dialect>, String> {
+        id.as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse().map_err(|_| format!("unknown dialect `{s}`")))
+            .transpose()
+    };
+    let (da, db) = (dialect(&o.dialect_a)?, dialect(&o.dialect_b)?);
+    let session = open_compare(Path::new(&o.a), Path::new(&o.b), da, db, app.isolated)?;
+    let (a, b) = match session.origin() {
+        Origin::Files { a, b } | Origin::Trees { a, b } => (a.clone(), b.clone()),
+    };
+    *app.compare.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(Mutex::new(session)));
+    if let Some(dir) = &app.data_dir {
+        remember(
+            dir,
+            Recent {
+                a: a.display().to_string(),
+                b: b.display().to_string(),
+                dialect_a: da.map(|d| d.id().to_string()),
+                dialect_b: db.map(|d| d.id().to_string()),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// A compare session on two files or two folders, with the config a command
+/// run in A's folder loads: the project's `sqldiff.toml` there or above, the
+/// user config and the private config beside the app (unless `isolated`).
+pub fn open_compare(
+    a: &Path,
+    b: &Path,
+    dialect_a: Option<Dialect>,
+    dialect_b: Option<Dialect>,
+    isolated: bool,
+) -> Result<Session, String> {
+    let (a, b) = (browse::absolute(a), browse::absolute(b));
+    for p in [&a, &b] {
+        if !p.exists() {
+            return Err(format!("{}: not found", p.display()));
+        }
+    }
+    if a.is_dir() != b.is_dir() {
+        return Err("give two files or two folders, not one of each".into());
+    }
+    let cwd = match a.is_dir() {
+        true => a.clone(),
+        false => a.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
+    let cfg = Resolved::load(&Sources {
+        project: None,
+        user: None,
+        isolated,
+        cwd: Some(cwd),
+        packs: Vec::new(),
+        cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+    })
+    .map_err(|e| e.0)?;
+    let store = Store::from_config(&cfg).map_err(|e| e.0)?;
+    Session::open_with(Origin::detect(a, b), dialect_a, dialect_b, cfg, None, store)
+}
+
+/// One comparison on the home page's recent list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recent {
+    pub a: String,
+    pub b: String,
+    #[serde(default)]
+    pub dialect_a: Option<String>,
+    #[serde(default)]
+    pub dialect_b: Option<String>,
+}
+
+/// Most comparisons kept on the recent list.
+pub const RECENT_MAX: usize = 8;
+
+fn recent_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("gui").join("recent.json")
+}
+
+/// The recent comparisons kept in `data_dir`, newest first; none when the
+/// file is missing or unreadable.
+pub fn recent(data_dir: &Path) -> Vec<Recent> {
+    std::fs::read_to_string(recent_file(data_dir))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Puts `r` first on the recent list. The list is a convenience: a failure
+/// to write it is not an error.
+fn remember(data_dir: &Path, r: Recent) {
+    let mut list = recent(data_dir);
+    list.retain(|x| x != &r);
+    list.insert(0, r);
+    list.truncate(RECENT_MAX);
+    let file = recent_file(data_dir);
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, serde_json::to_string_pretty(&list).unwrap() + "\n");
 }
