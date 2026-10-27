@@ -1,7 +1,8 @@
 //! Runs: long work started from the app, with progress, cancel and a list
 //! kept while the app runs. The one kind so far converts a tree into an
 //! output folder through `sqldiff_convert::job`, the code `sqldiff convert`
-//! runs, so a run writes what the command writes.
+//! runs, so a run writes what the command writes. Each run carries that
+//! command (`Command`), for scripts and pipelines.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -59,9 +60,150 @@ pub enum State {
     },
 }
 
+/// The `sqldiff convert` command that writes what a run writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Command {
+    /// The arguments after the program.
+    pub args: Vec<String>,
+    /// Where to run it when no project config pins the config: the folder
+    /// the run looked for `sqldiff.toml` from.
+    pub cwd: Option<String>,
+    /// The config files the run loaded, by path.
+    pub project_config: Option<String>,
+    pub user_config: Option<String>,
+    /// The whole command for PowerShell and for a POSIX shell.
+    pub powershell: String,
+    pub sh: String,
+}
+
+impl Command {
+    /// The command for `job`, with config found from `dir` as the run finds it.
+    pub fn new(program: &str, job: &Job, dir: &Path, isolated: bool) -> Command {
+        let t = &job.tree;
+        let mut args = vec![
+            "convert".into(),
+            path(&t.src),
+            "-o".into(),
+            path(&job.out),
+            "--from".into(),
+            t.from.id().into(),
+            "--to".into(),
+            t.to.id().into(),
+        ];
+        if job.overwrite {
+            args.push("--overwrite".into());
+        }
+        let (project, user) = match isolated {
+            true => (None, None),
+            false => (
+                config::find_project(dir),
+                config::user_config_path().filter(|p| p.is_file()),
+            ),
+        };
+        // With the project file named, the command loads the same config
+        // from any folder; without one it must find none either.
+        let cwd = match (isolated, &project) {
+            (true, _) => {
+                args.push("--isolated".into());
+                None
+            }
+            (false, Some(p)) => {
+                args.extend(["--config".into(), path(p)]);
+                None
+            }
+            (false, None) => Some(path(dir)),
+        };
+        let line = |cd: String, program: String, quote: fn(&str) -> String| {
+            let mut l = cd;
+            l.push_str(&program);
+            for a in &args {
+                l.push(' ');
+                l.push_str(&quote(a));
+            }
+            l
+        };
+        let ps_program = match powershell_quote(program) {
+            p if p == program => p,
+            p => format!("& {p}"),
+        };
+        Command {
+            powershell: line(
+                cwd.as_deref()
+                    .map(|d| {
+                        format!(
+                            "Set-Location -LiteralPath {} -ErrorAction Stop; ",
+                            powershell_quote(d)
+                        )
+                    })
+                    .unwrap_or_default(),
+                ps_program,
+                powershell_quote,
+            ),
+            sh: line(
+                cwd.as_deref()
+                    .map(|d| format!("cd {} && ", sh_quote(d)))
+                    .unwrap_or_default(),
+                sh_quote(program),
+                sh_quote,
+            ),
+            args,
+            cwd,
+            project_config: project.as_deref().map(path),
+            user_config: user.as_deref().map(path),
+        }
+    }
+}
+
+fn path(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// A PowerShell argument: bare when nothing in it is special there, else
+/// single-quoted with `'` (and the typographic quotes PowerShell reads as
+/// `'`) doubled.
+pub fn powershell_quote(a: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:\\=".contains(c);
+    if !a.is_empty() && a.chars().all(bare) {
+        return a.to_string();
+    }
+    let mut q = String::from("'");
+    for c in a.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            q.push(c);
+        }
+        q.push(c);
+    }
+    q.push('\'');
+    q
+}
+
+/// A POSIX shell argument: bare when nothing in it is special there, else
+/// single-quoted with `'` written as `'\''`.
+pub fn sh_quote(a: &str) -> String {
+    let bare = |c: char| c.is_ascii_alphanumeric() || "-_./:=+,@%".contains(c);
+    if !a.is_empty() && a.chars().all(bare) {
+        return a.to_string();
+    }
+    format!("'{}'", a.replace('\'', "'\\''"))
+}
+
+/// `sqldiff` beside this program when it is there (a distribution, or a
+/// build), else `sqldiff` on the PATH.
+pub fn program() -> String {
+    let name = format!("sqldiff{}", std::env::consts::EXE_SUFFIX);
+    std::env::current_exe()
+        .ok()
+        .map(|e| e.canonicalize().unwrap_or(e))
+        .and_then(|e| e.parent().map(|d| d.join(&name)))
+        .filter(|p| p.is_file())
+        .map(|p| path(&p))
+        .unwrap_or_else(|| "sqldiff".into())
+}
+
 pub struct Run {
     pub id: u64,
     pub spec: ConvertSpec,
+    pub command: Command,
     /// Absolute output folder, for the one-run-per-folder rule.
     out: PathBuf,
     started: String,
@@ -80,6 +222,7 @@ pub struct RunView {
     pub kind: &'static str,
     #[serde(flatten)]
     pub spec: ConvertSpec,
+    pub command: Command,
     pub started: String,
     pub checked: usize,
     pub total: usize,
@@ -94,6 +237,7 @@ impl Run {
             id: self.id,
             kind: "convert",
             spec: self.spec.clone(),
+            command: self.command.clone(),
             started: self.started.clone(),
             checked: self.checked.load(Ordering::Relaxed),
             total: self.total.load(Ordering::Relaxed),
@@ -146,7 +290,7 @@ impl Runs {
         isolated: bool,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let (job, out) = prepare(&spec, isolated)?;
+        let (job, out, command) = prepare(&spec, isolated)?;
         let run = {
             let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
             if l.iter()
@@ -160,6 +304,7 @@ impl Runs {
             let run = Arc::new(Run {
                 id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
                 spec,
+                command,
                 out,
                 started: sqldiff_review::time::now(),
                 checked: AtomicUsize::new(0),
@@ -184,9 +329,14 @@ impl Runs {
     }
 }
 
-/// The job a spec asks for, checked before a thread is started, and its
-/// absolute output folder.
-fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf), String> {
+/// The command a run of `spec` would carry, without starting one.
+pub fn command(spec: &ConvertSpec, isolated: bool) -> Result<Command, String> {
+    prepare(spec, isolated).map(|(_, _, c)| c)
+}
+
+/// The job a spec asks for, checked before a thread is started, its
+/// absolute output folder and the command that runs it.
+fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command), String> {
     let dialect = |id: &str| -> Result<Dialect, String> {
         id.parse().map_err(|_| format!("unknown dialect `{id}`"))
     };
@@ -206,14 +356,15 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf), String>
     if !src.exists() {
         return Err(format!("{}: not found", src.display()));
     }
+    let dir = match src.is_dir() {
+        true => src.clone(),
+        false => src.parent().map(Path::to_path_buf).unwrap_or_default(),
+    };
     let cfg = Resolved::load(&Sources {
         project: None,
         user: None,
         isolated,
-        cwd: Some(match src.is_dir() {
-            true => src.clone(),
-            false => src.parent().map(Path::to_path_buf).unwrap_or_default(),
-        }),
+        cwd: Some(dir.clone()),
         packs: Vec::new(),
         cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
     })
@@ -235,7 +386,8 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf), String>
         instances: None,
         queue_all: false,
     };
-    Ok((job, out))
+    let command = Command::new(&program(), &job, &dir, isolated);
+    Ok((job, out, command))
 }
 
 fn execute(run: &Arc<Run>, job: Job) -> State {

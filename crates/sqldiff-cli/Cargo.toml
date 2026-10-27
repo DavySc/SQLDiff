@@ -22,3 +22,7 @@ serde_json.workspace = true
 clap.workspace = true
 sha2.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+# The app's runs, for the GUI-vs-CLI parity test.
+sqldiff-gui = { path = "../sqldiff-gui" }

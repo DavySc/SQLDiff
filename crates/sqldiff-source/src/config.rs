@@ -529,7 +529,8 @@ fn compile(p: &Policy) -> Result<Compiled> {
     })
 }
 
-fn find_project(cwd: &Path) -> Option<PathBuf> {
+/// `sqldiff.toml` in `cwd` or the nearest ancestor that has one.
+pub fn find_project(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
         .map(|d| d.join(PROJECT_FILE))
         .find(|p| p.is_file())
