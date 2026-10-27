@@ -1802,11 +1802,14 @@ impl<'a> Cx<'a> {
         match ts[s[0]].up().as_str() {
             "INSERT" if !ts[s[1]].is("INTO") => pre = "INSERT INTO ".into(),
             "UPDATE" => {
-                let set = find_word(&ts, 0, "SET").unwrap_or(0);
-                if let Some(f) = find_word(&ts, set, "FROM") {
+                let set = find_word(&ts, 0, "SET");
+                if let Some(f) = find_word(&ts, set.unwrap_or(0), "FROM") {
                     if self.db2() {
                         return no("UPDATE … FROM with a join: Db2 for i needs a correlated subquery or MERGE, and with several matching rows T-SQL picks one unpredictably; needs a rewrite");
                     }
+                    let Some(set) = set else {
+                        return no("UPDATE … FROM without a SET clause the rules can read (the assignments may be a placeholder a generator fills); convert it by hand");
+                    };
                     return self.update_join(&ts, set, f);
                 }
                 from = s[0];
