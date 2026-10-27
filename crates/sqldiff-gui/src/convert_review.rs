@@ -90,33 +90,39 @@ struct Loaded {
 }
 
 /// Every file under the source, OUT and the instance report, with its size
-/// and modification time: what a gate verdict was judged on.
+/// and modification time: what a gate verdict was judged on. Names starting
+/// with a dot are skipped and links not followed below the given paths, as
+/// the engine reads a tree.
 type Stamp = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
 
 fn stamp(s: &Setup) -> Stamp {
-    fn add(p: &Path, out: &mut Stamp) {
-        let Ok(m) = std::fs::metadata(p) else {
-            out.push((p.to_path_buf(), u64::MAX, None));
-            return;
-        };
-        if m.is_dir() {
-            let mut entries: Vec<PathBuf> = std::fs::read_dir(p)
-                .map(|d| d.flatten().map(|e| e.path()).collect())
-                .unwrap_or_default();
-            entries.sort();
-            out.push((p.to_path_buf(), entries.len() as u64, None));
-            for e in entries {
-                add(&e, out);
+    fn dir(p: &Path, out: &mut Stamp) {
+        let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(p)
+            .map(|d| d.flatten().collect())
+            .unwrap_or_default();
+        entries.retain(|e| !e.file_name().to_string_lossy().starts_with('.'));
+        entries.sort_by_key(|e| e.file_name());
+        out.push((p.to_path_buf(), entries.len() as u64, None));
+        for e in entries {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => dir(&e.path(), out),
+                _ => file(&e.path(), std::fs::symlink_metadata(e.path()), out),
             }
-        } else {
-            out.push((p.to_path_buf(), m.len(), m.modified().ok()));
+        }
+    }
+    fn file(p: &Path, m: std::io::Result<std::fs::Metadata>, out: &mut Stamp) {
+        match m {
+            Ok(m) => out.push((p.to_path_buf(), m.len(), m.modified().ok())),
+            Err(_) => out.push((p.to_path_buf(), u64::MAX, None)),
         }
     }
     let mut out = Vec::new();
-    add(&s.tree.src, &mut out);
-    add(&s.out, &mut out);
-    if let Some(p) = &s.instances {
-        add(p, &mut out);
+    let given = [Some(&s.tree.src), Some(&s.out), s.instances.as_ref()];
+    for p in given.into_iter().flatten() {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_dir() => dir(p, &mut out),
+            m => file(p, m, &mut out),
+        }
     }
     out
 }
@@ -809,6 +815,9 @@ fn empty() -> Loaded {
 /// Reads and converts the tree (reusing `prev`'s conversion when no source
 /// changed), applies the ledger in OUT and reads the instance report.
 fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
+    // Taken before anything is read: a file that changes while this read
+    // judges makes the verdict stale.
+    let stamp = stamp(s);
     let instances = match &s.instances {
         Some(p) => Some(queue::read_instances(p)?),
         None => None,
@@ -836,8 +845,6 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
             (t, started.elapsed().as_secs_f64() * 1000.0, true)
         }
     };
-    // Taken first: a file changed while this read judges makes it stale.
-    let stamp = stamp(s);
     let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
     let gate = judge(&mut t, &inputs, s, instances.as_ref());
     let ids = inputs
