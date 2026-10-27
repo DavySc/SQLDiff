@@ -1228,6 +1228,17 @@ fn char_of_an_ascii_code_becomes_chr() {
     let out = out_of(&c, u);
     assert!(out.contains("chr(13)") && out.contains("chr(10)"), "{out}");
     assert!(!out.to_uppercase().contains("CHAR("), "{out}");
+    // `+` between two calls is concatenation: PostgreSQL has no text + text.
+    assert!(out.contains("chr(13) || chr(10)"), "{out}");
+    assert!(!out.contains('+'), "{out}");
+}
+
+#[test]
+fn plus_next_to_a_string_builtin_is_concatenation() {
+    let src = "DECLARE @s varchar(200) = DB_NAME() + CHAR(9);";
+    let c = tsql(src);
+    let out = c.output.clone();
+    assert!(out.contains("current_database() || chr(9)"), "{out}");
 }
 
 #[test]

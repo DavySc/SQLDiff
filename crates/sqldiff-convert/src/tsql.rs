@@ -3639,6 +3639,17 @@ impl<'a> Cx<'a> {
                 .vars
                 .get(&t.s.trim_start_matches('@').to_ascii_lowercase())
                 .map_or((false, false), |v| (v.string, v.numeric)),
+            // A call to a built-in that returns a string: `CHAR(13) + CHAR(10)`.
+            IDENT if next_sig(ts, j).is_some_and(|n| ts[n].k == L_PAREN) => {
+                (string_builtin(t), false)
+            }
+            R_PAREN => {
+                let open = (0..j)
+                    .rev()
+                    .find(|&o| ts[o].k == L_PAREN && matching(ts, o) == Some(j));
+                let name = open.and_then(|o| prev_sig(ts, o));
+                (name.is_some_and(|n| string_builtin(&ts[n])), false)
+            }
             _ => (false, false),
         }
     }
@@ -5373,6 +5384,12 @@ fn date_part(p: &str) -> Option<&'static str> {
         "second" | "ss" | "s" => "second",
         _ => return None,
     })
+}
+
+/// A T-SQL built-in whose result is always a string, so `+` next to a call
+/// to it is concatenation.
+fn string_builtin(t: &T) -> bool {
+    ["CHAR", "NCHAR", "DB_NAME"].iter().any(|w| t.is(w))
 }
 
 /// A date-time text whose fractional seconds PostgreSQL's microseconds
