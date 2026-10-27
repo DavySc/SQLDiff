@@ -750,3 +750,31 @@ fn db2_select_needs_from_and_sysdummy1_binds() {
     let r = check_rules(Dialect::Postgres, "SELECT 1;", None);
     assert!(rules(&r).is_empty(), "{:?}", rules(&r));
 }
+
+/// A PL/pgSQL option line before DECLARE is not a statement: the variables declared after it
+/// stay in scope. `#` is still an operator inside an expression.
+#[test]
+fn pg_option_line_before_declare_keeps_variables_in_scope() {
+    let body = "declare\n    v_qty integer := 1;\n    v_total integer;\nbegin\n    v_total := v_qty + 1;\n    perform v_total;\nend\n";
+    for option in [
+        "",
+        "#variable_conflict use_column\n",
+        "-- note\n#print_strict_params on\n#variable_conflict error\n",
+    ] {
+        let src =
+            format!("create function f() returns void language plpgsql as $$\n{option}{body}$$;\n");
+        let r = check_rules(Dialect::Postgres, &src, None);
+        assert!(
+            !rules(&r).iter().any(|x| x.0.starts_with("bind.")),
+            "option {option:?}: {:?}",
+            rules(&r)
+        );
+    }
+    let xor = "create function g(a integer, b integer) returns integer language sql as $$ select a # b $$;";
+    let r = check_rules(Dialect::Postgres, xor, None);
+    assert!(
+        !rules(&r).iter().any(|x| x.0.starts_with("bind.")),
+        "{:?}",
+        rules(&r)
+    );
+}
