@@ -18,6 +18,7 @@ pub mod changes;
 pub mod compose;
 pub mod config;
 mod error;
+pub mod format_file;
 pub mod fs;
 pub mod git;
 pub mod glob;

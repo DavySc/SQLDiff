@@ -575,6 +575,7 @@ dependencies = [
  "sqldiff-core",
  "sqldiff-syntax",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

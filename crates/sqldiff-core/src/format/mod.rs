@@ -172,6 +172,32 @@ impl FormatKeys {
         );
     }
 
+    /// Every key set to what `o` holds: the inverse of [`FormatKeys::apply`].
+    pub fn from_options(o: &FormatOptions) -> FormatKeys {
+        FormatKeys {
+            indent: Some(o.indent_width),
+            indent_style: Some(o.indent_style),
+            keyword_case: Some(o.keyword_case),
+            clause_breaks: Some(o.clause_breaks),
+            one_item_per_line: Some(o.one_item_per_line),
+            space_after_comma: Some(o.space_after_comma),
+            space_around_comparisons: Some(o.space_around_comparisons),
+            max_blank_lines: Some(o.max_blank_lines),
+            line_ending: Some(o.line_ending),
+            final_newline: Some(o.final_newline),
+            join_lines: Some(o.join_lines),
+            postgres_bodies: Some(o.postgres_bodies),
+        }
+    }
+
+    /// The names of the keys set here, as the config file spells them.
+    pub fn names(&self) -> Vec<String> {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::Object(m)) => m.keys().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     pub fn validate(&self, section: &str) -> Result<(), String> {
         if let Some(i) = self.indent {
             if !(1..=16).contains(&i) {
