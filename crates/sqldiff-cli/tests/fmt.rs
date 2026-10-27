@@ -61,7 +61,17 @@ fn layout_comes_from_config_then_flags() {
     let o = sqldiff(&d, &["fmt", "q.pg.sql"]);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     assert_eq!(stdout(&o), "select a,\n    b\nfrom t\nwhere x = 1\n");
-    let o = sqldiff(&d, &["fmt", "--keyword-case", "upper", "--indent", "2", "q.pg.sql"]);
+    let o = sqldiff(
+        &d,
+        &[
+            "fmt",
+            "--keyword-case",
+            "upper",
+            "--indent",
+            "2",
+            "q.pg.sql",
+        ],
+    );
     assert_eq!(stdout(&o), "SELECT a,\n  b\nFROM t\nWHERE x = 1\n");
     // A T-SQL file does not get the PostgreSQL table.
     std::fs::write(d.join("q.tsql.sql"), SRC).unwrap();
