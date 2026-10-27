@@ -71,8 +71,8 @@ pub struct App {
     pub convert: convert::Setup,
     pub compare: Option<Session>,
     pub review: Option<Review>,
-    /// Where the list of recent comparisons is kept (paths only); `None`
-    /// keeps none.
+    /// Where the list of recent comparisons (paths only) and the run
+    /// history are kept; `None` keeps neither.
     pub data_dir: Option<PathBuf>,
     /// Sessions opened from the app ignore project and user config files.
     pub isolated: bool,
@@ -154,7 +154,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         convert: app.convert,
         compare: Mutex::new(app.compare.map(|s| Arc::new(Mutex::new(s)))),
         review: app.review.map(Mutex::new),
-        runs: Runs::default(),
+        runs: Runs::with_history(app.data_dir.as_deref()),
         data_dir: app.data_dir,
         isolated: app.isolated,
         local,
@@ -258,8 +258,18 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             return json(&run.view());
         }
         let prefix = run_review_path(run.id);
-        let (Some(sub), Some(review)) = (mount(&req, &prefix), run.review()) else {
+        let Some(sub) = mount(&req, &prefix) else {
             return not_found();
+        };
+        // A run from an earlier session opens its tree from disk, which
+        // loads config: as for starting runs, only on this computer.
+        if run.review().is_none() && run.past() && !app.local {
+            return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string());
+        }
+        let review = match app.runs.open_review(&run, app.isolated) {
+            Ok(Some(r)) => r,
+            Ok(None) => return not_found(),
+            Err(e) => return ("409 Conflict", "text/plain", e),
         };
         let res = convert_review::route(&review, &sub);
         return match sub.path == "/" {

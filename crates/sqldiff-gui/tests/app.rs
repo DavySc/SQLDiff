@@ -670,6 +670,123 @@ fn a_run_never_reads_or_writes_where_a_running_run_writes() {
         assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
         assert!(text.contains(says), "{body}: {text}");
     }
+    // Another spelling of the same folder is the same folder.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&d.0, d.0.join("link")).unwrap();
+        let spec = serde_json::json!({ "src": d.0.join("src"), "out": d.0.join("link/out"), "from": "tsql", "to": "postgres" });
+        let (status, text) = request(addr, "POST", "/api/runs", &spec.to_string());
+        assert!(still(addr), "the first run finished too soon for this test");
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
+        assert!(text.contains("another run is writing there"), "{text}");
+    }
     request(addr, "POST", &format!("/runs/{id}/cancel"), "{}");
     assert_eq!(finished(addr, id)["state"], "cancelled");
+}
+
+#[test]
+fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
+    let d = Dir::new("history");
+    d.write("src/a.sql", "CREATE TABLE t (a int NOT NULL);\n");
+    let data = d.0.join("data");
+    let kept = || App {
+        data_dir: Some(data.clone()),
+        isolated: false,
+        ..app(None, None)
+    };
+    let addr = start(kept());
+    let spec = serde_json::json!({
+        "src": d.0.join("src"),
+        "out": d.0.join("out"),
+        "from": "tsql",
+        "to": "postgres",
+    });
+    let (status, body) = request(addr, "POST", "/api/runs", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let run = finished(addr, id);
+    assert_eq!(run["state"], "done", "{run}");
+    assert_eq!(run["past"], false);
+    // Paths, settings and totals: never the SQL.
+    let file = data.join("gui").join("runs.json");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(!text.contains("CREATE TABLE"), "{text}");
+    assert!(text.contains(r#""state": "done""#), "{text}");
+
+    // After a restart: listed as it finished, and its review opens again
+    // from the tree on disk, with the done gate judged there.
+    let addr = start(kept());
+    let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+    let past = &runs[0];
+    assert_eq!((&past["id"], &past["past"]), (&id.into(), &true.into()));
+    assert_eq!(past["state"], "done");
+    assert_eq!(past["command"], run["command"]);
+    assert_eq!(past["totals"], run["totals"]);
+    assert!(past["gate"].is_null(), "judged once the review opens");
+    let review = format!("/runs/{id}/review");
+    let (status, _) = get(addr, &review);
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    let state: serde_json::Value =
+        serde_json::from_str(&get(addr, &format!("{review}/api/state")).1).unwrap();
+    assert_eq!(state["gate"]["complete"], true, "{state}");
+    let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+    assert_eq!(runs[0]["gate"]["complete"], true, "{runs}");
+    // New runs go on from the last number.
+    let spec2 = serde_json::json!({ "src": d.0.join("src"), "out": d.0.join("out2"), "from": "tsql", "to": "postgres" });
+    let (_, body) = request(addr, "POST", "/api/runs", &spec2.to_string());
+    let id2 = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(id2, id + 1);
+    finished(addr, id2);
+
+    // Config found from the source changed since: the review is not opened
+    // on other config than the run's.
+    d.write("src/sqldiff.toml", "");
+    let addr = start(kept());
+    let (status, text) = get(addr, &review);
+    assert_eq!(status, "HTTP/1.1 409 Conflict", "{text}");
+    assert!(text.contains("other config"), "{text}");
+    std::fs::remove_file(d.0.join("src/sqldiff.toml")).unwrap();
+    // The source gone: refused, not opened on nothing.
+    std::fs::rename(d.0.join("src"), d.0.join("gone")).unwrap();
+    let (status, text) = get(addr, &review);
+    assert_eq!(status, "HTTP/1.1 409 Conflict", "{text}");
+    std::fs::rename(d.0.join("gone"), d.0.join("src")).unwrap();
+    // Opened again on a network address only from this computer.
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let lan = SocketAddr::from(([127, 0, 0, 1], listener.local_addr().unwrap().port()));
+    let lan_app = kept();
+    std::thread::spawn(move || serve(listener, lan_app, &[]));
+    assert_eq!(get(lan, &review).0, "HTTP/1.1 403 Forbidden");
+}
+
+#[test]
+fn a_run_the_app_stopped_during_is_listed_as_failed() {
+    let d = Dir::new("history-stopped");
+    let spec = serde_json::json!({ "kind": "convert", "src": d.0.join("src"), "out": d.0.join("out"), "from": "tsql", "to": "postgres" });
+    let record = serde_json::json!([{
+        "id": 7,
+        "spec": spec,
+        "command": { "args": ["convert"], "project_config": null, "user_config": null, "powershell": "sqldiff convert", "sh": "sqldiff convert" },
+        "started": "2026-10-27T10:00:00Z",
+        "checked": 3,
+        "total": 9,
+        "state": { "state": "running" },
+    }]);
+    d.write("data/gui/runs.json", &record.to_string());
+    let addr = start(App {
+        data_dir: Some(d.0.join("data")),
+        ..app(None, None)
+    });
+    let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+    assert_eq!(runs[0]["id"], 7, "{runs}");
+    assert_eq!(runs[0]["state"], "failed");
+    assert!(runs[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("may be incomplete"));
+    assert_eq!(get(addr, "/runs/7/review").0, "HTTP/1.1 404 Not Found");
 }

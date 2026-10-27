@@ -475,6 +475,13 @@ fn the_done_gate_follows_the_decisions_and_the_files() {
     let g = r.state(false).gate.expect("judged");
     assert!(g.complete, "{:?}", g.blockers);
     assert_eq!(g.nothing_found, 1, "the table: nothing found, not reviewed");
+    // Accepted by name, as `sqldiff review-status` lists it.
+    assert!(!g.accepted.is_empty());
+    assert!(
+        g.accepted.iter().all(|a| a.authors == ["Davy"]),
+        "{:?}",
+        g.accepted
+    );
     r.refresh().unwrap();
     assert!(r.state(false).gate.unwrap().complete);
     // The converted tree no longer what converting gives. Before anything

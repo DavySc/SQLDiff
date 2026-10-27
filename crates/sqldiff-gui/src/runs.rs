@@ -1,5 +1,7 @@
 //! Runs: long work started from the app, with progress, cancel and a list
-//! kept while the app runs. A run converts a tree into an output folder
+//! kept in the data directory (`gui/runs.json`: paths, settings, totals and
+//! errors, never SQL text), so finished runs, and their reviews, are there
+//! again after a restart. A run converts a tree into an output folder
 //! through `sqldiff_convert::job` (what `sqldiff convert` runs), or checks
 //! the instances of converted templates through
 //! `sqldiff_convert::instances` (what `sqldiff instances` runs), so a run
@@ -94,7 +96,7 @@ pub struct InstancesSpec {
 }
 
 /// What a run was asked to do.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Spec {
     Convert(ConvertSpec),
@@ -108,7 +110,7 @@ enum Work {
 }
 
 /// Where a run is.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum State {
     Running,
@@ -141,7 +143,7 @@ pub enum State {
 /// every config file the run loaded and finds no other (`--isolated`), so
 /// it loads the same config whatever folder, environment or `sqldiff` on
 /// the PATH it is run with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Command {
     /// The arguments after the program.
     pub args: Vec<String>,
@@ -329,11 +331,14 @@ pub struct Run {
     pub id: u64,
     pub spec: Spec,
     pub command: Command,
-    /// Absolute output folder, and what the run reads: no two running runs
-    /// write into one folder, and none reads where another writes.
+    /// Output folder and what the run reads, as `canonical` paths: no two
+    /// running runs write into one folder, and none reads where another
+    /// writes.
     out: PathBuf,
     reads: Vec<PathBuf>,
     started: String,
+    /// Kept from an earlier session of the app.
+    past: bool,
     checked: AtomicUsize,
     total: AtomicUsize,
     cancel: Arc<AtomicBool>,
@@ -351,6 +356,9 @@ pub struct GateView {
     /// Blockers per kind, and in all.
     pub counts: std::collections::BTreeMap<String, usize>,
     pub blockers: usize,
+    /// Assumptions accepted and decisions picked, by name, as
+    /// `sqldiff review-status` lists them.
+    pub accepted: Vec<sqldiff_convert::gate::Accepted>,
     /// Why the gate could not be judged.
     pub error: Option<String>,
 }
@@ -363,6 +371,9 @@ pub struct RunView {
     pub spec: Spec,
     pub command: Command,
     pub started: String,
+    /// From an earlier session of the app: its review opens again from the
+    /// tree on disk.
+    pub past: bool,
     pub checked: usize,
     pub total: usize,
     pub cancelling: bool,
@@ -380,6 +391,7 @@ impl Run {
             spec: self.spec.clone(),
             command: self.command.clone(),
             started: self.started.clone(),
+            past: self.past,
             checked: self.checked.load(Ordering::Relaxed),
             total: self.total.load(Ordering::Relaxed),
             cancelling: self.cancel.load(Ordering::Relaxed),
@@ -399,17 +411,24 @@ impl Run {
                     complete: g.complete,
                     counts: g.counts,
                     blockers: g.blockers.len(),
+                    accepted: g.accepted,
                     error: None,
                 },
                 Err(e) => GateView {
                     complete: false,
                     counts: Default::default(),
                     blockers: 0,
+                    accepted: Vec::new(),
                     error: Some(e),
                 },
             });
         }
         seen.clone()
+    }
+
+    /// Kept from an earlier session of the app.
+    pub fn past(&self) -> bool {
+        self.past
     }
 
     pub fn state(&self) -> State {
@@ -432,10 +451,181 @@ impl Run {
 #[derive(Default)]
 pub struct Runs {
     next: AtomicU64,
-    list: Mutex<Vec<Arc<Run>>>,
+    list: Arc<Mutex<Vec<Arc<Run>>>>,
+    /// Where the list is kept; `None` keeps it while the app runs only.
+    history: Option<PathBuf>,
+}
+
+/// A run as `gui/runs.json` keeps it.
+#[derive(Deserialize, Serialize)]
+struct Record {
+    id: u64,
+    spec: Spec,
+    command: Command,
+    started: String,
+    checked: usize,
+    total: usize,
+    state: State,
+}
+
+/// Most runs kept in the history.
+pub const HISTORY_MAX: usize = 100;
+
+fn history_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("gui").join("runs.json")
+}
+
+/// Writes the newest `HISTORY_MAX` runs of `list` to `file`, through a
+/// temporary file so a reader never sees half of it. The history is a
+/// convenience: a failure to write it is not an error.
+fn save(file: &Path, list: &[Arc<Run>]) {
+    let records: Vec<Record> = list
+        .iter()
+        .rev()
+        .take(HISTORY_MAX)
+        .rev()
+        .map(|r| Record {
+            id: r.id,
+            spec: r.spec.clone(),
+            command: r.command.clone(),
+            started: r.started.clone(),
+            checked: r.checked.load(Ordering::Relaxed),
+            total: r.total.load(Ordering::Relaxed),
+            state: r.state(),
+        })
+        .collect();
+    let Some(dir) = file.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = file.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(&records).unwrap() + "\n";
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
+}
+
+/// `p` (absolute) with every link resolved, and on Windows the case and
+/// form of its existing part, so that two spellings of one folder compare
+/// equal; the part that does not exist yet is kept as given.
+fn canonical(p: &Path) -> PathBuf {
+    let mut tail = Vec::new();
+    let mut base = p;
+    loop {
+        if let Ok(mut c) = base.canonicalize() {
+            c.extend(tail.iter().rev());
+            return c;
+        }
+        match (base.parent(), base.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                base = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
 }
 
 impl Runs {
+    /// Runs kept in `data_dir` (`None` keeps none). A run that was still
+    /// running when the app stopped is listed as failed: what it wrote may
+    /// be incomplete.
+    pub fn with_history(data_dir: Option<&Path>) -> Runs {
+        let Some(file) = data_dir.map(history_file) else {
+            return Runs::default();
+        };
+        let records: Vec<Record> = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let list: Vec<Arc<Run>> = records
+            .into_iter()
+            .map(|r| {
+                let state = match r.state {
+                    State::Running => State::Failed {
+                        error: "the app stopped while this run was running; what it wrote may be incomplete".into(),
+                        finished: r.started.clone(),
+                    },
+                    s => s,
+                };
+                let out = match &r.spec {
+                    Spec::Convert(s) => &s.out,
+                    Spec::Instances(s) => &s.out,
+                };
+                Arc::new(Run {
+                    id: r.id,
+                    out: canonical(&browse::absolute(Path::new(out.trim()))),
+                    reads: Vec::new(),
+                    spec: r.spec,
+                    command: r.command,
+                    started: r.started,
+                    past: true,
+                    checked: AtomicUsize::new(r.checked),
+                    total: AtomicUsize::new(r.total),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    state: Mutex::new(state),
+                    review: Mutex::new(None),
+                    gate: Mutex::new(None),
+                })
+            })
+            .collect();
+        Runs {
+            next: AtomicU64::new(list.iter().map(|r| r.id).max().unwrap_or(0)),
+            list: Arc::new(Mutex::new(list)),
+            history: Some(file),
+        }
+    }
+
+    /// The review of `run`: the one it opened, or for a finished conversion
+    /// from an earlier session, its tree on disk opened again as a run of
+    /// its settings finds it now. `Ok(None)` when the run has no review;
+    /// an error when it cannot be opened as the run wrote it.
+    pub fn open_review(
+        &self,
+        run: &Arc<Run>,
+        isolated: bool,
+    ) -> Result<Option<Arc<Mutex<Review>>>, String> {
+        let mut slot = run.review.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = slot.as_ref() {
+            return Ok(Some(Arc::clone(r)));
+        }
+        let (Spec::Convert(spec), State::Done { .. }, true) = (&run.spec, run.state(), run.past)
+        else {
+            return Ok(None);
+        };
+        {
+            let l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+            if l.iter().any(|r| {
+                matches!(r.state(), State::Running)
+                    && (r.out.starts_with(&run.out) || run.out.starts_with(&r.out))
+            }) {
+                return Err(format!(
+                    "{}: another run is writing there; wait for it or cancel it",
+                    run.out.display()
+                ));
+            }
+        }
+        let (job, _, command) = prepare(spec, isolated)?;
+        if (&command.args, &command.project_config, &command.user_config)
+            != (
+                &run.command.args,
+                &run.command.project_config,
+                &run.command.user_config,
+            )
+        {
+            return Err(format!(
+                "a run with these settings now loads other config than this run did ({}); start the run again to review it with the config as it is now",
+                run.command.project_config.as_deref().or(command.project_config.as_deref()).unwrap_or("project and user config files")
+            ));
+        }
+        let review = Review::open(convert_review::Setup {
+            tree: job.tree,
+            out: job.out,
+            instances: job.instances,
+        })?;
+        let review = Arc::new(Mutex::new(review));
+        *slot = Some(Arc::clone(&review));
+        Ok(Some(review))
+    }
+
     /// Newest first.
     pub fn list(&self) -> Vec<Arc<Run>> {
         let l = self.list.lock().unwrap_or_else(|e| e.into_inner());
@@ -504,6 +694,8 @@ impl Runs {
         command: Command,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
+        let out = canonical(&out);
+        let reads: Vec<PathBuf> = reads.iter().map(|p| canonical(p)).collect();
         let run = {
             let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
             let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
@@ -534,6 +726,7 @@ impl Runs {
                 out,
                 reads,
                 started: sqldiff_review::time::now(),
+                past: false,
                 checked: AtomicUsize::new(0),
                 total: AtomicUsize::new(0),
                 cancel: Arc::new(AtomicBool::new(false)),
@@ -542,17 +735,40 @@ impl Runs {
                 gate: Mutex::new(None),
             });
             l.push(Arc::clone(&run));
+            if let Some(f) = &self.history {
+                save(f, &l);
+            }
             run
         };
         let r = Arc::clone(&run);
-        std::thread::Builder::new()
+        let (list, history) = (Arc::clone(&self.list), self.history.clone());
+        let finish = move |r: &Arc<Run>, state: State| {
+            let l = list.lock().unwrap_or_else(|e| e.into_inner());
+            *r.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+            if let Some(f) = &history {
+                save(f, &l);
+            }
+        };
+        let fail = finish.clone();
+        let spawned = std::thread::Builder::new()
             .stack_size(sqldiff_core::ENGINE_STACK)
             .spawn(move || {
                 let state = execute(&r, work);
-                *r.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
+                finish(&r, state);
                 done(&r);
-            })
-            .map_err(|e| e.to_string())?;
+            });
+        if let Err(e) = spawned {
+            // Never left running: that would hold its folder until a restart.
+            let error = format!("the run could not be started: {e}");
+            fail(
+                &run,
+                State::Failed {
+                    error: error.clone(),
+                    finished: sqldiff_review::time::now(),
+                },
+            );
+            return Err(error);
+        }
         Ok(run)
     }
 }

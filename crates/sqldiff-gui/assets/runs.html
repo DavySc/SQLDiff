@@ -93,6 +93,8 @@ label.tog { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5
 .legend { grid-column: 2 / -1; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
 .legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; background: var(--c); }
 .legend b { color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }
+details.accepted { grid-column: 2 / -1; font-size: 12.5px; color: var(--muted); }
+details.accepted ul { margin: 4px 0 0; padding-left: 18px; }
 .failed-msg { grid-column: 2 / -1; color: var(--bad); font-size: 12.5px; overflow-wrap: anywhere; }
 .empty { padding: 16px; color: var(--muted); font-size: 13px; }
 a.btn { font-size: 12.5px; font-weight: 500; border: 1px solid var(--focus); color: var(--focus); border-radius: 6px; padding: 4px 10px; text-decoration: none; white-space: nowrap; }
@@ -209,7 +211,7 @@ function row(r) {
   const inst = r.kind === "instances";
   const title = inst ? `Check instances ${pair}` : `Convert ${r.template ? "templates " : ""}${pair}`;
   const what = inst ? (r.generator_only ? `the generator's output in <span class="path">${esc(r.woven)}</span>` : `<span class="path">${esc(r.target)}</span>`) : `<span class="path">${esc(r.src)}</span>`;
-  const sub = `${what} into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}`;
+  const sub = `${what} into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? ` · <span title="Kept from an earlier session of the app; its review opens again from the tree on disk">earlier session</span>` : ""}`;
   let right = "", act = "", extra = "", dot = r.state;
   if (r.state === "running") {
     const pct = r.total ? r.checked / r.total * 100 : 0;
@@ -224,10 +226,11 @@ function row(r) {
   } else if (r.state === "done") {
     const u = r.totals.units || {};
     const g = r.gate;
-    const gate = !g ? "" : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
+    const gate = !g ? (r.past ? " · done gate judged when the review opens" : "") : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
     right = ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>`;
     act = `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`;
     extra = legend(u)
+      + (g && g.accepted.length ? `<details class="accepted"><summary>Accepted by name: ${g.accepted.length} rule${g.accepted.length === 1 ? "" : "s"}</summary><ul>${g.accepted.map((x) => `<li>${esc(x.state)} <code>${esc(x.rule)}</code> on ${x.units} unit${x.units === 1 ? "" : "s"} by ${esc(x.authors.join(", "))}</li>`).join("")}</ul></details>` : "")
       + (r.not_applied.length ? `<div class="failed-msg">${r.not_applied.length} review decision${r.not_applied.length === 1 ? " was" : "s were"} not applied: ${esc(r.not_applied[0])}${r.not_applied.length > 1 ? " …" : ""}</div>` : "");
   } else if (r.state === "cancelled") {
     right = `<div class="meta">Cancelled; nothing was written into the output folder</div>`;
@@ -256,7 +259,7 @@ function sheet(r) {
 
 let timer = null;
 function render(runs) {
-  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, and open for review when they finish.</div>`;
+  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, open for review when they finish, and stay listed after the app restarts.</div>`;
   $("runs").querySelectorAll("[data-cancel]").forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
     try { await post(`/runs/${b.dataset.cancel}/cancel`, {}); } catch (e) { $("err").textContent = e.message; }

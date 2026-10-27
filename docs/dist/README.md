@@ -45,8 +45,13 @@ run writes exactly what `sqldiff convert src/ out/ --from … --to …` writes,
 with the project config found from the source folder upward. Each run's Command line shows that
 command for PowerShell and for sh, ready to copy into a script or pipeline,
 naming the config files it loaded (and, with `--isolated`, no others), so
-it writes the same from any folder or terminal. Runs are listed until the app is
-closed; the output folder and its review ledger stay.
+it writes the same from any folder or terminal. The list of runs (paths,
+settings, totals and errors, never SQL) is kept in SQLDiff's data folder, so
+finished runs are listed again after a restart, marked "earlier session",
+and their Review opens again from the tree on disk. It is not opened when
+the config a run of those settings finds has changed since; start the run
+again instead. The list is not kept when the data folder is encrypted or the
+app runs `--isolated`.
 
 The rail on the left switches between Home, Runs, Compare, Convert and Review
 in the same window. From a terminal the app can also start on files, folders or a
