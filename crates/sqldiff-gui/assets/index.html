@@ -254,6 +254,7 @@ table.q .none { color: var(--faint); }
 </style>
 </head>
 <body>
+<!--__SQLDIFF_SHELL__-->
 <header>
   <span class="logo" aria-hidden="true"></span>
   <nav id="nav"></nav>
@@ -313,6 +314,8 @@ table.q .none { color: var(--faint); }
 <script>
 "use strict";
 const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+// Where this view's API lives: "" alone, "/compare" inside the app.
+const BASE = /*__SQLDIFF_BASE__*/"";
 const CLASS_ORDER = ["transactional", "concurrency", "cardinality", "binding", "semantic", "residue", "limit", "structural", "cosmetic"];
 const SEV = { critical: 4, high: 3, medium: 2, low: 1, info: 0 };
 const VERD = { different: 3, unknown: 2, equal_under_assumptions: 1, equal: 0 };
@@ -337,7 +340,7 @@ const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 async function api(method, path, body) {
   const post = method === "POST";
-  const res = await fetch(path, { method, headers: post ? { "Content-Type": "application/json" } : {}, body: post ? JSON.stringify(body || {}) : undefined });
+  const res = await fetch(BASE + path, { method, headers: post ? { "Content-Type": "application/json" } : {}, body: post ? JSON.stringify(body || {}) : undefined });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -449,7 +452,7 @@ function renderProv() {
   const layers = s.layers.length ? s.layers.map((l) => `<span class="layer" title="${esc(l.kind)} · ${esc(l.hash)}">${esc(l.name)}${l.version ? " " + esc(l.version) : ""} <code>${esc(l.hash.slice(0, 8))}</code></span>`).join("") : "built-in";
   parts.push(kv("Config", layers));
   parts.push(kv("Tool", `sqldiff ${esc(s.tool_version)}${state.live ? "" : " · static export"}`));
-  if (state.live) parts.push(`<div class="acts"><button id="btn-refresh" title="Re-read the sources (r)">Re-read sources <kbd>r</kbd></button><a href="/api/report" target="_blank">Report ↗</a><a href="/api/report?redact=1" target="_blank">Redacted report ↗</a></div>`);
+  if (state.live) parts.push(`<div class="acts"><button id="btn-refresh" title="Re-read the sources (r)">Re-read sources <kbd>r</kbd></button><a href="${BASE}/api/report" target="_blank">Report ↗</a><a href="${BASE}/api/report?redact=1" target="_blank">Redacted report ↗</a></div>`);
   $("provbar").innerHTML = parts.join("");
   if ($("btn-refresh")) $("btn-refresh").onclick = refresh;
 }
@@ -1065,8 +1068,8 @@ function commands() {
       else add(`Reset assumption: ${a.id}`, () => setFlip(a.id, "open"));
     }
     add("Re-read sources", refresh, "r");
-    add("Open session report", () => window.open("/api/report", "_blank"));
-    add("Open redacted session report", () => window.open("/api/report?redact=1", "_blank"));
+    add("Open session report", () => window.open(BASE + "/api/report", "_blank"));
+    add("Open redacted session report", () => window.open(BASE + "/api/report?redact=1", "_blank"));
     add("Open convert mode", () => window.open("/convert", "_blank"));
   }
   add("Show details: sources, hashes, config", () => toggleInfo(true), "i");

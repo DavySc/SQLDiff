@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQLDiff</title>
+<style>
+/* Palette shared with index.html, convert.html and review.html; keep them in sync. */
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --faint: #9aa1ad; --line: #e8eaee; --soft: #f1f3f6;
+  --radius: 8px; --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5; --focus: #4f46e5;
+  --link-2: rgba(79,70,229,.06);
+  --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --faint: #5d6470; --line: #23272e; --soft: #1c2026;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8; --focus: #818cf8;
+    --link-2: rgba(129,140,248,.08);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+header { min-height: 44px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; gap: 10px; align-items: center; }
+header h1 { font-size: 13px; margin: 0; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+header h1::before { content: ""; width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
+.muted { color: var(--muted); font-size: 12px; }
+.spacer { flex: 1; }
+main { flex: 1; overflow: auto; padding: 32px 20px; }
+.col { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+h2 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 2px; }
+.card { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; align-items: center; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); color: inherit; text-decoration: none; }
+a.card:hover { border-color: var(--focus); background: var(--link-2); }
+a.card:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.card .t { font-weight: 600; }
+.card .s { grid-column: 1; color: var(--muted); font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
+.card .go { grid-row: 1 / span 2; grid-column: 2; color: var(--accent); font-size: 12.5px; font-weight: 500; }
+.card.closed { box-shadow: none; background: transparent; border-style: dashed; }
+.path { font-family: var(--mono); font-size: 12px; color: var(--fg); }
+code { font-family: var(--mono); font-size: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; user-select: all; }
+</style>
+</head>
+<body>
+<!--__SQLDIFF_SHELL__-->
+<header>
+  <h1>SQLDiff</h1>
+  <span class="spacer"></span>
+  <span class="muted" id="version"></span>
+</header>
+<main><div class="col" id="cards"></div></main>
+<script>
+const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const path = (p) => `<span class="path">${esc(p)}</span>`;
+
+function card(href, title, sub, go) {
+  return `<a class="card" href="${href}"><span class="t">${title}</span><span class="go">${go} →</span><span class="s">${sub}</span></a>`;
+}
+function closed(title, sub) {
+  return `<div class="card closed"><span class="t">${title}</span><span class="s">${sub}</span></div>`;
+}
+
+function render(d) {
+  document.getElementById("version").textContent = "v" + d.version;
+  const c = d.convert, cmp = d.compare, r = d.review;
+  const open = [], more = [];
+  if (cmp) {
+    const n = cmp.kind === "folders" ? ` · ${cmp.pairs} pair${cmp.pairs === 1 ? "" : "s"}` : "";
+    open.push(card("/compare", `Compare ${cmp.kind}`, `${path(cmp.a)} with ${path(cmp.b)}${n}`, "Open"));
+  } else {
+    more.push(closed("Compare files or folders", `Start the app on them: <code>sqldiff-gui serve OLD NEW</code>`));
+  }
+  if (r) {
+    open.push(card("/review", `Review ${esc(r.from)} → ${esc(r.to)}`, `${path(r.src)} converted into ${path(r.out)}`, "Open"));
+  } else {
+    more.push(closed("Review a converted tree", `After <code>sqldiff convert SRC -o OUT --to postgres</code>, start the app on it: <code>sqldiff-gui review SRC OUT --to postgres</code>`));
+  }
+  open.push(card("/convert", `Convert ${esc(c.from)} → ${esc(c.to)}`,
+    (c.name ? path(c.name) : "Type or paste SQL and see it converted and checked as you type") + (c.template ? " · template" : ""), "Open"));
+  document.getElementById("cards").innerHTML =
+    `<h2>Open</h2>${open.join("")}` + (more.length ? `<h2 style="margin-top:18px">More</h2>${more.join("")}` : "");
+}
+render(INITIAL);
+</script>
+</body>
+</html>

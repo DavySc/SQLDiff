@@ -236,6 +236,11 @@ impl Session {
         Ok(())
     }
 
+    /// The files or trees the session was opened on.
+    pub fn origin(&self) -> &Origin {
+        &self.origin
+    }
+
     pub fn len(&self) -> usize {
         self.pairs.len()
     }
