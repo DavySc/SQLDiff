@@ -423,6 +423,32 @@ fn fits(u: &Unit, r: &Record) -> Result<(), String> {
     }
 }
 
+/// What no review decision can discharge on a unit: the rules of its notes
+/// that are not proven, differ or are not converted, else the engine's part
+/// or the status when either is raised.
+pub fn undischargeable(u: &Unit) -> Vec<String> {
+    let mut v: Vec<String> = u
+        .notes
+        .iter()
+        .filter(|n| {
+            matches!(
+                n.status,
+                Status::Unproven | Status::Differs | Status::NotConverted
+            )
+        })
+        .map(|n| n.rule.clone())
+        .collect();
+    // The status and the engine's part as backstops: a raised status is never
+    // discharged, whatever notes it came with.
+    if u.checked != Status::Converted && v.is_empty() {
+        v.push(format!("engine: {}", u.checked.label()));
+    }
+    if u.status >= Status::Unproven && v.is_empty() {
+        v.push(format!("status: {}", u.status.label()));
+    }
+    v
+}
+
 fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
     let cur = |s: State, rule: &str| {
         decisions
@@ -430,26 +456,15 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
             .any(|a| a.current && a.record.state == s && a.record.rule == rule)
     };
     let mut open = Vec::new();
-    let mut undischargeable = Vec::new();
     for n in &u.notes {
         match n.status {
-            Status::Converted => {}
             Status::Assumptions if cur(State::Accepted, &n.rule) => {}
             Status::Decision if cur(State::Picked, &n.rule) => {}
             Status::Assumptions | Status::Decision => open.push(n.rule.clone()),
-            Status::Unproven | Status::Differs | Status::NotConverted => {
-                undischargeable.push(n.rule.clone())
-            }
+            _ => {}
         }
     }
-    // The status and the engine's part as backstops: a raised status is never
-    // discharged, whatever notes it came with.
-    if u.checked != Status::Converted && undischargeable.is_empty() {
-        undischargeable.push(format!("engine: {}", u.checked.label()));
-    }
-    if u.status >= Status::Unproven && undischargeable.is_empty() {
-        undischargeable.push(format!("status: {}", u.status.label()));
-    }
+    let undischargeable = undischargeable(u);
     // Hand-written output (applied by the conversion), or a record that the
     // output as it stands was written by hand.
     let written_by = decisions
