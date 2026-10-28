@@ -109,6 +109,12 @@ pub fn run(args: ChangesArgs) -> Result<ExitCode, String> {
     Ok(ExitCode::from(u8::from(fail)))
 }
 
+/// Writes `text` to `path`, making its folder if there is none, so the
+/// command on a run's sheet works on a machine that has not seen the folder.
 fn write(path: &Path, text: &str) -> Result<(), String> {
-    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    let fail = |e: std::io::Error| format!("{}: {e}", path.display());
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(fail)?;
+    }
+    std::fs::write(path, text).map_err(fail)
 }

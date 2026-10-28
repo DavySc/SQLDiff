@@ -400,6 +400,12 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         "HTTP/1.1 403 Forbidden"
     );
     assert!(!d.0.join("out").exists());
+    let changes = serde_json::json!({ "repo": d.0, "base": "main", "out": d.0.join("out") });
+    assert_eq!(
+        request(addr, "POST", "/api/runs/changes", &changes.to_string()).0,
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert!(!d.0.join("out").exists());
     // On loopback the same requests are answered.
     let addr = start(app(None, None));
     assert_eq!(
@@ -911,4 +917,123 @@ fn a_cancelled_drift_run_writes_no_report() {
         .map(|r| r.flatten().map(|e| e.file_name()).collect())
         .unwrap_or_default();
     assert!(written.is_empty(), "{written:?}");
+}
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let o = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+}
+
+/// A repository whose `topic` branch changes `n` SQL files of `main`.
+fn branch(d: &Dir, n: usize) -> PathBuf {
+    let repo = d.0.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    for i in 0..n {
+        d.write(
+            &format!("repo/f{i}.tsql.sql"),
+            "SELECT a FROM t WHERE b = 1;\n",
+        );
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "base"]);
+    git(&repo, &["checkout", "-q", "-b", "topic"]);
+    for i in 0..n {
+        d.write(
+            &format!("repo/f{i}.tsql.sql"),
+            "SELECT a FROM t WHERE b = 2;\n",
+        );
+    }
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-q", "-m", "change"]);
+    repo
+}
+
+fn start_changes(addr: SocketAddr, body: &serde_json::Value) -> u64 {
+    let (status, text) = request(addr, "POST", "/api/runs/changes", &body.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{text}");
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["id"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn a_branch_review_run_writes_its_files_and_is_not_a_review() {
+    let d = Dir::new("changes");
+    let repo = branch(&d, 2);
+    let addr = start(app(None, None));
+    let spec =
+        |out: &str| serde_json::json!({ "repo": repo, "base": "main", "out": d.0.join(out) });
+    let bad = |body: serde_json::Value, says: &str| {
+        let (status, text) = request(addr, "POST", "/api/runs/changes", &body.to_string());
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}: {text}");
+        assert!(text.contains(says), "{body}: {text}");
+    };
+    let mut missing = spec("out");
+    missing["repo"] = d.0.join("nowhere").to_str().unwrap().into();
+    bad(missing, "not found");
+    let mut blank = spec("out");
+    blank["base"] = " ".into();
+    bad(blank, "base revision");
+    let mut dialect = spec("out");
+    dialect["dialect"] = "oracle".into();
+    bad(dialect, "unknown dialect");
+    d.write("full/x.txt", "in the way\n");
+    bad(spec("full"), "not empty");
+    assert!(!d.0.join("out").exists());
+
+    let id = start_changes(addr, &spec("out"));
+    let run = finished(addr, id);
+    assert_eq!(run["kind"], "changes");
+    assert_eq!(run["state"], "done", "{run}");
+    assert_eq!(run["totals"]["verdict"], "different");
+    assert_eq!(run["totals"]["files"], 2);
+    assert_eq!(run["complete"], false);
+    assert!(run["gate"].is_null(), "{run}");
+    for f in ["changes.json", "changes.md", "changes.sarif"] {
+        assert!(d.0.join("out").join(f).is_file(), "{f}");
+    }
+    let args: Vec<_> = run["command"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    assert_eq!(args[0], "changes");
+    assert!(
+        args.contains(&"--no-cache") && args.contains(&"--isolated"),
+        "{args:?}"
+    );
+    assert_eq!(
+        get(addr, &format!("/runs/{id}/review")).0,
+        "HTTP/1.1 404 Not Found"
+    );
+}
+
+#[test]
+fn a_cancelled_branch_review_writes_nothing() {
+    let d = Dir::new("changes-cancel");
+    let repo = branch(&d, 1500);
+    let addr = start(app(None, None));
+    let id = start_changes(
+        addr,
+        &serde_json::json!({ "repo": repo, "base": "main", "out": d.0.join("out") }),
+    );
+    request(addr, "POST", &format!("/runs/{id}/cancel"), "{}");
+    let run = finished(addr, id);
+    assert_eq!(run["state"], "cancelled", "{run}");
+    // Not even the folder: the files and the folder are made after the last cancel point.
+    assert!(!d.0.join("out").exists());
 }

@@ -13,6 +13,8 @@
 //! - `POST /api/runs/drift` `{"trees": [{"dialect", "dir"}, ...], "out", ...}`:
 //!   check the template trees of several dialects for drift, as `sqldiff
 //!   drift` does
+//! - `POST /api/runs/changes` `{"repo", "base", "out", ...}`: review the SQL a
+//!   branch changed, as `sqldiff changes` does
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
@@ -48,7 +50,7 @@ use sqldiff_source::Resolved;
 use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::review::Store;
-use crate::runs::{ConvertSpec, DriftSpec, InstancesSpec, Runs};
+use crate::runs::{ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -168,11 +170,14 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         let Ok(stream) = stream else { continue };
         let shared = Arc::clone(&shared);
         let hosts = Arc::clone(&hosts);
-        std::thread::Builder::new()
+        // A thread that cannot be made (each reserves the engine's large
+        // stack) fails that one request, whose connection closes; it must not
+        // end the server, which would reset every connection still waiting.
+        let _ = std::thread::Builder::new()
             .stack_size(sqldiff_core::ENGINE_STACK)
             .spawn(move || {
                 let _ = handle(stream, &shared, &hosts);
-            })?;
+            });
     }
     Ok(())
 }
@@ -203,6 +208,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         | ("POST", "/api/runs")
         | ("POST", "/api/runs/instances")
         | ("POST", "/api/runs/drift")
+        | ("POST", "/api/runs/changes")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
@@ -247,6 +253,15 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             return match serde_json::from_slice::<DriftSpec>(&req.body)
                 .map_err(|e| e.to_string())
                 .and_then(|spec| app.runs.start_drift(spec, app.isolated, |_| {}))
+            {
+                Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            }
+        }
+        ("POST", "/api/runs/changes") => {
+            return match serde_json::from_slice::<ChangesSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start_changes(spec, app.isolated, |_| {}))
             {
                 Ok(run) => json(&run.view()),
                 Err(e) => bad(e),
