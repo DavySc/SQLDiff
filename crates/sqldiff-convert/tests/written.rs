@@ -313,7 +313,11 @@ fn a_hand_written_unit_is_reviewed_only_once_a_person_has_read_it() {
     assert!(!reviewed);
     assert_eq!(by, Some(By::Agent));
     assert!(open.contains(&"ASM-HAND-WRITTEN".to_string()), "{open:?}");
-    verdict(&fx, "a.sql", "2 = b", "ASM-HAND-WRITTEN", State::Accepted);
+    // The engine's assumptions about the file (no catalog: tables and
+    // column types) are open on the unit too.
+    for rule in open {
+        verdict(&fx, "a.sql", "2 = b", &rule, State::Accepted);
+    }
     verdict(&fx, "a.sql", "2 = b", "ASM-DBO-SCHEMA", State::Accepted);
     // Every assumption accepted, but an agent wrote it: a person approves.
     let (reviewed, open, _) = review(&fx);

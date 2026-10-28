@@ -443,7 +443,7 @@ statement = "Objects in T-SQL schema dbo are found in the target's default schem
 discharge = "deployment"
 fact = "The target's default schema holds the converted objects."
 fact_key = "default_schema"
-sites = ["sqldiff-convert/src/instances.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-DEFAULT-SCHEMA"
@@ -451,7 +451,7 @@ statement = "Unqualified names, T-SQL dbo and PostgreSQL public resolve to the s
 discharge = "deployment"
 fact = "The default schema in effect on both sides."
 fact_key = "default_schema"
-sites = ["sqldiff-convert/src/instances.rs", "sqldiff-core/src/equiv/canon.rs"]
+sites = ["sqldiff-convert/src/lib.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-EXTPROP-COMMENT"
@@ -494,7 +494,7 @@ statement = "Unquoted names on both sides name the same objects after case foldi
 discharge = "catalog"
 fact = "The object names in both catalogs and the T-SQL catalog collation."
 fact_key = "collation"
-sites = ["sqldiff-convert/src/instances.rs", "sqldiff-core/src/equiv/canon.rs"]
+sites = ["sqldiff-convert/src/lib.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-IDENTITY"
@@ -991,7 +991,7 @@ id = "ASM-TSQL-OWNERSHIP-CHAIN"
 statement = "Callers hold the privileges the statements need themselves (T-SQL skips checks along an ownership chain)."
 discharge = "deployment"
 fact = "The callers' grants on the target."
-sites = ["sqldiff-convert/src/instances.rs", "sqldiff-core/src/equiv/canon.rs"]
+sites = ["sqldiff-convert/src/lib.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-PLUS-IS-CONCAT"

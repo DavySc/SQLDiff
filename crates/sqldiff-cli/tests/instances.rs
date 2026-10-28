@@ -126,7 +126,9 @@ fn instance<'a>(r: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
 /// one open assumption.
 fn converted_but_row_counts(i: &serde_json::Value) {
     assert_eq!(i["status"], "assumptions", "{i}");
-    assert_eq!(rules(i), ["ASM-OBSERVER-ROWCOUNT"], "{i}");
+    // Once for the pair, and on each unit's status line in the converted
+    // template, which carries the conversion's own pair assumptions.
+    assert_eq!(rule_set(i), ["ASM-OBSERVER-ROWCOUNT"], "{i}");
 }
 
 fn rules(i: &serde_json::Value) -> Vec<String> {
@@ -136,6 +138,12 @@ fn rules(i: &serde_json::Value) -> Vec<String> {
         .iter()
         .map(|x| x["rule"].as_str().unwrap().to_string())
         .collect()
+}
+
+/// The distinct rules of an instance's items, sorted.
+fn rule_set(i: &serde_json::Value) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = rules(i).into_iter().collect();
+    set.into_iter().collect()
 }
 
 #[test]
@@ -207,7 +215,7 @@ fn the_converted_templates_status_lines_stand_until_resolved() {
     let t = instance(&r, "procs/TouchCustomer");
     assert_eq!(t["status"], "assumptions", "{t}");
     // The rows-affected counts the T-SQL procedure sends (decision 1).
-    assert_eq!(rules(t), ["ASM-OBSERVER-ROWCOUNT", "ASM-CI-COLLATION"]);
+    assert_eq!(rule_set(t), ["ASM-CI-COLLATION", "ASM-OBSERVER-ROWCOUNT"]);
     // Accepted: nothing holds the instance back any more.
     let (_, r) = instances(
         &d,
@@ -502,7 +510,7 @@ fn fragments_pairs_and_value_kinds() {
     let same = instance(&r, "save-same");
     assert_eq!(same["status"], "assumptions", "{same}");
     assert_eq!(
-        rules(same),
+        rule_set(same),
         ["ASM-OBSERVER-ROWCOUNT", "ASM-TEMPLATE-VALUE-SAME"]
     );
 }
