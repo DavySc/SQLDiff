@@ -874,12 +874,7 @@ type InstanceResult = (Vec<Item>, Vec<String>, Vec<(String, String)>);
 /// Assumptions the engine's diff makes about every pair of a conversion:
 /// names fold the same way, the default schemas are the same one, T-SQL's
 /// ownership chain. Listed per instance, not counted.
-const EVERY_PAIR: [&str; 4] = [
-    "ASM-IDENT-FOLD",
-    "ASM-DEFAULT-SCHEMA",
-    "ASM-DBO-SCHEMA",
-    "ASM-TSQL-OWNERSHIP-CHAIN",
-];
+use crate::EVERY_PAIR;
 
 /// How the engine's diff says it skipped a `CREATE TABLE`.
 const DDL_TABLE: &str = "a DDL statement `CREATE TABLE";
@@ -974,7 +969,7 @@ fn tables_by_rules(
         ));
     }
     let conv = crate::convert(source, from, to)?;
-    let mut items = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
     let mut engine = Vec::new();
     let lines = sqldiff_syntax::LineIndex::new(target);
     for (k, (&(ss, se), &(ts, te))) in st.iter().zip(&tt).enumerate() {
@@ -1018,7 +1013,9 @@ fn tables_by_rules(
                 if !engine.contains(&n.rule) {
                     engine.push(n.rule.clone());
                 }
-            } else if !accepted.contains(&n.rule) {
+            } else if !accepted.contains(&n.rule) && !items.iter().any(|i| i.rule == n.rule) {
+                // A file-level assumption of the conversion is on every
+                // table's unit: once is enough.
                 items.push(Item {
                     status: Outcome::Assumptions,
                     rule: n.rule.clone(),

@@ -630,9 +630,14 @@ fn a_template_without_directives_needs_no_directive_assumption() {
         .units
         .iter()
         .all(|u| !has_rule(u, "ASM-TEMPLATE-DIRECTIVE")));
-    assert_eq!(
-        c.units[0].status,
-        Status::Converted,
+    // Only what the engine assumes without a catalog: the table and its
+    // column types.
+    assert_eq!(c.units[0].status, Status::Assumptions);
+    assert!(
+        c.units[0]
+            .notes
+            .iter()
+            .all(|n| n.rule.starts_with("ASM-BIND-") || n.rule == "ASM-UNTYPED-STORE"),
         "{:?}",
         c.units[0].notes
     );
