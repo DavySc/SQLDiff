@@ -163,6 +163,9 @@ enum Command {
         /// Check each file alone, as with `sqldiff convert --no-catalog`.
         #[arg(long)]
         no_catalog: bool,
+        /// A base catalog (repeatable), as given to `sqldiff convert --catalog`.
+        #[arg(long = "catalog", value_name = "FILE", conflicts_with = "no_catalog")]
+        catalogs: Vec<PathBuf>,
         /// Parallel jobs (default: available cores).
         #[arg(short, long)]
         jobs: Option<usize>,
@@ -474,6 +477,7 @@ fn run(cli: Cli) -> Result<(), String> {
             isolated,
             extensions,
             no_catalog,
+            catalogs,
             jobs,
             instances,
             host,
@@ -507,7 +511,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers: cfg.options().helpers,
-                    catalogs: Vec::new(),
+                    catalogs,
                 },
                 out,
                 instances,

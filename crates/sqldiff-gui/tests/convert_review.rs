@@ -521,3 +521,67 @@ fn without_a_ledger_the_gate_is_judged_and_the_state_keeps_no_ledger() {
     assert!(g.complete, "{:?}", g.blockers);
     assert!(r.state(false).reviewed.is_empty());
 }
+
+#[test]
+fn a_decision_follows_the_base_catalogs_contents() {
+    let dir = std::env::temp_dir().join(format!("sqldiff-gui-review-base-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (p, text) in [("src/a.sql", ASSUMING), ("base/t.sql", PLAIN)] {
+        let f = dir.join(p);
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        std::fs::write(f, text).unwrap();
+    }
+    let a = || tree::Args {
+        src: dir.join("src"),
+        from: Dialect::Tsql,
+        to: Dialect::Postgres,
+        jobs: Some(1),
+        no_catalog: false,
+        template: None,
+        extensions: tree::extensions(Vec::new()),
+        helpers: Vec::new(),
+        catalogs: vec![dir.join("base/t.sql")],
+    };
+    let out = dir.join("out");
+    let (inputs, unreadable) = tree::read(&a()).unwrap();
+    tree::prepare_out(&a().src, &out, false).unwrap();
+    let t = tree::convert(&a(), &inputs, unreadable, Some(&out)).unwrap();
+    tree::write(&t, &out).unwrap();
+    let mut r = Review::open(Setup {
+        tree: a(),
+        out: out.clone(),
+        instances: None,
+    })
+    .unwrap();
+    let base = r.report_json()["base_hash"].as_str().unwrap().to_string();
+    let u = unit_with(&r, "a.sql", Status::Assumptions, false);
+    for rule in &u.assumptions {
+        r.record(req(Action::Accept, rule, vec![target(&u)]), AT)
+            .unwrap();
+    }
+    let text = std::fs::read_to_string(out.join(LEDGER_FILE)).unwrap();
+    let ledger = Ledger::parse(&text);
+    assert!(ledger
+        .records()
+        .all(|x| x.base_catalogs.as_deref() == Some(base.as_str())));
+    let open = |r: &Review| {
+        r.unit("a.sql", &u.unit)
+            .and_then(|v| v.review)
+            .map(|v| v.open)
+            .unwrap()
+    };
+    r.refresh().unwrap();
+    assert!(!r.converted_last());
+    assert!(open(&r).is_empty());
+    // Other contents: converted again, and the acceptances no longer apply.
+    std::fs::write(
+        dir.join("base/t.sql"),
+        "CREATE TABLE t (a int NOT NULL, b int NULL);\n",
+    )
+    .unwrap();
+    r.refresh().unwrap();
+    assert!(r.converted_last());
+    assert_ne!(r.report_json()["base_hash"].as_str().unwrap(), base);
+    assert_eq!(open(&r), u.assumptions);
+    let _ = std::fs::remove_dir_all(&dir);
+}

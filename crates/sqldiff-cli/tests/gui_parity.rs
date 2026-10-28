@@ -142,14 +142,36 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
     // The same tree without a project config.
     let bare = d.join("bare");
     write(&bare.join("a.sql"), "CREATE TABLE t (a int NOT NULL);\n");
+    // Base catalogs, in a folder whose name needs quoting too, and a query
+    // on a table only they define.
+    let base = root.join("base catalogs");
+    write(
+        &base.join("orders.sql"),
+        "CREATE TABLE orders (order_id int NOT NULL, status varchar(10) NOT NULL);\n",
+    );
+    write(
+        &base.join("items.sql"),
+        "CREATE TABLE order_items (order_id int NOT NULL);\n",
+    );
+    let with_base = root.join("upgrade");
+    write(
+        &with_base.join("a.sql"),
+        "CREATE TABLE t (a int NOT NULL);\n",
+    );
+    write(&with_base.join("q.sql"), "SELECT status FROM orders;\n");
+    let catalogs: Vec<String> = ["orders.sql", "items.sql"]
+        .iter()
+        .map(|f| base.join(f).display().to_string())
+        .collect();
 
     let runs = Runs::default();
     let mut sheets = Vec::new();
-    for (name, src, isolated, overwrite) in [
-        ("project", &src, false, false),
-        ("isolated", &src, true, false),
-        ("no-project", &bare, false, false),
-        ("overwrite", &src, false, true),
+    for (name, src, isolated, overwrite, cats) in [
+        ("project", &src, false, false, &Vec::new()),
+        ("isolated", &src, true, false, &Vec::new()),
+        ("no-project", &bare, false, false, &Vec::new()),
+        ("overwrite", &src, false, true, &Vec::new()),
+        ("catalogs", &with_base, false, false, &catalogs),
     ] {
         let gui = d.join(format!("gui {name}"));
         let cli = d.join(format!("cli {name}"));
@@ -167,6 +189,7 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
             parameters: Vec::new(),
             extensions: Vec::new(),
             packs: Vec::new(),
+            catalogs: cats.clone(),
             instances: None,
         };
         let run = runs.start(spec(&gui), isolated, |_| {}).unwrap();
@@ -191,8 +214,22 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
         assert_eq!(masked(&gui), masked(&cli), "{name}: {}", sheet.sh);
         assert_gate_is_review_status(&run);
         let c = &run.command;
+        // The catalogs are on the sheet, in order.
+        let given: Vec<&String> = c
+            .args
+            .iter()
+            .zip(c.args.iter().skip(1))
+            .filter(|(f, _)| *f == "--catalog")
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(given, cats.iter().collect::<Vec<_>>(), "{name}");
+        if name == "catalogs" {
+            let report = std::fs::read_to_string(gui.join("conversion-report.json")).unwrap();
+            assert!(report.contains("\"base_catalogs\""), "{report}");
+            assert!(!report.contains("bind.unknown-table"), "{report}");
+        }
         match name {
-            "project" | "overwrite" => {
+            "project" | "overwrite" | "catalogs" => {
                 assert_eq!(
                     c.project_config,
                     Some(root.join("sqldiff.toml").display().to_string())
@@ -274,6 +311,7 @@ fn a_template_run_and_its_command_write_the_same() {
         parameters: vec!["SCHEMA".into(), "TABLE".into()],
         extensions: vec![".tpl".into()],
         packs: vec![pack()],
+        catalogs: Vec::new(),
         instances: instances.map(|p| p.display().to_string()),
     };
     let runs = Runs::default();
