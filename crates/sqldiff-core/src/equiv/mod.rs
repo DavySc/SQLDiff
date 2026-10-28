@@ -24,6 +24,8 @@ pub mod term;
 mod trigger;
 pub mod xwit;
 
+use std::collections::BTreeMap;
+
 use sqldiff_syntax::{ast as cst, SyntaxNode};
 
 use crate::artifact::Analyzed;
@@ -1850,13 +1852,48 @@ fn name_assumptions(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item) -> Vec<Assum
         if !dx.is_empty() || !dy.is_empty() {
             v.push(asm::make(asm::DEFAULT_SCHEMA));
         }
-    } else if dx
-        .iter()
-        .any(|(k, d)| dy.iter().any(|(k2, d2)| k == k2 && d != d2))
-    {
-        v.push(asm::make(asm::DEFAULT_SCHEMA));
+    } else {
+        if dx
+            .iter()
+            .any(|(k, d)| dy.iter().any(|(k2, d2)| k == k2 && d != d2))
+        {
+            v.push(asm::make(asm::DEFAULT_SCHEMA));
+        }
+        if a.dialect().lexical().folding == sqldiff_syntax::IdentFolding::Collation
+            && respelled(a, b, x, y)
+        {
+            v.push(asm::make(asm::TSQL_CI_NAMES));
+        }
     }
     v
+}
+
+/// Whether a name or variable is spelled in more than one case across the
+/// two statements (`Orders` and `orders`). Terms fold names, which T-SQL only
+/// does under a case-insensitive catalog collation. Counted over both sides
+/// together, so a side that mixes spellings, or two sides that swap them,
+/// also count.
+fn respelled(a: &Analyzed, b: &Analyzed, x: &Item, y: &Item) -> bool {
+    let mut seen: BTreeMap<String, String> = BTreeMap::new();
+    let toks = x
+        .nodes
+        .iter()
+        .flat_map(|n| crate::normalize::norm_tokens(n, a.dialect()))
+        .chain(
+            y.nodes
+                .iter()
+                .flat_map(|n| crate::normalize::norm_tokens(n, b.dialect())),
+        );
+    for t in toks {
+        match seen.get(&t.loose) {
+            Some(s) if *s != t.strict => return true,
+            Some(_) => {}
+            None => {
+                seen.insert(t.loose, t.strict);
+            }
+        }
+    }
+    false
 }
 
 fn compare_pair(

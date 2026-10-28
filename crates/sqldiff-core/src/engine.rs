@@ -159,10 +159,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 normalizations.push("identifier quoting ([x], \"x\", x)".to_string());
                 if td.used_case_insensitive_idents {
                     normalizations.push("identifier and variable case".to_string());
-                    assumptions.push(Assumption::default(
-                        "ASM-TSQL-CI-COLLATION",
-                        "Identifiers and variables compare case-insensitively (case-insensitive catalog collation)",
-                    ));
+                    assumptions.push(equiv::canon::asm::make(equiv::canon::asm::TSQL_CI_NAMES));
                 }
             }
         }
