@@ -256,6 +256,13 @@ pub struct Report {
     /// then the verdict over the open findings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_before_suppression: Option<Verdict>,
+    /// What the proof gate found (decision 3); absent when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<crate::proof::Proof>,
+    /// The verdict before `require` mode made an unconfirmed "equal"
+    /// "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_before_proof: Option<Verdict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

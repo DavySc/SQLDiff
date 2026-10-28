@@ -16,6 +16,7 @@ use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
 
 mod changes_cmd;
+mod checker;
 mod convert_cmd;
 mod deny_hash;
 mod dist_cmd;
@@ -448,6 +449,26 @@ fn main() -> ExitCode {
     };
     lifecycle_notices();
     code
+}
+
+/// The proof gate for a run: the mode, and `sqldiff-check` when the mode
+/// needs it and it is found. A checker that does not start leaves none, so
+/// every "equal" is unconfirmed (and "unknown" under `require`).
+pub(crate) fn proof_settings(mode: sqldiff_core::proof::Mode) -> sqldiff_core::proof::Settings {
+    use sqldiff_core::proof::{Mode, Settings};
+    let checker = match mode {
+        Mode::Off => None,
+        _ => checker::find().and_then(|p| match checker::Subprocess::new(p) {
+            Ok(c) => {
+                Some(std::sync::Arc::new(c) as std::sync::Arc<dyn sqldiff_core::proof::Checker>)
+            }
+            Err(e) => {
+                eprintln!("sqldiff: note: {e}");
+                None
+            }
+        }),
+    };
+    Settings { mode, checker }
 }
 
 /// One line per analysed target that is in preview, legacy or retired, or

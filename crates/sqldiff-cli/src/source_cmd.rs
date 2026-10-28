@@ -44,6 +44,11 @@ pub struct ConfigArgs {
     /// $SQLDIFF_DATA_DIR or the platform data directory).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+    /// Proof gate for "equal" verdicts: off, report (record whether
+    /// sqldiff-check confirms it) or require (an unconfirmed "equal" becomes
+    /// "unknown"). See docs/verification-roadmap.md, decision 3.
+    #[arg(long, value_name = "MODE", default_value = "off")]
+    proof: sqldiff_core::proof::Mode,
 }
 
 pub fn key_value(s: &str) -> Result<(String, String), String> {
@@ -159,7 +164,9 @@ impl ConfigArgs {
                 l
             },
         };
-        Resolved::load(&sources).map_err(|e| e.0)
+        let mut cfg = Resolved::load(&sources).map_err(|e| e.0)?;
+        cfg.proof = crate::proof_settings(self.proof);
+        Ok(cfg)
     }
 }
 

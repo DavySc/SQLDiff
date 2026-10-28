@@ -20,6 +20,7 @@ pub mod lint;
 pub mod model;
 pub mod normalize;
 pub mod phrase;
+pub mod proof;
 pub mod render;
 pub mod rules;
 pub mod session;

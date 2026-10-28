@@ -1686,6 +1686,7 @@ mod tests {
             helpers,
             flips,
             declared,
+            proof,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1696,6 +1697,7 @@ mod tests {
             helpers,
             flips,
             declared,
+            proof,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1730,6 +1732,20 @@ mod tests {
                 "declared",
                 Box::new(|o| {
                     o.declared.insert("ASM-X".into(), "holds".into());
+                }),
+            ),
+            (
+                "proof mode",
+                Box::new(|o| o.proof.mode = sqldiff_core::proof::Mode::Require),
+            ),
+            (
+                "proof checker",
+                Box::new(|o| {
+                    o.proof.checker = Some(Arc::new(sqldiff_core::proof::FnChecker(|_| {
+                        sqldiff_core::proof::Answer::Unconfirmed {
+                            reason: "test".into(),
+                        }
+                    })))
                 }),
             ),
         ];

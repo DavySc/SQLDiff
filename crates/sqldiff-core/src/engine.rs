@@ -45,6 +45,9 @@ pub struct Options {
     /// declaration's text). A declared Db2 for i commit level is used for
     /// routines that do not state one.
     pub declared: BTreeMap<String, String>,
+    /// The proof gate (decision 3): its mode and the checker a front end
+    /// supplies. Off by default.
+    pub proof: crate::proof::Settings,
 }
 
 impl Default for Options {
@@ -58,6 +61,7 @@ impl Default for Options {
             helpers: Vec::new(),
             flips: BTreeMap::new(),
             declared: BTreeMap::new(),
+            proof: crate::proof::Settings::default(),
         }
     }
 }
@@ -265,7 +269,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
-    finish(Report {
+    let mut report = finish(Report {
         tool_version: TOOL_VERSION.to_string(),
         verdict: Verdict::Equal,
         a: aa.info(),
@@ -277,10 +281,14 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
+        proof: None,
+        verdict_before_proof: None,
         diagnostics,
         witnesses,
         discharged,
-    })
+    });
+    crate::proof::apply(&mut report, &aa, &ab, &opts.proof);
+    report
 }
 
 /// "What if this statement fails?" (design §6.1 `what_if`): the statement
@@ -349,6 +357,8 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
+        proof: None,
+        verdict_before_proof: None,
         diagnostics,
         witnesses: Vec::new(),
         discharged: Vec::new(),

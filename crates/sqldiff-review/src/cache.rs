@@ -130,7 +130,16 @@ impl Cache {
             return r;
         }
         let r = compute();
-        self.put("report", &key, &r);
+        // A checker that crashed or timed out says nothing about the pair;
+        // the next run asks again.
+        let checker_failed = r.proof.as_ref().is_some_and(|p| {
+            p.reason
+                .as_deref()
+                .is_some_and(|x| x.starts_with("checker failed"))
+        });
+        if !checker_failed {
+            self.put("report", &key, &r);
+        }
         r
     }
 }
@@ -171,6 +180,15 @@ pub fn report_key(a: &Artifact, b: Option<&Artifact>, opts: &Options, cfg: &Reso
         h.update(l.hash.as_bytes());
         h.update([0]);
     }
+    // The proof gate changes the verdict (require) and the report (report):
+    // its mode, and which checker answers (name, version and binary hash).
+    h.update(b"P");
+    h.update(format!("{:?}", opts.proof.mode).as_bytes());
+    h.update([0]);
+    if let Some(c) = &opts.proof.checker {
+        h.update(c.name().as_bytes());
+    }
+    h.update([0]);
     // Structured catalog facts change binding too; pack helpers are covered by
     // the layer hashes.
     for (tag, facts) in [(b"FA", &opts.facts_a), (b"FB", &opts.facts_b)] {
@@ -189,4 +207,35 @@ pub fn report_key(a: &Artifact, b: Option<&Artifact>, opts: &Options, cfg: &Reso
         None => h.update(b"-"),
     }
     hex(&h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use sqldiff_core::proof::{Answer, FnChecker, Mode};
+    use sqldiff_core::Dialect;
+
+    #[test]
+    fn the_proof_gate_is_in_the_report_key() {
+        let a = Artifact::new("a.sql", Dialect::Tsql, "SELECT 1;");
+        let cfg = Resolved::builtin();
+        let key = |o: &Options| report_key(&a, Some(&a), o, &cfg);
+        let base = Options::default();
+        let mut report = base.clone();
+        report.proof.mode = Mode::Report;
+        let mut require = base.clone();
+        require.proof.mode = Mode::Require;
+        let mut checked = require.clone();
+        checked.proof.checker = Some(Arc::new(FnChecker(|_| Answer::Unconfirmed {
+            reason: "x".into(),
+        })));
+        let keys = [key(&base), key(&report), key(&require), key(&checked)];
+        for (i, x) in keys.iter().enumerate() {
+            for y in &keys[i + 1..] {
+                assert_ne!(x, y);
+            }
+        }
+    }
 }

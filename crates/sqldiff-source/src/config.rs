@@ -205,6 +205,8 @@ pub struct Resolved {
     pub data_key: Option<String>,
     /// `[format]` of each layer that was read, in merge order (lowest first).
     pub format_layers: Vec<FormatLayer>,
+    /// The proof gate (decision 3); a front end sets the checker.
+    pub proof: sqldiff_core::proof::Settings,
     compiled: Compiled,
 }
 
@@ -238,6 +240,7 @@ impl Resolved {
                     })
                 })
                 .collect(),
+            proof: self.proof.clone(),
             ..sqldiff_core::Options::default()
         }
     }
@@ -386,6 +389,7 @@ impl Resolved {
             excerpt_lines: file.excerpt_lines.unwrap_or(3),
             data_key: file.data_key,
             format_layers,
+            proof: sqldiff_core::proof::Settings::default(),
             compiled,
         })
     }
