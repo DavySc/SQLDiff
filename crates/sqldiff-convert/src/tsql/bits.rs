@@ -35,11 +35,16 @@ pub(super) struct BitEdits {
     pub pre: HashMap<usize, String>,
     /// Output after the token.
     pub post: HashMap<usize, String>,
+    /// The rule of each rewrite and the tokens it rewrote (first and last
+    /// index): the expression walk that applies the edits records them as
+    /// steps.
+    pub steps: Vec<(&'static str, usize, usize)>,
 }
 
 impl BitEdits {
     /// Adds the edits of an enclosing rewrite: its text goes outside ours.
     pub fn wrap(&mut self, outer: BitEdits) {
+        self.steps.extend(outer.steps);
         self.rep.extend(outer.rep);
         for (k, p) in outer.pre {
             let inner = self.pre.remove(&k).unwrap_or_default();
@@ -350,14 +355,17 @@ impl Cx<'_> {
             // SMALLINT: the 0 or 1 T-SQL stores.
             if let Some(n) = int_literal(v) {
                 e.rep.insert(at, if n == 0 { "0" } else { "1" }.into());
+                e.steps.push(("tsql.bit.store", at, end));
             } else if let Some(b) = bit_string(v) {
                 e.rep.insert(at, b.into());
+                e.steps.push(("tsql.bit.store", at, end));
             }
             return true;
         }
         if let Some(n) = int_literal(v) {
             e.rep
                 .insert(at, if n == 0 { "FALSE" } else { "TRUE" }.into());
+            e.steps.push(("tsql.bit.store", at, end));
             return true;
         }
         if self.is_bit(v) || v.iter().all(|t| !t.sig() || t.is("NULL")) {
@@ -371,6 +379,7 @@ impl Cx<'_> {
         if self.is_numeric(v) {
             e.pre.insert(at, "(".into());
             e.post.insert(end, " <> 0)".into());
+            e.steps.push(("tsql.bit.store", at, end));
             return true;
         }
         false
@@ -475,6 +484,7 @@ impl Cx<'_> {
                         if let (Some(st), Some(en)) = (st, en) {
                             if self.is_bit(&ts[st..=en]) {
                                 e.post.insert(en, "::integer".into());
+                                e.steps.push(("tsql.bit.arithmetic", st, en));
                             }
                         }
                     }
@@ -487,6 +497,7 @@ impl Cx<'_> {
                             // NOT binds more loosely than ~.
                             e.rep.insert(i, "(NOT ".into());
                             e.post.insert(en.1, ")".into());
+                            e.steps.push(("tsql.bit.not", i, en.1));
                         } else {
                             self.unhandled(&ts[i..=en.1]);
                         }
@@ -505,9 +516,11 @@ impl Cx<'_> {
                         e.rep.insert(i, "<>".into());
                         e.pre.insert(ls, "(".into());
                         e.post.insert(re, ")".into());
+                        e.steps.push(("tsql.bit.bitwise", ls, re));
                     } else if l || r {
                         // On integers, & and | treat NULL as T-SQL does on
                         // bits; PostgreSQL's ^ is a power, # its exclusive or.
+                        e.steps.push(("tsql.bit.bitwise", ls, re));
                         if t.s == "^" {
                             e.rep.insert(i, "#".into());
                         }
@@ -525,9 +538,10 @@ impl Cx<'_> {
                 IDENT if t.is("CASE") => {
                     let spans = case_results(ts, i);
                     let rs: Vec<&[T]> = spans.iter().map(|&(f, l)| &ts[f..=l]).collect();
-                    for (&(f, _), r) in spans.iter().zip(self.bit_results(&rs)) {
+                    for (&(f, l), r) in spans.iter().zip(self.bit_results(&rs)) {
                         if let Some(r) = r {
                             e.rep.insert(f, r.into());
+                            e.steps.push(("tsql.bit.case-result", f, l));
                         }
                     }
                 }
@@ -556,6 +570,7 @@ impl Cx<'_> {
                         for &(f, l) in &spans {
                             if self.is_bit(&ts[f..=l]) {
                                 e.post.insert(l, "::integer".into());
+                                e.steps.push(("tsql.bit.concat", f, l));
                             }
                         }
                         continue;
@@ -567,9 +582,11 @@ impl Cx<'_> {
                             match int_literal(&ts[f..=l]) {
                                 Some(0) => {
                                     e.rep.insert(f, "FALSE".into());
+                                    e.steps.push(("tsql.bit.coalesce", f, l));
                                 }
                                 Some(1) => {
                                     e.rep.insert(f, "TRUE".into());
+                                    e.steps.push(("tsql.bit.coalesce", f, l));
                                 }
                                 _ if self.is_bit(&ts[f..=l]) || ts[f].is("NULL") => {}
                                 _ => self.unhandled(&ts[i..=close]),
@@ -641,10 +658,12 @@ impl Cx<'_> {
         match int_literal(other) {
             Some(0) => {
                 e.rep.insert(os, "FALSE".into());
+                e.steps.push(("tsql.bit.compare", os, oe));
                 return;
             }
             Some(1) => {
                 e.rep.insert(os, "TRUE".into());
+                e.steps.push(("tsql.bit.compare", os, oe));
                 return;
             }
             _ => {}
@@ -694,9 +713,11 @@ impl Cx<'_> {
             match int_literal(b) {
                 Some(0) => {
                     e.rep.insert(f, "FALSE".into());
+                    e.steps.push(("tsql.bit.between", f, l));
                 }
                 Some(1) => {
                     e.rep.insert(f, "TRUE".into());
+                    e.steps.push(("tsql.bit.between", f, l));
                 }
                 _ if self.is_bit(b)
                     || f == l
@@ -736,8 +757,8 @@ impl Cx<'_> {
         for a in split_commas(&ts[open + 1..close]) {
             let sg = sig(a);
             match (int_literal(a), sg.first()) {
-                (Some(0), Some(&f)) => reps.push((at + f, "FALSE")),
-                (Some(1), Some(&f)) => reps.push((at + f, "TRUE")),
+                (Some(0), Some(&f)) => reps.push((at + f, at + sg[sg.len() - 1], "FALSE")),
+                (Some(1), Some(&f)) => reps.push((at + f, at + sg[sg.len() - 1], "TRUE")),
                 _ if self.is_bit(a) => {}
                 _ => {
                     self.unhandled(&ts[ls..=close]);
@@ -746,8 +767,9 @@ impl Cx<'_> {
             }
             at += a.len() + 1;
         }
-        for (k, v) in reps {
+        for (k, l, v) in reps {
             e.rep.insert(k, v.into());
+            e.steps.push(("tsql.bit.in", k, l));
         }
     }
 
@@ -1060,6 +1082,7 @@ impl Cx<'_> {
                     self.note(Status::Assumptions, "ASM-BIT-SMALLINT", BIT_SMALLINT);
                     e.rep.insert(i, "(1 - ".into());
                     e.post.insert(en, ")".into());
+                    e.steps.push(("tsql.bit.not", i, en));
                 }
                 continue;
             }
@@ -1083,6 +1106,7 @@ impl Cx<'_> {
             let (os, oe) = if l { (rn, re) } else { (ls, lp) };
             if let Some(b) = bit_string(&ts[os..=oe]) {
                 e.rep.insert(os, b.into());
+                e.steps.push(("tsql.bit.compare", os, oe));
             }
         }
     }

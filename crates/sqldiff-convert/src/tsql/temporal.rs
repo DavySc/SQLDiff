@@ -54,6 +54,8 @@ impl Cx<'_> {
         if ts[..open].iter().any(|t| t.s.starts_with('#')) {
             return no("system-versioned temporary table: SQL Server refuses it");
         }
+        // The table, and the trigger functions and triggers after it.
+        self.step_ts("tsql.temporal.table", ts);
 
         // The table options: SYSTEM_VERSIONING out, the rest kept.
         let mut history = None;
@@ -75,6 +77,7 @@ impl Cx<'_> {
                     .is_some_and(|t| t.is("SYSTEM_VERSIONING"))
                 {
                     history = Some(versioning_option(trimmed(opt))?);
+                    self.step_ts("tsql.temporal.versioning-option", opt);
                 } else {
                     kept.push(opt);
                 }
@@ -83,10 +86,8 @@ impl Cx<'_> {
                 tail.extend(ts[i..=p].iter().cloned());
                 for (n, opt) in kept.iter().enumerate() {
                     if n > 0 {
-                        tail.push(T {
-                            k: COMMA,
-                            s: ",".into(),
-                        });
+                        let at = opt.first().map_or(0, |t| t.pos.0);
+                        tail.push(T::made(COMMA, ",", at, "tsql.temporal.table"));
                     }
                     tail.extend(opt.iter().cloned());
                 }
@@ -115,6 +116,7 @@ impl Cx<'_> {
                             && r.k == R_PAREN =>
                     {
                         period = Some((tsql_unquote(&a.s), tsql_unquote(&b.s)));
+                        self.step_ts("tsql.temporal.period", item);
                     }
                     _ => return no("PERIOD FOR SYSTEM_TIME: unexpected form"),
                 }
@@ -138,13 +140,15 @@ impl Cx<'_> {
                     }
                     let mut it: Vec<T> = item[..at].to_vec();
                     // Already converted: a token the expression walk copies as is.
-                    it.push(T {
-                        k: NUMBER,
-                        s: format!(
+                    it.push(T::made(
+                        NUMBER,
+                        format!(
                             "{}DEFAULT '-infinity'",
                             if not_null { "" } else { "NOT NULL " }
                         ),
-                    });
+                        item[at].pos.0,
+                        "tsql.temporal.period-column",
+                    ));
                     it.extend(item[at + len..].iter().cloned());
                     gen.push((col, is_start, digits));
                     items.push(it);
@@ -170,10 +174,8 @@ impl Cx<'_> {
         let mut out: Vec<T> = ts[..=open].to_vec();
         for (n, it) in items.into_iter().enumerate() {
             if n > 0 {
-                out.push(T {
-                    k: COMMA,
-                    s: ",".into(),
-                });
+                let at = it.first().map_or(0, |t| t.pos.0);
+                out.push(T::made(COMMA, ",", at, "tsql.temporal.table"));
             }
             out.extend(it);
         }
@@ -337,6 +339,7 @@ CREATE TRIGGER {}_truncate BEFORE TRUNCATE ON {table}
         let Some(hist) = hist else {
             self.note(Status::Converted, "tsql.temporal-history-created", &format!("The tree has no table {history}, so SQL Server creates it with the table's columns; so does the output (CREATE TABLE … (LIKE …): columns, types and NOT NULL, no defaults, keys or identity)."));
             let table = self.expr(name_t).trim().to_string();
+            self.step_ts("tsql.temporal-history-created", &t.history);
             return Ok(format!("CREATE TABLE {history} (LIKE {table});\n\n"));
         };
         if !main.columns_known || !hist.columns_known {

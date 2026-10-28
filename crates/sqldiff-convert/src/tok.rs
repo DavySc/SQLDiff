@@ -7,9 +7,25 @@ use SyntaxKind::*;
 pub(crate) struct T {
     pub k: SyntaxKind,
     pub s: String,
+    /// Byte range in the input text. A token a rule made up has an empty
+    /// range at the place it stands for.
+    pub pos: (usize, usize),
+    /// The rule that made this token up, if one did: the expression walk
+    /// records it as a step where it writes the token.
+    pub made: Option<&'static str>,
 }
 
 impl T {
+    /// A token rule `rule` makes up, standing at input offset `at`.
+    pub fn made(k: SyntaxKind, s: impl Into<String>, at: usize, rule: &'static str) -> T {
+        T {
+            k,
+            s: s.into(),
+            pos: (at, at),
+            made: Some(rule),
+        }
+    }
+
     pub fn sig(&self) -> bool {
         !self.k.is_trivia() && self.k != INFERRED_TERMINATOR
     }
@@ -28,11 +44,30 @@ impl T {
 pub(crate) fn tokens(n: &SyntaxNode) -> Vec<T> {
     n.descendants_with_tokens()
         .filter_map(SyntaxElement::into_token)
-        .map(|t| T {
-            k: t.kind(),
-            s: t.text().to_string(),
+        .map(|t| {
+            let r = t.text_range();
+            T {
+                k: t.kind(),
+                s: t.text().to_string(),
+                pos: (r.start().into(), r.end().into()),
+                made: None,
+            }
         })
         .collect()
+}
+
+/// The input bytes a token slice covers, from its first to its last
+/// significant token (made-up tokens count by the place they stand for).
+/// `None` for a slice with no significant token.
+pub(crate) fn span(ts: &[T]) -> Option<(usize, usize)> {
+    let mut sig = ts.iter().filter(|t| t.sig());
+    let first = sig.next()?;
+    let (mut s, mut e) = first.pos;
+    for t in sig {
+        s = s.min(t.pos.0);
+        e = e.max(t.pos.1);
+    }
+    Some((s, e))
 }
 
 /// Indices of significant tokens.

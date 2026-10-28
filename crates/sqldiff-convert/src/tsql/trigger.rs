@@ -126,9 +126,11 @@ impl Cx<'_> {
             }
         }
         let header_notes = self.take_notes();
+        let header_trace = self.take_trace();
         let single = h.events.len() == 1;
         let mut text = String::new();
         let mut notes: Vec<Note> = Vec::new();
+        let mut trace: Vec<crate::Step> = Vec::new();
         for &ev in &h.events {
             let suffix = if single { "" } else { ev.suffix() };
             let (fname, tname) = trigger_names(&h.schema, &h.name, suffix)?;
@@ -157,6 +159,18 @@ impl Cx<'_> {
             self.trigger = None;
             self.mode = Mode::Top;
             let leftover = self.take_notes();
+            let leftover_trace = self.take_trace();
+            for st in b
+                .units
+                .iter()
+                .chain(&decls.units)
+                .flat_map(|u| u.trace.iter())
+                .chain(&leftover_trace)
+            {
+                if !trace.contains(st) {
+                    trace.push(st.clone());
+                }
+            }
             for n in b
                 .units
                 .iter()
@@ -190,6 +204,23 @@ impl Cx<'_> {
             ));
         }
         self.notes = header_notes;
+        self.trace = header_trace;
+        // Rule T1: one function and statement trigger per event, with the
+        // images as transition tables.
+        self.step_ts_with(
+            "tsql.trigger",
+            &all[..body_at],
+            h.events
+                .iter()
+                .map(|e| e.word())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        for st in trace {
+            if !self.trace.contains(&st) {
+                self.trace.push(st);
+            }
+        }
         for n in notes {
             if !self.notes.iter().any(|x| x.rule == n.rule) {
                 self.notes.push(n);
@@ -244,7 +275,10 @@ impl Cx<'_> {
             for opt in split_commas(&ts[s[k] + 1..s[end]]) {
                 let words: Vec<String> = sig(opt).iter().map(|&j| opt[j].up()).collect();
                 match words.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-                    ["ENCRYPTION"] => self.note(Status::Converted, "tsql.routine-options-dropped", "WITH ENCRYPTION was dropped: it does not change results."),
+                    ["ENCRYPTION"] => {
+                        self.step_ts("tsql.routine-options-dropped", opt);
+                        self.note(Status::Converted, "tsql.routine-options-dropped", "WITH ENCRYPTION was dropped: it does not change results.")
+                    }
                     _ => return no(format!("trigger option WITH {}: no rule (EXECUTE AS changes whose privileges the statements use)", words.join(" "))),
                 }
             }
@@ -279,6 +313,7 @@ impl Cx<'_> {
             k += 2;
         }
         if up(k) == "NOT" && up(k + 1) == "FOR" && up(k + 2) == "REPLICATION" {
+            self.step_ts("tsql.routine-options", &ts[s[k]..=s[k + 2]]);
             self.note(Status::Decision, "tsql.routine-options", "NOT FOR REPLICATION was dropped: the T-SQL trigger does not fire for replication agents; a PostgreSQL trigger fires for logical replication only when enabled with ENABLE REPLICA or ENABLE ALWAYS.");
             k += 3;
         }
@@ -334,15 +369,15 @@ impl Cx<'_> {
             return false;
         }
         self.note(Status::Assumptions, "ASM-TRIGGER-ROWCOUNT", "IF @@ROWCOUNT = 0 RETURN, first in the trigger, becomes a test for rows in the statement's image. They differ when a MERGE fires the trigger: T-SQL's @@ROWCOUNT counts the rows of every MERGE action, so the trigger runs with an empty image, where PostgreSQL returns. Equal unless the rest of the trigger does something when its image is empty.");
-        let notes = self.take_notes();
-        out.unit(
+        self.step_node("tsql.trigger.rowcount-guard", n);
+        self.emit(
+            out,
             Self::range(n),
             indent,
             &format!(
                 "IF NOT EXISTS (SELECT 1 FROM {}) THEN\n  RETURN NULL;\nEND IF;",
                 ev.rows()
             ),
-            notes,
         );
         true
     }
