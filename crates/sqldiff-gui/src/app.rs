@@ -52,7 +52,8 @@ use crate::convert_review::{self, Review};
 use crate::review::Store;
 use crate::runs::{ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
 use crate::server::{
-    allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
+    allowed_hosts, bad, json, no_inherit, not_found, param, read_request, respond, Request,
+    Response,
 };
 use crate::session::{Origin, Session};
 use crate::settings;
@@ -168,6 +169,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        no_inherit(&stream);
         let shared = Arc::clone(&shared);
         let hosts = Arc::clone(&hosts);
         // A thread that cannot be made (each reserves the engine's large
