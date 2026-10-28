@@ -11,10 +11,10 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 | Discharge | Meaning | Ids |
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 49 |
-| `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 76 |
+| `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 77 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
-| | Total | 169 |
+| | Total | 171 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -61,6 +61,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-BUILTIN-ABSENT` | The dialect has no built-in function with a name the code calls (it is not on SQLDiff's built-in list). | `catalog` | The target's function list in the catalog. | `sqldiff-core/src/bind/query.rs` |
 | `ASM-C1-NO-ERRORS` | No statement of a routine confirmed outside the C2a slice raises an error: the core stops at one, T-SQL without XACT_ABORT ON carries on. | `nothing` | Expressions in the C2a slice (or a later scalar slice), with SET XACT_ABORT ON where they can raise. | `sqldiff-convert/src/cert.rs` |
 | `ASM-C1-OPERATORS` | Each operator, function and literal form in a routine confirmed by the C1 mirror check means the same in both dialects; C1 leaves them uninterpreted. | `nothing` | The C2 scalar semantics and its mirror lemmas (docs/verified-conversion.md, phase C2). | `sqldiff-convert/src/cert.rs` |
+| `ASM-CALLEE-CONFIRMED` | A routine a converted routine calls (the qualifier names it) behaves the same as its conversion; the confirmation of the caller took that as given. | `generated` | The callee's own certificate, confirmed in the same run and resting on no callee itself (the release gate checks this). | `sqldiff-convert/src/cert.rs` |
 | `ASM-CALLEE-CONVERTED` | The procedure a call names on side B is the conversion of the one it names on side A. | `generated` | The callee is converted in the same tree, and its own conversion is compared in its file. | `sqldiff-core/src/equiv/call.rs` |
 | `ASM-CALLEES-NO-TXN-CONTROL` | Called routines do not commit or roll back, and their writes follow the caller's transaction. | `catalog` | The callees' bodies in the catalog or the tree. | `sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-CALLER-CHECKS-RC` | Callers inspect the return code. | `deployment` | Every caller reads the return code. | `sqldiff-core/src/ir/behaviour.rs` |
@@ -187,6 +188,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TSQL-MONEY-ROUNDING` | T-SQL rounds a value with more than four decimals to money half away from zero, as PostgreSQL rounds to numeric(..., 4). | `nothing` | The behaviour checked on SQL Server. | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-TSQL-OWNERSHIP-CHAIN` | Callers hold the privileges the statements need themselves (T-SQL skips checks along an ownership chain). | `deployment` | The callers' grants on the target. | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-PLUS-IS-CONCAT` | Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates. | `catalog` | The operands' types. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-TSQL-QUOTED-IDENTIFIER` | The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string. | `deployment` | The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier). | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-RETURN-NULL-WARNING` | Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides). | `deployment` | How callers handle messages. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-STRING-AGG-8000` | The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that). | `deployment` | The data never aggregates a longer list. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-STRING-ARGS` | Every string argument a caller passes to a converted T-SQL routine fits the parameter's declared length (and, for varchar, its code page): T-SQL truncates it silently, PostgreSQL does not. | `deployment` | What callers pass. | `sqldiff-convert/src/cert.rs` |

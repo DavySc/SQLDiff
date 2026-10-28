@@ -144,7 +144,25 @@ pub struct Trusted {
     pub row_counts: bool,
     /// The deployment profile accepts [`BINARY_COLLATION`].
     pub binary_collation: bool,
+    /// The T-SQL routines the source tree declares, names as written: under
+    /// a binary collation names are case-sensitive, so a call reaches a
+    /// declared routine only when spelled exactly as declared.
+    pub declared_routines: Vec<Vec<String>>,
+    /// The routines of the whole converted tree, read back from the output:
+    /// the target catalog a call is checked against (a callee may be in
+    /// another file).
+    pub output_routines: Vec<Routine>,
 }
+
+/// A converted routine calls another and the confirmation took the callee
+/// as its own conversion: it holds when the callee's conversion is
+/// confirmed too (the release gate checks this in the same run).
+pub const CALLEE_CONFIRMED: &str = "ASM-CALLEE-CONFIRMED";
+
+/// A double-quoted T-SQL identifier is a name only under
+/// `QUOTED_IDENTIFIER ON` (the setting stored with the routine when it was
+/// created); OFF makes it a string.
+pub const QUOTED_IDENTIFIER: &str = "ASM-TSQL-QUOTED-IDENTIFIER";
 
 /// A T-SQL procedure that returns NULL returns 0 with a warning message;
 /// the converted procedure returns 0 without it.
@@ -164,14 +182,34 @@ fn returns_value(nodes: &[Node]) -> bool {
 }
 
 /// A PostgreSQL name as PostgreSQL resolves it: a quoted name whose case
-/// matters arrives with a leading `"` and is kept; any other is folded to
-/// lower case (`Sqldiff.Mirror.pgName`).
+/// matters arrives with a leading `"` and is kept; any other has its ASCII
+/// letters folded to lower case, and only those: PostgreSQL leaves other
+/// letters as written in a UTF-8 database (`CREATE PROCEDURE Ärger` makes
+/// `"Ärger"`), and so does `Sqldiff.Mirror.pgName`.
 pub fn pg_name(n: &str) -> String {
     if n.starts_with('"') {
         n.to_string()
     } else {
-        n.to_lowercase()
+        n.to_ascii_lowercase()
     }
+}
+
+/// The key a routine's name pairs on: T-SQL `dbo.` dropped, quotes gone,
+/// ASCII letters folded.
+pub(crate) fn pair_key(name: &str, d: Dialect) -> String {
+    let parts: Vec<String> = name.split('.').map(|p| p.to_ascii_lowercase()).collect();
+    match parts.as_slice() {
+        [s, n] if d == Dialect::Tsql && s == "dbo" => n.clone(),
+        _ => parts.join("."),
+    }
+}
+
+/// A name the trusted mappings may carry: two parts or more (a one-part
+/// T-SQL name resolves through the calling routine's schema and then
+/// `dbo`, which the mapping does not model), and ASCII, where the two
+/// dialects agree on what case folding does.
+fn mappable(parts: &[String]) -> bool {
+    parts.len() >= 2 && parts.iter().all(|p| p.is_ascii())
 }
 
 type Read = (String, (usize, usize), Result<Routine, String>);
@@ -302,7 +340,8 @@ pub const TABLES_AS_DECLARED: &str = "ASM-TABLES-AS-DECLARED";
 /// leaves the table out, so its data statements stay unconfirmed.
 #[derive(Debug, Clone, Default)]
 pub struct Tables {
-    by_target: Vec<MirrorTable>,
+    /// Each table with its T-SQL name as declared.
+    by_target: Vec<(MirrorTable, Vec<String>)>,
 }
 
 /// Words of a node as names compare: lower case, quotes removed.
@@ -313,6 +352,19 @@ fn words(n: &SyntaxNode, d: Dialect, out: &mut Vec<String>) {
             K::Quoted => sqldiff_syntax::abstract_syntax::quoted_name(&t.text, d)
                 .trim_start_matches('"')
                 .to_lowercase(),
+            // A name inside a string still names the table:
+            // `sp_bindefault 'df', 'dbo.Acct.Qty'`, `EXEC('ALTER TABLE ...')`.
+            K::Str => {
+                out.extend(
+                    t.text
+                        .split(|c: char| {
+                            !(c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$'))
+                        })
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_lowercase),
+                );
+                continue;
+            }
             _ => continue,
         };
         out.push(w);
@@ -431,14 +483,25 @@ impl Tables {
                 })
                 .collect();
             if let Some(cols) = cols {
-                by_target.push(MirrorTable { name: key, cols });
+                by_target.push((MirrorTable { name: key, cols }, a.name.clone()));
             }
         }
         Tables { by_target }
     }
 
     pub fn get(&self, target: &str) -> Option<&MirrorTable> {
-        self.by_target.iter().find(|t| t.name == target)
+        self.by_target
+            .iter()
+            .find(|t| t.0.name == target)
+            .map(|t| &t.0)
+    }
+
+    /// The T-SQL name the table was declared with.
+    fn declared(&self, target: &str) -> Option<&[String]> {
+        self.by_target
+            .iter()
+            .find(|t| t.0.name == target)
+            .map(|t| t.1.as_slice())
     }
 }
 
@@ -543,12 +606,20 @@ pub fn mirror_request(
     callees(&a.body.body, &mut calls);
     let mut routines = Vec::new();
     for c in calls {
+        // Not mapped, the call stays unknown to the checker, which refuses.
+        if !mappable(&c) || (trusted.binary_collation && !trusted.declared_routines.contains(&c)) {
+            continue;
+        }
         let (to, dbo) = target_routine(&c);
         if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
             assumptions.push("ASM-DBO-SCHEMA".to_string());
         }
         let pair = (c.join("."), to);
         if !routines.contains(&pair) {
+            let callee = format!("{CALLEE_CONFIRMED}:{}", c.join("."));
+            if !assumptions.contains(&callee) {
+                assumptions.push(callee);
+            }
             routines.push(pair);
         }
     }
@@ -556,8 +627,14 @@ pub fn mirror_request(
     written_tables(&a.body.body, &mut written);
     let (mut table_pairs, mut table_catalog) = (Vec::new(), Vec::<MirrorTable>::new());
     for w in &written {
+        if !mappable(w) {
+            continue;
+        }
         let (to, dbo) = target_routine(w);
         let Some(t) = tables.get(&to) else { continue };
+        if trusted.binary_collation && tables.declared(&to) != Some(w.as_slice()) {
+            continue;
+        }
         if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
             assumptions.push("ASM-DBO-SCHEMA".to_string());
         }
@@ -620,11 +697,16 @@ pub fn certify(
 ) -> Vec<Certificate> {
     let src = routines(input, from);
     let out = routines(output, to);
-    let readable: Vec<Routine> = out.iter().filter_map(|(_, _, r)| r.clone().ok()).collect();
+    let mut readable: Vec<Routine> = out.iter().filter_map(|(_, _, r)| r.clone().ok()).collect();
+    for r in &trusted.output_routines {
+        if !readable.iter().any(|x| x.name == r.name) {
+            readable.push(r.clone());
+        }
+    }
     let mut certs = Vec::new();
-    for (i, (name, span, a)) in src.into_iter().enumerate() {
+    for (name, span, a) in src {
         let mut c = Certificate {
-            routine: name,
+            routine: name.clone(),
             scalars: None,
             statements: None,
             errors: None,
@@ -639,7 +721,20 @@ pub fn certify(
                 reason: String::new(),
             },
         };
-        let b = out.get(i).map(|(_, _, b)| b.clone());
+        // The output routine of the same name, if exactly one.
+        let key = pair_key(&name, from);
+        let same: Vec<_> = out
+            .iter()
+            .filter(|(n, _, _)| pair_key(n, to) == key)
+            .collect();
+        let b = match same.as_slice() {
+            [(_, _, b)] => Some(b.clone()),
+            _ => None,
+        };
+        let quoted = from == Dialect::Tsql
+            && input
+                .get(span.0..span.1)
+                .is_some_and(|t| has_double_quoted_name(t, from));
         c.answer = match (a, b) {
             (Err(e), _) => Answer::Unconfirmed {
                 reason: format!("the source routine is outside the verified shape: {e}"),
@@ -657,7 +752,10 @@ pub fn certify(
                     Err(e) => Answer::Unconfirmed {
                         reason: format!("no renaming pairs the two routines: {e}"),
                     },
-                    Ok((req, assumptions)) => {
+                    Ok((req, mut assumptions)) => {
+                        if quoted {
+                            assumptions.push(QUOTED_IDENTIFIER.to_string());
+                        }
                         c.renaming = req.renaming.clone();
                         match checker {
                             None => Answer::Unconfirmed {
@@ -698,6 +796,32 @@ pub fn certify(
         certs.push(c);
     }
     certs
+}
+
+/// The routines of a converted tree that read back, for the target catalog.
+pub fn output_routines(texts: &[&str], d: Dialect) -> Vec<Routine> {
+    texts
+        .iter()
+        .flat_map(|t| routines(t, d))
+        .filter_map(|(_, _, r)| r.ok())
+        .collect()
+}
+
+/// The routines a tree declares, names as written (quotes removed).
+pub fn declared_routines(texts: &[&str], d: Dialect) -> Vec<Vec<String>> {
+    texts
+        .iter()
+        .flat_map(|t| routines(t, d))
+        .map(|(name, _, _)| name.split('.').map(str::to_string).collect())
+        .collect()
+}
+
+fn has_double_quoted_name(text: &str, d: Dialect) -> bool {
+    parse(text, d)
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| t.kind() == SyntaxKind::QUOTED_IDENT && t.text().starts_with('"'))
 }
 
 /// What a confirmation rests on: the C2a slice's residual assumptions
@@ -906,5 +1030,76 @@ END
         let read = |src: &str| routines(src, Dialect::Tsql).remove(0).2.unwrap();
         assert!(begins_tran_outside_try(&read(bracket).body.body));
         assert!(!begins_tran_outside_try(&read(idiom).body.body));
+    }
+
+    #[test]
+    fn names_fold_as_postgresql_folds_them() {
+        assert_eq!(pg_name("Acct"), "acct");
+        // PostgreSQL folds only ASCII letters in a UTF-8 database.
+        assert_eq!(pg_name("Ärger"), "Ärger");
+        assert_eq!(pg_name("\"Acct"), "\"Acct");
+    }
+
+    #[test]
+    fn only_qualified_ascii_names_are_mapped() {
+        let src = "CREATE PROCEDURE sales.p @x int OUTPUT AS\nBEGIN\n  EXEC q @x OUTPUT;\n  EXEC dbo.r @x OUTPUT;\n  EXEC dbo.Ärger @x OUTPUT;\nEND\n";
+        let out = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres)
+            .output()
+            .to_string();
+        let a = routines(src, Dialect::Tsql).remove(0).2.unwrap();
+        let b = routines(&out, Dialect::Postgres)
+            .remove(0)
+            .2
+            .unwrap_or_else(|e| panic!("{e}\n{out}"));
+        let (req, asm) = mirror_request(&a, &b, &[], &Trusted::default()).unwrap();
+        // `q` resolves through sales first in T-SQL; Ä folds differently.
+        assert_eq!(req.routines, [("dbo.r".to_string(), "r".to_string())]);
+        assert!(
+            asm.iter().any(|x| x == "ASM-CALLEE-CONFIRMED:dbo.r"),
+            "{asm:?}"
+        );
+        // Under a binary collation only the declared spelling reaches it.
+        let bin = Trusted {
+            binary_collation: true,
+            declared_routines: vec![vec!["dbo".into(), "R".into()]],
+            ..Default::default()
+        };
+        let (req, _) = mirror_request(&a, &b, &[], &bin).unwrap();
+        assert!(req.routines.is_empty(), "{:?}", req.routines);
+    }
+
+    #[test]
+    fn routines_pair_by_name_and_quoted_names_are_named() {
+        // The first routine has no output routine; the second is not paired
+        // with the first one's place.
+        let src = "CREATE PROCEDURE dbo.p1 @v sql_variant AS\nBEGIN\n  SET @v = NULL;\nEND\nGO\nCREATE PROCEDURE dbo.p2 @a int OUTPUT AS\nBEGIN\n  SET @a = \"a\";\nEND\n";
+        let out = "CREATE OR REPLACE PROCEDURE p2(INOUT p_a integer, INOUT return_code integer) LANGUAGE plpgsql AS $$\nBEGIN\n  return_code := 0;\n  p_a := p_a;\nEND;\n$$;\n";
+        let certs = certify(
+            src,
+            out,
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            None,
+        );
+        let Answer::Unconfirmed { reason } = &certs[0].answer else {
+            panic!()
+        };
+        assert_eq!(reason, "the output has no routine for it");
+        assert!(certs[1].target.is_some(), "{:?}", certs[1]);
+        assert!(has_double_quoted_name(src, Dialect::Tsql));
+        assert!(!has_double_quoted_name("SELECT [a], 'b'", Dialect::Tsql));
+    }
+
+    #[test]
+    fn a_table_named_in_a_string_is_not_plain() {
+        let ddl = "CREATE TABLE dbo.Acct (Id int NOT NULL, Qty int NULL, CONSTRAINT PK_Acct PRIMARY KEY (Id));\n";
+        let bind = format!("{ddl}GO\nEXEC sp_bindefault 'df_qty', 'dbo.Acct.Qty';\n");
+        let out = crate::rewrite(ddl, Dialect::Tsql, Dialect::Postgres)
+            .output()
+            .to_string();
+        let read = |src: &str| Tables::read(&[src], &[&out], Dialect::Tsql, Dialect::Postgres);
+        assert!(read(ddl).get("acct").is_some());
+        assert!(read(&bind).get("acct").is_none());
     }
 }

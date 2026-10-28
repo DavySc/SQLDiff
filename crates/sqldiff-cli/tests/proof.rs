@@ -605,3 +605,45 @@ fn the_real_checker_discharges_the_try_subtransaction_note() {
         assert!(stdout.contains(open), "{open}: {stdout}");
     }
 }
+
+/// A caller's confirmation takes its callee as its conversion: the release
+/// gate accepts that only when the callee's own certificate is confirmed
+/// (and calls nothing itself); otherwise it names the callee.
+#[test]
+fn the_real_checker_ties_a_caller_to_its_callee() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("callee-gate");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let caller = "CREATE PROCEDURE dbo.p @x int OUTPUT\nAS\nBEGIN\n  EXEC dbo.q @x OUTPUT;\nEND\n";
+    let run = |q: &str| {
+        write(&src, "q.sql", q);
+        write(&src, "p.sql", caller);
+        let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "require"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).to_string()
+    };
+    let good =
+        run("CREATE PROCEDURE dbo.q @n int OUTPUT\nAS\nBEGIN\n  SET @n = ISNULL(@n, 0);\nEND\n");
+    assert!(
+        good.contains("certificates: 2 of 2 routines confirmed"),
+        "{good}"
+    );
+    assert!(!good.contains("ASM-CALLEE-CONFIRMED"), "{good}");
+    let bad = run("CREATE PROCEDURE dbo.q @n int OUTPUT\nAS\nBEGIN\n  SAVE TRANSACTION s;\nEND\n");
+    assert!(bad.contains("ASM-CALLEE-CONFIRMED:dbo.q"), "{bad}");
+}

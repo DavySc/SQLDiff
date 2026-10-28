@@ -1025,6 +1025,20 @@ fact = "How callers handle errors (probed: eval/errors-txn P9d)."
 sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
+id = "ASM-CALLEE-CONFIRMED"
+statement = "A routine a converted routine calls (the qualifier names it) behaves the same as its conversion; the confirmation of the caller took that as given."
+discharge = "generated"
+fact = "The callee's own certificate, confirmed in the same run and resting on no callee itself (the release gate checks this)."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-QUOTED-IDENTIFIER"
+statement = "The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string."
+discharge = "deployment"
+fact = "The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier)."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
 id = "ASM-TSQL-ARITH-ERRORS"
 statement = "T-SQL raises an error on integer overflow and division by zero: ANSI_WARNINGS and ARITHABORT are not both OFF for the session."
 discharge = "deployment"

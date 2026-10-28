@@ -64,6 +64,22 @@ impl Certificates {
         if !w.tree.report.unreadable.is_empty() {
             why.push("some files could not be read (see conversion-report.md)".to_string());
         }
+        // A callee's conversion counts as confirmed when its certificate is
+        // confirmed and rests on no callee itself (no circular reasoning).
+        let all: Vec<&crate::cert::Certificate> =
+            self.files.iter().flat_map(|f| &f.routines).collect();
+        let callee_ok = |caller: &str, callee: &str| {
+            let key = crate::cert::pair_key(callee, self.from);
+            key != crate::cert::pair_key(caller, self.from)
+                && all.iter().any(|c| {
+                    crate::cert::pair_key(&c.routine, self.from) == key
+                        && matches!(c.answer, crate::cert::Answer::Confirmed { .. })
+                        && !c
+                            .assumptions
+                            .iter()
+                            .any(|a| a.starts_with(crate::cert::CALLEE_CONFIRMED))
+                })
+        };
         let accepted = |id: &str| !deployment.accepting(id).is_empty();
         for f in &self.files {
             for c in &f.routines {
@@ -73,7 +89,12 @@ impl Certificates {
                         f.path, c.routine
                     )),
                     crate::cert::Answer::Confirmed { .. } => {
-                        for a in c.assumptions.iter().filter(|a| !accepted(a)) {
+                        let proven = |a: &str| {
+                            a.strip_prefix(crate::cert::CALLEE_CONFIRMED)
+                                .and_then(|x| x.strip_prefix(':'))
+                                .is_some_and(|callee| callee_ok(&c.routine, callee))
+                        };
+                        for a in c.assumptions.iter().filter(|a| !accepted(a) && !proven(a)) {
                             why.push(format!(
                                 "{}: {}: rests on {a}, which the deployment profile does not accept",
                                 f.path, c.routine
@@ -219,13 +240,19 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
         None
     } else {
         let checker = job.proof.checker.as_deref();
-        // Tables are read from the whole tree, source and output as written.
-        let tables = crate::cert::Tables::read(
-            &inputs.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
-            &t.outputs.iter().map(String::as_str).collect::<Vec<_>>(),
-            job.tree.from,
-            job.tree.to,
-        );
+        // Tables are read from the whole tree, source and output as written;
+        // a file that could not be read may change any of them, so then none.
+        let texts: Vec<&str> = inputs.iter().map(|i| i.text.as_str()).collect();
+        let tables = if t.report.unreadable.is_empty() {
+            crate::cert::Tables::read(
+                &texts,
+                &t.outputs.iter().map(String::as_str).collect::<Vec<_>>(),
+                job.tree.from,
+                job.tree.to,
+            )
+        } else {
+            crate::cert::Tables::default()
+        };
         let trusted = crate::cert::Trusted {
             tables,
             row_counts: job.row_counts,
@@ -234,6 +261,11 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
                 .deployment
                 .accepting(crate::cert::BINARY_COLLATION)
                 .is_empty(),
+            declared_routines: crate::cert::declared_routines(&texts, job.tree.from),
+            output_routines: crate::cert::output_routines(
+                &t.outputs.iter().map(String::as_str).collect::<Vec<_>>(),
+                job.tree.to,
+            ),
         };
         let mut files = Vec::new();
         for (k, f) in t.report.files.iter().enumerate() {
