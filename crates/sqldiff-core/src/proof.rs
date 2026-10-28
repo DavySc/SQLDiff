@@ -11,13 +11,74 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sqldiff_syntax::{SyntaxElement, SyntaxNode};
+use sha2::{Digest, Sha256};
+use sqldiff_syntax::{SyntaxElement, SyntaxKind, SyntaxNode};
 
 use crate::artifact::Analyzed;
 use crate::model::{Report, Verdict};
 
 /// The line protocol `sqldiff-check` speaks (`formal/lean/Main.lean`).
-pub const PROTOCOL: &str = "sqldiff-check/1";
+/// Version 2 carries the syntax schema hash ([`schema_hash`]).
+pub const PROTOCOL: &str = "sqldiff-check/2";
+
+/// The syntax schema: every kind a tree can hold, one per line, `token` or
+/// `node` and the name. The Lean types are generated from it
+/// ([`lean_syntax`]).
+pub fn schema() -> String {
+    SyntaxKind::all()
+        .map(|k| {
+            let what = if k.is_token() { "token" } else { "node" };
+            format!("{what} {k:?}\n")
+        })
+        .collect()
+}
+
+/// The first 16 hex digits of the SHA-256 of [`schema`]. Requests carry it
+/// and the checker refuses one whose hash is not its own: a kind added,
+/// removed or renamed in Rust is unknown, never misread, until
+/// `formal/lean/Sqldiff/Syntax.lean` is generated again.
+pub fn schema_hash() -> String {
+    Sha256::digest(schema().as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The Lean module `formal/lean/Sqldiff/Syntax.lean`, generated from the
+/// schema. `crates/sqldiff-core/tests/lean_syntax.rs` fails when the file in
+/// the tree is not this text.
+pub fn lean_syntax() -> String {
+    let kinds: Vec<SyntaxKind> = SyntaxKind::all().collect();
+    let mut s = String::new();
+    s.push_str("/-\nGenerated from `sqldiff_syntax::SyntaxKind` by `sqldiff_core::proof::lean_syntax`.\nDo not edit: run `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test lean_syntax`.\n-/\n\n");
+    s.push_str("namespace Sqldiff.Syntax\n\n");
+    s.push_str(
+        "/-- The schema hash requests must carry (`sqldiff_core::proof::schema_hash`). -/\n",
+    );
+    let _ = writeln!(s, "def schemaHash : String := \"{}\"\n", schema_hash());
+    s.push_str("/-- The kinds of SQLDiff's syntax tree. -/\ninductive Kind where\n");
+    for k in &kinds {
+        let _ = writeln!(s, "  | {k:?}");
+    }
+    s.push_str("deriving DecidableEq, Repr\n\n");
+    s.push_str("/-- A kind by its Rust name; `none` for a name this schema lacks. -/\ndef Kind.ofName? : String → Option Kind\n");
+    for k in &kinds {
+        let _ = writeln!(s, "  | \"{k:?}\" => some .{k:?}");
+    }
+    s.push_str("  | _ => none\n\n");
+    s.push_str(
+        "/-- Whether the kind is a token (a leaf with text). -/\ndef Kind.isToken : Kind → Bool\n",
+    );
+    for k in &kinds {
+        let _ = writeln!(s, "  | .{k:?} => {}", k.is_token());
+    }
+    s.push_str("\n/-- Whitespace and comments, which trees sent to the checker leave out. -/\ndef Kind.isTrivia : Kind → Bool\n");
+    for k in &kinds {
+        let _ = writeln!(s, "  | .{k:?} => {}", k.is_trivia());
+    }
+    s.push_str("\nend Sqldiff.Syntax\n");
+    s
+}
 
 /// What the gate does with an "equal" verdict.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,7 +124,7 @@ pub struct Proof {
     /// Why it is not confirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// The checker that answered (`sqldiff-check 0.1.0 (sqldiff-check/1)`).
+    /// The checker that answered (`sqldiff-check 0.2.0 (sqldiff-check/2)`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checker: Option<String>,
 }
@@ -106,7 +167,7 @@ impl Request {
         if fields.iter().any(|f| f.contains(['\t', '\n', '\r'])) {
             return None;
         }
-        let mut s = format!("{PROTOCOL}\t{id}");
+        let mut s = format!("{PROTOCOL}\t{id}\t{}", schema_hash());
         for f in fields {
             s.push('\t');
             s.push_str(f);
@@ -282,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn request_lines_have_nine_fields() {
+    fn request_lines_have_ten_fields() {
         let d = Dialect::Postgres;
         let r = Request {
             dialect_a: "postgres".into(),
@@ -293,8 +354,9 @@ mod tests {
             tree_b: line("SELECT 1;", d),
         };
         let l = r.line(7).unwrap();
-        assert_eq!(l.split('\t').count(), 9, "{l}");
-        assert!(l.starts_with("sqldiff-check/1\t7\tpostgres\t18\t("));
+        assert_eq!(l.split('\t').count(), 10, "{l}");
+        let head = format!("sqldiff-check/2\t7\t{}\tpostgres\t18\t(", schema_hash());
+        assert!(l.starts_with(&head), "{l}");
         assert!(l.ends_with("\tend"));
         let bad = Request {
             target_a: "18\tx".into(),

@@ -5,18 +5,22 @@ target, whose syntax trees are identical once whitespace and comments are
 left out, are the same program; a program refines itself whatever the
 semantics, so the check needs no specification and no axioms.
 
-What is trusted here: SQLDiff's parser (it built the trees) and
-`sqldiff_core::proof::tree_line`, which writes a tree injectively.
+What is trusted here: SQLDiff's parser (it built the trees),
+`sqldiff_core::proof::tree_line`, which writes a tree injectively, and
+`Sqldiff.Tree.decode`, which reads it back.
 -/
+import Sqldiff.Tree
 
 namespace Sqldiff.Gate
+
+open Sqldiff.Tree
 
 /-- A program as SQLDiff's parser read it: dialect, canonical target and
 the syntax tree without whitespace and comments. -/
 structure Prog where
   dialect : String
   target : String
-  tree : String
+  tree : Tree
 deriving DecidableEq, Repr
 
 /-- The checker's answer. Its default, which `panic!` returns, is
@@ -55,9 +59,8 @@ def check (a b : Prog) : Answer :=
 theorem check_sound {Env Obs : Type} (run : Prog → Env → Obs → Prop) (a b : Prog)
     (t : String) (h : check a b = .confirmed t) : Refines run a b := by
   unfold check at h
-  by_cases hab : a = b
-  · exact refines_of_eq run hab
-  · rw [if_neg hab] at h
-    cases h
+  split at h
+  · next hab => exact refines_of_eq run hab
+  · cases h
 
 end Sqldiff.Gate

@@ -68,6 +68,12 @@ pub enum SyntaxKind {
 use SyntaxKind::*;
 
 impl SyntaxKind {
+    /// Every kind, in declaration order.
+    pub fn all() -> impl Iterator<Item = SyntaxKind> {
+        (0..__LAST as u16)
+            .map(|raw| <SqlLanguage as rowan::Language>::kind_from_raw(rowan::SyntaxKind(raw)))
+    }
+
     pub fn is_trivia(self) -> bool {
         matches!(self, WHITESPACE | LINE_COMMENT | BLOCK_COMMENT)
     }

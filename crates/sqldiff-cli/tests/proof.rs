@@ -1,5 +1,5 @@
 //! `--proof` with a checker process. The checker here is a stand-in script
-//! that speaks the sqldiff-check/1 protocol and decides like
+//! that speaks the sqldiff-check/2 protocol and decides like
 //! formal/lean/Sqldiff/Gate.lean (confirmed only for identical sides);
 //! formal-lean.yml tests the real one.
 #![cfg(unix)]
@@ -21,12 +21,12 @@ fn turn() -> std::sync::MutexGuard<'static, ()> {
 const STAND_IN: &str = r#"#!/usr/bin/env python3
 import json, sys
 if sys.argv[1:] == ["--version"]:
-    print("stand-in 0 (sqldiff-check/1)")
+    print("stand-in 0 (sqldiff-check/2)")
     sys.exit(0)
 for line in sys.stdin:
     f = line.rstrip("\n").split("\t")
-    ok = len(f) == 9 and f[0] == "sqldiff-check/1" and f[1].isdigit() and f[8] == "end"
-    if ok and f[2:5] == f[5:8]:
+    ok = len(f) == 10 and f[0] == "sqldiff-check/2" and f[1].isdigit() and f[9] == "end"
+    if ok and f[3:6] == f[6:9]:
         a = {"id": f[1], "proof": "confirmed", "theorem": "Sqldiff.Gate.check_sound"}
     else:
         a = {"id": f[1] if ok else "0", "proof": "unconfirmed", "reason": "outside the verified fragment"}
@@ -141,7 +141,7 @@ fn a_missing_or_broken_checker_never_confirms() {
     // One that dies.
     let chk = stand_in(
         &d,
-        "#!/bin/sh\n[ \"$1\" = --version ] && echo 'x (sqldiff-check/1)' && exit 0\nexit 3\n",
+        "#!/bin/sh\n[ \"$1\" = --version ] && echo 'x (sqldiff-check/2)' && exit 0\nexit 3\n",
     );
     let (_, v) = diff(Some(&chk), &a, &b, "require");
     assert_eq!(v["verdict"], "unknown");
@@ -169,4 +169,30 @@ fn off_is_the_default_and_leaves_no_proof() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["verdict"], "equal");
     assert!(v.get("proof").is_none());
+}
+
+/// The real checker, when `SQLDIFF_REAL_CHECK` names one (the Linux job of
+/// `.github/workflows/formal-lean.yml` builds it and sets it): the Rust
+/// trees, schema hash and protocol must be what the Lean side decodes.
+#[test]
+fn the_real_checker_confirms_a_reformatted_routine() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let real = PathBuf::from(real);
+    let _turn = turn();
+    let d = scratch("real");
+    let (a, b) = (write(&d, "a.sql", PROC), write(&d, "b.sql", REFORMATTED));
+    let (out, v) = diff(Some(&real), &a, &b, "require");
+    assert_eq!(out.status.code(), Some(0), "{v}");
+    assert_eq!(v["verdict"], "equal", "{v}");
+    assert_eq!(v["proof"]["status"], "confirmed", "{v}");
+    assert_eq!(v["proof"]["theorem"], "Sqldiff.Gate.check_sound");
+    let lower = write(&d, "c.sql", &PROC.replace("UPDATE", "update"));
+    let (_, v) = diff(Some(&real), &a, &lower, "require");
+    assert_eq!(v["verdict"], "unknown", "{v}");
+    assert_eq!(
+        v["proof"]["reason"],
+        "the syntax trees differ: outside the verified fragment"
+    );
 }
