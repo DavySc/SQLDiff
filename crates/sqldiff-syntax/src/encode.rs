@@ -25,7 +25,7 @@ use crate::abstract_syntax::{
     Call, ConflictAction, Cte, Expr, From, InsertSource, MergeAction, OrderItem, SelItem, Select,
     Stmt, Type, When,
 };
-use crate::routine::{Arg, Block, Mode, Node, Param, Routine, RoutineKind, Security};
+use crate::routine::{Arg, Block, Handler, Mode, Node, Param, Routine, RoutineKind, Security};
 
 /// The grammar of the encoding: one type per line, `Type := Ctor field* |
 /// ...`, a field `name:T` with `T` one of `s` (string), `b` (bool), a type
@@ -40,7 +40,9 @@ Param := Param name:s ty:Ty mode:Mode default:Expr?
 Mode := In | Out | InOut
 Security := Caller | Owner
 Block := Block decls:[Stmt] body:[Node]
-Node := NStmt stmt:Stmt | NBlock block:Block | If cond:Expr then:[Node] els:[Node] | While cond:Expr body:[Node] | Call name:[s] args:[Arg] ret:Expr? | Setting name:s on:b
+Node := NStmt stmt:Stmt | NBlock block:Block | If cond:Expr then:[Node] els:[Node] | While cond:Expr body:[Node] | Call name:[s] args:[Arg] ret:Expr? | Setting name:s on:b | Try body:[Node] handlers:[Handler] | Throw args:[Expr] | Raise level:s? format:s? args:[Expr] using:[RaiseOpt] | Txn op:s name:s?
+Handler := Handler conds:[s] body:[Node]
+RaiseOpt := RaiseOpt name:s value:Expr
 Arg := Arg name:s? value:Expr output:b
 Ty := Ty name:s args:[s]
 Expr := Name parts:[s] | Var name:s | Num text:s | Str value:s | Null | Star qual:s? | CallE call:CallF | Bin op:s l:Expr r:Expr | Unary op:s x:Expr | IsNull x:Expr neg:b | InList x:Expr list:[Expr] neg:b | InQuery x:Expr query:Select neg:b | Between x:Expr lo:Expr hi:Expr neg:b | Like x:Expr pattern:Expr neg:b ci:b | Cast x:Expr ty:Ty | Case operand:Expr? whens:[When2] els:Expr? | Exists query:Select | Subquery query:Select | Tuple xs:[Expr] | Special name:s | Extract field:s x:Expr
@@ -219,7 +221,47 @@ impl W {
                 self.s(name);
                 self.b(*on);
             }
+            Node::Try { body, handlers } => {
+                self.open("Try");
+                self.list(body, |w, n| w.node(n));
+                self.list(handlers, |w, h| w.handler(h));
+            }
+            Node::Throw { args } => {
+                self.open("Throw");
+                self.exprs(args);
+            }
+            Node::Raise {
+                level,
+                format,
+                args,
+                using,
+            } => {
+                self.open("Raise");
+                self.os(level);
+                self.os(format);
+                self.exprs(args);
+                self.list(using, |w, (n, e)| {
+                    w.sep();
+                    w.open("RaiseOpt");
+                    w.s(n);
+                    w.expr(e);
+                    w.close();
+                });
+            }
+            Node::Txn { op, name } => {
+                self.open("Txn");
+                self.s(op);
+                self.os(name);
+            }
         }
+        self.close();
+    }
+
+    fn handler(&mut self, h: &Handler) {
+        self.sep();
+        self.open("Handler");
+        self.strs(&h.conds);
+        self.list(&h.body, |w, n| w.node(n));
         self.close();
     }
 

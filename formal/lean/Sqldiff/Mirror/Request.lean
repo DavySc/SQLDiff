@@ -191,6 +191,15 @@ ever added, so a reader of the C1 answer keeps working.
   only the control statements of C1. Added in C3a, last, so a reader of
   the C2a answer keeps working.
 
+* `"errors"`: `"c4"` when the routines handle errors, raise them or
+  control transactions (C4: `TRY`/`CATCH` against an exception block,
+  `THROW` against `RAISE`, `BEGIN TRAN`/`COMMIT`, the rollback-and-rethrow
+  idiom); absent otherwise. Added in C4, last, so a reader of the C3a
+  answer keeps working. Its residuals (`ASM-CATCH-CORE-ERRORS`,
+  `ASM-NO-CALLER-TXN`, `ASM-THROW-ERRCODE`) are in `"residual"`, so a
+  reader that does not know them already does not treat the answer as a
+  C2a one.
+
 C2b adds no field: a confirmation whose routines use strings is a C2a
 answer (the slice grew; the theorem is the same), and its `"residual"`
 names the string facts it rests on (`ASM-CONCAT-NULL`,
@@ -206,7 +215,10 @@ def extra (dep cat ra : String) (ans : Answer) : String :=
       | some d, some g, some a => lowerT d g a
       | _, _, _ => none
     let stmts := if (ca.map Core.Routine.hasData).getD false then "c3a" else "c1"
-    let tail := ",\"statements\":\"" ++ stmts ++ "\""
+    let errs := match a, ca with
+      | some a, some ca => if usesC4 a ca then ",\"errors\":\"c4\"" else ""
+      | _, _ => ""
+    let tail := ",\"statements\":\"" ++ stmts ++ "\"" ++ errs
     if t == theoremC2a then
       let names := match a, ca with
         | some a, some ca => residual a ca

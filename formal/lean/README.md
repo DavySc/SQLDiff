@@ -10,16 +10,17 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Ast.lean` | Generated from the abstract syntax schema (`sqldiff_syntax::encode::SCHEMA`, `sqldiff_core::proof::lean_ast`): routines, statements and expressions as Lean types, and the decoder for their one-line encoding. Do not edit; the same bless command writes it |
 | `Sqldiff/Tree.lean` | The syntax tree as Lean types and its decoder: an unknown kind, a token where a node belongs or the reverse, or any other text fails to decode |
 | `Sqldiff/Gate.lean` | Programs, refinement (decision 1), the check, and `check_sound`: a confirmed answer means B refines A, for every semantics |
-| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a and C3a ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); expressions are slice expressions (`SExpr`: variables, columns, 32-bit integer literals, NULL, `+ - * / %`, negation, comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`) or uninterpreted operators; what a routine's statements can do (raise, violate a constraint, fail after a write) |
+| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); expressions are slice expressions (`SExpr`: variables, columns, 32-bit integer literals, NULL, `+ - * / %`, negation, comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
 | `Sqldiff/Core/Semantics.lean` | Values (NULL, three-valued booleans, 32-bit integers, opaque values), errors (overflow, division by zero, constraint violations), the meaning of slice expressions, the database (tables as lists of rows, observed as bags), the data statements, the fuel-based, executable interpreter, what a caller observes (out parameters, returned value, world and database after a finished call; error kind and calls for a failed one; decision 1) and `Refines` |
 | `Sqldiff/Core/Data.lean` | The data statements: congruence lemmas (`insertRows_map`, `updateRows_map`, `deleteRows_map`) and statement atomicity (`exec_error_atomic`) |
 | `Sqldiff/Core/Rename.lean` | An injective renaming of a routine's variables is observationally the same routine (`refines_rename`) |
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes (with a result or an error), more fuel gives the same observation (`obs_mono`) |
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
+| `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
 | `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice and the C3a data statements (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer |
-| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG); the extra answer fields (`scalars`, `residual`, `statements`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states), as `#guard`s checked on every build |
+| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC4.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs), as `#guard`s checked on every build |
 | `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
@@ -244,3 +245,81 @@ residuals; it does not cover the state after a failed call (C4), `MERGE`,
 Theorems with only the standard axioms: `check_sound`, `check_sound_c2a`,
 `refines_rename`, `obs_mono`, `Routine.obs_opFree`, `exec_error_atomic`
 and the congruence lemmas, and (C2b) `mkRtrim_eval` (`Axioms.lean`).
+
+### Phase C4: errors and transactions
+
+The core has handled errors and transaction control
+(`Sqldiff.Core.Stmt`): `tryCatch undo body handler` runs the handler
+when the body fails, with the error bound to its `reraise`s, from the
+state the error left, except that with `undo` the database is put back
+as the body found it; `raise k` fails with `k` (`ErrKind.user` for the
+routine's own errors, a new kind and class); `reraise`; and `commit`,
+which does nothing a finished call shows. T-SQL `TRY`/`CATCH` lowers to
+`tryCatch false`, PL/pgSQL `BEGIN ... EXCEPTION WHEN OTHERS THEN ... END`
+to `tryCatch true`: the one thing they differ in is PostgreSQL's
+rollback of the block (V18) against T-SQL keeping what the body wrote.
+
+**The check settles that difference instead of assuming it away**
+(`Sqldiff/Core/Handlers.lean`). It compares the PL/pgSQL routine with
+`(lowerT a).settleTop`, which sets `undo` on a T-SQL handler
+
+1. whose body cannot fail after it may have written (`undoSafe`: after a
+   data statement or call, only statements that cannot fail in any run of
+   the core): then the error leaves the database the body began with, and
+   `exec_settle` proves the outcomes equal, state for state; or
+2. that always fails and touches no database (`THROW;`, `THROW n, m, s`,
+   possibly after statements that neither write nor return), outside
+   every other handled body: then the error leaves the routine and the
+   two runs differ only in the database of a failed call, which `Obs`
+   does not carry (`exec_settleTop`, `ASM-STATE-AFTER-ERROR` in the
+   residual).
+
+A T-SQL `TRY` whose body can fail after a write and whose handler goes on
+is left without `undo` and refused against an exception block: the
+interpreter shows the two databases differ (`ExamplesC4`, "The rollback
+difference"). `check_sound` and `check_sound_c2a` keep their statements;
+their proofs go through `refines_settleTop_rename`.
+
+The rules (`Sqldiff/Mirror/Lower.lean`, "The C4 rules"; V10, V17 and V18
+are the checked vendor facts of `docs/vendor-facts-verification.md`,
+everything else is quoted **from memory** and must be checked against the
+page; **nothing is probed**: `eval/` has no run of any of it):
+
+| Rule | Vendor text | Probed |
+|---|---|---|
+| `TRY`/`CATCH` against `EXCEPTION WHEN OTHERS` (one handler, condition `OTHERS`, block without `DECLARE`); the handler sees the variables as the error left them | "TRY...CATCH (Transact-SQL)" (from memory); PL/pgSQL "Trapping Errors" (V18) | no |
+| Both catch every error of the core (severity 14/16 in T-SQL; `OTHERS` misses only `query_canceled`/`assert_failure`) | "TRY...CATCH" (from memory), V10, V18 | no |
+| PostgreSQL rolls back the block's writes; T-SQL keeps them (settled by the check, above) | V18; "TRY...CATCH", "SET XACT_ABORT" (V10) | no |
+| An error in a handler leaves it; handlers nest | both pages (from memory) | no |
+| `THROW n, 'm', s` (`n` 50000..2147483647, `s` 0..255, literals) and `RAISE [EXCEPTION] 'f'` (no `%`) / `USING MESSAGE = 'm' [, ERRCODE = 'P0001']` raise `user` | "THROW (Transact-SQL)", PL/pgSQL "Errors and Messages" (from memory) | no |
+| `THROW;` and `RAISE;` re-raise the handled error, only directly in a handler | same pages (from memory) | no |
+| `RAISERROR`, `RAISE NOTICE`, other `ERRCODE`s, `ERROR_NUMBER()` and the other error functions, `XACT_STATE()`, `@@ERROR`, `SQLSTATE`, `SQLERRM`, condition-specific handlers: outside | V10 (RAISERROR ignores XACT_ABORT) | n/a |
+| No call inside a handled body (a callee's errors are not in the core, its writes would differ) | n/a | n/a |
+| T-SQL `BEGIN TRAN ... COMMIT` as a bracket in the routine's own list (or in the idiom's body), under `SET XACT_ABORT ON`, nothing between them that returns, calls, handles or controls transactions; lowers to nothing and `commit` | "BEGIN/COMMIT TRANSACTION" (from memory), V10 | no |
+| The rollback-and-rethrow idiom (`IF @@TRANCOUNT > 0 ROLLBACK; THROW;`, or `ROLLBACK; THROW;` around a bracketed body), outside other handlers, lowers to its body | "ROLLBACK TRANSACTION", "THROW" (from memory) | no |
+| PL/pgSQL `COMMIT` only in a procedure without `SECURITY DEFINER`, outside exception blocks | V17 | no |
+| `TRY`, `THROW`, transactions only in T-SQL procedures | "CREATE FUNCTION (Transact-SQL)" (from memory) | n/a |
+
+**Residuals** added to a C2a answer: `ASM-CATCH-CORE-ERRORS` (the routine
+has a handler: inside a handled block no error is raised that the core
+does not model, or such an error is caught alike), `ASM-NO-CALLER-TXN`
+(an error can reach a handler, or there is transaction control: no
+transaction is open when the routine is called, `IMPLICIT_TRANSACTIONS
+OFF`, and the PostgreSQL `CALL` is top-level outside a transaction
+block), `ASM-THROW-ERRCODE` (the routine raises its own error: callers do
+not tell user errors apart by number). `ASM-STATE-AFTER-ERROR` is now
+decided on the settled routine, so a handled body that cannot fail after
+a write no longer names it. A confirmed answer whose routines use C4
+carries `"errors":"c4"` after `"statements"`; the checker reports
+`0.7.0`. The abstract syntax gained `Node.Try`, `Throw`, `Raise`, `Txn`,
+`Handler` and `RaiseOpt` (`crates/sqldiff-syntax/src/routine.rs`), so the
+schema hash changed.
+
+**Trust statement.** A confirmation of a routine with C4 constructs rests
+on the C4 rules above (trusted spec, unprobed, mostly quoted from
+memory), on the residuals, and on the earlier slices' facts. Not covered:
+`RAISERROR`, savepoints, `ROLLBACK` outside the idiom, nested
+transactions, `XACT_STATE()`/`@@TRANCOUNT` reads, calls in handled
+blocks, condition-specific handlers, error messages and numbers, the
+state after an error that leaves the routine, and explicit transactions
+opened by the caller.

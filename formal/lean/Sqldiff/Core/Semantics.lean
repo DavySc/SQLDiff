@@ -37,19 +37,8 @@ inductive Val (U : Type) where
   | str (s : String)
 deriving DecidableEq, Repr
 
-/-- Why an expression or a statement fails. `overflow` is T-SQL error
-8115 and PostgreSQL SQLSTATE 22003 ("integer out of range"); `divByZero`
-is T-SQL 8134 and SQLSTATE 22012. `constraint` is a data statement that
-would leave a NULL in a `NOT NULL` or key column (T-SQL 515, SQLSTATE
-23502) or two rows with one primary key (T-SQL 2627, SQLSTATE 23505).
-`other` is raised by an uninterpreted operator, or by a value of the
-wrong kind where the core needs an integer. -/
-inductive ErrKind where
-  | overflow
-  | divByZero
-  | constraint
-  | other (code : String)
-deriving DecidableEq, Repr
+-- `ErrKind`, why a statement fails, is in `Sqldiff.Core.Syntax`: C4's
+-- `raise` statement names one.
 
 /-- What a caller can tell about an error across dialects (decision 1:
 the error kind of the semantic profiles, `[error_kinds]`). Overflow and
@@ -59,11 +48,13 @@ expression are evaluated, which neither vendor specifies, does not matter
 here: within one expression of the slice the only errors are arithmetic
 ones, and whether some error happens does not depend on the order. For
 a data statement, the slice asks that it cannot fail with both kinds
-(`Sqldiff.Core.Stmt.dmlSafe`). -/
+(`Sqldiff.Core.Stmt.dmlSafe`). `user` (C4) is an error the routine raises
+itself (`THROW`, `RAISE EXCEPTION`). -/
 inductive ErrClass where
   | arithmetic
   | constraint
   | other (code : String)
+  | user
 deriving DecidableEq, Repr
 
 def ErrKind.cls : ErrKind → ErrClass
@@ -71,6 +62,7 @@ def ErrKind.cls : ErrKind → ErrClass
   | .divByZero => .arithmetic
   | .constraint => .constraint
   | .other c => .other c
+  | .user => .user
 
 /-- The result of evaluating an expression: a value (possibly NULL) or an
 error. -/
@@ -296,7 +288,8 @@ state and database, and one value per argument position (the parameter's
 value when the callee ended; the caller keeps those in `ref` positions
 only). The world is the environment of decision 1: chosen once, the same
 for both sides. A callee may read and write the database. A call does not
-fail (errors from callees are C4). -/
+fail: a callee's own errors are not modelled, which is why C4 keeps calls
+out of handled bodies (`Sqldiff.Mirror`, "The C4 rules"). -/
 structure WorldModel (U W : Type) where
   call : String → List (Val U) → W → Db U → W × Db U × List (Val U)
 
@@ -314,10 +307,9 @@ structure State (U W : Type) where
   db : Db U
   calls : List (CallEvent U)
 
-/-- How a statement ends. `error` ends the routine: there are no handlers
-yet (T-SQL `TRY`/`CATCH` and PL/pgSQL `EXCEPTION` are C4), and a T-SQL
-routine is in the spec with errors only when it aborts on them
-(`Sqldiff.Mirror.abortsT`). The state of an `error` is the state before
+/-- How a statement ends. `error` ends the routine unless a `tryCatch`
+handles it (C4); a T-SQL routine is in the spec with errors outside a
+handler only when it aborts on them (`Sqldiff.Mirror.abortsT`). The state of an `error` is the state before
 the failing statement: a statement that fails has no effect (statement
 atomicity, `Sqldiff.Core.exec_error_atomic`). `outOfFuel` keeps the state
 reached, so the calls made before the fuel ran out stay observable. -/
@@ -484,9 +476,10 @@ does so for every large enough `n`; a run that does not terminate is out
 of fuel for every `n`. Fuel is never an observation of its own: `Refines`
 quantifies over it. A `return` or an error ends the routine: it
 propagates out of every enclosing `seq` and `while` without running
-anything else. A statement whose expression fails changes nothing: the
-error keeps the state from before it; so does a data statement that fails
-on any row (statement atomicity). -/
+anything else, until a `tryCatch` body (C4), whose handler then runs.
+A statement whose expression fails changes nothing: the error keeps the
+state from before it; so does a data statement that fails on any row
+(statement atomicity). -/
 
 def exec (es : ExprSem U) (wm : WorldModel U W) : Nat → Stmt → State U W → Outcome U W
   | 0, _, st => .outOfFuel st
@@ -531,6 +524,13 @@ def exec (es : ExprSem U) (wm : WorldModel U W) : Nat → Stmt → State U W →
     match deleteRows (fun ρ e => e.eval es st.store ρ) t c (st.db.get t.name) with
     | .error k => .error k st
     | .ok rs => .normal { st with db := st.db.set t.name rs }
+  | n + 1, .tryCatch u b h, st =>
+    match exec es wm n b st with
+    | .error k st' => exec es wm n (h.bindErr k) (if u then { st' with db := st.db } else st')
+    | o => o
+  | _ + 1, .raise k, st => .error k st
+  | _ + 1, .reraise, st => .error (.other "reraise") st
+  | _ + 1, .commit, st => .normal st
 
 /-! ## A routine's run and what a caller observes (decision 1) -/
 
@@ -580,9 +580,13 @@ def outVals (σ : Store U) : List Param → List (Val U)
   world nor the database after a failed call is observed: what a caller
   sees of them depends on its transaction and on each dialect's rollback
   (T-SQL under `XACT_ABORT ON` without an open transaction keeps the
-  statements before the failing one, PostgreSQL rolls the whole call back),
-  which is phase C4. A confirmation of a routine that can fail after a
-  write says so (`Sqldiff.Mirror.residual`, `ASM-STATE-AFTER-ERROR`).
+  statements before the failing one, PostgreSQL rolls the whole call back).
+  A confirmation of a routine that can fail after a write says so
+  (`Sqldiff.Mirror.residual`, `ASM-STATE-AFTER-ERROR`). C4 keeps this
+  observation: a *handled* error does not end the call, and the database
+  the handler starts from, and so the one a finished call shows, is
+  modelled exactly (`Stmt.tryCatch`, `undo`); only the state after an
+  error that leaves the routine stays unobserved.
   Out parameters and the returned value do not reach a caller whose call
   failed.
 * `pending` is a run cut off by fuel: the world and the calls so far,

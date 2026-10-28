@@ -120,6 +120,10 @@ fn a_tsql_procedure_reads_into_the_same_shape() {
             Node::While { .. } => "while",
             Node::Call { .. } => "call",
             Node::Setting { .. } => "setting",
+            Node::Try { .. } => "try",
+            Node::Throw { .. } => "throw",
+            Node::Raise { .. } => "raise",
+            Node::Txn { .. } => "txn",
         })
         .collect();
     assert_eq!(shape, ["stmt", "if", "while", "call", "stmt"]);
@@ -209,4 +213,108 @@ fn tsql_routines_in_the_repository_read() {
         eprintln!("not read: {r}");
     }
     assert!(read >= 10, "only {read} routines read");
+}
+
+const TSQL_C4: &str = "CREATE PROCEDURE dbo.p @id int AS
+BEGIN
+  SET XACT_ABORT ON;
+  BEGIN TRY
+    BEGIN TRAN;
+    INSERT INTO dbo.t (id) VALUES (@id);
+    COMMIT TRANSACTION;
+  END TRY
+  BEGIN CATCH
+    IF @@TRANCOUNT > 0 ROLLBACK;
+    THROW;
+  END CATCH
+  BEGIN TRY
+    SET @id = @id / 0;
+  END TRY
+  BEGIN CATCH
+    THROW 50001, 'failed', 1;
+  END CATCH
+END
+";
+
+const PG_C4: &str = "CREATE PROCEDURE p(p_id integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO t (id) VALUES (p_id);
+  COMMIT;
+  BEGIN
+    p_id := p_id / 0;
+  EXCEPTION
+    WHEN division_by_zero OR SQLSTATE '22003' THEN
+      RAISE;
+    WHEN OTHERS THEN
+      RAISE EXCEPTION USING MESSAGE = 'failed', ERRCODE = 'P0001';
+  END;
+  RAISE NOTICE 'n = %', p_id;
+END;
+$$;
+";
+
+/// Phase C4: TRY/CATCH, THROW and transaction control read in T-SQL;
+/// exception blocks, RAISE and COMMIT read, print and read back in
+/// PL/pgSQL.
+#[test]
+fn error_handling_and_transactions_read() {
+    let r = routines(TSQL_C4, Dialect::Tsql).remove(0).unwrap();
+    let [Node::Setting { .. }, Node::Try { body, handlers }, Node::Try { handlers: h2, .. }] =
+        r.body.body.as_slice()
+    else {
+        panic!("{:?}", r.body.body);
+    };
+    assert!(matches!(
+        body.as_slice(),
+        [Node::Txn { op, name: None }, Node::Stmt(_), Node::Txn { .. }] if op == "BEGIN"
+    ));
+    assert!(handlers.len() == 1 && handlers[0].conds.is_empty());
+    assert!(matches!(
+        handlers[0].body.as_slice(),
+        [Node::If { .. }, Node::Throw { args }] if args.is_empty()
+    ));
+    assert!(matches!(h2[0].body.as_slice(), [Node::Throw { args }] if args.len() == 3));
+    assert!(routine::print_postgres(&r).is_err());
+
+    let r = routines(PG_C4, Dialect::Postgres).remove(0).unwrap();
+    let Node::Try { handlers, .. } = &r.body.body[2] else {
+        panic!("{:?}", r.body.body);
+    };
+    assert_eq!(
+        handlers.iter().map(|h| h.conds.clone()).collect::<Vec<_>>(),
+        [
+            vec!["division_by_zero".to_string(), "sqlstate:22003".to_string()],
+            vec!["others".to_string()]
+        ]
+    );
+    assert!(matches!(&r.body.body[1], Node::Txn { op, name: None } if op == "COMMIT"));
+    assert_eq!(reprint(&r), r);
+
+    for (body, what) in [
+        ("BEGIN DISTRIBUTED TRANSACTION;", "BEGIN"),
+        ("SAVE TRANSACTION s;", "SAVE"),
+        ("THROW 50001, 'x';", "THROW"),
+        ("COMMIT WITH (DELAYED_DURABILITY = ON);", "COMMIT"),
+    ] {
+        let text = format!("CREATE PROCEDURE dbo.p AS\nBEGIN\n  {body}\nEND\n");
+        let e = routines(&text, Dialect::Tsql).remove(0).expect_err(body);
+        assert!(e.contains(what), "{body}: {e}");
+    }
+    for body in [
+        "RAISE division_by_zero;",
+        "COMMIT AND CHAIN;",
+        "DECLARE x int; BEGIN x := 1; EXCEPTION WHEN OTHERS THEN x := 2; END;",
+    ] {
+        let text =
+            format!("CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  {body}\nEND;\n$$;\n");
+        assert!(
+            routines(&text, Dialect::Postgres).remove(0).is_err(),
+            "{body}"
+        );
+    }
+    // An exception section on the routine's own block is not read.
+    let top = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  NULL;\nEXCEPTION WHEN OTHERS THEN\n  RAISE;\nEND;\n$$;\n";
+    assert!(routines(top, Dialect::Postgres).remove(0).is_err());
 }
