@@ -43,6 +43,7 @@ impl Fixture {
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
             catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
         }
     }
 

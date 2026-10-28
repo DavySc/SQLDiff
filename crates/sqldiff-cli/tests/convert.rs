@@ -729,5 +729,50 @@ fn base_catalogs_bind_and_are_neither_written_nor_counted() {
         err.contains("--no-catalog") && err.contains("--catalog"),
         "{err}"
     );
+
+    // The target's own base DDL, for the target side.
+    let pg = d.join("base_pg/orders.sql");
+    write(
+        &pg,
+        b"CREATE TABLE orders (order_id integer NOT NULL PRIMARY KEY, status varchar(10) NOT NULL);\n",
+    );
+    let pg = pg.to_str().unwrap();
+    let r = run(&[
+        "convert",
+        s,
+        "-o",
+        o,
+        "--to",
+        "postgres",
+        "--isolated",
+        "--overwrite",
+        "--catalog",
+        b1,
+        "--catalog-b",
+        pg,
+    ]);
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(stdout.contains("--catalog-b"), "{stdout}");
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("conversion-report.json")).unwrap())
+            .unwrap();
+    assert_eq!(report["base_catalogs_b"][0]["path"], pg);
+    assert_eq!(gate(&["--catalog", b1, "--catalog-b", pg]), 0);
+    // Not without --catalog.
+    let r = run(&[
+        "convert",
+        s,
+        "-o",
+        o,
+        "--to",
+        "postgres",
+        "--isolated",
+        "--overwrite",
+        "--catalog-b",
+        pg,
+    ]);
+    assert_eq!(r.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(err.contains("--catalog"), "{err}");
     let _ = std::fs::remove_dir_all(&d);
 }

@@ -76,6 +76,7 @@ fn review(d: &Dir) -> Review {
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),
         catalogs: Vec::new(),
+        catalogs_b: Vec::new(),
     };
     let out = d.0.join("out");
     let (inputs, unreadable) = tree::read(&args).unwrap();

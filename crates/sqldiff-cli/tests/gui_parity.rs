@@ -163,15 +163,30 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
         .iter()
         .map(|f| base.join(f).display().to_string())
         .collect();
+    let base_pg = root.join("base catalogs pg").join("orders.sql");
+    write(
+        &base_pg,
+        "CREATE TABLE orders (order_id integer NOT NULL, status varchar(10) NOT NULL);\n",
+    );
+    let catalogs_b = vec![base_pg.display().to_string()];
 
     let runs = Runs::default();
     let mut sheets = Vec::new();
-    for (name, src, isolated, overwrite, cats) in [
-        ("project", &src, false, false, &Vec::new()),
-        ("isolated", &src, true, false, &Vec::new()),
-        ("no-project", &bare, false, false, &Vec::new()),
-        ("overwrite", &src, false, true, &Vec::new()),
-        ("catalogs", &with_base, false, false, &catalogs),
+    let none = Vec::new();
+    for (name, src, isolated, overwrite, cats, cats_b) in [
+        ("project", &src, false, false, &none, &none),
+        ("isolated", &src, true, false, &none, &none),
+        ("no-project", &bare, false, false, &none, &none),
+        ("overwrite", &src, false, true, &none, &none),
+        ("catalogs", &with_base, false, false, &catalogs, &none),
+        (
+            "catalogs-b",
+            &with_base,
+            false,
+            false,
+            &catalogs,
+            &catalogs_b,
+        ),
     ] {
         let gui = d.join(format!("gui {name}"));
         let cli = d.join(format!("cli {name}"));
@@ -190,6 +205,7 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
             extensions: Vec::new(),
             packs: Vec::new(),
             catalogs: cats.clone(),
+            catalogs_b: cats_b.clone(),
             instances: None,
         };
         let run = runs.start(spec(&gui), isolated, |_| {}).unwrap();
@@ -215,21 +231,31 @@ fn the_run_sheet_command_writes_what_the_run_wrote() {
         assert_gate_is_review_status(&run);
         let c = &run.command;
         // The catalogs are on the sheet, in order.
-        let given: Vec<&String> = c
-            .args
-            .iter()
-            .zip(c.args.iter().skip(1))
-            .filter(|(f, _)| *f == "--catalog")
-            .map(|(_, p)| p)
-            .collect();
-        assert_eq!(given, cats.iter().collect::<Vec<_>>(), "{name}");
-        if name == "catalogs" {
+        let given = |flag: &str| -> Vec<&String> {
+            c.args
+                .iter()
+                .zip(c.args.iter().skip(1))
+                .filter(|(f, _)| *f == flag)
+                .map(|(_, p)| p)
+                .collect()
+        };
+        assert_eq!(
+            given("--catalog"),
+            cats.iter().collect::<Vec<_>>(),
+            "{name}"
+        );
+        assert_eq!(
+            given("--catalog-b"),
+            cats_b.iter().collect::<Vec<_>>(),
+            "{name}"
+        );
+        if name.starts_with("catalogs") {
             let report = std::fs::read_to_string(gui.join("conversion-report.json")).unwrap();
             assert!(report.contains("\"base_catalogs\""), "{report}");
             assert!(!report.contains("bind.unknown-table"), "{report}");
         }
         match name {
-            "project" | "overwrite" | "catalogs" => {
+            "project" | "overwrite" | "catalogs" | "catalogs-b" => {
                 assert_eq!(
                     c.project_config,
                     Some(root.join("sqldiff.toml").display().to_string())
@@ -312,6 +338,7 @@ fn a_template_run_and_its_command_write_the_same() {
         extensions: vec![".tpl".into()],
         packs: vec![pack()],
         catalogs: Vec::new(),
+        catalogs_b: Vec::new(),
         instances: instances.map(|p| p.display().to_string()),
     };
     let runs = Runs::default();

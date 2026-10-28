@@ -129,7 +129,9 @@ a.btn:hover { background: var(--link-2); }
     <details class="more" id="more"><summary>Base catalogs, templates, extensions and packs</summary>
       <div class="field"><span>Catalogs</span><textarea id="catalogs" rows="2" placeholder="Base catalogs: DDL files of objects that exist already, one per line" aria-label="Base catalogs, one file per line" spellcheck="false"></textarea><button type="button" class="outline" data-browse="catalog-pick" data-near="src">Add…</button></div>
       <input type="hidden" id="catalog-pick">
-      <div class="hint">Base catalogs bind on both sides and are converted for the target side only; they are not written. An object the tree defines replaces one of the same name; a base object that does not convert leaves what uses it <em>differs</em>.</div>
+      <div class="field"><span>Target catalogs</span><textarea id="catalogs-b" rows="2" placeholder="Optional: the same base objects as DDL in the target dialect, one per line" aria-label="Target base catalogs, one file per line" spellcheck="false"></textarea><button type="button" class="outline" data-browse="catalog-b-pick" data-near="src">Add…</button></div>
+      <input type="hidden" id="catalog-b-pick">
+      <div class="hint">Base catalogs bind on both sides and are converted for the target side only; they are not written. An object the tree defines replaces one of the same name; what uses a base object that does not convert plainly carries an assumption to accept (ASM-BASE-SUSPECT). With target catalogs, the target side uses those as given instead, and nothing is converted.</div>
       <div class="acts"><label class="tog"><input type="checkbox" id="template"> Every file is a template in the <code>[template]</code> syntax of the config or a pack</label></div>
       <div class="field"><span>Parameters</span><input type="text" id="params" placeholder="Names, comma-separated; empty: the template syntax decides" aria-label="Template parameter names" spellcheck="false"><span></span></div>
       <div class="field"><span>Extensions</span><input type="text" id="exts" placeholder="sql" aria-label="File extensions, comma-separated" spellcheck="false"><span></span></div>
@@ -423,6 +425,7 @@ $("conv").addEventListener("submit", async (e) => {
       src, out, from: $("from").value, to: $("to").value, overwrite: $("overwrite").checked,
       template: $("template").checked, parameters: list("params"), extensions: list("exts"),
       catalogs: $("catalogs").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
+      catalogs_b: $("catalogs-b").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
       packs: $("pack").value.trim() ? [$("pack").value.trim()] : [], instances: $("inst").value.trim() || null,
     });
     $("overwrite").checked = false;
@@ -432,13 +435,15 @@ $("conv").addEventListener("submit", async (e) => {
 });
 
 // A catalog picked with Add… goes on its own line.
-$("catalog-pick").addEventListener("change", () => {
-  const p = $("catalog-pick").value.trim();
-  if (!p) return;
-  const t = $("catalogs");
-  t.value = (t.value.trim() ? t.value.replace(/\s*$/, "\n") : "") + p;
-  $("catalog-pick").value = "";
-});
+for (const [pick, list] of [["catalog-pick", "catalogs"], ["catalog-b-pick", "catalogs-b"]]) {
+  $(pick).addEventListener("change", () => {
+    const p = $(pick).value.trim();
+    if (!p) return;
+    const t = $(list);
+    t.value = (t.value.trim() ? t.value.replace(/\s*$/, "\n") : "") + p;
+    $(pick).value = "";
+  });
+}
 
 // Decisions recorded in a review tab change the done gate: read again on return.
 window.addEventListener("focus", () => { if (!timer) refresh(); });

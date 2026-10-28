@@ -642,7 +642,7 @@ pub fn splice_unit(
     Ok(())
 }
 
-fn recount(c: &mut Conversion) {
+pub(crate) fn recount(c: &mut Conversion) {
     let mut counts = Counts::default();
     for u in &c.units {
         *match u.status {

@@ -166,6 +166,9 @@ enum Command {
         /// A base catalog (repeatable), as given to `sqldiff convert --catalog`.
         #[arg(long = "catalog", value_name = "FILE", conflicts_with = "no_catalog")]
         catalogs: Vec<PathBuf>,
+        /// A target base catalog (repeatable), as given to `sqldiff convert --catalog-b`.
+        #[arg(long = "catalog-b", value_name = "FILE", requires = "catalogs")]
+        catalogs_b: Vec<PathBuf>,
         /// Parallel jobs (default: available cores).
         #[arg(short, long)]
         jobs: Option<usize>,
@@ -478,6 +481,7 @@ fn run(cli: Cli) -> Result<(), String> {
             extensions,
             no_catalog,
             catalogs,
+            catalogs_b,
             jobs,
             instances,
             host,
@@ -512,6 +516,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers: cfg.options().helpers,
                     catalogs,
+                    catalogs_b,
                 },
                 out,
                 instances,

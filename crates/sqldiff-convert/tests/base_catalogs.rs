@@ -1,8 +1,9 @@
 //! Base catalogs (`sqldiff convert --catalog FILE`): DDL of objects that exist
 //! already but are not part of the tree. They bind on both sides, the tree's
 //! own objects win, they are converted for the target catalog only and never
-//! written or counted, and a base object that does not convert leaves what
-//! uses it `differs`.
+//! written or counted, and what uses a base object that does not convert
+//! carries `ASM-BASE-SUSPECT`. With the target's own base DDL (`--catalog-b`), the
+//! target side binds against that as given instead.
 
 use std::path::PathBuf;
 
@@ -58,7 +59,14 @@ impl Fixture {
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
             catalogs: catalogs.iter().map(|c| self.path(c)).collect(),
+            catalogs_b: Vec::new(),
         }
+    }
+
+    fn args_b(&self, catalogs: &[&str], b: &[&str]) -> tree::Args {
+        let mut a = self.args(catalogs);
+        a.catalogs_b = b.iter().map(|c| self.path(c)).collect();
+        a
     }
 
     fn convert(&self, catalogs: &[&str]) -> Tree {
@@ -298,7 +306,7 @@ fn a_tree_object_replaces_every_base_object_of_its_name() {
 }
 
 #[test]
-fn a_base_object_that_does_not_convert_leaves_its_users_differs() {
+fn a_base_object_that_does_not_convert_flags_its_users() {
     let fx = Fixture::new(
         "unconverted",
         &[
@@ -309,7 +317,7 @@ fn a_base_object_that_does_not_convert_leaves_its_users_differs() {
             ),
             // datetime2 keeps 7 fraction digits, PostgreSQL's timestamp 6: the
             // table is converted but differs. The view over it converts, and
-            // is left out once the table is.
+            // is suspect through the table.
             (
                 "base/stamps.sql",
                 "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime2 NOT NULL);\nGO\n",
@@ -322,43 +330,72 @@ fn a_base_object_that_does_not_convert_leaves_its_users_differs() {
             ("src/q2.sql", "SELECT order_id FROM late_orders;\n"),
             ("src/q3.sql", "SELECT qty FROM order_items;\n"),
             ("src/q4.sql", "SELECT stamp_id FROM recent_stamps;\n"),
+            // A tree view over a suspect object is suspect, and so is what
+            // uses it, in another file.
+            (
+                "src/views/open_items.sql",
+                "CREATE VIEW open_items AS SELECT i.qty FROM order_items AS i JOIN open_orders AS o ON o.order_id = i.order_id;\n",
+            ),
+            ("src/q5.sql", "SELECT qty FROM open_items;\n"),
             (AUDIT.0, AUDIT.1),
         ],
     );
     let t = fx.convert(&["base/install.sql", "base/stamps.sql", "base/views.sql"]);
-    for q in ["q1.sql", "q2.sql", "q4.sql"] {
-        assert_eq!(
-            status(&t, q),
-            Status::Differs,
+    for q in [
+        "q1.sql",
+        "q2.sql",
+        "q4.sql",
+        "views/open_items.sql",
+        "q5.sql",
+    ] {
+        assert!(
+            has(&t, q, base::BASE_SUSPECT),
             "{q}: {:?}",
             unit_rules(&t, q)
         );
+        assert!(status(&t, q) >= Status::Assumptions);
+        // The suspect objects are in the target catalog.
         assert!(
-            has(&t, q, "bind.unknown-table"),
+            !has(&t, q, "bind.unknown-table"),
             "{q}: {:?}",
             unit_rules(&t, q)
         );
     }
     assert!(
-        status(&t, "q3.sql") <= Status::Unproven,
+        !has(&t, "q3.sql", base::BASE_SUSPECT),
         "{:?}",
         unit_rules(&t, "q3.sql")
     );
     assert!(!has(&t, "q3.sql", "bind.unknown-table"));
-    let out: Vec<(&str, &str, Status)> = t
+    // The note names the object and why.
+    let k = t
+        .report
+        .files
+        .iter()
+        .position(|f| f.path == "q5.sql")
+        .unwrap();
+    let note = t.conversions[k]
+        .units
+        .iter()
+        .flat_map(|u| &u.notes)
+        .find(|n| n.rule == base::BASE_SUSPECT)
+        .unwrap();
+    assert!(note.text.contains("view `open_items`"), "{}", note.text);
+    assert!(note.text.contains("uses `open_orders`"), "{}", note.text);
+    let suspect: Vec<(&str, &str, Status)> = t
         .report
         .base_objects
         .iter()
-        .filter(|o| !o.in_target)
+        .filter(|o| o.suspect)
         .map(|o| (o.kind.as_str(), o.name.as_str(), o.status))
         .collect();
     assert_eq!(
-        out,
+        suspect,
         [
             ("table", "orders", Status::NotConverted),
-            ("view", "open_orders", Status::Differs),
+            ("view", "open_orders", Status::NotConverted),
             ("table", "stamps", Status::Differs),
-            ("view", "late_orders", Status::Differs),
+            ("view", "late_orders", Status::NotConverted),
             ("view", "recent_stamps", Status::Differs),
         ],
         "{:#?}",
@@ -374,19 +411,41 @@ fn a_base_object_that_does_not_convert_leaves_its_users_differs() {
         .iter()
         .find(|o| o.name == "recent_stamps")
         .unwrap();
-    assert!(
-        recent.rules.contains(&"bind.unknown-table".to_string()),
-        "{recent:?}"
-    );
+    assert!(recent.reason.starts_with("Uses `stamps`"), "{recent:?}");
     assert!(t
         .report
         .base_objects
         .iter()
-        .all(|o| o.name != "order_items" || o.in_target));
+        .all(|o| o.name != "order_items" || !o.suspect));
     let md = tree::markdown(&t.report);
-    assert!(md.contains("### Base objects that did not convert"), "{md}");
+    assert!(md.contains("### Suspect base objects"), "{md}");
     assert!(md.contains("table `orders`"), "{md}");
-    assert!(tree::summary(&t.report).contains("5 base object(s) did not convert"));
+    assert!(tree::summary(&t.report).contains("5 suspect base object(s)"));
+}
+
+#[test]
+fn a_tree_object_of_the_same_name_is_not_suspect() {
+    let fx = Fixture::new(
+        "suspect-replaced",
+        &[
+            (
+                "base/stamps.sql",
+                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime2 NOT NULL);\nGO\n",
+            ),
+            (
+                "src/tables/stamps.sql",
+                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime NOT NULL);\n",
+            ),
+            ("src/q1.sql", "SELECT stamp_id FROM stamps;\n"),
+        ],
+    );
+    let t = fx.convert(&["base/stamps.sql"]);
+    assert!(t.report.base_objects.iter().any(|o| o.suspect));
+    assert!(
+        !has(&t, "q1.sql", base::BASE_SUSPECT),
+        "{:?}",
+        unit_rules(&t, "q1.sql")
+    );
 }
 
 #[test]
@@ -578,7 +637,7 @@ fn the_base_hash_reads_contents_in_order_not_paths() {
         path: p.into(),
         text: t.into(),
     };
-    let h = |v: Vec<base::File>| base::hash(&v);
+    let h = |v: Vec<base::File>| base::hash(&v, &[]);
     assert_eq!(h(Vec::new()), None);
     assert_eq!(h(vec![f("a.sql", "x\n")]), h(vec![f("C:\\b.sql", "x\r\n")]));
     assert_ne!(h(vec![f("a.sql", "x\n")]), h(vec![f("a.sql", "y\n")]));
@@ -586,4 +645,110 @@ fn the_base_hash_reads_contents_in_order_not_paths() {
         h(vec![f("a.sql", "x\n"), f("b.sql", "y\n")]),
         h(vec![f("b.sql", "y\n"), f("a.sql", "x\n")])
     );
+}
+
+#[test]
+fn the_base_hash_covers_the_target_catalogs() {
+    let f = |p: &str, t: &str| base::File {
+        path: p.into(),
+        text: t.into(),
+    };
+    let a = [f("a.sql", "x\n")];
+    let without = base::hash(&a, &[]);
+    let with = base::hash(&a, &[f("b.sql", "y\n")]);
+    assert!(with.is_some());
+    assert_ne!(without, with);
+    assert_ne!(with, base::hash(&a, &[f("b.sql", "z\n")]));
+    // Moving a file from one side to the other is another base.
+    assert_ne!(
+        base::hash(&[f("a.sql", "x\n"), f("b.sql", "y\n")], &[]),
+        with
+    );
+}
+
+/// The base of `a_base_object_that_does_not_convert_leaves_its_users_differs`,
+/// with the target's own DDL for it.
+const INSTALL: &str = "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, site geography NULL);\nGO\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\nGO\nCREATE TABLE order_items (order_id int NOT NULL, qty int NOT NULL);\nGO\n";
+const INSTALL_PG: &str = "CREATE TABLE orders (order_id integer NOT NULL PRIMARY KEY, site text NULL);\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\n";
+
+#[test]
+fn target_catalogs_replace_the_converted_base() {
+    let fx = Fixture::new(
+        "catalog-b",
+        &[
+            ("base/install.sql", INSTALL),
+            ("base_pg/install.sql", INSTALL_PG),
+            ("src/q1.sql", "SELECT order_id FROM orders;\n"),
+            ("src/q2.sql", "SELECT order_id FROM open_orders;\n"),
+            // In the source's base only: unknown on the target side.
+            ("src/q3.sql", "SELECT qty FROM order_items;\n"),
+            (AUDIT.0, AUDIT.1),
+        ],
+    );
+    // Converted, orders does not convert: its users are flagged.
+    let t = fx.convert(&["base/install.sql"]);
+    assert!(has(&t, "q1.sql", base::BASE_SUSPECT));
+    // With the target's DDL, orders binds on both sides, as given.
+    let a = fx.args_b(&["base/install.sql"], &["base_pg/install.sql"]);
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let t = tree::convert(&a, &inputs, unreadable, None).unwrap();
+    for q in ["q1.sql", "q2.sql"] {
+        assert!(!has(&t, q, base::BASE_SUSPECT));
+        assert!(
+            !has(&t, q, "bind.unknown-table"),
+            "{q}: {:?}",
+            unit_rules(&t, q)
+        );
+        assert!(
+            status(&t, q) < Status::Differs,
+            "{q}: {:?}",
+            unit_rules(&t, q)
+        );
+    }
+    assert_eq!(status(&t, "q3.sql"), Status::Differs);
+    assert!(has(&t, "q3.sql", "bind.unknown-table"));
+    // Nothing converted, so nothing left out; both sides' files listed.
+    assert!(
+        t.report.base_objects.is_empty(),
+        "{:#?}",
+        t.report.base_objects
+    );
+    assert!(t.report.base_statements.is_empty());
+    assert_eq!(t.report.base_catalogs.len(), 1);
+    assert_eq!(t.report.base_catalogs[0].tables, 3);
+    assert_eq!(t.report.base_catalogs_b.len(), 1);
+    assert_eq!(t.report.base_catalogs_b[0].tables, 2);
+    assert_eq!(t.report.base_catalogs_b[0].sha256, file_hash(INSTALL_PG));
+    let md = tree::markdown(&t.report);
+    assert!(md.contains("Target side"), "{md}");
+    assert!(tree::summary(&t.report).contains("--catalog-b"));
+    let files: Vec<&str> = t.report.files.iter().map(|f| f.path.as_str()).collect();
+    assert!(!files.iter().any(|f| f.contains("install")), "{files:?}");
+}
+
+#[test]
+fn bad_target_catalogs_are_refused() {
+    let fx = Fixture::new(
+        "catalog-b-refused",
+        &[
+            ("base/install.sql", INSTALL),
+            ("base_pg/install.sql", INSTALL_PG),
+            ("base_pg/bundle.json", "{}"),
+            ("src/q1.sql", "SELECT order_id FROM orders;\n"),
+        ],
+    );
+    let refused = |a: tree::Args| tree::read(&a).err().unwrap();
+    assert!(refused(fx.args_b(&[], &["base_pg/install.sql"])).contains("needs --catalog"));
+    assert!(
+        refused(fx.args_b(&["base/install.sql"], &["base_pg/bundle.json"]))
+            .contains("target dialect")
+    );
+    assert!(refused(fx.args_b(
+        &["base/install.sql"],
+        &["base_pg/install.sql", "base_pg/install.sql"]
+    ))
+    .contains("given twice as --catalog-b"));
+    let mut a = fx.args_b(&["base/install.sql"], &["base_pg/install.sql"]);
+    a.no_catalog = true;
+    assert!(refused(a).contains("--no-catalog"));
 }

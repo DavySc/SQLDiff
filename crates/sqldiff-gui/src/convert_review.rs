@@ -119,7 +119,8 @@ fn stamp(s: &Setup) -> Stamp {
     }
     let mut out = Vec::new();
     let given = [Some(&s.tree.src), Some(&s.out), s.instances.as_ref()];
-    for p in given.into_iter().flatten().chain(&s.tree.catalogs) {
+    let base = s.tree.catalogs.iter().chain(&s.tree.catalogs_b);
+    for p in given.into_iter().flatten().chain(base) {
         match std::fs::metadata(p) {
             Ok(m) if m.is_dir() => dir(p, &mut out),
             m => file(p, m, &mut out),
@@ -794,6 +795,7 @@ fn empty() -> Loaded {
                 catalogs: false,
                 templates: false,
                 base_catalogs: Vec::new(),
+                base_catalogs_b: Vec::new(),
                 base_hash: None,
                 base_objects: Vec::new(),
                 base_statements: Vec::new(),
@@ -831,10 +833,10 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
     let (inputs, unreadable) = tree::read(&s.tree)?;
     let written = written_texts(&s.out)?;
     // Base catalogs go into the conversion too: changed contents, convert again.
-    let base = sqldiff_convert::base::hash(&sqldiff_convert::base::read(
-        &s.tree.catalogs,
-        s.tree.no_catalog,
-    )?);
+    let base = sqldiff_convert::base::hash(
+        &sqldiff_convert::base::read(&s.tree.catalogs, s.tree.no_catalog)?,
+        &sqldiff_convert::base::read_b(&s.tree.catalogs_b, &s.tree.catalogs, s.tree.no_catalog)?,
+    );
     let same = prev.as_ref().is_some_and(|p| {
         p.written == written
             && p.tree.report.base_hash == base

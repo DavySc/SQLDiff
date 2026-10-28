@@ -62,6 +62,11 @@ pub struct ConvertSpec {
     /// bound against but not converted into the output, in order.
     #[serde(default)]
     pub catalogs: Vec<String>,
+    /// The target's base catalogs (`--catalog-b`): the same objects as DDL
+    /// in the target dialect, bound against instead of converting
+    /// `catalogs`. Need `catalogs`.
+    #[serde(default)]
+    pub catalogs_b: Vec<String>,
     /// An instance check of these templates (`--instances`): the review
     /// then judges each template by its woven instances.
     #[serde(default)]
@@ -299,6 +304,9 @@ impl Command {
         }
         for c in &t.catalogs {
             args.extend(["--catalog".into(), path(c)]);
+        }
+        for c in &t.catalogs_b {
+            args.extend(["--catalog-b".into(), path(c)]);
         }
         if let Some(p) = &job.instances {
             args.extend(["--instances".into(), path(p)]);
@@ -1304,8 +1312,10 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
     }
     let packs = existing_all(&spec.packs)?;
     let catalogs = existing_all(&spec.catalogs)?;
+    let catalogs_b = existing_all(&spec.catalogs_b)?;
     // Read now, so a bad one is refused before the run starts.
     sqldiff_convert::base::read(&catalogs, false)?;
+    sqldiff_convert::base::read_b(&catalogs_b, &catalogs, false)?;
     let instances = match spec.instances.as_deref().filter(|p| !p.trim().is_empty()) {
         Some(p) => Some(existing(p)?),
         None => None,
@@ -1337,6 +1347,7 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
             extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,
             catalogs,
+            catalogs_b,
         },
         out: out.clone(),
         overwrite: spec.overwrite,

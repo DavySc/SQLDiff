@@ -15,14 +15,20 @@
 //! drafts over those. Each top-level statement of a base file is converted
 //! and checked on its own, as a tree file is (diffed against its conversion,
 //! and the conversion checked on its own against the base catalogs), so each
-//! object gets its own verdict. A base object whose statement is `differs` or
-//! `not converted` is left out of side B, so every statement that uses it
-//! fails to bind there and is `differs`. A statement that alters a table, or
-//! creates an index or a trigger on it, counts for that table. Leaving an
-//! object out can make others that use it fail too (a view over it, a
-//! routine that calls it), so this repeats until nothing more is left out.
+//! object gets its own verdict. A base object whose statement is worse than
+//! converted under assumptions (a decision, not proven, `differs`, `not
+//! converted`), or that a statement altering it or putting an index or a
+//! trigger on it leaves so, is suspect, and so is every object whose
+//! statement uses a suspect one. Suspect objects stay on side B (one the
+//! rules wrote no definition for stands in as its source definition), and
+//! every unit of the tree that uses one carries `ASM-BASE-SUSPECT`, an
+//! assumption a person accepts once it is checked.
+//!
+//! When the target's own base DDL is at hand (`--catalog-b FILE`, in the
+//! target dialect), side B holds exactly that instead: nothing is converted
+//! or flagged, and a base object it lacks does not bind on side B.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -51,18 +57,37 @@ pub fn read(paths: &[PathBuf], no_catalog: bool) -> Result<Vec<File>, String> {
     if no_catalog {
         return Err("--catalog and --no-catalog do not go together: --no-catalog checks each file alone, without any catalog".into());
     }
+    read_files(paths, "--catalog", "source")
+}
+
+/// Reads the target's base catalog files (`--catalog-b`), as `read` does.
+/// They need the source's (`a`): side A needs the base objects too.
+pub fn read_b(paths: &[PathBuf], a: &[PathBuf], no_catalog: bool) -> Result<Vec<File>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    if no_catalog {
+        return Err("--catalog-b and --no-catalog do not go together: --no-catalog checks each file alone, without any catalog".into());
+    }
+    if a.is_empty() {
+        return Err("--catalog-b needs --catalog: the source side binds against the base objects too, in the source dialect".into());
+    }
+    read_files(paths, "--catalog-b", "target")
+}
+
+fn read_files(paths: &[PathBuf], flag: &str, side: &str) -> Result<Vec<File>, String> {
     let mut seen = HashSet::new();
     let mut files = Vec::new();
     for p in paths {
         let path = p.display().to_string();
         if !seen.insert(path.clone()) {
-            return Err(format!("{path}: given twice as --catalog"));
+            return Err(format!("{path}: given twice as {flag}"));
         }
         if p.extension()
             .is_some_and(|e| e.eq_ignore_ascii_case("json"))
         {
             return Err(format!(
-                "{path}: a base catalog for a conversion is DDL in the source dialect; snapshot bundles (.json) are not read here"
+                "{path}: a base catalog for a conversion is DDL in the {side} dialect; snapshot bundles (.json) are not read here"
             ));
         }
         if !p.is_file() {
@@ -76,16 +101,24 @@ pub fn read(paths: &[PathBuf], no_catalog: bool) -> Result<Vec<File>, String> {
     Ok(files)
 }
 
-/// One hash over the contents of the base catalogs, in order (CRLF read as
-/// LF, paths left out): what a review decision is tied to. `None` without
-/// base catalogs.
-pub fn hash(files: &[File]) -> Option<String> {
+/// One hash over the contents of the base catalogs, in order, the target's
+/// (`b`) after the source's (CRLF read as LF, paths left out): what a review
+/// decision is tied to. `None` without base catalogs.
+pub fn hash(files: &[File], b: &[File]) -> Option<String> {
     use sha2::{Digest, Sha256};
     if files.is_empty() {
         return None;
     }
     let mut h = Sha256::new();
     for f in files {
+        h.update(crate::review::file_hash(&f.text).as_bytes());
+        h.update([0]);
+    }
+    if !b.is_empty() {
+        h.update(b"catalog-b");
+        h.update([0]);
+    }
+    for f in b {
         h.update(crate::review::file_hash(&f.text).as_bytes());
         h.update([0]);
     }
@@ -115,9 +148,10 @@ pub struct ObjectReport {
     pub line: usize,
     /// The worst status of the statements that define or change it.
     pub status: Status,
-    /// Whether it is in the target catalog. When it is not, every statement
-    /// that uses it is `differs`.
-    pub in_target: bool,
+    /// Whether it is suspect: its own conversion is worse than converted
+    /// under assumptions, or it uses a suspect base object. Every statement
+    /// in the tree that uses it carries `ASM-BASE-SUSPECT`.
+    pub suspect: bool,
     pub rules: Vec<String>,
     pub reason: String,
 }
@@ -136,16 +170,30 @@ pub struct StatementReport {
 pub struct Base {
     /// Every base object in the source dialect.
     pub source: Catalog,
-    /// The base objects as converted, without those that did not convert.
+    /// The base objects as converted, without those that did not convert;
+    /// or, with `files_b`, those files' objects.
     pub target: Catalog,
     pub files: Vec<CatalogFile>,
-    /// Base objects that did not convert (left out of the target), then
-    /// those in the target that are not plainly converted.
+    /// The target's base catalog files (`--catalog-b`), if given.
+    pub files_b: Vec<CatalogFile>,
+    /// Suspect base objects, then the others that are not plainly
+    /// converted.
     pub objects: Vec<ObjectReport>,
     /// Statements that define no object and did not convert.
     pub statements: Vec<StatementReport>,
     pub hash: Option<String>,
+    suspects: Vec<Suspect>,
 }
+
+/// A suspect base object, for flagging what uses it.
+struct Suspect {
+    key: Key,
+    /// How the note names it.
+    label: String,
+}
+
+/// The rule a statement using a suspect base object carries.
+pub const BASE_SUSPECT: &str = "ASM-BASE-SUSPECT";
 
 /// The name an object is known by, for matching across files and sides:
 /// letter case as the dialect compares, and the dialect's default schema for
@@ -178,6 +226,13 @@ impl Key {
             _ => return None,
         };
         Some(Key::new(d, false, schema.as_deref(), &name.stored(d)))
+    }
+
+    /// The same name, whether a table or a routine: what a reference in a
+    /// statement, which does not say which, can mean.
+    fn same_name(&self, o: &Key) -> bool {
+        self.name == o.name
+            && (self.schema == o.schema || self.schema.is_none() || o.schema.is_none())
     }
 
     fn same(&self, o: &Key) -> bool {
@@ -251,6 +306,36 @@ fn nodes(text: &str, d: Dialect) -> Vec<Node> {
     out
 }
 
+/// Every name in `text` that may name a table, view or routine, with its
+/// offset: each dotted name, by its last two parts. Columns and aliases are
+/// among them; a column named like a suspect object flags too (a false
+/// alarm, never a miss).
+fn refs_at(text: &str, d: Dialect) -> Vec<(usize, Key)> {
+    use sqldiff_core::tokens::{of_node, qualified};
+    let root = sqldiff_syntax::parse(text, d).syntax();
+    let t = of_node(&root);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < t.len() {
+        let after_dot = i > 0 && t[i - 1].kind == SyntaxKind::DOT;
+        if !t[i].is_name() || after_dot {
+            i += 1;
+            continue;
+        }
+        let (parts, next) = qualified(&t, i);
+        let tail = &parts[parts.len().saturating_sub(2)..];
+        if let Some(k) = Key::of_parts(d, tail) {
+            out.push((t[i].start, k));
+        }
+        i = next.max(i + 1);
+    }
+    out
+}
+
+fn refs(text: &str, d: Dialect) -> Vec<Key> {
+    refs_at(text, d).into_iter().map(|(_, k)| k).collect()
+}
+
 /// The table `ALTER TABLE t …`, `CREATE … INDEX … ON t` or
 /// `CREATE … TRIGGER … ON t` is about.
 fn touched(node: &SyntaxNode, d: Dialect) -> Option<Key> {
@@ -317,8 +402,11 @@ struct Seen {
 /// Every top-level statement of a base file is converted and checked on its
 /// own (with the catalogs of all base files), so each object gets its own
 /// verdict and the engine compares each `CREATE TABLE` by itself.
+///
+/// With the target's own base catalogs (`b`), side B is those, as given.
 pub fn prepare(
     files: &[File],
+    b: &[File],
     from: Dialect,
     to: Dialect,
     helpers: &[Helper],
@@ -332,6 +420,25 @@ pub fn prepare(
         Path::new(&format!("base catalogs {}", names.join(", "))),
         None,
     );
+    if !b.is_empty() {
+        let names_b: Vec<&str> = b.iter().map(|f| f.path.as_str()).collect();
+        let target = crate::tree::catalog(
+            b.iter().map(|f| f.text.as_str()),
+            to,
+            Path::new(&format!("base catalogs {}", names_b.join(", "))),
+            None,
+        );
+        return Ok(Base {
+            source,
+            target,
+            files: catalog_files(files, from),
+            files_b: catalog_files(b, to),
+            objects: Vec::new(),
+            statements: Vec::new(),
+            hash: hash(files, b),
+            suspects: Vec::new(),
+        });
+    }
     let target_origin = format!("base catalogs {} (converted)", names.join(", "));
     let all: Vec<Vec<Node>> = crate::tree::parallel(jobs, files, |f| nodes(&f.text, from));
     // One piece per statement, in file and statement order.
@@ -347,25 +454,36 @@ pub fn prepare(
     });
     let outputs: Vec<String> = drafts.iter().map(|d| d.output().to_string()).collect();
     let source = Arc::new(source);
-    let target_of = |left_out: &BTreeSet<usize>| {
-        crate::tree::catalog(
-            outputs
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !left_out.contains(i))
-                .map(|(_, o)| o.as_str()),
-            to,
-            Path::new(&target_origin),
-            None,
-        )
+    let mut target = crate::tree::catalog(
+        outputs.iter().map(String::as_str),
+        to,
+        Path::new(&target_origin),
+        None,
+    );
+
+    // An object the rules wrote no definition for (its statement not
+    // converted, kept as a comment) stands in the target catalog as its
+    // source definition, so what uses it binds and is flagged, not refused.
+    let named = |c: &Catalog, k: &Key| {
+        c.tables.iter().any(|t| key(to, &t.name) == k.name)
+            || c.routines.iter().any(|r| key(to, &r.name) == k.name)
     };
+    let mut stand_in = Catalog::default();
+    for p in &pieces {
+        let node = &all[p.0][p.1];
+        if node.defines.iter().any(|o| !named(&target, &o.key)) {
+            let root = sqldiff_syntax::parse(text(p), from).syntax();
+            ddl::load_tree(&mut stand_in, &root, from);
+        }
+    }
+    target.extend(to, &stand_in);
 
     // Round one: each statement's own verdict, the check a tree file gets.
     hooks.stop_if_cancelled()?;
     let opts = Options {
         helpers: helpers.to_vec(),
         facts_a: vec![Arc::clone(&source)],
-        facts_b: vec![Arc::new(target_of(&BTreeSet::new()))],
+        facts_b: vec![Arc::new(target.clone())],
         ..Options::default()
     };
     let work = std::sync::Mutex::new(drafts.into_iter().map(Some).collect::<Vec<_>>());
@@ -402,99 +520,64 @@ pub fn prepare(
         }
         s
     });
-    let mut first_fail: HashMap<usize, Seen> = HashMap::new();
-    let mut failed: Vec<usize> = (0..pieces.len())
-        .filter(|&i| own[i].status >= Status::Differs)
-        .collect();
-    for &i in &failed {
-        first_fail.insert(i, own[i].clone());
-    }
-    // Left-out statements, and left-out objects with the verdict that left
-    // each out.
-    let mut left_out: BTreeSet<usize> = BTreeSet::new();
-    let mut excluded: Vec<(Key, Seen)> = Vec::new();
+    // Suspect: what a statement that does not plainly convert defines or
+    // changes, and then what a statement using a suspect object defines.
+    let refs_of: Vec<Vec<Key>> = crate::tree::parallel(jobs, &pieces, |p| refs(text(p), from));
     let keys = |i: usize| {
         let node = &all[pieces[i].0][pieces[i].1];
         node.defines.iter().map(|o| &o.key).chain(&node.touches)
     };
-    let target = loop {
-        for &i in &failed {
+    let mut suspect: Vec<(Key, Seen)> = Vec::new();
+    let mut failed: HashSet<usize> = HashSet::new();
+    for (i, seen) in own.iter().enumerate() {
+        if seen.status > Status::Assumptions {
+            failed.insert(i);
             for k in keys(i) {
-                if !excluded.iter().any(|(x, _)| x == k) {
-                    excluded.push((k.clone(), first_fail[&i].clone()));
+                if !suspect.iter().any(|(x, _)| x == k) {
+                    suspect.push((k.clone(), seen.clone()));
                 }
             }
-            left_out.insert(i);
         }
-        // Every statement on a left-out object goes with it, and so does
-        // whatever else that statement defines.
-        loop {
-            let mut grew = false;
-            for i in 0..pieces.len() {
-                if left_out.contains(&i) {
-                    continue;
+    }
+    loop {
+        let mut grew = false;
+        for (i, found) in refs_of.iter().enumerate() {
+            let mine: Vec<&Key> = keys(i).collect();
+            let Some((via, cause)) = found.iter().find_map(|r| {
+                if mine.iter().any(|k| k.same_name(r)) {
+                    return None;
                 }
-                let Some(cause) = keys(i).find_map(|k| {
-                    excluded
-                        .iter()
-                        .find(|(x, _)| x.same(k))
-                        .map(|(_, s)| s.clone())
-                }) else {
-                    continue;
-                };
-                left_out.insert(i);
-                for k in keys(i) {
-                    if !excluded.iter().any(|(x, _)| x == k) {
-                        excluded.push((k.clone(), cause.clone()));
-                    }
+                suspect.iter().find(|(x, _)| x.same_name(r))
+            }) else {
+                continue;
+            };
+            let cause = Seen {
+                status: cause.status,
+                rules: cause.rules.clone(),
+                reason: format!(
+                    "Uses `{}`, a suspect base object: {}",
+                    via.name, cause.reason
+                ),
+            };
+            for k in mine {
+                if !suspect.iter().any(|(x, _)| x == k) {
+                    suspect.push((k.clone(), cause.clone()));
+                    grew = true;
                 }
-                grew = true;
-            }
-            if !grew {
-                break;
             }
         }
-        let target = target_of(&left_out);
-        if failed.is_empty() {
-            break target;
+        if !grew {
+            break;
         }
-        // Later rounds: only what leaving objects out changes, whether the
-        // rest of the converted base still binds.
-        hooks.stop_if_cancelled()?;
-        let opts = Options {
-            helpers: helpers.to_vec(),
-            facts_a: vec![Arc::new(target)],
-            ..Options::default()
-        };
-        let rest: Vec<usize> = (0..pieces.len())
-            .filter(|i| !left_out.contains(i))
-            .collect();
-        let found = crate::tree::parallel(jobs, &rest, |&i| {
-            let b = sqldiff_core::Artifact::new("converted.sql", to, outputs[i].as_str());
-            sqldiff_core::check(&b, &opts)
-                .findings
-                .into_iter()
-                .find(crate::gates)
-        });
-        failed.clear();
-        for (&i, f) in rest.iter().zip(found) {
-            if let Some(f) = f {
-                first_fail.insert(
-                    i,
-                    Seen {
-                        status: Status::Differs,
-                        rules: vec![f.rule.clone()],
-                        reason: format!(
-                            "The converted base does not check as {} once the base objects that did not convert are left out: {}",
-                            to.display_name(),
-                            f.witness
-                        ),
-                    },
-                );
-                failed.push(i);
-            }
+    }
+
+    for (k, seen) in &mut suspect {
+        if named(&stand_in, k) {
+            seen.reason.push_str(
+                " (no converted definition: its source definition stands in the target catalog)",
+            );
         }
-    };
+    }
 
     // The report: each object once, at its last definition.
     let mut defs: Vec<(usize, &Object)> = Vec::new();
@@ -505,28 +588,40 @@ pub fn prepare(
             defs.retain(|(_, x)| x.key != o.key);
             defs.push((i, o));
         }
-        if node.defines.is_empty() && node.touches.is_none() {
-            if let Some(s) = first_fail.get(&i) {
-                statements.push(StatementReport {
-                    file: files[f].path.clone(),
-                    line: node.line,
-                    status: s.status,
-                    rules: s.rules.clone(),
-                    reason: s.reason.clone(),
-                });
-            }
+        if node.defines.is_empty() && node.touches.is_none() && failed.contains(&i) {
+            statements.push(StatementReport {
+                file: files[f].path.clone(),
+                line: node.line,
+                status: own[i].status,
+                rules: own[i].rules.clone(),
+                reason: own[i].reason.clone(),
+            });
         }
     }
     let mut objects: Vec<(usize, ObjectReport)> = Vec::new();
+    let mut suspects = Vec::new();
     for (i, o) in defs {
         let (f, n) = pieces[i];
-        let cause = excluded.iter().find(|(x, _)| x.same(&o.key));
-        // Left out: the failure that left it out; else its own verdict.
+        let cause = suspect.iter().find(|(x, _)| x.same(&o.key));
+        // Suspect: what made it suspect; else its own verdict.
         let seen = match cause {
             Some((_, s)) => s.clone(),
             None if own[i].status > Status::Converted => own[i].clone(),
             None => continue,
         };
+        if cause.is_some() {
+            suspects.push(Suspect {
+                key: o.key.clone(),
+                label: format!(
+                    "{} `{}` ({} line {}: {})",
+                    o.kind,
+                    o.name,
+                    files[f].path,
+                    all[f][n].line,
+                    seen.status.label()
+                ),
+            });
+        }
         objects.push((
             f,
             ObjectReport {
@@ -535,23 +630,42 @@ pub fn prepare(
                 file: files[f].path.clone(),
                 line: all[f][n].line,
                 status: seen.status,
-                in_target: cause.is_none(),
+                suspect: cause.is_some(),
                 rules: seen.rules,
                 reason: seen.reason,
             },
         ));
     }
-    // Left out first, then in the order of the files and lines.
+    // Suspect first, then in the order of the files and lines.
     objects.sort_by(|(fa, a), (fb, b)| {
-        a.in_target
-            .cmp(&b.in_target)
+        b.suspect
+            .cmp(&a.suspect)
             .then(fa.cmp(fb))
             .then(a.line.cmp(&b.line))
     });
     let objects = objects.into_iter().map(|(_, o)| o).collect();
-    let catalog_files = files
+    Ok(Base {
+        source: Arc::try_unwrap(source).unwrap_or_else(|a| (*a).clone()),
+        target,
+        files: summaries(files, &all),
+        files_b: Vec::new(),
+        objects,
+        statements,
+        hash: hash(files, &[]),
+        suspects,
+    })
+}
+
+/// What the report says about each of `files`, in dialect `d`.
+fn catalog_files(files: &[File], d: Dialect) -> Vec<CatalogFile> {
+    let all: Vec<Vec<Node>> = files.iter().map(|f| nodes(&f.text, d)).collect();
+    summaries(files, &all)
+}
+
+fn summaries(files: &[File], all: &[Vec<Node>]) -> Vec<CatalogFile> {
+    files
         .iter()
-        .zip(&all)
+        .zip(all)
         .map(|(f, ns)| {
             let defs = ns.iter().flat_map(|n| &n.defines);
             CatalogFile {
@@ -561,15 +675,111 @@ pub fn prepare(
                 routines: defs.filter(|o| o.key.routine).count(),
             }
         })
-        .collect();
-    Ok(Base {
-        source: Arc::try_unwrap(source).unwrap_or_else(|a| (*a).clone()),
-        target,
-        files: catalog_files,
-        objects,
-        statements,
-        hash: hash(files),
-    })
+        .collect()
+}
+
+impl Base {
+    /// Flags every unit of the tree (`files`: path and text, converted into
+    /// `convs`) that uses a suspect base object with `ASM-BASE-SUSPECT`. An
+    /// object the tree defines replaces the base object of its name; a tree
+    /// object whose statement uses a suspect object is suspect itself.
+    pub fn flag<'c>(
+        &self,
+        files: &[(&str, &str)],
+        convs: impl Iterator<Item = &'c mut Conversion>,
+        d: Dialect,
+    ) {
+        if self.suspects.is_empty() {
+            return;
+        }
+        let tree: Vec<Vec<Node>> = files.iter().map(|(_, t)| nodes(t, d)).collect();
+        let own: Vec<&Key> = tree
+            .iter()
+            .flatten()
+            .flat_map(|n| n.defines.iter().map(|o| &o.key))
+            .collect();
+        let mut set: Vec<(Key, String)> = self
+            .suspects
+            .iter()
+            .filter(|s| !own.iter().any(|k| k.same(&s.key)))
+            .map(|s| (s.key.clone(), s.label.clone()))
+            .collect();
+        loop {
+            let mut grew = false;
+            for ((path, text), ns) in files.iter().zip(&tree) {
+                for n in ns {
+                    let mine: Vec<&Key> = n.defines.iter().map(|o| &o.key).collect();
+                    let via = refs(&text[n.start..n.end], d).into_iter().find_map(|r| {
+                        if mine.iter().any(|k| k.same_name(&r)) {
+                            return None;
+                        }
+                        set.iter()
+                            .find(|(x, _)| x.same_name(&r))
+                            .map(|(x, _)| x.name.clone())
+                    });
+                    let Some(via) = via else { continue };
+                    for o in &n.defines {
+                        if !set.iter().any(|(x, _)| *x == o.key) {
+                            set.push((
+                                o.key.clone(),
+                                format!(
+                                    "{} `{}` ({path} line {}: uses `{via}`)",
+                                    o.kind, o.name, n.line
+                                ),
+                            ));
+                            grew = true;
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        for ((_, text), c) in files.iter().zip(convs) {
+            let found = refs_at(text, d);
+            let mut changed = false;
+            for u in &mut c.units {
+                let mut hit: Vec<&str> = Vec::new();
+                for (at, r) in &found {
+                    if *at < u.src.start || *at >= u.src.end {
+                        continue;
+                    }
+                    for (x, label) in &set {
+                        if x.same_name(r) && !hit.contains(&label.as_str()) {
+                            hit.push(label);
+                        }
+                    }
+                }
+                if hit.is_empty() {
+                    continue;
+                }
+                u.notes.push(crate::Note {
+                    status: Status::Assumptions,
+                    rule: BASE_SUSPECT.into(),
+                    text: format!(
+                        "Uses base objects whose own conversion is not plain: {}. The target catalog holds the rules' conversion of them, which may not be what the target has; the base catalogs report says why. Accept this once that is checked (a column or alias named like one of them also counts).",
+                        hit.join("; ")
+                    ),
+                });
+                u.status = u.status.max(Status::Assumptions);
+                changed = true;
+            }
+            if changed {
+                crate::recount(c);
+            }
+        }
+    }
+
+    /// The files side B's base objects come from: the target's own when
+    /// given, else the converted source's.
+    pub fn target_files(&self) -> &[CatalogFile] {
+        if self.files_b.is_empty() {
+            &self.files
+        } else {
+            &self.files_b
+        }
+    }
 }
 
 /// What a side's catalog is called in binding reasons when base catalogs

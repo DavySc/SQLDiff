@@ -53,6 +53,10 @@ pub struct Args {
     /// own objects win), converted for the target catalog only, never
     /// written or reported as files (`base`).
     pub catalogs: Vec<PathBuf>,
+    /// The target's base catalogs (`--catalog-b`): the same objects as
+    /// `catalogs` as DDL in the target dialect. Side B binds against these,
+    /// as given, instead of converting `catalogs`. Needs `catalogs`.
+    pub catalogs_b: Vec<PathBuf>,
 }
 
 /// How templates are read: the placeholder rules of `diff --template`.
@@ -229,13 +233,17 @@ pub struct Report {
     /// The base catalogs bound against (`--catalog`), in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_catalogs: Vec<crate::base::CatalogFile>,
+    /// The target's base catalogs (`--catalog-b`), in order: side B binds
+    /// against these instead of the converted `base_catalogs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_catalogs_b: Vec<crate::base::CatalogFile>,
     /// One hash over their contents (`base::hash`): review decisions keep it
     /// and apply only while it is the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_hash: Option<String>,
-    /// Base objects that did not convert and are left out of the target
-    /// catalog (`in_target: false`; every statement using one is `differs`),
-    /// then those in it whose conversion is not plainly converted.
+    /// Suspect base objects (`suspect: true`: every statement using one
+    /// carries `ASM-BASE-SUSPECT`), then the others whose conversion is not
+    /// plainly converted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub base_objects: Vec<crate::base::ObjectReport>,
     /// Base statements that define no object and did not convert.
@@ -305,6 +313,7 @@ pub fn read(a: &Args) -> Result<(Vec<Input>, Vec<String>), String> {
     }
     // The base catalogs too, so a bad one fails before anything is written.
     crate::base::read(&a.catalogs, a.no_catalog)?;
+    crate::base::read_b(&a.catalogs_b, &a.catalogs, a.no_catalog)?;
     let (inputs, unreadable) = collect(&a.src, &a.extensions)?;
     if inputs.is_empty() {
         return Err(format!(
@@ -362,10 +371,12 @@ pub fn convert_with(
     };
     let ledger = ledger.as_ref();
     let base_files = crate::base::read(&a.catalogs, a.no_catalog)?;
+    let base_files_b = crate::base::read_b(&a.catalogs_b, &a.catalogs, a.no_catalog)?;
     let base = match base_files.is_empty() {
         true => None,
         false => Some(crate::base::prepare(
             &base_files,
+            &base_files_b,
             a.from,
             a.to,
             &a.helpers,
@@ -377,6 +388,14 @@ pub fn convert_with(
         None => convert_files(a, label, inputs, jobs, ledger, base.as_ref(), hooks)?,
         Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger, base.as_ref(), hooks)?,
     };
+    let mut results = results;
+    if let Some(b) = &base {
+        let files: Vec<(&str, &str)> = inputs
+            .iter()
+            .map(|i| (i.rel.as_str(), i.text.as_str()))
+            .collect();
+        b.flag(&files, results.iter_mut().map(|(c, _)| c), a.from);
+    }
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
@@ -397,6 +416,7 @@ pub fn convert_with(
         templates: a.template.is_some(),
         base_hash: base.as_ref().and_then(|b| b.hash.clone()),
         base_catalogs: base.as_ref().map(|b| b.files.clone()).unwrap_or_default(),
+        base_catalogs_b: base.as_ref().map(|b| b.files_b.clone()).unwrap_or_default(),
         base_objects: base.as_ref().map(|b| b.objects.clone()).unwrap_or_default(),
         base_statements: base
             .as_ref()
@@ -539,7 +559,7 @@ fn convert_files(
                 &b.target,
                 texts,
                 a.to,
-                crate::base::origin(&out.display().to_string(), &b.files),
+                crate::base::origin(&out.display().to_string(), b.target_files()),
                 None,
             ),
             None => catalog(texts, a.to, out, None),
@@ -908,7 +928,7 @@ fn convert_templates(
                 &b.target,
                 texts,
                 a.to,
-                crate::base::origin(&out.display().to_string(), &b.files),
+                crate::base::origin(&out.display().to_string(), b.target_files()),
                 stem,
             ),
             None => catalog(texts, a.to, out, stem),
@@ -1664,12 +1684,20 @@ pub fn summary(r: &Report) -> String {
     if !r.unreadable.is_empty() {
         let _ = writeln!(s, "{:<20} {:>6}", "unreadable", r.unreadable.len());
     }
-    if !r.base_catalogs.is_empty() {
-        let left_out = r.base_objects.iter().filter(|o| !o.in_target).count();
+    if !r.base_catalogs_b.is_empty() {
         let _ = writeln!(
             s,
-            "base catalogs: {} file(s); {left_out} base object(s) did not convert and are left out of the target catalog",
-            r.base_catalogs.len()
+            "base catalogs: {} file(s), and {} file(s) for the target side (--catalog-b), used as given",
+            r.base_catalogs.len(),
+            r.base_catalogs_b.len()
+        );
+    } else if !r.base_catalogs.is_empty() {
+        let suspect = r.base_objects.iter().filter(|o| o.suspect).count();
+        let _ = writeln!(
+            s,
+            "base catalogs: {} file(s); {suspect} suspect base object(s), flagged where used ({})",
+            r.base_catalogs.len(),
+            crate::base::BASE_SUSPECT
         );
     }
     if let Some(l) = &r.ledger {
@@ -1713,7 +1741,10 @@ pub fn markdown(r: &Report) -> String {
         "Base catalogs: {}.\n",
         match r.base_catalogs.len() {
             0 => "none".to_string(),
-            n => format!("{n} file(s), listed below; bound against, not converted into this tree"),
+            n => match r.base_catalogs_b.len() {
+                0 => format!("{n} file(s), listed below; bound against, not converted into this tree"),
+                m => format!("{n} file(s), and {m} for the target side, listed below; bound against, not converted into this tree"),
+            },
         }
     );
     let _ = writeln!(
@@ -1786,22 +1817,35 @@ fn base_markdown(s: &mut String, r: &Report) {
     if r.base_catalogs.is_empty() {
         return;
     }
+    let table = |s: &mut String, files: &[crate::base::CatalogFile]| {
+        let _ = writeln!(
+            s,
+            "| file | sha256 | tables and views | routines |\n|---|---|---:|---:|"
+        );
+        for c in files {
+            let _ = writeln!(
+                s,
+                "| `{}` | `{}` | {} | {} |",
+                c.path, c.sha256, c.tables, c.routines
+            );
+        }
+        s.push('\n');
+    };
+    if !r.base_catalogs_b.is_empty() {
+        let _ = writeln!(
+            s,
+            "## Base catalogs\n\nDDL of objects that exist already: `--catalog` in the source dialect for the source side, `--catalog-b` in the target dialect for the target side, each used as given (nothing converted). An object the tree defines replaces the base object of that name. They are not written into this tree and not counted above.\n\nSource side:\n"
+        );
+        table(s, &r.base_catalogs);
+        let _ = writeln!(s, "Target side:\n");
+        table(s, &r.base_catalogs_b);
+        return;
+    }
     let _ = writeln!(
         s,
         "## Base catalogs\n\nDDL of objects that exist already (`--catalog`), in the source dialect. Their objects bind on both sides; an object the tree defines replaces the base object of that name. For the target side they are converted with the same rules and checked against the base catalogs alone; they are not written into this tree and not counted above.\n"
     );
-    let _ = writeln!(
-        s,
-        "| file | sha256 | tables and views | routines |\n|---|---|---:|---:|"
-    );
-    for c in &r.base_catalogs {
-        let _ = writeln!(
-            s,
-            "| `{}` | `{}` | {} | {} |",
-            c.path, c.sha256, c.tables, c.routines
-        );
-    }
-    s.push('\n');
+    table(s, &r.base_catalogs);
     let line = |s: &mut String, o: &crate::base::ObjectReport| {
         let _ = writeln!(
             s,
@@ -1815,11 +1859,12 @@ fn base_markdown(s: &mut String, r: &Report) {
             o.reason.lines().next().unwrap_or("")
         );
     };
-    let (out, kept): (Vec<_>, Vec<_>) = r.base_objects.iter().partition(|o| !o.in_target);
+    let (out, kept): (Vec<_>, Vec<_>) = r.base_objects.iter().partition(|o| o.suspect);
     if !out.is_empty() {
         let _ = writeln!(
             s,
-            "### Base objects that did not convert\n\nLeft out of the target catalog: every statement that uses one of them is `differs`.\n"
+            "### Suspect base objects\n\nTheir conversion is not plain (or they use one that is not); the target catalog holds it all the same. Every statement that uses one carries `{}`, to accept once checked.\n",
+            crate::base::BASE_SUSPECT
         );
         for o in out {
             line(s, o);
@@ -1829,7 +1874,7 @@ fn base_markdown(s: &mut String, r: &Report) {
     if !kept.is_empty() {
         let _ = writeln!(
             s,
-            "### Base objects in the target catalog, not plainly converted\n\nStatements that use them bind to their converted form; their own assumptions are not carried to those statements.\n"
+            "### Base objects converted under assumptions\n\nStatements that use them bind to their converted form; their assumptions are not carried to those statements.\n"
         );
         for o in kept {
             line(s, o);
