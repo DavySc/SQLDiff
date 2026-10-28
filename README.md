@@ -2,7 +2,7 @@
 
 A semantic diff for **T-SQL (SQL Server 2022), PostgreSQL 18 (incl. PL/pgSQL) and Db2 for i SQL PL**. It tells you what changed between two SQL artifacts, whether the *meaning* changed, and gives a concrete scenario for every behavioural difference. It is built for code kept in sync across dialects and for reviewing conversions.
 
-The full design is in [docs/design.md](docs/design.md). Its first rule: **never a false "equal"**. When equivalence can't be shown, the verdict is `unknown` or `equal under assumptions`. What a cross-dialect proof of a routine compares and assumes (routine options, security context, schema and case folding, files with several objects) is in [docs/cross-dialect-proofs.md](docs/cross-dialect-proofs.md).
+The full design is in [docs/design.md](docs/design.md). Its first rule: **never a false "equal"**. When equivalence can't be shown, the verdict is `unknown` or `equal under assumptions`. What a cross-dialect proof of a routine compares and assumes (routine options, security context, schema and case folding, files with several objects) is in [docs/cross-dialect-proofs.md](docs/cross-dialect-proofs.md). The plan for machine-checked proofs of "equal", and for supporting RDBMS versions by their vendors' lifecycles, is in [docs/verification-roadmap.md](docs/verification-roadmap.md).
 
 ## Quick start
 
