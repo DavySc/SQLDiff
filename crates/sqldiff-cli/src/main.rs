@@ -199,6 +199,15 @@ enum Command {
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
+        /// A base catalog (repeatable): DDL in the source dialect of objects
+        /// that exist already but are not part of SRC, such as the install an
+        /// upgrade script set changes. Its tables, views and routines bind on
+        /// both sides (an object SRC defines replaces one of the same name);
+        /// it is converted for the target catalog only, and never written or
+        /// counted. A base object that does not convert is left out of the
+        /// target catalog, so what uses it is `differs`. Not with --no-catalog.
+        #[arg(long = "catalog", value_name = "FILE", conflicts_with = "no_catalog")]
+        catalogs: Vec<PathBuf>,
         /// Every file is a template in the `[template]` syntax of the loaded
         /// packs or config: the output tree holds templates for the target,
         /// with the placeholders and generator directives kept.
@@ -249,6 +258,9 @@ enum Command {
         /// As given to `sqldiff convert`.
         #[arg(long)]
         no_catalog: bool,
+        /// As given to `sqldiff convert` (repeatable, same order).
+        #[arg(long = "catalog", value_name = "FILE", conflicts_with = "no_catalog")]
+        catalogs: Vec<PathBuf>,
         /// As given to `sqldiff convert`; then --instances is required.
         #[arg(long)]
         template: bool,
@@ -589,6 +601,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             to,
             jobs,
             no_catalog,
+            catalogs,
             template,
             parameters,
             extensions,
@@ -617,7 +630,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers,
-                    catalogs: Vec::new(),
+                    catalogs,
                 },
                 out,
                 instances,
@@ -634,6 +647,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             overwrite,
             discard_edits,
             no_catalog,
+            catalogs,
             template,
             parameters,
             extensions,
@@ -661,7 +675,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers,
-                    catalogs: Vec::new(),
+                    catalogs,
                 },
                 out,
                 overwrite,
