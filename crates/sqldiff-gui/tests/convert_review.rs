@@ -587,3 +587,73 @@ fn a_decision_follows_the_base_catalogs_contents() {
     assert_eq!(open(&r), u.assumptions);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
+    let f = Fixture::new(
+        "listed",
+        &[
+            ("a.sql", ASSUMING),
+            ("b.sql", ASSUMING_2),
+            ("r.sql", REFUSED),
+        ],
+    );
+    let mut r = f.open();
+    let st = r.state(false);
+    // The page groups and bulk-accepts from the list alone: each unit item
+    // carries the hashes /api/unit would give, and what blocks it.
+    for i in st.items.iter().filter(|i| i.item.unit.is_some()) {
+        let u = r.unit(&i.item.path, i.item.unit.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            i.hashes,
+            Some((u.input_hash.clone(), u.output_hash.clone())),
+            "{}",
+            i.item.path
+        );
+        if i.item.tier <= 2 {
+            assert!(!i.blocking.is_empty(), "{} lists no blocker", i.item.path);
+        } else {
+            assert!(i.blocking.is_empty(), "{}: {:?}", i.item.path, i.blocking);
+        }
+    }
+    let refused = st
+        .items
+        .iter()
+        .find(|i| i.item.path == "r.sql" && i.item.unit.is_some())
+        .expect("the refused unit is listed");
+    assert_eq!(refused.item.tier, 1);
+    // A group's bulk accept sends the listed hashes; the server takes them.
+    let a = unit_with(&r, "a.sql", Status::Assumptions, false);
+    let b = unit_with(&r, "b.sql", Status::Assumptions, false);
+    let rule = a
+        .assumptions
+        .iter()
+        .find(|x| b.assumptions.contains(x))
+        .expect("a shared assumption")
+        .clone();
+    let targets: Vec<Target> = st
+        .items
+        .iter()
+        .filter(|i| i.item.path != "r.sql" && i.open_assumptions.contains(&rule))
+        .map(|i| {
+            let (input_hash, output_hash) = i.hashes.clone().unwrap();
+            Target {
+                path: i.item.path.clone(),
+                unit: i.item.unit.clone().unwrap(),
+                input_hash,
+                output_hash,
+            }
+        })
+        .collect();
+    let n = targets.len();
+    assert!(n >= 2, "{n}");
+    assert_eq!(
+        r.record(req(Action::Accept, &rule, targets), AT).unwrap(),
+        n
+    );
+    assert!(!r
+        .state(false)
+        .items
+        .iter()
+        .any(|i| i.item.path != "r.sql" && i.open_assumptions.contains(&rule)));
+}
