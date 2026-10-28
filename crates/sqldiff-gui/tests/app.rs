@@ -1047,11 +1047,15 @@ fn a_cancelled_branch_review_writes_nothing() {
 #[test]
 fn pages_confirm_the_packs_loaded_and_name_no_private_pack() {
     let d = Dir::new("packs");
-    let shared = d.write(
+    // Expected paths are joined part by part: on Windows the app reports
+    // `\` throughout, and a joined "a/b" would keep its `/`.
+    let shared = d.0.join("shared").join("pack.toml");
+    d.write(
         "shared/pack.toml",
         "[pack]\nname = \"shared-rules\"\nversion = \"1.2.0\"\nschema = 1\n",
     );
-    let secret = d.write(
+    let secret = d.0.join("secret").join("pack.toml");
+    d.write(
         "secret/pack.toml",
         "[pack]\nname = \"secretname\"\nversion = \"9.9.9\"\nschema = 1\n\n[template]\nopen = \"<%\"\nclose = \"%>\"\nname_pattern = \"[A-Z_][A-Z0-9_]*\"\n",
     );
