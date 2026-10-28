@@ -64,6 +64,8 @@ target/release/sqldiff-gui convert proc.tpl.sql --template --pack my-pack  # a g
 $B convert src/tsql -o out/pg --to postgres        # or --to db2i; -j N parallel jobs
 # An upgrade script set: bind against the install it changes, without converting it
 $B convert upgrade/ -o out/pg --to postgres --catalog install/tables.sql --catalog install/procs.sql
+# ... and the target's own install DDL for the target side, instead of converting it
+$B convert upgrade/ -o out/pg --to postgres --catalog install/tables.sql --catalog-b install-pg/tables.sql
 # Review it in the browser: the queue by tier, decisions appended to out/pg/review-decisions.jsonl
 target/release/sqldiff-gui review src/tsql out/pg --to postgres
 ```
@@ -129,7 +131,7 @@ Or in any client's `mcpServers` config: `{"sqldiff": {"command": "/path/to/sqldi
 | `comment_text` | `finding_ids`, `excerpt_lines` (1), `fingerprints` (true) | A plain-text review comment from the phrase grammar: same findings, same text |
 | `open_in_gui` | `finding_id` or `pair`, `gui_url` | `{gui}/?a=<path>&b=<path>#f=<fingerprint>` and the `sqldiff-gui serve` command for the pair |
 | `convert` | `artifact`: `{dialect (source), path \| text, name?}`; `to`; `template`, `parameters` | One file or text converted as `sqldiff convert FILE` converts it: the file's status, unit counts, every unit that is not plainly converted with its rules and reason, and the annotated output |
-| `convert_tree` | `src`, `from` (tsql), `to`; `out`, `overwrite`, `no_catalog`, `catalogs`, `template`, `parameters`, `extensions`, `jobs`; listing: `statuses`, `folder`, `limit` (25), `max_units` (5) | A whole tree converted as `sqldiff convert SRC -o OUT`: totals, most frequent blockers, files worst first with their units (the entries of `conversion-report.json`), `ok` (the CLI's exit code 0) and a tree id. With `out` it writes the output tree and the reports; without it nothing is written |
+| `convert_tree` | `src`, `from` (tsql), `to`; `out`, `overwrite`, `no_catalog`, `catalogs`, `catalogs_b`, `template`, `parameters`, `extensions`, `jobs`; listing: `statuses`, `folder`, `limit` (25), `max_units` (5) | A whole tree converted as `sqldiff convert SRC -o OUT`: totals, most frequent blockers, files worst first with their units (the entries of `conversion-report.json`), `ok` (the CLI's exit code 0) and a tree id. With `out` it writes the output tree and the reports; without it nothing is written |
 | `converted_file` | `tree` id, `path` | One file of a converted tree: status, every unit that is not plainly converted, and its annotated output |
 
 The CLI has the same review commands: `sqldiff queue [SOURCE]`, `sqldiff assumptions A B`, `sqldiff comment A B [--finding FP]` and `sqldiff open A B [--finding FP]`. `--deny ID` / `--confirm ID` flip an assumption for that run only. Review state comes from the review store: accepted findings (and in-source deliberate-difference markers) are suppressed and counted, and a pair still needs review while it has an undecided finding or a verdict short of equal.
