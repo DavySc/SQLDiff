@@ -2,11 +2,12 @@
 The lowering of T-SQL and PL/pgSQL routines, as the Rust parser reads them
 (`Sqldiff.Ast`, generated), into the core. Decision 9
 (docs/verified-conversion.md): this file *is* the specification of the C1
-constructs and of the C2a scalar slice in both dialects; there is no other
-T-SQL or PL/pgSQL semantics to prove it against. One abstract syntax
-serves both dialects and the dialect is a parameter. The lowering is
-partial: `none` means "outside the spec" (queries, DML, error handlers,
-other settings, ...), and a routine outside it is never confirmed.
+constructs, of the C2a scalar slice and of the C3a data statements in both
+dialects; there is no other T-SQL or PL/pgSQL semantics to prove it
+against. One abstract syntax serves both dialects and the dialect is a
+parameter. The lowering is partial: `none` means "outside the spec"
+(queries, `MERGE`, data statements outside C3a, error handlers, other
+settings, ...), and a routine outside it is never confirmed.
 
 Errors (C2a): an expression of the slice can fail (overflow, division by
 zero), and the core then ends the routine with an error observation. That
@@ -18,11 +19,18 @@ faithful for every run only when the routine aborts on errors
 confirmation (`Sqldiff.Mirror.inC2a`) asks for one or the other. Errors
 from elsewhere (a missing argument without a default, `OUTPUT` on a
 parameter that is not one, a failing callee) are C4: the rule says what
-happens otherwise. No data either: names are variables, never columns.
+happens otherwise.
 
-Read top to bottom: the trusted inputs, the C2a slice with its vendor
-citations, expressions, statements, calls, blocks, the two routines, and
-the test for "every expression is in the slice".
+Data (C3a): single-table `INSERT ... VALUES`, `UPDATE` and `DELETE` on a
+table the target catalog describes, with the columns of the row in scope
+(section "The C3a slice: data statements", each rule with its vendor
+citation and probe status). A data statement that fails has no effect
+(statement atomicity) and then ends the routine like any error.
+
+Read top to bottom: the trusted inputs, names in data statements, the C2a
+slice with its vendor citations, expressions, the C3a data statements,
+statements, calls, blocks, the two routines, and the test for "every
+expression is in the slice".
 -/
 import Sqldiff.Ast
 import Sqldiff.Core.Semantics
@@ -46,16 +54,59 @@ structure Deployment where
   Whether two names reach routines that behave alike is a fact about the
   two databases, so it is an input here, not a certificate hint. -/
   routines : List (String × String)
+  /-- Each T-SQL table a data statement may name, `.`-joined as written,
+  and the target table it corresponds to (`dbo.t` to `t`: the schema
+  mapping of `ASM-DBO-SCHEMA`, and for an unqualified name the default
+  schema of `ASM-DEFAULT-SCHEMA`), as for routines. Phase C3a. -/
+  tables : List (String × String) := []
 
-/-- The parameter modes of the PostgreSQL routines a `CALL` can reach,
-from the target catalog (trusted like every catalog fact; its hash goes in
-the certificate). PL/pgSQL writes back to the variable in each `OUT` and
-`INOUT` position, so the lowering of `CALL` needs them. -/
-abbrev Catalog := List (String × List Ast.Mode)
+/-- A column of a target table (C3a): its name as the target catalog
+spells it (folded as `pgName` folds; the core's column), its spelling in
+the T-SQL table it corresponds to, and its constraints. Every column of a
+catalog table is a 32-bit integer (T-SQL `int`, PostgreSQL `integer`):
+the catalog encoding has no other type yet (`Sqldiff.Mirror.Request`). -/
+structure CatCol where
+  name : Core.Col
+  tsql : String
+  notNull : Bool
+  key : Bool
+deriving Repr
 
+/-- A target table and how the T-SQL table it corresponds to spells its
+columns (the state correspondence of decision 1: rows related column by
+column, the identity on values). What the catalog asserts about the table
+and about its T-SQL counterpart, which the check cannot see: both have
+exactly these columns, all `int`/`integer`, with these `NOT NULL` and
+primary key constraints; no other constraint (`CHECK`, `UNIQUE`, foreign
+keys), no default, no identity, sequence, computed or generated column, no
+trigger, rule or row-level security policy; the primary key is not
+`DEFERRABLE INITIALLY DEFERRED` in PostgreSQL and its index does not
+`IGNORE_DUP_KEY` in SQL Server; and the PostgreSQL table has no
+inheritance children or partitions. The Rust side sends a table only when
+its catalogs show all of this. -/
+structure CatTable where
+  name : String
+  cols : List CatCol
+deriving Repr
+
+/-- The target catalog (trusted like every catalog fact; its hash goes in
+the certificate): the parameter modes of the PostgreSQL routines a `CALL`
+can reach (PL/pgSQL writes back to the variable in each `OUT` and `INOUT`
+position, so the lowering of `CALL` needs them), and the tables data
+statements may write (C3a). -/
+structure Catalog where
+  routines : List (String × List Ast.Mode)
+  tables : List CatTable := []
+
+/-- The empty catalog. -/
+instance : EmptyCollection Catalog := ⟨{ routines := [] }⟩
+
+/-- A dialect and its trusted inputs. `vars` are the PL/pgSQL routine's
+variable names (folded), which a name in a data statement may clash with
+(`resolveName`). -/
 inductive Dialect where
-  | tsql (dep : Deployment)
-  | pg (Γ : Catalog)
+  | tsql (dep : Deployment) (Γ : Catalog)
+  | pg (Γ : Catalog) (vars : List Var)
 
 def dotted (parts : List String) : String := ".".intercalate parts
 
@@ -72,6 +123,61 @@ PostgreSQL but not to this rule. Catalog keys are names folded by this
 rule. -/
 def pgName (n : String) : String :=
   if n.startsWith "\"" then n else n.toLower
+
+/-! ## Names in data statements (C3a)
+
+A data statement brings columns into scope (`Scope`): the target table's,
+in `UPDATE` and `DELETE`; none in `INSERT ... VALUES`, whose values are
+evaluated before any row exists. A one-part name (`Ast.Expr.Name [x]`) in
+an expression resolves as follows (`resolveName`).
+
+* **T-SQL**: a variable is spelt `@x` (`Ast.Expr.Var`), so a name is a
+  column, or outside the spec when it is none of the target's. A name
+  matches a column only when it is spelt exactly as the catalog's T-SQL
+  spelling of the column (`CatCol.tsql`); `wellFormed` asks those to be
+  ASCII and distinct up to case, so the match is the same under a
+  case-sensitive and a case-insensitive collation. Microsoft Learn,
+  "Database identifiers" (identifier comparison follows the collation).
+  Not probed.
+* **PL/pgSQL**: a name is folded (`pgName`). If it is a column of the
+  target and also a variable of the routine (a parameter, a local, or
+  `found`: "FOUND is a local variable within each PL/pgSQL function",
+  PL/pgSQL "Obtaining the Result Status"), it is outside the spec: "By default, PL/pgSQL will
+  report an error if a name in an SQL statement could refer to either a
+  variable or a table column" (PL/pgSQL "Variable Substitution"; the
+  `plpgsql.variable_conflict` setting or a `#variable_conflict` option
+  would resolve it either way instead, so refusing every such name makes
+  the lowering independent of that setting and no
+  `ASM-PG-VARIABLE-CONFLICT-ERROR` is needed). A column that is not a
+  variable is the column; a name that is the table's own reference name
+  (the last part of the target's name) and not a column is a whole-row
+  reference, outside the spec (and an ambiguity error, too, when a
+  variable has that name); any other name is a variable, which must be
+  declared (`wellScoped`). Not probed.
+* In both dialects, the column list of `INSERT` and the column a `SET`
+  assigns are columns, never variables ("Variable Substitution": in
+  `INSERT INTO dest (col) ...`, "col must be a column of dest"), resolved
+  the same way
+  (`colOf`). A two-part name (`t.c`) is outside the spec. -/
+
+/-- The columns in scope: each as a statement may write it (the T-SQL
+spelling, or the folded PostgreSQL name) and the core column; and, for
+PostgreSQL, the target's reference name. Empty outside data statements. -/
+structure Scope where
+  cols : List (String × Core.Col) := []
+  rel : Option String := none
+
+/-- A one-part name: a column (`inl`), a variable (`inr`), or outside the
+spec (`none`). Outside data statements a T-SQL name is outside the spec
+and a PostgreSQL name is a variable, as in C1. -/
+def resolveName (d : Dialect) (sc : Scope) (x : String) : Option (Sum Core.Col Var) :=
+  match d with
+  | .tsql _ _ => (lookup sc.cols x).map .inl
+  | .pg _ vars =>
+    let n := pgName x
+    match lookup sc.cols n with
+    | some c => if vars.contains n then none else some (.inl c)
+    | none => if sc.rel == some n then none else some (.inr n)
 
 /-! ## The C2a slice: types
 
@@ -117,8 +223,8 @@ abbrev TyEnv := List (Var × Ast.Ty)
 
 /-- The declared type is the slice's integer type. -/
 def intType : Dialect → Ast.Ty → Bool
-  | .tsql _, .Ty n [] => n.toUpper == "INT" || n.toUpper == "INTEGER"
-  | .pg _, .Ty n [] => n.toUpper == "INT" || n.toUpper == "INTEGER" || n.toUpper == "INT4"
+  | .tsql _ _, .Ty n [] => n.toUpper == "INT" || n.toUpper == "INTEGER"
+  | .pg _ _, .Ty n [] => n.toUpper == "INT" || n.toUpper == "INTEGER" || n.toUpper == "INT4"
   | _, _ => false
 
 def intVar (d : Dialect) (env : TyEnv) (x : Var) : Bool :=
@@ -343,11 +449,11 @@ def cmpOp? : String → Option COp
   | ">=" => some .ge
   | _ => none
 
-/-- An expression without variables is in the slice only if evaluating it
-does not fail (constant subexpressions, above). -/
+/-- An expression without variables (and without columns) is in the slice
+only if evaluating it does not fail (constant subexpressions, above). -/
 def closedSafe (s : SExpr) : Bool :=
-  !s.vars.isEmpty ||
-    match s.eval (U := Unit) Core.nullStore with
+  !s.vars.isEmpty || s.hasCol ||
+    match s.eval (U := Unit) Core.nullStore Core.nullStore with
     | .err _ => false
     | .ok _ => true
 
@@ -385,7 +491,7 @@ def callTy (d : Dialect) (name : String) (args : List (SExpr × STy)) : Option (
   match name.toUpper, args, d with
   | "COALESCE", _, _ =>
     if args.length ≥ 2 && args.any (·.2 == .int) then (coalesceTy args).map (·, .int) else none
-  | "ISNULL", [(x, .int), (y, ty)], .tsql _ =>
+  | "ISNULL", [(x, .int), (y, ty)], .tsql _ _ =>
     if valTy ty && !y.mayRaise then some (.coalesce x y, .int) else none
   | _, _, _ => none
 
@@ -408,52 +514,55 @@ mutual
   /-- The slice form of an expression and its type, or `none` when the
   expression is outside the slice. A variable is in the slice when it is
   declared with the slice's integer type (`env`). -/
-  def typed (d : Dialect) (env : TyEnv) : Ast.Expr → Option (SExpr × STy)
+  def typed (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option (SExpr × STy)
     | .Var v => match d with
-      | .tsql _ => if intVar d env v then some (.var v, .int) else none
-      | .pg _ => none
-    | .Name [x] => match d with
-      | .pg _ => if intVar d env (pgName x) then some (.var (pgName x), .int) else none
-      | .tsql _ => none
+      | .tsql _ _ => if intVar d env v then some (.var v, .int) else none
+      | .pg _ _ => none
+    | .Name [x] => match resolveName d sc x with
+      | some (.inl c) => some (.col c, .int)
+      | some (.inr v) => if intVar d env v then some (.var v, .int) else none
+      | none => none
     | .Num s => (intLit? s).map fun n => (.int n, .int)
     | .Null => some (.null, .nul)
     | .Bin o a b => do
-      let a' ← typed d env a
-      let b' ← typed d env b
+      let a' ← typed d env sc a
+      let b' ← typed d env sc b
       guardC (binTy o a' b')
     | .Unary o a => do
-      let a' ← typed d env a
+      let a' ← typed d env sc a
       guardC (unTy o a')
     | .IsNull x isNot => do
-      let (x', tx) ← typed d env x
+      let (x', tx) ← typed d env sc x
       if tx == .int then guardC (some (.isNull x' isNot, .bool)) else none
     | .CallE (.CallF [n] args false [] false false false) => do
-      let args' ← typedList d env args
+      let args' ← typedList d env sc args
       guardC (callTy d n args')
     | .Case none whens els => do
-      let ws ← typedWhens d env whens
-      let e ← typedOpt d env els
+      let ws ← typedWhens d env sc whens
+      let e ← typedOpt d env sc els
       guardC (caseTy ws e)
     | _ => none
 
-  def typedList (d : Dialect) (env : TyEnv) : List Ast.Expr → Option (List (SExpr × STy))
+  def typedList (d : Dialect) (env : TyEnv) (sc : Scope) :
+      List Ast.Expr → Option (List (SExpr × STy))
     | [] => some []
     | e :: es => do
-      let e' ← typed d env e
-      let es' ← typedList d env es
+      let e' ← typed d env sc e
+      let es' ← typedList d env sc es
       pure (e' :: es')
 
-  def typedOpt (d : Dialect) (env : TyEnv) : Option Ast.Expr → Option (Option (SExpr × STy))
+  def typedOpt (d : Dialect) (env : TyEnv) (sc : Scope) :
+      Option Ast.Expr → Option (Option (SExpr × STy))
     | none => some none
-    | some e => (typed d env e).map some
+    | some e => (typed d env sc e).map some
 
-  def typedWhens (d : Dialect) (env : TyEnv) :
+  def typedWhens (d : Dialect) (env : TyEnv) (sc : Scope) :
       List Ast.When2 → Option (List ((SExpr × STy) × (SExpr × STy)))
     | [] => some []
     | .When2 c r :: ws => do
-      let c' ← typed d env c
-      let r' ← typed d env r
-      let ws' ← typedWhens d env ws
+      let c' ← typed d env sc c
+      let r' ← typed d env sc r
+      let ws' ← typedWhens d env sc ws
       pure ((c', r') :: ws')
 end
 
@@ -482,20 +591,21 @@ def tyName : Ast.Ty → String
   | .Ty n args => n.toLower ++ "(" ++ ",".intercalate args ++ ")"
 
 /-- The slice form of `e` if it has one, else `c1`. -/
-def withSlice (d : Dialect) (env : TyEnv) (e : Ast.Expr) (c1 : Option Core.Expr) :
+def withSlice (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) (c1 : Option Core.Expr) :
     Option Core.Expr :=
-  match typed d env e with
+  match typed d env sc e with
   | some (s, _) => some (.sc s)
   | none => c1
 
 mutual
-  def lowerExpr (d : Dialect) (env : TyEnv) : Ast.Expr → Option Core.Expr
+  def lowerExpr (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option Core.Expr
     | .Var v => match d with
-      | .tsql _ => if v.startsWith "@@" then none else some (.var v) -- `@@ERROR` etc.: C4
-      | .pg _ => none
-    | .Name [x] => match d with
-      | .pg _ => some (.var (pgName x))
-      | .tsql _ => none -- a column: data, C3
+      | .tsql _ _ => if v.startsWith "@@" then none else some (.var v) -- `@@ERROR` etc.: C4
+      | .pg _ _ => none
+    | .Name [x] => match resolveName d sc x with
+      | some (.inl c) => some (.sc (.col c))
+      | some (.inr v) => some (.var v)
+      | none => none
     | .Name _ => none
     | .Num s => some (match intLit? s with
       | some n => .lit n
@@ -504,69 +614,70 @@ mutual
     | .Null => some .null
     | .Star _ => none
     | .CallE (.CallF n args distinct order withinGroup over star) =>
-      withSlice d env (.CallE (.CallF n args distinct order withinGroup over star))
+      withSlice d env sc (.CallE (.CallF n args distinct order withinGroup over star))
         (if distinct || !order.isEmpty || withinGroup || over || star then none
-        else (lowerExprs d env args).map (.op ("fn:" ++ (dotted n).toLower)))
-    | .Bin o a b => withSlice d env (.Bin o a b) do
-      let a' ← lowerExpr d env a
-      let b' ← lowerExpr d env b
+        else (lowerExprs d env sc args).map (.op ("fn:" ++ (dotted n).toLower)))
+    | .Bin o a b => withSlice d env sc (.Bin o a b) do
+      let a' ← lowerExpr d env sc a
+      let b' ← lowerExpr d env sc b
       pure (.op ("bin:" ++ o.toLower) [a', b'])
-    | .Unary o a => withSlice d env (.Unary o a)
-      ((lowerExpr d env a).map fun a' => .op ("un:" ++ o.toLower) [a'])
-    | .IsNull x neg => withSlice d env (.IsNull x neg)
-      ((lowerExpr d env x).map fun x' => .op ("isnull:" ++ flag neg) [x'])
+    | .Unary o a => withSlice d env sc (.Unary o a)
+      ((lowerExpr d env sc a).map fun a' => .op ("un:" ++ o.toLower) [a'])
+    | .IsNull x neg => withSlice d env sc (.IsNull x neg)
+      ((lowerExpr d env sc x).map fun x' => .op ("isnull:" ++ flag neg) [x'])
     | .InList x xs neg => do
-      let x' ← lowerExpr d env x
-      let xs' ← lowerExprs d env xs
+      let x' ← lowerExpr d env sc x
+      let xs' ← lowerExprs d env sc xs
       pure (.op ("in:" ++ flag neg) (x' :: xs'))
     | .InQuery .. => none
     | .Between x lo hi neg => do
-      let x' ← lowerExpr d env x
-      let lo' ← lowerExpr d env lo
-      let hi' ← lowerExpr d env hi
+      let x' ← lowerExpr d env sc x
+      let lo' ← lowerExpr d env sc lo
+      let hi' ← lowerExpr d env sc hi
       pure (.op ("between:" ++ flag neg) [x', lo', hi'])
     | .Like x p neg ci => do
-      let x' ← lowerExpr d env x
-      let p' ← lowerExpr d env p
+      let x' ← lowerExpr d env sc x
+      let p' ← lowerExpr d env sc p
       pure (.op ("like:" ++ flag neg ++ flag ci) [x', p'])
-    | .Cast x ty => (lowerExpr d env x).map fun x' => .op ("cast:" ++ tyName ty) [x']
-    | .Case operand whens els => withSlice d env (.Case operand whens els) do
+    | .Cast x ty => (lowerExpr d env sc x).map fun x' => .op ("cast:" ++ tyName ty) [x']
+    | .Case operand whens els => withSlice d env sc (.Case operand whens els) do
       -- `case:OE`: whether there is an operand and an `ELSE`; the `WHEN`
       -- pairs fill the arguments between them.
-      let o' ← lowerOpt d env operand
-      let ws ← lowerWhens d env whens
-      let e' ← lowerOpt d env els
+      let o' ← lowerOpt d env sc operand
+      let ws ← lowerWhens d env sc whens
+      let e' ← lowerOpt d env sc els
       pure (.op ("case:" ++ flag o'.isSome ++ flag e'.isSome) (o'.toList ++ ws ++ e'.toList))
     | .Exists _ | .Subquery _ => none
-    | .Tuple xs => (lowerExprs d env xs).map (.op "tuple")
+    | .Tuple xs => (lowerExprs d env sc xs).map (.op "tuple")
     | .Special n => some (.op ("special:" ++ n.toLower) [])
-    | .Extract f x => (lowerExpr d env x).map fun x' => .op ("extract:" ++ f.toLower) [x']
+    | .Extract f x => (lowerExpr d env sc x).map fun x' => .op ("extract:" ++ f.toLower) [x']
 
-  def lowerExprs (d : Dialect) (env : TyEnv) : List Ast.Expr → Option (List Core.Expr)
+  def lowerExprs (d : Dialect) (env : TyEnv) (sc : Scope) : List Ast.Expr → Option (List Core.Expr)
     | [] => some []
     | e :: es => do
-      let e' ← lowerExpr d env e
-      let es' ← lowerExprs d env es
+      let e' ← lowerExpr d env sc e
+      let es' ← lowerExprs d env sc es
       pure (e' :: es')
 
   /-- An optional part: `some none` when absent, `none` when unsupported. -/
-  def lowerOpt (d : Dialect) (env : TyEnv) : Option Ast.Expr → Option (Option Core.Expr)
+  def lowerOpt (d : Dialect) (env : TyEnv) (sc : Scope) :
+      Option Ast.Expr → Option (Option Core.Expr)
     | none => some none
-    | some e => (lowerExpr d env e).map some
+    | some e => (lowerExpr d env sc e).map some
 
-  def lowerWhens (d : Dialect) (env : TyEnv) : List Ast.When2 → Option (List Core.Expr)
+  def lowerWhens (d : Dialect) (env : TyEnv) (sc : Scope) : List Ast.When2 → Option (List Core.Expr)
     | [] => some []
     | .When2 c r :: ws => do
-      let c' ← lowerExpr d env c
-      let r' ← lowerExpr d env r
-      let ws' ← lowerWhens d env ws
+      let c' ← lowerExpr d env sc c
+      let r' ← lowerExpr d env sc r
+      let ws' ← lowerWhens d env sc ws
       pure (c' :: r' :: ws')
 end
 
 /-- The variable an assignment or an `OUTPUT` argument names. -/
 def target : Dialect → Ast.Expr → Option Var
-  | .tsql _, .Var v => if v.startsWith "@@" then none else some v
-  | .pg _, .Name [x] => some (pgName x)
+  | .tsql _ _, .Var v => if v.startsWith "@@" then none else some v
+  | .pg _ _, .Name [x] => some (pgName x)
   | _, _ => none
 
 /-! ## The T-SQL return status
@@ -597,9 +708,222 @@ def statusVar : Var := "%status"
 def statusParam : Core.Param := ⟨statusVar, .inout, some .null⟩
 
 def statusExpr (d : Dialect) (env : TyEnv) (e : Ast.Expr) (e' : Core.Expr) : Core.Expr :=
-  match typed d env e with
+  match typed d env {} e with
   | some (s, t) => if valTy t then .sc (.coalesce s (.int 0)) else .op "fn:coalesce" [e', .lit 0]
   | none => .op "fn:coalesce" [e', .lit 0]
+
+/-! ## The C3a slice: data statements
+
+Single-table `INSERT ... VALUES`, `UPDATE` and `DELETE` in a procedure,
+on a table of the target catalog (`CatTable`), lowered to the core's
+`insert`, `update` and `delete` (`Sqldiff.Core.insertRows`,
+`updateRows`, `deleteRows`). Expressions are lowered as everywhere else,
+with the columns in scope (`Scope`, `resolveName`); a column of the
+catalog is an `int` in the slice's sense. Each rule states the claim, the
+vendor text and the probe status, as for C2a. "eval/casts/assign" is
+`eval/casts/assign-{mssql,postgres}.sql` with their `.out` files, and
+"eval/bit-boolean" is `eval/bit-boolean/{mssql,postgres}.sql`; both
+write tables only incidentally, to probe conversions, so most rules below
+are not probed.
+
+**Tables.** A T-SQL table name, `.`-joined as written (`dbo.t`), reaches
+the target table the deployment maps it to (`Deployment.tables`,
+`ASM-DBO-SCHEMA`); a PostgreSQL table name is folded (`pgName`) and
+`.`-joined, and must be a catalog table of that name (the routine's
+`search_path` finds it: the same trust as for `CALL`). A catalog table is
+usable only if its column names are ASCII, distinct, and their T-SQL
+spellings distinct up to case (`CatTable.wellFormed`). Not probed.
+
+**Where data statements may stand.** Only in a procedure: a T-SQL
+function cannot change a table ("CREATE FUNCTION (Transact-SQL)":
+user-defined functions "can't be used to perform actions that modify the
+database state"), so a T-SQL function with one is not a function SQL
+Server accepts, and its PostgreSQL mirror has no counterpart.
+
+**Row counts.** A T-SQL `INSERT`, `UPDATE` or `DELETE` sends its
+rows-affected count unless `SET NOCOUNT ON` ("SET NOCOUNT
+(Transact-SQL)"); a PL/pgSQL procedure sends none (a `CALL` reports only
+its own command tag). So when the deployment's observer reads row counts
+(`Deployment.rowCounts`), every T-SQL data statement is outside the spec
+(and C1 keeps `SET NOCOUNT` outside then too); when it does not, counts
+are not observed (`ASM-OBSERVER-ROWCOUNT`, the deployment's choice).
+
+**`INSERT INTO t (c1, ..., cn) VALUES (e1, ..., en), ...`**: a column
+list of distinct columns of `t`, one or more rows of exactly `n` values;
+each row gets the values in the listed columns and NULL in every other
+column. No query source, `DEFAULT VALUES`, `RETURNING`, `ON CONFLICT` or
+column list left out (the order of a table's columns is not in the
+correspondence).
+
+* T-SQL: "INSERT (Transact-SQL)": "If a column isn't in column_list, the
+  Database Engine must be able to provide a value based on the definition
+  of the column ... [it] automatically provides a value for the column if
+  the column: ... Is nullable. A null value is used." (the other cases,
+  identity, default, `timestamp`, computed, are excluded by the catalog).
+  A column without a value that is `NOT NULL` is error 515. Incidentally
+  probed: eval/casts/assign (`INSERT INTO #a (dt) VALUES (...)` leaves
+  the unlisted `dt2` NULL).
+* PostgreSQL: "INSERT": "Each column not present in the explicit or
+  implicit column list will be filled with a default value, either its
+  declared default value or null if there is none." Not probed.
+* The values see no columns: T-SQL refuses a column name in `VALUES`,
+  and PostgreSQL resolves it to nothing ("there is a column named ... but
+  it cannot be referenced from this part of the query"), so in PL/pgSQL a
+  name there is a variable even when the table has a column of that name
+  (`resolveName` with the empty scope). Not probed.
+
+**`UPDATE t SET c1 = e1, ... [WHERE p]`**: distinct one-part columns of
+`t`, none a key column; no alias, no `FROM` (T-SQL `UPDATE ... FROM`, which
+takes an unspecified source row, is outside C3a), no `OUTPUT`/`RETURNING`.
+Each row where `p` is TRUE gets every `ei` evaluated on the row's old
+values; FALSE and UNKNOWN leave the row as it is.
+
+* All assignments see the old values. PostgreSQL: "UPDATE", `expression`:
+  "The expression can use the old values of this and other columns in the
+  table." T-SQL: "UPDATE (Transact-SQL)", on `@variable = column =
+  expression`: "This differs from SET @variable = column, column =
+  expression, which sets the variable to the pre-update value of the
+  column", i.e. a `SET` list reads the row as it was before the statement
+  (the "all-at-once" rule; the page says it for variables, not in so many
+  words for columns: reviewers check). Not probed.
+* `WHERE` keeps the rows where it is TRUE. PostgreSQL: "UPDATE":
+  "Only rows for which this expression returns true will be updated."
+  T-SQL: "UPDATE (Transact-SQL)", `WHERE`: "Specifies the conditions that
+  limit the rows that are updated", with "Search condition
+  (Transact-SQL)" for UNKNOWN. Incidentally probed: eval/bit-boolean
+  (`UPDATE #f SET c = 7 WHERE id = 2` changes row 2 only, SQL Server).
+* A key column is never set: PostgreSQL checks a non-deferrable primary
+  key "immediately whenever a row is inserted or modified", not at the
+  end of the statement as the standard says, so `SET k = k + 1` can fail
+  part-way depending on the order rows are visited ("CREATE TABLE",
+  "Compatibility", "Non-Deferred Uniqueness Constraints"), where SQL
+  Server checks the statement's result. Outside the spec.
+
+**`DELETE FROM t [WHERE p]`**: no alias, no T-SQL second `FROM`, no
+PostgreSQL `USING`, no `OUTPUT`/`RETURNING`; removes the rows where `p` is
+TRUE. PostgreSQL: "DELETE": "Only rows for which this expression returns
+true will be deleted." T-SQL: "DELETE (Transact-SQL)", `WHERE`. Not
+probed.
+
+**Constraint violations.** A NULL in a `NOT NULL` or key column (T-SQL
+515, SQLSTATE 23502 `not_null_violation`) and a key that two rows share
+(T-SQL 2627, SQLSTATE 23505 `unique_violation`) are errors of the kind
+`constraint` (decision 1 compares the kind, so which of two violations is
+reported is not observed). PostgreSQL checks `NOT NULL` and a
+non-deferrable primary key for each row as it is written ("CREATE
+TABLE"); for `INSERT` that fails exactly when the statement's result has
+a NULL there or a duplicate key, which is when SQL Server fails. Not
+probed.
+
+**Statement atomicity.** A data statement that fails has no effect: T-SQL
+rolls back at least the failing statement ("SET XACT_ABORT
+(Transact-SQL)": "When SET XACT_ABORT is OFF, in some cases only the
+Transact-SQL statement that raised the error is rolled back and the
+transaction continues processing"; with it `ON`, "the entire transaction
+is terminated and rolled back"); PostgreSQL "treats every SQL statement
+as being executed within a transaction" ("Transactions", 3.4) and an
+error aborts it. The core keeps the state from before the statement
+(`Sqldiff.Core.exec_error_atomic`). The error then ends the routine (C2a:
+under `XACT_ABORT ON` in T-SQL, `abortsT`); what the caller sees of the
+database afterwards differs between the dialects and is not observed
+(`Sqldiff.Core.Obs`; `ASM-STATE-AFTER-ERROR` in `residual`). Not probed.
+
+**Row order and which error.** Neither vendor fixes the order in which a
+statement visits rows. A statement whose rows could fail with errors of
+two kinds (an arithmetic error on one row, a constraint violation on
+another) reports whichever comes first, so it is outside the slice
+(`Sqldiff.Core.Stmt.dmlSafe`); within one kind the core's order is not
+observed.
+
+**Where the expressions are evaluated.** A `WHERE` that can raise is
+outside the slice: which rows an engine tests depends on the access path
+(an index on `k` tests `k = @k AND 1/c > 0` only on the rows with that
+key). The values of `SET` are evaluated, in the core, only on the rows the
+`WHERE` keeps. For PostgreSQL that is SQL's logical order: "The WHERE
+Clause" (7.2.2) discards the rows for which the condition is not true,
+and what is computed from the rows (the select list, 7.3; an `UPDATE`'s
+values) is computed on what remains; the manual does not say it of
+`UPDATE` in so many words (reviewers check). SQL Server does not promise
+it, but the core's choice is one it may make, and T-SQL is the reference
+side, whose possible outcomes the core needs only to include one of. Not
+probed.
+
+**Values written to a column** are `int` expressions of the slice or the
+NULL literal, in both dialects; anything else is outside the spec, even
+on the C1 path. The column is `int`, so no conversion happens on the
+write. Of another type, the value would be converted on assignment, and
+the dialects convert differently (T-SQL truncates a `decimal` to `int`,
+PostgreSQL rounds: probed, eval/casts/assign, `INSERT` and `UPDATE`),
+which an uninterpreted operator does not show. The `WHERE` of `UPDATE`
+and `DELETE` may be any condition (an uninterpreted operator on the C1
+path).
+
+**Constant parts of a data statement.** PL/pgSQL runs a data statement
+through a prepared plan and may plan it with the variables' current
+values as constants (PL/pgSQL "Plan Caching"; "PREPARE", custom plans),
+and the planner folds constant subexpressions, raising their errors even
+when no row is written (9.18.1 "CASE", 4.2.14 "Expression Evaluation
+Rules"). So a part of an `UPDATE`'s values that reads no column and can
+raise is outside the slice (`Sqldiff.Core.SExpr.constRaise`). `INSERT ...
+VALUES` evaluates every value in any case, and a `WHERE` cannot raise.
+Not probed. -/
+
+/-- Spelling of a column as a statement of the dialect writes it. -/
+def colKey (d : Dialect) (c : CatCol) : String :=
+  match d with
+  | .tsql _ _ => c.tsql
+  | .pg _ _ => c.name
+
+/-- The table can be used: names ASCII and distinct; T-SQL spellings
+distinct up to case. -/
+def CatTable.wellFormed (t : CatTable) : Bool :=
+  !t.cols.isEmpty && t.cols.all (fun c => c.name.toList.all fun (ch : Char) => ch.toNat < 128) &&
+    distinct (t.cols.map (·.name)) &&
+    caseSafe (t.cols.map (·.tsql))
+
+/-- The catalog table a data statement names, if it can be used. -/
+def tableOf (d : Dialect) (target : List String) : Option CatTable :=
+  let (Γ, key) : Catalog × Option String := match d with
+    | .tsql dep Γ => (Γ, lookup dep.tables (dotted target))
+    | .pg Γ _ => (Γ, some (dotted (target.map pgName)))
+  key.bind fun n =>
+    (Γ.tables.find? (·.name == n)).bind fun t => if t.wellFormed then some t else none
+
+/-- A column named in an `INSERT` column list or as a `SET` target. -/
+def colOf (d : Dialect) (t : CatTable) (x : String) : Option Core.Col :=
+  let x := match d with
+    | .tsql _ _ => x
+    | .pg _ _ => pgName x
+  lookup (t.cols.map fun c => (colKey d c, c.name)) x
+
+/-- The columns an `UPDATE` or `DELETE` brings into scope, and for
+PostgreSQL the table's reference name (the last part of its name). -/
+def scopeOf (d : Dialect) (t : CatTable) (target : List String) : Scope :=
+  { cols := t.cols.map fun c => (colKey d c, c.name)
+    rel := match d with
+      | .tsql _ _ => none
+      | .pg _ _ => target.getLast?.map pgName }
+
+def CatTable.toDef (t : CatTable) : Core.TableDef :=
+  ⟨t.name, t.cols.map fun c => ⟨c.name, c.notNull, c.key⟩⟩
+
+def CatTable.isKey (t : CatTable) (c : Core.Col) : Bool :=
+  t.cols.any fun d => d.name == c && d.key
+
+/-- A value written to a column: an `int` expression of the slice or the
+NULL literal ("Values written to a column" above), else outside the spec. -/
+def colValue (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Option Core.Expr :=
+  match typed d env sc e with
+  | some (s, t) => if valTy t then some (.sc s) else none
+  | none => none
+
+/-- A data statement may stand here: in a procedure, and in T-SQL only
+when row counts are not observed. -/
+def dataOk (d : Dialect) (k : Ast.RoutineKind) : Bool :=
+  (k matches .Procedure) &&
+    match d with
+    | .tsql dep _ => !dep.rowCounts
+    | .pg _ _ => true
 
 /-! ## Statements -/
 
@@ -622,25 +946,55 @@ nests).
 * PL/pgSQL declarations belong to the `DECLARE` section (`lowerP`).
 * `RETURN e` in a function returns `e`; in a T-SQL procedure it sets the
   status (above); a PostgreSQL procedure cannot return a value.
-* Queries, DML and messages are outside the spec. -/
+* `INSERT ... VALUES`, `UPDATE` and `DELETE` as in "The C3a slice: data
+  statements" above; every other form of them is outside the spec.
+* Queries, `MERGE` and messages are outside the spec. -/
 def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → Option (List Stmt)
   | .Assign t v => do
     let x ← target d t
-    let v' ← lowerExpr d env v
+    let v' ← lowerExpr d env {} v
     pure [.assign x v']
   | .Return none => some [.ret none]
   | .Return (some e) => do
-    let e' ← lowerExpr d env e
+    let e' ← lowerExpr d env {} e
     match d, k with
     | _, .Function => pure [.ret (some e')]
-    | .tsql _, .Procedure => pure [.assign statusVar (statusExpr d env e e'), .ret none]
-    | .pg _, .Procedure => none
+    | .tsql _ _, .Procedure => pure [.assign statusVar (statusExpr d env e e'), .ret none]
+    | .pg _ _, .Procedure => none
   | .Declare x _ dflt => match d, dflt with
-    | .tsql _, none => some []
-    | .tsql _, some e => do
-      let e' ← lowerExpr d env e
+    | .tsql _ _, none => some []
+    | .tsql _ _, some e => do
+      let e' ← lowerExpr d env {} e
       pure [.assign x e']
-    | .pg _, _ => none
+    | .pg _ _, _ => none
+  | .Insert tgt cols (.SrcValues rows) [] [] none => do
+    if !dataOk d k then none else
+    let t ← tableOf d tgt
+    let cs ← cols.mapM (colOf d t)
+    if cs.isEmpty || !distinct cs || rows.isEmpty || !rows.all (·.length == cs.length) then none
+    else
+      let rows' ← rows.mapM (·.mapM (colValue d env {}))
+      pure [.insert t.toDef cs rows']
+  | .Update tgt none sets [] wh => do
+    if !dataOk d k then none else
+    let t ← tableOf d tgt
+    let sc := scopeOf d t tgt
+    let sets' ← sets.mapM fun
+      | .Set [c] e => do
+        let c' ← colOf d t c
+        if t.isKey c' then none else
+          let e' ← colValue d env sc e
+          pure (c', e')
+      | _ => none
+    if sets'.isEmpty || !distinct (sets'.map (·.1)) then none
+    else
+      let wh' ← lowerOpt d env sc wh
+      pure [.update t.toDef sets' wh']
+  | .Delete tgt none [] wh => do
+    if !dataOk d k then none else
+    let t ← tableOf d tgt
+    let wh' ← lowerOpt d env (scopeOf d t tgt) wh
+    pure [.delete t.toDef wh']
   | .SSelect .. | .Insert .. | .Update .. | .Delete .. | .Merge .. | .Message .. => none
 
 /-! ## Calls -/
@@ -654,7 +1008,7 @@ status is the callee's *last* parameter in the core (above), so placing
 def lowerTsqlArg (d : Dialect) (env : TyEnv) : Ast.Arg → Option Arg
   | .Arg (some _) _ _ => none -- named arguments: the core binds by position
   | .Arg none e true => (target d e).map .ref
-  | .Arg none e false => (lowerExpr d env e).map .val
+  | .Arg none e false => (lowerExpr d env {} e).map .val
 
 /-- PostgreSQL `CALL p(args)`: positional arguments only; an argument in
 an `OUT` or `INOUT` position (the catalog says which) must be a variable,
@@ -663,20 +1017,20 @@ argument take their defaults. -/
 def lowerPgArg (d : Dialect) (env : TyEnv) : Ast.Mode × Ast.Arg → Option Arg
   | (_, .Arg (some _) _ _) => none
   | (_, .Arg none _ true) => none -- `OUTPUT` is T-SQL syntax
-  | (.In, .Arg none e false) => (lowerExpr d env e).map .val
+  | (.In, .Arg none e false) => (lowerExpr d env {} e).map .val
   | (_, .Arg none e false) => (target d e).map .ref
 
 def lowerCall (d : Dialect) (env : TyEnv) (n : List String) (args : List Ast.Arg)
     (ret : Option Ast.Expr) : Option Stmt :=
   match d with
-  | .tsql dep => do
+  | .tsql dep _ => do
     if ret.isSome then none else
     let callee ← lookup dep.routines (dotted n)
     let args' ← args.mapM (lowerTsqlArg d env)
     pure (.call callee args')
-  | .pg Γ => do
+  | .pg Γ _ => do
     let callee := dotted (n.map pgName)
-    let modes ← lookup Γ callee
+    let modes ← lookup Γ.routines callee
     if args.length ≤ modes.length && ret.isNone then
       let args' ← (modes.zip args).mapM (lowerPgArg d env)
       pure (.call callee args')
@@ -698,11 +1052,11 @@ and other settings (`ARITHABORT`, `ANSI_WARNINGS`, ...) change error
 behaviour: outside the spec. -/
 def lowerSetting (d : Dialect) (name : String) (on : Bool) : Option (List Stmt) :=
   match d with
-  | .tsql dep =>
+  | .tsql dep _ =>
     if name.toUpper = "NOCOUNT" && !dep.rowCounts then some []
     else if name.toUpper = "XACT_ABORT" && on then some []
     else none
-  | .pg _ => none
+  | .pg _ _ => none
 
 /-! ## Blocks -/
 
@@ -711,12 +1065,12 @@ mutual
     | .NStmt s => lowerStmt d env k s
     | .NBlock b => lowerInner d env k b
     | .If c t e => do
-      let c' ← lowerExpr d env c
+      let c' ← lowerExpr d env {} c
       let t' ← lowerNodes d env k t
       let e' ← lowerNodes d env k e
       pure [.ite c' (seqList t') (seqList e')]
     | .While c b => do
-      let c' ← lowerExpr d env c
+      let c' ← lowerExpr d env {} c
       let b' ← lowerNodes d env k b
       pure [.while c' (seqList b')]
     | .Call n args ret => (lowerCall d env n args ret).map fun s => [s]
@@ -777,10 +1131,10 @@ def lowerMode : Ast.Mode → Core.Mode
 def lowerParam (d : Dialect) (env : TyEnv) : Ast.Param → Option Core.Param
   | .Param name _ mode dflt =>
     let name := match d with
-      | .tsql _ => name
-      | .pg _ => pgName name
+      | .tsql _ _ => name
+      | .pg _ _ => pgName name
     -- A default that reads a variable is refused by both engines.
-    match lowerOpt d env dflt with
+    match lowerOpt d env {} dflt with
     | some e => if (e.map Core.Expr.vars).getD [] = [] then some ⟨name, lowerMode mode, e⟩ else none
     | none => none
 
@@ -810,10 +1164,10 @@ def envT : Ast.Routine → TyEnv
   `@a` and `@A` are one variable depends on the instance's collation, so
   the lowering, which keeps names as written, is faithful only when no
   two names of the routine could be confused. -/
-def lowerT (dep : Deployment) (a : Ast.Routine) : Option Core.Routine :=
+def lowerT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option Core.Routine :=
   match a with
   | .Routine kind _ params _ _ _ body => do
-    let d := Dialect.tsql dep
+    let d := Dialect.tsql dep Γ
     let env := envT a
     let ps ← params.mapM (lowerParam d env)
     let stmts ← lowerInner d env kind body
@@ -845,7 +1199,7 @@ block runs on entry, in declaration order, when there is a default. -/
 def lowerDecl (d : Dialect) (env : TyEnv) : Ast.Stmt → Option (Var × List Stmt)
   | .Declare x _ none => some (pgName x, [])
   | .Declare x _ (some e) =>
-    (lowerExpr d env e).map fun e' => (pgName x, [.assign (pgName x) e'])
+    (lowerExpr d env {} e).map fun e' => (pgName x, [.assign (pgName x) e'])
   | _ => none
 
 /-- The declared types of a PL/pgSQL routine's variables, folded. -/
@@ -853,6 +1207,12 @@ def envP : Ast.Routine → TyEnv
   | .Routine _ _ params _ _ _ (.Block decls _) =>
     params.map (fun | .Param n ty _ _ => (pgName n, ty)) ++
       typedNames ((declTys decls).map fun (x, t) => (pgName x, t))
+
+/-- The names that are variables in a PL/pgSQL routine, folded: its
+parameters, its declarations, and `found` (`resolveName`). -/
+def pgVars : Ast.Routine → List Var
+  | .Routine _ _ params _ _ _ (.Block decls _) =>
+    params.map (fun | .Param n _ _ _ => pgName n) ++ (declTys decls).map (pgName ·.1) ++ ["found"]
 
 /-- A PL/pgSQL routine: one block, its `DECLARE` section, its statements.
 Every name is folded by `pgName`. Outside the spec, besides the
@@ -863,7 +1223,7 @@ the core has one variable per name); a variable never declared
 def lowerP (Γ : Catalog) (b : Ast.Routine) : Option Core.Routine :=
   match b with
   | .Routine kind _ params _ _ _ (.Block decls stmts) => do
-    let d := Dialect.pg Γ
+    let d := Dialect.pg Γ (pgVars b)
     let env := envP b
     let ps ← params.mapM (lowerParam d env)
     let ds ← decls.mapM (lowerDecl d env)
@@ -896,14 +1256,14 @@ lowering has no uninterpreted operator, and no conversion happens where
 the core does not see one. -/
 
 /-- A value position: an `int` expression or the NULL literal. -/
-def valueOk (d : Dialect) (env : TyEnv) (e : Ast.Expr) : Bool :=
-  match typed d env e with
+def valueOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
+  match typed d env sc e with
   | some (_, t) => valTy t
   | none => false
 
 /-- A condition: a three-valued boolean of the slice. -/
-def condOk (d : Dialect) (env : TyEnv) (e : Ast.Expr) : Bool :=
-  match typed d env e with
+def condOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
+  match typed d env sc e with
   | some (_, .bool) => true
   | _ => false
 
@@ -913,21 +1273,30 @@ def intTarget (d : Dialect) (env : TyEnv) (t : Ast.Expr) : Bool :=
   | none => false
 
 def sliceStmt (d : Dialect) (env : TyEnv) : Ast.Stmt → Bool
-  | .Assign t v => intTarget d env t && valueOk d env v
+  | .Assign t v => intTarget d env t && valueOk d env {} v
   | .Return none => true
-  | .Return (some e) => valueOk d env e
+  | .Return (some e) => valueOk d env {} e
   | .Declare _ ty dflt => match dflt with
     | none => true
-    | some e => (ty.map (intType d)).getD false && valueOk d env e
+    | some e => (ty.map (intType d)).getD false && valueOk d env {} e
+  | .Insert _ _ (.SrcValues rows) _ _ _ => rows.all (·.all (valueOk d env {}))
+  | .Update tgt _ sets _ wh => match tableOf d tgt with
+    | some t =>
+      let sc := scopeOf d t tgt
+      sets.all (fun | .Set _ e => valueOk d env sc e) && wh.all (condOk d env sc)
+    | none => false
+  | .Delete tgt _ _ wh => match tableOf d tgt with
+    | some t => wh.all (condOk d env (scopeOf d t tgt))
+    | none => false
   | _ => false
 
 mutual
   def sliceNode (d : Dialect) (env : TyEnv) : Ast.Node → Bool
     | .NStmt s => sliceStmt d env s
     | .NBlock b => sliceBlock d env b
-    | .If c t e => condOk d env c && sliceNodes d env t && sliceNodes d env e
-    | .While c b => condOk d env c && sliceNodes d env b
-    | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env e
+    | .If c t e => condOk d env {} c && sliceNodes d env t && sliceNodes d env e
+    | .While c b => condOk d env {} c && sliceNodes d env b
+    | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env {} e
     | .Setting .. => true
 
   def sliceNodes (d : Dialect) (env : TyEnv) : List Ast.Node → Bool
@@ -941,7 +1310,7 @@ end
 def sliceParam (d : Dialect) (env : TyEnv) : Ast.Param → Bool
   | .Param _ _ _ none => true
   | .Param _ _ _ (some .Null) => true
-  | .Param _ ty _ (some e) => intType d ty && valueOk d env e
+  | .Param _ ty _ (some e) => intType d ty && valueOk d env {} e
 
 def sliceRoutine (d : Dialect) (env : TyEnv) : Ast.Routine → Bool
   | .Routine kind _ params returns _ _ body =>
@@ -950,9 +1319,10 @@ def sliceRoutine (d : Dialect) (env : TyEnv) : Ast.Routine → Bool
       | .Function => (returns.map (intType d)).getD false
       | .Procedure => true
 
-def sliceT (dep : Deployment) (a : Ast.Routine) : Bool := sliceRoutine (.tsql dep) (envT a) a
+def sliceT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Bool :=
+  sliceRoutine (.tsql dep Γ) (envT a) a
 
-def sliceP (Γ : Catalog) (b : Ast.Routine) : Bool := sliceRoutine (.pg Γ) (envP b) b
+def sliceP (Γ : Catalog) (b : Ast.Routine) : Bool := sliceRoutine (.pg Γ (pgVars b)) (envP b) b
 
 /-- The settings a body starts with, in order. -/
 def leadingSettings : List Ast.Node → List (String × Bool)

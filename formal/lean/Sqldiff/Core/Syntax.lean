@@ -10,14 +10,44 @@ parameters with modes and defaults, local declarations, assignment, `if`,
 meaning of their own (`SExpr`): NULL, three-valued booleans and 32-bit
 integers with their operators. Every other expression is still an
 operator applied to expressions (`Expr.op`), whose meaning is a parameter
-of the semantics (`ExprSem.op`). There are no transactions (C4) and no
-data (C3).
+of the semantics (`ExprSem.op`). Phase C3a ("Statements", mirror depth)
+adds data: tables of rows of values, described by the target catalog
+(`TableDef`), and three single-table statements, `insert`, `update` and
+`delete`, whose expressions may read the columns of the row at hand
+(`SExpr.col`). There are no transactions yet (C4).
 -/
 
 namespace Sqldiff.Core
 
 /-- A variable name, as the lowering spells it. -/
 abbrev Var := String
+
+/-- A column, as the target catalog spells it (PostgreSQL's folded name,
+`Sqldiff.Mirror.pgName`). Columns are never renamed: both sides name the
+catalog's column. -/
+abbrev Col := String
+
+/-- A column of a table in the C3a slice: a 32-bit integer (T-SQL `int`,
+PostgreSQL `integer`), `NOT NULL` or nullable, and whether it is part of
+the primary key (a key column is `NOT NULL` whatever `notNull` says). -/
+structure ColDef where
+  name : Col
+  notNull : Bool
+  key : Bool
+deriving DecidableEq, Repr
+
+/-- A key column, or a `NOT NULL` one: NULL there is a constraint
+violation. -/
+def ColDef.required (c : ColDef) : Bool := c.notNull || c.key
+
+/-- A table: its catalog name and its columns in declaration order. A row
+of the table lists one value per column, in this order. -/
+structure TableDef where
+  name : String
+  cols : List ColDef
+deriving DecidableEq, Repr
+
+def TableDef.hasKey (t : TableDef) : Bool := t.cols.any (·.key)
 
 /-- Parameter modes. T-SQL `OUTPUT` is `inout` (the callee sees the value
 the caller passed); PostgreSQL `OUT` is `out` (the callee sees NULL). -/
@@ -55,6 +85,8 @@ literal, NULL, integer arithmetic and negation, comparisons, `AND`, `OR`,
 `NOT`, `IS [NOT] NULL` (`neg` is `IS NOT NULL`), `coalesce a b` (the
 second argument evaluated only when the first is NULL) and `cond c a b`
 (`CASE WHEN c THEN a ELSE b END`: `a` when `c` is TRUE, else `b`).
+`col c` reads column `c` of the row a C3a statement is at (NULL outside
+one): it is not a variable, so it is never renamed.
 
 The core does not type them; the lowerings build them only from
 expressions they have typed (`Sqldiff.Mirror.typed`). A variable read is
@@ -73,6 +105,7 @@ inductive SExpr where
   | isNull (a : SExpr) (neg : Bool)
   | coalesce (a b : SExpr)
   | cond (c a b : SExpr)
+  | col (c : Col)
 deriving DecidableEq, Repr
 
 /-- Expressions. `sc s` is an expression of the slice. `op f args`
@@ -132,7 +165,22 @@ deriving DecidableEq, Repr
 
 /-- Statements. A block is a sequence (`seq`); the empty block is
 `skip`. Calls name another routine, which the world runs (see
-`Sqldiff.Core.WorldModel`); they are never inlined. -/
+`Sqldiff.Core.WorldModel`); they are never inlined.
+
+The data statements of C3a carry the definition of the table they write
+(from the catalog, the same on both sides):
+
+* `insert t cs rows`: one row per element of `rows`, the values of the
+  columns `cs` in order (`INSERT INTO t (cs) VALUES (...), ...`); every
+  other column is NULL. The expressions see no columns.
+* `update t sets c`: each row where `c` is TRUE (every row when `c` is
+  `none`) gets, for each `(col, e)` of `sets`, the value of `e`
+  evaluated on the row's old values (`UPDATE t SET col = e, ... WHERE c`).
+* `delete t c`: removes each row where `c` is TRUE (every row when
+  `none`).
+
+Their meaning is `Sqldiff.Core.insertRows`, `updateRows` and
+`deleteRows`. -/
 inductive Stmt where
   | skip
   | assign (x : Var) (e : Expr)
@@ -141,6 +189,9 @@ inductive Stmt where
   | while (c : Expr) (body : Stmt)
   | ret (e : Option Expr)
   | call (proc : String) (args : List Arg)
+  | insert (t : TableDef) (cols : List Col) (rows : List (List Expr))
+  | update (t : TableDef) (sets : List (Col × Expr)) (cond : Option Expr)
+  | delete (t : TableDef) (cond : Option Expr)
 deriving DecidableEq, Repr
 
 /-- A parameter: name, mode, and the default used when the caller passes
@@ -187,6 +238,7 @@ def SExpr.vars : SExpr → List Var
   | .isNull a _ => a.vars
   | .coalesce a b => a.vars ++ b.vars
   | .cond c a b => c.vars ++ a.vars ++ b.vars
+  | .col _ => []
 
 mutual
   def Expr.vars : Expr → List Var
@@ -202,6 +254,11 @@ def Arg.vars : Arg → List Var
   | .val e => e.vars
   | .ref x => [x]
 
+/-- The variables of an optional expression. -/
+def Expr.varsOpt : Option Expr → List Var
+  | some e => e.vars
+  | none => []
+
 def Stmt.vars : Stmt → List Var
   | .skip => []
   | .assign x e => x :: e.vars
@@ -211,6 +268,9 @@ def Stmt.vars : Stmt → List Var
   | .ret none => []
   | .ret (some e) => e.vars
   | .call _ args => (args.map Arg.vars).flatten
+  | .insert _ _ rows => (rows.map fun es => (es.map Expr.vars).flatten).flatten
+  | .update _ sets c => (sets.map fun p => p.2.vars).flatten ++ Expr.varsOpt c
+  | .delete _ c => Expr.varsOpt c
 
 def Param.vars (p : Param) : List Var :=
   p.name :: (match p.default with | some e => e.vars | none => [])
@@ -233,6 +293,7 @@ def SExpr.rename (f : Var → Var) : SExpr → SExpr
   | .isNull a n => .isNull (a.rename f) n
   | .coalesce a b => .coalesce (a.rename f) (b.rename f)
   | .cond c a b => .cond (c.rename f) (a.rename f) (b.rename f)
+  | .col c => .col c
 
 mutual
   def Expr.rename (f : Var → Var) : Expr → Expr
@@ -256,6 +317,9 @@ def Stmt.rename (f : Var → Var) : Stmt → Stmt
   | .while c b => .while (c.rename f) (b.rename f)
   | .ret e => .ret (e.map (Expr.rename f))
   | .call p args => .call p (args.map (Arg.rename f))
+  | .insert t cs rows => .insert t cs (rows.map (·.map (Expr.rename f)))
+  | .update t sets c => .update t (sets.map fun p => (p.1, p.2.rename f)) (c.map (Expr.rename f))
+  | .delete t c => .delete t (c.map (Expr.rename f))
 
 def Param.rename (f : Var → Var) (p : Param) : Param :=
   { p with name := f p.name, default := p.default.map (Expr.rename f) }
@@ -291,6 +355,9 @@ def Stmt.opFree : Stmt → Bool
   | .ret none => true
   | .ret (some e) => e.opFree
   | .call _ args => args.all Arg.opFree
+  | .insert _ _ rows => rows.all (·.all Expr.opFree)
+  | .update _ sets c => sets.all (·.2.opFree) && c.all Expr.opFree
+  | .delete _ c => c.all Expr.opFree
 
 def Param.opFree (p : Param) : Bool :=
   match p.default with
@@ -310,6 +377,9 @@ def Stmt.exprs : Stmt → List Expr
   | .ret none => []
   | .ret (some e) => [e]
   | .call _ args => args.filterMap fun | .val e => some e | .ref _ => none
+  | .insert _ _ rows => rows.flatten
+  | .update _ sets c => sets.map (·.2) ++ c.toList
+  | .delete _ c => c.toList
 
 /-- Every expression of a routine: parameter defaults and the body's. -/
 def Routine.exprs (r : Routine) : List Expr :=
@@ -319,7 +389,7 @@ def Routine.exprs (r : Routine) : List Expr :=
 arithmetic or negation (overflow, division by zero). Conservative: a
 literal divisor or a constant operand does not count as safe. -/
 def SExpr.mayRaise : SExpr → Bool
-  | .var _ | .int _ | .null => false
+  | .var _ | .int _ | .null | .col _ => false
   | .arith .. | .neg _ => true
   | .cmp _ a b | .and a b | .or a b | .coalesce a b => a.mayRaise || b.mayRaise
   | .not a | .isNull a _ => a.mayRaise
@@ -328,7 +398,7 @@ def SExpr.mayRaise : SExpr → Bool
 /-- The expression compares with `=` or `<>`, the comparisons T-SQL's
 `ANSI_NULLS OFF` changes. -/
 def SExpr.hasEqNe : SExpr → Bool
-  | .var _ | .int _ | .null => false
+  | .var _ | .int _ | .null | .col _ => false
   | .cmp o a b => o == .eq || o == .ne || a.hasEqNe || b.hasEqNe
   | .arith _ a b | .and a b | .or a b | .coalesce a b => a.hasEqNe || b.hasEqNe
   | .neg a | .not a | .isNull a _ => a.hasEqNe
@@ -343,5 +413,139 @@ def Expr.test (p : SExpr → Bool) : Expr → Bool
 def Routine.mayRaise (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.mayRaise)
 
 def Routine.hasEqNe (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasEqNe)
+
+/-! ## What a routine's data statements can do (C3a)
+
+These decide whether a confirmation is in the slice
+(`Sqldiff.Mirror.inC2a`) and which residual assumptions it carries
+(`Sqldiff.Mirror.residual`). All are conservative: `true` means "might". -/
+
+/-- The expression reads a column. -/
+def SExpr.hasCol : SExpr → Bool
+  | .var _ | .int _ | .null => false
+  | .col _ => true
+  | .arith _ a b | .cmp _ a b | .and a b | .or a b | .coalesce a b => a.hasCol || b.hasCol
+  | .neg a | .not a | .isNull a _ => a.hasCol
+  | .cond c a b => c.hasCol || a.hasCol || b.hasCol
+
+/-- A part of the expression that reads no column can raise. PostgreSQL
+plans a data statement of PL/pgSQL with the variables' values as
+constants and may fold such a part while planning, so it can raise even
+when no row is written (`Sqldiff.Mirror`, "Constant parts of a data
+statement"). For an expression without columns this is `mayRaise`. -/
+def SExpr.constRaise : SExpr → Bool
+  | .var _ | .int _ | .null | .col _ => false
+  | .arith _ a b => if a.hasCol || b.hasCol then a.constRaise || b.constRaise else true
+  | .neg a => if a.hasCol then a.constRaise else true
+  | .cmp _ a b | .and a b | .or a b | .coalesce a b => a.constRaise || b.constRaise
+  | .not a | .isNull a _ => a.constRaise
+  | .cond c a b => c.constRaise || a.constRaise || b.constRaise
+
+/-- The expression can raise; an uninterpreted operator counts. -/
+def Expr.raise (e : Expr) : Bool := Expr.test SExpr.mayRaise e
+
+/-- Column `c` of `t` is `NOT NULL` or a key column. -/
+def TableDef.requires (t : TableDef) (c : Col) : Bool :=
+  t.cols.any fun d => d.name == c && d.required
+
+/-- The value is never NULL on a row of `t` whose required columns are
+not NULL (a state that satisfies the catalog): an integer literal, a
+required column, arithmetic on such values (which may raise, but not give
+NULL), and `COALESCE`/`CASE` whose result is one of them. -/
+def SExpr.nonNull (t : TableDef) : SExpr → Bool
+  | .int _ => true
+  | .col c => t.requires c
+  | .arith _ a b => a.nonNull t && b.nonNull t
+  | .neg a => a.nonNull t
+  | .coalesce a b => a.nonNull t || b.nonNull t
+  | .cond _ a b => a.nonNull t && b.nonNull t
+  | _ => false
+
+def Expr.nonNull (t : TableDef) : Expr → Bool
+  | .sc s => s.nonNull t
+  | .op .. => false
+
+/-- The statement can violate a constraint (`NOT NULL`, primary key): an
+`INSERT` into a table with a required column, an `UPDATE` that sets one
+to a value that may be NULL (key columns are never set, `Sqldiff.Mirror`).
+-/
+def Stmt.violates : Stmt → Bool
+  | .insert t _ _ => t.cols.any ColDef.required
+  | .update t sets _ => sets.any fun p => t.requires p.1 && !p.2.nonNull t
+  | _ => false
+
+/-- The statement itself (not the statements inside it) can fail. -/
+def Stmt.failsHere : Stmt → Bool
+  | .assign _ e => e.raise
+  | .ret (some e) => e.raise
+  | .ite c .. => c.raise
+  | .while c _ => c.raise
+  | .call _ args => args.any fun | .val e => e.raise | .ref _ => false
+  | .insert t cs rows => (Stmt.insert t cs rows).violates || rows.flatten.any Expr.raise
+  | .update t sets c =>
+    (Stmt.update t sets c).violates || sets.any (fun p => p.2.raise) || c.any Expr.raise
+  | .delete _ c => c.any Expr.raise
+  | _ => false
+
+/-- Some statement of `s` can fail. -/
+def Stmt.mayFail : Stmt → Bool
+  | .seq s t => s.mayFail || t.mayFail
+  | .ite c a b => c.raise || a.mayFail || b.mayFail
+  | .while c b => c.raise || b.mayFail
+  | s => s.failsHere
+
+/-- `s` may write: a data statement, or a call (the callee may write). -/
+def Stmt.hasWrite : Stmt → Bool
+  | .insert .. | .update .. | .delete .. | .call .. => true
+  | .seq s t | .ite _ s t => s.hasWrite || t.hasWrite
+  | .while _ b => b.hasWrite
+  | _ => false
+
+/-- `s` has a data statement. -/
+def Stmt.hasData : Stmt → Bool
+  | .insert .. | .update .. | .delete .. => true
+  | .seq s t | .ite _ s t => s.hasData || t.hasData
+  | .while _ b => b.hasData
+  | _ => false
+
+/-- Some statement of `s` can fail after a write has happened; `w` says
+whether one may have happened before `s`. A failing statement undoes its
+own effect, so a data statement that fails counts only after an earlier
+write. -/
+def Stmt.errAfterWrite (w : Bool) : Stmt → Bool
+  | .seq s t => s.errAfterWrite w || t.errAfterWrite (w || s.hasWrite)
+  | .ite c a b => (w && c.raise) || a.errAfterWrite w || b.errAfterWrite w
+  | .while c b =>
+    let w' := w || b.hasWrite
+    (w' && c.raise) || b.errAfterWrite w'
+  | s => w && s.failsHere
+
+/-- The data statements are in the C3a slice (`Sqldiff.Mirror`, "The C3a
+slice: data statements"): a `WHERE` cannot raise; a statement cannot fail
+both with an arithmetic error and with a constraint violation (which of
+the two it reports then depends on the order rows are processed in,
+which neither vendor fixes); no part of an `UPDATE`'s values that reads no
+column can raise (`SExpr.constRaise`). -/
+def Stmt.dmlSafe : Stmt → Bool
+  | .insert t cs rows =>
+    !((Stmt.insert t cs rows).violates && rows.flatten.any Expr.raise)
+  | .update t sets c =>
+    !(c.any Expr.raise) && !(sets.any fun p => Expr.test SExpr.constRaise p.2) &&
+      !((Stmt.update t sets c).violates && sets.any fun p => p.2.raise)
+  | .delete _ c => !(c.any Expr.raise)
+  | .seq s t | .ite _ s t => s.dmlSafe && t.dmlSafe
+  | .while _ b => b.dmlSafe
+  | _ => true
+
+/-- Some run of the routine might fail: an expression can raise, or a
+data statement can violate a constraint. -/
+def Routine.mayFail (r : Routine) : Bool :=
+  r.params.any (fun p => p.default.any Expr.raise) || r.body.mayFail
+
+def Routine.errAfterWrite (r : Routine) : Bool := r.body.errAfterWrite false
+
+def Routine.hasData (r : Routine) : Bool := r.body.hasData
+
+def Routine.dmlSafe (r : Routine) : Bool := r.body.dmlSafe
 
 end Sqldiff.Core

@@ -25,6 +25,9 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .ret none, _, _ => rfl
   | _ + 1, .ret (some _), _, _ => rfl
   | _ + 1, .call .., _, _ => rfl
+  | _ + 1, .insert .., _, _ => rfl
+  | _ + 1, .update .., _, _ => rfl
+  | _ + 1, .delete .., _, _ => rfl
   | n + 1, .seq s t, st, h => by
     have e1 : exec es wm (n + 1 + 1) (.seq s t) st =
         match exec es wm (n + 1) s st with
@@ -50,16 +53,16 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
       simp [Outcome.finished] at h
   | n + 1, .ite c s t, st, h => by
     have e1 : exec es wm (n + 1 + 1) (.ite c s t) st =
-        match c.eval es st.store with
+        match c.eval es st.store nullStore with
         | .err k => .error k st
         | .ok v => if isTrue v then exec es wm (n + 1) s st else exec es wm (n + 1) t st := rfl
     have e2 : exec es wm (n + 1) (.ite c s t) st =
-        match c.eval es st.store with
+        match c.eval es st.store nullStore with
         | .err k => .error k st
         | .ok v => if isTrue v then exec es wm n s st else exec es wm n t st := rfl
     rw [e2] at h
     rw [e1, e2]
-    generalize c.eval es st.store = r at h ⊢
+    generalize c.eval es st.store nullStore = r at h ⊢
     cases r with
     | err k => rfl
     | ok v =>
@@ -69,7 +72,7 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
       · next hc => simp only [hc] at h; exact exec_succ es wm n t st h
   | n + 1, .while c b, st, h => by
     have e1 : exec es wm (n + 1 + 1) (.while c b) st =
-        match c.eval es st.store with
+        match c.eval es st.store nullStore with
         | .err k => .error k st
         | .ok v =>
           if isTrue v then
@@ -78,7 +81,7 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
             | o => o
           else .normal st := rfl
     have e2 : exec es wm (n + 1) (.while c b) st =
-        match c.eval es st.store with
+        match c.eval es st.store nullStore with
         | .err k => .error k st
         | .ok v =>
           if isTrue v then
@@ -88,7 +91,7 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
           else .normal st := rfl
     rw [e2] at h
     rw [e1, e2]
-    generalize c.eval es st.store = r at h ⊢
+    generalize c.eval es st.store nullStore = r at h ⊢
     cases r with
     | err k => rfl
     | ok v =>
@@ -128,8 +131,8 @@ theorem exec_mono (es : ExprSem U) (wm : WorldModel U W) (n : Nat) (s : Stmt)
 /-- A finished observation (a result or an error) stays the same with
 more fuel. -/
 theorem obs_mono (es : ExprSem U) (wm : WorldModel U W) (r : Routine) (args : List (Val U))
-    (w : W) (n : Nat) (h : ∀ w' cs, r.obs es wm args w n ≠ .pending w' cs) :
-    ∀ m, n ≤ m → r.obs es wm args w m = r.obs es wm args w n := by
+    (w : W) (db : Db U) (n : Nat) (h : ∀ w' cs, r.obs es wm args w db n ≠ .pending w' cs) :
+    ∀ m, n ≤ m → r.obs es wm args w db m = r.obs es wm args w db n := by
   intro m hm
   simp only [Routine.obs] at h ⊢
   cases hi : initStore es r.params args with
@@ -137,7 +140,7 @@ theorem obs_mono (es : ExprSem U) (wm : WorldModel U W) (r : Routine) (args : Li
   | ok σ =>
     rw [hi] at h
     dsimp only at h ⊢
-    have hfin : (exec es wm n r.body ⟨σ, w, []⟩).finished = true := by
+    have hfin : (exec es wm n r.body ⟨σ, w, db, []⟩).finished = true := by
       generalize exec es wm n r.body _ = o at h ⊢
       cases o <;> simp_all [observe, Outcome.finished]
     rw [exec_mono es wm n r.body _ hfin m hm]

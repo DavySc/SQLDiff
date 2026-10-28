@@ -4,10 +4,10 @@ the core can serve as the oracle for engine differential tests (decision 9
 in docs/verified-conversion.md), the observations a caller makes (decision
 1 in docs/verification-roadmap.md), and refinement.
 
-Read top to bottom: values and errors, what a slice expression means, what
-an uninterpreted operator and the world may do, the state, one step of the
-interpreter per statement, a routine's run, what a caller observes, and
-`Refines`.
+Read top to bottom: values and errors, what a slice expression means, the
+database (C3a), what an uninterpreted operator and the world may do, the
+state, the data statements, one step of the interpreter per statement, a
+routine's run, what a caller observes, and `Refines`.
 -/
 import Sqldiff.Core.Syntax
 
@@ -15,7 +15,7 @@ namespace Sqldiff.Core
 
 variable {U W : Type}
 
-/-! ## Values and errors (C2a) -/
+/-! ## Values and errors (C2a, C3a) -/
 
 /-- A value. `null` is SQL NULL, and also UNKNOWN, the third truth value:
 a three-valued boolean is `bool true`, `bool false` or `null`. `int` is a
@@ -30,30 +30,39 @@ inductive Val (U : Type) where
   | opaque (u : U)
 deriving DecidableEq, Repr
 
-/-- Why an expression fails. `overflow` is T-SQL error 8115 and
-PostgreSQL SQLSTATE 22003 ("integer out of range"); `divByZero` is T-SQL
-8134 and SQLSTATE 22012. `other` is raised by an uninterpreted operator. -/
+/-- Why an expression or a statement fails. `overflow` is T-SQL error
+8115 and PostgreSQL SQLSTATE 22003 ("integer out of range"); `divByZero`
+is T-SQL 8134 and SQLSTATE 22012. `constraint` is a data statement that
+would leave a NULL in a `NOT NULL` or key column (T-SQL 515, SQLSTATE
+23502) or two rows with one primary key (T-SQL 2627, SQLSTATE 23505).
+`other` is raised by an uninterpreted operator, or by a value of the
+wrong kind where the core needs an integer. -/
 inductive ErrKind where
   | overflow
   | divByZero
+  | constraint
   | other (code : String)
 deriving DecidableEq, Repr
 
 /-- What a caller can tell about an error across dialects (decision 1:
 the error kind of the semantic profiles, `[error_kinds]`). Overflow and
-division by zero are both `arithmetic`. That is also why the order in
-which the operands of one expression are evaluated, which neither vendor
-specifies, does not matter here: within the slice the only errors are
-arithmetic ones, and whether some error happens does not depend on the
-order. -/
+division by zero are both `arithmetic`; both constraint violations are
+`constraint`. That is also why the order in which the operands of one
+expression are evaluated, which neither vendor specifies, does not matter
+here: within one expression of the slice the only errors are arithmetic
+ones, and whether some error happens does not depend on the order. For
+a data statement, the slice asks that it cannot fail with both kinds
+(`Sqldiff.Core.Stmt.dmlSafe`). -/
 inductive ErrClass where
   | arithmetic
+  | constraint
   | other (code : String)
 deriving DecidableEq, Repr
 
 def ErrKind.cls : ErrKind → ErrClass
   | .overflow => .arithmetic
   | .divByZero => .arithmetic
+  | .constraint => .constraint
   | .other c => .other c
 
 /-- The result of evaluating an expression: a value (possibly NULL) or an
@@ -146,49 +155,94 @@ def not3 : Val U → Res U
   | .bool b => .ok (.bool !b)
   | _ => typeErr
 
-/-- `IF`, `WHILE` and `CASE WHEN` take their branch only on TRUE: FALSE
-and UNKNOWN (NULL) go to `ELSE` or leave the loop. -/
+/-- `IF`, `WHILE`, `CASE WHEN` and `WHERE` take their branch or keep their
+row only on TRUE: FALSE and UNKNOWN (NULL) go to `ELSE`, leave the loop or
+skip the row. -/
 def isTrue : Val U → Bool
   | .bool true => true
   | _ => false
 
-/-- Every variable name has a value; names never assigned are NULL. -/
+/-- Every variable name has a value; names never assigned are NULL. The
+same shape serves for the columns of the row a data statement is at
+(`rowStore`). -/
 abbrev Store (U : Type) := Var → Val U
 
 def Store.set (σ : Store U) (x : Var) (v : Val U) : Store U :=
   fun y => if y = x then v else σ y
 
-/-- The meaning of a slice expression in a store. It needs no parameter:
-this is the part of the core that does not depend on operators meaning the
-same "by name". `coalesce` and `cond` evaluate only the branch they
-take. -/
-def SExpr.eval (σ : Store U) : SExpr → Res U
+/-- The store where every variable is NULL; as a row, no columns. -/
+def nullStore : Store U := fun _ => .null
+
+/-- The meaning of a slice expression with variables `σ` and, inside a
+data statement, the current row's columns `ρ` (`nullStore` elsewhere). It
+needs no parameter: this is the part of the core that does not depend on
+operators meaning the same "by name". `coalesce` and `cond` evaluate only
+the branch they take. -/
+def SExpr.eval (σ ρ : Store U) : SExpr → Res U
   | .var x => .ok (σ x)
+  | .col c => .ok (ρ c)
   | .int n => .ok (.int n)
   | .null => .ok .null
-  | .arith o a b => bind2 (a.eval σ) (b.eval σ) (intOp2 (arithInt o))
-  | .neg a => match a.eval σ with
+  | .arith o a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (intOp2 (arithInt o))
+  | .neg a => match a.eval σ ρ with
     | .err k => .err k
     | .ok .null => .ok .null
     | .ok (.int x) => toInt32 (-x)
     | .ok _ => typeErr
-  | .cmp o a b => bind2 (a.eval σ) (b.eval σ) (intOp2 fun x y => .ok (.bool (cmpInt o x y)))
-  | .and a b => bind2 (a.eval σ) (b.eval σ) and3
-  | .or a b => bind2 (a.eval σ) (b.eval σ) or3
-  | .not a => match a.eval σ with
+  | .cmp o a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (intOp2 fun x y => .ok (.bool (cmpInt o x y)))
+  | .and a b => bind2 (a.eval σ ρ) (b.eval σ ρ) and3
+  | .or a b => bind2 (a.eval σ ρ) (b.eval σ ρ) or3
+  | .not a => match a.eval σ ρ with
     | .err k => .err k
     | .ok v => not3 v
-  | .isNull a isNot => match a.eval σ with
+  | .isNull a isNot => match a.eval σ ρ with
     | .err k => .err k
     | .ok .null => .ok (.bool !isNot)
     | .ok _ => .ok (.bool isNot)
-  | .coalesce a b => match a.eval σ with
+  | .coalesce a b => match a.eval σ ρ with
     | .err k => .err k
-    | .ok .null => b.eval σ
+    | .ok .null => b.eval σ ρ
     | .ok v => .ok v
-  | .cond c a b => match c.eval σ with
+  | .cond c a b => match c.eval σ ρ with
     | .err k => .err k
-    | .ok v => if isTrue v then a.eval σ else b.eval σ
+    | .ok v => if isTrue v then a.eval σ ρ else b.eval σ ρ
+
+/-! ## The database (C3a)
+
+A table is a list of rows; a row lists one value per column of the
+table's definition (`TableDef.cols`), in that order. The database names
+each table's rows.
+
+**Lists, observed as bags.** The engines keep a table as a bag: neither
+promises an order of rows. The core keeps a list because its statements
+then have one result and its equality is decidable, and every statement
+treats the list as a bag would: `insert` appends, `update` maps each row
+on its own, `delete` filters; which rows are written, and whether a
+statement fails, never depends on the order. The one thing that would,
+which error a statement reports when two rows fail with different kinds,
+is kept out of the slice (`Stmt.dmlSafe`). So two runs from one start
+give equal lists exactly when a permutation-blind reading gives equal
+bags, and a confirmation's "equal lists" claims no more than "equal
+bags" about the engines. -/
+
+/-- A row: one value per column of its table, in the table's order. -/
+abbrev Row (U : Type) := List (Val U)
+
+/-- The database: each table's name and rows. A table it does not list
+has no rows. -/
+abbrev Db (U : Type) := List (String × List (Row U))
+
+/-- The rows of table `t` (the first entry wins). -/
+def Db.get (db : Db U) (t : String) : List (Row U) :=
+  match db.find? (·.1 == t) with
+  | some p => p.2
+  | none => []
+
+/-- Table `t` with rows `rs`, in place when the database lists it, else
+added at the end. -/
+def Db.set (db : Db U) (t : String) (rs : List (Row U)) : Db U :=
+  if db.any (·.1 == t) then db.map fun p => if p.1 == t then (t, rs) else p
+  else db ++ [(t, rs)]
 
 /-! ## Parameters of the semantics
 
@@ -203,13 +257,14 @@ structure ExprSem (U : Type) where
   op : String → List (Res U) → Res U
 
 /-- The routines a call reaches, as the world runs them: given the callee's
-name, the argument values and the world state, the new world state and
-one value per argument position (the parameter's value when the callee
-ended; the caller keeps those in `ref` positions only). The world is the
-environment of decision 1: chosen once, the same for both sides. A call
-does not fail (errors from callees are C4). -/
+name, the argument values, the world state and the database, the new world
+state and database, and one value per argument position (the parameter's
+value when the callee ended; the caller keeps those in `ref` positions
+only). The world is the environment of decision 1: chosen once, the same
+for both sides. A callee may read and write the database. A call does not
+fail (errors from callees are C4). -/
 structure WorldModel (U W : Type) where
-  call : String → List (Val U) → W → W × List (Val U)
+  call : String → List (Val U) → W → Db U → W × Db U × List (Val U)
 
 /-! ## State -/
 
@@ -222,13 +277,16 @@ deriving DecidableEq, Repr
 structure State (U W : Type) where
   store : Store U
   world : W
+  db : Db U
   calls : List (CallEvent U)
 
 /-- How a statement ends. `error` ends the routine: there are no handlers
 yet (T-SQL `TRY`/`CATCH` and PL/pgSQL `EXCEPTION` are C4), and a T-SQL
 routine is in the spec with errors only when it aborts on them
-(`Sqldiff.Mirror.abortsT`). `outOfFuel` keeps the state reached, so the
-calls made before the fuel ran out stay observable. -/
+(`Sqldiff.Mirror.abortsT`). The state of an `error` is the state before
+the failing statement: a statement that fails has no effect (statement
+atomicity, `Sqldiff.Core.exec_error_atomic`). `outOfFuel` keeps the state
+reached, so the calls made before the fuel ran out stay observable. -/
 inductive Outcome (U W : Type) where
   | normal (s : State U W)
   | returned (v : Option (Val U)) (s : State U W)
@@ -238,17 +296,18 @@ inductive Outcome (U W : Type) where
 /-! ## Expressions and calls -/
 
 mutual
-  def Expr.eval (es : ExprSem U) (σ : Store U) : Expr → Res U
-    | .sc s => s.eval σ
-    | .op f args => es.op f (Expr.evalList es σ args)
+  def Expr.eval (es : ExprSem U) (σ ρ : Store U) : Expr → Res U
+    | .sc s => s.eval σ ρ
+    | .op f args => es.op f (Expr.evalList es σ ρ args)
 
-  def Expr.evalList (es : ExprSem U) (σ : Store U) : List Expr → List (Res U)
+  def Expr.evalList (es : ExprSem U) (σ ρ : Store U) : List Expr → List (Res U)
     | [] => []
-    | e :: es' => e.eval es σ :: Expr.evalList es σ es'
+    | e :: es' => e.eval es σ ρ :: Expr.evalList es σ ρ es'
 end
 
+/-- An argument of a call; no columns are in scope. -/
 def Arg.eval (es : ExprSem U) (σ : Store U) : Arg → Res U
-  | .val e => e.eval es σ
+  | .val e => e.eval es σ nullStore
   | .ref x => .ok (σ x)
 
 /-- The arguments of a call, left to right; the first error wins and no
@@ -268,6 +327,119 @@ def Store.setRefs (σ : Store U) : List Arg → List (Val U) → Store U
   | .val _ :: as, _ :: vs => Store.setRefs σ as vs
   | _, _ => σ
 
+/-! ## The data statements (C3a)
+
+Each takes `ev`, how an expression evaluates given the current row's
+columns (the variables are fixed for the whole statement: a statement
+does not assign variables), and gives the table's new rows or the first
+error. The vendor rules are on the lowering (`Sqldiff.Mirror`, "The C3a
+slice: data statements"). Rows are processed in list order and the first
+error wins; within the slice, which row fails first is not observable
+(`ErrClass`, `Stmt.dmlSafe`). -/
+
+/-- The values of `es`, left to right; the first error wins. -/
+def evalVals (ev : Store U → Expr → Res U) (ρ : Store U) :
+    List Expr → Except ErrKind (List (Val U))
+  | [] => .ok []
+  | e :: es => match ev ρ e with
+    | .err k => .error k
+    | .ok v => match evalVals ev ρ es with
+      | .error k => .error k
+      | .ok vs => .ok (v :: vs)
+
+/-- A `WHERE` condition: the row is kept only when it is TRUE; no
+condition keeps every row. -/
+def keeps (ev : Store U → Expr → Res U) (ρ : Store U) : Option Expr → Except ErrKind Bool
+  | none => .ok true
+  | some p => match ev ρ p with
+    | .err k => .error k
+    | .ok v => .ok (isTrue v)
+
+/-- A row's columns as a store: column `c` is the row's value in `c`'s
+position (the first column of that name), NULL for a name that is not a
+column. -/
+def rowStore : List ColDef → Row U → Store U
+  | d :: ds, v :: vs => fun c => if c = d.name then v else rowStore ds vs c
+  | _, _ => nullStore
+
+/-- The value given to column `c` by a list of columns and their values
+(the first entry wins). -/
+def pick (cs : List Col) (vs : List (Val U)) (c : Col) : Option (Val U) :=
+  match cs, vs with
+  | c' :: cs, v :: vs => if c' = c then some v else pick cs vs c
+  | _, _ => none
+
+def isNullV : Val U → Bool
+  | .null => true
+  | _ => false
+
+/-- No required column (`NOT NULL` or key) of the row is NULL. -/
+def rowOk (t : List ColDef) (r : Row U) : Bool :=
+  (t.zip r).all fun p => !(p.1.required && isNullV p.2)
+
+def keyVal : Val U → Option Int
+  | .int i => some i
+  | _ => none
+
+/-- The row's primary key, `none` when a key value is not an integer. -/
+def keyOf (t : List ColDef) (r : Row U) : Option (List Int) :=
+  ((t.zip r).filter (·.1.key)).mapM fun p => keyVal p.2
+
+/-- `INSERT INTO t (cs) VALUES ...`: each row's values, left to right, with
+no columns in scope; the new row has them in the listed columns and NULL
+in the others; a NULL in a required column, or a key that a row already
+in the table (or inserted before it by this statement) has, is a
+constraint violation. `acc` is the table so far; new rows go at the end. -/
+def insertRows (ev : Store U → Expr → Res U) (t : TableDef) (cs : List Col) :
+    List (List Expr) → List (Row U) → Except ErrKind (List (Row U))
+  | [], acc => .ok acc
+  | es :: ess, acc => match evalVals ev nullStore es with
+    | .error k => .error k
+    | .ok vs =>
+      let r := t.cols.map fun d => (pick cs vs d.name).getD .null
+      if !rowOk t.cols r then .error .constraint
+      else if !t.hasKey then insertRows ev t cs ess (acc ++ [r])
+      else match keyOf t.cols r with
+        | none => .error (.other "type")
+        | some k =>
+          if acc.any (fun r' => keyOf t.cols r' == some k) then .error .constraint
+          else insertRows ev t cs ess (acc ++ [r])
+
+/-- One row of `UPDATE t SET c1 = e1, ...`: every `ei` on the row's old
+values, then each `ci` takes its value; a NULL in a required column is a
+constraint violation. Key columns are never set (`Sqldiff.Mirror`), so no
+key check is needed. -/
+def updRow (ev : Store U → Expr → Res U) (t : TableDef) (sets : List (Col × Expr)) (r : Row U) :
+    Except ErrKind (Row U) :=
+  match evalVals ev (rowStore t.cols r) (sets.map (·.2)) with
+  | .error k => .error k
+  | .ok vs =>
+    let r' := (t.cols.zip r).map fun p => (pick (sets.map (·.1)) vs p.1.name).getD p.2
+    if rowOk t.cols r' then .ok r' else .error .constraint
+
+/-- `UPDATE t SET ... [WHERE c]`, row by row. -/
+def updateRows (ev : Store U → Expr → Res U) (t : TableDef) (sets : List (Col × Expr))
+    (c : Option Expr) : List (Row U) → Except ErrKind (List (Row U))
+  | [] => .ok []
+  | r :: rs => match keeps ev (rowStore t.cols r) c with
+    | .error k => .error k
+    | .ok b =>
+      match (if b then updRow ev t sets r else .ok r) with
+      | .error k => .error k
+      | .ok r' => match updateRows ev t sets c rs with
+        | .error k => .error k
+        | .ok rs' => .ok (r' :: rs')
+
+/-- `DELETE FROM t [WHERE c]`, row by row. -/
+def deleteRows (ev : Store U → Expr → Res U) (t : TableDef) (c : Option Expr) :
+    List (Row U) → Except ErrKind (List (Row U))
+  | [] => .ok []
+  | r :: rs => match keeps ev (rowStore t.cols r) c with
+    | .error k => .error k
+    | .ok b => match deleteRows ev t c rs with
+      | .error k => .error k
+      | .ok rs' => .ok (if b then rs' else r :: rs')
+
 /-! ## The interpreter
 
 `exec es wm n s st` runs statement `s` from state `st` with fuel `n`. Fuel
@@ -279,22 +451,23 @@ of fuel for every `n`. Fuel is never an observation of its own: `Refines`
 quantifies over it. A `return` or an error ends the routine: it
 propagates out of every enclosing `seq` and `while` without running
 anything else. A statement whose expression fails changes nothing: the
-error keeps the state from before it. -/
+error keeps the state from before it; so does a data statement that fails
+on any row (statement atomicity). -/
 
 def exec (es : ExprSem U) (wm : WorldModel U W) : Nat → Stmt → State U W → Outcome U W
   | 0, _, st => .outOfFuel st
   | _ + 1, .skip, st => .normal st
-  | _ + 1, .assign x e, st => match e.eval es st.store with
+  | _ + 1, .assign x e, st => match e.eval es st.store nullStore with
     | .err k => .error k st
     | .ok v => .normal { st with store := st.store.set x v }
   | n + 1, .seq s t, st =>
     match exec es wm n s st with
     | .normal st' => exec es wm n t st'
     | o => o
-  | n + 1, .ite c s t, st => match c.eval es st.store with
+  | n + 1, .ite c s t, st => match c.eval es st.store nullStore with
     | .err k => .error k st
     | .ok v => if isTrue v then exec es wm n s st else exec es wm n t st
-  | n + 1, .while c b, st => match c.eval es st.store with
+  | n + 1, .while c b, st => match c.eval es st.store nullStore with
     | .err k => .error k st
     | .ok v =>
       if isTrue v then
@@ -303,19 +476,29 @@ def exec (es : ExprSem U) (wm : WorldModel U W) : Nat → Stmt → State U W →
         | o => o
       else .normal st
   | _ + 1, .ret none, st => .returned none st
-  | _ + 1, .ret (some e), st => match e.eval es st.store with
+  | _ + 1, .ret (some e), st => match e.eval es st.store nullStore with
     | .err k => .error k st
     | .ok v => .returned (some v) st
   | _ + 1, .call p args, st => match Arg.evalAll es st.store args with
     | .error k => .error k st
     | .ok vs =>
-      let (w', rs) := wm.call p vs st.world
-      .normal { store := st.store.setRefs args rs, world := w', calls := st.calls ++ [⟨p, vs⟩] }
+      let (w', db', rs) := wm.call p vs st.world st.db
+      .normal { store := st.store.setRefs args rs, world := w', db := db',
+                calls := st.calls ++ [⟨p, vs⟩] }
+  | _ + 1, .insert t cs rows, st =>
+    match insertRows (fun ρ e => e.eval es st.store ρ) t cs rows (st.db.get t.name) with
+    | .error k => .error k st
+    | .ok rs => .normal { st with db := st.db.set t.name rs }
+  | _ + 1, .update t sets c, st =>
+    match updateRows (fun ρ e => e.eval es st.store ρ) t sets c (st.db.get t.name) with
+    | .error k => .error k st
+    | .ok rs => .normal { st with db := st.db.set t.name rs }
+  | _ + 1, .delete t c, st =>
+    match deleteRows (fun ρ e => e.eval es st.store ρ) t c (st.db.get t.name) with
+    | .error k => .error k st
+    | .ok rs => .normal { st with db := st.db.set t.name rs }
 
 /-! ## A routine's run and what a caller observes (decision 1) -/
-
-/-- The store where every variable is NULL. -/
-def nullStore : Store U := fun _ => .null
 
 /-- The value a parameter starts with: NULL for `out`; otherwise the
 argument, or when the caller passed none, the default evaluated with every
@@ -327,7 +510,7 @@ def paramValue (es : ExprSem U) (p : Param) (arg : Option (Val U)) : Res U :=
   | .out, _ => .ok .null
   | _, some v => .ok v
   | _, none => match p.default with
-    | some e => e.eval es nullStore
+    | some e => e.eval es nullStore nullStore
     | none => .ok .null
 
 /-- The store on entry: arguments bound to parameters by position; every
@@ -352,43 +535,60 @@ def outVals (σ : Store U) : List Param → List (Val U)
   | [] => []
   | p :: ps => if p.mode = .inp then outVals σ ps else σ p.name :: outVals σ ps
 
-/-- An observation. `done` is a finished run: out parameters, the returned
-value (`none` for `RETURN` without a value and for falling off the end),
-the world afterwards and every call made. `failed` is a run that ended
-with an error: its kind as decision 1 compares it across dialects, the
-world and the calls made before it; out parameters and the returned value
-do not reach a caller whose call failed. `pending` is a run cut off by
-fuel: the world and the calls so far, which the world has already seen. -/
+/-- An observation.
+
+* `done` is a finished run: out parameters, the returned value (`none`
+  for `RETURN` without a value and for falling off the end), the world and
+  the database afterwards (decision 1: tables as bags, see "The database"
+  above), and every call made.
+* `failed` is a run that ended with an error: its kind as decision 1
+  compares it across dialects, and the calls made before it. Neither the
+  world nor the database after a failed call is observed: what a caller
+  sees of them depends on its transaction and on each dialect's rollback
+  (T-SQL under `XACT_ABORT ON` without an open transaction keeps the
+  statements before the failing one, PostgreSQL rolls the whole call back),
+  which is phase C4. A confirmation of a routine that can fail after a
+  write says so (`Sqldiff.Mirror.residual`, `ASM-STATE-AFTER-ERROR`).
+  Out parameters and the returned value do not reach a caller whose call
+  failed.
+* `pending` is a run cut off by fuel: the world and the calls so far,
+  which the world has already seen; the database of a run that has not
+  ended is not observed (one session, decision 1). -/
 inductive Obs (U W : Type) where
-  | done (outs : List (Val U)) (ret : Option (Val U)) (world : W) (calls : List (CallEvent U))
-  | failed (k : ErrClass) (world : W) (calls : List (CallEvent U))
+  | done (outs : List (Val U)) (ret : Option (Val U)) (world : W) (db : Db U)
+      (calls : List (CallEvent U))
+  | failed (k : ErrClass) (calls : List (CallEvent U))
   | pending (world : W) (calls : List (CallEvent U))
 deriving DecidableEq, Repr
 
 def observe (r : Routine) : Outcome U W → Obs U W
-  | .normal st => .done (outVals st.store r.params) none st.world st.calls
-  | .returned v st => .done (outVals st.store r.params) v st.world st.calls
-  | .error k st => .failed k.cls st.world st.calls
+  | .normal st => .done (outVals st.store r.params) none st.world st.db st.calls
+  | .returned v st => .done (outVals st.store r.params) v st.world st.db st.calls
+  | .error k st => .failed k.cls st.calls
   | .outOfFuel st => .pending st.world st.calls
 
-/-- The observation of running `r` on `args` in world `w` with fuel `n`. -/
+/-- The observation of running `r` on `args` in world `w` and database
+`db` with fuel `n`. -/
 def Routine.obs (es : ExprSem U) (wm : WorldModel U W) (r : Routine) (args : List (Val U)) (w : W)
-    (n : Nat) : Obs U W :=
+    (db : Db U) (n : Nat) : Obs U W :=
   match initStore es r.params args with
-  | .error k => .failed k.cls w []
-  | .ok σ => observe r (exec es wm n r.body ⟨σ, w, []⟩)
+  | .error k => .failed k.cls []
+  | .ok σ => observe r (exec es wm n r.body ⟨σ, w, db, []⟩)
 
 /-- `r` does not terminate: every amount of fuel runs out. -/
-def Diverges (es : ExprSem U) (wm : WorldModel U W) (r : Routine) (args : List (Val U)) (w : W) :
-    Prop :=
-  ∀ n, ∃ w' cs, r.obs es wm args w n = .pending w' cs
+def Diverges (es : ExprSem U) (wm : WorldModel U W) (r : Routine) (args : List (Val U)) (w : W)
+    (db : Db U) : Prop :=
+  ∀ n, ∃ w' cs, r.obs es wm args w db n = .pending w' cs
 
 /-! ## Refinement (decision 1)
 
 `a` is the reference (the source), `b` the candidate (the conversion).
-The environment, here the arguments and the world, is chosen once and
-shared: the value correspondence is the identity, since both sides are
-lowered into the same core values, and observations are positional, so
+The environment, here the arguments, the world and the database, is
+chosen once and shared: the value correspondence is the identity, since
+both sides are lowered into the same core values; the state
+correspondence is the identity too, since both sides name the target
+catalog's tables and columns (the lowering maps T-SQL names to them,
+`Sqldiff.Mirror.Deployment.tables`); and observations are positional, so
 the variable correspondence between the sides is not part of the
 statement (it is how `check` proves it, `Sqldiff.Core.Rename`).
 
@@ -408,8 +608,8 @@ depend on the fuel used to find it. The run is never empty, as decision 1
 requires: each fuel gives an observation, and either some fuel finishes
 or the run diverges. -/
 def Refines (es : ExprSem U) (wm : WorldModel U W) (a b : Routine) : Prop :=
-  ∀ (args : List (Val U)) (w : W),
-    (∀ n, ∃ m, b.obs es wm args w n = a.obs es wm args w m) ∧
-    (Diverges es wm b args w → Diverges es wm a args w)
+  ∀ (args : List (Val U)) (w : W) (db : Db U),
+    (∀ n, ∃ m, b.obs es wm args w db n = a.obs es wm args w db m) ∧
+    (Diverges es wm b args w db → Diverges es wm a args w db)
 
 end Sqldiff.Core

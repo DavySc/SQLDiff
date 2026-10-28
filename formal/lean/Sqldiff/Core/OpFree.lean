@@ -6,14 +6,14 @@ C1 premise that an operator name means the same function in both
 dialects: in such a routine every expression is a slice expression
 (`SExpr`), whose meaning the core fixes.
 -/
-import Sqldiff.Core.Semantics
+import Sqldiff.Core.Data
 
 namespace Sqldiff.Core
 
 variable {U W : Type}
 
-theorem Expr.eval_opFree (es es' : ExprSem U) (σ : Store U) :
-    ∀ e : Expr, e.opFree = true → e.eval es σ = e.eval es' σ
+theorem Expr.eval_opFree (es es' : ExprSem U) (σ ρ : Store U) :
+    ∀ e : Expr, e.opFree = true → e.eval es σ ρ = e.eval es' σ ρ
   | .sc _, _ => rfl
   | .op .., h => by simp [Expr.opFree] at h
 
@@ -25,7 +25,7 @@ theorem Arg.evalAll_opFree (es es' : ExprSem U) (σ : Store U) :
     simp only [List.all_cons, Bool.and_eq_true] at h
     have ha : a.eval es σ = a.eval es' σ := by
       cases a with
-      | val e => exact Expr.eval_opFree es es' σ e h.1
+      | val e => exact Expr.eval_opFree es es' σ nullStore e h.1
       | ref _ => rfl
     simp only [Arg.evalAll, ha, Arg.evalAll_opFree es es' σ as h.2]
 
@@ -35,7 +35,7 @@ theorem exec_opFree (es es' : ExprSem U) (wm : WorldModel U W) :
   | 0, _, _, _ => rfl
   | _ + 1, .skip, _, _ => rfl
   | _ + 1, .assign _ e, st, h => by
-    simp only [exec, Expr.eval_opFree es es' st.store e h]
+    simp only [exec, Expr.eval_opFree es es' st.store nullStore e h]
   | n + 1, .seq s t, st, h => by
     simp only [Stmt.opFree, Bool.and_eq_true] at h
     simp only [exec, exec_opFree es es' wm n s st h.1]
@@ -44,13 +44,13 @@ theorem exec_opFree (es es' : ExprSem U) (wm : WorldModel U W) :
     | _ => rfl
   | n + 1, .ite c s t, st, h => by
     simp only [Stmt.opFree, Bool.and_eq_true] at h
-    simp only [exec, Expr.eval_opFree es es' st.store c h.1.1, exec_opFree es es' wm n s st h.1.2,
+    simp only [exec, Expr.eval_opFree es es' st.store nullStore c h.1.1, exec_opFree es es' wm n s st h.1.2,
       exec_opFree es es' wm n t st h.2]
   | n + 1, .while c b, st, h => by
     have h' := h
     simp only [Stmt.opFree, Bool.and_eq_true] at h'
-    simp only [exec, Expr.eval_opFree es es' st.store c h'.1, exec_opFree es es' wm n b st h'.2]
-    cases c.eval es' st.store with
+    simp only [exec, Expr.eval_opFree es es' st.store nullStore c h'.1, exec_opFree es es' wm n b st h'.2]
+    cases c.eval es' st.store nullStore with
     | err _ => rfl
     | ok v =>
       dsimp only
@@ -61,9 +61,34 @@ theorem exec_opFree (es es' : ExprSem U) (wm : WorldModel U W) :
       · rfl
   | _ + 1, .ret none, _, _ => rfl
   | _ + 1, .ret (some e), st, h => by
-    simp only [exec, Expr.eval_opFree es es' st.store e h]
+    simp only [exec, Expr.eval_opFree es es' st.store nullStore e h]
   | _ + 1, .call _ args, st, h => by
     simp only [exec, Arg.evalAll_opFree es es' st.store args h]
+  | _ + 1, .insert t cs rows, st, h => by
+    have := insertRows_map (ev := fun ρ e => e.eval es st.store ρ)
+      (ev' := fun ρ e => e.eval es' st.store ρ) (g := fun e => e) t cs rows (st.db.get t.name)
+      (fun xs hxs e he ρ => (Expr.eval_opFree es es' st.store ρ e (by
+        simp only [Stmt.opFree, List.all_eq_true] at h
+        exact h xs hxs e he)).symm)
+    simp only [List.map_id'] at this
+    simp only [exec, this]
+  | _ + 1, .update t sets c, st, h => by
+    simp only [Stmt.opFree, Bool.and_eq_true, List.all_eq_true] at h
+    have := updateRows_map (ev := fun ρ e => e.eval es st.store ρ)
+      (ev' := fun ρ e => e.eval es' st.store ρ) (g := fun e => e) t sets c
+      (fun p hp ρ => (Expr.eval_opFree es es' st.store ρ p.2 (h.1 p hp)).symm)
+      (fun e he ρ => (Expr.eval_opFree es es' st.store ρ e (by subst he; simpa using h.2)).symm)
+      (st.db.get t.name)
+    simp only [List.map_id', Option.map_id'] at this
+    simp only [exec, this]
+  | _ + 1, .delete t c, st, h => by
+    simp only [Stmt.opFree] at h
+    have := deleteRows_map (ev := fun ρ e => e.eval es st.store ρ)
+      (ev' := fun ρ e => e.eval es' st.store ρ) (g := fun e => e) t c
+      (fun e he ρ => (Expr.eval_opFree es es' st.store ρ e (by subst he; simpa using h)).symm)
+      (st.db.get t.name)
+    simp only [Option.map_id'] at this
+    simp only [exec, this]
 
 theorem bindParams_opFree (es es' : ExprSem U) :
     ∀ (ps : List Param) (vs : List (Val U)) (σ : Store U), ps.all Param.opFree = true →
@@ -76,7 +101,7 @@ theorem bindParams_opFree (es es' : ExprSem U) :
       cases p with
       | mk x m d =>
         cases m <;> cases arg <;> cases d <;> simp only [paramValue]
-        all_goals first | rfl | exact Expr.eval_opFree es es' _ _ h.1
+        all_goals first | rfl | exact Expr.eval_opFree es es' _ _ _ h.1
     cases vs with
     | nil =>
       simp only [bindParams, hp none]
@@ -92,8 +117,8 @@ theorem bindParams_opFree (es es' : ExprSem U) :
 /-- A routine without uninterpreted operators gives the same observation
 whatever they mean. -/
 theorem Routine.obs_opFree (es es' : ExprSem U) (wm : WorldModel U W) (r : Routine)
-    (h : r.opFree = true) (args : List (Val U)) (w : W) (n : Nat) :
-    r.obs es wm args w n = r.obs es' wm args w n := by
+    (h : r.opFree = true) (args : List (Val U)) (w : W) (db : Db U) (n : Nat) :
+    r.obs es wm args w db n = r.obs es' wm args w db n := by
   simp only [Routine.opFree, Bool.and_eq_true] at h
   simp only [Routine.obs, initStore, bindParams_opFree es es' r.params args nullStore h.1]
   cases bindParams es' r.params args nullStore with

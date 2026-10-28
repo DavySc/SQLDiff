@@ -10,14 +10,37 @@ string in lower-case hex, two digits per byte:
   DEPLOYMENT  R or R,PAIR,PAIR,...   R is 1 when row counts are observed, else 0;
                                      PAIR is NAME:NAME, a T-SQL routine name
                                      (`.`-joined) and its target routine
-  CATALOG     - or ENTRY,ENTRY,...   ENTRY is NAME:MODES, a target routine (folded
-                                     as `Sqldiff.Mirror.pgName` folds) and one
+              then optionally        (C3a) `;` and TPAIR,TPAIR,...: TPAIR is
+                                     NAME:NAME, a T-SQL table name (`.`-joined
+                                     as written, `dbo.t`) and its target table
+                                     (a catalog TABLE name)
+  CATALOG     - or ENTRY,ENTRY,...   ENTRY is a routine or (C3a) a table:
+                ROUTINE NAME:MODES   a target routine (folded as
+                                     `Sqldiff.Mirror.pgName` folds) and one
                                      letter per parameter: i IN, o OUT, b INOUT
+                TABLE NAME=COL/COL/... a target table (folded, `.`-joined as
+                                     the PL/pgSQL code names it) and its
+                                     columns in declaration order, at least one
+                COL NAME.SPEC or NAME.SPEC.NAME
+                                     the column (folded), its type and
+                                     constraints, and optionally its spelling
+                                     in the T-SQL table (default: the folded
+                                     name without a leading `"`)
+                SPEC i, in, ik or ink  i: the type, `int`/`integer` (the only
+                                     one so far); n: NOT NULL; k: a column of
+                                     the primary key (NOT NULL in any case)
   CERT        - or PAIR,PAIR,...     PAIR is NAME:NAME, a T-SQL variable and its
                                      PL/pgSQL name
 
+A request without `;` in DEPLOYMENT and without TABLE entries is a C1/C2a
+request as before; its routines cannot have data statements in the spec.
+A TABLE entry asserts every fact `Sqldiff.Mirror.CatTable` lists (no
+other constraint, default, trigger, ...): the Rust side sends a table only
+when the catalogs show all of them.
+
 The answer: `check`, plus the fields `extra` adds to a confirmed answer
-(`"scalars"`, and `"residual"` for a C2a answer; see `Main.lean`).
+(`"scalars"`, `"residual"` for a C2a answer, and `"statements"`; see
+`Main.lean`).
 -/
 import Sqldiff.Ast
 import Sqldiff.Mirror.Check
@@ -59,21 +82,60 @@ def mode? : Char → Option Ast.Mode
   | 'b' => some .InOut
   | _ => none
 
-def deployment? (s : String) : Option Deployment :=
-  match s.splitOn "," with
+def deployment? (s : String) : Option Deployment := do
+  let (main, tables) ← match s.splitOn ";" with
+    | [m] => some (m, [])
+    | [m, t] => (t.splitOn ",").mapM pair? |>.map (m, ·)
+    | _ => none
+  match main.splitOn "," with
   | r :: ps => do
     let rc ← match r with
       | "0" => some false
       | "1" => some true
       | _ => none
     let routines ← ps.mapM pair?
-    pure { rowCounts := rc, routines }
+    pure { rowCounts := rc, routines, tables }
   | [] => none
 
-def catalog? (s : String) : Option Catalog :=
-  items? s fun e => match e.splitOn ":" with
-    | [n, ms] => do pure (← name? n, ← ms.toList.mapM mode?)
+/-- A column's type and constraints: `(notNull, key)`. -/
+def spec? : String → Option (Bool × Bool)
+  | "i" => some (false, false)
+  | "in" => some (true, false)
+  | "ik" => some (false, true)
+  | "ink" => some (true, true)
+  | _ => none
+
+def col? (s : String) : Option CatCol := do
+  let (n, sp, t) ← match s.splitOn "." with
+    | [n, sp] => some (n, sp, none)
+    | [n, sp, t] => some (n, sp, some t)
     | _ => none
+  let name ← name? n
+  let (notNull, key) ← spec? sp
+  let tsql ← match t with
+    | some t => name? t
+    | none => some (if name.startsWith "\"" then String.ofList (name.toList.drop 1) else name)
+  pure { name, tsql, notNull, key }
+
+/-- A catalog entry: a routine, or a table. -/
+inductive Entry where
+  | routine (n : String) (modes : List Ast.Mode)
+  | table (t : CatTable)
+
+def entry? (e : String) : Option Entry :=
+  match e.splitOn "=" with
+  | [n, cs] => do
+    let cols ← (cs.splitOn "/").mapM col?
+    pure (.table { name := ← name? n, cols })
+  | [_] => match e.splitOn ":" with
+    | [n, ms] => do pure (.routine (← name? n) (← ms.toList.mapM mode?))
+    | _ => none
+  | _ => none
+
+def catalog? (s : String) : Option Catalog :=
+  (items? s entry?).map fun es =>
+    { routines := es.filterMap fun | .routine n ms => some (n, ms) | .table _ => none
+      tables := es.filterMap fun | .table t => some t | .routine .. => none }
 
 def cert? (s : String) : Option Cert := (items? s pair?).map Cert.mk
 
@@ -100,20 +162,28 @@ ever added, so a reader of the C1 answer keeps working.
   `Sqldiff.Mirror.check_sound_c2a` (both routines in the C2a slice: the
   confirmation does not rest on `ASM-C1-OPERATORS`), `"uninterpreted"`
   when it names `Sqldiff.Mirror.check_sound` (it does).
-* `"residual"`, with `"c2a"` only: the session facts the confirmation
-  still rests on (`Sqldiff.Mirror.residual`), an array of assumption
-  names, possibly empty. -/
-def extra (dep ra : String) (ans : Answer) : String :=
+* `"residual"`, with `"c2a"` only: the facts the confirmation still
+  rests on (`Sqldiff.Mirror.residual`), an array of assumption names,
+  possibly empty.
+* `"statements"`: `"c3a"` when the routines have data statements (C3a:
+  the confirmation covers the target catalog's tables named in the
+  request, under the facts a TABLE entry asserts), `"c1"` when they have
+  only the control statements of C1. Added in C3a, last, so a reader of
+  the C2a answer keeps working. -/
+def extra (dep cat ra : String) (ans : Answer) : String :=
   match ans with
   | .unconfirmed _ => ""
   | .confirmed t =>
+    let ca := match deployment? dep, catalog? cat, Ast.decodeRoutineLine ra with
+      | some d, some g, some a => lowerT d g a
+      | _, _, _ => none
+    let stmts := if (ca.map Core.Routine.hasData).getD false then "c3a" else "c1"
+    let tail := ",\"statements\":\"" ++ stmts ++ "\""
     if t == theoremC2a then
-      let names := match deployment? dep, Ast.decodeRoutineLine ra with
-        | some d, some a => ((lowerT d a).map residual).getD []
-        | _, _ => []
+      let names := (ca.map residual).getD []
       let items := ",".intercalate (names.map fun n => "\"" ++ n ++ "\"")
-      ",\"scalars\":\"c2a\",\"residual\":[" ++ items ++ "]"
-    else ",\"scalars\":\"uninterpreted\""
+      ",\"scalars\":\"c2a\",\"residual\":[" ++ items ++ "]" ++ tail
+    else ",\"scalars\":\"uninterpreted\"" ++ tail
 
 #guard name? "40785f31" == some "@x_1"
 #guard name? "4" == none
@@ -124,5 +194,19 @@ def extra (dep ra : String) (ans : Answer) : String :=
 #guard (catalog? "70:ix").isNone
 #guard (deployment? "0").map (·.rowCounts) == some false
 #guard (deployment? "2").isNone
+#guard (deployment? "0;64626f2e74:74").map (·.tables) == some [("dbo.t", "t")]
+#guard (deployment? "0,70:70;74:74").map (·.routines) == some [("p", "p")]
+#guard (deployment? "0;").isNone
+#guard (deployment? "0;74:74;74:74").isNone
+-- A table `t` with key `id` and nullable `qty`, spelt `Qty` in T-SQL, and a routine.
+#guard (catalog? "74=6964.ink/717479.i.517479,70:ib").map
+    (fun g => (g.routines.length, g.tables.map fun t => t.cols.map fun c => (c.name, c.tsql, c.notNull, c.key))) ==
+  some (1, [[("id", "id", true, true), ("qty", "Qty", false, false)]])
+-- A quoted target name `"Qty`: its T-SQL spelling defaults to `Qty`.
+#guard (catalog? "74=22517479.in").map (fun g => g.tables.map fun t => t.cols.map (·.tsql)) ==
+  some [["Qty"]]
+#guard (catalog? "74=6964.ix").isNone
+#guard (catalog? "74=").isNone
+#guard (catalog? "74=6964").isNone
 
 end Sqldiff.Mirror.Request
