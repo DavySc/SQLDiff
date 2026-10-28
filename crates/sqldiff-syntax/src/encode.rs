@@ -6,6 +6,8 @@
 //!
 //! ```text
 //! v    := (Tag v*)        a constructor and its fields, in declaration order
+//!                         (space before each field, none for a constructor
+//!                         without fields)
 //!       | [v*]            a list
 //!       | s:HEX           a string, its UTF-8 bytes in lower-case hex
 //!       | -               None
@@ -13,10 +15,9 @@
 //! ```
 //!
 //! An `Option<T>` that is `Some(x)` is written as `x` (no tag): a field is
-//! either always optional or never, so this stays injective. Tags are the
-//! Rust constructor names; [`SCHEMA`] lists them with their fields, and the
-//! Lean decoder is written against that list; requests carry a hash of it
-//! (`sqldiff_core::proof`).
+//! either always optional or never, so this stays injective. [`SCHEMA`]
+//! lists the constructors with their fields; the Lean decoder is generated
+//! from it and requests carry its hash (`sqldiff_core::proof`).
 
 use std::fmt::Write as _;
 
@@ -26,44 +27,40 @@ use crate::abstract_syntax::{
 };
 use crate::routine::{Arg, Block, Mode, Node, Param, Routine, RoutineKind, Security};
 
-/// Every constructor the encoding writes, with its fields. A change to the
-/// Rust types that changes the encoding must change this text, which
-/// changes the hash requests carry.
+/// The grammar of the encoding: one type per line, `Type := Ctor field* |
+/// ...`, a field `name:T` with `T` one of `s` (string), `b` (bool), a type
+/// of this schema, `[T]` (list) or `T?` (option). The Lean types and
+/// decoder are generated from it (`sqldiff_core::proof::lean_ast`), and a
+/// test checks every encoded tree of the corpus against it, so the Rust
+/// encoder, this text and the Lean decoder cannot drift apart silently.
 pub const SCHEMA: &str = "\
-Routine kind name:[s] params:[Param] returns:Type? security volatility:s? body:Block
-Procedure | Function
-Param name:s ty:Type mode default:Expr?
-In | Out | InOut
-Caller | Owner
-Block decls:[Stmt] body:[Node]
-NStmt Stmt | NBlock Block | If cond:Expr then:[Node] els:[Node] | While cond:Expr body:[Node]
-Call name:[s] args:[Arg] ret:Expr? | Setting name:s on:b
-Arg name:s? value:Expr output:b
-Select ctes:[Cte] for_json:b set_ops:[SetOp] distinct:b top:Expr? items:[SelItem] into:[Expr] into_strict:b from:[From] where:Expr? group_by:[Expr] having:Expr? order_by:[OrderItem] offset:Expr? limit:Expr? locking:[s] values:[[Expr]]?
-SetOp op:s query:Select
-Cte name:s cols:[s] query:Select
-SelItem expr:Expr alias:s? assign:s?
-OrderItem expr:Expr desc:b nulls_first:b?
-Type name:s args:[s]
-Table name:[s] alias:s? hints:[s] | Sub query:Select alias:s? cols:[s] | Values rows:[[Expr]] alias:s? cols:[s]
-Func name:[s] args:[Expr] schema:[Col] alias:s? | DataChange kind:s stmt:Stmt alias:s? | Join kind:s left:From right:From on:Expr?
-Col name:s ty:Type
-Name [s] | Var s | Num s | Str s | Null | Star s? | CallE Call | Bin op:s Expr Expr | Unary op:s Expr
-IsNull Expr neg:b | InList Expr [Expr] neg:b | InQuery Expr Select neg:b | Between Expr Expr Expr neg:b
-Like Expr Expr neg:b ci:b | Cast Expr Type | Case Expr? [When2] Expr? | Exists Select | Subquery Select
-Tuple [Expr] | Special s | Extract s Expr
-When2 Expr Expr
-CallF name:[s] args:[Expr] distinct:b order:[OrderItem] within_group:b over:b star:b
-SSelect Select | Insert target:[s] cols:[s] source:Src returning:[SelItem] returning_into:[Expr] on_conflict:Conflict?
-Update target:[s] alias:s? sets:[Set] from:[From] where:Expr? | Delete target:[s] alias:s? from:[From] where:Expr?
-Merge target:[s] alias:s? hints:[s] source:From on:Expr whens:[When] | Assign Expr Expr | Return Expr?
-Declare name:s ty:Type? default:Expr? | Message Expr
-SrcValues [[Expr]] | SrcQuery Select | SrcDefault
-Conflict cols:[s] action:Action
-Nothing | DoUpdate [Set1] where:Expr?
-Set cols:[s] Expr | Set1 col:s Expr
-When matched:b by_source:b cond:Expr? action:MAction
-MUpdate [Set1] | MDelete | MInsert cols:[s] [Expr]
+Routine := Routine kind:RoutineKind name:[s] params:[Param] returns:Ty? security:Security volatility:s? body:Block
+RoutineKind := Procedure | Function
+Param := Param name:s ty:Ty mode:Mode default:Expr?
+Mode := In | Out | InOut
+Security := Caller | Owner
+Block := Block decls:[Stmt] body:[Node]
+Node := NStmt stmt:Stmt | NBlock block:Block | If cond:Expr then:[Node] els:[Node] | While cond:Expr body:[Node] | Call name:[s] args:[Arg] ret:Expr? | Setting name:s on:b
+Arg := Arg name:s? value:Expr output:b
+Ty := Ty name:s args:[s]
+Expr := Name parts:[s] | Var name:s | Num text:s | Str value:s | Null | Star qual:s? | CallE call:CallF | Bin op:s l:Expr r:Expr | Unary op:s x:Expr | IsNull x:Expr neg:b | InList x:Expr list:[Expr] neg:b | InQuery x:Expr query:Select neg:b | Between x:Expr lo:Expr hi:Expr neg:b | Like x:Expr pattern:Expr neg:b ci:b | Cast x:Expr ty:Ty | Case operand:Expr? whens:[When2] els:Expr? | Exists query:Select | Subquery query:Select | Tuple xs:[Expr] | Special name:s | Extract field:s x:Expr
+When2 := When2 cond:Expr result:Expr
+CallF := CallF name:[s] args:[Expr] distinct:b order:[OrderItem] within_group:b over:b star:b
+OrderItem := OrderItem expr:Expr desc:b nulls_first:b?
+SelItem := SelItem expr:Expr alias:s? assign:s?
+Cte := Cte name:s cols:[s] query:Select
+SetOp := SetOp op:s query:Select
+Select := Select ctes:[Cte] for_json:b set_ops:[SetOp] distinct:b top:Expr? items:[SelItem] into:[Expr] into_strict:b from:[From] where:Expr? group_by:[Expr] having:Expr? order_by:[OrderItem] offset:Expr? limit:Expr? locking:[s] values:[[Expr]]?
+From := Table name:[s] alias:s? hints:[s] | Sub query:Select alias:s? cols:[s] | Values rows:[[Expr]] alias:s? cols:[s] | Func name:[s] args:[Expr] schema:[Col] alias:s? | DataChange kind:s stmt:Stmt alias:s? | Join kind:s left:From right:From on:Expr?
+Col := Col name:s ty:Ty
+Stmt := SSelect query:Select | Insert target:[s] cols:[s] source:Src returning:[SelItem] returning_into:[Expr] on_conflict:Conflict? | Update target:[s] alias:s? sets:[Set] from:[From] where:Expr? | Delete target:[s] alias:s? from:[From] where:Expr? | Merge target:[s] alias:s? hints:[s] source:From on:Expr whens:[When] | Assign target:Expr value:Expr | Return value:Expr? | Declare name:s ty:Ty? default:Expr? | Message x:Expr
+Src := SrcValues rows:[[Expr]] | SrcQuery query:Select | SrcDefault
+Conflict := Conflict cols:[s] action:Action
+Action := Nothing | DoUpdate sets:[Set1] where:Expr?
+Set := Set cols:[s] value:Expr
+Set1 := Set1 col:s value:Expr
+When := When matched:b by_source:b cond:Expr? action:MAction
+MAction := MUpdate sets:[Set1] | MDelete | MInsert cols:[s] values:[Expr]
 ";
 
 struct W(String);
@@ -118,9 +115,11 @@ impl W {
     fn os(&mut self, v: &Option<String>) {
         self.opt(v, |w, x| w.s(x));
     }
+    /// A constructor without fields.
     fn tag(&mut self, tag: &str) {
         self.sep();
-        self.0.push_str(tag);
+        self.open(tag);
+        self.close();
     }
 }
 
@@ -235,7 +234,7 @@ impl W {
 
     fn ty(&mut self, t: &Type) {
         self.sep();
-        self.open("Type");
+        self.open("Ty");
         self.s(&t.name);
         self.strs(&t.args);
         self.close();
@@ -645,6 +644,221 @@ impl W {
         }
         self.close();
         self.close();
+    }
+}
+
+// ---- the schema as data, and checking a line against it ---------------------
+
+/// A field's type in [`SCHEMA`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldTy {
+    Str,
+    Bool,
+    Named(String),
+    List(Box<FieldTy>),
+    Opt(Box<FieldTy>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ctor {
+    pub name: String,
+    pub fields: Vec<(String, FieldTy)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeDef {
+    pub name: String,
+    pub ctors: Vec<Ctor>,
+}
+
+fn field_ty(t: &str) -> Result<FieldTy, String> {
+    if let Some(inner) = t.strip_suffix('?') {
+        return Ok(FieldTy::Opt(Box::new(field_ty(inner)?)));
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        return Ok(FieldTy::List(Box::new(field_ty(inner)?)));
+    }
+    match t {
+        "s" => Ok(FieldTy::Str),
+        "b" => Ok(FieldTy::Bool),
+        _ if !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            Ok(FieldTy::Named(t.to_string()))
+        }
+        _ => Err(format!("bad field type `{t}`")),
+    }
+}
+
+/// [`SCHEMA`] as data. Panics only if the constant itself is malformed,
+/// which the tests rule out.
+pub fn schema_types() -> Vec<TypeDef> {
+    parse_schema(SCHEMA).expect("SCHEMA is well formed")
+}
+
+pub fn parse_schema(text: &str) -> Result<Vec<TypeDef>, String> {
+    let mut out: Vec<TypeDef> = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let (name, rhs) = line
+            .split_once(" := ")
+            .ok_or(format!("no `:=` in `{line}`"))?;
+        let mut ctors = Vec::new();
+        for alt in rhs.split(" | ") {
+            let mut words = alt.split_whitespace();
+            let cname = words.next().ok_or("an empty alternative")?.to_string();
+            let mut fields = Vec::new();
+            for w in words {
+                let (f, t) = w
+                    .split_once(':')
+                    .ok_or(format!("field `{w}` has no type"))?;
+                fields.push((f.to_string(), field_ty(t)?));
+            }
+            ctors.push(Ctor {
+                name: cname,
+                fields,
+            });
+        }
+        out.push(TypeDef {
+            name: name.to_string(),
+            ctors,
+        });
+    }
+    // Every named type is defined, and constructor names are unique.
+    let names: Vec<&str> = out.iter().map(|t| t.name.as_str()).collect();
+    let mut seen = std::collections::HashSet::new();
+    for t in &out {
+        for c in &t.ctors {
+            if !seen.insert(c.name.clone()) {
+                return Err(format!("constructor `{}` defined twice", c.name));
+            }
+            for (_, ft) in &c.fields {
+                let mut f = ft;
+                loop {
+                    match f {
+                        FieldTy::List(x) | FieldTy::Opt(x) => f = x,
+                        FieldTy::Named(n) if !names.contains(&n.as_str()) => {
+                            return Err(format!("type `{n}` is not defined"))
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A line in its generic form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Ctor(String, Vec<Value>),
+    List(Vec<Value>),
+    /// The hex digits as written.
+    Str(String),
+    None,
+    Bool(bool),
+}
+
+/// Reads a line back into its generic form; `None` unless it is exactly one
+/// value in the grammar.
+pub fn parse_line(line: &str) -> Option<Value> {
+    fn value(s: &[u8], i: &mut usize) -> Option<Value> {
+        match s.get(*i)? {
+            b'(' => {
+                *i += 1;
+                let st = *i;
+                while s.get(*i).is_some_and(|c| c.is_ascii_alphanumeric()) {
+                    *i += 1;
+                }
+                let tag = std::str::from_utf8(&s[st..*i]).ok()?.to_string();
+                if tag.is_empty() {
+                    return None;
+                }
+                let mut kids = Vec::new();
+                while s.get(*i) == Some(&b' ') {
+                    *i += 1;
+                    kids.push(value(s, i)?);
+                }
+                (s.get(*i) == Some(&b')')).then(|| {
+                    *i += 1;
+                    Value::Ctor(tag, kids)
+                })
+            }
+            b'[' => {
+                *i += 1;
+                let mut kids = Vec::new();
+                if s.get(*i) != Some(&b']') {
+                    kids.push(value(s, i)?);
+                    while s.get(*i) == Some(&b' ') {
+                        *i += 1;
+                        kids.push(value(s, i)?);
+                    }
+                }
+                (s.get(*i) == Some(&b']')).then(|| {
+                    *i += 1;
+                    Value::List(kids)
+                })
+            }
+            b's' if s.get(*i + 1) == Some(&b':') => {
+                *i += 2;
+                let st = *i;
+                while s
+                    .get(*i)
+                    .is_some_and(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+                {
+                    *i += 1;
+                }
+                ((*i - st) % 2 == 0)
+                    .then(|| Value::Str(String::from_utf8_lossy(&s[st..*i]).to_string()))
+            }
+            b'-' => {
+                *i += 1;
+                Some(Value::None)
+            }
+            b't' => {
+                *i += 1;
+                Some(Value::Bool(true))
+            }
+            b'f' => {
+                *i += 1;
+                Some(Value::Bool(false))
+            }
+            _ => None,
+        }
+    }
+    let s = line.as_bytes();
+    let mut i = 0;
+    let v = value(s, &mut i)?;
+    (i == s.len()).then_some(v)
+}
+
+/// Whether `v` is a value of type `ty` under `schema`.
+pub fn check(v: &Value, ty: &FieldTy, schema: &[TypeDef]) -> Result<(), String> {
+    match (ty, v) {
+        (FieldTy::Str, Value::Str(_)) | (FieldTy::Bool, Value::Bool(_)) => Ok(()),
+        (FieldTy::Opt(_), Value::None) => Ok(()),
+        (FieldTy::Opt(t), v) => check(v, t, schema),
+        (FieldTy::List(t), Value::List(xs)) => xs.iter().try_for_each(|x| check(x, t, schema)),
+        (FieldTy::Named(n), Value::Ctor(tag, kids)) => {
+            let def = schema
+                .iter()
+                .find(|d| &d.name == n)
+                .ok_or(format!("no type `{n}`"))?;
+            let c = def
+                .ctors
+                .iter()
+                .find(|c| &c.name == tag)
+                .ok_or(format!("`{tag}` is not a constructor of `{n}`"))?;
+            if c.fields.len() != kids.len() {
+                return Err(format!(
+                    "`{tag}` has {} fields, the line has {}",
+                    c.fields.len(),
+                    kids.len()
+                ));
+            }
+            c.fields.iter().zip(kids).try_for_each(|((f, t), k)| {
+                check(k, t, schema).map_err(|e| format!("{tag}.{f}: {e}"))
+            })
+        }
+        (t, v) => Err(format!("expected {t:?}, found {v:?}")),
     }
 }
 
