@@ -46,7 +46,12 @@ pub struct ConfigArgs {
     data_dir: Option<PathBuf>,
     /// Proof gate for "equal" verdicts: off, report (record whether
     /// sqldiff-check confirms it) or require (an unconfirmed "equal" becomes
-    /// "unknown"). See docs/verification-roadmap.md, decision 3.
+    /// "unknown"). With `convert`: report writes certificates.json, one
+    /// certificate per converted routine; require also runs the release
+    /// gate (exit 1 while anything still needs a review). Experimental: the
+    /// checker covers only a slice of T-SQL so far, so most real routines
+    /// stay unconfirmed. See docs/verification-roadmap.md, decision 3, and
+    /// docs/verified-conversion.md.
     #[arg(long, value_name = "MODE", default_value = "off")]
     proof: sqldiff_core::proof::Mode,
 }

@@ -368,6 +368,15 @@ output.
 
 ## Progress (branch `verification`)
 
+**Status: experimental.** `sqldiff convert --proof report|require` and the
+`sqldiff-check` checker are opt-in (`--proof` defaults to `off`) and change
+no status when off. The checker covers a slice of T-SQL (the rows below);
+on the WideWorldImporters sample (2026-10-28) it confirms 0 of 47 routines,
+and 0 of the 26 corpus procedures, because every one uses something outside
+the slice (queries, cursors, dynamic SQL, temporal tables). Treat a
+confirmation as evidence within the slice, never as a release decision on
+its own; the release gate (`--proof require`) is for trying the workflow.
+
 | Item | State on 2026-10-28 |
 |---|---|
 | C0.1 Target AST and printer | Done for PostgreSQL. The abstract syntax moved to `sqldiff_syntax::abstract_syntax`, shared with the diff engine; `sqldiff_syntax::print` writes it as PostgreSQL (every non-atomic operand parenthesised, refusals instead of guesses); `sqldiff_syntax::routine` reads T-SQL and PL/pgSQL routines into one shape and prints PL/pgSQL. Round trips: 291 PostgreSQL statements and 20 PL/pgSQL routines in the repository print and read back as the same tree. The round trip found a false "equal" in the parser (PostgreSQL `\|\|` precedence, fixed) |
