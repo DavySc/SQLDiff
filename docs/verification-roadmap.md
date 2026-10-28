@@ -50,10 +50,11 @@ The statement to prove, for dialect versions `vA` and `vB`, artifacts `a` and
 Design: translation validation.
 
 1. Rust parses both sides and exports the AST, the catalog facts and the
-   dialect versions as JSON.
+   dialect versions as JSON, with its statement and path alignment as an
+   untrusted hint.
 2. `sqldiff-check`, a Lean 4 program compiled to a native binary, lowers the
-   AST with a lowering proven to preserve the dialect semantics and compares
-   the terms.
+   AST with a lowering proven to preserve the dialect semantics and checks
+   that B's terms refine A's (`tB ⊑ tA`), along the hinted alignment.
 3. The report says "equal" only when the checker confirms it. Rust "equal"
    that the checker does not confirm becomes "unknown" (in strict mode) or
    carries `proof: unconfirmed` (during rollout).
@@ -68,12 +69,69 @@ Trusted at the end: the Lean kernel and compiler, the dialect specification
 (reviewed, and tested against the engines), the named axioms (unverified
 vendor facts), the Rust parser and the AST export.
 
+### Decision 2: a gate, then convergence
+
+Decided by the project owner on 2026-10-28.
+
+| Choice | Decided | Rejected, and why |
+|---|---|---|
+| What is verified | A Lean checker gates every "equal"; once a fragment is verified and stable, Rust calls the compiled Lean lowering for it and deletes its own code (see "Convergence") | Proving the Rust (Aeneas, Verus, Creusot): `canon.rs` would first need rewriting into the verifiable subset, every refactor breaks proofs, and it needs the same Lean SQL semantics anyway |
+| Checker input | The parsed AST; Lean lowers it itself, so the Rust lowering is not trusted | Rust's terms plus a lowering certificate: a certificate format for every rule in `canon.rs`, and two lowerings forever |
+| Alignment | Rust sends its statement and path alignment as an untrusted hint; Lean checks refinement along it, which keeps the check about linear in routine size. A wrong hint makes the verdict unconfirmed, never wrong | Lean searching for the alignment itself: the same budget problems the Rust side has |
+| Integration | A separate `sqldiff-check` process first, one per CLI invocation for all its pairs and one per GUI or MCP session, over the chunked JSON stdio framing of [adapter-protocol.md](adapter-protocol.md); a linked library at convergence | Linked from the start: a Lean stack overflow would take down the GUI or MCP server, and the musl and macOS x64 builds must work before anything ships |
+
+Rules that follow, part of the trusted base:
+
+- **Failure means unconfirmed.** A missing checker, a crash, a timeout or a
+  schema mismatch gives "unconfirmed", "unknown" in strict mode; a Rust
+  "equal" never stands alone.
+- **No default reads as confirmed.** Lean's `panic!` prints and returns the
+  default value of the result type by default, in both integration modes.
+  The result type is designed so that its default, and every error path,
+  means "not confirmed".
+- **Only candidate equals are checked.** The checker runs only when Rust is
+  about to report "equal" or "equal under assumptions"; "different" and
+  "unknown" do not call it.
+- **The executable code imports only `Init` and `Std`.** Mathlib and the
+  `Lean` package stay in proof modules, so the binary carries neither; the
+  AST codegen emits its own decoder instead of using `Lean.Json`.
+
+Runtime model: Lean compiles to C and links a small runtime (`libleanrt`)
+plus the compiled modules it imports; proofs and types are erased. Memory is
+reference counted (no collection pauses; values with one owner are updated in
+place); every value is boxed and objects shared between threads use atomic
+counts, so per operation it is expected to be a small factor slower than
+Rust. In linked mode each Rust thread that calls Lean registers with its
+runtime, and depth limits or a large-stack thread guard against stack
+overflow.
+
+Baseline, release build, 2026-10-28 (this machine): a `sqldiff diff` of a
+corpus routine takes 4 to 6 ms including process start, a synthetic
+400-statement T-SQL to PostgreSQL routine 584 ms, and a process start 1.6 ms.
+Phase 0 measures the checker against these budgets:
+
+| Measure | Budget |
+|---|---|
+| Checker start, cold | < 20 ms |
+| Check of a corpus routine (about 20 lines) | < 5 ms |
+| Check of the 400-statement routine, edited to be equal | < 25% of the Rust diff time |
+| `diff` time on the corpus and the WWI benchmark, gate on against off | < 10% slower |
+| Binary size added (separate process) | < 20 MB |
+| Memory | Below the Rust process for the same pair |
+| Builds | All four release targets: Windows x64, macOS arm64 and x64 (built on arm64), static musl Linux x64 |
+
+When the spike misses a budget: run the gate asynchronously in the GUI
+("equal, confirming…"), cache checks by the hash of both ASTs, the versions,
+the observer profile and the checker version, or keep strict mode for CI
+while interactive runs show unconfirmed results first. If the musl build
+fails, a glibc checker ships beside the musl CLI.
+
 ## Open decisions
 
 | # | Decision | Recommendation | Status |
 |---|---|---|---|
 | 1 | What "related observations" means (below) | Refinement of the reference side, over a stated observer profile | Decided 2026-10-28 (four choices by the project owner, the rest proposed) |
-| 2 | Gate (translation validation) or proving the Rust | Gate, then converge per fragment (see "Drift management") | Proposed |
+| 2 | Gate (translation validation) or proving the Rust | Gate, then converge per fragment, with a performance gate (below) | Decided 2026-10-28 |
 | 3 | Rollout | `proof:` field first, strict mode once coverage is high | Proposed |
 | 4 | Access to IBM i systems | One per supported release, for probes | Open |
 | 5 | Who reviews spec, statements and axioms | A named human; the one role AI does not fill | Open |
@@ -268,7 +326,7 @@ bars; total about 16 to 28 months including multi-version support.
 
 | Phase | Scope | Exit criterion | Estimate |
 |---|---|---|---|
-| 0 Groundwork | Private `Report.verdict` (assigned today in core, source, review and convert); a coverage invariant (every unit proven or covered by a finding); tests for the leads below; typed dialect version (see "RDBMS versions"); `formal/lean` Lake project with `Term`; AST JSON export with schema hash; the gate on a trivial fragment; CI and agents | Gate confirms the trivial fragment on the corpus | 2 to 3 months |
+| 0 Groundwork | Private `Report.verdict` (assigned today in core, source, review and convert); a coverage invariant (every unit proven or covered by a finding); tests for the leads below; typed dialect version (see "RDBMS versions"); `formal/lean` Lake project with `Term`; AST JSON export with schema hash; the gate on a trivial fragment; the packaging and performance spike (decision 2); CI and agents | Gate confirms the trivial fragment on the corpus, on all four release targets, within the decision 2 budgets | 2 to 3 months |
 | 1 Scalar expressions | Three-valued logic, NULL, numeric types, strings and collation, casts and literals, bit and boolean, CASE/COALESCE/ISNULL; `compare.rs` hooks proven under their assumptions; `eval/casts`, `eval/bit-boolean`, `eval/literal` as Lean regression tests | Scalar-only "equal" on corpus and real-code confirmed; mutation gate at zero false equals | 3 to 4 months |
 | 2 Queries | Bags, joins, aggregates, ordering and NULL ordering, paging, set operations, scalar subquery contracts, catalog keys and nullability | As phase 1, for queries | 3 to 5 months |
 | 3 DML | INSERT, UPDATE (including `UPDATE … FROM`), DELETE, MERGE, upserts, generated keys and `RETURNING`; execution oracle as a Lean differential test | DML "equal" confirmed; oracle agrees with the Lean semantics | 2 to 4 months |
@@ -341,6 +399,14 @@ a static library) and retires its own code for that fragment, so drift inside
 the verified part is impossible. The Lean lowering mirrors `canon.rs`
 structurally from the start, so retiring Rust code is a swap. Cost: a Lean
 runtime in the Rust binaries and some Lean knowledge among contributors.
+
+Convergence puts Lean on the path of every diff, not only of candidate
+equals: the witness search and explanations use the lowered terms of every
+statement pair. A fragment therefore converges only when its Lean lowering
+stays within an agreed factor of the Rust lowering on the corpus and WWI
+benchmarks (the factor is set when the first fragment is ready, from the
+phase 0 measurements). A fragment that misses it stays with two
+implementations and the drift controls.
 
 ## RDBMS versions
 
