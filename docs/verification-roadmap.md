@@ -41,11 +41,11 @@ verify as they are.
 The statement to prove, for dialect versions `vA` and `vB`, artifacts `a` and
 `b`, catalog Γ and assumptions S:
 
-> If SQLDiff reports equal under S, then for every pair of related database
-> states satisfying Γ and every pair of related inputs, if S holds, running `a`
-> on `vA` and `b` on `vB` gives related observations.
+> If SQLDiff reports equal under S, then for every pair of related
+> environments satisfying Γ, if S holds, every observation of `b` on `vB` is
+> related to some observation `a` on `vA` can produce.
 
-"Related" and "observations" are decision 1 below.
+"Related", "environment" and "observation" are fixed by decision 1 below.
 
 Design: translation validation.
 
@@ -72,7 +72,7 @@ vendor facts), the Rust parser and the AST export.
 
 | # | Decision | Recommendation | Status |
 |---|---|---|---|
-| 1 | What "related observations" means (below) | Contextual equivalence over a stated set of observers | In progress |
+| 1 | What "related observations" means (below) | Refinement of the reference side, over a stated observer profile | Decided 2026-10-28 (four choices by the project owner, the rest proposed) |
 | 2 | Gate (translation validation) or proving the Rust | Gate, then converge per fragment (see "Drift management") | Proposed |
 | 3 | Rollout | `proof:` field first, strict mode once coverage is high | Proposed |
 | 4 | Access to IBM i systems | One per supported release, for probes | Open |
@@ -82,26 +82,154 @@ vendor facts), the Rust parser and the AST export.
 
 ### Decision 1: observational equivalence
 
-Three parts: what a caller observes, which contexts are quantified over, and
-how values and states correspond across dialects; plus how nondeterminism is
-treated. Facts already fixed by the current tool, checked with
-`sqldiff diff` on 2026-10-28:
+"Equal" is a statement about what a caller can observe. Decided by the
+project owner on 2026-10-28: refinement for nondeterminism, error kinds plus
+user codes, an observer profile for side channels, and session state
+observed. The other items are proposals that stand unless changed.
 
-- An output column alias rename (`AS OrderId` to `AS Id`) is reported
-  unknown, so result column names are treated as observable.
-- Adding `SET NOCOUNT ON` is reported different, so "rows affected" counts
-  are treated as observable. If decision 1 leaves them unobserved, this
-  becomes a false "different".
-- Adding `ORDER BY` to an unordered result is reported unknown, consistent
-  with observing a result as a bag unless both sides order it totally.
-- The execution oracle observes the error that reached the client, returned
-  rows, and durable state read in a fresh session; the TLA+ model observes
-  committed and pending work, the error, early stop, return code,
-  `@@TRANCOUNT` and a doomed caller transaction.
+#### Refinement, and the side it refines
 
-The remaining choices (error granularity, messages, row counts, generated
-keys, nondeterminism, environment faults, value correspondence) are worked
-out with the project owner and recorded here.
+`A` is the reference and `B` the candidate: the original and its conversion
+(UC3), the old version and the new one (UC2). "Equal" means **B refines A**:
+for every environment, every observation B can produce is one A could
+produce. B may be more deterministic than A (a conversion may add an
+`ORDER BY`), never less.
+
+- The order of `sqldiff diff a b` matters: swapping the sides can change the
+  verdict. Reports state which side is the reference; the GUI's swap action
+  re-runs the comparison.
+- **Equivalent** is refinement both ways. Reports carry it as a separate
+  field. Drift between two variants where neither is the original (UC1, and
+  UC4 collections without a declared reference tree) uses equivalence.
+- A refinement proof is one direction; equivalence needs a second proof.
+
+#### Environment against unspecified behaviour
+
+Refinement is only sound when the nondeterminism it ranges over is the
+engine's own unspecified behaviour. Everything else is an input that the
+environment chooses and both sides share:
+
+| Kind | Examples | Treatment |
+|---|---|---|
+| Environment (inputs, for all) | Database state, arguments, session settings, caller transaction, privileges, clock readings, `RAND`/`NEWID`/`uuidv4()` draws, environmental faults (lock timeout, cancel, a failing write) | Chosen once and related between the sides by the correspondence. Faults are related through a correspondence of writes (same kind, related target), as `ir/behaviour.rs` aligns them today |
+| Unspecified behaviour (refinable) | Order of an unordered result; the rows `TOP`/`LIMIT`/`FETCH` return without a total `ORDER BY`; the source row `UPDATE … FROM` or `SELECT @v = col` uses; evaluation order the vendor does not guarantee, including whether an error is raised; which of several violations is reported | A's set of allowed outcomes. B may pick any subset |
+
+Why the line matters: if clock or random draws were refinable, a B that
+always returns one fixed UUID, or freezes the clock, would refine A; if
+faults were refinable, a B that always fails with a lock timeout would
+refine any A that could time out.
+
+Two obligations follow:
+
+- `Run` is total and never empty (non-termination and errors are
+  observations), proven once in Lean; otherwise an empty B would refine
+  anything.
+- Marking behaviour as unspecified widens A's set, so a wrong "unspecified"
+  can produce a false "equal". Every such spec rule cites the vendor text
+  that says the behaviour is not guaranteed and is reviewed like an axiom.
+  Engine tests cannot confirm it (an engine shows one choice); they can only
+  refute it.
+
+#### Observations
+
+| Channel | Observed as |
+|---|---|
+| Result sets | Values through the value correspondence; a list when A orders it totally, else a bag; column types through the correspondence (`ASM-RESULT-TYPES` when unknown) |
+| Result column names | Same dialect: exact. Cross-dialect: case-insensitive, under `ASM-RESULT-NAMES-CI` (PostgreSQL returns an unquoted `AS OrderId` as `orderid`) |
+| Return value, OUT parameters, return code | Through the value correspondence |
+| Durable state (read in a fresh session) and pending state (the caller's own view) | Tables as bags, through the state correspondence |
+| Caller transaction afterwards | Open, committed, rolled back, doomed; trancount |
+| Errors | See below |
+| Session state left behind | Temporary tables that still exist and their contents, settings changed by `SET` that persist, open cursors. Observed because callers (connection pools) keep using the session |
+| Generated keys | Values written or returned, from related generator states. Generator positions afterwards (gaps after a rollback) are not observed, under `ASM-GENERATOR-GAPS` |
+| Rows-affected counts, messages | Set by the observer profile (below) |
+| Non-termination | An observation of its own |
+| Not observed | Performance, plans, locks held, statistics, log volume |
+
+#### Errors
+
+- **Cross-dialect:** the error kind from the semantic profiles
+  (`[error_kinds]`: constraint, conversion, arithmetic, cardinality,
+  not_found, lock, user_signal, name_resolution, cancel, other) must match.
+- **Same dialect:** the exact error number or SQLSTATE.
+- **Errors the code raises itself** (`THROW`, `RAISERROR`, `RAISE`,
+  `SIGNAL`): the user code, matched through a mapping a pack declares
+  (`THROW 50001` against `RAISE … USING ERRCODE = 'U0001'`), and the
+  message text as rendered. Text that formats a value (number, date, NULL)
+  is not proven unless the value is a literal, as for `PRINT` in scripts.
+- Engine message text is never compared.
+
+#### Observer profile
+
+Side channels that only some callers read are switches in an observer
+profile, set in `sqldiff.toml` or a pack (`[observer]`). Every report names
+the profile; when an unobserved channel could differ, the report lists its
+assumption (`ASM-OBSERVER-<CHANNEL>`).
+
+| Channel | Default | Why |
+|---|---|---|
+| Rows-affected counts (`SET NOCOUNT`, read by `ExecuteNonQuery`) | Observed in the same dialect, not across dialects | PostgreSQL procedures return no counts, so cross-dialect pairs could never be equal |
+| Messages (`PRINT`, `RAISE NOTICE`, warnings) | Observed | Scripts compare them today |
+
+#### Environments
+
+All database states satisfying the catalog; all arguments, across dialects
+those valid for both declared types (`ASM-PARAM-DOMAIN` when the domains
+differ); session settings fixed by the source or an assumption; caller
+privileges (a permission error is an error). Excluded by assumption:
+concurrency (serial, one session), resource limits and timeouts (class
+`Limit`).
+
+#### Correspondence
+
+Three relations, data with assumptions, all the identity within one dialect
+version: values (`bit` 1 to `true`, `datetime2(p)` to `timestamp(p)`;
+`eval/casts` and `eval/bit-boolean` are the ground truth), names
+(`ASM-IDENT-FOLD`, `ASM-DEFAULT-SCHEMA`) and states (tables related row by
+row).
+
+#### In Lean
+
+```lean
+structure Env where            -- chosen by the world; related between sides
+  db : DbState
+  args : List Value
+  settings : Settings
+  callerTxn : Option TxnState
+  privileges : Privileges
+  clock : Clock
+  draws : Draws
+  faults : FaultPlan
+
+-- every observation one run can produce; nonempty (theorem run_nonempty)
+def Run (v : DialectVersion) (p : Prog) (e : Env) : Set Obs
+
+def Refines (prof : Profile) (R : Corr) (vA : DialectVersion) (a : Prog)
+    (vB : DialectVersion) (b : Prog) (S : Assumptions) : Prop :=
+  ∀ eA eB, R.env eA eB → S.holds eA eB →
+    ∀ ob ∈ Run vB b eB, ∃ oa ∈ Run vA a eA, R.obs prof oa ob
+
+def Equivalent prof R vA a vB b S :=
+  Refines prof R vA a vB b S ∧ Refines prof R.symm vB b vA a S
+```
+
+#### What changes in today's verdicts
+
+Checked with `sqldiff diff` on 2026-10-28, before the change:
+
+| Case | Today | After decision 1 |
+|---|---|---|
+| B adds `ORDER BY` to an unordered result | unknown | equal (B refines A); not equivalent |
+| B drops the `ORDER BY` A had | unknown | different: B can return an order A never does |
+| B renames an output column alias | unknown | different in the same dialect |
+| B adds `SET NOCOUNT ON` (same dialect) | different | different (counts observed by default) |
+| A routine whose only cross-dialect difference is rows-affected counts | not separately reported | equal under `ASM-OBSERVER-ROWCOUNT` |
+| Silent row picks on both sides with no `ORDER BY` | equal under `ASM-SINGLE-ROW` | possibly equal without it, when A's pick is unspecified; NULL against unchanged on zero rows still differs |
+
+Work this creates outside the proofs: a reference side in the CLI, MCP,
+GUI, review store and `pairs`/`tree`/`queue` configuration; an
+`equivalent` field; the `[observer]` section; the error-code mapping in
+packs; witness texts that say which side can produce what.
 
 ## AI operating model
 
@@ -113,6 +241,7 @@ AI writes proofs; it never writes trusted statements unreviewed.
 | Theorem statements (`Statements/*.lean`) | AI drafts, human approves | `theorems.lock` (statement hashes); CI fails on a change not in the lock |
 | Dialect specification (`Spec/*.lean`) | AI drafts with a citation per rule, human approves | Engine differential tests, the lock |
 | Axioms | Human only | `#print axioms` checked against an allowlist; each maps to a `V*` fact |
+| Spec rules that mark behaviour unspecified | AI drafts with the vendor text that says it is not guaranteed, human approves like an axiom | Engine tests can only refute them (decision 1) |
 | `sorry` | Nobody | CI rejects it |
 
 Agents (in `.claude/agents/`):
