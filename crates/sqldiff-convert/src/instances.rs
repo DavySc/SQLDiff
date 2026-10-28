@@ -874,12 +874,7 @@ type InstanceResult = (Vec<Item>, Vec<String>, Vec<(String, String)>);
 /// Assumptions the engine's diff makes about every pair of a conversion:
 /// names fold the same way, the default schemas are the same one, T-SQL's
 /// ownership chain. Listed per instance, not counted.
-const EVERY_PAIR: [&str; 4] = [
-    "ASM-IDENT-FOLD",
-    "ASM-DEFAULT-SCHEMA",
-    "ASM-DBO-SCHEMA",
-    "ASM-TSQL-OWNERSHIP-CHAIN",
-];
+use crate::EVERY_PAIR;
 
 /// How the engine's diff says it skipped a `CREATE TABLE`.
 const DDL_TABLE: &str = "a DDL statement `CREATE TABLE";
