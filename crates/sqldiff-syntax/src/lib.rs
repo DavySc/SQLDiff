@@ -14,6 +14,7 @@ pub mod kind;
 pub mod lexer;
 mod parser;
 pub mod print;
+pub mod routine;
 pub mod template;
 
 pub use dialect::{Dialect, IdentFolding};

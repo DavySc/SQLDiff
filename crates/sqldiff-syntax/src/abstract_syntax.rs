@@ -439,24 +439,24 @@ impl<'a> Parser<'a> {
         self.i
     }
 
-    fn peek(&self) -> Option<&Tok> {
+    pub(crate) fn peek(&self) -> Option<&Tok> {
         self.t.get(self.i)
     }
 
-    fn peek_at(&self, n: usize) -> Option<&Tok> {
+    pub(crate) fn peek_at(&self, n: usize) -> Option<&Tok> {
         self.t.get(self.i + n)
     }
 
-    fn is_kw(&self, kw: &str) -> bool {
+    pub(crate) fn is_kw(&self, kw: &str) -> bool {
         self.peek().is_some_and(|t| t.kind == K::Word && t.up == kw)
     }
 
-    fn is_kw_at(&self, n: usize, kw: &str) -> bool {
+    pub(crate) fn is_kw_at(&self, n: usize, kw: &str) -> bool {
         self.peek_at(n)
             .is_some_and(|t| t.kind == K::Word && t.up == kw)
     }
 
-    fn eat_kw(&mut self, kw: &str) -> bool {
+    pub(crate) fn eat_kw(&mut self, kw: &str) -> bool {
         if self.is_kw(kw) {
             self.i += 1;
             true
@@ -465,7 +465,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn eat_kws(&mut self, kws: &[&str]) -> bool {
+    pub(crate) fn eat_kws(&mut self, kws: &[&str]) -> bool {
         if kws.iter().enumerate().all(|(n, k)| self.is_kw_at(n, k)) {
             self.i += kws.len();
             true
@@ -474,7 +474,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_kw(&mut self, kw: &str) -> PResult<()> {
+    pub(crate) fn expect_kw(&mut self, kw: &str) -> PResult<()> {
         if self.eat_kw(kw) {
             Ok(())
         } else {
@@ -482,11 +482,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn is_kind(&self, k: K) -> bool {
+    pub(crate) fn is_kind(&self, k: K) -> bool {
         self.peek().is_some_and(|t| t.kind == k)
     }
 
-    fn eat_kind(&mut self, k: K) -> bool {
+    pub(crate) fn eat_kind(&mut self, k: K) -> bool {
         if self.is_kind(k) {
             self.i += 1;
             true
@@ -495,7 +495,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn expect_kind(&mut self, k: K) -> PResult<()> {
+    pub(crate) fn expect_kind(&mut self, k: K) -> PResult<()> {
         if self.eat_kind(k) {
             Ok(())
         } else {
@@ -503,7 +503,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn is_op(&self, op: &str) -> bool {
+    pub(crate) fn is_op(&self, op: &str) -> bool {
         self.peek().is_some_and(|t| t.kind == K::Op && t.text == op)
     }
 
@@ -530,7 +530,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn eat_op(&mut self, op: &str) -> bool {
+    pub(crate) fn eat_op(&mut self, op: &str) -> bool {
         if self.is_op(op) {
             self.i += 1;
             true
@@ -547,7 +547,7 @@ impl<'a> Parser<'a> {
     }
 
     /// An identifier that is not a clause keyword.
-    fn ident(&mut self) -> PResult<String> {
+    pub(crate) fn ident(&mut self) -> PResult<String> {
         match self.peek() {
             Some(t) if t.kind == K::Word && !is_reserved(&t.up) => {
                 let s = t.text.clone();
@@ -564,7 +564,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Any word or quoted identifier (also keywords), e.g. after a `.`.
-    fn any_ident(&mut self) -> PResult<String> {
+    pub(crate) fn any_ident(&mut self) -> PResult<String> {
         match self.peek() {
             Some(t) if t.kind == K::Word => {
                 let s = t.text.clone();
@@ -1044,7 +1044,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn is_kind_at(&self, n: usize, k: K) -> bool {
+    pub(crate) fn is_kind_at(&self, n: usize, k: K) -> bool {
         self.peek_at(n).is_some_and(|t| t.kind == k)
     }
 
