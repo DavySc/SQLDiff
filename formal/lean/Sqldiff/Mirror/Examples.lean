@@ -285,6 +285,25 @@ ordinary second parameter.) -/
     (pgProc ["r"] [returnCode] [] [set (pv "return_code") (num 0)])) ==
   "the T-SQL routine is outside the C1 spec"
 
+/-! ## A procedure without `RETURN e`
+
+Its status is always 0, so the PL/pgSQL mirror needs no `return_code`
+(the deployment convention in `Sqldiff.Mirror.statusName`). -/
+
+def plainT : Ast.Routine :=
+  tsqlProc ["r"] [.Param "@n" int .InOut none] [set (tv "@n") (.Bin "+" (tv "@n") (num 1))]
+def plainP : Ast.Routine :=
+  pgProc ["r"] [.Param "n" integer .InOut none] [] [set (pv "n") (.Bin "+" (pv "n") (num 1))]
+def plainCert : Cert := ⟨[("@n", "n"), (statusVar, statusVar)]⟩
+
+#guard isConfirmed (check dep [] plainCert plainT plainP)
+-- A T-SQL `RETURN e` sets the status, which a mirror without
+-- `return_code` cannot show.
+#guard reasonOf (check dep [] plainCert
+    (tsqlProc ["r"] [.Param "@n" int .InOut none]
+      [set (tv "@n") (.Bin "+" (tv "@n") (num 1)), ret (some (num 7))]) plainP) ==
+  "the lowered routines differ beyond the renaming"
+
 /-! ## The core as an executable oracle
 
 Values are `Option Int` (`none` is NULL); operators get their integer

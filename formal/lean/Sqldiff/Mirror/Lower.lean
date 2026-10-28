@@ -377,6 +377,22 @@ def lowerT (dep : Deployment) : Ast.Routine → Option Core.Routine
     let r : Core.Routine := { params := ps, locals := declsBlock body, body := seqList stmts }
     if wellScoped r && caseSafe r.vars then some r else none
 
+/-- The deployment convention for the T-SQL return status of a converted
+procedure (`ASM-RETURN-CODE`): callers read it from the trailing `INOUT
+return_code` parameter, and a procedure without one has status 0, which
+is the status of a T-SQL procedure that never says `RETURN e`. So a
+PL/pgSQL procedure whose last parameter is `INOUT return_code` lowers as
+written (the certificate pairs `statusVar` with it), and one without is
+given the status parameter, set to 0 on entry and never changed. A
+procedure that does have the parameter must set it to 0 itself before
+anything else can end the routine. -/
+def statusName : Var := "return_code"
+
+def hasStatus (ps : List Core.Param) : Bool :=
+  match ps.getLast? with
+  | some p => p.name == statusName && p.mode == .inout
+  | none => false
+
 /-- A PL/pgSQL declaration `x t [:= e]`: the name, and the assignment the
 block runs on entry, in declaration order, when there is a default. -/
 def lowerDecl (d : Dialect) : Ast.Stmt → Option (Var × List Stmt)
@@ -396,8 +412,13 @@ def lowerP (Γ : Catalog) : Ast.Routine → Option Core.Routine
     let ps ← params.mapM (lowerParam d)
     let ds ← decls.mapM (lowerDecl d)
     let body ← lowerNodes d kind stmts
-    let r : Core.Routine :=
-      { params := ps, locals := ds.map (·.1), body := seqList ((ds.map (·.2)).flatten ++ body) }
+    let body := (ds.map (·.2)).flatten ++ body
+    -- The status of a procedure without `return_code` (see below).
+    let (ps, body) : List Core.Param × List Stmt :=
+      if kind matches .Procedure && !hasStatus ps then
+        (ps ++ [statusParam], Stmt.assign statusVar (.lit 0) :: body)
+      else (ps, body)
+    let r : Core.Routine := { params := ps, locals := ds.map (·.1), body := seqList body }
     if wellScoped r && asciiNames r.vars then some r else none
 
 /-- The routine kind and the privileges it runs with: the check asks both

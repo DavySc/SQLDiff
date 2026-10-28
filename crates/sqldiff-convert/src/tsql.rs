@@ -718,7 +718,7 @@ impl<'a> Cx<'a> {
             self.note(
                 Status::Assumptions,
                 "ASM-RETURN-CODE",
-                "PostgreSQL procedures cannot return a value: RETURN n becomes `return_code := n` on an INOUT parameter, so callers must read return_code.",
+                "PostgreSQL procedures cannot return a value: the T-SQL return status (0 unless RETURN n says otherwise, never NULL) becomes the INOUT parameter return_code, so callers must read return_code, and take 0 from a converted procedure that has none.",
             );
         }
         let mut security = "";
@@ -747,6 +747,11 @@ impl<'a> Cx<'a> {
         self.emit(out, (s, body.text_range().start().into()), 0, &header);
         self.write_decls(out);
         out.push("BEGIN\n");
+        if self.return_code && !func {
+            // T-SQL's status starts at 0: a path that ends without
+            // `RETURN e` returns 0, never the caller's value.
+            out.push(&format!("{}return_code := 0;\n", " ".repeat(INDENT)));
+        }
         out.append(b);
         out.push("END;\n$$;\n");
         self.mode = Mode::Top;
@@ -2736,7 +2741,8 @@ impl<'a> Cx<'a> {
             (Mode::Proc, Some(v)) => {
                 self.return_code = true;
                 self.step_ts_with("tsql.stmt.return", &ts, "return-code");
-                Ok(format!("return_code := {v};\nRETURN;"))
+                // A procedure cannot return NULL: T-SQL returns 0 instead.
+                Ok(format!("return_code := COALESCE({v}, 0);\nRETURN;"))
             }
             (Mode::Func, None) => self.misplaced("RETURN without a value in a function"),
             (_, None) => Ok("RETURN".into()),
