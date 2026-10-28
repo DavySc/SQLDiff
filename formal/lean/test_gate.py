@@ -1,7 +1,8 @@
 """Protocol tests for the built checker. sqldiff-check/2: confirmed only
 for identical sides that decode under the checker's syntax schema.
 sqldiff-check/3: the C1 mirror check, confirmed for a T-SQL procedure and
-its PL/pgSQL mirror. Anything else is unconfirmed, including malformed
+its PL/pgSQL mirror, with the C2a fields (`scalars`, `residual`) on a
+confirmed answer. Anything else is unconfirmed, including malformed
 requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
@@ -112,13 +113,15 @@ def call(name, *args):
     return C("Call", L(*map(S, name)), L(*(C("Arg", NONE, e, o) for e, o in args)), NONE)
 
 
-T_ROUTINE = proc(["dbo", "p"], [param("@a", "In"), param("@b", "InOut")], [], [
+T_PARAMS = [param("@a", "In"), param("@b", "InOut")]
+T_BODY = [
     C("NStmt", C("Declare", S("@x"), INT, num(1))),
     C("If", bin_(">", tv("@a"), num(1)), L(assign(tv("@x"), num(2))), L(assign(tv("@x"), num(3)))),
     C("While", bin_("<", tv("@x"), num(10)), L(assign(tv("@x"), bin_("+", tv("@x"), num(1))))),
     call(["dbo", "log_value"], (tv("@x"), "f"), (tv("@b"), "t")),
     C("NStmt", C("Return", tv("@x"))),
-])
+]
+T_ROUTINE = proc(["dbo", "p"], T_PARAMS, [], T_BODY)
 
 
 def p_routine(status):
@@ -162,7 +165,42 @@ cases += [
     ("38", req3(38, b=T_ROUTINE), "unconfirmed"),
     ("0", req3(39, kind="other"), "unconfirmed"),
 ]
-THEOREMS = {"31": "Sqldiff.Mirror.check_sound", "40": "Sqldiff.Mirror.check_sound"}
+# C2a: the same procedure under SET XACT_ABORT ON is in the scalar slice.
+T_ABORT = proc(["dbo", "p"], T_PARAMS, [], [C("Setting", S("XACT_ABORT"), "t")] + T_BODY)
+assert T_ABORT != T_ROUTINE
+
+
+def pair_t(e):
+    return proc(["r"], [param("@a", "In"), param("@r", "InOut")], [], [assign(tv("@r"), e)])
+
+
+def pair_p(e):
+    return proc(["r"], [param("a", "In"), param("r", "InOut")], [], [assign(pv("r"), e)])
+
+
+PAIR_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@a", "a"), ("@r", "r"), ("%status", "%status")])
+cases += [
+    ("41", req3(41, a=T_ABORT), "confirmed"),
+    # T-SQL ISNULL(@a, 0) and PostgreSQL COALESCE(a, 0) on int: in the slice, nothing can raise.
+    ("42", req3(42, a=pair_t(fn("ISNULL", tv("@a"), num(0))), b=pair_p(fn("COALESCE", pv("a"), num(0))),
+                cat="-", dep="0", cert=PAIR_CERT), "confirmed"),
+    # Integer division against `||`: refused.
+    ("43", req3(43, a=pair_t(bin_("/", tv("@a"), num(2))), b=pair_p(bin_("||", pv("a"), num(2))),
+                cat="-", dep="0", cert=PAIR_CERT), "unconfirmed"),
+]
+THEOREMS = {
+    "31": "Sqldiff.Mirror.check_sound",
+    "40": "Sqldiff.Mirror.check_sound",
+    "41": "Sqldiff.Mirror.check_sound_c2a",
+    "42": "Sqldiff.Mirror.check_sound_c2a",
+}
+# The fields a confirmed /3 answer adds (Main.lean); none on /2 or unconfirmed answers.
+EXTRA = {
+    "31": {"scalars": "uninterpreted"},
+    "40": {"scalars": "uninterpreted"},
+    "41": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS"]},
+    "42": {"scalars": "c2a", "residual": []},
+}
 inp = "".join(line + "\n" for _, line, _ in cases)
 out = subprocess.run([exe], input=inp.encode(), capture_output=True, check=True).stdout.decode()
 answers = [json.loads(line) for line in out.splitlines()]
@@ -172,4 +210,9 @@ for (want_id, line, want), got in zip(cases, answers):
     assert got["proof"] == want, (line, got)
     if want == "confirmed":
         assert got["theorem"] == THEOREMS.get(want_id, "Sqldiff.Gate.check_sound"), got
+        base = {"id", "proof", "theorem"}
+    else:
+        base = {"id", "proof", "reason"}
+    extra = {k: v for k, v in got.items() if k not in base}
+    assert extra == EXTRA.get(want_id, {}), got
 print(f"gate protocol ok ({len(cases)} cases)")
