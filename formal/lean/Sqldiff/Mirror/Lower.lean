@@ -531,7 +531,9 @@ FUNCTION" (CREATE FUNCTION, Notes; from memory, and that CREATE PROCEDURE
 does the same): a `varchar(10)` parameter holds any string. So a
 PostgreSQL parameter is read as having no length bound (`envP`), and a
 write to one is still held to its declared length (`envPDecl`), which is
-sound whether or not the modifier is kept. Not probed.
+sound whether or not the modifier is kept. Probed on PostgreSQL 18.6
+(2026-10-28, "String stores, on every path"): parameters, results and
+parameter defaults keep no length; locals do.
 
 **T-SQL parameters truncate.** A string argument longer than the
 parameter is silently truncated (probed: eval/casts/assign, `EXEC #q
@@ -1630,8 +1632,9 @@ spec.
   `'P0001'` exactly: PostgreSQL reads an `ERRCODE` of five digits and
   upper-case letters as an SQLSTATE and anything else as a condition
   name, so `'p0001'` is an unknown condition and the `RAISE` fails with
-  42704 ("unrecognized exception condition"; plpgsql `pl_exec.c`, from
-  memory; not probed).
+  42704 ("unrecognized exception condition"; probed on PostgreSQL 18.6,
+  2026-10-28: `RAISE EXCEPTION USING MESSAGE = 'm', ERRCODE = 'p0001'`
+  fails with `unrecognized exception condition "p0001"`).
 * The caller sees error number `n` from T-SQL and SQLSTATE P0001 from
   PostgreSQL, with the same message: decision 1 compares the kind, not
   the number or the text, so a confirmation that raises rests on
@@ -2050,6 +2053,172 @@ def envT : Ast.Routine → TyEnv
   | .Routine _ _ params _ _ _ body =>
     params.map (fun | .Param n ty _ _ => (n, ty)) ++ typedNames (declsBlock body)
 
+/-! ## String stores, on every path
+
+The C2b slice holds every string it stores to the target's declared
+length (`fitsTy`), but a routine outside the slice (the C1 path) used to
+store strings unchecked, and the core stores a value as it is. Both
+engines convert on a store, differently: T-SQL silently truncates a
+string longer than its target (probed: eval/casts/assign, `DECLARE @v
+varchar(3) = 'abcdef'` gives `abc`) and turns characters a `varchar`
+cannot hold into others; PostgreSQL raises "value too long" (probed:
+eval/casts/assign) unless the excess is spaces. "Assignment converts,
+differently" in "The C2b slice: strings" has the citations. So on every
+path (checker 0.9.0) a store into a target that may hold a string is in
+the spec only when no conversion can change the value (`storeOk`):
+
+* the value is the NULL literal; or
+* the target is the slice's integer type, or a type that is certainly not
+  a character type (`nonCharType`: the numeric, date and time, boolean,
+  binary, `uuid`, `xml` and `json` types by name; a conversion there
+  changes no length, and what it does change is the C1 path's
+  `ASM-C1-OPERATORS` caveat as before); or
+* the target is a string type without a length that holds every value:
+  PostgreSQL `text` or `varchar` without a length, T-SQL `nvarchar(max)`
+  (2 GB, beyond any value of a routine; from memory); or
+* the target has a length the value provably fits (`storeTy`, `fitsLen`):
+  the value is a string of the slice (`typed`) whose bound is at most the
+  target's length and, into a T-SQL `varchar` (with or without `max`),
+  not `wide` (no character outside the code page).
+
+Everything else is outside the spec: a value outside the slice (a
+function result, a cast, an integer) into a bounded string, `char(n)`
+and `nchar(n)` (blank-padded), T-SQL `text`, `sysname`, user and alias
+types (they may be strings), and a variable declared without a type.
+PostgreSQL drops the length of a parameter and of a function result and
+keeps that of a local: probed on PostgreSQL 18.6, 2026-10-28 (a
+procedure `(a varchar(3), INOUT r varchar(3))` doing `r := a || 'xyz'`
+called with `'abcdef'` returns `abcdefxyz`; a function `RETURNS
+varchar(3)` returning the same gives `abcdefxyz`; a parameter `s
+varchar(3) DEFAULT 'abcdef'` holds `abcdef`; a local `x varchar(3)`
+assigned `'abcdef'` raises "value too long for type character
+varying(3)"). So here a PostgreSQL parameter or result takes any string
+(`envP`, `stripMod`) and a local is held to its length. (The C2b slice
+still holds parameters to their declared length, `envPDecl`, which is
+only more conservative.)
+
+The stores (`storesNodes`): `SET @x = e` / `x := e`; T-SQL `DECLARE @x t
+= e` and a PL/pgSQL declaration's default; a function's `RETURN e`
+against its declared result type; and the copy-back of an `OUTPUT`
+argument (T-SQL) or of an argument in an `OUT`/`INOUT` position of the
+catalog (PL/pgSQL) into a variable, whose value comes from the callee
+and has no bound here, so the variable must be an integer, of a
+certainly non-character type, or a string type without a length that
+holds every value (`copyOk`). Parameter defaults are held by `dfltOk`.
+Data statements write only `int` columns (`colValue`). A procedure's
+`RETURN e` sets the integer status (`statusExpr`), not a string. Not
+covered here: the conversion of a call's argument into the callee's
+parameter (the callee's boundary; the catalog does not give its types),
+and what a T-SQL caller does with an `OUTPUT` value it receives. -/
+
+/-- A type that is certainly not a character type, by name. -/
+def nonCharType (ty : Ast.Ty) : Bool :=
+  match ty with
+  | .Ty n _ => ["INT", "INTEGER", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT", "DECIMAL",
+      "NUMERIC", "DEC", "MONEY", "SMALLMONEY", "FLOAT", "FLOAT4", "FLOAT8", "REAL",
+      "DOUBLE PRECISION", "BIT", "BOOLEAN", "BOOL", "DATE", "TIME", "DATETIME", "DATETIME2",
+      "SMALLDATETIME", "DATETIMEOFFSET", "TIMESTAMP", "TIMESTAMPTZ", "INTERVAL", "UNIQUEIDENTIFIER",
+      "UUID", "BINARY", "VARBINARY", "BYTEA", "XML", "JSON", "JSONB"].contains n.toUpper
+
+/-- The length and width of a string target: the slice's string types,
+and T-SQL `varchar(max)` and `nvarchar(max)` without a bound. -/
+def storeTy (d : Dialect) (ty : Ast.Ty) : Option (Option Nat × Bool) :=
+  match strType d ty, d, ty with
+  | some r, _, _ => some r
+  | none, .tsql _ _, .Ty n [a] =>
+    if a.toUpper == "MAX" then
+      if n.toUpper == "NVARCHAR" then some (none, true)
+      else if pgVarchar n.toUpper then some (none, false)
+      else none
+    else none
+  | none, _, _ => none
+
+/-- A store of `v` into a target declared `ty` changes no value. -/
+def storeOk (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : Bool :=
+  if v matches .Null then true else
+  match ty with
+  | none => false
+  | some ty =>
+    if intType d ty || nonCharType ty then true else
+    match storeTy d ty with
+    | none => false
+    | some (n, wt) =>
+      -- No length and every character: any value is kept.
+      if n.isNone && (wt || (d matches .pg _ _)) then true else
+      match typed d env {} v with
+      | some (_, .nul) => true
+      | some (_, .str m w) => fitsLen n m && (wt || !w)
+      | _ => false
+
+/-- The variable a copy-back writes can take any value of its type: an
+integer, a certainly non-character type, or a string type without a
+length that holds every value. -/
+def copyOk (d : Dialect) (wenv : TyEnv) (x : Var) : Bool :=
+  match lookup wenv x with
+  | some ty =>
+    intType d ty || nonCharType ty ||
+      match storeTy d ty with
+      | some (none, wt) => wt || (d matches .pg _ _)
+      | _ => false
+  | none => false
+
+/-- The copy-backs of a call's arguments. -/
+def callStoresOk (d : Dialect) (wenv : TyEnv) (n : List String) (args : List Ast.Arg) : Bool :=
+  match d with
+  | .tsql _ _ => args.all fun
+    | .Arg _ e true => match target d e with
+      | some x => copyOk d wenv x
+      | none => false
+    | .Arg _ _ false => true
+  | .pg Γ _ =>
+    let modes := (lookup Γ.routines (dotted (n.map pgName))).getD []
+    (modes.zip args).all fun
+      | (.In, _) => true
+      | (_, .Arg _ e _) => match target d e with
+        | some x => copyOk d wenv x
+        | none => false
+
+def storesStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
+  | .Assign t v => match target d t with
+    | some x => storeOk d env (lookup wenv x) v
+    | none => true -- refused by `lowerStmt`
+  | .Declare _ ty (some e) => storeOk d env ty e
+  | .Return (some e) => match ret with
+    | some ty => storeOk d env (some ty) e
+    | none => true -- a procedure's status
+  | _ => true
+
+mutual
+  def storesNode (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Node → Bool
+    | .NStmt s => storesStmt d env wenv ret s
+    | .NBlock (.Block ds body) =>
+      ds.all (storesStmt d env wenv ret) && storesNodes d env wenv ret body
+    | .If _ t e => storesNodes d env wenv ret t && storesNodes d env wenv ret e
+    | .While _ b => storesNodes d env wenv ret b
+    | .Call n args _ => callStoresOk d wenv n args
+    | .Try b hs => storesNodes d env wenv ret b && storesHandlers d env wenv ret hs
+    | .Setting .. | .Throw _ | .Raise .. | .Txn .. => true
+
+  def storesNodes (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : List Ast.Node → Bool
+    | [] => true
+    | n :: ns => storesNode d env wenv ret n && storesNodes d env wenv ret ns
+
+  def storesHandlers (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) :
+      List Ast.Handler → Bool
+    | [] => true
+    | .Handler _ b :: hs => storesNodes d env wenv ret b && storesHandlers d env wenv ret hs
+end
+
+/-- Every string store of the routine keeps its value (`storeOk`).
+`retTy` is the result type as the dialect keeps it (PostgreSQL drops a
+result's length, `stripMod`). -/
+def storesRoutine (d : Dialect) (env wenv : TyEnv) (retTy : Ast.Ty → Ast.Ty) : Ast.Routine → Bool
+  | .Routine kind _ _ returns _ _ (.Block ds body) =>
+    let ret := match kind with
+      | .Function => returns.map retTy
+      | .Procedure => none
+    ds.all (storesStmt d env wenv ret) && storesNodes d env wenv ret body
+
 /-- A T-SQL routine. Outside the spec, besides the statements above:
 
 * a name declared twice, or a local with a parameter's name (SQL Server
@@ -2060,7 +2229,9 @@ def envT : Ast.Routine → TyEnv
   two names of the routine could be confused;
 * (C4) a transaction statement in a routine that does not start with `SET
   XACT_ABORT ON`, or `BEGIN TRAN` and `COMMIT` that do not form a bracket
-  in the routine's statement list ("The C4 rules"). -/
+  in the routine's statement list ("The C4 rules");
+* a string store that could change the value ("String stores, on every
+  path"). -/
 def lowerT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option Core.Routine :=
   match a with
   | .Routine kind _ params _ _ _ body => do
@@ -2072,6 +2243,7 @@ def lowerT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option Core.Rou
       | .Block (_ :: _) _ => none
     if hasTxnNodes nodes && !(leadingSettings nodes).contains ("XACT_ABORT", true) then none else
     if !txnBracket nodes then none else
+    if !storesRoutine d env env id a then none else
     let stmts ← lowerNodes d env kind { txn := true } nodes
     let (ps, stmts) : List Core.Param × List Stmt := match kind with
       | .Procedure => (ps ++ [statusParam], Stmt.assign statusVar (.lit 0) :: stmts)
@@ -2143,6 +2315,8 @@ def lowerP (Γ : Catalog) (b : Ast.Routine) : Option Core.Routine :=
     let env := envP b
     let ps ← params.mapM (lowerParam d env)
     let ds ← decls.mapM (lowerDecl d env)
+    -- Every string store keeps its value ("String stores, on every path").
+    if !storesRoutine d env env stripMod b then none else
     -- C4: `COMMIT` only in a procedure with its caller's privileges.
     let cx : Ctx := { commit := (kind matches .Procedure) && (sec matches .Caller) }
     let body ← lowerNodes d env kind cx stmts
@@ -2223,7 +2397,8 @@ arguments the same dropped modifier is why a PostgreSQL parameter is read
 as unbounded ("PostgreSQL parameters carry no length", C2b): an argument
 longer than `n` reaches the PostgreSQL body whole and the T-SQL body
 truncated, which `ASM-TSQL-STRING-ARGS` excludes (callers pass values
-that fit). Not probed. -/
+that fit). Probed on PostgreSQL 18.6 (2026-10-28): `s varchar(3) DEFAULT
+'abcdef'` holds `abcdef`; the T-SQL truncation is the C2b `DECLARE` probe. -/
 
 /-- A T-SQL type and the PostgreSQL type it corresponds to on the C1 path
 only (upper-case names, no type arguments). -/

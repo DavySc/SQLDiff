@@ -74,6 +74,22 @@ default must be NULL or a slice value that fits the declared type (T-SQL
 truncates a default, PostgreSQL, having dropped the length, does not),
 else the routine is outside the spec.
 
+**String stores, on every path** (checker 0.9.0). A store into a target
+that may hold a string (`SET`/`:=`, a `DECLARE` default, a function's
+`RETURN`, an `OUTPUT` or `INOUT` copy-back) is in the spec only when no
+conversion can change the value: the value is NULL; or the target is an
+integer or a certainly non-character type; or the target is a string type
+without a length that takes every value (PostgreSQL `text`/`varchar`,
+T-SQL `nvarchar(max)`); or the value is a slice string whose bound fits
+the target's length (and, into a T-SQL `varchar`, is not `wide`). This
+holds on the C1 path too, where a stored string used to be lowered as it
+is although T-SQL truncates and PostgreSQL raises. PostgreSQL parameters
+and function results keep no length (probed on PostgreSQL 18.6), so they
+count as unbounded targets there; locals keep theirs. A copy-back, whose
+value comes from the callee, needs an unbounded or non-string target.
+`char(n)`, `sysname`, `varchar(max)` from a value outside the slice, and
+user or alias types take only NULL.
+
 ### Phase C2a: the first scalar slice
 
 The core now has values (NULL, three-valued booleans, 32-bit integers,

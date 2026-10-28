@@ -670,7 +670,9 @@ def badCase (a : Ast.Expr) : Ast.Expr :=
     set (tv "@r") ta]) (pairP pa)) == "the T-SQL routine is outside the C1 spec"
 -- A `varchar(10)` parameter copied into a PostgreSQL `varchar(10)` parameter:
 -- PostgreSQL parameters carry no length, so the copy is not known to fit
--- (C2b, `ExamplesC2b` has the `text` form, which is in the slice).
+-- (C2b, `ExamplesC2b` has the `text` form, which is in the slice). On the
+-- C1 path the store is fine: PostgreSQL keeps no length on a parameter
+-- (probed, "String stores, on every path").
 #guard isC1 (check dep ∅ pairCert (pairT false ta (.Ty "VARCHAR" ["10"]))
   (pairP pa (.Ty "VARCHAR" ["10"])))
 -- `int(4)` is not the slice's type.

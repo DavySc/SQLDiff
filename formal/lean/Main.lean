@@ -67,6 +67,12 @@ with a call is a `"c2a"` answer only under `SET XACT_ABORT ON`, and names
 `ASM-STATE-AFTER-ERROR`; `ERRCODE` must be `'P0001'` exactly; the
 unguarded `ROLLBACK; THROW;` idiom needs a body that is exactly one
 bracket, and the idiom stands only where transaction statements may.
+
+0.9.0, again more conservative, no new field or residual: every store
+into a target that may hold a string (assignment, `DECLARE` default, a
+function's `RETURN`, an `OUTPUT`/`INOUT` copy-back) must provably keep
+its value, also on the C1 path ("String stores, on every path" in
+`Sqldiff/Mirror/Lower.lean`), else the routine is outside the spec.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -120,7 +126,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.8.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.9.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

@@ -480,7 +480,48 @@ cases += [
                              L(try_([txn("BEGIN"), INS_T, txn("COMMIT")], [ROLLBACK_IF_OPEN, RETHROW])), L())]),
                  id_p([C("If", bin_(">", pv("p_id"), num(0)), L(INS_P, txn("COMMIT")), L())])), "unconfirmed"),
 ]
+
+# String stores on every path (checker 0.9.0): a store into a target that
+# may hold a string must provably keep the value.
+LONG = string("abcdefghijklmnopqrstuvwxyz")
+VC3_DECL_T = C("NStmt", C("Declare", S("@x"), VC3, string("abcdef")))
+X_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in
+                  [("@a", "a"), ("@b", "b"), ("@r", "r"), ("@x", "x"), ("%status", "%status")])
+cases += [
+    # SET @r = <26 characters> into varchar(20): T-SQL truncates.
+    ("76", req3s(76, s_t([assign(tv("@r"), LONG)]), s_p([assign(pv("r"), LONG)])), "unconfirmed"),
+    # SET @r = UPPER(@a): a value outside the slice into varchar(20).
+    ("77", req3s(77, s_t([assign(tv("@r"), fn("UPPER", tv("@a")))]), s_p([assign(pv("r"), fn("upper", pv("a")))])),
+     "unconfirmed"),
+    # DECLARE @x varchar(3) = 'abcdef' against x varchar(3) := 'abcdef'.
+    ("78", req3(78, a=s_t([VC3_DECL_T, assign(tv("@r"), tv("@x"))]),
+                b=proc(["r"], [sparam("a", "In", TEXT), sparam("b", "In", TEXT), sparam("r", "InOut", TEXT)],
+                       [C("Declare", S("x"), VC3, string("abcdef"))], [assign(pv("r"), pv("x"))]),
+                dep="0", cat="-", cert=X_CERT), "unconfirmed"),
+    # A function RETURNS varchar(5) returning a 6-character value.
+    ("79", req3(79, a=func(["dbo", "f"], [sparam("@a", "In", ty("VARCHAR", "5"))], ty("VARCHAR", "5"),
+                           [C("NStmt", C("Return", bin_("+", tv("@a"), string("x"))))]),
+                b=func(["f"], [sparam("a", "In", ty("VARCHAR", "5"))], TEXT,
+                       [C("NStmt", C("Return", bin_("||", pv("a"), string("x"))))]),
+                dep="0", cat="-", cert=f"{hx('@a')}:{hx('a')}"), "unconfirmed"),
+    # OUTPUT copy-back into @r varchar(20): the callee's value has no bound.
+    ("80", req3(80, a=s_t([call(["dbo", "log_value"], (tv("@a"), "f"), (tv("@r"), "t"))]),
+                b=s_p([call(["log_value"], (pv("a"), "f"), (pv("r"), "f"))]),
+                cat=CAT, cert=S_CERT), "unconfirmed"),
+    # The PostgreSQL side alone: x varchar(3) := 'abcdef' raises (a local
+    # keeps its length), where T-SQL's @x varchar(10) holds it.
+    ("81", req3(81, a=s_t([C("NStmt", C("Declare", S("@x"), VC10, string("abcdef"))), assign(tv("@r"), tv("@x"))]),
+                b=proc(["r"], [sparam("a", "In", TEXT), sparam("b", "In", TEXT), sparam("r", "InOut", TEXT)],
+                       [C("Declare", S("x"), VC3, string("abcdef"))], [assign(pv("r"), pv("x"))]),
+                dep="0", cat="-", cert=X_CERT), "unconfirmed"),
+    # What the converter writes for SET @r = @a with both varchar(10): the
+    # PostgreSQL parameters keep no length, so the copy is kept (C1 answer).
+    ("82", req3s(82, s_t([assign(tv("@r"), tv("@a"))]),
+                 proc(["r"], [sparam("a", "In", VC10), sparam("b", "In", VC10), sparam("r", "InOut", VC20)], [],
+                      [assign(pv("r"), pv("a"))])), "confirmed"),
+]
 THEOREMS = {
+    "82": "Sqldiff.Mirror.check_sound",
     "69": "Sqldiff.Mirror.check_sound_c2a",
     "70": "Sqldiff.Mirror.check_sound",
     "71": "Sqldiff.Mirror.check_sound_c2a",
@@ -509,6 +550,7 @@ EXTRA = {
            "statements": "c1"},
     "69": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
     "70": {"scalars": "uninterpreted", "statements": "c1"},
+    "82": {"scalars": "uninterpreted", "statements": "c1"},
     "71": {"scalars": "c2a", "residual": ["ASM-STATE-AFTER-ERROR"], "statements": "c1"},
     "74": {"scalars": "c2a",
            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-NO-CALLER-TXN"],
