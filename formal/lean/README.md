@@ -14,11 +14,11 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Core/Semantics.lean` | The fuel-based, executable interpreter, what a caller observes (out parameters, returned value, world, call list; decision 1) and `Refines` |
 | `Sqldiff/Core/Rename.lean` | An injective renaming of a routine's variables is observationally the same routine (`refines_rename`) |
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes, more fuel gives the same observation (`obs_mono`) |
-| `Sqldiff/Mirror/Ast.lean` | The C1 subset of the Rust routine syntax (`sqldiff-syntax`, `routine.rs` and `abstract_syntax.rs`), same constructors and field order, for both dialects; to be replaced by generated types |
-| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, as lowerings into the core; partial (`none` is "outside C1") |
+| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, as lowerings of the generated `Sqldiff.Ast.Routine` into the core; partial (`none` is "outside C1") |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming) and `check_sound` |
+| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding |
 | `Sqldiff/Mirror/Examples.lean` | Confirmed and refused pairs and interpreter runs, as `#guard`s checked on every build |
-| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash), one JSON answer per line on stdout. A request whose schema hash is not `Syntax.schemaHash`, or whose trees do not decode, is unconfirmed |
+| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout. A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
 | `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
@@ -37,9 +37,10 @@ The toolchain is pinned in `lean-toolchain`. Executable code imports only
 release target, and on Linux runs the Rust CLI's proof tests against it
 (`SQLDIFF_REAL_CHECK`).
 
-### Phase C1: the mirror check (not wired to the binary yet)
+### Phase C1: the mirror check (`sqldiff-check/3`)
 
-`Sqldiff.Mirror.check dep Γ cert a b` confirms a T-SQL routine `a` and a
+`Sqldiff.Mirror.check dep Γ cert a b`, served as the `sqldiff-check/3`
+request kind (`Main.lean`; `/2` is unchanged), confirms a T-SQL routine `a` and a
 PL/pgSQL routine `b` when `lowerP Γ b` is `lowerT dep a` with its variables
 renamed by `cert`, the renaming injective on `a`'s variables.
 `check_sound` says a confirmed answer means `b` refines `a` for every

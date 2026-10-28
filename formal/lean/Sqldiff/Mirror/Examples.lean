@@ -1,16 +1,16 @@
 /-
-Checked examples for the C1 mirror check: a T-SQL procedure and its
-PL/pgSQL mirror, confirmed; what the converter emits today, and variants
-that must not be confirmed; and runs of the core interpreter as an
-executable oracle. Every `#guard` runs on every `lake build`.
+Checked examples for the C1 mirror check, on the generated abstract syntax
+(`Sqldiff.Ast`): a T-SQL procedure and its PL/pgSQL mirror, confirmed;
+what the converter emits today, and variants that must not be confirmed;
+and runs of the core interpreter as an executable oracle. Every `#guard`
+runs on every `lake build`.
 -/
 import Sqldiff.Mirror.Check
 
 namespace Sqldiff.Mirror.Examples
 
-open Sqldiff.Core (ExprSem WorldModel Obs CallEvent Routine)
+open Sqldiff.Core (ExprSem WorldModel Obs CallEvent)
 open Sqldiff.Gate (Answer)
-open Ast
 
 def isConfirmed : Answer → Bool
   | .confirmed _ => true
@@ -22,22 +22,25 @@ def reasonOf : Answer → String
 
 /-! ## Building blocks -/
 
-def int : Ty := ⟨"int", []⟩
-def integer : Ty := ⟨"integer", []⟩
+def int : Ast.Ty := .Ty "int" []
+def integer : Ast.Ty := .Ty "integer" []
 /-- A T-SQL variable and a PL/pgSQL one. -/
-def tv (x : String) : Expr := .var x
-def pv (x : String) : Expr := .name [x]
-def num (n : Nat) : Expr := .num (toString n)
-def set (x v : Expr) : Node := .stmt (.assign x v)
-def ret (e : Option Expr) : Node := .stmt (.return_ e)
-def tsqlProc (name : List String) (ps : List Param) (body : List Node) : Ast.Routine :=
-  { kind := .procedure, name, params := ps, returns := none, security := .caller,
-    volatility := none, body := .mk [] body }
-def pgProc (name : List String) (ps : List Param) (decls : List Stmt) (body : List Node) :
-    Ast.Routine :=
-  { kind := .procedure, name, params := ps, returns := none, security := .caller,
-    volatility := none, body := .mk decls body }
-def returnCode : Param := ⟨"return_code", integer, .inOut, some .null⟩
+def tv (x : String) : Ast.Expr := .Var x
+def pv (x : String) : Ast.Expr := .Name [x]
+def num (n : Nat) : Ast.Expr := .Num (toString n)
+def fn (n : String) (args : List Ast.Expr) : Ast.Expr :=
+  .CallE (.CallF [n] args false [] false false false)
+def set (x v : Ast.Expr) : Ast.Node := .NStmt (.Assign x v)
+def ret (e : Option Ast.Expr) : Ast.Node := .NStmt (.Return e)
+def declT (x : String) (v : Option Ast.Expr) : Ast.Node := .NStmt (.Declare x (some int) v)
+def declP (x : String) (v : Option Ast.Expr) : Ast.Stmt := .Declare x (some integer) v
+def arg (e : Ast.Expr) (output : Bool) : Ast.Arg := .Arg none e output
+def tsqlProc (name : List String) (ps : List Ast.Param) (body : List Ast.Node) : Ast.Routine :=
+  .Routine .Procedure name ps none .Caller none (.Block [] body)
+def pgProc (name : List String) (ps : List Ast.Param) (decls : List Ast.Stmt)
+    (body : List Ast.Node) : Ast.Routine :=
+  .Routine .Procedure name ps none .Caller none (.Block decls body)
+def returnCode : Ast.Param := .Param "return_code" integer .InOut (some .Null)
 
 /-! ## The pair
 
@@ -77,41 +80,49 @@ END; $$;
 ```
 -/
 
-def srcT : Ast.Routine :=
-  tsqlProc ["dbo", "p"] [⟨"@a", int, .in_, none⟩, ⟨"@b", int, .inOut, some (num 2)⟩] [
-    .setting "NOCOUNT" true,
-    .stmt (.declare "@x" (some int) (some (num 1))),
-    .if_ (.bin ">" (tv "@a") (num 1)) [set (tv "@x") (num 2)]
-      [.if_ (.bin "<" (tv "@a") (num 0)) [.block (.mk [] [set (tv "@x") (num 3)])]
+def tsqlParams : List Ast.Param :=
+  [.Param "@a" int .In none, .Param "@b" int .InOut (some (num 2))]
+
+/-- The T-SQL procedure; `output` says whether `@b` is passed `OUTPUT`. -/
+def srcWith (output : Bool) : Ast.Routine :=
+  tsqlProc ["dbo", "p"] tsqlParams [
+    .Setting "NOCOUNT" true,
+    declT "@x" (some (num 1)),
+    .If (.Bin ">" (tv "@a") (num 1)) [set (tv "@x") (num 2)]
+      [.If (.Bin "<" (tv "@a") (num 0)) [.NBlock (.Block [] [set (tv "@x") (num 3)])]
         [set (tv "@x") (num 4)]],
-    .while (.bin "<" (tv "@x") (num 10)) [set (tv "@x") (.bin "+" (tv "@x") (num 1))],
-    .call ["dbo", "log_value"] [⟨none, tv "@x", false⟩, ⟨none, tv "@b", true⟩] none,
+    .While (.Bin "<" (tv "@x") (num 10)) [set (tv "@x") (.Bin "+" (tv "@x") (num 1))],
+    .Call ["dbo", "log_value"] [arg (tv "@x") false, arg (tv "@b") output] none,
     ret (some (tv "@x"))]
 
-/-- The PL/pgSQL body, with the two status lines as parameters. -/
-def pgBody (first : List Node) (status : Expr) : List Node :=
+def srcT : Ast.Routine := srcWith true
+
+/-- The PL/pgSQL body, with the two status lines and the `ELSIF` branches
+as parameters. -/
+def pgBody (first : List Ast.Node) (status : Ast.Expr) (b3 b4 : Nat := 3) : List Ast.Node :=
   first ++ [
     set (pv "v_x") (num 1),
-    .if_ (.bin ">" (pv "p_a") (num 1)) [set (pv "v_x") (num 2)]
-      [.if_ (.bin "<" (pv "p_a") (num 0)) [set (pv "v_x") (num 3)] [set (pv "v_x") (num 4)]],
-    .while (.bin "<" (pv "v_x") (num 10)) [set (pv "v_x") (.bin "+" (pv "v_x") (num 1))],
-    .call ["log_value"] [⟨none, pv "v_x", false⟩, ⟨none, pv "p_b", false⟩] none,
+    .If (.Bin ">" (pv "p_a") (num 1)) [set (pv "v_x") (num 2)]
+      [.If (.Bin "<" (pv "p_a") (num 0)) [set (pv "v_x") (num b3)]
+        [set (pv "v_x") (num (if b4 = 3 then 4 else b4))]],
+    .While (.Bin "<" (pv "v_x") (num 10)) [set (pv "v_x") (.Bin "+" (pv "v_x") (num 1))],
+    .Call ["log_value"] [arg (pv "v_x") false, arg (pv "p_b") false] none,
     set (pv "return_code") status,
     ret none]
 
-def pgParams : List Param :=
-  [⟨"p_a", integer, .in_, none⟩, ⟨"p_b", integer, .inOut, some (num 2)⟩, returnCode]
+def pgParams : List Ast.Param :=
+  [.Param "p_a" integer .In none, .Param "p_b" integer .InOut (some (num 2)), returnCode]
 
 def mirrorP : Ast.Routine :=
-  pgProc ["p"] pgParams [.declare "v_x" (some integer) none]
-    (pgBody [set (pv "return_code") (num 0)] (.call ["COALESCE"] [pv "v_x", num 0]))
+  pgProc ["p"] pgParams [declP "v_x" none]
+    (pgBody [set (pv "return_code") (num 0)] (fn "COALESCE" [pv "v_x", num 0]))
 
 /-- What the converter emits today. -/
 def todayP : Ast.Routine :=
-  pgProc ["p"] pgParams [.declare "v_x" (some integer) none] (pgBody [] (pv "v_x"))
+  pgProc ["p"] pgParams [declP "v_x" none] (pgBody [] (pv "v_x"))
 
 def dep : Deployment := { rowCounts := false, routines := [("dbo.log_value", "log_value")] }
-def Γ : Catalog := [("log_value", [.in_, .inOut, .inOut])]
+def Γ : Catalog := [("log_value", [.In, .InOut, .InOut])]
 def cert : Cert :=
   ⟨[("@a", "p_a"), ("@b", "p_b"), ("@x", "v_x"), (statusVar, "return_code")]⟩
 
@@ -120,21 +131,30 @@ def cert : Cert :=
 #guard isConfirmed (check dep Γ cert srcT mirrorP)
 -- The certificate's entries may come in any order.
 #guard isConfirmed (check dep Γ ⟨cert.vars.reverse⟩ srcT mirrorP)
+-- PostgreSQL folds unquoted names: `V_X`, `P_A` and `Log_Value` are `v_x`, `p_a`, `log_value`.
+#guard isConfirmed (check dep Γ cert srcT
+  (pgProc ["p"] [.Param "P_A" integer .In none, .Param "p_b" integer .InOut (some (num 2)),
+      returnCode] [declP "V_X" none]
+    ([set (pv "return_code") (num 0), set (pv "V_x") (num 1)] ++
+      (pgBody [] (fn "COALESCE" [pv "v_x", num 0])).drop 1 |>.map fun n =>
+        match n with
+        | .Call _ args r => .Call ["Log_Value"] args r
+        | n => n)))
 
 /-- `DECLARE` with a value inside a loop assigns on every iteration: the
 mirror declares at the top and assigns in the loop. -/
 def loopT : Ast.Routine :=
-  tsqlProc ["q"] [⟨"@n", int, .inOut, none⟩] [
-    .while (.bin "<" (tv "@n") (num 3)) [
-      .stmt (.declare "@y" (some int) (some (num 0))),
-      set (tv "@y") (.bin "+" (tv "@y") (num 1)),
-      set (tv "@n") (.bin "+" (tv "@n") (tv "@y"))]]
-def loopP (decl : Option Expr) (inLoop : List Node) : Ast.Routine :=
-  pgProc ["q"] [⟨"n", integer, .inOut, none⟩, returnCode] [.declare "y" (some integer) decl] [
+  tsqlProc ["q"] [.Param "@n" int .InOut none] [
+    .While (.Bin "<" (tv "@n") (num 3)) [
+      declT "@y" (some (num 0)),
+      set (tv "@y") (.Bin "+" (tv "@y") (num 1)),
+      set (tv "@n") (.Bin "+" (tv "@n") (tv "@y"))]]
+def loopP (decl : Option Ast.Expr) (inLoop : List Ast.Node) : Ast.Routine :=
+  pgProc ["q"] [.Param "n" integer .InOut none, returnCode] [declP "y" decl] [
     set (pv "return_code") (num 0),
-    .while (.bin "<" (pv "n") (num 3)) (inLoop ++ [
-      set (pv "y") (.bin "+" (pv "y") (num 1)),
-      set (pv "n") (.bin "+" (pv "n") (pv "y"))])]
+    .While (.Bin "<" (pv "n") (num 3)) (inLoop ++ [
+      set (pv "y") (.Bin "+" (pv "y") (num 1)),
+      set (pv "n") (.Bin "+" (pv "n") (pv "y"))])]
 def loopCert : Cert := ⟨[("@n", "n"), ("@y", "y"), (statusVar, "return_code")]⟩
 
 #guard isConfirmed (check dep [] loopCert loopT (loopP none [set (pv "y") (num 0)]))
@@ -152,15 +172,9 @@ never NULL and every path ends in `RETURN`, so the outputs happen to agree
   "the lowered routines differ beyond the renaming"
 
 -- The `ELSIF` branches swapped.
-#guard reasonOf (check dep Γ cert srcT (pgProc ["p"] pgParams [.declare "v_x" (some integer) none]
-    [set (pv "return_code") (num 0),
-     set (pv "v_x") (num 1),
-     .if_ (.bin ">" (pv "p_a") (num 1)) [set (pv "v_x") (num 2)]
-       [.if_ (.bin "<" (pv "p_a") (num 0)) [set (pv "v_x") (num 4)] [set (pv "v_x") (num 3)]],
-     .while (.bin "<" (pv "v_x") (num 10)) [set (pv "v_x") (.bin "+" (pv "v_x") (num 1))],
-     .call ["log_value"] [⟨none, pv "v_x", false⟩, ⟨none, pv "p_b", false⟩] none,
-     set (pv "return_code") (.call ["COALESCE"] [pv "v_x", num 0]),
-     ret none])) == "the lowered routines differ beyond the renaming"
+#guard reasonOf (check dep Γ cert srcT (pgProc ["p"] pgParams [declP "v_x" none]
+    (pgBody [set (pv "return_code") (num 0)] (fn "COALESCE" [pv "v_x", num 0]) 4 3))) ==
+  "the lowered routines differ beyond the renaming"
 
 /- A wrong renaming: `@a` and `@x` exchanged. Consistent and injective, but
 the renamed source is not the target. -/
@@ -180,20 +194,13 @@ the renamed source is not the target. -/
 
 /- `EXEC` without `OUTPUT` does not copy `@b` back; the `CALL` to an
 `INOUT` parameter does. -/
-#guard reasonOf (check dep Γ cert
-    { srcT with body := .mk [] [
-        .setting "NOCOUNT" true,
-        .stmt (.declare "@x" (some int) (some (num 1))),
-        .if_ (.bin ">" (tv "@a") (num 1)) [set (tv "@x") (num 2)]
-          [.if_ (.bin "<" (tv "@a") (num 0)) [set (tv "@x") (num 3)] [set (tv "@x") (num 4)]],
-        .while (.bin "<" (tv "@x") (num 10)) [set (tv "@x") (.bin "+" (tv "@x") (num 1))],
-        .call ["dbo", "log_value"] [⟨none, tv "@x", false⟩, ⟨none, tv "@b", false⟩] none,
-        ret (some (tv "@x"))] }
-    mirrorP) == "the lowered routines differ beyond the renaming"
+#guard reasonOf (check dep Γ cert (srcWith false) mirrorP) ==
+  "the lowered routines differ beyond the renaming"
 
 -- T-SQL `OUTPUT` is `INOUT`; an `OUT` parameter starts NULL.
 #guard !isConfirmed (check dep Γ cert srcT
-  { mirrorP with params := [⟨"p_a", integer, .in_, none⟩, ⟨"p_b", integer, .out, none⟩, returnCode] })
+  (pgProc ["p"] [.Param "p_a" integer .In none, .Param "p_b" integer .Out none, returnCode]
+    [declP "v_x" none] (pgBody [set (pv "return_code") (num 0)] (fn "COALESCE" [pv "v_x", num 0]))))
 
 -- An observer that reads row counts: `SET NOCOUNT ON` is outside C1.
 #guard reasonOf (check { dep with rowCounts := true } Γ cert srcT mirrorP) ==
@@ -207,9 +214,53 @@ the renamed source is not the target. -/
 /- `@I` and `@i` are one variable or two depending on the collation:
 outside the spec. -/
 #guard reasonOf (check dep [] ⟨[("@I", "a"), ("@i", "b"), (statusVar, "return_code")]⟩
-    (tsqlProc ["r"] [⟨"@I", int, .inOut, none⟩] [set (tv "@i") (num 1)])
-    (pgProc ["r"] [⟨"a", integer, .inOut, none⟩, returnCode] []
+    (tsqlProc ["r"] [.Param "@I" int .InOut none] [declT "@i" none, set (tv "@i") (num 1)])
+    (pgProc ["r"] [.Param "a" integer .InOut none, returnCode] [declP "b" none]
       [set (pv "return_code") (num 0), set (pv "b") (num 1)])) ==
+  "the T-SQL routine is outside the C1 spec"
+
+/- PostgreSQL folds `X` to `x`: `DECLARE X int; x int;` declares one name
+twice, and `X := 1; out1 := x` reads the 1 just written. Without the fold
+the core would see two variables, and this pair, where T-SQL has two
+variables and returns NULL in `@out`, would be confirmed. -/
+def twoT : Ast.Routine :=
+  tsqlProc ["r"] [.Param "@out" int .InOut none]
+    [declT "@x" none, declT "@y" none, set (tv "@x") (num 1), set (tv "@out") (tv "@y")]
+def oneP : Ast.Routine :=
+  pgProc ["r"] [.Param "out1" integer .InOut none, returnCode] [declP "X" none, declP "x" none]
+    [set (pv "return_code") (num 0), set (pv "X") (num 1), set (pv "out1") (pv "x")]
+#guard reasonOf (check dep [] ⟨[("@out", "out1"), ("@x", "X"), ("@y", "x"),
+    (statusVar, "return_code")]⟩ twoT oneP) == "the PL/pgSQL routine is outside the C1 spec"
+-- With `"X` quoted on both uses the names are distinct, and the pair is a mirror.
+#guard isConfirmed (check dep [] ⟨[("@out", "out1"), ("@x", "\"X"), ("@y", "y"),
+    (statusVar, "return_code")]⟩ twoT
+  (pgProc ["r"] [.Param "out1" integer .InOut none, returnCode] [declP "\"X" none, declP "y" none]
+    [set (pv "return_code") (num 0), set (pv "\"X") (num 1), set (pv "out1") (pv "y")]))
+
+-- An undeclared PL/pgSQL name is an error in PostgreSQL, not a NULL.
+#guard reasonOf (check dep [] ⟨[("@out", "out1"), ("@y", "y"), (statusVar, "return_code")]⟩
+    (tsqlProc ["r"] [.Param "@out" int .InOut none] [declT "@y" none, set (tv "@out") (tv "@y")])
+    (pgProc ["r"] [.Param "out1" integer .InOut none, returnCode] []
+      [set (pv "return_code") (num 0), set (pv "out1") (pv "y")])) ==
+  "the PL/pgSQL routine is outside the C1 spec"
+
+-- `@@ROWCOUNT` is a system function, not a variable.
+#guard reasonOf (check dep [] ⟨[("@x", "x"), (statusVar, "return_code")]⟩
+    (tsqlProc ["r"] [.Param "@x" int .InOut none] [set (tv "@x") (tv "@@ROWCOUNT")])
+    (pgProc ["r"] [.Param "x" integer .InOut none, returnCode] []
+      [set (pv "return_code") (num 0), set (pv "x") (pv "row_count")])) ==
+  "the T-SQL routine is outside the C1 spec"
+
+/- `EXEC @rc = p @a`: the status is `p`'s last parameter, which C1 cannot
+place without `p`'s arity, so this is outside C1. (Appending `@rc` after
+the arguments would have confirmed `CALL p(a, rc)` passing `rc` into an
+ordinary second parameter.) -/
+#guard reasonOf (check { dep with routines := [("p2", "p2")] } [("p2", [.In, .InOut, .InOut])]
+    ⟨[("@a", "a"), ("@rc", "rc"), (statusVar, "return_code")]⟩
+    (tsqlProc ["r"] [.Param "@a" int .In none]
+      [declT "@rc" none, .Call ["p2"] [arg (tv "@a") false] (some (tv "@rc"))])
+    (pgProc ["r"] [.Param "a" integer .In none, returnCode] [declP "rc" none]
+      [set (pv "return_code") (num 0), .Call ["p2"] [arg (pv "a") false, arg (pv "rc") false] none])) ==
   "the T-SQL routine is outside the C1 spec"
 
 -- A PostgreSQL procedure cannot `RETURN` a value.
@@ -220,13 +271,19 @@ outside the spec. -/
 
 -- A nested PL/pgSQL block with its own `DECLARE` re-initialises on entry.
 #guard reasonOf (check dep [] loopCert loopT
-    (pgProc ["q"] [⟨"n", integer, .inOut, none⟩, returnCode] [] [
+    (pgProc ["q"] [.Param "n" integer .InOut none, returnCode] [] [
       set (pv "return_code") (num 0),
-      .while (.bin "<" (pv "n") (num 3)) [
-        .block (.mk [.declare "y" (some integer) (some (num 0))] [
-          set (pv "y") (.bin "+" (pv "y") (num 1)),
-          set (pv "n") (.bin "+" (pv "n") (pv "y"))])]])) ==
+      .While (.Bin "<" (pv "n") (num 3)) [
+        .NBlock (.Block [declP "y" (some (num 0))] [
+          set (pv "y") (.Bin "+" (pv "y") (num 1)),
+          set (pv "n") (.Bin "+" (pv "n") (pv "y"))])]])) ==
   "the PL/pgSQL routine is outside the C1 spec"
+
+-- A query is outside C1.
+#guard reasonOf (check dep [] ⟨[(statusVar, "return_code")]⟩
+    (tsqlProc ["r"] [] [.NStmt (.Delete ["t"] none [] none)])
+    (pgProc ["r"] [returnCode] [] [set (pv "return_code") (num 0)])) ==
+  "the T-SQL routine is outside the C1 spec"
 
 /-! ## The core as an executable oracle
 
@@ -278,9 +335,8 @@ def P := lowerP Γ mirrorP
 `return_code := v_x` gives NULL. And a procedure that ends without
 `RETURN e` has status 0, while `return_code` keeps what the caller passed
 (NULL by default). -/
-def nullT : Ast.Routine :=
-  tsqlProc ["s"] [] [.stmt (.declare "@x" (some int) none), ret (some (tv "@x"))]
-def nullP : Ast.Routine := pgProc ["s"] [returnCode] [.declare "v_x" (some integer) none]
+def nullT : Ast.Routine := tsqlProc ["s"] [] [declT "@x" none, ret (some (tv "@x"))]
+def nullP : Ast.Routine := pgProc ["s"] [returnCode] [declP "v_x" none]
   [set (pv "return_code") (pv "v_x"), ret none]
 #guard run (lowerT dep nullT) [] 10 == some (.done [some 0] none 0 [])
 #guard run (lowerP [] nullP) [] 10 == some (.done [none] none 0 [])

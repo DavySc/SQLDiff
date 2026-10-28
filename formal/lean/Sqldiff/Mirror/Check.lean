@@ -59,9 +59,9 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
   | none, _ => .unconfirmed "the T-SQL routine is outside the C1 spec"
   | _, none => .unconfirmed "the PL/pgSQL routine is outside the C1 spec"
   | some ca, some cb =>
-    if a.kind ≠ b.kind then
+    if (header a).1 != (header b).1 then
       .unconfirmed "a procedure and a function"
-    else if a.security ≠ b.security then
+    else if (header a).2 != (header b).2 then
       .unconfirmed "the routines run with different privileges"
     else if !cert.consistent then
       .unconfirmed "certificate: a T-SQL variable is given two PL/pgSQL names"
