@@ -57,6 +57,7 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            catalogs: Vec::new(),
         }
     }
 
@@ -128,6 +129,7 @@ impl Fixture {
                 input_hash: file_hash(&inputs[k].text),
                 output_hash: file_hash(&t.conversions[k].output),
                 text: None,
+                base_catalogs: None,
             },
         )
         .unwrap();

@@ -37,6 +37,7 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            catalogs: Vec::new(),
         };
         let (inputs, unreadable) = tree::read(&a).unwrap();
         let mut t = tree::convert(&a, &inputs, unreadable, Some(&self.out())).unwrap();
@@ -168,6 +169,7 @@ fn record(input: &str, out: &str, unit: &str, rule: &str, state: State, by: By) 
         input_hash: file_hash(input),
         output_hash: file_hash(out),
         text: None,
+        base_catalogs: None,
     }
 }
 

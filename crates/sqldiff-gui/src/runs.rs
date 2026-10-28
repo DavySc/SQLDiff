@@ -1326,6 +1326,7 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
             template,
             extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,
+            catalogs: Vec::new(),
         },
         out: out.clone(),
         overwrite: spec.overwrite,

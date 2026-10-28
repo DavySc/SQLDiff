@@ -57,6 +57,7 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            catalogs: Vec::new(),
         }
     }
 
@@ -441,6 +442,7 @@ fn a_text_written_into_the_ledger_is_converted_in_on_refresh() {
         input_hash: String::new(),
         output_hash: String::new(),
         text: Some("CREATE TABLE t (a integer NOT NULL);".into()),
+        base_catalogs: None,
     };
     let mut ledger = std::fs::OpenOptions::new()
         .create(true)

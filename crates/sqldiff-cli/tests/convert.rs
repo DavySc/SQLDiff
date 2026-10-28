@@ -521,6 +521,7 @@ fn a_template_unit_written_by_hand_is_spliced_in_unchecked() {
         input_hash: file_hash(proc),
         output_hash: file_hash(&before),
         text: Some(text.into()),
+        base_catalogs: None,
     };
     std::fs::write(
         out.join(LEDGER_FILE),

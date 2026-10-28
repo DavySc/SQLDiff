@@ -106,6 +106,12 @@ pub struct Record {
     /// while that unit exists; the hashes are not compared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// `base::hash` of the base catalogs the conversion bound against
+    /// (`--catalog`), none without any. A decision applies only while the
+    /// conversion binds against the same contents: what a base object is
+    /// changes what the unit binds to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_catalogs: Option<String>,
 }
 
 /// The decisions read from a ledger, last record per (unit, rule, state
@@ -331,6 +337,19 @@ pub struct FileReview {
 /// the tree, `input` the text that was converted and `c` its conversion as
 /// checked.
 pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> FileReview {
+    review_file_in(path, input, c, ledger, None)
+}
+
+/// [`review_file`] for a conversion bound against base catalogs with
+/// `base::hash` `base` (`None` without any): a decision recorded with other
+/// base catalogs, or none, does not apply.
+pub fn review_file_in(
+    path: &str,
+    input: &str,
+    c: &Conversion,
+    ledger: &Ledger,
+    base: Option<&str>,
+) -> FileReview {
     let ids = unit_ids(path, input, c);
     let (ih, oh) = (file_hash(input), file_hash(&c.output));
     let mut units = Vec::new();
@@ -341,6 +360,8 @@ pub fn review_file(path: &str, input: &str, c: &Conversion, ledger: &Ledger) -> 
             .map(|r| {
                 let why_not = if r.input_hash != ih || r.output_hash != oh {
                     Some(FILE_CHANGED.to_string())
+                } else if r.base_catalogs.as_deref() != base {
+                    Some(CATALOGS_CHANGED.to_string())
                 } else {
                     fits(u, r).err()
                 };
@@ -521,6 +542,10 @@ impl Ledger {
 
 /// `Applied::why_not` of a decision made on other bytes of the file.
 pub const FILE_CHANGED: &str = "the file changed since: confirm it again";
+
+/// `Applied::why_not` of a decision made with other base catalogs (or none).
+pub const CATALOGS_CHANGED: &str =
+    "the base catalogs changed since (other files or contents, or none then): confirm it again";
 
 /// Appends a record to the ledger in `out` after checking it is allowed.
 /// The caller sets `by` from who it is, never from its own caller.
