@@ -6,6 +6,7 @@ use sqldiff_syntax::{ast, SyntaxKind, SyntaxNode};
 
 use crate::artifact::{snippet_of, Analyzed};
 use crate::classify::{stmt_kind, StmtKind};
+use crate::coverage::{Part, Receipt};
 use crate::model::{fingerprint, ChangeClass, Finding, FingerprintInput, Verdict};
 use crate::normalize::{
     loose_hash, norm_of, norm_tokens, similarity, strict_hash, token_hunks, NormTok,
@@ -70,6 +71,8 @@ pub struct TreeDiff {
     pub structural: usize,
     /// T-SQL identifiers matched only case-insensitively.
     pub used_case_insensitive_idents: bool,
+    /// What the diff vouches for (`coverage::unreceipted`).
+    pub receipts: Vec<Receipt>,
 }
 
 pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
@@ -89,6 +92,7 @@ pub fn diff(a: &Analyzed, b: &Analyzed) -> TreeDiff {
             cosmetic: 0,
             structural: 0,
             used_case_insensitive_idents: false,
+            receipts: Vec::new(),
         },
         removed: Vec::new(),
         added: Vec::new(),
@@ -151,6 +155,9 @@ impl Ctx<'_, '_> {
         if self.a.artifact.text[xs..xe] != self.b.artifact.text[ys..ye] {
             self.out.cosmetic += 1;
         }
+        self.out
+            .receipts
+            .push(Receipt::Same(x.node.clone(), y.node.clone()));
         self.case_only(x, y);
     }
 
@@ -322,6 +329,10 @@ impl Ctx<'_, '_> {
         }
         if x.header_hash != y.header_hash {
             self.push_change(x, y, &x.header, &y.header, "header.modified");
+        } else {
+            self.out
+                .receipts
+                .push(Receipt::Shell(x.node.clone(), y.node.clone()));
         }
         self.diff_lists(&x.children, &y.children);
     }
@@ -351,6 +362,18 @@ impl Ctx<'_, '_> {
         }
         if class == ChangeClass::Structural {
             self.out.structural += 1;
+            let part = |u: &Unit| {
+                if rule == "header.modified" {
+                    Part::Own(u.node.clone())
+                } else {
+                    Part::Whole(u.node.clone())
+                }
+            };
+            self.out.receipts.push(Receipt::Judged {
+                rule: "a change of structure only (treediff)",
+                a: Some(part(x)),
+                b: Some(part(y)),
+            });
             return;
         }
         let what = match (rule, x.kind) {
@@ -429,6 +452,11 @@ impl Ctx<'_, '_> {
             (ChangeClass::Semantic, Verdict::Unknown)
         } else {
             self.out.structural += 1;
+            self.out.receipts.push(Receipt::Judged {
+                rule: "a statement without effects moved (treediff)",
+                a: Some(Part::Whole(x.node.clone())),
+                b: Some(Part::Whole(y.node.clone())),
+            });
             return;
         };
         let witness = format!(
@@ -501,6 +529,12 @@ impl Ctx<'_, '_> {
     fn push_unpaired(&mut self, u: &Unit, removed: bool) {
         if u.node.kind() == SyntaxKind::LABEL {
             self.out.structural += 1;
+            let p = Some(Part::Whole(u.node.clone()));
+            self.out.receipts.push(Receipt::Judged {
+                rule: "a label added or removed (treediff)",
+                a: if removed { p.clone() } else { None },
+                b: if removed { None } else { p },
+            });
             return;
         }
         let (class, verdict) = if u.effectful {

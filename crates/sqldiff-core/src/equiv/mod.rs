@@ -50,6 +50,8 @@ pub struct Outcome {
     pub equal: usize,
     /// Why B only refines A (`compare::Cmp::refinements`).
     pub refinements: Vec<String>,
+    /// The statement pairs decided here (`coverage::unreceipted`).
+    pub receipts: Vec<crate::coverage::Receipt>,
 }
 
 impl Outcome {
@@ -2166,7 +2168,13 @@ pub fn refine_modified(
                 eprintln!("=> {} {:?} {}", g.rule, g.verdict, g.witness);
             }
         }
+        let settled = crate::coverage::Receipt::Judged {
+            rule: "statement equivalence",
+            a: f.a.as_ref().map(crate::coverage::Part::at),
+            b: f.b.as_ref().map(crate::coverage::Part::at),
+        };
         if sub.findings.is_empty() {
+            out.receipts.push(settled);
             out.structural += 1;
             for s in sub.assumptions {
                 out.assume(s);
@@ -2178,6 +2186,7 @@ pub fn refine_modified(
                 out.refine(r);
             }
         } else if sub.findings.iter().any(|g| g.verdict == Verdict::Different) {
+            out.receipts.push(settled);
             for s in sub.assumptions {
                 out.assume(s);
             }

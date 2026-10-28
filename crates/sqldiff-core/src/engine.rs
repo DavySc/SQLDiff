@@ -147,6 +147,8 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let schema_a = equiv::schema::Schema::from_view(&view_a);
     let schema_b = equiv::schema::Schema::from_view(&view_b);
     let mut eq = equiv::Outcome::default();
+    // What the same-dialect comparison vouches for (`coverage::unreceipted`).
+    let mut receipts = Vec::new();
 
     if same {
         let mut td = treediff::diff(&aa, &ab);
@@ -165,7 +167,17 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                     && (f.b.is_none() || text(&f.b, &ab))
             };
             let before = td.findings.len();
-            td.findings.retain(|f| !nocount(f));
+            td.findings.retain(|f| {
+                let keep = !nocount(f);
+                if !keep {
+                    td.receipts.push(crate::coverage::Receipt::Judged {
+                        rule: "observer profile: row counts are not observed",
+                        a: f.a.as_ref().map(crate::coverage::Part::at),
+                        b: f.b.as_ref().map(crate::coverage::Part::at),
+                    });
+                }
+                keep
+            });
             if td.findings.len() < before {
                 td.structural += before - td.findings.len();
                 assumptions.push(crate::observer::rowcount_assumption());
@@ -174,6 +186,8 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
+        receipts.append(&mut td.receipts);
+        receipts.append(&mut eq.receipts);
         noise.cosmetic = td.cosmetic;
         noise.structural = td.structural + eq.structural;
         match a.dialect.lexical().folding {
@@ -302,6 +316,11 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 
     if let Some(why) = crate::coverage::uncovered(&aa, &ab) {
         unknown_reasons.push(why);
+    }
+    if same {
+        if let Some(why) = crate::coverage::unreceipted(&aa, &ab, &receipts, &findings) {
+            unknown_reasons.push(why);
+        }
     }
 
     let mut diagnostics = aa.diagnostics();
