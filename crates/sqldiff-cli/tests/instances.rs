@@ -848,8 +848,12 @@ fn the_generators_own_output_is_checked_alone() {
     );
     assert_eq!(r["generator_only"], true);
     for i in r["instances"].as_array().unwrap() {
-        if i["status"] != "converted" {
+        // The one procedure sends rows-affected counts; everything else is
+        // plainly converted.
+        if i["name"] == "procs/TouchCustomer" {
             converted_but_row_counts(i);
+        } else {
+            assert_eq!(i["status"], "converted", "{i}");
         }
         assert_eq!(i["done"], true, "{i}");
     }
