@@ -235,7 +235,7 @@ sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[assumption]]
 id = "ASM-CI-COLLATION"
-statement = "String comparisons give the same result on both sides: the data's letter case is consistent, or the target compares case-insensitively."
+statement = "String comparisons give the same result on both sides: the data's letter case is consistent (or the target compares case-insensitively), and no compared value differs from another only by trailing spaces (T-SQL ignores trailing spaces in =, <> and <; PostgreSQL varchar and text do not)."
 discharge = "catalog"
 fact = "The collations of both sides (T-SQL's default is case-insensitive)."
 fact_key = "collation"
@@ -260,7 +260,7 @@ id = "ASM-CONCAT-NULL"
 statement = "T-SQL sessions run with CONCAT_NULL_YIELDS_NULL ON (the default)."
 discharge = "deployment"
 fact = "No session sets CONCAT_NULL_YIELDS_NULL OFF."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-CONCURRENT-WRITERS"
@@ -987,6 +987,27 @@ id = "ASM-TABLES-AS-DECLARED"
 statement = "The tables a converted routine writes are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree."
 discharge = "catalog"
 fact = "Both databases' catalogs: the tables' definitions match the tree's CREATE TABLE statements."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-BINARY-COLLATION"
+statement = "The T-SQL database's default collation is binary (_BIN or _BIN2), and every collation a PostgreSQL string comparison of the routine can take (including its callers' arguments) is deterministic: two strings compare equal only when they are the same characters (T-SQL ignoring trailing spaces)."
+discharge = "deployment"
+fact = "The databases' collations. Accepting this id makes the proof checker take it as given for string comparisons."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-LEN-BMP"
+statement = "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
+discharge = "deployment"
+fact = "The data the routines see, or the collation."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-STRING-ARGS"
+statement = "Every string argument a caller passes to a converted T-SQL routine fits the parameter's declared length (and, for varchar, its code page): T-SQL truncates it silently, PostgreSQL does not."
+discharge = "deployment"
+fact = "What callers pass."
 sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]

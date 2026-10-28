@@ -50,7 +50,9 @@ impl Certificates {
     /// the proof stands where the engine did not compare (`not proven`
     /// only because of `equiv.not-compared`), and a `c2a` confirmation
     /// discharges the converter assumptions it proves
-    /// (`cert::DISCHARGED_BY_C2A`). A difference is never overridden.
+    /// (`cert::DISCHARGED_BY_C2A`) and every residual id it would name when
+    /// needed but did not (`ASM-CONCAT-NULL` after a leading
+    /// `SET CONCAT_NULL_YIELDS_NULL ON`). A difference is never overridden.
     pub fn gate(
         &self,
         w: &Written,
@@ -112,7 +114,13 @@ impl Certificates {
                         crate::Status::Assumptions => {
                             let proven = proof.is_some_and(|c| {
                                 c.scalars.as_deref() == Some("c2a")
-                                    && crate::cert::DISCHARGED_BY_C2A.contains(&n.rule.as_str())
+                                    && (crate::cert::DISCHARGED_BY_C2A
+                                        .contains(&n.rule.as_str())
+                                        // A residual id the slice names when it is
+                                        // needed, and did not name here.
+                                        || (crate::cert::C2A_RESIDUALS
+                                            .contains(&n.rule.as_str())
+                                            && !c.assumptions.contains(&n.rule)))
                             });
                             !proven && !accepted(&n.rule)
                         }
@@ -213,6 +221,15 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
             job.tree.from,
             job.tree.to,
         );
+        let trusted = crate::cert::Trusted {
+            tables,
+            row_counts: job.row_counts,
+            binary_collation: !job
+                .tree
+                .deployment
+                .accepting(crate::cert::BINARY_COLLATION)
+                .is_empty(),
+        };
         let mut files = Vec::new();
         for (k, f) in t.report.files.iter().enumerate() {
             let (Some(input), Some(output)) =
@@ -226,8 +243,7 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
                 output,
                 job.tree.from,
                 job.tree.to,
-                &tables,
-                job.row_counts,
+                &trusted,
                 checker,
             );
             if !routines.is_empty() {

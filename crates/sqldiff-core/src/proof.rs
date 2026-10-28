@@ -248,6 +248,10 @@ pub struct MirrorRequest {
     /// Target tables (trusted): sent only when both catalogs show every
     /// fact a [`MirrorTable`] asserts.
     pub table_catalog: Vec<MirrorTable>,
+    /// Trusted (C2b): the T-SQL database has a binary (`_BIN`/`_BIN2`)
+    /// default collation and every collation a PostgreSQL comparison of
+    /// the routine can take is deterministic (`ASM-BINARY-COLLATION`).
+    pub binary_collation: bool,
     /// Source variable (with `@`) to target name; the T-SQL return status
     /// is `%status`.
     pub renaming: Vec<(String, String)>,
@@ -338,6 +342,10 @@ impl MirrorRequest {
             .iter()
             .map(|(n, m)| format!("{}:{m}", hex(n)))
             .chain(tables)
+            .chain(
+                self.binary_collation
+                    .then(|| "!binary-collation".to_string()),
+            )
             .collect::<Vec<_>>()
             .join(",");
         Some(format!(
@@ -710,6 +718,7 @@ mod tests {
                     col("total", "Total", true, false),
                 ],
             }],
+            binary_collation: true,
             renaming: Vec::new(),
             source: "(R)".into(),
             target: "(R)".into(),
@@ -719,7 +728,7 @@ mod tests {
         assert_eq!(f[4], "0;64626f2e41636374:61636374");
         assert_eq!(
             f[5],
-            "70:ib,61636374=6964.ink.4964/717479.i.517479/746f74616c.in.546f74616c"
+            "70:ib,61636374=6964.ink.4964/717479.i.517479/746f74616c.in.546f74616c,!binary-collation"
         );
     }
 }

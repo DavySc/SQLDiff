@@ -95,11 +95,34 @@ pub const C1_NO_ERRORS: &str = "ASM-C1-NO-ERRORS";
 /// OFF), and compares with NULL as UNKNOWN (ANSI_NULLS ON); and what the
 /// caller sees of the database after an error is not compared (T-SQL keeps
 /// earlier writes that PostgreSQL rolls back with the failed `CALL`).
-pub const C2A_RESIDUALS: [&str; 3] = [
+/// With strings (C2b): sessions concatenate NULL to NULL, collations are
+/// binary (only sent when the deployment accepts it), `LEN` sees no
+/// character outside the BMP, and string arguments fit their parameters.
+pub const C2A_RESIDUALS: [&str; 7] = [
     "ASM-TSQL-ARITH-ERRORS",
     "ASM-TSQL-ANSI-NULLS",
     "ASM-STATE-AFTER-ERROR",
+    "ASM-CONCAT-NULL",
+    BINARY_COLLATION,
+    "ASM-TSQL-LEN-BMP",
+    "ASM-TSQL-STRING-ARGS",
 ];
+
+/// The collation fact the checker takes as given when the deployment
+/// accepts it: string comparisons are then in the slice.
+pub const BINARY_COLLATION: &str = "ASM-BINARY-COLLATION";
+
+/// What Rust tells the checker that it cannot see, each from a stated
+/// source.
+#[derive(Debug, Clone, Default)]
+pub struct Trusted {
+    /// Plain tables of the tree ([`Tables`]).
+    pub tables: Tables,
+    /// The observer reads rows-affected counts (observer profile).
+    pub row_counts: bool,
+    /// The deployment profile accepts [`BINARY_COLLATION`].
+    pub binary_collation: bool,
+}
 
 /// A T-SQL procedure that returns NULL returns 0 with a warning message;
 /// the converted procedure returns 0 without it.
@@ -444,9 +467,9 @@ pub fn mirror_request(
     a: &Routine,
     b: &Routine,
     output_routines: &[Routine],
-    tables: &Tables,
-    row_counts: bool,
+    trusted: &Trusted,
 ) -> Result<(MirrorRequest, Vec<String>), String> {
+    let (tables, row_counts) = (&trusted.tables, trusted.row_counts);
     let renaming = propose_renaming(a, b)?;
     let mut assumptions = Vec::new();
     if a.kind == RoutineKind::Procedure {
@@ -488,6 +511,11 @@ pub fn mirror_request(
     if !written.is_empty() && !row_counts {
         assumptions.push("ASM-OBSERVER-ROWCOUNT".to_string());
     }
+    // Answers on the C1 theorem carry no residual: the record keeps the
+    // fact visible whatever the answer.
+    if trusted.binary_collation {
+        assumptions.push(BINARY_COLLATION.to_string());
+    }
     let catalog = output_routines
         .iter()
         .map(|r| {
@@ -507,6 +535,7 @@ pub fn mirror_request(
             catalog,
             tables: table_pairs,
             table_catalog,
+            binary_collation: trusted.binary_collation,
             renaming,
             source: encode::routine(a),
             target: encode::routine(b),
@@ -522,8 +551,7 @@ pub fn certify(
     output: &str,
     from: Dialect,
     to: Dialect,
-    tables: &Tables,
-    row_counts: bool,
+    trusted: &Trusted,
     checker: Option<&dyn Checker>,
 ) -> Vec<Certificate> {
     let src = routines(input, from);
@@ -560,7 +588,7 @@ pub fn certify(
             (Ok(a), Some(Ok(b))) => {
                 c.source = Some(sha(&encode::routine(&a)));
                 c.target = Some(sha(&encode::routine(&b)));
-                match mirror_request(&a, &b, &readable, tables, row_counts) {
+                match mirror_request(&a, &b, &readable, trusted) {
                     Err(e) => Answer::Unconfirmed {
                         reason: format!("no renaming pairs the two routines: {e}"),
                     },
@@ -574,13 +602,19 @@ pub fn certify(
                                 let m = k.check_mirror(&req);
                                 match m.answer {
                                     proof::Answer::Confirmed { theorem } => {
-                                        c.scalars = m.scalars.clone();
-                                        c.statements = m.statements.clone();
                                         c.assumptions = confirmed_rests_on(
                                             m.scalars.as_deref(),
                                             &m.residual,
                                             assumptions,
                                         );
+                                        // `c2a` only where its residual was taken.
+                                        c.scalars =
+                                            if c.assumptions.iter().any(|a| a == C1_OPERATORS) {
+                                                Some("uninterpreted".to_string())
+                                            } else {
+                                                m.scalars.clone()
+                                            };
+                                        c.statements = m.statements.clone();
                                         Answer::Confirmed {
                                             theorems: vec![theorem],
                                         }
@@ -671,8 +705,7 @@ END
             &out,
             Dialect::Tsql,
             Dialect::Postgres,
-            &Tables::default(),
-            false,
+            &Trusted::default(),
             None,
         );
         assert_eq!(certs.len(), 1, "{out}");
@@ -700,8 +733,7 @@ END
             d.output(),
             Dialect::Tsql,
             Dialect::Postgres,
-            &Tables::default(),
-            false,
+            &Trusted::default(),
             None,
         );
         let Answer::Unconfirmed { reason } = &certs[0].answer else {
@@ -723,8 +755,7 @@ END
             a[1].2.as_ref().unwrap(),
             b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
             &readable,
-            &Tables::default(),
-            false,
+            &Trusted::default(),
         )
         .unwrap();
         assert_eq!(req.routines, [("dbo.q".to_string(), "q".to_string())]);
@@ -772,7 +803,11 @@ END
             .output()
             .to_string();
         let b = routines(&p, Dialect::Postgres).remove(0).2.unwrap();
-        let (req, asm) = mirror_request(&a, &b, &[], &t, false).unwrap();
+        let trusted = Trusted {
+            tables: t.clone(),
+            ..Default::default()
+        };
+        let (req, asm) = mirror_request(&a, &b, &[], &trusted).unwrap();
         assert_eq!(req.tables, [("dbo.Acct".to_string(), "acct".to_string())]);
         assert_eq!(req.table_catalog, std::slice::from_ref(acct));
         for x in [

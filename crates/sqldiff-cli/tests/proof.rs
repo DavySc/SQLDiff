@@ -434,3 +434,63 @@ fn the_real_checker_confirms_data_statements_on_a_plain_table() {
     let r = run();
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
+
+/// C2b end to end: concatenation and ISNULL over bounded string variables
+/// are confirmed in the slice, and the leading SET CONCAT_NULL_YIELDS_NULL
+/// ON discharges ASM-CONCAT-NULL in the release gate. A string `=` is
+/// refused once the collation is trusted: T-SQL ignores trailing spaces,
+/// the converted comparison does not.
+#[test]
+fn the_real_checker_confirms_strings_and_refuses_a_padded_comparison() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2b-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let config = write(
+        &d,
+        "config.toml",
+        "[deployment]\naccept = [\"ASM-BINARY-COLLATION\"]\n",
+    );
+    let run = |body: &str| {
+        write(&src, "p.sql", &format!("CREATE PROCEDURE dbo.greet @n int, @out varchar(40) OUTPUT\nAS\nBEGIN\n  SET CONCAT_NULL_YIELDS_NULL ON;\n  DECLARE @v varchar(10) = 'abc';\n{body}END\n"));
+        let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args([
+                "--overwrite",
+                "--isolated",
+                "--proof",
+                "require",
+                "--config",
+            ])
+            .arg(&config)
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        (
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            c["files"][0]["routines"][0].clone(),
+        )
+    };
+    let (stdout, r) = run("  IF @n > 0\n    SET @out = 'hello ' + @v;\n  ELSE\n    SET @out = ISNULL(@v, 'nobody');\n");
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["scalars"], "c2a", "{r}");
+    assert!(!stdout.contains("ASM-CONCAT-NULL"), "{stdout}");
+    assert!(!stdout.contains("ASM-ISNULL-TYPE"), "{stdout}");
+    assert!(stdout.contains("ASM-TSQL-STRING-ARGS"), "{stdout}");
+    let (_, r) = run("  IF @v = 'abc'\n    SET @out = @v;\n");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+}
