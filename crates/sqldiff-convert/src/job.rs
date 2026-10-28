@@ -29,6 +29,8 @@ pub struct Job {
 #[derive(serde::Serialize)]
 pub struct Certificates {
     pub checker: Option<String>,
+    #[serde(skip)]
+    pub from: sqldiff_core::Dialect,
     pub files: Vec<FileCertificates>,
 }
 
@@ -39,6 +41,70 @@ pub struct FileCertificates {
 }
 
 impl Certificates {
+    /// The release gate of `--proof require` (decision 14 in
+    /// docs/verified-conversion.md): why the converted tree still needs a
+    /// review, if it does. Empty when every routine is confirmed, every
+    /// assumption a confirmation or a unit rests on is accepted by the
+    /// deployment profile, nothing lies outside a routine, and the tree
+    /// converted.
+    pub fn gate(
+        &self,
+        w: &Written,
+        deployment: &sqldiff_source::deployment::Profile,
+    ) -> Vec<String> {
+        let mut why = Vec::new();
+        if !w.tree.report.ok() {
+            why.push("the tree is not converted (see conversion-report.md)".to_string());
+        }
+        let accepted = |id: &str| !deployment.accepting(id).is_empty();
+        for f in &self.files {
+            for c in &f.routines {
+                match &c.answer {
+                    crate::cert::Answer::Unconfirmed { reason } => why.push(format!(
+                        "{}: {}: not confirmed: {reason}",
+                        f.path, c.routine
+                    )),
+                    crate::cert::Answer::Confirmed { .. } => {
+                        for a in c.assumptions.iter().filter(|a| !accepted(a)) {
+                            why.push(format!(
+                                "{}: {}: rests on {a}, which the deployment profile does not accept",
+                                f.path, c.routine
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for (k, f) in w.tree.report.files.iter().enumerate() {
+            if let Some(input) = w.inputs.iter().find(|i| i.rel == f.path) {
+                let n = crate::cert::outside_routines(&input.text, self.from);
+                if n > 0 {
+                    why.push(format!(
+                        "{}: {n} statement(s) outside a routine, which no certificate covers",
+                        f.path
+                    ));
+                }
+            }
+            let Some(conv) = w.tree.conversions.get(k) else {
+                continue;
+            };
+            let mut seen = Vec::new();
+            for n in conv.units.iter().flat_map(|u| &u.notes) {
+                if n.status == crate::Status::Assumptions
+                    && !accepted(&n.rule)
+                    && !seen.contains(&n.rule)
+                {
+                    seen.push(n.rule.clone());
+                    why.push(format!(
+                        "{}: rests on {}, which the deployment profile does not accept",
+                        f.path, n.rule
+                    ));
+                }
+            }
+        }
+        why
+    }
+
     /// (confirmed, all) routines.
     pub fn counts(&self) -> (usize, usize) {
         let all = self.files.iter().flat_map(|f| &f.routines);
@@ -115,6 +181,7 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
         }
         let c = Certificates {
             checker: checker.map(|k| k.name()),
+            from: job.tree.from,
             files,
         };
         let path = job.out.join("certificates.json");

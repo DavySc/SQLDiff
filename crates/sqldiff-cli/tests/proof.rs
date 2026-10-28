@@ -255,3 +255,50 @@ fn the_real_checker_confirms_a_converted_procedure() {
     assert_eq!(t["answer"], "unconfirmed", "{t}");
     assert_eq!(t["reason"], "the T-SQL routine is outside the C1 spec");
 }
+
+/// `--proof require` is the release gate: until C2 gives operators their
+/// meaning, a confirmed routine still rests on ASM-C1-OPERATORS, which no
+/// deployment can accept, so the gate names it and the exit code is 1.
+#[test]
+fn the_real_checker_and_the_release_gate_name_what_needs_a_review() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("gate-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "p.sql",
+        "CREATE PROCEDURE p @a int OUTPUT\nAS\nBEGIN\n  IF @a > 1\n    SET @a = 2;\nEND\n",
+    );
+    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--isolated", "--proof", "require"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("certificates: 1 of 1 routines confirmed"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("release gate: a review is still needed"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("p.sql: dbo.p: rests on ASM-C1-OPERATORS")
+            || stdout.contains("p.sql: p: rests on ASM-C1-OPERATORS"),
+        "{stdout}"
+    );
+}

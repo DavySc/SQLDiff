@@ -329,6 +329,24 @@ pub fn certify(
     certs
 }
 
+/// How many top-level statements of `input` are not routines: no
+/// certificate covers them.
+pub fn outside_routines(input: &str, from: Dialect) -> usize {
+    let root = parse(input, from).syntax();
+    let mut units = Vec::new();
+    for n in root.children() {
+        if n.kind() == SyntaxKind::BATCH {
+            units.extend(n.children().filter(|c| c.kind().is_unit()));
+        } else if n.kind().is_unit() {
+            units.push(n);
+        }
+    }
+    units
+        .iter()
+        .filter(|u| u.kind() != SyntaxKind::ROUTINE)
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

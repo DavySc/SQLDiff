@@ -31,5 +31,20 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
         qjson.display(),
         qmd.display()
     );
+    if a.proof.mode == sqldiff_core::proof::Mode::Require {
+        let why = match &w.certificates {
+            Some((c, _)) => c.gate(&w, &a.tree.deployment),
+            None => vec!["no certificates".to_string()],
+        };
+        if why.is_empty() {
+            println!("release gate: passed (every routine confirmed, every assumption accepted)");
+        } else {
+            println!("release gate: a review is still needed");
+            for y in &why {
+                println!("  {y}");
+            }
+            return Ok(ExitCode::from(1));
+        }
+    }
     Ok(ExitCode::from(if w.tree.report.ok() { 0 } else { 1 }))
 }
