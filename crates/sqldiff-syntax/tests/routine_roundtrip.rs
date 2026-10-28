@@ -128,6 +128,36 @@ fn a_tsql_procedure_reads_into_the_same_shape() {
 }
 
 #[test]
+fn syntax_the_tree_would_drop_is_refused() {
+    // The checker sees only the tree: a result set from OUTPUT, a qualified
+    // SET target (an error in PostgreSQL) or a table hint must not vanish.
+    for (stmt, what) in [
+        (
+            "INSERT INTO dbo.t (a) OUTPUT inserted.a VALUES (@x);",
+            "OUTPUT",
+        ),
+        (
+            "UPDATE dbo.t SET a = @x OUTPUT inserted.a WHERE a = 1;",
+            "OUTPUT",
+        ),
+        ("UPDATE dbo.t SET t.a = @x WHERE a = 1;", "qualifier"),
+        ("INSERT INTO dbo.t WITH (TABLOCK) (a) VALUES (@x);", "hints"),
+        (
+            "IF EXISTS (SELECT a FROM dbo.t FOR JSON PATH) SET @x = 1;",
+            "FOR JSON",
+        ),
+    ] {
+        let text = format!("CREATE PROCEDURE dbo.p @x int AS\nBEGIN\n  {stmt}\nEND\n");
+        let r = routines(&text, Dialect::Tsql).remove(0);
+        let e = r.expect_err(stmt);
+        assert!(e.contains(what), "{stmt}: {e}");
+    }
+    let plain =
+        "CREATE PROCEDURE dbo.p @x int AS\nBEGIN\n  UPDATE dbo.t SET a = @x WHERE a = 1;\nEND\n";
+    assert!(routines(plain, Dialect::Tsql).remove(0).is_ok());
+}
+
+#[test]
 fn every_plpgsql_routine_in_the_repository_round_trips() {
     let mut fs = Vec::new();
     let pick = |n: &str| n.starts_with("pg") || n.contains(".pg.") || n.contains("postgres");

@@ -409,6 +409,11 @@ pub struct Parser<'a> {
     /// clauses, FOR JSON and FOR SYSTEM_TIME. The canonical lowering never
     /// sees these.
     pub ext: bool,
+    /// What the extended parser read but left out of the tree (an `OUTPUT`
+    /// clause, table hints on an `INSERT` target, the qualifier of a `SET`
+    /// target, `FOR JSON` options). The evaluator compares the statement's
+    /// tokens as well; [`parse_stmt_exact`] refuses any of these.
+    pub dropped: Vec<&'static str>,
 }
 
 impl<'a> Parser<'a> {
@@ -418,6 +423,7 @@ impl<'a> Parser<'a> {
             i: 0,
             d,
             ext: false,
+            dropped: Vec::new(),
         }
     }
 
@@ -427,6 +433,7 @@ impl<'a> Parser<'a> {
             i: 0,
             d,
             ext: true,
+            dropped: Vec::new(),
         }
     }
 
@@ -1341,6 +1348,7 @@ impl<'a> Parser<'a> {
         // T-SQL FOR JSON PATH / AUTO [, options].
         if self.ext && self.d == Dialect::Tsql && self.is_kw("FOR") && self.is_kw_at(1, "JSON") {
             self.i += 2;
+            self.dropped.push("FOR JSON options");
             if !(self.eat_kw("PATH") || self.eat_kw("AUTO")) {
                 return Err(self.err("expected PATH or AUTO"));
             }
@@ -1632,6 +1640,9 @@ impl<'a> Parser<'a> {
                 self.col_list()?
             } else {
                 let n = self.qname()?;
+                if n.len() > 1 {
+                    self.dropped.push("the qualifier of a SET target");
+                }
                 let c = vec![n.last().cloned().unwrap_or_default()];
                 target = Some(n);
                 c
@@ -1670,6 +1681,7 @@ impl<'a> Parser<'a> {
             return Err("OUTPUT clauses are not supported".into());
         }
         self.i += 1;
+        self.dropped.push("an OUTPUT clause");
         loop {
             self.sel_item()?;
             if !self.eat_kind(K::Comma) {
@@ -1799,8 +1811,8 @@ impl<'a> Parser<'a> {
         self.eat_kw("INTO");
         let target = self.qname()?;
         // Table hints on the target do not change what is written.
-        if self.ext {
-            self.table_hints()?;
+        if self.ext && !self.table_hints()?.is_empty() {
+            self.dropped.push("table hints on an INSERT target");
         }
         if self.is_kw("AS")
             || (self.is_kind(K::Word)
@@ -2127,6 +2139,20 @@ pub fn parse_stmt_ext(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
     let s = p.stmt()?;
     if !p.at_end() {
         return Err(p.err("unexpected trailing tokens"));
+    }
+    Ok(s)
+}
+
+/// [`parse_stmt_ext`], refusing a statement the tree would not show whole
+/// (see [`Parser::dropped`]): for readers whose consumers see only the tree.
+pub fn parse_stmt_exact(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
+    let mut p = Parser::ext(toks, d);
+    let s = p.stmt()?;
+    if !p.at_end() {
+        return Err(p.err("unexpected trailing tokens"));
+    }
+    if let Some(what) = p.dropped.first() {
+        return Err(format!("{what} is not kept in the syntax tree"));
     }
     Ok(s)
 }

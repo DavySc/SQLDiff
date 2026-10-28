@@ -6,7 +6,7 @@
 //! Anything outside this shape is an error, not an approximation: a
 //! routine that does not read is one whose conversion cannot be confirmed.
 
-use crate::abstract_syntax::{parse_stmt_ext, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use crate::abstract_syntax::{parse_stmt_exact, tokens, Expr, Parser, Stmt, Tok, Type, K};
 use crate::{ast as cst, print, Dialect, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
@@ -339,7 +339,7 @@ fn declaration(s: &SyntaxNode, d: Dialect) -> RResult<Stmt> {
     if t.iter().any(|x| x.up == "CONSTANT" || x.up == "NOT") {
         return Err("CONSTANT and NOT NULL declarations are not read yet".into());
     }
-    match parse_stmt_ext(&t, d)? {
+    match parse_stmt_exact(&t, d)? {
         s @ Stmt::Declare { .. } => Ok(s),
         _ => Err("not a declaration".into()),
     }
@@ -381,6 +381,15 @@ fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
     }
 }
 
+/// Refuses what the extended parser read but left out of the tree: the
+/// checker sees only the tree.
+fn whole(p: &Parser) -> RResult<()> {
+    match p.dropped.first() {
+        Some(what) => Err(format!("{what} is not kept in the syntax tree")),
+        None => Ok(()),
+    }
+}
+
 fn condition(c: &SyntaxNode, d: Dialect) -> RResult<Expr> {
     let t = tokens(c);
     let mut p = Parser::ext(&t, d);
@@ -388,6 +397,7 @@ fn condition(c: &SyntaxNode, d: Dialect) -> RResult<Expr> {
     if !p.at_end() {
         return Err(p.err("unexpected tokens after the condition"));
     }
+    whole(&p)?;
     Ok(e)
 }
 
@@ -450,7 +460,7 @@ fn statement(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
             })
         }
         (Dialect::Postgres, "CALL") => call(&t, d),
-        _ => Ok(Node::Stmt(parse_stmt_ext(&t, d)?)),
+        _ => Ok(Node::Stmt(parse_stmt_exact(&t, d)?)),
     }
 }
 
@@ -494,6 +504,7 @@ fn exec(t: &[Tok], d: Dialect) -> RResult<Node> {
     if !p.at_end() {
         return Err(p.err("unexpected tokens in EXEC"));
     }
+    whole(&p)?;
     Ok(Node::Call { name, args, ret })
 }
 
@@ -527,6 +538,7 @@ fn call(t: &[Tok], d: Dialect) -> RResult<Node> {
     if !p.at_end() {
         return Err(p.err("unexpected tokens in CALL"));
     }
+    whole(&p)?;
     Ok(Node::Call {
         name,
         args,
