@@ -430,11 +430,9 @@ pub fn undischargeable(u: &Unit) -> Vec<String> {
     let mut v: Vec<String> = u
         .notes
         .iter()
-        .filter(|n| {
-            matches!(
-                n.status,
-                Status::Unproven | Status::Differs | Status::NotConverted
-            )
+        .filter(|n| match n.status {
+            Status::Unproven | Status::Differs | Status::NotConverted => true,
+            Status::Converted | Status::Assumptions | Status::Decision => false,
         })
         .map(|n| n.rule.clone())
         .collect();
@@ -461,7 +459,7 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
             Status::Assumptions if cur(State::Accepted, &n.rule) => {}
             Status::Decision if cur(State::Picked, &n.rule) => {}
             Status::Assumptions | Status::Decision => open.push(n.rule.clone()),
-            _ => {}
+            Status::Converted | Status::Unproven | Status::Differs | Status::NotConverted => {}
         }
     }
     let undischargeable = undischargeable(u);
