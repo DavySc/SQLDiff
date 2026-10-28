@@ -51,7 +51,7 @@ fn tsql_proc(cond: &str) -> String {
 #[test]
 fn changed_comparison_has_a_witness_row() {
     let r = run(&tsql_proc("price < @max"), &tsql_proc("price <= @max"), T);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     edit_witness(&r);
 }
 
@@ -66,7 +66,7 @@ fn reformatting_and_keyword_case_stay_equal() {
                 order by item_id;
              end";
     let r = run(&tsql_proc("price < @max"), b, T);
-    assert_eq!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn exists_select_list_is_not_a_difference() {
         )
     };
     let r = run(&p(1), &p(2), T);
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 fn tsql_param(width: u32, body: &str) -> String {
@@ -97,7 +97,7 @@ fn tsql_param(width: u32, body: &str) -> String {
 fn wider_string_parameter_keeps_characters_a_truncates() {
     let body = "SELECT item_id FROM dbo.item WHERE name = @name;";
     let r = run(&tsql_param(40, body), &tsql_param(41, body), T);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     let w = r
         .findings
         .iter()
@@ -113,7 +113,7 @@ fn wider_parameter_only_tested_for_null_is_not_different() {
     // width cannot be observed.
     let body = "IF @name IS NULL RETURN 1; RETURN 0;";
     let r = run(&tsql_param(40, body), &tsql_param(41, body), T);
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 #[test]
@@ -129,9 +129,9 @@ fn changed_declared_type_is_never_equal() {
     };
     let r = run(&p(7), &p(6), T);
     assert!(
-        !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
         "{:?}",
-        r.verdict
+        r.verdict()
     );
 }
 
@@ -148,7 +148,7 @@ fn subtracting_two_strings_does_not_compile() {
         )
     };
     let r = run(&p("+"), &p("-"), T);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert!(
         r.findings
             .iter()
@@ -192,7 +192,7 @@ fn pg_fn(cond: &str) -> String {
 #[test]
 fn postgres_changed_comparison_has_a_witness_row() {
     let r = run(&pg_fn("price < p_max"), &pg_fn("price <= p_max"), P);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     edit_witness(&r);
 }
 
@@ -203,7 +203,7 @@ fn postgres_and_or_swap_is_different() {
         &pg_fn("price < p_max OR item_id > 0"),
         P,
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 fn pg_sql_fn(returns: &str, cond: &str) -> String {
@@ -221,7 +221,7 @@ fn postgres_sql_function_returns_its_last_query() {
         &pg_sql_fn("SETOF integer", "price <= p_max"),
         P,
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     edit_witness(&r);
 }
 
@@ -260,7 +260,7 @@ fn set_column_to_its_own_value_is_not_different() {
         &tsql_write("UPDATE dbo.item SET name = N'x', price = price WHERE item_id = @id;"),
         T,
     );
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 #[test]
@@ -271,14 +271,14 @@ fn insert_values_are_matched_by_column() {
         &tsql_write("INSERT INTO dbo.item (price, item_id, name) VALUES (1, @id, N'x');"),
         T,
     );
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     // A changed value is still found, and named.
     let r = run(
         &tsql_write("INSERT INTO dbo.item (item_id, name, price) VALUES (@id, N'x', 1);"),
         &tsql_write("INSERT INTO dbo.item (price, item_id, name) VALUES (2, @id, N'x');"),
         T,
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert!(
         edit_witness(&r).contains("price = 2"),
         "{}",
@@ -293,7 +293,7 @@ fn update_witness_names_the_columns() {
         &tsql_write("UPDATE dbo.item SET price = 2 WHERE item_id = @id;"),
         T,
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     let w = edit_witness(&r);
     assert!(w.contains("price = 1") && w.contains("price = 2"), "{w}");
 }
@@ -314,10 +314,10 @@ fn unmodelled_function_may_return_null() {
         &p("CASE WHEN @x > 0 THEN 1 END"),
         T,
     );
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     // A function the evaluator does not know against a NULL: either may hold.
     let r = run(&p("SOUNDEX(N'x')"), &p("NULL"), T);
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 fn decimal_param(d: Dialect, precision: u32) -> String {
@@ -344,7 +344,7 @@ fn decimal_parameter_precision_only_matters_in_tsql() {
     // SQL Server rejects an argument that overflows decimal(p,s) (checked on
     // SQL Server 2022); PostgreSQL ignores a parameter's typmod.
     let r = run(&decimal_param(T, 8), &decimal_param(T, 10), T);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     let r = run(&decimal_param(P, 8), &decimal_param(P, 10), P);
     assert!(
         !r.findings
@@ -368,7 +368,7 @@ fn functions_that_never_return_null_still_differ_from_null() {
         )
     };
     let r = run(&f("format('item %s', name)"), &f("NULL::text"), P);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert!(edit_witness(&r).contains("format("), "{}", edit_witness(&r));
 }
 
@@ -393,8 +393,8 @@ fn compensating_edits_are_not_different() {
     let b = tsql_out("SET @x = @p + 2; SET @x = (@x - 1) * 2;");
     let r = run(&a, &b, T);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 // The same two edits, but they do not make up for each other: (p+1)*2 vs
@@ -406,7 +406,7 @@ fn dependent_edits_that_really_differ_are_never_equal() {
     let a = tsql_out("SET @x = @p + 1; SET @x = @x * 2;");
     let b = tsql_out("SET @x = @p + 2; SET @x = (@x - 1) * 3;");
     let r = run(&a, &b, T);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
 }
 
@@ -423,7 +423,7 @@ fn independent_edits_keep_their_witnesses() {
         )
     };
     let r = run(&p(1, 2), &p(2, 3), T);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert_eq!(edit_differents(&r).len(), 2, "{:#?}", r.findings);
 }
 
@@ -433,7 +433,7 @@ fn edit_after_unchanged_code_keeps_its_witness() {
     let a = tsql_out("SET @x = @p + 1; SET @x = @x * 2;");
     let b = tsql_out("SET @x = @p + 1; SET @x = @x * 3;");
     let r = run(&a, &b, T);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert_eq!(edit_differents(&r).len(), 1, "{:#?}", r.findings);
 }
 
@@ -445,7 +445,7 @@ fn guard_fed_by_an_earlier_change_is_not_a_witness() {
     let b = tsql_out("SET @x = @p + 2; IF @x > 3 SET @x = (@x - 1) * 2;");
     let r = run(&a, &b, T);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 // The earlier change reaches the edit through an unchanged statement.
@@ -455,7 +455,7 @@ fn change_reaching_the_edit_through_unchanged_code() {
     let b = tsql_out("DECLARE @t INT; SET @t = @p + 2; SET @x = @t; SET @x = (@x - 1) * 2;");
     let r = run(&a, &b, T);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 // Compensation through a table: the first change writes the rows the
@@ -473,7 +473,7 @@ fn compensating_edits_through_a_table() {
     };
     let r = run(&p(1, "price"), &p(2, "price - 1"), T);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 // The same through a T-SQL table variable.
@@ -487,7 +487,7 @@ fn compensating_edits_through_a_table_variable() {
     );
     let r = run(&a, &b, T);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 // Inside a loop, a change later in the body feeds an edit earlier in the
@@ -504,7 +504,7 @@ fn compensating_edits_in_a_loop() {
     );
     let r = run(&a, &b, T);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 // PL/pgSQL: the same compensating pair.
@@ -523,9 +523,9 @@ fn compensating_edits_plpgsql() {
     };
     let r = run(&f("p + 1", "x * 2"), &f("p + 2", "(x - 1) * 2"), P);
     assert!(edit_differents(&r).is_empty(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
     let r = run(&f("p + 1", "x * 2"), &f("p + 1", "x * 3"), P);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 // A parameter default that changes together with the body code that reads
@@ -542,5 +542,5 @@ fn default_change_with_compensating_body_change() {
         "{:#?}",
         r.findings
     );
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }

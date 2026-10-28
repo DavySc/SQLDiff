@@ -166,7 +166,7 @@ pub fn run_expect(case: &Case, e: &Expect) -> Result<(Outcome, Report), String> 
 ///   assumptions as the case lists. Wording is not compared (corpus README).
 /// - For "equal", classes are noise and are not checked.
 pub fn judge(case: &Case, e: &Expect, report: &Report) -> Outcome {
-    let actual = verdict_key(report.verdict);
+    let actual = verdict_key(report.verdict());
     let different_classes: BTreeSet<&str> = report
         .findings
         .iter()

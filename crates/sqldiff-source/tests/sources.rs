@@ -293,9 +293,9 @@ fn policy_applies_limits_overrides_and_assumptions() {
     assert_eq!(asm.source, AssumptionSource::Declared);
 
     let mut eq = sqldiff_core::diff(&b, &b, &sqldiff_core::Options::default());
-    assert_eq!(eq.verdict, Verdict::Equal);
+    assert_eq!(eq.verdict(), Verdict::Equal);
     policy::cap_stale(&mut eq, false, true);
-    assert_eq!(eq.verdict, Verdict::Unknown);
+    assert_eq!(eq.verdict(), Verdict::Unknown);
 }
 
 fn git(dir: &Path, args: &[&str]) {

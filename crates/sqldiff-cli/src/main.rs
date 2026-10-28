@@ -834,7 +834,7 @@ fn tree(
                 let _ = writeln!(
                     out,
                     "{:<26} {:<14} {:>8}  {}{} ↔ {}{}",
-                    r.verdict.label(),
+                    r.verdict().label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
                     r.findings.len(),
                     r.a.path,

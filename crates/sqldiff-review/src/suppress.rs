@@ -40,7 +40,7 @@ pub fn suppress(report: &mut Report, store: &Store, now: &str) -> usize {
         }
     }
     report.findings = kept;
-    report.settle_suppression();
+    report.settle();
     n
 }
 

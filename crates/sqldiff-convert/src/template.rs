@@ -751,7 +751,7 @@ pub fn check_template(
     for p in problems {
         r.unknown_reasons.push(format!("converted template, {p}"));
     }
-    r.verdict = sqldiff_core::session::derive_verdict(r);
+    r.settle();
 
     c.output = out;
     c.template = Some(TemplateInfo {
@@ -931,7 +931,7 @@ fn leaked(
     c.report
         .unknown_reasons
         .push(format!("converted template: {why}"));
-    c.report.verdict = sqldiff_core::session::derive_verdict(&c.report);
+    c.report.settle();
     c.output_check.findings.clear();
     c.unplaced.clear();
     c.unproven.clear();

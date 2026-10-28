@@ -490,7 +490,7 @@ impl Server {
         let structured = json!({
             "pair_id": id,
             "verdict": report.open_verdict(),
-            "verdict_before_suppression": report.verdict,
+            "verdict_before_suppression": report.verdict(),
             "suppressed": report.suppressed.iter().map(|x| json!({
                 "fingerprint": x.finding.fingerprint,
                 "kind": x.kind,
@@ -706,7 +706,7 @@ impl Server {
             let mut text = format!(
                 "{}  [{id}]\nVerdict: {}\n",
                 pair_label(&report),
-                report.verdict.label().to_uppercase()
+                report.verdict().label().to_uppercase()
             );
             if ledger.is_empty() {
                 text.push_str("No assumptions.\n");
@@ -733,7 +733,7 @@ impl Server {
             }
             return Ok((
                 text,
-                json!({ "pair_id": id, "verdict": report.verdict, "assumptions": ledger }),
+                json!({ "pair_id": id, "verdict": report.verdict(), "assumptions": ledger }),
             ));
         }
         let report = queue::view(&held.pair.report, &self.flips);
@@ -741,7 +741,7 @@ impl Server {
         let mut text = format!(
             "{}  [{id}]\nVerdict: {}\n",
             pair_label(&report),
-            report.verdict.label().to_uppercase()
+            report.verdict().label().to_uppercase()
         );
         if ledger.is_empty() {
             text.push_str("No assumptions.\n");
@@ -767,7 +767,7 @@ impl Server {
         }
         Ok((
             text,
-            json!({ "pair_id": id, "verdict": report.verdict, "assumptions": ledger }),
+            json!({ "pair_id": id, "verdict": report.verdict(), "assumptions": ledger }),
         ))
     }
 

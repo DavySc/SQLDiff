@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use sqldiff_core::model::{
     hex, Assumption, AssumptionSource, Finding, Location, Side, Suppressed, SuppressionKind,
 };
-use sqldiff_core::{Report, Verdict};
+use sqldiff_core::Report;
 use sqldiff_source::pack::MarkerKind;
 use sqldiff_source::policy::{markers, Marker};
 use sqldiff_source::Resolved;
@@ -138,10 +138,8 @@ pub fn apply(
             MarkerKind::ReviewNote | MarkerKind::SyncPartner => {}
         }
     }
-    if !summary.assumptions.is_empty() && report.verdict == Verdict::Equal {
-        report.verdict = Verdict::EqualUnderAssumptions;
-    }
-    report.settle_suppression();
+    // Author assumptions make an equal verdict "equal under assumptions".
+    report.settle();
     summary.markers = found;
     summary
 }

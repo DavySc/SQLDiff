@@ -227,7 +227,10 @@ pub struct NoiseCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub tool_version: String,
-    pub verdict: Verdict,
+    /// Derived from the rest of the report by [`Report::settle`], never set
+    /// directly: a weaker verdict needs a finding, an unknown reason or an
+    /// assumption that says why. Read it with [`Report::verdict`].
+    pub(crate) verdict: Verdict,
     pub a: ArtifactInfo,
     pub b: Option<ArtifactInfo>,
     pub findings: Vec<Finding>,
@@ -297,12 +300,19 @@ impl Report {
         }
     }
 
-    /// After findings were moved to `suppressed`: records the engine's
-    /// verdict once in `verdict_before_suppression` and sets `verdict` to
-    /// the [`open_verdict`](Report::open_verdict), so text, JSON, SARIF and
-    /// exit codes agree.
-    pub fn settle_suppression(&mut self) {
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Derives the verdict again from the findings, unknown reasons and
+    /// assumptions (`session::derive_verdict`). With suppressed findings it
+    /// records the engine's verdict once in `verdict_before_suppression` and
+    /// takes the [`open_verdict`](Report::open_verdict), so text, JSON,
+    /// SARIF and exit codes agree. Every change to a report's verdict goes
+    /// through here.
+    pub fn settle(&mut self) {
         if self.suppressed.is_empty() {
+            self.verdict = crate::session::derive_verdict(self);
             return;
         }
         if self.verdict_before_suppression.is_none() {

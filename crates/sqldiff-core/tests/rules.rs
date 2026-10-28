@@ -189,11 +189,11 @@ fn examples_convert_and_the_engine_agrees() {
         );
         let expect = ex.expect.as_deref().map(verdict);
         match expect {
-            Some(v) if v == rep.verdict => {}
+            Some(v) if v == rep.verdict() => {}
             Some(v) => failures.push(format!(
                 "{}: the engine says {} but the rule's example expects {}\n{}\n{}",
                 r.id,
-                rep.verdict.label(),
+                rep.verdict().label(),
                 v.label(),
                 rep.findings
                     .iter()
@@ -204,14 +204,14 @@ fn examples_convert_and_the_engine_agrees() {
             )),
             None => failures.push(format!("{}: example without (expect ...)", r.id)),
         }
-        if rep.verdict == Verdict::Unknown {
+        if rep.verdict() == Verdict::Unknown {
             unverified.push(r.id.clone());
         }
         // A rule that claims no difference must never meet a "different" from the engine.
         let claims_decision = pieces
             .iter()
             .any(|p| p.status >= sqldiff_core::rules::rule::Status::Decision);
-        if rep.verdict == Verdict::Different && !claims_decision {
+        if rep.verdict() == Verdict::Different && !claims_decision {
             failures.push(format!(
                 "{}: the engine finds a difference the rule does not declare",
                 r.id

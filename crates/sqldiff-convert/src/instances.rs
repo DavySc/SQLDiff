@@ -1258,7 +1258,7 @@ fn check_instance(
             text: r.clone(),
         });
     }
-    if report.verdict == Verdict::Unknown
+    if report.verdict() == Verdict::Unknown
         && report.unknown_reasons.is_empty()
         && !items.iter().any(|x| x.status >= Outcome::Unknown)
     {

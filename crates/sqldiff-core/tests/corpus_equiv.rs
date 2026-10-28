@@ -136,10 +136,10 @@ fn corpus_verdicts_are_sound_and_match() {
         );
         let label = format!("{} {}/{}", c.id, c.a_name, c.b_name);
         for (mode, r) in [("no catalog", &plain), ("catalog", &with_catalog)] {
-            if !sound(r.verdict, c.expected) {
+            if !sound(r.verdict(), c.expected) {
                 unsound.push(format!(
                     "{label} ({mode}): got {} but expected {}",
-                    r.verdict.label(),
+                    r.verdict().label(),
                     c.expected.label()
                 ));
             }
@@ -147,12 +147,12 @@ fn corpus_verdicts_are_sound_and_match() {
         let known_miss = KNOWN_MISSES
             .iter()
             .any(|(i, a, b)| *i == c.id && *a == c.a_name && *b == c.b_name);
-        let hit = with_catalog.verdict == c.expected;
+        let hit = with_catalog.verdict() == c.expected;
         matched += usize::from(hit);
         if !hit && !known_miss {
             regressed.push(format!(
                 "{label}: got {} but expected {}",
-                with_catalog.verdict.label(),
+                with_catalog.verdict().label(),
                 c.expected.label()
             ));
         }

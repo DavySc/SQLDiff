@@ -806,7 +806,7 @@ fn a_lost_directive_is_reported() {
         "{:?}",
         c.report.unknown_reasons
     );
-    assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
+    assert_ne!(c.report.verdict(), sqldiff_core::Verdict::Equal);
 }
 
 #[test]
@@ -826,7 +826,7 @@ fn a_placeholder_decided_by_pattern_is_an_open_question() {
         "{:?}",
         c.report.unknown_reasons
     );
-    assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
+    assert_ne!(c.report.verdict(), sqldiff_core::Verdict::Equal);
 }
 
 #[test]

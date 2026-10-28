@@ -1046,7 +1046,7 @@ pub fn template_notes(
             ));
         }
     }
-    report.verdict = crate::session::derive_verdict(report);
+    report.settle();
 }
 
 #[cfg(test)]

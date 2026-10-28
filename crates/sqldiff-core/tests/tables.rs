@@ -26,7 +26,7 @@ fn asms(r: &Report) -> Vec<&str> {
 fn equal(a: &str, b: &str) -> Report {
     let r = run(a, b);
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:#?}\n{:#?}",
         r.findings,
@@ -39,7 +39,7 @@ fn equal(a: &str, b: &str) -> Report {
 /// Different by `rule`, and the witness mentions `needle`.
 fn differs(a: &str, b: &str, rule: &str, needle: &str) {
     let r = run(a, b);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.unknown_reasons);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.unknown_reasons);
     let f = r
         .findings
         .iter()
@@ -57,8 +57,8 @@ fn unknown(a: &str, b: &str, needle: &str) {
         r.unknown_reasons,
         rules(&r)
     );
-    assert_ne!(r.verdict, Verdict::Equal);
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
 
 const ORDERS_T: &str = "CREATE TABLE dbo.Orders (
@@ -238,7 +238,7 @@ fn nullability_identity_and_defaults() {
     );
     // Defaults are compared by the engine.
     let r = run(ORDERS_T, &replace(ORDERS_P, "DEFAULT 0,", "DEFAULT 1,"));
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions, "{r:#?}");
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{r:#?}");
 }
 
 #[test]
@@ -315,7 +315,7 @@ fn foreign_keys_and_checks() {
         ORDERS_T,
         &replace(ORDERS_P, "CHECK (Amount >= 0)", "CHECK (Amount > 0)"),
     );
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions, "{r:#?}");
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{r:#?}");
     equal(
         ORDERS_T,
         &replace(ORDERS_P, "CHECK (Amount >= 0)", "CHECK ((0 <= Amount))"),

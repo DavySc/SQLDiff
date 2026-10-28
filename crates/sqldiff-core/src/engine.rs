@@ -378,7 +378,7 @@ pub(crate) fn finish(mut r: Report) -> Report {
             .then(y.verdict.cmp(&x.verdict))
             .then(first_line(x).cmp(&first_line(y)))
     });
-    r.verdict = crate::session::derive_verdict(&r);
+    r.settle();
     r
 }
 

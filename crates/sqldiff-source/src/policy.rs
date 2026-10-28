@@ -40,9 +40,7 @@ pub fn cap_stale(report: &mut Report, stale_a: bool, stale_b: bool) {
     report.unknown_reasons.push(format!(
         "side {side} is flagged stale by its source (generated output older than its inputs)"
     ));
-    if report.verdict < Verdict::Unknown {
-        report.verdict = Verdict::Unknown;
-    }
+    report.settle();
 }
 
 /// Findings of class `limit` for one artifact.
@@ -150,9 +148,7 @@ pub fn add_limits(report: &mut Report, a: &Artifact, b: Option<&Artifact>, confi
         report.findings.extend(limit_findings(b, Side::B, config));
     }
     if report.findings.len() > before {
-        report.verdict = report
-            .verdict
-            .max(sqldiff_core::session::derive_verdict(report));
+        report.settle();
     }
 }
 

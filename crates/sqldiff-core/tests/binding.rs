@@ -87,7 +87,7 @@ fn has(r: &sqldiff_core::Report, rule: &str, class: ChangeClass, verdict: Verdic
 #[test]
 fn m13_isnull_truncation() {
     let r = run_mutation("m13");
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(
         has(
             &r,
@@ -113,7 +113,7 @@ fn m13_isnull_truncation() {
 #[test]
 fn m15_dropped_column() {
     let r = run_mutation("m15");
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(
         has(
             &r,
@@ -136,13 +136,13 @@ fn m15_without_catalog_is_unknown() {
     let (a, b) = (load(&dir, "original.pg.sql"), load(&dir, "mutated.pg.sql"));
     let r = diff(&a, &b, &Options::default());
     assert!(rules(&r).is_empty(), "{:?}", rules(&r));
-    assert_ne!(r.verdict, Verdict::Different);
+    assert_ne!(r.verdict(), Verdict::Different);
 }
 
 #[test]
 fn m16_outdated_signature() {
     let r = run_mutation("m16");
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(
         has(
             &r,
@@ -162,7 +162,7 @@ fn m16_outdated_signature() {
 #[test]
 fn m17_shadowed_variable() {
     let r = run_mutation("m17");
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(
         has(
             &r,
@@ -188,7 +188,7 @@ fn m17_shadowed_variable() {
 #[test]
 fn m18_dialect_residue() {
     let r = run_mutation("m18");
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(
         has(
             &r,

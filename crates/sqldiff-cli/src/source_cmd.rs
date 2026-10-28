@@ -517,7 +517,7 @@ fn pairs(
     let mut reports: Vec<Report> = run.pairs.into_iter().map(|x| x.report).collect();
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
-            r.verdict,
+            r.verdict(),
             r.findings.iter().map(|f| f.severity).max(),
             r.findings.len(),
         ))
@@ -543,7 +543,7 @@ fn pairs(
             for r in &reports {
                 println!(
                     "{:<26} {:<14} {:>8}  {} ↔ {}",
-                    r.verdict.label(),
+                    r.verdict().label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
                     r.findings.len(),
                     r.a.path,
@@ -561,7 +561,7 @@ fn pairs(
     }
     let worst = reports
         .iter()
-        .map(|r| r.verdict)
+        .map(|r| r.verdict())
         .max()
         .unwrap_or(Verdict::Equal);
     let incomplete = !p.unpaired.is_empty() || !p.ambiguous.is_empty() || !p.missing.is_empty();

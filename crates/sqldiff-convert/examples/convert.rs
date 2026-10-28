@@ -11,7 +11,7 @@ fn main() {
     )
     .expect("supported pair");
     println!("{}", c.output);
-    println!("-- verdict: {}", c.report.verdict.label());
+    println!("-- verdict: {}", c.report.verdict().label());
     for u in &c.units {
         println!(
             "-- in {}-{} → out {}-{}: {}",

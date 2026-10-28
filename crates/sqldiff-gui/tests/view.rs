@@ -237,7 +237,7 @@ fn denying_an_assumption_drops_dependent_verdicts_to_unknown() {
             assert_eq!(f.verdict, sqldiff_core::Verdict::Unknown);
         }
     }
-    assert!(r.verdict >= sqldiff_core::Verdict::Unknown);
+    assert!(r.verdict() >= sqldiff_core::Verdict::Unknown);
     assert_eq!(
         s.info()
             .assumptions
@@ -644,12 +644,12 @@ fn template_mode_diffs_fragments_everywhere_in_the_session() {
         &Options::default(),
     )
     .unwrap();
-    assert_eq!(r.verdict, cli.verdict);
+    assert_eq!(r.verdict(), cli.verdict());
     assert_eq!(rules(&r), rules(&cli));
     // Read as plain SQL, the same pair reports otherwise.
     let plain = sqldiff_source::tree::diff(&a, &b, &c);
     assert!(
-        rules(&plain) != rules(&cli) || plain.verdict != cli.verdict,
+        rules(&plain) != rules(&cli) || plain.verdict() != cli.verdict(),
         "{:?}",
         rules(&plain)
     );

@@ -33,7 +33,7 @@ fn asms(r: &Report) -> Vec<&str> {
 fn equal_to(a: &str, b: &str, to: Dialect) -> Report {
     let r = run_to(a, b, to);
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:#?}\n{:#?}",
         r.findings,
@@ -51,7 +51,7 @@ fn equal(a: &str, b: &str) -> Report {
 /// Different by `rule`, and the witness mentions `needle`.
 fn differs(a: &str, b: &str, rule: &str, needle: &str) {
     let r = run(a, b);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.unknown_reasons);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.unknown_reasons);
     let f = r
         .findings
         .iter()
@@ -69,8 +69,8 @@ fn unknown_to(a: &str, b: &str, to: Dialect, needle: &str) {
         r.unknown_reasons,
         rules(&r)
     );
-    assert_ne!(r.verdict, Verdict::Equal);
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
 
 fn unknown(a: &str, b: &str, needle: &str) {
