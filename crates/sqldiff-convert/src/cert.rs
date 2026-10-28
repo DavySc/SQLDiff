@@ -4,14 +4,18 @@
 //! A certificate is about the text on disk: the output file is parsed with
 //! the target dialect's parser and read into the abstract syntax, so what
 //! the checker is shown is what will run, whatever the rules or the printer
-//! did. The source is read the same way. Everything Rust adds (the renaming
-//! that pairs the two sides' names) is an untrusted hint the checker
-//! verifies.
+//! did. The source is read the same way. Rust adds the renaming that pairs
+//! the two sides' names, an untrusted hint the checker verifies, and the
+//! trusted inputs the checker cannot see, each from a stated source: the
+//! callee names through the converter's schema rule (`ASM-DBO-SCHEMA`),
+//! the target routines' parameter modes from the converted output itself,
+//! and whether row counts are observed from the observer profile.
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sqldiff_core::proof::{self, Checker, MirrorRequest};
 use sqldiff_syntax::abstract_syntax::Stmt;
-use sqldiff_syntax::routine::{self, Mode, Node, Routine};
+use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
 use sqldiff_syntax::{encode, parse, Dialect, SyntaxKind};
 
 /// Where a certificate stands.
@@ -37,12 +41,18 @@ pub struct Certificate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Untrusted hint: source name to target name, for parameters and
-    /// variables (`@x` to `v_x`), and the T-SQL return code to the
-    /// parameter that carries it.
+    /// variables (`@x` to `v_x`), and the T-SQL return status
+    /// ([`STATUS`]) to the parameter that carries it.
     pub renaming: Renaming,
+    /// What a confirmation still rests on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assumptions: Vec<String>,
     #[serde(flatten)]
     pub answer: Answer,
 }
+
+/// A source to target name pairing.
+pub type Renaming = Vec<(String, String)>;
 
 fn sha(s: &str) -> String {
     Sha256::digest(s.as_bytes())
@@ -51,8 +61,27 @@ fn sha(s: &str) -> String {
         .collect()
 }
 
-/// Name of the T-SQL return code in a renaming (`RETURN @x` in a procedure).
-pub const RETURN_CODE: &str = "@@RETURN";
+/// The T-SQL return status in a renaming (`Sqldiff.Mirror.statusVar`).
+pub const STATUS: &str = "%status";
+
+/// The parameter a converted procedure carries the status in
+/// (`Sqldiff.Mirror.statusName`).
+pub const STATUS_PARAM: &str = "return_code";
+
+/// C1 operators are uninterpreted: a confirmation holds if each operator
+/// means the same function in both dialects, which C2 proves.
+pub const C1_OPERATORS: &str = "ASM-C1-OPERATORS";
+
+/// A PostgreSQL name as PostgreSQL resolves it: a quoted name whose case
+/// matters arrives with a leading `"` and is kept; any other is folded to
+/// lower case (`Sqldiff.Mirror.pgName`).
+pub fn pg_name(n: &str) -> String {
+    if n.starts_with('"') {
+        n.to_string()
+    } else {
+        n.to_lowercase()
+    }
+}
 
 fn routines(text: &str, d: Dialect) -> Vec<(String, Result<Routine, String>)> {
     parse(text, d)
@@ -82,26 +111,37 @@ fn tsql_locals(nodes: &[Node], out: &mut Vec<String>) {
     }
 }
 
-fn returns_value(nodes: &[Node]) -> bool {
-    nodes.iter().any(|n| match n {
-        Node::Stmt(Stmt::Return(Some(_))) => true,
-        Node::Block(b) => returns_value(&b.body),
-        Node::If { then, els, .. } => returns_value(then) || returns_value(els),
-        Node::While { body, .. } => returns_value(body),
-        _ => false,
-    })
+fn callees(nodes: &[Node], out: &mut Vec<Vec<String>>) {
+    for n in nodes {
+        match n {
+            Node::Call { name, .. } => out.push(name.clone()),
+            Node::Block(b) => callees(&b.body, out),
+            Node::If { then, els, .. } => {
+                callees(then, out);
+                callees(els, out);
+            }
+            Node::While { body, .. } => callees(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn has_status(b: &Routine) -> bool {
+    b.params
+        .last()
+        .is_some_and(|p| pg_name(&p.name) == STATUS_PARAM && p.mode == Mode::InOut)
 }
 
 /// Proposes which target name stands for each source name: parameters by
 /// position, T-SQL locals in declaration order against the PL/pgSQL
-/// declaration section, and the return code against the extra trailing
-/// `INOUT` parameter. The checker verifies the result; a wrong proposal can
-/// only make it refuse.
+/// declaration section, and the return status against the trailing
+/// `return_code` parameter (or itself, when the output has none). Target
+/// names are folded as PostgreSQL folds them. The checker verifies the
+/// result; a wrong proposal can only make it refuse.
 pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Renaming, String> {
     let mut out = Vec::new();
-    let code = a.kind == routine::RoutineKind::Procedure && returns_value(&a.body.body);
-    let extra = usize::from(code);
-    if b.params.len() != a.params.len() + extra {
+    let status = a.kind == RoutineKind::Procedure && has_status(b);
+    if b.params.len() != a.params.len() + usize::from(status) {
         return Err(format!(
             "{} parameters in the source, {} in the output",
             a.params.len(),
@@ -109,14 +149,11 @@ pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Renaming, String> {
         ));
     }
     for (x, y) in a.params.iter().zip(&b.params) {
-        out.push((x.name.clone(), y.name.clone()));
+        out.push((x.name.clone(), pg_name(&y.name)));
     }
-    if code {
-        let last = b.params.last().expect("checked above");
-        if last.mode != Mode::InOut {
-            return Err("the return code's parameter is not INOUT".into());
-        }
-        out.push((RETURN_CODE.to_string(), last.name.clone()));
+    if a.kind == RoutineKind::Procedure {
+        let to = if status { STATUS_PARAM } else { STATUS };
+        out.push((STATUS.to_string(), to.to_string()));
     }
     let mut locals = Vec::new();
     tsql_locals(&a.body.body, &mut locals);
@@ -125,7 +162,7 @@ pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Renaming, String> {
         .decls
         .iter()
         .filter_map(|s| match s {
-            Stmt::Declare { name, .. } => Some(name.clone()),
+            Stmt::Declare { name, .. } => Some(pg_name(name)),
             _ => None,
         })
         .collect();
@@ -139,31 +176,100 @@ pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Renaming, String> {
     out.extend(locals.into_iter().zip(decls));
     let mut seen = std::collections::HashSet::new();
     for (_, y) in &out {
-        if !seen.insert(y.to_lowercase()) {
+        if !seen.insert(y.clone()) {
             return Err(format!("two source names map to `{y}`"));
         }
     }
     Ok(out)
 }
 
-/// A source to target name pairing.
-pub type Renaming = Vec<(String, String)>;
+/// The target routine a T-SQL routine name reaches under the converter's
+/// schema rule: `dbo.` is dropped (`ASM-DBO-SCHEMA`), and the parts are
+/// folded as PostgreSQL folds unquoted names. The second value says whether
+/// the rule dropped `dbo`.
+pub fn target_routine(parts: &[String]) -> (String, bool) {
+    let dbo = parts.len() == 2 && parts[0].eq_ignore_ascii_case("dbo");
+    let rest = if dbo { &parts[1..] } else { parts };
+    let name = rest
+        .iter()
+        .map(|p| pg_name(p))
+        .collect::<Vec<_>>()
+        .join(".");
+    (name, dbo)
+}
 
-/// Answers a routine pair with its renaming.
-pub type Check<'a> = &'a dyn Fn(&Routine, &Routine, &[(String, String)]) -> Answer;
+fn mode_letter(m: Mode) -> char {
+    match m {
+        Mode::In => 'i',
+        Mode::Out => 'o',
+        Mode::InOut => 'b',
+    }
+}
 
-/// Certificates for the routines of one converted file. `check` answers a
-/// pair with its renaming; without a checker for routines every answer is
-/// unconfirmed, with the reason.
+/// What the checker is asked about one routine pair, and the assumptions
+/// a confirmation rests on.
+pub fn mirror_request(
+    a: &Routine,
+    b: &Routine,
+    output_routines: &[Routine],
+    row_counts: bool,
+) -> Result<(MirrorRequest, Vec<String>), String> {
+    let renaming = propose_renaming(a, b)?;
+    let mut assumptions = vec![C1_OPERATORS.to_string()];
+    if a.kind == RoutineKind::Procedure {
+        assumptions.push("ASM-RETURN-CODE".to_string());
+    }
+    let mut calls = Vec::new();
+    callees(&a.body.body, &mut calls);
+    let mut routines = Vec::new();
+    for c in calls {
+        let (to, dbo) = target_routine(&c);
+        if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
+            assumptions.push("ASM-DBO-SCHEMA".to_string());
+        }
+        let pair = (c.join("."), to);
+        if !routines.contains(&pair) {
+            routines.push(pair);
+        }
+    }
+    let catalog = output_routines
+        .iter()
+        .map(|r| {
+            let name = r
+                .name
+                .iter()
+                .map(|p| pg_name(p))
+                .collect::<Vec<_>>()
+                .join(".");
+            (name, r.params.iter().map(|p| mode_letter(p.mode)).collect())
+        })
+        .collect();
+    Ok((
+        MirrorRequest {
+            row_counts,
+            routines,
+            catalog,
+            renaming,
+            source: encode::routine(a),
+            target: encode::routine(b),
+        },
+        assumptions,
+    ))
+}
+
+/// Certificates for the routines of one converted file, asked of `checker`
+/// (none: every answer is unconfirmed, with the reason).
 pub fn certify(
     input: &str,
     output: &str,
     from: Dialect,
     to: Dialect,
-    check: Check,
+    row_counts: bool,
+    checker: Option<&dyn Checker>,
 ) -> Vec<Certificate> {
     let src = routines(input, from);
     let out = routines(output, to);
+    let readable: Vec<Routine> = out.iter().filter_map(|(_, r)| r.clone().ok()).collect();
     let mut certs = Vec::new();
     for (i, (name, a)) in src.into_iter().enumerate() {
         let mut c = Certificate {
@@ -173,6 +279,7 @@ pub fn certify(
             source: None,
             target: None,
             renaming: Vec::new(),
+            assumptions: Vec::new(),
             answer: Answer::Unconfirmed {
                 reason: String::new(),
             },
@@ -191,14 +298,28 @@ pub fn certify(
             (Ok(a), Some(Ok(b))) => {
                 c.source = Some(sha(&encode::routine(&a)));
                 c.target = Some(sha(&encode::routine(&b)));
-                match propose_renaming(&a, &b) {
+                match mirror_request(&a, &b, &readable, row_counts) {
                     Err(e) => Answer::Unconfirmed {
                         reason: format!("no renaming pairs the two routines: {e}"),
                     },
-                    Ok(r) => {
-                        let ans = check(&a, &b, &r);
-                        c.renaming = r;
-                        ans
+                    Ok((req, assumptions)) => {
+                        c.renaming = req.renaming.clone();
+                        match checker {
+                            None => Answer::Unconfirmed {
+                                reason: "no checker".into(),
+                            },
+                            Some(k) => match k.check_mirror(&req) {
+                                proof::Answer::Confirmed { theorem } => {
+                                    c.assumptions = assumptions;
+                                    Answer::Confirmed {
+                                        theorems: vec![theorem],
+                                    }
+                                }
+                                proof::Answer::Unconfirmed { reason } => {
+                                    Answer::Unconfirmed { reason }
+                                }
+                            },
+                        }
                     }
                 }
             }
@@ -206,13 +327,6 @@ pub fn certify(
         certs.push(c);
     }
     certs
-}
-
-/// The answer while the checker has no routine semantics (phase C1).
-pub fn no_checker(_: &Routine, _: &Routine, _: &[(String, String)]) -> Answer {
-    Answer::Unconfirmed {
-        reason: "the checker does not check routines yet (phase C1)".into(),
-    }
 }
 
 #[cfg(test)]
@@ -241,7 +355,7 @@ END
     fn a_converted_procedure_gets_a_certificate_with_its_renaming() {
         let d = crate::rewrite(TSQL, Dialect::Tsql, Dialect::Postgres);
         let out = d.output().to_string();
-        let certs = certify(TSQL, &out, Dialect::Tsql, Dialect::Postgres, &no_checker);
+        let certs = certify(TSQL, &out, Dialect::Tsql, Dialect::Postgres, false, None);
         assert_eq!(certs.len(), 1, "{out}");
         let c = &certs[0];
         assert!(c.source.is_some() && c.target.is_some(), "{c:?}\n{out}");
@@ -250,7 +364,7 @@ END
             [
                 ("@a", "p_a"),
                 ("@b", "p_b"),
-                (RETURN_CODE, "return_code"),
+                (STATUS, "return_code"),
                 ("@x", "v_x")
             ]
             .map(|(x, y)| (x.to_string(), y.to_string()))
@@ -267,11 +381,40 @@ END
             d.output(),
             Dialect::Tsql,
             Dialect::Postgres,
-            &no_checker,
+            false,
+            None,
         );
         let Answer::Unconfirmed { reason } = &certs[0].answer else {
             panic!();
         };
         assert!(reason.contains("outside the verified shape"), "{reason}");
+    }
+
+    #[test]
+    fn callees_follow_the_schema_rule_and_the_catalog_is_the_output() {
+        let src = "CREATE PROCEDURE dbo.q @n int AS BEGIN SET @n = @n + 1; END\nGO\nCREATE PROCEDURE dbo.p AS BEGIN DECLARE @v int = 1; EXEC dbo.q @v; END\n";
+        let out = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres)
+            .output()
+            .to_string();
+        let a = routines(src, Dialect::Tsql);
+        let b = routines(&out, Dialect::Postgres);
+        let readable: Vec<Routine> = b.iter().filter_map(|(_, r)| r.clone().ok()).collect();
+        let (req, asm) = mirror_request(
+            a[1].1.as_ref().unwrap(),
+            b[1].1.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
+            &readable,
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.routines, [("dbo.q".to_string(), "q".to_string())]);
+        assert!(
+            req.catalog.iter().any(|(n, _)| n == "q"),
+            "{:?}",
+            req.catalog
+        );
+        assert!(asm.contains(&"ASM-DBO-SCHEMA".to_string()));
+        let line = req.line(9).unwrap();
+        assert!(line.starts_with("sqldiff-check/3\t9\t"), "{line}");
+        assert_eq!(line.split('\t').count(), 10, "{line}");
     }
 }

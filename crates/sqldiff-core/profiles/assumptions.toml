@@ -156,6 +156,13 @@ fact = "The target's function list in the catalog."
 sites = ["sqldiff-core/src/bind/query.rs"]
 
 [[assumption]]
+id = "ASM-C1-OPERATORS"
+statement = "Each operator, function and literal form in a routine confirmed by the C1 mirror check means the same in both dialects; C1 leaves them uninterpreted."
+discharge = "nothing"
+fact = "The C2 scalar semantics and its mirror lemmas (docs/verified-conversion.md, phase C2)."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
 id = "ASM-CALLEE-CONVERTED"
 statement = "The procedure a call names on side B is the conversion of the one it names on side A."
 discharge = "generated"
@@ -443,7 +450,7 @@ statement = "Objects in T-SQL schema dbo are found in the target's default schem
 discharge = "deployment"
 fact = "The target's default schema holds the converted objects."
 fact_key = "default_schema"
-sites = ["sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-DEFAULT-SCHEMA"
@@ -713,7 +720,7 @@ id = "ASM-RETURN-CODE"
 statement = "Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter."
 discharge = "deployment"
 fact = "How callers read the return code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-RETURN-LENGTHS"

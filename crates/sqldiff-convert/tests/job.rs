@@ -50,6 +50,8 @@ impl Fixture {
             discard_edits: false,
             instances: None,
             queue_all: false,
+            proof: Default::default(),
+            row_counts: false,
         }
     }
 }

@@ -196,3 +196,62 @@ fn the_real_checker_confirms_a_reformatted_routine() {
         "the syntax trees differ: outside the verified fragment"
     );
 }
+
+/// C1 end to end with the real checker: a converted procedure with IF,
+/// ELSE IF, WHILE and RETURN is confirmed from the text on disk; one with
+/// an UPDATE is outside C1 and says so.
+#[test]
+fn the_real_checker_confirms_a_converted_procedure() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("convert-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(&src, "p.sql", "CREATE PROCEDURE dbo.p @a int, @b int = 2 OUTPUT\nAS\nBEGIN\n  DECLARE @x int = 1;\n  IF @a > 1\n    SET @x = 2;\n  ELSE IF @a < 0\n  BEGIN\n    SET @x = 3;\n  END\n  ELSE\n    SET @x = 4;\n  WHILE @x < 10\n    SET @x = @x + 1;\n  RETURN @x;\nEND\n");
+    write(
+        &src,
+        "touch.sql",
+        "CREATE PROCEDURE dbo.touch @id int AS\nBEGIN\n  UPDATE t SET x = 1 WHERE id = @id;\nEND\n",
+    );
+    let out = d.join("out");
+    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(&out)
+        .args(["--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains("certificates: 1 of 2 routines confirmed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("certificates.json")).unwrap())
+            .unwrap();
+    let routine = |path: &str| {
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == path)
+            .unwrap()["routines"][0]
+            .clone()
+    };
+    let p = routine("p.sql");
+    assert_eq!(p["answer"], "confirmed", "{p}");
+    assert_eq!(p["theorems"][0], "Sqldiff.Mirror.check_sound");
+    assert_eq!(p["assumptions"][0], "ASM-C1-OPERATORS", "{p}");
+    let t = routine("touch.sql");
+    assert_eq!(t["answer"], "unconfirmed", "{t}");
+    assert_eq!(t["reason"], "the T-SQL routine is outside the C1 spec");
+}

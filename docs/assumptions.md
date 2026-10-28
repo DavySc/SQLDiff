@@ -13,8 +13,8 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 45 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 67 |
-| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 25 |
-| | Total | 154 |
+| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 26 |
+| | Total | 155 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -57,6 +57,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-BIT-BOOLEAN-COLUMN` | The T-SQL bit column's 0 and 1 are the PostgreSQL boolean column's false and true. | `deployment` | The data migration maps bit 0 and 1 to false and true (the value correspondence of the deployment). | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-BIT-SMALLINT` | Only 0, 1 and NULL are written to a T-SQL bit converted to SMALLINT. | `generated` | A CHECK (x IN (0, 1)) on the converted column, or callers that write only 0, 1 and NULL. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/bits.rs` |
 | `ASM-BUILTIN-ABSENT` | The dialect has no built-in function with a name the code calls (it is not on SQLDiff's built-in list). | `catalog` | The target's function list in the catalog. | `sqldiff-core/src/bind/query.rs` |
+| `ASM-C1-OPERATORS` | Each operator, function and literal form in a routine confirmed by the C1 mirror check means the same in both dialects; C1 leaves them uninterpreted. | `nothing` | The C2 scalar semantics and its mirror lemmas (docs/verified-conversion.md, phase C2). | `sqldiff-convert/src/cert.rs` |
 | `ASM-CALLEE-CONVERTED` | The procedure a call names on side B is the conversion of the one it names on side A. | `generated` | The callee is converted in the same tree, and its own conversion is compared in its file. | `sqldiff-core/src/equiv/call.rs` |
 | `ASM-CALLEES-NO-TXN-CONTROL` | Called routines do not commit or roll back, and their writes follow the caller's transaction. | `catalog` | The callees' bodies in the catalog or the tree. | `sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-CALLER-CHECKS-RC` | Callers inspect the return code. | `deployment` | Every caller reads the return code. | `sqldiff-core/src/ir/behaviour.rs` |
@@ -96,7 +97,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-DB2-USRPRF-USER` | A Db2 for i routine without SET OPTION USRPRF runs with the caller's authority (system naming at creation; fact V25, not checked). | `deployment` | The naming mode the routines are created with. (fact key `db2i_naming`) | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-DB2-UTC` | The job's current UTC offset gives UTC time (off by the change around a daylight-saving switch). | `deployment` | The job's time zone, and whether the code runs around a switch. (fact key `time_zone`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DB2I-RESERVED-UNCHECKED` | A name is not a Db2 for i reserved word (no verified list is built in). | `nothing` | A verified reserved-word list, or the name created on a real system. | `sqldiff-convert/src/names.rs` |
-| `ASM-DBO-SCHEMA` | Objects in T-SQL schema dbo are found in the target's default schema (search_path, CURRENT SCHEMA or library list). | `deployment` | The target's default schema holds the converted objects. (fact key `default_schema`) | `sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `ASM-DBO-SCHEMA` | Objects in T-SQL schema dbo are found in the target's default schema (search_path, CURRENT SCHEMA or library list). | `deployment` | The target's default schema holds the converted objects. (fact key `default_schema`) | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-DEFAULT-SCHEMA` | Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides. | `deployment` | The default schema in effect on both sides. (fact key `default_schema`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-EXTPROP-COMMENT` | Whoever reads the T-SQL extended property reads the target's comment instead (one unnamed comment per object). | `deployment` | The tools that read the property. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-FACT-*` | A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2). | `nothing` | The vendor fact checked on a real system (docs/vendor-facts-verification.md). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/ir/interp.rs` |
@@ -134,7 +135,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-READ-UNCOMMITTED` | Reading only committed rows where T-SQL reads uncommitted ones gives the same results (concurrency is not observed). | `deployment` | Callers do not depend on dirty reads. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-RESULT-NAMES-CI` | Clients read result columns by name case-insensitively. | `deployment` | How the clients read result columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RESULT-TYPES` | Declared result column types hold the selected values without conversion. | `catalog` | The types of the selected columns. | `sqldiff-core/src/equiv/canon.rs` |
-| `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-RETURN-LENGTHS` | Returned values fit the shorter of the two sides' declared return types. | `catalog` | The types of the returned expressions. | `sqldiff-core/src/equiv/mod.rs` |
 | `ASM-RETURN-STATUS` | Callers read a Db2 for i procedure's return status with GET DIAGNOSTICS DB2_RETURN_STATUS (or the driver's return value). | `deployment` | How callers read the return status. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-ROUTINE-LABEL` | A routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful. | `catalog` | The routine's body in the catalog. | `sqldiff-core/src/equiv/canon.rs` |

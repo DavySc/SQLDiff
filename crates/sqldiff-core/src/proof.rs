@@ -191,6 +191,86 @@ pub trait Checker: Send + Sync + std::fmt::Debug {
     /// Name and version, recorded in the report.
     fn name(&self) -> String;
     fn check(&self, req: &Request) -> Answer;
+    /// The C1 mirror check of a converted routine (`sqldiff-check/3`). A
+    /// checker that does not speak it answers unconfirmed.
+    fn check_mirror(&self, _req: &MirrorRequest) -> Answer {
+        Answer::Unconfirmed {
+            reason: format!("the checker does not speak {MIRROR_PROTOCOL}"),
+        }
+    }
+}
+
+/// The line protocol of the mirror check (`formal/lean/Main.lean`,
+/// `formal/lean/Sqldiff/Mirror/Request.lean`).
+pub const MIRROR_PROTOCOL: &str = "sqldiff-check/3";
+
+/// One converted routine for the C1 mirror check: the source and the
+/// output routine (`sqldiff_syntax::encode::routine` lines), the trusted
+/// deployment facts and target catalog, and the untrusted renaming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorRequest {
+    /// The observer reads rows-affected counts.
+    pub row_counts: bool,
+    /// T-SQL routine names (`.`-joined, as written) and the target routine
+    /// each one is (trusted: the deployment's schema mapping).
+    pub routines: Vec<(String, String)>,
+    /// Target routines (folded names) and their parameter modes, one of
+    /// `i`, `o`, `b` (IN, OUT, INOUT) per parameter.
+    pub catalog: Vec<(String, String)>,
+    /// Source variable (with `@`) to target name; the T-SQL return status
+    /// is `%status`.
+    pub renaming: Vec<(String, String)>,
+    pub source: String,
+    pub target: String,
+}
+
+fn hex(s: &str) -> String {
+    s.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn pairs(v: &[(String, String)]) -> String {
+    v.iter()
+        .map(|(a, b)| format!("{}:{}", hex(a), hex(b)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl MirrorRequest {
+    /// The request line, without the line end. `None` when a field would
+    /// break the format (a routine line with a tab, a mode letter other
+    /// than i, o, b).
+    pub fn line(&self, id: u64) -> Option<String> {
+        if [&self.source, &self.target]
+            .iter()
+            .any(|f| f.contains(['\t', '\n', '\r']))
+            || self
+                .catalog
+                .iter()
+                .any(|(_, m)| !m.chars().all(|c| matches!(c, 'i' | 'o' | 'b')))
+        {
+            return None;
+        }
+        let mut dep = String::from(if self.row_counts { "1" } else { "0" });
+        if !self.routines.is_empty() {
+            dep.push(',');
+            dep.push_str(&pairs(&self.routines));
+        }
+        let or_dash = |s: String| if s.is_empty() { "-".to_string() } else { s };
+        let catalog = self
+            .catalog
+            .iter()
+            .map(|(n, m)| format!("{}:{m}", hex(n)))
+            .collect::<Vec<_>>()
+            .join(",");
+        Some(format!(
+            "{MIRROR_PROTOCOL}\t{id}\t{}\tmirror\t{dep}\t{}\t{}\t{}\t{}\tend",
+            ast_schema_hash(),
+            or_dash(catalog),
+            or_dash(pairs(&self.renaming)),
+            self.source,
+            self.target
+        ))
+    }
 }
 
 /// The gate's settings for one run.

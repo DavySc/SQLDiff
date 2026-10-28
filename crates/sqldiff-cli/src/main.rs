@@ -713,6 +713,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 discard_edits,
                 instances,
                 queue_all,
+                proof: resolved.proof.clone(),
+                row_counts: resolved.options().observer.row_counts
+                    == sqldiff_core::observer::RowCounts::Always,
             })
         }
         Command::Instances(args) => instances_cmd::run(args),

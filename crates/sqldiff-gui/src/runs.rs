@@ -1333,6 +1333,9 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
         discard_edits: false,
         instances,
         queue_all: false,
+        // The GUI does not start the proof checker yet.
+        proof: Default::default(),
+        row_counts: false,
     };
     let command = Command::new(&program(), &job, &packs, &dir, isolated);
     Ok((job, out, command))

@@ -11,7 +11,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sqldiff_core::proof::{Answer, Checker, Request};
+use sqldiff_core::proof::{Answer, Checker, MirrorRequest, Request, MIRROR_PROTOCOL};
 
 /// How long one answer may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -117,11 +117,9 @@ impl Subprocess {
         })
     }
 
-    fn ask(&self, req: &Request) -> Result<Answer, String> {
+    fn ask(&self, line: impl Fn(u64) -> Option<String>) -> Result<Answer, String> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        let line = req
-            .line(id)
-            .ok_or("a target contains a tab or line break")?;
+        let line = line(id).ok_or("a field contains a tab or line break")?;
         let mut guard = self.conn.lock().map_err(|_| "checker lock poisoned")?;
         if guard.is_none() {
             *guard = Some(self.start()?);
@@ -172,9 +170,22 @@ impl Checker for Subprocess {
     }
 
     fn check(&self, req: &Request) -> Answer {
-        self.ask(req).unwrap_or_else(|reason| Answer::Unconfirmed {
-            reason: format!("checker failed: {reason}"),
-        })
+        self.ask(|id| req.line(id))
+            .unwrap_or_else(|reason| Answer::Unconfirmed {
+                reason: format!("checker failed: {reason}"),
+            })
+    }
+
+    fn check_mirror(&self, req: &MirrorRequest) -> Answer {
+        if !self.name.contains(MIRROR_PROTOCOL) {
+            return Answer::Unconfirmed {
+                reason: format!("the checker does not speak {MIRROR_PROTOCOL}"),
+            };
+        }
+        self.ask(|id| req.line(id))
+            .unwrap_or_else(|reason| Answer::Unconfirmed {
+                reason: format!("checker failed: {reason}"),
+            })
     }
 }
 
