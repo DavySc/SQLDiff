@@ -16,8 +16,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linked dynamically against glibc only; a static glibc link crashed
+          # on start (run 1), so the release ships this beside the musl CLI.
           - { os: ubuntu-latest, label: linux-x64, arch: "" }
-          - { os: ubuntu-latest, label: linux-x64-static, arch: "", static: true }
           - { os: macos-latest, label: macos-arm64, arch: "" }
           # Release builds make macOS x64 on an arm64 runner; Lean has no
           # cross compiler, so this runs the x86_64 toolchain under Rosetta.
@@ -44,15 +45,9 @@ jobs:
         shell: pwsh
         run: |
           curl.exe -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.ps1 -o elan-init.ps1
-          powershell -ExecutionPolicy Bypass -File elan-init.ps1 -NoPrompt 1 -DefaultToolchain none
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          .\elan-init.ps1 -NoPrompt $true -DefaultToolchain none
           echo "$env:USERPROFILE\.elan\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Static link flags
-        if: matrix.static
-        run: |
-          cat >> lakefile.toml <<'EOF'
-          moreLinkArgs = ["-static"]
-          EOF
-          cat lakefile.toml
       - name: Build
         run: |
           ${{ matrix.arch }} lake --version
@@ -63,6 +58,12 @@ jobs:
           exe=.lake/build/bin/sqldiff_check
           [ -f "$exe.exe" ] && exe="$exe.exe"
           file "$exe" || true
+          otool -L "$exe" 2>/dev/null || true
+          if command -v objdump >/dev/null && [ "$RUNNER_OS" = Linux ]; then
+            echo "newest glibc symbol version needed:"
+            objdump -T "$exe" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          fi
+          ${{ matrix.arch }} "$exe" --version || echo "exit $?"
           python3 measure.py "$exe" | tee measure-${{ matrix.label }}.json
       - uses: actions/upload-artifact@v4
         with:
