@@ -158,6 +158,7 @@ h3:not(:first-child) { margin-top: 16px; }
 <header>
   <h1>SQLDiff review</h1>
   <span class="muted" id="pairname"></span>
+  <span class="chip" id="packs"></span>
   <span id="chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
   <span class="spacer"></span>
   <label class="tog" title="Also list plainly converted units nobody approved (tier 6): nothing found, not proven"><input type="checkbox" id="all"> Nothing found too</label>
@@ -238,6 +239,10 @@ function renderHeader() {
   const base = (p) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
   $("pairname").innerHTML = `${esc(dialectName(st.from))} → ${esc(dialectName(st.to))} · <span class="mono">${esc(base(st.src))}</span> → <span class="mono">${esc(base(st.out))}</span>${st.templates ? " · templates" : ""}`;
   $("pairname").title = `Source: ${st.src}\nConverted tree: ${st.out}\nDecisions: ${st.ledger_path}`;
+  // The packs this review's config loaded (a private pack by path only).
+  const label = (p) => p.private ? "private pack" : p.name + (p.version ? " " + p.version : "");
+  $("packs").textContent = !st.packs.length ? "No pack loaded" : (st.packs.length === 1 ? "Pack: " : "Packs: ") + st.packs.map(label).join(", ");
+  $("packs").title = st.packs.length ? "Loaded:\n" + st.packs.map((p) => `${label(p)}: ${p.path}`).join("\n") : "No pack is loaded: built-in rules and config files only";
   const tiers = Object.entries(st.tiers).filter(([, n]) => n > 0);
   const g = st.gate;
   const gate = g

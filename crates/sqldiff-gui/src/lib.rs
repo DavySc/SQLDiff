@@ -19,6 +19,7 @@ pub mod app;
 pub mod browse;
 pub mod convert;
 pub mod convert_review;
+pub mod packs;
 pub mod report;
 pub mod review;
 pub mod runs;

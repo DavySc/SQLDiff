@@ -284,16 +284,18 @@ fn launch() -> Result<(), String> {
     if let Err(e) = open_browser(&url) {
         println!("Could not open a browser ({e}); open {url} yourself.");
     }
-    app::serve(listener, app(sample(), None, None, false), &[]).map_err(|e| e.to_string())
+    app::serve(listener, app(sample(), None, None, false, Vec::new()), &[])
+        .map_err(|e| e.to_string())
 }
 
 /// The app with what a command opened; sessions opened from home load
-/// config as `isolated` says.
+/// config as `isolated` says, and `packs` (the command's `--pack`).
 fn app(
     convert: convert::Setup,
     compare: Option<Session>,
     review: Option<convert_review::Review>,
     isolated: bool,
+    packs: Vec<PathBuf>,
 ) -> App {
     App {
         convert,
@@ -301,6 +303,7 @@ fn app(
         review,
         data_dir: recent_dir(isolated),
         isolated,
+        packs,
     }
 }
 
@@ -382,11 +385,11 @@ fn run(cli: Cli) -> Result<(), String> {
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
             if pair.a.is_none() && pair.report.is_none() {
                 // Nothing to compare yet: home picks what to compare.
-                let app = app(sample(), None, None, pair.isolated);
+                let app = app(sample(), None, None, pair.isolated, pair.packs);
                 return start(listener, app, View::Home, &allow_hosts);
             }
-            let isolated = pair.isolated;
-            let app = app(sample(), Some(open(pair)?), None, isolated);
+            let (isolated, packs) = (pair.isolated, pair.packs.clone());
+            let app = app(sample(), Some(open(pair)?), None, isolated, packs);
             start(listener, app, View::Compare, &allow_hosts)
         }
         Command::Convert {
@@ -416,7 +419,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     user: None,
                     isolated,
                     cwd: None,
-                    packs,
+                    packs: packs.clone(),
                     cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
                 })
                 .map_err(|e| e.0)?;
@@ -426,6 +429,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 Some(convert::TemplateSetup {
                     placeholders: Placeholders::new(def).map_err(|e| e.0)?,
                     parameters: (!parameters.is_empty()).then(|| parameters.into_iter().collect()),
+                    packs: sqldiff_gui::packs::loaded(&cfg),
                 })
             } else {
                 None
@@ -459,7 +463,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 return Err(format!("no conversion rules from {from} to {to} yet"));
             }
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
-            let app = app(setup, None, None, isolated);
+            let app = app(setup, None, None, isolated, packs);
             start(listener, app, View::Convert, &allow_hosts)
         }
         Command::Review {
@@ -485,7 +489,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 user: None,
                 isolated,
                 cwd: None,
-                packs,
+                packs: packs.clone(),
                 cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
             })
             .map_err(|e| e.0)?;
@@ -510,10 +514,11 @@ fn run(cli: Cli) -> Result<(), String> {
                 },
                 out,
                 instances,
+                packs: sqldiff_gui::packs::loaded(&cfg),
             })?;
             let listener = TcpListener::bind((host.as_str(), port)).map_err(|e| e.to_string())?;
             println!("decisions go to {}", review.ledger_path().display());
-            let app = app(sample(), None, Some(review), isolated);
+            let app = app(sample(), None, Some(review), isolated, packs);
             start(listener, app, View::Review, &allow_hosts)
         }
         Command::Export { pair, output } => {
