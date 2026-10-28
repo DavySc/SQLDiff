@@ -786,7 +786,7 @@ vendor fact as an axiom (decision 5).
 | Instances whose converted PostgreSQL returns a column under a lower-case name | converted | under assumptions (`ASM-RESULT-NAMES-CI`) |
 | B adds `ORDER BY` to a top-level result A leaves unordered (no TOP or LIMIT) | unknown | equal, `equivalent: false`, with the reason in `refinements` |
 | Every "equal" or "equal under assumptions" | (no field) | `equivalent: true` unless a one-way step was used |
-| A T-SQL procedure that sends rows-affected counts (no `SET NOCOUNT ON` first) against a PostgreSQL or Db2 for i routine, which sends none | equal under assumptions, without it | under `ASM-OBSERVER-ROWCOUNT`; converted procedures and instances are "under assumptions" instead of "converted" |
+| A T-SQL procedure that sends rows-affected counts (no `SET NOCOUNT ON` first) against a PostgreSQL or Db2 for i routine, which sends none | equal under assumptions, without it | under `ASM-OBSERVER-ROWCOUNT`; converted procedures and instances are "under assumptions" instead of "converted". Decided 2026-10-28: no special handling; a team whose callers do not read the counts accepts `ASM-OBSERVER-ROWCOUNT` in its pack |
 | `SET NOCOUNT` changed within one dialect, `[observer] row_counts = "never"` | different | equal under `ASM-OBSERVER-ROWCOUNT` |
 
 ## Leads found while planning
