@@ -14,7 +14,8 @@ string in lower-case hex, two digits per byte:
                                      NAME:NAME, a T-SQL table name (`.`-joined
                                      as written, `dbo.t`) and its target table
                                      (a catalog TABLE name)
-  CATALOG     - or ENTRY,ENTRY,...   ENTRY is a routine or (C3a) a table:
+  CATALOG     - or ENTRY,ENTRY,...   ENTRY is a routine, (C3a) a table, or
+                                     (C2b) a fact:
                 ROUTINE NAME:MODES   a target routine (folded as
                                      `Sqldiff.Mirror.pgName` folds) and one
                                      letter per parameter: i IN, o OUT, b INOUT
@@ -29,11 +30,25 @@ string in lower-case hex, two digits per byte:
                 SPEC i, in, ik or ink  i: the type, `int`/`integer` (the only
                                      one so far); n: NOT NULL; k: a column of
                                      the primary key (NOT NULL in any case)
+                FACT !binary-collation (C2b) `Catalog.binaryCollation`: the
+                                     T-SQL database that holds the routine
+                                     has a `_BIN`/`_BIN2` default collation,
+                                     and every collation a PostgreSQL
+                                     comparison in the routine can take (the
+                                     database default, the collations of the
+                                     arguments callers pass) is deterministic.
+                                     Any other `!` entry does not decode
   CERT        - or PAIR,PAIR,...     PAIR is NAME:NAME, a T-SQL variable and its
                                      PL/pgSQL name
 
 A request without `;` in DEPLOYMENT and without TABLE entries is a C1/C2a
 request as before; its routines cannot have data statements in the spec.
+A request without a FACT entry has no string comparison in the slice
+(C2b): `=` and `<>` on strings stay uninterpreted operators. A checker
+older than C2b answers a request with a FACT "the catalog does not
+decode": the Rust side sends the fact only when the deployment profile
+declares it, and records `ASM-BINARY-COLLATION` for every routine it
+sends it with.
 A TABLE entry asserts every fact `Sqldiff.Mirror.CatTable` lists (no
 other constraint, default, trigger, ...): the Rust side sends a table only
 when the catalogs show all of them.
@@ -117,12 +132,16 @@ def col? (s : String) : Option CatCol := do
     | none => some (if name.startsWith "\"" then String.ofList (name.toList.drop 1) else name)
   pure { name, tsql, notNull, key }
 
-/-- A catalog entry: a routine, or a table. -/
+/-- A catalog entry: a routine, a table, or (C2b) the collation fact. -/
 inductive Entry where
   | routine (n : String) (modes : List Ast.Mode)
   | table (t : CatTable)
+  | binaryCollation
 
 def entry? (e : String) : Option Entry :=
+  if e.startsWith "!" then
+    if e == "!binary-collation" then some .binaryCollation else none
+  else
   match e.splitOn "=" with
   | [n, cs] => do
     let cols ← (cs.splitOn "/").mapM col?
@@ -134,8 +153,9 @@ def entry? (e : String) : Option Entry :=
 
 def catalog? (s : String) : Option Catalog :=
   (items? s entry?).map fun es =>
-    { routines := es.filterMap fun | .routine n ms => some (n, ms) | .table _ => none
-      tables := es.filterMap fun | .table t => some t | .routine .. => none }
+    { routines := es.filterMap fun | .routine n ms => some (n, ms) | _ => none
+      tables := es.filterMap fun | .table t => some t | _ => none
+      binaryCollation := es.any fun | .binaryCollation => true | _ => false }
 
 def cert? (s : String) : Option Cert := (items? s pair?).map Cert.mk
 
@@ -169,18 +189,28 @@ ever added, so a reader of the C1 answer keeps working.
   the confirmation covers the target catalog's tables named in the
   request, under the facts a TABLE entry asserts), `"c1"` when they have
   only the control statements of C1. Added in C3a, last, so a reader of
-  the C2a answer keeps working. -/
+  the C2a answer keeps working.
+
+C2b adds no field: a confirmation whose routines use strings is a C2a
+answer (the slice grew; the theorem is the same), and its `"residual"`
+names the string facts it rests on (`ASM-CONCAT-NULL`,
+`ASM-BINARY-COLLATION`, `ASM-TSQL-LEN-BMP`, `ASM-TSQL-STRING-ARGS`;
+`Sqldiff.Mirror.residual`). A reader that does not know one of them must
+not treat the answer as a C2a one. -/
 def extra (dep cat ra : String) (ans : Answer) : String :=
   match ans with
   | .unconfirmed _ => ""
   | .confirmed t =>
-    let ca := match deployment? dep, catalog? cat, Ast.decodeRoutineLine ra with
+    let a := Ast.decodeRoutineLine ra
+    let ca := match deployment? dep, catalog? cat, a with
       | some d, some g, some a => lowerT d g a
       | _, _, _ => none
     let stmts := if (ca.map Core.Routine.hasData).getD false then "c3a" else "c1"
     let tail := ",\"statements\":\"" ++ stmts ++ "\""
     if t == theoremC2a then
-      let names := (ca.map residual).getD []
+      let names := match a, ca with
+        | some a, some ca => residual a ca
+        | _, _ => []
       let items := ",".intercalate (names.map fun n => "\"" ++ n ++ "\"")
       ",\"scalars\":\"c2a\",\"residual\":[" ++ items ++ "]" ++ tail
     else ",\"scalars\":\"uninterpreted\"" ++ tail
@@ -206,6 +236,13 @@ def extra (dep cat ra : String) (ans : Answer) : String :=
 #guard (catalog? "74=22517479.in").map (fun g => g.tables.map fun t => t.cols.map (·.tsql)) ==
   some [["Qty"]]
 #guard (catalog? "74=6964.ix").isNone
+-- C2b: the collation fact, alone or with other entries; nothing else after `!`.
+#guard (catalog? "!binary-collation").map (·.binaryCollation) == some true
+#guard (catalog? "70:ib,!binary-collation").map (fun g => (g.routines.length, g.binaryCollation)) ==
+  some (1, true)
+#guard (catalog? "70:ib").map (·.binaryCollation) == some false
+#guard (catalog? "!binary").isNone
+#guard (catalog? "!").isNone
 #guard (catalog? "74=").isNone
 #guard (catalog? "74=6964").isNone
 

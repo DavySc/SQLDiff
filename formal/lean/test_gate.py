@@ -3,8 +3,9 @@ for identical sides that decode under the checker's syntax schema.
 sqldiff-check/3: the C1 mirror check, confirmed for a T-SQL procedure and
 its PL/pgSQL mirror, with the C2a fields (`scalars`, `residual`) and the
 C3a field (`statements`) on a confirmed answer; C3a requests with table
-mappings in DEPLOYMENT and table entries in CATALOG. Anything else is
-unconfirmed, including malformed requests.
+mappings in DEPLOYMENT and table entries in CATALOG; C2b string pairs,
+with the collation fact in CATALOG and the string residuals. Anything else
+is unconfirmed, including malformed requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
 """
@@ -256,6 +257,81 @@ cases += [
                 b=proc(["r"], [], [], [dele(["acct"], C("InList", pv("qty"), L(num(1), num(2)), "f"))]),
                 dep=D_DEP, cat=D_CAT, cert=f"{hx('%status')}:{hx('%status')}"), "confirmed"),
 ]
+
+# C2b: strings. T-SQL @a, @b varchar(10) and @r varchar(20) OUTPUT; the
+# PL/pgSQL mirror takes text. `!binary-collation` in CATALOG is the
+# collation fact (Sqldiff.Mirror.Catalog.binaryCollation).
+
+
+def ty(name, *args):
+    return C("Ty", S(name), L(*map(S, args)))
+
+
+def sparam(n, mode, t):
+    return C("Param", S(n), t, C(mode), NONE)
+
+
+def string(t):
+    return C("Str", S(t))
+
+
+VC10, VC3, VC20, TEXT = ty("VARCHAR", "10"), ty("VARCHAR", "3"), ty("VARCHAR", "20"), ty("TEXT")
+
+
+def s_t(body, ta=VC10):
+    return proc(["r"], [sparam("@a", "In", ta), sparam("@b", "In", ta), sparam("@r", "InOut", VC20)], [], body)
+
+
+def s_p(body, rt=TEXT):
+    return proc(["r"], [sparam("a", "In", TEXT), sparam("b", "In", TEXT), sparam("r", "InOut", rt)], [], body)
+
+
+S_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@a", "a"), ("@b", "b"), ("@r", "r"), ("%status", "%status")])
+
+
+def req3s(i, a, b, cat="-"):
+    return req3(i, a=a, b=b, dep="0", cat=cat, cert=S_CERT)
+
+
+def if_eq(cond, set_):
+    return C("If", cond, L(set_(string("eq"))), L(set_(string("ne"))))
+
+
+EQ_T = s_t([if_eq(bin_("=", tv("@a"), tv("@b")), lambda v: assign(tv("@r"), v))])
+EQ_P_RTRIM = s_p([if_eq(bin_("=", fn("rtrim", pv("a")), fn("rtrim", pv("b"))), lambda v: assign(pv("r"), v))])
+EQ_P_PLAIN = s_p([if_eq(bin_("=", pv("a"), pv("b")), lambda v: assign(pv("r"), v))])
+LEN_T = proc(["r"], [sparam("@a", "In", VC10), param("@r", "InOut")], [],
+             [assign(tv("@r"), fn("LEN", tv("@a")))])
+
+
+def len_p(e):
+    return proc(["r"], [sparam("a", "In", TEXT), param("r", "InOut")], [], [assign(pv("r"), e)])
+
+
+LEN_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@a", "a"), ("@r", "r"), ("%status", "%status")])
+cases += [
+    # `@r = @a + @b` against `r := a || b`.
+    ("51", req3s(51, s_t([assign(tv("@r"), bin_("+", tv("@a"), tv("@b")))]),
+                 s_p([assign(pv("r"), bin_("||", pv("a"), pv("b")))])), "confirmed"),
+    # T-SQL `=` pads with spaces: it is `rtrim(a) = rtrim(b)`, given the collation fact.
+    ("52", req3s(52, EQ_T, EQ_P_RTRIM, cat="!binary-collation"), "confirmed"),
+    # Without the fact string `=` is an uninterpreted operator: the rtrim form differs.
+    ("53", req3s(53, EQ_T, EQ_P_RTRIM), "unconfirmed"),
+    # Plain `a = b` counts trailing spaces: refused.
+    ("54", req3s(54, EQ_T, EQ_P_PLAIN, cat="!binary-collation"), "unconfirmed"),
+    # An unknown fact does not decode.
+    ("55", req3s(55, EQ_T, EQ_P_RTRIM, cat="!case-insensitive"), "unconfirmed"),
+    # LEN(@a) against length(rtrim(a)), and against length(a).
+    ("56", req3(56, a=LEN_T, b=len_p(fn("length", fn("rtrim", pv("a")))), dep="0", cat="-", cert=LEN_CERT),
+     "confirmed"),
+    ("57", req3(57, a=LEN_T, b=len_p(fn("length", pv("a"))), dep="0", cat="-", cert=LEN_CERT), "unconfirmed"),
+    # ISNULL(@a, 'abcdef') with @a varchar(3) truncates; COALESCE does not.
+    ("58", req3s(58, s_t([assign(tv("@r"), fn("ISNULL", tv("@a"), string("abcdef")))], ta=VC3),
+                 s_p([assign(pv("r"), fn("COALESCE", pv("a"), string("abcdef")))])), "unconfirmed"),
+    # 'none' fits @a varchar(10): ISNULL is COALESCE.
+    ("59", req3s(59, s_t([assign(tv("@r"), fn("ISNULL", tv("@a"), string("none")))]),
+                 s_p([assign(pv("r"), fn("COALESCE", pv("a"), string("none")))])), "confirmed"),
+]
 THEOREMS = {
     "31": "Sqldiff.Mirror.check_sound",
     "40": "Sqldiff.Mirror.check_sound",
@@ -263,6 +339,10 @@ THEOREMS = {
     "42": "Sqldiff.Mirror.check_sound_c2a",
     "44": "Sqldiff.Mirror.check_sound_c2a",
     "50": "Sqldiff.Mirror.check_sound",
+    "51": "Sqldiff.Mirror.check_sound_c2a",
+    "52": "Sqldiff.Mirror.check_sound_c2a",
+    "56": "Sqldiff.Mirror.check_sound_c2a",
+    "59": "Sqldiff.Mirror.check_sound_c2a",
 }
 # The fields a confirmed /3 answer adds (Main.lean); none on /2 or unconfirmed answers.
 EXTRA = {
@@ -274,6 +354,12 @@ EXTRA = {
            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR"],
            "statements": "c3a"},
     "50": {"scalars": "uninterpreted", "statements": "c3a"},
+    "51": {"scalars": "c2a", "residual": ["ASM-CONCAT-NULL", "ASM-TSQL-STRING-ARGS"], "statements": "c1"},
+    "52": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-BINARY-COLLATION", "ASM-TSQL-STRING-ARGS"],
+           "statements": "c1"},
+    "56": {"scalars": "c2a", "residual": ["ASM-TSQL-LEN-BMP", "ASM-TSQL-STRING-ARGS"], "statements": "c1"},
+    "59": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
 }
 inp = "".join(line + "\n" for _, line, _ in cases)
 out = subprocess.run([exe], input=inp.encode(), capture_output=True, check=True).stdout.decode()

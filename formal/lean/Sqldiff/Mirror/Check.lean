@@ -97,11 +97,40 @@ And one fact about the caller:
   statements before the failing one stay committed ("SET XACT_ABORT
   (Transact-SQL)"; autocommit, "Transactions (Transact-SQL)"), while
   PostgreSQL rolls back the whole `CALL` with its transaction. Phase C4
-  models both. -/
-def residual (ca : Core.Routine) : List String :=
+  models both.
+
+And, for strings (C2b, `Sqldiff.Mirror`, "The C2b slice: strings"):
+
+* `ASM-CONCAT-NULL`, when an expression concatenates strings and the
+  T-SQL routine does not start with `SET CONCAT_NULL_YIELDS_NULL ON`
+  (`concatNullOn`): T-SQL sessions run with `CONCAT_NULL_YIELDS_NULL ON`,
+  so `+` with a NULL string is NULL, as `||` is.
+* `ASM-BINARY-COLLATION`, when an expression compares strings: the
+  catalog fact `binaryCollation` the request asserted (the T-SQL
+  database's default collation is `_BIN`/`_BIN2`, every collation a
+  PostgreSQL comparison can take is deterministic).
+* `ASM-TSQL-LEN-BMP`, when an expression uses `LEN`: no character outside
+  the Basic Multilingual Plane reaches it, or the T-SQL collation is
+  supplementary-character aware (`_SC`, `_140_`, `_UTF8`), so that `LEN`
+  counts characters as `length` does.
+* `ASM-TSQL-STRING-ARGS`, when the T-SQL routine has a string parameter:
+  every string argument a caller passes fits the parameter's declared
+  type (at most `n` bytes for `varchar(n)`, `n` byte-pairs for
+  `nvarchar(n)`; for `varchar` only characters of the database's code
+  page), so T-SQL does not truncate or replace it on entry and the
+  PostgreSQL routine sees the same value. -/
+def residual (a : Ast.Routine) (ca : Core.Routine) : List String :=
   (if ca.mayRaise then ["ASM-TSQL-ARITH-ERRORS"] else []) ++
     (if ca.hasEqNe then ["ASM-TSQL-ANSI-NULLS"] else []) ++
-    (if ca.errAfterWrite then ["ASM-STATE-AFTER-ERROR"] else [])
+    (if ca.errAfterWrite then ["ASM-STATE-AFTER-ERROR"] else []) ++
+    (if ca.hasConcat && !concatNullOn a then ["ASM-CONCAT-NULL"] else []) ++
+    (if ca.hasStrEq then ["ASM-BINARY-COLLATION"] else []) ++
+    (if ca.hasLen then ["ASM-TSQL-LEN-BMP"] else []) ++
+    (if tsqlStringParams a then ["ASM-TSQL-STRING-ARGS"] else [])
+
+/-- The residual of a T-SQL routine, when it lowers. -/
+def residualOf (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option (List String) :=
+  (lowerT dep Γ a).map (residual a)
 
 def theoremC1 : String := "Sqldiff.Mirror.check_sound"
 def theoremC2a : String := "Sqldiff.Mirror.check_sound_c2a"

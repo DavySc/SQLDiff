@@ -8,7 +8,7 @@ ID is digits; SCHEMA is `sqldiff_core::proof::schema_hash`, which must be
 `Sqldiff.Syntax.schemaHash`; the trees come from
 `sqldiff_core::proof::tree_line` and contain no tab.
 
-The mirror check of phases C1, C2a and C3a (`Sqldiff.Mirror.check`,
+The mirror check of phases C1, C2a (with the C2b strings) and C3a (`Sqldiff.Mirror.check`,
 theorems `Sqldiff.Mirror.check_sound` and `Sqldiff.Mirror.check_sound_c2a`)
 is a second request kind:
 
@@ -18,7 +18,9 @@ AST-SCHEMA must be `Sqldiff.Ast.schemaHash`; ROUTINE-A (T-SQL, the
 reference) and ROUTINE-B (PL/pgSQL) are `sqldiff_syntax::encode` routine
 lines, decoded by `Sqldiff.Ast.decodeRoutineLine`; DEPLOYMENT, CATALOG and
 CERT are encoded as `Sqldiff.Mirror.Request` documents (C3a adds table
-mappings to DEPLOYMENT and table entries to CATALOG, both optional).
+mappings to DEPLOYMENT and table entries to CATALOG, both optional; C2b
+adds the optional CATALOG fact `!binary-collation`, which a checker
+before 0.6.0 does not decode).
 Anything else is answered "unconfirmed".
 
 Answers. `/2` and an unconfirmed `/3`:
@@ -40,9 +42,10 @@ slice and every data statement in the C3a slice, so the confirmation does
 not rest on operators meaning the same "by name" (`ASM-C1-OPERATORS`);
 `residual` lists the facts it rests on instead (possibly none): the T-SQL
 session facts `ASM-TSQL-ARITH-ERRORS` and `ASM-TSQL-ANSI-NULLS`, and
-(C3a) `ASM-STATE-AFTER-ERROR` when the routine can fail after a write. A
-reader that does not know a residual must not treat the answer as a C2a
-one. `"uninterpreted"` means it does rest on `ASM-C1-OPERATORS`.
+(C3a) `ASM-STATE-AFTER-ERROR` when the routine can fail after a write,
+and (C2b, strings) `ASM-CONCAT-NULL`, `ASM-BINARY-COLLATION`,
+`ASM-TSQL-LEN-BMP` and `ASM-TSQL-STRING-ARGS`. A reader that does not
+know a residual must not treat the answer as a C2a one. `"uninterpreted"` means it does rest on `ASM-C1-OPERATORS`.
 `"statements"` (C3a) is `"c3a"` when the routines have `INSERT`, `UPDATE`
 or `DELETE` statements, whose confirmation also rests on the TABLE entries
 of CATALOG and the table mappings of DEPLOYMENT, and `"c1"` otherwise.
@@ -99,7 +102,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.5.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.6.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

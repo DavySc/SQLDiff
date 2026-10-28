@@ -88,6 +88,14 @@ second argument evaluated only when the first is NULL) and `cond c a b`
 `col c` reads column `c` of the row a C3a statement is at (NULL outside
 one): it is not a variable, so it is never renamed.
 
+C2b adds strings: `str s` is a string literal, `concat a b` concatenation
+(NULL if either operand is NULL), `rtrim a` the string without its
+trailing spaces (U+0020 only), `streq a b` three-valued equality of two
+strings as sequences of characters (no collation, no padding: the T-SQL
+lowering puts the padding in with `rtrim`), and `len a` the number of
+characters. Which dialect construct lowers to which is the lowering's
+business (`Sqldiff.Mirror`, "The C2b slice: strings").
+
 The core does not type them; the lowerings build them only from
 expressions they have typed (`Sqldiff.Mirror.typed`). A variable read is
 always `var`, whatever the variable's type, so a routine outside the slice
@@ -106,6 +114,11 @@ inductive SExpr where
   | coalesce (a b : SExpr)
   | cond (c a b : SExpr)
   | col (c : Col)
+  | str (s : String)
+  | concat (a b : SExpr)
+  | rtrim (a : SExpr)
+  | streq (a b : SExpr)
+  | len (a : SExpr)
 deriving DecidableEq, Repr
 
 /-- Expressions. `sc s` is an expression of the slice. `op f args`
@@ -239,6 +252,11 @@ def SExpr.vars : SExpr → List Var
   | .coalesce a b => a.vars ++ b.vars
   | .cond c a b => c.vars ++ a.vars ++ b.vars
   | .col _ => []
+  | .str _ => []
+  | .concat a b => a.vars ++ b.vars
+  | .rtrim a => a.vars
+  | .streq a b => a.vars ++ b.vars
+  | .len a => a.vars
 
 mutual
   def Expr.vars : Expr → List Var
@@ -294,6 +312,11 @@ def SExpr.rename (f : Var → Var) : SExpr → SExpr
   | .coalesce a b => .coalesce (a.rename f) (b.rename f)
   | .cond c a b => .cond (c.rename f) (a.rename f) (b.rename f)
   | .col c => .col c
+  | .str s => .str s
+  | .concat a b => .concat (a.rename f) (b.rename f)
+  | .rtrim a => .rtrim (a.rename f)
+  | .streq a b => .streq (a.rename f) (b.rename f)
+  | .len a => .len (a.rename f)
 
 mutual
   def Expr.rename (f : Var → Var) : Expr → Expr
@@ -389,20 +412,39 @@ def Routine.exprs (r : Routine) : List Expr :=
 arithmetic or negation (overflow, division by zero). Conservative: a
 literal divisor or a constant operand does not count as safe. -/
 def SExpr.mayRaise : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ => false
+  | .var _ | .int _ | .null | .col _ | .str _ => false
   | .arith .. | .neg _ => true
-  | .cmp _ a b | .and a b | .or a b | .coalesce a b => a.mayRaise || b.mayRaise
-  | .not a | .isNull a _ => a.mayRaise
+  | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .streq a b =>
+    a.mayRaise || b.mayRaise
+  | .not a | .isNull a _ | .rtrim a | .len a => a.mayRaise
   | .cond c a b => c.mayRaise || a.mayRaise || b.mayRaise
 
 /-- The expression compares with `=` or `<>`, the comparisons T-SQL's
 `ANSI_NULLS OFF` changes. -/
 def SExpr.hasEqNe : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ => false
+  | .var _ | .int _ | .null | .col _ | .str _ => false
   | .cmp o a b => o == .eq || o == .ne || a.hasEqNe || b.hasEqNe
-  | .arith _ a b | .and a b | .or a b | .coalesce a b => a.hasEqNe || b.hasEqNe
-  | .neg a | .not a | .isNull a _ => a.hasEqNe
+  | .streq _ _ => true
+  | .arith _ a b | .and a b | .or a b | .coalesce a b | .concat a b => a.hasEqNe || b.hasEqNe
+  | .neg a | .not a | .isNull a _ | .rtrim a | .len a => a.hasEqNe
   | .cond c a b => c.hasEqNe || a.hasEqNe || b.hasEqNe
+
+/-- Some subterm (the expression itself included) satisfies `p`. -/
+def SExpr.anySub (p : SExpr → Bool) : SExpr → Bool
+  | s@(.var _) | s@(.int _) | s@.null | s@(.col _) | s@(.str _) => p s
+  | s@(.arith _ a b) | s@(.cmp _ a b) | s@(.and a b) | s@(.or a b) | s@(.coalesce a b)
+  | s@(.concat a b) | s@(.streq a b) => p s || a.anySub p || b.anySub p
+  | s@(.neg a) | s@(.not a) | s@(.isNull a _) | s@(.rtrim a) | s@(.len a) => p s || a.anySub p
+  | s@(.cond c a b) => p s || c.anySub p || a.anySub p || b.anySub p
+
+/-- The expression concatenates strings (C2b: `ASM-CONCAT-NULL`). -/
+def SExpr.hasConcat : SExpr → Bool := SExpr.anySub fun | .concat .. => true | _ => false
+
+/-- The expression compares strings (C2b: `ASM-BINARY-COLLATION`). -/
+def SExpr.hasStrEq : SExpr → Bool := SExpr.anySub fun | .streq .. => true | _ => false
+
+/-- The expression counts characters (C2b: `ASM-TSQL-LEN-BMP`). -/
+def SExpr.hasLen : SExpr → Bool := SExpr.anySub fun | .len _ => true | _ => false
 
 /-- An uninterpreted operator counts as raising and as comparing: what it
 does is unknown. -/
@@ -414,6 +456,12 @@ def Routine.mayRaise (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.mayRai
 
 def Routine.hasEqNe (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasEqNe)
 
+def Routine.hasConcat (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasConcat)
+
+def Routine.hasStrEq (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasStrEq)
+
+def Routine.hasLen (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasLen)
+
 /-! ## What a routine's data statements can do (C3a)
 
 These decide whether a confirmation is in the slice
@@ -422,10 +470,11 @@ These decide whether a confirmation is in the slice
 
 /-- The expression reads a column. -/
 def SExpr.hasCol : SExpr → Bool
-  | .var _ | .int _ | .null => false
+  | .var _ | .int _ | .null | .str _ => false
   | .col _ => true
-  | .arith _ a b | .cmp _ a b | .and a b | .or a b | .coalesce a b => a.hasCol || b.hasCol
-  | .neg a | .not a | .isNull a _ => a.hasCol
+  | .arith _ a b | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b
+  | .streq a b => a.hasCol || b.hasCol
+  | .neg a | .not a | .isNull a _ | .rtrim a | .len a => a.hasCol
   | .cond c a b => c.hasCol || a.hasCol || b.hasCol
 
 /-- A part of the expression that reads no column can raise. PostgreSQL
@@ -434,11 +483,12 @@ constants and may fold such a part while planning, so it can raise even
 when no row is written (`Sqldiff.Mirror`, "Constant parts of a data
 statement"). For an expression without columns this is `mayRaise`. -/
 def SExpr.constRaise : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ => false
+  | .var _ | .int _ | .null | .col _ | .str _ => false
   | .arith _ a b => if a.hasCol || b.hasCol then a.constRaise || b.constRaise else true
   | .neg a => if a.hasCol then a.constRaise else true
-  | .cmp _ a b | .and a b | .or a b | .coalesce a b => a.constRaise || b.constRaise
-  | .not a | .isNull a _ => a.constRaise
+  | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .streq a b =>
+    a.constRaise || b.constRaise
+  | .not a | .isNull a _ | .rtrim a | .len a => a.constRaise
   | .cond c a b => c.constRaise || a.constRaise || b.constRaise
 
 /-- The expression can raise; an uninterpreted operator counts. -/

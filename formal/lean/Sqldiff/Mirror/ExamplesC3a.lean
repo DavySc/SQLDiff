@@ -130,7 +130,7 @@ def bumpP (body : List Ast.Node := bumpBodyP) (params : List Ast.Param := [inP "
 #guard isC2a (checkD (bumpT) (bumpP))
 -- What the answer carries: the session facts, and that the routine can
 -- fail (the `INSERT` on a duplicate key, an overflow) after writing.
-#guard ((lowerT depd Γd bumpT).map residual) ==
+#guard (residualOf depd Γd bumpT) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR"]
 #guard ((lowerT depd Γd bumpT).map Core.Routine.hasData) == some true
 
@@ -156,7 +156,7 @@ def safeP : Ast.Routine :=
     upd ["acct"] [("qty", .Null)] (some (.IsNull (pv "p_id") true)),
     del ["acct"] (some (.IsNull (pv "qty") false))]
 #guard isC2a (checkD safeT safeP ⟨[("@id", "p_id"), (statusVar, statusVar)]⟩)
-#guard ((lowerT depd Γd safeT).map residual) == some []
+#guard (residualOf depd Γd safeT) == some []
 
 -- `DELETE` without `WHERE` and `UPDATE` without `WHERE`.
 #guard isC2a (checkD

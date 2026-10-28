@@ -15,3 +15,4 @@ import Sqldiff.Core.Data
 #print axioms Sqldiff.Core.insertRows_map
 #print axioms Sqldiff.Core.updateRows_map
 #print axioms Sqldiff.Core.deleteRows_map
+#print axioms Sqldiff.Mirror.mkRtrim_eval

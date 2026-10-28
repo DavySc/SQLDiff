@@ -2,7 +2,7 @@
 The lowering of T-SQL and PL/pgSQL routines, as the Rust parser reads them
 (`Sqldiff.Ast`, generated), into the core. Decision 9
 (docs/verified-conversion.md): this file *is* the specification of the C1
-constructs, of the C2a scalar slice and of the C3a data statements in both
+constructs, of the C2a scalar slice with the C2b strings, and of the C3a data statements in both
 dialects; there is no other T-SQL or PL/pgSQL semantics to prove it
 against. One abstract syntax serves both dialects and the dialect is a
 parameter. The lowering is partial: `none` means "outside the spec"
@@ -28,7 +28,7 @@ citation and probe status). A data statement that fails has no effect
 (statement atomicity) and then ends the routine like any error.
 
 Read top to bottom: the trusted inputs, names in data statements, the C2a
-slice with its vendor citations, expressions, the C3a data statements,
+slice with its vendor citations, the C2b strings, expressions, the C3a data statements,
 statements, calls, blocks, the two routines, and the test for "every
 expression is in the slice".
 -/
@@ -97,6 +97,15 @@ statements may write (C3a). -/
 structure Catalog where
   routines : List (String × List Ast.Mode)
   tables : List CatTable := []
+  /-- (C2b) A fact about both databases, from the deployment profile:
+  the T-SQL database that holds the routine has a binary default
+  collation (a `_BIN` or `_BIN2` collation), and every collation a
+  PostgreSQL comparison in the routine can take is deterministic (the
+  database's default, and the collation of every argument a caller
+  passes). Without it, `=` and `<>` on strings are outside the slice. The
+  answer names it as `ASM-BINARY-COLLATION` where a comparison uses it.
+  See "The C2b slice: strings". -/
+  binaryCollation : Bool := false
 
 /-- The empty catalog. -/
 instance : EmptyCollection Catalog := ⟨{ routines := [] }⟩
@@ -211,11 +220,18 @@ the three-valued booleans of conditions and the NULL literal.
 
 /-- The type of an expression of the slice. `nul` is the NULL literal,
 which takes the integer type from where it stands (a value position:
-assignment, `COALESCE`/`ISNULL` argument, `CASE` result). -/
+assignment, `COALESCE`/`ISNULL` argument, `CASE` result). `str n wide`
+is a string (C2b, "The C2b slice: strings"): `n` bounds the length of
+every value it can have (`none`: no bound), in T-SQL in bytes for
+`varchar` and in UTF-16 code units for `nvarchar` (so also in
+characters), in PostgreSQL in characters; `wide` says that a T-SQL value
+may hold characters outside the database's code page (it comes from an
+`nvarchar`); it is always `false` in PostgreSQL. -/
 inductive STy where
   | int
   | bool
   | nul
+  | str (n : Option Nat) (wide : Bool)
 deriving DecidableEq, Repr
 
 /-- The declared types of a routine's variables, by lowered name. -/
@@ -237,6 +253,7 @@ def valTy : STy → Bool
   | .int => true
   | .nul => true
   | .bool => false
+  | .str .. => false
 
 /-! ## The C2a slice: literals
 
@@ -432,6 +449,338 @@ caller observes the error's kind, not its number (decision 1; overflow
 and division by zero are both `arithmetic`). Not probed in a routine
 (eval/casts probes the errors in plain `SELECT`s). -/
 
+/-! ## The C2b slice: strings
+
+C2b adds character strings to the slice: variables and parameters of a
+string type, string literals, concatenation, `=` and `<>` (under a
+trusted collation fact only), `RTRIM`, `LEN`, `IS [NULL]`, and
+`COALESCE`, `ISNULL` and `CASE` over strings. Each rule states its claim,
+the vendor text, and its probe status, as for C2a. **Every vendor quote
+in this section was written from memory**: the vendor pages could not be
+reached when it was written (2026-10-28), so reviewers check each quote
+against the page named before this section is relied on; "from memory"
+below marks the ones the author is least sure of. A value is a sequence
+of characters (`Sqldiff.Core.Val.str`); the empty string is not NULL in
+either dialect (incidentally probed: eval/casts/assign, `''` into an
+`int` column is 0 in SQL Server and an input error in PostgreSQL, not
+NULL). Strings never meet integers in the slice: an operator,
+assignment or `COALESCE` that would convert between them is outside it.
+
+**Types, T-SQL.** `varchar(n)` (also spelt `char varying(n)`,
+`character varying(n)`) and `nvarchar(n)`, `1 ≤ n ≤ 4000`. For `varchar`
+`n` is "the string size in bytes" ("char and varchar (Transact-SQL)"),
+for `nvarchar` "the string size in byte-pairs" ("nchar and nvarchar
+(Transact-SQL)"); a character takes at least one byte or byte-pair, so
+`n` also bounds the number of characters, and a `varchar` value holds
+only characters of the code page of the database's collation. The cap of
+4000 (not 8000 for `varchar`) keeps every value of the slice under both
+concatenation limits below. Outside: `max`, no length (it means 1 in a
+declaration: "When n isn't specified in a data definition or variable
+declaration statement, the default length is 1"), `char(n)`/`nchar(n)`
+(blank-padded), `sysname`, `text`/`ntext`. Probed: eval/casts
+(`CAST('abcdef' AS varchar(3))` is `abc`, `CAST(N'abcdef' AS
+nvarchar(3))` is `abc`; `CAST(N'éééé' AS varchar(3))` is `ééé` under the
+probe server's single-byte collation).
+
+**Types, PostgreSQL.** `varchar(n)`, `character varying(n)`, `char
+varying(n)`, `1 ≤ n ≤ 10485760`: "strings up to n characters (not
+bytes) in length"; `varchar` without `n` and `text`: "the type accepts
+strings of any size" (8.3 "Character Types"). Outside: `char(n)`,
+`bpchar` and PostgreSQL `N'..'` (type `character`, blank-padded; the Rust
+parser refuses those literals), `name`, `citext`. A user type named
+`text` or `varchar` earlier in `search_path` than `pg_catalog` would
+shadow these names, as for `int4` above (assumed not to exist). Not
+probed as variable types.
+
+**PostgreSQL parameters carry no length.** "Parenthesized type modifiers
+(e.g., the precision field for type numeric) are discarded by CREATE
+FUNCTION" (CREATE FUNCTION, Notes; from memory, and that CREATE PROCEDURE
+does the same): a `varchar(10)` parameter holds any string. So a
+PostgreSQL parameter is read as having no length bound (`envP`), and a
+write to one is still held to its declared length (`envPDecl`), which is
+sound whether or not the modifier is kept. Not probed.
+
+**T-SQL parameters truncate.** A string argument longer than the
+parameter is silently truncated (probed: eval/casts/assign, `EXEC #q
+'abcdef'` with `@x varchar(3)` sees `abc`), and a `varchar` parameter
+replaces characters outside its code page; PostgreSQL does neither. The
+core binds arguments as they are, so the T-SQL lowering is faithful only
+for arguments that fit: `ASM-TSQL-STRING-ARGS` (`Sqldiff.Mirror.residual`)
+is the caller's promise that every string argument of a T-SQL string
+parameter (including the value passed to an `OUTPUT` parameter) has at
+most `n` bytes (`varchar(n)`) or byte-pairs (`nvarchar(n)`) and, for
+`varchar`, only characters of the database's code page. Strings passed
+to a call, and `OUTPUT` arguments that write back into a string
+variable, are outside the slice (the conversions at the callee's
+boundary are the callee's and the dialects differ there).
+
+**Assignment converts, differently.** T-SQL truncates a string that is
+too long for its target, silently (probed: eval/casts/assign, `DECLARE
+@v varchar(3) = 'abcdef'` gives `abc`; "char and varchar": "values that
+are too long for the new data type are truncated"), and replaces
+characters a `varchar` cannot hold (from memory: with `?`); PostgreSQL
+raises "value too long for type character varying(3)" (probed:
+eval/casts/assign, `DECLARE v varchar(3) := 'abcdef'`), or truncates
+when the excess characters are all spaces (8.3). So a string is stored
+(`SET`/`:=`, a `DECLARE` default, a parameter default, a function's
+`RETURN`) only when its bound is at most the target's length
+(`fitsTy`), and in T-SQL a value that may hold characters outside the
+code page (`wide`) is never stored in a `varchar`: then neither engine
+changes the value. A PostgreSQL target without a length takes any
+string. A function's declared return length is checked the same way on
+both sides (for PostgreSQL that is sound whether or not the modifier is
+kept, as for parameters).
+
+**Literals.** `'...'` whose characters are all printable ASCII
+(U+0020 to U+007E) and not a backslash, with bound `max 1 length` (an
+empty T-SQL literal is typed `varchar(1)`, from memory; the bound only
+needs to be at least the value's length). The Rust parser reads T-SQL
+`'ab'` and `N'ab'` to the same `Str` (`sqldiff_syntax::abstract_syntax::
+string_value`), so a literal must mean the same as either: ASCII
+characters are themselves in every code page SQL Server uses and in
+Unicode, and take one byte or byte-pair each (from memory; reviewers
+check the code pages in use). PostgreSQL: with
+`standard_conforming_strings` on (the default) a backslash is an
+ordinary character and with it off it escapes (4.1.2.1, 4.1.2.2);
+without backslashes both read the same. A doubled quote is one quote in
+both. Probed: eval/casts (`N'ab'` is `nvarchar` in T-SQL and `character`
+in PostgreSQL).
+
+**Concatenation.** T-SQL `a + b` and PostgreSQL `a || b`, both operands
+strings (not the NULL literal): the characters of `a` then those of `b`,
+NULL if either is NULL.
+
+* T-SQL: "+ (String Concatenation) (Transact-SQL)"; "If the result of
+  the concatenation of strings exceeds the limit of 8,000 bytes, the
+  result is truncated" (from memory), so every string expression of the
+  slice has a bound of at most 4000, which is under 8000 bytes and 4000
+  byte-pairs. NULL: "When SET CONCAT_NULL_YIELDS_NULL is ON,
+  concatenating a null value with a string yields a NULL result"; with
+  it OFF a NULL operand is an empty string ("SET CONCAT_NULL_YIELDS_NULL
+  (Transact-SQL)", from memory). It is a session setting fixed at run time, not
+  stored with the routine, so a confirmation that concatenates rests on
+  `ASM-CONCAT-NULL`, unless the routine starts with `SET
+  CONCAT_NULL_YIELDS_NULL ON` (`lowerSetting`, `concatNullOn`). The
+  result type is the operands' type with the higher precedence
+  (`nvarchar` over `varchar`: a lossless conversion). T-SQL `||` (SQL
+  Server 2025) is outside. Not probed.
+* PostgreSQL: 9.4 "String Functions and Operators", `text || text →
+  text`; `varchar` operands are `text` (binary coercible); the operator's
+  function is strict, so a NULL operand gives NULL (from memory, also for
+  the `anynonarray` variants, which the slice never selects since both
+  operands are strings). No length limit applies below 1 GB. Not probed.
+
+**`=` and `<>` on strings**, only when the catalog says
+`binaryCollation` (trusted; `ASM-BINARY-COLLATION` in the answer's
+residual):
+
+* T-SQL: variables, parameters and literals take the database's default
+  collation ("Collation precedence (Transact-SQL)": coercible-default),
+  which the fact says is `_BIN` or `_BIN2`: characters compare by code
+  point (BIN2) or, for equality, by identity (BIN). Before comparing,
+  SQL Server pads the shorter operand with spaces, whatever the
+  collation, so `'a' = 'a '` is TRUE ("SQL Server follows the ANSI/ISO
+  SQL-92 specification ... on how to compare strings with spaces",
+  Microsoft support article "How SQL Server compares strings with
+  trailing spaces"; from memory). Two strings are equal after padding
+  exactly when they are equal without their trailing spaces, so T-SQL
+  `a = b` is `streq (rtrim a) (rtrim b)`. A `varchar` operand is
+  converted to `nvarchar` when the other is one, which keeps its
+  characters. Not probed.
+* PostgreSQL: on `text` and `varchar`, trailing spaces are
+  "semantically significant" (8.3, from memory), and under a deterministic collation
+  strings are equal "only if they consist of the same byte sequence"
+  ("Collation Support", "Nondeterministic Collations"): `a = b` is
+  `streq a b`. A
+  PL/pgSQL parameter compares under the collation of the caller's
+  argument ("Collation of PL/pgSQL Variables"), which is why the fact
+  covers callers. Not probed.
+* So T-SQL `@a = @b` matches PostgreSQL `rtrim(a) = rtrim(b)` and not
+  `a = b`. `<>` is `NOT (... = ...)` on both sides. `mkRtrim` folds the
+  `rtrim` of a literal and of an `rtrim` (`mkRtrim_eval`), so
+  `@a = 'x'` matches `rtrim(a) = 'x'`. `ANSI_NULLS` applies as for
+  integers (`ASM-TSQL-ANSI-NULLS`). `<`, `>`, `LIKE`, and every
+  comparison under a case- or accent-insensitive collation (T-SQL's
+  default) are outside the slice: their result depends on collation
+  tables the core does not have (`ASM-CI-COLLATION` on the Rust side).
+
+**`RTRIM(x)`**, one string argument: `x` without its trailing spaces
+(U+0020 only). T-SQL: "RTRIM (Transact-SQL)": "Returns a character
+string after truncating all trailing spaces" (from memory; the two-argument form of
+SQL Server 2022 is outside). PostgreSQL: 9.4, `rtrim(string text [,
+characters text])`: "Removes the longest string containing only
+characters in characters (a space by default) from the end of string"
+(one argument only). Not probed.
+
+**`LEN(x)`** (T-SQL) and **`length(x)`**, `char_length`,
+`character_length` (PostgreSQL), one string argument, an `int`. T-SQL:
+"LEN (Transact-SQL)": "Returns the number of characters of the specified
+string expression, excluding trailing spaces", and "If you use SC
+collations, the returned integer value counts UTF-16 surrogate pairs as
+a single character" (otherwise as two; from memory): lowered `len (rtrim x)`, which
+counts code points, so a confirmation that uses `LEN` rests on
+`ASM-TSQL-LEN-BMP` (no character outside the Basic Multilingual Plane
+reaches `LEN`, or the collation is supplementary-character aware).
+PostgreSQL: 9.4, `length(text)` "Returns the number of characters in the
+string": lowered `len x`. So T-SQL `LEN(x)` matches PostgreSQL
+`length(rtrim(x))`, which the converter writes. Not probed (eval/casts
+uses `LEN` only to measure strings of `x`).
+
+**`COALESCE`, `CASE`** over strings: as for integers, every value
+argument a string or the NULL literal, at least one a string; the value
+is the chosen argument's, unchanged. T-SQL: the result type is the
+argument type of the highest precedence and, for strings of one type,
+the largest length (from memory: the pages state the precedence, not
+the length), so no argument is truncated. PostgreSQL: 10.5 resolves
+`text`/`varchar`/unknown arguments to `text` or `varchar`, without a
+length. The bound is the largest argument's bound. Not probed.
+
+**T-SQL `ISNULL(x, y)`** over strings: "Returns the same type as
+check_expression", so `y` is converted to `x`'s type and a longer `y` is
+truncated ("ISNULL (Transact-SQL)": "replacement_value can be truncated
+if replacement_value is longer than check_expression", from memory;
+`ASM-ISNULL-TYPE` on the Rust side).
+In the slice only when `x` is a variable or parameter, whose type is its
+declaration (`varchar(n)`/`nvarchar(n)`), and `y` is the NULL literal or
+a string that cannot raise, whose bound is at most `n`, and, when `x` is
+a `varchar`, that is not `wide`: then the conversion keeps `y` as it is
+and `ISNULL(x, y)` is `COALESCE(x, y)`. The result has `x`'s type. Not
+probed for strings.
+
+**`IS [NOT] NULL`** of a string: TRUE or FALSE, as for integers. -/
+
+/-- Digits as a number; nothing else (no sign, no `MAX`). -/
+def natArg? (s : String) : Option Nat :=
+  if s.isEmpty then none else digitsVal s.toList 0
+
+/-- The largest length of a T-SQL string in the slice. -/
+def tsqlMaxLen : Nat := 4000
+
+/-- The largest `n` of PostgreSQL `varchar(n)`. -/
+def pgMaxLen : Nat := 10485760
+
+/-- A T-SQL string type: its length and whether it is `nvarchar`. -/
+def strTypeT : Ast.Ty → Option (Option Nat × Bool)
+  | .Ty n [a] =>
+    let u := n.toUpper
+    (natArg? a).bind fun k =>
+      if 1 ≤ k ∧ k ≤ tsqlMaxLen then
+        if u == "VARCHAR" || u == "CHAR VARYING" || u == "CHARACTER VARYING" then some (some k, false)
+        else if u == "NVARCHAR" then some (some k, true)
+        else none
+      else none
+  | _ => none
+
+def pgVarchar (u : String) : Bool :=
+  u == "VARCHAR" || u == "CHAR VARYING" || u == "CHARACTER VARYING"
+
+/-- A PostgreSQL string type: its length (`none`: any), never `wide`. -/
+def strTypeP : Ast.Ty → Option (Option Nat × Bool)
+  | .Ty n [] =>
+    let u := n.toUpper
+    if u == "TEXT" || pgVarchar u then some (none, false) else none
+  | .Ty n [a] =>
+    if pgVarchar n.toUpper then
+      (natArg? a).bind fun k => if 1 ≤ k ∧ k ≤ pgMaxLen then some (some k, false) else none
+    else none
+  | _ => none
+
+/-- The declared type is a string type of the slice: its length bound and
+whether it is `wide`. -/
+def strType : Dialect → Ast.Ty → Option (Option Nat × Bool)
+  | .tsql _ _, t => strTypeT t
+  | .pg _ _, t => strTypeP t
+
+def strVar (d : Dialect) (env : TyEnv) (x : Var) : Option (Option Nat × Bool) :=
+  (lookup env x).bind (strType d)
+
+/-- The type of a variable of the slice: the integer type or a string
+type (C2b). -/
+def varTy (d : Dialect) (env : TyEnv) (x : Var) : Option STy :=
+  if intVar d env x then some .int
+  else (strVar d env x).map fun (n, w) => .str n w
+
+/-- A string literal of the slice: printable ASCII, no backslash. -/
+def strLitOk (s : String) : Bool :=
+  s.toList.all fun c => ' ' ≤ c && c ≤ '~' && c != '\\'
+
+def addB : Option Nat → Option Nat → Option Nat
+  | some a, some b => some (a + b)
+  | _, _ => none
+
+def maxB : Option Nat → Option Nat → Option Nat
+  | some a, some b => some (max a b)
+  | _, _ => none
+
+/-- A T-SQL string expression must stay within `tsqlMaxLen`. -/
+def boundOk (d : Dialect) (n : Option Nat) : Bool :=
+  match d, n with
+  | .tsql _ _, some k => k ≤ tsqlMaxLen
+  | .tsql _ _, none => false
+  | .pg _ _, _ => true
+
+/-- A value whose bound is `m` fits a target whose length is `n`. -/
+def fitsLen : Option Nat → Option Nat → Bool
+  | none, _ => true
+  | some n, some m => m ≤ n
+  | some _, none => false
+
+/-- `rtrim`, folded on a literal and on an `rtrim`
+(`Sqldiff.Mirror.mkRtrim_eval`: the same meaning). Both lowerings use it,
+so a trimmed literal is a literal on both sides. -/
+def mkRtrim : SExpr → SExpr
+  | .str s => .str (Core.rtrimSp s)
+  | .rtrim a => .rtrim a
+  | a => .rtrim a
+
+theorem dropWhile_idem {α : Type} (p : α → Bool) (l : List α) :
+    (l.dropWhile p).dropWhile p = l.dropWhile p := by
+  induction l with
+  | nil => rfl
+  | cons x xs ih =>
+    by_cases h : p x
+    · simp [h, ih]
+    · simp [h]
+
+theorem rtrimSp_idem (s : String) : Core.rtrimSp (Core.rtrimSp s) = Core.rtrimSp s := by
+  simp [Core.rtrimSp, dropWhile_idem]
+
+theorem mkRtrim_eval {U : Type} (σ ρ : Core.Store U) (a : SExpr) :
+    (mkRtrim a).eval σ ρ = (SExpr.rtrim a).eval σ ρ := by
+  cases a with
+  | str s => rfl
+  | rtrim b =>
+    simp only [mkRtrim, SExpr.eval]
+    cases b.eval σ ρ with
+    | err k => rfl
+    | ok v => cases v <;> simp [rtrimSp_idem, Core.typeErr]
+  | _ => rfl
+
+/-- The type `COALESCE` or `CASE` gives two value arguments, or `none`
+when they do not go together (an integer and a string, or a boolean). -/
+def joinTy : STy → STy → Option STy
+  | .nul, .nul => some .nul
+  | .nul, .int | .int, .nul | .int, .int => some .int
+  | .nul, .str n w | .str n w, .nul => some (.str n w)
+  | .str n w, .str m v => some (.str (maxB n m) (w || v))
+  | _, _ => none
+
+/-- A value type: an integer, a string or the NULL literal. -/
+def isVal : STy → Bool
+  | .bool => false
+  | _ => true
+
+/-- A value of type `vt` can be stored in a variable, parameter or result
+declared `ty` without a conversion the core does not show: an integer
+(or NULL) into the slice's integer type; a string (or NULL) that fits
+into a string type ("Assignment converts, differently"). -/
+def fitsTy (d : Dialect) (ty : Ast.Ty) (vt : STy) : Bool :=
+  if intType d ty then vt == .int || vt == .nul
+  else match strType d ty, vt with
+    | some _, .nul => true
+    | some (n, wt), .str m w => fitsLen n m && (wt || !w)
+    | _, _ => false
+
 def arithOp? : String → Option AOp
   | "+" => some .add
   | "-" => some .sub
@@ -460,7 +809,14 @@ def closedSafe (s : SExpr) : Bool :=
 def guardC (r : Option (SExpr × STy)) : Option (SExpr × STy) :=
   r.bind fun p => if closedSafe p.1 then some p else none
 
-def binTy (o : String) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
+/-- String `=` or `<>` (C2b), given the operands as each side compares
+them. -/
+def eqForm (o : String) (e : SExpr) : Option (SExpr × STy) :=
+  if o == "=" then some (e, .bool)
+  else if o == "<>" then some (.not e, .bool)
+  else none
+
+def binTy (d : Dialect) (o : String) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
   | (a, .int), (b, .int) =>
     match arithOp? o, cmpOp? o with
     | some .mod, _ => match b with
@@ -474,6 +830,17 @@ def binTy (o : String) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
     else if o.toUpper == "AND" then some (.and a b, .bool)
     else if o.toUpper == "OR" then some (.or a b, .bool)
     else none
+  | (a, .str n w), (b, .str m v) =>
+    match d with
+    | .tsql _ Γ =>
+      if o == "+" then
+        if boundOk d (addB n m) then some (.concat a b, .str (addB n m) (w || v)) else none
+      else if Γ.binaryCollation then eqForm o (.streq (mkRtrim a) (mkRtrim b))
+      else none
+    | .pg Γ _ =>
+      if o == "||" then some (.concat a b, .str (addB n m) false)
+      else if Γ.binaryCollation then eqForm o (.streq a b)
+      else none
   | _, _ => none
 
 def unTy (o : String) : SExpr × STy → Option (SExpr × STy)
@@ -481,34 +848,63 @@ def unTy (o : String) : SExpr × STy → Option (SExpr × STy)
   | (a, .bool) => if o.toUpper == "NOT" then some (.not a, .bool) else none
   | _ => none
 
-/-- `coalesce x1 (coalesce x2 ... xn)`, every argument a value. -/
-def coalesceTy : List (SExpr × STy) → Option SExpr
-  | [] => none
-  | [(a, t)] => if valTy t then some a else none
-  | (a, t) :: rest => if valTy t then (coalesceTy rest).map (.coalesce a) else none
+/-- The type of a list of value arguments (`COALESCE`, `CASE` results),
+starting from the NULL literal's. -/
+def joinAll : List STy → Option STy
+  | [] => some .nul
+  | t :: ts => (joinAll ts).bind (joinTy t)
 
-def callTy (d : Dialect) (name : String) (args : List (SExpr × STy)) : Option (SExpr × STy) :=
+/-- A value type with a value: an integer or a string, not only NULL. -/
+def typedVal : STy → Bool
+  | .int | .str .. => true
+  | _ => false
+
+/-- `coalesce x1 (coalesce x2 ... xn)`. -/
+def coalesceBuild : List SExpr → Option SExpr
+  | [] => none
+  | [a] => some a
+  | a :: rest => (coalesceBuild rest).map (.coalesce a)
+
+/-- A function call of the slice. `raw` are the arguments as written
+(T-SQL `ISNULL` over strings asks its first one to be a variable). -/
+def callTy (d : Dialect) (name : String) (raw : List Ast.Expr) (args : List (SExpr × STy)) :
+    Option (SExpr × STy) :=
   match name.toUpper, args, d with
   | "COALESCE", _, _ =>
-    if args.length ≥ 2 && args.any (·.2 == .int) then (coalesceTy args).map (·, .int) else none
+    if args.length ≥ 2 then
+      (joinAll (args.map (·.2))).bind fun t =>
+        if typedVal t then (coalesceBuild (args.map (·.1))).map (·, t) else none
+    else none
   | "ISNULL", [(x, .int), (y, ty)], .tsql _ _ =>
     if valTy ty && !y.mayRaise then some (.coalesce x y, .int) else none
+  | "ISNULL", [(x, .str (some n) wx), (y, ty)], .tsql _ _ =>
+    let isVar := match raw with
+      | .Var _ :: _ => true
+      | _ => false
+    let yOk := match ty with
+      | .nul => true
+      | .str m wy => fitsLen (some n) m && (wx || !wy)
+      | _ => false
+    if isVar && yOk && !y.mayRaise then some (.coalesce x y, .str (some n) wx) else none
+  | "RTRIM", [(x, .str n w)], _ => some (mkRtrim x, .str n w)
+  | "LEN", [(x, .str _ _)], .tsql _ _ => some (.len (mkRtrim x), .int)
+  | "LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int)
+  | "CHAR_LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int)
+  | "CHARACTER_LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int)
   | _, _, _ => none
 
 /-- `cond c1 r1 (cond c2 r2 ... e)`. -/
 def caseBuild : List ((SExpr × STy) × (SExpr × STy)) → SExpr → Option SExpr
   | [], e => some e
-  | ((c, .bool), (r, tr)) :: ws, e => if valTy tr then (caseBuild ws e).map (.cond c r) else none
+  | ((c, .bool), (r, tr)) :: ws, e => if isVal tr then (caseBuild ws e).map (.cond c r) else none
   | _, _ => none
 
 def caseTy (ws : List ((SExpr × STy) × (SExpr × STy))) (els : Option (SExpr × STy)) :
     Option (SExpr × STy) :=
-  let elsOk := match els with
-    | some (_, t) => valTy t
-    | none => true
-  let anyInt := ws.any (·.2.2 == .int) || els.any (·.2 == .int)
-  if ws.isEmpty || !elsOk || !anyInt then none
-  else (caseBuild ws ((els.map (·.1)).getD .null)).map (·, .int)
+  let tys := ws.map (·.2.2) ++ (els.map (·.2)).toList
+  if ws.isEmpty then none
+  else (joinAll tys).bind fun t =>
+    if typedVal t then (caseBuild ws ((els.map (·.1)).getD .null)).map (·, t) else none
 
 mutual
   /-- The slice form of an expression and its type, or `none` when the
@@ -516,27 +912,28 @@ mutual
   declared with the slice's integer type (`env`). -/
   def typed (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option (SExpr × STy)
     | .Var v => match d with
-      | .tsql _ _ => if intVar d env v then some (.var v, .int) else none
+      | .tsql _ _ => (varTy d env v).map (.var v, ·)
       | .pg _ _ => none
     | .Name [x] => match resolveName d sc x with
       | some (.inl c) => some (.col c, .int)
-      | some (.inr v) => if intVar d env v then some (.var v, .int) else none
+      | some (.inr v) => (varTy d env v).map (.var v, ·)
       | none => none
     | .Num s => (intLit? s).map fun n => (.int n, .int)
+    | .Str s => if strLitOk s then some (.str s, .str (some (max 1 s.length)) false) else none
     | .Null => some (.null, .nul)
     | .Bin o a b => do
       let a' ← typed d env sc a
       let b' ← typed d env sc b
-      guardC (binTy o a' b')
+      guardC (binTy d o a' b')
     | .Unary o a => do
       let a' ← typed d env sc a
       guardC (unTy o a')
     | .IsNull x isNot => do
       let (x', tx) ← typed d env sc x
-      if tx == .int then guardC (some (.isNull x' isNot, .bool)) else none
+      if typedVal tx then guardC (some (.isNull x' isNot, .bool)) else none
     | .CallE (.CallF [n] args false [] false false false) => do
       let args' ← typedList d env sc args
-      guardC (callTy d n args')
+      guardC (callTy d n args args')
     | .Case none whens els => do
       let ws ← typedWhens d env sc whens
       let e ← typedOpt d env sc els
@@ -610,7 +1007,7 @@ mutual
     | .Num s => some (match intLit? s with
       | some n => .lit n
       | none => .op ("num:" ++ s) [])
-    | .Str s => some (.op ("str:" ++ s) [])
+    | .Str s => withSlice d env sc (.Str s) (some (.op ("str:" ++ s) []))
     | .Null => some .null
     | .Star _ => none
     | .CallE (.CallF n args distinct order withinGroup over star) =>
@@ -1049,12 +1446,18 @@ error of the routine ends it; elsewhere it changes nothing for runs that
 raise no error, and a C2a confirmation then needs a routine that cannot
 raise. The rollback of the caller's transaction is C4. `XACT_ABORT OFF`
 and other settings (`ARITHABORT`, `ANSI_WARNINGS`, ...) change error
-behaviour: outside the spec. -/
+behaviour: outside the spec.
+
+`SET CONCAT_NULL_YIELDS_NULL ON` (C2b) makes `+` on a NULL string give
+NULL from there on, which is what the core's `concat` always does, so it
+lowers to nothing; at the start of the routine it discharges
+`ASM-CONCAT-NULL` (`concatNullOn`). `OFF` is outside the spec. -/
 def lowerSetting (d : Dialect) (name : String) (on : Bool) : Option (List Stmt) :=
   match d with
   | .tsql dep _ =>
     if name.toUpper = "NOCOUNT" && !dep.rowCounts then some []
     else if name.toUpper = "XACT_ABORT" && on then some []
+    else if name.toUpper = "CONCAT_NULL_YIELDS_NULL" && on then some []
     else none
   | .pg _ _ => none
 
@@ -1202,10 +1605,24 @@ def lowerDecl (d : Dialect) (env : TyEnv) : Ast.Stmt → Option (Var × List Stm
     (lowerExpr d env {} e).map fun e' => (pgName x, [.assign (pgName x) e'])
   | _ => none
 
-/-- The declared types of a PL/pgSQL routine's variables, folded. -/
-def envP : Ast.Routine → TyEnv
+/-- The declared types of a PL/pgSQL routine's variables, folded: what a
+write to them must fit (C2b). -/
+def envPDecl : Ast.Routine → TyEnv
   | .Routine _ _ params _ _ _ (.Block decls _) =>
     params.map (fun | .Param n ty _ _ => (pgName n, ty)) ++
+      typedNames ((declTys decls).map fun (x, t) => (pgName x, t))
+
+/-- A parameter's type as PostgreSQL keeps it: without the length of a
+`varchar` ("PostgreSQL parameters carry no length", C2b). -/
+def stripMod : Ast.Ty → Ast.Ty
+  | .Ty n args => if pgVarchar n.toUpper then .Ty n [] else .Ty n args
+
+/-- The types of a PL/pgSQL routine's variables as reads see them,
+folded: parameters without a `varchar` length (C2b). The lowering types
+expressions with these. -/
+def envP : Ast.Routine → TyEnv
+  | .Routine _ _ params _ _ _ (.Block decls _) =>
+    params.map (fun | .Param n ty _ _ => (pgName n, stripMod ty)) ++
       typedNames ((declTys decls).map fun (x, t) => (pgName x, t))
 
 /-- The names that are variables in a PL/pgSQL routine, folded: its
@@ -1244,21 +1661,32 @@ def header : Ast.Routine → Bool × Bool
     (match kind with | .Procedure => true | .Function => false,
      match sec with | .Caller => true | .Owner => false)
 
-/-! ## Every expression in the slice (C2a)
+/-! ## Every expression in the slice (C2a, C2b)
 
 A routine is in the C2a slice when every expression it evaluates is a
 slice expression of the right kind and every value it stores keeps its
 type: conditions are booleans of the slice; assigned values, `RETURN`
-values, call arguments and defaults are `int` expressions or NULL;
-targets and `OUTPUT` arguments are `int` variables; a function returns
-`int`. (A default may be NULL whatever the parameter's type.) Then its
-lowering has no uninterpreted operator, and no conversion happens where
-the core does not see one. -/
+values and defaults fit their target (`fitsTy`: an integer or NULL into
+an integer, a string that fits or NULL into a string type); call
+arguments are `int` expressions or NULL, and `OUTPUT` arguments `int`
+variables; a function returns `int` or a string type. Then its lowering
+has no uninterpreted operator, and no conversion happens where the core
+does not see one. `env` types the expressions (reads); `wenv` gives the
+declared type of a target (writes), which differs from `env` only for
+PostgreSQL parameters ("PostgreSQL parameters carry no length"). `ret`
+is a function's return type, `none` in a procedure (whose `RETURN e`
+sets the integer status). -/
 
 /-- A value position: an `int` expression or the NULL literal. -/
 def valueOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
   match typed d env sc e with
   | some (_, t) => valTy t
+  | none => false
+
+/-- A value stored in something declared `ty`. -/
+def valueFits (d : Dialect) (env : TyEnv) (sc : Scope) (ty : Ast.Ty) (e : Ast.Expr) : Bool :=
+  match typed d env sc e with
+  | some (_, t) => fitsTy d ty t
   | none => false
 
 /-- A condition: a three-valued boolean of the slice. -/
@@ -1267,18 +1695,23 @@ def condOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
   | some (_, .bool) => true
   | _ => false
 
-def intTarget (d : Dialect) (env : TyEnv) (t : Ast.Expr) : Bool :=
+/-- An assignment `t := v`: the value fits the target's declared type. -/
+def assignOk (d : Dialect) (env wenv : TyEnv) (t v : Ast.Expr) : Bool :=
   match target d t with
-  | some x => intVar d env x
+  | some x => match lookup wenv x with
+    | some ty => valueFits d env {} ty v
+    | none => false
   | none => false
 
-def sliceStmt (d : Dialect) (env : TyEnv) : Ast.Stmt → Bool
-  | .Assign t v => intTarget d env t && valueOk d env {} v
+def sliceStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
+  | .Assign t v => assignOk d env wenv t v
   | .Return none => true
-  | .Return (some e) => valueOk d env {} e
+  | .Return (some e) => match ret with
+    | some ty => valueFits d env {} ty e
+    | none => valueOk d env {} e
   | .Declare _ ty dflt => match dflt with
     | none => true
-    | some e => (ty.map (intType d)).getD false && valueOk d env {} e
+    | some e => (ty.map fun t => valueFits d env {} t e).getD false
   | .Insert _ _ (.SrcValues rows) _ _ _ => rows.all (·.all (valueOk d env {}))
   | .Update tgt _ sets _ wh => match tableOf d tgt with
     | some t =>
@@ -1291,38 +1724,45 @@ def sliceStmt (d : Dialect) (env : TyEnv) : Ast.Stmt → Bool
   | _ => false
 
 mutual
-  def sliceNode (d : Dialect) (env : TyEnv) : Ast.Node → Bool
-    | .NStmt s => sliceStmt d env s
-    | .NBlock b => sliceBlock d env b
-    | .If c t e => condOk d env {} c && sliceNodes d env t && sliceNodes d env e
-    | .While c b => condOk d env {} c && sliceNodes d env b
+  def sliceNode (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Node → Bool
+    | .NStmt s => sliceStmt d env wenv ret s
+    | .NBlock b => sliceBlock d env wenv ret b
+    | .If c t e => condOk d env {} c && sliceNodes d env wenv ret t && sliceNodes d env wenv ret e
+    | .While c b => condOk d env {} c && sliceNodes d env wenv ret b
     | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env {} e
     | .Setting .. => true
 
-  def sliceNodes (d : Dialect) (env : TyEnv) : List Ast.Node → Bool
+  def sliceNodes (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : List Ast.Node → Bool
     | [] => true
-    | n :: ns => sliceNode d env n && sliceNodes d env ns
+    | n :: ns => sliceNode d env wenv ret n && sliceNodes d env wenv ret ns
 
-  def sliceBlock (d : Dialect) (env : TyEnv) : Ast.Block → Bool
-    | .Block ds body => ds.all (sliceStmt d env) && sliceNodes d env body
+  def sliceBlock (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Block → Bool
+    | .Block ds body => ds.all (sliceStmt d env wenv ret) && sliceNodes d env wenv ret body
 end
 
 def sliceParam (d : Dialect) (env : TyEnv) : Ast.Param → Bool
   | .Param _ _ _ none => true
   | .Param _ _ _ (some .Null) => true
-  | .Param _ ty _ (some e) => intType d ty && valueOk d env {} e
+  | .Param _ ty _ (some e) => valueFits d env {} ty e
 
-def sliceRoutine (d : Dialect) (env : TyEnv) : Ast.Routine → Bool
+/-- A type a function of the slice may return. -/
+def retTypeOk (d : Dialect) (ty : Ast.Ty) : Bool := intType d ty || (strType d ty).isSome
+
+def sliceRoutine (d : Dialect) (env wenv : TyEnv) : Ast.Routine → Bool
   | .Routine kind _ params returns _ _ body =>
-    params.all (sliceParam d env) && sliceBlock d env body &&
+    let ret := match kind with
+      | .Function => returns
+      | .Procedure => none
+    params.all (sliceParam d env) && sliceBlock d env wenv ret body &&
       match kind with
-      | .Function => (returns.map (intType d)).getD false
+      | .Function => (returns.map (retTypeOk d)).getD false
       | .Procedure => true
 
 def sliceT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Bool :=
-  sliceRoutine (.tsql dep Γ) (envT a) a
+  sliceRoutine (.tsql dep Γ) (envT a) (envT a) a
 
-def sliceP (Γ : Catalog) (b : Ast.Routine) : Bool := sliceRoutine (.pg Γ (pgVars b)) (envP b) b
+def sliceP (Γ : Catalog) (b : Ast.Routine) : Bool :=
+  sliceRoutine (.pg Γ (pgVars b)) (envP b) (envPDecl b) b
 
 /-- The settings a body starts with, in order. -/
 def leadingSettings : List Ast.Node → List (String × Bool)
@@ -1333,5 +1773,17 @@ def leadingSettings : List Ast.Node → List (String × Bool)
 before any statement that could fail. -/
 def abortsT : Ast.Routine → Bool
   | .Routine _ _ _ _ _ _ (.Block _ body) => (leadingSettings body).contains ("XACT_ABORT", true)
+
+/-- The T-SQL routine starts by setting `CONCAT_NULL_YIELDS_NULL ON`, so
+every concatenation runs under it (C2b). -/
+def concatNullOn : Ast.Routine → Bool
+  | .Routine _ _ _ _ _ _ (.Block _ body) =>
+    (leadingSettings body).contains ("CONCAT_NULL_YIELDS_NULL", true)
+
+/-- The T-SQL routine has a parameter of a string type of the slice: the
+confirmation rests on the arguments fitting it (`ASM-TSQL-STRING-ARGS`,
+C2b). -/
+def tsqlStringParams : Ast.Routine → Bool
+  | .Routine _ _ params _ _ _ _ => params.any fun | .Param _ ty _ _ => (strTypeT ty).isSome
 
 end Sqldiff.Mirror

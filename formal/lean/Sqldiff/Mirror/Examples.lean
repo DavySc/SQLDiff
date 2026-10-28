@@ -454,7 +454,7 @@ def callThenDivP : Ast.Routine :=
 caller sees of that after the failure differs between the dialects (C4),
 so the answer names `ASM-STATE-AFTER-ERROR`, and the failed observation
 above has no world. -/
-#guard ((lowerT dep Γ callThenDivT).map residual) ==
+#guard (residualOf dep Γ callThenDivT) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR"]
 
 -- The slice's meaning, operator by operator (`SExpr.eval`).
@@ -652,7 +652,9 @@ def badCase (a : Ast.Expr) : Ast.Expr :=
 #guard reasonOf (check dep ∅ pairCert
   (tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [.Setting "XACT_ABORT" false,
     set (tv "@r") ta]) (pairP pa)) == "the T-SQL routine is outside the C1 spec"
--- A `varchar` variable read is not in the slice, even unchanged.
+-- A `varchar(10)` parameter copied into a PostgreSQL `varchar(10)` parameter:
+-- PostgreSQL parameters carry no length, so the copy is not known to fit
+-- (C2b, `ExamplesC2b` has the `text` form, which is in the slice).
 #guard isC1 (check dep ∅ pairCert (pairT false ta (.Ty "VARCHAR" ["10"]))
   (pairP pa (.Ty "VARCHAR" ["10"])))
 -- `int(4)` is not the slice's type.
@@ -687,10 +689,10 @@ def fnCert : Cert := ⟨[("@a", "a")]⟩
   (.Routine .Function ["f"] [inP "a"] (some bigint) .Caller none
     (.Block [] [ret (some (fn "COALESCE" [pa, num 0]))])))
 
-#guard ((lowerT dep Γ (pairT true (.Bin "/" ta tb))).map residual) ==
+#guard (residualOf dep Γ (pairT true (.Bin "/" ta tb))) ==
   some ["ASM-TSQL-ARITH-ERRORS"]
-#guard ((lowerT dep Γ ifT).map residual) == some ["ASM-TSQL-ANSI-NULLS"]
-#guard ((lowerT dep Γ (pairT false (fn "ISNULL" [ta, tb]))).map residual) == some []
+#guard (residualOf dep Γ ifT) == some ["ASM-TSQL-ANSI-NULLS"]
+#guard (residualOf dep Γ (pairT false (fn "ISNULL" [ta, tb]))) == some []
 
 /-! ### The pair at the top
 
@@ -703,7 +705,7 @@ def srcAbort : Ast.Routine :=
   match srcT with
   | .Routine k n ps r s v (.Block ds body) => .Routine k n ps r s v (.Block ds (xactAbort :: body))
 #guard isC2a (check dep Γ cert srcAbort mirrorP)
-#guard ((lowerT dep Γ srcAbort).map residual) == some ["ASM-TSQL-ARITH-ERRORS"]
+#guard (residualOf dep Γ srcAbort) == some ["ASM-TSQL-ARITH-ERRORS"]
 -- The two status lines are still needed.
 #guard !isConfirmed (check dep Γ cert srcAbort todayP)
 
