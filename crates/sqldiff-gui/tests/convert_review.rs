@@ -555,6 +555,7 @@ fn a_decision_follows_the_base_catalogs_contents() {
         tree: a(),
         out: out.clone(),
         instances: None,
+        packs: Vec::new(),
     })
     .unwrap();
     let base = r.report_json()["base_hash"].as_str().unwrap().to_string();
