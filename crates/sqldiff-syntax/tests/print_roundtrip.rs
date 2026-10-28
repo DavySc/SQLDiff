@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sqldiff_syntax::abstract_syntax::{parse_stmt_ext, tokens, Stmt};
+use sqldiff_syntax::abstract_syntax::{parse_stmt_ext, tokens, Expr, Stmt};
 use sqldiff_syntax::{parse, print, Dialect, SyntaxKind};
 
 const D: Dialect = Dialect::Postgres;
@@ -120,6 +120,32 @@ fn awkward_shapes_read_back() {
         let out = print::stmt(&s, D).unwrap_or_else(|e| panic!("{sql}: {e}"));
         assert_eq!(reread(&out).as_ref(), Ok(&s), "{sql}\nprinted: {out}");
     }
+}
+
+/// PostgreSQL ranks `||` below `+` and `-` and above comparisons, `LIKE`
+/// and `BETWEEN`.
+#[test]
+fn postgres_concatenation_binds_looser_than_addition() {
+    let bin = |op: &str, l: Expr, r: Expr| Expr::Bin(op.into(), Box::new(l), Box::new(r));
+    let n = |s: &str| Expr::Num(s.into());
+    let e = |sql: &str| match reread(&format!("SELECT {sql}")).unwrap() {
+        Stmt::Select(q) => q.items[0].expr.clone(),
+        s => panic!("{s:?}"),
+    };
+    assert_eq!(
+        e("'a' || 1 + 2"),
+        bin("||", Expr::Str("a".into()), bin("+", n("1"), n("2")))
+    );
+    assert_eq!(
+        e("x LIKE 'a' || '%'"),
+        Expr::Like(
+            Box::new(Expr::Name(vec!["x".into()])),
+            Box::new(bin("||", Expr::Str("a".into()), Expr::Str("%".into()))),
+            false,
+            false
+        )
+    );
+    assert_ne!(e("'a' || 1 + 2"), e("('a' || 1) + 2"));
 }
 
 #[test]

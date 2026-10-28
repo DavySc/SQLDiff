@@ -728,7 +728,7 @@ impl<'a> Parser<'a> {
     }
 
     fn pred(&mut self) -> PResult<Expr> {
-        let l = self.add()?;
+        let l = self.other()?;
         if let Some(t) = self.peek() {
             if t.kind == K::Op
                 && matches!(t.text.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
@@ -739,7 +739,7 @@ impl<'a> Parser<'a> {
                     t.text.clone()
                 };
                 self.i += 1;
-                let r = self.add()?;
+                let r = self.other()?;
                 return Ok(Expr::Bin(op, Box::new(l), Box::new(r)));
             }
         }
@@ -786,14 +786,14 @@ impl<'a> Parser<'a> {
             return Ok(Expr::InList(Box::new(l), list, neg));
         }
         if self.eat_kw("BETWEEN") {
-            let lo = self.add()?;
+            let lo = self.other()?;
             self.expect_kw("AND")?;
-            let hi = self.add()?;
+            let hi = self.other()?;
             return Ok(Expr::Between(Box::new(l), Box::new(lo), Box::new(hi), neg));
         }
         let ci = self.is_kw("ILIKE");
         if self.eat_kw("LIKE") || self.eat_kw("ILIKE") {
-            let r = self.add()?;
+            let r = self.other()?;
             if self.eat_kw("ESCAPE") {
                 return Err("LIKE ... ESCAPE is not supported".into());
             }
@@ -805,11 +805,30 @@ impl<'a> Parser<'a> {
         Ok(l)
     }
 
+    /// PostgreSQL ranks `||` with "any other operator", below `+` and `-`:
+    /// `'a' || 1 + 2` is `'a' || (1 + 2)`. The other dialects keep it with
+    /// `+` and `-` here.
+    fn other(&mut self) -> PResult<Expr> {
+        let mut l = self.add()?;
+        if self.d != Dialect::Postgres {
+            return Ok(l);
+        }
+        while self.eat_op("||") {
+            let r = self.add()?;
+            l = Expr::Bin("||".into(), Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
     fn add(&mut self) -> PResult<Expr> {
         let mut l = self.mul()?;
         loop {
             let op = match self.peek() {
-                Some(t) if t.kind == K::Op && matches!(t.text.as_str(), "+" | "-" | "||") => {
+                Some(t)
+                    if t.kind == K::Op
+                        && (matches!(t.text.as_str(), "+" | "-")
+                            || t.text == "||" && self.d != Dialect::Postgres) =>
+                {
                     t.text.clone()
                 }
                 // Db2 `CONCAT` operator form is rare; not supported.
