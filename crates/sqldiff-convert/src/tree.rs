@@ -20,7 +20,7 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -294,35 +294,7 @@ pub fn read(a: &Args) -> Result<(Vec<Input>, Vec<String>), String> {
     Ok((inputs, unreadable))
 }
 
-/// What a caller watching a conversion gets: progress, and a way to stop it.
-/// The default prints progress to stderr every 50 files, as the CLI shows it.
-#[derive(Default)]
-pub struct Hooks {
-    /// Called after each check (a file, or a routine's paired templates)
-    /// with the number checked so far and the total.
-    pub progress: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
-    /// Once set, checks not yet started are skipped and the conversion
-    /// fails with [`CANCELLED`]: a cancelled conversion has no report.
-    pub cancel: Option<Arc<AtomicBool>>,
-}
-
-/// The error of a conversion stopped through [`Hooks::cancel`].
-pub const CANCELLED: &str = "cancelled";
-
-impl Hooks {
-    pub(crate) fn cancelled(&self) -> bool {
-        self.cancel
-            .as_ref()
-            .is_some_and(|c| c.load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn stop_if_cancelled(&self) -> Result<(), String> {
-        match self.cancelled() {
-            true => Err(CANCELLED.to_string()),
-            false => Ok(()),
-        }
-    }
-}
+pub use sqldiff_core::hooks::{Hooks, CANCELLED};
 
 /// Converts and checks `inputs` (read by `read`, or given directly) and
 /// builds the report. Writes nothing; `out` only labels the report.

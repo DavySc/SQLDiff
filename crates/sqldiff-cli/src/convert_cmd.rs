@@ -7,7 +7,6 @@
 use std::process::ExitCode;
 
 use sqldiff_convert::tree;
-pub(crate) use sqldiff_convert::tree::collect;
 pub use sqldiff_convert::tree::TemplateMode;
 
 pub use sqldiff_convert::job::Job as Args;

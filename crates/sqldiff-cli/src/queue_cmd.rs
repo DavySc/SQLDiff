@@ -88,7 +88,7 @@ impl PairArgs {
 
     /// The review pipeline `diff` uses, and both sides.
     fn pipeline(&self) -> Result<(Pipeline, Artifact, Artifact), String> {
-        let pipe = Pipeline::new(self.cfg.resolve()?, &ReviewArgs::default())?;
+        let pipe = crate::review_cmd::pipeline(self.cfg.resolve()?, &ReviewArgs::default())?;
         let a = read(&self.a, self.dialect_a.or(self.dialect), &pipe.cfg)?;
         let b = read(&self.b, self.dialect_b.or(self.dialect), &pipe.cfg)?;
         Ok((pipe, a, b))

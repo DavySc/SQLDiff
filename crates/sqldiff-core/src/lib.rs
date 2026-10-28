@@ -13,6 +13,7 @@ mod engine;
 pub mod equiv;
 pub mod facts;
 pub mod format;
+pub mod hooks;
 pub mod ir;
 pub mod ledger;
 pub mod lint;
