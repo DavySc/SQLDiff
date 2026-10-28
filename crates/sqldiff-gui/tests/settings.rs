@@ -62,6 +62,7 @@ fn app(isolated: bool) -> App {
         review: None,
         data_dir: None,
         isolated,
+        packs: Vec::new(),
     }
 }
 

@@ -19,6 +19,7 @@ use sqldiff_convert::Conversion;
 use sqldiff_core::Dialect;
 use sqldiff_source::compose::Placeholders;
 
+use crate::packs::LoadedPack;
 use crate::server::{
     allowed_hosts, bad, json, not_found, read_request, respond, Request, Response,
 };
@@ -68,6 +69,8 @@ ORDER BY Qty DESC;
 pub struct TemplateSetup {
     pub placeholders: Placeholders,
     pub parameters: Option<BTreeSet<String>>,
+    /// The packs loaded for the template syntax, as the page confirms them.
+    pub packs: Vec<LoadedPack>,
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +150,9 @@ pub struct ConvertPayload {
     pub live: bool,
     /// Whether the server also has the pair view (compare files) at `/`.
     pub pair_view: bool,
+    /// In template mode, the packs loaded for the template syntax; absent
+    /// otherwise (the page loads no config then).
+    pub template_packs: Option<Vec<LoadedPack>>,
 }
 
 /// The engine's diff of two scratch texts (compare mode).
@@ -209,6 +215,7 @@ pub fn run_for(
         ms,
         live,
         pair_view: false,
+        template_packs: setup.template.as_ref().map(|t| t.packs.clone()),
     }
 }
 

@@ -21,6 +21,13 @@ that were loaded, with content hashes (`sqldiff config` shows them).
 `--isolated` skips project and user files not named on the command line.
 Relative paths in a config file are relative to that file.
 
+The GUI says on every page that uses packs (Compare, Convert in template
+mode, Review, each run on the Runs page, and Home for what a comparison
+opened there loads) which packs were loaded: a shared pack by name, version
+and path, a private pack (`private_packs`, and every `--pack` or pack field)
+by path only. "No pack loaded" means built-in rules and config files only.
+Comparisons opened from Home load the packs `sqldiff-gui` was started with.
+
 Merging: ordered rule lists (`pairing.rules`, `dialect_map`, `overrides`) are
 tried higher layer first; maps (`assumptions`, `dialect_versions`) and keyed
 lists (`limits` by id, `adapters` by name, `helpers` by dialect and name) are

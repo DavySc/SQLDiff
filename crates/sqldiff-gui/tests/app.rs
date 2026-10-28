@@ -88,6 +88,7 @@ fn review(d: &Dir) -> Review {
         tree: args,
         out,
         instances: None,
+        packs: Vec::new(),
     })
     .unwrap()
 }
@@ -99,6 +100,7 @@ fn app(compare: Option<Session>, review: Option<Review>) -> App {
         review,
         data_dir: None,
         isolated: true,
+        packs: Vec::new(),
     }
 }
 
@@ -1039,6 +1041,106 @@ fn a_cancelled_branch_review_writes_nothing() {
     assert_eq!(run["state"], "cancelled", "{run}");
     // Not even the folder: the files and the folder are made after the last cancel point.
     assert!(!d.0.join("out").exists());
+}
+
+/// What every page says about a comparison's or run's packs: a shared pack
+/// (named in a config file) by name, version and path, a private pack (the
+/// app's `--pack`, a run's pack field) by path only; its name never reaches
+/// a page or an API answer.
+#[test]
+fn pages_confirm_the_packs_loaded_and_name_no_private_pack() {
+    let d = Dir::new("packs");
+    // Expected paths are joined part by part: on Windows the app reports
+    // `\` throughout, and a joined "a/b" would keep its `/`.
+    let shared = d.0.join("shared").join("pack.toml");
+    d.write(
+        "shared/pack.toml",
+        "[pack]\nname = \"shared-rules\"\nversion = \"1.2.0\"\nschema = 1\n",
+    );
+    let secret = d.0.join("secret").join("pack.toml");
+    d.write(
+        "secret/pack.toml",
+        "[pack]\nname = \"secretname\"\nversion = \"9.9.9\"\nschema = 1\n\n[template]\nopen = \"<%\"\nclose = \"%>\"\nname_pattern = \"[A-Z_][A-Z0-9_]*\"\n",
+    );
+    d.write("ws/sqldiff.toml", "packs = [\"../shared\"]\n");
+    let a = d.write("ws/a.sql", "SELECT a FROM t WHERE b = 1;\n");
+    let b = d.write("ws/b.sql", "SELECT a FROM t WHERE b = 2;\n");
+    d.write("ws/src/p.sql", "CREATE TABLE t (a int NOT NULL);\n");
+    let addr = start(App {
+        isolated: false,
+        packs: vec![d.0.join("secret")],
+        ..app(None, None)
+    });
+    let path = |p: &std::path::Path| p.display().to_string();
+    let payload = |html: &str| -> serde_json::Value {
+        let at = html.find("/*__SQLDIFF_PAYLOAD__*/").expect("payload") + 23;
+        let mut de = serde_json::Deserializer::from_str(&html[at..]);
+        serde::Deserialize::deserialize(&mut de).unwrap()
+    };
+
+    // Home says which packs a comparison opened there loads besides its
+    // folder's config: the ones the app was started with.
+    let (_, home) = get(addr, "/");
+    assert_eq!(
+        payload(&home)["launch_packs"],
+        serde_json::json!([path(&d.0.join("secret"))])
+    );
+
+    let (status, body) = request(
+        addr,
+        "POST",
+        "/api/open/compare",
+        &serde_json::json!({ "a": a, "b": b, "dialect_a": "tsql", "dialect_b": "tsql" })
+            .to_string(),
+    );
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let want = serde_json::json!([
+        { "private": false, "name": "shared-rules", "version": "1.2.0", "path": path(&shared) },
+        { "private": true, "name": null, "version": null, "path": path(&secret) },
+    ]);
+    let (_, home) = get(addr, "/");
+    assert_eq!(payload(&home)["compare"]["packs"], want, "{home}");
+    let (_, page) = get(addr, "/compare");
+    assert_eq!(payload(&page)["session"]["packs"], want);
+    let (_, info) = get(addr, "/compare/api/session");
+    assert!(info.contains(r#""name":"private pack""#), "{info}");
+
+    // A run's packs: the config's and its own field's.
+    let (status, run) = request(
+        addr,
+        "POST",
+        "/api/runs",
+        &serde_json::json!({
+            "src": d.0.join("ws/src"), "out": d.0.join("out"), "from": "tsql", "to": "postgres",
+            "packs": [d.0.join("secret")],
+        })
+        .to_string(),
+    );
+    assert_eq!(status, "HTTP/1.1 200 OK", "{run}");
+    let id = serde_json::from_str::<serde_json::Value>(&run).unwrap()["id"]
+        .as_u64()
+        .unwrap();
+    let run = finished(addr, id);
+    assert_eq!(run["packs"], want, "{run}");
+    let (_, review) = get(addr, &format!("/runs/{id}/review/api/state"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&review).unwrap()["packs"],
+        want
+    );
+
+    for page in [
+        "/",
+        "/compare",
+        "/compare/api/session",
+        "/runs",
+        "/api/runs",
+    ] {
+        let (_, text) = get(addr, page);
+        assert!(
+            !text.contains("secretname") && !text.contains("9.9.9"),
+            "{page}: {text}"
+        );
+    }
 }
 
 /// A process started while a connection is open (a branch review runs `git`)

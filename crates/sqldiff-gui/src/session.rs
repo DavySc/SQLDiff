@@ -9,9 +9,11 @@ use serde::{Deserialize, Serialize};
 use sqldiff_core::ir::behaviour::RERUN_ASSUMPTIONS;
 use sqldiff_core::model::AssumptionSource;
 use sqldiff_core::{Artifact, ChangeClass, Dialect, Report, Severity, Verdict};
+use sqldiff_source::config::LayerKind;
 use sqldiff_source::tree::{self, Ambiguous, TemplateArtifact, Tree, TreePair};
 use sqldiff_source::{LayerRef, Resolved};
 
+use crate::packs::{self, LoadedPack};
 use crate::review::{self, time, Decision, State, Store};
 use crate::{build_view, build_view_on, Payload};
 
@@ -123,6 +125,8 @@ pub struct SessionInfo {
     pub tool_version: String,
     /// Config layers and packs, with hashes.
     pub layers: Vec<LayerRef>,
+    /// The packs loaded, as the page confirms them (private ones by path).
+    pub packs: Vec<LoadedPack>,
     pub dialect_versions: BTreeMap<String, String>,
     pub assumptions: Vec<AssumptionRow>,
     pub only_a: Vec<String>,
@@ -572,6 +576,11 @@ impl Session {
         rows.into_values().collect()
     }
 
+    /// The packs the session's config loaded (a private pack by path only).
+    pub fn packs(&self) -> Vec<LoadedPack> {
+        packs::loaded(&self.cfg)
+    }
+
     pub fn info(&self) -> SessionInfo {
         let mut rows = self.assumptions.clone();
         for r in &mut rows {
@@ -594,7 +603,21 @@ impl Session {
             origin: self.origin.clone(),
             loaded_at: self.loaded_at.clone(),
             tool_version: sqldiff_core::TOOL_VERSION.to_string(),
-            layers: self.cfg.layers.clone(),
+            // A private pack is confirmed by path (`packs`), never by name.
+            layers: self
+                .cfg
+                .layers
+                .iter()
+                .map(|l| match l.kind {
+                    LayerKind::PrivatePack => LayerRef {
+                        name: "private pack".into(),
+                        version: None,
+                        ..l.clone()
+                    },
+                    _ => l.clone(),
+                })
+                .collect(),
+            packs: self.packs(),
             dialect_versions: Dialect::ALL
                 .iter()
                 .map(|d| (d.id().to_string(), self.cfg.dialect_version(*d)))

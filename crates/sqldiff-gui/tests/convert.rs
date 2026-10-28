@@ -160,10 +160,20 @@ fn the_example_template_converts_with_the_example_pack() {
         template: Some(TemplateSetup {
             placeholders: Placeholders::new(cfg.policy.template.as_ref().unwrap()).unwrap(),
             parameters: None,
+            packs: sqldiff_gui::packs::loaded(&cfg),
         }),
         ..setup(&text)
     };
     let p = run(&s, &text, false);
+    // The page confirms the `--pack` it loaded, a private pack, by path only.
+    let packs = p
+        .template_packs
+        .as_ref()
+        .expect("template mode lists its packs");
+    assert_eq!(packs.len(), 1);
+    assert!(packs[0].private && packs[0].name.is_none() && packs[0].version.is_none());
+    assert!(packs[0].path.ends_with("pack.toml"), "{}", packs[0].path);
+    assert!(run(&setup(&text), &text, false).template_packs.is_none());
     let c = p.conversion.expect("converts");
     let info = c.template.as_ref().unwrap();
     assert_eq!(info.parameters, ["NAME", "SCHEMA", "ENTITY", "TABLE"]);
