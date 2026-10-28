@@ -152,8 +152,18 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 
     if same {
         let mut td = treediff::diff(&aa, &ab);
-        // An observer that does not read row counts does not see SET NOCOUNT.
-        if opts.observer.row_counts == crate::observer::RowCounts::Never {
+        // An observer that does not read row counts does not see SET NOCOUNT,
+        // unless the code reads them itself: SET resets @@ROWCOUNT (and
+        // ROWCOUNT_BIG()) to 0, so an added SET NOCOUNT before
+        // `IF @@ROWCOUNT = 0` changes the branch.
+        let reads_rowcount = |an: &Analyzed| {
+            let t = an.artifact.text.to_ascii_uppercase();
+            t.contains("@@ROWCOUNT") || t.contains("ROWCOUNT_BIG")
+        };
+        if opts.observer.row_counts == crate::observer::RowCounts::Never
+            && !reads_rowcount(&aa)
+            && !reads_rowcount(&ab)
+        {
             let nocount = |f: &Finding| {
                 let text = |l: &Option<Location>, an: &Analyzed| {
                     l.as_ref()

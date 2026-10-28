@@ -74,3 +74,17 @@ fn within_one_dialect_set_nocount_is_observed_unless_counts_are_not() {
     assert_ne!(r.verdict(), Verdict::Equal);
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
+
+#[test]
+fn set_nocount_is_kept_where_the_code_reads_rowcount() {
+    // SET resets @@ROWCOUNT to 0: an added SET NOCOUNT ON before
+    // `IF @@ROWCOUNT = 0` changes the branch, whatever the observer reads.
+    let a = "CREATE PROCEDURE dbo.up @id int AS\nBEGIN\n  UPDATE dbo.t SET x = 1 WHERE id = @id;\n  IF @@ROWCOUNT = 0 INSERT INTO dbo.t (id, x) VALUES (@id, 1);\nEND\n";
+    let b = "CREATE PROCEDURE dbo.up @id int AS\nBEGIN\n  UPDATE dbo.t SET x = 1 WHERE id = @id;\n  SET NOCOUNT ON;\n  IF @@ROWCOUNT = 0 INSERT INTO dbo.t (id, x) VALUES (@id, 1);\nEND\n";
+    let r = run((a, T), (b, T), RowCounts::Never);
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+}
