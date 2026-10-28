@@ -133,7 +133,7 @@ fails, a glibc checker ships beside the musl CLI.
 | 1 | What "related observations" means (below) | Refinement of the reference side, over a stated observer profile | Decided 2026-10-28 (four choices by the project owner, the rest proposed) |
 | 2 | Gate (translation validation) or proving the Rust | Gate, then converge per fragment, with a performance gate (below) | Decided 2026-10-28 |
 | 3 | Rollout | A `proof` field and modes off/report/require; `require` becomes the default per dialect pair (below) | Decided 2026-10-28 |
-| 4 | Access to IBM i systems | One per supported release, for probes | Open |
+| 4 | Access to IBM i systems | Manual probes now, rented IBM i decided at phase 3, no `require` without an engine differential (below) | Decided 2026-10-28; first access pending |
 | 5 | Who reviews spec, statements and axioms | A named human; the one role AI does not fill | Open |
 | 6 | Version support policy | Follow each vendor's lifecycle (see "RDBMS versions") | Proposed |
 | 7 | Azure SQL Database and Managed Instance | Out of scope until decided: versionless, compatibility level only | Open |
@@ -290,6 +290,48 @@ GUI, review store and `pairs`/`tree`/`queue` configuration; an
 packs; witness texts that say which side can produce what. It ships in
 Rust before the checker (decision 3).
 
+### Decision 4: IBM i access
+
+Decided by the project owner on 2026-10-28. As of that date no probe in
+`probes/db2i` has run on an IBM i: all 16 facts in `status.json` are
+`unverified`.
+
+What the plan needs from IBM i:
+
+| Workload | Scale | Access |
+|---|---|---|
+| W1 vendor-fact probes (`probes/db2i`) | One script, 139 probes, per supported release and Technology Refresh | Manual, as the probe README describes |
+| W2 spec differential (`spec-breaker`, phases 1 to 4) | Thousands of generated programs | Programmatic: JTOpen JDBC, ODBC or Mapepire |
+| W3 execution oracle and corpus Db2 fixtures | Tens of scenarios per run | Programmatic |
+
+Every system used must let a profile create a schema (journaled), run under
+commitment control and create SQL procedures, and must not be a production
+system or hold customer data: the probes write, and SQLDiff never writes to
+a source system.
+
+Decided:
+
+- **Now (phases 0 and 1): W1 by hand.** First access is PUB400 (free
+  community system, IBM i 7.5 per April 2026 reports, non-commercial use, one
+  profile per person), run by the project owner in Access Client Solutions.
+  It cannot run the V25 authority check, which needs a second profile, and
+  may refuse `CREATE SCHEMA SQLDFPROBE`, in which case the probe build needs
+  a configurable schema name. Running from a cloud session needs the host
+  allowed in its network policy and a non-HTTPS connection (SSH or the
+  database host servers), which may not be possible there.
+- **Rented IBM i for W2 and W3: decided at phase 3**, priced then (for
+  example IBM Power Virtual Server, started and stopped by CI under a budget
+  cap, credentials in CI secrets).
+- **No engine differential, no `require`.** A dialect version reaches stage
+  2 of decision 3 only after its spec has passed a differential test against
+  that engine version: PostgreSQL and SQL Server in CI containers, Db2 for i
+  through W2 on that release. Until then its confirmations rest on axioms,
+  listed as assumptions, and its default stays `report`.
+- **All supported releases are probed:** at least one W1 run per supported
+  release (7.5 and 7.6) at its latest Technology Refresh, repeated for each
+  new Technology Refresh. The `legacy` 7.4 gets one run before its spec is
+  frozen if access exists; otherwise its facts stay axioms for 7.4.
+
 ### Decision 3: rollout
 
 Decided by the project owner on 2026-10-28.
@@ -328,7 +370,7 @@ verdicts only.
 |---|---|---|
 | 0 | Phase 0: the gate covers only the trivial fragment | `off` for users; the project's own CI runs `report` and tracks coverage |
 | 1 | The gate ships in releases and confirms at least half of the corpus "equal" verdicts | `report` everywhere; nothing fails because of it |
-| 2 | Per dialect pair and version (T-SQL to PostgreSQL 18, …): at least 95% of "equal" verdicts on corpus, real-code and the WWI benchmark confirmed, and no contradiction open for 8 weeks | `require` for that pair, including the GitHub Action's default |
+| 2 | Per dialect pair and version (T-SQL to PostgreSQL 18, …): at least 95% of "equal" verdicts on corpus, real-code and the WWI benchmark confirmed, no contradiction open for 8 weeks, and both versions' specs passed an engine differential (decision 4) | `require` for that pair, including the GitHub Action's default |
 | 3 | Every supported pair is at stage 2 | `require` everywhere; `report` stays as an opt-out |
 
 Early users of `require`, from phase 0: the formatter's self-check
