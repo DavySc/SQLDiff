@@ -762,7 +762,7 @@ level, and a probe run plus a delta review for each IBM i Technology Refresh.
 | Typed dialect targets, `profiles/lifecycle.toml`, lifecycle notes | Done (dates unverified) |
 | Packaging and performance spike | Done: all four targets within budget (decision 2) |
 | Gate on the trivial fragment: `formal/lean` (`check_sound`, no axioms), `sqldiff_core::proof`, `--proof off|report|require` | Done; the CLI tests use a stand-in for the checker, CI tests the real one |
-| Decision 1 semantics in Rust | Not started |
+| Decision 1 semantics in Rust | Result column names done; reference side and `equivalent`, ORDER BY refinement, observer profile, error matching and session state to come |
 | Coverage invariant | Not started |
 | AST export with generated Lean types | Not started (phase 0 compares syntax trees as text) |
 | Signed locks, `allowed_signers`, `spec-critic` | Not started |
@@ -774,6 +774,16 @@ and comment changes. Keyword case is outside it, because a T-SQL word such
 as `date` can be a keyword or an identifier and identifiers are
 case-sensitive under a case-sensitive collation; bringing it in needs a
 vendor fact as an axiom (decision 5).
+
+### Verdict changes so far (for the release notes, decision 3)
+
+| Change | Before | Now |
+|---|---|---|
+| A T-SQL result column alias renamed (`AS OrderId` to `AS Id`) | unknown | different (`equiv.result-column-name`) |
+| A T-SQL result column alias whose only change is letter case (`AS OrderId` to `AS orderid` or `[ORDERID]`) | equal under `ASM-TSQL-CI-COLLATION` | different, or unknown inside a compound statement |
+| Result columns whose names differ only in letter case across dialects (T-SQL `Id`, PostgreSQL unquoted `id`, Db2 for i `ID`) | equal | equal under `ASM-RESULT-NAMES-CI` |
+| A rewritten same-dialect T-SQL statement that also changes the case of names | equal under assumptions without `ASM-TSQL-CI-COLLATION` | with it (also on `main`) |
+| Instances whose converted PostgreSQL returns a column under a lower-case name | converted | under assumptions (`ASM-RESULT-NAMES-CI`) |
 
 ## Leads found while planning
 
@@ -792,6 +802,10 @@ Each needs a test before it counts as a bug; outcomes are recorded here.
   empty (`.unwrap_or(Verdict::Equal)`). Two empty trees are equal (nothing
   is observable on either side); a file without a dialect makes `tree`
   unknown, an unreadable file or a missing folder is an error (exit 2).
+- The T-SQL to PostgreSQL converter writes `SELECT Id` as `SELECT id`, so
+  the result column comes back as `id` and the conversion needs
+  `ASM-RESULT-NAMES-CI` (decision 1). Writing `id AS "Id"` where the case
+  differs would keep the name and drop the assumption.
 - One assumption id, two settings: `ASM-TSQL-CI-COLLATION` stands both for
   names and variables comparing case-insensitively and for string
   comparisons using a case-insensitive collation (`canon::asm::TSQL_CI`).

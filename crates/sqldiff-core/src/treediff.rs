@@ -151,9 +151,42 @@ impl Ctx<'_, '_> {
         if self.a.artifact.text[xs..xe] != self.b.artifact.text[ys..ye] {
             self.out.cosmetic += 1;
         }
-        if x.strict != y.strict {
-            self.out.used_case_insensitive_idents = true;
+        self.case_only(x, y);
+    }
+
+    /// `x` and `y` are equal up to the case of names, which T-SQL folds
+    /// under a case-insensitive collation (assumed). Result column names keep
+    /// their case whatever the collation (decision 1 in
+    /// docs/verification-roadmap.md), so a SELECT that differs only that way
+    /// is left to statement equivalence, which compares the names a client
+    /// receives exactly. Compound statements are looked into, since the
+    /// SELECT can be nested.
+    fn case_only(&mut self, x: &Unit, y: &Unit) {
+        if x.strict == y.strict {
+            return;
         }
+        if !x.children.is_empty() && x.children.len() == y.children.len() {
+            if strict_hash(&x.header) != strict_hash(&y.header) {
+                self.out.used_case_insensitive_idents = true;
+            }
+            for (cx, cy) in x.children.iter().zip(&y.children) {
+                self.case_only(cx, cy);
+            }
+            return;
+        }
+        if x.kind == StmtKind::Select && y.kind == StmtKind::Select && x.children.is_empty() {
+            let exact = |t: &[NormTok]| -> Vec<NormTok> {
+                t.iter()
+                    .map(|t| NormTok {
+                        loose: t.strict.clone(),
+                        ..t.clone()
+                    })
+                    .collect()
+            };
+            self.push_change(x, y, &exact(&x.toks), &exact(&y.toks), "stmt.modified");
+            return;
+        }
+        self.out.used_case_insensitive_idents = true;
     }
 
     fn score(x: &Unit, y: &Unit) -> f64 {

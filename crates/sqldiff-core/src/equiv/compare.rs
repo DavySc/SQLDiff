@@ -37,6 +37,28 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
     if a == b {
         return;
     }
+    // Result column names (decision 1): exact within a dialect, up to letter
+    // case across dialects under ASM-RESULT-NAMES-CI; the kind of name
+    // (alias, column, declared) is not observed.
+    if a.is("colname") && b.is("colname") {
+        let (na, nb) = (a.kid(2).and_then(Term::atom), b.kid(2).and_then(Term::atom));
+        if na.is_some() && na == nb {
+            return;
+        }
+        let cross = a.kid(0) != b.kid(0);
+        if cross && na.zip(nb).is_some_and(|(x, y)| x.eq_ignore_ascii_case(y)) {
+            assume(c, asm::make(asm::RESULT_NAMES_CI));
+            return;
+        }
+        c.mismatches.push(Mismatch {
+            a: a.clone(),
+            b: b.clone(),
+            parent_a: pa.cloned(),
+            parent_b: pb.cloned(),
+            index,
+        });
+        return;
+    }
     // Hooks that make different spellings equal under an assumption.
     if let Some(x) = hook(a, b).or_else(|| hook(b, a)) {
         assume(c, x);
@@ -97,6 +119,24 @@ pub fn explain(
 ) -> Option<(ChangeClass, &'static str, String)> {
     let parent = m.parent_a.as_ref().map(Term::head).unwrap_or("");
     let (x, y) = (m.a.atom(), m.b.atom());
+    if m.a.is("colname") && m.b.is("colname") {
+        // Only two explicit aliases in one dialect are certainly different
+        // names; a column reference's returned name can depend on the catalog.
+        let alias = |t: &Term| t.kid(1).and_then(Term::atom) == Some("alias");
+        if !(alias(&m.a) && alias(&m.b) && m.a.kid(0) == m.b.kid(0)) {
+            return None;
+        }
+        let name = |t: &Term| t.kid(2).and_then(Term::atom).unwrap_or("").to_string();
+        return Some((
+            ChangeClass::Semantic,
+            "equiv.result-column-name",
+            format!(
+                "A result column is named `{}` on {side_a} and `{}` on {side_b}; a client that reads it by name does not find it.",
+                name(&m.a),
+                name(&m.b)
+            ),
+        ));
+    }
     match (parent, m.index) {
         ("strcmp", 1) => {
             let (ci, cs) = match (x?, y?) {

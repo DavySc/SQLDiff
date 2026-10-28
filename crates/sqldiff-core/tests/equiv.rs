@@ -879,7 +879,16 @@ fn db2_sysdummy1_is_no_from() {
         D,
         false,
     );
-    assert_eq!(r.verdict(), Verdict::Equal, "{:?}", rules(&r));
+    // Equal, except that T-SQL returns the column as `x` and Db2 for i as
+    // `X` (decision 1: result column names are observed).
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        rules(&r)
+    );
+    let ids: Vec<&str> = r.assumptions.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, ["ASM-RESULT-NAMES-CI"]);
     let r = run(
         "SELECT 1 AS x;",
         T,

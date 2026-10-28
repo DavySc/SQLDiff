@@ -465,10 +465,21 @@ fn fragments_pairs_and_value_kinds() {
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
     // The woven instances discharge the fragment and decision notes.
     // The table is the one the conversion rules write from the source.
-    for name in ["table", "list", "save"] {
+    for name in ["table", "save"] {
         let i = instance(&r, name);
         assert_eq!(i["status"], "converted", "{name}: {i}");
     }
+    // `SELECT Id` returns `Id` in T-SQL and `id` in PostgreSQL (decision 1:
+    // result column names are observed), and nothing else is open.
+    let i = instance(&r, "list");
+    assert_eq!(i["status"], "assumptions", "{i}");
+    let items: Vec<&str> = i["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x["rule"].as_str())
+        .collect();
+    assert_eq!(items, ["ASM-RESULT-NAMES-CI"], "{i}");
     let woven = std::fs::read_to_string(d.join("out/target/save.sql")).unwrap();
     assert!(woven.contains("(p_key integer)"), "{woven}");
     // A type given once for every dialect is an assumption.
