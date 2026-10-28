@@ -1,0 +1,72 @@
+name: Lean checker
+
+# The Lean side of the verification roadmap (docs/verification-roadmap.md).
+# For now the decision 2 packaging spike: build `sqldiff-check` for every
+# release target and measure start-up, throughput, size and linked libraries.
+
+on:
+  push:
+    branches: [verification]
+    paths: ["formal/lean/**", ".github/workflows/formal-lean.yml"]
+  workflow_dispatch:
+
+jobs:
+  spike:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: linux-x64, arch: "" }
+          - { os: ubuntu-latest, label: linux-x64-static, arch: "", static: true }
+          - { os: macos-latest, label: macos-arm64, arch: "" }
+          # Release builds make macOS x64 on an arm64 runner; Lean has no
+          # cross compiler, so this runs the x86_64 toolchain under Rosetta.
+          - { os: macos-latest, label: macos-x64, arch: "arch -x86_64" }
+          - { os: windows-latest, label: windows-x64, arch: "" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: formal/lean
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install elan (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          ${{ matrix.arch }} sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Install elan (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.ps1 -o elan-init.ps1
+          powershell -ExecutionPolicy Bypass -File elan-init.ps1 -NoPrompt 1 -DefaultToolchain none
+          echo "$env:USERPROFILE\.elan\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Static link flags
+        if: matrix.static
+        run: |
+          cat >> lakefile.toml <<'EOF'
+          moreLinkArgs = ["-static"]
+          EOF
+          cat lakefile.toml
+      - name: Build
+        run: |
+          ${{ matrix.arch }} lake --version
+          ${{ matrix.arch }} lake build
+          ls -l .lake/build/bin
+      - name: Measure
+        run: |
+          exe=.lake/build/bin/sqldiff_check
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          file "$exe" || true
+          python3 measure.py "$exe" | tee measure-${{ matrix.label }}.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqldiff-check-${{ matrix.label }}
+          path: |
+            formal/lean/.lake/build/bin/
+            formal/lean/measure-${{ matrix.label }}.json

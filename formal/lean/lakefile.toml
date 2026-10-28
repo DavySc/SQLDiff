@@ -1,0 +1,9 @@
+name = "sqldiff_check"
+version = "0.0.1"
+defaultTargets = ["sqldiff_check"]
+
+# The checker executable. Executable code imports only Init (decision 2):
+# no Mathlib, no `Lean` package, so the binary stays small.
+[[lean_exe]]
+name = "sqldiff_check"
+root = "Main"
