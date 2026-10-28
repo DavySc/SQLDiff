@@ -8,6 +8,10 @@ each supported RDBMS version. The first rule of the design (never a false
 "equal") is the property being proven; everything else (witnesses,
 explanations, conversion, GUI) stays outside the proof.
 
+See also [verified-conversion.md](verified-conversion.md), a proposal that
+re-cuts these phases around a converter whose output needs no re-review, and
+[qed-lessons.md](qed-lessons.md), what the QED prover contributes to phase 2.
+
 ## Assurance tiers
 
 | Tier | What it means | Status |
