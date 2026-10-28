@@ -134,7 +134,7 @@ fails, a glibc checker ships beside the musl CLI.
 | 2 | Gate (translation validation) or proving the Rust | Gate, then converge per fragment, with a performance gate (below) | Decided 2026-10-28 |
 | 3 | Rollout | A `proof` field and modes off/report/require; `require` becomes the default per dialect pair (below) | Decided 2026-10-28 |
 | 4 | Access to IBM i systems | Manual probes now, rented IBM i decided at phase 3, no `require` without an engine differential (below) | Decided 2026-10-28; first access pending |
-| 5 | Who reviews spec, statements and axioms | A named human; the one role AI does not fill | Open |
+| 5 | Who reviews spec, statements and axioms | The project owner, with external dialect experts at phase ends; approval by signed lock files (below) | Decided 2026-10-28 |
 | 6 | Version support policy | Follow each vendor's lifecycle (see "RDBMS versions") | Proposed |
 | 7 | Azure SQL Database and Managed Instance | Out of scope until decided: versionless, compatibility level only | Open |
 
@@ -290,6 +290,49 @@ GUI, review store and `pairs`/`tree`/`queue` configuration; an
 packs; witness texts that say which side can produce what. It ships in
 Rust before the checker (decision 3).
 
+### Decision 5: review of trusted content
+
+Decided by the project owner on 2026-10-28. On that date the project has one
+human contributor, commits (Claude's included) go straight to `main`, and
+there is no CODEOWNERS file, so review has to be cheap for one person and
+enforced by something an agent cannot produce.
+
+Trusted content, which only a human approves:
+
+| Item | What the review checks |
+|---|---|
+| Theorem statements (`Statements/`) | They say what decision 1 means, no weaker |
+| Spec rules (`Spec/`) | Each matches its cited vendor text and its engine test results |
+| Rules that mark behaviour unspecified | The vendor text really says the behaviour is not guaranteed (they widen what "equal" allows) |
+| Axioms | Each matches its `V*` fact in vendor-facts-verification.md and the probe status |
+| The AST meaning contract | What the parser produces is what the Lean side assumes |
+
+Decided:
+
+- **Who.** The project owner approves every item. At the end of each phase
+  an external expert per dialect (T-SQL, PostgreSQL, IBM i) reviews the
+  riskiest items: every unspecified-behaviour rule and axiom, and a sample of
+  spec rules chosen by risk. Expert time is budgeted per phase; their
+  findings are recorded like probe runs.
+- **Enforcement: signed locks.** `theorems.lock` and `SPEC.lock` hold one
+  hash per approved item (statement, rule, axiom, AST contract version) and
+  are signed with the owner's SSH or GPG key. CI checks the signature
+  against `formal/allowed_signers` and fails when trusted content has no
+  signed hash. No agent holds the key, so no agent can approve, however a
+  change reaches the repository; direct pushes keep working for everything
+  else. Changing `allowed_signers` itself needs a signature by a key already
+  in it.
+- **Adversarial review of every trusted change.** A `spec-critic` agent,
+  started fresh, sees the changed item and its vendor citation but not the
+  drafter's reasoning, and tries to break it (a counterexample, a misread
+  citation, a weaker statement than decision 1). Its report goes with the
+  review; its findings are leads, never approvals.
+- **What is approved is the Lean text.** Each item carries machine-checked
+  examples (Lean `example`s it must accept or reject, from engine runs where
+  they exist) and an AI paraphrase as a reading aid. The owner learns to
+  read, not write, Lean during phase 0. A generated table lists every item
+  with its citation, engine evidence, critic report and approval.
+
 ### Decision 4: IBM i access
 
 Decided by the project owner on 2026-10-28. As of that date no probe in
@@ -401,10 +444,10 @@ AI writes proofs; it never writes trusted statements unreviewed.
 | Artifact | Written by | Checked by |
 |---|---|---|
 | Proof bodies | AI | The Lean kernel |
-| Theorem statements (`Statements/*.lean`) | AI drafts, human approves | `theorems.lock` (statement hashes); CI fails on a change not in the lock |
-| Dialect specification (`Spec/*.lean`) | AI drafts with a citation per rule, human approves | Engine differential tests, the lock |
-| Axioms | Human only | `#print axioms` checked against an allowlist; each maps to a `V*` fact |
-| Spec rules that mark behaviour unspecified | AI drafts with the vendor text that says it is not guaranteed, human approves like an axiom | Engine tests can only refute them (decision 1) |
+| Theorem statements (`Statements/*.lean`) | AI drafts, human approves | `theorems.lock`, signed by the owner (decision 5); CI fails on a change not in it |
+| Dialect specification (`Spec/*.lean`) | AI drafts with a citation per rule, human approves | Engine differential tests, `SPEC.lock` signed by the owner |
+| Axioms | Human only | `#print axioms` checked against an allowlist in `SPEC.lock`; each maps to a `V*` fact |
+| Spec rules that mark behaviour unspecified | AI drafts with the vendor text that says it is not guaranteed, human approves like an axiom | Engine tests can only refute them (decision 1); external expert review at phase ends (decision 5) |
 | `sorry` | Nobody | CI rejects it |
 
 Agents (in `.claude/agents/`):
@@ -418,8 +461,11 @@ Agents (in `.claude/agents/`):
   and the real engines, and reports every disagreement.
 - `sync`: follows Rust changes into the Lean lowering (see "Drift
   management").
-- `audit` gains `lake build`, the lock, axiom and `sorry` checks, and the
-  Rust/Lean differential suite.
+- `spec-critic`: started fresh on every change to trusted content, sees the
+  item and its citation but not the drafter's reasoning, and tries to break
+  it (decision 5). Reports leads only.
+- `audit` gains `lake build`, the lock signature, axiom and `sorry` checks,
+  and the Rust/Lean differential suite.
 
 AI shortens proof work most; drafting the specification less; deciding and
 reviewing the semantics hardly at all. Review is the critical path.
@@ -431,7 +477,7 @@ bars; total about 16 to 28 months including multi-version support.
 
 | Phase | Scope | Exit criterion | Estimate |
 |---|---|---|---|
-| 0 Groundwork | Private `Report.verdict` (assigned today in core, source, review and convert); the decision 1 semantics in Rust and the `proof` field and modes (decision 3); a coverage invariant (every unit proven or covered by a finding); tests for the leads below; typed dialect version (see "RDBMS versions"); `formal/lean` Lake project with `Term`; AST JSON export with schema hash; the gate on a trivial fragment; the packaging and performance spike (decision 2); CI and agents | Gate confirms the trivial fragment on the corpus, on all four release targets, within the decision 2 budgets | 2 to 3 months |
+| 0 Groundwork | Private `Report.verdict` (assigned today in core, source, review and convert); the decision 1 semantics in Rust and the `proof` field and modes (decision 3); a coverage invariant (every unit proven or covered by a finding); tests for the leads below; typed dialect version (see "RDBMS versions"); `formal/lean` Lake project with `Term`; AST JSON export with schema hash; the gate on a trivial fragment; the packaging and performance spike (decision 2); signed locks, `allowed_signers` and the `spec-critic` agent (decision 5); the owner learning to read Lean; CI and agents | Gate confirms the trivial fragment on the corpus, on all four release targets, within the decision 2 budgets | 2 to 3 months |
 | 1 Scalar expressions | Three-valued logic, NULL, numeric types, strings and collation, casts and literals, bit and boolean, CASE/COALESCE/ISNULL; `compare.rs` hooks proven under their assumptions; `eval/casts`, `eval/bit-boolean`, `eval/literal` as Lean regression tests | Scalar-only "equal" on corpus and real-code confirmed; mutation gate at zero false equals | 3 to 4 months |
 | 2 Queries | Bags, joins, aggregates, ordering and NULL ordering, paging, set operations, scalar subquery contracts, catalog keys and nullability | As phase 1, for queries | 3 to 5 months |
 | 3 DML | INSERT, UPDATE (including `UPDATE … FROM`), DELETE, MERGE, upserts, generated keys and `RETURNING`; execution oracle as a Lean differential test | DML "equal" confirmed; oracle agrees with the Lean semantics | 2 to 4 months |
