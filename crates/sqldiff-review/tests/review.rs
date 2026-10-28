@@ -434,6 +434,38 @@ fn history_groups_by_work_item() {
     assert_eq!(g[2].revisions, vec!["r2"]);
 }
 
+/// A result cached against one catalog's contents is not served for other
+/// contents (a base catalog of a conversion edited between runs).
+#[test]
+fn cache_misses_when_catalog_contents_change() {
+    let dir = scratch("cache-catalog");
+    let cfg = config(&dir, PACK);
+    let (a, b) = movestock();
+    let facts = |ddl: &str| {
+        std::sync::Arc::new(sqldiff_core::catalog::ddl::load(
+            ddl,
+            Dialect::Tsql,
+            "base catalogs orders.sql",
+        ))
+    };
+    let with = |ddl: &str| Options {
+        facts_a: vec![facts(ddl)],
+        facts_b: vec![facts(ddl)],
+        ..Options::default()
+    };
+    let one = with("CREATE TABLE orders (order_id int NOT NULL);");
+    let same = with("CREATE TABLE orders (order_id int NOT NULL);");
+    let other = with("CREATE TABLE orders (order_id bigint NOT NULL);");
+    assert_eq!(
+        cache::report_key(&a, Some(&b), &one, &cfg),
+        cache::report_key(&a, Some(&b), &same, &cfg)
+    );
+    assert_ne!(
+        cache::report_key(&a, Some(&b), &one, &cfg),
+        cache::report_key(&a, Some(&b), &other, &cfg)
+    );
+}
+
 #[test]
 fn cache_hits_on_same_content_only() {
     let dir = scratch("cache");
