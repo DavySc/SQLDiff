@@ -5,6 +5,7 @@
 //! equivalent is reported as "unknown" or "equal under assumptions".
 
 pub mod artifact;
+pub mod assumptions;
 pub mod bind;
 pub mod catalog;
 pub mod classify;

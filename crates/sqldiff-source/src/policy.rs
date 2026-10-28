@@ -1,6 +1,6 @@
 //! Pack policy applied to engine reports: severity and class overrides,
-//! declared assumptions, limit rules, staleness, author markers and
-//! template placeholders.
+//! declared assumptions, the deployment profile's acceptances, limit rules,
+//! staleness, author markers and template placeholders.
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ pub fn apply(report: &mut Report, config: &Resolved) {
             a.text = text.clone();
         }
     }
+    // The deployment profile names what it accepts; the verdict stays.
+    config.deployment.apply(report);
 }
 
 /// Caps the verdict at unknown when a side is stale generated output.
