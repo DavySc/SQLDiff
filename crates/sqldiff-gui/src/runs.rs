@@ -29,6 +29,7 @@ use sqldiff_source::Resolved;
 
 use crate::browse;
 use crate::convert_review::{self, Review};
+use crate::packs::{self, LoadedPack};
 
 /// A tree conversion as the page asks for it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -545,6 +546,9 @@ pub struct Run {
     pub id: u64,
     pub spec: Spec,
     pub command: Command,
+    /// The packs the run's config loaded (a private pack by path only);
+    /// `None` for a run kept by an app that did not record them.
+    pub packs: Option<Vec<LoadedPack>>,
     /// Output folder and what the run reads, as `canonical` paths: no two
     /// running runs write into one folder, and none reads where another
     /// writes.
@@ -584,6 +588,9 @@ pub struct RunView {
     #[serde(flatten)]
     pub spec: Spec,
     pub command: Command,
+    /// The packs the run's config loaded (a private pack by path only);
+    /// `None` for a run kept by an app that did not record them.
+    pub packs: Option<Vec<LoadedPack>>,
     pub started: String,
     /// From an earlier session of the app: its review opens again from the
     /// tree on disk.
@@ -604,6 +611,7 @@ impl Run {
             id: self.id,
             spec: self.spec.clone(),
             command: self.command.clone(),
+            packs: self.packs.clone(),
             started: self.started.clone(),
             past: self.past,
             checked: self.checked.load(Ordering::Relaxed),
@@ -676,6 +684,9 @@ struct Record {
     id: u64,
     spec: Spec,
     command: Command,
+    /// Absent in a history written before packs were kept.
+    #[serde(default)]
+    packs: Option<Vec<LoadedPack>>,
     started: String,
     checked: usize,
     total: usize,
@@ -702,6 +713,7 @@ fn save(file: &Path, list: &[Arc<Run>]) {
             id: r.id,
             spec: r.spec.clone(),
             command: r.command.clone(),
+            packs: r.packs.clone(),
             started: r.started.clone(),
             checked: r.checked.load(Ordering::Relaxed),
             total: r.total.load(Ordering::Relaxed),
@@ -766,6 +778,7 @@ impl Runs {
                     reads: Vec::new(),
                     spec: r.spec,
                     command: r.command,
+                    packs: r.packs,
                     started: r.started,
                     past: true,
                     checked: AtomicUsize::new(r.checked),
@@ -813,7 +826,7 @@ impl Runs {
                 ));
             }
         }
-        let (job, _, command) = prepare(spec, isolated)?;
+        let (job, _, command, loaded) = prepare(spec, isolated)?;
         if (&command.args, &command.project_config, &command.user_config)
             != (
                 &run.command.args,
@@ -830,6 +843,7 @@ impl Runs {
             tree: job.tree,
             out: job.out,
             instances: job.instances,
+            packs: loaded,
         })?;
         let review = Arc::new(Mutex::new(review));
         *slot = Some(Arc::clone(&review));
@@ -856,7 +870,7 @@ impl Runs {
         isolated: bool,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let (job, out, command) = prepare(&spec, isolated)?;
+        let (job, out, command, loaded) = prepare(&spec, isolated)?;
         let reads = [Some(&job.tree.src), job.instances.as_ref()]
             .into_iter()
             .flatten()
@@ -866,7 +880,7 @@ impl Runs {
             Spec::Convert(spec),
             Work::Convert(Box::new(job)),
             (out, reads),
-            command,
+            (command, loaded),
             done,
         )
     }
@@ -879,7 +893,7 @@ impl Runs {
         isolated: bool,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let (a, command) = prepare_instances(&spec, isolated)?;
+        let (a, command, loaded) = prepare_instances(&spec, isolated)?;
         let out = a.out.clone();
         let reads = [Some(&a.manifest), a.source.as_ref(), a.target.as_ref()]
             .into_iter()
@@ -891,7 +905,7 @@ impl Runs {
             Spec::Instances(spec),
             Work::Instances(Box::new(a)),
             (out, reads),
-            command,
+            (command, loaded),
             done,
         )
     }
@@ -904,7 +918,7 @@ impl Runs {
         isolated: bool,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let (a, command) = prepare_drift(&spec, isolated)?;
+        let (a, command, loaded) = prepare_drift(&spec, isolated)?;
         let out = a.out.clone();
         let reads = a
             .trees
@@ -917,7 +931,7 @@ impl Runs {
             Spec::Drift(spec),
             Work::Drift(Box::new(a)),
             (out, reads),
-            command,
+            (command, loaded),
             done,
         )
     }
@@ -930,13 +944,13 @@ impl Runs {
         isolated: bool,
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let (w, command) = prepare_changes(&spec, isolated)?;
+        let (w, command, loaded) = prepare_changes(&spec, isolated)?;
         let (out, reads) = (w.out.clone(), vec![w.repo.clone()]);
         self.launch(
             Spec::Changes(spec),
             Work::Changes(Box::new(w)),
             (out, reads),
-            command,
+            (command, loaded),
             done,
         )
     }
@@ -946,7 +960,7 @@ impl Runs {
         spec: Spec,
         work: Work,
         (out, reads): (PathBuf, Vec<PathBuf>),
-        command: Command,
+        (command, packs): (Command, Vec<LoadedPack>),
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
         let out = canonical(&out);
@@ -978,6 +992,7 @@ impl Runs {
                 id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
                 spec,
                 command,
+                packs: Some(packs),
                 out,
                 reads,
                 started: sqldiff_review::time::now(),
@@ -1030,22 +1045,22 @@ impl Runs {
 
 /// The command a run of `spec` would carry, without starting one.
 pub fn command(spec: &ConvertSpec, isolated: bool) -> Result<Command, String> {
-    prepare(spec, isolated).map(|(_, _, c)| c)
+    prepare(spec, isolated).map(|(_, _, c, _)| c)
 }
 
 /// The command an instance check of `spec` would carry, without starting one.
 pub fn instances_command(spec: &InstancesSpec, isolated: bool) -> Result<Command, String> {
-    prepare_instances(spec, isolated).map(|(_, c)| c)
+    prepare_instances(spec, isolated).map(|(_, c, _)| c)
 }
 
 /// The command a drift check of `spec` would carry, without starting one.
 pub fn drift_command(spec: &DriftSpec, isolated: bool) -> Result<Command, String> {
-    prepare_drift(spec, isolated).map(|(_, c)| c)
+    prepare_drift(spec, isolated).map(|(_, c, _)| c)
 }
 
 /// The command a branch review of `spec` would carry, without starting one.
 pub fn changes_command(spec: &ChangesSpec, isolated: bool) -> Result<Command, String> {
-    prepare_changes(spec, isolated).map(|(_, c)| c)
+    prepare_changes(spec, isolated).map(|(_, c, _)| c)
 }
 
 fn dialects(from: &str, to: &str) -> Result<(Dialect, Dialect), String> {
@@ -1098,7 +1113,7 @@ fn load_config(dir: &Path, packs: &[PathBuf], isolated: bool) -> Result<Resolved
 fn prepare_instances(
     spec: &InstancesSpec,
     isolated: bool,
-) -> Result<(instances::Args, Command), String> {
+) -> Result<(instances::Args, Command, Vec<LoadedPack>), String> {
     let (from, to) = dialects(&spec.from, &spec.to)?;
     if spec.manifest.trim().is_empty() || spec.out.trim().is_empty() {
         return Err("give a manifest and an output folder".into());
@@ -1125,6 +1140,7 @@ fn prepare_instances(
     let packs = existing_all(&spec.packs)?;
     let dir = manifest.parent().map(Path::to_path_buf).unwrap_or_default();
     let cfg = load_config(&dir, &packs, isolated)?;
+    let loaded = packs::loaded(&cfg);
     let a = instances::Args {
         manifest,
         source,
@@ -1144,14 +1160,17 @@ fn prepare_instances(
         cfg,
     };
     let command = Command::instances(&program(), &a, &packs, &dir, isolated);
-    Ok((a, command))
+    Ok((a, command, loaded))
 }
 
 /// The branch review a spec asks for, checked before a thread is started,
 /// and the command that runs it. The review store is read (decisions suppress
 /// findings, as for the command) and the result cache is not used, so a run
 /// writes nothing but its output folder.
-fn prepare_changes(spec: &ChangesSpec, isolated: bool) -> Result<(ChangesWork, Command), String> {
+fn prepare_changes(
+    spec: &ChangesSpec,
+    isolated: bool,
+) -> Result<(ChangesWork, Command, Vec<LoadedPack>), String> {
     let repo = existing(&spec.repo)?;
     if !repo.is_dir() {
         return Err(format!("{}: not a folder", repo.display()));
@@ -1191,6 +1210,7 @@ fn prepare_changes(spec: &ChangesSpec, isolated: bool) -> Result<(ChangesWork, C
     }
     let packs = existing_all(&spec.packs)?;
     let cfg = load_config(&repo, &packs, isolated)?;
+    let loaded = packs::loaded(&cfg);
     let pipe = Pipeline::new(
         cfg,
         &Settings {
@@ -1208,12 +1228,15 @@ fn prepare_changes(spec: &ChangesSpec, isolated: bool) -> Result<(ChangesWork, C
         pipe,
     };
     let command = Command::changes(&program(), &w, &packs, &repo, isolated);
-    Ok((w, command))
+    Ok((w, command, loaded))
 }
 
 /// The drift check a spec asks for, checked before a thread is started, and
 /// the command that runs it.
-fn prepare_drift(spec: &DriftSpec, isolated: bool) -> Result<(drift::Args, Command), String> {
+fn prepare_drift(
+    spec: &DriftSpec,
+    isolated: bool,
+) -> Result<(drift::Args, Command, Vec<LoadedPack>), String> {
     let dialect = |id: &str| -> Result<Dialect, String> {
         id.trim()
             .parse()
@@ -1268,6 +1291,7 @@ fn prepare_drift(spec: &DriftSpec, isolated: bool) -> Result<(drift::Args, Comma
         .map(|(_, p)| p.clone())
         .unwrap_or_default();
     let cfg = load_config(&dir, &packs, isolated)?;
+    let loaded = packs::loaded(&cfg);
     if cfg.policy.template.is_none() {
         return Err(
             "drift needs a [template] syntax: load a pack or a sqldiff.toml that has one".into(),
@@ -1288,12 +1312,15 @@ fn prepare_drift(spec: &DriftSpec, isolated: bool) -> Result<(drift::Args, Comma
         cfg,
     };
     let command = Command::drift(&program(), &a, &packs, &dir, isolated);
-    Ok((a, command))
+    Ok((a, command, loaded))
 }
 
 /// The job a spec asks for, checked before a thread is started, its
 /// absolute output folder and the command that runs it.
-fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command), String> {
+fn prepare(
+    spec: &ConvertSpec,
+    isolated: bool,
+) -> Result<(Job, PathBuf, Command, Vec<LoadedPack>), String> {
     let (from, to) = dialects(&spec.from, &spec.to)?;
     if !sqldiff_convert::supported(from, to) {
         return Err(format!(
@@ -1329,6 +1356,7 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
         false => src.parent().map(Path::to_path_buf).unwrap_or_default(),
     };
     let cfg = load_config(&dir, &packs, isolated)?;
+    let loaded = packs::loaded(&cfg);
     let template = match spec.template {
         true => Some(tree::TemplateMode::configured(
             &cfg,
@@ -1356,7 +1384,7 @@ fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command)
         queue_all: false,
     };
     let command = Command::new(&program(), &job, &packs, &dir, isolated);
-    Ok((job, out, command))
+    Ok((job, out, command, loaded))
 }
 
 fn execute(run: &Arc<Run>, work: Work) -> State {
@@ -1447,6 +1475,7 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
         tree: job.tree,
         out: job.out,
         instances: job.instances,
+        packs: run.packs.clone().unwrap_or_default(),
     };
     match Review::open_converted(setup, w) {
         Ok(review) => {

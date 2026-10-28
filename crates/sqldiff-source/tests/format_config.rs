@@ -332,3 +332,38 @@ fn saving_drops_a_table_it_emptied_unless_it_has_a_comment() {
     assert_eq!(bare, "");
     assert_eq!(parse(&out), FormatConfig::default());
 }
+
+#[test]
+fn each_pack_is_listed_with_its_layer() {
+    let root = tmp("pack-kinds");
+    write(&root, "pack.toml", PACK);
+    write(
+        &root,
+        "shared/pack.toml",
+        "[pack]\nname = \"shared\"\nversion = \"1.0.0\"\nschema = 1\n",
+    );
+    write(
+        &root,
+        "private/pack.toml",
+        "[pack]\nname = \"private\"\nversion = \"1.0.0\"\nschema = 1\n",
+    );
+    let ws = write(
+        &root,
+        "ws/sqldiff.toml",
+        "packs = [\"../shared\"]\nprivate_packs = [\"../private\"]\n",
+    );
+    let cfg = load(&root, Some(&ws));
+    // Configured shared packs, then configured private ones, then `--pack`.
+    let packs: Vec<_> = cfg
+        .packs_by_kind()
+        .map(|(k, p)| (k, p.meta.name.as_str()))
+        .collect();
+    assert_eq!(
+        packs,
+        [
+            (LayerKind::SharedPack, "shared"),
+            (LayerKind::PrivatePack, "private"),
+            (LayerKind::PrivatePack, "fmt-pack"),
+        ]
+    );
+}

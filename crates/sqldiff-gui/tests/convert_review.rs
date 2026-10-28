@@ -67,6 +67,7 @@ impl Fixture {
             tree: self.args(),
             out: self.out(),
             instances: None,
+            packs: Vec::new(),
         })
         .unwrap()
     }
@@ -420,6 +421,7 @@ fn out_must_be_the_converted_tree() {
         tree: f.args(),
         out: f.dir.join("missing"),
         instances: None,
+        packs: Vec::new(),
     });
     assert!(r.is_err());
 }
@@ -553,6 +555,7 @@ fn a_decision_follows_the_base_catalogs_contents() {
         tree: a(),
         out: out.clone(),
         instances: None,
+        packs: Vec::new(),
     })
     .unwrap();
     let base = r.report_json()["base_hash"].as_str().unwrap().to_string();

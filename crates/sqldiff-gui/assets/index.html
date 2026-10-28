@@ -64,6 +64,8 @@ header { height: 44px; flex: none; padding: 0 12px 0 16px; border-bottom: 1px so
 .verdict.error { color: var(--err); } .verdict.error::before { background: var(--err); }
 #summary { color: var(--muted); font-size: 12.5px; white-space: nowrap; }
 #busy { font-size: 12px; color: var(--muted); white-space: nowrap; }
+#btn-packs { font-size: 12px; color: var(--muted); white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+#btn-packs.on { color: var(--fg); }
 #btn-palette { border: 1px solid var(--line); background: var(--bg); color: var(--faint); min-width: 220px; justify-content: space-between; padding: 4px 6px 4px 10px; font-weight: 400; }
 #btn-palette:hover { color: var(--muted); background: var(--bg); border-color: color-mix(in srgb, var(--focus) 40%, var(--line)); }
 
@@ -263,6 +265,7 @@ table.q .none { color: var(--faint); }
   <span class="spacer"></span>
   <a id="to-convert" class="standalone-only" href="/convert" hidden title="Convert mode: rewrite SQL into another dialect live, or compare two scratch texts">Convert ↗</a>
   <span id="busy" aria-live="polite"></span>
+  <button id="btn-packs" title="Packs loaded"></button>
   <button id="btn-palette" title="Command palette (Ctrl+K or :)"><span class="lbl">Search or run a command…</span><kbd>Ctrl K</kbd></button>
   <button id="btn-info" class="icon" aria-expanded="false" title="Sources, hashes, config and reports" aria-label="Details">
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6.3"/><path d="M8 7.2v3.8M8 5v.1" stroke-linecap="round"/></svg>
@@ -435,6 +438,8 @@ function wireFlips(root) {
 }
 
 // ---------- provenance bar ----------
+function packLabel(p) { return p.private ? "private pack" : p.name + (p.version ? " " + p.version : ""); }
+function packsChip(packs) { return !packs.length ? "No pack loaded" : (packs.length === 1 ? "Pack: " : "Packs: ") + packs.map(packLabel).join(", "); }
 function renderProv() {
   const s = state.page.session;
   const o = s.origin;
@@ -451,9 +456,14 @@ function renderProv() {
   }
   const layers = s.layers.length ? s.layers.map((l) => `<span class="layer" title="${esc(l.kind)} · ${esc(l.hash)}">${esc(l.name)}${l.version ? " " + esc(l.version) : ""} <code>${esc(l.hash.slice(0, 8))}</code></span>`).join("") : "built-in";
   parts.push(kv("Config", layers));
+  parts.push(kv("Packs", s.packs.length ? s.packs.map((p) => `<span class="layer">${esc(packLabel(p))}<br><code>${esc(p.path)}</code></span>`).join("") : "none loaded"));
   parts.push(kv("Tool", `sqldiff ${esc(s.tool_version)}${state.live ? "" : " · static export"}`));
   if (state.live) parts.push(`<div class="acts"><button id="btn-refresh" title="Re-read the sources (r)">Re-read sources <kbd>r</kbd></button><a href="${BASE}/api/report" target="_blank">Report ↗</a><a href="${BASE}/api/report?redact=1" target="_blank">Redacted report ↗</a></div>`);
   $("provbar").innerHTML = parts.join("");
+  const pk = $("btn-packs");
+  pk.textContent = packsChip(s.packs);
+  pk.classList.toggle("on", s.packs.length > 0);
+  pk.title = s.packs.length ? "Loaded: " + s.packs.map((p) => `${packLabel(p)} (${p.path})`).join("; ") : "No pack is loaded: built-in rules and config files only";
   if ($("btn-refresh")) $("btn-refresh").onclick = refresh;
 }
 function toggleInfo(on) {
@@ -1110,6 +1120,7 @@ function init() {
   $("btn-palette").onclick = openPalette;
   $("btn-help").onclick = () => $("help").classList.add("open");
   $("btn-info").onclick = (e) => { e.stopPropagation(); toggleInfo(); };
+  $("btn-packs").onclick = (e) => { e.stopPropagation(); toggleInfo(); };
   window.addEventListener("resize", syncFilterHeight);
   $("provbar").onclick = (e) => e.stopPropagation();
   document.addEventListener("click", () => toggleInfo(false));

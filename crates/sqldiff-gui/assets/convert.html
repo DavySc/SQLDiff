@@ -181,6 +181,7 @@ body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !importa
   <span class="pick"><select id="from" aria-label="Source dialect"></select><span>→</span><select id="to" aria-label="Target dialect"></select></span>
   <span class="norules conv-only" id="norules"></span>
   <span id="tpl" class="chip conv-only" style="display:none;cursor:default"></span>
+  <span id="packs" class="chip conv-only" style="display:none;cursor:default"></span>
   <span id="verdict" class="verdict"></span>
   <span id="chips" class="conv-only" style="display:flex;gap:4px;flex-wrap:wrap"></span>
   <span id="fcount" class="chip cmp-only" style="cursor:default"></span>
@@ -423,6 +424,15 @@ function render(data, keepSel) {
   $("srcdial").textContent = dialectName(data.from);
   $("outdial").textContent = dialectName(data.to);
   $("norules").textContent = data.rules ? "" : `No ${dialectName(data.from)} → ${dialectName(data.to)} rules yet: every statement stays as a comment`;
+  // Template mode loads config for the syntax: say which packs it loaded
+  // (a private pack by path only).
+  const packs = data.template_packs;
+  $("packs").style.display = packs ? "" : "none";
+  if (packs) {
+    const label = (p) => p.private ? "private pack" : p.name + (p.version ? " " + p.version : "");
+    $("packs").textContent = !packs.length ? "No pack loaded" : (packs.length === 1 ? "Pack: " : "Packs: ") + packs.map(label).join(", ");
+    $("packs").title = packs.length ? "The template syntax comes from:\n" + packs.map((p) => `${label(p)}: ${p.path}`).join("\n") : "No pack is loaded: the template syntax comes from a sqldiff.toml";
+  }
   if (state.mode !== "convert") return;
   $("timing").textContent = `converted and checked in ${data.ms.toFixed(1)} ms`;
   const c = data.conversion;

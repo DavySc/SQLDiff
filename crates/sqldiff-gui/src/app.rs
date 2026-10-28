@@ -49,6 +49,7 @@ use sqldiff_source::Resolved;
 
 use crate::convert;
 use crate::convert_review::{self, Review};
+use crate::packs::LoadedPack;
 use crate::review::Store;
 use crate::runs::{ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
 use crate::server::{
@@ -81,6 +82,9 @@ pub struct App {
     pub data_dir: Option<PathBuf>,
     /// Sessions opened from the app ignore project and user config files.
     pub isolated: bool,
+    /// The packs the app was started with (`--pack`): comparisons opened
+    /// from home load them too.
+    pub packs: Vec<PathBuf>,
 }
 
 /// A view of the app, in rail order.
@@ -117,6 +121,7 @@ struct Shared {
     runs: Runs,
     data_dir: Option<PathBuf>,
     isolated: bool,
+    packs: Vec<PathBuf>,
     /// Bound to a loopback address: only then can files be picked.
     local: bool,
     /// This launch's token, which the settings page sends with its POSTs.
@@ -162,6 +167,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         runs: Runs::with_history(app.data_dir.as_deref()),
         data_dir: app.data_dir,
         isolated: app.isolated,
+        packs: app.packs,
         local,
         token: settings::new_token(),
     });
@@ -459,6 +465,9 @@ struct Home {
     dialects: Vec<(&'static str, &'static str)>,
     /// Why files cannot be picked here, if they cannot.
     no_picking: Option<&'static str>,
+    /// The packs the app was started with, by path: comparisons opened here
+    /// load them.
+    launch_packs: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -476,6 +485,8 @@ struct CompareCard {
     a: String,
     b: String,
     pairs: usize,
+    /// The packs the comparison loaded (a private pack by path only).
+    packs: Vec<LoadedPack>,
 }
 
 #[derive(Serialize)]
@@ -507,6 +518,7 @@ fn home(app: &Shared) -> String {
                 a: a.display().to_string(),
                 b: b.display().to_string(),
                 pairs: s.len(),
+                packs: s.packs(),
             }
         }),
         review: app.review.as_ref().map(|r| {
@@ -525,6 +537,11 @@ fn home(app: &Shared) -> String {
             .map(|d| (d.id(), d.display_name()))
             .collect(),
         no_picking: (!app.local).then_some(NOT_LOCAL),
+        launch_packs: app
+            .packs
+            .iter()
+            .map(|p| browse::absolute(p).display().to_string())
+            .collect(),
     };
     let json = serde_json::to_string(&payload)
         .unwrap()
@@ -557,7 +574,14 @@ fn open_from_home(app: &Shared, o: OpenCompare) -> Result<(), String> {
             .transpose()
     };
     let (da, db) = (dialect(&o.dialect_a)?, dialect(&o.dialect_b)?);
-    let session = open_compare(Path::new(&o.a), Path::new(&o.b), da, db, app.isolated)?;
+    let session = open_compare(
+        Path::new(&o.a),
+        Path::new(&o.b),
+        da,
+        db,
+        &app.packs,
+        app.isolated,
+    )?;
     let (a, b) = match session.origin() {
         Origin::Files { a, b } | Origin::Trees { a, b } => (a.clone(), b.clone()),
     };
@@ -577,13 +601,15 @@ fn open_from_home(app: &Shared, o: OpenCompare) -> Result<(), String> {
 }
 
 /// A compare session on two files or two folders, with the config a command
-/// run in A's folder loads: the project's `sqldiff.toml` there or above, the
-/// user config and the private config beside the app (unless `isolated`).
+/// run in A's folder with `packs` loads: the project's `sqldiff.toml` there
+/// or above, the user config and the private config beside the app (unless
+/// `isolated`), and `packs`.
 pub fn open_compare(
     a: &Path,
     b: &Path,
     dialect_a: Option<Dialect>,
     dialect_b: Option<Dialect>,
+    packs: &[PathBuf],
     isolated: bool,
 ) -> Result<Session, String> {
     let (a, b) = (browse::absolute(a), browse::absolute(b));
@@ -604,7 +630,7 @@ pub fn open_compare(
         user: None,
         isolated,
         cwd: Some(cwd),
-        packs: Vec::new(),
+        packs: packs.to_vec(),
         cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
     })
     .map_err(|e| e.0)?;

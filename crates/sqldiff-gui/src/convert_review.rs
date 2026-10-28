@@ -46,6 +46,7 @@ use sqldiff_convert::review::{self, By, Record, State};
 use sqldiff_convert::tree::{self, Input, Tree, UnitReviewReport};
 use sqldiff_convert::{Status, Unit};
 
+use crate::packs::LoadedPack;
 use crate::server::{
     allowed_hosts, bad, json, not_found, read_request, respond, Request, Response,
 };
@@ -61,6 +62,8 @@ pub struct Setup {
     pub out: PathBuf,
     /// `instance-report.json`, or the directory holding it.
     pub instances: Option<PathBuf>,
+    /// The packs the config of this review loaded, as the page confirms them.
+    pub packs: Vec<LoadedPack>,
 }
 
 /// The tree as last read and converted, with the ledger applied.
@@ -199,6 +202,8 @@ pub struct StateView {
     pub gate: Option<Gate>,
     pub gate_error: Option<String>,
     pub gate_judged: String,
+    /// The packs loaded (a private pack by path only).
+    pub packs: Vec<LoadedPack>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -501,6 +506,7 @@ impl Review {
             gate: gate.as_ref().ok().cloned(),
             gate_error: gate.err(),
             gate_judged: l.judged.clone(),
+            packs: self.setup.packs.clone(),
         }
     }
 

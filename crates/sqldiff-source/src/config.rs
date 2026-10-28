@@ -205,6 +205,8 @@ pub struct Resolved {
     pub data_key: Option<String>,
     /// `[format]` of each layer that was read, in merge order (lowest first).
     pub format_layers: Vec<FormatLayer>,
+    /// The layer of each of `packs`, in the same order.
+    pack_kinds: Vec<LayerKind>,
     compiled: Compiled,
 }
 
@@ -377,10 +379,12 @@ impl Resolved {
             }
         }
         let compiled = compile(&policy)?;
+        let pack_kinds = packs.iter().map(|(k, _)| *k).collect();
         Ok(Resolved {
             layers,
             policy,
             packs: packs.into_iter().map(|(_, p)| p).collect(),
+            pack_kinds,
             data_dir: file.data_dir.unwrap_or_else(default_data_dir),
             source: file.source,
             excerpt_lines: file.excerpt_lines.unwrap_or(3),
@@ -388,6 +392,12 @@ impl Resolved {
             format_layers,
             compiled,
         })
+    }
+
+    /// The loaded packs with their layer: [`LayerKind::SharedPack`] or
+    /// [`LayerKind::PrivatePack`] (configured `private_packs` and `--pack`).
+    pub fn packs_by_kind(&self) -> impl Iterator<Item = (LayerKind, &Pack)> {
+        self.pack_kinds.iter().copied().zip(&self.packs)
     }
 
     /// The `[format]` layers with the project layer's keys replaced by

@@ -57,6 +57,8 @@ input[type=text]:focus, select:focus { outline: none; border-color: var(--focus)
 #cmp-err { color: #d92d20; font-size: 12.5px; flex: 1; overflow-wrap: anywhere; }
 #cmp-err:empty { visibility: hidden; }
 .recent { display: grid; gap: 2px; margin-top: 4px; border-top: 1px solid var(--line); padding-top: 8px; }
+.packs { font-size: 12px; color: var(--muted); }
+.packs:empty { display: none; }
 .recent .lbl { font-size: 11.5px; color: var(--faint); text-transform: uppercase; letter-spacing: .05em; }
 .recent button { text-align: left; font-family: var(--mono); font-size: 12px; font-weight: 400; color: var(--fg); padding: 4px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .recent button span { color: var(--faint); font-family: inherit; }
@@ -78,6 +80,7 @@ input[type=text]:focus, select:focus { outline: none; border-color: var(--focus)
     <div class="side"><b>B</b><input type="text" id="cmp-b" placeholder="New version, or the target dialect" aria-label="Side B: a file or folder" spellcheck="false"><button type="button" class="outline" data-browse="cmp-b" data-near="cmp-a" data-next="cmp-go">Browse…</button><select id="cmp-db" aria-label="Dialect of side B"></select></div>
     <div class="acts"><span id="cmp-err" role="alert"></span><button type="submit" class="primary" id="cmp-go">Compare</button></div>
     <div class="recent" id="recent" hidden></div>
+    <div class="packs" id="cmp-packs"></div>
   </form>
   <div id="more"></div>
 </div></main>
@@ -97,13 +100,16 @@ function closed(title, sub) {
   return `<div class="card closed"><span class="t">${title}</span><span class="s">${sub}</span></div>`;
 }
 
+function packLabel(p) { return p.private ? "private pack" : p.name + (p.version ? " " + p.version : ""); }
+
 function render(d) {
   $("version").textContent = "v" + d.version;
   const c = d.convert, cmp = d.compare, r = d.review;
   const open = [];
   if (cmp) {
     const n = cmp.kind === "folders" ? ` · ${cmp.pairs} pair${cmp.pairs === 1 ? "" : "s"}` : "";
-    open.push(card("/compare", `Compare ${cmp.kind}`, `${path(cmp.a)} with ${path(cmp.b)}${n}`, "Open"));
+    const pk = cmp.packs.length ? ` · pack${cmp.packs.length === 1 ? "" : "s"}: ` + cmp.packs.map((p) => esc(packLabel(p))).join(", ") : " · no pack loaded";
+    open.push(card("/compare", `Compare ${cmp.kind}`, `${path(cmp.a)} with ${path(cmp.b)}${n}${pk}`, "Open"));
   }
   if (r) open.push(card("/review", `Review ${esc(r.from)} → ${esc(r.to)}`, `${path(r.src)} converted into ${path(r.out)}`, "Open"));
   open.push(card("/convert", `Convert ${esc(c.from)} → ${esc(c.to)}`,
@@ -117,6 +123,10 @@ function render(d) {
   }
   const opts = `<option value="">Dialect: auto</option>` + d.dialects.map(([id, name]) => `<option value="${esc(id)}">${esc(name)}</option>`).join("");
   $("cmp-da").innerHTML = opts; $("cmp-db").innerHTML = opts;
+  // Which packs a comparison opened here loads besides its folder's config.
+  $("cmp-packs").innerHTML = d.launch_packs.length
+    ? "Also loads the pack" + (d.launch_packs.length === 1 ? "" : "s") + " the app was started with: " + d.launch_packs.map(path).join(", ")
+    : "";
   const rec = $("recent");
   rec.hidden = !d.recent.length;
   rec.innerHTML = `<span class="lbl">Recent</span>` + d.recent.map((x, i) =>
