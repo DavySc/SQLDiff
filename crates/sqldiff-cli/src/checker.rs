@@ -176,6 +176,7 @@ fn parse(reply: &str, id: u64) -> Result<MirrorAnswer, String> {
         answer,
         scalars: v["scalars"].as_str().map(str::to_string),
         residual,
+        statements: v["statements"].as_str().map(str::to_string),
     })
 }
 
@@ -223,11 +224,12 @@ mod tests {
             Ok(Answer::Unconfirmed { .. })
         ));
         let m = parse(
-            r#"{"id":"3","proof":"confirmed","theorem":"T","scalars":"c2a","residual":["ASM-X"]}"#,
+            r#"{"id":"3","proof":"confirmed","theorem":"T","scalars":"c2a","residual":["ASM-X"],"statements":"c3a"}"#,
             3,
         )
         .unwrap();
         assert_eq!(m.scalars.as_deref(), Some("c2a"));
+        assert_eq!(m.statements.as_deref(), Some("c3a"));
         assert_eq!(m.residual, ["ASM-X"]);
         for bad in [
             r#"{"id":"4","proof":"confirmed","theorem":"T"}"#,

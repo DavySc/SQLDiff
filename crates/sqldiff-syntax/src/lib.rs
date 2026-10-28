@@ -14,6 +14,7 @@ pub mod encode;
 pub mod kind;
 pub mod lexer;
 mod parser;
+pub mod plain_table;
 pub mod print;
 pub mod routine;
 pub mod template;

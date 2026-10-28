@@ -634,7 +634,7 @@ id = "ASM-OBSERVER-ROWCOUNT"
 statement = "The caller does not read rows-affected counts."
 discharge = "deployment"
 fact = "The callers' drivers ignore rows-affected counts (decision 1, observer profile)."
-sites = ["sqldiff-core/src/observer.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/src/observer.rs"]
 
 [[assumption]]
 id = "ASM-ORDER-TOTAL"
@@ -974,6 +974,20 @@ statement = "T-SQL columns declared without NULL or NOT NULL are nullable (ANSI_
 discharge = "catalog"
 fact = "The columns' nullability in the T-SQL catalog."
 sites = ["sqldiff-core/src/equiv/table.rs"]
+
+[[assumption]]
+id = "ASM-STATE-AFTER-ERROR"
+statement = "After a converted routine fails, callers do not rely on which of its earlier writes remain: T-SQL keeps the statements before the error (and a callee's writes), PostgreSQL rolls back the whole failed CALL."
+discharge = "deployment"
+fact = "How callers handle a failed call: they roll back their transaction, or do not read the data the routine wrote."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-TABLES-AS-DECLARED"
+statement = "The tables a converted routine writes are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree."
+discharge = "catalog"
+fact = "Both databases' catalogs: the tables' definitions match the tree's CREATE TABLE statements."
+sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ARITH-ERRORS"

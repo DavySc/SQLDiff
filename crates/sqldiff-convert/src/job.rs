@@ -206,6 +206,13 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
         None
     } else {
         let checker = job.proof.checker.as_deref();
+        // Tables are read from the whole tree, source and output as written.
+        let tables = crate::cert::Tables::read(
+            &inputs.iter().map(|i| i.text.as_str()).collect::<Vec<_>>(),
+            &t.outputs.iter().map(String::as_str).collect::<Vec<_>>(),
+            job.tree.from,
+            job.tree.to,
+        );
         let mut files = Vec::new();
         for (k, f) in t.report.files.iter().enumerate() {
             let (Some(input), Some(output)) =
@@ -219,6 +226,7 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
                 output,
                 job.tree.from,
                 job.tree.to,
+                &tables,
                 job.row_counts,
                 checker,
             );

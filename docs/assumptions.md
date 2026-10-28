@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 48 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 49 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 70 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 71 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
-| | Total | 162 |
+| | Total | 164 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -124,7 +124,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-NO-NESTED-TRAN` | Callers do not nest transactions (a second BEGIN only warns in PostgreSQL, where T-SQL counts it). | `deployment` | How callers use transactions. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-NO-TRIGGERS` | No triggers on the written tables change the error or transaction outcome. | `catalog` | The triggers on the written tables in the catalog. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-NOLOCK` | Results read without NOLOCK are the same: no other transaction writes while the query runs (concurrency is not observed). | `deployment` | Callers do not depend on reading uncommitted rows. | `sqldiff-convert/src/tsql.rs` |
-| `ASM-OBSERVER-ROWCOUNT` | The caller does not read rows-affected counts. | `deployment` | The callers' drivers ignore rows-affected counts (decision 1, observer profile). | `sqldiff-core/src/observer.rs` |
+| `ASM-OBSERVER-ROWCOUNT` | The caller does not read rows-affected counts. | `deployment` | The callers' drivers ignore rows-affected counts (decision 1, observer profile). | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/observer.rs` |
 | `ASM-ORDER-TOTAL` | The ORDER BY keys are unique, so both sides return the same rows in the same order. | `catalog` | A unique key over the ORDER BY columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OWNER-PRIVILEGES` | The routine owner holds every privilege its statements need on both sides. | `deployment` | The owner's grants on the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PARAM-NAMES` | The called procedure was converted with the same parameter names. | `generated` | The callee converted in the same tree. | `sqldiff-convert/src/tsql.rs` |
@@ -149,7 +149,9 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-SEQUENCE-TYPE` | Expressions that use a sequence's next value do not depend on its data type beyond the values it hands out. | `deployment` | How callers use the sequence's values. | `sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-SINGLE-ROW` | The query returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SMALLDATETIME` | Values written to a converted SMALLDATETIME are whole minutes (T-SQL rounds, TIMESTAMP(0) keeps seconds). | `generated` | A rounding in the converted writes, or callers that write whole minutes. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-STATE-AFTER-ERROR` | After a converted routine fails, callers do not rely on which of its earlier writes remain: T-SQL keeps the statements before the error (and a callee's writes), PostgreSQL rolls back the whole failed CALL. | `deployment` | How callers handle a failed call: they roll back their transaction, or do not read the data the routine wrote. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TABLE-VARIABLE` | A table variable converted to a job-scoped temporary table is not read after the batch that filled it. | `deployment` | How the job runs the code. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-TABLES-AS-DECLARED` | The tables a converted routine writes are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree. | `catalog` | Both databases' catalogs: the tables' definitions match the tree's CREATE TABLE statements. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TEMP-TABLE` | A #temp table converted to a session- or job-scoped temporary table is not created twice in one session. | `deployment` | How sessions run the code. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TEMPLATE-DIRECTIVE` | A template unit holds when its woven output holds (generator directives were converted as comments). | `generated` | The woven instances checked (`sqldiff instances`). | `sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/template.rs`<br>`sqldiff-convert/src/tree.rs` |
 | `ASM-TEMPLATE-FRAGMENT` | A template fragment means the same in the routine it is woven into. | `generated` | The woven instances checked. | `sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/template.rs` |

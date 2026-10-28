@@ -14,10 +14,10 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
-use sqldiff_core::proof::{self, Checker, MirrorRequest};
-use sqldiff_syntax::abstract_syntax::Stmt;
+use sqldiff_core::proof::{self, Checker, MirrorColumn, MirrorRequest, MirrorTable};
+use sqldiff_syntax::abstract_syntax::{tokens, Stmt, K};
 use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
-use sqldiff_syntax::{encode, parse, Dialect, SyntaxKind};
+use sqldiff_syntax::{encode, parse, plain_table, Dialect, SyntaxKind, SyntaxNode};
 
 /// Where a certificate stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,6 +52,10 @@ pub struct Certificate {
     /// expression has its meaning in the spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scalars: Option<String>,
+    /// The checker's statement slice for a confirmation: `c3a` when the
+    /// routine's data statements were in it, `c1` when it had none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statements: Option<String>,
     /// The routine's byte range in the source.
     #[serde(skip)]
     pub span: (usize, usize),
@@ -88,8 +92,14 @@ pub const C1_NO_ERRORS: &str = "ASM-C1-NO-ERRORS";
 /// The assumptions the C2a slice may still rest on, as the checker names
 /// them (`formal/lean/Sqldiff/Mirror/Lower.lean`): T-SQL raises on integer
 /// overflow and division by zero (ANSI_WARNINGS and ARITHABORT not both
-/// OFF), and compares with NULL as UNKNOWN (ANSI_NULLS ON).
-pub const C2A_RESIDUALS: [&str; 2] = ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS"];
+/// OFF), and compares with NULL as UNKNOWN (ANSI_NULLS ON); and what the
+/// caller sees of the database after an error is not compared (T-SQL keeps
+/// earlier writes that PostgreSQL rolls back with the failed `CALL`).
+pub const C2A_RESIDUALS: [&str; 3] = [
+    "ASM-TSQL-ARITH-ERRORS",
+    "ASM-TSQL-ANSI-NULLS",
+    "ASM-STATE-AFTER-ERROR",
+];
 
 /// A T-SQL procedure that returns NULL returns 0 with a warning message;
 /// the converted procedure returns 0 without it.
@@ -164,6 +174,187 @@ fn callees(nodes: &[Node], out: &mut Vec<Vec<String>>) {
             Node::While { body, .. } => callees(body, out),
             _ => {}
         }
+    }
+}
+
+/// The tables a routine's data statements write, as written.
+fn written_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
+    for n in nodes {
+        match n {
+            Node::Stmt(
+                Stmt::Insert { target, .. }
+                | Stmt::Update { target, .. }
+                | Stmt::Delete { target, .. },
+            ) => {
+                if !out.contains(target) {
+                    out.push(target.clone());
+                }
+            }
+            Node::Block(b) => written_tables(&b.body, out),
+            Node::If { then, els, .. } => {
+                written_tables(then, out);
+                written_tables(els, out);
+            }
+            Node::While { body, .. } => written_tables(body, out),
+            _ => {}
+        }
+    }
+}
+
+/// The tables a converted routine's tables are taken to be: in both
+/// databases exactly as the tree's DDL declares them
+/// (`ASM-TABLES-AS-DECLARED`).
+pub const TABLES_AS_DECLARED: &str = "ASM-TABLES-AS-DECLARED";
+
+/// The tables of a converted tree that the C3a slice may take as given
+/// (`proof::MirrorTable`), by target name. A table is here only when the
+/// source and the output tree each define it exactly once with a plain
+/// `CREATE TABLE` (`plain_table`), the two definitions pair column by
+/// column under the converter's naming (the T-SQL name folded as
+/// PostgreSQL folds it), and nothing else in either tree names it outside
+/// a procedure or function body (an index, trigger, rule, policy,
+/// `ALTER TABLE`, a table that inherits from it, a view), nor does any
+/// DDL statement inside one. Anything the DDL reader cannot show as plain
+/// leaves the table out, so its data statements stay unconfirmed.
+#[derive(Debug, Clone, Default)]
+pub struct Tables {
+    by_target: Vec<MirrorTable>,
+}
+
+/// Words of a node as names compare: lower case, quotes removed.
+fn words(n: &SyntaxNode, d: Dialect, out: &mut Vec<String>) {
+    for t in tokens(n) {
+        let w = match t.kind {
+            K::Word => t.text.to_lowercase(),
+            K::Quoted => sqldiff_syntax::abstract_syntax::quoted_name(&t.text, d)
+                .trim_start_matches('"')
+                .to_lowercase(),
+            _ => continue,
+        };
+        out.push(w);
+    }
+}
+
+fn is_ddl(n: &SyntaxNode) -> bool {
+    tokens(n).first().is_some_and(|t| {
+        matches!(
+            t.up.as_str(),
+            "CREATE" | "ALTER" | "DROP" | "ENABLE" | "DISABLE" | "EXEC" | "EXECUTE"
+        )
+    })
+}
+
+/// Plain table definitions of a tree, and every word named elsewhere.
+fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec<String>) {
+    let (mut defs, mut named) = (Vec::new(), Vec::new());
+    for text in texts {
+        let root = parse(text, d).syntax();
+        let mut it = root.preorder();
+        while let Some(ev) = it.next() {
+            let rowan::WalkEvent::Enter(n) = ev else {
+                continue;
+            };
+            match n.kind() {
+                SyntaxKind::ROUTINE => {
+                    let kind = tokens(&n)
+                        .iter()
+                        .take(4)
+                        .find(|t| !matches!(t.up.as_str(), "CREATE" | "OR" | "ALTER" | "REPLACE"))
+                        .map(|t| t.up.clone());
+                    if matches!(kind.as_deref(), Some("PROCEDURE" | "PROC" | "FUNCTION")) {
+                        // The body names its tables; only DDL in it counts.
+                        for s in n
+                            .descendants()
+                            .filter(|s| s.kind() == SyntaxKind::STATEMENT)
+                        {
+                            if is_ddl(&s) {
+                                words(&s, d, &mut named);
+                            }
+                        }
+                    } else {
+                        words(&n, d, &mut named);
+                    }
+                    it.skip_subtree();
+                }
+                SyntaxKind::STATEMENT => {
+                    match plain_table::read(&n, d) {
+                        Ok(t) => defs.push(t),
+                        Err(_) => words(&n, d, &mut named),
+                    }
+                    it.skip_subtree();
+                }
+                _ => {}
+            }
+        }
+    }
+    (defs, named)
+}
+
+impl Tables {
+    /// The plain tables of a T-SQL tree converted to PostgreSQL; none for
+    /// any other pair of dialects.
+    pub fn read(inputs: &[&str], outputs: &[&str], from: Dialect, to: Dialect) -> Tables {
+        if (from, to) != (Dialect::Tsql, Dialect::Postgres) {
+            return Tables::default();
+        }
+        let (src, src_named) = definitions(inputs, from);
+        let (out, out_named) = definitions(outputs, to);
+        let pg = |parts: &[String]| {
+            parts
+                .iter()
+                .map(|p| pg_name(p))
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let mut by_target = Vec::new();
+        for a in &src {
+            let key = target_routine(&a.name).0;
+            let last = key
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches('"')
+                .to_lowercase();
+            let once = src
+                .iter()
+                .filter(|x| target_routine(&x.name).0 == key)
+                .count()
+                == 1;
+            let bs: Vec<_> = out.iter().filter(|x| pg(&x.name) == key).collect();
+            let [b] = bs.as_slice() else { continue };
+            if !once
+                || src_named.contains(&last)
+                || out_named.contains(&last)
+                || a.cols.len() != b.cols.len()
+            {
+                continue;
+            }
+            let cols: Option<Vec<MirrorColumn>> = a
+                .cols
+                .iter()
+                .zip(&b.cols)
+                .map(|(x, y)| {
+                    (x.name.is_ascii()
+                        && pg_name(&x.name) == pg_name(&y.name)
+                        && x.not_null == y.not_null
+                        && x.key == y.key)
+                        .then(|| MirrorColumn {
+                            name: pg_name(&y.name),
+                            tsql: x.name.clone(),
+                            not_null: y.not_null,
+                            key: y.key,
+                        })
+                })
+                .collect();
+            if let Some(cols) = cols {
+                by_target.push(MirrorTable { name: key, cols });
+            }
+        }
+        Tables { by_target }
+    }
+
+    pub fn get(&self, target: &str) -> Option<&MirrorTable> {
+        self.by_target.iter().find(|t| t.name == target)
     }
 }
 
@@ -253,6 +444,7 @@ pub fn mirror_request(
     a: &Routine,
     b: &Routine,
     output_routines: &[Routine],
+    tables: &Tables,
     row_counts: bool,
 ) -> Result<(MirrorRequest, Vec<String>), String> {
     let renaming = propose_renaming(a, b)?;
@@ -276,6 +468,26 @@ pub fn mirror_request(
             routines.push(pair);
         }
     }
+    let mut written = Vec::new();
+    written_tables(&a.body.body, &mut written);
+    let (mut table_pairs, mut table_catalog) = (Vec::new(), Vec::<MirrorTable>::new());
+    for w in &written {
+        let (to, dbo) = target_routine(w);
+        let Some(t) = tables.get(&to) else { continue };
+        if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
+            assumptions.push("ASM-DBO-SCHEMA".to_string());
+        }
+        table_pairs.push((w.join("."), to));
+        if !table_catalog.contains(t) {
+            table_catalog.push(t.clone());
+        }
+    }
+    if !table_catalog.is_empty() {
+        assumptions.push(TABLES_AS_DECLARED.to_string());
+    }
+    if !written.is_empty() && !row_counts {
+        assumptions.push("ASM-OBSERVER-ROWCOUNT".to_string());
+    }
     let catalog = output_routines
         .iter()
         .map(|r| {
@@ -293,6 +505,8 @@ pub fn mirror_request(
             row_counts,
             routines,
             catalog,
+            tables: table_pairs,
+            table_catalog,
             renaming,
             source: encode::routine(a),
             target: encode::routine(b),
@@ -308,6 +522,7 @@ pub fn certify(
     output: &str,
     from: Dialect,
     to: Dialect,
+    tables: &Tables,
     row_counts: bool,
     checker: Option<&dyn Checker>,
 ) -> Vec<Certificate> {
@@ -319,6 +534,7 @@ pub fn certify(
         let mut c = Certificate {
             routine: name,
             scalars: None,
+            statements: None,
             span,
             from: from.id().to_string(),
             to: to.id().to_string(),
@@ -344,7 +560,7 @@ pub fn certify(
             (Ok(a), Some(Ok(b))) => {
                 c.source = Some(sha(&encode::routine(&a)));
                 c.target = Some(sha(&encode::routine(&b)));
-                match mirror_request(&a, &b, &readable, row_counts) {
+                match mirror_request(&a, &b, &readable, tables, row_counts) {
                     Err(e) => Answer::Unconfirmed {
                         reason: format!("no renaming pairs the two routines: {e}"),
                     },
@@ -359,6 +575,7 @@ pub fn certify(
                                 match m.answer {
                                     proof::Answer::Confirmed { theorem } => {
                                         c.scalars = m.scalars.clone();
+                                        c.statements = m.statements.clone();
                                         c.assumptions = confirmed_rests_on(
                                             m.scalars.as_deref(),
                                             &m.residual,
@@ -449,7 +666,15 @@ END
     fn a_converted_procedure_gets_a_certificate_with_its_renaming() {
         let d = crate::rewrite(TSQL, Dialect::Tsql, Dialect::Postgres);
         let out = d.output().to_string();
-        let certs = certify(TSQL, &out, Dialect::Tsql, Dialect::Postgres, false, None);
+        let certs = certify(
+            TSQL,
+            &out,
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Tables::default(),
+            false,
+            None,
+        );
         assert_eq!(certs.len(), 1, "{out}");
         let c = &certs[0];
         assert!(c.source.is_some() && c.target.is_some(), "{c:?}\n{out}");
@@ -475,6 +700,7 @@ END
             d.output(),
             Dialect::Tsql,
             Dialect::Postgres,
+            &Tables::default(),
             false,
             None,
         );
@@ -497,6 +723,7 @@ END
             a[1].2.as_ref().unwrap(),
             b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
             &readable,
+            &Tables::default(),
             false,
         )
         .unwrap();
@@ -510,5 +737,61 @@ END
         let line = req.line(9).unwrap();
         assert!(line.starts_with("sqldiff-check/3\t9\t"), "{line}");
         assert_eq!(line.split('\t').count(), 10, "{line}");
+    }
+
+    #[test]
+    fn only_plain_tables_named_nowhere_else_reach_the_checker() {
+        let ddl = "CREATE TABLE dbo.Acct (Id int NOT NULL, Qty int NULL, \
+                   CONSTRAINT PK_Acct PRIMARY KEY (Id));\n";
+        let proc = "CREATE PROCEDURE dbo.p @id int AS\nBEGIN\n  \
+                    UPDATE dbo.Acct SET Qty = 1 WHERE Id = @id;\nEND\n";
+        let tables = |extra: &str| {
+            let src = format!("{ddl}{extra}");
+            let out = crate::rewrite(&src, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string();
+            let p = crate::rewrite(proc, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string();
+            Tables::read(&[&src, proc], &[&out, &p], Dialect::Tsql, Dialect::Postgres)
+        };
+        let t = tables("");
+        let acct = t.get("acct").expect("a plain table");
+        let cols: Vec<(&str, &str, bool, bool)> = acct
+            .cols
+            .iter()
+            .map(|c| (c.name.as_str(), c.tsql.as_str(), c.not_null, c.key))
+            .collect();
+        assert_eq!(
+            cols,
+            [("id", "Id", true, true), ("qty", "Qty", false, false)]
+        );
+        // The routine's request names the table it writes, as written.
+        let a = routines(proc, Dialect::Tsql).remove(0).2.unwrap();
+        let p = crate::rewrite(proc, Dialect::Tsql, Dialect::Postgres)
+            .output()
+            .to_string();
+        let b = routines(&p, Dialect::Postgres).remove(0).2.unwrap();
+        let (req, asm) = mirror_request(&a, &b, &[], &t, false).unwrap();
+        assert_eq!(req.tables, [("dbo.Acct".to_string(), "acct".to_string())]);
+        assert_eq!(req.table_catalog, std::slice::from_ref(acct));
+        for x in [
+            TABLES_AS_DECLARED,
+            "ASM-DBO-SCHEMA",
+            "ASM-OBSERVER-ROWCOUNT",
+        ] {
+            assert!(asm.iter().any(|y| y == x), "{x}: {asm:?}");
+        }
+        // Anything else that names the table keeps it out.
+        for extra in [
+            "CREATE INDEX ix ON dbo.Acct (Qty);\n",
+            "GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n",
+            "ALTER TABLE dbo.Acct ADD CONSTRAINT ck CHECK (Qty > 0);\n",
+            "CREATE TABLE dbo.Line (Id int NOT NULL REFERENCES dbo.Acct (Id));\n",
+            "CREATE TABLE dbo.Acct (Id int NOT NULL PRIMARY KEY);\n",
+            "GO\nCREATE PROCEDURE dbo.q AS BEGIN ALTER TABLE dbo.Acct ADD z int NULL; END\n",
+        ] {
+            assert!(tables(extra).get("acct").is_none(), "{extra}");
+        }
     }
 }

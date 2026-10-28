@@ -364,3 +364,73 @@ fn the_real_checker_lets_the_release_gate_pass_in_the_c2a_slice() {
     assert_eq!(o.status.code(), Some(1), "{stdout}");
     assert!(stdout.contains("rests on ASM-RETURN-CODE"), "{stdout}");
 }
+
+/// C3a end to end: a procedure that writes a plain table (declared in the
+/// tree, nothing else on it) is confirmed with its data statements in the
+/// slice; once a trigger is declared on the table it is not.
+#[test]
+fn the_real_checker_confirms_data_statements_on_a_plain_table() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c3a-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let ddl = "CREATE TABLE dbo.Acct (Id int NOT NULL, Qty int NULL, Total int NOT NULL, CONSTRAINT PK_Acct PRIMARY KEY (Id));\n";
+    write(&src, "acct.sql", ddl);
+    write(&src, "p.sql", "CREATE PROCEDURE dbo.post @id int, @n int\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  IF @n > 0\n    INSERT INTO dbo.Acct (Id, Qty, Total) VALUES (@id, @n, 0);\n  UPDATE dbo.Acct SET Qty = Qty + 1 WHERE Id = @id;\n  DELETE FROM dbo.Acct WHERE Total < 0;\nEND\n");
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.post")
+            .unwrap()
+    };
+    let r = run();
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["statements"], "c3a", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    // The UPDATE can overflow after the INSERT wrote.
+    for a in [
+        "ASM-STATE-AFTER-ERROR",
+        "ASM-TABLES-AS-DECLARED",
+        "ASM-OBSERVER-ROWCOUNT",
+    ] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    write(
+        &src,
+        "acct.sql",
+        &format!(
+            "{ddl}GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n"
+        ),
+    );
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+}

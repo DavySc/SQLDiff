@@ -204,12 +204,14 @@ pub trait Checker: Send + Sync + std::fmt::Debug {
 /// every expression was in the C2a scalar slice (`scalars` is `c2a`: the
 /// operators have their meaning, and `residual` lists what the slice still
 /// assumes) or not (`uninterpreted`: operators are taken to mean the same
-/// in both dialects).
+/// in both dialects); and whether data statements were in the C3a slice
+/// (`statements` is `c3a`) or the routine had none in its spec (`c1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorAnswer {
     pub answer: Answer,
     pub scalars: Option<String>,
     pub residual: Vec<String>,
+    pub statements: Option<String>,
 }
 
 impl From<Answer> for MirrorAnswer {
@@ -218,6 +220,7 @@ impl From<Answer> for MirrorAnswer {
             answer,
             scalars: None,
             residual: Vec::new(),
+            statements: None,
         }
     }
 }
@@ -239,11 +242,43 @@ pub struct MirrorRequest {
     /// Target routines (folded names) and their parameter modes, one of
     /// `i`, `o`, `b` (IN, OUT, INOUT) per parameter.
     pub catalog: Vec<(String, String)>,
+    /// T-SQL table names (`.`-joined, as written) and the target table
+    /// each one is (trusted: the deployment's schema mapping, C3a).
+    pub tables: Vec<(String, String)>,
+    /// Target tables (trusted): sent only when both catalogs show every
+    /// fact a [`MirrorTable`] asserts.
+    pub table_catalog: Vec<MirrorTable>,
     /// Source variable (with `@`) to target name; the T-SQL return status
     /// is `%status`.
     pub renaming: Vec<(String, String)>,
     pub source: String,
     pub target: String,
+}
+
+/// A table of the target catalog for the C3a slice
+/// (`Sqldiff.Mirror.CatTable`). Sending one asserts that both databases
+/// have it with these `int` columns, nullability and primary key, and
+/// nothing else that changes a write: no other constraint, default,
+/// identity, sequence, computed column, trigger, rule or row-level
+/// security; a key neither deferrable nor `IGNORE_DUP_KEY`; no inheritance
+/// children; not a temporary table or table variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorTable {
+    /// Folded, `.`-joined as the PL/pgSQL code names it.
+    pub name: String,
+    /// In declaration order.
+    pub cols: Vec<MirrorColumn>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorColumn {
+    /// The target column (folded).
+    pub name: String,
+    /// Its spelling in the T-SQL table.
+    pub tsql: String,
+    pub not_null: bool,
+    /// A column of the primary key.
+    pub key: bool,
 }
 
 fn hex(s: &str) -> String {
@@ -277,11 +312,32 @@ impl MirrorRequest {
             dep.push(',');
             dep.push_str(&pairs(&self.routines));
         }
+        if !self.tables.is_empty() {
+            dep.push(';');
+            dep.push_str(&pairs(&self.tables));
+        }
         let or_dash = |s: String| if s.is_empty() { "-".to_string() } else { s };
+        let tables = self.table_catalog.iter().map(|t| {
+            let cols = t
+                .cols
+                .iter()
+                .map(|c| {
+                    let spec = match (c.key, c.not_null) {
+                        (true, _) => "ink",
+                        (false, true) => "in",
+                        (false, false) => "i",
+                    };
+                    format!("{}.{spec}.{}", hex(&c.name), hex(&c.tsql))
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{}={cols}", hex(&t.name))
+        });
         let catalog = self
             .catalog
             .iter()
             .map(|(n, m)| format!("{}:{m}", hex(n)))
+            .chain(tables)
             .collect::<Vec<_>>()
             .join(",");
         Some(format!(
@@ -629,5 +685,41 @@ mod tests {
             ..r
         };
         assert!(bad.line(1).is_none());
+    }
+
+    #[test]
+    fn a_mirror_request_encodes_tables_as_the_checker_reads_them() {
+        // The encoding of formal/lean/Sqldiff/Mirror/Request.lean, with its
+        // examples: `dbo.Acct` maps to `acct`, columns id (key), qty, total.
+        let col = |name: &str, tsql: &str, not_null, key| MirrorColumn {
+            name: name.into(),
+            tsql: tsql.into(),
+            not_null,
+            key,
+        };
+        let r = MirrorRequest {
+            row_counts: false,
+            routines: Vec::new(),
+            catalog: vec![("p".into(), "ib".into())],
+            tables: vec![("dbo.Acct".into(), "acct".into())],
+            table_catalog: vec![MirrorTable {
+                name: "acct".into(),
+                cols: vec![
+                    col("id", "Id", true, true),
+                    col("qty", "Qty", false, false),
+                    col("total", "Total", true, false),
+                ],
+            }],
+            renaming: Vec::new(),
+            source: "(R)".into(),
+            target: "(R)".into(),
+        };
+        let l = r.line(1).unwrap();
+        let f: Vec<&str> = l.split('\t').collect();
+        assert_eq!(f[4], "0;64626f2e41636374:61636374");
+        assert_eq!(
+            f[5],
+            "70:ib,61636374=6964.ink.4964/717479.i.517479/746f74616c.in.546f74616c"
+        );
     }
 }
