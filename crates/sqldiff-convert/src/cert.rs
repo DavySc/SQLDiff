@@ -109,7 +109,7 @@ pub const C2A_RESIDUALS: [&str; 10] = [
     "ASM-CONCAT-NULL",
     BINARY_COLLATION,
     "ASM-TSQL-LEN-BMP",
-    "ASM-TSQL-STRING-ARGS",
+    STRING_ARGS,
     // C4: only errors the core models reach a handler, no caller
     // transaction around a handled error or transaction control, and
     // callers ignore the number of an error the routine raises.
@@ -158,6 +158,9 @@ pub struct Trusted {
 /// as its own conversion: it holds when the callee's conversion is
 /// confirmed too (the release gate checks this in the same run).
 pub const CALLEE_CONFIRMED: &str = "ASM-CALLEE-CONFIRMED";
+
+/// String arguments fit their T-SQL parameters (see `C2A_RESIDUALS`).
+pub const STRING_ARGS: &str = "ASM-TSQL-STRING-ARGS";
 
 /// A double-quoted T-SQL identifier is a name only under
 /// `QUOTED_IDENTIFIER ON` (the setting stored with the routine when it was
@@ -651,6 +654,15 @@ pub fn mirror_request(
     }
     if begins_tran_outside_try(&a.body.body) {
         assumptions.push(DOOMED_TXN.to_string());
+    }
+    // T-SQL truncates a string argument to its parameter's length and
+    // PostgreSQL does not; the C2a residual names it, a C1 answer does not.
+    let stringy = |t: &str| {
+        let t = t.to_ascii_lowercase();
+        t.contains("char") || t == "sysname" || t.contains("text")
+    };
+    if a.params.iter().any(|p| stringy(&p.ty.name)) {
+        assumptions.push(STRING_ARGS.to_string());
     }
     // Answers on the C1 theorem carry no residual: the record keeps the
     // fact visible whatever the answer.
