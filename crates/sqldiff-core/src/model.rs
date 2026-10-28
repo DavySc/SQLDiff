@@ -256,6 +256,14 @@ pub struct Report {
     /// then the verdict over the open findings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_before_suppression: Option<Verdict>,
+    /// Why B only refines A, the reference: steps that hold one way
+    /// (decision 1). Empty when the two are equivalent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<String>,
+    /// For an "equal" or "equal under assumptions" verdict: whether A also
+    /// refines B. Derived by [`Report::settle`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivalent: Option<bool>,
     /// What the proof gate found (decision 3); absent when it is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proof: Option<crate::proof::Proof>,
@@ -320,12 +328,17 @@ impl Report {
     pub fn settle(&mut self) {
         if self.suppressed.is_empty() {
             self.verdict = crate::session::derive_verdict(self);
-            return;
+        } else {
+            if self.verdict_before_suppression.is_none() {
+                self.verdict_before_suppression = Some(self.verdict);
+            }
+            self.verdict = self.open_verdict();
         }
-        if self.verdict_before_suppression.is_none() {
-            self.verdict_before_suppression = Some(self.verdict);
-        }
-        self.verdict = self.open_verdict();
+        self.equivalent = matches!(
+            self.verdict,
+            Verdict::Equal | Verdict::EqualUnderAssumptions
+        )
+        .then(|| self.refinements.is_empty());
     }
 
     pub fn highest_class(&self) -> Option<ChangeClass> {

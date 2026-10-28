@@ -216,6 +216,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             assumptions.push(x);
         }
     }
+    let refinements = std::mem::take(&mut eq.refinements);
 
     let bound_a = bind::bind(
         &aa,
@@ -281,6 +282,8 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
+        refinements,
+        equivalent: None,
         proof: None,
         verdict_before_proof: None,
         diagnostics,
@@ -357,6 +360,8 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
+        refinements: Vec::new(),
+        equivalent: None,
         proof: None,
         verdict_before_proof: None,
         diagnostics,

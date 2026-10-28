@@ -146,6 +146,13 @@ pub fn text(report: &Report, show_assumption_details: bool) -> String {
         let _ = writeln!(out);
         let _ = writeln!(out, "Normalizations: {}", report.normalizations.join("; "));
     }
+    if report.equivalent == Some(false) {
+        let _ = writeln!(
+            out,
+            "Equivalent: no, B only refines A (the reference): {}",
+            report.refinements.join("; ")
+        );
+    }
     if !report.unknown_reasons.is_empty() {
         let _ = writeln!(out);
         for r in &report.unknown_reasons {

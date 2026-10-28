@@ -48,6 +48,8 @@ pub struct Outcome {
     pub structural: usize,
     /// Statement pairs proven equal.
     pub equal: usize,
+    /// Why B only refines A (`compare::Cmp::refinements`).
+    pub refinements: Vec<String>,
 }
 
 impl Outcome {
@@ -60,6 +62,12 @@ impl Outcome {
     fn normalize(&mut self, s: String) {
         if !self.normalizations.contains(&s) {
             self.normalizations.push(s);
+        }
+    }
+
+    fn refine(&mut self, s: String) {
+        if !self.refinements.contains(&s) {
+            self.refinements.push(s);
         }
     }
 }
@@ -1968,6 +1976,9 @@ fn compare_pair(
     let ids: Vec<String> = asms.iter().map(|s| s.id.clone()).collect();
     if c.mismatches.is_empty() {
         out.equal += 1;
+        for r in c.refinements {
+            out.refine(r);
+        }
         if x.term.is("raw") {
             // Same dialect, same tokens.
         } else {
@@ -2162,6 +2173,9 @@ pub fn refine_modified(
             }
             for nrm in sub.normalizations {
                 out.normalize(nrm);
+            }
+            for r in sub.refinements {
+                out.refine(r);
             }
         } else if sub.findings.iter().any(|g| g.verdict == Verdict::Different) {
             for s in sub.assumptions {

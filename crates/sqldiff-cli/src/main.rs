@@ -54,8 +54,15 @@ enum Command {
     ///
     /// Without a dialect flag, a side's dialect comes from `dialect_map` or
     /// the path convention (`tsql/x.sql`, `x.pg.sql`).
+    ///
+    /// A is the reference (the original, the old version): "equal" means
+    /// every outcome B can have, A can have too. B may be more deterministic
+    /// (an added ORDER BY), so swapping the sides can change the verdict;
+    /// the report says whether the two are also equivalent.
     Diff {
+        /// The reference side.
         a: PathBuf,
+        /// The side checked against it.
         b: PathBuf,
         /// Dialect of both sides (overridden by --dialect-a / --dialect-b).
         #[arg(short, long)]
