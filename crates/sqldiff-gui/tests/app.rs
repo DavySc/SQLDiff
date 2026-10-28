@@ -1040,8 +1040,8 @@ fn a_cancelled_branch_review_writes_nothing() {
 
 /// A process started while a connection is open (a branch review runs `git`)
 /// must not hold that connection: the response arrives when it is written,
-/// not when the process exits, and is not reset when it does (Windows,
-/// where an accepted socket is inheritable unless the server says not).
+/// not when the process exits, and is not reset when it does (Windows, where
+/// a socket from `try_clone` is inheritable).
 #[cfg(windows)]
 #[test]
 fn a_process_started_meanwhile_does_not_hold_the_connection() {

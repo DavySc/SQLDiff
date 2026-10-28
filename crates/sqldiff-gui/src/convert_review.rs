@@ -47,7 +47,7 @@ use sqldiff_convert::tree::{self, Input, Tree, UnitReviewReport};
 use sqldiff_convert::{Status, Unit};
 
 use crate::server::{
-    allowed_hosts, bad, json, no_inherit, not_found, read_request, respond, Request, Response,
+    allowed_hosts, bad, json, not_found, read_request, respond, Request, Response,
 };
 
 /// The review page; the payload is injected at `/*__SQLDIFF_PAYLOAD__*/null`
@@ -1014,7 +1014,6 @@ pub fn serve(listener: TcpListener, review: Review, extra_hosts: &[String]) -> s
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        no_inherit(&stream);
         let review = Arc::clone(&review);
         let hosts = Arc::clone(&hosts);
         std::thread::Builder::new()

@@ -76,7 +76,6 @@ pub fn serve_with_hosts(
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra)?);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        no_inherit(&stream);
         let session = Arc::clone(&session);
         let hosts = Arc::clone(&hosts);
         std::thread::Builder::new()
@@ -86,30 +85,6 @@ pub fn serve_with_hosts(
             })?;
     }
     Ok(())
-}
-
-/// Keeps an accepted connection out of the processes started while it is
-/// open. On Windows `accept` returns an inheritable socket and std leaves it
-/// so; a child started meanwhile (a branch review runs `git`) then holds the
-/// connection after the response is written, and resets it when it exits,
-/// so the browser gets an error instead of the response. Elsewhere std
-/// already accepts with close-on-exec. A child started between `accept` and
-/// this call can still inherit the socket; nothing in std closes that window.
-pub(crate) fn no_inherit(stream: &TcpStream) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn SetHandleInformation(handle: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
-        }
-        const HANDLE_FLAG_INHERIT: u32 = 1;
-        // SAFETY: the socket is open for the whole call, and only its
-        // inherit flag changes. A failure leaves it as accepted.
-        unsafe { SetHandleInformation(stream.as_raw_socket() as _, HANDLE_FLAG_INHERIT, 0) };
-    }
-    #[cfg(not(windows))]
-    let _ = stream;
 }
 
 pub(crate) type Response = (&'static str, &'static str, String);
@@ -267,12 +242,15 @@ fn refuse(method: &str, h: &Headers, hosts: &[String]) -> Option<Response> {
 
 /// Reads one request. `Err(response)` when it must be refused (see
 /// [`refuse`]); a refused body is drained first, so the client reads the
-/// response instead of a reset connection.
+/// response instead of a reset connection. Reads through the stream itself:
+/// on Windows `try_clone` returns an inheritable socket, which a process a
+/// run starts meanwhile (`git`) keeps open after the response is written and
+/// resets when it exits.
 pub(crate) fn read_request(
     stream: &TcpStream,
     hosts: &[String],
 ) -> std::io::Result<Result<Request, Response>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();
