@@ -9,6 +9,7 @@ pub mod bind;
 pub mod catalog;
 pub mod classify;
 pub mod composition;
+pub mod coverage;
 mod engine;
 pub mod equiv;
 pub mod facts;
