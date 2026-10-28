@@ -734,7 +734,7 @@ level, and a probe run plus a delta review for each IBM i Technology Refresh.
 
 Each needs a test before it counts as a bug; outcomes are recorded here.
 
-- Fixed on the `verification` branch: a same-dialect T-SQL statement that
+- Fixed (on `main`): a same-dialect T-SQL statement that
   changed both the case of its names and something statement equivalence
   proves (operand order, `DELETE` without `FROM`) was "equal under
   assumptions" without `ASM-TSQL-CI-COLLATION`, although the lowering folds
