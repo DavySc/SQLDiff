@@ -132,7 +132,7 @@ fails, a glibc checker ships beside the musl CLI.
 |---|---|---|---|
 | 1 | What "related observations" means (below) | Refinement of the reference side, over a stated observer profile | Decided 2026-10-28 (four choices by the project owner, the rest proposed) |
 | 2 | Gate (translation validation) or proving the Rust | Gate, then converge per fragment, with a performance gate (below) | Decided 2026-10-28 |
-| 3 | Rollout | `proof:` field first, strict mode once coverage is high | Proposed |
+| 3 | Rollout | A `proof` field and modes off/report/require; `require` becomes the default per dialect pair (below) | Decided 2026-10-28 |
 | 4 | Access to IBM i systems | One per supported release, for probes | Open |
 | 5 | Who reviews spec, statements and axioms | A named human; the one role AI does not fill | Open |
 | 6 | Version support policy | Follow each vendor's lifecycle (see "RDBMS versions") | Proposed |
@@ -287,7 +287,70 @@ Checked with `sqldiff diff` on 2026-10-28, before the change:
 Work this creates outside the proofs: a reference side in the CLI, MCP,
 GUI, review store and `pairs`/`tree`/`queue` configuration; an
 `equivalent` field; the `[observer]` section; the error-code mapping in
-packs; witness texts that say which side can produce what.
+packs; witness texts that say which side can produce what. It ships in
+Rust before the checker (decision 3).
+
+### Decision 3: rollout
+
+Decided by the project owner on 2026-10-28.
+
+#### How a report shows the proof
+
+The verdict values do not change. Reports gain:
+
+- `proof`: `confirmed`, `unconfirmed` or `n/a` (nothing to confirm: the
+  verdict is not "equal" or "equal under assumptions");
+- `proof_reason` when unconfirmed: fragment not covered, version in
+  `preview`, checker missing, timed out or crashed, schema mismatch, or a
+  contradiction with a Rust "different";
+- `verdict_before_proof` in `require` mode, recorded the way
+  `verdict_before_suppression` is (`Report::settle_suppression`), so text,
+  JSON, SARIF, the GitHub Action and exit codes agree without new flags.
+
+Modes, set by `[proof] mode` in `sqldiff.toml` or a pack, or `--proof`:
+
+| Mode | Effect |
+|---|---|
+| `off` | The checker is not called; no `proof` field |
+| `report` | The checker runs on candidate equals; the verdict is unchanged |
+| `require` | An unconfirmed "equal" or "equal under assumptions" becomes "unknown" |
+
+A confirmed verdict lists the axioms the confirming theorem used (from
+`#print axioms`), mapped to their `ASM-FACT-*` assumptions, so a proven
+"equal" names exactly what it rests on. Until `require` is the default, no
+document or screen says "proven" without "confirmed by `sqldiff-check`
+<version> against spec <version>"; the GUI shows a badge on confirmed
+verdicts only.
+
+#### Stages
+
+| Stage | When | Default mode |
+|---|---|---|
+| 0 | Phase 0: the gate covers only the trivial fragment | `off` for users; the project's own CI runs `report` and tracks coverage |
+| 1 | The gate ships in releases and confirms at least half of the corpus "equal" verdicts | `report` everywhere; nothing fails because of it |
+| 2 | Per dialect pair and version (T-SQL to PostgreSQL 18, …): at least 95% of "equal" verdicts on corpus, real-code and the WWI benchmark confirmed, and no contradiction open for 8 weeks | `require` for that pair, including the GitHub Action's default |
+| 3 | Every supported pair is at stage 2 | `require` everywhere; `report` stays as an opt-out |
+
+Early users of `require`, from phase 0: the formatter's self-check
+(`format::engine_check`, which needs "equal" and whose edits are the trivial
+fragment) and the mutation gate's meaning-preserving edits (whitespace,
+keyword case, comments).
+
+With the version lifecycle: `preview` versions never confirm, so under
+`require` they are always "unknown"; `legacy` versions keep their frozen
+proofs and still confirm.
+
+#### Semantics first
+
+The decision 1 changes to Rust's verdicts (refinement with a reference
+side, error matching, the observer profile, session state, the
+`equivalent` field) ship in Rust before the checker, as one deliberate
+behaviour change with release notes, so the checker checks the relation
+Rust already reports. Side A, the reference, stays the first argument
+everywhere: the base in `changes`, the source in `convert`. The release
+notes list the verdicts that change (table above) and the rule ids that
+change; reviews accepted under an old rule id no longer match their
+finding, and the release says so and how to re-accept.
 
 ## AI operating model
 
@@ -326,12 +389,12 @@ bars; total about 16 to 28 months including multi-version support.
 
 | Phase | Scope | Exit criterion | Estimate |
 |---|---|---|---|
-| 0 Groundwork | Private `Report.verdict` (assigned today in core, source, review and convert); a coverage invariant (every unit proven or covered by a finding); tests for the leads below; typed dialect version (see "RDBMS versions"); `formal/lean` Lake project with `Term`; AST JSON export with schema hash; the gate on a trivial fragment; the packaging and performance spike (decision 2); CI and agents | Gate confirms the trivial fragment on the corpus, on all four release targets, within the decision 2 budgets | 2 to 3 months |
+| 0 Groundwork | Private `Report.verdict` (assigned today in core, source, review and convert); the decision 1 semantics in Rust and the `proof` field and modes (decision 3); a coverage invariant (every unit proven or covered by a finding); tests for the leads below; typed dialect version (see "RDBMS versions"); `formal/lean` Lake project with `Term`; AST JSON export with schema hash; the gate on a trivial fragment; the packaging and performance spike (decision 2); CI and agents | Gate confirms the trivial fragment on the corpus, on all four release targets, within the decision 2 budgets | 2 to 3 months |
 | 1 Scalar expressions | Three-valued logic, NULL, numeric types, strings and collation, casts and literals, bit and boolean, CASE/COALESCE/ISNULL; `compare.rs` hooks proven under their assumptions; `eval/casts`, `eval/bit-boolean`, `eval/literal` as Lean regression tests | Scalar-only "equal" on corpus and real-code confirmed; mutation gate at zero false equals | 3 to 4 months |
 | 2 Queries | Bags, joins, aggregates, ordering and NULL ordering, paging, set operations, scalar subquery contracts, catalog keys and nullability | As phase 1, for queries | 3 to 5 months |
 | 3 DML | INSERT, UPDATE (including `UPDATE … FROM`), DELETE, MERGE, upserts, generated keys and `RETURNING`; execution oracle as a Lean differential test | DML "equal" confirmed; oracle agrees with the Lean semantics | 2 to 4 months |
 | 4 Routines | The `formal/ErrorTxn.tla` semantics ported to Lean over the CFG; routine equivalence by simulation; V4, V9, V14, V15 as axioms | Behavioural "equal" confirmed; axiom allowlist matches vendor-facts-verification.md | 3 to 5 months |
-| 5 Hardening | Coverage, checker performance, strict mode as default, parser differential tests against `libpg_query` and ScriptDom | Most real-code "equal" verdicts confirmed | Ongoing |
+| 5 Hardening | Coverage, checker performance, the decision 3 stages up to `require` everywhere, parser differential tests against `libpg_query` and ScriptDom | Most real-code "equal" verdicts confirmed | Ongoing |
 
 Concurrency stays out of scope: anything that depends on it remains an
 assumption.
