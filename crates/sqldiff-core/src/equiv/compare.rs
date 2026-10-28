@@ -82,7 +82,8 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
                 && ka[6] == n("order", Vec::new())
                 && !kb[6].kids().is_empty()
                 && ka[7].atom() == Some("-")
-                && kb[7].atom() == Some("-") =>
+                && kb[7].atom() == Some("-")
+                && order_cannot_fail(a, &kb[0], &kb[6]) =>
         {
             if !c.refinements.iter().any(|r| r == ORDER_ADDED) {
                 c.refinements.push(ORDER_ADDED.to_string());
@@ -123,6 +124,24 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
             index,
         }),
     }
+}
+
+/// An added ORDER BY refines only if it cannot make the query fail or
+/// change what it returns: every key a column reference (no expression
+/// that can raise, no subquery that can return two rows) that A's query
+/// already reads, so that A compiling shows the column exists (without a
+/// catalog nothing else does), and no DISTINCT, under which T-SQL refuses
+/// an ORDER BY key outside the select list (error 145) and PostgreSQL does
+/// too.
+fn order_cannot_fail(a: &Term, distinct: &Term, order: &Term) -> bool {
+    fn mentions(t: &Term, x: &Term) -> bool {
+        t == x || t.kids().iter().any(|k| mentions(k, x))
+    }
+    distinct.atom() == Some("all")
+        && order
+            .kids()
+            .iter()
+            .all(|o| o.is("ord") && o.kid(0).is_some_and(|k| k.is("col") && mentions(a, k)))
 }
 
 fn hook(a: &Term, b: &Term) -> Option<Assumption> {

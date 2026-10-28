@@ -65,3 +65,25 @@ fn across_dialects_too() {
         assert_eq!(r.equivalent, Some(false), "{:?}", r.refinements);
     }
 }
+
+#[test]
+fn an_order_that_can_fail_is_not_a_refinement() {
+    // An added ORDER BY refines only if it cannot make the query fail: a
+    // key that can raise, a subquery that can return two rows, or a key
+    // outside the select list of a DISTINCT query (T-SQL error 145).
+    for b in [
+        "SELECT o.OrderId FROM dbo.Orders o ORDER BY 1 / (o.Qty - o.Qty);",
+        "SELECT o.OrderId FROM dbo.Orders o ORDER BY (SELECT x.Id FROM dbo.X x);",
+        "SELECT o.OrderId FROM dbo.Orders o ORDER BY NoSuchColumn;",
+    ] {
+        let r = run(&tsql(UNORDERED), T, &tsql(b), T);
+        assert!(!equal(&r), "{b}: {:?}", r.verdict());
+    }
+    let r = run(
+        &tsql("SELECT DISTINCT o.OrderId FROM dbo.Orders o;"),
+        T,
+        &tsql("SELECT DISTINCT o.OrderId FROM dbo.Orders o ORDER BY o.Qty;"),
+        T,
+    );
+    assert!(!equal(&r), "{:?}", r.verdict());
+}
