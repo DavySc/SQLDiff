@@ -10,6 +10,7 @@
 pub mod abstract_syntax;
 pub mod ast;
 pub mod dialect;
+pub mod encode;
 pub mod kind;
 pub mod lexer;
 mod parser;
