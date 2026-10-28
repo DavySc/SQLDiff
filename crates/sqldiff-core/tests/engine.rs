@@ -123,6 +123,59 @@ fn tsql_identifier_case_needs_an_assumption() {
 }
 
 #[test]
+fn tsql_identifier_case_in_a_rewritten_statement_needs_an_assumption() {
+    // The statement also changed in a way statement equivalence proves
+    // (operand order, `DELETE` without `FROM`), so it is not matched as a
+    // whole; the lowering folds the names, which needs the same assumption.
+    let proc_ = |body: &str| format!("CREATE PROCEDURE dbo.P @p int AS\nBEGIN\n  {body}\nEND\n");
+    for (a, b) in [
+        (
+            "UPDATE dbo.Orders SET Total = 1 WHERE OrderId = @p AND Status = 2;",
+            "UPDATE dbo.orders SET total = 1 WHERE status = 2 AND orderid = @p;",
+        ),
+        (
+            "DELETE FROM dbo.Orders WHERE OrderId = @p;",
+            "DELETE dbo.orders WHERE orderid = @p;",
+        ),
+    ] {
+        let r = run(&proc_(a), Dialect::Tsql, &proc_(b), Dialect::Tsql);
+        assert_ne!(r.verdict, Verdict::Equal, "{a}");
+        assert!(
+            r.assumptions
+                .iter()
+                .any(|x| x.id == "ASM-TSQL-CI-COLLATION"),
+            "{a} / {b}: {:?}",
+            r.assumptions.iter().map(|x| &x.id).collect::<Vec<_>>()
+        );
+    }
+    // Same spelling everywhere: nothing is folded, so no assumption.
+    let a = "UPDATE dbo.Orders SET Total = 1 WHERE OrderId = @p AND Status = 2;";
+    let b = "UPDATE dbo.Orders SET Total = 1 WHERE Status = 2 AND OrderId = @p;";
+    let r = run(&proc_(a), Dialect::Tsql, &proc_(b), Dialect::Tsql);
+    assert!(
+        !r.assumptions
+            .iter()
+            .any(|x| x.id == "ASM-TSQL-CI-COLLATION"),
+        "{:?}",
+        r.assumptions.iter().map(|x| &x.id).collect::<Vec<_>>()
+    );
+    // PostgreSQL folds unquoted names itself: no assumption there.
+    let pg = |body: &str| {
+        format!("CREATE PROCEDURE p(p_p int) LANGUAGE plpgsql AS $$\nBEGIN\n  {body}\nEND $$;\n")
+    };
+    let r = run(
+        &pg("UPDATE Orders SET Total = 1 WHERE OrderId = p_p AND Status = 2;"),
+        Dialect::Postgres,
+        &pg("UPDATE orders SET total = 1 WHERE status = 2 AND orderid = p_p;"),
+        Dialect::Postgres,
+    );
+    assert!(!r
+        .assumptions
+        .iter()
+        .any(|x| x.id == "ASM-TSQL-CI-COLLATION"));
+}
+
+#[test]
 fn modified_statement_is_never_equal() {
     let a = "CREATE PROCEDURE p AS\nBEGIN\n  UPDATE t SET x = 1 WHERE EXISTS (SELECT 1 FROM s WHERE s.id = t.id);\n  SELECT 1;\nEND";
     let b = "CREATE PROCEDURE p AS\nBEGIN\n  UPDATE t SET x = 1;\n  SELECT 1;\nEND";

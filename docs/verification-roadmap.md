@@ -732,14 +732,27 @@ level, and a probe run plus a delta review for each IBM i Technology Refresh.
 
 ## Leads found while planning
 
-Not yet confirmed as bugs; each needs a test first.
+Each needs a test before it counts as a bug; outcomes are recorded here.
 
-- Raw terms for statements that fail to parse fold every word to upper case
-  (`equiv/mod.rs`, around lines 94 to 113) and can compare equal without
-  `ASM-TSQL-CI-COLLATION`, which matters under a case-sensitive collation.
-- Collection roll-ups default to "equal" when empty
-  (`.unwrap_or(Verdict::Equal)` in `sqldiff-cli` `main.rs`, `source_cmd.rs`
-  and `queue_cmd.rs`, and in `sqldiff-review/src/branch.rs`).
+- Fixed on the `verification` branch: a same-dialect T-SQL statement that
+  changed both the case of its names and something statement equivalence
+  proves (operand order, `DELETE` without `FROM`) was "equal under
+  assumptions" without `ASM-TSQL-CI-COLLATION`, although the lowering folds
+  the names (`canon::lc`) and `dbo.Orders` and `dbo.orders` are different
+  tables under a case-sensitive collation. `name_assumptions` now adds the
+  assumption when a name or variable is spelled in more than one case
+  across the two statements. The raw terms of statements that fail to lower
+  fold the same way and are covered by the same check.
+- Checked, not a bug: collection roll-ups that default to "equal" when
+  empty (`.unwrap_or(Verdict::Equal)`). Two empty trees are equal (nothing
+  is observable on either side); a file without a dialect makes `tree`
+  unknown, an unreadable file or a missing folder is an error (exit 2).
+- One assumption id, two settings: `ASM-TSQL-CI-COLLATION` stands both for
+  names and variables comparing case-insensitively and for string
+  comparisons using a case-insensitive collation (`canon::asm::TSQL_CI`).
+  T-SQL takes these from different collations, so confirming one in a
+  review also confirms the other. To be split, with care for the review
+  store, which keys on assumption ids.
 - `GENERATE_UUID` needs IBM i 7.6 or a Technology Refresh on 7.4 and 7.5
   (converter note in `sqldiff-convert/src/tsql.rs`), but has no
   `[db2i.since]` entry, so the binder never gates it.

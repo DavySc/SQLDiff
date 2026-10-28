@@ -109,6 +109,12 @@ pub mod asm {
         "ASM-DEFAULT-SCHEMA",
         "Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides (the default schema, search_path or Db2 for i current schema in effect)",
     );
+    /// Same id as [`TSQL_CI`]: T-SQL has one case-insensitive collation
+    /// assumption, stated for names here and for string comparisons there.
+    pub const TSQL_CI_NAMES: (&str, &str) = (
+        "ASM-TSQL-CI-COLLATION",
+        "Identifiers and variables compare case-insensitively (case-insensitive catalog collation)",
+    );
     pub const IDENT_FOLD: (&str, &str) = (
         "ASM-IDENT-FOLD",
         "Unquoted names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
