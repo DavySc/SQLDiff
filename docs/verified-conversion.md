@@ -366,6 +366,24 @@ output.
    | `ErrorTxn.tla` | Ported to Lean in C4, then retired once the Lean core passes every case it passes |
    | `ir/` | The untrusted Rust twin: it finds witnesses for "different" and may stay faster than the Lean interpreter; it is held to the shared cases, never trusted for "equal" |
 
+## Progress (branch `verification`)
+
+| Item | State on 2026-10-28 |
+|---|---|
+| C0.1 Target AST and printer | Done for PostgreSQL. The abstract syntax moved to `sqldiff_syntax::abstract_syntax`, shared with the diff engine; `sqldiff_syntax::print` writes it as PostgreSQL (every non-atomic operand parenthesised, refusals instead of guesses); `sqldiff_syntax::routine` reads T-SQL and PL/pgSQL routines into one shape and prints PL/pgSQL. Round trips: 291 PostgreSQL statements and 20 PL/pgSQL routines in the repository print and read back as the same tree. The round trip found a false "equal" in the parser (PostgreSQL `\|\|` precedence, fixed) |
+| C0 AST codegen | Done. `encode::SCHEMA` is a grammar; `formal/lean/Sqldiff/Ast.lean` (types and decoder) is generated from it with a schema hash in every request; every encoded tree of the repository is checked against the schema |
+| C0.2 Converter emits AST | Not needed for the guarantee, so deferred: the certificate reads the output text on disk back with the target parser (item 4's re-parse check, applied to everything), so neither the rules nor a printer are trusted, and the proof is about what will run. Emitting AST stays useful for the trace's node paths and for idiom passes |
+| C0.3 Complete trace | Done: every rewrite records a step (rule id, source span, instantiation), enforced by construction in the expression walk and by a corpus test; output byte-identical before and after |
+| C0.4 Re-parse check | Subsumed by C0.2's decision above |
+| C0.5 `--proof` on convert, certificate | Done: `sqldiff convert --proof report\|require` writes `certificates.json` (source and target AST hashes, renaming, residual assumptions, answer); unit statuses do not change yet |
+| C0.6 Deployment profile | Done: `[deployment] accept` and `facts`, validated against the registry; reported, never a verdict change |
+| C0.7 Assumption table | Done: `profiles/assumptions.toml` (154 ids, each with what discharges it), `docs/assumptions.md` generated, completeness enforced by a source scan |
+| C0.8 One model | Decided as a working plan (C0 item 8 above) |
+| C1 Skeleton | Done: core language, fuel interpreter, `Refines` with divergence, the mirror check `Sqldiff.Mirror.check_sound` (standard axioms only), lowerings over the generated AST, `sqldiff-check/3`. End to end: a converted T-SQL procedure with IF, ELSE IF, WHILE and RETURN, which the diff engine can only call "not proven", is confirmed from the output on disk, under `ASM-C1-OPERATORS` (operators uninterpreted until C2) and `ASM-RETURN-CODE`. The converter now writes the T-SQL return status in its provable form (`return_code := 0` first, `COALESCE(e, 0)` on RETURN) |
+| C2 Scalars | Started: integers, booleans, NULL and arithmetic errors (C2a) |
+
+Findings on the way, fixed: the PostgreSQL `||` precedence (a false "equal"); `convert` reported units as "converted" while the engine's diff named pair-level assumptions (rows-affected counts, untyped stores, binding without a catalog); the C1 lowering's review found three holes before merge (PostgreSQL name folding, undeclared names read as NULL, `EXEC @rc =` status position).
+
 ## Decisions this needs
 
 Decided 2026-10-28 by the project owner: the converter is the priority of
