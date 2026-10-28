@@ -4,8 +4,11 @@ sqldiff-check/3: the C1 mirror check, confirmed for a T-SQL procedure and
 its PL/pgSQL mirror, with the C2a fields (`scalars`, `residual`) and the
 C3a field (`statements`) on a confirmed answer; C3a requests with table
 mappings in DEPLOYMENT and table entries in CATALOG; C2b string pairs,
-with the collation fact in CATALOG and the string residuals. Anything else
-is unconfirmed, including malformed requests.
+with the collation fact in CATALOG and the string residuals; C4 pairs
+(TRY/CATCH against EXCEPTION blocks, THROW against RAISE, the
+rollback-and-rethrow idiom with COMMIT), with the C4 residuals and the
+`errors` field. Anything else is unconfirmed, including malformed
+requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
 """
@@ -332,7 +335,88 @@ cases += [
     ("59", req3s(59, s_t([assign(tv("@r"), fn("ISNULL", tv("@a"), string("none")))]),
                  s_p([assign(pv("r"), fn("COALESCE", pv("a"), string("none")))])), "confirmed"),
 ]
+
+# C4: errors and transactions, in the shapes `sqldiff convert` writes.
+# T-SQL TRY/CATCH is (Try body [(Handler [] catch)]); a PL/pgSQL block
+# with EXCEPTION WHEN OTHERS is (Try body [(Handler [s:others] handler)]).
+
+
+def try_(body, handler, conds=()):
+    return C("Try", L(*body), L(C("Handler", L(*map(S, conds)), L(*handler))))
+
+
+NOCOUNT = C("Setting", S("NOCOUNT"), "t")
+RETHROW = C("Throw", L())
+RERAISE = C("Raise", NONE, NONE, L(), L())
+
+
+def throw(n, m, s=1):
+    return C("Throw", L(num(n), string(m), num(s)))
+
+
+def raise_(m, code="P0001", level="EXCEPTION"):
+    return C("Raise", S(level), NONE, L(),
+             L(C("RaiseOpt", S("MESSAGE"), string(m)), C("RaiseOpt", S("ERRCODE"), string(code))))
+
+
+def txn(op):
+    return C("Txn", S(op), NONE)
+
+
+ROLLBACK_IF_OPEN = C("If", bin_(">", tv("@@TRANCOUNT"), num(0)), L(txn("ROLLBACK")), L())
+AB_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@a", "p_a"), ("@b", "p_b"), ("%status", "%status")])
+ID_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "p_id"), ("%status", "%status")])
+C4_P1_T = proc(["dbo", "p1"], [param("@a", "In"), param("@b", "InOut")], [], [
+    ABORT, NOCOUNT,
+    try_([assign(tv("@b"), bin_("/", tv("@a"), num(0)))], [assign(tv("@b"), C("Num", S("-1")))])])
+C4_P1_P = proc(["p1"], [param("p_a", "In"), param("p_b", "InOut")], [], [
+    try_([assign(pv("p_b"), bin_("/", pv("p_a"), num(0)))], [assign(pv("p_b"), C("Num", S("-1")))],
+         ["others"])])
+INS_T = ins(["dbo", "Acct"], ["Id", "Qty", "Total"], [[tv("@id"), num(1), num(0)]])
+INS_P = ins(["acct"], ["id", "qty", "total"], [[pv("p_id"), num(1), num(0)]])
+BUMP_T = upd(["dbo", "Acct"], [("Total", bin_("+", col("Total"), num(1)))])
+BUMP_P = upd(["acct"], [("total", bin_("+", pv("total"), num(1)))])
+
+
+def id_t(body):
+    return proc(["dbo", "p"], [param("@id", "In")], [], [ABORT, NOCOUNT] + body)
+
+
+def id_p(body):
+    return proc(["p"], [param("p_id", "In")], [], body)
+
+
+def req3e(i, a, b, cert=ID_CERT):
+    return req3(i, a=a, b=b, dep=D_DEP, cat=D_CAT, cert=cert)
+
+
+cases += [
+    # A handled division by zero: the TRY body writes nothing.
+    ("60", req3e(60, C4_P1_T, C4_P1_P, cert=AB_CERT), "confirmed"),
+    # A duplicate key re-raised as the routine's own error (THROW / RAISE EXCEPTION).
+    ("61", req3e(61, id_t([try_([INS_T], [throw(50001, "dup")])]),
+                 id_p([try_([INS_P], [raise_("dup")], ["others"])])), "confirmed"),
+    # CATCH THROW; after two writes: the caller sees a failed call either way.
+    ("62", req3e(62, id_t([try_([INS_T, BUMP_T], [RETHROW])]),
+                 id_p([try_([INS_P, BUMP_P], [RERAISE], ["others"])])), "confirmed"),
+    # The handler goes on after a write the block rolls back: refused.
+    ("63", req3e(63, id_t([try_([INS_T, BUMP_T], [assign(tv("@id"), num(0))])]),
+                 id_p([try_([INS_P, BUMP_P], [assign(pv("p_id"), num(0))], ["others"])])), "unconfirmed"),
+    # The rollback-and-rethrow idiom: the converter keeps the body and the COMMIT.
+    ("64", req3e(64, id_t([try_([txn("BEGIN"), INS_T, BUMP_T, txn("COMMIT")], [ROLLBACK_IF_OPEN, RETHROW])]),
+                 id_p([INS_P, BUMP_P, txn("COMMIT")])), "confirmed"),
+    # ERROR_NUMBER() against SQLSTATE: refused.
+    ("65", req3e(65, id_t([try_([INS_T], [assign(tv("@id"), fn("ERROR_NUMBER"))])]),
+                 id_p([try_([INS_P], [assign(pv("p_id"), pv("SQLSTATE"))], ["others"])])), "unconfirmed"),
+    # RAISE NOTICE is a message, not an error.
+    ("66", req3e(66, id_t([try_([INS_T], [throw(50001, "dup")])]),
+                 id_p([try_([INS_P], [raise_("dup", level="NOTICE")], ["others"])])), "unconfirmed"),
+]
 THEOREMS = {
+    "60": "Sqldiff.Mirror.check_sound_c2a",
+    "61": "Sqldiff.Mirror.check_sound_c2a",
+    "62": "Sqldiff.Mirror.check_sound_c2a",
+    "64": "Sqldiff.Mirror.check_sound_c2a",
     "31": "Sqldiff.Mirror.check_sound",
     "40": "Sqldiff.Mirror.check_sound",
     "41": "Sqldiff.Mirror.check_sound_c2a",
@@ -360,6 +444,19 @@ EXTRA = {
            "statements": "c1"},
     "56": {"scalars": "c2a", "residual": ["ASM-TSQL-LEN-BMP", "ASM-TSQL-STRING-ARGS"], "statements": "c1"},
     "59": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
+    "60": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN"],
+           "statements": "c1", "errors": "c4"},
+    "61": {"scalars": "c2a",
+           "residual": ["ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN", "ASM-THROW-ERRCODE"],
+           "statements": "c3a", "errors": "c4"},
+    "62": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-CATCH-CORE-ERRORS",
+                        "ASM-NO-CALLER-TXN"],
+           "statements": "c3a", "errors": "c4"},
+    "64": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-NO-CALLER-TXN"],
+           "statements": "c3a", "errors": "c4"},
 }
 inp = "".join(line + "\n" for _, line, _ in cases)
 out = subprocess.run([exe], input=inp.encode(), capture_output=True, check=True).stdout.decode()

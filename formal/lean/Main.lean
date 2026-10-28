@@ -8,7 +8,7 @@ ID is digits; SCHEMA is `sqldiff_core::proof::schema_hash`, which must be
 `Sqldiff.Syntax.schemaHash`; the trees come from
 `sqldiff_core::proof::tree_line` and contain no tab.
 
-The mirror check of phases C1, C2a (with the C2b strings) and C3a (`Sqldiff.Mirror.check`,
+The mirror check of phases C1, C2a (with the C2b strings), C3a and C4 (`Sqldiff.Mirror.check`,
 theorems `Sqldiff.Mirror.check_sound` and `Sqldiff.Mirror.check_sound_c2a`)
 is a second request kind:
 
@@ -49,6 +49,14 @@ know a residual must not treat the answer as a C2a one. `"uninterpreted"` means 
 `"statements"` (C3a) is `"c3a"` when the routines have `INSERT`, `UPDATE`
 or `DELETE` statements, whose confirmation also rests on the TABLE entries
 of CATALOG and the table mappings of DEPLOYMENT, and `"c1"` otherwise.
+`"errors":"c4"` (C4, 0.7.0) follows it when the routines handle errors
+(`TRY`/`CATCH` against an exception block), raise them (`THROW` against
+`RAISE EXCEPTION`) or control transactions; it is absent otherwise, and
+the C4 residuals (`ASM-CATCH-CORE-ERRORS`, `ASM-NO-CALLER-TXN`,
+`ASM-THROW-ERRCODE`) are in `residual`. The request format is unchanged;
+the abstract syntax schema hash changed with the C4 nodes, so an older
+checker answers a C4-era request "unconfirmed" (schema mismatch), and
+this checker answers an older client's request the same way.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -102,7 +110,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.6.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.7.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

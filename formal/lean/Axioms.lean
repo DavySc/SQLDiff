@@ -3,6 +3,7 @@ import Sqldiff.Mirror.Check
 import Sqldiff.Core.Fuel
 import Sqldiff.Core.OpFree
 import Sqldiff.Core.Data
+import Sqldiff.Core.Handlers
 
 -- CI compares this output against the allowlist in check_axioms.py.
 #print axioms Sqldiff.Gate.check_sound
@@ -16,3 +17,9 @@ import Sqldiff.Core.Data
 #print axioms Sqldiff.Core.updateRows_map
 #print axioms Sqldiff.Core.deleteRows_map
 #print axioms Sqldiff.Mirror.mkRtrim_eval
+-- C4: handled errors.
+#print axioms Sqldiff.Core.exec_undoSafe
+#print axioms Sqldiff.Core.exec_settle
+#print axioms Sqldiff.Core.exec_settleTop
+#print axioms Sqldiff.Core.Routine.obs_settleTop
+#print axioms Sqldiff.Core.refines_settleTop_rename

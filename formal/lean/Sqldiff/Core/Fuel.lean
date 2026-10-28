@@ -28,6 +28,32 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .insert .., _, _ => rfl
   | _ + 1, .update .., _, _ => rfl
   | _ + 1, .delete .., _, _ => rfl
+  | _ + 1, .raise _, _, _ => rfl
+  | _ + 1, .reraise, _, _ => rfl
+  | _ + 1, .commit, _, _ => rfl
+  | n + 1, .tryCatch u b h, st, hf => by
+    have e1 : exec es wm (n + 1 + 1) (.tryCatch u b h) st =
+        match exec es wm (n + 1) b st with
+        | .error k st' => exec es wm (n + 1) (h.bindErr k) (if u then { st' with db := st.db } else st')
+        | o => o := rfl
+    have e2 : exec es wm (n + 1) (.tryCatch u b h) st =
+        match exec es wm n b st with
+        | .error k st' => exec es wm n (h.bindErr k) (if u then { st' with db := st.db } else st')
+        | o => o := rfl
+    rw [e2] at hf
+    rw [e1, e2]
+    cases hs : exec es wm n b st with
+    | error k st' =>
+      rw [hs] at hf
+      rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
+      exact exec_succ es wm n _ _ hf
+    | normal st' =>
+      rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
+    | returned v st' =>
+      rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
+    | outOfFuel st' =>
+      rw [hs] at hf
+      simp [Outcome.finished] at hf
   | n + 1, .seq s t, st, h => by
     have e1 : exec es wm (n + 1 + 1) (.seq s t) st =
         match exec es wm (n + 1) s st with

@@ -10,7 +10,7 @@ if it is exactly a value of the schema.
 namespace Sqldiff.Ast
 
 /-- The schema hash requests about abstract syntax carry (`sqldiff_core::proof::ast_schema_hash`). -/
-def schemaHash : String := "c80f5750aff36ba8"
+def schemaHash : String := "c9f7127d840d0fcd"
 
 mutual
   inductive Routine where
@@ -36,6 +36,14 @@ mutual
     | While («cond» : Expr) («body» : (List Node))
     | Call («name» : (List String)) («args» : (List Arg)) («ret» : (Option Expr))
     | Setting («name» : String) («on» : Bool)
+    | Try («body» : (List Node)) («handlers» : (List Handler))
+    | Throw («args» : (List Expr))
+    | Raise («level» : (Option String)) («format» : (Option String)) («args» : (List Expr)) («using» : (List RaiseOpt))
+    | Txn («op» : String) («name» : (Option String))
+  inductive Handler where
+    | Handler («conds» : (List String)) («body» : (List Node))
+  inductive RaiseOpt where
+    | RaiseOpt («name» : String) («value» : Expr)
   inductive Arg where
     | Arg («name» : (Option String)) («value» : Expr) («output» : Bool)
   inductive Ty where
@@ -256,6 +264,35 @@ mutual
       let x0 ← str? v0
       let x1 ← bool? v1
       pure (.Setting x0 x1)
+    | .ctor "Try" [v0, v1] => do
+      let x0 ← list? v0 (fun x => decodeNode x)
+      let x1 ← list? v1 (fun x => decodeHandler x)
+      pure (.Try x0 x1)
+    | .ctor "Throw" [v0] => do
+      let x0 ← list? v0 (fun x => decodeExpr x)
+      pure (.Throw x0)
+    | .ctor "Raise" [v0, v1, v2, v3] => do
+      let x0 ← opt? v0 (fun x => str? x)
+      let x1 ← opt? v1 (fun x => str? x)
+      let x2 ← list? v2 (fun x => decodeExpr x)
+      let x3 ← list? v3 (fun x => decodeRaiseOpt x)
+      pure (.Raise x0 x1 x2 x3)
+    | .ctor "Txn" [v0, v1] => do
+      let x0 ← str? v0
+      let x1 ← opt? v1 (fun x => str? x)
+      pure (.Txn x0 x1)
+    | _ => none
+  partial def decodeHandler : Value → Option Handler
+    | .ctor "Handler" [v0, v1] => do
+      let x0 ← list? v0 (fun x => str? x)
+      let x1 ← list? v1 (fun x => decodeNode x)
+      pure (.Handler x0 x1)
+    | _ => none
+  partial def decodeRaiseOpt : Value → Option RaiseOpt
+    | .ctor "RaiseOpt" [v0, v1] => do
+      let x0 ← str? v0
+      let x1 ← decodeExpr v1
+      pure (.RaiseOpt x0 x1)
     | _ => none
   partial def decodeArg : Value → Option Arg
     | .ctor "Arg" [v0, v1, v2] => do

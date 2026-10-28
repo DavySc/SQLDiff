@@ -1,7 +1,10 @@
 //! Routines as abstract syntax: header, parameters and a body of
 //! statements, blocks, `IF`, `WHILE` and calls (docs/verified-conversion.md,
-//! C0 item 1 and phase C1). Read from the CST of T-SQL and PL/pgSQL
-//! routines; printed as PL/pgSQL by `print_postgres`.
+//! C0 item 1 and phase C1), and error handling and transaction control
+//! (phase C4: T-SQL `TRY`/`CATCH`, `THROW`, `BEGIN TRAN`/`COMMIT`/`ROLLBACK`;
+//! PL/pgSQL `EXCEPTION` blocks, `RAISE`, `COMMIT`/`ROLLBACK`). Read from the
+//! CST of T-SQL and PL/pgSQL routines; printed as PL/pgSQL by
+//! `print_postgres`.
 //!
 //! Anything outside this shape is an error, not an approximation: a
 //! routine that does not read is one whose conversion cannot be confirmed.
@@ -100,6 +103,48 @@ pub enum Node {
         name: String,
         on: bool,
     },
+    /// T-SQL `BEGIN TRY body END TRY BEGIN CATCH handler END CATCH` (one
+    /// handler without conditions); PL/pgSQL `BEGIN body EXCEPTION WHEN
+    /// ... THEN ... END` without a `DECLARE` section (a nested block; an
+    /// exception section on the routine's own block is not read).
+    Try {
+        body: Vec<Node>,
+        handlers: Vec<Handler>,
+    },
+    /// T-SQL `THROW` (no arguments: re-raise the error a `CATCH` handles)
+    /// or `THROW number, message, state` (three arguments).
+    Throw {
+        args: Vec<Expr>,
+    },
+    /// PL/pgSQL `RAISE [level] ['format' [, arg ...]] [USING option =
+    /// expr, ...]`. `level` is upper case as written (`None` when left
+    /// out: a bare `RAISE` re-raises, otherwise the level is `EXCEPTION`);
+    /// option names are upper case. A condition name or `SQLSTATE` after
+    /// the level is not read.
+    Raise {
+        level: Option<String>,
+        format: Option<String>,
+        args: Vec<Expr>,
+        using: Vec<(String, Expr)>,
+    },
+    /// Transaction control: T-SQL `BEGIN TRAN[SACTION] [name]`, `COMMIT
+    /// [TRAN[SACTION] | WORK] [name]`, `ROLLBACK [TRAN[SACTION] | WORK]
+    /// [name]`; PL/pgSQL `COMMIT`, `ROLLBACK`. `op` is `BEGIN`, `COMMIT`
+    /// or `ROLLBACK`.
+    Txn {
+        op: String,
+        name: Option<String>,
+    },
+}
+
+/// An exception handler: the conditions it catches and its statements.
+/// T-SQL `CATCH` has no conditions; PL/pgSQL condition names are lower
+/// case (`others`, `division_by_zero`), `SQLSTATE '22012'` is
+/// `sqlstate:22012`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Handler {
+    pub conds: Vec<String>,
+    pub body: Vec<Node>,
 }
 
 // ---- reading -------------------------------------------------------------
@@ -124,7 +169,15 @@ pub fn read(n: &SyntaxNode, d: Dialect) -> RResult<Routine> {
         Dialect::Postgres => {
             let units: Vec<SyntaxNode> = body.children().filter(|c| c.kind().is_unit()).collect();
             match units.as_slice() {
-                [b] if b.kind() == BLOCK => block(b, d)?,
+                [b] if b.kind() == BLOCK => match block(b, d)? {
+                    (blk, hs) if hs.is_empty() => blk,
+                    _ => {
+                        return Err(
+                            "an exception section on the routine's own block is not read yet"
+                                .into(),
+                        )
+                    }
+                },
                 _ => return Err("a PL/pgSQL body that is not one block".into()),
             }
         }
@@ -132,7 +185,7 @@ pub fn read(n: &SyntaxNode, d: Dialect) -> RResult<Routine> {
             let units: Vec<SyntaxNode> = body.children().filter(|c| c.kind().is_unit()).collect();
             match units.as_slice() {
                 // `AS BEGIN ... END` and `AS stmt ...` run the same statements.
-                [b] if b.kind() == BLOCK => block(b, d)?,
+                [b] if b.kind() == BLOCK => block(b, d)?.0,
                 _ => Block {
                     decls: Vec::new(),
                     body: nodes(&units, d)?,
@@ -288,14 +341,22 @@ fn param(p: &mut Parser, d: Dialect) -> RResult<Param> {
     })
 }
 
-fn block(b: &SyntaxNode, d: Dialect) -> RResult<Block> {
+/// A block and the handlers of its exception section (PL/pgSQL).
+fn block(b: &SyntaxNode, d: Dialect) -> RResult<(Block, Vec<Handler>)> {
     let mut out = Block::default();
     let mut units = Vec::new();
+    let mut handlers = Vec::new();
     for c in b.children() {
         match c.kind() {
             DECLARE_SECTION => {
                 for s in c.children().filter(|s| s.kind().is_unit()) {
                     out.decls.push(declaration(&s, d)?);
+                }
+            }
+            EXCEPTION_SECTION if d == Dialect::Postgres => {
+                handlers = exception_section(&c, d)?;
+                if handlers.is_empty() {
+                    return Err("an exception section without a handler".into());
                 }
             }
             EXCEPTION_SECTION => return Err("exception handlers are not read yet".into()),
@@ -320,7 +381,92 @@ fn block(b: &SyntaxNode, d: Dialect) -> RResult<Block> {
         return Err(format!("a block written `{}`", own.join(" ")));
     }
     out.body = nodes(&units, d)?;
+    Ok((out, handlers))
+}
+
+/// The handlers of a PL/pgSQL `EXCEPTION` section: `WHEN cond [OR cond
+/// ...] THEN statements`, a condition a name or `SQLSTATE 'xxxxx'`.
+fn exception_section(sec: &SyntaxNode, d: Dialect) -> RResult<Vec<Handler>> {
+    let own = upper_own(sec);
+    if own != ["EXCEPTION"] {
+        return Err(format!("an exception section written `{}`", own.join(" ")));
+    }
+    let mut out = Vec::new();
+    for h in sec.children() {
+        if h.kind() != EXCEPTION_HANDLER {
+            return Err(format!("{:?} in an exception section", h.kind()));
+        }
+        let own = upper_own(&h);
+        if own != ["WHEN", "THEN"] {
+            return Err(format!("an exception handler written `{}`", own.join(" ")));
+        }
+        let kids: Vec<SyntaxNode> = h.children().collect();
+        let [c, b] = kids.as_slice() else {
+            return Err("an exception handler of an unexpected shape".into());
+        };
+        if c.kind() != CONDITION || b.kind() != BRANCH {
+            return Err("an exception handler of an unexpected shape".into());
+        }
+        let toks = tokens(c);
+        let mut conds = Vec::new();
+        for part in toks.split(|t| t.kind == K::Word && t.up == "OR") {
+            match part {
+                [t] if t.kind == K::Word => conds.push(t.text.to_ascii_lowercase()),
+                [s, v] if s.kind == K::Word && s.up == "SQLSTATE" && v.kind == K::Str => {
+                    let code = v.text.trim_matches('\'');
+                    if code.len() != 5 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
+                        return Err(format!("the SQLSTATE `{}`", v.text));
+                    }
+                    conds.push(format!("sqlstate:{}", code.to_ascii_uppercase()));
+                }
+                _ => return Err("an exception condition of an unexpected shape".into()),
+            }
+        }
+        out.push(Handler {
+            conds,
+            body: branch(b, d)?,
+        });
+    }
     Ok(out)
+}
+
+/// A node's own significant tokens (not those of any child node), upper
+/// case, without semicolons.
+fn upper_own(n: &SyntaxNode) -> Vec<String> {
+    n.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| cst::is_significant(t.kind()) && t.kind() != SEMICOLON)
+        .map(|t| t.text().to_ascii_uppercase())
+        .collect()
+}
+
+/// The units of a node (`TRY_BLOCK`, `CATCH_BLOCK`), whose own tokens
+/// must be exactly `own`.
+fn units_of(n: &SyntaxNode, own: &[&str], d: Dialect) -> RResult<Vec<Node>> {
+    let toks = upper_own(n);
+    if toks != own {
+        return Err(format!("{:?} written `{}`", n.kind(), toks.join(" ")));
+    }
+    let units: Vec<SyntaxNode> = n.children().filter(|c| c.kind().is_unit()).collect();
+    nodes(&units, d)
+}
+
+/// T-SQL `BEGIN TRY ... END TRY BEGIN CATCH ... END CATCH`.
+fn try_catch(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
+    let kids: Vec<SyntaxNode> = u.children().collect();
+    let [t, c] = kids.as_slice() else {
+        return Err("a TRY without its CATCH".into());
+    };
+    if t.kind() != TRY_BLOCK || c.kind() != CATCH_BLOCK || !upper_own(u).is_empty() {
+        return Err("a TRY/CATCH of an unexpected shape".into());
+    }
+    Ok(Node::Try {
+        body: units_of(t, &["BEGIN", "TRY", "END", "TRY"], d)?,
+        handlers: vec![Handler {
+            conds: Vec::new(),
+            body: units_of(c, &["BEGIN", "CATCH", "END", "CATCH"], d)?,
+        }],
+    })
 }
 
 /// A PL/pgSQL declaration (`x integer := 1`), read as `DECLARE x ...`.
@@ -358,7 +504,17 @@ fn branch(b: &SyntaxNode, d: Dialect) -> RResult<Vec<Node>> {
 fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
     match u.kind() {
         STATEMENT => statement(u, d),
-        BLOCK => Ok(Node::Block(block(u, d)?)),
+        BLOCK => match block(u, d)? {
+            (b, hs) if hs.is_empty() => Ok(Node::Block(b)),
+            (b, _) if !b.decls.is_empty() => {
+                Err("a block with declarations and an exception section is not read yet".into())
+            }
+            (b, handlers) => Ok(Node::Try {
+                body: b.body,
+                handlers,
+            }),
+        },
+        TRY_CATCH if d == Dialect::Tsql => try_catch(u, d),
         IF_STMT => if_stmt(u, d),
         LOOP_STMT => {
             let first = cst::first_words(u, 1);
@@ -460,8 +616,113 @@ fn statement(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
             })
         }
         (Dialect::Postgres, "CALL") => call(&t, d),
+        (Dialect::Tsql, "THROW") => throw(&t, d),
+        (Dialect::Postgres, "RAISE") => raise(&t, d),
+        (Dialect::Tsql, "BEGIN")
+            if t.len() > 1 && matches!(t[1].up.as_str(), "TRAN" | "TRANSACTION") =>
+        {
+            txn(&t, d)
+        }
+        (_, "COMMIT" | "ROLLBACK") => txn(&t, d),
         _ => Ok(Node::Stmt(parse_stmt_exact(&t, d)?)),
     }
+}
+
+/// T-SQL `THROW` or `THROW number, message, state`.
+fn throw(t: &[Tok], d: Dialect) -> RResult<Node> {
+    let mut p = Parser::ext(t, d);
+    p.i += 1;
+    let mut args = Vec::new();
+    if !p.at_end() {
+        loop {
+            args.push(p.expr()?);
+            if !p.eat_kind(K::Comma) {
+                break;
+            }
+        }
+        if args.len() != 3 {
+            return Err("THROW takes no arguments or three".into());
+        }
+    }
+    if !p.at_end() {
+        return Err(p.err("unexpected tokens in THROW"));
+    }
+    whole(&p)?;
+    Ok(Node::Throw { args })
+}
+
+/// PL/pgSQL `RAISE [level] ['format' [, expr ...]] [USING name = expr, ...]`.
+fn raise(t: &[Tok], d: Dialect) -> RResult<Node> {
+    const LEVELS: [&str; 6] = ["DEBUG", "LOG", "INFO", "NOTICE", "WARNING", "EXCEPTION"];
+    let mut p = Parser::ext(t, d);
+    p.i += 1;
+    let mut level = None;
+    if let Some(l) = LEVELS.iter().find(|l| p.is_kw(l)) {
+        level = Some(l.to_string());
+        p.i += 1;
+    }
+    let (mut format, mut args, mut using) = (None, Vec::new(), Vec::new());
+    if p.is_kind(K::Str) {
+        match p.expr()? {
+            Expr::Str(s) => format = Some(s),
+            _ => return Err("a RAISE format that is not a string literal".into()),
+        }
+        while p.eat_kind(K::Comma) {
+            args.push(p.expr()?);
+        }
+    } else if !p.at_end() && !p.is_kw("USING") {
+        return Err(p.err("a RAISE with a condition name or SQLSTATE is not read yet"));
+    }
+    if p.eat_kw("USING") {
+        loop {
+            let name = p.any_ident()?.to_ascii_uppercase();
+            if !p.eat_op("=") {
+                return Err(p.err("expected = in RAISE USING"));
+            }
+            using.push((name, p.expr()?));
+            if !p.eat_kind(K::Comma) {
+                break;
+            }
+        }
+    }
+    if !p.at_end() {
+        return Err(p.err("unexpected tokens in RAISE"));
+    }
+    whole(&p)?;
+    Ok(Node::Raise {
+        level,
+        format,
+        args,
+        using,
+    })
+}
+
+/// Transaction control. T-SQL: `BEGIN TRAN[SACTION] [name]`, `COMMIT |
+/// ROLLBACK [TRAN[SACTION] | WORK] [name]`; PL/pgSQL: `COMMIT`,
+/// `ROLLBACK`. Anything else (`DISTRIBUTED`, `WITH MARK`, `AND CHAIN`,
+/// delayed durability, a PL/pgSQL `WORK` or `TRANSACTION`) is not read.
+fn txn(t: &[Tok], d: Dialect) -> RResult<Node> {
+    let op = t[0].up.clone();
+    let mut i = 1;
+    let mut name = None;
+    if d == Dialect::Tsql {
+        if t.get(i)
+            .is_some_and(|x| matches!(x.up.as_str(), "TRAN" | "TRANSACTION" | "WORK"))
+        {
+            i += 1;
+        }
+        if let Some(x) = t.get(i) {
+            if matches!(x.kind, K::Word | K::Var) && x.up != "WITH" {
+                name = Some(x.text.clone());
+                i += 1;
+            }
+        }
+    }
+    if i != t.len() {
+        let text: Vec<&str> = t.iter().map(|x| x.text.as_str()).collect();
+        return Err(format!("{op} written `{}`", text.join(" ")));
+    }
+    Ok(Node::Txn { op, name })
 }
 
 /// T-SQL `EXEC [@rc =] proc [[@p =] value [OUTPUT], ...]`.
@@ -695,6 +956,69 @@ fn print_node(n: &Node, depth: usize, out: &mut String) -> RResult<()> {
                 });
             }
             line(depth, &format!("CALL {}({});", name(n)?, a.join(", ")), out);
+        }
+        Node::Try { body, handlers } => {
+            if handlers.is_empty() || handlers.iter().any(|h| h.conds.is_empty()) {
+                return Err("a handler without conditions has no PL/pgSQL spelling".into());
+            }
+            line(depth, "BEGIN", out);
+            print_nodes(body, depth + 1, out)?;
+            line(depth, "EXCEPTION", out);
+            for h in handlers {
+                let mut cs = Vec::new();
+                for c in &h.conds {
+                    cs.push(match c.strip_prefix("sqlstate:") {
+                        Some(code) => format!("SQLSTATE '{code}'"),
+                        None if c.chars().all(|x| x.is_ascii_alphanumeric() || x == '_') => {
+                            c.clone()
+                        }
+                        None => return Err(format!("the condition `{c}`")),
+                    });
+                }
+                line(depth + 1, &format!("WHEN {} THEN", cs.join(" OR ")), out);
+                print_nodes(&h.body, depth + 2, out)?;
+            }
+            line(depth, "END;", out);
+        }
+        Node::Throw { .. } => return Err("THROW has no PL/pgSQL spelling".into()),
+        Node::Raise {
+            level,
+            format,
+            args,
+            using,
+        } => {
+            let mut s = String::from("RAISE");
+            if let Some(l) = level {
+                s.push(' ');
+                s.push_str(l);
+            }
+            if let Some(f) = format {
+                s.push(' ');
+                s.push_str(&print::expr(&Expr::Str(f.clone()), D)?);
+                for a in args {
+                    s.push_str(", ");
+                    s.push_str(&print::expr(a, D)?);
+                }
+            } else if !args.is_empty() {
+                return Err("RAISE arguments without a format".into());
+            }
+            if !using.is_empty() {
+                let mut u = Vec::new();
+                for (n, e) in using {
+                    u.push(format!("{n} = {}", print::expr(e, D)?));
+                }
+                s.push_str(" USING ");
+                s.push_str(&u.join(", "));
+            }
+            line(depth, &format!("{s};"), out);
+        }
+        Node::Txn { op, name } => {
+            if name.is_some() || !matches!(op.as_str(), "COMMIT" | "ROLLBACK") {
+                return Err(format!(
+                    "the transaction statement {op} has no PL/pgSQL spelling"
+                ));
+            }
+            line(depth, &format!("{op};"), out);
         }
     }
     Ok(())

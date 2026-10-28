@@ -1,9 +1,16 @@
 /-
 The C1 mirror check (docs/verified-conversion.md, "certifying converter"):
 a T-SQL routine `a` (the reference) and its PL/pgSQL conversion `b` are
-confirmed when `lowerP b` is `lowerT a` with its variables renamed by the
-certificate, and the renaming is injective on `a`'s variables. Lean does
-not search: the certificate says the renaming, the checker verifies it.
+confirmed when `lowerP b` is `lowerT a` settled (C4,
+`Sqldiff.Core.Stmt.settleTop`: `undo` on every handler whose body cannot
+fail after a write, and on every handler outside other handled bodies
+that always fails without touching the database) with its variables
+renamed by the certificate, and the renaming is injective on `a`'s
+variables. Lean does not search: the certificate says the renaming, the
+checker verifies it; settling is a function of the lowered routine,
+proven to change no observation (`Sqldiff.Core.Routine.obs_settleTop`:
+outcomes agree except in the database of a failed run, which a failed
+observation does not carry).
 
 The certificate is untrusted: a wrong one makes the answer unconfirmed,
 never wrong. What is trusted: the lowering (it is the spec), the
@@ -26,6 +33,7 @@ the lowering rules tie to each vendor's documentation.
 -/
 import Sqldiff.Core.Rename
 import Sqldiff.Core.OpFree
+import Sqldiff.Core.Handlers
 import Sqldiff.Mirror.Lower
 import Sqldiff.Gate
 
@@ -96,8 +104,9 @@ And one fact about the caller:
   `XACT_ABORT ON` rolls back the open transaction, and with none open the
   statements before the failing one stay committed ("SET XACT_ABORT
   (Transact-SQL)"; autocommit, "Transactions (Transact-SQL)"), while
-  PostgreSQL rolls back the whole `CALL` with its transaction. Phase C4
-  models both.
+  PostgreSQL rolls back the whole `CALL` with its transaction. C4 models
+  the state a *handled* error leaves (`Core.Stmt.tryCatch`); the state
+  after an error that leaves the routine stays unobserved.
 
 And, for strings (C2b, `Sqldiff.Mirror`, "The C2b slice: strings"):
 
@@ -118,15 +127,45 @@ And, for strings (C2b, `Sqldiff.Mirror`, "The C2b slice: strings"):
   type (at most `n` bytes for `varchar(n)`, `n` byte-pairs for
   `nvarchar(n)`; for `varchar` only characters of the database's code
   page), so T-SQL does not truncate or replace it on entry and the
-  PostgreSQL routine sees the same value. -/
+  PostgreSQL routine sees the same value.
+
+And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
+
+* `ASM-CATCH-CORE-ERRORS`, when the routine has a handler: inside a
+  handled block no error is raised that the core does not model
+  (deadlocks, timeouts, cancellation, resource limits, name resolution),
+  or such an error is caught, or not, alike by T-SQL `CATCH` and
+  PL/pgSQL `WHEN OTHERS`.
+* `ASM-NO-CALLER-TXN`, when an error can reach a handler, or the routine
+  has transaction statements (also those of the rollback-and-rethrow
+  idiom, which lowers to its body): the caller holds no open transaction
+  (T-SQL: `@@TRANCOUNT` 0 on entry and `IMPLICIT_TRANSACTIONS OFF`;
+  PostgreSQL: a top-level `CALL` outside a transaction block). Otherwise
+  a handled error dooms the caller's T-SQL transaction under `XACT_ABORT
+  ON`, and PostgreSQL's `COMMIT` fails.
+* `ASM-THROW-ERRCODE`, when the routine raises an error of its own:
+  callers do not tell such errors apart by the T-SQL error number (the
+  PostgreSQL caller sees SQLSTATE P0001).
+
+`ASM-STATE-AFTER-ERROR` is decided on the settled routine
+(`Core.Routine.settle`): a handled body that cannot fail after a write
+leaves nothing behind when it fails, which is what `undo` says. -/
 def residual (a : Ast.Routine) (ca : Core.Routine) : List String :=
   (if ca.mayRaise then ["ASM-TSQL-ARITH-ERRORS"] else []) ++
     (if ca.hasEqNe then ["ASM-TSQL-ANSI-NULLS"] else []) ++
-    (if ca.errAfterWrite then ["ASM-STATE-AFTER-ERROR"] else []) ++
+    (if ca.settle.errAfterWrite then ["ASM-STATE-AFTER-ERROR"] else []) ++
     (if ca.hasConcat && !concatNullOn a then ["ASM-CONCAT-NULL"] else []) ++
     (if ca.hasStrEq then ["ASM-BINARY-COLLATION"] else []) ++
     (if ca.hasLen then ["ASM-TSQL-LEN-BMP"] else []) ++
-    (if tsqlStringParams a then ["ASM-TSQL-STRING-ARGS"] else [])
+    (if tsqlStringParams a then ["ASM-TSQL-STRING-ARGS"] else []) ++
+    (if ca.hasCatch then ["ASM-CATCH-CORE-ERRORS"] else []) ++
+    (if ca.catches || ca.hasCommit || tsqlTxn a then ["ASM-NO-CALLER-TXN"] else []) ++
+    (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else [])
+
+/-- The routines use C4: a handler, a raised error or transaction
+control (the `"errors"` field of an answer). -/
+def usesC4 (a : Ast.Routine) (ca : Core.Routine) : Bool :=
+  ca.hasCatch || ca.raisesUser || ca.hasCommit || tsqlTxn a
 
 /-- The residual of a T-SQL routine, when it lowers. -/
 def residualOf (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option (List String) :=
@@ -155,7 +194,7 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
       .unconfirmed "certificate: two T-SQL variables are given one PL/pgSQL name"
     else if !cert.covers ca.vars then
       .unconfirmed "certificate: a T-SQL variable has no PL/pgSQL name"
-    else if InjOn cert.ren ca.vars ∧ cb = ca.rename cert.ren then
+    else if InjOn cert.ren ca.vars ∧ cb = ca.settleTop.rename cert.ren then
       .confirmed (if inC2a dep Γ a b ca cb then theoremC2a else theoremC1)
     else
       .unconfirmed "the lowered routines differ beyond the renaming"
@@ -188,7 +227,7 @@ theorem check_sound (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.R
     · next hok =>
       obtain ⟨inj, heq⟩ := hok
       rw [heq]
-      exact refines_rename es wm ca inj
+      exact refines_settleTop_rename es wm ca inj
     · cases h
 
 /-- A confirmed answer that names this theorem means, in addition: both

@@ -134,6 +134,9 @@ fn returns_value(nodes: &[Node]) -> bool {
         Node::Block(b) => returns_value(&b.body),
         Node::If { then, els, .. } => returns_value(then) || returns_value(els),
         Node::While { body, .. } => returns_value(body),
+        Node::Try { body, handlers } => {
+            returns_value(body) || handlers.iter().any(|h| returns_value(&h.body))
+        }
         _ => false,
     })
 }
@@ -180,6 +183,12 @@ fn tsql_locals(nodes: &[Node], out: &mut Vec<String>) {
                 tsql_locals(els, out);
             }
             Node::While { body, .. } => tsql_locals(body, out),
+            Node::Try { body, handlers } => {
+                tsql_locals(body, out);
+                for h in handlers {
+                    tsql_locals(&h.body, out);
+                }
+            }
             _ => {}
         }
     }
@@ -195,6 +204,12 @@ fn callees(nodes: &[Node], out: &mut Vec<Vec<String>>) {
                 callees(els, out);
             }
             Node::While { body, .. } => callees(body, out),
+            Node::Try { body, handlers } => {
+                callees(body, out);
+                for h in handlers {
+                    callees(&h.body, out);
+                }
+            }
             _ => {}
         }
     }
@@ -219,6 +234,12 @@ fn written_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
                 written_tables(els, out);
             }
             Node::While { body, .. } => written_tables(body, out),
+            Node::Try { body, handlers } => {
+                written_tables(body, out);
+                for h in handlers {
+                    written_tables(&h.body, out);
+                }
+            }
             _ => {}
         }
     }

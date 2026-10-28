@@ -29,6 +29,16 @@ theorem Arg.evalAll_opFree (es es' : ExprSem U) (σ : Store U) :
       | ref _ => rfl
     simp only [Arg.evalAll, ha, Arg.evalAll_opFree es es' σ as h.2]
 
+theorem Stmt.opFree_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).opFree = s.opFree
+  | .reraise => rfl
+  | .seq s t => by simp [Stmt.bindErr, Stmt.opFree, Stmt.opFree_bindErr k s, Stmt.opFree_bindErr k t]
+  | .ite c s t => by
+    simp [Stmt.bindErr, Stmt.opFree, Stmt.opFree_bindErr k s, Stmt.opFree_bindErr k t]
+  | .while c b => by simp [Stmt.bindErr, Stmt.opFree, Stmt.opFree_bindErr k b]
+  | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.opFree, Stmt.opFree_bindErr k b]
+  | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
+  | .commit => rfl
+
 theorem exec_opFree (es es' : ExprSem U) (wm : WorldModel U W) :
     ∀ (n : Nat) (s : Stmt) (st : State U W), s.opFree = true →
       exec es wm n s st = exec es' wm n s st
@@ -89,6 +99,16 @@ theorem exec_opFree (es es' : ExprSem U) (wm : WorldModel U W) :
       (st.db.get t.name)
     simp only [Option.map_id'] at this
     simp only [exec, this]
+  | _ + 1, .raise _, _, _ => rfl
+  | _ + 1, .reraise, _, _ => rfl
+  | _ + 1, .commit, _, _ => rfl
+  | n + 1, .tryCatch u b h, st, hop => by
+    simp only [Stmt.opFree, Bool.and_eq_true] at hop
+    simp only [exec, exec_opFree es es' wm n b st hop.1]
+    cases exec es' wm n b st with
+    | error k st' =>
+      exact exec_opFree es es' wm n _ _ (by rw [Stmt.opFree_bindErr]; exact hop.2)
+    | _ => rfl
 
 theorem bindParams_opFree (es es' : ExprSem U) :
     ∀ (ps : List Param) (vs : List (Val U)) (σ : Store U), ps.all Param.opFree = true →

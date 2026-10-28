@@ -150,6 +150,27 @@ theorem Agree.setRefs (inj : InjOn f D) :
     simp only [List.map_cons, Arg.rename, Store.setRefs]
     exact Agree.setRefs inj as vs _ _ (fun y hy => hs y (by simp [hy])) h
 
+theorem Stmt.rename_bindErr (k : ErrKind) :
+    ∀ s : Stmt, (s.bindErr k).rename f = (s.rename f).bindErr k
+  | .reraise => rfl
+  | .seq s t => by
+    simp [Stmt.bindErr, Stmt.rename, Stmt.rename_bindErr k s, Stmt.rename_bindErr k t]
+  | .ite c s t => by
+    simp [Stmt.bindErr, Stmt.rename, Stmt.rename_bindErr k s, Stmt.rename_bindErr k t]
+  | .while c b => by simp [Stmt.bindErr, Stmt.rename, Stmt.rename_bindErr k b]
+  | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.rename, Stmt.rename_bindErr k b]
+  | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
+  | .commit => rfl
+
+theorem Stmt.vars_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).vars = s.vars
+  | .reraise => rfl
+  | .seq s t => by simp [Stmt.bindErr, Stmt.vars, Stmt.vars_bindErr k s, Stmt.vars_bindErr k t]
+  | .ite c s t => by simp [Stmt.bindErr, Stmt.vars, Stmt.vars_bindErr k s, Stmt.vars_bindErr k t]
+  | .while c b => by simp [Stmt.bindErr, Stmt.vars, Stmt.vars_bindErr k b]
+  | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.vars, Stmt.vars_bindErr k b]
+  | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
+  | .commit => rfl
+
 /-! ## The lock-step simulation -/
 
 /-- Related states: stores agree through `f` on `D`; same world, same
@@ -269,6 +290,23 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
     cases deleteRows (fun ρ e => e.eval es a.store ρ) t c (b.db.get t.name) with
     | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
     | ok rs => exact ⟨hst, hw, rfl, hc⟩
+  | _ + 1, .raise _, _, _, _, h => ⟨rfl, h⟩
+  | _ + 1, .reraise, _, _, _, h => ⟨rfl, h⟩
+  | _ + 1, .commit, _, _, _, h => h
+  | n + 1, .tryCatch u body hd, a, b, hs, h => by
+    have ih := exec_rename es wm inj n body a b (fun y hy => hs y (by simp [Stmt.vars, hy])) h
+    simp only [exec, Stmt.rename]
+    generalize exec es wm n body a = oA at ih ⊢
+    generalize exec es wm n (body.rename f) b = oB at ih ⊢
+    cases oA <;> cases oB <;> simp only [OutRel] at ih ⊢
+    all_goals first | exact ih | exact ih.elim | skip
+    obtain ⟨rfl, hst⟩ := ih
+    rw [← Stmt.rename_bindErr]
+    refine exec_rename es wm inj n _ _ _ (fun y hy => hs y (by
+      simp only [Stmt.vars, List.mem_append]; exact Or.inr (by rwa [Stmt.vars_bindErr] at hy))) ?_
+    cases u
+    · exact hst
+    · exact ⟨hst.1, hst.2.1, h.2.2.1, hst.2.2.2⟩
 
 /-! ## Routines -/
 

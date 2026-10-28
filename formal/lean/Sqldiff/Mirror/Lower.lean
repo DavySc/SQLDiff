@@ -2,12 +2,14 @@
 The lowering of T-SQL and PL/pgSQL routines, as the Rust parser reads them
 (`Sqldiff.Ast`, generated), into the core. Decision 9
 (docs/verified-conversion.md): this file *is* the specification of the C1
-constructs, of the C2a scalar slice with the C2b strings, and of the C3a data statements in both
+constructs, of the C2a scalar slice with the C2b strings, of the C3a data statements and
+of the C4 error handling and transaction control in both
 dialects; there is no other T-SQL or PL/pgSQL semantics to prove it
 against. One abstract syntax serves both dialects and the dialect is a
 parameter. The lowering is partial: `none` means "outside the spec"
-(queries, `MERGE`, data statements outside C3a, error handlers, other
-settings, ...), and a routine outside it is never confirmed.
+(queries, `MERGE`, data statements outside C3a, handlers and
+transaction statements outside C4, other settings, ...), and a routine
+outside it is never confirmed.
 
 Errors (C2a): an expression of the slice can fail (overflow, division by
 zero), and the core then ends the routine with an error observation. That
@@ -18,8 +20,10 @@ faithful for every run only when the routine aborts on errors
 (`abortsT`), and otherwise for the runs that raise none, as in C1. A C2a
 confirmation (`Sqldiff.Mirror.inC2a`) asks for one or the other. Errors
 from elsewhere (a missing argument without a default, `OUTPUT` on a
-parameter that is not one, a failing callee) are C4: the rule says what
-happens otherwise.
+parameter that is not one, a failing callee) are not modelled: the rule
+says what happens otherwise. C4 handles errors (below) but still does
+not model a callee's errors, so a call is outside the spec where an error
+would be handled.
 
 Data (C3a): single-table `INSERT ... VALUES`, `UPDATE` and `DELETE` on a
 table the target catalog describes, with the columns of the row in scope
@@ -27,9 +31,14 @@ table the target catalog describes, with the columns of the row in scope
 citation and probe status). A data statement that fails has no effect
 (statement atomicity) and then ends the routine like any error.
 
+Errors and transactions (C4): T-SQL `TRY`/`CATCH` and PL/pgSQL
+exception blocks, `THROW` and `RAISE`, `BEGIN TRAN`/`COMMIT` in a
+bracket, the rollback-and-rethrow idiom, and PL/pgSQL `COMMIT` (section
+"The C4 rules", each rule with its citation and probe status).
+
 Read top to bottom: the trusted inputs, names in data statements, the C2a
 slice with its vendor citations, the C2b strings, expressions, the C3a data statements,
-statements, calls, blocks, the two routines, and the test for "every
+statements, calls, the C4 rules, blocks, the two routines, and the test for "every
 expression is in the slice".
 -/
 import Sqldiff.Ast
@@ -184,6 +193,8 @@ def resolveName (d : Dialect) (sc : Scope) (x : String) : Option (Sum Core.Col V
   | .tsql _ _ => (lookup sc.cols x).map .inl
   | .pg _ vars =>
     let n := pgName x
+    -- C4: the error variables of a handler are outside the spec.
+    if n == "sqlstate" || n == "sqlerrm" then none else
     match lookup sc.cols n with
     | some c => if vars.contains n then none else some (.inl c)
     | none => if sc.rel == some n then none else some (.inr n)
@@ -984,6 +995,12 @@ is later C2 work. Expressions that read data (subqueries, `EXISTS`,
 
 def flag (b : Bool) : String := if b then "1" else "0"
 
+/-- T-SQL functions that read the error a `CATCH` handles, or the
+transaction state (C4): outside the spec. -/
+def errorFns : List String :=
+  ["ERROR_NUMBER", "ERROR_MESSAGE", "ERROR_SEVERITY", "ERROR_STATE", "ERROR_LINE",
+   "ERROR_PROCEDURE", "XACT_STATE"]
+
 def tyName : Ast.Ty → String
   | .Ty n args => n.toLower ++ "(" ++ ",".intercalate args ++ ")"
 
@@ -1011,6 +1028,8 @@ mutual
     | .Null => some .null
     | .Star _ => none
     | .CallE (.CallF n args distinct order withinGroup over star) =>
+      -- C4: the error functions are outside the spec ("The C4 rules").
+      if (d matches .tsql _ _) && errorFns.contains (dotted n).toUpper then none else
       withSlice d env sc (.CallE (.CallF n args distinct order withinGroup over star))
         (if distinct || !order.isEmpty || withinGroup || over || star then none
         else (lowerExprs d env sc args).map (.op ("fn:" ++ (dotted n).toLower)))
@@ -1444,7 +1463,7 @@ back"), which is what the core does with every error, so it lowers to
 nothing. Where it is the routine's first statement (`abortsT`), every
 error of the routine ends it; elsewhere it changes nothing for runs that
 raise no error, and a C2a confirmation then needs a routine that cannot
-raise. The rollback of the caller's transaction is C4. `XACT_ABORT OFF`
+raise. What the caller's transaction sees is "The C4 rules" (`ASM-NO-CALLER-TXN`). `XACT_ABORT OFF`
 and other settings (`ARITHABORT`, `ANSI_WARNINGS`, ...) change error
 behaviour: outside the spec.
 
@@ -1461,38 +1480,414 @@ def lowerSetting (d : Dialect) (name : String) (on : Bool) : Option (List Stmt) 
     else none
   | .pg _ _ => none
 
+/-! ## The C4 rules: errors and transactions
+
+Phase C4 adds T-SQL `TRY`/`CATCH`, `THROW` and `BEGIN TRAN`/`COMMIT`,
+and PL/pgSQL exception blocks, `RAISE` and `COMMIT`, lowered to the
+core's `tryCatch`, `raise`, `reraise` and `commit`
+(`Sqldiff.Core.Stmt`). Each rule states its claim, the vendor text and
+the probe status, as for C2a. "V10", "V17" and "V18" are the vendor facts
+of docs/vendor-facts-verification.md, checked against the vendor pages on
+2026-10-23/24; **every other vendor quote in this section was written
+from memory** (the vendor sites were not reachable when it was written,
+2026-10-28) and reviewers check it against the page named. **No rule of
+this section is probed**: `eval/` has no run of `TRY`/`CATCH`,
+`EXCEPTION`, `THROW`, `RAISE` or transaction control on either engine;
+the error and transaction model `formal/ErrorTxn.tla` with the cases of
+`formal/profiles/error-txn.toml` is a model, not an engine run.
+
+**Which errors exist.** The core's errors are integer overflow and
+division by zero (`arithmetic`), `NOT NULL` and primary key violations
+(`constraint`), errors the routine raises (`user`, below) and an
+uninterpreted operator's (`other`, C1 path only). Both handlers catch
+every one of them: T-SQL "TRY...CATCH (Transact-SQL)": "A TRY...CATCH
+construct catches all execution errors that have a severity higher than
+10 that do not close the database connection" (from memory); 8115, 8134,
+515 and `THROW` have severity 16, 2627 severity 14 (from memory).
+PL/pgSQL: "The special condition name OTHERS matches every error type
+except QUERY_CANCELED and ASSERT_FAILURE" (V18). What either engine does
+not catch (T-SQL: severity 20 and above, attentions, `KILL`, and at the
+same level compile, recompilation and deferred-name-resolution errors,
+V10; PL/pgSQL: `query_canceled`, `assert_failure`, FATAL and PANIC, V18)
+comes from events the core does not model (cancellation, timeouts,
+resource limits, a catalog other than the one given): a confirmation of
+a routine with a handler rests on `ASM-CATCH-CORE-ERRORS`, that inside a
+handled block no error is raised that the core does not model, or that
+such an error is caught, or not, alike by both. A T-SQL routine with
+`RAISERROR` is outside the spec (below).
+
+**`TRY`/`CATCH` against `EXCEPTION WHEN OTHERS`.**
+T-SQL `BEGIN TRY b END TRY BEGIN CATCH h END CATCH` lowers to
+`tryCatch false b h`; PL/pgSQL `BEGIN b EXCEPTION WHEN OTHERS THEN h END`
+(a nested block without `DECLARE`, one handler, condition `OTHERS`)
+lowers to `tryCatch true b h`. Any other condition list (`WHEN
+division_by_zero`, `SQLSTATE '22012'`, several handlers) is outside the
+spec.
+
+* Control: when `b` raises, the rest of `b` is skipped and `h` runs;
+  when `b` finishes, `h` is skipped. T-SQL: "If there is an error in the
+  code that is enclosed in a TRY block, control passes to the first
+  statement in the associated CATCH block", and after a TRY block without
+  error, "control passes to the statement immediately after the
+  associated END CATCH statement" (from memory). PL/pgSQL "Trapping
+  Errors": "if an error occurs within the statements, further processing
+  of the statements is abandoned, and control passes to the EXCEPTION
+  list ... the corresponding handler_statements are executed, and then
+  control passes to the next statement after END" (V18's page; quoted
+  from memory). Not probed.
+* An error inside `h` is not caught by the same handler and leaves it:
+  T-SQL "TRY...CATCH": errors in a CATCH block go to an enclosing TRY or
+  to the caller (from memory); PL/pgSQL: "If a new error occurs within
+  the selected handler_statements, it cannot be caught by this EXCEPTION
+  clause, but is propagated out" (from memory). Handlers nest in both, as
+  `tryCatch` does. Not probed.
+* Variables keep the values the error left in both: PL/pgSQL "the local
+  variables of the PL/pgSQL function remain as they were when the error
+  occurred" (V18); T-SQL variables are not transactional (from memory:
+  "Transactions (Transact-SQL)", table variables and variables are not
+  affected by a rollback). Not probed.
+* **The database differs**: PL/pgSQL "all changes to persistent database
+  state within the block are rolled back" (V18), which is `undo`; T-SQL
+  rolls back only the failing statement, and keeps what `b` wrote
+  before it, committed when no transaction is open. With `XACT_ABORT ON`
+  in an open transaction, the error makes the transaction uncommittable
+  instead (`XACT_STATE() = -1`: "An error can make the transaction
+  uncommittable", V10), and every write of `h` then fails (error 3930,
+  from memory). So the T-SQL lowering is faithful only when no
+  transaction is open when the routine is called and the routine opens
+  none around a handled error: `ASM-NO-CALLER-TXN` (the caller holds no
+  open transaction, and `IMPLICIT_TRANSACTIONS` is `OFF` so that a
+  statement does not open one), named whenever an error can reach a
+  handler; and `BEGIN TRAN` is outside the spec inside a `TRY` (below).
+  The two lowerings then differ only by `undo`, and the check settles it
+  (`Sqldiff.Core.Stmt.settle`, theorem `Sqldiff.Core.exec_settle`): a
+  T-SQL `TRY` whose body cannot fail after it may have written
+  (`Sqldiff.Core.Stmt.undoSafe`) means the same with `undo`, and is
+  confirmed against an `EXCEPTION` block; one whose body can, is refused.
+* A call inside a handled body (at any depth) is outside the spec: a
+  callee's own errors are not in the core (`WorldModel.call` does not
+  fail), and its writes before its error are kept by T-SQL and rolled
+  back by PL/pgSQL.
+
+**`THROW` and `RAISE EXCEPTION`** raise an error of the kind `user`.
+
+* T-SQL `THROW n, m, s` with `n` an integer literal from 50000 to
+  2147483647, `m` a string literal and `s` an integer literal from 0 to
+  255: "THROW (Transact-SQL)": error_number "must be greater than or
+  equal to 50000 and less than or equal to 2147483647", state is
+  `tinyint`, "The severity is always set to 16", and "If a TRY...CATCH
+  construct is not available, the statement batch is terminated" (from
+  memory); so it ends the routine whatever `XACT_ABORT` says, which the
+  core does with every error. Variables as arguments are outside the
+  spec (a NULL or out-of-range value fails differently).
+* PL/pgSQL `RAISE [EXCEPTION] 'f'` with `f` without `%`, or `RAISE
+  [EXCEPTION] USING MESSAGE = 'm'`, optionally with `ERRCODE = 'P0001'`:
+  "Errors and Messages": the level `EXCEPTION` is the default and "raises
+  an error (which normally aborts the current transaction)"; "If no
+  condition name nor SQLSTATE is specified in a RAISE EXCEPTION command,
+  the default is to use raise_exception (P0001)" (from memory). Other
+  levels (`NOTICE`, ...) send a message, not an error: outside the spec.
+  A `%` in the format, arguments, or any other option (`DETAIL`,
+  `HINT`, another `ERRCODE`) are outside it too.
+* The caller sees error number `n` from T-SQL and SQLSTATE P0001 from
+  PostgreSQL, with the same message: decision 1 compares the kind, not
+  the number or the text, so a confirmation that raises rests on
+  `ASM-THROW-ERRCODE` (callers do not tell user errors apart by number).
+* `RAISERROR` is outside the spec: its severity decides whether it is an
+  error at all (0 to 10 are messages), and it does not end the routine
+  under `XACT_ABORT ON` ("THROW honours XACT_ABORT; RAISERROR does not",
+  V10). The converter refuses it too.
+
+**Re-raising.** T-SQL `THROW;` and PL/pgSQL `RAISE;` re-raise the error
+the handler handles, with its kind: "THROW (Transact-SQL)": "If the
+THROW statement is specified without parameters, it must appear inside a
+CATCH block. This causes the caught exception to be raised" (from
+memory); PL/pgSQL: the form without parameters "can only be used inside
+a BEGIN block's EXCEPTION clause; it causes the error currently being
+handled to be re-thrown" (from memory). They lower to `reraise` only
+directly in a handler, at any depth of `IF`/`WHILE` but not inside a
+`TRY` or block nested in the handler (which error it means there is not
+written down for both: outside the spec). Not probed.
+
+**Error functions.** `ERROR_NUMBER()`, `ERROR_MESSAGE()`,
+`ERROR_SEVERITY()`, `ERROR_STATE()`, `ERROR_LINE()`,
+`ERROR_PROCEDURE()`, `XACT_STATE()` and `@@ERROR` (T-SQL), and `SQLSTATE`
+and `SQLERRM` (PL/pgSQL) are outside the spec wherever they stand: the
+converter maps `ERROR_NUMBER()` to `SQLSTATE`, a number against a
+five-character code, and no mapping between them is exact.
+
+**Transactions, T-SQL.** `BEGIN TRAN` and `COMMIT` (without a name) only
+in a T-SQL routine that starts with `SET XACT_ABORT ON` (`abortsT`), and
+only as a bracket (`txnBracket`): in the routine's own statement list
+(or in the body of the `TRY` of the idiom below), each `BEGIN TRAN`
+followed in the same list by a `COMMIT`, not nested, and between them no
+`RETURN`, call, `TRY` or other transaction statement at any depth. Under
+`ASM-NO-CALLER-TXN` the transaction is then the routine's own, from
+`BEGIN TRAN` (`@@TRANCOUNT` 0 to 1, "BEGIN TRANSACTION (Transact-SQL)",
+from memory) to `COMMIT` (1 to 0, which "makes all data modifications
+... a permanent part of the database", "COMMIT TRANSACTION
+(Transact-SQL)", from memory); an error between them under `XACT_ABORT
+ON` rolls it back and ends the routine ("SET XACT_ABORT": "the entire
+transaction is terminated and rolled back", V10), which the core shows as
+the failed call it is, the database after it not observed
+(`ASM-STATE-AFTER-ERROR` as before). A finished call shows the database
+with everything committed, as without the transaction, so `BEGIN TRAN`
+lowers to nothing and `COMMIT` to the core's `commit`, which does
+nothing. Outside the spec: a `COMMIT` without its `BEGIN TRAN` (error
+3902), a `BEGIN TRAN` without its `COMMIT` (error 266 at the end of the
+procedure, from memory), nesting (`@@TRANCOUNT` 2), a `RETURN` between
+them, `ROLLBACK` except in the idiom below, `SAVE TRAN`, named
+transactions, and any of them inside `TRY`, `CATCH`, `IF` or `WHILE`.
+
+**The rollback-and-rethrow idiom.** T-SQL `BEGIN TRY b END TRY BEGIN
+CATCH IF @@TRANCOUNT > 0 ROLLBACK; THROW; END CATCH` (or `ROLLBACK;
+THROW;` when `b` begins with `BEGIN TRAN` and ends with `COMMIT`, so that
+a transaction is open whenever `b` fails), not inside any other `TRY` or
+`CATCH`, lowers to `b` itself, at transaction level (its `BEGIN TRAN`
+and `COMMIT` as above). When `b` fails, the handler rolls back the open
+transaction ("ROLLBACK TRANSACTION (Transact-SQL)": back to the
+outermost `BEGIN TRAN`, `@@TRANCOUNT` to 0, from memory) and re-raises
+the same error, so the routine fails with that error's kind, which is
+what the core's `b` does; the rollback changes only the database after a
+failed call, which a failed observation does not carry. When `b` does
+not fail, the handler does not run. The converter writes `b` without the
+handler (rule `idiom.rollback-rethrow`). Not probed.
+
+**Transactions, PL/pgSQL.** `COMMIT` lowers to `commit`, only in a
+procedure that runs with its caller's privileges (not `SECURITY
+DEFINER`), outside every exception block and handler: "A transaction
+cannot be ended inside a block with exception handlers"; "A SECURITY
+DEFINER procedure cannot execute transaction control statements";
+"If CALL is executed in a transaction block, then the called procedure
+cannot execute transaction control statements" (V17). The last is
+`ASM-NO-CALLER-TXN` again: the procedure is called by a top-level `CALL`
+outside a transaction block, from a chain of `CALL`s and `DO`s only.
+Then `COMMIT` cannot fail and changes nothing a finished call shows.
+`ROLLBACK`, `COMMIT AND CHAIN` and the rest are outside the spec.
+Not probed.
+
+**Only in procedures.** A T-SQL function cannot contain `TRY`/`CATCH`,
+`THROW` or transaction statements ("CREATE FUNCTION (Transact-SQL)": the
+statements valid in a function include "Control-of-flow statements
+except TRY...CATCH statements", from memory), so in a T-SQL function
+they are outside the spec. A PL/pgSQL function may raise and handle
+errors, but its T-SQL counterpart is a function too (the check's header
+test), which has neither, so the lowered routines differ; PL/pgSQL
+`COMMIT` is refused in a function by V17 (`Ctx.commit`). -/
+
+/-- Where a node stands. -/
+structure Ctx where
+  /-- Inside the body of a `TRY` or an exception block, at any depth
+  (handlers of blocks nested in it included): an error there is handled. -/
+  handled : Bool := false
+  /-- Directly in a handler (not inside a block or `TRY` nested in it):
+  `THROW;` and `RAISE;` re-raise the error it handles. -/
+  inHandler : Bool := false
+  /-- Inside any `TRY`, `CATCH`, or exception block or handler. -/
+  nested : Bool := false
+  /-- (T-SQL) In a list whose `BEGIN TRAN` and `COMMIT` form a bracket
+  (`txnBracket`). -/
+  txn : Bool := false
+  /-- (PL/pgSQL) `COMMIT` may stand here: a procedure with the caller's
+  privileges, outside every exception block. -/
+  commit : Bool := false
+
+/-- Inside an `IF`, a `WHILE` or a block: no transaction level. -/
+def Ctx.inner (cx : Ctx) : Ctx := { cx with txn := false }
+
+/-- The body of a `TRY` or an exception block. -/
+def Ctx.body (cx : Ctx) : Ctx :=
+  { cx with handled := true, inHandler := false, nested := true, txn := false, commit := false }
+
+/-- A handler. -/
+def Ctx.handler (cx : Ctx) : Ctx :=
+  { cx with inHandler := true, nested := true, txn := false, commit := false }
+
+/-- A node in which nothing is a transaction statement, a `RETURN`, a call
+or a `TRY`, at any depth: what may stand inside an open T-SQL
+transaction. -/
+def txnInner : Ast.Node → Bool
+  | .NStmt (.Return _) => false
+  | .NStmt _ => true
+  | .Setting .. => true
+  | .If _ t e => txnInnerList t && txnInnerList e
+  | .While _ b => txnInnerList b
+  | .NBlock (.Block _ b) => txnInnerList b
+  | .Call .. | .Try .. | .Txn .. => false
+  | .Throw _ | .Raise .. => true
+where
+  txnInnerList : List Ast.Node → Bool
+    | [] => true
+    | n :: ns => txnInner n && txnInnerList ns
+
+def isTxn (op : String) : Ast.Node → Bool
+  | .Txn o none => o.toUpper == op
+  | _ => false
+
+/-- The `BEGIN TRAN`s and `COMMIT`s of a T-SQL statement list form a
+bracket: each `BEGIN TRAN` is closed by a `COMMIT` later in the list,
+none is nested, every `COMMIT` closes one, and what stands between them
+may stand in an open transaction (`txnInner`). Transaction statements
+deeper in the list are refused where they stand (`Ctx.txn`). -/
+def txnBracket (ns : List Ast.Node) : Bool :=
+  go false ns
+where
+  go (open_ : Bool) : List Ast.Node → Bool
+    | [] => !open_
+    | n :: ns =>
+      if isTxn "BEGIN" n then !open_ && go true ns
+      else if isTxn "COMMIT" n then open_ && go false ns
+      else (!open_ || txnInner n) && go open_ ns
+
+/-- `@@TRANCOUNT > 0`. -/
+def trancountPos : Ast.Expr → Bool
+  | .Bin ">" (.Var v) (.Num "0") => v.toUpper == "@@TRANCOUNT"
+  | _ => false
+
+/-- The handler of the rollback-and-rethrow idiom, for a `TRY` with body
+`b`: `IF @@TRANCOUNT > 0 ROLLBACK; THROW;`, or `ROLLBACK; THROW;` when
+`b` begins with `BEGIN TRAN` and ends with `COMMIT`. -/
+def rollbackRethrow (b h : List Ast.Node) : Bool :=
+  match h with
+  | [.If c [r] [], .Throw []] => trancountPos c && isTxn "ROLLBACK" r
+  | [r, .Throw []] =>
+    isTxn "ROLLBACK" r && (b.head?.map (isTxn "BEGIN")).getD false &&
+      (b.getLast?.map (isTxn "COMMIT")).getD false
+  | _ => false
+
+/-- The handlers of a `TRY` with body `b` are the idiom's. -/
+def idiomHandler (b : List Ast.Node) : List Ast.Handler → Bool
+  | [.Handler [] h] => rollbackRethrow b h
+  | _ => false
+
+/-- T-SQL `THROW n, m, s` of the spec. -/
+def throwOk : List Ast.Expr → Bool
+  | [.Num n, .Str _, .Num s] =>
+    (match intLit? n with
+      | some v => decide (50000 ≤ v)
+      | none => false) &&
+    (match intLit? s with
+      | some v => decide (0 ≤ v ∧ v ≤ 255)
+      | none => false)
+  | _ => false
+
+/-- The options of a PL/pgSQL `RAISE EXCEPTION` of the spec: `MESSAGE`
+a string literal, `ERRCODE` the literal `'P0001'`, each at most once,
+nothing else. -/
+def raiseOptsOk (fmt : Option String) (opts : List Ast.RaiseOpt) : Bool :=
+  let names := opts.map fun | .RaiseOpt n _ => n.toUpper
+  distinct names && !(fmt.isSome && names.contains "MESSAGE") &&
+    opts.all fun
+      | .RaiseOpt n (.Str v) =>
+        n.toUpper == "MESSAGE" || (n.toUpper == "ERRCODE" && v.toUpper == "P0001")
+      | _ => false
+
+/-- PL/pgSQL `RAISE [EXCEPTION] ...` of the spec (not the bare re-raise). -/
+def raiseOk (lvl fmt : Option String) (args : List Ast.Expr) (opts : List Ast.RaiseOpt) : Bool :=
+  (lvl.map (·.toUpper == "EXCEPTION")).getD true && args.isEmpty &&
+    (fmt.map fun f => !f.toList.contains '%').getD true &&
+    (fmt.isSome || !opts.isEmpty) && raiseOptsOk fmt opts
+
+/-- A transaction statement. -/
+def lowerTxn (d : Dialect) (cx : Ctx) (op : String) (name : Option String) : Option (List Stmt) :=
+  if name.isSome then none
+  else match d, op.toUpper with
+    | .tsql _ _, "BEGIN" => if cx.txn then some [] else none
+    | .tsql _ _, "COMMIT" => if cx.txn then some [.commit] else none
+    | .pg _ _, "COMMIT" => if cx.commit then some [.commit] else none
+    | _, _ => none
+
+/-- `THROW` (T-SQL) and `RAISE` (PL/pgSQL). -/
+def lowerThrow (d : Dialect) (cx : Ctx) (args : List Ast.Expr) : Option (List Stmt) :=
+  match d, args with
+  | .tsql _ _, [] => if cx.inHandler then some [.reraise] else none
+  | .tsql _ _, args => if throwOk args then some [.raise .user] else none
+  | .pg _ _, _ => none
+
+def lowerRaise (d : Dialect) (cx : Ctx) (lvl fmt : Option String) (args : List Ast.Expr)
+    (opts : List Ast.RaiseOpt) : Option (List Stmt) :=
+  match d, lvl, fmt, args, opts with
+  | .pg _ _, none, none, [], [] => if cx.inHandler then some [.reraise] else none
+  | .pg _ _, lvl, fmt, args, opts => if raiseOk lvl fmt args opts then some [.raise .user] else none
+  | .tsql _ _, _, _, _, _ => none
+
+mutual
+  /-- Some node of a T-SQL statement tree is a transaction statement. -/
+  def hasTxnNode : Ast.Node → Bool
+    | .Txn .. => true
+    | .If _ t e => hasTxnNodes t || hasTxnNodes e
+    | .While _ b => hasTxnNodes b
+    | .NBlock (.Block _ b) => hasTxnNodes b
+    | .Try b hs => hasTxnNodes b || hasTxnHandlers hs
+    | _ => false
+
+  def hasTxnNodes : List Ast.Node → Bool
+    | [] => false
+    | n :: ns => hasTxnNode n || hasTxnNodes ns
+
+  def hasTxnHandlers : List Ast.Handler → Bool
+    | [] => false
+    | .Handler _ b :: hs => hasTxnNodes b || hasTxnHandlers hs
+end
+
+/-- The settings a body starts with, in order. -/
+def leadingSettings : List Ast.Node → List (String × Bool)
+  | .Setting n on :: ns => (n.toUpper, on) :: leadingSettings ns
+  | _ => []
+
 /-! ## Blocks -/
 
 mutual
-  def lowerNode (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Node → Option (List Stmt)
+  def lowerNode (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (cx : Ctx) :
+      Ast.Node → Option (List Stmt)
     | .NStmt s => lowerStmt d env k s
-    | .NBlock b => lowerInner d env k b
+    | .NBlock b => lowerInner d env k cx.inner b
     | .If c t e => do
       let c' ← lowerExpr d env {} c
-      let t' ← lowerNodes d env k t
-      let e' ← lowerNodes d env k e
+      let t' ← lowerNodes d env k cx.inner t
+      let e' ← lowerNodes d env k cx.inner e
       pure [.ite c' (seqList t') (seqList e')]
     | .While c b => do
       let c' ← lowerExpr d env {} c
-      let b' ← lowerNodes d env k b
+      let b' ← lowerNodes d env k cx.inner b
       pure [.while c' (seqList b')]
-    | .Call n args ret => (lowerCall d env n args ret).map fun s => [s]
+    | .Call n args ret =>
+      -- C4: no call in a handled body.
+      if cx.handled then none else (lowerCall d env n args ret).map fun s => [s]
     | .Setting n on => lowerSetting d n on
+    | .Try b hs => match d, hs with
+      | .tsql _ _, [.Handler [] h] =>
+        if !(k matches .Procedure) then none
+        else if !cx.nested && rollbackRethrow b h then
+          -- The rollback-and-rethrow idiom: the body, at transaction level.
+          if txnBracket b then lowerNodes d env k { cx with txn := true } b else none
+        else do
+          let b' ← lowerNodes d env k cx.body b
+          let h' ← lowerNodes d env k cx.handler h
+          pure [.tryCatch false (seqList b') (seqList h')]
+      | .pg _ _, [.Handler ["others"] h] => do
+        let b' ← lowerNodes d env k cx.body b
+        let h' ← lowerNodes d env k cx.handler h
+        pure [.tryCatch true (seqList b') (seqList h')]
+      | _, _ => none
+    | .Throw args => if k matches .Procedure then lowerThrow d cx args else none
+    | .Raise lvl fmt args opts => lowerRaise d cx lvl fmt args opts
+    | .Txn op name => if k matches .Procedure then lowerTxn d cx op name else none
 
-  def lowerNodes (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) :
+  def lowerNodes (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (cx : Ctx) :
       List Ast.Node → Option (List Stmt)
     | [] => some []
     | n :: ns => do
-      let s ← lowerNode d env k n
-      let ss ← lowerNodes d env k ns
+      let s ← lowerNode d env k cx n
+      let ss ← lowerNodes d env k cx ns
       pure (s ++ ss)
 
   /-- A block inside the body. With declarations it is outside the spec: a
   PL/pgSQL nested `DECLARE` re-initialises on every entry and can shadow.
   Without, it is its statements (T-SQL `BEGIN ... END` has none). -/
-  def lowerInner (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) :
+  def lowerInner (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (cx : Ctx) :
       Ast.Block → Option (List Stmt)
-    | .Block [] body => lowerNodes d env k body
+    | .Block [] body => lowerNodes d env k cx body
     | .Block (_ :: _) _ => none
 end
 
@@ -1510,11 +1905,16 @@ mutual
     | .NBlock b => declsBlock b
     | .If _ t e => declsNodes t ++ declsNodes e
     | .While _ b => declsNodes b
-    | .NStmt _ | .Call .. | .Setting .. => []
+    | .Try b hs => declsNodes b ++ declsHandlers hs
+    | .NStmt _ | .Call .. | .Setting .. | .Throw _ | .Raise .. | .Txn .. => []
 
   def declsNodes : List Ast.Node → List (String × Option Ast.Ty)
     | [] => []
     | n :: ns => declsNode n ++ declsNodes ns
+
+  def declsHandlers : List Ast.Handler → List (String × Option Ast.Ty)
+    | [] => []
+    | .Handler _ b :: hs => declsNodes b ++ declsHandlers hs
 
   def declsBlock : Ast.Block → List (String × Option Ast.Ty)
     | .Block ds body => declTys ds ++ declsNodes body
@@ -1566,14 +1966,22 @@ def envT : Ast.Routine → TyEnv
 * two different names equal up to case, or a non-ASCII name: whether
   `@a` and `@A` are one variable depends on the instance's collation, so
   the lowering, which keeps names as written, is faithful only when no
-  two names of the routine could be confused. -/
+  two names of the routine could be confused;
+* (C4) a transaction statement in a routine that does not start with `SET
+  XACT_ABORT ON`, or `BEGIN TRAN` and `COMMIT` that do not form a bracket
+  in the routine's statement list ("The C4 rules"). -/
 def lowerT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option Core.Routine :=
   match a with
   | .Routine kind _ params _ _ _ body => do
     let d := Dialect.tsql dep Γ
     let env := envT a
     let ps ← params.mapM (lowerParam d env)
-    let stmts ← lowerInner d env kind body
+    let nodes ← match body with
+      | .Block [] ns => some ns
+      | .Block (_ :: _) _ => none
+    if hasTxnNodes nodes && !(leadingSettings nodes).contains ("XACT_ABORT", true) then none else
+    if !txnBracket nodes then none else
+    let stmts ← lowerNodes d env kind { txn := true } nodes
     let (ps, stmts) : List Core.Param × List Stmt := match kind with
       | .Procedure => (ps ++ [statusParam], Stmt.assign statusVar (.lit 0) :: stmts)
       | .Function => (ps, stmts)
@@ -1639,12 +2047,14 @@ the core has one variable per name); a variable never declared
 (`wellScoped`). -/
 def lowerP (Γ : Catalog) (b : Ast.Routine) : Option Core.Routine :=
   match b with
-  | .Routine kind _ params _ _ _ (.Block decls stmts) => do
+  | .Routine kind _ params _ sec _ (.Block decls stmts) => do
     let d := Dialect.pg Γ (pgVars b)
     let env := envP b
     let ps ← params.mapM (lowerParam d env)
     let ds ← decls.mapM (lowerDecl d env)
-    let body ← lowerNodes d env kind stmts
+    -- C4: `COMMIT` only in a procedure with its caller's privileges.
+    let cx : Ctx := { commit := (kind matches .Procedure) && (sec matches .Caller) }
+    let body ← lowerNodes d env kind cx stmts
     let body := (ds.map (·.2)).flatten ++ body
     -- The status of a procedure without `return_code` (see below).
     let (ps, body) : List Core.Param × List Stmt :=
@@ -1731,10 +2141,19 @@ mutual
     | .While c b => condOk d env {} c && sliceNodes d env wenv ret b
     | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env {} e
     | .Setting .. => true
+    -- The handler of the rollback-and-rethrow idiom is not lowered.
+    | .Try b hs =>
+      sliceNodes d env wenv ret b && (idiomHandler b hs || sliceHandlers d env wenv ret hs)
+    | .Throw _ | .Raise .. | .Txn .. => true
 
   def sliceNodes (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : List Ast.Node → Bool
     | [] => true
     | n :: ns => sliceNode d env wenv ret n && sliceNodes d env wenv ret ns
+
+  def sliceHandlers (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) :
+      List Ast.Handler → Bool
+    | [] => true
+    | .Handler _ b :: hs => sliceNodes d env wenv ret b && sliceHandlers d env wenv ret hs
 
   def sliceBlock (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Block → Bool
     | .Block ds body => ds.all (sliceStmt d env wenv ret) && sliceNodes d env wenv ret body
@@ -1764,11 +2183,6 @@ def sliceT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Bool :=
 def sliceP (Γ : Catalog) (b : Ast.Routine) : Bool :=
   sliceRoutine (.pg Γ (pgVars b)) (envP b) (envPDecl b) b
 
-/-- The settings a body starts with, in order. -/
-def leadingSettings : List Ast.Node → List (String × Bool)
-  | .Setting n on :: ns => (n.toUpper, on) :: leadingSettings ns
-  | _ => []
-
 /-- The T-SQL routine aborts on every error: `SET XACT_ABORT ON` comes
 before any statement that could fail. -/
 def abortsT : Ast.Routine → Bool
@@ -1785,5 +2199,10 @@ confirmation rests on the arguments fitting it (`ASM-TSQL-STRING-ARGS`,
 C2b). -/
 def tsqlStringParams : Ast.Routine → Bool
   | .Routine _ _ params _ _ _ _ => params.any fun | .Param _ ty _ _ => (strTypeT ty).isSome
+
+/-- The T-SQL routine has a transaction statement (C4): `BEGIN TRAN`,
+`COMMIT`, or the `ROLLBACK` of the rollback-and-rethrow idiom. -/
+def tsqlTxn : Ast.Routine → Bool
+  | .Routine _ _ _ _ _ _ (.Block _ body) => hasTxnNodes body
 
 end Sqldiff.Mirror

@@ -14,7 +14,8 @@ of the semantics (`ExprSem.op`). Phase C3a ("Statements", mirror depth)
 adds data: tables of rows of values, described by the target catalog
 (`TableDef`), and three single-table statements, `insert`, `update` and
 `delete`, whose expressions may read the columns of the row at hand
-(`SExpr.col`). There are no transactions yet (C4).
+(`SExpr.col`). Phase C4 adds handled errors (`tryCatch`, `raise`,
+`reraise`) and `commit`.
 -/
 
 namespace Sqldiff.Core
@@ -168,6 +169,25 @@ end
 
 instance : DecidableEq Expr := Expr.decEq
 
+/-- Why an expression or a statement fails. `overflow` is T-SQL error
+8115 and PostgreSQL SQLSTATE 22003 ("integer out of range"); `divByZero`
+is T-SQL 8134 and SQLSTATE 22012. `constraint` is a data statement that
+would leave a NULL in a `NOT NULL` or key column (T-SQL 515, SQLSTATE
+23502) or two rows with one primary key (T-SQL 2627, SQLSTATE 23505).
+`other` is raised by an uninterpreted operator, or by a value of the
+wrong kind where the core needs an integer. `user` (C4) is an error the
+routine raises itself: T-SQL `THROW number, message, state` (error
+`number` ≥ 50000, severity 16) and PL/pgSQL `RAISE EXCEPTION` (SQLSTATE
+P0001, `raise_exception`); neither the number nor the message is part of
+the kind (decision 1 compares kinds, `ASM-THROW-ERRCODE`). -/
+inductive ErrKind where
+  | overflow
+  | divByZero
+  | constraint
+  | other (code : String)
+  | user
+deriving DecidableEq, Repr
+
 /-- An argument of a call: a value, or a variable the callee writes back
 (T-SQL `@x OUTPUT`; a variable in an `OUT`/`INOUT` position of a
 PostgreSQL `CALL`). A `ref` argument passes the variable's current value. -/
@@ -193,7 +213,28 @@ The data statements of C3a carry the definition of the table they write
   `none`).
 
 Their meaning is `Sqldiff.Core.insertRows`, `updateRows` and
-`deleteRows`. -/
+`deleteRows`.
+
+Phase C4 adds error handling and transaction control:
+
+* `tryCatch undo body handler`: runs `body`; if it ends with an error,
+  runs `handler` with that error bound to its `reraise`s
+  (`Stmt.bindErr`), from the state the error left, except that with
+  `undo` the database is put back as it was when `body` began. `undo` is
+  PL/pgSQL's `BEGIN ... EXCEPTION WHEN OTHERS THEN ... END` (the block is a
+  subtransaction); without it, T-SQL's `BEGIN TRY ... END TRY BEGIN CATCH
+  ... END CATCH`. Variables keep the values the error left in both.
+* `raise k`: fails with `k` (`THROW n, m, s`, `RAISE EXCEPTION`: `k` is
+  `ErrKind.user`).
+* `reraise`: T-SQL `THROW;`, PL/pgSQL `RAISE;`, the error the enclosing
+  handler handles. A handler's `reraise`s are replaced by `raise k` when
+  it runs (`Stmt.bindErr`); one that is never bound fails with
+  `other "reraise"` (the lowerings put `reraise` only directly in a
+  handler).
+* `commit`: T-SQL `COMMIT` and PL/pgSQL `COMMIT`, where the lowerings
+  admit them (`Sqldiff.Mirror`, "The C4 rules"): it changes nothing a
+  finished call shows, so it does nothing. A statement of its own, not
+  `skip`, so that a confirmation names it (`ASM-NO-CALLER-TXN`). -/
 inductive Stmt where
   | skip
   | assign (x : Var) (e : Expr)
@@ -205,7 +246,23 @@ inductive Stmt where
   | insert (t : TableDef) (cols : List Col) (rows : List (List Expr))
   | update (t : TableDef) (sets : List (Col × Expr)) (cond : Option Expr)
   | delete (t : TableDef) (cond : Option Expr)
+  | tryCatch (undo : Bool) (body handler : Stmt)
+  | raise (k : ErrKind)
+  | reraise
+  | commit
 deriving DecidableEq, Repr
+
+/-- The handler of an error `k`: every `reraise` of `s` becomes `raise k`,
+except in the handlers of the `tryCatch`s inside `s`, which bind their
+own error. (The lowerings never put a `reraise` in the body of a
+`tryCatch` inside a handler, so what this does there does not matter.) -/
+def Stmt.bindErr (k : ErrKind) : Stmt → Stmt
+  | .reraise => .raise k
+  | .seq s t => .seq (s.bindErr k) (t.bindErr k)
+  | .ite c s t => .ite c (s.bindErr k) (t.bindErr k)
+  | .while c b => .while c (b.bindErr k)
+  | .tryCatch u b h => .tryCatch u (b.bindErr k) h
+  | s => s
 
 /-- A parameter: name, mode, and the default used when the caller passes
 no argument for it. -/
@@ -289,6 +346,8 @@ def Stmt.vars : Stmt → List Var
   | .insert _ _ rows => (rows.map fun es => (es.map Expr.vars).flatten).flatten
   | .update _ sets c => (sets.map fun p => p.2.vars).flatten ++ Expr.varsOpt c
   | .delete _ c => Expr.varsOpt c
+  | .tryCatch _ b h => b.vars ++ h.vars
+  | .raise _ | .reraise | .commit => []
 
 def Param.vars (p : Param) : List Var :=
   p.name :: (match p.default with | some e => e.vars | none => [])
@@ -343,6 +402,10 @@ def Stmt.rename (f : Var → Var) : Stmt → Stmt
   | .insert t cs rows => .insert t cs (rows.map (·.map (Expr.rename f)))
   | .update t sets c => .update t (sets.map fun p => (p.1, p.2.rename f)) (c.map (Expr.rename f))
   | .delete t c => .delete t (c.map (Expr.rename f))
+  | .tryCatch u b h => .tryCatch u (b.rename f) (h.rename f)
+  | .raise k => .raise k
+  | .reraise => .reraise
+  | .commit => .commit
 
 def Param.rename (f : Var → Var) (p : Param) : Param :=
   { p with name := f p.name, default := p.default.map (Expr.rename f) }
@@ -381,6 +444,8 @@ def Stmt.opFree : Stmt → Bool
   | .insert _ _ rows => rows.all (·.all Expr.opFree)
   | .update _ sets c => sets.all (·.2.opFree) && c.all Expr.opFree
   | .delete _ c => c.all Expr.opFree
+  | .tryCatch _ b h => b.opFree && h.opFree
+  | .raise _ | .reraise | .commit => true
 
 def Param.opFree (p : Param) : Bool :=
   match p.default with
@@ -403,6 +468,8 @@ def Stmt.exprs : Stmt → List Expr
   | .insert _ _ rows => rows.flatten
   | .update _ sets c => sets.map (·.2) ++ c.toList
   | .delete _ c => c.toList
+  | .tryCatch _ b h => b.exprs ++ h.exprs
+  | .raise _ | .reraise | .commit => []
 
 /-- Every expression of a routine: parameter defaults and the body's. -/
 def Routine.exprs (r : Routine) : List Expr :=
@@ -535,26 +602,29 @@ def Stmt.failsHere : Stmt → Bool
   | .update t sets c =>
     (Stmt.update t sets c).violates || sets.any (fun p => p.2.raise) || c.any Expr.raise
   | .delete _ c => c.any Expr.raise
+  | .raise _ | .reraise => true
   | _ => false
 
-/-- Some statement of `s` can fail. -/
+/-- Some statement of `s` can fail, and the error leave `s`: an error in
+the body of a `tryCatch` is handled (C4). -/
 def Stmt.mayFail : Stmt → Bool
   | .seq s t => s.mayFail || t.mayFail
   | .ite c a b => c.raise || a.mayFail || b.mayFail
   | .while c b => c.raise || b.mayFail
+  | .tryCatch _ _ h => h.mayFail
   | s => s.failsHere
 
 /-- `s` may write: a data statement, or a call (the callee may write). -/
 def Stmt.hasWrite : Stmt → Bool
   | .insert .. | .update .. | .delete .. | .call .. => true
-  | .seq s t | .ite _ s t => s.hasWrite || t.hasWrite
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.hasWrite || t.hasWrite
   | .while _ b => b.hasWrite
   | _ => false
 
 /-- `s` has a data statement. -/
 def Stmt.hasData : Stmt → Bool
   | .insert .. | .update .. | .delete .. => true
-  | .seq s t | .ite _ s t => s.hasData || t.hasData
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.hasData || t.hasData
   | .while _ b => b.hasData
   | _ => false
 
@@ -568,6 +638,9 @@ def Stmt.errAfterWrite (w : Bool) : Stmt → Bool
   | .while c b =>
     let w' := w || b.hasWrite
     (w' && c.raise) || b.errAfterWrite w'
+  -- An error of the body is handled; the handler starts from the
+  -- database the body began with when `undo`, else from what it left.
+  | .tryCatch u b h => h.errAfterWrite (w || (!u && b.hasWrite))
   | s => w && s.failsHere
 
 /-- The data statements are in the C3a slice (`Sqldiff.Mirror`, "The C3a
@@ -583,7 +656,7 @@ def Stmt.dmlSafe : Stmt → Bool
     !(c.any Expr.raise) && !(sets.any fun p => Expr.test SExpr.constRaise p.2) &&
       !((Stmt.update t sets c).violates && sets.any fun p => p.2.raise)
   | .delete _ c => !(c.any Expr.raise)
-  | .seq s t | .ite _ s t => s.dmlSafe && t.dmlSafe
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.dmlSafe && t.dmlSafe
   | .while _ b => b.dmlSafe
   | _ => true
 
@@ -597,5 +670,43 @@ def Routine.errAfterWrite (r : Routine) : Bool := r.body.errAfterWrite false
 def Routine.hasData (r : Routine) : Bool := r.body.hasData
 
 def Routine.dmlSafe (r : Routine) : Bool := r.body.dmlSafe
+
+/-! ## Handlers and transactions (C4)
+
+What decides the C4 residual assumptions (`Sqldiff.Mirror.residual`). -/
+
+/-- `s` has a handler. -/
+def Stmt.hasCatch : Stmt → Bool
+  | .tryCatch .. => true
+  | .seq s t | .ite _ s t => s.hasCatch || t.hasCatch
+  | .while _ b => b.hasCatch
+  | _ => false
+
+/-- An error can reach a handler of `s`: the body of some `tryCatch` can
+fail. -/
+def Stmt.catches : Stmt → Bool
+  | .tryCatch _ b h => b.mayFail || b.catches || h.catches
+  | .seq s t | .ite _ s t => s.catches || t.catches
+  | .while _ b => b.catches
+  | _ => false
+
+/-- `s` commits. -/
+def Stmt.hasCommit : Stmt → Bool
+  | .commit => true
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.hasCommit || t.hasCommit
+  | .while _ b => b.hasCommit
+  | _ => false
+
+/-- `s` raises an error of its own (`THROW`, `RAISE EXCEPTION`). -/
+def Stmt.raisesUser : Stmt → Bool
+  | .raise .user => true
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.raisesUser || t.raisesUser
+  | .while _ b => b.raisesUser
+  | _ => false
+
+def Routine.hasCatch (r : Routine) : Bool := r.body.hasCatch
+def Routine.catches (r : Routine) : Bool := r.body.catches
+def Routine.hasCommit (r : Routine) : Bool := r.body.hasCommit
+def Routine.raisesUser (r : Routine) : Bool := r.body.raisesUser
 
 end Sqldiff.Core

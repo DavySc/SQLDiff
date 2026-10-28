@@ -256,6 +256,65 @@ fn the_real_checker_confirms_a_converted_procedure() {
     assert_eq!(t["reason"], "the T-SQL routine is outside the C1 spec");
 }
 
+/// C4 end to end with the real checker: the converter writes TRY/CATCH as
+/// a PL/pgSQL block with EXCEPTION WHEN OTHERS. A TRY body that writes
+/// nothing is confirmed (the block's rollback changes nothing); one that
+/// writes and can then fail, with a handler that carries on, is refused
+/// (PostgreSQL rolls the write back, T-SQL keeps it).
+#[test]
+fn the_real_checker_confirms_a_converted_try_catch() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("try-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(&src, "p.sql", "CREATE PROCEDURE dbo.p @a int, @b int OUTPUT\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  BEGIN TRY\n    SET @b = @a / 0;\n  END TRY\n  BEGIN CATCH\n    SET @b = -1;\n  END CATCH\nEND\n");
+    write(&src, "q.sql", "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, n int NULL);\nGO\nCREATE PROCEDURE dbo.q @a int, @b int OUTPUT\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  BEGIN TRY\n    INSERT INTO dbo.t (id, n) VALUES (@a, 1);\n    SET @b = @a / @b;\n  END TRY\n  BEGIN CATCH\n    SET @b = -1;\n  END CATCH\nEND\n");
+    let out = d.join("out");
+    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(&out)
+        .args(["--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        stdout.contains("certificates: 1 of 2 routines confirmed"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("certificates.json")).unwrap())
+            .unwrap();
+    let routine = |path: &str| {
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["path"] == path)
+            .unwrap()["routines"][0]
+            .clone()
+    };
+    let p = routine("p.sql");
+    assert_eq!(p["answer"], "confirmed", "{p}");
+    assert_eq!(p["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{p}");
+    let q = routine("q.sql");
+    assert_eq!(q["answer"], "unconfirmed", "{q}");
+    assert_eq!(
+        q["reason"], "the lowered routines differ beyond the renaming",
+        "{q}"
+    );
+}
+
 /// `--proof require` is the release gate: a routine outside the C2a slice
 /// (`@a + 1` can overflow, and without XACT_ABORT ON T-SQL would carry on)
 /// still rests on ASM-C1-OPERATORS, which no deployment can accept, so the
