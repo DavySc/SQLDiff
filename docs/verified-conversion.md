@@ -1,11 +1,15 @@
 # Verified conversion
 
-Status: proposal, second pass over the verification plan with one target in
-view. Written 2026-10-28. Companion to
-[verification-roadmap.md](verification-roadmap.md) (the decided plan for the
-diff gate) and [qed-lessons.md](qed-lessons.md) (what the QED prover
-contributes). Nothing here is decided; the decisions it needs are listed at
-the end.
+Status: the priority is decided, the structure is proposed. Written
+2026-10-28. On that date the project owner decided that **the converter
+comes first in the verification project**: the proof effort is ordered to
+reach converted code that needs no re-review, and the diff gate for
+human-written variants follows. The design below (decisions A and B, and 9
+to 14 at the end) follows from that priority and is proposed for the owner's
+confirmation item by item. Companion to
+[verification-roadmap.md](verification-roadmap.md) (the decided plan, whose
+phase order this supersedes for the converter) and
+[qed-lessons.md](qed-lessons.md) (what the QED prover contributes).
 
 ## The target
 
@@ -217,7 +221,82 @@ the certificate", in CI, on every schema or spec change.
 | Complete fragment | The staging unit for `require` mode: inside the fragment the fallback gate is a decision procedure, so "unconfirmed" there is "different" |
 | Calcite and CockroachDB pairs | Benchmark for the fallback normaliser, not for the converter |
 
-## Phases, reordered for the converter
+## Two decisions, not one
+
+Prioritising the converter means two things that are independent of each
+other and have different costs. They are kept apart so each can be judged
+on its own.
+
+### A. The converter gets its own proof path
+
+Today a conversion is confirmed only when the `diff` gate would confirm the
+pair, and Lean is given two ASTs with no record of how `b` came from `a`.
+Decision A adds the certifying path above: a typed target AST, the
+converter emitting AST, a complete rule trace, the re-parse check, the
+certificate, `--proof` on `convert`. This is **work the roadmap does not
+contain**, about 3 to 5 months of Rust (C0 below), and it is required for
+the target in any phase order: without it there is nothing a proof can be
+about, and non-literal rewrites (`SELECT @v = col` to `SELECT … INTO`,
+`CROSS APPLY` to `LATERAL`, `TRY/CATCH` to `EXCEPTION`) confirm only when
+Lean's search happens to rediscover the rule.
+
+| Improves | Does not improve |
+|---|---|
+| Coverage of non-literal rewrites: the trace names the lemma, Lean checks instead of searching | The calendar: C0 runs before or beside the first Lean phase and adds months; the first confirmed procedure does not arrive sooner |
+| Determinism: no search budget; a result does not depend on a timeout | The spec and review effort, which the roadmap rightly calls the critical path: every lemma still needs a cited spec rule and an approval |
+| Diagnosis: an unconfirmed unit names the rule and node that failed, so the fix is a rule, not a search for why normal forms differ | Assumptions no code can discharge: what the callers read and under which privileges they run stay in the deployment profile |
+| The printer gap is closed by the re-parse check | |
+| The converter can generate for provability, because it controls the AST it emits | |
+
+### B. Errors and transactions before the query normaliser
+
+The roadmap orders phases by semantic depth (scalars, queries with the
+normaliser, DML, routines), which is right for `diff`: a human rewrites a
+query and the normaliser shows the forms equal, so phase 2 is where `diff`
+first pays off. For the converter the same order spends the normaliser's 3
+to 5 months before the one phase that lets a procedure confirm at all, and
+a mirror conversion never needs it. Decision B does scalars, then queries
+and DML **at mirror depth**, then errors and transactions, then the
+normaliser.
+
+"Mirror depth" means: for output with the same shape as the source, the
+proof is one congruence lemma per operator (the same operator on related
+inputs gives related outputs), by structural recursion, with no normal
+forms. The hard semantic content is still all there and still has to be
+written and reviewed: NULL ordering in `ORDER BY`, `TOP`/`LIMIT` without a
+total order, `SUM` of no rows and `SUM(int)` overflowing, string equality
+under collation, `decimal` scale rules. Only the normaliser itself
+(sum-product normal form, bound-variable renaming, the one-point rule, key
+cancellations) and its external benchmark move to C5.
+
+| Improves | Costs |
+|---|---|
+| Whole procedures confirm after C4, without the normaliser in between: the same work as the roadmap's phases 0 to 4, minus one phase | **`diff` waits.** Human-written variants with rewritten queries (UC1 drift, UC2 version review) confirm only in C5. The GUI for human review, which design.md names as the product's primary face, is served later |
+| The machinery is stressed by the converter's real output rather than by optimiser rewrites it never produces | **C3's non-literal lemmas are hand proofs.** `CROSS APPLY` to `LATERAL`, `ISNULL` to `COALESCE` with its typing, `IIF`, `STRING_AGG`: several are exactly what a normaliser discharges mechanically. Hence the hybrid below |
+| | **Phase 4 is no easier for being earlier.** Porting `ErrorTxn.tla` and proving the T-SQL and PostgreSQL rows is the bottleneck under both orders |
+| | **Less idiomatic output until C5.** Explicit casts, quoted aliases, per-statement exception blocks where the source's continue-on-error is observable; idioms come back as verified passes |
+| | **A risk moves later.** The roadmap's phase 2 hardens the bag semantics early against 444 external pairs; here they are first stressed by congruences and engine tests, and a structural flaw in the core (decision 9) shows later |
+
+**The hybrid.** A small normaliser is written in C3 as a Lean *proof
+tactic*, used to prove the non-literal mirror lemmas, never run at check
+time. The runtime normaliser, the complete-fragment staging and the Calcite
+benchmark stay in C5. This recovers most of what a pure reorder loses and
+keeps the trusted path free of search.
+
+| | Roadmap order | A + B with the hybrid |
+|---|---|---|
+| First confirmed query rewrite in `diff` | After phase 2 | After C5 |
+| First confirmed converted procedure | After phase 4, where normal forms coincide; non-literal rewrites depend on search | After C4, every unit the trace covers, deterministic |
+| Confirmed conversion coverage | What the normaliser rediscovers | Rule coverage, measured per rule |
+| Unconfirmed conversion says | "normal forms differ" | "rule X at node Y: lemma failed" |
+| Spec and review effort | Same | Same |
+| Rust work | AST export | AST export, target AST, printer, trace, re-parse, certificate: 3 to 5 months more |
+| Time to the first confirmed procedure | Phases 0 to 4 | About the same, C0 against the normaliser |
+
+Unchanged under both: decisions 1, 3, 5, 7 and 8 of the roadmap, the
+lifecycle policy, and convergence.
+
+## Phases
 
 The roadmap's phases are kept and their contents reused; what changes is
 the order and the exit criteria, because the converter needs *breadth over a
@@ -231,16 +310,17 @@ add to it, except for C0's Rust work.
 | **C0 Shape** | A typed target AST and printer in `sqldiff-syntax` for PostgreSQL (and T-SQL, for the reverse direction later); the converter emits AST, rule by rule, text-emitting rules kept but their units can never confirm; a complete trace (every rewrite records its rule, including the ones that need no assumption); the re-parse check; `--proof` on `convert` with the certificate file; the deployment profile file; the AST codegen to Lean the roadmap plans; the decision below on the core | Nothing yet; the gate confirms what phase 0 confirms | 3 to 5 months, mostly Rust |
 | **C1 Skeleton** | Core CFG without data: `DECLARE`, `SET`/assignment of untyped placeholders, `IF`, `WHILE`, `RETURN`, blocks, routine headers and parameter modes, calls (`EXEC` to `CALL`); mirror lemmas for them; the error-free, transaction-free routine | Routines whose statements are all in C1 (rare, but the proof plumbing is complete end to end) | 2 to 3 months |
 | **C2 Scalars** (roadmap phase 1) | Values, NULL, numeric types with widths and overflow, `decimal` precision and scale rules, strings and collation, casts and implicit conversion made explicit, `CASE`/`COALESCE`/`ISNULL`, dates and `DATEADD`/`DATEDIFF`, the built-in pairs of `builtins.toml` with their facts | Expression-level conversions; every `ASM-UNTYPED-*` and `ASM-ISNULL-TYPE` gone | 4 to 6 months |
-| **C3 Statements** (roadmap phases 2 and 3, mirror depth) | Query operators by congruence (same operator, related inputs), `ORDER BY` and NULL ordering, `TOP`/`LIMIT` with the degenerate and tie-breaker lemmas, aggregates with their meaning, `INSERT`/`UPDATE`/`DELETE` including `UPDATE … FROM`, `MERGE` as a mirror where the target has it, generated keys, `RETURNING`; the converted DDL certified so Γ_B is output | Set-based routines without error handling: most of the corpus's statements | 4 to 6 months |
+| **C3 Statements** (roadmap phases 2 and 3, mirror depth) | Query operators by congruence (same operator, related inputs), `ORDER BY` and NULL ordering, `TOP`/`LIMIT` with the degenerate and tie-breaker lemmas, aggregates with their meaning, `INSERT`/`UPDATE`/`DELETE` including `UPDATE … FROM`, `MERGE` as a mirror where the target has it, generated keys, `RETURNING`; the converted DDL certified so Γ_B is output; the tactic-sized normaliser of the hybrid, for the non-literal lemmas | Set-based routines without error handling: most of the corpus's statements | 4 to 6 months |
 | **C4 Errors and transactions** (roadmap phase 4) | `ErrorTxn.tla` ported as the core's CFG semantics; `XACT_ABORT`, `TRY/CATCH` to `EXCEPTION`, `@@ERROR` and return codes, `THROW`/`RAISERROR` to `RAISE` with the pack's code mapping, `BEGIN TRAN`/`COMMIT`/`ROLLBACK` and `@@TRANCOUNT`, savepoints, the per-statement exception scaffolding; T-SQL and PostgreSQL rows of the model as lemmas, Db2 for i rows as axioms | **Whole procedures.** This is the phase that reaches the target for real code; everything before it is preparation | 4 to 6 months |
 | **C5 Idioms and the normaliser** (roadmap phases 2 and 5) | The semiring normaliser as the fallback gate; idiom passes as verified single-dialect rewrites with a user switch; the complete fragment as the `require` boundary; coverage ratchet; parser differential tests | Human-edited outputs and idiomatic outputs confirm; `require` by default per dialect pair | Ongoing |
 | **C6 Db2 for i** (roadmap phase 6, decision 8) | C1 to C4 for SQL PL; W2 and W3 on rented IBM i | | 4 to 8 months |
 
 Two things move earlier than in the roadmap: the typed target AST (C0,
-Rust) and the error and transaction model (C4 before the normaliser),
-because a procedure is never confirmable without C4 and the normaliser
-contributes nothing to a mirror. One thing moves later: deep query
-equivalence, because the converter does not need it to prove its own mirror
+Rust, decision A) and the error and transaction model (C4 before the
+normaliser, decision B), because a procedure is never confirmable without
+C4 and the normaliser contributes nothing to a mirror. One thing moves
+later: the runtime normaliser and with it the `diff` gate for rewritten
+queries, because the converter does not need it to prove its own mirror
 output.
 
 ## What the Rust side changes now (C0 in detail)
@@ -279,11 +359,17 @@ output.
 
 ## Decisions this needs
 
+Decided 2026-10-28 by the project owner: the converter is the priority of
+the verification project. The following follow from it and are proposed;
+each stands once the owner confirms it, like the roadmap's decisions.
+
 | # | Decision | Recommendation |
 |---|---|---|
+| A | The converter gets its own proof path (target AST, trace, certificate, re-parse check; C0) | Yes; required for the target in any order |
+| B | Errors and transactions before the runtime normaliser, with the tactic-sized normaliser in C3 | Yes, with the hybrid; the `diff` gate for rewritten queries moves to C5 |
 | 9 | Spec structure: one typed core whose semantics each dialect's lowering defines, or a semantics per dialect plus proven lowerings (decision 2 as written) | One core; the lowering rules are the reviewed spec. Fewer artifacts, one executable oracle, and `canon.rs` already has this shape |
 | 10 | The converter's default output: provable (mirror with explicit scaffolding) or idiomatic | Provable by default; idioms as verified, switchable passes. The GUI shows both |
 | 11 | A certificate (rule trace) for `convert`, beside the two-AST protocol decision 2 fixed for `diff` | Yes: the trace is untrusted hints over the same protocol, so decision 2 stands for `diff` |
 | 12 | Target AST and printer in Rust, converter migrated from text to AST | Yes, in C0; it is also the only way the GUI's live conversion and the tree converter can share one checked path |
-| 13 | Phase order: errors and transactions before the query normaliser | Yes, for the converter; the diff tool's phase 2 moves to C5 |
+| 13 | Phase order as in "Phases" above (C0 to C6), the detail of decision B | Yes; the diff tool's phase 2 moves to C5 |
 | 14 | Assumption discharge: a deployment profile that absorbs named assumptions, and `--proof require` as the release gate for converted trees | Yes; this is where "no re-review per routine" becomes a CI exit code |

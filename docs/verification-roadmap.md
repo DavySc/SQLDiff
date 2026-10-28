@@ -159,6 +159,7 @@ fails, a glibc checker ships beside the musl CLI.
 | 6 | Version support policy | Follow each vendor's lifecycle (see "RDBMS versions") | Proposed |
 | 7 | Azure SQL Database and Managed Instance | All Azure targets in scope as platform profiles; T-SQL targets keyed by platform, engine and compatibility level (below) | Decided 2026-10-28 |
 | 8 | When Db2 for i is proven | Deferred as long as possible: phases 1 to 4 cover T-SQL and PostgreSQL only (below) | Decided 2026-10-28 |
+| 9 | Which product the proof effort serves first: the `diff` gate or the converter | The converter: its own proof path, and errors and transactions before the query normaliser ([verified-conversion.md](verified-conversion.md), decisions A and B; the phase order there supersedes the one below for the converter) | Priority decided 2026-10-28; A and B proposed |
 
 ### Decision 1: observational equivalence
 
