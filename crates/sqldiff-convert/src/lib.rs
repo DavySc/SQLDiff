@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
+pub mod base;
 pub mod drift;
 pub mod gate;
 pub mod instances;
@@ -677,7 +678,7 @@ pub fn splice_unit(
     Ok(())
 }
 
-fn recount(c: &mut Conversion) {
+pub(crate) fn recount(c: &mut Conversion) {
     let mut counts = Counts::default();
     for u in &c.units {
         *match u.status {

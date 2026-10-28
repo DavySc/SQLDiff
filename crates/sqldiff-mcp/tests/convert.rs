@@ -465,3 +465,79 @@ fn an_agent_writes_a_unit_and_it_is_checked_and_waits_for_a_person() {
         ledger
     );
 }
+
+#[test]
+fn every_tool_that_converts_a_tree_takes_base_catalogs() {
+    let r = session(&[json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })]);
+    let tools = r[0]["result"]["tools"].as_array().unwrap();
+    for n in ["convert_tree", "conversion_queue", "write_unit"] {
+        let t = tools.iter().find(|t| t["name"] == n).unwrap();
+        for k in ["catalogs", "catalogs_b"] {
+            let p = &t["inputSchema"]["properties"][k];
+            assert_eq!(p["type"], "array", "{n} {k}: {t:#}");
+            assert_eq!(p["items"]["type"], "string", "{n} {k}");
+        }
+    }
+}
+
+#[test]
+fn convert_tree_binds_against_base_catalogs_as_the_cli_does() {
+    let d = scratch("catalogs");
+    let src = d.join("src");
+    let base = d.join("base/orders.sql");
+    write(
+        &base,
+        "CREATE TABLE orders (order_id int NOT NULL, status varchar(10) NOT NULL);\n",
+    );
+    write(&src.join("q.sql"), "SELECT status FROM orders;\n");
+    let base_pg = d.join("base_pg/orders.sql");
+    write(
+        &base_pg,
+        "CREATE TABLE orders (order_id integer NOT NULL, status varchar(10) NOT NULL);\n",
+    );
+    write(
+        &src.join("t.sql"),
+        "CREATE TABLE audit_log (id int NOT NULL);\n",
+    );
+    let mcp_out = d.join("mcp");
+    let r = session(&[
+        call(
+            1,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "out": mcp_out, "catalogs": [base] }),
+        ),
+        call(
+            2,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "catalogs": [base], "no_catalog": true }),
+        ),
+        call(
+            3,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "catalogs": [base], "catalogs_b": [base_pg] }),
+        ),
+        call(
+            4,
+            "convert_tree",
+            json!({ "src": src, "to": "postgres", "catalogs_b": [base_pg] }),
+        ),
+    ]);
+    let s = result(&r[0]);
+    assert_eq!(s["base_catalogs"][0]["path"], base.display().to_string());
+    assert!(s["base_hash"].is_string());
+    assert!(!s.to_string().contains("bind.unknown-table"), "{s:#}");
+    assert_eq!(r[1]["result"]["isError"], true, "{}", r[1]);
+    let s3 = result(&r[2]);
+    assert_eq!(
+        s3["base_catalogs_b"][0]["path"],
+        base_pg.display().to_string()
+    );
+    assert_ne!(s3["base_hash"], s["base_hash"]);
+    assert!(!s3.to_string().contains("bind.unknown-table"), "{s3:#}");
+    assert_eq!(r[3]["result"]["isError"], true, "{}", r[3]);
+    // Written, and the report says it too.
+    let report = std::fs::read_to_string(mcp_out.join("conversion-report.json")).unwrap();
+    assert!(report.contains("\"base_catalogs\""), "{report}");
+    assert!(!mcp_out.join("orders.sql").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}

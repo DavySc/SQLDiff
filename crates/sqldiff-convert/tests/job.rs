@@ -43,6 +43,8 @@ impl Fixture {
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
+                catalogs: Vec::new(),
+                catalogs_b: Vec::new(),
             },
             out: self.dir.join(out),
             overwrite: false,
