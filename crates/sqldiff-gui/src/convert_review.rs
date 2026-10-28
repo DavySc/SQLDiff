@@ -143,6 +143,14 @@ pub struct ListedItem {
     pub item: Item,
     /// For a unit: the assumptions still open on it (bulk accept offers these).
     pub open_assumptions: Vec<String>,
+    /// For a unit: what no decision can discharge on it (the page groups
+    /// units that need a fix by these).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocking: Vec<String>,
+    /// For a unit: the hashes an action on it sends back, as of this state
+    /// (bulk accept of a whole group sends these; the server checks them).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hashes: Option<(String, String)>,
 }
 
 /// A unit the ledger says is reviewed: accepted in review, never "converted".
@@ -393,25 +401,40 @@ impl Review {
         let l = &self.loaded;
         let r = &l.tree.report;
         let q = self.queue(all);
+        // Per file: the hashes of its input and output, taken once.
+        let mut hashes: BTreeMap<usize, (String, String)> = BTreeMap::new();
         let items = q
             .items
             .into_iter()
             .map(|item| {
-                let open_assumptions = match (&item.kind, &item.unit) {
-                    (Kind::Unit, Some(id)) => self
-                        .find(&item.path, id)
-                        .map(|(f, k)| {
-                            open_assumptions(
-                                &l.tree.conversions[f].units[k],
-                                self.unit_review(f, id),
-                            )
-                        })
-                        .unwrap_or_default(),
-                    _ => Vec::new(),
+                let found = match (&item.kind, &item.unit) {
+                    (Kind::Unit, Some(id)) => self.find(&item.path, id),
+                    _ => None,
                 };
+                let Some((f, k)) = found else {
+                    return ListedItem {
+                        item,
+                        open_assumptions: Vec::new(),
+                        blocking: Vec::new(),
+                        hashes: None,
+                    };
+                };
+                let u = &l.tree.conversions[f].units[k];
+                let rv = self.unit_review(f, &l.ids[f][k]);
+                let h = hashes.entry(f).or_insert_with(|| {
+                    (
+                        review::file_hash(&l.inputs[f].text),
+                        review::file_hash(&l.tree.conversions[f].output),
+                    )
+                });
                 ListedItem {
+                    open_assumptions: open_assumptions(u, rv),
+                    blocking: rv.map_or_else(
+                        || review::undischargeable(u),
+                        |rv| rv.undischargeable.clone(),
+                    ),
+                    hashes: Some(h.clone()),
                     item,
-                    open_assumptions,
                 }
             })
             .collect();
