@@ -762,7 +762,7 @@ level, and a probe run plus a delta review for each IBM i Technology Refresh.
 | Typed dialect targets, `profiles/lifecycle.toml`, lifecycle notes | Done (dates unverified) |
 | Packaging and performance spike | Done: all four targets within budget (decision 2) |
 | Gate on the trivial fragment: `formal/lean` (`check_sound`, no axioms), `sqldiff_core::proof`, `--proof off|report|require` | Done; the CLI tests use a stand-in for the checker, CI tests the real one |
-| Decision 1 semantics in Rust | Result column names, reference side with `equivalent` and `refinements`, ORDER BY added done; ORDER BY removed still unknown (needs knowing the result can hold two rows); observer profile for row counts done; error matching and session state to come |
+| Decision 1 semantics in Rust | Enforced where a verdict could be wrong: result column names, reference side with `equivalent` and `refinements`, ORDER BY added, observer profile for row counts. Checked 2026-10-28 and already conservative (never equal): raises across dialects (not covered by statement equivalence), temporary tables and `SET` in a body. Coverage still to add, turning unknown into proven: error kinds and pack-declared user error codes across dialects, PostgreSQL raise message changes (unknown, T-SQL already different), session state, ORDER BY removed (different when the result can hold two rows) |
 | Coverage invariant | Not started |
 | AST export with generated Lean types | Not started (phase 0 compares syntax trees as text) |
 | Signed locks, `allowed_signers`, `spec-critic` | Not started |
