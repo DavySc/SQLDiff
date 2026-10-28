@@ -39,7 +39,7 @@ pub struct Certificate {
     /// Untrusted hint: source name to target name, for parameters and
     /// variables (`@x` to `v_x`), and the T-SQL return code to the
     /// parameter that carries it.
-    pub renaming: Vec<(String, String)>,
+    pub renaming: Renaming,
     #[serde(flatten)]
     pub answer: Answer,
 }
@@ -97,7 +97,7 @@ fn returns_value(nodes: &[Node]) -> bool {
 /// declaration section, and the return code against the extra trailing
 /// `INOUT` parameter. The checker verifies the result; a wrong proposal can
 /// only make it refuse.
-pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Vec<(String, String)>, String> {
+pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Renaming, String> {
     let mut out = Vec::new();
     let code = a.kind == routine::RoutineKind::Procedure && returns_value(&a.body.body);
     let extra = usize::from(code);
@@ -146,6 +146,12 @@ pub fn propose_renaming(a: &Routine, b: &Routine) -> Result<Vec<(String, String)
     Ok(out)
 }
 
+/// A source to target name pairing.
+pub type Renaming = Vec<(String, String)>;
+
+/// Answers a routine pair with its renaming.
+pub type Check<'a> = &'a dyn Fn(&Routine, &Routine, &[(String, String)]) -> Answer;
+
 /// Certificates for the routines of one converted file. `check` answers a
 /// pair with its renaming; without a checker for routines every answer is
 /// unconfirmed, with the reason.
@@ -154,7 +160,7 @@ pub fn certify(
     output: &str,
     from: Dialect,
     to: Dialect,
-    check: &dyn Fn(&Routine, &Routine, &[(String, String)]) -> Answer,
+    check: Check,
 ) -> Vec<Certificate> {
     let src = routines(input, from);
     let out = routines(output, to);
