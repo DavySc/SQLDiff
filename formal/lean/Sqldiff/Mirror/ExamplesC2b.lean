@@ -96,9 +96,10 @@ def catLateT : Ast.Routine := sT [set tr (.Bin "+" ta tb), concatNull]
   "the lowered routines differ beyond the renaming"
 -- `nvarchar(2000) + nvarchar(2000)` is 4000: in.
 #guard isC2a (cs ∅ (sT [set tr (.Bin "+" ta tb)] (ta := nvc 2000) (trt := nvc 4000)) catP)
--- `max` types are outside: `+` stays an operator, refused.
+-- `max` types are outside: not even a parameter type the check pairs with
+-- `text` (and `+` would stay an operator).
 #guard reasonOf (cs ∅ (sT [set tr (.Bin "+" ta tb)] (ta := .Ty "VARCHAR" ["MAX"])
-  (trt := .Ty "VARCHAR" ["MAX"])) catP) == "the lowered routines differ beyond the renaming"
+  (trt := .Ty "VARCHAR" ["MAX"])) catP) == "the parameter or return types do not correspond"
 -- T-SQL `varchar` without a length (1 in a declaration) is outside.
 #guard (strTypeT (.Ty "VARCHAR" [])).isNone
 #guard strTypeT (.Ty "VARCHAR" ["4000"]) == some (some 4000, false)
@@ -279,6 +280,67 @@ def fP : Ast.Routine :=
 -- A parameter default must fit too.
 #guard !sliceT dep ∅ (tsqlProc ["r"] [.Param "@a" (vc 3) .In (some (str "abcdef"))] [])
 #guard sliceT dep ∅ (tsqlProc ["r"] [.Param "@a" (vc 3) .In (some (str "abc"))] [])
+
+/-! ## Parameter and return types, parameter defaults
+
+T-SQL `f(@a varchar(10)) RETURNS varchar(10)` against PL/pgSQL
+`f(a integer) RETURNS integer`: the bodies lower alike (`RETURN @a`), but
+a caller passing `'x'` gets `'x'` from one and an error from the other.
+The check compares the declared types (`sigCorr`). -/
+
+def sigT : Ast.Routine :=
+  .Routine .Function ["dbo", "f"] [inT "@a" (vc 10)] (some (vc 10)) .Caller none
+    (.Block [] [ret (some ta)])
+def sigP (pt rt : Ast.Ty) : Ast.Routine :=
+  .Routine .Function ["f"] [inP "a" pt] (some rt) .Caller none (.Block [] [ret (some pa)])
+#guard reasonOf (check dep ∅ fnCert sigT (sigP integer integer)) ==
+  "the parameter or return types do not correspond"
+-- One of the two differing is enough.
+#guard reasonOf (check dep ∅ fnCert sigT (sigP (vc 10) integer)) ==
+  "the parameter or return types do not correspond"
+#guard reasonOf (check dep ∅ fnCert sigT (sigP integer (vc 10))) ==
+  "the parameter or return types do not correspond"
+-- String types of the slice correspond whatever their lengths (PostgreSQL
+-- drops them on parameters and results). With `varchar(10)` on the
+-- PostgreSQL side the parameter is read unbounded, so `RETURN a` is not
+-- known to fit the declared result: a C1 answer; with `text`, C2a.
+#guard isC1 (check dep ∅ fnCert sigT (sigP (vc 10) (vc 10)))
+#guard isC2a (check dep ∅ fnCert sigT (sigP text text))
+#guard tyCorr (nvc 10) (vc 10) && tyCorr (vc 10) (.Ty "CHARACTER VARYING" ["20"])
+#guard tyCorr int (.Ty "INT4" []) && tyCorr (.Ty "INTEGER" []) integer
+-- On the C1 path only `bigint` and `smallint`, without arguments.
+#guard tyCorr bigint (.Ty "INT8" []) && tyCorr (.Ty "SMALLINT" []) (.Ty "INT2" [])
+#guard !tyCorr int bigint && !tyCorr bigint int && !tyCorr (.Ty "TINYINT" []) (.Ty "SMALLINT" [])
+#guard !tyCorr (.Ty "DECIMAL" ["10", "2"]) (.Ty "NUMERIC" ["10", "2"])
+#guard !tyCorr (.Ty "BIT" []) (.Ty "BOOLEAN" []) && !tyCorr (.Ty "DATE" []) (.Ty "DATE" [])
+#guard !tyCorr (.Ty "VARCHAR" ["MAX"]) text && !tyCorr (.Ty "CHAR" ["10"]) (.Ty "CHAR" ["10"])
+-- A procedure's trailing `return_code` must be the integer type.
+#guard reasonOf (check dep Γ cert srcT (match mirrorP with
+    | .Routine k n ps r s v b =>
+      .Routine k n (ps.dropLast ++ [.Param "return_code" text .InOut (some .Null)]) r s v b)) ==
+  "the parameter or return types do not correspond"
+
+/-! A default T-SQL truncates and PostgreSQL keeps: `@s varchar(3) =
+'abcdef'` is `'abc'` in the T-SQL body, while PostgreSQL drops the
+parameter's length and keeps all six characters. Outside the spec on both
+sides, also on the C1 path (`dfltOk`). -/
+
+def dfltT (d : Ast.Expr) : Ast.Routine :=
+  tsqlProc ["dbo", "pd"] [ioT "@r" (vc 10), .Param "@s" (vc 3) .In (some d)] [set tr (tv "@s")]
+def dfltP (d : Ast.Expr) : Ast.Routine :=
+  pgProc ["pd"] [ioP "r" text, .Param "s" (vc 3) .In (some d)] [] [set pr (pv "s")]
+def dfltCert : Cert := ⟨[("@r", "r"), ("@s", "s"), (statusVar, statusVar)]⟩
+#guard reasonOf (check dep ∅ dfltCert (dfltT (str "abcdef")) (dfltP (str "abcdef"))) ==
+  "the T-SQL routine is outside the C1 spec"
+#guard (lowerP ∅ (dfltP (str "abcdef"))).isNone
+-- A default that fits, and NULL, are in the slice.
+#guard isC2a (check dep ∅ dfltCert (dfltT (str "abc")) (dfltP (str "abc")))
+#guard isC2a (check dep ∅ dfltCert (dfltT .Null) (dfltP .Null))
+-- A default outside the slice (an integer into a string, a non-slice
+-- literal) is outside the spec, even on the C1 path.
+#guard (lowerT dep ∅ (dfltT (num 7))).isNone
+#guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" bigint .In (some (.Num "2147483648"))] [])).isNone
+#guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" bigint .In (some .Null)] [])).isSome
 
 /-! ## The core's string operators (`SExpr.eval`) -/
 

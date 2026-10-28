@@ -456,6 +456,21 @@ so the answer names `ASM-STATE-AFTER-ERROR`, and the failed observation
 above has no world. -/
 #guard (residualOf dep Γ callThenDivT) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR"]
+/- A callee's own error (a duplicate key, say) is not in the core, where a
+call never fails. Without `SET XACT_ABORT ON`, SQL Server goes on after
+the failed `EXEC` and sets `@r = 1`; PostgreSQL's `CALL` fails and ends
+the caller. So a call counts as able to fail (`Stmt.failsHere`): a T-SQL
+routine with one is a C2a answer only when it aborts on errors, and the
+state after the failed call is not relied on. -/
+def calleeT (pre : List Ast.Node) : Ast.Routine :=
+  tsqlProc ["dbo", "caller"] [inT "@a", ioT "@r"]
+    (pre ++ [set (tv "@r") (num 0), .Call ["dbo", "log_value"] [arg ta false] none, set (tv "@r") (num 1)])
+def calleeP : Ast.Routine :=
+  pgProc ["caller"] [inP "a", ioP "r"] []
+    [set (pv "r") (num 0), .Call ["log_value"] [arg pa false] none, set (pv "r") (num 1)]
+#guard isC1 (check dep Γ pairCert (calleeT []) calleeP)
+#guard isC2a (check dep Γ pairCert (calleeT [xactAbort]) calleeP)
+#guard residualOf dep Γ (calleeT [xactAbort]) == some ["ASM-STATE-AFTER-ERROR"]
 
 -- The slice's meaning, operator by operator (`SExpr.eval`).
 def σ2 (a b : V) : Core.Store Unit := fun x => if x = "a" then a else if x = "b" then b else .null
@@ -611,10 +626,11 @@ def badCase (a : Ast.Expr) : Ast.Expr :=
 -- `+` against `||`.
 #guard reasonOf (checkPair true (.Bin "+" ta tb) (.Bin "||" pa pb)) ==
   "the lowered routines differ beyond the renaming"
--- `int` against `bigint` arithmetic: the slice on one side only.
+-- `int` against `bigint` parameters: the types do not correspond (and the
+-- arithmetic is in the slice on one side only).
 #guard reasonOf (check dep ∅ pairCert (pairT true (.Bin "+" ta tb))
     (pairP (.Bin "+" pa pb) bigint)) ==
-  "the lowered routines differ beyond the renaming"
+  "the parameter or return types do not correspond"
 -- `@a % @b` is on the C1 path on both sides (a variable divisor), `@a % 2`
 -- in the slice, `@a % -1` not.
 #guard isC1 (checkPair true (.Bin "%" ta tb) (.Bin "%" pa pb))
@@ -705,7 +721,9 @@ def srcAbort : Ast.Routine :=
   match srcT with
   | .Routine k n ps r s v (.Block ds body) => .Routine k n ps r s v (.Block ds (xactAbort :: body))
 #guard isC2a (check dep Γ cert srcAbort mirrorP)
-#guard (residualOf dep Γ srcAbort) == some ["ASM-TSQL-ARITH-ERRORS"]
+-- The call to `log_value` can fail after the callee wrote (its errors are
+-- not in the core), so the state after a failed call is not relied on.
+#guard (residualOf dep Γ srcAbort) == some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR"]
 -- The two status lines are still needed.
 #guard !isConfirmed (check dep Γ cert srcAbort todayP)
 

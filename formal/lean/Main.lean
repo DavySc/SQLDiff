@@ -57,6 +57,16 @@ the C4 residuals (`ASM-CATCH-CORE-ERRORS`, `ASM-NO-CALLER-TXN`,
 the abstract syntax schema hash changed with the C4 nodes, so an older
 checker answers a C4-era request "unconfirmed" (schema mismatch), and
 this checker answers an older client's request the same way.
+
+0.8.0 answers more conservatively, with no new field or residual: a pair
+whose parameter or return types do not correspond is unconfirmed ("the
+parameter or return types do not correspond", `Sqldiff.Mirror.sigCorr`);
+a parameter default that is not NULL or a slice value fitting its type is
+outside the spec; a call can fail (a callee's error), so a T-SQL routine
+with a call is a `"c2a"` answer only under `SET XACT_ABORT ON`, and names
+`ASM-STATE-AFTER-ERROR`; `ERRCODE` must be `'P0001'` exactly; the
+unguarded `ROLLBACK; THROW;` idiom needs a body that is exactly one
+bracket, and the idiom stands only where transaction statements may.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -110,7 +120,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.7.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.8.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

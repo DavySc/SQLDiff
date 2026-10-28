@@ -71,7 +71,8 @@ every expression is a slice expression of the right type on both sides,
 neither lowering has an uninterpreted operator, every data statement is
 in the C3a slice (`Core.Stmt.dmlSafe`), and the T-SQL routine aborts on
 errors (`abortsT`) or has nothing that can fail (no expression that can
-raise, no data statement that can violate a constraint), so that the
+raise, no data statement that can violate a constraint, no call: a
+callee's errors are not in the core, `Core.Stmt.failsHere`), so that the
 core's "an error ends the routine" is what T-SQL does
 (`Sqldiff.Mirror.lowerT`, file header). -/
 def inC2a (dep : Deployment) (Γ : Catalog) (a b : Ast.Routine) (ca cb : Core.Routine) : Bool :=
@@ -97,7 +98,8 @@ settings the routine's text does not fix:
 And one fact about the caller:
 
 * `ASM-STATE-AFTER-ERROR`, when something can fail after a write (a data
-  statement or a call) may have happened (`Core.Routine.errAfterWrite`):
+  statement or a call) may have happened, or the routine calls a
+  procedure, which may write and then fail (`Core.Routine.errAfterWrite`):
   the caller does not rely on the database, or on what callees did, after
   a call that failed. A failed observation does not include them
   (`Core.Obs.failed`) because the dialects differ there: T-SQL under
@@ -188,6 +190,8 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
       .unconfirmed "a procedure and a function"
     else if (header a).2 != (header b).2 then
       .unconfirmed "the routines run with different privileges"
+    else if !sigCorr a b then
+      .unconfirmed "the parameter or return types do not correspond"
     else if !cert.consistent then
       .unconfirmed "certificate: a T-SQL variable is given two PL/pgSQL names"
     else if !cert.injective then
@@ -224,6 +228,8 @@ theorem check_sound (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.R
     split at h
     · cases h
     split at h
+    · cases h
+    split at h
     · next hok =>
       obtain ⟨inj, heq⟩ := hok
       rw [heq]
@@ -248,6 +254,8 @@ theorem check_sound_c2a (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : A
     unfold check at h
     rw [ha, hb] at h
     simp only at h
+    split at h
+    · cases h
     split at h
     · cases h
     split at h

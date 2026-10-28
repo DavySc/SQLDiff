@@ -20,8 +20,12 @@ faithful for every run only when the routine aborts on errors
 (`abortsT`), and otherwise for the runs that raise none, as in C1. A C2a
 confirmation (`Sqldiff.Mirror.inC2a`) asks for one or the other. Errors
 from elsewhere (a missing argument without a default, `OUTPUT` on a
-parameter that is not one, a failing callee) are not modelled: the rule
-says what happens otherwise. C4 handles errors (below) but still does
+parameter that is not one) are not modelled: the rule says what happens
+otherwise. A failing callee is not modelled either (`WorldModel.call`
+does not fail), but a call counts as a statement that can fail
+(`Core.Stmt.failsHere`), so a T-SQL routine with a call is in the C2a
+slice only when it aborts on errors: then a callee's error ends both
+routines, as any error does. C4 handles errors (below) but still does
 not model a callee's errors, so a call is outside the spec where an error
 would be handled.
 
@@ -368,6 +372,24 @@ literal divisor other than 0 and -1, so it never raises.
 T-SQL: "- (Negative) (Transact-SQL)"; PostgreSQL: Table 9.4 (`- integer`)
 and 8.1.1. Not probed (the parser folds `-5` into a literal; this is
 `-x` on a variable or an expression).
+
+*Precedence.* The rule applies to the tree the parser builds, so the
+parser must bind unary minus as each dialect does. T-SQL puts unary minus
+at the level of binary `+` and `-`, below `*`, `/` and `%` ("Operator
+precedence (Transact-SQL)": level 2 is `*` (Multiplication), `/`
+(Division), `%` (Modulus); level 3 is `+` (Positive), `-` (Negative), `+`
+(Addition), `+` (Concatenation), `-` (Subtraction), `&`, `^`, `|`; from
+memory), so T-SQL `-@a * @b` is `-(@a * @b)`. PostgreSQL binds unary
+minus tighter than `*` (4.1.6 "Operator Precedence", Table 4.2: unary
+`+ -` above `* / %`), so `-a * b` is `(-a) * b`. The two trees differ in
+when they overflow: on SQL Server `-@a * @b` with `@a = -2147483648` and
+`@b = 0` returns 0 (probed, 2026-10-28), where `(-@a) * @b` would raise
+8115 on the negation. The Rust parser reads T-SQL `-@a * @b` as
+`-(@a * @b)` (`sqldiff_syntax`, being fixed at the time of writing) and
+PostgreSQL `-a * b` as `(-a) * b`, so a conversion that copies the text
+unchanged gives two different trees and is refused; `-(a * b)` on the
+PostgreSQL side is confirmed. The negation rule itself needs no change:
+it is the same in both dialects once the tree is right.
 
 **Comparisons** `= <> < > <= >=` of two `int`s are three-valued: UNKNOWN
 (NULL) when either side is NULL. The NULL literal as an operand is outside
@@ -1604,7 +1626,12 @@ spec.
   P0001 with message `m`). Other
   levels (`NOTICE`, ...) send a message, not an error: outside the spec.
   A `%` in the format, arguments, or any other option (`DETAIL`,
-  `HINT`, another `ERRCODE`) are outside it too.
+  `HINT`, another `ERRCODE`) are outside it too. The code must be spelt
+  `'P0001'` exactly: PostgreSQL reads an `ERRCODE` of five digits and
+  upper-case letters as an SQLSTATE and anything else as a condition
+  name, so `'p0001'` is an unknown condition and the `RAISE` fails with
+  42704 ("unrecognized exception condition"; plpgsql `pl_exec.c`, from
+  memory; not probed).
 * The caller sees error number `n` from T-SQL and SQLSTATE P0001 from
   PostgreSQL, with the same message: decision 1 compares the kind, not
   the number or the text, so a confirmation that raises rests on
@@ -1664,14 +1691,24 @@ nothing. Outside the spec: a `COMMIT` without its `BEGIN TRAN` (error
 3902), a `BEGIN TRAN` without its `COMMIT` (error 266 at the end of the
 procedure; probed, P10, with `@@TRANCOUNT = 1` left to the caller), nesting (`@@TRANCOUNT` 2), a `RETURN` between
 them, `ROLLBACK` except in the idiom below, `SAVE TRAN`, named
-transactions, and any of them inside `TRY`, `CATCH`, `IF` or `WHILE`.
+transactions, and any of them inside `TRY`, `CATCH`, `IF`, `WHILE` or a
+nested `BEGIN ... END` (the idiom below included: it stands only in the
+routine's own statement list or in another idiom's body, `Ctx.txn`).
 
 **The rollback-and-rethrow idiom.** T-SQL `BEGIN TRY b END TRY BEGIN
 CATCH IF @@TRANCOUNT > 0 ROLLBACK; THROW; END CATCH` (or `ROLLBACK;
-THROW;` when `b` begins with `BEGIN TRAN` and ends with `COMMIT`, so that
-a transaction is open whenever `b` fails), not inside any other `TRY` or
-`CATCH`, lowers to `b` itself, at transaction level (its `BEGIN TRAN`
-and `COMMIT` as above). When `b` fails, the handler rolls back the open
+THROW;` when `b` is exactly one bracket: it begins with `BEGIN TRAN`,
+ends with `COMMIT`, and has no other transaction statement, so that a
+transaction is open whenever `b` fails), not inside any other `TRY` or
+`CATCH`, and not inside an `IF`, a `WHILE` or a nested block, lowers to
+`b` itself, at transaction level (its `BEGIN TRAN` and `COMMIT` as
+above). With two brackets in `b`, an error between them (after the first
+`COMMIT`, before the second `BEGIN TRAN`) finds no transaction open: the
+unguarded `ROLLBACK` then raises 3903 ("The ROLLBACK TRANSACTION request
+has no corresponding BEGIN TRANSACTION") and `THROW;` never runs, so the
+caller sees 3903, not the body's error (probed on SQL Server during
+review, 2026-10-28: `BEGIN TRAN; INSERT; COMMIT; SET @x = 10/@x; BEGIN TRAN;
+INSERT; COMMIT` with `@x = 0`); that form is outside the spec. When `b` fails, the handler rolls back the open
 transaction ("ROLLBACK TRANSACTION (Transact-SQL)": back to the
 outermost `BEGIN TRAN`, `@@TRANCOUNT` to 0, from memory) and re-raises
 the same error, so the routine fails with that error's kind, which is
@@ -1777,15 +1814,20 @@ def trancountPos : Ast.Expr → Bool
   | .Bin ">" (.Var v) (.Num "0") => v.toUpper == "@@TRANCOUNT"
   | _ => false
 
+/-- `b` is exactly one bracket: `BEGIN TRAN` first, `COMMIT` last, and no
+other transaction statement in the list (deeper ones are refused by
+`txnBracket`), so a transaction is open wherever `b` can fail. -/
+def oneBracket (b : List Ast.Node) : Bool :=
+  (b.head?.map (isTxn "BEGIN")).getD false && (b.getLast?.map (isTxn "COMMIT")).getD false &&
+    (b.filter fun | .Txn .. => true | _ => false).length == 2
+
 /-- The handler of the rollback-and-rethrow idiom, for a `TRY` with body
 `b`: `IF @@TRANCOUNT > 0 ROLLBACK; THROW;`, or `ROLLBACK; THROW;` when
-`b` begins with `BEGIN TRAN` and ends with `COMMIT`. -/
+`b` is exactly one bracket (`oneBracket`). -/
 def rollbackRethrow (b h : List Ast.Node) : Bool :=
   match h with
   | [.If c [r] [], .Throw []] => trancountPos c && isTxn "ROLLBACK" r
-  | [r, .Throw []] =>
-    isTxn "ROLLBACK" r && (b.head?.map (isTxn "BEGIN")).getD false &&
-      (b.getLast?.map (isTxn "COMMIT")).getD false
+  | [r, .Throw []] => isTxn "ROLLBACK" r && oneBracket b
   | _ => false
 
 /-- The handlers of a `TRY` with body `b` are the idiom's. -/
@@ -1805,14 +1847,16 @@ def throwOk : List Ast.Expr → Bool
   | _ => false
 
 /-- The options of a PL/pgSQL `RAISE EXCEPTION` of the spec: `MESSAGE`
-a string literal, `ERRCODE` the literal `'P0001'`, each at most once,
-nothing else. -/
+a string literal, `ERRCODE` the literal `'P0001'`, spelt exactly so (an
+SQLSTATE in `ERRCODE` is case-sensitive: `'p0001'` names no condition and
+PostgreSQL raises 42704 instead), each at most once, nothing else. The
+option names are keywords, matched without case. -/
 def raiseOptsOk (fmt : Option String) (opts : List Ast.RaiseOpt) : Bool :=
   let names := opts.map fun | .RaiseOpt n _ => n.toUpper
   distinct names && !(fmt.isSome && names.contains "MESSAGE") &&
     opts.all fun
       | .RaiseOpt n (.Str v) =>
-        n.toUpper == "MESSAGE" || (n.toUpper == "ERRCODE" && v.toUpper == "P0001")
+        n.toUpper == "MESSAGE" || (n.toUpper == "ERRCODE" && v == "P0001")
       | _ => false
 
 /-- PL/pgSQL `RAISE [EXCEPTION] ...` of the spec (not the bare re-raise). -/
@@ -1891,8 +1935,10 @@ mutual
     | .Try b hs => match d, hs with
       | .tsql _ _, [.Handler [] h] =>
         if !(k matches .Procedure) then none
-        else if !cx.nested && rollbackRethrow b h then
-          -- The rollback-and-rethrow idiom: the body, at transaction level.
+        else if !cx.nested && cx.txn && rollbackRethrow b h then
+          -- The rollback-and-rethrow idiom: the body, at transaction level,
+          -- only where a transaction statement may stand (`Ctx.txn`: not
+          -- inside `IF`, `WHILE` or a nested block).
           if txnBracket b then lowerNodes d env k { cx with txn := true } b else none
         else do
           let b' ← lowerNodes d env k cx.body b
@@ -1964,11 +2010,23 @@ def lowerMode : Ast.Mode → Core.Mode
   | .Out => .out
   | .InOut => .inout
 
+/-- A parameter default of the spec: none, the NULL literal, or a value of
+the slice that fits the parameter's declared type (`fitsTy`, as
+`valueFits` below), so that neither engine converts it ("Parameter and
+return types" below). -/
+def dfltOk (d : Dialect) (env : TyEnv) (ty : Ast.Ty) : Option Ast.Expr → Bool
+  | none => true
+  | some .Null => true
+  | some e => match typed d env {} e with
+    | some (_, t) => fitsTy d ty t
+    | none => false
+
 def lowerParam (d : Dialect) (env : TyEnv) : Ast.Param → Option Core.Param
-  | .Param name _ mode dflt =>
+  | .Param name ty mode dflt =>
     let name := match d with
       | .tsql _ _ => name
       | .pg _ _ => pgName name
+    if !dfltOk d env ty dflt then none else
     -- A default that reads a variable is refused by both engines.
     match lowerOpt d env {} dflt with
     | some e => if (e.map Core.Expr.vars).getD [] = [] then some ⟨name, lowerMode mode, e⟩ else none
@@ -2103,6 +2161,103 @@ def header : Ast.Routine → Bool × Bool
   | .Routine kind _ _ _ sec _ _ =>
     (match kind with | .Procedure => true | .Function => false,
      match sec with | .Caller => true | .Owner => false)
+
+/-! ## Parameter and return types
+
+The lowered routines carry no types: the core binds a value as it is. So
+the check also asks each T-SQL parameter and the PL/pgSQL parameter in
+its position, and the two return types of a function, to be declared
+with corresponding types (`sigCorr`), else the pair is outside the spec.
+Without this, T-SQL `f(@a varchar(10)) RETURNS varchar(10)` and
+PL/pgSQL `f(a integer) RETURNS integer` lower alike, though a caller
+passing `'x'` gets a value from one and a conversion error from the
+other. Corresponding types (`tyCorr`), as the converter writes them:
+
+* T-SQL `int`/`integer` and PostgreSQL `integer`/`int`/`int4` (the C2a
+  integer type, "The C2a slice: types");
+* a T-SQL string type of the slice (`varchar(n)`, `char varying(n)`,
+  `character varying(n)`, `nvarchar(n)`, `1 ≤ n ≤ 4000`) and a
+  PostgreSQL one (`varchar(m)`, `character varying(m)`, `char
+  varying(m)`, `varchar`, `text`), the C2b types (`strTypeT`,
+  `strTypeP`); the converter writes `varchar(n)` for both T-SQL types
+  (crates/sqldiff-convert/src/tsql.rs, `ty_pg`). The lengths need not
+  agree: PostgreSQL drops the length of a parameter and of a function
+  result (below), so `varchar(m)`, `varchar` and `text` there all take
+  and give any string; what a body stores in either is held to that
+  side's declared length by the slice (`fitsTy`), and an argument to the
+  T-SQL length by `ASM-TSQL-STRING-ARGS`. (On the C1 path a stored string
+  is not held to a length on either side; that is the C1 path's
+  `ASM-C1-OPERATORS` caveat, as for a C2b assignment that does not fit;
+  `ExamplesC2b`.) `max` lengths, `char(n)`, `bpchar` and the rest are
+  outside;
+* on the C1 path only (these types are not in the slice, so an answer
+  with them names `check_sound`): T-SQL `bigint` and PostgreSQL `bigint`
+  or `int8`, `smallint` and `smallint` or `int2`, without type
+  arguments. Each is the same range of integers in both ("int, bigint,
+  smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table 8.2), so
+  neither side converts an argument the other passes through. Every other
+  type is
+  outside the spec as a parameter or return type, also where the
+  converter maps it: `tinyint` to `smallint` (the range widens), `bit` to
+  `boolean`, `decimal(p,s)`/`numeric(p,s)` (PostgreSQL drops a parameter's
+  type modifiers, so T-SQL rounds an argument to scale `s` and PostgreSQL
+  does not), `datetime`, `datetime2`, `time` (precision), `char(n)`
+  (padding), `date` (PostgreSQL's range is wider), `varchar(max)` to
+  `text`, `uniqueidentifier` to `uuid` (text form), and user types.
+
+The trailing PL/pgSQL `INOUT return_code` parameter of a procedure (the
+T-SQL status, "The T-SQL return status") has no T-SQL counterpart; it
+must be the integer type, as the status is.
+
+**Parameter defaults** (`dfltOk`, in `lowerParam`) must be the NULL
+literal or a value of the slice that fits the parameter's declared type
+(`fitsTy`: an integer or a string literal within the declared length),
+else the routine is outside the spec. T-SQL converts a default to the
+parameter's type, truncating a string (`@s varchar(3) = 'abcdef'` is
+`'abc'` in the body, as for `DECLARE`, "Assignment converts,
+differently"); PostgreSQL drops a parameter's length modifier ("Parenthesized
+type modifiers ... are discarded by CREATE FUNCTION", CREATE FUNCTION,
+Notes; from memory), so `s varchar(3) DEFAULT 'abcdef'` keeps all six
+characters. A default that fits is the same value in both. For
+arguments the same dropped modifier is why a PostgreSQL parameter is read
+as unbounded ("PostgreSQL parameters carry no length", C2b): an argument
+longer than `n` reaches the PostgreSQL body whole and the T-SQL body
+truncated, which `ASM-TSQL-STRING-ARGS` excludes (callers pass values
+that fit). Not probed. -/
+
+/-- A T-SQL type and the PostgreSQL type it corresponds to on the C1 path
+only (upper-case names, no type arguments). -/
+def c1Types : List (String × List String) :=
+  [("BIGINT", ["BIGINT", "INT8"]), ("SMALLINT", ["SMALLINT", "INT2"])]
+
+/-- A T-SQL parameter or return type and a PostgreSQL one correspond. -/
+def tyCorr (ta tp : Ast.Ty) : Bool :=
+  let int : Bool := match ta, tp with
+    | .Ty a [], .Ty p [] =>
+      (a.toUpper == "INT" || a.toUpper == "INTEGER") &&
+        (p.toUpper == "INT" || p.toUpper == "INTEGER" || p.toUpper == "INT4")
+    | _, _ => false
+  let str : Bool := (strTypeT ta).isSome && (strTypeP tp).isSome
+  let c1 : Bool := match ta, tp with
+    | .Ty a [], .Ty p [] => ((lookup c1Types a.toUpper).map (·.contains p.toUpper)).getD false
+    | _, _ => false
+  int || str || c1
+
+def paramTy : Ast.Param → Ast.Ty
+  | .Param _ t _ _ => t
+
+/-- The parameters in the same position have corresponding types, any
+further PostgreSQL parameter (only the status `return_code` can lower
+alike) is an integer, and the return types correspond. -/
+def sigCorr : Ast.Routine → Ast.Routine → Bool
+  | .Routine _ _ pa ra _ _ _, .Routine _ _ pb rb _ _ _ =>
+    pa.length ≤ pb.length &&
+    (pa.zip pb).all (fun (x, y) => tyCorr (paramTy x) (paramTy y)) &&
+    (pb.drop pa.length).all (fun y => tyCorr (.Ty "INT" []) (paramTy y)) &&
+    match ra, rb with
+    | none, none => true
+    | some x, some y => tyCorr x y
+    | _, _ => false
 
 /-! ## Every expression in the slice (C2a, C2b)
 

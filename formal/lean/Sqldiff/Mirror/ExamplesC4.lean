@@ -302,6 +302,9 @@ def pOut : String := "the PL/pgSQL routine is outside the C1 spec"
 #guard outP (p3P [.Raise (some "NOTICE") (some "dup") [] []]) == pOut
 #guard outP (p3P [.Raise (some "EXCEPTION") (some "dup %") [] []]) == pOut
 #guard outP (p3P [raiseP "dup" "22012"]) == pOut
+-- `ERRCODE = 'p0001'`: an SQLSTATE is upper-case, so PostgreSQL reads a
+-- condition name, finds none, and raises 42704.
+#guard outP (p3P [raiseP "dup" "p0001"]) == pOut
 -- `RAISE EXCEPTION 'dup'` (P0001 by default) is in the spec.
 #guard isC2a (check depd Γd idCert p3T (p3P [.Raise (some "EXCEPTION") (some "dup") [] []]))
 -- A handler for one condition only.
@@ -356,6 +359,33 @@ def pOut : String := "the PL/pgSQL routine is outside the C1 spec"
 -- (error 3903 when nothing is open).
 #guard reasonOf (check depd Γd idCert (p2T [txn "ROLLBACK", rethrowT] (body := p4Body)) (p2P p4BodyP)) ==
   tOut
+/- The unguarded form around two brackets: when the division between them
+fails, no transaction is open, the `ROLLBACK` raises 3903 and `THROW;`
+never runs (probed on SQL Server). The body must be exactly one bracket. -/
+def twoBrackets : List Ast.Node :=
+  [txn "BEGIN", insAcct (tv "@id") (num 1), txn "COMMIT",
+   set (tv "@id") (.Bin "/" (num 10) (tv "@id")),
+   txn "BEGIN", bumpAllT, txn "COMMIT"]
+def twoBracketsP : Ast.Routine :=
+  p2P [insAcctP (pv "p_id") (num 1), txn "COMMIT", set (pv "p_id") (.Bin "/" (num 10) (pv "p_id")),
+    bumpAllP, txn "COMMIT"]
+#guard reasonOf (check depd Γd idCert (p2T [txn "ROLLBACK", rethrowT] (body := twoBrackets))
+  twoBracketsP) == tOut
+#guard !oneBracket twoBrackets
+#guard oneBracket ([txn "BEGIN"] ++ p4Body ++ [txn "COMMIT"])
+-- `IF @@TRANCOUNT > 0 ROLLBACK` is right whatever is open.
+#guard isC2a (check depd Γd idCert (p2T (body := twoBrackets)) twoBracketsP)
+/- The idiom inside an `IF` (or `WHILE`, or a nested block): transaction
+statements are outside the spec there, the idiom's included. -/
+#guard reasonOf (check depd Γd idCert
+  (tsqlProc ["dbo", "p2"] [inT "@id"] [xactAbort, nocount,
+    .If (.Bin ">" (tv "@id") (num 0)) [tryT ([txn "BEGIN"] ++ p4Body ++ [txn "COMMIT"])
+      [rollbackIfOpen, rethrowT]] []])
+  (p2P [.If (.Bin ">" (pv "p_id") (num 0)) (p4BodyP ++ [txn "COMMIT"]) []])) == tOut
+#guard reasonOf (check depd Γd idCert
+  (tsqlProc ["dbo", "p2"] [inT "@id"] [xactAbort, nocount,
+    .NBlock (.Block [] [tryT ([txn "BEGIN"] ++ p4Body ++ [txn "COMMIT"]) [rollbackIfOpen, rethrowT]])])
+  p2P) == tOut
 -- PostgreSQL `COMMIT` in a `SECURITY DEFINER` procedure, inside an
 -- exception block, or `ROLLBACK`.
 #guard reasonOf (check depd Γd idCert p2T (p2P (sec := .Owner))) == pOut
