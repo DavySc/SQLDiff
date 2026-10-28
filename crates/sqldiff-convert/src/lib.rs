@@ -540,6 +540,32 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
         }
     }
 
+    // The engine's assumptions about the pair as a whole name no line, so
+    // each one keeps every unit of the file from counting as converted:
+    // "converted" means no assumption at all. The few every conversion
+    // makes (`EVERY_PAIR`) are stated once for the whole tree instead.
+    for x in report
+        .assumptions
+        .iter()
+        .filter(|x| !EVERY_PAIR.contains(&x.id.as_str()))
+    {
+        for u in &mut units {
+            if u.notes.iter().any(|n| n.rule == x.id) {
+                continue;
+            }
+            u.status = u.status.max(Status::Assumptions);
+            let at = u.notes.partition_point(|n| n.status >= Status::Assumptions);
+            u.notes.insert(
+                at,
+                Note {
+                    status: Status::Assumptions,
+                    rule: x.id.clone(),
+                    text: x.text.clone(),
+                },
+            );
+        }
+    }
+
     let mut c = Conversion {
         from: from.id().to_string(),
         to: to.id().to_string(),
@@ -555,6 +581,16 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     recount(&mut c);
     c
 }
+
+/// Assumptions the engine's diff makes about every conversion pair (names
+/// fold, resolve in the default schema, and so on): stated once for the
+/// whole tree, not on each unit.
+pub(crate) const EVERY_PAIR: [&str; 4] = [
+    "ASM-IDENT-FOLD",
+    "ASM-DEFAULT-SCHEMA",
+    "ASM-DBO-SCHEMA",
+    "ASM-TSQL-OWNERSHIP-CHAIN",
+];
 
 /// Rule of the note on a unit the engine did not compare.
 pub const NOT_COMPARED: &str = "equiv.not-compared";
