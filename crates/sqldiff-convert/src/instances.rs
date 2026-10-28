@@ -1687,6 +1687,7 @@ mod tests {
             flips,
             declared,
             proof,
+            observer,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1698,6 +1699,7 @@ mod tests {
             flips,
             declared,
             proof,
+            observer,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1733,6 +1735,10 @@ mod tests {
                 Box::new(|o| {
                     o.declared.insert("ASM-X".into(), "holds".into());
                 }),
+            ),
+            (
+                "observer",
+                Box::new(|o| o.observer.row_counts = sqldiff_core::observer::RowCounts::Never),
             ),
             (
                 "proof mode",

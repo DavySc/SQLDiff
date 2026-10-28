@@ -19,6 +19,7 @@ pub mod ledger;
 pub mod lint;
 pub mod model;
 pub mod normalize;
+pub mod observer;
 pub mod phrase;
 pub mod proof;
 pub mod render;

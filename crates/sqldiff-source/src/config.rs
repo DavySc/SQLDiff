@@ -241,6 +241,7 @@ impl Resolved {
                 })
                 .collect(),
             proof: self.proof.clone(),
+            observer: self.policy.observer.unwrap_or_default(),
             ..sqldiff_core::Options::default()
         }
     }
@@ -588,6 +589,9 @@ fn merge(acc: &mut Policy, hi: &Policy) {
     acc.dialect_versions.extend(hi.dialect_versions.clone());
     if hi.template.is_some() {
         acc.template = hi.template.clone();
+    }
+    if hi.observer.is_some() {
+        acc.observer = hi.observer;
     }
     // Format keys: the higher layer replaces key by key.
     acc.format.merge(&hi.format);

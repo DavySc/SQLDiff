@@ -878,7 +878,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         StmtKind::SessionSetting if d == Dialect::Tsql && w(1) == "NOCOUNT" => {
             note(
                 u,
-                "SET NOCOUNT ON ignored (it only suppresses row-count messages)",
+                "SET NOCOUNT compared as rows-affected counts by the observer profile, not as a statement",
             );
         }
         StmtKind::TxnBegin | StmtKind::TxnCommit => {

@@ -266,7 +266,9 @@ fn checks_every_instance_against_the_reference() {
             .unwrap()
             .to_string()
     };
-    assert_eq!(status("TouchCustomer"), "converted");
+    // Converted but for the rows-affected counts the T-SQL procedure sends
+    // (decision 1, observer profile).
+    assert_eq!(status("TouchCustomer"), "assumptions");
     // The table is the one the conversion rules write.
     assert_eq!(status("Customer"), "converted");
     assert_eq!(

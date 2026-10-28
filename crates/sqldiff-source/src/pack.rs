@@ -53,6 +53,11 @@ pub struct Policy {
     /// Template syntax of a code generator (section 5.3).
     #[serde(default)]
     pub template: Option<TemplateSyntax>,
+    /// Side channels the caller reads (decision 1 in
+    /// docs/verification-roadmap.md): `row_counts = "same-dialect"`
+    /// (default), `"always"` or `"never"`.
+    #[serde(default)]
+    pub observer: Option<sqldiff_core::observer::Observer>,
     /// How to split composed output and read provenance markers.
     #[serde(default)]
     pub composition: Vec<CompositionPattern>,

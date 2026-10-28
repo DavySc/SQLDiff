@@ -50,6 +50,7 @@ schema = 1                  # packs newer than the build are rejected
 | `[dialect_versions]` | Target version per dialect |
 | `ignore` | Globs a tree source skips |
 | `[template]` | Placeholder delimiters, name pattern, special forms, the `include` form, value kinds (`values`), fragment kinds (`fragments`), routine halves (`pairs`), parameter sources, collision rule, generator-supplied `known_parameters` ([templates-and-composition.md](templates-and-composition.md), [convert-mode.md](convert-mode.md#fragments-routine-halves-and-value-kinds)) |
+| `[observer]` | Side channels the caller reads (decision 1 in [verification-roadmap.md](verification-roadmap.md)). `row_counts`: `"same-dialect"` (default; rows-affected counts are observed within one dialect, and across dialects a side that sends them while the other does not makes the verdict depend on `ASM-OBSERVER-ROWCOUNT`), `"always"` (also across dialects: such a pair is unknown) or `"never"` (within one dialect a changed `SET NOCOUNT` is set aside under `ASM-OBSERVER-ROWCOUNT`). The higher layer's section replaces a lower one's |
 | `[[composition]]` | Begin and end line markers of composed parts; named groups `part`, `template`, others become parameters |
 | `[[helpers]]` | Organisation functions for the built-in catalog |
 | `[[author_markers]]` | `kind` (`review_note`, `intentional_difference`, `sync_partner`, `assumption`) and a `pattern` whose first group is the value; see [review-and-export.md](review-and-export.md) |

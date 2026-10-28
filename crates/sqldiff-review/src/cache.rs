@@ -180,6 +180,8 @@ pub fn report_key(a: &Artifact, b: Option<&Artifact>, opts: &Options, cfg: &Reso
         h.update(l.hash.as_bytes());
         h.update([0]);
     }
+    h.update(format!("O{:?}", opts.observer).as_bytes());
+    h.update([0]);
     // The proof gate changes the verdict (require) and the report (report):
     // its mode, and which checker answers (name, version and binary hash).
     h.update(b"P");

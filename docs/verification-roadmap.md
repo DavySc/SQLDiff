@@ -762,7 +762,7 @@ level, and a probe run plus a delta review for each IBM i Technology Refresh.
 | Typed dialect targets, `profiles/lifecycle.toml`, lifecycle notes | Done (dates unverified) |
 | Packaging and performance spike | Done: all four targets within budget (decision 2) |
 | Gate on the trivial fragment: `formal/lean` (`check_sound`, no axioms), `sqldiff_core::proof`, `--proof off|report|require` | Done; the CLI tests use a stand-in for the checker, CI tests the real one |
-| Decision 1 semantics in Rust | Result column names, reference side with `equivalent` and `refinements`, ORDER BY added done; ORDER BY removed still unknown (needs knowing the result can hold two rows); observer profile, error matching and session state to come |
+| Decision 1 semantics in Rust | Result column names, reference side with `equivalent` and `refinements`, ORDER BY added done; ORDER BY removed still unknown (needs knowing the result can hold two rows); observer profile for row counts done; error matching and session state to come |
 | Coverage invariant | Not started |
 | AST export with generated Lean types | Not started (phase 0 compares syntax trees as text) |
 | Signed locks, `allowed_signers`, `spec-critic` | Not started |
@@ -786,6 +786,8 @@ vendor fact as an axiom (decision 5).
 | Instances whose converted PostgreSQL returns a column under a lower-case name | converted | under assumptions (`ASM-RESULT-NAMES-CI`) |
 | B adds `ORDER BY` to a top-level result A leaves unordered (no TOP or LIMIT) | unknown | equal, `equivalent: false`, with the reason in `refinements` |
 | Every "equal" or "equal under assumptions" | (no field) | `equivalent: true` unless a one-way step was used |
+| A T-SQL procedure that sends rows-affected counts (no `SET NOCOUNT ON` first) against a PostgreSQL or Db2 for i routine, which sends none | equal under assumptions, without it | under `ASM-OBSERVER-ROWCOUNT`; converted procedures and instances are "under assumptions" instead of "converted" |
+| `SET NOCOUNT` changed within one dialect, `[observer] row_counts = "never"` | different | equal under `ASM-OBSERVER-ROWCOUNT` |
 
 ## Leads found while planning
 

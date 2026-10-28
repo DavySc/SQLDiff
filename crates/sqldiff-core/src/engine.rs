@@ -48,6 +48,8 @@ pub struct Options {
     /// The proof gate (decision 3): its mode and the checker a front end
     /// supplies. Off by default.
     pub proof: crate::proof::Settings,
+    /// Side channels the caller reads (decision 1).
+    pub observer: crate::observer::Observer,
 }
 
 impl Default for Options {
@@ -62,6 +64,7 @@ impl Default for Options {
             flips: BTreeMap::new(),
             declared: BTreeMap::new(),
             proof: crate::proof::Settings::default(),
+            observer: crate::observer::Observer::default(),
         }
     }
 }
@@ -147,6 +150,27 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 
     if same {
         let mut td = treediff::diff(&aa, &ab);
+        // An observer that does not read row counts does not see SET NOCOUNT.
+        if opts.observer.row_counts == crate::observer::RowCounts::Never {
+            let nocount = |f: &Finding| {
+                let text = |l: &Option<Location>, an: &Analyzed| {
+                    l.as_ref()
+                        .and_then(|l| an.artifact.text.get(l.byte_start..l.byte_end))
+                        .is_some_and(crate::observer::is_nocount)
+                };
+                matches!(
+                    f.rule.as_str(),
+                    "stmt.added" | "stmt.removed" | "stmt.modified"
+                ) && (f.a.is_none() || text(&f.a, &aa))
+                    && (f.b.is_none() || text(&f.b, &ab))
+            };
+            let before = td.findings.len();
+            td.findings.retain(|f| !nocount(f));
+            if td.findings.len() < before {
+                td.structural += before - td.findings.len();
+                assumptions.push(crate::observer::rowcount_assumption());
+            }
+        }
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
@@ -200,6 +224,21 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         }
         eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
         findings.append(&mut eq.findings);
+        // Rows-affected counts across dialects (decision 1, observer profile).
+        let (ca, cb) = (
+            crate::observer::sends_counts(&aa),
+            crate::observer::sends_counts(&ab),
+        );
+        if ca != cb {
+            match opts.observer.row_counts {
+                crate::observer::RowCounts::Always => unknown_reasons.push(format!(
+                    "rows-affected counts are observed (observer profile): side {} sends them, side {} does not",
+                    if ca { "A" } else { "B" },
+                    if ca { "B" } else { "A" },
+                )),
+                _ => assumptions.push(crate::observer::rowcount_assumption()),
+            }
+        }
         noise.structural += eq.structural;
         unknown_reasons.append(&mut eq.unknown_reasons);
         normalizations.push(
