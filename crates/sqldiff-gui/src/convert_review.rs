@@ -89,8 +89,9 @@ struct Loaded {
     stamp: Stamp,
 }
 
-/// Every file under the source, OUT and the instance report, with its size
-/// and modification time: what a gate verdict was judged on. Names starting
+/// Every file under the source, OUT, the instance report and the base
+/// catalogs, with its size and modification time: what a gate verdict was
+/// judged on. Names starting
 /// with a dot are skipped and links not followed below the given paths, as
 /// the engine reads a tree.
 type Stamp = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
@@ -118,7 +119,8 @@ fn stamp(s: &Setup) -> Stamp {
     }
     let mut out = Vec::new();
     let given = [Some(&s.tree.src), Some(&s.out), s.instances.as_ref()];
-    for p in given.into_iter().flatten() {
+    let base = s.tree.catalogs.iter().chain(&s.tree.catalogs_b);
+    for p in given.into_iter().flatten().chain(base) {
         match std::fs::metadata(p) {
             Ok(m) if m.is_dir() => dir(p, &mut out),
             m => file(p, m, &mut out),
@@ -761,6 +763,7 @@ impl Review {
                 "at": at,
                 "input_hash": ih,
                 "output_hash": oh,
+                "base_catalogs": self.loaded.tree.report.base_hash,
             }))
             .map_err(|e| e.to_string())?;
             review::allowed(&r).map_err(|e| format!("{where_}: {e}"))?;
@@ -814,6 +817,11 @@ fn empty() -> Loaded {
                 out: None,
                 catalogs: false,
                 templates: false,
+                base_catalogs: Vec::new(),
+                base_catalogs_b: Vec::new(),
+                base_hash: None,
+                base_objects: Vec::new(),
+                base_statements: Vec::new(),
                 files: Vec::new(),
                 unreadable: Vec::new(),
                 totals: Default::default(),
@@ -848,8 +856,14 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
     };
     let (inputs, unreadable) = tree::read(&s.tree)?;
     let written = written_texts(&s.out)?;
+    // Base catalogs go into the conversion too: changed contents, convert again.
+    let base = sqldiff_convert::base::hash(
+        &sqldiff_convert::base::read(&s.tree.catalogs, s.tree.no_catalog)?,
+        &sqldiff_convert::base::read_b(&s.tree.catalogs_b, &s.tree.catalogs, s.tree.no_catalog)?,
+    );
     let same = prev.as_ref().is_some_and(|p| {
         p.written == written
+            && p.tree.report.base_hash == base
             && p.unreadable == unreadable
             && p.inputs.len() == inputs.len()
             && p.inputs

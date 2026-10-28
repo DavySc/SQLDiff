@@ -51,6 +51,15 @@ pub struct Args {
     /// The deployment profile (`[deployment]` in packs and config): the
     /// report lists which assumptions it accepts. Statuses do not change.
     pub deployment: sqldiff_source::deployment::Profile,
+    /// Base catalogs (`--catalog`): DDL files in the source dialect of
+    /// objects that exist already. Bound against on both sides (the tree's
+    /// own objects win), converted for the target catalog only, never
+    /// written or reported as files (`base`).
+    pub catalogs: Vec<PathBuf>,
+    /// The target's base catalogs (`--catalog-b`): the same objects as
+    /// `catalogs` as DDL in the target dialect. Side B binds against these,
+    /// as given, instead of converting `catalogs`. Needs `catalogs`.
+    pub catalogs_b: Vec<PathBuf>,
 }
 
 /// How templates are read: the placeholder rules of `diff --template`.
@@ -233,6 +242,25 @@ pub struct Report {
     pub catalogs: bool,
     /// Whether the files were read as templates.
     pub templates: bool,
+    /// The base catalogs bound against (`--catalog`), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_catalogs: Vec<crate::base::CatalogFile>,
+    /// The target's base catalogs (`--catalog-b`), in order: side B binds
+    /// against these instead of the converted `base_catalogs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_catalogs_b: Vec<crate::base::CatalogFile>,
+    /// One hash over their contents (`base::hash`): review decisions keep it
+    /// and apply only while it is the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_hash: Option<String>,
+    /// Suspect base objects (`suspect: true`: every statement using one
+    /// carries `ASM-BASE-SUSPECT`), then the others whose conversion is not
+    /// plainly converted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_objects: Vec<crate::base::ObjectReport>,
+    /// Base statements that define no object and did not convert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_statements: Vec<crate::base::StatementReport>,
     pub files: Vec<FileReport>,
     /// Files that could not be read as text.
     pub unreadable: Vec<String>,
@@ -338,6 +366,9 @@ pub fn read(a: &Args) -> Result<(Vec<Input>, Vec<String>), String> {
             a.to.display_name()
         ));
     }
+    // The base catalogs too, so a bad one fails before anything is written.
+    crate::base::read(&a.catalogs, a.no_catalog)?;
+    crate::base::read_b(&a.catalogs_b, &a.catalogs, a.no_catalog)?;
     let (inputs, unreadable) = collect(&a.src, &a.extensions)?;
     if inputs.is_empty() {
         return Err(format!(
@@ -394,10 +425,32 @@ pub fn convert_with(
         None => None,
     };
     let ledger = ledger.as_ref();
-    let results = match &a.template {
-        None => convert_files(a, label, inputs, jobs, ledger, hooks)?,
-        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger, hooks)?,
+    let base_files = crate::base::read(&a.catalogs, a.no_catalog)?;
+    let base_files_b = crate::base::read_b(&a.catalogs_b, &a.catalogs, a.no_catalog)?;
+    let base = match base_files.is_empty() {
+        true => None,
+        false => Some(crate::base::prepare(
+            &base_files,
+            &base_files_b,
+            a.from,
+            a.to,
+            &a.helpers,
+            jobs,
+            hooks,
+        )?),
     };
+    let results = match &a.template {
+        None => convert_files(a, label, inputs, jobs, ledger, base.as_ref(), hooks)?,
+        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger, base.as_ref(), hooks)?,
+    };
+    let mut results = results;
+    if let Some(b) = &base {
+        let files: Vec<(&str, &str)> = inputs
+            .iter()
+            .map(|i| (i.rel.as_str(), i.text.as_str()))
+            .collect();
+        b.flag(&files, results.iter_mut().map(|(c, _)| c), a.from);
+    }
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
@@ -417,6 +470,14 @@ pub fn convert_with(
         out: out.map(|o| o.display().to_string()),
         catalogs: !a.no_catalog,
         templates: a.template.is_some(),
+        base_hash: base.as_ref().and_then(|b| b.hash.clone()),
+        base_catalogs: base.as_ref().map(|b| b.files.clone()).unwrap_or_default(),
+        base_catalogs_b: base.as_ref().map(|b| b.files_b.clone()).unwrap_or_default(),
+        base_objects: base.as_ref().map(|b| b.objects.clone()).unwrap_or_default(),
+        base_statements: base
+            .as_ref()
+            .map(|b| b.statements.clone())
+            .unwrap_or_default(),
         totals: totals(&files, started.elapsed().as_secs_f64()),
         deployment: deployment_report(&a.deployment, &conversions),
         files,
@@ -513,17 +574,24 @@ fn convert_files(
     inputs: &[Input],
     jobs: usize,
     ledger: Option<&crate::review::Ledger>,
+    base: Option<&crate::base::Base>,
     hooks: &Hooks,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
+    // Base catalogs go under the tree's objects.
     let source = (!a.no_catalog).then(|| {
-        Arc::new(catalog(
-            inputs.iter().map(|i| i.text.as_str()),
-            a.from,
-            &a.src,
-            None,
-        ))
+        let texts = inputs.iter().map(|i| i.text.as_str());
+        Arc::new(match base {
+            Some(b) => crate::base::over(
+                &b.source,
+                texts,
+                a.from,
+                crate::base::origin(&a.src.display().to_string(), &b.files),
+                None,
+            ),
+            None => catalog(texts, a.from, &a.src, None),
+        })
     });
     // Pass 1: rules only.
     let mut drafts = parallel(jobs, inputs, |i| {
@@ -542,12 +610,17 @@ fn convert_files(
     };
     if let Some(source) = source {
         opts.facts_a = vec![source];
-        opts.facts_b = vec![Arc::new(catalog(
-            drafts.iter().map(|d| d.output()),
-            a.to,
-            out,
-            None,
-        ))];
+        let texts = drafts.iter().map(|d| d.output());
+        opts.facts_b = vec![Arc::new(match base {
+            Some(b) => crate::base::over(
+                &b.target,
+                texts,
+                a.to,
+                crate::base::origin(&out.display().to_string(), b.target_files()),
+                None,
+            ),
+            None => catalog(texts, a.to, out, None),
+        })];
     }
     // Pass 2: check every draft.
     hooks.stop_if_cancelled()?;
@@ -776,6 +849,7 @@ fn declared_name(d: &str) -> Option<String> {
 /// Converts templates: every file is split by the placeholder rules, and
 /// all fragments share one set of stand-in names, so a table a template
 /// creates as `<%SCHEMA%>.<%TABLE%>` binds in the templates that use it.
+#[allow(clippy::too_many_arguments)]
 fn convert_templates(
     a: &Args,
     out: &Path,
@@ -783,6 +857,7 @@ fn convert_templates(
     inputs: &[Input],
     jobs: usize,
     ledger: Option<&crate::review::Ledger>,
+    base: Option<&crate::base::Base>,
     hooks: &Hooks,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
@@ -809,12 +884,18 @@ fn convert_templates(
             .iter()
             .map(|(t, _)| crate::template_fragment(t, &stand))
             .collect();
-        Arc::new(catalog(
-            frags.iter().map(String::as_str),
-            a.from,
-            &a.src,
-            stem,
-        ))
+        let texts = frags.iter().map(String::as_str);
+        // Base catalogs are plain DDL: no placeholders are read in them.
+        Arc::new(match base {
+            Some(b) => crate::base::over(
+                &b.source,
+                texts,
+                a.from,
+                crate::base::origin(&a.src.display().to_string(), &b.files),
+                stem,
+            ),
+            None => catalog(texts, a.from, &a.src, stem),
+        })
     });
 
     // What to convert: each file alone, as its fragment kind, except a
@@ -898,12 +979,17 @@ fn convert_templates(
     };
     if let Some(source) = source {
         opts.facts_a = vec![source];
-        opts.facts_b = vec![Arc::new(catalog(
-            drafts.iter().map(|d| d.output()),
-            a.to,
-            out,
-            stem,
-        ))];
+        let texts = drafts.iter().map(|d| d.output());
+        opts.facts_b = vec![Arc::new(match base {
+            Some(b) => crate::base::over(
+                &b.target,
+                texts,
+                a.to,
+                crate::base::origin(&out.display().to_string(), b.target_files()),
+                stem,
+            ),
+            None => catalog(texts, a.to, out, stem),
+        })];
     }
     hooks.stop_if_cancelled()?;
     let work = slots(jobs_list.iter().zip(drafts));
@@ -1450,6 +1536,7 @@ pub fn written_record(
         input_hash: crate::review::file_hash(input),
         output_hash: crate::review::file_hash(&c.output),
         text: Some(text.to_string()),
+        base_catalogs: t.report.base_hash.clone(),
     };
     crate::review::allowed(&r)?;
     Ok(r)
@@ -1647,8 +1734,9 @@ pub fn review_in(t: &mut Tree, inputs: &[Input], out: &Path) -> Result<Vec<Strin
 /// Statuses are never changed.
 pub fn review(t: &mut Tree, inputs: &[Input], ledger: &crate::review::Ledger, path: &str) {
     let (mut units_reviewed, mut files_reviewed) = (0, 0);
+    let base = t.report.base_hash.clone();
     for ((f, c), input) in t.report.files.iter_mut().zip(&t.conversions).zip(inputs) {
-        let fr = crate::review::review_file(&f.path, &input.text, c, ledger);
+        let fr = crate::review::review_file_in(&f.path, &input.text, c, ledger, base.as_deref());
         let mut by_id: std::collections::HashMap<String, crate::review::UnitReview> =
             fr.units.into_iter().map(|u| (u.id.clone(), u)).collect();
         let mut outdated = 0;
@@ -1779,6 +1867,22 @@ pub fn summary(r: &Report) -> String {
     if !r.unreadable.is_empty() {
         let _ = writeln!(s, "{:<20} {:>6}", "unreadable", r.unreadable.len());
     }
+    if !r.base_catalogs_b.is_empty() {
+        let _ = writeln!(
+            s,
+            "base catalogs: {} file(s), and {} file(s) for the target side (--catalog-b), used as given",
+            r.base_catalogs.len(),
+            r.base_catalogs_b.len()
+        );
+    } else if !r.base_catalogs.is_empty() {
+        let suspect = r.base_objects.iter().filter(|o| o.suspect).count();
+        let _ = writeln!(
+            s,
+            "base catalogs: {} file(s); {suspect} suspect base object(s), flagged where used ({})",
+            r.base_catalogs.len(),
+            crate::base::BASE_SUSPECT
+        );
+    }
     if let Some(l) = &r.ledger {
         let units: usize = r
             .files
@@ -1832,12 +1936,24 @@ pub fn markdown(r: &Report) -> String {
     );
     let _ = writeln!(
         s,
+        "Base catalogs: {}.\n",
+        match r.base_catalogs.len() {
+            0 => "none".to_string(),
+            n => match r.base_catalogs_b.len() {
+                0 => format!("{n} file(s), listed below; bound against, not converted into this tree"),
+                m => format!("{n} file(s), and {m} for the target side, listed below; bound against, not converted into this tree"),
+            },
+        }
+    );
+    let _ = writeln!(
+        s,
         "A file counts as converted only when every unit in it is: no assumption, no decision, nothing found by the engine's diff or by checking the output on its own (binding, leftover source syntax, target limits).\n"
     );
     let _ = writeln!(s, "```\n{}```\n", summary(r));
     if let Some(d) = &r.deployment {
         deployment_markdown(&mut s, d);
     }
+    base_markdown(&mut s, r);
     if !r.totals.top_reasons.is_empty() {
         let _ = writeln!(
             s,
@@ -1943,6 +2059,95 @@ fn deployment_markdown(s: &mut String, d: &DeploymentReport) {
         );
     }
     if !d.facts.is_empty() {
+        s.push('\n');
+    }
+}
+
+/// The base catalogs section of the Markdown report.
+fn base_markdown(s: &mut String, r: &Report) {
+    if r.base_catalogs.is_empty() {
+        return;
+    }
+    let table = |s: &mut String, files: &[crate::base::CatalogFile]| {
+        let _ = writeln!(
+            s,
+            "| file | sha256 | tables and views | routines |\n|---|---|---:|---:|"
+        );
+        for c in files {
+            let _ = writeln!(
+                s,
+                "| `{}` | `{}` | {} | {} |",
+                c.path, c.sha256, c.tables, c.routines
+            );
+        }
+        s.push('\n');
+    };
+    if !r.base_catalogs_b.is_empty() {
+        let _ = writeln!(
+            s,
+            "## Base catalogs\n\nDDL of objects that exist already: `--catalog` in the source dialect for the source side, `--catalog-b` in the target dialect for the target side, each used as given (nothing converted). An object the tree defines replaces the base object of that name. They are not written into this tree and not counted above.\n\nSource side:\n"
+        );
+        table(s, &r.base_catalogs);
+        let _ = writeln!(s, "Target side:\n");
+        table(s, &r.base_catalogs_b);
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "## Base catalogs\n\nDDL of objects that exist already (`--catalog`), in the source dialect. Their objects bind on both sides; an object the tree defines replaces the base object of that name. For the target side they are converted with the same rules and checked against the base catalogs alone; they are not written into this tree and not counted above.\n"
+    );
+    table(s, &r.base_catalogs);
+    let line = |s: &mut String, o: &crate::base::ObjectReport| {
+        let _ = writeln!(
+            s,
+            "- {} `{}` (`{}` line {}): **{}** ({}) {}",
+            o.kind,
+            o.name,
+            o.file,
+            o.line,
+            o.status.label(),
+            o.rules.join(", "),
+            o.reason.lines().next().unwrap_or("")
+        );
+    };
+    let (out, kept): (Vec<_>, Vec<_>) = r.base_objects.iter().partition(|o| o.suspect);
+    if !out.is_empty() {
+        let _ = writeln!(
+            s,
+            "### Suspect base objects\n\nTheir conversion is not plain (or they use one that is not); the target catalog holds it all the same. Every statement that uses one carries `{}`, to accept once checked.\n",
+            crate::base::BASE_SUSPECT
+        );
+        for o in out {
+            line(s, o);
+        }
+        s.push('\n');
+    }
+    if !kept.is_empty() {
+        let _ = writeln!(
+            s,
+            "### Base objects converted under assumptions\n\nStatements that use them bind to their converted form; their assumptions are not carried to those statements.\n"
+        );
+        for o in kept {
+            line(s, o);
+        }
+        s.push('\n');
+    }
+    if !r.base_statements.is_empty() {
+        let _ = writeln!(
+            s,
+            "### Base statements that did not convert (they define no object)\n"
+        );
+        for st in &r.base_statements {
+            let _ = writeln!(
+                s,
+                "- `{}` line {}: **{}** ({}) {}",
+                st.file,
+                st.line,
+                st.status.label(),
+                st.rules.join(", "),
+                st.reason.lines().next().unwrap_or("")
+            );
+        }
         s.push('\n');
     }
 }

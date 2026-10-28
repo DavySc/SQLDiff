@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 47 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 48 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 70 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
-| | Total | 161 |
+| | Total | 162 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -42,6 +42,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-APPLOCK-CHECK-RAISES` | The `IF @rc < 0` branch after sp_getapplock only rolls back and raises. | `nothing` | A reading of the branch in the source routine (the rule does not match its body). | `sqldiff-core/profiles/rules/idioms.rules` |
 | `ASM-ARGUMENT-LENGTHS` | Arguments fit the shorter of the two sides' declared parameter types. | `deployment` | Callers never pass a value longer, larger or more precise than the shorter parameter type. | `sqldiff-core/src/equiv/mod.rs` |
 | `ASM-AUTHOR-*` | An assumption the author stated in a source comment (a pack author marker). | `nothing` | A reviewer resolving the marker for that routine. | `sqldiff-review/src/markers.rs` |
+| `ASM-BASE-SUSPECT` | The target's base objects are what the conversion rules made of the source base catalogs, though their conversion is not plain. | `catalog` | The target's own definitions of the base objects (--catalog-b). | `sqldiff-convert/src/base.rs` |
 | `ASM-BINARY-LENGTH` | Binary values written to a converted bytea column fit the T-SQL length (bytea has no limit and does not pad). | `generated` | A length check on the converted column, or data that never exceeds the declared length. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-BIND-ALIAS` | A qualifier names a relation in scope. | `catalog` | The relation the qualifier names, in the catalog. | `sqldiff-core/src/bind/query.rs` |
 | `ASM-BIND-COLUMN` | A column the code reads or writes exists in the table it names. | `catalog` | The table's columns in the catalog. | `sqldiff-core/src/bind/query.rs` |

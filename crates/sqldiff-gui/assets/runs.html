@@ -49,9 +49,9 @@ button.primary { border-color: var(--focus); color: var(--focus); background: va
 button.primary:hover:not(:disabled) { background: var(--link-2); color: var(--focus); }
 button:disabled { opacity: .45; cursor: default; }
 :focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-input[type=text], select { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; min-width: 0; }
-input[type=text] { font-family: var(--mono); font-size: 12px; }
-input[type=text]:focus, select:focus { outline: none; border-color: var(--focus); }
+input[type=text], textarea, select { font: inherit; font-size: 13px; color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; min-width: 0; }
+input[type=text], textarea { font-family: var(--mono); font-size: 12px; resize: vertical; }
+input[type=text]:focus, textarea:focus, select:focus { outline: none; border-color: var(--focus); }
 .form { padding: 14px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); display: grid; gap: 8px; }
 .side { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto 130px; gap: 8px; align-items: center; }
 .side b { color: var(--muted); font-size: 12px; text-align: center; }
@@ -126,7 +126,12 @@ a.btn:hover { background: var(--link-2); }
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
     <div class="field"><span>Dialects</span><span class="pick"><select id="from" aria-label="Source dialect"></select>→<select id="to" aria-label="Target dialect"></select></span><span></span></div>
     <div class="acts"><label class="tog" title="Files edited by hand since the last run are never replaced"><input type="checkbox" id="overwrite"> Replace files in a non-empty output folder</label></div>
-    <details class="more" id="more"><summary>Templates, extensions and packs</summary>
+    <details class="more" id="more"><summary>Base catalogs, templates, extensions and packs</summary>
+      <div class="field"><span>Catalogs</span><textarea id="catalogs" rows="2" placeholder="Base catalogs: DDL files of objects that exist already, one per line" aria-label="Base catalogs, one file per line" spellcheck="false"></textarea><button type="button" class="outline" data-browse="catalog-pick" data-near="src">Add…</button></div>
+      <input type="hidden" id="catalog-pick">
+      <div class="field"><span>Target catalogs</span><textarea id="catalogs-b" rows="2" placeholder="Optional: the same base objects as DDL in the target dialect, one per line" aria-label="Target base catalogs, one file per line" spellcheck="false"></textarea><button type="button" class="outline" data-browse="catalog-b-pick" data-near="src">Add…</button></div>
+      <input type="hidden" id="catalog-b-pick">
+      <div class="hint">Base catalogs bind on both sides and are converted for the target side only; they are not written. An object the tree defines replaces one of the same name; what uses a base object that does not convert plainly carries an assumption to accept (ASM-BASE-SUSPECT). With target catalogs, the target side uses those as given instead, and nothing is converted.</div>
       <div class="acts"><label class="tog"><input type="checkbox" id="template"> Every file is a template in the <code>[template]</code> syntax of the config or a pack</label></div>
       <div class="field"><span>Parameters</span><input type="text" id="params" placeholder="Names, comma-separated; empty: the template syntax decides" aria-label="Template parameter names" spellcheck="false"><span></span></div>
       <div class="field"><span>Extensions</span><input type="text" id="exts" placeholder="sql" aria-label="File extensions, comma-separated" spellcheck="false"><span></span></div>
@@ -419,6 +424,8 @@ $("conv").addEventListener("submit", async (e) => {
     await post("/api/runs", {
       src, out, from: $("from").value, to: $("to").value, overwrite: $("overwrite").checked,
       template: $("template").checked, parameters: list("params"), extensions: list("exts"),
+      catalogs: $("catalogs").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
+      catalogs_b: $("catalogs-b").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean),
       packs: $("pack").value.trim() ? [$("pack").value.trim()] : [], instances: $("inst").value.trim() || null,
     });
     $("overwrite").checked = false;
@@ -426,6 +433,17 @@ $("conv").addEventListener("submit", async (e) => {
   $("go").disabled = false;
   refresh();
 });
+
+// A catalog picked with Add… goes on its own line.
+for (const [pick, list] of [["catalog-pick", "catalogs"], ["catalog-b-pick", "catalogs-b"]]) {
+  $(pick).addEventListener("change", () => {
+    const p = $(pick).value.trim();
+    if (!p) return;
+    const t = $(list);
+    t.value = (t.value.trim() ? t.value.replace(/\s*$/, "\n") : "") + p;
+    $(pick).value = "";
+  });
+}
 
 // Decisions recorded in a review tab change the done gate: read again on return.
 window.addEventListener("focus", () => { if (!timer) refresh(); });

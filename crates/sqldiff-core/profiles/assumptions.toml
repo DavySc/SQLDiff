@@ -58,6 +58,13 @@ fact = "A length check on the converted column, or data that never exceeds the d
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-BASE-SUSPECT"
+statement = "The target's base objects are what the conversion rules made of the source base catalogs, though their conversion is not plain."
+discharge = "catalog"
+fact = "The target's own definitions of the base objects (--catalog-b)."
+sites = ["sqldiff-convert/src/base.rs"]
+
+[[assumption]]
 id = "ASM-BIND-ALIAS"
 statement = "A qualifier names a relation in scope."
 discharge = "catalog"

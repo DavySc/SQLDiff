@@ -207,6 +207,23 @@ enum Command {
         /// Check each file alone, without catalogs built from the whole tree.
         #[arg(long)]
         no_catalog: bool,
+        /// A base catalog (repeatable): DDL in the source dialect of objects
+        /// that exist already but are not part of SRC, such as the install an
+        /// upgrade script set changes. Its tables, views and routines bind on
+        /// both sides (an object SRC defines replaces one of the same name);
+        /// it is converted for the target catalog only, and never written or
+        /// counted. A statement that uses a base object whose conversion is
+        /// not plain carries ASM-BASE-SUSPECT, to accept once checked. Not
+        /// with --no-catalog.
+        #[arg(long = "catalog", value_name = "FILE", conflicts_with = "no_catalog")]
+        catalogs: Vec<PathBuf>,
+        /// The target's base catalog (repeatable): the same objects as
+        /// --catalog, as DDL in the target dialect (the install as it is on
+        /// the target). The target side binds against these, as given,
+        /// instead of converting --catalog: nothing is flagged. Needs
+        /// --catalog.
+        #[arg(long = "catalog-b", value_name = "FILE", requires = "catalogs")]
+        catalogs_b: Vec<PathBuf>,
         /// Every file is a template in the `[template]` syntax of the loaded
         /// packs or config: the output tree holds templates for the target,
         /// with the placeholders and generator directives kept.
@@ -257,6 +274,12 @@ enum Command {
         /// As given to `sqldiff convert`.
         #[arg(long)]
         no_catalog: bool,
+        /// As given to `sqldiff convert` (repeatable, same order).
+        #[arg(long = "catalog", value_name = "FILE", conflicts_with = "no_catalog")]
+        catalogs: Vec<PathBuf>,
+        /// As given to `sqldiff convert` (repeatable, same order).
+        #[arg(long = "catalog-b", value_name = "FILE", requires = "catalogs")]
+        catalogs_b: Vec<PathBuf>,
         /// As given to `sqldiff convert`; then --instances is required.
         #[arg(long)]
         template: bool,
@@ -634,6 +657,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             to,
             jobs,
             no_catalog,
+            catalogs,
+            catalogs_b,
             template,
             parameters,
             extensions,
@@ -663,6 +688,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers,
                     deployment: resolved.deployment.clone(),
+                    catalogs,
+                    catalogs_b,
                 },
                 out,
                 instances,
@@ -679,6 +706,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             overwrite,
             discard_edits,
             no_catalog,
+            catalogs,
+            catalogs_b,
             template,
             parameters,
             extensions,
@@ -707,6 +736,8 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers,
                     deployment: resolved.deployment.clone(),
+                    catalogs,
+                    catalogs_b,
                 },
                 out,
                 overwrite,

@@ -42,6 +42,8 @@ impl Fixture {
             extensions: tree::extensions(Vec::new()),
             helpers,
             deployment: Default::default(),
+            catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
         };
         let (inputs, unreadable) = tree::read(&a).unwrap();
         tree::convert(&a, &inputs, unreadable, None).unwrap()

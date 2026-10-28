@@ -191,6 +191,8 @@ fn update_from_with_placeholder_assignments_is_refused_not_a_panic() {
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),
         deployment: Default::default(),
+        catalogs: Vec::new(),
+        catalogs_b: Vec::new(),
     };
     let (inputs, unreadable) = tree::read(&a).unwrap();
     let t = tree::convert(&a, &inputs, unreadable, None).unwrap();

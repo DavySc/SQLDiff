@@ -242,12 +242,15 @@ fn refuse(method: &str, h: &Headers, hosts: &[String]) -> Option<Response> {
 
 /// Reads one request. `Err(response)` when it must be refused (see
 /// [`refuse`]); a refused body is drained first, so the client reads the
-/// response instead of a reset connection.
+/// response instead of a reset connection. Reads through the stream itself:
+/// on Windows `try_clone` returns an inheritable socket, which a process a
+/// run starts meanwhile (`git`) keeps open after the response is written and
+/// resets when it exits.
 pub(crate) fn read_request(
     stream: &TcpStream,
     hosts: &[String],
 ) -> std::io::Result<Result<Request, Response>> {
-    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     let mut parts = request_line.split_whitespace();

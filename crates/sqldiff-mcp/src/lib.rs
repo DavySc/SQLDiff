@@ -1110,6 +1110,8 @@ impl Server {
             extensions: Vec::new(),
             helpers: self.config.options().helpers,
             deployment: self.config.deployment.clone(),
+            catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
         };
         let t = tree::convert(&a, &inputs, Vec::new(), None)?;
         let f = &t.report.files[0];
@@ -1157,6 +1159,14 @@ impl Server {
             extensions: tree::extensions(list_arg(args, "extensions")?),
             helpers: self.config.options().helpers,
             deployment: self.config.deployment.clone(),
+            catalogs: list_arg::<String>(args, "catalogs")?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            catalogs_b: list_arg::<String>(args, "catalogs_b")?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         })
     }
 
@@ -1415,6 +1425,29 @@ impl Server {
         for u in &t.report.unreadable {
             text.push_str(&format!("unreadable (not converted): {u}\n"));
         }
+        for c in &t.report.base_catalogs {
+            text.push_str(&format!(
+                "base catalog {} (sha256 {}): {} tables and views, {} routines\n",
+                c.path, c.sha256, c.tables, c.routines
+            ));
+        }
+        for c in &t.report.base_catalogs_b {
+            text.push_str(&format!(
+                "target base catalog {} (sha256 {}): {} tables and views, {} routines\n",
+                c.path, c.sha256, c.tables, c.routines
+            ));
+        }
+        for o in t.report.base_objects.iter().filter(|o| o.suspect) {
+            text.push_str(&format!(
+                "suspect base {} {} ({}:{}), flagged where used: {} ({})\n",
+                o.kind,
+                o.name,
+                o.file,
+                o.line,
+                o.status.label(),
+                o.rules.join(", ")
+            ));
+        }
         let files: Vec<Value> = rows
             .iter()
             .map(|f| {
@@ -1447,6 +1480,11 @@ impl Server {
             "out": t.report.out,
             "catalogs": t.report.catalogs,
             "templates": t.report.templates,
+            "base_catalogs": t.report.base_catalogs,
+            "base_catalogs_b": t.report.base_catalogs_b,
+            "base_hash": t.report.base_hash,
+            "base_objects": t.report.base_objects,
+            "base_statements": t.report.base_statements,
             "ok": t.report.ok(),
             "totals": t.report.totals,
             "unreadable": t.report.unreadable,
@@ -1845,6 +1883,8 @@ fn tools() -> Value {
                     "overwrite": { "type": "boolean", "description": "Replace files in a non-empty `out` (default false)" },
                     "discard_edits": { "type": "boolean", "description": "With `overwrite`: also replace files edited by hand since the last run (refused otherwise)" },
                     "no_catalog": { "type": "boolean", "description": "Check each file alone, without catalogs built from the whole tree" },
+                    "catalogs": { "type": "array", "items": { "type": "string" }, "description": "Base catalogs, as `sqldiff convert --catalog` (in order): DDL files in the source dialect of objects that exist already but are not part of `src`. They bind on both sides (an object `src` defines replaces one of the same name), are converted for the target catalog only, and are never written or counted; a statement that uses a base object whose conversion is not plain carries ASM-BASE-SUSPECT. Not with `no_catalog`" },
+                    "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "The target's base catalogs, as `sqldiff convert --catalog-b` (in order): the same objects as `catalogs`, as DDL in the target dialect. The target side binds against these as given instead of converting `catalogs`. Needs `catalogs`" },
                     "template": { "type": "boolean", "description": "Every file is a template in the loaded packs' [template] syntax (as `sqldiff convert --template`)" },
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
                     "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
@@ -1870,6 +1910,8 @@ fn tools() -> Value {
                     "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
                     "out": { "type": "string", "description": "The converted tree (where review-decisions.jsonl lives)" },
                     "no_catalog": { "type": "boolean" },
+                    "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
+                    "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
@@ -1894,6 +1936,8 @@ fn tools() -> Value {
                     "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
                     "out": { "type": "string", "description": "The converted tree, written earlier by `convert_tree`" },
                     "no_catalog": { "type": "boolean" },
+                    "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
+                    "catalogs_b": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },

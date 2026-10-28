@@ -1214,6 +1214,7 @@ fn a_template_unit_written_by_hand_passes_the_gate_only_on_a_complete_instance_c
         input_hash: String::new(),
         output_hash: String::new(),
         text: Some(text.clone()),
+        base_catalogs: None,
     };
     std::fs::write(
         conv.join(LEDGER_FILE),

@@ -76,6 +76,8 @@ fn review(d: &Dir) -> Review {
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),
         deployment: Default::default(),
+        catalogs: Vec::new(),
+        catalogs_b: Vec::new(),
     };
     let out = d.0.join("out");
     let (inputs, unreadable) = tree::read(&args).unwrap();
@@ -1037,4 +1039,35 @@ fn a_cancelled_branch_review_writes_nothing() {
     assert_eq!(run["state"], "cancelled", "{run}");
     // Not even the folder: the files and the folder are made after the last cancel point.
     assert!(!d.0.join("out").exists());
+}
+
+/// A process started while a connection is open (a branch review runs `git`)
+/// must not hold that connection: the response arrives when it is written,
+/// not when the process exits, and is not reset when it does (Windows, where
+/// a socket from `try_clone` is inheritable).
+#[cfg(windows)]
+#[test]
+fn a_process_started_meanwhile_does_not_hold_the_connection() {
+    let addr = start(app(None, None));
+    let mut s = TcpStream::connect(addr).unwrap();
+    // Accepted by now (the server waits on the request line); if not, the
+    // child cannot hold it either, so this can pass wrongly but not fail wrongly.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping -n 6 127.0.0.1 >NUL"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t = std::time::Instant::now();
+    write!(s, "GET /api/runs HTTP/1.1\r\nHost: {addr}\r\n\r\n").unwrap();
+    let mut resp = String::new();
+    let read = s.read_to_string(&mut resp);
+    let took = t.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    read.unwrap();
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
 }
