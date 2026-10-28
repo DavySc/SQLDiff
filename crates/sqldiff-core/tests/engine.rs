@@ -512,3 +512,39 @@ fn hazard_introduced_in_new_version_is_reported() {
         rules(&r)
     );
 }
+
+/// `GO 5` runs the batch before it five times; the separator sits outside
+/// every statement, so the coverage check compares it (crate::coverage).
+#[test]
+fn a_repeated_batch_is_never_equal() {
+    let a = "UPDATE t SET x = x + 1;\nGO\nUPDATE t SET y = 2;\n";
+    let r = run(
+        a,
+        Dialect::Tsql,
+        &a.replace("GO\n", "GO 5\n"),
+        Dialect::Tsql,
+    );
+    assert_eq!(r.verdict, Verdict::Unknown, "{:?}", r.unknown_reasons);
+    assert!(r.unknown_reasons.iter().any(|x| x.contains("GO 5")));
+    // The same count spelled differently is the same script.
+    let r = run(
+        a,
+        Dialect::Tsql,
+        &a.replace("GO\n", "go 1\n"),
+        Dialect::Tsql,
+    );
+    assert_eq!(r.verdict, Verdict::Equal, "{:?}", r.unknown_reasons);
+    // Across dialects only a plain separator is covered.
+    let pg = "UPDATE t SET x = x + 1;\nUPDATE t SET y = 2;\n";
+    let r = run(
+        &a.replace("GO\n", "GO 5\n"),
+        Dialect::Tsql,
+        pg,
+        Dialect::Postgres,
+    );
+    assert!(
+        r.unknown_reasons.iter().any(|x| x.contains("GO 5")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}

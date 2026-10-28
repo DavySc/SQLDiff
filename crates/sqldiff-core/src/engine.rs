@@ -256,6 +256,10 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let mut discharged = crate::ledger::discharges(&aa);
     discharged.extend(crate::ledger::discharges(&ab));
 
+    if let Some(why) = crate::coverage::uncovered(&aa, &ab) {
+        unknown_reasons.push(why);
+    }
+
     let mut diagnostics = aa.diagnostics();
     diagnostics.extend(ab.diagnostics());
     if !diagnostics.is_empty() {
