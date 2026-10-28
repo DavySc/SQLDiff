@@ -120,6 +120,23 @@ Phase 0 measures the checker against these budgets:
 | Memory | Below the Rust process for the same pair |
 | Builds | All four release targets: Windows x64, macOS arm64 and x64 (built on arm64), static musl Linux x64 |
 
+Spike results, 2026-10-28 (`.github/workflows/formal-lean.yml`, Lean
+4.35.0, the phase 0 checker; release targets as in `release.yml`):
+
+| Target | Start-up, median | Per request | Size | Links against |
+|---|---|---|---|---|
+| Linux x64 | 3.2 ms | 2.1 µs | 8.2 MB (unstripped) | glibc 2.14 or newer, nothing else |
+| macOS arm64 | 6.5 ms | 2.1 µs | 2.3 MB | system libraries only |
+| macOS x64 (built and run under Rosetta on arm64) | 45 ms | 12.8 µs | 2.8 MB | system libraries only |
+| Windows x64 | 18.9 ms | 2.9 µs | 7.9 MB | Windows DLLs only |
+
+All within budget; the macOS x64 figures include Rosetta's translation and
+are not measured on Intel hardware. A static glibc link crashed on start,
+so Linux ships a glibc-linked checker beside the musl CLI. Lean 4.19's own
+linker produced macOS binaries that dyld refuses ("__DATA_CONST segment
+missing SG_READ_ONLY flag"); Apple's linker did not help; Lean 4.35.0 does
+not have the problem and is pinned.
+
 When the spike misses a budget: run the gate asynchronously in the GUI
 ("equal, confirming…"), cache checks by the hash of both ASTs, the versions,
 the observer profile and the checker version, or keep strict mode for CI
@@ -736,6 +753,27 @@ year-level table, **not yet verified against vendor pages**
 Expected ongoing cost per release: two to four weeks for a PostgreSQL major
 (yearly), more for a SQL Server release (every few years) or compatibility
 level, and a probe run plus a delta review for each IBM i Technology Refresh.
+
+## Phase 0 progress (branch `verification`)
+
+| Item | State |
+|---|---|
+| Private `Report.verdict`, changed only by `Report::settle` | Done |
+| Typed dialect targets, `profiles/lifecycle.toml`, lifecycle notes | Done (dates unverified) |
+| Packaging and performance spike | Done: all four targets within budget (decision 2) |
+| Gate on the trivial fragment: `formal/lean` (`check_sound`, no axioms), `sqldiff_core::proof`, `--proof off|report|require` | Done; the CLI tests use a stand-in for the checker, CI tests the real one |
+| Decision 1 semantics in Rust | Not started |
+| Coverage invariant | Not started |
+| AST export with generated Lean types | Not started (phase 0 compares syntax trees as text) |
+| Signed locks, `allowed_signers`, `spec-critic` | Not started |
+| Shipping `sqldiff-check` in releases | Not started |
+
+The trivial fragment: same dialect, same canonical target, and syntax trees
+equal once whitespace and comments are left out. It covers reformatting
+and comment changes. Keyword case is outside it, because a T-SQL word such
+as `date` can be a keyword or an identifier and identifiers are
+case-sensitive under a case-sensitive collation; bringing it in needs a
+vendor fact as an axiom (decision 5).
 
 ## Leads found while planning
 
