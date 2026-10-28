@@ -5,7 +5,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Progress and cancel. The default has neither.
+/// Progress and cancel. The default has neither; a conversion with no
+/// progress callback prints `checked n/total` to stderr every 50 files, as
+/// the command line shows it.
 #[derive(Default)]
 pub struct Hooks {
     /// Called after each check (a file, a routine's paired templates, an
