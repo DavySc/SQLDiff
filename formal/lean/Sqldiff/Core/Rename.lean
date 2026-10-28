@@ -11,7 +11,7 @@ on every variable the source names, and their worlds and call lists are
 equal. So the two observations are equal for every fuel, which gives both
 clauses of `Refines` with the same fuel on each side (`refines_rename`).
 -/
-import Sqldiff.Core.Semantics
+import Sqldiff.Core.Data
 
 namespace Sqldiff.Core
 
@@ -43,8 +43,9 @@ theorem Agree.set {σA σB : Store U} {x : Var} (inj : InjOn f D) (hx : x ∈ D)
   · have hf : f y ≠ f x := fun e => hyx (inj y hy x hx e)
     simp [hyx, hf, h y hy]
 
-theorem SExpr.eval_rename {σA σB : Store U} (h : Agree f D σA σB) :
-    ∀ s : SExpr, Sub s.vars D → (s.rename f).eval σB = s.eval σA
+theorem SExpr.eval_rename {σA σB ρ : Store U} (h : Agree f D σA σB) :
+    ∀ s : SExpr, Sub s.vars D → (s.rename f).eval σB ρ = s.eval σA ρ
+  | .col _, _ => rfl
   | .var x, hs => by
     simp only [SExpr.rename, SExpr.eval]
     rw [h x (hs x (by simp [SExpr.vars]))]
@@ -86,16 +87,16 @@ theorem SExpr.eval_rename {σA σB : Store U} (h : Agree f D σA σB) :
       SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
 
 mutual
-  theorem Expr.eval_rename (es : ExprSem U) {σA σB : Store U} (h : Agree f D σA σB) :
-      ∀ e : Expr, Sub e.vars D → (e.rename f).eval es σB = e.eval es σA
+  theorem Expr.eval_rename (es : ExprSem U) {σA σB ρ : Store U} (h : Agree f D σA σB) :
+      ∀ e : Expr, Sub e.vars D → (e.rename f).eval es σB ρ = e.eval es σA ρ
     | .sc s, hs => SExpr.eval_rename h s hs
     | .op g args, hs => by
       simp only [Expr.rename, Expr.eval]
       rw [Expr.evalList_rename es h args (fun y hy => hs y (by simpa [Expr.vars] using hy))]
 
-  theorem Expr.evalList_rename (es : ExprSem U) {σA σB : Store U} (h : Agree f D σA σB) :
+  theorem Expr.evalList_rename (es : ExprSem U) {σA σB ρ : Store U} (h : Agree f D σA σB) :
       ∀ args : List Expr, Sub (Expr.varsList args) D →
-        Expr.evalList es σB (Expr.renameList f args) = Expr.evalList es σA args
+        Expr.evalList es σB ρ (Expr.renameList f args) = Expr.evalList es σA ρ args
     | [], _ => rfl
     | e :: es', hs => by
       simp only [Expr.renameList, Expr.evalList]
@@ -136,9 +137,10 @@ theorem Agree.setRefs (inj : InjOn f D) :
 
 /-! ## The lock-step simulation -/
 
-/-- Related states: stores agree through `f` on `D`; same world, same calls. -/
+/-- Related states: stores agree through `f` on `D`; same world, same
+database, same calls. -/
 def StRel (f : Var → Var) (D : List Var) (a b : State U W) : Prop :=
-  Agree f D a.store b.store ∧ a.world = b.world ∧ a.calls = b.calls
+  Agree f D a.store b.store ∧ a.world = b.world ∧ a.db = b.db ∧ a.calls = b.calls
 
 /-- Related outcomes: the same kind of ending, related states, and the
 same returned value or error. -/
@@ -155,12 +157,12 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
   | 0, _, _, _, _, h => by simpa [exec, OutRel] using h
   | _ + 1, .skip, _, _, _, h => by simpa [exec, Stmt.rename, OutRel] using h
   | _ + 1, .assign x e, a, b, hs, h => by
-    obtain ⟨hst, hw, hc⟩ := h
+    obtain ⟨hst, hw, hdb, hc⟩ := h
     simp only [exec, Stmt.rename]
     rw [Expr.eval_rename es hst e (fun y hy => hs y (by simp [Stmt.vars, hy]))]
-    cases Expr.eval es a.store e with
-    | err k => exact ⟨rfl, hst, hw, hc⟩
-    | ok v => exact ⟨hst.set inj (hs x (by simp [Stmt.vars])) v, hw, hc⟩
+    cases Expr.eval es a.store nullStore e with
+    | err k => exact ⟨rfl, hst, hw, hdb, hc⟩
+    | ok v => exact ⟨hst.set inj (hs x (by simp [Stmt.vars])) v, hw, hdb, hc⟩
   | n + 1, .seq s t, a, b, hs, h => by
     have ih := exec_rename es wm inj n s a b (fun y hy => hs y (by simp [Stmt.vars, hy])) h
     simp only [exec, Stmt.rename]
@@ -172,7 +174,7 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
   | n + 1, .ite c s t, a, b, hs, h => by
     simp only [exec, Stmt.rename]
     rw [Expr.eval_rename es h.1 c (fun y hy => hs y (by simp [Stmt.vars, hy]))]
-    cases Expr.eval es a.store c with
+    cases Expr.eval es a.store nullStore c with
     | err k => exact ⟨rfl, h⟩
     | ok v =>
       dsimp only
@@ -182,7 +184,7 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
   | n + 1, .while c body, a, b, hs, h => by
     simp only [exec, Stmt.rename]
     rw [Expr.eval_rename es h.1 c (fun y hy => hs y (by simp [Stmt.vars, hy]))]
-    cases Expr.eval es a.store c with
+    cases Expr.eval es a.store nullStore c with
     | err k => exact ⟨rfl, h⟩
     | ok v =>
       dsimp only
@@ -200,22 +202,58 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
   | _ + 1, .ret (some e), a, b, hs, h => by
     simp only [exec, Stmt.rename, Option.map_some]
     rw [Expr.eval_rename es h.1 e (fun y hy => hs y (by simp [Stmt.vars, hy]))]
-    cases Expr.eval es a.store e with
+    cases Expr.eval es a.store nullStore e with
     | err k => exact ⟨rfl, h⟩
     | ok v => exact ⟨rfl, h⟩
   | _ + 1, .call p args, a, b, hs, h => by
-    obtain ⟨hst, hw, hc⟩ := h
+    obtain ⟨hst, hw, hdb, hc⟩ := h
     have hargs : Sub (args.map Arg.vars).flatten D := fun y hy => hs y (by simpa [Stmt.vars] using hy)
     simp only [exec, Stmt.rename]
     rw [args_eval_rename es hst args hargs]
     cases Arg.evalAll es a.store args with
-    | error k => exact ⟨rfl, hst, hw, hc⟩
+    | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
     | ok vs =>
       dsimp only
-      rw [hw]
+      rw [hw, hdb]
+      generalize wm.call p vs b.world b.db = res
+      obtain ⟨w', db', rs⟩ := res
       simp only [OutRel, StRel]
       refine ⟨Agree.setRefs inj args _ _ _ hargs hst, ?_⟩
       simp [hc]
+  | _ + 1, .insert t cs rows, a, b, hs, h => by
+    obtain ⟨hst, hw, hdb, hc⟩ := h
+    simp only [exec, Stmt.rename]
+    rw [insertRows_map (ev := fun ρ e => e.eval es a.store ρ) t cs rows _
+      (fun es' hes' e he _ => Expr.eval_rename es hst e (fun y hy => hs y (by
+        simp only [Stmt.vars, List.mem_flatten, List.mem_map]
+        exact ⟨_, ⟨es', hes', rfl⟩, List.mem_flatten.mpr ⟨e.vars, List.mem_map.mpr ⟨e, he, rfl⟩, hy⟩⟩))),
+      hdb]
+    cases insertRows (fun ρ e => e.eval es a.store ρ) t cs rows (b.db.get t.name) with
+    | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
+    | ok rs => exact ⟨hst, hw, rfl, hc⟩
+  | _ + 1, .update t sets c, a, b, hs, h => by
+    obtain ⟨hst, hw, hdb, hc⟩ := h
+    simp only [exec, Stmt.rename]
+    rw [updateRows_map (ev := fun ρ e => e.eval es a.store ρ) t sets c
+      (fun p hp _ => Expr.eval_rename es hst p.2 (fun y hy => hs y (by
+        simp only [Stmt.vars, List.mem_append, List.mem_flatten, List.mem_map]
+        exact Or.inl ⟨_, ⟨p, hp, rfl⟩, hy⟩)))
+      (fun e he _ => Expr.eval_rename es hst e (fun y hy => hs y (by
+        simp only [Stmt.vars, List.mem_append, he, Expr.varsOpt]
+        exact Or.inr hy))), hdb]
+    cases updateRows (fun ρ e => e.eval es a.store ρ) t sets c (b.db.get t.name) with
+    | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
+    | ok rs => exact ⟨hst, hw, rfl, hc⟩
+  | _ + 1, .delete t c, a, b, hs, h => by
+    obtain ⟨hst, hw, hdb, hc⟩ := h
+    simp only [exec, Stmt.rename]
+    rw [deleteRows_map (ev := fun ρ e => e.eval es a.store ρ) t c
+      (fun e he _ => Expr.eval_rename es hst e (fun y hy => hs y (by
+        simp only [Stmt.vars, he, Expr.varsOpt]
+        exact hy))), hdb]
+    cases deleteRows (fun ρ e => e.eval es a.store ρ) t c (b.db.get t.name) with
+    | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
+    | ok rs => exact ⟨hst, hw, rfl, hc⟩
 
 /-! ## Routines -/
 
@@ -278,8 +316,8 @@ theorem outVals_rename {σA σB : Store U} (h : Agree f D σA σB) :
 /-- With the same fuel, a routine and its injective renaming give the
 same observation. -/
 theorem obs_rename (es : ExprSem U) (wm : WorldModel U W) (r : Routine)
-    (inj : InjOn f r.vars) (args : List (Val U)) (w : W) (n : Nat) :
-    (r.rename f).obs es wm args w n = r.obs es wm args w n := by
+    (inj : InjOn f r.vars) (args : List (Val U)) (w : W) (db : Db U) (n : Nat) :
+    (r.rename f).obs es wm args w db n = r.obs es wm args w db n := by
   have hp : Sub (r.params.map Param.vars).flatten r.vars := fun y hy => by
     simp only [Routine.vars, List.mem_append]; exact Or.inl (Or.inl hy)
   have hb : Sub r.body.vars r.vars := fun y hy => by
@@ -291,27 +329,28 @@ theorem obs_rename (es : ExprSem U) (wm : WorldModel U W) (r : Routine)
   cases iA <;> cases iB <;> simp only [BindRel] at hbind
   · simp [hbind]
   · next σA σB =>
-    have hsim := exec_rename es wm inj n r.body ⟨σA, w, []⟩ ⟨σB, w, []⟩ hb ⟨hbind, rfl, rfl⟩
+    have hsim := exec_rename es wm inj n r.body ⟨σA, w, db, []⟩ ⟨σB, w, db, []⟩ hb
+      ⟨hbind, rfl, rfl, rfl⟩
     dsimp only
     generalize exec es wm n r.body _ = oA at hsim ⊢
     generalize exec es wm n (r.body.rename f) _ = oB at hsim ⊢
     cases oA <;> cases oB <;> simp only [OutRel] at hsim
-    · obtain ⟨hst, hw, hc⟩ := hsim
-      simp [observe, outVals_rename hst r.params hp, hw, hc]
-    · obtain ⟨hv, hst, hw, hc⟩ := hsim
-      simp [observe, outVals_rename hst r.params hp, hv, hw, hc]
-    · obtain ⟨hk, _, hw, hc⟩ := hsim
-      simp [observe, hk, hw, hc]
-    · obtain ⟨_, hw, hc⟩ := hsim
+    · obtain ⟨hst, hw, hdb, hc⟩ := hsim
+      simp [observe, outVals_rename hst r.params hp, hw, hdb, hc]
+    · obtain ⟨hv, hst, hw, hdb, hc⟩ := hsim
+      simp [observe, outVals_rename hst r.params hp, hv, hw, hdb, hc]
+    · obtain ⟨hk, _, _, _, hc⟩ := hsim
+      simp [observe, hk, hc]
+    · obtain ⟨_, hw, _, hc⟩ := hsim
       simp [observe, hw, hc]
 
 /-- An injective renaming of a routine refines it (and, by the same
 proof, is refined by it). -/
 theorem refines_rename (es : ExprSem U) (wm : WorldModel U W) (r : Routine)
     (inj : InjOn f r.vars) : Refines es wm r (r.rename f) := by
-  intro args w
-  refine ⟨fun n => ⟨n, obs_rename es wm r inj args w n⟩, fun hd n => ?_⟩
-  rw [← obs_rename es wm r inj args w n]
+  intro args w db
+  refine ⟨fun n => ⟨n, obs_rename es wm r inj args w db n⟩, fun hd n => ?_⟩
+  rw [← obs_rename es wm r inj args w db n]
   exact hd n
 
 end

@@ -5,7 +5,7 @@ defaultTargets = ["sqldiff_check", "Sqldiff"]
 # Definitions, the checker and its theorems. Executable code imports only
 # Init (decision 2): no Mathlib, no `Lean` package. Every module under
 # Sqldiff/ is built, including those the executable does not import yet
-# (the core and the mirror check, phases C1 and C2a), so their proofs and checked
+# (the core and the mirror check, phases C1 to C3a), so their proofs and checked
 # examples run on every build.
 [[lean_lib]]
 name = "Sqldiff"

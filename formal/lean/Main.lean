@@ -8,37 +8,44 @@ ID is digits; SCHEMA is `sqldiff_core::proof::schema_hash`, which must be
 `Sqldiff.Syntax.schemaHash`; the trees come from
 `sqldiff_core::proof::tree_line` and contain no tab.
 
-The mirror check of phases C1 and C2a (`Sqldiff.Mirror.check`, theorems
-`Sqldiff.Mirror.check_sound` and `Sqldiff.Mirror.check_sound_c2a`) is a
-second request kind:
+The mirror check of phases C1, C2a and C3a (`Sqldiff.Mirror.check`,
+theorems `Sqldiff.Mirror.check_sound` and `Sqldiff.Mirror.check_sound_c2a`)
+is a second request kind:
 
   sqldiff-check/3 ID AST-SCHEMA mirror DEPLOYMENT CATALOG CERT ROUTINE-A ROUTINE-B end
 
 AST-SCHEMA must be `Sqldiff.Ast.schemaHash`; ROUTINE-A (T-SQL, the
 reference) and ROUTINE-B (PL/pgSQL) are `sqldiff_syntax::encode` routine
 lines, decoded by `Sqldiff.Ast.decodeRoutineLine`; DEPLOYMENT, CATALOG and
-CERT are encoded as `Sqldiff.Mirror.Request` documents. Anything else is
-answered "unconfirmed".
+CERT are encoded as `Sqldiff.Mirror.Request` documents (C3a adds table
+mappings to DEPLOYMENT and table entries to CATALOG, both optional).
+Anything else is answered "unconfirmed".
 
 Answers. `/2` and an unconfirmed `/3`:
 
   {"id":ID,"proof":"confirmed","theorem":NAME}
   {"id":ID,"proof":"unconfirmed","reason":TEXT}
 
-A confirmed `/3` answer has two more fields after `theorem`
+A confirmed `/3` answer has more fields after `theorem`
 (`Sqldiff.Mirror.Request.extra`); a reader that ignores unknown fields
 reads it as before:
 
   {"id":ID,"proof":"confirmed","theorem":"Sqldiff.Mirror.check_sound_c2a",
-   "scalars":"c2a","residual":["ASM-TSQL-ARITH-ERRORS",...]}
+   "scalars":"c2a","residual":["ASM-TSQL-ARITH-ERRORS",...],"statements":"c3a"}
   {"id":ID,"proof":"confirmed","theorem":"Sqldiff.Mirror.check_sound",
-   "scalars":"uninterpreted"}
+   "scalars":"uninterpreted","statements":"c1"}
 
 `"scalars":"c2a"` means every expression of both routines is in the C2a
-slice, so the confirmation does not rest on operators meaning the same "by
-name" (`ASM-C1-OPERATORS`); `residual` lists the T-SQL session facts it
-rests on instead (possibly none). `"uninterpreted"` means it does rest on
-`ASM-C1-OPERATORS`.
+slice and every data statement in the C3a slice, so the confirmation does
+not rest on operators meaning the same "by name" (`ASM-C1-OPERATORS`);
+`residual` lists the facts it rests on instead (possibly none): the T-SQL
+session facts `ASM-TSQL-ARITH-ERRORS` and `ASM-TSQL-ANSI-NULLS`, and
+(C3a) `ASM-STATE-AFTER-ERROR` when the routine can fail after a write. A
+reader that does not know a residual must not treat the answer as a C2a
+one. `"uninterpreted"` means it does rest on `ASM-C1-OPERATORS`.
+`"statements"` (C3a) is `"c3a"` when the routines have `INSERT`, `UPDATE`
+or `DELETE` statements, whose confirmation also rests on the TABLE entries
+of CATALOG and the table mappings of DEPLOYMENT, and `"c1"` otherwise.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -75,7 +82,7 @@ def handle (line : String) : String :=
       else if p == mirrorProtocol && da == "mirror" then
         -- The same ten fields: kind, deployment, catalog, certificate, routines.
         let a := Sqldiff.Mirror.Request.answer schema ta xa db tb xb
-        answerLine id a (Sqldiff.Mirror.Request.extra ta tb a)
+        answerLine id a (Sqldiff.Mirror.Request.extra ta xa tb a)
       else
         answerLine "0" (.unconfirmed "malformed request")
     else
@@ -92,7 +99,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.4.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.5.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

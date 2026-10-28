@@ -1,9 +1,10 @@
 """Protocol tests for the built checker. sqldiff-check/2: confirmed only
 for identical sides that decode under the checker's syntax schema.
 sqldiff-check/3: the C1 mirror check, confirmed for a T-SQL procedure and
-its PL/pgSQL mirror, with the C2a fields (`scalars`, `residual`) on a
-confirmed answer. Anything else is unconfirmed, including malformed
-requests.
+its PL/pgSQL mirror, with the C2a fields (`scalars`, `residual`) and the
+C3a field (`statements`) on a confirmed answer; C3a requests with table
+mappings in DEPLOYMENT and table entries in CATALOG. Anything else is
+unconfirmed, including malformed requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
 """
@@ -188,18 +189,91 @@ cases += [
     ("43", req3(43, a=pair_t(bin_("/", tv("@a"), num(2))), b=pair_p(bin_("||", pv("a"), num(2))),
                 cat="-", dep="0", cert=PAIR_CERT), "unconfirmed"),
 ]
+
+# C3a: data statements on a catalog table. T-SQL dbo.Acct (Id int PRIMARY
+# KEY, Qty int NULL, Total int NOT NULL) is the target table acct (id, qty,
+# total); the deployment maps the name, the catalog describes the table.
+
+
+def upd(target, sets, where=NONE):
+    return C("NStmt", C("Update", L(*map(S, target)), NONE, L(*(C("Set", L(S(c)), e) for c, e in sets)),
+                        L(), where))
+
+
+def ins(target, cols, rows):
+    return C("NStmt", C("Insert", L(*map(S, target)), L(*map(S, cols)),
+                        C("SrcValues", L(*(L(*r) for r in rows))), L(), L(), NONE))
+
+
+def dele(target, where=NONE):
+    return C("NStmt", C("Delete", L(*map(S, target)), NONE, L(), where))
+
+
+def col(c):
+    return C("Name", L(S(c)))
+
+
+ABORT = C("Setting", S("XACT_ABORT"), "t")
+D_T = proc(["dbo", "bump"], [param("@id", "In"), param("@n", "In")], [], [
+    ABORT,
+    upd(["dbo", "Acct"], [("Qty", bin_("+", col("Qty"), tv("@n")))], bin_("=", col("Id"), tv("@id"))),
+    ins(["dbo", "Acct"], ["Id", "Qty", "Total"], [[tv("@id"), tv("@n"), num(0)]]),
+])
+
+
+def d_p(where=bin_("=", pv("id"), pv("p_id")), params=("p_id", "p_n")):
+    return proc(["bump"], [param(params[0], "In"), param(params[1], "In")], [], [
+        upd(["acct"], [("qty", bin_("+", pv("qty"), pv("p_n")))], where),
+        ins(["acct"], ["id", "qty", "total"], [[pv(params[0]), pv("p_n"), num(0)]]),
+    ])
+
+
+D_DEP = f"0;{hx('dbo.Acct')}:{hx('acct')}"
+D_CAT = (f"{hx('acct')}={hx('id')}.ink.{hx('Id')}/{hx('qty')}.i.{hx('Qty')}"
+         f"/{hx('total')}.in.{hx('Total')}")
+D_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "p_id"), ("@n", "p_n"), ("%status", "%status")])
+D_ID_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "id"), ("@n", "p_n"), ("%status", "%status")])
+
+
+def req3d(i, a=D_T, b=None, dep=D_DEP, cat=D_CAT, cert=D_CERT):
+    return req3(i, a=a, b=d_p() if b is None else b, dep=dep, cat=cat, cert=cert)
+
+
+cases += [
+    ("44", req3d(44), "confirmed"),
+    # The table missing from the catalog, or its name from the deployment.
+    ("45", req3d(45, cat="-"), "unconfirmed"),
+    ("46", req3d(46, dep="0"), "unconfirmed"),
+    # A different WHERE.
+    ("47", req3d(47, b=d_p(where=bin_(">=", pv("id"), pv("p_id")))), "unconfirmed"),
+    # The PL/pgSQL parameter is called id, like the column: ambiguous.
+    ("48", req3d(48, b=d_p(where=bin_("=", pv("id"), pv("id")), params=("id", "p_n")), cert=D_ID_CERT),
+     "unconfirmed"),
+    # Row counts observed: T-SQL sends one per statement, PostgreSQL none.
+    ("49", req3d(49, dep="1" + D_DEP[1:]), "unconfirmed"),
+    # A WHERE outside the scalar slice (IN): confirmed on the C1 theorem.
+    ("50", req3(50, a=proc(["r"], [], [], [dele(["dbo", "Acct"], C("InList", col("Qty"), L(num(1), num(2)), "f"))]),
+                b=proc(["r"], [], [], [dele(["acct"], C("InList", pv("qty"), L(num(1), num(2)), "f"))]),
+                dep=D_DEP, cat=D_CAT, cert=f"{hx('%status')}:{hx('%status')}"), "confirmed"),
+]
 THEOREMS = {
     "31": "Sqldiff.Mirror.check_sound",
     "40": "Sqldiff.Mirror.check_sound",
     "41": "Sqldiff.Mirror.check_sound_c2a",
     "42": "Sqldiff.Mirror.check_sound_c2a",
+    "44": "Sqldiff.Mirror.check_sound_c2a",
+    "50": "Sqldiff.Mirror.check_sound",
 }
 # The fields a confirmed /3 answer adds (Main.lean); none on /2 or unconfirmed answers.
 EXTRA = {
-    "31": {"scalars": "uninterpreted"},
-    "40": {"scalars": "uninterpreted"},
-    "41": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS"]},
-    "42": {"scalars": "c2a", "residual": []},
+    "31": {"scalars": "uninterpreted", "statements": "c1"},
+    "40": {"scalars": "uninterpreted", "statements": "c1"},
+    "41": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS"], "statements": "c1"},
+    "42": {"scalars": "c2a", "residual": [], "statements": "c1"},
+    "44": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR"],
+           "statements": "c3a"},
+    "50": {"scalars": "uninterpreted", "statements": "c3a"},
 }
 inp = "".join(line + "\n" for _, line, _ in cases)
 out = subprocess.run([exe], input=inp.encode(), capture_output=True, check=True).stdout.decode()
