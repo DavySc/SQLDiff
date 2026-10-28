@@ -82,6 +82,32 @@ main { flex: 1; display: grid; grid-template-columns: 380px minmax(0, 1fr); min-
 .flag { display: inline-block; font: 600 10.5px/1.6 "Inter", system-ui, sans-serif; padding: 0 6px; border-radius: 999px; background: var(--soft); color: var(--muted); margin-left: 4px; vertical-align: 1px; }
 .flag.warn { background: var(--chg-bg); color: var(--semantic); }
 .flag.bad { background: var(--del-bg); color: var(--transactional); }
+/* Lenses: what a person can settle here, apart from what needs a fix. */
+#lenses { display: flex; gap: 0; padding: 8px 6px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+#lenses button { border-radius: 6px 6px 0 0; border-bottom: 2px solid transparent; padding: 4px 6px 5px; font-size: 12px; }
+#lenses button.on { color: var(--fg); border-bottom-color: var(--focus); }
+#lenses button b { font-variant-numeric: tabular-nums; margin-left: 4px; color: var(--fg); font-weight: 600; }
+#lenses button:not(.on) b { color: var(--muted); font-weight: 500; }
+#tools { display: flex; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--line); align-items: center; }
+#tools input { flex: 1; min-width: 0; }
+#lenshint { padding: 6px 14px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); background: var(--soft); }
+#lenshint:empty { display: none; }
+#lenshint b { color: var(--fg); font-variant-numeric: tabular-nums; }
+.grp { position: sticky; top: 0; z-index: 1; background: var(--panel); display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 0 6px; align-items: center; padding: 7px 10px 7px 10px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.grp:hover { background: var(--soft); }
+.grp .chev { color: var(--muted); font-size: 10px; transition: transform .12s; }
+.grp.open .chev { transform: rotate(90deg); }
+.grp .k { font: 600 12.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grp .n { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.grp .d { grid-column: 2 / 4; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.grp .acts { grid-column: 2 / 4; margin-top: 4px; }
+.grp.open + .rows { border-bottom: 1px solid var(--line); }
+.rows .row { padding-left: 18px; }
+.grp .k .dir { color: var(--faint); font-weight: 400; font-size: 11.5px; }
+.row .p .dir { color: var(--faint); font-size: 11.5px; }
+.showmore { display: block; margin: 4px 0 6px 38px; }
+#bulk .units { max-height: 18vh; overflow: auto; font: 11.5px/1.5 var(--mono); color: var(--muted); margin: 2px 0 0; padding-left: 16px; }
+#bulkgo.confirm { background: var(--focus); color: #fff; }
 #done { border-top: 1px solid var(--line); font-size: 12.5px; }
 #done summary { padding: 8px 14px; cursor: pointer; color: var(--muted); }
 #done .list { max-height: 30vh; overflow: auto; }
@@ -160,7 +186,6 @@ h3:not(:first-child) { margin-top: 16px; }
   <span class="muted" id="pairname"></span>
   <span id="chips" style="display:flex;gap:4px;flex-wrap:wrap"></span>
   <span class="spacer"></span>
-  <label class="tog" title="Also list plainly converted units nobody approved (tier 6): nothing found, not proven"><input type="checkbox" id="all"> Nothing found too</label>
   <input type="text" id="author" placeholder="Your name" aria-label="Your name, recorded with every decision" title="Recorded as the author of every decision you make here (remembered in this browser)">
   <button id="refresh" title="Read the sources and the ledger again (R)">Refresh</button>
   <button id="helpbtn" title="How review works (?)">?</button>
@@ -168,12 +193,16 @@ h3:not(:first-child) { margin-top: 16px; }
 <div id="banners"></div>
 <main>
   <aside id="side">
+    <div id="lenses" role="tablist" aria-label="What to review"></div>
+    <div id="tools"><input type="text" id="filter" placeholder="Filter: path, rule or text  ( / )" aria-label="Filter the list"><select id="groupby" aria-label="Group the list" title="Group the list (G)"><option value="cause">By cause</option><option value="file">By file</option><option value="tier">By tier</option></select></div>
+    <div id="lenshint"></div>
     <div id="queue" role="listbox" aria-label="Review queue"></div>
     <div id="bulk">
       <div class="line"><strong id="bulkn"></strong><span class="spacer"></span><button id="bulkclear">Clear</button></div>
       <div class="line"><select id="bulkrule" aria-label="Assumption to accept"></select></div>
       <div class="line"><input type="text" id="bulkreason" placeholder="Why it holds for all of them" aria-label="Reason"></div>
-      <div class="line"><span class="muted" id="bulkhint"></span><span class="spacer"></span><button class="primary" id="bulkgo">Accept</button></div>
+      <details><summary class="muted" id="bulkhint"></summary><ul class="units" id="bulkunits"></ul></details>
+      <div class="line"><span class="spacer"></span><button class="primary" id="bulkgo">Accept</button></div>
     </div>
     <details id="done"><summary></summary><div class="list"></div></details>
   </aside>
@@ -182,7 +211,7 @@ h3:not(:first-child) { margin-top: 16px; }
 <div id="toast" role="status"></div>
 <div id="help"><div>
   <h3 style="margin-top:0">Reviewing a converted tree</h3>
-  <p>The queue lists what a person should look at, worst first, by tier (never by a score). Each decision you make is appended to <code>review-decisions.jsonl</code> in the converted tree, with your name, your reason and the hashes of both files; the converted files are never changed. After every decision the sources are read again, the ledger applied again and the queue rebuilt.</p>
+  <p>The list is split by what you can do about it. <strong>Needs you</strong>: decisions to pick, assumptions to accept, and output an agent wrote. <strong>Needs a fix</strong> and <strong>Not proven</strong>: nothing recorded here clears these; the output has to change and be converted again. <strong>Nothing found</strong>: plainly converted units, which are not proven either. Each lens is grouped by cause, biggest first, so one look covers many units; an assumption's group can be accepted for all its units at once, which still records one decision per unit. Inside a tier, items are worst first (never by a score). Each decision you make is appended to <code>review-decisions.jsonl</code> in the converted tree, with your name, your reason and the hashes of both files; the converted files are never changed. After every decision the sources are read again, the ledger applied again and the queue rebuilt.</p>
   <table>
     <tr><td><strong>Accept</strong></td><td>An assumption holds here. Bulk accept records one decision per selected unit.</td></tr>
     <tr><td><strong>Pick</strong></td><td>The target the conversion chose is the right one.</td></tr>
@@ -192,7 +221,11 @@ h3:not(:first-child) { margin-top: 16px; }
   </table>
   <p class="muted"><span class="badge rev">accepted in review</span> means people accepted everything that was open; it is never the same as converted. <em>Nothing found, not proven</em> is a plainly converted unit: the rules needed no assumption and SQLDiff found no difference, which is not a proof. A decision made on other file contents is <em>outdated</em> and must be confirmed again.</p>
   <table>
-    <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>Next / previous item</td></tr>
+    <tr><td><kbd>J</kbd> / <kbd>K</kbd></td><td>Next / previous item in this lens</td></tr>
+    <tr><td><kbd>]</kbd> / <kbd>[</kbd></td><td>Next / previous group</td></tr>
+    <tr><td><kbd>1</kbd> to <kbd>4</kbd></td><td>Needs you, Needs a fix, Not proven, Nothing found</td></tr>
+    <tr><td><kbd>/</kbd></td><td>Filter by path, rule or text</td></tr>
+    <tr><td><kbd>G</kbd></td><td>Group by cause, by file or by tier</td></tr>
     <tr><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>Record the decision being written</td></tr>
     <tr><td><kbd>X</kbd></td><td>Select the item for bulk accept</td></tr>
     <tr><td><kbd>R</kbd></td><td>Refresh</td></tr>
@@ -214,12 +247,35 @@ const KEYOF = { "converted": "converted", "under assumptions": "assumptions", "n
 const statusKey = (s) => KEYOF[s] || (LABEL[s] ? s : "unproven");
 const statusLabel = (s) => LABEL[statusKey(s)] || s;
 const dialectName = (id) => (INITIAL.dialects.find((d) => d.id === id) || { name: id }).name;
-const AUTHOR_KEY = "sqldiff.review.author", ALL_KEY = "sqldiff.review.all";
+const AUTHOR_KEY = "sqldiff.review.author", VIEW_KEY = "sqldiff.review.view";
+// What a person can do about an item decides where it is listed. Only the
+// first lens holds what a decision recorded here can settle.
+const LENSES = [
+  { id: "you", label: "Needs you", tiers: [3, 4, 5], hint: "Decisions to pick, assumptions to accept, and output an agent wrote that a person must approve." },
+  { id: "fix", label: "Needs a fix", tiers: [1], hint: "Differs, not converted, rejected or missing. Nothing recorded here clears these: fix the output (or what it needs) and convert again." },
+  { id: "unproven", label: "Not proven", tiers: [2], hint: "The engine could not prove these. Nothing recorded here clears them: the output has to change and be converted again, or the engine learn to prove it." },
+  { id: "found", label: "Nothing found", tiers: [6], hint: "Plainly converted units nobody approved: nothing found, which is not a proof. Approve the ones you checked." },
+];
+const KIND_LABEL = { missing_object: "missing object", unplaced: "outside any unit", template: "template instances", not_exercised: "template no instance uses", not_in_manifest: "not in the manifest", unreadable: "unreadable file" };
 const time = (t) => (t || "").replace("T", " ").replace(/:\d\d(\.\d+)?Z$/, " UTC");
-const S = { st: INITIAL.state, sel: null, view: null, unit: 0, picked: new Set(), files: new Map(), action: null, rule: "", gateOpen: false };
-try { $("author").value = localStorage.getItem(AUTHOR_KEY) || ""; $("all").checked = localStorage.getItem(ALL_KEY) === "1"; } catch { /* storage unavailable */ }
+const S = { st: INITIAL.state, sel: null, view: null, unit: 0, picked: new Set(), files: new Map(), action: null, rule: "", gateOpen: false,
+  lens: null, group: "cause", filter: "", openGroups: new Set(), full: new Set(), recorded: 0, confirm: 0 };
+try {
+  $("author").value = localStorage.getItem(AUTHOR_KEY) || "";
+  const v = JSON.parse(localStorage.getItem(VIEW_KEY) || "{}");
+  if (LENSES.some((l) => l.id === v.lens)) S.lens = v.lens;
+  if (["cause", "file", "tier"].includes(v.group)) S.group = v.group;
+} catch { /* storage unavailable */ }
+$("groupby").value = S.group;
+const saveView = () => { try { localStorage.setItem(VIEW_KEY, JSON.stringify({ lens: S.lens, group: S.group })); } catch { /* ignore */ } };
 const author = () => $("author").value.trim();
-const allQ = () => ($("all").checked ? "&all=1" : "");
+// Plainly converted units are only fetched for their own lens.
+const allQ = () => (S.lens === "found" ? "&all=1" : "");
+const lens = () => LENSES.find((l) => l.id === S.lens) || LENSES[0];
+const lensCount = (l) => l.tiers.reduce((n, t) => n + (S.st.tiers[t] || 0), 0);
+// The first lens with something in it, worst last: what needs a person first.
+const firstLens = () => (LENSES.slice(0, 3).find((l) => lensCount(l) > 0) || LENSES[0]).id;
+if (!S.lens) S.lens = firstLens();
 
 function toast(msg, bad) {
   const t = $("toast");
@@ -243,7 +299,8 @@ function renderHeader() {
   const gate = g
     ? `<button class="chip gate${g.complete ? " ok" : ""}" id="gatechip" aria-expanded="${S.gateOpen}" title="${g.complete ? "Done" : `Not done: ${g.blockers.length} blocker(s)`}, as the done gate (sqldiff review-status) judges it. Click for why.">${g.complete ? `<span class="dot" style="background:var(--s-converted)"></span>Done` : `<span class="dot" style="background:var(--s-unproven)"></span>Not done · <b>${g.blockers.length}</b>`}</button>`
     : `<span class="chip" title="${esc(st.gate_error || "")}">Done gate not judged</span>`;
-  $("chips").innerHTML = `<span class="chip" title="Items left in the queue"><b>${st.items.length}</b> to review</span><span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>${gate}`;
+  const nOpen = st.items.filter((i) => i.tier <= 5).length;
+  $("chips").innerHTML = `<span class="chip" title="Items in tiers 1 to 5, in every lens"><b>${nOpen}</b> open</span>${S.recorded ? `<span class="chip" title="Decisions recorded from this page since it was opened"><b>${S.recorded}</b> recorded now</span>` : ""}<span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>${gate}`;
   if ($("gatechip")) $("gatechip").onclick = () => { S.gateOpen = !S.gateOpen; renderHeader(); };
   const b = [];
   if (g && S.gateOpen) {
@@ -263,7 +320,8 @@ function renderHeader() {
   $("banners").innerHTML = b.join("");
 }
 
-function itemRow(it) {
+// `group`: the cause the row is listed under, left out of its own line.
+function itemRow(it, group) {
   const k = statusKey(it.status);
   const at = it.out_line ? `:${it.out_line}` : it.src_line ? ` (source ${it.src_line})` : "";
   const flags = [];
@@ -272,26 +330,106 @@ function itemRow(it) {
   if (it.instances) flags.push(`<span class="flag" title="Instances woven from this template">${it.instances} inst.</span>`);
   if (it.failing_instances && it.failing_instances.length) flags.push(`<span class="flag bad">${it.failing_instances.length} failing</span>`);
   if (it.units && it.units.length) flags.push(`<span class="flag">${it.units.length} units</span>`);
-  const box = it.open_assumptions.length ? `<input type="checkbox" data-pick="${esc(it.key)}" ${S.picked.has(it.key) ? "checked" : ""} title="Select for bulk accept (X)" aria-label="Select">` : "<span></span>";
-  // A unit lists what is still open on it, else why it is here.
-  const what = it.kind === "unit" ? ((it.open || []).join(", ") || it.rules.join(", ") || statusLabel(it.status)) : it.reason;
-  return `<div class="row${S.sel === it.key ? " sel" : ""}" data-key="${esc(it.key)}" role="option">${box}<span class="dot s-${k}" style="background:var(--s-${k})" title="${esc(statusLabel(it.status))}"></span><span class="p" title="${esc(it.path + at)}">${esc(it.path)}${esc(at)}${flags.join("")}</span><span class="r" title="${esc(it.reason)}">${esc(what)}</span></div>`;
+  // Bulk accept is offered where it settles something: in Needs you.
+  const box = it.open_assumptions.length && S.lens === "you" ? `<input type="checkbox" data-pick="${esc(it.key)}" ${S.picked.has(it.key) ? "checked" : ""} title="Select for bulk accept (X)" aria-label="Select">` : "<span></span>";
+  // What else is open or wrong on it, else why it is here.
+  const rest = causes(it).filter((c) => c !== group);
+  const what = it.kind === "unit" ? (group === undefined ? causes(it).join(", ") : rest.length ? `also ${rest.join(", ")}` : "") : group === undefined || !rest.length ? it.reason : rest.join(", ");
+  return `<div class="row${S.sel === it.key ? " sel" : ""}" data-key="${esc(it.key)}" role="option">${box}<span class="dot s-${k}" style="background:var(--s-${k})" title="${esc(statusLabel(it.status))}"></span><span class="p" title="${esc(it.path + at)}">${pathHtml(it.path, at)}${flags.join("")}</span>${what ? `<span class="r" title="${esc(it.reason)}">${esc(what)}</span>` : ""}</div>`;
+}
+
+// Why an item is listed, as group keys: what is open on it, else what no
+// decision can discharge. A unit with two open assumptions is in both groups
+// (each is settled on its own); a blocked unit is grouped by its first
+// blocker only, the root (a statement not converted is also not compared).
+function causes(it) {
+  if (it.kind !== "unit") return it.rules.length ? [...new Set(it.rules)] : [KIND_LABEL[it.kind] || it.kind];
+  if (it.tier <= 2) return it.blocking && it.blocking.length ? [...new Set(it.blocking)] : [it.tier === 1 ? "rejected in review" : statusLabel(it.status)];
+  if (it.tier === 3) return ["written by an agent"];
+  if (it.tier === 6) return ["nothing found, not proven"];
+  return it.open.length ? [...new Set(it.open)] : [statusLabel(it.status)];
+}
+
+function shown() {
+  const L = lens(), f = S.filter.trim().toLowerCase();
+  return S.st.items.filter((it) => L.tiers.includes(it.tier)
+    && (!f || [it.path, it.reason, ...causes(it)].some((x) => String(x).toLowerCase().includes(f))));
+}
+
+// Groups of the items shown, biggest first (by tier: worst first).
+function groups(items) {
+  const m = new Map(), add = (k, it) => { if (!m.has(k)) m.set(k, []); m.get(k).push(it); };
+  for (const it of items) {
+    if (S.group === "tier") add(it.tier, it);
+    else if (S.group === "file") add(it.path, it);
+    else if (it.tier <= 2) add(causes(it)[0], it);
+    else causes(it).forEach((c) => add(c, it));
+  }
+  const g = [...m].map(([key, items]) => ({ key: String(key), items }));
+  if (S.group === "tier") g.sort((a, b) => a.key - b.key);
+  else g.sort((a, b) => b.items.length - a.items.length || a.key.localeCompare(b.key));
+  return g;
+}
+
+// Keys in the order J/K walks them: group by group, each item once.
+function order() {
+  const seen = new Set(), keys = [];
+  for (const g of groups(shown())) for (const it of g.items) if (!seen.has(it.key)) { seen.add(it.key); keys.push(it.key); }
+  return keys;
+}
+
+const gid = (key) => `${S.group}:${key}`;
+const ROWS = 200;
+function groupTitle(g) {
+  if (S.group === "tier") return `Tier ${g.key} · ${S.st.tier_labels[g.key]}`;
+  return g.key;
+}
+// The file's name first: the folders are what truncates.
+function pathHtml(path, at = "") {
+  const cut = path.search(/[^\\/]*$/);
+  return `${esc(path.slice(cut))}${esc(at)} <span class="dir">${esc(path.slice(0, cut))}</span>`;
+}
+// Units in a group whose open assumption is the group's cause.
+const acceptable = (g) => S.group === "cause" ? g.items.filter((i) => i.open_assumptions.includes(g.key)) : [];
+
+function renderLenses() {
+  $("lenses").innerHTML = LENSES.map((l, k) => {
+    const n = l.id === "found" && !S.st.all ? "" : `<b>${lensCount(l)}</b>`;
+    return `<button role="tab" data-lens="${l.id}" class="${l.id === S.lens ? "on" : ""}" aria-selected="${l.id === S.lens}" title="${esc(l.hint)} (${k + 1})">${esc(l.label)}${n}</button>`;
+  }).join("");
 }
 
 function renderQueue() {
-  const st = S.st, by = {};
-  st.items.forEach((it) => (by[it.tier] = by[it.tier] || []).push(it));
+  const st = S.st, L = lens(), items = shown(), gs = groups(items);
+  renderLenses();
+  const total = lensCount(L), distinct = new Set(items.map((i) => i.key)).size;
+  $("lenshint").innerHTML = `${S.filter.trim() ? `<b>${distinct}</b> of ${total} match the filter · ` : `<b>${total}</b> left · `}${esc(L.hint)}`;
+  // With one group, that group is open; open() opens the selection's group.
   const html = [];
-  for (let t = 1; t <= 6; t++) {
-    if (!by[t]) continue;
-    html.push(`<div class="tier">Tier ${t} · ${esc(st.tier_labels[t])}<span class="spacer"></span><b>${by[t].length}</b></div>`);
-    html.push(by[t].map(itemRow).join(""));
+  for (const g of gs) {
+    const open = gs.length === 1 || S.openGroups.has(gid(g.key));
+    const acc = acceptable(g);
+    const desc = S.group === "cause" ? (g.items[0].kind === "unit" && g.items.length === 1 ? g.items[0].path : g.items[0].reason) : S.group === "file" ? [...new Set(g.items.flatMap(causes))].join(", ") : "";
+    html.push(`<div class="grp${open ? " open" : ""}" data-grp="${esc(g.key)}" role="button" aria-expanded="${open}"><span class="chev">▶</span><span class="k" title="${esc(groupTitle(g))}">${S.group === "file" ? pathHtml(g.key) : esc(groupTitle(g))}</span><span class="n">${g.items.length}</span>${desc ? `<span class="d" title="${esc(desc)}">${esc(desc)}</span>` : ""}${acc.length > 1 ? `<span class="acts"><button class="outline" data-accept="${esc(g.key)}" title="Select the ${acc.length} units with this open assumption for one bulk accept: one decision per unit, with your name and reason">Accept for all ${acc.length}…</button></span>` : ""}</div>`);
+    if (!open) continue;
+    const rows = S.full.has(gid(g.key)) ? g.items : g.items.slice(0, ROWS);
+    html.push(`<div class="rows">${rows.map((it) => itemRow(it, S.group === "cause" ? g.key : undefined)).join("")}${rows.length < g.items.length ? `<button class="showmore" data-more="${esc(g.key)}">Show all ${g.items.length}</button>` : ""}</div>`);
   }
-  $("queue").innerHTML = html.join("") || `<div class="empty">Nothing left to review${st.all ? "" : " in tiers 1 to 5. Plainly converted units nobody approved are not listed: tick “Nothing found too” to see them"}. Nothing is ever listed as safe.</div>`;
+  $("queue").innerHTML = html.join("") || `<div class="empty">${S.filter.trim() ? "Nothing in this lens matches the filter." : `Nothing in ${esc(L.label)}.`} ${LENSES.filter((l) => l !== L && l.id !== "found" && lensCount(l)).map((l) => `${lensCount(l)} in ${esc(l.label)}`).join(", ")}${L.id === "found" ? "" : ". Nothing is ever listed as safe."}</div>`;
   const d = $("done");
   d.querySelector("summary").textContent = `Accepted in review (${st.reviewed.length})`;
   d.querySelector(".list").innerHTML = st.reviewed.map((r) => `<div class="row" data-path="${esc(r.path)}" data-unit="${esc(r.unit)}"><span></span><span class="dot" style="background:var(--focus)"></span><span class="p">${esc(r.path)} (source ${r.src_line})</span><span class="r">accepted in review by ${esc(r.by.join(", ") || "?")} · status ${esc(LABEL[r.status])}</span></div>`).join("") || `<div class="empty">None yet.</div>`;
   renderBulk();
+}
+
+function acceptAll(rule) {
+  const g = groups(shown()).find((x) => x.key === rule);
+  if (!g) return;
+  S.picked = new Set(acceptable(g).map((i) => i.key));
+  S.confirm = 0;
+  renderQueue();
+  $("bulkrule").value = rule; renderBulk();
+  $("bulkreason").focus();
 }
 
 function renderBulk() {
@@ -305,8 +443,13 @@ function renderBulk() {
   $("bulkrule").innerHTML = rules.map((r) => `<option value="${esc(r)}">${esc(r)} (${count[r]} of ${items.length})</option>`).join("");
   if (rules.includes(prev)) $("bulkrule").value = prev;
   $("bulkn").textContent = `${items.length} selected`;
-  const r = $("bulkrule").value, n = count[r] || 0;
-  $("bulkhint").textContent = n < items.length ? `${items.length - n} without it are left out` : "one decision per unit";
+  const r = $("bulkrule").value, with_ = items.filter((i) => i.open_assumptions.includes(r));
+  $("bulkhint").textContent = `${with_.length} unit(s) in ${new Set(with_.map((i) => i.path)).size} file(s), one decision each${with_.length < items.length ? ` · ${items.length - with_.length} without it are left out` : ""}`;
+  $("bulkunits").innerHTML = with_.map((i) => `<li>${esc(i.path)}${i.out_line ? `:${i.out_line}` : ""}</li>`).join("");
+  const go = $("bulkgo");
+  go.classList.toggle("confirm", S.confirm > 0);
+  go.textContent = S.confirm > 0 ? `Record ${with_.length} decision${with_.length === 1 ? "" : "s"}` : `Accept for ${with_.length}`;
+  go.title = S.confirm > 0 ? "Click again to record them" : "";
 }
 
 async function bulkAccept() {
@@ -314,11 +457,17 @@ async function bulkAccept() {
   if (!author()) { needAuthor(); return; }
   if (!reason) { toast("Say why it holds: every decision needs a reason.", true); $("bulkreason").focus(); return; }
   const items = S.st.items.filter((i) => S.picked.has(i.key) && i.open_assumptions.includes(rule));
+  // Several units at once: say how many first, then record on a second click.
+  if (items.length > 1 && !S.confirm) {
+    S.confirm = setTimeout(() => { S.confirm = 0; renderBulk(); }, 6000);
+    renderBulk(); return;
+  }
+  clearTimeout(S.confirm); S.confirm = 0;
   const targets = [];
   for (const it of items) {
-    // The hashes the server checks are those of the unit as it is shown now.
-    const v = await api(`/api/unit?path=${encodeURIComponent(it.path)}&unit=${encodeURIComponent(it.unit)}`);
-    targets.push({ path: v.path, unit: v.unit, input_hash: v.input_hash, output_hash: v.output_hash });
+    // The hashes the server checks are those of the units as the list shows them.
+    const [input_hash, output_hash] = it.hashes || [];
+    targets.push({ path: it.path, unit: it.unit, input_hash, output_hash });
   }
   await submit({ action: "accept", rule, reason, author: author(), targets }, () => { S.picked.clear(); $("bulkreason").value = ""; });
 }
@@ -331,6 +480,7 @@ function needAuthor() {
 async function submit(body, after) {
   try {
     const r = await api(`/api/record?${allQ().slice(1)}`, body);
+    S.recorded += r.written;
     toast(`Recorded ${r.written} decision${r.written === 1 ? "" : "s"} in review-decisions.jsonl`);
     if (after) after();
     await apply(r.state, true);
@@ -342,17 +492,18 @@ async function submit(body, after) {
 }
 
 async function apply(st, advance) {
-  const before = S.st.items.map((i) => i.key), idx = before.indexOf(S.sel);
+  const before = order(), idx = before.indexOf(S.sel);
   S.st = st;
   for (const k of [...S.picked]) if (!st.items.some((i) => i.key === k && i.open_assumptions.length)) S.picked.delete(k);
   renderHeader(); renderQueue();
-  if (S.sel && st.items.some((i) => i.key === S.sel)) await open(S.sel, { keepUnit: true });
+  const now = order();
+  if (S.sel && now.includes(S.sel)) await open(S.sel, { keepUnit: true });
   else if (S.sel && !S.sel.startsWith("@") && advance) {
-    // The item left the queue: go on with the one that took its place.
-    const next = st.items[Math.min(Math.max(idx, 0), st.items.length - 1)];
-    if (next) await open(next.key); else showNone();
+    // The item left this lens: go on with the one that took its place.
+    const next = now[Math.min(Math.max(idx, 0), now.length - 1)];
+    if (next) await open(next); else showNone();
   } else if (S.sel && S.sel.startsWith("@")) await openUnit(S.view.units[0].path, S.view.units[0].unit);
-  else if (st.items.length) await open(st.items[0].key);
+  else if (now.length) await open(now[0]);
   else showNone();
 }
 
@@ -360,7 +511,7 @@ async function reload() { await apply(await api(`/api/state?${allQ().slice(1)}`)
 
 function showNone() {
   S.sel = null; S.view = null;
-  $("item").innerHTML = `<div class="empty">Nothing selected. ${S.st.items.length ? "Pick an item on the left." : "The queue is empty."}</div>`;
+  $("item").innerHTML = `<div class="empty">Nothing selected. ${order().length ? "Pick an item on the left." : `Nothing left in ${esc(lens().label)}.`}</div>`;
 }
 
 async function open(key, { keepUnit = false } = {}) {
@@ -369,6 +520,11 @@ async function open(key, { keepUnit = false } = {}) {
   catch { showNone(); return; }
   S.sel = key; S.view = v;
   if (!keepUnit || S.unit >= v.units.length) S.unit = 0;
+  if (!document.querySelector(`#queue .row[data-key="${CSS.escape(key)}"]`)) {
+    // Its group is folded, or the row is past the first ones shown.
+    const g = groups(shown()).find((x) => x.items.some((i) => i.key === key));
+    if (g) { S.openGroups.add(gid(g.key)); if (g.items.findIndex((i) => i.key === key) >= ROWS) S.full.add(gid(g.key)); renderQueue(); }
+  }
   document.querySelectorAll("#queue .row").forEach((r) => r.classList.toggle("sel", r.dataset.key === key));
   const row = document.querySelector(`#queue .row[data-key="${CSS.escape(key)}"]`);
   if (row) row.scrollIntoView({ block: "nearest" });
@@ -492,8 +648,9 @@ function decide(u) {
   const rv = u.review;
   const openA = u.assumptions.filter((r) => !rv || rv.open.includes(r)), openD = u.decisions.filter((r) => !rv || rv.open.includes(r));
   const can = { accept: u.assumptions.length > 0, pick: u.decisions.length > 0, approve: !u.approve_blocked, reject: true, comment: true };
+  const stuck = rv ? rv.undischargeable : u.approve_blocked ? [statusLabel(u.status)] : [];
   if (!S.action || !can[S.action]) S.action = openD.length ? "pick" : openA.length ? "accept" : can.approve ? "approve" : "comment";
-  return `<h3>Decide</h3><div id="form">
+  return `<h3>Decide</h3>${stuck.length ? `<div class="note finding">Nothing recorded here makes this unit done while <span class="mono">${esc(stuck.join(", "))}</span> is on it: fix the output and convert again. You can still reject it or comment${openA.length || openD.length ? ", and settle its assumptions and decisions for later" : ""}.</div>` : ""}<div id="form">
     <div class="seg" role="tablist">${ACTIONS.map(([a, l, t]) => `<button data-act="${a}" class="${a === S.action ? "on" : ""}" ${can[a] ? "" : "disabled"} title="${esc(a === "approve" && u.approve_blocked ? u.approve_blocked : !can[a] ? "Nothing of this kind on the unit" : t)}">${l}</button>`).join("")}</div>
     <select id="rule" aria-label="Rule"></select>
     <textarea id="reason" placeholder="Why" aria-label="Reason"></textarea>
@@ -542,21 +699,52 @@ function record(u) {
 }
 
 function step(d) {
-  const keys = S.st.items.map((i) => i.key);
+  const keys = order();
   if (!keys.length) return;
   const i = keys.indexOf(S.sel);
   open(keys[Math.max(0, Math.min(keys.length - 1, i < 0 ? 0 : i + d))]);
 }
 
+// To the first item of the next or previous group.
+function stepGroup(d) {
+  const gs = groups(shown());
+  if (!gs.length) return;
+  const i = gs.findIndex((g) => g.items.some((x) => x.key === S.sel));
+  const g = gs[Math.max(0, Math.min(gs.length - 1, i < 0 ? 0 : i + d))];
+  S.openGroups.add(gid(g.key));
+  open(g.items[0].key);
+}
+
+async function setLens(id) {
+  if (id === S.lens) return;
+  const was = S.lens;
+  S.lens = id; S.picked.clear(); saveView();
+  // Plainly converted units come with their own lens only.
+  if ((was === "found") !== (id === "found")) { S.sel = null; await reload(); return; }
+  renderQueue();
+  const keys = order();
+  if (keys.length) open(keys[0]); else showNone();
+}
+
 $("queue").addEventListener("click", (e) => {
+  const acc = e.target.closest("[data-accept]");
+  if (acc) { acceptAll(acc.dataset.accept); return; }
+  const more = e.target.closest("[data-more]");
+  if (more) { S.full.add(gid(more.dataset.more)); renderQueue(); return; }
+  const grp = e.target.closest(".grp");
+  if (grp) { const k = gid(grp.dataset.grp); S.openGroups.has(k) ? S.openGroups.delete(k) : S.openGroups.add(k); renderQueue(); return; }
   const box = e.target.closest("input[data-pick]");
   if (box) { box.checked ? S.picked.add(box.dataset.pick) : S.picked.delete(box.dataset.pick); renderBulk(); return; }
   const row = e.target.closest(".row"); if (row) open(row.dataset.key);
 });
 $("done").addEventListener("click", (e) => { const row = e.target.closest(".row[data-unit]"); if (row) openUnit(row.dataset.path, row.dataset.unit); });
 $("item").addEventListener("click", (e) => { const t = e.target.closest("[data-tab]"); if (t) { S.unit = +t.dataset.tab; renderItem(); } });
-$("bulkrule").addEventListener("change", renderBulk);
-$("bulkclear").addEventListener("click", () => { S.picked.clear(); renderQueue(); });
+$("bulkrule").addEventListener("change", () => { clearTimeout(S.confirm); S.confirm = 0; renderBulk(); });
+$("lenses").addEventListener("click", (e) => { const b = e.target.closest("[data-lens]"); if (b) setLens(b.dataset.lens); });
+$("filter").addEventListener("input", () => { S.filter = $("filter").value; renderQueue(); });
+$("filter").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); const k = order(); if (k.length) open(k[0]); } });
+$("groupby").addEventListener("change", () => { S.group = $("groupby").value; S.openGroups.clear(); S.full.clear(); saveView(); renderQueue(); if (S.sel) open(S.sel); });
+$("bulkclear").addEventListener("click", () => { clearTimeout(S.confirm); S.confirm = 0; S.picked.clear(); renderQueue(); });
 $("bulkgo").addEventListener("click", bulkAccept);
 $("bulkreason").addEventListener("keydown", (e) => { if (e.key === "Enter") bulkAccept(); });
 $("author").addEventListener("input", () => {
@@ -564,7 +752,6 @@ $("author").addEventListener("input", () => {
   try { localStorage.setItem(AUTHOR_KEY, author()); } catch { /* ignore */ }
   if ($("as")) $("as").textContent = author() || "?";
 });
-$("all").addEventListener("change", () => { try { localStorage.setItem(ALL_KEY, $("all").checked ? "1" : "0"); } catch { /* ignore */ } reload(); });
 // Files may have changed while the page was away: a done gate on them no
 // longer stands, and the state says so.
 // Only the gate is taken over, so nothing being picked or typed is lost.
@@ -584,16 +771,21 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "Escape") $("help").classList.remove("open");
   else if (e.key === "j") step(1);
   else if (e.key === "k") step(-1);
+  else if (e.key === "]") stepGroup(1);
+  else if (e.key === "[") stepGroup(-1);
+  else if (e.key === "/") { e.preventDefault(); $("filter").focus(); $("filter").select(); }
+  else if (e.key === "g") { const o = ["cause", "file", "tier"]; $("groupby").value = o[(o.indexOf(S.group) + 1) % 3]; $("groupby").dispatchEvent(new Event("change")); }
+  else if (e.key >= "1" && e.key <= "4") setLens(LENSES[+e.key - 1].id);
   else if (e.key === "r") $("refresh").click();
   else if (e.key === "x" && S.sel) {
     const it = S.st.items.find((i) => i.key === S.sel);
-    if (it && it.open_assumptions.length) { S.picked.has(it.key) ? S.picked.delete(it.key) : S.picked.add(it.key); renderQueue(); }
+    if (it && it.open_assumptions.length) { S.picked.has(it.key) ? S.picked.delete(it.key) : S.picked.add(it.key); clearTimeout(S.confirm); S.confirm = 0; renderQueue(); }
   }
 });
 
 renderHeader(); renderQueue();
-if ($("all").checked && !S.st.all) reload();
-else if (S.st.items.length) open(S.st.items[0].key); else showNone();
+if (S.lens === "found" && !S.st.all) reload();
+else if (order().length) open(order()[0]); else showNone();
 </script>
 </body>
 </html>
