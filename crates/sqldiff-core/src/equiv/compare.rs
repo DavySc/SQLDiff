@@ -131,7 +131,7 @@ fn hook(a: &Term, b: &Term) -> Option<Assumption> {
         let t = a.kid(0)?.atom()?;
         let col = b.kid(1)?.atom()?;
         return Some(Assumption::default(
-            &format!("ASM-IDENTITY-{}", t.to_uppercase()),
+            &format!("ASM-IDENTITY-COLUMN:{t}"),
             &format!("{t}.{col} is the identity column of {t}"),
         ));
     }

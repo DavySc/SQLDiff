@@ -303,12 +303,17 @@ mod tests {
     fn lookup_resolves_instances_and_families() {
         assert_eq!(lookup("ASM-BIND-COLUMN:qty").unwrap().id, "ASM-BIND-COLUMN");
         assert_eq!(lookup("ASM-FACT-V2").unwrap().id, "ASM-FACT-*");
-        // Registered as is wins over the family ASM-IDENTITY-*.
         assert_eq!(
             lookup("ASM-IDENTITY-VALUES").unwrap().id,
             "ASM-IDENTITY-VALUES"
         );
-        assert_eq!(lookup("ASM-IDENTITY-ORDERS").unwrap().id, "ASM-IDENTITY-*");
+        // A table name is an instance qualifier, never part of the id: a
+        // table named `values` cannot become ASM-IDENTITY-VALUES.
+        assert_eq!(
+            lookup("ASM-IDENTITY-COLUMN:orders").unwrap().id,
+            "ASM-IDENTITY-COLUMN"
+        );
+        assert!(lookup("ASM-IDENTITY-ORDERS").is_none());
         assert!(lookup("ASM-FACT-").is_none());
         assert!(lookup("ASM-NOT-THERE").is_none());
     }
@@ -331,7 +336,10 @@ mod tests {
         assert!(!covers("ASM-BIND-COLUMN:qty", "ASM-BIND-COLUMN:price"));
         assert!(!covers("ASM-BIND-COLUMN:qty", "ASM-BIND-COLUMN"));
         assert!(!covers("ASM-BIND-COLUMN", "ASM-BIND-COLUMNS"));
-        assert!(!covers("ASM-IDENTITY-ORDERS", "ASM-IDENTITY-ORDERS:x"));
+        assert!(!covers(
+            "ASM-IDENTITY-COLUMN:orders",
+            "ASM-IDENTITY-COLUMN:values"
+        ));
         assert!(!covers("ASM-IDENTITY", "ASM-IDENTITY-VALUES"));
     }
 

@@ -511,8 +511,8 @@ fact = "How callers write identity columns."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
-id = "ASM-IDENTITY-*"
-statement = "A named column is the identity column of its table (the rest of the id is the table)."
+id = "ASM-IDENTITY-COLUMN"
+statement = "A named column is the identity column of its table (the instance qualifier is the table)."
 discharge = "catalog"
 fact = "The table's identity column in the catalog."
 sites = ["sqldiff-core/src/equiv/compare.rs"]
