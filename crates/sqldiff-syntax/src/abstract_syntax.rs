@@ -828,7 +828,7 @@ impl<'a> Parser<'a> {
     }
 
     fn add(&mut self) -> PResult<Expr> {
-        let mut l = self.mul()?;
+        let mut l = self.add_operand()?;
         loop {
             let op = match self.peek() {
                 Some(t)
@@ -842,10 +842,30 @@ impl<'a> Parser<'a> {
                 _ => break,
             };
             self.i += 1;
-            let r = self.mul()?;
+            let r = self.add_operand()?;
             l = Expr::Bin(op, Box::new(l), Box::new(r));
         }
         Ok(l)
+    }
+
+    /// An operand of `+` and `-`. T-SQL ranks unary `+` and `-` with them,
+    /// below `*`, `/` and `%` ("Operator precedence (Transact-SQL)"), so
+    /// `-@a * @b` is `-(@a * @b)`: it differs from `(-@a) * @b` where the
+    /// product overflows (on SQL Server 2022, `-@a * @b` with @a =
+    /// -2147483648 and @b = 0 is 0). PostgreSQL and Db2 rank unary minus
+    /// above `*` (`unary`). A literal keeps its sign: `-5` is a number.
+    fn add_operand(&mut self) -> PResult<Expr> {
+        if self.d == Dialect::Tsql && (self.is_op("-") || self.is_op("+")) {
+            let minus = self.is_op("-");
+            self.i += 1;
+            let e = self.add_operand()?;
+            return Ok(match e {
+                _ if !minus => e,
+                Expr::Num(n) if !n.starts_with('-') => Expr::Num(format!("-{n}")),
+                e => Expr::Unary("-".into(), Box::new(e)),
+            });
+        }
+        self.mul()
     }
 
     fn mul(&mut self) -> PResult<Expr> {
@@ -2173,6 +2193,27 @@ mod tests {
     fn toks(sql: &str, d: Dialect) -> Vec<Tok> {
         let p = crate::parse(sql, d);
         tokens(&p.syntax())
+    }
+
+    #[test]
+    fn tsql_unary_minus_ranks_below_multiplication() {
+        let e = |src: &str, d: Dialect| {
+            let toks = tokens(&crate::parse(&format!("SELECT {src}"), d).syntax());
+            let mut p = Parser::new(&toks[1..], d);
+            p.expr().unwrap()
+        };
+        let neg = |x: Expr| Expr::Unary("-".into(), Box::new(x));
+        let mul = |x: Expr, y: Expr| Expr::Bin("*".into(), Box::new(x), Box::new(y));
+        let (a, b) = (Expr::Var("@a".into()), Expr::Var("@b".into()));
+        assert_eq!(e("-@a * @b", Dialect::Tsql), neg(mul(a.clone(), b.clone())));
+        let (pa, pb) = (Expr::Name(vec!["a".into()]), Expr::Name(vec!["b".into()]));
+        assert_eq!(e("-a * b", Dialect::Postgres), mul(neg(pa), pb));
+        // A literal keeps its sign; `-` then `+` binds as before.
+        assert_eq!(
+            e("-2147483648", Dialect::Tsql),
+            Expr::Num("-2147483648".into())
+        );
+        assert!(matches!(e("-@a + @b", Dialect::Tsql), Expr::Bin(op, _, _) if op == "+"));
     }
 
     #[test]
