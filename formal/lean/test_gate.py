@@ -15,7 +15,7 @@ import sys
 
 exe = sys.argv[1]
 P = "sqldiff-check/2"
-syntax = (pathlib.Path(__file__).parent / "Sqldiff" / "Syntax.lean").read_text()
+syntax = (pathlib.Path(__file__).parent / "Sqldiff" / "Syntax.lean").read_text(encoding="utf-8")
 H = re.search(r'def schemaHash : String := "([0-9a-f]+)"', syntax).group(1)
 # `SELECT 1` and `SELECT 2` as sqldiff_core::proof::tree_line writes them.
 ONE = "(SOURCE_FILE (STATEMENT IDENT:73656c656374 NUMBER:31 INFERRED_TERMINATOR:))"
@@ -51,7 +51,7 @@ cases = [
 # form `sqldiff_syntax::encode` writes (see Sqldiff/Ast.lean).
 AST = re.search(
     r'def schemaHash : String := "([0-9a-f]+)"',
-    (pathlib.Path(__file__).parent / "Sqldiff" / "Ast.lean").read_text(),
+    (pathlib.Path(__file__).parent / "Sqldiff" / "Ast.lean").read_text(encoding="utf-8"),
 ).group(1)
 
 

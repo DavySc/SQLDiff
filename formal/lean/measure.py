@@ -22,7 +22,7 @@ for _ in range(30):
     subprocess.run([exe, "--version"], check=True, capture_output=True)
     starts.append((time.perf_counter() - t) * 1000)
 
-syntax = (pathlib.Path(__file__).parent / "Sqldiff" / "Syntax.lean").read_text()
+syntax = (pathlib.Path(__file__).parent / "Sqldiff" / "Syntax.lean").read_text(encoding="utf-8")
 H = re.search(r'def schemaHash : String := "([0-9a-f]+)"', syntax).group(1)
 
 
