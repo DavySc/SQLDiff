@@ -120,7 +120,7 @@ a.btn:hover { background: var(--link-2); }
   <span class="muted">Runs are kept while the app is open</span>
 </header>
 <main><div class="col">
-  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button></div>
+  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button><button type="button" role="tab" data-tab="chgf" aria-selected="false">Review a branch</button></div>
   <form class="form" id="conv" autocomplete="off">
     <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
@@ -153,6 +153,40 @@ a.btn:hover { background: var(--link-2); }
       <div class="hint">An instance is done only when both sides were checked on the generator's own output.</div>
     </details>
     <div class="acts"><span class="err" id="i-err" role="alert"></span><button type="submit" class="primary" id="i-go">Check</button></div>
+  </form>
+  <form class="form" id="driftf" autocomplete="off" hidden>
+    <div class="field"><span>T-SQL</span><input type="text" id="d-tsql" placeholder="The template tree for T-SQL" aria-label="Template tree for T-SQL" spellcheck="false"><button type="button" class="outline" data-browse="d-tsql" data-next="d-postgres">Browse…</button></div>
+    <div class="field"><span>PostgreSQL</span><input type="text" id="d-postgres" placeholder="The template tree for PostgreSQL" aria-label="Template tree for PostgreSQL" spellcheck="false"><button type="button" class="outline" data-browse="d-postgres" data-near="d-tsql" data-next="d-db2i">Browse…</button></div>
+    <div class="field"><span>Db2 for i</span><input type="text" id="d-db2i" placeholder="The template tree for Db2 for i" aria-label="Template tree for Db2 for i" spellcheck="false"><button type="button" class="outline" data-browse="d-db2i" data-near="d-postgres" data-next="d-out">Browse…</button></div>
+    <div class="field"><span>Output</span><input type="text" id="d-out" placeholder="Empty or new folder for the drift report" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="d-out" data-near="d-tsql" data-next="d-go">Browse…</button></div>
+    <div class="hint">Give the trees of at least two dialects. Every template must be in every tree, with the same placeholders and directives.</div>
+    <div class="acts"><label class="tog"><input type="checkbox" id="d-overwrite"> Replace the files a check writes in a non-empty output folder</label></div>
+    <details class="more"><summary>Reference, changes since a revision, instances and packs</summary>
+      <div class="field"><span>Reference</span><select id="d-ref" aria-label="Reference tree"><option value="">The first tree given</option></select><span></span></div>
+      <div class="field"><span>Base</span><input type="text" id="d-base" placeholder="A revision: a template changed since its merge base in some trees only is drift" aria-label="Base revision" spellcheck="false"><span></span></div>
+      <div class="field"><span>Manifest</span><input type="text" id="d-manifest" placeholder="The instance manifest: also weave and check every instance in each tree" aria-label="Instance manifest" spellcheck="false"><button type="button" class="outline" data-browse="d-manifest" data-near="d-tsql">Browse…</button></div>
+      <div class="field"><span>Extensions</span><input type="text" id="d-exts" placeholder="sql" aria-label="Template file extensions, comma-separated" spellcheck="false"><span></span></div>
+      <div class="field"><span>Parameters</span><input type="text" id="d-params" placeholder="Names besides the manifest's, comma-separated" aria-label="Parameter names" spellcheck="false"><span></span></div>
+      <div class="field"><span>Accept</span><input type="text" id="d-accept" placeholder="Assumptions you know hold, comma-separated (instance checks)" aria-label="Accepted assumptions" spellcheck="false"><span></span></div>
+      <div class="field"><span>Pack</span><input type="text" id="d-pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="d-pack" data-near="d-tsql">Browse…</button></div>
+      <div class="hint">Drift is not a review: the result is the command's, no drift and instance checks ok, and nothing here is called done.</div>
+    </details>
+    <div class="acts"><span class="err" id="d-err" role="alert"></span><button type="submit" class="primary" id="d-go">Check</button></div>
+  </form>
+  <form class="form" id="chgf" autocomplete="off" hidden>
+    <div class="field"><span>Repository</span><input type="text" id="c-repo" placeholder="The git repository" aria-label="Git repository" spellcheck="false"><button type="button" class="outline" data-browse="c-repo" data-next="c-base">Browse…</button></div>
+    <div class="field"><span>Base</span><input type="text" id="c-base" placeholder="The branch or commit the change is reviewed against, e.g. main" aria-label="Base revision" spellcheck="false"><span></span></div>
+    <div class="field"><span>Output</span><input type="text" id="c-out" placeholder="Empty or new folder for changes.md, changes.json and changes.sarif" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="c-out" data-near="c-repo" data-next="c-go">Browse…</button></div>
+    <div class="hint">The diff starts at the base's merge base with the head, as a pull request does. Only the SQL files that changed are read.</div>
+    <div class="acts"><label class="tog"><input type="checkbox" id="c-overwrite"> Replace the files a review writes in a non-empty output folder</label></div>
+    <details class="more"><summary>Head, dialect, paths and packs</summary>
+      <div class="field"><span>Head</span><input type="text" id="c-head" placeholder="HEAD" aria-label="Head revision" spellcheck="false"><span></span></div>
+      <div class="field"><span>Dialect</span><select id="c-dialect" aria-label="Dialect of every changed file"><option value="">Per file, from the config or the path</option></select><span></span></div>
+      <div class="field"><span>Paths</span><input type="text" id="c-paths" placeholder="Only these git pathspecs, comma-separated" aria-label="Paths" spellcheck="false"><span></span></div>
+      <div class="field"><span>Pack</span><input type="text" id="c-pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="c-pack" data-near="c-repo">Browse…</button></div>
+      <div class="hint">A branch review is not a conversion review: its result is the command's, and nothing here is called done.</div>
+    </details>
+    <div class="acts"><span class="err" id="c-err" role="alert"></span><button type="submit" class="primary" id="c-go">Review</button></div>
   </form>
   <h2 style="margin-top:8px">Runs</h2>
   <div class="list" id="runs"></div>
@@ -206,7 +240,56 @@ function legend(units, steps = LADDER) {
   return `<div class="legend">${steps.filter(([k]) => units[k]).map(([k, l, c]) => `<span style="--c:var(${c})"><b>${units[k]}</b> ${esc(l)}</span>`).join("")}</div>`;
 }
 
+// A drift run: what it found, as the command's exit code says it; never "done",
+// which only a review's gate may say.
+function driftRow(r, sub) {
+  const t = r.totals || {};
+  let right = "", act = "", extra = "";
+  const trees = r.trees.map((x) => esc(NAME[x.dialect] || x.dialect)).join(", ");
+  const title = `Check drift ${trees}`;
+  if (r.state === "running") {
+    const pct = r.total ? r.checked / r.total * 100 : 0;
+    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Step ${r.checked} of ${r.total}` : "Reading templates…"}</div>`;
+    act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
+  } else if (r.state === "done") {
+    const bad = (t.instances || []).filter((i) => !i.ok);
+    const verdict = r.complete ? "No drift found" : t.drifting ? `Drift in ${t.drifting} template${t.drifting === 1 ? "" : "s"}` : "Instance checks not ok";
+    right = `<div class="meta"><b class="${r.complete ? "done" : ""}">${verdict}</b> · ${t.templates} template${t.templates === 1 ? "" : "s"}${t.waived ? ` · ${t.waived} changed on purpose` : ""}${(t.instances || []).length ? ` · instances ${bad.length ? `not ok for ${bad.map((i) => esc(NAME[i.dialect] || i.dialect)).join(", ")}` : "ok"}` : ""}</div>`;
+    extra = r.notes.map((n) => `<div class="failed-msg">${esc(n)}</div>`).join("");
+  } else if (r.state === "cancelled") {
+    right = `<div class="meta">Cancelled; no report was written (instance checks that had finished keep their files)</div>`;
+  } else {
+    extra = `<div class="failed-msg">${esc(r.error)}</div>`;
+  }
+  return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">${title}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
+}
+
+// A branch review: the command's verdict and the counts, never "done".
+function changesRow(r) {
+  const t = r.totals || {};
+  const c = t.counts || {};
+  const range = `${esc(r.base)}…${esc(r.head || "HEAD")}`;
+  const sub = `<span class="path">${esc(r.repo)}</span> into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`;
+  let right = "", act = "", extra = "";
+  if (r.state === "running") {
+    const pct = r.total ? r.checked / r.total * 100 : 0;
+    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Checked ${r.checked} of ${r.total}` : "Reading the changes…"}</div>`;
+    act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
+  } else if (r.state === "done") {
+    const parts = [["different", c.different], ["not proven", c.not_proven], ["equal under assumptions", c.equal_under_assumptions], ["equal", c.equal], ["added", c.added], ["not compared", c.not_compared]].filter(([, n]) => n);
+    right = `<div class="meta"><b class="${r.complete ? "done" : ""}">${esc(t.verdict)}</b> · ${t.files} changed file${t.files === 1 ? "" : "s"}${parts.length ? ` · ${parts.map(([k, n]) => `${n} ${k}`).join(", ")}` : ""}</div>`;
+    extra = `<div class="legend"><span>Wrote <code>changes.md</code>, <code>changes.json</code> and <code>changes.sarif</code> into the output folder</span></div>` + r.notes.map((n) => `<div class="failed-msg">${esc(n)}</div>`).join("");
+  } else if (r.state === "cancelled") {
+    right = `<div class="meta">Cancelled; nothing was written</div>`;
+  } else {
+    extra = `<div class="failed-msg">${esc(r.error)}</div>`;
+  }
+  return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">Review branch ${range}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
+}
+
 function row(r) {
+  if (r.kind === "changes") return changesRow(r);
+  if (r.kind === "drift") return driftRow(r, `into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`);
   const pair = `${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
   const inst = r.kind === "instances";
   const title = inst ? `Check instances ${pair}` : `Convert ${r.template ? "templates " : ""}${pair}`;
@@ -296,7 +379,7 @@ function render(runs) {
   }));
   clearTimeout(timer);
   if (runs.some((r) => r.state === "running")) timer = setTimeout(refresh, 700);
-  railReview(runs.find((r) => r.state === "done"));
+  railReview(runs.find((r) => r.state === "done" && r.kind === "convert"));
 }
 // The rail's Review leads to the newest finished run, as the server draws it
 // on the next page load (unless the app was started on a review).
@@ -377,9 +460,48 @@ $("instf").addEventListener("submit", async (e) => {
   $("i-go").disabled = false;
   refresh();
 });
+$("chgf").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const v = (id) => $(id).value.trim();
+  const list = (id) => v(id).split(",").map((x) => x.trim()).filter(Boolean);
+  if (!v("c-repo") || !v("c-base") || !v("c-out")) { $("c-err").textContent = "Give a repository, a base revision and an output folder."; return; }
+  $("c-err").textContent = ""; $("c-go").disabled = true;
+  try {
+    await post("/api/runs/changes", {
+      repo: v("c-repo"), base: v("c-base"), head: v("c-head") || null, dialect: v("c-dialect") || null,
+      paths: list("c-paths"), out: v("c-out"), packs: v("c-pack") ? [v("c-pack")] : [], overwrite: $("c-overwrite").checked,
+    });
+    $("c-overwrite").checked = false;
+  } catch (e) { $("c-err").textContent = e.message; }
+  $("c-go").disabled = false;
+  refresh();
+});
+$("c-dialect").innerHTML += INITIAL.dialects.map(([id, n]) => `<option value="${esc(id)}">${esc(n)}</option>`).join("");
+$("driftf").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const v = (id) => $(id).value.trim();
+  const list = (id) => v(id).split(",").map((x) => x.trim()).filter(Boolean);
+  const trees = ["tsql", "postgres", "db2i"].filter((d) => v("d-" + d)).map((d) => ({ dialect: d, dir: v("d-" + d) }));
+  if (trees.length < 2 || !v("d-out")) { $("d-err").textContent = "Give the trees of at least two dialects and an output folder."; return; }
+  $("d-err").textContent = ""; $("d-go").disabled = true;
+  try {
+    await post("/api/runs/drift", {
+      trees, reference: v("d-ref") || null, out: v("d-out"), extensions: list("d-exts"), parameters: list("d-params"),
+      accept: list("d-accept"), base: v("d-base") || null, manifest: v("d-manifest") || null,
+      packs: v("d-pack") ? [v("d-pack")] : [], overwrite: $("d-overwrite").checked,
+    });
+    $("d-overwrite").checked = false;
+  } catch (e) { $("d-err").textContent = e.message; }
+  $("d-go").disabled = false;
+  refresh();
+});
+// The reference can be any dialect that has a tree.
+$("d-ref").innerHTML += INITIAL.dialects.map(([id, n]) => `<option value="${esc(id)}">${esc(n)}</option>`).join("");
 if (INITIAL.no_picking) {
   $("conv").hidden = true;
   $("instf").hidden = true;
+  $("driftf").hidden = true;
+  $("chgf").hidden = true;
   $("conv").insertAdjacentHTML("beforebegin", `<div class="card closed"><span class="t">Not available on a network address</span><span class="s">${esc(INITIAL.no_picking.charAt(0).toUpperCase() + INITIAL.no_picking.slice(1))}.</span></div>`);
 }
 render(INITIAL.runs);

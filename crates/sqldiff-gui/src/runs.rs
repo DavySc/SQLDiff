@@ -2,10 +2,13 @@
 //! kept in the data directory (`gui/runs.json`: paths, settings, totals and
 //! errors, never SQL text), so finished runs, and their reviews, are there
 //! again after a restart. A run converts a tree into an output folder
-//! through `sqldiff_convert::job` (what `sqldiff convert` runs), or checks
+//! through `sqldiff_convert::job` (what `sqldiff convert` runs), checks
 //! the instances of converted templates through
-//! `sqldiff_convert::instances` (what `sqldiff instances` runs), so a run
-//! writes what the command writes. Each run carries that command
+//! `sqldiff_convert::instances` (what `sqldiff instances` runs), or checks
+//! the template trees of several dialects for drift through
+//! `sqldiff_convert::drift` (what `sqldiff drift` runs), or reviews the SQL
+//! a branch changed through `sqldiff_review::branch` (what `sqldiff
+//! changes` runs), so a run writes what the command writes. Each run carries that command
 //! (`Command`), for scripts and pipelines.
 
 use std::path::{Path, PathBuf};
@@ -13,10 +16,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use sqldiff_convert::drift;
 use sqldiff_convert::instances;
 use sqldiff_convert::job::{self, Job};
 use sqldiff_convert::tree::{self, Hooks};
 use sqldiff_core::Dialect;
+use sqldiff_review::branch;
+use sqldiff_review::pipeline::{Pipeline, Settings};
+use sqldiff_source::changes::ChangeScope;
 use sqldiff_source::config::{self, Sources};
 use sqldiff_source::Resolved;
 
@@ -95,18 +102,120 @@ pub struct InstancesSpec {
     pub overwrite: bool,
 }
 
+/// A template tree of one dialect.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftTree {
+    /// A dialect id.
+    pub dialect: String,
+    pub dir: String,
+}
+
+/// A drift check as the page asks for it: the arguments of `sqldiff drift`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriftSpec {
+    /// The template trees, one per dialect (`--tree`); at least two.
+    pub trees: Vec<DriftTree>,
+    /// The tree the others are checked against (`--reference`); none: the first.
+    #[serde(default)]
+    pub reference: Option<String>,
+    /// The output folder for the report and the instance checks.
+    pub out: String,
+    /// Template file extensions (`--extension`); none means `sql`.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Parameter names (`--parameter`) and accepted assumptions (`--accept`).
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// A template changed since the merge base with this revision in some
+    /// trees and not in all is drift (`--base`).
+    #[serde(default)]
+    pub base: Option<String>,
+    /// The instance manifest (`--manifest`): every instance is also woven in
+    /// each tree and checked as `sqldiff instances` does.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// Packs to load besides the config's (`--pack`), by path.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// A branch review as the page asks for it: the arguments of `sqldiff changes`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangesSpec {
+    /// The git repository (`--repo`).
+    pub repo: String,
+    /// The revision the change is reviewed against (`--base`); the diff
+    /// starts at its merge base with the head.
+    pub base: String,
+    /// The head revision (`--head`); none means `HEAD`.
+    #[serde(default)]
+    pub head: Option<String>,
+    /// Dialect of every changed file (`--dialect`); none: per file, from
+    /// `dialect_map` or the path convention.
+    #[serde(default)]
+    pub dialect: Option<String>,
+    /// Only these paths (git pathspecs).
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// The output folder for `changes.json`, `changes.md` and `changes.sarif`.
+    pub out: String,
+    /// Packs to load besides the config's (`--pack`), by path.
+    #[serde(default)]
+    pub packs: Vec<String>,
+    /// Replace the files a review writes in a non-empty output folder.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+/// What a branch review writes into its output folder.
+pub const CHANGES_FILES: [&str; 3] = ["changes.json", "changes.md", "changes.sarif"];
+
 /// What a run was asked to do.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Spec {
     Convert(ConvertSpec),
     Instances(InstancesSpec),
+    Drift(DriftSpec),
+    Changes(ChangesSpec),
+}
+
+impl Spec {
+    /// The output folder as given.
+    fn out(&self) -> &str {
+        match self {
+            Spec::Convert(s) => &s.out,
+            Spec::Instances(s) => &s.out,
+            Spec::Drift(s) => &s.out,
+            Spec::Changes(s) => &s.out,
+        }
+    }
 }
 
 /// The work a spec comes to, checked before a thread starts.
 enum Work {
     Convert(Box<Job>),
     Instances(Box<instances::Args>),
+    Drift(Box<drift::Args>),
+    Changes(Box<ChangesWork>),
+}
+
+/// A branch review, checked and ready to run.
+struct ChangesWork {
+    repo: PathBuf,
+    base: String,
+    head: String,
+    dialect: Option<Dialect>,
+    paths: Vec<String>,
+    out: PathBuf,
+    pipe: Pipeline,
 }
 
 /// Where a run is.
@@ -233,14 +342,103 @@ impl Command {
         Command::with_config(program, args, packs, dir, isolated)
     }
 
+    /// The `sqldiff drift` command for `a` with `packs`, with config found
+    /// from `dir` as the run finds it.
+    pub fn drift(
+        program: &str,
+        a: &drift::Args,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        let mut args = vec!["drift".into()];
+        for (d, p) in &a.trees {
+            args.extend(["--tree".into(), format!("{}={}", d.id(), path(p))]);
+        }
+        if let Some(d) = a.reference {
+            args.extend(["--reference".into(), d.id().into()]);
+        }
+        args.extend(["-o".into(), path(&a.out)]);
+        for e in &a.extensions {
+            args.extend(["--extension".into(), e.clone()]);
+        }
+        for p in &a.parameters {
+            args.extend(["--parameter".into(), p.clone()]);
+        }
+        if let Some(b) = &a.base {
+            args.extend(["--base".into(), b.clone()]);
+        }
+        if let Some(m) = &a.manifest {
+            args.extend(["--manifest".into(), path(m)]);
+        }
+        for id in &a.accept {
+            args.extend(["--accept".into(), id.clone()]);
+        }
+        if a.overwrite {
+            args.push("--overwrite".into());
+        }
+        Command::with_config(program, args, packs, dir, isolated)
+    }
+
+    /// The `sqldiff changes` command for `w` with `packs`, with config found
+    /// from `dir` as the run finds it. It writes the files a run writes, and
+    /// does not use the result cache, as a run does not.
+    fn changes(
+        program: &str,
+        w: &ChangesWork,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        let mut args = vec![
+            "changes".into(),
+            "--repo".into(),
+            path(&w.repo),
+            "--base".into(),
+            w.base.clone(),
+            "--head".into(),
+            w.head.clone(),
+        ];
+        if let Some(d) = w.dialect {
+            args.extend(["--dialect".into(), d.id().into()]);
+        }
+        for (flag, file) in ["--json", "--markdown", "--sarif"]
+            .into_iter()
+            .zip(CHANGES_FILES)
+        {
+            args.extend([flag.into(), path(&w.out.join(file))]);
+        }
+        args.push("--no-cache".into());
+        let tail = match w.paths.is_empty() {
+            true => Vec::new(),
+            false => std::iter::once("--".to_string())
+                .chain(w.paths.iter().cloned())
+                .collect(),
+        };
+        Command::with_config_then(program, args, packs, dir, isolated, tail)
+    }
+
     /// `args` with the packs and every config file the run loaded named,
     /// and no other found (`--isolated`).
     fn with_config(
+        program: &str,
+        args: Vec<String>,
+        packs: &[PathBuf],
+        dir: &Path,
+        isolated: bool,
+    ) -> Command {
+        Command::with_config_then(program, args, packs, dir, isolated, Vec::new())
+    }
+
+    /// [`Command::with_config`], then `tail` (arguments that must come last,
+    /// such as paths after `--`).
+    fn with_config_then(
         program: &str,
         mut args: Vec<String>,
         packs: &[PathBuf],
         dir: &Path,
         isolated: bool,
+        tail: Vec<String>,
     ) -> Command {
         for p in packs {
             args.extend(["--pack".into(), path(p)]);
@@ -259,6 +457,7 @@ impl Command {
         if let Some(p) = &user {
             args.extend(["--user-config".into(), path(p)]);
         }
+        args.extend(tail);
         let line = |program: String, quote: fn(&str) -> String| {
             let mut l = program;
             for a in &args {
@@ -546,13 +745,9 @@ impl Runs {
                     },
                     s => s,
                 };
-                let out = match &r.spec {
-                    Spec::Convert(s) => &s.out,
-                    Spec::Instances(s) => &s.out,
-                };
                 Arc::new(Run {
                     id: r.id,
-                    out: canonical(&browse::absolute(Path::new(out.trim()))),
+                    out: canonical(&browse::absolute(Path::new(r.spec.out().trim()))),
                     reads: Vec::new(),
                     spec: r.spec,
                     command: r.command,
@@ -686,6 +881,51 @@ impl Runs {
         )
     }
 
+    /// Starts a drift check on its own thread. Config is what a command run
+    /// in the reference tree loads (unless `isolated`).
+    pub fn start_drift(
+        &self,
+        spec: DriftSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (a, command) = prepare_drift(&spec, isolated)?;
+        let out = a.out.clone();
+        let reads = a
+            .trees
+            .iter()
+            .map(|(_, p)| p)
+            .chain(a.manifest.as_ref())
+            .cloned()
+            .collect();
+        self.launch(
+            Spec::Drift(spec),
+            Work::Drift(Box::new(a)),
+            (out, reads),
+            command,
+            done,
+        )
+    }
+
+    /// Starts a branch review on its own thread. Config is what a command
+    /// run in the repository loads (unless `isolated`).
+    pub fn start_changes(
+        &self,
+        spec: ChangesSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (w, command) = prepare_changes(&spec, isolated)?;
+        let (out, reads) = (w.out.clone(), vec![w.repo.clone()]);
+        self.launch(
+            Spec::Changes(spec),
+            Work::Changes(Box::new(w)),
+            (out, reads),
+            command,
+            done,
+        )
+    }
+
     fn launch(
         &self,
         spec: Spec,
@@ -781,6 +1021,16 @@ pub fn command(spec: &ConvertSpec, isolated: bool) -> Result<Command, String> {
 /// The command an instance check of `spec` would carry, without starting one.
 pub fn instances_command(spec: &InstancesSpec, isolated: bool) -> Result<Command, String> {
     prepare_instances(spec, isolated).map(|(_, c)| c)
+}
+
+/// The command a drift check of `spec` would carry, without starting one.
+pub fn drift_command(spec: &DriftSpec, isolated: bool) -> Result<Command, String> {
+    prepare_drift(spec, isolated).map(|(_, c)| c)
+}
+
+/// The command a branch review of `spec` would carry, without starting one.
+pub fn changes_command(spec: &ChangesSpec, isolated: bool) -> Result<Command, String> {
+    prepare_changes(spec, isolated).map(|(_, c)| c)
 }
 
 fn dialects(from: &str, to: &str) -> Result<(Dialect, Dialect), String> {
@@ -882,6 +1132,150 @@ fn prepare_instances(
     Ok((a, command))
 }
 
+/// The branch review a spec asks for, checked before a thread is started,
+/// and the command that runs it. The review store is read (decisions suppress
+/// findings, as for the command) and the result cache is not used, so a run
+/// writes nothing but its output folder.
+fn prepare_changes(spec: &ChangesSpec, isolated: bool) -> Result<(ChangesWork, Command), String> {
+    let repo = existing(&spec.repo)?;
+    if !repo.is_dir() {
+        return Err(format!("{}: not a folder", repo.display()));
+    }
+    let base = spec.base.trim().to_string();
+    if base.is_empty() || spec.out.trim().is_empty() {
+        return Err("give a base revision and an output folder".into());
+    }
+    let head = spec
+        .head
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or("HEAD")
+        .to_string();
+    let dialect = match spec
+        .dialect
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+    {
+        Some(d) => Some(
+            d.parse::<Dialect>()
+                .map_err(|_| format!("unknown dialect `{d}`"))?,
+        ),
+        None => None,
+    };
+    let out = browse::absolute(Path::new(spec.out.trim()));
+    let occupied = std::fs::read_dir(&out)
+        .map(|mut d| d.next().is_some())
+        .unwrap_or(false);
+    if occupied && !spec.overwrite {
+        return Err(format!(
+            "{}: not empty; replace the files a review writes to use it",
+            out.display()
+        ));
+    }
+    let packs = existing_all(&spec.packs)?;
+    let cfg = load_config(&repo, &packs, isolated)?;
+    let pipe = Pipeline::new(
+        cfg,
+        &Settings {
+            no_cache: true,
+            ..Settings::default()
+        },
+    )?;
+    let w = ChangesWork {
+        repo: repo.clone(),
+        base,
+        head,
+        dialect,
+        paths: names(&spec.paths),
+        out,
+        pipe,
+    };
+    let command = Command::changes(&program(), &w, &packs, &repo, isolated);
+    Ok((w, command))
+}
+
+/// The drift check a spec asks for, checked before a thread is started, and
+/// the command that runs it.
+fn prepare_drift(spec: &DriftSpec, isolated: bool) -> Result<(drift::Args, Command), String> {
+    let dialect = |id: &str| -> Result<Dialect, String> {
+        id.trim()
+            .parse()
+            .map_err(|_| format!("unknown dialect `{id}`"))
+    };
+    if spec.out.trim().is_empty() {
+        return Err("give an output folder".into());
+    }
+    let mut trees: Vec<(Dialect, PathBuf)> = Vec::new();
+    for t in &spec.trees {
+        let d = dialect(&t.dialect)?;
+        if trees.iter().any(|(x, _)| *x == d) {
+            return Err(format!("{}: given twice", d.display_name()));
+        }
+        let dir = existing(&t.dir)?;
+        if !dir.is_dir() {
+            return Err(format!("{}: not a folder", dir.display()));
+        }
+        trees.push((d, dir));
+    }
+    if trees.len() < 2 {
+        return Err("give the template trees of at least two dialects".into());
+    }
+    let reference = match spec.reference.as_deref().filter(|r| !r.trim().is_empty()) {
+        Some(r) => {
+            let d = dialect(r)?;
+            if !trees.iter().any(|(x, _)| *x == d) {
+                return Err(format!(
+                    "{}: has no tree to check against",
+                    d.display_name()
+                ));
+            }
+            Some(d)
+        }
+        None => None,
+    };
+    let manifest = match spec.manifest.as_deref().filter(|p| !p.trim().is_empty()) {
+        Some(p) => Some(existing(p)?),
+        None => None,
+    };
+    let base = spec
+        .base
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+    let packs = existing_all(&spec.packs)?;
+    let ref_tree = reference.unwrap_or(trees[0].0);
+    let dir = trees
+        .iter()
+        .find(|(d, _)| *d == ref_tree)
+        .map(|(_, p)| p.clone())
+        .unwrap_or_default();
+    let cfg = load_config(&dir, &packs, isolated)?;
+    if cfg.policy.template.is_none() {
+        return Err(
+            "drift needs a [template] syntax: load a pack or a sqldiff.toml that has one".into(),
+        );
+    }
+    let a = drift::Args {
+        trees,
+        reference,
+        out: browse::absolute(Path::new(spec.out.trim())),
+        extensions: names(&spec.extensions),
+        parameters: names(&spec.parameters),
+        base,
+        manifest,
+        accept: names(&spec.accept),
+        jobs: None,
+        overwrite: spec.overwrite,
+        options: Box::new(|_, _| Ok(sqldiff_core::Options::default())),
+        cfg,
+    };
+    let command = Command::drift(&program(), &a, &packs, &dir, isolated);
+    Ok((a, command))
+}
+
 /// The job a spec asks for, checked before a thread is started, its
 /// absolute output folder and the command that runs it.
 fn prepare(spec: &ConvertSpec, isolated: bool) -> Result<(Job, PathBuf, Command), String> {
@@ -964,6 +1358,43 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
     };
     let job = match work {
         Work::Convert(job) => job,
+        Work::Changes(w) => {
+            return match review_changes(&w, &hooks) {
+                Ok(mut state) => {
+                    if let State::Done {
+                        notes, finished: f, ..
+                    } = &mut state
+                    {
+                        notes.extend(w.pipe.warnings.iter().cloned());
+                        *f = finished();
+                    }
+                    state
+                }
+                Err(e) => stopped(e),
+            }
+        }
+        Work::Drift(a) => {
+            return match drift::check(&a, &hooks) {
+                Ok(c) => State::Done {
+                    totals: serde_json::json!({
+                        "templates": c.templates,
+                        "drifting": c.drifting,
+                        "items": c.items,
+                        "waived": c.waived,
+                        "instances": c.instance_ok
+                            .iter()
+                            .map(|(d, ok)| serde_json::json!({ "dialect": d, "ok": ok }))
+                            .collect::<Vec<_>>(),
+                    }),
+                    complete: c.ok,
+                    queue: c.drifting,
+                    not_applied: Vec::new(),
+                    notes: c.instance_runs.into_iter().flat_map(|r| r.notes).collect(),
+                    finished: finished(),
+                },
+                Err(e) => stopped(e),
+            }
+        }
         Work::Instances(a) => {
             return match instances::check(&a, &hooks) {
                 Ok(c) => State::Done {
@@ -1016,4 +1447,46 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
         notes: Vec::new(),
         finished: finished(),
     }
+}
+
+/// Reviews the branch, then writes the three files. Everything is read and
+/// judged first and the files are written last, after the last cancel point.
+fn review_changes(w: &ChangesWork, hooks: &Hooks) -> Result<State, String> {
+    let r = branch::review(
+        &ChangeScope {
+            repo: &w.repo,
+            base: &w.base,
+            head: &w.head,
+            dialect: w.dialect,
+            paths: &w.paths,
+        },
+        &w.pipe,
+        hooks,
+    )?;
+    hooks.stop_if_cancelled()?;
+    std::fs::create_dir_all(&w.out).map_err(|e| format!("{}: {e}", w.out.display()))?;
+    for (file, text) in CHANGES_FILES
+        .iter()
+        .zip([r.json(), r.markdown(), r.sarif()])
+    {
+        let p = w.out.join(file);
+        std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
+    }
+    let verdict = r.verdict();
+    let c = r.counts();
+    Ok(State::Done {
+        totals: serde_json::json!({
+            "verdict": verdict.label(),
+            "files": r.files(),
+            "counts": c,
+            "base": w.base,
+            "head": w.head,
+        }),
+        // The command's exit code: nothing differs and nothing is unproven.
+        complete: verdict < sqldiff_core::Verdict::Unknown,
+        queue: c.different + c.not_proven + c.not_compared,
+        not_applied: Vec::new(),
+        notes: Vec::new(),
+        finished: String::new(),
+    })
 }
