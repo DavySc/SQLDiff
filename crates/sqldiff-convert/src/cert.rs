@@ -56,6 +56,10 @@ pub struct Certificate {
     /// routine's data statements were in it, `c1` when it had none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statements: Option<String>,
+    /// `c4` when the routine's error handling and transactions were in the
+    /// checker's C4 slice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errors: Option<String>,
     /// The routine's byte range in the source.
     #[serde(skip)]
     pub span: (usize, usize),
@@ -98,7 +102,7 @@ pub const C1_NO_ERRORS: &str = "ASM-C1-NO-ERRORS";
 /// With strings (C2b): sessions concatenate NULL to NULL, collations are
 /// binary (only sent when the deployment accepts it), `LEN` sees no
 /// character outside the BMP, and string arguments fit their parameters.
-pub const C2A_RESIDUALS: [&str; 7] = [
+pub const C2A_RESIDUALS: [&str; 10] = [
     "ASM-TSQL-ARITH-ERRORS",
     "ASM-TSQL-ANSI-NULLS",
     "ASM-STATE-AFTER-ERROR",
@@ -106,7 +110,25 @@ pub const C2A_RESIDUALS: [&str; 7] = [
     BINARY_COLLATION,
     "ASM-TSQL-LEN-BMP",
     "ASM-TSQL-STRING-ARGS",
+    // C4: only errors the core models reach a handler, no caller
+    // transaction around a handled error or transaction control, and
+    // callers ignore the number of an error the routine raises.
+    "ASM-CATCH-CORE-ERRORS",
+    "ASM-NO-CALLER-TXN",
+    "ASM-THROW-ERRCODE",
 ];
+
+/// Residual ids the checker names whenever a routine needs them, so a
+/// `c2a` confirmation without one proves the converter's note of it.
+/// Not every residual: `ASM-NO-CALLER-TXN` is named only around handlers
+/// and transaction control, while an error that ends a plain routine also
+/// meets the caller's transaction.
+pub const NAMED_WHEN_NEEDED: [&str; 1] = ["ASM-CONCAT-NULL"];
+
+/// Converter assumptions a `c2a` confirmation in the C4 slice (`errors`
+/// is `c4`) establishes: the checker settles the PL/pgSQL block's rollback
+/// against T-SQL's TRY instead of assuming it away.
+pub const DISCHARGED_BY_C4: [&str; 1] = ["ASM-TRY-SUBTRANSACTION"];
 
 /// The collation fact the checker takes as given when the deployment
 /// accepts it: string comparisons are then in the slice.
@@ -584,6 +606,7 @@ pub fn certify(
             routine: name,
             scalars: None,
             statements: None,
+            errors: None,
             span,
             from: from.id().to_string(),
             to: to.id().to_string(),
@@ -636,6 +659,7 @@ pub fn certify(
                                                 m.scalars.clone()
                                             };
                                         c.statements = m.statements.clone();
+                                        c.errors = m.errors.clone();
                                         Answer::Confirmed {
                                             theorems: vec![theorem],
                                         }
@@ -747,7 +771,7 @@ END
 
     #[test]
     fn a_routine_outside_the_shape_says_why() {
-        let src = "CREATE PROCEDURE dbo.p AS BEGIN BEGIN TRAN; COMMIT; END\n";
+        let src = "CREATE PROCEDURE dbo.p AS BEGIN RAISERROR('x', 16, 1); END\n";
         let d = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres);
         let certs = certify(
             src,

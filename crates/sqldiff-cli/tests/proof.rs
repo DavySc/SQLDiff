@@ -553,3 +553,55 @@ fn the_real_checker_confirms_strings_and_refuses_a_padded_comparison() {
     let (_, r) = run("  IF @v = 'abc'\n    SET @out = @v;\n");
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
+
+/// C4 in the release gate: a TRY whose CATCH only re-raises is confirmed
+/// with `errors: c4`, the proof settles the PL/pgSQL block's rollback, so
+/// the converter's ASM-TRY-SUBTRANSACTION note is discharged, while what
+/// the proof itself rests on stays listed. ASM-NO-CALLER-TXN is not
+/// discharged by its absence from a residual.
+#[test]
+fn the_real_checker_discharges_the_try_subtransaction_note() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c4-gate");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(&src, "acct.sql", "CREATE TABLE dbo.Acct (Id int NOT NULL, Qty int NULL, CONSTRAINT PK_Acct PRIMARY KEY (Id));\n");
+    write(&src, "p.sql", "CREATE PROCEDURE dbo.post @id int, @n int\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  BEGIN TRY\n    INSERT INTO dbo.Acct (Id, Qty) VALUES (@id, @n);\n    UPDATE dbo.Acct SET Qty = Qty + 1 WHERE Id = @id;\n  END TRY\n  BEGIN CATCH\n    THROW;\n  END CATCH\nEND\n");
+    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--isolated", "--proof", "require"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap();
+    let r = c["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["routines"].as_array().unwrap().clone())
+        .find(|r| r["routine"] == "dbo.post")
+        .unwrap();
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["errors"], "c4", "{r}");
+    assert!(!stdout.contains("ASM-TRY-SUBTRANSACTION"), "{stdout}");
+    for open in [
+        "ASM-CATCH-CORE-ERRORS",
+        "ASM-STATE-AFTER-ERROR",
+        "ASM-NO-CALLER-TXN",
+    ] {
+        assert!(stdout.contains(open), "{open}: {stdout}");
+    }
+}

@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 49 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 74 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 75 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
-| | Total | 167 |
+| | Total | 168 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -69,6 +69,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-CASE-FOLD` | UPPER and LOWER fold the same characters as the case-insensitive comparison on the other side. | `catalog` | The collations of both sides. (fact key `collation`) | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-CAST-INT-FRACTION` | A value of unknown type cast to an integer has no fraction (T-SQL truncates, PostgreSQL rounds). | `generated` | A trunc(...) in the converted cast, or the value's type from the catalog. | `sqldiff-convert/src/tsql/bits.rs` |
 | `ASM-CAST-TEXT-NUMBER` | A string cast to a number is never empty or written with an exponent. | `deployment` | The data never holds an empty string or an exponent where it is cast. | `sqldiff-convert/src/tsql/bits.rs` |
+| `ASM-CATCH-CORE-ERRORS` | Inside a TRY or EXCEPTION block only the errors the proof checker models are raised (arithmetic, constraint, the routine's own THROW or RAISE), or any other error is caught alike by both sides. | `deployment` | The errors the handled statements can raise in production (deadlocks, timeouts, conversion errors). | `sqldiff-convert/src/cert.rs` |
 | `ASM-CI-COLLATION` | String comparisons give the same result on both sides: the data's letter case is consistent (or the target compares case-insensitively), and no compared value differs from another only by trailing spaces (T-SQL ignores trailing spaces in =, <> and <; PostgreSQL varchar and text do not). | `catalog` | The collations of both sides (T-SQL's default is case-insensitive). (fact key `collation`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-CLUSTERED` | No query relies on rows coming back in a clustered index's order without ORDER BY. | `deployment` | Callers order results explicitly. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-COLUMN-RANGE` | Stored values stay within what both sides' column types accept. | `generated` | CHECK constraints on the converted columns that reject what the original type rejects. | `sqldiff-core/src/equiv/table.rs` |
@@ -121,7 +122,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-LOCAL-VALUES` | Local variables can hold the witness values at the changed statement (a difference's witness, not an equality). | `nothing` | The engine tracing the variables' earlier assignments. | `sqldiff-core/src/equiv/edit.rs` |
 | `ASM-MULTI-ROW` | The statement can affect several rows (a difference's scenario, not an equality). | `nothing` | The engine deciding the row count from keys; a unique key makes the scenario impossible. | `sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-NEXT-VALUE-ONCE` | One statement does not ask for the next value of the same sequence twice. | `generated` | The converted statement takes the value once (a variable), or a reading of the statement. | `sqldiff-convert/src/tsql.rs` |
-| `ASM-NO-CALLER-TXN` | The caller does not hold an open transaction. | `deployment` | How callers call the routine. | `sqldiff-core/src/equiv/canon.rs`<br>`sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
+| `ASM-NO-CALLER-TXN` | The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block. | `deployment` | How callers call the routine. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/equiv/canon.rs`<br>`sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-NO-NESTED-TRAN` | Callers do not nest transactions (a second BEGIN only warns in PostgreSQL, where T-SQL counts it). | `deployment` | How callers use transactions. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-NO-TRIGGERS` | No triggers on the written tables change the error or transaction outcome. | `catalog` | The triggers on the written tables in the catalog. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-NOLOCK` | Results read without NOLOCK are the same: no other transaction writes while the query runs (concurrency is not observed). | `deployment` | Callers do not depend on reading uncommitted rows. | `sqldiff-convert/src/tsql.rs` |
@@ -162,7 +163,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TEMPLATE-VALUE-SAME` | A value woven into the target instance is the value woven into the source instance. | `generated` | The generator's values for both dialects. | `sqldiff-convert/src/instances.rs` |
 | `ASM-TEMPORAL-HISTORY` | The history table exists with the table's columns, by name and type in the same order. | `catalog` | The history table's definition. | `sqldiff-convert/src/tsql/temporal.rs` |
 | `ASM-TEMPORAL-TRIGGER` | System versioning by trigger matches T-SQL for the ways the table is written (no direct writes to the history table, no ALTER TABLE). | `deployment` | How the table and its history are written and altered. | `sqldiff-convert/src/tsql/temporal.rs` |
-| `ASM-THROW-ERRCODE` | Callers do not depend on the T-SQL error number of a raised error (they see a fixed SQLSTATE and the same message). | `deployment` | How callers handle the error. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-THROW-ERRCODE` | Callers do not depend on the T-SQL error number of a raised error (they see a fixed SQLSTATE and the same message). | `deployment` | How callers handle the error. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-TIME-SOURCE` | The session's time zone is the server's (the current time follows the session, T-SQL's the server clock). | `deployment` | The sessions' time zone. (fact key `time_zone`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TINYINT` | TINYINT values stay within 0-255 (the converted SMALLINT accepts more). | `generated` | A CHECK on the converted column, or callers that write only 0-255. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TRIGGER-ERROR` | Callers do not catch an error raised in the trigger and carry on (T-SQL dooms the transaction). | `deployment` | How callers handle errors from writes to the table. | `sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/src/equiv/trigger.rs` |
@@ -172,7 +173,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TRIGGER-REPLICATION` | No replication agent writes the table of a NOT FOR REPLICATION trigger. | `deployment` | The replication set-up of the target. | `sqldiff-core/src/equiv/trigger.rs` |
 | `ASM-TRIGGER-ROWCOUNT` | No MERGE fires the trigger, or the rest of the trigger does nothing when its image is empty. | `deployment` | Which statements write the table. | `sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/src/equiv/trigger.rs` |
 | `ASM-TRY-HANDLER` | The TRY part raises no compile or name-resolution error (T-SQL's CATCH skips those, an SQLEXCEPTION handler does not). | `catalog` | Every name in the TRY part binds against the catalog. | `sqldiff-convert/src/tsql.rs` |
-| `ASM-TRY-SUBTRANSACTION` | Undoing the TRY part's completed statements on an error matches T-SQL (XACT_ABORT ON, or a CATCH that rolls back). | `deployment` | The callers' XACT_ABORT setting, or a reading of the CATCH block. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-TRY-SUBTRANSACTION` | Undoing the TRY part's completed statements on an error matches T-SQL (XACT_ABORT ON, or a CATCH that rolls back). | `deployment` | The callers' XACT_ABORT setting, or a reading of the CATCH block. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-TSQL-ANSI-NULL-DEFAULT` | T-SQL columns declared without NULL or NOT NULL are nullable (ANSI_NULL_DFLT_ON when the table was created). | `catalog` | The columns' nullability in the T-SQL catalog. | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-TSQL-ANSI-NULLS` | The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN. | `catalog` | sys.sql_modules.uses_ansi_nulls for the routine. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-ARITH-ERRORS` | T-SQL raises an error on integer overflow and division by zero: ANSI_WARNINGS and ARITHABORT are not both OFF for the session. | `deployment` | The session settings of the callers. | `sqldiff-convert/src/cert.rs` |

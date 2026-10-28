@@ -212,6 +212,9 @@ pub struct MirrorAnswer {
     pub scalars: Option<String>,
     pub residual: Vec<String>,
     pub statements: Option<String>,
+    /// `c4` when the routine's error handling and transaction control were
+    /// in the C4 slice.
+    pub errors: Option<String>,
 }
 
 impl From<Answer> for MirrorAnswer {
@@ -221,6 +224,7 @@ impl From<Answer> for MirrorAnswer {
             scalars: None,
             residual: Vec::new(),
             statements: None,
+            errors: None,
         }
     }
 }

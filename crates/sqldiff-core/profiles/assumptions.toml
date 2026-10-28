@@ -603,10 +603,10 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-NO-CALLER-TXN"
-statement = "The caller does not hold an open transaction."
+statement = "The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block."
 discharge = "deployment"
 fact = "How callers call the routine."
-sites = ["sqldiff-core/src/equiv/canon.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/src/equiv/canon.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
 id = "ASM-NO-NESTED-TRAN"
@@ -888,7 +888,7 @@ id = "ASM-THROW-ERRCODE"
 statement = "Callers do not depend on the T-SQL error number of a raised error (they see a fixed SQLSTATE and the same message)."
 discharge = "deployment"
 fact = "How callers handle the error."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-TIME-SOURCE"
@@ -959,7 +959,7 @@ id = "ASM-TRY-SUBTRANSACTION"
 statement = "Undoing the TRY part's completed statements on an error matches T-SQL (XACT_ABORT ON, or a CATCH that rolls back)."
 discharge = "deployment"
 fact = "The callers' XACT_ABORT setting, or a reading of the CATCH block."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ANSI-NULLS"
@@ -1008,6 +1008,13 @@ id = "ASM-TSQL-STRING-ARGS"
 statement = "Every string argument a caller passes to a converted T-SQL routine fits the parameter's declared length (and, for varchar, its code page): T-SQL truncates it silently, PostgreSQL does not."
 discharge = "deployment"
 fact = "What callers pass."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-CATCH-CORE-ERRORS"
+statement = "Inside a TRY or EXCEPTION block only the errors the proof checker models are raised (arithmetic, constraint, the routine's own THROW or RAISE), or any other error is caught alike by both sides."
+discharge = "deployment"
+fact = "The errors the handled statements can raise in production (deadlocks, timeouts, conversion errors)."
 sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]

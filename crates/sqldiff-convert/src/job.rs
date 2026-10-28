@@ -50,9 +50,11 @@ impl Certificates {
     /// the proof stands where the engine did not compare (`not proven`
     /// only because of `equiv.not-compared`), and a `c2a` confirmation
     /// discharges the converter assumptions it proves
-    /// (`cert::DISCHARGED_BY_C2A`) and every residual id it would name when
-    /// needed but did not (`ASM-CONCAT-NULL` after a leading
-    /// `SET CONCAT_NULL_YIELDS_NULL ON`). A difference is never overridden.
+    /// (`cert::DISCHARGED_BY_C2A`; with error handling in the C4 slice also
+    /// `cert::DISCHARGED_BY_C4`), and every residual id it names whenever
+    /// needed but did not (`cert::NAMED_WHEN_NEEDED`: `ASM-CONCAT-NULL`
+    /// after a leading `SET CONCAT_NULL_YIELDS_NULL ON`). A difference is
+    /// never overridden.
     pub fn gate(
         &self,
         w: &Written,
@@ -118,9 +120,12 @@ impl Certificates {
                                         .contains(&n.rule.as_str())
                                         // A residual id the slice names when it is
                                         // needed, and did not name here.
-                                        || (crate::cert::C2A_RESIDUALS
+                                        || (crate::cert::NAMED_WHEN_NEEDED
                                             .contains(&n.rule.as_str())
-                                            && !c.assumptions.contains(&n.rule)))
+                                            && !c.assumptions.contains(&n.rule))
+                                        || (c.errors.as_deref() == Some("c4")
+                                            && crate::cert::DISCHARGED_BY_C4
+                                                .contains(&n.rule.as_str())))
                             });
                             !proven && !accepted(&n.rule)
                         }
