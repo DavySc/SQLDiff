@@ -156,6 +156,13 @@ fact = "The target's function list in the catalog."
 sites = ["sqldiff-core/src/bind/query.rs"]
 
 [[assumption]]
+id = "ASM-C1-NO-ERRORS"
+statement = "No statement of a routine confirmed outside the C2a slice raises an error: the core stops at one, T-SQL without XACT_ABORT ON carries on."
+discharge = "nothing"
+fact = "Expressions in the C2a slice (or a later scalar slice), with SET XACT_ABORT ON where they can raise."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
 id = "ASM-C1-OPERATORS"
 statement = "Each operator, function and literal form in a routine confirmed by the C1 mirror check means the same in both dialects; C1 leaves them uninterpreted."
 discharge = "nothing"
@@ -543,7 +550,7 @@ id = "ASM-ISNULL-TYPE"
 statement = "The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type)."
 discharge = "catalog"
 fact = "The types of both arguments."
-sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-LASTVAL-SAME-INSERT"
@@ -948,11 +955,32 @@ fact = "The callers' XACT_ABORT setting, or a reading of the CATCH block."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-TSQL-ANSI-NULLS"
+statement = "The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN."
+discharge = "catalog"
+fact = "sys.sql_modules.uses_ansi_nulls for the routine."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
 id = "ASM-TSQL-ANSI-NULL-DEFAULT"
 statement = "T-SQL columns declared without NULL or NOT NULL are nullable (ANSI_NULL_DFLT_ON when the table was created)."
 discharge = "catalog"
 fact = "The columns' nullability in the T-SQL catalog."
 sites = ["sqldiff-core/src/equiv/table.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-ARITH-ERRORS"
+statement = "T-SQL raises an error on integer overflow and division by zero: ANSI_WARNINGS and ARITHABORT are not both OFF for the session."
+discharge = "deployment"
+fact = "The session settings of the callers."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-RETURN-NULL-WARNING"
+statement = "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)."
+discharge = "deployment"
+fact = "How callers handle messages."
+sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-CALLER-XACT-ABORT-OFF"

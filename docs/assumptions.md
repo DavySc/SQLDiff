@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 46 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 47 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 68 |
-| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 26 |
-| | Total | 157 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 70 |
+| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
+| | Total | 161 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -57,6 +57,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-BIT-BOOLEAN-COLUMN` | The T-SQL bit column's 0 and 1 are the PostgreSQL boolean column's false and true. | `deployment` | The data migration maps bit 0 and 1 to false and true (the value correspondence of the deployment). | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-BIT-SMALLINT` | Only 0, 1 and NULL are written to a T-SQL bit converted to SMALLINT. | `generated` | A CHECK (x IN (0, 1)) on the converted column, or callers that write only 0, 1 and NULL. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/bits.rs` |
 | `ASM-BUILTIN-ABSENT` | The dialect has no built-in function with a name the code calls (it is not on SQLDiff's built-in list). | `catalog` | The target's function list in the catalog. | `sqldiff-core/src/bind/query.rs` |
+| `ASM-C1-NO-ERRORS` | No statement of a routine confirmed outside the C2a slice raises an error: the core stops at one, T-SQL without XACT_ABORT ON carries on. | `nothing` | Expressions in the C2a slice (or a later scalar slice), with SET XACT_ABORT ON where they can raise. | `sqldiff-convert/src/cert.rs` |
 | `ASM-C1-OPERATORS` | Each operator, function and literal form in a routine confirmed by the C1 mirror check means the same in both dialects; C1 leaves them uninterpreted. | `nothing` | The C2 scalar semantics and its mirror lemmas (docs/verified-conversion.md, phase C2). | `sqldiff-convert/src/cert.rs` |
 | `ASM-CALLEE-CONVERTED` | The procedure a call names on side B is the conversion of the one it names on side A. | `generated` | The callee is converted in the same tree, and its own conversion is compared in its file. | `sqldiff-core/src/equiv/call.rs` |
 | `ASM-CALLEES-NO-TXN-CONTROL` | Called routines do not commit or roll back, and their writes follow the caller's transaction. | `catalog` | The callees' bodies in the catalog or the tree. | `sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
@@ -111,7 +112,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-IDENTITY-VAL-LOCAL` | The INSERT before IDENTITY_VAL_LOCAL() is a single-row INSERT ... VALUES (after a multi-row INSERT it may differ from SCOPE_IDENTITY, not checked). | `nothing` | The behaviour checked on a real system, or a reading of the routine. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-IDENTITY-VALUES` | Identity columns hand out the same values on both sides: nobody relies on gaps, and explicit values go in the same way. | `deployment` | How callers write identity columns and read their values. | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-INDEX-NAME-SCHEMA` | No other index, table, view or sequence in the schema has the index's name on the target. | `catalog` | The target schema's object names. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
-| `ASM-ISNULL-TYPE` | The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type). | `catalog` | The types of both arguments. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `ASM-ISNULL-TYPE` | The ISNULL fallback fits the type of the first argument (ISNULL converts to it, COALESCE takes the wider type). | `catalog` | The types of both arguments. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-LASTVAL-SAME-INSERT` | No trigger on the target table inserts into another table with a sequence, so lastval() is the key of this INSERT. | `catalog` | The triggers on the table in the catalog. | `sqldiff-core/profiles/rules/idioms.rules` |
 | `ASM-LISTAGG` | The aggregated list fits LISTAGG's maximum length (STRING_AGG over MAX types has none). | `deployment` | The data never aggregates a longer list. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-LITERAL-FRACTION` | No stored value lies within half a microsecond of a 7-digit time literal without being equal to it. | `deployment` | The data was moved with the same rounding. | `sqldiff-convert/src/tsql.rs` |
@@ -169,6 +170,8 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TRY-HANDLER` | The TRY part raises no compile or name-resolution error (T-SQL's CATCH skips those, an SQLEXCEPTION handler does not). | `catalog` | Every name in the TRY part binds against the catalog. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TRY-SUBTRANSACTION` | Undoing the TRY part's completed statements on an error matches T-SQL (XACT_ABORT ON, or a CATCH that rolls back). | `deployment` | The callers' XACT_ABORT setting, or a reading of the CATCH block. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TSQL-ANSI-NULL-DEFAULT` | T-SQL columns declared without NULL or NOT NULL are nullable (ANSI_NULL_DFLT_ON when the table was created). | `catalog` | The columns' nullability in the T-SQL catalog. | `sqldiff-core/src/equiv/table.rs` |
+| `ASM-TSQL-ANSI-NULLS` | The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN. | `catalog` | sys.sql_modules.uses_ansi_nulls for the routine. | `sqldiff-convert/src/cert.rs` |
+| `ASM-TSQL-ARITH-ERRORS` | T-SQL raises an error on integer overflow and division by zero: ANSI_WARNINGS and ARITHABORT are not both OFF for the session. | `deployment` | The session settings of the callers. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-CALLER-XACT-ABORT-OFF` | The caller's XACT_ABORT setting is OFF. | `deployment` | The callers' XACT_ABORT setting. (fact key `tsql_xact_abort`) | `sqldiff-core/src/equiv/mod.rs`<br>`sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs`<br>`sqldiff-core/src/ledger.rs` |
 | `ASM-TSQL-CI-COLLATION` | T-SQL compares strings, identifiers and variables case-insensitively (case-insensitive collation). | `catalog` | The T-SQL database's and columns' collations. (fact key `collation`) | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-CODE-PAGE` | T-SQL char and varchar values hold only characters of a single-byte code page, so a length counts characters on both sides. | `catalog` | The columns' collations and code pages. (fact key `collation`) | `sqldiff-core/src/equiv/table.rs` |
@@ -177,6 +180,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TSQL-MONEY-ROUNDING` | T-SQL rounds a value with more than four decimals to money half away from zero, as PostgreSQL rounds to numeric(..., 4). | `nothing` | The behaviour checked on SQL Server. | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-TSQL-OWNERSHIP-CHAIN` | Callers hold the privileges the statements need themselves (T-SQL skips checks along an ownership chain). | `deployment` | The callers' grants on the target. | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-PLUS-IS-CONCAT` | Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates. | `catalog` | The operands' types. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-TSQL-RETURN-NULL-WARNING` | Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides). | `deployment` | How callers handle messages. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-STRING-AGG-8000` | The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that). | `deployment` | The data never aggregates a longer list. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-SYSDATETIME-PER-STATEMENT` | SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20). | `nothing` | Vendor fact V20 documented or checked. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-UNDECLARED-VAR` | A variable used without a declaration in the unit is declared elsewhere in the routine under its converted name. | `generated` | The routine converted as a whole, with the declaration. | `sqldiff-convert/src/tsql.rs` |

@@ -38,6 +38,9 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
         };
         if why.is_empty() {
             println!("release gate: passed (every routine confirmed, every assumption accepted)");
+            // The gate is the exit code: where the engine did not compare,
+            // the proof stands.
+            return Ok(ExitCode::SUCCESS);
         } else {
             println!("release gate: a review is still needed");
             for y in &why {

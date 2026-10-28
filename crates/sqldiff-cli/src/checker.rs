@@ -11,7 +11,7 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use sqldiff_core::proof::{Answer, Checker, MirrorRequest, Request, MIRROR_PROTOCOL};
+use sqldiff_core::proof::{Answer, Checker, MirrorAnswer, MirrorRequest, Request, MIRROR_PROTOCOL};
 
 /// How long one answer may take.
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -117,7 +117,7 @@ impl Subprocess {
         })
     }
 
-    fn ask(&self, line: impl Fn(u64) -> Option<String>) -> Result<Answer, String> {
+    fn ask(&self, line: impl Fn(u64) -> Option<String>) -> Result<MirrorAnswer, String> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let line = line(id).ok_or("a field contains a tab or line break")?;
         let mut guard = self.conn.lock().map_err(|_| "checker lock poisoned")?;
@@ -142,26 +142,41 @@ impl Subprocess {
     }
 }
 
-/// The answer to request `id`; anything else is an error.
-fn parse(reply: &str, id: u64) -> Result<Answer, String> {
+/// The answer to request `id`, with the mirror check's extra fields when
+/// it has them; anything else is an error.
+fn parse(reply: &str, id: u64) -> Result<MirrorAnswer, String> {
     let v: serde_json::Value =
         serde_json::from_str(reply).map_err(|e| format!("unreadable answer: {e}"))?;
     if v["id"].as_str() != Some(id.to_string().as_str()) {
         return Err(format!("answer for another request: {reply}"));
     }
-    match (
+    let answer = match (
         v["proof"].as_str(),
         v["theorem"].as_str(),
         v["reason"].as_str(),
     ) {
-        (Some("confirmed"), Some(t), _) => Ok(Answer::Confirmed {
+        (Some("confirmed"), Some(t), _) => Answer::Confirmed {
             theorem: t.to_string(),
-        }),
-        (Some("unconfirmed"), _, Some(r)) => Ok(Answer::Unconfirmed {
+        },
+        (Some("unconfirmed"), _, Some(r)) => Answer::Unconfirmed {
             reason: r.to_string(),
-        }),
-        _ => Err(format!("unexpected answer: {reply}")),
-    }
+        },
+        _ => return Err(format!("unexpected answer: {reply}")),
+    };
+    let residual = match &v["residual"] {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::Array(xs) => xs
+            .iter()
+            .map(|x| x.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| format!("unexpected residual: {reply}"))?,
+        _ => return Err(format!("unexpected residual: {reply}")),
+    };
+    Ok(MirrorAnswer {
+        answer,
+        scalars: v["scalars"].as_str().map(str::to_string),
+        residual,
+    })
 }
 
 impl Checker for Subprocess {
@@ -171,21 +186,23 @@ impl Checker for Subprocess {
 
     fn check(&self, req: &Request) -> Answer {
         self.ask(|id| req.line(id))
+            .map(|a| a.answer)
             .unwrap_or_else(|reason| Answer::Unconfirmed {
                 reason: format!("checker failed: {reason}"),
             })
     }
 
-    fn check_mirror(&self, req: &MirrorRequest) -> Answer {
+    fn check_mirror(&self, req: &MirrorRequest) -> MirrorAnswer {
         if !self.name.contains(MIRROR_PROTOCOL) {
-            return Answer::Unconfirmed {
+            return MirrorAnswer::from(Answer::Unconfirmed {
                 reason: format!("the checker does not speak {MIRROR_PROTOCOL}"),
-            };
+            });
         }
-        self.ask(|id| req.line(id))
-            .unwrap_or_else(|reason| Answer::Unconfirmed {
+        self.ask(|id| req.line(id)).unwrap_or_else(|reason| {
+            MirrorAnswer::from(Answer::Unconfirmed {
                 reason: format!("checker failed: {reason}"),
             })
+        })
     }
 }
 
@@ -196,20 +213,28 @@ mod tests {
     #[test]
     fn only_a_matching_well_formed_answer_counts() {
         assert_eq!(
-            parse(r#"{"id":"3","proof":"confirmed","theorem":"T"}"#, 3),
+            parse(r#"{"id":"3","proof":"confirmed","theorem":"T"}"#, 3).map(|a| a.answer),
             Ok(Answer::Confirmed {
                 theorem: "T".into()
             })
         );
         assert!(matches!(
-            parse(r#"{"id":"3","proof":"unconfirmed","reason":"r"}"#, 3),
+            parse(r#"{"id":"3","proof":"unconfirmed","reason":"r"}"#, 3).map(|a| a.answer),
             Ok(Answer::Unconfirmed { .. })
         ));
+        let m = parse(
+            r#"{"id":"3","proof":"confirmed","theorem":"T","scalars":"c2a","residual":["ASM-X"]}"#,
+            3,
+        )
+        .unwrap();
+        assert_eq!(m.scalars.as_deref(), Some("c2a"));
+        assert_eq!(m.residual, ["ASM-X"]);
         for bad in [
             r#"{"id":"4","proof":"confirmed","theorem":"T"}"#,
             r#"{"id":"3","proof":"confirmed"}"#,
             r#"{"id":"3","proof":"yes","theorem":"T"}"#,
             r#"{"id":3,"proof":"confirmed","theorem":"T"}"#,
+            r#"{"id":"3","proof":"confirmed","theorem":"T","residual":[1]}"#,
             "confirmed",
         ] {
             assert!(parse(bad, 3).is_err(), "{bad}");

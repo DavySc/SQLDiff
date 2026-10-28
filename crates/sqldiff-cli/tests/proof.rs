@@ -256,9 +256,10 @@ fn the_real_checker_confirms_a_converted_procedure() {
     assert_eq!(t["reason"], "the T-SQL routine is outside the C1 spec");
 }
 
-/// `--proof require` is the release gate: until C2 gives operators their
-/// meaning, a confirmed routine still rests on ASM-C1-OPERATORS, which no
-/// deployment can accept, so the gate names it and the exit code is 1.
+/// `--proof require` is the release gate: a routine outside the C2a slice
+/// (`@a + 1` can overflow, and without XACT_ABORT ON T-SQL would carry on)
+/// still rests on ASM-C1-OPERATORS, which no deployment can accept, so the
+/// gate names it and the exit code is 1.
 #[test]
 fn the_real_checker_and_the_release_gate_name_what_needs_a_review() {
     let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
@@ -271,7 +272,7 @@ fn the_real_checker_and_the_release_gate_name_what_needs_a_review() {
     write(
         &src,
         "p.sql",
-        "CREATE PROCEDURE p @a int OUTPUT\nAS\nBEGIN\n  IF @a > 1\n    SET @a = 2;\nEND\n",
+        "CREATE PROCEDURE p @a int OUTPUT\nAS\nBEGIN\n  IF @a > 1\n    SET @a = @a + 1;\nEND\n",
     );
     let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
         .args([
@@ -301,4 +302,65 @@ fn the_real_checker_and_the_release_gate_name_what_needs_a_review() {
             || stdout.contains("p.sql: p: rests on ASM-C1-OPERATORS"),
         "{stdout}"
     );
+}
+
+/// A procedure whose expressions are all in the C2a slice (comparison,
+/// ISNULL, CASE; nothing that can raise) is confirmed with its operators'
+/// meaning, and with the deployment accepting what it still rests on, the
+/// release gate passes: the proof stands where the engine did not compare.
+#[test]
+fn the_real_checker_lets_the_release_gate_pass_in_the_c2a_slice() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("gate-c2a");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(&src, "p.sql", "CREATE PROCEDURE p @a int, @b int OUTPUT\nAS\nBEGIN\n  IF @a > 1\n    SET @b = ISNULL(@a, 0);\n  ELSE\n    SET @b = CASE WHEN @a IS NULL THEN 0 ELSE @a END;\nEND\n");
+    let config = write(
+        &d,
+        "config.toml",
+        "[deployment]\naccept = [\"ASM-RETURN-CODE\", \"ASM-NO-CALLER-TXN\"]\n",
+    );
+    let run = |config: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_sqldiff"));
+        c.args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--overwrite", "--isolated", "--proof", "require"])
+        .env("SQLDIFF_CHECK", &real);
+        if let Some(f) = config {
+            c.args(["--config", f]);
+        }
+        c.output().unwrap()
+    };
+    let o = run(Some(&config));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("release gate: passed"), "{stdout}");
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap();
+    let r = &c["files"][0]["routines"][0];
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["scalars"], "c2a", "{r}");
+    assert!(
+        !r["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a == "ASM-C1-OPERATORS"),
+        "{r}"
+    );
+    // Without the deployment's acceptance the gate names what is open.
+    let o = run(None);
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert_eq!(o.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("rests on ASM-RETURN-CODE"), "{stdout}");
 }

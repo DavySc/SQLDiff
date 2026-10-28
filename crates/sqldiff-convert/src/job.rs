@@ -45,16 +45,20 @@ impl Certificates {
     /// docs/verified-conversion.md): why the converted tree still needs a
     /// review, if it does. Empty when every routine is confirmed, every
     /// assumption a confirmation or a unit rests on is accepted by the
-    /// deployment profile, nothing lies outside a routine, and the tree
-    /// converted.
+    /// deployment profile, nothing lies outside a routine, and every unit
+    /// converted (under assumptions at worst). Inside a confirmed routine
+    /// the proof stands where the engine did not compare (`not proven`
+    /// only because of `equiv.not-compared`), and a `c2a` confirmation
+    /// discharges the converter assumptions it proves
+    /// (`cert::DISCHARGED_BY_C2A`). A difference is never overridden.
     pub fn gate(
         &self,
         w: &Written,
         deployment: &sqldiff_source::deployment::Profile,
     ) -> Vec<String> {
         let mut why = Vec::new();
-        if !w.tree.report.ok() {
-            why.push("the tree is not converted (see conversion-report.md)".to_string());
+        if !w.tree.report.unreadable.is_empty() {
+            why.push("some files could not be read (see conversion-report.md)".to_string());
         }
         let accepted = |id: &str| !deployment.accepting(id).is_empty();
         for f in &self.files {
@@ -88,18 +92,64 @@ impl Certificates {
             let Some(conv) = w.tree.conversions.get(k) else {
                 continue;
             };
+            let certs: Vec<&crate::cert::Certificate> = self
+                .files
+                .iter()
+                .filter(|c| c.path == f.path)
+                .flat_map(|c| &c.routines)
+                .collect();
             let mut seen = Vec::new();
-            for n in conv.units.iter().flat_map(|u| &u.notes) {
-                if n.status == crate::Status::Assumptions
-                    && !accepted(&n.rule)
-                    && !seen.contains(&n.rule)
-                {
-                    seen.push(n.rule.clone());
-                    why.push(format!(
-                        "{}: rests on {}, which the deployment profile does not accept",
-                        f.path, n.rule
-                    ));
+            for u in &conv.units {
+                // The confirmed routine this unit lies in, if any.
+                let proof = certs.iter().find(|c| {
+                    matches!(c.answer, crate::cert::Answer::Confirmed { .. })
+                        && c.span.0 <= u.src.start
+                        && u.src.end <= c.span.1
+                });
+                for n in &u.notes {
+                    let open = match n.status {
+                        crate::Status::Converted => false,
+                        crate::Status::Assumptions => {
+                            let proven = proof.is_some_and(|c| {
+                                c.scalars.as_deref() == Some("c2a")
+                                    && crate::cert::DISCHARGED_BY_C2A.contains(&n.rule.as_str())
+                            });
+                            !proven && !accepted(&n.rule)
+                        }
+                        crate::Status::Unproven => {
+                            !(proof.is_some() && n.rule == crate::NOT_COMPARED)
+                        }
+                        _ => true,
+                    };
+                    if open && !seen.contains(&n.rule) {
+                        seen.push(n.rule.clone());
+                        why.push(match n.status {
+                            crate::Status::Assumptions => format!(
+                                "{}: rests on {}, which the deployment profile does not accept",
+                                f.path, n.rule
+                            ),
+                            s => format!("{}: a unit is {} ({})", f.path, s.label(), n.rule),
+                        });
+                    }
                 }
+                if u.checked == crate::Status::Differs && !seen.contains(&"differs".to_string()) {
+                    seen.push("differs".to_string());
+                    why.push(format!("{}: the engine found a difference", f.path));
+                }
+            }
+            for &x in &conv.unplaced {
+                let rule = conv
+                    .output_check
+                    .findings
+                    .get(x)
+                    .map_or("?", |g| g.rule.as_str());
+                why.push(format!(
+                    "{}: an output finding outside any unit ({rule})",
+                    f.path
+                ));
+            }
+            for r in &conv.unproven {
+                why.push(format!("{}: not compared outside any unit: {r}", f.path));
             }
         }
         why

@@ -13,6 +13,7 @@
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use sqldiff_core::assumptions;
 use sqldiff_core::proof::{self, Checker, MirrorRequest};
 use sqldiff_syntax::abstract_syntax::Stmt;
 use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
@@ -47,6 +48,13 @@ pub struct Certificate {
     /// What a confirmation still rests on.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub assumptions: Vec<String>,
+    /// The checker's scalar slice for a confirmation: `c2a` when every
+    /// expression has its meaning in the spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scalars: Option<String>,
+    /// The routine's byte range in the source.
+    #[serde(skip)]
+    pub span: (usize, usize),
     #[serde(flatten)]
     pub answer: Answer,
 }
@@ -72,6 +80,31 @@ pub const STATUS_PARAM: &str = "return_code";
 /// means the same function in both dialects, which C2 proves.
 pub const C1_OPERATORS: &str = "ASM-C1-OPERATORS";
 
+/// Outside the C2a slice the core stops at an error, where T-SQL without
+/// `XACT_ABORT ON` carries on with the next statement: a confirmation holds
+/// for runs without errors.
+pub const C1_NO_ERRORS: &str = "ASM-C1-NO-ERRORS";
+
+/// The assumptions the C2a slice may still rest on, as the checker names
+/// them (`formal/lean/Sqldiff/Mirror/Lower.lean`): T-SQL raises on integer
+/// overflow and division by zero (ANSI_WARNINGS and ARITHABORT not both
+/// OFF), and compares with NULL as UNKNOWN (ANSI_NULLS ON).
+pub const C2A_RESIDUALS: [&str; 2] = ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS"];
+
+/// A T-SQL procedure that returns NULL returns 0 with a warning message;
+/// the converted procedure returns 0 without it.
+pub const RETURN_NULL_WARNING: &str = "ASM-TSQL-RETURN-NULL-WARNING";
+
+fn returns_value(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Stmt(Stmt::Return(Some(_))) => true,
+        Node::Block(b) => returns_value(&b.body),
+        Node::If { then, els, .. } => returns_value(then) || returns_value(els),
+        Node::While { body, .. } => returns_value(body),
+        _ => false,
+    })
+}
+
 /// A PostgreSQL name as PostgreSQL resolves it: a quoted name whose case
 /// matters arrives with a leading `"` and is kept; any other is folded to
 /// lower case (`Sqldiff.Mirror.pgName`).
@@ -83,17 +116,25 @@ pub fn pg_name(n: &str) -> String {
     }
 }
 
-fn routines(text: &str, d: Dialect) -> Vec<(String, Result<Routine, String>)> {
+type Read = (String, (usize, usize), Result<Routine, String>);
+
+fn routines(text: &str, d: Dialect) -> Vec<Read> {
     parse(text, d)
         .syntax()
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::ROUTINE)
         .map(|n| {
             let name = sqldiff_syntax::ast::routine_name(&n).unwrap_or_default();
-            (name, routine::read(&n, d))
+            let span = sqldiff_syntax::ast::sig_range(&n);
+            (name, span, routine::read(&n, d))
         })
         .collect()
 }
+
+/// Assumptions of the converter's notes that a `c2a` confirmation of the
+/// whole routine establishes: ISNULL against COALESCE is proven for the
+/// int arguments the slice admits. Nothing else is discharged by a proof.
+pub const DISCHARGED_BY_C2A: [&str; 1] = ["ASM-ISNULL-TYPE"];
 
 /// T-SQL local variables in the order their DECLAREs appear.
 fn tsql_locals(nodes: &[Node], out: &mut Vec<String>) {
@@ -215,9 +256,12 @@ pub fn mirror_request(
     row_counts: bool,
 ) -> Result<(MirrorRequest, Vec<String>), String> {
     let renaming = propose_renaming(a, b)?;
-    let mut assumptions = vec![C1_OPERATORS.to_string()];
+    let mut assumptions = Vec::new();
     if a.kind == RoutineKind::Procedure {
         assumptions.push("ASM-RETURN-CODE".to_string());
+        if returns_value(&a.body.body) {
+            assumptions.push(RETURN_NULL_WARNING.to_string());
+        }
     }
     let mut calls = Vec::new();
     callees(&a.body.body, &mut calls);
@@ -269,11 +313,13 @@ pub fn certify(
 ) -> Vec<Certificate> {
     let src = routines(input, from);
     let out = routines(output, to);
-    let readable: Vec<Routine> = out.iter().filter_map(|(_, r)| r.clone().ok()).collect();
+    let readable: Vec<Routine> = out.iter().filter_map(|(_, _, r)| r.clone().ok()).collect();
     let mut certs = Vec::new();
-    for (i, (name, a)) in src.into_iter().enumerate() {
+    for (i, (name, span, a)) in src.into_iter().enumerate() {
         let mut c = Certificate {
             routine: name,
+            scalars: None,
+            span,
             from: from.id().to_string(),
             to: to.id().to_string(),
             source: None,
@@ -284,7 +330,7 @@ pub fn certify(
                 reason: String::new(),
             },
         };
-        let b = out.get(i).map(|(_, b)| b.clone());
+        let b = out.get(i).map(|(_, _, b)| b.clone());
         c.answer = match (a, b) {
             (Err(e), _) => Answer::Unconfirmed {
                 reason: format!("the source routine is outside the verified shape: {e}"),
@@ -308,17 +354,25 @@ pub fn certify(
                             None => Answer::Unconfirmed {
                                 reason: "no checker".into(),
                             },
-                            Some(k) => match k.check_mirror(&req) {
-                                proof::Answer::Confirmed { theorem } => {
-                                    c.assumptions = assumptions;
-                                    Answer::Confirmed {
-                                        theorems: vec![theorem],
+                            Some(k) => {
+                                let m = k.check_mirror(&req);
+                                match m.answer {
+                                    proof::Answer::Confirmed { theorem } => {
+                                        c.scalars = m.scalars.clone();
+                                        c.assumptions = confirmed_rests_on(
+                                            m.scalars.as_deref(),
+                                            &m.residual,
+                                            assumptions,
+                                        );
+                                        Answer::Confirmed {
+                                            theorems: vec![theorem],
+                                        }
+                                    }
+                                    proof::Answer::Unconfirmed { reason } => {
+                                        Answer::Unconfirmed { reason }
                                     }
                                 }
-                                proof::Answer::Unconfirmed { reason } => {
-                                    Answer::Unconfirmed { reason }
-                                }
-                            },
+                            }
                         }
                     }
                 }
@@ -327,6 +381,28 @@ pub fn certify(
         certs.push(c);
     }
     certs
+}
+
+/// What a confirmation rests on: the C2a slice's residual assumptions
+/// when every expression was in it, else the C1 caveats (operators taken
+/// to mean the same, runs without errors); then the routine's own.
+fn confirmed_rests_on(scalars: Option<&str>, residual: &[String], own: Vec<String>) -> Vec<String> {
+    // A residual the registry does not know (a checker newer than this
+    // build) is not trusted to mean anything: fall back to the C1 caveats.
+    let known = residual
+        .iter()
+        .all(|r| C2A_RESIDUALS.contains(&r.as_str()) && assumptions::lookup(r).is_some());
+    let mut out: Vec<String> = if scalars == Some("c2a") && known {
+        residual.to_vec()
+    } else {
+        vec![C1_OPERATORS.to_string(), C1_NO_ERRORS.to_string()]
+    };
+    for a in own {
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// How many top-level statements of `input` are not routines: no
@@ -416,10 +492,10 @@ END
             .to_string();
         let a = routines(src, Dialect::Tsql);
         let b = routines(&out, Dialect::Postgres);
-        let readable: Vec<Routine> = b.iter().filter_map(|(_, r)| r.clone().ok()).collect();
+        let readable: Vec<Routine> = b.iter().filter_map(|(_, _, r)| r.clone().ok()).collect();
         let (req, asm) = mirror_request(
-            a[1].1.as_ref().unwrap(),
-            b[1].1.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
+            a[1].2.as_ref().unwrap(),
+            b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
             &readable,
             false,
         )

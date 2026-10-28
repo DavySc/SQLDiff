@@ -193,9 +193,31 @@ pub trait Checker: Send + Sync + std::fmt::Debug {
     fn check(&self, req: &Request) -> Answer;
     /// The C1 mirror check of a converted routine (`sqldiff-check/3`). A
     /// checker that does not speak it answers unconfirmed.
-    fn check_mirror(&self, _req: &MirrorRequest) -> Answer {
-        Answer::Unconfirmed {
+    fn check_mirror(&self, _req: &MirrorRequest) -> MirrorAnswer {
+        MirrorAnswer::from(Answer::Unconfirmed {
             reason: format!("the checker does not speak {MIRROR_PROTOCOL}"),
+        })
+    }
+}
+
+/// The checker's answer to a mirror request: with a confirmation, whether
+/// every expression was in the C2a scalar slice (`scalars` is `c2a`: the
+/// operators have their meaning, and `residual` lists what the slice still
+/// assumes) or not (`uninterpreted`: operators are taken to mean the same
+/// in both dialects).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorAnswer {
+    pub answer: Answer,
+    pub scalars: Option<String>,
+    pub residual: Vec<String>,
+}
+
+impl From<Answer> for MirrorAnswer {
+    fn from(answer: Answer) -> Self {
+        MirrorAnswer {
+            answer,
+            scalars: None,
+            residual: Vec::new(),
         }
     }
 }
