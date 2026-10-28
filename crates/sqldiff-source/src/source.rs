@@ -49,7 +49,8 @@ pub fn to_artifact(data: &ArtifactData) -> Result<Artifact> {
         .map_err(|e: String| Error::new(format!("{}: {e}", data.info.id)))?;
     let mut a = Artifact::new(data.info.id.clone(), dialect, data.text.clone());
     if let Some(v) = &data.info.version {
-        a.version = v.clone();
+        a.set_version(v)
+            .map_err(|e| Error::new(format!("{}: {e}", data.info.id)))?;
     }
     // One object of a file with several: its own identity.
     if crate::split::split_id(&data.info.id).1.is_some() {

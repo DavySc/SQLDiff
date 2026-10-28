@@ -218,7 +218,7 @@ pub(crate) struct Binder<'a> {
 pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
     let mut b = Binder {
         d: a.dialect(),
-        version: a.artifact.version.clone(),
+        version: crate::target::engine_version(a.dialect(), &a.artifact.version),
         text: &a.artifact.text,
         lines: &a.lines,
         input,

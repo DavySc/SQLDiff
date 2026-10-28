@@ -725,7 +725,8 @@ pub fn cli_layer(
         policy.assumptions.insert(k.clone(), v.clone());
     }
     for (d, v) in versions {
-        parse_dialect(d, "--dialect-version")?;
+        let dialect = parse_dialect(d, "--dialect-version")?;
+        crate::pack::check_version(dialect, v, "--dialect-version")?;
         policy.dialect_versions.insert(d.clone(), v.clone());
     }
     let file = ConfigFile {

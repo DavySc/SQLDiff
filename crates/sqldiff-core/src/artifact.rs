@@ -29,6 +29,15 @@ impl Artifact {
             object: None,
         }
     }
+
+    /// Sets the target version after validating it against the lifecycle
+    /// data ([`crate::target::Target::parse`]); stores the canonical
+    /// spelling.
+    pub fn set_version(&mut self, version: &str) -> Result<(), String> {
+        self.version = crate::target::Target::parse(self.dialect, version)?.canonical();
+        crate::target::record_use(self.dialect, &self.version);
+        Ok(())
+    }
 }
 
 /// Content hash with line endings, BOM and trailing whitespace normalized.

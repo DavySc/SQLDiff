@@ -627,15 +627,22 @@ implementations and the drift controls.
 
 ### Today
 
-- The version is a free-form string per artifact, defaulting to SQL Server
-  2022, PostgreSQL 18 and IBM i 7.6 (`Dialect::default_version`,
+- The version is a string per artifact, defaulting to SQL Server 2022,
+  PostgreSQL 18 and IBM i 7.6 (`Dialect::default_version`,
   `crates/sqldiff-syntax/src/dialect.rs`). It is set by `--dialect-version`,
   `[dialect_versions]` in `sqldiff.toml` or a pack, or a `dialect_map` entry.
+  On the `verification` branch it is validated against
+  `crates/sqldiff-core/profiles/lifecycle.toml` (`sqldiff_core::target`): a
+  T-SQL target is `2019`, `2019/130`, `mi-2022`, `mi-evergreen`, `azure` or
+  `fabric` with an optional compatibility level, an unknown version is an
+  error, and the CLI prints a note for a `preview`, `legacy` or `retired`
+  version or one within 90 days of a change.
 - The only behaviour that depends on it is built-in availability
   (`[*.since]` in `profiles/builtins.toml`, compared by `version_lt` in
   `catalog/builtins.rs`). Semantic profiles, rules, the converter and the
   witness search do not use it.
-- Version strings are not validated; an unparsable part compares as 0.
+- Version strings were not validated, and an unparsable part compared as 0;
+  on the `verification` branch they are validated at every entry point.
 - The vendor facts, eval runs and CI containers cover SQL Server 2022 and
   PostgreSQL 18 only; Db2 for i facts were read for 7.4 to 7.6 and probed on
   whatever release a user has.

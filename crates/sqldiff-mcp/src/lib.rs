@@ -1608,7 +1608,7 @@ fn artifact(v: Option<&Value>, field: &str) -> Result<(Artifact, Option<String>)
     };
     let mut a = Artifact::new(path, dialect, text);
     if let Some(ver) = v.get("version").and_then(Value::as_str) {
-        a.version = ver.to_string();
+        a.set_version(ver).map_err(|e| format!("{field}: {e}"))?;
     }
     Ok((a, file))
 }

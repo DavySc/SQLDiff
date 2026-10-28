@@ -467,6 +467,13 @@ pub(crate) fn parse_dialect(s: &str, at: &str) -> Result<Dialect> {
         .map_err(|e| Error::new(format!("{at}: {e}")))
 }
 
+/// A target version the lifecycle data knows (`sqldiff_core::target`).
+pub(crate) fn check_version(d: Dialect, v: &str, at: &str) -> Result<()> {
+    sqldiff_core::target::Target::parse(d, v)
+        .map(|_| ())
+        .map_err(|e| Error::new(format!("{at}: {e}")))
+}
+
 impl Policy {
     /// Checks every regex, glob, dialect and credential reference.
     pub fn validate(&self) -> Result<()> {
@@ -486,10 +493,15 @@ impl Policy {
         }
         for m in &self.dialect_map {
             Glob::new(&m.glob)?;
-            parse_dialect(&m.dialect, &format!("dialect_map `{}`", m.glob))?;
+            let what = format!("dialect_map `{}`", m.glob);
+            let d = parse_dialect(&m.dialect, &what)?;
+            if let Some(v) = &m.version {
+                check_version(d, v, &what)?;
+            }
         }
-        for d in self.dialect_versions.keys() {
-            parse_dialect(d, "dialect_versions")?;
+        for (d, v) in &self.dialect_versions {
+            let d = parse_dialect(d, "dialect_versions")?;
+            check_version(d, v, "dialect_versions")?;
         }
         if let Some(t) = &self.template {
             if t.open.is_empty() || t.close.is_empty() {

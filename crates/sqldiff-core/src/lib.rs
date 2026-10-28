@@ -23,6 +23,7 @@ pub mod phrase;
 pub mod render;
 pub mod rules;
 pub mod session;
+pub mod target;
 pub mod tokens;
 pub mod treediff;
 

@@ -439,11 +439,28 @@ fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), Strin
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match sqldiff_core::with_engine_stack(|| run(cli)) {
+    let code = match sqldiff_core::with_engine_stack(|| run(cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("sqldiff: {e}");
             ExitCode::from(2)
+        }
+    };
+    lifecycle_notices();
+    code
+}
+
+/// One line per analysed target that is in preview, legacy or retired, or
+/// near its next lifecycle change (`profiles/lifecycle.toml`). The analysis
+/// never reads the clock; only this front end does.
+fn lifecycle_notices() {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    let today = sqldiff_core::target::date_from_days((now.as_secs() / 86_400) as i64);
+    for (d, v) in sqldiff_core::target::used() {
+        if let Some(n) = sqldiff_core::target::notice(d, &v, &today) {
+            eprintln!("sqldiff: note: {n}");
         }
     }
 }
