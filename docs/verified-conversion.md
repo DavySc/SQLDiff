@@ -360,8 +360,11 @@ output.
 ## Decisions this needs
 
 Decided 2026-10-28 by the project owner: the converter is the priority of
-the verification project. The following follow from it and are proposed;
-each stands once the owner confirms it, like the roadmap's decisions.
+the verification project. The following follow from it. On the same day
+the owner asked for the work to be reprioritised around this document and
+carried out as fast as possible, so the recommendations below are the
+working plan on the `verification` branch from 2026-10-28; each can still
+be overruled, and the table says which are in progress.
 
 | # | Decision | Recommendation |
 |---|---|---|
