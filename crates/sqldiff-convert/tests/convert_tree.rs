@@ -72,9 +72,13 @@ fn a_tsql_builtin_the_target_lacks_is_not_converted() {
 fn a_table_named_like_a_builtin_is_not_a_call() {
     let src = "INSERT INTO log (msg) VALUES ('x');\n";
     let c = pg(src);
-    assert_eq!(
-        c.units[0].status,
-        Status::Converted,
+    // Converted; equal only under what the engine assumes without a catalog.
+    assert_eq!(c.units[0].status, Status::Assumptions);
+    assert!(
+        c.units[0]
+            .notes
+            .iter()
+            .all(|n| n.rule.starts_with("ASM-BIND-") || n.rule == "ASM-UNTYPED-STORE"),
         "{:?}",
         c.units[0].notes
     );
@@ -172,7 +176,17 @@ fn temporal_tables_and_behavioural_options_are_not_storage() {
         assert_eq!(db2(src).units[0].status, Status::NotConverted, "{src}");
     }
     let harmless = "CREATE TABLE t (a int) WITH (DATA_COMPRESSION = PAGE);\n";
-    assert_eq!(pg(harmless).units[0].status, Status::Converted);
+    // Converted; the engine's assumption about NULL defaults stays.
+    let h = pg(harmless);
+    assert_eq!(h.units[0].status, Status::Assumptions);
+    assert!(
+        h.units[0]
+            .notes
+            .iter()
+            .all(|n| n.rule == "ASM-TSQL-ANSI-NULL-DEFAULT" || n.status == Status::Converted),
+        "{:?}",
+        h.units[0].notes
+    );
     let off = "CREATE INDEX ix ON t (a) WITH (DROP_EXISTING = OFF, FILLFACTOR = 80);\n";
     assert!(
         pg(off).units[0].status < Status::NotConverted,

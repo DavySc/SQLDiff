@@ -187,7 +187,8 @@ fn a_file_is_only_converted_when_every_unit_is() {
             .unwrap()
             .to_string()
     };
-    assert_eq!(status("ok.sql"), "converted");
+    // Without a catalog the engine assumes the table and its column types.
+    assert_eq!(status("ok.sql"), "assumptions");
     assert_eq!(status("mixed.sql"), "not_converted");
     let _ = std::fs::remove_dir_all(&d);
 }
