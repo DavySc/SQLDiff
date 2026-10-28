@@ -1,0 +1,39 @@
+NOTICE:  table "t" does not exist, skipping
+NOTICE:  P1 control: ac|d
+NOTICE:  P2 error-in-handler: inner-handler;outer-handler 22012
+NOTICE:  P3 variables: x=1
+NOTICE:  P4 db-after-handler: caught 23505
+NOTICE:  P4 db-after-handler: rows 9 100
+NOTICE:  P6 catch k=1: caught 22012 division by zero
+NOTICE:  P6 catch k=2: caught 22003 integer out of range
+NOTICE:  P6 catch k=3: caught 23502 null value in column "m" of relation "t" violates not-null constraint
+NOTICE:  P6 catch k=4: caught 23505 duplicate key value violates unique constraint "t_pkey"
+NOTICE:  P6 catch k=5: caught P0001 m
+NOTICE:  P6 catch k=6: caught P0001 m
+NOTICE:  P6 catch k=7: caught P0001 m
+ERROR:  assert
+CONTEXT:  PL/pgSQL function p6(integer) line 13 at ASSERT
+SQL statement "CALL p6(8)"
+PL/pgSQL function inline_code_block line 1 at CALL
+NOTICE:  P6 catch k=8: reached the caller as assert_failure P0004
+NOTICE:  P8 reraise: caller caught 22012
+ERROR:  duplicate key value violates unique constraint "t_pkey"
+DETAIL:  Key (id)=(1) already exists.
+CONTEXT:  SQL statement "INSERT INTO t (id, n) VALUES (1, 1)"
+PL/pgSQL function p9() line 5 at SQL statement
+P9 call-fails: rows []
+ERROR:  duplicate key value violates unique constraint "t_pkey"
+DETAIL:  Key (id)=(1) already exists.
+CONTEXT:  SQL statement "INSERT INTO t (id, n) VALUES (1, 1)"
+PL/pgSQL function p9b() line 6 at SQL statement
+P9b commit-then-fail: rows [100]
+ERROR:  cannot commit while a subtransaction is active
+CONTEXT:  PL/pgSQL function p13a() line 3 at COMMIT
+ERROR:  invalid transaction termination
+CONTEXT:  PL/pgSQL function p13b() line 2 at COMMIT
+ERROR:  invalid transaction termination
+CONTEXT:  PL/pgSQL function p13c() line 2 at COMMIT
+P12 atomic insert: rows []
+ERROR:  integer out of range
+P12 atomic update: n [1 2147483647]
+P13 update-old-values: n,m=20,10

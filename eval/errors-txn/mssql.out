@@ -1,0 +1,57 @@
+Changed database context to 'probe_c4'.
+P1 control: ac|d
+           
+-----------
+           
+-----------
+P2 error-in-catch: inner-catch;outer-catch 8134
+P3 variables: x=1
+P4 db-after-catch xact_abort=0: caught 2627 sev 14, XACT_STATE=0, TRANCOUNT=0
+P4 db-after-catch xact_abort=0: rows 1 9 
+P4 db-after-catch xact_abort=1: caught 2627 sev 14, XACT_STATE=0, TRANCOUNT=0
+P4 db-after-catch xact_abort=1: rows 1 9 
+           
+-----------
+P5 caller-txn: XACT_STATE in CATCH=-1
+P5 caller-txn: write in CATCH failed 3930
+P5 caller-txn: after call XACT_STATE=-1 TRANCOUNT=1
+           
+-----------
+P5b caller-txn abort-off: XACT_STATE in CATCH=1
+P6 catch k=1: caught 8134 sev 16 state 1
+P6 catch k=2: caught 8115 sev 16 state 2
+P6 catch k=3: caught 515 sev 16 state 2
+P6 catch k=4: caught 2627 sev 14 state 1
+P6 catch k=5: caught 50001 sev 16 state 1
+P7 throw-ends: caller caught 50002 sev 16
+P7 throw-ends: rows 1 
+P7b statement-error: caller caught 2627
+P7b statement-error abort-off: rows 1 
+P7c throw 49999: 35100 Error number 49999 in the THROW statement is outside the valid range. Specify an error number in the valid range of 50000 to 2147483647.
+           
+-----------
+P8 rethrow: caller caught 8134 sev 16
+P9 bracket: caller caught 2627, TRANCOUNT=1
+P9 bracket: rows 1 100 
+Msg 3998, Level 16, State 1, Line 1
+Uncommittable transaction is detected at the end of the batch. The transaction is rolled back.
+P10 unclosed: caught 266, TRANCOUNT=1
+P11 idiom: caller caught 2627, TRANCOUNT=0
+P11 idiom: rows []
+P12 atomic insert: rows []
+P12 atomic update: caught 8115
+P12 atomic update: n [1 2147483647 ]
+P13 update-old-values: n,m=20,10
+Msg 2627, Level 14, State 1, Procedure dbo.p9, Line 10
+Violation of PRIMARY KEY constraint 'pk_t'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key value is (1).
+P9c bracket, caller without TRY: next batch TRANCOUNT=0 rows [100 ]
+P9d caller caught 2627 XACT_STATE=-1
+P9d caller write failed 3930
+P9d after caller ROLLBACK: rows [100 ]
+Msg 2627, Level 14, State 1, Procedure dbo.p7b, Line 7
+Violation of PRIMARY KEY constraint 'pk_t'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key value is (1).
+The statement has been terminated.
+P7d statement-error abort-off, caller without TRY: rows [1 2 ]
+Msg 2627, Level 14, State 1, Procedure dbo.p4c, Line 7
+Violation of PRIMARY KEY constraint 'pk_t'. Cannot insert duplicate key in object 'dbo.t'. The duplicate key value is (1).
+P4c xact_abort on, autocommit, no TRY: rows [1 ]

@@ -216,6 +216,24 @@ fn tsql_locals(nodes: &[Node], out: &mut Vec<String>) {
     }
 }
 
+/// A T-SQL caller that catches an error raised inside a transaction the
+/// routine opened gets that transaction back, doomed (`XACT_STATE() = -1`,
+/// its writes fail with 3930 until it rolls back), where PostgreSQL leaves
+/// none open after a failed `CALL` (eval/errors-txn P9d). The checker does
+/// not observe it; the rollback-and-rethrow idiom inside a TRY does not
+/// leave it (P11), so only a `BEGIN TRAN` outside every TRY counts.
+pub const DOOMED_TXN: &str = "ASM-TSQL-DOOMED-TXN";
+
+fn begins_tran_outside_try(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Txn { op, .. } => op.eq_ignore_ascii_case("BEGIN"),
+        Node::Block(b) => begins_tran_outside_try(&b.body),
+        Node::If { then, els, .. } => begins_tran_outside_try(then) || begins_tran_outside_try(els),
+        Node::While { body, .. } => begins_tran_outside_try(body),
+        _ => false,
+    })
+}
+
 fn callees(nodes: &[Node], out: &mut Vec<Vec<String>>) {
     for n in nodes {
         match n {
@@ -554,6 +572,9 @@ pub fn mirror_request(
     if !written.is_empty() && !row_counts {
         assumptions.push("ASM-OBSERVER-ROWCOUNT".to_string());
     }
+    if begins_tran_outside_try(&a.body.body) {
+        assumptions.push(DOOMED_TXN.to_string());
+    }
     // Answers on the C1 theorem carry no residual: the record keeps the
     // fact visible whatever the answer.
     if trusted.binary_collation {
@@ -873,5 +894,17 @@ END
         ] {
             assert!(tables(extra).get("acct").is_none(), "{extra}");
         }
+    }
+
+    #[test]
+    fn a_transaction_outside_a_try_names_the_doomed_caller_transaction() {
+        let bracket = "CREATE PROCEDURE dbo.p @a int AS\nBEGIN\n  SET XACT_ABORT ON;\n  \
+                       BEGIN TRAN;\n  SET @a = @a + 1;\n  COMMIT;\nEND\n";
+        let idiom = "CREATE PROCEDURE dbo.p @a int AS\nBEGIN\n  SET XACT_ABORT ON;\n  \
+                     BEGIN TRY\n    BEGIN TRAN;\n    SET @a = @a + 1;\n    COMMIT;\n  END TRY\n  \
+                     BEGIN CATCH\n    IF @@TRANCOUNT > 0 ROLLBACK;\n    THROW;\n  END CATCH\nEND\n";
+        let read = |src: &str| routines(src, Dialect::Tsql).remove(0).2.unwrap();
+        assert!(begins_tran_outside_try(&read(bracket).body.body));
+        assert!(!begins_tran_outside_try(&read(idiom).body.body));
     }
 }

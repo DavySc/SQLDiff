@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 49 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 75 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 76 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
-| | Total | 168 |
+| | Total | 169 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -181,6 +181,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TSQL-CI-COLLATION` | T-SQL compares strings, identifiers and variables case-insensitively (case-insensitive collation). | `catalog` | The T-SQL database's and columns' collations. (fact key `collation`) | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-CODE-PAGE` | T-SQL char and varchar values hold only characters of a single-byte code page, so a length counts characters on both sides. | `catalog` | The columns' collations and code pages. (fact key `collation`) | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-TSQL-DATEFORMAT-YMD` | The session's DATEFORMAT reads a 'yyyy-mm-dd' literal as year-month-day (mdy, ymd or myd). | `deployment` | The sessions' DATEFORMAT (language) setting. (fact key `tsql_dateformat`) | `sqldiff-core/src/equiv/literal.rs` |
+| `ASM-TSQL-DOOMED-TXN` | A caller that catches an error from a converted T-SQL routine which opened a transaction (BEGIN TRAN) rolls back before anything else: SQL Server hands it the routine's doomed transaction (XACT_STATE() = -1; its writes fail with error 3930 until ROLLBACK), PostgreSQL leaves no transaction open after a failed CALL. | `deployment` | How callers handle errors (probed: eval/errors-txn P9d). | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-FILTERED-INDEX-SET-OPTIONS` | Sessions that change a table with a filtered index run with the SET options SQL Server requires for it. | `deployment` | The callers' session SET options. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-TSQL-LEN-BMP` | Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts. | `deployment` | The data the routines see, or the collation. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-MONEY-ROUNDING` | T-SQL rounds a value with more than four decimals to money half away from zero, as PostgreSQL rounds to numeric(..., 4). | `nothing` | The behaviour checked on SQL Server. | `sqldiff-core/src/equiv/table.rs` |

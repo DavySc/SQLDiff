@@ -1201,7 +1201,8 @@ values; FALSE and UNKNOWN leave the row as it is.
   expression, which sets the variable to the pre-update value of the
   column", i.e. a `SET` list reads the row as it was before the statement
   (the "all-at-once" rule; the page says it for variables, not in so many
-  words for columns: reviewers check). Not probed.
+  words for columns: reviewers check). Probed, eval/errors-txn P13: `SET n
+  = m, m = n` swaps the two columns on both engines.
 * `WHERE` keeps the rows where it is TRUE. PostgreSQL: "UPDATE":
   "Only rows for which this expression returns true will be updated."
   T-SQL: "UPDATE (Transact-SQL)", `WHERE`: "Specifies the conditions that
@@ -1242,7 +1243,10 @@ error aborts it. The core keeps the state from before the statement
 (`Sqldiff.Core.exec_error_atomic`). The error then ends the routine (C2a:
 under `XACT_ABORT ON` in T-SQL, `abortsT`); what the caller sees of the
 database afterwards differs between the dialects and is not observed
-(`Sqldiff.Core.Obs`; `ASM-STATE-AFTER-ERROR` in `residual`). Not probed.
+(`Sqldiff.Core.Obs`; `ASM-STATE-AFTER-ERROR` in `residual`). Probed,
+eval/errors-txn P12: a multi-row `INSERT` with a duplicate in its second
+row inserts nothing, an `UPDATE` overflowing on its second row changes
+nothing, on both engines.
 
 **Row order and which error.** Neither vendor fixes the order in which a
 statement visits rows. A statement whose rows could fail with errors of
@@ -1490,11 +1494,12 @@ the probe status, as for C2a. "V10", "V17" and "V18" are the vendor facts
 of docs/vendor-facts-verification.md, checked against the vendor pages on
 2026-10-23/24; **every other vendor quote in this section was written
 from memory** (the vendor sites were not reachable when it was written,
-2026-10-28) and reviewers check it against the page named. **No rule of
-this section is probed**: `eval/` has no run of `TRY`/`CATCH`,
-`EXCEPTION`, `THROW`, `RAISE` or transaction control on either engine;
-the error and transaction model `formal/ErrorTxn.tla` with the cases of
-`formal/profiles/error-txn.toml` is a model, not an engine run.
+2026-10-28) and reviewers check it against the page named. **Probed** on SQL
+Server 2022 (16.0.4305.5) and PostgreSQL 18.6, 2026-10-28:
+`eval/errors-txn/{mssql,postgres}.sql` with their `.out` files, probes
+P1 to P13 named below; every behaviour each rule claims was observed, and
+P9d found one the rules did not state (the doomed caller transaction,
+under "Transactions, T-SQL").
 
 **Which errors exist.** The core's errors are integer overflow and
 division by zero (`arithmetic`), `NOT NULL` and primary key violations
@@ -1503,9 +1508,11 @@ uninterpreted operator's (`other`, C1 path only). Both handlers catch
 every one of them: T-SQL "TRY...CATCH (Transact-SQL)": "A TRY...CATCH
 construct catches all execution errors that have a severity higher than
 10 that do not close the database connection" (from memory); 8115, 8134,
-515 and `THROW` have severity 16, 2627 severity 14 (from memory).
+515 and `THROW` have severity 16, 2627 severity 14 (probed, P6: all five
+caught, with those severities).
 PL/pgSQL: "The special condition name OTHERS matches every error type
-except QUERY_CANCELED and ASSERT_FAILURE" (V18). What either engine does
+except QUERY_CANCELED and ASSERT_FAILURE" (V18; probed, P6: 22012, 22003,
+23502, 23505 and P0001 caught, an `ASSERT` failure (P0004) not). What either engine does
 not catch (T-SQL: severity 20 and above, attentions, `KILL`, and at the
 same level compile, recompilation and deferred-name-resolution errors,
 V10; PL/pgSQL: `query_canceled`, `assert_failure`, FATAL and PANIC, V18)
@@ -1534,26 +1541,31 @@ spec.
   of the statements is abandoned, and control passes to the EXCEPTION
   list ... the corresponding handler_statements are executed, and then
   control passes to the next statement after END" (V18's page; quoted
-  from memory). Not probed.
+  from memory). Probed, P1, both engines.
 * An error inside `h` is not caught by the same handler and leaves it:
   T-SQL "TRY...CATCH": errors in a CATCH block go to an enclosing TRY or
   to the caller (from memory); PL/pgSQL: "If a new error occurs within
   the selected handler_statements, it cannot be caught by this EXCEPTION
   clause, but is propagated out" (from memory). Handlers nest in both, as
-  `tryCatch` does. Not probed.
+  `tryCatch` does. Probed, P2, both engines.
 * Variables keep the values the error left in both: PL/pgSQL "the local
   variables of the PL/pgSQL function remain as they were when the error
   occurred" (V18); T-SQL variables are not transactional (from memory:
   "Transactions (Transact-SQL)", table variables and variables are not
-  affected by a rollback). Not probed.
+  affected by a rollback). Probed, P3, both engines.
 * **The database differs**: PL/pgSQL "all changes to persistent database
   state within the block are rolled back" (V18), which is `undo`; T-SQL
   rolls back only the failing statement, and keeps what `b` wrote
   before it, committed when no transaction is open. With `XACT_ABORT ON`
   in an open transaction, the error makes the transaction uncommittable
   instead (`XACT_STATE() = -1`: "An error can make the transaction
-  uncommittable", V10), and every write of `h` then fails (error 3930,
-  from memory). So the T-SQL lowering is faithful only when no
+  uncommittable", V10), and every write of `h` then fails (error 3930).
+  Probed: P4 (autocommit, `XACT_ABORT` OFF and ON alike: the row written
+  before the error is kept, `XACT_STATE() = 0` and `@@TRANCOUNT = 0` in
+  `CATCH`, a write in `CATCH` succeeds; PostgreSQL rolls the block's row
+  back and keeps the handler's), P5 (a caller transaction under
+  `XACT_ABORT ON`: `XACT_STATE() = -1` in `CATCH`, the write fails with
+  3930; with `XACT_ABORT OFF` the transaction stays committable, P5b). So the T-SQL lowering is faithful only when no
   transaction is open when the routine is called and the routine opens
   none around a handled error: `ASM-NO-CALLER-TXN` (the caller holds no
   open transaction, and `IMPLICIT_TRANSACTIONS` is `OFF` so that a
@@ -1578,14 +1590,18 @@ spec.
   `tinyint`, "The severity is always set to 16", and "If a TRY...CATCH
   construct is not available, the statement batch is terminated" (from
   memory); so it ends the routine whatever `XACT_ABORT` says, which the
-  core does with every error. Variables as arguments are outside the
+  core does with every error. Probed: P6 (severity 16, the number and
+  state given), P7 (ends the procedure with `XACT_ABORT OFF`; a statement
+  error there does not, P7d), P7c (49999 is refused with error 35100). Variables as arguments are outside the
   spec (a NULL or out-of-range value fails differently).
 * PL/pgSQL `RAISE [EXCEPTION] 'f'` with `f` without `%`, or `RAISE
   [EXCEPTION] USING MESSAGE = 'm'`, optionally with `ERRCODE = 'P0001'`:
   "Errors and Messages": the level `EXCEPTION` is the default and "raises
   an error (which normally aborts the current transaction)"; "If no
   condition name nor SQLSTATE is specified in a RAISE EXCEPTION command,
-  the default is to use raise_exception (P0001)" (from memory). Other
+  the default is to use raise_exception (P0001)" (from memory; probed, P6: `RAISE EXCEPTION
+  'm'`, `RAISE 'm'` and `USING MESSAGE = 'm', ERRCODE = 'P0001'` all raise
+  P0001 with message `m`). Other
   levels (`NOTICE`, ...) send a message, not an error: outside the spec.
   A `%` in the format, arguments, or any other option (`DETAIL`,
   `HINT`, another `ERRCODE`) are outside it too.
@@ -1607,7 +1623,8 @@ a BEGIN block's EXCEPTION clause; it causes the error currently being
 handled to be re-thrown" (from memory). They lower to `reraise` only
 directly in a handler, at any depth of `IF`/`WHILE` but not inside a
 `TRY` or block nested in the handler (which error it means there is not
-written down for both: outside the spec). Not probed.
+written down for both: outside the spec). Probed, P8: the caller sees
+the original error (8134 severity 16; SQLSTATE 22012).
 
 **Error functions.** `ERROR_NUMBER()`, `ERROR_MESSAGE()`,
 `ERROR_SEVERITY()`, `ERROR_STATE()`, `ERROR_LINE()`,
@@ -1630,12 +1647,22 @@ from memory) to `COMMIT` (1 to 0, which "makes all data modifications
 ON` rolls it back and ends the routine ("SET XACT_ABORT": "the entire
 transaction is terminated and rolled back", V10), which the core shows as
 the failed call it is, the database after it not observed
-(`ASM-STATE-AFTER-ERROR` as before). A finished call shows the database
+(`ASM-STATE-AFTER-ERROR` as before). Probed: P9c, a caller without
+`TRY`: the batch ends and the transaction is rolled back (the statements
+before `BEGIN TRAN` stay). **But** P9 and P9d: a caller that catches the
+error gets control back with the routine's transaction still open and
+doomed (`@@TRANCOUNT = 1`, `XACT_STATE() = -1`, the routine's rows still
+visible to it, its own writes failing with 3930 until it rolls back; the
+batch rolls it back at its end, error 3998). PostgreSQL leaves no
+transaction open after a failed `CALL` (P9). A failed observation does
+not show the caller's transaction state, so the Rust side names this for
+every routine with a `BEGIN TRAN` outside a `TRY`
+(`ASM-TSQL-DOOMED-TXN`, crates/sqldiff-convert/src/cert.rs). A finished call shows the database
 with everything committed, as without the transaction, so `BEGIN TRAN`
 lowers to nothing and `COMMIT` to the core's `commit`, which does
 nothing. Outside the spec: a `COMMIT` without its `BEGIN TRAN` (error
 3902), a `BEGIN TRAN` without its `COMMIT` (error 266 at the end of the
-procedure, from memory), nesting (`@@TRANCOUNT` 2), a `RETURN` between
+procedure; probed, P10, with `@@TRANCOUNT = 1` left to the caller), nesting (`@@TRANCOUNT` 2), a `RETURN` between
 them, `ROLLBACK` except in the idiom below, `SAVE TRAN`, named
 transactions, and any of them inside `TRY`, `CATCH`, `IF` or `WHILE`.
 
@@ -1651,7 +1678,9 @@ the same error, so the routine fails with that error's kind, which is
 what the core's `b` does; the rollback changes only the database after a
 failed call, which a failed observation does not carry. When `b` does
 not fail, the handler does not run. The converter writes `b` without the
-handler (rule `idiom.rollback-rethrow`). Not probed.
+handler (rule `idiom.rollback-rethrow`). Probed, P11: the caller sees
+2627 with `@@TRANCOUNT = 0` and no row of `b` left, so no doomed
+transaction reaches it.
 
 **Transactions, PL/pgSQL.** `COMMIT` lowers to `commit`, only in a
 procedure that runs with its caller's privileges (not `SECURITY
@@ -1664,7 +1693,11 @@ cannot execute transaction control statements" (V17). The last is
 outside a transaction block, from a chain of `CALL`s and `DO`s only.
 Then `COMMIT` cannot fail and changes nothing a finished call shows.
 `ROLLBACK`, `COMMIT AND CHAIN` and the rest are outside the spec.
-Not probed.
+Probed: P9 (an error ends a top-level `CALL` and rolls back all its
+writes), P9b (a `COMMIT` keeps what came before it), P13 (`COMMIT` in a
+block with a handler: "cannot commit while a subtransaction is active";
+in a `SECURITY DEFINER` procedure and in a `CALL` inside a transaction
+block: "invalid transaction termination").
 
 **Only in procedures.** A T-SQL function cannot contain `TRY`/`CATCH`,
 `THROW` or transaction statements ("CREATE FUNCTION (Transact-SQL)": the
