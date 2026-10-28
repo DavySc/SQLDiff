@@ -20,7 +20,7 @@ An **idiom** has one canonical node and a form per dialect:
   (form postgres
     (insert (table ?t) (cols ?c...) (values (row ?v...)) (on-conflict (cols ?k...) (do-update (set ?sets...))))
     (bind ?conc atomic) (emit-any ?conc))
-  (require postgres (unique ?t ?k...) ASM-UPSERT-KEY-UNIQUE "...")
+  (require postgres (unique ?t ?k...) ASM-UPSERT-UNIQUE-INDEX "...")
   (note postgres decision "ON CONFLICT is atomic ..." (if ?conc race)))
 ```
 

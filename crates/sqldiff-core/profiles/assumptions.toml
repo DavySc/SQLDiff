@@ -780,10 +780,17 @@ sites = ["sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]
 id = "ASM-SINGLE-ROW"
-statement = "The query returns one row (the emitting rule says whether none is allowed)."
+statement = "The query returns at most one row."
 discharge = "catalog"
 fact = "A unique key over the query's predicate."
-sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-EXACTLY-ONE-ROW"
+statement = "The query returns exactly one row: with none, T-SQL keeps the variable and PostgreSQL sets it to NULL."
+discharge = "deployment"
+fact = "The data: a row always exists for the predicate (a unique key alone gives at most one)."
+sites = ["sqldiff-core/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-SMALLDATETIME"
@@ -1051,10 +1058,17 @@ sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-UPSERT-KEY-UNIQUE"
-statement = "A unique index or constraint covers the upsert's key columns."
+statement = "The MERGE match columns are a unique key of the target."
+discharge = "catalog"
+fact = "A unique key on the match columns."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-UPSERT-UNIQUE-INDEX"
+statement = "A unique index or constraint covers the upsert's key columns, as ON CONFLICT requires."
 discharge = "catalog"
 fact = "A unique index or constraint on the key columns."
-sites = ["sqldiff-core/profiles/rules/idioms.rules", "sqldiff-core/src/equiv/canon.rs"]
+sites = ["sqldiff-core/profiles/rules/idioms.rules"]
 
 [[assumption]]
 id = "ASM-USER-TYPE"

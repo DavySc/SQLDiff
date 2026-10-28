@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 45 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 46 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 17 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 67 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 68 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 26 |
-| | Total | 155 |
+| | Total | 157 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -99,6 +99,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-DB2I-RESERVED-UNCHECKED` | A name is not a Db2 for i reserved word (no verified list is built in). | `nothing` | A verified reserved-word list, or the name created on a real system. | `sqldiff-convert/src/names.rs` |
 | `ASM-DBO-SCHEMA` | Objects in T-SQL schema dbo are found in the target's default schema (search_path, CURRENT SCHEMA or library list). | `deployment` | The target's default schema holds the converted objects. (fact key `default_schema`) | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-DEFAULT-SCHEMA` | Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides. | `deployment` | The default schema in effect on both sides. (fact key `default_schema`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-EXACTLY-ONE-ROW` | The query returns exactly one row: with none, T-SQL keeps the variable and PostgreSQL sets it to NULL. | `deployment` | The data: a row always exists for the predicate (a unique key alone gives at most one). | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-EXTPROP-COMMENT` | Whoever reads the T-SQL extended property reads the target's comment instead (one unnamed comment per object). | `deployment` | The tools that read the property. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-FACT-*` | A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2). | `nothing` | The vendor fact checked on a real system (docs/vendor-facts-verification.md). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-FRACTIONAL-SECONDS` | Time values need at most 6 fractional digits (T-SQL keeps 7, the target rounds the last). | `deployment` | The data has at most microsecond precision. | `sqldiff-convert/src/tsql.rs` |
@@ -144,7 +145,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-SCHEMA-OWNER` | The schema's owner on the target holds the privileges its owner holds on the source. | `deployment` | The roles and grants of the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-SELECT-ASSIGN-CARDINALITY` | A query that assigns variables returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-SEQUENCE-TYPE` | Expressions that use a sequence's next value do not depend on its data type beyond the values it hands out. | `deployment` | How callers use the sequence's values. | `sqldiff-core/src/equiv/ddl.rs` |
-| `ASM-SINGLE-ROW` | The query returns one row (the emitting rule says whether none is allowed). | `catalog` | A unique key over the query's predicate. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-SINGLE-ROW` | The query returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SMALLDATETIME` | Values written to a converted SMALLDATETIME are whole minutes (T-SQL rounds, TIMESTAMP(0) keeps seconds). | `generated` | A rounding in the converted writes, or callers that write whole minutes. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TABLE-VARIABLE` | A table variable converted to a job-scoped temporary table is not read after the batch that filled it. | `deployment` | How the job runs the code. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TEMP-TABLE` | A #temp table converted to a session- or job-scoped temporary table is not created twice in one session. | `deployment` | How sessions run the code. | `sqldiff-convert/src/tsql.rs` |
@@ -182,7 +183,8 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-UNTYPED-CAST` | Values of unknown type that are cast convert the same on both sides (integers, or strings to strings). | `catalog` | The values' types. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-UNTYPED-NONCHAR` | Values of unknown type are not character strings, real, T-SQL tinyint or 38-digit decimals. | `catalog` | The values' types. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-UNTYPED-STORE` | Values stored in columns or variables of unknown type convert the same on both sides. | `catalog` | The columns' and variables' types. | `sqldiff-core/src/equiv/canon.rs` |
-| `ASM-UPSERT-KEY-UNIQUE` | A unique index or constraint covers the upsert's key columns. | `catalog` | A unique index or constraint on the key columns. | `sqldiff-core/profiles/rules/idioms.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-UPSERT-KEY-UNIQUE` | The MERGE match columns are a unique key of the target. | `catalog` | A unique key on the match columns. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-UPSERT-UNIQUE-INDEX` | A unique index or constraint covers the upsert's key columns, as ON CONFLICT requires. | `catalog` | A unique index or constraint on the key columns. | `sqldiff-core/profiles/rules/idioms.rules` |
 | `ASM-USER-TYPE` | A type without a conversion rule exists on the target under the same name. | `catalog` | The type in the target catalog. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-UUID-CHAR` | Nobody relies on uniqueidentifier ordering or case-insensitive comparison of a GUID stored as CHAR(36). | `deployment` | How callers compare and order the values. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-UUID-TEXT` | A UUID generated as upper-case CHAR(36) is used like T-SQL's uniqueidentifier (and the target release has GENERATE_UUID). | `deployment` | How callers compare the values, and the target's IBM i release. | `sqldiff-convert/src/tsql.rs` |
