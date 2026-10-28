@@ -585,6 +585,9 @@ pub fn check_template(
     for u in &mut c.units {
         let (ss, se) = frag.map.src_range(u.src.start, u.src.end);
         u.src = span(&t.text, &li, &ui, (ss, se));
+        for st in &mut u.trace {
+            (st.start, st.end) = frag.map.src_range(st.start, st.end);
+        }
         let (os, oe) = (shift(u.out.start), shift(u.out.end));
         u.out = span(&out, &lo, &uo, (os, oe.max(os)));
         if u.status == Status::NotConverted {
@@ -920,6 +923,7 @@ fn leaked(
             rule: "template.context-leak".into(),
             text: why.clone(),
         }],
+        trace: Vec::new(),
         src: all,
         out: all,
         findings: Vec::new(),
@@ -998,6 +1002,7 @@ pub fn split_pair(c: Conversion, head: &str, foot: &str, marker: &str) -> (Conve
                     rule: "template.pair-split".into(),
                     text: "This routine's opening and closing templates were converted together, and the conversion moved code across the line between them, so neither can be converted on its own: convert them by hand and check the woven instances.".into(),
                 }],
+                trace: Vec::new(),
                 src: all,
                 out: all,
                 findings: Vec::new(),
@@ -1014,11 +1019,19 @@ pub fn split_pair(c: Conversion, head: &str, foot: &str, marker: &str) -> (Conve
     for mut u in c.units.clone() {
         if u.src.start < head.len() {
             u.src.end = u.src.end.min(head.len());
+            for st in &mut u.trace {
+                st.start = st.start.min(head.len());
+                st.end = st.end.min(head.len());
+            }
             u.out.end = u.out.end.min(line);
             h.push(u);
         } else {
             u.src.start = u.src.start.max(foot_in) - foot_in;
             u.src.end = u.src.end.max(foot_in) - foot_in;
+            for st in &mut u.trace {
+                st.start = st.start.max(foot_in) - foot_in;
+                st.end = st.end.max(foot_in) - foot_in;
+            }
             u.out.start = u.out.start.max(next) - next;
             u.out.end = u.out.end.max(next) - next;
             f.push(u);

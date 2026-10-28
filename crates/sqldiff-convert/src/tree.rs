@@ -204,11 +204,16 @@ pub struct UnitReport {
     /// 1-based lines in the input file and in the written output file.
     pub src_line: usize,
     pub out_line: usize,
+    /// Rules of the unit's worst notes (what decides its status); empty for
+    /// a converted unit, which has none. The rewrites themselves are `trace`.
     pub rules: Vec<String>,
     pub reason: String,
     /// Rules of the engine's findings (diff and output check) on this unit,
     /// gating or not.
     pub findings: Vec<String>,
+    /// Every rewrite the rules made in this unit (rule id, input byte span,
+    /// instantiation), converted units included: the certificate's trace.
+    pub trace: Vec<crate::Step>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<UnitReviewReport>,
     /// The unit's assumptions the deployment profile accepts. The unit is
@@ -1368,6 +1373,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
             },
             reason,
             findings,
+            trace: u.trace.clone(),
             review: None,
             accepted: Vec::new(),
         };
