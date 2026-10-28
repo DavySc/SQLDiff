@@ -591,13 +591,21 @@ def Stmt.violates : Stmt → Bool
   | .update t sets _ => sets.any fun p => t.requires p.1 && !p.2.nonNull t
   | _ => false
 
-/-- The statement itself (not the statements inside it) can fail. -/
+/-- The statement itself (not the statements inside it) can fail. A call
+always can: the callee's own errors (a duplicate key, an overflow, its
+`THROW`) are not in the core, where `WorldModel.call` does not fail, but
+they reach the caller in both engines. So a T-SQL routine with a call is
+in the C2a slice only when it aborts on errors (`Sqldiff.Mirror.inC2a`):
+without `XACT_ABORT ON` SQL Server goes on after the failed `EXEC` (the
+failing statement inside the callee is rolled back, and the callee and
+then the caller carry on), while PostgreSQL's `CALL` fails and ends the
+caller. -/
 def Stmt.failsHere : Stmt → Bool
   | .assign _ e => e.raise
   | .ret (some e) => e.raise
   | .ite c .. => c.raise
   | .while c _ => c.raise
-  | .call _ args => args.any fun | .val e => e.raise | .ref _ => false
+  | .call .. => true
   | .insert t cs rows => (Stmt.insert t cs rows).violates || rows.flatten.any Expr.raise
   | .update t sets c =>
     (Stmt.update t sets c).violates || sets.any (fun p => p.2.raise) || c.any Expr.raise
@@ -641,6 +649,8 @@ def Stmt.errAfterWrite (w : Bool) : Stmt → Bool
   -- An error of the body is handled; the handler starts from the
   -- database the body began with when `undo`, else from what it left.
   | .tryCatch u b h => h.errAfterWrite (w || (!u && b.hasWrite))
+  -- A callee may write and then fail (`failsHere`).
+  | .call .. => true
   | s => w && s.failsHere
 
 /-- The data statements are in the C3a slice (`Sqldiff.Mirror`, "The C3a
@@ -660,8 +670,8 @@ def Stmt.dmlSafe : Stmt → Bool
   | .while _ b => b.dmlSafe
   | _ => true
 
-/-- Some run of the routine might fail: an expression can raise, or a
-data statement can violate a constraint. -/
+/-- Some run of the routine might fail: an expression can raise, a
+data statement can violate a constraint, or a callee can fail. -/
 def Routine.mayFail (r : Routine) : Bool :=
   r.params.any (fun p => p.default.any Expr.raise) || r.body.mayFail
 

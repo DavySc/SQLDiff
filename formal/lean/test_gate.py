@@ -412,7 +412,79 @@ cases += [
     ("66", req3e(66, id_t([try_([INS_T], [throw(50001, "dup")])]),
                  id_p([try_([INS_P], [raise_("dup", level="NOTICE")], ["others"])])), "unconfirmed"),
 ]
+
+# Soundness fixes (checker 0.8.0).
+
+
+def func(name, params, ret, body):
+    return C("Routine", C("Function"), L(*map(S, name)), L(*params), ret, C("Caller"), NONE,
+             C("Block", L(), L(*body)))
+
+
+def dparam(n, t, default):
+    return C("Param", S(n), t, C("In"), default)
+
+
+R_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@r", "r"), ("@s", "s"), ("%status", "%status")])
+
+
+def callee_t(pre):
+    return proc(["dbo", "p"], [param("@a", "In"), param("@r", "InOut")], [],
+                pre + [assign(tv("@r"), num(0)), call(["dbo", "log_value"], (tv("@a"), "f")),
+                       assign(tv("@r"), num(1))])
+
+
+CALLEE_P = proc(["p"], [param("a", "In"), param("r", "InOut")], [],
+                [assign(pv("r"), num(0)), call(["log_value"], (pv("a"), "f")), assign(pv("r"), num(1))])
+
+
+def two_brackets(handler):
+    return id_t([try_([txn("BEGIN"), INS_T, txn("COMMIT"), assign(tv("@id"), bin_("/", num(10), tv("@id"))),
+                       txn("BEGIN"), BUMP_T, txn("COMMIT")], handler)])
+
+
+TWO_BRACKETS_P = id_p([INS_P, txn("COMMIT"), assign(pv("p_id"), bin_("/", num(10), pv("p_id"))),
+                       BUMP_P, txn("COMMIT")])
+cases += [
+    # Parameter and return types are compared: varchar(10) against integer.
+    ("67", req3(67, a=func(["dbo", "f"], [sparam("@a", "In", VC10)], VC10, [C("NStmt", C("Return", tv("@a")))]),
+                b=func(["f"], [sparam("a", "In", INT)], INT, [C("NStmt", C("Return", pv("a")))]),
+                dep="0", cat="-", cert=f"{hx('@a')}:{hx('a')}"), "unconfirmed"),
+    # A parameter default T-SQL truncates ('abcdef' into varchar(3)) and PostgreSQL keeps.
+    ("68", req3(68, a=proc(["dbo", "pd"], [sparam("@r", "InOut", VC10), dparam("@s", VC3, string("abcdef"))], [],
+                           [assign(tv("@r"), tv("@s"))]),
+                b=proc(["pd"], [sparam("r", "InOut", VC10), dparam("s", VC3, string("abcdef"))], [],
+                       [assign(pv("r"), pv("s"))]),
+                dep="0", cat="-", cert=R_CERT), "unconfirmed"),
+    # A default that fits is in the slice (r is text: a PostgreSQL parameter
+    # is read without its length, so s fits only an unbounded target).
+    ("69", req3(69, a=proc(["dbo", "pd"], [sparam("@r", "InOut", VC10), dparam("@s", VC3, string("abc"))], [],
+                           [assign(tv("@r"), tv("@s"))]),
+                b=proc(["pd"], [sparam("r", "InOut", TEXT), dparam("s", VC3, string("abc"))], [],
+                       [assign(pv("r"), pv("s"))]),
+                dep="0", cat="-", cert=R_CERT), "confirmed"),
+    # A call without XACT_ABORT ON: the callee's error lets T-SQL go on and
+    # ends the PostgreSQL CALL, so not a C2a answer.
+    ("70", req3(70, a=callee_t([]), b=CALLEE_P, cert=PAIR_CERT), "confirmed"),
+    ("71", req3(71, a=callee_t([ABORT]), b=CALLEE_P, cert=PAIR_CERT), "confirmed"),
+    # ERRCODE = 'p0001' is not P0001 (PostgreSQL: 42704).
+    ("72", req3e(72, id_t([try_([INS_T], [throw(50001, "dup")])]),
+                 id_p([try_([INS_P], [raise_("dup", code="p0001")], ["others"])])), "unconfirmed"),
+    # Unguarded ROLLBACK; THROW; around two brackets: an error between them
+    # finds no transaction open (3903).
+    ("73", req3e(73, two_brackets([txn("ROLLBACK"), RETHROW]), TWO_BRACKETS_P), "unconfirmed"),
+    # The guarded form is fine.
+    ("74", req3e(74, two_brackets([ROLLBACK_IF_OPEN, RETHROW]), TWO_BRACKETS_P), "confirmed"),
+    # The idiom inside an IF: no transaction statements there.
+    ("75", req3e(75, id_t([C("If", bin_(">", tv("@id"), num(0)),
+                             L(try_([txn("BEGIN"), INS_T, txn("COMMIT")], [ROLLBACK_IF_OPEN, RETHROW])), L())]),
+                 id_p([C("If", bin_(">", pv("p_id"), num(0)), L(INS_P, txn("COMMIT")), L())])), "unconfirmed"),
+]
 THEOREMS = {
+    "69": "Sqldiff.Mirror.check_sound_c2a",
+    "70": "Sqldiff.Mirror.check_sound",
+    "71": "Sqldiff.Mirror.check_sound_c2a",
+    "74": "Sqldiff.Mirror.check_sound_c2a",
     "60": "Sqldiff.Mirror.check_sound_c2a",
     "61": "Sqldiff.Mirror.check_sound_c2a",
     "62": "Sqldiff.Mirror.check_sound_c2a",
@@ -432,7 +504,15 @@ THEOREMS = {
 EXTRA = {
     "31": {"scalars": "uninterpreted", "statements": "c1"},
     "40": {"scalars": "uninterpreted", "statements": "c1"},
-    "41": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS"], "statements": "c1"},
+    # The call to log_value can fail after the callee wrote (0.8.0).
+    "41": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR"],
+           "statements": "c1"},
+    "69": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
+    "70": {"scalars": "uninterpreted", "statements": "c1"},
+    "71": {"scalars": "c2a", "residual": ["ASM-STATE-AFTER-ERROR"], "statements": "c1"},
+    "74": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-NO-CALLER-TXN"],
+           "statements": "c3a", "errors": "c4"},
     "42": {"scalars": "c2a", "residual": [], "statements": "c1"},
     "44": {"scalars": "c2a",
            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR"],

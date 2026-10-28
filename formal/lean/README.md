@@ -60,6 +60,20 @@ structure, variables, parameters, calls and the T-SQL return status, not
 about real T-SQL against real PostgreSQL expressions. There is no data
 (C3) and no error handling (C4).
 
+**Parameter and return types** (checker 0.8.0). The lowered routines
+carry no types, so the check also compares the declared type of each
+parameter, position by position, and the return types
+(`Sqldiff.Mirror.sigCorr`, "Parameter and return types" in
+`Sqldiff/Mirror/Lower.lean`): T-SQL `int`/`integer` with PostgreSQL
+`integer`/`int`/`int4`, a C2b string type with a C2b string type (any
+lengths: PostgreSQL drops a parameter's and a result's length), and on
+the C1 path only `bigint` and `smallint` with themselves; any other pair
+is answered "the parameter or return types do not correspond". A
+procedure's trailing `INOUT return_code` must be an integer. A parameter
+default must be NULL or a slice value that fits the declared type (T-SQL
+truncates a default, PostgreSQL, having dropped the length, does not),
+else the routine is outside the spec.
+
 ### Phase C2a: the first scalar slice
 
 The core now has values (NULL, three-valued booleans, 32-bit integers,
@@ -120,7 +134,9 @@ other type (`bigint`, `decimal`, strings, dates, `bit`, ...), casts and
 implicit conversions, function calls other than `COALESCE`/`ISNULL`,
 `%` with a variable divisor, simple `CASE`, `IN`, `BETWEEN`, `LIKE`,
 comparisons with a NULL literal, `AND`/`OR` over operands that can raise,
-and T-SQL routines whose expressions can raise but that do not start with
+and T-SQL routines whose expressions can raise, or that call a
+procedure (whose own errors the core does not model, so a call counts as
+able to fail, checker 0.8.0), but that do not start with
 `SET XACT_ABORT ON` (T-SQL goes on after a failed statement; PostgreSQL
 stops). For those the core still evaluates the slice parts exactly, but
 the answer also rests on the C1 caveat that runs raise no error.
@@ -291,12 +307,12 @@ page; **nothing is probed**: `eval/` has no run of any of it):
 | Both catch every error of the core (severity 14/16 in T-SQL; `OTHERS` misses only `query_canceled`/`assert_failure`) | "TRY...CATCH" (from memory), V10, V18 | no |
 | PostgreSQL rolls back the block's writes; T-SQL keeps them (settled by the check, above) | V18; "TRY...CATCH", "SET XACT_ABORT" (V10) | no |
 | An error in a handler leaves it; handlers nest | both pages (from memory) | no |
-| `THROW n, 'm', s` (`n` 50000..2147483647, `s` 0..255, literals) and `RAISE [EXCEPTION] 'f'` (no `%`) / `USING MESSAGE = 'm' [, ERRCODE = 'P0001']` raise `user` | "THROW (Transact-SQL)", PL/pgSQL "Errors and Messages" (from memory) | no |
+| `THROW n, 'm', s` (`n` 50000..2147483647, `s` 0..255, literals) and `RAISE [EXCEPTION] 'f'` (no `%`) / `USING MESSAGE = 'm' [, ERRCODE = 'P0001']` (exactly that spelling: `'p0001'` raises 42704) raise `user` | "THROW (Transact-SQL)", PL/pgSQL "Errors and Messages" (from memory) | no |
 | `THROW;` and `RAISE;` re-raise the handled error, only directly in a handler | same pages (from memory) | no |
 | `RAISERROR`, `RAISE NOTICE`, other `ERRCODE`s, `ERROR_NUMBER()` and the other error functions, `XACT_STATE()`, `@@ERROR`, `SQLSTATE`, `SQLERRM`, condition-specific handlers: outside | V10 (RAISERROR ignores XACT_ABORT) | n/a |
 | No call inside a handled body (a callee's errors are not in the core, its writes would differ) | n/a | n/a |
 | T-SQL `BEGIN TRAN ... COMMIT` as a bracket in the routine's own list (or in the idiom's body), under `SET XACT_ABORT ON`, nothing between them that returns, calls, handles or controls transactions; lowers to nothing and `commit` | "BEGIN/COMMIT TRANSACTION" (from memory), V10 | no |
-| The rollback-and-rethrow idiom (`IF @@TRANCOUNT > 0 ROLLBACK; THROW;`, or `ROLLBACK; THROW;` around a bracketed body), outside other handlers, lowers to its body | "ROLLBACK TRANSACTION", "THROW" (from memory) | no |
+| The rollback-and-rethrow idiom (`IF @@TRANCOUNT > 0 ROLLBACK; THROW;`, or `ROLLBACK; THROW;` around a body that is exactly one bracket), outside other handlers and outside `IF`/`WHILE`/nested blocks, lowers to its body (0.8.0: with two brackets an error between them finds no transaction, the `ROLLBACK` raises 3903, probed) | "ROLLBACK TRANSACTION", "THROW" (from memory) | no |
 | PL/pgSQL `COMMIT` only in a procedure without `SECURITY DEFINER`, outside exception blocks | V17 | no |
 | `TRY`, `THROW`, transactions only in T-SQL procedures | "CREATE FUNCTION (Transact-SQL)" (from memory) | n/a |
 
