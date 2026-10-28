@@ -355,7 +355,16 @@ output.
    scattered over 122 call sites with their text inline.
 8. **One model.** Decide how `ir/`, `ErrorTxn.tla` and
    `profiles/semantics/*.toml` relate to the future core (which is the
-   source, what is generated), before C4 writes the fourth copy.
+   source, what is generated), before C4 writes the fourth copy. Working
+   plan (2026-10-28):
+
+   | Artifact | Role from C4 on |
+   |---|---|
+   | The Lean core and the dialect lowerings (`formal/lean/Sqldiff/Core`) | The semantics: the only definition of what a T-SQL or PostgreSQL error, rollback or handler does |
+   | `profiles/semantics/*.toml` | Data with citations (error kinds, native codes, which settings exist). Generated into a Lean module the way `Syntax.lean` is generated from the Rust kinds, with a test that fails while it is stale, so the spec and the Rust code read one table |
+   | `formal/profiles/error-txn.toml` cases | The shared test vectors: each scenario with its expected outcome runs on the Lean core's executable interpreter, on the Rust `ir/` interpreter and, until it is retired, on TLC; any disagreement fails CI |
+   | `ErrorTxn.tla` | Ported to Lean in C4, then retired once the Lean core passes every case it passes |
+   | `ir/` | The untrusted Rust twin: it finds witnesses for "different" and may stay faster than the Lean interpreter; it is held to the shared cases, never trusted for "equal" |
 
 ## Decisions this needs
 

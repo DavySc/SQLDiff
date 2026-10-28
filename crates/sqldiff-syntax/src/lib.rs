@@ -7,11 +7,15 @@
 //! sections). PostgreSQL routine bodies in dollar-quoted strings are parsed
 //! as nested PL/pgSQL or SQL with offsets in the outer artifact.
 
+pub mod abstract_syntax;
 pub mod ast;
 pub mod dialect;
+pub mod encode;
 pub mod kind;
 pub mod lexer;
 mod parser;
+pub mod print;
+pub mod routine;
 pub mod template;
 
 pub use dialect::{Dialect, IdentFolding};

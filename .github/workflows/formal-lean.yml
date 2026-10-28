@@ -20,6 +20,7 @@ on:
       # The request format and the generated Lean syntax types.
       - "crates/sqldiff-core/src/proof.rs"
       - "crates/sqldiff-syntax/src/kind.rs"
+      - "crates/sqldiff-syntax/src/encode.rs"
   workflow_dispatch:
 
 jobs:

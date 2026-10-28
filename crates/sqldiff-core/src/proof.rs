@@ -231,6 +231,170 @@ fn write_node(node: &SyntaxNode, out: &mut String) {
     out.push(')');
 }
 
+/// The first 16 hex digits of the SHA-256 of the abstract syntax schema
+/// (`sqldiff_syntax::encode::SCHEMA`), which requests about abstract syntax
+/// carry.
+pub fn ast_schema_hash() -> String {
+    Sha256::digest(sqldiff_syntax::encode::SCHEMA.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The Lean module `formal/lean/Sqldiff/Ast.lean`, generated from
+/// `sqldiff_syntax::encode::SCHEMA`: the abstract syntax as Lean types and
+/// a decoder for the line encoding. `crates/sqldiff-core/tests/lean_syntax.rs`
+/// fails while the file in the tree is not this text.
+pub fn lean_ast() -> String {
+    use sqldiff_syntax::encode::{schema_types, FieldTy};
+    let types = schema_types();
+    let lean_ty = |t: &FieldTy| -> String {
+        fn go(t: &FieldTy) -> String {
+            match t {
+                FieldTy::Str => "String".into(),
+                FieldTy::Bool => "Bool".into(),
+                FieldTy::Named(n) => n.clone(),
+                FieldTy::List(x) => format!("(List {})", go(x)),
+                FieldTy::Opt(x) => format!("(Option {})", go(x)),
+            }
+        }
+        go(t)
+    };
+    // The decoder expression for a field of type `t` from the value `v`.
+    fn dec(t: &FieldTy, v: &str) -> String {
+        match t {
+            FieldTy::Str => format!("str? {v}"),
+            FieldTy::Bool => format!("bool? {v}"),
+            FieldTy::Named(n) => format!("decode{n} {v}"),
+            FieldTy::List(x) => format!("list? {v} (fun x => {})", dec(x, "x")),
+            FieldTy::Opt(x) => format!("opt? {v} (fun x => {})", dec(x, "x")),
+        }
+    }
+    let mut s = String::new();
+    s.push_str("/-\nGenerated from `sqldiff_syntax::encode::SCHEMA` by `sqldiff_core::proof::lean_ast`.\nDo not edit: run `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test lean_syntax`.\n\nThe abstract syntax the Rust parser reads, as Lean types, and the decoder\nfor its one-line encoding (`sqldiff_syntax::encode`). A line decodes only\nif it is exactly a value of the schema.\n-/\n\n");
+    s.push_str("namespace Sqldiff.Ast\n\n");
+    s.push_str("/-- The schema hash requests about abstract syntax carry (`sqldiff_core::proof::ast_schema_hash`). -/\n");
+    let _ = writeln!(s, "def schemaHash : String := \"{}\"\n", ast_schema_hash());
+    s.push_str("mutual\n");
+    for t in &types {
+        let _ = writeln!(s, "  inductive {} where", t.name);
+        for c in &t.ctors {
+            let mut line = format!("    | {}", c.name);
+            for (f, ft) in &c.fields {
+                let _ = write!(line, " («{f}» : {})", lean_ty(ft));
+            }
+            let _ = writeln!(s, "{line}");
+        }
+    }
+    s.push_str("end\n\n");
+    s.push_str(
+        r#"/-- A line in its generic form (`sqldiff_syntax::encode::Value`). -/
+inductive Value where
+  | ctor (tag : String) (kids : List Value)
+  | list (xs : List Value)
+  | str (hex : String)
+  | none
+  | bool (b : Bool)
+
+private def isHexDigit (c : Char) : Bool := c.isDigit || ('a' ≤ c && c ≤ 'f')
+
+private def hexVal (c : Char) : Nat :=
+  if c.isDigit then c.toNat - '0'.toNat else c.toNat - 'a'.toNat + 10
+
+mutual
+  private partial def value : List Char → Option (Value × List Char)
+    | '(' :: rest =>
+      let tag := rest.takeWhile Char.isAlphanum
+      if tag.isEmpty then none
+      else match fields (rest.drop tag.length) with
+        | some (kids, ')' :: rest) => some (.ctor (String.ofList tag) kids, rest)
+        | _ => none
+    | '[' :: ']' :: rest => some (.list [], rest)
+    | '[' :: rest =>
+      match value rest with
+      | some (x, rest) =>
+        match fields rest with
+        | some (xs, ']' :: rest) => some (.list (x :: xs), rest)
+        | _ => none
+      | none => none
+    | 's' :: ':' :: rest =>
+      let h := rest.takeWhile isHexDigit
+      if h.length % 2 == 0 then some (.str (String.ofList h), rest.drop h.length) else none
+    | '-' :: rest => some (.none, rest)
+    | 't' :: rest => some (.bool true, rest)
+    | 'f' :: rest => some (.bool false, rest)
+    | _ => none
+
+  /-- ` v` repeated. -/
+  private partial def fields : List Char → Option (List Value × List Char)
+    | ' ' :: rest =>
+      match value rest with
+      | some (x, rest) =>
+        match fields rest with
+        | some (xs, rest) => some (x :: xs, rest)
+        | none => none
+      | none => none
+    | cs => some ([], cs)
+end
+
+/-- The value a whole line holds, if it is exactly one value. -/
+def parseLine (s : String) : Option Value :=
+  match value s.toList with
+  | some (v, []) => some v
+  | _ => none
+
+private def bytes : List Char → Option (List UInt8)
+  | a :: b :: rest => (bytes rest).map (fun bs => (hexVal a * 16 + hexVal b).toUInt8 :: bs)
+  | [] => some []
+  | _ => none
+
+private def str? : Value → Option String
+  | .str h => (bytes h.toList).bind (fun bs => String.fromUTF8? ⟨bs.toArray⟩)
+  | _ => none
+
+private def bool? : Value → Option Bool
+  | .bool b => some b
+  | _ => none
+
+private def list? {α : Type} : Value → (Value → Option α) → Option (List α)
+  | .list xs, f => xs.mapM f
+  | _, _ => none
+
+private def opt? {α : Type} : Value → (Value → Option α) → Option (Option α)
+  | .none, _ => some none
+  | v, f => (f v).map some
+
+"#,
+    );
+    s.push_str("mutual\n");
+    for t in &types {
+        let _ = writeln!(
+            s,
+            "  partial def decode{} : Value → Option {}",
+            t.name, t.name
+        );
+        for c in &t.ctors {
+            let vars: Vec<String> = (0..c.fields.len()).map(|i| format!("v{i}")).collect();
+            let _ = write!(s, "    | .ctor \"{}\" [{}] => ", c.name, vars.join(", "));
+            if c.fields.is_empty() {
+                let _ = writeln!(s, "some .{}", c.name);
+                continue;
+            }
+            s.push_str("do\n");
+            for (i, (_, ft)) in c.fields.iter().enumerate() {
+                let _ = writeln!(s, "      let x{i} ← {}", dec(ft, &format!("v{i}")));
+            }
+            let xs: Vec<String> = (0..c.fields.len()).map(|i| format!("x{i}")).collect();
+            let _ = writeln!(s, "      pure (.{} {})", c.name, xs.join(" "));
+        }
+        s.push_str("    | _ => none\n");
+    }
+    s.push_str("end\n\n");
+    s.push_str("/-- A routine from its line, if the line is exactly one. -/\ndef decodeRoutineLine (s : String) : Option Routine := (parseLine s).bind decodeRoutine\n\n");
+    s.push_str("end Sqldiff.Ast\n");
+    s
+}
+
 /// Runs the gate on a finished diff report.
 pub(crate) fn apply(r: &mut Report, a: &Analyzed, b: &Analyzed, s: &Settings) {
     if s.mode == Mode::Off {
