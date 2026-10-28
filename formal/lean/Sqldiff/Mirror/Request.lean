@@ -15,6 +15,9 @@ string in lower-case hex, two digits per byte:
                                      letter per parameter: i IN, o OUT, b INOUT
   CERT        - or PAIR,PAIR,...     PAIR is NAME:NAME, a T-SQL variable and its
                                      PL/pgSQL name
+
+The answer: `check`, plus the fields `extra` adds to a confirmed answer
+(`"scalars"`, and `"residual"` for a C2a answer; see `Main.lean`).
 -/
 import Sqldiff.Ast
 import Sqldiff.Mirror.Check
@@ -88,6 +91,29 @@ def answer (schema dep cat cert ra rb : String) : Answer :=
     | none, _, _ => .unconfirmed "the deployment does not decode"
     | _, none, _ => .unconfirmed "the catalog does not decode"
     | _, _, none => .unconfirmed "the certificate does not decode"
+
+/-- What a confirmed `mirror` answer adds to the `/3` JSON line, after
+`theorem` (`Main.lean`); nothing for an unconfirmed one. Fields are only
+ever added, so a reader of the C1 answer keeps working.
+
+* `"scalars"`: `"c2a"` when the answer names
+  `Sqldiff.Mirror.check_sound_c2a` (both routines in the C2a slice: the
+  confirmation does not rest on `ASM-C1-OPERATORS`), `"uninterpreted"`
+  when it names `Sqldiff.Mirror.check_sound` (it does).
+* `"residual"`, with `"c2a"` only: the session facts the confirmation
+  still rests on (`Sqldiff.Mirror.residual`), an array of assumption
+  names, possibly empty. -/
+def extra (dep ra : String) (ans : Answer) : String :=
+  match ans with
+  | .unconfirmed _ => ""
+  | .confirmed t =>
+    if t == theoremC2a then
+      let names := match deployment? dep, Ast.decodeRoutineLine ra with
+        | some d, some a => ((lowerT d a).map residual).getD []
+        | _, _ => []
+      let items := ",".intercalate (names.map fun n => "\"" ++ n ++ "\"")
+      ",\"scalars\":\"c2a\",\"residual\":[" ++ items ++ "]"
+    else ",\"scalars\":\"uninterpreted\""
 
 #guard name? "40785f31" == some "@x_1"
 #guard name? "4" == none

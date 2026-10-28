@@ -9,7 +9,7 @@ import Sqldiff.Mirror.Check
 
 namespace Sqldiff.Mirror.Examples
 
-open Sqldiff.Core (ExprSem WorldModel Obs CallEvent)
+open Sqldiff.Core (ExprSem WorldModel Obs CallEvent SExpr)
 open Sqldiff.Gate (Answer)
 
 def isConfirmed : Answer → Bool
@@ -306,49 +306,52 @@ def plainCert : Cert := ⟨[("@n", "n"), (statusVar, statusVar)]⟩
 
 /-! ## The core as an executable oracle
 
-Values are `Option Int` (`none` is NULL); operators get their integer
-meaning; `log_value` counts its calls in the world and adds its first
-argument to its second. -/
+Values of type `Val Unit`: the routines below are in the slice, so no
+uninterpreted operator is evaluated (`es` fails if one were). `log_value`
+counts its calls in the world and adds its first argument to its
+second. -/
 
-def es : ExprSem (Option Int) where
-  null := none
-  lit n := some n
-  op
-    | "bin:>", [some a, some b] => some (if a > b then 1 else 0)
-    | "bin:<", [some a, some b] => some (if a < b then 1 else 0)
-    | "bin:+", [some a, some b] => some (a + b)
-    | "fn:coalesce", [a, b] => a.orElse fun _ => b
-    | _, _ => none
-  truthy v := v == some 1
+abbrev V := Core.Val Unit
+def I (n : Int) : V := .int n
+def N : V := .null
 
-def wm : WorldModel (Option Int) Nat where
+def es : ExprSem Unit := ⟨fun _ _ => .err (.other "op")⟩
+
+def addV : V → V → V
+  | .int x, .int y => .int (x + y)
+  | _, _ => .null
+
+def wm : WorldModel Unit Nat where
   call
-    | "log_value", [v, b], w => (w + 1, [v, (fun x y => x + y) <$> v <*> b, some 0])
+    | "log_value", [v, b], w => (w + 1, [v, addV v b, .int 0])
     | _, vs, w => (w, vs)
 
-def run (r : Option Core.Routine) (args : List (Option Int)) (fuel : Nat) :
-    Option (Obs (Option Int) Nat) :=
+def run (r : Option Core.Routine) (args : List V) (fuel : Nat) : Option (Obs Unit Nat) :=
   r.map fun r => r.obs es wm args 0 fuel
 
 def T := lowerT dep srcT
 def P := lowerP Γ mirrorP
 
 -- `@a = 5`: `@x` goes 2 to 10, `@b` becomes 7 + 10, the status is 10.
-#guard run T [some 5, some 7] 100 ==
-  some (.done [some 17, some 10] none 1 [⟨"log_value", [some 10, some 7]⟩])
-#guard run P [some 5, some 7] 100 == run T [some 5, some 7] 100
+#guard run T [I 5, I 7] 100 ==
+  some (.done [I 17, I 10] none 1 [⟨"log_value", [I 10, I 7]⟩])
+#guard run P [I 5, I 7] 100 == run T [I 5, I 7] 100
 -- `@b` omitted: its default 2.
-#guard run T [some (-3)] 100 ==
-  some (.done [some 12, some 10] none 1 [⟨"log_value", [some 10, some 2]⟩])
-#guard run P [some (-3)] 100 == run T [some (-3)] 100
+#guard run T [I (-3)] 100 ==
+  some (.done [I 12, I 10] none 1 [⟨"log_value", [I 10, I 2]⟩])
+#guard run P [I (-3)] 100 == run T [I (-3)] 100
+-- `@a` NULL: `@a > 1` and `@a < 0` are UNKNOWN, so the last `ELSE` runs.
+#guard run T [N, I 7] 100 ==
+  some (.done [I 17, I 10] none 1 [⟨"log_value", [I 10, I 7]⟩])
+#guard run P [N, I 7] 100 == run T [N, I 7] 100
 -- Too little fuel: both cut off at the same point.
-#guard run T [some 5, some 7] 4 == run P [some 5, some 7] 4
-#guard match run T [some 5, some 7] 4 with
+#guard run T [I 5, I 7] 4 == run P [I 5, I 7] 4
+#guard match run T [I 5, I 7] 4 with
   | some (.pending _ []) => true
   | _ => false
 
 -- Today's output agrees here, because `v_x` is never NULL ...
-#guard run (lowerP Γ todayP) [some 5, some 7] 100 == run T [some 5, some 7] 100
+#guard run (lowerP Γ todayP) [I 5, I 7] 100 == run T [I 5, I 7] 100
 
 /- ... but not in general. `RETURN @x` with `@x` NULL returns status 0;
 `return_code := v_x` gives NULL. And a procedure that ends without
@@ -357,12 +360,345 @@ def P := lowerP Γ mirrorP
 def nullT : Ast.Routine := tsqlProc ["s"] [] [declT "@x" none, ret (some (tv "@x"))]
 def nullP : Ast.Routine := pgProc ["s"] [returnCode] [declP "v_x" none]
   [set (pv "return_code") (pv "v_x"), ret none]
-#guard run (lowerT dep nullT) [] 10 == some (.done [some 0] none 0 [])
-#guard run (lowerP [] nullP) [] 10 == some (.done [none] none 0 [])
+#guard run (lowerT dep nullT) [] 10 == some (.done [I 0] none 0 [])
+#guard run (lowerP [] nullP) [] 10 == some (.done [N] none 0 [])
 
 def endT : Ast.Routine := tsqlProc ["s"] [] []
 def endP : Ast.Routine := pgProc ["s"] [returnCode] [] []
-#guard run (lowerT dep endT) [] 10 == some (.done [some 0] none 0 [])
-#guard run (lowerP [] endP) [] 10 == some (.done [none] none 0 [])
+#guard run (lowerT dep endT) [] 10 == some (.done [I 0] none 0 [])
+#guard run (lowerP [] endP) [] 10 == some (.done [N] none 0 [])
+
+/-! ## C2a: the scalar slice
+
+Which theorem a confirmation names: `check_sound_c2a` when every
+expression of both routines is in the slice (and the T-SQL routine aborts
+on errors or cannot raise one), `check_sound` otherwise. -/
+
+def theoremOf : Answer → String
+  | .confirmed t => t
+  | .unconfirmed _ => ""
+
+def isC2a (a : Answer) : Bool := theoremOf a == theoremC2a
+def isC1 (a : Answer) : Bool := theoremOf a == theoremC1
+
+def bigint : Ast.Ty := .Ty "BIGINT" []
+def xactAbort : Ast.Node := .Setting "XACT_ABORT" true
+def inP (x : String) (ty : Ast.Ty := integer) : Ast.Param := .Param x ty .In none
+def ioP (x : String) (ty : Ast.Ty := integer) : Ast.Param := .Param x ty .InOut none
+def inT (x : String) (ty : Ast.Ty := int) : Ast.Param := .Param x ty .In none
+def ioT (x : String) (ty : Ast.Ty := int) : Ast.Param := .Param x ty .InOut none
+
+/-- `@r = e` in T-SQL and `r := e'` in PL/pgSQL, with parameters `a`, `b`
+in and `r` in-out, the T-SQL side optionally under `XACT_ABORT ON`; the
+PL/pgSQL procedure has no `return_code` (its status is 0, as the T-SQL
+procedure's, `Sqldiff.Mirror.statusName`). -/
+def pairT (abort : Bool) (e : Ast.Expr) (ty : Ast.Ty := int) : Ast.Routine :=
+  tsqlProc ["r"] [inT "@a" ty, inT "@b" ty, ioT "@r" ty]
+    ((if abort then [xactAbort] else []) ++ [set (tv "@r") e])
+def pairP (e : Ast.Expr) (ty : Ast.Ty := integer) : Ast.Routine :=
+  pgProc ["r"] [inP "a" ty, inP "b" ty, ioP "r" ty] [] [set (pv "r") e]
+def pairCert : Cert := ⟨[("@a", "a"), ("@b", "b"), ("@r", "r"), (statusVar, statusVar)]⟩
+def checkPair (abort : Bool) (t p : Ast.Expr) : Answer :=
+  check dep [] pairCert (pairT abort t) (pairP p)
+def runPair (abort : Bool) (t p : Ast.Expr) (args : List V) :
+    Option (Obs Unit Nat) × Option (Obs Unit Nat) :=
+  (run (lowerT dep (pairT abort t)) args 20, run (lowerP [] (pairP p)) args 20)
+
+def ta : Ast.Expr := tv "@a"
+def tb : Ast.Expr := tv "@b"
+def pa : Ast.Expr := pv "a"
+def pb : Ast.Expr := pv "b"
+
+/-! ### Arithmetic: overflow and division by zero are error observations -/
+
+-- `@a / @b` against `a / b`, under `XACT_ABORT ON`: in the slice.
+#guard isC2a (checkPair true (.Bin "/" ta tb) (.Bin "/" pa pb))
+-- Without `XACT_ABORT ON` T-SQL goes on after the failed statement, so the
+-- confirmation stays on the C1 theorem.
+#guard isC1 (checkPair false (.Bin "/" ta tb) (.Bin "/" pa pb))
+-- Truncation toward zero, on both sides.
+#guard runPair true (.Bin "/" ta tb) (.Bin "/" pa pb) [I (-7), I 2, N] ==
+  (some (.done [I (-3), I 0] none 0 []), some (.done [I (-3), I 0] none 0 []))
+-- Division by zero: an arithmetic error ends both routines.
+#guard runPair true (.Bin "/" ta tb) (.Bin "/" pa pb) [I 1, I 0, I 5] ==
+  (some (.failed .arithmetic 0 []), some (.failed .arithmetic 0 []))
+-- `-2147483648 / -1` overflows.
+#guard runPair true (.Bin "/" ta tb) (.Bin "/" pa pb) [I (-2147483648), I (-1), N] ==
+  (some (.failed .arithmetic 0 []), some (.failed .arithmetic 0 []))
+-- NULL in, NULL out.
+#guard runPair true (.Bin "/" ta tb) (.Bin "/" pa pb) [N, I 0, I 5] ==
+  (some (.done [N, I 0] none 0 []), some (.done [N, I 0] none 0 []))
+-- `2147483647 + 1` overflows on both sides.
+#guard isC2a (checkPair true (.Bin "+" ta tb) (.Bin "+" pa pb))
+#guard runPair true (.Bin "+" ta tb) (.Bin "+" pa pb) [I 2147483647, I 1, N] ==
+  (some (.failed .arithmetic 0 []), some (.failed .arithmetic 0 []))
+-- `-(-2147483648)` overflows.
+#guard runPair true (.Unary "-" ta) (.Unary "-" pa) [I (-2147483648), N, N] ==
+  (some (.failed .arithmetic 0 []), some (.failed .arithmetic 0 []))
+#guard runPair true (.Unary "-" ta) (.Unary "-" pa) [I 5, N, N] ==
+  (some (.done [I (-5), I 0] none 0 []), some (.done [I (-5), I 0] none 0 []))
+-- The error keeps the calls made before it.
+def callThenDivT : Ast.Routine :=
+  tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"]
+    [xactAbort, .Call ["dbo", "log_value"] [arg ta false, arg (tv "@r") true] none,
+      set (tv "@r") (.Bin "/" ta tb)]
+def callThenDivP : Ast.Routine :=
+  pgProc ["r"] [inP "a", inP "b", ioP "r"] []
+    [.Call ["log_value"] [arg pa false, arg (pv "r") false] none, set (pv "r") (.Bin "/" pa pb)]
+#guard isC2a (check dep Γ pairCert callThenDivT callThenDivP)
+#guard run (lowerT dep callThenDivT) [I 1, I 0, I 2] 20 ==
+  some (.failed .arithmetic 1 [⟨"log_value", [I 1, I 2]⟩])
+#guard run (lowerP Γ callThenDivP) [I 1, I 0, I 2] 20 ==
+  run (lowerT dep callThenDivT) [I 1, I 0, I 2] 20
+
+-- The slice's meaning, operator by operator (`SExpr.eval`).
+def σ2 (a b : V) : Core.Store Unit := fun x => if x = "a" then a else if x = "b" then b else .null
+def ev (s : SExpr) (a b : V) : Core.Res Unit := s.eval (σ2 a b)
+#guard ev (.arith .div (.var "a") (.var "b")) (I 7) (I 2) == .ok (I 3)
+#guard ev (.arith .div (.var "a") (.var "b")) (I (-7)) (I 2) == .ok (I (-3))
+#guard ev (.arith .mod (.var "a") (.int 2)) (I (-7)) N == .ok (I (-1))
+#guard ev (.arith .mod (.var "a") (.int (-2))) (I 7) N == .ok (I 1)
+#guard ev (.arith .div (.var "a") (.var "b")) (I 1) (I 0) == .err .divByZero
+#guard ev (.arith .add (.var "a") (.var "b")) (I 2147483647) (I 1) == .err .overflow
+#guard ev (.arith .mul (.var "a") (.var "b")) (I 65536) (I 32768) == .err .overflow
+#guard ev (.arith .sub (.var "a") (.var "b")) (I (-2147483648)) (I 1) == .err .overflow
+#guard ev (.arith .div (.var "a") (.var "b")) (I (-2147483648)) (I (-1)) == .err .overflow
+#guard ev (.neg (.var "a")) (I (-2147483648)) N == .err .overflow
+-- A NULL operand gives NULL, but the other operand is still evaluated.
+#guard ev (.arith .add (.var "a") (.var "b")) N (I 1) == .ok N
+#guard ev (.arith .add (.var "a") (.arith .div (.var "b") (.int 0))) N (I 1) == .err .divByZero
+-- Three-valued comparisons and connectives.
+#guard ev (.cmp .eq (.var "a") (.var "b")) N N == .ok N
+#guard ev (.cmp .ne (.var "a") (.var "b")) (I 1) N == .ok N
+#guard ev (.cmp .lt (.var "a") (.var "b")) (I 1) (I 2) == .ok (.bool true)
+#guard ev (.and (.cmp .eq (.var "a") (.int 1)) (.cmp .eq (.var "b") (.int 1))) (I 2) N ==
+  .ok (.bool false)
+#guard ev (.and (.cmp .eq (.var "a") (.int 1)) (.cmp .eq (.var "b") (.int 1))) (I 1) N == .ok N
+#guard ev (.or (.cmp .eq (.var "a") (.int 1)) (.cmp .eq (.var "b") (.int 1))) (I 1) N ==
+  .ok (.bool true)
+#guard ev (.or (.cmp .eq (.var "a") (.int 1)) (.cmp .eq (.var "b") (.int 1))) (I 2) N == .ok N
+#guard ev (.not (.cmp .eq (.var "a") (.int 1))) N N == .ok N
+#guard ev (.isNull (.var "a") false) N N == .ok (.bool true)
+#guard ev (.isNull (.var "a") true) N N == .ok (.bool false)
+-- `COALESCE` and `CASE` evaluate only what they need.
+#guard ev (.coalesce (.var "a") (.arith .div (.int 1) (.var "b"))) (I 3) (I 0) == .ok (I 3)
+#guard ev (.coalesce (.var "a") (.arith .div (.int 1) (.var "b"))) N (I 0) == .err .divByZero
+#guard ev (.cond (.cmp .eq (.var "b") (.int 0)) .null (.arith .div (.var "a") (.var "b")))
+  (I 1) (I 0) == .ok N
+-- An UNKNOWN `WHEN` goes on to the next branch.
+#guard ev (.cond (.cmp .eq (.var "b") (.int 0)) (.int 1) (.int 2)) (I 1) N == .ok (I 2)
+
+/-! ### Comparisons with NULL and three-valued `IF`
+
+```sql
+CREATE PROCEDURE dbo.r @a int, @b int, @r int OUTPUT AS
+BEGIN
+  IF @a = @b SET @r = 1;
+  ELSE IF NOT (@a = @b) SET @r = 2;
+  ELSE SET @r = 3;
+END
+```
+
+With `@a` or `@b` NULL, `@a = @b` and `NOT (@a = @b)` are both UNKNOWN,
+so `@r` is 3. Nothing can raise, so no `XACT_ABORT` is needed. -/
+
+def ifT : Ast.Routine :=
+  tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [
+    .If (.Bin "=" ta tb) [set (tv "@r") (num 1)]
+      [.If (.Unary "NOT" (.Bin "=" ta tb)) [set (tv "@r") (num 2)] [set (tv "@r") (num 3)]]]
+def ifP : Ast.Routine :=
+  pgProc ["r"] [inP "a", inP "b", ioP "r"] [] [
+    .If (.Bin "=" pa pb) [set (pv "r") (num 1)]
+      [.If (.Unary "NOT" (.Bin "=" pa pb)) [set (pv "r") (num 2)] [set (pv "r") (num 3)]]]
+
+#guard isC2a (check dep [] pairCert ifT ifP)
+#guard run (lowerT dep ifT) [I 1, I 1, N] 20 == some (.done [I 1, I 0] none 0 [])
+#guard run (lowerT dep ifT) [I 1, I 2, N] 20 == some (.done [I 2, I 0] none 0 [])
+#guard run (lowerT dep ifT) [N, I 2, N] 20 == some (.done [I 3, I 0] none 0 [])
+#guard run (lowerP [] ifP) [N, I 2, N] 20 == run (lowerT dep ifT) [N, I 2, N] 20
+#guard run (lowerP [] ifP) [N, N, N] 20 == some (.done [I 3, I 0] none 0 [])
+-- Swapping the branches of an `IF` on a possibly UNKNOWN condition is not
+-- `IF NOT`: refused.
+#guard reasonOf (check dep [] pairCert ifT
+  (pgProc ["r"] [inP "a", inP "b", ioP "r"] [] [
+    .If (.Unary "NOT" (.Bin "=" pa pb)) [set (pv "r") (num 2)]
+      [.If (.Bin "=" pa pb) [set (pv "r") (num 1)] [set (pv "r") (num 3)]]])) ==
+  "the lowered routines differ beyond the renaming"
+-- `WHILE` on UNKNOWN does not loop.
+def whileT : Ast.Routine :=
+  tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [
+    set (tv "@r") (num 0),
+    .While (.Bin "<" (tv "@r") ta) [set (tv "@r") (.Bin "+" (tv "@r") (num 1))]]
+#guard run (lowerT dep whileT) [I 3, N, N] 20 == some (.done [I 3, I 0] none 0 [])
+#guard run (lowerT dep whileT) [N, N, N] 20 == some (.done [I 0, I 0] none 0 [])
+
+/-! ### `COALESCE` and `ISNULL` -/
+
+-- T-SQL `ISNULL(@a, @b)` with `int`s is PostgreSQL `COALESCE(a, b)`.
+#guard isC2a (checkPair false (fn "ISNULL" [ta, tb]) (fn "COALESCE" [pa, pb]))
+#guard isC2a (checkPair false (fn "COALESCE" [ta, tb]) (fn "COALESCE" [pa, pb]))
+#guard isC2a (checkPair false (fn "ISNULL" [ta, num 0]) (fn "COALESCE" [pa, num 0]))
+#guard isC2a (checkPair false (fn "COALESCE" [ta, tb, num 0]) (fn "COALESCE" [pa, pb, num 0]))
+#guard isC2a (checkPair false (fn "ISNULL" [ta, .Null]) (fn "COALESCE" [pa, .Null]))
+#guard runPair false (fn "ISNULL" [ta, tb]) (fn "COALESCE" [pa, pb]) [N, I 4, N] ==
+  (some (.done [I 4, I 0] none 0 []), some (.done [I 4, I 0] none 0 []))
+#guard runPair false (fn "ISNULL" [ta, tb]) (fn "COALESCE" [pa, pb]) [I 1, I 4, N] ==
+  (some (.done [I 1, I 0] none 0 []), some (.done [I 1, I 0] none 0 []))
+-- `ISNULL(NULL, @b)`: the first argument must be an `int` expression.
+#guard (typed (.tsql dep) [("@b", int)] (fn "ISNULL" [.Null, tb])).isNone
+-- `COALESCE(NULL, NULL)` has no `int` argument.
+#guard (typed (.tsql dep) [] (fn "COALESCE" [.Null, .Null])).isNone
+-- `COALESCE(x, y, z)` is not `COALESCE(COALESCE(x, y), z)` as a term.
+#guard reasonOf (checkPair false (fn "COALESCE" [ta, tb, num 0])
+    (fn "COALESCE" [fn "COALESCE" [pa, pb], num 0])) ==
+  "the lowered routines differ beyond the renaming"
+/- A replacement that can raise: whether T-SQL evaluates it when `@a` is
+not NULL is not documented, so `ISNULL` is outside the slice and does not
+lower like `COALESCE`. -/
+#guard reasonOf (checkPair true (fn "ISNULL" [ta, .Bin "+" tb (num 1)])
+    (fn "COALESCE" [pa, .Bin "+" pb (num 1)])) ==
+  "the lowered routines differ beyond the renaming"
+/- With `bigint` (outside the slice) `ISNULL` and `COALESCE` stay two
+operators: `ASM-ISNULL-TYPE` is not discharged there. -/
+#guard reasonOf (check dep [] pairCert (pairT false (fn "ISNULL" [ta, tb]) bigint)
+    (pairP (fn "COALESCE" [pa, pb]) bigint)) ==
+  "the lowered routines differ beyond the renaming"
+-- PostgreSQL has no `ISNULL` function: never the slice's `coalesce`.
+#guard (typed (.pg []) [("a", integer), ("b", integer)] (fn "ISNULL" [pa, pb])).isNone
+
+/-! ### `CASE` -/
+
+def safeDiv (a b : Ast.Expr) : Ast.Expr :=
+  .Case none [.When2 (.Bin "=" b (num 0)) .Null] (some (.Bin "/" a b))
+#guard isC2a (checkPair true (safeDiv ta tb) (safeDiv pa pb))
+#guard runPair true (safeDiv ta tb) (safeDiv pa pb) [I 7, I 0, I 9] ==
+  (some (.done [N, I 0] none 0 []), some (.done [N, I 0] none 0 []))
+#guard runPair true (safeDiv ta tb) (safeDiv pa pb) [I 7, I 2, I 9] ==
+  (some (.done [I 3, I 0] none 0 []), some (.done [I 3, I 0] none 0 []))
+-- Without `ELSE`, NULL.
+#guard isC2a (checkPair false (.Case none [.When2 (.Bin ">" ta tb) ta] none)
+  (.Case none [.When2 (.Bin ">" pa pb) pa] none))
+#guard runPair false (.Case none [.When2 (.Bin ">" ta tb) ta] none)
+  (.Case none [.When2 (.Bin ">" pa pb) pa] none) [I 1, I 2, I 9] ==
+  (some (.done [N, I 0] none 0 []), some (.done [N, I 0] none 0 []))
+/- A branch without variables that fails: PostgreSQL may fail while
+planning even when the branch is not taken, so it is outside the slice;
+the pair is still a C1 mirror. -/
+def badCase (a : Ast.Expr) : Ast.Expr :=
+  .Case none [.When2 (.Bin ">" a (num 0)) (num 1)] (some (.Bin "/" (num 1) (num 0)))
+#guard isC1 (checkPair true (badCase ta) (badCase pa))
+-- A constant branch that does not fail is fine.
+#guard isC2a (checkPair true
+  (.Case none [.When2 (.Bin ">" ta (num 0)) (num 1)] (some (.Bin "/" (num 6) (num 3))))
+  (.Case none [.When2 (.Bin ">" pa (num 0)) (num 1)] (some (.Bin "/" (num 6) (num 3)))))
+-- Branch order matters.
+#guard reasonOf (checkPair false
+    (.Case none [.When2 (.Bin ">" ta tb) ta, .When2 (.Bin "<" ta tb) tb] (some (num 0)))
+    (.Case none [.When2 (.Bin "<" pa pb) pb, .When2 (.Bin ">" pa pb) pa] (some (num 0)))) ==
+  "the lowered routines differ beyond the renaming"
+
+/-! ### Refused: the lowerings differ -/
+
+-- `@a / @b` (integer division) against `a::numeric / b`.
+#guard reasonOf (checkPair true (.Bin "/" ta tb) (.Bin "/" (.Cast pa (.Ty "NUMERIC" [])) pb)) ==
+  "the lowered routines differ beyond the renaming"
+-- `+` against `||`.
+#guard reasonOf (checkPair true (.Bin "+" ta tb) (.Bin "||" pa pb)) ==
+  "the lowered routines differ beyond the renaming"
+-- `int` against `bigint` arithmetic: the slice on one side only.
+#guard reasonOf (check dep [] pairCert (pairT true (.Bin "+" ta tb))
+    (pairP (.Bin "+" pa pb) bigint)) ==
+  "the lowered routines differ beyond the renaming"
+-- `@a % @b` is on the C1 path on both sides (a variable divisor), `@a % 2`
+-- in the slice, `@a % -1` not.
+#guard isC1 (checkPair true (.Bin "%" ta tb) (.Bin "%" pa pb))
+#guard isC2a (checkPair true (.Bin "%" ta (num 2)) (.Bin "%" pa (num 2)))
+#guard isC1 (checkPair true (.Bin "%" ta (.Num "-1")) (.Bin "%" pa (.Num "-1")))
+
+/-! ### At the edge of the slice -/
+
+-- Literals: `2147483648` is `numeric` in T-SQL and `bigint` in PostgreSQL.
+#guard intLit? "2147483647" == some 2147483647
+#guard intLit? "-2147483648" == some (-2147483648)
+#guard intLit? "0" == some 0
+#guard intLit? "2147483648" == none
+#guard intLit? "-2147483649" == none
+#guard intLit? "1_000" == none
+#guard intLit? "007" == none
+#guard intLit? "0x1f" == none
+#guard intLit? "1e3" == none
+#guard intLit? "--5" == none
+#guard intLit? "" == none
+#guard isC1 (checkPair false (.Num "2147483648") (.Num "2147483648"))
+-- `AND` with an operand that can raise: evaluation order is unspecified.
+#guard isC1 (check dep [] pairCert
+  (tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [xactAbort,
+    .If (.Bin "AND" (.Bin "<>" tb (num 0)) (.Bin ">" (.Bin "/" ta tb) (num 1)))
+      [set (tv "@r") (num 1)] []])
+  (pgProc ["r"] [inP "a", inP "b", ioP "r"] [] [
+    .If (.Bin "AND" (.Bin "<>" pb (num 0)) (.Bin ">" (.Bin "/" pa pb) (num 1)))
+      [set (pv "r") (num 1)] []]))
+-- `SET XACT_ABORT ON` after a statement that can fail: not at the start.
+#guard isC1 (check dep [] pairCert
+  (tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [set (tv "@r") (.Bin "/" ta tb), xactAbort])
+  (pairP (.Bin "/" pa pb)))
+-- `SET XACT_ABORT OFF` is outside the spec.
+#guard reasonOf (check dep [] pairCert
+  (tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [.Setting "XACT_ABORT" false,
+    set (tv "@r") ta]) (pairP pa)) == "the T-SQL routine is outside the C1 spec"
+-- A `varchar` variable read is not in the slice, even unchanged.
+#guard isC1 (check dep [] pairCert (pairT false ta (.Ty "VARCHAR" ["10"]))
+  (pairP pa (.Ty "VARCHAR" ["10"])))
+-- `int(4)` is not the slice's type.
+#guard !intType (.pg []) (.Ty "INT" ["4"])
+-- `NULL` compared with `=`: outside the slice (session settings change it).
+#guard isC1 (checkPair false (.Case none [.When2 (.Bin "=" ta .Null) (num 1)] (some (num 0)))
+  (.Case none [.When2 (.Bin "=" pa .Null) (num 1)] (some (num 0))))
+-- PostgreSQL `int4` and `INT`, T-SQL `INTEGER` and `INT`: the slice's integer.
+#guard isC2a (check dep [] pairCert (pairT false (fn "ISNULL" [ta, tb]) (.Ty "INTEGER" []))
+  (pairP (fn "COALESCE" [pa, pb]) (.Ty "INT4" [])))
+#guard isC2a (check dep [] pairCert (pairT false (fn "ISNULL" [ta, tb]) (.Ty "INT" []))
+  (pairP (fn "COALESCE" [pa, pb]) (.Ty "int" [])))
+
+/-! ### Functions and the residual assumptions -/
+
+def fnT (body : List Ast.Node) : Ast.Routine :=
+  .Routine .Function ["f"] [inT "@a"] (some int) .Caller none (.Block [] body)
+def fnP (body : List Ast.Node) : Ast.Routine :=
+  .Routine .Function ["f"] [inP "a"] (some integer) .Caller none (.Block [] body)
+def fnCert : Cert := ⟨[("@a", "a")]⟩
+
+-- A T-SQL function cannot `SET XACT_ABORT ON`: in the slice only if
+-- nothing can raise.
+#guard isC2a (check dep [] fnCert (fnT [ret (some (fn "ISNULL" [ta, num 0]))])
+  (fnP [ret (some (fn "COALESCE" [pa, num 0]))]))
+#guard isC1 (check dep [] fnCert (fnT [ret (some (.Bin "+" ta (num 1)))])
+  (fnP [ret (some (.Bin "+" pa (num 1)))]))
+-- A function returning `bigint` is not in the slice.
+#guard isC1 (check dep [] fnCert
+  (.Routine .Function ["f"] [inT "@a"] (some bigint) .Caller none
+    (.Block [] [ret (some (fn "ISNULL" [ta, num 0]))]))
+  (.Routine .Function ["f"] [inP "a"] (some bigint) .Caller none
+    (.Block [] [ret (some (fn "COALESCE" [pa, num 0]))])))
+
+#guard ((lowerT dep (pairT true (.Bin "/" ta tb))).map residual) ==
+  some ["ASM-TSQL-ARITH-ERRORS"]
+#guard ((lowerT dep ifT).map residual) == some ["ASM-TSQL-ANSI-NULLS"]
+#guard ((lowerT dep (pairT false (fn "ISNULL" [ta, tb]))).map residual) == some []
+
+/-! ### The pair at the top
+
+It is in the slice but for `XACT_ABORT`: `@x + 1` can overflow, and
+T-SQL would go on after it. With `SET XACT_ABORT ON` first, it is a C2a
+confirmation. -/
+
+#guard isC1 (check dep Γ cert srcT mirrorP)
+def srcAbort : Ast.Routine :=
+  match srcT with
+  | .Routine k n ps r s v (.Block ds body) => .Routine k n ps r s v (.Block ds (xactAbort :: body))
+#guard isC2a (check dep Γ cert srcAbort mirrorP)
+#guard ((lowerT dep srcAbort).map residual) == some ["ASM-TSQL-ARITH-ERRORS"]
+-- The two status lines are still needed.
+#guard !isConfirmed (check dep Γ cert srcAbort todayP)
 
 end Sqldiff.Mirror.Examples

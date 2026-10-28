@@ -8,20 +8,22 @@ import Sqldiff.Core.Semantics
 
 namespace Sqldiff.Core
 
-variable {V W : Type}
+variable {U W : Type}
 
-/-- The run ended (normally or by `return`), rather than running out. -/
-def Outcome.finished : Outcome V W → Bool
+/-- The run ended (normally, by `return` or by an error), rather than
+running out. -/
+def Outcome.finished : Outcome U W → Bool
   | .outOfFuel _ => false
   | _ => true
 
-theorem exec_succ (es : ExprSem V) (wm : WorldModel V W) :
-    ∀ (n : Nat) (s : Stmt) (st : State V W), (exec es wm n s st).finished = true →
+theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
+    ∀ (n : Nat) (s : Stmt) (st : State U W), (exec es wm n s st).finished = true →
       exec es wm (n + 1) s st = exec es wm n s st
   | 0, _, _, h => by simp [exec, Outcome.finished] at h
   | _ + 1, .skip, _, _ => rfl
   | _ + 1, .assign .., _, _ => rfl
-  | _ + 1, .ret _, _, _ => rfl
+  | _ + 1, .ret none, _, _ => rfl
+  | _ + 1, .ret (some _), _, _ => rfl
   | _ + 1, .call .., _, _ => rfl
   | n + 1, .seq s t, st, h => by
     have e1 : exec es wm (n + 1 + 1) (.seq s t) st =
@@ -41,46 +43,75 @@ theorem exec_succ (es : ExprSem V) (wm : WorldModel V W) :
       exact exec_succ es wm n t st' h
     | returned v st' =>
       rw [exec_succ es wm n s st (by rw [hs]; rfl), hs]
+    | error k st' =>
+      rw [exec_succ es wm n s st (by rw [hs]; rfl), hs]
     | outOfFuel st' =>
       rw [hs] at h
       simp [Outcome.finished] at h
   | n + 1, .ite c s t, st, h => by
-    simp only [exec] at h ⊢
-    split
-    · next hc => simp only [hc, ↓reduceIte] at h; exact exec_succ es wm n s st h
-    · next hc => simp only [hc] at h; exact exec_succ es wm n t st h
-  | n + 1, .while c b, st, h => by
-    have e1 : exec es wm (n + 1 + 1) (.while c b) st =
-        if es.truthy (c.eval es st.store) then
-          match exec es wm (n + 1) b st with
-          | .normal st' => exec es wm (n + 1) (.while c b) st'
-          | o => o
-        else .normal st := rfl
-    have e2 : exec es wm (n + 1) (.while c b) st =
-        if es.truthy (c.eval es st.store) then
-          match exec es wm n b st with
-          | .normal st' => exec es wm n (.while c b) st'
-          | o => o
-        else .normal st := rfl
+    have e1 : exec es wm (n + 1 + 1) (.ite c s t) st =
+        match c.eval es st.store with
+        | .err k => .error k st
+        | .ok v => if isTrue v then exec es wm (n + 1) s st else exec es wm (n + 1) t st := rfl
+    have e2 : exec es wm (n + 1) (.ite c s t) st =
+        match c.eval es st.store with
+        | .err k => .error k st
+        | .ok v => if isTrue v then exec es wm n s st else exec es wm n t st := rfl
     rw [e2] at h
     rw [e1, e2]
-    split
-    · next hc =>
-      simp only [hc, ↓reduceIte] at h
-      cases hs : exec es wm n b st with
-      | normal st' =>
-        rw [hs] at h
-        rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
-        exact exec_succ es wm n (.while c b) st' h
-      | returned v st' =>
-        rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
-      | outOfFuel st' =>
-        rw [hs] at h
-        simp [Outcome.finished] at h
-    · rfl
+    generalize c.eval es st.store = r at h ⊢
+    cases r with
+    | err k => rfl
+    | ok v =>
+      dsimp only at h ⊢
+      split
+      · next hc => simp only [hc, ↓reduceIte] at h; exact exec_succ es wm n s st h
+      · next hc => simp only [hc] at h; exact exec_succ es wm n t st h
+  | n + 1, .while c b, st, h => by
+    have e1 : exec es wm (n + 1 + 1) (.while c b) st =
+        match c.eval es st.store with
+        | .err k => .error k st
+        | .ok v =>
+          if isTrue v then
+            match exec es wm (n + 1) b st with
+            | .normal st' => exec es wm (n + 1) (.while c b) st'
+            | o => o
+          else .normal st := rfl
+    have e2 : exec es wm (n + 1) (.while c b) st =
+        match c.eval es st.store with
+        | .err k => .error k st
+        | .ok v =>
+          if isTrue v then
+            match exec es wm n b st with
+            | .normal st' => exec es wm n (.while c b) st'
+            | o => o
+          else .normal st := rfl
+    rw [e2] at h
+    rw [e1, e2]
+    generalize c.eval es st.store = r at h ⊢
+    cases r with
+    | err k => rfl
+    | ok v =>
+      dsimp only at h ⊢
+      split
+      · next hc =>
+        simp only [hc, ↓reduceIte] at h
+        cases hs : exec es wm n b st with
+        | normal st' =>
+          rw [hs] at h
+          rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
+          exact exec_succ es wm n (.while c b) st' h
+        | returned v st' =>
+          rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
+        | error k st' =>
+          rw [exec_succ es wm n b st (by rw [hs]; rfl), hs]
+        | outOfFuel st' =>
+          rw [hs] at h
+          simp [Outcome.finished] at h
+      · rfl
 
-theorem exec_mono (es : ExprSem V) (wm : WorldModel V W) (n : Nat) (s : Stmt)
-    (st : State V W) (h : (exec es wm n s st).finished = true) :
+theorem exec_mono (es : ExprSem U) (wm : WorldModel U W) (n : Nat) (s : Stmt)
+    (st : State U W) (h : (exec es wm n s st).finished = true) :
     ∀ m, n ≤ m → exec es wm m s st = exec es wm n s st := by
   intro m hm
   induction m with
@@ -94,18 +125,21 @@ theorem exec_mono (es : ExprSem V) (wm : WorldModel V W) (n : Nat) (s : Stmt)
       rw [exec_succ es wm m s st h, ih']
     · rw [heq]
 
-/-- A finished observation stays the same with more fuel. -/
-theorem obs_mono (es : ExprSem V) (wm : WorldModel V W) (r : Routine) (args : List V) (w : W)
-    (n : Nat) {outs : List V} {ret : Option V} {w' : W} {cs : List (CallEvent V)}
-    (h : r.obs es wm args w n = .done outs ret w' cs) :
-    ∀ m, n ≤ m → r.obs es wm args w m = .done outs ret w' cs := by
+/-- A finished observation (a result or an error) stays the same with
+more fuel. -/
+theorem obs_mono (es : ExprSem U) (wm : WorldModel U W) (r : Routine) (args : List (Val U))
+    (w : W) (n : Nat) (h : ∀ w' cs, r.obs es wm args w n ≠ .pending w' cs) :
+    ∀ m, n ≤ m → r.obs es wm args w m = r.obs es wm args w n := by
   intro m hm
-  have hfin : (exec es wm n r.body ⟨initStore es r.params args, w, []⟩).finished = true := by
-    simp only [Routine.obs] at h
-    generalize exec es wm n r.body _ = o at h ⊢
-    cases o <;> simp_all [observe, Outcome.finished]
   simp only [Routine.obs] at h ⊢
-  rw [exec_mono es wm n r.body _ hfin m hm]
-  exact h
+  cases hi : initStore es r.params args with
+  | error k => rfl
+  | ok σ =>
+    rw [hi] at h
+    dsimp only at h ⊢
+    have hfin : (exec es wm n r.body ⟨σ, w, []⟩).finished = true := by
+      generalize exec es wm n r.body _ = o at h ⊢
+      cases o <;> simp_all [observe, Outcome.finished]
+    rw [exec_mono es wm n r.body _ hfin m hm]
 
 end Sqldiff.Core
