@@ -1156,7 +1156,10 @@ impl Server {
             template: self.template_mode(args)?,
             extensions: tree::extensions(list_arg(args, "extensions")?),
             helpers: self.config.options().helpers,
-            catalogs: Vec::new(),
+            catalogs: list_arg::<String>(args, "catalogs")?
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         })
     }
 
@@ -1415,6 +1418,23 @@ impl Server {
         for u in &t.report.unreadable {
             text.push_str(&format!("unreadable (not converted): {u}\n"));
         }
+        for c in &t.report.base_catalogs {
+            text.push_str(&format!(
+                "base catalog {} (sha256 {}): {} tables and views, {} routines\n",
+                c.path, c.sha256, c.tables, c.routines
+            ));
+        }
+        for o in t.report.base_objects.iter().filter(|o| !o.in_target) {
+            text.push_str(&format!(
+                "base {} {} ({}:{}) did not convert, left out of the target catalog: {} ({})\n",
+                o.kind,
+                o.name,
+                o.file,
+                o.line,
+                o.status.label(),
+                o.rules.join(", ")
+            ));
+        }
         let files: Vec<Value> = rows
             .iter()
             .map(|f| {
@@ -1447,6 +1467,10 @@ impl Server {
             "out": t.report.out,
             "catalogs": t.report.catalogs,
             "templates": t.report.templates,
+            "base_catalogs": t.report.base_catalogs,
+            "base_hash": t.report.base_hash,
+            "base_objects": t.report.base_objects,
+            "base_statements": t.report.base_statements,
             "ok": t.report.ok(),
             "totals": t.report.totals,
             "unreadable": t.report.unreadable,
@@ -1845,6 +1869,7 @@ fn tools() -> Value {
                     "overwrite": { "type": "boolean", "description": "Replace files in a non-empty `out` (default false)" },
                     "discard_edits": { "type": "boolean", "description": "With `overwrite`: also replace files edited by hand since the last run (refused otherwise)" },
                     "no_catalog": { "type": "boolean", "description": "Check each file alone, without catalogs built from the whole tree" },
+                    "catalogs": { "type": "array", "items": { "type": "string" }, "description": "Base catalogs, as `sqldiff convert --catalog` (in order): DDL files in the source dialect of objects that exist already but are not part of `src`. They bind on both sides (an object `src` defines replaces one of the same name), are converted for the target catalog only, and are never written or counted; a base object that does not convert is left out of the target catalog, so what uses it is differs. Not with `no_catalog`" },
                     "template": { "type": "boolean", "description": "Every file is a template in the loaded packs' [template] syntax (as `sqldiff convert --template`)" },
                     "parameters": { "type": "array", "items": { "type": "string" }, "description": "With `template`: the only placeholder names, besides the pack's known_parameters" },
                     "extensions": { "type": "array", "items": { "type": "string" }, "description": "File extensions to convert (default [\"sql\"])" },
@@ -1870,6 +1895,7 @@ fn tools() -> Value {
                     "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
                     "out": { "type": "string", "description": "The converted tree (where review-decisions.jsonl lives)" },
                     "no_catalog": { "type": "boolean" },
+                    "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
@@ -1894,6 +1920,7 @@ fn tools() -> Value {
                     "to": { "type": "string", "enum": ["tsql", "postgres", "db2i"], "description": "Target dialect" },
                     "out": { "type": "string", "description": "The converted tree, written earlier by `convert_tree`" },
                     "no_catalog": { "type": "boolean" },
+                    "catalogs": { "type": "array", "items": { "type": "string" }, "description": "As given to `convert_tree`" },
                     "template": { "type": "boolean" },
                     "parameters": { "type": "array", "items": { "type": "string" } },
                     "extensions": { "type": "array", "items": { "type": "string" } },
