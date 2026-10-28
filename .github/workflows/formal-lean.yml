@@ -1,8 +1,14 @@
 name: Lean checker
 
-# The Lean side of the verification roadmap (docs/verification-roadmap.md).
-# For now the decision 2 packaging spike: build `sqldiff-check` for every
-# release target and measure start-up, throughput, size and linked libraries.
+# The Lean side of the verification roadmap (docs/verification-roadmap.md):
+# build `sqldiff-check` for every release target, check that its theorems use
+# only allowed axioms, run its protocol tests, and measure start-up,
+# throughput, size and linked libraries (decision 2 budgets).
+#
+# Spike results that shaped this file: a static glibc link crashed on start,
+# so Linux ships a glibc-linked checker (glibc 2.14 or newer) beside the musl
+# CLI; Lean 4.19's own linker produced macOS binaries dyld refuses
+# ("__DATA_CONST segment missing SG_READ_ONLY flag"), Lean 4.35 does not.
 
 on:
   push:
@@ -11,23 +17,16 @@ on:
   workflow_dispatch:
 
 jobs:
-  spike:
+  checker:
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linked dynamically against glibc only; a static glibc link crashed
-          # on start (run 1), so the release ships this beside the musl CLI.
           - { os: ubuntu-latest, label: linux-x64, arch: "" }
-          # Run 2: with the pinned toolchain's own linker, dyld refused the
-          # binary ("__DATA_CONST segment missing SG_READ_ONLY flag"). Two
-          # candidate fixes: Apple's linker, or the current stable Lean.
-          - { os: macos-latest, label: macos-arm64-applelink, arch: "", applelink: true }
-          - { os: macos-latest, label: macos-arm64-stable, arch: "", toolchain: "leanprover/lean4:stable" }
+          - { os: macos-latest, label: macos-arm64, arch: "" }
           # Release builds make macOS x64 on an arm64 runner; Lean has no
           # cross compiler, so this runs the x86_64 toolchain under Rosetta.
-          - { os: macos-latest, label: macos-x64-applelink, arch: "arch -x86_64", applelink: true }
-          - { os: macos-latest, label: macos-x64-stable, arch: "arch -x86_64", toolchain: "leanprover/lean4:stable" }
+          - { os: macos-latest, label: macos-x64, arch: "arch -x86_64" }
           - { os: windows-latest, label: windows-x64, arch: "" }
     runs-on: ${{ matrix.os }}
     defaults:
@@ -53,35 +52,28 @@ jobs:
           Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
           .\elan-init.ps1 -NoPrompt $true -DefaultToolchain none
           echo "$env:USERPROFILE\.elan\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - name: Toolchain override
-        if: matrix.toolchain
-        run: echo "${{ matrix.toolchain }}" > lean-toolchain
-      - name: Link with Apple's linker
-        if: matrix.applelink
-        run: |
-          cat >> lakefile.toml <<'EOF'
-          moreLinkArgs = ["-fuse-ld=/usr/bin/ld"]
-          EOF
       - name: Build
         run: |
           ${{ matrix.arch }} lake --version
           ${{ matrix.arch }} lake build
           ls -l .lake/build/bin
-      - name: Measure
+      - name: Axioms
+        run: ${{ matrix.arch }} lake env lean Axioms.lean | python3 check_axioms.py
+      - name: Protocol tests and measurements
         run: |
           exe=.lake/build/bin/sqldiff_check
           [ -f "$exe.exe" ] && exe="$exe.exe"
-          file "$exe" || true
           otool -L "$exe" 2>/dev/null || true
-          if command -v objdump >/dev/null && [ "$RUNNER_OS" = Linux ]; then
+          if [ "$RUNNER_OS" = Linux ]; then
             echo "newest glibc symbol version needed:"
             objdump -T "$exe" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
           fi
-          ${{ matrix.arch }} "$exe" --version || echo "exit $?"
+          ${{ matrix.arch }} "$exe" --version
+          python3 test_gate.py "$exe"
           python3 measure.py "$exe" | tee measure-${{ matrix.label }}.json
       - uses: actions/upload-artifact@v4
         with:
           name: sqldiff-check-${{ matrix.label }}
           path: |
-            formal/lean/.lake/build/bin/
+            formal/lean/.lake/build/bin/sqldiff_check*
             formal/lean/measure-${{ matrix.label }}.json

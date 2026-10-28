@@ -1,22 +1,44 @@
 /-
-Packaging and performance spike for `sqldiff-check` (decision 2 in
-docs/verification-roadmap.md). Reads one request per line on stdin and
-answers one line per request. Every answer is "unconfirmed": the spike
-proves nothing, and nothing it can print reads as confirmed.
--/
+`sqldiff-check`: answers one request per line on stdin with one JSON line
+on stdout. A request is tab-separated:
 
-partial def serve (inp out : IO.FS.Stream) (n : Nat) : IO Nat := do
+  sqldiff-check/1 ID DIALECT-A TARGET-A TREE-A DIALECT-B TARGET-B TREE-B end
+
+ID is digits; the trees come from `sqldiff_core::proof::tree_line` and
+contain no tab. Anything else is answered "unconfirmed".
+-/
+import Sqldiff.Gate
+
+open Sqldiff.Gate
+
+def protocol : String := "sqldiff-check/1"
+
+/-- The JSON answer. `id` is digits and the other strings are constants
+of this program, so nothing needs escaping. -/
+def answerLine (id : String) : Answer → String
+  | .confirmed t => s!"\{\"id\":\"{id}\",\"proof\":\"confirmed\",\"theorem\":\"{t}\"}"
+  | .unconfirmed r => s!"\{\"id\":\"{id}\",\"proof\":\"unconfirmed\",\"reason\":\"{r}\"}"
+
+def handle (line : String) : String :=
+  match line.splitOn "\t" with
+  | [p, id, da, ta, xa, db, tb, xb, fin] =>
+    if p == protocol && !id.isEmpty && id.all Char.isDigit && fin.startsWith "end" then
+      answerLine id (check ⟨da, ta, xa⟩ ⟨db, tb, xb⟩)
+    else
+      answerLine "0" (.unconfirmed "malformed request")
+  | _ => answerLine "0" (.unconfirmed "malformed request")
+
+partial def serve (inp out : IO.FS.Stream) : IO Unit := do
   let line ← inp.getLine
   if line.isEmpty then
-    return n
-  out.putStrLn s!"\{\"proof\":\"unconfirmed\",\"reason\":\"spike\",\"request\":{n}}"
+    return
+  out.putStrLn (handle line)
   out.flush
-  serve inp out (n + 1)
+  serve inp out
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println "sqldiff-check spike 0.0.1"
+    IO.println s!"sqldiff-check 0.1.0 ({protocol})"
     return 0
-  let n ← serve (← IO.getStdin) (← IO.getStdout) 0
-  IO.eprintln s!"{n} requests"
+  serve (← IO.getStdin) (← IO.getStdout)
   return 0

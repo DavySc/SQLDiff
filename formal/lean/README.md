@@ -1,10 +1,23 @@
 # Lean checker (`sqldiff-check`)
 
-The Lean side of [the verification roadmap](../../docs/verification-roadmap.md).
-For now only the decision 2 packaging and performance spike: `Main.lean`
-answers every request with "unconfirmed", and
-`.github/workflows/formal-lean.yml` builds it for every release target and
-runs `measure.py` (start-up, throughput, size, linked libraries).
+The verified gate of [the verification roadmap](../../docs/verification-roadmap.md)
+(decision 2): SQLDiff reports "equal" only when this checker confirms it, in
+`require` mode (decision 3).
+
+| File | What it is |
+|---|---|
+| `Sqldiff/Gate.lean` | Programs, refinement (decision 1), the check, and `check_sound`: a confirmed answer means B refines A, for every semantics |
+| `Main.lean` | The executable: one tab-separated request per line on stdin, one JSON answer per line on stdout |
+| `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
+| `test_gate.py` | Protocol tests against the built binary |
+| `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
+
+Phase 0 covers the trivial fragment only: both sides in the same dialect,
+analysed for the same target, with identical syntax trees once whitespace
+and comments are left out. The proof is reflexivity, so it needs no
+specification and no axioms. What it trusts: SQLDiff's parser, and
+`sqldiff_core::proof::tree_line`, which writes a tree injectively.
 
 The toolchain is pinned in `lean-toolchain`. Executable code imports only
-`Init`; proofs and the specification will live in separate modules.
+`Init`. `.github/workflows/formal-lean.yml` builds and tests it on every
+release target.
