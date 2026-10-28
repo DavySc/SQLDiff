@@ -19,7 +19,7 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice and the C3a data statements (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer |
 | `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG); the extra answer fields (`scalars`, `residual`, `statements`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC3a.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C3a with table states), as `#guard`s checked on every build |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states), as `#guard`s checked on every build |
 | `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
@@ -124,6 +124,36 @@ and T-SQL routines whose expressions can raise but that do not start with
 stops). For those the core still evaluates the slice parts exactly, but
 the answer also rests on the C1 caveat that runs raise no error.
 
+### Phase C2b: strings
+
+The core has string values (`Val.str`, a sequence of characters; the
+empty string is not NULL) and five slice operators: `str`, `concat`,
+`rtrim` (trailing U+0020 only), `streq` (exact, three-valued) and `len`
+(characters). The rules, each with its vendor citation and probe status,
+are in `Sqldiff/Mirror/Lower.lean`, "The C2b slice: strings". **Every
+vendor quote there was written from memory** (the vendor sites were not
+reachable when it was written) and needs checking against the page.
+
+| Rule | Probed |
+|---|---|
+| Types: T-SQL `varchar(n)`/`nvarchar(n)`, `n ≤ 4000`; PostgreSQL `varchar(n)`, `varchar`, `text`. `max`, `char(n)`, no-length T-SQL `varchar` are outside | eval/casts (truncation by `CAST`) |
+| PostgreSQL parameters carry no length (read unbounded; writes still held to the declared length) | not probed |
+| Assignment, declaration defaults, parameter defaults, function results: only when the value provably fits (T-SQL truncates, PostgreSQL raises); never `nvarchar` into `varchar` | eval/casts/assign (T-SQL `abc`, PostgreSQL error) |
+| Literals: printable ASCII, no backslash (`'..'` and `N'..'` are one `Str` in the AST) | eval/casts (literal types) |
+| T-SQL `+` / PostgreSQL `||` on two strings, NULL-propagating; every T-SQL string bound ≤ 4000 | not probed |
+| `=`/`<>` only with the CATALOG fact `!binary-collation`: T-SQL `a = b` is `rtrim(a) = rtrim(b)` exactly (padding), PostgreSQL `a = b` is exact | not probed |
+| `RTRIM`/`rtrim`; T-SQL `LEN(x)` is PostgreSQL `length(rtrim(x))` | not probed |
+| `COALESCE`, `CASE` over strings; T-SQL `ISNULL(x, y)` is `COALESCE` only when `x` is a variable and `y` fits its declared length | not probed |
+| Strings passed to calls and `OUTPUT` arguments into string variables are outside the slice | n/a |
+
+New residuals in a C2a answer: `ASM-CONCAT-NULL` (concatenation, unless
+the T-SQL routine starts with `SET CONCAT_NULL_YIELDS_NULL ON`),
+`ASM-BINARY-COLLATION` (a string comparison, under the fact the request
+asserted), `ASM-TSQL-LEN-BMP` (`LEN`: no character outside the BMP, or an
+SC collation), `ASM-TSQL-STRING-ARGS` (a T-SQL string parameter: callers
+pass values that fit it). The answer format is unchanged (`"scalars":
+"c2a"`, the same theorems); the checker reports `0.6.0`.
+
 ### Phase C3a: single-table data statements
 
 The core has a database: each table a list of rows, a row one value per
@@ -213,4 +243,4 @@ residuals; it does not cover the state after a failed call (C4), `MERGE`,
 `UPDATE ... FROM`, queries, `RETURNING`/`OUTPUT`, or any type but `int`.
 Theorems with only the standard axioms: `check_sound`, `check_sound_c2a`,
 `refines_rename`, `obs_mono`, `Routine.obs_opFree`, `exec_error_atomic`
-and the congruence lemmas (`Axioms.lean`).
+and the congruence lemmas, and (C2b) `mkRtrim_eval` (`Axioms.lean`).

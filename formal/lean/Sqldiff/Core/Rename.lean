@@ -85,6 +85,21 @@ theorem SExpr.eval_rename {σA σB ρ : Store U} (h : Agree f D σA σB) :
     rw [SExpr.eval_rename h c (fun y hy => hs y (by simp [SExpr.vars, hy])),
       SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
       SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .str _, _ => rfl
+  | .concat a b, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
+      SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .rtrim a, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .streq a b, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
+      SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .len a, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy]))]
 
 mutual
   theorem Expr.eval_rename (es : ExprSem U) {σA σB ρ : Store U} (h : Agree f D σA σB) :

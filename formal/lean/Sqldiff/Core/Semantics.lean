@@ -20,14 +20,21 @@ variable {U W : Type}
 /-- A value. `null` is SQL NULL, and also UNKNOWN, the third truth value:
 a three-valued boolean is `bool true`, `bool false` or `null`. `int` is a
 32-bit signed integer (T-SQL `int`, PostgreSQL `integer`); the slice's
-operators keep it in range (`toInt32`). `opaque` is any value outside the
-slice (strings, decimals, dates, ...): only uninterpreted operators and
-the world make or read one, so theorems hold for every type `U` of them. -/
+operators keep it in range (`toInt32`). `str` is a character string (C2b):
+a sequence of Unicode characters, the same value whichever T-SQL
+(`varchar`, `nvarchar`) or PostgreSQL (`varchar`, `text`) type holds it;
+the empty string is not NULL. Which strings each type can hold, and what
+happens to one that does not fit, is the lowering's business
+(`Sqldiff.Mirror`, "The C2b slice: strings"). `opaque` is any value
+outside the slice (decimals, dates, ...): only uninterpreted operators
+and the world make or read one, so theorems hold for every type `U` of
+them. -/
 inductive Val (U : Type) where
   | null
   | bool (b : Bool)
   | int (i : Int)
   | opaque (u : U)
+  | str (s : String)
 deriving DecidableEq, Repr
 
 /-- Why an expression or a statement fails. `overflow` is T-SQL error
@@ -124,6 +131,18 @@ def intOp2 (f : Int → Int → Res U) : Val U → Val U → Res U
   | .int x, .int y => f x y
   | _, _ => typeErr
 
+/-- A strict string operator: NULL if either operand is NULL. -/
+def strOp2 (f : String → String → Res U) : Val U → Val U → Res U
+  | .null, _ => .ok .null
+  | _, .null => .ok .null
+  | .str x, .str y => f x y
+  | _, _ => typeErr
+
+/-- The string without its trailing spaces: U+0020 only, not tabs or other
+blanks (T-SQL `RTRIM`, PostgreSQL `rtrim` with one argument). -/
+def rtrimSp (s : String) : String :=
+  String.ofList (s.toList.reverse.dropWhile (· == ' ')).reverse
+
 /-- A truth value: `some none` is UNKNOWN. -/
 def truth : Val U → Option (Option Bool)
   | .null => some none
@@ -177,7 +196,9 @@ def nullStore : Store U := fun _ => .null
 data statement, the current row's columns `ρ` (`nullStore` elsewhere). It
 needs no parameter: this is the part of the core that does not depend on
 operators meaning the same "by name". `coalesce` and `cond` evaluate only
-the branch they take. -/
+the branch they take. `len` counts characters (Unicode scalar values) and
+cannot overflow within the slice: the lowerings bound every string they
+admit (4000 characters in T-SQL; a PostgreSQL value is at most 1 GB). -/
 def SExpr.eval (σ ρ : Store U) : SExpr → Res U
   | .var x => .ok (σ x)
   | .col c => .ok (ρ c)
@@ -206,6 +227,19 @@ def SExpr.eval (σ ρ : Store U) : SExpr → Res U
   | .cond c a b => match c.eval σ ρ with
     | .err k => .err k
     | .ok v => if isTrue v then a.eval σ ρ else b.eval σ ρ
+  | .str s => .ok (.str s)
+  | .concat a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (strOp2 fun x y => .ok (.str (x ++ y)))
+  | .rtrim a => match a.eval σ ρ with
+    | .err k => .err k
+    | .ok .null => .ok .null
+    | .ok (.str s) => .ok (.str (rtrimSp s))
+    | .ok _ => typeErr
+  | .streq a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (strOp2 fun x y => .ok (.bool (x == y)))
+  | .len a => match a.eval σ ρ with
+    | .err k => .err k
+    | .ok .null => .ok .null
+    | .ok (.str s) => .ok (.int s.length)
+    | .ok _ => typeErr
 
 /-! ## The database (C3a)
 
