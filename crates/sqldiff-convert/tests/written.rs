@@ -42,6 +42,7 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            deployment: Default::default(),
         }
     }
 

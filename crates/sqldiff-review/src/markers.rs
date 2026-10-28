@@ -130,6 +130,7 @@ pub fn apply(
                             text: m.marker.value.clone(),
                             source: AssumptionSource::Author,
                             cite: Some(cite),
+                            accepted_by: Vec::new(),
                         });
                         summary.assumptions.push(id);
                     }

@@ -1109,6 +1109,7 @@ impl Server {
             template,
             extensions: Vec::new(),
             helpers: self.config.options().helpers,
+            deployment: self.config.deployment.clone(),
         };
         let t = tree::convert(&a, &inputs, Vec::new(), None)?;
         let f = &t.report.files[0];
@@ -1155,6 +1156,7 @@ impl Server {
             template: self.template_mode(args)?,
             extensions: tree::extensions(list_arg(args, "extensions")?),
             helpers: self.config.options().helpers,
+            deployment: self.config.deployment.clone(),
         })
     }
 

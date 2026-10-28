@@ -17,6 +17,7 @@ pub mod bundle;
 pub mod changes;
 pub mod compose;
 pub mod config;
+pub mod deployment;
 mod error;
 pub mod format_file;
 pub mod fs;

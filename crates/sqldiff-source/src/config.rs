@@ -38,6 +38,20 @@ pub enum LayerKind {
     CommandLine,
 }
 
+impl LayerKind {
+    /// The kind as JSON spells it: `shared_pack`, `project`, ...
+    pub fn label(self) -> &'static str {
+        match self {
+            LayerKind::Builtin => "builtin",
+            LayerKind::SharedPack => "shared_pack",
+            LayerKind::PrivatePack => "private_pack",
+            LayerKind::Project => "project",
+            LayerKind::User => "user",
+            LayerKind::CommandLine => "command_line",
+        }
+    }
+}
+
 /// Names and hashes of what produced a result, for the provenance bar and exports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerRef {
@@ -207,6 +221,9 @@ pub struct Resolved {
     pub format_layers: Vec<FormatLayer>,
     /// The proof gate (decision 3); a front end sets the checker.
     pub proof: sqldiff_core::proof::Settings,
+    /// The `[deployment]` tables of every layer, with where each entry
+    /// comes from (decision 14).
+    pub deployment: crate::deployment::Profile,
     compiled: Compiled,
 }
 
@@ -330,7 +347,18 @@ impl Resolved {
         }];
         let mut policy = Policy::default();
         let mut format_layers = Vec::new();
+        let mut deployment = crate::deployment::Profile::default();
         for (kind, p) in &packs {
+            if let Some(d) = &p.policy.deployment {
+                deployment.add(
+                    d,
+                    sqldiff_core::model::DeploymentSource {
+                        layer: kind.label().to_string(),
+                        pack: Some(p.meta.name.clone()),
+                        file: Some(p.path.display().to_string()),
+                    },
+                );
+            }
             format_layers.push(FormatLayer {
                 kind: *kind,
                 path: Some(p.path.clone()),
@@ -362,6 +390,16 @@ impl Resolved {
                 hash: c.hash.clone(),
             });
             merge(&mut policy, &c.policy);
+            if let Some(d) = &c.policy.deployment {
+                deployment.add(
+                    d,
+                    sqldiff_core::model::DeploymentSource {
+                        layer: kind.label().to_string(),
+                        pack: None,
+                        file: c.path.as_ref().map(|p| p.display().to_string()),
+                    },
+                );
+            }
             format_layers.push(FormatLayer {
                 kind: *kind,
                 path: c.path.clone(),
@@ -391,6 +429,7 @@ impl Resolved {
             data_key: file.data_key,
             format_layers,
             proof: sqldiff_core::proof::Settings::default(),
+            deployment,
             compiled,
         })
     }
@@ -592,6 +631,16 @@ fn merge(acc: &mut Policy, hi: &Policy) {
     }
     if hi.observer.is_some() {
         acc.observer = hi.observer;
+    }
+    // `[deployment]`: accept lists join, facts are replaced by key.
+    if let Some(d) = &hi.deployment {
+        let acc = acc.deployment.get_or_insert_with(Default::default);
+        for id in &d.accept {
+            if !acc.accept.contains(id) {
+                acc.accept.push(id.clone());
+            }
+        }
+        acc.facts.extend(d.facts.clone());
     }
     // Format keys: the higher layer replaces key by key.
     acc.format.merge(&hi.format);

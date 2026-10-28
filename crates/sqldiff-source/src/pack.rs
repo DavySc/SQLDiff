@@ -58,6 +58,11 @@ pub struct Policy {
     /// (default), `"always"` or `"never"`.
     #[serde(default)]
     pub observer: Option<sqldiff_core::observer::Observer>,
+    /// The deployment profile (decision 14 in docs/verified-conversion.md):
+    /// the assumptions this deployment accepts and the catalog facts its
+    /// owner asserts. Reported, never a change of verdict.
+    #[serde(default)]
+    pub deployment: Option<Deployment>,
     /// How to split composed output and read provenance markers.
     #[serde(default)]
     pub composition: Vec<CompositionPattern>,
@@ -88,6 +93,47 @@ pub struct Policy {
     /// Formatter layout (`sqldiff fmt`), with per-dialect tables.
     #[serde(default, skip_serializing_if = "is_default")]
     pub format: sqldiff_core::format::FormatConfig,
+}
+
+/// `[deployment]` of one layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deployment {
+    /// Assumption ids the deployment accepts (`sqldiff_core::assumptions`):
+    /// a registered id, which also covers its `ID:qualifier` instances, one
+    /// instance, or one member of a family. An id nothing can discharge is
+    /// refused.
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// Catalog facts the user asserts, by fact key (`collation = "..."`);
+    /// the keys are the registry's `fact_key`s. Reported as the user's own
+    /// declarations.
+    #[serde(default)]
+    pub facts: BTreeMap<String, String>,
+}
+
+impl Deployment {
+    /// Checks every accepted id against the assumption registry and every
+    /// fact key against the keys it names.
+    pub fn validate(&self) -> Result<()> {
+        for id in &self.accept {
+            sqldiff_core::assumptions::check_accept(id)
+                .map_err(|e| Error::new(format!("deployment.accept: {e}")))?;
+        }
+        let keys = sqldiff_core::assumptions::fact_keys();
+        for (k, v) in &self.facts {
+            if !keys.contains(k.as_str()) {
+                return Err(Error::new(format!(
+                    "deployment.facts: unknown fact `{k}`; expected one of {}",
+                    keys.into_iter().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            if v.trim().is_empty() {
+                return Err(Error::new(format!("deployment.facts.{k}: empty value")));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn is_default<T: Default + PartialEq>(v: &T) -> bool {
@@ -607,6 +653,9 @@ impl Policy {
         for o in &self.overrides {
             Glob::new(&o.rule)?;
         }
+        if let Some(d) = &self.deployment {
+            d.validate()?;
+        }
         for a in &self.adapters {
             if a.command.is_empty() {
                 return Err(Error::new(format!("adapter `{}`: empty command", a.name)));
@@ -667,6 +716,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.0.contains("credential"), "{e}");
+    }
+
+    #[test]
+    fn deployment_ids_and_facts_are_checked_against_the_registry() {
+        let head = "[pack]\nname = \"x\"\nversion = \"1\"\n[deployment]\n";
+        let p = parse(&format!(
+            "{head}accept = [\"ASM-OBSERVER-ROWCOUNT\", \"ASM-BIND-COLUMN:qty\"]\n[deployment.facts]\ncollation = \"SQL_Latin1_General_CP1_CI_AS\"\n"
+        ))
+        .unwrap();
+        let d = p.policy.deployment.unwrap();
+        assert_eq!(d.accept.len(), 2);
+        assert_eq!(d.facts["collation"], "SQL_Latin1_General_CP1_CI_AS");
+        let e = parse(&format!("{head}accept = [\"ASM-NO-SUCH-THING\"]\n")).unwrap_err();
+        assert!(e.0.contains("not a registered assumption"), "{e}");
+        let e = parse(&format!("{head}accept = [\"ASM-FACT-V2\"]\n")).unwrap_err();
+        assert!(e.0.contains("cannot be accepted"), "{e}");
+        let e = parse(&format!("{head}[deployment.facts]\ncolation = \"x\"\n")).unwrap_err();
+        assert!(e.0.contains("unknown fact `colation`"), "{e}");
+        assert!(parse(&format!("{head}bogus = 1\n")).is_err());
     }
 
     #[test]

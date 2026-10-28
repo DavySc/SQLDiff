@@ -37,6 +37,7 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            deployment: Default::default(),
         };
         let (inputs, unreadable) = tree::read(&a).unwrap();
         let mut t = tree::convert(&a, &inputs, unreadable, Some(&self.out())).unwrap();

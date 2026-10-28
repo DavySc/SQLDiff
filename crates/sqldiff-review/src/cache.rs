@@ -182,6 +182,10 @@ pub fn report_key(a: &Artifact, b: Option<&Artifact>, opts: &Options, cfg: &Reso
     }
     h.update(format!("O{:?}", opts.observer).as_bytes());
     h.update([0]);
+    // The deployment profile marks accepted assumptions (decision 14).
+    h.update(b"DP");
+    h.update(serde_json::to_vec(&cfg.deployment).unwrap_or_default());
+    h.update([0]);
     // The proof gate changes the verdict (require) and the report (report):
     // its mode, and which checker answers (name, version and binary hash).
     h.update(b"P");
@@ -218,6 +222,29 @@ mod tests {
 
     use sqldiff_core::proof::{Answer, FnChecker, Mode};
     use sqldiff_core::Dialect;
+
+    #[test]
+    fn the_deployment_profile_is_in_the_report_key() {
+        let a = Artifact::new("a.sql", Dialect::Tsql, "SELECT 1;");
+        let cfg = Resolved::builtin();
+        let mut accepting = cfg.clone();
+        accepting.deployment.add(
+            &sqldiff_source::pack::Deployment {
+                accept: vec!["ASM-OBSERVER-ROWCOUNT".into()],
+                facts: Default::default(),
+            },
+            sqldiff_core::model::DeploymentSource {
+                layer: "project".into(),
+                pack: None,
+                file: Some("sqldiff.toml".into()),
+            },
+        );
+        let o = Options::default();
+        assert_ne!(
+            report_key(&a, Some(&a), &o, &cfg),
+            report_key(&a, Some(&a), &o, &accepting)
+        );
+    }
 
     #[test]
     fn the_proof_gate_is_in_the_report_key() {

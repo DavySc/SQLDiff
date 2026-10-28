@@ -268,6 +268,12 @@ impl Redactor {
             self.add_object(&info.object);
             self.add_path(&info.path);
         }
+        // The files of the deployment profiles that accept an assumption.
+        for a in &r.assumptions {
+            for f in a.accepted_by.iter().filter_map(|b| b.file.as_deref()) {
+                self.add_path(f);
+            }
+        }
         let v = serde_json::to_value(r).expect("report serializes");
         let mut texts = Vec::new();
         collect_strings(&v, &mut texts);
@@ -467,6 +473,11 @@ impl Redactor {
         for a in &mut r.assumptions {
             a.id = self.redact_str(&a.id);
             a.text = self.redact_str(&a.text);
+            for b in &mut a.accepted_by {
+                for t in b.pack.iter_mut().chain(b.file.iter_mut()) {
+                    *t = self.redact_str(t);
+                }
+            }
         }
         for t in r
             .normalizations

@@ -266,10 +266,15 @@ fn policy_applies_limits_overrides_and_assumptions() {
     let a = src.load_artifact("mssql/curs.sql").unwrap();
     let b = src.load_artifact("pg/get_stock.sql").unwrap();
     let mut r = sqldiff_core::diff(&a, &b, &sqldiff_core::Options::default());
-    r.assumptions.push(sqldiff_core::model::Assumption::default(
-        "ASM-EXAMPLE",
-        "default",
-    ));
+    // A pack may declare an id the registry does not know; built by hand, as
+    // `Assumption::default` takes registered ids only.
+    r.assumptions.push(sqldiff_core::model::Assumption {
+        id: "ASM-EXAMPLE".into(),
+        text: "default".into(),
+        source: sqldiff_core::model::AssumptionSource::Default,
+        cite: None,
+        accepted_by: Vec::new(),
+    });
     policy::add_limits(&mut r, &a, Some(&b), &cfg);
     policy::apply(&mut r, &cfg);
     let lim: Vec<_> = r

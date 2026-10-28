@@ -507,6 +507,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers: cfg.options().helpers,
+                    deployment: cfg.deployment.clone(),
                 },
                 out,
                 instances,

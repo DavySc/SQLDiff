@@ -133,6 +133,15 @@ pub fn text(report: &Report, show_assumption_details: bool) -> String {
             } else {
                 let _ = writeln!(out, "  {:<32} {}", x.id, x.text);
             }
+            if !x.accepted_by.is_empty() {
+                let by: Vec<String> = x.accepted_by.iter().map(|s| s.label()).collect();
+                let _ = writeln!(
+                    out,
+                    "  {:<32} accepted by the deployment profile: {}",
+                    "",
+                    by.join("; ")
+                );
+            }
         }
     }
     if !proven.is_empty() {

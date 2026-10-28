@@ -756,6 +756,7 @@ fn wrapper_facts(report: &mut Report, an: &Analyzed, comp: &Composition) {
             ),
             source: AssumptionSource::ComposedOutput,
             cite: Some(format!("{:?}:{}", an.side, an.lines.line_col(off).0)),
+            accepted_by: Vec::new(),
         });
     }
 }
@@ -1039,6 +1040,7 @@ pub fn template_notes(
                 ),
                 source: AssumptionSource::Declared,
                 cite: None,
+                accepted_by: Vec::new(),
             });
         } else {
             report.unknown_reasons.push(format!(

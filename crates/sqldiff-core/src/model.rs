@@ -137,15 +137,55 @@ pub struct Assumption {
     /// Where the assumption was stated, e.g. `A:12` for side A line 12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cite: Option<String>,
+    /// The deployment profiles (`[deployment] accept`) that accept the
+    /// assumption. A reviewable fact only: the verdict does not change, and
+    /// an accepted assumption still makes a result "equal under assumptions".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_by: Vec<DeploymentSource>,
+}
+
+/// Where a deployment profile entry comes from: the config layer, and the
+/// pack and file that hold it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeploymentSource {
+    /// `shared_pack`, `private_pack`, `project`, `user` or `command_line`.
+    pub layer: String,
+    /// The pack's name, when a pack holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<String>,
+    /// The `pack.toml` or config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+impl DeploymentSource {
+    /// `pack team (path/pack.toml)`, `project sqldiff.toml`, ...
+    pub fn label(&self) -> String {
+        let layer = self.layer.replace('_', " ");
+        match (&self.pack, &self.file) {
+            (Some(p), Some(f)) => format!("{layer} {p} ({f})"),
+            (Some(p), None) => format!("{layer} {p}"),
+            (None, Some(f)) => format!("{layer} {f}"),
+            (None, None) => layer,
+        }
+    }
 }
 
 impl Assumption {
+    /// An assumption the tool makes by default. The id must be in the
+    /// assumption registry (`crate::assumptions`); debug builds refuse one
+    /// that is not.
     pub fn default(id: &str, text: &str) -> Self {
+        debug_assert!(
+            crate::assumptions::lookup(id).is_some(),
+            "assumption id `{id}` is not registered in crates/sqldiff-core/profiles/assumptions.toml"
+        );
         Assumption {
             id: id.to_string(),
             text: text.to_string(),
             source: AssumptionSource::Default,
             cite: None,
+            accepted_by: Vec::new(),
         }
     }
 }
