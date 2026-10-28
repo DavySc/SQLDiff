@@ -16,7 +16,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::queue::Instances;
-use crate::review::{By, State, FILE_CHANGED};
+use crate::review::{By, State, CATALOGS_CHANGED, FILE_CHANGED};
 use crate::tree::Tree;
 use crate::Status;
 
@@ -233,7 +233,9 @@ pub fn check(
                 );
             }
             for d in &r.decisions {
-                if !d.current && d.why_not.as_deref() == Some(FILE_CHANGED) {
+                if !d.current
+                    && matches!(d.why_not.as_deref(), Some(FILE_CHANGED | CATALOGS_CHANGED))
+                {
                     block(
                         &mut b,
                         "outdated",
@@ -241,13 +243,18 @@ pub fn check(
                         id,
                         u.out_line,
                         format!(
-                            "{} {}{} on other bytes of the file: confirm it again",
+                            "{} {}{} {}: confirm it again",
                             d.record.author,
                             d.record.state.label(),
                             if d.record.rule.is_empty() {
                                 String::new()
                             } else {
                                 format!(" `{}`", d.record.rule)
+                            },
+                            if d.why_not.as_deref() == Some(FILE_CHANGED) {
+                                "on other bytes of the file"
+                            } else {
+                                "with other base catalogs (--catalog)"
                             }
                         ),
                     );

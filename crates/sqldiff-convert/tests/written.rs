@@ -42,6 +42,8 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
         }
     }
 
@@ -270,6 +272,7 @@ fn verdict(fx: &Fixture, path: &str, needle: &str, rule: &str, state: State) {
         input_hash: file_hash(&inputs[k].text),
         output_hash: file_hash(&t.conversions[k].output),
         text: None,
+        base_catalogs: None,
     };
     append(&fx.out(), &r).unwrap();
 }

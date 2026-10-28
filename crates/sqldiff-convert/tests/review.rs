@@ -57,6 +57,7 @@ fn record(input: &str, c: &Conversion, unit: &str, rule: &str, state: State, by:
         input_hash: file_hash(input),
         output_hash: file_hash(&c.output),
         text: None,
+        base_catalogs: None,
     }
 }
 
@@ -305,6 +306,8 @@ mod tree_report {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
         }
     }
 
@@ -414,6 +417,8 @@ mod empty_files {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            catalogs: Vec::new(),
+            catalogs_b: Vec::new(),
         };
         let (inputs, unreadable) = tree::read(&a).unwrap();
         let mut t = tree::convert(&a, &inputs, unreadable, Some(&out)).unwrap();
