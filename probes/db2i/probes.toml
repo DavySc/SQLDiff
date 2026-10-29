@@ -2603,3 +2603,256 @@ outcome = [
   { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "An error, as T-SQL (or the expression is not accepted there; SQLSTATE recorded)." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another result (in N1)." },
 ]
+
+# ---------------------------------------------------------------- V33 date and timestamp strings
+# The converter writes a T-SQL date or datetime2 literal assigned to a variable
+# in the ISO form (crates/sqldiff-convert/src/tsql.rs date_store), and the
+# engine reads it as the CAST the IBM i "Timestamp strings" and "Date strings"
+# pages describe (crates/sqldiff-core/src/equiv/literal.rs). Each probe assigns
+# a string to a TIMESTAMP(7) or DATE variable: N1 is year * 10000 + month * 100
+# + day, N2 hour * 10000 + minute * 100 + second, TEXT the timestamp as VARCHAR.
+
+[[procedure]]
+name = "V33_TS7"
+commit = "*NONE"
+params = "IN S VARCHAR(40)"
+body = """
+BEGIN
+  DECLARE V TIMESTAMP(7);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = S;
+    SET O_N1 = YEAR(V) * 10000 + MONTH(V) * 100 + DAY(V);
+    SET O_N2 = HOUR(V) * 10000 + MINUTE(V) * 100 + SECOND(V);
+    SET O_TEXT = VARCHAR(V);
+  END;
+END
+"""
+
+[[procedure]]
+name = "V33_TS7_CONST"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE V TIMESTAMP(7);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = '9999-12-31 23:59:59.9999999';
+    SET O_N1 = YEAR(V) * 10000 + MONTH(V) * 100 + DAY(V);
+    SET O_N2 = HOUR(V) * 10000 + MINUTE(V) * 100 + SECOND(V);
+    SET O_TEXT = VARCHAR(V);
+  END;
+END
+"""
+
+[[procedure]]
+name = "V33_DATE"
+commit = "*NONE"
+params = "IN S VARCHAR(40)"
+body = """
+BEGIN
+  DECLARE V DATE;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = S;
+    SET O_N1 = YEAR(V) * 10000 + MONTH(V) * 100 + DAY(V);
+  END;
+END
+"""
+
+[[probe]]
+id = "V33-TS-ISO"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7"
+args = ["'2020-01-01 00:00:00'"]
+question = "The ISO timestamp string '2020-01-01 00:00:00' assigned to a TIMESTAMP(7) variable: is it 2020-01-01 00:00:00?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings (ISO form); that an assignment reads it as a cast does is inferred."
+outcome = [
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101", n2 = "=0" }, verdict = "consistent", meaning = "Assigned and read as that timestamp." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded): the converter must not assign this form." },
+]
+
+[[probe]]
+id = "V33-TS-ISO-FRACTION"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7"
+args = ["'2020-01-01 10:00:00.5'"]
+question = "'2020-01-01 10:00:00.5' assigned to a TIMESTAMP(7) variable: is it 10:00:00.5000000 (padded with zeros)?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings: missing fraction digits are zeros."
+outcome = [
+  { label = "padded", when = { create = "00000", state = "00000", n1 = "=20200101", n2 = "=100000", text = "contains:.5000000" }, verdict = "consistent", meaning = "Read with the fraction padded to 7 digits." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2, TEXT)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-TS-END-OF-TIME"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7_CONST"
+question = "The constant '9999-12-31 23:59:59.9999999' assigned to a TIMESTAMP(7) variable (what the converter writes for T-SQL's end of time): does it keep all 7 digits?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings (0 to 12 fraction digits); the assignment of a constant is what the converter writes."
+outcome = [
+  { label = "exact", when = { create = "00000", state = "00000", n1 = "=99991231", n2 = "=235959", text = "contains:.9999999" }, verdict = "consistent", meaning = "Assigned exactly, with 7 fraction digits." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2, TEXT)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-TS-IBM-SQL"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7"
+args = ["'2020-01-01-10.00.00.5'"]
+question = "The IBM SQL form '2020-01-01-10.00.00.5' assigned to a TIMESTAMP(7) variable: is it 2020-01-01 10:00:00.5?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings (IBM SQL form)."
+outcome = [
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101", n2 = "=100000", text = "contains:.5000000" }, verdict = "consistent", meaning = "Assigned and read as that timestamp." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2, TEXT)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-DATE-ISO"
+fact = "V33"
+role = "decisive"
+procedure = "V33_DATE"
+args = ["'2020-01-01'"]
+question = "The ISO date string '2020-01-01' assigned to a DATE variable: is it 2020-01-01?"
+source = "IBM i 7.4 SQL Reference, Date strings (ISO form); that an assignment reads it as a cast does is inferred."
+outcome = [
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101" }, verdict = "consistent", meaning = "Assigned and read as that date." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-DATE-COMPACT"
+fact = "V33"
+role = "info"
+procedure = "V33_DATE"
+args = ["'20200101'"]
+question = "T-SQL's compact '20200101' assigned to a DATE variable: rejected (no Db2 for i date string form), as the docs read?"
+source = "IBM i 7.4 SQL Reference, Date strings: no 8-digit form; why the converter rewrites these literals."
+outcome = [
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Rejected: the rewrite to ISO is needed." },
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101" }, verdict = "open", meaning = "Accepted as 2020-01-01: the rewrite is not needed, but stays correct." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Accepted as another date (N1)." },
+]
+
+[[probe]]
+id = "V33-TS-COMPACT"
+fact = "V33"
+role = "info"
+procedure = "V33_TS7"
+args = ["'99991231 23:59:59.9999999'"]
+question = "T-SQL's '99991231 23:59:59.9999999' assigned to a TIMESTAMP(7) variable: rejected, as the docs read?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings: no form with a space and no dashes; why the converter rewrites these literals."
+outcome = [
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Rejected: the rewrite to ISO is needed." },
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=99991231", n2 = "=235959" }, verdict = "open", meaning = "Accepted as the end of time: the rewrite is not needed, but stays correct." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Accepted as another value (N1, N2, TEXT)." },
+]
+
+# ---------------------------------------------------------------- V34 sequence defaults as a BEFORE INSERT trigger
+# Db2 for i takes no NEXT VALUE in a column default, so a T-SQL sequence
+# default on a NOT NULL column becomes a BEFORE INSERT trigger that sets the
+# column when the INSERT leaves it out. Each probe runs the table, the
+# sequence (first value 10) and the trigger, then one or two INSERTs, with
+# V29_DDL: O_TEXT one letter per statement, O_N1 the rows, O_N2 the smallest K.
+
+[[probe]]
+id = "V34-OMITTED"
+fact = "V34"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''a'')'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''b'')'", "''"]
+question = "Two INSERTs that leave the NOT NULL column K out (it has no default): does the trigger fill it before the NOT NULL check, giving 10 and 11?"
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+outcome = [
+  { label = "filled", when = { text = "YYYYY-", n1 = "=2", n2 = "=10" }, verdict = "consistent", meaning = "The trigger fills the column, as T-SQL's default does." },
+  { label = "refused", when = { text = "YYYN*" }, verdict = "contradicts", meaning = "The INSERT is refused before the trigger can set the column (the NOT NULL check comes first, or the trigger was not created): the conversion needs another form." },
+  { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
+]
+
+[[probe]]
+id = "V34-MULTI-ROW"
+fact = "V34"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''a''), (''b''), (''c'')'", "'INSERT INTO SQLDFPROBE.UX (S) SELECT ''d'' FROM SYSIBM.SYSDUMMY1'", "''"]
+question = "A multi-row INSERT and an INSERT ... SELECT that leave K out: one new value per row (4 rows, the primary key holds, smallest 10)?"
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+outcome = [
+  { label = "per row", when = { text = "YYYYY-", n1 = "=4", n2 = "=10" }, verdict = "consistent", meaning = "One value per row, as T-SQL's default." },
+  { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
+]
+
+[[probe]]
+id = "V34-GIVEN"
+fact = "V34"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (K, S) VALUES (100, ''a'')'", "'INSERT INTO SQLDFPROBE.UX (S) VALUES (''b'')'", "''"]
+question = "An INSERT that gives K takes no sequence value (WHEN fails): the next INSERT that leaves K out still gets 10 (N2 = 10, not 11)?"
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+outcome = [
+  { label = "not taken", when = { text = "YYYYY-", n1 = "=2", n2 = "=10" }, verdict = "consistent", meaning = "No value taken for a given K, as T-SQL's default." },
+  { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
+]
+
+[[probe]]
+id = "V34-MERGE"
+fact = "V34"
+role = "decisive"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'MERGE INTO SQLDFPROBE.UX AS T USING (VALUES (''a'')) AS M (S) ON 1 = 0 WHEN NOT MATCHED THEN INSERT (S) VALUES (M.S)'", "''", "''"]
+question = "MERGE ... WHEN NOT MATCHED THEN INSERT leaving K out: does the BEFORE INSERT trigger fire and fill K (N2 = 10)?"
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+outcome = [
+  { label = "filled", when = { text = "YYYY--", n1 = "=1", n2 = "=10" }, verdict = "consistent", meaning = "The trigger fires for MERGE's INSERT." },
+  { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
+]
+
+[[probe]]
+id = "V34-NULL-GIVEN"
+fact = "V34"
+role = "info"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (K, S) VALUES (NULL, ''a'')'", "''", "''"]
+question = "An INSERT that writes NULL into K: T-SQL refuses it (NOT NULL); the trigger sees NULL and fills in 10 (ASM-SEQUENCE-DEFAULT-TRIGGER states this difference). Which happens?"
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+outcome = [
+  { label = "filled", when = { text = "YYYY--", n1 = "=1", n2 = "=10" }, verdict = "consistent", meaning = "Filled with the next value: the difference ASM-SEQUENCE-DEFAULT-TRIGGER states." },
+  { label = "refused", when = { text = "YYYN--" }, verdict = "refines", meaning = "Refused, as T-SQL: the stated difference does not exist." },
+  { label = "other", when = { text = "*" }, verdict = "contradicts", meaning = "Something else (see O_TEXT, N1, N2 and the SQLSTATE): the converted sequence default does not behave as T-SQL's." },
+]
+
+[[probe]]
+id = "V34-DEFAULT-KEYWORD"
+fact = "V34"
+role = "info"
+procedure = "V29_DDL"
+args = ["'CREATE TABLE SQLDFPROBE.UX (K BIGINT NOT NULL PRIMARY KEY, S VARCHAR(10))'", "'CREATE SEQUENCE SQLDFPROBE.SQ AS BIGINT START WITH 10 INCREMENT BY 1 MINVALUE 1 MAXVALUE 1000 NO CYCLE NO CACHE'", "'CREATE TRIGGER SQLDFPROBE.UXSEQ NO CASCADE BEFORE INSERT ON SQLDFPROBE.UX REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.K IS NULL) SET N.K = NEXT VALUE FOR SQLDFPROBE.SQ'", "'INSERT INTO SQLDFPROBE.UX (K, S) VALUES (DEFAULT, ''a'')'", "''", "''"]
+question = "An INSERT that writes DEFAULT into K (no default declared): T-SQL takes the next sequence value. Does Db2 for i refuse it, or hand the trigger NULL so it is filled (N2 = 10)?"
+source = "The converter writes a T-SQL `DEFAULT (NEXT VALUE FOR seq)` on a NOT NULL column as this trigger (crates/sqldiff-convert/src/tsql.rs, sequence_default_triggers); the IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch)."
+outcome = [
+  { label = "filled", when = { text = "YYYY--", n1 = "=1", n2 = "=10" }, verdict = "open", meaning = "Filled, as T-SQL." },
+  { label = "refused", when = { text = "YYYN--" }, verdict = "open", meaning = "Refused: INSERTs writing DEFAULT into the column need it left out instead." },
+  { label = "other", when = { text = "*" }, verdict = "open", meaning = "Something else (see O_TEXT and the SQLSTATE)." },
+]

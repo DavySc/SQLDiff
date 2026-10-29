@@ -4,7 +4,7 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{parse_stmt, tokens, Parser, Stmt, Tok, Type, K};
+use super::ast::{parse_stmt, tokens, Expr, Parser, Stmt, Tok, Type, K};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
 use crate::classify::{stmt_kind, StmtKind};
@@ -89,6 +89,91 @@ pub struct LStmt {
     pub ast: Result<Stmt, String>,
     /// PostgreSQL declaration-section initializers are lowered as assignments.
     pub from_declare: bool,
+    /// A message or error built from a format (`ast` then says why it is
+    /// not a plain statement): compared as its text (`Canon::message`).
+    pub msg: Option<Msg>,
+}
+
+/// A message or raised error whose text a format builds: T-SQL
+/// `RAISERROR (format, severity, state [, args])`, PL/pgSQL
+/// `RAISE NOTICE | EXCEPTION 'format' [, args]`.
+#[derive(Debug, Clone)]
+pub struct Msg {
+    /// Raised as an error (T-SQL severity 11 to 18, `RAISE EXCEPTION`);
+    /// otherwise an informational message (severity 0 to 10, `RAISE NOTICE`).
+    pub error: bool,
+    pub parts: Vec<MsgPart>,
+    /// T-SQL `RAISERROR`: the text is cut to 2,047 characters, and an empty
+    /// text reaches the client as one space.
+    pub tsql: bool,
+    /// The format is a variable (`RAISERROR (@v, …)`): a `%` in its value
+    /// is a format specification.
+    pub format_var: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum MsgPart {
+    Text(String),
+    /// A value shown as text, and as `null` when it is NULL.
+    Arg {
+        value: super::ast::Expr,
+        null: String,
+        spec: Spec,
+    },
+}
+
+/// What a format argument must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spec {
+    /// T-SQL `%s`, PostgreSQL `%` of a string: a character string.
+    Str,
+    /// T-SQL `%d` / `%i`, PostgreSQL `%` of `CAST(x AS text)`: an integer.
+    Int,
+}
+
+/// A control-flow step among the data statements: IF and WHILE are lowered
+/// to a flat sequence of markers around the statements they control, the
+/// same sequence in every dialect. `IF c THEN x ELSIF d THEN y ELSE z END
+/// IF` and T-SQL's `IF c x ELSE IF d y ELSE z` both become `if(c) x else
+/// if(d) y else z end end`; `WHILE c` becomes `while(c) … end`. Comparing
+/// the sequences marker against marker, with every statement in the same
+/// branch as its counterpart (`equiv::pair_items`), compares the control
+/// flow.
+#[derive(Debug, Clone)]
+pub enum CtlKind {
+    /// IF, ELSIF / ELSEIF, or the IF of T-SQL's ELSE IF: its condition. The
+    /// branch is taken when the condition is true (not false, not NULL) in
+    /// all three dialects.
+    If(Result<Expr, String>),
+    /// WHILE: the body runs while the condition is true.
+    While(Result<Expr, String>),
+    /// The start of the branch taken when the conditions before are not true.
+    Else,
+    /// The end of an IF (one per IF and per ELSIF) or of a loop.
+    End,
+    /// T-SQL BREAK, PostgreSQL EXIT, Db2 for i LEAVE of the innermost loop.
+    Break,
+    /// T-SQL and PostgreSQL CONTINUE, Db2 for i ITERATE of the innermost loop.
+    Continue,
+    /// A procedure call inside an IF or a loop. The call itself is compared
+    /// call against call (`call.rs`); the marker keeps its place in the
+    /// branch.
+    Call,
+}
+
+#[derive(Debug, Clone)]
+pub struct Ctl {
+    pub kind: CtlKind,
+    /// The condition for IF and WHILE (the IF or loop for END and ELSE, the
+    /// statement for the others), for locations.
+    pub node: SyntaxNode,
+    /// Where a conversion's trace finds it: the condition of the IF or loop
+    /// it belongs to (an ELSE and END close the IF of the condition before
+    /// them, so a T-SQL `ELSE IF` and the `ELSIF` it became sit in the same
+    /// trace unit), the statement for the others.
+    pub anchor: SyntaxNode,
+    /// The number of data statements before it.
+    pub after: usize,
 }
 
 /// Where a call sits: after this many data statements of the body, or
@@ -170,6 +255,12 @@ pub struct Unit {
     /// PostgreSQL `DROP TABLE IF EXISTS`, placed like `table_vars`: the drop
     /// before a converted table variable's `CREATE TEMP TABLE`.
     pub temp_drops: Vec<(SyntaxNode, usize)>,
+    /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
+    pub ctl: Vec<Ctl>,
+    /// How many IFs and loops the statement being lowered sits in.
+    depth: usize,
+    /// The labels of the loops around it, innermost last (upper case).
+    loops: Vec<Option<String>>,
 }
 
 /// The event a trigger body is lowered for.
@@ -238,6 +329,9 @@ fn empty(d: Dialect) -> Unit {
         other_temps: Default::default(),
         table_vars: Vec::new(),
         temp_drops: Vec::new(),
+        ctl: Vec::new(),
+        depth: 0,
+        loops: Vec::new(),
     }
 }
 
@@ -527,6 +621,8 @@ fn last_leaf(n: &SyntaxNode) -> Option<SyntaxNode> {
 fn place_txn(u: &mut Unit) {
     // The transaction protocol is understood only as BEGIN before the first
     // data statement and COMMIT after the last one (RETURN aside).
+    // An IF or loop condition reads data too; an END marks where its
+    // construct ends.
     let data: Vec<(usize, bool)> = u
         .stmts
         .iter()
@@ -536,6 +632,14 @@ fn place_txn(u: &mut Unit) {
                 matches!(s.ast, Ok(Stmt::Return(_))),
             )
         })
+        .chain(u.ctl.iter().map(|m| {
+            let r = m.node.text_range();
+            let at = match m.kind {
+                CtlKind::End => r.end(),
+                _ => r.start(),
+            };
+            (usize::from(at), false)
+        }))
         .collect();
     for (node, kind) in std::mem::take(&mut u.txn_stmts) {
         let at = usize::from(node.text_range().start());
@@ -767,16 +871,30 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         SyntaxKind::BLOCK => {
             let w = cst::first_words(c, 2);
             if w.get(1).is_some_and(|x| x == "ATOMIC") {
+                if u.depth > 0 {
+                    return inside_flow(c, u, "an atomic block");
+                }
                 u.txn_control = true;
             }
             walk(c, u)
         }
+        // A nested block's declarations are set again each time the block
+        // runs (PostgreSQL), where a T-SQL DECLARE inside a loop keeps the
+        // value: not compared inside IFs and loops.
+        SyntaxKind::DECLARE_SECTION if u.depth > 0 => inside_flow(c, u, "a declaration"),
         SyntaxKind::DECLARE_SECTION => {
             for s in cst::structural_children(c) {
                 pg_declaration(&s, u);
             }
         }
         SyntaxKind::STATEMENT => statement(c, u),
+        SyntaxKind::IF_STMT if u.trigger.is_none() => if_stmt(c, u),
+        SyntaxKind::LOOP_STMT if u.trigger.is_none() => loop_stmt(c, u),
+        // A CATCH or handler decides how the whole routine goes on after an
+        // error (`stops_on_error`), which one inside an IF or loop does not.
+        SyntaxKind::TRY_CATCH | SyntaxKind::HANDLER if u.depth > 0 => {
+            inside_flow(c, u, "error handling")
+        }
         SyntaxKind::TRY_CATCH => {
             for part in c.children() {
                 match part.kind() {
@@ -819,17 +937,233 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
     }
 }
 
+/// A construct that is compared at the top level but not inside an IF or a
+/// loop.
+fn inside_flow(c: &SyntaxNode, u: &mut Unit, what: &str) {
+    u.uncovered
+        .push((c.clone(), format!("{what} inside an IF or a loop")));
+}
+
+fn mark(u: &mut Unit, kind: CtlKind, node: &SyntaxNode) {
+    mark_at(u, kind, node, node);
+}
+
+fn mark_at(u: &mut Unit, kind: CtlKind, node: &SyntaxNode, anchor: &SyntaxNode) {
+    u.ctl.push(Ctl {
+        kind,
+        node: node.clone(),
+        anchor: anchor.clone(),
+        after: u.stmts.len(),
+    });
+}
+
+/// The expression of a CONDITION node: the whole of its tokens.
+fn condition(c: &SyntaxNode, d: Dialect) -> Result<Expr, String> {
+    expression(&tokens(c), d)
+}
+
+fn expression(toks: &[Tok], d: Dialect) -> Result<Expr, String> {
+    let mut p = Parser::new(toks, d);
+    let e = p.expr()?;
+    if !p.at_end() {
+        return Err("unexpected tokens after the condition".into());
+    }
+    Ok(e)
+}
+
+/// IF … [ELSIF …] [ELSE …]: `if(c) …` per condition, `else` before every
+/// branch but the first, and one `end` per condition (`CtlKind`). An IF of
+/// another shape stays uncovered.
+fn if_stmt(c: &SyntaxNode, u: &mut Unit) {
+    use SyntaxKind::{BRANCH, CONDITION};
+    let kids: Vec<SyntaxNode> = c.children().collect();
+    // CONDITION BRANCH (CONDITION BRANCH)* [BRANCH], nothing else.
+    let shape = {
+        let mut i = 0;
+        let mut conds = 0;
+        while i + 1 < kids.len() && kids[i].kind() == CONDITION && kids[i + 1].kind() == BRANCH {
+            i += 2;
+            conds += 1;
+        }
+        if i < kids.len() && kids[i].kind() == BRANCH {
+            i += 1;
+        }
+        conds > 0 && i == kids.len()
+    };
+    if !shape {
+        u.uncovered.push((c.clone(), "an IF statement".into()));
+        return;
+    }
+    // The conditions opened so far: an ELSE closes the branch of the last.
+    let mut opened: Vec<&SyntaxNode> = Vec::new();
+    let mut cond: Option<&SyntaxNode> = None;
+    for k in &kids {
+        if k.kind() == CONDITION {
+            cond = Some(k);
+            continue;
+        }
+        if let Some(&last) = opened.last() {
+            mark_at(u, CtlKind::Else, k, last);
+        }
+        if let Some(cn) = cond.take() {
+            mark(u, CtlKind::If(condition(cn, u.dialect)), cn);
+            opened.push(cn);
+        }
+        u.depth += 1;
+        walk(k, u);
+        u.depth -= 1;
+    }
+    for cn in opened.into_iter().rev() {
+        mark_at(u, CtlKind::End, c, cn);
+    }
+}
+
+/// WHILE c (T-SQL `WHILE c stmt`, PostgreSQL `WHILE c LOOP … END LOOP`,
+/// Db2 for i `[label:] WHILE c DO … END WHILE [label]`): `while(c) … end`.
+/// Other loops (PostgreSQL LOOP, FOR, Db2 for i REPEAT, FOR) stay uncovered.
+fn loop_stmt(c: &SyntaxNode, u: &mut Unit) {
+    use SyntaxKind::{BRANCH, CONDITION, LABEL};
+    let kids: Vec<SyntaxNode> = c.children().collect();
+    let (label, rest) = match kids.split_first() {
+        Some((l, rest)) if l.kind() == LABEL => {
+            let name = tokens(l)
+                .first()
+                .filter(|t| t.kind == K::Word)
+                .map(|t| t.up.clone());
+            if name.is_none() {
+                u.uncovered.push((c.clone(), "a loop".into()));
+                return;
+            }
+            (name, rest)
+        }
+        _ => (None, &kids[..]),
+    };
+    let first_word = c
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_ascii_uppercase());
+    let [cond, body] = rest else {
+        u.uncovered.push((c.clone(), "a loop".into()));
+        return;
+    };
+    if first_word.as_deref() != Some("WHILE") || cond.kind() != CONDITION || body.kind() != BRANCH {
+        u.uncovered.push((c.clone(), "a loop".into()));
+        return;
+    }
+    mark(u, CtlKind::While(condition(cond, u.dialect)), cond);
+    u.depth += 1;
+    u.loops.push(label);
+    walk(body, u);
+    u.loops.pop();
+    u.depth -= 1;
+    mark_at(u, CtlKind::End, c, cond);
+}
+
+/// BREAK / CONTINUE of the innermost loop: T-SQL `BREAK`, `CONTINUE`;
+/// PostgreSQL `EXIT`, `CONTINUE` without a label, optionally `WHEN c`
+/// (`if(c) break end`); Db2 for i `LEAVE l`, `ITERATE l` where `l` labels the
+/// innermost loop. Returns whether the statement was one (lowered, or
+/// uncovered when it leaves anything but the innermost loop).
+fn jump(c: &SyntaxNode, u: &mut Unit) -> bool {
+    let d = u.dialect;
+    let toks: Vec<Tok> = tokens(c)
+        .into_iter()
+        .filter(|t| t.kind != K::Semi)
+        .collect();
+    let Some(first) = toks.first().filter(|t| t.kind == K::Word) else {
+        return false;
+    };
+    let kind = match (d, first.up.as_str()) {
+        (Dialect::Tsql, "BREAK") | (Dialect::Postgres, "EXIT") | (Dialect::Db2i, "LEAVE") => {
+            CtlKind::Break
+        }
+        (Dialect::Tsql | Dialect::Postgres, "CONTINUE") | (Dialect::Db2i, "ITERATE") => {
+            CtlKind::Continue
+        }
+        _ => return false,
+    };
+    let rest = &toks[1..];
+    let Some(innermost) = u.loops.last().cloned() else {
+        u.uncovered
+            .push((c.clone(), format!("`{}` outside a loop", first.up)));
+        return true;
+    };
+    let when = match d {
+        Dialect::Tsql if rest.is_empty() => None,
+        Dialect::Db2i => match rest {
+            [l] if l.kind == K::Word && innermost.as_deref() == Some(l.up.as_str()) => None,
+            _ => {
+                u.uncovered.push((
+                    c.clone(),
+                    format!("`{}` of another loop or block", first.up),
+                ));
+                return true;
+            }
+        },
+        Dialect::Postgres => match rest {
+            [] => None,
+            [w, cond @ ..] if w.kind == K::Word && w.up == "WHEN" && !cond.is_empty() => {
+                Some(expression(cond, d))
+            }
+            _ => {
+                u.uncovered.push((
+                    c.clone(),
+                    format!("`{}` of another loop or block", first.up),
+                ));
+                return true;
+            }
+        },
+        _ => {
+            u.uncovered.push((c.clone(), format!("`{}`", first.up)));
+            return true;
+        }
+    };
+    match when {
+        None => mark(u, kind, c),
+        Some(cond) => {
+            mark(u, CtlKind::If(cond), c);
+            mark(u, kind, c);
+            mark(u, CtlKind::End, c);
+        }
+    }
+    true
+}
+
 fn statement(c: &SyntaxNode, u: &mut Unit) {
     let d = u.dialect;
     let kind = stmt_kind(c, d);
     let words = cst::first_words(c, 3);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
-    if let Some(ast) = message(c, d) {
+    if jump(c, u) {
+        return;
+    }
+    if u.depth > 0 {
+        let what = match kind {
+            // A T-SQL variable lives from its DECLARE to the end of the
+            // batch whatever branch it sits in, and a DECLARE in a loop does
+            // not reset it: only the initial value is a statement, an
+            // assignment in its place. PostgreSQL and Db2 for i declare at
+            // the top of a block, which a block inside a loop runs again.
+            StmtKind::Declare if d != Dialect::Tsql => Some("a declaration"),
+            StmtKind::Ddl => Some("a DDL statement"),
+            StmtKind::TxnBegin | StmtKind::TxnCommit | StmtKind::TxnSetting => {
+                Some("transaction control")
+            }
+            StmtKind::SessionSetting => Some("a session setting"),
+            _ => None,
+        };
+        if let Some(what) = what.filter(|_| !is_call(c, d)) {
+            return inside_flow(c, u, what);
+        }
+    }
+    if let Some((ast, msg)) = message(c, d) {
         u.stmts.push(LStmt {
             node: c.clone(),
             toks: tokens(c),
             ast,
             from_declare: false,
+            msg,
         });
         return;
     }
@@ -849,6 +1183,9 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 after: u.stmts.len(),
             };
             u.calls.push((c.clone(), at));
+            if u.depth > 0 {
+                mark(u, CtlKind::Call, c);
+            }
         }
         StmtKind::Select
         | StmtKind::Insert
@@ -883,6 +1220,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 toks,
                 ast,
                 from_declare,
+                msg: None,
             });
         }
         // A script's own `CREATE TABLE`: compared table against table
@@ -921,6 +1259,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                         toks: body,
                         ast,
                         from_declare: false,
+                        msg: None,
                     });
                 }
                 _ => u
@@ -1070,22 +1409,37 @@ fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }
 
-/// T-SQL `PRINT e`; PostgreSQL `RAISE NOTICE '%', e` or `RAISE NOTICE 'text'`
-/// (no placeholder). `None` for any other statement; an error for a message
-/// whose form is not read.
-fn message(c: &SyntaxNode, d: Dialect) -> Option<Result<Stmt, String>> {
+/// What a message statement lowers to: a plain statement, or a message
+/// built from a format.
+type Lowered = (Result<Stmt, String>, Option<Msg>);
+
+/// T-SQL `PRINT e` and `RAISERROR (format, severity, state [, args])`;
+/// PostgreSQL `RAISE NOTICE '%', e`, `RAISE NOTICE 'text'` and
+/// `RAISE NOTICE | EXCEPTION 'format', args`. `None` for any other
+/// statement; an error for a message whose form is not read.
+fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
+    use super::ast::Expr;
     let toks: Vec<Tok> = tokens(c)
         .into_iter()
         .filter(|t| t.kind != K::Semi)
         .collect();
+    let level = toks.get(1).map(|t| t.up.as_str());
     let rest = match (d, toks.first().map(|t| t.up.as_str())) {
         (Dialect::Tsql, Some("PRINT")) => &toks[1..],
-        (Dialect::Postgres, Some("RAISE")) if toks.get(1).is_some_and(|t| t.up == "NOTICE") => {
+        (Dialect::Tsql, Some("RAISERROR")) => {
+            let r = raiserror(&toks[1..]);
+            let why = "a RAISERROR compared as its message".to_string();
+            return Some(match r {
+                Ok(m) => (Err(why), Some(m)),
+                Err(e) => (Err(e), None),
+            });
+        }
+        (Dialect::Postgres, Some("RAISE")) if matches!(level, Some("NOTICE" | "EXCEPTION")) => {
             &toks[2..]
         }
         _ => return None,
     };
-    let expr = |ts: &[Tok]| -> Result<super::ast::Expr, String> {
+    let expr = |ts: &[Tok]| -> Result<Expr, String> {
         let mut p = Parser::new(ts, d);
         let e = p.expr()?;
         if p.at_end() {
@@ -1094,21 +1448,279 @@ fn message(c: &SyntaxNode, d: Dialect) -> Option<Result<Stmt, String>> {
             Err("trailing tokens after the message".into())
         }
     };
-    Some((|| {
-        if d == Dialect::Tsql {
-            return Ok(Stmt::Message(expr(rest)?));
-        }
-        let parts = split_commas(rest);
-        let fmt = match parts.first().map(|p| expr(p)) {
-            Some(Ok(super::ast::Expr::Str(f))) => f,
-            _ => return Err("RAISE NOTICE without a format string".into()),
+    if d == Dialect::Tsql {
+        return Some((expr(rest).map(Stmt::Message), None));
+    }
+    let error = level == Some("EXCEPTION");
+    // `RAISE EXCEPTION USING MESSAGE = …` (THROW's conversion) and other
+    // forms without a format string stay uncovered, as before.
+    if !rest.first().is_some_and(|t| t.kind == K::Str) {
+        return if error {
+            None
+        } else {
+            Some((Err("RAISE NOTICE without a format string".into()), None))
         };
-        match parts.as_slice() {
-            [_] if !fmt.contains('%') => Ok(Stmt::Message(super::ast::Expr::Str(fmt))),
-            [_, arg] if fmt == "%" => Ok(Stmt::Message(expr(arg)?)),
-            _ => Err("a RAISE NOTICE format other than '%' with one value".into()),
+    }
+    // `USING ERRCODE = 'P0001'` (RAISE EXCEPTION's own default) is the one
+    // option read: the rest change what the caller sees.
+    let using = rest
+        .iter()
+        .position(|t| t.kind == K::Word && t.up == "USING")
+        .unwrap_or(rest.len());
+    let opts: Vec<&str> = rest[using..]
+        .iter()
+        .map(|t| {
+            if t.kind == K::Word {
+                t.up.as_str()
+            } else {
+                t.text.as_str()
+            }
+        })
+        .collect();
+    let errcode = matches!(opts.as_slice(), ["USING", "ERRCODE", "=", "'P0001'"]);
+    // A RAISE EXCEPTION without it is no RAISERROR's conversion (the
+    // converter's stand-in for a statement it did not convert is one): it
+    // stays uncovered, as before.
+    if error && !errcode {
+        return None;
+    }
+    let opts_ok = opts.is_empty() || errcode;
+    let parts = split_commas(&rest[..using]);
+    let fmt = match parts.first().map(|p| expr(p)) {
+        Some(Ok(Expr::Str(f))) => f,
+        _ => return Some((Err("RAISE without a format string".into()), None)),
+    };
+    let lowered =
+        (|| -> Result<Lowered, String> {
+            if !opts_ok {
+                return Err("RAISE with USING options other than ERRCODE = 'P0001'".into());
+            }
+            let args = parts[1..]
+                .iter()
+                .map(|p| expr(p))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !error {
+                match (args.as_slice(), fmt.as_str()) {
+                    ([], f) if !f.contains('%') => {
+                        return Ok((Ok(Stmt::Message(Expr::Str(fmt.clone()))), None))
+                    }
+                    ([arg], "%") if pg_shown(arg).is_none() => {
+                        return Ok((Ok(Stmt::Message(arg.clone())), None))
+                    }
+                    _ => {}
+                }
+            }
+            let mut args = args.into_iter();
+            let mut parts = Vec::new();
+            let mut text = String::new();
+            let mut cs = fmt.chars().peekable();
+            while let Some(ch) = cs.next() {
+                if ch != '%' {
+                    text.push(ch);
+                    continue;
+                }
+                if cs.peek() == Some(&'%') {
+                    cs.next();
+                    text.push('%');
+                    continue;
+                }
+                let arg = args.next().ok_or("too few parameters for RAISE")?;
+                match pg_shown(&arg) {
+                    Some(MsgPart::Text(s)) => text.push_str(&s),
+                    Some(p) => {
+                        parts.push(MsgPart::Text(std::mem::take(&mut text)));
+                        parts.push(p);
+                    }
+                    None => return Err(
+                        "a RAISE value that may be NULL (PostgreSQL shows <NULL>, T-SQL (null))"
+                            .into(),
+                    ),
+                }
+            }
+            if args.next().is_some() {
+                return Err("too many parameters for RAISE".into());
+            }
+            parts.push(MsgPart::Text(text));
+            let msg = Msg {
+                error,
+                parts,
+                tsql: false,
+                format_var: false,
+            };
+            Ok((Err("a RAISE compared as its message".into()), Some(msg)))
+        })();
+    Some(lowered.unwrap_or_else(|e| (Err(e), None)))
+}
+
+/// A PL/pgSQL `RAISE` argument that is never NULL, as a message part: a
+/// string literal, `COALESCE(x, 'text')` (a string `x`) or
+/// `COALESCE(CAST(x AS text), 'text')` (an integer `x`).
+fn pg_shown(e: &super::ast::Expr) -> Option<MsgPart> {
+    use super::ast::Expr;
+    match e {
+        Expr::Str(s) => Some(MsgPart::Text(s.clone())),
+        Expr::Call(c)
+            if c.name.len() == 1
+                && c.name[0].eq_ignore_ascii_case("COALESCE")
+                && !c.distinct
+                && !c.over
+                && !c.star
+                && c.order.is_empty() =>
+        {
+            let [x, Expr::Str(null)] = c.args.as_slice() else {
+                return None;
+            };
+            let (value, spec) = match x {
+                Expr::Cast(v, t) if t.name.eq_ignore_ascii_case("TEXT") && t.args.is_empty() => {
+                    ((**v).clone(), Spec::Int)
+                }
+                v => (v.clone(), Spec::Str),
+            };
+            Some(MsgPart::Arg {
+                value,
+                null: null.clone(),
+                spec,
+            })
         }
-    })())
+        _ => None,
+    }
+}
+
+/// `RAISERROR (format, severity, state [, args]) [WITH NOWAIT]`, from the
+/// token after the keyword. Read only with a literal severity of 0 to 18 and
+/// a format that is a string literal (`%s`, `%d`, `%i`, `%%` and as many
+/// arguments as it takes) or a variable without arguments. Verified on SQL
+/// Server 2022: a NULL argument shows as `(null)`, a NULL format as an
+/// empty message; severity 0 to 10 is an informational message that
+/// TRY/CATCH does not catch.
+fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
+    use super::ast::Expr;
+    let close = match toks.first() {
+        Some(t) if t.kind == K::LParen => {
+            let mut depth = 0;
+            toks.iter()
+                .position(|t| {
+                    match t.kind {
+                        K::LParen => depth += 1,
+                        K::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .ok_or("RAISERROR without its closing parenthesis")?
+        }
+        _ => return Err("RAISERROR without parentheses".into()),
+    };
+    // WITH NOWAIT only sends the message at once; LOG and SETERROR change
+    // what is recorded.
+    match toks[close + 1..]
+        .iter()
+        .map(|t| t.up.as_str())
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] | ["WITH", "NOWAIT"] => {}
+        _ => return Err("RAISERROR WITH LOG or SETERROR".into()),
+    }
+    let expr = |ts: &[Tok]| -> Result<Expr, String> {
+        let mut p = Parser::new(ts, Dialect::Tsql);
+        let e = p.expr()?;
+        if p.at_end() {
+            Ok(e)
+        } else {
+            Err("trailing tokens in a RAISERROR argument".into())
+        }
+    };
+    let args = split_commas(&toks[1..close])
+        .into_iter()
+        .map(expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    let [fmt, sev, _state, args @ ..] = args.as_slice() else {
+        return Err("RAISERROR with fewer than three arguments".into());
+    };
+    let error = match sev {
+        Expr::Num(s) => match s.parse::<u32>() {
+            Ok(0..=10) => false,
+            Ok(11..=18) => true,
+            _ => return Err("a RAISERROR severity outside 0 to 18".into()),
+        },
+        _ => return Err("a RAISERROR severity that is not a literal".into()),
+    };
+    let null = "(null)".to_string();
+    let mut parts = Vec::new();
+    let format_var = match fmt {
+        Expr::Var(v) if !v.starts_with("@@") => {
+            if !args.is_empty() {
+                return Err("a RAISERROR format variable with arguments".into());
+            }
+            parts.push(MsgPart::Arg {
+                value: fmt.clone(),
+                null: String::new(),
+                spec: Spec::Str,
+            });
+            true
+        }
+        Expr::Str(f) => {
+            let mut args = args.iter();
+            let mut text = String::new();
+            let mut cs = f.chars();
+            while let Some(ch) = cs.next() {
+                if ch != '%' {
+                    text.push(ch);
+                    continue;
+                }
+                let spec = match cs.next() {
+                    Some('%') => {
+                        text.push('%');
+                        continue;
+                    }
+                    Some('s') => Spec::Str,
+                    Some('d' | 'i') => Spec::Int,
+                    _ => {
+                        return Err(
+                            "a RAISERROR format specification other than %s, %d, %i or %%".into(),
+                        )
+                    }
+                };
+                let value = args
+                    .next()
+                    .ok_or("a RAISERROR format with more specifications than arguments")?;
+                // A constant shows as its text (the substitution is not read
+                // as a format again).
+                match (value, spec) {
+                    (Expr::Str(x), Spec::Str) => {
+                        text.push_str(x);
+                        continue;
+                    }
+                    (Expr::Num(x), Spec::Int)
+                        if x.parse::<i32>().is_ok_and(|v| v.to_string() == *x) =>
+                    {
+                        text.push_str(x);
+                        continue;
+                    }
+                    _ => {}
+                }
+                parts.push(MsgPart::Text(std::mem::take(&mut text)));
+                parts.push(MsgPart::Arg {
+                    value: value.clone(),
+                    null: null.clone(),
+                    spec,
+                });
+            }
+            if args.next().is_some() {
+                return Err("a RAISERROR with more arguments than its format uses".into());
+            }
+            parts.push(MsgPart::Text(text));
+            false
+        }
+        _ => return Err("a RAISERROR message number".into()),
+    };
+    Ok(Msg {
+        error,
+        parts,
+        tsql: true,
+        format_var,
+    })
 }
 
 fn note(u: &mut Unit, s: &str) {
@@ -1166,6 +1778,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         toks,
         ast,
         from_declare: true,
+        msg: None,
     });
 }
 

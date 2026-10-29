@@ -552,3 +552,38 @@ fn review_cases() {
         Dialect::Postgres,
     );
 }
+
+/// A T-SQL computed column whose CASE results are all `CONVERT(bit, …)` is a
+/// bit column (T-SQL gives a CASE its results' type), so a reader that keeps
+/// `= 1` against the PostgreSQL boolean generated column is caught.
+#[test]
+fn computed_bit_column_is_a_bit() {
+    let ms = "CREATE TABLE dbo.T (Id int NOT NULL, D date NULL,
+  IsOpen AS (CASE WHEN D IS NULL THEN CONVERT(bit,1) ELSE CONVERT(bit,0) END));";
+    let pg = "CREATE TABLE T (Id integer NOT NULL, D date NULL,
+  IsOpen boolean GENERATED ALWAYS AS (CASE WHEN D IS NULL THEN TRUE ELSE FALSE END) STORED);";
+    let run = |b: &str| {
+        let opts = Options {
+            catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, ms)],
+            catalog_b: vec![Artifact::new("catalog.sql", Dialect::Postgres, pg)],
+            ..Options::default()
+        };
+        diff(
+            &Artifact::new(
+                "a.sql",
+                Dialect::Tsql,
+                "CREATE VIEW dbo.V AS SELECT Id FROM dbo.T WHERE IsOpen = 1;",
+            ),
+            &Artifact::new("b.sql", Dialect::Postgres, b),
+            &opts,
+        )
+    };
+    let kept = run("CREATE OR REPLACE VIEW V AS SELECT Id FROM T WHERE IsOpen = 1;");
+    assert_eq!(kept.verdict(), Verdict::Different, "{:#?}", kept.findings);
+    assert!(kept
+        .findings
+        .iter()
+        .any(|f| f.rule == "equiv.bool-type-error"));
+    let fixed = run("CREATE OR REPLACE VIEW V AS SELECT Id FROM T WHERE IsOpen = TRUE;");
+    assert_ne!(fixed.verdict(), Verdict::Different, "{:#?}", fixed.findings);
+}

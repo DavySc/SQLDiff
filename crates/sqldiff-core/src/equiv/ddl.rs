@@ -1037,7 +1037,12 @@ fn indexes(
             }
             null_cols.push(c.clone());
         }
-        if ft.string.is_some() {
+        if ft.string.is_some() && fo.string.is_some() && super::compare::ci_collation() {
+            // Conversions: the duplicates T-SQL's collation rejects and
+            // PostgreSQL accepts are flagged.
+            ev.push(Event::Asm(super::canon::asm::TSQL_CI));
+            ev.push(Event::Asm(super::canon::asm::CI_COLLATION));
+        } else if ft.string.is_some() {
             ev.push(Event::Asm(super::canon::asm::TSQL_CI));
             ev.push(diff(
                 "equiv.case-sensitivity",

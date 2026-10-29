@@ -197,10 +197,10 @@ fn temporal_tables_and_behavioural_options_are_not_storage() {
 
 #[test]
 fn a_qualified_system_type_is_one_type() {
-    let src = "CREATE TABLE t (a int, loc [sys].[geography] NULL);\n";
+    let src = "CREATE TABLE t (a int, loc [sys].[hierarchyid] NULL);\n";
     let c = pg(src);
     assert_eq!(c.units[0].status, Status::NotConverted, "{}", c.output);
-    assert!(c.output.contains("GEOGRAPHY"), "{}", c.output);
+    assert!(c.output.contains("HIERARCHYID"), "{}", c.output);
 }
 
 #[test]
@@ -315,7 +315,7 @@ fn exec_with_output_needs_the_callee_from_the_tree() {
 #[test]
 fn the_target_catalog_binds_names_from_other_files() {
     // A table the conversion could not create does not exist in the output tree.
-    let table = "CREATE TABLE s.t (a int, loc geography);\n";
+    let table = "CREATE TABLE s.t (a int, loc hierarchyid);\n";
     let query = "CREATE PROCEDURE s.p AS\nBEGIN\n  UPDATE s.t SET a = 1;\nEND\n";
     let out_table = sqldiff_convert::rewrite(table, Dialect::Tsql, Dialect::Postgres);
     let mut target = sqldiff_core::catalog::Catalog::default();

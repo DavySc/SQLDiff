@@ -309,6 +309,9 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
                     // T-SQL computed column: `c AS (expr)`.
                     col.has_default = true;
                     col.generated = true;
+                    if let Some(ty) = computed_case_type(&opts[1..]) {
+                        col.data_type = DataType::parse(&tokens::texts(ty));
+                    }
                 }
                 _ => {}
             }
@@ -318,6 +321,91 @@ pub fn column_defs(tb: &mut Table, inner: &[Tok], dialect: Dialect) {
             .retain(|c| super::key(dialect, &c.name) != super::key(dialect, &name));
         tb.columns.push(col);
     }
+}
+
+/// The type of a T-SQL computed column `(CASE … END) [PERSISTED …]` whose
+/// every result is `CONVERT(t, …)` or `CAST(… AS t)` of one type `t`: T-SQL
+/// gives a CASE the type of its results, so the column has type `t`. Other
+/// expressions: `None` (the type stays unknown).
+fn computed_case_type(el: &[Tok]) -> Option<&[Tok]> {
+    el.first().filter(|x| x.is(SyntaxKind::L_PAREN))?;
+    let close = close_paren(el, 0);
+    let mut e = el.get(1..close)?;
+    while e.len() > 2 && e[0].is(SyntaxKind::L_PAREN) && close_paren(e, 0) == e.len() - 1 {
+        e = &e[1..e.len() - 1];
+    }
+    if !e.first()?.is_kw("CASE") || !e.last()?.is_kw("END") {
+        return None;
+    }
+    // Results: after THEN / ELSE of this CASE, up to its next WHEN / ELSE / END.
+    let mut results: Vec<&[Tok]> = Vec::new();
+    let (mut depth, mut cases) = (0usize, 0usize);
+    let mut start: Option<usize> = None;
+    for (i, x) in e.iter().enumerate() {
+        match x.kind {
+            SyntaxKind::L_PAREN => depth += 1,
+            SyntaxKind::R_PAREN => depth = depth.saturating_sub(1),
+            _ if depth > 0 => {}
+            _ if x.is_kw("CASE") => cases += 1,
+            _ if cases == 1 && (x.is_kw("WHEN") || x.is_kw("ELSE") || x.is_kw("END")) => {
+                if let Some(s) = start.take() {
+                    results.push(&e[s..i]);
+                }
+                if x.is_kw("ELSE") {
+                    start = Some(i + 1);
+                }
+                if x.is_kw("END") {
+                    cases -= 1;
+                }
+            }
+            _ if cases == 1 && x.is_kw("THEN") => start = Some(i + 1),
+            _ if x.is_kw("END") => cases -= 1,
+            _ => {}
+        }
+    }
+    let mut ty: Option<&[Tok]> = None;
+    for mut r in results {
+        while r.len() > 2 && r[0].is(SyntaxKind::L_PAREN) && close_paren(r, 0) == r.len() - 1 {
+            r = &r[1..r.len() - 1];
+        }
+        let f = r.first()?;
+        if r.len() < 4 || !r[1].is(SyntaxKind::L_PAREN) || close_paren(r, 1) != r.len() - 1 {
+            return None;
+        }
+        let inner = &r[2..r.len() - 1];
+        let t = if f.is_kw("CONVERT") {
+            *split_commas(inner).first()?
+        } else if f.is_kw("CAST") {
+            let mut d = 0usize;
+            let at = inner.iter().enumerate().rev().find_map(|(i, x)| {
+                match x.kind {
+                    SyntaxKind::R_PAREN => d += 1,
+                    SyntaxKind::L_PAREN => d = d.saturating_sub(1),
+                    _ if d == 0 && x.is_kw("AS") => return Some(i),
+                    _ => {}
+                }
+                None
+            })?;
+            &inner[at + 1..]
+        } else {
+            return None;
+        };
+        let key = |t: &[Tok]| -> Vec<String> {
+            t.iter()
+                .filter(|x| !matches!(x.kind, SyntaxKind::L_BRACKET | SyntaxKind::R_BRACKET))
+                .map(|x| {
+                    x.text
+                        .trim_matches(|c| c == '[' || c == ']')
+                        .to_ascii_uppercase()
+                })
+                .collect()
+        };
+        match ty {
+            Some(prev) if key(prev) != key(t) => return None,
+            _ => ty = Some(t),
+        }
+    }
+    ty
 }
 
 /// End of the type words in a column or parameter definition starting at `from`.

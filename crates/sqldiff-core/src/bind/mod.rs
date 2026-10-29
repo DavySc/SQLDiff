@@ -1867,6 +1867,23 @@ impl<'a> Binder<'a> {
                     Vec::new(),
                 );
             }
+            // PostGIS's `geography`, the conversion of T-SQL GEOGRAPHY: an
+            // extension type, so it exists only where postgis is installed.
+            builtins::Availability::Unknown
+                if self.d == Dialect::Postgres && base.eq_ignore_ascii_case("geography") =>
+            {
+                let id = self.assume(
+                    "ASM-POSTGIS-GEOGRAPHY".to_string(),
+                    format!("Type `{}` is PostGIS's: the postgis extension is installed and on the search path", ty.text),
+                );
+                self.add_ref(
+                    RefKind::Type,
+                    ty.text.clone(),
+                    span,
+                    stmt,
+                    Resolution::Assumed(id),
+                );
+            }
             builtins::Availability::Unknown => {
                 let elsewhere = builtins::type_elsewhere(&base, self.d);
                 if !elsewhere.is_empty() {

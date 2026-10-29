@@ -32,6 +32,12 @@ pub mod asm {
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
     );
+    /// Davy, 2026-10-29: T-SQL string equality against the other side's
+    /// case-sensitive one is kept, and flagged with this per statement.
+    pub const CI_COLLATION: (&str, &str) = (
+        "ASM-CI-COLLATION",
+        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+    );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
         "UPPER/LOWER fold the same characters as the case-insensitive comparison on the other side",
@@ -87,6 +93,14 @@ pub mod asm {
     pub const PAGE_COUNT_NOT_NULL: (&str, &str) = (
         "ASM-PAGE-COUNT-NOT-NULL",
         "The row count and offset of TOP / LIMIT / FETCH / OFFSET are never NULL: T-SQL raises an error for NULL (Msg 1014), PostgreSQL reads LIMIT NULL as no limit and OFFSET NULL as 0, and Db2 for i was not checked",
+    );
+    pub const RAISERROR_TEXT: (&str, &str) = (
+        "ASM-RAISERROR-TEXT",
+        "The RAISERROR message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space, where PostgreSQL keeps the text as it is",
+    );
+    pub const RAISERROR_FORMAT: (&str, &str) = (
+        "ASM-RAISERROR-FORMAT",
+        "The variable RAISERROR takes as its message holds no % sign: T-SQL reads it as a format, so % starts a substitution",
     );
     pub const RESULT_TYPES: (&str, &str) = (
         "ASM-RESULT-TYPES",
@@ -535,12 +549,15 @@ impl<'a> Canon<'a> {
     }
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
-    fn fits(dst: &Ty, src: &Ty) -> bool {
+    fn fits(&self, dst: &Ty, src: &Ty) -> bool {
         if dst.fam != src.fam {
+            // PostgreSQL drops the trailing blanks of a CHAR value converted
+            // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
             return dst.is_string()
                 && src.is_string()
                 && dst.fam == Fam::VarChar
-                && dst.len.is_none();
+                && dst.len.is_none()
+                && !(self.d == Dialect::Postgres && src.fam == Fam::Char);
         }
         match dst.fam {
             // A bounded binary target cuts a longer value off in T-SQL and
@@ -563,7 +580,11 @@ impl<'a> Canon<'a> {
                 src.len.is_none()
                     || (dst.scale == src.scale && dst.len.zip(src.len).is_some_and(|(d, s)| d >= s))
             }
-            _ => true,
+            // The engine does not know which type an `Other` is (BINARY(n),
+            // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
+            // round or fail.
+            Fam::Other => false,
+            Fam::Date | Fam::Interval | Fam::Bool => true,
         }
     }
 
@@ -640,7 +661,7 @@ impl<'a> Canon<'a> {
             }
         }
         match &v.1 {
-            Some(s) if Self::fits(d, s) => v,
+            Some(s) if self.fits(d, s) => v,
             None if matches!(v.0.head(), "null") => v,
             _ => self.convert(*d, v, if var { How::Var } else { How::Store }),
         }
@@ -892,9 +913,17 @@ impl<'a> Canon<'a> {
                 }
                 items.sort();
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
-                // Like `=`: string membership depends on the collation.
+                // Like `=`: string membership depends on the collation. With
+                // a string operand and string items it is string equality
+                // (`coll-eq`); otherwise a conversion may take part.
                 if string {
-                    kids.push(self.dtag());
+                    let all_strings = ty.is_some_and(|t| t.is_string())
+                        && item_tys.iter().all(|t| t.is_some_and(|t| t.is_string()));
+                    kids.push(if all_strings {
+                        n("coll-eq", vec![self.dtag()])
+                    } else {
+                        self.dtag()
+                    });
                 } else if !known {
                     self.assume(asm::UNTYPED);
                 }
@@ -1370,6 +1399,9 @@ impl<'a> Canon<'a> {
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
             // padded values compare and concatenate, which those terms keep.
+            // PostgreSQL drops a CHAR value's trailing blanks when it becomes
+            // varchar or text; SQL Server keeps them.
+            (Char, VarChar) if self.d == Dialect::Postgres => Rule::Dialect,
             (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
             (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
             // Fewer fractional digits round differently: PostgreSQL rounds a
@@ -1515,7 +1547,7 @@ impl<'a> Canon<'a> {
                     || (b.is("str")
                         && b.kid(0).and_then(Term::atom) == Some("")
                         && first_ty.is_some_and(|t| t.is_string()))
-                    || matches!((first_ty, bty), (Some(x), Some(y)) if Self::fits(&x, &y));
+                    || matches!((first_ty, bty), (Some(x), Some(y)) if self.fits(&x, &y));
                 if fits {
                     portable("coalesce", args, first_ty)
                 } else if let (Some(x), Some(y)) = (first_ty, bty) {
@@ -2572,6 +2604,14 @@ impl<'a> Canon<'a> {
         s.ok_or_else(|| "assignment target is not a parameter or local variable".to_string())
     }
 
+    /// The condition of an IF or WHILE, evaluated once each time it is
+    /// tested.
+    pub fn condition(&mut self, e: &Expr) -> R<Term> {
+        self.seen_tables.clear();
+        self.single_row = true;
+        Ok(self.cond(e)?.0)
+    }
+
     pub fn stmt(&mut self, s: &Stmt) -> R<Term> {
         self.seen_tables.clear();
         self.single_row = false;
@@ -2702,6 +2742,74 @@ impl<'a> Canon<'a> {
             }
             Stmt::Message(_) => Err("a message that is not a string literal".into()),
         }
+    }
+
+    /// A message or raised error a format builds (`lower::Msg`): the text
+    /// as literal pieces and shown values, `message` (informational, as
+    /// `PRINT` and `RAISE NOTICE`) or `raise-error`. A value is shown only
+    /// when its text is the same on both sides: a variable-length string
+    /// (not blank-padded `char`), or an integer of at most 32 bits for
+    /// T-SQL `%d` (bigint is an error there). The NULL text is part of the
+    /// term, so T-SQL `(null)` meets only a PostgreSQL `COALESCE(x, '(null)')`.
+    pub fn message(&mut self, m: &super::lower::Msg) -> R<Term> {
+        use super::lower::{MsgPart, Spec};
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        // Most characters the text can have (None: no bound), and whether it
+        // can be empty.
+        let mut most = Some(0usize);
+        let mut empty = true;
+        for p in &m.parts {
+            match p {
+                MsgPart::Text(s) => {
+                    most = most.map(|x| x + s.chars().count());
+                    empty &= s.is_empty();
+                    text.push_str(s);
+                }
+                MsgPart::Arg { value, null, spec } => {
+                    let (t, ty) = self.expr(value)?;
+                    let Some(ty) = ty else {
+                        return Err("a message value of unknown type".into());
+                    };
+                    let (head, width) = match (spec, ty.fam) {
+                        (Spec::Str, Fam::VarChar) => ("msg-str", ty.len.map(|l| l as usize)),
+                        (Spec::Int, Fam::Int)
+                            if self.d != Dialect::Tsql || ty.len.is_some_and(|b| b <= 32) =>
+                        {
+                            // "-2147483648"
+                            empty = false;
+                            ("msg-int", Some(11))
+                        }
+                        (Spec::Str, _) => {
+                            return Err(
+                                "a message value that is not a variable-length string".into()
+                            )
+                        }
+                        (Spec::Int, _) => {
+                            return Err("a %d message value that is not an int".into())
+                        }
+                    };
+                    empty &= null.is_empty() || head == "msg-int";
+                    most = most
+                        .zip(width)
+                        .map(|(x, w)| x + w.max(null.chars().count()));
+                    if !text.is_empty() {
+                        parts.push(n("str", vec![a(std::mem::take(&mut text))]));
+                    }
+                    parts.push(n(head, vec![t, a(null.clone())]));
+                }
+            }
+        }
+        if !text.is_empty() || parts.is_empty() {
+            parts.push(n("str", vec![a(text)]));
+        }
+        if m.tsql && (empty || most.map_or(true, |x| x > 2047)) {
+            self.assume(asm::RAISERROR_TEXT);
+        }
+        if m.format_var {
+            self.assume(asm::RAISERROR_FORMAT);
+        }
+        Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
     fn resultset(&mut self, q: &Select) -> R<Term> {

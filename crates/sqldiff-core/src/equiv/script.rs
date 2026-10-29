@@ -563,6 +563,20 @@ pub(super) fn cannot_fail(u: &Unit, node: &SyntaxNode) -> bool {
     let Some(s) = u.stmts.iter().find(|s| &s.node == node) else {
         return false;
     };
+    // An informational message of variables and constants: it fails only
+    // on an argument of the wrong type, which `Canon::message` refuses.
+    if let Some(m) = &s.msg {
+        return !m.error
+            && m.parts.iter().all(|p| match p {
+                super::lower::MsgPart::Text(_) => true,
+                super::lower::MsgPart::Arg { value, .. } => {
+                    matches!(
+                        value,
+                        Expr::Var(_) | Expr::Name(_) | Expr::Str(_) | Expr::Num(_)
+                    )
+                }
+            });
+    }
     let Some((target, v)) = s.ast.as_ref().ok().and_then(Stmt::assignment) else {
         return false;
     };
