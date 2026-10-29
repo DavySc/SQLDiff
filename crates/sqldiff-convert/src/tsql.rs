@@ -461,11 +461,15 @@ impl<'a> Cx<'a> {
             out.append(body);
             out.push("END;\n");
         } else {
-            out.push("DO $$\n");
-            self.write_decls(out);
-            out.push("BEGIN\n");
-            out.append(body);
-            out.push("END\n$$;\n");
+            let mut inner = Out::default();
+            self.write_decls(&mut inner);
+            inner.push("BEGIN\n");
+            inner.append(body);
+            inner.push("END\n");
+            let tag = dollar_tag(&[&inner.text]);
+            out.push(&format!("DO {tag}\n"));
+            out.append(inner);
+            out.push(&format!("{tag};\n"));
         }
         self.mode = Mode::Top;
     }
@@ -797,8 +801,15 @@ impl<'a> Cx<'a> {
                 );
             }
         }
+        let decls: Vec<&str> = self
+            .decls
+            .iter()
+            .chain(&self.cursors)
+            .flat_map(|d| d.lines.iter().map(String::as_str))
+            .collect();
+        let tag = dollar_tag(&[&b.text, &decls.join("\n")]);
         let header = format!(
-            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS $$",
+            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS {tag}",
             if func { "FUNCTION" } else { "PROCEDURE" },
             params.join(", ")
         );
@@ -812,7 +823,7 @@ impl<'a> Cx<'a> {
             out.push(&format!("{}return_code := 0;\n", " ".repeat(INDENT)));
         }
         out.append(b);
-        out.push("END;\n$$;\n");
+        out.push(&format!("END;\n{tag};\n"));
         self.mode = Mode::Top;
         Ok(None)
     }
@@ -8998,4 +9009,18 @@ fn has_aggregate(item: &[T]) -> bool {
         }
     }
     found
+}
+
+/// The dollar quote for a PostgreSQL body: `$$`, or `$sqldiff$` (then
+/// `$sqldiff1$`, ...) when the body holds the shorter one (a string literal
+/// with `$$` in it would end a `$$` body).
+fn dollar_tag(texts: &[&str]) -> String {
+    (0..)
+        .map(|k| match k {
+            0 => "$$".to_string(),
+            1 => "$sqldiff$".to_string(),
+            _ => format!("$sqldiff{}$", k - 1),
+        })
+        .find(|t| !texts.iter().any(|x| x.contains(t.as_str())))
+        .unwrap_or_default()
 }

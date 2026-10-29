@@ -138,6 +138,10 @@ pub mod asm {
         "ASM-VALUES-ROW-ORDER",
         "A multi-row VALUES list gets the values the table generates (identity, sequence defaults) in the order its rows are written on both sides",
     );
+    pub const RETURN_NULL_WARNING: (&str, &str) = (
+        "ASM-TSQL-RETURN-NULL-WARNING",
+        "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)",
+    );
     pub const NO_CALLER_TXN: (&str, &str) = (
         "ASM-NO-CALLER-TXN",
         "The caller does not hold an open transaction",
@@ -3298,7 +3302,14 @@ impl<'a> Canon<'a> {
                     }
                     _ => {
                         let v = self.expr(e)?;
-                        let ret = self.unit.returns;
+                        // A T-SQL procedure returns an int status.
+                        let ret = match (self.unit.dialect, self.unit.kind) {
+                            (Dialect::Tsql, UnitKind::Proc) => Some(Ty {
+                                len: Some(32),
+                                ..Ty::of(Fam::Int)
+                            }),
+                            _ => self.unit.returns,
+                        };
                         Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
                 }
@@ -4541,6 +4552,54 @@ impl<'a> Canon<'a> {
         Ok(n("delete", vec![a(table), w]))
     }
 
+    /// `assign(return_code, coalesce(v, 0))` then `return` in a PostgreSQL
+    /// procedure, `return_code` being its INOUT parameter of that name and
+    /// `v` an integer literal or an integer variable or parameter: `v`, and
+    /// whether it may be NULL.
+    fn return_code(&self, x: &Term, y: &Term) -> Option<(Term, bool)> {
+        if self.unit.dialect != Dialect::Postgres
+            || self.unit.kind != UnitKind::Proc
+            || !y.is("return")
+            || !y.kids().is_empty()
+            || !x.is("assign")
+        {
+            return None;
+        }
+        let param = |s: &Term| {
+            let k = s.kid(0)?.atom()?.strip_prefix('p')?.parse::<usize>().ok()?;
+            self.unit.params.get(k.checked_sub(1)?)
+        };
+        let target = x.kid(0).filter(|s| s.is("sym")).and_then(param)?;
+        if target.name != "return_code" || !target.out {
+            return None;
+        }
+        let v = x.kid(1).filter(|v| {
+            v.is("fn")
+                && v.kids().len() == 3
+                && v.kid(0).and_then(Term::atom) == Some("coalesce")
+                && v.kid(2) == Some(&n("num", vec![a("0")]))
+        })?;
+        let v = v.kid(1)?;
+        let int = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|b| b > 1 && b <= 32))
+        };
+        if v.is("num") {
+            v.kid(0)?.atom()?.parse::<i32>().ok()?;
+            return Some((v.clone(), false));
+        }
+        if !v.is("sym") {
+            return None;
+        }
+        let name = v.kid(0)?.atom()?;
+        let k = name[1..].parse::<usize>().ok()?.checked_sub(1)?;
+        let ty = match name.as_bytes().first()? {
+            b'l' => self.unit.locals.get(k)?.ty,
+            b'p' => self.unit.params.get(k)?.ty,
+            _ => return None,
+        };
+        int(&ty).then(|| (v.clone(), true))
+    }
+
     /// Statement list of the unit, after the cross-statement lifts.
     pub fn lift(&mut self, stmts: Vec<Item>) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
@@ -4577,6 +4636,25 @@ impl<'a> Canon<'a> {
                 }
             }
             out.push(it);
+        }
+        // PostgreSQL procedure converted from T-SQL: `return_code :=
+        // COALESCE(v, 0); RETURN;` is T-SQL's `RETURN v` (a procedure's
+        // status is never NULL: T-SQL returns 0 instead). Only for an
+        // integer `v` the assignment stores as it is (no conversion), so
+        // T-SQL's conversion of `v` to int changes nothing either.
+        let mut i = 0;
+        while i + 1 < out.len() {
+            match self.return_code(&out[i].term, &out[i + 1].term) {
+                Some((v, may_be_null)) => {
+                    let next = out.remove(i + 1);
+                    out[i].term = n("return", vec![v]);
+                    out[i].absorb(next);
+                    if may_be_null {
+                        out[i].asm.push(asm::make(asm::RETURN_NULL_WARNING));
+                    }
+                }
+                None => i += 1,
+            }
         }
         // Inline `assign(local, v); return(local)` when the local is fresh.
         let mut i = 0;

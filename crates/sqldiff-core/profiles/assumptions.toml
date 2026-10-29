@@ -1183,7 +1183,7 @@ id = "ASM-TSQL-RETURN-NULL-WARNING"
 statement = "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)."
 discharge = "deployment"
 fact = "How callers handle messages."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-CALLER-XACT-ABORT-OFF"
