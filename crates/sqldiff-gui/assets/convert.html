@@ -231,6 +231,8 @@ body:not(.compare) #bwrap, body:not(.compare) .cmp-only { display: none !importa
   </table>
 </div></div>
 <script>
+// This launch's token, which every POST carries (absent outside the app).
+const APP_TOKEN = document.querySelector('meta[name="sqldiff-token"]')?.content ?? "";
 const INITIAL = /*__SQLDIFF_PAYLOAD__*/null;
 const $ = (id) => document.getElementById(id);
 const LABEL = { converted: "converted", assumptions: "under assumptions", decision: "needs a decision", unproven: "not proven", differs: "differs", not_converted: "not converted" };
@@ -741,7 +743,7 @@ function schedule(delay = 150) {
       ? { text: $("src").value, from: state.from, to: state.to }
       : { a: $("src").value, b: $("b").value, from: state.from, to: state.to };
     try {
-      const r = await fetch(mode === "convert" ? "/api/convert" : "/api/compare", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const r = await fetch(mode === "convert" ? "/api/convert" : "/api/compare", { method: "POST", headers: { "Content-Type": "application/json", "X-SQLDiff-Token": APP_TOKEN }, body: JSON.stringify(body) });
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
       if (seq < state.shown || mode !== state.mode) return;

@@ -78,10 +78,22 @@ fn start_with(app: App) -> SocketAddr {
 }
 
 fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (String, String) {
+    request_with(addr, method, path, body, None)
+}
+
+/// [`request`] with `token`, if any, as the `X-SQLDiff-Token` header.
+fn request_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+    token: Option<&str>,
+) -> (String, String) {
     let mut s = TcpStream::connect(addr).unwrap();
+    let token = token.map_or(String::new(), |t| format!("X-SQLDiff-Token: {t}\r\n"));
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{token}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -96,7 +108,10 @@ fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (String, S
 fn token(addr: SocketAddr) -> String {
     let (status, page) = request(addr, "GET", "/settings", "");
     assert_eq!(status, "200 OK");
-    let at = page.find(r#""token":""#).expect("token in the page") + 9;
+    let at = page
+        .find(r#"<meta name="sqldiff-token" content=""#)
+        .expect("token in the page")
+        + 36;
     page[at..at + page[at..].find('"').unwrap()].to_string()
 }
 
@@ -126,9 +141,9 @@ fn settings(addr: SocketAddr, dir: &std::path::Path) -> (String, Value) {
     (status, v)
 }
 
-fn post(addr: SocketAddr, path: &str, mut body: Value) -> (String, Value) {
-    body["token"] = json!(token(addr));
-    let (status, text) = request(addr, "POST", path, &body.to_string());
+fn post(addr: SocketAddr, path: &str, body: Value) -> (String, Value) {
+    let t = token(addr);
+    let (status, text) = request_with(addr, "POST", path, &body.to_string(), Some(&t));
     let v = serde_json::from_str(&text).unwrap_or(Value::String(text));
     (status, v)
 }
@@ -566,30 +581,24 @@ fn posts_need_this_launchs_token() {
     let d = Dir::new("token");
     d.write("ws/sqldiff.toml", WORKSPACE);
     let addr = start(true);
-    let body = |t: Option<&str>| {
-        let mut b = json!({"dir": d.0.join("ws"), "draft": {"indent": 8}, "hash": null});
-        if let Some(t) = t {
-            b["token"] = json!(t);
-        }
-        b.to_string()
-    };
+    let body = json!({"dir": d.0.join("ws"), "draft": {"indent": 8}, "hash": null}).to_string();
     for t in [
         None,
         Some(""),
         Some("0".repeat(32).as_str()),
         Some(token(start(true)).as_str()),
     ] {
-        let (status, text) = request(addr, "POST", "/api/settings/save", &body(t));
-        assert!(
-            status == "400 Bad Request" || status == "403 Forbidden",
-            "{status} {text}"
-        );
+        let (status, text) = request_with(addr, "POST", "/api/settings/save", &body, t);
+        assert_eq!(status, "403 Forbidden", "{text}");
     }
-    let (status, text) = request(addr, "POST", "/api/settings/preview", &body(Some("x")));
-    assert!(
-        status == "400 Bad Request" || status == "403 Forbidden",
-        "{status} {text}"
-    );
+    let (status, text) = request_with(addr, "POST", "/api/settings/preview", &body, Some("x"));
+    assert_eq!(status, "403 Forbidden", "{text}");
+    // The token in the body, as the page sent it before, is not enough.
+    let t = token(addr);
+    let mut b: Value = serde_json::from_str(&body).unwrap();
+    b["token"] = json!(t);
+    let (status, text) = request(addr, "POST", "/api/settings/save", &b.to_string());
+    assert_eq!(status, "403 Forbidden", "{text}");
     assert_eq!(d.read("ws/sqldiff.toml"), WORKSPACE);
 }
 
@@ -766,9 +775,9 @@ fn settings_answer_only_on_loopback() {
     assert!(!body.contains("indent"));
     let t = token(addr);
     for path in ["/api/settings/preview", "/api/settings/save"] {
-        let b = json!({"token": t, "dir": d.0.join("ws"), "draft": {"indent": 8}, "hash": null,
+        let b = json!({"dir": d.0.join("ws"), "draft": {"indent": 8}, "hash": null,
                        "dialect": "tsql", "text": QUERY});
-        let (status, _) = request(addr, "POST", path, &b.to_string());
+        let (status, _) = request_with(addr, "POST", path, &b.to_string(), Some(&t));
         assert_eq!(status, "403 Forbidden", "{path}");
     }
     assert_eq!(d.read("ws/sqldiff.toml"), WORKSPACE);

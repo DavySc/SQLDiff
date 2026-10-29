@@ -143,6 +143,8 @@ pub(crate) struct Request {
     pub path: String,
     pub query: String,
     pub body: Vec<u8>,
+    /// The `X-SQLDiff-Token` header; empty when absent.
+    pub token: String,
 }
 
 /// Convert mode's start: T-SQL → PostgreSQL with the sample.
@@ -192,6 +194,7 @@ struct Headers {
     origin: Option<String>,
     content_type: Option<String>,
     fetch_site: Option<String>,
+    token: Option<String>,
 }
 
 /// Why a request is refused before it is routed, if it is.
@@ -270,6 +273,7 @@ pub(crate) fn read_request(
                 "origin" => h.origin = Some(v),
                 "content-type" => h.content_type = Some(v),
                 "sec-fetch-site" => h.fetch_site = Some(v),
+                "x-sqldiff-token" => h.token = Some(v),
                 _ => {}
             }
         }
@@ -290,6 +294,7 @@ pub(crate) fn read_request(
         path: path.to_string(),
         query: query.to_string(),
         body,
+        token: h.token.unwrap_or_default(),
     }))
 }
 
