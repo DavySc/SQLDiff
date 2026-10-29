@@ -30,13 +30,13 @@ folds them, with the T-SQL spelling of each; the deployment maps
 
 def acct : CatTable :=
   { name := "acct"
-    cols := [⟨"id", "Id", true, true⟩, ⟨"qty", "Qty", false, false⟩,
-      ⟨"total", "Total", true, false⟩] }
+    cols := [⟨"id", "Id", true, true, none, none⟩, ⟨"qty", "Qty", false, false, none, none⟩,
+      ⟨"total", "Total", true, false, none, none⟩] }
 
 /-- A table without a key and two nullable columns, for `UPDATE`'s old
 values. -/
 def pairT : CatTable :=
-  { name := "pair", cols := [⟨"a", "A", false, false⟩, ⟨"b", "B", false, false⟩] }
+  { name := "pair", cols := [⟨"a", "A", false, false, none, none⟩, ⟨"b", "B", false, false, none, none⟩] }
 
 def Γd : Catalog := { routines := [], tables := [acct, pairT] }
 def depd : Deployment :=
@@ -200,7 +200,7 @@ setting. -/
   "the PL/pgSQL routine is outside the C1 spec"
 -- `found` is a variable of every PL/pgSQL routine: a column of that name
 -- would be ambiguous too.
-#guard resolveName (.pg Γd ["found"]) (scopeOf (.pg Γd []) { acct with cols := [⟨"found", "found", false, false⟩] } ["acct"]) "found" == none
+#guard resolveName (.pg Γd ["found"]) (scopeOf (.pg Γd []) { acct with cols := [⟨"found", "found", false, false, none, none⟩] } ["acct"]) "found" == none
 -- The table's own name is a whole-row reference in PostgreSQL.
 #guard reasonOf (checkD safeT
     (pgProc ["r"] [inP "p_id"] [] [

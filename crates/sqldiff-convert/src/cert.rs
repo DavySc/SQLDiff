@@ -14,7 +14,7 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
-use sqldiff_core::proof::{self, Checker, MirrorColumn, MirrorRequest, MirrorTable};
+use sqldiff_core::proof::{self, Checker, MirrorColumn, MirrorDefault, MirrorRequest, MirrorTable};
 use sqldiff_syntax::abstract_syntax::{tokens, Expr, From, Select, Stmt, K};
 use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
 use sqldiff_syntax::{encode, parse, plain_table, Dialect, SyntaxKind, SyntaxNode};
@@ -384,6 +384,11 @@ fn read_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
 /// (`ASM-TABLES-AS-DECLARED`).
 pub const TABLES_AS_DECLARED: &str = "ASM-TABLES-AS-DECLARED";
 
+/// (C3c) The T-SQL `varchar` columns a routine writes were created with
+/// `ANSI_PADDING ON`, so they keep trailing spaces as PostgreSQL does
+/// (`ASM-TSQL-ANSI-PADDING`; eval/tables T3).
+pub const ANSI_PADDING: &str = "ASM-TSQL-ANSI-PADDING";
+
 /// The tables of a converted tree that the C3a slice may take as given
 /// (`proof::MirrorTable`), by target name. A table is here only when the
 /// source and the output tree each define it exactly once with a plain
@@ -394,6 +399,13 @@ pub const TABLES_AS_DECLARED: &str = "ASM-TABLES-AS-DECLARED";
 /// `ALTER TABLE`, a table that inherits from it, a view), nor does any
 /// DDL statement inside one. Anything the DDL reader cannot show as plain
 /// leaves the table out, so its data statements stay unconfirmed.
+///
+/// (C3c) Columns pair with their types (`int` with `integer`, `varchar(n)`
+/// and `nvarchar(n)` with `varchar(n)`) and their constant defaults, the
+/// same on both sides; a plain index (`plain_table::index`: non-unique, no
+/// filter or option) does not keep the table out when no entry of it can
+/// exceed the engine's size limit (`PlainIndex::fits`); a T-SQL tree that
+/// turns `ANSI_PADDING` off keeps out every table with a `varchar` column.
 #[derive(Debug, Clone, Default)]
 pub struct Tables {
     /// Each table with its T-SQL name as declared.
@@ -477,10 +489,54 @@ fn dynamic_sql(n: &SyntaxNode, d: Dialect) -> bool {
     })
 }
 
-/// Plain table definitions of a tree, every word named elsewhere, and
-/// whether the tree runs dynamic SQL anywhere.
-fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec<String>, bool) {
+/// What a tree's DDL says about its tables ([`definitions`]).
+#[derive(Default)]
+struct Ddl {
+    /// The plain table definitions.
+    defs: Vec<plain_table::PlainTable>,
+    /// (C3c) The plain indexes (non-unique, no filter or option).
+    indexes: Vec<plain_table::PlainIndex>,
+    /// Every word named elsewhere.
+    named: Vec<String>,
+    /// The tree runs dynamic SQL somewhere.
+    dynamic: bool,
+    /// (C3c) A T-SQL `SET ANSI_PADDING OFF` (or `SET ANSI_DEFAULTS OFF`) at
+    /// the top level: a `varchar` column created after it trims trailing
+    /// spaces on every write (eval/tables T3).
+    padding_off: bool,
+    /// A T-SQL `ALTER DATABASE ... COLLATE`: columns created before it keep
+    /// the old collation, so no column is known to have the database's.
+    collation_changed: bool,
+}
+
+/// A statement that may turn `ANSI_PADDING` off: `SET ANSI_PADDING OFF`,
+/// `SET ANSI_DEFAULTS OFF` (which turns it off too), `ALTER DATABASE ...
+/// SET ANSI_PADDING OFF`, or `sp_configure 'user options'` (the server's
+/// default for connections). Any such statement counts, wherever it stands.
+fn padding_off(n: &SyntaxNode) -> bool {
+    let t = tokens(n);
+    let named = |w: &str| t.iter().any(|x| x.up == w);
+    ((named("ANSI_PADDING") || named("ANSI_DEFAULTS")) && named("OFF"))
+        || (named("SP_CONFIGURE")
+            && t.iter()
+                .any(|x| x.kind == K::Str && x.text.to_lowercase().contains("user options")))
+}
+
+/// `ALTER DATABASE ... COLLATE ...`.
+fn collation_changed(n: &SyntaxNode) -> bool {
+    let t = tokens(n);
+    t.len() >= 2
+        && t[0].up == "ALTER"
+        && t[1].up == "DATABASE"
+        && t.iter().any(|x| x.up == "COLLATE")
+}
+
+/// Plain table definitions and (C3c) plain indexes of a tree, every word
+/// named elsewhere, whether the tree runs dynamic SQL anywhere, and
+/// whether it turns `ANSI_PADDING` off.
+fn definitions(texts: &[&str], d: Dialect) -> Ddl {
     let (mut defs, mut named, mut dynamic) = (Vec::new(), Vec::new(), false);
+    let (mut indexes, mut padding, mut collation) = (Vec::new(), false, false);
     for text in texts {
         let root = parse(text, d).syntax();
         let mut it = root.preorder();
@@ -516,9 +572,17 @@ fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec
                 }
                 SyntaxKind::STATEMENT => {
                     dynamic |= dynamic_sql(&n, d);
+                    padding |= d == Dialect::Tsql && padding_off(&n);
+                    collation |= d == Dialect::Tsql && collation_changed(&n);
                     match plain_table::read(&n, d) {
                         Ok(t) => defs.push(t),
-                        Err(_) => words(&n, d, &mut named),
+                        // C3c: a plain index is checked against its table's
+                        // sizes in `Tables::read`; any other statement that
+                        // names the table keeps it out.
+                        Err(_) => match plain_table::index(&n, d) {
+                            Ok(ix) => indexes.push(ix),
+                            Err(_) => words(&n, d, &mut named),
+                        },
                     }
                     it.skip_subtree();
                 }
@@ -526,7 +590,53 @@ fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec
             }
         }
     }
-    (defs, named, dynamic)
+    Ddl {
+        defs,
+        indexes,
+        named,
+        dynamic,
+        padding_off: padding,
+        collation_changed: collation,
+    }
+}
+
+/// (C3c) The column type of the checker's catalog for a T-SQL column and
+/// the PostgreSQL column converted from it: `int` against `integer`, and
+/// `varchar(n)` or `nvarchar(n)` against `varchar(n)` with the same `n`
+/// (the converter's mapping); anything else does not pair.
+fn pair_type(a: plain_table::ColType, b: plain_table::ColType) -> Option<Option<(u32, bool)>> {
+    use plain_table::ColType::{Int, NVarchar, Varchar};
+    match (a, b) {
+        (Int, Int) => Some(None),
+        (Varchar(n), Varchar(m)) if n == m => Some(Some((n, false))),
+        (NVarchar(n), Varchar(m)) if n == m => Some(Some((n, true))),
+        _ => None,
+    }
+}
+
+/// (C3c) The default both columns declare, the same constant (`None` for
+/// none on both sides), or why they do not pair.
+fn pair_default(
+    a: &Option<plain_table::ColDefault>,
+    b: &Option<plain_table::ColDefault>,
+) -> Option<Option<MirrorDefault>> {
+    use plain_table::ColDefault;
+    match (a, b) {
+        (None, None) => Some(None),
+        (Some(ColDefault::Int(x)), Some(ColDefault::Int(y))) if x == y => {
+            Some(Some(MirrorDefault::Int(*x)))
+        }
+        (Some(ColDefault::Str(x)), Some(ColDefault::Str(y))) if x == y => {
+            Some(Some(MirrorDefault::Str(x.clone())))
+        }
+        _ => None,
+    }
+}
+
+/// (C3c) The T-SQL table has a `varchar` column (the one `ANSI_PADDING`
+/// applies to; eval/tables T3).
+pub fn has_varchar(t: &MirrorTable) -> bool {
+    t.cols.iter().any(|c| matches!(c.str, Some((_, false))))
 }
 
 impl Tables {
@@ -536,12 +646,16 @@ impl Tables {
         if (from, to) != (Dialect::Tsql, Dialect::Postgres) {
             return Tables::default();
         }
-        let (src, src_named, src_dynamic) = definitions(inputs, from);
-        let (out, out_named, out_dynamic) = definitions(outputs, to);
+        let src_ddl = definitions(inputs, from);
+        let out_ddl = definitions(outputs, to);
         // A statement built at run time may change any table.
-        if src_dynamic || out_dynamic {
+        // After a change of the database's collation no column is known to
+        // have it (ASM-TABLES-AS-DECLARED); every table is kept out.
+        if src_ddl.dynamic || out_ddl.dynamic || src_ddl.collation_changed {
             return Tables::default();
         }
+        let (src, src_named) = (&src_ddl.defs, &src_ddl.named);
+        let (out, out_named) = (&out_ddl.defs, &out_ddl.named);
         let pg = |parts: &[String]| {
             parts
                 .iter()
@@ -549,15 +663,17 @@ impl Tables {
                 .collect::<Vec<_>>()
                 .join(".")
         };
-        let mut by_target = Vec::new();
-        for a in &src {
-            let key = target_routine(&a.name).0;
-            let last = key
-                .rsplit('.')
+        let last_of = |key: &str| {
+            key.rsplit('.')
                 .next()
                 .unwrap_or_default()
                 .trim_start_matches('"')
-                .to_lowercase();
+                .to_lowercase()
+        };
+        let mut by_target = Vec::new();
+        for a in src {
+            let key = target_routine(&a.name).0;
+            let last = last_of(&key);
             let once = src
                 .iter()
                 .filter(|x| target_routine(&x.name).0 == key)
@@ -572,25 +688,67 @@ impl Tables {
             {
                 continue;
             }
+            // C3c: an index naming the table under another spelling
+            // (`MyDb.dbo.W`, `public.w`) may be on it; it keeps it out, as
+            // any other statement naming it does.
+            let elsewhere = src_ddl.indexes.iter().any(|ix| {
+                let k = target_routine(&ix.table).0;
+                k != key && last_of(&k) == last
+            }) || out_ddl.indexes.iter().any(|ix| {
+                let k = pg(&ix.table);
+                k != key && last_of(&k) == last
+            });
+            if elsewhere {
+                continue;
+            }
+            // C3c: every index on the table, on either side, is plain and
+            // its entries fit the engine's limit (eval/tables T8).
+            let indexes_fit = src_ddl
+                .indexes
+                .iter()
+                .filter(|ix| target_routine(&ix.table).0 == key)
+                .all(|ix| ix.fits(a, from).is_ok())
+                && out_ddl
+                    .indexes
+                    .iter()
+                    .filter(|ix| pg(&ix.table) == key)
+                    .all(|ix| ix.fits(b, to).is_ok());
+            if !indexes_fit {
+                continue;
+            }
             let cols: Option<Vec<MirrorColumn>> = a
                 .cols
                 .iter()
                 .zip(&b.cols)
                 .map(|(x, y)| {
-                    (x.name.is_ascii()
+                    if !(x.name.is_ascii()
                         && pg_name(&x.name) == pg_name(&y.name)
                         && x.not_null == y.not_null
                         && x.key == y.key)
-                        .then(|| MirrorColumn {
-                            name: pg_name(&y.name),
-                            tsql: x.name.clone(),
-                            not_null: y.not_null,
-                            key: y.key,
-                        })
+                    {
+                        return None;
+                    }
+                    // C3c: the type and the default as both DDLs show them.
+                    let str = pair_type(x.ty, y.ty)?;
+                    let default = pair_default(&x.default, &y.default)?;
+                    Some(MirrorColumn {
+                        name: pg_name(&y.name),
+                        tsql: x.name.clone(),
+                        not_null: y.not_null,
+                        key: y.key,
+                        str,
+                        default,
+                    })
                 })
                 .collect();
             if let Some(cols) = cols {
-                by_target.push((MirrorTable { name: key, cols }, a.name.clone()));
+                let t = MirrorTable { name: key, cols };
+                // A `varchar` column created under `ANSI_PADDING OFF` trims
+                // trailing spaces on writes (eval/tables T3).
+                if src_ddl.padding_off && has_varchar(&t) {
+                    continue;
+                }
+                by_target.push((t, a.name.clone()));
             }
         }
         Tables { by_target }
@@ -755,6 +913,18 @@ pub fn mirror_request(
     }
     if !table_catalog.is_empty() {
         assumptions.push(TABLES_AS_DECLARED.to_string());
+    }
+    // C3c: a write to a `varchar` column keeps trailing spaces only if the
+    // column was created under `ANSI_PADDING ON` (eval/tables T3), which
+    // the DDL does not show.
+    let writes_varchar = written.iter().any(|w| {
+        mappable(w)
+            && table_catalog
+                .iter()
+                .any(|t| t.name == target_routine(w).0 && has_varchar(t))
+    });
+    if writes_varchar {
+        assumptions.push(ANSI_PADDING.to_string());
     }
     // Only writes send a rows-affected count: `SELECT @x = ...`, `IF EXISTS`
     // and `SET @x = (subquery)` do not (eval/queries Q3).
@@ -1128,9 +1298,15 @@ END
         ] {
             assert!(asm.iter().any(|y| y == x), "{x}: {asm:?}");
         }
+        // A plain index does not keep it out (C3c).
+        assert_eq!(
+            tables("CREATE INDEX ix ON dbo.Acct (Qty);\n").get("acct"),
+            Some(acct)
+        );
         // Anything else that names the table keeps it out.
         for extra in [
-            "CREATE INDEX ix ON dbo.Acct (Qty);\n",
+            "CREATE UNIQUE INDEX ix ON dbo.Acct (Qty);\n",
+            "CREATE INDEX ix ON dbo.Acct (Qty) WHERE Qty IS NOT NULL;\n",
             "GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n",
             "ALTER TABLE dbo.Acct ADD CONSTRAINT ck CHECK (Qty > 0);\n",
             "CREATE TABLE dbo.Line (Id int NOT NULL REFERENCES dbo.Acct (Id));\n",
@@ -1139,6 +1315,134 @@ END
         ] {
             assert!(tables(extra).get("acct").is_none(), "{extra}");
         }
+    }
+
+    #[test]
+    fn string_columns_defaults_and_plain_indexes_reach_the_checker() {
+        let ddl = "CREATE TABLE dbo.Cust (Id int NOT NULL PRIMARY KEY, Name varchar(20) NOT NULL, \
+                   City nvarchar(30) NULL DEFAULT 'Paris', Qty int NOT NULL DEFAULT 0);\n";
+        let proc = "CREATE PROCEDURE dbo.p @id int AS\nBEGIN\n  \
+                    INSERT INTO dbo.Cust (Id, Name) VALUES (@id, 'a');\nEND\n";
+        let read_proc = "CREATE PROCEDURE dbo.r @id int, @c nvarchar(30) OUTPUT AS\nBEGIN\n  \
+                         SELECT @c = City FROM dbo.Cust WHERE Id = @id;\nEND\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        // Both trees as given (the output edited by hand where a case needs it).
+        let tables_of =
+            |src: &str, out: &str| Tables::read(&[src], &[out], Dialect::Tsql, Dialect::Postgres);
+        let tables = |extra: &str| {
+            let src = format!("{ddl}{extra}");
+            tables_of(&src, &convert(&src))
+        };
+        let t = tables("");
+        let cust = t.get("cust").expect("a plain table");
+        type Col<'a> = (&'a str, Option<(u32, bool)>, Option<MirrorDefault>);
+        let cols: Vec<Col> = cust
+            .cols
+            .iter()
+            .map(|c| (c.name.as_str(), c.str, c.default.clone()))
+            .collect();
+        assert_eq!(
+            cols,
+            [
+                ("id", None, None),
+                ("name", Some((20, false)), None),
+                (
+                    "city",
+                    Some((30, true)),
+                    Some(MirrorDefault::Str("Paris".into()))
+                ),
+                ("qty", None, Some(MirrorDefault::Int(0))),
+            ]
+        );
+        // A write to a table with a varchar column names ANSI_PADDING; a read
+        // does not.
+        let req = |p: &str| {
+            let a = routines(p, Dialect::Tsql).remove(0).2.unwrap();
+            let b = routines(&convert(p), Dialect::Postgres)
+                .remove(0)
+                .2
+                .unwrap();
+            let trusted = Trusted {
+                tables: t.clone(),
+                ..Default::default()
+            };
+            mirror_request(&a, &b, &[], &trusted).unwrap()
+        };
+        let (r, asm) = req(proc);
+        assert_eq!(r.table_catalog, std::slice::from_ref(cust));
+        assert!(asm.iter().any(|x| x == ANSI_PADDING), "{asm:?}");
+        let (r, asm) = req(read_proc);
+        assert_eq!(r.table_catalog, std::slice::from_ref(cust));
+        assert!(!asm.iter().any(|x| x == ANSI_PADDING), "{asm:?}");
+        // Plain indexes whose entries fit both engines keep the table in.
+        for extra in [
+            "CREATE INDEX IX_Name ON dbo.Cust (Name);\n",
+            "CREATE NONCLUSTERED INDEX IX_City ON dbo.Cust (City DESC) INCLUDE (Qty);\n",
+        ] {
+            assert!(tables(extra).get("cust").is_some(), "{extra}");
+        }
+        // Anything else keeps it out.
+        for extra in [
+            "CREATE UNIQUE INDEX UX_Name ON dbo.Cust (Name);\n",
+            "CREATE INDEX IX_Name ON dbo.Cust (Name) WHERE Name > 'a';\n",
+            "CREATE INDEX IX_Name ON dbo.Cust (Name) WITH (FILLFACTOR = 80);\n",
+            "CREATE INDEX IX_Nope ON dbo.Cust (Nope);\n",
+            "SET ANSI_PADDING OFF;\n",
+        ] {
+            assert!(tables(extra).get("cust").is_none(), "{extra}");
+        }
+        // An index whose PostgreSQL entry may exceed the btree limit: 700
+        // characters may take 2800 bytes (eval/tables T8), though 700 bytes
+        // fit SQL Server's 1700.
+        let wide = "CREATE TABLE dbo.W (Id int NOT NULL PRIMARY KEY, V varchar(700) NULL);\n\
+                    CREATE INDEX IX_V ON dbo.W (V);\n";
+        assert!(tables_of(wide, &convert(wide)).get("w").is_none());
+        let wide_ok = wide.replace("700", "600");
+        assert!(tables_of(&wide_ok, &convert(&wide_ok)).get("w").is_some());
+        // Types and defaults must pair: an output edited to another length,
+        // to text, without the default, with another default.
+        let out = convert(ddl);
+        assert!(tables_of(ddl, &out).get("cust").is_some());
+        // An index on another spelling of the table's name, on one side
+        // only (the other side's tree as converted from the bare DDL), and
+        // padding turned off for the database or the server.
+        for extra in [
+            "CREATE INDEX IX_Name ON MyDb.dbo.Cust (Name);\n",
+            "CREATE INDEX IX_Name ON srv.MyDb.dbo.Cust (Name);\n",
+            "ALTER DATABASE CURRENT SET ANSI_PADDING OFF;\n",
+            "EXEC sp_configure 'user options', 16;\n",
+            "ALTER DATABASE CURRENT COLLATE Latin1_General_100_BIN2;\n",
+        ] {
+            let src = format!("{ddl}{extra}");
+            assert!(tables_of(&src, &out).get("cust").is_none(), "{extra}");
+        }
+        for extra in [
+            "CREATE INDEX ix_name ON public.cust (name);\n",
+            "CREATE INDEX ix_name ON \"public\".\"cust\" (name);\n",
+            "CREATE INDEX ix_name ON mydb.public.cust (name);\n",
+            "CREATE INDEX ix_name ON dbo.cust (name);\n",
+        ] {
+            let edited = format!("{out}{extra}");
+            assert!(tables_of(ddl, &edited).get("cust").is_none(), "{extra}");
+        }
+        for (from, to) in [
+            ("Name varchar(20)", "Name varchar(21)"),
+            ("Name varchar(20)", "Name text"),
+            (" DEFAULT 'Paris'", ""),
+            ("DEFAULT 'Paris'", "DEFAULT 'Lyon'"),
+            ("DEFAULT 0", "DEFAULT 1"),
+        ] {
+            assert!(out.contains(from), "{from} in {out}");
+            let edited = out.replace(from, to);
+            assert!(tables_of(ddl, &edited).get("cust").is_none(), "{to}");
+        }
+        // A default only one side shows, the other way round.
+        let src = ddl.replace(" DEFAULT 0", "");
+        assert!(tables_of(&src, &out).get("cust").is_none());
     }
 
     #[test]

@@ -442,8 +442,10 @@ def long26 : Ast.Expr := str "abcdefghijklmnopqrstuvwxyz"
 -- Into an integer it is kept (the C1 pair at the top of `Examples`).
 #guard isConfirmed (check dep Γ cert srcT mirrorP)
 
--- `INSERT`/`UPDATE`: columns are `int` (C3a), and a string value is never
--- written to one (`colValue`), on either path.
-#guard (colValue (.tsql dep ∅) [] {} (str "a")).isNone
+-- `INSERT`/`UPDATE`: a string value is never written to an `int` column
+-- (`colValue`), on either path; (C3c) a string column takes one that fits
+-- (`ExamplesC3c`).
+#guard (colValue (.tsql dep ∅) [] {} ⟨"c", "c", false, false, none, none⟩ (str "a")).isNone
+#guard (colValue (.tsql dep ∅) [] {} ⟨"c", "c", false, false, some (1, false), none⟩ (str "a")).isSome
 
 end Sqldiff.Mirror.ExamplesC2b

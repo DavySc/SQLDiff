@@ -8,7 +8,8 @@ with the collation fact in CATALOG and the string residuals; C4 pairs
 (TRY/CATCH against EXCEPTION blocks, THROW against RAISE, the
 rollback-and-rethrow idiom with COMMIT), with the C4 residuals and the
 `errors` field; C3b queries (`SELECT @x = col` against the PL/pgSQL `FOR`
-block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`.
+block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`;
+C3c string columns and constant defaults in the CATALOG.
 Anything else is unconfirmed, including malformed requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
@@ -595,7 +596,70 @@ cases += [
     ("90", req3q(90, q_t([SEL_T]), q_p([for_block([item(pv("qty"), alias=S("sqldiff_c1"))], ["acct"], Q_KEY_P,
                                                   [field("p_q", "sqldiff_c2")])])), "unconfirmed"),
 ]
+
+# C3c: wider tables. T-SQL dbo.Cust (Id int PRIMARY KEY, Name varchar(20) NOT
+# NULL, City nvarchar(30) NULL DEFAULT 'Paris', Qty int NOT NULL DEFAULT 0)
+# is the target table cust; a string column is `v<n>`/`w<n>` in its SPEC, a
+# default the fourth field (`s<hex>`, `i<int>`).
+C_DEP = f"0;{hx('dbo.Cust')}:{hx('cust')}"
+
+
+def c_cat(name="v20n", city=f"w30.{hx('City')}.s{hx('Paris')}"):
+    return (f"{hx('cust')}={hx('id')}.ink.{hx('Id')}/{hx('name')}.{name}.{hx('Name')}"
+            f"/{hx('city')}.{city}/{hx('qty')}.in.{hx('Qty')}.i0")
+
+
+C_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in
+                  [("@id", "p_id"), ("@c", "p_c"), ("@n", "v_n"), ("%status", "%status")])
+VC30, NVC30 = ty("VARCHAR", "30"), ty("NVARCHAR", "30")
+C_KEY_T = bin_("=", col("Id"), tv("@id"))
+C_KEY_P = bin_("=", pv("Id"), pv("p_id"))
+
+
+def c_t(name_value=tv("@n")):
+    return proc(["dbo", "addc"], [param("@id", "In"), sparam("@c", "InOut", NVC30)], [], [
+        ABORT,
+        C("NStmt", C("Declare", S("@n"), VC20, string("abc"))),
+        ins(["dbo", "Cust"], ["Id", "Name"], [[tv("@id"), name_value]]),
+        upd(["dbo", "Cust"], [("Name", fn("RTRIM", col("Name"))), ("City", string("Lyon"))], C_KEY_T),
+        C("NStmt", C("SSelect", sel([item(col("City"), assign_=S("@c"))], ["dbo", "Cust"], C_KEY_T))),
+    ])
+
+
+def c_p(local=VC20):
+    return proc(["addc"], [param("p_id", "In"), sparam("p_c", "InOut", VC30)],
+                [C("Declare", S("v_n"), local, NONE)], [
+        assign(pv("v_n"), string("abc")),
+        ins(["Cust"], ["Id", "Name"], [[pv("p_id"), pv("v_n")]]),
+        upd(["Cust"], [("Name", fn("rtrim", pv("Name"))), ("City", string("Lyon"))], C_KEY_P),
+        for_block([item(pv("City"), alias=S("sqldiff_c1"))], ["Cust"], C_KEY_P, [field("p_c", "sqldiff_c1")]),
+    ])
+
+
+def req3c(i, a=None, b=None, cat=None):
+    return req3(i, a=c_t() if a is None else a, b=c_p() if b is None else b, dep=C_DEP,
+                cat=c_cat() if cat is None else cat, cert=C_CERT)
+
+
+cases += [
+    ("91", req3c(91), "confirmed"),
+    # Name as an int column: a string is not stored into it.
+    ("92", req3c(92, cat=c_cat(name="in")), "unconfirmed"),
+    # A default that does not fit its column: the table is not usable.
+    ("93", req3c(93, cat=c_cat(city=f"w3.{hx('City')}.s{hx('Paris')}")), "unconfirmed"),
+    # A string key column: the table is not usable.
+    ("94", req3c(94, cat=c_cat(name="v20k")), "unconfirmed"),
+    # 21 characters into varchar(20): 2628 against 22001.
+    ("95", req3c(95, a=c_t(string("abcdefghijklmnopqrstu"))), "unconfirmed"),
+    # The PL/pgSQL local v_n as varchar(21): its value may not fit Name
+    # (varchar(20)), so the INSERT is outside the spec.
+    ("96", req3c(96, b=c_p(local=ty("VARCHAR", "21"))), "unconfirmed"),
+    # A malformed SPEC or DEFAULT: the catalog does not decode.
+    ("97", req3c(97, cat=c_cat(name="v")), "unconfirmed"),
+    ("98", req3c(98, cat=c_cat(city=f"w30.{hx('City')}.x1")), "unconfirmed"),
+]
 THEOREMS = {
+    "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
     "86": "Sqldiff.Mirror.check_sound_c2a",
     "87": "Sqldiff.Mirror.check_sound_c2a",
@@ -622,6 +686,9 @@ THEOREMS = {
 }
 # The fields a confirmed /3 answer adds (Main.lean); none on /2 or unconfirmed answers.
 EXTRA = {
+    "91": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
+           "statements": "c3b"},
     "83": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},
     "86": {"scalars": "c2a", "residual": [], "statements": "c3b"},
     "87": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},

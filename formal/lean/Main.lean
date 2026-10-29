@@ -85,6 +85,15 @@ abstract syntax gained the PL/pgSQL `FOR` loop over a query
 (`Node.ForQuery`), so the schema hash changed and an older checker
 answers "unconfirmed" (schema mismatch). The CATALOG now also lists the
 tables a routine only reads; the request format is unchanged.
+
+0.11.0 (C3c) takes wider tables: string columns (a column SPEC `v<n>` or
+`w<n>`, T-SQL `varchar(n)`/`nvarchar(n)` against PostgreSQL `varchar(n)`)
+and constant defaults (a fourth column field, `i<int>` or `s<hex>`), "The
+C3c tables" in `Sqldiff/Mirror/Lower.lean`. A request without either
+decodes as before, so the format stays backward compatible; an older
+checker answers a request with them "the catalog does not decode". No new
+answer field or residual: a confirmation over string columns is a
+`"c3a"`/`"c3b"` answer whose residual names the C2b facts it uses.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -138,7 +147,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.10.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.11.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

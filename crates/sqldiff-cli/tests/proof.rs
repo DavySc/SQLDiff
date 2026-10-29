@@ -581,6 +581,111 @@ fn the_real_checker_confirms_reads_of_a_plain_table() {
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
 
+/// C3c end to end: a procedure over a table with a `varchar` and an
+/// `nvarchar` column, two constant defaults and a non-unique index inserts
+/// (the left-out columns get their defaults), updates the string columns
+/// with values that fit and reads one into a variable it fits; it is
+/// confirmed by `check_sound_c2a` and names `ASM-TSQL-ANSI-PADDING`. A
+/// value that may not fit its column, and a UNIQUE index, are refused.
+#[test]
+fn the_real_checker_confirms_a_table_with_strings_defaults_and_an_index() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c3c-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let ddl = |index: &str| {
+        format!(
+            "CREATE TABLE dbo.Cust (Id int NOT NULL, Name varchar(20) NOT NULL, \
+             City nvarchar(30) NULL CONSTRAINT DF_Cust_City DEFAULT 'Paris', \
+             Qty int NOT NULL CONSTRAINT DF_Cust_Qty DEFAULT ((0)), \
+             CONSTRAINT PK_Cust PRIMARY KEY (Id));\nGO\n{index}\nGO\n"
+        )
+    };
+    let proc = |set_name: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.addc @id int, @c nvarchar(30) OUTPUT\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  DECLARE @n varchar(20) = 'abc';\n  INSERT INTO dbo.Cust (Id, Name) VALUES (@id, @n);\n  UPDATE dbo.Cust SET Name = {set_name}, City = 'Lyon' WHERE Id = @id;\n  SELECT @c = City FROM dbo.Cust WHERE Id = @id;\nEND\n"
+        )
+    };
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.addc")
+            .unwrap()
+    };
+    write(
+        &src,
+        "cust.sql",
+        &ddl("CREATE INDEX IX_Cust_Name ON dbo.Cust (Name);"),
+    );
+    write(&src, "addc.sql", &proc("RTRIM(Name)"));
+    let r = run();
+    // The converter writes the table, its defaults and the index as the
+    // checker's catalog takes them.
+    let out = std::fs::read_to_string(d.join("out/cust.sql")).unwrap();
+    for shape in [
+        "Name varchar(20) NOT NULL",
+        "City varchar(30) NULL CONSTRAINT DF_Cust_City DEFAULT 'Paris'",
+        "CREATE INDEX IX_Cust_Name ON Cust (Name);",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["scalars"], "c2a", "{r}");
+    assert_eq!(r["statements"], "c3b", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for a in [
+        "ASM-TABLES-AS-DECLARED",
+        "ASM-TSQL-ANSI-PADDING",
+        "ASM-STATE-AFTER-ERROR",
+        "ASM-TSQL-STRING-ARGS",
+    ] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    // 21 characters may not fit Name: SQL Server raises 2628 or truncates,
+    // PostgreSQL raises 22001 (eval/tables T2).
+    write(&src, "addc.sql", &proc("RTRIM(Name) + 'x'"));
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    // A UNIQUE index keeps the table out of the catalog.
+    write(&src, "addc.sql", &proc("RTRIM(Name)"));
+    write(
+        &src,
+        "cust.sql",
+        &ddl("CREATE UNIQUE INDEX UX_Cust_Name ON dbo.Cust (Name);"),
+    );
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+}
+
 /// C2b end to end: concatenation and ISNULL over bounded string variables
 /// are confirmed in the slice, and the leading SET CONCAT_NULL_YIELDS_NULL
 /// ON discharges ASM-CONCAT-NULL in the release gate. A string `=` is
