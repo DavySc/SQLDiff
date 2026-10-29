@@ -560,7 +560,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
 }
 
 /// Whether a PostgreSQL routine node is a DO block.
-fn is_do(r: &SyntaxNode) -> bool {
+pub(super) fn is_do(r: &SyntaxNode) -> bool {
     cst::header_tokens(r)
         .first()
         .is_some_and(|t| t.text().eq_ignore_ascii_case("DO"))
