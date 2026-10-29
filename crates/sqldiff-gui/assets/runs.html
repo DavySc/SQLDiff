@@ -112,20 +112,28 @@ a.btn:hover { background: var(--link-2); }
 .cmd ul { margin: 6px 0 0; padding-left: 18px; }
 .cmd li .path { color: var(--muted); }
 .batches { display: grid; gap: 10px; }
-.batch { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 12px 16px; display: grid; gap: 10px; }
+details.group { border-bottom: 1px solid var(--line); }
+details.group:last-child { border-bottom: 0; }
+details.group > summary { padding: 12px 16px; cursor: pointer; font-size: 13px; }
+details.group > summary .t { font-weight: 600; }
+details.group[open] > summary { border-bottom: 1px solid var(--line); }
+details.group .run { padding-left: 32px; }
+.batch { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 10px 14px; display: grid; gap: 6px; }
 .batch .head { display: flex; gap: 10px; align-items: center; }
 .batch .head .t { font-weight: 600; }
-.batch .head .s { color: var(--muted); font-size: 12px; flex: 1; overflow-wrap: anywhere; }
+.batch .head .s { color: var(--muted); font-size: 12px; flex: 1; }
 .matrix { overflow-x: auto; }
-.matrix table { border-collapse: collapse; width: 100%; font-size: 12.5px; }
-.matrix th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; padding: 6px 8px; border-bottom: 1px solid var(--line); }
-.matrix td { vertical-align: top; padding: 8px; border-bottom: 1px solid var(--line); min-width: 180px; }
-.matrix tr:last-child td { border-bottom: 0; }
-.matrix td.src { min-width: 0; max-width: 260px; overflow-wrap: anywhere; }
-.matrix td.src .path { font-size: 11px; color: var(--muted); }
-.matrix td .meta { margin-top: 4px; }
-.matrix td .go { margin-top: 6px; display: flex; gap: 8px; align-items: center; }
-.matrix td.none { color: var(--faint); }
+.matrix table { border-collapse: collapse; width: 100%; font-size: 12.5px; table-layout: fixed; }
+.matrix th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 8px; }
+.matrix tbody th { color: var(--fg); font-weight: 500; width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-top: 1px solid var(--line); }
+.matrix td { padding: 2px; border-top: 1px solid var(--line); }
+.matrix .cell { display: block; padding: 6px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
+.matrix a.cell:hover { background: var(--soft); }
+.matrix .cell .bar { height: 4px; }
+.matrix .cell .line { margin-top: 5px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.matrix .cell b.done { font-weight: 600; }
+.matrix .bad { color: var(--bad); }
+.matrix td.none { color: var(--faint); font-size: 12px; padding: 8px; }
 .targets { display: flex; gap: 14px; flex-wrap: wrap; }
 </style>
 </head>
@@ -338,30 +346,49 @@ function convDone(r) {
   };
 }
 
-// A batch: one matrix of its runs, each cell that run's own totals and gate.
+// A batch: one matrix of its runs, each cell that run's own totals and gate,
+// one line each; the details are in the cell's tooltip and the run's row.
 function batchCard(b, byId) {
   const targets = b.spec.targets;
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
   const cell = (i, to) => {
     const c = b.cells.find((x) => x.source === i && x.to === to);
-    if (!c) return `<td class="none">already ${esc(NAME[to] || to)}</td>`;
+    if (!c) return `<td class="none">—</td>`;
     const r = c.run != null && byId.get(c.run);
-    if (!r) return `<td class="none">no longer kept</td>`;
-    let body;
-    if (r.state === "done") { const d = convDone(r); body = d.right + `<div class="go">${d.act}</div>`; }
-    else if (r.state === "running") { const pct = r.total ? r.checked / r.total * 100 : 0; body = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Checked ${r.checked} of ${r.total}` : "Reading and converting…"}</div>`; }
-    else if (r.state === "queued") body = `<div class="meta">${r.cancelling ? "Cancelling…" : "Waiting"}</div>`;
-    else if (r.state === "cancelled") body = `<div class="meta">Cancelled; nothing was written</div>`;
-    else body = `<div class="failed-msg">${esc(r.error)}</div>`;
-    return `<td title="Run ${r.id}: ${esc(r.out)}">${body}</td>`;
+    if (!r) return `<td class="none" title="This run is no longer kept">not kept</td>`;
+    const tip = [`Run ${r.id}`, r.out];
+    let bar = "", line;
+    if (r.state === "done") {
+      const g = r.gate, u = r.totals.units || {};
+      bar = ladder(u);
+      line = !g ? `<span class="muted">${r.past ? "open to judge" : "…"}</span>`
+        : g.error ? `<span class="muted">gate not judged</span>`
+        : g.complete ? `<b class="done">done</b>`
+        : `<span>${plural(g.blockers, "blocker")}</span>`;
+      if (r.queue) line += ` <span class="muted">· ${r.queue} to review</span>`;
+      tip.push(plural(r.totals.files, "file"), `${r.queue} to review`);
+      if (g) tip.push(g.error || (g.complete ? "done" : Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")));
+      if (!r.complete) tip.push("not every file converted");
+      return `<td title="${esc(tip.join("\n"))}"><a class="cell" href="/runs/${r.id}/review">${bar}<div class="line">${line}</div></a></td>`;
+    }
+    if (r.state === "running") {
+      const pct = r.total ? r.checked / r.total * 100 : 0;
+      bar = `<div class="bar"><i class="p" style="width:${pct}%"></i></div>`;
+      line = `<span class="muted">${r.cancelling ? "cancelling…" : r.total ? `${r.checked} / ${r.total}` : "reading…"}</span>`;
+    } else if (r.state === "queued") line = `<span class="muted">${r.cancelling ? "cancelling…" : "waiting"}</span>`;
+    else if (r.state === "cancelled") line = `<span class="muted">cancelled</span>`;
+    else { line = `<span class="bad">failed</span>`; tip.push(r.error); }
+    return `<td title="${esc(tip.join("\n"))}"><div class="cell">${bar}<div class="line">${line}</div></div></td>`;
   };
-  const rows = b.spec.sources.map((s, i) => `<tr><td class="src" title="${esc(s.src)}"><b>${esc(b.names[i])}</b><div class="meta">${esc(NAME[s.from] || s.from)} · <span class="path">${esc(s.src)}</span></div></td>${targets.map((t) => cell(i, t)).join("")}</tr>`).join("");
+  const froms = [...new Set(b.spec.sources.map((s) => NAME[s.from] || s.from))].join(", ");
+  const rows = b.spec.sources.map((s, i) => `<tr><th scope="row" title="${esc(s.src)}">${esc(b.names[i])}</th>${targets.map((t) => cell(i, t)).join("")}</tr>`).join("");
   const n = b.cells.length;
   const sc = b.script;
-  return `<div class="batch"><div class="head"><span class="t">Batch ${b.id}: ${n} run${n === 1 ? "" : "s"}</span><span class="s">into <span class="path">${esc(b.spec.out)}</span> · started ${esc(time(b.started))}</span>${b.busy ? `<button type="button" data-cancel-batch="${b.id}">Cancel all</button>` : ""}</div>`
-    + `<div class="matrix"><table><thead><tr><th>Source</th>${targets.map((t) => `<th>${esc(NAME[t] || t)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`
-    + `<details class="cmd" data-batch="${b.id}"${shownBatch.has(b.id) ? " open" : ""}><summary>Script of the runs' commands</summary>`
+  return `<div class="batch"><div class="head"><span class="t">Batch ${b.id}</span><span class="s" title="${esc(b.spec.out)}">${plural(n, "run")} · ${esc(froms)} · started ${esc(time(b.started))}</span>${b.busy ? `<button type="button" data-cancel-batch="${b.id}">Cancel all</button>` : ""}</div>`
+    + `<div class="matrix"><table><thead><tr><th></th>${targets.map((t) => `<th>${esc(NAME[t] || t)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`
+    + `<details class="cmd" data-batch="${b.id}"${shownBatch.has(b.id) ? " open" : ""}><summary>Script</summary>`
     + `<div class="shells" role="group" aria-label="Shell">${[["powershell", "PowerShell"], ["sh", "sh / bash"]].map(([k, l]) => `<button type="button" data-shell="${k}" class="${k === shell ? "on" : ""}" aria-pressed="${k === shell}">${l}</button>`).join("")}<button type="button" class="copy outline" data-copy-batch="${b.id}">Copy</button></div>`
-    + `<pre>${esc(sc[shell])}</pre><ul><li>Each command is the one on its run's sheet; the config each run loaded is listed there</li></ul></details></div>`;
+    + `<pre>${esc(sc[shell])}</pre><ul><li>Output into <span class="path">${esc(b.spec.out)}</span>; each command is the one on its run's sheet, which lists the config it loaded</li></ul></details></div>`;
 }
 
 function row(r) {
@@ -430,6 +457,21 @@ function sheet(r) {
 
 let timer = null;
 let batches = INITIAL.batches || [];
+// The list, with a batch's runs folded into one row where its newest is:
+// the batch's matrix sums them up; each run's row keeps its sheet and notes.
+const shownGroup = new Set();
+function listed(runs) {
+  const seen = new Set();
+  return runs.map((r) => {
+    if (!r.batch) return row(r);
+    const id = r.batch.batch;
+    if (seen.has(id)) return "";
+    seen.add(id);
+    const mine = runs.filter((x) => x.batch && x.batch.batch === id);
+    const busy = mine.filter((x) => x.state === "running" || x.state === "queued").length;
+    return `<details class="group" data-group="${id}"${shownGroup.has(id) ? " open" : ""}><summary><span class="t">Batch ${id}</span> <span class="muted">${mine.length} run${mine.length === 1 ? "" : "s"}${busy ? ` · ${busy} not finished` : ""}</span></summary>${mine.map(row).join("")}</details>`;
+  }).join("");
+}
 function render(runs) {
   const byId = new Map(runs.map((r) => [r.id, r]));
   $("batches").innerHTML = batches.map((b) => batchCard(b, byId)).join("");
@@ -451,11 +493,14 @@ function render(runs) {
     catch (e) { b.textContent = "Select and copy"; }
     setTimeout(() => { b.textContent = "Copy"; }, 1500);
   }));
-  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, open for review when they finish, and stay listed after the app restarts.</div>`;
+  $("runs").innerHTML = runs.length ? listed(runs) : `<div class="empty">No runs yet. Converted trees appear here with their progress, open for review when they finish, and stay listed after the app restarts.</div>`;
   $("runs").querySelectorAll("[data-cancel]").forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
     try { await post(`/runs/${b.dataset.cancel}/cancel`, {}); } catch (e) { $("err").textContent = e.message; }
     refresh();
+  }));
+  $("runs").querySelectorAll("details.group").forEach((d) => d.addEventListener("toggle", () => {
+    d.open ? shownGroup.add(+d.dataset.group) : shownGroup.delete(+d.dataset.group);
   }));
   $("runs").querySelectorAll("details.cmd").forEach((d) => d.addEventListener("toggle", () => {
     d.open ? shown.add(+d.dataset.run) : shown.delete(+d.dataset.run);
