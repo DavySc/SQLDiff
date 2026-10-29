@@ -83,3 +83,71 @@ fn layout_comes_from_config_then_flags() {
     assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("indnet"));
 }
+
+#[test]
+fn a_folder_stands_for_its_sql_files() {
+    let d = scratch("folder");
+    std::fs::create_dir_all(d.join("db/sub")).unwrap();
+    std::fs::create_dir_all(d.join("db/target")).unwrap();
+    std::fs::write(d.join("db/a.pg.sql"), SRC).unwrap();
+    std::fs::write(d.join("db/sub/b.tsql.sql"), "SELECT a, b\nFROM t;\n").unwrap();
+    std::fs::write(d.join("db/notes.txt"), SRC).unwrap();
+    // Tool folders are not listed, as a tree source does not list them.
+    std::fs::write(d.join("db/target/c.pg.sql"), SRC).unwrap();
+    // A folder is several files: it needs --check or --write.
+    let o = sqldiff(&d, &["fmt", "db"]);
+    assert_eq!(o.status.code(), Some(2));
+    let o = sqldiff(&d, &["fmt", "--check", "db"]);
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let a = std::path::Path::new("db")
+        .join("a.pg.sql")
+        .display()
+        .to_string();
+    assert_eq!(stdout(&o), format!("{a}\n"));
+    let o = sqldiff(&d, &["fmt", "--write", "db"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(stdout(&o), format!("formatted {a}\n"));
+    assert_eq!(
+        std::fs::read_to_string(d.join("db/a.pg.sql")).unwrap(),
+        "SELECT a, b\nFROM t\nWHERE x = 1\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join("db/notes.txt")).unwrap(),
+        SRC
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join("db/target/c.pg.sql")).unwrap(),
+        SRC
+    );
+    let o = sqldiff(&d, &["fmt", "--check", "db"]);
+    assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
+    // A folder without SQL files is an error, not a pass.
+    std::fs::create_dir_all(d.join("empty")).unwrap();
+    let o = sqldiff(&d, &["fmt", "--check", "empty"]);
+    assert_eq!(o.status.code(), Some(2));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_in_a_folder_is_not_written_through() {
+    let d = scratch("link");
+    std::fs::create_dir_all(d.join("db")).unwrap();
+    std::fs::write(d.join("outside.pg.sql"), SRC).unwrap();
+    std::os::unix::fs::symlink(d.join("outside.pg.sql"), d.join("db/l.pg.sql")).unwrap();
+    let o = sqldiff(&d, &["fmt", "--write", "db"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("not formatted: a symbolic link"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(d.join("outside.pg.sql")).unwrap(),
+        SRC
+    );
+}

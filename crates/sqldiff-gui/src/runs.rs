@@ -8,7 +8,9 @@
 //! the template trees of several dialects for drift through
 //! `sqldiff_convert::drift` (what `sqldiff drift` runs), or reviews the SQL
 //! a branch changed through `sqldiff_review::branch` (what `sqldiff
-//! changes` runs), so a run writes what the command writes. Each run carries that command
+//! changes` runs), or lays out a folder's SQL files through
+//! `sqldiff_source::format_run` (what `sqldiff fmt --check` or `--write`
+//! runs), so a run writes what the command writes. Each run carries that command
 //! (`Command`), for scripts and pipelines.
 //!
 //! A batch (mass conversion) is several source trees converted into several
@@ -25,11 +27,13 @@ use sqldiff_convert::drift;
 use sqldiff_convert::instances;
 use sqldiff_convert::job::{self, Job};
 use sqldiff_convert::tree::{self, Hooks};
+use sqldiff_core::format::FormatConfig;
 use sqldiff_core::Dialect;
 use sqldiff_review::branch;
 use sqldiff_review::pipeline::{Pipeline, Settings};
 use sqldiff_source::changes::ChangeScope;
 use sqldiff_source::config::{self, Sources};
+use sqldiff_source::format_run;
 use sqldiff_source::Resolved;
 
 use crate::browse;
@@ -236,6 +240,22 @@ pub struct BatchCell {
     pub to: String,
 }
 
+/// A folder laid out as `sqldiff fmt` lays it out, as the page asks for it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatSpec {
+    /// The folder whose SQL files are laid out.
+    pub dir: String,
+    /// Write the laid-out files back (`--write`); otherwise only check
+    /// (`--check`) and write nothing.
+    #[serde(default)]
+    pub write: bool,
+    /// The config file the page showed for the folder: the run is refused
+    /// when a command run there would load another one.
+    #[serde(default)]
+    pub config: Option<String>,
+}
+
 /// What a run was asked to do.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -244,6 +264,7 @@ pub enum Spec {
     Instances(InstancesSpec),
     Drift(DriftSpec),
     Changes(ChangesSpec),
+    Format(FormatSpec),
 }
 
 impl Spec {
@@ -254,6 +275,8 @@ impl Spec {
             Spec::Instances(s) => &s.out,
             Spec::Drift(s) => &s.out,
             Spec::Changes(s) => &s.out,
+            // A format run holds the folder it reads and may write.
+            Spec::Format(s) => &s.dir,
         }
     }
 }
@@ -264,6 +287,18 @@ enum Work {
     Instances(Box<instances::Args>),
     Drift(Box<drift::Args>),
     Changes(Box<ChangesWork>),
+    Format(Box<FormatWork>),
+}
+
+/// A folder to lay out, checked and ready to run.
+struct FormatWork {
+    dir: PathBuf,
+    write: bool,
+    /// The project and user config files loaded.
+    files: (Option<PathBuf>, Option<PathBuf>),
+    /// The config's `[format]`.
+    format: FormatConfig,
+    cfg: Resolved,
 }
 
 /// A branch review, checked and ready to run.
@@ -492,6 +527,13 @@ impl Command {
         Command::with_config_then(program, args, packs, dir, isolated, tail)
     }
 
+    /// The `sqldiff fmt` command for `w`, naming the config files it loaded.
+    fn format(program: &str, w: &FormatWork) -> Command {
+        let mode = if w.write { "--write" } else { "--check" };
+        let args = vec!["fmt".into(), mode.into(), path(&w.dir)];
+        Command::with_files(program, args, &[], w.files.clone(), Vec::new())
+    }
+
     /// `args` with the packs and every config file the run loaded named,
     /// and no other found (`--isolated`).
     fn with_config(
@@ -508,15 +550,12 @@ impl Command {
     /// such as paths after `--`).
     fn with_config_then(
         program: &str,
-        mut args: Vec<String>,
+        args: Vec<String>,
         packs: &[PathBuf],
         dir: &Path,
         isolated: bool,
         tail: Vec<String>,
     ) -> Command {
-        for p in packs {
-            args.extend(["--pack".into(), path(p)]);
-        }
         let (project, user) = match isolated {
             true => (None, None),
             false => (
@@ -524,6 +563,21 @@ impl Command {
                 config::user_config_path().filter(|p| p.is_file()),
             ),
         };
+        Command::with_files(program, args, packs, (project, user), tail)
+    }
+
+    /// `args` with the packs and the config files `project` and `user`
+    /// named, and no other found (`--isolated`), then `tail`.
+    fn with_files(
+        program: &str,
+        mut args: Vec<String>,
+        packs: &[PathBuf],
+        (project, user): (Option<PathBuf>, Option<PathBuf>),
+        tail: Vec<String>,
+    ) -> Command {
+        for p in packs {
+            args.extend(["--pack".into(), path(p)]);
+        }
         args.push("--isolated".into());
         if let Some(p) = &project {
             args.extend(["--config".into(), path(p)]);
@@ -1119,6 +1173,27 @@ impl Runs {
         )
     }
 
+    /// Starts laying out a folder on its own thread. Config is what a
+    /// command run in the folder loads (unless `isolated`). The run holds
+    /// the folder: no other run reads or writes there meanwhile.
+    pub fn start_format(
+        &self,
+        spec: FormatSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (w, command) = prepare_format(&spec, isolated)?;
+        let loaded = packs::loaded(&w.cfg);
+        let out = w.dir.clone();
+        self.launch(
+            Spec::Format(spec),
+            Work::Format(Box::new(w)),
+            (out, Vec::new()),
+            (command, loaded),
+            done,
+        )
+    }
+
     fn launch(
         &self,
         spec: Spec,
@@ -1533,6 +1608,11 @@ pub fn drift_command(spec: &DriftSpec, isolated: bool) -> Result<Command, String
     prepare_drift(spec, isolated).map(|(_, c, _)| c)
 }
 
+/// The command a format run of `spec` would carry, without starting one.
+pub fn format_command(spec: &FormatSpec, isolated: bool) -> Result<Command, String> {
+    prepare_format(spec, isolated).map(|(_, c)| c)
+}
+
 /// The command a branch review of `spec` would carry, without starting one.
 pub fn changes_command(spec: &ChangesSpec, isolated: bool) -> Result<Command, String> {
     prepare_changes(spec, isolated).map(|(_, c, _)| c)
@@ -1642,6 +1722,88 @@ fn prepare_instances(
 /// and the command that runs it. The review store is read (decisions suppress
 /// findings, as for the command) and the result cache is not used, so a run
 /// writes nothing but its output folder.
+/// The folder a format run lays out, checked before a thread is started,
+/// and the command that runs it.
+fn prepare_format(spec: &FormatSpec, isolated: bool) -> Result<(FormatWork, Command), String> {
+    let dir = existing(&spec.dir)?;
+    if !dir.is_dir() {
+        return Err(format!("{}: not a folder", dir.display()));
+    }
+    // The page shows the folder's own `sqldiff.toml`, present or not.
+    let shown = spec
+        .config
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| browse::absolute(Path::new(c.trim())));
+    let own = dir.join(config::PROJECT_FILE);
+    if shown
+        .as_deref()
+        .is_some_and(|c| canonical(c) != canonical(&own))
+    {
+        return Err(format!(
+            "settings are shown for {}, which is not {}",
+            shown.as_deref().unwrap_or(&own).display(),
+            own.display()
+        ));
+    }
+    let project = match (isolated, &shown) {
+        // An app that ignores config still formats with the settings it
+        // shows: the folder's own file, named.
+        (true, Some(_)) => Some(own.clone()).filter(|p| p.is_file()),
+        (true, None) => None,
+        (false, _) => config::find_project(&dir),
+    };
+    // The page shows that file, or the defaults when there is none: a command
+    // run there must load the same, not a file further up.
+    let expected = own.is_file().then(|| canonical(&own));
+    if !isolated && shown.is_some() && project.as_deref().map(canonical) != expected {
+        return Err(format!(
+            "a command run in {} loads {} rather than the settings shown; open that folder's settings, or run the command",
+            dir.display(),
+            project
+                .as_deref()
+                .map_or("no project config".into(), |f| f.display().to_string())
+        ));
+    }
+    let user = match isolated {
+        true => None,
+        false => config::user_config_path().filter(|p| p.is_file()),
+    };
+    if let Some(p) = &project {
+        // As on the Settings page: the user config or a private pack is
+        // never read as a folder's config, and nothing of it is quoted.
+        if crate::settings::private_file(p, isolated, &[]) {
+            return Err(format!(
+                "{}: this file is also the user config or a private pack (or the configuration that would tell cannot be loaded), whose contents are not shown; choose another folder",
+                p.display()
+            ));
+        }
+        // An error in the folder's own file is the user's to read.
+        config::ConfigLayer::load(p).map_err(|e| e.0)?;
+    }
+    let cfg = Resolved::load_without_search(&Sources {
+        project: project.clone(),
+        user: user.clone(),
+        isolated: true,
+        cwd: Some(dir.clone()),
+        packs: Vec::new(),
+        cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+    })
+    // One in another layer may quote a private config.
+    .map_err(|_| {
+        "another configuration layer (user config or a pack) could not be loaded; run `sqldiff config` to see why".to_string()
+    })?;
+    let w = FormatWork {
+        dir,
+        write: spec.write,
+        files: (project, user),
+        format: cfg.policy.format.clone(),
+        cfg,
+    };
+    let command = Command::format(&program(), &w);
+    Ok((w, command))
+}
+
 fn prepare_changes(
     spec: &ChangesSpec,
     isolated: bool,
@@ -1902,6 +2064,17 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
                 Err(e) => stopped(e),
             }
         }
+        Work::Format(w) => {
+            return match format_folder(&w, &hooks) {
+                Ok(mut state) => {
+                    if let State::Done { finished: f, .. } = &mut state {
+                        *f = finished();
+                    }
+                    state
+                }
+                Err(e) => stopped(e),
+            }
+        }
         Work::Drift(a) => {
             return match drift::check(&a, &hooks) {
                 Ok(c) => State::Done {
@@ -1977,6 +2150,54 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
         notes: Vec::new(),
         finished: finished(),
     }
+}
+
+/// Lays out every file first; a write run then writes the changed files,
+/// after the last cancel point. `totals` holds the files, those laid out
+/// differently from what is on disk (written, for a write run), the
+/// statements kept as written and the files skipped; `complete` is the
+/// command's exit code 0.
+fn format_folder(w: &FormatWork, hooks: &Hooks) -> Result<State, String> {
+    let files = format_run::check(std::slice::from_ref(&w.dir), None, &w.format, &w.cfg, hooks)?;
+    hooks.stop_if_cancelled()?;
+    let mut notes = Vec::new();
+    let (mut changed, mut kept, mut skipped) = (0, 0, 0);
+    for f in &files {
+        if let Some(line) = f.skipped_line() {
+            notes.push(line);
+            skipped += 1;
+            continue;
+        }
+        notes.extend(f.kept_lines());
+        kept += f.kept.len();
+        if f.changed {
+            changed += 1;
+        }
+    }
+    if w.write {
+        let mut written = 0;
+        for f in &files {
+            match f.write() {
+                Ok(true) => written += 1,
+                Ok(false) => {}
+                Err(e) => return Err(format!("{e} ({written} files written before it)")),
+            }
+        }
+    }
+    Ok(State::Done {
+        totals: serde_json::json!({
+            "files": files.len(),
+            "changed": changed,
+            "written": w.write,
+            "kept": kept,
+            "skipped": skipped,
+        }),
+        complete: skipped == 0 && (w.write || changed == 0),
+        queue: if w.write { 0 } else { changed },
+        not_applied: Vec::new(),
+        notes,
+        finished: String::new(),
+    })
 }
 
 /// Reviews the branch, then writes the three files. Everything is read and
