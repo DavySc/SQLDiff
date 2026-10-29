@@ -12,6 +12,7 @@ mod call;
 pub mod canon;
 pub mod compare;
 pub mod ddl;
+pub mod dynamic;
 pub mod edit;
 pub mod eval;
 pub mod literal;
@@ -210,6 +211,7 @@ fn compare_units(
     script::locals(a, b, ua, ub, &na, &nb, out);
     tables(a, b, ua, ub, sa, sb, out);
     calls(a, b, ua, ub, sa, sb, out);
+    dynamic_sql(a, b, ua, ub, sa, sb, out);
     ddl_stmts(a, b, ua, ub, sa, sb, out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
         out.assume(x.clone());
@@ -247,7 +249,9 @@ fn compare_units(
         && ub.uncovered.is_empty()
         // A called procedure can touch the witness's table.
         && ua.calls.is_empty()
-        && ub.calls.is_empty())
+        && ub.calls.is_empty()
+        && ua.dynamic.is_empty()
+        && ub.dynamic.is_empty())
     .then(|| Witnessing {
         a: xwit::Side {
             unit: ua,
@@ -462,6 +466,211 @@ fn calls(
                     b: Some(line_at(b, ob)),
                     assumptions: Vec::new(),
                 });
+            }
+        }
+    }
+}
+
+/// Compares dynamic SQL (`dynamic.rs`): T-SQL `EXEC (…)` / `sp_executesql`
+/// against PL/pgSQL `EXECUTE '…'`, paired in order, each by the one
+/// statement its text runs. The texts are compared like two files, so the
+/// pair is equal only when that comparison is.
+#[allow(clippy::too_many_arguments)]
+fn dynamic_sql(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) {
+    use sqldiff_syntax::Dialect;
+    if ua.dynamic.is_empty() && ub.dynamic.is_empty() {
+        return;
+    }
+    let (na, nb) = (side_name(a), side_name(b));
+    let shown = |n: &SyntaxNode| {
+        let text = n.text().to_string();
+        let w: Vec<&str> = text.split_whitespace().collect();
+        let mut s = w.join(" ");
+        if s.chars().count() > 60 {
+            s = s.chars().take(57).collect::<String>() + "…";
+        }
+        format!("`{s}`")
+    };
+    let t_is_a = match (a.dialect(), b.dialect()) {
+        (Dialect::Tsql, Dialect::Postgres) => Some(true),
+        (Dialect::Postgres, Dialect::Tsql) => Some(false),
+        _ => None,
+    };
+    let paired = t_is_a.is_some() && ua.dynamic.len() == ub.dynamic.len();
+    if !paired {
+        let why = if t_is_a.is_none() {
+            "only T-SQL against PostgreSQL is".to_string()
+        } else {
+            format!(
+                "the sides run dynamic SQL {} and {} times",
+                ua.dynamic.len(),
+                ub.dynamic.len()
+            )
+        };
+        for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
+            for (node, _) in &u.dynamic {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: the dynamic SQL {} is not compared: {why}",
+                    side.line_of(node),
+                    shown(node)
+                ));
+            }
+        }
+        return;
+    }
+    let t_is_a = t_is_a == Some(true);
+    // Only assignments of variables run before: the tables hold whatever
+    // the caller left, so a witness of the texts alone is one of the routine.
+    let untouched = |u: &Unit, at: &lower::CallAt| {
+        u.calls.is_empty()
+            && u.uncovered.is_empty()
+            && u.txn_stmts.is_empty()
+            && u.stmts[..at.after.min(u.stmts.len())]
+                .iter()
+                .all(|s| matches!(s.ast, Ok(ast::Stmt::Assign(..))))
+    };
+    for (k, ((xn, at_a), (yn, at_b))) in ua.dynamic.iter().zip(&ub.dynamic).enumerate() {
+        let (la, lb) = (a.line_of(xn), b.line_of(yn));
+        let unknown = |out: &mut Outcome, why: &str| {
+            out.unknown_reasons.push(format!(
+                "{na} line {la}: the dynamic SQL {} (and {nb} line {lb}) is not compared: {why}",
+                shown(xn)
+            ));
+        };
+        if at_a != at_b {
+            unknown(
+                out,
+                "it does not sit in the same place among the data statements",
+            );
+            continue;
+        }
+        let (tn, pn) = if t_is_a { (xn, yn) } else { (yn, xn) };
+        let ttext = match dynamic::tsql_text(tn) {
+            dynamic::Text::Known(s) => s,
+            dynamic::Text::Null => {
+                unknown(out, "the T-SQL text is NULL, so T-SQL runs nothing");
+                continue;
+            }
+            dynamic::Text::Unknown(why) => {
+                unknown(
+                    out,
+                    &format!("its T-SQL text is not known before it runs: {why}"),
+                );
+                continue;
+            }
+        };
+        let ptext = match dynamic::pg_text(pn) {
+            Some(Ok(s)) => s,
+            Some(Err(why)) => {
+                unknown(
+                    out,
+                    &format!("the PostgreSQL text is not a constant: {why}"),
+                );
+                continue;
+            }
+            None => {
+                unknown(out, "the PostgreSQL side is not EXECUTE");
+                continue;
+            }
+        };
+        if let Some(why) = dynamic::tsql_inner_refusal(&ttext) {
+            unknown(out, &why);
+            continue;
+        }
+        let pparse = sqldiff_syntax::parse(&ptext, Dialect::Postgres);
+        let top = pparse
+            .syntax()
+            .children()
+            .filter(|n| n.kind().is_unit())
+            .count();
+        if !pparse.diagnostics.is_empty() || top != 1 {
+            unknown(out, "the PostgreSQL text is not one statement");
+            continue;
+        }
+        let (ta, tb) = if t_is_a {
+            (ttext.as_str(), ptext.as_str())
+        } else {
+            (ptext.as_str(), ttext.as_str())
+        };
+        let xa = crate::artifact::Artifact::new(
+            format!("{} (dynamic SQL at line {la})", a.artifact.path),
+            a.dialect(),
+            ta,
+        );
+        let xb = crate::artifact::Artifact::new(
+            format!("{} (dynamic SQL at line {lb})", b.artifact.path),
+            b.dialect(),
+            tb,
+        );
+        let (ia, ib) = (
+            Analyzed::new(&xa, Side::A, a.excerpt_lines),
+            Analyzed::new(&xb, Side::B, b.excerpt_lines),
+        );
+        let inner = compare(&ia, &ib, sa, sb);
+        // The batch reads ANSI_NULLS and QUOTED_IDENTIFIER from the session,
+        // not from the procedure.
+        out.assume(asm::make(asm::DYNAMIC_SESSION_OPTIONS));
+        for x in inner.assumptions {
+            out.assume(x);
+        }
+        for n in inner.normalizations {
+            out.normalize(n);
+        }
+        for r in inner.refinements {
+            out.refine(r);
+        }
+        for r in &inner.unknown_reasons {
+            // `side A (T-SQL) line 1: why` → `why`.
+            let why = r.split_once(": ").map_or(r.as_str(), |(_, w)| w);
+            unknown(out, &format!("inside its text, {why}"));
+        }
+        let settled = inner.findings.is_empty() && inner.unknown_reasons.is_empty();
+        let first = k == 0 && untouched(ua, at_a) && untouched(ub, at_b);
+        for f in inner.findings {
+            if f.verdict == Verdict::Different && !first {
+                unknown(
+                    out,
+                    &format!(
+                        "inside its text the statements differ on data that earlier statements of the routine may not leave: {}",
+                        f.witness
+                    ),
+                );
+                continue;
+            }
+            let anchor = |n: &SyntaxNode| {
+                crate::normalize::hash_strs(std::iter::once(n.text().to_string().as_str()))
+            };
+            out.findings.push(Finding {
+                fingerprint: fingerprint(&FingerprintInput {
+                    object: &a.object,
+                    class: f.class,
+                    rule: &f.rule,
+                    anchor_a: &anchor(xn),
+                    anchor_b: &anchor(yn),
+                }),
+                witness: format!(
+                    "The dynamic SQL at A line {la} and B line {lb} runs statements that differ: {}",
+                    f.witness
+                ),
+                a: Some(location(a, std::slice::from_ref(xn))),
+                b: Some(location(b, std::slice::from_ref(yn))),
+                ..f
+            });
+        }
+        if settled {
+            if inner.equal == 0 {
+                unknown(out, "nothing in its text was compared");
+            } else {
+                out.equal += 1;
+                out.structural += 1;
             }
         }
     }
@@ -1259,6 +1468,7 @@ fn error_continues(
     enum E {
         Item(usize),
         Call(usize),
+        Dyn(usize),
     }
     let mut seq: Vec<(usize, E)> = items
         .iter()
@@ -1278,11 +1488,19 @@ fn error_continues(
                 .filter(|(_, (_, at))| at.outside.is_none() && t.kind == UnitKind::Proc)
                 .map(|(i, (n, _))| (cst::sig_range(n).0, E::Call(i))),
         )
+        // Dynamic SQL fails like a call and changes what its text changes.
+        .chain(
+            t.dynamic
+                .iter()
+                .enumerate()
+                .filter(|_| t.kind == UnitKind::Proc)
+                .map(|(i, (n, _))| (cst::sig_range(n).0, E::Dyn(i))),
+        )
         .collect();
     seq.sort_by_key(|x| x.0);
     let is_effect = |e: E| match e {
         E::Item(i) => effect(&items[i].term),
-        E::Call(_) => true,
+        E::Call(_) | E::Dyn(_) => true,
     };
     let Some((i, j)) = (0..seq.len()).find_map(|i| {
         if let E::Item(k) = seq[i].1 {
@@ -1305,6 +1523,7 @@ fn error_continues(
         match e {
             E::Item(k) => items[k].nodes.clone(),
             E::Call(k) => vec![t.calls[k].0.clone()],
+            E::Dyn(k) => vec![t.dynamic[k].0.clone()],
         }
     };
     let (xn, yn) = (nodes(seq[i].1), nodes(seq[j].1));
@@ -1324,7 +1543,7 @@ fn error_continues(
     let class = ChangeClass::Transactional;
     let anchor_text = match seq[i].1 {
         E::Item(k) => items[k].term.to_string(),
-        E::Call(_) => xn[0].text().to_string(),
+        E::Call(_) | E::Dyn(_) => xn[0].text().to_string(),
     };
     let anchor = crate::normalize::hash_strs(std::iter::once(anchor_text.as_str()));
     out.findings.push(Finding {

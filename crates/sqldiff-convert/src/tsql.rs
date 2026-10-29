@@ -408,6 +408,7 @@ impl<'a> Cx<'a> {
         self.mode = Mode::Do;
         self.reset();
         self.dynamic = dynamic_sql_vars(&tokens(b));
+        self.drop_known_dynamic(b);
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
         if self.db2() {
@@ -543,6 +544,9 @@ impl<'a> Cx<'a> {
         self.txn_control = false;
         let all = tokens(r);
         self.dynamic = dynamic_sql_vars(&all);
+        let mode = std::mem::replace(&mut self.mode, if func { Mode::Func } else { Mode::Proc });
+        self.drop_known_dynamic(r);
+        self.mode = mode;
         let body_at = all.len()
             - r.children()
                 .find(|c| c.kind() == ROUTINE_BODY)
@@ -1122,6 +1126,100 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Dynamic SQL whose text is known before it runs (`equiv::dynamic`):
+    /// the statement inside is converted by the same rules and run with
+    /// `EXECUTE '<converted text>'`. The variable keeps the T-SQL text, which
+    /// nothing runs any more; the engine compares the statement inside the
+    /// string with the one inside the `EXECUTE`.
+    fn dynamic_exec(&mut self, n: &SyntaxNode) -> R<String> {
+        let (text, notes) = self.dynamic_inner(n).map_err(No)?;
+        for x in notes {
+            if x.status > Status::Converted {
+                self.note(
+                    x.status,
+                    &x.rule,
+                    &format!("In the dynamic SQL: {}", x.text),
+                );
+            }
+        }
+        self.step_node("tsql.stmt.dynamic-known-text", n);
+        Ok(format!("EXECUTE '{}'", text.replace('\'', "''")))
+    }
+
+    /// The converted statement a dynamic SQL statement runs, with the notes
+    /// of its conversion, or why it cannot be converted.
+    fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>), String> {
+        use sqldiff_core::equiv::dynamic::{self, Text};
+        if self.db2() {
+            return Err(
+                "dynamic SQL: not converted for Db2 for i yet; use EXECUTE IMMEDIATE after review"
+                    .into(),
+            );
+        }
+        if self.mode != Mode::Proc && self.mode != Mode::Do || self.trigger.is_some() {
+            return Err("dynamic SQL outside a procedure or script block".into());
+        }
+        let text = match dynamic::tsql_text(n) {
+            Text::Known(t) => t,
+            Text::Null => {
+                return Err("dynamic SQL whose text is NULL: T-SQL runs nothing and PostgreSQL EXECUTE NULL fails; remove the statement after review".into())
+            }
+            Text::Unknown(why) => {
+                return Err(format!(
+                    "dynamic SQL whose text is not known before it runs ({why}): use EXECUTE format(…) after review; the checker cannot compare it"
+                ))
+            }
+        };
+        if text.trim().is_empty() {
+            return Err("dynamic SQL with empty text: T-SQL runs nothing; remove the statement after review".into());
+        }
+        if let Some(why) = dynamic::tsql_inner_refusal(&text) {
+            return Err(format!("dynamic SQL with known text, not converted: {why}"));
+        }
+        let root = sqldiff_syntax::parse(&text, Dialect::Tsql).syntax();
+        let inner = convert(&root, &text, self.to, self.catalog);
+        let [u] = inner.units.as_slice() else {
+            return Err("dynamic SQL with known text, not converted: its statement did not convert to one statement".into());
+        };
+        if let Some(bad) = u.notes.iter().find(|x| x.status > Status::Decision) {
+            return Err(format!(
+                "dynamic SQL with known text, not converted: {}",
+                bad.text
+            ));
+        }
+        let out = inner.text[u.out.0..u.out.1].trim();
+        // Comment lines the rules keep (`-- SET NOCOUNT ON: …`) are not code.
+        if out.lines().any(|l| l.trim_start().starts_with("--")) || out.contains('$') {
+            return Err("dynamic SQL with known text, not converted: the converted statement holds comments or `$`".into());
+        }
+        Ok((out.trim_end_matches(';').to_string(), u.notes.clone()))
+    }
+
+    /// Takes off `self.dynamic` the variables that only known-text dynamic
+    /// SQL runs: those statements now run the converted text, not the
+    /// variable, so its T-SQL text no longer reaches PostgreSQL.
+    fn drop_known_dynamic(&mut self, scope: &SyntaxNode) {
+        if self.dynamic.is_empty() {
+            return;
+        }
+        let sites: Vec<SyntaxNode> = scope
+            .descendants()
+            .filter(sqldiff_core::equiv::dynamic::is_tsql)
+            .collect();
+        let known: Vec<bool> = sites
+            .iter()
+            .map(|d| self.dynamic_inner(d).is_ok())
+            .collect();
+        // Kept while some statement that is not converted this way runs it.
+        self.dynamic.retain(|v| {
+            sites.iter().zip(&known).any(|(d, ok)| {
+                !*ok && tokens(d)
+                    .iter()
+                    .any(|t| t.k == VARIABLE && t.s[1..].eq_ignore_ascii_case(v))
+            })
+        });
+    }
+
     /// A statement that assigns a variable later run as dynamic SQL builds
     /// T-SQL text: the rules convert the statement, not the SQL in the string,
     /// so the unit cannot count as converted.
@@ -1522,6 +1620,7 @@ impl<'a> Cx<'a> {
             "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
             "SAVE" if self.db2() => self.save(&ts)?,
             "SAVE" => return no("SAVE TRANSACTION: use SAVEPOINT, but a PL/pgSQL body cannot; use a nested BEGIN … EXCEPTION block"),
+            "EXEC" | "EXECUTE" if sqldiff_core::equiv::dynamic::is_tsql(n) => self.dynamic_exec(n)?,
             "EXEC" | "EXECUTE" => self.exec(&ts)?,
             "CREATE" => self.create(&ts)?,
             "ALTER" if w(1) == "TABLE" => self.alter_table(&ts)?,

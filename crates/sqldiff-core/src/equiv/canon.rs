@@ -101,6 +101,11 @@ pub mod asm {
         "The caller does not hold an open transaction",
     );
 
+    pub const DYNAMIC_SESSION_OPTIONS: (&str, &str) = (
+        "ASM-TSQL-DYNAMIC-SESSION-OPTIONS",
+        "The session runs dynamic SQL with ANSI_NULLS and QUOTED_IDENTIFIER ON (the defaults): T-SQL takes them for a dynamic batch from the session, not from the procedure",
+    );
+
     pub const OWNER_PRIVILEGES: (&str, &str) = (
         "ASM-OWNER-PRIVILEGES",
         "The routine owner holds every privilege its statements need on both sides (Db2 for i USRPRF *OWNER adds the owner's authority to the caller's; T-SQL EXECUTE AS OWNER and PostgreSQL SECURITY DEFINER use the owner's alone)",

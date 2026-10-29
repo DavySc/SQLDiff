@@ -219,6 +219,60 @@ procedure for a bigint argument to an int parameter nor for 1 to a boolean;
 gives an OUT parameter NULL whatever is passed; an INOUT parameter receives the
 value; copying back into a shorter `varchar` variable fails; an INOUT argument that needs any cast (a `varchar(10)` variable for a `text` parameter, `int` for `bigint`) fails the call as not writable.
 
+## Dynamic SQL
+
+T-SQL `EXEC (…)` and `EXEC [sys.]sp_executesql …` run a string as a batch;
+PL/pgSQL `EXECUTE '…'` runs a string as one statement. Both are compared by
+the statement their text runs (`equiv/dynamic.rs`), paired in order and in
+the same place among the data statements, like calls.
+
+The T-SQL text must be fixed by the code alone: string literals, `NCHAR(n)`
+and `CHAR(n)` of a constant, `QUOTENAME` and `+` over those, and local
+variables whose last assignment before the statement (`SET @v = …`, `SET @v
++= …`, `DECLARE @v T = …`, or a `DECLARE` without a value: NULL) is such an
+expression. The reading walks back through the statements before it, into
+the enclosing blocks, past an IF to the statements before the IF and out of
+a TRY part. It stops, and the text is unknown, at a parameter, a value read
+from a table or a call, any other statement that mentions the variable
+(running or printing it does not count), an IF or block that may assign it,
+a loop or a CATCH block around the statement, GOTO or labels anywhere,
+`SET CONCAT_NULL_YIELDS_NULL`, a declaration that is not `nvarchar(n|max)`,
+`varchar(n|max)` or `sysname`, varchar text outside ASCII (it depends on the
+code page) and characters outside the Basic Multilingual Plane. A value is
+cut to its variable's declared length; a concatenation that would be cut at
+4000 / 8000 characters (no operand of a `max` type) is unknown. The
+PostgreSQL side must be `EXECUTE` of one string constant, without INTO or
+USING.
+
+The T-SQL text must be one statement that runs the same as a batch and as a
+PostgreSQL `EXECUTE`: no query that returns rows (T-SQL sends them to the
+client, `EXECUTE` discards them), no `OUTPUT` clause, no variables (the
+batch cannot see the caller's), no `#temp` table (dropped when the batch
+ends), no `SET`, `USE`, transaction control or nested dynamic SQL, and only
+one statement (without XACT_ABORT a failing statement lets the next one in
+the batch run). The two texts are then compared as two files, and the pair
+is equal exactly when that comparison is; its assumptions carry over, plus
+`ASM-TSQL-DYNAMIC-SESSION-OPTIONS` (a dynamic batch takes ANSI_NULLS and
+QUOTED_IDENTIFIER from the session, not from the procedure). A difference
+found by a witness is kept as "different" only when nothing but variable
+assignments runs before the first dynamic statement on both sides; after
+other statements the tables may not hold the witness rows, and the pair is
+unknown.
+
+Facts (SQL Server 2022 and PostgreSQL 18.6, run 2026-10-29): `EXEC (NULL)`,
+`EXEC (N'')` and `sp_executesql NULL` run nothing and raise nothing; a varchar
+argument to `sp_executesql` fails ("expects parameter '@statement' of type
+'ntext/nchar/nvarchar'"); `nvarchar(5)` keeps 'abcde' of 'abcdefgh'; two
+3000-character `nvarchar` literals concatenate to 4000 characters, a
+`nvarchar(max)` variable first keeps all 6000; a 5000-character `N'…'`
+literal is not cut; `QUOTENAME` of 129 characters is NULL; a `#temp` table
+created by `EXEC` is gone afterwards; `@x` inside `EXEC` fails ("Must declare
+the scalar variable"); `EXEC (N'INSERT … 1/0; INSERT …')` runs the second
+INSERT without XACT_ABORT and neither with it. PostgreSQL `EXECUTE NULL`
+fails ("query string argument of EXECUTE is null"), `EXECUTE ''` does nothing,
+`EXECUTE 'SELECT 1'` discards the row, and one `EXECUTE` may run several
+statements; `format('%I', NULL)` fails.
+
 ## Indexes, sequences and schemas
 
 A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE SCHEMA`

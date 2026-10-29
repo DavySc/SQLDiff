@@ -120,6 +120,9 @@ pub struct Unit {
     /// (`sp_addextendedproperty`, `COMMENT ON`), compared call against call
     /// (`call.rs`), with where each one sits.
     pub calls: Vec<(SyntaxNode, CallAt)>,
+    /// Dynamic SQL: T-SQL `EXEC (…)` / `sp_executesql`, PL/pgSQL `EXECUTE`,
+    /// compared by the statement each runs (`dynamic.rs`), placed like calls.
+    pub dynamic: Vec<(SyntaxNode, CallAt)>,
     /// A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE
     /// SCHEMA` statements (`ddl.rs`), placed like `tables`.
     pub ddl: Vec<(SyntaxNode, usize)>,
@@ -204,6 +207,7 @@ fn empty(d: Dialect) -> Unit {
         uncovered: Vec::new(),
         tables: Vec::new(),
         calls: Vec::new(),
+        dynamic: Vec::new(),
         ddl: Vec::new(),
         txn_control: false,
         stops_on_error: false,
@@ -788,7 +792,19 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         });
         return;
     }
+    let dynamic = match d {
+        Dialect::Tsql => super::dynamic::is_tsql(c),
+        _ => u.in_block && super::dynamic::pg_text(c).is_some(),
+    };
     match kind {
+        // Dynamic SQL: compared by the statement it runs (`dynamic.rs`).
+        _ if dynamic => {
+            let at = CallAt {
+                outside: None,
+                after: u.stmts.len(),
+            };
+            u.dynamic.push((c.clone(), at));
+        }
         // Calls and comments: compared call against call (`call.rs`).
         _ if is_call(c, d) => {
             let at = CallAt {
