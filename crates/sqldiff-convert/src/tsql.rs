@@ -73,6 +73,7 @@ pub(crate) fn convert(
         return_code: false,
         txn_control: false,
         wrapper: None,
+        autocommit: Vec::new(),
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
@@ -213,6 +214,10 @@ struct Cx<'a> {
     /// that wraps all the durable work of the routine or script start
     /// ([`txn_wrapper`]); both are dropped.
     wrapper: Option<(usize, usize)>,
+    /// PostgreSQL: where the T-SQL body commits a statement on its own
+    /// (autocommit outside an explicit transaction, [`autocommit_points`]);
+    /// a COMMIT follows each of them.
+    autocommit: Vec<usize>,
     decls: Vec<Decl>,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
@@ -441,6 +446,7 @@ impl<'a> Cx<'a> {
         self.savepoints.clear();
         self.dynamic.clear();
         self.wrapper = None;
+        self.autocommit.clear();
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
@@ -451,6 +457,9 @@ impl<'a> Cx<'a> {
         self.drop_known_dynamic(b);
         if !self.db2() {
             self.wrapper = txn_wrapper(b);
+            if self.wrapper.is_none() {
+                self.autocommit = autocommit_points(b).unwrap_or_default();
+            }
         }
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
@@ -741,6 +750,10 @@ impl<'a> Cx<'a> {
         ))?;
         if !self.db2() && !func {
             self.wrapper = txn_wrapper(&body);
+            // A SECURITY DEFINER procedure may not commit.
+            if self.wrapper.is_none() && !owner {
+                self.autocommit = autocommit_points(&body).unwrap_or_default();
+            }
         }
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
@@ -1157,6 +1170,7 @@ impl<'a> Cx<'a> {
                     Ok(_) if self.blocked().is_some() => self.blocked().unwrap(),
                     Ok(text) => {
                         self.dynamic_text(n);
+                        let text = self.autocommit_after(n, text);
                         return self.emit(out, Self::range(n), indent, &text);
                     }
                     Err(No(reason)) => reason,
@@ -3343,6 +3357,23 @@ impl<'a> Cx<'a> {
         self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-notice");
         self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
         Ok(format!("RAISE NOTICE '{fmt}'{values}"))
+    }
+
+    /// A statement T-SQL commits on its own (autocommit under
+    /// `SET XACT_ABORT ON`): a COMMIT after it, so that a failure later in
+    /// the procedure leaves it durable on both sides.
+    fn autocommit_after(&mut self, n: &SyntaxNode, text: String) -> String {
+        let at = tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
+        if self.db2()
+            || !matches!(self.mode, Mode::Proc | Mode::Do)
+            || !at.is_some_and(|a| self.autocommit.contains(&a))
+        {
+            return text;
+        }
+        self.step_node("tsql.txn.autocommit", n);
+        self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "T-SQL commits this statement on its own (no transaction is open), so a COMMIT follows it: a later failure leaves it durable on both sides. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL leaves it to the caller, where PostgreSQL refuses the COMMIT.");
+        self.txn_control = true;
+        format!("{text}\nCOMMIT;")
     }
 
     /// `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS MEMORY_OPTIMIZED_DATA |
@@ -6954,6 +6985,146 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Where a T-SQL body commits a statement on its own, for a PostgreSQL
+/// procedure or DO block, which is one transaction unless it commits: the
+/// start of every statement that writes (a table, a temporary table, a
+/// call, DDL) while no explicit transaction is open. Only when the body runs
+/// with `SET XACT_ABORT ON` (set before anything writes, never turned off),
+/// so that a failure ends the routine on both sides and what T-SQL had
+/// committed stays; and only when that matters, that is when the body
+/// commits at least twice (counting explicit transactions, and a loop as
+/// twice). Checked on SQL Server 2022 and PostgreSQL 18.
+///
+/// The open transaction must be known statically: `BEGIN TRAN` and its
+/// `COMMIT` in the same statement list, never nested, every IF branch and
+/// loop body leaving it as it found it, no RETURN, BREAK or CONTINUE inside
+/// one. Refused: ROLLBACK, SAVE, @@TRANCOUNT, XACT_STATE, TRY/CATCH (a
+/// PostgreSQL block with an EXCEPTION clause cannot commit), RAISERROR
+/// (it ignores XACT_ABORT), cursors, GOTO, IMPLICIT_TRANSACTIONS and
+/// isolation levels (a PostgreSQL COMMIT resets them).
+fn autocommit_points(body: &SyntaxNode) -> Option<Vec<usize>> {
+    struct W {
+        points: Vec<usize>,
+        commits: usize,
+    }
+    fn neutral(n: &SyntaxNode) -> bool {
+        match first_word(n).as_str() {
+            "DECLARE" | "SET" | "PRINT" | "THROW" => true,
+            "SELECT" => !tokens(n).iter().any(|t| t.is("INTO")),
+            _ => false,
+        }
+    }
+    fn walk(n: &SyntaxNode, depth: &mut u32, in_loop: bool, w: &mut W) -> Option<()> {
+        for c in n.children() {
+            match c.kind() {
+                BLOCK => walk(&c, depth, in_loop, w)?,
+                k if k.is_container() => walk(&c, depth, in_loop, w)?,
+                IF_STMT | LOOP_STMT => {
+                    let looped = in_loop || c.kind() == LOOP_STMT;
+                    for b in c.children().filter(|b| b.kind() == BRANCH) {
+                        let mut d = *depth;
+                        walk(&b, &mut d, looped, w)?;
+                        if d != *depth {
+                            return None;
+                        }
+                    }
+                }
+                STATEMENT => {
+                    let w0 = first_word(&c);
+                    let second = tokens(&c)
+                        .into_iter()
+                        .filter(|t| t.sig())
+                        .nth(1)
+                        .map(|t| t.up())
+                        .unwrap_or_default();
+                    let weight = if in_loop { 2 } else { 1 };
+                    match w0.as_str() {
+                        "BEGIN" if matches!(second.as_str(), "TRAN" | "TRANSACTION") => {
+                            if *depth > 0 {
+                                return None;
+                            }
+                            *depth = 1;
+                        }
+                        "COMMIT" => {
+                            if *depth != 1 {
+                                return None;
+                            }
+                            *depth = 0;
+                            w.commits += weight;
+                        }
+                        "RETURN" | "BREAK" | "CONTINUE" if *depth > 0 => return None,
+                        "RETURN" | "BREAK" | "CONTINUE" => {}
+                        _ if neutral(&c) => {}
+                        _ if *depth == 0 => {
+                            let at = tokens(&c).iter().find(|t| t.sig())?.pos.0;
+                            w.points.push(at);
+                            w.commits += weight;
+                        }
+                        _ => {}
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
+    let banned = all.iter().any(|t| {
+        [
+            "ROLLBACK",
+            "SAVE",
+            "XACT_STATE",
+            "RAISERROR",
+            "CURSOR",
+            "GOTO",
+            "IMPLICIT_TRANSACTIONS",
+            "ISOLATION",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+    }) || all
+        .windows(2)
+        .any(|w| w[0].is("XACT_ABORT") && w[1].is("OFF"))
+        || body.descendants().any(|d| d.kind() == TRY_CATCH);
+    if banned {
+        return None;
+    }
+    // XACT_ABORT ON before the first statement that is not neutral.
+    let mut top = Vec::new();
+    fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+        for c in n.children() {
+            if c.kind() == BLOCK || c.kind().is_container() {
+                flat(&c, out);
+            } else if c.kind().is_unit() {
+                out.push(c);
+            }
+        }
+    }
+    flat(body, &mut top);
+    let on = top.iter().position(|n| {
+        let w: Vec<String> = tokens(n)
+            .iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .map(|t| t.up())
+            .collect();
+        w == ["SET", "XACT_ABORT", "ON"]
+    })?;
+    if top[..on]
+        .iter()
+        .any(|n| n.kind() != STATEMENT || !neutral(n))
+    {
+        return None;
+    }
+    let mut w = W {
+        points: Vec::new(),
+        commits: 0,
+    };
+    let mut depth = 0;
+    walk(body, &mut depth, false, &mut w)?;
+    (depth == 0 && w.commits >= 2 && !w.points.is_empty()).then_some(w.points)
 }
 
 /// The `BEGIN TRAN` and `COMMIT` (where each starts) of a body whose durable

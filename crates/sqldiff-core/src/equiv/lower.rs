@@ -225,6 +225,10 @@ pub struct Unit {
     pub stops_on_error: bool,
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
+    /// The entries of `uncovered` that are transaction statements between
+    /// data statements: the behaviour model may have compared those
+    /// (`ir::behaviour::Behaviour::txn_compared`).
+    pub txn_placed: Vec<SyntaxNode>,
     pub notes: Vec<String>,
     /// Security context of a routine (scripts and views: the caller's).
     pub security: Security,
@@ -334,6 +338,7 @@ fn empty(d: Dialect) -> Unit {
         txn_control: false,
         stops_on_error: false,
         txn_stmts: Vec::new(),
+        txn_placed: Vec::new(),
         notes: Vec::new(),
         security: Security::Caller,
         security_cite: None,
@@ -871,6 +876,7 @@ fn place_txn(u: &mut Unit) {
             _ => data.iter().any(|(o, is_return)| *o > at && !is_return),
         };
         if misplaced {
+            u.txn_placed.push(node.clone());
             u.uncovered
                 .push((node, format!("{} between data statements", kind.label())));
         }
@@ -1391,6 +1397,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             _ => None,
         };
         if let Some(what) = what.filter(|_| !is_call(c, d)) {
+            // Where a COMMIT sits is the behaviour model's to compare.
+            if kind == StmtKind::TxnCommit {
+                u.txn_placed.push(c.clone());
+            }
             return inside_flow(c, u, what);
         }
     }
