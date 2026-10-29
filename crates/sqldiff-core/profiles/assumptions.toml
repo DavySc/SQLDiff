@@ -961,6 +961,20 @@ fact = "The history table's definition."
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
 
 [[assumption]]
+id = "ASM-TEMPORAL-PERIOD-WRITE"
+statement = "A statement that writes a period column of a system-versioned table runs while versioning is off and the period dropped."
+discharge = "deployment"
+fact = "When the code that writes period values runs (a data load between turning versioning off and on)."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-TEMPORAL-SWITCH"
+statement = "Turning versioning off and on and dropping and adding the period become disabling and enabling the converted table's versioning triggers; PostgreSQL skips SQL Server's checks on those statements."
+discharge = "generated"
+fact = "The triggers the converted CREATE TABLE made, and code that does not rely on SQL Server's checks when versioning starts or the period is added."
+sites = ["sqldiff-convert/src/tsql/temporal.rs", "sqldiff-core/src/equiv/call.rs"]
+
+[[assumption]]
 id = "ASM-TEMPORAL-TRIGGER"
 statement = "System versioning by trigger matches T-SQL for the ways the table is written (no direct writes to the history table, no ALTER TABLE)."
 discharge = "deployment"

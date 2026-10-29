@@ -1552,7 +1552,10 @@ fn is_call(c: &SyntaxNode, d: Dialect) -> bool {
             }
             _ => w(0) == "CALL",
         },
-        StmtKind::Ddl => d != Dialect::Tsql && w(0) == "COMMENT" && w(1) == "ON",
+        StmtKind::Ddl => {
+            (d != Dialect::Tsql && w(0) == "COMMENT" && w(1) == "ON")
+                || super::call::is_switch(&tokens(c), d)
+        }
         _ => false,
     }
 }
