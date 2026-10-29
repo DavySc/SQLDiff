@@ -260,3 +260,21 @@ fn several_transactions_differ_when_callers_hold_a_transaction() {
     let c = pg_in(TWO_TRANSACTIONS, true);
     assert!(!txn_differences(&c).is_empty(), "{}", c.output);
 }
+
+#[test]
+fn a_return_code_after_the_commit_still_drops_it() {
+    // WWI DW MigrateStaged*: `COMMIT; RETURN 0;`.
+    let c = pg(&WRAPPED.replace("    COMMIT;\n", "    COMMIT;\n    RETURN 0;\n"));
+    assert_eq!(commits(&c), 0, "{}", c.output);
+    assert!(txn_differences(&c).is_empty(), "{:?}", txn_differences(&c));
+}
+
+#[test]
+fn a_statement_after_the_commit_keeps_it() {
+    // If it failed, T-SQL's work would stay committed.
+    let c = pg(&WRAPPED.replace(
+        "    COMMIT;\n",
+        "    COMMIT;\n    SET @n = (SELECT Qty FROM dbo.A WHERE Id = @Id);\n",
+    ));
+    assert_eq!(commits(&c), 1, "{}", c.output);
+}

@@ -5167,13 +5167,13 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
 /// decrements @@TRANCOUNT). Checked on SQL Server 2022 and PostgreSQL 18.
 ///
 /// The body's own list (BEGIN … END blocks flattened) holds exactly one
-/// `BEGIN TRAN` and, after it, one `COMMIT`; before and after them only
-/// declarations, SET, PRINT and SELECT without INTO. Nowhere else in the
-/// body: transaction control, @@TRANCOUNT, XACT_STATE, TRY/CATCH, THROW,
-/// RAISERROR, EXEC, GOTO, RETURN (but a last one) or a table variable. A
-/// failing statement must end the transaction alike: `SET XACT_ABORT ON`
-/// before the BEGIN, or only one statement inside that writes (a statement
-/// fails as a whole).
+/// `BEGIN TRAN` and, after it, one `COMMIT`; before them only declarations,
+/// SET, PRINT and SELECT without INTO, after them at most `RETURN n`.
+/// Nowhere else in the body: transaction control, @@TRANCOUNT, XACT_STATE,
+/// TRY/CATCH, THROW, RAISERROR, EXEC, GOTO, another RETURN or a table
+/// variable. A failing statement must end the transaction alike:
+/// `SET XACT_ABORT ON` before the BEGIN, or only one statement inside that
+/// writes (a statement fails as a whole).
 fn txn_wrapper(body: &SyntaxNode) -> Option<(usize, usize)> {
     fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
         for c in n.children() {
@@ -5243,15 +5243,19 @@ fn txn_wrapper(body: &SyntaxNode) -> Option<(usize, usize)> {
     if begun != 1 || c < b {
         return None;
     }
+    // After the COMMIT, a statement that fails would leave T-SQL's work
+    // committed and roll PostgreSQL's back: only a last `RETURN` or
+    // `RETURN <number>`.
     let ret_last = |i: usize| {
+        let w: Vec<T> = tokens(&top[i])
+            .into_iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .collect();
         i + 1 == top.len()
-            && first_word(&top[i]) == "RETURN"
-            && tokens(&top[i]).iter().filter(|t| t.sig()).count() <= 2
+            && w.first().is_some_and(|t| t.is("RETURN"))
+            && (w.len() == 1 || w.len() == 2 && w[1].s.bytes().all(|b| b.is_ascii_digit()))
     };
-    if !(0..b)
-        .chain(c + 1..top.len())
-        .all(|i| neutral(&top[i]) || ret_last(i))
-    {
+    if !(0..b).all(|i| neutral(&top[i])) || !(c + 1..top.len()).all(ret_last) {
         return None;
     }
     let xact_abort = top[..b].iter().any(|n| {
