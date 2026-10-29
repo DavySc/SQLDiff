@@ -1,28 +1,27 @@
 //! Stored conversions: a run's converted tree kept in the data directory
 //! (`gui/conversions/`), so its review opens again after a restart without
-//! waiting for the tree to be converted again.
+//! converting the tree again.
 //!
-//! A stored conversion only ever stands in until a fresh one is there. The
-//! review it opens is provisional (`convert_review::GATE_CONFIRMING`): the
-//! queue shows at once, while the tree is converted again on another
-//! thread; the done gate is judged, and decisions recorded, only on the
-//! fresh conversion, which then replaces the stored one. A key that misses
-//! some input can make a stored conversion stale, never a verdict.
+//! A stored conversion stands for a fresh one (Davy, 2026-10-29): the
+//! review opened from it judges the done gate on it, with the ledger, the
+//! instance report and the files in OUT read as they are now. So its key
+//! (`convert_review::stored_key`) takes everything a conversion is made
+//! from: this build of the app (a hash of its executable), the run's
+//! command, the contents of the config files and pack folders it loads,
+//! every source file, the ledger's hand-written texts in ledger order and
+//! the base catalogs. A file must read back to the very bytes it was
+//! written from, or it is deleted and the tree converted again.
 //!
-//! Each file is `<key>.json.gz`: the `tree::Tree` as JSON, gzipped. The key
-//! (`convert_review::stored_key`) hashes the run's command and the contents
-//! of the config and packs it loads, every source file, the ledger's
-//! hand-written texts and the base catalogs. Not the build of the app: what
-//! another build converts differently, the fresh conversion replaces. Files that
-//! cannot be read back are deleted. The oldest files go once the folder
-//! holds more than [`CAP`]; the settings page shows the folder, what it
-//! holds, and clears it.
+//! Each file is `<key>.json.gz`: the `tree::Tree` as JSON, gzipped. The
+//! least recently used go once the folder holds more than [`CAP`]; the
+//! settings page shows the folder, what it holds, and clears it.
 //!
 //! Stored conversions hold SQL, unlike the run history: an app with a
 //! `data_key` (or no data directory) keeps none.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::Serialize;
 use sqldiff_convert::tree::Tree;
@@ -62,10 +61,12 @@ impl Stored {
         let file = self.file(key);
         let bytes = std::fs::read(&file).ok()?;
         let mut json = Vec::new();
+        // Read back exactly: what serializes to other bytes is not taken.
         let read = flate2::read::GzDecoder::new(&bytes[..])
             .read_to_end(&mut json)
             .ok()
-            .and_then(|_| serde_json::from_slice::<Tree>(&json).ok());
+            .and_then(|_| serde_json::from_slice::<Tree>(&json).ok())
+            .filter(|t| serde_json::to_vec(t).is_ok_and(|again| again == json));
         match read {
             Some(t) => {
                 // Used now: the last to go.
@@ -151,6 +152,20 @@ impl Stored {
         }
         self.usage()
     }
+}
+
+/// This build of the app: a hash of its own executable, so a conversion
+/// another build made is never taken. Empty when the executable cannot be
+/// read, which stores nothing.
+pub fn build() -> &'static str {
+    static BUILD: OnceLock<String> = OnceLock::new();
+    BUILD.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        std::env::current_exe()
+            .and_then(std::fs::read)
+            .map(|b| format!("{:x}", Sha256::digest(b)))
+            .unwrap_or_default()
+    })
 }
 
 /// Every file under `p` (or `p` itself), in a fixed order, with its

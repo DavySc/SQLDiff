@@ -138,7 +138,7 @@ pre.out { font-family: var(--mono); font-size: 12px; color: var(--fg); backgroun
   <div id="storedbox" hidden>
     <h2>Stored conversions</h2>
     <div class="form">
-      <div class="muted">Each run's conversion is kept here, so its review opens at once after a restart. It is converted again in the background before the done gate is judged or a decision recorded. The oldest go when the folder holds more than <span id="stored-cap"></span>.</div>
+      <div class="muted">Each run's conversion is kept here, so its review opens at once after a restart. One is used only by this build of the app, with the same sources, config, packs, base catalogs and hand-written texts; otherwise the tree is converted again. The oldest go when the folder holds more than <span id="stored-cap"></span>.</div>
       <div class="field"><span>Folder</span><code id="stored-dir"></code></div>
       <div class="acts"><span class="msg" id="stored-msg" role="status"></span><button type="button" class="outline" id="stored-clear">Clear</button></div>
     </div>

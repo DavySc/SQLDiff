@@ -9,7 +9,7 @@ use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
 use sqldiff_gui::convert_review::{
     stored_key, Action, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN,
-    GATE_CONFIRMING, GATE_STALE, RECORD_CONFIRMING,
+    GATE_STALE,
 };
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
@@ -744,62 +744,47 @@ fn the_gate_banner_counts_the_blockers_it_does_not_list() {
 }
 
 /// The state as the page gets it, without what differs between two reads
-/// of the same tree (when, how long) and the gate.
-fn queue_json(r: &Review) -> serde_json::Value {
+/// of the same tree (when, how long).
+fn state_json(r: &Review) -> serde_json::Value {
     let mut v = serde_json::to_value(r.state(true)).unwrap();
-    for k in [
-        "convert_ms",
-        "gate",
-        "gate_error",
-        "gate_judged",
-        "provisional",
-    ] {
+    for k in ["convert_ms", "gate_judged"] {
         v.as_object_mut().unwrap().remove(k);
     }
     v
 }
 
 #[test]
-fn a_stored_conversion_shows_the_queue_but_judges_and_records_nothing() {
+fn a_stored_conversion_opens_the_review_a_fresh_one_would() {
     let f = Fixture::new("stored", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
     let fresh = f.open();
-    assert!(!fresh.provisional());
     let tree: tree::Tree = serde_json::from_slice(&fresh.tree_json()).unwrap();
     // Read back byte for byte.
     assert_eq!(serde_json::to_vec(&tree).unwrap(), fresh.tree_json());
     let (key, now) = stored_key(&f.setup(), b"extra").unwrap();
     assert_eq!(key, fresh.stored_key(b"extra"));
-    assert_ne!(key, fresh.stored_key(b"other config"));
+    assert_ne!(key, fresh.stored_key(b"other build or config"));
     let mut r = Review::open_stored(f.setup(), tree, now).unwrap();
-    assert!(r.provisional());
-    // The same queue as converting gives, at once.
-    assert_eq!(queue_json(&r), queue_json(&fresh));
-    // No verdict, and no decision, on it.
-    assert!(fresh.gate().is_ok());
-    assert_eq!(r.gate().unwrap_err(), GATE_CONFIRMING);
-    let st = r.state(false);
-    assert!(st.gate.is_none() && st.provisional);
-    assert_eq!(st.gate_error.as_deref(), Some(GATE_CONFIRMING));
+    assert!(!r.converted_last());
+    // Queue, gate and all, as converting gives.
+    assert_eq!(state_json(&r), state_json(&fresh));
+    assert!(r.gate().is_ok());
+    // Decisions apply to it as to a fresh one.
     let u = unit_with(&r, "a.sql", Status::Assumptions, false);
-    let rule = u.assumptions[0].clone();
-    let e = r
-        .record(req(Action::Accept, &rule, vec![target(&u)]), AT)
-        .unwrap_err();
-    assert_eq!(e, RECORD_CONFIRMING);
-    assert_eq!(f.ledger(), "");
-    // Reading again keeps it provisional while no source changed.
-    r.refresh().unwrap();
-    assert!(r.provisional());
-    assert_eq!(r.gate().unwrap_err(), GATE_CONFIRMING);
-    // A changed source is converted, and that conversion is judged.
+    for rule in u.assumptions.clone() {
+        r.record(req(Action::Accept, &rule, vec![target(&u)]), AT)
+            .unwrap();
+    }
+    let mut again = f.open();
+    again.refresh().unwrap();
+    assert_eq!(state_json(&r), state_json(&again));
+    // Files in OUT edited by hand still make it stale.
+    std::fs::write(f.out().join("t.sql"), "-- edited\n").unwrap();
+    assert_eq!(r.gate().unwrap_err(), GATE_STALE);
+    // A changed source, or a hand-written text, changes the key.
     std::fs::write(
         f.dir.join("src").join("t.sql"),
         "CREATE TABLE t (b int NOT NULL);\n",
     )
     .unwrap();
     assert_ne!(stored_key(&f.setup(), b"extra").unwrap().0, key);
-    r.refresh().unwrap();
-    assert!(r.converted_last());
-    assert!(!r.provisional());
-    assert!(r.gate().is_ok());
 }

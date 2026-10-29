@@ -1029,23 +1029,18 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
         html.contains("/*__SQLDIFF_PAYLOAD__*/{"),
         "the review itself"
     );
-    // Opened from the stored conversion first (provisional), then from
-    // converting again: only that is judged.
-    confirmed(addr, &review);
     let state: serde_json::Value =
         serde_json::from_str(&get(addr, &format!("{review}/api/state")).1).unwrap();
-    assert_eq!(state["provisional"], false, "{state}");
     assert_eq!(state["gate"]["complete"], true, "{state}");
     let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
     assert_eq!(runs[0]["gate"]["complete"], true, "{runs}");
     // Converting again stored it again; after the next restart the review
-    // opens from it at once, and is judged once converted again.
+    // opens from it at once, judged the same.
     stored_files(addr, 1);
     let addr = start(kept());
     let (status, html) = get(addr, &review);
     assert_eq!(status, "HTTP/1.1 200 OK");
     assert!(html.contains("/*__SQLDIFF_PAYLOAD__*/{"), "{html}");
-    confirmed(addr, &review);
     let state: serde_json::Value =
         serde_json::from_str(&get(addr, &format!("{review}/api/state")).1).unwrap();
     assert_eq!(state["gate"]["complete"], true, "{state}");
@@ -1099,21 +1094,6 @@ fn stored_files(addr: SocketAddr, n: u64) -> serde_json::Value {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
     panic!("never {n} stored conversion(s)");
-}
-
-/// Waits until the review at `review` no longer rests on a stored
-/// conversion: converted again, and judged.
-fn confirmed(addr: SocketAddr, review: &str) {
-    for _ in 0..600 {
-        let (status, body) = get(addr, &format!("{review}/api/gate"));
-        assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
-        let g: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if g["provisional"] == false {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    panic!("{review}: still provisional");
 }
 
 #[test]

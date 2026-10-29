@@ -92,9 +92,6 @@ struct Loaded {
     gate: Result<Gate, String>,
     judged: String,
     stamp: Stamp,
-    /// Opened from a stored conversion that a fresh one has not confirmed
-    /// yet: the done gate is not judged and nothing is recorded meanwhile.
-    provisional: bool,
 }
 
 /// Every file under the source, OUT, the instance report and the base
@@ -136,15 +133,6 @@ fn stamp(s: &Setup) -> Stamp {
     }
     out
 }
-
-/// Why the done gate is not judged on a review opened from a stored
-/// conversion: only a fresh conversion decides it.
-pub const GATE_CONFIRMING: &str =
-    "opened from the stored conversion; the done gate is judged once converting again confirms it";
-
-/// Why a review opened from a stored conversion records nothing yet.
-pub const RECORD_CONFIRMING: &str =
-    "opened from the stored conversion; decisions can be recorded once converting again confirms it";
 
 /// Why a verdict is not shown once its files changed.
 pub const GATE_STALE: &str =
@@ -218,8 +206,6 @@ pub struct StateView {
     pub gate: Option<Gate>,
     pub gate_error: Option<String>,
     pub gate_judged: String,
-    /// Opened from a stored conversion not yet confirmed by a fresh one.
-    pub provisional: bool,
     /// The packs loaded (a private pack by path only).
     pub packs: Vec<LoadedPack>,
 }
@@ -231,7 +217,6 @@ pub struct GateState {
     pub gate: Option<Gate>,
     pub gate_error: Option<String>,
     pub gate_judged: String,
-    pub provisional: bool,
 }
 
 /// Blockers the page gets of a gate; it shows these and counts the rest
@@ -390,7 +375,7 @@ impl Review {
                 setup.out.display()
             ));
         }
-        let loaded = load(&setup, None, hooks, false)?;
+        let loaded = load(&setup, None, hooks)?;
         Ok(Review { setup, loaded })
     }
 
@@ -408,14 +393,15 @@ impl Review {
             written: written_texts(&setup.out)?,
             ..empty()
         };
-        let loaded = load(&setup, Some(prev), &tree::Hooks::default(), false)?;
+        let loaded = load(&setup, Some(prev), &tree::Hooks::default())?;
         Ok(Review { setup, loaded })
     }
 
     /// A review of a stored conversion of `setup`'s tree (see
-    /// [`crate::stored`]) as read now (`now`, from [`stored_key`]). It shows
-    /// the queue at once, but stays provisional: no done gate, nothing
-    /// recorded, until a fresh conversion replaces it.
+    /// [`crate::stored`]), with the tree as read now (`now`, from
+    /// [`stored_key`], whose key it was stored under): the ledger, the
+    /// instance report and the done gate are read and judged as for a
+    /// fresh conversion; only converting is skipped.
     pub fn open_stored(setup: Setup, tree: Tree, now: Now) -> Result<Review, String> {
         if !setup.out.is_dir() {
             return Err(format!(
@@ -431,7 +417,7 @@ impl Review {
             tree,
             ..empty()
         };
-        let loaded = load(&setup, Some(prev), &tree::Hooks::default(), true)?;
+        let loaded = load(&setup, Some(prev), &tree::Hooks::default())?;
         Ok(Review { setup, loaded })
     }
 
@@ -453,11 +439,6 @@ impl Review {
         serde_json::to_vec(&self.loaded.tree).unwrap_or_default()
     }
 
-    /// Whether this review rests on a stored conversion not yet confirmed.
-    pub fn provisional(&self) -> bool {
-        self.loaded.provisional
-    }
-
     /// What the review was opened on.
     pub fn setup(&self) -> &Setup {
         &self.setup
@@ -470,21 +451,15 @@ impl Review {
     /// Reads the sources, the instance report and the ledger again.
     pub fn refresh(&mut self) -> Result<(), String> {
         let prev = std::mem::replace(&mut self.loaded, empty());
-        let provisional = prev.provisional;
-        match load(
-            &self.setup,
-            Some(prev),
-            &tree::Hooks::default(),
-            provisional,
-        ) {
+        match load(&self.setup, Some(prev), &tree::Hooks::default()) {
             Ok(l) => {
                 self.loaded = l;
                 Ok(())
             }
             Err(e) => {
                 // Keep nothing stale: the next read starts over.
-                self.loaded = load(&self.setup, None, &tree::Hooks::default(), false)
-                    .unwrap_or_else(|_| empty());
+                self.loaded =
+                    load(&self.setup, None, &tree::Hooks::default()).unwrap_or_else(|_| empty());
                 Err(e)
             }
         }
@@ -521,9 +496,6 @@ impl Review {
     /// The done gate as last judged, or why it could not be judged; never
     /// a verdict on files that changed since (`GATE_STALE`).
     pub fn gate(&self) -> Result<Gate, String> {
-        if self.loaded.provisional {
-            return Err(GATE_CONFIRMING.into());
-        }
         match stamp(&self.setup) == self.loaded.stamp {
             true => self.loaded.gate.clone(),
             false => Err(GATE_STALE.into()),
@@ -542,7 +514,6 @@ impl Review {
             gate: gate.as_ref().ok().cloned(),
             gate_error: gate.err(),
             gate_judged: self.loaded.judged.clone(),
-            provisional: self.loaded.provisional,
         }
     }
 
@@ -649,7 +620,6 @@ impl Review {
             gate: gate.gate,
             gate_error: gate.gate_error,
             gate_judged: gate.gate_judged,
-            provisional: gate.provisional,
             packs: self.setup.packs.clone(),
         }
     }
@@ -804,9 +774,6 @@ impl Review {
     /// Checks a request against the tree as it is now and appends its
     /// records, all or none. Reads everything again first and after.
     pub fn record(&mut self, req: RecordRequest, at: &str) -> Result<usize, String> {
-        if self.loaded.provisional {
-            return Err(RECORD_CONFIRMING.into());
-        }
         self.refresh()?;
         let records = self.build(&req, at)?;
         let path = review::ledger_file(&self.setup.out)?;
@@ -985,6 +952,8 @@ pub fn stored_key(s: &Setup, extra: &[u8]) -> Result<(String, Now), String> {
     ))
 }
 
+/// SHA-256 over every part, each with its length, so no two lists of parts
+/// run together.
 fn key_of(
     extra: &[u8],
     inputs: &[Input],
@@ -994,7 +963,6 @@ fn key_of(
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    // Every part with its length, so no two lists of parts run together.
     let mut part = |b: &[u8]| {
         h.update((b.len() as u64).to_le_bytes());
         h.update(b);
@@ -1013,8 +981,8 @@ fn key_of(
     for w in written {
         part(w.as_bytes());
     }
-    part(base.unwrap_or("").as_bytes());
     part(&[base.is_some() as u8]);
+    part(base.unwrap_or("").as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -1054,18 +1022,12 @@ fn empty() -> Loaded {
         gate: Err("not judged yet".into()),
         judged: String::new(),
         stamp: Vec::new(),
-        provisional: false,
     }
 }
 
 /// Reads and converts the tree (reusing `prev`'s conversion when no source
 /// changed), applies the ledger in OUT and reads the instance report.
-fn load(
-    s: &Setup,
-    prev: Option<Loaded>,
-    hooks: &tree::Hooks,
-    provisional: bool,
-) -> Result<Loaded, String> {
+fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, String> {
     // Taken before anything is read: a file that changes while this read
     // judges makes the verdict stale.
     let stamp = stamp(s);
@@ -1103,11 +1065,7 @@ fn load(
         }
     };
     let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
-    // A stored conversion is not judged: only a fresh one decides "done".
-    let gate = match provisional && !converted {
-        true => Err(GATE_CONFIRMING.to_string()),
-        false => judge(&mut t, &inputs, s, instances.as_ref()),
-    };
+    let gate = judge(&mut t, &inputs, s, instances.as_ref());
     let ids = inputs
         .iter()
         .zip(&t.conversions)
@@ -1137,7 +1095,6 @@ fn load(
         gate,
         judged: sqldiff_review::time::now(),
         stamp,
-        provisional: provisional && !converted,
     })
 }
 
@@ -1173,7 +1130,8 @@ fn judge(
 }
 
 /// The ledger's hand-written texts (every `written` record with a text),
-/// in a fixed order: what `tree::convert` reads from the ledger.
+/// in ledger order: what `tree::convert` reads from the ledger (which of
+/// equal texts it credits follows that order).
 fn written_texts(out: &std::path::Path) -> Result<Vec<String>, String> {
     let path = out.join(review::LEDGER_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -1181,12 +1139,11 @@ fn written_texts(out: &std::path::Path) -> Result<Vec<String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let mut v: Vec<String> = review::Ledger::parse(&text)
+    let v: Vec<String> = review::Ledger::parse(&text)
         .records()
         .filter(|r| r.state == State::Written && r.text.is_some())
         .map(|r| serde_json::to_string(r).unwrap_or_default())
         .collect();
-    v.sort();
     Ok(v)
 }
 

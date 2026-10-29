@@ -1133,12 +1133,12 @@ impl Runs {
             instances: job.instances,
             packs: loaded,
         };
-        // A stored conversion, if there is one, is shown while this one
-        // converts again: read through a setup of its own.
+        // A stored conversion, if there is one, is read through a setup of
+        // its own; `setup` converts when there is none.
         let stored = self
             .stored
             .clone()
-            .map(|st| (st, stored_extra(&run.command, &setup.packs)));
+            .zip(stored_extra(&run.command, &setup.packs));
         let first = match &stored {
             Some(_) => {
                 let (job, _, _, loaded) = prepare(spec, isolated)?;
@@ -2153,9 +2153,9 @@ fn prepare(
     Ok((job, out, command, loaded))
 }
 
-/// Opens `r`'s review again: at once from its stored conversion, if there
-/// is one (`first`), provisionally; then from converting `setup` again,
-/// which replaces it and is stored in turn.
+/// Opens `r`'s review again: from its stored conversion (`first`), if
+/// one was stored under the key of the tree as it is now; else by
+/// converting `setup` again, which is stored in turn.
 fn reopen(
     r: &Arc<Run>,
     first: Option<convert_review::Setup>,
@@ -2163,51 +2163,51 @@ fn reopen(
     stored: Option<(Arc<Stored>, Vec<u8>)>,
     hooks: &Hooks,
 ) {
-    // As requests lock them: the review first, then `opening`.
-    let install = |review: Option<Arc<Mutex<Review>>>, failed: Option<String>| {
+    let from_store = (|| {
+        let ((st, extra), first) = (stored.as_ref()?, first?);
+        let (key, now) = convert_review::stored_key(&first, extra).ok()?;
+        Review::open_stored(first, st.get(&key)?, now).ok()
+    })();
+    let fresh = from_store.is_none();
+    let opened = match from_store {
+        Some(review) => Ok(review),
+        None => Review::open_with(setup, hooks),
+    };
+    // Stored after the review is shown: compressing takes a moment.
+    let keep = match (&opened, &stored) {
+        (Ok(review), Some((st, extra))) if fresh => {
+            Some((Arc::clone(st), review.stored_key(extra), review.tree_json()))
+        }
+        _ => None,
+    };
+    {
+        // As requests lock them: the review first, then `opening`.
         let mut slot = r.review.lock().unwrap_or_else(|e| e.into_inner());
         let mut opening = r.opening.lock().unwrap_or_else(|e| e.into_inner());
-        *slot = review;
-        *opening = failed.map(Opening::Failed);
-    };
-    let mut shown = None;
-    if let (Some((st, extra)), Some(first)) = (&stored, first) {
-        let review = convert_review::stored_key(&first, extra)
-            .ok()
-            .and_then(|(key, now)| Some((st.get(&key)?, now)))
-            .and_then(|(tree, now)| Review::open_stored(first, tree, now).ok());
-        if let Some(review) = review {
-            let review = Arc::new(Mutex::new(review));
-            install(Some(Arc::clone(&review)), None);
-            shown = Some(review);
+        match opened {
+            Ok(review) => {
+                *slot = Some(Arc::new(Mutex::new(review)));
+                *opening = None;
+            }
+            Err(e) => *opening = Some(Opening::Failed(e)),
         }
     }
-    match Review::open_with(setup, hooks) {
-        Ok(review) => {
-            let keep = stored
-                .as_ref()
-                .map(|(_, extra)| (review.stored_key(extra), review.tree_json()));
-            match shown {
-                Some(s) => *s.lock().unwrap_or_else(|e| e.into_inner()) = review,
-                None => install(Some(Arc::new(Mutex::new(review))), None),
-            }
-            if let (Some((st, _)), Some((key, json))) = (stored, keep) {
-                st.put(&key, &json);
-            }
-        }
-        // Nothing provisional is left standing on a tree that cannot be
-        // converted now; the next request says why and tries again.
-        Err(e) => install(None, Some(e)),
+    if let Some((st, key, json)) = keep {
+        st.put(&key, &json);
     }
 }
 
-/// What a stored conversion's key takes besides the tree: the run's
-/// command and the contents of the config files and packs it loads. Not
-/// the build of the app: a stored conversion is confirmed by converting
-/// again anyway, and after an upgrade it still shows the queue at once.
-fn stored_extra(command: &Command, packs: &[LoadedPack]) -> Vec<u8> {
+/// What a stored conversion's key takes besides the tree: this build of
+/// the app, the run's command, and the contents of the config files and
+/// packs it loads. `None` (store nothing) when the build is not known.
+fn stored_extra(command: &Command, packs: &[LoadedPack]) -> Option<Vec<u8>> {
+    let build = stored::build();
+    if build.is_empty() {
+        return None;
+    }
     let pinned = (&command.args, &command.project_config, &command.user_config);
-    let mut out = serde_json::to_vec(&pinned).unwrap_or_default();
+    let mut out = build.as_bytes().to_vec();
+    out.extend(serde_json::to_vec(&pinned).unwrap_or_default());
     for f in [&command.project_config, &command.user_config]
         .into_iter()
         .flatten()
@@ -2218,7 +2218,7 @@ fn stored_extra(command: &Command, packs: &[LoadedPack]) -> Vec<u8> {
         let path = Path::new(&p.path);
         stored::contents(path.parent().unwrap_or(path), &mut out);
     }
-    out
+    Some(out)
 }
 
 fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
@@ -2322,7 +2322,7 @@ fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
         instances: job.instances,
         packs: run.packs.clone().unwrap_or_default(),
     };
-    let extra = stored.map(|st| (st, stored_extra(&run.command, &setup.packs)));
+    let extra = stored.zip(stored_extra(&run.command, &setup.packs));
     match Review::open_converted(setup, w) {
         Ok(review) => {
             let keep = extra.map(|(st, extra)| {
