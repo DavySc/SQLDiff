@@ -48,7 +48,7 @@ pub mod asm {
     /// case-sensitive one is kept, and flagged with this per statement.
     pub const CI_COLLATION: (&str, &str) = (
         "ASM-CI-COLLATION",
-        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+        "String equality and LIKE give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar), and no value LIKE tests has trailing spaces or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -1152,13 +1152,26 @@ impl<'a> Canon<'a> {
                 (n("between", kids), None)
             }
             Expr::Like(x, p, neg, ci) => {
-                let x = self.expr(x)?.0;
+                let (x, ty) = self.expr(x)?;
+                // A varchar value against a literal pattern without `[` or
+                // `\` differs across dialects only by the collation
+                // (`coll-like`): case, trailing spaces of the value (T-SQL
+                // varchar drops them) and characters the collation expands
+                // (checked on SQL Server 2022). T-SQL `[...]` is a character
+                // class and PostgreSQL's `\` an escape; a char value is
+                // blank-padded on one side only.
+                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
                 let p = self.expr(p)?.0;
-                // Case sensitivity and trailing blanks of LIKE differ per dialect.
+                let coll = if plain {
+                    n("coll-like", vec![self.dtag()])
+                } else {
+                    self.dtag()
+                };
                 (
                     n(
                         "like",
-                        vec![self.dtag(), x, p, a(neg.to_string()), a(ci.to_string())],
+                        vec![coll, x, p, a(neg.to_string()), a(ci.to_string())],
                     ),
                     None,
                 )
