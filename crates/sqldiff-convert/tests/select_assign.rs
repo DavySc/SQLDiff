@@ -191,3 +191,24 @@ fn a_where_without_from_is_refused() {
         assert!(!c.output.contains(":= 1 WHERE"), "{}", c.output);
     }
 }
+
+#[test]
+fn the_engine_compares_the_loop_with_the_select() {
+    // The loop block is read as the SELECT it came from: the unit is
+    // compared (not "a declaration is not covered"), at top level and inside
+    // an IF, and stays proven.
+    for src in [
+        "CREATE PROCEDURE p @k int AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @n int = 5;\n  SELECT @n = c FROM t WHERE id = @k;\n  UPDATE u SET x = @n;\nEND\n",
+        "CREATE PROCEDURE p @k int AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @n int = 5;\n  IF @k > 0\n    SELECT @n = c FROM t WHERE id = @k;\n  UPDATE u SET x = @n;\nEND\n",
+    ] {
+        let c = convert(src, Dialect::Postgres);
+        assert!(c.output.contains("FOR sqldiff_r IN"), "{}", c.output);
+        let u = select_unit(&c, src);
+        assert!(u.status <= Status::Assumptions, "{:?}\n{:#?}", u.status, c.report.unknown_reasons);
+        assert!(
+            c.report.unknown_reasons.iter().all(|r| !r.contains("not covered")),
+            "{:#?}",
+            c.report.unknown_reasons
+        );
+    }
+}

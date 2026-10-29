@@ -27,6 +27,10 @@ pub struct Cmp {
     /// T-SQL against another dialect in a conversion check: string equality
     /// that differs only in the collation is equal under `ASM-CI-COLLATION`.
     ci_collation: bool,
+    /// T-SQL against PostgreSQL in a conversion check, and whether side A is
+    /// T-SQL: T-SQL's end of time against PostgreSQL's 6-digit one is equal
+    /// under `ASM-END-OF-TIME`.
+    fraction_tsql_a: Option<bool>,
 }
 
 thread_local! {
@@ -65,8 +69,14 @@ pub fn compare(a: &Term, b: &Term) -> Cmp {
 
 /// [`compare`] for statements of dialects `da` and `db`.
 pub fn compare_across(a: &Term, b: &Term, da: Dialect, db: Dialect) -> Cmp {
+    let conversion = ci_collation();
     let mut c = Cmp {
-        ci_collation: ci_collation() && da != db && (da == Dialect::Tsql || db == Dialect::Tsql),
+        ci_collation: conversion && da != db && (da == Dialect::Tsql || db == Dialect::Tsql),
+        fraction_tsql_a: match (da, db) {
+            (Dialect::Tsql, Dialect::Postgres) if conversion => Some(true),
+            (Dialect::Postgres, Dialect::Tsql) if conversion => Some(false),
+            _ => None,
+        },
         ..Cmp::default()
     };
     walk(a, b, None, None, 0, &mut c);
@@ -144,6 +154,15 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
         assume(c, asm::make(asm::PAGE_COUNT_NOT_NULL));
         return;
     }
+    // T-SQL's end of time against the 6-digit one the converter writes for
+    // PostgreSQL, which would round the 7-digit value to 10000-01-01.
+    if let Some(tsql_a) = c.fraction_tsql_a {
+        let (t, p) = if tsql_a { (a, b) } else { (b, a) };
+        if end_of_time(t, p) {
+            assume(c, asm::make(asm::END_OF_TIME));
+            return;
+        }
+    }
     // Hooks that make different spellings equal under an assumption.
     if let Some(x) = hook(a, b).or_else(|| hook(b, a)) {
         assume(c, x);
@@ -195,6 +214,29 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
             index,
         }),
     }
+}
+
+/// Whether `a` (dialect `da`) and `b` (dialect `db`) are T-SQL's end of
+/// time and PostgreSQL's 6-digit one, in a conversion check
+/// (`ASM-END-OF-TIME`).
+pub fn end_of_time_across(a: &Term, b: &Term, da: Dialect, db: Dialect) -> bool {
+    ci_collation()
+        && match (da, db) {
+            (Dialect::Tsql, Dialect::Postgres) => end_of_time(a, b),
+            (Dialect::Postgres, Dialect::Tsql) => end_of_time(b, a),
+            _ => false,
+        }
+}
+
+/// `t` is the timestamp 9999-12-31 23:59:59.9999999 and `p` the timestamp
+/// 9999-12-31 23:59:59.999999.
+fn end_of_time(t: &Term, p: &Term) -> bool {
+    let ts = |x: &Term, v: &str| {
+        x.is("tval")
+            && x.kid(0).and_then(Term::atom) == Some("ts")
+            && x.kid(1).and_then(Term::atom) == Some(v)
+    };
+    ts(t, "9999-12-31 23:59:59.9999999") && ts(p, "9999-12-31 23:59:59.999999")
 }
 
 fn hook(a: &Term, b: &Term) -> Option<Assumption> {
@@ -903,5 +945,42 @@ fn render_ty(t: Option<&Term>) -> String {
         ("Exact", Some(l), Some(s)) => format!("{base}({l},{s})"),
         ("VarChar" | "Char" | "Timestamp" | "Time", Some(l), None) => format!("{base}({l})"),
         _ => base.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::equiv::term::{a, n};
+
+    fn ts(v: &str) -> Term {
+        n("tval", vec![a("ts"), a(v)])
+    }
+
+    #[test]
+    fn the_end_of_time_against_its_six_digit_form() {
+        let end = ts("9999-12-31 23:59:59.9999999");
+        let six = ts("9999-12-31 23:59:59.999999");
+        let (t, p) = (Dialect::Tsql, Dialect::Postgres);
+        // Only in a conversion check.
+        assert!(!end_of_time_across(&end, &six, t, p));
+        let _scope = ci_collation_scope(true);
+        assert!(end_of_time_across(&end, &six, t, p));
+        assert!(end_of_time_across(&six, &end, p, t));
+        // Rounded; another dialect pair; any other 7-digit value.
+        assert!(!end_of_time_across(&end, &ts("10000-01-01 00:00:00"), t, p));
+        assert!(!end_of_time_across(&end, &six, t, Dialect::Db2i));
+        assert!(!end_of_time_across(&six, &end, t, p));
+        assert!(!end_of_time_across(
+            &ts("2020-01-01 10:00:00.1234567"),
+            &ts("2020-01-01 10:00:00.123456"),
+            t,
+            p
+        ));
+        let c = compare_across(&end, &six, t, p);
+        assert!(c.mismatches.is_empty());
+        assert_eq!(c.assumptions[0].id, "ASM-END-OF-TIME");
+        let c = compare_across(&end, &ts("9999-12-31 23:59:59.999998"), t, p);
+        assert!(!c.mismatches.is_empty());
     }
 }

@@ -25,7 +25,10 @@ fn reason(src: &str) -> String {
 fn sqlcmd_is_not_sql() {
     assert!(reason(":r .\\pds100-ins-app-people.sql\n").contains("includes another file"));
     let r = reason("SELECT * FROM [$(Db)].dbo.t;\n");
-    assert!(r.contains("SQLCMD variable") && r.contains("template"), "{r}");
+    assert!(
+        r.contains("SQLCMD variable") && r.contains("template"),
+        "{r}"
+    );
     // A string that only looks like one is SQL.
     let c = pg("SELECT '$(x)' AS v;\n");
     assert_ne!(c.units[0].status, Status::NotConverted, "{}", c.output);
@@ -35,7 +38,12 @@ fn sqlcmd_is_not_sql() {
 fn a_filegroup_is_storage() {
     let c = pg("ALTER DATABASE [$(DatabaseName)]\n    ADD FILEGROUP [WWI_MemoryOptimized_Data] CONTAINS MEMORY_OPTIMIZED_DATA;\n");
     assert!(c.output.contains("storage only"), "{}", c.output);
-    assert_eq!(c.units[0].status, Status::Converted, "{:#?}", c.units[0].notes);
+    assert_eq!(
+        c.units[0].status,
+        Status::Converted,
+        "{:#?}",
+        c.units[0].notes
+    );
     let r = reason("ALTER DATABASE CURRENT SET MEMORY_OPTIMIZED_ELEVATE_TO_SNAPSHOT=ON;\n");
     assert!(r.contains("server configuration"), "{r}");
 }
@@ -46,5 +54,9 @@ fn goto_names_the_rewrite() {
     let c = pg(src);
     let u = c.units.iter().find(|u| u.src.line == 6).unwrap();
     assert_eq!(u.status, Status::NotConverted);
-    assert!(u.notes[0].text.contains("<<logging>>"), "{}", u.notes[0].text);
+    assert!(
+        u.notes[0].text.contains("<<logging>>"),
+        "{}",
+        u.notes[0].text
+    );
 }
