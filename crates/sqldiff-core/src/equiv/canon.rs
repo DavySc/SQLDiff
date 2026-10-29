@@ -420,11 +420,14 @@ impl<'a> Canon<'a> {
     /// (and database) unless the schema is the default one (none written,
     /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`; a
     /// table variable `@t` of routine `routine` converted to one of
-    /// `other_temps` gets that table's key (`classify::table_variable_table`).
+    /// `other_temps` gets that table's key (`classify::table_variable_table`),
+    /// and so does a bare name in `local_temps` (a PostgreSQL temporary
+    /// table the unit created, which the bare name finds first).
     /// Returns the key and, for a default schema, how it was written.
     pub fn table_name(
         parts: &[String],
         other_temps: &std::collections::HashSet<String>,
+        local_temps: &std::collections::HashSet<String>,
         routine: Option<&str>,
     ) -> (String, Option<String>) {
         let last = parts.last().map(|s| lc(s)).unwrap_or_default();
@@ -435,6 +438,9 @@ impl<'a> Canon<'a> {
             if other_temps.contains(&t) {
                 return (format!("temp:{t}"), None);
             }
+        }
+        if parts.len() == 1 && local_temps.contains(&last) {
+            return (format!("temp:{last}"), None);
         }
         let temp = last.starts_with('#')
             || last.starts_with('@')
@@ -462,8 +468,12 @@ impl<'a> Canon<'a> {
 
     /// `table_name`, remembering the name for the statement's item.
     fn table_key(&mut self, parts: &[String]) -> String {
-        let (key, default) =
-            Self::table_name(parts, &self.unit.other_temps, self.unit.routine.as_deref());
+        let (key, default) = Self::table_name(
+            parts,
+            &self.unit.other_temps,
+            &self.unit.local_temps,
+            self.unit.routine.as_deref(),
+        );
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);

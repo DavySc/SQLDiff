@@ -258,7 +258,7 @@ impl Cx<'_> {
             {
                 e += 2;
             }
-            if matches!(ts[s[k]].k, IDENT | QUOTED_IDENT) {
+            if matches!(ts[s[k]].k, IDENT | QUOTED_IDENT | VARIABLE) {
                 cols.extend(self.table_bit_cols(&ts[s[k]..=s[e]]));
             }
             k = e + 1;
@@ -601,10 +601,15 @@ impl Cx<'_> {
     }
 
     /// Whether any bit can be in play: a bit variable, a column of the table
-    /// being defined, or a bit column in the catalog.
+    /// being defined, a bit column of a table variable or `#` table, or a
+    /// bit column in the catalog.
     fn bits_possible(&self) -> bool {
         !self.bit_cols.is_empty()
             || self.vars.values().any(|v| v.dt == Dt::Bit)
+            || self
+                .own_tables
+                .iter()
+                .any(|t| t.columns.iter().any(|c| c.data_type.base == "BIT"))
             || self.type_catalog().is_some_and(|c| {
                 c.tables
                     .iter()
@@ -789,7 +794,7 @@ impl Cx<'_> {
         };
         let parts: Vec<String> = ts[name_start..=name_end]
             .iter()
-            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT | VARIABLE))
             .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
             .collect();
         let entry = ScopeEntry {
@@ -994,7 +999,7 @@ impl Cx<'_> {
     pub(super) fn table_bit_cols(&self, name: &[T]) -> Vec<String> {
         let parts: Vec<String> = name
             .iter()
-            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT | VARIABLE))
             .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
             .collect();
         let entry = ScopeEntry {

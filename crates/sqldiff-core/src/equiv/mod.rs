@@ -275,6 +275,40 @@ fn tv_names(a: &Analyzed, b: &Analyzed, ua: &mut Unit, ub: &mut Unit) {
     }
 }
 
+/// `schema` with the tables the unit creates for its own use, under the
+/// keys its statements name them by: a column of a table variable or a
+/// temporary table has its declared type, as a catalog table's column has.
+fn local_schema<'s>(schema: &'s Schema, u: &Unit) -> std::borrow::Cow<'s, Schema> {
+    let mut out = std::borrow::Cow::Borrowed(schema);
+    for node in &u.local_tables {
+        let text = node.text().to_string();
+        let words = cst::first_words(node, 2);
+        // `DECLARE @t [AS] TABLE (columns)` as `CREATE TABLE t (columns)`.
+        let (ddl, var) =
+            if u.dialect == Dialect::Tsql && words.first().is_some_and(|w| w == "DECLARE") {
+                let Some(open) = text.find('(') else {
+                    continue;
+                };
+                let var = ast::tokens(node).get(1).map(|t| t.text.clone());
+                (format!("CREATE TABLE local_table {}", &text[open..]), var)
+            } else {
+                (text, None)
+            };
+        let key = |schema: Option<&str>, name: &str| {
+            let parts: Vec<String> = match (&var, schema) {
+                (Some(v), _) => vec![v.clone()],
+                (None, Some(s)) => vec![s.to_string(), name.to_string()],
+                (None, None) => vec![name.to_string()],
+            };
+            Canon::table_name(&parts, &u.other_temps, &u.local_temps, u.routine.as_deref()).0
+        };
+        if let Some(s) = out.with_local(&ddl, u.dialect, key) {
+            out = std::borrow::Cow::Owned(s);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compare_units(
     a: &Analyzed,
@@ -286,6 +320,8 @@ fn compare_units(
     anchors: &[Anchor],
     out: &mut Outcome,
 ) {
+    let (la, lb) = (local_schema(sa, ua), local_schema(sb, ub));
+    let (sa, sb) = (la.as_ref(), lb.as_ref());
     let (na, nb) = (side_name(a), side_name(b));
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
