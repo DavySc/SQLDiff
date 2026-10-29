@@ -165,3 +165,72 @@ $$;"
     let r = run(a, &b("ColorName = j.ColorName, Price = j.Price + 1"));
     assert!(!equal(&r));
 }
+
+fn run_tsql(a: &str, b: &str) -> Report {
+    let opts = Options {
+        catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, MS_DDL)],
+        catalog_b: vec![Artifact::new("catalog.sql", Dialect::Tsql, MS_DDL)],
+        ..Options::default()
+    };
+    diff(
+        &Artifact::new("a.sql", Dialect::Tsql, a),
+        &Artifact::new("b.sql", Dialect::Tsql, b),
+        &opts,
+    )
+}
+
+fn view(with: &str) -> String {
+    format!("CREATE PROCEDURE dbo.V @J nvarchar(max) AS BEGIN INSERT INTO dbo.Colors (ColorID, Price) SELECT A, B FROM OPENJSON(@J) WITH ({with}); END;")
+}
+
+/// Review of #170: which name reads which key is part of the term.
+#[test]
+fn names_stay_tied_to_their_keys() {
+    let a = view("A int '$.x', B int '$.y'");
+    // T-SQL against T-SQL: the same keys in the same order, names swapped.
+    assert!(!equal(&run_tsql(&a, &view("B int '$.x', A int '$.y'"))));
+    assert!(equal(&run_tsql(&a, &view("A int '$.x', B int '$.y'"))));
+    // Default paths read the column name as written: `$.Id` is not `$.ID`.
+    assert!(!equal(&run_tsql(&view("A int, B int"), &view("a int, B int"))));
+    // Across dialects.
+    let pg = |cols: &str| {
+        format!(
+            "CREATE OR REPLACE PROCEDURE V(p_j text)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  INSERT INTO Colors (ColorID, Price) SELECT A, B FROM (SELECT {cols} FROM {}) AS openjson;
+END;
+$$;",
+            ROWS.replace("p_colors", "p_j")
+        )
+    };
+    let ok = pg("CAST(e ->> 'x' AS integer) AS A, CAST(e ->> 'y' AS integer) AS B");
+    assert!(equal(&run(&a, &ok)), "{:?}", run(&a, &ok).verdict());
+    let swapped = pg("CAST(e ->> 'x' AS integer) AS B, CAST(e ->> 'y' AS integer) AS A");
+    assert!(!equal(&run(&a, &swapped)));
+}
+
+#[test]
+fn update_from_names_stay_tied_to_their_keys() {
+    let a = "CREATE PROCEDURE dbo.U @J nvarchar(max)
+AS
+BEGIN
+    UPDATE t SET Price = j.Price FROM dbo.Colors AS t JOIN OPENJSON(@J) WITH (ColorID int, Price decimal(18,2)) AS j ON t.ColorID = j.ColorID;
+END;";
+    let b = |c1: &str, c2: &str| {
+        format!(
+            "CREATE OR REPLACE PROCEDURE U(p_j text)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE Colors AS t SET Price = j.Price FROM (SELECT CAST(e ->> 'ColorID' AS integer) AS {c1}, CAST(e ->> 'Price' AS numeric(18, 2)) AS {c2} FROM {}) AS j WHERE t.ColorID = j.ColorID;
+END;
+$$;",
+            ROWS.replace("p_colors", "p_j")
+        )
+    };
+    let r = run(a, &b("ColorID", "Price"));
+    assert!(equal(&r), "{:?}", r.verdict());
+    assert!(!equal(&run(a, &b("Price", "ColorID"))));
+}

@@ -2419,7 +2419,7 @@ impl<'a> Canon<'a> {
 
     /// The rows of a JSON document (T-SQL OPENJSON or its PostgreSQL form,
     /// see [`pg_json_rows`]), under `alias` or `openjson`. Both sides lower
-    /// to `(openjson table src (cols (jc key mode type)...))`; a column reads
+    /// to `(openjson table src (cols (jc name key mode type)...))`; a column reads
     /// as `(col table name)` with its own side's type.
     fn json_rows(&mut self, src: &Expr, fields: &[JsonField], alias: &Option<String>) -> R<Term> {
         let (st, _) = self.expr(src)?;
@@ -2446,8 +2446,11 @@ impl<'a> Canon<'a> {
                 )
             })?;
             let mode = if f.strict { "strict" } else { "lax" };
-            cols.push(n("jc", vec![a(f.key.clone()), a(mode), a(tag)]));
             let name = lc(f.name.trim_matches(['[', ']', '"']));
+            // The key in hex: JSON keys are case-sensitive, whatever case
+            // rules apply to names and atoms.
+            let key: String = f.key.bytes().map(|b| format!("{b:02x}")).collect();
+            cols.push(n("jc", vec![a(name.clone()), a(format!("key:{key}")), a(mode), a(tag)]));
             if derived.iter().any(|(c, _, _)| *c == name) {
                 return Err(format!("OPENJSON column `{name}` twice"));
             }

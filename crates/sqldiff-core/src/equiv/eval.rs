@@ -1148,9 +1148,9 @@ pub fn table_key_with(name: &[String], hints: &[String]) -> String {
 }
 
 /// Key of a table function call: its name and arguments.
-/// Key of a table function read. The OPENJSON column paths that differ from
-/// the default (`$.` and the column name) are part of it: a column read
-/// from another path is another input.
+/// Key of a table function read. Each OPENJSON column's path (by default
+/// `$.` and the column name as written; JSON keys are case-sensitive) is
+/// part of it: a column read from another path is another input.
 pub fn func_key(
     name: &[String],
     args: &[Expr],
@@ -1172,12 +1172,10 @@ pub fn func_key(
         let default = format!("$.{c}");
         let path = p.path.as_deref().unwrap_or(&default);
         let path = path.strip_prefix("lax ").unwrap_or(path);
-        if path != default || p.as_json {
-            key.push_str(&format!(
-                " {c}:{path}{}",
-                if p.as_json { " AS JSON" } else { "" }
-            ));
-        }
+        key.push_str(&format!(
+            " {c}:{path}{}",
+            if p.as_json { " AS JSON" } else { "" }
+        ));
     }
     key
 }

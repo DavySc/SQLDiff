@@ -166,8 +166,8 @@ impl Ctx<'_, '_> {
     /// their case whatever the collation (decision 1 in
     /// docs/verification-roadmap.md), so a SELECT that differs only that way
     /// is left to statement equivalence, which compares the names a client
-    /// receives exactly. Compound statements are looked into, since the
-    /// SELECT can be nested.
+    /// receives exactly; so is a statement that reads OPENJSON. Compound
+    /// statements are looked into, since the SELECT can be nested.
     fn case_only(&mut self, x: &Unit, y: &Unit) {
         if x.strict == y.strict {
             return;
@@ -181,7 +181,15 @@ impl Ctx<'_, '_> {
             }
             return;
         }
-        if x.kind == StmtKind::Select && y.kind == StmtKind::Select && x.children.is_empty() {
+        // OPENJSON reads a column without a path from the key spelled like
+        // the column, and JSON keys are case-sensitive.
+        let openjson = |u: &Unit| u.toks.iter().any(|t| t.loose.eq_ignore_ascii_case("OPENJSON"));
+        if x.children.is_empty()
+            && y.children.is_empty()
+            && ((x.kind == StmtKind::Select && y.kind == StmtKind::Select)
+                || openjson(x)
+                || openjson(y))
+        {
             let exact = |t: &[NormTok]| -> Vec<NormTok> {
                 t.iter()
                     .map(|t| NormTok {
