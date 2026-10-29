@@ -1525,10 +1525,8 @@ impl<'a> Cx<'a> {
             }
             "CONTINUE" => "CONTINUE".into(),
             "THROW" => self.throw(&ts)?,
-            "RAISERROR" => return no(self.pick(
-                "RAISERROR: severity decides whether it is an error at all; rewrite as RAISE EXCEPTION or RAISE NOTICE",
-                "RAISERROR: severity decides whether it is an error at all; rewrite as SIGNAL (an error or a warning SQLSTATE)",
-            )),
+            "RAISERROR" if self.db2() => return no("RAISERROR: severity decides whether it is an error at all; rewrite as SIGNAL (an error or a warning SQLSTATE)"),
+            "RAISERROR" => self.raiserror(&ts)?,
             "BEGIN" if matches!(w(1).as_str(), "TRAN" | "TRANSACTION") => self.txn("BEGIN", &ts)?,
             "COMMIT" => self.txn("COMMIT", &ts)?,
             "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
@@ -2810,6 +2808,134 @@ impl<'a> Cx<'a> {
         Ok(format!(
             "RAISE EXCEPTION USING MESSAGE = {msg}, ERRCODE = 'P0001'"
         ))
+    }
+
+    /// PostgreSQL: `RAISERROR (format, severity, state [, args]) [WITH
+    /// NOWAIT]` with a literal severity. 0 to 10 is an informational message
+    /// (`RAISE NOTICE`), 11 to 18 an error (`RAISE EXCEPTION`); whether the
+    /// code after it still runs is the engine's to compare (T-SQL carries on
+    /// after RAISERROR outside TRY, even under XACT_ABORT ON). The format
+    /// may use `%s`, `%d`, `%i` and `%%` only. Checked on SQL Server 2022:
+    /// a NULL argument shows as `(null)`, so each value becomes
+    /// `COALESCE(value, '(null)')` (PostgreSQL would show `<NULL>`).
+    fn raiserror(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let form = || No("RAISERROR form not understood".into());
+        let open = *s.get(1).filter(|&&j| ts[j].k == L_PAREN).ok_or_else(form)?;
+        let close = matching(&ts, open).ok_or_else(form)?;
+        let tail: Vec<String> = ts[close + 1..]
+            .iter()
+            .filter(|t| t.sig())
+            .map(T::up)
+            .collect();
+        if !tail.is_empty() && tail.join(" ") != "WITH NOWAIT" {
+            return no("RAISERROR WITH LOG or SETERROR: also writes the error log or sets @@ERROR; rewrite by hand");
+        }
+        let args = split_commas(&ts[open + 1..close]);
+        if args.len() < 3 {
+            return Err(form());
+        }
+        let error = match trimmed(args[1]) {
+            [t] if t.k == NUMBER => match t.s.parse::<u32>() {
+                Ok(0..=10) => false,
+                Ok(11..=18) => true,
+                _ => return no("RAISERROR severity 19 or more: needs WITH LOG and ends the connection from 20; rewrite by hand"),
+            },
+            _ => return no("RAISERROR with a severity that is not a literal: whether it is an error or a message depends on its value"),
+        };
+        if error && self.trigger.is_some() {
+            return self.misplaced("RAISERROR of severity 11 or more in a trigger: T-SQL carries on with the trigger, PostgreSQL fails the statement that fired it");
+        }
+        let var = |cx: &Self, t: &T| -> Option<(String, Dt)> {
+            let v = cx.vars.get(&t.s.get(1..)?.to_ascii_lowercase())?;
+            (t.k == VARIABLE && !t.s.starts_with("@@")).then(|| (v.name.clone(), v.dt))
+        };
+        // The PostgreSQL format, its values, and whether any value is shown.
+        let mut fmt = String::new();
+        let mut values = Vec::new();
+        let rest = &args[3..];
+        match trimmed(args[0]) {
+            [t] if t.k == VARIABLE => {
+                let Some((name, Dt::Text)) = var(self, t) else {
+                    return no("RAISERROR with a message number or a variable that is not a declared string: rewrite by hand");
+                };
+                if !rest.is_empty() {
+                    return no("RAISERROR with a format variable and arguments: the substitutions depend on the variable's value");
+                }
+                self.note(Status::Assumptions, "ASM-RAISERROR-FORMAT", "The message variable holds no % sign: T-SQL reads it as a format (a % starts a substitution), PostgreSQL shows it as it is. A NULL message shows as an empty one on both sides.");
+                fmt.push('%');
+                values.push(format!("COALESCE({name}, '')"));
+            }
+            [t] if t.k == STRING => {
+                if !t.s.starts_with(['N', 'n']) && !t.s.is_ascii() {
+                    return no("RAISERROR with a non-Unicode format holding characters outside ASCII: the code page decides them; write it as N'…'");
+                }
+                let mut rest = rest.iter();
+                let mut cs = string_value(&t.s).chars().collect::<Vec<_>>().into_iter();
+                while let Some(ch) = cs.next() {
+                    if ch != '%' {
+                        fmt.push(ch);
+                        continue;
+                    }
+                    let spec = cs.next();
+                    if spec == Some('%') {
+                        fmt.push_str("%%");
+                        continue;
+                    }
+                    if !matches!(spec, Some('s' | 'd' | 'i')) {
+                        return no("RAISERROR format with a specification other than %s, %d, %i or %% (width, precision, flags, %u, %o, %x): not converted");
+                    }
+                    let Some(arg) = rest.next() else {
+                        return no("RAISERROR format with more specifications than arguments: T-SQL shows (null) for the missing ones; pass them");
+                    };
+                    let string = spec == Some('s');
+                    match trimmed(arg) {
+                        // A constant goes into the format as its text.
+                        [a] if string && a.k == STRING && (a.s.starts_with(['N', 'n']) || a.s.is_ascii()) => {
+                            fmt.push_str(&string_value(&a.s).replace('%', "%%"));
+                        }
+                        [a] if !string && a.k == NUMBER && a.s.parse::<i32>().is_ok_and(|n| n.to_string() == a.s) => {
+                            fmt.push_str(&a.s);
+                        }
+                        [a] => match (var(self, a), string) {
+                            (Some((name, Dt::Text)), true) => {
+                                fmt.push('%');
+                                values.push(format!("COALESCE({name}, '(null)')"));
+                            }
+                            (Some((name, Dt::Int)), false) => {
+                                fmt.push('%');
+                                values.push(format!("COALESCE(CAST({name} AS text), '(null)')"));
+                            }
+                            _ => return no("RAISERROR argument that is not a declared variable or constant of the type its specification takes (%s a string, %d/%i an int): T-SQL raises error 2786"),
+                        },
+                        _ => return Err(form()),
+                    }
+                }
+                if rest.next().is_some() {
+                    return no("RAISERROR with more arguments than its format uses: not converted");
+                }
+            }
+            _ => return no("RAISERROR with a message number: the text comes from sys.messages; rewrite by hand"),
+        }
+        let chars = fmt.chars().count();
+        if !values.is_empty() || chars == 0 {
+            self.note(Status::Assumptions, "ASM-RAISERROR-TEXT", "The message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space; PostgreSQL keeps the text as it is.");
+        } else if chars > 2047 {
+            return no("RAISERROR message longer than 2,047 characters: T-SQL cuts it; shorten it");
+        }
+        let fmt = fmt.replace('\'', "''");
+        let values: String = values.iter().map(|v| format!(", {v}")).collect();
+        if error {
+            self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-exception");
+            self.note(Status::Assumptions, "ASM-THROW-ERRCODE", "The T-SQL error number (50000), severity and state are not carried over: callers see SQLSTATE P0001 with the same message.");
+            return Ok(format!(
+                "RAISE EXCEPTION '{fmt}'{values} USING ERRCODE = 'P0001'"
+            ));
+        }
+        self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-notice");
+        self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
+        Ok(format!("RAISE NOTICE '{fmt}'{values}"))
     }
 
     fn txn(&mut self, kw: &str, ts: &[T]) -> R<String> {
