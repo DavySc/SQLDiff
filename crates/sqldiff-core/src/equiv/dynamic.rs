@@ -31,6 +31,11 @@
 //! - A `#temp` table created in the dynamic batch is dropped when the batch
 //!   ends; the batch cannot see the caller's variables; without XACT_ABORT a
 //!   failing statement inside it lets the next one run.
+//! - `sp_executesql` converts each value to its parameter's type as it
+//!   passes it (2.7 to `int` gives 2) and fails when a declared parameter is
+//!   not passed; PostgreSQL `EXECUTE … USING` types `$n` by the value (`USING
+//!   2.7` stored in an integer column gives 3) and lets `$n` go unread. So
+//!   only variables of exactly the parameter's type are compared as values.
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
@@ -107,6 +112,232 @@ fn close_of(ts: &[Tok], open: usize) -> Option<usize> {
     None
 }
 
+/// Positions of the commas outside parentheses.
+fn top_commas(ts: &[Tok]) -> Vec<usize> {
+    let mut depth = 0usize;
+    let mut out = Vec::new();
+    for (i, t) in ts.iter().enumerate() {
+        match t.kind {
+            K::LParen => depth += 1,
+            K::RParen => depth = depth.saturating_sub(1),
+            K::Comma if depth == 0 => out.push(i),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn split_top(ts: &[Tok]) -> Vec<&[Tok]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    for c in top_commas(ts) {
+        parts.push(&ts[start..c]);
+        start = c + 1;
+    }
+    parts.push(&ts[start..]);
+    parts
+}
+
+fn shown(ts: &[Tok]) -> String {
+    ts.iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A parameter `sp_executesql` declares for its text.
+#[derive(Debug, Clone)]
+pub struct Param {
+    /// Lower case, without `@`.
+    pub name: String,
+    /// The type as declared.
+    pub ty: Vec<Tok>,
+}
+
+/// What `sp_executesql` declares and passes after its text: the
+/// parameters, and the value each receives, in parameter order.
+#[derive(Debug, Clone)]
+pub struct Passed {
+    pub params: Vec<Param>,
+    pub args: Vec<Vec<Tok>>,
+}
+
+/// The parameters of `EXEC sp_executesql text, N'@a int, …', @a = …`:
+/// `None` without any. Only plain input parameters, each passed exactly
+/// once: no OUTPUT, no defaults (SQL Server fails the call when a declared
+/// parameter is not passed, PostgreSQL `USING` does not).
+pub fn exec_params(stmt: &SyntaxNode) -> Result<Option<Passed>, String> {
+    let ts = tokens(stmt);
+    let Some(Form::ExecuteSql(s, e)) = exec_form(&ts) else {
+        return Ok(None);
+    };
+    let parts = split_top(&ts[s..e]);
+    if parts.len() == 1 {
+        return Ok(None);
+    }
+    let named = |p: &[Tok], name: &str| -> bool {
+        p.first()
+            .is_some_and(|t| t.kind == K::Var && t.text[1..].eq_ignore_ascii_case(name))
+            && p.get(1).is_some_and(|t| t.kind == K::Op && t.text == "=")
+    };
+    let decl = if named(parts[1], "params") {
+        &parts[1][2..]
+    } else {
+        parts[1]
+    };
+    jumps(stmt)?;
+    let v = Reader { depth: 0 }.expr(stmt, decl)?;
+    let Some(text) = v.s else {
+        return Err("the parameter list is NULL".into());
+    };
+    if !v.unicode {
+        return Err("sp_executesql is given a varchar parameter list, which it rejects".into());
+    }
+    let root = sqldiff_syntax::parse(&format!("DECLARE {text}"), Dialect::Tsql).syntax();
+    let dts = tokens(&root);
+    let mut params: Vec<Param> = Vec::new();
+    for p in split_top(&dts[1..]) {
+        let (Some(v), rest) = (
+            p.first().filter(|t| t.kind == K::Var),
+            p.get(1..).unwrap_or(&[]),
+        ) else {
+            return Err(format!("the parameter list `{text}` is not read"));
+        };
+        let rest = match rest.first() {
+            Some(t) if t.kind == K::Word && t.up == "AS" => &rest[1..],
+            _ => rest,
+        };
+        if rest.is_empty()
+            || rest.iter().any(|t| {
+                t.kind == K::Op && t.text == "="
+                    || t.kind == K::Word && matches!(t.up.as_str(), "OUTPUT" | "OUT" | "READONLY")
+            })
+        {
+            return Err(format!(
+                "the parameter `{}` has a default, OUTPUT or READONLY",
+                shown(p)
+            ));
+        }
+        let name = v.text[1..].to_lowercase();
+        if params.iter().any(|q| q.name == name) {
+            return Err(format!("the parameter @{name} is declared twice"));
+        }
+        params.push(Param {
+            name,
+            ty: rest.to_vec(),
+        });
+    }
+    let mut args: Vec<Option<Vec<Tok>>> = vec![None; params.len()];
+    let mut by_name = false;
+    for (k, a) in parts[2..].iter().enumerate() {
+        if a.iter()
+            .any(|t| t.kind == K::Word && matches!(t.up.as_str(), "OUTPUT" | "OUT"))
+        {
+            return Err("sp_executesql passes an OUTPUT parameter".into());
+        }
+        let (at, value) = match a {
+            [v, eq, rest @ ..] if v.kind == K::Var && eq.kind == K::Op && eq.text == "=" => {
+                by_name = true;
+                let n = v.text[1..].to_lowercase();
+                let i = params
+                    .iter()
+                    .position(|q| q.name == n)
+                    .ok_or_else(|| format!("sp_executesql passes @{n}, which is not declared"))?;
+                (i, rest)
+            }
+            _ if by_name => return Err("a positional value after a named one".into()),
+            _ if k < params.len() => (k, *a),
+            _ => return Err("sp_executesql passes more values than parameters".into()),
+        };
+        if value.is_empty() || value.iter().any(|t| t.kind == K::Word && t.up == "DEFAULT") {
+            return Err("sp_executesql passes DEFAULT or nothing".into());
+        }
+        if args[at].replace(value.to_vec()).is_some() {
+            return Err(format!("@{} is passed twice", params[at].name));
+        }
+    }
+    let args = args
+        .into_iter()
+        .zip(&params)
+        .map(|(a, p)| {
+            a.ok_or_else(|| {
+                format!(
+                    "@{} is declared and not passed, which fails the call",
+                    p.name
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Passed { params, args }))
+}
+
+/// The type `@name` is declared with in the routine or batch holding `at`,
+/// as a parameter of the routine or in its one DECLARE.
+pub fn declared_type(at: &SyntaxNode, name: &str) -> Option<Vec<Tok>> {
+    let scope = at.ancestors().find(|n| {
+        matches!(
+            n.kind(),
+            SyntaxKind::ROUTINE | SyntaxKind::BATCH | SyntaxKind::SOURCE_FILE
+        )
+    })?;
+    let mut found: Vec<Vec<Tok>> = Vec::new();
+    for n in scope
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+    {
+        let ts = tokens(&n);
+        if ts
+            .first()
+            .is_some_and(|t| t.kind == K::Word && t.up == "DECLARE")
+        {
+            if let Some((ty, _)) = declarator(&ts[1..], name) {
+                found.push(ty.to_vec());
+            }
+        }
+    }
+    if scope.kind() == SyntaxKind::ROUTINE {
+        // The header up to the AS that starts the body.
+        let ts = tokens(&scope);
+        let end = (1..ts.len())
+            .find(|&j| ts[j].kind == K::Word && ts[j].up == "AS" && ts[j - 1].kind != K::Var)
+            .unwrap_or(ts.len());
+        for p in split_top(&ts[..end]) {
+            let Some(i) = p
+                .iter()
+                .position(|t| t.kind == K::Var && t.text[1..].eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            let mut rest = &p[i + 1..];
+            if rest
+                .first()
+                .is_some_and(|t| t.kind == K::Word && t.up == "AS")
+            {
+                rest = &rest[1..];
+            }
+            let stop = rest
+                .iter()
+                .position(|t| {
+                    t.kind == K::Op && t.text == "="
+                        || t.kind == K::Word
+                            && matches!(t.up.as_str(), "OUTPUT" | "OUT" | "READONLY")
+                })
+                .unwrap_or(rest.len());
+            found.push(rest[..stop].to_vec());
+        }
+    }
+    match found.as_slice() {
+        [t] if !t.is_empty() => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Two T-SQL types written the same way, letter case and spaces aside.
+pub fn same_type(x: &[Tok], y: &[Tok]) -> bool {
+    let key = |ts: &[Tok]| ts.iter().map(|t| t.up.clone()).collect::<Vec<_>>();
+    key(x) == key(y)
+}
+
 /// The text a T-SQL dynamic SQL statement runs, when the code alone fixes it.
 pub fn tsql_text(stmt: &SyntaxNode) -> Text {
     let ts = tokens(stmt);
@@ -140,9 +371,8 @@ fn tsql_text_of(stmt: &SyntaxNode, ts: &[Tok]) -> Result<Option<String>, String>
             {
                 arg = &arg[2..];
             }
-            if arg.iter().any(|t| t.kind == K::Comma) {
-                return Err("sp_executesql passes parameters: not read yet".into());
-            }
+            // The parameters and their values follow: `exec_params`.
+            let arg = &arg[..top_commas(arg).first().copied().unwrap_or(arg.len())];
             let [t] = arg else {
                 return Err("sp_executesql without one text argument".into());
             };
@@ -652,7 +882,15 @@ pub fn pg_text(stmt: &SyntaxNode) -> Option<Result<String, String>> {
     if !(first.kind() == SyntaxKind::IDENT && first.text().eq_ignore_ascii_case("EXECUTE")) {
         return None;
     }
-    Some(match toks.as_slice() {
+    // `EXECUTE '…' USING a, b`: the values are read by `pg_using`.
+    let using = toks
+        .iter()
+        .position(|t| t.kind() == SyntaxKind::IDENT && t.text().eq_ignore_ascii_case("USING"));
+    let toks = match using {
+        Some(u) if u + 1 < toks.len() => &toks[..u],
+        _ => &toks[..],
+    };
+    Some(match toks {
         [_, s] if s.kind() == SyntaxKind::STRING => {
             let raw = s.text();
             if !raw.starts_with('\'') {
@@ -673,8 +911,60 @@ pub fn pg_text(stmt: &SyntaxNode) -> Option<Result<String, String>> {
                 .map(str::to_string)
                 .ok_or_else(|| "unterminated dollar-quoted string".into())
         }
-        _ => Err("EXECUTE of an expression, or with INTO or USING".into()),
+        _ => Err("EXECUTE of an expression, or with INTO".into()),
     })
+}
+
+/// The values of PL/pgSQL `EXECUTE '…' USING a, b`, in order; empty
+/// without USING.
+pub fn pg_using(stmt: &SyntaxNode) -> Vec<Vec<Tok>> {
+    let ts: Vec<Tok> = tokens(stmt)
+        .into_iter()
+        .filter(|t| t.kind != K::Semi)
+        .collect();
+    match ts.iter().position(|t| t.kind == K::Word && t.up == "USING") {
+        Some(u) if u == 2 => split_top(&ts[u + 1..])
+            .into_iter()
+            .map(<[Tok]>::to_vec)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The name the comparison gives PostgreSQL `$n` in a procedure body.
+pub const PG_PARAM: &str = "sqldiff_dynamic_";
+
+/// The PostgreSQL text reads `$n` parameters.
+pub fn pg_has_params(root: &SyntaxNode) -> bool {
+    root.descendants_with_tokens()
+        .any(|e| e.kind() == SyntaxKind::PARAM)
+}
+
+/// The PostgreSQL text with each `$n` (1 ≤ n ≤ `count`) renamed to
+/// `PG_PARAM` + n, to run as a procedure body taking them.
+pub fn pg_bind_params(root: &SyntaxNode, count: usize) -> Result<String, String> {
+    let mut out = String::new();
+    for e in root.descendants_with_tokens() {
+        let Some(t) = e.as_token() else { continue };
+        if t.text().to_ascii_lowercase().contains(PG_PARAM) {
+            return Err(format!("the PostgreSQL text uses the name {PG_PARAM}"));
+        }
+        if t.kind() == SyntaxKind::PARAM {
+            let n: usize = t.text()[1..]
+                .parse()
+                .map_err(|_| format!("the parameter {} is not read", t.text()))?;
+            if n == 0 || n > count {
+                return Err(format!(
+                    "the PostgreSQL text reads {}, and EXECUTE passes {count} value(s)",
+                    t.text()
+                ));
+            }
+            out.push_str(&format!("{PG_PARAM}{n}"));
+        } else {
+            out.push_str(t.text());
+        }
+    }
+    Ok(out)
 }
 
 /// Why the T-SQL text of a dynamic batch cannot be compared as one
@@ -684,6 +974,12 @@ pub fn pg_text(stmt: &SyntaxNode) -> Option<Result<String, String>> {
 /// settings, database switches, transaction control and batch-level
 /// statements.
 pub fn tsql_inner_refusal(text: &str) -> Option<String> {
+    tsql_inner_refusal_with(text, &[])
+}
+
+/// `tsql_inner_refusal`, where the text may read the parameters `params`
+/// (lower case, without `@`) that `sp_executesql` passes.
+pub fn tsql_inner_refusal_with(text: &str, params: &[String]) -> Option<String> {
     let p = sqldiff_syntax::parse(text, Dialect::Tsql);
     if !p.diagnostics.is_empty() {
         return Some("the text does not parse as T-SQL".into());
@@ -714,7 +1010,10 @@ pub fn tsql_inner_refusal(text: &str) -> Option<String> {
         return Some("the text holds GO".into());
     }
     let ts = tokens(stmt);
-    if let Some(v) = ts.iter().find(|t| t.kind == K::Var) {
+    if let Some(v) = ts
+        .iter()
+        .find(|t| t.kind == K::Var && !params.contains(&t.text[1..].to_lowercase()))
+    {
         return Some(format!(
             "the text reads {}, which the dynamic batch cannot see",
             v.text
@@ -919,5 +1218,106 @@ mod tests {
         assert!(tsql_inner_refusal("UPDATE dbo.t SET a = @x").is_some_and(|w| w.contains("@x")));
         assert!(tsql_inner_refusal("SET NOCOUNT ON").is_some());
         assert!(tsql_inner_refusal("USE master").is_some());
+        assert_eq!(
+            tsql_inner_refusal_with("UPDATE dbo.t SET a = @V", &["v".into()]),
+            None
+        );
+    }
+
+    fn params(src: &str) -> Result<Option<Passed>, String> {
+        exec_params(&exec_at(src, 0))
+    }
+
+    fn names(p: &Passed) -> Vec<String> {
+        p.args
+            .iter()
+            .map(|a| {
+                a.iter()
+                    .map(|t| t.text.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sp_executesql_parameters() {
+        let p = params(&proc(
+            "EXEC sp_executesql N'x', N'@a int, @B nvarchar(10)', @b = @p, @a = @q;",
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            p.params.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(names(&p), ["@q", "@p"]);
+        assert_eq!(p.params[1].ty.len(), 4);
+        // Positional; a variable holding the list.
+        let p = params(&proc("DECLARE @l nvarchar(100) = N'@a int';\nEXEC sp_executesql @stmt = N'x', @params = @l, @p;"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(names(&p), ["@p"]);
+        assert!(params(&proc("EXEC sp_executesql N'x';")).unwrap().is_none());
+        for (call, why) in [
+            ("N'x', N'@a int', @a = @p OUTPUT", "OUTPUT"),
+            ("N'x', N'@a int OUTPUT', @a = @p", "OUTPUT"),
+            ("N'x', N'@a int = 1'", "default"),
+            ("N'x', N'@a int, @b int', @a = @p", "not passed"),
+            ("N'x', N'@a int', @a = @p, @a = @p", "twice"),
+            ("N'x', N'@a int', @c = @p", "not declared"),
+            ("N'x', N'@a int', @p, @p", "more values"),
+            ("N'x', '@a int', @p", "varchar"),
+            ("N'x', N'@a int', @a = @p, @p", "positional"),
+        ] {
+            let r = params(&proc(&format!("EXEC sp_executesql {call};")));
+            assert!(r.as_ref().is_err_and(|e| e.contains(why)), "{call}: {r:?}");
+        }
+    }
+
+    #[test]
+    fn declared_types() {
+        let src =
+            proc("DECLARE @a int, @b nvarchar (20);\nEXEC sp_executesql N'x', N'@v int', @v = @a;");
+        let at = exec_at(&src, 0);
+        let up = |ts: Vec<Tok>| {
+            ts.iter()
+                .map(|t| t.up.clone())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(declared_type(&at, "a").map(up).as_deref(), Some("INT"));
+        assert_eq!(
+            declared_type(&at, "B").map(up).as_deref(),
+            Some("NVARCHAR ( 20 )")
+        );
+        assert_eq!(declared_type(&at, "p").map(up).as_deref(), Some("SYSNAME"));
+        assert!(declared_type(&at, "zz").is_none());
+    }
+
+    #[test]
+    fn pg_using_and_parameters() {
+        let root = sqldiff_syntax::parse(
+            "DO $$ BEGIN EXECUTE 'UPDATE t SET a = $1 WHERE id = $2' USING v_a, p_x; END $$;",
+            Dialect::Postgres,
+        )
+        .syntax();
+        let ex = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::STATEMENT && pg_text(n).is_some())
+            .unwrap();
+        assert_eq!(
+            pg_text(&ex),
+            Some(Ok("UPDATE t SET a = $1 WHERE id = $2".into()))
+        );
+        assert_eq!(pg_using(&ex).len(), 2);
+        let body =
+            sqldiff_syntax::parse("UPDATE t SET a = $1 WHERE id = $2", Dialect::Postgres).syntax();
+        assert!(pg_has_params(&body));
+        assert_eq!(
+            pg_bind_params(&body, 2).unwrap(),
+            "UPDATE t SET a = sqldiff_dynamic_1 WHERE id = sqldiff_dynamic_2"
+        );
+        assert!(pg_bind_params(&body, 1).is_err_and(|e| e.contains("$2")));
     }
 }

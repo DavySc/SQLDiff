@@ -293,6 +293,42 @@ fails ("query string argument of EXECUTE is null"), `EXECUTE ''` does nothing,
 `EXECUTE 'SELECT 1'` discards the row, and one `EXECUTE` may run several
 statements; `format('%I', NULL)` fails.
 
+### Parameters: `sp_executesql` against `EXECUTE … USING`
+
+`EXEC sp_executesql N'… @v …', N'@v int, …', @v = @a, …` passes values to
+parameters its text reads; PL/pgSQL `EXECUTE '… $1 …' USING a, …` passes them
+by position. The parameter list must be known text like the statement (a
+literal or a variable read as above), with plain input parameters only (no
+default, OUTPUT or READONLY), each passed exactly once by name or position.
+Each value must be a variable of the routine on both sides, the same
+variable, declared on the T-SQL side with exactly the parameter's type, and
+of the same type on the PostgreSQL side. Each text then becomes the body of a
+procedure taking the parameters in order (`@v` on T-SQL, `$n` renamed on
+PostgreSQL, with the type of the n-th value), and the two procedures are
+compared as files; the pair is equal exactly when they are. A difference a
+witness finds is never kept as "different": the witness picks parameter
+values the routine fixes. The text may read only its own parameters.
+
+Why only variables of exactly the parameter's type: SQL Server converts a
+value to the parameter's type as it passes it, PostgreSQL types `$n` by the
+value. Facts (SQL Server 2022 and PostgreSQL 18.6, run 2026-10-29): `2.7`
+passed to an `int` parameter arrives as 2, `USING 2.7` assigned to an
+integer column stores 3; `'12345'` passed to `varchar(2)` arrives as '12';
+`USING '8'::text` assigned to an integer column fails ("column is of type
+integer but expression is of type text"); a declared parameter that is not
+passed fails the call (error 8178), while `USING` may leave `$n` unread;
+NULL values pass as NULL on both sides.
+
+`QUOTENAME(@x)` of a parameter is not converted: the name a value stands for
+on PostgreSQL depends on how the conversion names objects (case folded,
+`dbo` mapped, names with capitals or spaces quoted), which a value known only
+at run time cannot follow. Facts: `QUOTENAME` takes up to 128 characters
+(NULL above; 128 `]` give 258 characters), resolves `[cityid]` to column
+`CityID` under the CI collation; `quote_ident('CityID')` is `"CityID"`, which
+does not resolve to `cityid`; `quote_ident(NULL)` is NULL while
+`format('%I', NULL)` fails; PostgreSQL cuts an identifier over 63 bytes with
+a notice.
+
 ## Indexes, sequences and schemas
 
 A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE SCHEMA`
