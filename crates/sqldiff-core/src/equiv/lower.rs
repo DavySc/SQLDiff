@@ -229,6 +229,14 @@ pub fn lower(a: &Analyzed) -> Unit {
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::ROUTINE)
         .collect();
+    // PostgreSQL DO blocks beside one routine are statements outside it, as
+    // a Db2 for i compound statement is (a converted script's setup batch).
+    let named: Vec<SyntaxNode> = routines
+        .iter()
+        .filter(|r| !(d == Dialect::Postgres && is_do(r)))
+        .cloned()
+        .collect();
+    let routines = if named.len() == 1 { named } else { routines };
     match routines.as_slice() {
         [] => walk(&a.root, &mut u),
         [r] => {
@@ -307,6 +315,13 @@ pub fn lower(a: &Analyzed) -> Unit {
     }
     place_txn(&mut u);
     u
+}
+
+/// Whether a PostgreSQL routine node is a DO block.
+fn is_do(r: &SyntaxNode) -> bool {
+    cst::header_tokens(r)
+        .first()
+        .is_some_and(|t| t.text().eq_ignore_ascii_case("DO"))
 }
 
 /// One part of a script that runs as a whole: a T-SQL batch that needs

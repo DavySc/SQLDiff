@@ -69,7 +69,7 @@ impl Status {
 }
 
 /// Why a unit has the status it has.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub status: Status,
     /// Stable rule id, e.g. `ASM-CI-COLLATION` or `tsql.merge`.
@@ -82,7 +82,7 @@ pub struct Note {
 /// came from the input, for the certificate's trace (docs/verified-conversion.md),
 /// and is an untrusted hint to a checker. Every rewrite leaves one, including
 /// those that need no assumption; a token copied unchanged leaves none.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Step {
     /// Stable rule id, `tsql.<area>.<name>` (e.g. `tsql.func.len`), or the
     /// id of the note the rule also writes where it has one (`tsql.merge`).
@@ -108,7 +108,7 @@ pub fn trace_text(s: &str) -> String {
 }
 
 /// A span in the input or the output.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     /// Byte offsets.
     pub start: usize,
@@ -122,7 +122,7 @@ pub struct Span {
 }
 
 /// One converted statement (or compound header) and where it came from.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Unit {
     pub status: Status,
     pub notes: Vec<Note>,
@@ -148,7 +148,7 @@ pub struct Unit {
 }
 
 /// Who wrote a unit's output by hand.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Written {
     pub by: review::By,
     pub author: String,
@@ -156,7 +156,7 @@ pub struct Written {
     pub origin: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Counts {
     pub converted: usize,
     pub assumptions: usize,
@@ -166,7 +166,7 @@ pub struct Counts {
     pub not_converted: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversion {
     /// Dialect ids, e.g. `tsql`.
     pub from: String,
@@ -380,12 +380,22 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     let Draft { from, to, raw } = draft;
     let a = Artifact::new("input.sql", from, input);
     let b = Artifact::new("converted.sql", to, raw.text.as_str());
+    // The engine pairs statements through the units' trace: an input
+    // statement only with output written from it.
+    let traced = Options {
+        anchors: raw
+            .units
+            .iter()
+            .map(|u| sqldiff_core::equiv::Anchor { a: u.src, b: u.out })
+            .collect(),
+        ..opts.clone()
+    };
     // Davy, 2026-10-29: the output keeps the target's text types, and each
     // statement whose result T-SQL's case-insensitive collation can change
     // is flagged with ASM-CI-COLLATION for the reviewer.
     let report = {
         let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
-        sqldiff_core::diff(&a, &b, opts)
+        sqldiff_core::diff(&a, &b, &traced)
     };
     // The output on its own, bound against the target catalog.
     let own = Options {

@@ -13,7 +13,7 @@
 //! never guessed back.
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqldiff_core::artifact::location_in;
 use sqldiff_core::composition::{remap_to_template, template_notes, PlaceholderBasis};
 use sqldiff_core::model::Side;
@@ -29,7 +29,7 @@ use sqldiff_core::Options;
 const EXCERPT: usize = 3;
 
 /// What the template held, for the viewer.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TemplateInfo {
     /// Placeholder names, in order of first use.
     pub parameters: Vec<String>,
@@ -40,7 +40,7 @@ pub struct TemplateInfo {
 }
 
 /// What a parameter's values are (`[template] values` in the pack).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ValueKind {
     /// A name (the default): converted as one, so every value must be a
@@ -97,7 +97,7 @@ impl ValueKind {
 /// exactly as it does around a neutral fragment, or the conversion reached
 /// across the fragment's edge (hoisted a declaration, added a parameter)
 /// and the fragment cannot be converted on its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FragmentKind {
     Statements,

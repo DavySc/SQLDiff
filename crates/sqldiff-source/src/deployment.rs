@@ -8,13 +8,13 @@
 //! that accepted each assumption, and a converted tree says whether every
 //! assumption it carries is accepted (`sqldiff_convert::tree`).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqldiff_core::assumptions;
 use sqldiff_core::model::{Assumption, AssumptionSource, DeploymentSource};
 use sqldiff_core::Report;
 
 /// One accepted id and every layer that accepts it, lowest first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Accepted {
     pub id: String,
     pub by: Vec<DeploymentSource>,

@@ -397,6 +397,48 @@ impl Review {
         Ok(Review { setup, loaded })
     }
 
+    /// A review of a stored conversion of `setup`'s tree (see
+    /// [`crate::stored`]), with the tree as read now (`now`, from
+    /// [`stored_key`], whose key it was stored under): the ledger, the
+    /// instance report and the done gate are read and judged as for a
+    /// fresh conversion; only converting is skipped.
+    pub fn open_stored(setup: Setup, tree: Tree, now: Now) -> Result<Review, String> {
+        if !setup.out.is_dir() {
+            return Err(format!(
+                "{}: not a directory; give the converted tree `sqldiff convert -o` wrote",
+                setup.out.display()
+            ));
+        }
+        let prev = Loaded {
+            convert_ms: tree.report.totals.seconds * 1000.0,
+            inputs: now.inputs,
+            unreadable: now.unreadable,
+            written: now.written,
+            tree,
+            ..empty()
+        };
+        let loaded = load(&setup, Some(prev), &tree::Hooks::default())?;
+        Ok(Review { setup, loaded })
+    }
+
+    /// The key a stored copy of this conversion goes under: what it was
+    /// converted from, and `extra` (the build, the command, its config).
+    pub fn stored_key(&self, extra: &[u8]) -> String {
+        let l = &self.loaded;
+        key_of(
+            extra,
+            &l.inputs,
+            &l.unreadable,
+            &l.written,
+            l.tree.report.base_hash.as_deref(),
+        )
+    }
+
+    /// The conversion as it is stored ([`crate::stored`]).
+    pub fn tree_json(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.loaded.tree).unwrap_or_default()
+    }
+
     /// What the review was opened on.
     pub fn setup(&self) -> &Setup {
         &self.setup
@@ -883,6 +925,67 @@ fn approve_blocked(rv: Option<&UnitReviewReport>, u: &Unit) -> Option<String> {
     })
 }
 
+/// The tree as [`stored_key`] read it, for [`Review::open_stored`].
+pub struct Now {
+    inputs: Vec<Input>,
+    unreadable: Vec<String>,
+    written: Vec<String>,
+}
+
+/// The key of a stored conversion of `s`'s tree as it is on disk now
+/// (sources, the ledger's hand-written texts, base catalogs), with `extra`.
+pub fn stored_key(s: &Setup, extra: &[u8]) -> Result<(String, Now), String> {
+    let (inputs, unreadable) = tree::read(&s.tree)?;
+    let written = written_texts(&s.out)?;
+    let base = sqldiff_convert::base::hash(
+        &sqldiff_convert::base::read(&s.tree.catalogs, s.tree.no_catalog)?,
+        &sqldiff_convert::base::read_b(&s.tree.catalogs_b, &s.tree.catalogs, s.tree.no_catalog)?,
+    );
+    let key = key_of(extra, &inputs, &unreadable, &written, base.as_deref());
+    Ok((
+        key,
+        Now {
+            inputs,
+            unreadable,
+            written,
+        },
+    ))
+}
+
+/// SHA-256 over every part, each with its length, so no two lists of parts
+/// run together.
+fn key_of(
+    extra: &[u8],
+    inputs: &[Input],
+    unreadable: &[String],
+    written: &[String],
+    base: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut part = |b: &[u8]| {
+        h.update((b.len() as u64).to_le_bytes());
+        h.update(b);
+    };
+    part(extra);
+    part(&(inputs.len() as u64).to_le_bytes());
+    for i in inputs {
+        part(i.rel.as_bytes());
+        part(i.text.as_bytes());
+    }
+    part(&(unreadable.len() as u64).to_le_bytes());
+    for u in unreadable {
+        part(u.as_bytes());
+    }
+    part(&(written.len() as u64).to_le_bytes());
+    for w in written {
+        part(w.as_bytes());
+    }
+    part(&[base.is_some() as u8]);
+    part(base.unwrap_or("").as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 fn empty() -> Loaded {
     Loaded {
         inputs: Vec::new(),
@@ -1027,7 +1130,8 @@ fn judge(
 }
 
 /// The ledger's hand-written texts (every `written` record with a text),
-/// in a fixed order: what `tree::convert` reads from the ledger.
+/// in ledger order: what `tree::convert` reads from the ledger (which of
+/// equal texts it credits follows that order).
 fn written_texts(out: &std::path::Path) -> Result<Vec<String>, String> {
     let path = out.join(review::LEDGER_FILE);
     let text = match std::fs::read_to_string(&path) {
@@ -1035,12 +1139,11 @@ fn written_texts(out: &std::path::Path) -> Result<Vec<String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
-    let mut v: Vec<String> = review::Ledger::parse(&text)
+    let v: Vec<String> = review::Ledger::parse(&text)
         .records()
         .filter(|r| r.state == State::Written && r.text.is_some())
         .map(|r| serde_json::to_string(r).unwrap_or_default())
         .collect();
-    v.sort();
     Ok(v)
 }
 

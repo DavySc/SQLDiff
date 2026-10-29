@@ -56,6 +56,27 @@ fn update_from_joins_become_postgres_update_from() {
             "UPDATE orders SET total = i.amount FROM dbo.orders, dbo.order_items i WHERE i.item_id = orders.order_id;",
             "UPDATE orders SET total = i.amount FROM order_items i WHERE i.item_id = orders.order_id;",
         ),
+        // A schema-qualified target, the only FROM table (SQL Server binds
+        // it to the FROM reference of the same table).
+        (
+            "UPDATE dbo.orders SET total = 1 FROM dbo.orders WHERE order_id = 1;",
+            "UPDATE orders SET total = 1 WHERE order_id = 1;",
+        ),
+        // ... and to an aliased reference of the same table.
+        (
+            "UPDATE dbo.orders SET total = i.amount FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id;",
+            "UPDATE orders o SET total = i.amount FROM order_items i WHERE i.item_id = o.order_id;",
+        ),
+        // The target is not in FROM: SQL Server joins it in, as PostgreSQL
+        // does.
+        (
+            "UPDATE dbo.orders SET total = i.amount FROM dbo.order_items i WHERE i.item_id = dbo.orders.order_id;",
+            "UPDATE orders SET total = i.amount FROM order_items i WHERE i.item_id = orders.order_id;",
+        ),
+        (
+            "UPDATE orders SET qty = 0 FROM dbo.order_items AS i WHERE i.item_id = 7 AND i.order_id = qty;",
+            "UPDATE orders SET qty = 0 FROM order_items AS i WHERE i.item_id = 7 AND i.order_id = qty;",
+        ),
         // A unique key matched against a variable.
         (
             "DECLARE @k int = 1;\nUPDATE o SET qty = 0 FROM dbo.orders o JOIN dbo.order_items i ON i.order_id = o.order_id AND i.item_id = @k;",
@@ -150,15 +171,43 @@ fn update_from_shapes_without_a_rule_are_refused() {
         "UPDATE o SET total = 1 FROM dbo.orders o INNER LOOP JOIN dbo.order_items i ON i.item_id = o.order_id;",
         "UPDATE o SET total = 1 FROM dbo.orders o CROSS APPLY dbo.f(o.order_id) f;",
         "UPDATE o SET total = 1 FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id OPTION (MAXDOP 1);",
-        // The target binds to no FROM table, or not by a modelled rule.
-        "UPDATE dbo.orders SET total = 1 FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id;",
+        // The target binds to no FROM table, or not by a modelled rule:
+        // only one side states a schema, so the default schema decides
+        // whether the two are the same table.
         "UPDATE orders SET total = 1 FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id;",
+        "UPDATE dbo.orders SET total = 1 FROM orders JOIN dbo.order_items i ON i.item_id = orders.order_id;",
+        // Three-part target.
+        "UPDATE db.dbo.orders SET total = 1 FROM db.dbo.orders WHERE order_id = 1;",
+        // The same table twice.
+        "UPDATE dbo.orders SET total = 1 FROM dbo.orders JOIN dbo.orders o2 ON o2.order_id = dbo.orders.qty;",
         // A SET column qualified by another table.
         "UPDATE o SET i.amount = 1 FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id;",
     ] {
         let (c, _) = tsql(stmt);
         let (out, u) = last(&c);
         assert_eq!(u.status, Status::NotConverted, "{stmt}\n{out}");
+    }
+}
+
+/// Shapes the UPDATE … FROM rule refuses but the fallback rules still
+/// write: the engine must not call them clean.
+#[test]
+fn qualified_targets_without_a_modelled_binding_are_not_clean() {
+    for stmt in [
+        // Another FROM item's alias has the target's name.
+        "UPDATE dbo.orders SET total = 1 FROM dbo.order_items orders WHERE orders.item_id = 1;",
+        // The target is joined in implicitly, but an order meets several
+        // items.
+        "UPDATE dbo.orders SET total = i.amount FROM dbo.order_items i WHERE i.order_id = dbo.orders.order_id;",
+        // The target is not in FROM, and a FROM table has its name.
+        "UPDATE dbo.orders SET total = 1 FROM sales.orders WHERE sales.orders.order_id = 1;",
+        // The target is not in FROM, and a join condition names it (an
+        // error in both dialects).
+        "UPDATE dbo.orders SET total = 1 FROM dbo.order_items i JOIN dbo.order_items p ON p.item_id = dbo.orders.qty;",
+    ] {
+        let (c, _) = tsql(stmt);
+        let (out, u) = last(&c);
+        assert!(u.status >= Status::Unproven, "{stmt}\n{out}: {:?}", u.notes);
     }
 }
 
