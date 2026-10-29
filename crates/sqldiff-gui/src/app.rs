@@ -15,7 +15,14 @@
 //!   drift` does
 //! - `POST /api/runs/changes` `{"repo", "base", "out", ...}`: review the SQL a
 //!   branch changed, as `sqldiff changes` does
+//! - `POST /api/runs/format` `{"dir", "write"?, "config"?}`: lay out the SQL
+//!   files of a folder, as `sqldiff fmt --check` (or `--write`) does
+//! - `POST /api/runs/batch` `{"sources": [{"src", "from"}, ...], "targets",
+//!   "out", ...}`: convert every source into every target dialect, one run
+//!   each (a batch), with one summary matrix
+//! - `GET /api/batches`: the batches, with their cells and run sheet script
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
+//! - `POST /api/batches/N/cancel`: stop every run of batch N that has not finished
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
 //!   editor (see `settings`)
@@ -30,6 +37,10 @@
 //! the server is bound to a loopback address: bound to a network address
 //! (`--host`), anyone who can reach it could otherwise browse the disk, read
 //! any file through a comparison or write a conversion anywhere.
+//!
+//! Every POST carries this launch's token (`X-SQLDiff-Token`), which only
+//! the pages this server serves have (a `<meta name="sqldiff-token">`);
+//! without it nothing is routed.
 //!
 //! Each view keeps its own page and API. The app mounts the API under the
 //! view's path, tells the page where (`BASE` in the page) and puts the rail in
@@ -51,7 +62,9 @@ use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::packs::LoadedPack;
 use crate::review::Store;
-use crate::runs::{ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
+use crate::runs::{
+    BatchSpec, ChangesSpec, ConvertSpec, DriftSpec, FormatSpec, InstancesSpec, Runs,
+};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -124,7 +137,7 @@ struct Shared {
     packs: Vec<PathBuf>,
     /// Bound to a loopback address: only then can files be picked.
     local: bool,
-    /// This launch's token, which the settings page sends with its POSTs.
+    /// This launch's token, which every page sends with its POSTs.
     token: String,
 }
 
@@ -169,7 +182,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         isolated: app.isolated,
         packs: app.packs,
         local,
-        token: settings::new_token(),
+        token: new_token(),
     });
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
@@ -202,12 +215,22 @@ fn run_review_path(id: u64) -> String {
 }
 
 fn route(app: &Arc<Shared>, req: Request) -> Response {
+    // Every POST writes to disk, starts work or changes what a view shows:
+    // only a page this launch served may send one.
+    if req.method == "POST" && !same(&req.token, &app.token) {
+        return (
+            "403 Forbidden",
+            "text/plain",
+            "missing or wrong token: reload the page".to_string(),
+        );
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => return page(app, View::Home, home(app), ""),
         ("GET", "/runs") => return page(app, View::Runs, runs_page(app), ""),
         ("GET", "/api/runs") => {
             return json(&app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>())
         }
+        ("GET", "/api/batches") => return json(&app.runs.batches()),
         ("GET", "/settings") => return page(app, View::Settings, settings_page(app), ""),
         ("GET", "/api/fs")
         | ("POST", "/api/open/compare")
@@ -215,6 +238,8 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         | ("POST", "/api/runs/instances")
         | ("POST", "/api/runs/drift")
         | ("POST", "/api/runs/changes")
+        | ("POST", "/api/runs/format")
+        | ("POST", "/api/runs/batch")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
@@ -264,6 +289,27 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 Err(e) => bad(e),
             }
         }
+        ("POST", "/api/runs/format") => {
+            return match serde_json::from_slice::<FormatSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| {
+                    // A pack given at launch is private too (the runs do
+                    // not know the launch packs).
+                    let own = browse::absolute(Path::new(spec.dir.trim()))
+                        .join(sqldiff_source::config::PROJECT_FILE);
+                    match settings::private_file(&own, app.isolated, &app.packs) {
+                        true => Err(format!(
+                            "{}: this file is also a private pack, whose contents are not shown; choose another folder",
+                            own.display()
+                        )),
+                        false => app.runs.start_format(spec, app.isolated, |_| {}),
+                    }
+                })
+            {
+                Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            };
+        }
         ("POST", "/api/runs/changes") => {
             return match serde_json::from_slice::<ChangesSpec>(&req.body)
                 .map_err(|e| e.to_string())
@@ -273,14 +319,36 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 Err(e) => bad(e),
             }
         }
+        ("POST", "/api/runs/batch") => {
+            return match serde_json::from_slice::<BatchSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start_batch(spec, app.isolated))
+            {
+                Ok(batch) => json(&batch),
+                Err(e) => bad(e),
+            }
+        }
         _ => {}
     }
     let ctx = settings::Ctx {
         isolated: app.isolated,
-        token: &app.token,
+        packs: &app.packs,
     };
     if let Some(res) = settings::route(&req, &ctx) {
         return res;
+    }
+    if let Some(id) = req
+        .path
+        .strip_prefix("/api/batches/")
+        .and_then(|p| p.strip_suffix("/cancel"))
+    {
+        if req.method != "POST" {
+            return not_found();
+        }
+        return match id.parse().ok().and_then(|id| app.runs.cancel_batch(id)) {
+            Some(b) => json(&b),
+            None => not_found(),
+        };
     }
     if let Some(rest) = req.path.strip_prefix("/runs/") {
         let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -350,6 +418,7 @@ fn mount(req: &Request, prefix: &str) -> Option<Request> {
         path: path.to_string(),
         query: req.query.clone(),
         body: req.body.clone(),
+        token: req.token.clone(),
     })
 }
 
@@ -371,10 +440,26 @@ fn page(app: &Shared, view: View, html: String, base: &str) -> Response {
         )
         .replacen(
             "<!--__SQLDIFF_SHELL__-->",
-            &rail(app, view, if base.is_empty() { view.path() } else { base }),
+            &format!(
+                r#"<meta name="sqldiff-token" content="{}">{}"#,
+                app.token,
+                rail(app, view, if base.is_empty() { view.path() } else { base })
+            ),
             1,
         );
     ("200 OK", "text/html; charset=utf-8", html)
+}
+
+/// A new per-launch token: 128 random bits from the operating system.
+fn new_token() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("the operating system has no random numbers");
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Equal strings, compared without stopping at the first difference.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// The rail: one link per view, the current one marked; a view with nothing
@@ -682,6 +767,7 @@ fn remember(data_dir: &Path, r: Recent) {
 fn runs_page(app: &Shared) -> String {
     let payload = serde_json::json!({
         "runs": app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>(),
+        "batches": app.runs.batches(),
         "dialects": Dialect::ALL.iter().map(|d| (d.id(), d.display_name())).collect::<Vec<_>>(),
         "with_rules": Dialect::ALL
             .iter()
@@ -703,12 +789,9 @@ fn runs_page(app: &Shared) -> String {
 }
 
 fn settings_page(app: &Shared) -> String {
-    let json = serde_json::to_string(&settings::payload(
-        (!app.local).then_some(NOT_LOCAL),
-        &app.token,
-    ))
-    .unwrap()
-    .replace("</", "<\\/");
+    let json = serde_json::to_string(&settings::payload((!app.local).then_some(NOT_LOCAL)))
+        .unwrap()
+        .replace("</", "<\\/");
     SETTINGS_HTML
         .replace(
             "/*__SQLDIFF_PAYLOAD__*/null",

@@ -140,8 +140,10 @@ function render(d) {
   $("more").innerHTML = r ? "" : `<div style="display:grid;gap:10px;margin-top:8px"><h2>More</h2>${closed("Review a converted tree", `After <code>sqldiff convert SRC -o OUT --to postgres</code>, start the app on it: <code>sqldiff-gui review SRC OUT --to postgres</code>`)}</div>`;
 }
 
+// This launch's token, which every POST carries (absent outside the app).
+const APP_TOKEN = document.querySelector('meta[name="sqldiff-token"]')?.content ?? "";
 async function post(url, body) {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-SQLDiff-Token": APP_TOKEN }, body: JSON.stringify(body) });
   const text = await res.text();
   if (!res.ok) throw new Error(text || res.statusText);
   return JSON.parse(text);

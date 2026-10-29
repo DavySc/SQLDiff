@@ -8,8 +8,15 @@
 //! the template trees of several dialects for drift through
 //! `sqldiff_convert::drift` (what `sqldiff drift` runs), or reviews the SQL
 //! a branch changed through `sqldiff_review::branch` (what `sqldiff
-//! changes` runs), so a run writes what the command writes. Each run carries that command
+//! changes` runs), or lays out a folder's SQL files through
+//! `sqldiff_source::format_run` (what `sqldiff fmt --check` or `--write`
+//! runs), so a run writes what the command writes. Each run carries that command
 //! (`Command`), for scripts and pipelines.
+//!
+//! A batch (mass conversion) is several source trees converted into several
+//! target dialects: one ordinary conversion run per source and target, run
+//! one after another, with one summary matrix of the runs' own totals and
+//! done gates and a script of the runs' commands (`Batch`).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -20,11 +27,13 @@ use sqldiff_convert::drift;
 use sqldiff_convert::instances;
 use sqldiff_convert::job::{self, Job};
 use sqldiff_convert::tree::{self, Hooks};
+use sqldiff_core::format::FormatConfig;
 use sqldiff_core::Dialect;
 use sqldiff_review::branch;
 use sqldiff_review::pipeline::{Pipeline, Settings};
 use sqldiff_source::changes::ChangeScope;
 use sqldiff_source::config::{self, Sources};
+use sqldiff_source::format_run;
 use sqldiff_source::Resolved;
 
 use crate::browse;
@@ -187,6 +196,66 @@ pub struct ChangesSpec {
 /// What a branch review writes into its output folder.
 pub const CHANGES_FILES: [&str; 3] = ["changes.json", "changes.md", "changes.sarif"];
 
+/// A source tree of a batch.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSource {
+    /// The source tree, or one file.
+    pub src: String,
+    /// Its dialect id.
+    pub from: String,
+}
+
+/// A batch as the page asks for it: every source converted into every
+/// target dialect (but its own), each as an ordinary conversion run.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSpec {
+    pub sources: Vec<BatchSource>,
+    /// Target dialect ids.
+    pub targets: Vec<String>,
+    /// The folder the runs write into: `OUT/<source name>/<target id>`.
+    pub out: String,
+    /// As for a run, for every run of the batch.
+    #[serde(default)]
+    pub overwrite: bool,
+    #[serde(default)]
+    pub template: bool,
+    #[serde(default)]
+    pub parameters: Vec<String>,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub packs: Vec<String>,
+}
+
+/// Where a run sits in its batch.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BatchCell {
+    /// The batch's id.
+    pub batch: u64,
+    /// The index of the run's source in the batch's sources.
+    pub source: usize,
+    /// The target dialect id.
+    pub to: String,
+}
+
+/// A folder laid out as `sqldiff fmt` lays it out, as the page asks for it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormatSpec {
+    /// The folder whose SQL files are laid out.
+    pub dir: String,
+    /// Write the laid-out files back (`--write`); otherwise only check
+    /// (`--check`) and write nothing.
+    #[serde(default)]
+    pub write: bool,
+    /// The config file the page showed for the folder: the run is refused
+    /// when a command run there would load another one.
+    #[serde(default)]
+    pub config: Option<String>,
+}
+
 /// What a run was asked to do.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -195,6 +264,7 @@ pub enum Spec {
     Instances(InstancesSpec),
     Drift(DriftSpec),
     Changes(ChangesSpec),
+    Format(FormatSpec),
 }
 
 impl Spec {
@@ -205,6 +275,8 @@ impl Spec {
             Spec::Instances(s) => &s.out,
             Spec::Drift(s) => &s.out,
             Spec::Changes(s) => &s.out,
+            // A format run holds the folder it reads and may write.
+            Spec::Format(s) => &s.dir,
         }
     }
 }
@@ -215,6 +287,18 @@ enum Work {
     Instances(Box<instances::Args>),
     Drift(Box<drift::Args>),
     Changes(Box<ChangesWork>),
+    Format(Box<FormatWork>),
+}
+
+/// A folder to lay out, checked and ready to run.
+struct FormatWork {
+    dir: PathBuf,
+    write: bool,
+    /// The project and user config files loaded.
+    files: (Option<PathBuf>, Option<PathBuf>),
+    /// The config's `[format]`.
+    format: FormatConfig,
+    cfg: Resolved,
 }
 
 /// A branch review, checked and ready to run.
@@ -232,6 +316,8 @@ struct ChangesWork {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum State {
+    /// A run of a batch waiting for the runs before it; nothing written yet.
+    Queued,
     Running,
     /// Written. For a conversion `totals` is as in `conversion-report.json`,
     /// `complete` says every file is converted or converted under
@@ -256,6 +342,13 @@ pub enum State {
         error: String,
         finished: String,
     },
+}
+
+impl State {
+    /// Queued or running: the run holds its output folder and what it reads.
+    pub fn busy(&self) -> bool {
+        matches!(self, State::Queued | State::Running)
+    }
 }
 
 /// The `sqldiff convert` command that writes what a run writes. It names
@@ -434,6 +527,13 @@ impl Command {
         Command::with_config_then(program, args, packs, dir, isolated, tail)
     }
 
+    /// The `sqldiff fmt` command for `w`, naming the config files it loaded.
+    fn format(program: &str, w: &FormatWork) -> Command {
+        let mode = if w.write { "--write" } else { "--check" };
+        let args = vec!["fmt".into(), mode.into(), path(&w.dir)];
+        Command::with_files(program, args, &[], w.files.clone(), Vec::new())
+    }
+
     /// `args` with the packs and every config file the run loaded named,
     /// and no other found (`--isolated`).
     fn with_config(
@@ -450,15 +550,12 @@ impl Command {
     /// such as paths after `--`).
     fn with_config_then(
         program: &str,
-        mut args: Vec<String>,
+        args: Vec<String>,
         packs: &[PathBuf],
         dir: &Path,
         isolated: bool,
         tail: Vec<String>,
     ) -> Command {
-        for p in packs {
-            args.extend(["--pack".into(), path(p)]);
-        }
         let (project, user) = match isolated {
             true => (None, None),
             false => (
@@ -466,6 +563,21 @@ impl Command {
                 config::user_config_path().filter(|p| p.is_file()),
             ),
         };
+        Command::with_files(program, args, packs, (project, user), tail)
+    }
+
+    /// `args` with the packs and the config files `project` and `user`
+    /// named, and no other found (`--isolated`), then `tail`.
+    fn with_files(
+        program: &str,
+        mut args: Vec<String>,
+        packs: &[PathBuf],
+        (project, user): (Option<PathBuf>, Option<PathBuf>),
+        tail: Vec<String>,
+    ) -> Command {
+        for p in packs {
+            args.extend(["--pack".into(), path(p)]);
+        }
         args.push("--isolated".into());
         if let Some(p) = &project {
             args.extend(["--config".into(), path(p)]);
@@ -549,6 +661,8 @@ pub struct Run {
     /// The packs the run's config loaded (a private pack by path only);
     /// `None` for a run kept by an app that did not record them.
     pub packs: Option<Vec<LoadedPack>>,
+    /// Where the run sits in its batch, if it is a batch's.
+    pub batch: Option<BatchCell>,
     /// Output folder and what the run reads, as `canonical` paths: no two
     /// running runs write into one folder, and none reads where another
     /// writes.
@@ -591,6 +705,7 @@ pub struct RunView {
     /// The packs the run's config loaded (a private pack by path only);
     /// `None` for a run kept by an app that did not record them.
     pub packs: Option<Vec<LoadedPack>>,
+    pub batch: Option<BatchCell>,
     pub started: String,
     /// From an earlier session of the app: its review opens again from the
     /// tree on disk.
@@ -612,6 +727,7 @@ impl Run {
             spec: self.spec.clone(),
             command: self.command.clone(),
             packs: self.packs.clone(),
+            batch: self.batch.clone(),
             started: self.started.clone(),
             past: self.past,
             checked: self.checked.load(Ordering::Relaxed),
@@ -657,7 +773,7 @@ impl Run {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Asks a running run to stop; it stops before writing anything.
+    /// Asks a queued or running run to stop; it stops before writing anything.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -676,6 +792,86 @@ pub struct Runs {
     list: Arc<Mutex<Vec<Arc<Run>>>>,
     /// Where the list is kept; `None` keeps it while the app runs only.
     history: Option<PathBuf>,
+    /// Batches, oldest first, kept beside the list (`gui/batches.json`).
+    batches: Mutex<Vec<Batch>>,
+}
+
+/// A batch: what was asked, and when. Its runs carry their `BatchCell`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Batch {
+    pub id: u64,
+    pub spec: BatchSpec,
+    pub started: String,
+}
+
+/// A run of a batch as its matrix shows it: the run's own view, where kept.
+#[derive(Debug, Serialize)]
+pub struct CellView {
+    pub source: usize,
+    pub to: String,
+    /// `None` when the run is no longer kept in the history.
+    pub run: Option<u64>,
+}
+
+/// A batch as the page shows it.
+#[derive(Debug, Serialize)]
+pub struct BatchView {
+    pub id: u64,
+    pub spec: BatchSpec,
+    pub started: String,
+    /// The folder name each source's runs write under, by source.
+    pub names: Vec<String>,
+    /// One per source and target, sources first; a source is not converted
+    /// into its own dialect.
+    pub cells: Vec<CellView>,
+    /// Some run is queued or running.
+    pub busy: bool,
+    /// The run sheet: the runs' commands, one after another.
+    pub script: Script,
+}
+
+/// A batch's run sheet: a script of its runs' commands, as on each run's
+/// sheet, in the order the batch runs them. It runs every one and exits with
+/// the worst exit code among them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Script {
+    pub powershell: String,
+    pub sh: String,
+}
+
+impl Script {
+    /// The script for batch `id` of `commands`; `missing` runs are no
+    /// longer kept and are left out, which the script says.
+    pub fn new(id: u64, commands: &[&Command], missing: usize) -> Script {
+        let mut head = vec![
+            format!("SQLDiff batch {id}: its runs' commands, one after another."),
+            "Exit code: the worst of the runs' (0 every file converted, 1 not, 2 error).".into(),
+        ];
+        if missing > 0 {
+            head.push(format!(
+                "{missing} run{} of this batch no longer kept by the app {} left out.",
+                if missing == 1 { "" } else { "s" },
+                if missing == 1 { "is" } else { "are" }
+            ));
+        }
+        let comment = |l: &String| format!("# {l}\n");
+        let mut sh = String::from("#!/bin/sh\n");
+        sh.extend(head.iter().map(comment));
+        sh.push_str("status=0\n");
+        let mut ps: String = head.iter().map(comment).collect();
+        ps.push_str("$status = 0\n");
+        for c in commands {
+            sh.push_str(&c.sh);
+            sh.push_str("\nc=$?; if [ \"$c\" -gt \"$status\" ]; then status=$c; fi\n");
+            // A program that could not be started sets no exit code: an error.
+            ps.push_str("$global:LASTEXITCODE = 0\n");
+            ps.push_str(&c.powershell);
+            ps.push_str("\n$ok = $?\nif (-not $ok -and $LASTEXITCODE -eq 0) { $global:LASTEXITCODE = 2 }\nif ($LASTEXITCODE -gt $status) { $status = $LASTEXITCODE }\n");
+        }
+        sh.push_str("exit \"$status\"\n");
+        ps.push_str("exit $status\n");
+        Script { powershell: ps, sh }
+    }
 }
 
 /// A run as `gui/runs.json` keeps it.
@@ -687,6 +883,8 @@ struct Record {
     /// Absent in a history written before packs were kept.
     #[serde(default)]
     packs: Option<Vec<LoadedPack>>,
+    #[serde(default)]
+    batch: Option<BatchCell>,
     started: String,
     checked: usize,
     total: usize,
@@ -698,6 +896,22 @@ pub const HISTORY_MAX: usize = 100;
 
 fn history_file(data_dir: &Path) -> PathBuf {
     data_dir.join("gui").join("runs.json")
+}
+
+/// The batches kept beside the history `file`.
+fn batches_file(file: &Path) -> PathBuf {
+    file.with_file_name("batches.json")
+}
+
+/// `text` written to `file` through a temporary file, so a reader never
+/// sees half of it; a convenience, so a failure is not an error.
+fn write_whole(file: &Path, text: String) {
+    let Some(dir) = file.parent() else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = file.with_extension("json.tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
 }
 
 /// Writes the newest `HISTORY_MAX` runs of `list` to `file`, through a
@@ -714,19 +928,14 @@ fn save(file: &Path, list: &[Arc<Run>]) {
             spec: r.spec.clone(),
             command: r.command.clone(),
             packs: r.packs.clone(),
+            batch: r.batch.clone(),
             started: r.started.clone(),
             checked: r.checked.load(Ordering::Relaxed),
             total: r.total.load(Ordering::Relaxed),
             state: r.state(),
         })
         .collect();
-    let Some(dir) = file.parent() else { return };
-    let _ = std::fs::create_dir_all(dir);
-    let tmp = file.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(&records).unwrap() + "\n";
-    if std::fs::write(&tmp, text).is_ok() {
-        let _ = std::fs::rename(&tmp, file);
-    }
+    write_whole(file, serde_json::to_string_pretty(&records).unwrap() + "\n");
 }
 
 /// `p` (absolute) with every link resolved, and on Windows the case and
@@ -766,6 +975,10 @@ impl Runs {
             .into_iter()
             .map(|r| {
                 let state = match r.state {
+                    State::Queued => State::Failed {
+                        error: "the app stopped before this run started; nothing was written".into(),
+                        finished: r.started.clone(),
+                    },
                     State::Running => State::Failed {
                         error: "the app stopped while this run was running; what it wrote may be incomplete".into(),
                         finished: r.started.clone(),
@@ -779,6 +992,7 @@ impl Runs {
                     spec: r.spec,
                     command: r.command,
                     packs: r.packs,
+                    batch: r.batch,
                     started: r.started,
                     past: true,
                     checked: AtomicUsize::new(r.checked),
@@ -790,10 +1004,15 @@ impl Runs {
                 })
             })
             .collect();
+        let batches: Vec<Batch> = std::fs::read_to_string(batches_file(&file))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
         Runs {
             next: AtomicU64::new(list.iter().map(|r| r.id).max().unwrap_or(0)),
             list: Arc::new(Mutex::new(list)),
             history: Some(file),
+            batches: Mutex::new(batches),
         }
     }
 
@@ -817,8 +1036,7 @@ impl Runs {
         {
             let l = self.list.lock().unwrap_or_else(|e| e.into_inner());
             if l.iter().any(|r| {
-                matches!(r.state(), State::Running)
-                    && (r.out.starts_with(&run.out) || run.out.starts_with(&r.out))
+                r.state().busy() && (r.out.starts_with(&run.out) || run.out.starts_with(&r.out))
             }) {
                 return Err(format!(
                     "{}: another run is writing there; wait for it or cancel it",
@@ -955,6 +1173,27 @@ impl Runs {
         )
     }
 
+    /// Starts laying out a folder on its own thread. Config is what a
+    /// command run in the folder loads (unless `isolated`). The run holds
+    /// the folder: no other run reads or writes there meanwhile.
+    pub fn start_format(
+        &self,
+        spec: FormatSpec,
+        isolated: bool,
+        done: impl FnOnce(&Arc<Run>) + Send + 'static,
+    ) -> Result<Arc<Run>, String> {
+        let (w, command) = prepare_format(&spec, isolated)?;
+        let loaded = packs::loaded(&w.cfg);
+        let out = w.dir.clone();
+        self.launch(
+            Spec::Format(spec),
+            Work::Format(Box::new(w)),
+            (out, Vec::new()),
+            (command, loaded),
+            done,
+        )
+    }
+
     fn launch(
         &self,
         spec: Spec,
@@ -963,12 +1202,79 @@ impl Runs {
         (command, packs): (Command, Vec<LoadedPack>),
         done: impl FnOnce(&Arc<Run>) + Send + 'static,
     ) -> Result<Arc<Run>, String> {
-        let out = canonical(&out);
-        let reads: Vec<PathBuf> = reads.iter().map(|p| canonical(p)).collect();
-        let run = {
-            let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
-            let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
-            for r in l.iter().filter(|r| matches!(r.state(), State::Running)) {
+        let item = Admit {
+            spec,
+            work,
+            out,
+            reads,
+            command,
+            packs,
+            cell: None,
+        };
+        let admitted = self.admit(vec![item], None)?;
+        let run = Arc::clone(&admitted[0].0);
+        let mut done = Some(done);
+        self.spawn(admitted, move |r| {
+            if let Some(d) = done.take() {
+                d(r)
+            }
+        })?;
+        Ok(run)
+    }
+
+    /// Starts a batch: every source converted into every target dialect but
+    /// its own, each as an ordinary conversion run (what `start` starts) into
+    /// `OUT/<source name>/<target id>`, run one after another on one thread.
+    /// Every run is checked first: if any is refused, none starts.
+    pub fn start_batch(&self, spec: BatchSpec, isolated: bool) -> Result<BatchView, String> {
+        let mut items = Vec::new();
+        for (source, to, cell) in batch_cells(&spec)? {
+            let label = || format!("{} → {to}", spec.sources[source].src.trim());
+            let (job, out, command, loaded) =
+                prepare(&cell, isolated).map_err(|e| format!("{}: {e}", label()))?;
+            // Refused here rather than by the run, so that none starts.
+            let occupied = std::fs::read_dir(&out)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+            if occupied && !spec.overwrite {
+                return Err(format!(
+                    "{}: not empty; replace the files a conversion writes to use it",
+                    out.display()
+                ));
+            }
+            let reads = vec![job.tree.src.clone()];
+            items.push(Admit {
+                spec: Spec::Convert(cell),
+                work: Work::Convert(Box::new(job)),
+                out,
+                reads,
+                command,
+                packs: loaded,
+                cell: Some((source, to)),
+            });
+        }
+        let admitted = self.admit(items, Some(spec))?;
+        let id = admitted[0].0.id;
+        self.spawn(admitted, |_| {})?;
+        self.batch(id)
+            .ok_or_else(|| "the batch is not listed".to_string())
+    }
+
+    /// Checks `items` against the runs that hold a folder and against each
+    /// other, and lists them, all or none: queued when they are a batch's
+    /// (`batch`), else running.
+    fn admit(
+        &self,
+        items: Vec<Admit>,
+        batch: Option<BatchSpec>,
+    ) -> Result<Vec<(Arc<Run>, Work)>, String> {
+        let overlap = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+        let mut l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+        let mut checked: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+        for it in &items {
+            let out = canonical(&it.out);
+            let reads: Vec<PathBuf> = it.reads.iter().map(|p| canonical(p)).collect();
+            for r in l.iter().filter(|r| r.state().busy()) {
                 if overlap(&r.out, &out) {
                     return Err(format!(
                         "{}: another run is writing there; wait for it or cancel it",
@@ -988,59 +1294,303 @@ impl Runs {
                     ));
                 }
             }
+            for (o, rs) in &checked {
+                if overlap(o, &out) {
+                    return Err(format!(
+                        "{}: two runs of this batch would write there",
+                        out.display()
+                    ));
+                }
+                if let Some(p) = reads
+                    .iter()
+                    .chain(rs)
+                    .find(|p| overlap(o, p) || overlap(&out, p))
+                {
+                    return Err(format!(
+                        "{}: a run of this batch would write where another reads",
+                        p.display()
+                    ));
+                }
+            }
+            // A batch's runs write under one folder: none may read there.
+            if let Some(p) = reads.iter().find(|p| batch.is_some() && overlap(&out, p)) {
+                return Err(format!(
+                    "{}: a run of this batch would write where it reads",
+                    p.display()
+                ));
+            }
+            checked.push((out, reads));
+        }
+        let first = self.next.fetch_add(items.len() as u64, Ordering::Relaxed) + 1;
+        let started = sqldiff_review::time::now();
+        let state = match batch {
+            Some(_) => State::Queued,
+            None => State::Running,
+        };
+        let mut admitted = Vec::new();
+        for (i, (it, (out, reads))) in items.into_iter().zip(checked).enumerate() {
             let run = Arc::new(Run {
-                id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
-                spec,
-                command,
-                packs: Some(packs),
+                id: first + i as u64,
+                spec: it.spec,
+                command: it.command,
+                packs: Some(it.packs),
+                batch: it.cell.map(|(source, to)| BatchCell {
+                    batch: first,
+                    source,
+                    to,
+                }),
                 out,
                 reads,
-                started: sqldiff_review::time::now(),
+                started: started.clone(),
                 past: false,
                 checked: AtomicUsize::new(0),
                 total: AtomicUsize::new(0),
                 cancel: Arc::new(AtomicBool::new(false)),
-                state: Mutex::new(State::Running),
+                state: Mutex::new(state.clone()),
                 review: Mutex::new(None),
                 gate: Mutex::new(None),
             });
             l.push(Arc::clone(&run));
+            admitted.push((run, it.work));
+        }
+        if let Some(spec) = batch {
+            let mut b = self.batches.lock().unwrap_or_else(|e| e.into_inner());
+            b.push(Batch {
+                id: first,
+                spec,
+                started,
+            });
+            // Kept while one of its runs is.
+            let kept = l
+                .iter()
+                .rev()
+                .take(HISTORY_MAX)
+                .filter_map(|r| r.batch.as_ref());
+            let kept: std::collections::BTreeSet<u64> = kept.map(|c| c.batch).collect();
+            b.retain(|x| kept.contains(&x.id));
             if let Some(f) = &self.history {
-                save(f, &l);
+                write_whole(
+                    &batches_file(f),
+                    serde_json::to_string_pretty(&*b).unwrap() + "\n",
+                );
             }
-            run
-        };
-        let r = Arc::clone(&run);
+        }
+        if let Some(f) = &self.history {
+            save(f, &l);
+        }
+        Ok(admitted)
+    }
+
+    /// Runs `admitted` one after another on a thread of its own; `done` gets
+    /// each once it is finished. A queued run asked to stop before its turn
+    /// is cancelled without starting.
+    fn spawn(
+        &self,
+        admitted: Vec<(Arc<Run>, Work)>,
+        mut done: impl FnMut(&Arc<Run>) + Send + 'static,
+    ) -> Result<(), String> {
+        let runs: Vec<Arc<Run>> = admitted.iter().map(|(r, _)| Arc::clone(r)).collect();
         let (list, history) = (Arc::clone(&self.list), self.history.clone());
-        let finish = move |r: &Arc<Run>, state: State| {
+        let set = move |r: &Arc<Run>, state: State| {
             let l = list.lock().unwrap_or_else(|e| e.into_inner());
             *r.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
             if let Some(f) = &history {
                 save(f, &l);
             }
         };
-        let fail = finish.clone();
+        let fail = set.clone();
         let spawned = std::thread::Builder::new()
             .stack_size(sqldiff_core::ENGINE_STACK)
             .spawn(move || {
-                let state = execute(&r, work);
-                finish(&r, state);
-                done(&r);
+                for (r, work) in admitted {
+                    if matches!(r.state(), State::Queued) {
+                        if r.cancel.load(Ordering::Relaxed) {
+                            let finished = sqldiff_review::time::now();
+                            set(&r, State::Cancelled { finished });
+                            done(&r);
+                            continue;
+                        }
+                        set(&r, State::Running);
+                    }
+                    let state = execute(&r, work);
+                    set(&r, state);
+                    done(&r);
+                }
             });
         if let Err(e) = spawned {
             // Never left running: that would hold its folder until a restart.
             let error = format!("the run could not be started: {e}");
-            fail(
-                &run,
-                State::Failed {
-                    error: error.clone(),
-                    finished: sqldiff_review::time::now(),
-                },
-            );
+            for r in &runs {
+                fail(
+                    r,
+                    State::Failed {
+                        error: error.clone(),
+                        finished: sqldiff_review::time::now(),
+                    },
+                );
+            }
             return Err(error);
         }
-        Ok(run)
+        Ok(())
     }
+
+    /// Batches, newest first.
+    pub fn batches(&self) -> Vec<BatchView> {
+        let ids: Vec<u64> = {
+            let b = self.batches.lock().unwrap_or_else(|e| e.into_inner());
+            b.iter().rev().map(|x| x.id).collect()
+        };
+        ids.into_iter().filter_map(|id| self.batch(id)).collect()
+    }
+
+    /// Batch `id` with its runs as they are now.
+    pub fn batch(&self, id: u64) -> Option<BatchView> {
+        let b = {
+            let b = self.batches.lock().unwrap_or_else(|e| e.into_inner());
+            b.iter().find(|x| x.id == id)?.clone()
+        };
+        let runs: Vec<Arc<Run>> = {
+            let l = self.list.lock().unwrap_or_else(|e| e.into_inner());
+            l.iter()
+                .filter(|r| r.batch.as_ref().is_some_and(|c| c.batch == id))
+                .cloned()
+                .collect()
+        };
+        let cells = batch_cells(&b.spec).ok()?;
+        let mut views = Vec::new();
+        let mut commands = Vec::new();
+        for (source, to, _) in cells {
+            let run = runs.iter().find(|r| {
+                r.batch
+                    .as_ref()
+                    .is_some_and(|c| c.source == source && c.to == to)
+            });
+            if let Some(r) = run {
+                commands.push(&r.command);
+            }
+            views.push(CellView {
+                source,
+                to,
+                run: run.map(|r| r.id),
+            });
+        }
+        let missing = views.len() - commands.len();
+        Some(BatchView {
+            id,
+            script: Script::new(id, &commands, missing),
+            busy: runs.iter().any(|r| r.state().busy()),
+            names: b
+                .spec
+                .sources
+                .iter()
+                .map(|s| source_name(&s.src).unwrap_or_default())
+                .collect(),
+            spec: b.spec,
+            started: b.started,
+            cells: views,
+        })
+    }
+
+    /// Asks every run of batch `id` that has not finished to stop.
+    pub fn cancel_batch(&self, id: u64) -> Option<BatchView> {
+        for r in self.list() {
+            if r.batch.as_ref().is_some_and(|c| c.batch == id) && r.state().busy() {
+                r.cancel();
+            }
+        }
+        self.batch(id)
+    }
+}
+
+/// A run checked and ready to list.
+struct Admit {
+    spec: Spec,
+    work: Work,
+    out: PathBuf,
+    reads: Vec<PathBuf>,
+    command: Command,
+    packs: Vec<LoadedPack>,
+    /// Its source's index and target dialect, for a batch's run.
+    cell: Option<(usize, String)>,
+}
+
+/// The runs batch `spec` asks for, in the order it runs them: its source's
+/// index, the target dialect id and the run's spec. A source is not
+/// converted into its own dialect; the names its runs write under must
+/// differ.
+pub fn batch_cells(spec: &BatchSpec) -> Result<Vec<(usize, String, ConvertSpec)>, String> {
+    if spec.out.trim().is_empty() {
+        return Err("give an output folder".into());
+    }
+    let out = browse::absolute(Path::new(spec.out.trim()));
+    let mut targets: Vec<Dialect> = Vec::new();
+    for t in &spec.targets {
+        let d: Dialect = t
+            .trim()
+            .parse()
+            .map_err(|_| format!("unknown dialect `{t}`"))?;
+        if targets.contains(&d) {
+            return Err(format!("{}: given twice", d.display_name()));
+        }
+        targets.push(d);
+    }
+    if spec.sources.is_empty() || targets.is_empty() {
+        return Err("give at least one source and one target dialect".into());
+    }
+    let mut names: Vec<String> = Vec::new();
+    let mut cells = Vec::new();
+    for (i, s) in spec.sources.iter().enumerate() {
+        let from: Dialect = s
+            .from
+            .trim()
+            .parse()
+            .map_err(|_| format!("unknown dialect `{}`", s.from))?;
+        let name = source_name(&s.src)
+            .ok_or_else(|| format!("{}: give a source folder or file", s.src.trim()))?;
+        // Compared without case: one folder on Windows and macOS.
+        if names
+            .iter()
+            .any(|n| n.to_lowercase() == name.to_lowercase())
+        {
+            return Err(format!(
+                "two sources are named `{name}`, so their runs would write into one folder; give one of them under another name"
+            ));
+        }
+        names.push(name.clone());
+        for &to in targets.iter().filter(|&&t| t != from) {
+            cells.push((
+                i,
+                to.id().to_string(),
+                ConvertSpec {
+                    src: s.src.trim().to_string(),
+                    out: path(&out.join(&name).join(to.id())),
+                    from: from.id().into(),
+                    to: to.id().into(),
+                    overwrite: spec.overwrite,
+                    template: spec.template,
+                    parameters: spec.parameters.clone(),
+                    extensions: spec.extensions.clone(),
+                    packs: spec.packs.clone(),
+                    catalogs: Vec::new(),
+                    catalogs_b: Vec::new(),
+                    instances: None,
+                },
+            ));
+        }
+    }
+    if cells.is_empty() {
+        return Err("every source is already in every target dialect: nothing to convert".into());
+    }
+    Ok(cells)
+}
+
+/// The folder name a batch's runs of source `src` write under.
+fn source_name(src: &str) -> Option<String> {
+    let src = src.trim();
+    browse::absolute(Path::new(src))
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !src.is_empty() && !n.is_empty())
 }
 
 /// The command a run of `spec` would carry, without starting one.
@@ -1056,6 +1606,11 @@ pub fn instances_command(spec: &InstancesSpec, isolated: bool) -> Result<Command
 /// The command a drift check of `spec` would carry, without starting one.
 pub fn drift_command(spec: &DriftSpec, isolated: bool) -> Result<Command, String> {
     prepare_drift(spec, isolated).map(|(_, c, _)| c)
+}
+
+/// The command a format run of `spec` would carry, without starting one.
+pub fn format_command(spec: &FormatSpec, isolated: bool) -> Result<Command, String> {
+    prepare_format(spec, isolated).map(|(_, c)| c)
 }
 
 /// The command a branch review of `spec` would carry, without starting one.
@@ -1167,6 +1722,88 @@ fn prepare_instances(
 /// and the command that runs it. The review store is read (decisions suppress
 /// findings, as for the command) and the result cache is not used, so a run
 /// writes nothing but its output folder.
+/// The folder a format run lays out, checked before a thread is started,
+/// and the command that runs it.
+fn prepare_format(spec: &FormatSpec, isolated: bool) -> Result<(FormatWork, Command), String> {
+    let dir = existing(&spec.dir)?;
+    if !dir.is_dir() {
+        return Err(format!("{}: not a folder", dir.display()));
+    }
+    // The page shows the folder's own `sqldiff.toml`, present or not.
+    let shown = spec
+        .config
+        .as_deref()
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| browse::absolute(Path::new(c.trim())));
+    let own = dir.join(config::PROJECT_FILE);
+    if shown
+        .as_deref()
+        .is_some_and(|c| canonical(c) != canonical(&own))
+    {
+        return Err(format!(
+            "settings are shown for {}, which is not {}",
+            shown.as_deref().unwrap_or(&own).display(),
+            own.display()
+        ));
+    }
+    let project = match (isolated, &shown) {
+        // An app that ignores config still formats with the settings it
+        // shows: the folder's own file, named.
+        (true, Some(_)) => Some(own.clone()).filter(|p| p.is_file()),
+        (true, None) => None,
+        (false, _) => config::find_project(&dir),
+    };
+    // The page shows that file, or the defaults when there is none: a command
+    // run there must load the same, not a file further up.
+    let expected = own.is_file().then(|| canonical(&own));
+    if !isolated && shown.is_some() && project.as_deref().map(canonical) != expected {
+        return Err(format!(
+            "a command run in {} loads {} rather than the settings shown; open that folder's settings, or run the command",
+            dir.display(),
+            project
+                .as_deref()
+                .map_or("no project config".into(), |f| f.display().to_string())
+        ));
+    }
+    let user = match isolated {
+        true => None,
+        false => config::user_config_path().filter(|p| p.is_file()),
+    };
+    if let Some(p) = &project {
+        // As on the Settings page: the user config or a private pack is
+        // never read as a folder's config, and nothing of it is quoted.
+        if crate::settings::private_file(p, isolated, &[]) {
+            return Err(format!(
+                "{}: this file is also the user config or a private pack (or the configuration that would tell cannot be loaded), whose contents are not shown; choose another folder",
+                p.display()
+            ));
+        }
+        // An error in the folder's own file is the user's to read.
+        config::ConfigLayer::load(p).map_err(|e| e.0)?;
+    }
+    let cfg = Resolved::load_without_search(&Sources {
+        project: project.clone(),
+        user: user.clone(),
+        isolated: true,
+        cwd: Some(dir.clone()),
+        packs: Vec::new(),
+        cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
+    })
+    // One in another layer may quote a private config.
+    .map_err(|_| {
+        "another configuration layer (user config or a pack) could not be loaded; run `sqldiff config` to see why".to_string()
+    })?;
+    let w = FormatWork {
+        dir,
+        write: spec.write,
+        files: (project, user),
+        format: cfg.policy.format.clone(),
+        cfg,
+    };
+    let command = Command::format(&program(), &w);
+    Ok((w, command))
+}
+
 fn prepare_changes(
     spec: &ChangesSpec,
     isolated: bool,
@@ -1427,6 +2064,17 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
                 Err(e) => stopped(e),
             }
         }
+        Work::Format(w) => {
+            return match format_folder(&w, &hooks) {
+                Ok(mut state) => {
+                    if let State::Done { finished: f, .. } = &mut state {
+                        *f = finished();
+                    }
+                    state
+                }
+                Err(e) => stopped(e),
+            }
+        }
         Work::Drift(a) => {
             return match drift::check(&a, &hooks) {
                 Ok(c) => State::Done {
@@ -1502,6 +2150,54 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
         notes: Vec::new(),
         finished: finished(),
     }
+}
+
+/// Lays out every file first; a write run then writes the changed files,
+/// after the last cancel point. `totals` holds the files, those laid out
+/// differently from what is on disk (written, for a write run), the
+/// statements kept as written and the files skipped; `complete` is the
+/// command's exit code 0.
+fn format_folder(w: &FormatWork, hooks: &Hooks) -> Result<State, String> {
+    let files = format_run::check(std::slice::from_ref(&w.dir), None, &w.format, &w.cfg, hooks)?;
+    hooks.stop_if_cancelled()?;
+    let mut notes = Vec::new();
+    let (mut changed, mut kept, mut skipped) = (0, 0, 0);
+    for f in &files {
+        if let Some(line) = f.skipped_line() {
+            notes.push(line);
+            skipped += 1;
+            continue;
+        }
+        notes.extend(f.kept_lines());
+        kept += f.kept.len();
+        if f.changed {
+            changed += 1;
+        }
+    }
+    if w.write {
+        let mut written = 0;
+        for f in &files {
+            match f.write() {
+                Ok(true) => written += 1,
+                Ok(false) => {}
+                Err(e) => return Err(format!("{e} ({written} files written before it)")),
+            }
+        }
+    }
+    Ok(State::Done {
+        totals: serde_json::json!({
+            "files": files.len(),
+            "changed": changed,
+            "written": w.write,
+            "kept": kept,
+            "skipped": skipped,
+        }),
+        complete: skipped == 0 && (w.write || changed == 0),
+        queue: if w.write { 0 } else { changed },
+        not_applied: Vec::new(),
+        notes,
+        finished: String::new(),
+    })
 }
 
 /// Reviews the branch, then writes the three files. Everything is read and

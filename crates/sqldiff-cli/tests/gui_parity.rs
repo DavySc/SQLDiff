@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use sqldiff_gui::runs::{
-    self, ChangesSpec, Command as Sheet, ConvertSpec, DriftSpec, DriftTree, InstancesSpec, Run,
-    Runs, State,
+    self, BatchSource, BatchSpec, ChangesSpec, Command as Sheet, ConvertSpec, DriftSpec, DriftTree,
+    FormatSpec, InstancesSpec, Run, Runs, State,
 };
 
 fn write(p: &Path, text: &str) {
@@ -70,7 +70,7 @@ fn masked(dir: &Path) -> Vec<(String, String)> {
 fn finish(run: &Run) -> State {
     for _ in 0..1200 {
         match run.state() {
-            State::Running => std::thread::sleep(std::time::Duration::from_millis(50)),
+            s if s.busy() => std::thread::sleep(std::time::Duration::from_millis(50)),
             s => return s,
         }
     }
@@ -730,5 +730,195 @@ fn a_branch_review_run_and_its_command_write_the_same() {
         );
         assert_eq!(g, c, "{name}: {}", sheet.sh);
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// `files`, with the timings masked.
+fn timeless(dir: &Path) -> Vec<(String, String)> {
+    files(dir)
+        .into_iter()
+        .map(|(p, t)| {
+            let t = t
+                .lines()
+                .map(|l| {
+                    let s = l.trim_start();
+                    match s.starts_with("\"seconds\":")
+                        || (s.contains(" files, ") && s.ends_with(" s"))
+                    {
+                        true => "(time)",
+                        false => l,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (p, t)
+        })
+        .collect()
+}
+
+#[test]
+fn a_batch_and_its_script_write_the_same() {
+    let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-batch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let elsewhere = d.join("elsewhere");
+    write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    // Two trees, one in a folder whose name needs quoting in either shell.
+    let orders = d.join("in").join("it's [orders] $HOME");
+    write(
+        &orders.join("t.sql"),
+        "CREATE TABLE dbo.orders (id int NOT NULL, status varchar(10) NOT NULL);\n",
+    );
+    write(
+        &orders.join("sub").join("q.sql"),
+        "SELECT TOP 5 id FROM dbo.orders WHERE status = 'open' ORDER BY id;\n",
+    );
+    let billing = d.join("in").join("billing");
+    write(
+        &billing.join("b.sql"),
+        "CREATE TABLE dbo.bills (id int NOT NULL, amount decimal(10,2) NULL);\n",
+    );
+    let out = d.join("out");
+    let runs = Runs::default();
+    // Isolated: the commands load no config, as the runs did.
+    let b = runs
+        .start_batch(
+            BatchSpec {
+                sources: [&orders, &billing]
+                    .iter()
+                    .map(|s| BatchSource {
+                        src: s.display().to_string(),
+                        from: "tsql".into(),
+                    })
+                    .collect(),
+                targets: vec!["postgres".into(), "db2i".into()],
+                out: out.display().to_string(),
+                overwrite: false,
+                template: false,
+                parameters: Vec::new(),
+                extensions: Vec::new(),
+                packs: Vec::new(),
+            },
+            true,
+        )
+        .unwrap();
+    for c in &b.cells {
+        let run = runs.get(c.run.unwrap()).unwrap();
+        assert!(
+            matches!(finish(&run), State::Done { .. }),
+            "{:?}",
+            run.state()
+        );
+    }
+    let script = runs.batch(b.id).unwrap().script;
+    // The app's trees moved aside, the script writes them again where the
+    // runs wrote them.
+    let app = d.join("app");
+    std::fs::rename(&out, &app).unwrap();
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_sqldiff"));
+    let mut path = vec![bin.parent().unwrap().to_path_buf()];
+    path.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut c = if cfg!(windows) {
+        let mut c = Command::new("powershell");
+        c.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script.powershell,
+        ]);
+        c
+    } else {
+        let mut c = Command::new("sh");
+        c.args(["-c", &script.sh]);
+        c
+    };
+    let o = c
+        .current_dir(&elsewhere)
+        .env("PATH", std::env::join_paths(path).unwrap())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(o.status.code().is_some_and(|c| c <= 1), "{err}");
+    assert_eq!(timeless(&app), timeless(&out), "{}", script.sh);
+    // Four trees, two per source.
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    // The worst exit code comes through: a run that fails fails the script.
+    std::fs::remove_dir_all(&out).unwrap();
+    std::fs::remove_dir_all(&billing).unwrap();
+    let o = c.output().unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_format_run_and_its_command_lay_out_the_same() {
+    let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-fmt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let elsewhere = d.join("elsewhere");
+    write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    // The same folder twice: one laid out by the run, one by its command.
+    for side in ["gui ws", "cli ws"] {
+        let ws = d.join(side);
+        write(
+            &ws.join("sqldiff.toml"),
+            "[format]\nkeyword_case = \"lower\"\n\n[format.tsql]\none_item_per_line = true\n",
+        );
+        write(&ws.join("a.pg.sql"), "select a,b from t where x=1\n");
+        write(
+            &ws.join("sub/b.tsql.sql"),
+            "SELECT a,b FROM t WHERE x=1;\r\nGO\r\n",
+        );
+        write(&ws.join("sub/c.pg.sql"), "select 1\n");
+        write(&ws.join("notes.txt"), "select a,b\n");
+    }
+    let spec = |side: &str, write: bool| FormatSpec {
+        dir: d.join(side).display().to_string(),
+        write,
+        config: Some(d.join(side).join("sqldiff.toml").display().to_string()),
+    };
+    let runs = Runs::default();
+    for write in [false, true] {
+        let run = runs
+            .start_format(spec("gui ws", write), true, |_| {})
+            .unwrap();
+        let state = finish(&run);
+        let State::Done { complete, .. } = &state else {
+            panic!("{write}: {state:?}");
+        };
+        let sheet = runs::format_command(&spec("cli ws", write), true).unwrap();
+        assert!(
+            sheet.args.contains(&"--isolated".to_string()),
+            "{}",
+            sheet.sh
+        );
+        assert!(sheet.args.contains(&"--config".to_string()), "{}", sheet.sh);
+        let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            o.status.code().is_some_and(|c| c <= 1),
+            "{write}: {}\n{err}",
+            sheet.sh
+        );
+        assert_eq!(*complete, o.status.code() == Some(0), "{write}: {err}");
+        assert_eq!(
+            files(&d.join("gui ws")),
+            files(&d.join("cli ws")),
+            "{write}: {}",
+            sheet.sh
+        );
+    }
+    // Laid out with the folder's settings, CRLF kept.
+    let b = std::fs::read_to_string(d.join("gui ws/sub/b.tsql.sql")).unwrap();
+    assert!(b.starts_with("select a,\r\n"), "{b:?}");
+    assert_eq!(
+        std::fs::read_to_string(d.join("gui ws/notes.txt")).unwrap(),
+        "select a,b\n"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

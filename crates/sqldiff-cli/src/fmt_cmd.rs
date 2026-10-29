@@ -3,14 +3,17 @@
 //! Layout comes from the `[format]` section of the loaded config and packs
 //! (with `[format.tsql]`, `[format.postgres]`, `[format.db2i]`), then from
 //! the command-line flags. Statements the check rejects stay as written and
-//! are listed on stderr.
+//! are listed on stderr. The files are laid out by
+//! `sqldiff_source::format_run`, which the app's format runs run too.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args as ClapArgs, ValueEnum};
 use sqldiff_core::format::{self, FormatKeys, IndentStyle, KeywordCase, LineEnding};
+use sqldiff_core::hooks::Hooks;
 use sqldiff_core::Dialect;
+use sqldiff_source::format_run;
 
 use crate::source_cmd::ConfigArgs;
 
@@ -30,7 +33,8 @@ pub enum Ending {
 
 #[derive(ClapArgs)]
 pub struct Args {
-    /// Files to format.
+    /// Files to format; a folder stands for its SQL files (`.sql` and what
+    /// `dialect_map` names), which need --write or --check.
     #[arg(required = true)]
     files: Vec<PathBuf>,
     /// Dialect (default: from `dialect_map` or the path convention).
@@ -99,7 +103,7 @@ impl Args {
 }
 
 pub fn run(a: Args) -> Result<ExitCode, String> {
-    if !a.write && !a.check && a.files.len() > 1 {
+    if !a.write && !a.check && (a.files.len() > 1 || a.files.iter().any(|f| f.is_dir())) {
         return Err("several files: give --write or --check".into());
     }
     let cfg = a.cfg.resolve()?;
@@ -110,49 +114,29 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     flags.validate()?;
     let mut config = cfg.policy.format.clone();
     config.merge(&flags);
+    let files = format_run::check(&a.files, a.dialect, &config, &cfg, &Hooks::default())?;
     let mut unformatted = 0;
     let mut errors = 0;
-    for path in &a.files {
-        let art = match crate::read(path, a.dialect, &cfg) {
-            Ok(art) => art,
-            Err(e) => {
-                eprintln!("sqldiff: {e}");
-                errors += 1;
-                continue;
-            }
-        };
-        // A generator template is not SQL; its placeholders are outside what
-        // the check can prove.
-        if let Some(t) = &cfg.policy.template {
-            if art.text.contains(&t.open) {
-                eprintln!(
-                    "{}: not formatted: a template (contains `{}`)",
-                    art.path, t.open
-                );
-                errors += 1;
-                continue;
-            }
+    for f in &files {
+        if let Some(line) = f.skipped_line() {
+            eprintln!("{line}");
+            errors += 1;
+            continue;
         }
-        let out = format::format(&art.text, art.dialect, &config.options(art.dialect));
-        for k in &out.kept {
-            eprintln!(
-                "{}:{}-{}: kept as written: {}",
-                art.path, k.start_line, k.end_line, k.reason
-            );
+        for line in f.kept_lines() {
+            eprintln!("{line}");
         }
-        let changed = out.changed(&art.text);
         if a.check {
-            if changed {
-                println!("{}", art.path);
+            if f.changed {
+                println!("{}", f.shown);
                 unformatted += 1;
             }
         } else if a.write {
-            if changed {
-                std::fs::write(path, &out.text).map_err(|e| format!("{}: {e}", path.display()))?;
-                println!("formatted {}", art.path);
+            if f.write()? {
+                println!("formatted {}", f.shown);
             }
-        } else {
-            print!("{}", out.text);
+        } else if let Some(t) = &f.text {
+            print!("{t}");
         }
     }
     Ok(if errors > 0 {

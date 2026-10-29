@@ -467,12 +467,24 @@ fn string_words(n: &SyntaxNode, out: &mut Vec<String>) {
 /// `sp_executesql`; PL/pgSQL `EXECUTE` (in PostgreSQL always dynamic).
 fn dynamic_sql(n: &SyntaxNode, d: Dialect) -> bool {
     let t = tokens(n);
+    let runs_text = |j: usize| {
+        t.get(j)
+            .is_some_and(|y| matches!(y.kind, K::LParen | K::Var | K::Str))
+    };
     t.iter().enumerate().any(|(i, x)| {
         let exec = x.up == "EXEC" || x.up == "EXECUTE";
+        // `EXEC @rc = dbo.p` captures a return code: what runs is the
+        // named procedure, unless it too is a variable (`EXEC @rc = @p`).
+        let rc = t.get(i + 1).is_some_and(|y| y.kind == K::Var)
+            && t.get(i + 2)
+                .is_some_and(|y| y.kind == K::Op && y.text == "=");
         (exec && d == Dialect::Postgres)
             || (exec
-                && t.get(i + 1)
-                    .is_some_and(|y| matches!(y.kind, K::LParen | K::Var | K::Str)))
+                && if rc {
+                    runs_text(i + 3)
+                } else {
+                    runs_text(i + 1)
+                })
             || x.up == "SP_EXECUTESQL"
     })
 }
@@ -1523,5 +1535,15 @@ END
             "{ddl}GO\nCREATE PROCEDURE dbo.any @t sysname AS\nBEGIN\n  DECLARE @s nvarchar(200) = N'DROP TABLE ' + @t;\n  EXEC sp_executesql @s;\nEND\n"
         );
         assert!(read(&built).get("acct").is_none());
+        // Capturing a return code is not dynamic SQL; running a procedure
+        // named by a variable is.
+        let rc = format!(
+            "{ddl}GO\nCREATE PROCEDURE dbo.q AS\nBEGIN\n  DECLARE @rc int;\n  EXEC @rc = dbo.r;\nEND\n"
+        );
+        assert!(read(&rc).get("acct").is_some());
+        let by_name = format!(
+            "{ddl}GO\nCREATE PROCEDURE dbo.q @p sysname AS\nBEGIN\n  DECLARE @rc int;\n  EXEC @rc = @p;\nEND\n"
+        );
+        assert!(read(&by_name).get("acct").is_none());
     }
 }

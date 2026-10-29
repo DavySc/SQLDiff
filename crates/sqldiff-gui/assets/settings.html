@@ -101,14 +101,14 @@ pre.out { font-family: var(--mono); font-size: 12px; color: var(--fg); backgroun
 <header>
   <h1>SQLDiff settings</h1>
   <span class="spacer"></span>
-  <span class="muted">Saved to the workspace's sqldiff.toml only</span>
+  <span class="muted">Settings are saved to the workspace's sqldiff.toml only</span>
 </header>
 <main><div class="col">
   <div class="card closed" id="closed" hidden><span class="t">Not available on a network address</span><span class="s" id="closed-why"></span></div>
   <h2>Workspace</h2>
   <form class="form" id="ws" autocomplete="off">
     <div class="field"><span>Folder</span><input type="text" id="dir" placeholder="Folder that holds, or will hold, sqldiff.toml" aria-label="Workspace folder" spellcheck="false"><button type="button" class="outline" data-browse="dir" data-next="dir">Browse…</button></div>
-    <div class="acts"><span class="msg" id="ws-msg" role="status">Choose the folder of the workspace. Its sqldiff.toml is the only file the app writes here.</span><button type="submit" class="outline">Load</button></div>
+    <div class="acts"><span class="msg" id="ws-msg" role="status">Choose the folder of the workspace. Settings are saved to its sqldiff.toml; SQL files are written only by a format run you confirm below.</span><button type="submit" class="outline">Load</button></div>
   </form>
   <div id="editor" hidden>
     <h2>Config layers</h2>
@@ -128,6 +128,11 @@ pre.out { font-family: var(--mono); font-size: 12px; color: var(--fg); backgroun
         <div><div class="lbl" id="out-lbl">Formatted</div><pre class="out" id="out" tabindex="0" aria-label="Formatted SQL"></pre></div>
       </div>
       <div class="kept" id="kept"></div>
+    </div>
+    <h2>Folder</h2>
+    <div class="form">
+      <div class="acts"><span class="msg" id="run-msg" role="status"></span><button type="button" id="fcheck">Check formatting</button><button type="button" id="fwrite">Format files…</button></div>
+      <div class="acts" id="fconfirm" hidden><span class="msg err" id="fconfirm-msg"></span><button type="button" id="fno">Cancel</button><button type="button" class="primary" id="fgo">Format files</button></div>
     </div>
   </div>
 </div></main>
@@ -158,8 +163,10 @@ function tidy(d) {
 }
 const dirty = () => JSON.stringify(tidy(draft)) !== JSON.stringify(tidy(st.draft));
 
+// This launch's token, which every POST carries (absent outside the app).
+const APP_TOKEN = document.querySelector('meta[name="sqldiff-token"]')?.content ?? "";
 async function call(method, url, body) {
-  const res = await fetch(url, method === "GET" ? {} : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: INITIAL.token, ...body }) });
+  const res = await fetch(url, method === "GET" ? {} : { method, headers: { "Content-Type": "application/json", "X-SQLDiff-Token": APP_TOKEN }, body: JSON.stringify(body) });
   const text = await res.text();
   if (!res.ok) throw new Error(text || res.statusText);
   return JSON.parse(text);
@@ -181,6 +188,8 @@ async function load() {
 
 function adopt(v) {
   st = v;
+  delete $("run-msg").dataset.keep;
+  $("fconfirm").hidden = true;
   draft = clone(v.draft);
   $("dir").value = v.dir || $("dir").value;
   say("ws-msg", v.exists ? v.file : v.file + " does not exist yet; saving creates it.");
@@ -264,6 +273,8 @@ function paint() {
   const d = dirty();
   $("save").disabled = !d || !!st.writable;
   $("revert").disabled = !d;
+  $("fcheck").disabled = $("fwrite").disabled = $("fgo").disabled = d;
+  if (!$("run-msg").dataset.keep) say("run-msg", d ? "Save the settings first: a run uses the saved settings, as sqldiff fmt does" : "Run sqldiff fmt on the SQL files of this folder and its subfolders, as a run on the Runs page");
   if (st.writable) say("msg", st.writable, true);
   else if (!$("msg").dataset.keep) say("msg", d ? "Unsaved edits" : "");
 }
@@ -301,6 +312,27 @@ $("save").addEventListener("click", async () => {
     $("save").disabled = false;
   }
 });
+// A format run of the workspace folder: checking writes nothing; formatting
+// rewrites its SQL files in place, only after this confirmation.
+async function startFormat(write) {
+  $("fconfirm").hidden = true;
+  $("run-msg").dataset.keep = "1";
+  try {
+    const r = await call("POST", "/api/runs/format", { dir: st.dir, write, config: st.file });
+    $("run-msg").innerHTML = `Run ${r.id} started: <a href="/runs">follow it on the Runs page</a>`;
+    $("run-msg").classList.remove("err");
+  } catch (e) {
+    say("run-msg", e.message, true);
+  }
+}
+$("fcheck").addEventListener("click", () => startFormat(false));
+$("fwrite").addEventListener("click", () => {
+  $("fconfirm-msg").textContent = `This rewrites the SQL files under ${st.dir} in place. A statement whose layout the check cannot prove stays as written.`;
+  $("fconfirm").hidden = false;
+  $("fgo").focus();
+});
+$("fno").addEventListener("click", () => { $("fconfirm").hidden = true; });
+$("fgo").addEventListener("click", () => startFormat(true));
 $("revert").addEventListener("click", () => { draft = clone(st.draft); delete $("msg").dataset.keep; renderRows(); paint(); preview(); });
 $("ws").addEventListener("submit", (e) => { e.preventDefault(); load(); });
 $("dir").addEventListener("change", load);
