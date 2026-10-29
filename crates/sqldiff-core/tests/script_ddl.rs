@@ -154,3 +154,63 @@ fn tables_pair_by_name_when_one_side_creates_fewer() {
         r.unknown_reasons
     );
 }
+
+const TWO: &str = "CREATE TABLE dbo.T (id int NOT NULL PRIMARY KEY, n int NOT NULL);
+GO
+CREATE PROCEDURE dbo.p1 AS
+BEGIN
+    UPDATE dbo.T SET n = 1;
+END;
+GO
+DELETE FROM dbo.T;
+GO
+CREATE PROCEDURE dbo.p2 AS
+BEGIN
+    UPDATE dbo.T SET n = 2;
+END;
+GO
+";
+
+fn two_pg(n1: &str, n2: &str, v2: &str) -> String {
+    format!(
+        "CREATE TABLE T (id integer NOT NULL PRIMARY KEY, n integer NOT NULL);
+CREATE OR REPLACE PROCEDURE {n1}()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE T SET n = 1;
+END;
+$$;
+DELETE FROM T;
+CREATE OR REPLACE PROCEDURE {n2}()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE T SET n = {v2};
+END;
+$$;
+"
+    )
+}
+
+#[test]
+fn several_routines_meet_their_conversions_by_name() {
+    let r = equal(TWO, &two_pg("p1", "p2", "2"));
+    assert!(asms(&r).contains(&"ASM-DEFAULT-SCHEMA"), "{:?}", asms(&r));
+    // The second routine is compared too.
+    let r = run(TWO, &two_pg("p1", "p2", "3"));
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.unknown_reasons);
+    // Routines in another order (or under other names) are not paired: the
+    // scripts are compared whole and every routine's statements are named.
+    let r = run(TWO, &two_pg("p2", "p1", "2"));
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    for line in [3, 5, 10, 12] {
+        assert!(
+            r.unknown_reasons
+                .iter()
+                .any(|x| x.starts_with(&format!("side A (T-SQL) line {line}:"))),
+            "{line}: {:?}",
+            r.unknown_reasons
+        );
+    }
+}

@@ -49,25 +49,87 @@ pub(super) fn segment_pairs(a: &Analyzed, b: &Analyzed) -> Option<Vec<(Unit, Uni
         return None;
     }
     // A plain segment that lowers to nothing (`SET NOCOUNT ON` alone) has
-    // nothing to pair with; a block always has its partner.
-    let lowered = |an: &Analyzed, s: &[Segment]| -> Vec<(bool, Unit)> {
+    // nothing to pair with; a block or routine always has its partner.
+    fn lowered<'s>(an: &Analyzed, s: &'s [Segment]) -> Vec<(&'s Segment, Unit)> {
         s.iter()
-            .map(|g| (g.block, lower::lower_segment(an.dialect(), g)))
-            .filter(|(block, u)| *block || !nothing(u))
+            .map(|g| (g, lower::lower_segment(an.dialect(), g)))
+            .filter(|(g, u)| g.block || g.routine || !nothing(u))
             .collect()
-    };
+    }
     let (ua, ub) = (lowered(a, &sa), lowered(b, &sb));
-    if ua.len() != ub.len() || ua.iter().zip(&ub).any(|(x, y)| x.0 != y.0) {
+    if ua.len() != ub.len()
+        || ua
+            .iter()
+            .zip(&ub)
+            .any(|(x, y)| (x.0.block, x.0.routine) != (y.0.block, y.0.routine))
+    {
         return None;
     }
-    Some(ua.into_iter().zip(ub).map(|(x, y)| (x.1, y.1)).collect())
+    let mut out = Vec::new();
+    for ((gx, mut ux), (gy, uy)) in ua.into_iter().zip(ub) {
+        if gx.routine {
+            // Routines meet in order and by name, or the scripts are compared
+            // whole (and their routines stay not compared).
+            let asms = same_routine(&gx.nodes[0], a.dialect(), &gy.nodes[0], b.dialect())?;
+            ux.assumptions.extend(asms);
+        }
+        out.push((ux, uy));
+    }
+    Some(out)
 }
 
+/// Whether two routines of paired scripts are the same object: the same kind
+/// (view, function or procedure) and name. The assumptions name resolution
+/// takes.
+fn same_routine(
+    x: &SyntaxNode,
+    dx: Dialect,
+    y: &SyntaxNode,
+    dy: Dialect,
+) -> Option<Vec<crate::model::Assumption>> {
+    let (kx, nx) = routine_key(x, dx)?;
+    let (ky, ny) = routine_key(y, dy)?;
+    if kx != ky || nx != ny {
+        return None;
+    }
+    let mut asms = vec![asm::make(asm::IDENT_FOLD)];
+    if nx.0.is_none() {
+        asms.push(asm::make(asm::DEFAULT_SCHEMA));
+    }
+    Some(asms)
+}
+
+fn routine_key(r: &SyntaxNode, d: Dialect) -> Option<(&'static str, (Option<String>, String))> {
+    let toks: Vec<Tok> = cst::header_tokens(r).iter().map(Tok::from_syntax).collect();
+    let kw = toks.iter().position(|t| {
+        matches!(
+            t.up.as_str(),
+            "VIEW" | "FUNCTION" | "PROCEDURE" | "PROC" | "TRIGGER"
+        )
+    })?;
+    let kind = match toks[kw].up.as_str() {
+        "VIEW" => "view",
+        "FUNCTION" => "function",
+        "PROCEDURE" | "PROC" => "procedure",
+        _ => return None,
+    };
+    let (name, _) = table::dotted(&toks, kw + 1).ok()?;
+    Some((kind, super::ddl::object_key(&name, d).ok()?))
+}
+
+/// A segment with nothing to compare (only statements that lower to notes,
+/// such as `SET NOCOUNT ON`). Indexes, sequences, schemas, calls, comments
+/// and dynamic SQL count: a segment holding only those must meet its partner.
 fn nothing(u: &Unit) -> bool {
     u.stmts.is_empty()
         && u.uncovered.is_empty()
         && u.tables.is_empty()
+        && u.ddl.is_empty()
+        && u.calls.is_empty()
+        && u.dynamic.is_empty()
+        && u.txn_stmts.is_empty()
         && u.locals.is_empty()
+        && u.assumptions.is_empty()
         && !u.txn_control
 }
 
