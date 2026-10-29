@@ -1378,6 +1378,51 @@ fn table_pair(
                     }
                 }
             }
+            table::Event::Computed {
+                col,
+                a: ea,
+                b: eb,
+                at,
+            } => {
+                let (sa2, sb2) = with_table();
+                let select = |e: &[ast::Tok], name: &[ast::Tok]| {
+                    let mut v = vec![synth(K::Word, "SELECT")];
+                    v.extend(e.iter().cloned());
+                    v.push(synth(K::Word, "FROM"));
+                    v.extend(name.iter().cloned());
+                    v
+                };
+                match same_stmt(
+                    &select(&ea, &ta.name_toks),
+                    &select(&eb, &tb.name_toks),
+                    ua,
+                    ub,
+                    sa2,
+                    sb2,
+                    &na,
+                    &nb,
+                ) {
+                    Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                    Same::No(class, rule, w) => {
+                        found = true;
+                        finding(
+                            out,
+                            rule,
+                            class,
+                            format!("Tables (A line {la}, B line {lb}) differ in the computed column {col}: {w}"),
+                            at,
+                            Vec::new(),
+                        );
+                    }
+                    Same::Unknown(w) => {
+                        decided = false;
+                        unknown(
+                            out,
+                            format!("the computed column {col} was not shown equal: {w}"),
+                        );
+                    }
+                }
+            }
             table::Event::Check {
                 what,
                 a: ea,

@@ -86,6 +86,8 @@ pub(crate) fn convert(
         trigger: None,
         seq_defaults: Vec::new(),
         table_cols: Vec::new(),
+        table_items: Vec::new(),
+        left_out_indexes: Vec::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -240,6 +242,10 @@ struct Cx<'a> {
     seq_defaults: Vec<(String, String)>,
     /// The columns of the table being created (lower case, unquoted).
     table_cols: Vec<String>,
+    /// The column list items of the table being created.
+    table_items: Vec<Vec<T>>,
+    /// Indexes the conversion left out (columnstore), lower case.
+    left_out_indexes: Vec<String>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -3457,6 +3463,16 @@ impl<'a> Cx<'a> {
                     ("TABLE" | "VIEW", None, _) => format!("{o} {obj}"),
                     ("PROCEDURE" | "FUNCTION", None, _) => format!("{o} {obj}"),
                     ("TABLE" | "VIEW", Some("COLUMN"), Some(c)) => format!("COLUMN {obj}.{c}"),
+                    ("TABLE", Some("INDEX"), Some(i))
+                        if !self.db2()
+                            && self
+                                .left_out_indexes
+                                .contains(&tsql_unquote(i.trim_matches('"')).to_ascii_lowercase()) =>
+                    {
+                        return no(format!(
+                            "sp_addextendedproperty on INDEX {i}: the conversion left the (columnstore) index out, so there is nothing to comment on"
+                        ))
+                    }
                     ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
                         format!("INDEX {schema}.{i}")
                     }
@@ -3934,10 +3950,30 @@ impl<'a> Cx<'a> {
                     .then(|| tsql_unquote(&item[f].s).to_ascii_lowercase())
             })
             .collect();
+        self.table_items = split_commas(&ts[open + 1..close])
+            .into_iter()
+            .map(<[T]>::to_vec)
+            .collect();
         let mut names = Vec::new();
         let mut indexes = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
             if sig(item).first().is_some_and(|&f| item[f].is("INDEX")) && !temp {
+                // `INDEX name CLUSTERED COLUMNSTORE` only stores the rows
+                // column by column: no key, no order, nothing enforced.
+                let words: Vec<&T> = sig(item).into_iter().map(|k| &item[k]).collect();
+                if !self.db2()
+                    && matches!(words.as_slice(), [_, n, c, s]
+                        if matches!(n.k, IDENT | QUOTED_IDENT) && c.is("CLUSTERED") && s.is("COLUMNSTORE"))
+                {
+                    self.step_ts("tsql.table.columnstore", item);
+                    self.left_out_indexes
+                        .push(tsql_unquote(&words[1].s).to_ascii_lowercase());
+                    self.note(Status::Converted, "tsql.table.columnstore", &format!(
+                        "The clustered columnstore index {} is left out: PostgreSQL has no columnstore storage, and the index has no key, orders nothing and enforces nothing, so no result depends on it. Statements that name the index (a comment on it, ALTER INDEX) have no counterpart.",
+                        words[1].s
+                    ));
+                    continue;
+                }
                 indexes.push(self.inline_index(item, &name_t)?);
                 continue;
             }
@@ -4333,6 +4369,18 @@ impl<'a> Cx<'a> {
         while e.len() > 2 && e[0].k == L_PAREN && matching(e, 0) == Some(e.len() - 1) {
             e = trimmed(&e[1..e.len() - 1]);
         }
+        if let Some((ty, expr)) = self.computed_concat(e, it[as_at].pos.0)? {
+            self.step_ts("tsql.table.computed-concat", &it[as_at..]);
+            self.note(Status::Assumptions, "ASM-COMPUTED-STORED", &format!(
+                "A computed CONCAT column (first: {0}) becomes a STORED generated column: CONCAT reads a NULL part as an empty string, so each column part becomes COALESCE(part, ''), and the column has the type SQL Server derives for the CONCAT. T-SQL computes a column that is not PERSISTED when the row is read, PostgreSQL when the row is written; CONCAT of strings cannot fail, so both give the same value. Both refuse a value written into it. Not the same: an INSERT without a column list skips the column in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                name.trim(),
+            ));
+            return Ok(format!(
+                "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
+                name.trim(),
+                if not_null { " NOT NULL" } else { "" }
+            ));
+        }
         let es = sig(e);
         if es.len() < 2 || !e[es[0]].is("CASE") || !e[*es.last().unwrap()].is("END") {
             return no(format!(
@@ -4424,6 +4472,91 @@ impl<'a> Cx<'a> {
             expr.trim(),
             if not_null { " NOT NULL" } else { "" }
         ))
+    }
+
+    /// `CONCAT(a, b, …)` of string literals and varying-string columns of
+    /// the table: the PostgreSQL type of the result SQL Server derives (the
+    /// parts' lengths added up, unbounded when one is `max`) and the
+    /// expression `COALESCE(col, '') || 'lit' || …`. `None` when `e` is not
+    /// a CONCAT; refused when a part is anything else, or when the result
+    /// is longer than 4,000 characters (SQL Server cuts it there).
+    fn computed_concat(&mut self, e: &[T], at: usize) -> R<Option<(String, String)>> {
+        let es = sig(e);
+        let is_concat = es.len() >= 3
+            && e[es[0]].is("CONCAT")
+            && e[es[1]].k == L_PAREN
+            && matching(e, es[1]) == Some(*es.last().unwrap());
+        if !is_concat {
+            return Ok(None);
+        }
+        const REASON: &str = "computed column: CONCAT of anything but string literals and varying-string columns of the table has no rule yet";
+        let args = split_commas(&e[es[1] + 1..*es.last().unwrap()]);
+        if args.len() < 2 {
+            return no(REASON);
+        }
+        let (mut parts, mut len, mut national) = (Vec::new(), Some(0u32), false);
+        for a in args {
+            let a = trimmed(a);
+            match a {
+                [t] if t.k == STRING => {
+                    let n = t.s.starts_with(['N', 'n']);
+                    let body = t.s[usize::from(n)..].trim_matches('\'').replace("''", "'");
+                    national |= n;
+                    len = len.map(|l| l + body.encode_utf16().count() as u32);
+                    parts.push(self.expr(a).trim().to_string());
+                }
+                [t] if matches!(t.k, IDENT | QUOTED_IDENT) && !t.s.starts_with('@') => {
+                    let key = tsql_unquote(&t.s).to_ascii_lowercase();
+                    let ty: Vec<T> = self
+                        .table_items
+                        .iter()
+                        .find_map(|item| {
+                            let s = sig(item);
+                            let f = *s.first()?;
+                            (tsql_unquote(&item[f].s).to_ascii_lowercase() == key
+                                && !constraint_item(&item[f]))
+                            .then(|| s[1..].iter().map(|&k| item[k].clone()).collect())
+                        })
+                        .ok_or_else(|| No(REASON.into()))?;
+                    // `nvarchar(n)`, `varchar(n)` or `… (max)`, then column options.
+                    let word = ty.first().map(|t| tsql_unquote(&t.s).to_ascii_lowercase());
+                    let n = match word.as_deref() {
+                        Some("nvarchar") => true,
+                        Some("varchar") => false,
+                        _ => return no(REASON),
+                    };
+                    let l = match ty.get(1..4) {
+                        Some([o, v, c]) if o.k == L_PAREN && c.k == R_PAREN => {
+                            if v.is("MAX") {
+                                None
+                            } else {
+                                Some(v.s.parse::<u32>().map_err(|_| No(REASON.into()))?)
+                            }
+                        }
+                        _ => return no(REASON),
+                    };
+                    national |= n;
+                    len = len.zip(l).map(|(x, y)| x + y);
+                    parts.push(format!("COALESCE({}, '')", self.expr(a).trim()));
+                }
+                _ => return no(REASON),
+            }
+        }
+        if len.is_some_and(|l| l > 4000) {
+            return no("computed column: CONCAT longer than 4,000 characters (SQL Server cuts the result there): no rule yet");
+        }
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-concat");
+        let ty = [
+            made(IDENT, if national { "nvarchar" } else { "varchar" }),
+            made(L_PAREN, "("),
+            match len {
+                Some(l) => made(NUMBER, &l.to_string()),
+                None => made(IDENT, "max"),
+            },
+            made(R_PAREN, ")"),
+        ];
+        let (ty, _, _) = self.ty(&ty)?;
+        Ok(Some((ty, parts.join(" || "))))
     }
 
     fn alter_table(&mut self, ts: &[T]) -> R<String> {
