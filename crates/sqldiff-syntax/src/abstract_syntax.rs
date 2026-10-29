@@ -1800,8 +1800,11 @@ impl<'a> Parser<'a> {
         };
         let s = match t.up.as_str() {
             "SELECT" | "VALUES" => Stmt::Select(Box::new(self.select()?)),
-            "WITH" if self.ext => Stmt::Select(Box::new(self.select()?)),
-            "WITH" => return Err("common table expressions are not supported".into()),
+            "WITH" => match self.with_update()? {
+                Some(u) => u,
+                None if self.ext => Stmt::Select(Box::new(self.select()?)),
+                None => return Err("common table expressions are not supported".into()),
+            },
             "INSERT" => self.insert()?,
             "UPDATE" => self.update()?,
             "DELETE" => self.delete()?,
@@ -1985,6 +1988,119 @@ impl<'a> Parser<'a> {
             returning_into,
             on_conflict,
         })
+    }
+
+    /// `WITH ctes UPDATE …`: each CTE becomes a derived table where the
+    /// UPDATE's FROM list names it, which is what both T-SQL and PostgreSQL
+    /// do with a non-recursive CTE that only reads. `None` (nothing read)
+    /// when no UPDATE follows the list. An error when a CTE is named anywhere
+    /// else (the target, a subquery, another CTE's query, its own), so the
+    /// tree never holds a CTE name that would bind to a table.
+    fn with_update(&mut self) -> PResult<Option<Stmt>> {
+        let start = self.i;
+        self.expect_kw("WITH")?;
+        if self.is_kw("RECURSIVE") {
+            self.i = start;
+            return Ok(None);
+        }
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident()?;
+            let cols = if self.is_kind(K::LParen) {
+                self.col_list()?
+            } else {
+                Vec::new()
+            };
+            self.expect_kw("AS")?;
+            if self.is_kw("MATERIALIZED") || self.is_kw("NOT") {
+                return Err("MATERIALIZED common table expressions are not supported".into());
+            }
+            self.expect_kind(K::LParen)?;
+            let query = self.select()?;
+            self.expect_kind(K::RParen)?;
+            ctes.push(Cte { name, cols, query });
+            if !self.eat_kind(K::Comma) {
+                break;
+            }
+        }
+        if !self.is_kw("UPDATE") {
+            self.i = start;
+            return Ok(None);
+        }
+        let mut st = self.update()?;
+        let Stmt::Update { target, from, .. } = &mut st else {
+            unreachable!("update() returns an UPDATE")
+        };
+        let same = |x: &str, y: &str| {
+            if x.starts_with('"') || y.starts_with('"') {
+                x == y
+            } else {
+                x.eq_ignore_ascii_case(y)
+            }
+        };
+        if let [t] = &target[..] {
+            if ctes.iter().any(|c| same(&c.name, t)) {
+                return Err("UPDATE through a common table expression is not supported".into());
+            }
+        }
+        fn inline(
+            f: &mut From,
+            ctes: &[Cte],
+            same: &dyn Fn(&str, &str) -> bool,
+            hits: &mut [usize],
+        ) -> PResult<()> {
+            match f {
+                From::Join { left, right, .. } => {
+                    inline(left, ctes, same, hits)?;
+                    inline(right, ctes, same, hits)
+                }
+                From::Table { name, alias, hints } if name.len() == 1 => {
+                    let Some(j) = ctes.iter().position(|c| same(&c.name, &name[0])) else {
+                        return Ok(());
+                    };
+                    if !hints.is_empty() {
+                        return Err("table hints on a common table expression".into());
+                    }
+                    hits[j] += 1;
+                    let c = &ctes[j];
+                    *f = From::Sub {
+                        query: Box::new(c.query.clone()),
+                        alias: Some(alias.clone().unwrap_or_else(|| c.name.clone())),
+                        cols: c.cols.clone(),
+                    };
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        let mut hits = vec![0; ctes.len()];
+        for f in from.iter_mut() {
+            inline(f, &ctes, &same, &mut hits)?;
+        }
+        // Every name of a CTE outside a qualifier (`cte.col`): its
+        // definition and the FROM items just inlined, nothing else.
+        for (j, c) in ctes.iter().enumerate() {
+            let named = self.t[start..self.i]
+                .iter()
+                .enumerate()
+                .filter(|(k, t)| {
+                    let text = match t.kind {
+                        K::Word => t.text.clone(),
+                        K::Quoted => quoted_name(&t.text, self.d),
+                        _ => return false,
+                    };
+                    same(&text, &c.name)
+                        && !self.t.get(start + k + 1).is_some_and(|n| n.kind == K::Dot)
+                })
+                .count();
+            if named != 1 + hits[j] {
+                return Err(
+                    "a common table expression named outside the UPDATE's FROM list is not supported"
+                        .into(),
+                );
+            }
+        }
+        Ok(Some(st))
     }
 
     fn update(&mut self) -> PResult<Stmt> {
@@ -2183,6 +2299,43 @@ pub(crate) fn is_clause_start(up: &str) -> bool {
 /// A quoted identifier. When quoting changes its meaning (PostgreSQL folds
 /// unquoted names to lower case, Db2 for i to upper case), the name keeps a
 /// leading `"` so it never matches the unquoted spelling.
+/// Output column names (as written) that hold distinct values on every row
+/// of query `q`: the items of a GROUP BY whose keys are all plain columns
+/// the query also returns. NULLs group together, and the grouping compares
+/// values as the dialect's own `=` does, so a row of another table meets at
+/// most one row of `q` through equalities on those columns.
+pub fn group_key(q: &Select) -> Option<Vec<String>> {
+    if q.group_by.is_empty() || !q.set_ops.is_empty() || q.values.is_some() || q.for_json {
+        return None;
+    }
+    // A `"`-marked name keeps its case (see `quoted_name`).
+    let norm = |p: &[String]| -> Vec<String> {
+        p.iter()
+            .map(|x| {
+                if x.starts_with('"') {
+                    x.clone()
+                } else {
+                    x.to_lowercase()
+                }
+            })
+            .collect()
+    };
+    let mut key = Vec::new();
+    for g in &q.group_by {
+        let Expr::Name(gp) = g else { return None };
+        let out = q.items.iter().find_map(|it| match &it.expr {
+            Expr::Name(ip) if it.assign.is_none() && norm(ip) == norm(gp) => Some(
+                it.alias
+                    .clone()
+                    .unwrap_or_else(|| ip.last().cloned().unwrap_or_default()),
+            ),
+            _ => None,
+        })?;
+        key.push(out);
+    }
+    Some(key)
+}
+
 pub fn quoted_name(raw: &str, d: Dialect) -> String {
     let s = cst::unquote(raw);
     let significant = match d {
