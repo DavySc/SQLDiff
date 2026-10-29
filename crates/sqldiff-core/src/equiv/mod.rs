@@ -780,7 +780,31 @@ fn dynamic_sql(
                 continue;
             }
         };
-        if let Some(why) = dynamic::tsql_inner_refusal(&ttext) {
+        // `sp_executesql` parameters against `EXECUTE … USING` values.
+        let passed = match dynamic::exec_params(tn) {
+            Ok(x) => x,
+            Err(why) => {
+                unknown(out, &format!("its parameters are not read: {why}"));
+                continue;
+            }
+        };
+        let using = dynamic::pg_using(pn);
+        let names: Vec<String> = passed
+            .iter()
+            .flat_map(|x| x.params.iter().map(|q| q.name.clone()))
+            .collect();
+        if names.len() != using.len() {
+            unknown(
+                out,
+                &format!(
+                    "T-SQL passes {} parameter value(s) and PostgreSQL {}",
+                    names.len(),
+                    using.len()
+                ),
+            );
+            continue;
+        }
+        if let Some(why) = dynamic::tsql_inner_refusal_with(&ttext, &names) {
             unknown(out, &why);
             continue;
         }
@@ -794,6 +818,95 @@ fn dynamic_sql(
             unknown(out, "the PostgreSQL text is not one statement");
             continue;
         }
+        // With parameters, each text becomes the body of a procedure taking
+        // them, in order: T-SQL binds `@name` to the value passed, PostgreSQL
+        // `$n` to the n-th USING value, typed by it.
+        let (ttext, ptext) = match &passed {
+            None => {
+                if dynamic::pg_has_params(&pparse.syntax()) {
+                    unknown(
+                        out,
+                        "the PostgreSQL text reads $n parameters and EXECUTE passes none",
+                    );
+                    continue;
+                }
+                (ttext, ptext)
+            }
+            Some(ps) => {
+                let tside = call::Side {
+                    d: Dialect::Tsql,
+                    unit: if t_is_a { ua } else { ub },
+                    schema: if t_is_a { sa } else { sb },
+                    name: if t_is_a { &na } else { &nb },
+                    in_do: false,
+                };
+                let pside = call::Side {
+                    d: Dialect::Postgres,
+                    unit: if t_is_a { ub } else { ua },
+                    schema: if t_is_a { sb } else { sa },
+                    name: if t_is_a { &nb } else { &na },
+                    in_do: in_do(pn, Dialect::Postgres),
+                };
+                let mut typed = Vec::new();
+                for q in &ps.params {
+                    match ast::Parser::new(&q.ty, Dialect::Tsql).ty() {
+                        Ok(ty) => typed.push((q.name.clone(), ty)),
+                        Err(e) => {
+                            unknown(out, &format!("the type of @{} is not read: {e}", q.name));
+                            break;
+                        }
+                    }
+                }
+                if typed.len() != ps.params.len() {
+                    continue;
+                }
+                let ptypes = match call::dynamic_args(&typed, &ps.args, &using, &tside, &pside) {
+                    Ok((asms, types)) => {
+                        for x in asms {
+                            out.assume(x);
+                        }
+                        types
+                    }
+                    Err(why) => {
+                        unknown(out, &why);
+                        continue;
+                    }
+                };
+                let body = match dynamic::pg_bind_params(&pparse.syntax(), ps.params.len()) {
+                    Ok(b) => b,
+                    Err(why) => {
+                        unknown(out, &why);
+                        continue;
+                    }
+                };
+                let tdecl = ps
+                    .params
+                    .iter()
+                    .map(|q| format!("@{} {}", q.name, ast_text(&q.ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let pdecl = ptypes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| {
+                        let args = if ty.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", ty.args.join(", "))
+                        };
+                        format!("{}{} {}{args}", dynamic::PG_PARAM, i + 1, ty.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!("CREATE PROCEDURE dbo.sqldiff_dynamic {tdecl}\nAS\nBEGIN\n{ttext}\nEND;\n"),
+                    format!(
+                        "CREATE OR REPLACE PROCEDURE sqldiff_dynamic({pdecl})\nLANGUAGE plpgsql\nAS $sqldiff_dynamic$\nBEGIN\n{};\nEND;\n$sqldiff_dynamic$;\n",
+                        body.trim_end().trim_end_matches(';')
+                    ),
+                )
+            }
+        };
         let (ta, tb) = if t_is_a {
             (ttext.as_str(), ptext.as_str())
         } else {
@@ -832,7 +945,8 @@ fn dynamic_sql(
             unknown(out, &format!("inside its text, {why}"));
         }
         let settled = inner.findings.is_empty() && inner.unknown_reasons.is_empty();
-        let first = k == 0 && untouched(ua, at_a) && untouched(ub, at_b);
+        // A witness picks the parameters' values, which the routine fixes.
+        let first = k == 0 && passed.is_none() && untouched(ua, at_a) && untouched(ub, at_b);
         for f in inner.findings {
             if f.verdict == Verdict::Different && !first {
                 unknown(
