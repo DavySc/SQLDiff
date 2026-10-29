@@ -1,7 +1,7 @@
 -- SQLDiff probes for Db2 for i (IBM i 7.x only).
 --
 -- GENERATED from probes/db2i/probes.toml by probes/db2i/db2i_probes.py build.
--- Do not edit by hand. Probe set d7722f82a612.
+-- Do not edit by hand. Probe set 6a47f67e5b01.
 --
 -- What it does: creates the schema SQLDFPROBE (CREATE SCHEMA, so its tables are
 -- journaled), two tables and about 35 small procedures in it, runs them, and
@@ -108,7 +108,7 @@ BEGIN
   DECLARE V_NO_STATE CHAR(5);
   DECLARE V_NO_N INTEGER;
   CALL SQLDFPROBE.LOG_CALL('META-FORMAT', '00000', 1, 'probe set',
-    V_NO_STATE, V_NO_N, V_NO_N, V_NO_N, 'd7722f82a612');
+    V_NO_STATE, V_NO_N, V_NO_N, V_NO_N, '6a47f67e5b01');
 END;
 
 -- 2. Create the probe procedures. Each create is logged with its SQLSTATE,
@@ -4533,7 +4533,7 @@ BEGIN
     O_STATE, O_CODE, O_N1, O_N2, O_TEXT);
 END;
 
--- V32-DERIVED (V32, decisive): A derived table with ORDER BY … DESC FETCH
+-- V32-DERIVED (V32, decisive): A derived table with ORDER BY ... DESC FETCH
 --     FIRST 2 ROWS ONLY over 1, 2, 3: is it accepted, and does it keep 3 and 2
 --     (sum 5)?
 BEGIN
@@ -4581,7 +4581,7 @@ BEGIN
     O_STATE, O_CODE, O_N1, O_N2, O_TEXT);
 END;
 
--- V32-SCALAR (V32, decisive): A scalar subquery with ORDER BY … DESC FETCH
+-- V32-SCALAR (V32, decisive): A scalar subquery with ORDER BY ... DESC FETCH
 --     FIRST 1 ROWS ONLY: is it accepted and 3?
 BEGIN
   DECLARE V_STATE CHAR(5) DEFAULT '00000';
@@ -4604,7 +4604,7 @@ BEGIN
     O_STATE, O_CODE, O_N1, O_N2, O_TEXT);
 END;
 
--- V32-CTE (V32, decisive): A common table expression with ORDER BY … DESC
+-- V32-CTE (V32, decisive): A common table expression with ORDER BY ... DESC
 --     FETCH FIRST 2 ROWS ONLY: does it keep 3 and 2 (sum 5)?
 BEGIN
   DECLARE V_STATE CHAR(5) DEFAULT '00000';
@@ -4628,7 +4628,8 @@ BEGIN
 END;
 
 -- V32-ORDER-ONLY (V32, decisive): A derived table with ORDER BY and no FETCH
---     FIRST (what TOP 100 PERCENT … ORDER BY leaves): is it accepted (sum 6)?
+--     FIRST (what TOP 100 PERCENT ... ORDER BY leaves): is it accepted (sum
+--     6)?
 BEGIN
   DECLARE V_STATE CHAR(5) DEFAULT '00000';
   DECLARE V_CODE INTEGER DEFAULT 0;

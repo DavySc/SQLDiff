@@ -79,7 +79,7 @@ review = ["crates/sqldiff-core/src/equiv/canon.rs", "eval/casts/README.md"]
 
 [[fact]]
 id = "V32"
-title = "ORDER BY and FETCH FIRST n ROWS ONLY below the outer query (subquery, derived table, CTE, INSERT … SELECT, view), and a NULL row count"
+title = "ORDER BY and FETCH FIRST n ROWS ONLY below the outer query (subquery, derived table, CTE, INSERT ... SELECT, view), and a NULL row count"
 review = ["crates/sqldiff-convert/src/tsql/paging.rs", "docs/convert-mode.md"]
 
 [[fact]]
