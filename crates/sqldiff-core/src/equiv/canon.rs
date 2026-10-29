@@ -50,6 +50,14 @@ pub mod asm {
         "ASM-UNTYPED-NONCHAR",
         "Values whose type is unknown (no catalog) are not character strings, real (single precision), T-SQL tinyint or decimals of 38 digits, so comparison and arithmetic mean the same on both sides",
     );
+    pub const DATEADD_RANGE: (&str, &str) = (
+        "ASM-DATEADD-RANGE",
+        "DATEADD results stay within the range of their type: T-SQL raises an error past 9999-12-31 (or before 0001-01-01), where PostgreSQL returns the date",
+    );
+    pub const DATEADD_YEAR_END: (&str, &str) = (
+        "ASM-DATEADD-YEAR-END",
+        "T-SQL DATEADD clamps years to the month end as it does months (2024-02-29 + 1 year = 2025-02-28), as PostgreSQL does; Microsoft documents the rule for months only",
+    );
     pub const UNTYPED_CAST: (&str, &str) = (
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
@@ -1096,6 +1104,17 @@ impl<'a> Canon<'a> {
                 (n("bytes", vec![a(hex)]), None)
             }
             Expr::Cast(x, ty) => {
+                if let Expr::Bin(op, l, r) = x.as_ref() {
+                    if self.d == Dialect::Postgres
+                        && op == "+"
+                        && ty.name.eq_ignore_ascii_case("DATE")
+                        && ty.args.is_empty()
+                    {
+                        if let Some(t) = self.pg_date_add(l, r, true)? {
+                            return Ok(t);
+                        }
+                    }
+                }
                 let dst = Ty::from_type(ty, self.d, true);
                 // A string literal cast to a type whose conversion is modelled
                 // stands for the value it converts to ('12' as int is 12 on
@@ -1594,6 +1613,15 @@ impl<'a> Canon<'a> {
                     return self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty));
                 }
             }
+            (Dialect::Tsql, "dateadd") if argc == 3 && plain => {
+                if let Some(field) = tsql_datepart(&c.args[0]) {
+                    let k = self.expr(&c.args[1])?;
+                    let d = self.expr(&c.args[2])?;
+                    if let Some(t) = self.date_add(field, k, d) {
+                        return Ok(t);
+                    }
+                }
+            }
             // IIF is shorthand for this CASE; SQL Server rewrites it so.
             (Dialect::Tsql, "iif") if argc == 3 && plain => {
                 let [c0, x, y] = [0, 1, 2].map(|k| c.args[k].clone());
@@ -1770,7 +1798,92 @@ impl<'a> Canon<'a> {
         })
     }
 
+    /// `d + n` (a number of days) or `d + make_interval(…)` in PostgreSQL,
+    /// as the `date-add` T-SQL DATEADD lowers to. `to_date`: the sum is
+    /// cast to date, which turns PostgreSQL's timestamp result of a date
+    /// plus an interval back into a date. `None` for any other sum.
+    fn pg_date_add(&mut self, l: &Expr, r: &Expr, to_date: bool) -> R<Option<(Term, Option<Ty>)>> {
+        let interval = match r {
+            Expr::Call(c) if is_make_interval(c) => Some(c),
+            _ => None,
+        };
+        // Only these two shapes; anything else is lowered as it was.
+        if interval.is_none() && to_date {
+            return Ok(None);
+        }
+        let d = self.expr(l)?;
+        let is_date = d.1.is_some_and(|t| t.fam == Fam::Date);
+        let (field, k) = match interval {
+            Some(c) => {
+                // Exactly one amount other than a zero literal.
+                let given: Vec<usize> = (0..c.args.len())
+                    .filter(|&i| !is_zero_literal(&c.args[i]))
+                    .collect();
+                let [i] = given.as_slice() else {
+                    return Ok(None);
+                };
+                // date + interval is a timestamp: only its cast back to date
+                // is DATEADD on a date.
+                if is_date != to_date {
+                    return Ok(None);
+                }
+                (MAKE_INTERVAL_FIELDS[*i], self.expr(&c.args[*i])?)
+            }
+            None if is_date => ("days", self.expr(r)?),
+            None => return Ok(None),
+        };
+        Ok(self.date_add(field, k, d))
+    }
+
+    /// DATEADD of `k` `field`s (`years` … `secs`, PostgreSQL's
+    /// make_interval names) to `d`, where both engines give the same
+    /// value: `k` an integer of at most 32 bits (T-SQL converts other
+    /// numbers to int, truncating; PostgreSQL's secs keeps a fraction), and
+    /// `d` a date (whole days or longer; T-SQL rejects smaller parts) or a
+    /// timestamp without T-SQL's datetime/smalldatetime ticks, which round.
+    /// Both add months by moving a day the month lacks to its last day,
+    /// and add hours, minutes and seconds exactly. The result has `d`'s
+    /// type, as in T-SQL.
+    fn date_add(
+        &mut self,
+        field: &str,
+        k: (Term, Option<Ty>),
+        d: (Term, Option<Ty>),
+    ) -> Option<(Term, Option<Ty>)> {
+        let (kt, kty) = k;
+        let (dt, dty) = d;
+        let kty = kty?;
+        if kty.fam != Fam::Int || kty.len.map_or(true, |b| b > 32) {
+            return None;
+        }
+        let dty = dty?;
+        let ok = match dty.fam {
+            Fam::Date => matches!(field, "years" | "months" | "weeks" | "days"),
+            Fam::Timestamp => dty.scale.is_none(),
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+        // A week is seven days on both sides; a literal count is folded so
+        // `d + 14` meets two weeks.
+        let (field, kt) = match (field, int_literal(&kt)) {
+            ("weeks", Some(w)) => ("days", n("num", vec![a((w * 7).to_string())])),
+            _ => (field, kt),
+        };
+        self.assume(asm::DATEADD_RANGE);
+        if field == "years" {
+            self.assume(asm::DATEADD_YEAR_END);
+        }
+        Some((n("date-add", vec![a(field), kt, dt]), Some(dty)))
+    }
+
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
+        if self.d == Dialect::Postgres && op == "+" {
+            if let Some(t) = self.pg_date_add(l, r, false)? {
+                return Ok(t);
+            }
+        }
         if op == "AND" || op == "OR" {
             let mut parts = Vec::new();
             for side in [l, r] {
@@ -4560,4 +4673,61 @@ fn empty_query(q: &Select) -> Option<Vec<String>> {
         }] if plain && is_false && hints.is_empty() => Some(name.clone()),
         _ => None,
     }
+}
+
+/// PostgreSQL's make_interval parameters in order (the parser writes named
+/// arguments out by position); each one left out is zero.
+const MAKE_INTERVAL_FIELDS: [&str; 7] =
+    ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+
+fn is_make_interval(c: &Call) -> bool {
+    let builtin = match c.name.as_slice() {
+        [f] => f,
+        [s, f] if s.eq_ignore_ascii_case("pg_catalog") => f,
+        _ => return false,
+    };
+    builtin.eq_ignore_ascii_case("make_interval")
+        && (1..=MAKE_INTERVAL_FIELDS.len()).contains(&c.args.len())
+        && !c.distinct
+        && c.order.is_empty()
+        && !c.star
+        && !c.over
+        && !c.within_group
+}
+
+fn is_zero_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Num(s) if s.parse::<f64>().is_ok_and(|v| v == 0.0))
+}
+
+/// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
+/// amounts round (milliseconds and smaller) and quarters have none.
+fn tsql_datepart(e: &Expr) -> Option<&'static str> {
+    let Expr::Name(p) = e else {
+        return None;
+    };
+    let [part] = p.as_slice() else {
+        return None;
+    };
+    // DATEADD adds days for dayofyear and weekday, as for day.
+    Some(match lc(part).as_str() {
+        "year" | "yy" | "yyyy" => "years",
+        "month" | "mm" | "m" => "months",
+        "week" | "wk" | "ww" => "weeks",
+        "dayofyear" | "dy" | "y" | "day" | "dd" | "d" | "weekday" | "dw" | "w" => "days",
+        "hour" | "hh" => "hours",
+        "minute" | "mi" | "n" => "mins",
+        "second" | "ss" | "s" => "secs",
+        _ => return None,
+    })
+}
+
+/// The value of an integer literal term (`num` or a negated one).
+fn int_literal(t: &Term) -> Option<i64> {
+    if t.is("neg") {
+        return t.kid(0).and_then(int_literal).map(|v| -v);
+    }
+    if !t.is("num") {
+        return None;
+    }
+    t.kid(0).and_then(Term::atom)?.parse().ok()
 }
