@@ -2305,6 +2305,15 @@ impl<'a> Cx<'a> {
         if hits.len() > 1 {
             return Err(why("the target matches more than one FROM table"));
         }
+        for st in chains.iter().flatten() {
+            if let Some(v) = st.leaf.name[..].first().and_then(|n| n.strip_prefix('@')) {
+                if !self.tables.contains_key(v) {
+                    return Err(why(&format!(
+                        "the table variable `@{v}` was not converted to a table"
+                    )));
+                }
+            }
+        }
         if chains
             .iter()
             .flatten()
@@ -2522,12 +2531,20 @@ impl<'a> Cx<'a> {
                         }
                     }
                 }
-                let unique = match self.update_cte(&st.leaf.name) {
-                    // A CTE: its GROUP BY columns, matched in full.
-                    Some(key) => key.is_some_and(|k| k.iter().all(|c| cols.contains(c))),
-                    None => self.has_unique_key(&st.leaf.name, &cols),
+                // A CTE or a derived table: its GROUP BY columns, matched
+                // in full; a table: a key of the catalog.
+                let grouped = |key: Option<&Vec<String>>| {
+                    key.is_some_and(|k| k.iter().all(|c| cols.contains(c)))
                 };
-                if st.leaf.table && unique {
+                let unique = if !st.leaf.table {
+                    derived_query(st.leaf.toks).is_some_and(|q| grouped(cte_group_key(q).as_ref()))
+                } else {
+                    match self.update_cte(&st.leaf.name) {
+                        Some(key) => grouped(key),
+                        None => self.has_unique_key(&st.leaf.name, &cols),
+                    }
+                };
+                if unique {
                     bound.push(k);
                     progress = true;
                 }
@@ -6175,13 +6192,13 @@ fn join_steps(ts: &[T]) -> Result<Vec<Step<'_>>, String> {
                 }
                 steps.push(Step {
                     kind,
-                    leaf: leaf(&ts[a..o])?,
+                    leaf: leaf_or_var(&ts[a..o])?,
                     on: Some(&ts[o + 1..b]),
                 });
             }
             (None, false) => steps.push(Step {
                 kind,
-                leaf: leaf(&ts[a..b])?,
+                leaf: leaf_or_var(&ts[a..b])?,
                 on: None,
             }),
             (None, true) => return Err("a JOIN without its ON".into()),
@@ -6400,6 +6417,36 @@ fn join_chain<'a>(
 
 /// One FROM table: `name [[AS] alias] [WITH (hints)]` or a derived table
 /// `(SELECT …) [AS] alias`.
+/// `leaf`, or a table variable (`@t [AS] alias`), named `@t` (lower case).
+/// Whether the variable became a table is the caller's to check.
+fn leaf_or_var(ts: &[T]) -> Result<Leaf<'_>, String> {
+    let s = sig(ts);
+    match s.first().map(|&i| &ts[i]) {
+        Some(v) if v.k == VARIABLE && !v.s.starts_with("@@") => {
+            let mut k = 1;
+            if s.get(k).is_some_and(|&i| ts[i].is("AS")) {
+                k += 1;
+            }
+            let alias = match s.get(k).map(|&i| &ts[i]) {
+                None => None,
+                Some(t) if t.k == IDENT && !t.is("WITH") => Some(t.s.to_ascii_lowercase()),
+                Some(t) if t.k == QUOTED_IDENT => Some(tsql_unquote(&t.s).to_ascii_lowercase()),
+                Some(_) => return leaf(ts),
+            };
+            if s.len() != k + usize::from(alias.is_some()) {
+                return leaf(ts);
+            }
+            Ok(Leaf {
+                toks: ts,
+                name: vec![v.s.to_ascii_lowercase()],
+                alias,
+                table: true,
+            })
+        }
+        _ => leaf(ts),
+    }
+}
+
 fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
     let bad =
         || Err("a FROM item that is not a table, a derived table or a table function".to_string());
@@ -6496,6 +6543,17 @@ fn cte_bodies(ts: &[T]) -> Option<Vec<(String, std::ops::Range<usize>)>> {
         }
     }
     (bodies.len() == names.len()).then(|| names.into_iter().zip(bodies).collect())
+}
+
+/// The query of a derived table `( SELECT … ) [AS] alias`, between the
+/// parentheses.
+fn derived_query(ts: &[T]) -> Option<&[T]> {
+    let open = *sig(ts).first()?;
+    if ts[open].k != L_PAREN {
+        return None;
+    }
+    let close = matching(ts, open)?;
+    Some(&ts[open + 1..close])
 }
 
 /// The GROUP BY key a CTE's query returns (`group_key`), folded.
