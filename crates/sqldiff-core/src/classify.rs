@@ -334,6 +334,112 @@ pub fn is_temp_target(parts: &[String]) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case("pg_temp"))
 }
 
+/// The temporary table a T-SQL table variable becomes when converted
+/// (PostgreSQL `pg_temp.<name>`, Db2 for i `SESSION.<name>`). The converter
+/// writes it and the engine expects it, so the two pair up.
+///
+/// `tv_<routine>_<variable>` inside a routine, `tv__<variable>` in a script.
+/// The routine part (letters and digits of the routine's own name) keeps a
+/// called routine from replacing its caller's table: both live in the one
+/// session-wide temporary schema. Names over 63 bytes (PostgreSQL's limit)
+/// are cut and end in a hash of the whole name.
+pub fn table_variable_table(routine: Option<&str>, variable: &str) -> String {
+    let v = snake_case(variable.trim_start_matches('@'));
+    let r = routine.map_or(String::new(), |r| {
+        let last = r.rsplit('.').next().unwrap_or(r);
+        let key: String = last
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
+        if key.is_empty() {
+            format!("{:08x}", fnv1a(r))
+        } else {
+            key
+        }
+    });
+    let name = format!("tv_{r}_{v}");
+    if name.len() <= 63 {
+        return name;
+    }
+    let cut = (0..=54)
+        .rev()
+        .find(|&i| name.is_char_boundary(i))
+        .unwrap_or(0);
+    format!("{}_{:08x}", &name[..cut], fnv1a(&name))
+}
+
+/// Lower-case names of the temporary tables `root` names as `pg_temp.x` or
+/// `SESSION.x`: where a converted T-SQL table variable may have gone.
+pub fn temp_table_names(root: &SyntaxNode) -> std::collections::HashSet<String> {
+    let toks: Vec<SyntaxToken> = ast::sig_tokens(root).collect();
+    toks.windows(3)
+        .filter(|w| {
+            (w[0].text().eq_ignore_ascii_case("pg_temp")
+                || w[0].text().eq_ignore_ascii_case("SESSION"))
+                && w[1].kind() == SyntaxKind::DOT
+                && w[2].kind() == SyntaxKind::IDENT
+        })
+        .map(|w| w[2].text().to_lowercase())
+        .collect()
+}
+
+/// A T-SQL ROLLBACK in `node`, other than in a CATCH that only rolls back
+/// and rethrows (`IF @@TRANCOUNT > 0 ROLLBACK; THROW;`): that error ends the
+/// routine, and its table variables with it. A PostgreSQL ROLLBACK empties
+/// the temporary table a table variable became, where T-SQL keeps the rows.
+pub fn rolls_back(node: &SyntaxNode) -> bool {
+    node.descendants()
+        .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+        .filter(|n| ast::starts_with_kw(n, "ROLLBACK"))
+        .any(|n| {
+            !n.ancestors()
+                .any(|a| a.kind() == SyntaxKind::CATCH_BLOCK && rollback_rethrow(&a))
+        })
+}
+
+/// CATCH body that is only `IF @@TRANCOUNT > 0 ROLLBACK [TRAN]` and `THROW;`.
+pub fn rollback_rethrow(catch: &SyntaxNode) -> bool {
+    let words: Vec<String> = ast::sig_tokens(catch)
+        .map(|t| t.text().to_ascii_uppercase())
+        .filter(|w| {
+            !matches!(
+                w.as_str(),
+                ";" | "BEGIN" | "END" | "CATCH" | "TRAN" | "TRANSACTION"
+            )
+        })
+        .collect();
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    matches!(
+        w.as_slice(),
+        ["IF", "@@TRANCOUNT", ">", "0", "ROLLBACK", "THROW"] | ["ROLLBACK", "THROW"]
+    )
+}
+
+/// `CamelCase` → `camel_case`, as the converter names variables.
+fn snake_case(name: &str) -> String {
+    let mut out = String::new();
+    let cs: Vec<char> = name.chars().collect();
+    for (i, &c) in cs.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev = cs[i - 1];
+            let next_lower = cs.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if prev.is_lowercase() || prev.is_ascii_digit() || (prev.is_uppercase() && next_lower) {
+                out.push('_');
+            }
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// 32-bit FNV-1a: stable across builds and platforms, unlike `DefaultHasher`.
+fn fnv1a(s: &str) -> u32 {
+    s.bytes().fold(0x811c_9dc5, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
 /// Name used to pair objects across dialects: last part, upper case, without `_`.
 pub fn pairing_key(parts: &[String]) -> String {
     parts

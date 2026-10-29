@@ -3,7 +3,7 @@
 //! `yyyymmdd hh:mm:ss` as a date or timestamp, fact V33), and the engine
 //! proves the assigned values equal. PostgreSQL keeps the literal.
 
-use sqldiff_convert::{convert, Conversion};
+use sqldiff_convert::{convert, Conversion, Status};
 use sqldiff_core::Dialect;
 
 const PROC: &str = "CREATE PROCEDURE dbo.P
@@ -83,8 +83,68 @@ fn the_engine_proves_the_db2_values() {
 }
 
 #[test]
-fn postgres_keeps_the_literal() {
+fn postgres_keeps_a_literal_without_a_seventh_digit() {
     let c = run(Dialect::Postgres);
     assert!(c.output.contains("v_c := '20200101';"), "{}", c.output);
     assert!(!rules(&c).contains(&"ASM-FACT-V33"));
+}
+
+const SEVEN: &str = "CREATE PROCEDURE dbo.Q
+AS
+BEGIN
+    DECLARE @EndOfTime datetime2(7) = '99991231 23:59:59.9999999';
+    DECLARE @t datetime2 = '2020-01-01 10:00:00.1234567';
+    DECLARE @r datetime2(3);
+    SET @EndOfTime = '9999-12-31 23:59:59.9999999';
+    SET @r = '9999-12-31 23:59:59.9999999';
+END
+";
+
+/// PostgreSQL keeps 6 fraction digits and rounds a 7th, so T-SQL's end of
+/// time into a datetime2(7) variable is written with 6 (Davy, 2026-10-29)
+/// under ASM-END-OF-TIME, and the engine shows it equal under that
+/// assumption and ASM-FRACTIONAL-SECONDS. Other 7-digit literals stay.
+#[test]
+fn postgres_writes_the_end_of_time_with_six_digits_under_an_assumption() {
+    let c = convert(SEVEN, Dialect::Tsql, Dialect::Postgres).unwrap();
+    for line in [
+        "v_end_of_time := '9999-12-31 23:59:59.999999';",
+        "v_t := '2020-01-01 10:00:00.1234567';",
+        // datetime2(3): T-SQL rounds into 10000-01-01 too; kept.
+        "v_r := '9999-12-31 23:59:59.9999999';",
+    ] {
+        assert!(c.output.contains(line), "missing {line}\n{}", c.output);
+    }
+    let unit = |line: usize| {
+        c.units
+            .iter()
+            .filter(|u| u.src.line == line)
+            .map(|u| {
+                (
+                    u.status,
+                    u.notes.iter().map(|n| n.rule.as_str()).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    for line in [4, 7] {
+        let us = unit(line);
+        assert!(!us.is_empty(), "line {line}");
+        assert!(
+            us.iter().all(|(s, _)| *s == Status::Assumptions),
+            "line {line}: {us:?}"
+        );
+        assert!(
+            us.iter().any(|(_, r)| r.contains(&"ASM-END-OF-TIME")),
+            "line {line}: {us:?}"
+        );
+    }
+    // Not the sentinel: not rewritten, and not shown equal.
+    for line in [5, 8] {
+        let us = unit(line);
+        assert!(
+            us.iter().all(|(s, _)| *s > Status::Assumptions),
+            "line {line}: {us:?}"
+        );
+    }
 }

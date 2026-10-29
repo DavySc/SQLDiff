@@ -482,6 +482,13 @@ fact = "The tools that read the property."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
+id = "ASM-END-OF-TIME"
+statement = "T-SQL's end of time 9999-12-31 23:59:59.9999999, written for PostgreSQL as 23:59:59.999999, is only an open-end sentinel: compared with values converted by the same rule, and data moved from SQL Server truncates its 7th digit rather than rounding it to 10000-01-01."
+discharge = "deployment"
+fact = "The value is used only as an open-end sentinel, and data was moved with the 7th digit truncated."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-FACT-*"
 statement = "A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2)."
 discharge = "nothing"
@@ -490,10 +497,10 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/paging.rs", "s
 
 [[assumption]]
 id = "ASM-FRACTIONAL-SECONDS"
-statement = "Time values need at most 6 fractional digits (T-SQL keeps 7, the target rounds the last)."
+statement = "No value depends on the 7th fraction digit of the seconds: datetime2(7) and time(7) values are whole microseconds (T-SQL keeps 7 digits, the target 6 and rounds the last)."
 discharge = "deployment"
 fact = "The data has at most microsecond precision."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/table.rs"]
 
 [[assumption]]
 id = "ASM-HAND-WRITTEN"
@@ -885,10 +892,10 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-TABLE-VARIABLE"
-statement = "A table variable converted to a job-scoped temporary table is not read after the batch that filled it."
+statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"
-fact = "How the job runs the code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+fact = "How the job or session runs the code, and what the routines it calls do."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMP-TABLE"
