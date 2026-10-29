@@ -68,7 +68,11 @@ fn select_rewrites() {
         "{out}"
     );
     assert!(out.contains("FROM Items\nWHERE c = 1"), "{out}");
-    assert!(out.trim_end().ends_with("ORDER BY n\nLIMIT 10;"), "{out}");
+    assert!(
+        out.trim_end()
+            .ends_with("ORDER BY n NULLS FIRST\nLIMIT 10;"),
+        "{out}"
+    );
     // The rules need assumptions; the engine does not check table hints, so
     // it cannot confirm them either.
     assert_eq!(rule_status(u), Status::Assumptions);
@@ -308,7 +312,7 @@ fn top_in_parentheses_with_assignment() {
     let c = tsql(src);
     assert!(
         c.output.contains(
-            "FOR sqldiff_r IN SELECT Name AS sqldiff_c1 FROM t ORDER BY Name LIMIT (1) LOOP\n      v_n := sqldiff_r.sqldiff_c1;\n    END LOOP;"
+            "FOR sqldiff_r IN SELECT Name AS sqldiff_c1 FROM t ORDER BY Name NULLS FIRST LIMIT 1 LOOP\n      v_n := sqldiff_r.sqldiff_c1;\n    END LOOP;"
         ),
         "{}",
         c.output

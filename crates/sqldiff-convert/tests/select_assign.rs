@@ -49,7 +49,7 @@ fn several_targets_and_expressions_and_top_with_order() {
     let c = convert(src, Dialect::Postgres);
     assert!(
         c.output.contains(
-            "FOR sqldiff_r IN SELECT x + 1 AS sqldiff_c1, y AS sqldiff_c2 FROM t ORDER BY z LIMIT 1 LOOP\n      v_a := sqldiff_r.sqldiff_c1;\n      v_b := sqldiff_r.sqldiff_c2;\n    END LOOP;"
+            "FOR sqldiff_r IN SELECT x + 1 AS sqldiff_c1, y AS sqldiff_c2 FROM t ORDER BY z NULLS FIRST LIMIT 1 LOOP\n      v_a := sqldiff_r.sqldiff_c1;\n      v_b := sqldiff_r.sqldiff_c2;\n    END LOOP;"
         ),
         "{}",
         c.output
