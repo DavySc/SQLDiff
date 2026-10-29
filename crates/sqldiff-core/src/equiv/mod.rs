@@ -253,8 +253,8 @@ pub fn compare(
         }
         return out;
     }
-    let pairs =
-        script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
+    let pairs = script::segment_pairs(a, b, anchors, &mut out)
+        .unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
@@ -2937,12 +2937,27 @@ fn pair_items(
                     } else {
                         (&na, &gaps[0][x.gap])
                     };
+                    // With a trace the gap was written from this very
+                    // statement: the reason names the gap's line, so it
+                    // lands on the output piece that left the statement
+                    // uncompared, not on every piece written from it (a
+                    // declaration moved to the top of the block is compared
+                    // on its own).
+                    if is_a && !anchors.is_empty() {
+                        format!(
+                            "{gname} line {}: the statement at {name} line {} is not paired: its counterpart may be in this {}, which is not compared",
+                            g.line,
+                            line(side, &it.nodes),
+                            g.what
+                        )
+                    } else {
                     format!(
                         "{name} line {}: statement is not paired: its counterpart may be in {} at {gname} line {}, which is not compared",
                         line(side, &it.nodes),
                         g.what,
                         g.line
                     )
+                    }
                 }
                 None if moved.contains(&(is_a, i)) => format!(
                     "{name} line {}: statement is not paired: the conversion put it in another order among the statements it is paired with",
