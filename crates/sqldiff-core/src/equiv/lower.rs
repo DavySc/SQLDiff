@@ -127,6 +127,11 @@ pub struct Ctl {
     /// The condition for IF and WHILE (the IF or loop for END and ELSE, the
     /// statement for the others), for locations.
     pub node: SyntaxNode,
+    /// Where a conversion's trace finds it: the condition of the IF or loop
+    /// it belongs to (an ELSE and END close the IF of the condition before
+    /// them, so a T-SQL `ELSE IF` and the `ELSIF` it became sit in the same
+    /// trace unit), the statement for the others.
+    pub anchor: SyntaxNode,
     /// The number of data statements before it.
     pub after: usize,
 }
@@ -278,6 +283,14 @@ pub fn lower(a: &Analyzed) -> Unit {
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::ROUTINE)
         .collect();
+    // PostgreSQL DO blocks beside one routine are statements outside it, as
+    // a Db2 for i compound statement is (a converted script's setup batch).
+    let named: Vec<SyntaxNode> = routines
+        .iter()
+        .filter(|r| !(d == Dialect::Postgres && is_do(r)))
+        .cloned()
+        .collect();
+    let routines = if named.len() == 1 { named } else { routines };
     match routines.as_slice() {
         [] => walk(&a.root, &mut u),
         [r] => {
@@ -356,6 +369,13 @@ pub fn lower(a: &Analyzed) -> Unit {
     }
     place_txn(&mut u);
     u
+}
+
+/// Whether a PostgreSQL routine node is a DO block.
+fn is_do(r: &SyntaxNode) -> bool {
+    cst::header_tokens(r)
+        .first()
+        .is_some_and(|t| t.text().eq_ignore_ascii_case("DO"))
 }
 
 /// One part of a script that runs as a whole: a T-SQL batch that needs
@@ -855,9 +875,14 @@ fn inside_flow(c: &SyntaxNode, u: &mut Unit, what: &str) {
 }
 
 fn mark(u: &mut Unit, kind: CtlKind, node: &SyntaxNode) {
+    mark_at(u, kind, node, node);
+}
+
+fn mark_at(u: &mut Unit, kind: CtlKind, node: &SyntaxNode, anchor: &SyntaxNode) {
     u.ctl.push(Ctl {
         kind,
         node: node.clone(),
+        anchor: anchor.clone(),
         after: u.stmts.len(),
     });
 }
@@ -899,26 +924,27 @@ fn if_stmt(c: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((c.clone(), "an IF statement".into()));
         return;
     }
-    let mut opened = 0;
+    // The conditions opened so far: an ELSE closes the branch of the last.
+    let mut opened: Vec<&SyntaxNode> = Vec::new();
     let mut cond: Option<&SyntaxNode> = None;
     for k in &kids {
         if k.kind() == CONDITION {
             cond = Some(k);
             continue;
         }
-        if opened > 0 {
-            mark(u, CtlKind::Else, k);
+        if let Some(&last) = opened.last() {
+            mark_at(u, CtlKind::Else, k, last);
         }
         if let Some(cn) = cond.take() {
             mark(u, CtlKind::If(condition(cn, u.dialect)), cn);
-            opened += 1;
+            opened.push(cn);
         }
         u.depth += 1;
         walk(k, u);
         u.depth -= 1;
     }
-    for _ in 0..opened {
-        mark(u, CtlKind::End, c);
+    for cn in opened.into_iter().rev() {
+        mark_at(u, CtlKind::End, c, cn);
     }
 }
 
@@ -961,7 +987,7 @@ fn loop_stmt(c: &SyntaxNode, u: &mut Unit) {
     walk(body, u);
     u.loops.pop();
     u.depth -= 1;
-    mark(u, CtlKind::End, c);
+    mark_at(u, CtlKind::End, c, cond);
 }
 
 /// BREAK / CONTINUE of the innermost loop: T-SQL `BREAK`, `CONTINUE`;
