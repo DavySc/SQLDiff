@@ -2235,6 +2235,9 @@ impl<'a> Cx<'a> {
                 trimmed(&ts[from..end]).to_vec()
             }
         };
+        if find_word(&ts[..o], 0, "WITH").is_some() || hinted(&ts[..o]) {
+            return Err(why("table hints on the target are not converted"));
+        }
         if name_parts(&target)
             .and_then(|p| p.last().cloned())
             .is_some_and(|n| n == "new" || n == "old")

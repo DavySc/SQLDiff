@@ -60,7 +60,11 @@ fn output_into_becomes_returning_into_an_insert() {
             c.report.unknown_reasons,
             c.report.findings
         );
-        assert!(u.notes.iter().any(|n| n.rule == "ASM-OUTPUT-INTO-TARGET"), "{:?}", u.notes);
+        assert!(
+            u.notes.iter().any(|n| n.rule == "ASM-OUTPUT-INTO-TARGET"),
+            "{:?}",
+            u.notes
+        );
     }
 }
 
@@ -76,7 +80,12 @@ fn output_into_a_table_variable_writes_its_temp_table() {
             && out.contains("SELECT item_id, qty FROM sqldiff_output;"),
         "{out}"
     );
-    assert!(u.status < Status::Unproven, "{:?}\n{:?}", u.notes, c.report.unknown_reasons);
+    assert!(
+        u.status < Status::Unproven,
+        "{:?}\n{:?}",
+        u.notes,
+        c.report.unknown_reasons
+    );
 }
 
 #[test]
@@ -97,6 +106,10 @@ fn other_output_clauses_are_refused() {
         (
             "UPDATE dbo.item SET qty = 0 OUTPUT inserted.qty + 1 INTO dbo.item_log (new_qty);",
             "an item other than",
+        ),
+        (
+            "DELETE dbo.item WITH (TABLOCK) OUTPUT deleted.item_id INTO dbo.item_log (item_id) WHERE qty = 0;",
+            "table hints",
         ),
         (
             "UPDATE i SET qty = 0 OUTPUT inserted.qty INTO dbo.item_log (new_qty) FROM dbo.item i JOIN dbo.item_log l ON l.item_id = i.item_id;",
