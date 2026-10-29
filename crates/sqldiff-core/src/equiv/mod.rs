@@ -1787,6 +1787,32 @@ fn ddl_stmts(
             unknown(out, e);
             continue;
         }
+        // `GRANT … ON name` names a table in PostgreSQL; on the T-SQL side
+        // it might as well be a function, a procedure or a sequence. Only a
+        // table the file creates or the catalog has is compared.
+        let grant_table = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {
+            let ddl::Ddl::Grant(g) = dd else {
+                return true;
+            };
+            let d = side.dialect();
+            let Ok(want) = ddl::stored_key(&g.object, d) else {
+                return false;
+            };
+            u.tables.iter().any(|(n, _)| {
+                table::parse(&ast::tokens(n), d)
+                    .ok()
+                    .and_then(|t| ddl::stored_key(&t.name, d).ok())
+                    .as_ref()
+                    == Some(&want)
+            }) || s.table_exact(want.0.as_deref(), &want.1).is_some()
+        };
+        if !grant_table(a, ua, sa, dx) || !grant_table(b, ub, sb, dy) {
+            unknown(
+                out,
+                "GRANT on an object that is not a table the file creates or the catalog has".into(),
+            );
+            continue;
+        }
         let table_of = |d: &ddl::Ddl| match d {
             ddl::Ddl::Index(i) => Some((i.table.clone(), i.table_toks.clone())),
             _ => None,

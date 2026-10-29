@@ -227,6 +227,41 @@ fn fetched_variables_are_not_read_after_the_loop() {
         ),
         "may be read after the cursor loop",
     );
+    // Read in an IF or WHILE condition before it is set again.
+    refused(
+        &t(
+            T_DECL,
+            &T_LOOP.replace(
+                "  INSERT INTO dbo.log (id, v) VALUES (0, @total);",
+                "  IF @v IS NULL INSERT INTO dbo.log (id, v) VALUES (0, @total);\n  SET @v = 0;",
+            ),
+        ),
+        &p(
+            P_OPEN,
+            &P_LOOP.replace(
+                "  INSERT INTO log (id, v) VALUES (0, v_total);",
+                "  IF v_v IS NULL THEN\n    INSERT INTO log (id, v) VALUES (0, v_total);\n  END IF;\n  v_v := 0;",
+            ),
+        ),
+        "may be read after the cursor loop",
+    );
+    refused(
+        &t(
+            T_DECL,
+            &T_LOOP.replace(
+                "  INSERT INTO dbo.log (id, v) VALUES (0, @total);",
+                "  WHILE @v IS NULL SET @total = 1;\n  SET @v = 0;",
+            ),
+        ),
+        &p(
+            P_OPEN,
+            &P_LOOP.replace(
+                "  INSERT INTO log (id, v) VALUES (0, v_total);",
+                "  WHILE v_v IS NULL LOOP\n    v_total := 1;\n  END LOOP;\n  v_v := 0;",
+            ),
+        ),
+        "may be read after the cursor loop",
+    );
 }
 
 #[test]

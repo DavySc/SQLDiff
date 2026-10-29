@@ -585,12 +585,35 @@ fn dead_after(end: &SyntaxNode, lp: &SyntaxNode, u: &Unit, name: &str) -> Result
     let end_at = end.text_range().end();
     let mentions = |t: &Tok| match d {
         Dialect::Tsql => t.kind == K::Var && t.text.eq_ignore_ascii_case(name),
-        _ => t.kind == K::Word && t.text.eq_ignore_ascii_case(name),
+        _ => {
+            (t.kind == K::Word && t.text.eq_ignore_ascii_case(name))
+                || (t.kind == K::Quoted && cst::unquote(&t.text).eq_ignore_ascii_case(name))
+        }
     };
-    let first = root
-        .descendants()
-        .filter(|x| x.kind() == SyntaxKind::STATEMENT && x.text_range().start() >= end_at)
-        .find(|x| words(x).iter().any(mentions));
+    // The first mention anywhere after the loop, an IF or WHILE condition
+    // included; it must lie in the statement that sets the variable again.
+    let at = words(&root)
+        .into_iter()
+        .find(|t| t.off >= usize::from(end_at) && mentions(t))
+        .map(|t| t.off);
+    let first = match at {
+        None => None,
+        Some(at) => {
+            let st = root
+                .descendants()
+                .filter(|x| {
+                    x.kind() == SyntaxKind::STATEMENT
+                        && x.text_range().start() >= end_at
+                        && usize::from(x.text_range().start()) <= at
+                        && at < usize::from(x.text_range().end())
+                })
+                .last();
+            if st.is_none() {
+                return stale();
+            }
+            st
+        }
+    };
     jumps(&root, lp, end, first.as_ref(), d).map_err(|why| {
         format!("{name} may be read after the cursor loop ({why}): T-SQL keeps the last row's value there, PostgreSQL's last FETCH sets it to NULL")
     })?;
