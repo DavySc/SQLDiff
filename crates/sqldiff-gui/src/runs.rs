@@ -39,6 +39,7 @@ use sqldiff_source::Resolved;
 use crate::browse;
 use crate::convert_review::{self, Review};
 use crate::packs::{self, LoadedPack};
+use crate::stored::{self, Stored};
 
 /// A tree conversion as the page asks for it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -835,6 +836,9 @@ pub struct Runs {
     history: Option<PathBuf>,
     /// Batches, oldest first, kept beside the list (`gui/batches.json`).
     batches: Mutex<Vec<Batch>>,
+    /// Conversions kept beside the list (`gui/conversions/`), so a review
+    /// opens again at once after a restart; `None` keeps none.
+    stored: Option<Arc<Stored>>,
 }
 
 /// A batch: what was asked, and when. Its runs carry their `BatchCell`.
@@ -1001,6 +1005,16 @@ fn canonical(p: &Path) -> PathBuf {
 }
 
 impl Runs {
+    /// What the stored conversions take up; `None` when none are kept.
+    pub fn stored(&self) -> Option<stored::Usage> {
+        self.stored.as_ref().map(|s| s.usage())
+    }
+
+    /// Deletes the stored conversions.
+    pub fn clear_stored(&self) -> Option<stored::Usage> {
+        self.stored.as_ref().map(|s| s.clear())
+    }
+
     /// Runs kept in `data_dir` (`None` keeps none). A run that was still
     /// running when the app stopped is listed as failed: what it wrote may
     /// be incomplete.
@@ -1055,6 +1069,7 @@ impl Runs {
             list: Arc::new(Mutex::new(list)),
             history: Some(file),
             batches: Mutex::new(batches),
+            stored: data_dir.map(|d| Arc::new(Stored::in_data_dir(d))),
         }
     }
 
@@ -1118,6 +1133,24 @@ impl Runs {
             instances: job.instances,
             packs: loaded,
         };
+        // A stored conversion, if there is one, is read through a setup of
+        // its own; `setup` converts when there is none.
+        let stored = self
+            .stored
+            .clone()
+            .zip(stored_extra(&run.command, &setup.packs));
+        let first = match &stored {
+            Some(_) => {
+                let (job, _, _, loaded) = prepare(spec, isolated)?;
+                Some(convert_review::Setup {
+                    tree: job.tree,
+                    out: job.out,
+                    instances: job.instances,
+                    packs: loaded,
+                })
+            }
+            None => None,
+        };
         let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
         let p = Arc::clone(&progress);
         let hooks = Hooks {
@@ -1130,24 +1163,31 @@ impl Runs {
         let r = Arc::clone(run);
         std::thread::Builder::new()
             .name(format!("sqldiff-review-{}", run.id))
-            .spawn(move || {
-                let opened = Review::open_with(setup, &hooks);
-                // As requests lock them: the review first, then `opening`.
-                let mut slot = r.review.lock().unwrap_or_else(|e| e.into_inner());
-                let mut opening = r.opening.lock().unwrap_or_else(|e| e.into_inner());
-                match opened {
-                    Ok(review) => {
-                        *slot = Some(Arc::new(Mutex::new(review)));
-                        *opening = None;
-                    }
-                    Err(e) => *opening = Some(Opening::Failed(e)),
-                }
-            })
+            .stack_size(sqldiff_core::ENGINE_STACK)
+            .spawn(move || reopen(&r, first, setup, stored, &hooks))
             .map_err(|e| format!("could not start opening the review: {e}"))?;
         *opening = Some(Opening::Converting(progress));
-        Ok(Some(ReviewOpen::Opening {
-            checked: 0,
-            total: 0,
+        drop((opening, slot));
+        // A stored conversion reads in well under a second: wait for it
+        // rather than show the progress page for a moment.
+        if self.stored.is_some() {
+            for _ in 0..60 {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                if let Some(r) = run.review() {
+                    return Ok(Some(ReviewOpen::Ready(r)));
+                }
+            }
+        }
+        let p = run.opening.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Some(match p.as_ref() {
+            Some(Opening::Converting(p)) => ReviewOpen::Opening {
+                checked: p.0.load(Ordering::Relaxed),
+                total: p.1.load(Ordering::Relaxed),
+            },
+            _ => ReviewOpen::Opening {
+                checked: 0,
+                total: 0,
+            },
         }))
     }
 
@@ -1475,6 +1515,7 @@ impl Runs {
     ) -> Result<(), String> {
         let runs: Vec<Arc<Run>> = admitted.iter().map(|(r, _)| Arc::clone(r)).collect();
         let (list, history) = (Arc::clone(&self.list), self.history.clone());
+        let stored = self.stored.clone();
         let set = move |r: &Arc<Run>, state: State| {
             let l = list.lock().unwrap_or_else(|e| e.into_inner());
             *r.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
@@ -1496,7 +1537,7 @@ impl Runs {
                         }
                         set(&r, State::Running);
                     }
-                    let state = execute(&r, work);
+                    let state = execute(&r, work, stored.as_ref());
                     set(&r, state);
                     done(&r);
                 }
@@ -2112,7 +2153,75 @@ fn prepare(
     Ok((job, out, command, loaded))
 }
 
-fn execute(run: &Arc<Run>, work: Work) -> State {
+/// Opens `r`'s review again: from its stored conversion (`first`), if
+/// one was stored under the key of the tree as it is now; else by
+/// converting `setup` again, which is stored in turn.
+fn reopen(
+    r: &Arc<Run>,
+    first: Option<convert_review::Setup>,
+    setup: convert_review::Setup,
+    stored: Option<(Arc<Stored>, Vec<u8>)>,
+    hooks: &Hooks,
+) {
+    let from_store = (|| {
+        let ((st, extra), first) = (stored.as_ref()?, first?);
+        let (key, now) = convert_review::stored_key(&first, extra).ok()?;
+        Review::open_stored(first, st.get(&key)?, now).ok()
+    })();
+    let fresh = from_store.is_none();
+    let opened = match from_store {
+        Some(review) => Ok(review),
+        None => Review::open_with(setup, hooks),
+    };
+    // Stored after the review is shown: compressing takes a moment.
+    let keep = match (&opened, &stored) {
+        (Ok(review), Some((st, extra))) if fresh => {
+            Some((Arc::clone(st), review.stored_key(extra), review.tree_json()))
+        }
+        _ => None,
+    };
+    {
+        // As requests lock them: the review first, then `opening`.
+        let mut slot = r.review.lock().unwrap_or_else(|e| e.into_inner());
+        let mut opening = r.opening.lock().unwrap_or_else(|e| e.into_inner());
+        match opened {
+            Ok(review) => {
+                *slot = Some(Arc::new(Mutex::new(review)));
+                *opening = None;
+            }
+            Err(e) => *opening = Some(Opening::Failed(e)),
+        }
+    }
+    if let Some((st, key, json)) = keep {
+        st.put(&key, &json);
+    }
+}
+
+/// What a stored conversion's key takes besides the tree: this build of
+/// the app, the run's command, and the contents of the config files and
+/// packs it loads. `None` (store nothing) when the build is not known.
+fn stored_extra(command: &Command, packs: &[LoadedPack]) -> Option<Vec<u8>> {
+    let build = stored::build();
+    if build.is_empty() {
+        return None;
+    }
+    let pinned = (&command.args, &command.project_config, &command.user_config);
+    let mut out = build.as_bytes().to_vec();
+    out.extend(serde_json::to_vec(&pinned).unwrap_or_default());
+    for f in [&command.project_config, &command.user_config]
+        .into_iter()
+        .flatten()
+    {
+        stored::contents(Path::new(f), &mut out)?;
+    }
+    // The `pack.toml` the pack was loaded from: all `Pack::load` reads.
+    for p in packs {
+        stored::contents(Path::new(&p.path), &mut out)?;
+    }
+    Some(out)
+}
+
+fn execute(run: &Arc<Run>, work: Work, stored: Option<&Arc<Stored>>) -> State {
     let r = Arc::clone(run);
     let hooks = Hooks {
         progress: Some(Box::new(move |checked, total| {
@@ -2213,10 +2322,24 @@ fn execute(run: &Arc<Run>, work: Work) -> State {
         instances: job.instances,
         packs: run.packs.clone().unwrap_or_default(),
     };
+    let extra = stored.zip(stored_extra(&run.command, &setup.packs));
     match Review::open_converted(setup, w) {
         Ok(review) => {
+            let keep = extra.map(|(st, extra)| {
+                (
+                    Arc::clone(st),
+                    review.stored_key(&extra),
+                    review.tree_json(),
+                )
+            });
             *run.review.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(Arc::new(Mutex::new(review)));
+            // Compressing a large tree takes a moment: not on the run's time.
+            if let Some((st, key, json)) = keep {
+                let _ = std::thread::Builder::new()
+                    .name(format!("sqldiff-store-{}", run.id))
+                    .spawn(move || st.put(&key, &json));
+            }
         }
         // Written all the same: the review can be opened from the command line.
         Err(e) => {
@@ -2324,4 +2447,68 @@ fn review_changes(w: &ChangesWork, hooks: &Hooks) -> Result<State, String> {
         notes: Vec::new(),
         finished: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(config: Option<&Path>) -> Command {
+        Command {
+            args: vec!["convert".into()],
+            project_config: config.map(|p| p.display().to_string()),
+            user_config: None,
+            powershell: String::new(),
+            sh: String::new(),
+        }
+    }
+
+    fn pack(path: &Path) -> LoadedPack {
+        LoadedPack {
+            private: true,
+            name: None,
+            version: None,
+            path: path.display().to_string(),
+        }
+    }
+
+    #[test]
+    fn the_key_follows_the_config_and_pack_contents() {
+        let d = std::env::temp_dir().join(format!("sqldiff-extra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (cfg, p) = (d.join("sqldiff.toml"), d.join("pack.toml"));
+        std::fs::write(&cfg, "a = 1\n").unwrap();
+        std::fs::write(&p, "b = 1\n").unwrap();
+        let key = || stored_extra(&command(Some(&cfg)), &[pack(&p)]).unwrap();
+        let first = key();
+        assert_eq!(key(), first);
+        std::fs::write(&p, "b = 2\n").unwrap();
+        let second = key();
+        assert_ne!(second, first, "pack contents");
+        std::fs::write(&cfg, "a = 2\n").unwrap();
+        assert_ne!(key(), second, "config contents");
+        // A file that cannot be read: nothing is stored.
+        std::fs::remove_file(&p).unwrap();
+        assert!(stored_extra(&command(Some(&cfg)), &[pack(&p)]).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `Pack::load` reads `pack.toml` through a link: so does the key.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_pack_toml_is_keyed_by_what_it_points_to() {
+        let d = std::env::temp_dir().join(format!("sqldiff-extra-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("pack")).unwrap();
+        let target = d.join("real.toml");
+        std::fs::write(&target, "b = 1\n").unwrap();
+        let link = d.join("pack").join("pack.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let key = || stored_extra(&command(None), &[pack(&link)]).unwrap();
+        let first = key();
+        std::fs::write(&target, "b = 2\n").unwrap();
+        assert_ne!(key(), first);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
