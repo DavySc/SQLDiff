@@ -429,6 +429,21 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
 }
 
 /// Run `id` as `/api/runs` lists it, once it has stopped running.
+/// GETs `path` under a run's review, waiting while the review opens again
+/// (a run from an earlier session converts its tree again first).
+fn opened(addr: SocketAddr, path: &str) -> (String, String) {
+    for _ in 0..600 {
+        let (status, body) = get(addr, path);
+        let opening = status == "HTTP/1.1 503 Service Unavailable"
+            || body.contains("Opening the review of run");
+        if !opening {
+            return (status, body);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("{path}: still opening");
+}
+
 fn finished(addr: SocketAddr, id: u64) -> serde_json::Value {
     for _ in 0..600 {
         let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
@@ -839,8 +854,19 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
     assert_eq!(past["totals"], run["totals"]);
     assert!(past["gate"].is_null(), "judged once the review opens");
     let review = format!("/runs/{id}/review");
-    let (status, _) = get(addr, &review);
+    // Converted again on its own thread: the page says so and reloads, and
+    // an API call is told to wait.
+    let (status, html) = get(addr, &review);
     assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(html.contains("Opening the review of run"), "{html}");
+    assert!(html.contains(r#"http-equiv="refresh""#), "{html}");
+    assert!(html.contains(r#"<nav id="app-rail""#), "{html}");
+    let (status, html) = opened(addr, &review);
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(
+        html.contains("/*__SQLDIFF_PAYLOAD__*/{"),
+        "the review itself"
+    );
     let state: serde_json::Value =
         serde_json::from_str(&get(addr, &format!("{review}/api/state")).1).unwrap();
     assert_eq!(state["gate"]["complete"], true, "{state}");
@@ -859,13 +885,13 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
     // on other config than the run's.
     d.write("src/sqldiff.toml", "");
     let addr = start(kept());
-    let (status, text) = get(addr, &review);
+    let (status, text) = opened(addr, &review);
     assert_eq!(status, "HTTP/1.1 409 Conflict", "{text}");
     assert!(text.contains("other config"), "{text}");
     std::fs::remove_file(d.0.join("src/sqldiff.toml")).unwrap();
     // The source gone: refused, not opened on nothing.
     std::fs::rename(d.0.join("src"), d.0.join("gone")).unwrap();
-    let (status, text) = get(addr, &review);
+    let (status, text) = opened(addr, &review);
     assert_eq!(status, "HTTP/1.1 409 Conflict", "{text}");
     std::fs::rename(d.0.join("gone"), d.0.join("src")).unwrap();
     // Opened again on a network address only from this computer.

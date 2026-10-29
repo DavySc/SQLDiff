@@ -8,7 +8,7 @@ use sqldiff_convert::tree;
 use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
 use sqldiff_gui::convert_review::{
-    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_STALE,
+    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN, GATE_STALE,
 };
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
@@ -661,4 +661,34 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
         .items
         .iter()
         .any(|i| i.item.path != "r.sql" && i.open_assumptions.contains(&rule)));
+}
+
+#[test]
+fn the_page_gets_the_gates_first_blockers_and_how_many_there_are() {
+    let f = Fixture::new("gate-shown", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
+    let r = f.open();
+    let mut st = r.state(false);
+    let g = st.gate.as_mut().expect("judged");
+    let first = g.blockers[0].clone();
+    g.blockers = vec![first; GATE_BLOCKERS_SHOWN + 5];
+    let full = serde_json::to_value(&*g).unwrap();
+    let v = serde_json::to_value(&st).unwrap();
+    let shown = v["gate"]["blockers"].as_array().unwrap();
+    assert_eq!(shown.len(), GATE_BLOCKERS_SHOWN);
+    assert_eq!(v["gate"]["blockers_total"], GATE_BLOCKERS_SHOWN + 5);
+    // Everything else as the gate has it.
+    let mut expect = full;
+    expect["blockers"] = serde_json::Value::Array(shown.clone());
+    expect["blockers_total"] = (GATE_BLOCKERS_SHOWN + 5).into();
+    assert_eq!(v["gate"], expect);
+    // `/api/gate` gives the state's gate, error and time.
+    let st = serde_json::to_value(r.state(false)).unwrap();
+    let gate = serde_json::to_value(r.gate_state()).unwrap();
+    for k in ["gate", "gate_error", "gate_judged"] {
+        assert_eq!(gate[k], st[k], "{k}");
+    }
+    assert_eq!(
+        st["gate"]["blockers_total"],
+        st["gate"]["blockers"].as_array().unwrap().len()
+    );
 }

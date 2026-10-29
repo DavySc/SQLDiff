@@ -56,7 +56,9 @@ use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::packs::LoadedPack;
 use crate::review::Store;
-use crate::runs::{BatchSpec, ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
+use crate::runs::{
+    self, BatchSpec, ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, ReviewOpen, Runs,
+};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -331,7 +333,23 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string());
         }
         let review = match app.runs.open_review(&run, app.isolated) {
-            Ok(Some(r)) => r,
+            Ok(Some(ReviewOpen::Ready(r))) => r,
+            // Converting again: the page waits, an API call is told to.
+            Ok(Some(ReviewOpen::Opening { checked, total })) => {
+                return match (req.method.as_str(), sub.path.as_str()) {
+                    ("GET", "/") => page(
+                        app,
+                        View::Review,
+                        runs::opening_page(run.id, checked, total),
+                        &prefix,
+                    ),
+                    _ => (
+                        "503 Service Unavailable",
+                        "text/plain",
+                        "the review is still opening (converting the source again); try again shortly".into(),
+                    ),
+                };
+            }
             Ok(None) => return not_found(),
             Err(e) => return ("409 Conflict", "text/plain", e),
         };

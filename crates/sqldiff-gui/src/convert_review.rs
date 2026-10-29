@@ -25,7 +25,9 @@
 //!
 //! - `GET /`: the page
 //! - `GET /api/state[?all=1]`: queue, ledger summary, warnings, the done
-//!   gate (`all` adds tier 6)
+//!   gate (`all` adds tier 6; the gate lists its first
+//!   [`GATE_BLOCKERS_SHOWN`] blockers, and `blockers_total` counts them all)
+//! - `GET /api/gate`: the done gate alone, as `/api/state` gives it
 //! - `GET /api/item?key=K[&all=1]`: one queue item in detail
 //! - `GET /api/unit?path=P&unit=U`: one unit in detail (also reviewed ones)
 //! - `GET /api/file?path=P&side=in|out`: a whole input, or its conversion
@@ -198,12 +200,65 @@ pub struct StateView {
     pub unreadable: Vec<String>,
     pub convert_ms: f64,
     /// The done gate (`sqldiff review-status`): the only place "done" comes
-    /// from. `gate_error` says why it could not be judged.
+    /// from. `gate_error` says why it could not be judged. Sent with its
+    /// first [`GATE_BLOCKERS_SHOWN`] blockers and `blockers_total`.
+    #[serde(serialize_with = "gate_shown")]
     pub gate: Option<Gate>,
     pub gate_error: Option<String>,
     pub gate_judged: String,
     /// The packs loaded (a private pack by path only).
     pub packs: Vec<LoadedPack>,
+}
+
+/// The done gate alone, as [`StateView`] has it (`GET /api/gate`).
+#[derive(Debug, Clone, Serialize)]
+pub struct GateState {
+    #[serde(serialize_with = "gate_shown")]
+    pub gate: Option<Gate>,
+    pub gate_error: Option<String>,
+    pub gate_judged: String,
+}
+
+/// Blockers the page gets of a gate; it shows these and counts the rest
+/// (`blockers_total`). A large tree has tens of thousands, which made the
+/// page's payload several times larger than everything else on it.
+pub const GATE_BLOCKERS_SHOWN: usize = 100;
+
+fn gate_shown<S: serde::Serializer>(g: &Option<Gate>, s: S) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Shown<'a> {
+        complete: bool,
+        blockers: &'a [gate::Blocker],
+        blockers_total: usize,
+        counts: &'a BTreeMap<String, usize>,
+        accepted: &'a [gate::Accepted],
+        units: usize,
+        nothing_found: usize,
+        instances: Option<bool>,
+    }
+    // Every field named, so a field added to `Gate` cannot be left out here.
+    let Some(Gate {
+        complete,
+        blockers,
+        counts,
+        accepted,
+        units,
+        nothing_found,
+        instances,
+    }) = g
+    else {
+        return s.serialize_none();
+    };
+    s.serialize_some(&Shown {
+        complete: *complete,
+        blockers: &blockers[..blockers.len().min(GATE_BLOCKERS_SHOWN)],
+        blockers_total: blockers.len(),
+        counts,
+        accepted,
+        units: *units,
+        nothing_found: *nothing_found,
+        instances: *instances,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,13 +363,19 @@ pub struct RecordOutcome {
 
 impl Review {
     pub fn open(setup: Setup) -> Result<Review, String> {
+        Review::open_with(setup, &tree::Hooks::default())
+    }
+
+    /// [`Review::open`], reporting the conversion's progress to `hooks` and
+    /// stopping when they say so.
+    pub fn open_with(setup: Setup, hooks: &tree::Hooks) -> Result<Review, String> {
         if !setup.out.is_dir() {
             return Err(format!(
                 "{}: not a directory; give the converted tree `sqldiff convert -o` wrote",
                 setup.out.display()
             ));
         }
-        let loaded = load(&setup, None)?;
+        let loaded = load(&setup, None, hooks)?;
         Ok(Review { setup, loaded })
     }
 
@@ -332,7 +393,7 @@ impl Review {
             written: written_texts(&setup.out)?,
             ..empty()
         };
-        let loaded = load(&setup, Some(prev))?;
+        let loaded = load(&setup, Some(prev), &tree::Hooks::default())?;
         Ok(Review { setup, loaded })
     }
 
@@ -348,14 +409,15 @@ impl Review {
     /// Reads the sources, the instance report and the ledger again.
     pub fn refresh(&mut self) -> Result<(), String> {
         let prev = std::mem::replace(&mut self.loaded, empty());
-        match load(&self.setup, Some(prev)) {
+        match load(&self.setup, Some(prev), &tree::Hooks::default()) {
             Ok(l) => {
                 self.loaded = l;
                 Ok(())
             }
             Err(e) => {
                 // Keep nothing stale: the next read starts over.
-                self.loaded = load(&self.setup, None).unwrap_or_else(|_| empty());
+                self.loaded =
+                    load(&self.setup, None, &tree::Hooks::default()).unwrap_or_else(|_| empty());
                 Err(e)
             }
         }
@@ -403,8 +465,18 @@ impl Review {
         &self.loaded.judged
     }
 
-    pub fn state(&self, all: bool) -> StateView {
+    /// The done gate as the page shows it, judged or stale.
+    pub fn gate_state(&self) -> GateState {
         let gate = self.gate();
+        GateState {
+            gate: gate.as_ref().ok().cloned(),
+            gate_error: gate.err(),
+            gate_judged: self.loaded.judged.clone(),
+        }
+    }
+
+    pub fn state(&self, all: bool) -> StateView {
+        let gate = self.gate_state();
         let l = &self.loaded;
         let r = &l.tree.report;
         let q = self.queue(all);
@@ -503,9 +575,9 @@ impl Review {
             out_differs: l.out_differs.clone(),
             unreadable: l.unreadable.clone(),
             convert_ms: l.convert_ms,
-            gate: gate.as_ref().ok().cloned(),
-            gate_error: gate.err(),
-            gate_judged: l.judged.clone(),
+            gate: gate.gate,
+            gate_error: gate.gate_error,
+            gate_judged: gate.gate_judged,
             packs: self.setup.packs.clone(),
         }
     }
@@ -852,7 +924,7 @@ fn empty() -> Loaded {
 
 /// Reads and converts the tree (reusing `prev`'s conversion when no source
 /// changed), applies the ledger in OUT and reads the instance report.
-fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
+fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, String> {
     // Taken before anything is read: a file that changes while this read
     // judges makes the verdict stale.
     let stamp = stamp(s);
@@ -885,7 +957,7 @@ fn load(s: &Setup, prev: Option<Loaded>) -> Result<Loaded, String> {
         }
         _ => {
             let started = Instant::now();
-            let t = tree::convert(&s.tree, &inputs, unreadable.clone(), Some(&s.out))?;
+            let t = tree::convert_with(&s.tree, &inputs, unreadable.clone(), Some(&s.out), hooks)?;
             (t, started.elapsed().as_secs_f64() * 1000.0, true)
         }
     };
@@ -1017,6 +1089,7 @@ pub(crate) fn route(r: &Mutex<Review>, req: &Request) -> Response {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => ("200 OK", "text/html; charset=utf-8", page(&s.state(all))),
         ("GET", "/api/state") => json(&s.state(all)),
+        ("GET", "/api/gate") => json(&s.gate_state()),
         ("GET", "/api/item") => match param(&req.query, "key").and_then(|k| s.item(&k, all)) {
             Some(v) => json(&v),
             None => not_found(),
