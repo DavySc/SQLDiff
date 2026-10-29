@@ -390,8 +390,8 @@ $$;
         )
     };
     let r = diff(
-        &Artifact::new("a.sql", Dialect::Postgres, &pg("1000")),
-        &Artifact::new("b.sql", Dialect::Postgres, &pg("1001")),
+        &Artifact::new("a.sql", Dialect::Postgres, pg("1000")),
+        &Artifact::new("b.sql", Dialect::Postgres, pg("1001")),
         &Options::default(),
     );
     assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
