@@ -10,6 +10,7 @@
 //!   bundle is the canonical offline and fixture format.
 //! - [`pairing`] and [`policy`]: pack-driven pairing, and pack policy applied
 //!   to engine reports (overrides, declared assumptions, limits).
+//! - [`format_run`]: `sqldiff fmt` over files and folders.
 //! - [`queue`]: every pair of a source diffed and ranked for review, with
 //!   session-local assumption flips and GUI deep links.
 
@@ -20,6 +21,7 @@ pub mod config;
 pub mod deployment;
 mod error;
 pub mod format_file;
+pub mod format_run;
 pub mod fs;
 pub mod git;
 pub mod glob;

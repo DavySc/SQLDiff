@@ -334,6 +334,30 @@ function changesRow(r) {
   return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">Review branch ${range}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
 }
 
+// A format run (`sqldiff fmt --check` or `--write` on a folder): the
+// command's result, never "done".
+function formatRow(r) {
+  const t = r.totals || {};
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const sub = `<span class="path">${esc(r.dir)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`;
+  let right = "", act = "", extra = "";
+  if (r.state === "running") {
+    const pct = r.total ? r.checked / r.total * 100 : 0;
+    right = `<div class="bar"><i class="p" style="width:${pct}%"></i></div><div class="meta">${r.cancelling ? "Cancelling…" : r.total ? `Laid out ${r.checked} of ${r.total}` : "Listing files…"}</div>`;
+    act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
+  } else if (r.state === "done") {
+    const verdict = r.write ? (t.changed ? `Formatted ${plural(t.changed, "file")}` : "Nothing to format")
+      : t.changed ? `${plural(t.changed, "file")} not formatted` : "Every file formatted";
+    right = `<div class="meta"><b class="${r.complete ? "done" : ""}">${verdict}</b> · ${plural(t.files, "file")}${t.kept ? ` · ${plural(t.kept, "statement")} kept as written` : ""}${t.skipped ? ` · ${t.skipped} skipped` : ""}</div>`;
+    extra = r.notes.map((n) => `<div class="failed-msg">${esc(n)}</div>`).join("");
+  } else if (r.state === "cancelled") {
+    right = `<div class="meta">Cancelled; nothing was written</div>`;
+  } else {
+    extra = `<div class="failed-msg">${esc(r.error)}</div>`;
+  }
+  return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">${r.write ? "Format" : "Check formatting of"} a folder</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
+}
+
 // A finished conversion: its own totals and its done gate (`sqldiff
 // review-status`, as the server reads it), never a count made up here.
 function convDone(r) {
@@ -393,6 +417,7 @@ function batchCard(b, byId) {
 
 function row(r) {
   if (r.kind === "changes") return changesRow(r);
+  if (r.kind === "format") return formatRow(r);
   if (r.kind === "drift") return driftRow(r, `into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`);
   const pair = `${esc(NAME[r.from] || r.from)} → ${esc(NAME[r.to] || r.to)}`;
   const inst = r.kind === "instances";
@@ -558,8 +583,10 @@ async function refresh() {
     if (res.ok) render(await res.json());
   } catch (e) { timer = setTimeout(refresh, 3000); }
 }
+// This launch's token, which every POST carries (absent outside the app).
+const APP_TOKEN = document.querySelector('meta[name="sqldiff-token"]')?.content ?? "";
 async function post(url, body) {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-SQLDiff-Token": APP_TOKEN }, body: JSON.stringify(body) });
   const text = await res.text();
   if (!res.ok) throw new Error(text || res.statusText);
   return JSON.parse(text);

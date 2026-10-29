@@ -5,10 +5,10 @@
 //! - `GET /settings`: the page (see `app`)
 //! - `GET /api/settings?dir=`: the layers and effective values for the
 //!   folder (or `sqldiff.toml`) `dir`
-//! - `POST /api/settings/preview` `{"token", "dir", "draft", "dialect", "text"}`:
+//! - `POST /api/settings/preview` `{"dir", "draft", "dialect", "text"}`:
 //!   `text` formatted as `sqldiff fmt` would with the draft in place of the
 //!   workspace file's `[format]`, and the effective values for that draft
-//! - `POST /api/settings/save` `{"token", "dir", "draft", "hash"}`: write the
+//! - `POST /api/settings/save` `{"dir", "draft", "hash"}`: write the
 //!   draft into the workspace `sqldiff.toml`
 //!
 //! The configuration is loaded, merged and formatted by the library code the
@@ -25,8 +25,8 @@
 //!   layers, but nothing from them reaches the page: no value, no pack name,
 //!   no parse error text. A key one of them sets shows as "set by", without
 //!   its value.
-//! - Every POST needs the per-launch token the settings page was served with.
-//!   The routes answer only when the app listens on loopback (see `app`).
+//! - Every POST needs the per-launch token the page was served with, and the
+//!   routes answer only when the app listens on loopback (both in `app`).
 
 use std::path::{Path, PathBuf};
 
@@ -50,18 +50,9 @@ pub const MAX_PREVIEW: usize = 1 << 20;
 pub struct Ctx<'a> {
     /// The app ignores the user config (tests, reproducible runs).
     pub isolated: bool,
-    /// This launch's token.
-    pub token: &'a str,
     /// The packs given at launch (`--pack`), private like configured
     /// `private_packs`.
     pub packs: &'a [PathBuf],
-}
-
-/// A new token: 128 random bits from the operating system.
-pub fn new_token() -> String {
-    let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("the operating system has no random numbers");
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// The settings routes, if `req` is one.
@@ -80,7 +71,7 @@ pub(crate) fn route(req: &Request, ctx: &Ctx) -> Option<Response> {
     })
 }
 
-fn post<T: for<'de> Deserialize<'de> + Tokened>(
+fn post<T: for<'de> Deserialize<'de>>(
     req: &Request,
     ctx: &Ctx,
     f: impl FnOnce(T, &Ctx) -> Result<Value, (&'static str, String)>,
@@ -89,26 +80,10 @@ fn post<T: for<'de> Deserialize<'de> + Tokened>(
         Ok(b) => b,
         Err(e) => return bad(e),
     };
-    if !same(body.token(), ctx.token) {
-        return (
-            "403 Forbidden",
-            "text/plain",
-            "missing or wrong token: reload the settings page".into(),
-        );
-    }
     match f(body, ctx) {
         Ok(v) => json(&v),
         Err((status, e)) => (status, "text/plain", e),
     }
-}
-
-trait Tokened {
-    fn token(&self) -> &str;
-}
-
-/// Equal strings, compared without stopping at the first difference.
-fn same(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 const BAD: &str = "400 Bad Request";
@@ -116,33 +91,19 @@ const BAD: &str = "400 Bad Request";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Preview {
-    token: String,
     dir: String,
     draft: FormatConfig,
     dialect: String,
     text: String,
 }
 
-impl Tokened for Preview {
-    fn token(&self) -> &str {
-        &self.token
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Save {
-    token: String,
     dir: String,
     draft: FormatConfig,
     /// The hash of the file as the page read it; `None`: it did not exist.
     hash: Option<String>,
-}
-
-impl Tokened for Save {
-    fn token(&self) -> &str {
-        &self.token
-    }
 }
 
 fn preview(p: Preview, ctx: &Ctx) -> Result<Value, (&'static str, String)> {
@@ -295,6 +256,11 @@ fn load(dir: &str, ctx: &Ctx) -> Result<Workspace, String> {
         cfg,
         pack_names,
     })
+}
+
+/// [`is_private_file`] for a caller outside the settings routes.
+pub(crate) fn private_file(file: &Path, isolated: bool, packs: &[PathBuf]) -> bool {
+    is_private_file(file, &Ctx { isolated, packs })
 }
 
 /// `file` is the user config or a private pack the app would load,
@@ -559,9 +525,8 @@ pub fn initial_dir() -> Option<String> {
 }
 
 /// The page's payload.
-pub fn payload(no_picking: Option<&str>, token: &str) -> Value {
+pub fn payload(no_picking: Option<&str>) -> Value {
     json!({
-        "token": token,
         "no_picking": no_picking,
         "initial_dir": initial_dir(),
         "dialects": Dialect::ALL.iter().map(|d| (d.id(), d.display_name())).collect::<Vec<_>>(),

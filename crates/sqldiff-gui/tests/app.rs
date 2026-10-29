@@ -111,12 +111,37 @@ fn start(app: App) -> SocketAddr {
     addr
 }
 
-/// Status line and body.
+/// Status line and body; a POST carries this launch's token, as the pages
+/// send it.
 fn request(addr: SocketAddr, method: &str, path: &str, body: &str) -> (String, String) {
+    let token = (method == "POST").then(|| token(addr));
+    request_with(addr, method, path, body, token.as_deref())
+}
+
+/// The token the pages of the app at `addr` carry.
+fn token(addr: SocketAddr) -> String {
+    let (status, page) = request_with(addr, "GET", "/settings", "", None);
+    assert!(status.ends_with("200 OK"), "{status}");
+    let at = page
+        .find(r#"<meta name="sqldiff-token" content=""#)
+        .expect("token in the page")
+        + 36;
+    page[at..at + page[at..].find('"').unwrap()].to_string()
+}
+
+/// [`request`] with `token`, if any, as the `X-SQLDiff-Token` header.
+fn request_with(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    body: &str,
+    token: Option<&str>,
+) -> (String, String) {
     let mut s = TcpStream::connect(addr).unwrap();
+    let token = token.map_or(String::new(), |t| format!("X-SQLDiff-Token: {t}\r\n"));
     write!(
         s,
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{token}Content-Length: {}\r\n\r\n{body}",
         body.len()
     )
     .unwrap();
@@ -246,6 +271,133 @@ fn cross_origin_posts_are_refused_on_every_view() {
         s.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 403"), "{path}: {resp}");
     }
+}
+
+/// Every file below `d` with its contents, to tell that nothing was written.
+fn snapshot(d: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut todo = vec![d.to_path_buf()];
+    while let Some(p) = todo.pop() {
+        for e in std::fs::read_dir(&p).unwrap() {
+            let e = e.unwrap().path();
+            if e.is_dir() {
+                todo.push(e.clone());
+                out.push((e, Vec::new()));
+            } else {
+                out.push((e.clone(), std::fs::read(&e).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn every_post_needs_this_launchs_token_and_writes_nothing_without_it() {
+    let d = Dir::new("token");
+    d.write("ws/sqldiff.toml", "[format]\nindent = 2\n");
+    let addr = start(app(Some(session(&d)), Some(review(&d))));
+    // A run that exists, so its cancel and review routes are reached.
+    let spec = serde_json::json!({
+        "src": d.0.join("src"), "out": d.0.join("run1"), "from": "tsql", "to": "postgres",
+    });
+    let (status, body) = request(addr, "POST", "/api/runs", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let run = finished(addr, 1);
+    assert_eq!(run["state"], "done", "{run}");
+    let before = snapshot(&d.0);
+    let (_, runs_before) = get(addr, "/api/runs");
+    let (_, batches_before) = get(addr, "/api/batches");
+    let src = d.0.join("src");
+    let posts = [
+        (
+            "/api/open/compare",
+            serde_json::json!({"a": d.0.join("a.sql"), "b": d.0.join("b.sql")}),
+        ),
+        (
+            "/api/runs",
+            serde_json::json!({"src": src, "out": d.0.join("o1"), "from": "tsql", "to": "postgres"}),
+        ),
+        (
+            "/api/runs/instances",
+            serde_json::json!({"src": src, "out": d.0.join("o2")}),
+        ),
+        (
+            "/api/runs/drift",
+            serde_json::json!({"src": src, "out": d.0.join("o3")}),
+        ),
+        (
+            "/api/runs/changes",
+            serde_json::json!({"src": src, "out": d.0.join("o4")}),
+        ),
+        (
+            "/api/runs/batch",
+            serde_json::json!({"sources": [{"src": src, "from": "tsql"}], "targets": ["postgres"], "out": d.0.join("o5")}),
+        ),
+        ("/api/batches/1/cancel", serde_json::json!({})),
+        ("/runs/1/cancel", serde_json::json!({})),
+        ("/runs/1/review/api/record", serde_json::json!({})),
+        ("/runs/1/review/api/refresh", serde_json::json!({})),
+        ("/review/api/record", serde_json::json!({})),
+        ("/review/api/refresh", serde_json::json!({})),
+        ("/compare/api/review", serde_json::json!({})),
+        ("/compare/api/assumption", serde_json::json!({})),
+        ("/compare/api/refresh", serde_json::json!({})),
+        ("/compare/api/diff", serde_json::json!({})),
+        (
+            "/api/convert",
+            serde_json::json!({"text": "SELECT 1;", "from": "tsql", "to": "postgres"}),
+        ),
+        (
+            "/api/compare",
+            serde_json::json!({"a": "SELECT 1;", "b": "SELECT 2;", "from": "tsql", "to": "postgres"}),
+        ),
+        (
+            "/api/settings/preview",
+            serde_json::json!({"dir": d.0.join("ws"), "draft": {}, "dialect": "tsql", "text": "SELECT 1;"}),
+        ),
+        (
+            "/api/settings/save",
+            serde_json::json!({"dir": d.0.join("ws"), "draft": {"indent": 8}, "hash": null}),
+        ),
+    ];
+    let other = token(start(app(None, None)));
+    for (path, body) in &posts {
+        for t in [
+            None,
+            Some(String::new()),
+            Some("0".repeat(32)),
+            Some(other.clone()),
+        ] {
+            let (status, text) = request_with(addr, "POST", path, &body.to_string(), t.as_deref());
+            assert_eq!(status, "HTTP/1.1 403 Forbidden", "{path} {t:?}: {text}");
+            assert!(text.contains("token"), "{path}: {text}");
+        }
+    }
+    assert!(snapshot(&d.0) == before, "a refused POST wrote to disk");
+    assert_eq!(get(addr, "/api/runs").1, runs_before);
+    assert_eq!(get(addr, "/api/batches").1, batches_before);
+    // The token is on every page the app serves, and only there.
+    for view in [
+        "/",
+        "/runs",
+        "/compare",
+        "/convert",
+        "/review",
+        "/runs/1/review",
+        "/settings",
+    ] {
+        let (status, html) = get(addr, view);
+        assert_eq!(status, "HTTP/1.1 200 OK", "{view}");
+        assert!(
+            html.contains(&format!(
+                r#"<meta name="sqldiff-token" content="{}">"#,
+                token(addr)
+            )),
+            "{view}"
+        );
+    }
+    assert!(!sqldiff_gui::page(&serde_json::Value::Null).contains(r#"<meta name="sqldiff-token""#));
 }
 
 #[test]
@@ -1291,4 +1443,186 @@ fn a_process_started_meanwhile_does_not_hold_the_connection() {
     read.unwrap();
     assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
     assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+}
+
+const UNFORMATTED: &str = "select a,b from t where x=1\n";
+const FORMATTED: &str = "SELECT a, b\nFROM t\nWHERE x = 1\n";
+
+fn start_format(addr: SocketAddr, body: &serde_json::Value) -> u64 {
+    let (status, text) = request(addr, "POST", "/api/runs/format", &body.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{text}");
+    serde_json::from_str::<serde_json::Value>(&text).unwrap()["id"]
+        .as_u64()
+        .unwrap()
+}
+
+#[test]
+fn a_format_run_checks_then_writes_only_when_asked() {
+    let d = Dir::new("format");
+    d.write("ws/a.pg.sql", UNFORMATTED);
+    d.write("ws/sub/b.pg.sql", FORMATTED);
+    d.write("ws/notes.txt", UNFORMATTED);
+    let ws = d.0.join("ws");
+    let addr = start(app(None, None));
+    let check = serde_json::json!({"dir": ws, "config": ws.join("sqldiff.toml")});
+    let id = start_format(addr, &check);
+    let run = finished(addr, id);
+    assert_eq!(run["kind"], "format");
+    assert_eq!(run["state"], "done", "{run}");
+    // The command's result: one file is not formatted; nothing is written.
+    assert_eq!(run["complete"], false);
+    assert_eq!(
+        (&run["totals"]["files"], &run["totals"]["changed"]),
+        (&2.into(), &1.into()),
+        "{run}"
+    );
+    assert!(run["gate"].is_null(), "{run}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.pg.sql")).unwrap(),
+        UNFORMATTED
+    );
+    let args: Vec<_> = run["command"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    let dir = ws.display().to_string();
+    assert_eq!(args, ["fmt", "--check", dir.as_str(), "--isolated"]);
+    let mut write = check.clone();
+    write["write"] = true.into();
+    let run = finished(addr, start_format(addr, &write));
+    assert_eq!(run["state"], "done", "{run}");
+    assert_eq!(run["complete"], true, "{run}");
+    assert_eq!(run["command"]["args"][1], "--write");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.pg.sql")).unwrap(),
+        FORMATTED
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("sub/b.pg.sql")).unwrap(),
+        FORMATTED
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("notes.txt")).unwrap(),
+        UNFORMATTED
+    );
+    let run = finished(addr, start_format(addr, &check));
+    assert_eq!(run["complete"], true, "{run}");
+}
+
+#[test]
+fn a_format_run_uses_the_settings_the_page_shows() {
+    let d = Dir::new("format-config");
+    d.write("ws/sqldiff.toml", "[format]\nkeyword_case = \"lower\"\n");
+    d.write("ws/a.pg.sql", UNFORMATTED);
+    d.write("ws/sub/b.pg.sql", UNFORMATTED);
+    let ws = d.0.join("ws");
+    // Started isolated, the app still formats with the file it shows, and
+    // the command names it.
+    let addr = start(app(None, None));
+    let body = serde_json::json!({"dir": ws, "write": true, "config": ws.join("sqldiff.toml")});
+    let run = finished(addr, start_format(addr, &body));
+    assert_eq!(run["state"], "done", "{run}");
+    assert_eq!(
+        run["command"]["project_config"],
+        ws.join("sqldiff.toml").display().to_string()
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.pg.sql")).unwrap(),
+        "select a, b\nfrom t\nwhere x = 1\n"
+    );
+    // Settings shown for another folder's file are refused.
+    d.write("ws/sub/b.pg.sql", UNFORMATTED);
+    let other = serde_json::json!({"dir": ws.join("sub"), "write": true, "config": ws.join("sqldiff.toml")});
+    let (status, text) = request(addr, "POST", "/api/runs/format", &other.to_string());
+    assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("sub/b.pg.sql")).unwrap(),
+        UNFORMATTED
+    );
+    // Not a folder, or a folder without SQL files.
+    let (status, _) = request(
+        addr,
+        "POST",
+        "/api/runs/format",
+        &serde_json::json!({"dir": ws.join("a.pg.sql")}).to_string(),
+    );
+    assert_eq!(status, "HTTP/1.1 400 Bad Request");
+    d.write("empty/notes.txt", "");
+    let run = finished(
+        addr,
+        start_format(addr, &serde_json::json!({"dir": d.0.join("empty")})),
+    );
+    assert_eq!(run["state"], "failed", "{run}");
+}
+
+#[test]
+fn a_cancelled_format_run_writes_nothing() {
+    let d = Dir::new("format-cancel");
+    for n in 0..3000 {
+        d.write(&format!("ws/t{n}.pg.sql"), UNFORMATTED);
+    }
+    let addr = start(app(None, None));
+    let id = start_format(
+        addr,
+        &serde_json::json!({"dir": d.0.join("ws"), "write": true}),
+    );
+    request(addr, "POST", &format!("/runs/{id}/cancel"), "{}");
+    let run = finished(addr, id);
+    assert_eq!(run["state"], "cancelled", "{run}");
+    for n in 0..3000 {
+        let t = std::fs::read_to_string(d.0.join(format!("ws/t{n}.pg.sql"))).unwrap();
+        assert_eq!(t, UNFORMATTED, "t{n}");
+    }
+}
+
+#[test]
+fn a_format_run_holds_its_folder() {
+    let d = Dir::new("format-hold");
+    for n in 0..3000 {
+        d.write(&format!("ws/t{n}.tsql.sql"), UNFORMATTED);
+    }
+    let addr = start(app(None, None));
+    let id = start_format(
+        addr,
+        &serde_json::json!({"dir": d.0.join("ws"), "write": true}),
+    );
+    // A conversion reading the folder meanwhile would read half-written files.
+    let spec = serde_json::json!({
+        "src": d.0.join("ws"), "out": d.0.join("out"), "from": "tsql", "to": "postgres",
+    });
+    let (status, text) = request(addr, "POST", "/api/runs", &spec.to_string());
+    let run = finished(addr, id);
+    assert_eq!(run["state"], "done", "{run}");
+    assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
+    assert!(text.contains("another run is writing there"), "{text}");
+}
+
+#[test]
+fn a_format_run_never_reads_a_private_pack_as_the_folders_config() {
+    let d = Dir::new("format-private");
+    let pack = "[pack]\nname = \"zz-private-name\"\nversion = \"1\"\n[format]\nkeyword_case = \"zz-preserve\"\n";
+    d.write("ws/sqldiff.toml", pack);
+    d.write("ws/a.pg.sql", UNFORMATTED);
+    let ws = d.0.join("ws");
+    let mut a = app(None, None);
+    a.packs = vec![ws.join("sqldiff.toml")];
+    let addr = start(a);
+    for write in [false, true] {
+        let body =
+            serde_json::json!({"dir": ws, "write": write, "config": ws.join("sqldiff.toml")});
+        let (status, text) = request(addr, "POST", "/api/runs/format", &body.to_string());
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
+        assert!(!text.contains("zz-"), "{text}");
+    }
+    assert_eq!(get(addr, "/api/runs").1, "[]");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.pg.sql")).unwrap(),
+        UNFORMATTED
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("sqldiff.toml")).unwrap(),
+        pack
+    );
 }
