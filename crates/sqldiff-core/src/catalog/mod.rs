@@ -152,6 +152,22 @@ pub struct Table {
     pub indexes: Vec<Index>,
     #[serde(default)]
     pub triggers: Vec<String>,
+    /// T-SQL system versioning declared by the CREATE TABLE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning: Option<Versioning>,
+}
+
+/// `PERIOD FOR SYSTEM_TIME (start, end)` with `SYSTEM_VERSIONING = ON
+/// (HISTORY_TABLE = history)`, as a T-SQL CREATE TABLE declares them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Versioning {
+    /// The period's start and end columns, as stored.
+    pub start: String,
+    pub end: String,
+    /// The history table's name parts, as stored; `None` when the CREATE
+    /// TABLE names none (SQL Server makes one up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<String>>,
 }
 
 impl Table {
@@ -165,6 +181,7 @@ impl Table {
             keys: Vec::new(),
             indexes: Vec::new(),
             triggers: Vec::new(),
+            versioning: None,
         }
     }
 

@@ -189,6 +189,81 @@ fn update_from_shapes_without_a_rule_are_refused() {
     }
 }
 
+/// `WITH … UPDATE … FROM`: a CTE read as another FROM item stays a CTE in
+/// PostgreSQL; its GROUP BY columns are the key the one-match check needs.
+#[test]
+fn with_update_from_keeps_a_grouped_cte() {
+    let (c, _) = tsql(
+        "WITH t AS (SELECT order_id, MAX(amount) AS amt FROM dbo.order_items GROUP BY order_id)\nUPDATE o SET total = t.amt FROM dbo.orders AS o JOIN t ON t.order_id = o.order_id WHERE o.qty > 0;",
+    );
+    let (out, u) = last(&c);
+    assert!(
+        out.contains("WITH t AS (SELECT order_id, MAX(amount) AS amt FROM order_items GROUP BY order_id) UPDATE orders AS o SET total = t.amt FROM t WHERE (t.order_id = o.order_id) AND (o.qty > 0);"),
+        "{out}"
+    );
+    assert!(
+        u.status < Status::Unproven,
+        "{out}: {:?}\n{:?}",
+        u.notes,
+        c.report.unknown_reasons
+    );
+    // The same as a derived table.
+    let (c, _) = tsql(
+        "UPDATE o SET total = t.amt FROM dbo.orders AS o JOIN (SELECT order_id, MAX(amount) AS amt FROM dbo.order_items GROUP BY order_id) AS t ON t.order_id = o.order_id;",
+    );
+    let (out, u) = last(&c);
+    assert!(
+        out.contains("UPDATE orders AS o SET total = t.amt FROM (SELECT order_id, MAX(amount) AS amt FROM order_items GROUP BY order_id) AS t WHERE t.order_id = o.order_id;"),
+        "{out}"
+    );
+    assert!(u.status < Status::Unproven, "{out}: {:?}", u.notes);
+    for stmt in [
+        // Grouped by more than the join matches.
+        "UPDATE o SET total = t.amt FROM dbo.orders AS o JOIN (SELECT order_id, code, MAX(amount) AS amt FROM dbo.order_items GROUP BY order_id, code) AS t ON t.order_id = o.order_id;",
+        // No GROUP BY: an order meets several items.
+        "WITH t AS (SELECT order_id, amount AS amt FROM dbo.order_items)\nUPDATE o SET total = t.amt FROM dbo.orders AS o JOIN t ON t.order_id = o.order_id;",
+        // The target is the CTE.
+        "WITH t AS (SELECT order_id, total FROM dbo.orders)\nUPDATE x SET total = 0 FROM t AS x JOIN dbo.order_items i ON i.item_id = x.order_id;",
+    ] {
+        let (c, _) = tsql(stmt);
+        let (out, u) = last(&c);
+        assert_eq!(u.status, Status::NotConverted, "{stmt}\n{out}");
+    }
+}
+
+/// A table variable converted to a temporary table is a FROM table like any
+/// other: the target, or another table with a key the catalog shows.
+#[test]
+fn update_from_takes_converted_table_variables() {
+    let (c, _) = tsql(
+        "CREATE PROCEDURE dbo.p AS
+BEGIN
+  SET XACT_ABORT ON;
+  DECLARE @t TABLE (id int NOT NULL PRIMARY KEY, v int NULL);
+  UPDATE x SET v = 1 FROM @t AS x WHERE x.id = 1;
+  UPDATE x SET v = o.qty FROM @t AS x JOIN dbo.orders AS o ON o.order_id = x.id;
+END",
+    );
+    for want in [
+        "UPDATE pg_temp.tv_p_t AS x SET v = 1 WHERE x.id = 1;",
+        "UPDATE pg_temp.tv_p_t AS x SET v = o.qty FROM orders AS o WHERE o.order_id = x.id;",
+    ] {
+        // The statement's own unit: the smallest that holds it.
+        let u = c
+            .units
+            .iter()
+            .filter(|u| c.output[u.out.start..u.out.end].contains(want))
+            .min_by_key(|u| u.out.end - u.out.start)
+            .unwrap_or_else(|| panic!("{want}\n{}", c.output));
+        assert!(
+            u.status < Status::Unproven,
+            "{want}: {:?} {:?}",
+            u.status,
+            u.notes
+        );
+    }
+}
+
 /// Shapes the UPDATE … FROM rule refuses but the fallback rules still
 /// write: the engine must not call them clean.
 #[test]

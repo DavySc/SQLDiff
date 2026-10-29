@@ -230,6 +230,9 @@ pub struct Column {
     pub identity: bool,
     /// Computed by the database (see `catalog::Column::generated`).
     pub generated: bool,
+    /// A period column of a T-SQL system-versioned table (`GENERATED ALWAYS
+    /// AS ROW START|END`).
+    pub period: bool,
     /// What a string literal compared with this column converts to.
     pub target: Option<Target>,
     /// A collation the column states.
@@ -528,6 +531,9 @@ impl Schema {
                     not_null: !c.nullable,
                     identity: c.identity,
                     generated: c.generated,
+                    period: t.versioning.as_ref().is_some_and(|v| {
+                        c.name.eq_ignore_ascii_case(&v.start) || c.name.eq_ignore_ascii_case(&v.end)
+                    }),
                     target: Target::of(&c.data_type.base, &c.data_type.args, d),
                     collation: c.collation.clone(),
                 })

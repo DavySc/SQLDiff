@@ -320,6 +320,19 @@ pub(super) fn filegroup(ts: &[Tok], i: usize, storage: &mut Vec<String>) -> R<us
 }
 
 /// Reads a whole `CREATE TABLE` statement (terminator dropped).
+/// The name a plain `CREATE TABLE name (…)` creates, without reading the
+/// rest of the statement.
+pub(super) fn created_name(ts: &[Tok]) -> R<Vec<Name>> {
+    if !word(ts.first(), "CREATE") || !word(ts.get(1), "TABLE") {
+        return Err("not a plain CREATE TABLE".into());
+    }
+    let (name, i) = dotted(ts, 2)?;
+    if !ts.get(i).is_some_and(|t| t.kind == K::LParen) {
+        return Err("not a plain CREATE TABLE".into());
+    }
+    Ok(name)
+}
+
 pub fn parse(ts: &[Tok], d: Dialect) -> R<Table> {
     if !word(ts.first(), "CREATE") {
         return Err("not a CREATE TABLE".into());
@@ -1300,7 +1313,7 @@ fn keys(ns: &[Name], d: Dialect) -> R<Vec<String>> {
 }
 
 /// Schema (None for the default one) and table name.
-fn table_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
+pub(super) fn table_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
     let ks = keys(parts, d)?;
     let default = match d {
         Dialect::Tsql => "dbo",

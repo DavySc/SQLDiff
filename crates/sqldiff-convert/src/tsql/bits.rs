@@ -1013,6 +1013,26 @@ impl Cx<'_> {
             .unwrap_or_default()
     }
 
+    /// Whether the catalog gives a column of the named table a default (or
+    /// makes it an identity or computed column).
+    pub(super) fn table_col_has_default(&self, name: &[T], col: &str) -> bool {
+        let parts: Vec<String> = name
+            .iter()
+            .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT))
+            .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
+            .collect();
+        let entry = ScopeEntry {
+            name: parts,
+            alias: None,
+            named: true,
+        };
+        self.entry_table(&entry).is_some_and(|t| {
+            t.columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(col) && (c.has_default || c.identity))
+        })
+    }
+
     /// Runs `f` with `cols` as the bit columns of the table being defined,
     /// and refuses what it wrote when a bit met a number with no exact
     /// rewrite (the engine does not compare DDL).

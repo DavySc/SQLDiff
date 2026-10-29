@@ -255,8 +255,8 @@ pub struct Unit {
     /// statements before each: a table variable compared against the
     /// temporary table it became (`mod.rs`).
     pub table_vars: Vec<(SyntaxNode, usize)>,
-    /// PostgreSQL `DROP TABLE IF EXISTS`, placed like `table_vars`: the drop
-    /// before a converted table variable's `CREATE TEMP TABLE`.
+    /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.t`, placed like `table_vars`:
+    /// the drop before a converted table variable's `CREATE TEMP TABLE`.
     pub temp_drops: Vec<(SyntaxNode, usize)>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
@@ -394,9 +394,13 @@ pub fn lower(a: &Analyzed) -> Unit {
                 }
             }
         }
-        [first, ..] => {
-            u.uncovered
-                .push((first.clone(), "several routines in one artifact".into()));
+        [..] => {
+            // Each routine, so that the statements inside every one of them
+            // (not only the first) are reported as not compared.
+            for r in &routines {
+                u.uncovered
+                    .push((r.clone(), "several routines in one artifact".into()));
+            }
             // Every statement outside the routines is reported on its own
             // line (or compared, for tables, indexes, sequences and schemas),
             // so none counts as compared because the routines were not.
@@ -595,37 +599,51 @@ fn index_beside(r: &SyntaxNode, n: &SyntaxNode, d: Dialect) -> bool {
 
 /// One part of a script that runs as a whole: a T-SQL batch that needs
 /// variables or control flow, a PostgreSQL DO block, a Db2 for i compound
-/// statement (`block`), or the plain statements between them.
+/// statement (`block`), a routine of a script that creates several
+/// (`routine`, its one node), or the plain statements between them.
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub nodes: Vec<SyntaxNode>,
     pub block: bool,
+    pub routine: bool,
 }
 
-/// A script's segments in order; `None` when the artifact holds a routine
-/// (other than a DO block) or a PostgreSQL DO block in another language.
-/// Consecutive plain T-SQL batches form one segment, as do consecutive plain
-/// statements on the other side: a conversion turns a T-SQL batch with
-/// variables or control flow into one block and leaves the others' statements
-/// as they are.
+/// A script's segments in order; `None` when the artifact holds one routine
+/// (other than a DO block), a routine that is not a statement of its own
+/// (a T-SQL batch holds nothing else), or a PostgreSQL DO block in another
+/// language. Consecutive plain T-SQL batches form one segment, as do
+/// consecutive plain statements on the other side: a conversion turns a
+/// T-SQL batch with variables or control flow into one block and leaves the
+/// others' statements as they are. A script that creates several routines
+/// gets one segment for each, so that each routine meets its own conversion
+/// (`script::segment_pairs` pairs them by name).
 pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
     let d = a.dialect();
     let mut out: Vec<Segment> = Vec::new();
-    let mut push = |nodes: Vec<SyntaxNode>, block: bool| {
+    let mut push = |nodes: Vec<SyntaxNode>, block: bool, routine: bool| {
         if nodes.is_empty() {
             return;
         }
         match out.last_mut() {
-            Some(last) if !block && !last.block => last.nodes.extend(nodes),
-            _ => out.push(Segment { nodes, block }),
+            Some(last) if !block && !routine && !last.block && !last.routine => {
+                last.nodes.extend(nodes)
+            }
+            _ => out.push(Segment {
+                nodes,
+                block,
+                routine,
+            }),
         }
     };
+    let routines: Vec<SyntaxNode> = a
+        .root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::ROUTINE && !(d == Dialect::Postgres && is_do(n)))
+        .collect();
+    let several = routines.len() >= 2;
     let top: Vec<SyntaxNode> = cst::structural_children(&a.root);
     if d == Dialect::Tsql {
-        if a.root
-            .descendants()
-            .any(|n| n.kind() == SyntaxKind::ROUTINE)
-        {
+        if !routines.is_empty() && !several {
             return None;
         }
         let batches: Vec<SyntaxNode> = if top.iter().any(|n| n.kind() == SyntaxKind::BATCH) {
@@ -633,13 +651,25 @@ pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
         } else {
             vec![a.root.clone()]
         };
+        let mut seen = 0;
         for b in batches {
             let nodes = cst::structural_children(&b);
+            if nodes.iter().any(|n| n.kind() == SyntaxKind::ROUTINE) {
+                if nodes.len() != 1 {
+                    return None;
+                }
+                seen += 1;
+                push(nodes, false, true);
+                continue;
+            }
             let block = nodes.iter().any(tsql_block);
-            push(nodes, block);
+            push(nodes, block, false);
         }
-        return Some(out);
+        // Every routine is a batch of its own (none sits inside another
+        // statement).
+        return (seen == routines.len()).then_some(out);
     }
+    let mut seen = 0;
     for n in top.into_iter().flat_map(|n| {
         if n.kind() == SyntaxKind::BATCH {
             cst::structural_children(&n)
@@ -648,7 +678,7 @@ pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
         }
     }) {
         match n.kind() {
-            SyntaxKind::ROUTINE if d == Dialect::Postgres => {
+            SyntaxKind::ROUTINE if d == Dialect::Postgres && is_do(&n) => {
                 let words: Vec<String> = cst::header_tokens(&n)
                     .iter()
                     .map(|t| t.text().to_ascii_uppercase())
@@ -669,14 +699,18 @@ pub fn segments(a: &Analyzed) -> Option<Vec<Segment>> {
                 if body.len() != 1 {
                     return None;
                 }
-                push(body, true);
+                push(body, true, false);
+            }
+            SyntaxKind::ROUTINE if several => {
+                seen += 1;
+                push(vec![n], false, true);
             }
             SyntaxKind::ROUTINE => return None,
-            SyntaxKind::BLOCK if d == Dialect::Db2i => push(vec![n], true),
-            _ => push(vec![n], false),
+            SyntaxKind::BLOCK if d == Dialect::Db2i => push(vec![n], true, false),
+            _ => push(vec![n], false, false),
         }
     }
-    Some(out)
+    (seen == routines.len()).then_some(out)
 }
 
 /// Whether a T-SQL statement needs a block to run elsewhere: control flow,
@@ -708,6 +742,19 @@ fn tsql_block(n: &SyntaxNode) -> bool {
 /// Lowers one segment of a script.
 pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
     let mut u = empty(d);
+    if let (true, [r]) = (seg.routine, seg.nodes.as_slice()) {
+        // As `lower` lowers the one routine of an artifact.
+        u.in_block = true;
+        header(r, &mut u);
+        for c in r.children() {
+            if c.kind() == SyntaxKind::ROUTINE_BODY {
+                walk(&c, &mut u);
+            }
+        }
+        super::options::body_checks(r, &mut u);
+        place_txn(&mut u);
+        return u;
+    }
     u.in_block = seg.block && d != Dialect::Tsql;
     let routines: Vec<SyntaxNode> = seg
         .nodes
@@ -1521,9 +1568,10 @@ fn table_var_decl(c: &SyntaxNode, d: Dialect) -> bool {
     }
 }
 
-/// PostgreSQL `DROP TABLE IF EXISTS`.
+/// PostgreSQL `DROP TABLE IF EXISTS pg_temp.…`. Other drops are compared
+/// statement against statement (`ddl.rs`).
 fn temp_drop(c: &SyntaxNode, d: Dialect) -> bool {
-    d == Dialect::Postgres && cst::first_words(c, 4) == ["DROP", "TABLE", "IF", "EXISTS"]
+    d == Dialect::Postgres && cst::first_words(c, 5) == ["DROP", "TABLE", "IF", "EXISTS", "PG_TEMP"]
 }
 
 /// A top-level `CREATE [prefix] TABLE` statement.
@@ -1552,7 +1600,10 @@ fn is_call(c: &SyntaxNode, d: Dialect) -> bool {
             }
             _ => w(0) == "CALL",
         },
-        StmtKind::Ddl => d != Dialect::Tsql && w(0) == "COMMENT" && w(1) == "ON",
+        StmtKind::Ddl => {
+            (d != Dialect::Tsql && w(0) == "COMMENT" && w(1) == "ON")
+                || super::call::is_switch(&tokens(c), d)
+        }
         _ => false,
     }
 }
