@@ -486,7 +486,7 @@ id = "ASM-FACT-*"
 statement = "A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2)."
 discharge = "nothing"
 fact = "The vendor fact checked on a real system (docs/vendor-facts-verification.md)."
-sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/paging.rs", "sqldiff-core/src/ir/interp.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/paging.rs", "sqldiff-core/src/equiv/literal.rs", "sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
 id = "ASM-FRACTIONAL-SECONDS"
