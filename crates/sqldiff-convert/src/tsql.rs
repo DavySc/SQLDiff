@@ -68,6 +68,7 @@ pub(crate) fn convert(
         in_cast: false,
         return_code: false,
         txn_control: false,
+        wrapper: None,
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
@@ -191,6 +192,10 @@ struct Cx<'a> {
     /// PostgreSQL: the procedure body COMMITs or ROLLs BACK, which a
     /// SECURITY DEFINER procedure may not.
     txn_control: bool,
+    /// PostgreSQL: where the `BEGIN TRAN` and the `COMMIT` of a transaction
+    /// that wraps all the durable work of the routine or script start
+    /// ([`txn_wrapper`]); both are dropped.
+    wrapper: Option<(usize, usize)>,
     decls: Vec<Decl>,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
@@ -409,12 +414,16 @@ impl<'a> Cx<'a> {
         self.tables.clear();
         self.savepoints.clear();
         self.dynamic.clear();
+        self.wrapper = None;
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
         self.mode = Mode::Do;
         self.reset();
         self.dynamic = dynamic_sql_vars(&tokens(b));
+        if !self.db2() {
+            self.wrapper = txn_wrapper(b);
+        }
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
         if self.db2() {
@@ -693,6 +702,9 @@ impl<'a> Cx<'a> {
         let body = r.children().find(|c| c.kind() == ROUTINE_BODY).ok_or(No(
             "routine without a body: the statement is cut short or malformed".into(),
         ))?;
+        if !self.db2() && !func {
+            self.wrapper = txn_wrapper(&body);
+        }
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
         match block {
@@ -2995,11 +3007,26 @@ impl<'a> Cx<'a> {
                 if self.in_catch {
                     return self.misplaced("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
                 }
+                let at = s.first().map(|&j| ts[j].pos.0);
+                if let (Some(at), Some((b, c))) = (at, self.wrapper) {
+                    if at == b || at == c {
+                        // The CALL (or DO) is one transaction already, and
+                        // inside a caller's transaction both sides leave the
+                        // work to the caller: nothing to choose.
+                        self.step_ts("tsql.txn.wrapper", &ts);
+                        return Ok(if at == b {
+                            "-- BEGIN TRANSACTION: the call is one transaction in PostgreSQL"
+                        } else {
+                            "-- COMMIT: the work commits with the call (or with the caller's transaction)"
+                        }
+                        .into());
+                    }
+                }
                 if kw == "BEGIN" {
-                    self.note(Status::Decision, "pg.proc-transaction", "A PostgreSQL procedure already runs inside a transaction; BEGIN TRAN is dropped. Nested-transaction behaviour (@@TRANCOUNT) does not exist.");
+                    self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "BEGIN TRAN is dropped: a PostgreSQL procedure already runs inside a transaction, and the COMMITs that follow end it. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL nests (@@TRANCOUNT) and PostgreSQL refuses the COMMIT.");
                     return Ok("-- BEGIN TRANSACTION: implicit in PostgreSQL".into());
                 }
-                self.note(Status::Decision, "pg.proc-transaction", "COMMIT/ROLLBACK in a procedure only works when it is CALLed outside an explicit transaction block. In T-SQL a COMMIT inside the caller's transaction only decrements @@TRANCOUNT; here it commits the caller's work too.");
+                self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "COMMIT/ROLLBACK stays: right when the procedure is CALLed outside a transaction block (autocommit). Inside a caller's transaction T-SQL's inner COMMIT only decrements @@TRANCOUNT, where PostgreSQL refuses it (invalid transaction termination).");
                 self.txn_control = true;
                 Ok(kw.to_string())
             }
@@ -5677,6 +5704,127 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The `BEGIN TRAN` and `COMMIT` (where each starts) of a body whose durable
+/// work all runs inside that one transaction, so that a PostgreSQL CALL or
+/// DO, which is one transaction already, behaves the same without them:
+/// autocommit commits the work with the call, and inside a caller's
+/// transaction both sides leave it to the caller (T-SQL's inner COMMIT only
+/// decrements @@TRANCOUNT). Checked on SQL Server 2022 and PostgreSQL 18.
+///
+/// The body's own list (BEGIN … END blocks flattened) holds exactly one
+/// `BEGIN TRAN` and, after it, one `COMMIT`; before them only declarations,
+/// SET, PRINT and SELECT without INTO, after them at most `RETURN n`.
+/// Nowhere else in the body: transaction control, @@TRANCOUNT, XACT_STATE,
+/// TRY/CATCH, THROW, RAISERROR, EXEC, GOTO, another RETURN or a table
+/// variable. A failing statement must end the transaction alike:
+/// `SET XACT_ABORT ON` before the BEGIN, or only one statement inside that
+/// writes (a statement fails as a whole).
+fn txn_wrapper(body: &SyntaxNode) -> Option<(usize, usize)> {
+    fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+        for c in n.children() {
+            if c.kind() == BLOCK || c.kind().is_container() {
+                flat(&c, out);
+            } else if c.kind().is_unit() {
+                out.push(c);
+            }
+        }
+    }
+    let at = |n: &SyntaxNode| tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
+    let words = |n: &SyntaxNode| -> Vec<String> {
+        tokens(n)
+            .iter()
+            .filter(|t| t.sig())
+            .take(2)
+            .map(|t| t.up())
+            .collect()
+    };
+    let is_begin = |n: &SyntaxNode| {
+        let w = words(n);
+        n.kind() == STATEMENT
+            && w.len() == 2
+            && w[0] == "BEGIN"
+            && matches!(w[1].as_str(), "TRAN" | "TRANSACTION")
+    };
+    let neutral = |n: &SyntaxNode| {
+        n.kind() == STATEMENT
+            && match first_word(n).as_str() {
+                "DECLARE" | "SET" | "PRINT" => true,
+                "SELECT" => !tokens(n).iter().any(|t| t.is("INTO")),
+                _ => false,
+            }
+    };
+    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
+    let banned = all.iter().any(|t| {
+        [
+            "ROLLBACK",
+            "SAVE",
+            "THROW",
+            "RAISERROR",
+            "EXEC",
+            "EXECUTE",
+            "GOTO",
+            "XACT_STATE",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+    }) || all
+        .windows(2)
+        .any(|w| w[0].k == VARIABLE && w[1].is("TABLE"))
+        || body.descendants().any(|d| d.kind() == TRY_CATCH);
+    if banned || all.iter().filter(|t| t.is("COMMIT")).count() != 1 {
+        return None;
+    }
+    let mut top = Vec::new();
+    flat(body, &mut top);
+    let begins: Vec<usize> = (0..top.len()).filter(|&i| is_begin(&top[i])).collect();
+    let begun = all
+        .windows(2)
+        .filter(|w| w[0].is("BEGIN") && (w[1].is("TRAN") || w[1].is("TRANSACTION")))
+        .count();
+    let [b] = begins[..] else { return None };
+    let c =
+        (0..top.len()).find(|&i| first_word(&top[i]) == "COMMIT" && top[i].kind() == STATEMENT)?;
+    if begun != 1 || c < b {
+        return None;
+    }
+    // After the COMMIT, a statement that fails would leave T-SQL's work
+    // committed and roll PostgreSQL's back: only a last `RETURN` or
+    // `RETURN <number>`.
+    let ret_last = |i: usize| {
+        let w: Vec<T> = tokens(&top[i])
+            .into_iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .collect();
+        i + 1 == top.len()
+            && w.first().is_some_and(|t| t.is("RETURN"))
+            && (w.len() == 1 || w.len() == 2 && w[1].s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !(0..b).all(|i| neutral(&top[i])) || !(c + 1..top.len()).all(ret_last) {
+        return None;
+    }
+    let xact_abort = top[..b].iter().any(|n| {
+        let w: Vec<String> = tokens(n)
+            .iter()
+            .filter(|t| t.sig())
+            .map(|t| t.up())
+            .collect();
+        w == ["SET", "XACT_ABORT", "ON"] || w == ["SET", "XACT_ABORT", "ON", ";"]
+    }) && !all
+        .windows(2)
+        .any(|w| w[0].is("XACT_ABORT") && w[1].is("OFF"));
+    let writes: Vec<&SyntaxNode> = top[b + 1..c].iter().filter(|n| !neutral(n)).collect();
+    if !xact_abort && (writes.len() > 1 || writes.iter().any(|n| n.kind() != STATEMENT)) {
+        return None;
+    }
+    // A RETURN before the COMMIT leaves T-SQL's transaction open.
+    let returns = all.iter().filter(|t| t.is("RETURN")).count();
+    if returns > usize::from(ret_last(top.len().wrapping_sub(1))) {
+        return None;
+    }
+    Some((at(&top[b])?, at(&top[c])?))
 }
 
 /// The first keyword of a unit, upper case.
