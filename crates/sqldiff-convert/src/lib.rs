@@ -380,7 +380,17 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     let Draft { from, to, raw } = draft;
     let a = Artifact::new("input.sql", from, input);
     let b = Artifact::new("converted.sql", to, raw.text.as_str());
-    let report = sqldiff_core::diff(&a, &b, opts);
+    // The engine pairs statements through the units' trace: an input
+    // statement only with output written from it.
+    let traced = Options {
+        anchors: raw
+            .units
+            .iter()
+            .map(|u| sqldiff_core::equiv::Anchor { a: u.src, b: u.out })
+            .collect(),
+        ..opts.clone()
+    };
+    let report = sqldiff_core::diff(&a, &b, &traced);
     // The output on its own, bound against the target catalog.
     let own = Options {
         catalog_a: opts.catalog_b.clone(),

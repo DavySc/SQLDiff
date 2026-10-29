@@ -429,6 +429,25 @@ literal assignment that cannot fail (NULL, a string or binary constant into a
 variable of that kind, a literal whose conversion is modelled and succeeds)
 is not taken as the failing statement.
 
+## Pairing the statements of a conversion
+
+Two hand-written artifacts are paired statement by statement in order (by
+position when both have as many statements, otherwise by an alignment that
+keeps only what every best alignment agrees on). When `sqldiff convert`
+checks its own output it knows more: each unit records the input span it
+read and the output span it wrote, and the check passes these to the
+engine as anchors (`Options::anchors`). Then a statement pairs only with a
+statement in the same anchor (the innermost one holding it on each side;
+several when one input statement gave several pieces of output, such as a
+declaration moved to the top of its block and the assignment left in
+place). Statements linked through shared anchors form a group: one
+statement per side is a pair, a larger group is aligned on its own. A
+statement no anchor links has no counterpart, and pairs that cross another
+pair are dropped ("the conversion put it in another order"): comparing
+statements one by one says nothing about a changed order. So a dropped
+PRINT, a statement the engine cannot read, or a run of identical statements
+never shifts the pairing of the statements around it.
+
 ## Witnesses for changed statements
 
 When two paired statements lower to terms that differ in a way no rule

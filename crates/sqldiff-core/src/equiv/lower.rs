@@ -89,6 +89,46 @@ pub struct LStmt {
     pub ast: Result<Stmt, String>,
     /// PostgreSQL declaration-section initializers are lowered as assignments.
     pub from_declare: bool,
+    /// A message or error built from a format (`ast` then says why it is
+    /// not a plain statement): compared as its text (`Canon::message`).
+    pub msg: Option<Msg>,
+}
+
+/// A message or raised error whose text a format builds: T-SQL
+/// `RAISERROR (format, severity, state [, args])`, PL/pgSQL
+/// `RAISE NOTICE | EXCEPTION 'format' [, args]`.
+#[derive(Debug, Clone)]
+pub struct Msg {
+    /// Raised as an error (T-SQL severity 11 to 18, `RAISE EXCEPTION`);
+    /// otherwise an informational message (severity 0 to 10, `RAISE NOTICE`).
+    pub error: bool,
+    pub parts: Vec<MsgPart>,
+    /// T-SQL `RAISERROR`: the text is cut to 2,047 characters, and an empty
+    /// text reaches the client as one space.
+    pub tsql: bool,
+    /// The format is a variable (`RAISERROR (@v, …)`): a `%` in its value
+    /// is a format specification.
+    pub format_var: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum MsgPart {
+    Text(String),
+    /// A value shown as text, and as `null` when it is NULL.
+    Arg {
+        value: super::ast::Expr,
+        null: String,
+        spec: Spec,
+    },
+}
+
+/// What a format argument must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spec {
+    /// T-SQL `%s`, PostgreSQL `%` of a string: a character string.
+    Str,
+    /// T-SQL `%d` / `%i`, PostgreSQL `%` of `CAST(x AS text)`: an integer.
+    Int,
 }
 
 /// Where a call sits: after this many data statements of the body, or
@@ -233,6 +273,14 @@ pub fn lower(a: &Analyzed) -> Unit {
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::ROUTINE)
         .collect();
+    // PostgreSQL DO blocks beside one routine are statements outside it, as
+    // a Db2 for i compound statement is (a converted script's setup batch).
+    let named: Vec<SyntaxNode> = routines
+        .iter()
+        .filter(|r| !(d == Dialect::Postgres && is_do(r)))
+        .cloned()
+        .collect();
+    let routines = if named.len() == 1 { named } else { routines };
     match routines.as_slice() {
         [] => walk(&a.root, &mut u),
         [r] => {
@@ -311,6 +359,13 @@ pub fn lower(a: &Analyzed) -> Unit {
     }
     place_txn(&mut u);
     u
+}
+
+/// Whether a PostgreSQL routine node is a DO block.
+fn is_do(r: &SyntaxNode) -> bool {
+    cst::header_tokens(r)
+        .first()
+        .is_some_and(|t| t.text().eq_ignore_ascii_case("DO"))
 }
 
 /// One part of a script that runs as a whole: a T-SQL batch that needs
@@ -783,12 +838,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     let kind = stmt_kind(c, d);
     let words = cst::first_words(c, 3);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
-    if let Some(ast) = message(c, d) {
+    if let Some((ast, msg)) = message(c, d) {
         u.stmts.push(LStmt {
             node: c.clone(),
             toks: tokens(c),
             ast,
             from_declare: false,
+            msg,
         });
         return;
     }
@@ -846,6 +902,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 toks,
                 ast,
                 from_declare,
+                msg: None,
             });
         }
         // A script's own `CREATE TABLE`: compared table against table
@@ -884,6 +941,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                         toks: body,
                         ast,
                         from_declare: false,
+                        msg: None,
                     });
                 }
                 _ => u
@@ -1007,22 +1065,37 @@ fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }
 
-/// T-SQL `PRINT e`; PostgreSQL `RAISE NOTICE '%', e` or `RAISE NOTICE 'text'`
-/// (no placeholder). `None` for any other statement; an error for a message
-/// whose form is not read.
-fn message(c: &SyntaxNode, d: Dialect) -> Option<Result<Stmt, String>> {
+/// What a message statement lowers to: a plain statement, or a message
+/// built from a format.
+type Lowered = (Result<Stmt, String>, Option<Msg>);
+
+/// T-SQL `PRINT e` and `RAISERROR (format, severity, state [, args])`;
+/// PostgreSQL `RAISE NOTICE '%', e`, `RAISE NOTICE 'text'` and
+/// `RAISE NOTICE | EXCEPTION 'format', args`. `None` for any other
+/// statement; an error for a message whose form is not read.
+fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
+    use super::ast::Expr;
     let toks: Vec<Tok> = tokens(c)
         .into_iter()
         .filter(|t| t.kind != K::Semi)
         .collect();
+    let level = toks.get(1).map(|t| t.up.as_str());
     let rest = match (d, toks.first().map(|t| t.up.as_str())) {
         (Dialect::Tsql, Some("PRINT")) => &toks[1..],
-        (Dialect::Postgres, Some("RAISE")) if toks.get(1).is_some_and(|t| t.up == "NOTICE") => {
+        (Dialect::Tsql, Some("RAISERROR")) => {
+            let r = raiserror(&toks[1..]);
+            let why = "a RAISERROR compared as its message".to_string();
+            return Some(match r {
+                Ok(m) => (Err(why), Some(m)),
+                Err(e) => (Err(e), None),
+            });
+        }
+        (Dialect::Postgres, Some("RAISE")) if matches!(level, Some("NOTICE" | "EXCEPTION")) => {
             &toks[2..]
         }
         _ => return None,
     };
-    let expr = |ts: &[Tok]| -> Result<super::ast::Expr, String> {
+    let expr = |ts: &[Tok]| -> Result<Expr, String> {
         let mut p = Parser::new(ts, d);
         let e = p.expr()?;
         if p.at_end() {
@@ -1031,21 +1104,279 @@ fn message(c: &SyntaxNode, d: Dialect) -> Option<Result<Stmt, String>> {
             Err("trailing tokens after the message".into())
         }
     };
-    Some((|| {
-        if d == Dialect::Tsql {
-            return Ok(Stmt::Message(expr(rest)?));
-        }
-        let parts = split_commas(rest);
-        let fmt = match parts.first().map(|p| expr(p)) {
-            Some(Ok(super::ast::Expr::Str(f))) => f,
-            _ => return Err("RAISE NOTICE without a format string".into()),
+    if d == Dialect::Tsql {
+        return Some((expr(rest).map(Stmt::Message), None));
+    }
+    let error = level == Some("EXCEPTION");
+    // `RAISE EXCEPTION USING MESSAGE = …` (THROW's conversion) and other
+    // forms without a format string stay uncovered, as before.
+    if !rest.first().is_some_and(|t| t.kind == K::Str) {
+        return if error {
+            None
+        } else {
+            Some((Err("RAISE NOTICE without a format string".into()), None))
         };
-        match parts.as_slice() {
-            [_] if !fmt.contains('%') => Ok(Stmt::Message(super::ast::Expr::Str(fmt))),
-            [_, arg] if fmt == "%" => Ok(Stmt::Message(expr(arg)?)),
-            _ => Err("a RAISE NOTICE format other than '%' with one value".into()),
+    }
+    // `USING ERRCODE = 'P0001'` (RAISE EXCEPTION's own default) is the one
+    // option read: the rest change what the caller sees.
+    let using = rest
+        .iter()
+        .position(|t| t.kind == K::Word && t.up == "USING")
+        .unwrap_or(rest.len());
+    let opts: Vec<&str> = rest[using..]
+        .iter()
+        .map(|t| {
+            if t.kind == K::Word {
+                t.up.as_str()
+            } else {
+                t.text.as_str()
+            }
+        })
+        .collect();
+    let errcode = matches!(opts.as_slice(), ["USING", "ERRCODE", "=", "'P0001'"]);
+    // A RAISE EXCEPTION without it is no RAISERROR's conversion (the
+    // converter's stand-in for a statement it did not convert is one): it
+    // stays uncovered, as before.
+    if error && !errcode {
+        return None;
+    }
+    let opts_ok = opts.is_empty() || errcode;
+    let parts = split_commas(&rest[..using]);
+    let fmt = match parts.first().map(|p| expr(p)) {
+        Some(Ok(Expr::Str(f))) => f,
+        _ => return Some((Err("RAISE without a format string".into()), None)),
+    };
+    let lowered =
+        (|| -> Result<Lowered, String> {
+            if !opts_ok {
+                return Err("RAISE with USING options other than ERRCODE = 'P0001'".into());
+            }
+            let args = parts[1..]
+                .iter()
+                .map(|p| expr(p))
+                .collect::<Result<Vec<_>, _>>()?;
+            if !error {
+                match (args.as_slice(), fmt.as_str()) {
+                    ([], f) if !f.contains('%') => {
+                        return Ok((Ok(Stmt::Message(Expr::Str(fmt.clone()))), None))
+                    }
+                    ([arg], "%") if pg_shown(arg).is_none() => {
+                        return Ok((Ok(Stmt::Message(arg.clone())), None))
+                    }
+                    _ => {}
+                }
+            }
+            let mut args = args.into_iter();
+            let mut parts = Vec::new();
+            let mut text = String::new();
+            let mut cs = fmt.chars().peekable();
+            while let Some(ch) = cs.next() {
+                if ch != '%' {
+                    text.push(ch);
+                    continue;
+                }
+                if cs.peek() == Some(&'%') {
+                    cs.next();
+                    text.push('%');
+                    continue;
+                }
+                let arg = args.next().ok_or("too few parameters for RAISE")?;
+                match pg_shown(&arg) {
+                    Some(MsgPart::Text(s)) => text.push_str(&s),
+                    Some(p) => {
+                        parts.push(MsgPart::Text(std::mem::take(&mut text)));
+                        parts.push(p);
+                    }
+                    None => return Err(
+                        "a RAISE value that may be NULL (PostgreSQL shows <NULL>, T-SQL (null))"
+                            .into(),
+                    ),
+                }
+            }
+            if args.next().is_some() {
+                return Err("too many parameters for RAISE".into());
+            }
+            parts.push(MsgPart::Text(text));
+            let msg = Msg {
+                error,
+                parts,
+                tsql: false,
+                format_var: false,
+            };
+            Ok((Err("a RAISE compared as its message".into()), Some(msg)))
+        })();
+    Some(lowered.unwrap_or_else(|e| (Err(e), None)))
+}
+
+/// A PL/pgSQL `RAISE` argument that is never NULL, as a message part: a
+/// string literal, `COALESCE(x, 'text')` (a string `x`) or
+/// `COALESCE(CAST(x AS text), 'text')` (an integer `x`).
+fn pg_shown(e: &super::ast::Expr) -> Option<MsgPart> {
+    use super::ast::Expr;
+    match e {
+        Expr::Str(s) => Some(MsgPart::Text(s.clone())),
+        Expr::Call(c)
+            if c.name.len() == 1
+                && c.name[0].eq_ignore_ascii_case("COALESCE")
+                && !c.distinct
+                && !c.over
+                && !c.star
+                && c.order.is_empty() =>
+        {
+            let [x, Expr::Str(null)] = c.args.as_slice() else {
+                return None;
+            };
+            let (value, spec) = match x {
+                Expr::Cast(v, t) if t.name.eq_ignore_ascii_case("TEXT") && t.args.is_empty() => {
+                    ((**v).clone(), Spec::Int)
+                }
+                v => (v.clone(), Spec::Str),
+            };
+            Some(MsgPart::Arg {
+                value,
+                null: null.clone(),
+                spec,
+            })
         }
-    })())
+        _ => None,
+    }
+}
+
+/// `RAISERROR (format, severity, state [, args]) [WITH NOWAIT]`, from the
+/// token after the keyword. Read only with a literal severity of 0 to 18 and
+/// a format that is a string literal (`%s`, `%d`, `%i`, `%%` and as many
+/// arguments as it takes) or a variable without arguments. Verified on SQL
+/// Server 2022: a NULL argument shows as `(null)`, a NULL format as an
+/// empty message; severity 0 to 10 is an informational message that
+/// TRY/CATCH does not catch.
+fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
+    use super::ast::Expr;
+    let close = match toks.first() {
+        Some(t) if t.kind == K::LParen => {
+            let mut depth = 0;
+            toks.iter()
+                .position(|t| {
+                    match t.kind {
+                        K::LParen => depth += 1,
+                        K::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .ok_or("RAISERROR without its closing parenthesis")?
+        }
+        _ => return Err("RAISERROR without parentheses".into()),
+    };
+    // WITH NOWAIT only sends the message at once; LOG and SETERROR change
+    // what is recorded.
+    match toks[close + 1..]
+        .iter()
+        .map(|t| t.up.as_str())
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] | ["WITH", "NOWAIT"] => {}
+        _ => return Err("RAISERROR WITH LOG or SETERROR".into()),
+    }
+    let expr = |ts: &[Tok]| -> Result<Expr, String> {
+        let mut p = Parser::new(ts, Dialect::Tsql);
+        let e = p.expr()?;
+        if p.at_end() {
+            Ok(e)
+        } else {
+            Err("trailing tokens in a RAISERROR argument".into())
+        }
+    };
+    let args = split_commas(&toks[1..close])
+        .into_iter()
+        .map(expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    let [fmt, sev, _state, args @ ..] = args.as_slice() else {
+        return Err("RAISERROR with fewer than three arguments".into());
+    };
+    let error = match sev {
+        Expr::Num(s) => match s.parse::<u32>() {
+            Ok(0..=10) => false,
+            Ok(11..=18) => true,
+            _ => return Err("a RAISERROR severity outside 0 to 18".into()),
+        },
+        _ => return Err("a RAISERROR severity that is not a literal".into()),
+    };
+    let null = "(null)".to_string();
+    let mut parts = Vec::new();
+    let format_var = match fmt {
+        Expr::Var(v) if !v.starts_with("@@") => {
+            if !args.is_empty() {
+                return Err("a RAISERROR format variable with arguments".into());
+            }
+            parts.push(MsgPart::Arg {
+                value: fmt.clone(),
+                null: String::new(),
+                spec: Spec::Str,
+            });
+            true
+        }
+        Expr::Str(f) => {
+            let mut args = args.iter();
+            let mut text = String::new();
+            let mut cs = f.chars();
+            while let Some(ch) = cs.next() {
+                if ch != '%' {
+                    text.push(ch);
+                    continue;
+                }
+                let spec = match cs.next() {
+                    Some('%') => {
+                        text.push('%');
+                        continue;
+                    }
+                    Some('s') => Spec::Str,
+                    Some('d' | 'i') => Spec::Int,
+                    _ => {
+                        return Err(
+                            "a RAISERROR format specification other than %s, %d, %i or %%".into(),
+                        )
+                    }
+                };
+                let value = args
+                    .next()
+                    .ok_or("a RAISERROR format with more specifications than arguments")?;
+                // A constant shows as its text (the substitution is not read
+                // as a format again).
+                match (value, spec) {
+                    (Expr::Str(x), Spec::Str) => {
+                        text.push_str(x);
+                        continue;
+                    }
+                    (Expr::Num(x), Spec::Int)
+                        if x.parse::<i32>().is_ok_and(|v| v.to_string() == *x) =>
+                    {
+                        text.push_str(x);
+                        continue;
+                    }
+                    _ => {}
+                }
+                parts.push(MsgPart::Text(std::mem::take(&mut text)));
+                parts.push(MsgPart::Arg {
+                    value: value.clone(),
+                    null: null.clone(),
+                    spec,
+                });
+            }
+            if args.next().is_some() {
+                return Err("a RAISERROR with more arguments than its format uses".into());
+            }
+            parts.push(MsgPart::Text(text));
+            false
+        }
+        _ => return Err("a RAISERROR message number".into()),
+    };
+    Ok(Msg {
+        error,
+        parts,
+        tsql: true,
+        format_var,
+    })
 }
 
 fn note(u: &mut Unit, s: &str) {
@@ -1103,6 +1434,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         toks,
         ast,
         from_declare: true,
+        msg: None,
     });
 }
 

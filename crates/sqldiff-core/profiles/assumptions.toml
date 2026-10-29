@@ -715,6 +715,27 @@ fact = "A reading of how the routine uses the result."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-RAISERROR-FORMAT"
+statement = "The variable RAISERROR takes as its message holds no % sign (T-SQL reads it as a format)."
+discharge = "deployment"
+fact = "The values the routine puts in the message variable."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-RAISERROR-INFO"
+statement = "Callers read an informational RAISERROR message by its text, not its message number (50000), severity or state, which a PostgreSQL notice does not carry."
+discharge = "deployment"
+fact = "How callers read informational messages."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-RAISERROR-TEXT"
+statement = "A RAISERROR message is 1 to 2,047 characters long (T-SQL cuts a longer one and sends an empty one as a space)."
+discharge = "deployment"
+fact = "The values the message is built from."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-RAND-PER-QUERY"
 statement = "A statement with RAND() produces a single value (T-SQL evaluates it once per query, the target once per row)."
 discharge = "generated"
