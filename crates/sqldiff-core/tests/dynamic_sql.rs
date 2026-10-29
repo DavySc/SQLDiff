@@ -182,3 +182,61 @@ fn statements_inside_an_uncovered_if_are_each_not_compared() {
         );
     }
 }
+
+#[test]
+fn a_call_moved_across_the_dynamic_sql_is_unknown() {
+    // q sets v = 1 on row 3: T-SQL deletes it, PostgreSQL keeps it.
+    let cat_t = "CREATE TABLE dbo.t (id int NOT NULL PRIMARY KEY, v int NULL);\nGO\nCREATE PROCEDURE dbo.q AS BEGIN UPDATE dbo.t SET v = 1 WHERE id = 3; END;\n";
+    let cat_p = "CREATE TABLE t (id int NOT NULL PRIMARY KEY, v int NULL);\nCREATE OR REPLACE PROCEDURE q() LANGUAGE plpgsql AS $$ BEGIN UPDATE t SET v = 1 WHERE id = 3; END; $$;\n";
+    let o = Options {
+        catalog_a: vec![Artifact::new("cat.sql", T, cat_t)],
+        catalog_b: vec![Artifact::new("cat.pg.sql", P, cat_p)],
+        ..Options::default()
+    };
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            T,
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n    SET XACT_ABORT ON;\n    EXEC dbo.q;\n    EXEC (N'DELETE FROM dbo.t WHERE v = 1');\nEND;\n",
+        ),
+        &Artifact::new(
+            "b.sql",
+            P,
+            "CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    EXECUTE 'DELETE FROM t WHERE v = 1';\n    CALL q();\nEND;\n$$;\n",
+        ),
+        &o,
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(
+        dynamic_reasons(&r)
+            .iter()
+            .any(|x| x.contains("another order")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // The same order on both sides is still compared.
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            T,
+            "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n    SET XACT_ABORT ON;\n    EXEC dbo.q;\n    EXEC (N'DELETE FROM dbo.t WHERE v = 1');\nEND;\n",
+        ),
+        &Artifact::new(
+            "b.sql",
+            P,
+            "CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n    CALL q();\n    EXECUTE 'DELETE FROM t WHERE v = 1';\nEND;\n$$;\n",
+        ),
+        &o,
+    );
+    assert!(
+        !dynamic_reasons(&r)
+            .iter()
+            .any(|x| x.contains("another order")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}

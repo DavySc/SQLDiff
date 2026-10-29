@@ -552,6 +552,25 @@ fn dynamic_sql(
             );
             continue;
         }
+        // Calls in the same gap run before or after it: both sides must
+        // order them the same way, or a call's changes reach one text only.
+        let around = |side: &Analyzed, u: &Unit, n: &SyntaxNode, at: &lower::CallAt| {
+            let gap = u.calls.iter().filter(|(c, c_at)| {
+                c_at.after == at.after && !lower::is_comment(c, side.dialect())
+            });
+            let before = gap
+                .clone()
+                .filter(|(c, _)| c.text_range().start() < n.text_range().start())
+                .count();
+            (before, gap.count())
+        };
+        if around(a, ua, xn, at_a) != around(b, ub, yn, at_b) {
+            unknown(
+                out,
+                "calls next to it run in another order relative to it on the two sides",
+            );
+            continue;
+        }
         let (tn, pn) = if t_is_a { (xn, yn) } else { (yn, xn) };
         let ttext = match dynamic::tsql_text(tn) {
             dynamic::Text::Known(s) => s,
