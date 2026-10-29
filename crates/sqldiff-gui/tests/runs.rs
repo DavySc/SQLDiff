@@ -2,7 +2,7 @@
 //! unchanged, in PowerShell and in a POSIX shell. (The GUI-vs-CLI parity
 //! test in sqldiff-cli runs the commands through this platform's shell.)
 
-use sqldiff_gui::runs::{powershell_quote, sh_quote};
+use sqldiff_gui::runs::{opening_page, powershell_quote, sh_quote};
 
 #[test]
 fn plain_arguments_stay_bare() {
@@ -43,4 +43,19 @@ fn sh_single_quotes_and_closes_around_quotes() {
         let q = sh_quote(a);
         assert!(q.starts_with('\'') && q.ends_with('\''), "{a} -> {q}");
     }
+}
+
+#[test]
+fn the_opening_page_reloads_and_says_how_far_the_conversion_got() {
+    let html = opening_page(7, 0, 0);
+    assert!(html.contains(r#"<meta http-equiv="refresh" content="1">"#));
+    assert!(html.contains("Opening the review of run 7"));
+    assert!(html.contains("Reading the source tree"));
+    assert!(
+        html.contains("<!--__SQLDIFF_SHELL__-->"),
+        "framed by the app"
+    );
+    let html = opening_page(7, 92, 336);
+    assert!(html.contains("Converted 92 of 336 files"));
+    assert!(html.contains("width: 27%"));
 }
