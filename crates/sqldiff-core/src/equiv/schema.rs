@@ -29,6 +29,10 @@ pub enum Fam {
     /// PostgreSQL interval.
     Interval,
     Bool,
+    /// Variable-length binary string (T-SQL varbinary, PostgreSQL bytea,
+    /// Db2 for i VARBINARY and BLOB); `len` None means unbounded (MAX).
+    /// Fixed-length BINARY(n) stays `Other`: T-SQL pads it with zeros.
+    Binary,
     Other,
 }
 
@@ -204,6 +208,13 @@ impl Ty {
             "TIME" => Self::time_ty(Fam::Time, n(0), d),
             "INTERVAL" if d == Dialect::Postgres => Ty::of(Fam::Interval),
             "BOOLEAN" | "BOOL" => Ty::of(Fam::Bool),
+            "VARBINARY" | "BINARY VARYING" => fam_len(Fam::Binary, tsql_default),
+            "BYTEA" if d == Dialect::Postgres => Ty::of(Fam::Binary),
+            "BLOB" | "BINARY LARGE OBJECT" if d == Dialect::Db2i => Ty {
+                fam: Fam::Binary,
+                len: if max { None } else { n(0) },
+                scale: None,
+            },
             _ => Ty::of(Fam::Other),
         }
     }
