@@ -1075,6 +1075,10 @@ pub mod asm {
         "ASM-IDENTITY-VALUES",
         "Identity columns hand out the same values: nobody relies on the gaps rolled-back inserts or restarts leave (SQL Server caches identity values, PostgreSQL sequences do not), and explicit values go in only with IDENTITY_INSERT on one side and OVERRIDING SYSTEM VALUE on the other",
     );
+    pub const FRACTIONAL_SECONDS: (&str, &str) = (
+        "ASM-FRACTIONAL-SECONDS",
+        "No value depends on the 7th fraction digit of the seconds: the datetime2(7) and time(7) values stored, compared and computed are whole microseconds, which PostgreSQL's 6 digits hold exactly (PostgreSQL rounds a 7th digit away; data moved from SQL Server must carry none, or drop it the same way)",
+    );
     pub const ANSI_NULL_DEFAULT: (&str, &str) = (
         "ASM-TSQL-ANSI-NULL-DEFAULT",
         "T-SQL columns declared without NULL or NOT NULL are nullable: ANSI_NULL_DFLT_ON is in effect when the table is created, as it is for ODBC, OLE DB and .NET connections and SSDT deployments",
@@ -1193,6 +1197,19 @@ pub fn types(t: &Ty, p: &Ty) -> TyCmp {
         (Ty::Time(a), Ty::Time(b)) if a == b => c.wider = Some("24:00:00".into()),
         (Ty::DateTime2(a), Ty::Timestamp(b)) if a == b => {
             c.wider = Some("timestamps before year 1 or after year 9999, and infinity".into())
+        }
+        // T-SQL's default 7 digits against PostgreSQL's 6: equal in a
+        // conversion check under ASM-FRACTIONAL-SECONDS (Davy, 2026-10-29),
+        // a difference in a diff.
+        (Ty::Time(7), Ty::Time(6)) | (Ty::DateTime2(7), Ty::Timestamp(6))
+            if super::compare::ci_collation() =>
+        {
+            c.asms.push(asm::FRACTIONAL_SECONDS);
+            c.wider = Some(if matches!(t, Ty::Time(_)) {
+                "24:00:00".into()
+            } else {
+                "timestamps before year 1 or after year 9999, and infinity".into()
+            });
         }
         (Ty::Time(a), Ty::Time(b)) | (Ty::DateTime2(a), Ty::Timestamp(b)) => diff(
             &mut c,
@@ -2089,4 +2106,23 @@ pub(super) fn text_name(ns: &[Name]) -> String {
         .map(|n| n.text.as_str())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seven_fraction_digits_against_six_only_in_a_conversion_check() {
+        let (t, p) = (Ty::DateTime2(7), Ty::Timestamp(6));
+        assert!(types(&t, &p).diff.is_some());
+        let _scope = super::super::compare::ci_collation_scope(true);
+        let c = types(&t, &p);
+        assert!(c.diff.is_none());
+        assert_eq!(c.asms, vec![asm::FRACTIONAL_SECONDS]);
+        assert!(types(&Ty::Time(7), &Ty::Time(6)).diff.is_none());
+        // Other precisions still differ.
+        assert!(types(&Ty::DateTime2(7), &Ty::Timestamp(3)).diff.is_some());
+        assert!(types(&Ty::DateTime2(5), &Ty::Timestamp(6)).diff.is_some());
+    }
 }

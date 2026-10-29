@@ -139,6 +139,10 @@ pub mod asm {
     );
     /// Decision 1: across dialects, result column names that differ only in
     /// letter case are equal when the client matches names that way.
+    pub const END_OF_TIME: (&str, &str) = (
+        "ASM-END-OF-TIME",
+        "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written for PostgreSQL as '9999-12-31 23:59:59.999999' (PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00): it is only an open-end sentinel, compared with values converted by the same rule (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit the same way rather than rounding it; no value lies between the two",
+    );
     pub const RESULT_NAMES_CI: (&str, &str) = (
         "ASM-RESULT-NAMES-CI",
         "Clients read result columns by name case-insensitively (PostgreSQL returns an unquoted alias such as OrderId as orderid; T-SQL returns it as written)",
