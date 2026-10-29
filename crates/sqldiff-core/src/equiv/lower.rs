@@ -418,6 +418,126 @@ pub fn lower(a: &Analyzed) -> Unit {
     u
 }
 
+/// A PL/pgSQL block that assigns variables from each row of a query in
+/// turn, as the conversion writes T-SQL `SELECT @v = e FROM …`:
+///
+/// ```text
+/// DECLARE r record;
+/// BEGIN
+///   FOR r IN SELECT e1 AS c1, … FROM … LOOP
+///     v1 := r.c1; …
+///   END LOOP;
+/// END;
+/// ```
+///
+/// Lowered as that SELECT: after the loop each variable holds the last
+/// row's value, and with no row it keeps its own; each value goes through
+/// the variable's assignment conversion. Only that exact shape: one record,
+/// every column assigned once to a different variable, and neither the
+/// record nor a variable read by the query (the loop reads the query once,
+/// where T-SQL would see the values of earlier rows). The record is the
+/// loop's own, so declaring it again each time the block runs changes
+/// nothing, inside an IF or loop too.
+fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
+    use SyntaxKind::{BRANCH, CONDITION, DECLARE_SECTION, LOOP_STMT, STATEMENT};
+    let d = u.dialect;
+    if d != Dialect::Postgres {
+        return false;
+    }
+    let kids: Vec<SyntaxNode> = c.children().collect();
+    let [decl, lp] = kids.as_slice() else {
+        return false;
+    };
+    if decl.kind() != DECLARE_SECTION || lp.kind() != LOOP_STMT {
+        return false;
+    }
+    // `DECLARE r record;`
+    let decls: Vec<SyntaxNode> = decl.children().collect();
+    let [rec] = decls.as_slice() else {
+        return false;
+    };
+    let rt = tokens(rec);
+    let r = match rt.as_slice() {
+        [n, ty] if n.kind == K::Word && ty.up == "RECORD" => n.up.clone(),
+        _ => return false,
+    };
+    // `FOR r IN <query> LOOP <assignments> END LOOP`
+    let parts: Vec<SyntaxNode> = lp.children().collect();
+    let [cond, body] = parts.as_slice() else {
+        return false;
+    };
+    let first = lp
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_ascii_uppercase());
+    if first.as_deref() != Some("FOR") || cond.kind() != CONDITION || body.kind() != BRANCH {
+        return false;
+    }
+    let ct = tokens(cond);
+    let query = match ct.as_slice() {
+        [v, kw, rest @ ..] if v.kind == K::Word && v.up == r && kw.up == "IN" => rest,
+        _ => return false,
+    };
+    let Ok(Stmt::Select(mut sel)) = parse_stmt(query, d) else {
+        return false;
+    };
+    // `v := r.c`, each variable and each column once.
+    let mut set: Vec<(String, String)> = Vec::new();
+    for st in body.children() {
+        if st.kind() != STATEMENT {
+            return false;
+        }
+        match tokens(&st).as_slice() {
+            [v, op, rec, dot, col]
+                if v.kind == K::Word
+                    && op.text == ":="
+                    && rec.kind == K::Word
+                    && rec.up == r
+                    && dot.kind == K::Dot
+                    && col.kind == K::Word =>
+            {
+                if set.iter().any(|(x, y)| *x == v.up || *y == col.up) {
+                    return false;
+                }
+                set.push((v.up.clone(), col.up.clone()));
+            }
+            _ => return false,
+        }
+    }
+    if set.is_empty() || set.len() != sel.items.len() || !sel.into.is_empty() {
+        return false;
+    }
+    // Neither the record nor an assigned variable in the query.
+    if query
+        .iter()
+        .any(|t| t.kind == K::Word && (t.up == r || set.iter().any(|(v, _)| *v == t.up)))
+    {
+        return false;
+    }
+    for it in &mut sel.items {
+        let Some(alias) = it.alias.as_ref().map(|x| x.to_ascii_uppercase()) else {
+            return false;
+        };
+        let Some((v, _)) = set.iter().find(|(_, col)| *col == alias) else {
+            return false;
+        };
+        if it.assign.is_some() {
+            return false;
+        }
+        it.assign = Some(v.to_lowercase());
+        it.alias = None;
+    }
+    u.stmts.push(LStmt {
+        node: c.clone(),
+        toks: tokens(c),
+        ast: Ok(Stmt::Select(sel)),
+        from_declare: false,
+        msg: None,
+    });
+    true
+}
+
 /// Whether a PostgreSQL routine node is a DO block.
 fn is_do(r: &SyntaxNode) -> bool {
     cst::header_tokens(r)
@@ -872,6 +992,7 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         | SyntaxKind::BATCH
         | SyntaxKind::ROUTINE_BODY
         | SyntaxKind::TRY_BLOCK => walk(c, u),
+        SyntaxKind::BLOCK if assign_loop(c, u) => {}
         SyntaxKind::BLOCK => {
             let w = cst::first_words(c, 2);
             if w.get(1).is_some_and(|x| x == "ATOMIC") {
