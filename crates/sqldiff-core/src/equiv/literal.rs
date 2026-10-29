@@ -32,7 +32,19 @@
 //!   `'0'`/`'1'`; boolean: PostgreSQL reads those and more spellings.
 //! - uniqueidentifier and uuid: case and braces do not matter on either.
 //! - A cast to a type with a precision or scale rounds to it on both.
-//! - Db2 for i is not checked, so nothing is modelled for it.
+//!
+//! Db2 for i (fact V33, IBM i 7.4 and 7.6 Db2 for i SQL Reference, "Date
+//! strings" and "Timestamp strings"; no system has run the probes yet): only
+//! DATE and TIMESTAMP(p) are modelled, and only for a CAST or an assignment
+//! (a comparison is not). A date string is read in the ISO form
+//! `yyyy-mm-dd`; a timestamp string in the ISO form `yyyy-mm-dd hh:mm:ss.n…`
+//! or the IBM SQL form `yyyy-mm-dd-hh.mm.ss.n…`, with 0 to 12 fraction
+//! digits, padded with zeros to the precision and truncated past it. Neither
+//! accepts T-SQL's compact `yyyymmdd`: a date string is ISO, USA, EUR, JIS,
+//! the job's format or the 7-digit Julian `yyyyddd`, and a timestamp string
+//! without separators has 14 to 26 digits. Only the two-digit fields of these
+//! forms with at most the target's fraction digits are modelled, under
+//! `ASM-FACT-V33` (that an assignment reads the string as the cast does).
 
 use sqldiff_syntax::Dialect;
 
@@ -82,6 +94,8 @@ impl Target {
         };
         let digits = |default: u32| args.first().copied().unwrap_or(default);
         Some(match (d, base) {
+            (Dialect::Db2i, "DATE") => Target::Date,
+            (Dialect::Db2i, "TIMESTAMP") => Target::Timestamp { digits: digits(6) },
             (Dialect::Db2i, _) => return None,
             (_, "INTEGER" | "INT" | "INT4") => int(32),
             (_, "SMALLINT" | "INT2") => int(16),
@@ -150,7 +164,7 @@ pub fn convert(
     cast: bool,
 ) -> Option<(Term, Option<(&'static str, &'static str)>)> {
     if d == Dialect::Db2i {
-        return None;
+        return db2i(s, t, cast);
     }
     let tval = |kind: &str, v: String| n("tval", vec![a(kind), a(v)]);
     match t {
@@ -266,6 +280,98 @@ pub fn convert(
             Some((tval("ts", dt.show()), assume))
         }
     }
+}
+
+pub const FACT_V33: (&str, &str) = (
+    "ASM-FACT-V33",
+    "Db2 for i reads a date or timestamp string the same way when it is assigned or stored as when it is cast: 'yyyy-mm-dd' as that date, 'yyyy-mm-dd hh:mm:ss.n' and 'yyyy-mm-dd-hh.mm.ss.n' as that timestamp, the fraction padded with zeros (IBM i SQL Reference, Date strings and Timestamp strings; fact V33, not checked on a real system)",
+);
+
+/// A Db2 for i date or timestamp string, cast or assigned (see the module
+/// notes). Anything else is not modelled.
+fn db2i(s: &str, t: Target, cast: bool) -> Option<(Term, Option<(&'static str, &'static str)>)> {
+    if !cast || !s.is_ascii() || s.len() < 10 {
+        return None;
+    }
+    let tval = |kind: &str, v: String| n("tval", vec![a(kind), a(v)]);
+    let (date, rest) = s.split_at(10);
+    let b = date.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y = num(&date[..4], 4, 4)?;
+    let mo = num(&date[5..7], 2, 2)?;
+    let day = num(&date[8..], 2, 2)?;
+    if !valid_date(y, mo, day) {
+        return None;
+    }
+    let dt = |time| Dt {
+        y,
+        mo,
+        d: day,
+        time,
+        form: Form::Dash,
+    };
+    match t {
+        Target::Date if rest.is_empty() => Some((tval("date", dt(None).date()), Some(FACT_V33))),
+        Target::Timestamp { digits } => {
+            // ` hh:mm:ss[.f]` (ISO) or `-hh.mm.ss[.f]` (IBM SQL).
+            let (sep, field) = match rest.as_bytes().first()? {
+                b' ' => (':', &rest[1..]),
+                b'-' => ('.', &rest[1..]),
+                _ => return None,
+            };
+            let (hms, frac) = match field.get(8..9) {
+                None if field.len() == 8 => (field, ""),
+                Some(".") => (&field[..8], &field[9..]),
+                _ => return None,
+            };
+            let hb = hms.as_bytes();
+            if hb[2] != sep as u8 || hb[5] != sep as u8 {
+                return None;
+            }
+            let (h, m, sec) = (
+                num(&hms[..2], 2, 2)?,
+                num(&hms[3..5], 2, 2)?,
+                num(&hms[6..], 2, 2)?,
+            );
+            let digits_ok = frac.bytes().all(|b| b.is_ascii_digit())
+                && (frac.len() as u32) <= digits.min(12)
+                && !(field.len() > 8 && frac.is_empty());
+            if h > 23 || m > 59 || sec > 59 || !digits_ok {
+                return None;
+            }
+            let tm = Tm {
+                h,
+                m,
+                sec,
+                frac: frac.to_string(),
+            };
+            Some((tval("ts", dt(Some(tm)).show()), Some(FACT_V33)))
+        }
+        _ => None,
+    }
+}
+
+/// The ISO text of a T-SQL literal as the value `t` stores (assigned or
+/// cast): `yyyy-mm-dd` for a date, `yyyy-mm-dd hh:mm:ss[.f]` otherwise, with
+/// the assumption the T-SQL reading rests on. None unless `t` is a date or
+/// time-of-day type the literal converts to exactly.
+pub fn iso_tsql(s: &str, t: Target) -> Option<(String, Option<(&'static str, &'static str)>)> {
+    if !matches!(
+        t,
+        Target::Date | Target::Timestamp { .. } | Target::Datetime | Target::Smalldatetime
+    ) {
+        return None;
+    }
+    let (_, asm) = convert(s, t, Dialect::Tsql, true)?;
+    let dt = datetime(s, Dialect::Tsql)?;
+    let text = if t == Target::Date {
+        dt.date()
+    } else {
+        dt.show()
+    };
+    Some((text, asm))
 }
 
 pub const DATEFORMAT: (&str, &str) = (
@@ -547,9 +653,76 @@ mod tests {
         assert_eq!(v("6F9619FF8B86D011B42D00C04FC964FF", Target::Uuid, P), None);
     }
 
+    const D: Dialect = Dialect::Db2i;
+
+    fn c(s: &str, t: Target, d: Dialect) -> Option<String> {
+        convert(s, t, d, true).map(|(t, _)| t.to_string())
+    }
+
     #[test]
-    fn db2_for_i_is_not_modelled() {
-        assert_eq!(Target::of("DATE", &[], Dialect::Db2i), None);
-        assert_eq!(v("2020-01-01", Target::Date, Dialect::Db2i), None);
+    fn db2_for_i_reads_iso_and_ibm_sql_strings_on_assignment() {
+        let ts7 = Target::of("TIMESTAMP", &[7], D).unwrap();
+        assert_eq!(
+            Target::of("TIMESTAMP", &[], D),
+            Some(Target::Timestamp { digits: 6 })
+        );
+        let tsql7 = Target::Timestamp { digits: 7 };
+        let end = c("99991231 23:59:59.9999999", tsql7, T);
+        assert!(end.is_some());
+        assert_eq!(c("9999-12-31 23:59:59.9999999", ts7, D), end);
+        assert_eq!(c("9999-12-31-23.59.59.9999999", ts7, D), end);
+        assert_eq!(c("2020-01-01 00:00:00", ts7, D), c("20200101", tsql7, T));
+        assert_eq!(
+            c("2020-01-01-00.00.00.000", ts7, D),
+            c("20200101", tsql7, T)
+        );
+        assert_eq!(
+            c("2020-01-01", Target::Date, D),
+            c("20200101", Target::Date, T)
+        );
+        let (_, asm) = convert("2020-01-01", Target::Date, D, true).unwrap();
+        assert_eq!(asm, Some(FACT_V33));
+        // T-SQL's compact forms are not Db2 for i date or timestamp strings.
+        assert_eq!(c("20200101", Target::Date, D), None);
+        assert_eq!(c("20200101", ts7, D), None);
+        assert_eq!(c("99991231 23:59:59.9999999", ts7, D), None);
+        // Not modelled: a date alone as a timestamp, a time alone, one-digit
+        // fields, more fraction digits than the precision (truncated), mixed
+        // separators, a comparison.
+        assert_eq!(c("2020-01-01", ts7, D), None);
+        assert_eq!(c("2020-1-01 00:00:00", ts7, D), None);
+        assert_eq!(c("2020-01-01 0:00:00", ts7, D), None);
+        assert_eq!(c("2020-01-01 00:00:00.12345678", ts7, D), None);
+        assert_eq!(c("2020-01-01 00.00.00", ts7, D), None);
+        assert_eq!(c("2020-01-01-00:00:00", ts7, D), None);
+        assert_eq!(c("2020-01-01 00:00:00.", ts7, D), None);
+        assert_eq!(c("2020-01-01 24:00:00", ts7, D), None);
+        assert_eq!(c("2020-02-30", Target::Date, D), None);
+        assert_eq!(c("2020-01-01 ", Target::Date, D), None);
+        assert_eq!(v("2020-01-01", Target::Date, D), None);
+        assert_eq!(Target::of("INTEGER", &[], D), None);
+    }
+
+    #[test]
+    fn iso_text_of_tsql_literals() {
+        let ts = |p| Target::Timestamp { digits: p };
+        assert_eq!(
+            iso_tsql("20200101", ts(7)).unwrap().0,
+            "2020-01-01 00:00:00"
+        );
+        assert_eq!(
+            iso_tsql("99991231 23:59:59.9999999", ts(7)).unwrap().0,
+            "9999-12-31 23:59:59.9999999"
+        );
+        assert_eq!(iso_tsql("20200101", Target::Date).unwrap().0, "2020-01-01");
+        // T-SQL rounds to the precision: no exact text.
+        assert_eq!(iso_tsql("2020-01-01 10:00:00.1234", ts(3)), None);
+        assert_eq!(iso_tsql("93748567", ts(7)), None);
+        assert_eq!(iso_tsql("20200101", Target::Uuid), None);
+        let dash = iso_tsql("2020-01-02", Target::Datetime).unwrap();
+        assert_eq!(
+            (dash.0.as_str(), dash.1),
+            ("2020-01-02 00:00:00", Some(DATEFORMAT))
+        );
     }
 }

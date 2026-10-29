@@ -1889,7 +1889,15 @@ fn compare_into(x: &Table, y: &Table, na: &str, nb: &str, ev: &mut Vec<Event>) -
                     "the {what} names column {c}, which the table does not have"
                 ));
             };
-            if matches!(ct.ty, Ty::Str { .. }) {
+            if matches!(ct.ty, Ty::Str { .. })
+                && matches!(cp.ty, Ty::Str { .. })
+                && super::compare::ci_collation()
+            {
+                // Conversions (Davy, 2026-10-29): the duplicates T-SQL's
+                // collation rejects and PostgreSQL accepts are flagged.
+                ev.push(Event::Asm(super::canon::asm::TSQL_CI));
+                ev.push(Event::Asm(super::canon::asm::CI_COLLATION));
+            } else if matches!(ct.ty, Ty::Str { .. }) {
                 ev.push(Event::Asm(super::canon::asm::TSQL_CI));
                 ev.push(diff(
                     "equiv.case-sensitivity",
@@ -2020,7 +2028,13 @@ fn compare_into(x: &Table, y: &Table, na: &str, nb: &str, ev: &mut Vec<Event>) -
         let tt = if tsql_a { x } else { y };
         let tsql_cols = if tsql_a { &fx.cols } else { &fy.cols };
         for c in keys(tsql_cols, Dialect::Tsql)? {
-            if column_by_key(tt, &c).is_some_and(|ct| matches!(ct.ty, Ty::Str { .. })) {
+            let string = column_by_key(tt, &c).is_some_and(|ct| matches!(ct.ty, Ty::Str { .. }));
+            if string && super::compare::ci_collation() {
+                // Conversions: a match T-SQL's collation finds and
+                // PostgreSQL does not is flagged.
+                ev.push(Event::Asm(super::canon::asm::TSQL_CI));
+                ev.push(Event::Asm(super::canon::asm::CI_COLLATION));
+            } else if string {
                 ev.push(Event::Asm(super::canon::asm::TSQL_CI));
                 ev.push(diff(
                     "equiv.case-sensitivity",
