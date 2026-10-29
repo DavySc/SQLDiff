@@ -189,6 +189,36 @@ fn update_from_shapes_without_a_rule_are_refused() {
     }
 }
 
+/// `WITH … UPDATE … FROM`: a CTE read as another FROM item stays a CTE in
+/// PostgreSQL; its GROUP BY columns are the key the one-match check needs.
+#[test]
+fn with_update_from_keeps_a_grouped_cte() {
+    let (c, _) = tsql(
+        "WITH t AS (SELECT order_id, MAX(amount) AS amt FROM dbo.order_items GROUP BY order_id)\nUPDATE o SET total = t.amt FROM dbo.orders AS o JOIN t ON t.order_id = o.order_id WHERE o.qty > 0;",
+    );
+    let (out, u) = last(&c);
+    assert!(
+        out.contains("WITH t AS (SELECT order_id, MAX(amount) AS amt FROM order_items GROUP BY order_id) UPDATE orders AS o SET total = t.amt FROM t WHERE (t.order_id = o.order_id) AND (o.qty > 0);"),
+        "{out}"
+    );
+    assert!(
+        u.status < Status::Unproven,
+        "{out}: {:?}\n{:?}",
+        u.notes,
+        c.report.unknown_reasons
+    );
+    for stmt in [
+        // No GROUP BY: an order meets several items.
+        "WITH t AS (SELECT order_id, amount AS amt FROM dbo.order_items)\nUPDATE o SET total = t.amt FROM dbo.orders AS o JOIN t ON t.order_id = o.order_id;",
+        // The target is the CTE.
+        "WITH t AS (SELECT order_id, total FROM dbo.orders)\nUPDATE x SET total = 0 FROM t AS x JOIN dbo.order_items i ON i.item_id = x.order_id;",
+    ] {
+        let (c, _) = tsql(stmt);
+        let (out, u) = last(&c);
+        assert_eq!(u.status, Status::NotConverted, "{stmt}\n{out}");
+    }
+}
+
 /// Shapes the UPDATE … FROM rule refuses but the fallback rules still
 /// write: the engine must not call them clean.
 #[test]

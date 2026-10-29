@@ -343,6 +343,99 @@ fn update_from_binds_a_qualified_target_by_table() {
     );
 }
 
+/// `WITH … UPDATE … FROM`: a CTE read in FROM is a derived table in both
+/// dialects. A GROUP BY whose columns the CTE returns makes those columns a
+/// unique key, so the one-match check can pass through it.
+#[test]
+fn with_update_from_reads_a_cte_as_a_derived_table() {
+    let ts = |cte: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.reprice AS BEGIN
+             WITH r AS ({cte})
+             UPDATE p SET unit_price = r.mp FROM dbo.item_price AS p JOIN r ON r.item_id = p.item_id; END"
+        )
+    };
+    let pg = |cte: &str| {
+        format!(
+            "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             WITH r AS ({cte})
+             UPDATE item_price AS p SET unit_price = r.mp FROM r WHERE r.item_id = p.item_id; $$;"
+        )
+    };
+    let grouped = "SELECT item_id, MAX(unit_price) AS mp FROM price_feed GROUP BY item_id";
+    let ok = |r: Report, why: &str| {
+        assert!(
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    let not_ok = |r: Report, why: &str| {
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    ok(run(&ts(grouped), T, &pg(grouped), P, true), "grouped CTE");
+    // The same derived table written inline on the PostgreSQL side.
+    ok(
+        run(
+            &ts(grouped),
+            T,
+            &format!(
+                "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+                 UPDATE item_price AS p SET unit_price = r.mp FROM ({grouped}) AS r WHERE r.item_id = p.item_id; $$;"
+            ),
+            P,
+            true,
+        ),
+        "inline derived table",
+    );
+    // Without GROUP BY, price_feed has no key: several rows may match.
+    let plain = "SELECT item_id, unit_price AS mp FROM price_feed";
+    not_ok(run(&ts(plain), T, &pg(plain), P, true), "no key");
+    // Grouped by another column than the join's.
+    let other =
+        "SELECT unit_price AS item_id, MAX(unit_price) AS mp FROM price_feed GROUP BY unit_price";
+    let by_item =
+        "SELECT item_id, MAX(unit_price) AS mp FROM price_feed GROUP BY item_id, unit_price";
+    not_ok(
+        run(&ts(by_item), T, &pg(by_item), P, true),
+        "key not matched in full",
+    );
+    ok(
+        run(&ts(other), T, &pg(other), P, true),
+        "alias of the grouped column",
+    );
+    // A different aggregate is a different statement.
+    not_ok(
+        run(
+            &ts(grouped),
+            T,
+            &pg("SELECT item_id, MIN(unit_price) AS mp FROM price_feed GROUP BY item_id"),
+            P,
+            true,
+        ),
+        "MAX vs MIN",
+    );
+    // The CTE named outside FROM, and the target as a CTE, are not read.
+    let sub = "CREATE PROCEDURE dbo.reprice AS BEGIN
+         WITH r AS (SELECT item_id FROM price_feed GROUP BY item_id)
+         UPDATE p SET unit_price = 0 FROM dbo.item_price AS p WHERE p.item_id IN (SELECT item_id FROM r); END";
+    not_ok(
+        run(
+            sub,
+            T,
+            "CREATE PROCEDURE reprice() LANGUAGE sql AS $$
+             UPDATE item_price AS p SET unit_price = 0 WHERE p.item_id IN (SELECT item_id FROM price_feed); $$;",
+            P,
+            true,
+        ),
+        "CTE in a subquery",
+    );
+}
+
 #[test]
 fn string_comparison_collation_is_explicit() {
     let ts = "CREATE FUNCTION dbo.f (@Email varchar(254)) RETURNS int AS

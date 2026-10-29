@@ -83,6 +83,7 @@ pub(crate) fn convert(
         trigger: None,
         seq_defaults: Vec::new(),
         table_cols: Vec::new(),
+        update_ctes: Vec::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -230,6 +231,9 @@ struct Cx<'a> {
     seq_defaults: Vec<(String, String)>,
     /// The columns of the table being created (lower case, unquoted).
     table_cols: Vec<String>,
+    /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
+    /// with the GROUP BY key their query returns (`group_key`), if any.
+    update_ctes: Vec<(String, Option<Vec<String>>)>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -2027,14 +2031,32 @@ impl<'a> Cx<'a> {
                     .map_or(verb, |&j| if ts[j].is("FROM") { j } else { verb })
             };
             if find_word(&ts, after + 1, "FROM").is_some() {
-                return no(format!(
-                    "WITH … {what} … FROM: not converted yet; the FROM tables may be CTEs, and the target one of them"
-                ));
+                if what != "UPDATE" {
+                    return no(format!(
+                        "WITH … {what} … FROM: not converted yet; the FROM tables may be CTEs, and the target one of them"
+                    ));
+                }
+                // UPDATE … FROM: the CTEs may be other FROM items, read as
+                // derived tables in both dialects (`update_join` refuses a
+                // CTE as the target).
+                self.update_ctes = cte_bodies(&ts)
+                    .ok_or(No("unreadable WITH list".into()))?
+                    .into_iter()
+                    .map(|(n, body)| {
+                        let key = cte_group_key(&ts[body]);
+                        (n, key)
+                    })
+                    .collect();
             }
         }
-        let prefix = self.with_list(&ts, verb)?.trim().to_string();
-        let body = self.dml(&ts[verb..])?;
-        Ok(format!("{prefix} {}", body.trim_start()))
+        let prefix = self.with_list(&ts, verb);
+        let body = match prefix {
+            Ok(_) => self.dml(&ts[verb..]),
+            Err(_) => Ok(String::new()),
+        };
+        self.update_ctes.clear();
+        let (prefix, body) = (prefix?, body?);
+        Ok(format!("{} {}", prefix.trim(), body.trim_start()))
     }
 
     /// `ts[..end]` of a statement that starts with WITH. A recursive CTE
@@ -2283,6 +2305,11 @@ impl<'a> Cx<'a> {
             if !c[li].leaf.table {
                 return Err(why("the target is not a table"));
             }
+            if self.update_cte(&c[li].leaf.name).is_some() {
+                return Err(why(
+                    "the target is a CTE (T-SQL changes the CTE's base table); rewrite the statement against that table",
+                ));
+            }
             let inner = |k: Join| matches!(k, Join::Inner | Join::Cross);
             let tleaf = match li {
                 0 if c.len() == 1 => chains.remove(ci).remove(0).leaf,
@@ -2480,7 +2507,12 @@ impl<'a> Cx<'a> {
                         }
                     }
                 }
-                if st.leaf.table && self.has_unique_key(&st.leaf.name, &cols) {
+                let unique = match self.update_cte(&st.leaf.name) {
+                    // A CTE: its GROUP BY columns, matched in full.
+                    Some(key) => key.is_some_and(|k| k.iter().all(|c| cols.contains(c))),
+                    None => self.has_unique_key(&st.leaf.name, &cols),
+                };
+                if st.leaf.table && unique {
                     bound.push(k);
                     progress = true;
                 }
@@ -2507,6 +2539,16 @@ impl<'a> Cx<'a> {
                 .map(|c| c.name.to_ascii_lowercase())
                 .collect()
         })
+    }
+
+    /// The CTE of the `WITH … UPDATE … FROM` being converted that a
+    /// one-part FROM name reads, with its GROUP BY key if it has one.
+    fn update_cte(&self, name: &[String]) -> Option<Option<&Vec<String>>> {
+        let [n] = name else { return None };
+        self.update_ctes
+            .iter()
+            .find(|(c, _)| c == n)
+            .map(|(_, k)| k.as_ref())
     }
 
     /// Whether `cols` include every column of a primary key, a UNIQUE
@@ -6397,6 +6439,45 @@ fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
 
 /// The CTE names of a statement that starts with WITH (unquoted,
 /// lowercased), and the index of the statement word after the list.
+/// The CTEs of a WITH list: each name (lower case) and the tokens of its
+/// query, between the parentheses.
+fn cte_bodies(ts: &[T]) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    let (names, verb) = cte_list(ts)?;
+    let ds = crate::tok::depths(ts);
+    let mut bodies = Vec::new();
+    let mut open = None;
+    for i in sig(&ts[..verb]) {
+        match ts[i].k {
+            L_PAREN
+                if ds[i] == 0 && i > 0 && sig(&ts[..i]).last().is_some_and(|&j| ts[j].is("AS")) =>
+            {
+                open = Some(i)
+            }
+            R_PAREN if ds[i] == 0 => {
+                if let Some(o) = open.take() {
+                    bodies.push(o + 1..i);
+                }
+            }
+            _ => {}
+        }
+    }
+    (bodies.len() == names.len()).then(|| names.into_iter().zip(bodies).collect())
+}
+
+/// The GROUP BY key a CTE's query returns (`group_key`), folded.
+fn cte_group_key(body: &[T]) -> Option<Vec<String>> {
+    let text: Vec<&str> = sig(body).into_iter().map(|i| body[i].s.as_str()).collect();
+    let root = sqldiff_syntax::parse(&text.join(" "), Dialect::Tsql).syntax();
+    let toks = sqldiff_syntax::abstract_syntax::tokens(&root);
+    let mut p = sqldiff_syntax::abstract_syntax::Parser::new(&toks, Dialect::Tsql);
+    let q = p.select().ok()?;
+    if !p.at_end() {
+        return None;
+    }
+    let key = sqldiff_syntax::abstract_syntax::group_key(&q)?;
+    Some(key.iter().map(|c| c.to_ascii_lowercase()).collect())
+}
+
 fn cte_list(ts: &[T]) -> Option<(Vec<String>, usize)> {
     cte_list_rec(ts).map(|(n, v, ..)| (n, v))
 }
