@@ -517,6 +517,13 @@ fact = "The data has at most microsecond precision."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-GRANT-PRINCIPAL"
+statement = "The target role a GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY outranks the grant."
+discharge = "deployment"
+fact = "How T-SQL users and roles map to PostgreSQL roles, and the DENY statements on the object."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
+
+[[assumption]]
 id = "ASM-HAND-WRITTEN"
 statement = "A unit's output written by hand means what the source means, beyond what the check compares."
 discharge = "nothing"

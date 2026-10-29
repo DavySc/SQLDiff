@@ -1165,6 +1165,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             return inside_flow(c, u, what);
         }
     }
+    if d == Dialect::Tsql && add_filegroup(c) {
+        note(
+            u,
+            "ALTER DATABASE … ADD FILEGROUP compared as storage: where data is stored is not seen in results",
+        );
+        return;
+    }
     if let Some((ast, msg)) = message(c, d) {
         u.stmts.push(LStmt {
             node: c.clone(),
@@ -1305,6 +1312,28 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             u.uncovered.push((c.clone(), what));
         }
     }
+}
+
+/// T-SQL `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS
+/// MEMORY_OPTIMIZED_DATA | FILESTREAM]`: a place to store data, nothing a
+/// statement's result shows.
+fn add_filegroup(c: &SyntaxNode) -> bool {
+    let w: Vec<String> = tokens(c).iter().map(|t| t.up.clone()).collect();
+    let w: Vec<&str> = w.iter().map(String::as_str).collect();
+    matches!(
+        w.as_slice(),
+        ["ALTER", "DATABASE", _, "ADD", "FILEGROUP", _]
+            | [
+                "ALTER",
+                "DATABASE",
+                _,
+                "ADD",
+                "FILEGROUP",
+                _,
+                "CONTAINS",
+                "MEMORY_OPTIMIZED_DATA" | "FILESTREAM"
+            ]
+    )
 }
 
 /// A statement of a cursor loop (`cursor.rs`): the T-SQL DECLARE or

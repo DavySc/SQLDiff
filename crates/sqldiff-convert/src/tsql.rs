@@ -1585,6 +1585,11 @@ impl<'a> Cx<'a> {
             ));
         }
         let first = w(0);
+        if let Some(v) = ts.iter().find(|t| {
+            t.k != STRING && t.s.contains("$(") && !(first == "ALTER" && w(1) == "DATABASE")
+        }) {
+            return no(format!("{}: a SQLCMD variable, so this statement is a template, not SQL; convert it in template mode (a [template] syntax for SQLCMD variables) or with the value filled in", v.s.trim()));
+        }
         if !matches!(first.as_str(), "SET" | "DECLARE" | "PRINT") {
             // XACT_ABORT ON after this cannot become a routine-wide handler.
             self.seen_work = true;
@@ -1659,8 +1664,15 @@ impl<'a> Cx<'a> {
                 self.cursor_stmt(n, &first, &ts)?
             }
             "EXEC" | "EXECUTE" => self.exec(&ts)?,
+            "GRANT" if !self.db2() => self.grant(&ts)?,
             "CREATE" => self.create(&ts)?,
             "ALTER" if w(1) == "TABLE" => self.alter_table(&ts)?,
+            "ALTER" if w(1) == "DATABASE" => self.alter_database(&ts)?,
+            "GOTO" => {
+                let label = s.get(1).map(|&i| tsql_unquote(&ts[i].s)).unwrap_or_default();
+                return no(goto(n, &label));
+            }
+            ":" => return no(sqlcmd(&w(1))),
             "DROP" => {
                 if w(1) == "INDEX" && find_word(&ts, s[1], "ON").is_some() {
                     return no(self.pick(
@@ -3076,6 +3088,115 @@ impl<'a> Cx<'a> {
         self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-notice");
         self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
         Ok(format!("RAISE NOTICE '{fmt}'{values}"))
+    }
+
+    /// `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS MEMORY_OPTIMIZED_DATA |
+    /// FILESTREAM]` only says where data is stored, which results do not
+    /// see: the target places data with tablespaces (or not at all), so
+    /// nothing is created. Other database settings are server configuration.
+    fn alter_database(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let w: Vec<String> = s.iter().map(|&j| ts[j].up()).collect();
+        let storage = w.len() >= 6
+            && w[3] == "ADD"
+            && w[4] == "FILEGROUP"
+            && (w.len() == 6
+                || (w.len() == 8
+                    && w[6] == "CONTAINS"
+                    && matches!(w[7].as_str(), "MEMORY_OPTIMIZED_DATA" | "FILESTREAM")));
+        if !storage {
+            return no(self.pick(
+                "ALTER DATABASE: database options and files are server configuration with no one-to-one PostgreSQL statement (ALTER DATABASE … SET, postgresql.conf); not converted",
+                "ALTER DATABASE: database options and files are server configuration with no Db2 for i statement; not converted",
+            ));
+        }
+        self.step_ts("tsql.database.filegroup", &ts);
+        Ok(format!(
+            "-- ALTER DATABASE … ADD FILEGROUP {}: storage only; {} places data without it",
+            tsql_unquote(&ts[s[5]].s),
+            self.to.display_name()
+        ))
+    }
+
+    /// PostgreSQL: `GRANT p [, p] ON [OBJECT::]name TO g [, g] [WITH GRANT
+    /// OPTION]` for the object privileges both grant alike on a table or view
+    /// (SELECT, INSERT, UPDATE, DELETE, REFERENCES). The others differ in
+    /// scope: a schema permission (`ON SCHEMA::s`) also covers objects
+    /// created later in T-SQL, which PostgreSQL's `ALL TABLES IN SCHEMA`
+    /// does not; a database permission (CONNECT) and EXECUTE need names and
+    /// signatures T-SQL does not give.
+    fn grant(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let w = |i: usize| s.get(i).map(|&j| ts[j].up()).unwrap_or_default();
+        if let Some(k) = (1..s.len()).find(|&k| w(k) == "::" && w(k - 1) != "OBJECT") {
+            let class = w(k - 1);
+            return no(format!("GRANT … ON {class}::: SQL Server's permission on a whole {} also covers objects created later; PostgreSQL's GRANT … ON ALL TABLES IN SCHEMA covers only those that exist (and ALTER DEFAULT PRIVILEGES only those one role creates); not converted", class.to_lowercase()));
+        }
+        let mut i = 1;
+        let mut privileges = Vec::new();
+        loop {
+            let p = w(i);
+            match p.as_str() {
+                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REFERENCES" => privileges.push(p),
+                "EXECUTE" | "EXEC" => return no("GRANT EXECUTE: PostgreSQL grants it ON FUNCTION or ON PROCEDURE with the argument types; not converted"),
+                "ALL" => return no("GRANT ALL: SQL Server's ALL is another set of permissions than PostgreSQL's ALL PRIVILEGES; grant the permissions by name"),
+                _ if !ts.iter().any(|t| t.is("ON")) => return no(format!("GRANT {p}: a database permission; PostgreSQL grants database privileges ON DATABASE by name (CONNECT) or as role attributes; not converted")),
+                _ => return no(format!("GRANT {p}: no one-to-one PostgreSQL privilege; not converted")),
+            }
+            i += 1;
+            match w(i).as_str() {
+                "," => i += 1,
+                "(" => return no("GRANT on columns: not converted"),
+                _ => break,
+            }
+        }
+        if w(i) != "ON" {
+            return no("GRANT of a database permission: not converted");
+        }
+        i += 1;
+        let obj_at = if w(i + 1) == "::" { i + 2 } else { i };
+        let Some(to) = (obj_at..s.len()).find(|&k| w(k) == "TO") else {
+            return no("GRANT without TO");
+        };
+        if (obj_at..to)
+            .any(|k| ts[s[k]].k != IDENT && ts[s[k]].k != QUOTED_IDENT && ts[s[k]].k != DOT)
+        {
+            return no("GRANT on something other than a table or view name");
+        }
+        let rest: Vec<String> = (to + 1..s.len()).map(w).collect();
+        let (grantees_end, option) = match rest.iter().position(|x| x == "WITH" || x == "AS") {
+            Some(p) if rest[p..] == ["WITH", "GRANT", "OPTION"] => (to + 1 + p, true),
+            Some(_) => return no("GRANT … AS principal: not converted"),
+            None => (to + 1 + rest.len(), false),
+        };
+        let mut grantees = Vec::new();
+        for k in to + 1..grantees_end {
+            let t = &ts[s[k]];
+            match t.k {
+                IDENT | QUOTED_IDENT => grantees.push(self.expr(std::slice::from_ref(t))),
+                COMMA => {}
+                _ => return no("GRANT to something other than principal names"),
+            }
+        }
+        if grantees.is_empty() {
+            return no("GRANT without a grantee");
+        }
+        let object = self.expr(&ts[s[obj_at]..=s[to - 1]]);
+        self.note(Status::Assumptions, "ASM-GRANT-PRINCIPAL", "The PostgreSQL role this GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY on the object outranks the grant (PostgreSQL has no DENY).");
+        self.step_ts("tsql.stmt.grant", &ts);
+        Ok(format!(
+            "GRANT {} ON {} TO {}{}",
+            privileges.join(", "),
+            object.trim(),
+            grantees
+                .iter()
+                .map(|g| g.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if option { " WITH GRANT OPTION" } else { "" }
+        ))
     }
 
     /// PostgreSQL: `DECLARE c CURSOR … FOR query` of the standard loop
@@ -7480,6 +7601,39 @@ struct ScopeEntry {
 
 /// The FROM, JOIN, UPDATE, MERGE and USING items of a statement, at any
 /// depth. `None` when the statement has CTEs, whose names would hide tables.
+/// Why GOTO is not converted. PL/pgSQL has no GOTO; a jump forward to a
+/// label later in an enclosing statement list (Ola Hallengren's `GOTO
+/// Logging`) is a labelled block left with EXIT, which the engine does not
+/// compare yet.
+fn goto(n: &SyntaxNode, label: &str) -> String {
+    let at = n.text_range().start();
+    let forward = n.ancestors().skip(1).any(|a| {
+        a.children().any(|c| {
+            c.kind() == LABEL
+                && c.text_range().start() > at
+                && c.text()
+                    .to_string()
+                    .trim()
+                    .trim_end_matches(':')
+                    .eq_ignore_ascii_case(label)
+        })
+    });
+    if forward {
+        format!("GOTO {label}: PL/pgSQL has no GOTO. This jump forward is a labelled block from here to the label, left with EXIT (<<{0}>> BEGIN … EXIT {0}; … END; then the statements after {label}:); not converted yet, since the engine does not compare such blocks", label.to_lowercase())
+    } else {
+        format!("GOTO {label}: PL/pgSQL has no GOTO, and this jump does not go forward to a label in an enclosing statement list; rewrite it as a loop or IF; not converted")
+    }
+}
+
+/// Why a SQLCMD directive (`:r`, `:setvar`, `:on error`, …) is not
+/// converted: it is not SQL.
+fn sqlcmd(cmd: &str) -> String {
+    match cmd.to_ascii_lowercase().as_str() {
+        "r" => ":r includes another file: a SQLCMD directive, not SQL. The included file is converted on its own; include its conversion with psql's \\ir (or run it in order) after review".into(),
+        c => format!(":{c}: a SQLCMD directive, not SQL; not converted"),
+    }
+}
+
 /// PostgreSQL: a T-SQL cursor loop as the rules convert it
 /// (`Cx::cursor_plan`).
 #[derive(Debug, Clone)]
