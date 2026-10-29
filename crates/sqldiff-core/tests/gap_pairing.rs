@@ -56,9 +56,34 @@ END;
 $$;
 ";
 
+/// `PG` with a loop block the engine does not read (its body assigns an
+/// expression, not the row's column), which the comparison leaves out.
+fn pg_gap() -> String {
+    PG.replace(
+        "v_x := sqldiff_r.sqldiff_c1;",
+        "v_x := sqldiff_r.sqldiff_c1 + 0;",
+    )
+}
+
+#[test]
+fn the_converted_loop_block_is_compared_with_its_select() {
+    let r = run(TSQL, PG);
+    assert!(
+        !r.unknown_reasons.iter().any(|x| x.contains("not paired")
+            || x.contains("no counterpart")
+            || x.contains("not covered")),
+        "{:#?}",
+        r.unknown_reasons
+    );
+    // The one finding: T-SQL goes on after a failing statement (no SET
+    // XACT_ABORT ON), PostgreSQL stops.
+    let rules: Vec<&str> = r.findings.iter().map(|f| f.rule.as_str()).collect();
+    assert_eq!(rules, vec!["equiv.error-continues"], "{:#?}", r.findings);
+}
+
 #[test]
 fn statements_after_a_loop_block_meet_their_own_counterparts() {
-    let r = run(TSQL, PG);
+    let r = run(TSQL, &pg_gap());
     // Before: A line 5 was compared with B line 15 and A line 6 with B line
     // 16, two spurious findings.
     assert_eq!(
@@ -86,7 +111,10 @@ fn statements_after_a_loop_block_meet_their_own_counterparts() {
 
 #[test]
 fn a_real_difference_after_a_loop_block_names_the_right_lines() {
-    let r = run(TSQL, &PG.replace("v_x := v_x * 2;", "v_x := v_x * 3;"));
+    let r = run(
+        TSQL,
+        &pg_gap().replace("v_x := v_x * 2;", "v_x := v_x * 3;"),
+    );
     assert_eq!(compared(&r), vec![(7, 16)], "{:#?}", r.findings);
     let f = r
         .findings
