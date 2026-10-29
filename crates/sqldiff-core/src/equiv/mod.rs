@@ -319,7 +319,6 @@ fn compare_units(
     script::locals(a, b, ua, ub, &na, &nb, out);
     tables(a, b, ua, ub, sa, sb, out);
     table_vars(a, b, ua, ub, sa, sb, out);
-    calls(a, b, ua, ub, sa, sb, anchors, out);
     dynamic_sql(a, b, ua, ub, sa, sb, out);
     ddl_stmts(a, b, ua, ub, sa, sb, out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
@@ -379,58 +378,49 @@ fn compare_units(
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
-    pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
 }
 
-/// Compares the procedure calls and object comments of both sides
-/// (`call.rs`), paired in order by what they call or comment on.
-#[allow(clippy::too_many_arguments)]
 /// With a conversion's trace, whether call `xn` (side A) and its
 /// counterpart `yn` (side B) sit among the same data statements although
 /// the sides hold different numbers of statements before them (a statement
-/// left unconverted, an initialization only one side writes): every
-/// statement the trace links to the other side is before the call on one
-/// side exactly when its counterpart is before the call on the other. A
-/// statement the trace links to nothing is compared, or reported, on its
-/// own.
-fn same_place_traced(
-    ua: &Unit,
-    ub: &Unit,
+/// left unconverted, an initialization only one side writes): the trace
+/// links the two calls, and every pair of statements the comparison made
+/// is before the call on both sides or after it on both. A statement left
+/// unpaired is reported on its own.
+fn same_place_paired(
+    (ia, ib): (&[Item], &[Item]),
+    pairs: &[(usize, usize)],
     xn: &SyntaxNode,
     yn: &SyntaxNode,
     anchors: &[Anchor],
 ) -> bool {
-    let (ca, cb) = (cst::sig_range(xn).0, cst::sig_range(yn).0);
+    let (ca, cb) = (cst::sig_range(xn), cst::sig_range(yn));
     // The trace must link the two calls themselves.
-    let linked = innermost(anchors, true, ca)
+    let linked = innermost(anchors, true, ca.0)
         .iter()
-        .any(|&k| anchors[k].b.0 <= cb && cb < anchors[k].b.1);
+        .any(|&k| anchors[k].b.0 <= cb.0 && cb.0 < anchors[k].b.1);
     if !linked {
         return false;
     }
-    for (u, side_a) in [(ua, true), (ub, false)] {
-        let (mine, theirs) = if side_a { (ca, cb) } else { (cb, ca) };
-        for st in &u.stmts {
-            let at = cst::sig_range(&st.node).0;
-            for k in innermost(anchors, side_a, at) {
-                let (here, there) = if side_a {
-                    (anchors[k].a, anchors[k].b)
-                } else {
-                    (anchors[k].b, anchors[k].a)
-                };
-                // Only an anchor written for this statement says where its
-                // counterpart is, not one around it.
-                if here.0 < at {
-                    continue;
-                }
-                if (at < mine) != (there.0 < theirs) {
-                    return false;
-                }
-            }
+    // Whether every node of the item is before the call (`Some(true)`) or
+    // after it (`Some(false)`); `None` when it holds or straddles the call.
+    let before = |it: &Item, call: (usize, usize)| {
+        let r: Vec<(usize, usize)> = it.nodes.iter().map(cst::sig_range).collect();
+        if r.iter().all(|x| x.1 <= call.0) {
+            Some(true)
+        } else if r.iter().all(|x| x.0 >= call.1) {
+            Some(false)
+        } else {
+            None
         }
-    }
-    true
+    };
+    pairs.iter().all(|&(i, j)| {
+        let (p, q) = (before(&ia[i], ca), before(&ib[j], cb));
+        p.is_some() && p == q
+    })
 }
 
 /// Whether a PostgreSQL statement sits in a DO block in PL/pgSQL.
@@ -451,6 +441,12 @@ fn in_do(node: &SyntaxNode, d: Dialect) -> bool {
         })
 }
 
+/// The statements of both sides and the pairs the comparison made of them.
+type Paired<'a> = ((&'a [Item], &'a [Item]), &'a [(usize, usize)]);
+
+/// Compares the procedure calls and object comments of both sides
+/// (`call.rs`), paired in order by what they call or comment on; `paired`
+/// is the statements of both sides and the pairs the comparison made.
 #[allow(clippy::too_many_arguments)]
 fn calls(
     a: &Analyzed,
@@ -460,6 +456,7 @@ fn calls(
     sa: &Schema,
     sb: &Schema,
     anchors: &[Anchor],
+    paired: Paired,
     out: &mut Outcome,
 ) {
     use sqldiff_syntax::Dialect;
@@ -584,7 +581,8 @@ fn calls(
                 continue;
             }
         } else if at_a != at_b
-            && !(at_a.outside == at_b.outside && same_place_traced(ua, ub, xn, yn, anchors))
+            && !(at_a.outside == at_b.outside
+                && same_place_paired(paired.0, paired.1, xn, yn, anchors))
         {
             unknown(
                 out,
@@ -2880,7 +2878,7 @@ fn pair_items(
     anchors: &[Anchor],
     wit: Option<&Witnessing>,
     out: &mut Outcome,
-) {
+) -> Vec<(usize, usize)> {
     let ka: Vec<String> = ia.iter().map(|x| key(&x.term)).collect();
     let kb: Vec<String> = ib.iter().map(|x| key(&x.term)).collect();
     let Alignment {
@@ -2992,6 +2990,7 @@ fn pair_items(
             out,
         );
     }
+    pairs
 }
 
 /// One entry of a statement sequence in the IF and loop structure: a
