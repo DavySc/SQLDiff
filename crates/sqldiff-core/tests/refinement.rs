@@ -34,11 +34,14 @@ fn identical_sides_are_equivalent() {
 }
 
 #[test]
-fn ordering_an_unordered_result_refines_it() {
+fn an_added_order_by_is_not_taken_as_a_refinement() {
+    // An added ORDER BY refines A only when it cannot fail, and the engine
+    // cannot tell that yet: a key outside GROUP BY (T-SQL 8127), next to an
+    // aggregate, or of a type that does not sort (text, ntext, xml: 305,
+    // 306) makes B fail where A runs. It stays unknown, as before decision 1.
     let r = run(&tsql(UNORDERED), T, &tsql(ORDERED), T);
-    assert!(equal(&r), "{:?}", r.findings);
-    assert_eq!(r.equivalent, Some(false));
-    assert_eq!(r.refinements.len(), 1);
+    assert!(!equal(&r), "{:?}", r.verdict());
+    assert!(r.refinements.is_empty());
 }
 
 #[test]
@@ -77,6 +80,23 @@ fn an_order_that_can_fail_is_not_a_refinement() {
         "SELECT o.OrderId FROM dbo.Orders o ORDER BY NoSuchColumn;",
     ] {
         let r = run(&tsql(UNORDERED), T, &tsql(b), T);
+        assert!(!equal(&r), "{b}: {:?}", r.verdict());
+    }
+    for (a, b) in [
+        (
+            "SELECT o.Dept, COUNT(*) AS n FROM dbo.Orders o WHERE o.Qty > 0 GROUP BY o.Dept;",
+            "SELECT o.Dept, COUNT(*) AS n FROM dbo.Orders o WHERE o.Qty > 0 GROUP BY o.Dept ORDER BY o.Qty;",
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM dbo.Orders o WHERE o.Qty > 0;",
+            "SELECT COUNT(*) AS n FROM dbo.Orders o WHERE o.Qty > 0 ORDER BY o.Qty;",
+        ),
+        (
+            "SELECT o.OrderId, o.Notes FROM dbo.Orders o;",
+            "SELECT o.OrderId, o.Notes FROM dbo.Orders o ORDER BY o.Notes;",
+        ),
+    ] {
+        let r = run(&tsql(a), T, &tsql(b), T);
         assert!(!equal(&r), "{b}: {:?}", r.verdict());
     }
     let r = run(

@@ -300,7 +300,7 @@ Checked with `sqldiff diff` on 2026-10-28, before the change:
 
 | Case | Today | After decision 1 |
 |---|---|---|
-| B adds `ORDER BY` to an unordered result | unknown | equal (B refines A); not equivalent |
+| B adds `ORDER BY` to an unordered result | unknown | unknown: B refines A only when its ORDER BY cannot fail, which the engine cannot show yet (withdrawn on review of #132: a key outside GROUP BY, beside an aggregate, or of a type that does not sort makes B fail) |
 | B drops the `ORDER BY` A had | unknown | different: B can return an order A never does |
 | B renames an output column alias | unknown | different in the same dialect |
 | B adds `SET NOCOUNT ON` (same dialect) | different | different (counts observed by default) |
@@ -789,7 +789,7 @@ vendor fact as an axiom (decision 5).
 | Result columns whose names differ only in letter case across dialects (T-SQL `Id`, PostgreSQL unquoted `id`, Db2 for i `ID`) | equal | equal under `ASM-RESULT-NAMES-CI` |
 | A rewritten same-dialect T-SQL statement that also changes the case of names | equal under assumptions without `ASM-TSQL-CI-COLLATION` | with it (also on `main`) |
 | Instances whose converted PostgreSQL returns a column under a lower-case name | converted | under assumptions (`ASM-RESULT-NAMES-CI`) |
-| B adds `ORDER BY` to a top-level result A leaves unordered (no TOP or LIMIT) | unknown | equal, `equivalent: false`, with the reason in `refinements` |
+| B adds `ORDER BY` to a top-level result A leaves unordered (no TOP or LIMIT) | unknown | unknown (the refinement was withdrawn on review: the engine cannot show that B's ORDER BY cannot fail) |
 | Every "equal" or "equal under assumptions" | (no field) | `equivalent: true` unless a one-way step was used |
 | A T-SQL procedure that sends rows-affected counts (no `SET NOCOUNT ON` first) against a PostgreSQL or Db2 for i routine, which sends none | equal under assumptions, without it | under `ASM-OBSERVER-ROWCOUNT`; converted procedures and instances are "under assumptions" instead of "converted". Decided 2026-10-28: no special handling; a team whose callers do not read the counts accepts `ASM-OBSERVER-ROWCOUNT` in its pack |
 | `SET NOCOUNT` changed within one dialect, `[observer] row_counts = "never"` | different | equal under `ASM-OBSERVER-ROWCOUNT` |

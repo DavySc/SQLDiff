@@ -2,7 +2,7 @@
 //! difference with a concrete witness, or unexplained (unknown).
 
 use super::canon::asm;
-use super::term::{n, Term};
+use super::term::Term;
 use crate::model::{Assumption, ChangeClass};
 
 /// A pair of subterms that differ, with their parents for context.
@@ -23,11 +23,6 @@ pub struct Cmp {
     /// (decision 1). With no mismatch the pair is equal but not equivalent.
     pub refinements: Vec<String>,
 }
-
-/// B orders a top-level result A leaves unordered: every order B returns is
-/// one A may return, so B refines A, but not the other way. Neither side may
-/// page, since TOP or LIMIT without an order picks the rows themselves.
-const ORDER_ADDED: &str = "B orders a result set that A leaves unordered";
 
 pub fn compare(a: &Term, b: &Term) -> Cmp {
     let mut c = Cmp::default();
@@ -73,27 +68,6 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
         return;
     }
     match (a, b) {
-        (Term::N(ha, ka), Term::N(hb, kb))
-            if ha == "q"
-                && hb == "q"
-                && ka.len() == 9
-                && kb.len() == 9
-                && pa.is_some_and(|p| p.is("resultset"))
-                && ka[6] == n("order", Vec::new())
-                && !kb[6].kids().is_empty()
-                && ka[7].atom() == Some("-")
-                && kb[7].atom() == Some("-")
-                && order_cannot_fail(a, &kb[0], &kb[6]) =>
-        {
-            if !c.refinements.iter().any(|r| r == ORDER_ADDED) {
-                c.refinements.push(ORDER_ADDED.to_string());
-            }
-            for (i, (x, y)) in ka.iter().zip(kb).enumerate() {
-                if i != 6 {
-                    walk(x, y, Some(a), Some(b), i, c);
-                }
-            }
-        }
         (Term::N(ha, ka), Term::N(hb, kb)) if ha == hb && ka.len() == kb.len() => {
             // Scalar contracts: two silent picks of an arbitrary row agree when
             // at most one row qualifies.
@@ -124,24 +98,6 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
             index,
         }),
     }
-}
-
-/// An added ORDER BY refines only if it cannot make the query fail or
-/// change what it returns: every key a column reference (no expression
-/// that can raise, no subquery that can return two rows) that A's query
-/// already reads, so that A compiling shows the column exists (without a
-/// catalog nothing else does), and no DISTINCT, under which T-SQL refuses
-/// an ORDER BY key outside the select list (error 145) and PostgreSQL does
-/// too.
-fn order_cannot_fail(a: &Term, distinct: &Term, order: &Term) -> bool {
-    fn mentions(t: &Term, x: &Term) -> bool {
-        t == x || t.kids().iter().any(|k| mentions(k, x))
-    }
-    distinct.atom() == Some("all")
-        && order
-            .kids()
-            .iter()
-            .all(|o| o.is("ord") && o.kid(0).is_some_and(|k| k.is("col") && mentions(a, k)))
 }
 
 fn hook(a: &Term, b: &Term) -> Option<Assumption> {
