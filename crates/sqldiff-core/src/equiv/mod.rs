@@ -1114,13 +1114,7 @@ fn same_stmt(
         }
     }
     let m = &c.mismatches[0];
-    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| {
-        format!(
-            "A has `{}` where B has `{}`",
-            compare::render(&m.a),
-            compare::render(&m.b)
-        )
-    }))
+    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| compare::mismatch_text(m)))
 }
 
 /// The rest of the line from byte `off`, white space trimmed.
@@ -3954,13 +3948,7 @@ fn compare_pair(
         }
     }
     let m = unexplained[0];
-    let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| {
-        format!(
-            "A has `{}` where B has `{}`",
-            compare::render(&m.a),
-            compare::render(&m.b)
-        )
-    });
+    let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| compare::mismatch_text(m));
     push(
         out,
         "equiv.unproven",
