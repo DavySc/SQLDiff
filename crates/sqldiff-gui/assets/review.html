@@ -292,6 +292,12 @@ async function api(path, body) {
   return r.headers.get("Content-Type").startsWith("application/json") ? JSON.parse(text) : text;
 }
 
+// The blockers the state carries (the first few), and how many more there are.
+function blockerList(g) {
+  const more = g.blockers_total - g.blockers.length;
+  return `<ul>${g.blockers.map((x) => `<li>${esc(x.path)}${x.out_line ? `:${x.out_line}` : ""}${x.unit ? ` ${esc(x.unit)}` : ""} · ${esc(x.kind)}: ${esc(x.what)}</li>`).join("")}${more > 0 ? `<li>… and ${more} more</li>` : ""}</ul>`;
+}
+
 function renderHeader() {
   const st = S.st;
   const base = (p) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
@@ -304,7 +310,7 @@ function renderHeader() {
   const tiers = Object.entries(st.tiers).filter(([, n]) => n > 0);
   const g = st.gate;
   const gate = g
-    ? `<button class="chip gate${g.complete ? " ok" : ""}" id="gatechip" aria-expanded="${S.gateOpen}" title="${g.complete ? "Done" : `Not done: ${g.blockers.length} blocker(s)`}, as the done gate (sqldiff review-status) judges it. Click for why.">${g.complete ? `<span class="dot" style="background:var(--s-converted)"></span>Done` : `<span class="dot" style="background:var(--s-unproven)"></span>Not done · <b>${g.blockers.length}</b>`}</button>`
+    ? `<button class="chip gate${g.complete ? " ok" : ""}" id="gatechip" aria-expanded="${S.gateOpen}" title="${g.complete ? "Done" : `Not done: ${g.blockers_total} blocker(s)`}, as the done gate (sqldiff review-status) judges it. Click for why.">${g.complete ? `<span class="dot" style="background:var(--s-converted)"></span>Done` : `<span class="dot" style="background:var(--s-unproven)"></span>Not done · <b>${g.blockers_total}</b>`}</button>`
     : `<span class="chip" title="${esc(st.gate_error || "")}">Done gate not judged</span>`;
   const nOpen = st.items.filter((i) => i.tier <= 5).length;
   $("chips").innerHTML = `<span class="chip" title="Items in tiers 1 to 5, in every lens"><b>${nOpen}</b> open</span>${S.recorded ? `<span class="chip" title="Decisions recorded from this page since it was opened"><b>${S.recorded}</b> recorded now</span>` : ""}<span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>${gate}`;
@@ -314,7 +320,7 @@ function renderHeader() {
     const kinds = Object.entries(g.counts).map(([k, n]) => `${n} ${esc(k)}`).join(", ");
     b.push(`<div class="banner gate">${g.complete
       ? `Done: every unit is converted, or its assumptions are accepted and its decisions picked by a person; no rejection stands; what an agent wrote is approved by a person; and the converted tree is what converting the source gives (judged ${esc(time(st.gate_judged))}, files unchanged since)${g.instances === true ? ", with a current, complete instance check" : ""}. ${g.nothing_found} of ${g.units} unit(s) are converted with nothing found: not proven, and not reviewed.`
-      : `Not done (${kinds}):<ul>${g.blockers.slice(0, 100).map((x) => `<li>${esc(x.path)}${x.out_line ? `:${x.out_line}` : ""}${x.unit ? ` ${esc(x.unit)}` : ""} · ${esc(x.kind)}: ${esc(x.what)}</li>`).join("")}${g.blockers.length > 100 ? `<li>… and ${g.blockers.length - 100} more</li>` : ""}</ul>`}</div>`);
+      : `Not done (${kinds}):${blockerList(g)}`}</div>`);
   }
   if (g && S.gateOpen && g.accepted.length) b.push(`<div class="banner gate"><details><summary>Accepted by name: ${g.accepted.length} rule(s)</summary><ul>${g.accepted.map((x) => `<li>${esc(x.state)} ${esc(x.rule)} on ${x.units} unit(s) by ${esc(x.authors.join(", "))}</li>`).join("")}</ul></details></div>`);
   if (!g && st.gate_error) b.push(`<div class="banner">Done gate not judged: ${esc(st.gate_error)}</div>`);
@@ -764,7 +770,7 @@ $("author").addEventListener("input", () => {
 // Only the gate is taken over, so nothing being picked or typed is lost.
 window.addEventListener("focus", async () => {
   try {
-    const st = await api(`/api/state?${allQ().slice(1)}`);
+    const st = await api("/api/gate");
     Object.assign(S.st, { gate: st.gate, gate_error: st.gate_error, gate_judged: st.gate_judged });
     renderHeader();
   } catch (e) { /* the next action shows the error */ }

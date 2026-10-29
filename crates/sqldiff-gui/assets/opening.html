@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="1">
+<title>SQLDiff review</title>
+<style>
+/* Palette shared with home.html and review.html; keep them in sync. */
+:root {
+  --bg: #f7f8fa; --panel: #ffffff; --fg: #16181d; --muted: #6b7280; --line: #e8eaee; --soft: #f1f3f6;
+  --shadow: 0 1px 2px rgba(16,24,40,.05); --accent: #4f46e5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --panel: #15181d; --fg: #e6e8ec; --muted: #8b93a1; --line: #23272e; --soft: #1c2026;
+    --shadow: 0 1px 2px rgba(0,0,0,.4); --accent: #818cf8;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.5 "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+header { min-height: 44px; padding: 6px 12px 6px 16px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; align-items: center; }
+header h1 { font-size: 13px; margin: 0; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+header h1::before { content: ""; width: 16px; height: 16px; border-radius: 4px; background: linear-gradient(135deg, var(--accent), #06b6d4); }
+main { flex: 1; overflow: auto; padding: 32px 20px; }
+.card { max-width: 560px; margin: 0 auto; padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); }
+.card p { margin: 0 0 10px; }
+.muted { color: var(--muted); font-size: 12.5px; }
+.bar { height: 6px; border-radius: 3px; background: var(--soft); overflow: hidden; margin: 12px 0 6px; }
+.bar span { display: block; height: 100%; background: var(--accent); }
+</style>
+</head>
+<body>
+<!--__SQLDIFF_SHELL__-->
+<header><h1>SQLDiff review</h1></header>
+<main>
+  <div class="card" role="status">
+    <p><b>Opening the review of run /*__RUN__*/</b></p>
+    <p class="muted">This run is from an earlier session of the app, so its source is converted again: the done gate is only judged on a fresh conversion. This page opens the review once that is done.</p>
+    <div class="bar"><span style="width: /*__PERCENT__*/%"></span></div>
+    <div class="muted">/*__PROGRESS__*/</div>
+  </div>
+</main>
+</body>
+</html>
