@@ -22,7 +22,7 @@ The table is C3a's `acct` (`Id` key, `Qty` nullable, `Total NOT NULL`),
 columns. -/
 
 def twoK : CatTable :=
-  { name := "two", cols := [⟨"a", "A", true, true⟩, ⟨"b", "B", true, true⟩, ⟨"v", "V", false, false⟩] }
+  { name := "two", cols := [⟨"a", "A", true, true, none, none⟩, ⟨"b", "B", true, true, none, none⟩, ⟨"v", "V", false, false, none, none⟩] }
 
 def Γq : Catalog := { Γd with tables := Γd.tables ++ [twoK] }
 def depq : Deployment := { depd with tables := depd.tables ++ [("dbo.Two", "two")] }

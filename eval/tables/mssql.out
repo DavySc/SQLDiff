@@ -1,0 +1,31 @@
+Changed database context to 'probe_c3c'.
+T1 fits, trailing spaces: v=[ab  ] bytes=4 w=[ab  ] bytes=8
+T1 stored bytes: v=4 w=8
+T1 fits exactly: v=[abcde] w=[abcde]
+T1 empty string: v=[] null=no
+T1 update fits: bytes=3
+T2 insert too long: error 2628, rows=0
+T2 update too long: error 2628
+T2 insert too long by spaces: no error, bytes=5
+T2 nvarchar too long: error 2628
+T2 ANSI_WARNINGS OFF: v=[abcde]
+T3 ANSI_PADDING OFF column: v bytes=2 (is_ansi_padded 0), w bytes=8 (is_ansi_padded 1)
+T4 defaults: q=0 r=-1 c=Paris n=x z=NULL u=NULL
+T4 listed columns win: q=5 c=NULL
+T4 update leaves defaults alone: c=NULL
+T4 default too long: error 2628
+T5 server-default collation: rows with v = 'a': 2
+Changed database context to 'probe_c3c_bin'.
+T5 BIN2 database: column collation Latin1_General_100_BIN2, rows with v = 'a': 2
+T5 BIN2 database: rows with rtrim(v) = rtrim('a'): 2
+T6 string key a, a-space: error 2627
+Changed database context to 'probe_c3c'.
+T7 non-unique index: rows=3 v1=y
+Warning! The maximum key length for a nonclustered index is 1700 bytes. The index 'ix_w_v' has maximum length of 2000 bytes. For some combination of large values, the insert/update operation will fail.
+T8 index key 1700 bytes: no error
+T8 index key 1702 bytes: error 1946
+Warning! The maximum key length for a clustered index is 900 bytes. The index 'ix_wc_v' has maximum length of 1000 bytes. For some combination of large values, the insert/update operation will fail.
+T8 clustered key 900 bytes: no error
+T8 clustered key 901 bytes: error 1946
+T9 read into a shorter variable: x=[ab]
+Changed database context to 'master'.

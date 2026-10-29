@@ -17,10 +17,10 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes (with a result or an error), more fuel gives the same observation (`obs_mono`) |
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
 | `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
-| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C3a data statements and the C3b queries (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
+| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C3a data statements, the C3b queries and the C3c tables (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer |
-| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC4.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C3b queries; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs), as `#guard`s checked on every build |
+| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs), as `#guard`s checked on every build |
 | `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
@@ -342,6 +342,37 @@ the C4 settling. One C4 fact needed a correction for reads:
 same from any database) now also asks for no query, and a handler with a
 query is no longer a `failHandler` (it would read the database `undo`
 restores). Standard axioms only (`Axioms.lean`).
+
+### Phase C3c: wider plain tables
+
+Checker 0.11.0. The core is unchanged: a catalog table (`CatTable`) may
+now have string columns and constant defaults, and the Rust side lets a
+non-unique index through. "The C3c tables" in `Sqldiff/Mirror/Lower.lean`
+has every rule with its claim, vendor text (**all quoted from memory**)
+and probe; `eval/tables/{mssql,postgres}.sql` with their `.out` files
+(T1 to T9) is the probe, run on SQL Server 2022 and PostgreSQL 18.6.
+
+| Rule | Claim | Probed (eval/tables) |
+|---|---|---|
+| String columns | T-SQL `varchar(n)`/`nvarchar(n)`, `1 ≤ n ≤ 4000`, against PostgreSQL `varchar(n)` with the same `n` (SPEC `v<n>`/`w<n>`); a value that fits is stored and read back as it is, trailing spaces included | T1 |
+| Reads | a column read has the column's bound (`wide` for `nvarchar`); every C2b rule applies to it as to a string variable (`=`/`<>` only under the collation fact, which now covers columns: a column without `COLLATE` has the database's collation) | T1, T5 |
+| Writes | `INSERT`/`UPDATE` store into a string column only NULL or a string of the slice that fits (`colFits`); SQL Server raises 2628 under `ANSI_WARNINGS ON` and truncates under `OFF`, PostgreSQL raises 22001, both truncate excess spaces | T2 |
+| Picks | C3b `SELECT @x = col` and `SET @x = (SELECT col ...)` may read a string column into a string variable it fits (`pickStoresOk`, `forStoresOk`); SQL Server truncates, PostgreSQL raises 22001 | T9 |
+| `ANSI_PADDING` | a `varchar` column created under `OFF` trims trailing spaces on writes (`nvarchar` does not); the catalog asserts `ON`, Rust names `ASM-TSQL-ANSI-PADDING` for a routine that writes a table with a `varchar` column and keeps out every such table of a T-SQL tree that turns it off | T3 |
+| String keys | outside: SQL Server pads key values (`'a'` and `'a '` collide, 2627, even under BIN2), PostgreSQL does not | T6 |
+| Defaults | an integer literal for an `int` column or a slice string literal that fits for a string column, the same in both DDLs (a fourth column field, `i<int>`/`s<hex>`); both lowerings add the left-out columns with a default to the `INSERT` (`defaultsFor`); expressions, functions, sequences, a default on one side only, and different defaults stay outside | T4 (also: a default too long fails the `INSERT`, 2628 against 22001) |
+| Indexes | a non-unique, unfiltered index without options on plain columns changes no result unless an entry exceeds the engine's limit (SQL Server 1700 bytes nonclustered, 900 clustered; PostgreSQL btree about 2704 bytes, `INCLUDE` counted); the Rust side checks declared sizes (`plain_table::PlainIndex::fits`) and the catalog asserts it | T7, T8 |
+
+PostgreSQL parameters still carry no length (C2b), so a string parameter
+cannot be written to a `varchar(n)` column; a local declared with a
+length can. **What it rests on**, beyond C3b: `ASM-TABLES-AS-DECLARED`
+(now also: the column types, defaults, indexes and column collations are
+as the DDL declares them), `ASM-TSQL-ANSI-PADDING` (Rust-side, for a
+routine that writes a `varchar` column), and the C2b residuals the
+routine's expressions need. No new answer field or Lean residual; the
+proofs are untouched (`check_sound` and `check_sound_c2a` keep their
+statements; `Axioms.lean` unchanged). `ExamplesC3c` has the confirmed and
+refused pairs and interpreter runs.
 
 ### Phase C4: errors and transactions
 

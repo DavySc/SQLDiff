@@ -22,14 +22,30 @@ string in lower-case hex, two digits per byte:
                 TABLE NAME=COL/COL/... a target table (folded, `.`-joined as
                                      the PL/pgSQL code names it) and its
                                      columns in declaration order, at least one
-                COL NAME.SPEC or NAME.SPEC.NAME
+                COL NAME.SPEC, NAME.SPEC.NAME or NAME.SPEC.NAME.DEFAULT
                                      the column (folded), its type and
-                                     constraints, and optionally its spelling
+                                     constraints, optionally its spelling
                                      in the T-SQL table (default: the folded
-                                     name without a leading `"`)
-                SPEC i, in, ik or ink  i: the type, `int`/`integer` (the only
-                                     one so far); n: NOT NULL; k: a column of
-                                     the primary key (NOT NULL in any case)
+                                     name without a leading `"`), and (C3c)
+                                     optionally its default
+                SPEC TYPE then optionally n, then optionally k
+                                     n: NOT NULL; k: a column of the primary
+                                     key (NOT NULL in any case). So C3a's
+                                     i, in, ik, ink decode as before
+                TYPE i               `int`/`integer`
+                     v DIGITS        (C3c) T-SQL `varchar(DIGITS)`, PostgreSQL
+                                     `varchar(DIGITS)`
+                     w DIGITS        (C3c) T-SQL `nvarchar(DIGITS)`, PostgreSQL
+                                     `varchar(DIGITS)`
+                                     (`CatCol.str`; a string key column, a
+                                     length outside 1..4000, decodes but the
+                                     table is not usable: `CatTable.wellFormed`)
+                DEFAULT i INT        (C3c) an integer literal, `-` allowed:
+                                     `i0`, `i-1` (`Sqldiff.Mirror.intLit?`)
+                        s HEX        (C3c) a string literal, its UTF-8 bytes
+                                     as for NAME (`s` alone: the empty string)
+                                     Both tables declare the default; DEFAULT
+                                     NULL is sent as no DEFAULT (`CatCol.dflt`)
                 FACT !binary-collation (C2b) `Catalog.binaryCollation`: the
                                      T-SQL database that holds the routine
                                      has a `_BIN`/`_BIN2` default collation,
@@ -51,7 +67,9 @@ declares it, and records `ASM-BINARY-COLLATION` for every routine it
 sends it with.
 A TABLE entry asserts every fact `Sqldiff.Mirror.CatTable` lists (no
 other constraint, default, trigger, ...): the Rust side sends a table only
-when the catalogs show all of them.
+when the catalogs show all of them. (C3c) A checker older than C3c
+answers a request with a `v`/`w` column or a DEFAULT "the catalog does
+not decode"; a C3c checker reads every older request as before.
 
 The answer: `check`, plus the fields `extra` adds to a confirmed answer
 (`"scalars"`, `"residual"` for a C2a answer, and `"statements"`; see
@@ -112,25 +130,52 @@ def deployment? (s : String) : Option Deployment := do
     pure { rowCounts := rc, routines, tables }
   | [] => none
 
-/-- A column's type and constraints: `(notNull, key)`. -/
-def spec? : String → Option (Bool × Bool)
-  | "i" => some (false, false)
-  | "in" => some (true, false)
-  | "ik" => some (false, true)
-  | "ink" => some (true, true)
+/-- The flags after a column's type: `(notNull, key)`. -/
+def flags? : List Char → Option (Bool × Bool)
+  | [] => some (false, false)
+  | ['n'] => some (true, false)
+  | ['k'] => some (false, true)
+  | ['n', 'k'] => some (true, true)
+  | _ => none
+
+/-- A column's type, constraints and (C3c) string type: `(str, notNull,
+key)`. `i` with the C3a flags decodes as before. -/
+def spec? (s : String) : Option (Option (Nat × Bool) × Bool × Bool) :=
+  match s.toList with
+  | 'i' :: fl => (flags? fl).map fun (n, k) => (none, n, k)
+  | c :: rest =>
+    if c == 'v' || c == 'w' then
+      let ds := rest.takeWhile Char.isDigit
+      if ds.isEmpty then none else do
+        let len ← digitsVal ds 0
+        let (n, k) ← flags? (rest.drop ds.length)
+        pure (some (len, c == 'w'), n, k)
+    else none
+  | [] => none
+
+/-- (C3c) A column's default: `i` and an integer literal, `s` and the hex
+of a string. -/
+def dflt? (s : String) : Option Core.SExpr :=
+  match s.toList with
+  | 'i' :: ds => (intLit? (String.ofList ds)).map .int
+  | 's' :: hs => (name? (String.ofList hs)).map .str
   | _ => none
 
 def col? (s : String) : Option CatCol := do
-  let (n, sp, t) ← match s.splitOn "." with
-    | [n, sp] => some (n, sp, none)
-    | [n, sp, t] => some (n, sp, some t)
+  let (n, sp, t, df) ← match s.splitOn "." with
+    | [n, sp] => some (n, sp, none, none)
+    | [n, sp, t] => some (n, sp, some t, none)
+    | [n, sp, t, df] => some (n, sp, some t, some df)
     | _ => none
   let name ← name? n
-  let (notNull, key) ← spec? sp
+  let (str, notNull, key) ← spec? sp
   let tsql ← match t with
     | some t => name? t
     | none => some (if name.startsWith "\"" then String.ofList (name.toList.drop 1) else name)
-  pure { name, tsql, notNull, key }
+  let dflt ← match df with
+    | some df => (dflt? df).map some
+    | none => some none
+  pure { name, tsql, notNull, key, str, dflt }
 
 /-- A catalog entry: a routine, a table, or (C2b) the collation fact. -/
 inductive Entry where
@@ -258,6 +303,45 @@ def extra (dep cat ra : String) (ans : Answer) : String :=
 #guard (catalog? "70:ib").map (·.binaryCollation) == some false
 #guard (catalog? "!binary").isNone
 #guard (catalog? "!").isNone
+-- C3c: string columns and defaults. `name varchar(20) NOT NULL`, `city
+-- nvarchar(30)` with DEFAULT 'Paris', `qty int` NOT NULL DEFAULT -1.
+#guard (catalog? ("74=6964.ink/6e616d65.v20n/63697479.w30.43697479.s5061726973/" ++
+    "717479.in.517479.i-1")).map
+    (fun g => g.tables.map fun t => t.cols.map fun c => (c.name, c.tsql, c.notNull, c.key, c.str,
+      c.dflt)) ==
+  some [[("id", "id", true, true, none, none),
+    ("name", "name", true, false, some (20, false), none),
+    ("city", "City", false, false, some (30, true), some (.str "Paris")),
+    ("qty", "Qty", true, false, none, some (.int (-1)))]]
+-- The line `crates/sqldiff-core/src/proof.rs` writes for the same table
+-- (its test `a_mirror_request_encodes_tables_as_the_checker_reads_them`).
+#guard (catalog? ("70:ib,61636374=6964.ink.6964/6e616d65.v20n.6e616d65/" ++
+    "63697479.w30.43697479.s5061726973/717479.in.517479.i-1")).map
+    (fun g => g.tables.map fun t => (t.wellFormed, t.cols.map fun c => (c.name, c.str, c.dflt))) ==
+  some [(true, [("id", none, none), ("name", some (20, false), none),
+    ("city", some (30, true), some (.str "Paris")), ("qty", none, some (.int (-1)))])]
+-- The empty string as a default; a string key decodes (and is refused by `wellFormed`).
+#guard (catalog? "74=63.v5.63.s").map (fun g => g.tables.map fun t => t.cols.map (·.dflt)) ==
+  some [[some (.str "")]]
+#guard (catalog? "74=63.v5k").map (fun g => g.tables.map fun t => t.wellFormed) == some [false]
+#guard (catalog? "74=6964.ik/63.v5n").map (fun g => g.tables.map fun t => t.wellFormed) == some [true]
+#guard (catalog? "74=63.v").isNone
+#guard (catalog? "74=63.vn").isNone
+#guard (catalog? "74=63.v5x").isNone
+#guard (catalog? "74=63.x5").isNone
+#guard (catalog? "74=63.i.63.i2147483648").isNone
+#guard (catalog? "74=63.i.63.x1").isNone
+#guard (catalog? "74=63.i.63.s4").isNone
+#guard (catalog? "74=63.i.63.i1.0").isNone
+-- A default of the wrong kind, too long, or out of the slice decodes; the table is unusable.
+#guard (catalog? "74=63.i.63.s61").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.v2.63.s616263").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.v3.63.s616263").map (fun g => g.tables.map (·.wellFormed)) == some [true]
+#guard (catalog? "74=63.v3.63.i1").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.v3.63.s5c").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.v0").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.v4001").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.w4000").map (fun g => g.tables.map (·.wellFormed)) == some [true]
 #guard (catalog? "74=").isNone
 #guard (catalog? "74=6964").isNone
 

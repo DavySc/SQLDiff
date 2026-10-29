@@ -266,11 +266,15 @@ pub struct MirrorRequest {
 
 /// A table of the target catalog for the C3a slice
 /// (`Sqldiff.Mirror.CatTable`). Sending one asserts that both databases
-/// have it with these `int` columns, nullability and primary key, and
-/// nothing else that changes a write: no other constraint, default,
-/// identity, sequence, computed column, trigger, rule or row-level
-/// security; a key neither deferrable nor `IGNORE_DUP_KEY`; no inheritance
-/// children; not a temporary table or table variable.
+/// have it with these columns (`int`, or (C3c) the string types of
+/// [`MirrorColumn::str`]), nullability, primary key and (C3c) constant
+/// defaults, and nothing else that changes a write: no other constraint,
+/// default, identity, sequence, computed column, trigger, rule or
+/// row-level security; a key neither deferrable nor `IGNORE_DUP_KEY`; no
+/// inheritance children; not a temporary table or table variable; (C3c)
+/// only non-unique indexes whose entries stay within the engines' size
+/// limits; string columns with the database's default collation, created
+/// in SQL Server with `ANSI_PADDING ON`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorTable {
     /// Folded, `.`-joined as the PL/pgSQL code names it.
@@ -288,6 +292,20 @@ pub struct MirrorColumn {
     pub not_null: bool,
     /// A column of the primary key.
     pub key: bool,
+    /// (C3c) A string column: `(n, wide)` is T-SQL `varchar(n)` (`wide`
+    /// false) or `nvarchar(n)` (true) against PostgreSQL `varchar(n)`.
+    /// `None`: `int`/`integer`. Sent only when both DDLs show it.
+    pub str: Option<(u32, bool)>,
+    /// (C3c) The constant default both DDLs declare; `None` for none or
+    /// `DEFAULT NULL`.
+    pub default: Option<MirrorDefault>,
+}
+
+/// (C3c) A column default the checker takes as given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MirrorDefault {
+    Int(i32),
+    Str(String),
 }
 
 fn hex(s: &str) -> String {
@@ -331,12 +349,25 @@ impl MirrorRequest {
                 .cols
                 .iter()
                 .map(|c| {
-                    let spec = match (c.key, c.not_null) {
-                        (true, _) => "ink",
-                        (false, true) => "in",
-                        (false, false) => "i",
+                    // SPEC (Request.lean): the type (`i`, or (C3c) `v<n>` /
+                    // `w<n>`), then `n` for NOT NULL, then `k` for a key
+                    // column; (C3c) the default as a fourth field.
+                    let mut spec = match c.str {
+                        None => "i".to_string(),
+                        Some((n, false)) => format!("v{n}"),
+                        Some((n, true)) => format!("w{n}"),
                     };
-                    format!("{}.{spec}.{}", hex(&c.name), hex(&c.tsql))
+                    match (c.key, c.not_null) {
+                        (true, _) => spec.push_str("nk"),
+                        (false, true) => spec.push('n'),
+                        (false, false) => {}
+                    }
+                    let default = match &c.default {
+                        None => String::new(),
+                        Some(MirrorDefault::Int(i)) => format!(".i{i}"),
+                        Some(MirrorDefault::Str(v)) => format!(".s{}", hex(v)),
+                    };
+                    format!("{}.{spec}.{}{default}", hex(&c.name), hex(&c.tsql))
                 })
                 .collect::<Vec<_>>()
                 .join("/");
@@ -709,6 +740,8 @@ mod tests {
             tsql: tsql.into(),
             not_null,
             key,
+            str: None,
+            default: None,
         };
         let r = MirrorRequest {
             row_counts: false,
@@ -734,6 +767,34 @@ mod tests {
         assert_eq!(
             f[5],
             "70:ib,61636374=6964.ink.4964/717479.i.517479/746f74616c.in.546f74616c,!binary-collation"
+        );
+        // C3c: string columns and defaults, as Request.lean's examples
+        // decode them (`name varchar(20) NOT NULL`, `city nvarchar(30)`
+        // DEFAULT 'Paris', `qty int NOT NULL DEFAULT -1`).
+        let mut r = r;
+        r.binary_collation = false;
+        r.table_catalog[0].cols = vec![
+            col("id", "id", true, true),
+            MirrorColumn {
+                str: Some((20, false)),
+                ..col("name", "name", true, false)
+            },
+            MirrorColumn {
+                str: Some((30, true)),
+                default: Some(MirrorDefault::Str("Paris".into())),
+                ..col("city", "City", false, false)
+            },
+            MirrorColumn {
+                default: Some(MirrorDefault::Int(-1)),
+                ..col("qty", "Qty", true, false)
+            },
+        ];
+        let l = r.line(1).unwrap();
+        let f: Vec<&str> = l.split('\t').collect();
+        assert_eq!(
+            f[5],
+            "70:ib,61636374=6964.ink.6964/6e616d65.v20n.6e616d65/63697479.w30.43697479.s5061726973/\
+             717479.in.517479.i-1"
         );
     }
 }
