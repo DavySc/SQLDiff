@@ -3254,6 +3254,19 @@ impl<'a> Canon<'a> {
             Dialect::Db2i => return Err("UPDATE ... FROM is not supported".into()),
         };
         conds.extend(where_.iter().cloned());
+        if others.is_empty() {
+            // `UPDATE t … FROM t WHERE w` is a plain UPDATE.
+            let where_ = conds
+                .into_iter()
+                .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)));
+            return self.stmt(&Stmt::Update {
+                target: tname,
+                alias: talias,
+                sets: sets.to_vec(),
+                from: Vec::new(),
+                where_,
+            });
+        }
         let tkey = talias
             .as_ref()
             .map(|x| lc(x))
@@ -4018,20 +4031,49 @@ fn tsql_update_target(
     from: &[From],
 ) -> R<(Vec<String>, Option<String>, Vec<From>, Vec<Expr>)> {
     let unsupported = |why: &str| Err(format!("UPDATE ... FROM: {why}"));
-    let [t] = target else {
-        return unsupported("the target is not a one-part name");
-    };
+    if target.is_empty() || target.len() > 2 {
+        return unsupported("the target is not a table name, a schema-qualified one or an alias");
+    }
     if alias.is_some() {
         return unsupported("the target has an alias");
     }
-    let key = lc(t);
-    let binds = |f: &From| match f {
-        From::Table { name, alias, .. } => match alias {
-            Some(a) => lc(a) == key,
-            None => name.last().is_some_and(|x| lc(x) == key),
-        },
+    let t: Vec<String> = target.iter().map(|x| lc(x)).collect();
+    let one = t.len() == 1;
+    let key = t.last().cloned().unwrap_or_default();
+    // SQL Server binds the target to the FROM reference of the same table,
+    // aliased or not, and a one-part target also to an alias or to an
+    // unaliased table's last name part (checked on SQL Server 2022). Where
+    // only one side states a schema the default schema decides, which is
+    // not modelled.
+    let mut unclear = None;
+    let mut binds = |f: &From| match f {
+        From::Table { name, alias, .. } => {
+            let n: Vec<String> = name.iter().map(|x| lc(x)).collect();
+            if let Some(a) = alias {
+                if lc(a) == key {
+                    if !one {
+                        unclear = Some("the alias of another FROM item has the target's name");
+                    }
+                    return one;
+                }
+            }
+            if n.last() != Some(&key) {
+                return false;
+            }
+            if n == t || (one && alias.is_none()) {
+                return true;
+            }
+            if n.len() != t.len() {
+                unclear = Some("the target and a FROM table may or may not be the same table (only one states a schema)");
+            }
+            false
+        }
         From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
-            alias.as_ref().is_some_and(|a| lc(a) == key)
+            let hit = alias.as_ref().is_some_and(|a| lc(a) == key);
+            if hit && !one {
+                unclear = Some("the alias of another FROM item has the target's name");
+            }
+            hit && one
         }
         _ => false,
     };
@@ -4043,22 +4085,39 @@ fn tsql_update_target(
         }
         chains.push(c);
     }
-    let hits: Vec<(usize, usize)> = chains
-        .iter()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            c.iter()
-                .enumerate()
-                .filter(|(_, s)| binds(&s.1))
-                .map(move |(j, _)| (i, j))
-        })
-        .collect();
-    let [(ci, li)] = hits[..] else {
-        return unsupported(if hits.is_empty() {
-            "the target is not one of the FROM tables by alias or one-part name"
-        } else {
-            "the target matches more than one FROM table"
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (i, c) in chains.iter().enumerate() {
+        for (j, s) in c.iter().enumerate() {
+            if binds(&s.1) {
+                hits.push((i, j));
+            }
+        }
+    }
+    if let Some(w) = unclear {
+        return unsupported(w);
+    }
+    if hits.is_empty() {
+        // The target is not in FROM: SQL Server joins it to the FROM
+        // tables, in scope in SET and WHERE but not in ON, which is
+        // PostgreSQL's shape (checked on SQL Server 2022). A FROM item that
+        // also shows the target's name is not modelled.
+        let shown = chains.iter().flatten().any(|s| match &s.1 {
+            From::Table { name, alias, .. } => match alias {
+                Some(a) => lc(a) == key,
+                None => name.last().is_some_and(|x| lc(x) == key),
+            },
+            From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
+                alias.as_ref().is_some_and(|a| lc(a) == key)
+            }
+            _ => true,
         });
+        if shown {
+            return unsupported("the target is not in FROM, and a FROM item is also named like it");
+        }
+        return Ok((target.to_vec(), None, from.to_vec(), Vec::new()));
+    }
+    let [(ci, li)] = hits[..] else {
+        return unsupported("the target matches more than one FROM table");
     };
     let c = &mut chains[ci];
     let From::Table { name, alias, hints } = c[li].1.clone() else {
