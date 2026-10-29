@@ -1168,7 +1168,11 @@ fn check_instance(
     }
     // Every finding of the diff counts: proven different, not decided
     // (unknown), or equal only under the assumptions it names.
-    let report = sqldiff_core::diff(&sa, &ta, opts);
+    // As in `crate::check`: case-insensitive string equality is flagged.
+    let report = {
+        let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
+        sqldiff_core::diff(&sa, &ta, opts)
+    };
     for f in &report.findings {
         let (status, rule) = if f.verdict == Verdict::Different
             || f.class == ChangeClass::Residue && f.b.is_some()
