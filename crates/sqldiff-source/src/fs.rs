@@ -39,6 +39,12 @@ impl FsSource {
         self
     }
 
+    /// Relative paths of the SQL files this source lists, sorted, with `/`
+    /// separators.
+    pub fn list(&self) -> Result<Vec<String>> {
+        self.files()
+    }
+
     /// Relative paths of candidate files, sorted, with `/` separators.
     fn files(&self) -> Result<Vec<String>> {
         let mut out = Vec::new();
