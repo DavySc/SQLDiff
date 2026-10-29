@@ -637,6 +637,13 @@ fact = "How callers call the routine."
 sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
+id = "ASM-TSQL-DYNAMIC-SESSION-OPTIONS"
+statement = "The session runs dynamic SQL with ANSI_NULLS and QUOTED_IDENTIFIER ON (the defaults): a T-SQL dynamic batch takes them from the session, not from the procedure that runs it."
+discharge = "deployment"
+fact = "The SET options of the sessions that call the routine."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-NO-NESTED-TRAN"
 statement = "Callers do not nest transactions (a second BEGIN only warns in PostgreSQL, where T-SQL counts it)."
 discharge = "deployment"
