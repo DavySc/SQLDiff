@@ -81,6 +81,7 @@ pub(crate) fn convert(
         view_query: false,
         trigger: None,
         seq_defaults: Vec::new(),
+        table_cols: Vec::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -222,6 +223,8 @@ struct Cx<'a> {
     /// Db2: columns of the table being created whose T-SQL default is
     /// `NEXT VALUE FOR seq` (column, sequence), filled by a trigger.
     seq_defaults: Vec<(String, String)>,
+    /// The columns of the table being created (lower case, unquoted).
+    table_cols: Vec<String>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -3584,6 +3587,14 @@ impl<'a> Cx<'a> {
         } else {
             Vec::new()
         };
+        self.table_cols = split_commas(&ts[open + 1..close])
+            .iter()
+            .filter_map(|item| {
+                let &f = sig(item).first()?;
+                (!constraint_item(&item[f]) && !item[f].is("INDEX"))
+                    .then(|| tsql_unquote(&item[f].s).to_ascii_lowercase())
+            })
+            .collect();
         let mut names = Vec::new();
         let mut indexes = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
@@ -4034,7 +4045,17 @@ impl<'a> Cx<'a> {
                         && next_sig(e, es[k])
                             .map_or(true, |n| e[n].k != L_PAREN && e[n].k != DOT) =>
                 {
-                    // A column of this table: T-SQL allows nothing else here.
+                    // A column of this table (not a niladic function such as
+                    // CURRENT_TIMESTAMP).
+                    if !self
+                        .table_cols
+                        .contains(&tsql_unquote(&t.s).to_ascii_lowercase())
+                    {
+                        return no(format!(
+                            "{REASON} ({} is not a column of the table: no rule yet)",
+                            t.s
+                        ));
+                    }
                 }
                 L_PAREN | R_PAREN => {}
                 _ => return no(format!("{REASON} ({} in the expression: no rule yet)", t.s)),
@@ -5124,7 +5145,11 @@ impl<'a> Cx<'a> {
             "UNIQUEIDENTIFIER" => ("uuid".into(), false, false),
             "XML" => ("xml".into(), false, false),
             "ROWVERSION" | "TIMESTAMP" => return no("ROWVERSION/TIMESTAMP: PostgreSQL has no automatic row version column; use xmin or a trigger-maintained column"),
-            "SQL_VARIANT" | "HIERARCHYID" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
+            "GEOGRAPHY" => {
+                self.note(Status::Assumptions, "ASM-POSTGIS-GEOGRAPHY", "GEOGRAPHY becomes PostGIS geography (no type modifier, so each value keeps its own SRID, as in SQL Server): the database has the postgis extension and its types are on the search path. A value is carried as it is; SQL Server's geography methods (STDistance, Lat, …) and PostGIS's functions differ, so every spatial expression is converted and checked on its own, and clients read PostGIS's formats.");
+                ("geography".into(), false, false)
+            }
+            "SQL_VARIANT" | "HIERARCHYID" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in PostgreSQL under that name.");
                 let t: String = ts.iter().map(|t| t.s.clone()).collect();

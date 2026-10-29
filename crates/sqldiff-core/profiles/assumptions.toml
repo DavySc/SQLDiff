@@ -623,6 +623,13 @@ fact = "The code base's transactions on the table do not rely on those errors (o
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-POSTGIS-GEOGRAPHY"
+statement = "PostgreSQL: the postgis extension is installed and its types are on the search path; a T-SQL GEOGRAPHY value is carried unchanged as a PostGIS geography (spatial methods are converted, or refused, on their own)."
+discharge = "deployment"
+fact = "The target database has CREATE EXTENSION postgis."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/bind/mod.rs"]
+
+[[assumption]]
 id = "ASM-NO-CALLER-TXN"
 statement = "The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block."
 discharge = "deployment"

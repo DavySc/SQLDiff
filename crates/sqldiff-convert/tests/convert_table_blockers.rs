@@ -141,6 +141,7 @@ fn pg_computed_columns_without_an_exact_rule_stay_refused() {
         "(case when [a] IS NULL then CONVERT([bit],(0)) else [f] end)",
         "(case when getdate() IS NULL then CONVERT([bit],(0)) end)",
         "(case when [a] IS NULL then case when [b] IS NULL then CONVERT([bit],(0)) end end)",
+        "(case when CURRENT_TIMESTAMP IS NULL then CONVERT([bit],(0)) end)",
     ] {
         let src = format!("CREATE TABLE s.t (a NVARCHAR(10) NULL, b NVARCHAR(10) NULL, n INT NULL, f BIT NULL, c AS {expr});\n");
         let c = pg(&src);
@@ -233,4 +234,67 @@ fn memory_optimized_with_durable_rows_is_a_plain_table() {
         "{:?}",
         c.units[0].notes
     );
+}
+
+#[test]
+fn pg_geography_becomes_postgis_geography() {
+    let src = "CREATE TABLE [Application].[Cities] (\n    [CityID] INT NOT NULL PRIMARY KEY,\n    [Location] [sys].[geography] NULL\n);\n";
+    let c = pg(src);
+    assert!(
+        c.units[0].status < Status::NotConverted,
+        "{:?}",
+        c.units[0].notes
+    );
+    assert!(
+        c.output.contains("    Location geography NULL\n"),
+        "{}",
+        c.output
+    );
+    assert!(has(&c, "ASM-POSTGIS-GEOGRAPHY"));
+    // The output check takes PostGIS's type under the same assumption.
+    assert!(
+        !c.units[0].notes.iter().any(|n| n.rule.starts_with("bind.")),
+        "{:?}",
+        c.units[0].notes
+    );
+    // Spatial expressions keep no rule; Db2 for i keeps refusing the type.
+    let point = "DECLARE @p geography = geography::Point(1, 2, 4326);\n";
+    assert!(
+        pg(point).units.iter().any(|u| u.status >= Status::Unproven),
+        "{}",
+        pg(point).output
+    );
+    assert_eq!(db2(src).units[0].status, Status::NotConverted);
+    // GEOMETRY stays refused.
+    let geo = "CREATE TABLE s.t (g geometry NULL);\n";
+    assert_eq!(pg(geo).units[0].status, Status::NotConverted);
+}
+
+/// From the review: readers of a computed bit column see a bit (T-SQL gives
+/// the CASE its results' type), so they get TRUE / FALSE against the boolean
+/// generated column, not `= 1`, which PostgreSQL rejects.
+#[test]
+fn pg_readers_of_a_computed_bit_column_compare_booleans() {
+    let table = "CREATE TABLE dbo.T (Id int NOT NULL, D date NULL,\n  IsOpen AS (CASE WHEN D IS NULL THEN CONVERT(bit,1) ELSE CONVERT(bit,0) END));\nGO\n";
+    for (reader, want, not) in [
+        (
+            "CREATE PROCEDURE dbo.P @n int OUTPUT AS SELECT @n = COUNT(*) FROM dbo.T WHERE IsOpen = 1;\n",
+            "WHERE IsOpen = TRUE",
+            "IsOpen = 1",
+        ),
+        (
+            "CREATE PROCEDURE dbo.P @n int OUTPUT AS SELECT @n = COUNT(*) FROM dbo.T AS t JOIN dbo.T AS u ON u.Id = t.Id AND t.IsOpen = 0;\n",
+            "t.IsOpen = FALSE",
+            "IsOpen = 0",
+        ),
+        (
+            "CREATE PROCEDURE dbo.P @b bit OUTPUT AS SET @b = (SELECT IsOpen FROM dbo.T WHERE Id = 1);\n",
+            "INOUT p_b boolean",
+            "p_b smallint",
+        ),
+    ] {
+        let c = pg(&format!("{table}{reader}"));
+        assert!(c.output.contains(want), "{reader}\n{}", c.output);
+        assert!(!c.output.contains(not), "{reader}\n{}", c.output);
+    }
 }
