@@ -67,9 +67,13 @@ fn app(isolated: bool) -> App {
 }
 
 fn start(isolated: bool) -> SocketAddr {
+    start_with(app(isolated))
+}
+
+fn start_with(app: App) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    std::thread::spawn(move || serve(listener, app(isolated), &[]));
+    std::thread::spawn(move || serve(listener, app, &[]));
     addr
 }
 
@@ -438,6 +442,50 @@ fn user_config_scenario(d: &Dir) {
     assert_eq!(status, "400 Bad Request", "{v}");
     assert!(!v.to_string().contains("zz-"), "{v}");
     assert!(!v.to_string().contains("unknown field"), "{v}");
+}
+
+#[test]
+fn a_launch_pack_is_never_the_workspace_file() {
+    let d = Dir::new("launch-pack");
+    let pack = "[pack]\nname = \"zz-launch-name\"\nversion = \"1\"\n\n[format]\nindent = 6\nkeyword_case = \"preserve\"\n";
+    d.write("ws/sqldiff.toml", pack);
+    let mut a = app(true);
+    // Named by another spelling of the same file.
+    a.packs = vec![d.p("ws/../ws/sqldiff.toml")];
+    let addr = start_with(a);
+    let leaks = |v: &Value| {
+        let t = v.to_string();
+        assert!(!t.contains("zz-"), "{t}");
+        assert!(!t.contains("preserve"), "{t}");
+        assert!(!t.contains("unknown field"), "{t}");
+    };
+    for dir in [d.p("ws"), d.p("ws/sqldiff.toml")] {
+        let (status, v) = settings(addr, &dir);
+        assert_eq!(status, "400 Bad Request", "{v}");
+        leaks(&v);
+    }
+    let (status, v) = post(
+        addr,
+        "/api/settings/preview",
+        json!({"dir": d.p("ws"), "draft": {}, "dialect": "postgres", "text": QUERY}),
+    );
+    assert_eq!(status, "400 Bad Request", "{v}");
+    leaks(&v);
+    let (status, v) = post(
+        addr,
+        "/api/settings/save",
+        json!({"dir": d.p("ws"), "draft": {"indent": 4}, "hash": null}),
+    );
+    assert_eq!(status, "400 Bad Request", "{v}");
+    leaks(&v);
+    assert_eq!(d.read("ws/sqldiff.toml"), pack);
+    // A launch pack that cannot be loaded may be any file: nothing is read.
+    let mut a = app(true);
+    a.packs = vec![d.p("missing/pack.toml")];
+    let addr = start_with(a);
+    d.write("other/sqldiff.toml", "[format]\nindent = 2\n");
+    let (status, v) = settings(addr, &d.p("other"));
+    assert_eq!(status, "400 Bad Request", "{v}");
 }
 
 #[test]
