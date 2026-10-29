@@ -86,7 +86,8 @@ pub fn compare_across(a: &Term, b: &Term, da: Dialect, db: Dialect) -> Cmp {
 /// Kid positions of `a` and `b` (same head, same arity) that hold only the
 /// collation of an equality: case sensitivity and trailing-space handling
 /// of `=` / `<>` (`strcmp`), or the dialect whose collation decides
-/// `IN` membership (`coll-eq`), GROUP BY keys (`collate`) and DISTINCT.
+/// `IN` membership (`coll-eq`), LIKE on varchar with a plain literal
+/// pattern (`coll-like`), GROUP BY keys (`collate`) and DISTINCT.
 /// None when the pair differs elsewhere in those positions.
 fn collation_kids(a: &Term, b: &Term) -> Option<&'static [usize]> {
     let dialect = |t: &Term| matches!(t.atom(), Some("tsql" | "postgres" | "db2i"));
@@ -108,7 +109,7 @@ fn collation_kids(a: &Term, b: &Term) -> Option<&'static [usize]> {
         {
             Some(&[0])
         }
-        "coll-eq" | "collate" | "distinct"
+        "coll-eq" | "coll-like" | "collate" | "distinct"
             if a.kid(0)
                 .zip(b.kid(0))
                 .is_some_and(|(x, y)| dialect(x) && dialect(y)) =>

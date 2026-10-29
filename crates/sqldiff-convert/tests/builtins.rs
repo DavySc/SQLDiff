@@ -213,5 +213,8 @@ fn trims_and_quotes_are_proven() {
     proven("SET @r = LTRIM(RTRIM(@s));", "v_r := LTRIM(RTRIM(p_s));");
     proven("SET @r = QUOTENAME(@s);", "v_r := quote_ident(p_s);");
     let (c, _) = run("SET @r = QUOTENAME(@s);");
-    assert!(unit(&c).notes.iter().any(|n| n.rule == "ASM-QUOTENAME-IDENT"));
+    assert!(unit(&c)
+        .notes
+        .iter()
+        .any(|n| n.rule == "ASM-QUOTENAME-IDENT"));
 }
