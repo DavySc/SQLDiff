@@ -7,10 +7,11 @@ use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
 
 const MS_DDL: &str = "CREATE TABLE dbo.M (Id int NOT NULL PRIMARY KEY, S varchar(20) NULL, C char(5) NULL, NC nchar(5) NULL,
   N nvarchar(max) NULL, T datetime2(3) NULL, Dt datetime NULL, Day date NULL, Tm time(3) NULL,
-  Q int NULL, Dto datetimeoffset NULL);";
+  Q int NULL, Dto datetimeoffset NULL, D decimal(10,2) NULL, F float NULL, S2 varchar(10) NULL);";
 const PG_DDL: &str = "CREATE TABLE M (Id integer NOT NULL PRIMARY KEY, S varchar(20) NULL, C char(5) NULL, NC char(5) NULL,
   N text NULL, T timestamp(3) NULL, Dt timestamp(3) NULL, Day date NULL, Tm time(3) NULL,
-  Q integer NULL, Dto timestamptz NULL);";
+  Q integer NULL, Dto timestamptz NULL, D decimal(10,2) NULL, F double precision NULL,
+  S2 varchar(10) NULL);";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Want {
@@ -22,6 +23,13 @@ enum Want {
 use Want::*;
 
 fn run(a: &str, b: &str, catalog: bool) -> Report {
+    run_as(a, b, catalog, false)
+}
+
+/// `conversion`: as a conversion check runs it, where T-SQL's
+/// case-insensitive string matching is flagged with ASM-CI-COLLATION.
+fn run_as(a: &str, b: &str, catalog: bool, conversion: bool) -> Report {
+    let _ci = sqldiff_core::equiv::compare::ci_collation_scope(conversion);
     let opts = if catalog {
         Options {
             catalog_a: vec![Artifact::new("catalog.sql", Dialect::Tsql, MS_DDL)],
@@ -47,9 +55,13 @@ fn run(a: &str, b: &str, catalog: bool) -> Report {
 }
 
 fn check(cases: &[(&str, &str, Want)]) {
+    check_as(cases, false)
+}
+
+fn check_as(cases: &[(&str, &str, Want)], conversion: bool) {
     let mut bad = Vec::new();
     for (a, b, want) in cases {
-        let r = run(a, b, true);
+        let r = run_as(a, b, true, conversion);
         let equal = matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions);
         let ids: Vec<_> = r.assumptions.iter().map(|x| x.id.as_str()).collect();
         let ok = match want {
@@ -267,4 +279,92 @@ fn database_name() {
         "current_database()",
         Eq(&["ASM-SAME-DATABASE-NAME"]),
     )]);
+}
+
+/// REPLACE and CHARINDEX match under the collation: T-SQL finds 'b' in
+/// 'ABC', PostgreSQL does not. Equal only in a conversion check, under
+/// ASM-CI-COLLATION; a plain diff keeps them apart.
+#[test]
+fn substring_matches_follow_the_collation() {
+    const CI: Want = Eq(&["ASM-CI-COLLATION"]);
+    check_as(
+        &[
+            ("REPLACE(S, 'a', 'b')", "replace(S, 'a', 'b')", CI),
+            ("REPLACE(S, 'a', 'b')", "replace(S, 'a', 'c')", NotEq),
+            // Shrinks: never cut, whatever the length.
+            ("REPLACE(N, 'ab', 'x')", "replace(N, 'ab', 'x')", CI),
+            // Grows within 4,000 characters of a known length.
+            ("REPLACE(S, 'a', 'bb')", "replace(S, 'a', 'bb')", CI),
+            // Grows from an unknown length: T-SQL may cut at 8,000 bytes.
+            ("REPLACE(N, , '')", "replace(N, , '')", NotEq),
+            ("REPLACE(S, S2, N)", "replace(S, S2, N)", NotEq),
+            // PostgreSQL strips char padding before replacing.
+            ("REPLACE(C, 'a', 'b')", "replace(C, 'a', 'b')", NotEq),
+            ("CHARINDEX('a', S)", "strpos(S, 'a')", CI),
+            ("CHARINDEX(',' + S2, S)", "strpos(S, ',' || S2)", CI),
+            // An empty needle: CHARINDEX 0, strpos 1.
+            ("CHARINDEX(S2, S)", "strpos(S, S2)", NotEq),
+            ("CHARINDEX('', S)", "strpos(S, '')", NotEq),
+            (
+                "CHARINDEX(S2, S)",
+                "CASE WHEN length(S2) = 0 THEN 0 ELSE strpos(S, S2) END",
+                CI,
+            ),
+            (
+                "CHARINDEX(S2, S)",
+                "CASE WHEN length(S) = 0 THEN 0 ELSE strpos(S, S2) END",
+                NotEq,
+            ),
+            ("CHARINDEX('a', C)", "strpos(C, 'a')", NotEq),
+            ("CHARINDEX('a', S)", "strpos(S, 'b')", NotEq),
+        ],
+        true,
+    );
+    check(&[
+        ("REPLACE(S, 'a', 'b')", "replace(S, 'a', 'b')", NotEq),
+        ("CHARINDEX('a', S)", "strpos(S, 'a')", NotEq),
+    ]);
+}
+
+#[test]
+fn trims_quotes_and_numbers() {
+    check(&[
+        // Spaces only on both sides (not tabs or NBSP).
+        ("LTRIM(S)", "ltrim(S)", Eq(&[])),
+        ("RTRIM(LTRIM(S))", "rtrim(ltrim(S))", Eq(&[])),
+        ("LTRIM(S)", "rtrim(S)", NotEq),
+        ("LTRIM(S)", "btrim(S)", NotEq),
+        // PostgreSQL strips char padding first: LTRIM(' ab') of a char(6)
+        // keeps 'ab   ' in T-SQL.
+        ("LTRIM(C)", "ltrim(C)", NotEq),
+        (
+            "QUOTENAME(S)",
+            "quote_ident(S)",
+            Eq(&["ASM-QUOTENAME-IDENT"]),
+        ),
+        ("QUOTENAME(S)", "S", NotEq),
+        ("CEILING(D)", "ceil(D)", Eq(&[])),
+        ("CEILING(D)", "ceiling(D)", Eq(&[])),
+        ("FLOOR(F)", "floor(F)", Eq(&[])),
+        ("CEILING(D)", "floor(D)", NotEq),
+        // CEILING of an int stays int in T-SQL, is double precision in
+        // PostgreSQL: the division that follows differs.
+        ("CEILING(Q) / 2", "ceil(Q) / 2", NotEq),
+        ("SQRT(F)", "sqrt(F)", Eq(&[])),
+        ("SQRT(Q)", "sqrt(Q)", Eq(&[])),
+        // sqrt(numeric) is a numeric with other digits than T-SQL's float.
+        ("SQRT(D)", "sqrt(D)", NotEq),
+    ]);
+}
+
+/// A construct lowered per dialect is named in the unproven message.
+#[test]
+fn unproven_built_ins_are_named() {
+    let r = run("NEWID()", "gen_random_uuid()", true);
+    assert_eq!(r.verdict(), Verdict::Unknown);
+    let text = format!("{:?}", r.findings);
+    assert!(
+        text.contains("A has `newid()` (T-SQL) where B has `gen_random_uuid()` (PostgreSQL)"),
+        "{text}"
+    );
 }

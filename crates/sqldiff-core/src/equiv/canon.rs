@@ -40,6 +40,10 @@ pub mod asm {
         "ASM-SAME-DATABASE-NAME",
         "The PostgreSQL database has the same name, letter for letter, as the SQL Server database",
     );
+    pub const QUOTENAME_IDENT: (&str, &str) = (
+        "ASM-QUOTENAME-IDENT",
+        "QUOTENAME's result is used only as an identifier, never as text, and is at most 128 characters: QUOTENAME brackets ([a]]b]) where quote_ident double-quotes only when needed (\"a]b\")",
+    );
     pub const TSQL_CI: (&str, &str) = (
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
@@ -48,7 +52,7 @@ pub mod asm {
     /// case-sensitive one is kept, and flagged with this per statement.
     pub const CI_COLLATION: (&str, &str) = (
         "ASM-CI-COLLATION",
-        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+        "String equality (and the substrings REPLACE and CHARINDEX find) gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -1231,6 +1235,23 @@ impl<'a> Canon<'a> {
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
+            // The converter's CHARINDEX of a needle that may be empty:
+            // CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END.
+            Expr::Case(None, whens, Some(els))
+                if self.d == Dialect::Postgres && charindex_case(whens, els).is_some() =>
+            {
+                let (hay, needle) = charindex_case(whens, els).unwrap();
+                let (h, hty) = self.expr(hay)?;
+                let (x, xty) = self.expr(needle)?;
+                if [hty, xty]
+                    .iter()
+                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
+                {
+                    let ci = self.collation_marker();
+                    return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
+                }
+                (n("dfn", vec![self.dtag(), a("charindex-case"), h, x]), None)
+            }
             Expr::Case(op, whens, els) => {
                 let mut kids = Vec::new();
                 match op {
@@ -1817,6 +1838,110 @@ impl<'a> Canon<'a> {
             // LEN counts characters without trailing spaces: PostgreSQL's
             // length(rtrim(x)) (rtrim removes only spaces, as LEN ignores
             // only spaces). T-SQL counts UTF-16 code units.
+            // REPLACE matches `from` under the collation: case-insensitively
+            // in T-SQL (by default), exactly in PostgreSQL. The collation is
+            // kept as a marker, as in `strcmp`, so the two are equal only
+            // under ASM-CI-COLLATION in a conversion check. varchar only
+            // (PostgreSQL strips char padding first), and only where T-SQL
+            // cannot cut the result at 8,000 bytes.
+            (Dialect::Tsql | Dialect::Postgres, "replace", 3)
+                if args
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar))
+                    && replace_fits(d, &c.args, &args) =>
+            {
+                let ci = self.collation_marker();
+                let mut kids = vec![a(ci)];
+                kids.extend(args.into_iter().map(|x| x.0));
+                (
+                    n("strreplace", kids),
+                    first_ty.map(|t| Ty { len: None, ..t }),
+                )
+            }
+            // CHARINDEX(needle, s): 0 for an empty needle. PostgreSQL's
+            // strpos(s, needle) agrees once the needle cannot be empty, or
+            // inside the converter's `CASE WHEN length(x) = 0 THEN 0 ELSE
+            // strpos(s, x) END` (lowered in `expr`). Collation as for REPLACE.
+            (Dialect::Tsql, "charindex", 2)
+                if args
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar)) =>
+            {
+                let ci = self.collation_marker();
+                let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
+                (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+            }
+            (Dialect::Postgres, "strpos", 2)
+                if args
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar))
+                    && nonempty_text(&c.args[1]) =>
+            {
+                let ci = self.collation_marker();
+                let (hay, needle) = (args[0].0.clone(), args[1].0.clone());
+                (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+            }
+            // LTRIM / RTRIM with one argument remove spaces only, on both
+            // sides (not tabs, NBSP or ideographic spaces). varchar only:
+            // PostgreSQL strips char padding first.
+            (Dialect::Tsql | Dialect::Postgres, "ltrim" | "rtrim", 1)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar) =>
+            {
+                let x = args[0].0.clone();
+                (n("trim", vec![a(&name[..1]), x]), first_ty)
+            }
+            // QUOTENAME brackets ([a]]b]), quote_ident double-quotes only
+            // when needed ("a]b"): the same identifier, not the same text.
+            // Equal only under ASM-QUOTENAME-IDENT, which the converter notes.
+            (Dialect::Tsql, "quotename", 1) | (Dialect::Postgres, "quote_ident", 1)
+                if first_ty.is_some_and(|t| t.is_string()) =>
+            {
+                self.assume(asm::QUOTENAME_IDENT);
+                let x = args[0].0.clone();
+                (n("quoteident", vec![x]), Some(Ty::of(Fam::VarChar)))
+            }
+            // CEILING / FLOOR: the same value of a number. The result types
+            // differ (T-SQL keeps int and decimal(p, 0); PostgreSQL gives
+            // double precision for an int and an unconstrained numeric), so
+            // each side keeps its own and what follows is typed apart.
+            (Dialect::Tsql, "ceiling" | "floor", 1)
+            | (Dialect::Postgres, "ceil" | "ceiling" | "floor", 1)
+                if first_ty.is_some_and(|t| t.is_numeric()) =>
+            {
+                let t = first_ty.unwrap();
+                let ty = match (d, t.fam) {
+                    (Dialect::Tsql, Fam::Exact) => Ty {
+                        scale: Some(0),
+                        ..t
+                    },
+                    (Dialect::Tsql, _) => t,
+                    (_, Fam::Exact) => Ty::of(Fam::Exact),
+                    _ => Ty {
+                        fam: Fam::Float,
+                        len: Some(53),
+                        scale: None,
+                    },
+                };
+                let h = if name == "floor" { "floor" } else { "ceil" };
+                let x = args[0].0.clone();
+                (n(h, vec![x]), Some(ty))
+            }
+            // SQRT of an integer or a float is the correctly rounded double
+            // on both sides; PostgreSQL's sqrt(numeric) is a numeric with
+            // other digits, so decimals are left out.
+            (Dialect::Tsql | Dialect::Postgres, "sqrt", 1)
+                if first_ty.is_some_and(|t| matches!(t.fam, Fam::Int | Fam::Float)) =>
+            {
+                let x = args[0].0.clone();
+                (
+                    n("sqrt", vec![x]),
+                    Some(Ty {
+                        fam: Fam::Float,
+                        len: Some(53),
+                        scale: None,
+                    }),
+                )
+            }
             (Dialect::Tsql, "len", 1) if first_ty.is_some_and(|t| t.is_string()) => {
                 self.assume(asm::LEN_BMP);
                 let bits = if first_ty.and_then(|t| t.len).is_some() {
@@ -2063,6 +2188,22 @@ impl<'a> Canon<'a> {
                 )
             }
         })
+    }
+
+    /// The collation of a string match, as `strcmp` writes it: `ci` in
+    /// T-SQL (ASM-TSQL-CI-COLLATION), `cs` in PostgreSQL and Db2 for i.
+    fn collation_marker(&mut self) -> &'static str {
+        match self.d {
+            Dialect::Tsql => {
+                self.assume(asm::TSQL_CI);
+                "ci"
+            }
+            Dialect::Postgres => "cs",
+            Dialect::Db2i => {
+                self.assume(asm::DB2_SRTSEQ);
+                "cs"
+            }
+        }
     }
 
     /// A date part as an integer: `year`, `month`, `day`, `hour`,
@@ -4561,6 +4702,73 @@ impl Item {
 /// page, lock)`). It aggregates even when WHERE matches no row; HAVING, TOP 0
 /// or OFFSET can drop that row. Only an aggregate in the select list itself
 /// counts, not one inside a subquery.
+const INT32: Ty = Ty {
+    fam: Fam::Int,
+    len: Some(32),
+    scale: None,
+};
+
+/// A string expression that is never empty (NULL aside): a non-empty
+/// literal, or a `||` chain with one.
+fn nonempty_text(e: &Expr) -> bool {
+    match e {
+        Expr::Str(s) => !s.is_empty(),
+        Expr::Bin(op, l, r) if op == "||" => nonempty_text(l) || nonempty_text(r),
+        _ => false,
+    }
+}
+
+/// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END`: (s, x).
+fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
+    let [(Expr::Bin(op, l, r), Expr::Num(zero))] = whens else {
+        return None;
+    };
+    let call = |e: &'e Expr, name: &str, argc: usize| match e {
+        Expr::Call(c)
+            if c.name.len() == 1
+                && c.name[0].eq_ignore_ascii_case(name)
+                && c.args.len() == argc
+                && !c.distinct
+                && !c.star
+                && c.order.is_empty() =>
+        {
+            Some(&c.args)
+        }
+        _ => None,
+    };
+    let x = &call(l, "length", 1)?[0];
+    let pos = call(els, "strpos", 2)?;
+    (op == "=" && zero == "0" && matches!(r.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
+        .then_some((&pos[0], x))
+}
+
+/// Whether REPLACE(s, from, to) cannot outgrow what T-SQL returns uncut
+/// (8,000 bytes for a non-MAX value, so 4,000 characters): the result is
+/// never longer than `s` (`to` no longer than any non-empty `from`; an
+/// empty `from` changes nothing), or `s` has a known length whose worst
+/// growth stays within 4,000 characters. PostgreSQL never cuts.
+fn replace_fits(d: Dialect, e: &[Expr], args: &[(Term, Option<Ty>)]) -> bool {
+    if d != Dialect::Tsql {
+        return true;
+    }
+    let lit = |x: &Expr| match x {
+        Expr::Str(s) => Some(s.chars().count() as u32),
+        _ => None,
+    };
+    let min_from = lit(&e[1]).unwrap_or(1).max(1);
+    let max_to = lit(&e[2]).or(args[2].1.and_then(|t| t.len));
+    let Some(max_to) = max_to else {
+        return false;
+    };
+    if max_to <= min_from {
+        return true;
+    }
+    match args[0].1.and_then(|t| t.len) {
+        Some(len) => (len / min_from + 1).saturating_mul(max_to) + len <= 4000,
+        None => false,
+    }
+}
+
 /// T-SQL CONVERT styles with a PostgreSQL to_char format that prints the
 /// same text: (style, format, length). Checked on SQL Server 2022 and
 /// PostgreSQL 18 for date, datetime and datetime2 (eval/builtins/2026-10-29).
