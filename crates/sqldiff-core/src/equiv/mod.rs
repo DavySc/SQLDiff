@@ -83,8 +83,16 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
     let mut c = Canon::new(unit, schema);
     c.by_name = by_name;
     let mut out = Vec::new();
-    let mut stmts = unit.stmts.iter().peekable();
-    while let Some(s) = stmts.next() {
+    let mut stmts = unit.stmts.iter().enumerate().peekable();
+    let mut ctl = unit.ctl.iter().peekable();
+    loop {
+        // The IF and loop markers before the next statement.
+        let next = stmts.peek().map_or(usize::MAX, |(i, _)| *i);
+        while let Some(m) = ctl.next_if(|m| m.after <= next) {
+            c.reset();
+            out.push(ctl_item(&mut c, unit, m));
+        }
+        let Some((_, s)) = stmts.next() else { break };
         c.reset();
         let mut nodes = vec![s.node.clone()];
         let res = match (&s.msg, &s.ast) {
@@ -94,7 +102,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
             // T-SQL inline table function: `RETURN` and its SELECT are two CST statements.
             (None, Ok(ast::Stmt::Return(None))) if unit.kind == UnitKind::TableFn => {
                 match stmts.peek() {
-                    Some(next) => match &next.ast {
+                    Some((_, next)) => match &next.ast {
                         Ok(ast::Stmt::Select(q)) => {
                             nodes.push(next.node.clone());
                             stmts.next();
@@ -138,6 +146,62 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
     }
     c.reset();
     c.lift(out)
+}
+
+/// The item of an IF or loop marker (`lower::CtlKind`): `ctl-if(cond)`,
+/// `ctl-while(cond)`, `ctl-else`, `ctl-end`, `ctl-break`, `ctl-continue`,
+/// `ctl-call(callee)`.
+fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
+    use lower::CtlKind as C;
+    let (head, res): (&str, Result<Vec<Term>, String>) = match &m.kind {
+        C::If(e) => (
+            "ctl-if",
+            e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
+        ),
+        C::While(e) => (
+            "ctl-while",
+            e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
+        ),
+        C::Else => ("ctl-else", Ok(vec![])),
+        C::End => ("ctl-end", Ok(vec![])),
+        C::Break => ("ctl-break", Ok(vec![])),
+        C::Continue => ("ctl-continue", Ok(vec![])),
+        C::Call => (
+            "ctl-call",
+            call::parse(&ast::tokens(&m.node), unit.dialect)
+                .and_then(|s| call::pair_key(&s, unit.dialect))
+                .map(|k| vec![a(k)]),
+        ),
+    };
+    // A marker that could not be read keeps its head, so the branches
+    // around it still line up; its own comparison is left unknown.
+    let (term, err) = match res {
+        Ok(kids) => (n(head, kids), None),
+        Err(e) => (
+            n(
+                head,
+                vec![n(
+                    "raw",
+                    vec![a(unit.dialect.id()), a(m.node.text().to_string())],
+                )],
+            ),
+            Some(e),
+        ),
+    };
+    Item {
+        term,
+        // The anchor last: `start` places a marker by it.
+        nodes: vec![m.node.clone(), m.anchor.clone()],
+        asm: std::mem::take(&mut c.asm),
+        disc: std::mem::take(&mut c.discharged),
+        err,
+        names: std::mem::take(&mut c.names),
+    }
+}
+
+/// Whether an item is an IF or loop marker.
+fn is_ctl(it: &Item) -> bool {
+    it.term.head().starts_with("ctl-")
 }
 
 fn location(side: &Analyzed, nodes: &[SyntaxNode]) -> Location {
@@ -208,10 +272,27 @@ fn compare_units(
     let (na, nb) = (side_name(a), side_name(b));
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
+            let at = side.line_of(node);
             out.unknown_reasons.push(format!(
-                "{name} line {}: {what} is not covered by statement-level equivalence",
-                side.line_of(node)
+                "{name} line {at}: {what} is not covered by statement-level equivalence"
             ));
+            // The statements inside anything uncovered (an IF, loop, CATCH,
+            // handler, or a routine beside others) were not compared either:
+            // each is named on its own line, so none of them counts as
+            // converted.
+            let mut seen = vec![at];
+            for st in node
+                .descendants()
+                .filter(|d| d != node && d.kind() == sqldiff_syntax::SyntaxKind::STATEMENT)
+            {
+                let l = side.line_of(&st);
+                if !seen.contains(&l) {
+                    seen.push(l);
+                    out.unknown_reasons.push(format!(
+                        "{name} line {l}: a statement inside {what} at line {at} is not covered by statement-level equivalence"
+                    ));
+                }
+            }
         }
         for note in &u.notes {
             out.normalize(note.clone());
@@ -258,7 +339,9 @@ fn compare_units(
         && ub.uncovered.is_empty()
         // A called procedure can touch the witness's table.
         && ua.calls.is_empty()
-        && ub.calls.is_empty())
+        && ub.calls.is_empty()
+        // Witnesses run the statements in a straight line.
+        && !ia.iter().chain(&ib).any(is_ctl))
     .then(|| Witnessing {
         a: xwit::Side {
             unit: ua,
@@ -1264,22 +1347,34 @@ fn error_continues(
                     .kid(2)
                     .is_some_and(|k| k.is("into") && k.kid(0).is_some_and(out_param)))
     };
-    // Data statements and calls in text order: a call can fail, and it
-    // has an effect (the procedure's, or the comment).
+    // Data statements, IF and loop markers and calls in order: a call can
+    // fail, and it has an effect (the procedure's, or the comment). A call
+    // inside an IF or loop stands where its marker is.
     #[derive(Clone, Copy)]
     enum E {
         Item(usize),
         Call(usize),
     }
+    let call_of = |it: &Item| {
+        t.calls
+            .iter()
+            .position(|(n, _)| it.term.is("ctl-call") && it.nodes.first() == Some(n))
+    };
+    // An END stands where its IF or loop ends.
+    let at = |it: &Item| {
+        it.nodes.first().map_or(0, |n| {
+            if it.term.is("ctl-end") {
+                cst::sig_range(n).1
+            } else {
+                cst::sig_range(n).0
+            }
+        })
+    };
+    let marked: Vec<usize> = items.iter().filter_map(call_of).collect();
     let mut seq: Vec<(usize, E)> = items
         .iter()
         .enumerate()
-        .map(|(i, it)| {
-            (
-                it.nodes.first().map_or(0, |n| cst::sig_range(n).0),
-                E::Item(i),
-            )
-        })
+        .map(|(i, it)| (at(it), call_of(it).map_or(E::Item(i), E::Call)))
         .chain(
             t.calls
                 .iter()
@@ -1287,29 +1382,150 @@ fn error_continues(
                 // Inside a procedure; how a script goes on after a failed
                 // statement depends on the client running it.
                 .filter(|(_, (_, at))| at.outside.is_none() && t.kind == UnitKind::Proc)
+                .filter(|(i, _)| !marked.contains(i))
                 .map(|(i, (n, _))| (cst::sig_range(n).0, E::Call(i))),
         )
         .collect();
     seq.sort_by_key(|x| x.0);
+    // Calls inside a script's IF or loop are not in `seq` as effects.
+    if t.kind != UnitKind::Proc {
+        seq.retain(|(_, e)| matches!(e, E::Item(_)));
+    }
+    let head = |e: E| match e {
+        E::Item(i) => items[i].term.head(),
+        E::Call(_) => "call",
+    };
     let is_effect = |e: E| match e {
-        E::Item(i) => effect(&items[i].term),
+        E::Item(i) => !is_ctl(&items[i]) && effect(&items[i].term),
         E::Call(_) => true,
     };
-    let Some((i, j)) = (0..seq.len()).find_map(|i| {
-        if let E::Item(k) = seq[i].1 {
+    // The END of each IF, ELSE and WHILE marker, and each END's opener.
+    let mut close = vec![usize::MAX; seq.len()];
+    let mut opener = vec![usize::MAX; seq.len()];
+    let mut stack: Vec<usize> = Vec::new();
+    for (k, (_, e)) in seq.iter().enumerate() {
+        match head(*e) {
+            "ctl-if" | "ctl-while" => stack.push(k),
+            "ctl-else" => {}
+            "ctl-end" => {
+                if let Some(o) = stack.pop() {
+                    opener[k] = o;
+                    close[o] = k;
+                }
+            }
+            _ => {}
+        }
+    }
+    for k in 0..seq.len() {
+        if head(seq[k].1) == "ctl-else" {
+            close[k] = (k..seq.len())
+                .find(|&e| head(seq[e].1) == "ctl-end" && opener[e] < k)
+                .unwrap_or(usize::MAX);
+        }
+    }
+    // What runs after the statement at `p` fails and the routine goes on:
+    // the first effect sure to run (no IF, loop or jump decides it), else
+    // the first effect that may run.
+    enum Next {
+        Sure(usize),
+        Maybe(usize),
+        None,
+    }
+    let after = |p: usize, maybe_only: bool| -> Next {
+        let mut depth = 0usize;
+        let mut unsure = maybe_only;
+        let mut maybe = None;
+        let mut k = p + 1;
+        while k < seq.len() {
+            let e = seq[k].1;
+            match head(e) {
+                "ctl-if" | "ctl-while" => depth += 1,
+                // The branch around `p` ends: skip the ELSE branches.
+                "ctl-else" if depth == 0 => {
+                    k = close[k];
+                    continue;
+                }
+                "ctl-end" if depth > 0 => depth -= 1,
+                "ctl-end" => {
+                    // The loop around `p` goes round again: what it ran
+                    // before `p` may run again, and it may never end.
+                    let o = opener[k];
+                    if o != usize::MAX && head(seq[o].1) == "ctl-while" {
+                        if let Some(x) = (o + 1..p).find(|&x| is_effect(seq[x].1)) {
+                            maybe = maybe.or(Some(x));
+                        }
+                        unsure = true;
+                    }
+                }
+                "ctl-break" | "ctl-continue" => unsure = true,
+                "return" => {
+                    if is_effect(e) {
+                        if depth == 0 && !unsure {
+                            return Next::Sure(k);
+                        }
+                        maybe = maybe.or(Some(k));
+                    }
+                    if depth == 0 && !unsure {
+                        break;
+                    }
+                    unsure = true;
+                }
+                _ if is_effect(e) => {
+                    if depth == 0 && !unsure {
+                        return Next::Sure(k);
+                    }
+                    maybe = maybe.or(Some(k));
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+        maybe.map_or(Next::None, Next::Maybe)
+    };
+    let mut first_maybe = None;
+    let mut found = None;
+    for (i, &(_, e)) in seq.iter().enumerate() {
+        if let E::Item(k) = e {
             if inner(&items[k]) {
-                return Some((i, i));
+                found = Some((i, i));
+                break;
             }
-        }
-        if let E::Item(k) = seq[i].1 {
+            match items[k].term.head() {
+                // These cannot fail; a call marker's call is in `seq`.
+                "ctl-else" | "ctl-end" | "ctl-break" | "ctl-continue" | "ctl-call" => continue,
+                _ => {}
+            }
             if items[k].nodes.len() == 1 && script::cannot_fail(t, &items[k].nodes[0]) {
-                return None;
+                continue;
             }
         }
-        (i + 1..seq.len())
-            .find(|&j| is_effect(seq[j].1))
-            .map(|j| (i, j))
-    }) else {
+        // Where a failing IF or WHILE condition goes on is not modelled.
+        let cond = matches!(head(e), "ctl-if" | "ctl-while");
+        match after(i, cond) {
+            Next::Sure(j) => {
+                found = Some((i, j));
+                break;
+            }
+            Next::Maybe(j) => {
+                first_maybe = first_maybe.or(Some((i, j)));
+            }
+            Next::None => {}
+        }
+    }
+    let Some((i, j)) = found else {
+        if let Some((i, j)) = first_maybe {
+            let line_of = |e: E| match e {
+                E::Item(k) => line(tside, &items[k].nodes),
+                E::Call(k) => tside.line_of(&t.calls[k].0),
+            };
+            let tname = side_name(tside);
+            let oname = side_name(oside);
+            out.unknown_reasons.push(format!(
+                "{tname} line {}: if this statement fails, {tname} reports the error and goes on (no SET XACT_ABORT ON or rethrowing CATCH), and the statement at line {} may run after it, where {oname} stops at the error: not compared",
+                line_of(seq[i].1),
+                line_of(seq[j].1)
+            ));
+        }
         return;
     };
     let nodes = |e: E| -> Vec<SyntaxNode> {
@@ -1547,6 +1763,11 @@ fn bool_default(s: &str) -> Option<bool> {
 }
 
 fn key(t: &Term) -> String {
+    // IF and loop markers line up by kind; their conditions are compared
+    // once paired.
+    if t.head().starts_with("ctl-") {
+        return t.head().to_string();
+    }
     format!(
         "{}:{}",
         t.head(),
@@ -1585,14 +1806,16 @@ struct Gap {
 
 fn gaps(side: &Analyzed, u: &Unit, items: &[Item]) -> Vec<Gap> {
     use sqldiff_syntax::SyntaxKind as SK;
+    // A marker stands where it is written, not at its anchor.
     let starts: Vec<usize> = items
         .iter()
         .map(|it| {
-            it.nodes
-                .iter()
-                .map(|n| cst::sig_range(n).0)
-                .min()
-                .unwrap_or(0)
+            let nodes = if is_ctl(it) {
+                &it.nodes[..1]
+            } else {
+                &it.nodes[..]
+            };
+            nodes.iter().map(|n| cst::sig_range(n).0).min().unwrap_or(0)
         })
         .collect();
     let mut found: Vec<(usize, Gap)> = Vec::new();
@@ -1681,7 +1904,14 @@ fn slots<'k>(keys: &'k [String], items: &[Item], gaps: &[Gap]) -> Vec<Slot<'k>> 
 /// place differently is left unpaired and reported, never compared with a
 /// neighbour of its counterpart.
 fn align(a: &[Slot], b: &[Slot]) -> Alignment {
-    let gap = |s: &[Slot]| s.iter().any(|x| matches!(x, Slot::Gap(_)));
+    // IF and loop markers (`ctl-…` keys) are aligned like gaps are: a
+    // statement that could sit inside a loop or after it is not paired.
+    let gap = |s: &[Slot]| {
+        s.iter().any(|x| match x {
+            Slot::Gap(_) => true,
+            Slot::Item(_, k, _) => k.starts_with("ctl-"),
+        })
+    };
     if !gap(a) && !gap(b) {
         let ka: Vec<&str> = a.iter().filter_map(Slot::key).collect();
         let kb: Vec<&str> = b.iter().filter_map(Slot::key).collect();
@@ -1794,6 +2024,9 @@ struct Alignment {
 }
 
 fn start(it: &Item) -> usize {
+    if is_ctl(it) {
+        return it.nodes.last().map_or(0, |n| cst::sig_range(n).0);
+    }
     it.nodes
         .iter()
         .map(|n| cst::sig_range(n).0)
@@ -1971,7 +2204,11 @@ fn pair_items(
         ambiguous,
         moved,
     } = if !anchors.is_empty() {
+        // Markers fall into their IF or loop's anchor; `same_branches`
+        // below still drops any pair across branches.
         traced(ia, ib, &ka, &kb, gaps, anchors)
+    } else if ia.iter().chain(ib).any(is_ctl) {
+        align_flow(ia, ib, &ka, &kb, gaps)
     } else if ia.len() == ib.len() {
         Alignment {
             pairs: (0..ia.len()).map(|i| (i, i)).collect(),
@@ -1981,15 +2218,36 @@ fn pair_items(
         let (sa, sb) = (slots(&ka, ia, &gaps[0]), slots(&kb, ib, &gaps[1]));
         align(&sa, &sb)
     };
+    let (pairs, elsewhere) = same_branches(ia, ib, pairs);
     let (na, nb) = (side_name(a), side_name(b));
     for (side, items, name, is_a) in [(a, ia, &na, true), (b, ib, &nb, false)] {
+        let is_paired = |i: usize| pairs.iter().any(|p| if is_a { p.0 == i } else { p.1 == i });
+        let frames = branches(items);
         for (i, it) in items.iter().enumerate() {
-            let paired = pairs.iter().any(|p| if is_a { p.0 == i } else { p.1 == i });
-            if paired {
+            if is_paired(i) {
+                continue;
+            }
+            // An ELSE or END whose IF or loop is not paired: the IF or
+            // loop's own reason names its line.
+            if frames[i].1.is_some_and(|o| !is_paired(o)) {
                 continue;
             }
             let gap = beside.iter().find(|x| x.item_a == is_a && x.item == i);
+            let across = elsewhere
+                .iter()
+                .any(|p| if is_a { p.0 == i } else { p.1 == i });
+            // The IF or loop around it, when that one is not paired.
+            let around = frames[i].0.filter(|&f| !is_paired(f));
             out.unknown_reasons.push(match gap {
+                _ if across => format!(
+                    "{name} line {}: statement is not paired: the statement it lines up with sits in another IF or loop branch",
+                    line(side, &it.nodes)
+                ),
+                _ if around.is_some() && !ambiguous.contains(&(is_a, i)) => format!(
+                    "{name} line {}: statement is not paired: the IF or loop around it (line {}) is not paired",
+                    line(side, &it.nodes),
+                    line(side, &items[around.unwrap_or(i)].nodes)
+                ),
                 Some(x) => {
                     let (gname, g) = if is_a {
                         (&nb, &gaps[1][x.gap])
@@ -2049,6 +2307,258 @@ fn pair_items(
             out,
         );
     }
+}
+
+/// One entry of a statement sequence in the IF and loop structure: a
+/// statement, an IF or loop with its branches, or a gap.
+enum Entry {
+    Leaf(usize),
+    Flow(Flow),
+    Gap(usize),
+}
+
+/// An IF or loop: its marker, its branches (the ELSE marker that starts
+/// each one after the first) and its END marker.
+struct Flow {
+    open: usize,
+    parts: Vec<(Option<usize>, Vec<Entry>)>,
+    end: Option<usize>,
+}
+
+/// The sequence of items from `*k` up to the ELSE or END that ends it (or
+/// the end of the items), with the gaps that sit in it.
+fn flow_seq(items: &[Item], gaps: &[Gap], k: &mut usize, g: &mut usize) -> Vec<Entry> {
+    let mut out = Vec::new();
+    loop {
+        while *g < gaps.len() && gaps[*g].before <= *k {
+            out.push(Entry::Gap(*g));
+            *g += 1;
+        }
+        let Some(it) = items.get(*k) else {
+            return out;
+        };
+        match it.term.head() {
+            "ctl-else" | "ctl-end" => return out,
+            "ctl-if" | "ctl-while" => {
+                let open = *k;
+                *k += 1;
+                let mut parts = vec![(None, flow_seq(items, gaps, k, g))];
+                let is_if = it.term.is("ctl-if");
+                while is_if && items.get(*k).is_some_and(|x| x.term.is("ctl-else")) {
+                    let e = *k;
+                    *k += 1;
+                    parts.push((Some(e), flow_seq(items, gaps, k, g)));
+                }
+                let end = items
+                    .get(*k)
+                    .is_some_and(|x| x.term.is("ctl-end"))
+                    .then(|| {
+                        *k += 1;
+                        *k - 1
+                    });
+                out.push(Entry::Flow(Flow { open, parts, end }));
+            }
+            _ => {
+                out.push(Entry::Leaf(*k));
+                *k += 1;
+            }
+        }
+    }
+}
+
+/// Pairs statements level by level of the IF and loop structure: the
+/// statements and IF/loop blocks of a sequence are aligned as `align` does
+/// (an IF or loop stands as one statement keyed by its kind and number of
+/// branches), and the branches of two paired blocks are aligned with each
+/// other. A statement is only ever paired inside the branch its counterpart
+/// sits in.
+fn align_flow(
+    ia: &[Item],
+    ib: &[Item],
+    ka: &[String],
+    kb: &[String],
+    gaps: &[Vec<Gap>; 2],
+) -> Alignment {
+    let (mut k, mut g) = (0, 0);
+    let mut sa = flow_seq(ia, &gaps[0], &mut k, &mut g);
+    // Stray ELSE or END markers (not produced by `lower`) stand alone.
+    while k < ia.len() {
+        sa.push(Entry::Leaf(k));
+        k += 1;
+        sa.extend(flow_seq(ia, &gaps[0], &mut k, &mut g));
+    }
+    let (mut k, mut g) = (0, 0);
+    let mut sb = flow_seq(ib, &gaps[1], &mut k, &mut g);
+    while k < ib.len() {
+        sb.push(Entry::Leaf(k));
+        k += 1;
+        sb.extend(flow_seq(ib, &gaps[1], &mut k, &mut g));
+    }
+    let mut out = Alignment::default();
+    level(&sa, &sb, ia, ib, ka, kb, &mut out);
+    out
+}
+
+/// The slots of one level: a statement, or an IF or loop standing as its
+/// marker's item, keyed by `keys` (one per entry).
+fn level_slots<'k>(seq: &[Entry], keys: &'k [String], items: &[Item]) -> Vec<Slot<'k>> {
+    seq.iter()
+        .zip(keys)
+        .map(|(e, k)| match e {
+            Entry::Gap(gi) => Slot::Gap(*gi),
+            Entry::Leaf(i) => Slot::Item(*i, k.as_str(), items[*i].err.is_some()),
+            Entry::Flow(f) => Slot::Item(f.open, k.as_str(), false),
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn level(
+    sa: &[Entry],
+    sb: &[Entry],
+    ia: &[Item],
+    ib: &[Item],
+    ka: &[String],
+    kb: &[String],
+    out: &mut Alignment,
+) {
+    let flow_key =
+        |f: &Flow, items: &[Item]| format!("{}/{}", items[f.open].term.head(), f.parts.len());
+    let keys_a: Vec<String> = sa
+        .iter()
+        .map(|e| match e {
+            Entry::Leaf(i) => ka[*i].clone(),
+            Entry::Flow(f) => flow_key(f, ia),
+            Entry::Gap(_) => String::new(),
+        })
+        .collect();
+    let keys_b: Vec<String> = sb
+        .iter()
+        .map(|e| match e {
+            Entry::Leaf(i) => kb[*i].clone(),
+            Entry::Flow(f) => flow_key(f, ib),
+            Entry::Gap(_) => String::new(),
+        })
+        .collect();
+    let (la, lb) = (level_slots(sa, &keys_a, ia), level_slots(sb, &keys_b, ib));
+    let count = |s: &[Slot]| s.iter().filter(|x| matches!(x, Slot::Item(..))).count();
+    let al = if count(&la) == count(&lb) {
+        let ia_: Vec<usize> = la
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Item(i, ..) => Some(*i),
+                Slot::Gap(_) => None,
+            })
+            .collect();
+        let ib_: Vec<usize> = lb
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Item(i, ..) => Some(*i),
+                Slot::Gap(_) => None,
+            })
+            .collect();
+        Alignment {
+            pairs: ia_.into_iter().zip(ib_).collect(),
+            ..Alignment::default()
+        }
+    } else {
+        // Flow keys (`ctl-if/2`) make `align` weigh every best alignment,
+        // as gaps do.
+        align(&la, &lb)
+    };
+    out.beside.extend(al.beside);
+    out.ambiguous.extend(al.ambiguous);
+    let entry = |seq: &'_ [Entry], i: usize| -> Option<usize> {
+        seq.iter().position(|e| match e {
+            Entry::Leaf(x) => *x == i,
+            Entry::Flow(f) => f.open == i,
+            Entry::Gap(_) => false,
+        })
+    };
+    for (i, j) in al.pairs {
+        out.pairs.push((i, j));
+        let (Some(ea), Some(eb)) = (entry(sa, i), entry(sb, j)) else {
+            continue;
+        };
+        if let (Entry::Flow(fa), Entry::Flow(fb)) = (&sa[ea], &sb[eb]) {
+            if fa.parts.len() != fb.parts.len()
+                || ia[fa.open].term.head() != ib[fb.open].term.head()
+            {
+                continue;
+            }
+            for ((ma, pa), (mb, pb)) in fa.parts.iter().zip(&fb.parts) {
+                if let (Some(x), Some(y)) = (ma, mb) {
+                    out.pairs.push((*x, *y));
+                }
+                level(pa, pb, ia, ib, ka, kb, out);
+            }
+            if let (Some(x), Some(y)) = (fa.end, fb.end) {
+                out.pairs.push((x, y));
+            }
+        }
+    }
+}
+
+/// Where each item sits in the IF and loop structure (`lower::CtlKind`):
+/// the marker that opens its branch (an IF, ELSE or WHILE marker), and for
+/// an ELSE or END marker the IF or WHILE it belongs to.
+fn branches(items: &[Item]) -> Vec<(Option<usize>, Option<usize>)> {
+    // (opener, the marker that opens the current branch)
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut out = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        let frame = stack.last().map(|x| x.1);
+        match it.term.head() {
+            "ctl-if" | "ctl-while" => {
+                out.push((frame, None));
+                stack.push((i, i));
+            }
+            "ctl-else" => match stack.pop() {
+                Some((opener, _)) => {
+                    out.push((stack.last().map(|x| x.1), Some(opener)));
+                    stack.push((opener, i));
+                }
+                None => out.push((None, None)),
+            },
+            "ctl-end" => match stack.pop() {
+                Some((opener, _)) => out.push((stack.last().map(|x| x.1), Some(opener))),
+                None => out.push((None, None)),
+            },
+            _ => out.push((frame, None)),
+        }
+    }
+    out
+}
+
+/// Keeps the pairs whose items sit in branches that are paired with each
+/// other (and ELSE and END markers whose IF or WHILE markers are paired):
+/// a statement inside an IF is never compared with one outside it, or in
+/// the other branch, so equal pairs compare the control flow too. Returns
+/// the kept pairs and the dropped ones.
+type Pairs = Vec<(usize, usize)>;
+
+fn same_branches(ia: &[Item], ib: &[Item], mut pairs: Pairs) -> (Pairs, Pairs) {
+    if !ia.iter().chain(ib).any(is_ctl) {
+        return (pairs, Vec::new());
+    }
+    let (fa, fb) = (branches(ia), branches(ib));
+    pairs.sort_unstable();
+    let mut kept: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut dropped = Vec::new();
+    // Openers come before what they open, so they are decided first.
+    let linked = |x: Option<usize>, y: Option<usize>, kept: &BTreeMap<usize, usize>| match (x, y) {
+        (None, None) => true,
+        (Some(x), Some(y)) => kept.get(&x) == Some(&y),
+        _ => false,
+    };
+    for (i, j) in pairs {
+        if linked(fa[i].0, fb[j].0, &kept) && linked(fa[i].1, fb[j].1, &kept) {
+            kept.insert(i, j);
+        } else {
+            dropped.push((i, j));
+        }
+    }
+    (kept.into_iter().collect(), dropped)
 }
 
 /// What matching the two statements' table names relies on. Across
@@ -2151,6 +2661,33 @@ fn compare_pair(
             assumptions: asms,
         });
     };
+    if (is_ctl(x) || is_ctl(y)) && x.term.head() != y.term.head() {
+        let what = |it: &Item| match it.term.head() {
+            "ctl-if" => "an IF condition",
+            "ctl-while" => "a WHILE condition",
+            "ctl-else" => "the start of an ELSE branch",
+            "ctl-end" => "the end of an IF or loop",
+            "ctl-break" => "a loop exit",
+            "ctl-continue" => "a CONTINUE",
+            "ctl-call" => "a call",
+            _ => "a statement",
+        };
+        push(
+            out,
+            "equiv.unproven",
+            ChangeClass::Semantic,
+            Verdict::Unknown,
+            format!(
+                "Statements (A line {}, B line {}) could not be shown equivalent: the control flow differs: A has {} where B has {}.",
+                la.start_line,
+                lb.start_line,
+                what(x),
+                what(y)
+            ),
+            Vec::new(),
+        );
+        return;
+    }
     if let Some(e) = x
         .err
         .as_ref()
@@ -2331,10 +2868,14 @@ pub fn refine_modified(
         } else {
             f.b.as_ref()?
         };
+        // IF and loop markers are not statements: an END or ELSE marker
+        // starts where its whole IF does, which a finding on the IF names.
         items.iter().position(|it| {
-            it.nodes
-                .iter()
-                .any(|n| cst::sig_range(n).0 == loc.byte_start)
+            !is_ctl(it)
+                && it
+                    .nodes
+                    .iter()
+                    .any(|n| cst::sig_range(n).0 == loc.byte_start)
         })
     };
     let mut keep = Vec::new();
