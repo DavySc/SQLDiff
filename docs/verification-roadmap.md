@@ -8,6 +8,10 @@ each supported RDBMS version. The first rule of the design (never a false
 "equal") is the property being proven; everything else (witnesses,
 explanations, conversion, GUI) stays outside the proof.
 
+See also [verified-conversion.md](verified-conversion.md), a proposal that
+re-cuts these phases around a converter whose output needs no re-review, and
+[qed-lessons.md](qed-lessons.md), what the QED prover contributes to phase 2.
+
 ## Assurance tiers
 
 | Tier | What it means | Status |
@@ -120,6 +124,23 @@ Phase 0 measures the checker against these budgets:
 | Memory | Below the Rust process for the same pair |
 | Builds | All four release targets: Windows x64, macOS arm64 and x64 (built on arm64), static musl Linux x64 |
 
+Spike results, 2026-10-28 (`.github/workflows/formal-lean.yml`, Lean
+4.35.0, the phase 0 checker; release targets as in `release.yml`):
+
+| Target | Start-up, median | Per request | Size | Links against |
+|---|---|---|---|---|
+| Linux x64 | 3.2 ms | 2.1 µs | 8.2 MB (unstripped) | glibc 2.14 or newer, nothing else |
+| macOS arm64 | 6.5 ms | 2.1 µs | 2.3 MB | system libraries only |
+| macOS x64 (built and run under Rosetta on arm64) | 45 ms | 12.8 µs | 2.8 MB | system libraries only |
+| Windows x64 | 18.9 ms | 2.9 µs | 7.9 MB | Windows DLLs only |
+
+All within budget; the macOS x64 figures include Rosetta's translation and
+are not measured on Intel hardware. A static glibc link crashed on start,
+so Linux ships a glibc-linked checker beside the musl CLI. Lean 4.19's own
+linker produced macOS binaries that dyld refuses ("__DATA_CONST segment
+missing SG_READ_ONLY flag"); Apple's linker did not help; Lean 4.35.0 does
+not have the problem and is pinned.
+
 When the spike misses a budget: run the gate asynchronously in the GUI
 ("equal, confirming…"), cache checks by the hash of both ASTs, the versions,
 the observer profile and the checker version, or keep strict mode for CI
@@ -138,6 +159,7 @@ fails, a glibc checker ships beside the musl CLI.
 | 6 | Version support policy | Follow each vendor's lifecycle (see "RDBMS versions") | Proposed |
 | 7 | Azure SQL Database and Managed Instance | All Azure targets in scope as platform profiles; T-SQL targets keyed by platform, engine and compatibility level (below) | Decided 2026-10-28 |
 | 8 | When Db2 for i is proven | Deferred as long as possible: phases 1 to 4 cover T-SQL and PostgreSQL only (below) | Decided 2026-10-28 |
+| 9 | Which product the proof effort serves first: the `diff` gate or the converter | The converter: its own proof path, and errors and transactions before the query normaliser ([verified-conversion.md](verified-conversion.md), decisions A and B; the phase order there supersedes the one below for the converter) | Priority decided 2026-10-28; A, B and 9 to 14 are the working plan since 2026-10-28 (C0 in progress) |
 
 ### Decision 1: observational equivalence
 
@@ -278,7 +300,7 @@ Checked with `sqldiff diff` on 2026-10-28, before the change:
 
 | Case | Today | After decision 1 |
 |---|---|---|
-| B adds `ORDER BY` to an unordered result | unknown | equal (B refines A); not equivalent |
+| B adds `ORDER BY` to an unordered result | unknown | unknown: B refines A only when its ORDER BY cannot fail, which the engine cannot show yet (withdrawn on review of #132: a key outside GROUP BY, beside an aggregate, or of a type that does not sort makes B fail) |
 | B drops the `ORDER BY` A had | unknown | different: B can return an order A never does |
 | B renames an output column alias | unknown | different in the same dialect |
 | B adds `SET NOCOUNT ON` (same dialect) | different | different (counts observed by default) |
@@ -627,15 +649,22 @@ implementations and the drift controls.
 
 ### Today
 
-- The version is a free-form string per artifact, defaulting to SQL Server
-  2022, PostgreSQL 18 and IBM i 7.6 (`Dialect::default_version`,
+- The version is a string per artifact, defaulting to SQL Server 2022,
+  PostgreSQL 18 and IBM i 7.6 (`Dialect::default_version`,
   `crates/sqldiff-syntax/src/dialect.rs`). It is set by `--dialect-version`,
   `[dialect_versions]` in `sqldiff.toml` or a pack, or a `dialect_map` entry.
+  On the `verification` branch it is validated against
+  `crates/sqldiff-core/profiles/lifecycle.toml` (`sqldiff_core::target`): a
+  T-SQL target is `2019`, `2019/130`, `mi-2022`, `mi-evergreen`, `azure` or
+  `fabric` with an optional compatibility level, an unknown version is an
+  error, and the CLI prints a note for a `preview`, `legacy` or `retired`
+  version or one within 90 days of a change.
 - The only behaviour that depends on it is built-in availability
   (`[*.since]` in `profiles/builtins.toml`, compared by `version_lt` in
   `catalog/builtins.rs`). Semantic profiles, rules, the converter and the
   witness search do not use it.
-- Version strings are not validated; an unparsable part compares as 0.
+- Version strings were not validated, and an unparsable part compared as 0;
+  on the `verification` branch they are validated at every entry point.
 - The vendor facts, eval runs and CI containers cover SQL Server 2022 and
   PostgreSQL 18 only; Db2 for i facts were read for 7.4 to 7.6 and probed on
   whatever release a user has.
@@ -730,6 +759,41 @@ Expected ongoing cost per release: two to four weeks for a PostgreSQL major
 (yearly), more for a SQL Server release (every few years) or compatibility
 level, and a probe run plus a delta review for each IBM i Technology Refresh.
 
+## Phase 0 progress (branch `verification`)
+
+| Item | State |
+|---|---|
+| Private `Report.verdict`, changed only by `Report::settle` | Done |
+| Typed dialect targets, `profiles/lifecycle.toml`, lifecycle notes | Done (dates unverified) |
+| Packaging and performance spike | Done: all four targets within budget (decision 2) |
+| Gate on the trivial fragment: `formal/lean` (`check_sound`, no axioms), `sqldiff_core::proof`, `--proof off|report|require` | Done; the CLI tests use a stand-in for the checker; CI runs the protocol tests on the real one on all four targets and, on Linux, the CLI's proof tests against it |
+| Decision 1 semantics in Rust | Enforced where a verdict could be wrong: result column names, reference side with `equivalent` and `refinements`, ORDER BY added, observer profile for row counts. Checked 2026-10-28 and already conservative (never equal): raises across dialects (not covered by statement equivalence), temporary tables and `SET` in a body. Coverage still to add, turning unknown into proven: error kinds and pack-declared user error codes across dialects, PostgreSQL raise message changes (unknown, T-SQL already different), session state, ORDER BY removed (different when the result can hold two rows) |
+| Coverage invariant | Enforced by construction within one dialect (`crates/sqldiff-core/src/coverage.rs`). Text outside statements is compared token by token (`GO` against `GO 5` is unknown). Inside statements every comparison step leaves a receipt for the text it decided: the structural diff (same tokens, same shell, or a named structural judgment), statement equivalence and the observer profile. A final check re-verifies the "same tokens" and "same shell" receipts and requires every significant token on both sides to be under a receipt or a finding; a token under none makes the verdict unknown ("not compared"). A step that forgets a unit therefore yields unknown, not a false equal. Across dialects the lowering lists what statement equivalence does not cover (`equiv::lower`); moving that onto receipts is still to do |
+| AST export with generated Lean types | Done for the syntax tree: `formal/lean/Sqldiff/Syntax.lean` is generated from the Rust kinds with a schema hash (a test fails while it is stale), requests carry the hash (`sqldiff-check/2`), and the checker decodes trees into Lean types and refuses unknown kinds, a hash mismatch or malformed text. Decoding costs 25 µs per one-statement request and 5.3 ms for 400 statements (Linux x64, this container). The canonical `Term` export follows with phase 1 |
+| Signed locks, `allowed_signers`, `spec-critic` | Not started |
+| Shipping `sqldiff-check` in releases | Not started |
+
+The trivial fragment: same dialect, same canonical target, and syntax trees
+equal once whitespace and comments are left out. It covers reformatting
+and comment changes. Keyword case is outside it, because a T-SQL word such
+as `date` can be a keyword or an identifier and identifiers are
+case-sensitive under a case-sensitive collation; bringing it in needs a
+vendor fact as an axiom (decision 5).
+
+### Verdict changes so far (for the release notes, decision 3)
+
+| Change | Before | Now |
+|---|---|---|
+| A T-SQL result column alias renamed (`AS OrderId` to `AS Id`) | unknown | different (`equiv.result-column-name`) |
+| A T-SQL result column alias whose only change is letter case (`AS OrderId` to `AS orderid` or `[ORDERID]`) | equal under `ASM-TSQL-CI-COLLATION` | different, or unknown inside a compound statement |
+| Result columns whose names differ only in letter case across dialects (T-SQL `Id`, PostgreSQL unquoted `id`, Db2 for i `ID`) | equal | equal under `ASM-RESULT-NAMES-CI` |
+| A rewritten same-dialect T-SQL statement that also changes the case of names | equal under assumptions without `ASM-TSQL-CI-COLLATION` | with it (also on `main`) |
+| Instances whose converted PostgreSQL returns a column under a lower-case name | converted | under assumptions (`ASM-RESULT-NAMES-CI`) |
+| B adds `ORDER BY` to a top-level result A leaves unordered (no TOP or LIMIT) | unknown | unknown (the refinement was withdrawn on review: the engine cannot show that B's ORDER BY cannot fail) |
+| Every "equal" or "equal under assumptions" | (no field) | `equivalent: true` unless a one-way step was used |
+| A T-SQL procedure that sends rows-affected counts (no `SET NOCOUNT ON` first) against a PostgreSQL or Db2 for i routine, which sends none | equal under assumptions, without it | under `ASM-OBSERVER-ROWCOUNT`; converted procedures and instances are "under assumptions" instead of "converted". Decided 2026-10-28: no special handling; a team whose callers do not read the counts accepts `ASM-OBSERVER-ROWCOUNT` in its pack |
+| `SET NOCOUNT` changed within one dialect, `[observer] row_counts = "never"` | different | equal under `ASM-OBSERVER-ROWCOUNT` |
+
 ## Leads found while planning
 
 Each needs a test before it counts as a bug; outcomes are recorded here.
@@ -747,6 +811,10 @@ Each needs a test before it counts as a bug; outcomes are recorded here.
   empty (`.unwrap_or(Verdict::Equal)`). Two empty trees are equal (nothing
   is observable on either side); a file without a dialect makes `tree`
   unknown, an unreadable file or a missing folder is an error (exit 2).
+- The T-SQL to PostgreSQL converter writes `SELECT Id` as `SELECT id`, so
+  the result column comes back as `id` and the conversion needs
+  `ASM-RESULT-NAMES-CI` (decision 1). Writing `id AS "Id"` where the case
+  differs would keep the name and drop the assumption.
 - One assumption id, two settings: `ASM-TSQL-CI-COLLATION` stands both for
   names and variables comparing case-insensitively and for string
   comparisons using a case-insensitive collation (`canon::asm::TSQL_CI`).

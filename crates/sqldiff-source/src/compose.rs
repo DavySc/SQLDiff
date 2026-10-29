@@ -386,7 +386,7 @@ fn unknown(report: &mut Report, why: &str) {
     report
         .unknown_reasons
         .push(format!("composition not read: {why}"));
-    report.verdict = report.verdict.max(sqldiff_core::Verdict::Unknown);
+    report.settle();
 }
 
 /// Runs read mode (and check mode with `templates`) on both sides and adds

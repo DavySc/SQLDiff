@@ -48,6 +48,9 @@ pub struct Args {
     /// Pack helper functions: routines the dialects provide that no file in
     /// the tree defines. The output's check resolves calls to them.
     pub helpers: Vec<Helper>,
+    /// The deployment profile (`[deployment]` in packs and config): the
+    /// report lists which assumptions it accepts. Statuses do not change.
+    pub deployment: sqldiff_source::deployment::Profile,
     /// Base catalogs (`--catalog`): DDL files in the source dialect of
     /// objects that exist already. Bound against on both sides (the tree's
     /// own objects win), converted for the target catalog only, never
@@ -210,13 +213,22 @@ pub struct UnitReport {
     /// 1-based lines in the input file and in the written output file.
     pub src_line: usize,
     pub out_line: usize,
+    /// Rules of the unit's worst notes (what decides its status); empty for
+    /// a converted unit, which has none. The rewrites themselves are `trace`.
     pub rules: Vec<String>,
     pub reason: String,
     /// Rules of the engine's findings (diff and output check) on this unit,
     /// gating or not.
     pub findings: Vec<String>,
+    /// Every rewrite the rules made in this unit (rule id, input byte span,
+    /// instantiation), converted units included: the certificate's trace.
+    pub trace: Vec<crate::Step>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review: Option<UnitReviewReport>,
+    /// The unit's assumptions the deployment profile accepts. The unit is
+    /// still under assumptions; see [`Report::deployment`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -256,6 +268,49 @@ pub struct Report {
     /// The review ledger that was applied, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerReport>,
+    /// The deployment profile and what it covers, when a pack or config
+    /// file has a `[deployment]` table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<DeploymentReport>,
+}
+
+/// The deployment profile applied to a converted tree (decision 14). It
+/// changes no status: an accepted assumption is listed as accepted, and
+/// `assumptions_within_accept` says whether all of them are.
+#[derive(Serialize)]
+pub struct DeploymentReport {
+    /// Accepted ids, each with the layers (pack, file) that accept it.
+    pub accept: Vec<sqldiff_source::deployment::Accepted>,
+    /// Facts the user asserts: their own declarations, not checked against
+    /// a catalog and not used for any status yet.
+    pub facts: Vec<DeploymentFact>,
+    /// Every assumption the tree carries is accepted: each unit's
+    /// assumption notes and the engine's open assumptions on each file (its
+    /// diff and its output check). Only one of the conditions for shipping
+    /// a tree unreviewed: units that differ, are not converted or are not
+    /// proven carry no assumption for that and are not counted here.
+    pub assumptions_within_accept: bool,
+    /// Every assumption id the tree carries, accepted or not.
+    pub carried: Vec<CarriedAssumption>,
+}
+
+#[derive(Serialize)]
+pub struct DeploymentFact {
+    pub key: String,
+    pub value: String,
+    pub by: sqldiff_core::model::DeploymentSource,
+    /// The registered assumptions the fact bears on.
+    pub bears_on: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct CarriedAssumption {
+    pub id: String,
+    /// Units with an assumption note of this id.
+    pub units: usize,
+    /// Files whose engine reports carry it.
+    pub files: usize,
+    pub accepted: bool,
 }
 
 #[derive(Serialize)]
@@ -403,6 +458,7 @@ pub fn convert_with(
         let (text, lines) = annotate(&c);
         let mut f = file_report(&input.rel, &input.text, &c, &lines, secs);
         f.output_hash = crate::review::file_hash(&text);
+        mark_accepted(&mut f, input, &c, &a.deployment);
         files.push(f);
         outputs.push(text);
         conversions.push(c);
@@ -423,6 +479,7 @@ pub fn convert_with(
             .map(|b| b.statements.clone())
             .unwrap_or_default(),
         totals: totals(&files, started.elapsed().as_secs_f64()),
+        deployment: deployment_report(&a.deployment, &conversions),
         files,
         unreadable,
         ledger: None,
@@ -1402,7 +1459,9 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
             },
             reason,
             findings,
+            trace: u.trace.clone(),
             review: None,
+            accepted: Vec::new(),
         };
         if u.status == Status::Converted {
             converted_units.push(r);
@@ -1528,6 +1587,130 @@ pub fn guard_hand_edits(out: &Path, discard: bool) -> Result<(), String> {
         edited.join(", "),
         crate::review::LEDGER_FILE
     ))
+}
+
+/// The rule ids of a unit's assumption notes, in note order without repeats.
+fn unit_assumptions(u: &crate::Unit) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for n in u.notes.iter().filter(|n| n.status == Status::Assumptions) {
+        debug_assert!(
+            !n.rule.starts_with("ASM-") || sqldiff_core::assumptions::lookup(&n.rule).is_some(),
+            "assumption id `{}` is not registered in crates/sqldiff-core/profiles/assumptions.toml",
+            n.rule
+        );
+        if !out.contains(&n.rule.as_str()) {
+            out.push(&n.rule);
+        }
+    }
+    out
+}
+
+/// The engine's open assumptions on a file: its diff's and its output
+/// check's, without facts proven from composed output.
+fn engine_assumptions(c: &Conversion) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for a in c
+        .report
+        .assumptions
+        .iter()
+        .chain(&c.output_check.assumptions)
+    {
+        if a.source != sqldiff_core::model::AssumptionSource::ComposedOutput
+            && !out.contains(&a.id.as_str())
+        {
+            out.push(&a.id);
+        }
+    }
+    out
+}
+
+/// Fills each unit report's `accepted`: its assumptions the profile accepts.
+fn mark_accepted(
+    f: &mut FileReport,
+    input: &Input,
+    c: &Conversion,
+    profile: &sqldiff_source::deployment::Profile,
+) {
+    if profile.accept.is_empty() {
+        return;
+    }
+    let ids = crate::review::unit_ids(&input.rel, &input.text, c);
+    for (u, id) in c.units.iter().zip(ids) {
+        let accepted: Vec<String> = unit_assumptions(u)
+            .into_iter()
+            .filter(|r| !profile.accepting(r).is_empty())
+            .map(str::to_string)
+            .collect();
+        if let Some(r) = f
+            .units
+            .iter_mut()
+            .chain(f.converted_units.iter_mut())
+            .find(|r| r.id == id)
+        {
+            r.accepted = accepted;
+        }
+    }
+}
+
+/// The deployment section of a tree's report; `None` when no layer has a
+/// `[deployment]` table.
+fn deployment_report(
+    profile: &sqldiff_source::deployment::Profile,
+    conversions: &[Conversion],
+) -> Option<DeploymentReport> {
+    if !profile.declared {
+        return None;
+    }
+    let mut carried: Vec<CarriedAssumption> = Vec::new();
+    let mut count = |id: &str, unit: bool| {
+        let i = match carried.iter().position(|x| x.id == id) {
+            Some(i) => i,
+            None => {
+                carried.push(CarriedAssumption {
+                    id: id.to_string(),
+                    units: 0,
+                    files: 0,
+                    accepted: !profile.accepting(id).is_empty(),
+                });
+                carried.len() - 1
+            }
+        };
+        if unit {
+            carried[i].units += 1;
+        } else {
+            carried[i].files += 1;
+        }
+    };
+    for c in conversions {
+        for u in &c.units {
+            for id in unit_assumptions(u) {
+                count(id, true);
+            }
+        }
+        for id in engine_assumptions(c) {
+            count(id, false);
+        }
+    }
+    // Not accepted first.
+    carried.sort_by(|a, b| a.accepted.cmp(&b.accepted).then(a.id.cmp(&b.id)));
+    Some(DeploymentReport {
+        accept: profile.accept.clone(),
+        facts: profile
+            .facts
+            .iter()
+            .map(|f| DeploymentFact {
+                key: f.key.clone(),
+                value: f.value.clone(),
+                by: f.by.clone(),
+                bears_on: sqldiff_core::assumptions::bearing_on(&f.key)
+                    .iter()
+                    .map(|e| e.id.clone())
+                    .collect(),
+            })
+            .collect(),
+        assumptions_within_accept: carried.iter().all(|x| x.accepted),
+        carried,
+    })
 }
 
 /// Applies the ledger committed in the output directory, if there is one
@@ -1721,6 +1904,21 @@ pub fn summary(r: &Report) -> String {
             }
         );
     }
+    if let Some(d) = &r.deployment {
+        let open = d.carried.iter().filter(|x| !x.accepted).count();
+        let _ = writeln!(
+            s,
+            "deployment profile: {}",
+            if d.assumptions_within_accept {
+                format!(
+                    "every assumption accepted ({} ids; units stay under assumptions)",
+                    d.carried.len()
+                )
+            } else {
+                format!("{open} of {} assumption ids not accepted", d.carried.len())
+            }
+        );
+    }
     s
 }
 
@@ -1752,6 +1950,9 @@ pub fn markdown(r: &Report) -> String {
         "A file counts as converted only when every unit in it is: no assumption, no decision, nothing found by the engine's diff or by checking the output on its own (binding, leftover source syntax, target limits).\n"
     );
     let _ = writeln!(s, "```\n{}```\n", summary(r));
+    if let Some(d) = &r.deployment {
+        deployment_markdown(&mut s, d);
+    }
     base_markdown(&mut s, r);
     if !r.totals.top_reasons.is_empty() {
         let _ = writeln!(
@@ -1810,6 +2011,56 @@ pub fn markdown(r: &Report) -> String {
         s.push('\n');
     }
     s
+}
+
+fn deployment_markdown(s: &mut String, d: &DeploymentReport) {
+    let _ = writeln!(s, "## Deployment profile\n");
+    let _ = writeln!(
+        s,
+        "{}\n",
+        if d.assumptions_within_accept {
+            "Every assumption the tree carries is accepted by the deployment profile. Acceptance is listed for review; it changes no status, so these units stay under assumptions."
+        } else {
+            "Not every assumption the tree carries is accepted by the deployment profile (marked below)."
+        }
+    );
+    if !d.carried.is_empty() {
+        let _ = writeln!(
+            s,
+            "| assumption | units | files (engine) | accepted by |\n|---|---:|---:|---|"
+        );
+        for x in &d.carried {
+            let mut by: Vec<String> = Vec::new();
+            for a in &d.accept {
+                if sqldiff_core::assumptions::covers(&a.id, &x.id) {
+                    for b in &a.by {
+                        if !by.contains(&b.label()) {
+                            by.push(b.label());
+                        }
+                    }
+                }
+            }
+            let by = if by.is_empty() {
+                "**not accepted**".to_string()
+            } else {
+                by.join("; ")
+            };
+            let _ = writeln!(s, "| `{}` | {} | {} | {by} |", x.id, x.units, x.files);
+        }
+        s.push('\n');
+    }
+    for f in &d.facts {
+        let _ = writeln!(
+            s,
+            "- fact `{}` = `{}`, declared by {} (the user's own declaration, not checked)",
+            f.key,
+            f.value,
+            f.by.label()
+        );
+    }
+    if !d.facts.is_empty() {
+        s.push('\n');
+    }
 }
 
 /// The base catalogs section of the Markdown report.

@@ -28,7 +28,7 @@ fn worked_example_tsql_to_db2() {
         &fixture("movestock.db2i.sql"),
         Dialect::Db2i,
     );
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let rs = rules(&r);
     for expected in ["txn.atomicity", "txn.caller-transaction", "error.contract"] {
         assert!(rs.contains(&expected), "missing {expected}: {rs:?}");
@@ -86,7 +86,7 @@ fn reformat_only_is_equal() {
         &fixture("movestock_reformatted.tsql.sql"),
         Dialect::Tsql,
     );
-    assert_eq!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
     assert!(r.findings.is_empty());
     assert!(r.noise.cosmetic > 0);
 }
@@ -99,7 +99,7 @@ fn tsql_identifier_case_needs_an_assumption() {
         "UPDATE stock SET qty = 1",
         Dialect::Tsql,
     );
-    assert_eq!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions);
     assert!(r
         .assumptions
         .iter()
@@ -111,7 +111,7 @@ fn tsql_identifier_case_needs_an_assumption() {
         "update stock set qty = 1;",
         Dialect::Postgres,
     );
-    assert_eq!(r.verdict, Verdict::Equal);
+    assert_eq!(r.verdict(), Verdict::Equal);
     // ...but a quoted identifier keeps its case.
     let r = run(
         "UPDATE \"Stock\" SET qty = 1;",
@@ -119,7 +119,7 @@ fn tsql_identifier_case_needs_an_assumption() {
         "UPDATE stock SET qty = 1;",
         Dialect::Postgres,
     );
-    assert_ne!(r.verdict, Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::Equal);
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn tsql_identifier_case_in_a_rewritten_statement_needs_an_assumption() {
         ),
     ] {
         let r = run(&proc_(a), Dialect::Tsql, &proc_(b), Dialect::Tsql);
-        assert_ne!(r.verdict, Verdict::Equal, "{a}");
+        assert_ne!(r.verdict(), Verdict::Equal, "{a}");
         assert!(
             r.assumptions
                 .iter()
@@ -181,7 +181,7 @@ fn modified_statement_is_never_equal() {
     let b = "CREATE PROCEDURE p AS\nBEGIN\n  UPDATE t SET x = 1;\n  SELECT 1;\nEND";
     let r = run(a, Dialect::Tsql, b, Dialect::Tsql);
     // The edit is evaluated: with no matching row in s, only B updates t.
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let f = &r.findings[0];
     assert_eq!(f.rule, "equiv.edit");
     assert!(f.witness.contains("s has no rows"), "{}", f.witness);
@@ -193,7 +193,7 @@ fn moved_commit_is_transactional() {
     let a = "BEGIN TRAN;\nUPDATE a SET x = 1;\nINSERT INTO b VALUES (1);\nCOMMIT;";
     let b = "BEGIN TRAN;\nUPDATE a SET x = 1;\nCOMMIT;\nINSERT INTO b VALUES (1);";
     let r = run(a, Dialect::Tsql, b, Dialect::Tsql);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(
         r.findings
             .iter()
@@ -208,7 +208,7 @@ fn removed_write_is_different() {
     let a = "UPDATE a SET x = 1;\nINSERT INTO log VALUES (1);";
     let b = "UPDATE a SET x = 1;";
     let r = run(a, Dialect::Postgres, b, Dialect::Postgres);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert_eq!(rules(&r), vec!["stmt.removed"]);
 }
 
@@ -219,7 +219,7 @@ fn commit_level_change_is_transactional() {
     let r = run(a, Dialect::Db2i, &b, Dialect::Db2i);
     // ATOMIC under *NONE rests on vendor fact V4, untested on a real IBM i:
     // the witness is shown, the verdict capped (milestone M5b).
-    assert_eq!(r.verdict, Verdict::Unknown);
+    assert_eq!(r.verdict(), Verdict::Unknown);
     assert!(rules(&r).contains(&"txn.atomicity"), "{:?}", rules(&r));
     assert!(r
         .findings
@@ -524,7 +524,7 @@ fn a_repeated_batch_is_never_equal() {
         &a.replace("GO\n", "GO 5\n"),
         Dialect::Tsql,
     );
-    assert_eq!(r.verdict, Verdict::Unknown, "{:?}", r.unknown_reasons);
+    assert_eq!(r.verdict(), Verdict::Unknown, "{:?}", r.unknown_reasons);
     assert!(r.unknown_reasons.iter().any(|x| x.contains("GO 5")));
     // The same count spelled differently is the same script.
     let r = run(
@@ -533,7 +533,7 @@ fn a_repeated_batch_is_never_equal() {
         &a.replace("GO\n", "go 1\n"),
         Dialect::Tsql,
     );
-    assert_eq!(r.verdict, Verdict::Equal, "{:?}", r.unknown_reasons);
+    assert_eq!(r.verdict(), Verdict::Equal, "{:?}", r.unknown_reasons);
     // Across dialects only a plain separator is covered.
     let pg = "UPDATE t SET x = x + 1;\nUPDATE t SET y = 2;\n";
     let r = run(

@@ -108,7 +108,7 @@ fn equal(a: &str, b: &str) -> Report {
 /// Different by `rule`, and the witness mentions `needle`.
 fn differs(a: &str, b: &str, rule: &str, needle: &str) {
     let r = run(a, b);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.unknown_reasons);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.unknown_reasons);
     let f = r
         .findings
         .iter()
@@ -126,8 +126,8 @@ fn unknown_with(a: &str, b: &str, o: &Options, needle: &str) {
         r.unknown_reasons,
         rules(&r)
     );
-    assert_ne!(r.verdict, Verdict::Equal);
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
 
 fn unknown(a: &str, b: &str, needle: &str) {
@@ -415,7 +415,7 @@ fn extended_properties_become_comments() {
             "{pg}: {:?}",
             asms(&r)
         );
-        assert_eq!(r.verdict, Verdict::EqualUnderAssumptions, "{pg}");
+        assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions, "{pg}");
     }
     let schema = "EXEC sys.sp_addextendedproperty @name = N'Description', @value = N'Sales data', @level0type = N'SCHEMA', @level0name = N'Sales';";
     equal(schema, "COMMENT ON SCHEMA Sales IS 'Sales data';");
@@ -513,7 +513,7 @@ fn comments_follow_the_tables_they_describe() {
     let r = run_with(&t, p, &o);
     assert!(r.unknown_reasons.is_empty(), "{:?}", r.unknown_reasons);
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:#?}",
         r.findings

@@ -490,7 +490,7 @@ impl Server {
         let structured = json!({
             "pair_id": id,
             "verdict": report.open_verdict(),
-            "verdict_before_suppression": report.verdict,
+            "verdict_before_suppression": report.verdict(),
             "suppressed": report.suppressed.iter().map(|x| json!({
                 "fingerprint": x.finding.fingerprint,
                 "kind": x.kind,
@@ -706,7 +706,7 @@ impl Server {
             let mut text = format!(
                 "{}  [{id}]\nVerdict: {}\n",
                 pair_label(&report),
-                report.verdict.label().to_uppercase()
+                report.verdict().label().to_uppercase()
             );
             if ledger.is_empty() {
                 text.push_str("No assumptions.\n");
@@ -733,7 +733,7 @@ impl Server {
             }
             return Ok((
                 text,
-                json!({ "pair_id": id, "verdict": report.verdict, "assumptions": ledger }),
+                json!({ "pair_id": id, "verdict": report.verdict(), "assumptions": ledger }),
             ));
         }
         let report = queue::view(&held.pair.report, &self.flips);
@@ -741,7 +741,7 @@ impl Server {
         let mut text = format!(
             "{}  [{id}]\nVerdict: {}\n",
             pair_label(&report),
-            report.verdict.label().to_uppercase()
+            report.verdict().label().to_uppercase()
         );
         if ledger.is_empty() {
             text.push_str("No assumptions.\n");
@@ -767,7 +767,7 @@ impl Server {
         }
         Ok((
             text,
-            json!({ "pair_id": id, "verdict": report.verdict, "assumptions": ledger }),
+            json!({ "pair_id": id, "verdict": report.verdict(), "assumptions": ledger }),
         ))
     }
 
@@ -1109,6 +1109,7 @@ impl Server {
             template,
             extensions: Vec::new(),
             helpers: self.config.options().helpers,
+            deployment: self.config.deployment.clone(),
             catalogs: Vec::new(),
             catalogs_b: Vec::new(),
         };
@@ -1157,6 +1158,7 @@ impl Server {
             template: self.template_mode(args)?,
             extensions: tree::extensions(list_arg(args, "extensions")?),
             helpers: self.config.options().helpers,
+            deployment: self.config.deployment.clone(),
             catalogs: list_arg::<String>(args, "catalogs")?
                 .into_iter()
                 .map(Into::into)
@@ -1646,7 +1648,7 @@ fn artifact(v: Option<&Value>, field: &str) -> Result<(Artifact, Option<String>)
     };
     let mut a = Artifact::new(path, dialect, text);
     if let Some(ver) = v.get("version").and_then(Value::as_str) {
-        a.version = ver.to_string();
+        a.set_version(ver).map_err(|e| format!("{field}: {e}"))?;
     }
     Ok((a, file))
 }

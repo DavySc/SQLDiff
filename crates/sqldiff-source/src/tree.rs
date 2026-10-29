@@ -27,11 +27,13 @@ pub fn artifact(
             "{display}: dialect unknown; give a dialect flag or map it with dialect_map"
         ))
     })?;
-    let mut a = Artifact::new(display, d, text);
-    a.version = match version {
+    let mut a = Artifact::new(display.clone(), d, text);
+    let v = match version {
         Some(v) if found == Some(d) => v,
         _ => cfg.dialect_version(d),
     };
+    a.set_version(&v)
+        .map_err(|e| Error(format!("{display}: {e}")))?;
     Ok(a)
 }
 

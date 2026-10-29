@@ -9,7 +9,7 @@
 use sqldiff_core::ir::witness::{ScenarioKind, Witness};
 use sqldiff_core::ir::ErrorKind;
 use sqldiff_core::ledger::{self, Status};
-use sqldiff_core::model::Side;
+use sqldiff_core::model::{Side, Suppressed, SuppressionKind};
 use sqldiff_core::{
     diff, overlay, what_if, Artifact, ChangeClass, Dialect, Finding, Options, Report, Verdict,
 };
@@ -57,7 +57,7 @@ fn flipped(id: &str, holds: bool) -> Options {
 fn worked_example_tsql_db2i() {
     let (a, b) = p01("db2i.sql", Dialect::Db2i);
     let r = diff(&a, &b, &Options::default());
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
 
     // 1. If the INSERT fails, T-SQL rolls back the UPDATE and returns 2; Db2
     //    exits with the UPDATE already durable.
@@ -177,7 +177,7 @@ fn m5a_tsql_pg_divergences_match_the_oracle() {
     let f = finding(&r, "txn.caller-continuation");
     assert_eq!(f.verdict, Verdict::Different);
     assert!(f.witness.contains("A line 6 runs next"), "{}", f.witness);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
 
     // Oracle: with a non-positive price SQL Server writes audit rows, PostgreSQL none.
     let c = "pairs/p10-temp-state-rollback";
@@ -206,7 +206,7 @@ fn single_statement_routines_do_not_diverge_on_continuation() {
         .findings
         .iter()
         .any(|f| f.rule == "txn.caller-continuation"));
-    assert_ne!(r.verdict, Verdict::Different);
+    assert_ne!(r.verdict(), Verdict::Different);
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn ledger_ranks_sources_and_reruns() {
 
     let (a, b) = p01("pg.sql", Dialect::Postgres);
     let (r, entries) = ledger::ledger(&a, &b, &Options::default());
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let first = &entries[0];
     assert!(first.flips_verdict, "{entries:#?}");
     assert!(first.reruns);
@@ -447,15 +447,24 @@ fn relabel_without_a_hit_keeps_the_verdict() {
     let (a, b) = p01("pg.sql", Dialect::Postgres);
     let mut r = diff(&a, &b, &Options::default());
     // As after review accepted every finding.
-    r.verdict = Verdict::EqualUnderAssumptions;
-    r.findings.clear();
+    r.suppressed = r
+        .findings
+        .drain(..)
+        .map(|finding| Suppressed {
+            finding,
+            kind: SuppressionKind::Review,
+            justification: "accepted".into(),
+        })
+        .collect();
+    r.settle();
+    assert_ne!(r.verdict(), Verdict::Equal);
     let before = r.clone();
     ledger::relabel(&mut r, &Default::default());
-    assert_eq!(r.verdict, before.verdict);
+    assert_eq!(r.verdict(), before.verdict());
     let mut flips = std::collections::BTreeMap::new();
     flips.insert("ASM-NOT-USED".to_string(), false);
     ledger::relabel(&mut r, &flips);
-    assert_eq!(r.verdict, before.verdict);
+    assert_eq!(r.verdict(), before.verdict());
 }
 
 #[test]

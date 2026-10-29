@@ -11,7 +11,7 @@ fn main() {
     )
     .expect("supported pair");
     println!("{}", c.output);
-    println!("-- verdict: {}", c.report.verdict.label());
+    println!("-- verdict: {}", c.report.verdict().label());
     for u in &c.units {
         println!(
             "-- in {}-{} → out {}-{}: {}",
@@ -23,6 +23,14 @@ fn main() {
         );
         for n in &u.notes {
             println!("--     [{}] {}: {}", n.status.label(), n.rule, n.text);
+        }
+        for s in &u.trace {
+            let inst = s
+                .inst
+                .as_deref()
+                .map(|i| format!(" → {i}"))
+                .unwrap_or_default();
+            println!("--     step {} {:?}{inst}", s.rule, &text[s.start..s.end]);
         }
         for &f in &u.findings {
             let f = &c.report.findings[f];

@@ -340,7 +340,7 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                 });
             match format {
                 Format::Text => {
-                    println!("Verdict: {}", view.verdict.label().to_uppercase());
+                    println!("Verdict: {}", view.verdict().label().to_uppercase());
                     if ledger.is_empty() {
                         println!("No assumptions.");
                     }
@@ -382,14 +382,14 @@ pub fn run(cmd: QueueCommand) -> Result<ExitCode, String> {
                 _ => println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "verdict": view.verdict,
+                        "verdict": view.verdict(),
                         "flips": flips,
                         "assumptions": ledger,
                     }))
                     .unwrap()
                 ),
             }
-            Ok(exit_for(view.verdict))
+            Ok(exit_for(view.verdict()))
         }
         QueueCommand::Comment {
             pair,

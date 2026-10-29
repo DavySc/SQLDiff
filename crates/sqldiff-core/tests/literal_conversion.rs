@@ -65,7 +65,7 @@ fn assumptions(r: &Report) -> Vec<&str> {
 }
 
 fn equal(r: &Report) -> bool {
-    matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions)
+    matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions)
 }
 
 fn no_collation_finding(r: &Report) {
@@ -83,7 +83,7 @@ fn datetime2_period_end_is_not_a_string_comparison() {
     let lit = "e = '9999-12-31 23:59:59.9999999'";
     let r = run(lit, T, lit, P);
     no_collation_finding(&r);
-    assert_eq!(r.verdict, Verdict::Unknown, "{:?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Unknown, "{:?}", r.findings);
     let text = format!("{:?}", r.findings);
     assert!(text.contains("not modelled for certain"), "{text}");
     // The same literal on both sides of one dialect is equal.
@@ -110,11 +110,11 @@ fn date_and_time_literals_compare_as_values() {
     ] {
         let r = run(a, T, b, P);
         no_collation_finding(&r);
-        assert!(equal(&r), "{a} / {b}: {:?} {:?}", r.verdict, r.findings);
+        assert!(equal(&r), "{a} / {b}: {:?} {:?}", r.verdict(), r.findings);
     }
     // Different values are not equal.
     let r = run("d = '2020-01-01'", T, "d = '2020-01-02'", P);
-    assert!(!equal(&r), "{:?}", r.verdict);
+    assert!(!equal(&r), "{:?}", r.verdict());
 }
 
 /// Before: string literals inside BETWEEN, IN and CAST compared as equal
@@ -138,8 +138,8 @@ fn literals_that_round_differently_are_not_equal() {
         ("tm = '10:00:00.1234567'", "tm = '10:00:00.1234567'"),
     ] {
         let r = run(a, T, b, P);
-        assert!(!equal(&r), "{a}: {:?}", r.verdict);
-        assert_ne!(r.verdict, Verdict::Different, "{a}: {:?}", r.findings);
+        assert!(!equal(&r), "{a}: {:?}", r.verdict());
+        assert_ne!(r.verdict(), Verdict::Different, "{a}: {:?}", r.findings);
     }
 }
 
@@ -148,7 +148,7 @@ fn literals_that_round_differently_are_not_equal() {
 #[test]
 fn decimal_literals_round_to_the_column_scale_on_sql_server_only() {
     let r = run("amt = '1.005'", T, "amt = '1.005'", P);
-    assert!(!equal(&r), "{:?}", r.verdict);
+    assert!(!equal(&r), "{:?}", r.verdict());
     no_collation_finding(&r);
     for (a, b) in [
         ("amt = '1.01'", "amt = '1.010'"),
@@ -157,24 +157,24 @@ fn decimal_literals_round_to_the_column_scale_on_sql_server_only() {
         ("n < '+7'", "n < '7'"),
     ] {
         let r = run(a, T, b, P);
-        assert!(equal(&r), "{a} / {b}: {:?} {:?}", r.verdict, r.findings);
+        assert!(equal(&r), "{a} / {b}: {:?} {:?}", r.verdict(), r.findings);
     }
     // Out of the integer range: both fail, but that is not modelled.
     let r = run("n = '9999999999'", T, "n = '9999999999'", P);
-    assert!(!equal(&r), "{:?}", r.verdict);
+    assert!(!equal(&r), "{:?}", r.verdict());
 }
 
 #[test]
 fn datetime_dash_literals_depend_on_dateformat() {
     let r = run("dt = '2020-01-02'", T, "dt = '2020-01-02'", P);
-    assert!(equal(&r), "{:?} {:?}", r.verdict, r.findings);
+    assert!(equal(&r), "{:?} {:?}", r.verdict(), r.findings);
     assert!(
         assumptions(&r).contains(&"ASM-TSQL-DATEFORMAT-YMD"),
         "{:?}",
         assumptions(&r)
     );
     let r = run("dt = '20200102'", T, "dt = '2020-01-02'", P);
-    assert!(equal(&r), "{:?}", r.verdict);
+    assert!(equal(&r), "{:?}", r.verdict());
     assert!(!assumptions(&r).contains(&"ASM-TSQL-DATEFORMAT-YMD"));
     // datetime rounds milliseconds to 1/300 s.
     let r = run(
@@ -183,7 +183,7 @@ fn datetime_dash_literals_depend_on_dateformat() {
         "dt = '2020-01-02 10:00:00.001'",
         P,
     );
-    assert!(!equal(&r), "{:?}", r.verdict);
+    assert!(!equal(&r), "{:?}", r.verdict());
 }
 
 #[test]
@@ -195,11 +195,11 @@ fn uuid_literals_ignore_case_and_braces_but_not_order() {
         P,
     );
     no_collation_finding(&r);
-    assert!(equal(&r), "{:?} {:?}", r.verdict, r.findings);
+    assert!(equal(&r), "{:?} {:?}", r.verdict(), r.findings);
     // uniqueidentifier and uuid sort differently.
     let lit = "g < '6F9619FF-8B86-D011-B42D-00C04FC964FF'";
     let r = run(lit, T, lit, P);
-    assert!(!equal(&r), "{:?}", r.verdict);
+    assert!(!equal(&r), "{:?}", r.verdict());
     no_collation_finding(&r);
 }
 
@@ -207,8 +207,8 @@ fn uuid_literals_ignore_case_and_braces_but_not_order() {
 #[test]
 fn rowversion_is_not_a_timestamp() {
     let r = run("rv = '2020-01-01'", T, "rv = '2020-01-01'", P);
-    assert!(!equal(&r), "{:?}", r.verdict);
-    assert_ne!(r.verdict, Verdict::Different);
+    assert!(!equal(&r), "{:?}", r.verdict());
+    assert_ne!(r.verdict(), Verdict::Different);
 }
 
 /// Without catalog facts the column may be a string or not: neither a
@@ -218,7 +218,7 @@ fn untyped_column_against_a_literal_is_unknown() {
     let lit = "e = '2020-01-01'";
     let r = run_with(&view(T, lit), T, &view(P, lit), P, false);
     no_collation_finding(&r);
-    assert_eq!(r.verdict, Verdict::Unknown, "{:?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Unknown, "{:?}", r.findings);
     let text = format!("{:?}", r.findings);
     assert!(text.contains("no catalog facts"), "{text}");
 }
@@ -230,8 +230,8 @@ fn db2_for_i_literal_conversions_stay_unknown() {
     let lit = "d = '2020-01-01'";
     let r = run(lit, T, lit, D);
     no_collation_finding(&r);
-    assert!(!equal(&r), "{:?}", r.verdict);
-    assert_ne!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert!(!equal(&r), "{:?}", r.verdict());
+    assert_ne!(r.verdict(), Verdict::Different, "{:?}", r.findings);
 }
 
 /// A character column compared with a literal still follows the collation.
@@ -257,6 +257,6 @@ fn string_columns_keep_the_collation_finding() {
         ),
         &opts,
     );
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(rules(&r).contains(&"equiv.case-sensitivity"));
 }

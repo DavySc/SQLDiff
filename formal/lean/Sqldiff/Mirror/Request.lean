@@ -1,0 +1,261 @@
+/-
+The mirror check as a `sqldiff-check/3` request (see `Main.lean`):
+decoding of its fields and the answer. A field that does not decode, a
+routine that does not decode, or an abstract syntax schema other than
+`Sqldiff.Ast.schemaHash` is answered "unconfirmed".
+
+Field encodings, all ASCII without tabs; NAME is the UTF-8 bytes of a
+string in lower-case hex, two digits per byte:
+
+  DEPLOYMENT  R or R,PAIR,PAIR,...   R is 1 when row counts are observed, else 0;
+                                     PAIR is NAME:NAME, a T-SQL routine name
+                                     (`.`-joined) and its target routine
+              then optionally        (C3a) `;` and TPAIR,TPAIR,...: TPAIR is
+                                     NAME:NAME, a T-SQL table name (`.`-joined
+                                     as written, `dbo.t`) and its target table
+                                     (a catalog TABLE name)
+  CATALOG     - or ENTRY,ENTRY,...   ENTRY is a routine, (C3a) a table, or
+                                     (C2b) a fact:
+                ROUTINE NAME:MODES   a target routine (folded as
+                                     `Sqldiff.Mirror.pgName` folds) and one
+                                     letter per parameter: i IN, o OUT, b INOUT
+                TABLE NAME=COL/COL/... a target table (folded, `.`-joined as
+                                     the PL/pgSQL code names it) and its
+                                     columns in declaration order, at least one
+                COL NAME.SPEC or NAME.SPEC.NAME
+                                     the column (folded), its type and
+                                     constraints, and optionally its spelling
+                                     in the T-SQL table (default: the folded
+                                     name without a leading `"`)
+                SPEC i, in, ik or ink  i: the type, `int`/`integer` (the only
+                                     one so far); n: NOT NULL; k: a column of
+                                     the primary key (NOT NULL in any case)
+                FACT !binary-collation (C2b) `Catalog.binaryCollation`: the
+                                     T-SQL database that holds the routine
+                                     has a `_BIN`/`_BIN2` default collation,
+                                     and every collation a PostgreSQL
+                                     comparison in the routine can take (the
+                                     database default, the collations of the
+                                     arguments callers pass) is deterministic.
+                                     Any other `!` entry does not decode
+  CERT        - or PAIR,PAIR,...     PAIR is NAME:NAME, a T-SQL variable and its
+                                     PL/pgSQL name
+
+A request without `;` in DEPLOYMENT and without TABLE entries is a C1/C2a
+request as before; its routines cannot have data statements in the spec.
+A request without a FACT entry has no string comparison in the slice
+(C2b): `=` and `<>` on strings stay uninterpreted operators. A checker
+older than C2b answers a request with a FACT "the catalog does not
+decode": the Rust side sends the fact only when the deployment profile
+declares it, and records `ASM-BINARY-COLLATION` for every routine it
+sends it with.
+A TABLE entry asserts every fact `Sqldiff.Mirror.CatTable` lists (no
+other constraint, default, trigger, ...): the Rust side sends a table only
+when the catalogs show all of them.
+
+The answer: `check`, plus the fields `extra` adds to a confirmed answer
+(`"scalars"`, `"residual"` for a C2a answer, and `"statements"`; see
+`Main.lean`).
+-/
+import Sqldiff.Ast
+import Sqldiff.Mirror.Check
+
+namespace Sqldiff.Mirror.Request
+
+open Sqldiff.Gate (Answer)
+
+private def hexDigit (c : Char) : Option Nat :=
+  if c.isDigit then some (c.toNat - '0'.toNat)
+  else if 'a' ≤ c && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10)
+  else none
+
+private def hexBytes : List Char → Option (List UInt8)
+  | a :: b :: rest => do
+    let x ← hexDigit a
+    let y ← hexDigit b
+    let bs ← hexBytes rest
+    pure ((x * 16 + y).toUInt8 :: bs)
+  | [] => some []
+  | [_] => none
+
+/-- A NAME: lower-case hex of UTF-8 bytes. -/
+def name? (s : String) : Option String :=
+  (hexBytes s.toList).bind fun bs => String.fromUTF8? ⟨bs.toArray⟩
+
+/-- `-` is the empty list; otherwise comma-separated items. -/
+def items? {α : Type} (s : String) (f : String → Option α) : Option (List α) :=
+  if s = "-" then some [] else (s.splitOn ",").mapM f
+
+def pair? (s : String) : Option (String × String) :=
+  match s.splitOn ":" with
+  | [a, b] => do pure (← name? a, ← name? b)
+  | _ => none
+
+def mode? : Char → Option Ast.Mode
+  | 'i' => some .In
+  | 'o' => some .Out
+  | 'b' => some .InOut
+  | _ => none
+
+def deployment? (s : String) : Option Deployment := do
+  let (main, tables) ← match s.splitOn ";" with
+    | [m] => some (m, [])
+    | [m, t] => (t.splitOn ",").mapM pair? |>.map (m, ·)
+    | _ => none
+  match main.splitOn "," with
+  | r :: ps => do
+    let rc ← match r with
+      | "0" => some false
+      | "1" => some true
+      | _ => none
+    let routines ← ps.mapM pair?
+    pure { rowCounts := rc, routines, tables }
+  | [] => none
+
+/-- A column's type and constraints: `(notNull, key)`. -/
+def spec? : String → Option (Bool × Bool)
+  | "i" => some (false, false)
+  | "in" => some (true, false)
+  | "ik" => some (false, true)
+  | "ink" => some (true, true)
+  | _ => none
+
+def col? (s : String) : Option CatCol := do
+  let (n, sp, t) ← match s.splitOn "." with
+    | [n, sp] => some (n, sp, none)
+    | [n, sp, t] => some (n, sp, some t)
+    | _ => none
+  let name ← name? n
+  let (notNull, key) ← spec? sp
+  let tsql ← match t with
+    | some t => name? t
+    | none => some (if name.startsWith "\"" then String.ofList (name.toList.drop 1) else name)
+  pure { name, tsql, notNull, key }
+
+/-- A catalog entry: a routine, a table, or (C2b) the collation fact. -/
+inductive Entry where
+  | routine (n : String) (modes : List Ast.Mode)
+  | table (t : CatTable)
+  | binaryCollation
+
+def entry? (e : String) : Option Entry :=
+  if e.startsWith "!" then
+    if e == "!binary-collation" then some .binaryCollation else none
+  else
+  match e.splitOn "=" with
+  | [n, cs] => do
+    let cols ← (cs.splitOn "/").mapM col?
+    pure (.table { name := ← name? n, cols })
+  | [_] => match e.splitOn ":" with
+    | [n, ms] => do pure (.routine (← name? n) (← ms.toList.mapM mode?))
+    | _ => none
+  | _ => none
+
+def catalog? (s : String) : Option Catalog :=
+  (items? s entry?).map fun es =>
+    { routines := es.filterMap fun | .routine n ms => some (n, ms) | _ => none
+      tables := es.filterMap fun | .table t => some t | _ => none
+      binaryCollation := es.any fun | .binaryCollation => true | _ => false }
+
+def cert? (s : String) : Option Cert := (items? s pair?).map Cert.mk
+
+/-- The answer to a well-formed `mirror` request. -/
+def answer (schema dep cat cert ra rb : String) : Answer :=
+  if schema != Sqldiff.Ast.schemaHash then
+    .unconfirmed "the request's abstract syntax schema is not this checker's: generate formal/lean/Sqldiff/Ast.lean again and rebuild"
+  else
+    match deployment? dep, catalog? cat, cert? cert with
+    | some d, some g, some c =>
+      match Ast.decodeRoutineLine ra, Ast.decodeRoutineLine rb with
+      | some a, some b => check d g c a b
+      | none, _ => .unconfirmed "routine A does not decode"
+      | _, none => .unconfirmed "routine B does not decode"
+    | none, _, _ => .unconfirmed "the deployment does not decode"
+    | _, none, _ => .unconfirmed "the catalog does not decode"
+    | _, _, none => .unconfirmed "the certificate does not decode"
+
+/-- What a confirmed `mirror` answer adds to the `/3` JSON line, after
+`theorem` (`Main.lean`); nothing for an unconfirmed one. Fields are only
+ever added, so a reader of the C1 answer keeps working.
+
+* `"scalars"`: `"c2a"` when the answer names
+  `Sqldiff.Mirror.check_sound_c2a` (both routines in the C2a slice: the
+  confirmation does not rest on `ASM-C1-OPERATORS`), `"uninterpreted"`
+  when it names `Sqldiff.Mirror.check_sound` (it does).
+* `"residual"`, with `"c2a"` only: the facts the confirmation still
+  rests on (`Sqldiff.Mirror.residual`), an array of assumption names,
+  possibly empty.
+* `"statements"`: `"c3a"` when the routines have data statements (C3a:
+  the confirmation covers the target catalog's tables named in the
+  request, under the facts a TABLE entry asserts), `"c1"` when they have
+  only the control statements of C1. Added in C3a, last, so a reader of
+  the C2a answer keeps working.
+
+* `"errors"`: `"c4"` when the routines handle errors, raise them or
+  control transactions (C4: `TRY`/`CATCH` against an exception block,
+  `THROW` against `RAISE`, `BEGIN TRAN`/`COMMIT`, the rollback-and-rethrow
+  idiom); absent otherwise. Added in C4, last, so a reader of the C3a
+  answer keeps working. Its residuals (`ASM-CATCH-CORE-ERRORS`,
+  `ASM-NO-CALLER-TXN`, `ASM-THROW-ERRCODE`) are in `"residual"`, so a
+  reader that does not know them already does not treat the answer as a
+  C2a one.
+
+C2b adds no field: a confirmation whose routines use strings is a C2a
+answer (the slice grew; the theorem is the same), and its `"residual"`
+names the string facts it rests on (`ASM-CONCAT-NULL`,
+`ASM-BINARY-COLLATION`, `ASM-TSQL-LEN-BMP`, `ASM-TSQL-STRING-ARGS`;
+`Sqldiff.Mirror.residual`). A reader that does not know one of them must
+not treat the answer as a C2a one. -/
+def extra (dep cat ra : String) (ans : Answer) : String :=
+  match ans with
+  | .unconfirmed _ => ""
+  | .confirmed t =>
+    let a := Ast.decodeRoutineLine ra
+    let ca := match deployment? dep, catalog? cat, a with
+      | some d, some g, some a => lowerT d g a
+      | _, _, _ => none
+    let stmts := if (ca.map Core.Routine.hasData).getD false then "c3a" else "c1"
+    let errs := match a, ca with
+      | some a, some ca => if usesC4 a ca then ",\"errors\":\"c4\"" else ""
+      | _, _ => ""
+    let tail := ",\"statements\":\"" ++ stmts ++ "\"" ++ errs
+    if t == theoremC2a then
+      let names := match a, ca with
+        | some a, some ca => residual a ca
+        | _, _ => []
+      let items := ",".intercalate (names.map fun n => "\"" ++ n ++ "\"")
+      ",\"scalars\":\"c2a\",\"residual\":[" ++ items ++ "]" ++ tail
+    else ",\"scalars\":\"uninterpreted\"" ++ tail
+
+#guard name? "40785f31" == some "@x_1"
+#guard name? "4" == none
+#guard name? "4G" == none
+#guard (cert? "4078:78,4079:79").map (·.vars) == some [("@x", "x"), ("@y", "y")]
+#guard (cert? "-").map (·.vars) == some []
+#guard (catalog? "70:ib").isSome
+#guard (catalog? "70:ix").isNone
+#guard (deployment? "0").map (·.rowCounts) == some false
+#guard (deployment? "2").isNone
+#guard (deployment? "0;64626f2e74:74").map (·.tables) == some [("dbo.t", "t")]
+#guard (deployment? "0,70:70;74:74").map (·.routines) == some [("p", "p")]
+#guard (deployment? "0;").isNone
+#guard (deployment? "0;74:74;74:74").isNone
+-- A table `t` with key `id` and nullable `qty`, spelt `Qty` in T-SQL, and a routine.
+#guard (catalog? "74=6964.ink/717479.i.517479,70:ib").map
+    (fun g => (g.routines.length, g.tables.map fun t => t.cols.map fun c => (c.name, c.tsql, c.notNull, c.key))) ==
+  some (1, [[("id", "id", true, true), ("qty", "Qty", false, false)]])
+-- A quoted target name `"Qty`: its T-SQL spelling defaults to `Qty`.
+#guard (catalog? "74=22517479.in").map (fun g => g.tables.map fun t => t.cols.map (·.tsql)) ==
+  some [["Qty"]]
+#guard (catalog? "74=6964.ix").isNone
+-- C2b: the collation fact, alone or with other entries; nothing else after `!`.
+#guard (catalog? "!binary-collation").map (·.binaryCollation) == some true
+#guard (catalog? "70:ib,!binary-collation").map (fun g => (g.routines.length, g.binaryCollation)) ==
+  some (1, true)
+#guard (catalog? "70:ib").map (·.binaryCollation) == some false
+#guard (catalog? "!binary").isNone
+#guard (catalog? "!").isNone
+#guard (catalog? "74=").isNone
+#guard (catalog? "74=6964").isNone
+
+end Sqldiff.Mirror.Request

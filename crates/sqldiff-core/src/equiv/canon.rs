@@ -115,6 +115,12 @@ pub mod asm {
         "ASM-TSQL-CI-COLLATION",
         "Identifiers and variables compare case-insensitively (case-insensitive catalog collation)",
     );
+    /// Decision 1: across dialects, result column names that differ only in
+    /// letter case are equal when the client matches names that way.
+    pub const RESULT_NAMES_CI: (&str, &str) = (
+        "ASM-RESULT-NAMES-CI",
+        "Clients read result columns by name case-insensitively (PostgreSQL returns an unquoted alias such as OrderId as orderid; T-SQL returns it as written)",
+    );
     pub const IDENT_FOLD: (&str, &str) = (
         "ASM-IDENT-FOLD",
         "Unquoted names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
@@ -196,6 +202,30 @@ pub struct Canon<'a> {
 /// every character is a hex digit and they make whole bytes.
 pub(super) fn hex_bytes(s: &str) -> Option<String> {
     (s.len() % 2 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// The name a client receives for a result column, from the parser's
+/// spelling (`ast::quoted_name` marks a quoted name whose case matters with
+/// a leading `"`): such a name as it is; otherwise as written in T-SQL,
+/// folded to lower case in PostgreSQL and to upper case in Db2 for i.
+fn returned_name(d: Dialect, s: &str) -> String {
+    match s.strip_prefix('"') {
+        Some(q) => q.to_string(),
+        None => match d {
+            Dialect::Tsql => s.to_string(),
+            Dialect::Postgres => s.to_lowercase(),
+            Dialect::Db2i => s.to_uppercase(),
+        },
+    }
+}
+
+/// A result column's name as decision 1 observes it: `(colname DIALECT
+/// KIND NAME)`, KIND `alias`, `col` (a column reference without alias),
+/// `decl` (a declared output column) or `expr` (unnamed, NAME empty).
+/// `compare` checks names exactly within a dialect and up to letter case
+/// across dialects, under `ASM-RESULT-NAMES-CI`.
+fn colname(d: Dialect, kind: &str, name: &str) -> Term {
+    n("colname", vec![a(d.id()), a(kind), a(name)])
 }
 
 /// Folded name; names whose quoting is significant (leading `"`) keep their case.
@@ -2564,10 +2594,33 @@ impl<'a> Canon<'a> {
                         expr
                     }
                 };
-                item_terms.push(n("item", vec![expr, a(name)]));
+                item_terms.push(n(
+                    "item",
+                    vec![expr, colname(self.d, "decl", &returned_name(self.d, &name))],
+                ));
             }
         } else {
-            item_terms = items.into_iter().map(|x| x.0).collect();
+            // The names a client receives (decision 1); derived tables and
+            // subqueries keep folded names, which nothing outside observes.
+            let named = items.len() == q.items.len();
+            item_terms = items
+                .into_iter()
+                .zip(q.items.iter().map(Some).chain(std::iter::repeat(None)))
+                .map(|((t, _), it)| match (named, it, t.kids()) {
+                    (true, Some(it), [expr, _]) => {
+                        let name = match (&it.alias, &it.expr) {
+                            (Some(x), _) => colname(self.d, "alias", &returned_name(self.d, x)),
+                            (None, Expr::Name(p)) => match p.last() {
+                                Some(x) => colname(self.d, "col", &returned_name(self.d, x)),
+                                None => colname(self.d, "expr", ""),
+                            },
+                            (None, _) => colname(self.d, "expr", ""),
+                        };
+                        n("item", vec![expr.clone(), name])
+                    }
+                    _ => t,
+                })
+                .collect();
         }
         parts.insert(1, n("items", item_terms));
         Ok(n("resultset", vec![n("q", parts)]))

@@ -32,7 +32,7 @@ fn run(a: &str, b: &str, d: Dialect) -> Report {
 
 fn different(a: &str, b: &str, d: Dialect) -> String {
     let r = run(a, b, d);
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     r.findings
         .iter()
         .find(|f| f.verdict == Verdict::Different)
@@ -42,7 +42,7 @@ fn different(a: &str, b: &str, d: Dialect) -> String {
 
 fn not_different(a: &str, b: &str, d: Dialect) {
     let r = run(a, b, d);
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 fn pg_since(span: &str) -> String {
@@ -149,7 +149,7 @@ fn top_assignment_is_a_variable_write() {
         )
     };
     let r = run(&p(1), &p(2), T);
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
 
 #[test]
@@ -197,7 +197,7 @@ fn times_a_column_rounds_alike_are_not_different() {
             let u = |v: &str| format!("UPDATE dbo.T SET Q = 1 WHERE {col} {op} '{v}';");
             let r = run_types(&u(x), &u(y));
             assert_ne!(
-                r.verdict,
+                r.verdict(),
                 Verdict::Different,
                 "{col} {op}: {:#?}",
                 r.findings
@@ -205,7 +205,7 @@ fn times_a_column_rounds_alike_are_not_different() {
         }
     }
     let u = |op: &str| format!("UPDATE dbo.T SET Q = 1 WHERE DT {op} '2020-01-01 10:00';");
-    assert_eq!(run_types(&u(">"), &u(">=")).verdict, Verdict::Different);
+    assert_eq!(run_types(&u(">"), &u(">=")).verdict(), Verdict::Different);
 }
 
 #[test]
@@ -222,12 +222,12 @@ fn foreign_key_bounds_a_column_length() {
         format!("CREATE TABLE dbo.C (Id int NOT NULL, Code varchar({n}) NOT NULL REFERENCES dbo.P (Code));")
     };
     let r = run_types(&inline(10), &inline(20));
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     let named = |n: u32| {
         format!("CREATE TABLE dbo.C (Id int NOT NULL, Code varchar({n}) NOT NULL, CONSTRAINT FK_C FOREIGN KEY (Code) REFERENCES dbo.P (Code));")
     };
     let r = run_types(&named(10), &named(20));
-    assert_ne!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }
 
 #[test]
@@ -248,5 +248,5 @@ fn foreign_key_on_another_column_keeps_a_default_witness() {
         format!("CREATE TABLE dbo.C (Code varchar(10) NOT NULL REFERENCES dbo.P (Code), tries int NOT NULL DEFAULT (({v})));")
     };
     let r = run_types(&t(3), &t(4));
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
 }

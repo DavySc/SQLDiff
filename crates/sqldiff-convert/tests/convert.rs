@@ -107,10 +107,13 @@ fn procedure_with_control_flow() {
     let src = "CREATE PROCEDURE dbo.P @ItemId int, @Note nvarchar(20) = NULL OUTPUT AS\nBEGIN\n  DECLARE @i INT = 0;\n  WHILE @i < 3\n  BEGIN\n    SET @i += 1;\n    IF @i = 1 PRINT 'one' ELSE IF @i = 2 PRINT 'two' ELSE PRINT 'many';\n  END\n  SET @Note = 'n' + @Note;\n  RETURN 7;\nEND\nGO\n";
     let c = tsql(src);
     let o = &c.output;
-    assert!(o.starts_with("CREATE OR REPLACE PROCEDURE P(p_item_id integer, INOUT p_note varchar(20) DEFAULT NULL, INOUT return_code integer DEFAULT NULL)\nLANGUAGE plpgsql\nAS $$\nDECLARE\n  v_i integer;\nBEGIN\n"), "{o}");
+    assert!(o.starts_with("CREATE OR REPLACE PROCEDURE P(p_item_id integer, INOUT p_note varchar(20) DEFAULT NULL, INOUT return_code integer DEFAULT NULL)\nLANGUAGE plpgsql\nAS $$\nDECLARE\n  v_i integer;\nBEGIN\n  return_code := 0;\n"), "{o}");
     assert!(o.contains("  v_i := 0;\n  WHILE v_i < 3 LOOP\n    v_i := v_i + 1;\n    IF v_i = 1 THEN\n      RAISE NOTICE '%', 'one';\n    ELSIF v_i = 2 THEN\n      RAISE NOTICE '%', 'two';\n    ELSE\n      RAISE NOTICE '%', 'many';\n    END IF;\n  END LOOP;\n"), "{o}");
     assert!(o.contains("p_note := 'n' || p_note;"), "{o}");
-    assert!(o.contains("return_code := 7;\n  RETURN;\nEND;\n$$;"), "{o}");
+    assert!(
+        o.contains("return_code := COALESCE(7, 0);\n  RETURN;\nEND;\n$$;"),
+        "{o}"
+    );
     assert!(has_rule(
         unit(&c, src, "CREATE PROCEDURE"),
         "ASM-RETURN-CODE"
@@ -539,7 +542,11 @@ fn only_the_refused_statement_goes_to_the_idiom_rules() {
     let c = tsql(src);
     // The IF and RETURN keep the token rules' spelling; only the MERGE is the rules'.
     assert!(c.output.contains("IF p_price > 0 THEN"), "{}", c.output);
-    assert!(c.output.contains("return_code := 1;"), "{}", c.output);
+    assert!(
+        c.output.contains("return_code := COALESCE(1, 0);"),
+        "{}",
+        c.output
+    );
     assert!(c.output.contains("INOUT return_code"), "{}", c.output);
     let m = unit(&c, src, "MERGE");
     assert!(has_rule(m, "idiom-rules"), "{:?}", m.notes);
@@ -811,7 +818,7 @@ fn a_lost_directive_is_reported() {
         "{:?}",
         c.report.unknown_reasons
     );
-    assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
+    assert_ne!(c.report.verdict(), sqldiff_core::Verdict::Equal);
 }
 
 #[test]
@@ -831,7 +838,7 @@ fn a_placeholder_decided_by_pattern_is_an_open_question() {
         "{:?}",
         c.report.unknown_reasons
     );
-    assert_ne!(c.report.verdict, sqldiff_core::Verdict::Equal);
+    assert_ne!(c.report.verdict(), sqldiff_core::Verdict::Equal);
 }
 
 #[test]

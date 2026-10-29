@@ -1,6 +1,6 @@
 //! Output text with the units written into it.
 
-use crate::Note;
+use crate::{Note, Step};
 
 /// A unit before verification: byte ranges in input and output.
 #[derive(Debug, Clone)]
@@ -8,6 +8,8 @@ pub(crate) struct RawUnit {
     pub src: (usize, usize),
     pub out: (usize, usize),
     pub notes: Vec<Note>,
+    /// The rewrites that produced this unit's output.
+    pub trace: Vec<Step>,
     /// Set when a person or an agent wrote this unit's output by hand.
     pub written: Option<crate::Written>,
 }
@@ -25,7 +27,14 @@ impl Out {
 
     /// Writes `text` indented by `indent` spaces (every line), newline-terminated,
     /// and records it as a unit for `src`.
-    pub fn unit(&mut self, src: (usize, usize), indent: usize, text: &str, notes: Vec<Note>) {
+    pub fn unit(
+        &mut self,
+        src: (usize, usize),
+        indent: usize,
+        text: &str,
+        notes: Vec<Note>,
+        trace: Vec<Step>,
+    ) {
         let start = self.text.len();
         self.lines(indent, text);
         let end = self.text.len().saturating_sub(1).max(start);
@@ -33,6 +42,7 @@ impl Out {
             src,
             out: (start, end),
             notes,
+            trace,
             written: None,
         });
     }

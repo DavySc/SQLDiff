@@ -306,6 +306,7 @@ mod tree_report {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            deployment: Default::default(),
             catalogs: Vec::new(),
             catalogs_b: Vec::new(),
         }
@@ -417,6 +418,7 @@ mod empty_files {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            deployment: Default::default(),
             catalogs: Vec::new(),
             catalogs_b: Vec::new(),
         };

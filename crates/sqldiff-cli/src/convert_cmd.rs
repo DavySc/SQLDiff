@@ -18,6 +18,11 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
     }
     print!("{}", tree::summary(&w.tree.report));
     print!("{}", sqldiff_convert::queue::summary(&w.queue));
+    if let Some((c, path)) = &w.certificates {
+        let (confirmed, all) = c.counts();
+        println!("certificates: {confirmed} of {all} routines confirmed by the proof checker");
+        eprintln!("wrote {}", path.display());
+    }
     let [json, md, qjson, qmd] = &w.reports;
     eprintln!(
         "wrote {}, {}, {} and {}",
@@ -26,5 +31,23 @@ pub fn run(a: Args) -> Result<ExitCode, String> {
         qjson.display(),
         qmd.display()
     );
+    if a.proof.mode == sqldiff_core::proof::Mode::Require {
+        let why = match &w.certificates {
+            Some((c, _)) => c.gate(&w, &a.tree.deployment),
+            None => vec!["no certificates".to_string()],
+        };
+        if why.is_empty() {
+            println!("release gate: passed (every routine confirmed, every assumption accepted)");
+            // The gate is the exit code: where the engine did not compare,
+            // the proof stands.
+            return Ok(ExitCode::SUCCESS);
+        } else {
+            println!("release gate: a review is still needed");
+            for y in &why {
+                println!("  {y}");
+            }
+            return Ok(ExitCode::from(1));
+        }
+    }
     Ok(ExitCode::from(if w.tree.report.ok() { 0 } else { 1 }))
 }

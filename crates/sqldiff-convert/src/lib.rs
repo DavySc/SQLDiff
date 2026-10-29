@@ -16,6 +16,7 @@ use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
 pub mod base;
+pub mod cert;
 pub mod drift;
 pub mod gate;
 pub mod instances;
@@ -76,6 +77,36 @@ pub struct Note {
     pub text: String,
 }
 
+/// One rewrite the rules made: which rule, on which input bytes. Unlike a
+/// [`Note`], a step never decides a unit's status; it records how the output
+/// came from the input, for the certificate's trace (docs/verified-conversion.md),
+/// and is an untrusted hint to a checker. Every rewrite leaves one, including
+/// those that need no assumption; a token copied unchanged leaves none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Step {
+    /// Stable rule id, `tsql.<area>.<name>` (e.g. `tsql.func.len`), or the
+    /// id of the note the rule also writes where it has one (`tsql.merge`).
+    pub rule: String,
+    /// Byte offsets in the input of the text the rule rewrote.
+    pub start: usize,
+    pub end: usize,
+    /// What the rule was applied with, when its id alone does not say
+    /// (the target type, the variable's new name, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inst: Option<String>,
+}
+
+/// A unit's text as the trace's completeness rule compares it: without
+/// whitespace and statement terminators, in lower case. A unit whose input
+/// and output differ by more than that was rewritten, and its trace names at
+/// least one rule (checked in debug builds and by the corpus test).
+pub fn trace_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_whitespace() && *c != ';')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// A span in the input or the output.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Span {
@@ -95,6 +126,9 @@ pub struct Span {
 pub struct Unit {
     pub status: Status,
     pub notes: Vec<Note>,
+    /// The rewrites the rules made in this unit, in the order they made
+    /// them. Empty for a unit written by hand.
+    pub trace: Vec<Step>,
     pub src: Span,
     pub out: Span,
     /// Indices into `report.findings` that point into this unit.
@@ -251,6 +285,7 @@ impl Draft {
             if k == i {
                 u.out = (s, s + text.len());
                 u.notes = kept_notes(&note, &u.notes);
+                u.trace.clear();
                 u.written = Some(written.clone());
             } else {
                 u.out = (shift(u.out.0), shift(u.out.1));
@@ -366,6 +401,7 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
             Unit {
                 status: notes.first().map_or(Status::Converted, |n| n.status),
                 notes,
+                trace: u.trace,
                 src: span(input, &li, &ui, u.src),
                 out: span(&raw.text, &lo, &uo, u.out),
                 findings: Vec::new(),
@@ -667,6 +703,7 @@ pub fn splice_unit(
         u.out = span(&c.output, &lo, &uo, (a, b));
         if k == i {
             u.notes = kept_notes(&note, &u.notes);
+            u.trace.clear();
             u.findings.clear();
             u.output_findings.clear();
             u.checked = Status::Unproven;
@@ -735,6 +772,12 @@ fn refuse_all(root: &sqldiff_syntax::SyntaxNode, text: &str, reason: &str, rule:
                 status: Status::NotConverted,
                 rule: rule.into(),
                 text: reason.to_string(),
+            }],
+            vec![Step {
+                rule: rule.into(),
+                start: s,
+                end: e,
+                inst: None,
             }],
         );
     }

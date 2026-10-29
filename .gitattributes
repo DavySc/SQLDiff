@@ -5,3 +5,9 @@ scripts/hooks/* text eol=lf
 # Fixtures are compared byte for byte and edited by string replacement in tests;
 # a CRLF checkout on Windows breaks them.
 tests/fixtures/* text eol=lf
+
+# Generated files compared byte for byte with what the code generates
+# (crates/sqldiff-core/tests/{assumptions,lean_syntax}.rs).
+docs/assumptions.md text eol=lf
+formal/lean/Sqldiff/Syntax.lean text eol=lf
+formal/lean/Sqldiff/Ast.lean text eol=lf

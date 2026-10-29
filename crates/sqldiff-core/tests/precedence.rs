@@ -9,12 +9,12 @@ fn postgres_concatenation_and_addition_are_not_regrouped() {
     let b = Artifact::new("b.sql", Dialect::Postgres, "SELECT ('a' || 1) + 2 AS x;\n");
     let r = diff(&a, &b, &Options::default());
     assert!(
-        !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
         "{:?}",
-        r.verdict
+        r.verdict()
     );
     // The grouping PostgreSQL applies anyway is equal.
     let c = Artifact::new("c.sql", Dialect::Postgres, "SELECT 'a' || (1 + 2) AS x;\n");
     let r = diff(&a, &c, &Options::default());
-    assert_eq!(r.verdict, Verdict::Equal, "{:?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Equal, "{:?}", r.findings);
 }

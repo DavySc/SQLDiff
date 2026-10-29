@@ -832,6 +832,7 @@ fn empty() -> Loaded {
                 unreadable: Vec::new(),
                 totals: Default::default(),
                 ledger: None,
+                deployment: None,
             },
             outputs: Vec::new(),
             conversions: Vec::new(),

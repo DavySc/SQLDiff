@@ -510,7 +510,7 @@ impl Session {
         let snap = sqldiff_review::snapshot(&r);
         e.dialect_a = r.a.dialect.clone();
         e.dialect_b = r.b.as_ref().map(|b| b.dialect.clone()).unwrap_or_default();
-        e.verdict = Some(r.verdict);
+        e.verdict = Some(r.verdict());
         e.highest_class = r.highest_class();
         e.severity = r.findings.iter().map(|f| f.severity).max();
         e.findings = r.findings.len();
@@ -568,7 +568,7 @@ impl Session {
                         r
                     }
                 };
-                if denied.verdict != base.verdict {
+                if denied.verdict() != base.verdict() {
                     row.flips_verdict.push(i);
                 }
             }

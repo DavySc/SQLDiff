@@ -186,11 +186,7 @@ pub fn relabel(r: &mut Report, flips: &Flips) {
             .collect()
     };
     crate::session::confirm_assumptions(r, &ids(true));
-    let before = r.verdict;
     crate::session::deny_assumptions(r, &ids(false));
-    if r.verdict != before && !r.suppressed.is_empty() {
-        r.verdict = r.open_verdict();
-    }
 }
 
 /// Diff under flips: scenario flips re-run the analysis, the rest relabel.

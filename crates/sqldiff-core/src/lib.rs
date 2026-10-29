@@ -5,6 +5,7 @@
 //! equivalent is reported as "unknown" or "equal under assumptions".
 
 pub mod artifact;
+pub mod assumptions;
 pub mod bind;
 pub mod catalog;
 pub mod classify;
@@ -20,10 +21,13 @@ pub mod ledger;
 pub mod lint;
 pub mod model;
 pub mod normalize;
+pub mod observer;
 pub mod phrase;
+pub mod proof;
 pub mod render;
 pub mod rules;
 pub mod session;
+pub mod target;
 pub mod tokens;
 pub mod treediff;
 

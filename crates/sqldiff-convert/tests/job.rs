@@ -43,6 +43,7 @@ impl Fixture {
                 template: None,
                 extensions: tree::extensions(Vec::new()),
                 helpers: Vec::new(),
+                deployment: Default::default(),
                 catalogs: Vec::new(),
                 catalogs_b: Vec::new(),
             },
@@ -51,6 +52,8 @@ impl Fixture {
             discard_edits: false,
             instances: None,
             queue_all: false,
+            proof: Default::default(),
+            row_counts: false,
         }
     }
 }

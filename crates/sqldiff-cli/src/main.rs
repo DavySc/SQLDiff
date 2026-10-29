@@ -16,6 +16,7 @@ use sqldiff_source::{compose, tree, Resolved};
 use sqldiff_syntax::ast;
 
 mod changes_cmd;
+mod checker;
 mod convert_cmd;
 mod deny_hash;
 mod dist_cmd;
@@ -53,8 +54,15 @@ enum Command {
     ///
     /// Without a dialect flag, a side's dialect comes from `dialect_map` or
     /// the path convention (`tsql/x.sql`, `x.pg.sql`).
+    ///
+    /// A is the reference (the original, the old version): "equal" means
+    /// every outcome B can have, A can have too. B may be more deterministic
+    /// (an added ORDER BY), so swapping the sides can change the verdict;
+    /// the report says whether the two are also equivalent.
     Diff {
+        /// The reference side.
         a: PathBuf,
+        /// The side checked against it.
         b: PathBuf,
         /// Dialect of both sides (overridden by --dialect-a / --dialect-b).
         #[arg(short, long)]
@@ -462,11 +470,48 @@ fn emit(report: Report, format: Format, pipe: &mut Pipeline) -> Result<(), Strin
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match sqldiff_core::with_engine_stack(|| run(cli)) {
+    let code = match sqldiff_core::with_engine_stack(|| run(cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("sqldiff: {e}");
             ExitCode::from(2)
+        }
+    };
+    lifecycle_notices();
+    code
+}
+
+/// The proof gate for a run: the mode, and `sqldiff-check` when the mode
+/// needs it and it is found. A checker that does not start leaves none, so
+/// every "equal" is unconfirmed (and "unknown" under `require`).
+pub(crate) fn proof_settings(mode: sqldiff_core::proof::Mode) -> sqldiff_core::proof::Settings {
+    use sqldiff_core::proof::{Mode, Settings};
+    let checker = match mode {
+        Mode::Off => None,
+        _ => checker::find().and_then(|p| match checker::Subprocess::new(p) {
+            Ok(c) => {
+                Some(std::sync::Arc::new(c) as std::sync::Arc<dyn sqldiff_core::proof::Checker>)
+            }
+            Err(e) => {
+                eprintln!("sqldiff: note: {e}");
+                None
+            }
+        }),
+    };
+    Settings { mode, checker }
+}
+
+/// One line per analysed target that is in preview, legacy or retired, or
+/// near its next lifecycle change (`profiles/lifecycle.toml`). The analysis
+/// never reads the clock; only this front end does.
+fn lifecycle_notices() {
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    let today = sqldiff_core::target::date_from_days((now.as_secs() / 86_400) as i64);
+    for (d, v) in sqldiff_core::target::used() {
+        if let Some(n) = sqldiff_core::target::notice(d, &v, &today) {
+            eprintln!("sqldiff: note: {n}");
         }
     }
 }
@@ -642,6 +687,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers,
+                    deployment: resolved.deployment.clone(),
                     catalogs,
                     catalogs_b,
                 },
@@ -689,6 +735,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                     template,
                     extensions: sqldiff_convert::tree::extensions(extensions),
                     helpers,
+                    deployment: resolved.deployment.clone(),
                     catalogs,
                     catalogs_b,
                 },
@@ -697,6 +744,9 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
                 discard_edits,
                 instances,
                 queue_all,
+                proof: resolved.proof.clone(),
+                row_counts: resolved.options().observer.row_counts
+                    == sqldiff_core::observer::RowCounts::Always,
             })
         }
         Command::Instances(args) => instances_cmd::run(args),
@@ -865,7 +915,7 @@ fn tree(
                 let _ = writeln!(
                     out,
                     "{:<26} {:<14} {:>8}  {}{} ↔ {}{}",
-                    r.verdict.label(),
+                    r.verdict().label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
                     r.findings.len(),
                     r.a.path,

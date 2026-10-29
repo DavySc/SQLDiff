@@ -39,6 +39,7 @@ impl Fixture {
             template: Some(TemplateMode::new(&def, None).unwrap()),
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            deployment: Default::default(),
             catalogs: Vec::new(),
             catalogs_b: Vec::new(),
         };

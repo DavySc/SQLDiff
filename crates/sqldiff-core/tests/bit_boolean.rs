@@ -61,18 +61,18 @@ fn check(cases: &[(&str, &str, Want)], db: Dialect) {
     let mut bad = Vec::new();
     for (a, b, want) in cases {
         let r = run(a, b, db);
-        let equal = matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions);
+        let equal = matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions);
         let ok = match want {
             Eq => equal,
-            Diff => r.verdict == Verdict::Different,
+            Diff => r.verdict() == Verdict::Different,
             NotEq => !equal,
-            Unknown => r.verdict == Verdict::Unknown,
+            Unknown => r.verdict() == Verdict::Unknown,
         };
         if !ok {
             let rules: Vec<_> = r.findings.iter().map(|f| f.rule.as_str()).collect();
             bad.push(format!(
                 "{want:?}: got {:?} {rules:?}\n  A: {a}\n  B: {b}",
-                r.verdict
+                r.verdict()
             ));
         }
     }
@@ -460,7 +460,7 @@ fn kept_comparison_names_the_postgres_error() {
         "Id FROM Flags WHERE IsActive = 1",
         Dialect::Postgres,
     );
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let f = r
         .findings
         .iter()

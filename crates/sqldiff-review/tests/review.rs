@@ -166,7 +166,7 @@ fn store_encrypted_at_rest() {
 #[test]
 fn accepted_findings_are_suppressed() {
     let mut r = report();
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let n = r.findings.len();
     assert!(n >= 1);
     let fp = r.findings[0].fingerprint.clone();
@@ -212,7 +212,7 @@ fn accepted_findings_are_suppressed() {
         .justification
         .contains("accepted by dana: intended"));
     assert_eq!(r.verdict_before_suppression, Some(Verdict::Different));
-    assert_eq!(r.verdict, r.open_verdict(), "verdict is the open verdict");
+    assert_eq!(r.verdict(), r.open_verdict(), "verdict is the open verdict");
     if r.findings.iter().all(|f| f.verdict != Verdict::Different) {
         assert_ne!(r.open_verdict(), Verdict::Different);
     }
@@ -335,7 +335,7 @@ fn redacted_export_passes_leak_check() {
     assert_ne!(render::json(&other.redact_report(&r)), json);
     // Structure survives: fingerprints and verdicts are not touched.
     assert_eq!(out.findings[0].fingerprint, r.findings[0].fingerprint);
-    assert_eq!(out.verdict, r.verdict);
+    assert_eq!(out.verdict(), r.verdict());
 
     // Excerpts can be dropped entirely.
     let mut drop = Redactor::from_config(&cfg).unwrap();
@@ -565,7 +565,7 @@ fn redaction_never_touches_keys_enums_or_hashes() {
         let out = red.redact_report(&r);
         let json = render::json(&out);
         let back: Report = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.verdict, r.verdict);
+        assert_eq!(back.verdict(), r.verdict());
         assert_eq!(back.a.content_hash, r.a.content_hash);
         for (x, y) in back.findings.iter().zip(&r.findings) {
             assert_eq!(x.fingerprint, y.fingerprint);
@@ -620,7 +620,7 @@ fn whole_body_finding_is_not_hidden_by_an_inner_marker() {
     f.a = Some(loc);
     r.findings = vec![f];
     assert_eq!(markers::apply(&mut r, &text, None, &cfg).suppressed, 1);
-    assert_eq!(r.verdict, r.open_verdict());
+    assert_eq!(r.verdict(), r.open_verdict());
     assert!(r.verdict_before_suppression.is_some());
 }
 

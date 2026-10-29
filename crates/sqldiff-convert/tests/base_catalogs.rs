@@ -60,6 +60,7 @@ impl Fixture {
             helpers: Vec::new(),
             catalogs: catalogs.iter().map(|c| self.path(c)).collect(),
             catalogs_b: Vec::new(),
+            deployment: Default::default(),
         }
     }
 
@@ -181,6 +182,8 @@ fn base_ddl_is_not_written_listed_or_counted() {
         discard_edits: false,
         instances: None,
         queue_all: false,
+        proof: Default::default(),
+        row_counts: false,
     };
     let w = convert_into(&job, &Hooks::default()).unwrap();
     let mut written: Vec<String> = std::fs::read_dir(fx.path("out"))
@@ -487,6 +490,8 @@ fn a_catalog_only_procedure_changes_the_rules_and_the_ledger_follows_its_content
         discard_edits: false,
         instances: None,
         queue_all: false,
+        proof: Default::default(),
+        row_counts: false,
     };
     let w = convert_into(
         &job(fx.args(&["base/orders.sql", "base/procs.sql"])),
@@ -616,6 +621,8 @@ fn bad_catalogs_are_refused_before_anything_is_written() {
             discard_edits: false,
             instances: None,
             queue_all: false,
+            proof: Default::default(),
+            row_counts: false,
         };
         let e = convert_into(&job, &Hooks::default()).err().unwrap();
         assert!(!fx.path("out").exists(), "{e}");

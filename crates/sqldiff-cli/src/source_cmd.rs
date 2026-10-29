@@ -44,6 +44,16 @@ pub struct ConfigArgs {
     /// $SQLDIFF_DATA_DIR or the platform data directory).
     #[arg(long, value_name = "DIR")]
     data_dir: Option<PathBuf>,
+    /// Proof gate for "equal" verdicts: off, report (record whether
+    /// sqldiff-check confirms it) or require (an unconfirmed "equal" becomes
+    /// "unknown"). With `convert`: report writes certificates.json, one
+    /// certificate per converted routine; require also runs the release
+    /// gate (exit 1 while anything still needs a review). Experimental: the
+    /// checker covers only a slice of T-SQL so far, so most real routines
+    /// stay unconfirmed. See docs/verification-roadmap.md, decision 3, and
+    /// docs/verified-conversion.md.
+    #[arg(long, value_name = "MODE", default_value = "off")]
+    proof: sqldiff_core::proof::Mode,
 }
 
 pub fn key_value(s: &str) -> Result<(String, String), String> {
@@ -159,7 +169,9 @@ impl ConfigArgs {
                 l
             },
         };
-        Resolved::load(&sources).map_err(|e| e.0)
+        let mut cfg = Resolved::load(&sources).map_err(|e| e.0)?;
+        cfg.proof = crate::proof_settings(self.proof);
+        Ok(cfg)
     }
 }
 
@@ -517,7 +529,7 @@ fn pairs(
     let mut reports: Vec<Report> = run.pairs.into_iter().map(|x| x.report).collect();
     reports.sort_by_key(|r| {
         std::cmp::Reverse((
-            r.verdict,
+            r.verdict(),
             r.findings.iter().map(|f| f.severity).max(),
             r.findings.len(),
         ))
@@ -543,7 +555,7 @@ fn pairs(
             for r in &reports {
                 println!(
                     "{:<26} {:<14} {:>8}  {} ↔ {}",
-                    r.verdict.label(),
+                    r.verdict().label(),
                     r.highest_class().map(|c| c.label()).unwrap_or("-"),
                     r.findings.len(),
                     r.a.path,
@@ -561,7 +573,7 @@ fn pairs(
     }
     let worst = reports
         .iter()
-        .map(|r| r.verdict)
+        .map(|r| r.verdict())
         .max()
         .unwrap_or(Verdict::Equal);
     let incomplete = !p.unpaired.is_empty() || !p.ambiguous.is_empty() || !p.missing.is_empty();

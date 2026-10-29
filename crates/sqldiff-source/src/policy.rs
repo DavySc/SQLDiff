@@ -1,6 +1,6 @@
 //! Pack policy applied to engine reports: severity and class overrides,
-//! declared assumptions, limit rules, staleness, author markers and
-//! template placeholders.
+//! declared assumptions, the deployment profile's acceptances, limit rules,
+//! staleness, author markers and template placeholders.
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,8 @@ pub fn apply(report: &mut Report, config: &Resolved) {
             a.text = text.clone();
         }
     }
+    // The deployment profile names what it accepts; the verdict stays.
+    config.deployment.apply(report);
 }
 
 /// Caps the verdict at unknown when a side is stale generated output.
@@ -40,9 +42,7 @@ pub fn cap_stale(report: &mut Report, stale_a: bool, stale_b: bool) {
     report.unknown_reasons.push(format!(
         "side {side} is flagged stale by its source (generated output older than its inputs)"
     ));
-    if report.verdict < Verdict::Unknown {
-        report.verdict = Verdict::Unknown;
-    }
+    report.settle();
 }
 
 /// Findings of class `limit` for one artifact.
@@ -150,9 +150,7 @@ pub fn add_limits(report: &mut Report, a: &Artifact, b: Option<&Artifact>, confi
         report.findings.extend(limit_findings(b, Side::B, config));
     }
     if report.findings.len() > before {
-        report.verdict = report
-            .verdict
-            .max(sqldiff_core::session::derive_verdict(report));
+        report.settle();
     }
 }
 

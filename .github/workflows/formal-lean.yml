@@ -1,0 +1,109 @@
+name: Lean checker
+
+# The Lean side of the verification roadmap (docs/verification-roadmap.md):
+# build `sqldiff-check` for every release target, check that its theorems use
+# only allowed axioms, run its protocol tests, and measure start-up,
+# throughput, size and linked libraries (decision 2 budgets). On Linux the
+# Rust CLI's proof tests also run against the built checker.
+#
+# Spike results that shaped this file: a static glibc link crashed on start,
+# so Linux ships a glibc-linked checker (glibc 2.14 or newer) beside the musl
+# CLI; Lean 4.19's own linker produced macOS binaries dyld refuses
+# ("__DATA_CONST segment missing SG_READ_ONLY flag"), Lean 4.35 does not.
+
+# Every change to the checker, the request format it reads, the generated
+# Lean syntax types, or the CLI code that runs it builds and tests it, on
+# pull requests and on main.
+on:
+  push:
+    branches: [main, verification]
+    paths:
+      - "formal/lean/**"
+      - ".github/workflows/formal-lean.yml"
+      # The request format and the generated Lean syntax types.
+      - "crates/sqldiff-core/src/proof.rs"
+      - "crates/sqldiff-syntax/src/kind.rs"
+      - "crates/sqldiff-syntax/src/encode.rs"
+      # The CLI side of the protocol (`the_real_checker`).
+      - "crates/sqldiff-cli/src/checker.rs"
+      - "crates/sqldiff-cli/tests/proof.rs"
+  pull_request:
+    paths:
+      - "formal/lean/**"
+      - ".github/workflows/formal-lean.yml"
+      # The request format and the generated Lean syntax types.
+      - "crates/sqldiff-core/src/proof.rs"
+      - "crates/sqldiff-syntax/src/kind.rs"
+      - "crates/sqldiff-syntax/src/encode.rs"
+      # The CLI side of the protocol (`the_real_checker`).
+      - "crates/sqldiff-cli/src/checker.rs"
+      - "crates/sqldiff-cli/tests/proof.rs"
+  workflow_dispatch:
+
+jobs:
+  checker:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, label: linux-x64, arch: "" }
+          - { os: macos-latest, label: macos-arm64, arch: "" }
+          # Release builds make macOS x64 on an arm64 runner; Lean has no
+          # cross compiler, so this runs the x86_64 toolchain under Rosetta.
+          - { os: macos-latest, label: macos-x64, arch: "arch -x86_64" }
+          - { os: windows-latest, label: windows-x64, arch: "" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: formal/lean
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install elan (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o elan-init.sh
+          ${{ matrix.arch }} sh elan-init.sh -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Install elan (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.ps1 -o elan-init.ps1
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+          .\elan-init.ps1 -NoPrompt $true -DefaultToolchain none
+          echo "$env:USERPROFILE\.elan\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build
+        run: |
+          ${{ matrix.arch }} lake --version
+          ${{ matrix.arch }} lake build
+          ls -l .lake/build/bin
+      - name: Axioms
+        run: ${{ matrix.arch }} lake env lean Axioms.lean | python3 check_axioms.py
+      - name: Protocol tests and measurements
+        run: |
+          exe=.lake/build/bin/sqldiff_check
+          [ -f "$exe.exe" ] && exe="$exe.exe"
+          otool -L "$exe" 2>/dev/null || true
+          if [ "$RUNNER_OS" = Linux ]; then
+            echo "newest glibc symbol version needed:"
+            objdump -T "$exe" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          fi
+          ${{ matrix.arch }} "$exe" --version
+          python3 test_gate.py "$exe"
+          python3 measure.py "$exe" | tee measure-${{ matrix.label }}.json
+      - name: The Rust CLI against the real checker
+        if: runner.os == 'Linux'
+        working-directory: .
+        run: |
+          SQLDIFF_REAL_CHECK="$PWD/formal/lean/.lake/build/bin/sqldiff_check" \
+            cargo test -p sqldiff-cli --test proof the_real_checker -- --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqldiff-check-${{ matrix.label }}
+          path: |
+            formal/lean/.lake/build/bin/sqldiff_check*
+            formal/lean/measure-${{ matrix.label }}.json

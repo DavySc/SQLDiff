@@ -46,7 +46,12 @@ fn rewritten_select_of_rand_is_unknown_not_different() {
         ),
     ] {
         let r = run(&tsql_proc(a), &tsql_proc(b), T);
-        assert_eq!(r.verdict, Verdict::Unknown, "{a} | {b}: {:#?}", r.findings);
+        assert_eq!(
+            r.verdict(),
+            Verdict::Unknown,
+            "{a} | {b}: {:#?}",
+            r.findings
+        );
         assert!(!unpaired(&r), "{a} | {b}: {:?}", rules(&r));
         assert!(rules(&r).contains(&"stmt.modified"), "{:?}", rules(&r));
     }
@@ -60,7 +65,7 @@ fn rewritten_plpgsql_return_is_unknown_not_different() {
         )
     };
     let r = run(&f("floor(random())::int"), &f("0"), P);
-    assert_eq!(r.verdict, Verdict::Unknown, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Unknown, "{:#?}", r.findings);
     assert!(!unpaired(&r), "{:?}", rules(&r));
 }
 
@@ -74,7 +79,7 @@ fn rewritten_select_that_differs_is_still_different() {
     ] {
         let r = run(&tsql_proc(a), &tsql_proc(b), T);
         assert_eq!(
-            r.verdict,
+            r.verdict(),
             Verdict::Different,
             "{a} | {b}: {:#?}",
             r.findings
@@ -90,7 +95,7 @@ fn extra_result_set_is_still_different() {
         &tsql_proc("SELECT 0e0 AS y; SELECT 0e0 AS z;"),
         T,
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert!(rules(&r).contains(&"stmt.added"), "{:?}", rules(&r));
 }
 
@@ -101,7 +106,7 @@ fn statements_of_different_kinds_are_not_paired() {
         &tsql_proc("UPDATE t SET a = 0;"),
         T,
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:#?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:#?}", r.findings);
     assert!(rules(&r).contains(&"stmt.removed"), "{:?}", rules(&r));
     assert!(rules(&r).contains(&"stmt.added"), "{:?}", rules(&r));
 }

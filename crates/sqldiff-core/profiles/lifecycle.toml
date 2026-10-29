@@ -1,0 +1,174 @@
+# Vendor lifecycle of each dialect version SQLDiff knows (RDBMS versions in
+# docs/verification-roadmap.md). A version's status follows from the date:
+#
+#   preview    before `released` (or `released` absent)
+#   supported  until `support_ends` (vendor standard, mainstream or extended
+#              support; absent: no end announced)
+#   legacy     until `legacy_ends` (a paid extension, or 12 months after
+#              `support_ends`)
+#   retired    after that
+#
+# Dates are `YYYY-MM-DD`, or `YYYY-MM` where only the month is known (read as
+# the first of the month). `checked` says whether a person read the dates on
+# the vendor's own lifecycle page (`verified`) or they come from secondary
+# sources (`unverified`); AI may draft entries, a person verifies them.
+#
+# T-SQL keys: a SQL Server release by year; `mi-2022` and `mi-2025` are Azure
+# SQL Managed Instance update policies (they upgrade themselves at the end of
+# that release's mainstream support); `mi-evergreen`, `azure` and `fabric` are
+# evergreen (Always-up-to-date, Azure SQL Database, Fabric SQL database).
+
+[[postgres]]
+version = "13"
+released = "2020-09-24"
+support_ends = "2025-11-13"
+legacy_ends = "2026-11-13"
+source = "https://www.postgresql.org/support/versioning/"
+checked = "unverified"
+
+[[postgres]]
+version = "14"
+released = "2021-09-30"
+support_ends = "2026-11-12"
+legacy_ends = "2027-11-12"
+source = "https://www.postgresql.org/support/versioning/"
+checked = "unverified"
+
+[[postgres]]
+version = "15"
+released = "2022-10-13"
+support_ends = "2027-11"
+legacy_ends = "2028-11"
+source = "https://www.postgresql.org/support/versioning/"
+checked = "unverified"
+
+[[postgres]]
+version = "16"
+released = "2023-09-14"
+support_ends = "2028-11"
+legacy_ends = "2029-11"
+source = "https://www.postgresql.org/support/versioning/"
+checked = "unverified"
+
+[[postgres]]
+version = "17"
+released = "2024-09-26"
+support_ends = "2029-11"
+legacy_ends = "2030-11"
+source = "https://www.postgresql.org/support/versioning/"
+checked = "unverified"
+
+[[postgres]]
+version = "18"
+released = "2025-09-25"
+support_ends = "2030-11"
+legacy_ends = "2031-11"
+source = "https://www.postgresql.org/support/versioning/"
+checked = "unverified"
+
+[[postgres]]
+version = "19"
+source = "https://www.postgresql.org/developer/roadmap/"
+checked = "unverified"
+
+[[tsql]]
+version = "2016"
+released = "2016-06-01"
+support_ends = "2026-07-14"
+legacy_ends = "2029-07-17"
+source = "https://learn.microsoft.com/en-us/lifecycle/products/sql-server-2016"
+checked = "unverified"
+
+[[tsql]]
+version = "2017"
+released = "2017-10-02"
+support_ends = "2027-10-12"
+legacy_ends = "2028-10-12"
+source = "https://learn.microsoft.com/en-us/lifecycle/products/sql-server-2017"
+checked = "unverified"
+
+[[tsql]]
+version = "2019"
+released = "2019-11-04"
+support_ends = "2030-01-08"
+legacy_ends = "2031-01-08"
+source = "https://learn.microsoft.com/en-us/lifecycle/products/sql-server-2019"
+checked = "unverified"
+
+[[tsql]]
+version = "2022"
+released = "2022-11-16"
+support_ends = "2033-01-11"
+legacy_ends = "2034-01-11"
+source = "https://learn.microsoft.com/en-us/lifecycle/products/sql-server-2022"
+checked = "unverified"
+
+[[tsql]]
+version = "2025"
+released = "2025-11"
+support_ends = "2036-01-06"
+legacy_ends = "2037-01-06"
+source = "https://learn.microsoft.com/en-us/sql/sql-server/end-of-support/sql-server-end-of-support-overview"
+checked = "unverified"
+
+[[tsql]]
+version = "mi-2022"
+released = "2022-11-16"
+support_ends = "2028-01-11"
+legacy_ends = "2028-01-11"
+source = "https://learn.microsoft.com/en-us/azure/azure-sql/managed-instance/update-policy"
+checked = "unverified"
+
+[[tsql]]
+version = "mi-2025"
+released = "2025-11"
+support_ends = "2031-01-06"
+legacy_ends = "2031-01-06"
+source = "https://learn.microsoft.com/en-us/azure/azure-sql/managed-instance/update-policy"
+checked = "unverified"
+
+[[tsql]]
+version = "mi-evergreen"
+released = "2022-11-16"
+source = "https://learn.microsoft.com/en-us/azure/azure-sql/managed-instance/update-policy"
+checked = "unverified"
+
+[[tsql]]
+version = "azure"
+released = "2010-02-01"
+source = "https://learn.microsoft.com/en-us/azure/azure-sql/database/sql-database-paas-overview"
+checked = "unverified"
+
+[[tsql]]
+version = "fabric"
+released = "2024-11"
+source = "https://learn.microsoft.com/en-us/fabric/database/sql/overview"
+checked = "unverified"
+
+[[db2i]]
+version = "7.3"
+released = "2016-04-15"
+support_ends = "2023-09-30"
+legacy_ends = "2024-09-30"
+source = "https://www.ibm.com/support/pages/release-life-cycle"
+checked = "unverified"
+
+[[db2i]]
+version = "7.4"
+released = "2019-06-21"
+support_ends = "2026-09-30"
+legacy_ends = "2029-09-30"
+source = "https://www.ibm.com/support/pages/release-life-cycle"
+checked = "unverified"
+
+[[db2i]]
+version = "7.5"
+released = "2022-05-10"
+source = "https://www.ibm.com/support/pages/release-life-cycle"
+checked = "unverified"
+
+[[db2i]]
+version = "7.6"
+released = "2025-04-18"
+source = "https://www.ibm.com/support/pages/ibm-i760"
+checked = "unverified"

@@ -66,17 +66,17 @@ fn check(cases: &[(&str, &str, Want)], db: Dialect) {
     let mut bad = Vec::new();
     for (a, b, want) in cases {
         let r = run(a, b, db, true);
-        let equal = matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions);
+        let equal = matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions);
         let rules: Vec<_> = r.findings.iter().map(|f| f.rule.as_str()).collect();
         let ok = match want {
             Eq => equal,
-            Diff(rule) => r.verdict == Verdict::Different && rules.contains(rule),
-            Unknown => r.verdict == Verdict::Unknown,
+            Diff(rule) => r.verdict() == Verdict::Different && rules.contains(rule),
+            Unknown => r.verdict() == Verdict::Unknown,
         };
         if !ok {
             bad.push(format!(
                 "{want:?}: got {:?} {rules:?}\n  A: {a}\n  B: {b}\n  {:?}",
-                r.verdict,
+                r.verdict(),
                 r.findings.iter().map(|f| &f.witness).collect::<Vec<_>>()
             ));
         }
@@ -88,8 +88,8 @@ fn check(cases: &[(&str, &str, Want)], db: Dialect) {
                 .assumptions
                 .iter()
                 .any(|x| x.id.starts_with("ASM-UNTYPED"));
-            let equal = r.verdict == Verdict::Equal
-                || (r.verdict == Verdict::EqualUnderAssumptions && !untyped);
+            let equal = r.verdict() == Verdict::Equal
+                || (r.verdict() == Verdict::EqualUnderAssumptions && !untyped);
             if equal {
                 bad.push(format!("equal without catalogs\n  A: {a}\n  B: {b}"));
             }

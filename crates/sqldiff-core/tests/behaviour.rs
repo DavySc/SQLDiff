@@ -65,7 +65,7 @@ fn m05_table_variable_replaced_by_temp_table() {
 #[test]
 fn m06_continue_handler_removed() {
     let r = mutation("m06-continue-handler-removed", Dialect::Db2i);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let f = finding(&r, "error.contract");
     assert_eq!(f.verdict, Verdict::Different);
     assert!(
@@ -175,7 +175,7 @@ fn identical_routines_have_no_behavioural_findings() {
             &Artifact::new("b.sql", d, t),
             &Options::default(),
         );
-        assert_eq!(r.verdict, Verdict::Equal, "{case}: {:#?}", r.findings);
+        assert_eq!(r.verdict(), Verdict::Equal, "{case}: {:#?}", r.findings);
     }
 }
 

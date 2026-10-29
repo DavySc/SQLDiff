@@ -57,6 +57,7 @@ impl Fixture {
             template: None,
             extensions: tree::extensions(Vec::new()),
             helpers: Vec::new(),
+            deployment: Default::default(),
             catalogs: Vec::new(),
             catalogs_b: Vec::new(),
         }
@@ -545,6 +546,7 @@ fn a_decision_follows_the_base_catalogs_contents() {
         helpers: Vec::new(),
         catalogs: vec![dir.join("base/t.sql")],
         catalogs_b: Vec::new(),
+        deployment: Default::default(),
     };
     let out = dir.join("out");
     let (inputs, unreadable) = tree::read(&a()).unwrap();

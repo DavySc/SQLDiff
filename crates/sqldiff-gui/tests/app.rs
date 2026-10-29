@@ -75,6 +75,7 @@ fn review(d: &Dir) -> Review {
         template: None,
         extensions: tree::extensions(Vec::new()),
         helpers: Vec::new(),
+        deployment: Default::default(),
         catalogs: Vec::new(),
         catalogs_b: Vec::new(),
     };

@@ -236,8 +236,8 @@ fn unreadable_input_degrades_to_unknown() {
         format!("{PG_T}CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n  PERFORM 1 FROM @extschema@.t WHERE id = nope;\nEND $$;"),
     );
     let r = diff(&a, &b, &Options::default());
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
     // And B fixing an error A had is not silently dropped.
     let r = diff(&b, &a, &Options::default());
-    assert_ne!(r.verdict, Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }

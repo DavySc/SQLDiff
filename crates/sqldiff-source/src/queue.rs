@@ -113,7 +113,7 @@ pub fn run_with(
                 if let Some(why) = why {
                     r.unknown_reasons
                         .push(format!("{why}; compared as plain SQL"));
-                    r.verdict = sqldiff_core::session::derive_verdict(&r);
+                    r.settle();
                 }
                 r
             }

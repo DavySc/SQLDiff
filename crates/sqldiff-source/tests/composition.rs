@@ -60,7 +60,7 @@ fn diff(a: &Artifact, b: &Artifact, pack: &Pack, templates: Option<&TemplateDir>
 fn m23_dropped_part_is_the_finding() {
     let (a, b) = (m23("original"), m23("mutated"));
     let r = diff(&a, &b, &pack(), None);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let part = r
         .findings
         .iter()
@@ -133,7 +133,7 @@ fn composed_facts_do_not_weaken_equal() {
         .iter()
         .all(|x| x.source == AssumptionSource::ComposedOutput));
     assert!(!r.assumptions.is_empty());
-    assert_eq!(r.verdict, Verdict::Equal, "{r:#?}");
+    assert_eq!(r.verdict(), Verdict::Equal, "{r:#?}");
 }
 
 const GENERATED: &str = "\
@@ -181,7 +181,7 @@ fn check_mode_matches_and_mismatches() {
     let (_d, dir) = template_dir("  DELETE FROM {{SCHEMA}}.orders WHERE closed = 1;\n");
     let ok = check_mode(GENERATED, &dir, &params);
     assert!(ok.findings.is_empty(), "{:#?}", ok.findings);
-    assert_eq!(ok.verdict, Verdict::Equal, "{:?}", ok.unknown_reasons);
+    assert_eq!(ok.verdict(), Verdict::Equal, "{:?}", ok.unknown_reasons);
 
     // Someone edited the generated output by hand.
     let edited = GENERATED.replace("closed = 1", "closed = 1 AND archived = 1");
@@ -197,7 +197,7 @@ fn check_mode_matches_and_mismatches() {
         f.witness
     );
     assert_eq!(f.a.as_ref().unwrap().start_line, 6);
-    assert_eq!(bad.verdict, Verdict::Unknown);
+    assert_eq!(bad.verdict(), Verdict::Unknown);
 
     // No value for SCHEMA: the header cannot be checked, which is never hidden.
     let none = check_mode(GENERATED, &dir, &BTreeMap::new());
@@ -208,7 +208,7 @@ fn check_mode_matches_and_mismatches() {
         "{:?}",
         none.unknown_reasons
     );
-    assert_eq!(none.verdict, Verdict::Unknown);
+    assert_eq!(none.verdict(), Verdict::Unknown);
 }
 
 /// A dropped part holding a compound with a write inside stays DIFFERENT.
@@ -228,7 +228,7 @@ fn dropped_compound_part_is_different() {
         .find(|f| f.rule == "composition.part-removed")
         .expect("part finding");
     assert_eq!(f.verdict, Verdict::Different, "{}", f.witness);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
 }
 
 /// Check mode asked for without composition markers says so.
@@ -249,7 +249,7 @@ fn templates_without_markers_are_not_silent() {
         "{:?}",
         r.unknown_reasons
     );
-    assert_eq!(r.verdict, Verdict::Unknown);
+    assert_eq!(r.verdict(), Verdict::Unknown);
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn stale_adapter_composition_caps_at_unknown() {
         Some(Composed::new(&a, Some(&comp))),
         &opts,
     );
-    assert_eq!(r.verdict, Verdict::Unknown);
+    assert_eq!(r.verdict(), Verdict::Unknown);
     assert!(r.unknown_reasons.iter().any(|x| x.contains("stale")));
 }
 

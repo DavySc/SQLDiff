@@ -137,15 +137,56 @@ pub struct Assumption {
     /// Where the assumption was stated, e.g. `A:12` for side A line 12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cite: Option<String>,
+    /// The deployment profiles (`[deployment] accept`) that accept the
+    /// assumption. A reviewable fact only: the verdict does not change, and
+    /// an accepted assumption still makes a result "equal under assumptions".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_by: Vec<DeploymentSource>,
+}
+
+/// Where a deployment profile entry comes from: the config layer, and the
+/// pack and file that hold it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct DeploymentSource {
+    /// `shared_pack`, `private_pack`, `project`, `user` or `command_line`.
+    pub layer: String,
+    /// The pack's name, when a shared pack holds it. A private pack is
+    /// named by its file only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack: Option<String>,
+    /// The `pack.toml` or config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+}
+
+impl DeploymentSource {
+    /// `pack team (path/pack.toml)`, `project sqldiff.toml`, ...
+    pub fn label(&self) -> String {
+        let layer = self.layer.replace('_', " ");
+        match (&self.pack, &self.file) {
+            (Some(p), Some(f)) => format!("{layer} {p} ({f})"),
+            (Some(p), None) => format!("{layer} {p}"),
+            (None, Some(f)) => format!("{layer} {f}"),
+            (None, None) => layer,
+        }
+    }
 }
 
 impl Assumption {
+    /// An assumption the tool makes by default. The id must be in the
+    /// assumption registry (`crate::assumptions`); debug builds refuse one
+    /// that is not.
     pub fn default(id: &str, text: &str) -> Self {
+        debug_assert!(
+            crate::assumptions::lookup(id).is_some(),
+            "assumption id `{id}` is not registered in crates/sqldiff-core/profiles/assumptions.toml"
+        );
         Assumption {
             id: id.to_string(),
             text: text.to_string(),
             source: AssumptionSource::Default,
             cite: None,
+            accepted_by: Vec::new(),
         }
     }
 }
@@ -227,7 +268,10 @@ pub struct NoiseCounts {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
     pub tool_version: String,
-    pub verdict: Verdict,
+    /// Derived from the rest of the report by [`Report::settle`], never set
+    /// directly: a weaker verdict needs a finding, an unknown reason or an
+    /// assumption that says why. Read it with [`Report::verdict`].
+    pub(crate) verdict: Verdict,
     pub a: ArtifactInfo,
     pub b: Option<ArtifactInfo>,
     pub findings: Vec<Finding>,
@@ -253,6 +297,21 @@ pub struct Report {
     /// then the verdict over the open findings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_before_suppression: Option<Verdict>,
+    /// Why B only refines A, the reference: steps that hold one way
+    /// (decision 1). Empty when the two are equivalent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refinements: Vec<String>,
+    /// For an "equal" or "equal under assumptions" verdict: whether A also
+    /// refines B. Derived by [`Report::settle`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub equivalent: Option<bool>,
+    /// What the proof gate found (decision 3); absent when it is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<crate::proof::Proof>,
+    /// The verdict before `require` mode made an unconfirmed "equal"
+    /// "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_before_proof: Option<Verdict>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -297,18 +356,30 @@ impl Report {
         }
     }
 
-    /// After findings were moved to `suppressed`: records the engine's
-    /// verdict once in `verdict_before_suppression` and sets `verdict` to
-    /// the [`open_verdict`](Report::open_verdict), so text, JSON, SARIF and
-    /// exit codes agree.
-    pub fn settle_suppression(&mut self) {
+    pub fn verdict(&self) -> Verdict {
+        self.verdict
+    }
+
+    /// Derives the verdict again from the findings, unknown reasons and
+    /// assumptions (`session::derive_verdict`). With suppressed findings it
+    /// records the engine's verdict once in `verdict_before_suppression` and
+    /// takes the [`open_verdict`](Report::open_verdict), so text, JSON,
+    /// SARIF and exit codes agree. Every change to a report's verdict goes
+    /// through here.
+    pub fn settle(&mut self) {
         if self.suppressed.is_empty() {
-            return;
+            self.verdict = crate::session::derive_verdict(self);
+        } else {
+            if self.verdict_before_suppression.is_none() {
+                self.verdict_before_suppression = Some(self.verdict);
+            }
+            self.verdict = self.open_verdict();
         }
-        if self.verdict_before_suppression.is_none() {
-            self.verdict_before_suppression = Some(self.verdict);
-        }
-        self.verdict = self.open_verdict();
+        self.equivalent = matches!(
+            self.verdict,
+            Verdict::Equal | Verdict::EqualUnderAssumptions
+        )
+        .then(|| self.refinements.is_empty());
     }
 
     pub fn highest_class(&self) -> Option<ChangeClass> {

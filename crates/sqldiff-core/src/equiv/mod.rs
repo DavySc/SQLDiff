@@ -48,6 +48,10 @@ pub struct Outcome {
     pub structural: usize,
     /// Statement pairs proven equal.
     pub equal: usize,
+    /// Why B only refines A (`compare::Cmp::refinements`).
+    pub refinements: Vec<String>,
+    /// The statement pairs decided here (`coverage::unreceipted`).
+    pub receipts: Vec<crate::coverage::Receipt>,
 }
 
 impl Outcome {
@@ -60,6 +64,12 @@ impl Outcome {
     fn normalize(&mut self, s: String) {
         if !self.normalizations.contains(&s) {
             self.normalizations.push(s);
+        }
+    }
+
+    fn refine(&mut self, s: String) {
+        if !self.refinements.contains(&s) {
+            self.refinements.push(s);
         }
     }
 }
@@ -1968,6 +1978,9 @@ fn compare_pair(
     let ids: Vec<String> = asms.iter().map(|s| s.id.clone()).collect();
     if c.mismatches.is_empty() {
         out.equal += 1;
+        for r in c.refinements {
+            out.refine(r);
+        }
         if x.term.is("raw") {
             // Same dialect, same tokens.
         } else {
@@ -2155,7 +2168,13 @@ pub fn refine_modified(
                 eprintln!("=> {} {:?} {}", g.rule, g.verdict, g.witness);
             }
         }
+        let settled = crate::coverage::Receipt::Judged {
+            rule: "statement equivalence",
+            a: f.a.as_ref().map(crate::coverage::Part::at),
+            b: f.b.as_ref().map(crate::coverage::Part::at),
+        };
         if sub.findings.is_empty() {
+            out.receipts.push(settled);
             out.structural += 1;
             for s in sub.assumptions {
                 out.assume(s);
@@ -2163,7 +2182,11 @@ pub fn refine_modified(
             for nrm in sub.normalizations {
                 out.normalize(nrm);
             }
+            for r in sub.refinements {
+                out.refine(r);
+            }
         } else if sub.findings.iter().any(|g| g.verdict == Verdict::Different) {
+            out.receipts.push(settled);
             for s in sub.assumptions {
                 out.assume(s);
             }

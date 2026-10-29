@@ -78,7 +78,7 @@
     (insert (table ?t) (cols ?c...) (values (row ?v...)) (on-conflict (cols ?k...) (do-update (set ?sets...))))
     (bind ?conc atomic)
     (emit-any ?conc))
-  (require postgres (unique ?t ?k...) ASM-UPSERT-KEY-UNIQUE "A unique index or constraint covers the key columns (ON CONFLICT needs one, and the original matches at most one row)")
+  (require postgres (unique ?t ?k...) ASM-UPSERT-UNIQUE-INDEX "A unique index or constraint covers the key columns (ON CONFLICT needs one, and the original matches at most one row)")
   (note postgres decision "ON CONFLICT is atomic. The original checks and then writes, so two sessions can both miss the row and one INSERT fails with a duplicate key; the conversion removes that race." (if ?conc race))
   (note postgres converted "MERGE WITH (HOLDLOCK) serialises the upsert; ON CONFLICT is atomic as well." (if ?conc serialized)))
 
@@ -104,7 +104,7 @@
     (insert (table ?t) (cols ?c...) (values (row ?v...)) (on-conflict (cols ?k...) (do-nothing)))
     (bind ?conc atomic)
     (emit-any ?conc))
-  (require postgres (unique ?t ?k...) ASM-UPSERT-KEY-UNIQUE "A unique index or constraint covers the key columns (ON CONFLICT needs one, and the original matches at most one row)")
+  (require postgres (unique ?t ?k...) ASM-UPSERT-UNIQUE-INDEX "A unique index or constraint covers the key columns (ON CONFLICT needs one, and the original matches at most one row)")
   (note postgres decision "ON CONFLICT DO NOTHING is atomic. The original checks and then inserts, so a concurrent insert of the same key makes it fail with a duplicate key; the conversion removes that race." (if ?conc race)))
 
 ; ------------------------------------------------------------ delete-orphans

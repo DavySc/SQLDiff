@@ -44,14 +44,14 @@ fn isnull_equals_coalesce_only_when_the_replacement_fits() {
     let ok =
         "CREATE VIEW dbo.v AS SELECT customer_id, ISNULL(first_name, '') AS n FROM dbo.customer;";
     assert_eq!(
-        run(ok, T, pg, P, true).verdict,
+        run(ok, T, pg, P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
     let pg2 = "CREATE VIEW v AS SELECT customer_id, COALESCE(nick, email) AS n FROM customer;";
     let narrow =
         "CREATE VIEW dbo.v AS SELECT customer_id, ISNULL(nick, email) AS n FROM dbo.customer;";
     let r = run(narrow, T, pg2, P, true);
-    assert_eq!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.findings);
     assert!(rules(&r).contains(&"equiv.isnull-type"));
 }
 
@@ -72,11 +72,11 @@ fn upsert_spellings_and_the_missing_lock_hint() {
         )
     };
     assert_eq!(
-        run(&merge("WITH (HOLDLOCK)"), T, pg, P, true).verdict,
+        run(&merge("WITH (HOLDLOCK)"), T, pg, P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
     let r = run(&merge(""), T, pg, P, true);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(rules(&r).contains(&"equiv.upsert-race"));
 }
 
@@ -94,12 +94,12 @@ fn anti_join_delete_needs_the_null_test_on_a_join_column() {
         )
     };
     assert_eq!(
-        run(&ts("item_id"), T, pg, P, true).verdict,
+        run(&ts("item_id"), T, pg, P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
     // `i.name IS NULL` also keeps matched rows whose name is NULL: not the same rewrite.
     assert!(!matches!(
-        run(&ts("name"), T, pg, P, false).verdict,
+        run(&ts("name"), T, pg, P, false).verdict(),
         Verdict::Equal | Verdict::EqualUnderAssumptions
     ));
 }
@@ -132,7 +132,7 @@ fn delete_join_is_a_semi_join_in_every_spelling() {
     let both = "i.item_id = pf.item_id AND i.item_id > 100";
     let equal = |r: Report| {
         assert!(
-            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
             "{:?}",
             r.findings
         )
@@ -148,7 +148,7 @@ fn delete_join_is_a_semi_join_in_every_spelling() {
     ] {
         let r = run(&a, da, &b, db, true);
         assert!(
-            !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
             "{a}\n{b}"
         );
     }
@@ -170,7 +170,7 @@ fn delete_join_is_a_semi_join_in_every_spelling() {
     let (t, d) = bare("item_id");
     let r = run(&t, T, &d, D, true);
     assert!(
-        !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
         "{:?}",
         r.findings
     );
@@ -205,14 +205,14 @@ fn update_from_join_moves_the_target_condition_to_where() {
     let both = "f.item_id = p.item_id AND i.name IS NOT NULL";
     let equal = |r: Report| {
         assert!(
-            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
             "{:?}",
             r.findings
         )
     };
     let not_equal = |r: Report, why: &str| {
         assert!(
-            !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
             "{why}: {:?}",
             r.findings
         )
@@ -287,7 +287,7 @@ fn string_comparison_collation_is_explicit() {
     let pg = "CREATE FUNCTION f(p_email varchar(254)) RETURNS integer LANGUAGE plpgsql AS $$
       BEGIN RETURN (SELECT customer_id FROM customer WHERE email = p_email); END; $$;";
     let r = run(ts, T, pg, P, true);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(rules(&r).contains(&"equiv.case-sensitivity"));
     assert!(rules(&r).contains(&"equiv.trailing-spaces"));
     // Db2 pads like T-SQL; UPPER on both sides emulates case-insensitivity.
@@ -312,15 +312,15 @@ fn null_ordering_needs_a_not_null_key() {
         ),
     };
     assert_eq!(
-        run(&page(T, "created_at"), T, &page(P, "created_at"), P, true).verdict,
+        run(&page(T, "created_at"), T, &page(P, "created_at"), P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
     let r = run(&page(T, "shipped_at"), T, &page(P, "shipped_at"), P, true);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(rules(&r).contains(&"equiv.null-ordering"));
     // Without catalog facts the nullability is unknown: never equal.
     assert_eq!(
-        run(&page(T, "created_at"), T, &page(P, "created_at"), P, false).verdict,
+        run(&page(T, "created_at"), T, &page(P, "created_at"), P, false).verdict(),
         Verdict::Unknown
     );
 }
@@ -330,12 +330,12 @@ fn quoted_names_keep_their_case() {
     let a = "CREATE VIEW v AS SELECT \"Name\" FROM item;";
     let b = "CREATE VIEW V AS SELECT NAME FROM ITEM;";
     assert!(!matches!(
-        run(a, P, b, D, false).verdict,
+        run(a, P, b, D, false).verdict(),
         Verdict::Equal | Verdict::EqualUnderAssumptions
     ));
     let a = "CREATE VIEW v AS SELECT name FROM item;";
     assert_eq!(
-        run(a, P, b, D, false).verdict,
+        run(a, P, b, D, false).verdict(),
         Verdict::EqualUnderAssumptions
     );
 }
@@ -346,10 +346,10 @@ fn integer_to_string_casts() {
     let ok = "CREATE VIEW dbo.v AS SELECT CAST(item_id AS varchar(11)) AS k FROM dbo.item;";
     let short = "CREATE VIEW dbo.v AS SELECT CAST(item_id AS varchar(5)) AS k FROM dbo.item;";
     assert_eq!(
-        run(ok, T, pg, P, true).verdict,
+        run(ok, T, pg, P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
-    assert_eq!(run(short, T, pg, P, true).verdict, Verdict::Unknown);
+    assert_eq!(run(short, T, pg, P, true).verdict(), Verdict::Unknown);
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn parameter_shadowed_by_a_column_is_not_resolved() {
     // default `variable_conflict = error` the PostgreSQL side raises
     // "column reference is ambiguous", while Db2 takes the column.
     let r = run(pg, P, db2, D, true);
-    assert_eq!(r.verdict, Verdict::Different, "{:?}", rules(&r));
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", rules(&r));
     let f = r
         .findings
         .iter()
@@ -383,11 +383,11 @@ fn unsupported_control_flow_stays_unknown() {
       END";
     let pg = "CREATE PROCEDURE p(p_x integer) LANGUAGE plpgsql AS $$
       BEGIN UPDATE item SET name = 'x' WHERE item_id = p_x; END; $$;";
-    assert_eq!(run(ts, T, pg, P, true).verdict, Verdict::Unknown);
+    assert_eq!(run(ts, T, pg, P, true).verdict(), Verdict::Unknown);
 }
 
 fn not_equal(r: &Report) -> bool {
-    !matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions)
+    !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions)
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn in_list_of_strings_depends_on_collation() {
     let pg = "CREATE VIEW v AS SELECT customer_id FROM customer WHERE email IN ('A@x.com');";
     for catalog in [false, true] {
         let r = run(ts, T, pg, P, catalog);
-        assert!(not_equal(&r), "catalog={catalog}: {:?}", r.verdict);
+        assert!(not_equal(&r), "catalog={catalog}: {:?}", r.verdict());
     }
 }
 
@@ -432,11 +432,11 @@ fn different_parameter_defaults_are_not_equal() {
     let pg = "CREATE FUNCTION top_items(p_take integer DEFAULT 50) RETURNS TABLE (item_id integer)
               LANGUAGE sql AS $$ SELECT item_id FROM item ORDER BY item_id LIMIT p_take; $$;";
     assert_eq!(
-        run(&ts(50), T, pg, P, true).verdict,
+        run(&ts(50), T, pg, P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
     let r = run(&ts(10), T, pg, P, true);
-    assert!(not_equal(&r), "{:?}", r.verdict);
+    assert!(not_equal(&r), "{:?}", r.verdict());
 }
 
 #[test]
@@ -455,7 +455,7 @@ fn declared_initial_value_survives_zero_rows() {
               END; $$;";
     // T-SQL keeps -1 when no row qualifies; PL/pgSQL SELECT INTO sets NULL.
     let r = run(ts, T, pg, P, true);
-    assert_eq!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.findings);
     assert!(rules(&r).contains(&"equiv.no-rows"));
 }
 
@@ -497,7 +497,7 @@ fn anti_join_delete_keeps_joined_table_columns_apart() {
     assert!(not_equal(&with(&a, &b)));
     // A target column is fine once the catalog shows it.
     assert_eq!(
-        with(&ts("unit_price > 0"), &pg("unit_price > 0")).verdict,
+        with(&ts("unit_price > 0"), &pg("unit_price > 0")).verdict(),
         Verdict::EqualUnderAssumptions
     );
 }
@@ -521,7 +521,7 @@ fn tsql_continues_after_a_failed_statement() {
                 RETURNING order_id INTO p_order_id;
               END; $$;";
     let r = run(&ts(""), T, pg, P, true);
-    assert_eq!(r.verdict, Verdict::Different, "{:?}", r.findings);
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", r.findings);
     assert!(rules(&r).contains(&"equiv.error-continues"));
     let r = run(&ts("SET XACT_ABORT ON;"), T, pg, P, true);
     assert!(
@@ -560,7 +560,7 @@ fn large_character_columns_are_strings() {
             ..Options::default()
         },
     );
-    assert!(not_equal(&r), "{:?} {:?}", r.verdict, rules(&r));
+    assert!(not_equal(&r), "{:?} {:?}", r.verdict(), rules(&r));
 }
 
 fn assumption_ids(r: &Report) -> Vec<&str> {
@@ -600,7 +600,7 @@ fn execute_as_owner_matches_security_definer() {
         true,
     );
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:?} {:?}",
         r.findings,
@@ -617,7 +617,7 @@ fn execute_as_owner_matches_security_definer() {
         true,
     );
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:?}",
         r.unknown_reasons
@@ -630,7 +630,7 @@ fn execute_as_owner_matches_security_definer() {
         true,
     );
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:?}",
         r.unknown_reasons
@@ -648,7 +648,7 @@ fn owner_against_caller_privileges_is_a_difference() {
         P,
         true,
     );
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(rules(&r).contains(&"equiv.security-context"));
     let r = run(
         &ts_delete("WITH ENCRYPTION, EXECUTE AS OWNER"),
@@ -657,7 +657,7 @@ fn owner_against_caller_privileges_is_a_difference() {
         P,
         true,
     );
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let r = run(
         &pg_delete("SECURITY DEFINER"),
         P,
@@ -665,15 +665,15 @@ fn owner_against_caller_privileges_is_a_difference() {
         D,
         true,
     );
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     // T-SQL's default context can still skip checks along ownership chains:
     // against an owner's context the outcome depends on object ownership.
     let r = run(&ts_delete(""), T, &pg_delete("SECURITY DEFINER"), P, true);
-    assert_eq!(r.verdict, Verdict::Unknown);
+    assert_eq!(r.verdict(), Verdict::Unknown);
     // Db2 without USRPRF: caller's authority only as a named assumption.
     let r = run(&ts_delete(""), T, &db2_delete(""), D, true);
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:?}",
         r.unknown_reasons
@@ -687,7 +687,7 @@ fn owner_against_caller_privileges_is_a_difference() {
         D,
         true,
     );
-    assert_eq!(r.verdict, Verdict::Unknown);
+    assert_eq!(r.verdict(), Verdict::Unknown);
 }
 
 #[test]
@@ -700,7 +700,7 @@ fn routine_options_outside_the_comparison_stay_unknown() {
         "FOR REPLICATION",
     ] {
         let r = run(&ts_delete(opts), T, &pg, P, true);
-        assert!(not_equal(&r), "{opts}: {:?}", r.verdict);
+        assert!(not_equal(&r), "{opts}: {:?}", r.verdict());
     }
     for opts in [
         "SET TimeZone = 'UTC'",
@@ -709,7 +709,7 @@ fn routine_options_outside_the_comparison_stay_unknown() {
         "SET search_path FROM CURRENT",
     ] {
         let r = run(&ts_delete(""), T, &pg_delete(opts), P, true);
-        assert!(not_equal(&r), "{opts}: {:?}", r.verdict);
+        assert!(not_equal(&r), "{opts}: {:?}", r.verdict());
     }
     for opts in [
         "SET OPTION DATFMT = *MDY",
@@ -719,7 +719,7 @@ fn routine_options_outside_the_comparison_stay_unknown() {
         "CONCURRENT ACCESS RESOLUTION SKIP LOCKED DATA",
     ] {
         let r = run(&ts_delete(""), T, &db2_delete(opts), D, true);
-        assert!(not_equal(&r), "{opts}: {:?}", r.verdict);
+        assert!(not_equal(&r), "{opts}: {:?}", r.verdict());
     }
 }
 
@@ -733,7 +733,7 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
         true,
     );
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:?}",
         r.unknown_reasons
@@ -753,7 +753,7 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
             true,
         );
         assert_eq!(
-            r.verdict,
+            r.verdict(),
             Verdict::EqualUnderAssumptions,
             "{path}: {:?}",
             r.unknown_reasons
@@ -776,7 +776,7 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
             P,
             true,
         );
-        assert!(not_equal(&r), "{path}: {:?}", r.verdict);
+        assert!(not_equal(&r), "{path}: {:?}", r.verdict());
     }
     let r = run(
         &ts_delete(""),
@@ -786,7 +786,7 @@ fn routine_options_without_effect_or_with_a_named_assumption() {
         true,
     );
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:?}",
         r.unknown_reasons
@@ -836,7 +836,7 @@ fn schema_names_are_compared() {
     // dbo and public are the default schemas.
     for s in ["", "public."] {
         let r = run(&ts_delete(""), T, &pg(s), P, true);
-        assert_eq!(r.verdict, Verdict::EqualUnderAssumptions, "{s}");
+        assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions, "{s}");
         assert!(assumption_ids(&r).contains(&"ASM-DEFAULT-SCHEMA"));
     }
     assert!(not_equal(&run(&ts_delete(""), T, &pg("archive."), P, true)));
@@ -844,7 +844,7 @@ fn schema_names_are_compared() {
         .replace("{opts}", "")
         .replace("dbo.item_price", "Sales.item_price");
     assert_eq!(
-        run(&sales, T, &pg("sales."), P, true).verdict,
+        run(&sales, T, &pg("sales."), P, true).verdict(),
         Verdict::EqualUnderAssumptions
     );
     assert!(not_equal(&run(&sales, T, &pg(""), P, true)));
@@ -863,7 +863,7 @@ fn schema_names_are_compared() {
         true,
     );
     assert!(
-        matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
         "{:?}",
         r.findings
     );
@@ -879,7 +879,16 @@ fn db2_sysdummy1_is_no_from() {
         D,
         false,
     );
-    assert_eq!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    // Equal, except that T-SQL returns the column as `x` and Db2 for i as
+    // `X` (decision 1: result column names are observed).
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        rules(&r)
+    );
+    let ids: Vec<&str> = r.assumptions.iter().map(|a| a.id.as_str()).collect();
+    assert_eq!(ids, ["ASM-RESULT-NAMES-CI"]);
     let r = run(
         "SELECT 1 AS x;",
         T,
@@ -887,7 +896,7 @@ fn db2_sysdummy1_is_no_from() {
         D,
         false,
     );
-    assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    assert_ne!(r.verdict(), Verdict::Equal, "{:?}", rules(&r));
     // Its column is not an empty FROM's.
     let r = run(
         "SELECT 'Y' AS x;",
@@ -896,7 +905,7 @@ fn db2_sysdummy1_is_no_from() {
         D,
         false,
     );
-    assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    assert_ne!(r.verdict(), Verdict::Equal, "{:?}", rules(&r));
     // Only Db2 for i has it.
     let r = run(
         "SELECT 1 AS x;",
@@ -905,7 +914,7 @@ fn db2_sysdummy1_is_no_from() {
         P,
         false,
     );
-    assert_ne!(r.verdict, Verdict::Equal, "{:?}", rules(&r));
+    assert_ne!(r.verdict(), Verdict::Equal, "{:?}", rules(&r));
 }
 
 /// An unterminated string literal has no value: it used to panic (or, for
@@ -917,7 +926,11 @@ fn unterminated_string_literal_is_not_read() {
             let a = sqldiff_core::Artifact::new("a.sql", d, text);
             let b = sqldiff_core::Artifact::new("b.sql", d, "SELECT 'ab'");
             let r = sqldiff_core::diff(&a, &b, &sqldiff_core::Options::default());
-            assert_ne!(r.verdict, sqldiff_core::Verdict::Equal, "{text:?} ({d:?})");
+            assert_ne!(
+                r.verdict(),
+                sqldiff_core::Verdict::Equal,
+                "{text:?} ({d:?})"
+            );
         }
     }
 }
@@ -969,9 +982,9 @@ fn ungrouped_aggregate_assign_always_returns_one_row() {
     ] {
         let r = select_assign(ts, pg);
         assert!(
-            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
             "{ts}: {:?} {:?}",
-            r.verdict,
+            r.verdict(),
             r.findings
         );
     }
@@ -1001,7 +1014,7 @@ fn aggregate_assign_that_can_return_no_row_keeps_the_finding() {
         ),
     ] {
         let r = select_assign(ts, pg);
-        assert_eq!(r.verdict, Verdict::Different, "{ts}: {:?}", r.findings);
+        assert_eq!(r.verdict(), Verdict::Different, "{ts}: {:?}", r.findings);
         assert!(
             rules(&r).contains(&"equiv.no-rows"),
             "{ts}: {:?}",
@@ -1019,9 +1032,9 @@ fn select_assign_without_from_is_a_plain_assignment() {
         "r := (SELECT count(*) FROM customer)",
     );
     assert!(
-        matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
         "{:?} {:?}",
-        r.verdict,
+        r.verdict(),
         r.findings
     );
     // The literal checks read it as the assignment it is, as for `SET @r = 1`
@@ -1029,15 +1042,15 @@ fn select_assign_without_from_is_a_plain_assignment() {
     for ts in ["SET @r = 1", "SELECT @r = 1"] {
         let r = select_assign(ts, "r := 1");
         assert!(
-            matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions),
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
             "{ts}: {:?} {:?}",
-            r.verdict,
+            r.verdict(),
             r.findings
         );
     }
     // With a WHERE the query can return no row: T-SQL then keeps -1.
     let r = select_assign("SELECT @r = 1 WHERE @id = 0", "r := 1");
-    assert!(not_equal(&r), "{:?}", r.verdict);
+    assert!(not_equal(&r), "{:?}", r.verdict());
 }
 
 #[test]
@@ -1056,7 +1069,7 @@ fn ungrouped_sum_and_avg_return_one_row_but_stay_the_dialects_own() {
         ),
     ] {
         let r = select_assign(ts, pg);
-        assert!(not_equal(&r), "{ts}: {:?}", r.verdict);
+        assert!(not_equal(&r), "{ts}: {:?}", r.verdict());
         assert!(
             !rules(&r).contains(&"equiv.no-rows"),
             "{ts}: {:?}",
@@ -1078,5 +1091,5 @@ fn a_qualified_call_is_a_user_function_not_the_built_in() {
         "SELECT @r = dbo.max(customer_id) FROM dbo.customer",
         "SELECT max(customer_id) INTO r FROM customer",
     );
-    assert!(not_equal(&r), "{:?} {:?}", r.verdict, r.findings);
+    assert!(not_equal(&r), "{:?} {:?}", r.verdict(), r.findings);
 }

@@ -48,7 +48,7 @@ pub fn deny_assumptions(r: &mut Report, ids: &[String]) {
         }
     }
     if hit {
-        r.verdict = derive_verdict(r);
+        r.settle();
     }
 }
 

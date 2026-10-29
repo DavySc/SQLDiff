@@ -45,6 +45,11 @@ pub struct Options {
     /// declaration's text). A declared Db2 for i commit level is used for
     /// routines that do not state one.
     pub declared: BTreeMap<String, String>,
+    /// The proof gate (decision 3): its mode and the checker a front end
+    /// supplies. Off by default.
+    pub proof: crate::proof::Settings,
+    /// Side channels the caller reads (decision 1).
+    pub observer: crate::observer::Observer,
 }
 
 impl Default for Options {
@@ -58,6 +63,8 @@ impl Default for Options {
             helpers: Vec::new(),
             flips: BTreeMap::new(),
             declared: BTreeMap::new(),
+            proof: crate::proof::Settings::default(),
+            observer: crate::observer::Observer::default(),
         }
     }
 }
@@ -140,12 +147,57 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let schema_a = equiv::schema::Schema::from_view(&view_a);
     let schema_b = equiv::schema::Schema::from_view(&view_b);
     let mut eq = equiv::Outcome::default();
+    // What the same-dialect comparison vouches for (`coverage::unreceipted`).
+    let mut receipts = Vec::new();
 
     if same {
         let mut td = treediff::diff(&aa, &ab);
+        // An observer that does not read row counts does not see SET NOCOUNT,
+        // unless the code reads them itself: SET resets @@ROWCOUNT (and
+        // ROWCOUNT_BIG()) to 0, so an added SET NOCOUNT before
+        // `IF @@ROWCOUNT = 0` changes the branch.
+        let reads_rowcount = |an: &Analyzed| {
+            let t = an.artifact.text.to_ascii_uppercase();
+            t.contains("@@ROWCOUNT") || t.contains("ROWCOUNT_BIG")
+        };
+        if opts.observer.row_counts == crate::observer::RowCounts::Never
+            && !reads_rowcount(&aa)
+            && !reads_rowcount(&ab)
+        {
+            let nocount = |f: &Finding| {
+                let text = |l: &Option<Location>, an: &Analyzed| {
+                    l.as_ref()
+                        .and_then(|l| an.artifact.text.get(l.byte_start..l.byte_end))
+                        .is_some_and(crate::observer::is_nocount)
+                };
+                matches!(
+                    f.rule.as_str(),
+                    "stmt.added" | "stmt.removed" | "stmt.modified"
+                ) && (f.a.is_none() || text(&f.a, &aa))
+                    && (f.b.is_none() || text(&f.b, &ab))
+            };
+            let before = td.findings.len();
+            td.findings.retain(|f| {
+                let keep = !nocount(f);
+                if !keep {
+                    td.receipts.push(crate::coverage::Receipt::Judged {
+                        rule: "observer profile: row counts are not observed",
+                        a: f.a.as_ref().map(crate::coverage::Part::at),
+                        b: f.b.as_ref().map(crate::coverage::Part::at),
+                    });
+                }
+                keep
+            });
+            if td.findings.len() < before {
+                td.structural += before - td.findings.len();
+                assumptions.push(crate::observer::rowcount_assumption());
+            }
+        }
         equiv::refine_modified(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         equiv::edit::decide(&aa, &ab, &schema_a, &schema_b, &mut td.findings, &mut eq);
         findings.extend(td.findings);
+        receipts.append(&mut td.receipts);
+        receipts.append(&mut eq.receipts);
         noise.cosmetic = td.cosmetic;
         noise.structural = td.structural + eq.structural;
         match a.dialect.lexical().folding {
@@ -196,6 +248,21 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         }
         eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
         findings.append(&mut eq.findings);
+        // Rows-affected counts across dialects (decision 1, observer profile).
+        let (ca, cb) = (
+            crate::observer::sends_counts(&aa),
+            crate::observer::sends_counts(&ab),
+        );
+        if ca != cb {
+            match opts.observer.row_counts {
+                crate::observer::RowCounts::Always => unknown_reasons.push(format!(
+                    "rows-affected counts are observed (observer profile): side {} sends them, side {} does not",
+                    if ca { "A" } else { "B" },
+                    if ca { "B" } else { "A" },
+                )),
+                _ => assumptions.push(crate::observer::rowcount_assumption()),
+            }
+        }
         noise.structural += eq.structural;
         unknown_reasons.append(&mut eq.unknown_reasons);
         normalizations.push(
@@ -212,6 +279,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
             assumptions.push(x);
         }
     }
+    let refinements = std::mem::take(&mut eq.refinements);
 
     let bound_a = bind::bind(
         &aa,
@@ -259,6 +327,11 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     if let Some(why) = crate::coverage::uncovered(&aa, &ab) {
         unknown_reasons.push(why);
     }
+    if same {
+        if let Some(why) = crate::coverage::unreceipted(&aa, &ab, &receipts, &findings) {
+            unknown_reasons.push(why);
+        }
+    }
 
     let mut diagnostics = aa.diagnostics();
     diagnostics.extend(ab.diagnostics());
@@ -269,7 +342,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         ));
     }
 
-    finish(Report {
+    let mut report = finish(Report {
         tool_version: TOOL_VERSION.to_string(),
         verdict: Verdict::Equal,
         a: aa.info(),
@@ -281,10 +354,16 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
+        refinements,
+        equivalent: None,
+        proof: None,
+        verdict_before_proof: None,
         diagnostics,
         witnesses,
         discharged,
-    })
+    });
+    crate::proof::apply(&mut report, &aa, &ab, &opts.proof);
+    report
 }
 
 /// "What if this statement fails?" (design §6.1 `what_if`): the statement
@@ -353,6 +432,10 @@ pub fn check(a: &Artifact, opts: &Options) -> Report {
         unknown_reasons,
         suppressed: Vec::new(),
         verdict_before_suppression: None,
+        refinements: Vec::new(),
+        equivalent: None,
+        proof: None,
+        verdict_before_proof: None,
         diagnostics,
         witnesses: Vec::new(),
         discharged: Vec::new(),
@@ -382,7 +465,7 @@ pub(crate) fn finish(mut r: Report) -> Report {
             .then(y.verdict.cmp(&x.verdict))
             .then(first_line(x).cmp(&first_line(y)))
     });
-    r.verdict = crate::session::derive_verdict(&r);
+    r.settle();
     r
 }
 

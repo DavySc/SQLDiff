@@ -1374,6 +1374,7 @@ fn prepare(
             template,
             extensions: tree::extensions(names(&spec.extensions)),
             helpers: cfg.options().helpers,
+            deployment: cfg.deployment.clone(),
             catalogs,
             catalogs_b,
         },
@@ -1382,6 +1383,9 @@ fn prepare(
         discard_edits: false,
         instances,
         queue_all: false,
+        // The GUI does not start the proof checker yet.
+        proof: Default::default(),
+        row_counts: false,
     };
     let command = Command::new(&program(), &job, &packs, &dir, isolated);
     Ok((job, out, command, loaded))

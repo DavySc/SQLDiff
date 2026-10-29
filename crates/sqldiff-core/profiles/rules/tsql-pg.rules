@@ -90,13 +90,13 @@
   (doc "SELECT @v = e FROM ... is SELECT e INTO v FROM ... when one row qualifies.")
   (form tsql (select (items (assign-item ?v ?e)) ?rest...) (lift-only))
   (form postgres (select (items (item ?e)) (into ?v) ?rest...))
-  (assume tsql ASM-SINGLE-ROW "The query returns exactly one row (with none, T-SQL keeps the variable and PostgreSQL sets it to NULL; with several, they keep different rows)"))
+  (assume tsql ASM-EXACTLY-ONE-ROW "The query returns exactly one row (with none, T-SQL keeps the variable and PostgreSQL sets it to NULL; with several, they keep different rows)"))
 
 (translate select-assign2/into
   (priority 2)
   (form tsql (select (items (assign-item ?v ?e) (assign-item ?w ?f)) ?rest...) (lift-only))
   (form postgres (select (items (item ?e) (item ?f)) (into ?v ?w) ?rest...))
-  (assume tsql ASM-SINGLE-ROW "The query returns exactly one row (with none, T-SQL keeps the variable and PostgreSQL sets it to NULL; with several, they keep different rows)"))
+  (assume tsql ASM-EXACTLY-ONE-ROW "The query returns exactly one row (with none, T-SQL keeps the variable and PostgreSQL sets it to NULL; with several, they keep different rows)"))
 
 (translate nolock/plain-read
   (form tsql (table ?n (?opt (alias ?al)) (hints nolock)) (lift-only))

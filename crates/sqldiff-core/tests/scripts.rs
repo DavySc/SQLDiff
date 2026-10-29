@@ -41,7 +41,7 @@ fn rules(r: &Report) -> Vec<&str> {
 fn equal(a: &str, b: &str) -> Report {
     let r = run(a, b);
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:#?}\n{:#?}",
         r.findings,
@@ -62,8 +62,8 @@ fn not_equal(r: Report, needle: &str) {
         r.unknown_reasons,
         rules(&r)
     );
-    assert_ne!(r.verdict, Verdict::Equal);
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
 
 const SCRIPT_T: &str = "PRINT 'Inserting Methods'
@@ -150,8 +150,8 @@ BEGIN
 END
 $$;";
     let r = run(SCRIPT_T, one_block);
-    assert_ne!(r.verdict, Verdict::Equal);
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
 }
 
 #[test]
@@ -274,7 +274,7 @@ fn error_continuation() {
         "DECLARE @x int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@x, 'a', NULL);\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', NULL);",
         "DO $$\nDECLARE\n  v_x integer;\nBEGIN\n  v_x := 1;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (v_x, 'a', NULL);\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, 'b', NULL);\nEND\n$$;",
     );
-    assert_eq!(r.verdict, Verdict::Different, "{:?}", rules(&r));
+    assert_eq!(r.verdict(), Verdict::Different, "{:?}", rules(&r));
     let f = r
         .findings
         .iter()

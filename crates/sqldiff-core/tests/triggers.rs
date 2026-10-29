@@ -28,7 +28,7 @@ fn run_with(tsql: &str, pg: &str, ddl_a: &str, ddl_b: &str) -> Report {
 }
 
 fn equal(r: &Report) -> bool {
-    matches!(r.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions)
+    matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions)
 }
 
 fn assumes(r: &Report, id: &str) -> bool {

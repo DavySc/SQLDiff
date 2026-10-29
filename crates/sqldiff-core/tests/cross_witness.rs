@@ -63,7 +63,7 @@ fn different(a: &str, da: Dialect, b: &str, db: Dialect) -> String {
     for catalog in [false, true] {
         let r = run(a, da, b, db, catalog);
         assert_eq!(
-            r.verdict,
+            r.verdict(),
             Verdict::Different,
             "catalog {catalog}: {:#?} {:?}",
             r.findings,
@@ -98,7 +98,7 @@ fn the_unchanged_pair_is_equal() {
     for (b, d) in [(pg(BASE.1), P), (db2(BASE.1), D)] {
         let r = run(&ts(BASE.0), T, &b, d, true);
         assert_eq!(
-            r.verdict,
+            r.verdict(),
             Verdict::EqualUnderAssumptions,
             "{:?} {:?}",
             r.findings,
@@ -263,7 +263,7 @@ fn decimals_and_unknown_shapes_stay_unknown() {
         true,
     );
     assert!(witness(&r).is_none(), "{:#?}", r.findings);
-    assert_ne!(r.verdict, Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
     // Subqueries are not evaluated.
     no_witness(
         &ts("DELETE FROM dbo.item WHERE item_id IN (SELECT item_id FROM dbo.item_price);"),
@@ -281,7 +281,7 @@ fn reaching_the_statement_is_assumed_when_others_surround_it() {
     let b =
         pg("DELETE FROM item_price WHERE item_id = p_id; DELETE FROM item WHERE item_id <> p_id;");
     let r = run(&a, T, &b, P, true);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     let f = witness(&r).expect("witness");
     assert!(ids(f).contains(&"ASM-WITNESS-PATH"), "{:?}", f.assumptions);
     let r = run(
@@ -328,7 +328,7 @@ fn tsql_parameters_without_parentheses_and_with_as() {
         r.unknown_reasons
     );
     assert_eq!(
-        r.verdict,
+        r.verdict(),
         Verdict::EqualUnderAssumptions,
         "{:#?} {:?}",
         r.findings,
@@ -336,7 +336,7 @@ fn tsql_parameters_without_parentheses_and_with_as() {
     );
     let b2 = b.replace("item_id = p_id", "item_id <> p_id");
     let r = run(a, T, &b2, P, true);
-    assert_eq!(r.verdict, Verdict::Different);
+    assert_eq!(r.verdict(), Verdict::Different);
     assert!(witness(&r).is_some(), "{:#?}", r.findings);
 }
 
@@ -423,7 +423,7 @@ fn changes_that_compensate_each_other_have_no_witness() {
         for catalog in [false, true] {
             let r = run(a, T, b, P, catalog);
             assert!(witness(&r).is_none(), "{a}\n{b}\n{:#?}", r.findings);
-            assert!(!r.verdict.label().starts_with("equal"), "{a}");
+            assert!(!r.verdict().label().starts_with("equal"), "{a}");
         }
     }
     // One changed statement, but another statement writes its table first.

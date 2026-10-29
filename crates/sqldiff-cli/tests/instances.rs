@@ -121,6 +121,16 @@ fn instance<'a>(r: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
         .unwrap()
 }
 
+/// Converted, except that the T-SQL procedure sends rows-affected counts and
+/// PostgreSQL does not: decision 1's observer profile lists that as the
+/// one open assumption.
+fn converted_but_row_counts(i: &serde_json::Value) {
+    assert_eq!(i["status"], "assumptions", "{i}");
+    // Once for the pair, and on each unit's status line in the converted
+    // template, which carries the conversion's own pair assumptions.
+    assert_eq!(rule_set(i), ["ASM-OBSERVER-ROWCOUNT"], "{i}");
+}
+
 fn rules(i: &serde_json::Value) -> Vec<String> {
     i["items"]
         .as_array()
@@ -128,6 +138,12 @@ fn rules(i: &serde_json::Value) -> Vec<String> {
         .iter()
         .map(|x| x["rule"].as_str().unwrap().to_string())
         .collect()
+}
+
+/// The distinct rules of an instance's items, sorted.
+fn rule_set(i: &serde_json::Value) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = rules(i).into_iter().collect();
+    set.into_iter().collect()
 }
 
 #[test]
@@ -154,7 +170,7 @@ fn checks_every_instance_and_rolls_up_to_templates() {
 
     // The template assumptions are discharged by the instances.
     let t = instance(&r, "procs/TouchCustomer");
-    assert_eq!(t["status"], "converted", "{t}");
+    converted_but_row_counts(t);
     for rule in rules(t) {
         assert!(!rule.starts_with("ASM-TEMPLATE"), "{rule}");
     }
@@ -198,9 +214,18 @@ fn the_converted_templates_status_lines_stand_until_resolved() {
     let (_, r) = instances(&d, &[]);
     let t = instance(&r, "procs/TouchCustomer");
     assert_eq!(t["status"], "assumptions", "{t}");
-    assert_eq!(rules(t), ["ASM-CI-COLLATION"]);
+    // The rows-affected counts the T-SQL procedure sends (decision 1).
+    assert_eq!(rule_set(t), ["ASM-CI-COLLATION", "ASM-OBSERVER-ROWCOUNT"]);
     // Accepted: nothing holds the instance back any more.
-    let (_, r) = instances(&d, &["--accept", "ASM-CI-COLLATION"]);
+    let (_, r) = instances(
+        &d,
+        &[
+            "--accept",
+            "ASM-CI-COLLATION",
+            "--accept",
+            "ASM-OBSERVER-ROWCOUNT",
+        ],
+    );
     let t = instance(&r, "procs/TouchCustomer");
     assert_eq!(t["status"], "converted", "{t}");
     assert_eq!(r["accepted"][0], "ASM-CI-COLLATION");
@@ -465,16 +490,29 @@ fn fragments_pairs_and_value_kinds() {
             .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(&o.stderr)));
     // The woven instances discharge the fragment and decision notes.
     // The table is the one the conversion rules write from the source.
-    for name in ["table", "list", "save"] {
-        let i = instance(&r, name);
-        assert_eq!(i["status"], "converted", "{name}: {i}");
-    }
+    let i = instance(&r, "table");
+    assert_eq!(i["status"], "converted", "table: {i}");
+    converted_but_row_counts(instance(&r, "save"));
+    // `SELECT Id` returns `Id` in T-SQL and `id` in PostgreSQL (decision 1:
+    // result column names are observed), and nothing else is open.
+    let i = instance(&r, "list");
+    assert_eq!(i["status"], "assumptions", "{i}");
+    let items: Vec<&str> = i["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x["rule"].as_str())
+        .collect();
+    assert_eq!(items, ["ASM-RESULT-NAMES-CI"], "{i}");
     let woven = std::fs::read_to_string(d.join("out/target/save.sql")).unwrap();
     assert!(woven.contains("(p_key integer)"), "{woven}");
     // A type given once for every dialect is an assumption.
     let same = instance(&r, "save-same");
     assert_eq!(same["status"], "assumptions", "{same}");
-    assert_eq!(rules(same), ["ASM-TEMPLATE-VALUE-SAME"]);
+    assert_eq!(
+        rule_set(same),
+        ["ASM-OBSERVER-ROWCOUNT", "ASM-TEMPLATE-VALUE-SAME"]
+    );
 }
 
 #[test]
@@ -494,7 +532,7 @@ fn an_object_two_instances_create_is_not_decided() {
         assert_eq!(i["status"], "unknown", "{i}");
         assert!(rules(i).contains(&"weave.object-twice".to_string()), "{i}");
     }
-    assert_eq!(instance(&r, "procs/TouchCustomer")["status"], "converted");
+    converted_but_row_counts(instance(&r, "procs/TouchCustomer"));
 }
 
 #[test]
@@ -818,7 +856,13 @@ fn the_generators_own_output_is_checked_alone() {
     );
     assert_eq!(r["generator_only"], true);
     for i in r["instances"].as_array().unwrap() {
-        assert_eq!(i["status"], "converted", "{i}");
+        // The one procedure sends rows-affected counts; everything else is
+        // plainly converted.
+        if i["name"] == "procs/TouchCustomer" {
+            converted_but_row_counts(i);
+        } else {
+            assert_eq!(i["status"], "converted", "{i}");
+        }
         assert_eq!(i["done"], true, "{i}");
     }
     // Mapped to the templates the manifest names.
