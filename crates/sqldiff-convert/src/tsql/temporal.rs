@@ -215,28 +215,10 @@ impl Cx<'_> {
         let start = col(&t.start)?;
         let end = col(&t.end)?;
         let create_history = self.history_check(t, name_t)?;
-        let named = |suffix: &str| -> R<String> {
-            let (schema, last) = match table.rfind('.') {
-                Some(d) if !table[d..].contains('"') || table[d..].starts_with(".\"") => {
-                    (&table[..=d], &table[d + 1..])
-                }
-                _ => ("", table),
-            };
-            let inner = last.trim_matches('"');
-            if inner.len() + suffix.len() > 63 {
-                return no(format!(
-                    "system-versioned table {table}: the trigger name {inner}{suffix} is longer than PostgreSQL's 63 bytes"
-                ));
-            }
-            Ok(if last.starts_with('"') {
-                format!("{schema}\"{inner}{suffix}\"")
-            } else {
-                format!("{schema}{inner}{suffix}")
-            })
-        };
+        let named = |suffix: &str| trigger_name(table, suffix);
         let func = named("_versioning")?;
         let guard = named("_period_update")?;
-        let trig = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+        let truncate = named("_versioning_truncate")?;
         let ty = format!("timestamp({})", t.digits);
         let max = if t.digits == 0 {
             "9999-12-31 23:59:59".to_string()
@@ -298,13 +280,13 @@ CREATE TRIGGER {} BEFORE UPDATE OF {start}, {end} ON {table}
 CREATE TRIGGER {} BEFORE INSERT OR UPDATE OR DELETE ON {table}
     FOR EACH ROW EXECUTE FUNCTION {func}();
 
-CREATE TRIGGER {}_truncate BEFORE TRUNCATE ON {table}
+CREATE TRIGGER {} BEFORE TRUNCATE ON {table}
     FOR EACH STATEMENT EXECUTE FUNCTION {func}()",
             names.join(", "),
             old.join(", "),
             trig(&guard),
             trig(&func),
-            trig(&func),
+            trig(&truncate),
         ))
     }
 
@@ -364,6 +346,184 @@ CREATE TRIGGER {}_truncate BEFORE TRUNCATE ON {table}
         }
         Ok(String::new())
     }
+}
+
+impl Cx<'_> {
+    /// ALTER TABLE on a table the tree creates system-versioned, in the four
+    /// forms a data load uses to write period values (WWI
+    /// DeactivateTemporalTablesBeforeDataLoad and Reactivate…):
+    /// - `SET (SYSTEM_VERSIONING = OFF)` → the versioning triggers disabled;
+    /// - `DROP PERIOD FOR SYSTEM_TIME` → the period-update guard disabled;
+    /// - `ADD PERIOD FOR SYSTEM_TIME (start, end)` → the guard enabled;
+    /// - `SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h …))` → the
+    ///   versioning triggers enabled.
+    ///
+    /// The catalog must show the CREATE TABLE's period and history table, and
+    /// the ALTER must name the same ones, so the triggers it switches are the
+    /// ones the converted CREATE TABLE made and write the same history.
+    pub(super) fn alter_versioning(&mut self, ts: &[T]) -> R<String> {
+        if self.db2() {
+            return no("ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: Db2 for i system-period tables are not converted yet (their facts are not verified on IBM i); no rule yet");
+        }
+        const FORMS: &str = "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: only SET (SYSTEM_VERSIONING = OFF), DROP PERIOD FOR SYSTEM_TIME, ADD PERIOD FOR SYSTEM_TIME (start, end) and SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = …)) have a rule";
+        let s = sig(ts);
+        let w = |k: usize| s.get(k).map(|&j| &ts[j]);
+        let is = |k: usize, word: &str| w(k).is_some_and(|t| t.is(word));
+        if !(is(0, "ALTER") && is(1, "TABLE")) {
+            return no(FORMS);
+        }
+        let Some(act) = (2..s.len()).find(|&k| is(k, "SET") || is(k, "DROP") || is(k, "ADD"))
+        else {
+            return no(FORMS);
+        };
+        let name_t: Vec<T> = ts[s[2]..s[act]].to_vec();
+        let Some(parts) = name_parts(&name_t) else {
+            return no(FORMS);
+        };
+        let words = &s[act..];
+        let word = |k: usize| words.get(k).map(|&j| &ts[j]);
+        let wis = |k: usize, x: &str| word(k).is_some_and(|t| t.is(x));
+        let period = wis(1, "PERIOD") && wis(2, "FOR") && wis(3, "SYSTEM_TIME");
+        enum Switch {
+            Off,
+            On(Vec<T>),
+            Drop,
+            Add(String, String),
+        }
+        let switch = if wis(0, "DROP") && period && words.len() == 4 {
+            Switch::Drop
+        } else if wis(0, "ADD") && period {
+            let rest: Vec<&T> = words[4..].iter().map(|&j| &ts[j]).collect();
+            match rest.as_slice() {
+                [l, a, c, b, r] if l.k == L_PAREN && c.k == COMMA && r.k == R_PAREN => {
+                    Switch::Add(tsql_unquote(&a.s), tsql_unquote(&b.s))
+                }
+                _ => return no(FORMS),
+            }
+        } else if wis(0, "SET") && word(1).is_some_and(|t| t.k == L_PAREN) {
+            let p = words[1];
+            let r = matching(ts, p).ok_or(No("unbalanced parentheses".into()))?;
+            if words.last() != Some(&r) {
+                return no(FORMS);
+            }
+            let opts = split_commas(&ts[p + 1..r]);
+            let [opt] = opts.as_slice() else {
+                return no(FORMS);
+            };
+            let opt = trimmed(opt);
+            let os = sig(opt);
+            if !os.first().is_some_and(|&j| opt[j].is("SYSTEM_VERSIONING")) {
+                return no(FORMS);
+            }
+            if os.len() == 3 && opt[os[1]].s == "=" && opt[os[2]].is("OFF") {
+                Switch::Off
+            } else {
+                Switch::On(versioning_option(opt)?)
+            }
+        } else {
+            return no(FORMS);
+        };
+
+        // What the tree's CREATE TABLE declared.
+        let strip = |mut p: Vec<String>| {
+            if p.len() == 2 && p[0] == "dbo" {
+                p.remove(0);
+            }
+            p
+        };
+        let parts = strip(parts);
+        let found = self.catalog.and_then(|cat| {
+            if parts.len() > 2 {
+                return None;
+            }
+            let idents: Vec<Ident> = parts.iter().map(|p| Ident::plain(p.clone())).collect();
+            let t = &cat.tables[table_position(Dialect::Tsql, cat, &idents)?];
+            t.versioning.clone()
+        });
+        let table = self.expr(&name_t).trim().to_string();
+        let Some(v) = found else {
+            return no(format!("ALTER TABLE {table} … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: the tree has no CREATE TABLE {table} with PERIOD FOR SYSTEM_TIME and SYSTEM_VERSIONING = ON, so which history triggers the converted table has is not known; no rule"));
+        };
+        let func = trigger_name(&table, "_versioning")?;
+        let truncate = trigger_name(&table, "_versioning_truncate")?;
+        let guard = trigger_name(&table, "_period_update")?;
+        let (how, out) = match switch {
+            Switch::Off => (
+                "versioning-off",
+                format!(
+                    "ALTER TABLE {table} DISABLE TRIGGER {}, DISABLE TRIGGER {}",
+                    trig(&func),
+                    trig(&truncate)
+                ),
+            ),
+            Switch::Drop => (
+                "drop-period",
+                format!("ALTER TABLE {table} DISABLE TRIGGER {}", trig(&guard)),
+            ),
+            Switch::Add(a, b) => {
+                if !(a.eq_ignore_ascii_case(&v.start) && b.eq_ignore_ascii_case(&v.end)) {
+                    return no(format!("ADD PERIOD FOR SYSTEM_TIME ({a}, {b}): the CREATE TABLE's period is ({}, {}), which the converted triggers write; no rule", v.start, v.end));
+                }
+                (
+                    "add-period",
+                    format!("ALTER TABLE {table} ENABLE TRIGGER {}", trig(&guard)),
+                )
+            }
+            Switch::On(history) => {
+                let named = name_parts(&history).map(strip);
+                let declared = v
+                    .history
+                    .clone()
+                    .map(|h| strip(h.iter().map(|x| x.to_ascii_lowercase()).collect()));
+                if named.is_none() || named != declared {
+                    let h = self.expr(&history).trim().to_string();
+                    return no(format!("SYSTEM_VERSIONING = ON (HISTORY_TABLE = {h}): the converted CREATE TABLE's trigger writes the history table its SYSTEM_VERSIONING named; another one has no rule"));
+                }
+                (
+                    "versioning-on",
+                    format!(
+                        "ALTER TABLE {table} ENABLE TRIGGER {}, ENABLE TRIGGER {}",
+                        trig(&func),
+                        trig(&truncate)
+                    ),
+                )
+            }
+        };
+        self.step_ts_with("tsql.temporal.switch", ts, how);
+        self.note(Status::Assumptions, "ASM-TEMPORAL-SWITCH", &format!(
+            "Turning versioning off and on and dropping and adding the period become disabling and enabling the triggers the converted CREATE TABLE made ({} and {} for versioning, {} for the period). The table and its rows stay the same. Not the same: SQL Server refuses DROP PERIOD while versioning is on, and checks on ADD PERIOD that every row's {} is before its {} and on SYSTEM_VERSIONING = ON that the history table matches (with DATA_CONSISTENCY_CHECK = ON, also its rows); PostgreSQL checks none of that. Between SYSTEM_VERSIONING = OFF and DROP PERIOD, and between ADD PERIOD and SYSTEM_VERSIONING = ON, SQL Server still sets the period columns and refuses explicit values on INSERT, PostgreSQL does not. After DROP PERIOD an INSERT that leaves out a period column fails in SQL Server (the column has no default) and stores '-infinity' in PostgreSQL. Enabling and disabling triggers needs the table's owner in PostgreSQL, ALTER on the table in SQL Server.",
+            trig(&func), trig(&truncate), trig(&guard), v.start, v.end
+        ));
+        Ok(out)
+    }
+}
+
+/// The name of a trigger or trigger function the converted CREATE TABLE
+/// makes: the converted table name with `suffix` on its last part.
+fn trigger_name(table: &str, suffix: &str) -> R<String> {
+    let (schema, last) = match table.rfind('.') {
+        Some(d) if !table[d..].contains('"') || table[d..].starts_with(".\"") => {
+            (&table[..=d], &table[d + 1..])
+        }
+        _ => ("", table),
+    };
+    let inner = last.trim_matches('"');
+    if inner.len() + suffix.len() > 63 {
+        return no(format!(
+            "system-versioned table {table}: the trigger name {inner}{suffix} is longer than PostgreSQL's 63 bytes"
+        ));
+    }
+    Ok(if last.starts_with('"') {
+        format!("{schema}\"{inner}{suffix}\"")
+    } else {
+        format!("{schema}{inner}{suffix}")
+    })
+}
+
+/// A trigger's own name, without the schema: `ALTER TABLE … ENABLE TRIGGER`
+/// takes it unqualified.
+fn trig(n: &str) -> &str {
+    n.rsplit('.').next().unwrap_or(n)
 }
 
 /// `SYSTEM_VERSIONING = ON (HISTORY_TABLE = x [, DATA_CONSISTENCY_CHECK = …]

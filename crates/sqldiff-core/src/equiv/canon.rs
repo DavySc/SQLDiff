@@ -48,7 +48,7 @@ pub mod asm {
     /// case-sensitive one is kept, and flagged with this per statement.
     pub const CI_COLLATION: (&str, &str) = (
         "ASM-CI-COLLATION",
-        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+        "String equality and LIKE give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar), and no value LIKE tests has trailing spaces or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -65,6 +65,10 @@ pub mod asm {
     pub const UNTYPED_CAST: (&str, &str) = (
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
+    );
+    pub const PERIOD_WRITE: (&str, &str) = (
+        "ASM-TEMPORAL-PERIOD-WRITE",
+        "The statement gives a period column of a system-versioned table a value: assumes the code runs while versioning is off and the period dropped (SYSTEM_VERSIONING = OFF, DROP PERIOD FOR SYSTEM_TIME; in PostgreSQL the converted versioning triggers disabled), as data loads do, so both sides store the value as given. While versioning is on, both sides refuse the statement; while only the period remains, SQL Server refuses it and PostgreSQL stores the value",
     );
     pub const UNTYPED_STORE: (&str, &str) = (
         "ASM-UNTYPED-STORE",
@@ -216,6 +220,10 @@ struct Binding {
     table: String,
     /// Derived single-row sources: column → value.
     derived: Option<Vec<(String, Term, Option<Ty>)>>,
+    /// A derived table's unique key: the GROUP BY columns its query
+    /// returns (`ast::group_key`), folded. Kept with the binding, as a
+    /// subquery elsewhere in the statement may reuse the alias.
+    unique: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -487,6 +495,7 @@ impl<'a> Canon<'a> {
                 .unwrap_or_else(|| lc(parts.last().map(String::as_str).unwrap_or(""))),
             table: canon,
             derived: None,
+            unique: None,
         }
     }
 
@@ -523,19 +532,79 @@ impl<'a> Canon<'a> {
     }
 
     /// A statement writes `col`: refused for a column the database computes
-    /// (period, computed, GENERATED ALWAYS), whose explicit values one side
-    /// rejects or replaces depending on settings and triggers the statement
-    /// does not show.
-    fn written(&self, table: &str, col: &str) -> R<()> {
-        let generated = self
+    /// (computed, GENERATED ALWAYS), whose explicit values one side rejects
+    /// or replaces depending on settings and triggers the statement does not
+    /// show. A period column of a system-versioned table is the exception:
+    /// code writes it only with the period dropped, a state the statement
+    /// does not show either, so that is an assumption.
+    fn written(&mut self, table: &str, col: &str) -> R<()> {
+        let (generated, period) = self
             .schema
             .table(Self::base_table(table))
             .and_then(|t| t.column(col))
-            .is_some_and(|c| c.generated);
-        if generated {
+            .map_or((false, false), |c| (c.generated, c.period));
+        if period {
+            self.assume(asm::PERIOD_WRITE);
+        } else if generated {
             return Err(format!("writes the generated column {col}"));
         }
         Ok(())
+    }
+
+    /// An INSERT that leaves out a period column, in code that drops the
+    /// table's period (it switches the versioning or writes a period
+    /// column): with the period dropped, SQL Server takes the column's
+    /// default or fails on NOT NULL, while PostgreSQL, its versioning
+    /// triggers disabled, stores the converted default `-infinity`.
+    fn period_omitted(&self, table: &str, cols: &[String]) -> R<()> {
+        let Some(t) = self.schema.table(Self::base_table(table)) else {
+            return Ok(());
+        };
+        let missing: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period && !cols.contains(&c.name))
+            .map(|c| c.name.as_str())
+            .collect();
+        if missing.is_empty() || !self.drops_period(t) {
+            return Ok(());
+        }
+        Err(format!(
+            "the INSERT leaves out the period column {} of a table whose period this code drops or writes: with the period dropped SQL Server takes the column's default or fails, PostgreSQL stores '-infinity'",
+            missing.join(", ")
+        ))
+    }
+
+    /// Whether the unit switches `t`'s versioning, or writes (or may write:
+    /// a data statement naming the column) one of its period columns.
+    fn drops_period(&self, t: &super::schema::Table) -> bool {
+        let switched = self.unit.calls.iter().any(|(node, _)| {
+            matches!(
+                super::call::parse(&super::ast::tokens(node), self.d),
+                Ok(super::call::Stmt::Switch(s))
+                    if s.table.last().is_some_and(|n| n.text.eq_ignore_ascii_case(&t.name))
+            )
+        });
+        let period: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period)
+            .map(|c| c.name.as_str())
+            .collect();
+        switched
+            || self.unit.stmts.iter().any(|s| {
+                s.toks
+                    .first()
+                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
+                    && s.toks.iter().any(|x| {
+                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
+                            && period.contains(
+                                &sqldiff_syntax::ast::unquote(&x.text)
+                                    .to_lowercase()
+                                    .as_str(),
+                            )
+                    })
+            })
     }
 
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
@@ -1083,13 +1152,26 @@ impl<'a> Canon<'a> {
                 (n("between", kids), None)
             }
             Expr::Like(x, p, neg, ci) => {
-                let x = self.expr(x)?.0;
+                let (x, ty) = self.expr(x)?;
+                // A varchar value against a literal pattern without `[` or
+                // `\` differs across dialects only by the collation
+                // (`coll-like`): case, trailing spaces of the value (T-SQL
+                // varchar drops them) and characters the collation expands
+                // (checked on SQL Server 2022). T-SQL `[...]` is a character
+                // class and PostgreSQL's `\` an escape; a char value is
+                // blank-padded on one side only.
+                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
                 let p = self.expr(p)?.0;
-                // Case sensitivity and trailing blanks of LIKE differ per dialect.
+                let coll = if plain {
+                    n("coll-like", vec![self.dtag()])
+                } else {
+                    self.dtag()
+                };
                 (
                     n(
                         "like",
-                        vec![self.dtag(), x, p, a(neg.to_string()), a(ci.to_string())],
+                        vec![coll, x, p, a(neg.to_string()), a(ci.to_string())],
                     ),
                     None,
                 )
@@ -2668,6 +2750,8 @@ impl<'a> Canon<'a> {
                         self.sub_bits.insert(format!("sub:{key}"), bits);
                     }
                 }
+                let unique = sqldiff_syntax::abstract_syntax::group_key(query)
+                    .map(|k| k.iter().map(|c| lc(c)).collect());
                 let item_terms: Vec<Term> = items.into_iter().map(|x| x.0).collect();
                 parts.insert(1, n("items", item_terms));
                 let q = (n("q", parts), None::<Ty>);
@@ -2675,6 +2759,7 @@ impl<'a> Canon<'a> {
                     key: key.clone(),
                     table: format!("sub:{key}"),
                     derived: None,
+                    unique,
                 });
                 Ok(n("sub", vec![q.0]))
             }
@@ -3387,6 +3472,7 @@ impl<'a> Canon<'a> {
                 Ok(n("insertn", vec![a(table), n("rows", sets)]))
             }
             InsertSource::Query(q) => {
+                self.period_omitted(table, cols)?;
                 let (parts, items) = self.query_parts(q, QCtx::Scalar)?;
                 if items.len() != cols.len() {
                     return Err("INSERT column count does not match the query".into());
@@ -3405,7 +3491,10 @@ impl<'a> Canon<'a> {
                 kv.sort();
                 Ok(n("insertq", vec![a(table), n("set", kv), n("q", parts)]))
             }
-            InsertSource::Default => Ok(n("insertdefault", vec![a(table)])),
+            InsertSource::Default => {
+                self.period_omitted(table, &[])?;
+                Ok(n("insertdefault", vec![a(table)]))
+            }
         }
     }
 
@@ -3415,6 +3504,7 @@ impl<'a> Canon<'a> {
         cols: &[String],
         row: &[Expr],
     ) -> R<Vec<(String, Term, Option<Ty>)>> {
+        self.period_omitted(table, cols)?;
         if row.len() != cols.len() {
             return Err("INSERT column count does not match VALUES".into());
         }
@@ -3443,6 +3533,7 @@ impl<'a> Canon<'a> {
             key: table.to_string(),
             table: table.to_string(),
             derived: None,
+            unique: None,
         }]);
         let items: R<Vec<Term>> = returning
             .iter()
@@ -3524,6 +3615,7 @@ impl<'a> Canon<'a> {
             key: table.to_string(),
             table: table.to_string(),
             derived: None,
+            unique: None,
         }]);
         let upd: R<Vec<Term>> = sets
             .iter()
@@ -3634,6 +3726,7 @@ impl<'a> Canon<'a> {
                 .unwrap_or_else(|| table.clone()),
             table: table.clone(),
             derived: None,
+            unique: None,
         };
         self.scopes.push(vec![
             tb,
@@ -3641,6 +3734,7 @@ impl<'a> Canon<'a> {
                 key: src_key,
                 table: "merge:source".into(),
                 derived: Some(src),
+                unique: None,
             },
         ]);
         let r = self.merge_inner(&table, hints, on, whens);
@@ -3854,6 +3948,18 @@ impl<'a> Canon<'a> {
             let table = b.table.clone();
             self.scopes.last_mut().unwrap().push(b);
             let from_t = self.push_from(&others)?;
+            // The derived tables of FROM, in order, with their keys as bound
+            // (WHERE's subqueries may reuse an alias).
+            let subs: Vec<(String, Option<Vec<String>>)> = self
+                .scopes
+                .last()
+                .map(|s| {
+                    s.iter()
+                        .filter(|b| b.table.starts_with("sub:"))
+                        .map(|b| (b.table.clone(), b.unique.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let w = match conds
                 .into_iter()
                 .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)))
@@ -3861,7 +3967,7 @@ impl<'a> Canon<'a> {
                 Some(w) => self.cond(&w)?.0,
                 None => a("-"),
             };
-            self.unique_match(&table, &from_t, &w)?;
+            self.unique_match(&table, &from_t, &subs, &w)?;
             let kv = self.update_sets(&table, sets)?;
             Ok(n(
                 "update-from",
@@ -3879,7 +3985,13 @@ impl<'a> Canon<'a> {
     /// LEFT JOIN, else in WHERE or any inner join's ON condition. String keys
     /// count only under the dialect's own comparison, which its unique keys
     /// follow.
-    fn unique_match(&mut self, target: &str, from: &[Term], w: &Term) -> R<()> {
+    fn unique_match(
+        &mut self,
+        target: &str,
+        from: &[Term],
+        subs: &[(String, Option<Vec<String>>)],
+        w: &Term,
+    ) -> R<()> {
         fn conj(t: &Term) -> Vec<Term> {
             if t.is("and") {
                 t.kids().to_vec()
@@ -3889,14 +4001,28 @@ impl<'a> Canon<'a> {
                 vec![t.clone()]
             }
         }
-        // (table, own ON condition of a LEFT JOIN)
-        fn leaves(t: &Term, out: &mut Vec<(String, Option<Term>)>, all: &mut Vec<Term>) -> bool {
+        // (table, own ON condition of a LEFT JOIN). A derived table is
+        // named by the next of `subs`, its bindings in FROM order.
+        type Subs<'s> = std::slice::Iter<'s, (String, Option<Vec<String>>)>;
+        fn name(t: &Term, subs: &mut Subs) -> Option<String> {
             match t.head() {
-                "t" => {
-                    out.push((
-                        t.kid(0).and_then(Term::atom).unwrap_or("").to_string(),
-                        None,
-                    ));
+                "t" => Some(t.kid(0).and_then(Term::atom).unwrap_or("").to_string()),
+                "sub" => subs.next().map(|s| s.0.clone()),
+                _ => None,
+            }
+        }
+        fn leaves(
+            t: &Term,
+            out: &mut Vec<(String, Option<Term>)>,
+            all: &mut Vec<Term>,
+            subs: &mut Subs,
+        ) -> bool {
+            match t.head() {
+                "t" | "sub" => {
+                    let Some(name) = name(t, subs) else {
+                        return false;
+                    };
+                    out.push((name, None));
                     true
                 }
                 "join" => {
@@ -3905,10 +4031,12 @@ impl<'a> Canon<'a> {
                     else {
                         return false;
                     };
-                    if !leaves(l, out, all) || !r.is("t") {
+                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub")) {
                         return false;
                     }
-                    let name = r.kid(0).and_then(Term::atom).unwrap_or("").to_string();
+                    let Some(name) = name(r, subs) else {
+                        return false;
+                    };
                     match kind {
                         "inner" | "cross" => {
                             all.extend(conj(on));
@@ -3927,8 +4055,9 @@ impl<'a> Canon<'a> {
         };
         let mut ls = Vec::new();
         let mut all = conj(w);
+        let mut sub_iter = subs.iter();
         for f in from {
-            if !leaves(f, &mut ls, &mut all) {
+            if !leaves(f, &mut ls, &mut all, &mut sub_iter) {
                 return fail();
             }
         }
@@ -3977,14 +4106,25 @@ impl<'a> Canon<'a> {
                         }
                     }
                 }
-                let key = self.schema.table(Self::base_table(t)).and_then(|tab| {
-                    tab.keys
+                let (key, how) = if t.starts_with("sub:") {
+                    let k = subs
                         .iter()
-                        .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
-                        .cloned()
-                });
+                        .find(|s| s.0 == *t)
+                        .and_then(|s| s.1.as_ref())
+                        .filter(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                        .cloned();
+                    (k, "GROUP BY")
+                } else {
+                    let k = self.schema.table(Self::base_table(t)).and_then(|tab| {
+                        tab.keys
+                            .iter()
+                            .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                            .cloned()
+                    });
+                    (k, "catalog")
+                };
                 if let Some(key) = key {
-                    self.discharge(format!("{t}.{} is a unique key (catalog)", key.join(", ")));
+                    self.discharge(format!("{t}.{} is a unique key ({how})", key.join(", ")));
                     bound.push(t.clone());
                     progress = true;
                 }
