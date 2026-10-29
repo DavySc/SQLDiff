@@ -204,7 +204,11 @@ the converted CREATE TABLE names after the table: `t_versioning` and
 disabled for DROP PERIOD and enabled for ADD PERIOD. Equal under
 `ASM-TEMPORAL-SWITCH` (those triggers are the converted versioning triggers,
 and the checks SQL Server makes on these statements are not relied on). `ALL`
-and `USER` are not compared.
+and `USER` are not compared. A write to a period column is compared as a
+plain write under `ASM-TEMPORAL-PERIOD-WRITE`; an INSERT that leaves a period
+column out, in a unit that switches the table's versioning or writes its
+period columns, is not compared (SQL Server takes the default or fails,
+PostgreSQL stores `-infinity`).
 
 **Comments.** The extended property's levels name the object: a schema; a
 table, view, procedure or function; a table's or view's column; a table's

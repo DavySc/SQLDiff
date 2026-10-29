@@ -186,3 +186,43 @@ fn a_computed_column_write_stays_refused() {
     );
     assert!(!asms(&r).contains(&"ASM-TEMPORAL-PERIOD-WRITE"));
 }
+
+#[test]
+fn an_insert_leaving_out_the_period_is_not_compared_where_the_period_is_dropped() {
+    // With the period dropped SQL Server takes the column's default or
+    // fails on NOT NULL (here: fails); PostgreSQL, its triggers disabled,
+    // stores '-infinity'.
+    let a = format!("{OFF_T}\n    INSERT Sales.Groups (GroupID, Name) VALUES (1, N'a');");
+    let b = format!("{OFF_P}\n    INSERT INTO Sales.Groups (GroupID, Name) VALUES (1, 'a');");
+    let r = run(&proc_t(&a), &proc_p(&b));
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    let why = "leaves out the period column validfrom, validto";
+    assert!(
+        r.unknown_reasons.iter().any(|x| x.contains(why))
+            || r.findings.iter().any(|f| f.witness.contains(why)),
+        "{:?} {:#?}",
+        r.unknown_reasons,
+        r.findings
+    );
+    // The same in code that writes a period column without switching.
+    let r = run(
+        &proc_t("    UPDATE Sales.Groups SET ValidFrom = '2020-01-02' WHERE GroupID = 1;\n    INSERT Sales.Groups (GroupID, Name) VALUES (2, N'b');"),
+        &proc_p("    UPDATE Sales.Groups SET ValidFrom = '2020-01-02' WHERE GroupID = 1;\n    INSERT INTO Sales.Groups (GroupID, Name) VALUES (2, 'b');"),
+    );
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    // Without either, the versioning triggers are on and stamp the period
+    // as SQL Server does: compared as before.
+    let r = run(
+        &proc_t("    INSERT Sales.Groups (GroupID, Name) VALUES (1, N'a');"),
+        &proc_p("    INSERT INTO Sales.Groups (GroupID, Name) VALUES (1, 'a');"),
+    );
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.witness.contains("leaves out the period")),
+        "{:#?}",
+        r.findings
+    );
+}

@@ -534,6 +534,62 @@ impl<'a> Canon<'a> {
         Ok(())
     }
 
+    /// An INSERT that leaves out a period column, in code that drops the
+    /// table's period (it switches the versioning or writes a period
+    /// column): with the period dropped, SQL Server takes the column's
+    /// default or fails on NOT NULL, while PostgreSQL, its versioning
+    /// triggers disabled, stores the converted default `-infinity`.
+    fn period_omitted(&self, table: &str, cols: &[String]) -> R<()> {
+        let Some(t) = self.schema.table(Self::base_table(table)) else {
+            return Ok(());
+        };
+        let missing: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period && !cols.contains(&c.name))
+            .map(|c| c.name.as_str())
+            .collect();
+        if missing.is_empty() || !self.drops_period(t) {
+            return Ok(());
+        }
+        Err(format!(
+            "the INSERT leaves out the period column {} of a table whose period this code drops or writes: with the period dropped SQL Server takes the column's default or fails, PostgreSQL stores '-infinity'",
+            missing.join(", ")
+        ))
+    }
+
+    /// Whether the unit switches `t`'s versioning, or writes (or may write:
+    /// a data statement naming the column) one of its period columns.
+    fn drops_period(&self, t: &super::schema::Table) -> bool {
+        let switched = self.unit.calls.iter().any(|(node, _)| {
+            matches!(
+                super::call::parse(&super::ast::tokens(node), self.d),
+                Ok(super::call::Stmt::Switch(s))
+                    if s.table.last().is_some_and(|n| n.text.eq_ignore_ascii_case(&t.name))
+            )
+        });
+        let period: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period)
+            .map(|c| c.name.as_str())
+            .collect();
+        switched
+            || self.unit.stmts.iter().any(|s| {
+                s.toks
+                    .first()
+                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
+                    && s.toks.iter().any(|x| {
+                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
+                            && period.contains(
+                                &sqldiff_syntax::ast::unquote(&x.text)
+                                    .to_lowercase()
+                                    .as_str(),
+                            )
+                    })
+            })
+    }
+
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
         let n0 = lc(name.trim_start_matches('@'));
         if let Some(i) = self.unit.params.iter().position(|p| p.name == n0) {
@@ -3093,6 +3149,7 @@ impl<'a> Canon<'a> {
                 Ok(n("insertn", vec![a(table), n("rows", sets)]))
             }
             InsertSource::Query(q) => {
+                self.period_omitted(table, cols)?;
                 let (parts, items) = self.query_parts(q, QCtx::Scalar)?;
                 if items.len() != cols.len() {
                     return Err("INSERT column count does not match the query".into());
@@ -3111,7 +3168,10 @@ impl<'a> Canon<'a> {
                 kv.sort();
                 Ok(n("insertq", vec![a(table), n("set", kv), n("q", parts)]))
             }
-            InsertSource::Default => Ok(n("insertdefault", vec![a(table)])),
+            InsertSource::Default => {
+                self.period_omitted(table, &[])?;
+                Ok(n("insertdefault", vec![a(table)]))
+            }
         }
     }
 
@@ -3121,6 +3181,7 @@ impl<'a> Canon<'a> {
         cols: &[String],
         row: &[Expr],
     ) -> R<Vec<(String, Term, Option<Ty>)>> {
+        self.period_omitted(table, cols)?;
         if row.len() != cols.len() {
             return Err("INSERT column count does not match VALUES".into());
         }
