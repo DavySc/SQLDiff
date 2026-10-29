@@ -361,3 +361,38 @@ $$;
         r.unknown_reasons
     );
 }
+
+#[test]
+fn a_change_inside_an_if_is_not_equal_in_one_dialect() {
+    // The mutation gate's case: an IF reported modified starts where its
+    // END marker's node does; the marker must not settle the finding.
+    let pg = |d: &str| {
+        format!(
+            "CREATE OR REPLACE FUNCTION f(p_s text) RETURNS timestamptz
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v timestamptz;
+BEGIN
+  IF p_s = 'a' THEN
+    v := now();
+  ELSIF p_s IS NOT NULL THEN
+    IF p_s = 'seconds' THEN
+      v := to_timestamp(p_s::double precision);
+    ELSIF p_s = 'milliseconds' THEN
+      v := to_timestamp((p_s::double precision) / {d});
+    END IF;
+  END IF;
+  RETURN v;
+END;
+$$;
+"
+        )
+    };
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Postgres, &pg("1000")),
+        &Artifact::new("b.sql", Dialect::Postgres, &pg("1001")),
+        &Options::default(),
+    );
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
+}

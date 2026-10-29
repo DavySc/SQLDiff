@@ -2674,10 +2674,14 @@ pub fn refine_modified(
         } else {
             f.b.as_ref()?
         };
+        // IF and loop markers are not statements: an END or ELSE marker
+        // starts where its whole IF does, which a finding on the IF names.
         items.iter().position(|it| {
-            it.nodes
-                .iter()
-                .any(|n| cst::sig_range(n).0 == loc.byte_start)
+            !is_ctl(it)
+                && it
+                    .nodes
+                    .iter()
+                    .any(|n| cst::sig_range(n).0 == loc.byte_start)
         })
     };
     let mut keep = Vec::new();
