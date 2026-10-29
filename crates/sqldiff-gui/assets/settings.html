@@ -135,6 +135,14 @@ pre.out { font-family: var(--mono); font-size: 12px; color: var(--fg); backgroun
       <div class="acts" id="fconfirm" hidden><span class="msg err" id="fconfirm-msg"></span><button type="button" id="fno">Cancel</button><button type="button" class="primary" id="fgo">Format files</button></div>
     </div>
   </div>
+  <div id="storedbox" hidden>
+    <h2>Stored conversions</h2>
+    <div class="form">
+      <div class="muted">Each run's conversion is kept here, so its review opens at once after a restart. One is used only by this build of the app, with the same sources, config, packs, base catalogs and hand-written texts; otherwise the tree is converted again. The oldest go when the folder holds more than <span id="stored-cap"></span>.</div>
+      <div class="field"><span>Folder</span><code id="stored-dir"></code></div>
+      <div class="acts"><span class="msg" id="stored-msg" role="status"></span><button type="button" class="outline" id="stored-clear">Clear</button></div>
+    </div>
+  </div>
 </div></main>
 <!--__SQLDIFF_PICKER__-->
 <script>
@@ -350,6 +358,20 @@ $("pdialect").innerHTML = INITIAL.dialects.map(([id, n]) => `<option value="${es
 $("pdialect").addEventListener("change", () => { useSample(); preview(); });
 $("src").addEventListener("input", schedule);
 useSample();
+
+const size = (n) => n >= 1 << 30 ? `${(n / (1 << 30)).toFixed(1)} GB` : n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB` : `${Math.ceil(n / 1024)} KB`;
+function showStored(u) {
+  $("storedbox").hidden = !u;
+  if (!u) return;
+  $("stored-dir").textContent = u.dir;
+  $("stored-cap").textContent = size(u.cap);
+  say("stored-msg", u.files ? `${u.files} conversion${u.files === 1 ? "" : "s"}, ${size(u.bytes)}` : "Nothing stored");
+  $("stored-clear").disabled = !u.files;
+}
+$("stored-clear").addEventListener("click", async () => {
+  try { showStored(await call("POST", "/api/stored/clear", {})); } catch (e) { say("stored-msg", e.message, true); }
+});
+if (!INITIAL.no_picking) call("GET", "/api/stored").then(showStored, () => {});
 
 if (INITIAL.no_picking) {
   $("ws").hidden = true;
