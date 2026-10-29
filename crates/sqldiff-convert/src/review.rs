@@ -287,7 +287,7 @@ pub fn ids_of<'a>(path: &str, units: impl Iterator<Item = (&'a str, &'a str)>) -
 }
 
 /// How a decision relates to the current conversion.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Applied {
     pub record: Record,
     /// Applies now: same unit, same files, and it fits the unit.
@@ -298,7 +298,7 @@ pub struct Applied {
 }
 
 /// A unit and what the ledger says about it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitReview {
     pub id: String,
     /// The unit's status, unchanged by any decision.
@@ -319,7 +319,7 @@ pub struct UnitReview {
 }
 
 /// The review of every unit of one converted file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileReview {
     pub path: String,
     pub units: Vec<UnitReview>,
