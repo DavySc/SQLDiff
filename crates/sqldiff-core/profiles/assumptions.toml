@@ -1405,3 +1405,10 @@ statement = "No view, routine or other object depends on a dropped object, and a
 discharge = "catalog"
 fact = "The target catalog's dependencies (pg_depend) on the object are only those dropped with it, and its routine name has one signature."
 sites = ["sqldiff-core/src/equiv/ddl.rs"]
+
+[[assumption]]
+id = "ASM-TRUNCATE"
+statement = "TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no ON TRUNCATE trigger is on the target table (T-SQL has none to fire), no sequence other than an identity column's belongs to the table (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe)."
+discharge = "catalog"
+fact = "No indexed view refers to the source table; the target table has no TRUNCATE trigger and owns only its identity column's sequence, whose START WITH is the T-SQL seed."
+sites = ["sqldiff-core/src/equiv/ddl.rs"]

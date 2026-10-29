@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 51 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 52 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 95 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 194 |
+| | Total | 195 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -193,6 +193,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TRIGGER-REPLACE` | No target trigger for an event the converted trigger no longer has stays behind after CREATE OR REPLACE. | `catalog` | The existing triggers on the target table. | `sqldiff-convert/src/tsql/trigger.rs` |
 | `ASM-TRIGGER-REPLICATION` | No replication agent writes the table of a NOT FOR REPLICATION trigger. | `deployment` | The replication set-up of the target. | `sqldiff-core/src/equiv/trigger.rs` |
 | `ASM-TRIGGER-ROWCOUNT` | No MERGE fires the trigger, or the rest of the trigger does nothing when its image is empty. | `deployment` | Which statements write the table. | `sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/src/equiv/trigger.rs` |
+| `ASM-TRUNCATE` | TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no ON TRUNCATE trigger is on the target table (T-SQL has none to fire), no sequence other than an identity column's belongs to the table (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe). | `catalog` | No indexed view refers to the source table; the target table has no TRUNCATE trigger and owns only its identity column's sequence, whose START WITH is the T-SQL seed. | `sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-TRY-HANDLER` | The TRY part raises no compile or name-resolution error (T-SQL's CATCH skips those, an SQLEXCEPTION handler does not). | `catalog` | Every name in the TRY part binds against the catalog. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TRY-SUBTRANSACTION` | Undoing the TRY part's completed statements on an error matches T-SQL (XACT_ABORT ON, or a CATCH that rolls back). | `deployment` | The callers' XACT_ABORT setting, or a reading of the CATCH block. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-TSQL-ANSI-NULL-DEFAULT` | T-SQL columns declared without NULL or NOT NULL are nullable (ANSI_NULL_DFLT_ON when the table was created). | `catalog` | The columns' nullability in the T-SQL catalog. | `sqldiff-core/src/equiv/table.rs` |

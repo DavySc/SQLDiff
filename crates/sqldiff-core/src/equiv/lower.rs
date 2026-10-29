@@ -1487,6 +1487,12 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         StmtKind::Ddl if u.kind == UnitKind::Script && is_create_ddl(c, d) => {
             u.ddl.push((c.clone(), u.stmts.len()));
         }
+        // A routine's TRUNCATE: compared statement against statement too,
+        // in its place among the data statements (`mod.rs::ddl_stmts` checks
+        // that it runs once).
+        StmtKind::Ddl if cst::first_words(c, 1) == ["TRUNCATE"] => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
             // `CREATE [OR REPLACE] VIEW name AS query` parsed as one statement.
             let toks = tokens(c);

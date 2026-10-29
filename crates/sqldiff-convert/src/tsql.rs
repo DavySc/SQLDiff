@@ -1835,14 +1835,25 @@ impl<'a> Cx<'a> {
                 if self.db2() && w(2) == "IF" {
                     return no("DROP … IF EXISTS: not checked for Db2 for i; test for the object in QSYS2 (for example QSYS2.SYSTABLES) first");
                 }
+                if !self.db2() && w(1) == "TRIGGER" {
+                    return no("DROP TRIGGER: PostgreSQL drops a trigger by name ON its table, which the T-SQL statement does not name; a converted trigger may also have a trigger function to drop");
+                }
                 self.expr(&ts)
+            }
+            "TRUNCATE" if ts.iter().any(|t| t.is("WITH")) => {
+                return no("TRUNCATE TABLE … WITH (PARTITIONS …): no rule yet");
             }
             "TRUNCATE" if self.db2() => {
                 self.note(Status::Assumptions, "ASM-DB2-TRUNCATE", "TRUNCATE TABLE gets RESTART IDENTITY, since T-SQL resets the identity seed. Not checked on a real system: whether Db2 for i can roll a TRUNCATE back as T-SQL can (IMMEDIATE certainly cannot).");
                 self.step_ts("tsql.stmt.truncate", &ts);
                 format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
             }
-            "TRUNCATE" => self.expr(&ts),
+            "TRUNCATE" => {
+                // T-SQL resets the identity to its seed; PostgreSQL keeps it
+                // unless asked.
+                self.step_ts("tsql.stmt.truncate", &ts);
+                format!("{} RESTART IDENTITY", self.expr(&Self::body_toks(&ts)).trim_end())
+            }
             "USE" => return no(self.pick(
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
@@ -4411,7 +4422,11 @@ impl<'a> Cx<'a> {
         while i < ts.len() {
             let after_paren = prev_sig(ts, i).is_some_and(|p| ts[p].k == R_PAREN);
             if ds[i] == 0 && after_paren && (ts[i].is("ON") || ts[i].is("TEXTIMAGE_ON")) {
-                let nx = next_sig(ts, i).unwrap_or(i);
+                let mut nx = next_sig(ts, i).unwrap_or(i);
+                // `ON scheme (column)`: a partition scheme with its column.
+                if let Some(open) = next_sig(ts, nx).filter(|&p| ts[p].k == L_PAREN) {
+                    nx = matching(ts, open).ok_or(No("unbalanced parentheses".into()))?;
+                }
                 cut[i..=nx].iter_mut().for_each(|c| *c = true);
                 self.step_ts("tsql.storage-options", &ts[i..=nx]);
                 dropped = true;
@@ -4805,34 +4820,7 @@ impl<'a> Cx<'a> {
             return no("empty item in the column list (a trailing comma)");
         };
         if constraint_item(first) {
-            // PRIMARY KEY (a ASC): the targets take no sort order in a key's
-            // column list. The order only shapes the key's index.
-            let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
-            let ds = crate::tok::depths(it);
-            let order = |j: usize| key && ds[j] == 1 && (it[j].is("ASC") || it[j].is("DESC"));
-            if (0..it.len()).any(|j| order(j) && it[j].is("DESC")) {
-                let text = self.pick(
-                    "DESC in a key's column list was dropped: PostgreSQL keys take no sort order. Results are the same; only the key's index is built ascending.",
-                    "DESC in a key's column list was dropped: Db2 for i keys take no sort order. Results are the same; only the key's index is built ascending.",
-                ).to_string();
-                self.note(Status::Converted, "tsql.key-order", &text);
-            }
-            for j in 0..it.len() {
-                if it[j].is("CLUSTERED") || it[j].is("NONCLUSTERED") {
-                    self.step_ts("tsql.index.clustered", &it[j..=j]);
-                } else if order(j) {
-                    self.step_ts("tsql.key-order", &it[j..=j]);
-                }
-            }
-            let kept: Vec<T> = (0..it.len())
-                .filter(|&j| {
-                    let t = &it[j];
-                    let before_order = !t.sig() && next_sig(it, j).is_some_and(order);
-                    !(t.is("CLUSTERED") || t.is("NONCLUSTERED") || order(j) || before_order)
-                })
-                .map(|j| it[j].clone())
-                .collect();
-            return Ok(format!("{lead}{}", collapse_spaces(&self.expr(&kept))));
+            return Ok(format!("{lead}{}", self.constraint_def(it)?));
         }
         if first.is("INDEX") {
             return no(
@@ -4841,6 +4829,95 @@ impl<'a> Cx<'a> {
         }
         let pk_col = pk.contains(&tsql_unquote(&first.s).to_ascii_lowercase());
         Ok(format!("{lead}{}", self.column_def(it, pk_col)?))
+    }
+
+    /// A table constraint (`[CONSTRAINT n] PRIMARY KEY CLUSTERED (a ASC)`)
+    /// without what only shapes the key's index: CLUSTERED / NONCLUSTERED
+    /// and a sort order in the key's column list.
+    fn constraint_def(&mut self, it: &[T]) -> R<String> {
+        // The key's index: storage options (not IGNORE_DUP_KEY = ON, which
+        // changes what the key accepts), a filegroup or a partition scheme.
+        let it = &self.strip_constraint_storage(it)?;
+        let ds = crate::tok::depths(it);
+        // PRIMARY KEY (a ASC): the targets take no sort order in a key's
+        // column list. The order only shapes the key's index.
+        let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
+        let order = |j: usize| key && ds[j] == 1 && (it[j].is("ASC") || it[j].is("DESC"));
+        if (0..it.len()).any(|j| order(j) && it[j].is("DESC")) {
+            let text = self.pick(
+                "DESC in a key's column list was dropped: PostgreSQL keys take no sort order. Results are the same; only the key's index is built ascending.",
+                "DESC in a key's column list was dropped: Db2 for i keys take no sort order. Results are the same; only the key's index is built ascending.",
+            ).to_string();
+            self.note(Status::Converted, "tsql.key-order", &text);
+        }
+        for j in 0..it.len() {
+            if it[j].is("CLUSTERED") || it[j].is("NONCLUSTERED") {
+                self.step_ts("tsql.index.clustered", &it[j..=j]);
+            } else if order(j) {
+                self.step_ts("tsql.key-order", &it[j..=j]);
+            }
+        }
+        let kept: Vec<T> = (0..it.len())
+            .filter(|&j| {
+                let t = &it[j];
+                let before_order = !t.sig() && next_sig(it, j).is_some_and(order);
+                !(t.is("CLUSTERED") || t.is("NONCLUSTERED") || order(j) || before_order)
+            })
+            .map(|j| it[j].clone())
+            .collect();
+        Ok(collapse_spaces(&self.expr(&kept)))
+    }
+
+    /// A table constraint's `WITH (…)` storage options and `ON filegroup` /
+    /// `ON scheme (column)`, removed (`ON DELETE` / `ON UPDATE` stay).
+    fn strip_constraint_storage(&mut self, it: &[T]) -> R<Vec<T>> {
+        let ds = crate::tok::depths(it);
+        let mut cut = vec![false; it.len()];
+        let mut dropped = false;
+        let mut i = 0;
+        while i < it.len() {
+            if ds[i] != 0 {
+                i += 1;
+                continue;
+            }
+            if it[i].is("WITH") {
+                let open = next_sig(it, i).filter(|&p| it[p].k == L_PAREN).ok_or(No(
+                    "constraint WITH option without parentheses: no rule yet".into(),
+                ))?;
+                let r = matching(it, open).ok_or(No("unbalanced parentheses".into()))?;
+                for opt in split_commas(&it[open + 1..r]) {
+                    storage_option(opt)?;
+                }
+                cut[i..=r].iter_mut().for_each(|c| *c = true);
+                self.step_ts("tsql.storage-options", &it[i..=r]);
+                dropped = true;
+                i = r + 1;
+                continue;
+            }
+            let action = next_sig(it, i).is_some_and(|k| it[k].is("DELETE") || it[k].is("UPDATE"));
+            if it[i].is("ON") && !action {
+                let name = next_sig(it, i).ok_or(No("ON without a filegroup".into()))?;
+                let end = match next_sig(it, name).filter(|&p| it[p].k == L_PAREN) {
+                    Some(open) => matching(it, open).ok_or(No("unbalanced parentheses".into()))?,
+                    None => name,
+                };
+                cut[i..=end].iter_mut().for_each(|c| *c = true);
+                self.step_ts("tsql.storage-options", &it[i..=end]);
+                dropped = true;
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        if dropped {
+            self.note(Status::Converted, "tsql.storage-options", "Filegroup, partition scheme and storage options of a key (ON [PRIMARY], ON scheme (column), WITH (…)) were dropped; they place rows and shape the key's index, they do not change results.");
+        }
+        Ok(it
+            .iter()
+            .zip(cut)
+            .filter(|(_, c)| !c)
+            .map(|(t, _)| t.clone())
+            .collect())
     }
 
     /// `pk_col`: (Db2) the column is in a table-level PRIMARY KEY.
@@ -5375,7 +5452,18 @@ impl<'a> Cx<'a> {
                 let cols = find_word(&ts, 0, "TABLE")
                     .map(|t| self.table_bit_cols(&ts[t + 1..name_end]))
                     .unwrap_or_default();
-                return self.with_bit_cols(cols, |cx| Ok(cx.expr(&ts)));
+                // Each constraint as a table constraint is (CLUSTERED and a
+                // key's sort order dropped); the targets repeat ADD.
+                let head = self.expr(&ts[..nx]);
+                let items: Vec<Vec<T>> = split_commas(&ts[nx..])
+                    .into_iter()
+                    .map(|c| trimmed(c).to_vec())
+                    .collect();
+                let sep = self.pick(", ADD ", " ADD ");
+                return self.with_bit_cols(cols, |cx| {
+                    let defs: R<Vec<String>> = items.iter().map(|c| cx.constraint_def(c)).collect();
+                    Ok(format!("{head}{}", defs?.join(sep)))
+                });
             }
             let head = self.expr(&ts[..nx]);
             let cols: R<Vec<String>> = split_commas(&ts[nx..])

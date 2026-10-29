@@ -274,3 +274,107 @@ fn a_second_default_is_not_compared() {
         .expect("assumption");
     assert!(a.text.contains("no default yet"), "{}", a.text);
 }
+
+const PROC_T: &str = "CREATE PROCEDURE dbo.reset AS
+BEGIN
+    SET XACT_ABORT ON;
+    BEGIN TRANSACTION;
+    DELETE FROM dbo.Log WHERE id < 0;
+    TRUNCATE TABLE dbo.Orders;
+    INSERT INTO dbo.Log (id) VALUES (1);
+    COMMIT;
+END;
+";
+
+fn proc_p(truncate: &str) -> String {
+    format!(
+        "CREATE OR REPLACE PROCEDURE reset()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  DELETE FROM Log WHERE id < 0;
+  {truncate}
+  INSERT INTO Log (id) VALUES (1);
+  COMMIT;
+END;
+$$;
+"
+    )
+}
+
+#[test]
+fn truncate_is_compared_with_the_identity_restarted() {
+    let r = equal(PROC_T, &proc_p("TRUNCATE TABLE Orders RESTART IDENTITY;"));
+    assert!(asms(&r).contains(&"ASM-TRUNCATE"), "{:?}", asms(&r));
+    // PostgreSQL keeps the identity counter unless asked.
+    unknown(
+        PROC_T,
+        &proc_p("TRUNCATE TABLE Orders;"),
+        "RESTART IDENTITY",
+    );
+    unknown(
+        PROC_T,
+        &proc_p("TRUNCATE TABLE Orders CONTINUE IDENTITY;"),
+        "RESTART IDENTITY",
+    );
+    differs(
+        PROC_T,
+        &proc_p("TRUNCATE TABLE Log RESTART IDENTITY;"),
+        "equiv.truncate-table",
+    );
+    // CASCADE empties the tables that refer to it too; several tables.
+    unknown(
+        PROC_T,
+        &proc_p("TRUNCATE TABLE Orders RESTART IDENTITY CASCADE;"),
+        "TRUNCATE",
+    );
+    unknown(
+        PROC_T,
+        &proc_p("TRUNCATE TABLE Orders, Log RESTART IDENTITY;"),
+        "TRUNCATE",
+    );
+    // In its place among the data statements.
+    let moved = "CREATE OR REPLACE PROCEDURE reset()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  TRUNCATE TABLE Orders RESTART IDENTITY;
+  DELETE FROM Log WHERE id < 0;
+  INSERT INTO Log (id) VALUES (1);
+  COMMIT;
+END;
+$$;
+";
+    unknown(PROC_T, moved, "data statement(s)");
+    // Inside a branch, or with a row count read, it is not compared.
+    let t_if = PROC_T.replace(
+        "    TRUNCATE TABLE dbo.Orders;",
+        "    IF 1 = 1 TRUNCATE TABLE dbo.Orders;",
+    );
+    let p_if = proc_p("IF 1 = 1 THEN TRUNCATE TABLE Orders RESTART IDENTITY; END IF;");
+    unknown(&t_if, &p_if, "inside an IF");
+    let t_rc = PROC_T.replace(
+        "    INSERT INTO dbo.Log (id) VALUES (1);",
+        "    INSERT INTO dbo.Log (id) VALUES (@@ROWCOUNT);",
+    );
+    let p_rc = proc_p("TRUNCATE TABLE Orders RESTART IDENTITY;").replace(
+        "  INSERT INTO Log (id) VALUES (1);",
+        "  GET DIAGNOSTICS n = ROW_COUNT;\n  INSERT INTO Log (id) VALUES (n);",
+    );
+    unknown(&t_rc, &p_rc, "row count");
+}
+
+#[test]
+fn a_truncate_kept_by_t_sql_after_a_failure_is_found() {
+    // Without XACT_ABORT ON, T-SQL keeps the TRUNCATE when the INSERT after
+    // it fails; the PostgreSQL procedure undoes it.
+    let t = PROC_T
+        .replace("    SET XACT_ABORT ON;\n", "")
+        .replace("    BEGIN TRANSACTION;\n", "")
+        .replace("    COMMIT;\n", "")
+        .replace("    DELETE FROM dbo.Log WHERE id < 0;\n", "");
+    let p = proc_p("TRUNCATE TABLE Orders RESTART IDENTITY;")
+        .replace("  COMMIT;\n", "")
+        .replace("  DELETE FROM Log WHERE id < 0;\n", "");
+    differs(&t, &p, "txn.atomicity");
+}
