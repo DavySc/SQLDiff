@@ -640,6 +640,9 @@ pub struct Side<'s> {
     pub unit: &'s Unit,
     pub schema: &'s Schema,
     pub name: &'s str,
+    /// The statement sits in a PostgreSQL DO block (PL/pgSQL), even when
+    /// the unit is a script.
+    pub in_do: bool,
 }
 
 /// Compares a T-SQL statement `t` with a PostgreSQL statement `p`.
@@ -1276,7 +1279,7 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
                     "{what}: the output is not passed to a variable on both sides"
                 ));
             }
-            if p.unit.kind == super::lower::UnitKind::Script {
+            if p.unit.kind == super::lower::UnitKind::Script && !p.in_do {
                 return Err(format!(
                     "{what}: a CALL outside PL/pgSQL returns INOUT values as a row"
                 ));
