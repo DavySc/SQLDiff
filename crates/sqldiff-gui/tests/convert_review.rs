@@ -704,7 +704,8 @@ fn the_gate_banner_counts_the_blockers_it_does_not_list() {
         eprintln!("skipped: node not found");
         return;
     }
-    let page = sqldiff_gui::convert_review::REVIEW_HTML;
+    // CRLF where Windows CI checks the page out so.
+    let page = sqldiff_gui::convert_review::REVIEW_HTML.replace("\r\n", "\n");
     let esc = &page[page.find("const esc = ").expect("esc")..];
     let esc = &esc[..esc.find('\n').unwrap()];
     let list = &page[page.find("function blockerList(g)").expect("blockerList")..];
