@@ -4531,6 +4531,11 @@ impl<'a> Cx<'a> {
                 ("@@TRANCOUNT", true) => "@@TRANCOUNT: Db2 for i transactions do not nest",
                 ("@@IDENTITY", false) => "@@IDENTITY: use INSERT … RETURNING",
                 ("@@IDENTITY", true) => "@@IDENTITY: use IDENTITY_VAL_LOCAL() or SELECT … FROM FINAL TABLE (INSERT …)",
+                ("@@FETCH_STATUS", false) => "@@FETCH_STATUS: convert the cursor loop to FOR rec IN … LOOP, or FETCH …; EXIT WHEN NOT FOUND (no rule yet)",
+                ("@@PROCID", false) => "@@PROCID is the running module's SQL Server object id; PostgreSQL routines have none. Write the routine's own name (or what the id was used to look up) as a literal",
+                ("@@SERVERNAME", false) => "@@SERVERNAME is the SQL Server instance name; PostgreSQL has no instance name (cluster_name and inet_server_addr() are other things)",
+                ("@@SPID", false) => "@@SPID: pg_backend_pid() is a process id, not a session id that SQL Server tables hold",
+                ("@@VERSION", false) => "@@VERSION: version() returns PostgreSQL's own text; code that parses SQL Server's version string must be rewritten",
                 (_, false) => "T-SQL global variable with no PostgreSQL equivalent",
                 (_, true) => "T-SQL global variable with no Db2 for i equivalent",
             };
@@ -5183,10 +5188,22 @@ impl<'a> Cx<'a> {
             ("CHARINDEX", 2) => {
                 self.ci_note();
                 let (x, y) = (e(self, 0), e(self, 1));
-                format!("strpos({y}, {x})")
+                // CHARINDEX finds an empty string nowhere (0); strpos finds it
+                // at 1. A literal needle shows it is not empty.
+                if nonempty_literal(a[0]) || self.nonempty_concat(a[0]) {
+                    format!("strpos({y}, {x})")
+                } else if simple_operand(a[0]) {
+                    format!("(CASE WHEN length({x}) = 0 THEN 0 ELSE strpos({y}, {x}) END)")
+                } else {
+                    self.note(Status::NotConverted, "tsql.charindex", "CHARINDEX of a computed needle: CHARINDEX finds an empty needle nowhere (0), strpos at 1, so the needle must be tested first. Store it in a variable, then convert.");
+                    return None;
+                }
             }
             ("NEWID", 0) => "gen_random_uuid()".into(),
-            ("DB_NAME", 0) => "current_database()".into(),
+            ("DB_NAME", 0) => {
+                self.note(Status::Assumptions, "ASM-SAME-DATABASE-NAME", "DB_NAME() becomes current_database(): equal if the PostgreSQL database has the same name, letter for letter, as the SQL Server database.");
+                "current_database()".into()
+            }
             // Code points 1 to 127 are the same character in every code page and in
             // Unicode. 0 (`chr(0)` is an error), 128 to 255 (the database's code
             // page decides) and a value only known at run time stay unconverted.
@@ -5199,6 +5216,21 @@ impl<'a> Cx<'a> {
                 match text.parse::<u8>() {
                     Ok(code @ 1..=127) => format!("chr({code})"),
                     _ => return None,
+                }
+            }
+            // NCHAR: the same for code points 1 to 127.
+            ("NCHAR", 1) => {
+                let text: String = a[0]
+                    .iter()
+                    .filter(|t| t.sig())
+                    .map(|t| t.s.as_str())
+                    .collect();
+                match text.parse::<u8>() {
+                    Ok(code @ 1..=127) => format!("chr({code})"),
+                    _ => {
+                        self.note(Status::NotConverted, "tsql.nchar", "NCHAR() of a value other than a literal from 1 to 127: NCHAR returns a UTF-16 code unit (or NULL out of range), chr() a code point in the database encoding (an error for 0); not converted.");
+                        return None;
+                    }
                 }
             }
             ("QUOTENAME", 1) => {
@@ -5240,14 +5272,20 @@ impl<'a> Cx<'a> {
                 return self.cast_pg(&a[0][..at], &a[0][at + 1..]);
             }
             ("CONVERT", 2) => return self.cast_pg(a[1], a[0]),
-            ("CONVERT", 3) => {
-                self.note(Status::NotConverted, "tsql.convert-style", "CONVERT with a style code: use to_char / to_timestamp with the matching format.");
-                return None;
-            }
+            ("CONVERT", 3) => return self.convert_style(&a),
             ("DATEADD", 3) => return self.dateadd(&a),
             ("DATEPART", 2) => {
-                let part = date_part(&self.expr(a[0]))?;
-                format!("EXTRACT({part} FROM {})::int", e(self, 1))
+                let p = self.expr(a[0]);
+                if is_weekday(&p) {
+                    self.note(Status::Assumptions, "ASM-TSQL-DATEFIRST-7", "DATEPART(weekday, …) becomes EXTRACT(DOW …) + 1: Sunday is 1, as with SET DATEFIRST 7 (the us_english default). Equal if the session keeps DATEFIRST 7.");
+                    return Some(format!("(EXTRACT(DOW FROM {})::int + 1)", e(self, 1)));
+                }
+                match date_part(&p)? {
+                    // EXTRACT(SECOND …) keeps the fraction and ::int rounds it
+                    // (59.9 → 60); DATEPART truncates (59).
+                    "second" => format!("floor(EXTRACT(SECOND FROM {}))::int", e(self, 1)),
+                    part => format!("EXTRACT({part} FROM {})::int", e(self, 1)),
+                }
             }
             ("YEAR" | "MONTH" | "DAY", 1) => format!("EXTRACT({name} FROM {})::int", e(self, 0)),
             ("DATEDIFF", 3)
@@ -5272,10 +5310,14 @@ impl<'a> Cx<'a> {
                 | "ERROR_PROCEDURE",
                 _,
             ) => {
+                let text = match builtin_refusal(name) {
+                    Some(why) => format!("{name}(): {why}"),
+                    None => format!("{name}() has no rule yet."),
+                };
                 self.note(
                     Status::NotConverted,
                     &format!("tsql.{}", name.to_ascii_lowercase()),
-                    &format!("{name}() has no rule yet."),
+                    &text,
                 );
                 return None;
             }
@@ -5440,15 +5482,20 @@ impl<'a> Cx<'a> {
         let tsql = builtins::of(Dialect::Tsql).function(name, "9999") != Availability::Unknown;
         let target = builtins::of(self.to).function(name, "9999") != Availability::Unknown;
         if tsql && !target {
-            self.note(
-                Status::NotConverted,
-                "tsql.builtin",
-                &format!(
-                    "{}() is a T-SQL built-in that {} does not have; no rule yet.",
-                    name.to_ascii_uppercase(),
+            let up = name.to_ascii_uppercase();
+            let why = if self.db2() {
+                None
+            } else {
+                builtin_refusal(&up)
+            };
+            let text = match why {
+                Some(why) => format!("{up}(): {why}"),
+                None => format!(
+                    "{up}() is a T-SQL built-in that {} does not have; no rule yet.",
                     self.to.display_name()
                 ),
-            );
+            };
+            self.note(Status::NotConverted, "tsql.builtin", &text);
         }
     }
 
@@ -6689,6 +6736,75 @@ fn date_part(p: &str) -> Option<&'static str> {
     })
 }
 
+/// Why a T-SQL built-in has no rule: the ones whose result describes SQL
+/// Server itself, or whose target counterpart was checked and differs.
+fn builtin_refusal(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "SERVERPROPERTY" => "describes the SQL Server instance (version, edition, installed features such as In-Memory OLTP or PolyBase); the target has no such properties. Decide by hand what the check means on the target (usually: drop the branch for a SQL Server-only feature).",
+        "DATABASEPROPERTYEX" => "describes a SQL Server database setting; the target has no such properties. Decide by hand what the check means on the target.",
+        "OBJECT_ID" => "returns a SQL Server object id, which nothing on the target has. For an existence test on PostgreSQL write to_regclass('schema.name') IS NULL (any relation kind) or a pg_class query that checks the kind; not converted automatically, because OBJECT_ID's type argument ('U', 'P', …) does not map onto one lookup.",
+        "OBJECT_NAME" | "OBJECT_SCHEMA_NAME" | "OBJECT_DEFINITION" => "looks a SQL Server object id up (often @@PROCID, the running module); the target has no object ids. Write the routine's own name as a literal.",
+        "DB_ID" => "returns a SQL Server database id; the target has none that compare. Compare database names instead (current_database() on PostgreSQL).",
+        "SCHEMA_NAME" => "looks a SQL Server schema id up; the target's schema ids differ. Write the schema name as a literal or use current_schema.",
+        "SUSER_SNAME" | "SUSER_NAME" | "SUSER_SID" => "returns a SQL Server login (or the login of a SID such as 0x01, sa); logins have no target equivalent (PostgreSQL roles are not logins).",
+        "JSON_MODIFY" => "jsonb_set is not the same function: JSON_MODIFY deletes a key when the new value is NULL, quotes a string unless it is wrapped in JSON_QUERY, appends with 'append', and treats lax and strict paths differently. No checked rule.",
+        "CHECKSUM" | "BINARY_CHECKSUM" => "is SQL Server's own hash; no target function gives the same values. ABS(CHECKSUM(NEWID())) % n is a random number: rewrite it by hand (floor(random() * n)::int on PostgreSQL), knowing no conversion of a random value can be shown equal.",
+        "HASHBYTES" => "hashes the bytes of the T-SQL value: UTF-16LE for NVARCHAR, the code page for VARCHAR. PostgreSQL's sha256/md5 hash UTF-8 text, so the results differ for most strings; not converted.",
+        "COMPRESS" | "DECOMPRESS" => "uses SQL Server's GZIP format on varbinary; the target has no built-in that reads or writes it.",
+        "SESSION_CONTEXT" => "reads SQL Server session context (sp_set_session_context); on PostgreSQL use custom settings (current_setting('app.key', true)) and set them where sp_set_session_context is called.",
+        "ISJSON" => "differs from PostgreSQL's IS JSON in which values count as JSON (scalars, duplicate keys); not checked, so not converted.",
+        "STRING_ESCAPE" => "has no target counterpart that escapes the same characters; not converted.",
+        "DATENAME" => "returns names in the session language (SET LANGUAGE); to_char's names follow lc_time and are blank-padded unless FM is used. No checked rule.",
+        "XACT_STATE" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE" | "ERROR_PROCEDURE" => "error and transaction state has no PostgreSQL counterpart with the same values (PostgreSQL ends the transaction on an error and has no severity); rewrite the CATCH logic by hand.",
+        "FORMAT" => "uses .NET format strings and culture; to_char's patterns differ. No checked rule.",
+        _ => return None,
+    })
+}
+
+/// DATEPART's `weekday` and its abbreviations.
+fn is_weekday(p: &str) -> bool {
+    matches!(
+        p.trim().to_ascii_lowercase().as_str(),
+        "weekday" | "dw" | "w"
+    )
+}
+
+/// A string literal with at least one character.
+fn nonempty_literal(ts: &[T]) -> bool {
+    match sig(trimmed(ts)).as_slice() {
+        [i] => {
+            let t = &trimmed(ts)[*i];
+            t.k == STRING && !string_value(&t.s).is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// One variable, column name or literal: safe to evaluate twice.
+fn simple_operand(ts: &[T]) -> bool {
+    let ts = trimmed(ts);
+    let s = sig(ts);
+    s.iter().enumerate().all(|(k, &i)| match ts[i].k {
+        VARIABLE | STRING | NUMBER => s.len() == 1,
+        IDENT | QUOTED_IDENT => k % 2 == 0,
+        DOT => k % 2 == 1,
+        _ => false,
+    }) && !s.is_empty()
+        && s.len() % 2 == 1
+}
+
+/// The PostgreSQL to_char format that prints what CONVERT(varchar, x, style)
+/// prints, and the text's length: the engine's table, for a date or a
+/// datetime / datetime2 (smalldatetime and time are left out).
+fn style_format(dt: Dt, style: u32) -> Option<(&'static str, u32)> {
+    let date_only = match dt {
+        Dt::Date => true,
+        Dt::DateTime | Dt::DateTime2(_) => false,
+        _ => return None,
+    };
+    sqldiff_core::equiv::canon::style_format(date_only, style)
+}
+
 /// A T-SQL built-in whose result is always a string, so `+` next to a call
 /// to it is concatenation.
 fn string_builtin(ts: &[T], i: usize) -> bool {
@@ -7461,6 +7577,90 @@ impl Cx<'_> {
             }
             _ => self.column_dt(ts),
         }
+    }
+
+    /// `@s + ' '`: string variables and literals joined by `+`, one of them
+    /// a non-empty literal, so the result is never empty (NULL stays NULL).
+    fn nonempty_concat(&self, ts: &[T]) -> bool {
+        let ts = trimmed(ts);
+        let s = sig(ts);
+        let mut literal = false;
+        for (k, &i) in s.iter().enumerate() {
+            let t = &ts[i];
+            let ok = if k % 2 == 1 {
+                t.k == OP && t.s == "+"
+            } else {
+                match t.k {
+                    STRING => {
+                        literal |= !string_value(&t.s).is_empty();
+                        true
+                    }
+                    VARIABLE => self.expr_dt(&ts[i..=i]) == Some(Dt::Text),
+                    _ => false,
+                }
+            };
+            if !ok {
+                return false;
+            }
+        }
+        literal && s.len() % 2 == 1
+    }
+
+    /// PostgreSQL: CONVERT(varchar(n), x, style) of a date or date-time
+    /// value → to_char(x, format), for the styles `style_format` knows.
+    fn convert_style(&mut self, a: &[&[T]]) -> Option<String> {
+        let refuse = |cx: &mut Self, why: String| {
+            cx.note(
+                Status::NotConverted,
+                "tsql.convert-style",
+                &format!("CONVERT with a style code: {why}"),
+            );
+            None
+        };
+        let ty = trimmed(a[0]);
+        let words: Vec<String> = sig(ty).iter().map(|&i| ty[i].up()).collect();
+        let len = match words
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["VARCHAR" | "NVARCHAR"] => Some(30),
+            ["VARCHAR" | "NVARCHAR", "(", "MAX", ")"] => None,
+            ["VARCHAR" | "NVARCHAR", "(", n, ")"] => match n.parse::<u32>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => return refuse(self, "the target length is not a number.".into()),
+            },
+            _ => {
+                return refuse(
+                    self,
+                    "only a VARCHAR or NVARCHAR target has a checked rule (to_char).".into(),
+                )
+            }
+        };
+        let style = trimmed(a[2]);
+        let style = match sig(style).as_slice() {
+            [i] if style[*i].k == NUMBER => style[*i].s.parse::<u32>().ok(),
+            _ => None,
+        };
+        let Some(style) = style else {
+            return refuse(self, "the style is not a literal number.".into());
+        };
+        let dt = self.expr_dt(a[1]);
+        let Some((fmt, width)) = dt.and_then(|d| style_format(d, style)) else {
+            let of = match dt {
+                Some(d) if d.is_date() => d.name(),
+                Some(_) => "a value that is not a date".into(),
+                None => "a value of unknown type".into(),
+            };
+            return refuse(self, format!("style {style} of {of} has no checked to_char format (checked: 20, 120, 23, 102, 111, 112 of date, datetime and datetime2; 108 of datetime and datetime2)."));
+        };
+        let x = self.expr(a[1]).trim().to_string();
+        let out = format!("to_char({x}, '{fmt}')");
+        Some(match len {
+            Some(n) if n < width => format!("CAST({out} AS varchar({n}))"),
+            _ => out,
+        })
     }
 
     /// The DATEADD number as an integer, made the way T-SQL makes it: a

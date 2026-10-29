@@ -28,6 +28,18 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 
 /// Assumption identifiers and texts used by the equivalence rules.
 pub mod asm {
+    pub const LEN_BMP: (&str, &str) = (
+        "ASM-TSQL-LEN-BMP",
+        "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
+    );
+    pub const DATEFIRST_7: (&str, &str) = (
+        "ASM-TSQL-DATEFIRST-7",
+        "The T-SQL session keeps SET DATEFIRST 7 (the us_english default): DATEPART(weekday) counts Sunday as 1",
+    );
+    pub const SAME_DATABASE_NAME: (&str, &str) = (
+        "ASM-SAME-DATABASE-NAME",
+        "The PostgreSQL database has the same name, letter for letter, as the SQL Server database",
+    );
     pub const TSQL_CI: (&str, &str) = (
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
@@ -1120,6 +1132,33 @@ impl<'a> Canon<'a> {
                         }
                     }
                 }
+                // EXTRACT(part FROM x)::int is DATEPART's integer; for
+                // seconds only once floor or trunc drops the fraction
+                // (::int rounds 59.9 to 60).
+                if self.d == Dialect::Postgres && dst.fam == Fam::Int && dst.len == Some(32) {
+                    let inner = match x.as_ref() {
+                        Expr::Extract(f, y) if !f.eq_ignore_ascii_case("second") => Some((f, y)),
+                        Expr::Call(c)
+                            if c.name.len() == 1
+                                && matches!(lc(&c.name[0]).as_str(), "floor" | "trunc")
+                                && c.args.len() == 1 =>
+                        {
+                            match &c.args[0] {
+                                Expr::Extract(f, y) if f.eq_ignore_ascii_case("second") => {
+                                    Some((f, y))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((f, y)) = inner {
+                        let v = self.expr(y)?;
+                        if let Some(t) = self.datepart(&lc(f), v) {
+                            return Ok(t);
+                        }
+                    }
+                }
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
@@ -1594,6 +1633,39 @@ impl<'a> Canon<'a> {
                     return self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty));
                 }
             }
+            // CONVERT(varchar(n), x, style) of a date or date-time: the text
+            // to_char prints with the matching format.
+            (Dialect::Tsql, "convert") if argc == 3 && plain => {
+                if let Some(t) = self.tsql_convert_style(c)? {
+                    return Ok(t);
+                }
+            }
+            (Dialect::Tsql, "datepart") if argc == 2 && plain => {
+                let part = match &c.args[0] {
+                    Expr::Name(p) if p.len() == 1 => tsql_datepart(&p[0]),
+                    _ => None,
+                };
+                if let Some(part) = part {
+                    let x = self.expr(&c.args[1])?;
+                    if part == "weekday" {
+                        // Sunday is 1 under DATEFIRST 7: EXTRACT(DOW) + 1.
+                        if let Some(dow) = self.datepart("dow", x) {
+                            self.assume(asm::DATEFIRST_7);
+                            let mut v = vec![dow.0, n("num", vec![a("1")])];
+                            v.sort();
+                            return Ok((n("add", v), dow.1));
+                        }
+                    } else if let Some(t) = self.datepart(part, x) {
+                        return Ok(t);
+                    }
+                }
+            }
+            (Dialect::Tsql, "year" | "month" | "day") if argc == 1 && plain => {
+                let x = self.expr(&c.args[0])?;
+                if let Some(t) = self.datepart(&name, x) {
+                    return Ok(t);
+                }
+            }
             // IIF is shorthand for this CASE; SQL Server rewrites it so.
             (Dialect::Tsql, "iif") if argc == 3 && plain => {
                 let [c0, x, y] = [0, 1, 2].map(|k| c.args[k].clone());
@@ -1671,6 +1743,160 @@ impl<'a> Canon<'a> {
                         ),
                         first_ty,
                     )
+                }
+            }
+            // LEN counts characters without trailing spaces: PostgreSQL's
+            // length(rtrim(x)) (rtrim removes only spaces, as LEN ignores
+            // only spaces). T-SQL counts UTF-16 code units.
+            (Dialect::Tsql, "len", 1) if first_ty.is_some_and(|t| t.is_string()) => {
+                self.assume(asm::LEN_BMP);
+                let bits = if first_ty.and_then(|t| t.len).is_some() {
+                    32
+                } else {
+                    64
+                };
+                let (x, _) = args.into_iter().next().unwrap();
+                (
+                    n("strlen", vec![x]),
+                    Some(Ty {
+                        fam: Fam::Int,
+                        len: Some(bits),
+                        scale: None,
+                    }),
+                )
+            }
+            (Dialect::Postgres, "length", 1)
+                if matches!(&c.args[0], Expr::Call(r) if r.name.len() == 1
+                    && r.name[0].eq_ignore_ascii_case("rtrim")
+                    && r.args.len() == 1 && !r.distinct && !r.star && r.order.is_empty()) =>
+            {
+                let Expr::Call(r) = &c.args[0] else {
+                    unreachable!()
+                };
+                let (x, ty) = self.expr(&r.args[0])?;
+                if ty.is_some_and(|t| t.is_string()) {
+                    (
+                        n("strlen", vec![x]),
+                        Some(Ty {
+                            fam: Fam::Int,
+                            len: Some(32),
+                            scale: None,
+                        }),
+                    )
+                } else {
+                    (
+                        n("dfn", vec![self.dtag(), a("length"), args[0].0.clone()]),
+                        None,
+                    )
+                }
+            }
+            // REPLICATE and repeat agree for a count that is a literal from 0
+            // up (a negative count is NULL in T-SQL, '' in PostgreSQL) while
+            // the result stays within 4,000 characters of a known length
+            // (T-SQL cuts a non-MAX result at 8,000 bytes).
+            // Only varchar: PostgreSQL strips a char value's padding before
+            // repeat, T-SQL repeats it.
+            (Dialect::Tsql, "replicate", 2) | (Dialect::Postgres, "repeat", 2)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar) =>
+            {
+                let count = match &c.args[1] {
+                    Expr::Num(v) => v.parse::<u32>().ok(),
+                    _ => None,
+                };
+                let len = first_ty.and_then(|t| t.len);
+                let fits = match (d, count, len) {
+                    (_, None, _) => false,
+                    (Dialect::Tsql, Some(k), Some(l)) => l.saturating_mul(k) <= 4000,
+                    // No known length: possibly a non-MAX value cut at
+                    // 8,000 bytes (DB_NAME() is nvarchar(128)), so unknown.
+                    (Dialect::Tsql, Some(_), None) => false,
+                    (_, Some(_), _) => true,
+                };
+                if fits {
+                    let k = count.unwrap();
+                    let ty = Ty {
+                        fam: Fam::VarChar,
+                        len: len.map(|l| l.saturating_mul(k)),
+                        scale: None,
+                    };
+                    let x = args[0].0.clone();
+                    (
+                        n("repeat", vec![x, n("num", vec![a(k.to_string())])]),
+                        Some(ty),
+                    )
+                } else {
+                    (
+                        n(
+                            "dfn",
+                            std::iter::once(self.dtag())
+                                .chain(std::iter::once(a(name.clone())))
+                                .chain(args.into_iter().map(|x| x.0))
+                                .collect(),
+                        ),
+                        None,
+                    )
+                }
+            }
+            // A literal code point from 1 to 127 is the same one-character
+            // string in every code page, in UTF-16 and in UTF-8.
+            (Dialect::Tsql, "char" | "nchar", 1) | (Dialect::Postgres, "chr", 1)
+                if ascii_code(&c.args[0]).is_some() =>
+            {
+                let ch = ascii_code(&c.args[0]).unwrap() as char;
+                (
+                    n("str", vec![a(ch.to_string())]),
+                    Some(Ty {
+                        fam: Fam::VarChar,
+                        len: Some(1),
+                        scale: None,
+                    }),
+                )
+            }
+            (Dialect::Tsql, "db_name", 0) | (Dialect::Postgres, "current_database", 0) => {
+                if d == Dialect::Tsql {
+                    self.assume(asm::SAME_DATABASE_NAME);
+                }
+                (n("dbname", vec![]), Some(Ty::of(Fam::VarChar)))
+            }
+            (Dialect::Postgres, "to_char", 2) => {
+                let fmt = match &c.args[1] {
+                    Expr::Str(f) => Some(f.as_str()),
+                    _ => None,
+                };
+                let date_only = match first_ty.map(|t| t.fam) {
+                    Some(Fam::Date) => Some(true),
+                    Some(Fam::Timestamp) => Some(false),
+                    _ => None,
+                };
+                match (fmt, date_only) {
+                    // Only the formats a T-SQL style prints, of the input
+                    // types it prints them for.
+                    (Some(f), Some(dt))
+                        if STYLES.iter().any(|&(st, fm, _)| {
+                            fm == f && style_format(dt, st).is_some_and(|x| x.0 == f)
+                        }) =>
+                    {
+                        let width = STYLES.iter().find(|x| x.1 == f).map(|x| x.2);
+                        let x = args[0].0.clone();
+                        (
+                            n("datefmt", vec![a(f), x]),
+                            Some(Ty {
+                                fam: Fam::VarChar,
+                                len: width,
+                                scale: None,
+                            }),
+                        )
+                    }
+                    _ => (
+                        n(
+                            "dfn",
+                            std::iter::once(self.dtag())
+                                .chain(std::iter::once(a(name.clone())))
+                                .chain(args.into_iter().map(|x| x.0))
+                                .collect(),
+                        ),
+                        None,
+                    ),
                 }
             }
             (_, "upper" | "ucase", 1) => portable("upper", args, first_ty),
@@ -1768,6 +1994,82 @@ impl<'a> Canon<'a> {
                 )
             }
         })
+    }
+
+    /// A date part as an integer: `year`, `month`, `day`, `hour`,
+    /// `minute`, `second` (truncated) or `dow` (Sunday 0), of a date,
+    /// timestamp (without time zone) or time where both dialects define it.
+    fn datepart(&mut self, part: &str, x: (Term, Option<Ty>)) -> Option<(Term, Option<Ty>)> {
+        let fam = x.1?.fam;
+        let ok = match part {
+            "year" | "month" | "day" | "dow" => matches!(fam, Fam::Date | Fam::Timestamp),
+            "hour" | "minute" | "second" => matches!(fam, Fam::Timestamp | Fam::Time),
+            _ => false,
+        };
+        ok.then(|| {
+            (
+                n("datepart", vec![a(part), x.0]),
+                Some(Ty {
+                    fam: Fam::Int,
+                    len: Some(32),
+                    scale: None,
+                }),
+            )
+        })
+    }
+
+    /// T-SQL CONVERT(varchar(n) / nvarchar(n), x, style) of a date or
+    /// date-time `x`, for the styles `style_format` knows.
+    fn tsql_convert_style(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
+        let ty = match &c.args[0] {
+            Expr::Name(p) if p.len() == 1 => (p[0].to_uppercase(), Some(30)),
+            Expr::Call(t) if t.name.len() == 1 && t.args.len() == 1 => {
+                let len = match &t.args[0] {
+                    Expr::Num(v) => match v.parse::<u32>() {
+                        Ok(n) if n > 0 => Some(n),
+                        _ => return Ok(None),
+                    },
+                    Expr::Name(m) if m.len() == 1 && m[0].eq_ignore_ascii_case("max") => None,
+                    _ => return Ok(None),
+                };
+                (t.name[0].to_uppercase(), len)
+            }
+            _ => return Ok(None),
+        };
+        if !matches!(ty.0.as_str(), "VARCHAR" | "NVARCHAR") {
+            return Ok(None);
+        }
+        let style = match &c.args[2] {
+            Expr::Num(v) => v.parse::<u32>().ok(),
+            _ => None,
+        };
+        let x = self.expr(&c.args[1])?;
+        let date_only = match x.1.map(|t| t.fam) {
+            Some(Fam::Date) => true,
+            Some(Fam::Timestamp) => false,
+            _ => return Ok(None),
+        };
+        let Some((fmt, width)) = style.and_then(|st| style_format(date_only, st)) else {
+            return Ok(None);
+        };
+        let v = (
+            n("datefmt", vec![a(fmt), x.0]),
+            Some(Ty {
+                fam: Fam::VarChar,
+                len: Some(width),
+                scale: None,
+            }),
+        );
+        // A target that holds the whole text changes nothing.
+        if ty.1.map_or(true, |n| n >= width) {
+            return Ok(Some(v));
+        }
+        let dst = Ty {
+            fam: Fam::VarChar,
+            len: ty.1,
+            scale: None,
+        };
+        Ok(Some(self.cast(dst, v)))
     }
 
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
@@ -4132,6 +4434,55 @@ impl Item {
 /// page, lock)`). It aggregates even when WHERE matches no row; HAVING, TOP 0
 /// or OFFSET can drop that row. Only an aggregate in the select list itself
 /// counts, not one inside a subquery.
+/// T-SQL CONVERT styles with a PostgreSQL to_char format that prints the
+/// same text: (style, format, length). Checked on SQL Server 2022 and
+/// PostgreSQL 18 for date, datetime and datetime2 (eval/builtins/2026-10-29).
+const STYLES: &[(u32, &str, u32)] = &[
+    (20, "YYYY-MM-DD HH24:MI:SS", 19),
+    (120, "YYYY-MM-DD HH24:MI:SS", 19),
+    (23, "YYYY-MM-DD", 10),
+    (112, "YYYYMMDD", 8),
+    (102, "YYYY.MM.DD", 10),
+    (111, "YYYY/MM/DD", 10),
+    (108, "HH24:MI:SS", 8),
+];
+
+/// The to_char format and text length of CONVERT(varchar, x, style), for a
+/// date (`date_only`) or a date-time (datetime, datetime2, smalldatetime).
+/// A date prints only its date part, also in styles 20 and 120; a time-only
+/// style of a date is an error in T-SQL. Shared with the converter.
+pub fn style_format(date_only: bool, style: u32) -> Option<(&'static str, u32)> {
+    let &(_, fmt, width) = STYLES.iter().find(|x| x.0 == style)?;
+    match (date_only, style) {
+        (true, 20 | 120) => Some(("YYYY-MM-DD", 10)),
+        (true, 108) => None,
+        _ => Some((fmt, width)),
+    }
+}
+
+/// DATEPART's part names (and abbreviations) that have a PostgreSQL
+/// counterpart.
+fn tsql_datepart(p: &str) -> Option<&'static str> {
+    Some(match p.to_ascii_lowercase().as_str() {
+        "year" | "yy" | "yyyy" => "year",
+        "month" | "mm" | "m" => "month",
+        "day" | "dd" | "d" => "day",
+        "hour" | "hh" => "hour",
+        "minute" | "mi" | "n" => "minute",
+        "second" | "ss" | "s" => "second",
+        "weekday" | "dw" | "w" => "weekday",
+        _ => return None,
+    })
+}
+
+/// A literal code point from 1 to 127.
+fn ascii_code(e: &Expr) -> Option<u8> {
+    match e {
+        Expr::Num(v) => v.parse::<u8>().ok().filter(|c| (1..=127).contains(c)),
+        _ => None,
+    }
+}
+
 fn exactly_one(q: &Term) -> bool {
     if !q.is("q") {
         return false;
