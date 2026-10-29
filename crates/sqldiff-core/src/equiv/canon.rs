@@ -527,7 +527,9 @@ impl<'a> Canon<'a> {
                 && dst.len.is_none();
         }
         match dst.fam {
-            Fam::Int | Fam::VarChar => match (dst.len, src.len) {
+            // A bounded binary target cuts a longer value off in T-SQL and
+            // keeps or rejects it elsewhere.
+            Fam::Int | Fam::VarChar | Fam::Binary => match (dst.len, src.len) {
                 (None, _) => true,
                 (Some(d), Some(s)) => d >= s,
                 (Some(_), None) => false,
@@ -1297,7 +1299,18 @@ impl<'a> Canon<'a> {
     fn conv_rule(&self, src: Option<Ty>, dst: Ty, how: How) -> Rule {
         use Fam::*;
         let Some(src) = src else { return Rule::Dialect };
-        if src.fam == Other || dst.fam == Other {
+        // A binary string kept whole: the target holds any length, or one at
+        // least as long as the value can be. T-SQL cuts a longer value off
+        // silently where the others keep it or fail.
+        if src.fam == Binary && dst.fam == Binary {
+            let fits = match (dst.len, src.len) {
+                (None, _) => true,
+                (Some(d), Some(s)) => s <= d,
+                (Some(_), None) => false,
+            };
+            return if fits { Rule::Same } else { Rule::Dialect };
+        }
+        if matches!(src.fam, Other | Binary) || matches!(dst.fam, Other | Binary) {
             return Rule::Dialect;
         }
         // A value without a fraction: an integer, a decimal of scale 0, or
@@ -1713,6 +1726,9 @@ impl<'a> Canon<'a> {
                 let (x, y, op) = order_operands(op, lt, rt);
                 Ok((n("cmp", vec![a(op), x, y]), Some(Ty::of(Fam::Bool))))
             }
+            "||" if self.is_binary(&lt, lty) && self.is_binary(&rt, rty) => {
+                Ok(self.concat_bin(lt, lty, rt, rty))
+            }
             "||" => {
                 if any(&|t| t.fam == Fam::Char) {
                     return Ok((
@@ -1732,6 +1748,13 @@ impl<'a> Canon<'a> {
                         scale: None,
                     }),
                 ))
+            }
+            // T-SQL `+` between two binary strings concatenates them.
+            "+" if self.d == Dialect::Tsql
+                && self.is_binary(&lt, lty)
+                && self.is_binary(&rt, rty) =>
+            {
+                Ok(self.concat_bin(lt, lty, rt, rty))
             }
             "+" if self.d == Dialect::Tsql && (any(&|t| t.is_string()) || l_or_r_is_str(l, r)) => {
                 if any(&|t| t.is_numeric() || t.is_temporal()) {
@@ -1814,6 +1837,52 @@ impl<'a> Canon<'a> {
             }
             _ => Ok((n("dfn", vec![self.dtag(), a(op), lt, rt]), None)),
         }
+    }
+
+    /// A variable-length binary string: a value of that type, or a binary
+    /// constant (`0x01`, `'\x01'::bytea`).
+    fn is_binary(&self, t: &Term, ty: Option<Ty>) -> bool {
+        ty.is_some_and(|t| t.fam == Fam::Binary) || t.is("bytes")
+    }
+
+    /// The length a binary operand can reach: a constant's byte count, a
+    /// typed value's declared length, None when unbounded.
+    fn binary_len(t: &Term, ty: Option<Ty>) -> Option<u32> {
+        if t.is("bytes") {
+            return t
+                .kid(0)
+                .and_then(Term::atom)
+                .map(|h| h.len().div_ceil(2) as u32);
+        }
+        ty.and_then(|t| t.len)
+    }
+
+    /// Binary concatenation (T-SQL `+`, PostgreSQL and Db2 for i `||`). NULL
+    /// in either operand gives NULL everywhere. T-SQL cuts the result to
+    /// 8000 bytes unless an operand is varbinary(max), so a longer bounded
+    /// result stays T-SQL's own.
+    fn concat_bin(
+        &mut self,
+        lt: Term,
+        lty: Option<Ty>,
+        rt: Term,
+        rty: Option<Ty>,
+    ) -> (Term, Option<Ty>) {
+        let len = Self::binary_len(&lt, lty)
+            .zip(Self::binary_len(&rt, rty))
+            .map(|(x, y)| x + y);
+        if self.d == Dialect::Tsql && len.is_some_and(|l| l > 8000) {
+            return (n("dfn", vec![a("tsql"), a("+"), lt, rt]), None);
+        }
+        let len = if self.d == Dialect::Tsql { len } else { None };
+        (
+            n("concat-bin", vec![lt, rt]),
+            Some(Ty {
+                fam: Fam::Binary,
+                len,
+                scale: None,
+            }),
+        )
     }
 
     /// Whether a real (single precision) meets a number of another type,
@@ -3185,6 +3254,19 @@ impl<'a> Canon<'a> {
             Dialect::Db2i => return Err("UPDATE ... FROM is not supported".into()),
         };
         conds.extend(where_.iter().cloned());
+        if others.is_empty() {
+            // `UPDATE t … FROM t WHERE w` is a plain UPDATE.
+            let where_ = conds
+                .into_iter()
+                .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)));
+            return self.stmt(&Stmt::Update {
+                target: tname,
+                alias: talias,
+                sets: sets.to_vec(),
+                from: Vec::new(),
+                where_,
+            });
+        }
         let tkey = talias
             .as_ref()
             .map(|x| lc(x))
@@ -3949,20 +4031,49 @@ fn tsql_update_target(
     from: &[From],
 ) -> R<(Vec<String>, Option<String>, Vec<From>, Vec<Expr>)> {
     let unsupported = |why: &str| Err(format!("UPDATE ... FROM: {why}"));
-    let [t] = target else {
-        return unsupported("the target is not a one-part name");
-    };
+    if target.is_empty() || target.len() > 2 {
+        return unsupported("the target is not a table name, a schema-qualified one or an alias");
+    }
     if alias.is_some() {
         return unsupported("the target has an alias");
     }
-    let key = lc(t);
-    let binds = |f: &From| match f {
-        From::Table { name, alias, .. } => match alias {
-            Some(a) => lc(a) == key,
-            None => name.last().is_some_and(|x| lc(x) == key),
-        },
+    let t: Vec<String> = target.iter().map(|x| lc(x)).collect();
+    let one = t.len() == 1;
+    let key = t.last().cloned().unwrap_or_default();
+    // SQL Server binds the target to the FROM reference of the same table,
+    // aliased or not, and a one-part target also to an alias or to an
+    // unaliased table's last name part (checked on SQL Server 2022). Where
+    // only one side states a schema the default schema decides, which is
+    // not modelled.
+    let mut unclear = None;
+    let mut binds = |f: &From| match f {
+        From::Table { name, alias, .. } => {
+            let n: Vec<String> = name.iter().map(|x| lc(x)).collect();
+            if let Some(a) = alias {
+                if lc(a) == key {
+                    if !one {
+                        unclear = Some("the alias of another FROM item has the target's name");
+                    }
+                    return one;
+                }
+            }
+            if n.last() != Some(&key) {
+                return false;
+            }
+            if n == t || (one && alias.is_none()) {
+                return true;
+            }
+            if n.len() != t.len() {
+                unclear = Some("the target and a FROM table may or may not be the same table (only one states a schema)");
+            }
+            false
+        }
         From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
-            alias.as_ref().is_some_and(|a| lc(a) == key)
+            let hit = alias.as_ref().is_some_and(|a| lc(a) == key);
+            if hit && !one {
+                unclear = Some("the alias of another FROM item has the target's name");
+            }
+            hit && one
         }
         _ => false,
     };
@@ -3974,22 +4085,39 @@ fn tsql_update_target(
         }
         chains.push(c);
     }
-    let hits: Vec<(usize, usize)> = chains
-        .iter()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            c.iter()
-                .enumerate()
-                .filter(|(_, s)| binds(&s.1))
-                .map(move |(j, _)| (i, j))
-        })
-        .collect();
-    let [(ci, li)] = hits[..] else {
-        return unsupported(if hits.is_empty() {
-            "the target is not one of the FROM tables by alias or one-part name"
-        } else {
-            "the target matches more than one FROM table"
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (i, c) in chains.iter().enumerate() {
+        for (j, s) in c.iter().enumerate() {
+            if binds(&s.1) {
+                hits.push((i, j));
+            }
+        }
+    }
+    if let Some(w) = unclear {
+        return unsupported(w);
+    }
+    if hits.is_empty() {
+        // The target is not in FROM: SQL Server joins it to the FROM
+        // tables, in scope in SET and WHERE but not in ON, which is
+        // PostgreSQL's shape (checked on SQL Server 2022). A FROM item that
+        // also shows the target's name is not modelled.
+        let shown = chains.iter().flatten().any(|s| match &s.1 {
+            From::Table { name, alias, .. } => match alias {
+                Some(a) => lc(a) == key,
+                None => name.last().is_some_and(|x| lc(x) == key),
+            },
+            From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
+                alias.as_ref().is_some_and(|a| lc(a) == key)
+            }
+            _ => true,
         });
+        if shown {
+            return unsupported("the target is not in FROM, and a FROM item is also named like it");
+        }
+        return Ok((target.to_vec(), None, from.to_vec(), Vec::new()));
+    }
+    let [(ci, li)] = hits[..] else {
+        return unsupported("the target matches more than one FROM table");
     };
     let c = &mut chains[ci];
     let From::Table { name, alias, hints } = c[li].1.clone() else {

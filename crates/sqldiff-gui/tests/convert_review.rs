@@ -8,7 +8,8 @@ use sqldiff_convert::tree;
 use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
 use sqldiff_gui::convert_review::{
-    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN, GATE_STALE,
+    stored_key, Action, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN,
+    GATE_STALE,
 };
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
@@ -63,14 +64,17 @@ impl Fixture {
         }
     }
 
-    fn open(&self) -> Review {
-        Review::open(Setup {
+    fn setup(&self) -> Setup {
+        Setup {
             tree: self.args(),
             out: self.out(),
             instances: None,
             packs: Vec::new(),
-        })
-        .unwrap()
+        }
+    }
+
+    fn open(&self) -> Review {
+        Review::open(self.setup()).unwrap()
     }
 
     fn ledger(&self) -> String {
@@ -737,4 +741,50 @@ fn the_gate_banner_counts_the_blockers_it_does_not_list() {
     assert!(lines[0].contains("<li>… and 5 more</li>"), "{}", lines[0]);
     assert_eq!(lines[1].matches("<li>a.sql:3").count(), 2);
     assert!(!lines[1].contains("more"), "{}", lines[1]);
+}
+
+/// The state as the page gets it, without what differs between two reads
+/// of the same tree (when, how long).
+fn state_json(r: &Review) -> serde_json::Value {
+    let mut v = serde_json::to_value(r.state(true)).unwrap();
+    for k in ["convert_ms", "gate_judged"] {
+        v.as_object_mut().unwrap().remove(k);
+    }
+    v
+}
+
+#[test]
+fn a_stored_conversion_opens_the_review_a_fresh_one_would() {
+    let f = Fixture::new("stored", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
+    let fresh = f.open();
+    let tree: tree::Tree = serde_json::from_slice(&fresh.tree_json()).unwrap();
+    // Read back byte for byte.
+    assert_eq!(serde_json::to_vec(&tree).unwrap(), fresh.tree_json());
+    let (key, now) = stored_key(&f.setup(), b"extra").unwrap();
+    assert_eq!(key, fresh.stored_key(b"extra"));
+    assert_ne!(key, fresh.stored_key(b"other build or config"));
+    let mut r = Review::open_stored(f.setup(), tree, now).unwrap();
+    assert!(!r.converted_last());
+    // Queue, gate and all, as converting gives.
+    assert_eq!(state_json(&r), state_json(&fresh));
+    assert!(r.gate().is_ok());
+    // Decisions apply to it as to a fresh one.
+    let u = unit_with(&r, "a.sql", Status::Assumptions, false);
+    for rule in u.assumptions.clone() {
+        r.record(req(Action::Accept, &rule, vec![target(&u)]), AT)
+            .unwrap();
+    }
+    let mut again = f.open();
+    again.refresh().unwrap();
+    assert_eq!(state_json(&r), state_json(&again));
+    // Files in OUT edited by hand still make it stale.
+    std::fs::write(f.out().join("t.sql"), "-- edited\n").unwrap();
+    assert_eq!(r.gate().unwrap_err(), GATE_STALE);
+    // A changed source, or a hand-written text, changes the key.
+    std::fs::write(
+        f.dir.join("src").join("t.sql"),
+        "CREATE TABLE t (b int NOT NULL);\n",
+    )
+    .unwrap();
+    assert_ne!(stored_key(&f.setup(), b"extra").unwrap().0, key);
 }

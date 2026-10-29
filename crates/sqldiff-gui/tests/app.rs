@@ -336,6 +336,7 @@ fn every_post_needs_this_launchs_token_and_writes_nothing_without_it() {
         ),
         ("/api/batches/1/cancel", serde_json::json!({})),
         ("/runs/1/cancel", serde_json::json!({})),
+        ("/api/stored/clear", serde_json::json!({})),
         ("/runs/1/review/api/record", serde_json::json!({})),
         ("/runs/1/review/api/refresh", serde_json::json!({})),
         ("/review/api/record", serde_json::json!({})),
@@ -994,9 +995,17 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
     let text = std::fs::read_to_string(&file).unwrap();
     assert!(!text.contains("CREATE TABLE"), "{text}");
     assert!(text.contains(r#""state": "done""#), "{text}");
+    // The conversion is stored beside it, for the review after a restart.
+    let stored = stored_files(addr, 1);
+    assert_eq!(
+        stored["dir"],
+        data.join("gui").join("conversions").display().to_string()
+    );
 
     // After a restart: listed as it finished, and its review opens again
-    // from the tree on disk, with the done gate judged there.
+    // from the tree on disk, with the done gate judged there. First without
+    // the stored conversion: converted again behind a progress page.
+    std::fs::remove_dir_all(data.join("gui").join("conversions")).unwrap();
     let addr = start(kept());
     let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
     let past = &runs[0];
@@ -1006,13 +1015,14 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
     assert_eq!(past["totals"], run["totals"]);
     assert!(past["gate"].is_null(), "judged once the review opens");
     let review = format!("/runs/{id}/review");
-    // Converted again on its own thread: the page says so and reloads, and
-    // an API call is told to wait.
+    // Converted again on its own thread: until it is done (this tree takes
+    // a moment at most), the page says so, in the app's frame, and reloads.
     let (status, html) = get(addr, &review);
     assert_eq!(status, "HTTP/1.1 200 OK");
-    assert!(html.contains("Opening the review of run"), "{html}");
-    assert!(html.contains(r#"http-equiv="refresh""#), "{html}");
-    assert!(html.contains(r#"<nav id="app-rail""#), "{html}");
+    if html.contains("Opening the review of run") {
+        assert!(html.contains(r#"http-equiv="refresh""#), "{html}");
+        assert!(html.contains(r#"<nav id="app-rail""#), "{html}");
+    }
     let (status, html) = opened(addr, &review);
     assert_eq!(status, "HTTP/1.1 200 OK");
     assert!(
@@ -1024,6 +1034,16 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
     assert_eq!(state["gate"]["complete"], true, "{state}");
     let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
     assert_eq!(runs[0]["gate"]["complete"], true, "{runs}");
+    // Converting again stored it again; after the next restart the review
+    // opens from it at once, judged the same.
+    stored_files(addr, 1);
+    let addr = start(kept());
+    let (status, html) = get(addr, &review);
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    assert!(html.contains("/*__SQLDIFF_PAYLOAD__*/{"), "{html}");
+    let state: serde_json::Value =
+        serde_json::from_str(&get(addr, &format!("{review}/api/state")).1).unwrap();
+    assert_eq!(state["gate"]["complete"], true, "{state}");
     // New runs go on from the last number.
     let spec2 = serde_json::json!({ "src": d.0.join("src"), "out": d.0.join("out2"), "from": "tsql", "to": "postgres" });
     let (_, body) = request(addr, "POST", "/api/runs", &spec2.to_string());
@@ -1052,6 +1072,28 @@ fn runs_are_kept_in_the_data_dir_and_their_reviews_open_again() {
     let lan_app = kept();
     std::thread::spawn(move || serve(listener, lan_app, &[]));
     assert_eq!(get(lan, &review).0, "HTTP/1.1 403 Forbidden");
+    assert_eq!(get(lan, "/api/stored").0, "HTTP/1.1 403 Forbidden");
+    // Cleared from the settings page: nothing else in the data dir goes.
+    let (status, body) = request(addr, "POST", "/api/stored/clear", "{}");
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["files"],
+        0
+    );
+    assert!(file.is_file());
+}
+
+/// What `/api/stored` says once it holds `n` conversions (they are written
+/// on a thread of their own).
+fn stored_files(addr: SocketAddr, n: u64) -> serde_json::Value {
+    for _ in 0..600 {
+        let v: serde_json::Value = serde_json::from_str(&get(addr, "/api/stored").1).unwrap();
+        if v["files"] == n {
+            return v;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("never {n} stored conversion(s)");
 }
 
 #[test]
