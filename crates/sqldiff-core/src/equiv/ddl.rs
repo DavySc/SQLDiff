@@ -1,6 +1,8 @@
-//! `CREATE INDEX`, `CREATE SEQUENCE`, `CREATE SCHEMA` and `GRANT` compared
-//! across dialects: T-SQL against PostgreSQL or Db2 for i (GRANT: against
-//! PostgreSQL).
+//! `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE SCHEMA` compared across
+//! dialects: T-SQL against PostgreSQL or Db2 for i. Also, T-SQL against
+//! PostgreSQL only: `GRANT`, `DROP TABLE / VIEW / PROCEDURE / FUNCTION /
+//! SEQUENCE / SCHEMA` and a column default added after the table
+//! (`ADD [CONSTRAINT n] DEFAULT v FOR c` against `ALTER COLUMN c SET DEFAULT v`).
 //!
 //! Like `table.rs`, each statement is read completely, and a clause the
 //! model does not know leaves the statement not compared. Clauses that
@@ -100,12 +102,39 @@ pub struct Grant {
     pub off: usize,
 }
 
+/// `DROP kind [IF EXISTS] name`: one object.
+#[derive(Debug, Clone)]
+pub struct DropDef {
+    pub dialect: Dialect,
+    /// `TABLE`, `VIEW`, `PROCEDURE`, `FUNCTION`, `SEQUENCE` or `SCHEMA`.
+    pub kind: &'static str,
+    pub name: Vec<Name>,
+    pub if_exists: bool,
+    pub off: usize,
+}
+
+/// A column default set after the table: T-SQL `ALTER TABLE t ADD
+/// [CONSTRAINT n] DEFAULT v FOR c`, PostgreSQL `ALTER TABLE t ALTER [COLUMN]
+/// c SET DEFAULT v`.
+#[derive(Debug, Clone)]
+pub struct SetDefault {
+    pub dialect: Dialect,
+    pub table: Vec<Name>,
+    pub column: Name,
+    /// The T-SQL constraint name.
+    pub name: Option<Name>,
+    pub value: Vec<Tok>,
+    pub off: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum Ddl {
     Index(Index),
     Sequence(Sequence),
     Schema(SchemaDef),
     Grant(Grant),
+    Drop(DropDef),
+    Default(SetDefault),
 }
 
 impl Ddl {
@@ -115,16 +144,25 @@ impl Ddl {
             Ddl::Sequence(_) => "CREATE SEQUENCE",
             Ddl::Schema(_) => "CREATE SCHEMA",
             Ddl::Grant(_) => "GRANT",
+            Ddl::Drop(d) => match d.kind {
+                "TABLE" => "DROP TABLE",
+                "VIEW" => "DROP VIEW",
+                "PROCEDURE" => "DROP PROCEDURE",
+                "FUNCTION" => "DROP FUNCTION",
+                "SEQUENCE" => "DROP SEQUENCE",
+                _ => "DROP SCHEMA",
+            },
+            Ddl::Default(_) => "column default",
         }
     }
 }
 
 /// Whether a statement's first words make it one of the statements this
 /// module reads (`CREATE … INDEX`, `CREATE SEQUENCE`, `CREATE SCHEMA`,
-/// `GRANT`).
+/// `GRANT`, and the `DROP` and `ALTER TABLE` of `is_drop_or_alter`).
 pub fn is_ddl(words: &[String]) -> bool {
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
-    if w(0) == "GRANT" {
+    if w(0) == "GRANT" || is_drop_or_alter(words) {
         return true;
     }
     if w(0) != "CREATE" {
@@ -135,6 +173,29 @@ pub fn is_ddl(words: &[String]) -> bool {
         i = 3;
     }
     matches!(w(i), "SEQUENCE" | "SCHEMA") || (i..words.len().min(i + 4)).any(|j| w(j) == "INDEX")
+}
+
+/// Whether a statement's first words make it a `DROP` or `ALTER TABLE`
+/// this module reads (`parse` says whether it reads the rest).
+fn is_drop_or_alter(words: &[String]) -> bool {
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    match w(0) {
+        "DROP" => drop_kind(w(1)).is_some(),
+        "ALTER" => w(1) == "TABLE",
+        _ => false,
+    }
+}
+
+fn drop_kind(w: &str) -> Option<&'static str> {
+    Some(match w {
+        "TABLE" => "TABLE",
+        "VIEW" => "VIEW",
+        "PROCEDURE" | "PROC" => "PROCEDURE",
+        "FUNCTION" => "FUNCTION",
+        "SEQUENCE" => "SEQUENCE",
+        "SCHEMA" => "SCHEMA",
+        _ => return None,
+    })
 }
 
 /// The name a part resolves to (see `table::key`); a quoted Db2 for i name
@@ -223,6 +284,16 @@ pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
                 schema.case_check(&stored(n), true)?;
             }
         }
+        Ddl::Drop(x) if x.dialect == Dialect::Postgres => {
+            for n in &x.name {
+                schema.case_check(&stored(n), x.kind == "TABLE")?;
+            }
+        }
+        Ddl::Default(x) if x.dialect == Dialect::Postgres => {
+            for n in x.table.iter().chain(std::iter::once(&x.column)) {
+                schema.case_check(&stored(n), true)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -259,11 +330,36 @@ pub fn pair_key(x: &Ddl) -> R<String> {
                 to.join(",")
             )
         }
+        Ddl::Drop(x) if x.kind == "SCHEMA" => {
+            format!("drop schema {}", fold(&x.name[0], x.dialect)?)
+        }
+        Ddl::Drop(x) => {
+            let (s, n) = object_key(&x.name, x.dialect)?;
+            format!("drop {} {}.{n}", x.kind, s.unwrap_or_default())
+        }
+        Ddl::Default(x) => {
+            let (s, t) = object_key(&x.table, x.dialect)?;
+            format!(
+                "default {}.{t}.{}",
+                s.unwrap_or_default(),
+                fold(&x.column, x.dialect)?
+            )
+        }
     })
 }
 
 /// Reads a whole statement (terminator dropped).
 pub fn parse(ts: &[Tok], d: Dialect) -> R<Ddl> {
+    let ts = match ts.last() {
+        Some(t) if t.kind == K::Semi => &ts[..ts.len() - 1],
+        _ => ts,
+    };
+    if word(ts.first(), "DROP") {
+        return drop(ts, d).map(Ddl::Drop);
+    }
+    if word(ts.first(), "ALTER") {
+        return set_default(ts, d).map(Ddl::Default);
+    }
     if word(ts.first(), "GRANT") {
         return grant(ts, d).map(Ddl::Grant);
     }
@@ -733,6 +829,148 @@ fn sequence(ts: &[Tok], d: Dialect) -> R<Sequence> {
     Ok(q)
 }
 
+/// `DROP kind [IF EXISTS] name [RESTRICT]`.
+fn drop(ts: &[Tok], d: Dialect) -> R<DropDef> {
+    if d == Dialect::Db2i {
+        return Err("DROP on Db2 for i is not compared yet".into());
+    }
+    let kind = ts
+        .get(1)
+        .filter(|t| t.kind == K::Word)
+        .and_then(|t| drop_kind(&t.up))
+        .ok_or("not a DROP this module reads")?;
+    let mut i = 2;
+    let if_exists = word(ts.get(i), "IF") && word(ts.get(i + 1), "EXISTS");
+    if if_exists {
+        i += 2;
+    }
+    let (name, mut j) = dotted(ts, i)?;
+    if ts.get(j).is_some_and(|t| t.kind == K::Comma) {
+        // T-SQL drops the objects one by one and stops at the first that
+        // fails, leaving the earlier ones dropped; PostgreSQL drops all or
+        // none.
+        return Err(format!("DROP {kind} of several objects"));
+    }
+    if ts.get(j).is_some_and(|t| t.kind == K::LParen) {
+        return Err(format!("DROP {kind} with an argument list"));
+    }
+    if d == Dialect::Postgres && word(ts.get(j), "RESTRICT") {
+        j += 1;
+    }
+    if j != ts.len() {
+        return Err(format!("DROP {kind} with `{}`", text(&ts[j..])));
+    }
+    if kind == "SCHEMA" && name.len() != 1 {
+        return Err("DROP SCHEMA with a qualified name".into());
+    }
+    Ok(DropDef {
+        dialect: d,
+        kind,
+        name,
+        if_exists,
+        off: ts[0].off,
+    })
+}
+
+/// T-SQL `ALTER TABLE t ADD [CONSTRAINT n] DEFAULT v FOR c`; PostgreSQL
+/// `ALTER TABLE [ONLY] t ALTER [COLUMN] c SET DEFAULT v`.
+fn set_default(ts: &[Tok], d: Dialect) -> R<SetDefault> {
+    let what = || format!("the ALTER TABLE `{}`", text(ts));
+    if !word(ts.get(1), "TABLE") {
+        return Err(what());
+    }
+    let mut i = 2;
+    if d == Dialect::Postgres && word(ts.get(i), "ONLY") {
+        i += 1;
+    }
+    let (table, mut i) = dotted(ts, i)?;
+    let value_of = |v: &[Tok]| -> R<Vec<Tok>> {
+        let mut v = v;
+        while v.len() > 2 && v[0].kind == K::LParen && close(v, 0).ok() == Some(v.len() - 1) {
+            v = &v[1..v.len() - 1];
+        }
+        if v.is_empty() {
+            return Err("a default without a value".into());
+        }
+        Ok(v.to_vec())
+    };
+    match d {
+        Dialect::Tsql => {
+            if !word(ts.get(i), "ADD") {
+                return Err(what());
+            }
+            i += 1;
+            let mut name = None;
+            if word(ts.get(i), "CONSTRAINT") {
+                name = Some(ts.get(i + 1).and_then(name_of).ok_or_else(what)?);
+                i += 2;
+            }
+            if !word(ts.get(i), "DEFAULT") {
+                return Err(what());
+            }
+            // The value ends at the top-level FOR.
+            let mut depth = 0i32;
+            let mut f = None;
+            for (k, t) in ts.iter().enumerate().skip(i + 1) {
+                match t.kind {
+                    K::LParen => depth += 1,
+                    K::RParen => depth -= 1,
+                    K::Word if depth == 0 && t.up == "FOR" => {
+                        f = Some(k);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let f = f.ok_or_else(what)?;
+            let column = ts.get(f + 1).and_then(name_of).ok_or_else(what)?;
+            if f + 2 != ts.len() {
+                return Err(what());
+            }
+            Ok(SetDefault {
+                dialect: d,
+                table,
+                column,
+                name,
+                value: value_of(&ts[i + 1..f])?,
+                off: ts[0].off,
+            })
+        }
+        Dialect::Postgres => {
+            if !word(ts.get(i), "ALTER") {
+                return Err(what());
+            }
+            i += 1;
+            if word(ts.get(i), "COLUMN") {
+                i += 1;
+            }
+            let column = ts.get(i).and_then(name_of).ok_or_else(what)?;
+            if !(word(ts.get(i + 1), "SET") && word(ts.get(i + 2), "DEFAULT")) {
+                return Err(what());
+            }
+            // A second action after a top-level comma.
+            let mut depth = 0i32;
+            for t in &ts[i + 3..] {
+                match t.kind {
+                    K::LParen => depth += 1,
+                    K::RParen => depth -= 1,
+                    K::Comma if depth == 0 => return Err(what()),
+                    _ => {}
+                }
+            }
+            Ok(SetDefault {
+                dialect: d,
+                table,
+                column,
+                name: None,
+                value: value_of(&ts[i + 3..])?,
+                off: ts[0].off,
+            })
+        }
+        Dialect::Db2i => Err("ALTER TABLE on Db2 for i is not compared yet".into()),
+    }
+}
+
 fn schema(ts: &[Tok], d: Dialect) -> R<SchemaDef> {
     let mut i = 2;
     if word(ts.get(i), "IF") {
@@ -931,6 +1169,13 @@ pub enum Event {
         b: Vec<Tok>,
         at: (usize, usize),
     },
+    /// Two default values of one column: equal when `SELECT a` and
+    /// `SELECT b` are.
+    Default {
+        a: Vec<Tok>,
+        b: Vec<Tok>,
+        at: (usize, usize),
+    },
 }
 
 pub mod asm {
@@ -958,6 +1203,14 @@ pub mod asm {
         "ASM-GRANT-PRINCIPAL",
         "The target role a GRANT names stands for the same users as the T-SQL principal of that name (T-SQL compares principal names without letter case), and no T-SQL DENY on the object outranks the grant (PostgreSQL has no DENY)",
     );
+    pub const DROP_DEPENDENTS: (&str, &str) = (
+        "ASM-DROP-NO-DEPENDENTS",
+        "No view, routine or other object depends on the dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP (RESTRICT) where SQL Server drops a table or view under a view that is not schema-bound",
+    );
+    pub const DEFAULT_NAME: (&str, &str) = (
+        "ASM-DEFAULT-CONSTRAINT-NAME",
+        "The column has no default yet, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name",
+    );
     pub const SCHEMA_OWNER: (&str, &str) = (
         "ASM-SCHEMA-OWNER",
         "The schema's owner on the target holds the privileges its owner holds on the source: the role it names, or the user running the script, which stands for T-SQL dbo (the database owner)",
@@ -984,6 +1237,8 @@ pub fn compare(
         (Ddl::Sequence(a), Ddl::Sequence(b)) => sequences(a, b, na, nb, &mut ev),
         (Ddl::Schema(a), Ddl::Schema(b)) => schemas(a, b, na, nb, &mut ev),
         (Ddl::Grant(a), Ddl::Grant(b)) => grants(a, b, na, nb, &mut ev),
+        (Ddl::Drop(a), Ddl::Drop(b)) => drops(a, b, na, nb, &mut ev),
+        (Ddl::Default(a), Ddl::Default(b)) => defaults(a, b, na, nb, &mut ev),
         _ => Err(format!("{} against {}", x.what(), y.what())),
     };
     if let Err(e) = r {
@@ -1626,6 +1881,108 @@ fn grants(x: &Grant, y: &Grant, na: &str, nb: &str, ev: &mut Vec<Event>) -> R<()
             at,
         });
     }
+    Ok(())
+}
+
+/// Only T-SQL against PostgreSQL: Db2 for i DROP and ALTER TABLE have no
+/// verified facts yet.
+fn tsql_pg(da: Dialect, db: Dialect) -> R<()> {
+    match (da, db) {
+        (Dialect::Tsql, Dialect::Postgres) | (Dialect::Postgres, Dialect::Tsql) => Ok(()),
+        _ => Err("only T-SQL against PostgreSQL is compared".into()),
+    }
+}
+
+/// Two DROPs: the same kind of object, the same name, both or neither
+/// with IF EXISTS. Each fails when the object is missing (without IF
+/// EXISTS) and when a foreign key references the table; PostgreSQL also
+/// refuses an object others depend on (views, defaults, triggers), which
+/// SQL Server drops.
+fn drops(x: &DropDef, y: &DropDef, na: &str, nb: &str, ev: &mut Vec<Event>) -> R<()> {
+    tsql_pg(x.dialect, y.dialect)?;
+    let at = (x.off, y.off);
+    ev.push(Event::Asm(super::canon::asm::IDENT_FOLD));
+    let (kx, ky) = if x.kind == "SCHEMA" {
+        (
+            (None, fold(&x.name[0], x.dialect)?),
+            (None, fold(&y.name[0], y.dialect)?),
+        )
+    } else {
+        (
+            object_key(&x.name, x.dialect)?,
+            object_key(&y.name, y.dialect)?,
+        )
+    };
+    if x.kind != y.kind || kx != ky {
+        ev.push(Event::Diff {
+            rule: "equiv.drop-object",
+            witness: format!(
+                "{na} drops the {} {} and {nb} the {} {}",
+                x.kind.to_lowercase(),
+                super::table::text_name(&x.name),
+                y.kind.to_lowercase(),
+                super::table::text_name(&y.name)
+            ),
+            at,
+        });
+        return Ok(());
+    }
+    if kx.0.is_none() && x.kind != "SCHEMA" {
+        ev.push(Event::Asm(super::canon::asm::DEFAULT_SCHEMA));
+    }
+    if x.if_exists != y.if_exists {
+        let (with, without) = if x.if_exists { (na, nb) } else { (nb, na) };
+        ev.push(Event::Diff {
+            rule: "equiv.drop-if-exists",
+            witness: format!(
+                "when the {} does not exist, {without} fails and {with} (IF EXISTS) goes on",
+                x.kind.to_lowercase()
+            ),
+            at,
+        });
+        return Ok(());
+    }
+    // A schema is dropped only when empty, on both.
+    if x.kind != "SCHEMA" {
+        ev.push(Event::Asm(asm::DROP_DEPENDENTS));
+    }
+    Ok(())
+}
+
+/// Two column defaults set after the table: the same table and column; the
+/// values are compared by the caller (`Event::Default`).
+fn defaults(x: &SetDefault, y: &SetDefault, na: &str, nb: &str, ev: &mut Vec<Event>) -> R<()> {
+    tsql_pg(x.dialect, y.dialect)?;
+    let at = (x.off, y.off);
+    ev.push(Event::Asm(super::canon::asm::IDENT_FOLD));
+    let (tx, ty) = (
+        object_key(&x.table, x.dialect)?,
+        object_key(&y.table, y.dialect)?,
+    );
+    if tx != ty || fold(&x.column, x.dialect)? != fold(&y.column, y.dialect)? {
+        ev.push(Event::Diff {
+            rule: "equiv.column-default",
+            witness: format!(
+                "{na} sets the default of {}.{} and {nb} of {}.{}",
+                super::table::text_name(&x.table),
+                x.column.text,
+                super::table::text_name(&y.table),
+                y.column.text
+            ),
+            at,
+        });
+        return Ok(());
+    }
+    if tx.0.is_none() {
+        ev.push(Event::Asm(super::canon::asm::DEFAULT_SCHEMA));
+    }
+    // T-SQL adds a default (named or not), PostgreSQL sets one.
+    ev.push(Event::Asm(asm::DEFAULT_NAME));
+    ev.push(Event::Default {
+        a: x.value.clone(),
+        b: y.value.clone(),
+        at,
+    });
     Ok(())
 }
 

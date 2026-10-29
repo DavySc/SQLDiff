@@ -1,8 +1,8 @@
 //! Davy, 2026-10-29: a conversion keeps the target's text types, and each
 //! statement whose result T-SQL's case-insensitive, trailing-space-blind
 //! string equality can change is flagged with `ASM-CI-COLLATION` for the
-//! reviewer. Plain diffs still report the difference. Ordering and LIKE
-//! depend on more than case and trailing spaces and stay not proven.
+//! reviewer. Plain diffs still report the difference. Ordering depends on
+//! more than case and trailing spaces and stays not proven.
 
 use sqldiff_core::equiv::compare::ci_collation_scope;
 use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
@@ -123,15 +123,51 @@ fn grouping_and_distinct_are_flagged() {
 }
 
 #[test]
-fn ordering_and_like_are_not_covered() {
+fn ordering_is_not_covered() {
     for body in [
         "SELECT customer_id FROM customer WHERE email < 'm';",
-        "SELECT customer_id FROM customer WHERE email LIKE 'a%';",
         "SELECT email FROM customer ORDER BY email;",
     ] {
         let r = convert(body, P);
         not_equal(&r);
     }
+}
+
+/// LIKE on varchar with a literal pattern differs only by the collation
+/// (case, the value's trailing spaces, expanded characters; checked on SQL
+/// Server 2022 and PostgreSQL 18). A `[` (T-SQL character class) or `\`
+/// (PostgreSQL escape) in the pattern, a pattern that is not a literal and a
+/// blank-padded char value are not covered.
+#[test]
+fn like_on_varchar_with_a_plain_pattern_is_flagged() {
+    flagged(&convert(
+        "SELECT customer_id FROM customer WHERE email LIKE 'a%';",
+        P,
+    ));
+    flagged(&convert(
+        "SELECT customer_id FROM customer WHERE email NOT LIKE '%@x_com';",
+        P,
+    ));
+    for body in [
+        "SELECT customer_id FROM customer WHERE email LIKE '[ab]%';",
+        "SELECT customer_id FROM customer WHERE email LIKE 'a\\_%';",
+        "SELECT customer_id FROM customer WHERE email LIKE nick;",
+        "SELECT customer_id FROM customer WHERE code LIKE 'a%';",
+    ] {
+        not_equal(&convert(body, P));
+    }
+    // The pattern is still compared.
+    not_equal(&run(
+        &view(T, "SELECT customer_id FROM customer WHERE email LIKE 'a%';"),
+        T,
+        &view(P, "SELECT customer_id FROM customer WHERE email LIKE 'b%';"),
+        P,
+        true,
+        true,
+    ));
+    // A plain diff keeps it unproven.
+    let body = "SELECT customer_id FROM customer WHERE email LIKE 'a%';";
+    not_equal(&run(&view(T, body), T, &view(P, body), P, true, false));
 }
 
 /// The assumption covers the collation only: any other change between the

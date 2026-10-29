@@ -87,6 +87,7 @@ pub(crate) fn convert(
         trigger: None,
         seq_defaults: Vec::new(),
         table_cols: Vec::new(),
+        update_ctes: Vec::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -244,6 +245,9 @@ struct Cx<'a> {
     seq_defaults: Vec<(String, String)>,
     /// The columns of the table being created (lower case, unquoted).
     table_cols: Vec<String>,
+    /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
+    /// with the GROUP BY key their query returns (`group_key`), if any.
+    update_ctes: Vec<(String, Option<Vec<String>>)>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -2074,14 +2078,32 @@ impl<'a> Cx<'a> {
                     .map_or(verb, |&j| if ts[j].is("FROM") { j } else { verb })
             };
             if find_word(&ts, after + 1, "FROM").is_some() {
-                return no(format!(
-                    "WITH … {what} … FROM: not converted yet; the FROM tables may be CTEs, and the target one of them"
-                ));
+                if what != "UPDATE" {
+                    return no(format!(
+                        "WITH … {what} … FROM: not converted yet; the FROM tables may be CTEs, and the target one of them"
+                    ));
+                }
+                // UPDATE … FROM: the CTEs may be other FROM items, read as
+                // derived tables in both dialects (`update_join` refuses a
+                // CTE as the target).
+                self.update_ctes = cte_bodies(&ts)
+                    .ok_or(No("unreadable WITH list".into()))?
+                    .into_iter()
+                    .map(|(n, body)| {
+                        let key = cte_group_key(&ts[body]);
+                        (n, key)
+                    })
+                    .collect();
             }
         }
-        let prefix = self.with_list(&ts, verb)?.trim().to_string();
-        let body = self.dml(&ts[verb..])?;
-        Ok(format!("{prefix} {}", body.trim_start()))
+        let prefix = self.with_list(&ts, verb);
+        let body = match prefix {
+            Ok(_) => self.dml(&ts[verb..]),
+            Err(_) => Ok(String::new()),
+        };
+        self.update_ctes.clear();
+        let (prefix, body) = (prefix?, body?);
+        Ok(format!("{} {}", prefix.trim(), body.trim_start()))
     }
 
     /// `ts[..end]` of a statement that starts with WITH. A recursive CTE
@@ -2315,6 +2337,15 @@ impl<'a> Cx<'a> {
         if hits.len() > 1 {
             return Err(why("the target matches more than one FROM table"));
         }
+        for st in chains.iter().flatten() {
+            if let Some(v) = st.leaf.name[..].first().and_then(|n| n.strip_prefix('@')) {
+                if !self.tables.contains_key(v) {
+                    return Err(why(&format!(
+                        "the table variable `@{v}` was not converted to a table"
+                    )));
+                }
+            }
+        }
         if chains
             .iter()
             .flatten()
@@ -2329,6 +2360,11 @@ impl<'a> Cx<'a> {
             let c = &mut chains[ci];
             if !c[li].leaf.table {
                 return Err(why("the target is not a table"));
+            }
+            if self.update_cte(&c[li].leaf.name).is_some() {
+                return Err(why(
+                    "the target is a CTE (T-SQL changes the CTE's base table); rewrite the statement against that table",
+                ));
             }
             let inner = |k: Join| matches!(k, Join::Inner | Join::Cross);
             let tleaf = match li {
@@ -2527,7 +2563,20 @@ impl<'a> Cx<'a> {
                         }
                     }
                 }
-                if st.leaf.table && self.has_unique_key(&st.leaf.name, &cols) {
+                // A CTE or a derived table: its GROUP BY columns, matched
+                // in full; a table: a key of the catalog.
+                let grouped = |key: Option<&Vec<String>>| {
+                    key.is_some_and(|k| k.iter().all(|c| cols.contains(c)))
+                };
+                let unique = if !st.leaf.table {
+                    derived_query(st.leaf.toks).is_some_and(|q| grouped(cte_group_key(q).as_ref()))
+                } else {
+                    match self.update_cte(&st.leaf.name) {
+                        Some(key) => grouped(key),
+                        None => self.has_unique_key(&st.leaf.name, &cols),
+                    }
+                };
+                if unique {
                     bound.push(k);
                     progress = true;
                 }
@@ -2554,6 +2603,16 @@ impl<'a> Cx<'a> {
                 .map(|c| c.name.to_ascii_lowercase())
                 .collect()
         })
+    }
+
+    /// The CTE of the `WITH … UPDATE … FROM` being converted that a
+    /// one-part FROM name reads, with its GROUP BY key if it has one.
+    fn update_cte(&self, name: &[String]) -> Option<Option<&Vec<String>>> {
+        let [n] = name else { return None };
+        self.update_ctes
+            .iter()
+            .find(|(c, _)| c == n)
+            .map(|(_, k)| k.as_ref())
     }
 
     /// Whether `cols` include every column of a primary key, a UNIQUE
@@ -4910,12 +4969,136 @@ impl<'a> Cx<'a> {
             .iter()
             .any(|t| t.is("SYSTEM_VERSIONING") || t.is("SYSTEM_TIME"))
         {
-            return no(self.pick(
-                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: in PostgreSQL versioning is the history trigger of the converted CREATE TABLE; turning it off, dropping the period or adding it later needs those triggers changed to match; no rule yet",
-                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: Db2 for i system-period tables are not converted yet (their facts are not verified on IBM i); no rule yet",
-            ));
+            return self.alter_versioning(&ts);
         }
         let first = sig(&ts)[0];
+        // The action: what follows the table name.
+        let action = sig(&ts).into_iter().skip(3).find(|&k| {
+            [
+                "WITH", "ADD", "CHECK", "NOCHECK", "DROP", "ALTER", "SET", "ENABLE", "DISABLE",
+            ]
+            .iter()
+            .any(|w| ts[k].is(w))
+        });
+        // `WITH CHECK` / `WITH NOCHECK` before ADD or CHECK CONSTRAINT: whether
+        // existing rows are checked.
+        let mut checked = false;
+        let mut ts = ts.to_vec();
+        if let Some(w) = action.filter(|&w| ts[w].is("WITH")) {
+            let n = next_sig(&ts, w).ok_or(No("ALTER TABLE … WITH".into()))?;
+            if ts[n].is("NOCHECK") {
+                return no(self.pick(
+                    "ALTER TABLE … WITH NOCHECK: the constraint does not check the rows already there; PostgreSQL's nearest is NOT VALID (FOREIGN KEY and CHECK only); no rule yet",
+                    "ALTER TABLE … WITH NOCHECK: the constraint does not check the rows already there; no rule yet for Db2 for i",
+                ));
+            }
+            let then = next_sig(&ts, n).filter(|&m| ts[m].is("ADD") || ts[m].is("CHECK"));
+            if !ts[n].is("CHECK") || then.is_none() {
+                return no("ALTER TABLE … WITH: no rule for this form yet");
+            }
+            if self.db2() {
+                return no("ALTER TABLE … WITH CHECK: no rule yet for Db2 for i");
+            }
+            // PostgreSQL checks the rows already there when it adds a
+            // constraint, as WITH CHECK asks.
+            self.step_ts("tsql.table.with-check", &ts[w..=n]);
+            ts.drain(w..=n);
+            checked = true;
+        }
+        let action = action.map(|_| {
+            sig(&ts)
+                .into_iter()
+                .skip(3)
+                .find(|&k| {
+                    [
+                        "ADD", "CHECK", "NOCHECK", "DROP", "ALTER", "SET", "ENABLE", "DISABLE",
+                    ]
+                    .iter()
+                    .any(|w| ts[k].is(w))
+                })
+                .unwrap_or(ts.len())
+        });
+        if let Some(act) = action.filter(|&k| k < ts.len()) {
+            let head = self.expr(&ts[..act]).trim_end().to_string();
+            let after = next_sig(&ts, act);
+            // `CHECK CONSTRAINT name` turns a constraint on (and, after WITH
+            // CHECK, checks the rows already there); `NOCHECK` turns it off.
+            if (ts[act].is("CHECK") || ts[act].is("NOCHECK"))
+                && after.is_some_and(|k| ts[k].is("CONSTRAINT"))
+            {
+                if ts[act].is("NOCHECK") {
+                    return no(self.pick(
+                        "ALTER TABLE … NOCHECK CONSTRAINT: PostgreSQL cannot turn a constraint off; drop it and add it back",
+                        "ALTER TABLE … NOCHECK CONSTRAINT: no rule yet for Db2 for i",
+                    ));
+                }
+                if self.db2() {
+                    return no("ALTER TABLE … CHECK CONSTRAINT: no rule yet for Db2 for i");
+                }
+                let names: Vec<&[T]> = split_commas(&ts[after.unwrap() + 1..]);
+                let [name] = names.as_slice() else {
+                    return no(
+                        "ALTER TABLE … CHECK CONSTRAINT with several constraints: no rule yet",
+                    );
+                };
+                if trimmed(name).len() != 1 || trimmed(name)[0].is("ALL") {
+                    return no("ALTER TABLE … CHECK CONSTRAINT ALL: no rule yet");
+                }
+                // PostgreSQL constraints are always on; VALIDATE checks the
+                // rows already there (nothing to do for a constraint that
+                // was added with its check).
+                self.step_ts("tsql.table.check-constraint", &ts[act..]);
+                if !checked {
+                    self.note(Status::Assumptions, "ASM-CONSTRAINT-ROWS-VALID", "CHECK CONSTRAINT becomes VALIDATE CONSTRAINT, which also checks the rows already in the table: T-SQL turns the constraint on without checking them (it stays not trusted), PostgreSQL fails if one of them breaks it.");
+                }
+                let n = self.expr(name).trim().to_string();
+                return Ok(format!("{head} VALIDATE CONSTRAINT {n}"));
+            }
+            // `ADD [CONSTRAINT n] DEFAULT value FOR column`.
+            if ts[act].is("ADD") {
+                let mut d = after.ok_or(No("ADD without a column".into()))?;
+                if ts[d].is("CONSTRAINT") {
+                    d = next_sig(&ts, d)
+                        .and_then(|n| next_sig(&ts, n))
+                        .ok_or(No("ADD CONSTRAINT without a name".into()))?;
+                }
+                if ts[d].is("DEFAULT") {
+                    if self.db2() {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR: no rule yet for Db2 for i");
+                    }
+                    let f = find_word(&ts, d + 1, "FOR")
+                        .ok_or(No("ADD DEFAULT without FOR column".into()))?;
+                    let col = trimmed(&ts[f + 1..]);
+                    if col.len() != 1 || !matches!(col[0].k, IDENT | QUOTED_IDENT) {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR: one column only");
+                    }
+                    let tname = find_word(&ts, 0, "TABLE")
+                        .map(|t| self.table_bit_cols(&ts[t + 1..act]))
+                        .unwrap_or_default();
+                    let colname = tsql_unquote(&col[0].s).to_ascii_lowercase();
+                    if tname.iter().any(|b| b.eq_ignore_ascii_case(&colname)) {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a BIT column: no rule yet");
+                    }
+                    if find_word(&ts, 0, "TABLE")
+                        .is_some_and(|t| self.table_col_has_default(&ts[t + 1..act], &colname))
+                    {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a column that already has a default or is an identity: SQL Server refuses it (Msg 1781), PostgreSQL's SET DEFAULT would replace the default");
+                    }
+                    let mut value = trimmed(&ts[d + 1..f]);
+                    while value.len() > 2
+                        && value[0].k == L_PAREN
+                        && matching(value, 0) == Some(value.len() - 1)
+                    {
+                        value = trimmed(&value[1..value.len() - 1]);
+                    }
+                    self.step_ts("tsql.table.add-default", &ts[act..]);
+                    self.note(Status::Assumptions, "ASM-DEFAULT-CONSTRAINT-NAME", "The default becomes ALTER COLUMN … SET DEFAULT. Assumes the column has no default yet: SQL Server refuses a second default (Msg 1781) where SET DEFAULT replaces it. PostgreSQL defaults have no name, so a later ALTER TABLE … DROP CONSTRAINT of it finds no constraint.");
+                    let v = self.expr(value).trim().to_string();
+                    let c = self.expr(col).trim().to_string();
+                    return Ok(format!("{head} ALTER COLUMN {c} SET DEFAULT {v}"));
+                }
+            }
+        }
         if find_word(&ts, first + 1, "ALTER").is_some() {
             return no(self.pick(
                 "ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions",
@@ -4955,6 +5138,19 @@ impl<'a> Cx<'a> {
     }
 
     // ----- expressions ----------------------------------------------------------
+
+    /// `dbo.` (or `[dbo].`) at `i`, followed by a dot: dropped. Returns the
+    /// index after the dot.
+    fn drop_dbo(&mut self, ts: &[T], i: usize) -> usize {
+        let dot = next_sig(ts, i).unwrap_or(i);
+        let text = self.pick(
+            "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+            "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+        ).to_string();
+        self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+        self.step_ts("tsql.expr.dbo-schema", &ts[i..=dot]);
+        dot + 1
+    }
 
     fn is_varbinary_var(&self, v: &str) -> bool {
         self.vars
@@ -5009,6 +5205,11 @@ impl<'a> Cx<'a> {
                 ("@@TRANCOUNT", true) => "@@TRANCOUNT: Db2 for i transactions do not nest",
                 ("@@IDENTITY", false) => "@@IDENTITY: use INSERT … RETURNING",
                 ("@@IDENTITY", true) => "@@IDENTITY: use IDENTITY_VAL_LOCAL() or SELECT … FROM FINAL TABLE (INSERT …)",
+                ("@@FETCH_STATUS", false) => "@@FETCH_STATUS: convert the cursor loop to FOR rec IN … LOOP, or FETCH …; EXIT WHEN NOT FOUND (no rule yet)",
+                ("@@PROCID", false) => "@@PROCID is the running module's SQL Server object id; PostgreSQL routines have none. Write the routine's own name (or what the id was used to look up) as a literal",
+                ("@@SERVERNAME", false) => "@@SERVERNAME is the SQL Server instance name; PostgreSQL has no instance name (cluster_name and inet_server_addr() are other things)",
+                ("@@SPID", false) => "@@SPID: pg_backend_pid() is a process id, not a session id that SQL Server tables hold",
+                ("@@VERSION", false) => "@@VERSION: version() returns PostgreSQL's own text; code that parses SQL Server's version string must be rewritten",
                 (_, false) => "T-SQL global variable with no PostgreSQL equivalent",
                 (_, true) => "T-SQL global variable with no Db2 for i equivalent",
             };
@@ -5141,6 +5342,13 @@ impl<'a> Cx<'a> {
                 let r = self.var_ref(t);
                 o.push_str(&r)
             }
+            // `[dbo].x` names the same schema as `dbo.x`.
+            QUOTED_IDENT
+                if tsql_unquote(&t.s).eq_ignore_ascii_case("dbo")
+                    && next_sig(ts, i).is_some_and(|d| ts[d].k == DOT) =>
+            {
+                return self.drop_dbo(ts, i);
+            }
             QUOTED_IDENT => {
                 let q = quoted(&t.s);
                 if q != t.s {
@@ -5220,13 +5428,7 @@ impl<'a> Cx<'a> {
                 let up = t.up();
                 let nx = next_sig(ts, i);
                 if up == "DBO" && nx.is_some_and(|d| ts[d].k == DOT) {
-                    let text = self.pick(
-                        "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
-                        "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
-                    ).to_string();
-                    self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
-                    self.step_ts("tsql.expr.dbo-schema", &ts[i..=nx.unwrap()]);
-                    return nx.unwrap() + 1;
+                    return self.drop_dbo(ts, i);
                 }
                 if up == "NEXT" && !self.db2() {
                     if let Some((text, end)) = self.next_value(ts, i) {
@@ -5661,10 +5863,22 @@ impl<'a> Cx<'a> {
             ("CHARINDEX", 2) => {
                 self.ci_note();
                 let (x, y) = (e(self, 0), e(self, 1));
-                format!("strpos({y}, {x})")
+                // CHARINDEX finds an empty string nowhere (0); strpos finds it
+                // at 1. A literal needle shows it is not empty.
+                if nonempty_literal(a[0]) || self.nonempty_concat(a[0]) {
+                    format!("strpos({y}, {x})")
+                } else if simple_operand(a[0]) {
+                    format!("(CASE WHEN length({x}) = 0 THEN 0 ELSE strpos({y}, {x}) END)")
+                } else {
+                    self.note(Status::NotConverted, "tsql.charindex", "CHARINDEX of a computed needle: CHARINDEX finds an empty needle nowhere (0), strpos at 1, so the needle must be tested first. Store it in a variable, then convert.");
+                    return None;
+                }
             }
             ("NEWID", 0) => "gen_random_uuid()".into(),
-            ("DB_NAME", 0) => "current_database()".into(),
+            ("DB_NAME", 0) => {
+                self.note(Status::Assumptions, "ASM-SAME-DATABASE-NAME", "DB_NAME() becomes current_database(): equal if the PostgreSQL database has the same name, letter for letter, as the SQL Server database.");
+                "current_database()".into()
+            }
             // Code points 1 to 127 are the same character in every code page and in
             // Unicode. 0 (`chr(0)` is an error), 128 to 255 (the database's code
             // page decides) and a value only known at run time stay unconverted.
@@ -5677,6 +5891,21 @@ impl<'a> Cx<'a> {
                 match text.parse::<u8>() {
                     Ok(code @ 1..=127) => format!("chr({code})"),
                     _ => return None,
+                }
+            }
+            // NCHAR: the same for code points 1 to 127.
+            ("NCHAR", 1) => {
+                let text: String = a[0]
+                    .iter()
+                    .filter(|t| t.sig())
+                    .map(|t| t.s.as_str())
+                    .collect();
+                match text.parse::<u8>() {
+                    Ok(code @ 1..=127) => format!("chr({code})"),
+                    _ => {
+                        self.note(Status::NotConverted, "tsql.nchar", "NCHAR() of a value other than a literal from 1 to 127: NCHAR returns a UTF-16 code unit (or NULL out of range), chr() a code point in the database encoding (an error for 0); not converted.");
+                        return None;
+                    }
                 }
             }
             ("QUOTENAME", 1) => {
@@ -5718,14 +5947,20 @@ impl<'a> Cx<'a> {
                 return self.cast_pg(&a[0][..at], &a[0][at + 1..]);
             }
             ("CONVERT", 2) => return self.cast_pg(a[1], a[0]),
-            ("CONVERT", 3) => {
-                self.note(Status::NotConverted, "tsql.convert-style", "CONVERT with a style code: use to_char / to_timestamp with the matching format.");
-                return None;
-            }
+            ("CONVERT", 3) => return self.convert_style(&a),
             ("DATEADD", 3) => return self.dateadd(&a),
             ("DATEPART", 2) => {
-                let part = date_part(&self.expr(a[0]))?;
-                format!("EXTRACT({part} FROM {})::int", e(self, 1))
+                let p = self.expr(a[0]);
+                if is_weekday(&p) {
+                    self.note(Status::Assumptions, "ASM-TSQL-DATEFIRST-7", "DATEPART(weekday, …) becomes EXTRACT(DOW …) + 1: Sunday is 1, as with SET DATEFIRST 7 (the us_english default). Equal if the session keeps DATEFIRST 7.");
+                    return Some(format!("(EXTRACT(DOW FROM {})::int + 1)", e(self, 1)));
+                }
+                match date_part(&p)? {
+                    // EXTRACT(SECOND …) keeps the fraction and ::int rounds it
+                    // (59.9 → 60); DATEPART truncates (59).
+                    "second" => format!("floor(EXTRACT(SECOND FROM {}))::int", e(self, 1)),
+                    part => format!("EXTRACT({part} FROM {})::int", e(self, 1)),
+                }
             }
             ("YEAR" | "MONTH" | "DAY", 1) => format!("EXTRACT({name} FROM {})::int", e(self, 0)),
             ("DATEDIFF", 3)
@@ -5750,10 +5985,14 @@ impl<'a> Cx<'a> {
                 | "ERROR_PROCEDURE",
                 _,
             ) => {
+                let text = match builtin_refusal(name) {
+                    Some(why) => format!("{name}(): {why}"),
+                    None => format!("{name}() has no rule yet."),
+                };
                 self.note(
                     Status::NotConverted,
                     &format!("tsql.{}", name.to_ascii_lowercase()),
-                    &format!("{name}() has no rule yet."),
+                    &text,
                 );
                 return None;
             }
@@ -5918,15 +6157,20 @@ impl<'a> Cx<'a> {
         let tsql = builtins::of(Dialect::Tsql).function(name, "9999") != Availability::Unknown;
         let target = builtins::of(self.to).function(name, "9999") != Availability::Unknown;
         if tsql && !target {
-            self.note(
-                Status::NotConverted,
-                "tsql.builtin",
-                &format!(
-                    "{}() is a T-SQL built-in that {} does not have; no rule yet.",
-                    name.to_ascii_uppercase(),
+            let up = name.to_ascii_uppercase();
+            let why = if self.db2() {
+                None
+            } else {
+                builtin_refusal(&up)
+            };
+            let text = match why {
+                Some(why) => format!("{up}(): {why}"),
+                None => format!(
+                    "{up}() is a T-SQL built-in that {} does not have; no rule yet.",
                     self.to.display_name()
                 ),
-            );
+            };
+            self.note(Status::NotConverted, "tsql.builtin", &text);
         }
     }
 
@@ -6640,13 +6884,13 @@ fn join_steps(ts: &[T]) -> Result<Vec<Step<'_>>, String> {
                 }
                 steps.push(Step {
                     kind,
-                    leaf: leaf(&ts[a..o])?,
+                    leaf: leaf_or_var(&ts[a..o])?,
                     on: Some(&ts[o + 1..b]),
                 });
             }
             (None, false) => steps.push(Step {
                 kind,
-                leaf: leaf(&ts[a..b])?,
+                leaf: leaf_or_var(&ts[a..b])?,
                 on: None,
             }),
             (None, true) => return Err("a JOIN without its ON".into()),
@@ -6865,6 +7109,36 @@ fn join_chain<'a>(
 
 /// One FROM table: `name [[AS] alias] [WITH (hints)]` or a derived table
 /// `(SELECT …) [AS] alias`.
+/// `leaf`, or a table variable (`@t [AS] alias`), named `@t` (lower case).
+/// Whether the variable became a table is the caller's to check.
+fn leaf_or_var(ts: &[T]) -> Result<Leaf<'_>, String> {
+    let s = sig(ts);
+    match s.first().map(|&i| &ts[i]) {
+        Some(v) if v.k == VARIABLE && !v.s.starts_with("@@") => {
+            let mut k = 1;
+            if s.get(k).is_some_and(|&i| ts[i].is("AS")) {
+                k += 1;
+            }
+            let alias = match s.get(k).map(|&i| &ts[i]) {
+                None => None,
+                Some(t) if t.k == IDENT && !t.is("WITH") => Some(t.s.to_ascii_lowercase()),
+                Some(t) if t.k == QUOTED_IDENT => Some(tsql_unquote(&t.s).to_ascii_lowercase()),
+                Some(_) => return leaf(ts),
+            };
+            if s.len() != k + usize::from(alias.is_some()) {
+                return leaf(ts);
+            }
+            Ok(Leaf {
+                toks: ts,
+                name: vec![v.s.to_ascii_lowercase()],
+                alias,
+                table: true,
+            })
+        }
+        _ => leaf(ts),
+    }
+}
+
 fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
     let bad =
         || Err("a FROM item that is not a table, a derived table or a table function".to_string());
@@ -6938,6 +7212,56 @@ fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
 
 /// The CTE names of a statement that starts with WITH (unquoted,
 /// lowercased), and the index of the statement word after the list.
+/// The CTEs of a WITH list: each name (lower case) and the tokens of its
+/// query, between the parentheses.
+fn cte_bodies(ts: &[T]) -> Option<Vec<(String, std::ops::Range<usize>)>> {
+    let (names, verb) = cte_list(ts)?;
+    let ds = crate::tok::depths(ts);
+    let mut bodies = Vec::new();
+    let mut open = None;
+    for i in sig(&ts[..verb]) {
+        match ts[i].k {
+            L_PAREN
+                if ds[i] == 0 && i > 0 && sig(&ts[..i]).last().is_some_and(|&j| ts[j].is("AS")) =>
+            {
+                open = Some(i)
+            }
+            R_PAREN if ds[i] == 0 => {
+                if let Some(o) = open.take() {
+                    bodies.push(o + 1..i);
+                }
+            }
+            _ => {}
+        }
+    }
+    (bodies.len() == names.len()).then(|| names.into_iter().zip(bodies).collect())
+}
+
+/// The query of a derived table `( SELECT … ) [AS] alias`, between the
+/// parentheses.
+fn derived_query(ts: &[T]) -> Option<&[T]> {
+    let open = *sig(ts).first()?;
+    if ts[open].k != L_PAREN {
+        return None;
+    }
+    let close = matching(ts, open)?;
+    Some(&ts[open + 1..close])
+}
+
+/// The GROUP BY key a CTE's query returns (`group_key`), folded.
+fn cte_group_key(body: &[T]) -> Option<Vec<String>> {
+    let text: Vec<&str> = sig(body).into_iter().map(|i| body[i].s.as_str()).collect();
+    let root = sqldiff_syntax::parse(&text.join(" "), Dialect::Tsql).syntax();
+    let toks = sqldiff_syntax::abstract_syntax::tokens(&root);
+    let mut p = sqldiff_syntax::abstract_syntax::Parser::new(&toks, Dialect::Tsql);
+    let q = p.select().ok()?;
+    if !p.at_end() {
+        return None;
+    }
+    let key = sqldiff_syntax::abstract_syntax::group_key(&q)?;
+    Some(key.iter().map(|c| c.to_ascii_lowercase()).collect())
+}
+
 fn cte_list(ts: &[T]) -> Option<(Vec<String>, usize)> {
     cte_list_rec(ts).map(|(n, v, ..)| (n, v))
 }
@@ -7165,6 +7489,75 @@ fn date_part(p: &str) -> Option<&'static str> {
         "second" | "ss" | "s" => "second",
         _ => return None,
     })
+}
+
+/// Why a T-SQL built-in has no rule: the ones whose result describes SQL
+/// Server itself, or whose target counterpart was checked and differs.
+fn builtin_refusal(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "SERVERPROPERTY" => "describes the SQL Server instance (version, edition, installed features such as In-Memory OLTP or PolyBase); the target has no such properties. Decide by hand what the check means on the target (usually: drop the branch for a SQL Server-only feature).",
+        "DATABASEPROPERTYEX" => "describes a SQL Server database setting; the target has no such properties. Decide by hand what the check means on the target.",
+        "OBJECT_ID" => "returns a SQL Server object id, which nothing on the target has. For an existence test on PostgreSQL write to_regclass('schema.name') IS NULL (any relation kind) or a pg_class query that checks the kind; not converted automatically, because OBJECT_ID's type argument ('U', 'P', …) does not map onto one lookup.",
+        "OBJECT_NAME" | "OBJECT_SCHEMA_NAME" | "OBJECT_DEFINITION" => "looks a SQL Server object id up (often @@PROCID, the running module); the target has no object ids. Write the routine's own name as a literal.",
+        "DB_ID" => "returns a SQL Server database id; the target has none that compare. Compare database names instead (current_database() on PostgreSQL).",
+        "SCHEMA_NAME" => "looks a SQL Server schema id up; the target's schema ids differ. Write the schema name as a literal or use current_schema.",
+        "SUSER_SNAME" | "SUSER_NAME" | "SUSER_SID" => "returns a SQL Server login (or the login of a SID such as 0x01, sa); logins have no target equivalent (PostgreSQL roles are not logins).",
+        "JSON_MODIFY" => "jsonb_set is not the same function: JSON_MODIFY deletes a key when the new value is NULL, quotes a string unless it is wrapped in JSON_QUERY, appends with 'append', and treats lax and strict paths differently. No checked rule.",
+        "CHECKSUM" | "BINARY_CHECKSUM" => "is SQL Server's own hash; no target function gives the same values. ABS(CHECKSUM(NEWID())) % n is a random number: rewrite it by hand (floor(random() * n)::int on PostgreSQL), knowing no conversion of a random value can be shown equal.",
+        "HASHBYTES" => "hashes the bytes of the T-SQL value: UTF-16LE for NVARCHAR, the code page for VARCHAR. PostgreSQL's sha256/md5 hash UTF-8 text, so the results differ for most strings; not converted.",
+        "COMPRESS" | "DECOMPRESS" => "uses SQL Server's GZIP format on varbinary; the target has no built-in that reads or writes it.",
+        "SESSION_CONTEXT" => "reads SQL Server session context (sp_set_session_context); on PostgreSQL use custom settings (current_setting('app.key', true)) and set them where sp_set_session_context is called.",
+        "ISJSON" => "differs from PostgreSQL's IS JSON in which values count as JSON (scalars, duplicate keys); not checked, so not converted.",
+        "STRING_ESCAPE" => "has no target counterpart that escapes the same characters; not converted.",
+        "DATENAME" => "returns names in the session language (SET LANGUAGE); to_char's names follow lc_time and are blank-padded unless FM is used. No checked rule.",
+        "XACT_STATE" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE" | "ERROR_PROCEDURE" => "error and transaction state has no PostgreSQL counterpart with the same values (PostgreSQL ends the transaction on an error and has no severity); rewrite the CATCH logic by hand.",
+        "FORMAT" => "uses .NET format strings and culture; to_char's patterns differ. No checked rule.",
+        _ => return None,
+    })
+}
+
+/// DATEPART's `weekday` and its abbreviations.
+fn is_weekday(p: &str) -> bool {
+    matches!(
+        p.trim().to_ascii_lowercase().as_str(),
+        "weekday" | "dw" | "w"
+    )
+}
+
+/// A string literal with at least one character.
+fn nonempty_literal(ts: &[T]) -> bool {
+    match sig(trimmed(ts)).as_slice() {
+        [i] => {
+            let t = &trimmed(ts)[*i];
+            t.k == STRING && !string_value(&t.s).is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// One variable, column name or literal: safe to evaluate twice.
+fn simple_operand(ts: &[T]) -> bool {
+    let ts = trimmed(ts);
+    let s = sig(ts);
+    s.iter().enumerate().all(|(k, &i)| match ts[i].k {
+        VARIABLE | STRING | NUMBER => s.len() == 1,
+        IDENT | QUOTED_IDENT => k % 2 == 0,
+        DOT => k % 2 == 1,
+        _ => false,
+    }) && !s.is_empty()
+        && s.len() % 2 == 1
+}
+
+/// The PostgreSQL to_char format that prints what CONVERT(varchar, x, style)
+/// prints, and the text's length: the engine's table, for a date or a
+/// datetime / datetime2 (smalldatetime and time are left out).
+fn style_format(dt: Dt, style: u32) -> Option<(&'static str, u32)> {
+    let date_only = match dt {
+        Dt::Date => true,
+        Dt::DateTime | Dt::DateTime2(_) => false,
+        _ => return None,
+    };
+    sqldiff_core::equiv::canon::style_format(date_only, style)
 }
 
 /// A T-SQL built-in whose result is always a string, so `+` next to a call
@@ -8117,6 +8510,90 @@ impl Cx<'_> {
             }
             _ => self.column_dt(ts),
         }
+    }
+
+    /// `@s + ' '`: string variables and literals joined by `+`, one of them
+    /// a non-empty literal, so the result is never empty (NULL stays NULL).
+    fn nonempty_concat(&self, ts: &[T]) -> bool {
+        let ts = trimmed(ts);
+        let s = sig(ts);
+        let mut literal = false;
+        for (k, &i) in s.iter().enumerate() {
+            let t = &ts[i];
+            let ok = if k % 2 == 1 {
+                t.k == OP && t.s == "+"
+            } else {
+                match t.k {
+                    STRING => {
+                        literal |= !string_value(&t.s).is_empty();
+                        true
+                    }
+                    VARIABLE => self.expr_dt(&ts[i..=i]) == Some(Dt::Text),
+                    _ => false,
+                }
+            };
+            if !ok {
+                return false;
+            }
+        }
+        literal && s.len() % 2 == 1
+    }
+
+    /// PostgreSQL: CONVERT(varchar(n), x, style) of a date or date-time
+    /// value → to_char(x, format), for the styles `style_format` knows.
+    fn convert_style(&mut self, a: &[&[T]]) -> Option<String> {
+        let refuse = |cx: &mut Self, why: String| {
+            cx.note(
+                Status::NotConverted,
+                "tsql.convert-style",
+                &format!("CONVERT with a style code: {why}"),
+            );
+            None
+        };
+        let ty = trimmed(a[0]);
+        let words: Vec<String> = sig(ty).iter().map(|&i| ty[i].up()).collect();
+        let len = match words
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["VARCHAR" | "NVARCHAR"] => Some(30),
+            ["VARCHAR" | "NVARCHAR", "(", "MAX", ")"] => None,
+            ["VARCHAR" | "NVARCHAR", "(", n, ")"] => match n.parse::<u32>() {
+                Ok(n) if n > 0 => Some(n),
+                _ => return refuse(self, "the target length is not a number.".into()),
+            },
+            _ => {
+                return refuse(
+                    self,
+                    "only a VARCHAR or NVARCHAR target has a checked rule (to_char).".into(),
+                )
+            }
+        };
+        let style = trimmed(a[2]);
+        let style = match sig(style).as_slice() {
+            [i] if style[*i].k == NUMBER => style[*i].s.parse::<u32>().ok(),
+            _ => None,
+        };
+        let Some(style) = style else {
+            return refuse(self, "the style is not a literal number.".into());
+        };
+        let dt = self.expr_dt(a[1]);
+        let Some((fmt, width)) = dt.and_then(|d| style_format(d, style)) else {
+            let of = match dt {
+                Some(d) if d.is_date() => d.name(),
+                Some(_) => "a value that is not a date".into(),
+                None => "a value of unknown type".into(),
+            };
+            return refuse(self, format!("style {style} of {of} has no checked to_char format (checked: 20, 120, 23, 102, 111, 112 of date, datetime and datetime2; 108 of datetime and datetime2)."));
+        };
+        let x = self.expr(a[1]).trim().to_string();
+        let out = format!("to_char({x}, '{fmt}')");
+        Some(match len {
+            Some(n) if n < width => format!("CAST({out} AS varchar({n}))"),
+            _ => out,
+        })
     }
 
     /// The DATEADD number as an integer, made the way T-SQL makes it: a
