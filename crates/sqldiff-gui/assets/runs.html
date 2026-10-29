@@ -111,6 +111,30 @@ a.btn:hover { background: var(--link-2); }
 .cmd pre { margin: 0; font-family: var(--mono); font-size: 12px; color: var(--fg); background: var(--soft); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; overflow-wrap: anywhere; user-select: all; }
 .cmd ul { margin: 6px 0 0; padding-left: 18px; }
 .cmd li .path { color: var(--muted); }
+.batches { display: grid; gap: 10px; }
+details.group { border-bottom: 1px solid var(--line); }
+details.group:last-child { border-bottom: 0; }
+details.group > summary { padding: 12px 16px; cursor: pointer; font-size: 13px; }
+details.group > summary .t { font-weight: 600; }
+details.group[open] > summary { border-bottom: 1px solid var(--line); }
+details.group .run { padding-left: 32px; }
+.batch { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 10px 14px; display: grid; gap: 6px; }
+.batch .head { display: flex; gap: 10px; align-items: center; }
+.batch .head .t { font-weight: 600; }
+.batch .head .s { color: var(--muted); font-size: 12px; flex: 1; }
+.matrix { overflow-x: auto; }
+.matrix table { border-collapse: collapse; width: 100%; font-size: 12.5px; table-layout: fixed; }
+.matrix th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 4px 8px; }
+.matrix tbody th { color: var(--fg); font-weight: 500; width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-top: 1px solid var(--line); }
+.matrix td { padding: 2px; border-top: 1px solid var(--line); }
+.matrix .cell { display: block; padding: 6px 6px; border-radius: 6px; color: inherit; text-decoration: none; }
+.matrix a.cell:hover { background: var(--soft); }
+.matrix .cell .bar { height: 4px; }
+.matrix .cell .line { margin-top: 5px; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.matrix .cell b.done { font-weight: 600; }
+.matrix .bad { color: var(--bad); }
+.matrix td.none { color: var(--faint); font-size: 12px; padding: 8px; }
+.targets { display: flex; gap: 14px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -121,7 +145,7 @@ a.btn:hover { background: var(--link-2); }
   <span class="muted">Runs are kept while the app is open</span>
 </header>
 <main><div class="col">
-  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button><button type="button" role="tab" data-tab="chgf" aria-selected="false">Review a branch</button></div>
+  <div class="tabs" role="tablist" aria-label="Kind of run"><button type="button" role="tab" data-tab="conv" class="on" aria-selected="true">Convert a tree</button><button type="button" role="tab" data-tab="instf" aria-selected="false">Check template instances</button><button type="button" role="tab" data-tab="driftf" aria-selected="false">Check template drift</button><button type="button" role="tab" data-tab="chgf" aria-selected="false">Review a branch</button><button type="button" role="tab" data-tab="batchf" aria-selected="false">Mass conversion</button></div>
   <form class="form" id="conv" autocomplete="off">
     <div class="field"><span>Source</span><input type="text" id="src" placeholder="Folder of SQL files, or one file" aria-label="Source folder or file" spellcheck="false"><button type="button" class="outline" data-browse="src" data-near="out" data-next="out">Browse…</button></div>
     <div class="field"><span>Output</span><input type="text" id="out" placeholder="Empty or new folder for the converted tree" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="out" data-near="src" data-next="go">Browse…</button></div>
@@ -194,6 +218,23 @@ a.btn:hover { background: var(--link-2); }
     </details>
     <div class="acts"><span class="err" id="c-err" role="alert"></span><button type="submit" class="primary" id="c-go">Review</button></div>
   </form>
+  <form class="form" id="batchf" autocomplete="off" hidden>
+    <div class="field"><span>Sources</span><textarea id="b-srcs" rows="3" placeholder="Source trees (folders of SQL files, or files), one per line" aria-label="Source trees, one per line" spellcheck="false"></textarea><button type="button" class="outline" data-browse="b-pick" data-next="b-out">Add…</button></div>
+    <input type="hidden" id="b-pick">
+    <div class="field"><span>Sources in</span><span class="pick"><select id="b-from" aria-label="Dialect of the sources"></select></span><span></span></div>
+    <div class="field"><span>Targets</span><span class="targets" id="b-targets" role="group" aria-label="Target dialects"></span><span></span></div>
+    <div class="field"><span>Output</span><input type="text" id="b-out" placeholder="Folder for the runs: one folder per source, with one per target in it" aria-label="Output folder" spellcheck="false"><button type="button" class="outline" data-browse="b-out" data-near="b-srcs" data-next="b-go">Browse…</button></div>
+    <div class="hint">Each source and target is an ordinary conversion run into <code>Output/&lt;source name&gt;/&lt;target&gt;</code>, run one after another, with its own review and done gate. If any run is refused, none starts.</div>
+    <div class="acts"><label class="tog" title="Files edited by hand since the last run are never replaced"><input type="checkbox" id="b-overwrite"> Replace files in non-empty output folders</label></div>
+    <details class="more"><summary>Templates, extensions and packs</summary>
+      <div class="acts"><label class="tog"><input type="checkbox" id="b-template"> Every file is a template in the <code>[template]</code> syntax of the config or a pack</label></div>
+      <div class="field"><span>Parameters</span><input type="text" id="b-params" placeholder="Names, comma-separated; empty: the template syntax decides" aria-label="Template parameter names" spellcheck="false"><span></span></div>
+      <div class="field"><span>Extensions</span><input type="text" id="b-exts" placeholder="sql" aria-label="File extensions, comma-separated" spellcheck="false"><span></span></div>
+      <div class="field"><span>Pack</span><input type="text" id="b-pack" placeholder="A pack to load besides the config's (pack.toml or its folder)" aria-label="Pack" spellcheck="false"><button type="button" class="outline" data-browse="b-pack">Browse…</button></div>
+    </details>
+    <div class="acts"><span class="err" id="b-err" role="alert"></span><button type="submit" class="primary" id="b-go">Convert all</button></div>
+  </form>
+  <div class="batches" id="batches"></div>
   <h2 style="margin-top:8px">Runs</h2>
   <div class="list" id="runs"></div>
 </div></main>
@@ -293,6 +334,63 @@ function changesRow(r) {
   return `<div class="run"><span class="dot ${r.state}"></span><div><div class="t">Review branch ${range}</div><div class="s">${sub}</div></div><div>${right}</div><div>${act}</div>${extra}${sheet(r)}</div>`;
 }
 
+// A finished conversion: its own totals and its done gate (`sqldiff
+// review-status`, as the server reads it), never a count made up here.
+function convDone(r) {
+  const u = r.totals.units || {};
+  const g = r.gate;
+  const gate = !g ? (r.past ? " · done gate judged when the review opens" : "") : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
+  return {
+    right: ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>`,
+    act: `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`,
+  };
+}
+
+// A batch: one matrix of its runs, each cell that run's own totals and gate,
+// one line each; the details are in the cell's tooltip and the run's row.
+function batchCard(b, byId) {
+  const targets = b.spec.targets;
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const cell = (i, to) => {
+    const c = b.cells.find((x) => x.source === i && x.to === to);
+    if (!c) return `<td class="none">—</td>`;
+    const r = c.run != null && byId.get(c.run);
+    if (!r) return `<td class="none" title="This run is no longer kept">not kept</td>`;
+    const tip = [`Run ${r.id}`, r.out];
+    let bar = "", line;
+    if (r.state === "done") {
+      const g = r.gate, u = r.totals.units || {};
+      bar = ladder(u);
+      line = !g ? `<span class="muted">${r.past ? "open to judge" : "…"}</span>`
+        : g.error ? `<span class="muted">gate not judged</span>`
+        : g.complete ? `<b class="done">done</b>`
+        : `<span>${plural(g.blockers, "blocker")}</span>`;
+      if (r.queue) line += ` <span class="muted">· ${r.queue} to review</span>`;
+      tip.push(plural(r.totals.files, "file"), `${r.queue} to review`);
+      if (g) tip.push(g.error || (g.complete ? "done" : Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")));
+      if (!r.complete) tip.push("not every file converted");
+      return `<td title="${esc(tip.join("\n"))}"><a class="cell" href="/runs/${r.id}/review">${bar}<div class="line">${line}</div></a></td>`;
+    }
+    if (r.state === "running") {
+      const pct = r.total ? r.checked / r.total * 100 : 0;
+      bar = `<div class="bar"><i class="p" style="width:${pct}%"></i></div>`;
+      line = `<span class="muted">${r.cancelling ? "cancelling…" : r.total ? `${r.checked} / ${r.total}` : "reading…"}</span>`;
+    } else if (r.state === "queued") line = `<span class="muted">${r.cancelling ? "cancelling…" : "waiting"}</span>`;
+    else if (r.state === "cancelled") line = `<span class="muted">cancelled</span>`;
+    else { line = `<span class="bad">failed</span>`; tip.push(r.error); }
+    return `<td title="${esc(tip.join("\n"))}"><div class="cell">${bar}<div class="line">${line}</div></div></td>`;
+  };
+  const froms = [...new Set(b.spec.sources.map((s) => NAME[s.from] || s.from))].join(", ");
+  const rows = b.spec.sources.map((s, i) => `<tr><th scope="row" title="${esc(s.src)}">${esc(b.names[i])}</th>${targets.map((t) => cell(i, t)).join("")}</tr>`).join("");
+  const n = b.cells.length;
+  const sc = b.script;
+  return `<div class="batch"><div class="head"><span class="t">Batch ${b.id}</span><span class="s" title="${esc(b.spec.out)}">${plural(n, "run")} · ${esc(froms)} · started ${esc(time(b.started))}</span>${b.busy ? `<button type="button" data-cancel-batch="${b.id}">Cancel all</button>` : ""}</div>`
+    + `<div class="matrix"><table><thead><tr><th></th>${targets.map((t) => `<th>${esc(NAME[t] || t)}</th>`).join("")}</tr></thead><tbody>${rows}</tbody></table></div>`
+    + `<details class="cmd" data-batch="${b.id}"${shownBatch.has(b.id) ? " open" : ""}><summary>Script</summary>`
+    + `<div class="shells" role="group" aria-label="Shell">${[["powershell", "PowerShell"], ["sh", "sh / bash"]].map(([k, l]) => `<button type="button" data-shell="${k}" class="${k === shell ? "on" : ""}" aria-pressed="${k === shell}">${l}</button>`).join("")}<button type="button" class="copy outline" data-copy-batch="${b.id}">Copy</button></div>`
+    + `<pre>${esc(sc[shell])}</pre><ul><li>Output into <span class="path">${esc(b.spec.out)}</span>; each command is the one on its run's sheet, which lists the config it loaded</li></ul></details></div>`;
+}
+
 function row(r) {
   if (r.kind === "changes") return changesRow(r);
   if (r.kind === "drift") return driftRow(r, `into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? " · earlier session" : ""}`);
@@ -300,7 +398,7 @@ function row(r) {
   const inst = r.kind === "instances";
   const title = inst ? `Check instances ${pair}` : `Convert ${r.template ? "templates " : ""}${pair}`;
   const what = inst ? (r.generator_only ? `the generator's output in <span class="path">${esc(r.woven)}</span>` : `<span class="path">${esc(r.target)}</span>`) : `<span class="path">${esc(r.src)}</span>`;
-  const sub = `${what} into <span class="path">${esc(r.out)}</span> · started ${esc(time(r.started))}${r.past ? ` · <span title="Kept from an earlier session of the app; its review opens again from the tree on disk">earlier session</span>` : ""}`;
+  const sub = `${what} into <span class="path">${esc(r.out)}</span>${r.batch ? ` · batch ${r.batch.batch}` : ""} · started ${esc(time(r.started))}${r.past ? ` · <span title="Kept from an earlier session of the app; its review opens again from the tree on disk">earlier session</span>` : ""}`;
   let right = "", act = "", extra = "", dot = r.state;
   if (r.state === "running") {
     const pct = r.total ? r.checked / r.total * 100 : 0;
@@ -312,12 +410,13 @@ function row(r) {
     right = ladder(u, INSTANCE_LADDER) + `<div class="meta">${n} instance${n === 1 ? "" : "s"} · ${r.totals.done} done${r.complete ? "" : " · not complete"}</div>`;
     act = r.generator_only ? "" : `<button type="button" class="outline" data-use="${r.id}" title="Convert the templates again into the checked folder with this check, so their review judges each template by its instances">Use in a template run</button>`;
     extra = legend(u, INSTANCE_LADDER) + r.notes.map((n) => `<div class="failed-msg">${esc(n)}</div>`).join("");
+  } else if (r.state === "queued") {
+    right = `<div class="meta">${r.cancelling ? "Cancelling…" : `Waiting for the runs before it in batch ${r.batch ? r.batch.batch : ""}`}</div>`;
+    act = r.cancelling ? "" : `<button type="button" data-cancel="${r.id}">Cancel</button>`;
   } else if (r.state === "done") {
     const u = r.totals.units || {};
     const g = r.gate;
-    const gate = !g ? (r.past ? " · done gate judged when the review opens" : "") : g.error ? ` · done gate not judged` : g.complete ? ` · <b class="done">done</b>` : ` · not done: ${g.blockers} blocker${g.blockers === 1 ? "" : "s"}`;
-    right = ladder(u) + `<div class="meta" title="${g ? esc(g.error || Object.entries(g.counts).map(([k, n]) => `${n} ${k}`).join(", ")) : ""}">${r.totals.files} file${r.totals.files === 1 ? "" : "s"} · ${r.queue} to review${gate}${r.complete ? "" : " · not every file converted"}</div>`;
-    act = `<a class="btn" href="/runs/${r.id}/review">Review${r.queue ? ` ${r.queue}` : ""}</a>`;
+    ({ right, act } = convDone(r));
     extra = legend(u)
       + (g && g.accepted.length ? `<details class="accepted"><summary>Accepted by name: ${g.accepted.length} rule${g.accepted.length === 1 ? "" : "s"}</summary><ul>${g.accepted.map((x) => `<li>${esc(x.state)} <code>${esc(x.rule)}</code> on ${x.units} unit${x.units === 1 ? "" : "s"} by ${esc(x.authors.join(", "))}</li>`).join("")}</ul></details>` : "")
       + (r.not_applied.length ? `<div class="failed-msg">${r.not_applied.length} review decision${r.not_applied.length === 1 ? " was" : "s were"} not applied: ${esc(r.not_applied[0])}${r.not_applied.length > 1 ? " …" : ""}</div>` : "");
@@ -332,6 +431,7 @@ function row(r) {
 // The run sheet: the `sqldiff convert` command that writes what the run
 // writes, for scripts and pipelines, and the config it loaded, by path.
 const shown = new Set();
+const shownBatch = new Set();
 let shell = /Win/.test(navigator.platform || navigator.userAgent) ? "powershell" : "sh";
 function packLabel(p) { return p.private ? "private pack" : p.name + (p.version ? " " + p.version : ""); }
 // The packs the run's config loaded (a private pack by path only); a run
@@ -356,12 +456,51 @@ function sheet(r) {
 }
 
 let timer = null;
+let batches = INITIAL.batches || [];
+// The list, with a batch's runs folded into one row where its newest is:
+// the batch's matrix sums them up; each run's row keeps its sheet and notes.
+const shownGroup = new Set();
+function listed(runs) {
+  const seen = new Set();
+  return runs.map((r) => {
+    if (!r.batch) return row(r);
+    const id = r.batch.batch;
+    if (seen.has(id)) return "";
+    seen.add(id);
+    const mine = runs.filter((x) => x.batch && x.batch.batch === id);
+    const busy = mine.filter((x) => x.state === "running" || x.state === "queued").length;
+    return `<details class="group" data-group="${id}"${shownGroup.has(id) ? " open" : ""}><summary><span class="t">Batch ${id}</span> <span class="muted">${mine.length} run${mine.length === 1 ? "" : "s"}${busy ? ` · ${busy} not finished` : ""}</span></summary>${mine.map(row).join("")}</details>`;
+  }).join("");
+}
 function render(runs) {
-  $("runs").innerHTML = runs.length ? runs.map(row).join("") : `<div class="empty">No runs yet. Converted trees appear here with their progress, open for review when they finish, and stay listed after the app restarts.</div>`;
+  const byId = new Map(runs.map((r) => [r.id, r]));
+  $("batches").innerHTML = batches.map((b) => batchCard(b, byId)).join("");
+  $("batches").querySelectorAll("[data-cancel-batch]").forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try { await post(`/api/batches/${b.dataset.cancelBatch}/cancel`, {}); } catch (e) { $("b-err").textContent = e.message; }
+    refresh();
+  }));
+  $("batches").querySelectorAll("details.cmd").forEach((d) => d.addEventListener("toggle", () => {
+    d.open ? shownBatch.add(+d.dataset.batch) : shownBatch.delete(+d.dataset.batch);
+  }));
+  $("batches").querySelectorAll("[data-shell]").forEach((b) => b.addEventListener("click", () => {
+    shell = b.dataset.shell;
+    render(runs);
+  }));
+  $("batches").querySelectorAll("[data-copy-batch]").forEach((b) => b.addEventListener("click", async () => {
+    const x = batches.find((y) => y.id === +b.dataset.copyBatch);
+    try { await navigator.clipboard.writeText(x.script[shell]); b.textContent = "Copied"; }
+    catch (e) { b.textContent = "Select and copy"; }
+    setTimeout(() => { b.textContent = "Copy"; }, 1500);
+  }));
+  $("runs").innerHTML = runs.length ? listed(runs) : `<div class="empty">No runs yet. Converted trees appear here with their progress, open for review when they finish, and stay listed after the app restarts.</div>`;
   $("runs").querySelectorAll("[data-cancel]").forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
     try { await post(`/runs/${b.dataset.cancel}/cancel`, {}); } catch (e) { $("err").textContent = e.message; }
     refresh();
+  }));
+  $("runs").querySelectorAll("details.group").forEach((d) => d.addEventListener("toggle", () => {
+    d.open ? shownGroup.add(+d.dataset.group) : shownGroup.delete(+d.dataset.group);
   }));
   $("runs").querySelectorAll("details.cmd").forEach((d) => d.addEventListener("toggle", () => {
     d.open ? shown.add(+d.dataset.run) : shown.delete(+d.dataset.run);
@@ -393,7 +532,7 @@ function render(runs) {
     setTimeout(() => { b.textContent = "Copy"; }, 1500);
   }));
   clearTimeout(timer);
-  if (runs.some((r) => r.state === "running")) timer = setTimeout(refresh, 700);
+  if (runs.some((r) => r.state === "running" || r.state === "queued")) timer = setTimeout(refresh, 700);
   railReview(runs.find((r) => r.state === "done" && r.kind === "convert"));
 }
 // The rail's Review leads to the newest finished run, as the server draws it
@@ -414,7 +553,8 @@ function railReview(run) {
 }
 async function refresh() {
   try {
-    const res = await fetch("/api/runs");
+    const [res, bres] = await Promise.all([fetch("/api/runs"), fetch("/api/batches")]);
+    if (bres.ok) batches = await bres.json();
     if (res.ok) render(await res.json());
   } catch (e) { timer = setTimeout(refresh, 3000); }
 }
@@ -525,7 +665,43 @@ $("driftf").addEventListener("submit", async (e) => {
 });
 // The reference can be any dialect that has a tree.
 $("d-ref").innerHTML += INITIAL.dialects.map(([id, n]) => `<option value="${esc(id)}">${esc(n)}</option>`).join("");
+$("b-from").innerHTML = [...new Set(INITIAL.with_rules.map(([f]) => f))].map((f) => `<option value="${esc(f)}">${esc(NAME[f])}</option>`).join("");
+function batchTargets() {
+  const keep = new Set([...document.querySelectorAll("#b-targets input:checked")].map((x) => x.value));
+  const ts = INITIAL.with_rules.filter(([f]) => f === $("b-from").value).map(([, t]) => t);
+  $("b-targets").innerHTML = ts.map((t) => `<label class="tog"><input type="checkbox" value="${esc(t)}"${keep.size === 0 || keep.has(t) ? " checked" : ""}> ${esc(NAME[t])}</label>`).join("");
+}
+$("b-from").addEventListener("change", batchTargets);
+batchTargets();
+$("b-pick").addEventListener("change", () => {
+  const p = $("b-pick").value.trim();
+  if (!p) return;
+  const t = $("b-srcs");
+  t.value = (t.value.trim() ? t.value.replace(/\s*$/, "\n") : "") + p;
+  $("b-pick").value = "";
+});
+$("batchf").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const v = (id) => $(id).value.trim();
+  const list = (id) => v(id).split(",").map((x) => x.trim()).filter(Boolean);
+  const from = $("b-from").value;
+  const sources = $("b-srcs").value.split(/\r?\n/).map((x) => x.trim()).filter(Boolean).map((src) => ({ src, from }));
+  const targets = [...document.querySelectorAll("#b-targets input:checked")].map((x) => x.value);
+  if (!sources.length || !targets.length || !v("b-out")) { $("b-err").textContent = "Give at least one source, one target and an output folder."; return; }
+  $("b-err").textContent = ""; $("b-go").disabled = true;
+  try {
+    await post("/api/runs/batch", {
+      sources, targets, out: v("b-out"), overwrite: $("b-overwrite").checked,
+      template: $("b-template").checked, parameters: list("b-params"), extensions: list("b-exts"),
+      packs: v("b-pack") ? [v("b-pack")] : [],
+    });
+    $("b-overwrite").checked = false;
+  } catch (e) { $("b-err").textContent = e.message; }
+  $("b-go").disabled = false;
+  refresh();
+});
 if (INITIAL.no_picking) {
+  $("batchf").hidden = true;
   $("conv").hidden = true;
   $("instf").hidden = true;
   $("driftf").hidden = true;
