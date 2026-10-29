@@ -507,3 +507,38 @@ fn a_script_part_with_only_a_schema_or_index_is_compared() {
     );
     assert!(rules(&r).contains(&"equiv.schema-name"), "{:?}", rules(&r));
 }
+
+#[test]
+fn an_index_after_a_trigger_is_placed_as_without_it() {
+    // A conversion adds trigger functions after a table (temporal tables,
+    // Db2 for i sequence defaults). Creating a trigger runs nothing and binds
+    // no index it does not name, so the index after it is still compared.
+    let func = |body: &str| {
+        format!(
+            "CREATE FUNCTION items_trg() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    {body}\n    RETURN NEW;\nEND\n$$;\nCREATE TRIGGER items_trg BEFORE INSERT ON Items FOR EACH ROW EXECUTE FUNCTION items_trg();\n"
+        )
+    };
+    let placed = |r: &Report| r.unknown_reasons.iter().all(|x| !x.contains("comes after"));
+    let a = t("CREATE UNIQUE INDEX UX_Bin ON dbo.Items (Bin);");
+    let b = p(&format!(
+        "{}CREATE INDEX UX_Bin ON Items (Bin);",
+        func("NEW.Qty := 0;")
+    ));
+    let r = run(&a, &b);
+    assert!(rules(&r).contains(&"equiv.index-unique"), "{:?}", rules(&r));
+    assert!(placed(&r), "{:?}", r.unknown_reasons);
+    // Db2 for i: the trigger is the file's one routine.
+    let b = "CREATE TABLE Items (ItemID INTEGER NOT NULL PRIMARY KEY, Code VARCHAR(10), Qty INTEGER, Bin INTEGER NOT NULL, Name VARCHAR(50) NOT NULL);\nCREATE TRIGGER Items_Qty NO CASCADE BEFORE INSERT ON Items REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.Qty IS NULL) SET N.Qty = 0;\nCREATE INDEX UX_Bin ON Items (Bin);\n";
+    let r = run_to(&a, b, D);
+    assert!(rules(&r).contains(&"equiv.index-unique"), "{:?}", rules(&r));
+    assert!(placed(&r), "{:?}", r.unknown_reasons);
+    // A trigger that names the index, or a routine that is no trigger, still
+    // counts.
+    for b in [
+        func("RAISE NOTICE 'see ux_bin';"),
+        "CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE FUNCTION g() RETURNS integer LANGUAGE sql AS $$ SELECT 2 $$;\n".into(),
+    ] {
+        let r = run(&a, &p(&format!("{b}CREATE INDEX UX_Bin ON Items (Bin);")));
+        assert!(!placed(&r), "{b}: {:?}", r.unknown_reasons);
+    }
+}

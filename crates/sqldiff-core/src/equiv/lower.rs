@@ -242,6 +242,22 @@ pub struct Unit {
     pub local_ids: Option<Vec<String>>,
     /// A trigger body lowered for one event (`trigger.rs`).
     pub trigger: Option<TrigCtx>,
+    /// Name of the artifact's one routine: names the temporary table each
+    /// table variable became (`classify::table_variable_table`).
+    pub routine: Option<String>,
+    /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
+    /// temporary tables (`classify::temp_table_names`). A table variable
+    /// converted to one of them is named as it; otherwise `@t` keeps the key
+    /// `temp:t`, which a `#t` replacing it shares.
+    pub other_temps: std::collections::HashSet<String>,
+    /// T-SQL `DECLARE @t TABLE`, PostgreSQL `CREATE TEMP TABLE`, Db2 for i
+    /// `DECLARE GLOBAL TEMPORARY TABLE` statements, with the number of
+    /// statements before each: a table variable compared against the
+    /// temporary table it became (`mod.rs`).
+    pub table_vars: Vec<(SyntaxNode, usize)>,
+    /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.t`, placed like `table_vars`:
+    /// the drop before a converted table variable's `CREATE TEMP TABLE`.
+    pub temp_drops: Vec<(SyntaxNode, usize)>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
     /// How many IFs and loops the statement being lowered sits in.
@@ -313,6 +329,10 @@ fn empty(d: Dialect) -> Unit {
         in_block: false,
         local_ids: None,
         trigger: None,
+        routine: None,
+        other_temps: Default::default(),
+        table_vars: Vec::new(),
+        temp_drops: Vec::new(),
         ctl: Vec::new(),
         depth: 0,
         loops: Vec::new(),
@@ -339,6 +359,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         [] => walk(&a.root, &mut u),
         [r] => {
             u.in_block = true;
+            u.routine = sqldiff_syntax::ast::routine_name(r);
             header(r, &mut u);
             // Statements outside the routine (other than batch separators) are
             // not covered, except the tables it creates, compared table against
@@ -347,7 +368,8 @@ pub fn lower(a: &Analyzed) -> Unit {
                 if n.kind() == SyntaxKind::STATEMENT
                     && !r.text_range().contains_range(n.text_range())
                 {
-                    let after = n.text_range().start() >= r.text_range().end();
+                    let after =
+                        n.text_range().start() >= r.text_range().end() && !index_beside(r, &n, d);
                     if is_create_table(&n, d) {
                         u.tables.push((n.clone(), usize::from(after)));
                     } else if is_call(&n, d) {
@@ -392,7 +414,9 @@ pub fn lower(a: &Analyzed) -> Unit {
                 }
                 let before = routines
                     .iter()
-                    .filter(|r| r.text_range().end() <= n.text_range().start())
+                    .filter(|r| {
+                        r.text_range().end() <= n.text_range().start() && !index_beside(r, &n, d)
+                    })
                     .count();
                 if is_create_table(&n, d) {
                     u.tables.push((n.clone(), before));
@@ -419,11 +443,158 @@ pub fn lower(a: &Analyzed) -> Unit {
     u
 }
 
+/// A PL/pgSQL block that assigns variables from each row of a query in
+/// turn, as the conversion writes T-SQL `SELECT @v = e FROM …`:
+///
+/// ```text
+/// DECLARE r record;
+/// BEGIN
+///   FOR r IN SELECT e1 AS c1, … FROM … LOOP
+///     v1 := r.c1; …
+///   END LOOP;
+/// END;
+/// ```
+///
+/// Lowered as that SELECT: after the loop each variable holds the last
+/// row's value, and with no row it keeps its own; each value goes through
+/// the variable's assignment conversion. Only that exact shape: one record,
+/// every column assigned once to a different variable, and neither the
+/// record nor a variable read by the query (the loop reads the query once,
+/// where T-SQL would see the values of earlier rows). The record is the
+/// loop's own, so declaring it again each time the block runs changes
+/// nothing, inside an IF or loop too.
+fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
+    use SyntaxKind::{BRANCH, CONDITION, DECLARE_SECTION, LOOP_STMT, STATEMENT};
+    let d = u.dialect;
+    if d != Dialect::Postgres {
+        return false;
+    }
+    let kids: Vec<SyntaxNode> = c.children().collect();
+    let [decl, lp] = kids.as_slice() else {
+        return false;
+    };
+    if decl.kind() != DECLARE_SECTION || lp.kind() != LOOP_STMT {
+        return false;
+    }
+    // `DECLARE r record;`
+    let decls: Vec<SyntaxNode> = decl.children().collect();
+    let [rec] = decls.as_slice() else {
+        return false;
+    };
+    let rt = tokens(rec);
+    let r = match rt.as_slice() {
+        [n, ty] if n.kind == K::Word && ty.up == "RECORD" => n.up.clone(),
+        _ => return false,
+    };
+    // `FOR r IN <query> LOOP <assignments> END LOOP`
+    let parts: Vec<SyntaxNode> = lp.children().collect();
+    let [cond, body] = parts.as_slice() else {
+        return false;
+    };
+    let first = lp
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_ascii_uppercase());
+    if first.as_deref() != Some("FOR") || cond.kind() != CONDITION || body.kind() != BRANCH {
+        return false;
+    }
+    let ct = tokens(cond);
+    let query = match ct.as_slice() {
+        [v, kw, rest @ ..] if v.kind == K::Word && v.up == r && kw.up == "IN" => rest,
+        _ => return false,
+    };
+    let Ok(Stmt::Select(mut sel)) = parse_stmt(query, d) else {
+        return false;
+    };
+    // `v := r.c`, each variable and each column once.
+    let mut set: Vec<(String, String)> = Vec::new();
+    for st in body.children() {
+        if st.kind() != STATEMENT {
+            return false;
+        }
+        match tokens(&st).as_slice() {
+            [v, op, rec, dot, col]
+                if v.kind == K::Word
+                    && op.text == ":="
+                    && rec.kind == K::Word
+                    && rec.up == r
+                    && dot.kind == K::Dot
+                    && col.kind == K::Word =>
+            {
+                if set.iter().any(|(x, y)| *x == v.up || *y == col.up) {
+                    return false;
+                }
+                set.push((v.up.clone(), col.up.clone()));
+            }
+            _ => return false,
+        }
+    }
+    if set.is_empty() || set.len() != sel.items.len() || !sel.into.is_empty() {
+        return false;
+    }
+    // Neither the record nor an assigned variable in the query.
+    if query
+        .iter()
+        .any(|t| t.kind == K::Word && (t.up == r || set.iter().any(|(v, _)| *v == t.up)))
+    {
+        return false;
+    }
+    for it in &mut sel.items {
+        let Some(alias) = it.alias.as_ref().map(|x| x.to_ascii_uppercase()) else {
+            return false;
+        };
+        let Some((v, _)) = set.iter().find(|(_, col)| *col == alias) else {
+            return false;
+        };
+        if it.assign.is_some() {
+            return false;
+        }
+        it.assign = Some(v.to_lowercase());
+        it.alias = None;
+    }
+    u.stmts.push(LStmt {
+        node: c.clone(),
+        toks: tokens(c),
+        ast: Ok(Stmt::Select(sel)),
+        from_declare: false,
+        msg: None,
+    });
+    true
+}
+
 /// Whether a PostgreSQL routine node is a DO block.
 fn is_do(r: &SyntaxNode) -> bool {
     cst::header_tokens(r)
         .first()
         .is_some_and(|t| t.text().eq_ignore_ascii_case("DO"))
+}
+
+/// Whether `n` creates an index whose place before or after routine `r`
+/// does not matter: `r` is a trigger (T-SQL, Db2 for i) or a PostgreSQL
+/// trigger function, and it never names the index. Creating
+/// either one runs neither: a trigger body binds tables and columns (Db2 for
+/// i when it is created, T-SQL and PL/pgSQL when it runs), never an index it
+/// does not name, and an index changes no row a trigger sees. So a
+/// conversion that adds trigger functions before a table's indexes (temporal
+/// tables, Db2 for i sequence defaults) places them as the original did.
+fn index_beside(r: &SyntaxNode, n: &SyntaxNode, d: Dialect) -> bool {
+    let Ok(super::ddl::Ddl::Index(ix)) = super::ddl::parse(&tokens(n), d) else {
+        return false;
+    };
+    let header: Vec<Tok> = cst::header_tokens(r).iter().map(Tok::from_syntax).collect();
+    let trigger = header.iter().take(4).any(|t| t.up == "TRIGGER")
+        || header
+            .windows(2)
+            .any(|w| w[0].up == "RETURNS" && w[1].up == "TRIGGER");
+    // A name in a string counts too (dynamic SQL, an error message).
+    let name = ix.name.text.to_lowercase();
+    trigger
+        && !tokens(r).iter().any(|t| match t.kind {
+            K::Word | K::Quoted => cst::unquote(&t.text).to_lowercase() == name,
+            K::Str => t.text.to_lowercase().contains(&name),
+            _ => false,
+        })
 }
 
 /// One part of a script that runs as a whole: a T-SQL batch that needs
@@ -585,6 +756,15 @@ pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
         return u;
     }
     u.in_block = seg.block && d != Dialect::Tsql;
+    let routines: Vec<SyntaxNode> = seg
+        .nodes
+        .iter()
+        .flat_map(|n| n.descendants())
+        .filter(|n| n.kind() == SyntaxKind::ROUTINE)
+        .collect();
+    if let [r] = routines.as_slice() {
+        u.routine = cst::routine_name(r);
+    }
     for n in &seg.nodes {
         unit(n, &mut u);
     }
@@ -889,6 +1069,7 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         | SyntaxKind::BATCH
         | SyntaxKind::ROUTINE_BODY
         | SyntaxKind::TRY_BLOCK => walk(c, u),
+        SyntaxKind::BLOCK if assign_loop(c, u) => {}
         SyntaxKind::BLOCK => {
             let w = cst::first_words(c, 2);
             if w.get(1).is_some_and(|x| x == "ATOMIC") {
@@ -1197,6 +1378,14 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         });
         return;
     }
+    if table_var_decl(c, d) {
+        u.table_vars.push((c.clone(), u.stmts.len()));
+        return;
+    }
+    if temp_drop(c, d) {
+        u.temp_drops.push((c.clone(), u.stmts.len()));
+        return;
+    }
     match kind {
         // Dynamic SQL: compared by the statement it runs (`dynamic.rs`).
         _ if dynamic => {
@@ -1356,6 +1545,33 @@ fn guard(c: &SyntaxNode, d: Dialect, rows: &str) -> Option<bool> {
         _ => false,
     };
     ok.then_some(false)
+}
+
+/// A T-SQL table variable's `DECLARE @t [AS] TABLE`, or a temporary table
+/// a converted one may have become: PostgreSQL `CREATE TEMP[ORARY] TABLE`,
+/// Db2 for i `DECLARE GLOBAL TEMPORARY TABLE`.
+fn table_var_decl(c: &SyntaxNode, d: Dialect) -> bool {
+    let words = cst::first_words(c, 4);
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    match d {
+        Dialect::Tsql => {
+            w(0) == "DECLARE"
+                && w(1).starts_with('@')
+                && (w(2) == "TABLE" || (w(2) == "AS" && w(3) == "TABLE"))
+        }
+        Dialect::Postgres => {
+            w(0) == "CREATE" && matches!(w(1), "TEMP" | "TEMPORARY") && w(2) == "TABLE"
+        }
+        Dialect::Db2i => {
+            w(0) == "DECLARE" && w(1) == "GLOBAL" && w(2) == "TEMPORARY" && w(3) == "TABLE"
+        }
+    }
+}
+
+/// PostgreSQL `DROP TABLE IF EXISTS pg_temp.…`. Other drops are compared
+/// statement against statement (`ddl.rs`).
+fn temp_drop(c: &SyntaxNode, d: Dialect) -> bool {
+    d == Dialect::Postgres && cst::first_words(c, 5) == ["DROP", "TABLE", "IF", "EXISTS", "PG_TEMP"]
 }
 
 /// A top-level `CREATE [prefix] TABLE` statement.

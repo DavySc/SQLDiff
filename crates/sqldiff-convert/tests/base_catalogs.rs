@@ -318,12 +318,12 @@ fn a_base_object_that_does_not_convert_flags_its_users() {
                 "base/install.sql",
                 "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, site hierarchyid NULL);\nGO\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\nGO\nCREATE TABLE order_items (order_id int NOT NULL, qty int NOT NULL);\nGO\n",
             ),
-            // datetime2 keeps 7 fraction digits, PostgreSQL's timestamp 6: the
-            // table is converted but differs. The view over it converts, and
+            // datetime rounds to 1/300 s, PostgreSQL's timestamp(3) keeps the
+            // milliseconds: the table is converted but differs. The view over it converts, and
             // is suspect through the table.
             (
                 "base/stamps.sql",
-                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime2 NOT NULL);\nGO\n",
+                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime NOT NULL);\nGO\n",
             ),
             (
                 "base/views.sql",
@@ -433,11 +433,11 @@ fn a_tree_object_of_the_same_name_is_not_suspect() {
         &[
             (
                 "base/stamps.sql",
-                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime2 NOT NULL);\nGO\n",
+                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime NOT NULL);\nGO\n",
             ),
             (
                 "src/tables/stamps.sql",
-                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime NOT NULL);\n",
+                "CREATE TABLE stamps (stamp_id int NOT NULL PRIMARY KEY, placed datetime2(3) NOT NULL);\n",
             ),
             ("src/q1.sql", "SELECT stamp_id FROM stamps;\n"),
         ],
