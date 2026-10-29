@@ -53,6 +53,11 @@ pub struct Outcome {
     pub refinements: Vec<String>,
     /// The statement pairs decided here (`coverage::unreceipted`).
     pub receipts: Vec<crate::coverage::Receipt>,
+    /// Transaction statements between data statements, which statement-level
+    /// equivalence does not compare: (side A?, where the statement starts,
+    /// the unknown reason). The engine keeps the reason unless the
+    /// behaviour model compared the routine that holds the statement.
+    pub txn_unknown: Vec<(bool, usize, String)>,
 }
 
 impl Outcome {
@@ -290,9 +295,14 @@ fn compare_units(
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
             let at = side.line_of(node);
-            out.unknown_reasons.push(format!(
-                "{name} line {at}: {what} is not covered by statement-level equivalence"
-            ));
+            let why =
+                format!("{name} line {at}: {what} is not covered by statement-level equivalence");
+            if u.txn_placed.contains(node) {
+                let start = usize::from(node.text_range().start());
+                out.txn_unknown.push((std::ptr::eq(side, a), start, why));
+                continue;
+            }
+            out.unknown_reasons.push(why);
             // The statements inside anything uncovered (an IF, loop, CATCH,
             // handler, or a routine beside others) were not compared either:
             // each is named on its own line, so none of them counts as
