@@ -1020,6 +1020,12 @@ pub struct Behaviour {
     pub findings: Vec<Finding>,
     pub assumptions: Vec<Assumption>,
     pub witnesses: Vec<Witness>,
+    /// Every scenario ran on both sides, nothing in it was left unmodelled,
+    /// and every finding is equal (under assumptions): where each side
+    /// commits and rolls back was compared here, so statement-level
+    /// equivalence need not refuse transaction statements between data
+    /// statements.
+    pub txn_compared: bool,
 }
 
 struct Collector<'x, 'a> {
@@ -1034,6 +1040,9 @@ struct Collector<'x, 'a> {
     /// Each side's fault-free run, which fault scenarios resume from.
     xa: OnceCell<Explorer>,
     xb: OnceCell<Explorer>,
+    /// Some scenario had no outcome on a side, or an outcome or finding
+    /// that is not exact (see [`Behaviour::txn_compared`]).
+    incomplete: bool,
 }
 
 impl<'x, 'a> Collector<'x, 'a> {
@@ -1048,6 +1057,7 @@ impl<'x, 'a> Collector<'x, 'a> {
             contract_at: HashMap::new(),
             xa: OnceCell::new(),
             xb: OnceCell::new(),
+            incomplete: false,
         };
         c.splits = splits(&c.sa, &c.sb, true);
         c.splits.extend(splits(&c.sb, &c.sa, false));
@@ -1112,6 +1122,12 @@ impl<'x, 'a> Collector<'x, 'a> {
         scen_b: Scenario,
     ) -> (Vec<Outcome>, Vec<Outcome>) {
         let (pa, pb) = self.outcomes(&sc, &scen_a, &scen_b);
+        let inexact = |o: &Outcome| {
+            !o.imprecise.is_empty() || o.durability_unknown.is_some() || !o.untested.is_empty()
+        };
+        if pa.is_empty() || pb.is_empty() || pa.iter().chain(&pb).any(inexact) {
+            self.incomplete = true;
+        }
         if pa.is_empty() || pb.is_empty() {
             return (pa, pb);
         }
@@ -1522,6 +1538,13 @@ pub fn analyze(a: &Analyzed, b: &Analyzed, env: &Env) -> Behaviour {
         .flat_map(|f| f.assumptions.iter().cloned())
         .collect();
     c.out.assumptions.retain(|x| used.contains(&x.id));
+    // Exact, and no divergence the assumptions do not cover: a finding that
+    // is different or unknown keeps the transaction statements unproven too.
+    c.out.txn_compared = !c.incomplete
+        && c.out
+            .findings
+            .iter()
+            .all(|f| matches!(f.verdict, Verdict::Equal | Verdict::EqualUnderAssumptions));
     c.out
 }
 

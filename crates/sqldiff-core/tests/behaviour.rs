@@ -322,3 +322,131 @@ fn temp_state_on_two_tables_counts_once_per_path() {
     assert_eq!(ts.len(), 1, "{:#?}", r.findings);
     assert_eq!(ts[0].verdict, Verdict::Unknown, "{:#?}", ts[0]);
 }
+
+const TSQL_AUTOCOMMIT: &str = "CREATE PROCEDURE dbo.Move @Id int AS
+BEGIN
+    SET XACT_ABORT ON;
+    UPDATE dbo.A SET Qty = 0 WHERE Id = @Id;
+    BEGIN TRAN;
+    UPDATE dbo.B SET Qty = Qty + 1 WHERE Id = @Id;
+    UPDATE dbo.A SET Qty = Qty + 1 WHERE Id = @Id;
+    COMMIT;
+END;
+";
+
+fn pg_move(first_commit: bool) -> String {
+    format!(
+        "CREATE OR REPLACE PROCEDURE Move(p_id integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE A SET Qty = 0 WHERE Id = p_id;
+{}  UPDATE B SET Qty = Qty + 1 WHERE Id = p_id;
+  UPDATE A SET Qty = Qty + 1 WHERE Id = p_id;
+  COMMIT;
+END;
+$$;
+",
+        if first_commit { "  COMMIT;\n" } else { "" }
+    )
+}
+
+fn txn_placement_reasons(r: &Report) -> Vec<&String> {
+    r.unknown_reasons
+        .iter()
+        .filter(|w| w.contains("between data statements"))
+        .collect()
+}
+
+/// Transaction statements between data statements are compared by the
+/// behaviour model when it modelled the whole routine on both sides exactly
+/// and found nothing its assumptions do not cover.
+#[test]
+fn commits_between_data_statements_are_compared_by_the_behaviour_model() {
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, TSQL_AUTOCOMMIT),
+        &Artifact::new("b.sql", Dialect::Postgres, pg_move(true)),
+        &Options::default(),
+    );
+    assert!(
+        txn_placement_reasons(&r).is_empty(),
+        "{:#?}",
+        r.unknown_reasons
+    );
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.rule.starts_with("txn.") && f.verdict == Verdict::Different),
+        "{:#?}",
+        r.findings
+    );
+}
+
+/// Without the COMMIT after the first UPDATE, a failure in the transaction
+/// undoes it in PostgreSQL only: the routine differs, and the transaction
+/// statements stay not compared.
+#[test]
+fn a_missing_autocommit_differs_and_keeps_the_statements_unproven() {
+    let r = diff(
+        &Artifact::new("a.sql", Dialect::Tsql, TSQL_AUTOCOMMIT),
+        &Artifact::new("b.sql", Dialect::Postgres, pg_move(false)),
+        &Options::default(),
+    );
+    assert_eq!(r.verdict(), Verdict::Different);
+    finding(&r, "txn.atomicity");
+    assert!(
+        !txn_placement_reasons(&r).is_empty(),
+        "{:#?}",
+        r.unknown_reasons
+    );
+}
+
+/// The behaviour model summarizes a loop after two iterations, so a COMMIT
+/// missing from (or present in) a loop is never taken as compared: in T-SQL
+/// each iteration's UPDATE commits on its own, in PostgreSQL without the
+/// COMMIT a failure in a later iteration undoes the earlier ones.
+#[test]
+fn transaction_placement_around_a_loop_stays_unproven() {
+    let a = "CREATE PROCEDURE dbo.Load @N int AS
+BEGIN
+    SET XACT_ABORT ON;
+    DECLARE @i int = 0;
+    INSERT dbo.A (Id, Qty) VALUES (@N, 0);
+    WHILE @i < @N
+    BEGIN
+        SET @i = @i + 1;
+        UPDATE dbo.A SET Qty = Qty + 1 WHERE Id = @N;
+    END;
+END;
+";
+    for commit in ["", "    COMMIT;\n"] {
+        let b = format!(
+            "CREATE OR REPLACE PROCEDURE Load(p_n integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_i integer;
+BEGIN
+  v_i := 0;
+  INSERT INTO A (Id, Qty) VALUES (p_n, 0);
+  COMMIT;
+  WHILE v_i < p_n LOOP
+    v_i := v_i + 1;
+    UPDATE A SET Qty = Qty + 1 WHERE Id = p_n;
+{commit}  END LOOP;
+END;
+$$;
+"
+        );
+        let r = pair((a, Dialect::Tsql), (&b, Dialect::Postgres));
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{r:?}"
+        );
+        assert!(
+            !txn_placement_reasons(&r).is_empty(),
+            "{:?}",
+            r.unknown_reasons
+        );
+    }
+}

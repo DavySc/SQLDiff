@@ -475,14 +475,11 @@ fn statements_beside_several_routines_are_each_reported() {
     // compared; the statements outside them must not count as compared
     // either. Routines that do meet are compared one by one, and so are the
     // statements between them.
-    let a = "CREATE SCHEMA Sales;\nGO\nCREATE PROCEDURE dbo.A AS SELECT 1;\nGO\nCREATE PROCEDURE dbo.B AS SELECT 2;\nGO\nTRUNCATE TABLE dbo.Old;\n";
-    let b = "CREATE SCHEMA Salesx;\nCREATE PROCEDURE A() LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE PROCEDURE B() LANGUAGE sql AS $$ SELECT 2 $$;\nTRUNCATE TABLE Old;\n";
+    let a = "CREATE SCHEMA Sales;\nGO\nCREATE PROCEDURE dbo.A AS SELECT 1;\nGO\nCREATE PROCEDURE dbo.B AS SELECT 2;\nGO\nALTER TABLE dbo.Old ENABLE TRIGGER ALL;\n";
+    let b = "CREATE SCHEMA Salesx;\nCREATE PROCEDURE A() LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE PROCEDURE B() LANGUAGE sql AS $$ SELECT 2 $$;\nALTER TABLE Old ENABLE TRIGGER ALL;\n";
     for (b, why) in [
-        (b.to_string(), "TRUNCATE"),
-        (
-            b.replace("PROCEDURE A()", "PROCEDURE C()"),
-            "outside the routines",
-        ),
+        (b.to_string(), "not compared"),
+        (b.replace("PROCEDURE A()", "PROCEDURE C()"), "not compared"),
     ] {
         let r = run(a, &b);
         assert!(rules(&r).contains(&"equiv.schema-name"), "{:?}", rules(&r));

@@ -152,6 +152,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
     let schema_a = equiv::schema::Schema::from_view(&view_a);
     let schema_b = equiv::schema::Schema::from_view(&view_b);
     let mut eq = equiv::Outcome::default();
+    let mut txn_unknown = Vec::new();
     // What the same-dialect comparison vouches for (`coverage::unreceipted`).
     let mut receipts = Vec::new();
 
@@ -270,6 +271,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
         }
         noise.structural += eq.structural;
         unknown_reasons.append(&mut eq.unknown_reasons);
+        txn_unknown = std::mem::take(&mut eq.txn_unknown);
         normalizations.push(
             "statement lowering: parameters by position, aliases resolved, dialect built-ins and idioms mapped to one form".to_string(),
         );
@@ -317,6 +319,32 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
 
     let env = crate::ir::behaviour::Env::from_options(opts);
     let beh = crate::ir::behaviour::analyze(&aa, &ab, &env);
+    // A transaction statement between data statements is compared when the
+    // behaviour model compared the routine that holds it: it lowers the
+    // first routine of each side, so only a side with exactly one routine
+    // counts.
+    let only_routine = |an: &Analyzed| {
+        let mut rs = an
+            .root
+            .descendants()
+            .filter(|n| n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE);
+        match (rs.next(), rs.next()) {
+            (Some(r), None) => {
+                let r = r.text_range();
+                Some(usize::from(r.start())..usize::from(r.end()))
+            }
+            _ => None,
+        }
+    };
+    let (ra, rb) = (only_routine(&aa), only_routine(&ab));
+    for (on_a, at, why) in txn_unknown {
+        let within = if on_a { &ra } else { &rb }
+            .as_ref()
+            .is_some_and(|r| r.contains(&at));
+        if !(beh.txn_compared && ra.is_some() && rb.is_some() && within) {
+            unknown_reasons.push(why);
+        }
+    }
     let witnesses = beh.witnesses;
     findings.extend(beh.findings);
     for x in beh.assumptions {

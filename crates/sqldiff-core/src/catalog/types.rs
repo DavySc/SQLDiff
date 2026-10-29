@@ -50,6 +50,18 @@ impl DataType {
                         max = true;
                     } else if let Ok(n) = w.parse::<u32>() {
                         args.push(n);
+                    } else if let (Some(m), Some(last)) = (lob_unit(w), args.last_mut()) {
+                        // Db2 for i `CLOB(1G)`, lexed as `1` and `G`.
+                        *last = last.saturating_mul(m);
+                    } else if let Some(n) = w.len().checked_sub(1).and_then(|k| {
+                        Some(
+                            w[..k]
+                                .parse::<u32>()
+                                .ok()?
+                                .saturating_mul(lob_unit(&w[k..])?),
+                        )
+                    }) {
+                        args.push(n);
                     }
                 }
                 _ => names.push(w.to_ascii_uppercase()),
@@ -165,9 +177,31 @@ pub fn canonical(upper: &str) -> &str {
     }
 }
 
+/// The multiplier of a Db2 for i LOB length unit: `K`, `M` or `G`.
+fn lob_unit(w: &str) -> Option<u32> {
+    match w {
+        "K" | "k" => Some(1 << 10),
+        "M" | "m" => Some(1 << 20),
+        "G" | "g" => Some(1 << 30),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lob_lengths_take_their_unit() {
+        // `1G` lexes as `1` and `G`; read as 1 it made every Db2 for i
+        // NCLOB(1G) column a one-character string.
+        assert_eq!(
+            DataType::parse(&["NCLOB", "(", "1", "G", ")"]).args,
+            [1 << 30]
+        );
+        assert_eq!(DataType::parse(&["CLOB", "(", "2M", ")"]).args, [2 << 20]);
+        assert_eq!(DataType::parse(&["VARCHAR", "(", "40", ")"]).args, [40]);
+    }
 
     #[test]
     fn parses_common_spellings() {
