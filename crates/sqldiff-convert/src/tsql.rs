@@ -2127,8 +2127,10 @@ impl<'a> Cx<'a> {
         };
         let upd = sig(ts)[0];
         let target = name_parts(trimmed(&ts[upd + 1..set]))
-            .filter(|p| p.len() == 1)
-            .ok_or_else(|| why("the target is not a one-part table name or alias"))?;
+            .filter(|p| p.len() <= 2)
+            .ok_or_else(|| {
+                why("the target is not a table name, a schema-qualified one or an alias")
+            })?;
         if find_word(ts, from + 1, "OPTION").is_some() {
             return Err(why("query hints (OPTION) are not converted"));
         }
@@ -2137,23 +2139,17 @@ impl<'a> Cx<'a> {
         for item in split_commas(&ts[from + 1..end]) {
             chains.push(join_steps(item).map_err(|w| why(&w))?);
         }
-        let hits: Vec<(usize, usize)> = chains
-            .iter()
-            .enumerate()
-            .flat_map(|(i, c)| {
-                c.iter()
-                    .enumerate()
-                    .filter(|(_, st)| st.leaf.binds(&target))
-                    .map(move |(j, _)| (i, j))
-            })
-            .collect();
-        let [(ci, li)] = hits[..] else {
-            return Err(why(if hits.is_empty() {
-                "the target is not one of the FROM tables by alias or one-part name"
-            } else {
-                "the target matches more than one FROM table"
-            }));
-        };
+        let mut hits: Vec<(usize, usize)> = Vec::new();
+        for (i, c) in chains.iter().enumerate() {
+            for (j, st) in c.iter().enumerate() {
+                if update_binds(&st.leaf, &target).map_err(|w| why(&w))? {
+                    hits.push((i, j));
+                }
+            }
+        }
+        if hits.len() > 1 {
+            return Err(why("the target matches more than one FROM table"));
+        }
         if chains
             .iter()
             .flatten()
@@ -2161,38 +2157,61 @@ impl<'a> Cx<'a> {
         {
             return Err(why("table hints are not converted"));
         }
-        let c = &mut chains[ci];
-        if !c[li].leaf.table {
-            return Err(why("the target is not a table"));
-        }
-        let inner = |k: Join| matches!(k, Join::Inner | Join::Cross);
         let mut moved: Vec<&[T]> = Vec::new();
-        let tleaf = match li {
-            0 if c.len() == 1 => chains.remove(ci).remove(0).leaf,
-            0 if inner(c[1].kind) => {
-                moved.extend(c[1].on);
-                let t = c.remove(0).leaf;
-                c[0].kind = Join::First;
-                c[0].on = None;
-                t
+        // The target's name parts, its key (alias or last name part), and
+        // its text in the output.
+        let (tname, tkey, tgt) = if let [(ci, li)] = hits[..] {
+            let c = &mut chains[ci];
+            if !c[li].leaf.table {
+                return Err(why("the target is not a table"));
             }
-            1 if inner(c[1].kind) => {
-                moved.extend(c[1].on);
-                c.remove(1).leaf
+            let inner = |k: Join| matches!(k, Join::Inner | Join::Cross);
+            let tleaf = match li {
+                0 if c.len() == 1 => chains.remove(ci).remove(0).leaf,
+                0 if inner(c[1].kind) => {
+                    moved.extend(c[1].on);
+                    let t = c.remove(0).leaf;
+                    c[0].kind = Join::First;
+                    c[0].on = None;
+                    t
+                }
+                1 if inner(c[1].kind) => {
+                    moved.extend(c[1].on);
+                    c.remove(1).leaf
+                }
+                _ => {
+                    return Err(why(
+                        "the target is not joined first, by an inner or cross join",
+                    ))
+                }
+            };
+            let tkey = tleaf
+                .alias
+                .clone()
+                .or_else(|| tleaf.name.last().cloned())
+                .unwrap_or_default();
+            let tgt = self.expr(trimmed(tleaf.toks)).trim().to_string();
+            (tleaf.name, tkey, tgt)
+        } else {
+            // The target is not in FROM: SQL Server joins it to the FROM
+            // tables, in scope in SET and WHERE but not in ON, as PostgreSQL
+            // does (checked on SQL Server 2022). A FROM item that shows the
+            // target's name next to it is refused: PostgreSQL rejects the
+            // name twice, and the binding was not checked.
+            let key = target.last().cloned().unwrap_or_default();
+            if chains.iter().flatten().any(|st| {
+                st.leaf.alias.as_ref() == Some(&key)
+                    || (st.leaf.alias.is_none() && st.leaf.name.last() == Some(&key))
+            }) {
+                return Err(why(&format!(
+                    "the target is not in FROM, and a FROM item is also named `{key}`"
+                )));
             }
-            _ => {
-                return Err(why(
-                    "the target is not joined first, by an inner or cross join",
-                ))
-            }
+            let tgt = self.expr(trimmed(&ts[upd + 1..set])).trim().to_string();
+            (target.clone(), key, tgt)
         };
-        let tkey = tleaf
-            .alias
-            .clone()
-            .or_else(|| tleaf.name.last().cloned())
-            .unwrap_or_default();
         // The conditions left in FROM must not name the target.
-        let target_cols = self.table_columns(&tleaf.name);
+        let target_cols = self.table_columns(&tname);
         for st in chains.iter().flatten() {
             let Some(on) = st.on else { continue };
             if qualifies(on, &tkey) {
@@ -2242,7 +2261,6 @@ impl<'a> Cx<'a> {
             }
         }
         let sets = self.expr(&set_toks).trim().to_string();
-        let tgt = self.expr(trimmed(tleaf.toks)).trim().to_string();
         let mut text = format!("UPDATE {tgt} SET {sets}");
         let others: Vec<String> = chains
             .iter()
@@ -2437,6 +2455,12 @@ impl<'a> Cx<'a> {
                 self.expr(&ts[value..]).trim().to_string()
             };
             self.step_ts_with("tsql.stmt.set-variable", &ts, op.s.clone());
+            // `SET @b += 0x…` on a VARBINARY variable appends bytes.
+            let bin_concat =
+                op.s == "+=" && self.is_varbinary_var(&a.s) && self.binary_chain(&ts[value..]);
+            if bin_concat {
+                self.binary_concat_note(std::slice::from_ref(op));
+            }
             let assign = |v: String| {
                 if self.db2() {
                     format!("SET {target} = {v}")
@@ -2447,7 +2471,7 @@ impl<'a> Cx<'a> {
             return match op.s.as_str() {
                 "=" => Ok(assign(rhs)),
                 "+=" | "-=" | "*=" | "/=" => {
-                    let o = if op.s == "+=" && self.is_string_var(&a.s) {
+                    let o = if bin_concat || (op.s == "+=" && self.is_string_var(&a.s)) {
                         "||".to_string()
                     } else {
                         op.s[..1].to_string()
@@ -3960,6 +3984,38 @@ impl<'a> Cx<'a> {
 
     // ----- expressions ----------------------------------------------------------
 
+    fn is_varbinary_var(&self, v: &str) -> bool {
+        self.vars
+            .get(&v.trim_start_matches('@').to_ascii_lowercase())
+            .is_some_and(|x| x.dt == Dt::VarBinary)
+    }
+
+    /// `ts` is binary operands (`0x…` constants, VARBINARY variables) joined
+    /// by `+` and nothing else. Only then is every `+` in it a binary
+    /// concatenation: next to a number or a string, T-SQL converts the
+    /// binary value instead (int and the string types rank above varbinary).
+    fn binary_chain(&self, ts: &[T]) -> bool {
+        let s = sig(ts);
+        !s.is_empty()
+            && s.len() % 2 == 1
+            && s.iter().enumerate().all(|(n, &j)| {
+                let t = &ts[j];
+                if n % 2 == 1 {
+                    return t.k == OP && t.s == "+";
+                }
+                match t.k {
+                    NUMBER => t.s.len() >= 2 && t.s[..2].eq_ignore_ascii_case("0x"),
+                    VARIABLE => self.is_varbinary_var(&t.s),
+                    _ => false,
+                }
+            })
+    }
+
+    fn binary_concat_note(&mut self, at: &[T]) {
+        self.step_ts("tsql.expr.binary-concat", at);
+        self.note(Status::Assumptions, "ASM-CONCAT-NULL", "Binary + becomes ||; both give NULL when an operand is NULL (CONCAT_NULL_YIELDS_NULL ON, the default).");
+    }
+
     fn is_string_var(&self, v: &str) -> bool {
         self.vars
             .get(&v.trim_start_matches('@').to_ascii_lowercase())
@@ -4150,6 +4206,11 @@ impl<'a> Cx<'a> {
                 o.push_str(lit);
                 self.string_compare(ts, i);
                 self.fraction_note(t, lit);
+            }
+            // `0x01 + @b`: every operand is binary, so `+` concatenates.
+            OP if t.s == "+" && self.binary_chain(ts) => {
+                self.binary_concat_note(&ts[i..=i]);
+                o.push_str("||");
             }
             OP if t.s == "+" => {
                 let l = self.operand_kind(ts, prev_sig(ts, i));
@@ -5355,6 +5416,49 @@ impl Leaf<'_> {
     }
 }
 
+/// Whether the T-SQL UPDATE target `t` (one or two name parts) is the FROM
+/// table `l`. SQL Server 2022 binds the target to the FROM reference of the
+/// same table, aliased or not (`UPDATE dbo.T … FROM dbo.T AS x` and
+/// `UPDATE T … FROM dbo.T AS x` change the rows `x` keeps), and a one-part
+/// target also to an alias or an unaliased table's last name part. Names
+/// whose schema only one side states could be the same table or not (the
+/// default schema decides), and a two-part target next to an alias equal to
+/// its name has no checked binding: both are errors.
+fn update_binds(l: &Leaf, t: &[String]) -> Result<bool, String> {
+    if let ([x], Some(a)) = (t, &l.alias) {
+        if a == x {
+            return Ok(true);
+        }
+    }
+    if let ([_, x], Some(a)) = (t, &l.alias) {
+        if a == x {
+            return Err(format!(
+                "the alias `{a}` of another FROM item has the target's name"
+            ));
+        }
+    }
+    if !l.table || l.name.last() != t.last() {
+        return Ok(false);
+    }
+    if l.name == t || (t.len() == 1 && l.alias.is_none()) {
+        return Ok(true);
+    }
+    if l.name.len() > 2 || l.name.len() == t.len() {
+        // Another schema, or a database name: another table, or one whose
+        // binding was not checked.
+        return if l.name.len() == t.len() {
+            Ok(false)
+        } else {
+            Err("a FROM table with a three- or four-part name".into())
+        };
+    }
+    Err(format!(
+        "the target `{}` and the FROM table `{}` may or may not be the same table (only one states a schema)",
+        t.join("."),
+        l.name.join(".")
+    ))
+}
+
 /// How a table joins its chain in an UPDATE's FROM list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Join {
@@ -5485,7 +5589,12 @@ fn equalities(ts: &[T]) -> Vec<(Vec<String>, Vec<String>)> {
         let x = trimmed(x);
         match x {
             [t] if matches!(t.k, VARIABLE | NUMBER | STRING) => Some(Vec::new()),
-            _ => name_parts(x).filter(|p| p.len() == 2),
+            // `schema.table.column` names an unaliased table, whose key is
+            // its last name part (T-SQL rejects two unaliased FROM tables
+            // with one last part, Msg 1013).
+            _ => name_parts(x)
+                .filter(|p| p.len() == 2 || p.len() == 3)
+                .map(|p| p[p.len() - 2..].to_vec()),
         }
     };
     let mut out = Vec::new();
@@ -6171,6 +6280,8 @@ enum Dt {
     /// A string (a literal, or a CHAR/VARCHAR value).
     Text,
     Bit,
+    /// VARBINARY(n) or VARBINARY(MAX): `+` concatenates.
+    VarBinary,
     Other,
 }
 
@@ -6192,6 +6303,7 @@ impl Dt {
             "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "CHARACTER" | "CHARACTER VARYING"
             | "TEXT" | "NTEXT" | "SYSNAME" => Dt::Text,
             "BIT" => Dt::Bit,
+            "VARBINARY" | "BINARY VARYING" => Dt::VarBinary,
             _ => Dt::Other,
         }
     }
