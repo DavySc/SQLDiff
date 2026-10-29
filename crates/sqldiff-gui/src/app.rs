@@ -129,7 +129,7 @@ struct Shared {
     packs: Vec<PathBuf>,
     /// Bound to a loopback address: only then can files be picked.
     local: bool,
-    /// This launch's token, which the settings page sends with its POSTs.
+    /// This launch's token, which every page sends with its POSTs.
     token: String,
 }
 
@@ -174,7 +174,7 @@ pub fn serve(listener: TcpListener, app: App, extra_hosts: &[String]) -> std::io
         isolated: app.isolated,
         packs: app.packs,
         local,
-        token: settings::new_token(),
+        token: new_token(),
     });
     let hosts: Arc<Vec<String>> = Arc::new(allowed_hosts(&listener, extra_hosts)?);
     for stream in listener.incoming() {
@@ -207,6 +207,15 @@ fn run_review_path(id: u64) -> String {
 }
 
 fn route(app: &Arc<Shared>, req: Request) -> Response {
+    // Every POST writes to disk, starts work or changes what a view shows:
+    // only a page this launch served may send one.
+    if req.method == "POST" && !same(&req.token, &app.token) {
+        return (
+            "403 Forbidden",
+            "text/plain",
+            "missing or wrong token: reload the page".to_string(),
+        );
+    }
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => return page(app, View::Home, home(app), ""),
         ("GET", "/runs") => return page(app, View::Runs, runs_page(app), ""),
@@ -293,7 +302,6 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
     }
     let ctx = settings::Ctx {
         isolated: app.isolated,
-        token: &app.token,
         packs: &app.packs,
     };
     if let Some(res) = settings::route(&req, &ctx) {
@@ -380,6 +388,7 @@ fn mount(req: &Request, prefix: &str) -> Option<Request> {
         path: path.to_string(),
         query: req.query.clone(),
         body: req.body.clone(),
+        token: req.token.clone(),
     })
 }
 
@@ -401,10 +410,26 @@ fn page(app: &Shared, view: View, html: String, base: &str) -> Response {
         )
         .replacen(
             "<!--__SQLDIFF_SHELL__-->",
-            &rail(app, view, if base.is_empty() { view.path() } else { base }),
+            &format!(
+                r#"<meta name="sqldiff-token" content="{}">{}"#,
+                app.token,
+                rail(app, view, if base.is_empty() { view.path() } else { base })
+            ),
             1,
         );
     ("200 OK", "text/html; charset=utf-8", html)
+}
+
+/// A new per-launch token: 128 random bits from the operating system.
+fn new_token() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("the operating system has no random numbers");
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Equal strings, compared without stopping at the first difference.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |d, (x, y)| d | (x ^ y)) == 0
 }
 
 /// The rail: one link per view, the current one marked; a view with nothing
@@ -734,12 +759,9 @@ fn runs_page(app: &Shared) -> String {
 }
 
 fn settings_page(app: &Shared) -> String {
-    let json = serde_json::to_string(&settings::payload(
-        (!app.local).then_some(NOT_LOCAL),
-        &app.token,
-    ))
-    .unwrap()
-    .replace("</", "<\\/");
+    let json = serde_json::to_string(&settings::payload((!app.local).then_some(NOT_LOCAL)))
+        .unwrap()
+        .replace("</", "<\\/");
     SETTINGS_HTML
         .replace(
             "/*__SQLDIFF_PAYLOAD__*/null",

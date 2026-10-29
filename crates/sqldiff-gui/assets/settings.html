@@ -158,8 +158,10 @@ function tidy(d) {
 }
 const dirty = () => JSON.stringify(tidy(draft)) !== JSON.stringify(tidy(st.draft));
 
+// This launch's token, which every POST carries (absent outside the app).
+const APP_TOKEN = document.querySelector('meta[name="sqldiff-token"]')?.content ?? "";
 async function call(method, url, body) {
-  const res = await fetch(url, method === "GET" ? {} : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: INITIAL.token, ...body }) });
+  const res = await fetch(url, method === "GET" ? {} : { method, headers: { "Content-Type": "application/json", "X-SQLDiff-Token": APP_TOKEN }, body: JSON.stringify(body) });
   const text = await res.text();
   if (!res.ok) throw new Error(text || res.statusText);
   return JSON.parse(text);

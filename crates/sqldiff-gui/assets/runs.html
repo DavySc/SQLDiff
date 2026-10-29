@@ -558,8 +558,10 @@ async function refresh() {
     if (res.ok) render(await res.json());
   } catch (e) { timer = setTimeout(refresh, 3000); }
 }
+// This launch's token, which every POST carries (absent outside the app).
+const APP_TOKEN = document.querySelector('meta[name="sqldiff-token"]')?.content ?? "";
 async function post(url, body) {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "X-SQLDiff-Token": APP_TOKEN }, body: JSON.stringify(body) });
   const text = await res.text();
   if (!res.ok) throw new Error(text || res.statusText);
   return JSON.parse(text);
