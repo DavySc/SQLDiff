@@ -829,10 +829,10 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-TABLE-VARIABLE"
-statement = "A table variable converted to a job-scoped temporary table is not read after the batch that filled it."
+statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"
-fact = "How the job runs the code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+fact = "How the job or session runs the code, and what the routines it calls do."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMP-TABLE"

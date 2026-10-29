@@ -1329,7 +1329,27 @@ impl<'a> Binder<'a> {
                 }
                 self.local.put_table(self.d, tb);
             }
-            if let Some(q) = t.iter().position(|x| x.is_any_kw(&["SELECT", "WITH"])) {
+            // `AS (fullselect) WITH DATA`: the query is the one after a
+            // top-level AS, not `START WITH` in a column or `WITH REPLACE`.
+            let mut depth = 0usize;
+            let mut as_at = None;
+            for (i, x) in t.iter().enumerate() {
+                match x.kind {
+                    SyntaxKind::L_PAREN => depth += 1,
+                    SyntaxKind::R_PAREN => depth = depth.saturating_sub(1),
+                    _ if depth == 0
+                        && x.is_kw("AS")
+                        && t.get(i + 1).is_some_and(|y| y.kind == SyntaxKind::L_PAREN) =>
+                    {
+                        as_at = Some(i);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(q) =
+                as_at.and_then(|a| (a + 2..t.len()).find(|&j| t[j].is_any_kw(&["SELECT", "WITH"])))
+            {
                 self.analyze(&t[q..], stmt);
             }
             return;
