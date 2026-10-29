@@ -811,7 +811,7 @@ fn col_facts(
     }
     let t = schema.table_exact(want.0.as_deref(), &want.1)?;
     let c = t.column(col)?;
-    if c.collation.is_some() || c.ty.fam == schema::Fam::Other {
+    if c.collation.is_some() || matches!(c.ty.fam, schema::Fam::Other | schema::Fam::Binary) {
         return None;
     }
     Some(ddl::ColFacts {
