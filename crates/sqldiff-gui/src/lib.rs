@@ -26,6 +26,7 @@ pub mod runs;
 pub mod server;
 pub mod session;
 pub mod settings;
+pub mod stored;
 
 /// The UI page; the payload is injected by the server or by `export`.
 pub const INDEX_HTML: &str = include_str!("../assets/index.html");

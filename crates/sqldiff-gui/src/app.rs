@@ -24,6 +24,8 @@
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
 //! - `POST /api/batches/N/cancel`: stop every run of batch N that has not finished
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
+//! - `GET /api/stored`, `POST /api/stored/clear`: the stored conversions
+//!   (see `stored`) and clearing them
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
 //!   editor (see `settings`)
 //! - `GET /convert`, `POST /api/convert`, `POST /api/compare`: convert mode
@@ -244,6 +246,8 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
+        | ("GET", "/api/stored")
+        | ("POST", "/api/stored/clear")
             if !app.local =>
         {
             return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string())
@@ -254,6 +258,10 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 Err(e) => bad(e),
             }
         }
+        // Stored conversions (data dir, on this computer only): what they take
+        // up, and clearing them.
+        ("GET", "/api/stored") => return json(&app.runs.stored()),
+        ("POST", "/api/stored/clear") => return json(&app.runs.clear_stored()),
         ("POST", "/api/open/compare") => {
             return match serde_json::from_slice::<OpenCompare>(&req.body)
                 .map_err(|e| e.to_string())

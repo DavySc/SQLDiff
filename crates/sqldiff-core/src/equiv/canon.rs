@@ -543,7 +543,9 @@ impl<'a> Canon<'a> {
                 && dst.len.is_none();
         }
         match dst.fam {
-            Fam::Int | Fam::VarChar => match (dst.len, src.len) {
+            // A bounded binary target cuts a longer value off in T-SQL and
+            // keeps or rejects it elsewhere.
+            Fam::Int | Fam::VarChar | Fam::Binary => match (dst.len, src.len) {
                 (None, _) => true,
                 (Some(d), Some(s)) => d >= s,
                 (Some(_), None) => false,
@@ -1313,7 +1315,18 @@ impl<'a> Canon<'a> {
     fn conv_rule(&self, src: Option<Ty>, dst: Ty, how: How) -> Rule {
         use Fam::*;
         let Some(src) = src else { return Rule::Dialect };
-        if src.fam == Other || dst.fam == Other {
+        // A binary string kept whole: the target holds any length, or one at
+        // least as long as the value can be. T-SQL cuts a longer value off
+        // silently where the others keep it or fail.
+        if src.fam == Binary && dst.fam == Binary {
+            let fits = match (dst.len, src.len) {
+                (None, _) => true,
+                (Some(d), Some(s)) => s <= d,
+                (Some(_), None) => false,
+            };
+            return if fits { Rule::Same } else { Rule::Dialect };
+        }
+        if matches!(src.fam, Other | Binary) || matches!(dst.fam, Other | Binary) {
             return Rule::Dialect;
         }
         // A value without a fraction: an integer, a decimal of scale 0, or
@@ -1729,6 +1742,9 @@ impl<'a> Canon<'a> {
                 let (x, y, op) = order_operands(op, lt, rt);
                 Ok((n("cmp", vec![a(op), x, y]), Some(Ty::of(Fam::Bool))))
             }
+            "||" if self.is_binary(&lt, lty) && self.is_binary(&rt, rty) => {
+                Ok(self.concat_bin(lt, lty, rt, rty))
+            }
             "||" => {
                 if any(&|t| t.fam == Fam::Char) {
                     return Ok((
@@ -1748,6 +1764,13 @@ impl<'a> Canon<'a> {
                         scale: None,
                     }),
                 ))
+            }
+            // T-SQL `+` between two binary strings concatenates them.
+            "+" if self.d == Dialect::Tsql
+                && self.is_binary(&lt, lty)
+                && self.is_binary(&rt, rty) =>
+            {
+                Ok(self.concat_bin(lt, lty, rt, rty))
             }
             "+" if self.d == Dialect::Tsql && (any(&|t| t.is_string()) || l_or_r_is_str(l, r)) => {
                 if any(&|t| t.is_numeric() || t.is_temporal()) {
@@ -1830,6 +1853,52 @@ impl<'a> Canon<'a> {
             }
             _ => Ok((n("dfn", vec![self.dtag(), a(op), lt, rt]), None)),
         }
+    }
+
+    /// A variable-length binary string: a value of that type, or a binary
+    /// constant (`0x01`, `'\x01'::bytea`).
+    fn is_binary(&self, t: &Term, ty: Option<Ty>) -> bool {
+        ty.is_some_and(|t| t.fam == Fam::Binary) || t.is("bytes")
+    }
+
+    /// The length a binary operand can reach: a constant's byte count, a
+    /// typed value's declared length, None when unbounded.
+    fn binary_len(t: &Term, ty: Option<Ty>) -> Option<u32> {
+        if t.is("bytes") {
+            return t
+                .kid(0)
+                .and_then(Term::atom)
+                .map(|h| h.len().div_ceil(2) as u32);
+        }
+        ty.and_then(|t| t.len)
+    }
+
+    /// Binary concatenation (T-SQL `+`, PostgreSQL and Db2 for i `||`). NULL
+    /// in either operand gives NULL everywhere. T-SQL cuts the result to
+    /// 8000 bytes unless an operand is varbinary(max), so a longer bounded
+    /// result stays T-SQL's own.
+    fn concat_bin(
+        &mut self,
+        lt: Term,
+        lty: Option<Ty>,
+        rt: Term,
+        rty: Option<Ty>,
+    ) -> (Term, Option<Ty>) {
+        let len = Self::binary_len(&lt, lty)
+            .zip(Self::binary_len(&rt, rty))
+            .map(|(x, y)| x + y);
+        if self.d == Dialect::Tsql && len.is_some_and(|l| l > 8000) {
+            return (n("dfn", vec![a("tsql"), a("+"), lt, rt]), None);
+        }
+        let len = if self.d == Dialect::Tsql { len } else { None };
+        (
+            n("concat-bin", vec![lt, rt]),
+            Some(Ty {
+                fam: Fam::Binary,
+                len,
+                scale: None,
+            }),
+        )
     }
 
     /// Whether a real (single precision) meets a number of another type,
