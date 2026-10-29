@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::builtins::Helper;
 use sqldiff_core::catalog::{ddl, default_schema, key, Catalog, Ident, RoutineKind, TableKind};
 use sqldiff_core::{Dialect, Options};
@@ -126,7 +126,7 @@ pub fn hash(files: &[File], b: &[File]) -> Option<String> {
 }
 
 /// What the report says about one base catalog file.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogFile {
     pub path: String,
     /// `review::file_hash` of its text.
@@ -137,7 +137,7 @@ pub struct CatalogFile {
 }
 
 /// A base object whose conversion is not plainly converted.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectReport {
     /// `table`, `view`, `procedure`, `function`, `trigger`.
     pub kind: String,
@@ -157,7 +157,7 @@ pub struct ObjectReport {
 }
 
 /// A base statement that defines no object and did not convert.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatementReport {
     pub file: String,
     pub line: usize,

@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{Conversion, FragmentKind, StandIns, Status, ValueKind};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqldiff_core::catalog::builtins::Helper;
 use sqldiff_core::catalog::{ddl, Catalog};
 use sqldiff_core::{Dialect, Options};
@@ -149,7 +149,7 @@ pub struct Input {
     pub text: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FileReport {
     pub path: String,
     /// The worst unit status in the file; `differs` when an output finding
@@ -179,7 +179,7 @@ pub struct FileReport {
 }
 
 /// The ledger applied to one file.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FileReviewReport {
     /// Every unit reviewed and nothing unplaced.
     pub reviewed: bool,
@@ -192,7 +192,7 @@ pub struct FileReviewReport {
 }
 
 /// The ledger applied to one unit (`review::UnitReview`, without the unit).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnitReviewReport {
     /// Reviewed by people: shown as "accepted in review", never as converted.
     pub reviewed: bool,
@@ -205,7 +205,7 @@ pub struct UnitReviewReport {
     pub decisions: Vec<crate::review::Applied>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct UnitReport {
     /// Stable id (`review::unit_ids`): what review decisions are keyed to.
     pub id: String,
@@ -231,7 +231,7 @@ pub struct UnitReport {
     pub accepted: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Report {
     pub from: String,
     pub to: String,
@@ -277,7 +277,7 @@ pub struct Report {
 /// The deployment profile applied to a converted tree (decision 14). It
 /// changes no status: an accepted assumption is listed as accepted, and
 /// `assumptions_within_accept` says whether all of them are.
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DeploymentReport {
     /// Accepted ids, each with the layers (pack, file) that accept it.
     pub accept: Vec<sqldiff_source::deployment::Accepted>,
@@ -294,7 +294,7 @@ pub struct DeploymentReport {
     pub carried: Vec<CarriedAssumption>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DeploymentFact {
     pub key: String,
     pub value: String,
@@ -303,7 +303,7 @@ pub struct DeploymentFact {
     pub bears_on: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CarriedAssumption {
     pub id: String,
     /// Units with an assumption note of this id.
@@ -313,7 +313,7 @@ pub struct CarriedAssumption {
     pub accepted: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct LedgerReport {
     pub path: String,
     pub records: usize,
@@ -337,10 +337,25 @@ impl Report {
     }
 }
 
-#[derive(Serialize, Default)]
+/// Counts keyed by status label, read back: a label no status has is refused.
+fn by_status<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<&'static str, usize>, D::Error> {
+    let read = std::collections::BTreeMap::<String, usize>::deserialize(d)?;
+    read.into_iter()
+        .map(|(k, n)| match ORDER.iter().find(|s| s.label() == k) {
+            Some(s) => Ok((s.label(), n)),
+            None => Err(serde::de::Error::custom(format!("no status {k:?}"))),
+        })
+        .collect()
+}
+
+#[derive(Serialize, Deserialize, Default)]
 pub struct Totals {
     pub files: usize,
+    #[serde(deserialize_with = "by_status")]
     pub files_by_status: std::collections::BTreeMap<&'static str, usize>,
+    #[serde(deserialize_with = "by_status")]
     pub units: std::collections::BTreeMap<&'static str, usize>,
     pub seconds: f64,
     /// Most frequent reasons a unit is not converted, with counts.
@@ -349,6 +364,7 @@ pub struct Totals {
 
 /// A converted tree: the report, and every file as it is written (the
 /// output with its status lines), in report order.
+#[derive(Serialize, Deserialize)]
 pub struct Tree {
     pub report: Report,
     pub outputs: Vec<String>,
