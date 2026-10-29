@@ -180,10 +180,12 @@ fn implicit_conversion_to_integer() {
             "!UPDATE M SET D = D0 WHERE Id = 1;",
             Eq,
         ),
+        // char(5) 'a' stored in varchar(20): SQL Server keeps 'a    ',
+        // PostgreSQL drops the trailing blanks ('a').
         (
             "!UPDATE dbo.M SET S = C WHERE Id = 1;",
             "!UPDATE M SET S = C WHERE Id = 1;",
-            Eq,
+            Unknown,
         ),
     ];
     check(&cases, Dialect::Postgres);

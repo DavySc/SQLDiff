@@ -259,8 +259,9 @@ fn temp_tables_and_table_variables_are_global_temporary_tables() {
         "{o}"
     );
     // V16: only NOT LOGGED ON ROLLBACK PRESERVE ROWS keeps a table variable's rows.
+    // The name carries the routine's, so a called routine's @seen is another table.
     assert!(
-        o.contains("DECLARE GLOBAL TEMPORARY TABLE SESSION.tv_seen ("),
+        o.contains("DECLARE GLOBAL TEMPORARY TABLE SESSION.tv_p_seen ("),
         "{o}"
     );
     assert!(o.contains("id INTEGER NOT NULL PRIMARY KEY"), "{o}");
@@ -269,7 +270,7 @@ fn temp_tables_and_table_variables_are_global_temporary_tables() {
         "{o}"
     );
     assert!(
-        o.contains("INSERT INTO SESSION.work (id) SELECT id FROM SESSION.tv_seen;"),
+        o.contains("INSERT INTO SESSION.work (id) SELECT id FROM SESSION.tv_p_seen;"),
         "{o}"
     );
     assert!(o.contains("DROP TABLE SESSION.work;"), "{o}");
@@ -462,7 +463,10 @@ fn trancount_guarded_rollback_becomes_rollback() {
     let src = "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRY\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH\n    IF @@TRANCOUNT > 0 ROLLBACK TRAN;\n    INSERT INTO log (msg) VALUES (ERROR_MESSAGE());\n  END CATCH\nEND\n";
     let c = db2(src);
     let u = unit(&c, src, "@@TRANCOUNT");
-    assert_eq!(u.status, Status::Decision, "{}", c.output);
+    // A decision, and not proven: the engine does not compare a CATCH
+    // block, so the statements inside it are not compared either.
+    assert_eq!(u.status, Status::Unproven, "{}", c.output);
+    assert!(u.notes.iter().any(|n| n.status == Status::Decision));
     assert!(has_rule(u, "db2.proc-transaction"));
     assert!(
         c.output.contains("      ROLLBACK;\n      INSERT INTO log"),

@@ -29,6 +29,10 @@ pub enum Fam {
     /// PostgreSQL interval.
     Interval,
     Bool,
+    /// Variable-length binary string (T-SQL varbinary, PostgreSQL bytea,
+    /// Db2 for i VARBINARY and BLOB); `len` None means unbounded (MAX).
+    /// Fixed-length BINARY(n) stays `Other`: T-SQL pads it with zeros.
+    Binary,
     Other,
 }
 
@@ -82,7 +86,7 @@ impl Ty {
     }
 
     pub fn from_type(t: &Type, d: Dialect, in_cast: bool) -> Ty {
-        let n = |i: usize| t.args.get(i).and_then(|a| a.parse::<u32>().ok());
+        let n = |i: usize| t.args.get(i).and_then(|a| length(a));
         let max = t.args.first().is_some_and(|a| a == "MAX");
         let fam_len = |fam: Fam, default: Option<u32>| Ty {
             fam,
@@ -195,6 +199,8 @@ impl Ty {
                 len: Some(0),
                 scale: Some(60),
             },
+            // T-SQL timestamp is rowversion, an 8-byte binary(8), not a time.
+            "TIMESTAMP" if d == Dialect::Tsql => Ty::of(Fam::Other),
             "DATETIME2" | "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => {
                 Self::time_ty(Fam::Timestamp, n(0), d)
             }
@@ -204,6 +210,13 @@ impl Ty {
             "TIME" => Self::time_ty(Fam::Time, n(0), d),
             "INTERVAL" if d == Dialect::Postgres => Ty::of(Fam::Interval),
             "BOOLEAN" | "BOOL" => Ty::of(Fam::Bool),
+            "VARBINARY" | "BINARY VARYING" => fam_len(Fam::Binary, tsql_default),
+            "BYTEA" if d == Dialect::Postgres => Ty::of(Fam::Binary),
+            "BLOB" | "BINARY LARGE OBJECT" if d == Dialect::Db2i => Ty {
+                fam: Fam::Binary,
+                len: if max { None } else { n(0) },
+                scale: None,
+            },
             _ => Ty::of(Fam::Other),
         }
     }
@@ -265,6 +278,10 @@ pub struct Schema {
     view: Option<std::sync::Arc<CatalogView>>,
     /// Unqualified names of user tables in more than one schema.
     ambiguous: std::collections::HashSet<String>,
+    /// PostgreSQL: the stored spellings of every catalog name (schemas,
+    /// tables and views, columns, keys, indexes, routines), by lower case.
+    /// Two spellings under one key are names that differ only in letter case.
+    spellings: HashMap<String, std::collections::BTreeSet<String>>,
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -391,7 +408,44 @@ impl Schema {
         }
         s.ambiguous.extend(extra.ambiguous);
         s.tables.extend(extra.tables);
+        for (k, v) in extra.spellings {
+            s.spellings.entry(k).or_default().extend(v);
+        }
         s
+    }
+
+    /// PostgreSQL: whether a name, spelled as PostgreSQL stores it (a quoted
+    /// name as written, others in lower case), may be compared with T-SQL
+    /// names up to letter case (`ASM-IDENT-FOLD`). Not when the catalog holds
+    /// two names that differ only in letter case (a T-SQL name cannot say
+    /// which it means), nor when it holds the name only in another case
+    /// (PostgreSQL resolves `stored` to none of them). `known`: the name must
+    /// be a catalog name.
+    pub fn case_check(&self, stored: &str, known: bool) -> Result<(), String> {
+        let lower = stored.to_lowercase();
+        match self.spellings.get(&lower) {
+            None if known && stored != lower => Err(format!(
+                "the quoted name \"{stored}\" is not in the catalog, so how PostgreSQL resolves it is not known"
+            )),
+            None => Ok(()),
+            Some(v) if v.len() > 1 => {
+                let v: Vec<&str> = v.iter().map(String::as_str).collect();
+                Err(format!(
+                    "the PostgreSQL catalog has the names \"{}\", which differ only in letter case, so a T-SQL name does not say which one it means",
+                    v.join("\", \"")
+                ))
+            }
+            Some(v) if !v.contains(stored) => Err(format!(
+                "PostgreSQL resolves {} to no catalog object: the catalog spells it \"{}\"",
+                if stored == lower {
+                    stored.to_string()
+                } else {
+                    format!("\"{stored}\"")
+                },
+                v.iter().next().map_or("", String::as_str)
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Reads DDL artifacts through the shared catalog loader; files fold in order.
@@ -421,6 +475,31 @@ impl Schema {
             view: view.supplied.then(|| std::sync::Arc::new(view.clone())),
             ..Schema::default()
         };
+        if d == Dialect::Postgres {
+            let c = &view.catalog;
+            let names = c
+                .schemas
+                .iter()
+                .chain(
+                    c.routines
+                        .iter()
+                        .flat_map(|r| r.schema.iter().chain([&r.name])),
+                )
+                .chain(c.tables.iter().flat_map(|t| {
+                    t.schema
+                        .iter()
+                        .chain([&t.name])
+                        .chain(t.columns.iter().map(|c| &c.name))
+                        .chain(t.keys.iter().filter_map(|k| k.name.as_ref()))
+                        .chain(t.indexes.iter().map(|i| &i.name))
+                }));
+            for n in names {
+                s.spellings
+                    .entry(n.to_lowercase())
+                    .or_default()
+                    .insert(n.clone());
+            }
+        }
         // Base and temporary tables only: view columns are derived, and their
         // types and nullability are not facts equivalence may rely on.
         for t in view
@@ -494,6 +573,20 @@ fn ty_of(t: &DataType, d: Dialect) -> Ty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tsql_timestamp_is_rowversion_not_a_time() {
+        let t = Type {
+            name: "TIMESTAMP".into(),
+            args: vec![],
+        };
+        assert_eq!(Ty::from_type(&t, Dialect::Tsql, false).fam, Fam::Other);
+        assert_eq!(
+            Ty::from_type(&t, Dialect::Postgres, false).fam,
+            Fam::Timestamp
+        );
+        assert_eq!(Ty::from_type(&t, Dialect::Db2i, false).fam, Fam::Timestamp);
+    }
 
     #[test]
     fn loads_the_corpus_catalogs() {
@@ -572,5 +665,34 @@ mod tests {
                 assert!(c.ty.is_string(), "{ddl}: {} is {:?}", c.name, c.ty);
             }
         }
+    }
+}
+
+/// A type length argument: a number, or a Db2 for i LOB length with its
+/// multiplier (`64K`, `1M`, `1G`: 1024, 1024², 1024³).
+fn length(a: &str) -> Option<u32> {
+    let (num, mul) = match a.as_bytes().last()? {
+        b'K' => (&a[..a.len() - 1], 1u32 << 10),
+        b'M' => (&a[..a.len() - 1], 1 << 20),
+        b'G' => (&a[..a.len() - 1], 1 << 30),
+        _ => (a, 1),
+    };
+    num.parse::<u32>().ok()?.checked_mul(mul)
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::length;
+
+    #[test]
+    fn lob_lengths_take_their_multiplier() {
+        assert_eq!(length("10"), Some(10));
+        assert_eq!(length("64K"), Some(65_536));
+        assert_eq!(length("1M"), Some(1_048_576));
+        assert_eq!(length("1G"), Some(1_073_741_824));
+        assert_eq!(length("2G"), Some(2_147_483_648));
+        assert_eq!(length("MAX"), None);
+        assert_eq!(length("G"), None);
+        assert_eq!(length("8G"), None);
     }
 }

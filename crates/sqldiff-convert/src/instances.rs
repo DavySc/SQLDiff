@@ -1168,7 +1168,11 @@ fn check_instance(
     }
     // Every finding of the diff counts: proven different, not decided
     // (unknown), or equal only under the assumptions it names.
-    let report = sqldiff_core::diff(&sa, &ta, opts);
+    // As in `crate::check`: case-insensitive string equality is flagged.
+    let report = {
+        let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
+        sqldiff_core::diff(&sa, &ta, opts)
+    };
     for f in &report.findings {
         let (status, rule) = if f.verdict == Verdict::Different
             || f.class == ChangeClass::Residue && f.b.is_some()
@@ -1685,6 +1689,7 @@ mod tests {
             declared,
             proof,
             observer,
+            anchors,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1697,6 +1702,7 @@ mod tests {
             declared,
             proof,
             observer,
+            anchors,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1736,6 +1742,15 @@ mod tests {
             (
                 "observer",
                 Box::new(|o| o.observer.row_counts = sqldiff_core::observer::RowCounts::Never),
+            ),
+            (
+                "anchors",
+                Box::new(|o| {
+                    o.anchors.push(sqldiff_core::equiv::Anchor {
+                        a: (0, 1),
+                        b: (0, 1),
+                    })
+                }),
             ),
             (
                 "proof mode",

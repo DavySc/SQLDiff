@@ -8,7 +8,7 @@
 //! that make a rewrite sound are either discharged from the catalog or
 //! recorded as assumptions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use sqldiff_syntax::Dialect;
 
@@ -43,6 +43,12 @@ pub mod asm {
     pub const TSQL_CI: (&str, &str) = (
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
+    );
+    /// Davy, 2026-10-29: T-SQL string equality against the other side's
+    /// case-sensitive one is kept, and flagged with this per statement.
+    pub const CI_COLLATION: (&str, &str) = (
+        "ASM-CI-COLLATION",
+        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -100,6 +106,14 @@ pub mod asm {
         "ASM-PAGE-COUNT-NOT-NULL",
         "The row count and offset of TOP / LIMIT / FETCH / OFFSET are never NULL: T-SQL raises an error for NULL (Msg 1014), PostgreSQL reads LIMIT NULL as no limit and OFFSET NULL as 0, and Db2 for i was not checked",
     );
+    pub const RAISERROR_TEXT: (&str, &str) = (
+        "ASM-RAISERROR-TEXT",
+        "The RAISERROR message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space, where PostgreSQL keeps the text as it is",
+    );
+    pub const RAISERROR_FORMAT: (&str, &str) = (
+        "ASM-RAISERROR-FORMAT",
+        "The variable RAISERROR takes as its message holds no % sign: T-SQL reads it as a format, so % starts a substitution",
+    );
     pub const RESULT_TYPES: (&str, &str) = (
         "ASM-RESULT-TYPES",
         "Declared result column types hold the selected values without conversion",
@@ -111,6 +125,11 @@ pub mod asm {
     pub const NO_CALLER_TXN: (&str, &str) = (
         "ASM-NO-CALLER-TXN",
         "The caller does not hold an open transaction",
+    );
+
+    pub const DYNAMIC_SESSION_OPTIONS: (&str, &str) = (
+        "ASM-TSQL-DYNAMIC-SESSION-OPTIONS",
+        "The session runs dynamic SQL with ANSI_NULLS and QUOTED_IDENTIFIER ON (the defaults): T-SQL takes them for a dynamic batch from the session, not from the procedure",
     );
 
     pub const OWNER_PRIVILEGES: (&str, &str) = (
@@ -137,13 +156,17 @@ pub mod asm {
     );
     /// Decision 1: across dialects, result column names that differ only in
     /// letter case are equal when the client matches names that way.
+    pub const END_OF_TIME: (&str, &str) = (
+        "ASM-END-OF-TIME",
+        "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written for PostgreSQL as '9999-12-31 23:59:59.999999' (PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00): it is only an open-end sentinel, compared with values converted by the same rule (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit the same way rather than rounding it; no value lies between the two",
+    );
     pub const RESULT_NAMES_CI: (&str, &str) = (
         "ASM-RESULT-NAMES-CI",
         "Clients read result columns by name case-insensitively (PostgreSQL returns an unquoted alias such as OrderId as orderid; T-SQL returns it as written)",
     );
     pub const IDENT_FOLD: (&str, &str) = (
         "ASM-IDENT-FOLD",
-        "Unquoted names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
+        "Names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, or, in PostgreSQL, from the quoted names the statements write, which no other name of the statement or the catalog matches up to letter case; and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
     );
     pub const ROUTINE_LABEL: (&str, &str) = (
         "ASM-ROUTINE-LABEL",
@@ -195,6 +218,7 @@ struct Binding {
     derived: Option<Vec<(String, Term, Option<Ty>)>>,
 }
 
+#[derive(Clone)]
 pub struct Canon<'a> {
     pub d: Dialect,
     pub schema: &'a Schema,
@@ -211,6 +235,9 @@ pub struct Canon<'a> {
     /// only some statements of two versions are compared, so a renaming is
     /// not checked across the whole routine.
     pub by_name: bool,
+    /// PostgreSQL compared with T-SQL: quoted names may fold to lower case
+    /// (see `stmt`).
+    pub fold_quoted: bool,
     /// Table names of the statement being lowered (see `Item::names`).
     pub names: Vec<(String, Option<String>)>,
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
@@ -248,12 +275,97 @@ fn colname(d: Dialect, kind: &str, name: &str) -> Term {
     n("colname", vec![a(d.id()), a(kind), a(name)])
 }
 
-/// Folded name; names whose quoting is significant (leading `"`) keep their case.
+/// Folded name; names whose quoting is significant (leading `"`) keep their
+/// case, except while a PostgreSQL statement is lowered again with its
+/// quoted names folded (see `Canon::stmt`).
 fn lc(s: &str) -> String {
-    if s.starts_with('"') {
+    let (stored, quoted) = match s.strip_prefix('"') {
+        Some(q) => (q.to_string(), true),
+        None => (s.to_lowercase(), false),
+    };
+    let fold = FOLDING.with(|f| match &mut *f.borrow_mut() {
+        Folding::Off => false,
+        Folding::Record(m) => {
+            m.entry(stored.to_lowercase())
+                .or_default()
+                .insert(stored.clone());
+            false
+        }
+        Folding::Fold => true,
+    });
+    if fold {
+        stored.to_lowercase()
+    } else if quoted {
         s.to_string()
     } else {
-        s.to_lowercase()
+        stored
+    }
+}
+
+/// How `lc` treats a PostgreSQL statement's names.
+enum Folding {
+    Off,
+    /// Records each name, by lower case, with the spellings PostgreSQL
+    /// stores it under (a quoted name as written, others in lower case).
+    Record(BTreeMap<String, BTreeSet<String>>),
+    /// Folds quoted names to lower case as well.
+    Fold,
+}
+
+thread_local! {
+    static FOLDING: std::cell::RefCell<Folding> = const { std::cell::RefCell::new(Folding::Off) };
+}
+
+/// Sets how `lc` treats names until dropped.
+struct FoldingGuard;
+
+impl FoldingGuard {
+    fn set(mode: Folding) -> FoldingGuard {
+        FOLDING.with(|f| *f.borrow_mut() = mode);
+        FoldingGuard
+    }
+
+    fn take(self) -> Folding {
+        FOLDING.with(|f| std::mem::replace(&mut *f.borrow_mut(), Folding::Off))
+    }
+}
+
+impl Drop for FoldingGuard {
+    fn drop(&mut self) {
+        FOLDING.with(|f| *f.borrow_mut() = Folding::Off);
+    }
+}
+
+/// Whether a PostgreSQL statement's quoted names may fold to lower case to
+/// meet the T-SQL names they were converted from (`ASM-IDENT-FOLD`):
+/// folding resolves names as PostgreSQL does when no two names the statement
+/// uses differ only in letter case and each is spelled as the catalog spells
+/// it (`Schema::case_check`). `seen` is what a `Folding::Record` lowering
+/// recorded.
+fn fold_check(seen: &BTreeMap<String, BTreeSet<String>>, schema: &Schema) -> R<()> {
+    for spellings in seen.values() {
+        let mut it = spellings.iter();
+        match (it.next(), it.next()) {
+            (Some(x), Some(y)) => {
+                return Err(format!(
+                    "the PostgreSQL names {} and {} differ only in letter case, so a T-SQL name does not say which one it means",
+                    shown(x),
+                    shown(y)
+                ))
+            }
+            (Some(x), None) => schema.case_check(x, false)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// A PostgreSQL name as written: quoted unless it is stored in lower case.
+fn shown(stored: &str) -> String {
+    if stored == stored.to_lowercase() {
+        stored.to_string()
+    } else {
+        format!("\"{stored}\"")
     }
 }
 
@@ -271,6 +383,7 @@ impl<'a> Canon<'a> {
             excluded: None,
             sub_bits: HashMap::new(),
             by_name: false,
+            fold_quoted: false,
             names: Vec::new(),
         }
     }
@@ -305,35 +418,52 @@ impl<'a> Canon<'a> {
 
     /// Key of a table name: the folded name, prefixed with its folded schema
     /// (and database) unless the schema is the default one (none written,
-    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`.
+    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`; a
+    /// table variable `@t` of routine `routine` converted to one of
+    /// `other_temps` gets that table's key (`classify::table_variable_table`).
     /// Returns the key and, for a default schema, how it was written.
-    pub fn table_name(parts: &[String]) -> (String, Option<String>) {
+    pub fn table_name(
+        parts: &[String],
+        other_temps: &std::collections::HashSet<String>,
+        routine: Option<&str>,
+    ) -> (String, Option<String>) {
         let last = parts.last().map(|s| lc(s)).unwrap_or_default();
+        if parts.len() == 1 && last.starts_with('@') {
+            // From the spelling, as the converter names it: a reference
+            // spelled with other capitals than the DECLARE does not pair.
+            let t = lc(&crate::classify::table_variable_table(routine, &parts[0]));
+            if other_temps.contains(&t) {
+                return (format!("temp:{t}"), None);
+            }
+        }
         let temp = last.starts_with('#')
             || last.starts_with('@')
-            || parts
-                .first()
-                .is_some_and(|p| p.eq_ignore_ascii_case("SESSION") && parts.len() > 1);
+            || parts.first().is_some_and(|p| {
+                (p.eq_ignore_ascii_case("SESSION") || p.eq_ignore_ascii_case("pg_temp"))
+                    && parts.len() > 1
+            });
         if temp {
             return (
                 format!("temp:{}", last.trim_start_matches(['#', '@'])),
                 None,
             );
         }
-        let quals: Vec<String> = parts[..parts.len().saturating_sub(1)]
-            .iter()
-            .map(|s| lc(s))
-            .collect();
+        let raw = &parts[..parts.len().saturating_sub(1)];
+        let quals: Vec<String> = raw.iter().map(|s| lc(s)).collect();
         match quals.as_slice() {
             [] => (last, Some(String::new())),
-            [q] if q == "dbo" || q == "public" => (last, Some(q.clone())),
+            // A quoted PostgreSQL "Public" (leading `"`) is another schema.
+            [q] if (q == "dbo" || q == "public") && !raw[0].starts_with('"') => {
+                (last, Some(q.clone()))
+            }
             _ => (format!("{}.{last}", quals.join(".")), None),
         }
     }
 
     /// `table_name`, remembering the name for the statement's item.
     fn table_key(&mut self, parts: &[String]) -> String {
-        let (key, default) = Self::table_name(parts);
+        let (key, default) =
+            Self::table_name(parts, &self.unit.other_temps, self.unit.routine.as_deref());
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);
@@ -531,15 +661,20 @@ impl<'a> Canon<'a> {
     }
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
-    fn fits(dst: &Ty, src: &Ty) -> bool {
+    fn fits(&self, dst: &Ty, src: &Ty) -> bool {
         if dst.fam != src.fam {
+            // PostgreSQL drops the trailing blanks of a CHAR value converted
+            // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
             return dst.is_string()
                 && src.is_string()
                 && dst.fam == Fam::VarChar
-                && dst.len.is_none();
+                && dst.len.is_none()
+                && !(self.d == Dialect::Postgres && src.fam == Fam::Char);
         }
         match dst.fam {
-            Fam::Int | Fam::VarChar => match (dst.len, src.len) {
+            // A bounded binary target cuts a longer value off in T-SQL and
+            // keeps or rejects it elsewhere.
+            Fam::Int | Fam::VarChar | Fam::Binary => match (dst.len, src.len) {
                 (None, _) => true,
                 (Some(d), Some(s)) => d >= s,
                 (Some(_), None) => false,
@@ -557,7 +692,11 @@ impl<'a> Canon<'a> {
                 src.len.is_none()
                     || (dst.scale == src.scale && dst.len.zip(src.len).is_some_and(|(d, s)| d >= s))
             }
-            _ => true,
+            // The engine does not know which type an `Other` is (BINARY(n),
+            // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
+            // round or fail.
+            Fam::Other => false,
+            Fam::Date | Fam::Interval | Fam::Bool => true,
         }
     }
 
@@ -634,7 +773,7 @@ impl<'a> Canon<'a> {
             }
         }
         match &v.1 {
-            Some(s) if Self::fits(d, s) => v,
+            Some(s) if self.fits(d, s) => v,
             None if matches!(v.0.head(), "null") => v,
             _ => self.convert(*d, v, if var { How::Var } else { How::Store }),
         }
@@ -886,9 +1025,17 @@ impl<'a> Canon<'a> {
                 }
                 items.sort();
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
-                // Like `=`: string membership depends on the collation.
+                // Like `=`: string membership depends on the collation. With
+                // a string operand and string items it is string equality
+                // (`coll-eq`); otherwise a conversion may take part.
                 if string {
-                    kids.push(self.dtag());
+                    let all_strings = ty.is_some_and(|t| t.is_string())
+                        && item_tys.iter().all(|t| t.is_some_and(|t| t.is_string()));
+                    kids.push(if all_strings {
+                        n("coll-eq", vec![self.dtag()])
+                    } else {
+                        self.dtag()
+                    });
                 } else if !known {
                     self.assume(asm::UNTYPED);
                 }
@@ -1336,7 +1483,18 @@ impl<'a> Canon<'a> {
     fn conv_rule(&self, src: Option<Ty>, dst: Ty, how: How) -> Rule {
         use Fam::*;
         let Some(src) = src else { return Rule::Dialect };
-        if src.fam == Other || dst.fam == Other {
+        // A binary string kept whole: the target holds any length, or one at
+        // least as long as the value can be. T-SQL cuts a longer value off
+        // silently where the others keep it or fail.
+        if src.fam == Binary && dst.fam == Binary {
+            let fits = match (dst.len, src.len) {
+                (None, _) => true,
+                (Some(d), Some(s)) => s <= d,
+                (Some(_), None) => false,
+            };
+            return if fits { Rule::Same } else { Rule::Dialect };
+        }
+        if matches!(src.fam, Other | Binary) || matches!(dst.fam, Other | Binary) {
             return Rule::Dialect;
         }
         // A value without a fraction: an integer, a decimal of scale 0, or
@@ -1380,6 +1538,9 @@ impl<'a> Canon<'a> {
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
             // padded values compare and concatenate, which those terms keep.
+            // PostgreSQL drops a CHAR value's trailing blanks when it becomes
+            // varchar or text; SQL Server keeps them.
+            (Char, VarChar) if self.d == Dialect::Postgres => Rule::Dialect,
             (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
             (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
             // Fewer fractional digits round differently: PostgreSQL rounds a
@@ -1558,7 +1719,7 @@ impl<'a> Canon<'a> {
                     || (b.is("str")
                         && b.kid(0).and_then(Term::atom) == Some("")
                         && first_ty.is_some_and(|t| t.is_string()))
-                    || matches!((first_ty, bty), (Some(x), Some(y)) if Self::fits(&x, &y));
+                    || matches!((first_ty, bty), (Some(x), Some(y)) if self.fits(&x, &y));
                 if fits {
                     portable("coalesce", args, first_ty)
                 } else if let (Some(x), Some(y)) = (first_ty, bty) {
@@ -2015,6 +2176,9 @@ impl<'a> Canon<'a> {
                 let (x, y, op) = order_operands(op, lt, rt);
                 Ok((n("cmp", vec![a(op), x, y]), Some(Ty::of(Fam::Bool))))
             }
+            "||" if self.is_binary(&lt, lty) && self.is_binary(&rt, rty) => {
+                Ok(self.concat_bin(lt, lty, rt, rty))
+            }
             "||" => {
                 if any(&|t| t.fam == Fam::Char) {
                     return Ok((
@@ -2034,6 +2198,13 @@ impl<'a> Canon<'a> {
                         scale: None,
                     }),
                 ))
+            }
+            // T-SQL `+` between two binary strings concatenates them.
+            "+" if self.d == Dialect::Tsql
+                && self.is_binary(&lt, lty)
+                && self.is_binary(&rt, rty) =>
+            {
+                Ok(self.concat_bin(lt, lty, rt, rty))
             }
             "+" if self.d == Dialect::Tsql && (any(&|t| t.is_string()) || l_or_r_is_str(l, r)) => {
                 if any(&|t| t.is_numeric() || t.is_temporal()) {
@@ -2116,6 +2287,52 @@ impl<'a> Canon<'a> {
             }
             _ => Ok((n("dfn", vec![self.dtag(), a(op), lt, rt]), None)),
         }
+    }
+
+    /// A variable-length binary string: a value of that type, or a binary
+    /// constant (`0x01`, `'\x01'::bytea`).
+    fn is_binary(&self, t: &Term, ty: Option<Ty>) -> bool {
+        ty.is_some_and(|t| t.fam == Fam::Binary) || t.is("bytes")
+    }
+
+    /// The length a binary operand can reach: a constant's byte count, a
+    /// typed value's declared length, None when unbounded.
+    fn binary_len(t: &Term, ty: Option<Ty>) -> Option<u32> {
+        if t.is("bytes") {
+            return t
+                .kid(0)
+                .and_then(Term::atom)
+                .map(|h| h.len().div_ceil(2) as u32);
+        }
+        ty.and_then(|t| t.len)
+    }
+
+    /// Binary concatenation (T-SQL `+`, PostgreSQL and Db2 for i `||`). NULL
+    /// in either operand gives NULL everywhere. T-SQL cuts the result to
+    /// 8000 bytes unless an operand is varbinary(max), so a longer bounded
+    /// result stays T-SQL's own.
+    fn concat_bin(
+        &mut self,
+        lt: Term,
+        lty: Option<Ty>,
+        rt: Term,
+        rty: Option<Ty>,
+    ) -> (Term, Option<Ty>) {
+        let len = Self::binary_len(&lt, lty)
+            .zip(Self::binary_len(&rt, rty))
+            .map(|(x, y)| x + y);
+        if self.d == Dialect::Tsql && len.is_some_and(|l| l > 8000) {
+            return (n("dfn", vec![a("tsql"), a("+"), lt, rt]), None);
+        }
+        let len = if self.d == Dialect::Tsql { len } else { None };
+        (
+            n("concat-bin", vec![lt, rt]),
+            Some(Ty {
+                fam: Fam::Binary,
+                len,
+                scale: None,
+            }),
+        )
     }
 
     /// Whether a real (single precision) meets a number of another type,
@@ -2789,7 +3006,41 @@ impl<'a> Canon<'a> {
         s.ok_or_else(|| "assignment target is not a parameter or local variable".to_string())
     }
 
+    /// The condition of an IF or WHILE, evaluated once each time it is
+    /// tested.
+    pub fn condition(&mut self, e: &Expr) -> R<Term> {
+        self.seen_tables.clear();
+        self.single_row = true;
+        Ok(self.cond(e)?.0)
+    }
+
+    /// Lowers a statement. A PostgreSQL statement with quoted names that
+    /// keep capitals is lowered twice: once as written, recording its
+    /// names, and, when `fold_check` allows, again with those names folded.
     pub fn stmt(&mut self, s: &Stmt) -> R<Term> {
+        let nested = FOLDING.with(|f| !matches!(*f.borrow(), Folding::Off));
+        if self.d != Dialect::Postgres || !self.fold_quoted || nested {
+            return self.stmt_unfolded(s);
+        }
+        let saved = self.clone();
+        let guard = FoldingGuard::set(Folding::Record(BTreeMap::new()));
+        let t = self.stmt_unfolded(s);
+        let Folding::Record(seen) = guard.take() else {
+            return t;
+        };
+        let t = t?;
+        // Lower-case names fold to themselves, but the catalog may still
+        // hold another spelling the T-SQL name could mean.
+        fold_check(&seen, self.schema)?;
+        if seen.values().flatten().all(|x| *x == x.to_lowercase()) {
+            return Ok(t);
+        }
+        *self = saved;
+        let _guard = FoldingGuard::set(Folding::Fold);
+        self.stmt_unfolded(s)
+    }
+
+    fn stmt_unfolded(&mut self, s: &Stmt) -> R<Term> {
         self.seen_tables.clear();
         self.single_row = false;
         match s {
@@ -2919,6 +3170,74 @@ impl<'a> Canon<'a> {
             }
             Stmt::Message(_) => Err("a message that is not a string literal".into()),
         }
+    }
+
+    /// A message or raised error a format builds (`lower::Msg`): the text
+    /// as literal pieces and shown values, `message` (informational, as
+    /// `PRINT` and `RAISE NOTICE`) or `raise-error`. A value is shown only
+    /// when its text is the same on both sides: a variable-length string
+    /// (not blank-padded `char`), or an integer of at most 32 bits for
+    /// T-SQL `%d` (bigint is an error there). The NULL text is part of the
+    /// term, so T-SQL `(null)` meets only a PostgreSQL `COALESCE(x, '(null)')`.
+    pub fn message(&mut self, m: &super::lower::Msg) -> R<Term> {
+        use super::lower::{MsgPart, Spec};
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        // Most characters the text can have (None: no bound), and whether it
+        // can be empty.
+        let mut most = Some(0usize);
+        let mut empty = true;
+        for p in &m.parts {
+            match p {
+                MsgPart::Text(s) => {
+                    most = most.map(|x| x + s.chars().count());
+                    empty &= s.is_empty();
+                    text.push_str(s);
+                }
+                MsgPart::Arg { value, null, spec } => {
+                    let (t, ty) = self.expr(value)?;
+                    let Some(ty) = ty else {
+                        return Err("a message value of unknown type".into());
+                    };
+                    let (head, width) = match (spec, ty.fam) {
+                        (Spec::Str, Fam::VarChar) => ("msg-str", ty.len.map(|l| l as usize)),
+                        (Spec::Int, Fam::Int)
+                            if self.d != Dialect::Tsql || ty.len.is_some_and(|b| b <= 32) =>
+                        {
+                            // "-2147483648"
+                            empty = false;
+                            ("msg-int", Some(11))
+                        }
+                        (Spec::Str, _) => {
+                            return Err(
+                                "a message value that is not a variable-length string".into()
+                            )
+                        }
+                        (Spec::Int, _) => {
+                            return Err("a %d message value that is not an int".into())
+                        }
+                    };
+                    empty &= null.is_empty() || head == "msg-int";
+                    most = most
+                        .zip(width)
+                        .map(|(x, w)| x + w.max(null.chars().count()));
+                    if !text.is_empty() {
+                        parts.push(n("str", vec![a(std::mem::take(&mut text))]));
+                    }
+                    parts.push(n(head, vec![t, a(null.clone())]));
+                }
+            }
+        }
+        if !text.is_empty() || parts.is_empty() {
+            parts.push(n("str", vec![a(text)]));
+        }
+        if m.tsql && (empty || most.map_or(true, |x| x > 2047)) {
+            self.assume(asm::RAISERROR_TEXT);
+        }
+        if m.format_var {
+            self.assume(asm::RAISERROR_FORMAT);
+        }
+        Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
     fn resultset(&mut self, q: &Select) -> R<Term> {
@@ -3487,6 +3806,19 @@ impl<'a> Canon<'a> {
             Dialect::Db2i => return Err("UPDATE ... FROM is not supported".into()),
         };
         conds.extend(where_.iter().cloned());
+        if others.is_empty() {
+            // `UPDATE t … FROM t WHERE w` is a plain UPDATE.
+            let where_ = conds
+                .into_iter()
+                .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)));
+            return self.stmt(&Stmt::Update {
+                target: tname,
+                alias: talias,
+                sets: sets.to_vec(),
+                from: Vec::new(),
+                where_,
+            });
+        }
         let tkey = talias
             .as_ref()
             .map(|x| lc(x))
@@ -4300,20 +4632,49 @@ fn tsql_update_target(
     from: &[From],
 ) -> R<(Vec<String>, Option<String>, Vec<From>, Vec<Expr>)> {
     let unsupported = |why: &str| Err(format!("UPDATE ... FROM: {why}"));
-    let [t] = target else {
-        return unsupported("the target is not a one-part name");
-    };
+    if target.is_empty() || target.len() > 2 {
+        return unsupported("the target is not a table name, a schema-qualified one or an alias");
+    }
     if alias.is_some() {
         return unsupported("the target has an alias");
     }
-    let key = lc(t);
-    let binds = |f: &From| match f {
-        From::Table { name, alias, .. } => match alias {
-            Some(a) => lc(a) == key,
-            None => name.last().is_some_and(|x| lc(x) == key),
-        },
+    let t: Vec<String> = target.iter().map(|x| lc(x)).collect();
+    let one = t.len() == 1;
+    let key = t.last().cloned().unwrap_or_default();
+    // SQL Server binds the target to the FROM reference of the same table,
+    // aliased or not, and a one-part target also to an alias or to an
+    // unaliased table's last name part (checked on SQL Server 2022). Where
+    // only one side states a schema the default schema decides, which is
+    // not modelled.
+    let mut unclear = None;
+    let mut binds = |f: &From| match f {
+        From::Table { name, alias, .. } => {
+            let n: Vec<String> = name.iter().map(|x| lc(x)).collect();
+            if let Some(a) = alias {
+                if lc(a) == key {
+                    if !one {
+                        unclear = Some("the alias of another FROM item has the target's name");
+                    }
+                    return one;
+                }
+            }
+            if n.last() != Some(&key) {
+                return false;
+            }
+            if n == t || (one && alias.is_none()) {
+                return true;
+            }
+            if n.len() != t.len() {
+                unclear = Some("the target and a FROM table may or may not be the same table (only one states a schema)");
+            }
+            false
+        }
         From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
-            alias.as_ref().is_some_and(|a| lc(a) == key)
+            let hit = alias.as_ref().is_some_and(|a| lc(a) == key);
+            if hit && !one {
+                unclear = Some("the alias of another FROM item has the target's name");
+            }
+            hit && one
         }
         _ => false,
     };
@@ -4325,22 +4686,39 @@ fn tsql_update_target(
         }
         chains.push(c);
     }
-    let hits: Vec<(usize, usize)> = chains
-        .iter()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            c.iter()
-                .enumerate()
-                .filter(|(_, s)| binds(&s.1))
-                .map(move |(j, _)| (i, j))
-        })
-        .collect();
-    let [(ci, li)] = hits[..] else {
-        return unsupported(if hits.is_empty() {
-            "the target is not one of the FROM tables by alias or one-part name"
-        } else {
-            "the target matches more than one FROM table"
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for (i, c) in chains.iter().enumerate() {
+        for (j, s) in c.iter().enumerate() {
+            if binds(&s.1) {
+                hits.push((i, j));
+            }
+        }
+    }
+    if let Some(w) = unclear {
+        return unsupported(w);
+    }
+    if hits.is_empty() {
+        // The target is not in FROM: SQL Server joins it to the FROM
+        // tables, in scope in SET and WHERE but not in ON, which is
+        // PostgreSQL's shape (checked on SQL Server 2022). A FROM item that
+        // also shows the target's name is not modelled.
+        let shown = chains.iter().flatten().any(|s| match &s.1 {
+            From::Table { name, alias, .. } => match alias {
+                Some(a) => lc(a) == key,
+                None => name.last().is_some_and(|x| lc(x) == key),
+            },
+            From::Sub { alias, .. } | From::Values { alias, .. } | From::Func { alias, .. } => {
+                alias.as_ref().is_some_and(|a| lc(a) == key)
+            }
+            _ => true,
         });
+        if shown {
+            return unsupported("the target is not in FROM, and a FROM item is also named like it");
+        }
+        return Ok((target.to_vec(), None, from.to_vec(), Vec::new()));
+    }
+    let [(ci, li)] = hits[..] else {
+        return unsupported("the target matches more than one FROM table");
     };
     let c = &mut chains[ci];
     let From::Table { name, alias, hints } = c[li].1.clone() else {

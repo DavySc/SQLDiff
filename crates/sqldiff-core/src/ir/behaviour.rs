@@ -23,9 +23,9 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-use sqldiff_syntax::{ast, SyntaxNode};
+use sqldiff_syntax::{ast, Dialect, SyntaxNode};
 
-use super::cfg::{lower, Cfg, Effect, NodeId};
+use super::cfg::{Cfg, Effect, NodeId};
 use super::interp::{Exit, Explorer, Fate, Fault, Outcome, Routed, Scenario, TempState};
 use super::profile::ErrorKind;
 use super::witness::{PathStep, ScenarioInfo, ScenarioKind, SideOutcome, WhatIf, Witness};
@@ -91,8 +91,8 @@ impl<'x, 'a> SideIr<'x, 'a> {
     /// Lowers one side and indexes its effects and reads: the scenarios
     /// look keys up for every outcome pair, so a scan per lookup made large
     /// routines cubic.
-    fn new(a: &'x Analyzed<'a>) -> Self {
-        let cfg = lower(a);
+    fn new(a: &'x Analyzed<'a>, other: &Analyzed) -> Self {
+        let cfg = super::cfg::lower_with(a, other_temps(a, other));
         let mut at = HashMap::new();
         let mut bases = HashMap::new();
         for (i, (n, e)) in cfg.effect_nodes().into_iter().enumerate() {
@@ -964,6 +964,16 @@ fn norm_cond(c: &str) -> String {
     out.join(" ")
 }
 
+/// T-SQL compared against PostgreSQL or Db2 for i: the other side's
+/// temporary tables, which a table variable may have been converted to.
+fn other_temps(x: &Analyzed, other: &Analyzed) -> HashSet<String> {
+    if x.dialect() == Dialect::Tsql && other.dialect() != Dialect::Tsql {
+        crate::classify::temp_table_names(&other.root)
+    } else {
+        HashSet::new()
+    }
+}
+
 /// Pairs the outcomes of both sides: by path signature when both sides
 /// branch on the same conditions, otherwise every combination (and the
 /// verdict is capped at unknown unless all combinations agree).
@@ -1029,8 +1039,8 @@ struct Collector<'x, 'a> {
 impl<'x, 'a> Collector<'x, 'a> {
     fn new(a: &'x Analyzed<'a>, b: &'x Analyzed<'a>, env: Env) -> Self {
         let mut c = Collector {
-            sa: SideIr::new(a),
-            sb: SideIr::new(b),
+            sa: SideIr::new(a, b),
+            sb: SideIr::new(b, a),
             env,
             splits: Vec::new(),
             out: Behaviour::default(),

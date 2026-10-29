@@ -253,6 +253,17 @@ fn local_pair(ua: &Unit, ub: &Unit, x: &Local, y: &Local) -> Result<Asms, String
             // or not fit (T-SQL cuts a string off, PostgreSQL raises).
             match (assigned_literals(ua, x), assigned_literals(ub, y)) {
                 (Some(lx), Some(ly)) if lx == ly => {}
+                // T-SQL's end of time, which the converter writes with 6
+                // fraction digits for PostgreSQL (a conversion check only).
+                (Some(lx), Some(ly))
+                    if lx.len() == ly.len()
+                        && lx.iter().zip(&ly).all(|(p, q)| {
+                            p == q
+                                || super::compare::end_of_time_across(p, q, ua.dialect, ub.dialect)
+                        }) =>
+                {
+                    v.push(super::canon::asm::END_OF_TIME);
+                }
                 (Some(_), Some(_)) => {
                     return Err("the literals assigned do not convert to the same values".into())
                 }
@@ -563,6 +574,20 @@ pub(super) fn cannot_fail(u: &Unit, node: &SyntaxNode) -> bool {
     let Some(s) = u.stmts.iter().find(|s| &s.node == node) else {
         return false;
     };
+    // An informational message of variables and constants: it fails only
+    // on an argument of the wrong type, which `Canon::message` refuses.
+    if let Some(m) = &s.msg {
+        return !m.error
+            && m.parts.iter().all(|p| match p {
+                super::lower::MsgPart::Text(_) => true,
+                super::lower::MsgPart::Arg { value, .. } => {
+                    matches!(
+                        value,
+                        Expr::Var(_) | Expr::Name(_) | Expr::Str(_) | Expr::Num(_)
+                    )
+                }
+            });
+    }
     let Some((target, v)) = s.ast.as_ref().ok().and_then(Stmt::assignment) else {
         return false;
     };
