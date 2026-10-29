@@ -518,7 +518,7 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-IDENT-FOLD"
-statement = "Unquoted names on both sides name the same objects after case folding."
+statement = "Names on both sides name the same objects after case folding: unquoted names, and quoted PostgreSQL names that no other name of the statement or catalog matches up to letter case."
 discharge = "catalog"
 fact = "The object names in both catalogs and the T-SQL catalog collation."
 fact_key = "collation"
@@ -642,6 +642,13 @@ statement = "The caller does not hold an open transaction: T-SQL runs the routin
 discharge = "deployment"
 fact = "How callers call the routine."
 sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-DYNAMIC-SESSION-OPTIONS"
+statement = "The session runs dynamic SQL with ANSI_NULLS and QUOTED_IDENTIFIER ON (the defaults): a T-SQL dynamic batch takes them from the session, not from the procedure that runs it."
+discharge = "deployment"
+fact = "The SET options of the sessions that call the routine."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-NO-NESTED-TRAN"
@@ -885,10 +892,10 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-TABLE-VARIABLE"
-statement = "A table variable converted to a job-scoped temporary table is not read after the batch that filled it."
+statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"
-fact = "How the job runs the code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+fact = "How the job or session runs the code, and what the routines it calls do."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMP-TABLE"
