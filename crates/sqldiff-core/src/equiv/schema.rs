@@ -199,6 +199,8 @@ impl Ty {
                 len: Some(0),
                 scale: Some(60),
             },
+            // T-SQL timestamp is rowversion, an 8-byte binary(8), not a time.
+            "TIMESTAMP" if d == Dialect::Tsql => Ty::of(Fam::Other),
             "DATETIME2" | "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => {
                 Self::time_ty(Fam::Timestamp, n(0), d)
             }
@@ -505,6 +507,20 @@ fn ty_of(t: &DataType, d: Dialect) -> Ty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tsql_timestamp_is_rowversion_not_a_time() {
+        let t = Type {
+            name: "TIMESTAMP".into(),
+            args: vec![],
+        };
+        assert_eq!(Ty::from_type(&t, Dialect::Tsql, false).fam, Fam::Other);
+        assert_eq!(
+            Ty::from_type(&t, Dialect::Postgres, false).fam,
+            Fam::Timestamp
+        );
+        assert_eq!(Ty::from_type(&t, Dialect::Db2i, false).fam, Fam::Timestamp);
+    }
 
     #[test]
     fn loads_the_corpus_catalogs() {
