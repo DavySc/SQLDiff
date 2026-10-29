@@ -67,7 +67,8 @@ fn a_unique_index_holds_one_null_on_both_sides() {
         "CREATE UNIQUE INDEX UX_Qty ON Items (Qty, Bin) NULLS NOT DISTINCT;"
     );
     assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
-    // A string key compares case-insensitively in T-SQL: a difference.
+    // A string key compares case-insensitively in T-SQL: flagged with
+    // ASM-CI-COLLATION for the reviewer (Davy, 2026-10-29).
     let src = format!(
         "{ITEMS}CREATE UNIQUE INDEX UX_Code ON dbo.Items (Code) WHERE Code IS NOT NULL;\nGO\n"
     );
@@ -77,7 +78,8 @@ fn a_unique_index_holds_one_null_on_both_sides() {
         out(&c, u).trim(),
         "CREATE UNIQUE INDEX UX_Code ON Items (Code) NULLS NOT DISTINCT WHERE Code IS NOT NULL;"
     );
-    assert_eq!(u.status, Status::Differs, "{:?}", u.notes);
+    assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
+    assert!(rules(u).contains(&"ASM-CI-COLLATION"), "{:?}", rules(u));
     // Db2 for i: how a unique index treats NULLs is not verified.
     let src = format!("{ITEMS}CREATE UNIQUE INDEX UX_Bin ON dbo.Items (Bin);\nGO\n");
     let c = convert(&src, Dialect::Db2i);

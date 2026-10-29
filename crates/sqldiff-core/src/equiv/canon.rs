@@ -32,6 +32,12 @@ pub mod asm {
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
     );
+    /// Davy, 2026-10-29: T-SQL string equality against the other side's
+    /// case-sensitive one is kept, and flagged with this per statement.
+    pub const CI_COLLATION: (&str, &str) = (
+        "ASM-CI-COLLATION",
+        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+    );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
         "UPPER/LOWER fold the same characters as the case-insensitive comparison on the other side",
@@ -891,9 +897,17 @@ impl<'a> Canon<'a> {
                 }
                 items.sort();
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
-                // Like `=`: string membership depends on the collation.
+                // Like `=`: string membership depends on the collation. With
+                // a string operand and string items it is string equality
+                // (`coll-eq`); otherwise a conversion may take part.
                 if string {
-                    kids.push(self.dtag());
+                    let all_strings = ty.is_some_and(|t| t.is_string())
+                        && item_tys.iter().all(|t| t.is_some_and(|t| t.is_string()));
+                    kids.push(if all_strings {
+                        n("coll-eq", vec![self.dtag()])
+                    } else {
+                        self.dtag()
+                    });
                 } else if !known {
                     self.assume(asm::UNTYPED);
                 }

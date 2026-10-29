@@ -4895,7 +4895,7 @@ impl<'a> Cx<'a> {
 
     fn ci_note(&mut self) {
         let text = self.pick(
-            "String comparison: T-SQL's default collation is case-insensitive, and T-SQL ignores trailing spaces when it compares; PostgreSQL compares case-sensitively and counts trailing spaces in varchar and text. Equal only if the data's case is consistent (or use a case-insensitive collation) and no compared value differs from another only by trailing spaces.",
+            "String comparison: T-SQL's default collation is case-insensitive, and T-SQL ignores trailing spaces when it compares; PostgreSQL compares case-sensitively and counts trailing spaces in varchar and text. Equal only if no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (the default equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters).",
             "String comparison: T-SQL's default collation is case-insensitive; Db2 for i compares by the sort sequence, case-sensitively with the default *HEX. Both ignore trailing blanks (fact V8). Equal only if the data's case is consistent (or the routine uses SRTSEQ(*LANGIDSHR)).",
         ).to_string();
         self.note(Status::Assumptions, "ASM-CI-COLLATION", &text);
