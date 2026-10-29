@@ -124,3 +124,42 @@ fn a_second_default_is_refused() {
         .unwrap();
     assert_eq!(u.status, Status::NotConverted, "{}", c.output);
 }
+
+#[test]
+fn key_constraints_added_later_lose_clustered_and_sort_order() {
+    let src = "CREATE TABLE s (k int NOT NULL, d int NOT NULL, c int NULL)\nGO\nALTER TABLE s ADD CONSTRAINT PK_s PRIMARY KEY NONCLUSTERED\n(\n    k ASC,\n    d DESC\n)\nGO\nALTER TABLE s ADD CONSTRAINT UQ_c UNIQUE CLUSTERED (c), CONSTRAINT CK_c CHECK (c > 0)\nGO\n";
+    let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+    let out = &c.output;
+    assert!(!out.contains("CLUSTERED"), "{out}");
+    assert!(!out.contains("ASC") && !out.contains("DESC"), "{out}");
+    assert!(
+        out.contains("ADD CONSTRAINT UQ_c UNIQUE (c), ADD CONSTRAINT CK_c CHECK (c > 0)"),
+        "{out}"
+    );
+    // Index options (IGNORE_DUP_KEY changes what the key accepts) are refused.
+    let c = convert(
+        "ALTER TABLE s ADD CONSTRAINT PK_s PRIMARY KEY (k) WITH (IGNORE_DUP_KEY = ON)\n",
+        Dialect::Tsql,
+        Dialect::Postgres,
+    )
+    .unwrap();
+    assert!(c.units.iter().any(|u| u.status == Status::NotConverted), "{}", c.output);
+}
+
+#[test]
+fn drop_trigger_is_refused_and_truncate_restarts_identity() {
+    let c = convert(
+        "DROP TRIGGER IF EXISTS Application.TR_x\nGO\nTRUNCATE TABLE dbo.Orders\nGO\n",
+        Dialect::Tsql,
+        Dialect::Postgres,
+    )
+    .unwrap();
+    let out = &c.output;
+    assert!(!out.contains("\nDROP TRIGGER"), "{out}");
+    assert!(out.contains("TRUNCATE TABLE dbo.Orders RESTART IDENTITY;") || out.contains("TRUNCATE TABLE Orders RESTART IDENTITY;"), "{out}");
+    assert_eq!(
+        c.units.iter().filter(|u| u.status == Status::NotConverted).count(),
+        1,
+        "{out}"
+    );
+}
