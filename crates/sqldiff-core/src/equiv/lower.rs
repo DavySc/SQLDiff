@@ -269,6 +269,15 @@ pub struct Unit {
     /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.t`, placed like `table_vars`:
     /// the drop before a converted table variable's `CREATE TEMP TABLE`.
     pub temp_drops: Vec<(SyntaxNode, usize)>,
+    /// The tables the unit itself creates for its own use: T-SQL table
+    /// variables and `#` tables, PostgreSQL `CREATE TEMP TABLE`, Db2 for i
+    /// `DECLARE GLOBAL TEMPORARY TABLE`. Their columns are typed for the
+    /// unit's statements as a catalog table's are (`mod.rs`, `local_schema`).
+    pub local_tables: Vec<SyntaxNode>,
+    /// PostgreSQL: the unqualified names of the temporary tables the unit
+    /// creates (lower case). PostgreSQL looks in `pg_temp` first, so the bare
+    /// name is the temporary table, as `#t` is in T-SQL.
+    pub local_temps: std::collections::HashSet<String>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
     /// Cursor loops of the shape `cursor.rs` compares.
@@ -353,6 +362,8 @@ fn empty(d: Dialect) -> Unit {
         other_temps: Default::default(),
         table_vars: Vec::new(),
         temp_drops: Vec::new(),
+        local_tables: Vec::new(),
+        local_temps: Default::default(),
         ctl: Vec::new(),
         cursor_loops: Vec::new(),
         cursor_vars: Vec::new(),
@@ -1422,6 +1433,18 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         });
         return;
     }
+    if table_var_decl(c, d) || temp_create(c, d) {
+        u.local_tables.push(c.clone());
+        if d == Dialect::Postgres {
+            let ts = tokens(c);
+            // `CREATE TEMP TABLE name (` with a one-part name.
+            if let [_, _, _, n, next, ..] = ts.as_slice() {
+                if n.kind == K::Word && next.kind != K::Dot {
+                    u.local_temps.insert(n.text.to_lowercase());
+                }
+            }
+        }
+    }
     if table_var_decl(c, d) {
         u.table_vars.push((c.clone(), u.stmts.len()));
         return;
@@ -1745,6 +1768,13 @@ fn table_var_decl(c: &SyntaxNode, d: Dialect) -> bool {
             w(0) == "DECLARE" && w(1) == "GLOBAL" && w(2) == "TEMPORARY" && w(3) == "TABLE"
         }
     }
+}
+
+/// T-SQL `CREATE TABLE #t`.
+fn temp_create(c: &SyntaxNode, d: Dialect) -> bool {
+    d == Dialect::Tsql
+        && cst::first_words(c, 2) == ["CREATE", "TABLE"]
+        && tokens(c).get(2).is_some_and(|t| t.text.starts_with('#'))
 }
 
 /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.…`. Other drops are compared

@@ -79,6 +79,7 @@ pub(crate) fn convert(
         dynamic: Vec::new(),
         scope: None,
         local: std::cell::OnceCell::new(),
+        own_tables: Vec::new(),
         bit_cols: Vec::new(),
         bit_unhandled: Vec::new(),
         bit_outer: None,
@@ -230,6 +231,9 @@ struct Cx<'a> {
     scope: Option<Scope>,
     /// Without a tree catalog: one read from this input, made when needed.
     local: std::cell::OnceCell<sqldiff_core::catalog::Catalog>,
+    /// The table variables and `#` tables this routine or script declared
+    /// so far, for the types of their columns (names lower case).
+    own_tables: Vec<sqldiff_core::catalog::Table>,
     /// The BIT columns of the table being created or altered (lower case).
     bit_cols: Vec<String>,
     /// PostgreSQL: places where a bit meets a number with no exact rewrite.
@@ -441,6 +445,7 @@ impl<'a> Cx<'a> {
         self.xact_abort = false;
         self.seen_work = false;
         self.tables.clear();
+        self.own_tables.clear();
         self.routine = None;
         self.rolls_back = false;
         self.savepoints.clear();
@@ -1431,7 +1436,15 @@ impl<'a> Cx<'a> {
                 if self.db2() {
                     ts = dummy_from(&ts, false);
                 }
-                self.expr(&ts).trim().to_string()
+                // The tables its subqueries read, for the types of their
+                // columns (a bit column compared with 0 or 1).
+                let outer = std::mem::replace(&mut self.scope, scope_of(&ts));
+                let aliases = self.bit_aliases_of(&ts);
+                let outer_aliases = std::mem::replace(&mut self.bit_aliases, aliases);
+                let cond = self.expr(&ts).trim().to_string();
+                self.scope = outer;
+                self.bit_aliases = outer_aliases;
+                cond
             })
             .unwrap_or_default();
         // The engine does not compare conditions: what has no exact rewrite is refused.
@@ -3143,6 +3156,7 @@ impl<'a> Cx<'a> {
         }
         self.tables
             .insert(v.s[1..].to_ascii_lowercase(), table.clone());
+        self.own_table(&v.s, &ts[open + 1..close]);
         self.step_ts_with("tsql.decl.table-variable", ts, table.clone());
         if self.db2() {
             self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again. Its name carries the routine's, so a routine it calls does not replace it; assumes the routine is not re-entered (called from itself, directly or through other routines) while the table is in use.");
@@ -4695,6 +4709,11 @@ impl<'a> Cx<'a> {
                 ));
             }
             cols.push(col);
+        }
+        if temp {
+            if let Some(&n) = sig(&name_t).first() {
+                self.own_table(&name_t[n].s.clone(), &ts[open + 1..close]);
+            }
         }
         let tail = self.expr(&ts[close + 1..]);
         if let Some(t) = temporal {
@@ -8812,7 +8831,11 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
                 if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == L_PAREN) {
                     let end = matching(ts, j).unwrap_or(ts.len() - 1);
                     k = s.partition_point(|&x| x <= end);
-                } else if s.get(k).is_some_and(|&j| ts[j].k == VARIABLE) {
+                } else if let Some(&j) = s.get(k).filter(|&&j| ts[j].k == VARIABLE) {
+                    // A table variable: its columns are typed when this
+                    // routine declared it (`own_tables`).
+                    name.push(ts[j].s.to_ascii_lowercase());
+                    named = true;
                     k += 1;
                 }
             }
@@ -8933,11 +8956,37 @@ impl Cx<'_> {
             .into()
     }
 
+    /// Records a table variable or `#` table `name` with the column list
+    /// `cols` (the tokens between its parentheses), replacing one of that name.
+    fn own_table(&mut self, name: &str, cols: &[T]) {
+        let text: String = cols.iter().map(|t| t.s.as_str()).collect();
+        let cat = sqldiff_core::catalog::ddl::load(
+            &format!("CREATE TABLE own_table ({text})"),
+            Dialect::Tsql,
+            "routine",
+        );
+        let name = name.to_ascii_lowercase();
+        self.own_tables.retain(|t| t.name != name);
+        if let [t] = cat.tables.as_slice() {
+            let mut t = t.clone();
+            t.name = name;
+            self.own_tables.push(t);
+        }
+    }
+
     /// The catalog table of a scope entry whose columns are known.
     fn entry_table(&self, e: &ScopeEntry) -> Option<&sqldiff_core::catalog::Table> {
         use sqldiff_core::catalog::{table_position, Ident};
         if !e.named {
             return None;
+        }
+        if let [n] = e.name.as_slice() {
+            if let Some(t) = self.own_tables.iter().find(|t| &t.name == n) {
+                return t.columns_known.then_some(t);
+            }
+            if n.starts_with('@') {
+                return None;
+            }
         }
         let cat = self.type_catalog()?;
         let parts: Vec<Ident> = match self.image_table(&e.name) {
