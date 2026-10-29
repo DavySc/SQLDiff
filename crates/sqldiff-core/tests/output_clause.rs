@@ -152,6 +152,26 @@ fn returned_names_must_feed_the_insert_in_order() {
     );
 }
 
+/// PL/pgSQL raises "column reference is ambiguous" for a bare RETURNING
+/// name that is also a variable.
+#[test]
+fn a_returned_name_that_is_also_a_variable_is_refused() {
+    let r = run(
+        "CREATE PROCEDURE dbo.p @qty int AS\nBEGIN\n  DELETE FROM dbo.item OUTPUT deleted.qty INTO dbo.item_log (old_qty) WHERE qty = @qty;\nEND\n",
+        "CREATE OR REPLACE PROCEDURE p(qty integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  WITH o AS (DELETE FROM item WHERE item.qty = p.qty RETURNING qty AS old_qty) INSERT INTO item_log (old_qty) SELECT old_qty FROM o;\nEND;\n$$;\n",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{}",
+        why(&r)
+    );
+    assert!(
+        why(&r).contains("names both a column and a variable"),
+        "{}",
+        why(&r)
+    );
+}
+
 #[test]
 fn rows_returned_to_the_caller_are_not_compared() {
     not_equal(

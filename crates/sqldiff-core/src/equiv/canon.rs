@@ -2830,7 +2830,8 @@ impl<'a> Canon<'a> {
         };
         let mut items = Vec::new();
         for it in &o.items {
-            items.push(output_item(&it.expr, self.d, &t, cur, &image)?);
+            let var = |x: &str| self.sym(x).is_some();
+            items.push(output_item(&it.expr, self.d, &t, cur, &image, &var)?);
         }
         let bind = |img: &str| Binding {
             key: img.to_string(),
@@ -4714,15 +4715,18 @@ const OLD_IMAGE: &str = "\u{1}old";
 /// `image.column` (`NEW_IMAGE` or `OLD_IMAGE`). `image` maps a qualifier
 /// to its image; an unqualified name is a column of the changed row (`cur`)
 /// in PostgreSQL when the table has it, and otherwise left for `resolve`
-/// (a PL/pgSQL variable). Subqueries, `*` and window functions are refused.
+/// (a PL/pgSQL variable); a name that is both a column and a variable
+/// (`var`) is refused, as PL/pgSQL raises "column reference is ambiguous"
+/// for it. Subqueries, `*` and window functions are refused.
 fn output_item(
     e: &Expr,
     d: Dialect,
     t: &super::schema::Table,
     cur: &str,
     image: &dyn Fn(&str) -> R<&'static str>,
+    var: &dyn Fn(&str) -> bool,
 ) -> R<Expr> {
-    let go = |x: &Expr| output_item(x, d, t, cur, image);
+    let go = |x: &Expr| output_item(x, d, t, cur, image, var);
     let bx = |x: &Expr| go(x).map(Box::new);
     Ok(match e {
         Expr::Name(p) if p.len() == 1 => {
@@ -4730,6 +4734,9 @@ fn output_item(
                 return Err("an unqualified column in OUTPUT (name inserted. or deleted.)".into());
             }
             if t.column(&p[0]).is_some() {
+                if var(&p[0]) {
+                    return Err(format!("`{}` names both a column and a variable", lc(&p[0])));
+                }
                 Expr::Name(vec![cur.to_string(), p[0].clone()])
             } else {
                 e.clone()
