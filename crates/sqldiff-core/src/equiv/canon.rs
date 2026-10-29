@@ -1631,10 +1631,12 @@ impl<'a> Canon<'a> {
             }
             // REPLICATE and repeat agree for a count that is a literal from 0
             // up (a negative count is NULL in T-SQL, '' in PostgreSQL) while
-            // the result stays within 4,000 characters (T-SQL cuts a non-MAX
-            // result at 8,000 bytes).
+            // the result stays within 4,000 characters of a known length
+            // (T-SQL cuts a non-MAX result at 8,000 bytes).
+            // Only varchar: PostgreSQL strips a char value's padding before
+            // repeat, T-SQL repeats it.
             (Dialect::Tsql, "replicate", 2) | (Dialect::Postgres, "repeat", 2)
-                if first_ty.is_some_and(|t| t.is_string()) =>
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar) =>
             {
                 let count = match &c.args[1] {
                     Expr::Num(v) => v.parse::<u32>().ok(),
@@ -1644,7 +1646,9 @@ impl<'a> Canon<'a> {
                 let fits = match (d, count, len) {
                     (_, None, _) => false,
                     (Dialect::Tsql, Some(k), Some(l)) => l.saturating_mul(k) <= 4000,
-                    (Dialect::Tsql, Some(_), None) => true,
+                    // No known length: possibly a non-MAX value cut at
+                    // 8,000 bytes (DB_NAME() is nvarchar(128)), so unknown.
+                    (Dialect::Tsql, Some(_), None) => false,
                     (_, Some(_), _) => true,
                 };
                 if fits {

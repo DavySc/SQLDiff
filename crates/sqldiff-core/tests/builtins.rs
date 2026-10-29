@@ -5,10 +5,10 @@
 
 use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
 
-const MS_DDL: &str = "CREATE TABLE dbo.M (Id int NOT NULL PRIMARY KEY, S varchar(20) NULL,
+const MS_DDL: &str = "CREATE TABLE dbo.M (Id int NOT NULL PRIMARY KEY, S varchar(20) NULL, C char(5) NULL, NC nchar(5) NULL,
   N nvarchar(max) NULL, T datetime2(3) NULL, Dt datetime NULL, Day date NULL, Tm time(3) NULL,
   Q int NULL, Dto datetimeoffset NULL);";
-const PG_DDL: &str = "CREATE TABLE M (Id integer NOT NULL PRIMARY KEY, S varchar(20) NULL,
+const PG_DDL: &str = "CREATE TABLE M (Id integer NOT NULL PRIMARY KEY, S varchar(20) NULL, C char(5) NULL, NC char(5) NULL,
   N text NULL, T timestamp(3) NULL, Dt timestamp(3) NULL, Day date NULL, Tm time(3) NULL,
   Q integer NULL, Dto timestamptz NULL);";
 
@@ -92,7 +92,17 @@ fn string_functions() {
         ("REPLICATE(S, Q)", "repeat(S, Q)", NotEq),
         // T-SQL cuts a non-MAX result at 8,000 bytes.
         ("REPLICATE(S, 300)", "repeat(S, 300)", NotEq),
-        ("REPLICATE(N, 300)", "repeat(N, 300)", Eq(&[])),
+        // A MAX value is not told apart from one of unknown length, which
+        // T-SQL may cut (DB_NAME() is nvarchar(128)): not shown equal.
+        ("REPLICATE(N, 300)", "repeat(N, 300)", NotEq),
+        (
+            "REPLICATE(DB_NAME(), 3000)",
+            "repeat(current_database(), 3000)",
+            NotEq,
+        ),
+        // PostgreSQL strips char padding before repeat; T-SQL keeps it.
+        ("REPLICATE(C, 3)", "repeat(C, 3)", NotEq),
+        ("REPLICATE(NC, 3)", "repeat(NC, 3)", NotEq),
         ("REPLICATE(S, 3)", "repeat(S, 2)", NotEq),
     ]);
 }
