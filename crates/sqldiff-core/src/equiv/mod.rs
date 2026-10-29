@@ -319,7 +319,6 @@ fn compare_units(
     script::locals(a, b, ua, ub, &na, &nb, out);
     tables(a, b, ua, ub, sa, sb, out);
     table_vars(a, b, ua, ub, sa, sb, out);
-    calls(a, b, ua, ub, sa, sb, out);
     dynamic_sql(a, b, ua, ub, sa, sb, out);
     ddl_stmts(a, b, ua, ub, sa, sb, out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
@@ -379,12 +378,75 @@ fn compare_units(
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
-    pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
+    calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
 }
 
+/// With a conversion's trace, whether call `xn` (side A) and its
+/// counterpart `yn` (side B) sit among the same data statements although
+/// the sides hold different numbers of statements before them (a statement
+/// left unconverted, an initialization only one side writes): the trace
+/// links the two calls, and every pair of statements the comparison made
+/// is before the call on both sides or after it on both. A statement left
+/// unpaired is reported on its own.
+fn same_place_paired(
+    (ia, ib): (&[Item], &[Item]),
+    pairs: &[(usize, usize)],
+    xn: &SyntaxNode,
+    yn: &SyntaxNode,
+    anchors: &[Anchor],
+) -> bool {
+    let (ca, cb) = (cst::sig_range(xn), cst::sig_range(yn));
+    // The trace must link the two calls themselves.
+    let linked = innermost(anchors, true, ca.0)
+        .iter()
+        .any(|&k| anchors[k].b.0 <= cb.0 && cb.0 < anchors[k].b.1);
+    if !linked {
+        return false;
+    }
+    // Whether every node of the item is before the call (`Some(true)`) or
+    // after it (`Some(false)`); `None` when it holds or straddles the call.
+    let before = |it: &Item, call: (usize, usize)| {
+        let r: Vec<(usize, usize)> = it.nodes.iter().map(cst::sig_range).collect();
+        if r.iter().all(|x| x.1 <= call.0) {
+            Some(true)
+        } else if r.iter().all(|x| x.0 >= call.1) {
+            Some(false)
+        } else {
+            None
+        }
+    };
+    pairs.iter().all(|&(i, j)| {
+        let (p, q) = (before(&ia[i], ca), before(&ib[j], cb));
+        p.is_some() && p == q
+    })
+}
+
+/// Whether a PostgreSQL statement sits in a DO block in PL/pgSQL.
+fn in_do(node: &SyntaxNode, d: Dialect) -> bool {
+    let plpgsql = |r: &SyntaxNode| {
+        let words: Vec<String> = cst::header_tokens(r)
+            .iter()
+            .map(|t| t.text().to_ascii_uppercase())
+            .collect();
+        match words.iter().position(|w| w == "LANGUAGE") {
+            Some(i) => words.get(i + 1).is_some_and(|l| l == "PLPGSQL"),
+            None => true,
+        }
+    };
+    d == Dialect::Postgres
+        && node.ancestors().any(|n| {
+            n.kind() == sqldiff_syntax::SyntaxKind::ROUTINE && lower::is_do(&n) && plpgsql(&n)
+        })
+}
+
+/// The statements of both sides and the pairs the comparison made of them.
+type Paired<'a> = ((&'a [Item], &'a [Item]), &'a [(usize, usize)]);
+
 /// Compares the procedure calls and object comments of both sides
-/// (`call.rs`), paired in order by what they call or comment on.
+/// (`call.rs`), paired in order by what they call or comment on; `paired`
+/// is the statements of both sides and the pairs the comparison made.
 #[allow(clippy::too_many_arguments)]
 fn calls(
     a: &Analyzed,
@@ -393,6 +455,8 @@ fn calls(
     ub: &Unit,
     sa: &Schema,
     sb: &Schema,
+    anchors: &[Anchor],
+    paired: Paired,
     out: &mut Outcome,
 ) {
     use sqldiff_syntax::Dialect;
@@ -516,7 +580,10 @@ fn calls(
                 );
                 continue;
             }
-        } else if at_a != at_b {
+        } else if at_a != at_b
+            && !(at_a.outside == at_b.outside
+                && same_place_paired(paired.0, paired.1, xn, yn, anchors))
+        {
             unknown(
                 out,
                 "it does not sit in the same place among the data statements".into(),
@@ -531,12 +598,14 @@ fn calls(
             unit: ua,
             schema: sa,
             name: &na,
+            in_do: in_do(xn, a.dialect()),
         };
         let side_b = call::Side {
             d: b.dialect(),
             unit: ub,
             schema: sb,
             name: &nb,
+            in_do: in_do(yn, b.dialect()),
         };
         let verdict = if t_is_a {
             call::compare((sx, &side_a), (sy, &side_b))
@@ -2809,7 +2878,7 @@ fn pair_items(
     anchors: &[Anchor],
     wit: Option<&Witnessing>,
     out: &mut Outcome,
-) {
+) -> Vec<(usize, usize)> {
     let ka: Vec<String> = ia.iter().map(|x| key(&x.term)).collect();
     let kb: Vec<String> = ib.iter().map(|x| key(&x.term)).collect();
     let Alignment {
@@ -2921,6 +2990,7 @@ fn pair_items(
             out,
         );
     }
+    pairs
 }
 
 /// One entry of a statement sequence in the IF and loop structure: a
