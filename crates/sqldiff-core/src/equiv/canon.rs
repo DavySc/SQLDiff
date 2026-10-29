@@ -2752,7 +2752,10 @@ impl<'a> Canon<'a> {
             // The key in hex: JSON keys are case-sensitive, whatever case
             // rules apply to names and atoms.
             let key: String = f.key.bytes().map(|b| format!("{b:02x}")).collect();
-            cols.push(n("jc", vec![a(name.clone()), a(format!("key:{key}")), a(mode), a(tag)]));
+            cols.push(n(
+                "jc",
+                vec![a(name.clone()), a(format!("key:{key}")), a(mode), a(tag)],
+            ));
             if derived.iter().any(|(c, _, _)| *c == name) {
                 return Err(format!("OPENJSON column `{name}` twice"));
             }

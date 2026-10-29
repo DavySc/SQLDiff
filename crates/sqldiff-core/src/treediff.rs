@@ -183,7 +183,11 @@ impl Ctx<'_, '_> {
         }
         // OPENJSON reads a column without a path from the key spelled like
         // the column, and JSON keys are case-sensitive.
-        let openjson = |u: &Unit| u.toks.iter().any(|t| t.loose.eq_ignore_ascii_case("OPENJSON"));
+        let openjson = |u: &Unit| {
+            u.toks
+                .iter()
+                .any(|t| t.loose.eq_ignore_ascii_case("OPENJSON"))
+        };
         if x.children.is_empty()
             && y.children.is_empty()
             && ((x.kind == StmtKind::Select && y.kind == StmtKind::Select)

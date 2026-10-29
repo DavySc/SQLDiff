@@ -191,7 +191,10 @@ fn names_stay_tied_to_their_keys() {
     assert!(!equal(&run_tsql(&a, &view("B int '$.x', A int '$.y'"))));
     assert!(equal(&run_tsql(&a, &view("A int '$.x', B int '$.y'"))));
     // Default paths read the column name as written: `$.Id` is not `$.ID`.
-    assert!(!equal(&run_tsql(&view("A int, B int"), &view("a int, B int"))));
+    assert!(!equal(&run_tsql(
+        &view("A int, B int"),
+        &view("a int, B int")
+    )));
     // Across dialects.
     let pg = |cols: &str| {
         format!(
