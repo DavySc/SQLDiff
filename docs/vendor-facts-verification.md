@@ -48,6 +48,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V26 | Db2 i CTE scoping and recursion | Unverified | Forward reference to a later CTE, and a recursive CTE without a column list: probes in `probes/db2i`. |
 | V27 | Db2 i labeled durations as the DATEADD rewrite | Unverified | Month-end clamping and warning 01506, TIME wrap-around, `CAST(… AS INTEGER)` truncation, BIGINT microsecond durations, the 9999 range error: probes `V27-*` in `probes/db2i`. |
 | V29 | Db2 i unique indexes, index names, sequence defaults | Unverified | NULLs, case and trailing blanks in a UNIQUE index; an index named like a table; the default type and first value of a sequence: probes `V29-*` in `probes/db2i`. |
+| V32 | Db2 i ORDER BY and FETCH FIRST below the outer query | Unverified | FETCH FIRST n ROWS ONLY and ORDER BY in a derived table, IN and scalar subquery, CTE (and INSERT … SELECT, view), and a NULL row count: probes `V32-*` in `probes/db2i`. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 

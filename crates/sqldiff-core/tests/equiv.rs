@@ -440,6 +440,76 @@ fn different_parameter_defaults_are_not_equal() {
 }
 
 #[test]
+fn a_row_count_that_may_be_null_is_an_assumption_across_dialects() {
+    // T-SQL raises Msg 1014 for TOP (NULL); PostgreSQL's LIMIT NULL returns
+    // every row (SQL Server 2022, PostgreSQL 18.6).
+    let ts = |ty: &str| {
+        format!(
+            "CREATE FUNCTION dbo.top_items (@take {ty}) RETURNS TABLE AS
+             RETURN SELECT TOP (@take) item_id FROM dbo.item ORDER BY item_id;"
+        )
+    };
+    let pg = |ty: &str| {
+        format!(
+            "CREATE FUNCTION top_items(p_take {ty}) RETURNS TABLE (item_id integer)
+             LANGUAGE sql AS $$ SELECT item_id FROM item ORDER BY item_id LIMIT p_take; $$;"
+        )
+    };
+    let r = run(&ts("int"), T, &pg("integer"), P, true);
+    assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions);
+    assert!(
+        assumption_ids(&r).contains(&"ASM-PAGE-COUNT-NOT-NULL"),
+        "{:?}",
+        assumption_ids(&r)
+    );
+    // Within one dialect NULL means the same.
+    let r = run(&pg("integer"), P, &pg("integer"), P, true);
+    assert!(!assumption_ids(&r).contains(&"ASM-PAGE-COUNT-NOT-NULL"));
+    let r = run(&ts("int"), T, &ts("int"), T, true);
+    assert!(!assumption_ids(&r).contains(&"ASM-PAGE-COUNT-NOT-NULL"));
+    // A fractional count is an error in T-SQL (Msg 1060), rounded in PostgreSQL.
+    let r = run(&ts("decimal(10,2)"), T, &pg("numeric(10,2)"), P, true);
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+    // Without ORDER BY any rows will do, which only a reading of the code can say.
+    let ts0 = "CREATE VIEW dbo.v AS SELECT TOP 5 item_id FROM dbo.item;";
+    let pg0 = "CREATE VIEW v AS SELECT item_id FROM item LIMIT 5;";
+    let r = run(ts0, T, pg0, P, true);
+    assert!(
+        assumption_ids(&r).contains(&"ASM-PAGE-UNORDERED"),
+        "{:?}",
+        assumption_ids(&r)
+    );
+    assert!(!assumption_ids(&r).contains(&"ASM-ORDER-TOTAL"));
+}
+
+#[test]
+fn exists_ignores_a_limit_of_one_row_or_more() {
+    let ts = |n: u32| {
+        format!(
+            "CREATE VIEW dbo.v AS SELECT customer_id FROM dbo.customer c
+             WHERE EXISTS (SELECT TOP {n} 1 FROM dbo.orders o WHERE o.customer_id = c.customer_id ORDER BY o.created_at);"
+        )
+    };
+    let pg = "CREATE VIEW v AS SELECT customer_id FROM customer c
+              WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id);";
+    let r = run(&ts(1), T, pg, P, true);
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.findings
+    );
+    assert!(!assumption_ids(&r).contains(&"ASM-PAGE-UNORDERED"));
+    // TOP 0 keeps no row: the EXISTS is false.
+    let r = run(&ts(0), T, pg, P, true);
+    assert!(not_equal(&r), "{:?}", r.verdict());
+}
+
+#[test]
 fn declared_initial_value_survives_zero_rows() {
     let ts = "CREATE FUNCTION dbo.f (@id int) RETURNS int AS
              BEGIN

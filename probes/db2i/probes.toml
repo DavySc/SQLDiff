@@ -2512,3 +2512,94 @@ outcome = [
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another value (in N1)." },
   { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "Rejected (SQLSTATE and SQLCODE recorded)." },
 ]
+
+# ---------------------------------------------------------------- V32 ORDER BY and FETCH FIRST below the outer query
+# T-SQL TOP inside a subquery, derived table, CTE or INSERT … SELECT becomes
+# FETCH FIRST n ROWS ONLY there, after that query's ORDER BY; a view keeps the
+# ORDER BY next to TOP 100 PERCENT. Each probe sums or counts what the limited
+# query keeps from 1, 2, 3.
+
+[[probe]]
+id = "V32-DERIVED"
+fact = "V32"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT SUM(K) FROM (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K DESC FETCH FIRST 2 ROWS ONLY) AS S'"]
+question = "A derived table with ORDER BY … DESC FETCH FIRST 2 ROWS ONLY over 1, 2, 3: is it accepted, and does it keep 3 and 2 (sum 5)?"
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+outcome = [
+  { label = "limited", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted here (SQLSTATE and SQLCODE recorded): the conversion must not put FETCH FIRST / ORDER BY in this place." },
+]
+
+[[probe]]
+id = "V32-IN"
+fact = "V32"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT SUM(K) FROM (VALUES (1), (2), (3)) AS Q (K) WHERE K IN (SELECT R FROM (VALUES (1), (2), (3)) AS P (R) ORDER BY R FETCH FIRST 2 ROWS ONLY)'"]
+question = "An IN subquery with ORDER BY FETCH FIRST 2 ROWS ONLY: does it keep 1 and 2 (sum 3)?"
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+outcome = [
+  { label = "limited", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted here (SQLSTATE and SQLCODE recorded): the conversion must not put FETCH FIRST / ORDER BY in this place." },
+]
+
+[[probe]]
+id = "V32-SCALAR"
+fact = "V32"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K DESC FETCH FIRST 1 ROWS ONLY) FROM SYSIBM.SYSDUMMY1'"]
+question = "A scalar subquery with ORDER BY … DESC FETCH FIRST 1 ROWS ONLY: is it accepted and 3?"
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+outcome = [
+  { label = "limited", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted here (SQLSTATE and SQLCODE recorded): the conversion must not put FETCH FIRST / ORDER BY in this place." },
+]
+
+[[probe]]
+id = "V32-CTE"
+fact = "V32"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'WITH C AS (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K DESC FETCH FIRST 2 ROWS ONLY) SELECT SUM(K) FROM C'"]
+question = "A common table expression with ORDER BY … DESC FETCH FIRST 2 ROWS ONLY: does it keep 3 and 2 (sum 5)?"
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+outcome = [
+  { label = "limited", when = { create = "00000", state = "00000", n1 = "=5" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted here (SQLSTATE and SQLCODE recorded): the conversion must not put FETCH FIRST / ORDER BY in this place." },
+]
+
+[[probe]]
+id = "V32-ORDER-ONLY"
+fact = "V32"
+role = "decisive"
+procedure = "V27_INT"
+args = ["'SELECT SUM(K) FROM (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K) AS S'"]
+question = "A derived table with ORDER BY and no FETCH FIRST (what TOP 100 PERCENT … ORDER BY leaves): is it accepted (sum 6)?"
+source = "SQLDiff converts T-SQL TOP inside a query to FETCH FIRST there (crates/sqldiff-convert/src/tsql/paging.rs); the IBM i fetch-clause page could not be read."
+outcome = [
+  { label = "accepted", when = { create = "00000", state = "00000", n1 = "=6" }, verdict = "consistent", meaning = "Accepted, and the limit applies to that query after its own ORDER BY." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Accepted with another result (in N1): the limit or the order is not applied there." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted here (SQLSTATE and SQLCODE recorded): the conversion must not put FETCH FIRST / ORDER BY in this place." },
+]
+
+[[probe]]
+id = "V32-NULL-COUNT"
+fact = "V32"
+role = "info"
+procedure = "V27_INT"
+args = ["'SELECT COUNT(*) FROM (SELECT K FROM (VALUES (1), (2), (3)) AS Q (K) ORDER BY K FETCH FIRST CAST(NULL AS INTEGER) ROWS ONLY) AS S'"]
+question = "FETCH FIRST with a NULL count: an error (as T-SQL TOP), every row (as PostgreSQL LIMIT NULL, N1 = 3), or no row?"
+source = "T-SQL raises Msg 1014 for TOP (NULL) and PostgreSQL returns every row (SQL Server 2022, PostgreSQL 18.6); the conversion carries ASM-PAGE-COUNT-NOT-NULL for a variable count."
+outcome = [
+  { label = "every row", when = { create = "00000", state = "00000", n1 = "=3" }, verdict = "open", meaning = "NULL means no limit, as PostgreSQL." },
+  { label = "no row", when = { create = "00000", state = "00000", n1 = "=0" }, verdict = "open", meaning = "NULL keeps no row." },
+  { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "An error, as T-SQL (or the expression is not accepted there; SQLSTATE recorded)." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another result (in N1)." },
+]

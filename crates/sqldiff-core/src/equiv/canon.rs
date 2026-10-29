@@ -80,6 +80,14 @@ pub mod asm {
         "ASM-ORDER-TOTAL",
         "The ORDER BY keys are unique, so both sides return the same rows in the same order",
     );
+    pub const PAGE_UNORDERED: (&str, &str) = (
+        "ASM-PAGE-UNORDERED",
+        "A row limit or offset without ORDER BY: which rows each side keeps is up to its engine, so any such rows will do",
+    );
+    pub const PAGE_COUNT_NOT_NULL: (&str, &str) = (
+        "ASM-PAGE-COUNT-NOT-NULL",
+        "The row count and offset of TOP / LIMIT / FETCH / OFFSET are never NULL: T-SQL raises an error for NULL (Msg 1014), PostgreSQL reads LIMIT NULL as no limit and OFFSET NULL as 0, and Db2 for i was not checked",
+    );
     pub const RESULT_TYPES: (&str, &str) = (
         "ASM-RESULT-TYPES",
         "Declared result column types hold the selected values without conversion",
@@ -2255,15 +2263,32 @@ impl<'a> Canon<'a> {
         };
         let order = self.order_terms(&s.order_by, None)?;
         let limit = match (&s.top, &s.limit) {
-            (Some(t), _) | (None, Some(t)) => Some(self.expr(t)?.0),
+            (Some(t), _) | (None, Some(t)) => Some(self.row_count(t)?),
             _ => None,
         };
         let offset = match &s.offset {
-            Some(o) => Some(self.expr(o)?.0),
+            Some(o) => Some(self.row_count(o)?),
             None => None,
         };
+        // EXISTS only asks whether a row qualifies: its ORDER BY and a limit
+        // of one row or more change nothing (`EXISTS (SELECT TOP 1 …)`).
+        let any_row = |l: &Term| {
+            l.is("num")
+                && l.kid(0)
+                    .and_then(Term::atom)
+                    .and_then(|x| x.parse::<u64>().ok())
+                    .is_some_and(|x| x >= 1)
+        };
+        let (order, limit) =
+            if ctx == QCtx::Exists && offset.is_none() && limit.as_ref().map_or(true, any_row) {
+                (Vec::new(), None)
+            } else {
+                (order, limit)
+            };
         let page = if limit.is_some() || offset.is_some() {
-            if !self.total_order(&from, &order) {
+            if order.is_empty() {
+                self.assume(asm::PAGE_UNORDERED);
+            } else if !self.total_order(&from, &order) {
                 self.assume(asm::ORDER_TOTAL);
             }
             n(
@@ -2302,6 +2327,24 @@ impl<'a> Canon<'a> {
     }
 
     /// The ORDER BY keys include a unique key of the only table in FROM.
+    /// A row count or offset. A literal is itself; anything else may be
+    /// NULL, which each dialect reads its own way (T-SQL raises an error,
+    /// PostgreSQL drops the limit), and a fractional count is an error in
+    /// T-SQL but rounded in PostgreSQL: `(count DIALECT int|? term)`, which
+    /// `compare` matches across dialects for integers only, under
+    /// `ASM-PAGE-COUNT-NOT-NULL`.
+    fn row_count(&mut self, e: &Expr) -> R<Term> {
+        let (t, ty) = self.expr(e)?;
+        if t.is("num") {
+            return Ok(t);
+        }
+        let int = ty.is_some_and(|ty| ty.fam == Fam::Int);
+        Ok(n(
+            "count",
+            vec![self.dtag(), a(if int { "int" } else { "?" }), t],
+        ))
+    }
+
     fn total_order(&mut self, from: &[Term], order: &[Term]) -> bool {
         let [f] = from else { return false };
         if !f.is("t") {
