@@ -519,3 +519,52 @@ fn comments_follow_the_tables_they_describe() {
         r.findings
     );
 }
+
+/// `diff` with a trace that links the two routines and the two calls only:
+/// the statements around the calls pair through the routines' anchor.
+fn traced(a: &str, b: &str, call: (&str, &str)) -> Report {
+    let span = |t: &str, s: &str| {
+        let at = t.find(s).unwrap();
+        (at, at + s.len())
+    };
+    let mut o = opts(CAT_T, CAT_P);
+    o.anchors = vec![
+        sqldiff_core::equiv::Anchor {
+            a: (0, a.len()),
+            b: (0, b.len()),
+        },
+        sqldiff_core::equiv::Anchor {
+            a: span(a, call.0),
+            b: span(b, call.1),
+        },
+    ];
+    run_with(a, b, &o)
+}
+
+#[test]
+fn a_traced_call_keeps_its_place_among_the_paired_statements() {
+    let call = (
+        "EXEC dbo.Touch '20200101', 1;",
+        "CALL Touch('20200101', 1);",
+    );
+    let place = |r: &Report| r.unknown_reasons.iter().any(|x| x.contains("same place"));
+    // A statement only one side has does not move the call.
+    let a = caller_t(&format!("SET @nm = @n;\n    {}", call.0));
+    let b = caller_p(&format!("v_nm := p_n;\n  v_newid := 0;\n  {}", call.1));
+    let r = traced(&a, &b, call);
+    assert!(!place(&r), "{:?}", r.unknown_reasons);
+    // A statement that pairs through the routines' anchor and sits on the
+    // other side of the call does.
+    let a = caller_t(&format!(
+        "UPDATE dbo.Things SET Qty = 1 WHERE Id = 1;\n    {}",
+        call.0
+    ));
+    let b = caller_p(&format!(
+        "{}\n  UPDATE Things SET Qty = 1 WHERE Id = 1;",
+        call.1
+    ));
+    let r = traced(&a, &b, call);
+    assert!(place(&r), "{:?}", r.unknown_reasons);
+    assert_ne!(r.verdict(), Verdict::Equal);
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions);
+}
