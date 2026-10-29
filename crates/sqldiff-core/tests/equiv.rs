@@ -419,6 +419,26 @@ fn with_update_from_reads_a_cte_as_a_derived_table() {
         ),
         "MAX vs MIN",
     );
+    // A derived table in a WHERE subquery with the same alias as a FROM one
+    // lends it no key (review of #168).
+    let shadow = |d: Dialect| {
+        let stmt = "UPDATE {t} SET unit_price = d.mp FROM {f}(SELECT item_id, unit_price AS mp FROM price_feed) AS d WHERE d.item_id = p.item_id AND EXISTS (SELECT 1 FROM (SELECT item_id FROM price_feed GROUP BY item_id) AS d WHERE d.item_id = 1)";
+        match d {
+            Dialect::Tsql => format!(
+                "CREATE PROCEDURE dbo.reprice AS BEGIN {}; END",
+                stmt.replace("{t}", "p")
+                    .replace("{f}", "dbo.item_price AS p, ")
+            ),
+            _ => format!(
+                "CREATE PROCEDURE reprice() LANGUAGE sql AS $$ {}; $$;",
+                stmt.replace("{t}", "item_price AS p").replace("{f}", "")
+            ),
+        }
+    };
+    not_ok(
+        run(&shadow(T), T, &shadow(P), P, true),
+        "alias reused in WHERE",
+    );
     // The CTE named outside FROM, and the target as a CTE, are not read.
     let sub = "CREATE PROCEDURE dbo.reprice AS BEGIN
          WITH r AS (SELECT item_id FROM price_feed GROUP BY item_id)
