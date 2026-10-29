@@ -56,6 +56,10 @@ pub mod asms {
         "ASM-PG-PARAMETER-TYPMOD",
         "Arguments and the values a procedure assigns to its OUTPUT parameters already have the parameter's declared length, precision and scale: PostgreSQL ignores them in a parameter's type (nothing is truncated, rounded or padded), T-SQL converts to them",
     );
+    pub const SWITCH: (&str, &str) = (
+        "ASM-TEMPORAL-SWITCH",
+        "The PostgreSQL triggers an ALTER TABLE enables or disables are the versioning triggers the converted CREATE TABLE made (the function that sets the period and copies history, its TRUNCATE trigger, the period-update guard). Not the same: SQL Server refuses DROP PERIOD while versioning is on and checks on ADD PERIOD that each row's period starts before it ends and on SYSTEM_VERSIONING = ON that the history table matches (with DATA_CONSISTENCY_CHECK = ON, also its rows); PostgreSQL checks none of that. Between SYSTEM_VERSIONING = OFF and DROP PERIOD, and between ADD PERIOD and SYSTEM_VERSIONING = ON, SQL Server still sets the period columns and refuses explicit values, PostgreSQL does not",
+    );
     pub const EXTPROP_COMMENT: (&str, &str) = (
         "ASM-EXTPROP-COMMENT",
         "Whoever reads the T-SQL extended property reads the PostgreSQL comment instead: the property name is not kept, and an object has one comment",
@@ -109,6 +113,7 @@ pub struct Comment {
 pub enum Stmt {
     Call(Call),
     Comment(Comment),
+    Switch(Switch),
 }
 
 fn name_of(t: &Tok) -> Option<Name> {
@@ -227,6 +232,9 @@ impl Target {
 
 /// Reads one call or comment statement.
 pub fn parse(ts: &[Tok], d: Dialect) -> R<Stmt> {
+    if is_switch(ts, d) {
+        return switch(ts, d).map(Stmt::Switch);
+    }
     match d {
         Dialect::Tsql => tsql(ts),
         Dialect::Postgres => match ts.first().map(|t| t.up.as_str()) {
@@ -583,6 +591,14 @@ pub fn pair_key(s: &Stmt, d: Dialect) -> R<String> {
                 o.to_lowercase()
             )
         }
+        Stmt::Switch(s) => {
+            let (s, o) = object_key(&s.table, d)?;
+            format!(
+                "versioning {}.{}",
+                s.unwrap_or_default().to_lowercase(),
+                o.to_lowercase()
+            )
+        }
         Stmt::Comment(c) => match &c.target {
             Target::Schema(s) => format!("comment schema {}", k(s)?),
             Target::Object(kind, s, o) => format!("comment {kind} {}.{}", schema(s)?, k(o)?),
@@ -654,8 +670,258 @@ pub fn compare(t: (&Stmt, &Side), p: (&Stmt, &Side)) -> Verdict {
             Ok(v) => v,
             Err(e) => Verdict::Unknown(e),
         },
-        _ => Verdict::Unknown("a call against a comment".into()),
+        (Stmt::Switch(x), Stmt::Switch(y)) => match switches(x, t.1, y, p.1) {
+            Ok(v) => v,
+            Err(e) => Verdict::Unknown(e),
+        },
+        _ => Verdict::Unknown("statements of different kinds".into()),
     }
+}
+
+// ---------------------------------------------------------------------
+// Versioning switches
+
+/// T-SQL `ALTER TABLE t SET (SYSTEM_VERSIONING = OFF | ON (…))` or `DROP |
+/// ADD PERIOD FOR SYSTEM_TIME`, PostgreSQL `ALTER TABLE t ENABLE | DISABLE
+/// TRIGGER x, …`.
+#[derive(Debug, Clone)]
+pub struct Switch {
+    pub table: Vec<Name>,
+    pub action: Action,
+}
+
+#[derive(Debug, Clone)]
+pub enum Action {
+    Off,
+    /// The history table.
+    On(Vec<Name>),
+    DropPeriod,
+    /// Start and end columns.
+    AddPeriod(Name, Name),
+    /// PostgreSQL: (enable, trigger) in order.
+    Triggers(Vec<(bool, Name)>),
+}
+
+/// Whether an ALTER TABLE statement is one `switch` reads.
+pub fn is_switch(ts: &[Tok], d: Dialect) -> bool {
+    word(ts.first(), "ALTER")
+        && word(ts.get(1), "TABLE")
+        && match d {
+            Dialect::Tsql => ts
+                .iter()
+                .any(|t| word(Some(t), "SYSTEM_VERSIONING") || word(Some(t), "SYSTEM_TIME")),
+            Dialect::Postgres => ts.windows(2).any(|w| {
+                (word(Some(&w[0]), "ENABLE") || word(Some(&w[0]), "DISABLE"))
+                    && word(Some(&w[1]), "TRIGGER")
+            }),
+            Dialect::Db2i => false,
+        }
+}
+
+fn switch(ts: &[Tok], d: Dialect) -> R<Switch> {
+    let ts = match ts.last() {
+        Some(t) if t.kind == K::Semi => &ts[..ts.len() - 1],
+        _ => ts,
+    };
+    let (table, i) = dotted(ts, 2)?;
+    let rest = &ts[i..];
+    let w = |k: usize, x: &str| word(rest.get(k), x);
+    let kind = |k: usize, x: K| rest.get(k).is_some_and(|t| t.kind == x);
+    let op = |k: usize, x: &str| rest.get(k).is_some_and(|t| t.text == x);
+    let period = w(1, "PERIOD") && w(2, "FOR") && w(3, "SYSTEM_TIME");
+    let name = |k: usize| rest.get(k).and_then(name_of);
+    let action = match d {
+        Dialect::Tsql if w(0, "DROP") && period && rest.len() == 4 => Action::DropPeriod,
+        Dialect::Tsql if w(0, "ADD") && period && rest.len() == 9 => match (name(5), name(7)) {
+            (Some(a), Some(b)) if kind(4, K::LParen) && kind(6, K::Comma) && kind(8, K::RParen) => {
+                Action::AddPeriod(a, b)
+            }
+            _ => return Err("ADD PERIOD FOR SYSTEM_TIME: unexpected form".into()),
+        },
+        Dialect::Tsql
+            if w(0, "SET")
+                && kind(1, K::LParen)
+                && w(2, "SYSTEM_VERSIONING")
+                && op(3, "=")
+                && rest.last().is_some_and(|t| t.kind == K::RParen) =>
+        {
+            if w(4, "OFF") && rest.len() == 6 {
+                Action::Off
+            } else if w(4, "ON")
+                && kind(5, K::LParen)
+                && rest.len() > 7
+                && kind(rest.len() - 2, K::RParen)
+            {
+                let mut history = None;
+                for o in split(&rest[6..rest.len() - 2]) {
+                    let ow = |k: usize, x: &str| word(o.get(k), x);
+                    let eq = o.get(1).is_some_and(|t| t.text == "=");
+                    if ow(0, "HISTORY_TABLE") && eq {
+                        let (h, j) = dotted(o, 2)?;
+                        if j != o.len() {
+                            return Err("HISTORY_TABLE: unexpected form".into());
+                        }
+                        history = Some(h);
+                    } else {
+                        // Checks the history table when versioning starts,
+                        // and keeps history forever: nothing PostgreSQL does.
+                        let checks =
+                            ow(0, "DATA_CONSISTENCY_CHECK") && (ow(2, "ON") || ow(2, "OFF"));
+                        let keeps = ow(0, "HISTORY_RETENTION_PERIOD") && ow(2, "INFINITE");
+                        if !(eq && o.len() == 3 && (checks || keeps)) {
+                            return Err(
+                                "a SYSTEM_VERSIONING option the engine does not read".into()
+                            );
+                        }
+                    }
+                }
+                Action::On(history.ok_or("SYSTEM_VERSIONING = ON without HISTORY_TABLE")?)
+            } else {
+                return Err("SYSTEM_VERSIONING: unexpected form".into());
+            }
+        }
+        Dialect::Postgres => {
+            let mut out = Vec::new();
+            for part in split(rest) {
+                let on = match part {
+                    [e, t, n] if word(Some(t), "TRIGGER") && word(Some(e), "ENABLE") => (true, n),
+                    [e, t, n] if word(Some(t), "TRIGGER") && word(Some(e), "DISABLE") => (false, n),
+                    _ => {
+                        return Err(
+                            "an ALTER TABLE action other than ENABLE | DISABLE TRIGGER name".into(),
+                        )
+                    }
+                };
+                if word(Some(on.1), "ALL") || word(Some(on.1), "USER") {
+                    return Err("ENABLE | DISABLE TRIGGER ALL | USER".into());
+                }
+                out.push((on.0, name_of(on.1).ok_or("a trigger name was expected")?));
+            }
+            Action::Triggers(out)
+        }
+        _ => return Err("an ALTER TABLE form the engine does not read".into()),
+    };
+    Ok(Switch { table, action })
+}
+
+/// The T-SQL switch against the PostgreSQL triggers. The T-SQL catalog must
+/// show the table system-versioned with the period and history table the
+/// statement names; the PostgreSQL statement must switch exactly the
+/// triggers the converted CREATE TABLE names after the table
+/// (`<table>_versioning`, `<table>_versioning_truncate`,
+/// `<table>_period_update`) on the same table.
+fn switches(x: &Switch, t: &Side, y: &Switch, p: &Side) -> R<Verdict> {
+    let tv = t.schema.catalog().ok_or_else(|| {
+        format!(
+            "{} has no catalog, so the table's versioning is not known",
+            t.name
+        )
+    })?;
+    let shown = |n: &[Name]| {
+        n.iter()
+            .map(|x| x.text.clone())
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let parts: Vec<Ident> = x.table.iter().map(ident).collect();
+    let Lookup::Found(table) = tv.table(&parts) else {
+        return Err(format!(
+            "{}'s catalog has no table {}",
+            t.name,
+            shown(&x.table)
+        ));
+    };
+    let v = table.versioning.as_ref().ok_or_else(|| {
+        format!(
+            "{}'s catalog does not show {} created with PERIOD FOR SYSTEM_TIME and SYSTEM_VERSIONING = ON",
+            t.name,
+            shown(&x.table)
+        )
+    })?;
+    let pv = p
+        .schema
+        .catalog()
+        .ok_or_else(|| format!("{} has no catalog", p.name))?;
+    let pparts: Vec<Ident> = y.table.iter().map(ident).collect();
+    match pv.table(&pparts) {
+        Lookup::Found(pt) if pt.kind == catalog::TableKind::Table => {}
+        _ => {
+            return Err(format!(
+                "{}'s catalog has no table {}",
+                p.name,
+                shown(&y.table)
+            ))
+        }
+    }
+    case_check(&y.table, p)?;
+    let last = y.table.last().ok_or("a table name was expected")?;
+    let trigger = |suffix: &str| {
+        key(
+            &Name {
+                text: format!("{}{suffix}", last.text),
+                quoted: last.quoted,
+            },
+            Dialect::Postgres,
+        )
+    };
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let strip = |n: Vec<String>| -> Vec<String> {
+        let mut n: Vec<String> = n.into_iter().map(|s| s.to_lowercase()).collect();
+        if n.len() == 2 && n[0] == "dbo" {
+            n.remove(0);
+        }
+        n
+    };
+    let want: Vec<(bool, String)> = match &x.action {
+        Action::Off => vec![
+            (false, trigger("_versioning")?),
+            (false, trigger("_versioning_truncate")?),
+        ],
+        Action::On(h) => {
+            let named = strip(h.iter().map(|n| n.text.clone()).collect());
+            if v.history.clone().map(strip) != Some(named) {
+                return Err(format!(
+                    "HISTORY_TABLE = {} is not the history table {} was created with",
+                    shown(h),
+                    shown(&x.table)
+                ));
+            }
+            vec![
+                (true, trigger("_versioning")?),
+                (true, trigger("_versioning_truncate")?),
+            ]
+        }
+        Action::DropPeriod => vec![(false, trigger("_period_update")?)],
+        Action::AddPeriod(a, b) => {
+            if !(same(&a.text, &v.start) && same(&b.text, &v.end)) {
+                return Err(format!(
+                    "the period ({}, {}) is not the one {} was created with",
+                    a.text,
+                    b.text,
+                    shown(&x.table)
+                ));
+            }
+            vec![(true, trigger("_period_update")?)]
+        }
+        Action::Triggers(_) => return Err("two PostgreSQL statements".into()),
+    };
+    let Action::Triggers(got) = &y.action else {
+        return Err("the PostgreSQL statement does not switch triggers".into());
+    };
+    let got: Vec<(bool, String)> = got
+        .iter()
+        .map(|(e, n)| key(n, Dialect::Postgres).map(|k| (*e, k)))
+        .collect::<R<_>>()?;
+    if got != want {
+        return Err(format!(
+            "the PostgreSQL statement switches other triggers than the converted table's {}",
+            want.iter()
+                .map(|w| w.1.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    Ok(Verdict::Equal(vec![asm::make(asms::SWITCH)]))
 }
 
 // ---------------------------------------------------------------------

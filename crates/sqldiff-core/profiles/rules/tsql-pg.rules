@@ -31,9 +31,10 @@
   (doc "LEN ignores trailing spaces.")
   (form tsql (call len ?a))
   (form postgres (call length (call rtrim ?a)))
+  (assume tsql ASM-TSQL-LEN-BMP "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)")
   (example (tsql "SELECT LEN(last_name) AS n FROM dbo.customer;")
            (postgres "SELECT length(rtrim(last_name)) AS n FROM customer;")
-           (expect unknown)))
+           (expect equal-under-assumptions)))
 
 (translate charindex/strpos
   (form tsql (call charindex ?needle ?hay))

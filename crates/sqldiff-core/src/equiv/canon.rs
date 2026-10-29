@@ -28,6 +28,18 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 
 /// Assumption identifiers and texts used by the equivalence rules.
 pub mod asm {
+    pub const LEN_BMP: (&str, &str) = (
+        "ASM-TSQL-LEN-BMP",
+        "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
+    );
+    pub const DATEFIRST_7: (&str, &str) = (
+        "ASM-TSQL-DATEFIRST-7",
+        "The T-SQL session keeps SET DATEFIRST 7 (the us_english default): DATEPART(weekday) counts Sunday as 1",
+    );
+    pub const SAME_DATABASE_NAME: (&str, &str) = (
+        "ASM-SAME-DATABASE-NAME",
+        "The PostgreSQL database has the same name, letter for letter, as the SQL Server database",
+    );
     pub const TSQL_CI: (&str, &str) = (
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
@@ -36,7 +48,7 @@ pub mod asm {
     /// case-sensitive one is kept, and flagged with this per statement.
     pub const CI_COLLATION: (&str, &str) = (
         "ASM-CI-COLLATION",
-        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+        "String equality and LIKE give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar), and no value LIKE tests has trailing spaces or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -53,6 +65,10 @@ pub mod asm {
     pub const UNTYPED_CAST: (&str, &str) = (
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
+    );
+    pub const PERIOD_WRITE: (&str, &str) = (
+        "ASM-TEMPORAL-PERIOD-WRITE",
+        "The statement gives a period column of a system-versioned table a value: assumes the code runs while versioning is off and the period dropped (SYSTEM_VERSIONING = OFF, DROP PERIOD FOR SYSTEM_TIME; in PostgreSQL the converted versioning triggers disabled), as data loads do, so both sides store the value as given. While versioning is on, both sides refuse the statement; while only the period remains, SQL Server refuses it and PostgreSQL stores the value",
     );
     pub const UNTYPED_STORE: (&str, &str) = (
         "ASM-UNTYPED-STORE",
@@ -208,6 +224,10 @@ struct Binding {
     table: String,
     /// Derived single-row sources: column → value.
     derived: Option<Vec<(String, Term, Option<Ty>)>>,
+    /// A derived table's unique key: the GROUP BY columns its query
+    /// returns (`ast::group_key`), folded. Kept with the binding, as a
+    /// subquery elsewhere in the statement may reuse the alias.
+    unique: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -479,6 +499,7 @@ impl<'a> Canon<'a> {
                 .unwrap_or_else(|| lc(parts.last().map(String::as_str).unwrap_or(""))),
             table: canon,
             derived: None,
+            unique: None,
         }
     }
 
@@ -515,19 +536,79 @@ impl<'a> Canon<'a> {
     }
 
     /// A statement writes `col`: refused for a column the database computes
-    /// (period, computed, GENERATED ALWAYS), whose explicit values one side
-    /// rejects or replaces depending on settings and triggers the statement
-    /// does not show.
-    fn written(&self, table: &str, col: &str) -> R<()> {
-        let generated = self
+    /// (computed, GENERATED ALWAYS), whose explicit values one side rejects
+    /// or replaces depending on settings and triggers the statement does not
+    /// show. A period column of a system-versioned table is the exception:
+    /// code writes it only with the period dropped, a state the statement
+    /// does not show either, so that is an assumption.
+    fn written(&mut self, table: &str, col: &str) -> R<()> {
+        let (generated, period) = self
             .schema
             .table(Self::base_table(table))
             .and_then(|t| t.column(col))
-            .is_some_and(|c| c.generated);
-        if generated {
+            .map_or((false, false), |c| (c.generated, c.period));
+        if period {
+            self.assume(asm::PERIOD_WRITE);
+        } else if generated {
             return Err(format!("writes the generated column {col}"));
         }
         Ok(())
+    }
+
+    /// An INSERT that leaves out a period column, in code that drops the
+    /// table's period (it switches the versioning or writes a period
+    /// column): with the period dropped, SQL Server takes the column's
+    /// default or fails on NOT NULL, while PostgreSQL, its versioning
+    /// triggers disabled, stores the converted default `-infinity`.
+    fn period_omitted(&self, table: &str, cols: &[String]) -> R<()> {
+        let Some(t) = self.schema.table(Self::base_table(table)) else {
+            return Ok(());
+        };
+        let missing: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period && !cols.contains(&c.name))
+            .map(|c| c.name.as_str())
+            .collect();
+        if missing.is_empty() || !self.drops_period(t) {
+            return Ok(());
+        }
+        Err(format!(
+            "the INSERT leaves out the period column {} of a table whose period this code drops or writes: with the period dropped SQL Server takes the column's default or fails, PostgreSQL stores '-infinity'",
+            missing.join(", ")
+        ))
+    }
+
+    /// Whether the unit switches `t`'s versioning, or writes (or may write:
+    /// a data statement naming the column) one of its period columns.
+    fn drops_period(&self, t: &super::schema::Table) -> bool {
+        let switched = self.unit.calls.iter().any(|(node, _)| {
+            matches!(
+                super::call::parse(&super::ast::tokens(node), self.d),
+                Ok(super::call::Stmt::Switch(s))
+                    if s.table.last().is_some_and(|n| n.text.eq_ignore_ascii_case(&t.name))
+            )
+        });
+        let period: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period)
+            .map(|c| c.name.as_str())
+            .collect();
+        switched
+            || self.unit.stmts.iter().any(|s| {
+                s.toks
+                    .first()
+                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
+                    && s.toks.iter().any(|x| {
+                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
+                            && period.contains(
+                                &sqldiff_syntax::ast::unquote(&x.text)
+                                    .to_lowercase()
+                                    .as_str(),
+                            )
+                    })
+            })
     }
 
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
@@ -1075,13 +1156,26 @@ impl<'a> Canon<'a> {
                 (n("between", kids), None)
             }
             Expr::Like(x, p, neg, ci) => {
-                let x = self.expr(x)?.0;
+                let (x, ty) = self.expr(x)?;
+                // A varchar value against a literal pattern without `[` or
+                // `\` differs across dialects only by the collation
+                // (`coll-like`): case, trailing spaces of the value (T-SQL
+                // varchar drops them) and characters the collation expands
+                // (checked on SQL Server 2022). T-SQL `[...]` is a character
+                // class and PostgreSQL's `\` an escape; a char value is
+                // blank-padded on one side only.
+                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
                 let p = self.expr(p)?.0;
-                // Case sensitivity and trailing blanks of LIKE differ per dialect.
+                let coll = if plain {
+                    n("coll-like", vec![self.dtag()])
+                } else {
+                    self.dtag()
+                };
                 (
                     n(
                         "like",
-                        vec![self.dtag(), x, p, a(neg.to_string()), a(ci.to_string())],
+                        vec![coll, x, p, a(neg.to_string()), a(ci.to_string())],
                     ),
                     None,
                 )
@@ -1121,6 +1215,33 @@ impl<'a> Canon<'a> {
                                 ),
                                 Some(dst),
                             ))
+                        }
+                    }
+                }
+                // EXTRACT(part FROM x)::int is DATEPART's integer; for
+                // seconds only once floor or trunc drops the fraction
+                // (::int rounds 59.9 to 60).
+                if self.d == Dialect::Postgres && dst.fam == Fam::Int && dst.len == Some(32) {
+                    let inner = match x.as_ref() {
+                        Expr::Extract(f, y) if !f.eq_ignore_ascii_case("second") => Some((f, y)),
+                        Expr::Call(c)
+                            if c.name.len() == 1
+                                && matches!(lc(&c.name[0]).as_str(), "floor" | "trunc")
+                                && c.args.len() == 1 =>
+                        {
+                            match &c.args[0] {
+                                Expr::Extract(f, y) if f.eq_ignore_ascii_case("second") => {
+                                    Some((f, y))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((f, y)) = inner {
+                        let v = self.expr(y)?;
+                        if let Some(t) = self.datepart(&lc(f), v) {
+                            return Ok(t);
                         }
                     }
                 }
@@ -1598,6 +1719,39 @@ impl<'a> Canon<'a> {
                     return self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty));
                 }
             }
+            // CONVERT(varchar(n), x, style) of a date or date-time: the text
+            // to_char prints with the matching format.
+            (Dialect::Tsql, "convert") if argc == 3 && plain => {
+                if let Some(t) = self.tsql_convert_style(c)? {
+                    return Ok(t);
+                }
+            }
+            (Dialect::Tsql, "datepart") if argc == 2 && plain => {
+                let part = match &c.args[0] {
+                    Expr::Name(p) if p.len() == 1 => tsql_datepart(&p[0]),
+                    _ => None,
+                };
+                if let Some(part) = part {
+                    let x = self.expr(&c.args[1])?;
+                    if part == "weekday" {
+                        // Sunday is 1 under DATEFIRST 7: EXTRACT(DOW) + 1.
+                        if let Some(dow) = self.datepart("dow", x) {
+                            self.assume(asm::DATEFIRST_7);
+                            let mut v = vec![dow.0, n("num", vec![a("1")])];
+                            v.sort();
+                            return Ok((n("add", v), dow.1));
+                        }
+                    } else if let Some(t) = self.datepart(part, x) {
+                        return Ok(t);
+                    }
+                }
+            }
+            (Dialect::Tsql, "year" | "month" | "day") if argc == 1 && plain => {
+                let x = self.expr(&c.args[0])?;
+                if let Some(t) = self.datepart(&name, x) {
+                    return Ok(t);
+                }
+            }
             // IIF is shorthand for this CASE; SQL Server rewrites it so.
             (Dialect::Tsql, "iif") if argc == 3 && plain => {
                 let [c0, x, y] = [0, 1, 2].map(|k| c.args[k].clone());
@@ -1675,6 +1829,160 @@ impl<'a> Canon<'a> {
                         ),
                         first_ty,
                     )
+                }
+            }
+            // LEN counts characters without trailing spaces: PostgreSQL's
+            // length(rtrim(x)) (rtrim removes only spaces, as LEN ignores
+            // only spaces). T-SQL counts UTF-16 code units.
+            (Dialect::Tsql, "len", 1) if first_ty.is_some_and(|t| t.is_string()) => {
+                self.assume(asm::LEN_BMP);
+                let bits = if first_ty.and_then(|t| t.len).is_some() {
+                    32
+                } else {
+                    64
+                };
+                let (x, _) = args.into_iter().next().unwrap();
+                (
+                    n("strlen", vec![x]),
+                    Some(Ty {
+                        fam: Fam::Int,
+                        len: Some(bits),
+                        scale: None,
+                    }),
+                )
+            }
+            (Dialect::Postgres, "length", 1)
+                if matches!(&c.args[0], Expr::Call(r) if r.name.len() == 1
+                    && r.name[0].eq_ignore_ascii_case("rtrim")
+                    && r.args.len() == 1 && !r.distinct && !r.star && r.order.is_empty()) =>
+            {
+                let Expr::Call(r) = &c.args[0] else {
+                    unreachable!()
+                };
+                let (x, ty) = self.expr(&r.args[0])?;
+                if ty.is_some_and(|t| t.is_string()) {
+                    (
+                        n("strlen", vec![x]),
+                        Some(Ty {
+                            fam: Fam::Int,
+                            len: Some(32),
+                            scale: None,
+                        }),
+                    )
+                } else {
+                    (
+                        n("dfn", vec![self.dtag(), a("length"), args[0].0.clone()]),
+                        None,
+                    )
+                }
+            }
+            // REPLICATE and repeat agree for a count that is a literal from 0
+            // up (a negative count is NULL in T-SQL, '' in PostgreSQL) while
+            // the result stays within 4,000 characters of a known length
+            // (T-SQL cuts a non-MAX result at 8,000 bytes).
+            // Only varchar: PostgreSQL strips a char value's padding before
+            // repeat, T-SQL repeats it.
+            (Dialect::Tsql, "replicate", 2) | (Dialect::Postgres, "repeat", 2)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar) =>
+            {
+                let count = match &c.args[1] {
+                    Expr::Num(v) => v.parse::<u32>().ok(),
+                    _ => None,
+                };
+                let len = first_ty.and_then(|t| t.len);
+                let fits = match (d, count, len) {
+                    (_, None, _) => false,
+                    (Dialect::Tsql, Some(k), Some(l)) => l.saturating_mul(k) <= 4000,
+                    // No known length: possibly a non-MAX value cut at
+                    // 8,000 bytes (DB_NAME() is nvarchar(128)), so unknown.
+                    (Dialect::Tsql, Some(_), None) => false,
+                    (_, Some(_), _) => true,
+                };
+                if fits {
+                    let k = count.unwrap();
+                    let ty = Ty {
+                        fam: Fam::VarChar,
+                        len: len.map(|l| l.saturating_mul(k)),
+                        scale: None,
+                    };
+                    let x = args[0].0.clone();
+                    (
+                        n("repeat", vec![x, n("num", vec![a(k.to_string())])]),
+                        Some(ty),
+                    )
+                } else {
+                    (
+                        n(
+                            "dfn",
+                            std::iter::once(self.dtag())
+                                .chain(std::iter::once(a(name.clone())))
+                                .chain(args.into_iter().map(|x| x.0))
+                                .collect(),
+                        ),
+                        None,
+                    )
+                }
+            }
+            // A literal code point from 1 to 127 is the same one-character
+            // string in every code page, in UTF-16 and in UTF-8.
+            (Dialect::Tsql, "char" | "nchar", 1) | (Dialect::Postgres, "chr", 1)
+                if ascii_code(&c.args[0]).is_some() =>
+            {
+                let ch = ascii_code(&c.args[0]).unwrap() as char;
+                (
+                    n("str", vec![a(ch.to_string())]),
+                    Some(Ty {
+                        fam: Fam::VarChar,
+                        len: Some(1),
+                        scale: None,
+                    }),
+                )
+            }
+            (Dialect::Tsql, "db_name", 0) | (Dialect::Postgres, "current_database", 0) => {
+                if d == Dialect::Tsql {
+                    self.assume(asm::SAME_DATABASE_NAME);
+                }
+                (n("dbname", vec![]), Some(Ty::of(Fam::VarChar)))
+            }
+            (Dialect::Postgres, "to_char", 2) => {
+                let fmt = match &c.args[1] {
+                    Expr::Str(f) => Some(f.as_str()),
+                    _ => None,
+                };
+                let date_only = match first_ty.map(|t| t.fam) {
+                    Some(Fam::Date) => Some(true),
+                    Some(Fam::Timestamp) => Some(false),
+                    _ => None,
+                };
+                match (fmt, date_only) {
+                    // Only the formats a T-SQL style prints, of the input
+                    // types it prints them for.
+                    (Some(f), Some(dt))
+                        if STYLES.iter().any(|&(st, fm, _)| {
+                            fm == f && style_format(dt, st).is_some_and(|x| x.0 == f)
+                        }) =>
+                    {
+                        let width = STYLES.iter().find(|x| x.1 == f).map(|x| x.2);
+                        let x = args[0].0.clone();
+                        (
+                            n("datefmt", vec![a(f), x]),
+                            Some(Ty {
+                                fam: Fam::VarChar,
+                                len: width,
+                                scale: None,
+                            }),
+                        )
+                    }
+                    _ => (
+                        n(
+                            "dfn",
+                            std::iter::once(self.dtag())
+                                .chain(std::iter::once(a(name.clone())))
+                                .chain(args.into_iter().map(|x| x.0))
+                                .collect(),
+                        ),
+                        None,
+                    ),
                 }
             }
             (_, "upper" | "ucase", 1) => portable("upper", args, first_ty),
@@ -1772,6 +2080,82 @@ impl<'a> Canon<'a> {
                 )
             }
         })
+    }
+
+    /// A date part as an integer: `year`, `month`, `day`, `hour`,
+    /// `minute`, `second` (truncated) or `dow` (Sunday 0), of a date,
+    /// timestamp (without time zone) or time where both dialects define it.
+    fn datepart(&mut self, part: &str, x: (Term, Option<Ty>)) -> Option<(Term, Option<Ty>)> {
+        let fam = x.1?.fam;
+        let ok = match part {
+            "year" | "month" | "day" | "dow" => matches!(fam, Fam::Date | Fam::Timestamp),
+            "hour" | "minute" | "second" => matches!(fam, Fam::Timestamp | Fam::Time),
+            _ => false,
+        };
+        ok.then(|| {
+            (
+                n("datepart", vec![a(part), x.0]),
+                Some(Ty {
+                    fam: Fam::Int,
+                    len: Some(32),
+                    scale: None,
+                }),
+            )
+        })
+    }
+
+    /// T-SQL CONVERT(varchar(n) / nvarchar(n), x, style) of a date or
+    /// date-time `x`, for the styles `style_format` knows.
+    fn tsql_convert_style(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
+        let ty = match &c.args[0] {
+            Expr::Name(p) if p.len() == 1 => (p[0].to_uppercase(), Some(30)),
+            Expr::Call(t) if t.name.len() == 1 && t.args.len() == 1 => {
+                let len = match &t.args[0] {
+                    Expr::Num(v) => match v.parse::<u32>() {
+                        Ok(n) if n > 0 => Some(n),
+                        _ => return Ok(None),
+                    },
+                    Expr::Name(m) if m.len() == 1 && m[0].eq_ignore_ascii_case("max") => None,
+                    _ => return Ok(None),
+                };
+                (t.name[0].to_uppercase(), len)
+            }
+            _ => return Ok(None),
+        };
+        if !matches!(ty.0.as_str(), "VARCHAR" | "NVARCHAR") {
+            return Ok(None);
+        }
+        let style = match &c.args[2] {
+            Expr::Num(v) => v.parse::<u32>().ok(),
+            _ => None,
+        };
+        let x = self.expr(&c.args[1])?;
+        let date_only = match x.1.map(|t| t.fam) {
+            Some(Fam::Date) => true,
+            Some(Fam::Timestamp) => false,
+            _ => return Ok(None),
+        };
+        let Some((fmt, width)) = style.and_then(|st| style_format(date_only, st)) else {
+            return Ok(None);
+        };
+        let v = (
+            n("datefmt", vec![a(fmt), x.0]),
+            Some(Ty {
+                fam: Fam::VarChar,
+                len: Some(width),
+                scale: None,
+            }),
+        );
+        // A target that holds the whole text changes nothing.
+        if ty.1.map_or(true, |n| n >= width) {
+            return Ok(Some(v));
+        }
+        let dst = Ty {
+            fam: Fam::VarChar,
+            len: ty.1,
+            scale: None,
+        };
+        Ok(Some(self.cast(dst, v)))
     }
 
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
@@ -2370,6 +2754,8 @@ impl<'a> Canon<'a> {
                         self.sub_bits.insert(format!("sub:{key}"), bits);
                     }
                 }
+                let unique = sqldiff_syntax::abstract_syntax::group_key(query)
+                    .map(|k| k.iter().map(|c| lc(c)).collect());
                 let item_terms: Vec<Term> = items.into_iter().map(|x| x.0).collect();
                 parts.insert(1, n("items", item_terms));
                 let q = (n("q", parts), None::<Ty>);
@@ -2377,6 +2763,7 @@ impl<'a> Canon<'a> {
                     key: key.clone(),
                     table: format!("sub:{key}"),
                     derived: None,
+                    unique,
                 });
                 Ok(n("sub", vec![q.0]))
             }
@@ -3096,6 +3483,7 @@ impl<'a> Canon<'a> {
                 Ok(n("insertn", vec![a(table), n("rows", sets)]))
             }
             InsertSource::Query(q) => {
+                self.period_omitted(table, cols)?;
                 let (parts, items) = self.query_parts(q, QCtx::Scalar)?;
                 if items.len() != cols.len() {
                     return Err("INSERT column count does not match the query".into());
@@ -3114,7 +3502,10 @@ impl<'a> Canon<'a> {
                 kv.sort();
                 Ok(n("insertq", vec![a(table), n("set", kv), n("q", parts)]))
             }
-            InsertSource::Default => Ok(n("insertdefault", vec![a(table)])),
+            InsertSource::Default => {
+                self.period_omitted(table, &[])?;
+                Ok(n("insertdefault", vec![a(table)]))
+            }
         }
     }
 
@@ -3124,6 +3515,7 @@ impl<'a> Canon<'a> {
         cols: &[String],
         row: &[Expr],
     ) -> R<Vec<(String, Term, Option<Ty>)>> {
+        self.period_omitted(table, cols)?;
         if row.len() != cols.len() {
             return Err("INSERT column count does not match VALUES".into());
         }
@@ -3152,6 +3544,7 @@ impl<'a> Canon<'a> {
             key: table.to_string(),
             table: table.to_string(),
             derived: None,
+            unique: None,
         }]);
         let items: R<Vec<Term>> = returning
             .iter()
@@ -3233,6 +3626,7 @@ impl<'a> Canon<'a> {
             key: table.to_string(),
             table: table.to_string(),
             derived: None,
+            unique: None,
         }]);
         let upd: R<Vec<Term>> = sets
             .iter()
@@ -3343,6 +3737,7 @@ impl<'a> Canon<'a> {
                 .unwrap_or_else(|| table.clone()),
             table: table.clone(),
             derived: None,
+            unique: None,
         };
         self.scopes.push(vec![
             tb,
@@ -3350,6 +3745,7 @@ impl<'a> Canon<'a> {
                 key: src_key,
                 table: "merge:source".into(),
                 derived: Some(src),
+                unique: None,
             },
         ]);
         let r = self.merge_inner(&table, hints, on, whens);
@@ -3563,6 +3959,18 @@ impl<'a> Canon<'a> {
             let table = b.table.clone();
             self.scopes.last_mut().unwrap().push(b);
             let from_t = self.push_from(&others)?;
+            // The derived tables of FROM, in order, with their keys as bound
+            // (WHERE's subqueries may reuse an alias).
+            let subs: Vec<(String, Option<Vec<String>>)> = self
+                .scopes
+                .last()
+                .map(|s| {
+                    s.iter()
+                        .filter(|b| b.table.starts_with("sub:"))
+                        .map(|b| (b.table.clone(), b.unique.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let w = match conds
                 .into_iter()
                 .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)))
@@ -3570,7 +3978,7 @@ impl<'a> Canon<'a> {
                 Some(w) => self.cond(&w)?.0,
                 None => a("-"),
             };
-            self.unique_match(&table, &from_t, &w)?;
+            self.unique_match(&table, &from_t, &subs, &w)?;
             let kv = self.update_sets(&table, sets)?;
             Ok(n(
                 "update-from",
@@ -3588,7 +3996,13 @@ impl<'a> Canon<'a> {
     /// LEFT JOIN, else in WHERE or any inner join's ON condition. String keys
     /// count only under the dialect's own comparison, which its unique keys
     /// follow.
-    fn unique_match(&mut self, target: &str, from: &[Term], w: &Term) -> R<()> {
+    fn unique_match(
+        &mut self,
+        target: &str,
+        from: &[Term],
+        subs: &[(String, Option<Vec<String>>)],
+        w: &Term,
+    ) -> R<()> {
         fn conj(t: &Term) -> Vec<Term> {
             if t.is("and") {
                 t.kids().to_vec()
@@ -3598,14 +4012,28 @@ impl<'a> Canon<'a> {
                 vec![t.clone()]
             }
         }
-        // (table, own ON condition of a LEFT JOIN)
-        fn leaves(t: &Term, out: &mut Vec<(String, Option<Term>)>, all: &mut Vec<Term>) -> bool {
+        // (table, own ON condition of a LEFT JOIN). A derived table is
+        // named by the next of `subs`, its bindings in FROM order.
+        type Subs<'s> = std::slice::Iter<'s, (String, Option<Vec<String>>)>;
+        fn name(t: &Term, subs: &mut Subs) -> Option<String> {
             match t.head() {
-                "t" => {
-                    out.push((
-                        t.kid(0).and_then(Term::atom).unwrap_or("").to_string(),
-                        None,
-                    ));
+                "t" => Some(t.kid(0).and_then(Term::atom).unwrap_or("").to_string()),
+                "sub" => subs.next().map(|s| s.0.clone()),
+                _ => None,
+            }
+        }
+        fn leaves(
+            t: &Term,
+            out: &mut Vec<(String, Option<Term>)>,
+            all: &mut Vec<Term>,
+            subs: &mut Subs,
+        ) -> bool {
+            match t.head() {
+                "t" | "sub" => {
+                    let Some(name) = name(t, subs) else {
+                        return false;
+                    };
+                    out.push((name, None));
                     true
                 }
                 "join" => {
@@ -3614,10 +4042,12 @@ impl<'a> Canon<'a> {
                     else {
                         return false;
                     };
-                    if !leaves(l, out, all) || !r.is("t") {
+                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub")) {
                         return false;
                     }
-                    let name = r.kid(0).and_then(Term::atom).unwrap_or("").to_string();
+                    let Some(name) = name(r, subs) else {
+                        return false;
+                    };
                     match kind {
                         "inner" | "cross" => {
                             all.extend(conj(on));
@@ -3636,8 +4066,9 @@ impl<'a> Canon<'a> {
         };
         let mut ls = Vec::new();
         let mut all = conj(w);
+        let mut sub_iter = subs.iter();
         for f in from {
-            if !leaves(f, &mut ls, &mut all) {
+            if !leaves(f, &mut ls, &mut all, &mut sub_iter) {
                 return fail();
             }
         }
@@ -3686,14 +4117,25 @@ impl<'a> Canon<'a> {
                         }
                     }
                 }
-                let key = self.schema.table(Self::base_table(t)).and_then(|tab| {
-                    tab.keys
+                let (key, how) = if t.starts_with("sub:") {
+                    let k = subs
                         .iter()
-                        .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
-                        .cloned()
-                });
+                        .find(|s| s.0 == *t)
+                        .and_then(|s| s.1.as_ref())
+                        .filter(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                        .cloned();
+                    (k, "GROUP BY")
+                } else {
+                    let k = self.schema.table(Self::base_table(t)).and_then(|tab| {
+                        tab.keys
+                            .iter()
+                            .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                            .cloned()
+                    });
+                    (k, "catalog")
+                };
                 if let Some(key) = key {
-                    self.discharge(format!("{t}.{} is a unique key (catalog)", key.join(", ")));
+                    self.discharge(format!("{t}.{} is a unique key ({how})", key.join(", ")));
                     bound.push(t.clone());
                     progress = true;
                 }
@@ -4210,6 +4652,55 @@ impl Item {
 /// page, lock)`). It aggregates even when WHERE matches no row; HAVING, TOP 0
 /// or OFFSET can drop that row. Only an aggregate in the select list itself
 /// counts, not one inside a subquery.
+/// T-SQL CONVERT styles with a PostgreSQL to_char format that prints the
+/// same text: (style, format, length). Checked on SQL Server 2022 and
+/// PostgreSQL 18 for date, datetime and datetime2 (eval/builtins/2026-10-29).
+const STYLES: &[(u32, &str, u32)] = &[
+    (20, "YYYY-MM-DD HH24:MI:SS", 19),
+    (120, "YYYY-MM-DD HH24:MI:SS", 19),
+    (23, "YYYY-MM-DD", 10),
+    (112, "YYYYMMDD", 8),
+    (102, "YYYY.MM.DD", 10),
+    (111, "YYYY/MM/DD", 10),
+    (108, "HH24:MI:SS", 8),
+];
+
+/// The to_char format and text length of CONVERT(varchar, x, style), for a
+/// date (`date_only`) or a date-time (datetime, datetime2, smalldatetime).
+/// A date prints only its date part, also in styles 20 and 120; a time-only
+/// style of a date is an error in T-SQL. Shared with the converter.
+pub fn style_format(date_only: bool, style: u32) -> Option<(&'static str, u32)> {
+    let &(_, fmt, width) = STYLES.iter().find(|x| x.0 == style)?;
+    match (date_only, style) {
+        (true, 20 | 120) => Some(("YYYY-MM-DD", 10)),
+        (true, 108) => None,
+        _ => Some((fmt, width)),
+    }
+}
+
+/// DATEPART's part names (and abbreviations) that have a PostgreSQL
+/// counterpart.
+fn tsql_datepart(p: &str) -> Option<&'static str> {
+    Some(match p.to_ascii_lowercase().as_str() {
+        "year" | "yy" | "yyyy" => "year",
+        "month" | "mm" | "m" => "month",
+        "day" | "dd" | "d" => "day",
+        "hour" | "hh" => "hour",
+        "minute" | "mi" | "n" => "minute",
+        "second" | "ss" | "s" => "second",
+        "weekday" | "dw" | "w" => "weekday",
+        _ => return None,
+    })
+}
+
+/// A literal code point from 1 to 127.
+fn ascii_code(e: &Expr) -> Option<u8> {
+    match e {
+        Expr::Num(v) => v.parse::<u8>().ok().filter(|c| (1..=127).contains(c)),
+        _ => None,
+    }
+}
+
 fn exactly_one(q: &Term) -> bool {
     if !q.is("q") {
         return false;
