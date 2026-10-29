@@ -869,13 +869,18 @@ fn execute_as_owner_becomes_security_definer() {
 
 #[test]
 fn security_definer_procedures_cannot_commit() {
-    let src = "CREATE PROCEDURE dbo.Purge @Id int WITH EXECUTE AS OWNER AS\nBEGIN\n  BEGIN TRAN;\n  DELETE FROM dbo.item WHERE item_id = @Id;\n  COMMIT;\nEND\n";
+    // Two transactions: the COMMITs stay.
+    let src = "CREATE PROCEDURE dbo.Purge @Id int WITH EXECUTE AS OWNER AS\nBEGIN\n  BEGIN TRAN;\n  DELETE FROM dbo.item WHERE item_id = @Id;\n  COMMIT;\n  BEGIN TRAN;\n  DELETE FROM dbo.item WHERE item_id = @Id + 1;\n  COMMIT;\nEND\n";
     let c = tsql(src);
     assert!(!c.output.contains("SECURITY DEFINER"), "{}", c.output);
     assert!(c
         .units
         .iter()
         .any(|u| has_rule(u, "pg.security-definer-transaction")));
+    // One transaction around all the work is dropped, so nothing commits.
+    let one = "CREATE PROCEDURE dbo.Purge @Id int WITH EXECUTE AS OWNER AS\nBEGIN\n  BEGIN TRAN;\n  DELETE FROM dbo.item WHERE item_id = @Id;\n  COMMIT;\nEND\n";
+    let c = tsql(one);
+    assert!(c.output.contains("SECURITY DEFINER"), "{}", c.output);
 }
 
 #[test]

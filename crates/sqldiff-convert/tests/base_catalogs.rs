@@ -313,10 +313,10 @@ fn a_base_object_that_does_not_convert_flags_its_users() {
     let fx = Fixture::new(
         "unconverted",
         &[
-            // No rule converts geography: the table is refused.
+            // No rule converts hierarchyid: the table is refused.
             (
                 "base/install.sql",
-                "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, site geography NULL);\nGO\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\nGO\nCREATE TABLE order_items (order_id int NOT NULL, qty int NOT NULL);\nGO\n",
+                "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, site hierarchyid NULL);\nGO\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\nGO\nCREATE TABLE order_items (order_id int NOT NULL, qty int NOT NULL);\nGO\n",
             ),
             // datetime2 keeps 7 fraction digits, PostgreSQL's timestamp 6: the
             // table is converted but differs. The view over it converts, and
@@ -407,7 +407,7 @@ fn a_base_object_that_does_not_convert_flags_its_users() {
     let orders = &t.report.base_objects[0];
     assert_eq!(orders.line, 1);
     assert!(orders.file.ends_with("install.sql"));
-    assert!(orders.reason.contains("GEOGRAPHY"), "{orders:?}");
+    assert!(orders.reason.contains("HIERARCHYID"), "{orders:?}");
     let recent = t
         .report
         .base_objects
@@ -675,7 +675,7 @@ fn the_base_hash_covers_the_target_catalogs() {
 
 /// The base of `a_base_object_that_does_not_convert_leaves_its_users_differs`,
 /// with the target's own DDL for it.
-const INSTALL: &str = "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, site geography NULL);\nGO\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\nGO\nCREATE TABLE order_items (order_id int NOT NULL, qty int NOT NULL);\nGO\n";
+const INSTALL: &str = "CREATE TABLE orders (order_id int NOT NULL PRIMARY KEY, site hierarchyid NULL);\nGO\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\nGO\nCREATE TABLE order_items (order_id int NOT NULL, qty int NOT NULL);\nGO\n";
 const INSTALL_PG: &str = "CREATE TABLE orders (order_id integer NOT NULL PRIMARY KEY, site text NULL);\nCREATE VIEW open_orders AS SELECT order_id FROM orders;\n";
 
 #[test]

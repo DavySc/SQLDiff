@@ -582,7 +582,10 @@ fn reentry(b: &Analyzed, table: &[String], events: &[Event], pairs: &[Pair], out
     let own = |target: &[String]| same_table(table, target);
     let fires = |e: Event| events.contains(&e);
     // A called routine may write the table, which this proof cannot see.
-    if let Some((node, _)) = pairs.iter().find_map(|(_, ub, _, _)| ub.calls.first()) {
+    if let Some((node, _)) = pairs
+        .iter()
+        .find_map(|(_, ub, _, _)| ub.calls.first().or(ub.dynamic.first()))
+    {
         out.unknown_reasons.push(format!(
             "{}the trigger calls a routine, which may write its table {}: PostgreSQL fires the table's trigger again for that statement and T-SQL does not (RECURSIVE_TRIGGERS OFF); no proof covers it",
             place(b, node),
@@ -668,6 +671,7 @@ fn reentry(b: &Analyzed, table: &[String], events: &[Event], pairs: &[Pair], out
         && guarded(ua)
         && ub.uncovered.is_empty()
         && ub.calls.is_empty()
+        && ub.dynamic.is_empty()
         && !ub.stmts.is_empty()
         && ub.stmts.iter().all(|s| match &s.ast {
             Ok(Stmt::Update {
