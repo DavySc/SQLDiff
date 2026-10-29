@@ -183,10 +183,24 @@ fn compare_units(
     let (na, nb) = (side_name(a), side_name(b));
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
+            let line = side.line_of(node);
             out.unknown_reasons.push(format!(
-                "{name} line {}: {what} is not covered by statement-level equivalence",
-                side.line_of(node)
+                "{name} line {line}: {what} is not covered by statement-level equivalence"
             ));
+            // The statements inside it were not compared either: each is
+            // named on its own line, so none counts as compared because its
+            // enclosing IF, loop or handler was reported on another.
+            for inner in node
+                .descendants()
+                .filter(|d| d != node && d.kind() == sqldiff_syntax::SyntaxKind::STATEMENT)
+            {
+                let at = side.line_of(&inner);
+                if at != line {
+                    out.unknown_reasons.push(format!(
+                        "{name} line {at}: a statement inside {what} (line {line}) is not covered by statement-level equivalence"
+                    ));
+                }
+            }
         }
         for note in &u.notes {
             out.normalize(note.clone());

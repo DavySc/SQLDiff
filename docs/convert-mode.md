@@ -32,6 +32,7 @@ Two limits keep this honest. Statements the token rules already convert keep the
 ### Never silent
 
 - A T-SQL built-in the target does not have (on the built-in lists in `profiles/builtins.toml`) refuses its statement instead of passing through: `HASHBYTES`, `CHECKSUM`, `SERVERPROPERTY`, `RAND(seed)`, … Names in object position (`INSERT INTO log (…)`) are not calls.
+- The statements inside an IF, a loop or a CATCH block that the statement-level comparison does not cover are each `not proven` on their own line, like the IF itself: none counts as compared because its enclosing statement was reported elsewhere.
 - A statement that builds text later run by `EXEC (@sql)` or `sp_executesql @sql` is `differs` (`dynamic-sql.text`): the statement converts, the SQL in the string is still T-SQL.
 - Inside a routine or block, a statement kept as a comment is followed by `RAISE EXCEPTION 'sqldiff: statement at source line N was not converted'` (Db2 for i: `SIGNAL SQLSTATE '75001'`), so the converted routine stops there instead of quietly skipping it. At the top level of a script the statement is only commented out.
 - `WITH (…)` options are dropped only when they change storage or performance, never results (`DATA_COMPRESSION`, `FILLFACTOR`, `PAD_INDEX`, `ALLOW_ROW_LOCKS`, `IGNORE_DUP_KEY = OFF`, …). `MEMORY_OPTIMIZED`/`DURABILITY`, `IGNORE_DUP_KEY = ON` and anything unknown refuse the statement. `SYSTEM_VERSIONING = ON` has its own rule (below) for PostgreSQL and is refused for Db2 for i.
