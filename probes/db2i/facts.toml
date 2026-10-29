@@ -191,3 +191,20 @@ facts = ["V19"]
 file = "crates/sqldiff-convert/src/tsql/paging.rs"
 anchor = "\"ASM-FACT-V19\""
 hedge = "not checked on a real system"
+
+[[fact]]
+id = "V33"
+title = "Date and timestamp strings: ISO and IBM SQL forms read on assignment as in a CAST; T-SQL's compact yyyymmdd rejected"
+review = ["crates/sqldiff-core/src/equiv/literal.rs", "crates/sqldiff-convert/src/tsql.rs", "docs/vendor-facts-verification.md"]
+
+[[link]]
+facts = ["V33"]
+file = "crates/sqldiff-core/src/equiv/literal.rs"
+anchor = "\"ASM-FACT-V33\","
+hedge = "not checked on a real system"
+
+[[link]]
+facts = ["V33"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-FACT-V33\""
+hedge = "not checked on a real system"
