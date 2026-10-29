@@ -4494,6 +4494,133 @@ impl<'a> Cx<'a> {
             return self.alter_versioning(&ts);
         }
         let first = sig(&ts)[0];
+        // The action: what follows the table name.
+        let action = sig(&ts).into_iter().skip(3).find(|&k| {
+            [
+                "WITH", "ADD", "CHECK", "NOCHECK", "DROP", "ALTER", "SET", "ENABLE", "DISABLE",
+            ]
+            .iter()
+            .any(|w| ts[k].is(w))
+        });
+        // `WITH CHECK` / `WITH NOCHECK` before ADD or CHECK CONSTRAINT: whether
+        // existing rows are checked.
+        let mut checked = false;
+        let mut ts = ts.to_vec();
+        if let Some(w) = action.filter(|&w| ts[w].is("WITH")) {
+            let n = next_sig(&ts, w).ok_or(No("ALTER TABLE … WITH".into()))?;
+            if ts[n].is("NOCHECK") {
+                return no(self.pick(
+                    "ALTER TABLE … WITH NOCHECK: the constraint does not check the rows already there; PostgreSQL's nearest is NOT VALID (FOREIGN KEY and CHECK only); no rule yet",
+                    "ALTER TABLE … WITH NOCHECK: the constraint does not check the rows already there; no rule yet for Db2 for i",
+                ));
+            }
+            let then = next_sig(&ts, n).filter(|&m| ts[m].is("ADD") || ts[m].is("CHECK"));
+            if !ts[n].is("CHECK") || then.is_none() {
+                return no("ALTER TABLE … WITH: no rule for this form yet");
+            }
+            if self.db2() {
+                return no("ALTER TABLE … WITH CHECK: no rule yet for Db2 for i");
+            }
+            // PostgreSQL checks the rows already there when it adds a
+            // constraint, as WITH CHECK asks.
+            self.step_ts("tsql.table.with-check", &ts[w..=n]);
+            ts.drain(w..=n);
+            checked = true;
+        }
+        let action = action.map(|_| {
+            sig(&ts)
+                .into_iter()
+                .skip(3)
+                .find(|&k| {
+                    [
+                        "ADD", "CHECK", "NOCHECK", "DROP", "ALTER", "SET", "ENABLE", "DISABLE",
+                    ]
+                    .iter()
+                    .any(|w| ts[k].is(w))
+                })
+                .unwrap_or(ts.len())
+        });
+        if let Some(act) = action.filter(|&k| k < ts.len()) {
+            let head = self.expr(&ts[..act]).trim_end().to_string();
+            let after = next_sig(&ts, act);
+            // `CHECK CONSTRAINT name` turns a constraint on (and, after WITH
+            // CHECK, checks the rows already there); `NOCHECK` turns it off.
+            if (ts[act].is("CHECK") || ts[act].is("NOCHECK"))
+                && after.is_some_and(|k| ts[k].is("CONSTRAINT"))
+            {
+                if ts[act].is("NOCHECK") {
+                    return no(self.pick(
+                        "ALTER TABLE … NOCHECK CONSTRAINT: PostgreSQL cannot turn a constraint off; drop it and add it back",
+                        "ALTER TABLE … NOCHECK CONSTRAINT: no rule yet for Db2 for i",
+                    ));
+                }
+                if self.db2() {
+                    return no("ALTER TABLE … CHECK CONSTRAINT: no rule yet for Db2 for i");
+                }
+                let names: Vec<&[T]> = split_commas(&ts[after.unwrap() + 1..]);
+                let [name] = names.as_slice() else {
+                    return no(
+                        "ALTER TABLE … CHECK CONSTRAINT with several constraints: no rule yet",
+                    );
+                };
+                if trimmed(name).len() != 1 || trimmed(name)[0].is("ALL") {
+                    return no("ALTER TABLE … CHECK CONSTRAINT ALL: no rule yet");
+                }
+                // PostgreSQL constraints are always on; VALIDATE checks the
+                // rows already there (nothing to do for a constraint that
+                // was added with its check).
+                self.step_ts("tsql.table.check-constraint", &ts[act..]);
+                if !checked {
+                    self.note(Status::Assumptions, "ASM-CONSTRAINT-ROWS-VALID", "CHECK CONSTRAINT becomes VALIDATE CONSTRAINT, which also checks the rows already in the table: T-SQL turns the constraint on without checking them (it stays not trusted), PostgreSQL fails if one of them breaks it.");
+                }
+                let n = self.expr(name).trim().to_string();
+                return Ok(format!("{head} VALIDATE CONSTRAINT {n}"));
+            }
+            // `ADD [CONSTRAINT n] DEFAULT value FOR column`.
+            if ts[act].is("ADD") {
+                let mut d = after.ok_or(No("ADD without a column".into()))?;
+                if ts[d].is("CONSTRAINT") {
+                    d = next_sig(&ts, d)
+                        .and_then(|n| next_sig(&ts, n))
+                        .ok_or(No("ADD CONSTRAINT without a name".into()))?;
+                }
+                if ts[d].is("DEFAULT") {
+                    if self.db2() {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR: no rule yet for Db2 for i");
+                    }
+                    let f = find_word(&ts, d + 1, "FOR")
+                        .ok_or(No("ADD DEFAULT without FOR column".into()))?;
+                    let col = trimmed(&ts[f + 1..]);
+                    if col.len() != 1 || !matches!(col[0].k, IDENT | QUOTED_IDENT) {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR: one column only");
+                    }
+                    let tname = find_word(&ts, 0, "TABLE")
+                        .map(|t| self.table_bit_cols(&ts[t + 1..act]))
+                        .unwrap_or_default();
+                    let colname = tsql_unquote(&col[0].s).to_ascii_lowercase();
+                    if tname.iter().any(|b| b.eq_ignore_ascii_case(&colname)) {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a BIT column: no rule yet");
+                    }
+                    if find_word(&ts, 0, "TABLE")
+                        .is_some_and(|t| self.table_col_has_default(&ts[t + 1..act], &colname))
+                    {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a column that already has a default or is an identity: SQL Server refuses it (Msg 1781), PostgreSQL's SET DEFAULT would replace the default");
+                    }
+                    let mut value = trimmed(&ts[d + 1..f]);
+                    while value.len() > 2
+                        && value[0].k == L_PAREN
+                        && matching(value, 0) == Some(value.len() - 1)
+                    {
+                        value = trimmed(&value[1..value.len() - 1]);
+                    }
+                    self.step_ts("tsql.table.add-default", &ts[act..]);
+                    self.note(Status::Assumptions, "ASM-DEFAULT-CONSTRAINT-NAME", "The default becomes ALTER COLUMN … SET DEFAULT. Assumes the column has no default yet: SQL Server refuses a second default (Msg 1781) where SET DEFAULT replaces it. PostgreSQL defaults have no name, so a later ALTER TABLE … DROP CONSTRAINT of it finds no constraint.");
+                    let v = self.expr(value).trim().to_string();
+                    let c = self.expr(col).trim().to_string();
+                    return Ok(format!("{head} ALTER COLUMN {c} SET DEFAULT {v}"));
+                }
+            }
+        }
         if find_word(&ts, first + 1, "ALTER").is_some() {
             return no(self.pick(
                 "ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions",
