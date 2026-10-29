@@ -132,7 +132,7 @@ fn a_changed_message_is_not_equal() {
             "DECLARE @m varchar(10) = NULL;\nPRINT @m;",
             "DO $$\nDECLARE v_m varchar(10);\nBEGIN\n  v_m := NULL;\n  RAISE NOTICE '%', v_m;\nEND\n$$;",
         ),
-        "not a string literal",
+        "<NULL>",
     );
 }
 

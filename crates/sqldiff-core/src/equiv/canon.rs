@@ -2864,11 +2864,12 @@ impl<'a> Canon<'a> {
                 returning_into,
                 on_conflict,
             } => {
-                if cols.is_empty() {
-                    return Err("INSERT without a column list".into());
-                }
                 let table = self.table_key(target);
-                let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
+                let cols: Vec<String> = if cols.is_empty() {
+                    self.all_columns(&table, source)?
+                } else {
+                    cols.iter().map(|c| lc(c)).collect()
+                };
                 if let Some((keys, action)) = on_conflict {
                     return self.on_conflict(&table, &cols, source, keys, action, returning);
                 }
@@ -2979,8 +2980,43 @@ impl<'a> Canon<'a> {
             Stmt::Message(Expr::Str(s)) if s.chars().count() <= 4000 => {
                 Ok(n("message", vec![n("str", vec![a(s.clone())])]))
             }
-            Stmt::Message(_) => Err("a message that is not a string literal".into()),
+            Stmt::Message(e) => self.print(e),
         }
+    }
+
+    /// A message that is an expression: T-SQL `PRINT e`, PL/pgSQL
+    /// `RAISE NOTICE '%', e`. Only a variable-length string or an integer,
+    /// whose text is the same on both sides: PRINT converts an integer to
+    /// its digits, as PostgreSQL shows it. A NULL shows as an empty line in
+    /// T-SQL and as `<NULL>` in PostgreSQL, which is part of the term, so a
+    /// T-SQL PRINT meets `RAISE NOTICE '%', COALESCE(e, '')`. PRINT cuts a
+    /// message off after 8,000 bytes (4,000 characters for nvarchar), so the
+    /// T-SQL string must be declared at most 4,000 characters long.
+    fn print(&mut self, e: &Expr) -> R<Term> {
+        let (t, ty) = self.expr(e)?;
+        let Some(ty) = ty else {
+            return Err("a message value of unknown type".into());
+        };
+        let null = match self.d {
+            Dialect::Tsql => "",
+            Dialect::Postgres => "<NULL>",
+            Dialect::Db2i => return Err("a message that is not a string literal".into()),
+        };
+        let head = match ty.fam {
+            Fam::VarChar if self.d != Dialect::Tsql || ty.len.is_some_and(|l| l <= 4000) => {
+                "msg-str"
+            }
+            Fam::VarChar => {
+                return Err("a PRINT value that may be longer than 4,000 characters".into())
+            }
+            Fam::Int => "msg-int",
+            _ => {
+                return Err(
+                    "a message value that is not a variable-length string or an integer".into(),
+                )
+            }
+        };
+        Ok(n("message", vec![n(head, vec![t, a(null)])]))
     }
 
     /// A message or raised error a format builds (`lower::Msg`): the text
@@ -3012,6 +3048,10 @@ impl<'a> Canon<'a> {
                     };
                     let (head, width) = match (spec, ty.fam) {
                         (Spec::Str, Fam::VarChar) => ("msg-str", ty.len.map(|l| l as usize)),
+                        // PostgreSQL `CAST(x AS text)` of a string is its text.
+                        (Spec::Int, Fam::VarChar) if !m.tsql => {
+                            ("msg-str", ty.len.map(|l| l as usize))
+                        }
                         (Spec::Int, Fam::Int)
                             if self.d != Dialect::Tsql || ty.len.is_some_and(|b| b <= 32) =>
                         {
@@ -3105,8 +3145,11 @@ impl<'a> Canon<'a> {
         let assigns: Vec<&SelItem> = sel.items.iter().filter(|i| i.assign.is_some()).collect();
         if !assigns.is_empty() {
             // T-SQL `SELECT @v = col FROM ...`: keeps the last row; zero rows leave @v unchanged.
-            if assigns.len() != sel.items.len() || assigns.len() != 1 {
-                return Err("SELECT assigning several variables is not supported".into());
+            if assigns.len() != sel.items.len() {
+                return Err("SELECT mixing assignments with other items".into());
+            }
+            if assigns.len() > 1 {
+                return self.assign_row(sel);
             }
             if let Some((var, v)) = sel.bare_assign() {
                 return self.stmt(&Stmt::Assign(var, v.clone()));
@@ -3152,6 +3195,121 @@ impl<'a> Canon<'a> {
             ) => Err("SELECT without INTO in PL/pgSQL".into()),
             _ => self.resultset(sel),
         }
+    }
+
+    /// The columns an INSERT without a column list fills: every column of
+    /// the table, in the catalog's order. Only for a table without identity
+    /// or computed columns: T-SQL leaves those out of the list, PostgreSQL
+    /// fills them too. The values must then match the columns one for one
+    /// (`insert_row`, `insert`), where PostgreSQL would also accept fewer.
+    fn all_columns(&self, table: &str, source: &InsertSource) -> R<Vec<String>> {
+        if matches!(source, InsertSource::Default) {
+            return Ok(Vec::new());
+        }
+        let temp;
+        let t = match table.strip_prefix("temp:") {
+            Some(_) => {
+                temp = self.temp_table(table);
+                temp.as_ref()
+            }
+            None => self.schema.table_exact(
+                table.rsplit_once('.').map(|(s, _)| s),
+                Self::base_table(table),
+            ),
+        };
+        let Some(t) = t else {
+            return Err(
+                "INSERT without a column list into a table whose definition is not known".into(),
+            );
+        };
+        if t.columns.iter().any(|c| c.identity || c.generated) {
+            return Err(
+                "INSERT without a column list into a table with an identity or computed column"
+                    .into(),
+            );
+        }
+        if !t.complete || t.columns.is_empty() {
+            return Err(
+                "INSERT without a column list into a table whose columns are not all known".into(),
+            );
+        }
+        Ok(t.columns.iter().map(|c| c.name.clone()).collect())
+    }
+
+    /// The one table variable or temporary table of this unit (`DECLARE
+    /// @t TABLE (…)`, `CREATE TEMP TABLE t (…)`) that the key `temp:…`
+    /// names, read from its column list.
+    fn temp_table(&self, key: &str) -> Option<super::schema::Table> {
+        use sqldiff_syntax::abstract_syntax::K;
+        let mut found = Vec::new();
+        for (node, _) in &self.unit.table_vars {
+            let ts = sqldiff_syntax::abstract_syntax::tokens(node);
+            let open = ts.iter().position(|t| t.kind == K::LParen)?;
+            let parts: Vec<String> = match self.d {
+                Dialect::Tsql => ts.get(1).map(|t| vec![t.text.clone()])?,
+                Dialect::Postgres => {
+                    let at = ts.iter().position(|t| t.up == "TABLE")? + 1;
+                    ts[at..open]
+                        .iter()
+                        .filter(|t| t.kind != K::Dot)
+                        .map(|t| t.text.clone())
+                        .collect()
+                }
+                Dialect::Db2i => return None,
+            };
+            let (k, _) =
+                Self::table_name(&parts, &self.unit.other_temps, self.unit.routine.as_deref());
+            if k == key {
+                let text = node.text().to_string();
+                let from = ts[open].off - usize::from(node.text_range().start());
+                found.push(format!("CREATE TABLE t {}", text.get(from..)?));
+            }
+        }
+        let [ddl] = found.as_slice() else {
+            return None;
+        };
+        Schema::default().with_ddl(ddl, self.d).table("t").cloned()
+    }
+
+    /// T-SQL `SELECT @a = x, @b = y FROM …` (and the PL/pgSQL loop block
+    /// the conversion writes for it): each row assigns every variable, so
+    /// after the last row each holds that row's value, and with no row each
+    /// keeps its own, as for one variable. Each value goes through its
+    /// variable's assignment conversion. The pairs are kept in variable
+    /// order, which does not matter once no item reads an assigned
+    /// variable: T-SQL then assigns the same values in any order. A query
+    /// that reads one, or assigns a variable twice, is refused.
+    fn assign_row(&mut self, sel: &Select) -> R<Term> {
+        let mut targets = Vec::new();
+        for it in &sel.items {
+            let v = it.assign.clone().unwrap_or_default();
+            let (sym, ty) = self.target_sym(&Expr::Var(v))?;
+            if targets.iter().any(|(s, _)| *s == sym) {
+                return Err("SELECT assigning a variable twice".into());
+            }
+            targets.push((sym, ty));
+        }
+        let (mut parts, items) = self.query_parts(sel, QCtx::Into)?;
+        let mut pairs: Vec<(Term, Term)> = Vec::new();
+        for ((sym, ty), v) in targets.into_iter().zip(items) {
+            let v = self.conv_var(&ty, v).0;
+            pairs.push((sym, v));
+        }
+        let reads_target = parts
+            .iter()
+            .chain(pairs.iter().map(|(_, v)| v))
+            .any(|t| t.any(&|x| pairs.iter().any(|(s, _)| x == s)));
+        if reads_target {
+            return Err("SELECT reading a variable it assigns".into());
+        }
+        pairs.sort();
+        let (syms, vals): (Vec<Term>, Vec<Term>) = pairs.into_iter().unzip();
+        parts.insert(1, n("items", vals));
+        let q = n("q", parts);
+        Ok(n(
+            "assign-row",
+            vec![n("targets", syms), self.scalar(q, "last", "unchanged")],
+        ))
     }
 
     fn insert(&mut self, table: &str, cols: &[String], source: &InsertSource) -> R<Term> {
