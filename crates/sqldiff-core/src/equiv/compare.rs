@@ -62,6 +62,18 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
         });
         return;
     }
+    // Row counts and offsets that are not literals (canon `row_count`):
+    // integers on both sides agree across dialects when never NULL.
+    if a.is("count")
+        && b.is("count")
+        && a.kid(0) != b.kid(0)
+        && a.kid(2) == b.kid(2)
+        && a.kid(1).and_then(Term::atom) == Some("int")
+        && b.kid(1).and_then(Term::atom) == Some("int")
+    {
+        assume(c, asm::make(asm::PAGE_COUNT_NOT_NULL));
+        return;
+    }
     // Hooks that make different spellings equal under an assumption.
     if let Some(x) = hook(a, b).or_else(|| hook(b, a)) {
         assume(c, x);
