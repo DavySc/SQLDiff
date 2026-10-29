@@ -148,6 +148,10 @@ pub mod asm {
     );
     /// Decision 1: across dialects, result column names that differ only in
     /// letter case are equal when the client matches names that way.
+    pub const END_OF_TIME: (&str, &str) = (
+        "ASM-END-OF-TIME",
+        "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written for PostgreSQL as '9999-12-31 23:59:59.999999' (PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00): it is only an open-end sentinel, compared with values converted by the same rule (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit the same way rather than rounding it; no value lies between the two",
+    );
     pub const RESULT_NAMES_CI: (&str, &str) = (
         "ASM-RESULT-NAMES-CI",
         "Clients read result columns by name case-insensitively (PostgreSQL returns an unquoted alias such as OrderId as orderid; T-SQL returns it as written)",
@@ -406,15 +410,30 @@ impl<'a> Canon<'a> {
 
     /// Key of a table name: the folded name, prefixed with its folded schema
     /// (and database) unless the schema is the default one (none written,
-    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`.
+    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`; a
+    /// table variable `@t` of routine `routine` converted to one of
+    /// `other_temps` gets that table's key (`classify::table_variable_table`).
     /// Returns the key and, for a default schema, how it was written.
-    pub fn table_name(parts: &[String]) -> (String, Option<String>) {
+    pub fn table_name(
+        parts: &[String],
+        other_temps: &std::collections::HashSet<String>,
+        routine: Option<&str>,
+    ) -> (String, Option<String>) {
         let last = parts.last().map(|s| lc(s)).unwrap_or_default();
+        if parts.len() == 1 && last.starts_with('@') {
+            // From the spelling, as the converter names it: a reference
+            // spelled with other capitals than the DECLARE does not pair.
+            let t = lc(&crate::classify::table_variable_table(routine, &parts[0]));
+            if other_temps.contains(&t) {
+                return (format!("temp:{t}"), None);
+            }
+        }
         let temp = last.starts_with('#')
             || last.starts_with('@')
-            || parts
-                .first()
-                .is_some_and(|p| p.eq_ignore_ascii_case("SESSION") && parts.len() > 1);
+            || parts.first().is_some_and(|p| {
+                (p.eq_ignore_ascii_case("SESSION") || p.eq_ignore_ascii_case("pg_temp"))
+                    && parts.len() > 1
+            });
         if temp {
             return (
                 format!("temp:{}", last.trim_start_matches(['#', '@'])),
@@ -435,7 +454,8 @@ impl<'a> Canon<'a> {
 
     /// `table_name`, remembering the name for the statement's item.
     fn table_key(&mut self, parts: &[String]) -> String {
-        let (key, default) = Self::table_name(parts);
+        let (key, default) =
+            Self::table_name(parts, &self.unit.other_temps, self.unit.routine.as_deref());
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);

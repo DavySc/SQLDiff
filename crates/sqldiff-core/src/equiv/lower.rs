@@ -242,6 +242,22 @@ pub struct Unit {
     pub local_ids: Option<Vec<String>>,
     /// A trigger body lowered for one event (`trigger.rs`).
     pub trigger: Option<TrigCtx>,
+    /// Name of the artifact's one routine: names the temporary table each
+    /// table variable became (`classify::table_variable_table`).
+    pub routine: Option<String>,
+    /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
+    /// temporary tables (`classify::temp_table_names`). A table variable
+    /// converted to one of them is named as it; otherwise `@t` keeps the key
+    /// `temp:t`, which a `#t` replacing it shares.
+    pub other_temps: std::collections::HashSet<String>,
+    /// T-SQL `DECLARE @t TABLE`, PostgreSQL `CREATE TEMP TABLE`, Db2 for i
+    /// `DECLARE GLOBAL TEMPORARY TABLE` statements, with the number of
+    /// statements before each: a table variable compared against the
+    /// temporary table it became (`mod.rs`).
+    pub table_vars: Vec<(SyntaxNode, usize)>,
+    /// PostgreSQL `DROP TABLE IF EXISTS`, placed like `table_vars`: the drop
+    /// before a converted table variable's `CREATE TEMP TABLE`.
+    pub temp_drops: Vec<(SyntaxNode, usize)>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
     /// How many IFs and loops the statement being lowered sits in.
@@ -313,6 +329,10 @@ fn empty(d: Dialect) -> Unit {
         in_block: false,
         local_ids: None,
         trigger: None,
+        routine: None,
+        other_temps: Default::default(),
+        table_vars: Vec::new(),
+        temp_drops: Vec::new(),
         ctl: Vec::new(),
         depth: 0,
         loops: Vec::new(),
@@ -339,6 +359,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         [] => walk(&a.root, &mut u),
         [r] => {
             u.in_block = true;
+            u.routine = sqldiff_syntax::ast::routine_name(r);
             header(r, &mut u);
             // Statements outside the routine (other than batch separators) are
             // not covered, except the tables it creates, compared table against
@@ -538,6 +559,15 @@ fn tsql_block(n: &SyntaxNode) -> bool {
 pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
     let mut u = empty(d);
     u.in_block = seg.block && d != Dialect::Tsql;
+    let routines: Vec<SyntaxNode> = seg
+        .nodes
+        .iter()
+        .flat_map(|n| n.descendants())
+        .filter(|n| n.kind() == SyntaxKind::ROUTINE)
+        .collect();
+    if let [r] = routines.as_slice() {
+        u.routine = cst::routine_name(r);
+    }
     for n in &seg.nodes {
         unit(n, &mut u);
     }
@@ -1150,6 +1180,14 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         });
         return;
     }
+    if table_var_decl(c, d) {
+        u.table_vars.push((c.clone(), u.stmts.len()));
+        return;
+    }
+    if temp_drop(c, d) {
+        u.temp_drops.push((c.clone(), u.stmts.len()));
+        return;
+    }
     match kind {
         // Dynamic SQL: compared by the statement it runs (`dynamic.rs`).
         _ if dynamic => {
@@ -1309,6 +1347,32 @@ fn guard(c: &SyntaxNode, d: Dialect, rows: &str) -> Option<bool> {
         _ => false,
     };
     ok.then_some(false)
+}
+
+/// A T-SQL table variable's `DECLARE @t [AS] TABLE`, or a temporary table
+/// a converted one may have become: PostgreSQL `CREATE TEMP[ORARY] TABLE`,
+/// Db2 for i `DECLARE GLOBAL TEMPORARY TABLE`.
+fn table_var_decl(c: &SyntaxNode, d: Dialect) -> bool {
+    let words = cst::first_words(c, 4);
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    match d {
+        Dialect::Tsql => {
+            w(0) == "DECLARE"
+                && w(1).starts_with('@')
+                && (w(2) == "TABLE" || (w(2) == "AS" && w(3) == "TABLE"))
+        }
+        Dialect::Postgres => {
+            w(0) == "CREATE" && matches!(w(1), "TEMP" | "TEMPORARY") && w(2) == "TABLE"
+        }
+        Dialect::Db2i => {
+            w(0) == "DECLARE" && w(1) == "GLOBAL" && w(2) == "TEMPORARY" && w(3) == "TABLE"
+        }
+    }
+}
+
+/// PostgreSQL `DROP TABLE IF EXISTS`.
+fn temp_drop(c: &SyntaxNode, d: Dialect) -> bool {
+    d == Dialect::Postgres && cst::first_words(c, 4) == ["DROP", "TABLE", "IF", "EXISTS"]
 }
 
 /// A top-level `CREATE [prefix] TABLE` statement.

@@ -15,6 +15,7 @@ use sqldiff_syntax::{Dialect, SyntaxElement, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
 use sqldiff_core::catalog::ParamMode;
+use sqldiff_core::classify::{rollback_rethrow, rolls_back};
 
 use crate::out::Out;
 use crate::tok::{
@@ -57,6 +58,8 @@ pub(crate) fn convert(
         xact_abort: false,
         seen_work: false,
         tables: HashMap::new(),
+        routine: None,
+        rolls_back: false,
         savepoints: Vec::new(),
         vars: HashMap::new(),
         notes: Vec::new(),
@@ -169,8 +172,15 @@ struct Cx<'a> {
     xact_abort: bool,
     /// A statement that does work ran before (XACT_ABORT ON must come first).
     seen_work: bool,
-    /// Db2: table variables (lower-case name without `@`) → `SESSION.t_name`.
+    /// Table variables (lower-case name without `@`) → the temporary table
+    /// they became (`SESSION.tv_…` on Db2 for i, `pg_temp.tv_…` on PostgreSQL).
     tables: HashMap<String, String>,
+    /// Name of the routine being converted: part of its table variables'
+    /// temporary table names (`classify::table_variable_table`).
+    routine: Option<String>,
+    /// The routine or script rolls back outside a CATCH that only rolls back
+    /// and rethrows (PostgreSQL: a rollback empties a temporary table).
+    rolls_back: bool,
     /// Savepoint names set with SAVE TRANSACTION in this routine or script.
     savepoints: Vec<String>,
     vars: HashMap<String, Var>,
@@ -412,6 +422,8 @@ impl<'a> Cx<'a> {
         self.xact_abort = false;
         self.seen_work = false;
         self.tables.clear();
+        self.routine = None;
+        self.rolls_back = false;
         self.savepoints.clear();
         self.dynamic.clear();
         self.wrapper = None;
@@ -420,6 +432,7 @@ impl<'a> Cx<'a> {
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
         self.mode = Mode::Do;
         self.reset();
+        self.rolls_back = rolls_back(b);
         self.dynamic = dynamic_sql_vars(&tokens(b));
         self.drop_known_dynamic(b);
         if !self.db2() {
@@ -555,6 +568,8 @@ impl<'a> Cx<'a> {
 
     fn proc_or_func(&mut self, out: &mut Out, r: &SyntaxNode, func: bool) -> R<Option<String>> {
         self.reset();
+        self.routine = sqldiff_syntax::ast::routine_name(r);
+        self.rolls_back = rolls_back(r);
         self.ret_bit = false;
         self.return_code = false;
         self.txn_control = false;
@@ -2726,12 +2741,11 @@ impl<'a> Cx<'a> {
                 "cursors: declare an SQL PL cursor (or use a FOR loop over the query)",
             ));
         }
-        if self.db2()
-            && s.len() > 2
+        if s.len() > 2
             && (ts[s[2]].is("TABLE")
                 || ts[s[2]].is("AS") && s.get(3).is_some_and(|&j| ts[j].is("TABLE")))
         {
-            return self.table_variable(&ts);
+            return self.table_variable(&ts, n);
         }
         let mut lines = Vec::new();
         let mut pending = Vec::new(); // (variable, initialiser tokens, BIT, T-SQL type)
@@ -2752,10 +2766,7 @@ impl<'a> Cx<'a> {
             }
             let it2: Vec<T> = it[j..].iter().filter(|t| t.sig()).cloned().collect();
             if it2.first().is_some_and(|t| t.is("TABLE")) {
-                return no(self.pick(
-                    "table variables: use a temporary table (note: it does not survive ROLLBACK the way a table variable does)",
-                    "table variables: declare one table variable per DECLARE",
-                ));
+                return no("table variables: declare one table variable per DECLARE");
             }
             let eq = it.iter().position(|t| t.k == OP && t.s == "=");
             let (ty, string, numeric) = self.ty(&it[j..eq.unwrap_or(it.len())])?;
@@ -2826,13 +2837,38 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// Db2: `DECLARE @t TABLE (…)` becomes a NOT LOGGED global temporary
-    /// table that keeps its rows on rollback, as a table variable does (V16).
-    fn table_variable(&mut self, ts: &[T]) -> R<String> {
+    /// `DECLARE @t TABLE (…)` becomes a temporary table named after the
+    /// routine and the variable (`classify::table_variable_table`), created
+    /// empty where the DECLARE stands. Db2 for i: a NOT LOGGED global
+    /// temporary table that keeps its rows on rollback, as a table variable
+    /// does (V16). PostgreSQL: a TEMP table, dropped first so each run starts
+    /// empty; a rollback empties it, so in a routine that rolls back the
+    /// DECLARE needs a reviewer's decision.
+    fn table_variable(&mut self, ts: &[T], n: &SyntaxNode) -> R<String> {
         let s = sig(ts);
         let v = &ts[s[1]];
         if v.k != VARIABLE || split_commas(&ts[s[1]..]).len() != 1 {
             return no("DECLARE form not understood");
+        }
+        // T-SQL creates a table variable once for the batch or routine: in a
+        // loop it keeps its rows from one pass to the next, and in a branch
+        // not taken it still exists. The output creates it when the
+        // statement runs, so only a DECLARE run exactly once converts.
+        let nested = n
+            .ancestors()
+            .skip(1)
+            .take_while(|a| !matches!(a.kind(), ROUTINE_BODY | BATCH | SOURCE_FILE))
+            .any(|a| {
+                matches!(
+                    a.kind(),
+                    IF_STMT | LOOP_STMT | TRY_CATCH | TRY_BLOCK | CATCH_BLOCK | CASE_STMT | BRANCH
+                )
+            });
+        if nested {
+            return no("table variable declared inside IF, WHILE or TRY/CATCH: T-SQL creates it once for the whole routine (in a loop it keeps its rows from one pass to the next), the temporary table each time the DECLARE runs; move the DECLARE to the top of the routine");
+        }
+        if !self.db2() && self.mode == Mode::Func {
+            return no("table variable in a function: a PostgreSQL function that creates a temporary table must be VOLATILE and cannot run on a standby; use a CTE or an array, or a procedure");
         }
         let open = (s[2]..ts.len())
             .find(|&j| ts[j].k == L_PAREN)
@@ -2841,18 +2877,34 @@ impl<'a> Cx<'a> {
         if trimmed(&ts[close + 1..]).iter().any(|t| t.sig()) {
             return no("table variable options after the column list");
         }
-        let name = format!("tv_{}", snake(&v.s[1..]));
+        let name = sqldiff_core::classify::table_variable_table(self.routine.as_deref(), &v.s);
+        let table = format!("{}.{name}", self.pick("pg_temp", "SESSION"));
+        if self.tables.values().any(|t| t.eq_ignore_ascii_case(&table)) {
+            return no(format!(
+                "two table variables of this routine would both become {table}; rename one"
+            ));
+        }
         let mut cols = Vec::new();
         let pk = primary_key_columns(&ts[open + 1..close]);
         for item in split_commas(&ts[open + 1..close]) {
             cols.push(self.table_item(item, &pk)?);
         }
         self.tables
-            .insert(v.s[1..].to_ascii_lowercase(), format!("SESSION.{name}"));
-        self.step_ts_with("tsql.decl.table-variable", ts, format!("SESSION.{name}"));
-        self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again.");
+            .insert(v.s[1..].to_ascii_lowercase(), table.clone());
+        self.step_ts_with("tsql.decl.table-variable", ts, table.clone());
+        if self.db2() {
+            self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again. Its name carries the routine's, so a routine it calls does not replace it; assumes the routine is not re-entered (called from itself, directly or through other routines) while the table is in use.");
+            return Ok(format!(
+                "DECLARE GLOBAL TEMPORARY TABLE {table} ({}\n) ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE",
+                cols.join(",")
+            ));
+        }
+        if self.rolls_back {
+            self.note(Status::Decision, "pg.table-variable-rollback", "This routine rolls back. PostgreSQL's ROLLBACK empties the temporary table of rows written since the transaction began (and drops it when it was created in that transaction), while a table variable keeps its rows. Check that the table is not read after a rollback (or recreate and refill it there).");
+        }
+        self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a TEMP table in pg_temp, dropped and created again where the DECLARE stands, so each run starts empty (the DROP sends a notice when there is no table yet). It lives until the session ends rather than the batch, keeps its rows on COMMIT, and its name carries the routine's, so a routine it calls does not replace it. A ROLLBACK empties it where a table variable keeps its rows: the routine itself does not roll back, so assumes no routine it calls rolls the transaction back, and the routine is not re-entered (called from itself, directly or through other routines), while the table is in use.");
         Ok(format!(
-            "DECLARE GLOBAL TEMPORARY TABLE SESSION.{name} ({}\n) ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE",
+            "DROP TABLE IF EXISTS {table};\nCREATE TEMP TABLE {table} ({}\n)",
             cols.join(",")
         ))
     }
@@ -4959,7 +5011,7 @@ impl<'a> Cx<'a> {
     fn date_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
         use sqldiff_core::equiv::literal::{iso_tsql, Target};
         if !self.db2() {
-            return None;
+            return self.end_of_time_store(dt, ts);
         }
         let target = match dt {
             Dt::Date => Target::Date,
@@ -4987,6 +5039,35 @@ impl<'a> Cx<'a> {
         self.note(Status::Assumptions, "ASM-FACT-V33", "A date or timestamp literal is written in the ISO form ('yyyy-mm-dd', 'yyyy-mm-dd hh:mm:ss.n'), which Db2 for i reads as that value when it is assigned, as it does in a CAST (fact V33, not checked on a real system). T-SQL's compact 'yyyymmdd' is not a Db2 for i date or timestamp string.");
         self.step_ts("tsql.expr.datetime-literal", &ts[i..=i]);
         Some(format!("'{text}'"))
+    }
+
+    /// T-SQL's end of time '9999-12-31 23:59:59.9999999' (any spelling)
+    /// assigned to a datetime2(7) variable, for PostgreSQL: its timestamp
+    /// keeps 6 digits and would round it to 10000-01-01 00:00:00, so it is
+    /// written '9999-12-31 23:59:59.999999' under `ASM-END-OF-TIME` (Davy,
+    /// 2026-10-29: 6 digits under an assumption). Any other 7-digit literal
+    /// stays as written.
+    fn end_of_time_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
+        use sqldiff_core::equiv::literal::{iso_tsql, Target};
+        if dt != Dt::DateTime2(7) {
+            return None;
+        }
+        let [i] = sig(ts)[..] else {
+            return None;
+        };
+        let t = &ts[i];
+        if t.k != STRING {
+            return None;
+        }
+        let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+        let body = lit.strip_prefix('\'').and_then(|x| x.strip_suffix('\''))?;
+        let (text, _) = iso_tsql(body, Target::Timestamp { digits: 7 })?;
+        if text != "9999-12-31 23:59:59.9999999" {
+            return None;
+        }
+        self.note(Status::Assumptions, "ASM-END-OF-TIME", "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written '9999-12-31 23:59:59.999999': PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00. Equal only if the value is just an open-end sentinel, compared with values converted the same way (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit rather than rounding it.");
+        self.step_ts("tsql.expr.end-of-time-literal", &ts[i..=i]);
+        Some("'9999-12-31 23:59:59.999999'".into())
     }
 
     fn ci_note(&mut self) {
@@ -5977,24 +6058,6 @@ fn procedural(n: &SyntaxNode) -> bool {
                 && !(exec && next_sig(&ts, i).is_some_and(|j| ts[j].k == OP && ts[j].s == "="))
         })
     }
-}
-
-/// CATCH body that is only `IF @@TRANCOUNT > 0 ROLLBACK [TRAN]` and `THROW;`.
-fn rollback_rethrow(catch: &SyntaxNode) -> bool {
-    let words: Vec<String> = sqldiff_syntax::ast::sig_tokens(catch)
-        .map(|t| t.text().to_ascii_uppercase())
-        .filter(|w| {
-            !matches!(
-                w.as_str(),
-                ";" | "BEGIN" | "END" | "CATCH" | "TRAN" | "TRANSACTION"
-            )
-        })
-        .collect();
-    let w: Vec<&str> = words.iter().map(String::as_str).collect();
-    matches!(
-        w.as_slice(),
-        ["IF", "@@TRANCOUNT", ">", "0", "ROLLBACK", "THROW"] | ["ROLLBACK", "THROW"]
-    )
 }
 
 /// One table of a DELETE's FROM list.
