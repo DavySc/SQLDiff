@@ -1748,6 +1748,49 @@ impl<'a> Canon<'a> {
                     return Ok(t);
                 }
             }
+            // CONCAT of strings is `||` with each NULL read as '' (literals
+            // are never NULL). Other argument types are converted to strings
+            // first, and a result longer than 4,000 characters is cut unless
+            // an argument is (n)varchar(max): neither has a rule here.
+            (Dialect::Tsql, "concat") if argc >= 2 && plain => {
+                let mut acc: Option<(Term, Option<u32>)> = None;
+                for x in &c.args {
+                    let (t, ty) = self.expr(x)?;
+                    let (t, len) = match (x, ty) {
+                        (Expr::Str(_), ty) => (t, ty.and_then(|y| y.len)),
+                        (_, Some(y)) if y.fam == Fam::VarChar => (
+                            n("fn", vec![a("coalesce"), t, n("str", vec![a("")])]),
+                            y.len,
+                        ),
+                        _ => {
+                            let mut kids = vec![a("tsql"), a("concat")];
+                            for x in &c.args {
+                                kids.push(self.expr(x)?.0);
+                            }
+                            return Ok((n("dfn", kids), Some(Ty::of(Fam::VarChar))));
+                        }
+                    };
+                    acc = Some(match acc {
+                        None => (t, len),
+                        Some((l, ll)) => (n("concat", vec![l, t]), ll.zip(len).map(|(p, q)| p + q)),
+                    });
+                }
+                let (t, len) = acc.expect("two or more arguments");
+                if len.is_some_and(|l| l > 4000) {
+                    return Ok((
+                        n("dfn", vec![a("tsql"), a("concat-cut"), t]),
+                        Some(Ty::of(Fam::VarChar)),
+                    ));
+                }
+                return Ok((
+                    t,
+                    Some(Ty {
+                        fam: Fam::VarChar,
+                        len,
+                        scale: None,
+                    }),
+                ));
+            }
             // IIF is shorthand for this CASE; SQL Server rewrites it so.
             (Dialect::Tsql, "iif") if argc == 3 && plain => {
                 let [c0, x, y] = [0, 1, 2].map(|k| c.args[k].clone());
