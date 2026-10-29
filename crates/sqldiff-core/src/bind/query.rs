@@ -266,6 +266,9 @@ struct Analysis {
     /// table or a parenthesized join: inside it, so the relations of the
     /// inner query or join are read too.
     resume: Option<usize>,
+    /// PostgreSQL RETURNING: its query group, where it starts (byte offset)
+    /// and the target source its `old` and `new` rows belong to.
+    returning: Option<(usize, usize, usize)>,
 }
 
 impl Analysis {
@@ -291,6 +294,7 @@ impl<'a> Binder<'a> {
             isnull: Vec::new(),
             select_into: None,
             resume: None,
+            returning: None,
         };
         self.find_ctes(t, &sh, &mut an);
         let pending = self.find_relations(t, &sh, &mut an);
@@ -1218,13 +1222,8 @@ impl<'a> Binder<'a> {
                     .find(|(tg, _)| *tg == g)
                     .or(an.targets.first())
                     .map(|(_, i)| *i);
-                if let Some(s) = ti.and_then(|i| an.sources.get(i)) {
-                    let (cols, auth) = (s.columns.clone(), s.authoritative);
-                    for img in ["new", "old"] {
-                        if !an.sources.iter().any(|x| x.alias.as_deref() == Some(img)) {
-                            add(an, img, cols.clone(), auth);
-                        }
-                    }
+                if let Some(i) = ti {
+                    an.returning = Some((g, t[r].start, i));
                 }
             }
         }
@@ -2160,6 +2159,15 @@ impl<'a> Binder<'a> {
         })
     }
 
+    /// PostgreSQL 18 `old` / `new` in RETURNING (only there): the changed
+    /// table's row before and after the change.
+    fn row_image<'s>(&self, an: &'s Analysis, g: usize, q: &str, at: usize) -> Option<&'s Source> {
+        let (rg, start, ti) = an.returning?;
+        (matches!(q, "new" | "old") && rg == g && at > start)
+            .then(|| an.sources.get(ti))
+            .flatten()
+    }
+
     fn qualifier_ref(
         &mut self,
         parts: &[Ident],
@@ -2170,7 +2178,9 @@ impl<'a> Binder<'a> {
         an: &Analysis,
     ) {
         let q = parts.last().map(|p| p.key(self.d)).unwrap_or_default();
-        if self.find_source(an, sh, g, &q, None).is_some() {
+        if self.find_source(an, sh, g, &q, None).is_some()
+            || self.row_image(an, g, &q, span.0).is_some()
+        {
             self.add_ref(
                 RefKind::Table,
                 parts.last().unwrap().text.clone(),
@@ -2234,7 +2244,17 @@ impl<'a> Binder<'a> {
                     .map(|p| p.text.clone())
                     .collect::<Vec<_>>()
                     .join(".");
-                if let Some(src) = self.find_source(an, sh, g, &q, schema.as_deref()).cloned() {
+                let image = || {
+                    schema
+                        .is_none()
+                        .then(|| self.row_image(an, g, &q, span.0))
+                        .flatten()
+                };
+                if let Some(src) = self
+                    .find_source(an, sh, g, &q, schema.as_deref())
+                    .or_else(image)
+                    .cloned()
+                {
                     self.column_of(&src, n, &name, span, stmt);
                     return;
                 }

@@ -208,3 +208,43 @@ fn returning_old_and_new_bind_to_the_target() {
         );
     }
 }
+
+/// `old` and `new` name the row images in RETURNING only.
+#[test]
+fn old_and_new_outside_returning_do_not_bind() {
+    use sqldiff_core::artifact::Analyzed;
+    use sqldiff_core::bind::{self, BindInput, Resolution};
+    use sqldiff_core::catalog::{ddl, CatalogView};
+    let cat = ddl::load(DDL, P, "catalog.sql");
+    let view = CatalogView::new(P, &[&cat]);
+    let src = pg("UPDATE item SET qty = p_q WHERE new.item_id = p_id RETURNING old.qty INTO p_q");
+    let art = Artifact::new("b.sql", P, &src);
+    let analyzed = Analyzed::new(&art, sqldiff_core::model::Side::B, 3);
+    let bound = bind::bind(
+        &analyzed,
+        &BindInput {
+            view: &view,
+            helpers: &[],
+        },
+    );
+    let r = bound
+        .refs
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case("new.item_id"))
+        .expect("new.item_id is a reference");
+    assert!(
+        !matches!(r.resolution, Resolution::Resolved(_)),
+        "{:?}",
+        r.resolution
+    );
+    let r = bound
+        .refs
+        .iter()
+        .find(|r| r.name.eq_ignore_ascii_case("old.qty"))
+        .expect("old.qty is a reference");
+    assert!(
+        matches!(r.resolution, Resolution::Resolved(_)),
+        "{:?}",
+        r.resolution
+    );
+}
