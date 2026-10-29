@@ -280,6 +280,69 @@ fn update_from_join_moves_the_target_condition_to_where() {
     not_equal(run(&ts("JOIN", key), T, named, P, true), "target in ON");
 }
 
+/// How SQL Server binds a T-SQL `UPDATE … FROM` target (checked on SQL
+/// Server 2022): to the FROM reference of the same table, aliased or not,
+/// and to a join of its own when the table is not in FROM. Where only one
+/// side states a schema, the default schema decides, which is not modelled.
+#[test]
+fn update_from_binds_a_qualified_target_by_table() {
+    let ts = |stmt: &str| format!("CREATE PROCEDURE dbo.reprice AS BEGIN {stmt}; END");
+    let pg = |stmt: &str| format!("CREATE PROCEDURE reprice() LANGUAGE sql AS $$ {stmt}; $$;");
+    let verdict = |a: &str, b: &str| run(&ts(a), T, &pg(b), P, true);
+    let equal = |r: Report, why: &str| {
+        assert!(
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    let not_equal = |r: Report, why: &str| {
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    let aliased = "UPDATE price_feed AS f SET unit_price = p.unit_price FROM item_price AS p WHERE p.item_id = f.item_id";
+    equal(
+        verdict(
+            "UPDATE dbo.price_feed SET unit_price = p.unit_price FROM dbo.price_feed AS f JOIN dbo.item_price AS p ON p.item_id = f.item_id",
+            aliased,
+        ),
+        "aliased reference",
+    );
+    equal(
+        verdict(
+            "UPDATE dbo.price_feed SET unit_price = 0 FROM dbo.price_feed WHERE item_id = 1",
+            "UPDATE price_feed SET unit_price = 0 WHERE item_id = 1",
+        ),
+        "the only FROM table",
+    );
+    equal(
+        verdict(
+            "UPDATE dbo.price_feed SET unit_price = p.unit_price FROM dbo.item_price AS p WHERE p.item_id = dbo.price_feed.item_id",
+            "UPDATE price_feed SET unit_price = p.unit_price FROM item_price AS p WHERE p.item_id = price_feed.item_id",
+        ),
+        "joined in implicitly",
+    );
+    // Joined in implicitly, the target is not limited by the FROM rows.
+    not_equal(
+        verdict(
+            "UPDATE dbo.price_feed SET unit_price = p.unit_price FROM dbo.item_price AS p WHERE p.item_id = 1",
+            "UPDATE price_feed AS f SET unit_price = p.unit_price FROM item_price AS p WHERE p.item_id = 1 AND f.item_id = 1",
+        ),
+        "implicit join is a cross join",
+    );
+    // Only one side states a schema: not modelled.
+    not_equal(
+        verdict(
+            "UPDATE price_feed SET unit_price = p.unit_price FROM dbo.price_feed AS f JOIN dbo.item_price AS p ON p.item_id = f.item_id",
+            aliased,
+        ),
+        "mixed schema forms",
+    );
+}
+
 #[test]
 fn string_comparison_collation_is_explicit() {
     let ts = "CREATE FUNCTION dbo.f (@Email varchar(254)) RETURNS int AS
