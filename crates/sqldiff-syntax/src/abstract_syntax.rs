@@ -687,8 +687,23 @@ impl<'a> Parser<'a> {
             loop {
                 match self.peek() {
                     Some(t) if matches!(t.kind, K::Num | K::Word) => {
-                        args.push(t.up.clone());
+                        let mut arg = t.up.clone();
+                        let end = t.off + t.text.len();
+                        let num = t.kind == K::Num;
                         self.i += 1;
+                        // Db2 for i LOB lengths take a multiplier written
+                        // against the number: `CLOB(1G)`, `BLOB(64K)`.
+                        if self.d == Dialect::Db2i && num {
+                            if let Some(m) = self.peek().filter(|m| {
+                                m.kind == K::Word
+                                    && m.off == end
+                                    && matches!(m.up.as_str(), "K" | "M" | "G")
+                            }) {
+                                arg.push_str(&m.up);
+                                self.i += 1;
+                            }
+                        }
+                        args.push(arg);
                     }
                     _ => return Err(self.err("bad type argument")),
                 }
