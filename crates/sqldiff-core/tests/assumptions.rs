@@ -259,7 +259,10 @@ fn the_assumption_table_is_generated_from_the_registry() {
     if std::env::var_os("SQLDIFF_BLESS").is_some() {
         std::fs::write(&path, &want).unwrap();
     }
-    let got = std::fs::read_to_string(&path).unwrap_or_default();
+    // A CRLF checkout (Windows) is the same file.
+    let got = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert!(
         got == want,
         "{} is stale: run SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test assumptions",

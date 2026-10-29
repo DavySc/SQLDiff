@@ -13,7 +13,10 @@ fn the_lean_syntax_module_is_generated_from_the_rust_kinds() {
     if std::env::var_os("SQLDIFF_BLESS").is_some() {
         std::fs::write(&path, &want).unwrap();
     }
-    let got = std::fs::read_to_string(&path).unwrap_or_default();
+    // A CRLF checkout (Windows) is the same file.
+    let got = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert!(
         got == want,
         "{} is stale: run SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test lean_syntax",
@@ -28,7 +31,10 @@ fn the_lean_ast_module_is_generated_from_the_schema() {
     if std::env::var_os("SQLDIFF_BLESS").is_some() {
         std::fs::write(&path, &want).unwrap();
     }
-    let got = std::fs::read_to_string(&path).unwrap_or_default();
+    // A CRLF checkout (Windows) is the same file.
+    let got = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
     assert!(
         got == want,
         "{} is stale: run SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test lean_syntax",
