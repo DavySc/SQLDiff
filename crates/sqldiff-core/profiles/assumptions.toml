@@ -786,6 +786,13 @@ fact = "The profile row checked against the engine (eval/ probes)."
 sites = ["sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
+id = "ASM-SAME-DATABASE-NAME"
+statement = "The PostgreSQL database has the same name, letter for letter, as the SQL Server database (DB_NAME() becomes current_database())."
+discharge = "deployment"
+fact = "The database names on both sides."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SCHEMA-OWNER"
 statement = "The schema's owner on the target holds the privileges its owner holds on the source."
 discharge = "deployment"
@@ -1022,7 +1029,7 @@ id = "ASM-TSQL-LEN-BMP"
 statement = "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
 discharge = "deployment"
 fact = "The data the routines see, or the collation."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-STRING-ARGS"
@@ -1096,6 +1103,13 @@ discharge = "catalog"
 fact = "The columns' collations and code pages."
 fact_key = "collation"
 sites = ["sqldiff-core/src/equiv/table.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-DATEFIRST-7"
+statement = "T-SQL sessions keep SET DATEFIRST 7 (the us_english default), so DATEPART(weekday) counts Sunday as 1, as EXTRACT(DOW) + 1 does."
+discharge = "deployment"
+fact = "The sessions' DATEFIRST (language) setting."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-DATEFORMAT-YMD"
