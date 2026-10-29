@@ -132,7 +132,11 @@ fn pg_computed_bit_case_becomes_a_stored_generated_column() {
 #[test]
 fn pg_computed_columns_without_an_exact_rule_stay_refused() {
     for expr in [
-        "(concat([a],N' ',[b]))",
+        "(concat([a],N' ',[n]))",
+        "(concat([a],N' ',[ch]))",
+        "(concat([a],N' ',upper([b])))",
+        "(concat([a],[w],[w]))",
+        "(concat([a]))",
         "(json_query([a],N'$.Tags'))",
         "([n]*(2))",
         "(case when [a] IS NULL then CONVERT([bit],(2)) else CONVERT([bit],(1)) end)",
@@ -143,7 +147,7 @@ fn pg_computed_columns_without_an_exact_rule_stay_refused() {
         "(case when [a] IS NULL then case when [b] IS NULL then CONVERT([bit],(0)) end end)",
         "(case when CURRENT_TIMESTAMP IS NULL then CONVERT([bit],(0)) end)",
     ] {
-        let src = format!("CREATE TABLE s.t (a NVARCHAR(10) NULL, b NVARCHAR(10) NULL, n INT NULL, f BIT NULL, c AS {expr});\n");
+        let src = format!("CREATE TABLE s.t (a NVARCHAR(10) NULL, b NVARCHAR(10) NULL, n INT NULL, f BIT NULL, ch NCHAR(5) NULL, w NVARCHAR(2000) NULL, c AS {expr});\n");
         let c = pg(&src);
         assert_eq!(
             c.units[0].status,
@@ -188,9 +192,9 @@ fn inline_index_becomes_create_index_after_the_table() {
         "UNIQUE NONCLUSTERED ([SensorNumber])",
     ));
     assert!(u.output.contains("CREATE UNIQUE INDEX IX_Readings_SensorNumber ON Warehouse.Readings (SensorNumber) NULLS NOT DISTINCT"), "{}", u.output);
-    // Columnstore and hash indexes keep their refusal.
+    // Hash and nonclustered columnstore indexes keep their refusal.
     for idx in [
-        "INDEX cx CLUSTERED COLUMNSTORE",
+        "INDEX cx NONCLUSTERED COLUMNSTORE (a)",
         "INDEX ix NONCLUSTERED HASH (a) WITH (BUCKET_COUNT = 1024)",
     ] {
         let src = format!("CREATE TABLE s.t (a INT NOT NULL, {idx});\n");
@@ -297,4 +301,60 @@ fn pg_readers_of_a_computed_bit_column_compare_booleans() {
         assert!(c.output.contains(want), "{reader}\n{}", c.output);
         assert!(!c.output.contains(not), "{reader}\n{}", c.output);
     }
+}
+
+#[test]
+fn pg_computed_concat_becomes_coalesce_parts() {
+    let src = "CREATE TABLE [Application].[People] (\n    [PersonID] INT NOT NULL,\n    [FullName] NVARCHAR (50) NOT NULL,\n    [PreferredName] NVARCHAR (50) NOT NULL,\n    [SearchName] AS (concat([PreferredName],N' ',[FullName])) PERSISTED NOT NULL,\n    [Notes] NVARCHAR (MAX) NULL,\n    [SearchDetails] AS (concat([FullName],N' ',[Notes])),\n    CONSTRAINT [PK_People] PRIMARY KEY CLUSTERED ([PersonID] ASC)\n);\n";
+    let c = pg(src);
+    assert!(
+        c.output.contains("    SearchName varchar(101) GENERATED ALWAYS AS (COALESCE(PreferredName, '') || ' ' || COALESCE(FullName, '')) STORED NOT NULL,\n"),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output.contains("    SearchDetails text GENERATED ALWAYS AS (COALESCE(FullName, '') || ' ' || COALESCE(Notes, '')) STORED,\n"),
+        "{}",
+        c.output
+    );
+    // The engine compared the table, generated columns included.
+    assert_eq!(
+        c.units[0].checked,
+        Status::Converted,
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert!(
+        matches!(c.units[0].status, Status::Converted | Status::Assumptions),
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert!(has(&c, "ASM-COMPUTED-STORED"));
+}
+
+#[test]
+fn pg_clustered_columnstore_index_is_left_out() {
+    let src = "CREATE TABLE [Application].[Logs](\n\t[Message] NVARCHAR(4000) NOT NULL,\n\t[Level] VARCHAR(16) NOT NULL,\n\tINDEX CCX_Application_Logs CLUSTERED COLUMNSTORE\n)\nGO\nEXECUTE sp_addextendedproperty @name = N'Description', @value = 'x', @level0type = N'SCHEMA', @level0name = N'Application', @level1type = N'TABLE', @level1name = N'Logs', @level2type = N'INDEX', @level2name = N'CCX_Application_Logs';\nGO\n";
+    let c = pg(src);
+    assert!(!c.output.contains("CREATE INDEX"), "{}", c.output);
+    assert_eq!(
+        c.units[0].checked,
+        Status::Converted,
+        "{:#?}",
+        c.units[0].notes
+    );
+    assert!(has(&c, "tsql.table.columnstore"));
+    // The comment on the index has nothing to land on.
+    let u = c
+        .units
+        .iter()
+        .find(|u| {
+            u.notes
+                .iter()
+                .any(|n| n.text.contains("left the (columnstore) index out"))
+        })
+        .expect("the index comment is refused");
+    assert_eq!(u.status, Status::NotConverted);
+    // Db2 for i keeps the refusal.
+    assert_eq!(db2(src).units[0].status, Status::NotConverted);
 }

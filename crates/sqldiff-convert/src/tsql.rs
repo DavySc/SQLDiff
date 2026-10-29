@@ -55,6 +55,7 @@ pub(crate) fn convert(
         loops: Vec::new(),
         labels: 0,
         cursors: Vec::new(),
+        cursor_plans: HashMap::new(),
         xact_abort: false,
         seen_work: false,
         tables: HashMap::new(),
@@ -87,6 +88,8 @@ pub(crate) fn convert(
         trigger: None,
         seq_defaults: Vec::new(),
         table_cols: Vec::new(),
+        table_items: Vec::new(),
+        left_out_indexes: Vec::new(),
         update_ctes: Vec::new(),
     };
     let mut out = Out::default();
@@ -169,6 +172,9 @@ struct Cx<'a> {
     labels: usize,
     /// Db2: result-set cursors of the routine, declared after the variables.
     cursors: Vec<Decl>,
+    /// PostgreSQL: the cursor loops of this routine or script, by lower-case
+    /// cursor name: the plan its statements follow, or why it is refused.
+    cursor_plans: HashMap<String, Result<CursorPlan, String>>,
     /// Db2: `SET XACT_ABORT ON` seen; the routine gets an EXIT handler that
     /// rolls back and resignals.
     xact_abort: bool,
@@ -246,6 +252,10 @@ struct Cx<'a> {
     seq_defaults: Vec<(String, String)>,
     /// The columns of the table being created (lower case, unquoted).
     table_cols: Vec<String>,
+    /// The column list items of the table being created.
+    table_items: Vec<Vec<T>>,
+    /// Indexes the conversion left out (columnstore), lower case.
+    left_out_indexes: Vec<String>,
     /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
     /// with the GROUP BY key their query returns (`group_key`), if any.
     update_ctes: Vec<(String, Option<Vec<String>>)>,
@@ -1184,7 +1194,7 @@ impl<'a> Cx<'a> {
     /// nothing runs any more; the engine compares the statement inside the
     /// string with the one inside the `EXECUTE`.
     fn dynamic_exec(&mut self, n: &SyntaxNode) -> R<String> {
-        let (text, notes) = self.dynamic_inner(n).map_err(No)?;
+        let (text, notes, using) = self.dynamic_inner(n).map_err(No)?;
         for x in notes {
             if x.status > Status::Converted {
                 self.note(
@@ -1194,13 +1204,25 @@ impl<'a> Cx<'a> {
                 );
             }
         }
-        self.step_node("tsql.stmt.dynamic-known-text", n);
-        Ok(format!("EXECUTE '{}'", text.replace('\'', "''")))
+        if using.is_empty() {
+            self.step_node("tsql.stmt.dynamic-known-text", n);
+            Ok(format!("EXECUTE '{}'", text.replace('\'', "''")))
+        } else {
+            self.step_node("tsql.stmt.dynamic-parameters", n);
+            Ok(format!(
+                "EXECUTE '{}' USING {}",
+                text.replace('\'', "''"),
+                using.join(", ")
+            ))
+        }
     }
 
     /// The converted statement a dynamic SQL statement runs, with the notes
     /// of its conversion, or why it cannot be converted.
-    fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>), String> {
+    /// With `sp_executesql` parameters, also the values for `USING`, in
+    /// parameter order, which the text reads as `$1`, `$2`, ….
+    #[allow(clippy::type_complexity)]
+    fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>, Vec<String>), String> {
         use sqldiff_core::equiv::dynamic::{self, Text};
         if self.db2() {
             return Err(
@@ -1225,12 +1247,80 @@ impl<'a> Cx<'a> {
         if text.trim().is_empty() {
             return Err("dynamic SQL with empty text: T-SQL runs nothing; remove the statement after review".into());
         }
-        if let Some(why) = dynamic::tsql_inner_refusal(&text) {
+        let passed = dynamic::exec_params(n)
+            .map_err(|why| format!("dynamic SQL with parameters, not converted: {why}"))?;
+        let names: Vec<String> = passed
+            .iter()
+            .flat_map(|p| p.params.iter().map(|q| q.name.clone()))
+            .collect();
+        if let Some(why) = dynamic::tsql_inner_refusal_with(&text, &names) {
             return Err(format!("dynamic SQL with known text, not converted: {why}"));
         }
-        let root = sqldiff_syntax::parse(&text, Dialect::Tsql).syntax();
-        let inner = convert(&root, &text, self.to, self.catalog);
-        let [u] = inner.units.as_slice() else {
+        // `$n` is put back where the converted parameter name stands: the
+        // text may not use that name for anything else.
+        let words =
+            sqldiff_core::equiv::ast::tokens(&sqldiff_syntax::parse(&text, Dialect::Tsql).syntax());
+        if let Some(q) = names.iter().find(|q| {
+            words.iter().any(|w| {
+                w.text
+                    .trim_matches(['[', ']', '"'])
+                    .eq_ignore_ascii_case(&format!("p_{}", snake(q)))
+            })
+        }) {
+            return Err(format!("dynamic SQL with parameters, not converted: the text uses the name p_{}, which the parameter @{q} becomes", snake(q)));
+        }
+        // The values passed: a variable of exactly the parameter's type, so
+        // that T-SQL does not convert it (PostgreSQL types `$n` by the value).
+        let mut using = Vec::new();
+        for (q, a) in passed.iter().flat_map(|p| p.params.iter().zip(&p.args)) {
+            let [v] = a.as_slice() else {
+                return Err(format!("dynamic SQL with parameters, not converted: the value of @{} is not a variable", q.name));
+            };
+            let var = v
+                .text
+                .get(1..)
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let same = v.kind == sqldiff_core::equiv::ast::K::Var
+                && dynamic::declared_type(n, &var).is_some_and(|t| dynamic::same_type(&t, &q.ty));
+            let conv = self.vars.get(&var).map(|x| x.name.clone());
+            match (same, conv) {
+                (true, Some(c)) => using.push(c),
+                _ => return Err(format!("dynamic SQL with parameters, not converted: the value of @{} is not a variable of the parameter's own type, so T-SQL converts it as it passes it and PostgreSQL does not", q.name)),
+            }
+        }
+        // With parameters the text is converted as the body of a procedure
+        // that takes them, and they are then read as `$n`.
+        let (wrapped, start) = match &passed {
+            None => (text.clone(), 0),
+            Some(p) => {
+                let decl = p
+                    .params
+                    .iter()
+                    .map(|q| {
+                        format!(
+                            "@{} {}",
+                            q.name,
+                            q.ty.iter()
+                                .map(|t| t.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let head = format!("CREATE PROCEDURE dbo.sqldiff_dynamic {decl}\nAS\nBEGIN\n");
+                (format!("{head}{text}\nEND;\n"), head.len())
+            }
+        };
+        let root = sqldiff_syntax::parse(&wrapped, Dialect::Tsql).syntax();
+        let inner = convert(&root, &wrapped, self.to, self.catalog);
+        let units: Vec<_> = inner
+            .units
+            .iter()
+            .filter(|u| u.src.0 >= start && u.src.1 <= start + text.len())
+            .collect();
+        let [u] = units.as_slice() else {
             return Err("dynamic SQL with known text, not converted: its statement did not convert to one statement".into());
         };
         if let Some(bad) = u.notes.iter().find(|x| x.status > Status::Decision) {
@@ -1244,7 +1334,26 @@ impl<'a> Cx<'a> {
         if out.lines().any(|l| l.trim_start().starts_with("--")) || out.contains('$') {
             return Err("dynamic SQL with known text, not converted: the converted statement holds comments or `$`".into());
         }
-        Ok((out.trim_end_matches(';').to_string(), u.notes.clone()))
+        let mut out = out.trim_end_matches(';').to_string();
+        if let Some(p) = &passed {
+            // `p_name` → `$n`, by token: names inside strings stay.
+            let root = sqldiff_syntax::parse(&out, Dialect::Postgres).syntax();
+            let mut bound = String::new();
+            for e in root.descendants_with_tokens() {
+                let Some(t) = e.as_token() else { continue };
+                let k = p.params.iter().position(|q| {
+                    t.kind() == sqldiff_syntax::SyntaxKind::IDENT
+                        && t.text()
+                            .eq_ignore_ascii_case(&format!("p_{}", snake(&q.name)))
+                });
+                match k {
+                    Some(k) => bound.push_str(&format!("${}", k + 1)),
+                    None => bound.push_str(t.text()),
+                }
+            }
+            out = bound;
+        }
+        Ok((out, u.notes.clone(), using))
     }
 
     /// Takes off `self.dynamic` the variables that only known-text dynamic
@@ -1384,6 +1493,19 @@ impl<'a> Cx<'a> {
         let ts = tokens(n);
         if !ts.iter().find(|t| t.sig()).is_some_and(|t| t.is("WHILE")) {
             return self.refuse(out, n, indent, "loop form not supported");
+        }
+        if let Some(plan) = self.fetch_loop(n) {
+            match plan {
+                Ok(_) => {
+                    self.header_unit(out, n, indent, "WHILE FOUND LOOP", "tsql.cursor.while");
+                    for b in n.children().filter(|c| c.kind() == BRANCH) {
+                        self.body_elements(out, &b, indent + INDENT);
+                    }
+                    out.lines(indent, "END LOOP;");
+                    return;
+                }
+                Err(reason) => return self.refuse(out, n, indent, &reason),
+            }
         }
         let cond = self.condition(n);
         if let Some(reason) = self.blocked() {
@@ -1601,6 +1723,11 @@ impl<'a> Cx<'a> {
             ));
         }
         let first = w(0);
+        if let Some(v) = ts.iter().find(|t| {
+            t.k != STRING && t.s.contains("$(") && !(first == "ALTER" && w(1) == "DATABASE")
+        }) {
+            return no(format!("{}: a SQLCMD variable, so this statement is a template, not SQL; convert it in template mode (a [template] syntax for SQLCMD variables) or with the value filled in", v.s.trim()));
+        }
         if !matches!(first.as_str(), "SET" | "DECLARE" | "PRINT") {
             // XACT_ABORT ON after this cannot become a routine-wide handler.
             self.seen_work = true;
@@ -1671,9 +1798,19 @@ impl<'a> Cx<'a> {
             "SAVE" if self.db2() => self.save(&ts)?,
             "SAVE" => return no("SAVE TRANSACTION: use SAVEPOINT, but a PL/pgSQL body cannot; use a nested BEGIN … EXCEPTION block"),
             "EXEC" | "EXECUTE" if sqldiff_core::equiv::dynamic::is_tsql(n) => self.dynamic_exec(n)?,
+            "OPEN" | "FETCH" | "CLOSE" | "DEALLOCATE" if !self.db2() => {
+                self.cursor_stmt(n, &first, &ts)?
+            }
             "EXEC" | "EXECUTE" => self.exec(&ts)?,
+            "GRANT" if !self.db2() => self.grant(&ts)?,
             "CREATE" => self.create(&ts)?,
             "ALTER" if w(1) == "TABLE" => self.alter_table(&ts)?,
+            "ALTER" if w(1) == "DATABASE" => self.alter_database(&ts)?,
+            "GOTO" => {
+                let label = s.get(1).map(|&i| tsql_unquote(&ts[i].s)).unwrap_or_default();
+                return no(goto(n, &label));
+            }
+            ":" => return no(sqlcmd(&w(1))),
             "DROP" => {
                 if w(1) == "INDEX" && find_word(&ts, s[1], "ON").is_some() {
                     return no(self.pick(
@@ -2808,6 +2945,9 @@ impl<'a> Cx<'a> {
     fn declare(&mut self, ts: &[T], n: &SyntaxNode) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
+        if !self.db2() && s.len() > 2 && s[2..].iter().any(|&j| ts[j].is("CURSOR")) {
+            return self.declare_cursor(&ts, n);
+        }
         if s.len() > 2 && (ts[s[2]].is("CURSOR") || ts[s[1]].is("CURSOR")) {
             return no(self.pick(
                 "cursors: declare a PL/pgSQL cursor (or use a FOR loop over the query)",
@@ -3197,6 +3337,449 @@ impl<'a> Cx<'a> {
         format!("{text}\nCOMMIT;")
     }
 
+    /// `ALTER DATABASE name ADD FILEGROUP fg [CONTAINS MEMORY_OPTIMIZED_DATA |
+    /// FILESTREAM]` only says where data is stored, which results do not
+    /// see: the target places data with tablespaces (or not at all), so
+    /// nothing is created. Other database settings are server configuration.
+    fn alter_database(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let w: Vec<String> = s.iter().map(|&j| ts[j].up()).collect();
+        let storage = w.len() >= 6
+            && w[3] == "ADD"
+            && w[4] == "FILEGROUP"
+            && (w.len() == 6
+                || (w.len() == 8
+                    && w[6] == "CONTAINS"
+                    && matches!(w[7].as_str(), "MEMORY_OPTIMIZED_DATA" | "FILESTREAM")));
+        if !storage {
+            return no(self.pick(
+                "ALTER DATABASE: database options and files are server configuration with no one-to-one PostgreSQL statement (ALTER DATABASE … SET, postgresql.conf); not converted",
+                "ALTER DATABASE: database options and files are server configuration with no Db2 for i statement; not converted",
+            ));
+        }
+        self.step_ts("tsql.database.filegroup", &ts);
+        Ok(format!(
+            "-- ALTER DATABASE … ADD FILEGROUP {}: storage only; {} places data without it",
+            tsql_unquote(&ts[s[5]].s),
+            self.to.display_name()
+        ))
+    }
+
+    /// PostgreSQL: `GRANT p [, p] ON [OBJECT::]name TO g [, g] [WITH GRANT
+    /// OPTION]` for the object privileges both grant alike on a table or view
+    /// (SELECT, INSERT, UPDATE, DELETE, REFERENCES). The others differ in
+    /// scope: a schema permission (`ON SCHEMA::s`) also covers objects
+    /// created later in T-SQL, which PostgreSQL's `ALL TABLES IN SCHEMA`
+    /// does not; a database permission (CONNECT) and EXECUTE need names and
+    /// signatures T-SQL does not give.
+    fn grant(&mut self, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let s = sig(&ts);
+        let w = |i: usize| s.get(i).map(|&j| ts[j].up()).unwrap_or_default();
+        if let Some(k) = (1..s.len()).find(|&k| w(k) == "::" && w(k - 1) != "OBJECT") {
+            let class = w(k - 1);
+            return no(format!("GRANT … ON {class}::: SQL Server's permission on a whole {} also covers objects created later; PostgreSQL's GRANT … ON ALL TABLES IN SCHEMA covers only those that exist (and ALTER DEFAULT PRIVILEGES only those one role creates); not converted", class.to_lowercase()));
+        }
+        let mut i = 1;
+        let mut privileges = Vec::new();
+        loop {
+            let p = w(i);
+            match p.as_str() {
+                "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "REFERENCES" => privileges.push(p),
+                "EXECUTE" | "EXEC" => return no("GRANT EXECUTE: PostgreSQL grants it ON FUNCTION or ON PROCEDURE with the argument types; not converted"),
+                "ALL" => return no("GRANT ALL: SQL Server's ALL is another set of permissions than PostgreSQL's ALL PRIVILEGES; grant the permissions by name"),
+                _ if !ts.iter().any(|t| t.is("ON")) => return no(format!("GRANT {p}: a database permission; PostgreSQL grants database privileges ON DATABASE by name (CONNECT) or as role attributes; not converted")),
+                _ => return no(format!("GRANT {p}: no one-to-one PostgreSQL privilege; not converted")),
+            }
+            i += 1;
+            match w(i).as_str() {
+                "," => i += 1,
+                "(" => return no("GRANT on columns: not converted"),
+                _ => break,
+            }
+        }
+        if w(i) != "ON" {
+            return no("GRANT of a database permission: not converted");
+        }
+        i += 1;
+        let obj_at = if w(i + 1) == "::" { i + 2 } else { i };
+        let Some(to) = (obj_at..s.len()).find(|&k| w(k) == "TO") else {
+            return no("GRANT without TO");
+        };
+        if (obj_at..to)
+            .any(|k| ts[s[k]].k != IDENT && ts[s[k]].k != QUOTED_IDENT && ts[s[k]].k != DOT)
+        {
+            return no("GRANT on something other than a table or view name");
+        }
+        let rest: Vec<String> = (to + 1..s.len()).map(w).collect();
+        let (grantees_end, option) = match rest.iter().position(|x| x == "WITH" || x == "AS") {
+            Some(p) if rest[p..] == ["WITH", "GRANT", "OPTION"] => (to + 1 + p, true),
+            Some(_) => return no("GRANT … AS principal: not converted"),
+            None => (to + 1 + rest.len(), false),
+        };
+        let mut grantees = Vec::new();
+        for k in to + 1..grantees_end {
+            let t = &ts[s[k]];
+            match t.k {
+                IDENT | QUOTED_IDENT => grantees.push(self.expr(std::slice::from_ref(t))),
+                COMMA => {}
+                _ => return no("GRANT to something other than principal names"),
+            }
+        }
+        if grantees.is_empty() {
+            return no("GRANT without a grantee");
+        }
+        let object = self.expr(&ts[s[obj_at]..=s[to - 1]]);
+        self.note(Status::Assumptions, "ASM-GRANT-PRINCIPAL", "The PostgreSQL role this GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY on the object outranks the grant (PostgreSQL has no DENY).");
+        self.step_ts("tsql.stmt.grant", &ts);
+        Ok(format!(
+            "GRANT {} ON {} TO {}{}",
+            privileges.join(", "),
+            object.trim(),
+            grantees
+                .iter()
+                .map(|g| g.trim().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if option { " WITH GRANT OPTION" } else { "" }
+        ))
+    }
+
+    /// PostgreSQL: `DECLARE c CURSOR … FOR query` of the standard loop
+    /// (`cursor_plan`): a `refcursor` in the DECLARE section, opened with
+    /// the query by the OPEN that follows.
+    fn declare_cursor(&mut self, ts: &[T], n: &SyntaxNode) -> R<String> {
+        let s = sig(ts);
+        let raw = tsql_unquote(&ts[s[1]].s);
+        let plan = self.cursor_plan(ts, n);
+        self.cursor_plans
+            .insert(raw.to_ascii_lowercase(), plan.clone());
+        let plan = plan.map_err(No)?;
+        self.step_ts_with("tsql.cursor.declare", ts, plan.name.clone());
+        let notes = self.take_notes();
+        let trace = self.take_trace();
+        self.decls.push(Decl {
+            src: Self::range(n),
+            lines: vec![format!("{} refcursor;", plan.name)],
+            notes,
+            trace,
+        });
+        self.step_ts_with("tsql.cursor.declare", ts, "moved to OPEN");
+        Ok(format!(
+            "-- DECLARE {raw} CURSOR: {} in the DECLARE section, opened with the query below",
+            plan.name
+        ))
+    }
+
+    /// Whether `DECLARE c CURSOR … FOR query` is the standard loop the rules
+    /// convert, read from the statements after it:
+    ///
+    /// ```text
+    /// OPEN c; FETCH [NEXT] [FROM] c INTO @a, …;
+    /// WHILE @@FETCH_STATUS = 0 BEGIN … FETCH [NEXT] [FROM] c INTO @a, …; END
+    /// CLOSE c; DEALLOCATE c;
+    /// ```
+    ///
+    /// It becomes `OPEN c FOR query; FETCH …; WHILE FOUND LOOP … END LOOP;
+    /// CLOSE c;`. `FOUND` tells what `@@FETCH_STATUS = 0` tells only where a
+    /// FETCH of this cursor comes right before each test: so no CONTINUE or
+    /// GOTO in the body, and the body ends with the FETCH. Checked on SQL
+    /// Server 2022 and PostgreSQL 18: T-SQL reads the query's variables at
+    /// DECLARE (so OPEN must follow at once), and a FETCH that finds no row
+    /// leaves T-SQL's variables as they were but sets PostgreSQL's to NULL
+    /// (so the variables are not read after the loop before they are set
+    /// again). A cursor that is not STATIC may see the loop's own writes in
+    /// T-SQL; a PostgreSQL cursor reads the rows as of OPEN, so the loop must
+    /// not write the tables the cursor reads or call procedures.
+    fn cursor_plan(&self, ts: &[T], n: &SyntaxNode) -> Result<CursorPlan, String> {
+        let s = sig(ts);
+        let raw = tsql_unquote(&ts[s[1]].s);
+        if !matches!(self.mode, Mode::Proc | Mode::Do | Mode::Func) || self.trigger.is_some() {
+            return Err("cursor outside a procedure, function or script block".into());
+        }
+        let ds = crate::tok::depths(ts);
+        let Some(for_at) = s[2..]
+            .iter()
+            .copied()
+            .find(|&j| ds[j] == 0 && ts[j].is("FOR"))
+        else {
+            return Err("DECLARE CURSOR without FOR".into());
+        };
+        let (mut stat, mut local) = (false, false);
+        for &j in s[2..].iter().take_while(|&&j| j < for_at) {
+            match ts[j].up().as_str() {
+                "CURSOR" | "FORWARD_ONLY" | "FAST_FORWARD" | "READ_ONLY" | "KEYSET" | "DYNAMIC"
+                | "GLOBAL" => {}
+                "LOCAL" => local = true,
+                "STATIC" | "INSENSITIVE" => stat = true,
+                o => {
+                    return Err(format!(
+                        "cursor option {o}: only forward-only, read-only cursors are converted"
+                    ))
+                }
+            }
+        }
+        let query: Vec<T> = trimmed(&ts[for_at + 1..]).to_vec();
+        let qs = sig(&query);
+        let qd = crate::tok::depths(&query);
+        if !qs
+            .first()
+            .is_some_and(|&j| query[j].is("SELECT") || query[j].is("WITH"))
+        {
+            return Err("cursor over something other than a query".into());
+        }
+        if qs.iter().any(|&j| qd[j] == 0 && query[j].is("FOR")) {
+            return Err(
+                "cursor query with FOR UPDATE, FOR READ ONLY, FOR XML or FOR JSON: not converted"
+                    .into(),
+            );
+        }
+        if n.ancestors().skip(1).any(|a| a.kind() == LOOP_STMT) {
+            return Err("cursor loop inside another loop: not converted (the variables it fetches carry over to the next pass)".into());
+        }
+        let Some(parent) = n.parent() else {
+            return Err("cursor form not understood".into());
+        };
+        let units: Vec<SyntaxNode> = parent
+            .children()
+            .filter(|c| c.kind().is_unit())
+            .skip_while(|c| c != n)
+            .skip(1)
+            .collect();
+        let shape = "the cursor is not used in the standard loop (OPEN; FETCH … INTO; WHILE @@FETCH_STATUS = 0 … ending with the same FETCH; CLOSE; DEALLOCATE)";
+        let key = raw.to_ascii_lowercase();
+        let is = |n: &SyntaxNode, kw: &str| {
+            sig_words(n).as_slice() == [kw.to_string(), key.to_ascii_uppercase()]
+        };
+        // Statements between DECLARE and OPEN: T-SQL reads the query's
+        // variables at DECLARE, PostgreSQL at OPEN, so none of them may be
+        // set there; nor may the routine leave before OPEN.
+        let Some(at_open) = units.iter().position(|u| is(u, "OPEN")) else {
+            return Err(shape.into());
+        };
+        let qvars: Vec<String> = query
+            .iter()
+            .filter(|t| t.k == VARIABLE)
+            .map(|t| t.s.to_ascii_lowercase())
+            .collect();
+        for u in &units[..at_open] {
+            let ws = sig_words(u);
+            if u.kind() != STATEMENT
+                || ws.first().is_some_and(|w| {
+                    matches!(
+                        w.as_str(),
+                        "RETURN" | "GOTO" | "BREAK" | "CONTINUE" | "THROW" | "RAISERROR"
+                    )
+                })
+                || ws.iter().any(|w| w.eq_ignore_ascii_case(&key))
+                || tokens(u)
+                    .iter()
+                    .any(|t| t.k == VARIABLE && qvars.contains(&t.s.to_ascii_lowercase()))
+            {
+                return Err("statements between the cursor's DECLARE and OPEN that may set the variables its query reads or leave the routine: T-SQL reads them at DECLARE, PostgreSQL at OPEN".into());
+            }
+        }
+        let [open, first, lp, close, dealloc, after @ ..] = &units[at_open..] else {
+            return Err(shape.into());
+        };
+        let vars = fetch_into(first, &key).ok_or(shape)?;
+        if !is(open, "OPEN") || !is(close, "CLOSE") || !is(dealloc, "DEALLOCATE") {
+            return Err(shape.into());
+        }
+        if lp.kind() != LOOP_STMT {
+            return Err(shape.into());
+        }
+        let mut cond: Vec<String> = lp
+            .children()
+            .find(|c| c.kind() == CONDITION)
+            .map(|c| sig_words(&c))
+            .unwrap_or_default();
+        while cond.first().is_some_and(|x| x == "(") && cond.last().is_some_and(|x| x == ")") {
+            cond = cond[1..cond.len() - 1].to_vec();
+        }
+        if cond != ["@@FETCH_STATUS", "=", "0"] {
+            return Err(shape.into());
+        }
+        let Some(body) = lp.children().find(|c| c.kind() == BRANCH) else {
+            return Err(shape.into());
+        };
+        let inner = loop_units(&body);
+        let Some((last, rest)) = inner.split_last() else {
+            return Err(shape.into());
+        };
+        if fetch_into(last, &key).as_ref() != Some(&vars) {
+            return Err("the loop body does not end with the same FETCH as before the loop: @@FETCH_STATUS and FOUND then tell different things".into());
+        }
+        for d in body
+            .descendants()
+            .filter(|d| d.kind() == STATEMENT || d.kind() == LABEL)
+        {
+            let w = sig_words(&d);
+            let first_w = w.first().map(String::as_str).unwrap_or("");
+            if matches!(first_w, "COMMIT" | "ROLLBACK" | "SAVE")
+                || (first_w == "BEGIN" && w.get(1).is_some_and(|x| x.starts_with("TRAN")))
+            {
+                return Err("transaction control in the cursor loop: PostgreSQL closes the cursor at COMMIT or ROLLBACK, T-SQL keeps it open".into());
+            }
+            if d.kind() == LABEL || matches!(first_w, "CONTINUE" | "GOTO") {
+                return Err("CONTINUE, GOTO or a label in the cursor loop: PostgreSQL's FOUND would then not come from the cursor's FETCH".into());
+            }
+            if d != *last
+                && matches!(first_w, "OPEN" | "FETCH" | "CLOSE" | "DEALLOCATE")
+                && w.iter().any(|x| *x == key.to_ascii_uppercase())
+            {
+                return Err("the cursor is fetched, opened or closed again inside its loop".into());
+            }
+        }
+        let _ = rest;
+        // After the loop, each variable is set before it is read.
+        let at_top = parent.ancestors().skip(1).all(|a| {
+            !matches!(
+                a.kind(),
+                IF_STMT | LOOP_STMT | TRY_CATCH | BRANCH | CATCH_BLOCK | TRY_BLOCK
+            )
+        });
+        for v in &vars {
+            let mentions = |u: &SyntaxNode| {
+                tokens(u)
+                    .iter()
+                    .filter(|t| t.k == VARIABLE && t.s[1..].eq_ignore_ascii_case(v))
+                    .count()
+            };
+            match after.iter().find(|u| mentions(u) > 0) {
+                Some(u) => {
+                    let w = sig_words(u);
+                    let set = w.len() > 2
+                        && w[0] == "SET"
+                        && w[1].eq_ignore_ascii_case(&format!("@{v}"))
+                        && w[2] == "="
+                        && mentions(u) == 1;
+                    let fetch = w.first().is_some_and(|x| x == "FETCH") && mentions(u) == 1;
+                    if !set && !fetch {
+                        return Err(format!("@{v} is read after the loop: T-SQL keeps the last row's value there, PostgreSQL's FETCH sets it to NULL when no row is left"));
+                    }
+                }
+                None if !at_top => {
+                    return Err(format!("@{v} may be read after the IF or block the loop sits in: T-SQL keeps the last row's value there, PostgreSQL's FETCH sets it to NULL when no row is left"));
+                }
+                None => {}
+            }
+        }
+        if !stat {
+            let reads = table_names(&query);
+            for d in body.descendants().filter(|d| d.kind() == STATEMENT) {
+                let w = sig_words(&d);
+                match w.first().map(String::as_str) {
+                    Some("EXEC" | "EXECUTE") => {
+                        return Err("the cursor loop calls a procedure, which may write the tables the cursor reads: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it".into())
+                    }
+                    Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") => {
+                        let names = written_tables(&tokens(&d));
+                        if let Some(t) = reads.iter().find(|t| names.contains(t)) {
+                            return Err(format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(CursorPlan {
+            name: format!("cur_{}", snake(&raw)),
+            raw: raw.clone(),
+            query,
+            vars: vars.clone(),
+            stat,
+            local,
+            open_at: Self::range(open),
+            fetch_at: vec![Self::range(first), Self::range(last)],
+            loop_at: Self::range(lp),
+        })
+    }
+
+    /// The plan of the cursor loop `n` is, if `n` is one: `WHILE
+    /// @@FETCH_STATUS = 0` right after a cursor's first FETCH.
+    fn fetch_loop(&self, n: &SyntaxNode) -> Option<Result<CursorPlan, String>> {
+        if self.db2() {
+            return None;
+        }
+        let at = Self::range(n);
+        self.cursor_plans
+            .values()
+            .find(|p| p.as_ref().is_ok_and(|p| p.loop_at == at))
+            .cloned()
+    }
+
+    /// PostgreSQL: OPEN, FETCH, CLOSE and DEALLOCATE of a converted cursor
+    /// loop (`cursor_plan`).
+    fn cursor_stmt(&mut self, n: &SyntaxNode, first: &str, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let name = sig(&ts)
+            .into_iter()
+            .skip(1)
+            .map(|j| tsql_unquote(&ts[j].s))
+            .find(|x| {
+                first != "FETCH"
+                    || !(x.eq_ignore_ascii_case("NEXT") || x.eq_ignore_ascii_case("FROM"))
+            })
+            .unwrap_or_default();
+        let key = name.to_ascii_lowercase();
+        let plan = match self.cursor_plans.get(&key) {
+            Some(Ok(p)) => p.clone(),
+            Some(Err(why)) => return no(format!("cursor {name}: {why}")),
+            None => return no("cursor statement without the cursor's DECLARE before it in this routine: not converted"),
+        };
+        let at = Self::range(n);
+        match first {
+            "OPEN" if at == plan.open_at => {
+                let outer = std::mem::replace(&mut self.scope, scope_of(&plan.query));
+                let q = self.select(&plan.query);
+                self.scope = outer;
+                let (q, assigns) = q?;
+                if assigns {
+                    return no("cursor query that assigns variables");
+                }
+                if !plan.stat {
+                    self.note(Status::Assumptions, "ASM-CURSOR-SNAPSHOT", "No other session changes the tables the cursor reads while the loop runs: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN.");
+                }
+                if !plan.local {
+                    self.note(Status::Assumptions, "ASM-CURSOR-GLOBAL", "No error leaves the loop early: a T-SQL cursor declared without LOCAL then stays allocated in the session, and the routine's next DECLARE of it fails; PostgreSQL closes it with the transaction.");
+                }
+                self.step_ts_with("tsql.cursor.open", &ts, plan.name.clone());
+                Ok(format!("OPEN {} FOR {}", plan.name, q.trim()))
+            }
+            "FETCH" if plan.fetch_at.contains(&at) => {
+                // Declared local variables only: a parameter would show the
+                // NULL PostgreSQL's last FETCH leaves to the caller.
+                let mut vars = Vec::new();
+                for v in &plan.vars {
+                    match self.vars.get(v) {
+                        Some(x) if x.name.starts_with("v_") => vars.push(x.name.clone()),
+                        _ => return no(format!("FETCH INTO @{v}, which is not a local variable: not converted (PostgreSQL's FETCH sets it to NULL after the last row, T-SQL keeps the last row's value)")),
+                    }
+                }
+                self.step_ts_with("tsql.cursor.fetch", &ts, plan.name.clone());
+                Ok(format!(
+                    "FETCH NEXT FROM {} INTO {}",
+                    plan.name,
+                    vars.join(", ")
+                ))
+            }
+            "CLOSE" => {
+                self.step_ts_with("tsql.cursor.close", &ts, plan.name.clone());
+                Ok(format!("CLOSE {}", plan.name))
+            }
+            "DEALLOCATE" => {
+                self.step_ts_with("tsql.cursor.deallocate", &ts, "dropped");
+                Ok(format!(
+                    "-- DEALLOCATE {}: PostgreSQL frees the cursor at CLOSE",
+                    plan.raw
+                ))
+            }
+            _ => no("cursor statement outside the cursor's standard loop: not converted"),
+        }
+    }
+
     fn txn(&mut self, kw: &str, ts: &[T]) -> R<String> {
         if self.trigger.is_some() {
             return self.misplaced(trigger::TXN);
@@ -3547,6 +4130,16 @@ impl<'a> Cx<'a> {
                     ("TABLE" | "VIEW", None, _) => format!("{o} {obj}"),
                     ("PROCEDURE" | "FUNCTION", None, _) => format!("{o} {obj}"),
                     ("TABLE" | "VIEW", Some("COLUMN"), Some(c)) => format!("COLUMN {obj}.{c}"),
+                    ("TABLE", Some("INDEX"), Some(i))
+                        if !self.db2()
+                            && self
+                                .left_out_indexes
+                                .contains(&tsql_unquote(i.trim_matches('"')).to_ascii_lowercase()) =>
+                    {
+                        return no(format!(
+                            "sp_addextendedproperty on INDEX {i}: the conversion left the (columnstore) index out, so there is nothing to comment on"
+                        ))
+                    }
                     ("TABLE", Some("INDEX"), Some(i)) if !self.db2() => {
                         format!("INDEX {schema}.{i}")
                     }
@@ -4024,10 +4617,30 @@ impl<'a> Cx<'a> {
                     .then(|| tsql_unquote(&item[f].s).to_ascii_lowercase())
             })
             .collect();
+        self.table_items = split_commas(&ts[open + 1..close])
+            .into_iter()
+            .map(<[T]>::to_vec)
+            .collect();
         let mut names = Vec::new();
         let mut indexes = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
             if sig(item).first().is_some_and(|&f| item[f].is("INDEX")) && !temp {
+                // `INDEX name CLUSTERED COLUMNSTORE` only stores the rows
+                // column by column: no key, no order, nothing enforced.
+                let words: Vec<&T> = sig(item).into_iter().map(|k| &item[k]).collect();
+                if !self.db2()
+                    && matches!(words.as_slice(), [_, n, c, s]
+                        if matches!(n.k, IDENT | QUOTED_IDENT) && c.is("CLUSTERED") && s.is("COLUMNSTORE"))
+                {
+                    self.step_ts("tsql.table.columnstore", item);
+                    self.left_out_indexes
+                        .push(tsql_unquote(&words[1].s).to_ascii_lowercase());
+                    self.note(Status::Converted, "tsql.table.columnstore", &format!(
+                        "The clustered columnstore index {} is left out: PostgreSQL has no columnstore storage, and the index has no key, orders nothing and enforces nothing, so no result depends on it. Statements that name the index (a comment on it, ALTER INDEX) have no counterpart.",
+                        words[1].s
+                    ));
+                    continue;
+                }
                 indexes.push(self.inline_index(item, &name_t)?);
                 continue;
             }
@@ -4423,6 +5036,18 @@ impl<'a> Cx<'a> {
         while e.len() > 2 && e[0].k == L_PAREN && matching(e, 0) == Some(e.len() - 1) {
             e = trimmed(&e[1..e.len() - 1]);
         }
+        if let Some((ty, expr)) = self.computed_concat(e, it[as_at].pos.0)? {
+            self.step_ts("tsql.table.computed-concat", &it[as_at..]);
+            self.note(Status::Assumptions, "ASM-COMPUTED-STORED", &format!(
+                "A computed CONCAT column (first: {0}) becomes a STORED generated column: CONCAT reads a NULL part as an empty string, so each column part becomes COALESCE(part, ''), and the column has the type SQL Server derives for the CONCAT. T-SQL computes a column that is not PERSISTED when the row is read, PostgreSQL when the row is written; CONCAT of strings cannot fail, so both give the same value. Both refuse a value written into it. Not the same: an INSERT without a column list skips the column in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                name.trim(),
+            ));
+            return Ok(format!(
+                "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
+                name.trim(),
+                if not_null { " NOT NULL" } else { "" }
+            ));
+        }
         let es = sig(e);
         if es.len() < 2 || !e[es[0]].is("CASE") || !e[*es.last().unwrap()].is("END") {
             return no(format!(
@@ -4516,6 +5141,91 @@ impl<'a> Cx<'a> {
         ))
     }
 
+    /// `CONCAT(a, b, …)` of string literals and varying-string columns of
+    /// the table: the PostgreSQL type of the result SQL Server derives (the
+    /// parts' lengths added up, unbounded when one is `max`) and the
+    /// expression `COALESCE(col, '') || 'lit' || …`. `None` when `e` is not
+    /// a CONCAT; refused when a part is anything else, or when the result
+    /// is longer than 4,000 characters (SQL Server cuts it there).
+    fn computed_concat(&mut self, e: &[T], at: usize) -> R<Option<(String, String)>> {
+        let es = sig(e);
+        let is_concat = es.len() >= 3
+            && e[es[0]].is("CONCAT")
+            && e[es[1]].k == L_PAREN
+            && matching(e, es[1]) == Some(*es.last().unwrap());
+        if !is_concat {
+            return Ok(None);
+        }
+        const REASON: &str = "computed column: CONCAT of anything but string literals and varying-string columns of the table has no rule yet";
+        let args = split_commas(&e[es[1] + 1..*es.last().unwrap()]);
+        if args.len() < 2 {
+            return no(REASON);
+        }
+        let (mut parts, mut len, mut national) = (Vec::new(), Some(0u32), false);
+        for a in args {
+            let a = trimmed(a);
+            match a {
+                [t] if t.k == STRING => {
+                    let n = t.s.starts_with(['N', 'n']);
+                    let body = t.s[usize::from(n)..].trim_matches('\'').replace("''", "'");
+                    national |= n;
+                    len = len.map(|l| l + body.encode_utf16().count() as u32);
+                    parts.push(self.expr(a).trim().to_string());
+                }
+                [t] if matches!(t.k, IDENT | QUOTED_IDENT) && !t.s.starts_with('@') => {
+                    let key = tsql_unquote(&t.s).to_ascii_lowercase();
+                    let ty: Vec<T> = self
+                        .table_items
+                        .iter()
+                        .find_map(|item| {
+                            let s = sig(item);
+                            let f = *s.first()?;
+                            (tsql_unquote(&item[f].s).to_ascii_lowercase() == key
+                                && !constraint_item(&item[f]))
+                            .then(|| s[1..].iter().map(|&k| item[k].clone()).collect())
+                        })
+                        .ok_or_else(|| No(REASON.into()))?;
+                    // `nvarchar(n)`, `varchar(n)` or `… (max)`, then column options.
+                    let word = ty.first().map(|t| tsql_unquote(&t.s).to_ascii_lowercase());
+                    let n = match word.as_deref() {
+                        Some("nvarchar") => true,
+                        Some("varchar") => false,
+                        _ => return no(REASON),
+                    };
+                    let l = match ty.get(1..4) {
+                        Some([o, v, c]) if o.k == L_PAREN && c.k == R_PAREN => {
+                            if v.is("MAX") {
+                                None
+                            } else {
+                                Some(v.s.parse::<u32>().map_err(|_| No(REASON.into()))?)
+                            }
+                        }
+                        _ => return no(REASON),
+                    };
+                    national |= n;
+                    len = len.zip(l).map(|(x, y)| x + y);
+                    parts.push(format!("COALESCE({}, '')", self.expr(a).trim()));
+                }
+                _ => return no(REASON),
+            }
+        }
+        if len.is_some_and(|l| l > 4000) {
+            return no("computed column: CONCAT longer than 4,000 characters (SQL Server cuts the result there): no rule yet");
+        }
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-concat");
+        let ty = [
+            made(IDENT, if national { "nvarchar" } else { "varchar" }),
+            made(L_PAREN, "("),
+            match len {
+                Some(l) => made(NUMBER, &l.to_string()),
+                None => made(IDENT, "max"),
+            },
+            made(R_PAREN, ")"),
+        ];
+        let (ty, _, _) = self.ty(&ty)?;
+        Ok(Some((ty, parts.join(" || "))))
+    }
+
     fn alter_table(&mut self, ts: &[T]) -> R<String> {
         let ts = Self::body_toks(ts);
         if ts
@@ -4525,6 +5235,133 @@ impl<'a> Cx<'a> {
             return self.alter_versioning(&ts);
         }
         let first = sig(&ts)[0];
+        // The action: what follows the table name.
+        let action = sig(&ts).into_iter().skip(3).find(|&k| {
+            [
+                "WITH", "ADD", "CHECK", "NOCHECK", "DROP", "ALTER", "SET", "ENABLE", "DISABLE",
+            ]
+            .iter()
+            .any(|w| ts[k].is(w))
+        });
+        // `WITH CHECK` / `WITH NOCHECK` before ADD or CHECK CONSTRAINT: whether
+        // existing rows are checked.
+        let mut checked = false;
+        let mut ts = ts.to_vec();
+        if let Some(w) = action.filter(|&w| ts[w].is("WITH")) {
+            let n = next_sig(&ts, w).ok_or(No("ALTER TABLE … WITH".into()))?;
+            if ts[n].is("NOCHECK") {
+                return no(self.pick(
+                    "ALTER TABLE … WITH NOCHECK: the constraint does not check the rows already there; PostgreSQL's nearest is NOT VALID (FOREIGN KEY and CHECK only); no rule yet",
+                    "ALTER TABLE … WITH NOCHECK: the constraint does not check the rows already there; no rule yet for Db2 for i",
+                ));
+            }
+            let then = next_sig(&ts, n).filter(|&m| ts[m].is("ADD") || ts[m].is("CHECK"));
+            if !ts[n].is("CHECK") || then.is_none() {
+                return no("ALTER TABLE … WITH: no rule for this form yet");
+            }
+            if self.db2() {
+                return no("ALTER TABLE … WITH CHECK: no rule yet for Db2 for i");
+            }
+            // PostgreSQL checks the rows already there when it adds a
+            // constraint, as WITH CHECK asks.
+            self.step_ts("tsql.table.with-check", &ts[w..=n]);
+            ts.drain(w..=n);
+            checked = true;
+        }
+        let action = action.map(|_| {
+            sig(&ts)
+                .into_iter()
+                .skip(3)
+                .find(|&k| {
+                    [
+                        "ADD", "CHECK", "NOCHECK", "DROP", "ALTER", "SET", "ENABLE", "DISABLE",
+                    ]
+                    .iter()
+                    .any(|w| ts[k].is(w))
+                })
+                .unwrap_or(ts.len())
+        });
+        if let Some(act) = action.filter(|&k| k < ts.len()) {
+            let head = self.expr(&ts[..act]).trim_end().to_string();
+            let after = next_sig(&ts, act);
+            // `CHECK CONSTRAINT name` turns a constraint on (and, after WITH
+            // CHECK, checks the rows already there); `NOCHECK` turns it off.
+            if (ts[act].is("CHECK") || ts[act].is("NOCHECK"))
+                && after.is_some_and(|k| ts[k].is("CONSTRAINT"))
+            {
+                if ts[act].is("NOCHECK") {
+                    return no(self.pick(
+                        "ALTER TABLE … NOCHECK CONSTRAINT: PostgreSQL cannot turn a constraint off; drop it and add it back",
+                        "ALTER TABLE … NOCHECK CONSTRAINT: no rule yet for Db2 for i",
+                    ));
+                }
+                if self.db2() {
+                    return no("ALTER TABLE … CHECK CONSTRAINT: no rule yet for Db2 for i");
+                }
+                let names: Vec<&[T]> = split_commas(&ts[after.unwrap() + 1..]);
+                let [name] = names.as_slice() else {
+                    return no(
+                        "ALTER TABLE … CHECK CONSTRAINT with several constraints: no rule yet",
+                    );
+                };
+                if trimmed(name).len() != 1 || trimmed(name)[0].is("ALL") {
+                    return no("ALTER TABLE … CHECK CONSTRAINT ALL: no rule yet");
+                }
+                // PostgreSQL constraints are always on; VALIDATE checks the
+                // rows already there (nothing to do for a constraint that
+                // was added with its check).
+                self.step_ts("tsql.table.check-constraint", &ts[act..]);
+                if !checked {
+                    self.note(Status::Assumptions, "ASM-CONSTRAINT-ROWS-VALID", "CHECK CONSTRAINT becomes VALIDATE CONSTRAINT, which also checks the rows already in the table: T-SQL turns the constraint on without checking them (it stays not trusted), PostgreSQL fails if one of them breaks it.");
+                }
+                let n = self.expr(name).trim().to_string();
+                return Ok(format!("{head} VALIDATE CONSTRAINT {n}"));
+            }
+            // `ADD [CONSTRAINT n] DEFAULT value FOR column`.
+            if ts[act].is("ADD") {
+                let mut d = after.ok_or(No("ADD without a column".into()))?;
+                if ts[d].is("CONSTRAINT") {
+                    d = next_sig(&ts, d)
+                        .and_then(|n| next_sig(&ts, n))
+                        .ok_or(No("ADD CONSTRAINT without a name".into()))?;
+                }
+                if ts[d].is("DEFAULT") {
+                    if self.db2() {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR: no rule yet for Db2 for i");
+                    }
+                    let f = find_word(&ts, d + 1, "FOR")
+                        .ok_or(No("ADD DEFAULT without FOR column".into()))?;
+                    let col = trimmed(&ts[f + 1..]);
+                    if col.len() != 1 || !matches!(col[0].k, IDENT | QUOTED_IDENT) {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR: one column only");
+                    }
+                    let tname = find_word(&ts, 0, "TABLE")
+                        .map(|t| self.table_bit_cols(&ts[t + 1..act]))
+                        .unwrap_or_default();
+                    let colname = tsql_unquote(&col[0].s).to_ascii_lowercase();
+                    if tname.iter().any(|b| b.eq_ignore_ascii_case(&colname)) {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a BIT column: no rule yet");
+                    }
+                    if find_word(&ts, 0, "TABLE")
+                        .is_some_and(|t| self.table_col_has_default(&ts[t + 1..act], &colname))
+                    {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a column that already has a default or is an identity: SQL Server refuses it (Msg 1781), PostgreSQL's SET DEFAULT would replace the default");
+                    }
+                    let mut value = trimmed(&ts[d + 1..f]);
+                    while value.len() > 2
+                        && value[0].k == L_PAREN
+                        && matching(value, 0) == Some(value.len() - 1)
+                    {
+                        value = trimmed(&value[1..value.len() - 1]);
+                    }
+                    self.step_ts("tsql.table.add-default", &ts[act..]);
+                    self.note(Status::Assumptions, "ASM-DEFAULT-CONSTRAINT-NAME", "The default becomes ALTER COLUMN … SET DEFAULT. Assumes the column has no default yet: SQL Server refuses a second default (Msg 1781) where SET DEFAULT replaces it. PostgreSQL defaults have no name, so a later ALTER TABLE … DROP CONSTRAINT of it finds no constraint.");
+                    let v = self.expr(value).trim().to_string();
+                    let c = self.expr(col).trim().to_string();
+                    return Ok(format!("{head} ALTER COLUMN {c} SET DEFAULT {v}"));
+                }
+            }
+        }
         if find_word(&ts, first + 1, "ALTER").is_some() {
             return no(self.pick(
                 "ALTER COLUMN: PostgreSQL uses ALTER COLUMN … TYPE / SET NOT NULL as separate actions",
@@ -7623,6 +8460,184 @@ struct ScopeEntry {
 
 /// The FROM, JOIN, UPDATE, MERGE and USING items of a statement, at any
 /// depth. `None` when the statement has CTEs, whose names would hide tables.
+/// Why GOTO is not converted. PL/pgSQL has no GOTO; a jump forward to a
+/// label later in an enclosing statement list (Ola Hallengren's `GOTO
+/// Logging`) is a labelled block left with EXIT, which the engine does not
+/// compare yet.
+fn goto(n: &SyntaxNode, label: &str) -> String {
+    let at = n.text_range().start();
+    let forward = n.ancestors().skip(1).any(|a| {
+        a.children().any(|c| {
+            c.kind() == LABEL
+                && c.text_range().start() > at
+                && c.text()
+                    .to_string()
+                    .trim()
+                    .trim_end_matches(':')
+                    .eq_ignore_ascii_case(label)
+        })
+    });
+    if forward {
+        format!("GOTO {label}: PL/pgSQL has no GOTO. This jump forward is a labelled block from here to the label, left with EXIT (<<{0}>> BEGIN … EXIT {0}; … END; then the statements after {label}:); not converted yet, since the engine does not compare such blocks", label.to_lowercase())
+    } else {
+        format!("GOTO {label}: PL/pgSQL has no GOTO, and this jump does not go forward to a label in an enclosing statement list; rewrite it as a loop or IF; not converted")
+    }
+}
+
+/// Why a SQLCMD directive (`:r`, `:setvar`, `:on error`, …) is not
+/// converted: it is not SQL.
+fn sqlcmd(cmd: &str) -> String {
+    match cmd.to_ascii_lowercase().as_str() {
+        "r" => ":r includes another file: a SQLCMD directive, not SQL. The included file is converted on its own; include its conversion with psql's \\ir (or run it in order) after review".into(),
+        c => format!(":{c}: a SQLCMD directive, not SQL; not converted"),
+    }
+}
+
+/// PostgreSQL: a T-SQL cursor loop as the rules convert it
+/// (`Cx::cursor_plan`).
+#[derive(Debug, Clone)]
+struct CursorPlan {
+    /// The PL/pgSQL `refcursor` variable.
+    name: String,
+    /// The T-SQL cursor name.
+    raw: String,
+    /// The cursor's query (after FOR).
+    query: Vec<T>,
+    /// The T-SQL variables FETCH sets (lower case, without `@`).
+    vars: Vec<String>,
+    /// STATIC or INSENSITIVE: T-SQL reads the rows as of OPEN.
+    stat: bool,
+    /// LOCAL: T-SQL frees it when the routine ends.
+    local: bool,
+    open_at: (usize, usize),
+    /// The FETCH before the loop and the one that ends its body.
+    fetch_at: Vec<(usize, usize)>,
+    loop_at: (usize, usize),
+}
+
+/// The significant tokens of a node, words upper-cased.
+fn sig_words(n: &SyntaxNode) -> Vec<String> {
+    sig_words_t(&tokens(n))
+}
+
+fn sig_words_t(ts: &[T]) -> Vec<String> {
+    ts.iter()
+        .filter(|t| t.sig() && t.k != SEMICOLON)
+        .map(|t| {
+            if t.k == IDENT {
+                tsql_unquote(&t.s).to_ascii_uppercase()
+            } else {
+                t.s.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+/// `FETCH [NEXT] [FROM] cursor INTO @a, @b`: the variables (lower case,
+/// without `@`), when `n` is that FETCH of `cursor` (lower case).
+fn fetch_into(n: &SyntaxNode, cursor: &str) -> Option<Vec<String>> {
+    if n.kind() != STATEMENT {
+        return None;
+    }
+    let w = sig_words(n);
+    let mut i = 1;
+    if w.first()? != "FETCH" {
+        return None;
+    }
+    if w.get(i)? == "NEXT" {
+        i += 1;
+    }
+    if w.get(i)? == "FROM" {
+        i += 1;
+    }
+    if !w.get(i)?.eq_ignore_ascii_case(cursor) || w.get(i + 1)? != "INTO" {
+        return None;
+    }
+    let mut vars = Vec::new();
+    for (k, x) in w[i + 2..].iter().enumerate() {
+        if k % 2 == 1 {
+            if x != "," {
+                return None;
+            }
+            continue;
+        }
+        let v = x.strip_prefix('@').filter(|v| !v.starts_with('@'))?;
+        vars.push(v.to_ascii_lowercase());
+    }
+    (!vars.is_empty() && vars.iter().collect::<std::collections::HashSet<_>>().len() == vars.len())
+        .then_some(vars)
+}
+
+/// The statements of a loop body: a BEGIN … END block's, or the one statement.
+fn loop_units(branch: &SyntaxNode) -> Vec<SyntaxNode> {
+    let kids: Vec<SyntaxNode> = branch.children().filter(|c| c.kind().is_unit()).collect();
+    match kids.as_slice() {
+        [b] if b.kind() == BLOCK => b.children().filter(|c| c.kind().is_unit()).collect(),
+        _ => kids,
+    }
+}
+
+/// Tables a statement names after FROM, JOIN, APPLY or USING, or as the
+/// target of INSERT, UPDATE, DELETE or MERGE (last name part, lower case):
+/// over-approximates the tables it reads or writes.
+fn table_names(ts: &[T]) -> Vec<String> {
+    let s = sig(ts);
+    let mut out = Vec::new();
+    for (k, &j) in s.iter().enumerate() {
+        let kw = [
+            "FROM", "JOIN", "APPLY", "USING", "INTO", "INSERT", "UPDATE", "DELETE", "MERGE",
+        ];
+        if !kw.iter().any(|w| ts[j].is(w)) {
+            continue;
+        }
+        let mut last = None;
+        let mut want_name = true;
+        for &x in &s[k + 1..] {
+            match ts[x].k {
+                IDENT | QUOTED_IDENT if want_name => {
+                    last = Some(tsql_unquote(&ts[x].s).to_ascii_lowercase());
+                    want_name = false;
+                }
+                DOT if !want_name => want_name = true,
+                _ => break,
+            }
+        }
+        if let Some(l) = last.filter(|l| !kw.iter().any(|w| l.eq_ignore_ascii_case(w))) {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// The tables a write statement may change: the target of INSERT or MERGE;
+/// for UPDATE and DELETE also the tables after FROM, since the target may
+/// be an alias of one of them; for a statement with a CTE every table it
+/// names.
+fn written_tables(ts: &[T]) -> Vec<String> {
+    let s = sig(ts);
+    let Some(&first) = s.first() else {
+        return Vec::new();
+    };
+    if ts[first].is("UPDATE") || ts[first].is("DELETE") || ts[first].is("WITH") {
+        return table_names(ts);
+    }
+    let ds = crate::tok::depths(ts);
+    // INSERT [INTO] t …, MERGE [INTO] t …: the name after the keyword.
+    let head: Vec<T> = s
+        .iter()
+        .take_while(|&&j| {
+            ds[j] == 0
+                && ![
+                    "SELECT", "VALUES", "USING", "EXEC", "EXECUTE", "DEFAULT", "OUTPUT",
+                ]
+                .iter()
+                .any(|w| ts[j].is(w))
+        })
+        .map(|&j| ts[j].clone())
+        .collect();
+    table_names(&head).into_iter().take(1).collect()
+}
+
 fn scope_of(ts: &[T]) -> Option<Scope> {
     if cte_list(ts).is_some() {
         return None;

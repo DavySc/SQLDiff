@@ -90,7 +90,10 @@ routine, are compared table against table, in order (`equiv/table.rs`). They
 must sit in the same place: after as many data statements on each side, or on
 the same side of the routine. Only T-SQL against PostgreSQL is compared; Db2
 for i column types have no verified facts yet, so a Db2 for i table is not
-compared (not proven).
+compared (not proven). When one side creates fewer tables (the conversion
+left a CREATE TABLE out), the tables are paired by the name they create, but
+only when every name reads, no side creates a name twice and the pairs keep
+both sides' order; the table with no counterpart stays not compared.
 
 Each statement is read completely. A clause the model does not know leaves the
 table not compared: a computed or generated column, a column collation, a
@@ -290,6 +293,42 @@ fails ("query string argument of EXECUTE is null"), `EXECUTE ''` does nothing,
 `EXECUTE 'SELECT 1'` discards the row, and one `EXECUTE` may run several
 statements; `format('%I', NULL)` fails.
 
+### Parameters: `sp_executesql` against `EXECUTE … USING`
+
+`EXEC sp_executesql N'… @v …', N'@v int, …', @v = @a, …` passes values to
+parameters its text reads; PL/pgSQL `EXECUTE '… $1 …' USING a, …` passes them
+by position. The parameter list must be known text like the statement (a
+literal or a variable read as above), with plain input parameters only (no
+default, OUTPUT or READONLY), each passed exactly once by name or position.
+Each value must be a variable of the routine on both sides, the same
+variable, declared on the T-SQL side with exactly the parameter's type, and
+of the same type on the PostgreSQL side. Each text then becomes the body of a
+procedure taking the parameters in order (`@v` on T-SQL, `$n` renamed on
+PostgreSQL, with the type of the n-th value), and the two procedures are
+compared as files; the pair is equal exactly when they are. A difference a
+witness finds is never kept as "different": the witness picks parameter
+values the routine fixes. The text may read only its own parameters.
+
+Why only variables of exactly the parameter's type: SQL Server converts a
+value to the parameter's type as it passes it, PostgreSQL types `$n` by the
+value. Facts (SQL Server 2022 and PostgreSQL 18.6, run 2026-10-29): `2.7`
+passed to an `int` parameter arrives as 2, `USING 2.7` assigned to an
+integer column stores 3; `'12345'` passed to `varchar(2)` arrives as '12';
+`USING '8'::text` assigned to an integer column fails ("column is of type
+integer but expression is of type text"); a declared parameter that is not
+passed fails the call (error 8178), while `USING` may leave `$n` unread;
+NULL values pass as NULL on both sides.
+
+`QUOTENAME(@x)` of a parameter is not converted: the name a value stands for
+on PostgreSQL depends on how the conversion names objects (case folded,
+`dbo` mapped, names with capitals or spaces quoted), which a value known only
+at run time cannot follow. Facts: `QUOTENAME` takes up to 128 characters
+(NULL above; 128 `]` give 258 characters), resolves `[cityid]` to column
+`CityID` under the CI collation; `quote_ident('CityID')` is `"CityID"`, which
+does not resolve to `cityid`; `quote_ident(NULL)` is NULL while
+`format('%I', NULL)` fails; PostgreSQL cuts an identifier over 63 bytes with
+a notice.
+
 ## Indexes, sequences and schemas
 
 A script's top-level `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE SCHEMA`
@@ -380,6 +419,23 @@ index named like another index or a table of the schema, rejects `WITH` after
 `WHERE`, and has no role `dbo`. Sequence defaults as in the table, read from
 `sys.sequences` and `pg_sequences`; both restart a cycling sequence at its
 minimum.
+
+T-SQL against PostgreSQL only, `DROP TABLE / VIEW / PROCEDURE / FUNCTION /
+SEQUENCE / SCHEMA` of one object is compared by kind, name and `IF EXISTS`
+(a differing `IF EXISTS` is a difference: without it a missing object fails
+the script). Several objects in one DROP, an argument list and `CASCADE`
+are not compared: T-SQL drops the objects one by one and stops at the first
+that fails, PostgreSQL drops all or none. A DROP of anything but a schema
+assumes `ASM-DROP-NO-DEPENDENTS`: PostgreSQL refuses (RESTRICT, its default)
+to drop an object a view, default or trigger depends on, and a routine name
+with several signatures, where SQL Server drops a table or view under a view
+that is not schema-bound (from the vendors' documentation, not probed). A
+schema is dropped only when empty on both. A column default added after the
+table, T-SQL `ADD [CONSTRAINT n] DEFAULT v FOR c` against PostgreSQL `ALTER
+COLUMN c SET DEFAULT v`, is compared like a table's default (`SELECT v`), with
+`ASM-DEFAULT-CONSTRAINT-NAME` when T-SQL names it. A DROP TABLE or default
+must come after the file's CREATE TABLE of that table on both sides, or on
+neither.
 
 ## Scripts
 

@@ -264,3 +264,89 @@ fn dynamic_sql_inside_an_if_is_not_compared() {
         r.unknown_reasons
     );
 }
+
+#[test]
+fn sp_executesql_parameters_against_using() {
+    let t = tsql("    DECLARE @a int = 1;\n    EXEC sp_executesql N'UPDATE dbo.t SET a = @v WHERE id = @k', N'@v int, @k int', @v = @a, @k = @x;");
+    let p = pg("    DECLARE\n        v_a int := 1;\n    BEGIN\n    EXECUTE 'UPDATE t SET a = $1 WHERE id = $2' USING v_a, p_x;\n    END;");
+    let r = run(&t, &p);
+    assert!(dynamic_reasons(&r).is_empty(), "{:?}", r.unknown_reasons);
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:#?} {:?}",
+        r.findings,
+        r.unknown_reasons
+    );
+}
+
+fn param_case(targs: &str, ttypes: &str, using: &str, ptext: &str) -> Report {
+    run(
+        &tsql(&format!("    DECLARE @a int = 1;\n    DECLARE @b bigint = 1;\n    EXEC sp_executesql N'UPDATE dbo.t SET a = @v WHERE id = @k', N'{ttypes}', {targs};")),
+        &pg(&format!("    DECLARE\n        v_a int := 1;\n        v_b bigint := 1;\n    BEGIN\n    EXECUTE '{ptext}' USING {using};\n    END;")),
+    )
+}
+
+#[test]
+fn parameters_passed_differently_are_not_equal() {
+    let same = "UPDATE t SET a = $1 WHERE id = $2";
+    // Values swapped: the routine passes @x as the new value on one side only.
+    let r = param_case("@v = @a, @k = @x", "@v int, @k int", "p_x, v_a", same);
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // Placeholders swapped inside the text.
+    let r = param_case(
+        "@v = @a, @k = @x",
+        "@v int, @k int",
+        "v_a, p_x",
+        "UPDATE t SET a = $2 WHERE id = $1",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // A bigint passed to an int parameter: T-SQL converts it, $1 is bigint.
+    let r = param_case("@v = @b, @k = @x", "@v int, @k int", "v_b, p_x", same);
+    assert!(
+        dynamic_reasons(&r)
+            .iter()
+            .any(|x| x.contains("not the parameter's")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // A literal value is not compared.
+    let r = param_case("@v = 2, @k = @x", "@v int, @k int", "2, p_x", same);
+    assert!(
+        dynamic_reasons(&r)
+            .iter()
+            .any(|x| x.contains("only a variable")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // A declared parameter not passed fails the T-SQL call.
+    let r = param_case("@v = @a", "@v int, @k int", "v_a", same);
+    assert!(
+        dynamic_reasons(&r).iter().any(|x| x.contains("not passed")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    // Positional values bind in order.
+    let r = param_case("@a, @x", "@v int, @k int", "v_a, p_x", same);
+    assert!(dynamic_reasons(&r).is_empty(), "{:?}", r.unknown_reasons);
+    // $3 with two values.
+    let r = param_case(
+        "@v = @a, @k = @x",
+        "@v int, @k int",
+        "v_a, p_x",
+        "UPDATE t SET a = $3 WHERE id = $2",
+    );
+    assert!(
+        dynamic_reasons(&r).iter().any(|x| x.contains("$3")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
