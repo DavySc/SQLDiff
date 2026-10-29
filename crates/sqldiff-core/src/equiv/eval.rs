@@ -5002,3 +5002,31 @@ fn rej<T>() -> R<T> {
     }
     Err(Stop::Reject)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouping_does_not_split_strings_a_collation_may_join() {
+        let s = |x: &str| V::Str(x.into());
+        assert_eq!(group_same(&s("a"), &s("A")), None);
+        assert_eq!(group_same(&s("a"), &s("a ")), None);
+        assert_eq!(group_same(&s("a"), &s("b")), Some(false));
+        assert_eq!(group_same(&s("a"), &s("a")), Some(true));
+        assert_eq!(group_same(&V::Null, &V::Null), Some(true));
+        // Output rows still tell 'a' and 'A' apart.
+        assert_eq!(same(&s("a"), &s("A")), Some(false));
+    }
+
+    #[test]
+    fn group_by_names_match_by_column_and_qualifier() {
+        let n = |x: &str| x.split('.').map(String::from).collect::<Vec<_>>();
+        assert!(same_column(&n("g"), &n("G"), 2));
+        assert!(same_column(&n("dbo.t.g"), &n("t.g"), 2));
+        assert!(same_column(&n("t.g"), &n("g"), 1));
+        assert!(!same_column(&n("t.g"), &n("g"), 2));
+        assert!(!same_column(&n("a.g"), &n("b.g"), 2));
+        assert!(!same_column(&n("g"), &n("n"), 1));
+    }
+}
