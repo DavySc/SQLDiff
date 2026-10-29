@@ -49,6 +49,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V27 | Db2 i labeled durations as the DATEADD rewrite | Unverified | Month-end clamping and warning 01506, TIME wrap-around, `CAST(… AS INTEGER)` truncation, BIGINT microsecond durations, the 9999 range error: probes `V27-*` in `probes/db2i`. |
 | V29 | Db2 i unique indexes, index names, sequence defaults | Unverified | NULLs, case and trailing blanks in a UNIQUE index; an index named like a table; the default type and first value of a sequence: probes `V29-*` in `probes/db2i`. |
 | V32 | Db2 i ORDER BY and FETCH FIRST below the outer query | Unverified | FETCH FIRST n ROWS ONLY and ORDER BY in a derived table, IN and scalar subquery, CTE (and INSERT … SELECT, view), and a NULL row count: probes `V32-*` in `probes/db2i`. |
+| V33 | Db2 i date and timestamp strings | Partial | ISO `yyyy-mm-dd` dates, ISO and IBM SQL timestamps (0 to 12 fraction digits, padded or truncated to the precision) documented; T-SQL's compact `yyyymmdd` is not a Db2 i date or timestamp string. That an assignment reads them as a CAST does is inferred: probes `V33-*` in `probes/db2i`. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -303,6 +304,17 @@ What converted indexes and sequences rely on (`equiv/ddl.rs`, "Indexes, sequence
 - A schema name longer than 10 characters: its library gets a generated system name (not probed, since the probes create nothing outside `SQLDFPROBE`); such schemas are not proven.
 
 Probes `V29-*` in [probes/db2i](../probes/db2i/README.md).
+
+### V33. Date and timestamp strings on Db2 for i — Partial
+
+T-SQL assigns compact literals to date and datetime2 variables (`DECLARE @d datetime2(7) = '20200101'`, `@EndOfTime = '99991231 23:59:59.9999999'`, 143 such literals in WideWorldImporters). Read on 2026-10-29 in the IBM i 7.6 [Timestamp strings](https://www.ibm.com/docs/en/ssw_ibm_i_76/db2/rbafztsstrings.htm) and IBM i 7.4 [Date strings](https://ibm.com/docs/th/ssw_ibm_i_74/db2/rbafzdatestrings.htm) pages of the Db2 for i SQL Reference (the 7.5 pages refused the fetch):
+
+- A timestamp string "starts with a digit and has a length of at least 14 characters", in the ISO form `yyyy-mm-dd hh:mm:ss.nnnnnnnnnnnn`, the IBM SQL form `yyyy-mm-dd-hh.mm.ss.nnnnnnnnnnnn`, or 14 to 26 digits without separators. "The number of digits of fractional seconds can vary from 0 to 12"; the separator before them may be left out with them. In a cast, "Digits in the string beyond the timestamp precision of the cast are truncated" and missing ones "are assumed to be zeros". Leading zeros may be left out of month, day, hour, minute and second; trailing blanks are allowed.
+- A date string "starts with a digit and has a length of at least 6 characters", in ISO or JIS `yyyy-mm-dd`, USA `mm/dd/yyyy`, EUR `dd.mm.yyyy`, the job's default format (DATFMT/DATSEP, two-digit years), or the unformatted Julian `yyyyddd`.
+- So T-SQL's `'20200101'` is neither a Db2 for i date string (8 digits: no listed form) nor a timestamp string (shorter than 14), and `'99991231 23:59:59.9999999'` is not a timestamp string (a space, but no dashes). A Db2 for i output that kept them failed at run time.
+- Not documented on these pages, and inferred: that assigning a string to a DATE or TIMESTAMP variable or column reads it as the cast does (the "Datetime assignments" page could not be read). Held as `ASM-FACT-V33`.
+
+The converter writes a date or date-and-time literal assigned to a Db2 for i variable in the ISO form of the value T-SQL stores (`'2020-01-01 00:00:00'`, `'9999-12-31 23:59:59.9999999'` into TIMESTAMP(7)), only when T-SQL stores it exactly. The engine (`equiv/literal.rs`) reads only two-digit ISO dates and two-digit ISO or IBM SQL timestamps with at most the target's fraction digits, in a CAST or an assignment, never in a comparison. Probes `V33-*` in [probes/db2i](../probes/db2i/README.md).
 
 ## Follow-up
 

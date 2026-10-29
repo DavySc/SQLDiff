@@ -2433,7 +2433,16 @@ impl<'a> Cx<'a> {
                 .vars
                 .get(&a.s[1..].to_ascii_lowercase())
                 .is_some_and(|v| v.dt == Dt::Bit);
-            let rhs = if bit && op.s == "=" {
+            let dt = self
+                .vars
+                .get(&a.s[1..].to_ascii_lowercase())
+                .map_or(Dt::Other, |v| v.dt);
+            let date = (op.s == "=")
+                .then(|| self.date_store(dt, &ts[value..]))
+                .flatten();
+            let rhs = if let Some(d) = date {
+                d
+            } else if bit && op.s == "=" {
                 self.bit_store_text(&ts[value..])
             } else {
                 self.expr(&ts[value..]).trim().to_string()
@@ -2585,7 +2594,7 @@ impl<'a> Cx<'a> {
             return self.table_variable(&ts);
         }
         let mut lines = Vec::new();
-        let mut pending = Vec::new(); // (variable, initialiser tokens, BIT)
+        let mut pending = Vec::new(); // (variable, initialiser tokens, BIT, T-SQL type)
         for item in split_commas(&ts[*s.get(1).ok_or(No("DECLARE without a name".into()))?..]) {
             let it = trimmed(item);
             let Some(v) = it.first().filter(|t| t.k == VARIABLE) else {
@@ -2628,8 +2637,8 @@ impl<'a> Cx<'a> {
             self.step_ts_with("tsql.decl.variable", it, line.clone());
             lines.push(line);
             if let Some(eq) = eq {
-                let bit = Dt::of_tokens(&it[j..eq]) == Dt::Bit;
-                pending.push((name, it[eq + 1..].to_vec(), bit));
+                let dt = Dt::of_tokens(&it[j..eq]);
+                pending.push((name, it[eq + 1..].to_vec(), dt == Dt::Bit, dt));
             }
         }
         // Type notes belong to the hoisted declaration; initialiser notes to
@@ -2645,8 +2654,10 @@ impl<'a> Cx<'a> {
         let db2 = self.db2();
         let inits: Vec<String> = pending
             .iter()
-            .map(|(name, init, bit)| {
-                let v = if *bit {
+            .map(|(name, init, bit, dt)| {
+                let v = if let Some(d) = self.date_store(*dt, init) {
+                    d
+                } else if *bit {
                     self.bit_store_text(init)
                 } else {
                     self.expr(init).trim().to_string()
@@ -4321,6 +4332,46 @@ impl<'a> Cx<'a> {
             self.step_ts("tsql.expr.literal-fraction", std::slice::from_ref(t));
             self.note(Status::Assumptions, "ASM-LITERAL-FRACTION", "A date and time literal with 7 fractional digits: where it meets a date and time value, T-SQL keeps the 100 ns digit and PostgreSQL rounds it to microseconds ('9999-12-31 23:59:59.9999999' becomes 10000-01-01 00:00:00). Equal only if no stored value lies within half a microsecond of the literal without being equal to it (data moved with the same rounding).");
         }
+    }
+
+    /// A date or date-and-time literal assigned to a variable of T-SQL type
+    /// `dt`, for Db2 for i: the ISO text of the value T-SQL stores. Db2 for i
+    /// reads neither T-SQL's compact `yyyymmdd` nor `yyyymmdd hh:mm:ss` as a
+    /// date or timestamp (fact V33: a date string is ISO, USA, EUR, JIS, the
+    /// job's format or `yyyyddd`; a timestamp string without separators has
+    /// 14 to 26 digits), so `'20200101'` would fail there at run time. None
+    /// when `ts` is not one such literal or T-SQL would round it.
+    fn date_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
+        use sqldiff_core::equiv::literal::{iso_tsql, Target};
+        if !self.db2() {
+            return None;
+        }
+        let target = match dt {
+            Dt::Date => Target::Date,
+            Dt::DateTime2(p) if p <= 7 => Target::Timestamp { digits: p },
+            Dt::DateTime => Target::Datetime,
+            Dt::SmallDateTime => Target::Smalldatetime,
+            _ => return None,
+        };
+        let [i] = sig(ts)[..] else {
+            return None;
+        };
+        let t = &ts[i];
+        if t.k != STRING {
+            return None;
+        }
+        let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+        let body = lit.strip_prefix('\'').and_then(|x| x.strip_suffix('\''))?;
+        if body.contains('\'') {
+            return None;
+        }
+        let (text, asm) = iso_tsql(body, target)?;
+        if let Some((id, why)) = asm {
+            self.note(Status::Assumptions, id, why);
+        }
+        self.note(Status::Assumptions, "ASM-FACT-V33", "A date or timestamp literal is written in the ISO form ('yyyy-mm-dd', 'yyyy-mm-dd hh:mm:ss.n'), which Db2 for i reads as that value when it is assigned, as it does in a CAST (fact V33, not checked on a real system). T-SQL's compact 'yyyymmdd' is not a Db2 for i date or timestamp string.");
+        self.step_ts("tsql.expr.datetime-literal", &ts[i..=i]);
+        Some(format!("'{text}'"))
     }
 
     fn ci_note(&mut self) {
