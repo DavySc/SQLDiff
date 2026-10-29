@@ -471,19 +471,41 @@ fn a_partition_scheme_shapes_only_storage() {
 
 #[test]
 fn statements_beside_several_routines_are_each_reported() {
-    // A file with two routines is not compared; the statements outside them
-    // must not count as compared either.
-    let a = "CREATE SCHEMA Sales;\nGO\nCREATE PROCEDURE dbo.A AS SELECT 1;\nGO\nCREATE PROCEDURE dbo.B AS SELECT 2;\nGO\nDROP TABLE dbo.Old;\n";
-    let b = "CREATE SCHEMA Salesx;\nCREATE PROCEDURE A() LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE PROCEDURE B() LANGUAGE sql AS $$ SELECT 2 $$;\nDROP TABLE Old;\n";
-    let r = run(a, b);
-    assert!(rules(&r).contains(&"equiv.schema-name"), "{:?}", rules(&r));
-    assert!(
-        r.unknown_reasons
-            .iter()
-            .any(|x| x.starts_with("side A (T-SQL) line 7:") && x.contains("outside the routines")),
-        "{:?}",
-        r.unknown_reasons
+    // A file whose routines do not meet their counterparts in order is not
+    // compared; the statements outside them must not count as compared
+    // either. Routines that do meet are compared one by one, and so are the
+    // statements between them.
+    let a = "CREATE SCHEMA Sales;\nGO\nCREATE PROCEDURE dbo.A AS SELECT 1;\nGO\nCREATE PROCEDURE dbo.B AS SELECT 2;\nGO\nTRUNCATE TABLE dbo.Old;\n";
+    let b = "CREATE SCHEMA Salesx;\nCREATE PROCEDURE A() LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE PROCEDURE B() LANGUAGE sql AS $$ SELECT 2 $$;\nTRUNCATE TABLE Old;\n";
+    for (b, why) in [
+        (b.to_string(), "TRUNCATE"),
+        (
+            b.replace("PROCEDURE A()", "PROCEDURE C()"),
+            "outside the routines",
+        ),
+    ] {
+        let r = run(a, &b);
+        assert!(rules(&r).contains(&"equiv.schema-name"), "{:?}", rules(&r));
+        assert!(
+            r.unknown_reasons
+                .iter()
+                .any(|x| x.starts_with("side A (T-SQL) line 7:") && x.contains(why)),
+            "{why}: {:?}",
+            r.unknown_reasons
+        );
+    }
+}
+
+#[test]
+fn a_script_part_with_only_a_schema_or_index_is_compared() {
+    // A plain part beside a block, holding only DDL the engine compares
+    // statement against statement, meets its partner (it was left out as if
+    // empty).
+    let r = run(
+        "CREATE SCHEMA Sales;\nGO\nDECLARE @x int = 1;\n",
+        "CREATE SCHEMA Salesx;\nDO $$ DECLARE x integer := 1; BEGIN END $$;\n",
     );
+    assert!(rules(&r).contains(&"equiv.schema-name"), "{:?}", rules(&r));
 }
 
 #[test]

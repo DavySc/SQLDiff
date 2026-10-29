@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 51 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 90 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 92 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 187 |
+| | Total | 190 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -77,6 +77,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-COMPUTED-STORED` | PostgreSQL: no INSERT relies on T-SQL skipping a computed column in an INSERT without a column list, and none writes DEFAULT into it; the column became a STORED generated column with the same values. | `deployment` | The code base's INSERTs into the table name their columns (the engine compares no INSERT without a column list). | `sqldiff-convert/src/tsql.rs` |
 | `ASM-CONCAT-NULL` | T-SQL sessions run with CONCAT_NULL_YIELDS_NULL ON (the default). | `deployment` | No session sets CONCAT_NULL_YIELDS_NULL OFF. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-CONCURRENT-WRITERS` | Other sessions can change the tables the routine reads while it runs. | `deployment` | Whether other sessions write the tables while the routine runs. | `sqldiff-core/src/ir/behaviour.rs` |
+| `ASM-CONSTRAINT-ROWS-VALID` | The rows already in the table satisfy a constraint that ALTER TABLE … CHECK CONSTRAINT turns on: PostgreSQL's VALIDATE CONSTRAINT checks them, T-SQL does not. | `deployment` | The table holds no row that breaks the constraint when the statement runs. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-CTE-MAXRECURSION` | A recursive CTE stays within T-SQL's recursion limit (the target has none). | `deployment` | The data never recurses deeper than the limit. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DATALENGTH` | DATALENGTH and octet_length count the same bytes (they differ for NVARCHAR: UTF-16 against UTF-8). | `deployment` | The values measured hold no NVARCHAR data, or callers do not depend on the byte count. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DATEADD-RANGE` | DATEADD results stay within the range of their type. | `deployment` | The data never moves a date past the type's range. | `sqldiff-convert/src/tsql.rs` |
@@ -104,7 +105,9 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-DB2-UTC` | The job's current UTC offset gives UTC time (off by the change around a daylight-saving switch). | `deployment` | The job's time zone, and whether the code runs around a switch. (fact key `time_zone`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DB2I-RESERVED-UNCHECKED` | A name is not a Db2 for i reserved word (no verified list is built in). | `nothing` | A verified reserved-word list, or the name created on a real system. | `sqldiff-convert/src/names.rs` |
 | `ASM-DBO-SCHEMA` | Objects in T-SQL schema dbo are found in the target's default schema (search_path, CURRENT SCHEMA or library list). | `deployment` | The target's default schema holds the converted objects. (fact key `default_schema`) | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `ASM-DEFAULT-CONSTRAINT-NAME` | The column has no default yet when the default is added, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name. | `deployment` | The column has no default before the statement runs, and no later statement drops or alters the default constraint by name. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-DEFAULT-SCHEMA` | Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides. | `deployment` | The default schema in effect on both sides. (fact key `default_schema`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-DROP-NO-DEPENDENTS` | No view, routine or other object depends on a dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP, SQL Server drops a table or view under a view that is not schema-bound. | `catalog` | The target catalog's dependencies (pg_depend) on the object are only those dropped with it, and its routine name has one signature. | `sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-END-OF-TIME` | T-SQL's end of time 9999-12-31 23:59:59.9999999, written for PostgreSQL as 23:59:59.999999, is only an open-end sentinel: compared with values converted by the same rule, and data moved from SQL Server truncates its 7th digit rather than rounding it to 10000-01-01. | `deployment` | The value is used only as an open-end sentinel, and data was moved with the 7th digit truncated. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-EXACTLY-ONE-ROW` | The query returns exactly one row: with none, T-SQL keeps the variable and PostgreSQL sets it to NULL. | `deployment` | The data: a row always exists for the predicate (a unique key alone gives at most one). | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-EXTPROP-COMMENT` | Whoever reads the T-SQL extended property reads the target's comment instead (one unnamed comment per object). | `deployment` | The tools that read the property. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
