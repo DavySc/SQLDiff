@@ -11,6 +11,7 @@ pub mod ast;
 mod call;
 pub mod canon;
 pub mod compare;
+pub mod cursor;
 pub mod ddl;
 pub mod dynamic;
 pub mod edit;
@@ -99,6 +100,8 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
         c.reset();
         let mut nodes = vec![s.node.clone()];
         let res = match (&s.msg, &s.ast) {
+            // A statement of a cursor loop.
+            _ if s.cursor.is_some() => c.cursor_op(s.cursor.as_ref().unwrap()),
             // A message a format builds: compared as its text.
             (Some(m), _) => c.message(m),
             (None, Err(e)) => Err(e.clone()),
@@ -164,6 +167,11 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
         C::While(e) => (
             "ctl-while",
             e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
+        ),
+        // Both dialects' tests of the FETCH just before (`cursor.rs`).
+        C::FetchWhile(key) => (
+            "ctl-while",
+            Ok(vec![n("cursor-found", vec![a(key.clone())])]),
         ),
         C::Else => ("ctl-else", Ok(vec![])),
         C::End => ("ctl-end", Ok(vec![])),
@@ -366,6 +374,34 @@ fn compare_units(
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
     pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
+    linked(a, b, ua, ub, out);
+}
+
+/// A statement compared as part of another (`Unit::linked`: a T-SQL
+/// cursor's DECLARE with its OPEN, its DEALLOCATE with its CLOSE) is not
+/// shown equivalent when that other is not.
+fn linked(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, out: &mut Outcome) {
+    for (side, u, is_a) in [(a, ua, true), (b, ub, false)] {
+        let name = side_name(side);
+        for (main, part) in &u.linked {
+            let (s, e) = cst::sig_range(main);
+            let at = side.line_of(main);
+            let prefix = format!("{name} line {at}:");
+            let undecided = out.unknown_reasons.iter().any(|r| r.starts_with(&prefix))
+                || out.findings.iter().any(|f| {
+                    let l = if is_a { &f.a } else { &f.b };
+                    f.verdict != Verdict::Equal
+                        && l.as_ref()
+                            .is_some_and(|l| l.byte_start < e && s < l.byte_end)
+                });
+            if undecided {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: compared as part of the statement at line {at}, which was not shown equivalent",
+                    side.line_of(part)
+                ));
+            }
+        }
+    }
 }
 
 /// Compares the procedure calls and object comments of both sides

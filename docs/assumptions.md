@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 86 |
-| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 182 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 88 |
+| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
+| | Total | 185 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -78,6 +78,9 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-CONCAT-NULL` | T-SQL sessions run with CONCAT_NULL_YIELDS_NULL ON (the default). | `deployment` | No session sets CONCAT_NULL_YIELDS_NULL OFF. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-CONCURRENT-WRITERS` | Other sessions can change the tables the routine reads while it runs. | `deployment` | Whether other sessions write the tables while the routine runs. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-CTE-MAXRECURSION` | A recursive CTE stays within T-SQL's recursion limit (the target has none). | `deployment` | The data never recurses deeper than the limit. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-CURSOR-GLOBAL` | No error or RETURN leaves a T-SQL cursor declared without LOCAL open (it would stay in the session and the next DECLARE of it would fail). | `deployment` | The routine is not left between the cursor's DECLARE and DEALLOCATE, or the database default is LOCAL cursors. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-CURSOR-ORDER` | What a cursor loop does does not depend on the order of rows its ORDER BY leaves open. | `nothing` | A per-routine review of the loop, or an ORDER BY on a unique key. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-CURSOR-SNAPSHOT` | A cursor loop fetches the rows its query gives at OPEN: no other session or trigger changes them during the loop, and the values do not depend on when a row is fetched. | `deployment` | No concurrent writers to the cursor's tables while the routine runs, and no time- or session-dependent functions in its query. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-DATALENGTH` | DATALENGTH and octet_length count the same bytes (they differ for NVARCHAR: UTF-16 against UTF-8). | `deployment` | The values measured hold no NVARCHAR data, or callers do not depend on the byte count. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DATEADD-RANGE` | DATEADD results stay within the range of their type. | `deployment` | The data never moves a date past the type's range. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DATEADD-TIME-WRAP` | T-SQL DATEADD on a time wraps around midnight (not documented, not checked). | `nothing` | A check of the behaviour on SQL Server. | `sqldiff-convert/src/tsql.rs` |

@@ -5,6 +5,7 @@
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
 use super::ast::{parse_stmt, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use super::cursor::{CursorLoop, CursorOp};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
 use crate::classify::{stmt_kind, StmtKind};
@@ -92,6 +93,9 @@ pub struct LStmt {
     /// A message or error built from a format (`ast` then says why it is
     /// not a plain statement): compared as its text (`Canon::message`).
     pub msg: Option<Msg>,
+    /// A statement of a cursor loop (`cursor.rs`; `ast` then says why it is
+    /// not a plain statement): compared as `Canon::cursor_op` says.
+    pub cursor: Option<CursorOp>,
 }
 
 /// A message or raised error whose text a format builds: T-SQL
@@ -147,6 +151,9 @@ pub enum CtlKind {
     If(Result<Expr, String>),
     /// WHILE: the body runs while the condition is true.
     While(Result<Expr, String>),
+    /// The WHILE of a cursor loop (`cursor.rs`): T-SQL `@@FETCH_STATUS = 0`,
+    /// PostgreSQL `FOUND`, both right after a FETCH of the cursor (its key).
+    FetchWhile(String),
     /// The start of the branch taken when the conditions before are not true.
     Else,
     /// The end of an IF (one per IF and per ELSIF) or of a loop.
@@ -244,6 +251,14 @@ pub struct Unit {
     pub trigger: Option<TrigCtx>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
+    /// Cursor loops of the shape `cursor.rs` compares.
+    pub cursor_loops: Vec<CursorLoop>,
+    /// PostgreSQL `name refcursor` declarations: (name, declaration).
+    pub cursor_vars: Vec<(String, SyntaxNode)>,
+    /// Statements compared as part of another (a T-SQL cursor's DECLARE
+    /// with its OPEN, its DEALLOCATE with its CLOSE): (compared, part).
+    /// What leaves the compared one undecided leaves the part so too.
+    pub linked: Vec<(SyntaxNode, SyntaxNode)>,
     /// How many IFs and loops the statement being lowered sits in.
     depth: usize,
     /// The labels of the loops around it, innermost last (upper case).
@@ -314,6 +329,9 @@ fn empty(d: Dialect) -> Unit {
         local_ids: None,
         trigger: None,
         ctl: Vec::new(),
+        cursor_loops: Vec::new(),
+        cursor_vars: Vec::new(),
+        linked: Vec::new(),
         depth: 0,
         loops: Vec::new(),
     }
@@ -411,6 +429,7 @@ pub fn lower(a: &Analyzed) -> Unit {
     if let [r] = routines.as_slice() {
         super::options::body_checks(r, &mut u);
     }
+    cursors_done(&mut u);
     place_txn(&mut u);
     u
 }
@@ -541,6 +560,7 @@ pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
     for n in &seg.nodes {
         unit(n, &mut u);
     }
+    cursors_done(&mut u);
     place_txn(&mut u);
     u
 }
@@ -578,6 +598,7 @@ pub fn lower_trigger(d: Dialect, body: &SyntaxNode, ctx: TrigCtx) -> Unit {
             "a trigger function that does not end with RETURN NULL (falling off its end is an error)".into(),
         ));
     }
+    cursors_done(&mut u);
     place_txn(&mut u);
     u
 }
@@ -1025,7 +1046,11 @@ fn loop_stmt(c: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((c.clone(), "a loop".into()));
         return;
     }
-    mark(u, CtlKind::While(condition(cond, u.dialect)), cond);
+    let kind = match u.cursor_loops.iter().find(|l| l.lp == *c) {
+        Some(l) => CtlKind::FetchWhile(l.key.clone()),
+        None => CtlKind::While(condition(cond, u.dialect)),
+    };
+    mark(u, kind, cond);
     u.depth += 1;
     u.loops.push(label);
     walk(body, u);
@@ -1109,7 +1134,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     let kind = stmt_kind(c, d);
     let words = cst::first_words(c, 3);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
-    if jump(c, u) {
+    if jump(c, u) || cursor_stmt(c, u) {
         return;
     }
     let dynamic = match d {
@@ -1147,6 +1172,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             ast,
             from_declare: false,
             msg,
+            cursor: None,
         });
         return;
     }
@@ -1204,6 +1230,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 ast,
                 from_declare,
                 msg: None,
+                cursor: None,
             });
         }
         // A script's own `CREATE TABLE`: compared table against table
@@ -1243,6 +1270,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                         ast,
                         from_declare: false,
                         msg: None,
+                        cursor: None,
                     });
                 }
                 _ => u
@@ -1275,6 +1303,111 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 words.join(" ")
             );
             u.uncovered.push((c.clone(), what));
+        }
+    }
+}
+
+/// A statement of a cursor loop (`cursor.rs`): the T-SQL DECLARE or
+/// PostgreSQL OPEN that starts one (checked there; refused with the reason
+/// when the loop is not of the shape), and the OPEN, FETCH, CLOSE and
+/// DEALLOCATE of a loop found so. Returns whether `c` was one.
+fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
+    let d = u.dialect;
+    if d == Dialect::Db2i {
+        return false;
+    }
+    if let Some(found) = super::cursor::start(c, u) {
+        match found {
+            Ok(l) => {
+                if let Some(decl) = &l.decl {
+                    u.linked.push((l.open.clone(), decl.clone()));
+                }
+                if let Some(x) = &l.dealloc {
+                    u.linked.push((l.close.clone(), x.clone()));
+                }
+                let opens = l.open == *c;
+                u.cursor_loops.push(l);
+                // A T-SQL DECLARE is compared with its OPEN.
+                if !opens {
+                    return true;
+                }
+            }
+            Err(why) => {
+                u.uncovered.push((c.clone(), format!("a cursor ({why})")));
+                return true;
+            }
+        }
+    }
+    let Some(l) = u.cursor_loops.iter().find(|l| {
+        l.open == *c || l.fetches.contains(c) || l.close == *c || l.dealloc.as_ref() == Some(c)
+    }) else {
+        return false;
+    };
+    let key = l.key.clone();
+    let op = if l.open == *c {
+        CursorOp::Open {
+            key,
+            query: l.query.clone(),
+            tsql: (d == Dialect::Tsql).then_some((l.stat, l.local)),
+        }
+    } else if l.fetches.contains(c) {
+        let targets = l
+            .targets
+            .iter()
+            .map(|t| match d {
+                Dialect::Tsql => Expr::Var(t.clone()),
+                _ => Expr::Name(vec![t.clone()]),
+            })
+            .collect();
+        CursorOp::Fetch { key, targets }
+    } else if l.close == *c {
+        CursorOp::Close { key }
+    } else {
+        // DEALLOCATE: compared with the CLOSE (`linked`).
+        return true;
+    };
+    u.stmts.push(LStmt {
+        node: c.clone(),
+        toks: tokens(c),
+        ast: Err("a cursor statement".into()),
+        from_declare: false,
+        msg: None,
+        cursor: Some(op),
+    });
+    true
+}
+
+/// PostgreSQL: each `refcursor` variable is the cursor of one loop found,
+/// and each loop's cursor is such a variable; anything else is not compared.
+fn cursors_done(u: &mut Unit) {
+    if u.dialect != Dialect::Postgres {
+        return;
+    }
+    let names: Vec<String> = u
+        .cursor_loops
+        .iter()
+        .map(|l| super::cursor::key(Dialect::Tsql, &l.name))
+        .collect();
+    for (name, node) in u.cursor_vars.clone() {
+        let k = super::cursor::key(Dialect::Tsql, &name);
+        if names.iter().filter(|x| **x == k).count() != 1 {
+            u.uncovered.push((
+                node,
+                "a cursor variable not used by one standard cursor loop".into(),
+            ));
+        }
+    }
+    for l in u.cursor_loops.clone() {
+        let k = super::cursor::key(Dialect::Tsql, &l.name);
+        if !u
+            .cursor_vars
+            .iter()
+            .any(|(n, _)| super::cursor::key(Dialect::Tsql, n) == k)
+        {
+            u.uncovered.push((
+                l.open.clone(),
+                "a cursor that is not a refcursor variable of the routine".into(),
+            ));
         }
     }
 }
@@ -1703,6 +1836,10 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((s.clone(), "a declaration".into()));
         return;
     };
+    if ty.name.eq_ignore_ascii_case("REFCURSOR") && at == toks.len() {
+        u.cursor_vars.push((name, s.clone()));
+        return;
+    }
     if matches!(ty.name.as_str(), "CONSTANT" | "CURSOR" | "RECORD" | "ALIAS") {
         u.uncovered.push((s.clone(), "a declaration".into()));
         return;
@@ -1736,6 +1873,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         ast,
         from_declare: true,
         msg: None,
+        cursor: None,
     });
 }
 

@@ -94,6 +94,18 @@ pub mod asm {
         "ASM-PAGE-COUNT-NOT-NULL",
         "The row count and offset of TOP / LIMIT / FETCH / OFFSET are never NULL: T-SQL raises an error for NULL (Msg 1014), PostgreSQL reads LIMIT NULL as no limit and OFFSET NULL as 0, and Db2 for i was not checked",
     );
+    pub const CURSOR_SNAPSHOT: (&str, &str) = (
+        "ASM-CURSOR-SNAPSHOT",
+        "The rows a cursor loop fetches are those its query gives at OPEN: no other session or trigger changes the tables it reads while the loop runs, and its values do not depend on when each row is fetched (a T-SQL cursor that is not STATIC reads rows as it fetches them, a PostgreSQL cursor reads the database as of OPEN)",
+    );
+    pub const CURSOR_ORDER: (&str, &str) = (
+        "ASM-CURSOR-ORDER",
+        "What a cursor loop does does not depend on the order of the rows beyond its ORDER BY: rows that ORDER BY leaves in no order may come in another order on each side",
+    );
+    pub const CURSOR_GLOBAL: (&str, &str) = (
+        "ASM-CURSOR-GLOBAL",
+        "No error or RETURN leaves a T-SQL cursor declared without LOCAL open: it then stays in the session and the routine's next DECLARE of it fails, where PostgreSQL closes it at the end of the transaction",
+    );
     pub const RAISERROR_TEXT: (&str, &str) = (
         "ASM-RAISERROR-TEXT",
         "The RAISERROR message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space, where PostgreSQL keeps the text as it is",
@@ -227,6 +239,9 @@ pub struct Canon<'a> {
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
     /// bit read through a derived table still meets numbers as a bit.
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
+    /// The column types of each cursor's query, by key, from its OPEN
+    /// (`cursor_op`); kept across statements.
+    cursor_cols: HashMap<String, Vec<Option<Ty>>>,
 }
 
 /// Lower-case hex digits of a byte string written in hex, `None` unless
@@ -366,6 +381,7 @@ impl<'a> Canon<'a> {
             seen_tables: HashMap::new(),
             excluded: None,
             sub_bits: HashMap::new(),
+            cursor_cols: HashMap::new(),
             by_name: false,
             fold_quoted: false,
             names: Vec::new(),
@@ -2916,6 +2932,56 @@ impl<'a> Canon<'a> {
             self.assume(asm::RAISERROR_FORMAT);
         }
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
+    }
+
+    /// A statement of a cursor loop (`cursor.rs`): `cursor-open(key, q)`
+    /// with the query as a list of values per row and its ORDER BY,
+    /// `cursor-fetch(key, assign…)` with each target set to its column as an
+    /// assignment converts it, `cursor-close(key)`. FETCH reads the column
+    /// types of the OPEN before it.
+    pub fn cursor_op(&mut self, op: &super::cursor::CursorOp) -> R<Term> {
+        use super::cursor::CursorOp;
+        match op {
+            CursorOp::Open { key, query, tsql } => {
+                let q = query.as_ref().map_err(Clone::clone)?;
+                let (mut parts, items) = self.query_parts(q, QCtx::Scalar)?;
+                let from: Vec<Term> = parts.get(1).map(|f| f.kids().to_vec()).unwrap_or_default();
+                let order: Vec<Term> = parts.get(5).map(|o| o.kids().to_vec()).unwrap_or_default();
+                if order.is_empty() || !self.total_order(&from, &order) {
+                    self.assume(asm::CURSOR_ORDER);
+                }
+                self.assume(asm::CURSOR_SNAPSHOT);
+                if let Some((_, false)) = tsql {
+                    self.assume(asm::CURSOR_GLOBAL);
+                }
+                self.cursor_cols
+                    .insert(key.clone(), items.iter().map(|x| x.1).collect());
+                parts.insert(1, n("items", items.into_iter().map(|x| x.0).collect()));
+                Ok(n("cursor-open", vec![a(key.clone()), n("q", parts)]))
+            }
+            CursorOp::Fetch { key, targets } => {
+                let cols = self
+                    .cursor_cols
+                    .get(key)
+                    .cloned()
+                    .ok_or("a FETCH whose cursor's OPEN was not read")?;
+                if cols.len() != targets.len() {
+                    return Err(
+                        "a FETCH into another number of variables than the cursor has columns"
+                            .into(),
+                    );
+                }
+                let mut kids = vec![a(key.clone())];
+                for (i, (t, ty)) in targets.iter().zip(cols).enumerate() {
+                    let (sym, vty) = self.target_sym(t)?;
+                    let col = n("cursor-col", vec![a(key.clone()), a(i.to_string())]);
+                    let v = self.conv_var(&vty, (col, ty)).0;
+                    kids.push(n("assign", vec![sym, v]));
+                }
+                Ok(n("cursor-fetch", kids))
+            }
+            CursorOp::Close { key } => Ok(n("cursor-close", vec![a(key.clone())])),
+        }
     }
 
     fn resultset(&mut self, q: &Select) -> R<Term> {

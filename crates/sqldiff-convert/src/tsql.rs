@@ -54,6 +54,7 @@ pub(crate) fn convert(
         loops: Vec::new(),
         labels: 0,
         cursors: Vec::new(),
+        cursor_plans: HashMap::new(),
         xact_abort: false,
         seen_work: false,
         tables: HashMap::new(),
@@ -164,6 +165,9 @@ struct Cx<'a> {
     labels: usize,
     /// Db2: result-set cursors of the routine, declared after the variables.
     cursors: Vec<Decl>,
+    /// PostgreSQL: the cursor loops of this routine or script, by lower-case
+    /// cursor name: the plan its statements follow, or why it is refused.
+    cursor_plans: HashMap<String, Result<CursorPlan, String>>,
     /// Db2: `SET XACT_ABORT ON` seen; the routine gets an EXIT handler that
     /// rolls back and resignals.
     xact_abort: bool,
@@ -1352,6 +1356,19 @@ impl<'a> Cx<'a> {
         if !ts.iter().find(|t| t.sig()).is_some_and(|t| t.is("WHILE")) {
             return self.refuse(out, n, indent, "loop form not supported");
         }
+        if let Some(plan) = self.fetch_loop(n) {
+            match plan {
+                Ok(_) => {
+                    self.header_unit(out, n, indent, "WHILE FOUND LOOP", "tsql.cursor.while");
+                    for b in n.children().filter(|c| c.kind() == BRANCH) {
+                        self.body_elements(out, &b, indent + INDENT);
+                    }
+                    out.lines(indent, "END LOOP;");
+                    return;
+                }
+                Err(reason) => return self.refuse(out, n, indent, &reason),
+            }
+        }
         let cond = self.condition(n);
         if let Some(reason) = self.blocked() {
             return self.refuse(out, n, indent, &reason);
@@ -1638,6 +1655,9 @@ impl<'a> Cx<'a> {
             "SAVE" if self.db2() => self.save(&ts)?,
             "SAVE" => return no("SAVE TRANSACTION: use SAVEPOINT, but a PL/pgSQL body cannot; use a nested BEGIN … EXCEPTION block"),
             "EXEC" | "EXECUTE" if sqldiff_core::equiv::dynamic::is_tsql(n) => self.dynamic_exec(n)?,
+            "OPEN" | "FETCH" | "CLOSE" | "DEALLOCATE" if !self.db2() => {
+                self.cursor_stmt(n, &first, &ts)?
+            }
             "EXEC" | "EXECUTE" => self.exec(&ts)?,
             "CREATE" => self.create(&ts)?,
             "ALTER" if w(1) == "TABLE" => self.alter_table(&ts)?,
@@ -2720,6 +2740,9 @@ impl<'a> Cx<'a> {
     fn declare(&mut self, ts: &[T], n: &SyntaxNode) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
+        if !self.db2() && s.len() > 2 && s[2..].iter().any(|&j| ts[j].is("CURSOR")) {
+            return self.declare_cursor(&ts, n);
+        }
         if s.len() > 2 && (ts[s[2]].is("CURSOR") || ts[s[1]].is("CURSOR")) {
             return no(self.pick(
                 "cursors: declare a PL/pgSQL cursor (or use a FOR loop over the query)",
@@ -3053,6 +3076,340 @@ impl<'a> Cx<'a> {
         self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-notice");
         self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
         Ok(format!("RAISE NOTICE '{fmt}'{values}"))
+    }
+
+    /// PostgreSQL: `DECLARE c CURSOR … FOR query` of the standard loop
+    /// (`cursor_plan`): a `refcursor` in the DECLARE section, opened with
+    /// the query by the OPEN that follows.
+    fn declare_cursor(&mut self, ts: &[T], n: &SyntaxNode) -> R<String> {
+        let s = sig(ts);
+        let raw = tsql_unquote(&ts[s[1]].s);
+        let plan = self.cursor_plan(ts, n);
+        self.cursor_plans
+            .insert(raw.to_ascii_lowercase(), plan.clone());
+        let plan = plan.map_err(No)?;
+        self.step_ts_with("tsql.cursor.declare", ts, plan.name.clone());
+        let notes = self.take_notes();
+        let trace = self.take_trace();
+        self.decls.push(Decl {
+            src: Self::range(n),
+            lines: vec![format!("{} refcursor;", plan.name)],
+            notes,
+            trace,
+        });
+        self.step_ts_with("tsql.cursor.declare", ts, "moved to OPEN");
+        Ok(format!(
+            "-- DECLARE {raw} CURSOR: {} in the DECLARE section, opened with the query below",
+            plan.name
+        ))
+    }
+
+    /// Whether `DECLARE c CURSOR … FOR query` is the standard loop the rules
+    /// convert, read from the statements after it:
+    ///
+    /// ```text
+    /// OPEN c; FETCH [NEXT] [FROM] c INTO @a, …;
+    /// WHILE @@FETCH_STATUS = 0 BEGIN … FETCH [NEXT] [FROM] c INTO @a, …; END
+    /// CLOSE c; DEALLOCATE c;
+    /// ```
+    ///
+    /// It becomes `OPEN c FOR query; FETCH …; WHILE FOUND LOOP … END LOOP;
+    /// CLOSE c;`. `FOUND` tells what `@@FETCH_STATUS = 0` tells only where a
+    /// FETCH of this cursor comes right before each test: so no CONTINUE or
+    /// GOTO in the body, and the body ends with the FETCH. Checked on SQL
+    /// Server 2022 and PostgreSQL 18: T-SQL reads the query's variables at
+    /// DECLARE (so OPEN must follow at once), and a FETCH that finds no row
+    /// leaves T-SQL's variables as they were but sets PostgreSQL's to NULL
+    /// (so the variables are not read after the loop before they are set
+    /// again). A cursor that is not STATIC may see the loop's own writes in
+    /// T-SQL; a PostgreSQL cursor reads the rows as of OPEN, so the loop must
+    /// not write the tables the cursor reads or call procedures.
+    fn cursor_plan(&self, ts: &[T], n: &SyntaxNode) -> Result<CursorPlan, String> {
+        let s = sig(ts);
+        let raw = tsql_unquote(&ts[s[1]].s);
+        if !matches!(self.mode, Mode::Proc | Mode::Do | Mode::Func) || self.trigger.is_some() {
+            return Err("cursor outside a procedure, function or script block".into());
+        }
+        let ds = crate::tok::depths(ts);
+        let Some(for_at) = s[2..]
+            .iter()
+            .copied()
+            .find(|&j| ds[j] == 0 && ts[j].is("FOR"))
+        else {
+            return Err("DECLARE CURSOR without FOR".into());
+        };
+        let (mut stat, mut local) = (false, false);
+        for &j in s[2..].iter().take_while(|&&j| j < for_at) {
+            match ts[j].up().as_str() {
+                "CURSOR" | "FORWARD_ONLY" | "FAST_FORWARD" | "READ_ONLY" | "KEYSET" | "DYNAMIC"
+                | "GLOBAL" => {}
+                "LOCAL" => local = true,
+                "STATIC" | "INSENSITIVE" => stat = true,
+                o => {
+                    return Err(format!(
+                        "cursor option {o}: only forward-only, read-only cursors are converted"
+                    ))
+                }
+            }
+        }
+        let query: Vec<T> = trimmed(&ts[for_at + 1..]).to_vec();
+        let qs = sig(&query);
+        let qd = crate::tok::depths(&query);
+        if !qs
+            .first()
+            .is_some_and(|&j| query[j].is("SELECT") || query[j].is("WITH"))
+        {
+            return Err("cursor over something other than a query".into());
+        }
+        if qs.iter().any(|&j| qd[j] == 0 && query[j].is("FOR")) {
+            return Err(
+                "cursor query with FOR UPDATE, FOR READ ONLY, FOR XML or FOR JSON: not converted"
+                    .into(),
+            );
+        }
+        if n.ancestors().skip(1).any(|a| a.kind() == LOOP_STMT) {
+            return Err("cursor loop inside another loop: not converted (the variables it fetches carry over to the next pass)".into());
+        }
+        let Some(parent) = n.parent() else {
+            return Err("cursor form not understood".into());
+        };
+        let units: Vec<SyntaxNode> = parent
+            .children()
+            .filter(|c| c.kind().is_unit())
+            .skip_while(|c| c != n)
+            .skip(1)
+            .collect();
+        let shape = "the cursor is not used in the standard loop (OPEN; FETCH … INTO; WHILE @@FETCH_STATUS = 0 … ending with the same FETCH; CLOSE; DEALLOCATE)";
+        let key = raw.to_ascii_lowercase();
+        let is = |n: &SyntaxNode, kw: &str| {
+            sig_words(n).as_slice() == [kw.to_string(), key.to_ascii_uppercase()]
+        };
+        // Statements between DECLARE and OPEN: T-SQL reads the query's
+        // variables at DECLARE, PostgreSQL at OPEN, so none of them may be
+        // set there; nor may the routine leave before OPEN.
+        let Some(at_open) = units.iter().position(|u| is(u, "OPEN")) else {
+            return Err(shape.into());
+        };
+        let qvars: Vec<String> = query
+            .iter()
+            .filter(|t| t.k == VARIABLE)
+            .map(|t| t.s.to_ascii_lowercase())
+            .collect();
+        for u in &units[..at_open] {
+            let ws = sig_words(u);
+            if u.kind() != STATEMENT
+                || ws.first().is_some_and(|w| {
+                    matches!(
+                        w.as_str(),
+                        "RETURN" | "GOTO" | "BREAK" | "CONTINUE" | "THROW" | "RAISERROR"
+                    )
+                })
+                || ws.iter().any(|w| w.eq_ignore_ascii_case(&key))
+                || tokens(u)
+                    .iter()
+                    .any(|t| t.k == VARIABLE && qvars.contains(&t.s.to_ascii_lowercase()))
+            {
+                return Err("statements between the cursor's DECLARE and OPEN that may set the variables its query reads or leave the routine: T-SQL reads them at DECLARE, PostgreSQL at OPEN".into());
+            }
+        }
+        let [open, first, lp, close, dealloc, after @ ..] = &units[at_open..] else {
+            return Err(shape.into());
+        };
+        let vars = fetch_into(first, &key).ok_or(shape)?;
+        if !is(open, "OPEN") || !is(close, "CLOSE") || !is(dealloc, "DEALLOCATE") {
+            return Err(shape.into());
+        }
+        if lp.kind() != LOOP_STMT {
+            return Err(shape.into());
+        }
+        let mut cond: Vec<String> = lp
+            .children()
+            .find(|c| c.kind() == CONDITION)
+            .map(|c| sig_words(&c))
+            .unwrap_or_default();
+        while cond.first().is_some_and(|x| x == "(") && cond.last().is_some_and(|x| x == ")") {
+            cond = cond[1..cond.len() - 1].to_vec();
+        }
+        if cond != ["@@FETCH_STATUS", "=", "0"] {
+            return Err(shape.into());
+        }
+        let Some(body) = lp.children().find(|c| c.kind() == BRANCH) else {
+            return Err(shape.into());
+        };
+        let inner = loop_units(&body);
+        let Some((last, rest)) = inner.split_last() else {
+            return Err(shape.into());
+        };
+        if fetch_into(last, &key).as_ref() != Some(&vars) {
+            return Err("the loop body does not end with the same FETCH as before the loop: @@FETCH_STATUS and FOUND then tell different things".into());
+        }
+        for d in body
+            .descendants()
+            .filter(|d| d.kind() == STATEMENT || d.kind() == LABEL)
+        {
+            let w = sig_words(&d);
+            let first_w = w.first().map(String::as_str).unwrap_or("");
+            if matches!(first_w, "COMMIT" | "ROLLBACK" | "SAVE")
+                || (first_w == "BEGIN" && w.get(1).is_some_and(|x| x.starts_with("TRAN")))
+            {
+                return Err("transaction control in the cursor loop: PostgreSQL closes the cursor at COMMIT or ROLLBACK, T-SQL keeps it open".into());
+            }
+            if d.kind() == LABEL || matches!(first_w, "CONTINUE" | "GOTO") {
+                return Err("CONTINUE, GOTO or a label in the cursor loop: PostgreSQL's FOUND would then not come from the cursor's FETCH".into());
+            }
+            if d != *last
+                && matches!(first_w, "OPEN" | "FETCH" | "CLOSE" | "DEALLOCATE")
+                && w.iter().any(|x| *x == key.to_ascii_uppercase())
+            {
+                return Err("the cursor is fetched, opened or closed again inside its loop".into());
+            }
+        }
+        let _ = rest;
+        // After the loop, each variable is set before it is read.
+        let at_top = parent.ancestors().skip(1).all(|a| {
+            !matches!(
+                a.kind(),
+                IF_STMT | LOOP_STMT | TRY_CATCH | BRANCH | CATCH_BLOCK | TRY_BLOCK
+            )
+        });
+        for v in &vars {
+            let mentions = |u: &SyntaxNode| {
+                tokens(u)
+                    .iter()
+                    .filter(|t| t.k == VARIABLE && t.s[1..].eq_ignore_ascii_case(v))
+                    .count()
+            };
+            match after.iter().find(|u| mentions(u) > 0) {
+                Some(u) => {
+                    let w = sig_words(u);
+                    let set = w.len() > 2
+                        && w[0] == "SET"
+                        && w[1].eq_ignore_ascii_case(&format!("@{v}"))
+                        && w[2] == "="
+                        && mentions(u) == 1;
+                    let fetch = w.first().is_some_and(|x| x == "FETCH") && mentions(u) == 1;
+                    if !set && !fetch {
+                        return Err(format!("@{v} is read after the loop: T-SQL keeps the last row's value there, PostgreSQL's FETCH sets it to NULL when no row is left"));
+                    }
+                }
+                None if !at_top => {
+                    return Err(format!("@{v} may be read after the IF or block the loop sits in: T-SQL keeps the last row's value there, PostgreSQL's FETCH sets it to NULL when no row is left"));
+                }
+                None => {}
+            }
+        }
+        if !stat {
+            let reads = table_names(&query);
+            for d in body.descendants().filter(|d| d.kind() == STATEMENT) {
+                let w = sig_words(&d);
+                match w.first().map(String::as_str) {
+                    Some("EXEC" | "EXECUTE") => {
+                        return Err("the cursor loop calls a procedure, which may write the tables the cursor reads: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it".into())
+                    }
+                    Some("INSERT" | "UPDATE" | "DELETE" | "MERGE" | "WITH") => {
+                        let names = written_tables(&tokens(&d));
+                        if let Some(t) = reads.iter().find(|t| names.contains(t)) {
+                            return Err(format!("the cursor loop writes {t}, which the cursor reads: a T-SQL cursor that is not STATIC may see the change, a PostgreSQL cursor reads the rows as of OPEN; declare it STATIC to convert it"));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(CursorPlan {
+            name: format!("cur_{}", snake(&raw)),
+            raw: raw.clone(),
+            query,
+            vars: vars.clone(),
+            stat,
+            local,
+            open_at: Self::range(open),
+            fetch_at: vec![Self::range(first), Self::range(last)],
+            loop_at: Self::range(lp),
+        })
+    }
+
+    /// The plan of the cursor loop `n` is, if `n` is one: `WHILE
+    /// @@FETCH_STATUS = 0` right after a cursor's first FETCH.
+    fn fetch_loop(&self, n: &SyntaxNode) -> Option<Result<CursorPlan, String>> {
+        if self.db2() {
+            return None;
+        }
+        let at = Self::range(n);
+        self.cursor_plans
+            .values()
+            .find(|p| p.as_ref().is_ok_and(|p| p.loop_at == at))
+            .cloned()
+    }
+
+    /// PostgreSQL: OPEN, FETCH, CLOSE and DEALLOCATE of a converted cursor
+    /// loop (`cursor_plan`).
+    fn cursor_stmt(&mut self, n: &SyntaxNode, first: &str, ts: &[T]) -> R<String> {
+        let ts = Self::body_toks(ts);
+        let name = sig(&ts)
+            .into_iter()
+            .skip(1)
+            .map(|j| tsql_unquote(&ts[j].s))
+            .find(|x| {
+                first != "FETCH"
+                    || !(x.eq_ignore_ascii_case("NEXT") || x.eq_ignore_ascii_case("FROM"))
+            })
+            .unwrap_or_default();
+        let key = name.to_ascii_lowercase();
+        let plan = match self.cursor_plans.get(&key) {
+            Some(Ok(p)) => p.clone(),
+            Some(Err(why)) => return no(format!("cursor {name}: {why}")),
+            None => return no("cursor statement without the cursor's DECLARE before it in this routine: not converted"),
+        };
+        let at = Self::range(n);
+        match first {
+            "OPEN" if at == plan.open_at => {
+                let outer = std::mem::replace(&mut self.scope, scope_of(&plan.query));
+                let q = self.select(&plan.query);
+                self.scope = outer;
+                let (q, assigns) = q?;
+                if assigns {
+                    return no("cursor query that assigns variables");
+                }
+                if !plan.stat {
+                    self.note(Status::Assumptions, "ASM-CURSOR-SNAPSHOT", "No other session changes the tables the cursor reads while the loop runs: a T-SQL cursor that is not STATIC may see such changes, a PostgreSQL cursor reads the rows as of OPEN.");
+                }
+                if !plan.local {
+                    self.note(Status::Assumptions, "ASM-CURSOR-GLOBAL", "No error leaves the loop early: a T-SQL cursor declared without LOCAL then stays allocated in the session, and the routine's next DECLARE of it fails; PostgreSQL closes it with the transaction.");
+                }
+                self.step_ts_with("tsql.cursor.open", &ts, plan.name.clone());
+                Ok(format!("OPEN {} FOR {}", plan.name, q.trim()))
+            }
+            "FETCH" if plan.fetch_at.contains(&at) => {
+                // Declared local variables only: a parameter would show the
+                // NULL PostgreSQL's last FETCH leaves to the caller.
+                let mut vars = Vec::new();
+                for v in &plan.vars {
+                    match self.vars.get(v) {
+                        Some(x) if x.name.starts_with("v_") => vars.push(x.name.clone()),
+                        _ => return no(format!("FETCH INTO @{v}, which is not a local variable: not converted (PostgreSQL's FETCH sets it to NULL after the last row, T-SQL keeps the last row's value)")),
+                    }
+                }
+                self.step_ts_with("tsql.cursor.fetch", &ts, plan.name.clone());
+                Ok(format!(
+                    "FETCH NEXT FROM {} INTO {}",
+                    plan.name,
+                    vars.join(", ")
+                ))
+            }
+            "CLOSE" => {
+                self.step_ts_with("tsql.cursor.close", &ts, plan.name.clone());
+                Ok(format!("CLOSE {}", plan.name))
+            }
+            "DEALLOCATE" => {
+                self.step_ts_with("tsql.cursor.deallocate", &ts, "dropped");
+                Ok(format!(
+                    "-- DEALLOCATE {}: PostgreSQL frees the cursor at CLOSE",
+                    plan.raw
+                ))
+            }
+            _ => no("cursor statement outside the cursor's standard loop: not converted"),
+        }
     }
 
     fn txn(&mut self, kw: &str, ts: &[T]) -> R<String> {
@@ -7123,6 +7480,151 @@ struct ScopeEntry {
 
 /// The FROM, JOIN, UPDATE, MERGE and USING items of a statement, at any
 /// depth. `None` when the statement has CTEs, whose names would hide tables.
+/// PostgreSQL: a T-SQL cursor loop as the rules convert it
+/// (`Cx::cursor_plan`).
+#[derive(Debug, Clone)]
+struct CursorPlan {
+    /// The PL/pgSQL `refcursor` variable.
+    name: String,
+    /// The T-SQL cursor name.
+    raw: String,
+    /// The cursor's query (after FOR).
+    query: Vec<T>,
+    /// The T-SQL variables FETCH sets (lower case, without `@`).
+    vars: Vec<String>,
+    /// STATIC or INSENSITIVE: T-SQL reads the rows as of OPEN.
+    stat: bool,
+    /// LOCAL: T-SQL frees it when the routine ends.
+    local: bool,
+    open_at: (usize, usize),
+    /// The FETCH before the loop and the one that ends its body.
+    fetch_at: Vec<(usize, usize)>,
+    loop_at: (usize, usize),
+}
+
+/// The significant tokens of a node, words upper-cased.
+fn sig_words(n: &SyntaxNode) -> Vec<String> {
+    sig_words_t(&tokens(n))
+}
+
+fn sig_words_t(ts: &[T]) -> Vec<String> {
+    ts.iter()
+        .filter(|t| t.sig() && t.k != SEMICOLON)
+        .map(|t| {
+            if t.k == IDENT {
+                tsql_unquote(&t.s).to_ascii_uppercase()
+            } else {
+                t.s.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
+/// `FETCH [NEXT] [FROM] cursor INTO @a, @b`: the variables (lower case,
+/// without `@`), when `n` is that FETCH of `cursor` (lower case).
+fn fetch_into(n: &SyntaxNode, cursor: &str) -> Option<Vec<String>> {
+    if n.kind() != STATEMENT {
+        return None;
+    }
+    let w = sig_words(n);
+    let mut i = 1;
+    if w.first()? != "FETCH" {
+        return None;
+    }
+    if w.get(i)? == "NEXT" {
+        i += 1;
+    }
+    if w.get(i)? == "FROM" {
+        i += 1;
+    }
+    if !w.get(i)?.eq_ignore_ascii_case(cursor) || w.get(i + 1)? != "INTO" {
+        return None;
+    }
+    let mut vars = Vec::new();
+    for (k, x) in w[i + 2..].iter().enumerate() {
+        if k % 2 == 1 {
+            if x != "," {
+                return None;
+            }
+            continue;
+        }
+        let v = x.strip_prefix('@').filter(|v| !v.starts_with('@'))?;
+        vars.push(v.to_ascii_lowercase());
+    }
+    (!vars.is_empty() && vars.iter().collect::<std::collections::HashSet<_>>().len() == vars.len())
+        .then_some(vars)
+}
+
+/// The statements of a loop body: a BEGIN … END block's, or the one statement.
+fn loop_units(branch: &SyntaxNode) -> Vec<SyntaxNode> {
+    let kids: Vec<SyntaxNode> = branch.children().filter(|c| c.kind().is_unit()).collect();
+    match kids.as_slice() {
+        [b] if b.kind() == BLOCK => b.children().filter(|c| c.kind().is_unit()).collect(),
+        _ => kids,
+    }
+}
+
+/// Tables a statement names after FROM, JOIN, APPLY or USING, or as the
+/// target of INSERT, UPDATE, DELETE or MERGE (last name part, lower case):
+/// over-approximates the tables it reads or writes.
+fn table_names(ts: &[T]) -> Vec<String> {
+    let s = sig(ts);
+    let mut out = Vec::new();
+    for (k, &j) in s.iter().enumerate() {
+        let kw = [
+            "FROM", "JOIN", "APPLY", "USING", "INTO", "INSERT", "UPDATE", "DELETE", "MERGE",
+        ];
+        if !kw.iter().any(|w| ts[j].is(w)) {
+            continue;
+        }
+        let mut last = None;
+        let mut want_name = true;
+        for &x in &s[k + 1..] {
+            match ts[x].k {
+                IDENT | QUOTED_IDENT if want_name => {
+                    last = Some(tsql_unquote(&ts[x].s).to_ascii_lowercase());
+                    want_name = false;
+                }
+                DOT if !want_name => want_name = true,
+                _ => break,
+            }
+        }
+        if let Some(l) = last.filter(|l| !kw.iter().any(|w| l.eq_ignore_ascii_case(w))) {
+            out.push(l);
+        }
+    }
+    out
+}
+
+/// The tables a write statement may change: the target of INSERT or MERGE;
+/// for UPDATE and DELETE also the tables after FROM, since the target may
+/// be an alias of one of them; for a statement with a CTE every table it
+/// names.
+fn written_tables(ts: &[T]) -> Vec<String> {
+    let s = sig(ts);
+    let Some(&first) = s.first() else {
+        return Vec::new();
+    };
+    if ts[first].is("UPDATE") || ts[first].is("DELETE") || ts[first].is("WITH") {
+        return table_names(ts);
+    }
+    let ds = crate::tok::depths(ts);
+    // INSERT [INTO] t …, MERGE [INTO] t …: the name after the keyword.
+    let head: Vec<T> = s
+        .iter()
+        .take_while(|&&j| {
+            ds[j] == 0
+                && ![
+                    "SELECT", "VALUES", "USING", "EXEC", "EXECUTE", "DEFAULT", "OUTPUT",
+                ]
+                .iter()
+                .any(|w| ts[j].is(w))
+        })
+        .map(|&j| ts[j].clone())
+        .collect();
+    table_names(&head).into_iter().take(1).collect()
+}
+
 fn scope_of(ts: &[T]) -> Option<Scope> {
     if cte_list(ts).is_some() {
         return None;
