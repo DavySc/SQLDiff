@@ -998,14 +998,21 @@ sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TABLES-AS-DECLARED"
-statement = "The tables a converted routine writes or reads are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree."
+statement = "The tables a converted routine writes or reads are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree, string columns have the database's default collation, and PostgreSQL uses the default 8 kB block size (its btree entry limit; SQL Server's index key limits hold from 2016, the oldest version supported)."
 discharge = "catalog"
-fact = "Both databases' catalogs: the tables' definitions match the tree's CREATE TABLE statements."
+fact = "Both databases' catalogs: the tables' definitions (columns, types, defaults, keys, indexes, column collations) match the tree's CREATE TABLE and CREATE INDEX statements."
+sites = ["sqldiff-convert/src/cert.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-ANSI-PADDING"
+statement = "The T-SQL varchar columns a converted routine writes were created with ANSI_PADDING ON (the default), so they keep the trailing spaces of a value as PostgreSQL does; under OFF SQL Server trims them on every write."
+discharge = "catalog"
+fact = "SQL Server's sys.columns: is_ansi_padded = 1 for those columns."
 sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-BINARY-COLLATION"
-statement = "The T-SQL database's default collation is binary (_BIN or _BIN2), and every collation a PostgreSQL string comparison of the routine can take (including its callers' arguments) is deterministic: two strings compare equal only when they are the same characters (T-SQL ignoring trailing spaces)."
+statement = "The T-SQL database's default collation is binary (_BIN or _BIN2), and every collation a PostgreSQL string comparison of the routine can take (including its callers' arguments and the columns of the tables it reads) is deterministic: two strings compare equal only when they are the same characters (T-SQL ignoring trailing spaces)."
 discharge = "deployment"
 fact = "The databases' collations. Accepting this id makes the proof checker take it as given for string comparisons."
 sites = ["sqldiff-convert/src/cert.rs"]

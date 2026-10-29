@@ -1,0 +1,26 @@
+NOTICE:  table "s" does not exist, skipping
+NOTICE:  table "d" does not exist, skipping
+NOTICE:  table "dl" does not exist, skipping
+NOTICE:  table "k" does not exist, skipping
+NOTICE:  table "i" does not exist, skipping
+NOTICE:  table "w" does not exist, skipping
+NOTICE:  table "wi" does not exist, skipping
+NOTICE:  T1 fits, trailing spaces: v=[ab  ] chars=4 w=[ab  ] chars=4
+NOTICE:  T1 fits exactly: v=[abcde] w=[abcde]
+NOTICE:  T1 empty string: v=[] null=no
+NOTICE:  T1 update fits: chars=3
+NOTICE:  T2 insert too long: error 22001, rows=0
+NOTICE:  T2 update too long: error 22001
+NOTICE:  T2 insert too long by spaces: no error, chars=5
+NOTICE:  T4 defaults: q=0 r=-1 c=Paris n=x z=NULL u=NULL
+NOTICE:  T4 listed columns win: q=5 c=NULL
+NOTICE:  T4 update leaves defaults alone: c=NULL
+NOTICE:  T4 default too long: error 22001
+NOTICE:  T5 deterministic collation: rows with v = 'a': 1
+NOTICE:  T5 rows with rtrim(v) = rtrim('a'): 2
+NOTICE:  T6 string key a, a-space: no error
+NOTICE:  T7 non-unique index: rows=3 v1=y
+NOTICE:  T8 index entry of 2688 bytes: no error
+NOTICE:  T8 index entry of 2720 bytes: error 54000
+NOTICE:  T8 INCLUDE entry of 2720 bytes: error 54000
+NOTICE:  T9 read into a shorter variable: error 22001

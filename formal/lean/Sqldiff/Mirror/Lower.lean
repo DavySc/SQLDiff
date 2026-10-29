@@ -40,14 +40,19 @@ converter's PL/pgSQL `FOR` block, `IF [NOT] EXISTS`, a scalar subquery by
 key, and `COUNT(*)` into a variable, on a catalog table (section "The C3b
 slice: queries", each rule with its citation and probe status).
 
+Tables (C3c): a catalog table may have `varchar(n)`/`nvarchar(n)`
+columns, read and written under the C2b bounds, and constant defaults,
+which an `INSERT` that leaves the column out stores (section "The C3c
+tables", each rule with its citation and probe status).
+
 Errors and transactions (C4): T-SQL `TRY`/`CATCH` and PL/pgSQL
 exception blocks, `THROW` and `RAISE`, `BEGIN TRAN`/`COMMIT` in a
 bracket, the rollback-and-rethrow idiom, and PL/pgSQL `COMMIT` (section
 "The C4 rules", each rule with its citation and probe status).
 
 Read top to bottom: the trusted inputs, names in data statements, the C2a
-slice with its vendor citations, the C2b strings, expressions, the C3a data statements,
-the C3b queries, statements, calls, the C4 rules, blocks, the two routines, and the test for "every
+slice with its vendor citations, the C2b strings, expressions, the C3a
+data statements and the C3c tables, the C3b queries, statements, calls, the C4 rules, blocks, the two routines, and the test for "every
 expression is in the slice".
 -/
 import Sqldiff.Ast
@@ -80,28 +85,45 @@ structure Deployment where
 
 /-- A column of a target table (C3a): its name as the target catalog
 spells it (folded as `pgName` folds; the core's column), its spelling in
-the T-SQL table it corresponds to, and its constraints. Every column of a
-catalog table is a 32-bit integer (T-SQL `int`, PostgreSQL `integer`):
-the catalog encoding has no other type yet (`Sqldiff.Mirror.Request`). -/
+the T-SQL table it corresponds to, and its constraints. (C3c) Its type
+and its default, see "The C3c tables" below; without them, as in C3a and
+C3b, the column is a 32-bit integer (T-SQL `int`, PostgreSQL `integer`)
+without a default. -/
 structure CatCol where
   name : Core.Col
   tsql : String
   notNull : Bool
   key : Bool
+  /-- (C3c) `none`: the 32-bit integer. `some (n, wide)`: a string
+  column, T-SQL `varchar(n)` (`wide = false`) or `nvarchar(n)` (`wide =
+  true`) and PostgreSQL `varchar(n)` with the same `n`, `1 ≤ n ≤ 4000`
+  (`CatTable.wellFormed`). -/
+  str : Option (Nat × Bool) := none
+  /-- (C3c) The default both tables declare for the column, a constant:
+  an integer literal (`SExpr.int`) or a string literal (`SExpr.str`).
+  `none`: no default, or `DEFAULT NULL`, which an `INSERT` treats alike
+  (the column is NULL). -/
+  dflt : Option SExpr := none
 deriving Repr
 
 /-- A target table and how the T-SQL table it corresponds to spells its
 columns (the state correspondence of decision 1: rows related column by
 column, the identity on values). What the catalog asserts about the table
 and about its T-SQL counterpart, which the check cannot see: both have
-exactly these columns, all `int`/`integer`, with these `NOT NULL` and
-primary key constraints; no other constraint (`CHECK`, `UNIQUE`, foreign
-keys), no default, no identity, sequence, computed or generated column, no
-trigger, rule or row-level security policy; the primary key is not
-`DEFERRABLE INITIALLY DEFERRED` in PostgreSQL and its index does not
-`IGNORE_DUP_KEY` in SQL Server; and the PostgreSQL table has no
-inheritance children or partitions. The Rust side sends a table only when
-its catalogs show all of this. -/
+exactly these columns, of these types (`int`/`integer`, or (C3c) the
+string types `CatCol.str` names), with these `NOT NULL` and primary key
+constraints and (C3c) these constant defaults; no other constraint
+(`CHECK`, `UNIQUE`, foreign keys), no other default, no identity,
+sequence, computed or generated column, no trigger, rule or row-level
+security policy; the primary key is not `DEFERRABLE INITIALLY DEFERRED`
+in PostgreSQL and its index does not `IGNORE_DUP_KEY` in SQL Server; and
+the PostgreSQL table has no inheritance children or partitions. (C3c)
+Indexes other than the primary key's are non-unique, unfiltered and on
+plain columns, and no row of the slice can exceed their key size limits
+(see "The C3c tables"): they then change no result. String columns have
+the database's default collation (no `COLLATE` clause) and, in SQL Server,
+were created with `ANSI_PADDING ON`. The Rust side sends a table only
+when its catalogs show all of this. -/
 structure CatTable where
   name : String
   cols : List CatCol
@@ -120,7 +142,10 @@ structure Catalog where
   collation (a `_BIN` or `_BIN2` collation), and every collation a
   PostgreSQL comparison in the routine can take is deterministic (the
   database's default, and the collation of every argument a caller
-  passes). Without it, `=` and `<>` on strings are outside the slice. The
+  passes). (C3c) A string column of a catalog table has the database's
+  default collation in both (the catalog asserts it, `CatTable`), so the
+  fact covers comparisons with columns too. Without it, `=` and `<>` on
+  strings are outside the slice. The
   answer names it as `ASM-BINARY-COLLATION` where a comparison uses it.
   See "The C2b slice: strings". -/
   binaryCollation : Bool := false
@@ -193,6 +218,9 @@ PostgreSQL, the target's reference name. Empty outside data statements. -/
 structure Scope where
   cols : List (String × Core.Col) := []
   rel : Option String := none
+  /-- (C3c) The string columns among `cols` and their types
+  (`CatCol.str`); every other column is an integer. -/
+  strCols : List (Core.Col × (Nat × Bool)) := []
 
 /-- A one-part name: a column (`inl`), a variable (`inr`), or outside the
 spec (`none`). Outside data statements a T-SQL name is outside the spec
@@ -796,6 +824,13 @@ theorem mkRtrim_eval {U : Type} (σ ρ : Core.Store U) (a : SExpr) :
     | ok v => cases v <;> simp [rtrimSp_idem, Core.typeErr]
   | _ => rfl
 
+/-- (C3c) The type of a column read: an integer, or a string of the
+column's length, `wide` for a T-SQL `nvarchar` ("The C3c tables"). -/
+def colTy (d : Dialect) (sc : Scope) (c : Core.Col) : STy :=
+  match lookup sc.strCols c with
+  | some (n, w) => .str (some n) (w && (d matches .tsql _ _))
+  | none => .int
+
 /-- The type `COALESCE` or `CASE` gives two value arguments, or `none`
 when they do not go together (an integer and a string, or a boolean). -/
 def joinTy : STy → STy → Option STy
@@ -955,7 +990,7 @@ mutual
       | .tsql _ _ => (varTy d env v).map (.var v, ·)
       | .pg _ _ => none
     | .Name [x] => match resolveName d sc x with
-      | some (.inl c) => some (.col c, .int)
+      | some (.inl c) => some (.col c, colTy d sc c)
       | some (.inr v) => (varTy d env v).map (.var v, ·)
       | none => none
     | .Num s => (intLit? s).map fun n => (.int n, .int)
@@ -1199,7 +1234,7 @@ are not observed (`ASM-OBSERVER-ROWCOUNT`, the deployment's choice).
 **`INSERT INTO t (c1, ..., cn) VALUES (e1, ..., en), ...`**: a column
 list of distinct columns of `t`, one or more rows of exactly `n` values;
 each row gets the values in the listed columns and NULL in every other
-column. No query source, `DEFAULT VALUES`, `RETURNING`, `ON CONFLICT` or
+column ((C3c) or the column's default: "The C3c tables"). No query source, `DEFAULT VALUES`, `RETURNING`, `ON CONFLICT` or
 column list left out (the order of a table's columns is not in the
 correspondence).
 
@@ -1301,8 +1336,9 @@ side, whose possible outcomes the core needs only to include one of. Not
 probed.
 
 **Values written to a column** are `int` expressions of the slice or the
-NULL literal, in both dialects; anything else is outside the spec, even
-on the C1 path. The column is `int`, so no conversion happens on the
+NULL literal, in both dialects ((C3c) into a string column: a string of
+the slice that fits, or NULL, "The C3c tables"); anything else is outside
+the spec, even on the C1 path. The column is `int`, so no conversion happens on the
 write. Of another type, the value would be converted on assignment, and
 the dialects convert differently (T-SQL truncates a `decimal` to `int`,
 PostgreSQL rounds: probed, eval/casts/assign, `INSERT` and `UPDATE`),
@@ -1320,6 +1356,167 @@ raise is outside the slice (`Sqldiff.Core.SExpr.constRaise`). `INSERT ...
 VALUES` evaluates every value in any case, and a `WHERE` cannot raise.
 Not probed. -/
 
+/-! ## The C3c tables: string columns, constant defaults, indexes
+
+Phase C3c widens what a catalog table (`CatTable`) may be, without a new
+statement in the core: a string column is a column whose values are
+strings (`Core.Val.str`), and a default is a value the lowering writes
+where an `INSERT` leaves the column out. Each rule states the claim, the
+vendor text and the probe. "eval/tables Tn" is probe `Tn` of
+`eval/tables/{mssql,postgres}.sql` with their `.out` files, run on SQL
+Server 2022 and PostgreSQL 18.6 on 2026-10-29 with the tables as
+`sqldiff convert --to postgres` writes them. **Every vendor quote here
+was written from memory** (the vendor sites were not reachable when this
+was written) and needs checking against the page; the probes are what
+the rules rest on.
+
+**String column types** (`CatCol.str`). T-SQL `varchar(n)` or
+`nvarchar(n)`, `1 ≤ n ≤ 4000`, against PostgreSQL `varchar(n)` with the
+same `n` (the converter writes `varchar(n)` for both,
+crates/sqldiff-convert/src/tsql.rs, `ty_pg`): the C2b types ("The C2b
+slice: strings", with its citations: `n` bytes for `varchar`, byte-pairs
+for `nvarchar`, characters for PostgreSQL). `max`, `char(n)`,
+`nchar(n)`, `text` and every other type stay outside (the Rust side does
+not send such a table). A string column is never a key column (below).
+Probed, eval/tables T1: a value that fits is stored and read back as it
+is, trailing spaces included, and `''` is not NULL, on both engines.
+
+**Reads.** A column read in a `WHERE`, an `UPDATE`'s values or a C3b
+pick has the column's type: a string of bound `n`, `wide` when the T-SQL
+column is `nvarchar` (`colTy`). The bound holds for every value the
+column can hold: at most `n` bytes or byte-pairs in SQL Server, at most
+`n` characters in PostgreSQL, and both databases hold the same rows (the
+state correspondence, decision 1). A string column is no integer, so it
+never meets an integer operator, and every C2b rule applies to it as to
+a string variable: `=`/`<>` only under the binary-collation fact (T-SQL
+pads: `a = b` is `rtrim(a) = rtrim(b)`), `RTRIM`, `LEN`, concatenation,
+`COALESCE`, `CASE`, `IS [NOT] NULL`. A column without a `COLLATE` clause
+takes the database's default collation ("Set or change the column
+collation" for SQL Server; PostgreSQL "Collation Support": a column's
+collation defaults to the database's; both from memory), so the fact
+covers it (`Catalog.binaryCollation`). Probed, eval/tables T5: in a
+`Latin1_General_100_BIN2` database a column created without `COLLATE`
+has that collation, and `v = 'a'` keeps `'a'` and `'a '` (2 rows) where
+PostgreSQL keeps `'a'` only (1 row) and `rtrim(v) = rtrim('a')` keeps
+both; under the server's default collation SQL Server also keeps `'A'`.
+A pick (C3b rules 1 and 2) may now assign a string column to a string
+variable: the stored value must fit the variable's declared type
+("String stores, on every path": SQL Server truncates, PostgreSQL raises
+22001; probed, eval/tables T9).
+
+**Writes** (`colValue`, `colFits`). `INSERT ... VALUES` and `UPDATE ...
+SET` store into a string column only the NULL literal or a string of the
+slice whose bound is at most `n` and which, into a T-SQL `varchar`, is
+not `wide`: then neither engine changes the value. A value that may be
+too long is outside the spec: SQL Server raises 2628 ("String or binary
+data would be truncated in table ..., column ...") only under
+`ANSI_WARNINGS ON` and truncates silently under `OFF` ("SET
+ANSI_WARNINGS (Transact-SQL)"; both from memory), a session setting the
+routine does not fix; PostgreSQL raises 22001 ("value too long for type
+character varying(n)"); and both truncate silently when the excess is
+spaces only (PostgreSQL 8.3: "An attempt to store a longer string into a
+column of these types will result in an error, unless the excess
+characters are all spaces, in which case the string will be truncated to
+the maximum length", from memory). Probed, eval/tables T2: 2628 against
+22001 for `INSERT` and `UPDATE`, nothing written; `'abcde   '` into
+`varchar(5)` stored as `'abcde'` on both; under `ANSI_WARNINGS OFF` SQL
+Server stores `'abcde'` for `'abcdef'`. An integer is never stored into a
+string column, nor a string into an integer column (both convert).
+
+**`ANSI_PADDING`.** A T-SQL `varchar` column created under `SET
+ANSI_PADDING OFF` trims trailing spaces from every value written to it;
+an `nvarchar` column keeps them ("SET ANSI_PADDING (Transact-SQL)", from
+memory). Probed, eval/tables T3: `'ab  '` is stored as 2 bytes in such a
+`varchar` column (`is_ansi_padded` 0), as 8 bytes in the `nvarchar` one.
+The catalog asserts that the T-SQL string columns were created with
+`ANSI_PADDING ON` (the default); the Rust side refuses a T-SQL tree that
+turns it off and names `ASM-TSQL-ANSI-PADDING` for a routine that writes
+a table with a `varchar` column (the setting is stored per column, which
+the DDL alone does not show).
+
+**String keys are outside.** A key column is an integer (`CatCol.ok`):
+SQL Server compares key values as `=` does, padding trailing spaces under
+every collation and ignoring case under the usual ones, while PostgreSQL
+compares exactly. Probed, eval/tables T6: in a BIN2 database `'a'` and
+`'a '` are a duplicate key (2627); PostgreSQL stores both.
+(`Core.keyOf` reads integer keys only.)
+
+**Constant defaults** (`CatCol.dflt`). A column may have a default both
+tables declare: an integer literal in the 32-bit range for an integer
+column, or a string literal of the slice (printable ASCII, no backslash)
+that fits for a string column (`CatCol.ok`); `DEFAULT NULL` is no
+default. An `INSERT` whose column list leaves such a column out stores
+the default in it. T-SQL "INSERT (Transact-SQL)": a column not in the
+column list that "Has a default" gets it ("The default for the column is
+used", from memory); PostgreSQL "INSERT": "Each column not present in the
+explicit or implicit column list will be filled with a default value,
+either its declared default value or null if there is none". Both
+lowerings add the left-out columns that have a default to the
+statement's column list, with the literal on every row (`defaultsFor`,
+`lowerStmt`), so the core statement is the C3a `insert` and the two sides
+get the same one. A literal cannot fail, so where it is evaluated does
+not matter. Probed, eval/tables T4: an omitted column gets its default
+(integer, negative integer, string, `N'x'` in SQL Server against `'x'`,
+`NOT NULL` with a default), a listed column gets its value (also NULL),
+an `UPDATE` leaves the default alone, `DEFAULT NULL` and no default give
+NULL; a default that does not fit is accepted by `CREATE TABLE` and fails
+the `INSERT` (2628 against 22001), which is why the default must fit.
+Expressions, functions (`GETDATE()`, `NEWID()`, `NEXT VALUE FOR`,
+`nextval`), a default only one table has, and two different defaults are
+outside (the Rust side does not send the table). `UPDATE ... SET c =
+DEFAULT` and `DEFAULT VALUES` stay outside the spec.
+
+**Indexes.** A non-unique index (not `UNIQUE`, no filter, plain columns,
+in PostgreSQL `btree`) does not change what a read or a write gives, the
+rows, the error kinds and the values being those of the table without
+it, except that each engine limits the size of an index entry and fails
+a write whose entry is too large. Probed, eval/tables T7 (duplicates and
+NULLs accepted, the same rows after `INSERT`, `UPDATE` and `DELETE`, both
+engines) and T8: SQL Server warns at `CREATE INDEX` and fails the write
+with 1946 for a key over 1700 bytes (nonclustered) or 900 bytes
+(clustered); PostgreSQL fails it with 54000 for an entry over about 2704
+bytes, `INCLUDE` columns counted. The check sees no index: the Rust side
+sends a table with an index only when no row the table can hold exceeds
+the limits, counting declared lengths (SQL Server: `int` 4, `varchar(n)`
+`n` and `nvarchar(n)` `2n` bytes over the key columns, at most 900 for a
+clustered and 1700 for a nonclustered index; PostgreSQL: `integer` 8 and
+`varchar(n)` `4n + 8` bytes over the key and `INCLUDE` columns, at most
+2600), and the catalog asserts it (`ASM-TABLES-AS-DECLARED`). A `UNIQUE`
+or filtered index, any other access method, an expression or an option
+leaves the table out. -/
+
+/-- (C3c) A column's type and default can be used: a string column of
+length `1 ≤ n ≤ 4000` that is not a key column; a default that is an
+integer of the 32-bit range for an integer column, or a string literal of
+the slice that fits for a string column. -/
+def CatCol.ok (c : CatCol) : Bool :=
+  (match c.str with
+    | none => true
+    | some (n, _) => decide (1 ≤ n ∧ n ≤ tsqlMaxLen) && !c.key) &&
+  match c.dflt, c.str with
+  | none, _ => true
+  | some (.int i), none => decide (Core.intMin ≤ i ∧ i ≤ Core.intMax)
+  | some (.str s), some (n, _) => strLitOk s && decide (s.length ≤ n)
+  | _, _ => false
+
+/-- (C3c) A value of type `vt` can be stored in column `c` as it is: NULL;
+an integer into an integer column; a string whose bound is at most the
+column's length into a string column, and into a T-SQL `varchar` only
+one that is not `wide` ("Writes" above). -/
+def colFits (c : CatCol) : STy → Bool
+  | .nul => true
+  | .int => c.str.isNone
+  | .str m w => match c.str with
+    | some (n, wide) => fitsLen (some n) m && (wide || !w)
+    | none => false
+  | .bool => false
+
+/-- (C3c) The left-out columns of an `INSERT` into `t` with column list
+`cs` that have a default, each with its literal ("Constant defaults"). -/
+def defaultsFor (t : CatTable) (cs : List Core.Col) : List (Core.Col × Core.Expr) :=
+  t.cols.filterMap fun c =>
+    if cs.contains c.name then none else c.dflt.map fun v => (c.name, .sc v)
+
 /-- Spelling of a column as a statement of the dialect writes it. -/
 def colKey (d : Dialect) (c : CatCol) : String :=
   match d with
@@ -1327,11 +1524,13 @@ def colKey (d : Dialect) (c : CatCol) : String :=
   | .pg _ _ => c.name
 
 /-- The table can be used: names ASCII and distinct; T-SQL spellings
-distinct up to case. -/
+distinct up to case; (C3c) every column's type and default as "The C3c
+tables" admits them (`CatCol.ok`). -/
 def CatTable.wellFormed (t : CatTable) : Bool :=
   !t.cols.isEmpty && t.cols.all (fun c => c.name.toList.all fun (ch : Char) => ch.toNat < 128) &&
     distinct (t.cols.map (·.name)) &&
-    caseSafe (t.cols.map (·.tsql))
+    caseSafe (t.cols.map (·.tsql)) &&
+    t.cols.all CatCol.ok
 
 /-- The catalog table a data statement names, if it can be used. -/
 def tableOf (d : Dialect) (target : List String) : Option CatTable :=
@@ -1342,11 +1541,11 @@ def tableOf (d : Dialect) (target : List String) : Option CatTable :=
     (Γ.tables.find? (·.name == n)).bind fun t => if t.wellFormed then some t else none
 
 /-- A column named in an `INSERT` column list or as a `SET` target. -/
-def colOf (d : Dialect) (t : CatTable) (x : String) : Option Core.Col :=
+def colOf (d : Dialect) (t : CatTable) (x : String) : Option CatCol :=
   let x := match d with
     | .tsql _ _ => x
     | .pg _ _ => pgName x
-  lookup (t.cols.map fun c => (colKey d c, c.name)) x
+  lookup (t.cols.map fun c => (colKey d c, c)) x
 
 /-- The columns an `UPDATE` or `DELETE` brings into scope, and for
 PostgreSQL the table's reference name (the last part of its name). -/
@@ -1354,7 +1553,8 @@ def scopeOf (d : Dialect) (t : CatTable) (target : List String) : Scope :=
   { cols := t.cols.map fun c => (colKey d c, c.name)
     rel := match d with
       | .tsql _ _ => none
-      | .pg _ _ => target.getLast?.map pgName }
+      | .pg _ _ => target.getLast?.map pgName
+    strCols := t.cols.filterMap fun c => c.str.map (c.name, ·) }
 
 def CatTable.toDef (t : CatTable) : Core.TableDef :=
   ⟨t.name, t.cols.map fun c => ⟨c.name, c.notNull, c.key⟩⟩
@@ -1362,11 +1562,14 @@ def CatTable.toDef (t : CatTable) : Core.TableDef :=
 def CatTable.isKey (t : CatTable) (c : Core.Col) : Bool :=
   t.cols.any fun d => d.name == c && d.key
 
-/-- A value written to a column: an `int` expression of the slice or the
-NULL literal ("Values written to a column" above), else outside the spec. -/
-def colValue (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Option Core.Expr :=
+/-- A value written to column `c`: an `int` expression of the slice or
+the NULL literal into an integer column ("Values written to a column"
+above), (C3c) a string of the slice that fits or the NULL literal into a
+string column (`colFits`, "The C3c tables"), else outside the spec. -/
+def colValue (d : Dialect) (env : TyEnv) (sc : Scope) (c : CatCol) (e : Ast.Expr) :
+    Option Core.Expr :=
   match typed d env sc e with
-  | some (s, t) => if valTy t then some (.sc s) else none
+  | some (s, t) => if colFits c t then some (.sc s) else none
   | none => none
 
 /-- A data statement may stand here: in a procedure, and in T-SQL only
@@ -1551,11 +1754,24 @@ def existsItems : List Ast.SelItem → Bool
   | [.SelItem (.Num "1") none none] | [.SelItem (.Star none) none none] => true
   | _ => false
 
-/-- A value a query assigns from the row it picks: an `int` expression of
-the slice or NULL (`colValue`), reading no variable, that cannot raise. -/
-def pickValue (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Option Core.Expr := do
-  let e' ← colValue d env sc e
-  if e'.vars.isEmpty && !e'.raise then some e' else none
+/-- A value a query assigns from the row it picks, with its type: an
+`int` expression of the slice, (C3c) a string expression of the slice,
+or NULL, reading no variable, that cannot raise. -/
+def pickValue (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) :
+    Option (Core.Expr × STy) := do
+  let (s, t) ← typed d env sc e
+  let e' : Core.Expr := .sc s
+  if isVal t && e'.vars.isEmpty && !e'.raise then some (e', t) else none
+
+/-- (C3b, C3c) A variable a pick may assign a value of type `t` to: an
+`int` variable for an integer, a string variable for a string (whether
+the string fits is a store, held by `storesRoutine`: "String stores, on
+every path"), either for NULL. -/
+def pickTarget (d : Dialect) (env : TyEnv) (x : Var) : STy → Bool
+  | .int => intVar d env x
+  | .str .. => (strVar d env x).isSome
+  | .nul => intVar d env x || (strVar d env x).isSome
+  | .bool => false
 
 /-- The conjuncts of a condition. -/
 def conjuncts : SExpr → List SExpr
@@ -1583,14 +1799,14 @@ def queryOn (d : Dialect) (env : TyEnv) (tgt : List String) (wh : Option Ast.Exp
   let c ← lowerOpt d env sc wh
   pure (t, sc, c)
 
-/-- `.row`: distinct `int` targets that the condition does not read, and
-a condition that fixes the key. -/
+/-- `.row`: distinct targets of the values' types (`pickTarget`) that the
+condition does not read, and a condition that fixes the key. -/
 def rowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (orNull : Bool)
-    (sets : List (Var × Core.Expr)) : Option Stmt :=
+    (sets : List (Var × Core.Expr × STy)) : Option Stmt :=
   let xs := sets.map (·.1)
-  if !sets.isEmpty && distinct xs && xs.all (intVar d env) &&
+  if !sets.isEmpty && distinct xs && sets.all (fun (x, _, ty) => pickTarget d env x ty) &&
       !(xs.any (Core.Expr.varsOpt c).contains) && keyFixed t c then
-    some (.query t.toDef c (.row orNull sets))
+    some (.query t.toDef c (.row orNull (sets.map fun (x, e, _) => (x, e))))
   else none
 
 /-- `.count`: an `int` target that the condition does not read. -/
@@ -1652,6 +1868,13 @@ def lowerExists (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := 
   if !into.isEmpty || strict || !existsItems items then none else
   let (t, _, c) ← queryOn d env tgt wh
   pure (.query t.toDef c (.any existsVar))
+
+/-- (C3b) The dialect a `FOR` loop's query is read in: its record is a
+variable there (`lowerForBlock`). -/
+def withRecord (d : Dialect) (r : String) : Dialect :=
+  match d with
+  | .pg Γ vars => .pg Γ (vars ++ [pgName r])
+  | d => d
 
 /-- A `record` declaration's type. -/
 def recordType : Ast.Ty → Bool
@@ -1749,11 +1972,14 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
   | .Insert tgt cols (.SrcValues rows) [] [] none => do
     if !dataOk d k then none else
     let t ← tableOf d tgt
-    let cs ← cols.mapM (colOf d t)
+    let ccs ← cols.mapM (colOf d t)
+    let cs := ccs.map (·.name)
     if cs.isEmpty || !distinct cs || rows.isEmpty || !rows.all (·.length == cs.length) then none
     else
-      let rows' ← rows.mapM (·.mapM (colValue d env {}))
-      pure [.insert t.toDef cs rows']
+      let rows' ← rows.mapM fun r => (ccs.zip r).mapM fun (c, e) => colValue d env {} c e
+      -- C3c: the left-out columns with a default get it.
+      let dfl := defaultsFor t cs
+      pure [.insert t.toDef (cs ++ dfl.map (·.1)) (rows'.map (· ++ dfl.map (·.2)))]
   | .Update tgt none sets [] wh => do
     if !dataOk d k then none else
     let t ← tableOf d tgt
@@ -1761,9 +1987,9 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
     let sets' ← sets.mapM fun
       | .Set [c] e => do
         let c' ← colOf d t c
-        if t.isKey c' then none else
-          let e' ← colValue d env sc e
-          pure (c', e')
+        if t.isKey c'.name then none else
+          let e' ← colValue d env sc c' e
+          pure (c'.name, e')
       | _ => none
     if sets'.isEmpty || !distinct (sets'.map (·.1)) then none
     else
@@ -2462,7 +2688,9 @@ catalog (PL/pgSQL) into a variable, whose value comes from the callee
 and has no bound here, so the variable must be an integer, of a
 certainly non-character type, or a string type without a length that
 holds every value (`copyOk`). Parameter defaults are held by `dfltOk`.
-Data statements write only `int` columns (`colValue`). A procedure's
+Data statements write `int` columns and (C3c) string columns only with
+values that fit (`colValue`, `colFits`); a C3b pick's string store is
+held here (`pickStoresOk`). A procedure's
 `RETURN e` sets the integer status (`statusExpr`), not a string. Not
 covered here: the conversion of a call's argument into the callee's
 parameter (the callee's boundary; the catalog does not give its types),
@@ -2490,9 +2718,11 @@ def storeTy (d : Dialect) (ty : Ast.Ty) : Option (Option Nat × Bool) :=
     else none
   | none, _, _ => none
 
-/-- A store of `v` into a target declared `ty` changes no value. -/
-def storeOk (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : Bool :=
-  if v matches .Null then true else
+/-- A store into a target declared `ty` of the NULL literal (`isNull`),
+or of a value whose slice type is `vt` (`none`: outside the slice),
+changes no value. -/
+def storeOkTy (d : Dialect) (ty : Option Ast.Ty) (isNull : Bool) (vt : Option STy) : Bool :=
+  if isNull then true else
   match ty with
   | none => false
   | some ty =>
@@ -2502,10 +2732,45 @@ def storeOk (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : Bo
     | some (n, wt) =>
       -- No length and every character: any value is kept.
       if n.isNone && (wt || (d matches .pg _ _)) then true else
-      match typed d env {} v with
-      | some (_, .nul) => true
-      | some (_, .str m w) => fitsLen n m && (wt || !w)
+      match vt with
+      | some .nul => true
+      | some (.str m w) => fitsLen n m && (wt || !w)
       | _ => false
+
+/-- A store of `v` into a target declared `ty` changes no value. -/
+def storeOk (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : Bool :=
+  storeOkTy d ty (v matches .Null) ((typed d env {} v).map (·.2))
+
+/-- (C3c) The type of the select item `e` of the query `q`, typed with
+the query's table in scope: the value a pick stores. -/
+def itemTy (d : Dialect) (env : TyEnv) (q : Ast.Select) (e : Ast.Expr) : Option STy := do
+  let (_, _, _, tgt, _) ← selParts q
+  let t ← tableOf d tgt
+  (typed d env (scopeOf d t tgt) e).map (·.2)
+
+/-- (C3c) The stores of a query's picks (C3b rules 1, 2 and 4): each
+target variable with the select item it gets. A string column read into
+a string variable must fit it (eval/tables T9: SQL Server truncates,
+PostgreSQL raises 22001). -/
+def pickStoresOk (d : Dialect) (env wenv : TyEnv) (q : Ast.Select) (ts : List (Var × Ast.Expr)) :
+    Bool :=
+  ts.all fun (x, e) => storeOkTy d (lookup wenv x) false (itemTy d env q e)
+
+/-- (C3c) The stores of the converter's `FOR` block over record `r`
+(C3b rule 1): every statement of the loop's body is `x := r.a` for an
+item `e AS a` of the query, and `e` fits `x`. Any other body is refused
+here; `lowerForBlock` refuses it too. -/
+def forStoresOk (d : Dialect) (env wenv : TyEnv) (r : String) (q : Ast.Select)
+    (body : List Ast.Node) : Bool :=
+  let items := match selParts q with
+    | some (items, _, _, _, _) => items
+    | none => []
+  body.all fun n => match fieldAssign (pgName r) n with
+    | some (x, a) =>
+      match items.find? (fun | .SelItem _ (some a') _ => pgName a' == a | _ => false) with
+      | some (.SelItem e _ _) => storeOkTy d (lookup wenv x) false (itemTy (withRecord d r) env q e)
+      | none => false
+    | none => false
 
 /-- The variable a copy-back writes can take any value of its type: an
 integer, a certainly non-character type, or a string type without a
@@ -2536,6 +2801,21 @@ def callStoresOk (d : Dialect) (wenv : TyEnv) (n : List String) (args : List Ast
         | none => false
 
 def storesStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
+  -- C3c: a scalar subquery's one item, and the picks of `SELECT @x = e` and
+  -- `SELECT ... INTO x`.
+  | .Assign t (.Subquery q) => match target d t, selParts q with
+    | some x, some ([.SelItem e _ _], _, _, _, _) => pickStoresOk d env wenv q [(x, e)]
+    | some x, _ => storeOk d env (lookup wenv x) (.Subquery q)
+    | none, _ => true -- refused by `lowerStmt`
+  | .SSelect q => match selParts q with
+    | some (items, into, _, _, _) =>
+      let assigned := items.filterMap fun
+        | .SelItem e _ (some v) => (target d (.Var v)).map (·, e)
+        | _ => none
+      let intos := (into.zip items).filterMap fun
+        | (x, .SelItem e _ _) => (target d x).map (·, e)
+      pickStoresOk d env wenv q (assigned ++ intos)
+    | none => true -- refused by `lowerStmt`
   | .Assign t v => match target d t with
     | some x => storeOk d env (lookup wenv x) v
     | none => true -- refused by `lowerStmt`
@@ -2552,7 +2832,7 @@ mutual
       ds.all (storesStmt d env wenv ret) && storesNodes d env wenv ret body
     | .If _ t e => storesNodes d env wenv ret t && storesNodes d env wenv ret e
     | .While _ b => storesNodes d env wenv ret b
-    | .ForQuery _ _ b => storesNodes d env wenv ret b
+    | .ForQuery r q b => forStoresOk d env wenv r q b
     | .Call n args _ => callStoresOk d wenv n args
     | .Try b hs => storesNodes d env wenv ret b && storesHandlers d env wenv ret hs
     | .Setting .. | .Throw _ | .Raise .. | .Txn .. => true
@@ -2816,6 +3096,14 @@ def valueOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
   | some (_, t) => valTy t
   | none => false
 
+/-- (C3c) A value position of a data statement or a query: an integer, a
+string or the NULL literal of the slice (the column or the target is
+held to it by `colValue` and `storesRoutine`). -/
+def anyValueOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
+  match typed d env sc e with
+  | some (_, t) => isVal t
+  | none => false
+
 /-- A value stored in something declared `ty`. -/
 def valueFits (d : Dialect) (env : TyEnv) (sc : Scope) (ty : Ast.Ty) (e : Ast.Expr) : Bool :=
   match typed d env sc e with
@@ -2846,16 +3134,9 @@ def querySlice (d : Dialect) (env : TyEnv) (q : Ast.Select) : Bool :=
     | some t =>
       let sc := scopeOf d t tgt
       wh.all (condOk d env sc) &&
-        (existsItems items || items.all fun | .SelItem e _ _ => countStar e || valueOk d env sc e)
+        (existsItems items || items.all fun | .SelItem e _ _ => countStar e || anyValueOk d env sc e)
     | none => false
   | none => false
-
-/-- (C3b) The dialect a `FOR` loop's query is read in: its record is a
-variable there (`lowerForBlock`). -/
-def withRecord (d : Dialect) (r : String) : Dialect :=
-  match d with
-  | .pg Γ vars => .pg Γ (vars ++ [pgName r])
-  | d => d
 
 def sliceStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
   | .Assign _ (.Subquery q) => querySlice d env q
@@ -2868,11 +3149,12 @@ def sliceStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt 
   | .Declare _ ty dflt => match dflt with
     | none => true
     | some e => (ty.map fun t => valueFits d env {} t e).getD false
-  | .Insert _ _ (.SrcValues rows) _ _ _ => rows.all (·.all (valueOk d env {}))
+  -- C3c: string values too; `colValue` holds them to the column.
+  | .Insert _ _ (.SrcValues rows) _ _ _ => rows.all (·.all (anyValueOk d env {}))
   | .Update tgt _ sets _ wh => match tableOf d tgt with
     | some t =>
       let sc := scopeOf d t tgt
-      sets.all (fun | .Set _ e => valueOk d env sc e) && wh.all (condOk d env sc)
+      sets.all (fun | .Set _ e => anyValueOk d env sc e) && wh.all (condOk d env sc)
     | none => false
   | .Delete tgt _ _ wh => match tableOf d tgt with
     | some t => wh.all (condOk d env (scopeOf d t tgt))
