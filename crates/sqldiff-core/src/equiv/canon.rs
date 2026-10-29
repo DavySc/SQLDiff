@@ -543,12 +543,15 @@ impl<'a> Canon<'a> {
     }
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
-    fn fits(dst: &Ty, src: &Ty) -> bool {
+    fn fits(&self, dst: &Ty, src: &Ty) -> bool {
         if dst.fam != src.fam {
+            // PostgreSQL drops the trailing blanks of a CHAR value converted
+            // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
             return dst.is_string()
                 && src.is_string()
                 && dst.fam == Fam::VarChar
-                && dst.len.is_none();
+                && dst.len.is_none()
+                && !(self.d == Dialect::Postgres && src.fam == Fam::Char);
         }
         match dst.fam {
             // A bounded binary target cuts a longer value off in T-SQL and
@@ -571,7 +574,11 @@ impl<'a> Canon<'a> {
                 src.len.is_none()
                     || (dst.scale == src.scale && dst.len.zip(src.len).is_some_and(|(d, s)| d >= s))
             }
-            _ => true,
+            // The engine does not know which type an `Other` is (BINARY(n),
+            // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
+            // round or fail.
+            Fam::Other => false,
+            Fam::Date | Fam::Interval | Fam::Bool => true,
         }
     }
 
@@ -648,7 +655,7 @@ impl<'a> Canon<'a> {
             }
         }
         match &v.1 {
-            Some(s) if Self::fits(d, s) => v,
+            Some(s) if self.fits(d, s) => v,
             None if matches!(v.0.head(), "null") => v,
             _ => self.convert(*d, v, if var { How::Var } else { How::Store }),
         }
@@ -1378,6 +1385,9 @@ impl<'a> Canon<'a> {
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
             // padded values compare and concatenate, which those terms keep.
+            // PostgreSQL drops a CHAR value's trailing blanks when it becomes
+            // varchar or text; SQL Server keeps them.
+            (Char, VarChar) if self.d == Dialect::Postgres => Rule::Dialect,
             (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
             (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
             // Fewer fractional digits round differently: PostgreSQL rounds a
@@ -1523,7 +1533,7 @@ impl<'a> Canon<'a> {
                     || (b.is("str")
                         && b.kid(0).and_then(Term::atom) == Some("")
                         && first_ty.is_some_and(|t| t.is_string()))
-                    || matches!((first_ty, bty), (Some(x), Some(y)) if Self::fits(&x, &y));
+                    || matches!((first_ty, bty), (Some(x), Some(y)) if self.fits(&x, &y));
                 if fits {
                     portable("coalesce", args, first_ty)
                 } else if let (Some(x), Some(y)) = (first_ty, bty) {
