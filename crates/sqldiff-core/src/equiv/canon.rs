@@ -153,6 +153,11 @@ pub mod asm {
         "ASM-OPENJSON-VALUES",
         "The JSON documents read with OPENJSON are valid JSON (nothing after the value), an object or an array of objects, with no duplicate keys, no \\u0000 escape and no unpaired surrogate escape; each value a WITH column reads is null or a scalar in its type's plain form: a string of Basic Multilingual Plane characters for nvarchar, an integer number in range for int and bigint, a number without exponent for decimal, a 'yyyy-mm-dd' string for date, true, false, 0 or 1 for bit",
     );
+    /// An OPENJSON source of UPDATE … FROM reads one row per target row.
+    pub const OPENJSON_ONE_ROW: (&str, &str) = (
+        "ASM-OPENJSON-ONE-ROW",
+        "The JSON document an UPDATE … FROM reads with OPENJSON is one object, not an array: it gives at most one row, so each target row meets at most one (with several, SQL Server and PostgreSQL each pick one unpredictably)",
+    );
     /// Decision 1: across dialects, result column names that differ only in
     /// letter case are equal when the client matches names that way.
     pub const RESULT_NAMES_CI: (&str, &str) = (
@@ -2458,6 +2463,7 @@ impl<'a> Canon<'a> {
             key,
             table: table.clone(),
             derived: Some(derived),
+            unique: None,
         });
         Ok(n("openjson", vec![a(table), st, n("cols", cols)]))
     }
@@ -3696,6 +3702,7 @@ impl<'a> Canon<'a> {
             match t.head() {
                 "t" => Some(t.kid(0).and_then(Term::atom).unwrap_or("").to_string()),
                 "sub" => subs.next().map(|s| s.0.clone()),
+                "openjson" => t.kid(0).and_then(Term::atom).map(str::to_string),
                 _ => None,
             }
         }
@@ -3706,7 +3713,7 @@ impl<'a> Canon<'a> {
             subs: &mut Subs,
         ) -> bool {
             match t.head() {
-                "t" | "sub" => {
+                "t" | "sub" | "openjson" => {
                     let Some(name) = name(t, subs) else {
                         return false;
                     };
@@ -3719,7 +3726,8 @@ impl<'a> Canon<'a> {
                     else {
                         return false;
                     };
-                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub")) {
+                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub") || r.is("openjson"))
+                    {
                         return false;
                     }
                     let Some(name) = name(r, subs) else {
@@ -3755,6 +3763,14 @@ impl<'a> Canon<'a> {
             let mut progress = false;
             for (t, on) in &ls {
                 if bound.contains(t) {
+                    continue;
+                }
+                // A JSON object is one row (`{}` none): every target row
+                // meets at most one.
+                if t.starts_with("oj:") {
+                    self.assume(asm::OPENJSON_ONE_ROW);
+                    bound.push(t.clone());
+                    progress = true;
                     continue;
                 }
                 let cs = match on {

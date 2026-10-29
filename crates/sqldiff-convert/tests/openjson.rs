@@ -105,3 +105,31 @@ fn other_forms_are_not_converted() {
         assert!(!c.output.contains("jsonb"), "{from}: {}", c.output);
     }
 }
+
+#[test]
+fn update_from_openjson_is_proven_for_one_object() {
+    let src = "CREATE PROCEDURE WebApi.UpdateCityFromJson(@City NVARCHAR(MAX), @CityID int, @UserID int)
+AS BEGIN
+    UPDATE Application.Cities SET
+        CityName = json.CityName,
+        StateProvinceID = json.StateProvinceID,
+        LastEditedBy = @UserID
+    FROM OPENJSON (@City)
+        WITH (CityName nvarchar(50) N'strict $.CityName', StateProvinceID int N'strict $.StateProvinceID') as json
+    WHERE Application.Cities.CityID = @CityID
+END";
+    let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+    assert!(
+        c.output
+            .contains("AS e) as json WHERE Application.Cities.CityID = p_city_id;"),
+        "{}",
+        c.output
+    );
+    let u = c
+        .units
+        .iter()
+        .find(|u| u.notes.iter().any(|n| n.rule == "ASM-OPENJSON-ONE-ROW"))
+        .expect("the UPDATE notes ASM-OPENJSON-ONE-ROW");
+    assert_eq!(u.status, Status::Assumptions, "{:#?}", c.units);
+    assert!(u.notes.iter().any(|n| n.rule == "ASM-OPENJSON-VALUES"));
+}

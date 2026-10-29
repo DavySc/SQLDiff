@@ -2314,11 +2314,10 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        if chains
-            .iter()
-            .flatten()
-            .any(|st| find_word(st.leaf.toks, 0, "WITH").is_some() || hinted(st.leaf.toks))
-        {
+        if chains.iter().flatten().any(|st| {
+            !st.leaf.is_openjson()
+                && (find_word(st.leaf.toks, 0, "WITH").is_some() || hinted(st.leaf.toks))
+        }) {
             return Err(why("table hints are not converted"));
         }
         let mut moved: Vec<&[T]> = Vec::new();
@@ -2402,6 +2401,13 @@ impl<'a> Cx<'a> {
         let wh: Option<&[T]> = (end < ts.len()).then(|| &ts[end + 1..]);
         self.unique_join(&tkey, &chains, &moved, wh)
             .map_err(|w| why(&w))?;
+        if chains.iter().flatten().any(|st| st.leaf.is_openjson()) {
+            self.note(
+                Status::Assumptions,
+                "ASM-OPENJSON-ONE-ROW",
+                "The JSON document the UPDATE reads with OPENJSON is one object, not an array: each target row then meets at most one row of it (with several, SQL Server and PostgreSQL each pick one unpredictably).",
+            );
+        }
 
         self.step_ts("tsql.dml.update-from", ts);
         // SET list: PostgreSQL takes no table name before a column.
@@ -2536,7 +2542,10 @@ impl<'a> Cx<'a> {
                 let grouped = |key: Option<&Vec<String>>| {
                     key.is_some_and(|k| k.iter().all(|c| cols.contains(c)))
                 };
-                let unique = if !st.leaf.table {
+                // OPENJSON: one row for an object (ASM-OPENJSON-ONE-ROW).
+                let unique = if st.leaf.is_openjson() {
+                    true
+                } else if !st.leaf.table {
                     derived_query(st.leaf.toks).is_some_and(|q| grouped(cte_group_key(q).as_ref()))
                 } else {
                     match self.update_cte(&st.leaf.name) {
@@ -4938,6 +4947,15 @@ impl<'a> Cx<'a> {
             self.step_ts("tsql.trigger.missing-image", &ts[..1]);
             return format!("{r}{}", self.expr(&ts[1..])).trim().to_string();
         }
+        if !self.db2() && leaf.is_openjson() {
+            let first = sig(ts)[0];
+            if let Some((text, end)) = self.openjson_pg(ts, first) {
+                self.step_ts("tsql.from.openjson", &ts[first..end]);
+                return format!("{text}{}", self.expr(&ts[end..]))
+                    .trim()
+                    .to_string();
+            }
+        }
         if self.db2() && !leaf.table && !leaf.name.is_empty() {
             if let Some((call, end)) = self.table_function_db2(ts, 0) {
                 self.step_ts("tsql.from.table-function", &ts[..end]);
@@ -6282,6 +6300,11 @@ struct Leaf<'a> {
 }
 
 impl Leaf<'_> {
+    /// `OPENJSON(…) [WITH (…)] [AS x]`.
+    fn is_openjson(&self) -> bool {
+        !self.table && self.name == ["openjson"]
+    }
+
     /// Whether the DELETE target `t` names this table: by its alias, or by
     /// a one-part name equal to the last part of an unaliased table.
     fn binds(&self, t: &[String]) -> bool {
@@ -6652,8 +6675,15 @@ fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
             return bad();
         };
         if s.get(k).is_some_and(|&i| ts[i].k == L_PAREN) {
-            // A table-valued function call.
-            let close = matching(ts, s[k]).ok_or("unbalanced parentheses")?;
+            // A table-valued function call; OPENJSON's WITH list is part of it.
+            let mut close = matching(ts, s[k]).ok_or("unbalanced parentheses")?;
+            let after = s.iter().position(|&i| i > close).unwrap_or(s.len());
+            if name == ["openjson"]
+                && s.get(after).is_some_and(|&i| ts[i].is("WITH"))
+                && s.get(after + 1).is_some_and(|&i| ts[i].k == L_PAREN)
+            {
+                close = matching(ts, s[after + 1]).ok_or("unbalanced parentheses")?;
+            }
             (
                 name,
                 false,

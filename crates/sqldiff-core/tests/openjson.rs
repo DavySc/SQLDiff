@@ -137,3 +137,31 @@ fn other_openjson_forms_are_not_compared() {
         assert!(!equal(&r), "{to}: {:?}", r.verdict());
     }
 }
+
+#[test]
+fn update_from_one_object() {
+    let a = "CREATE PROCEDURE dbo.U @Colors nvarchar(max), @ID int
+AS
+BEGIN
+    UPDATE dbo.Colors SET ColorName = j.ColorName, Price = j.Price
+    FROM OPENJSON(@Colors) WITH (ColorName nvarchar(20) N'strict $.ColorName', Price decimal(18,2)) AS j
+    WHERE dbo.Colors.ColorID = @ID;
+END;";
+    let b = |set: &str| {
+        format!(
+            "CREATE OR REPLACE PROCEDURE U(p_colors text, p_id integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  UPDATE Colors SET {set} FROM (SELECT CAST(jsonb_path_query_first(e, 'strict $.\"ColorName\"') #>> '{{}}' AS varchar(20)) AS ColorName, CAST(e ->> 'Price' AS numeric(18, 2)) AS Price FROM {ROWS}) AS j WHERE Colors.ColorID = p_id;
+END;
+$$;"
+        )
+    };
+    let r = run(a, &b("ColorName = j.ColorName, Price = j.Price"));
+    assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions, "{r:#?}");
+    let ids: Vec<&str> = r.assumptions.iter().map(|a| a.id.as_str()).collect();
+    assert!(ids.contains(&"ASM-OPENJSON-ONE-ROW"), "{ids:?}");
+    let r = run(a, &b("ColorName = j.ColorName, Price = j.Price + 1"));
+    assert!(!equal(&r));
+}

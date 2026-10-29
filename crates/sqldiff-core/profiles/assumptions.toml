@@ -609,6 +609,13 @@ fact = "The converted statement takes the value once (a variable), or a reading 
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-OPENJSON-ONE-ROW"
+statement = "The JSON document an UPDATE … FROM reads with OPENJSON is one object, not an array, so each target row meets at most one of its rows."
+discharge = "deployment"
+fact = "The callers pass one JSON object (as the WWI WebApi Update…FromJson procedures do), never an array."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-OPENJSON-VALUES"
 statement = "The JSON documents OPENJSON reads are valid JSON (an object or an array of objects, nothing after it) without duplicate keys, \\u0000 or unpaired surrogate escapes, and each value a WITH column reads is null or a plain value of its type (BMP strings for nvarchar, integers in range for int and bigint, numbers without exponent for decimal, 'yyyy-mm-dd' for date, true, false, 0 or 1 for bit)."
 discharge = "deployment"
