@@ -692,3 +692,48 @@ fn the_page_gets_the_gates_first_blockers_and_how_many_there_are() {
         st["gate"]["blockers"].as_array().unwrap().len()
     );
 }
+
+#[test]
+fn the_gate_banner_counts_the_blockers_it_does_not_list() {
+    use std::process::Command;
+    if Command::new("node").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "node is needed for this test on CI"
+        );
+        eprintln!("skipped: node not found");
+        return;
+    }
+    let page = sqldiff_gui::convert_review::REVIEW_HTML;
+    let esc = &page[page.find("const esc = ").expect("esc")..];
+    let esc = &esc[..esc.find('\n').unwrap()];
+    let list = &page[page.find("function blockerList(g)").expect("blockerList")..];
+    let list = &list[..list.find("\n}\n").unwrap() + 2];
+    let blocker =
+        serde_json::json!({ "kind": "open", "path": "a.sql", "out_line": 3, "what": "x" });
+    let gate = |shown: usize, total: usize| serde_json::json!({ "blockers": vec![blocker.clone(); shown], "blockers_total": total });
+    let script = format!(
+        "{esc}\n{list}\nfor (const g of [{}, {}]) console.log(blockerList(g));\n",
+        gate(GATE_BLOCKERS_SHOWN, GATE_BLOCKERS_SHOWN + 5),
+        gate(2, 2),
+    );
+    let dir = std::env::temp_dir().join(format!("sqldiff-banner-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("banner.js"), script).unwrap();
+    let out = Command::new("node")
+        .arg(dir.join("banner.js"))
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0].matches("<li>a.sql:3").count(), GATE_BLOCKERS_SHOWN);
+    assert!(lines[0].contains("<li>… and 5 more</li>"), "{}", lines[0]);
+    assert_eq!(lines[1].matches("<li>a.sql:3").count(), 2);
+    assert!(!lines[1].contains("more"), "{}", lines[1]);
+}

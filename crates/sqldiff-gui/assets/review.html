@@ -290,6 +290,12 @@ async function api(path, body) {
   return r.headers.get("Content-Type").startsWith("application/json") ? JSON.parse(text) : text;
 }
 
+// The blockers the state carries (the first few), and how many more there are.
+function blockerList(g) {
+  const more = g.blockers_total - g.blockers.length;
+  return `<ul>${g.blockers.map((x) => `<li>${esc(x.path)}${x.out_line ? `:${x.out_line}` : ""}${x.unit ? ` ${esc(x.unit)}` : ""} · ${esc(x.kind)}: ${esc(x.what)}</li>`).join("")}${more > 0 ? `<li>… and ${more} more</li>` : ""}</ul>`;
+}
+
 function renderHeader() {
   const st = S.st;
   const base = (p) => p.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
@@ -312,7 +318,7 @@ function renderHeader() {
     const kinds = Object.entries(g.counts).map(([k, n]) => `${n} ${esc(k)}`).join(", ");
     b.push(`<div class="banner gate">${g.complete
       ? `Done: every unit is converted, or its assumptions are accepted and its decisions picked by a person; no rejection stands; what an agent wrote is approved by a person; and the converted tree is what converting the source gives (judged ${esc(time(st.gate_judged))}, files unchanged since)${g.instances === true ? ", with a current, complete instance check" : ""}. ${g.nothing_found} of ${g.units} unit(s) are converted with nothing found: not proven, and not reviewed.`
-      : `Not done (${kinds}):<ul>${g.blockers.slice(0, 100).map((x) => `<li>${esc(x.path)}${x.out_line ? `:${x.out_line}` : ""}${x.unit ? ` ${esc(x.unit)}` : ""} · ${esc(x.kind)}: ${esc(x.what)}</li>`).join("")}${g.blockers_total > g.blockers_total ? `<li>… and ${g.blockers_total - g.blockers_total} more</li>` : ""}</ul>`}</div>`);
+      : `Not done (${kinds}):${blockerList(g)}`}</div>`);
   }
   if (g && S.gateOpen && g.accepted.length) b.push(`<div class="banner gate"><details><summary>Accepted by name: ${g.accepted.length} rule(s)</summary><ul>${g.accepted.map((x) => `<li>${esc(x.state)} ${esc(x.rule)} on ${x.units} unit(s) by ${esc(x.authors.join(", "))}</li>`).join("")}</ul></details></div>`);
   if (!g && st.gate_error) b.push(`<div class="banner">Done gate not judged: ${esc(st.gate_error)}</div>`);
