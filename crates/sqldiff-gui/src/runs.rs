@@ -2212,11 +2212,11 @@ fn stored_extra(command: &Command, packs: &[LoadedPack]) -> Option<Vec<u8>> {
         .into_iter()
         .flatten()
     {
-        stored::contents(Path::new(f), &mut out);
+        stored::contents(Path::new(f), &mut out)?;
     }
+    // The `pack.toml` the pack was loaded from: all `Pack::load` reads.
     for p in packs {
-        let path = Path::new(&p.path);
-        stored::contents(path.parent().unwrap_or(path), &mut out);
+        stored::contents(Path::new(&p.path), &mut out)?;
     }
     Some(out)
 }
@@ -2447,4 +2447,68 @@ fn review_changes(w: &ChangesWork, hooks: &Hooks) -> Result<State, String> {
         notes: Vec::new(),
         finished: String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(config: Option<&Path>) -> Command {
+        Command {
+            args: vec!["convert".into()],
+            project_config: config.map(|p| p.display().to_string()),
+            user_config: None,
+            powershell: String::new(),
+            sh: String::new(),
+        }
+    }
+
+    fn pack(path: &Path) -> LoadedPack {
+        LoadedPack {
+            private: true,
+            name: None,
+            version: None,
+            path: path.display().to_string(),
+        }
+    }
+
+    #[test]
+    fn the_key_follows_the_config_and_pack_contents() {
+        let d = std::env::temp_dir().join(format!("sqldiff-extra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let (cfg, p) = (d.join("sqldiff.toml"), d.join("pack.toml"));
+        std::fs::write(&cfg, "a = 1\n").unwrap();
+        std::fs::write(&p, "b = 1\n").unwrap();
+        let key = || stored_extra(&command(Some(&cfg)), &[pack(&p)]).unwrap();
+        let first = key();
+        assert_eq!(key(), first);
+        std::fs::write(&p, "b = 2\n").unwrap();
+        let second = key();
+        assert_ne!(second, first, "pack contents");
+        std::fs::write(&cfg, "a = 2\n").unwrap();
+        assert_ne!(key(), second, "config contents");
+        // A file that cannot be read: nothing is stored.
+        std::fs::remove_file(&p).unwrap();
+        assert!(stored_extra(&command(Some(&cfg)), &[pack(&p)]).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `Pack::load` reads `pack.toml` through a link: so does the key.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_pack_toml_is_keyed_by_what_it_points_to() {
+        let d = std::env::temp_dir().join(format!("sqldiff-extra-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("pack")).unwrap();
+        let target = d.join("real.toml");
+        std::fs::write(&target, "b = 1\n").unwrap();
+        let link = d.join("pack").join("pack.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let key = || stored_extra(&command(None), &[pack(&link)]).unwrap();
+        let first = key();
+        std::fs::write(&target, "b = 2\n").unwrap();
+        assert_ne!(key(), first);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -7,7 +7,7 @@
 //! instance report and the files in OUT read as they are now. So its key
 //! (`convert_review::stored_key`) takes everything a conversion is made
 //! from: this build of the app (a hash of its executable), the run's
-//! command, the contents of the config files and pack folders it loads,
+//! command, the contents of the config files and packs (`pack.toml`) it loads,
 //! every source file, the ledger's hand-written texts in ledger order and
 //! the base catalogs. A file must read back to the very bytes it was
 //! written from, or it is deleted and the tree converted again.
@@ -168,31 +168,17 @@ pub fn build() -> &'static str {
     })
 }
 
-/// Every file under `p` (or `p` itself), in a fixed order, with its
-/// contents: what a key takes of config files and packs. Links below `p`
-/// are not followed.
-pub fn contents(p: &Path, out: &mut Vec<u8>) {
-    fn part(out: &mut Vec<u8>, b: &[u8]) {
+/// `p` and the contents of the file it names, read as the config and
+/// pack loaders read it (through a link, if it is one): what a key takes
+/// of a config file or a pack. `None` when it cannot be read, which
+/// stores nothing.
+pub fn contents(p: &Path, out: &mut Vec<u8>) -> Option<()> {
+    let text = std::fs::read(p).ok()?;
+    for b in [p.display().to_string().as_bytes(), &text[..]] {
         out.extend((b.len() as u64).to_le_bytes());
         out.extend(b);
     }
-    part(out, p.display().to_string().as_bytes());
-    if p.is_dir() {
-        let mut entries: Vec<PathBuf> = std::fs::read_dir(p)
-            .map(|d| d.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default();
-        entries.sort();
-        part(out, &(entries.len() as u64).to_le_bytes());
-        for e in entries {
-            match std::fs::symlink_metadata(&e) {
-                Ok(m) if m.file_type().is_symlink() => part(out, b"link"),
-                _ => contents(&e, out),
-            }
-        }
-    } else {
-        let text = std::fs::read(p).unwrap_or_default();
-        part(out, &text);
-    }
+    Some(())
 }
 
 #[cfg(test)]
