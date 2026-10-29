@@ -21,3 +21,6 @@ serde_json.workspace = true
 regex.workspace = true
 clap.workspace = true
 getrandom = "0.2"
+sha2.workspace = true
+# Stored conversions (`stored`) are kept gzipped; pure Rust.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
