@@ -315,9 +315,10 @@ is accepted only as the converter writes it: its one declaration a
 `record` without default, named like no variable of the routine, the
 loop its only statement, the loop's body exactly `xi := r.ai` in the
 order of the select list's aliases. `EXISTS` is the whole condition of
-an `IF`, its test held in a variable no dialect can name
-(`Sqldiff.Mirror.existsVar`, `"%exists"`), a local of both lowered
-routines that the certificate need not list. Queries stand only in
+an `IF`, its test held in a hidden variable (`Sqldiff.Mirror.existsVar`,
+`%exists`), a local of both lowered routines that the certificate need
+not list; a routine that names it too is refused (duplicate local, or a
+renaming that is not injective). Queries stand only in
 procedures; `WHILE EXISTS`, `EXISTS` inside a larger condition, joins,
 aliases, hints, `TOP`, `ORDER BY`, `GROUP BY` and `DISTINCT` are outside
 the spec, as is PL/pgSQL `SELECT col INTO x` (NULL on no row, probed

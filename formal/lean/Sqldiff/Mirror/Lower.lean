@@ -1486,11 +1486,13 @@ reads would add PostgreSQL's volatility and snapshot rules to the spec).
    (`EXISTS (SELECT 1/0 ...)` is TRUE, no error); the rule takes only `1`
    and `*` there all the same. No row count is needed, so any `WHERE` is
    allowed (a C1 `WHERE` puts the routine outside C2a as for C3a).
-   `existsVar` is a name neither dialect can spell (T-SQL variables
-   start with `@`, a PostgreSQL name with `%` arrives quoted, `pgName`),
-   declared as a local of both lowered routines, set right before its
-   one test and never read elsewhere; the certificate need not name it
-   (`check`). Only the whole condition of an `IF` (or `ELSE IF`); `WHILE
+   `existsVar` is declared as a local of both lowered routines, set
+   right before its one test and never read elsewhere; the certificate
+   need not name it (`check`). A routine can spell it: T-SQL variables
+   start with `@`, but a PL/pgSQL `"%exists"` arrives unquoted, as this
+   very name. A routine that declares it and uses `EXISTS` is refused
+   as a duplicate local (`wellScoped`), and a renaming that maps a
+   source name onto it is refused by the injectivity test (`InjOn`). Only the whole condition of an `IF` (or `ELSE IF`); `WHILE
    EXISTS` and `EXISTS` inside a larger condition are outside the spec.
 
 4. **`SELECT @x = COUNT(*) FROM t [WHERE c]`** (T-SQL), **`SELECT
@@ -1525,8 +1527,9 @@ statements left it (probed, eval/queries Q8: a read after an `UPDATE` in
 the same procedure sees it, both engines); other sessions are not
 modelled (decision 1: serial, one session). -/
 
-/-- The variable an `EXISTS` test is put in: no T-SQL or PL/pgSQL
-variable can have this name. -/
+/-- The variable an `EXISTS` test is put in. A PL/pgSQL `"%exists"` can
+spell it; `wellScoped` and the renaming's injectivity refuse the
+collision (see the C3b rules). -/
 def existsVar : Var := "%exists"
 
 /-- The parts of a plain one-table `SELECT`: its items, its `INTO`
