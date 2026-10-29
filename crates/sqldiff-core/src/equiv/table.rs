@@ -1743,6 +1743,28 @@ fn default_fits(ts: &[Tok], ty: &Ty) -> R<()> {
         {
             Ok(())
         }
+        // PostgreSQL `f()::t` (`statement_timestamp()::timestamp` for
+        // SYSDATETIME()): an argument-free call cast to the column's own
+        // date or time type, so storing converts nothing.
+        [f, o, c, cast, t]
+            if f.kind == K::Word
+                && o.kind == K::LParen
+                && c.kind == K::RParen
+                && cast.kind == K::Op
+                && cast.text == "::"
+                && t.kind == K::Word
+                && matches!(
+                    ty,
+                    Ty::Date | Ty::Time(_) | Ty::Timestamp(_) | Ty::TimestampTz(_)
+                )
+                && pg_type(&ast::Type {
+                    name: t.up.clone(),
+                    args: Vec::new(),
+                })
+                .is_ok_and(|c| c == *ty) =>
+        {
+            Ok(())
+        }
         _ => not("(an expression whose type the table proof does not check)"),
     }
 }

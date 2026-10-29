@@ -1120,7 +1120,7 @@ statement = "The session's time zone is the server's (the current time follows t
 discharge = "deployment"
 fact = "The sessions' time zone."
 fact_key = "time_zone"
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TINYINT"

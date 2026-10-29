@@ -246,6 +246,10 @@ pub mod asm {
         "ASM-OPENJSON-ONE-ROW",
         "The JSON document an UPDATE … FROM reads with OPENJSON is one object, not an array: it gives at most one row, so each target row meets at most one (with several, SQL Server and PostgreSQL each pick one unpredictably)",
     );
+    pub const TIME_SOURCE: (&str, &str) = (
+        "ASM-TIME-SOURCE",
+        "The session's time zone is the server's: PostgreSQL's current time as a local timestamp follows the session, T-SQL's the server clock",
+    );
     /// Decision 1: across dialects, result column names that differ only in
     /// letter case are equal when the client matches names that way.
     pub const RESULT_NAMES_CI: (&str, &str) = (
@@ -1717,6 +1721,21 @@ impl<'a> Canon<'a> {
 
     fn cast(&mut self, dst: Ty, v: (Term, Option<Ty>)) -> (Term, Option<Ty>) {
         let to = Some(dst);
+        // `statement_timestamp()::timestamp`, the conversion of SYSDATETIME(),
+        // in a conversion check: the statement's start time as a local
+        // timestamp (ASM-TIME-SOURCE), its 6 fraction digits standing for
+        // T-SQL's 7 (ASM-FRACTIONAL-SECONDS).
+        if self.d == Dialect::Postgres
+            && super::compare::ci_collation()
+            && v.0.is("time")
+            && v.0.kid(0).and_then(Term::atom) == Some("stmt")
+            && dst.fam == Fam::Timestamp
+            && dst.len == Some(6)
+        {
+            self.assume(asm::TIME_SOURCE);
+            self.assume(super::table::asm::FRACTIONAL_SECONDS);
+            return (v.0, to);
+        }
         if self.is_bool(&v.1) {
             // PostgreSQL casts boolean to integer (0 / 1, the bit value) and
             // to text ('true' / 'false'), and to no other type.
