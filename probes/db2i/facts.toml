@@ -169,6 +169,17 @@ id = "V30"
 title = "Procedure calls and COMMENT ON: open questions for comparing Db2 for i calls"
 review = ["crates/sqldiff-core/src/equiv/call.rs", "docs/cross-dialect-proofs.md"]
 
+[[fact]]
+id = "V34"
+title = "BEFORE INSERT trigger filling a NOT NULL column from NEXT VALUE FOR (the converted sequence default)"
+review = ["crates/sqldiff-convert/src/tsql.rs", "docs/convert-mode.md"]
+
+[[link]]
+facts = ["V34"]
+file = "crates/sqldiff-convert/src/tsql.rs"
+anchor = "\"ASM-FACT-V34\""
+hedge = "not checked on a real system"
+
 [[link]]
 facts = ["V32"]
 file = "crates/sqldiff-convert/src/tsql/paging.rs"

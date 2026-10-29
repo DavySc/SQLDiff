@@ -602,6 +602,27 @@ fact = "The converted statement takes the value once (a variable), or a reading 
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-SEQUENCE-DEFAULT-TRIGGER"
+statement = "Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name."
+discharge = "deployment"
+fact = "The code base's INSERTs into the table leave the column out or give it a value."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-COMPUTED-STORED"
+statement = "PostgreSQL: no INSERT relies on T-SQL skipping a computed column in an INSERT without a column list, and none writes DEFAULT into it; the column became a STORED generated column with the same values."
+discharge = "deployment"
+fact = "The code base's INSERTs into the table name their columns (the engine compares no INSERT without a column list)."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-MEMORY-OPTIMIZED"
+statement = "A memory-optimized table with durable rows (SCHEMA_AND_DATA) became a plain table: no code depends on the errors of SQL Server's optimistic concurrency for memory-optimized tables (write conflicts, required SNAPSHOT isolation) or on statements T-SQL refuses on them."
+discharge = "deployment"
+fact = "The code base's transactions on the table do not rely on those errors (one writer at a time, or conflicts handled the same either way)."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
 id = "ASM-NO-CALLER-TXN"
 statement = "The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block."
 discharge = "deployment"

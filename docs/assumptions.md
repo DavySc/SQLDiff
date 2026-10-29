@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 78 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 81 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 174 |
+| | Total | 177 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -74,6 +74,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-CI-COLLATION` | String comparisons give the same result on both sides: the data's letter case is consistent (or the target compares case-insensitively), and no compared value differs from another only by trailing spaces (T-SQL ignores trailing spaces in =, <> and <; PostgreSQL varchar and text do not). | `catalog` | The collations of both sides (T-SQL's default is case-insensitive). (fact key `collation`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-CLUSTERED` | No query relies on rows coming back in a clustered index's order without ORDER BY. | `deployment` | Callers order results explicitly. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-COLUMN-RANGE` | Stored values stay within what both sides' column types accept. | `generated` | CHECK constraints on the converted columns that reject what the original type rejects. | `sqldiff-core/src/equiv/table.rs` |
+| `ASM-COMPUTED-STORED` | PostgreSQL: no INSERT relies on T-SQL skipping a computed column in an INSERT without a column list, and none writes DEFAULT into it; the column became a STORED generated column with the same values. | `deployment` | The code base's INSERTs into the table name their columns (the engine compares no INSERT without a column list). | `sqldiff-convert/src/tsql.rs` |
 | `ASM-CONCAT-NULL` | T-SQL sessions run with CONCAT_NULL_YIELDS_NULL ON (the default). | `deployment` | No session sets CONCAT_NULL_YIELDS_NULL OFF. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-CONCURRENT-WRITERS` | Other sessions can change the tables the routine reads while it runs. | `deployment` | Whether other sessions write the tables while the routine runs. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-CTE-MAXRECURSION` | A recursive CTE stays within T-SQL's recursion limit (the target has none). | `deployment` | The data never recurses deeper than the limit. | `sqldiff-convert/src/tsql.rs` |
@@ -121,6 +122,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-LISTAGG` | The aggregated list fits LISTAGG's maximum length (STRING_AGG over MAX types has none). | `deployment` | The data never aggregates a longer list. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-LITERAL-FRACTION` | No stored value lies within half a microsecond of a 7-digit time literal without being equal to it. | `deployment` | The data was moved with the same rounding. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-LOCAL-VALUES` | Local variables can hold the witness values at the changed statement (a difference's witness, not an equality). | `nothing` | The engine tracing the variables' earlier assignments. | `sqldiff-core/src/equiv/edit.rs` |
+| `ASM-MEMORY-OPTIMIZED` | A memory-optimized table with durable rows (SCHEMA_AND_DATA) became a plain table: no code depends on the errors of SQL Server's optimistic concurrency for memory-optimized tables (write conflicts, required SNAPSHOT isolation) or on statements T-SQL refuses on them. | `deployment` | The code base's transactions on the table do not rely on those errors (one writer at a time, or conflicts handled the same either way). | `sqldiff-convert/src/tsql.rs` |
 | `ASM-MULTI-ROW` | The statement can affect several rows (a difference's scenario, not an equality). | `nothing` | The engine deciding the row count from keys; a unique key makes the scenario impossible. | `sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-NEXT-VALUE-ONCE` | One statement does not ask for the next value of the same sequence twice. | `generated` | The converted statement takes the value once (a variable), or a reading of the statement. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-NO-CALLER-TXN` | The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block. | `deployment` | How callers call the routine. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/equiv/canon.rs`<br>`sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs` |
@@ -151,6 +153,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-ROW-*` | A row of the dialect's semantic profile holds as tabled (the rest of the id is the row). | `nothing` | The profile row checked against the engine (eval/ probes). | `sqldiff-core/src/ir/interp.rs` |
 | `ASM-SCHEMA-OWNER` | The schema's owner on the target holds the privileges its owner holds on the source. | `deployment` | The roles and grants of the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-SELECT-ASSIGN-CARDINALITY` | A query that assigns variables returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-SEQUENCE-DEFAULT-TRIGGER` | Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name. | `deployment` | The code base's INSERTs into the table leave the column out or give it a value. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-SEQUENCE-TYPE` | Expressions that use a sequence's next value do not depend on its data type beyond the values it hands out. | `deployment` | How callers use the sequence's values. | `sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-SINGLE-ROW` | The query returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SMALLDATETIME` | Values written to a converted SMALLDATETIME are whole minutes (T-SQL rounds, TIMESTAMP(0) keeps seconds). | `generated` | A rounding in the converted writes, or callers that write whole minutes. | `sqldiff-convert/src/tsql.rs` |

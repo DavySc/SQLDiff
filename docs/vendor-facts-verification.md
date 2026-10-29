@@ -49,6 +49,7 @@ Checked against official vendor documentation on 2026-10-23. Target versions are
 | V27 | Db2 i labeled durations as the DATEADD rewrite | Unverified | Month-end clamping and warning 01506, TIME wrap-around, `CAST(… AS INTEGER)` truncation, BIGINT microsecond durations, the 9999 range error: probes `V27-*` in `probes/db2i`. |
 | V29 | Db2 i unique indexes, index names, sequence defaults | Unverified | NULLs, case and trailing blanks in a UNIQUE index; an index named like a table; the default type and first value of a sequence: probes `V29-*` in `probes/db2i`. |
 | V32 | Db2 i ORDER BY and FETCH FIRST below the outer query | Unverified | FETCH FIRST n ROWS ONLY and ORDER BY in a derived table, IN and scalar subquery, CTE (and INSERT … SELECT, view), and a NULL row count: probes `V32-*` in `probes/db2i`. |
+| V34 | Db2 i BEFORE INSERT trigger as a sequence default | Unverified | A NOT NULL column left out of an INSERT, filled by a `WHEN (N.c IS NULL) SET N.c = NEXT VALUE FOR s` trigger before the NOT NULL check, per row, for INSERT … SELECT and MERGE, no value taken when the INSERT gives one; a written NULL and the DEFAULT keyword: probes `V34-*` in `probes/db2i`. |
 
 Items that change implementation decisions: **V2, V7/V16, V10, V13 (UUID case), V20 (Db2 time source)**.
 
@@ -303,6 +304,15 @@ What converted indexes and sequences rely on (`equiv/ddl.rs`, "Indexes, sequence
 - A schema name longer than 10 characters: its library gets a generated system name (not probed, since the probes create nothing outside `SQLDFPROBE`); such schemas are not proven.
 
 Probes `V29-*` in [probes/db2i](../probes/db2i/README.md).
+
+### V34. A BEFORE INSERT trigger as the conversion of a sequence default — Unverified
+
+Db2 for i takes no `NEXT VALUE FOR` in a column default, so the converter writes a T-SQL `DEFAULT (NEXT VALUE FOR s)` on a NOT NULL column as a `NO CASCADE BEFORE INSERT … REFERENCING NEW AS N FOR EACH ROW MODE DB2SQL WHEN (N.c IS NULL) SET N.c = NEXT VALUE FOR s` trigger (`ASM-FACT-V34`). The IBM i CREATE TRIGGER page could not be read (IBM Documentation refused the fetch), so these stay open until a run answers the `V34-*` probes in [probes/db2i](../probes/db2i/README.md):
+
+- An INSERT that leaves the column out (it has no default) reaches the trigger, and the NOT NULL check comes after the trigger sets it.
+- One value per row of a multi-row INSERT and of INSERT … SELECT; the trigger fires for MERGE's INSERT too.
+- An INSERT that gives the column takes no sequence value.
+- Open, no expectation: an INSERT that writes NULL into the column (T-SQL refuses it; the trigger would fill it, as `ASM-SEQUENCE-DEFAULT-TRIGGER` states) and one that writes `DEFAULT`.
 
 ## Follow-up
 
