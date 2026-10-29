@@ -23,6 +23,7 @@ use crate::tok::{
 use crate::{Note, Status};
 
 mod bits;
+mod paging;
 mod temporal;
 mod trigger;
 
@@ -77,6 +78,7 @@ pub(crate) fn convert(
         bit_outer: None,
         bit_aliases: Vec::new(),
         ret_bit: false,
+        view_query: false,
         trigger: None,
     };
     let mut out = Out::default();
@@ -211,6 +213,9 @@ struct Cx<'a> {
     bit_aliases: Vec<String>,
     /// The function being converted returns BIT.
     ret_bit: bool,
+    /// The query of a view is being converted: its ORDER BY does not order
+    /// the view's rows.
+    view_query: bool,
     /// The trigger whose body is being converted, for one of its events.
     trigger: Option<trigger::Trig>,
 }
@@ -522,7 +527,9 @@ impl<'a> Cx<'a> {
         let outer = std::mem::replace(&mut self.scope, scope_of(&qt));
         let aliases = self.bit_aliases_of(&qt);
         let outer_aliases = std::mem::replace(&mut self.bit_aliases, aliases);
+        let was = std::mem::replace(&mut self.view_query, true);
         let q = self.select(&qt);
+        self.view_query = was;
         self.scope = outer;
         self.bit_aliases = outer_aliases;
         let (q, _) = q?;
@@ -1572,9 +1579,6 @@ impl<'a> Cx<'a> {
         let ds = crate::tok::depths(&ts);
         let s = sig(&ts);
         if ts[s[0]].is("WITH") {
-            if ts.iter().any(|t| t.is("TOP")) {
-                return no("TOP inside a CTE query");
-            }
             // A view's query comes here without `stmt`'s FROM-less SELECTs fixed.
             let ts = if self.db2() {
                 dummy_from(&ts, true)
@@ -1593,41 +1597,32 @@ impl<'a> Cx<'a> {
             i = 2;
         }
         if let Some(&top) = s.get(i).filter(|&&j| ts[j].is("TOP")) {
-            let arg = *s.get(i + 1).ok_or(No("TOP without a count".into()))?;
-            let (end, lim) = if ts[arg].k == L_PAREN {
-                let r = matching(&ts, arg).ok_or(No("unbalanced TOP".into()))?;
-                let inner = trimmed(&ts[arg + 1..r]);
-                if self.db2() {
-                    // FETCH FIRST takes a constant or a variable, not an expression.
-                    if inner.len() != 1 || !matches!(inner[0].k, NUMBER | VARIABLE) {
-                        return no("TOP (expression): Db2 for i FETCH FIRST takes a number or a variable; compute the count into a variable first");
-                    }
-                    (r, self.expr(inner).trim().to_string())
-                } else {
-                    (r, format!("({})", self.expr(inner).trim()))
-                }
-            } else {
-                (arg, self.expr(&ts[arg..=arg]))
+            let (end, lim) = match self.top_clause(&ts, top)? {
+                paging::Top::Rows { end, count } => (end, Some(count)),
+                paging::Top::All { end } => (end, None),
             };
-            if next_sig(&ts, end).is_some_and(|j| ts[j].is("PERCENT") || ts[j].is("WITH")) {
-                return no("TOP … PERCENT / WITH TIES");
+            match &lim {
+                Some(l) => self.step_ts_with(paging::TOP, &ts[top..=end], self.limit(l, "")),
+                None => self.step_ts(paging::TOP, &ts[top..=end]),
             }
-            self.step_ts_with("tsql.select.top", &ts[top..=end], self.limit(&lim, ""));
+            // A view keeps the ORDER BY next to TOP 100 PERCENT.
+            if lim.is_none()
+                && self.view_query
+                && self.db2()
+                && find_word(&ts, 0, "ORDER").is_some()
+            {
+                self.note_v32();
+            }
             cut.extend(top..=end);
-            if next_sig(&ts, end).is_some() {
+            if let Some(nx) = next_sig(&ts, end) {
                 // also drop whitespace after the count
-                let nx = next_sig(&ts, end).unwrap();
                 cut.extend(end + 1..nx);
             }
-            limit = Some(lim);
+            if find_word(&ts, 0, "OFFSET").is_some() {
+                return no("TOP and OFFSET in one query: SQL Server rejects it (Msg 10741)");
+            }
+            limit = lim;
             list_from = next_sig(&ts, end);
-        }
-        if ts
-            .iter()
-            .enumerate()
-            .any(|(j, t)| t.is("TOP") && !cut.contains(&j))
-        {
-            return no("TOP inside a subquery: rewrite with LIMIT in the subquery");
         }
         if limit.is_some()
             && (0..ts.len()).any(|j| {
@@ -1974,9 +1969,6 @@ impl<'a> Cx<'a> {
         }
         if find_word(&ts, 0, "EXEC").is_some() || find_word(&ts, 0, "EXECUTE").is_some() {
             return no("INSERT … EXEC");
-        }
-        if find_word(&ts, 0, "TOP").is_some() {
-            return no("TOP in a query inside INSERT/UPDATE/DELETE: no rule yet");
         }
         let mut pre = String::new();
         let mut from = s[1];
@@ -3915,6 +3907,8 @@ impl<'a> Cx<'a> {
     }
 
     fn expr(&mut self, ts: &[T]) -> String {
+        let paged = self.paging(ts);
+        let ts: &[T] = &paged;
         let mut edits = self.bit_edits(ts);
         if let Some(outer) = self.bit_outer.take() {
             edits.wrap(outer);

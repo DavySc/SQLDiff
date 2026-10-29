@@ -3331,7 +3331,7 @@ impl Ctx<'_> {
         let contains = |set: &[Vec<V>], r: &[V]| -> R<bool> {
             let mut unsure = false;
             for x in set {
-                match rows_same(x, r) {
+                match rows_group_same(x, r) {
                     Some(true) => return Ok(true),
                     Some(false) => {}
                     None => unsure = true,
@@ -3532,27 +3532,22 @@ impl Ctx<'_> {
                 kept.push(row);
             }
         }
+        if q.group_by.iter().any(|k| matches!(k, Expr::Num(_))) {
+            // PostgreSQL groups by output position; T-SQL refuses it.
+            return unsupported("GROUP BY a position");
+        }
+        // With DISTINCT, ORDER BY sorts by output columns only.
+        if q.distinct
+            && q.order_by.iter().any(|o| {
+                matches!(order_target(o, &q.items, &[]), OrderTarget::Expr)
+                    && !q.items.iter().any(|i| i.expr == o.expr)
+            })
+        {
+            return unsupported("DISTINCT ordered by an expression it does not return");
+        }
         let grouped = !q.group_by.is_empty()
             || q.having.is_some()
             || q.items.iter().any(|i| has_aggregate(&i.expr));
-        if exists_only && !grouped {
-            return Ok(Rows {
-                names: Vec::new(),
-                rows: kept.into_iter().map(|_| Vec::new()).collect(),
-                ordered: false,
-            });
-        }
-        if q.distinct && exists_only {
-            return Ok(Rows {
-                names: Vec::new(),
-                rows: if kept.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![Vec::new()]
-                },
-                ordered: false,
-            });
-        }
         let names: Vec<String> = q
             .items
             .iter()
@@ -3581,7 +3576,7 @@ impl Ctx<'_> {
                     for (k, rows) in groups.iter_mut() {
                         let mut eq = true;
                         for (x, y) in k.iter().zip(&key) {
-                            match same(x, y) {
+                            match group_same(x, y) {
                                 Some(true) => {}
                                 Some(false) => eq = false,
                                 None => return rej(),
@@ -3599,36 +3594,47 @@ impl Ctx<'_> {
                 }
             }
             for (_, rows) in &groups {
-                // Non-aggregated columns are read from the group's first row.
-                let first = rows.first().cloned().unwrap_or_default();
-                let mut sc = outer.to_vec();
-                sc.push(if rows.is_empty() { Vec::new() } else { first });
                 let g = Group { rows };
                 if let Some(h) = &q.having {
-                    let v = self.expr(h, &sc, Some(&g))?;
+                    let v = self.group_expr(h, outer, &g, &q.group_by)?;
                     if truth(&v)? != Some(true) {
                         continue;
                     }
                 }
-                if exists_only {
-                    out.push((Vec::new(), Vec::new()));
-                    continue;
-                }
                 let mut vals = Vec::new();
-                for i in &q.items {
-                    if matches!(i.expr, Expr::Star(_)) {
-                        return unsupported("* in a grouped query");
+                if !exists_only {
+                    for i in &q.items {
+                        if matches!(i.expr, Expr::Star(_)) {
+                            return unsupported("* in a grouped query");
+                        }
+                        vals.push(self.group_expr(&i.expr, outer, &g, &q.group_by)?);
                     }
-                    vals.push(self.expr(&i.expr, &sc, Some(&g))?);
                 }
+                // Keys are computed under EXISTS too: a key the group does
+                // not determine is not a query the engine would run.
                 let mut keys = Vec::new();
                 for o in &q.order_by {
-                    keys.push(self.order_key(o, &q.items, &vals, &sc, Some(&g))?);
+                    let e = match order_target(o, &q.items, &vals) {
+                        OrderTarget::Val(v) => {
+                            keys.push(v);
+                            continue;
+                        }
+                        OrderTarget::Item(i) => &q.items[i].expr,
+                        OrderTarget::Expr => &o.expr,
+                        OrderTarget::Invalid => return rej(),
+                    };
+                    keys.push(self.group_expr(e, outer, &g, &q.group_by)?);
                 }
                 out.push((vals, keys));
             }
         } else {
             for row in kept {
+                if exists_only {
+                    // Neither the select list nor the order matters, only
+                    // how many rows there are.
+                    out.push((Vec::new(), Vec::new()));
+                    continue;
+                }
                 let mut sc = outer.to_vec();
                 sc.push(row.clone());
                 let mut vals = Vec::new();
@@ -3640,7 +3646,12 @@ impl Ctx<'_> {
                 }
                 let mut keys = Vec::new();
                 for o in &q.order_by {
-                    keys.push(self.order_key(o, &q.items, &vals, &sc, None)?);
+                    keys.push(match order_target(o, &q.items, &vals) {
+                        OrderTarget::Val(v) => v,
+                        OrderTarget::Item(i) => self.expr(&q.items[i].expr, &sc, None)?,
+                        OrderTarget::Expr => self.expr(&o.expr, &sc, None)?,
+                        OrderTarget::Invalid => return rej(),
+                    });
                 }
                 out.push((vals, keys));
             }
@@ -3650,7 +3661,14 @@ impl Ctx<'_> {
             for r in out {
                 let mut dup = false;
                 for x in &d {
-                    if rows_same(&x.0, &r.0).ok_or(Stop::Reject)? {
+                    if rows_group_same(&x.0, &r.0).ok_or(Stop::Reject)? {
+                        // Which duplicate is kept is unspecified: they must
+                        // look and sort the same.
+                        if rows_same(&x.0, &r.0) != Some(true)
+                            || (!exists_only && rows_same(&x.1, &r.1) != Some(true))
+                        {
+                            return rej();
+                        }
                         dup = true;
                     }
                 }
@@ -3660,9 +3678,13 @@ impl Ctx<'_> {
             }
             out = d;
         }
-        // ORDER BY: a stable sort is only meaningful without ties between different rows.
+        // ORDER BY: a stable sort is only meaningful without ties between
+        // different rows. Under EXISTS only the number of rows counts.
         let mut ties = false;
-        if !q.order_by.is_empty() {
+        if !q.order_by.is_empty() && !exists_only {
+            if out.iter().any(|r| r.1.len() != q.order_by.len()) {
+                return unsupported("ORDER BY keys that were not computed");
+            }
             let mut err = false;
             let descs: Vec<(bool, Option<bool>)> =
                 q.order_by.iter().map(|o| (o.desc, o.nulls_first)).collect();
@@ -3764,37 +3786,73 @@ impl Ctx<'_> {
         Ok(Rows {
             names,
             rows,
-            ordered: !q.order_by.is_empty() && !ties,
+            ordered: !q.order_by.is_empty() && !ties && !exists_only,
         })
     }
 
-    fn order_key(
-        &mut self,
-        o: &OrderItem,
-        items: &[super::ast::SelItem],
-        vals: &[V],
-        sc: &[Scope],
-        g: Option<&Group>,
-    ) -> R<V> {
-        // ORDER BY 2: the second output column.
-        if let Expr::Num(n) = &o.expr {
-            if let Ok(i) = n.parse::<usize>() {
-                return vals.get(i.wrapping_sub(1)).cloned().ok_or(Stop::Reject);
-            }
-        }
-        // An output alias.
-        if let Expr::Name(p) = &o.expr {
-            if p.len() == 1 {
-                let n = p[0].to_lowercase();
-                if let Some(i) = items
-                    .iter()
-                    .position(|it| it.alias.as_ref().is_some_and(|a| a.to_lowercase() == n))
-                {
-                    return Ok(vals[i].clone());
+    /// A grouped query's expression for one group. A column of the
+    /// query's own rows outside an aggregate must be a grouping column:
+    /// otherwise SQL Server and PostgreSQL (short of a grouped primary key)
+    /// refuse the query, and there is no result to compare. What the check
+    /// cannot see (subqueries) must at least have one value in the group,
+    /// or the result is unspecified and the assignment is no witness.
+    fn group_expr(&mut self, e: &Expr, outer: &[Scope], g: &Group, group_by: &[Expr]) -> R<V> {
+        let mut names = Vec::new();
+        ungrouped_names(e, group_by, &mut names);
+        if !names.is_empty() {
+            // Only names that bind to the query's own rows are wrong;
+            // without a row there is no telling.
+            let Some(row) = g.rows.first() else {
+                return rej();
+            };
+            for p in &names {
+                let covered = group_by.iter().any(|k| match k {
+                    Expr::Name(q) => same_column(q, p, row.len()),
+                    _ => false,
+                });
+                if !covered && self.binds_in(p, row) {
+                    return unsupported(format!(
+                        "column {} outside GROUP BY and aggregates",
+                        p.join(".")
+                    ));
                 }
             }
         }
-        self.expr(&o.expr, sc, g)
+        let mut sc = outer.to_vec();
+        sc.push(g.rows.first().cloned().unwrap_or_default());
+        let v = self.expr(e, &sc, Some(g))?;
+        for row in g.rows.iter().skip(1) {
+            let last = sc.len() - 1;
+            sc[last] = row.clone();
+            let w = self.expr(e, &sc, Some(g))?;
+            if v != w && same(&v, &w) != Some(true) {
+                return rej();
+            }
+        }
+        Ok(v)
+    }
+
+    /// Whether `resolve` would read name `p` from `scope` (the query's own
+    /// row), as opposed to a variable or an outer query.
+    fn binds_in(&self, p: &[String], scope: &Scope) -> bool {
+        let lower: Vec<String> = p.iter().map(|x| x.to_lowercase()).collect();
+        let col = lower.last().cloned().unwrap_or_default();
+        if lower.len() == 1 && self.d != Dialect::Tsql && self.vars.contains_key(&col) {
+            return false;
+        }
+        if lower.len() == 2 && self.d != Dialect::Tsql && self.records.contains(&lower[0]) {
+            return false;
+        }
+        if lower.len() >= 2 {
+            let q = lower[..lower.len() - 1].join(".");
+            return scope
+                .iter()
+                .any(|b| b.names.iter().any(|n| *n == q || n == last_part(&q)));
+        }
+        scope.len() == 1
+            || scope
+                .iter()
+                .any(|b| self.has_column(b, &col) != Some(false))
     }
 }
 
@@ -3946,6 +4004,139 @@ fn inserts_differ(
     ) {
         Some(false) if !same_cols => None,
         r => r,
+    }
+}
+
+/// What an ORDER BY item sorts by.
+enum OrderTarget {
+    /// An output column already computed.
+    Val(V),
+    /// Output column `i`, not computed (under EXISTS).
+    Item(usize),
+    /// An expression over the input rows.
+    Expr,
+    /// A position past the last output column.
+    Invalid,
+}
+
+fn order_target(o: &OrderItem, items: &[super::ast::SelItem], vals: &[V]) -> OrderTarget {
+    let at = |i: usize| match vals.get(i) {
+        Some(v) => OrderTarget::Val(v.clone()),
+        None => OrderTarget::Item(i),
+    };
+    // ORDER BY 2: the second output column.
+    if let Expr::Num(n) = &o.expr {
+        if let Ok(i) = n.parse::<usize>() {
+            return match i.checked_sub(1).filter(|i| *i < items.len()) {
+                Some(i) => at(i),
+                // Out of range: the query does not compile.
+                None => OrderTarget::Invalid,
+            };
+        }
+    }
+    // An output alias.
+    if let Expr::Name(p) = &o.expr {
+        if p.len() == 1 {
+            let n = p[0].to_lowercase();
+            if let Some(i) = items
+                .iter()
+                .position(|it| it.alias.as_ref().is_some_and(|a| a.to_lowercase() == n))
+            {
+                return at(i);
+            }
+        }
+    }
+    OrderTarget::Expr
+}
+
+/// Whether GROUP BY, DISTINCT and set operations put two values together.
+/// Strings that differ only in case, trailing spaces or accents are one
+/// group under some collations, so that is unknown.
+fn group_same(a: &V, b: &V) -> Option<bool> {
+    match (a, b) {
+        (V::Str(_), V::Str(_)) => eq_vals(a, b),
+        _ => same(a, b),
+    }
+}
+
+fn rows_group_same(a: &[V], b: &[V]) -> Option<bool> {
+    if a.len() != b.len() {
+        return Some(false);
+    }
+    let mut all = true;
+    for (x, y) in a.iter().zip(b) {
+        match group_same(x, y) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => all = false,
+        }
+    }
+    all.then_some(true)
+}
+
+/// Column names in `e` outside aggregates and outside any subexpression
+/// that is itself a GROUP BY expression. Subqueries are not entered.
+fn ungrouped_names(e: &Expr, group_by: &[Expr], out: &mut Vec<Vec<String>>) {
+    if is_aggregate(e) || group_by.iter().any(|k| k == e) {
+        return;
+    }
+    let mut go = |x: &Expr| ungrouped_names(x, group_by, out);
+    match e {
+        Expr::Name(p) => out.push(p.clone()),
+        Expr::Call(c) => c.args.iter().for_each(go),
+        Expr::Bin(_, l, r) => {
+            go(l);
+            go(r);
+        }
+        Expr::Unary(_, x)
+        | Expr::IsNull(x, _)
+        | Expr::Cast(x, _)
+        | Expr::Extract(_, x)
+        | Expr::InQuery(x, _, _) => go(x),
+        Expr::InList(x, l, _) => {
+            go(x);
+            l.iter().for_each(go);
+        }
+        Expr::Between(x, l, h, _) => {
+            go(x);
+            go(l);
+            go(h);
+        }
+        Expr::Like(x, p, _, _) => {
+            go(x);
+            go(p);
+        }
+        Expr::Case(o, w, e2) => {
+            if let Some(o) = o {
+                go(o);
+            }
+            for (a, b) in w {
+                go(a);
+                go(b);
+            }
+            if let Some(e2) = e2 {
+                go(e2);
+            }
+        }
+        Expr::Tuple(l) => l.iter().for_each(go),
+        _ => {}
+    }
+}
+
+/// Whether GROUP BY name `k` and name `p` are certainly the same column of
+/// a query over `tables` tables: same column name and, when the query
+/// reads more than one table, the same qualifier.
+fn same_column(k: &[String], p: &[String], tables: usize) -> bool {
+    let low = |v: &[String]| v.iter().map(|x| x.to_lowercase()).collect::<Vec<_>>();
+    let (k, p) = (low(k), low(p));
+    if k.last() != p.last() {
+        return false;
+    }
+    // `dbo.t.g` and `t.g` name the same table.
+    match (&k[..k.len() - 1], &p[..p.len() - 1]) {
+        ([], []) => true,
+        ([.., x], [.., y]) => x == y,
+        _ => tables == 1,
     }
 }
 
@@ -4810,4 +5001,32 @@ fn rej<T>() -> R<T> {
         );
     }
     Err(Stop::Reject)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grouping_does_not_split_strings_a_collation_may_join() {
+        let s = |x: &str| V::Str(x.into());
+        assert_eq!(group_same(&s("a"), &s("A")), None);
+        assert_eq!(group_same(&s("a"), &s("a ")), None);
+        assert_eq!(group_same(&s("a"), &s("b")), Some(false));
+        assert_eq!(group_same(&s("a"), &s("a")), Some(true));
+        assert_eq!(group_same(&V::Null, &V::Null), Some(true));
+        // Output rows still tell 'a' and 'A' apart.
+        assert_eq!(same(&s("a"), &s("A")), Some(false));
+    }
+
+    #[test]
+    fn group_by_names_match_by_column_and_qualifier() {
+        let n = |x: &str| x.split('.').map(String::from).collect::<Vec<_>>();
+        assert!(same_column(&n("g"), &n("G"), 2));
+        assert!(same_column(&n("dbo.t.g"), &n("t.g"), 2));
+        assert!(same_column(&n("t.g"), &n("g"), 1));
+        assert!(!same_column(&n("t.g"), &n("g"), 2));
+        assert!(!same_column(&n("a.g"), &n("b.g"), 2));
+        assert!(!same_column(&n("g"), &n("n"), 1));
+    }
 }

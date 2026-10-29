@@ -677,9 +677,50 @@ pub struct Run {
     state: Mutex<State>,
     /// The review of what the run wrote, once it is done.
     review: Mutex<Option<Arc<Mutex<Review>>>>,
+    /// A review from an earlier session while it opens again, or why that
+    /// failed. Locked after `review`, never before.
+    opening: Mutex<Option<Opening>>,
     /// The done gate as last read from the review, for when it is busy.
     gate: Mutex<Option<GateView>>,
 }
+
+/// A run's review from an earlier session while its tree is converted
+/// again on its own thread (files checked, of the total), or why opening
+/// it failed, until a request has said so.
+enum Opening {
+    Converting(Arc<(AtomicUsize, AtomicUsize)>),
+    Failed(String),
+}
+
+/// A run's review as a request finds it.
+pub enum ReviewOpen {
+    Ready(Arc<Mutex<Review>>),
+    /// Being opened again: files converted so far, of the total (0 while
+    /// not yet known).
+    Opening {
+        checked: usize,
+        total: usize,
+    },
+}
+
+/// The page shown while a run's review opens again: it reloads itself
+/// every second until the review is there.
+pub fn opening_page(id: u64, checked: usize, total: usize) -> String {
+    let progress = match total {
+        0 => "Reading the source tree".to_string(),
+        t => format!("Converted {checked} of {t} files"),
+    };
+    let percent = match total {
+        0 => 0,
+        t => checked.min(t) * 100 / t,
+    };
+    OPENING_HTML
+        .replace("/*__RUN__*/", &id.to_string())
+        .replace("/*__PERCENT__*/", &percent.to_string())
+        .replace("/*__PROGRESS__*/", &progress)
+}
+
+const OPENING_HTML: &str = include_str!("../assets/opening.html");
 
 /// A converted tree's done gate as the runs list shows it.
 #[derive(Debug, Clone, Serialize)]
@@ -1000,6 +1041,7 @@ impl Runs {
                     cancel: Arc::new(AtomicBool::new(false)),
                     state: Mutex::new(state),
                     review: Mutex::new(None),
+                    opening: Mutex::new(None),
                     gate: Mutex::new(None),
                 })
             })
@@ -1018,16 +1060,29 @@ impl Runs {
 
     /// The review of `run`: the one it opened, or for a finished conversion
     /// from an earlier session, its tree on disk opened again as a run of
-    /// its settings finds it now. `Ok(None)` when the run has no review;
-    /// an error when it cannot be opened as the run wrote it.
+    /// its settings finds it now. That converts the tree again, which takes
+    /// as long as the run did, so it happens on its own thread: until it is
+    /// done this says how far it got. `Ok(None)` when the run has no review;
+    /// an error when it cannot be opened as the run wrote it (said once:
+    /// the next request tries again).
     pub fn open_review(
         &self,
         run: &Arc<Run>,
         isolated: bool,
-    ) -> Result<Option<Arc<Mutex<Review>>>, String> {
-        let mut slot = run.review.lock().unwrap_or_else(|e| e.into_inner());
+    ) -> Result<Option<ReviewOpen>, String> {
+        let slot = run.review.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = slot.as_ref() {
-            return Ok(Some(Arc::clone(r)));
+            return Ok(Some(ReviewOpen::Ready(Arc::clone(r))));
+        }
+        let mut opening = run.opening.lock().unwrap_or_else(|e| e.into_inner());
+        match opening.take() {
+            Some(Opening::Converting(p)) => {
+                let (checked, total) = (p.0.load(Ordering::Relaxed), p.1.load(Ordering::Relaxed));
+                *opening = Some(Opening::Converting(p));
+                return Ok(Some(ReviewOpen::Opening { checked, total }));
+            }
+            Some(Opening::Failed(e)) => return Err(e),
+            None => {}
         }
         let (Spec::Convert(spec), State::Done { .. }, true) = (&run.spec, run.state(), run.past)
         else {
@@ -1057,15 +1112,43 @@ impl Runs {
                 run.command.project_config.as_deref().or(command.project_config.as_deref()).unwrap_or("project and user config files")
             ));
         }
-        let review = Review::open(convert_review::Setup {
+        let setup = convert_review::Setup {
             tree: job.tree,
             out: job.out,
             instances: job.instances,
             packs: loaded,
-        })?;
-        let review = Arc::new(Mutex::new(review));
-        *slot = Some(Arc::clone(&review));
-        Ok(Some(review))
+        };
+        let progress = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let p = Arc::clone(&progress);
+        let hooks = Hooks {
+            progress: Some(Box::new(move |checked, total| {
+                p.1.store(total, Ordering::Relaxed);
+                p.0.store(checked, Ordering::Relaxed);
+            })),
+            cancel: None,
+        };
+        let r = Arc::clone(run);
+        std::thread::Builder::new()
+            .name(format!("sqldiff-review-{}", run.id))
+            .spawn(move || {
+                let opened = Review::open_with(setup, &hooks);
+                // As requests lock them: the review first, then `opening`.
+                let mut slot = r.review.lock().unwrap_or_else(|e| e.into_inner());
+                let mut opening = r.opening.lock().unwrap_or_else(|e| e.into_inner());
+                match opened {
+                    Ok(review) => {
+                        *slot = Some(Arc::new(Mutex::new(review)));
+                        *opening = None;
+                    }
+                    Err(e) => *opening = Some(Opening::Failed(e)),
+                }
+            })
+            .map_err(|e| format!("could not start opening the review: {e}"))?;
+        *opening = Some(Opening::Converting(progress));
+        Ok(Some(ReviewOpen::Opening {
+            checked: 0,
+            total: 0,
+        }))
     }
 
     /// Newest first.
@@ -1348,6 +1431,7 @@ impl Runs {
                 cancel: Arc::new(AtomicBool::new(false)),
                 state: Mutex::new(state.clone()),
                 review: Mutex::new(None),
+                opening: Mutex::new(None),
                 gate: Mutex::new(None),
             });
             l.push(Arc::clone(&run));

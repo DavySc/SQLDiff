@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 77 |
-| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 27 |
-| | Total | 172 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 78 |
+| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
+| | Total | 174 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -106,7 +106,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-DEFAULT-SCHEMA` | Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides. | `deployment` | The default schema in effect on both sides. (fact key `default_schema`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-EXACTLY-ONE-ROW` | The query returns exactly one row: with none, T-SQL keeps the variable and PostgreSQL sets it to NULL. | `deployment` | The data: a row always exists for the predicate (a unique key alone gives at most one). | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-EXTPROP-COMMENT` | Whoever reads the T-SQL extended property reads the target's comment instead (one unnamed comment per object). | `deployment` | The tools that read the property. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
-| `ASM-FACT-*` | A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2). | `nothing` | The vendor fact checked on a real system (docs/vendor-facts-verification.md). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/ir/interp.rs` |
+| `ASM-FACT-*` | A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2). | `nothing` | The vendor fact checked on a real system (docs/vendor-facts-verification.md). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-FRACTIONAL-SECONDS` | Time values need at most 6 fractional digits (T-SQL keeps 7, the target rounds the last). | `deployment` | The data has at most microsecond precision. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-HAND-WRITTEN` | A unit's output written by hand means what the source means, beyond what the check compares. | `nothing` | A reviewer reading the text against the source (a review decision, per unit). | `sqldiff-convert/src/tree.rs` |
 | `ASM-HEX-BINARY` | A 0x... constant is used as a binary value, not converted to a number. | `catalog` | The type of what the constant is compared with or stored into. | `sqldiff-convert/src/tsql.rs` |
@@ -130,6 +130,8 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-OBSERVER-ROWCOUNT` | The caller does not read rows-affected counts. | `deployment` | The callers' drivers ignore rows-affected counts (decision 1, observer profile). | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/observer.rs` |
 | `ASM-ORDER-TOTAL` | The ORDER BY keys are unique, so both sides return the same rows in the same order. | `catalog` | A unique key over the ORDER BY columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OWNER-PRIVILEGES` | The routine owner holds every privilege its statements need on both sides. | `deployment` | The owner's grants on the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-PAGE-COUNT-NOT-NULL` | The row count and offset of TOP, LIMIT, FETCH and OFFSET are never NULL: T-SQL raises an error for NULL, PostgreSQL reads it as no limit (OFFSET NULL as 0). | `deployment` | Callers never pass a NULL row count or offset, and the routine never computes one. | `sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-PAGE-UNORDERED` | A row limit or offset without ORDER BY keeps rows that each engine picks: any such rows will do. | `nothing` | A reading of the statement: its callers accept any rows (an ORDER BY would make it deterministic). | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PARAM-NAMES` | The called procedure was converted with the same parameter names. | `generated` | The callee converted in the same tree. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-PG-NAME-TRUNCATED` | Every reference to a name longer than PostgreSQL's limit truncates to the same name, and no other name does. | `catalog` | The target schema's names. | `sqldiff-convert/src/names.rs` |
 | `ASM-PG-PARAMETER-TYPMOD` | Arguments and assigned OUTPUT values already have the parameter's declared length, precision and scale. | `deployment` | Callers pass values that fit the declared parameter types. | `sqldiff-core/src/equiv/call.rs` |

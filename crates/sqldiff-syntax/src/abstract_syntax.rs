@@ -1248,10 +1248,17 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("TOP") {
             let e = self.primary()?;
-            if self.is_kw("PERCENT") || self.is_kws_with_ties() {
+            // `TOP 100 PERCENT` keeps every row.
+            if matches!(&e, Expr::Num(n) if n.parse::<f64>() == Ok(100.0))
+                && self.is_kw("PERCENT")
+                && !self.is_kw_at(1, "WITH")
+            {
+                self.i += 1;
+            } else if self.is_kw("PERCENT") || self.is_kws_with_ties() {
                 return Err("TOP PERCENT / WITH TIES is not supported".into());
+            } else {
+                s.top = Some(e);
             }
-            s.top = Some(e);
         }
         loop {
             s.items.push(self.sel_item()?);

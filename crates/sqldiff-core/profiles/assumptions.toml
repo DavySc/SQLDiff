@@ -486,7 +486,7 @@ id = "ASM-FACT-*"
 statement = "A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2)."
 discharge = "nothing"
 fact = "The vendor fact checked on a real system (docs/vendor-facts-verification.md)."
-sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/ir/interp.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/paging.rs", "sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
 id = "ASM-FRACTIONAL-SECONDS"
@@ -649,6 +649,20 @@ statement = "The routine owner holds every privilege its statements need on both
 discharge = "deployment"
 fact = "The owner's grants on the target."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-PAGE-COUNT-NOT-NULL"
+statement = "The row count and offset of TOP, LIMIT, FETCH and OFFSET are never NULL: T-SQL raises an error for NULL, PostgreSQL reads it as no limit (OFFSET NULL as 0)."
+discharge = "deployment"
+fact = "Callers never pass a NULL row count or offset, and the routine never computes one."
+sites = ["sqldiff-convert/src/tsql/paging.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-PAGE-UNORDERED"
+statement = "A row limit or offset without ORDER BY keeps rows that each engine picks: any such rows will do."
+discharge = "nothing"
+fact = "A reading of the statement: its callers accept any rows (an ORDER BY would make it deterministic)."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-PARAM-NAMES"
