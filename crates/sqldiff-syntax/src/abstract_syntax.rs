@@ -1564,7 +1564,10 @@ impl<'a> Parser<'a> {
                 alias,
             });
         }
-        self.eat_kw("ONLY");
+        if self.eat_kw("ONLY") {
+            // Leaves inheritance children out; not kept in the tree.
+            self.dropped.push("ONLY");
+        }
         let name = self.qname()?;
         if self.is_kind(K::LParen) {
             if !self.ext {
@@ -1926,7 +1929,10 @@ impl<'a> Parser<'a> {
         if self.is_kw("TOP") {
             return Err("UPDATE TOP is not supported".into());
         }
-        self.eat_kw("ONLY");
+        if self.eat_kw("ONLY") {
+            // Leaves inheritance children out; not kept in the tree.
+            self.dropped.push("ONLY");
+        }
         let target = self.qname()?;
         let hints = self.table_hints()?;
         if !hints.is_empty() {
@@ -1968,7 +1974,10 @@ impl<'a> Parser<'a> {
             return Err("DELETE TOP is not supported".into());
         }
         let has_from = self.eat_kw("FROM");
-        self.eat_kw("ONLY");
+        if self.eat_kw("ONLY") {
+            // Leaves inheritance children out; not kept in the tree.
+            self.dropped.push("ONLY");
+        }
         let target = self.qname()?;
         let alias =
             if self.is_kw("FROM") || self.is_kw("WHERE") || self.is_kw("USING") || self.at_end() {

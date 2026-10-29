@@ -436,9 +436,39 @@ fn is_ddl(n: &SyntaxNode) -> bool {
     })
 }
 
-/// Plain table definitions of a tree, and every word named elsewhere.
-fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec<String>) {
-    let (mut defs, mut named) = (Vec::new(), Vec::new());
+/// Words inside the string literals of a node: a statement that is not DDL
+/// may still carry DDL as text (`DECLARE @s nvarchar(200) = N'ALTER TABLE
+/// ...'`, then `EXEC (@s)`).
+fn string_words(n: &SyntaxNode, out: &mut Vec<String>) {
+    for t in tokens(n).iter().filter(|t| t.kind == K::Str) {
+        out.extend(
+            t.text
+                .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')))
+                .filter(|w| !w.is_empty())
+                .map(str::to_lowercase),
+        );
+    }
+}
+
+/// Dynamic SQL: a string run as a statement, whose text no scan can see
+/// when it is built at run time. T-SQL `EXEC (...)`, `EXEC @s`,
+/// `sp_executesql`; PL/pgSQL `EXECUTE` (in PostgreSQL always dynamic).
+fn dynamic_sql(n: &SyntaxNode, d: Dialect) -> bool {
+    let t = tokens(n);
+    t.iter().enumerate().any(|(i, x)| {
+        let exec = x.up == "EXEC" || x.up == "EXECUTE";
+        (exec && d == Dialect::Postgres)
+            || (exec
+                && t.get(i + 1)
+                    .is_some_and(|y| matches!(y.kind, K::LParen | K::Var | K::Str)))
+            || x.up == "SP_EXECUTESQL"
+    })
+}
+
+/// Plain table definitions of a tree, every word named elsewhere, and
+/// whether the tree runs dynamic SQL anywhere.
+fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec<String>, bool) {
+    let (mut defs, mut named, mut dynamic) = (Vec::new(), Vec::new(), false);
     for text in texts {
         let root = parse(text, d).syntax();
         let mut it = root.preorder();
@@ -454,21 +484,26 @@ fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec
                         .find(|t| !matches!(t.up.as_str(), "CREATE" | "OR" | "ALTER" | "REPLACE"))
                         .map(|t| t.up.clone());
                     if matches!(kind.as_deref(), Some("PROCEDURE" | "PROC" | "FUNCTION")) {
-                        // The body names its tables; only DDL in it counts.
+                        // The body names its tables; only DDL in it counts, and
+                        // any table named in a string (DDL kept as text).
                         for s in n
                             .descendants()
                             .filter(|s| s.kind() == SyntaxKind::STATEMENT)
                         {
                             if is_ddl(&s) {
                                 words(&s, d, &mut named);
+                            } else {
+                                string_words(&s, &mut named);
                             }
                         }
+                        dynamic |= dynamic_sql(&n, d);
                     } else {
                         words(&n, d, &mut named);
                     }
                     it.skip_subtree();
                 }
                 SyntaxKind::STATEMENT => {
+                    dynamic |= dynamic_sql(&n, d);
                     match plain_table::read(&n, d) {
                         Ok(t) => defs.push(t),
                         Err(_) => words(&n, d, &mut named),
@@ -479,7 +514,7 @@ fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec
             }
         }
     }
-    (defs, named)
+    (defs, named, dynamic)
 }
 
 impl Tables {
@@ -489,8 +524,12 @@ impl Tables {
         if (from, to) != (Dialect::Tsql, Dialect::Postgres) {
             return Tables::default();
         }
-        let (src, src_named) = definitions(inputs, from);
-        let (out, out_named) = definitions(outputs, to);
+        let (src, src_named, src_dynamic) = definitions(inputs, from);
+        let (out, out_named, out_dynamic) = definitions(outputs, to);
+        // A statement built at run time may change any table.
+        if src_dynamic || out_dynamic {
+            return Tables::default();
+        }
         let pg = |parts: &[String]| {
             parts
                 .iter()
@@ -1171,5 +1210,14 @@ END
         let read = |src: &str| Tables::read(&[src], &[&out], Dialect::Tsql, Dialect::Postgres);
         assert!(read(ddl).get("acct").is_some());
         assert!(read(&bind).get("acct").is_none());
+        // DDL kept in a variable and run later, and dynamic SQL anywhere.
+        let hidden = format!(
+            "{ddl}GO\nCREATE PROCEDURE dbo.unkey AS\nBEGIN\n  DECLARE @s nvarchar(200) = N'ALTER TABLE dbo.Acct DROP CONSTRAINT PK_Acct';\n  EXEC (@s);\nEND\n"
+        );
+        assert!(read(&hidden).get("acct").is_none());
+        let built = format!(
+            "{ddl}GO\nCREATE PROCEDURE dbo.any @t sysname AS\nBEGIN\n  DECLARE @s nvarchar(200) = N'DROP TABLE ' + @t;\n  EXEC sp_executesql @s;\nEND\n"
+        );
+        assert!(read(&built).get("acct").is_none());
     }
 }

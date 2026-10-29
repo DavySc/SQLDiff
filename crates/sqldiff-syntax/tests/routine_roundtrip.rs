@@ -160,6 +160,13 @@ fn syntax_the_tree_would_drop_is_refused() {
     let plain =
         "CREATE PROCEDURE dbo.p @x int AS\nBEGIN\n  UPDATE dbo.t SET a = @x WHERE a = 1;\nEND\n";
     assert!(routines(plain, Dialect::Tsql).remove(0).is_ok());
+    // PostgreSQL ONLY leaves inheritance children out; the tree would not
+    // show it.
+    let only = "CREATE PROCEDURE p(x integer) LANGUAGE plpgsql AS $$\nBEGIN\n  UPDATE ONLY t SET a = x WHERE a = 1;\nEND;\n$$;\n";
+    let e = routines(only, Dialect::Postgres)
+        .remove(0)
+        .expect_err("ONLY");
+    assert!(e.contains("ONLY"), "{e}");
 }
 
 #[test]
