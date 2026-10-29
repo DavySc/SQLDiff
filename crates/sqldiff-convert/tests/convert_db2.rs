@@ -462,9 +462,8 @@ fn trancount_guarded_rollback_becomes_rollback() {
     let src = "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRY\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH\n    IF @@TRANCOUNT > 0 ROLLBACK TRAN;\n    INSERT INTO log (msg) VALUES (ERROR_MESSAGE());\n  END CATCH\nEND\n";
     let c = db2(src);
     let u = unit(&c, src, "@@TRANCOUNT");
-    // The decision stands; the CATCH block (it logs, so it is no
-    // rollback-and-rethrow protocol) is not compared, so neither is the
-    // statement inside it.
+    // A decision, and not proven: the engine does not compare a CATCH
+    // block, so the statements inside it are not compared either.
     assert_eq!(u.status, Status::Unproven, "{}", c.output);
     assert!(u.notes.iter().any(|n| n.status == Status::Decision));
     assert!(has_rule(u, "db2.proc-transaction"));

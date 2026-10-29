@@ -32,6 +32,12 @@ pub mod asm {
         "ASM-TSQL-CI-COLLATION",
         "T-SQL string comparisons use a case-insensitive collation",
     );
+    /// Davy, 2026-10-29: T-SQL string equality against the other side's
+    /// case-sensitive one is kept, and flagged with this per statement.
+    pub const CI_COLLATION: (&str, &str) = (
+        "ASM-CI-COLLATION",
+        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+    );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
         "UPPER/LOWER fold the same characters as the case-insensitive comparison on the other side",
@@ -532,12 +538,15 @@ impl<'a> Canon<'a> {
     }
 
     /// Whether a value of type `src` is stored in `dst` unchanged.
-    fn fits(dst: &Ty, src: &Ty) -> bool {
+    fn fits(&self, dst: &Ty, src: &Ty) -> bool {
         if dst.fam != src.fam {
+            // PostgreSQL drops the trailing blanks of a CHAR value converted
+            // to varchar or text ('a  ' becomes 'a'); SQL Server keeps them.
             return dst.is_string()
                 && src.is_string()
                 && dst.fam == Fam::VarChar
-                && dst.len.is_none();
+                && dst.len.is_none()
+                && !(self.d == Dialect::Postgres && src.fam == Fam::Char);
         }
         match dst.fam {
             // A bounded binary target cuts a longer value off in T-SQL and
@@ -560,7 +569,11 @@ impl<'a> Canon<'a> {
                 src.len.is_none()
                     || (dst.scale == src.scale && dst.len.zip(src.len).is_some_and(|(d, s)| d >= s))
             }
-            _ => true,
+            // The engine does not know which type an `Other` is (BINARY(n),
+            // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
+            // round or fail.
+            Fam::Other => false,
+            Fam::Date | Fam::Interval | Fam::Bool => true,
         }
     }
 
@@ -637,7 +650,7 @@ impl<'a> Canon<'a> {
             }
         }
         match &v.1 {
-            Some(s) if Self::fits(d, s) => v,
+            Some(s) if self.fits(d, s) => v,
             None if matches!(v.0.head(), "null") => v,
             _ => self.convert(*d, v, if var { How::Var } else { How::Store }),
         }
@@ -889,9 +902,17 @@ impl<'a> Canon<'a> {
                 }
                 items.sort();
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
-                // Like `=`: string membership depends on the collation.
+                // Like `=`: string membership depends on the collation. With
+                // a string operand and string items it is string equality
+                // (`coll-eq`); otherwise a conversion may take part.
                 if string {
-                    kids.push(self.dtag());
+                    let all_strings = ty.is_some_and(|t| t.is_string())
+                        && item_tys.iter().all(|t| t.is_some_and(|t| t.is_string()));
+                    kids.push(if all_strings {
+                        n("coll-eq", vec![self.dtag()])
+                    } else {
+                        self.dtag()
+                    });
                 } else if !known {
                     self.assume(asm::UNTYPED);
                 }
@@ -1367,6 +1388,9 @@ impl<'a> Canon<'a> {
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
             // padded values compare and concatenate, which those terms keep.
+            // PostgreSQL drops a CHAR value's trailing blanks when it becomes
+            // varchar or text; SQL Server keeps them.
+            (Char, VarChar) if self.d == Dialect::Postgres => Rule::Dialect,
             (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
             (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
             // Fewer fractional digits round differently: PostgreSQL rounds a
@@ -1512,7 +1536,7 @@ impl<'a> Canon<'a> {
                     || (b.is("str")
                         && b.kid(0).and_then(Term::atom) == Some("")
                         && first_ty.is_some_and(|t| t.is_string()))
-                    || matches!((first_ty, bty), (Some(x), Some(y)) if Self::fits(&x, &y));
+                    || matches!((first_ty, bty), (Some(x), Some(y)) if self.fits(&x, &y));
                 if fits {
                     portable("coalesce", args, first_ty)
                 } else if let (Some(x), Some(y)) = (first_ty, bty) {
@@ -2567,6 +2591,14 @@ impl<'a> Canon<'a> {
             _ => None,
         };
         s.ok_or_else(|| "assignment target is not a parameter or local variable".to_string())
+    }
+
+    /// The condition of an IF or WHILE, evaluated once each time it is
+    /// tested.
+    pub fn condition(&mut self, e: &Expr) -> R<Term> {
+        self.seen_tables.clear();
+        self.single_row = true;
+        Ok(self.cond(e)?.0)
     }
 
     pub fn stmt(&mut self, s: &Stmt) -> R<Term> {

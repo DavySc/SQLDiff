@@ -166,21 +166,24 @@ fn unequal_counts_are_unknown() {
 }
 
 #[test]
-fn statements_inside_an_uncovered_if_are_each_not_compared() {
+fn dynamic_sql_inside_a_compared_if_is_not_compared() {
     let r = run(
         &tsql("    IF @x = 1\n    BEGIN\n        UPDATE dbo.t SET a = 1 WHERE id = 2;\n        EXECUTE (N'DELETE FROM dbo.t');\n    END;"),
         &pg("    IF p_x = 1 THEN\n        UPDATE t SET a = 9 WHERE id = 2;\n        EXECUTE 'DELETE FROM t';\n    END IF;"),
     );
-    assert_ne!(r.verdict(), Verdict::Equal);
-    for line in [8, 9] {
-        assert!(
-            r.unknown_reasons.iter().any(|x| x.starts_with(&format!(
-                "side A (T-SQL) line {line}: a statement inside an IF statement"
-            ))),
-            "{line}: {:?}",
-            r.unknown_reasons
-        );
-    }
+    // The dynamic SQL inside the IF is not compared, so nothing is equal.
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.starts_with("side A (T-SQL) line 9: dynamic SQL inside an IF or a loop")),
+        "{:?}",
+        r.unknown_reasons
+    );
 }
 
 #[test]
@@ -236,6 +239,27 @@ fn a_call_moved_across_the_dynamic_sql_is_unknown() {
         !dynamic_reasons(&r)
             .iter()
             .any(|x| x.contains("another order")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn dynamic_sql_inside_an_if_is_not_compared() {
+    // Only one side guards the text with the IF.
+    let r = run(
+        &tsql("    IF @x = 1\n        EXECUTE (N'DELETE FROM dbo.t');"),
+        &pg("    EXECUTE 'DELETE FROM t';"),
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("dynamic SQL inside an IF or a loop")),
         "{:?}",
         r.unknown_reasons
     );

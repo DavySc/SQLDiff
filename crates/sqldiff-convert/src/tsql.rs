@@ -68,6 +68,7 @@ pub(crate) fn convert(
         in_cast: false,
         return_code: false,
         txn_control: false,
+        wrapper: None,
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
@@ -80,6 +81,8 @@ pub(crate) fn convert(
         ret_bit: false,
         view_query: false,
         trigger: None,
+        seq_defaults: Vec::new(),
+        table_cols: Vec::new(),
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -189,6 +192,10 @@ struct Cx<'a> {
     /// PostgreSQL: the procedure body COMMITs or ROLLs BACK, which a
     /// SECURITY DEFINER procedure may not.
     txn_control: bool,
+    /// PostgreSQL: where the `BEGIN TRAN` and the `COMMIT` of a transaction
+    /// that wraps all the durable work of the routine or script start
+    /// ([`txn_wrapper`]); both are dropped.
+    wrapper: Option<(usize, usize)>,
     decls: Vec<Decl>,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
@@ -218,6 +225,11 @@ struct Cx<'a> {
     view_query: bool,
     /// The trigger whose body is being converted, for one of its events.
     trigger: Option<trigger::Trig>,
+    /// Db2: columns of the table being created whose T-SQL default is
+    /// `NEXT VALUE FOR seq` (column, sequence), filled by a trigger.
+    seq_defaults: Vec<(String, String)>,
+    /// The columns of the table being created (lower case, unquoted).
+    table_cols: Vec<String>,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -402,6 +414,7 @@ impl<'a> Cx<'a> {
         self.tables.clear();
         self.savepoints.clear();
         self.dynamic.clear();
+        self.wrapper = None;
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
@@ -409,6 +422,9 @@ impl<'a> Cx<'a> {
         self.reset();
         self.dynamic = dynamic_sql_vars(&tokens(b));
         self.drop_known_dynamic(b);
+        if !self.db2() {
+            self.wrapper = txn_wrapper(b);
+        }
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
         if self.db2() {
@@ -690,6 +706,9 @@ impl<'a> Cx<'a> {
         let body = r.children().find(|c| c.kind() == ROUTINE_BODY).ok_or(No(
             "routine without a body: the statement is cut short or malformed".into(),
         ))?;
+        if !self.db2() && !func {
+            self.wrapper = txn_wrapper(&body);
+        }
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
         match block {
@@ -2548,7 +2567,16 @@ impl<'a> Cx<'a> {
                 .vars
                 .get(&a.s[1..].to_ascii_lowercase())
                 .is_some_and(|v| v.dt == Dt::Bit);
-            let rhs = if bit && op.s == "=" {
+            let dt = self
+                .vars
+                .get(&a.s[1..].to_ascii_lowercase())
+                .map_or(Dt::Other, |v| v.dt);
+            let date = (op.s == "=")
+                .then(|| self.date_store(dt, &ts[value..]))
+                .flatten();
+            let rhs = if let Some(d) = date {
+                d
+            } else if bit && op.s == "=" {
                 self.bit_store_text(&ts[value..])
             } else {
                 self.expr(&ts[value..]).trim().to_string()
@@ -2706,7 +2734,7 @@ impl<'a> Cx<'a> {
             return self.table_variable(&ts);
         }
         let mut lines = Vec::new();
-        let mut pending = Vec::new(); // (variable, initialiser tokens, BIT)
+        let mut pending = Vec::new(); // (variable, initialiser tokens, BIT, T-SQL type)
         for item in split_commas(&ts[*s.get(1).ok_or(No("DECLARE without a name".into()))?..]) {
             let it = trimmed(item);
             let Some(v) = it.first().filter(|t| t.k == VARIABLE) else {
@@ -2749,8 +2777,8 @@ impl<'a> Cx<'a> {
             self.step_ts_with("tsql.decl.variable", it, line.clone());
             lines.push(line);
             if let Some(eq) = eq {
-                let bit = Dt::of_tokens(&it[j..eq]) == Dt::Bit;
-                pending.push((name, it[eq + 1..].to_vec(), bit));
+                let dt = Dt::of_tokens(&it[j..eq]);
+                pending.push((name, it[eq + 1..].to_vec(), dt == Dt::Bit, dt));
             }
         }
         // Type notes belong to the hoisted declaration; initialiser notes to
@@ -2766,8 +2794,10 @@ impl<'a> Cx<'a> {
         let db2 = self.db2();
         let inits: Vec<String> = pending
             .iter()
-            .map(|(name, init, bit)| {
-                let v = if *bit {
+            .map(|(name, init, bit, dt)| {
+                let v = if let Some(d) = self.date_store(*dt, init) {
+                    d
+                } else if *bit {
                     self.bit_store_text(init)
                 } else {
                     self.expr(init).trim().to_string()
@@ -3076,11 +3106,26 @@ impl<'a> Cx<'a> {
                 if self.in_catch {
                     return self.misplaced("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
                 }
+                let at = s.first().map(|&j| ts[j].pos.0);
+                if let (Some(at), Some((b, c))) = (at, self.wrapper) {
+                    if at == b || at == c {
+                        // The CALL (or DO) is one transaction already, and
+                        // inside a caller's transaction both sides leave the
+                        // work to the caller: nothing to choose.
+                        self.step_ts("tsql.txn.wrapper", &ts);
+                        return Ok(if at == b {
+                            "-- BEGIN TRANSACTION: the call is one transaction in PostgreSQL"
+                        } else {
+                            "-- COMMIT: the work commits with the call (or with the caller's transaction)"
+                        }
+                        .into());
+                    }
+                }
                 if kw == "BEGIN" {
-                    self.note(Status::Decision, "pg.proc-transaction", "A PostgreSQL procedure already runs inside a transaction; BEGIN TRAN is dropped. Nested-transaction behaviour (@@TRANCOUNT) does not exist.");
+                    self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "BEGIN TRAN is dropped: a PostgreSQL procedure already runs inside a transaction, and the COMMITs that follow end it. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL nests (@@TRANCOUNT) and PostgreSQL refuses the COMMIT.");
                     return Ok("-- BEGIN TRANSACTION: implicit in PostgreSQL".into());
                 }
-                self.note(Status::Decision, "pg.proc-transaction", "COMMIT/ROLLBACK in a procedure only works when it is CALLed outside an explicit transaction block. In T-SQL a COMMIT inside the caller's transaction only decrements @@TRANCOUNT; here it commits the caller's work too.");
+                self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "COMMIT/ROLLBACK stays: right when the procedure is CALLed outside a transaction block (autocommit). Inside a caller's transaction T-SQL's inner COMMIT only decrements @@TRANCOUNT, where PostgreSQL refuses it (invalid transaction termination).");
                 self.txn_control = true;
                 Ok(kw.to_string())
             }
@@ -3412,86 +3457,90 @@ impl<'a> Cx<'a> {
                     .unwrap_or_default();
                 self.with_bit_cols(cols, |cx| cx.create_table(&ts))
             }
-            "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => {
-                if let Some(t) = ts
-                    .iter()
-                    .take_while(|t| !t.is("INDEX"))
-                    .find(|t| t.is("COLUMNSTORE") || t.is("XML") || t.is("SPATIAL"))
-                {
-                    return no(format!(
-                        "{} index: {} has no counterpart; create a plain index (or none) after review",
-                        t.up(),
-                        self.to.display_name()
-                    ));
-                }
-                let ts = self.strip_partition_scheme(&ts);
-                let ts = self.strip_storage(&ts)?;
-                let ts = self.strip_after_filter(&ts)?;
-                if self.db2() {
-                    if let Some(w) = ts.iter().find(|t| t.is("INCLUDE") || t.is("WHERE")) {
-                        return no(format!("index with {}: not checked for Db2 for i; create a plain index (or an encoded vector or derived-key index) after review", w.up()));
-                    }
-                }
-                for t in ts
-                    .iter()
-                    .filter(|t| t.is("CLUSTERED") || t.is("NONCLUSTERED"))
-                {
-                    self.step_ts("tsql.index.clustered", std::slice::from_ref(t));
-                }
-                let kept: Vec<T> = ts
-                    .iter()
-                    .filter(|t| !(t.is("CLUSTERED") || t.is("NONCLUSTERED")))
-                    .cloned()
-                    .collect();
-                if ts.iter().any(|t| t.is("CLUSTERED")) {
-                    let text = self.pick(
-                        "PostgreSQL has no clustered indexes: this becomes a plain index (CLUSTER can reorder the table once). Results are the same; performance may differ.",
-                        "Db2 for i has no clustered indexes: this becomes a plain index. Results are the same; performance may differ.",
-                    ).to_string();
-                    self.note(Status::Assumptions, "ASM-CLUSTERED", &text);
-                }
-                let text = self.pick(
-                    "PostgreSQL index names are schema objects (T-SQL's are per table): no other index, table, view or sequence in the schema may have this name.",
-                    "Db2 for i index names are schema objects (T-SQL's are per table): no other index, table, view or sequence in the schema may have this name.",
-                ).to_string();
-                self.note(Status::Assumptions, "ASM-INDEX-NAME-SCHEMA", &text);
-                if find_word(&kept, 0, "WHERE").is_some() {
-                    self.note(Status::Assumptions, "ASM-TSQL-FILTERED-INDEX-SET-OPTIONS", "SQL Server rejects changes to a table with a filtered index from sessions with ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT or CONCAT_NULL_YIELDS_NULL OFF (or NUMERIC_ROUNDABORT ON); the target does not, so such sessions are assumed not to exist.");
-                }
-                // Db2 for i creates an unqualified index name in the default
-                // schema; T-SQL's index belongs to its table.
-                let kept = if self.db2() {
-                    let q = qualify_index(kept.clone());
-                    if self.source(&q) != self.source(&kept) {
-                        self.step_ts("tsql.index.qualify", &kept);
-                    }
-                    q
-                } else {
-                    kept
-                };
-                // T-SQL's unique index holds one NULL (NULLs are equal keys);
-                // PostgreSQL's holds any number unless NULLS NOT DISTINCT.
-                let kept = if !self.db2() && w1 == "UNIQUE" {
-                    self.note(Status::Converted, "tsql.unique-nulls", "UNIQUE index gets NULLS NOT DISTINCT: in T-SQL a unique index treats NULLs as equal keys, so it holds one row with NULL, as NULLS NOT DISTINCT does.");
-                    nulls_not_distinct(kept)
-                } else {
-                    kept
-                };
-                // A filtered index's WHERE on BIT columns of the ON table.
-                let cols = find_word(&kept, 0, "ON")
-                    .map(|on| {
-                        let end = (on + 1..kept.len())
-                            .find(|&j| kept[j].k == L_PAREN)
-                            .unwrap_or(kept.len());
-                        self.table_bit_cols(&kept[on + 1..end])
-                    })
-                    .unwrap_or_default();
-                self.with_bit_cols(cols, |cx| Ok(collapse_spaces(&cx.expr(&kept))))
-            }
+            "UNIQUE" | "INDEX" | "CLUSTERED" | "NONCLUSTERED" => self.create_index(ts, &w1),
             "SCHEMA" => self.create_schema(&ts),
             "SEQUENCE" => self.create_sequence(&ts, s[2..].to_vec()),
             _ => no(format!("CREATE {w1}: no rule yet")),
         }
+    }
+
+    /// `CREATE [UNIQUE] [CLUSTERED | NONCLUSTERED] INDEX …`; `w1` is the
+    /// word after CREATE.
+    fn create_index(&mut self, ts: Vec<T>, w1: &str) -> R<String> {
+        if let Some(t) = ts
+            .iter()
+            .take_while(|t| !t.is("INDEX"))
+            .find(|t| t.is("COLUMNSTORE") || t.is("XML") || t.is("SPATIAL"))
+        {
+            return no(format!(
+                "{} index: {} has no counterpart; create a plain index (or none) after review",
+                t.up(),
+                self.to.display_name()
+            ));
+        }
+        let ts = self.strip_partition_scheme(&ts);
+        let ts = self.strip_storage(&ts)?;
+        let ts = self.strip_after_filter(&ts)?;
+        if self.db2() {
+            if let Some(w) = ts.iter().find(|t| t.is("INCLUDE") || t.is("WHERE")) {
+                return no(format!("index with {}: not checked for Db2 for i; create a plain index (or an encoded vector or derived-key index) after review", w.up()));
+            }
+        }
+        for t in ts
+            .iter()
+            .filter(|t| t.is("CLUSTERED") || t.is("NONCLUSTERED"))
+        {
+            self.step_ts("tsql.index.clustered", std::slice::from_ref(t));
+        }
+        let kept: Vec<T> = ts
+            .iter()
+            .filter(|t| !(t.is("CLUSTERED") || t.is("NONCLUSTERED")))
+            .cloned()
+            .collect();
+        if ts.iter().any(|t| t.is("CLUSTERED")) {
+            let text = self.pick(
+                    "PostgreSQL has no clustered indexes: this becomes a plain index (CLUSTER can reorder the table once). Results are the same; performance may differ.",
+                    "Db2 for i has no clustered indexes: this becomes a plain index. Results are the same; performance may differ.",
+                ).to_string();
+            self.note(Status::Assumptions, "ASM-CLUSTERED", &text);
+        }
+        let text = self.pick(
+                "PostgreSQL index names are schema objects (T-SQL's are per table): no other index, table, view or sequence in the schema may have this name.",
+                "Db2 for i index names are schema objects (T-SQL's are per table): no other index, table, view or sequence in the schema may have this name.",
+            ).to_string();
+        self.note(Status::Assumptions, "ASM-INDEX-NAME-SCHEMA", &text);
+        if find_word(&kept, 0, "WHERE").is_some() {
+            self.note(Status::Assumptions, "ASM-TSQL-FILTERED-INDEX-SET-OPTIONS", "SQL Server rejects changes to a table with a filtered index from sessions with ANSI_NULLS, QUOTED_IDENTIFIER, ANSI_PADDING, ANSI_WARNINGS, ARITHABORT or CONCAT_NULL_YIELDS_NULL OFF (or NUMERIC_ROUNDABORT ON); the target does not, so such sessions are assumed not to exist.");
+        }
+        // Db2 for i creates an unqualified index name in the default
+        // schema; T-SQL's index belongs to its table.
+        let kept = if self.db2() {
+            let q = qualify_index(kept.clone());
+            if self.source(&q) != self.source(&kept) {
+                self.step_ts("tsql.index.qualify", &kept);
+            }
+            q
+        } else {
+            kept
+        };
+        // T-SQL's unique index holds one NULL (NULLs are equal keys);
+        // PostgreSQL's holds any number unless NULLS NOT DISTINCT.
+        let kept = if !self.db2() && w1 == "UNIQUE" {
+            self.note(Status::Converted, "tsql.unique-nulls", "UNIQUE index gets NULLS NOT DISTINCT: in T-SQL a unique index treats NULLs as equal keys, so it holds one row with NULL, as NULLS NOT DISTINCT does.");
+            nulls_not_distinct(kept)
+        } else {
+            kept
+        };
+        // A filtered index's WHERE on BIT columns of the ON table.
+        let cols = find_word(&kept, 0, "ON")
+            .map(|on| {
+                let end = (on + 1..kept.len())
+                    .find(|&j| kept[j].k == L_PAREN)
+                    .unwrap_or(kept.len());
+                self.table_bit_cols(&kept[on + 1..end])
+            })
+            .unwrap_or_default();
+        self.with_bit_cols(cols, |cx| Ok(collapse_spaces(&cx.expr(&kept))))
     }
 
     /// `CREATE SCHEMA s [AUTHORIZATION owner]`. T-SQL's `dbo` is the
@@ -3640,8 +3689,21 @@ impl<'a> Cx<'a> {
             if ds[i] == 0 && after_paren && ts[i].is("WITH") {
                 if let Some(r) = next_sig(ts, i).and_then(|p| matching(ts, p)) {
                     let open = next_sig(ts, i).unwrap();
-                    for opt in split_commas(&ts[open + 1..r]) {
+                    let opts = split_commas(&ts[open + 1..r]);
+                    let memory = memory_optimized(&opts)?;
+                    for opt in opts {
+                        let o = trimmed(opt);
+                        if memory
+                            && o.first()
+                                .is_some_and(|t| t.is("MEMORY_OPTIMIZED") || t.is("DURABILITY"))
+                        {
+                            continue;
+                        }
                         storage_option(opt)?;
+                    }
+                    if memory {
+                        let text = format!("The memory-optimized table (MEMORY_OPTIMIZED = ON, durable: SCHEMA_AND_DATA) becomes a plain table that keeps its rows the same way. Not the same: SQL Server runs memory-optimized tables with optimistic multi-version concurrency, so a write that conflicts with another transaction fails at once (Msg 41302 and others) and explicit transactions need SNAPSHOT isolation, where {} waits on locks; statements T-SQL does not allow on memory-optimized tables run on {}. Results are the same for code that does not depend on those errors.", self.to.display_name(), self.to.display_name());
+                        self.note(Status::Assumptions, "ASM-MEMORY-OPTIMIZED", &text);
                     }
                     cut[i..=r].iter_mut().for_each(|c| *c = true);
                     self.step_ts("tsql.storage-options", &ts[i..=r]);
@@ -3783,12 +3845,16 @@ impl<'a> Cx<'a> {
             .iter()
             .any(|t| t.is("SYSTEM_TIME") || t.is("SYSTEM_VERSIONING"))
         {
+            if ts.iter().any(|t| t.is("MEMORY_OPTIMIZED")) && !self.db2() {
+                return no("system-versioned table with MEMORY_OPTIMIZED: the versioning rule was checked on disk-based tables only; no rule yet");
+            }
             let (t, ts) = self.temporal(ts)?;
             (Some(t), ts)
         } else {
             (None, ts.to_vec())
         };
         let ts = self.strip_storage(&ts)?;
+        self.seq_defaults.clear();
         let open = ts
             .iter()
             .position(|t| t.k == L_PAREN)
@@ -3808,8 +3874,21 @@ impl<'a> Cx<'a> {
         } else {
             Vec::new()
         };
+        self.table_cols = split_commas(&ts[open + 1..close])
+            .iter()
+            .filter_map(|item| {
+                let &f = sig(item).first()?;
+                (!constraint_item(&item[f]) && !item[f].is("INDEX"))
+                    .then(|| tsql_unquote(&item[f].s).to_ascii_lowercase())
+            })
+            .collect();
         let mut names = Vec::new();
+        let mut indexes = Vec::new();
         for item in split_commas(&ts[open + 1..close]) {
+            if sig(item).first().is_some_and(|&f| item[f].is("INDEX")) && !temp {
+                indexes.push(self.inline_index(item, &name_t)?);
+                continue;
+            }
             let col = self.table_item(item, &pk)?;
             if let Some(&f) = sig(item).first().filter(|&&f| !constraint_item(&item[f])) {
                 names.push((
@@ -3827,12 +3906,14 @@ impl<'a> Cx<'a> {
                 tail.trim_end()
             ));
             let versioning = self.versioning(&t, &name, &name_t, &names)?;
-            return table.map(|t| format!("{t};\n\n{versioning}"));
+            let indexes: String = indexes.iter().map(|i| format!(";\n\n{i}")).collect();
+            return table.map(|t| format!("{t};\n\n{versioning}{indexes}"));
         }
         if temp {
             let how = self.pick("temp", "declare-global-temporary");
             self.step_ts_with("tsql.table.temp", &ts[..open], how);
         }
+        let triggers = self.sequence_default_triggers(&name, temp)?;
         if temp && self.db2() {
             // LOGGED: a rollback undoes the rows, as for a #temp table.
             return Ok(format!(
@@ -3841,12 +3922,115 @@ impl<'a> Cx<'a> {
                 tail.trim_end()
             ));
         }
+        let indexes: String = indexes.iter().map(|i| format!(";\n\n{i}")).collect();
         Ok(format!(
-            "CREATE {}TABLE {name} ({}\n){}",
+            "CREATE {}TABLE {name} ({}\n){}{triggers}{indexes}",
             if temp { "TEMP " } else { "" },
             cols.join(","),
             tail.trim_end()
         ))
+    }
+
+    /// An index declared in CREATE TABLE (`INDEX ix [UNIQUE] [CLUSTERED |
+    /// NONCLUSTERED] (cols) …`), converted as the CREATE INDEX that declares
+    /// the same index after the table.
+    fn inline_index(&mut self, item: &[T], table: &[T]) -> R<String> {
+        let it = trimmed(item);
+        let s = sig(it);
+        let name = *s.get(1).ok_or(No("inline INDEX without a name".into()))?;
+        let mut k = 2;
+        let mut words = Vec::new();
+        while let Some(&j) = s.get(k) {
+            if !it[j].is("UNIQUE")
+                && !it[j].is("CLUSTERED")
+                && !it[j].is("NONCLUSTERED")
+                && !it[j].is("COLUMNSTORE")
+                && !it[j].is("HASH")
+            {
+                break;
+            }
+            if it[j].is("HASH") {
+                return no("inline HASH index: no rule yet (create a plain index after review)");
+            }
+            words.push(it[j].clone());
+            k += 1;
+        }
+        let at = it[s[0]].pos.0;
+        let made = |w: &str| T::made(IDENT, w, at, "tsql.table.inline-index");
+        let space = || T::made(WHITESPACE, " ", at, "tsql.table.inline-index");
+        let mut ts = vec![made("CREATE")];
+        for w in &words {
+            ts.push(space());
+            ts.push(w.clone());
+        }
+        ts.extend([
+            space(),
+            made("INDEX"),
+            space(),
+            it[name].clone(),
+            space(),
+            made("ON"),
+            space(),
+        ]);
+        ts.extend(trimmed(table).iter().cloned());
+        ts.push(space());
+        if let Some(&rest) = s.get(k) {
+            ts.extend(it[rest..].iter().cloned());
+        }
+        let w1 = words
+            .first()
+            .map(|w| w.up())
+            .unwrap_or_else(|| "INDEX".into());
+        let index = self.create_index(ts, &w1)?;
+        self.step_ts("tsql.table.inline-index", it);
+        self.note(Status::Converted, "tsql.table.inline-index", "The index declared in CREATE TABLE is created by a CREATE INDEX after the table: the same index.");
+        Ok(index)
+    }
+
+    /// Db2 for i: one BEFORE INSERT trigger per column whose T-SQL default
+    /// is `NEXT VALUE FOR seq` (`column_def` only takes NOT NULL columns),
+    /// as statements to follow the CREATE TABLE.
+    fn sequence_default_triggers(&mut self, table: &str, temp: bool) -> R<String> {
+        if self.seq_defaults.is_empty() {
+            return Ok(String::new());
+        }
+        if temp {
+            return no("column DEFAULT NEXT VALUE FOR in a temporary table: Db2 for i takes no NEXT VALUE in a default, and a declared temporary table can have no trigger");
+        }
+        let parts = split_name(table);
+        let (schema, bare) = match &parts[..] {
+            [t] => (None, t.as_str()),
+            [s, t] => (Some(s.as_str()), t.as_str()),
+            _ => {
+                return no(format!(
+                    "column DEFAULT NEXT VALUE FOR in table {table}: no rule for a three-part name"
+                ))
+            }
+        };
+        let mut out = String::new();
+        for (col, seq) in std::mem::take(&mut self.seq_defaults) {
+            let raw = format!("{}_{}_NEXT", unquote_db2(bare), unquote_db2(&col));
+            let mut trig: String = raw
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            if !trig.starts_with(|c: char| c.is_ascii_alphabetic()) {
+                trig.insert_str(0, "T_");
+            }
+            if trig.len() > 128 {
+                return no(format!("column DEFAULT NEXT VALUE FOR on {col}: the trigger name {trig} is longer than 128 characters"));
+            }
+            let trig = match schema {
+                Some(s) => format!("{s}.{trig}"),
+                None => trig,
+            };
+            out.push_str(&format!(
+                ";\n\nCREATE TRIGGER {trig}\n    NO CASCADE BEFORE INSERT ON {table}\n    REFERENCING NEW AS N\n    FOR EACH ROW MODE DB2SQL\n    WHEN (N.{col} IS NULL)\n    SET N.{col} = NEXT VALUE FOR {seq}"
+            ));
+            self.note(Status::Assumptions, "ASM-SEQUENCE-DEFAULT-TRIGGER", &format!("Db2 for i takes no NEXT VALUE in a column default, so the trigger {trig} sets {col} to NEXT VALUE FOR {seq} when an INSERT leaves it out: one value per row, and none taken when the INSERT gives one, as T-SQL's default. Not the same: an INSERT that writes NULL into {col} fails in T-SQL and gets the next value here; the default's constraint name is gone, so ALTER TABLE … DROP CONSTRAINT of it becomes DROP TRIGGER {trig}."));
+        }
+        self.note(Status::Assumptions, "ASM-FACT-V34", "A Db2 for i BEFORE INSERT trigger can set a NOT NULL column that the INSERT leaves out (no default) from NEXT VALUE FOR, once per row of a multi-row INSERT, INSERT … SELECT and MERGE … INSERT, before the NOT NULL check (fact V34, not checked on a real system).");
+        Ok(out)
     }
 
     /// One column definition or table constraint, keeping its leading layout.
@@ -3915,10 +4099,10 @@ impl<'a> Cx<'a> {
             return no("column without a type");
         };
         if it[ty_at].is("AS") {
-            return no(self.pick(
-                "computed column: use GENERATED ALWAYS AS (…) STORED after checking the expression",
-                "computed column: Db2 for i has no generated expression columns; use a view or a trigger",
-            ));
+            if self.db2() {
+                return no("computed column: Db2 for i has no generated expression columns; use a view or a trigger");
+            }
+            return self.computed_column(it, ty_at);
         }
         // A qualified type name (`sys.geography`, `dbo.Phone`) is one type.
         let mut name_end = ty_at;
@@ -3933,6 +4117,7 @@ impl<'a> Cx<'a> {
         let (ty, _, _) = self.ty(&it[ty_at..=ty_end])?;
         let mut rest: Vec<T> = Vec::new();
         let mut gen = String::new();
+        let mut seq_default = false;
         let mut j = ty_end + 1;
         while j < it.len() {
             let t = &it[j];
@@ -3987,6 +4172,21 @@ impl<'a> Cx<'a> {
                     inner = trimmed(&inner[1..inner.len() - 1]);
                 }
                 let val = self.expr(inner).trim().to_string();
+                if let Some(seq) = next_value_name(inner) {
+                    // Db2 for i takes no NEXT VALUE in a default: a BEFORE
+                    // INSERT trigger fills the column (`create_table`). The
+                    // default's constraint name goes with it.
+                    let s = sig(&rest);
+                    if s.len() >= 2 && rest[s[s.len() - 2]].is("CONSTRAINT") {
+                        rest.truncate(s[s.len() - 2]);
+                    }
+                    let seq = self.expr(seq).trim().to_string();
+                    self.step_ts("tsql.table.sequence-default-trigger", &it[j..=end]);
+                    self.seq_defaults.push((name.trim().to_string(), seq));
+                    seq_default = true;
+                    j = end + 1;
+                    continue;
+                }
                 let constant = match inner {
                     [x] => matches!(x.k, NUMBER | STRING) || x.is("NULL"),
                     [m, x] => m.k == OP && m.s == "-" && x.k == NUMBER,
@@ -4008,6 +4208,15 @@ impl<'a> Cx<'a> {
             rest.push(t.clone());
             j += 1;
         }
+        // NOT NULL or a PRIMARY KEY of the column itself (not inside CHECK).
+        let not_null = pk_col || {
+            let ds = crate::tok::depths(&rest);
+            let top: Vec<usize> = sig(&rest).into_iter().filter(|&k| ds[k] == 0).collect();
+            top.windows(2).any(|w| {
+                (rest[w[0]].is("NOT") && rest[w[1]].is("NULL"))
+                    || (rest[w[0]].is("PRIMARY") && rest[w[1]].is("KEY"))
+            })
+        };
         let mut rest = collapse_spaces(&self.expr(&rest));
         if self.db2()
             && (pk_col || rest.to_ascii_uppercase().contains("PRIMARY KEY"))
@@ -4016,6 +4225,11 @@ impl<'a> Cx<'a> {
             // T-SQL makes primary key columns NOT NULL; Db2 wants it written.
             self.step_ts("tsql.table.primary-key-not-null", it);
             rest = format!("NOT NULL {}", rest.trim());
+        }
+        if seq_default && !not_null {
+            // A NULL written into the column stays NULL in T-SQL; the trigger
+            // would replace it with the next value.
+            return no(format!("column DEFAULT NEXT VALUE FOR on the nullable column {}: Db2 for i takes no NEXT VALUE in a default, and a trigger cannot tell a NULL written into the column from a column left out", name.trim()));
         }
         if ty == "boolean" {
             let b = bits::bool_default(&rest);
@@ -4028,6 +4242,135 @@ impl<'a> Cx<'a> {
         Ok(format!(
             "{name} {ty}{gen}{}{rest}",
             if rest.is_empty() { "" } else { " " }
+        ))
+    }
+
+    /// PostgreSQL: a computed column `c AS (expr) [PERSISTED] [NOT NULL]`
+    /// becomes `c type GENERATED ALWAYS AS (expr) STORED`. Only for
+    /// expressions whose value and type are exact: a CASE over the row's
+    /// own columns tested with IS [NOT] NULL, AND, OR, NOT, whose every
+    /// result is a bit constant (`CONVERT(bit, 0)`, `CAST(1 AS bit)`).
+    /// Such an expression is deterministic, so computing it when the row is
+    /// written (STORED) gives what T-SQL computes when it is read.
+    fn computed_column(&mut self, it: &[T], as_at: usize) -> R<String> {
+        const REASON: &str =
+            "computed column: use GENERATED ALWAYS AS (…) STORED after checking the expression";
+        let s = sig(it);
+        let name = self.expr(&it[s[0]..=s[0]]);
+        let open = next_sig(it, as_at)
+            .filter(|&p| it[p].k == L_PAREN)
+            .ok_or(No(REASON.into()))?;
+        let close = matching(it, open).ok_or(No("unbalanced computed column".into()))?;
+        // After the expression: PERSISTED, then NULL or NOT NULL, and nothing else.
+        let after: Vec<&T> = sig(&it[close + 1..])
+            .into_iter()
+            .map(|k| &it[close + 1 + k])
+            .collect();
+        let (persisted, not_null) = match after.as_slice() {
+            [] => (false, false),
+            [p] if p.is("PERSISTED") => (true, false),
+            [p, n] if p.is("PERSISTED") && n.is("NULL") => (true, false),
+            [p, n, m] if p.is("PERSISTED") && n.is("NOT") && m.is("NULL") => (true, true),
+            _ => {
+                return no(format!(
+                    "{REASON} (column options after the expression: no rule yet)"
+                ))
+            }
+        };
+        let mut e = trimmed(&it[open + 1..close]);
+        while e.len() > 2 && e[0].k == L_PAREN && matching(e, 0) == Some(e.len() - 1) {
+            e = trimmed(&e[1..e.len() - 1]);
+        }
+        let es = sig(e);
+        if es.len() < 2 || !e[es[0]].is("CASE") || !e[*es.last().unwrap()].is("END") {
+            return no(format!(
+                "{REASON} (only a CASE whose results are bit constants has a rule yet)"
+            ));
+        }
+        // Every word and the type of every result.
+        const WORDS: [&str; 10] = [
+            "CASE", "WHEN", "THEN", "ELSE", "END", "IS", "NOT", "NULL", "AND", "OR",
+        ];
+        let mut k = 0;
+        let mut results = 0;
+        let mut expect_result = false;
+        while k < es.len() {
+            let t = &e[es[k]];
+            if expect_result {
+                // One bit constant, perhaps in parentheses.
+                let mut a = es[k];
+                let mut depth = 0;
+                while e[a].k == L_PAREN {
+                    depth += 1;
+                    a = next_sig(e, a).ok_or(No(REASON.into()))?;
+                }
+                let end = bit_constant(e, a).ok_or_else(|| {
+                    No(format!(
+                        "{REASON} (a result that is not a bit constant: no rule yet)"
+                    ))
+                })?;
+                let mut b = end;
+                for _ in 0..depth {
+                    b = next_sig(e, b)
+                        .filter(|&r| e[r].k == R_PAREN)
+                        .ok_or(No(REASON.into()))?;
+                }
+                k = es.iter().position(|&x| x > b).unwrap_or(es.len());
+                results += 1;
+                expect_result = false;
+                continue;
+            }
+            match t.k {
+                IDENT if WORDS.iter().any(|w| t.is(w)) => {
+                    if k > 0 && t.is("CASE") {
+                        return no(format!("{REASON} (a nested CASE: no rule yet)"));
+                    }
+                    expect_result = t.is("THEN") || t.is("ELSE");
+                }
+                IDENT | QUOTED_IDENT
+                    if !t.s.starts_with('@')
+                        && next_sig(e, es[k])
+                            .map_or(true, |n| e[n].k != L_PAREN && e[n].k != DOT) =>
+                {
+                    // A column of this table (not a niladic function such as
+                    // CURRENT_TIMESTAMP).
+                    if !self
+                        .table_cols
+                        .contains(&tsql_unquote(&t.s).to_ascii_lowercase())
+                    {
+                        return no(format!(
+                            "{REASON} ({} is not a column of the table: no rule yet)",
+                            t.s
+                        ));
+                    }
+                }
+                L_PAREN | R_PAREN => {}
+                _ => return no(format!("{REASON} ({} in the expression: no rule yet)", t.s)),
+            }
+            k += 1;
+        }
+        if results == 0 {
+            return no(REASON);
+        }
+        let bit = [T::made(
+            IDENT,
+            "bit",
+            it[as_at].pos.0,
+            "tsql.table.computed-column",
+        )];
+        let (ty, _, _) = self.ty(&bit)?;
+        let expr = self.expr(&it[open..=close]);
+        self.step_ts("tsql.table.computed-column", &it[as_at..]);
+        self.note(Status::Assumptions, "ASM-COMPUTED-STORED", &format!(
+            "The computed column {0} becomes a STORED generated column: {1} The values are the same, because its expression is deterministic and reads only the row's own columns, and both refuse a value written into it. Not the same: an INSERT without a column list skips {0} in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+            name.trim(),
+            if persisted { "T-SQL stores it too (PERSISTED)." } else { "T-SQL computes it when the row is read, PostgreSQL when the row is written." }
+        ));
+        Ok(format!(
+            "{} {ty} GENERATED ALWAYS AS {} STORED{}",
+            name.trim(),
+            expr.trim(),
+            if not_null { " NOT NULL" } else { "" }
         ))
     }
 
@@ -4609,9 +4952,49 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// A date or date-and-time literal assigned to a variable of T-SQL type
+    /// `dt`, for Db2 for i: the ISO text of the value T-SQL stores. Db2 for i
+    /// reads neither T-SQL's compact `yyyymmdd` nor `yyyymmdd hh:mm:ss` as a
+    /// date or timestamp (fact V33: a date string is ISO, USA, EUR, JIS, the
+    /// job's format or `yyyyddd`; a timestamp string without separators has
+    /// 14 to 26 digits), so `'20200101'` would fail there at run time. None
+    /// when `ts` is not one such literal or T-SQL would round it.
+    fn date_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
+        use sqldiff_core::equiv::literal::{iso_tsql, Target};
+        if !self.db2() {
+            return None;
+        }
+        let target = match dt {
+            Dt::Date => Target::Date,
+            Dt::DateTime2(p) if p <= 7 => Target::Timestamp { digits: p },
+            Dt::DateTime => Target::Datetime,
+            Dt::SmallDateTime => Target::Smalldatetime,
+            _ => return None,
+        };
+        let [i] = sig(ts)[..] else {
+            return None;
+        };
+        let t = &ts[i];
+        if t.k != STRING {
+            return None;
+        }
+        let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+        let body = lit.strip_prefix('\'').and_then(|x| x.strip_suffix('\''))?;
+        if body.contains('\'') {
+            return None;
+        }
+        let (text, asm) = iso_tsql(body, target)?;
+        if let Some((id, why)) = asm {
+            self.note(Status::Assumptions, id, why);
+        }
+        self.note(Status::Assumptions, "ASM-FACT-V33", "A date or timestamp literal is written in the ISO form ('yyyy-mm-dd', 'yyyy-mm-dd hh:mm:ss.n'), which Db2 for i reads as that value when it is assigned, as it does in a CAST (fact V33, not checked on a real system). T-SQL's compact 'yyyymmdd' is not a Db2 for i date or timestamp string.");
+        self.step_ts("tsql.expr.datetime-literal", &ts[i..=i]);
+        Some(format!("'{text}'"))
+    }
+
     fn ci_note(&mut self) {
         let text = self.pick(
-            "String comparison: T-SQL's default collation is case-insensitive, and T-SQL ignores trailing spaces when it compares; PostgreSQL compares case-sensitively and counts trailing spaces in varchar and text. Equal only if the data's case is consistent (or use a case-insensitive collation) and no compared value differs from another only by trailing spaces.",
+            "String comparison: T-SQL's default collation is case-insensitive, and T-SQL ignores trailing spaces when it compares; PostgreSQL compares case-sensitively and counts trailing spaces in varchar and text. Equal only if no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (the default equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters).",
             "String comparison: T-SQL's default collation is case-insensitive; Db2 for i compares by the sort sequence, case-sensitively with the default *HEX. Both ignore trailing blanks (fact V8). Equal only if the data's case is consistent (or the routine uses SRTSEQ(*LANGIDSHR)).",
         ).to_string();
         self.note(Status::Assumptions, "ASM-CI-COLLATION", &text);
@@ -5126,7 +5509,11 @@ impl<'a> Cx<'a> {
             "UNIQUEIDENTIFIER" => ("uuid".into(), false, false),
             "XML" => ("xml".into(), false, false),
             "ROWVERSION" | "TIMESTAMP" => return no("ROWVERSION/TIMESTAMP: PostgreSQL has no automatic row version column; use xmin or a trigger-maintained column"),
-            "SQL_VARIANT" | "HIERARCHYID" | "GEOGRAPHY" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
+            "GEOGRAPHY" => {
+                self.note(Status::Assumptions, "ASM-POSTGIS-GEOGRAPHY", "GEOGRAPHY becomes PostGIS geography (no type modifier, so each value keeps its own SRID, as in SQL Server): the database has the postgis extension and its types are on the search path. A value is carried as it is; SQL Server's geography methods (STDistance, Lat, …) and PostGIS's functions differ, so every spatial expression is converted and checked on its own, and clients read PostGIS's formats.");
+                ("geography".into(), false, false)
+            }
+            "SQL_VARIANT" | "HIERARCHYID" | "GEOMETRY" | "CURSOR" | "TABLE" => return no(format!("type {up} has no PostgreSQL equivalent rule yet")),
             _ => {
                 self.note(Status::Assumptions, "ASM-USER-TYPE", "A type without a rule was kept as written: it must exist in PostgreSQL under that name.");
                 let t: String = ts.iter().map(|t| t.s.clone()).collect();
@@ -5416,6 +5803,127 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The `BEGIN TRAN` and `COMMIT` (where each starts) of a body whose durable
+/// work all runs inside that one transaction, so that a PostgreSQL CALL or
+/// DO, which is one transaction already, behaves the same without them:
+/// autocommit commits the work with the call, and inside a caller's
+/// transaction both sides leave it to the caller (T-SQL's inner COMMIT only
+/// decrements @@TRANCOUNT). Checked on SQL Server 2022 and PostgreSQL 18.
+///
+/// The body's own list (BEGIN … END blocks flattened) holds exactly one
+/// `BEGIN TRAN` and, after it, one `COMMIT`; before them only declarations,
+/// SET, PRINT and SELECT without INTO, after them at most `RETURN n`.
+/// Nowhere else in the body: transaction control, @@TRANCOUNT, XACT_STATE,
+/// TRY/CATCH, THROW, RAISERROR, EXEC, GOTO, another RETURN or a table
+/// variable. A failing statement must end the transaction alike:
+/// `SET XACT_ABORT ON` before the BEGIN, or only one statement inside that
+/// writes (a statement fails as a whole).
+fn txn_wrapper(body: &SyntaxNode) -> Option<(usize, usize)> {
+    fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+        for c in n.children() {
+            if c.kind() == BLOCK || c.kind().is_container() {
+                flat(&c, out);
+            } else if c.kind().is_unit() {
+                out.push(c);
+            }
+        }
+    }
+    let at = |n: &SyntaxNode| tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
+    let words = |n: &SyntaxNode| -> Vec<String> {
+        tokens(n)
+            .iter()
+            .filter(|t| t.sig())
+            .take(2)
+            .map(|t| t.up())
+            .collect()
+    };
+    let is_begin = |n: &SyntaxNode| {
+        let w = words(n);
+        n.kind() == STATEMENT
+            && w.len() == 2
+            && w[0] == "BEGIN"
+            && matches!(w[1].as_str(), "TRAN" | "TRANSACTION")
+    };
+    let neutral = |n: &SyntaxNode| {
+        n.kind() == STATEMENT
+            && match first_word(n).as_str() {
+                "DECLARE" | "SET" | "PRINT" => true,
+                "SELECT" => !tokens(n).iter().any(|t| t.is("INTO")),
+                _ => false,
+            }
+    };
+    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
+    let banned = all.iter().any(|t| {
+        [
+            "ROLLBACK",
+            "SAVE",
+            "THROW",
+            "RAISERROR",
+            "EXEC",
+            "EXECUTE",
+            "GOTO",
+            "XACT_STATE",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+    }) || all
+        .windows(2)
+        .any(|w| w[0].k == VARIABLE && w[1].is("TABLE"))
+        || body.descendants().any(|d| d.kind() == TRY_CATCH);
+    if banned || all.iter().filter(|t| t.is("COMMIT")).count() != 1 {
+        return None;
+    }
+    let mut top = Vec::new();
+    flat(body, &mut top);
+    let begins: Vec<usize> = (0..top.len()).filter(|&i| is_begin(&top[i])).collect();
+    let begun = all
+        .windows(2)
+        .filter(|w| w[0].is("BEGIN") && (w[1].is("TRAN") || w[1].is("TRANSACTION")))
+        .count();
+    let [b] = begins[..] else { return None };
+    let c =
+        (0..top.len()).find(|&i| first_word(&top[i]) == "COMMIT" && top[i].kind() == STATEMENT)?;
+    if begun != 1 || c < b {
+        return None;
+    }
+    // After the COMMIT, a statement that fails would leave T-SQL's work
+    // committed and roll PostgreSQL's back: only a last `RETURN` or
+    // `RETURN <number>`.
+    let ret_last = |i: usize| {
+        let w: Vec<T> = tokens(&top[i])
+            .into_iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .collect();
+        i + 1 == top.len()
+            && w.first().is_some_and(|t| t.is("RETURN"))
+            && (w.len() == 1 || w.len() == 2 && w[1].s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !(0..b).all(|i| neutral(&top[i])) || !(c + 1..top.len()).all(ret_last) {
+        return None;
+    }
+    let xact_abort = top[..b].iter().any(|n| {
+        let w: Vec<String> = tokens(n)
+            .iter()
+            .filter(|t| t.sig())
+            .map(|t| t.up())
+            .collect();
+        w == ["SET", "XACT_ABORT", "ON"] || w == ["SET", "XACT_ABORT", "ON", ";"]
+    }) && !all
+        .windows(2)
+        .any(|w| w[0].is("XACT_ABORT") && w[1].is("OFF"));
+    let writes: Vec<&SyntaxNode> = top[b + 1..c].iter().filter(|n| !neutral(n)).collect();
+    if !xact_abort && (writes.len() > 1 || writes.iter().any(|n| n.kind() != STATEMENT)) {
+        return None;
+    }
+    // A RETURN before the COMMIT leaves T-SQL's transaction open.
+    let returns = all.iter().filter(|t| t.is("RETURN")).count();
+    if returns > usize::from(ret_last(top.len().wrapping_sub(1))) {
+        return None;
+    }
+    Some((at(&top[b])?, at(&top[c])?))
 }
 
 /// The first keyword of a unit, upper case.
@@ -6227,6 +6735,97 @@ fn nulls_not_distinct(ts: Vec<T>) -> Vec<T> {
     }
     out.extend(ts[at..].iter().cloned());
     out
+}
+
+/// `CONVERT(bit, 0)`, `CONVERT([bit], (1))` or `CAST(0 AS bit)` starting at
+/// `ts[at]`: the index of its closing parenthesis.
+fn bit_constant(ts: &[T], at: usize) -> Option<usize> {
+    let f = &ts[at];
+    if !(f.is("CONVERT") || f.is("CAST")) {
+        return None;
+    }
+    let open = next_sig(ts, at).filter(|&p| ts[p].k == L_PAREN)?;
+    let close = matching(ts, open)?;
+    let inner = &ts[open + 1..close];
+    let (ty, arg) = if f.is("CONVERT") {
+        match split_commas(inner)[..] {
+            [ty, arg] => (ty, arg),
+            _ => return None,
+        }
+    } else {
+        let a = sig(inner).into_iter().find(|&k| inner[k].is("AS"))?;
+        (&inner[a + 1..], &inner[..a])
+    };
+    let ty: Vec<&T> = sig(ty).into_iter().map(|k| &ty[k]).collect();
+    if !matches!(ty[..], [t] if tsql_unquote(&t.s).eq_ignore_ascii_case("bit")) {
+        return None;
+    }
+    let num: Vec<&T> = sig(arg)
+        .into_iter()
+        .map(|k| &arg[k])
+        .filter(|t| t.k != L_PAREN && t.k != R_PAREN)
+        .collect();
+    matches!(num[..], [n] if n.k == NUMBER && (n.s == "0" || n.s == "1")).then_some(close)
+}
+
+/// A converted name split at the dots outside double quotes.
+fn split_name(name: &str) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut quoted = false;
+    for c in name.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                parts.last_mut().unwrap().push(c);
+            }
+            '.' if !quoted => parts.push(String::new()),
+            _ => parts.last_mut().unwrap().push(c),
+        }
+    }
+    parts.into_iter().map(|p| p.trim().to_string()).collect()
+}
+
+/// A Db2 name part without its double quotes.
+fn unquote_db2(part: &str) -> String {
+    part.strip_prefix('"')
+        .and_then(|p| p.strip_suffix('"'))
+        .map(|p| p.replace("\"\"", "\""))
+        .unwrap_or_else(|| part.to_string())
+}
+
+/// `NEXT VALUE FOR name` (and nothing else): the name's tokens.
+fn next_value_name(ts: &[T]) -> Option<&[T]> {
+    let s = sig(ts);
+    let [n, v, f, first, ..] = s[..] else {
+        return None;
+    };
+    if !(ts[n].is("NEXT") && ts[v].is("VALUE") && ts[f].is("FOR")) {
+        return None;
+    }
+    let name = &ts[first..=*s.last()?];
+    name_parts(name).map(|_| name)
+}
+
+/// `WITH (MEMORY_OPTIMIZED = ON [, DURABILITY = …])`: whether the table is
+/// memory-optimized with durable rows. `DURABILITY = SCHEMA_ONLY` keeps no
+/// rows across a restart, which is behaviour: refused.
+fn memory_optimized(opts: &[&[T]]) -> R<bool> {
+    let value = |name: &str| {
+        opts.iter().find_map(|o| {
+            let o = trimmed(o);
+            o.first()
+                .filter(|t| t.is(name))
+                .and_then(|_| o.iter().rev().find(|t| t.sig()))
+                .map(|t| t.up())
+        })
+    };
+    if value("MEMORY_OPTIMIZED").as_deref() != Some("ON") {
+        return Ok(false);
+    }
+    match value("DURABILITY").as_deref() {
+        None | Some("SCHEMA_AND_DATA") => Ok(true),
+        Some(d) => no(format!("table option DURABILITY = {d}: SQL Server keeps none of the table's rows across a restart; a plain table keeps them. No rule yet")),
+    }
 }
 
 fn storage_option(opt: &[T]) -> R<()> {

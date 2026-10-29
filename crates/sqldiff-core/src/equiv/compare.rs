@@ -2,6 +2,8 @@
 //! difference with a concrete witness, or unexplained (unknown).
 
 use super::canon::asm;
+use sqldiff_syntax::Dialect;
+
 use super::term::Term;
 use crate::model::{Assumption, ChangeClass};
 
@@ -22,12 +24,80 @@ pub struct Cmp {
     /// Steps that hold one way only: B refines A here, A does not refine B
     /// (decision 1). With no mismatch the pair is equal but not equivalent.
     pub refinements: Vec<String>,
+    /// T-SQL against another dialect in a conversion check: string equality
+    /// that differs only in the collation is equal under `ASM-CI-COLLATION`.
+    ci_collation: bool,
+}
+
+thread_local! {
+    static CI_COLLATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the diff running on this thread checks a conversion that keeps
+/// the target's text types (Davy, 2026-10-29; diffs report the difference
+/// instead): then
+/// T-SQL's case-insensitive string equality against the other side's
+/// case-sensitive one is equal under `ASM-CI-COLLATION`, statement by
+/// statement, instead of a difference.
+pub fn ci_collation() -> bool {
+    CI_COLLATION.with(|c| c.get())
+}
+
+/// Sets [`ci_collation`] for this thread until the guard is dropped (a
+/// conversion check sets it around the diffs it runs).
+pub fn ci_collation_scope(on: bool) -> CiCollationScope {
+    CiCollationScope(CI_COLLATION.with(|c| c.replace(on)))
+}
+
+pub struct CiCollationScope(bool);
+
+impl Drop for CiCollationScope {
+    fn drop(&mut self) {
+        CI_COLLATION.with(|c| c.set(self.0));
+    }
 }
 
 pub fn compare(a: &Term, b: &Term) -> Cmp {
     let mut c = Cmp::default();
     walk(a, b, None, None, 0, &mut c);
     c
+}
+
+/// [`compare`] for statements of dialects `da` and `db`.
+pub fn compare_across(a: &Term, b: &Term, da: Dialect, db: Dialect) -> Cmp {
+    let mut c = Cmp {
+        ci_collation: ci_collation() && da != db && (da == Dialect::Tsql || db == Dialect::Tsql),
+        ..Cmp::default()
+    };
+    walk(a, b, None, None, 0, &mut c);
+    c
+}
+
+/// Kid positions of `a` and `b` (same head, same arity) that hold only the
+/// collation of an equality: case sensitivity and trailing-space handling
+/// of `=` / `<>` (`strcmp`), or the dialect whose collation decides
+/// `IN` membership (`coll-eq`), GROUP BY keys (`collate`) and DISTINCT.
+/// None when the pair differs elsewhere in those positions.
+fn collation_kids(a: &Term, b: &Term) -> Option<&'static [usize]> {
+    let dialect = |t: &Term| matches!(t.atom(), Some("tsql" | "postgres" | "db2i"));
+    match a.head() {
+        "strcmp" if a.kid(0) == b.kid(0) => {
+            let ci = |t: &Term| matches!(t.atom(), Some("ci" | "cs"));
+            let pad = |t: &Term| matches!(t.atom(), Some("pad" | "nopad" | "pad-mixed"));
+            let ok = [(1, ci as fn(&Term) -> bool), (2, pad)]
+                .iter()
+                .all(|&(i, f)| a.kid(i).zip(b.kid(i)).is_some_and(|(x, y)| f(x) && f(y)));
+            ok.then_some(&[1, 2])
+        }
+        "coll-eq" | "collate" | "distinct"
+            if a.kid(0)
+                .zip(b.kid(0))
+                .is_some_and(|(x, y)| dialect(x) && dialect(y)) =>
+        {
+            Some(&[0])
+        }
+        _ => None,
+    }
 }
 
 fn assume(c: &mut Cmp, x: Assumption) {
@@ -78,6 +148,21 @@ fn walk(a: &Term, b: &Term, pa: Option<&Term>, pb: Option<&Term>, index: usize, 
     if let Some(x) = hook(a, b).or_else(|| hook(b, a)) {
         assume(c, x);
         return;
+    }
+    // String equality whose only difference is the collation.
+    if c.ci_collation && a.head() == b.head() && a.kids().len() == b.kids().len() {
+        if let Some(coll) = collation_kids(a, b) {
+            for (i, (x, y)) in a.kids().iter().zip(b.kids()).enumerate() {
+                if coll.contains(&i) {
+                    if x != y {
+                        assume(c, asm::make(asm::CI_COLLATION));
+                    }
+                } else {
+                    walk(x, y, Some(a), Some(b), i, c);
+                }
+            }
+            return;
+        }
     }
     match (a, b) {
         (Term::N(ha, ka), Term::N(hb, kb)) if ha == hb && ka.len() == kb.len() => {
