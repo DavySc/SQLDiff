@@ -216,6 +216,10 @@ struct Binding {
     table: String,
     /// Derived single-row sources: column → value.
     derived: Option<Vec<(String, Term, Option<Ty>)>>,
+    /// A derived table's unique key: the GROUP BY columns its query
+    /// returns (`ast::group_key`), folded. Kept with the binding, as a
+    /// subquery elsewhere in the statement may reuse the alias.
+    unique: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -487,6 +491,7 @@ impl<'a> Canon<'a> {
                 .unwrap_or_else(|| lc(parts.last().map(String::as_str).unwrap_or(""))),
             table: canon,
             derived: None,
+            unique: None,
         }
     }
 
@@ -2668,6 +2673,8 @@ impl<'a> Canon<'a> {
                         self.sub_bits.insert(format!("sub:{key}"), bits);
                     }
                 }
+                let unique = sqldiff_syntax::abstract_syntax::group_key(query)
+                    .map(|k| k.iter().map(|c| lc(c)).collect());
                 let item_terms: Vec<Term> = items.into_iter().map(|x| x.0).collect();
                 parts.insert(1, n("items", item_terms));
                 let q = (n("q", parts), None::<Ty>);
@@ -2675,6 +2682,7 @@ impl<'a> Canon<'a> {
                     key: key.clone(),
                     table: format!("sub:{key}"),
                     derived: None,
+                    unique,
                 });
                 Ok(n("sub", vec![q.0]))
             }
@@ -3443,6 +3451,7 @@ impl<'a> Canon<'a> {
             key: table.to_string(),
             table: table.to_string(),
             derived: None,
+            unique: None,
         }]);
         let items: R<Vec<Term>> = returning
             .iter()
@@ -3524,6 +3533,7 @@ impl<'a> Canon<'a> {
             key: table.to_string(),
             table: table.to_string(),
             derived: None,
+            unique: None,
         }]);
         let upd: R<Vec<Term>> = sets
             .iter()
@@ -3634,6 +3644,7 @@ impl<'a> Canon<'a> {
                 .unwrap_or_else(|| table.clone()),
             table: table.clone(),
             derived: None,
+            unique: None,
         };
         self.scopes.push(vec![
             tb,
@@ -3641,6 +3652,7 @@ impl<'a> Canon<'a> {
                 key: src_key,
                 table: "merge:source".into(),
                 derived: Some(src),
+                unique: None,
             },
         ]);
         let r = self.merge_inner(&table, hints, on, whens);
@@ -3854,6 +3866,18 @@ impl<'a> Canon<'a> {
             let table = b.table.clone();
             self.scopes.last_mut().unwrap().push(b);
             let from_t = self.push_from(&others)?;
+            // The derived tables of FROM, in order, with their keys as bound
+            // (WHERE's subqueries may reuse an alias).
+            let subs: Vec<(String, Option<Vec<String>>)> = self
+                .scopes
+                .last()
+                .map(|s| {
+                    s.iter()
+                        .filter(|b| b.table.starts_with("sub:"))
+                        .map(|b| (b.table.clone(), b.unique.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let w = match conds
                 .into_iter()
                 .reduce(|l, r| Expr::Bin("AND".into(), Box::new(l), Box::new(r)))
@@ -3861,7 +3885,7 @@ impl<'a> Canon<'a> {
                 Some(w) => self.cond(&w)?.0,
                 None => a("-"),
             };
-            self.unique_match(&table, &from_t, &w)?;
+            self.unique_match(&table, &from_t, &subs, &w)?;
             let kv = self.update_sets(&table, sets)?;
             Ok(n(
                 "update-from",
@@ -3879,7 +3903,13 @@ impl<'a> Canon<'a> {
     /// LEFT JOIN, else in WHERE or any inner join's ON condition. String keys
     /// count only under the dialect's own comparison, which its unique keys
     /// follow.
-    fn unique_match(&mut self, target: &str, from: &[Term], w: &Term) -> R<()> {
+    fn unique_match(
+        &mut self,
+        target: &str,
+        from: &[Term],
+        subs: &[(String, Option<Vec<String>>)],
+        w: &Term,
+    ) -> R<()> {
         fn conj(t: &Term) -> Vec<Term> {
             if t.is("and") {
                 t.kids().to_vec()
@@ -3889,14 +3919,28 @@ impl<'a> Canon<'a> {
                 vec![t.clone()]
             }
         }
-        // (table, own ON condition of a LEFT JOIN)
-        fn leaves(t: &Term, out: &mut Vec<(String, Option<Term>)>, all: &mut Vec<Term>) -> bool {
+        // (table, own ON condition of a LEFT JOIN). A derived table is
+        // named by the next of `subs`, its bindings in FROM order.
+        type Subs<'s> = std::slice::Iter<'s, (String, Option<Vec<String>>)>;
+        fn name(t: &Term, subs: &mut Subs) -> Option<String> {
             match t.head() {
-                "t" => {
-                    out.push((
-                        t.kid(0).and_then(Term::atom).unwrap_or("").to_string(),
-                        None,
-                    ));
+                "t" => Some(t.kid(0).and_then(Term::atom).unwrap_or("").to_string()),
+                "sub" => subs.next().map(|s| s.0.clone()),
+                _ => None,
+            }
+        }
+        fn leaves(
+            t: &Term,
+            out: &mut Vec<(String, Option<Term>)>,
+            all: &mut Vec<Term>,
+            subs: &mut Subs,
+        ) -> bool {
+            match t.head() {
+                "t" | "sub" => {
+                    let Some(name) = name(t, subs) else {
+                        return false;
+                    };
+                    out.push((name, None));
                     true
                 }
                 "join" => {
@@ -3905,10 +3949,12 @@ impl<'a> Canon<'a> {
                     else {
                         return false;
                     };
-                    if !leaves(l, out, all) || !r.is("t") {
+                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub")) {
                         return false;
                     }
-                    let name = r.kid(0).and_then(Term::atom).unwrap_or("").to_string();
+                    let Some(name) = name(r, subs) else {
+                        return false;
+                    };
                     match kind {
                         "inner" | "cross" => {
                             all.extend(conj(on));
@@ -3927,8 +3973,9 @@ impl<'a> Canon<'a> {
         };
         let mut ls = Vec::new();
         let mut all = conj(w);
+        let mut sub_iter = subs.iter();
         for f in from {
-            if !leaves(f, &mut ls, &mut all) {
+            if !leaves(f, &mut ls, &mut all, &mut sub_iter) {
                 return fail();
             }
         }
@@ -3977,14 +4024,25 @@ impl<'a> Canon<'a> {
                         }
                     }
                 }
-                let key = self.schema.table(Self::base_table(t)).and_then(|tab| {
-                    tab.keys
+                let (key, how) = if t.starts_with("sub:") {
+                    let k = subs
                         .iter()
-                        .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
-                        .cloned()
-                });
+                        .find(|s| s.0 == *t)
+                        .and_then(|s| s.1.as_ref())
+                        .filter(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                        .cloned();
+                    (k, "GROUP BY")
+                } else {
+                    let k = self.schema.table(Self::base_table(t)).and_then(|tab| {
+                        tab.keys
+                            .iter()
+                            .find(|k| !k.is_empty() && k.iter().all(|c| cols.contains(c)))
+                            .cloned()
+                    });
+                    (k, "catalog")
+                };
                 if let Some(key) = key {
-                    self.discharge(format!("{t}.{} is a unique key (catalog)", key.join(", ")));
+                    self.discharge(format!("{t}.{} is a unique key ({how})", key.join(", ")));
                     bound.push(t.clone());
                     progress = true;
                 }
