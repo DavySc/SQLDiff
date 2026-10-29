@@ -3801,7 +3801,11 @@ impl<'a> Cx<'a> {
         while i < ts.len() {
             let after_paren = prev_sig(ts, i).is_some_and(|p| ts[p].k == R_PAREN);
             if ds[i] == 0 && after_paren && (ts[i].is("ON") || ts[i].is("TEXTIMAGE_ON")) {
-                let nx = next_sig(ts, i).unwrap_or(i);
+                let mut nx = next_sig(ts, i).unwrap_or(i);
+                // `ON scheme (column)`: a partition scheme with its column.
+                if let Some(open) = next_sig(ts, nx).filter(|&p| ts[p].k == L_PAREN) {
+                    nx = matching(ts, open).ok_or(No("unbalanced parentheses".into()))?;
+                }
                 cut[i..=nx].iter_mut().for_each(|c| *c = true);
                 self.step_ts("tsql.storage-options", &ts[i..=nx]);
                 dropped = true;
@@ -4190,16 +4194,10 @@ impl<'a> Cx<'a> {
     /// without what only shapes the key's index: CLUSTERED / NONCLUSTERED
     /// and a sort order in the key's column list.
     fn constraint_def(&mut self, it: &[T]) -> R<String> {
-        // Index options (IGNORE_DUP_KEY changes what the key accepts) and
-        // filegroups have no rule.
+        // The key's index: storage options (not IGNORE_DUP_KEY = ON, which
+        // changes what the key accepts), a filegroup or a partition scheme.
+        let it = &self.strip_constraint_storage(it)?;
         let ds = crate::tok::depths(it);
-        for j in 0..it.len() {
-            let on_action = it[j].is("ON")
-                && next_sig(it, j).is_some_and(|k| it[k].is("DELETE") || it[k].is("UPDATE"));
-            if ds[j] == 0 && (it[j].is("WITH") || (it[j].is("ON") && !on_action)) {
-                return no("index options or a filegroup on a table constraint: no rule yet");
-            }
-        }
         // PRIMARY KEY (a ASC): the targets take no sort order in a key's
         // column list. The order only shapes the key's index.
         let key = it.iter().any(|t| t.is("PRIMARY") || t.is("UNIQUE"));
@@ -4227,6 +4225,58 @@ impl<'a> Cx<'a> {
             .map(|j| it[j].clone())
             .collect();
         Ok(collapse_spaces(&self.expr(&kept)))
+    }
+
+    /// A table constraint's `WITH (…)` storage options and `ON filegroup` /
+    /// `ON scheme (column)`, removed (`ON DELETE` / `ON UPDATE` stay).
+    fn strip_constraint_storage(&mut self, it: &[T]) -> R<Vec<T>> {
+        let ds = crate::tok::depths(it);
+        let mut cut = vec![false; it.len()];
+        let mut dropped = false;
+        let mut i = 0;
+        while i < it.len() {
+            if ds[i] != 0 {
+                i += 1;
+                continue;
+            }
+            if it[i].is("WITH") {
+                let open = next_sig(it, i).filter(|&p| it[p].k == L_PAREN).ok_or(No(
+                    "constraint WITH option without parentheses: no rule yet".into(),
+                ))?;
+                let r = matching(it, open).ok_or(No("unbalanced parentheses".into()))?;
+                for opt in split_commas(&it[open + 1..r]) {
+                    storage_option(opt)?;
+                }
+                cut[i..=r].iter_mut().for_each(|c| *c = true);
+                self.step_ts("tsql.storage-options", &it[i..=r]);
+                dropped = true;
+                i = r + 1;
+                continue;
+            }
+            let action = next_sig(it, i).is_some_and(|k| it[k].is("DELETE") || it[k].is("UPDATE"));
+            if it[i].is("ON") && !action {
+                let name = next_sig(it, i).ok_or(No("ON without a filegroup".into()))?;
+                let end = match next_sig(it, name).filter(|&p| it[p].k == L_PAREN) {
+                    Some(open) => matching(it, open).ok_or(No("unbalanced parentheses".into()))?,
+                    None => name,
+                };
+                cut[i..=end].iter_mut().for_each(|c| *c = true);
+                self.step_ts("tsql.storage-options", &it[i..=end]);
+                dropped = true;
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        if dropped {
+            self.note(Status::Converted, "tsql.storage-options", "Filegroup, partition scheme and storage options of a key (ON [PRIMARY], ON scheme (column), WITH (…)) were dropped; they place rows and shape the key's index, they do not change results.");
+        }
+        Ok(it
+            .iter()
+            .zip(cut)
+            .filter(|(_, c)| !c)
+            .map(|(t, _)| t.clone())
+            .collect())
     }
 
     /// `pk_col`: (Db2) the column is in a table-level PRIMARY KEY.

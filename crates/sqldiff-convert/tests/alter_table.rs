@@ -174,3 +174,25 @@ fn drop_trigger_is_refused_and_truncate_restarts_identity() {
         "{out}"
     );
 }
+
+#[test]
+fn partition_schemes_and_filegroups_are_dropped_from_tables_and_keys() {
+    // Before, `ON PS_Date ("Date Key")` stayed on the key and `("Date Key")`
+    // after the table, which PostgreSQL rejects.
+    let src = "CREATE TABLE m (k bigint NOT NULL, d date NOT NULL,\n    CONSTRAINT PK_m PRIMARY KEY NONCLUSTERED (k ASC, d ASC) ON [PS_Date] ([d]))\nON [PS_Date] ([d]);\nGO\nALTER TABLE m ADD CONSTRAINT UQ_m UNIQUE (d, k) WITH (FILLFACTOR = 90) ON [PRIMARY];\nGO\n";
+    let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+    let out = &c.output;
+    assert!(
+        !out.contains("PS_Date") && !out.contains("PRIMARY]"),
+        "{out}"
+    );
+    assert!(
+        out.contains("CONSTRAINT PK_m PRIMARY KEY (k, d)\n);"),
+        "{out}"
+    );
+    assert!(out.contains("ADD CONSTRAINT UQ_m UNIQUE (d, k);"), "{out}");
+    assert!(
+        c.units.iter().all(|u| u.status != Status::NotConverted),
+        "{out}"
+    );
+}
