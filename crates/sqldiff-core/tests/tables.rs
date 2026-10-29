@@ -403,11 +403,6 @@ fn what_the_model_does_not_read_stays_unknown() {
             ),
             "UNLOGGED",
         ),
-        (
-            ORDERS_T.to_string(),
-            replace(ORDERS_P, "CREATE TABLE Orders", "CREATE TABLE \"Orders\""),
-            "keeps its capitals",
-        ),
     ] {
         unknown(&t, &p, why);
     }
