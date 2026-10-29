@@ -1166,7 +1166,7 @@ impl<'a> Cx<'a> {
     /// nothing runs any more; the engine compares the statement inside the
     /// string with the one inside the `EXECUTE`.
     fn dynamic_exec(&mut self, n: &SyntaxNode) -> R<String> {
-        let (text, notes) = self.dynamic_inner(n).map_err(No)?;
+        let (text, notes, using) = self.dynamic_inner(n).map_err(No)?;
         for x in notes {
             if x.status > Status::Converted {
                 self.note(
@@ -1176,13 +1176,25 @@ impl<'a> Cx<'a> {
                 );
             }
         }
-        self.step_node("tsql.stmt.dynamic-known-text", n);
-        Ok(format!("EXECUTE '{}'", text.replace('\'', "''")))
+        if using.is_empty() {
+            self.step_node("tsql.stmt.dynamic-known-text", n);
+            Ok(format!("EXECUTE '{}'", text.replace('\'', "''")))
+        } else {
+            self.step_node("tsql.stmt.dynamic-parameters", n);
+            Ok(format!(
+                "EXECUTE '{}' USING {}",
+                text.replace('\'', "''"),
+                using.join(", ")
+            ))
+        }
     }
 
     /// The converted statement a dynamic SQL statement runs, with the notes
     /// of its conversion, or why it cannot be converted.
-    fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>), String> {
+    /// With `sp_executesql` parameters, also the values for `USING`, in
+    /// parameter order, which the text reads as `$1`, `$2`, ….
+    #[allow(clippy::type_complexity)]
+    fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>, Vec<String>), String> {
         use sqldiff_core::equiv::dynamic::{self, Text};
         if self.db2() {
             return Err(
@@ -1207,12 +1219,80 @@ impl<'a> Cx<'a> {
         if text.trim().is_empty() {
             return Err("dynamic SQL with empty text: T-SQL runs nothing; remove the statement after review".into());
         }
-        if let Some(why) = dynamic::tsql_inner_refusal(&text) {
+        let passed = dynamic::exec_params(n)
+            .map_err(|why| format!("dynamic SQL with parameters, not converted: {why}"))?;
+        let names: Vec<String> = passed
+            .iter()
+            .flat_map(|p| p.params.iter().map(|q| q.name.clone()))
+            .collect();
+        if let Some(why) = dynamic::tsql_inner_refusal_with(&text, &names) {
             return Err(format!("dynamic SQL with known text, not converted: {why}"));
         }
-        let root = sqldiff_syntax::parse(&text, Dialect::Tsql).syntax();
-        let inner = convert(&root, &text, self.to, self.catalog);
-        let [u] = inner.units.as_slice() else {
+        // `$n` is put back where the converted parameter name stands: the
+        // text may not use that name for anything else.
+        let words =
+            sqldiff_core::equiv::ast::tokens(&sqldiff_syntax::parse(&text, Dialect::Tsql).syntax());
+        if let Some(q) = names.iter().find(|q| {
+            words.iter().any(|w| {
+                w.text
+                    .trim_matches(['[', ']', '"'])
+                    .eq_ignore_ascii_case(&format!("p_{}", snake(q)))
+            })
+        }) {
+            return Err(format!("dynamic SQL with parameters, not converted: the text uses the name p_{}, which the parameter @{q} becomes", snake(q)));
+        }
+        // The values passed: a variable of exactly the parameter's type, so
+        // that T-SQL does not convert it (PostgreSQL types `$n` by the value).
+        let mut using = Vec::new();
+        for (q, a) in passed.iter().flat_map(|p| p.params.iter().zip(&p.args)) {
+            let [v] = a.as_slice() else {
+                return Err(format!("dynamic SQL with parameters, not converted: the value of @{} is not a variable", q.name));
+            };
+            let var = v
+                .text
+                .get(1..)
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            let same = v.kind == sqldiff_core::equiv::ast::K::Var
+                && dynamic::declared_type(n, &var).is_some_and(|t| dynamic::same_type(&t, &q.ty));
+            let conv = self.vars.get(&var).map(|x| x.name.clone());
+            match (same, conv) {
+                (true, Some(c)) => using.push(c),
+                _ => return Err(format!("dynamic SQL with parameters, not converted: the value of @{} is not a variable of the parameter's own type, so T-SQL converts it as it passes it and PostgreSQL does not", q.name)),
+            }
+        }
+        // With parameters the text is converted as the body of a procedure
+        // that takes them, and they are then read as `$n`.
+        let (wrapped, start) = match &passed {
+            None => (text.clone(), 0),
+            Some(p) => {
+                let decl = p
+                    .params
+                    .iter()
+                    .map(|q| {
+                        format!(
+                            "@{} {}",
+                            q.name,
+                            q.ty.iter()
+                                .map(|t| t.text.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let head = format!("CREATE PROCEDURE dbo.sqldiff_dynamic {decl}\nAS\nBEGIN\n");
+                (format!("{head}{text}\nEND;\n"), head.len())
+            }
+        };
+        let root = sqldiff_syntax::parse(&wrapped, Dialect::Tsql).syntax();
+        let inner = convert(&root, &wrapped, self.to, self.catalog);
+        let units: Vec<_> = inner
+            .units
+            .iter()
+            .filter(|u| u.src.0 >= start && u.src.1 <= start + text.len())
+            .collect();
+        let [u] = units.as_slice() else {
             return Err("dynamic SQL with known text, not converted: its statement did not convert to one statement".into());
         };
         if let Some(bad) = u.notes.iter().find(|x| x.status > Status::Decision) {
@@ -1226,7 +1306,26 @@ impl<'a> Cx<'a> {
         if out.lines().any(|l| l.trim_start().starts_with("--")) || out.contains('$') {
             return Err("dynamic SQL with known text, not converted: the converted statement holds comments or `$`".into());
         }
-        Ok((out.trim_end_matches(';').to_string(), u.notes.clone()))
+        let mut out = out.trim_end_matches(';').to_string();
+        if let Some(p) = &passed {
+            // `p_name` → `$n`, by token: names inside strings stay.
+            let root = sqldiff_syntax::parse(&out, Dialect::Postgres).syntax();
+            let mut bound = String::new();
+            for e in root.descendants_with_tokens() {
+                let Some(t) = e.as_token() else { continue };
+                let k = p.params.iter().position(|q| {
+                    t.kind() == sqldiff_syntax::SyntaxKind::IDENT
+                        && t.text()
+                            .eq_ignore_ascii_case(&format!("p_{}", snake(&q.name)))
+                });
+                match k {
+                    Some(k) => bound.push_str(&format!("${}", k + 1)),
+                    None => bound.push_str(t.text()),
+                }
+            }
+            out = bound;
+        }
+        Ok((out, u.notes.clone(), using))
     }
 
     /// Takes off `self.dynamic` the variables that only known-text dynamic

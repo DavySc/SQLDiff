@@ -1411,3 +1411,67 @@ fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
 fn show(t: &Ty) -> String {
     format!("{t:?}").to_lowercase()
 }
+
+/// The values T-SQL `sp_executesql` passes to the parameters of its text
+/// (`params`, with their declared types) against the values of PL/pgSQL
+/// `EXECUTE … USING`. Only a variable of the calling routine on each side,
+/// the same variable, of exactly the parameter's type, is compared: T-SQL
+/// converts a value to the parameter type as it passes it (2.7 to an int
+/// parameter gives 2) while PostgreSQL types `$n` by the value itself, so
+/// any conversion would differ. Returns the assumptions and the type each
+/// `$n` takes on PostgreSQL.
+pub fn dynamic_args(
+    params: &[(String, Type)],
+    targs: &[Vec<Tok>],
+    pargs: &[Vec<Tok>],
+    t: &Side,
+    p: &Side,
+) -> R<(Vec<Assumption>, Vec<Type>)> {
+    let mut asms = Vec::new();
+    let mut types = Vec::new();
+    for (i, ((pname, pty), (vt, vp))) in params.iter().zip(targs.iter().zip(pargs)).enumerate() {
+        let what = format!("the value of @{pname} (USING ${})", i + 1);
+        let (Val::Var(a), Val::Var(b)) = (value(vt, t.d)?, value(vp, p.d)?) else {
+            return Err(format!(
+                "{what}: only a variable passed on both sides is compared"
+            ));
+        };
+        let (x, y) = (var_term(&a, t)?, var_term(&b, p)?);
+        let c = super::compare::compare(&x, &y);
+        if !c.mismatches.is_empty() {
+            return Err(format!(
+                "{what}: the variables {a} and {b} were not shown the same"
+            ));
+        }
+        asms.extend(c.assumptions);
+        let decl_t = var_type(t.unit, &a)
+            .ok_or_else(|| format!("{}: the type of {a} is not known", t.name))?;
+        let decl_p = var_type(p.unit, &b)
+            .ok_or_else(|| format!("{}: the type of {b} is not known", p.name))?;
+        let (vty_t, vty_p, ty_t) = (
+            read_ty(&decl_t, t.d)?,
+            read_ty(&decl_p, p.d)?,
+            read_ty(pty, Dialect::Tsql)?,
+        );
+        if !fits_tsql(&vty_t, &ty_t) || !fits_tsql(&ty_t, &vty_t) {
+            return Err(format!(
+                "{what}: the variable's type ({}) is not the parameter's ({}), so T-SQL converts it",
+                show(&vty_t),
+                show(&ty_t)
+            ));
+        }
+        let c = table::types(&vty_t, &vty_p);
+        if c.diff.is_some() {
+            return Err(format!(
+                "{what}: the variables' types differ ({} on {}, {} on {})",
+                show(&vty_t),
+                t.name,
+                show(&vty_p),
+                p.name
+            ));
+        }
+        asms.extend(c.asms.into_iter().map(asm::make));
+        types.push(decl_p);
+    }
+    Ok((asms, types))
+}
