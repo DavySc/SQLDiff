@@ -527,7 +527,9 @@ impl<'a> Canon<'a> {
                 && dst.len.is_none();
         }
         match dst.fam {
-            Fam::Int | Fam::VarChar => match (dst.len, src.len) {
+            // A bounded binary target cuts a longer value off in T-SQL and
+            // keeps or rejects it elsewhere.
+            Fam::Int | Fam::VarChar | Fam::Binary => match (dst.len, src.len) {
                 (None, _) => true,
                 (Some(d), Some(s)) => d >= s,
                 (Some(_), None) => false,
@@ -1847,7 +1849,10 @@ impl<'a> Canon<'a> {
     /// typed value's declared length, None when unbounded.
     fn binary_len(t: &Term, ty: Option<Ty>) -> Option<u32> {
         if t.is("bytes") {
-            return t.kid(0).and_then(Term::atom).map(|h| (h.len() / 2) as u32);
+            return t
+                .kid(0)
+                .and_then(Term::atom)
+                .map(|h| h.len().div_ceil(2) as u32);
         }
         ty.and_then(|t| t.len)
     }

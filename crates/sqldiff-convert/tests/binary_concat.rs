@@ -83,3 +83,27 @@ fn db2_writes_concatenation_too() {
     assert!(o.contains("SET v_b = v_b || BX'05' || v_c;"), "{o}");
     assert!(o.contains("SET v_b = 1 + v_b + BX'01';"), "{o}");
 }
+
+#[test]
+fn overflowing_a_bounded_output_parameter_is_not_proven() {
+    // SQL Server 2022: with @x = 0x0A0B, `EXEC dbo.p1 @x OUTPUT` returns
+    // 0x0A0B (the appended byte is cut off); PostgreSQL returns \x0a0b01.
+    let src = "CREATE PROCEDURE dbo.p1 @c varbinary(2) OUTPUT AS BEGIN SET @c = @c + 0x01; END\n";
+    let c = conv(src, Dialect::Postgres);
+    assert!(
+        c.output.contains("p_c := p_c || '\\x01'::bytea;"),
+        "{}",
+        c.output
+    );
+    let u = unit(&c, src, "SET @c = @c + 0x01");
+    assert!(u.status > Status::Assumptions, "{:?}", u.notes);
+}
+
+#[test]
+fn a_longer_binary_into_a_bounded_parameter_is_not_proven() {
+    // SQL Server returns 0x0102 for @d = 0x010203; PostgreSQL all three bytes.
+    let src = "CREATE PROCEDURE dbo.p2 @c varbinary(2) OUTPUT, @d varbinary(3) AS BEGIN SET @c = @d; END\n";
+    let c = conv(src, Dialect::Postgres);
+    let u = unit(&c, src, "SET @c = @d");
+    assert!(u.status > Status::Assumptions, "{:?}", u.notes);
+}
