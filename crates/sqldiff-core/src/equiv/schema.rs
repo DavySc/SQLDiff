@@ -82,7 +82,7 @@ impl Ty {
     }
 
     pub fn from_type(t: &Type, d: Dialect, in_cast: bool) -> Ty {
-        let n = |i: usize| t.args.get(i).and_then(|a| a.parse::<u32>().ok());
+        let n = |i: usize| t.args.get(i).and_then(|a| length(a));
         let max = t.args.first().is_some_and(|a| a == "MAX");
         let fam_len = |fam: Fam, default: Option<u32>| Ty {
             fam,
@@ -572,5 +572,34 @@ mod tests {
                 assert!(c.ty.is_string(), "{ddl}: {} is {:?}", c.name, c.ty);
             }
         }
+    }
+}
+
+/// A type length argument: a number, or a Db2 for i LOB length with its
+/// multiplier (`64K`, `1M`, `1G`: 1024, 1024², 1024³).
+fn length(a: &str) -> Option<u32> {
+    let (num, mul) = match a.as_bytes().last()? {
+        b'K' => (&a[..a.len() - 1], 1u32 << 10),
+        b'M' => (&a[..a.len() - 1], 1 << 20),
+        b'G' => (&a[..a.len() - 1], 1 << 30),
+        _ => (a, 1),
+    };
+    num.parse::<u32>().ok()?.checked_mul(mul)
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::length;
+
+    #[test]
+    fn lob_lengths_take_their_multiplier() {
+        assert_eq!(length("10"), Some(10));
+        assert_eq!(length("64K"), Some(65_536));
+        assert_eq!(length("1M"), Some(1_048_576));
+        assert_eq!(length("1G"), Some(1_073_741_824));
+        assert_eq!(length("2G"), Some(2_147_483_648));
+        assert_eq!(length("MAX"), None);
+        assert_eq!(length("G"), None);
+        assert_eq!(length("8G"), None);
     }
 }

@@ -1685,6 +1685,7 @@ mod tests {
             declared,
             proof,
             observer,
+            anchors,
         } = Options::default();
         let base = Options {
             excerpt_lines,
@@ -1697,6 +1698,7 @@ mod tests {
             declared,
             proof,
             observer,
+            anchors,
         };
         let artifact = || Artifact::new("schema.sql", Dialect::Tsql, "CREATE TABLE t (id int);");
         let changes: Vec<Change<Options>> = vec![
@@ -1736,6 +1738,15 @@ mod tests {
             (
                 "observer",
                 Box::new(|o| o.observer.row_counts = sqldiff_core::observer::RowCounts::Never),
+            ),
+            (
+                "anchors",
+                Box::new(|o| {
+                    o.anchors.push(sqldiff_core::equiv::Anchor {
+                        a: (0, 1),
+                        b: (0, 1),
+                    })
+                }),
             ),
             (
                 "proof mode",
