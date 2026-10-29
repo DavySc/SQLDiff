@@ -507,6 +507,7 @@ impl W {
                 args,
                 schema,
                 alias,
+                ..
             } => {
                 self.open("Func");
                 self.strs(name);

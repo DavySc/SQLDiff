@@ -1,0 +1,37 @@
+Warning: Null value is eliminated by an aggregate or other SET operation.
+Warning: Null value is eliminated by an aggregate or other SET operation.
+Warning: Null value is eliminated by an aggregate or other SET operation.
+Warning: Null value is eliminated by an aggregate or other SET operation.
+ 
+-
+obj2 => 1:x
+obj-onlyb => 1:
+obj-null => 1:
+arr-of-empty => 2:
+nested-arr => 1:
+order => 3,1,2
+path-root => 2:y
+arg-path => 1:x
+obj-of-obj => 1:z
+dup2 => f
+dup-null => <null>
+dup-obj => <null>
+key-esc => s
+nul-char => 3
+num-big => 123456789012345678901234567890
+num-neg => -0.0
+lead-zero => ERR JSON text is not properly formatted. Unexpected character '0' is found at position 6.
+trailing => 1
+int-plus => 5
+int-tab => ERR Conversion failed when converting the nvarchar value '	5' to data type int.
+int-lead0 => 7
+dec-sp => 1.50
+dec-empty => ERR Error converting data type nvarchar to decimal.
+dec-dot => 0.50
+dec-half => 0.13
+date-empty => 1900-01-01
+bit-empty => 0
+bit-neg => 1
+bit-0str => 0
+bit-FALSE => 0
+vb => 0x0102

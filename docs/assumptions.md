@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 87 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 88 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 183 |
+| | Total | 184 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -131,6 +131,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-NO-TRIGGERS` | No triggers on the written tables change the error or transaction outcome. | `catalog` | The triggers on the written tables in the catalog. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-NOLOCK` | Results read without NOLOCK are the same: no other transaction writes while the query runs (concurrency is not observed). | `deployment` | Callers do not depend on reading uncommitted rows. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-OBSERVER-ROWCOUNT` | The caller does not read rows-affected counts. | `deployment` | The callers' drivers ignore rows-affected counts (decision 1, observer profile). | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/observer.rs` |
+| `ASM-OPENJSON-VALUES` | The JSON documents OPENJSON reads are valid JSON (an object or an array of objects, nothing after it) without duplicate keys, \u0000 or unpaired surrogate escapes, and each value a WITH column reads is null or a plain value of its type (BMP strings for nvarchar, integers in range for int and bigint, numbers without exponent for decimal, 'yyyy-mm-dd' for date, true, false, 0 or 1 for bit). | `deployment` | The callers pass such documents: on these, OPENJSON and PostgreSQL's jsonb functions read the same rows and values (checked on SQL Server 2022 and PostgreSQL 18). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-ORDER-TOTAL` | The ORDER BY keys are unique, so both sides return the same rows in the same order. | `catalog` | A unique key over the ORDER BY columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OWNER-PRIVILEGES` | The routine owner holds every privilege its statements need on both sides. | `deployment` | The owner's grants on the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PAGE-COUNT-NOT-NULL` | The row count and offset of TOP, LIMIT, FETCH and OFFSET are never NULL: T-SQL raises an error for NULL, PostgreSQL reads it as no limit (OFFSET NULL as 0). | `deployment` | Callers never pass a NULL row count or offset, and the routine never computes one. | `sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/equiv/canon.rs` |

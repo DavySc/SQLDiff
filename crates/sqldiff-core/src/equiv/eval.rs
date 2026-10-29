@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use sqldiff_syntax::Dialect;
 
-use super::ast::{Call, Cte, Expr, From, InsertSource, OrderItem, Select, Stmt, Type};
+use super::ast::{Call, Cte, Expr, From, InsertSource, JsonCol, OrderItem, Select, Stmt, Type};
 use super::schema::{Fam, Schema, Ty};
 
 // ---- values ------------------------------------------------------------
@@ -1148,7 +1148,15 @@ pub fn table_key_with(name: &[String], hints: &[String]) -> String {
 }
 
 /// Key of a table function call: its name and arguments.
-pub fn func_key(name: &[String], args: &[Expr]) -> String {
+/// Key of a table function read. The OPENJSON column paths that differ from
+/// the default (`$.` and the column name) are part of it: a column read
+/// from another path is another input.
+pub fn func_key(
+    name: &[String],
+    args: &[Expr],
+    schema: &[(String, Type)],
+    paths: &[JsonCol],
+) -> String {
     let shown: Vec<String> = args
         .iter()
         .map(|a| match a {
@@ -1159,7 +1167,19 @@ pub fn func_key(name: &[String], args: &[Expr]) -> String {
             _ => "…".into(),
         })
         .collect();
-    format!("{}({})", name.join("."), shown.join(", "))
+    let mut key = format!("{}({})", name.join("."), shown.join(", "));
+    for ((c, _), p) in schema.iter().zip(paths) {
+        let default = format!("$.{c}");
+        let path = p.path.as_deref().unwrap_or(&default);
+        let path = path.strip_prefix("lax ").unwrap_or(path);
+        if path != default || p.as_json {
+            key.push_str(&format!(
+                " {c}:{path}{}",
+                if p.as_json { " AS JSON" } else { "" }
+            ));
+        }
+    }
+    key
 }
 
 /// The JSON text of `FOR JSON` rows, as a value that is equal exactly when
@@ -3181,9 +3201,10 @@ impl Ctx<'_> {
                 name,
                 args,
                 schema,
+                paths,
                 alias,
             } => {
-                let key = func_key(name, args);
+                let key = func_key(name, args, schema, paths);
                 if schema.is_empty() {
                     return unsupported(format!("{key} without a WITH schema"));
                 }
@@ -3889,13 +3910,17 @@ fn from_names(f: &From) -> Vec<(Vec<String>, Option<String>)> {
             vec![(names, Some(table_key_with(name, hints)))]
         }
         From::Func {
-            name, args, alias, ..
+            name,
+            args,
+            schema,
+            paths,
+            alias,
         } => {
             let names = vec![alias
                 .as_ref()
                 .map(|a| a.to_lowercase())
                 .unwrap_or_else(|| name.last().map(|x| x.to_lowercase()).unwrap_or_default())];
-            vec![(names, Some(func_key(name, args)))]
+            vec![(names, Some(func_key(name, args, schema, paths)))]
         }
         From::Sub { alias, .. } | From::Values { alias, .. } | From::DataChange { alias, .. } => {
             vec![(
@@ -4969,7 +4994,13 @@ fn query_tables(q: &Select, out: &mut Vec<String>) {
 fn from_tables(f: &From, out: &mut Vec<String>) {
     match f {
         From::Table { name, hints, .. } => push_table(out, table_key_with(name, hints)),
-        From::Func { name, args, .. } => push_table(out, func_key(name, args)),
+        From::Func {
+            name,
+            args,
+            schema,
+            paths,
+            ..
+        } => push_table(out, func_key(name, args, schema, paths)),
         From::Sub { query, .. } => query_tables(query, out),
         From::Join {
             left, right, on, ..

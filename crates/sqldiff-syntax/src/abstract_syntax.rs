@@ -116,6 +116,13 @@ pub struct Call {
     pub star: bool,
 }
 
+/// A T-SQL `OPENJSON ... WITH` column's `'path'` and `AS JSON`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonCol {
+    pub path: Option<String>,
+    pub as_json: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Type {
     pub name: String,
@@ -162,6 +169,8 @@ pub enum From {
         args: Vec<Expr>,
         /// T-SQL `WITH (col type ['path'], ...)` result schema.
         schema: Vec<(String, Type)>,
+        /// The path and `AS JSON` of each `schema` column. Not encoded.
+        paths: Vec<JsonCol>,
         alias: Option<String>,
     },
     /// Db2 `FINAL TABLE (INSERT ...)` and friends.
@@ -835,9 +844,14 @@ impl<'a> Parser<'a> {
         if self.d != Dialect::Postgres {
             return Ok(l);
         }
-        while self.eat_op("||") {
+        // The jsonb operators `->`, `->>`, `#>` and `#>>` share the rank.
+        while let Some(op) = ["||", "->>", "->", "#>>", "#>"]
+            .into_iter()
+            .find(|op| self.is_op(op))
+        {
+            self.i += 1;
             let r = self.add()?;
-            l = Expr::Bin("||".into(), Box::new(l), Box::new(r));
+            l = Expr::Bin(op.into(), Box::new(l), Box::new(r));
         }
         Ok(l)
     }
@@ -1601,7 +1615,13 @@ impl<'a> Parser<'a> {
         }
         let name = self.qname()?;
         if self.is_kind(K::LParen) {
-            if !self.ext {
+            // The engine reads only the JSON row sources it models.
+            let json = match (self.d, name.as_slice()) {
+                (Dialect::Tsql, [f]) => f.eq_ignore_ascii_case("OPENJSON"),
+                (Dialect::Postgres, [f]) => f.eq_ignore_ascii_case("jsonb_array_elements"),
+                _ => false,
+            };
+            if !self.ext && !json {
                 return Err("table functions in FROM are not supported".into());
             }
             self.i += 1;
@@ -1612,18 +1632,29 @@ impl<'a> Parser<'a> {
             };
             self.expect_kind(K::RParen)?;
             let mut schema = Vec::new();
+            let mut paths = Vec::new();
             if self.d == Dialect::Tsql && self.is_kw("WITH") && self.is_kind_at(1, K::LParen) {
                 self.i += 2;
                 loop {
                     let col = self.ident()?;
                     let ty = self.ty()?;
-                    if self.is_kind(K::Str) {
+                    let path = if self.is_kind(K::Str) {
+                        let t = self.peek().unwrap().text.clone();
                         self.i += 1;
-                    }
-                    if self.eat_kw("AS") {
+                        Some(string_value(&t)?)
+                    } else {
+                        None
+                    };
+                    let as_json = self.eat_kw("AS");
+                    if as_json {
                         self.expect_kw("JSON")?;
                     }
+                    if path.is_some() || as_json {
+                        // Not in the encoded tree (see `From::Func`).
+                        self.dropped.push("an OPENJSON column path");
+                    }
                     schema.push((col, ty));
+                    paths.push(JsonCol { path, as_json });
                     if !self.eat_kind(K::Comma) {
                         break;
                     }
@@ -1635,6 +1666,7 @@ impl<'a> Parser<'a> {
                 name,
                 args,
                 schema,
+                paths,
                 alias,
             });
         }
@@ -2233,6 +2265,55 @@ mod tests {
     fn toks(sql: &str, d: Dialect) -> Vec<Tok> {
         let p = crate::parse(sql, d);
         tokens(&p.syntax())
+    }
+
+    #[test]
+    fn json_row_sources() {
+        // The engine's parser reads OPENJSON and its paths...
+        let t = toks(
+            "SELECT a FROM OPENJSON(@j) WITH (a int N'strict $.A', b date, c nvarchar(max) '$.c' AS JSON) AS o",
+            Dialect::Tsql,
+        );
+        let Stmt::Select(q) = parse_stmt(&t, Dialect::Tsql).unwrap() else {
+            panic!()
+        };
+        let From::Func { paths, .. } = &q.from[0] else {
+            panic!()
+        };
+        let p = |path: Option<&str>, as_json| JsonCol {
+            path: path.map(Into::into),
+            as_json,
+        };
+        assert_eq!(
+            paths,
+            &[
+                p(Some("strict $.A"), false),
+                p(None, false),
+                p(Some("$.c"), true)
+            ]
+        );
+        // ... which the encoded tree does not show.
+        assert!(parse_stmt_exact(&t, Dialect::Tsql).is_err());
+        // Other table functions stay refused.
+        let t = toks("SELECT a FROM STRING_SPLIT(@j, ',')", Dialect::Tsql);
+        assert!(parse_stmt(&t, Dialect::Tsql).is_err());
+        // PostgreSQL's jsonb operators rank with `||`, left to right.
+        let t = toks(
+            "SELECT CAST(e ->> 'k' AS int), x #>> '{}' || 'a' FROM jsonb_array_elements(CAST(p_j AS jsonb)) AS e",
+            Dialect::Postgres,
+        );
+        let Stmt::Select(q) = parse_stmt(&t, Dialect::Postgres).unwrap() else {
+            panic!()
+        };
+        let Expr::Cast(x, _) = &q.items[0].expr else {
+            panic!()
+        };
+        assert!(matches!(&**x, Expr::Bin(op, _, _) if op == "->>"));
+        let Expr::Bin(op, l, _) = &q.items[1].expr else {
+            panic!()
+        };
+        assert_eq!(op, "||");
+        assert!(matches!(&**l, Expr::Bin(op, _, _) if op == "#>>"));
     }
 
     #[test]

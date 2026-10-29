@@ -1,0 +1,57 @@
+CREATE FUNCTION
+obj-rows|1
+arr-rows|2
+empty-arr|0
+empty-obj|0
+ERROR:  cannot extract elements from a scalar
+CONTEXT:  SQL function "rows_of" statement 1
+ERROR:  cannot extract elements from a scalar
+CONTEXT:  SQL function "rows_of" statement 1
+null-in|0
+ERROR:  invalid input syntax for type json
+DETAIL:  The input string ended unexpectedly.
+CONTEXT:  JSON data, line 1: 
+SQL function "rows_of" statement 1
+ws|1
+arr-mixed|[],[y],[],[],[]
+arr-of-empty|2
+lax-missing|<null>
+ERROR:  JSON object does not contain key "a"
+strict-null|<null>
+ERROR:  jsonpath member accessor can only be applied to an object
+lax-null|<null>
+dup|second
+trunc|abcde
+trunc-surr|a😀
+num-str|1.50
+exp-str|100
+bool-str|true
+trail-sp|[x  ]
+int|12
+int-neg|-12
+ERROR:  value "2147483648" is out of range for type integer
+ERROR:  invalid input syntax for type integer: "12.7"
+bigint|9007199254740993
+dec|1.01
+dec-neg|-1.01
+dec-half|0.13
+dec-3|2.001
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 18, scale 2 must round to an absolute value less than 10^16.
+dec-long|0.13
+date|2020-01-31
+ERROR:  date/time field value out of range: "2020-02-30"
+date-y1|0001-01-01
+bool-t|t
+bool-f|f
+bool-1|t
+bool-0|f
+text|9000
+ERROR:  invalid input syntax for type json
+DETAIL:  Expected JSON value, but found "}".
+CONTEXT:  JSON data, line 1: {"a":}
+SQL function "rows_of" statement 1
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "x" is invalid.
+CONTEXT:  JSON data, line 1: [{"a":1}] x
+SQL function "rows_of" statement 1

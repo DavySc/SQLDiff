@@ -509,6 +509,7 @@ impl P {
                 args,
                 schema,
                 alias,
+                ..
             } => {
                 if !schema.is_empty() {
                     return no("a WITH (...) result schema");
