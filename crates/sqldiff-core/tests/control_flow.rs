@@ -396,3 +396,77 @@ $$;
     );
     assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
 }
+
+/// T-SQL `SELECT @a = …` against the loop the conversion writes for it, with
+/// the loop's body and query as given.
+fn assign_loop(query: &str, body: &str) -> Report {
+    let a = "CREATE PROCEDURE p @k int AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @a int = 5;\n  SELECT @a = c FROM t WHERE id = @k;\n  UPDATE u SET x = @a;\nEND\n";
+    let b = format!(
+        "CREATE PROCEDURE p(p_k integer) LANGUAGE plpgsql AS $$\nDECLARE\n  v_a integer := 5;\nBEGIN\n  DECLARE\n    sqldiff_r record;\n  BEGIN\n    FOR sqldiff_r IN {query} LOOP\n      {body}\n    END LOOP;\n  END;\n  UPDATE u SET x = v_a;\nEND;\n$$;\n"
+    );
+    diff(
+        &Artifact::new("a.sql", Dialect::Tsql, a),
+        &Artifact::new("b.sql", Dialect::Postgres, b),
+        &Options::default(),
+    )
+}
+
+#[test]
+fn a_select_assign_loop_is_read_as_the_select() {
+    let q = "SELECT c AS sqldiff_c1 FROM t WHERE id = p_k";
+    let r = assign_loop(q, "v_a := sqldiff_r.sqldiff_c1;");
+    assert!(
+        matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:#?}\n{:#?}",
+        r.findings,
+        r.unknown_reasons
+    );
+    // Another column, another filter: compared, and not equal.
+    for (q, body) in [
+        (
+            "SELECT d AS sqldiff_c1 FROM t WHERE id = p_k",
+            "v_a := sqldiff_r.sqldiff_c1;",
+        ),
+        (
+            "SELECT c AS sqldiff_c1 FROM t WHERE id > p_k",
+            "v_a := sqldiff_r.sqldiff_c1;",
+        ),
+    ] {
+        let r = assign_loop(q, body);
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{q}"
+        );
+        assert!(
+            r.unknown_reasons.iter().all(|x| !x.contains("not covered")),
+            "{:#?}",
+            r.unknown_reasons
+        );
+    }
+    // Shapes the loop is not read in: the query reads the variable it
+    // assigns (T-SQL sees earlier rows' values), the body does more than
+    // assign, a column goes nowhere. Those stay not covered.
+    for (q, body) in [
+        (
+            "SELECT c AS sqldiff_c1 FROM t WHERE id = v_a",
+            "v_a := sqldiff_r.sqldiff_c1;",
+        ),
+        (q, "v_a := sqldiff_r.sqldiff_c1; v_a := v_a + 1;"),
+        (
+            "SELECT c AS sqldiff_c1, d AS sqldiff_c2 FROM t WHERE id = p_k",
+            "v_a := sqldiff_r.sqldiff_c1;",
+        ),
+        (q, "v_a := sqldiff_r.sqldiff_c1 + 1;"),
+    ] {
+        let r = assign_loop(q, body);
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{q} / {body}"
+        );
+        assert!(
+            r.unknown_reasons.iter().any(|x| x.contains("not covered")),
+            "{q} / {body}: {:#?}",
+            r.unknown_reasons
+        );
+    }
+}
