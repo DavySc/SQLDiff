@@ -2487,6 +2487,14 @@ impl<'a> Canon<'a> {
         s.ok_or_else(|| "assignment target is not a parameter or local variable".to_string())
     }
 
+    /// The condition of an IF or WHILE, evaluated once each time it is
+    /// tested.
+    pub fn condition(&mut self, e: &Expr) -> R<Term> {
+        self.seen_tables.clear();
+        self.single_row = true;
+        Ok(self.cond(e)?.0)
+    }
+
     pub fn stmt(&mut self, s: &Stmt) -> R<Term> {
         self.seen_tables.clear();
         self.single_row = false;
