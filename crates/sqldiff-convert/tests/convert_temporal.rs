@@ -275,12 +275,74 @@ fn key_columns_lose_their_sort_order() {
     }
 }
 
+const SWITCHES: &str = "ALTER TABLE [Sales].[Groups] SET (SYSTEM_VERSIONING = OFF);
+ALTER TABLE [Sales].[Groups] DROP PERIOD FOR SYSTEM_TIME;
+ALTER TABLE [Sales].[Groups] ADD PERIOD FOR SYSTEM_TIME([ValidFrom], [ValidTo]);
+ALTER TABLE [Sales].[Groups] SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = [Sales].[Groups_Archive], DATA_CONSISTENCY_CHECK = ON));
+";
+
 #[test]
-fn altering_versioning_is_refused() {
-    let src = "ALTER TABLE s.t SET (SYSTEM_VERSIONING = OFF);\nALTER TABLE s.t DROP PERIOD FOR SYSTEM_TIME;\n";
-    for to in [Dialect::Postgres, Dialect::Db2i] {
-        let c = convert(src, Dialect::Tsql, to).unwrap();
-        assert_eq!(c.counts.not_converted, 2, "{}", c.output);
+fn switching_versioning_switches_the_history_triggers() {
+    let c = in_tree(SWITCHES, &[MAIN, ARCHIVE]);
+    let o = &c.output;
+    assert_eq!(c.units.len(), 4, "{o}");
+    for u in &c.units {
+        assert_eq!(rules_only(u), Status::Assumptions, "{:?}", u.notes);
+        assert!(
+            u.notes.iter().any(|n| n.rule == "ASM-TEMPORAL-SWITCH"),
+            "{:?}",
+            u.notes
+        );
+    }
+    for want in [
+        "ALTER TABLE Sales.Groups DISABLE TRIGGER Groups_versioning, DISABLE TRIGGER Groups_versioning_truncate;",
+        "ALTER TABLE Sales.Groups DISABLE TRIGGER Groups_period_update;",
+        "ALTER TABLE Sales.Groups ENABLE TRIGGER Groups_period_update;",
+        "ALTER TABLE Sales.Groups ENABLE TRIGGER Groups_versioning, ENABLE TRIGGER Groups_versioning_truncate;",
+    ] {
+        assert!(o.contains(want), "{want}\n{o}");
+    }
+}
+
+#[test]
+fn switching_versioning_needs_the_tables_definition() {
+    // Without the tree's catalog, or for a table it does not show
+    // system-versioned, which triggers the table has is not known.
+    for c in [pg(SWITCHES), in_tree(SWITCHES, &[ARCHIVE])] {
+        assert_eq!(c.counts.not_converted, 4, "{}", c.output);
+    }
+    // Db2 for i refuses system versioning altogether.
+    let c = convert(SWITCHES, Dialect::Tsql, Dialect::Db2i).unwrap();
+    assert_eq!(c.counts.not_converted, 4, "{}", c.output);
+    for (src, why) in [
+        (
+            "ALTER TABLE Sales.Groups ADD PERIOD FOR SYSTEM_TIME (ValidTo, ValidFrom);\n",
+            "the CREATE TABLE's period",
+        ),
+        (
+            "ALTER TABLE Sales.Groups SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = Sales.Other));\n",
+            "trigger writes the history table",
+        ),
+        (
+            "ALTER TABLE Sales.Groups SET (SYSTEM_VERSIONING = ON);\n",
+            "generated name",
+        ),
+        (
+            "ALTER TABLE Sales.Groups SET (SYSTEM_VERSIONING = ON (HISTORY_TABLE = Sales.Groups_Archive, HISTORY_RETENTION_PERIOD = 6 MONTHS));\n",
+            "HISTORY_RETENTION_PERIOD",
+        ),
+        (
+            "ALTER TABLE Sales.Groups SET (SYSTEM_VERSIONING = OFF, DATA_DELETION = ON);\n",
+            "only SET (SYSTEM_VERSIONING = OFF)",
+        ),
+    ] {
+        let c = in_tree(src, &[MAIN, ARCHIVE]);
+        assert_eq!(c.units[0].status, Status::NotConverted, "{src}: {}", c.output);
+        assert!(
+            c.units[0].notes.iter().any(|n| n.text.contains(why)),
+            "{src}: {:?}",
+            c.units[0].notes
+        );
     }
 }
 

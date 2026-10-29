@@ -11,10 +11,10 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 | Discharge | Meaning | Ids |
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
-| `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 89 |
+| `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 90 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 185 |
+| | Total | 187 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -174,6 +174,8 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TEMPLATE-SHARED-VALUES` | One weave fills each placeholder with the same value in every template. | `generated` | The woven instances checked. | `sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/template.rs` |
 | `ASM-TEMPLATE-VALUE-SAME` | A value woven into the target instance is the value woven into the source instance. | `generated` | The generator's values for both dialects. | `sqldiff-convert/src/instances.rs` |
 | `ASM-TEMPORAL-HISTORY` | The history table exists with the table's columns, by name and type in the same order. | `catalog` | The history table's definition. | `sqldiff-convert/src/tsql/temporal.rs` |
+| `ASM-TEMPORAL-PERIOD-WRITE` | A statement that writes a period column of a system-versioned table runs while versioning is off and the period dropped. | `deployment` | When the code that writes period values runs (a data load between turning versioning off and on). | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-TEMPORAL-SWITCH` | Turning versioning off and on and dropping and adding the period become disabling and enabling the converted table's versioning triggers; PostgreSQL skips SQL Server's checks on those statements. | `generated` | The triggers the converted CREATE TABLE made, and code that does not rely on SQL Server's checks when versioning starts or the period is added. | `sqldiff-convert/src/tsql/temporal.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-TEMPORAL-TRIGGER` | System versioning by trigger matches T-SQL for the ways the table is written (no direct writes to the history table, no ALTER TABLE). | `deployment` | How the table and its history are written and altered. | `sqldiff-convert/src/tsql/temporal.rs` |
 | `ASM-THROW-ERRCODE` | Callers do not depend on the T-SQL error number of a raised error (they see a fixed SQLSTATE and the same message). | `deployment` | How callers handle the error. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-TIME-SOURCE` | The session's time zone is the server's (the current time follows the session, T-SQL's the server clock). | `deployment` | The sessions' time zone. (fact key `time_zone`) | `sqldiff-convert/src/tsql.rs` |

@@ -66,6 +66,10 @@ pub mod asm {
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
     );
+    pub const PERIOD_WRITE: (&str, &str) = (
+        "ASM-TEMPORAL-PERIOD-WRITE",
+        "The statement gives a period column of a system-versioned table a value: assumes the code runs while versioning is off and the period dropped (SYSTEM_VERSIONING = OFF, DROP PERIOD FOR SYSTEM_TIME; in PostgreSQL the converted versioning triggers disabled), as data loads do, so both sides store the value as given. While versioning is on, both sides refuse the statement; while only the period remains, SQL Server refuses it and PostgreSQL stores the value",
+    );
     pub const UNTYPED_STORE: (&str, &str) = (
         "ASM-UNTYPED-STORE",
         "Values stored in columns or variables of unknown type (no catalog) convert the same on both sides: no fraction goes into an integer, no number into a bit or boolean, no string longer than the column, and no text into a number",
@@ -528,19 +532,79 @@ impl<'a> Canon<'a> {
     }
 
     /// A statement writes `col`: refused for a column the database computes
-    /// (period, computed, GENERATED ALWAYS), whose explicit values one side
-    /// rejects or replaces depending on settings and triggers the statement
-    /// does not show.
-    fn written(&self, table: &str, col: &str) -> R<()> {
-        let generated = self
+    /// (computed, GENERATED ALWAYS), whose explicit values one side rejects
+    /// or replaces depending on settings and triggers the statement does not
+    /// show. A period column of a system-versioned table is the exception:
+    /// code writes it only with the period dropped, a state the statement
+    /// does not show either, so that is an assumption.
+    fn written(&mut self, table: &str, col: &str) -> R<()> {
+        let (generated, period) = self
             .schema
             .table(Self::base_table(table))
             .and_then(|t| t.column(col))
-            .is_some_and(|c| c.generated);
-        if generated {
+            .map_or((false, false), |c| (c.generated, c.period));
+        if period {
+            self.assume(asm::PERIOD_WRITE);
+        } else if generated {
             return Err(format!("writes the generated column {col}"));
         }
         Ok(())
+    }
+
+    /// An INSERT that leaves out a period column, in code that drops the
+    /// table's period (it switches the versioning or writes a period
+    /// column): with the period dropped, SQL Server takes the column's
+    /// default or fails on NOT NULL, while PostgreSQL, its versioning
+    /// triggers disabled, stores the converted default `-infinity`.
+    fn period_omitted(&self, table: &str, cols: &[String]) -> R<()> {
+        let Some(t) = self.schema.table(Self::base_table(table)) else {
+            return Ok(());
+        };
+        let missing: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period && !cols.contains(&c.name))
+            .map(|c| c.name.as_str())
+            .collect();
+        if missing.is_empty() || !self.drops_period(t) {
+            return Ok(());
+        }
+        Err(format!(
+            "the INSERT leaves out the period column {} of a table whose period this code drops or writes: with the period dropped SQL Server takes the column's default or fails, PostgreSQL stores '-infinity'",
+            missing.join(", ")
+        ))
+    }
+
+    /// Whether the unit switches `t`'s versioning, or writes (or may write:
+    /// a data statement naming the column) one of its period columns.
+    fn drops_period(&self, t: &super::schema::Table) -> bool {
+        let switched = self.unit.calls.iter().any(|(node, _)| {
+            matches!(
+                super::call::parse(&super::ast::tokens(node), self.d),
+                Ok(super::call::Stmt::Switch(s))
+                    if s.table.last().is_some_and(|n| n.text.eq_ignore_ascii_case(&t.name))
+            )
+        });
+        let period: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period)
+            .map(|c| c.name.as_str())
+            .collect();
+        switched
+            || self.unit.stmts.iter().any(|s| {
+                s.toks
+                    .first()
+                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
+                    && s.toks.iter().any(|x| {
+                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
+                            && period.contains(
+                                &sqldiff_syntax::ast::unquote(&x.text)
+                                    .to_lowercase()
+                                    .as_str(),
+                            )
+                    })
+            })
     }
 
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
@@ -3395,6 +3459,7 @@ impl<'a> Canon<'a> {
                 Ok(n("insertn", vec![a(table), n("rows", sets)]))
             }
             InsertSource::Query(q) => {
+                self.period_omitted(table, cols)?;
                 let (parts, items) = self.query_parts(q, QCtx::Scalar)?;
                 if items.len() != cols.len() {
                     return Err("INSERT column count does not match the query".into());
@@ -3413,7 +3478,10 @@ impl<'a> Canon<'a> {
                 kv.sort();
                 Ok(n("insertq", vec![a(table), n("set", kv), n("q", parts)]))
             }
-            InsertSource::Default => Ok(n("insertdefault", vec![a(table)])),
+            InsertSource::Default => {
+                self.period_omitted(table, &[])?;
+                Ok(n("insertdefault", vec![a(table)]))
+            }
         }
     }
 
@@ -3423,6 +3491,7 @@ impl<'a> Canon<'a> {
         cols: &[String],
         row: &[Expr],
     ) -> R<Vec<(String, Term, Option<Ty>)>> {
+        self.period_omitted(table, cols)?;
         if row.len() != cols.len() {
             return Err("INSERT column count does not match VALUES".into());
         }

@@ -7,7 +7,7 @@ use sqldiff_syntax::{parse, Dialect, SyntaxKind, SyntaxNode};
 
 use super::{
     Catalog, Column, DataType, Ident, Index, Key, Param, ParamMode, Routine, RoutineKind, Table,
-    TableKind,
+    TableKind, Versioning,
 };
 use crate::tokens::{self, close_paren, find_kw, qualified, split_commas, Tok};
 
@@ -144,11 +144,50 @@ pub fn create_table(t: &[Tok], dialect: Dialect) -> Option<Table> {
     if t.get(j).is_some_and(|x| x.is(SyntaxKind::L_PAREN)) {
         let c = close_paren(t, j);
         column_defs(&mut tb, &t[j + 1..c], dialect);
+        if dialect == Dialect::Tsql {
+            tb.versioning = versioning(&t[j + 1..c], t.get(c + 1..).unwrap_or_default(), dialect);
+        }
     } else {
         // `AS SELECT`, `LIKE other`, `AS (subquery) WITH DATA`.
         tb.columns_known = false;
     }
     Some(tb)
+}
+
+/// T-SQL `PERIOD FOR SYSTEM_TIME (start, end)` in the column list with
+/// `WITH (SYSTEM_VERSIONING = ON [(HISTORY_TABLE = h, …)])` after it.
+fn versioning(inner: &[Tok], after: &[Tok], dialect: Dialect) -> Option<Versioning> {
+    let period = split_commas(inner).into_iter().find(|e| {
+        e.first().is_some_and(|x| x.is_kw("PERIOD"))
+            && e.get(1).is_some_and(|x| x.is_kw("FOR"))
+            && e.get(2).is_some_and(|x| x.is_kw("SYSTEM_TIME"))
+    })?;
+    let (cols, _) = paren_names(&period[3..], dialect);
+    let [start, end] = <[String; 2]>::try_from(cols).ok()?;
+    let at = after.iter().position(|x| x.is_kw("SYSTEM_VERSIONING"))?;
+    // SYSTEM_VERSIONING = ON
+    if !after.get(at + 1).is_some_and(|x| x.is_op("="))
+        || !after.get(at + 2).is_some_and(|x| x.is_kw("ON"))
+    {
+        return None;
+    }
+    let mut history = None;
+    if after.get(at + 3).is_some_and(|x| x.is(SyntaxKind::L_PAREN)) {
+        let c = close_paren(after, at + 3);
+        for o in split_commas(&after[at + 4..c]) {
+            if o.first().is_some_and(|x| x.is_kw("HISTORY_TABLE"))
+                && o.get(1).is_some_and(|x| x.is_op("="))
+            {
+                let (parts, _) = qualified(o, 2);
+                history = Some(parts.iter().map(|p| p.stored(dialect)).collect());
+            }
+        }
+    }
+    Some(Versioning {
+        start,
+        end,
+        history,
+    })
 }
 
 const COLUMN_OPTIONS: &[&str] = &[
