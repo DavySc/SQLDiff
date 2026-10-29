@@ -10,7 +10,7 @@
 //! the profile tables. Commit statements carry error edges too, because
 //! deferred constraints fail at commit time.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use sqldiff_syntax::{ast, Dialect, SyntaxKind, SyntaxNode, SyntaxToken};
@@ -333,10 +333,24 @@ struct Lowerer {
     temps: BTreeMap<String, TempObject>,
     keys: HashMap<(usize, usize), String>,
     savepoint_names: Vec<String>,
+    /// The routine's name: names the temporary table a T-SQL table variable
+    /// is converted to (`classify::table_variable_table`).
+    routine_name: Option<String>,
+    /// The other side's temporary tables (`classify::temp_table_names`): a
+    /// table variable converted to one of them is keyed by its name.
+    /// Otherwise `@t` and `#t` share the key `T`, so a table variable
+    /// replaced by a temporary table of the same name pairs.
+    other_temps: HashSet<String>,
 }
 
 /// Lowers an analyzed artifact.
 pub fn lower(a: &Analyzed) -> Cfg {
+    lower_with(a, HashSet::new())
+}
+
+/// `lower`, keying a T-SQL table variable by the temporary table it is
+/// converted to when the other side has that table (`other_temps`).
+pub fn lower_with(a: &Analyzed, other_temps: HashSet<String>) -> Cfg {
     let d = a.dialect();
     let prof = Profile::of(d);
     let routine_node = a
@@ -374,6 +388,8 @@ pub fn lower(a: &Analyzed) -> Cfg {
         temps: BTreeMap::new(),
         keys: HashMap::new(),
         savepoint_names: Vec::new(),
+        routine_name: routine_node.as_ref().and_then(ast::routine_name),
+        other_temps,
     };
     l.add(Op::ExitOk, None);
     l.add(Op::ExitErr, None);
@@ -440,6 +456,18 @@ pub fn temp_key(name: &str) -> String {
 }
 
 impl Lowerer {
+    /// Key of a temporary object named `name`: a T-SQL table variable gets
+    /// the key of the temporary table it is converted to, so the sides meet.
+    fn name_key(&self, name: &str) -> String {
+        if self.dialect == Dialect::Tsql && name.starts_with('@') {
+            let t = classify::table_variable_table(self.routine_name.as_deref(), name);
+            if self.other_temps.contains(&t.to_lowercase()) {
+                return temp_key(&t);
+            }
+        }
+        temp_key(name)
+    }
+
     fn add(&mut self, op: Op, syntax: Option<SyntaxNode>) -> NodeId {
         self.nodes.push(Node {
             op,
@@ -494,6 +522,10 @@ impl Lowerer {
         let w = |i: usize| toks.get(i).map(upper).unwrap_or_default();
         let words: Vec<String> = toks.iter().map(upper).collect();
         let has = |a: &str, b: &str| words.windows(2).any(|x| x[0] == a && x[1] == b);
+        let tv_key = toks
+            .get(1)
+            .filter(|t| t.text().starts_with('@'))
+            .map(|t| self.name_key(t.text()));
         let mut add = |key: String, object: &str, on_rollback: String, on_commit: String| {
             self.temps.insert(
                 key.clone(),
@@ -508,17 +540,9 @@ impl Lowerer {
         let row = |o: &str| self.prof.temp_row(o).cloned();
         match self.dialect {
             Dialect::Tsql => {
-                if w(0) == "DECLARE"
-                    && toks.get(1).is_some_and(|t| t.text().starts_with('@'))
-                    && w(2) == "TABLE"
-                {
-                    if let Some(r) = row("table_variable") {
-                        add(
-                            temp_key(toks[1].text()),
-                            "table_variable",
-                            r.on_rollback,
-                            r.on_commit,
-                        );
+                if w(0) == "DECLARE" && w(2) == "TABLE" {
+                    if let (Some(key), Some(r)) = (tv_key, row("table_variable")) {
+                        add(key, "table_variable", r.on_rollback, r.on_commit);
                     }
                 }
                 if w(0) == "CREATE" && w(1) == "TABLE" {
@@ -595,7 +619,7 @@ impl Lowerer {
             }
             return Some(key);
         }
-        let key = temp_key(last);
+        let key = self.name_key(last);
         let schema_temp = parts.len() > 1
             && parts[0].eq_ignore_ascii_case(match self.dialect {
                 Dialect::Db2i => "SESSION",
@@ -1294,7 +1318,7 @@ impl Lowerer {
                 Dialect::Tsql => {
                     t.text().starts_with('#')
                         || (t.text().starts_with('@')
-                            && self.temps.contains_key(&temp_key(t.text())))
+                            && self.temps.contains_key(&self.name_key(t.text())))
                 }
                 _ => {
                     self.temps
@@ -1306,7 +1330,7 @@ impl Lowerer {
             };
             if is_temp {
                 *mentions
-                    .entry(temp_key(parts.last().unwrap_or(&t.text().to_string())))
+                    .entry(self.name_key(parts.last().unwrap_or(&t.text().to_string())))
                     .or_insert(0) += 1;
             }
         }

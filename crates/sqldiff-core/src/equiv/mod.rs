@@ -247,8 +247,9 @@ pub fn compare(
 ) -> Outcome {
     let mut out = Outcome::default();
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
-        for (ua, ub, sa, sb) in &pairs {
-            compare_units(a, b, ua, ub, sa, sb, anchors, &mut out);
+        for (mut ua, mut ub, sa, sb) in pairs {
+            tv_names(a, b, &mut ua, &mut ub);
+            compare_units(a, b, &ua, &ub, &sa, &sb, anchors, &mut out);
         }
         return out;
     }
@@ -256,9 +257,22 @@ pub fn compare(
         script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
+        tv_names(a, b, &mut ua, &mut ub);
         compare_units(a, b, &ua, &ub, sa, sb, anchors, &mut out);
     }
     out
+}
+
+/// T-SQL against PostgreSQL or Db2 for i: the other side's temporary
+/// tables, which the T-SQL side's table variables may have become.
+fn tv_names(a: &Analyzed, b: &Analyzed, ua: &mut Unit, ub: &mut Unit) {
+    let tsql = sqldiff_syntax::Dialect::Tsql;
+    if a.dialect() == tsql && b.dialect() != tsql {
+        ua.other_temps = crate::classify::temp_table_names(&b.root);
+    }
+    if b.dialect() == tsql && a.dialect() != tsql {
+        ub.other_temps = crate::classify::temp_table_names(&a.root);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -304,6 +318,7 @@ fn compare_units(
     signature(ua, ub, &na, &nb, out);
     script::locals(a, b, ua, ub, &na, &nb, out);
     tables(a, b, ua, ub, sa, sb, out);
+    table_vars(a, b, ua, ub, sa, sb, out);
     calls(a, b, ua, ub, sa, sb, out);
     dynamic_sql(a, b, ua, ub, sa, sb, out);
     ddl_stmts(a, b, ua, ub, sa, sb, out);
@@ -809,6 +824,14 @@ fn only_comments_after(side: &Analyzed, node: &SyntaxNode) -> bool {
 }
 
 /// A token made up for a statement built around a table's parts.
+/// Tokens as SQL text, one space between them.
+fn ast_text(ts: &[ast::Tok]) -> String {
+    ts.iter()
+        .map(|t| t.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn synth(kind: ast::K, text: &str) -> ast::Tok {
     ast::Tok {
         kind,
@@ -901,7 +924,6 @@ fn tables(
     sb: &Schema,
     out: &mut Outcome,
 ) {
-    use ast::K;
     if ua.tables.is_empty() && ub.tables.is_empty() {
         return;
     }
@@ -921,200 +943,503 @@ fn tables(
     }
     for ((xa, pa), (xb, pb)) in ua.tables.iter().zip(&ub.tables) {
         let (la, lb) = (a.line_of(xa), b.line_of(xb));
+        if pa != pb {
+            out.unknown_reasons.push(format!(
+                "{na} line {la}: the CREATE TABLE (and {nb} line {lb}) is not compared: it comes after {pa} data statement(s) on one side and {pb} on the other"
+            ));
+            continue;
+        }
+        let pair = TablePair {
+            what: "the CREATE TABLE".into(),
+            xa,
+            xb,
+            ta: ast::tokens(xa),
+            tb: ast::tokens(xb),
+            ddl: (xa.text().to_string(), xb.text().to_string()),
+        };
+        table_pair(a, b, ua, ub, sa, sb, &pair, out);
+    }
+}
+
+/// Compares each T-SQL table variable with the temporary table it became
+/// (`classify::table_variable_table` names it): PostgreSQL `DROP TABLE IF
+/// EXISTS pg_temp.t` then `CREATE TEMP TABLE pg_temp.t (…)`, so each run
+/// starts empty; Db2 for i `DECLARE GLOBAL TEMPORARY TABLE SESSION.t (…) ON
+/// COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE`,
+/// which keeps its rows on rollback as a table variable does (V16). The
+/// columns are compared as tables are; each must stand in the same place.
+#[allow(clippy::too_many_arguments)]
+fn table_vars(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    out: &mut Outcome,
+) {
+    use ast::K;
+    if ua.table_vars.is_empty() && ub.table_vars.is_empty() && ub.temp_drops.is_empty() {
+        return;
+    }
+    let (na, nb) = (side_name(a), side_name(b));
+    let (da, db) = (a.dialect(), b.dialect());
+    let cross = da == sqldiff_syntax::Dialect::Tsql
+        && matches!(
+            db,
+            sqldiff_syntax::Dialect::Postgres | sqldiff_syntax::Dialect::Db2i
+        );
+    // Name parts after the leading keywords of a temporary table statement.
+    let name_at = |ts: &[ast::Tok], i: usize| -> (Vec<String>, usize) {
+        let mut parts = Vec::new();
+        let mut j = i;
+        while let Some(t) = ts.get(j) {
+            if !matches!(t.kind, K::Word | K::Quoted) {
+                break;
+            }
+            parts.push(t.text.to_lowercase());
+            j += 1;
+            if ts.get(j).is_some_and(|t| t.kind == K::Dot) {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        (parts, j)
+    };
+    let creation = |x: &SyntaxNode| -> (Vec<ast::Tok>, Vec<String>, usize) {
+        let ts = ast::tokens(x);
+        let start = if db == sqldiff_syntax::Dialect::Db2i {
+            4
+        } else {
+            3
+        };
+        let (parts, j) = name_at(&ts, start);
+        (ts, parts, j)
+    };
+    let temp_schema = if db == sqldiff_syntax::Dialect::Db2i {
+        "session"
+    } else {
+        "pg_temp"
+    };
+    let mut used_b = vec![false; ub.table_vars.len()];
+    let mut used_drop = vec![false; ub.temp_drops.len()];
+    for (xa, _) in &ua.table_vars {
+        let la = a.line_of(xa);
+        let ta = ast::tokens(xa);
+        let var = ta.get(1).map(|t| t.text.clone()).unwrap_or_default();
         let unknown = |out: &mut Outcome, why: String| {
             out.unknown_reasons.push(format!(
-                "{na} line {la}: the CREATE TABLE (and {nb} line {lb}) is not compared: {why}"
+                "{na} line {la}: the table variable {var} is not compared: {why}"
             ));
         };
-        if pa != pb {
+        if !cross {
             unknown(
                 out,
-                format!("it comes after {pa} data statement(s) on one side and {pb} on the other"),
+                "only a table variable converted from T-SQL to PostgreSQL or Db2 for i is compared"
+                    .into(),
             );
             continue;
         }
-        let (ta, tb) = match (
-            table::parse(&ast::tokens(xa), a.dialect()),
-            table::parse(&ast::tokens(xb), b.dialect()),
-        ) {
-            (Ok(x), Ok(y)) => (x, y),
-            (Err(e), _) => {
-                unknown(out, format!("{na}: {e}"));
-                continue;
-            }
-            (_, Err(e)) => {
-                unknown(out, format!("{nb}: {e}"));
-                continue;
-            }
+        let want =
+            crate::classify::table_variable_table(ua.routine.as_deref(), &var).to_lowercase();
+        let found = ub.table_vars.iter().enumerate().find(|(k, (xb, _))| {
+            !used_b[*k] && creation(xb).1 == [temp_schema.to_string(), want.clone()]
+        });
+        let Some((k, (xb, pb))) = found else {
+            unknown(
+                out,
+                format!("{nb} creates no temporary table {temp_schema}.{want}"),
+            );
+            continue;
         };
-        let anchor = |n: &SyntaxNode| {
-            crate::normalize::hash_strs(std::iter::once(n.text().to_string().as_str()))
-        };
-        let mut decided = true;
-        let finding = |out: &mut Outcome,
-                       rule: &str,
-                       class: ChangeClass,
-                       witness: String,
-                       at: (usize, usize),
-                       asms: Vec<String>| {
-            out.findings.push(Finding {
-                fingerprint: fingerprint(&FingerprintInput {
-                    object: &a.object,
-                    class,
-                    rule,
-                    anchor_a: &format!("{}:{}", anchor(xa), at.0),
-                    anchor_b: &format!("{}:{}", anchor(xb), at.1),
-                }),
-                rule: rule.to_string(),
-                class,
-                severity: class.default_severity(),
-                verdict: Verdict::Different,
-                witness,
-                a: Some(line_at(a, at.0)),
-                b: Some(line_at(b, at.1)),
-                assumptions: asms,
-            });
-        };
-        let mut asms: Vec<Assumption> = Vec::new();
-        let add = |asms: &mut Vec<Assumption>, x: Assumption| {
-            if !asms.iter().any(|y| y.id == x.id) {
-                asms.push(x);
-            }
-        };
-        let mut found = false;
-        let sch = std::cell::OnceCell::new();
-        let with_table = || {
-            sch.get_or_init(|| {
-                (
-                    sa.with_ddl(&xa.text().to_string(), a.dialect()),
-                    sb.with_ddl(&xb.text().to_string(), b.dialect()),
-                )
+        used_b[k] = true;
+        let lb = b.line_of(xb);
+        // Created once, where the routine's own statements run: not in a
+        // loop, a branch, or a block whose error handler would undo it.
+        if let Some(x) = [(xa, &na), (xb, &nb)]
+            .into_iter()
+            .find(|(x, _)| !runs_once(x))
+        {
+            unknown(
+                out,
+                format!(
+                    "{} declares it inside a branch, loop or error-handling block",
+                    x.1
+                ),
+            );
+            continue;
+        }
+        // Nothing on B uses the table before it is created: T-SQL accepts
+        // no use of a table variable before its DECLARE.
+        let start = usize::from(xb.text_range().start());
+        let drop_at = ub
+            .temp_drops
+            .iter()
+            .find(|(d, p)| p == pb && d.text_range().end() <= xb.text_range().start());
+        let used_before = b
+            .root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| usize::from(t.text_range().end()) <= start)
+            .filter(|t| {
+                !drop_at.is_some_and(|(d, _)| d.text_range().contains_range(t.text_range()))
             })
+            .any(|t| t.text().eq_ignore_ascii_case(&want));
+        if used_before {
+            unknown(
+                out,
+                format!("{nb} uses {want} before line {lb}, where it is created"),
+            );
+            continue;
+        }
+        let (tb, _, j) = creation(xb);
+        let (Some(oa), Some(ob)) = (
+            ta.iter().position(|t| t.kind == K::LParen),
+            (j < tb.len() && tb[j].kind == K::LParen).then_some(j),
+        ) else {
+            unknown(out, "no column list".into());
+            continue;
         };
-        let pg = sqldiff_syntax::Dialect::Postgres;
-        if a.dialect() == pg || b.dialect() == pg {
-            let (sa2, sb2) = with_table();
-            if let Err(e) = ta.case_check(sa2).and_then(|_| tb.case_check(sb2)) {
-                unknown(out, e);
+        let (Ok(ca), Ok(cb)) = (table::close(&ta, oa), table::close(&tb, ob)) else {
+            unknown(out, "unbalanced parentheses".into());
+            continue;
+        };
+        if ta[ca + 1..].iter().any(|t| t.kind != K::Semi) {
+            unknown(out, "options after the column list".into());
+            continue;
+        }
+        let tail: Vec<&str> = tb[cb + 1..].iter().map(|t| t.up.as_str()).collect();
+        if db == sqldiff_syntax::Dialect::Db2i {
+            // Rows kept on commit and on rollback, emptied when run again (V16).
+            const KEEP: [&str; 12] = [
+                "ON", "COMMIT", "PRESERVE", "ROWS", "NOT", "LOGGED", "ON", "ROLLBACK", "PRESERVE",
+                "ROWS", "WITH", "REPLACE",
+            ];
+            if tail != KEEP {
+                unknown(out, format!("{nb} line {lb} does not declare the table ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE, so its rows do not live as a table variable's do"));
+                continue;
+            }
+        } else {
+            if !tail.is_empty() {
+                unknown(out, format!("{nb} line {lb} has options after the column list (ON COMMIT may empty or drop the table)"));
+                continue;
+            }
+            let drop = ub.temp_drops.iter().enumerate().find(|(k, (d, p))| {
+                let ts = ast::tokens(d);
+                !used_drop[*k] && p == pb && ts.len() > 4 && {
+                    let (parts, end) = name_at(&ts, 4);
+                    end == ts.len() && parts == [temp_schema.to_string(), want.clone()]
+                }
+            });
+            let Some((k, _)) = drop else {
+                unknown(out, format!("{nb} line {lb} creates the temporary table without dropping it first, so a second run finds it (and its rows) still there"));
+                continue;
+            };
+            used_drop[k] = true;
+            if crate::classify::rolls_back(&a.root) {
+                unknown(out, format!("{na} rolls back, and a PostgreSQL ROLLBACK empties the temporary table where T-SQL keeps the table variable's rows"));
                 continue;
             }
         }
-        for e in table::compare(&ta, &tb, &na, &nb) {
-            match e {
-                table::Event::Asm(x) => add(&mut asms, asm::make(x)),
-                table::Event::Note(s) => out.normalize(s),
-                table::Event::Unknown(s) => {
-                    decided = false;
-                    unknown(out, s);
-                }
-                table::Event::Diff { rule, witness, at } => {
-                    found = true;
-                    let ids = asms.iter().map(|x| x.id.clone()).collect();
-                    finding(
-                        out,
-                        rule,
-                        ChangeClass::Semantic,
-                        format!("Tables (A line {la}, B line {lb}) differ: {witness}."),
-                        at,
-                        ids,
-                    );
-                }
-                table::Event::Default {
-                    col,
-                    a: ea,
-                    b: eb,
+        out.assume(asm::make(TABLE_VARIABLE));
+        // Both as `CREATE TABLE schema.name (columns)`, named and placed at
+        // the variable and at the temporary table's name.
+        let name_off = (ta[1].off, tb[j - 1].off);
+        let head = |off: usize| {
+            let at = |mut t: ast::Tok| {
+                t.off = off;
+                t
+            };
+            vec![
+                at(synth(K::Word, "CREATE")),
+                at(synth(K::Word, "TABLE")),
+                at(synth(K::Word, temp_schema)),
+                at(synth(K::Dot, ".")),
+                at(synth(K::Word, &want)),
+            ]
+        };
+        let mut ca_toks = head(name_off.0);
+        ca_toks.extend(ta[oa..=ca].iter().cloned());
+        let mut cb_toks = head(name_off.1);
+        cb_toks.extend(tb[ob..=cb].iter().cloned());
+        let pair = TablePair {
+            what: format!("the table variable {var}"),
+            xa,
+            xb,
+            ddl: (ast_text(&ca_toks), ast_text(&cb_toks)),
+            ta: ca_toks,
+            tb: cb_toks,
+        };
+        table_pair(a, b, ua, ub, sa, sb, &pair, out);
+    }
+    for (k, (xb, _)) in ub.table_vars.iter().enumerate() {
+        if !used_b[k] {
+            out.unknown_reasons.push(format!(
+                "{nb} line {}: a temporary table that is not a table variable of {na} is not covered by statement-level equivalence",
+                b.line_of(xb)
+            ));
+        }
+    }
+    for (k, (xb, _)) in ub.temp_drops.iter().enumerate() {
+        if !used_drop[k] {
+            out.unknown_reasons.push(format!(
+                "{nb} line {}: a DDL statement `DROP TABLE IF EXISTS` is not covered by statement-level equivalence",
+                b.line_of(xb)
+            ));
+        }
+    }
+}
+
+/// Whether `x` runs exactly once per run of its routine or script:
+/// no enclosing branch, loop, handler or TRY/CATCH, and no enclosing block
+/// with an EXCEPTION section (a PostgreSQL subtransaction that undoes it
+/// before its handler runs).
+fn runs_once(x: &SyntaxNode) -> bool {
+    use sqldiff_syntax::SyntaxKind as S;
+    for a in x.ancestors().skip(1) {
+        match a.kind() {
+            S::ROUTINE_BODY | S::BATCH | S::SOURCE_FILE | S::ROUTINE => return true,
+            S::BLOCK if a.children().any(|c| c.kind() == S::EXCEPTION_SECTION) => return false,
+            S::IF_STMT
+            | S::LOOP_STMT
+            | S::CASE_STMT
+            | S::BRANCH
+            | S::TRY_CATCH
+            | S::TRY_BLOCK
+            | S::CATCH_BLOCK
+            | S::EXCEPTION_SECTION
+            | S::EXCEPTION_HANDLER
+            | S::HANDLER => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// The table variable assumption the converter states (`ASM-TABLE-VARIABLE`).
+const TABLE_VARIABLE: (&str, &str) = (
+    "ASM-TABLE-VARIABLE",
+    "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows",
+);
+
+/// Two table definitions compared by `table_pair`: the statements, and the
+/// `CREATE TABLE` tokens read from them.
+struct TablePair<'n> {
+    /// How the reasons name side A's statement.
+    what: String,
+    xa: &'n SyntaxNode,
+    xb: &'n SyntaxNode,
+    ta: Vec<ast::Tok>,
+    tb: Vec<ast::Tok>,
+    /// Each side's table as DDL, for the schema CHECK constraints read.
+    ddl: (String, String),
+}
+
+/// Compares two table definitions column by column (`table.rs`), with their
+/// defaults and CHECK constraints compared as expressions.
+#[allow(clippy::too_many_arguments)]
+fn table_pair(
+    a: &Analyzed,
+    b: &Analyzed,
+    ua: &Unit,
+    ub: &Unit,
+    sa: &Schema,
+    sb: &Schema,
+    p: &TablePair,
+    out: &mut Outcome,
+) {
+    use ast::K;
+    let (na, nb) = (side_name(a), side_name(b));
+    let (xa, xb) = (p.xa, p.xb);
+    let (la, lb) = (a.line_of(xa), b.line_of(xb));
+    let what = &p.what;
+    let unknown = |out: &mut Outcome, why: String| {
+        out.unknown_reasons.push(format!(
+            "{na} line {la}: {what} (and {nb} line {lb}) is not compared: {why}"
+        ));
+    };
+    let (ta, tb) = match (
+        table::parse(&p.ta, a.dialect()),
+        table::parse(&p.tb, b.dialect()),
+    ) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) => {
+            unknown(out, format!("{na}: {e}"));
+            return;
+        }
+        (_, Err(e)) => {
+            unknown(out, format!("{nb}: {e}"));
+            return;
+        }
+    };
+    let anchor = |n: &SyntaxNode| {
+        crate::normalize::hash_strs(std::iter::once(n.text().to_string().as_str()))
+    };
+    let mut decided = true;
+    let finding = |out: &mut Outcome,
+                   rule: &str,
+                   class: ChangeClass,
+                   witness: String,
+                   at: (usize, usize),
+                   asms: Vec<String>| {
+        out.findings.push(Finding {
+            fingerprint: fingerprint(&FingerprintInput {
+                object: &a.object,
+                class,
+                rule,
+                anchor_a: &format!("{}:{}", anchor(xa), at.0),
+                anchor_b: &format!("{}:{}", anchor(xb), at.1),
+            }),
+            rule: rule.to_string(),
+            class,
+            severity: class.default_severity(),
+            verdict: Verdict::Different,
+            witness,
+            a: Some(line_at(a, at.0)),
+            b: Some(line_at(b, at.1)),
+            assumptions: asms,
+        });
+    };
+    let mut asms: Vec<Assumption> = Vec::new();
+    let add = |asms: &mut Vec<Assumption>, x: Assumption| {
+        if !asms.iter().any(|y| y.id == x.id) {
+            asms.push(x);
+        }
+    };
+    let mut found = false;
+    let sch = std::cell::OnceCell::new();
+    let with_table = || {
+        sch.get_or_init(|| {
+            (
+                sa.with_ddl(&p.ddl.0, a.dialect()),
+                sb.with_ddl(&p.ddl.1, b.dialect()),
+            )
+        })
+    };
+    let pg = sqldiff_syntax::Dialect::Postgres;
+    if a.dialect() == pg || b.dialect() == pg {
+        let (sa2, sb2) = with_table();
+        if let Err(e) = ta.case_check(sa2).and_then(|_| tb.case_check(sb2)) {
+            unknown(out, e);
+            return;
+        }
+    }
+    for e in table::compare(&ta, &tb, &na, &nb) {
+        match e {
+            table::Event::Asm(x) => add(&mut asms, asm::make(x)),
+            table::Event::Note(s) => out.normalize(s),
+            table::Event::Unknown(s) => {
+                decided = false;
+                unknown(out, s);
+            }
+            table::Event::Diff { rule, witness, at } => {
+                found = true;
+                let ids = asms.iter().map(|x| x.id.clone()).collect();
+                finding(
+                    out,
+                    rule,
+                    ChangeClass::Semantic,
+                    format!("Tables (A line {la}, B line {lb}) differ: {witness}."),
                     at,
-                } => {
-                    let select = |e: &[ast::Tok]| {
-                        let mut v = vec![synth(K::Word, "SELECT")];
-                        v.extend(e.iter().cloned());
-                        v
-                    };
-                    match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
-                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
-                        Same::No(class, rule, w) => {
-                            found = true;
-                            finding(
-                                out,
-                                rule,
-                                class,
-                                format!("Tables (A line {la}, B line {lb}) differ in the default of column {col}: {w}"),
-                                at,
-                                Vec::new(),
-                            );
-                        }
-                        Same::Unknown(w) => {
-                            decided = false;
-                            unknown(
-                                out,
-                                format!("the defaults of column {col} were not shown equal: {w}"),
-                            );
-                        }
+                    ids,
+                );
+            }
+            table::Event::Default {
+                col,
+                a: ea,
+                b: eb,
+                at,
+            } => {
+                let select = |e: &[ast::Tok]| {
+                    let mut v = vec![synth(K::Word, "SELECT")];
+                    v.extend(e.iter().cloned());
+                    v
+                };
+                match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                    Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                    Same::No(class, rule, w) => {
+                        found = true;
+                        finding(
+                            out,
+                            rule,
+                            class,
+                            format!("Tables (A line {la}, B line {lb}) differ in the default of column {col}: {w}"),
+                            at,
+                            Vec::new(),
+                        );
+                    }
+                    Same::Unknown(w) => {
+                        decided = false;
+                        unknown(
+                            out,
+                            format!("the defaults of column {col} were not shown equal: {w}"),
+                        );
                     }
                 }
-                table::Event::Check {
-                    what,
-                    a: ea,
-                    b: eb,
-                    at,
-                } => {
-                    let (sa2, sb2) = with_table();
-                    // A check rejects the rows its predicate makes false:
-                    // those `WHERE NOT (predicate)` selects.
-                    let rejected = |e: &[ast::Tok], name: &[ast::Tok]| {
-                        let mut v = vec![
-                            synth(K::Word, "SELECT"),
-                            synth(K::Num, "1"),
-                            synth(K::Word, "FROM"),
-                        ];
-                        v.extend(name.iter().cloned());
-                        v.push(synth(K::Word, "WHERE"));
-                        v.push(synth(K::Word, "NOT"));
-                        v.push(synth(K::LParen, "("));
-                        v.extend(e.iter().cloned());
-                        v.push(synth(K::RParen, ")"));
-                        v
-                    };
-                    match same_stmt(
-                        &rejected(&ea, &ta.name_toks),
-                        &rejected(&eb, &tb.name_toks),
-                        ua,
-                        ub,
-                        sa2,
-                        sb2,
-                        &na,
-                        &nb,
-                    ) {
-                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
-                        Same::No(class, rule, w) => {
-                            found = true;
-                            finding(
-                                out,
-                                rule,
-                                class,
-                                format!("Tables (A line {la}, B line {lb}) differ in the CHECK constraint `{what}`: {w}"),
-                                at,
-                                Vec::new(),
-                            );
-                        }
-                        Same::Unknown(w) => {
-                            decided = false;
-                            unknown(
-                                out,
-                                format!("the CHECK constraint `{what}` was not shown equal: {w}"),
-                            );
-                        }
+            }
+            table::Event::Check {
+                what,
+                a: ea,
+                b: eb,
+                at,
+            } => {
+                let (sa2, sb2) = with_table();
+                // A check rejects the rows its predicate makes false:
+                // those `WHERE NOT (predicate)` selects.
+                let rejected = |e: &[ast::Tok], name: &[ast::Tok]| {
+                    let mut v = vec![
+                        synth(K::Word, "SELECT"),
+                        synth(K::Num, "1"),
+                        synth(K::Word, "FROM"),
+                    ];
+                    v.extend(name.iter().cloned());
+                    v.push(synth(K::Word, "WHERE"));
+                    v.push(synth(K::Word, "NOT"));
+                    v.push(synth(K::LParen, "("));
+                    v.extend(e.iter().cloned());
+                    v.push(synth(K::RParen, ")"));
+                    v
+                };
+                match same_stmt(
+                    &rejected(&ea, &ta.name_toks),
+                    &rejected(&eb, &tb.name_toks),
+                    ua,
+                    ub,
+                    sa2,
+                    sb2,
+                    &na,
+                    &nb,
+                ) {
+                    Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                    Same::No(class, rule, w) => {
+                        found = true;
+                        finding(
+                            out,
+                            rule,
+                            class,
+                            format!("Tables (A line {la}, B line {lb}) differ in the CHECK constraint `{what}`: {w}"),
+                            at,
+                            Vec::new(),
+                        );
+                    }
+                    Same::Unknown(w) => {
+                        decided = false;
+                        unknown(
+                            out,
+                            format!("the CHECK constraint `{what}` was not shown equal: {w}"),
+                        );
                     }
                 }
             }
         }
-        for x in asms {
-            out.assume(x);
-        }
-        if decided && !found {
-            out.equal += 1;
-            out.structural += 1;
-        }
+    }
+    for x in asms {
+        out.assume(x);
+    }
+    if decided && !found {
+        out.equal += 1;
+        out.structural += 1;
     }
 }
 

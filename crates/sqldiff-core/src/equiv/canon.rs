@@ -402,15 +402,30 @@ impl<'a> Canon<'a> {
 
     /// Key of a table name: the folded name, prefixed with its folded schema
     /// (and database) unless the schema is the default one (none written,
-    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`.
+    /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`; a
+    /// table variable `@t` of routine `routine` converted to one of
+    /// `other_temps` gets that table's key (`classify::table_variable_table`).
     /// Returns the key and, for a default schema, how it was written.
-    pub fn table_name(parts: &[String]) -> (String, Option<String>) {
+    pub fn table_name(
+        parts: &[String],
+        other_temps: &std::collections::HashSet<String>,
+        routine: Option<&str>,
+    ) -> (String, Option<String>) {
         let last = parts.last().map(|s| lc(s)).unwrap_or_default();
+        if parts.len() == 1 && last.starts_with('@') {
+            // From the spelling, as the converter names it: a reference
+            // spelled with other capitals than the DECLARE does not pair.
+            let t = lc(&crate::classify::table_variable_table(routine, &parts[0]));
+            if other_temps.contains(&t) {
+                return (format!("temp:{t}"), None);
+            }
+        }
         let temp = last.starts_with('#')
             || last.starts_with('@')
-            || parts
-                .first()
-                .is_some_and(|p| p.eq_ignore_ascii_case("SESSION") && parts.len() > 1);
+            || parts.first().is_some_and(|p| {
+                (p.eq_ignore_ascii_case("SESSION") || p.eq_ignore_ascii_case("pg_temp"))
+                    && parts.len() > 1
+            });
         if temp {
             return (
                 format!("temp:{}", last.trim_start_matches(['#', '@'])),
@@ -431,7 +446,8 @@ impl<'a> Canon<'a> {
 
     /// `table_name`, remembering the name for the statement's item.
     fn table_key(&mut self, parts: &[String]) -> String {
-        let (key, default) = Self::table_name(parts);
+        let (key, default) =
+            Self::table_name(parts, &self.unit.other_temps, self.unit.routine.as_deref());
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);
