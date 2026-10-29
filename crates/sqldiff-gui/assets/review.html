@@ -311,6 +311,7 @@ function renderHeader() {
   const g = st.gate;
   const gate = g
     ? `<button class="chip gate${g.complete ? " ok" : ""}" id="gatechip" aria-expanded="${S.gateOpen}" title="${g.complete ? "Done" : `Not done: ${g.blockers_total} blocker(s)`}, as the done gate (sqldiff review-status) judges it. Click for why.">${g.complete ? `<span class="dot" style="background:var(--s-converted)"></span>Done` : `<span class="dot" style="background:var(--s-unproven)"></span>Not done · <b>${g.blockers_total}</b>`}</button>`
+    : st.provisional ? `<span class="chip" title="${esc(st.gate_error || "")}">Confirming…</span>`
     : `<span class="chip" title="${esc(st.gate_error || "")}">Done gate not judged</span>`;
   const nOpen = st.items.filter((i) => i.tier <= 5).length;
   $("chips").innerHTML = `<span class="chip" title="Items in tiers 1 to 5, in every lens"><b>${nOpen}</b> open</span>${S.recorded ? `<span class="chip" title="Decisions recorded from this page since it was opened"><b>${S.recorded}</b> recorded now</span>` : ""}<span class="chip" title="Units people accepted in review (accepted, which is not the same as converted)"><span class="dot" style="background:var(--focus)"></span><b>${st.reviewed.length}</b> of ${st.units} accepted in review</span>${gate}`;
@@ -323,7 +324,8 @@ function renderHeader() {
       : `Not done (${kinds}):${blockerList(g)}`}</div>`);
   }
   if (g && S.gateOpen && g.accepted.length) b.push(`<div class="banner gate"><details><summary>Accepted by name: ${g.accepted.length} rule(s)</summary><ul>${g.accepted.map((x) => `<li>${esc(x.state)} ${esc(x.rule)} on ${x.units} unit(s) by ${esc(x.authors.join(", "))}</li>`).join("")}</ul></details></div>`);
-  if (!g && st.gate_error) b.push(`<div class="banner">Done gate not judged: ${esc(st.gate_error)}</div>`);
+  if (st.provisional) b.push(`<div class="banner">Opened from the stored conversion, which is being converted again to confirm it. The done gate and decisions wait for that; this page updates by itself.</div>`);
+  else if (!g && st.gate_error) b.push(`<div class="banner">Done gate not judged: ${esc(st.gate_error)}</div>`);
   if (st.not_applied.length) b.push(`<div class="banner bad"><details><summary>${st.not_applied.length} line(s) of the ledger were not applied</summary><ul>${st.not_applied.map((x) => `<li>${esc(x)}</li>`).join("")}</ul></details></div>`);
   if (st.outdated) b.push(`<div class="banner">${st.outdated} unit(s) have a decision made on other file contents: it no longer applies until someone confirms it again (marked <span class="flag warn">outdated</span>).</div>`);
   if (st.orphaned) b.push(`<div class="banner">${st.orphaned} decision(s) are about units whose text changed; they apply to nothing now.</div>`);
@@ -521,6 +523,16 @@ async function apply(st, advance) {
 }
 
 async function reload() { await apply(await api(`/api/state?${allQ().slice(1)}`), false); }
+// A review opened from a stored conversion: once the fresh one replaces
+// it, the whole state is read again (it may differ).
+async function confirmLater() {
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 1500));
+    let g;
+    try { g = await api("/api/gate"); } catch (e) { toast(e.message, true); return; }
+    if (!g.provisional) { await reload(); toast("Converted again: the review is confirmed"); return; }
+  }
+}
 
 function showNone() {
   S.sel = null; S.view = null;
@@ -797,6 +809,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 renderHeader(); renderQueue();
+if (S.st.provisional) confirmLater();
 if (S.lens === "found" && !S.st.all) reload();
 else if (order().length) open(order()[0]); else showNone();
 </script>
