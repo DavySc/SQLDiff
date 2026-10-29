@@ -150,7 +150,8 @@ pub struct Assumption {
 pub struct DeploymentSource {
     /// `shared_pack`, `private_pack`, `project`, `user` or `command_line`.
     pub layer: String,
-    /// The pack's name, when a pack holds it.
+    /// The pack's name, when a shared pack holds it. A private pack is
+    /// named by its file only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pack: Option<String>,
     /// The `pack.toml` or config file.

@@ -18,6 +18,8 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Subprocess {
     path: PathBuf,
+    /// The name and version (`--version`) plus a hash of the binary, so a
+    /// run fingerprint changes when the checker does.
     name: String,
     next: AtomicU64,
     conn: Mutex<Option<Conn>>,
@@ -36,8 +38,6 @@ impl Drop for Conn {
     }
 }
 
-/// The name and version (`--version`) plus a hash of the binary, so a run
-/// fingerprint changes when the checker does.
 impl std::fmt::Debug for Subprocess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subprocess({})", self.name)

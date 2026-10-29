@@ -356,7 +356,9 @@ impl Resolved {
                     d,
                     sqldiff_core::model::DeploymentSource {
                         layer: kind.label().to_string(),
-                        pack: Some(p.meta.name.clone()),
+                        // A private pack is named by path only: its name
+                        // would reach reports, pages and API answers.
+                        pack: (*kind != LayerKind::PrivatePack).then(|| p.meta.name.clone()),
                         file: Some(p.path.display().to_string()),
                     },
                 );

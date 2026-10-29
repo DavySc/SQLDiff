@@ -62,8 +62,10 @@ fn accepted_assumptions_are_marked_with_their_source_and_the_verdict_stays() {
     // Lowest layer first: the pack, then the project file.
     assert_eq!(rc.by.len(), 2);
     assert_eq!(rc.by[0].layer, "private_pack");
-    assert_eq!(rc.by[0].pack.as_deref(), Some("team"));
-    assert!(rc.by[0].file.as_deref().unwrap().ends_with("pack.toml"));
+    // A private pack is named by its file only.
+    assert_eq!(rc.by[0].pack, None);
+    let pack_file = root.join("pack").join("pack.toml").display().to_string();
+    assert_eq!(rc.by[0].file.as_deref(), Some(pack_file.as_str()));
     assert_eq!(rc.by[1].layer, "project");
     assert_eq!(rc.by[1].pack, None);
     assert!(rc.by[1].file.as_deref().unwrap().ends_with("sqldiff.toml"));
@@ -100,7 +102,9 @@ fn accepted_assumptions_are_marked_with_their_source_and_the_verdict_stays() {
     }
     let text = sqldiff_core::render::text(&r, false);
     assert!(
-        text.contains("accepted by the deployment profile: private pack team ("),
+        text.contains(&format!(
+            "accepted by the deployment profile: private pack {pack_file}; project "
+        )),
         "{text}"
     );
     let json = sqldiff_core::render::json(&r);
@@ -147,5 +151,69 @@ fn unknown_and_undischargeable_ids_are_config_errors() {
     assert!(e.0.contains("unknown fact"), "{e}");
     let e = load(&root, "[deployment]\nobserver = 1\n").unwrap_err();
     assert!(e.0.contains("observer"), "{e}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A private pack's name never reaches a report: `accepted_by` and the
+/// profile name it by its file only. A shared pack keeps its name.
+#[test]
+fn a_private_pack_is_named_by_its_file_only() {
+    const SECRET: &str = "zz-private-pack-name-must-not-leak";
+    let root = dir("private-name");
+    std::fs::write(
+        root.join("pack").join("pack.toml"),
+        format!(
+            "[pack]\nname = \"{SECRET}\"\nversion = \"1.0.0\"\n\n[deployment]\naccept = [\"ASM-OBSERVER-ROWCOUNT\"]\n"
+        ),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("shared")).unwrap();
+    std::fs::write(
+        root.join("shared").join("pack.toml"),
+        "[pack]\nname = \"shared-team\"\nversion = \"1.0.0\"\n\n[deployment]\naccept = [\"ASM-OBSERVER-ROWCOUNT\"]\n",
+    )
+    .unwrap();
+    let cfg = load(&root, "packs = [\"shared\"]\n").unwrap();
+    let private_file = root.join("pack").join("pack.toml").display().to_string();
+    let shared_file = root.join("shared").join("pack.toml").display().to_string();
+
+    let rc = cfg
+        .deployment
+        .accept
+        .iter()
+        .find(|a| a.id == "ASM-OBSERVER-ROWCOUNT")
+        .unwrap();
+    assert_eq!(rc.by.len(), 2);
+    assert_eq!(rc.by[0].layer, "shared_pack");
+    assert_eq!(rc.by[0].pack.as_deref(), Some("shared-team"));
+    assert_eq!(rc.by[0].file.as_deref(), Some(shared_file.as_str()));
+    assert_eq!(rc.by[1].layer, "private_pack");
+    assert_eq!(rc.by[1].pack, None);
+    assert_eq!(rc.by[1].file.as_deref(), Some(private_file.as_str()));
+
+    let a = Artifact::new("a.sql", Dialect::Tsql, COUNTS);
+    let b = Artifact::new("b.sql", Dialect::Postgres, PG);
+    let mut r = diff(&a, &b, &cfg.options());
+    policy::apply(&mut r, &cfg);
+    let x = r
+        .assumptions
+        .iter()
+        .find(|x| x.id == "ASM-OBSERVER-ROWCOUNT")
+        .unwrap();
+    assert_eq!(x.accepted_by, rc.by);
+    let json = sqldiff_core::render::json(&r);
+    assert!(json.contains("\"private_pack\""), "{json}");
+    assert!(json.contains("shared-team"), "{json}");
+    let text = sqldiff_core::render::text(&r, true);
+    assert!(
+        text.contains(&format!(
+            "accepted by the deployment profile: shared pack shared-team ({shared_file}); private pack {private_file}"
+        )),
+        "{text}"
+    );
+    let profile = serde_json::to_string(&cfg.deployment).unwrap();
+    for out in [&json, &text, &profile] {
+        assert!(!out.contains(SECRET), "{out}");
+    }
     let _ = std::fs::remove_dir_all(&root);
 }

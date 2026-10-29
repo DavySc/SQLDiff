@@ -11,9 +11,12 @@ name: Lean checker
 # CLI; Lean 4.19's own linker produced macOS binaries dyld refuses
 # ("__DATA_CONST segment missing SG_READ_ONLY flag"), Lean 4.35 does not.
 
+# Every change to the checker, the request format it reads, the generated
+# Lean syntax types, or the CLI code that runs it builds and tests it, on
+# pull requests and on main.
 on:
   push:
-    branches: [verification]
+    branches: [main, verification]
     paths:
       - "formal/lean/**"
       - ".github/workflows/formal-lean.yml"
@@ -21,6 +24,20 @@ on:
       - "crates/sqldiff-core/src/proof.rs"
       - "crates/sqldiff-syntax/src/kind.rs"
       - "crates/sqldiff-syntax/src/encode.rs"
+      # The CLI side of the protocol (`the_real_checker`).
+      - "crates/sqldiff-cli/src/checker.rs"
+      - "crates/sqldiff-cli/tests/proof.rs"
+  pull_request:
+    paths:
+      - "formal/lean/**"
+      - ".github/workflows/formal-lean.yml"
+      # The request format and the generated Lean syntax types.
+      - "crates/sqldiff-core/src/proof.rs"
+      - "crates/sqldiff-syntax/src/kind.rs"
+      - "crates/sqldiff-syntax/src/encode.rs"
+      # The CLI side of the protocol (`the_real_checker`).
+      - "crates/sqldiff-cli/src/checker.rs"
+      - "crates/sqldiff-cli/tests/proof.rs"
   workflow_dispatch:
 
 jobs:

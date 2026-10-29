@@ -60,7 +60,7 @@ impl Drop for Fixture {
 
 fn source() -> DeploymentSource {
     DeploymentSource {
-        layer: "private_pack".into(),
+        layer: "shared_pack".into(),
         pack: Some("team".into()),
         file: Some("/packs/team/pack.toml".into()),
     }
@@ -150,7 +150,7 @@ fn accepted_assumptions_are_listed_and_statuses_stay() {
     assert!(md.contains("## Deployment profile"), "{md}");
     assert!(
         md.contains("| `ASM-DBO-SCHEMA` |")
-            && md.contains("private pack team (/packs/team/pack.toml)"),
+            && md.contains("shared pack team (/packs/team/pack.toml)"),
         "{md}"
     );
 
@@ -187,4 +187,45 @@ fn an_assumption_not_accepted_keeps_the_tree_outside_accept() {
         "{}",
         tree::summary(&t.report)
     );
+}
+
+/// A private pack loaded from disk: the converted tree's report names it by
+/// its file only, never by its name.
+#[test]
+fn a_private_pack_is_named_by_its_file_only_in_the_tree_report() {
+    const SECRET: &str = "zz-private-pack-name-must-not-leak";
+    let f = Fixture::new("private-name");
+    let pack = f.dir.join("private-pack");
+    std::fs::create_dir_all(&pack).unwrap();
+    std::fs::write(
+        pack.join("pack.toml"),
+        format!(
+            "[pack]\nname = \"{SECRET}\"\nversion = \"1.0.0\"\n\n[deployment]\naccept = [\"ASM-DBO-SCHEMA\"]\n\n[deployment.facts]\ncollation = \"SQL_Latin1_General_CP1_CI_AS\"\n"
+        ),
+    )
+    .unwrap();
+    let cfg = sqldiff_source::Resolved::load(&sqldiff_source::config::Sources {
+        isolated: true,
+        packs: vec![pack.clone()],
+        ..Default::default()
+    })
+    .unwrap();
+    // `pack.toml` is not SQL, so the tree does not read it.
+    let t = f.convert(cfg.deployment.clone());
+    assert!(t.report.unreadable.is_empty());
+    let file = pack.join("pack.toml").display().to_string();
+    let d = t.report.deployment.as_ref().unwrap();
+    let by = &d.accept[0].by;
+    assert_eq!(by.len(), 1);
+    assert_eq!(by[0].layer, "private_pack");
+    assert_eq!(by[0].pack, None);
+    assert_eq!(by[0].file.as_deref(), Some(file.as_str()));
+    assert_eq!(d.facts[0].by, by[0]);
+
+    let json = serde_json::to_string(&t.report).unwrap();
+    let md = tree::markdown(&t.report);
+    assert!(md.contains(&format!("private pack {file}")), "{md}");
+    for out in [&json, &md] {
+        assert!(!out.contains(SECRET), "{out}");
+    }
 }

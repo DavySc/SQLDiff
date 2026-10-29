@@ -115,7 +115,7 @@ assumptions". What changes is the reporting:
 
 - In a diff report each accepted assumption has `accepted_by`: the layer
   (`shared_pack`, `private_pack`, `project`, `user`), the pack's name and
-  the file. The text output adds "accepted by the deployment profile: ...".
+  the file. A private pack is named by its file only, never by its name. The text output adds "accepted by the deployment profile: ...".
 - In a converted tree (`conversion-report.json` and `.md`) each unit lists
   its accepted assumptions in `accepted`, and a `deployment` section lists
   the profile (accepted ids with their sources, the facts) and every
