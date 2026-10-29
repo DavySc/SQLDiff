@@ -1769,6 +1769,18 @@ fn prepare_format(spec: &FormatSpec, isolated: bool) -> Result<(FormatWork, Comm
         true => None,
         false => config::user_config_path().filter(|p| p.is_file()),
     };
+    if let Some(p) = &project {
+        // As on the Settings page: the user config or a private pack is
+        // never read as a folder's config, and nothing of it is quoted.
+        if crate::settings::private_file(p, isolated, &[]) {
+            return Err(format!(
+                "{}: this file is also the user config or a private pack (or the configuration that would tell cannot be loaded), whose contents are not shown; choose another folder",
+                p.display()
+            ));
+        }
+        // An error in the folder's own file is the user's to read.
+        config::ConfigLayer::load(p).map_err(|e| e.0)?;
+    }
     let cfg = Resolved::load_without_search(&Sources {
         project: project.clone(),
         user: user.clone(),
@@ -1777,7 +1789,10 @@ fn prepare_format(spec: &FormatSpec, isolated: bool) -> Result<(FormatWork, Comm
         packs: Vec::new(),
         cli: config::cli_layer(&[], &[], None).map_err(|e| e.0)?,
     })
-    .map_err(|e| e.0)?;
+    // One in another layer may quote a private config.
+    .map_err(|_| {
+        "another configuration layer (user config or a pack) could not be loaded; run `sqldiff config` to see why".to_string()
+    })?;
     let w = FormatWork {
         dir,
         write: spec.write,

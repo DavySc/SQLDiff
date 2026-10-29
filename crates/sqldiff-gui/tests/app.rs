@@ -1572,3 +1572,31 @@ fn a_format_run_holds_its_folder() {
     assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
     assert!(text.contains("another run is writing there"), "{text}");
 }
+
+#[test]
+fn a_format_run_never_reads_a_private_pack_as_the_folders_config() {
+    let d = Dir::new("format-private");
+    let pack = "[pack]\nname = \"zz-private-name\"\nversion = \"1\"\n[format]\nkeyword_case = \"zz-preserve\"\n";
+    d.write("ws/sqldiff.toml", pack);
+    d.write("ws/a.pg.sql", UNFORMATTED);
+    let ws = d.0.join("ws");
+    let mut a = app(None, None);
+    a.packs = vec![ws.join("sqldiff.toml")];
+    let addr = start(a);
+    for write in [false, true] {
+        let body =
+            serde_json::json!({"dir": ws, "write": write, "config": ws.join("sqldiff.toml")});
+        let (status, text) = request(addr, "POST", "/api/runs/format", &body.to_string());
+        assert_eq!(status, "HTTP/1.1 400 Bad Request", "{text}");
+        assert!(!text.contains("zz-"), "{text}");
+    }
+    assert_eq!(get(addr, "/api/runs").1, "[]");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.pg.sql")).unwrap(),
+        UNFORMATTED
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("sqldiff.toml")).unwrap(),
+        pack
+    );
+}

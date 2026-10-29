@@ -292,11 +292,23 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         ("POST", "/api/runs/format") => {
             return match serde_json::from_slice::<FormatSpec>(&req.body)
                 .map_err(|e| e.to_string())
-                .and_then(|spec| app.runs.start_format(spec, app.isolated, |_| {}))
+                .and_then(|spec| {
+                    // A pack given at launch is private too (the runs do
+                    // not know the launch packs).
+                    let own = browse::absolute(Path::new(spec.dir.trim()))
+                        .join(sqldiff_source::config::PROJECT_FILE);
+                    match settings::private_file(&own, app.isolated, &app.packs) {
+                        true => Err(format!(
+                            "{}: this file is also a private pack, whose contents are not shown; choose another folder",
+                            own.display()
+                        )),
+                        false => app.runs.start_format(spec, app.isolated, |_| {}),
+                    }
+                })
             {
                 Ok(run) => json(&run.view()),
                 Err(e) => bad(e),
-            }
+            };
         }
         ("POST", "/api/runs/changes") => {
             return match serde_json::from_slice::<ChangesSpec>(&req.body)
