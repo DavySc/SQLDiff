@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 50 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 18 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 86 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 87 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 182 |
+| | Total | 183 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
