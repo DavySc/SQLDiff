@@ -316,3 +316,48 @@ $$;
         f.witness
     );
 }
+
+#[test]
+fn a_tsql_declaration_inside_a_branch_is_its_initial_assignment() {
+    let tsql = "CREATE PROCEDURE dbo.p @n int
+AS
+BEGIN
+    SET XACT_ABORT ON;
+    IF @n > 0
+    BEGIN
+        DECLARE @x int = @n * 2;
+        UPDATE dbo.t SET v = @x WHERE id = @n;
+    END
+END;
+";
+    let pg = "CREATE OR REPLACE PROCEDURE p(p_n integer)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_x integer;
+BEGIN
+  IF p_n > 0 THEN
+    v_x := p_n * 2;
+    UPDATE t SET v = v_x WHERE id = p_n;
+  END IF;
+END;
+$$;
+";
+    let r = run(tsql, pg, Dialect::Postgres);
+    assert!(not_covered(&r).is_empty(), "{:#?}", r.unknown_reasons);
+    assert!(equiv(&r).is_empty(), "{:#?}", r.findings);
+    // A PostgreSQL block inside the IF declares its variable again each
+    // time it runs: not compared.
+    let pg = pg.replace(
+        "    v_x := p_n * 2;\n",
+        "    DECLARE\n      v_y integer;\n    BEGIN\n      v_y := 1;\n    END;\n    v_x := p_n * 2;\n",
+    );
+    let r = run(tsql, &pg, Dialect::Postgres);
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("a declaration inside an IF or a loop")),
+        "{:#?}",
+        r.unknown_reasons
+    );
+}

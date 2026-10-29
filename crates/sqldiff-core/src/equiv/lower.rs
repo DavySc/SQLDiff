@@ -1044,7 +1044,12 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     }
     if u.depth > 0 {
         let what = match kind {
-            StmtKind::Declare => Some("a declaration"),
+            // A T-SQL variable lives from its DECLARE to the end of the
+            // batch whatever branch it sits in, and a DECLARE in a loop does
+            // not reset it: only the initial value is a statement, an
+            // assignment in its place. PostgreSQL and Db2 for i declare at
+            // the top of a block, which a block inside a loop runs again.
+            StmtKind::Declare if d != Dialect::Tsql => Some("a declaration"),
             StmtKind::Ddl => Some("a DDL statement"),
             StmtKind::TxnBegin | StmtKind::TxnCommit | StmtKind::TxnSetting => {
                 Some("transaction control")
