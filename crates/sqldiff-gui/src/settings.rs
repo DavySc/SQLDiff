@@ -52,6 +52,9 @@ pub struct Ctx<'a> {
     pub isolated: bool,
     /// This launch's token.
     pub token: &'a str,
+    /// The packs given at launch (`--pack`), private like configured
+    /// `private_packs`.
+    pub packs: &'a [PathBuf],
 }
 
 /// A new token: 128 random bits from the operating system.
@@ -66,7 +69,7 @@ pub(crate) fn route(req: &Request, ctx: &Ctx) -> Option<Response> {
     Some(match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/api/settings") => {
             let dir = crate::server::param(&req.query, "dir").unwrap_or_default();
-            match load(&dir, ctx.isolated).map(|w| w.view()) {
+            match load(&dir, ctx).map(|w| w.view()) {
                 Ok(v) => json(&v),
                 Err(e) => bad(e),
             }
@@ -153,7 +156,7 @@ fn preview(p: Preview, ctx: &Ctx) -> Result<Value, (&'static str, String)> {
             format!("the preview formats up to {} KiB", MAX_PREVIEW >> 10),
         ));
     }
-    let w = load(&p.dir, ctx.isolated).map_err(|e| (BAD, e))?;
+    let w = load(&p.dir, ctx).map_err(|e| (BAD, e))?;
     let layers = w.layers_with(&p.draft);
     // What `sqldiff fmt` does: the merged `[format]`, then the dialect's options.
     let options = merge_format(&layers).options(dialect);
@@ -172,7 +175,7 @@ fn preview(p: Preview, ctx: &Ctx) -> Result<Value, (&'static str, String)> {
 }
 
 fn save(s: Save, ctx: &Ctx) -> Result<Value, (&'static str, String)> {
-    let w = load(&s.dir, ctx.isolated).map_err(|e| (BAD, e))?;
+    let w = load(&s.dir, ctx).map_err(|e| (BAD, e))?;
     w.writable().map_err(|e| ("403 Forbidden", e))?;
     let text = match std::fs::read_to_string(&w.file) {
         Ok(t) => Some(t),
@@ -194,7 +197,7 @@ fn save(s: Save, ctx: &Ctx) -> Result<Value, (&'static str, String)> {
     if text.as_deref() != Some(new.as_str()) {
         write_beside(&w.file, &new).map_err(|e| ("500 Internal Server Error", e))?;
     }
-    let w = load(&s.dir, ctx.isolated).map_err(|e| (BAD, e))?;
+    let w = load(&s.dir, ctx).map_err(|e| (BAD, e))?;
     Ok(w.view())
 }
 
@@ -251,11 +254,12 @@ fn workspace_file(dir: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn load(dir: &str, isolated: bool) -> Result<Workspace, String> {
+fn load(dir: &str, ctx: &Ctx) -> Result<Workspace, String> {
+    let isolated = ctx.isolated;
     let file = workspace_file(dir)?;
     // A `sqldiff.toml` that is also the user config or a private pack would
     // otherwise be read, shown and quoted in errors as the workspace file.
-    if is_private_file(&file, isolated) {
+    if is_private_file(&file, ctx) {
         return Err(format!(
             "{}: this file is also the user config or a private pack (or the configuration that would tell cannot be loaded), whose contents are not shown; choose another folder",
             file.display()
@@ -293,23 +297,28 @@ fn load(dir: &str, isolated: bool) -> Result<Workspace, String> {
     })
 }
 
-/// `file` is the user config or a private pack the app would load.
-fn is_private_file(file: &Path, isolated: bool) -> bool {
+/// `file` is the user config or a private pack the app would load,
+/// including the packs given at launch.
+fn is_private_file(file: &Path, ctx: &Ctx) -> bool {
     let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| browse::absolute(p));
     let me = canon(file);
     if config::user_config_path().is_some_and(|p| canon(&p) == me) {
         return true;
     }
-    // The packs the other layers load, without any workspace file.
+    if ctx.packs.iter().any(|p| canon(p) == me) {
+        return true;
+    }
+    // The packs the other layers and the launch load, without any workspace
+    // file; a launch pack named by its folder is matched by the file loaded.
     let Ok(cli) = config::cli_layer(&[], &[], None) else {
         return true;
     };
     let others = Resolved::load_without_search(&Sources {
         project: None,
         user: None,
-        isolated,
+        isolated: ctx.isolated,
         cwd: file.parent().map(Path::to_path_buf),
-        packs: Vec::new(),
+        packs: ctx.packs.to_vec(),
         cli,
     });
     match others {

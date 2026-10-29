@@ -294,6 +294,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
     let ctx = settings::Ctx {
         isolated: app.isolated,
         token: &app.token,
+        packs: &app.packs,
     };
     if let Some(res) = settings::route(&req, &ctx) {
         return res;
