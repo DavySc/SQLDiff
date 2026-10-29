@@ -4478,6 +4478,19 @@ impl<'a> Cx<'a> {
 
     // ----- expressions ----------------------------------------------------------
 
+    /// `dbo.` (or `[dbo].`) at `i`, followed by a dot: dropped. Returns the
+    /// index after the dot.
+    fn drop_dbo(&mut self, ts: &[T], i: usize) -> usize {
+        let dot = next_sig(ts, i).unwrap_or(i);
+        let text = self.pick(
+            "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+            "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
+        ).to_string();
+        self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+        self.step_ts("tsql.expr.dbo-schema", &ts[i..=dot]);
+        dot + 1
+    }
+
     fn is_varbinary_var(&self, v: &str) -> bool {
         self.vars
             .get(&v.trim_start_matches('@').to_ascii_lowercase())
@@ -4663,6 +4676,13 @@ impl<'a> Cx<'a> {
                 let r = self.var_ref(t);
                 o.push_str(&r)
             }
+            // `[dbo].x` names the same schema as `dbo.x`.
+            QUOTED_IDENT
+                if tsql_unquote(&t.s).eq_ignore_ascii_case("dbo")
+                    && next_sig(ts, i).is_some_and(|d| ts[d].k == DOT) =>
+            {
+                return self.drop_dbo(ts, i);
+            }
             QUOTED_IDENT => {
                 let q = quoted(&t.s);
                 if q != t.s {
@@ -4742,13 +4762,7 @@ impl<'a> Cx<'a> {
                 let up = t.up();
                 let nx = next_sig(ts, i);
                 if up == "DBO" && nx.is_some_and(|d| ts[d].k == DOT) {
-                    let text = self.pick(
-                        "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
-                        "The dbo schema is dropped: objects are assumed to be found through the default schema (CURRENT SCHEMA, or the library list with system naming).",
-                    ).to_string();
-                    self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
-                    self.step_ts("tsql.expr.dbo-schema", &ts[i..=nx.unwrap()]);
-                    return nx.unwrap() + 1;
+                    return self.drop_dbo(ts, i);
                 }
                 if up == "NEXT" && !self.db2() {
                     if let Some((text, end)) = self.next_value(ts, i) {
