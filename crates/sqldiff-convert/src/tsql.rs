@@ -5073,7 +5073,7 @@ impl<'a> Cx<'a> {
     fn date_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
         use sqldiff_core::equiv::literal::{iso_tsql, Target};
         if !self.db2() {
-            return None;
+            return self.end_of_time_store(dt, ts);
         }
         let target = match dt {
             Dt::Date => Target::Date,
@@ -5101,6 +5101,35 @@ impl<'a> Cx<'a> {
         self.note(Status::Assumptions, "ASM-FACT-V33", "A date or timestamp literal is written in the ISO form ('yyyy-mm-dd', 'yyyy-mm-dd hh:mm:ss.n'), which Db2 for i reads as that value when it is assigned, as it does in a CAST (fact V33, not checked on a real system). T-SQL's compact 'yyyymmdd' is not a Db2 for i date or timestamp string.");
         self.step_ts("tsql.expr.datetime-literal", &ts[i..=i]);
         Some(format!("'{text}'"))
+    }
+
+    /// T-SQL's end of time '9999-12-31 23:59:59.9999999' (any spelling)
+    /// assigned to a datetime2(7) variable, for PostgreSQL: its timestamp
+    /// keeps 6 digits and would round it to 10000-01-01 00:00:00, so it is
+    /// written '9999-12-31 23:59:59.999999' under `ASM-END-OF-TIME` (Davy,
+    /// 2026-10-29: 6 digits under an assumption). Any other 7-digit literal
+    /// stays as written.
+    fn end_of_time_store(&mut self, dt: Dt, ts: &[T]) -> Option<String> {
+        use sqldiff_core::equiv::literal::{iso_tsql, Target};
+        if dt != Dt::DateTime2(7) {
+            return None;
+        }
+        let [i] = sig(ts)[..] else {
+            return None;
+        };
+        let t = &ts[i];
+        if t.k != STRING {
+            return None;
+        }
+        let lit = t.s.strip_prefix(['N', 'n']).unwrap_or(&t.s);
+        let body = lit.strip_prefix('\'').and_then(|x| x.strip_suffix('\''))?;
+        let (text, _) = iso_tsql(body, Target::Timestamp { digits: 7 })?;
+        if text != "9999-12-31 23:59:59.9999999" {
+            return None;
+        }
+        self.note(Status::Assumptions, "ASM-END-OF-TIME", "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written '9999-12-31 23:59:59.999999': PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00. Equal only if the value is just an open-end sentinel, compared with values converted the same way (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit rather than rounding it.");
+        self.step_ts("tsql.expr.end-of-time-literal", &ts[i..=i]);
+        Some("'9999-12-31 23:59:59.999999'".into())
     }
 
     fn ci_note(&mut self) {
