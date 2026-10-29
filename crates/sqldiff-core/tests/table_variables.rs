@@ -298,3 +298,27 @@ fn temp_table_columns_have_their_declared_types() {
         reasons(&r)
     );
 }
+
+#[test]
+fn a_local_table_created_twice_stays_untyped_and_if_not_exists_is_read() {
+    let a = "CREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  CREATE TABLE #t (Name nvarchar(100), Flag bit);\n  INSERT INTO #t (Name, Flag) VALUES (N'a', 1);\n  SELECT @n = COUNT(*) FROM #t WHERE Flag = 1;\nEND\n";
+    // `IF NOT EXISTS`: the bare name is still the temporary table, typed.
+    let b = "CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  CREATE TEMP TABLE IF NOT EXISTS t (\n    Name varchar(100),\n    Flag boolean\n  );\n  INSERT INTO t (Name, Flag) VALUES ('a', TRUE);\n  SELECT COUNT(*) INTO p_n FROM t WHERE Flag = 1;\nEND;\n$$;\n";
+    let r = run(a, b, P);
+    assert!(
+        r.findings.iter().any(|f| f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    // Created twice with other columns: no one type holds for every
+    // statement, so none is used (the later CREATE does not type the
+    // statements before it).
+    let b = "CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  CREATE TEMP TABLE t (\n    Name varchar(100),\n    Flag integer\n  );\n  INSERT INTO t (Name, Flag) VALUES ('a', 1);\n  SELECT COUNT(*) INTO p_n FROM t WHERE Flag = 1;\n  DROP TABLE t;\n  CREATE TEMP TABLE t (\n    Name varchar(100),\n    Flag boolean\n  );\nEND;\n$$;\n";
+    let r = run(a, b, P);
+    assert!(
+        !r.findings.iter().any(|f| f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    assert_ne!(r.verdict(), Verdict::Equal, "{}", reasons(&r));
+}

@@ -1437,8 +1437,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         u.local_tables.push(c.clone());
         if d == Dialect::Postgres {
             let ts = tokens(c);
-            // `CREATE TEMP TABLE name (` with a one-part name.
-            if let [_, _, _, n, next, ..] = ts.as_slice() {
+            // `CREATE TEMP TABLE [IF NOT EXISTS] name (` with a one-part name.
+            let at = if ts.get(3).is_some_and(|t| t.up == "IF") {
+                6
+            } else {
+                3
+            };
+            if let [n, next, ..] = ts.get(at..).unwrap_or_default() {
                 if n.kind == K::Word && next.kind != K::Dot {
                     u.local_temps.insert(n.text.to_lowercase());
                 }
