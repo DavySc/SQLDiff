@@ -1207,6 +1207,26 @@ impl<'a> Binder<'a> {
             for (_, i) in an.targets.clone() {
                 reveal(an, i, r);
             }
+            // PostgreSQL 18: `old` and `new` name the row before and after the
+            // change in RETURNING (a trigger function's NEW and OLD are its own).
+            let pg_trigger = self.trigger.as_ref().is_some_and(|tr| tr.pg_function);
+            if d == Dialect::Postgres && !pg_trigger {
+                let g = shape(t).group[r];
+                let ti = an
+                    .targets
+                    .iter()
+                    .find(|(tg, _)| *tg == g)
+                    .or(an.targets.first())
+                    .map(|(_, i)| *i);
+                if let Some(s) = ti.and_then(|i| an.sources.get(i)) {
+                    let (cols, auth) = (s.columns.clone(), s.authoritative);
+                    for img in ["new", "old"] {
+                        if !an.sources.iter().any(|x| x.alias.as_deref() == Some(img)) {
+                            add(an, img, cols.clone(), auth);
+                        }
+                    }
+                }
+            }
         }
         if d == Dialect::Postgres {
             if let Some(c) = t.iter().position(|x| x.is_kw("CONFLICT")) {

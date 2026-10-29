@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use sqldiff_syntax::Dialect;
 
 use super::ast::{
-    Call, ConflictAction, Expr, From, InsertSource, MergeAction, OrderItem, SelItem, Select, Stmt,
+    Call, ConflictAction, Expr, From, InsertSource, MergeAction, OrderItem, Output, SelItem,
+    Select, Stmt,
 };
 use super::literal::{self, Target};
 use super::lower::{Unit, UnitKind};
@@ -109,6 +110,14 @@ pub mod asm {
     pub const VALUES_ORDER: (&str, &str) = (
         "ASM-VALUES-ROW-ORDER",
         "A multi-row VALUES list gets the values the table generates (identity, sequence defaults) in the order its rows are written on both sides",
+    );
+    pub const OUTPUT_INTO_TARGET: (&str, &str) = (
+        "ASM-OUTPUT-INTO-TARGET",
+        "The table OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key: SQL Server rejects the statement otherwise (Msg 331, 332, 333), where the PostgreSQL insert runs",
+    );
+    pub const OUTPUT_ROW_ORDER: (&str, &str) = (
+        "ASM-OUTPUT-ROW-ORDER",
+        "The rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order",
     );
     pub const NO_CALLER_TXN: (&str, &str) = (
         "ASM-NO-CALLER-TXN",
@@ -231,6 +240,8 @@ pub struct Canon<'a> {
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
     /// bit read through a derived table still meets numbers as a bit.
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
+    /// The rows the statement being lowered returns (see `output_stmt`).
+    output: Option<Output>,
 }
 
 /// Lower-case hex digits of a byte string written in hex, `None` unless
@@ -373,6 +384,7 @@ impl<'a> Canon<'a> {
             by_name: false,
             fold_quoted: false,
             names: Vec::new(),
+            output: None,
         }
     }
 
@@ -384,6 +396,7 @@ impl<'a> Canon<'a> {
         self.seen_tables.clear();
         self.excluded = None;
         self.names.clear();
+        self.output = None;
     }
 
     fn assume(&mut self, x: (&str, &str)) {
@@ -2738,7 +2751,137 @@ impl<'a> Canon<'a> {
         self.stmt_unfolded(s)
     }
 
+    /// Lowers a statement that returns the rows it changed (T-SQL OUTPUT,
+    /// PostgreSQL RETURNING; see `ast::Output`).
+    pub fn output_stmt(&mut self, s: &Stmt, o: &Output) -> R<Term> {
+        self.output = Some(o.clone());
+        let t = self.stmt(s);
+        self.output = None;
+        t
+    }
+
+    /// `(output-into DML TABLE (set (kv COL VALUE)...))`: the data change
+    /// `DML` and the rows it writes to `TABLE`, one per changed row, with
+    /// VALUE read from the row before (`old`) or after (`new`) the change.
+    /// T-SQL names the images `deleted` and `inserted`; PostgreSQL 18 names
+    /// them `old` and `new`, and a bare or table-qualified column means the
+    /// row after an INSERT or UPDATE and the row before a DELETE (checked
+    /// on PostgreSQL 18). Only images, variables and constants are taken:
+    /// no FROM list, subqueries or `*`. Rows returned to the caller (no
+    /// INTO) are not compared.
+    fn output_unfolded(&mut self, s: &Stmt, o: &Output) -> R<Term> {
+        self.output = None;
+        let (kind, target, alias) = match s {
+            Stmt::Insert {
+                target,
+                returning,
+                on_conflict: None,
+                ..
+            } if returning.is_empty() => ("insert", target, None),
+            Stmt::Update {
+                target,
+                alias,
+                from,
+                ..
+            } if from.is_empty() => ("update", target, alias.as_ref()),
+            Stmt::Delete {
+                target,
+                alias,
+                from,
+                ..
+            } if from.is_empty() => ("delete", target, alias.as_ref()),
+            _ => return Err("OUTPUT or RETURNING of this statement is not compared".into()),
+        };
+        let Some((into, cols)) = &o.into else {
+            return Err(
+                "rows returned to the caller by OUTPUT or RETURNING are not compared".into(),
+            );
+        };
+        if cols.is_empty() {
+            return Err("OUTPUT … INTO without a column list".into());
+        }
+        if cols.len() != o.items.len() {
+            return Err("OUTPUT … INTO column count does not match its items".into());
+        }
+        let dml = self.stmt_unfolded(s)?;
+        let table = self.table_key(target);
+        let Some(t) = self.schema.table(Self::base_table(&table)).cloned() else {
+            return Err(format!("the columns of {table} are not known"));
+        };
+        let cur = if kind == "delete" {
+            OLD_IMAGE
+        } else {
+            NEW_IMAGE
+        };
+        // What qualifies the changed row in PostgreSQL: the alias, else the
+        // table's name.
+        let qual = alias.or(target.last()).map(|x| lc(x)).unwrap_or_default();
+        let image = |x: &str| -> R<&'static str> {
+            match (self.d, x) {
+                (Dialect::Tsql, "inserted") if kind != "delete" => Ok(NEW_IMAGE),
+                (Dialect::Tsql, "deleted") if kind != "insert" => Ok(OLD_IMAGE),
+                (Dialect::Postgres, "new") if kind != "delete" => Ok(NEW_IMAGE),
+                (Dialect::Postgres, "old") if kind != "insert" => Ok(OLD_IMAGE),
+                (Dialect::Postgres, q) if q == qual => Ok(cur),
+                _ => Err(format!(
+                    "OUTPUT or RETURNING names `{x}`, which is not a row image of this statement"
+                )),
+            }
+        };
+        let mut items = Vec::new();
+        for it in &o.items {
+            items.push(output_item(&it.expr, self.d, &t, cur, &image)?);
+        }
+        let bind = |img: &str| Binding {
+            key: img.to_string(),
+            table: table.clone(),
+            derived: Some(
+                t.columns
+                    .iter()
+                    .map(|c| {
+                        let side = if img == NEW_IMAGE { "new" } else { "old" };
+                        (
+                            c.name.clone(),
+                            n("image", vec![a(side), a(table.clone()), a(c.name.clone())]),
+                            Some(c.ty),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        self.scopes.push(vec![bind(NEW_IMAGE), bind(OLD_IMAGE)]);
+        let vals: R<Vec<(Term, Option<Ty>)>> = items.iter().map(|e| self.expr(e)).collect();
+        self.scopes.pop();
+        let vals = vals?;
+        if vals.iter().any(|(v, _)| has_head(v, "col")) {
+            return Err("OUTPUT or RETURNING reads a column outside the changed row".into());
+        }
+        let out = self.table_key(into);
+        let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
+        let mut kv = Vec::new();
+        for (c, v) in cols.iter().zip(vals) {
+            self.written(&out, c)?;
+            let (v, _) = self.conv_col(&out, c, v);
+            kv.push(n("kv", vec![a(c.clone()), v]));
+        }
+        kv.sort();
+        if self.d == Dialect::Tsql {
+            self.assume(asm::OUTPUT_INTO_TARGET);
+        }
+        let all_listed = self
+            .schema
+            .table(Self::base_table(&out))
+            .is_some_and(|t| t.columns.iter().all(|c| cols.contains(&c.name)));
+        if !all_listed {
+            self.assume(asm::OUTPUT_ROW_ORDER);
+        }
+        Ok(n("output-into", vec![dml, a(out), n("set", kv)]))
+    }
+
     fn stmt_unfolded(&mut self, s: &Stmt) -> R<Term> {
+        if let Some(o) = self.output.clone() {
+            return self.output_unfolded(s, &o);
+        }
         self.seen_tables.clear();
         self.single_row = false;
         match s {
@@ -4560,4 +4703,73 @@ fn empty_query(q: &Select) -> Option<Vec<String>> {
         }] if plain && is_false && hints.is_empty() => Some(name.clone()),
         _ => None,
     }
+}
+
+/// Scope keys of the row images an OUTPUT or RETURNING item reads; no
+/// name a statement can spell.
+const NEW_IMAGE: &str = "\u{1}new";
+const OLD_IMAGE: &str = "\u{1}old";
+
+/// An OUTPUT / RETURNING item with every column it names rewritten to
+/// `image.column` (`NEW_IMAGE` or `OLD_IMAGE`). `image` maps a qualifier
+/// to its image; an unqualified name is a column of the changed row (`cur`)
+/// in PostgreSQL when the table has it, and otherwise left for `resolve`
+/// (a PL/pgSQL variable). Subqueries, `*` and window functions are refused.
+fn output_item(
+    e: &Expr,
+    d: Dialect,
+    t: &super::schema::Table,
+    cur: &str,
+    image: &dyn Fn(&str) -> R<&'static str>,
+) -> R<Expr> {
+    let go = |x: &Expr| output_item(x, d, t, cur, image);
+    let bx = |x: &Expr| go(x).map(Box::new);
+    Ok(match e {
+        Expr::Name(p) if p.len() == 1 => {
+            if d == Dialect::Tsql {
+                return Err("an unqualified column in OUTPUT (name inserted. or deleted.)".into());
+            }
+            if t.column(&p[0]).is_some() {
+                Expr::Name(vec![cur.to_string(), p[0].clone()])
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Name(p) => {
+            let (col, qual) = p.split_last().expect("a qualified name");
+            let q = qual.last().map(|x| lc(x)).unwrap_or_default();
+            if qual.len() > 1 && d == Dialect::Tsql {
+                return Err("a schema-qualified column in OUTPUT".into());
+            }
+            if qual.len() > 1 && !matches!(image(&q), Ok(i) if i == cur) {
+                return Err(format!("`{}` in RETURNING", p.join(".")));
+            }
+            Expr::Name(vec![image(&q)?.to_string(), col.clone()])
+        }
+        Expr::Var(_) | Expr::Num(_) | Expr::Str(_) | Expr::Null | Expr::Special(_) => e.clone(),
+        Expr::Call(c) if !c.over && c.order.is_empty() && !c.distinct => {
+            let mut c2 = (**c).clone();
+            c2.args = c.args.iter().map(go).collect::<R<_>>()?;
+            Expr::Call(Box::new(c2))
+        }
+        Expr::Bin(op, x, y) => Expr::Bin(op.clone(), bx(x)?, bx(y)?),
+        Expr::Unary(op, x) => Expr::Unary(op.clone(), bx(x)?),
+        Expr::IsNull(x, b) => Expr::IsNull(bx(x)?, *b),
+        Expr::Cast(x, ty) => Expr::Cast(bx(x)?, ty.clone()),
+        Expr::Case(op, whens, els) => Expr::Case(
+            op.as_deref().map(bx).transpose()?,
+            whens
+                .iter()
+                .map(|(w, v)| Ok((go(w)?, go(v)?)))
+                .collect::<R<_>>()?,
+            els.as_deref().map(bx).transpose()?,
+        ),
+        Expr::Extract(f, x) => Expr::Extract(f.clone(), bx(x)?),
+        _ => return Err("an OUTPUT or RETURNING item other than columns of the changed row, variables, constants and functions of them".into()),
+    })
+}
+
+/// Whether `t` holds a node with head `h`.
+fn has_head(t: &Term, h: &str) -> bool {
+    t.is(h) || t.kids().iter().any(|k| has_head(k, h))
 }
