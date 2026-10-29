@@ -154,13 +154,32 @@ fn line(side: &Analyzed, nodes: &[SyntaxNode]) -> usize {
 
 pub use trigger::functions as trigger_functions;
 
+/// A piece of side B that a conversion wrote from a piece of side A: their
+/// byte spans. A conversion records one per unit; units nest (a routine's
+/// header unit spans its statements' units), and one input statement can
+/// give several units (a declaration moved to the top of its block and the
+/// assignment left in its place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub a: (usize, usize),
+    pub b: (usize, usize),
+}
+
 /// Cross-dialect comparison of two artifacts. Scripts are compared segment
 /// by segment (`script.rs`): a T-SQL batch against the block it became.
-pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome {
+/// With `anchors` (a conversion's trace), statements are paired only where
+/// the anchors link them (`pair_items`).
+pub fn compare(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    anchors: &[Anchor],
+) -> Outcome {
     let mut out = Outcome::default();
     if let Some(pairs) = trigger::pairs(a, b, sa, sb, &mut out) {
         for (ua, ub, sa, sb) in &pairs {
-            compare_units(a, b, ua, ub, sa, sb, &mut out);
+            compare_units(a, b, ua, ub, sa, sb, anchors, &mut out);
         }
         return out;
     }
@@ -168,11 +187,12 @@ pub fn compare(a: &Analyzed, b: &Analyzed, sa: &Schema, sb: &Schema) -> Outcome 
         script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
-        compare_units(a, b, &ua, &ub, sa, sb, &mut out);
+        compare_units(a, b, &ua, &ub, sa, sb, anchors, &mut out);
     }
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compare_units(
     a: &Analyzed,
     b: &Analyzed,
@@ -180,6 +200,7 @@ fn compare_units(
     ub: &Unit,
     sa: &Schema,
     sb: &Schema,
+    anchors: &[Anchor],
     out: &mut Outcome,
 ) {
     let (na, nb) = (side_name(a), side_name(b));
@@ -252,7 +273,7 @@ fn compare_units(
         certain: ia.len() == 1 && ib.len() == 1 && !ua.txn_control && !ub.txn_control,
     });
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
-    pair_items(a, b, &ia, &ib, &gaps, wit.as_ref(), out);
+    pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
 }
 
@@ -1602,6 +1623,8 @@ fn other_terms(items: &[Item], k: usize) -> Vec<&Term> {
 /// statement's place.
 struct Gap {
     before: usize,
+    /// Byte offset where it starts.
+    start: usize,
     line: usize,
     what: String,
 }
@@ -1642,6 +1665,7 @@ fn gaps(side: &Analyzed, u: &Unit, items: &[Item]) -> Vec<Gap> {
             s,
             Gap {
                 before: starts.iter().filter(|&&x| x < s).count(),
+                start: s,
                 line: side.line_of(node),
                 what: what.clone(),
             },
@@ -1712,6 +1736,12 @@ fn align(a: &[Slot], b: &[Slot]) -> Alignment {
             ..Alignment::default()
         };
     }
+    align_certain(a, b)
+}
+
+/// The alignment search of `align`: only what every best alignment agrees
+/// on.
+fn align_certain(a: &[Slot], b: &[Slot]) -> Alignment {
     let (n, m) = (a.len(), b.len());
     if n.saturating_mul(m) > ALIGN_CELLS {
         return Alignment::default();
@@ -1805,14 +1835,177 @@ struct Alignment {
     beside: Vec<Beside>,
     /// Statements best alignments place differently: (side A, index).
     ambiguous: Vec<(bool, usize)>,
+    /// Statements whose traced counterpart is out of order: (side A, index).
+    moved: Vec<(bool, usize)>,
 }
 
+fn start(it: &Item) -> usize {
+    it.nodes
+        .iter()
+        .map(|n| cst::sig_range(n).0)
+        .min()
+        .unwrap_or(0)
+}
+
+/// The anchors a position of a side sits in most closely: of the anchors
+/// whose span on that side holds it, those with the shortest span (several
+/// when one input statement gave several pieces of output).
+fn innermost(anchors: &[Anchor], side_a: bool, at: usize) -> Vec<usize> {
+    let span = |x: &Anchor| if side_a { x.a } else { x.b };
+    let holding: Vec<usize> = (0..anchors.len())
+        .filter(|&k| {
+            let (s, e) = span(&anchors[k]);
+            s <= at && at < e
+        })
+        .collect();
+    let Some(len) = holding
+        .iter()
+        .map(|&k| span(&anchors[k]).1 - span(&anchors[k]).0)
+        .min()
+    else {
+        return Vec::new();
+    };
+    holding
+        .into_iter()
+        .filter(|&k| span(&anchors[k]).1 - span(&anchors[k]).0 == len)
+        .collect()
+}
+
+/// Pairs statements through a conversion's trace: two statements can pair
+/// only when they sit in the same anchor (the input statement and the
+/// output written from it). Statements linked through shared anchors form a
+/// group; a group of one statement per side is a pair, a larger group is
+/// aligned on its own (only what every best alignment agrees on). A
+/// statement in no anchor, or alone in its group, has no counterpart. Pairs
+/// must keep the order of both sides: pairs that cross another pair are
+/// dropped, since comparing statements one by one says nothing about a
+/// changed order.
+fn traced(
+    ia: &[Item],
+    ib: &[Item],
+    ka: &[String],
+    kb: &[String],
+    gaps: &[Vec<Gap>; 2],
+    anchors: &[Anchor],
+) -> Alignment {
+    let (n, m) = (ia.len(), ib.len());
+    let at_a: Vec<Vec<usize>> = ia
+        .iter()
+        .map(|x| innermost(anchors, true, start(x)))
+        .collect();
+    let at_b: Vec<Vec<usize>> = ib
+        .iter()
+        .map(|x| innermost(anchors, false, start(x)))
+        .collect();
+    // Union-find over A items, B items and anchors.
+    let mut up: Vec<usize> = (0..n + m + anchors.len()).collect();
+    fn root(up: &mut [usize], mut x: usize) -> usize {
+        while up[x] != x {
+            up[x] = up[up[x]];
+            x = up[x];
+        }
+        x
+    }
+    for (base, at) in [(0, &at_a), (n, &at_b)] {
+        for (i, ks) in at.iter().enumerate() {
+            for &k in ks {
+                let (x, y) = (root(&mut up, base + i), root(&mut up, n + m + k));
+                up[x] = y;
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+    for (base, at) in [(0, &at_a), (n, &at_b)] {
+        for (i, ks) in at.iter().enumerate() {
+            if !ks.is_empty() {
+                let g = groups.entry(root(&mut up, base + i)).or_default();
+                if base == 0 { &mut g.0 } else { &mut g.1 }.push(i);
+            }
+        }
+    }
+    let mut out = Alignment::default();
+    for (ga, gb) in groups.values() {
+        match (ga.as_slice(), gb.as_slice()) {
+            ([], _) | (_, []) => {}
+            (&[i], &[j]) => out.pairs.push((i, j)),
+            _ => {
+                let sa: Vec<Slot> = ga
+                    .iter()
+                    .map(|&i| Slot::Item(i, &ka[i], ia[i].err.is_some()))
+                    .collect();
+                let sb: Vec<Slot> = gb
+                    .iter()
+                    .map(|&j| Slot::Item(j, &kb[j], ib[j].err.is_some()))
+                    .collect();
+                let g = align_certain(&sa, &sb);
+                out.pairs.extend(g.pairs);
+                out.ambiguous.extend(g.ambiguous);
+            }
+        }
+    }
+    // Pairs out of order with another pair are not kept.
+    let crossing: Vec<bool> = out
+        .pairs
+        .iter()
+        .map(|&(i, j)| {
+            out.pairs
+                .iter()
+                .any(|&(x, y)| (x < i && y > j) || (x > i && y < j))
+        })
+        .collect();
+    let mut kept = Vec::new();
+    for (p, c) in out.pairs.iter().zip(crossing) {
+        if c {
+            out.moved.push((true, p.0));
+            out.moved.push((false, p.1));
+        } else {
+            kept.push(*p);
+        }
+    }
+    kept.sort_unstable();
+    out.pairs = kept;
+    // A statement left unpaired whose anchor holds a gap of the other side:
+    // its counterpart is in that gap.
+    for (is_a, at) in [(true, &at_a), (false, &at_b)] {
+        let other = if is_a { &gaps[1] } else { &gaps[0] };
+        for (i, ks) in at.iter().enumerate() {
+            if ks.is_empty()
+                || out
+                    .pairs
+                    .iter()
+                    .any(|p| if is_a { p.0 == i } else { p.1 == i })
+                || out.moved.contains(&(is_a, i))
+            {
+                continue;
+            }
+            let near: Vec<usize> = (0..other.len())
+                .filter(|&g| {
+                    innermost(anchors, !is_a, other[g].start)
+                        .iter()
+                        .any(|k| ks.contains(k))
+                })
+                .collect();
+            if let [g] = near.as_slice() {
+                out.ambiguous.retain(|x| *x != (is_a, i));
+                out.beside.push(Beside {
+                    item_a: is_a,
+                    item: i,
+                    gap: *g,
+                });
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pair_items(
     a: &Analyzed,
     b: &Analyzed,
     ia: &[Item],
     ib: &[Item],
     gaps: &[Vec<Gap>; 2],
+    anchors: &[Anchor],
     wit: Option<&Witnessing>,
     out: &mut Outcome,
 ) {
@@ -1822,7 +2015,10 @@ fn pair_items(
         pairs,
         beside,
         ambiguous,
-    } = if ia.len() == ib.len() {
+        moved,
+    } = if !anchors.is_empty() {
+        traced(ia, ib, &ka, &kb, gaps, anchors)
+    } else if ia.len() == ib.len() {
         Alignment {
             pairs: (0..ia.len()).map(|i| (i, i)).collect(),
             ..Alignment::default()
@@ -1853,6 +2049,10 @@ fn pair_items(
                         g.line
                     )
                 }
+                None if moved.contains(&(is_a, i)) => format!(
+                    "{name} line {}: statement is not paired: the conversion put it in another order among the statements it is paired with",
+                    line(side, &it.nodes)
+                ),
                 None if ambiguous.contains(&(is_a, i)) => format!(
                     "{name} line {}: statement is not paired: the statements around it line up with the other side in more than one way",
                     line(side, &it.nodes)

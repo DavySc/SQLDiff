@@ -186,3 +186,134 @@ $$;
         );
     }
 }
+
+/// Anchors linking each `(A text, B text)`: the byte spans of the first
+/// occurrence of each.
+fn anchors(a: &str, b: &str, links: &[(&str, &str)]) -> Vec<sqldiff_core::equiv::Anchor> {
+    let span = |t: &str, s: &str| {
+        let at = t.find(s).unwrap_or_else(|| panic!("{s} not in {t}"));
+        (at, at + s.len())
+    };
+    links
+        .iter()
+        .map(|(x, y)| sqldiff_core::equiv::Anchor {
+            a: span(a, x),
+            b: span(b, y),
+        })
+        .collect()
+}
+
+fn run_traced(a: &str, b: &str, links: &[(&str, &str)]) -> Report {
+    diff(
+        &Artifact::new("a.sql", Dialect::Tsql, a),
+        &Artifact::new("b.sql", Dialect::Postgres, b),
+        &Options {
+            anchors: anchors(a, b, links),
+            ..Options::default()
+        },
+    )
+}
+
+const TWO_SETS: &str = "CREATE PROCEDURE dbo.p
+AS
+BEGIN
+    DECLARE @x int;
+    SET @x = 1;
+    SET @x = 2;
+END;
+";
+
+#[test]
+fn the_trace_pairs_a_statement_with_the_output_written_from_it() {
+    // The conversion dropped `SET @x = 1` (a dead store): by position or
+    // by key, `SET @x = 1` would meet `v_x := 2` and differ.
+    let pg = "CREATE OR REPLACE PROCEDURE p()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_x integer;
+BEGIN
+  -- SET @x = 1: dropped
+  v_x := 2;
+END;
+$$;
+";
+    let untraced = run(TWO_SETS, pg);
+    assert_eq!(
+        compared(&untraced),
+        vec![(5, 8)],
+        "{:#?}",
+        untraced.findings
+    );
+    let r = run_traced(
+        TWO_SETS,
+        pg,
+        &[
+            ("SET @x = 1;", "-- SET @x = 1: dropped"),
+            ("SET @x = 2;", "v_x := 2;"),
+        ],
+    );
+    assert_eq!(
+        compared(&r),
+        Vec::<(usize, usize)>::new(),
+        "{:#?}",
+        r.findings
+    );
+    assert!(
+        r.unknown_reasons.contains(
+            &"side A (T-SQL) line 5: statement has no counterpart on the other side".to_string()
+        ),
+        "{:#?}",
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn the_trace_never_pairs_statements_it_does_not_link() {
+    // Same number of statements on both sides, so they would be paired by
+    // position; the trace says each was written from the other one, out
+    // of order. Comparing them one by one says nothing about the order, so
+    // neither pair is compared.
+    let pg = "CREATE OR REPLACE PROCEDURE p()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_x integer;
+BEGIN
+  v_x := 2;
+  v_x := 1;
+END;
+$$;
+";
+    let r = run_traced(
+        TWO_SETS,
+        pg,
+        &[("SET @x = 1;", "v_x := 1;"), ("SET @x = 2;", "v_x := 2;")],
+    );
+    assert_eq!(
+        compared(&r),
+        Vec::<(usize, usize)>::new(),
+        "{:#?}",
+        r.findings
+    );
+    for line in [5, 6] {
+        let want = format!(
+            "side A (T-SQL) line {line}: statement is not paired: the conversion put it in another order among the statements it is paired with"
+        );
+        assert!(
+            r.unknown_reasons.contains(&want),
+            "{want}\n{:#?}",
+            r.unknown_reasons
+        );
+    }
+    assert_ne!(r.verdict(), sqldiff_core::Verdict::Equal);
+    // A statement in no anchor has no counterpart.
+    let r = run_traced(TWO_SETS, pg, &[("SET @x = 2;", "v_x := 2;")]);
+    assert!(
+        r.unknown_reasons.contains(
+            &"side A (T-SQL) line 5: statement has no counterpart on the other side".to_string()
+        ),
+        "{:#?}",
+        r.unknown_reasons
+    );
+}
