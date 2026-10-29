@@ -57,6 +57,10 @@ The MCP server runs the same engine (`sqldiff_convert::tree`): `convert_tree` ta
 
 On WideWorldImporters (336 files, 58,610 lines, 4 cores): PostgreSQL in 9 s, Db2 for i in 25 s. 33 files convert completely for each target; most of the rest carry assumptions, dynamic SQL or tables that need types without a rule (`geography`), whose dependants then do not bind.
 
+### Mass conversion in the GUI
+
+The Runs page's *Mass conversion* tab converts several source trees into several target dialects as one batch. Each source and target is an ordinary conversion run (what `sqldiff convert` runs) into `OUT/<source folder name>/<target>`, with its own review, done gate and run sheet; the runs go one after another, and a source is not converted into its own dialect. Every run is checked before any starts (paths, rules for the pair, packs, output folders that are not empty without *Replace files*, two sources with one folder name, a run writing where another reads or a running run writes), and the batch starts all or none. The summary matrix shows, per source and target, that run's own totals and done gate (`sqldiff review-status`), never a count made up for the batch. *Cancel all* stops every run that has not finished: queued runs never start, and a running one stops before writing. The batch's sheet is a script (sh or PowerShell) of its runs' commands in the same order, exiting with the worst of their exit codes; `crates/sqldiff-cli/tests/gui_parity.rs` runs it through the shell and compares the trees with the batch's.
+
 ### Base catalogs
 
 ```sh

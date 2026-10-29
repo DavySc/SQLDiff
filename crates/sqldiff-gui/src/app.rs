@@ -15,7 +15,12 @@
 //!   drift` does
 //! - `POST /api/runs/changes` `{"repo", "base", "out", ...}`: review the SQL a
 //!   branch changed, as `sqldiff changes` does
+//! - `POST /api/runs/batch` `{"sources": [{"src", "from"}, ...], "targets",
+//!   "out", ...}`: convert every source into every target dialect, one run
+//!   each (a batch), with one summary matrix
+//! - `GET /api/batches`: the batches, with their cells and run sheet script
 //! - `POST /runs/N/cancel`: stop run N before it writes anything
+//! - `POST /api/batches/N/cancel`: stop every run of batch N that has not finished
 //! - `GET /runs/N/review`, `/runs/N/review/api/...`: the review of what run N wrote
 //! - `GET /settings`, `/api/settings...`: config layers and the `[format]`
 //!   editor (see `settings`)
@@ -51,7 +56,7 @@ use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::packs::LoadedPack;
 use crate::review::Store;
-use crate::runs::{ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
+use crate::runs::{BatchSpec, ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -208,6 +213,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         ("GET", "/api/runs") => {
             return json(&app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>())
         }
+        ("GET", "/api/batches") => return json(&app.runs.batches()),
         ("GET", "/settings") => return page(app, View::Settings, settings_page(app), ""),
         ("GET", "/api/fs")
         | ("POST", "/api/open/compare")
@@ -215,6 +221,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         | ("POST", "/api/runs/instances")
         | ("POST", "/api/runs/drift")
         | ("POST", "/api/runs/changes")
+        | ("POST", "/api/runs/batch")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
         | ("POST", "/api/settings/save")
@@ -273,6 +280,15 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 Err(e) => bad(e),
             }
         }
+        ("POST", "/api/runs/batch") => {
+            return match serde_json::from_slice::<BatchSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| app.runs.start_batch(spec, app.isolated))
+            {
+                Ok(batch) => json(&batch),
+                Err(e) => bad(e),
+            }
+        }
         _ => {}
     }
     let ctx = settings::Ctx {
@@ -281,6 +297,19 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
     };
     if let Some(res) = settings::route(&req, &ctx) {
         return res;
+    }
+    if let Some(id) = req
+        .path
+        .strip_prefix("/api/batches/")
+        .and_then(|p| p.strip_suffix("/cancel"))
+    {
+        if req.method != "POST" {
+            return not_found();
+        }
+        return match id.parse().ok().and_then(|id| app.runs.cancel_batch(id)) {
+            Some(b) => json(&b),
+            None => not_found(),
+        };
     }
     if let Some(rest) = req.path.strip_prefix("/runs/") {
         let (id, tail) = rest.split_once('/').unwrap_or((rest, ""));
@@ -682,6 +711,7 @@ fn remember(data_dir: &Path, r: Recent) {
 fn runs_page(app: &Shared) -> String {
     let payload = serde_json::json!({
         "runs": app.runs.list().iter().map(|r| r.view()).collect::<Vec<_>>(),
+        "batches": app.runs.batches(),
         "dialects": Dialect::ALL.iter().map(|d| (d.id(), d.display_name())).collect::<Vec<_>>(),
         "with_rules": Dialect::ALL
             .iter()

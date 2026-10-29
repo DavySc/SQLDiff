@@ -411,6 +411,14 @@ fn files_cannot_be_picked_or_opened_on_a_network_address() {
         "HTTP/1.1 403 Forbidden"
     );
     assert!(!d.0.join("out").exists());
+    let batch = serde_json::json!({
+        "sources": [{"src": d.0, "from": "tsql"}], "targets": ["postgres"], "out": d.0.join("out"),
+    });
+    assert_eq!(
+        request(addr, "POST", "/api/runs/batch", &batch.to_string()).0,
+        "HTTP/1.1 403 Forbidden"
+    );
+    assert!(!d.0.join("out").exists());
     // On loopback the same requests are answered.
     let addr = start(app(None, None));
     assert_eq!(
@@ -431,12 +439,97 @@ fn finished(addr: SocketAddr, id: u64) -> serde_json::Value {
             .find(|r| r["id"] == id)
             .cloned()
             .expect("listed");
-        if run["state"] != "running" {
+        if run["state"] != "running" && run["state"] != "queued" {
             return run;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     panic!("run {id} still running after a minute");
+}
+
+#[test]
+fn a_batch_is_listed_with_its_matrix_script_and_runs() {
+    let d = Dir::new("batch");
+    d.write("in/orders/a.sql", "CREATE TABLE t (a int NOT NULL);\n");
+    d.write("in/billing/b.sql", "SELECT 1 AS one;\n");
+    let addr = start(app(None, None));
+    let (_, html) = get(addr, "/runs");
+    assert!(html.contains(r#""batches":[]"#), "{html}");
+    let spec = serde_json::json!({
+        "sources": [
+            {"src": d.0.join("in").join("orders"), "from": "tsql"},
+            {"src": d.0.join("in").join("billing"), "from": "tsql"},
+        ],
+        "targets": ["postgres", "db2i"],
+        "out": d.0.join("out"),
+    });
+    let (status, body) = request(addr, "POST", "/api/runs/batch", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let b: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let ids: Vec<u64> = b["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["run"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 4);
+    for id in &ids {
+        let run = finished(addr, *id);
+        assert_eq!(run["state"], "done", "{run}");
+        assert_eq!(run["kind"], "convert");
+        assert_eq!(run["batch"]["batch"], b["id"]);
+        // Each cell is an ordinary run with its own review.
+        assert_eq!(
+            get(addr, &format!("/runs/{id}/review")).0,
+            "HTTP/1.1 200 OK"
+        );
+    }
+    let batches: serde_json::Value = serde_json::from_str(&get(addr, "/api/batches").1).unwrap();
+    assert_eq!(batches[0]["id"], b["id"]);
+    assert_eq!(batches[0]["busy"], false);
+    assert!(batches[0]["script"]["sh"]
+        .as_str()
+        .unwrap()
+        .contains(" convert "));
+    let out = d.0.join("out");
+    for (src, to) in [
+        ("orders", "postgres"),
+        ("orders", "db2i"),
+        ("billing", "postgres"),
+        ("billing", "db2i"),
+    ] {
+        assert!(
+            out.join(src)
+                .join(to)
+                .join("conversion-report.json")
+                .is_file(),
+            "{src} {to}"
+        );
+    }
+    // Cancel answers with the batch; nothing is left to stop.
+    let path = format!("/api/batches/{}/cancel", b["id"]);
+    let (status, body) = request(addr, "POST", &path, "{}");
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    assert_eq!(get(addr, &path).0, "HTTP/1.1 404 Not Found");
+    assert_eq!(
+        request(addr, "POST", "/api/batches/999/cancel", "{}").0,
+        "HTTP/1.1 404 Not Found"
+    );
+    // The same folders again, without replacing: refused whole.
+    let (status, body) = request(addr, "POST", "/api/runs/batch", &spec.to_string());
+    assert_eq!(status, "HTTP/1.1 400 Bad Request", "{body}");
+    assert!(body.contains("not empty"), "{body}");
+    let runs: serde_json::Value = serde_json::from_str(&get(addr, "/api/runs").1).unwrap();
+    assert_eq!(runs.as_array().unwrap().len(), 4);
+    // Replacing, it runs again.
+    let mut again = spec.clone();
+    again["overwrite"] = true.into();
+    let (status, body) = request(addr, "POST", "/api/runs/batch", &again.to_string());
+    assert_eq!(status, "HTTP/1.1 200 OK", "{body}");
+    let b: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for c in b["cells"].as_array().unwrap() {
+        assert_eq!(finished(addr, c["run"].as_u64().unwrap())["state"], "done");
+    }
 }
 
 #[test]
