@@ -7,11 +7,12 @@ use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
 
 const MS_DDL: &str = "CREATE TABLE dbo.M (Id int NOT NULL PRIMARY KEY, S varchar(20) NULL, C char(5) NULL, NC nchar(5) NULL,
   N nvarchar(max) NULL, T datetime2(3) NULL, Dt datetime NULL, Day date NULL, Tm time(3) NULL,
-  Q int NULL, Dto datetimeoffset NULL, D decimal(10,2) NULL, F float NULL, S2 varchar(10) NULL);";
+  Q int NULL, Dto datetimeoffset NULL, D decimal(10,2) NULL, F float NULL, S2 varchar(10) NULL,
+  B bigint NULL, W nvarchar(4000) NULL, V varchar(8000) NULL);";
 const PG_DDL: &str = "CREATE TABLE M (Id integer NOT NULL PRIMARY KEY, S varchar(20) NULL, C char(5) NULL, NC char(5) NULL,
   N text NULL, T timestamp(3) NULL, Dt timestamp(3) NULL, Day date NULL, Tm time(3) NULL,
   Q integer NULL, Dto timestamptz NULL, D decimal(10,2) NULL, F double precision NULL,
-  S2 varchar(10) NULL);";
+  S2 varchar(10) NULL, B bigint NULL, W varchar(4000) NULL, V varchar(8000) NULL);";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Want {
@@ -298,9 +299,19 @@ fn substring_matches_follow_the_collation() {
             // Grows from an unknown length: T-SQL may cut at 8,000 bytes.
             ("REPLACE(N, , '')", "replace(N, , '')", NotEq),
             ("REPLACE(S, S2, N)", "replace(S, S2, N)", NotEq),
+            // One character for one, but 😀 is two UTF-16 units (four UTF-8
+            // bytes): 4,000 'a's become 8,000 units, which T-SQL cuts.
+            ("REPLACE(W, N'a', N'😀')", "replace(W, 'a', '😀')", NotEq),
+            ("REPLACE(V, 'a', 'é')", "replace(V, 'a', 'é')", NotEq),
+            ("REPLACE(W, N'é', N'a')", "replace(W, 'é', 'a')", CI),
             // PostgreSQL strips char padding before replacing.
             ("REPLACE(C, 'a', 'b')", "replace(C, 'a', 'b')", NotEq),
-            ("CHARINDEX('a', S)", "strpos(S, 'a')", CI),
+            // Positions count UTF-16 units in T-SQL: ASM-TSQL-LEN-BMP too.
+            (
+                "CHARINDEX('a', S)",
+                "strpos(S, 'a')",
+                Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]),
+            ),
             ("CHARINDEX(',' + S2, S)", "strpos(S, ',' || S2)", CI),
             // An empty needle: CHARINDEX 0, strpos 1.
             ("CHARINDEX(S2, S)", "strpos(S, S2)", NotEq),
@@ -347,6 +358,13 @@ fn trims_quotes_and_numbers() {
         ("CEILING(D)", "ceiling(D)", Eq(&[])),
         ("FLOOR(F)", "floor(F)", Eq(&[])),
         ("CEILING(D)", "floor(D)", NotEq),
+        ("CEILING(Q)", "ceil(Q)", Eq(&[])),
+        // ceil(bigint) is ceil(double precision): 9007199254740993 becomes
+        // 9007199254740992.
+        ("CEILING(B)", "ceil(B)", NotEq),
+        ("FLOOR(B)", "floor(B)", NotEq),
+        ("CEILING(B) + 1", "ceil(B) + 1", NotEq),
+        ("SQRT(B)", "sqrt(B)", Eq(&[])),
         // CEILING of an int stays int in T-SQL, is double precision in
         // PostgreSQL: the division that follows differs.
         ("CEILING(Q) / 2", "ceil(Q) / 2", NotEq),

@@ -1848,9 +1848,6 @@ impl<'a> Canon<'a> {
                     )
                 }
             }
-            // LEN counts characters without trailing spaces: PostgreSQL's
-            // length(rtrim(x)) (rtrim removes only spaces, as LEN ignores
-            // only spaces). T-SQL counts UTF-16 code units.
             // REPLACE matches `from` under the collation: case-insensitively
             // in T-SQL (by default), exactly in PostgreSQL. The collation is
             // kept as a marker, as in `strcmp`, so the two are equal only
@@ -1874,13 +1871,17 @@ impl<'a> Canon<'a> {
             // CHARINDEX(needle, s): 0 for an empty needle. PostgreSQL's
             // strpos(s, needle) agrees once the needle cannot be empty, or
             // inside the converter's `CASE WHEN length(x) = 0 THEN 0 ELSE
-            // strpos(s, x) END` (lowered in `expr`). Collation as for REPLACE.
+            // strpos(s, x) END` (lowered in `expr`). Collation as for REPLACE;
+            // positions under ASM-TSQL-LEN-BMP.
             (Dialect::Tsql, "charindex", 2)
                 if args
                     .iter()
                     .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar)) =>
             {
                 let ci = self.collation_marker();
+                // Positions count UTF-16 code units in T-SQL (non-_SC
+                // collations), code points in PostgreSQL.
+                self.assume(asm::LEN_BMP);
                 let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
                 (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
             }
@@ -1917,9 +1918,16 @@ impl<'a> Canon<'a> {
             // differ (T-SQL keeps int and decimal(p, 0); PostgreSQL gives
             // double precision for an int and an unconstrained numeric), so
             // each side keeps its own and what follows is typed apart.
+            // PostgreSQL takes ceil(double precision) for an integer, which
+            // is exact only up to int (bigint above 2^53 is rounded).
             (Dialect::Tsql, "ceiling" | "floor", 1)
             | (Dialect::Postgres, "ceil" | "ceiling" | "floor", 1)
-                if first_ty.is_some_and(|t| t.is_numeric()) =>
+                if first_ty.is_some_and(|t| {
+                    t.is_numeric()
+                        && (d == Dialect::Tsql
+                            || t.fam != Fam::Int
+                            || t.len.is_some_and(|l| l <= 32))
+                }) =>
             {
                 let t = first_ty.unwrap();
                 let ty = match (d, t.fam) {
@@ -1955,6 +1963,9 @@ impl<'a> Canon<'a> {
                     }),
                 )
             }
+            // LEN counts characters without trailing spaces: PostgreSQL's
+            // length(rtrim(x)) (rtrim removes only spaces, as LEN ignores
+            // only spaces). T-SQL counts UTF-16 code units.
             (Dialect::Tsql, "len", 1) if first_ty.is_some_and(|t| t.is_string()) => {
                 self.assume(asm::LEN_BMP);
                 let bits = if first_ty.and_then(|t| t.len).is_some() {
@@ -4755,21 +4766,28 @@ fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e E
         .then_some((&pos[0], x))
 }
 
-/// Whether REPLACE(s, from, to) cannot outgrow what T-SQL returns uncut
-/// (8,000 bytes for a non-MAX value, so 4,000 characters): the result is
-/// never longer than `s` (`to` no longer than any non-empty `from`; an
-/// empty `from` changes nothing), or `s` has a known length whose worst
-/// growth stays within 4,000 characters. PostgreSQL never cuts.
+/// Whether REPLACE(s, from, to) cannot outgrow what T-SQL returns uncut:
+/// 8,000 bytes for a non-MAX value, so 4,000 UTF-16 code units (nvarchar)
+/// or 4,000 bytes (varchar, also under a UTF-8 collation) to be safe.
+/// `from` is counted in characters (never more than its units or bytes),
+/// `to` in UTF-8 bytes (never fewer than its UTF-16 units or its bytes in
+/// any code page; a typed `to` at 4 bytes a character). Then the result
+/// is never longer than `s` when `to` is no longer than any non-empty
+/// `from` (an empty `from` changes nothing), or `s` has a known length
+/// whose worst growth stays within the bound. PostgreSQL never cuts.
 fn replace_fits(d: Dialect, e: &[Expr], args: &[(Term, Option<Ty>)]) -> bool {
     if d != Dialect::Tsql {
         return true;
     }
-    let lit = |x: &Expr| match x {
-        Expr::Str(s) => Some(s.chars().count() as u32),
-        _ => None,
+    let min_from = match &e[1] {
+        Expr::Str(s) => s.chars().count() as u32,
+        _ => 1,
+    }
+    .max(1);
+    let max_to = match &e[2] {
+        Expr::Str(s) => Some(s.len() as u32),
+        _ => args[2].1.and_then(|t| t.len).map(|l| l.saturating_mul(4)),
     };
-    let min_from = lit(&e[1]).unwrap_or(1).max(1);
-    let max_to = lit(&e[2]).or(args[2].1.and_then(|t| t.len));
     let Some(max_to) = max_to else {
         return false;
     };
@@ -4777,7 +4795,12 @@ fn replace_fits(d: Dialect, e: &[Expr], args: &[(Term, Option<Ty>)]) -> bool {
         return true;
     }
     match args[0].1.and_then(|t| t.len) {
-        Some(len) => (len / min_from + 1).saturating_mul(max_to) + len <= 4000,
+        Some(len) => {
+            (len / min_from + 1)
+                .saturating_mul(max_to)
+                .saturating_add(len)
+                <= 4000
+        }
         None => false,
     }
 }
