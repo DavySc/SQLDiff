@@ -118,6 +118,7 @@ fn a_tsql_procedure_reads_into_the_same_shape() {
             Node::Block(_) => "block",
             Node::If { .. } => "if",
             Node::While { .. } => "while",
+            Node::ForQuery { .. } => "for",
             Node::Call { .. } => "call",
             Node::Setting { .. } => "setting",
             Node::Try { .. } => "try",
@@ -159,6 +160,13 @@ fn syntax_the_tree_would_drop_is_refused() {
     let plain =
         "CREATE PROCEDURE dbo.p @x int AS\nBEGIN\n  UPDATE dbo.t SET a = @x WHERE a = 1;\nEND\n";
     assert!(routines(plain, Dialect::Tsql).remove(0).is_ok());
+    // PostgreSQL ONLY leaves inheritance children out; the tree would not
+    // show it.
+    let only = "CREATE PROCEDURE p(x integer) LANGUAGE plpgsql AS $$\nBEGIN\n  UPDATE ONLY t SET a = x WHERE a = 1;\nEND;\n$$;\n";
+    let e = routines(only, Dialect::Postgres)
+        .remove(0)
+        .expect_err("ONLY");
+    assert!(e.contains("ONLY"), "{e}");
 }
 
 #[test]
@@ -317,4 +325,51 @@ fn error_handling_and_transactions_read() {
     // An exception section on the routine's own block is not read.
     let top = "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$\nBEGIN\n  NULL;\nEXCEPTION WHEN OTHERS THEN\n  RAISE;\nEND;\n$$;\n";
     assert!(routines(top, Dialect::Postgres).remove(0).is_err());
+}
+
+/// C3b: the PL/pgSQL block the converter writes for T-SQL `SELECT @x =
+/// col` reads as a nested block around a `FOR` loop over the query, and
+/// prints and reads back as the same tree; other `FOR` loops are refused.
+#[test]
+fn a_for_loop_over_a_query_reads() {
+    let text = "CREATE PROCEDURE look(p_id integer, INOUT p_q integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  DECLARE
+  sqldiff_r record;
+  BEGIN
+  FOR sqldiff_r IN SELECT Qty AS sqldiff_c1 FROM Acct WHERE Id = p_id LOOP
+    p_q := sqldiff_r.sqldiff_c1;
+  END LOOP;
+  END;
+END;
+$$;
+";
+    let r = routines(text, Dialect::Postgres).remove(0).unwrap();
+    let [Node::Block(b)] = r.body.body.as_slice() else {
+        panic!("{:?}", r.body.body);
+    };
+    assert_eq!(b.decls.len(), 1);
+    let [Node::ForQuery { var, query, body }] = b.body.as_slice() else {
+        panic!("{:?}", b.body);
+    };
+    assert_eq!(var, "sqldiff_r");
+    assert_eq!(query.items.len(), 1);
+    assert_eq!(body.len(), 1);
+    assert_eq!(reprint(&r), r);
+    for lp in [
+        "FOR i IN 1..3 LOOP p_q := i; END LOOP;",
+        "FOR sqldiff_r IN EXECUTE 'SELECT 1' LOOP p_q := 1; END LOOP;",
+        "FOR i IN REVERSE 3..1 LOOP p_q := i; END LOOP;",
+        "<<l>> FOR sqldiff_r IN SELECT 1 AS a LOOP p_q := 1; END LOOP;",
+    ] {
+        let text = format!(
+            "CREATE PROCEDURE look(INOUT p_q integer) LANGUAGE plpgsql AS $$\nDECLARE i integer; sqldiff_r record;\nBEGIN\n  {lp}\nEND;\n$$;\n"
+        );
+        assert!(
+            routines(&text, Dialect::Postgres).remove(0).is_err(),
+            "{lp}"
+        );
+    }
 }

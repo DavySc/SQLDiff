@@ -984,7 +984,7 @@ sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TABLES-AS-DECLARED"
-statement = "The tables a converted routine writes are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree."
+statement = "The tables a converted routine writes or reads are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree."
 discharge = "catalog"
 fact = "Both databases' catalogs: the tables' definitions match the tree's CREATE TABLE statements."
 sites = ["sqldiff-convert/src/cert.rs"]

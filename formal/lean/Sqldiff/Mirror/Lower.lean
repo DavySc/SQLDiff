@@ -2,12 +2,12 @@
 The lowering of T-SQL and PL/pgSQL routines, as the Rust parser reads them
 (`Sqldiff.Ast`, generated), into the core. Decision 9
 (docs/verified-conversion.md): this file *is* the specification of the C1
-constructs, of the C2a scalar slice with the C2b strings, of the C3a data statements and
-of the C4 error handling and transaction control in both
+constructs, of the C2a scalar slice with the C2b strings, of the C3a data statements, of
+the C3b single-table queries and of the C4 error handling and transaction control in both
 dialects; there is no other T-SQL or PL/pgSQL semantics to prove it
 against. One abstract syntax serves both dialects and the dialect is a
 parameter. The lowering is partial: `none` means "outside the spec"
-(queries, `MERGE`, data statements outside C3a, handlers and
+(queries outside C3b, `MERGE`, data statements outside C3a, handlers and
 transaction statements outside C4, other settings, ...), and a routine
 outside it is never confirmed.
 
@@ -35,6 +35,11 @@ table the target catalog describes, with the columns of the row in scope
 citation and probe status). A data statement that fails has no effect
 (statement atomicity) and then ends the routine like any error.
 
+Queries (C3b): T-SQL `SELECT @x = col` by primary key against the
+converter's PL/pgSQL `FOR` block, `IF [NOT] EXISTS`, a scalar subquery by
+key, and `COUNT(*)` into a variable, on a catalog table (section "The C3b
+slice: queries", each rule with its citation and probe status).
+
 Errors and transactions (C4): T-SQL `TRY`/`CATCH` and PL/pgSQL
 exception blocks, `THROW` and `RAISE`, `BEGIN TRAN`/`COMMIT` in a
 bracket, the rollback-and-rethrow idiom, and PL/pgSQL `COMMIT` (section
@@ -42,7 +47,7 @@ bracket, the rollback-and-rethrow idiom, and PL/pgSQL `COMMIT` (section
 
 Read top to bottom: the trusted inputs, names in data statements, the C2a
 slice with its vendor citations, the C2b strings, expressions, the C3a data statements,
-statements, calls, the C4 rules, blocks, the two routines, and the test for "every
+the C3b queries, statements, calls, the C4 rules, blocks, the two routines, and the test for "every
 expression is in the slice".
 -/
 import Sqldiff.Ast
@@ -1015,7 +1020,10 @@ uses one is relative to **the same operator name meaning the same function
 in both dialects** (`ASM-C1-OPERATORS`). T-SQL `@a + @b` and PostgreSQL
 `a + b` on `varchar` variables agree on the C1 path; whether they agree
 is later C2 work. Expressions that read data (subqueries, `EXISTS`,
-`IN (SELECT ...)`, `*`, aggregates and window calls) are C3. -/
+`IN (SELECT ...)`, `*`, aggregates and window calls) are outside the
+spec here; C3b reads the few whole-statement shapes of "The C3b slice:
+queries" (a scalar subquery as the whole assigned value, `EXISTS` as the
+whole condition of an `IF`). -/
 
 def flag (b : Bool) : String := if b then "1" else "0"
 
@@ -1369,6 +1377,319 @@ def dataOk (d : Dialect) (k : Ast.RoutineKind) : Bool :=
     | .tsql dep _ => !dep.rowCounts
     | .pg _ _ => true
 
+/-! ## The C3b slice: queries
+
+Phase C3b reads one table of the target catalog, in exactly the shapes
+`sqldiff convert --to postgres` writes, lowered to the core's `query`
+(`Sqldiff.Core.Stmt.query`, `Pick`, `keptRows`, `pickRows`). Each rule
+states the claim, the vendor text and the probe status, as for C2a.
+"eval/queries Qn" is probe `Qn` of `eval/queries/{mssql,postgres}.sql`
+with their `.out` files, run on SQL Server 2022 and PostgreSQL 18 on
+2026-10-29 with the converter's own PL/pgSQL shapes. The vendor quotes
+below were written **from memory** (the vendor sites were not reachable
+when this was written) and need checking against the pages; the probes
+are what the rules rest on.
+
+**The shapes.** A query is a plain `SELECT items FROM t [WHERE c]`: one
+table of the catalog (`tableOf`, as for C3a), no alias, no table hints,
+no join, `DISTINCT`, `TOP`, `GROUP BY`, `HAVING`, `ORDER BY`, paging,
+locking clause, set operation, CTE or `FOR JSON` (`selParts`). Its
+`WHERE` sees the table's columns, resolved by `resolveName` exactly as in
+an `UPDATE` (C3a, "Names in data statements"): a T-SQL name is a column
+spelt as the catalog spells it, a PL/pgSQL name that is both a column and
+a variable is outside the spec (probed, eval/queries Q9: PostgreSQL
+raises 42702 "column reference is ambiguous" in a `FOR` query and in
+`EXISTS`). The `WHERE` keeps the rows where it is TRUE, FALSE and
+UNKNOWN skip them (as for C3a; probed, eval/queries Q1 and Q4: `id =
+@k` with `@k` NULL matches no row on both engines, under `ANSI_NULLS ON`,
+`ASM-TSQL-ANSI-NULLS`). Queries stand only in procedures (a function's
+reads would add PostgreSQL's volatility and snapshot rules to the spec).
+
+1. **`SELECT @x1 = e1, ..., @xn = en FROM t WHERE c`** (T-SQL), and
+   its conversion, the PL/pgSQL block
+
+   ```
+   DECLARE r record;
+   BEGIN
+   FOR r IN SELECT e1 AS a1, ..., en AS an FROM t WHERE c LOOP
+     x1 := r.a1; ...; xn := r.an;
+   END LOOP;
+   END;
+   ```
+
+   lower to `query t c (.row false [(x1, e1), ...])`. T-SQL assigns
+   for each row the query returns, so with no row every variable keeps
+   its value, and with several the values of one of them, which one not
+   specified ("SELECT @local_variable (Transact-SQL)": "If the SELECT
+   statement returns no rows, the variable retains its present value";
+   "If ... returns more than one value, the variable is assigned the last
+   value that is returned"; from memory). The `FOR` loop assigns once per
+   row, in the order the query returns them, and runs no iteration for
+   no row (PL/pgSQL "Looping Through Query Results"; from memory). Probed,
+   eval/queries Q1 (one row assigns, a NULL column assigns NULL, no row
+   keeps the value, two targets, both engines) and Q2 (three matching
+   rows: T-SQL ends with one of them; PostgreSQL iterates three times and
+   ends with one of them).
+
+   Which row "last" is depends on the plan on both sides, so the rule
+   asks that **at most one row can match** (`keyFixed`): `c` is a
+   conjunction (`AND`, in the slice) with, for every column of the
+   table's primary key, a conjunct `k = e` or `e = k` where `e` reads no
+   column. Every row `c` keeps then has the key `e` gives, the same
+   value for every row (no variable the query assigns is read by `c`,
+   below), and the primary key (`ASM-TABLES-AS-DECLARED`, a fact of both
+   catalogs: not deferrable in PostgreSQL, so it holds at every statement
+   boundary, "CREATE TABLE"; checked on every write in SQL Server) admits
+   at most one such row in every database state an engine can be in.
+   (The core's `Refines` quantifies over every list of rows, including
+   ones that break the key; on those it takes the last row in list
+   order, which is a choice of the core and not a claim about either
+   engine.) Without such a `WHERE` the pair is outside the spec.
+
+   The values `ei` are `int` expressions of the slice (or NULL) that
+   read no variable and cannot raise (`pickValue`): T-SQL may compute
+   them on rows the `WHERE` later discards (the plan may place a compute
+   scalar below the filter), and a variable read there would see the
+   assignments of earlier rows (`SELECT @x = @x + c` is a running
+   total in T-SQL, never in PostgreSQL, whose query parameters are fixed
+   when it starts: PL/pgSQL "Variable Substitution", from memory). The
+   targets are distinct `int` variables, so the store converts nothing
+   (the field `r.ai` is `integer`, from an `integer` column or
+   expression), and `c` reads none of them. The `FOR` block is exactly
+   this shape: its one declaration is a `record` variable `r` without a
+   default, it holds only the loop, the loop's body is exactly the
+   assignments `xi := r.ai` in the order of the select list, each `ai` an
+   alias of its item, distinct. So `r` is read nowhere else, its scope
+   is the block, and the block's other effect, `FOUND`, is never read (a
+   routine that reads `found` is outside the spec, `wellScoped`). `r` is
+   not a name of the routine (no shadowing), and is a variable for the
+   query's name resolution (`resolveName`).
+
+2. **`SET @x = (SELECT e FROM t WHERE c)`** (T-SQL) and **`x := (SELECT e
+   FROM t WHERE c)`** (PL/pgSQL), a scalar subquery as the whole value,
+   lower to `query t c (.row true [(x, e)])`: NULL when no row matches,
+   the row's value when one does, and an error when several do (T-SQL
+   512, PostgreSQL 21000 `cardinality_violation`, "Scalar Subqueries",
+   4.2.11; "Subqueries" (Transact-SQL); from memory). Probed,
+   eval/queries Q5 (300, NULL, 512 against 21000 with the variable kept,
+   both engines). The same `keyFixed` `WHERE` is required, so the error
+   cannot happen (it is then not in the core), and the same rules for
+   `e` and `x`.
+
+3. **`IF [NOT] EXISTS (SELECT 1 FROM t [WHERE c]) ... [ELSE ...]`**, the
+   same text in both dialects (`SELECT *` too), lowers to `query t c
+   (.any existsVar)` followed by the `IF` on that variable (`NOT`: on
+   its negation). `EXISTS` is TRUE when the subquery returns a row and
+   FALSE otherwise, never UNKNOWN ("EXISTS (Transact-SQL)"; PostgreSQL
+   9.23.1 "EXISTS"; from memory). Probed, eval/queries Q4. The select
+   list is not evaluated: probed on both engines, eval/queries Q7
+   (`EXISTS (SELECT 1/0 ...)` is TRUE, no error); the rule takes only `1`
+   and `*` there all the same. No row count is needed, so any `WHERE` is
+   allowed (a C1 `WHERE` puts the routine outside C2a as for C3a).
+   `existsVar` is declared as a local of both lowered routines, set
+   right before its one test and never read elsewhere; the certificate
+   need not name it (`check`). A routine can spell it: T-SQL variables
+   start with `@`, but a PL/pgSQL `"%exists"` arrives unquoted, as this
+   very name. A routine that declares it and uses `EXISTS` is refused
+   as a duplicate local (`wellScoped`), and a renaming that maps a
+   source name onto it is refused by the injectivity test (`InjOn`). Only the whole condition of an `IF` (or `ELSE IF`); `WHILE
+   EXISTS` and `EXISTS` inside a larger condition are outside the spec.
+
+4. **`SELECT @x = COUNT(*) FROM t [WHERE c]`** (T-SQL), **`SELECT
+   COUNT(*) INTO x FROM t [WHERE c]`** (PL/pgSQL, not `STRICT`) and the
+   scalar-subquery form `SET @x = (SELECT COUNT(*) FROM t [WHERE c])` / `x
+   := (...)` lower to `query t c (.count x)`: an aggregate without `GROUP
+   BY` returns exactly one row, so the assignment always happens, with
+   the number of rows `c` keeps (0 for none). T-SQL `COUNT` is `int` and
+   raises 8115 beyond 2^31-1 ("COUNT (Transact-SQL)", from memory);
+   PostgreSQL `count` is `bigint`, converted to the `integer` target on
+   assignment, raising 22003 beyond it (PL/pgSQL "Assignment"; from
+   memory): both the core's overflow (`arithmetic`), whose T-SQL side
+   rests on `ASM-TSQL-ARITH-ERRORS` like every overflow. Probed,
+   eval/queries Q6 (0 on no row, 1, 3; `int` and `bigint`); the overflow
+   is not probed (2^31 rows). The target is an `int` variable that `c`
+   does not read.
+
+**Row counts.** A T-SQL `SELECT @x = ...`, `IF EXISTS` and `SET @x =
+(subquery)` send no rows-affected count even without `SET NOCOUNT ON`
+(probed, eval/queries Q3: only the `UPDATE` control prints one), so the
+deployment's `rowCounts` does not matter here.
+
+**Errors.** A query fails only by its `WHERE` or its values (and `COUNT`
+by overflow); it writes no table, so statement atomicity is trivial, and
+a failed query leaves the variables as they were (the core assigns after
+evaluating everything). A `WHERE` or a value that can raise is outside
+the C2a slice (`Core.Stmt.dmlSafe`), as for C3a: which rows an engine
+tests depends on the access path.
+
+**What a query sees.** The database as the routine's own earlier
+statements left it (probed, eval/queries Q8: a read after an `UPDATE` in
+the same procedure sees it, both engines); other sessions are not
+modelled (decision 1: serial, one session). -/
+
+/-- The variable an `EXISTS` test is put in. A PL/pgSQL `"%exists"` can
+spell it; `wellScoped` and the renaming's injectivity refuse the
+collision (see the C3b rules). -/
+def existsVar : Var := "%exists"
+
+/-- The parts of a plain one-table `SELECT`: its items, its `INTO`
+targets and `STRICT`, the table's name and the `WHERE`. Anything else in
+the query puts it outside the spec. -/
+def selParts : Ast.Select →
+    Option (List Ast.SelItem × List Ast.Expr × Bool × List String × Option Ast.Expr)
+  | .Select [] false [] false none items into strict [.Table tgt none []] wh [] none [] none none []
+      none => some (items, into, strict, tgt, wh)
+  | _ => none
+
+/-- `COUNT(*)`. -/
+def countStar : Ast.Expr → Bool
+  | .CallE (.CallF [n] [] false [] false false true) => n.toUpper == "COUNT"
+  | _ => false
+
+/-- The select list of an `EXISTS`: `1` or `*`. -/
+def existsItems : List Ast.SelItem → Bool
+  | [.SelItem (.Num "1") none none] | [.SelItem (.Star none) none none] => true
+  | _ => false
+
+/-- A value a query assigns from the row it picks: an `int` expression of
+the slice or NULL (`colValue`), reading no variable, that cannot raise. -/
+def pickValue (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Option Core.Expr := do
+  let e' ← colValue d env sc e
+  if e'.vars.isEmpty && !e'.raise then some e' else none
+
+/-- The conjuncts of a condition. -/
+def conjuncts : SExpr → List SExpr
+  | .and a b => conjuncts a ++ conjuncts b
+  | s => [s]
+
+/-- `c = e` or `e = c`, `e` reading no column. -/
+def fixesCol (c : Core.Col) : SExpr → Bool
+  | .cmp .eq (.col c') e => c' == c && !e.hasCol
+  | .cmp .eq e (.col c') => c' == c && !e.hasCol
+  | _ => false
+
+/-- The condition fixes every column of the table's primary key with `=`,
+so at most one row of a database that satisfies the key is kept. -/
+def keyFixed (t : CatTable) : Option Core.Expr → Bool
+  | some (.sc s) =>
+    t.cols.any (·.key) && (t.cols.filter (·.key)).all fun k => (conjuncts s).any (fixesCol k.name)
+  | _ => false
+
+/-- A query of the table: its scope and its lowered `WHERE`. -/
+def queryOn (d : Dialect) (env : TyEnv) (tgt : List String) (wh : Option Ast.Expr) :
+    Option (CatTable × Scope × Option Core.Expr) := do
+  let t ← tableOf d tgt
+  let sc := scopeOf d t tgt
+  let c ← lowerOpt d env sc wh
+  pure (t, sc, c)
+
+/-- `.row`: distinct `int` targets that the condition does not read, and
+a condition that fixes the key. -/
+def rowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (orNull : Bool)
+    (sets : List (Var × Core.Expr)) : Option Stmt :=
+  let xs := sets.map (·.1)
+  if !sets.isEmpty && distinct xs && xs.all (intVar d env) &&
+      !(xs.any (Core.Expr.varsOpt c).contains) && keyFixed t c then
+    some (.query t.toDef c (.row orNull sets))
+  else none
+
+/-- `.count`: an `int` target that the condition does not read. -/
+def countPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (x : Var) :
+    Option Stmt :=
+  if intVar d env x && !(Core.Expr.varsOpt c).contains x then
+    some (.query t.toDef c (.count x))
+  else none
+
+/-- T-SQL `SELECT @x = e, ... FROM t WHERE c` and `SELECT @x = COUNT(*) FROM
+t [WHERE c]` (rules 1 and 4). -/
+def lowerSelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
+  let (items, into, strict, tgt, wh) ← selParts sel
+  if !into.isEmpty || strict then none else
+  let (t, sc, c) ← queryOn d env tgt wh
+  let row : Option Stmt := do
+    let sets ← items.mapM fun
+      | .SelItem e none (some v) => do pure (← target d (.Var v), ← pickValue d env sc e)
+      | _ => none
+    rowPick d env t c false sets
+  match items with
+  | [.SelItem e none (some v)] =>
+    if countStar e then do countPick d env t c (← target d (.Var v)) else row
+  | _ => row
+
+/-- PL/pgSQL `SELECT COUNT(*) INTO x FROM t [WHERE c]` (rule 4). -/
+def lowerSelectP (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
+  let (items, into, strict, tgt, wh) ← selParts sel
+  match items, into, strict with
+  | [.SelItem e none none], [x], false =>
+    if countStar e then do
+      let x ← target d x
+      let (t, _, c) ← queryOn d env tgt wh
+      countPick d env t c x
+    else none
+  | _, _, _ => none
+
+/-- `x := (SELECT e FROM t WHERE c)` in either dialect (rules 2 and 4). -/
+def lowerScalar (d : Dialect) (env : TyEnv) (x : Var) (sel : Ast.Select) : Option Stmt := do
+  let (items, into, strict, tgt, wh) ← selParts sel
+  if !into.isEmpty || strict then none else
+  let (t, sc, c) ← queryOn d env tgt wh
+  match items with
+  | [.SelItem e none none] =>
+    if countStar e then countPick d env t c x
+    else rowPick d env t c true [(x, ← pickValue d env sc e)]
+  | _ => none
+
+/-- The condition of an `IF` that is `EXISTS (q)` (`false`) or `NOT EXISTS
+(q)` (`true`). -/
+def existsCond : Ast.Expr → Option (Ast.Select × Bool)
+  | .Exists q => some (q, false)
+  | .Unary o (.Exists q) => if o.toUpper == "NOT" then some (q, true) else none
+  | _ => none
+
+/-- `EXISTS (SELECT 1 FROM t [WHERE c])` (rule 3). -/
+def lowerExists (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
+  let (items, into, strict, tgt, wh) ← selParts sel
+  if !into.isEmpty || strict || !existsItems items then none else
+  let (t, _, c) ← queryOn d env tgt wh
+  pure (.query t.toDef c (.any existsVar))
+
+/-- A `record` declaration's type. -/
+def recordType : Ast.Ty → Bool
+  | .Ty n [] => n.toUpper == "RECORD"
+  | _ => false
+
+/-- `x := r.a` in the body of the converter's `FOR` loop over `r`: the
+target and the field, folded. -/
+def fieldAssign (r : String) : Ast.Node → Option (Var × String)
+  | .NStmt (.Assign (.Name [x]) (.Name [r', a])) =>
+    if pgName r' == r then some (pgName x, pgName a) else none
+  | _ => none
+
+/-- The PL/pgSQL block `DECLARE r record; BEGIN FOR r IN SELECT e1 AS a1,
+... FROM t WHERE c LOOP x1 := r.a1; ... END LOOP; END;` (rule 1). -/
+def lowerForBlock (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : Ast.Ty)
+    (r' : String) (sel : Ast.Select) (body : List Ast.Node) : Option (List Stmt) :=
+  match d with
+  | .tsql _ _ => none
+  | .pg Γ vars => do
+    let r := pgName r
+    if !(k matches .Procedure) || !recordType ty || pgName r' != r || vars.contains r then none
+    else
+    -- The record is a variable for the query's names.
+    let d' := Dialect.pg Γ (vars ++ [r])
+    let (items, into, strict, tgt, wh) ← selParts sel
+    if !into.isEmpty || strict then none else
+    let (t, sc, c) ← queryOn d' env tgt wh
+    let cols ← items.mapM fun
+      | .SelItem e (some a) none => do pure (pgName a, ← pickValue d' env sc e)
+      | _ => none
+    let asg ← body.mapM (fieldAssign r)
+    if asg.length != cols.length || !distinct (cols.map (·.1)) ||
+        !(asg.zip cols).all (fun (p, q) => p.2 == q.1) || (asg.map (·.1)).contains r then none
+    else
+    let s ← rowPick d' env t c false ((asg.zip cols).map fun (p, q) => (p.1, q.2))
+    pure [s]
+
 /-! ## Statements -/
 
 /-- One statement, as a list of core statements (a block contributes its
@@ -1392,8 +1713,22 @@ nests).
   status (above); a PostgreSQL procedure cannot return a value.
 * `INSERT ... VALUES`, `UPDATE` and `DELETE` as in "The C3a slice: data
   statements" above; every other form of them is outside the spec.
-* Queries, `MERGE` and messages are outside the spec. -/
+* (C3b) The queries of "The C3b slice: queries": T-SQL `SELECT @x = ...`,
+  PL/pgSQL `SELECT COUNT(*) INTO x`, and an assignment whose whole value
+  is a scalar subquery, in procedures only.
+* Other queries, `MERGE` and messages are outside the spec. -/
 def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → Option (List Stmt)
+  | .Assign t (.Subquery q) => do
+    if !(k matches .Procedure) then none else
+    let x ← target d t
+    let s ← lowerScalar d env x q
+    pure [s]
+  | .SSelect q => do
+    if !(k matches .Procedure) then none else
+    let s ← match d with
+      | .tsql _ _ => lowerSelectT d env q
+      | .pg _ _ => lowerSelectP d env q
+    pure [s]
   | .Assign t v => do
     let x ← target d t
     let v' ← lowerExpr d env {} v
@@ -1439,7 +1774,7 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
     let t ← tableOf d tgt
     let wh' ← lowerOpt d env (scopeOf d t tgt) wh
     pure [.delete t.toDef wh']
-  | .SSelect .. | .Insert .. | .Update .. | .Delete .. | .Merge .. | .Message .. => none
+  | .Insert .. | .Update .. | .Delete .. | .Merge .. | .Message .. => none
 
 /-! ## Calls -/
 
@@ -1785,6 +2120,7 @@ def txnInner : Ast.Node → Bool
   | .Setting .. => true
   | .If _ t e => txnInnerList t && txnInnerList e
   | .While _ b => txnInnerList b
+  | .ForQuery _ _ b => txnInnerList b
   | .NBlock (.Block _ b) => txnInnerList b
   | .Call .. | .Try .. | .Txn .. => false
   | .Throw _ | .Raise .. => true
@@ -1897,6 +2233,7 @@ mutual
     | .Txn .. => true
     | .If _ t e => hasTxnNodes t || hasTxnNodes e
     | .While _ b => hasTxnNodes b
+    | .ForQuery _ _ b => hasTxnNodes b
     | .NBlock (.Block _ b) => hasTxnNodes b
     | .Try b hs => hasTxnNodes b || hasTxnHandlers hs
     | _ => false
@@ -1923,14 +2260,24 @@ mutual
     | .NStmt s => lowerStmt d env k s
     | .NBlock b => lowerInner d env k cx.inner b
     | .If c t e => do
-      let c' ← lowerExpr d env {} c
       let t' ← lowerNodes d env k cx.inner t
       let e' ← lowerNodes d env k cx.inner e
-      pure [.ite c' (seqList t') (seqList e')]
+      match existsCond c with
+      | some (q, neg) =>
+        -- C3b: `IF [NOT] EXISTS (q)`, the test put in `existsVar` first.
+        if !(k matches .Procedure) then none else
+        let s ← lowerExists d env q
+        let v : Core.Expr := .sc (.var existsVar)
+        pure [s, .ite (if neg then .sc (.not (.var existsVar)) else v) (seqList t') (seqList e')]
+      | none =>
+        let c' ← lowerExpr d env {} c
+        pure [.ite c' (seqList t') (seqList e')]
     | .While c b => do
       let c' ← lowerExpr d env {} c
       let b' ← lowerNodes d env k cx.inner b
       pure [.while c' (seqList b')]
+    -- C3b: a `FOR` loop only in the converter's block (`lowerInner`).
+    | .ForQuery .. => none
     | .Call n args ret =>
       -- C4: no call in a handled body.
       if cx.handled then none else (lowerCall d env n args ret).map fun s => [s]
@@ -1966,10 +2313,14 @@ mutual
 
   /-- A block inside the body. With declarations it is outside the spec: a
   PL/pgSQL nested `DECLARE` re-initialises on every entry and can shadow.
-  Without, it is its statements (T-SQL `BEGIN ... END` has none). -/
+  Without, it is its statements (T-SQL `BEGIN ... END` has none). The one
+  exception (C3b) is the converter's block around a `FOR` loop over a
+  query, which declares only the loop's record (`lowerForBlock`). -/
   def lowerInner (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (cx : Ctx) :
       Ast.Block → Option (List Stmt)
     | .Block [] body => lowerNodes d env k cx body
+    | .Block [.Declare r (some ty) none] [.ForQuery r' q body] =>
+      lowerForBlock d env k r ty r' q body
     | .Block (_ :: _) _ => none
 end
 
@@ -1987,6 +2338,7 @@ mutual
     | .NBlock b => declsBlock b
     | .If _ t e => declsNodes t ++ declsNodes e
     | .While _ b => declsNodes b
+    | .ForQuery _ _ b => declsNodes b
     | .Try b hs => declsNodes b ++ declsHandlers hs
     | .NStmt _ | .Call .. | .Setting .. | .Throw _ | .Raise .. | .Txn .. => []
 
@@ -2047,6 +2399,11 @@ system functions such as `@@ROWCOUNT` are not variables either. -/
 def wellScoped (r : Core.Routine) : Bool :=
   let declared := r.params.map (·.name) ++ r.locals
   distinct declared && r.vars.all declared.contains
+
+/-- (C3b) The variable of `EXISTS` tests (`existsVar`), as a local of the
+lowered routine when its body uses it. -/
+def hiddenLocals (s : Stmt) : List Var :=
+  if s.vars.contains existsVar then [existsVar] else []
 
 /-- The declared types of a T-SQL routine's variables. -/
 def envT : Ast.Routine → TyEnv
@@ -2195,6 +2552,7 @@ mutual
       ds.all (storesStmt d env wenv ret) && storesNodes d env wenv ret body
     | .If _ t e => storesNodes d env wenv ret t && storesNodes d env wenv ret e
     | .While _ b => storesNodes d env wenv ret b
+    | .ForQuery _ _ b => storesNodes d env wenv ret b
     | .Call n args _ => callStoresOk d wenv n args
     | .Try b hs => storesNodes d env wenv ret b && storesHandlers d env wenv ret hs
     | .Setting .. | .Throw _ | .Raise .. | .Txn .. => true
@@ -2249,7 +2607,8 @@ def lowerT (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option Core.Rou
       | .Procedure => (ps ++ [statusParam], Stmt.assign statusVar (.lit 0) :: stmts)
       | .Function => (ps, stmts)
     let r : Core.Routine :=
-      { params := ps, locals := (declsBlock body).map (·.1), body := seqList stmts }
+      { params := ps, locals := (declsBlock body).map (·.1) ++ hiddenLocals (seqList stmts),
+        body := seqList stmts }
     if wellScoped r && caseSafe r.vars then some r else none
 
 /-- The deployment convention for the T-SQL return status of a converted
@@ -2326,7 +2685,8 @@ def lowerP (Γ : Catalog) (b : Ast.Routine) : Option Core.Routine :=
       if kind matches .Procedure && !hasStatus ps then
         (ps ++ [statusParam], Stmt.assign statusVar (.lit 0) :: body)
       else (ps, body)
-    let r : Core.Routine := { params := ps, locals := ds.map (·.1), body := seqList body }
+    let r : Core.Routine :=
+      { params := ps, locals := ds.map (·.1) ++ hiddenLocals (seqList body), body := seqList body }
     if wellScoped r && asciiNames r.vars then some r else none
 
 /-- The routine kind and the privileges it runs with: the check asks both
@@ -2476,7 +2836,30 @@ def assignOk (d : Dialect) (env wenv : TyEnv) (t v : Ast.Expr) : Bool :=
     | none => false
   | none => false
 
+/-- (C3b) A query whose `WHERE`, if any, is a condition of the slice and
+whose items are `COUNT(*)`, the `1` or `*` of `EXISTS`, or values of the
+slice. The lowering checks the rest of the shape (`lowerSelectT`,
+`lowerScalar`, `lowerExists`, `lowerForBlock`). -/
+def querySlice (d : Dialect) (env : TyEnv) (q : Ast.Select) : Bool :=
+  match selParts q with
+  | some (items, _, _, tgt, wh) => match tableOf d tgt with
+    | some t =>
+      let sc := scopeOf d t tgt
+      wh.all (condOk d env sc) &&
+        (existsItems items || items.all fun | .SelItem e _ _ => countStar e || valueOk d env sc e)
+    | none => false
+  | none => false
+
+/-- (C3b) The dialect a `FOR` loop's query is read in: its record is a
+variable there (`lowerForBlock`). -/
+def withRecord (d : Dialect) (r : String) : Dialect :=
+  match d with
+  | .pg Γ vars => .pg Γ (vars ++ [pgName r])
+  | d => d
+
 def sliceStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
+  | .Assign _ (.Subquery q) => querySlice d env q
+  | .SSelect q => querySlice d env q
   | .Assign t v => assignOk d env wenv t v
   | .Return none => true
   | .Return (some e) => match ret with
@@ -2500,8 +2883,14 @@ mutual
   def sliceNode (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Node → Bool
     | .NStmt s => sliceStmt d env wenv ret s
     | .NBlock b => sliceBlock d env wenv ret b
-    | .If c t e => condOk d env {} c && sliceNodes d env wenv ret t && sliceNodes d env wenv ret e
+    | .If c t e =>
+      (match existsCond c with
+        | some (q, _) => querySlice d env q
+        | none => condOk d env {} c) &&
+        sliceNodes d env wenv ret t && sliceNodes d env wenv ret e
     | .While c b => condOk d env {} c && sliceNodes d env wenv ret b
+    -- C3b: the loop's body is the record's fields, checked by the lowering.
+    | .ForQuery r q _ => querySlice (withRecord d r) env q
     | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env {} e
     | .Setting .. => true
     -- The handler of the rollback-and-rethrow idiom is not lowered.

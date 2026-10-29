@@ -31,6 +31,7 @@ theorem exec_succ (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .raise _, _, _ => rfl
   | _ + 1, .reraise, _, _ => rfl
   | _ + 1, .commit, _, _ => rfl
+  | _ + 1, .query .., _, _ => rfl
   | n + 1, .tryCatch u b h, st, hf => by
     have e1 : exec es wm (n + 1 + 1) (.tryCatch u b h) st =
         match exec es wm (n + 1) b st with

@@ -1036,9 +1036,18 @@ impl<'a> Parser<'a> {
                 self.i += 2;
                 Ok(Expr::Special(s))
             }
+            // Keywords that are functions, not names: unquoted, they never
+            // read a column of that name (`WHERE current_role IS NULL` is
+            // the role in PostgreSQL even with a column `"current_role"`).
             "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIMESTAMP"
-            | "CURRENT_USER" | "SESSION_USER" | "USER"
+            | "CURRENT_USER" | "SESSION_USER" | "USER" | "SYSTEM_USER"
                 if !self.is_kind_at(1, K::LParen) =>
+            {
+                self.i += 1;
+                Ok(Expr::Special(t.up.clone()))
+            }
+            "CURRENT_ROLE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" | "LOCALTIME"
+                if self.d == Dialect::Postgres && !self.is_kind_at(1, K::LParen) =>
             {
                 self.i += 1;
                 Ok(Expr::Special(t.up.clone()))
@@ -1564,7 +1573,10 @@ impl<'a> Parser<'a> {
                 alias,
             });
         }
-        self.eat_kw("ONLY");
+        if self.eat_kw("ONLY") {
+            // Leaves inheritance children out; not kept in the tree.
+            self.dropped.push("ONLY");
+        }
         let name = self.qname()?;
         if self.is_kind(K::LParen) {
             if !self.ext {
@@ -1926,7 +1938,10 @@ impl<'a> Parser<'a> {
         if self.is_kw("TOP") {
             return Err("UPDATE TOP is not supported".into());
         }
-        self.eat_kw("ONLY");
+        if self.eat_kw("ONLY") {
+            // Leaves inheritance children out; not kept in the tree.
+            self.dropped.push("ONLY");
+        }
         let target = self.qname()?;
         let hints = self.table_hints()?;
         if !hints.is_empty() {
@@ -1968,7 +1983,10 @@ impl<'a> Parser<'a> {
             return Err("DELETE TOP is not supported".into());
         }
         let has_from = self.eat_kw("FROM");
-        self.eat_kw("ONLY");
+        if self.eat_kw("ONLY") {
+            // Leaves inheritance children out; not kept in the tree.
+            self.dropped.push("ONLY");
+        }
         let target = self.qname()?;
         let alias =
             if self.is_kw("FROM") || self.is_kw("WHERE") || self.is_kw("USING") || self.at_end() {
@@ -2193,6 +2211,39 @@ mod tests {
     fn toks(sql: &str, d: Dialect) -> Vec<Tok> {
         let p = crate::parse(sql, d);
         tokens(&p.syntax())
+    }
+
+    #[test]
+    fn keywords_that_are_functions_are_not_names() {
+        let e = |src: &str, d: Dialect| {
+            let toks = tokens(&crate::parse(&format!("SELECT {src}"), d).syntax());
+            let mut p = Parser::new(&toks[1..], d);
+            p.expr().unwrap()
+        };
+        for k in [
+            "current_role",
+            "current_catalog",
+            "current_schema",
+            "localtime",
+            "system_user",
+        ] {
+            assert_eq!(
+                e(k, Dialect::Postgres),
+                Expr::Special(k.to_uppercase()),
+                "{k}"
+            );
+        }
+        assert_eq!(
+            e("SYSTEM_USER", Dialect::Tsql),
+            Expr::Special("SYSTEM_USER".into())
+        );
+        // Quoted, they are names; in T-SQL current_role is a name anyway.
+        assert!(matches!(
+            e("\"current_role\"", Dialect::Postgres),
+            Expr::Name(_)
+        ));
+        assert!(matches!(e("[SYSTEM_USER]", Dialect::Tsql), Expr::Name(_)));
+        assert!(matches!(e("current_role", Dialect::Tsql), Expr::Name(_)));
     }
 
     #[test]

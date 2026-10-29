@@ -89,6 +89,32 @@ theorem deleteRows_map (t : TableDef) (c : Option Expr)
     simp only [deleteRows]
     rw [keeps_map _ c hc, deleteRows_map t c hc rs]
 
+/-- (C3b) The rows a query keeps. -/
+theorem keptRows_map (t : TableDef) (c : Option Expr)
+    (hc : ∀ e, c = some e → ∀ ρ, ev' ρ (g e) = ev ρ e) :
+    ∀ rs : List (Row U), keptRows ev' t (c.map g) rs = keptRows ev t c rs
+  | [] => rfl
+  | r :: rs => by
+    simp only [keptRows]
+    rw [keeps_map _ c hc, keptRows_map t c hc rs]
+
+/-- (C3b) A pick whose expressions agree, the variables unchanged. -/
+theorem pickRows_map (t : TableDef) (σ : Store U) (rows : List (Row U)) :
+    ∀ p : Pick, (∀ e ∈ p.exprs, ∀ ρ, ev' ρ e = ev ρ e) →
+      pickRows ev' t σ rows p = pickRows ev t σ rows p
+  | .row n sets, h => by
+    simp only [pickRows]
+    cases rows.getLast? with
+    | none => rfl
+    | some r =>
+      dsimp only
+      have := evalVals_map (ev := ev) (ev' := ev') (g := fun e => e) (rowStore t.cols r)
+        (sets.map (·.2)) (fun e he ρ => h e (by simpa [Pick.exprs] using he) ρ)
+      simp only [List.map_id'] at this
+      rw [this]
+  | .count _, _ => rfl
+  | .any _, _ => rfl
+
 end
 
 /-! ## Statement atomicity -/

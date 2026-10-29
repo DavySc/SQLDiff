@@ -1,0 +1,26 @@
+Changed database context to 'probe_c3b'.
+Q1 select-assign one row: v=10
+Q1 select-assign one row, NULL column: v=NULL
+Q1 select-assign zero rows: v=-1
+Q1 select-assign two targets: v=30 w=300
+Q1 select-assign key = NULL: v=-1
+Q2 select-assign several rows: v in (11,12,13): yes
+Q3 counts: UPDATE t SET n = n WHERE id = 1
+
+(1 rows affected)
+Q3 counts: SELECT @v = n FROM t WHERE id = 1
+Q3 counts: SELECT @v = COUNT(*) FROM t
+Q3 counts: IF EXISTS (SELECT 1 FROM t WHERE id = 1)
+Q3 counts: SET @v = (SELECT n FROM t WHERE id = 1)
+Q3 counts: end
+Q4 exists: adfgi
+Q5 scalar one row: v=300
+Q5 scalar zero rows: v=NULL
+Q5 scalar several rows: error 512 sev 16, v=-1
+Q6 count no rows: c=0
+Q6 count where: c=1
+Q6 count scalar: c=3
+Q6 count type: int
+Q7 exists 1/0: true, no error
+Q8 read own write: v=31
+Changed database context to 'master'.

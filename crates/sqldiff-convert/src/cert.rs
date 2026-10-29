@@ -15,7 +15,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
 use sqldiff_core::proof::{self, Checker, MirrorColumn, MirrorRequest, MirrorTable};
-use sqldiff_syntax::abstract_syntax::{tokens, Stmt, K};
+use sqldiff_syntax::abstract_syntax::{tokens, Expr, From, Select, Stmt, K};
 use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
 use sqldiff_syntax::{encode, parse, plain_table, Dialect, SyntaxKind, SyntaxNode};
 
@@ -52,8 +52,9 @@ pub struct Certificate {
     /// expression has its meaning in the spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scalars: Option<String>,
-    /// The checker's statement slice for a confirmation: `c3a` when the
-    /// routine's data statements were in it, `c1` when it had none.
+    /// The checker's statement slice for a confirmation: `c3b` when the
+    /// routine reads a table (with or without data statements), `c3a` when
+    /// its data statements were in it, `c1` when it had none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statements: Option<String>,
     /// `c4` when the routine's error handling and transactions were in the
@@ -176,7 +177,7 @@ fn returns_value(nodes: &[Node]) -> bool {
         Node::Stmt(Stmt::Return(Some(_))) => true,
         Node::Block(b) => returns_value(&b.body),
         Node::If { then, els, .. } => returns_value(then) || returns_value(els),
-        Node::While { body, .. } => returns_value(body),
+        Node::While { body, .. } | Node::ForQuery { body, .. } => returns_value(body),
         Node::Try { body, handlers } => {
             returns_value(body) || handlers.iter().any(|h| returns_value(&h.body))
         }
@@ -245,7 +246,7 @@ fn tsql_locals(nodes: &[Node], out: &mut Vec<String>) {
                 tsql_locals(then, out);
                 tsql_locals(els, out);
             }
-            Node::While { body, .. } => tsql_locals(body, out),
+            Node::While { body, .. } | Node::ForQuery { body, .. } => tsql_locals(body, out),
             Node::Try { body, handlers } => {
                 tsql_locals(body, out);
                 for h in handlers {
@@ -270,7 +271,7 @@ fn begins_tran_outside_try(nodes: &[Node]) -> bool {
         Node::Txn { op, .. } => op.eq_ignore_ascii_case("BEGIN"),
         Node::Block(b) => begins_tran_outside_try(&b.body),
         Node::If { then, els, .. } => begins_tran_outside_try(then) || begins_tran_outside_try(els),
-        Node::While { body, .. } => begins_tran_outside_try(body),
+        Node::While { body, .. } | Node::ForQuery { body, .. } => begins_tran_outside_try(body),
         _ => false,
     })
 }
@@ -284,7 +285,7 @@ fn callees(nodes: &[Node], out: &mut Vec<Vec<String>>) {
                 callees(then, out);
                 callees(els, out);
             }
-            Node::While { body, .. } => callees(body, out),
+            Node::While { body, .. } | Node::ForQuery { body, .. } => callees(body, out),
             Node::Try { body, handlers } => {
                 callees(body, out);
                 for h in handlers {
@@ -314,11 +315,63 @@ fn written_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
                 written_tables(then, out);
                 written_tables(els, out);
             }
-            Node::While { body, .. } => written_tables(body, out),
+            Node::While { body, .. } | Node::ForQuery { body, .. } => written_tables(body, out),
             Node::Try { body, handlers } => {
                 written_tables(body, out);
                 for h in handlers {
                     written_tables(&h.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The tables in a query's `FROM`, as written (C3b: the checker reads only
+/// a one-table `FROM`; anything else is refused there).
+fn from_tables(q: &Select, out: &mut Vec<Vec<String>>) {
+    for f in &q.from {
+        if let From::Table { name, .. } = f {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+}
+
+/// The tables a routine's queries read, as written, in the shapes the
+/// checker's C3b slice reads: `SELECT @x = ...`, `SET @x = (SELECT ...)`,
+/// `IF [NOT] EXISTS (SELECT ...)` (formal/lean/Sqldiff/Mirror/Lower.lean,
+/// "The C3b slice: queries").
+fn read_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
+    for n in nodes {
+        match n {
+            Node::Stmt(Stmt::Select(q)) | Node::Stmt(Stmt::Assign(_, Expr::Subquery(q))) => {
+                from_tables(q, out)
+            }
+            Node::Block(b) => read_tables(&b.body, out),
+            Node::If { cond, then, els } => {
+                match cond {
+                    Expr::Exists(q) => from_tables(q, out),
+                    Expr::Unary(op, x) if op.eq_ignore_ascii_case("NOT") => {
+                        if let Expr::Exists(q) = x.as_ref() {
+                            from_tables(q, out);
+                        }
+                    }
+                    _ => {}
+                }
+                read_tables(then, out);
+                read_tables(els, out);
+            }
+            Node::While { body, .. } => read_tables(body, out),
+            Node::ForQuery { query, body, .. } => {
+                from_tables(query, out);
+                read_tables(body, out);
+            }
+            Node::Try { body, handlers } => {
+                read_tables(body, out);
+                for h in handlers {
+                    read_tables(&h.body, out);
                 }
             }
             _ => {}
@@ -383,9 +436,39 @@ fn is_ddl(n: &SyntaxNode) -> bool {
     })
 }
 
-/// Plain table definitions of a tree, and every word named elsewhere.
-fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec<String>) {
-    let (mut defs, mut named) = (Vec::new(), Vec::new());
+/// Words inside the string literals of a node: a statement that is not DDL
+/// may still carry DDL as text (`DECLARE @s nvarchar(200) = N'ALTER TABLE
+/// ...'`, then `EXEC (@s)`).
+fn string_words(n: &SyntaxNode, out: &mut Vec<String>) {
+    for t in tokens(n).iter().filter(|t| t.kind == K::Str) {
+        out.extend(
+            t.text
+                .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '@' | '#' | '$')))
+                .filter(|w| !w.is_empty())
+                .map(str::to_lowercase),
+        );
+    }
+}
+
+/// Dynamic SQL: a string run as a statement, whose text no scan can see
+/// when it is built at run time. T-SQL `EXEC (...)`, `EXEC @s`,
+/// `sp_executesql`; PL/pgSQL `EXECUTE` (in PostgreSQL always dynamic).
+fn dynamic_sql(n: &SyntaxNode, d: Dialect) -> bool {
+    let t = tokens(n);
+    t.iter().enumerate().any(|(i, x)| {
+        let exec = x.up == "EXEC" || x.up == "EXECUTE";
+        (exec && d == Dialect::Postgres)
+            || (exec
+                && t.get(i + 1)
+                    .is_some_and(|y| matches!(y.kind, K::LParen | K::Var | K::Str)))
+            || x.up == "SP_EXECUTESQL"
+    })
+}
+
+/// Plain table definitions of a tree, every word named elsewhere, and
+/// whether the tree runs dynamic SQL anywhere.
+fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec<String>, bool) {
+    let (mut defs, mut named, mut dynamic) = (Vec::new(), Vec::new(), false);
     for text in texts {
         let root = parse(text, d).syntax();
         let mut it = root.preorder();
@@ -401,21 +484,26 @@ fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec
                         .find(|t| !matches!(t.up.as_str(), "CREATE" | "OR" | "ALTER" | "REPLACE"))
                         .map(|t| t.up.clone());
                     if matches!(kind.as_deref(), Some("PROCEDURE" | "PROC" | "FUNCTION")) {
-                        // The body names its tables; only DDL in it counts.
+                        // The body names its tables; only DDL in it counts, and
+                        // any table named in a string (DDL kept as text).
                         for s in n
                             .descendants()
                             .filter(|s| s.kind() == SyntaxKind::STATEMENT)
                         {
                             if is_ddl(&s) {
                                 words(&s, d, &mut named);
+                            } else {
+                                string_words(&s, &mut named);
                             }
                         }
+                        dynamic |= dynamic_sql(&n, d);
                     } else {
                         words(&n, d, &mut named);
                     }
                     it.skip_subtree();
                 }
                 SyntaxKind::STATEMENT => {
+                    dynamic |= dynamic_sql(&n, d);
                     match plain_table::read(&n, d) {
                         Ok(t) => defs.push(t),
                         Err(_) => words(&n, d, &mut named),
@@ -426,7 +514,7 @@ fn definitions(texts: &[&str], d: Dialect) -> (Vec<plain_table::PlainTable>, Vec
             }
         }
     }
-    (defs, named)
+    (defs, named, dynamic)
 }
 
 impl Tables {
@@ -436,8 +524,12 @@ impl Tables {
         if (from, to) != (Dialect::Tsql, Dialect::Postgres) {
             return Tables::default();
         }
-        let (src, src_named) = definitions(inputs, from);
-        let (out, out_named) = definitions(outputs, to);
+        let (src, src_named, src_dynamic) = definitions(inputs, from);
+        let (out, out_named, out_dynamic) = definitions(outputs, to);
+        // A statement built at run time may change any table.
+        if src_dynamic || out_dynamic {
+            return Tables::default();
+        }
         let pg = |parts: &[String]| {
             parts
                 .iter()
@@ -628,8 +720,11 @@ pub fn mirror_request(
     }
     let mut written = Vec::new();
     written_tables(&a.body.body, &mut written);
+    // C3b: the tables the routine reads are sent on the same conditions.
+    let mut used = written.clone();
+    read_tables(&a.body.body, &mut used);
     let (mut table_pairs, mut table_catalog) = (Vec::new(), Vec::<MirrorTable>::new());
-    for w in &written {
+    for w in &used {
         if !mappable(w) {
             continue;
         }
@@ -649,6 +744,8 @@ pub fn mirror_request(
     if !table_catalog.is_empty() {
         assumptions.push(TABLES_AS_DECLARED.to_string());
     }
+    // Only writes send a rows-affected count: `SELECT @x = ...`, `IF EXISTS`
+    // and `SET @x = (subquery)` do not (eval/queries Q3).
     if !written.is_empty() && !row_counts {
         assumptions.push("ASM-OBSERVER-ROWCOUNT".to_string());
     }
@@ -1113,5 +1210,14 @@ END
         let read = |src: &str| Tables::read(&[src], &[&out], Dialect::Tsql, Dialect::Postgres);
         assert!(read(ddl).get("acct").is_some());
         assert!(read(&bind).get("acct").is_none());
+        // DDL kept in a variable and run later, and dynamic SQL anywhere.
+        let hidden = format!(
+            "{ddl}GO\nCREATE PROCEDURE dbo.unkey AS\nBEGIN\n  DECLARE @s nvarchar(200) = N'ALTER TABLE dbo.Acct DROP CONSTRAINT PK_Acct';\n  EXEC (@s);\nEND\n"
+        );
+        assert!(read(&hidden).get("acct").is_none());
+        let built = format!(
+            "{ddl}GO\nCREATE PROCEDURE dbo.any @t sysname AS\nBEGIN\n  DECLARE @s nvarchar(200) = N'DROP TABLE ' + @t;\n  EXEC sp_executesql @s;\nEND\n"
+        );
+        assert!(read(&built).get("acct").is_none());
     }
 }

@@ -1,0 +1,21 @@
+NOTICE:  table "t" does not exist, skipping
+NOTICE:  table "d" does not exist, skipping
+NOTICE:  Q1 select-assign one row: v=10
+NOTICE:  Q1 select-assign one row, NULL column: v=NULL
+NOTICE:  Q1 select-assign zero rows: v=-1
+NOTICE:  Q1 select-assign two targets: v=30 w=300
+NOTICE:  Q1 select-assign key = NULL: v=-1
+NOTICE:  Q2 select-assign several rows: iterations=3, v in (11,12,13): yes
+NOTICE:  Q4 exists: adfgi
+NOTICE:  Q5 scalar one row: v=300
+NOTICE:  Q5 scalar zero rows: v=NULL
+NOTICE:  Q5 scalar several rows: error 21000 (more than one row returned by a subquery used as an expression), v=-1
+NOTICE:  Q6 count no rows: c=0
+NOTICE:  Q6 count where: c=1
+NOTICE:  Q6 count scalar: c=3
+NOTICE:  Q6 count type: bigint
+NOTICE:  Q7 exists 1/0: true, no error
+NOTICE:  Q8 read own write: v=31
+NOTICE:  Q9 ambiguous name in FOR query: error 42702
+NOTICE:  Q9 ambiguous name in EXISTS: error 42702
+NOTICE:  Q10 select into zero rows: v=NULL

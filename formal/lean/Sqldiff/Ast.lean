@@ -10,7 +10,7 @@ if it is exactly a value of the schema.
 namespace Sqldiff.Ast
 
 /-- The schema hash requests about abstract syntax carry (`sqldiff_core::proof::ast_schema_hash`). -/
-def schemaHash : String := "c9f7127d840d0fcd"
+def schemaHash : String := "ec077e5c1682af48"
 
 mutual
   inductive Routine where
@@ -34,6 +34,7 @@ mutual
     | NBlock («block» : Block)
     | If («cond» : Expr) («then» : (List Node)) («els» : (List Node))
     | While («cond» : Expr) («body» : (List Node))
+    | ForQuery («var» : String) («query» : Select) («body» : (List Node))
     | Call («name» : (List String)) («args» : (List Arg)) («ret» : (Option Expr))
     | Setting («name» : String) («on» : Bool)
     | Try («body» : (List Node)) («handlers» : (List Handler))
@@ -255,6 +256,11 @@ mutual
       let x0 ← decodeExpr v0
       let x1 ← list? v1 (fun x => decodeNode x)
       pure (.While x0 x1)
+    | .ctor "ForQuery" [v0, v1, v2] => do
+      let x0 ← str? v0
+      let x1 ← decodeSelect v1
+      let x2 ← list? v2 (fun x => decodeNode x)
+      pure (.ForQuery x0 x1 x2)
     | .ctor "Call" [v0, v1, v2] => do
       let x0 ← list? v0 (fun x => str? x)
       let x1 ← list? v1 (fun x => decodeArg x)

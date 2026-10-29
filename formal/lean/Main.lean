@@ -8,7 +8,7 @@ ID is digits; SCHEMA is `sqldiff_core::proof::schema_hash`, which must be
 `Sqldiff.Syntax.schemaHash`; the trees come from
 `sqldiff_core::proof::tree_line` and contain no tab.
 
-The mirror check of phases C1, C2a (with the C2b strings), C3a and C4 (`Sqldiff.Mirror.check`,
+The mirror check of phases C1, C2a (with the C2b strings), C3a, C3b and C4 (`Sqldiff.Mirror.check`,
 theorems `Sqldiff.Mirror.check_sound` and `Sqldiff.Mirror.check_sound_c2a`)
 is a second request kind:
 
@@ -73,6 +73,18 @@ into a target that may hold a string (assignment, `DECLARE` default, a
 function's `RETURN`, an `OUTPUT`/`INOUT` copy-back) must provably keep
 its value, also on the C1 path ("String stores, on every path" in
 `Sqldiff/Mirror/Lower.lean`), else the routine is outside the spec.
+
+0.10.0 (C3b) reads tables: T-SQL `SELECT @x = col, ... FROM t WHERE` the
+whole primary key `=` against the converter's PL/pgSQL `FOR` block, `IF
+[NOT] EXISTS (SELECT 1 FROM t [WHERE c])`, `SET @x = (SELECT col FROM t
+WHERE key)` against `x := (...)`, and `COUNT(*)` into a variable ("The
+C3b slice: queries" in `Sqldiff/Mirror/Lower.lean`). `"statements"` is
+`"c3b"` when the routines read a table (whether or not they also write
+one); a routine that counts rows names `ASM-TSQL-ARITH-ERRORS`. The
+abstract syntax gained the PL/pgSQL `FOR` loop over a query
+(`Node.ForQuery`), so the schema hash changed and an older checker
+answers "unconfirmed" (schema mismatch). The CATALOG now also lists the
+tables a routine only reads; the request format is unchanged.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -126,7 +138,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.9.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.10.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0
