@@ -142,6 +142,57 @@ pub fn object_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
     }
 }
 
+/// Schema (`None` for the default one) and name as the dialect resolves
+/// them, for checks within one dialect: unlike `object_key`, a quoted
+/// PostgreSQL name keeps its case.
+pub fn stored_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
+    if d != Dialect::Postgres {
+        return object_key(parts, d);
+    }
+    let ks: Vec<String> = parts.iter().map(super::table::stored).collect();
+    match ks.as_slice() {
+        [t] => Ok((None, t.clone())),
+        [s, t] if s == "public" => Ok((None, t.clone())),
+        [s, t] => Ok((Some(s.clone()), t.clone())),
+        _ => Err("a name with a database or server part".into()),
+    }
+}
+
+/// PostgreSQL: whether the statement's names may be compared up to letter
+/// case (`object_key`, `fold`), given `schema`, the catalog with the
+/// index's table added when the file creates it (see `Schema::case_check`).
+pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
+    let stored = super::table::stored;
+    match x {
+        Ddl::Index(i) if i.dialect == Dialect::Postgres => {
+            for n in i
+                .table
+                .iter()
+                .chain(i.keys.iter().map(|k| &k.name))
+                .chain(&i.include)
+            {
+                schema.case_check(&stored(n), true)?;
+            }
+            schema.case_check(&stored(&i.name), false)?;
+            for t in i.filter.iter().flatten() {
+                if let Some(n) = name_of(t) {
+                    schema.case_check(&stored(&n), false)?;
+                }
+            }
+        }
+        Ddl::Sequence(q) if q.dialect == Dialect::Postgres => {
+            for n in &q.name {
+                schema.case_check(&stored(n), false)?;
+            }
+        }
+        Ddl::Schema(c) if c.dialect == Dialect::Postgres => {
+            schema.case_check(&stored(&c.name), false)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// What a statement is paired by: kind, schema and name (an index also by
 /// its table, since T-SQL index names are per table).
 pub fn pair_key(x: &Ddl) -> R<String> {

@@ -511,7 +511,7 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-IDENT-FOLD"
-statement = "Unquoted names on both sides name the same objects after case folding."
+statement = "Names on both sides name the same objects after case folding: unquoted names, and quoted PostgreSQL names that no other name of the statement or catalog matches up to letter case."
 discharge = "catalog"
 fact = "The object names in both catalogs and the T-SQL catalog collation."
 fact_key = "collation"

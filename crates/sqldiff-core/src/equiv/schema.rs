@@ -265,6 +265,10 @@ pub struct Schema {
     view: Option<std::sync::Arc<CatalogView>>,
     /// Unqualified names of user tables in more than one schema.
     ambiguous: std::collections::HashSet<String>,
+    /// PostgreSQL: the stored spellings of every catalog name (schemas,
+    /// tables and views, columns, keys, indexes, routines), by lower case.
+    /// Two spellings under one key are names that differ only in letter case.
+    spellings: HashMap<String, std::collections::BTreeSet<String>>,
 }
 
 /// The SQL Server catalog views in `sys_catalog.sql`.
@@ -391,7 +395,44 @@ impl Schema {
         }
         s.ambiguous.extend(extra.ambiguous);
         s.tables.extend(extra.tables);
+        for (k, v) in extra.spellings {
+            s.spellings.entry(k).or_default().extend(v);
+        }
         s
+    }
+
+    /// PostgreSQL: whether a name, spelled as PostgreSQL stores it (a quoted
+    /// name as written, others in lower case), may be compared with T-SQL
+    /// names up to letter case (`ASM-IDENT-FOLD`). Not when the catalog holds
+    /// two names that differ only in letter case (a T-SQL name cannot say
+    /// which it means), nor when it holds the name only in another case
+    /// (PostgreSQL resolves `stored` to none of them). `known`: the name must
+    /// be a catalog name.
+    pub fn case_check(&self, stored: &str, known: bool) -> Result<(), String> {
+        let lower = stored.to_lowercase();
+        match self.spellings.get(&lower) {
+            None if known && stored != lower => Err(format!(
+                "the quoted name \"{stored}\" is not in the catalog, so how PostgreSQL resolves it is not known"
+            )),
+            None => Ok(()),
+            Some(v) if v.len() > 1 => {
+                let v: Vec<&str> = v.iter().map(String::as_str).collect();
+                Err(format!(
+                    "the PostgreSQL catalog has the names \"{}\", which differ only in letter case, so a T-SQL name does not say which one it means",
+                    v.join("\", \"")
+                ))
+            }
+            Some(v) if !v.contains(stored) => Err(format!(
+                "PostgreSQL resolves {} to no catalog object: the catalog spells it \"{}\"",
+                if stored == lower {
+                    stored.to_string()
+                } else {
+                    format!("\"{stored}\"")
+                },
+                v.iter().next().map_or("", String::as_str)
+            )),
+            Some(_) => Ok(()),
+        }
     }
 
     /// Reads DDL artifacts through the shared catalog loader; files fold in order.
@@ -421,6 +462,31 @@ impl Schema {
             view: view.supplied.then(|| std::sync::Arc::new(view.clone())),
             ..Schema::default()
         };
+        if d == Dialect::Postgres {
+            let c = &view.catalog;
+            let names = c
+                .schemas
+                .iter()
+                .chain(
+                    c.routines
+                        .iter()
+                        .flat_map(|r| r.schema.iter().chain([&r.name])),
+                )
+                .chain(c.tables.iter().flat_map(|t| {
+                    t.schema
+                        .iter()
+                        .chain([&t.name])
+                        .chain(t.columns.iter().map(|c| &c.name))
+                        .chain(t.keys.iter().filter_map(|k| k.name.as_ref()))
+                        .chain(t.indexes.iter().map(|i| &i.name))
+                }));
+            for n in names {
+                s.spellings
+                    .entry(n.to_lowercase())
+                    .or_default()
+                    .insert(n.clone());
+            }
+        }
         // Base and temporary tables only: view columns are derived, and their
         // types and nullability are not facts equivalence may rely on.
         for t in view

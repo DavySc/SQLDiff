@@ -167,20 +167,17 @@ fn word(t: Option<&Tok>, w: &str) -> bool {
     t.is_some_and(|t| t.kind == K::Word && t.up == w)
 }
 
-/// The key a name part resolves to (see `table::key`): T-SQL ignores case
-/// (`ASM-IDENT-FOLD`), PostgreSQL folds unquoted names to lower case; a
-/// quoted PostgreSQL name with capitals matches no unquoted name.
+/// The key a name part resolves to within its dialect (see `table::key`):
+/// T-SQL ignores case (`ASM-IDENT-FOLD`), PostgreSQL folds unquoted names to
+/// lower case and keeps a quoted name as written.
 fn key(n: &Name, d: Dialect) -> R<String> {
     match d {
-        Dialect::Postgres if n.quoted && n.text != n.text.to_lowercase() => Err(format!(
-            "the quoted name \"{}\" keeps its capitals in PostgreSQL",
-            n.text
-        )),
+        Dialect::Postgres if n.quoted => Ok(n.text.clone()),
         _ => Ok(n.text.to_lowercase()),
     }
 }
 
-/// Schema (`None` for the default one) and name.
+/// Schema (`None` for the default one) and name, each as `key` resolves it.
 fn object_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
     let default = match d {
         Dialect::Tsql => "dbo",
@@ -194,6 +191,37 @@ fn object_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
             Ok(((s != default).then_some(s), key(o, d)?))
         }
         _ => Err("a name with more than two parts".into()),
+    }
+}
+
+/// The names a PostgreSQL statement uses, checked against its catalog: a
+/// T-SQL name matches the PostgreSQL name that differs from it only in
+/// letter case (`ASM-IDENT-FOLD`), which says nothing when the catalog holds
+/// two names that differ only in letter case (see `Schema::case_check`).
+fn case_check<'n>(names: impl IntoIterator<Item = &'n Name>, s: &Side) -> R<()> {
+    if s.d != Dialect::Postgres {
+        return Ok(());
+    }
+    for n in names {
+        s.schema
+            .case_check(&key(n, s.d)?, true)
+            .map_err(|e| format!("{}: {e}", s.name))?;
+    }
+    Ok(())
+}
+
+impl Target {
+    fn names(&self) -> Vec<&Name> {
+        match self {
+            Target::Schema(s) => vec![s],
+            Target::Object(_, s, o) => vec![s, o],
+            Target::Column(_, s, o, c) => vec![s, o, c],
+            Target::Index(s, t, x) => [Some(s), t.as_ref(), Some(x)]
+                .into_iter()
+                .flatten()
+                .collect(),
+            Target::Constraint(s, t, c) => vec![s, t, c],
+        }
     }
 }
 
@@ -535,34 +563,36 @@ fn extended_property(rest: &[Tok]) -> R<Comment> {
 /// What pairs a statement with its counterpart: the call's procedure, or
 /// the comment's object.
 pub fn pair_key(s: &Stmt, d: Dialect) -> R<String> {
+    // Names pair up to letter case (`ASM-IDENT-FOLD`); `compare` checks that
+    // the PostgreSQL catalog has no other name differing only in case.
+    let k = |n: &Name| -> R<String> { Ok(key(n, d)?.to_lowercase()) };
     let schema = |n: &Name| -> R<String> {
-        let k = key(n, d)?;
         let default = if d == Dialect::Tsql { "dbo" } else { "public" };
-        Ok(if k == default { String::new() } else { k })
+        Ok(if key(n, d)? == default {
+            String::new()
+        } else {
+            k(n)?
+        })
     };
     Ok(match s {
         Stmt::Call(c) => {
             let (s, o) = object_key(&c.name, d)?;
-            format!("call {}.{o}", s.unwrap_or_default())
+            format!(
+                "call {}.{}",
+                s.unwrap_or_default().to_lowercase(),
+                o.to_lowercase()
+            )
         }
         Stmt::Comment(c) => match &c.target {
-            Target::Schema(s) => format!("comment schema {}", key(s, d)?),
-            Target::Object(k, s, o) => format!("comment {k} {}.{}", schema(s)?, key(o, d)?),
+            Target::Schema(s) => format!("comment schema {}", k(s)?),
+            Target::Object(kind, s, o) => format!("comment {kind} {}.{}", schema(s)?, k(o)?),
             Target::Column(_, s, o, c) => {
-                format!(
-                    "comment column {}.{}.{}",
-                    schema(s)?,
-                    key(o, d)?,
-                    key(c, d)?
-                )
+                format!("comment column {}.{}.{}", schema(s)?, k(o)?, k(c)?)
             }
-            Target::Index(s, _, x) => format!("comment index {}.{}", schema(s)?, key(x, d)?),
-            Target::Constraint(s, t, c) => format!(
-                "comment constraint {}.{}.{}",
-                schema(s)?,
-                key(t, d)?,
-                key(c, d)?
-            ),
+            Target::Index(s, _, x) => format!("comment index {}.{}", schema(s)?, k(x)?),
+            Target::Constraint(s, t, c) => {
+                format!("comment constraint {}.{}.{}", schema(s)?, k(t)?, k(c)?)
+            }
         },
     })
 }
@@ -774,7 +804,7 @@ fn comments(x: &Comment, t: &Side, y: &Comment, p: &Side) -> Verdict {
             }
             (tg, _) => tg.clone(),
         };
-        if let Err(e) = exists(&target, view, s.name) {
+        if let Err(e) = exists(&target, view, s.name).and_then(|_| case_check(target.names(), s)) {
             return Verdict::Unknown(e);
         }
     }
@@ -920,7 +950,11 @@ fn value(ts: &[Tok], d: Dialect) -> R<Val> {
             Ok(Val::Bool(t.up == "TRUE"))
         }
         [t] if matches!(t.kind, K::Word | K::Quoted) && d == Dialect::Postgres => {
-            Ok(Val::Var(key(&name_of(t).unwrap(), d)?))
+            let n = name_of(t).unwrap();
+            if n.quoted && n.text != n.text.to_lowercase() {
+                return Err(format!("the quoted variable name \"{}\"", n.text));
+            }
+            Ok(Val::Var(key(&n, d)?))
         }
         [t] if t.kind == K::Str => {
             if d == Dialect::Postgres && !t.text.starts_with('\'') {
@@ -1184,6 +1218,7 @@ fn comparable(x: &Term, y: &Term) -> bool {
 fn calls(x: &Call, t: &Side, y: &Call, p: &Side) -> R<Verdict> {
     let mut asms = vec![asm::make(asms::CALLEE), asm::make(asm::IDENT_FOLD)];
     let (rt, rp) = (callee(x, t)?, callee(y, p)?);
+    case_check(&y.name, p)?;
     if object_key(&x.name, t.d)?.0.is_none() && object_key(&y.name, p.d)?.0.is_none() {
         asms.push(asm::make(asm::DEFAULT_SCHEMA));
     }
