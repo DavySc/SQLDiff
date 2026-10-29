@@ -492,18 +492,31 @@ struct Ddl {
     /// the top level: a `varchar` column created after it trims trailing
     /// spaces on every write (eval/tables T3).
     padding_off: bool,
+    /// A T-SQL `ALTER DATABASE ... COLLATE`: columns created before it keep
+    /// the old collation, so no column is known to have the database's.
+    collation_changed: bool,
 }
 
-/// `SET ANSI_PADDING OFF` or `SET ANSI_DEFAULTS OFF` (which turns
-/// `ANSI_PADDING` off too).
+/// A statement that may turn `ANSI_PADDING` off: `SET ANSI_PADDING OFF`,
+/// `SET ANSI_DEFAULTS OFF` (which turns it off too), `ALTER DATABASE ...
+/// SET ANSI_PADDING OFF`, or `sp_configure 'user options'` (the server's
+/// default for connections). Any such statement counts, wherever it stands.
 fn padding_off(n: &SyntaxNode) -> bool {
     let t = tokens(n);
-    t.len() >= 3
-        && t[0].up == "SET"
-        && t[t.len() - 1].up == "OFF"
-        && t[1..t.len() - 1]
-            .iter()
-            .any(|x| x.up == "ANSI_PADDING" || x.up == "ANSI_DEFAULTS")
+    let named = |w: &str| t.iter().any(|x| x.up == w);
+    ((named("ANSI_PADDING") || named("ANSI_DEFAULTS")) && named("OFF"))
+        || (named("SP_CONFIGURE")
+            && t.iter()
+                .any(|x| x.kind == K::Str && x.text.to_lowercase().contains("user options")))
+}
+
+/// `ALTER DATABASE ... COLLATE ...`.
+fn collation_changed(n: &SyntaxNode) -> bool {
+    let t = tokens(n);
+    t.len() >= 2
+        && t[0].up == "ALTER"
+        && t[1].up == "DATABASE"
+        && t.iter().any(|x| x.up == "COLLATE")
 }
 
 /// Plain table definitions and (C3c) plain indexes of a tree, every word
@@ -511,7 +524,7 @@ fn padding_off(n: &SyntaxNode) -> bool {
 /// whether it turns `ANSI_PADDING` off.
 fn definitions(texts: &[&str], d: Dialect) -> Ddl {
     let (mut defs, mut named, mut dynamic) = (Vec::new(), Vec::new(), false);
-    let (mut indexes, mut padding) = (Vec::new(), false);
+    let (mut indexes, mut padding, mut collation) = (Vec::new(), false, false);
     for text in texts {
         let root = parse(text, d).syntax();
         let mut it = root.preorder();
@@ -548,6 +561,7 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
                 SyntaxKind::STATEMENT => {
                     dynamic |= dynamic_sql(&n, d);
                     padding |= d == Dialect::Tsql && padding_off(&n);
+                    collation |= d == Dialect::Tsql && collation_changed(&n);
                     match plain_table::read(&n, d) {
                         Ok(t) => defs.push(t),
                         // C3c: a plain index is checked against its table's
@@ -570,6 +584,7 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
         named,
         dynamic,
         padding_off: padding,
+        collation_changed: collation,
     }
 }
 
@@ -622,7 +637,9 @@ impl Tables {
         let src_ddl = definitions(inputs, from);
         let out_ddl = definitions(outputs, to);
         // A statement built at run time may change any table.
-        if src_ddl.dynamic || out_ddl.dynamic {
+        // After a change of the database's collation no column is known to
+        // have it (ASM-TABLES-AS-DECLARED); every table is kept out.
+        if src_ddl.dynamic || out_ddl.dynamic || src_ddl.collation_changed {
             return Tables::default();
         }
         let (src, src_named) = (&src_ddl.defs, &src_ddl.named);
@@ -634,15 +651,17 @@ impl Tables {
                 .collect::<Vec<_>>()
                 .join(".")
         };
-        let mut by_target = Vec::new();
-        for a in src {
-            let key = target_routine(&a.name).0;
-            let last = key
-                .rsplit('.')
+        let last_of = |key: &str| {
+            key.rsplit('.')
                 .next()
                 .unwrap_or_default()
                 .trim_start_matches('"')
-                .to_lowercase();
+                .to_lowercase()
+        };
+        let mut by_target = Vec::new();
+        for a in src {
+            let key = target_routine(&a.name).0;
+            let last = last_of(&key);
             let once = src
                 .iter()
                 .filter(|x| target_routine(&x.name).0 == key)
@@ -655,6 +674,19 @@ impl Tables {
                 || out_named.contains(&last)
                 || a.cols.len() != b.cols.len()
             {
+                continue;
+            }
+            // C3c: an index naming the table under another spelling
+            // (`MyDb.dbo.W`, `public.w`) may be on it; it keeps it out, as
+            // any other statement naming it does.
+            let elsewhere = src_ddl.indexes.iter().any(|ix| {
+                let k = target_routine(&ix.table).0;
+                k != key && last_of(&k) == last
+            }) || out_ddl.indexes.iter().any(|ix| {
+                let k = pg(&ix.table);
+                k != key && last_of(&k) == last
+            });
+            if elsewhere {
                 continue;
             }
             // C3c: every index on the table, on either side, is plain and
@@ -1363,6 +1395,28 @@ END
         // to text, without the default, with another default.
         let out = convert(ddl);
         assert!(tables_of(ddl, &out).get("cust").is_some());
+        // An index on another spelling of the table's name, on one side
+        // only (the other side's tree as converted from the bare DDL), and
+        // padding turned off for the database or the server.
+        for extra in [
+            "CREATE INDEX IX_Name ON MyDb.dbo.Cust (Name);\n",
+            "CREATE INDEX IX_Name ON srv.MyDb.dbo.Cust (Name);\n",
+            "ALTER DATABASE CURRENT SET ANSI_PADDING OFF;\n",
+            "EXEC sp_configure 'user options', 16;\n",
+            "ALTER DATABASE CURRENT COLLATE Latin1_General_100_BIN2;\n",
+        ] {
+            let src = format!("{ddl}{extra}");
+            assert!(tables_of(&src, &out).get("cust").is_none(), "{extra}");
+        }
+        for extra in [
+            "CREATE INDEX ix_name ON public.cust (name);\n",
+            "CREATE INDEX ix_name ON \"public\".\"cust\" (name);\n",
+            "CREATE INDEX ix_name ON mydb.public.cust (name);\n",
+            "CREATE INDEX ix_name ON dbo.cust (name);\n",
+        ] {
+            let edited = format!("{out}{extra}");
+            assert!(tables_of(ddl, &edited).get("cust").is_none(), "{extra}");
+        }
         for (from, to) in [
             ("Name varchar(20)", "Name varchar(21)"),
             ("Name varchar(20)", "Name text"),

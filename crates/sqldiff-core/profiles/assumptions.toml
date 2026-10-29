@@ -984,7 +984,7 @@ sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TABLES-AS-DECLARED"
-statement = "The tables a converted routine writes or reads are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree, and string columns have the database's default collation."
+statement = "The tables a converted routine writes or reads are, in both databases, exactly as the converted tree's DDL declares them: no constraint, default, trigger, rule, policy or index is added outside the tree, string columns have the database's default collation, and PostgreSQL uses the default 8 kB block size (its btree entry limit; SQL Server's index key limits hold from 2016, the oldest version supported)."
 discharge = "catalog"
 fact = "Both databases' catalogs: the tables' definitions (columns, types, defaults, keys, indexes, column collations) match the tree's CREATE TABLE and CREATE INDEX statements."
 sites = ["sqldiff-convert/src/cert.rs"]
