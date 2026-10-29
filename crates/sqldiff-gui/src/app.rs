@@ -15,6 +15,8 @@
 //!   drift` does
 //! - `POST /api/runs/changes` `{"repo", "base", "out", ...}`: review the SQL a
 //!   branch changed, as `sqldiff changes` does
+//! - `POST /api/runs/format` `{"dir", "write"?, "config"?}`: lay out the SQL
+//!   files of a folder, as `sqldiff fmt --check` (or `--write`) does
 //! - `POST /api/runs/batch` `{"sources": [{"src", "from"}, ...], "targets",
 //!   "out", ...}`: convert every source into every target dialect, one run
 //!   each (a batch), with one summary matrix
@@ -36,6 +38,10 @@
 //! (`--host`), anyone who can reach it could otherwise browse the disk, read
 //! any file through a comparison or write a conversion anywhere.
 //!
+//! Every POST carries this launch's token (`X-SQLDiff-Token`), which only
+//! the pages this server serves have (a `<meta name="sqldiff-token">`);
+//! without it nothing is routed.
+//!
 //! Each view keeps its own page and API. The app mounts the API under the
 //! view's path, tells the page where (`BASE` in the page) and puts the rail in
 //! front of it. Requests pass the same checks as the single-view servers
@@ -56,7 +62,10 @@ use crate::convert;
 use crate::convert_review::{self, Review};
 use crate::packs::LoadedPack;
 use crate::review::Store;
-use crate::runs::{BatchSpec, ChangesSpec, ConvertSpec, DriftSpec, InstancesSpec, Runs};
+use crate::runs::{
+    self, BatchSpec, ChangesSpec, ConvertSpec, DriftSpec, FormatSpec, InstancesSpec, ReviewOpen,
+    Runs,
+};
 use crate::server::{
     allowed_hosts, bad, json, not_found, param, read_request, respond, Request, Response,
 };
@@ -230,6 +239,7 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
         | ("POST", "/api/runs/instances")
         | ("POST", "/api/runs/drift")
         | ("POST", "/api/runs/changes")
+        | ("POST", "/api/runs/format")
         | ("POST", "/api/runs/batch")
         | ("GET", "/api/settings")
         | ("POST", "/api/settings/preview")
@@ -279,6 +289,27 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
                 Ok(run) => json(&run.view()),
                 Err(e) => bad(e),
             }
+        }
+        ("POST", "/api/runs/format") => {
+            return match serde_json::from_slice::<FormatSpec>(&req.body)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| {
+                    // A pack given at launch is private too (the runs do
+                    // not know the launch packs).
+                    let own = browse::absolute(Path::new(spec.dir.trim()))
+                        .join(sqldiff_source::config::PROJECT_FILE);
+                    match settings::private_file(&own, app.isolated, &app.packs) {
+                        true => Err(format!(
+                            "{}: this file is also a private pack, whose contents are not shown; choose another folder",
+                            own.display()
+                        )),
+                        false => app.runs.start_format(spec, app.isolated, |_| {}),
+                    }
+                })
+            {
+                Ok(run) => json(&run.view()),
+                Err(e) => bad(e),
+            };
         }
         ("POST", "/api/runs/changes") => {
             return match serde_json::from_slice::<ChangesSpec>(&req.body)
@@ -339,7 +370,23 @@ fn route(app: &Arc<Shared>, req: Request) -> Response {
             return ("403 Forbidden", "text/plain", NOT_LOCAL.to_string());
         }
         let review = match app.runs.open_review(&run, app.isolated) {
-            Ok(Some(r)) => r,
+            Ok(Some(ReviewOpen::Ready(r))) => r,
+            // Converting again: the page waits, an API call is told to.
+            Ok(Some(ReviewOpen::Opening { checked, total })) => {
+                return match (req.method.as_str(), sub.path.as_str()) {
+                    ("GET", "/") => page(
+                        app,
+                        View::Review,
+                        runs::opening_page(run.id, checked, total),
+                        &prefix,
+                    ),
+                    _ => (
+                        "503 Service Unavailable",
+                        "text/plain",
+                        "the review is still opening (converting the source again); try again shortly".into(),
+                    ),
+                };
+            }
             Ok(None) => return not_found(),
             Err(e) => return ("409 Conflict", "text/plain", e),
         };

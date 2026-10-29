@@ -6,7 +6,7 @@ use std::process::Command;
 
 use sqldiff_gui::runs::{
     self, BatchSource, BatchSpec, ChangesSpec, Command as Sheet, ConvertSpec, DriftSpec, DriftTree,
-    InstancesSpec, Run, Runs, State,
+    FormatSpec, InstancesSpec, Run, Runs, State,
 };
 
 fn write(p: &Path, text: &str) {
@@ -852,6 +852,73 @@ fn a_batch_and_its_script_write_the_same() {
         Some(2),
         "{}",
         String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_format_run_and_its_command_lay_out_the_same() {
+    let d = std::env::temp_dir().join(format!("sqldiff-gui-parity-fmt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    let elsewhere = d.join("elsewhere");
+    write(&elsewhere.join("sqldiff.toml"), "not a config [\n");
+    // The same folder twice: one laid out by the run, one by its command.
+    for side in ["gui ws", "cli ws"] {
+        let ws = d.join(side);
+        write(
+            &ws.join("sqldiff.toml"),
+            "[format]\nkeyword_case = \"lower\"\n\n[format.tsql]\none_item_per_line = true\n",
+        );
+        write(&ws.join("a.pg.sql"), "select a,b from t where x=1\n");
+        write(
+            &ws.join("sub/b.tsql.sql"),
+            "SELECT a,b FROM t WHERE x=1;\r\nGO\r\n",
+        );
+        write(&ws.join("sub/c.pg.sql"), "select 1\n");
+        write(&ws.join("notes.txt"), "select a,b\n");
+    }
+    let spec = |side: &str, write: bool| FormatSpec {
+        dir: d.join(side).display().to_string(),
+        write,
+        config: Some(d.join(side).join("sqldiff.toml").display().to_string()),
+    };
+    let runs = Runs::default();
+    for write in [false, true] {
+        let run = runs
+            .start_format(spec("gui ws", write), true, |_| {})
+            .unwrap();
+        let state = finish(&run);
+        let State::Done { complete, .. } = &state else {
+            panic!("{write}: {state:?}");
+        };
+        let sheet = runs::format_command(&spec("cli ws", write), true).unwrap();
+        assert!(
+            sheet.args.contains(&"--isolated".to_string()),
+            "{}",
+            sheet.sh
+        );
+        assert!(sheet.args.contains(&"--config".to_string()), "{}", sheet.sh);
+        let o = run_sheet(&sheet, &elsewhere, &d.join("absent.toml"));
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            o.status.code().is_some_and(|c| c <= 1),
+            "{write}: {}\n{err}",
+            sheet.sh
+        );
+        assert_eq!(*complete, o.status.code() == Some(0), "{write}: {err}");
+        assert_eq!(
+            files(&d.join("gui ws")),
+            files(&d.join("cli ws")),
+            "{write}: {}",
+            sheet.sh
+        );
+    }
+    // Laid out with the folder's settings, CRLF kept.
+    let b = std::fs::read_to_string(d.join("gui ws/sub/b.tsql.sql")).unwrap();
+    assert!(b.starts_with("select a,\r\n"), "{b:?}");
+    assert_eq!(
+        std::fs::read_to_string(d.join("gui ws/notes.txt")).unwrap(),
+        "select a,b\n"
     );
     let _ = std::fs::remove_dir_all(&d);
 }

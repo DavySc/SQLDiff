@@ -258,6 +258,11 @@ fn load(dir: &str, ctx: &Ctx) -> Result<Workspace, String> {
     })
 }
 
+/// [`is_private_file`] for a caller outside the settings routes.
+pub(crate) fn private_file(file: &Path, isolated: bool, packs: &[PathBuf]) -> bool {
+    is_private_file(file, &Ctx { isolated, packs })
+}
+
 /// `file` is the user config or a private pack the app would load,
 /// including the packs given at launch.
 fn is_private_file(file: &Path, ctx: &Ctx) -> bool {

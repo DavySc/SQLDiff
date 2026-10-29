@@ -8,7 +8,7 @@ use sqldiff_convert::tree;
 use sqldiff_convert::Status;
 use sqldiff_core::Dialect;
 use sqldiff_gui::convert_review::{
-    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_STALE,
+    Action, RecordRequest, Review, Setup, Target, UnitView, GATE_BLOCKERS_SHOWN, GATE_STALE,
 };
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
@@ -661,4 +661,80 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
         .items
         .iter()
         .any(|i| i.item.path != "r.sql" && i.open_assumptions.contains(&rule)));
+}
+
+#[test]
+fn the_page_gets_the_gates_first_blockers_and_how_many_there_are() {
+    let f = Fixture::new("gate-shown", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
+    let r = f.open();
+    let mut st = r.state(false);
+    let g = st.gate.as_mut().expect("judged");
+    let first = g.blockers[0].clone();
+    g.blockers = vec![first; GATE_BLOCKERS_SHOWN + 5];
+    let full = serde_json::to_value(&*g).unwrap();
+    let v = serde_json::to_value(&st).unwrap();
+    let shown = v["gate"]["blockers"].as_array().unwrap();
+    assert_eq!(shown.len(), GATE_BLOCKERS_SHOWN);
+    assert_eq!(v["gate"]["blockers_total"], GATE_BLOCKERS_SHOWN + 5);
+    // Everything else as the gate has it.
+    let mut expect = full;
+    expect["blockers"] = serde_json::Value::Array(shown.clone());
+    expect["blockers_total"] = (GATE_BLOCKERS_SHOWN + 5).into();
+    assert_eq!(v["gate"], expect);
+    // `/api/gate` gives the state's gate, error and time.
+    let st = serde_json::to_value(r.state(false)).unwrap();
+    let gate = serde_json::to_value(r.gate_state()).unwrap();
+    for k in ["gate", "gate_error", "gate_judged"] {
+        assert_eq!(gate[k], st[k], "{k}");
+    }
+    assert_eq!(
+        st["gate"]["blockers_total"],
+        st["gate"]["blockers"].as_array().unwrap().len()
+    );
+}
+
+#[test]
+fn the_gate_banner_counts_the_blockers_it_does_not_list() {
+    use std::process::Command;
+    if Command::new("node").arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "node is needed for this test on CI"
+        );
+        eprintln!("skipped: node not found");
+        return;
+    }
+    // CRLF where Windows CI checks the page out so.
+    let page = sqldiff_gui::convert_review::REVIEW_HTML.replace("\r\n", "\n");
+    let esc = &page[page.find("const esc = ").expect("esc")..];
+    let esc = &esc[..esc.find('\n').unwrap()];
+    let list = &page[page.find("function blockerList(g)").expect("blockerList")..];
+    let list = &list[..list.find("\n}\n").unwrap() + 2];
+    let blocker =
+        serde_json::json!({ "kind": "open", "path": "a.sql", "out_line": 3, "what": "x" });
+    let gate = |shown: usize, total: usize| serde_json::json!({ "blockers": vec![blocker.clone(); shown], "blockers_total": total });
+    let script = format!(
+        "{esc}\n{list}\nfor (const g of [{}, {}]) console.log(blockerList(g));\n",
+        gate(GATE_BLOCKERS_SHOWN, GATE_BLOCKERS_SHOWN + 5),
+        gate(2, 2),
+    );
+    let dir = std::env::temp_dir().join(format!("sqldiff-banner-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("banner.js"), script).unwrap();
+    let out = Command::new("node")
+        .arg(dir.join("banner.js"))
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0].matches("<li>a.sql:3").count(), GATE_BLOCKERS_SHOWN);
+    assert!(lines[0].contains("<li>… and 5 more</li>"), "{}", lines[0]);
+    assert_eq!(lines[1].matches("<li>a.sql:3").count(), 2);
+    assert!(!lines[1].contains("more"), "{}", lines[1]);
 }
