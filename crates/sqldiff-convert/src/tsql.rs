@@ -2446,6 +2446,12 @@ impl<'a> Cx<'a> {
                 self.expr(&ts[value..]).trim().to_string()
             };
             self.step_ts_with("tsql.stmt.set-variable", &ts, op.s.clone());
+            // `SET @b += 0x…` on a VARBINARY variable appends bytes.
+            let bin_concat =
+                op.s == "+=" && self.is_varbinary_var(&a.s) && self.binary_chain(&ts[value..]);
+            if bin_concat {
+                self.binary_concat_note(std::slice::from_ref(op));
+            }
             let assign = |v: String| {
                 if self.db2() {
                     format!("SET {target} = {v}")
@@ -2456,7 +2462,7 @@ impl<'a> Cx<'a> {
             return match op.s.as_str() {
                 "=" => Ok(assign(rhs)),
                 "+=" | "-=" | "*=" | "/=" => {
-                    let o = if op.s == "+=" && self.is_string_var(&a.s) {
+                    let o = if bin_concat || (op.s == "+=" && self.is_string_var(&a.s)) {
                         "||".to_string()
                     } else {
                         op.s[..1].to_string()
@@ -4139,6 +4145,38 @@ impl<'a> Cx<'a> {
 
     // ----- expressions ----------------------------------------------------------
 
+    fn is_varbinary_var(&self, v: &str) -> bool {
+        self.vars
+            .get(&v.trim_start_matches('@').to_ascii_lowercase())
+            .is_some_and(|x| x.dt == Dt::VarBinary)
+    }
+
+    /// `ts` is binary operands (`0x…` constants, VARBINARY variables) joined
+    /// by `+` and nothing else. Only then is every `+` in it a binary
+    /// concatenation: next to a number or a string, T-SQL converts the
+    /// binary value instead (int and the string types rank above varbinary).
+    fn binary_chain(&self, ts: &[T]) -> bool {
+        let s = sig(ts);
+        !s.is_empty()
+            && s.len() % 2 == 1
+            && s.iter().enumerate().all(|(n, &j)| {
+                let t = &ts[j];
+                if n % 2 == 1 {
+                    return t.k == OP && t.s == "+";
+                }
+                match t.k {
+                    NUMBER => t.s.len() >= 2 && t.s[..2].eq_ignore_ascii_case("0x"),
+                    VARIABLE => self.is_varbinary_var(&t.s),
+                    _ => false,
+                }
+            })
+    }
+
+    fn binary_concat_note(&mut self, at: &[T]) {
+        self.step_ts("tsql.expr.binary-concat", at);
+        self.note(Status::Assumptions, "ASM-CONCAT-NULL", "Binary + becomes ||; both give NULL when an operand is NULL (CONCAT_NULL_YIELDS_NULL ON, the default).");
+    }
+
     fn is_string_var(&self, v: &str) -> bool {
         self.vars
             .get(&v.trim_start_matches('@').to_ascii_lowercase())
@@ -4329,6 +4367,11 @@ impl<'a> Cx<'a> {
                 o.push_str(lit);
                 self.string_compare(ts, i);
                 self.fraction_note(t, lit);
+            }
+            // `0x01 + @b`: every operand is binary, so `+` concatenates.
+            OP if t.s == "+" && self.binary_chain(ts) => {
+                self.binary_concat_note(&ts[i..=i]);
+                o.push_str("||");
             }
             OP if t.s == "+" => {
                 let l = self.operand_kind(ts, prev_sig(ts, i));
@@ -6445,6 +6488,8 @@ enum Dt {
     /// A string (a literal, or a CHAR/VARCHAR value).
     Text,
     Bit,
+    /// VARBINARY(n) or VARBINARY(MAX): `+` concatenates.
+    VarBinary,
     Other,
 }
 
@@ -6466,6 +6511,7 @@ impl Dt {
             "CHAR" | "NCHAR" | "VARCHAR" | "NVARCHAR" | "CHARACTER" | "CHARACTER VARYING"
             | "TEXT" | "NTEXT" | "SYSNAME" => Dt::Text,
             "BIT" => Dt::Bit,
+            "VARBINARY" | "BINARY VARYING" => Dt::VarBinary,
             _ => Dt::Other,
         }
     }
