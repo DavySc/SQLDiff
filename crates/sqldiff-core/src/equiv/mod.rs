@@ -87,21 +87,25 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
     while let Some(s) = stmts.next() {
         c.reset();
         let mut nodes = vec![s.node.clone()];
-        let res = match &s.ast {
-            Err(e) => Err(e.clone()),
+        let res = match (&s.msg, &s.ast) {
+            // A message a format builds: compared as its text.
+            (Some(m), _) => c.message(m),
+            (None, Err(e)) => Err(e.clone()),
             // T-SQL inline table function: `RETURN` and its SELECT are two CST statements.
-            Ok(ast::Stmt::Return(None)) if unit.kind == UnitKind::TableFn => match stmts.peek() {
-                Some(next) => match &next.ast {
-                    Ok(ast::Stmt::Select(q)) => {
-                        nodes.push(next.node.clone());
-                        stmts.next();
-                        c.stmt(&ast::Stmt::Return(Some(ast::Expr::Subquery(q.clone()))))
-                    }
-                    _ => c.stmt(&ast::Stmt::Return(None)),
-                },
-                None => c.stmt(&ast::Stmt::Return(None)),
-            },
-            Ok(st) => c.stmt(st),
+            (None, Ok(ast::Stmt::Return(None))) if unit.kind == UnitKind::TableFn => {
+                match stmts.peek() {
+                    Some(next) => match &next.ast {
+                        Ok(ast::Stmt::Select(q)) => {
+                            nodes.push(next.node.clone());
+                            stmts.next();
+                            c.stmt(&ast::Stmt::Return(Some(ast::Expr::Subquery(q.clone()))))
+                        }
+                        _ => c.stmt(&ast::Stmt::Return(None)),
+                    },
+                    None => c.stmt(&ast::Stmt::Return(None)),
+                }
+            }
+            (None, Ok(st)) => c.stmt(st),
         };
         let (term, err) = match res {
             Ok(t) => (t, None),
