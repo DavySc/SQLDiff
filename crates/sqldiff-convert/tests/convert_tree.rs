@@ -362,3 +362,68 @@ fn parameters_may_say_as() {
         c.output
     );
 }
+
+#[test]
+fn a_call_after_a_statement_only_one_side_writes_is_placed_by_the_trace() {
+    // `RETURN 0` makes the conversion add `return_code := 0;` at the start,
+    // so the PostgreSQL CALL has one statement more before it.
+    let callee = "CREATE PROCEDURE Sales.Touch AS\nBEGIN\n  SET NOCOUNT ON;\nEND\n";
+    let caller = "CREATE PROCEDURE p AS\nBEGIN\n  EXEC Sales.Touch;\n  RETURN 0;\nEND\n";
+    let cat = source_catalog(&[callee, caller]);
+    let d = rewrite_in(caller, Dialect::Tsql, Dialect::Postgres, Some(&cat));
+    let c = sqldiff_convert::check(caller, d, &Options::default());
+    let u = unit(&c, caller, "EXEC");
+    assert!(
+        !u.notes.iter().any(|n| n.text.contains("same place")),
+        "{:?}\n{}",
+        u.notes,
+        c.output
+    );
+    assert!(
+        u.status < Status::NotConverted,
+        "{:?}\n{}",
+        u.notes,
+        c.output
+    );
+}
+
+#[test]
+fn exec_with_output_in_a_script_becomes_a_call_in_a_do_block() {
+    let callee = "CREATE PROCEDURE Sales.NextOrder @CustomerID int, @OrderID int OUTPUT AS\nBEGIN\n  SET @OrderID = 1;\nEND\n";
+    let callee_pg = "CREATE SCHEMA sales;\nCREATE PROCEDURE Sales.NextOrder(p_customer_id integer, INOUT p_order_id integer)\nLANGUAGE plpgsql AS $$ BEGIN p_order_id := 1; END $$;\n";
+    // The PRINT batch becomes a block of its own on one side only, so the
+    // script is compared as a whole rather than block by block.
+    let script = "PRINT N'Adding';\nGO\nDECLARE @id int;\nEXEC Sales.NextOrder @CustomerID = 5, @OrderID = @id OUTPUT;\nGO\n";
+    let cat = source_catalog(&[callee, script]);
+    let d = rewrite_in(script, Dialect::Tsql, Dialect::Postgres, Some(&cat));
+    let o = Options {
+        catalog_a: vec![sqldiff_core::Artifact::new(
+            "cat.sql",
+            Dialect::Tsql,
+            callee,
+        )],
+        catalog_b: vec![sqldiff_core::Artifact::new(
+            "cat.pg.sql",
+            Dialect::Postgres,
+            callee_pg,
+        )],
+        ..Options::default()
+    };
+    let c = sqldiff_convert::check(script, d, &o);
+    assert!(c.output.contains("DO $$"), "{}", c.output);
+    let u = unit(&c, script, "EXEC");
+    // Inside a DO block PL/pgSQL assigns the INOUT value back to the
+    // variable, as T-SQL does with OUTPUT.
+    assert!(
+        !u.notes.iter().any(|n| n.text.contains("outside PL/pgSQL")),
+        "{:?}\n{}",
+        u.notes,
+        c.output
+    );
+    assert!(
+        u.status <= Status::Assumptions,
+        "{:?}\n{}",
+        u.notes,
+        c.output
+    );
+}
