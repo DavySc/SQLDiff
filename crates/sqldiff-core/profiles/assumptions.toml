@@ -235,7 +235,7 @@ sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[assumption]]
 id = "ASM-CI-COLLATION"
-statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). Covers equality, IN lists, joins, GROUP BY, DISTINCT, unique keys and foreign keys; not ordering or LIKE."
+statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern (no [ or \\): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys; not ordering."
 discharge = "catalog"
 fact = "The collations of both sides (T-SQL's default is case-insensitive) and the data."
 fact_key = "collation"
@@ -849,6 +849,13 @@ fact = "The profile row checked against the engine (eval/ probes)."
 sites = ["sqldiff-core/src/ir/interp.rs"]
 
 [[assumption]]
+id = "ASM-SAME-DATABASE-NAME"
+statement = "The PostgreSQL database has the same name, letter for letter, as the SQL Server database (DB_NAME() becomes current_database())."
+discharge = "deployment"
+fact = "The database names on both sides."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SCHEMA-OWNER"
 statement = "The schema's owner on the target holds the privileges its owner holds on the source."
 discharge = "deployment"
@@ -952,6 +959,20 @@ statement = "The history table exists with the table's columns, by name and type
 discharge = "catalog"
 fact = "The history table's definition."
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
+
+[[assumption]]
+id = "ASM-TEMPORAL-PERIOD-WRITE"
+statement = "A statement that writes a period column of a system-versioned table runs while versioning is off and the period dropped."
+discharge = "deployment"
+fact = "When the code that writes period values runs (a data load between turning versioning off and on)."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-TEMPORAL-SWITCH"
+statement = "Turning versioning off and on and dropping and adding the period become disabling and enabling the converted table's versioning triggers; PostgreSQL skips SQL Server's checks on those statements."
+discharge = "generated"
+fact = "The triggers the converted CREATE TABLE made, and code that does not rely on SQL Server's checks when versioning starts or the period is added."
+sites = ["sqldiff-convert/src/tsql/temporal.rs", "sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
 id = "ASM-TEMPORAL-TRIGGER"
@@ -1085,7 +1106,7 @@ id = "ASM-TSQL-LEN-BMP"
 statement = "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
 discharge = "deployment"
 fact = "The data the routines see, or the collation."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-STRING-ARGS"
@@ -1159,6 +1180,13 @@ discharge = "catalog"
 fact = "The columns' collations and code pages."
 fact_key = "collation"
 sites = ["sqldiff-core/src/equiv/table.rs"]
+
+[[assumption]]
+id = "ASM-TSQL-DATEFIRST-7"
+statement = "T-SQL sessions keep SET DATEFIRST 7 (the us_english default), so DATEPART(weekday) counts Sunday as 1, as EXTRACT(DOW) + 1 does."
+discharge = "deployment"
+fact = "The sessions' DATEFIRST (language) setting."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-DATEFORMAT-YMD"

@@ -193,6 +193,23 @@ A failed call is a failed statement: in a procedure without `SET XACT_ABORT
 ON` or a rethrowing CATCH, T-SQL goes on with the next statement and
 PostgreSQL stops (`equiv.error-continues`).
 
+**Versioning switches.** T-SQL `ALTER TABLE t SET (SYSTEM_VERSIONING = OFF |
+ON (HISTORY_TABLE = h …))` and `DROP | ADD PERIOD FOR SYSTEM_TIME` against
+PostgreSQL `ALTER TABLE t ENABLE | DISABLE TRIGGER …` are paired like calls, by
+the table. The T-SQL catalog must show `t` created with `PERIOD FOR
+SYSTEM_TIME` and `SYSTEM_VERSIONING = ON`, with the period and history table
+the statement names; the PostgreSQL statement must switch exactly the triggers
+the converted CREATE TABLE names after the table: `t_versioning` and
+`t_versioning_truncate` disabled for OFF and enabled for ON, `t_period_update`
+disabled for DROP PERIOD and enabled for ADD PERIOD. Equal under
+`ASM-TEMPORAL-SWITCH` (those triggers are the converted versioning triggers,
+and the checks SQL Server makes on these statements are not relied on). `ALL`
+and `USER` are not compared. A write to a period column is compared as a
+plain write under `ASM-TEMPORAL-PERIOD-WRITE`; an INSERT that leaves a period
+column out, in a unit that switches the table's versioning or writes its
+period columns, is not compared (SQL Server takes the default or fails,
+PostgreSQL stores `-infinity`).
+
 **Comments.** The extended property's levels name the object: a schema; a
 table, view, procedure or function; a table's or view's column; a table's
 index or constraint. The PostgreSQL comment must name the same object, which
@@ -567,8 +584,16 @@ are all strings (catalog types), GROUP BY keys, DISTINCT, unique keys and
 indexes, and foreign keys. The assumption also names what SQL Server 2022's
 default `SQL_Latin1_General_CP1_CI_AS` equates beyond case for nvarchar
 (checked on SQL Server 2022: `N'æ' = N'ae'`, `N'ß' = N'ss'`, full-width
-`N'Ａ' = N'A'`, `NCHAR(0)` ignored; none of these for varchar). Ordering
-(`<`, `BETWEEN`, ORDER BY), LIKE, `IN (subquery)` and simple CASE are not
-covered: they depend on more than case and trailing spaces, and stay not
-proven. A plain `sqldiff diff` still reports `equiv.case-sensitivity` and
+`N'Ａ' = N'A'`, `NCHAR(0)` ignored; none of these for varchar). LIKE is
+covered when the value is varchar and the pattern a literal without `[`
+(a T-SQL character class) or `\` (a PostgreSQL escape). Checked on SQL
+Server 2022 and PostgreSQL 18: T-SQL LIKE ignores case, drops a varchar
+value's trailing spaces (`'ab ' LIKE '%b'` is true; not for nvarchar),
+expands `N'æx' LIKE N'ae%'` to true, and keeps the pattern's trailing
+spaces significant, as PostgreSQL does. A char value (blank-padded on one
+side only) or a pattern that is not a literal is not covered. Ordering
+(`<`, `BETWEEN`, ORDER BY), `IN (subquery)` and simple CASE are not covered
+either: they depend on more than case and trailing spaces, and stay not
+proven. IF and WHILE conditions are compared as statements are, so they
+are covered the same way. A plain `sqldiff diff` still reports `equiv.case-sensitivity` and
 `equiv.trailing-spaces`.
