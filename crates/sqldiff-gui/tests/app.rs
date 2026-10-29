@@ -307,6 +307,7 @@ fn every_post_needs_this_launchs_token_and_writes_nothing_without_it() {
     assert_eq!(run["state"], "done", "{run}");
     let before = snapshot(&d.0);
     let (_, runs_before) = get(addr, "/api/runs");
+    let (_, batches_before) = get(addr, "/api/batches");
     let src = d.0.join("src");
     let posts = [
         (
@@ -329,6 +330,11 @@ fn every_post_needs_this_launchs_token_and_writes_nothing_without_it() {
             "/api/runs/changes",
             serde_json::json!({"src": src, "out": d.0.join("o4")}),
         ),
+        (
+            "/api/runs/batch",
+            serde_json::json!({"sources": [{"src": src, "from": "tsql"}], "targets": ["postgres"], "out": d.0.join("o5")}),
+        ),
+        ("/api/batches/1/cancel", serde_json::json!({})),
         ("/runs/1/cancel", serde_json::json!({})),
         ("/runs/1/review/api/record", serde_json::json!({})),
         ("/runs/1/review/api/refresh", serde_json::json!({})),
@@ -370,6 +376,7 @@ fn every_post_needs_this_launchs_token_and_writes_nothing_without_it() {
     }
     assert!(snapshot(&d.0) == before, "a refused POST wrote to disk");
     assert_eq!(get(addr, "/api/runs").1, runs_before);
+    assert_eq!(get(addr, "/api/batches").1, batches_before);
     // The token is on every page the app serves, and only there.
     for view in [
         "/",
