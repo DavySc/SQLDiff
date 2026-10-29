@@ -134,10 +134,17 @@ pub fn object_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
         Dialect::Postgres => Some("public"),
         Dialect::Db2i => None,
     };
-    match ks.as_slice() {
-        [t] => Ok((None, t.clone())),
-        [s, t] if Some(s.as_str()) == default => Ok((None, t.clone())),
-        [s, t] => Ok((Some(s.clone()), t.clone())),
+    // The default schema by its stored spelling: PostgreSQL's "Public" is
+    // another schema.
+    let is_default = |n: &Name| match (d, default) {
+        (Dialect::Postgres, Some(def)) => super::table::stored(n) == def,
+        (_, Some(def)) => n.text.eq_ignore_ascii_case(def),
+        (_, None) => false,
+    };
+    match (ks.as_slice(), parts) {
+        ([t], _) => Ok((None, t.clone())),
+        ([_, t], [s, _]) if is_default(s) => Ok((None, t.clone())),
+        ([s, t], _) => Ok((Some(s.clone()), t.clone())),
         _ => Err("a name with a database or server part".into()),
     }
 }

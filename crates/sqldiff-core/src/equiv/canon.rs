@@ -398,13 +398,14 @@ impl<'a> Canon<'a> {
                 None,
             );
         }
-        let quals: Vec<String> = parts[..parts.len().saturating_sub(1)]
-            .iter()
-            .map(|s| lc(s))
-            .collect();
+        let raw = &parts[..parts.len().saturating_sub(1)];
+        let quals: Vec<String> = raw.iter().map(|s| lc(s)).collect();
         match quals.as_slice() {
             [] => (last, Some(String::new())),
-            [q] if q == "dbo" || q == "public" => (last, Some(q.clone())),
+            // A quoted PostgreSQL "Public" (leading `"`) is another schema.
+            [q] if (q == "dbo" || q == "public") && !raw[0].starts_with('"') => {
+                (last, Some(q.clone()))
+            }
             _ => (format!("{}.{last}", quals.join(".")), None),
         }
     }
@@ -2661,10 +2662,12 @@ impl<'a> Canon<'a> {
             return t;
         };
         let t = t?;
+        // Lower-case names fold to themselves, but the catalog may still
+        // hold another spelling the T-SQL name could mean.
+        fold_check(&seen, self.schema)?;
         if seen.values().flatten().all(|x| *x == x.to_lowercase()) {
             return Ok(t);
         }
-        fold_check(&seen, self.schema)?;
         *self = saved;
         let _guard = FoldingGuard::set(Folding::Fold);
         self.stmt_unfolded(s)

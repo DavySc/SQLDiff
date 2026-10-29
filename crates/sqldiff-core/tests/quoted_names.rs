@@ -234,3 +234,87 @@ fn an_index_whose_names_resolve_differently_is_unknown() {
     // No catalog: whether the table has the column is not known.
     not_equal(&run_with(INDEX_T, INDEX_P, None), "not in the catalog");
 }
+
+/// Not equal, for whatever reason the engine gives.
+fn never_equal(r: &Report) {
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?} {:?}",
+        rules(r),
+        r.unknown_reasons
+    );
+}
+
+#[test]
+fn a_quoted_public_schema_is_not_the_default_one() {
+    // PostgreSQL creates this table in a schema named "Public", which
+    // unqualified names never reach.
+    let t = "CREATE TABLE dbo.u (id int NOT NULL PRIMARY KEY, StockKey int NULL);";
+    let p =
+        "CREATE TABLE \"Public\".u (id integer NOT NULL PRIMARY KEY, \"StockKey\" integer NULL);";
+    never_equal(&run_with(t, p, None));
+    equal(&run_with(t, &p.replace("\"Public\"", "public"), None));
+    // An index on it.
+    let ti = "CREATE INDEX IX_u ON dbo.u (StockKey);";
+    let pi = "CREATE INDEX IX_u ON \"Public\".u (\"StockKey\");";
+    never_equal(&run_with(
+        &format!("{t}\nGO\n{ti}"),
+        &format!("{p}\n{pi}"),
+        None,
+    ));
+    // A statement on it.
+    let cat_t = format!("{CAT_T}GO\nCREATE TABLE dbo.Totals ([Total Key] int NOT NULL PRIMARY KEY, [Amount Due] int NULL);\n");
+    let cat_p = format!("{CAT_P}CREATE SCHEMA \"Public\";\nCREATE TABLE \"Public\".Totals (\"Total Key\" integer NOT NULL PRIMARY KEY, \"Amount Due\" integer NULL);\n");
+    let o = Options {
+        catalog_a: vec![Artifact::new("cat.sql", T, &cat_t)],
+        catalog_b: vec![Artifact::new("cat.pg.sql", P, &cat_p)],
+        ..Options::default()
+    };
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            T,
+            tsql_proc("UPDATE dbo.Totals SET [Amount Due] = @n WHERE [Total Key] = @k;"),
+        ),
+        &Artifact::new(
+            "b.sql",
+            P,
+            pg_proc("UPDATE \"Public\".Totals SET \"Amount Due\" = p_n WHERE \"Total Key\" = p_k;"),
+        ),
+        &o,
+    );
+    never_equal(&r);
+}
+
+#[test]
+fn a_lower_case_name_the_catalog_also_spells_in_another_case_is_not_equal() {
+    // Every name of the statement is lower case, but the catalog has both
+    // "StockKey" and stockkey: T-SQL StockKey could mean either.
+    let o = Options {
+        catalog_a: vec![Artifact::new(
+            "cat.sql",
+            T,
+            "CREATE TABLE dbo.stocks (id int NOT NULL PRIMARY KEY, StockKey int NULL);",
+        )],
+        catalog_b: vec![Artifact::new(
+            "cat.pg.sql",
+            P,
+            "CREATE TABLE stocks (id integer NOT NULL PRIMARY KEY, \"StockKey\" integer NULL, stockkey integer NULL);",
+        )],
+        ..Options::default()
+    };
+    let r = diff(
+        &Artifact::new(
+            "a.sql",
+            T,
+            tsql_proc("UPDATE dbo.stocks SET StockKey = @n WHERE id = @k;"),
+        ),
+        &Artifact::new(
+            "b.sql",
+            P,
+            pg_proc("UPDATE stocks SET stockkey = p_n WHERE id = p_k;"),
+        ),
+        &o,
+    );
+    not_equal(&r, "differ only in letter case");
+}

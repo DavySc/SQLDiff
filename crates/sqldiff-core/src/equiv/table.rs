@@ -1290,10 +1290,16 @@ fn table_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
         Dialect::Postgres => "public",
         Dialect::Db2i => return Err("Db2 for i tables are not compared".into()),
     };
-    match ks.as_slice() {
-        [t] => Ok((None, t.clone())),
-        [s, t] if s == default => Ok((None, t.clone())),
-        [s, t] => Ok((Some(s.clone()), t.clone())),
+    // The default schema by its stored spelling: PostgreSQL's "Public" is
+    // another schema.
+    let is_default = |n: &Name| match d {
+        Dialect::Postgres => stored(n) == default,
+        _ => n.text.eq_ignore_ascii_case(default),
+    };
+    match (ks.as_slice(), parts) {
+        ([t], _) => Ok((None, t.clone())),
+        ([_, t], [s, _]) if is_default(s) => Ok((None, t.clone())),
+        ([s, t], _) => Ok((Some(s.clone()), t.clone())),
         _ => Err("a name with more than two parts".into()),
     }
 }
