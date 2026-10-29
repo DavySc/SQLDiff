@@ -3926,8 +3926,12 @@ impl<'a> Canon<'a> {
                 }
                 Dialect::Db2i => return None,
             };
-            let (k, _) =
-                Self::table_name(&parts, &self.unit.other_temps, self.unit.routine.as_deref());
+            let (k, _) = Self::table_name(
+                &parts,
+                &self.unit.other_temps,
+                &self.unit.local_temps,
+                self.unit.routine.as_deref(),
+            );
             if k == key {
                 let text = node.text().to_string();
                 let from = ts[open].off - usize::from(node.text_range().start());
