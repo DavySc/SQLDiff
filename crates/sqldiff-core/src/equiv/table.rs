@@ -90,6 +90,9 @@ pub struct Column {
     pub identity: Option<Identity>,
     /// The default expression's tokens.
     pub default: Option<Vec<Tok>>,
+    /// A computed (T-SQL) or generated (PostgreSQL `GENERATED ALWAYS AS
+    /// (…)`) column: its expression, parentheses included.
+    pub computed: Option<Vec<Tok>>,
     /// Byte offset of the column definition.
     pub off: usize,
 }
@@ -403,6 +406,7 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Table> {
         }
     }
     tail(&ts[end + 1..], d, &mut t)?;
+    computed_types(&mut t)?;
     if t.columns.is_empty() {
         return Err("a table without columns".into());
     }
@@ -635,6 +639,19 @@ fn table_constraint(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
             t.checks.push(c);
             j
         }
+        // A clustered columnstore index only stores the rows column by
+        // column: it has no key, enforces nothing and orders nothing.
+        "INDEX"
+            if d == Dialect::Tsql
+                && name.is_none()
+                && ts.len() == 4
+                && ts.get(1).and_then(name_of).is_some()
+                && word(ts.get(2), "CLUSTERED")
+                && word(ts.get(3), "COLUMNSTORE") =>
+        {
+            t.storage.push(text(ts));
+            4
+        }
         _ => return Err(format!("the table item `{}`", text(ts))),
     };
     if d == Dialect::Tsql && word(ts.get(end), "NOT") && word(ts.get(end + 1), "FOR") {
@@ -694,7 +711,7 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
     let name = name_of(&ts[0]).ok_or_else(|| format!("the column item `{}`", text(ts)))?;
     let what = |s: &str| format!("column {}: {s}", name.text);
     if word(ts.get(1), "AS") {
-        return Err(what("a computed column"));
+        return computed_column(ts, d, t);
     }
     let mut p = ast::Parser::new(&ts[1..], d);
     let ty = p.ty().map_err(|e| what(&e))?;
@@ -724,6 +741,7 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
         null: None,
         identity: None,
         default: None,
+        computed: None,
         off: ts[0].off,
     };
     let mut cname: Option<Name> = None;
@@ -801,6 +819,22 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
                 } else {
                     return Err(what("GENERATED"));
                 };
+                if always
+                    && word(ts.get(j), "AS")
+                    && ts.get(j + 1).is_some_and(|t| t.kind == K::LParen)
+                {
+                    // `GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]`.
+                    if c.computed.is_some() || c.default.is_some() || c.identity.is_some() {
+                        return Err(what("a generated column with a default"));
+                    }
+                    let end = close(ts, j + 1)?;
+                    c.computed = Some(ts[j + 1..=end].to_vec());
+                    i = end + 1;
+                    if word(ts.get(i), "STORED") || word(ts.get(i), "VIRTUAL") {
+                        i += 1;
+                    }
+                    continue;
+                }
                 if !(word(ts.get(j), "AS") && word(ts.get(j + 1), "IDENTITY")) {
                     return Err(what("a generated column"));
                 }
@@ -904,6 +938,160 @@ fn column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
         return Err(what("CONSTRAINT with nothing after it"));
     }
     t.columns.push(c);
+    Ok(())
+}
+
+/// A T-SQL computed column `c AS (expr) [PERSISTED [NOT NULL]]`. Its type
+/// is set by `computed_types` once every column is read.
+fn computed_column(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
+    let name = name_of(&ts[0]).ok_or_else(|| format!("the column item `{}`", text(ts)))?;
+    let what = |s: &str| format!("column {}: {s}", name.text);
+    if d != Dialect::Tsql || !ts.get(2).is_some_and(|t| t.kind == K::LParen) {
+        return Err(what("a computed column"));
+    }
+    let end = close(ts, 2)?;
+    let words: Vec<&str> = ts[end + 1..].iter().map(|t| t.up.as_str()).collect();
+    let null = match words.as_slice() {
+        [] | ["PERSISTED"] | ["PERSISTED", "NULL"] => None,
+        ["PERSISTED", "NOT", "NULL"] => Some(false),
+        _ => {
+            return Err(what(&format!(
+                "`{}` after a computed column's expression",
+                text(&ts[end + 1..])
+            )))
+        }
+    };
+    t.columns.push(Column {
+        name,
+        // Set by `computed_types`.
+        ty: Ty::Bit,
+        ty_text: String::new(),
+        null,
+        identity: None,
+        default: None,
+        computed: Some(ts[2..=end].to_vec()),
+        off: ts[0].off,
+    });
+    Ok(())
+}
+
+/// The value of a string literal token, without its `N` and quotes.
+fn str_value(t: &Tok) -> Option<String> {
+    if t.kind != K::Str {
+        return None;
+    }
+    let s = t.text.strip_prefix(['N', 'n']).unwrap_or(&t.text);
+    let s = s.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(s.replace("''", "'"))
+}
+
+/// The types of a T-SQL table's computed columns, as SQL Server derives
+/// them (checked in `sys.columns` on SQL Server 2022): `CONCAT` of strings
+/// is a string as long as its parts together (`(n)varchar(max)` when one
+/// part is), `JSON_QUERY` is `nvarchar(max)`, `JSON_VALUE`
+/// `nvarchar(4000)`, `TRY_CONVERT(t, …)` is `t`. Other expressions are not
+/// read.
+fn computed_types(t: &mut Table) -> R<()> {
+    for k in 0..t.columns.len() {
+        let Some(e) = t.columns[k].computed.clone() else {
+            continue;
+        };
+        if t.dialect != Dialect::Tsql {
+            continue;
+        }
+        let what = |s: &str| format!("column {}: {s}", t.columns[k].name.text);
+        let mut e = &e[..];
+        while e.len() > 2 && e[0].kind == K::LParen && close(e, 0)? == e.len() - 1 {
+            e = &e[1..e.len() - 1];
+        }
+        let call = e.len() > 3
+            && e[0].kind == K::Word
+            && e[1].kind == K::LParen
+            && close(e, 1)? == e.len() - 1;
+        if !call {
+            return Err(what("a computed column"));
+        }
+        let args = split(&e[2..e.len() - 1]);
+        let col = |a: &[Tok]| -> Option<&Column> {
+            let [x] = a else { return None };
+            let n = name_of(x)?;
+            t.columns
+                .iter()
+                .find(|c| c.computed.is_none() && c.name.text.eq_ignore_ascii_case(&n.text))
+        };
+        let lit = |a: &[Tok]| match a {
+            [x] => str_value(x),
+            _ => None,
+        };
+        let (ty, ty_text) = match e[0].up.as_str() {
+            "CONCAT" if args.len() >= 2 => {
+                let (mut len, mut national) = (Some(0u32), false);
+                for a in &args {
+                    if let Some(v) = lit(a) {
+                        national |= a[0].text.starts_with(['N', 'n']);
+                        len = len.map(|l| l + v.encode_utf16().count() as u32);
+                    } else if let Some(c) = col(a) {
+                        let Ty::Str {
+                            fixed: false,
+                            national: n,
+                            len: l,
+                        } = c.ty
+                        else {
+                            return Err(what("CONCAT of a value that is not a varying string"));
+                        };
+                        national |= n;
+                        len = len.zip(l).map(|(x, y)| x + y);
+                    } else {
+                        return Err(what("CONCAT of an expression"));
+                    }
+                }
+                if len.is_some_and(|l| l > 4000) {
+                    return Err(what(
+                        "CONCAT longer than 4,000 characters (SQL Server cuts it)",
+                    ));
+                }
+                let name = if national { "nvarchar" } else { "varchar" };
+                (
+                    Ty::Str {
+                        fixed: false,
+                        national,
+                        len,
+                    },
+                    format!(
+                        "{name}({})",
+                        len.map_or("max".to_string(), |l| l.to_string())
+                    ),
+                )
+            }
+            "JSON_QUERY" | "JSON_VALUE"
+                if args.len() == 2 && col(args[0]).is_some() && lit(args[1]).is_some() =>
+            {
+                let len = (e[0].up == "JSON_VALUE").then_some(4000);
+                (
+                    Ty::Str {
+                        fixed: false,
+                        national: true,
+                        len,
+                    },
+                    format!(
+                        "nvarchar({})",
+                        len.map_or("max".to_string(), |l| l.to_string())
+                    ),
+                )
+            }
+            "TRY_CONVERT" if args.len() >= 2 => {
+                let mut p = ast::Parser::new(args[0], Dialect::Tsql);
+                let ty = p.ty().map_err(|x| what(&x))?;
+                if p.pos() != args[0].len() {
+                    return Err(what("TRY_CONVERT to a type"));
+                }
+                (tsql_type(&ty).map_err(|x| what(&x))?, text(args[0]))
+            }
+            _ => return Err(what("a computed column")),
+        };
+        t.columns[k].ty = ty;
+        t.columns[k].ty_text = ty_text;
+    }
     Ok(())
 }
 
@@ -1273,6 +1461,13 @@ pub enum Event {
     Note(String),
     /// Two defaults to compare as `SELECT a` against `SELECT b`.
     Default {
+        col: String,
+        a: Vec<Tok>,
+        b: Vec<Tok>,
+        at: (usize, usize),
+    },
+    /// Two computed columns' expressions, compared as `SELECT expr FROM t`.
+    Computed {
         col: String,
         a: Vec<Tok>,
         b: Vec<Tok>,
@@ -1729,6 +1924,49 @@ fn compare_into(x: &Table, y: &Table, na: &str, nb: &str, ev: &mut Vec<Event>) -
         }
         if let Some(w) = tc.wider {
             wider.push(format!("{} ({w})", cx.name.text));
+        }
+        // Computed: the value of each row is the expression's, compared as
+        // `SELECT expr FROM t`; the NOT NULL each side declares rejects the
+        // same rows when the values are the same.
+        if ct.computed.is_some() || cp.computed.is_some() {
+            match (&cx.computed, &cy.computed) {
+                (Some(a), Some(b)) => {
+                    let nn = |c: &Column| c.null == Some(false);
+                    if nn(ct) != nn(cp) {
+                        let (yes, no) = if nn(ct) {
+                            ("{P}", "{T}")
+                        } else {
+                            ("{T}", "{P}")
+                        };
+                        ev.push(diff(
+                            "equiv.column-null",
+                            format!(
+                                "{yes} stores a row whose column {} computes NULL, {no} rejects it",
+                                cx.name.text
+                            ),
+                            at,
+                        ));
+                    }
+                    ev.push(Event::Computed {
+                        col: cx.name.text.clone(),
+                        a: a.clone(),
+                        b: b.clone(),
+                        at,
+                    });
+                }
+                _ => {
+                    let has = if ct.computed.is_some() { "{T}" } else { "{P}" };
+                    ev.push(diff(
+                        "equiv.column-computed",
+                        format!(
+                            "{has} computes column {}, so an INSERT or UPDATE that writes it is refused there and accepted on the other side",
+                            cx.name.text
+                        ),
+                        at,
+                    ));
+                }
+            }
+            continue;
         }
         // NULL.
         if ct.null.is_none() && ct.identity.is_none() && nullable(tt, ct)? {
