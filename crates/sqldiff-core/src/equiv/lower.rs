@@ -347,7 +347,8 @@ pub fn lower(a: &Analyzed) -> Unit {
                 if n.kind() == SyntaxKind::STATEMENT
                     && !r.text_range().contains_range(n.text_range())
                 {
-                    let after = n.text_range().start() >= r.text_range().end();
+                    let after =
+                        n.text_range().start() >= r.text_range().end() && !index_beside(r, &n, d);
                     if is_create_table(&n, d) {
                         u.tables.push((n.clone(), usize::from(after)));
                     } else if is_call(&n, d) {
@@ -388,7 +389,9 @@ pub fn lower(a: &Analyzed) -> Unit {
                 }
                 let before = routines
                     .iter()
-                    .filter(|r| r.text_range().end() <= n.text_range().start())
+                    .filter(|r| {
+                        r.text_range().end() <= n.text_range().start() && !index_beside(r, &n, d)
+                    })
                     .count();
                 if is_create_table(&n, d) {
                     u.tables.push((n.clone(), before));
@@ -420,6 +423,33 @@ fn is_do(r: &SyntaxNode) -> bool {
     cst::header_tokens(r)
         .first()
         .is_some_and(|t| t.text().eq_ignore_ascii_case("DO"))
+}
+
+/// Whether `n` creates an index whose place before or after routine `r`
+/// does not matter: `r` is a trigger (T-SQL, Db2 for i) or a PostgreSQL
+/// trigger function, and it never names the index. Creating
+/// either one runs neither: a trigger body binds tables and columns (Db2 for
+/// i when it is created, T-SQL and PL/pgSQL when it runs), never an index it
+/// does not name, and an index changes no row a trigger sees. So a
+/// conversion that adds trigger functions before a table's indexes (temporal
+/// tables, Db2 for i sequence defaults) places them as the original did.
+fn index_beside(r: &SyntaxNode, n: &SyntaxNode, d: Dialect) -> bool {
+    let Ok(super::ddl::Ddl::Index(ix)) = super::ddl::parse(&tokens(n), d) else {
+        return false;
+    };
+    let header: Vec<Tok> = cst::header_tokens(r).iter().map(Tok::from_syntax).collect();
+    let trigger = header.iter().take(4).any(|t| t.up == "TRIGGER")
+        || header
+            .windows(2)
+            .any(|w| w[0].up == "RETURNS" && w[1].up == "TRIGGER");
+    // A name in a string counts too (dynamic SQL, an error message).
+    let name = ix.name.text.to_lowercase();
+    trigger
+        && !tokens(r).iter().any(|t| match t.kind {
+            K::Word | K::Quoted => cst::unquote(&t.text).to_lowercase() == name,
+            K::Str => t.text.to_lowercase().contains(&name),
+            _ => false,
+        })
 }
 
 /// One part of a script that runs as a whole: a T-SQL batch that needs
