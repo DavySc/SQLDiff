@@ -380,7 +380,13 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
     let Draft { from, to, raw } = draft;
     let a = Artifact::new("input.sql", from, input);
     let b = Artifact::new("converted.sql", to, raw.text.as_str());
-    let report = sqldiff_core::diff(&a, &b, opts);
+    // Davy, 2026-10-29: the output keeps the target's text types, and each
+    // statement whose result T-SQL's case-insensitive collation can change
+    // is flagged with ASM-CI-COLLATION for the reviewer.
+    let report = {
+        let _ci = sqldiff_core::equiv::compare::ci_collation_scope(true);
+        sqldiff_core::diff(&a, &b, opts)
+    };
     // The output on its own, bound against the target catalog.
     let own = Options {
         catalog_a: opts.catalog_b.clone(),

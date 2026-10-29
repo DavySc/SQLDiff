@@ -84,21 +84,28 @@ fn update_from_joins_become_postgres_update_from() {
 }
 
 /// A string key is unique on both sides, but T-SQL compares it without
-/// regard to case and trailing spaces: the engine reports the difference.
+/// regard to case and trailing spaces: the conversion is equal only under
+/// ASM-CI-COLLATION (Davy, 2026-10-29: keep the text types, flag each case).
 #[test]
-fn a_string_key_match_differs_by_collation() {
+fn a_string_key_match_is_flagged_by_collation() {
     let (c, _) = tsql("DECLARE @c varchar(10) = 'x';\nUPDATE o SET qty = 0 FROM dbo.orders o JOIN dbo.order_items i ON i.order_id = o.order_id AND i.code = @c;");
     assert!(
         c.output.contains("UPDATE orders o SET qty = 0 FROM order_items i WHERE i.order_id = o.order_id AND i.code = v_c;"),
         "{}",
         c.output
     );
-    assert_eq!(last(&c).1.status, Status::Differs);
-    assert!(c
+    let u = last(&c).1;
+    assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
+    assert!(
+        u.notes.iter().any(|n| n.rule == "ASM-CI-COLLATION"),
+        "{:?}",
+        u.notes
+    );
+    assert!(!c
         .report
         .findings
         .iter()
-        .any(|f| f.rule == "equiv.case-sensitivity"));
+        .any(|f| f.rule == "equiv.case-sensitivity" || f.rule == "equiv.trailing-spaces"));
 }
 
 #[test]

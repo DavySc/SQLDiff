@@ -515,7 +515,7 @@ fn same_stmt(
         Ok(v) => v,
         Err(e) => return Same::Unknown(format!("{nb}: {e}")),
     };
-    let c = compare::compare(&tx, &ty);
+    let c = compare::compare_across(&tx, &ty, ua.dialect, ub.dialect);
     for s in by.into_iter().chain(c.assumptions) {
         if !asms.iter().any(|z| z.id == s.id) {
             asms.push(s);
@@ -1823,9 +1823,14 @@ fn pair_items(
         .filter(|&&(i, j)| {
             ia[i].err.is_some()
                 || ib[j].err.is_some()
-                || !compare::compare(&ia[i].term, &ib[j].term)
-                    .mismatches
-                    .is_empty()
+                || !compare::compare_across(
+                    &ia[i].term,
+                    &ib[j].term,
+                    a.artifact.dialect,
+                    b.artifact.dialect,
+                )
+                .mismatches
+                .is_empty()
         })
         .count();
     let wit = wit.filter(|_| all_paired && unequal == 1);
@@ -1963,7 +1968,7 @@ fn compare_pair(
             return;
         }
     }
-    let c = compare::compare(&x.term, &y.term);
+    let c = compare::compare_across(&x.term, &y.term, a.artifact.dialect, b.artifact.dialect);
     let mut asms: Vec<Assumption> = x.asm.clone();
     for s in name_assumptions(a, b, x, y) {
         if !asms.iter().any(|z| z.id == s.id) {
