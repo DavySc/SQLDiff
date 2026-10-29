@@ -235,7 +235,7 @@ sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[assumption]]
 id = "ASM-CI-COLLATION"
-statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). Covers equality, IN lists, joins, GROUP BY, DISTINCT, unique keys and foreign keys; not ordering or LIKE."
+statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern (no [ or \\): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys; not ordering."
 discharge = "catalog"
 fact = "The collations of both sides (T-SQL's default is case-insensitive) and the data."
 fact_key = "collation"
@@ -275,6 +275,27 @@ statement = "A recursive CTE stays within T-SQL's recursion limit (the target ha
 discharge = "deployment"
 fact = "The data never recurses deeper than the limit."
 sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-CURSOR-GLOBAL"
+statement = "No error or RETURN leaves a T-SQL cursor declared without LOCAL open (it would stay in the session and the next DECLARE of it would fail)."
+discharge = "deployment"
+fact = "The routine is not left between the cursor's DECLARE and DEALLOCATE, or the database default is LOCAL cursors."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-CURSOR-ORDER"
+statement = "What a cursor loop does does not depend on the order of rows its ORDER BY leaves open."
+discharge = "nothing"
+fact = "A per-routine review of the loop, or an ORDER BY on a unique key."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-CURSOR-SNAPSHOT"
+statement = "A cursor loop fetches the rows its query gives at OPEN: no other session or trigger changes them during the loop, and the values do not depend on when a row is fetched."
+discharge = "deployment"
+fact = "No concurrent writers to the cursor's tables while the routine runs, and no time- or session-dependent functions in its query."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-DATALENGTH"
@@ -501,6 +522,13 @@ statement = "No value depends on the 7th fraction digit of the seconds: datetime
 discharge = "deployment"
 fact = "The data has at most microsecond precision."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/table.rs"]
+
+[[assumption]]
+id = "ASM-GRANT-PRINCIPAL"
+statement = "The target role a GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY outranks the grant."
+discharge = "deployment"
+fact = "How T-SQL users and roles map to PostgreSQL roles, and the DENY statements on the object."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]
 id = "ASM-HAND-WRITTEN"
@@ -975,6 +1003,20 @@ fact = "The history table's definition."
 sites = ["sqldiff-convert/src/tsql/temporal.rs"]
 
 [[assumption]]
+id = "ASM-TEMPORAL-PERIOD-WRITE"
+statement = "A statement that writes a period column of a system-versioned table runs while versioning is off and the period dropped."
+discharge = "deployment"
+fact = "When the code that writes period values runs (a data load between turning versioning off and on)."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-TEMPORAL-SWITCH"
+statement = "Turning versioning off and on and dropping and adding the period become disabling and enabling the converted table's versioning triggers; PostgreSQL skips SQL Server's checks on those statements."
+discharge = "generated"
+fact = "The triggers the converted CREATE TABLE made, and code that does not rely on SQL Server's checks when versioning starts or the period is added."
+sites = ["sqldiff-convert/src/tsql/temporal.rs", "sqldiff-core/src/equiv/call.rs"]
+
+[[assumption]]
 id = "ASM-TEMPORAL-TRIGGER"
 statement = "System versioning by trigger matches T-SQL for the ways the table is written (no direct writes to the history table, no ALTER TABLE)."
 discharge = "deployment"
@@ -1356,3 +1398,24 @@ statement = "PostgreSQL's abort on error matches SET XACT_ABORT ON for the state
 discharge = "nothing"
 fact = "The error and transaction model (phase C4) proving the mapping."
 sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-CONSTRAINT-ROWS-VALID"
+statement = "The rows already in the table satisfy a constraint that ALTER TABLE … CHECK CONSTRAINT turns on: PostgreSQL's VALIDATE CONSTRAINT checks them, T-SQL does not."
+discharge = "deployment"
+fact = "The table holds no row that breaks the constraint when the statement runs."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-DEFAULT-CONSTRAINT-NAME"
+statement = "The column has no default yet when the default is added, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name."
+discharge = "deployment"
+fact = "The column has no default before the statement runs, and no later statement drops or alters the default constraint by name."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
+
+[[assumption]]
+id = "ASM-DROP-NO-DEPENDENTS"
+statement = "No view, routine or other object depends on a dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP, SQL Server drops a table or view under a view that is not schema-bound."
+discharge = "catalog"
+fact = "The target catalog's dependencies (pg_depend) on the object are only those dropped with it, and its routine name has one signature."
+sites = ["sqldiff-core/src/equiv/ddl.rs"]

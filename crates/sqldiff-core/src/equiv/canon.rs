@@ -49,7 +49,7 @@ pub mod asm {
     /// case-sensitive one is kept, and flagged with this per statement.
     pub const CI_COLLATION: (&str, &str) = (
         "ASM-CI-COLLATION",
-        "String equality gives the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar); the other side compares those values as different",
+        "String equality and LIKE give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar), and no value LIKE tests has trailing spaces or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -66,6 +66,10 @@ pub mod asm {
     pub const UNTYPED_CAST: (&str, &str) = (
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
+    );
+    pub const PERIOD_WRITE: (&str, &str) = (
+        "ASM-TEMPORAL-PERIOD-WRITE",
+        "The statement gives a period column of a system-versioned table a value: assumes the code runs while versioning is off and the period dropped (SYSTEM_VERSIONING = OFF, DROP PERIOD FOR SYSTEM_TIME; in PostgreSQL the converted versioning triggers disabled), as data loads do, so both sides store the value as given. While versioning is on, both sides refuse the statement; while only the period remains, SQL Server refuses it and PostgreSQL stores the value",
     );
     pub const UNTYPED_STORE: (&str, &str) = (
         "ASM-UNTYPED-STORE",
@@ -106,6 +110,18 @@ pub mod asm {
     pub const PAGE_COUNT_NOT_NULL: (&str, &str) = (
         "ASM-PAGE-COUNT-NOT-NULL",
         "The row count and offset of TOP / LIMIT / FETCH / OFFSET are never NULL: T-SQL raises an error for NULL (Msg 1014), PostgreSQL reads LIMIT NULL as no limit and OFFSET NULL as 0, and Db2 for i was not checked",
+    );
+    pub const CURSOR_SNAPSHOT: (&str, &str) = (
+        "ASM-CURSOR-SNAPSHOT",
+        "The rows a cursor loop fetches are those its query gives at OPEN: no other session or trigger changes the tables it reads while the loop runs, and its values do not depend on when each row is fetched (a T-SQL cursor that is not STATIC reads rows as it fetches them, a PostgreSQL cursor reads the database as of OPEN)",
+    );
+    pub const CURSOR_ORDER: (&str, &str) = (
+        "ASM-CURSOR-ORDER",
+        "What a cursor loop does does not depend on the order of the rows beyond its ORDER BY: rows that ORDER BY leaves in no order may come in another order on each side",
+    );
+    pub const CURSOR_GLOBAL: (&str, &str) = (
+        "ASM-CURSOR-GLOBAL",
+        "No error or RETURN leaves a T-SQL cursor declared without LOCAL open: it then stays in the session and the routine's next DECLARE of it fails, where PostgreSQL closes it at the end of the transaction",
     );
     pub const RAISERROR_TEXT: (&str, &str) = (
         "ASM-RAISERROR-TEXT",
@@ -259,6 +275,9 @@ pub struct Canon<'a> {
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
     /// bit read through a derived table still meets numbers as a bit.
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
+    /// The column types of each cursor's query, by key, from its OPEN
+    /// (`cursor_op`); kept across statements.
+    cursor_cols: HashMap<String, Vec<Option<Ty>>>,
 }
 
 /// Lower-case hex digits of a byte string written in hex, `None` unless
@@ -398,6 +417,7 @@ impl<'a> Canon<'a> {
             seen_tables: HashMap::new(),
             excluded: None,
             sub_bits: HashMap::new(),
+            cursor_cols: HashMap::new(),
             by_name: false,
             fold_quoted: false,
             names: Vec::new(),
@@ -540,19 +560,79 @@ impl<'a> Canon<'a> {
     }
 
     /// A statement writes `col`: refused for a column the database computes
-    /// (period, computed, GENERATED ALWAYS), whose explicit values one side
-    /// rejects or replaces depending on settings and triggers the statement
-    /// does not show.
-    fn written(&self, table: &str, col: &str) -> R<()> {
-        let generated = self
+    /// (computed, GENERATED ALWAYS), whose explicit values one side rejects
+    /// or replaces depending on settings and triggers the statement does not
+    /// show. A period column of a system-versioned table is the exception:
+    /// code writes it only with the period dropped, a state the statement
+    /// does not show either, so that is an assumption.
+    fn written(&mut self, table: &str, col: &str) -> R<()> {
+        let (generated, period) = self
             .schema
             .table(Self::base_table(table))
             .and_then(|t| t.column(col))
-            .is_some_and(|c| c.generated);
-        if generated {
+            .map_or((false, false), |c| (c.generated, c.period));
+        if period {
+            self.assume(asm::PERIOD_WRITE);
+        } else if generated {
             return Err(format!("writes the generated column {col}"));
         }
         Ok(())
+    }
+
+    /// An INSERT that leaves out a period column, in code that drops the
+    /// table's period (it switches the versioning or writes a period
+    /// column): with the period dropped, SQL Server takes the column's
+    /// default or fails on NOT NULL, while PostgreSQL, its versioning
+    /// triggers disabled, stores the converted default `-infinity`.
+    fn period_omitted(&self, table: &str, cols: &[String]) -> R<()> {
+        let Some(t) = self.schema.table(Self::base_table(table)) else {
+            return Ok(());
+        };
+        let missing: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period && !cols.contains(&c.name))
+            .map(|c| c.name.as_str())
+            .collect();
+        if missing.is_empty() || !self.drops_period(t) {
+            return Ok(());
+        }
+        Err(format!(
+            "the INSERT leaves out the period column {} of a table whose period this code drops or writes: with the period dropped SQL Server takes the column's default or fails, PostgreSQL stores '-infinity'",
+            missing.join(", ")
+        ))
+    }
+
+    /// Whether the unit switches `t`'s versioning, or writes (or may write:
+    /// a data statement naming the column) one of its period columns.
+    fn drops_period(&self, t: &super::schema::Table) -> bool {
+        let switched = self.unit.calls.iter().any(|(node, _)| {
+            matches!(
+                super::call::parse(&super::ast::tokens(node), self.d),
+                Ok(super::call::Stmt::Switch(s))
+                    if s.table.last().is_some_and(|n| n.text.eq_ignore_ascii_case(&t.name))
+            )
+        });
+        let period: Vec<&str> = t
+            .columns
+            .iter()
+            .filter(|c| c.period)
+            .map(|c| c.name.as_str())
+            .collect();
+        switched
+            || self.unit.stmts.iter().any(|s| {
+                s.toks
+                    .first()
+                    .is_some_and(|f| matches!(f.up.as_str(), "INSERT" | "UPDATE" | "MERGE"))
+                    && s.toks.iter().any(|x| {
+                        matches!(x.kind, super::ast::K::Word | super::ast::K::Quoted)
+                            && period.contains(
+                                &sqldiff_syntax::ast::unquote(&x.text)
+                                    .to_lowercase()
+                                    .as_str(),
+                            )
+                    })
+            })
     }
 
     fn sym(&self, name: &str) -> Option<(Term, Option<Ty>)> {
@@ -1100,13 +1180,26 @@ impl<'a> Canon<'a> {
                 (n("between", kids), None)
             }
             Expr::Like(x, p, neg, ci) => {
-                let x = self.expr(x)?.0;
+                let (x, ty) = self.expr(x)?;
+                // A varchar value against a literal pattern without `[` or
+                // `\` differs across dialects only by the collation
+                // (`coll-like`): case, trailing spaces of the value (T-SQL
+                // varchar drops them) and characters the collation expands
+                // (checked on SQL Server 2022). T-SQL `[...]` is a character
+                // class and PostgreSQL's `\` an escape; a char value is
+                // blank-padded on one side only.
+                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
                 let p = self.expr(p)?.0;
-                // Case sensitivity and trailing blanks of LIKE differ per dialect.
+                let coll = if plain {
+                    n("coll-like", vec![self.dtag()])
+                } else {
+                    self.dtag()
+                };
                 (
                     n(
                         "like",
-                        vec![self.dtag(), x, p, a(neg.to_string()), a(ci.to_string())],
+                        vec![coll, x, p, a(neg.to_string()), a(ci.to_string())],
                     ),
                     None,
                 )
@@ -1682,6 +1775,49 @@ impl<'a> Canon<'a> {
                 if let Some(t) = self.datepart(&name, x) {
                     return Ok(t);
                 }
+            }
+            // CONCAT of strings is `||` with each NULL read as '' (literals
+            // are never NULL). Other argument types are converted to strings
+            // first, and a result longer than 4,000 characters is cut unless
+            // an argument is (n)varchar(max): neither has a rule here.
+            (Dialect::Tsql, "concat") if argc >= 2 && plain => {
+                let mut acc: Option<(Term, Option<u32>)> = None;
+                for x in &c.args {
+                    let (t, ty) = self.expr(x)?;
+                    let (t, len) = match (x, ty) {
+                        (Expr::Str(_), ty) => (t, ty.and_then(|y| y.len)),
+                        (_, Some(y)) if y.fam == Fam::VarChar => (
+                            n("fn", vec![a("coalesce"), t, n("str", vec![a("")])]),
+                            y.len,
+                        ),
+                        _ => {
+                            let mut kids = vec![a("tsql"), a("concat")];
+                            for x in &c.args {
+                                kids.push(self.expr(x)?.0);
+                            }
+                            return Ok((n("dfn", kids), Some(Ty::of(Fam::VarChar))));
+                        }
+                    };
+                    acc = Some(match acc {
+                        None => (t, len),
+                        Some((l, ll)) => (n("concat", vec![l, t]), ll.zip(len).map(|(p, q)| p + q)),
+                    });
+                }
+                let (t, len) = acc.expect("two or more arguments");
+                if len.is_some_and(|l| l > 4000) {
+                    return Ok((
+                        n("dfn", vec![a("tsql"), a("concat-cut"), t]),
+                        Some(Ty::of(Fam::VarChar)),
+                    ));
+                }
+                return Ok((
+                    t,
+                    Some(Ty {
+                        fam: Fam::VarChar,
+                        len,
+                        scale: None,
+                    }),
+                ));
             }
             // IIF is shorthand for this CASE; SQL Server rewrites it so.
             (Dialect::Tsql, "iif") if argc == 3 && plain => {
@@ -3332,6 +3468,56 @@ impl<'a> Canon<'a> {
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
+    /// A statement of a cursor loop (`cursor.rs`): `cursor-open(key, q)`
+    /// with the query as a list of values per row and its ORDER BY,
+    /// `cursor-fetch(key, assign…)` with each target set to its column as an
+    /// assignment converts it, `cursor-close(key)`. FETCH reads the column
+    /// types of the OPEN before it.
+    pub fn cursor_op(&mut self, op: &super::cursor::CursorOp) -> R<Term> {
+        use super::cursor::CursorOp;
+        match op {
+            CursorOp::Open { key, query, tsql } => {
+                let q = query.as_ref().map_err(Clone::clone)?;
+                let (mut parts, items) = self.query_parts(q, QCtx::Scalar)?;
+                let from: Vec<Term> = parts.get(1).map(|f| f.kids().to_vec()).unwrap_or_default();
+                let order: Vec<Term> = parts.get(5).map(|o| o.kids().to_vec()).unwrap_or_default();
+                if order.is_empty() || !self.total_order(&from, &order) {
+                    self.assume(asm::CURSOR_ORDER);
+                }
+                self.assume(asm::CURSOR_SNAPSHOT);
+                if let Some((_, false)) = tsql {
+                    self.assume(asm::CURSOR_GLOBAL);
+                }
+                self.cursor_cols
+                    .insert(key.clone(), items.iter().map(|x| x.1).collect());
+                parts.insert(1, n("items", items.into_iter().map(|x| x.0).collect()));
+                Ok(n("cursor-open", vec![a(key.clone()), n("q", parts)]))
+            }
+            CursorOp::Fetch { key, targets } => {
+                let cols = self
+                    .cursor_cols
+                    .get(key)
+                    .cloned()
+                    .ok_or("a FETCH whose cursor's OPEN was not read")?;
+                if cols.len() != targets.len() {
+                    return Err(
+                        "a FETCH into another number of variables than the cursor has columns"
+                            .into(),
+                    );
+                }
+                let mut kids = vec![a(key.clone())];
+                for (i, (t, ty)) in targets.iter().zip(cols).enumerate() {
+                    let (sym, vty) = self.target_sym(t)?;
+                    let col = n("cursor-col", vec![a(key.clone()), a(i.to_string())]);
+                    let v = self.conv_var(&vty, (col, ty)).0;
+                    kids.push(n("assign", vec![sym, v]));
+                }
+                Ok(n("cursor-fetch", kids))
+            }
+            CursorOp::Close { key } => Ok(n("cursor-close", vec![a(key.clone())])),
+        }
+    }
+
     fn resultset(&mut self, q: &Select) -> R<Term> {
         let (mut parts, items) = self.query_parts(q, QCtx::Set)?;
         let decl = &self.unit.ret_cols;
@@ -3479,6 +3665,7 @@ impl<'a> Canon<'a> {
                 Ok(n("insertn", vec![a(table), n("rows", sets)]))
             }
             InsertSource::Query(q) => {
+                self.period_omitted(table, cols)?;
                 let (parts, items) = self.query_parts(q, QCtx::Scalar)?;
                 if items.len() != cols.len() {
                     return Err("INSERT column count does not match the query".into());
@@ -3497,7 +3684,10 @@ impl<'a> Canon<'a> {
                 kv.sort();
                 Ok(n("insertq", vec![a(table), n("set", kv), n("q", parts)]))
             }
-            InsertSource::Default => Ok(n("insertdefault", vec![a(table)])),
+            InsertSource::Default => {
+                self.period_omitted(table, &[])?;
+                Ok(n("insertdefault", vec![a(table)]))
+            }
         }
     }
 
@@ -3507,6 +3697,7 @@ impl<'a> Canon<'a> {
         cols: &[String],
         row: &[Expr],
     ) -> R<Vec<(String, Term, Option<Ty>)>> {
+        self.period_omitted(table, cols)?;
         if row.len() != cols.len() {
             return Err("INSERT column count does not match VALUES".into());
         }

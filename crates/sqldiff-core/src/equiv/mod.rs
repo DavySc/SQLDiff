@@ -11,6 +11,7 @@ pub mod ast;
 mod call;
 pub mod canon;
 pub mod compare;
+pub mod cursor;
 pub mod ddl;
 pub mod dynamic;
 pub mod edit;
@@ -99,6 +100,8 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
         c.reset();
         let mut nodes = vec![s.node.clone()];
         let res = match (&s.msg, &s.ast) {
+            // A statement of a cursor loop.
+            _ if s.cursor.is_some() => c.cursor_op(s.cursor.as_ref().unwrap()),
             // A message a format builds: compared as its text.
             (Some(m), _) => c.message(m),
             (None, Err(e)) => Err(e.clone()),
@@ -164,6 +167,11 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
         C::While(e) => (
             "ctl-while",
             e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
+        ),
+        // Both dialects' tests of the FETCH just before (`cursor.rs`).
+        C::FetchWhile(key) => (
+            "ctl-while",
+            Ok(vec![n("cursor-found", vec![a(key.clone())])]),
         ),
         C::Else => ("ctl-else", Ok(vec![])),
         C::End => ("ctl-end", Ok(vec![])),
@@ -381,6 +389,34 @@ fn compare_units(
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
+    linked(a, b, ua, ub, out);
+}
+
+/// A statement compared as part of another (`Unit::linked`: a T-SQL
+/// cursor's DECLARE with its OPEN, its DEALLOCATE with its CLOSE) is not
+/// shown equivalent when that other is not.
+fn linked(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, out: &mut Outcome) {
+    for (side, u, is_a) in [(a, ua, true), (b, ub, false)] {
+        let name = side_name(side);
+        for (main, part) in &u.linked {
+            let (s, e) = cst::sig_range(main);
+            let at = side.line_of(main);
+            let prefix = format!("{name} line {at}:");
+            let undecided = out.unknown_reasons.iter().any(|r| r.starts_with(&prefix))
+                || out.findings.iter().any(|f| {
+                    let l = if is_a { &f.a } else { &f.b };
+                    f.verdict != Verdict::Equal
+                        && l.as_ref()
+                            .is_some_and(|l| l.byte_start < e && s < l.byte_end)
+                });
+            if undecided {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: compared as part of the statement at line {at}, which was not shown equivalent",
+                    side.line_of(part)
+                ));
+            }
+        }
+    }
 }
 
 /// With a conversion's trace, whether call `xn` (side A) and its
@@ -780,7 +816,31 @@ fn dynamic_sql(
                 continue;
             }
         };
-        if let Some(why) = dynamic::tsql_inner_refusal(&ttext) {
+        // `sp_executesql` parameters against `EXECUTE … USING` values.
+        let passed = match dynamic::exec_params(tn) {
+            Ok(x) => x,
+            Err(why) => {
+                unknown(out, &format!("its parameters are not read: {why}"));
+                continue;
+            }
+        };
+        let using = dynamic::pg_using(pn);
+        let names: Vec<String> = passed
+            .iter()
+            .flat_map(|x| x.params.iter().map(|q| q.name.clone()))
+            .collect();
+        if names.len() != using.len() {
+            unknown(
+                out,
+                &format!(
+                    "T-SQL passes {} parameter value(s) and PostgreSQL {}",
+                    names.len(),
+                    using.len()
+                ),
+            );
+            continue;
+        }
+        if let Some(why) = dynamic::tsql_inner_refusal_with(&ttext, &names) {
             unknown(out, &why);
             continue;
         }
@@ -794,6 +854,95 @@ fn dynamic_sql(
             unknown(out, "the PostgreSQL text is not one statement");
             continue;
         }
+        // With parameters, each text becomes the body of a procedure taking
+        // them, in order: T-SQL binds `@name` to the value passed, PostgreSQL
+        // `$n` to the n-th USING value, typed by it.
+        let (ttext, ptext) = match &passed {
+            None => {
+                if dynamic::pg_has_params(&pparse.syntax()) {
+                    unknown(
+                        out,
+                        "the PostgreSQL text reads $n parameters and EXECUTE passes none",
+                    );
+                    continue;
+                }
+                (ttext, ptext)
+            }
+            Some(ps) => {
+                let tside = call::Side {
+                    d: Dialect::Tsql,
+                    unit: if t_is_a { ua } else { ub },
+                    schema: if t_is_a { sa } else { sb },
+                    name: if t_is_a { &na } else { &nb },
+                    in_do: false,
+                };
+                let pside = call::Side {
+                    d: Dialect::Postgres,
+                    unit: if t_is_a { ub } else { ua },
+                    schema: if t_is_a { sb } else { sa },
+                    name: if t_is_a { &nb } else { &na },
+                    in_do: in_do(pn, Dialect::Postgres),
+                };
+                let mut typed = Vec::new();
+                for q in &ps.params {
+                    match ast::Parser::new(&q.ty, Dialect::Tsql).ty() {
+                        Ok(ty) => typed.push((q.name.clone(), ty)),
+                        Err(e) => {
+                            unknown(out, &format!("the type of @{} is not read: {e}", q.name));
+                            break;
+                        }
+                    }
+                }
+                if typed.len() != ps.params.len() {
+                    continue;
+                }
+                let ptypes = match call::dynamic_args(&typed, &ps.args, &using, &tside, &pside) {
+                    Ok((asms, types)) => {
+                        for x in asms {
+                            out.assume(x);
+                        }
+                        types
+                    }
+                    Err(why) => {
+                        unknown(out, &why);
+                        continue;
+                    }
+                };
+                let body = match dynamic::pg_bind_params(&pparse.syntax(), ps.params.len()) {
+                    Ok(b) => b,
+                    Err(why) => {
+                        unknown(out, &why);
+                        continue;
+                    }
+                };
+                let tdecl = ps
+                    .params
+                    .iter()
+                    .map(|q| format!("@{} {}", q.name, ast_text(&q.ty)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let pdecl = ptypes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| {
+                        let args = if ty.args.is_empty() {
+                            String::new()
+                        } else {
+                            format!("({})", ty.args.join(", "))
+                        };
+                        format!("{}{} {}{args}", dynamic::PG_PARAM, i + 1, ty.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!("CREATE PROCEDURE dbo.sqldiff_dynamic {tdecl}\nAS\nBEGIN\n{ttext}\nEND;\n"),
+                    format!(
+                        "CREATE OR REPLACE PROCEDURE sqldiff_dynamic({pdecl})\nLANGUAGE plpgsql\nAS $sqldiff_dynamic$\nBEGIN\n{};\nEND;\n$sqldiff_dynamic$;\n",
+                        body.trim_end().trim_end_matches(';')
+                    ),
+                )
+            }
+        };
         let (ta, tb) = if t_is_a {
             (ttext.as_str(), ptext.as_str())
         } else {
@@ -832,7 +981,8 @@ fn dynamic_sql(
             unknown(out, &format!("inside its text, {why}"));
         }
         let settled = inner.findings.is_empty() && inner.unknown_reasons.is_empty();
-        let first = k == 0 && untouched(ua, at_a) && untouched(ub, at_b);
+        // A witness picks the parameters' values, which the routine fixes.
+        let first = k == 0 && passed.is_none() && untouched(ua, at_a) && untouched(ub, at_b);
         for f in inner.findings {
             if f.verdict == Verdict::Different && !first {
                 unknown(
@@ -982,6 +1132,30 @@ fn line_at(side: &Analyzed, off: usize) -> crate::model::Location {
     side.location(off, end.max(off + 1).min(text.len().max(off)))
 }
 
+/// The scripts' `CREATE TABLE` statements paired by the table they create,
+/// in order: only when every statement reads, no side creates one name
+/// twice, and the pairs keep both sides' order. `None` otherwise.
+fn tables_by_name(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit) -> Option<Vec<(usize, usize)>> {
+    let keys = |side: &Analyzed, u: &Unit| -> Option<Vec<(Option<String>, String)>> {
+        let ks = u
+            .tables
+            .iter()
+            .map(|(n, _)| {
+                table::created_name(&ast::tokens(n))
+                    .and_then(|name| table::table_key(&name, side.dialect()))
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut seen = std::collections::BTreeSet::new();
+        ks.iter().all(|k| seen.insert(k.clone())).then_some(ks)
+    };
+    let (ka, kb) = (keys(a, ua)?, keys(b, ub)?);
+    let pairs = crate::normalize::lcs_pairs(&ka, &kb);
+    // Every name both sides create is paired: otherwise the order differs.
+    let common = ka.iter().filter(|k| kb.contains(k)).count();
+    (pairs.len() == common).then_some(pairs)
+}
+
 /// Compares the scripts' `CREATE TABLE` statements, in order (`table.rs`).
 #[allow(clippy::too_many_arguments)]
 fn tables(
@@ -997,7 +1171,24 @@ fn tables(
         return;
     }
     let (na, nb) = (side_name(a), side_name(b));
-    if ua.tables.len() != ub.tables.len() {
+    let pairs: Vec<(usize, usize)> = if ua.tables.len() == ub.tables.len() {
+        (0..ua.tables.len()).map(|i| (i, i)).collect()
+    } else if let Some(pairs) = tables_by_name(a, b, ua, ub) {
+        // A table one side does not create (a statement the conversion
+        // did not convert) is not compared; the others meet their own
+        // counterparts.
+        for (side, u, name, is_a) in [(a, ua, &na, true), (b, ub, &nb, false)] {
+            for (i, (node, _)) in u.tables.iter().enumerate() {
+                if !pairs.iter().any(|p| if is_a { p.0 == i } else { p.1 == i }) {
+                    out.unknown_reasons.push(format!(
+                        "{name} line {}: a CREATE TABLE is not compared: the other side creates no table of that name",
+                        side.line_of(node)
+                    ));
+                }
+            }
+        }
+        pairs
+    } else {
         for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
             for (node, _) in &u.tables {
                 out.unknown_reasons.push(format!(
@@ -1009,8 +1200,11 @@ fn tables(
             }
         }
         return;
-    }
-    for ((xa, pa), (xb, pb)) in ua.tables.iter().zip(&ub.tables) {
+    };
+    for (xa, pa, xb, pb) in pairs.iter().map(|&(i, j)| {
+        let ((xa, pa), (xb, pb)) = (&ua.tables[i], &ub.tables[j]);
+        (xa, pa, xb, pb)
+    }) {
         let (la, lb) = (a.line_of(xa), b.line_of(xb));
         if pa != pb {
             out.unknown_reasons.push(format!(
@@ -1260,6 +1454,133 @@ fn table_vars(
     }
 }
 
+/// Whether a T-SQL file gives the column of `sd` a default (or makes it an
+/// identity) before `at`: in the CREATE TABLE of its table or an earlier
+/// `ADD DEFAULT … FOR` it. `None` when that CREATE TABLE is not read.
+fn default_before(side: &Analyzed, at: &SyntaxNode, sd: &ddl::SetDefault) -> Option<bool> {
+    let d = side.dialect();
+    let want = ddl::object_key(&sd.table, d).ok()?;
+    let col = table::key(&sd.column, d).ok()?;
+    for n in side.root.descendants() {
+        if n.kind() != sqldiff_syntax::SyntaxKind::STATEMENT
+            || n.text_range().start() >= at.text_range().start()
+        {
+            continue;
+        }
+        let ts = ast::tokens(&n);
+        if let Ok(c) = table::created_name(&ts) {
+            if ddl::object_key(&c, d).ok() != Some(want.clone()) {
+                continue;
+            }
+            let t = table::parse(&ts, d).ok()?;
+            let has = t.columns.iter().any(|c| {
+                table::key(&c.name, d).ok().as_ref() == Some(&col)
+                    && (c.default.is_some() || c.identity.is_some())
+            });
+            if has {
+                return Some(true);
+            }
+        } else if let Ok(ddl::Ddl::Default(o)) = ddl::parse(&ts, d) {
+            if ddl::object_key(&o.table, d).ok() == Some(want.clone())
+                && table::key(&o.column, d).ok() == Some(col.clone())
+            {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Where `at` sits among the file's top-level statements (and routines)
+/// that concern an object: `C` creates it, `D` drops it, `M` names it
+/// otherwise (a run of these counts once), `X` is `at`'s own. For a schema
+/// (`schema`), any statement naming the schema concerns it. `None` when the
+/// object's name cannot be read.
+fn object_events(
+    side: &Analyzed,
+    at: &SyntaxNode,
+    name: &[table::Name],
+    schema: bool,
+) -> Option<String> {
+    use ast::K;
+    let d = side.dialect();
+    let key = |n: &[table::Name]| -> Option<(Option<String>, String)> {
+        if schema {
+            let [s] = n else { return None };
+            Some((None, table::key(s, d).ok()?))
+        } else {
+            ddl::object_key(n, d).ok()
+        }
+    };
+    let want = key(name)?;
+    let word = &want.1;
+    let items: Vec<SyntaxNode> = cst::structural_children(&side.root)
+        .into_iter()
+        .flat_map(|n| {
+            if n.kind() == sqldiff_syntax::SyntaxKind::BATCH {
+                cst::structural_children(&n)
+            } else {
+                vec![n]
+            }
+        })
+        .collect();
+    let mut out = String::new();
+    for it in &items {
+        let c = if it.text_range().contains_range(at.text_range()) {
+            'X'
+        } else {
+            let ts = ast::tokens(it);
+            let names =
+                |t: &ast::Tok| table::name_of(t).is_some_and(|n| n.text.eq_ignore_ascii_case(word));
+            if !ts.iter().any(names) {
+                continue;
+            }
+            // `CREATE … KIND name` / `DROP KIND [IF EXISTS] name` of the
+            // object itself.
+            let own = (|| {
+                let verb = ts.first()?.up.clone();
+                if verb != "CREATE" && verb != "DROP" {
+                    return None;
+                }
+                let k = ts.iter().position(|t| {
+                    t.kind == K::Word
+                        && matches!(
+                            t.up.as_str(),
+                            "TABLE"
+                                | "VIEW"
+                                | "PROC"
+                                | "PROCEDURE"
+                                | "FUNCTION"
+                                | "SEQUENCE"
+                                | "SCHEMA"
+                                | "TRIGGER"
+                                | "TYPE"
+                                | "INDEX"
+                        )
+                })?;
+                if (ts[k].up == "SCHEMA") != schema || ts[k].up == "INDEX" {
+                    return None;
+                }
+                let mut i = k + 1;
+                if ts.get(i).is_some_and(|t| t.up == "IF") {
+                    i += if ts.get(i + 1).is_some_and(|t| t.up == "NOT") {
+                        3
+                    } else {
+                        2
+                    };
+                }
+                let (n, _) = table::dotted(&ts, i).ok()?;
+                (key(&n)? == want).then_some(if verb == "CREATE" { 'C' } else { 'D' })
+            })();
+            own.unwrap_or('M')
+        };
+        if !(c == 'M' && out.ends_with('M')) {
+            out.push(c);
+        }
+    }
+    out.contains('X').then_some(out)
+}
+
 /// Whether `x` runs exactly once per run of its routine or script:
 /// no enclosing branch, loop, handler or TRY/CATCH, and no enclosing block
 /// with an EXCEPTION section (a PostgreSQL subtransaction that undoes it
@@ -1443,6 +1764,51 @@ fn table_pair(
                         unknown(
                             out,
                             format!("the defaults of column {col} were not shown equal: {w}"),
+                        );
+                    }
+                }
+            }
+            table::Event::Computed {
+                col,
+                a: ea,
+                b: eb,
+                at,
+            } => {
+                let (sa2, sb2) = with_table();
+                let select = |e: &[ast::Tok], name: &[ast::Tok]| {
+                    let mut v = vec![synth(K::Word, "SELECT")];
+                    v.extend(e.iter().cloned());
+                    v.push(synth(K::Word, "FROM"));
+                    v.extend(name.iter().cloned());
+                    v
+                };
+                match same_stmt(
+                    &select(&ea, &ta.name_toks),
+                    &select(&eb, &tb.name_toks),
+                    ua,
+                    ub,
+                    sa2,
+                    sb2,
+                    &na,
+                    &nb,
+                ) {
+                    Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                    Same::No(class, rule, w) => {
+                        found = true;
+                        finding(
+                            out,
+                            rule,
+                            class,
+                            format!("Tables (A line {la}, B line {lb}) differ in the computed column {col}: {w}"),
+                            at,
+                            Vec::new(),
+                        );
+                    }
+                    Same::Unknown(w) => {
+                        decided = false;
+                        unknown(
+                            out,
+                            format!("the computed column {col} was not shown equal: {w}"),
                         );
                     }
                 }
@@ -1792,6 +2158,43 @@ fn ddl_stmts(
                 continue;
             }
         }
+        // A DROP or a table's default sits in the same place on both sides
+        // among the file's statements that create, drop or name its object
+        // (for a schema: anything in it).
+        let target = |dd: &ddl::Ddl| match dd {
+            ddl::Ddl::Default(x) => Some((x.table.clone(), false)),
+            ddl::Ddl::Drop(x) => Some((x.name.clone(), x.kind == "SCHEMA")),
+            _ => None,
+        };
+        if let (Some((nx, sx)), Some((ny, sy))) = (target(dx), target(dy)) {
+            let ex = object_events(a, x.node, &nx, sx);
+            let ey = object_events(b, y.node, &ny, sy);
+            if ex.is_none() || ex != ey {
+                unknown(
+                    out,
+                    "the file creates, drops or uses its object in another order around it on the two sides".into(),
+                );
+                continue;
+            }
+        }
+        // SQL Server refuses a second default on a column (Msg 1781) where
+        // PostgreSQL's SET DEFAULT replaces the one there.
+        let second = [(a, x.node, dx), (b, y.node, dy)]
+            .into_iter()
+            .find_map(|(side, n, dd)| match dd {
+                ddl::Ddl::Default(sd) if side.dialect() == Dialect::Tsql => {
+                    match default_before(side, n, sd) {
+                        Some(false) => None,
+                        Some(true) => Some("the file already gives the column a default (or an identity) before it: SQL Server refuses a second default, PostgreSQL replaces it"),
+                        None => Some("the file creates the column's table in a form not read, so whether the column has a default already is unknown"),
+                    }
+                }
+                _ => None,
+            });
+        if let Some(why) = second {
+            unknown(out, why.into());
+            continue;
+        }
         // PostgreSQL names are compared up to letter case only where no
         // other name differs from them only in case.
         let case_check = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {
@@ -1818,6 +2221,32 @@ fn ddl_stmts(
         };
         if let Err(e) = case_check(a, ua, sa, dx).and_then(|_| case_check(b, ub, sb, dy)) {
             unknown(out, e);
+            continue;
+        }
+        // `GRANT … ON name` names a table in PostgreSQL; on the T-SQL side
+        // it might as well be a function, a procedure or a sequence. Only a
+        // table the file creates or the catalog has is compared.
+        let grant_table = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {
+            let ddl::Ddl::Grant(g) = dd else {
+                return true;
+            };
+            let d = side.dialect();
+            let Ok(want) = ddl::stored_key(&g.object, d) else {
+                return false;
+            };
+            u.tables.iter().any(|(n, _)| {
+                table::parse(&ast::tokens(n), d)
+                    .ok()
+                    .and_then(|t| ddl::stored_key(&t.name, d).ok())
+                    .as_ref()
+                    == Some(&want)
+            }) || s.table_exact(want.0.as_deref(), &want.1).is_some()
+        };
+        if !grant_table(a, ua, sa, dx) || !grant_table(b, ub, sb, dy) {
+            unknown(
+                out,
+                "GRANT on an object that is not a table the file creates or the catalog has".into(),
+            );
             continue;
         }
         let table_of = |d: &ddl::Ddl| match d {
@@ -1885,6 +2314,31 @@ fn ddl_stmts(
                         at,
                         ids,
                     );
+                }
+                ddl::Event::Default { a: ea, b: eb, at } => {
+                    let select = |e: &[ast::Tok]| {
+                        let mut v = vec![synth(K::Word, "SELECT")];
+                        v.extend(e.iter().cloned());
+                        v
+                    };
+                    match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                        Same::No(class, rule, w) => {
+                            found = true;
+                            finding(
+                                out,
+                                rule,
+                                class,
+                                format!("Column defaults (A line {la}, B line {lb}) differ: {w}"),
+                                at,
+                                Vec::new(),
+                            );
+                        }
+                        Same::Unknown(w) => {
+                            decided = false;
+                            unknown(out, format!("the defaults were not shown equal: {w}"));
+                        }
+                    }
                 }
                 ddl::Event::Filter {
                     unique,
