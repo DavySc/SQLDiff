@@ -185,11 +185,12 @@ ever added, so a reader of the C1 answer keeps working.
 * `"residual"`, with `"c2a"` only: the facts the confirmation still
   rests on (`Sqldiff.Mirror.residual`), an array of assumption names,
   possibly empty.
-* `"statements"`: `"c3a"` when the routines have data statements (C3a:
-  the confirmation covers the target catalog's tables named in the
-  request, under the facts a TABLE entry asserts), `"c1"` when they have
-  only the control statements of C1. Added in C3a, last, so a reader of
-  the C2a answer keeps working.
+* `"statements"`: `"c3b"` when the routines read a table (C3b: queries,
+  with or without data statements), else `"c3a"` when they have data
+  statements (C3a: the confirmation covers the target catalog's tables
+  named in the request, under the facts a TABLE entry asserts), `"c1"`
+  when they have only the control statements of C1. Added in C3a, last,
+  so a reader of the C2a answer keeps working; `"c3b"` added in C3b.
 
 * `"errors"`: `"c4"` when the routines handle errors, raise them or
   control transactions (C4: `TRY`/`CATCH` against an exception block,
@@ -214,7 +215,9 @@ def extra (dep cat ra : String) (ans : Answer) : String :=
     let ca := match deployment? dep, catalog? cat, a with
       | some d, some g, some a => lowerT d g a
       | _, _, _ => none
-    let stmts := if (ca.map Core.Routine.hasData).getD false then "c3a" else "c1"
+    let stmts :=
+      if (ca.map Core.Routine.hasQuery).getD false then "c3b"
+      else if (ca.map Core.Routine.hasData).getD false then "c3a" else "c1"
     let errs := match a, ca with
       | some a, some ca => if usesC4 a ca then ",\"errors\":\"c4\"" else ""
       | _, _ => ""

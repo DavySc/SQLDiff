@@ -205,7 +205,8 @@ pub trait Checker: Send + Sync + std::fmt::Debug {
 /// operators have their meaning, and `residual` lists what the slice still
 /// assumes) or not (`uninterpreted`: operators are taken to mean the same
 /// in both dialects); and whether data statements were in the C3a slice
-/// (`statements` is `c3a`) or the routine had none in its spec (`c1`).
+/// (`statements` is `c3a`), queries in the C3b slice (`c3b`, with or
+/// without data statements), or the routine had none in its spec (`c1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorAnswer {
     pub answer: Answer,

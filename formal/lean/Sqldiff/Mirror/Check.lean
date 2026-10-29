@@ -83,7 +83,8 @@ def inC2a (dep : Deployment) (Γ : Catalog) (a b : Ast.Routine) (ca cb : Core.Ro
 for the Rust side to record in place of `ASM-C1-OPERATORS`. Both are
 settings the routine's text does not fix:
 
-* `ASM-TSQL-ARITH-ERRORS`, when an expression can raise: integer overflow
+* `ASM-TSQL-ARITH-ERRORS`, when an expression can raise, or (C3b) the
+  routine counts rows (`COUNT(*)` beyond 2^31-1): integer overflow
   and division by zero raise an error. With `ANSI_WARNINGS` and
   `ARITHABORT` both `OFF` they give NULL and a warning instead ("SET
   ARITHABORT (Transact-SQL)", "SET ANSI_WARNINGS (Transact-SQL)");
@@ -153,7 +154,7 @@ And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
 (`Core.Routine.settle`): a handled body that cannot fail after a write
 leaves nothing behind when it fails, which is what `undo` says. -/
 def residual (a : Ast.Routine) (ca : Core.Routine) : List String :=
-  (if ca.mayRaise then ["ASM-TSQL-ARITH-ERRORS"] else []) ++
+  (if ca.mayRaise || ca.hasCount then ["ASM-TSQL-ARITH-ERRORS"] else []) ++
     (if ca.hasEqNe then ["ASM-TSQL-ANSI-NULLS"] else []) ++
     (if ca.settle.errAfterWrite then ["ASM-STATE-AFTER-ERROR"] else []) ++
     (if ca.hasConcat && !concatNullOn a then ["ASM-CONCAT-NULL"] else []) ++
@@ -196,7 +197,8 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
       .unconfirmed "certificate: a T-SQL variable is given two PL/pgSQL names"
     else if !cert.injective then
       .unconfirmed "certificate: two T-SQL variables are given one PL/pgSQL name"
-    else if !cert.covers ca.vars then
+    -- `existsVar` (C3b) is no name of either dialect: it stays as it is.
+    else if !cert.covers (ca.vars.filter (· != existsVar)) then
       .unconfirmed "certificate: a T-SQL variable has no PL/pgSQL name"
     else if InjOn cert.ren ca.vars ∧ cb = ca.settleTop.rename cert.ren then
       .confirmed (if inC2a dep Γ a b ca cb then theoremC2a else theoremC1)

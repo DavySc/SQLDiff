@@ -23,3 +23,8 @@ import Sqldiff.Core.Handlers
 #print axioms Sqldiff.Core.exec_settleTop
 #print axioms Sqldiff.Core.Routine.obs_settleTop
 #print axioms Sqldiff.Core.refines_settleTop_rename
+-- C3b: queries.
+#print axioms Sqldiff.Core.keptRows_map
+#print axioms Sqldiff.Core.pickRows_map
+#print axioms Sqldiff.Core.pickRows_rename
+#print axioms Sqldiff.Core.exec_setDb

@@ -160,7 +160,7 @@ theorem Stmt.rename_bindErr (k : ErrKind) :
   | .while c b => by simp [Stmt.bindErr, Stmt.rename, Stmt.rename_bindErr k b]
   | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.rename, Stmt.rename_bindErr k b]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 theorem Stmt.vars_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).vars = s.vars
   | .reraise => rfl
@@ -169,7 +169,66 @@ theorem Stmt.vars_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).vars = s.v
   | .while c b => by simp [Stmt.bindErr, Stmt.vars, Stmt.vars_bindErr k b]
   | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.vars, Stmt.vars_bindErr k b]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
+
+/-- Related stores after a step that may fail: the same error, or stores
+that agree (entry stores, C3b picks). -/
+def BindRel (f : Var → Var) (D : List Var) :
+    Except ErrKind (Store U) → Except ErrKind (Store U) → Prop
+  | .error k, .error k' => k = k'
+  | .ok σA, .ok σB => Agree f D σA σB
+  | _, _ => False
+
+theorem Agree.setAll (inj : InjOn f D) :
+    ∀ (xs : List Var) (vs : List (Val U)) (σA σB : Store U), Sub xs D → Agree f D σA σB →
+      Agree f D (σA.setAll xs vs) (σB.setAll (xs.map f) vs)
+  | [], _, _, _, _, h => by simpa [Store.setAll] using h
+  | _ :: _, [], _, _, _, h => by simpa [Store.setAll] using h
+  | x :: xs, v :: vs, σA, σB, hs, h => by
+    simp only [List.map_cons, Store.setAll]
+    exact Agree.setAll inj xs vs _ _ (fun y hy => hs y (by simp [hy]))
+      (h.set inj (hs x (by simp)) v)
+
+/-- (C3b) A pick and its renaming, on the same rows, with expressions that
+agree through the renaming. -/
+theorem pickRows_rename (inj : InjOn f D) (ev ev' : Store U → Expr → Res U) (t : TableDef)
+    {σA σB : Store U} (h : Agree f D σA σB) (rows : List (Row U)) :
+    ∀ p : Pick, Sub p.vars D → (∀ e ∈ p.exprs, ∀ ρ, ev' ρ (e.rename f) = ev ρ e) →
+      BindRel f D (pickRows ev t σA rows p) (pickRows ev' t σB rows (p.rename f))
+  | .row n sets, hs, he => by
+    have h1 : (sets.map fun p => (f p.1, p.2.rename f)).map (·.1) = (sets.map (·.1)).map f := by
+      simp [List.map_map, Function.comp_def]
+    have h2 : (sets.map fun p => (f p.1, p.2.rename f)).map (·.2) =
+        (sets.map (·.2)).map (Expr.rename f) := by
+      simp [List.map_map, Function.comp_def]
+    have h3 : (sets.map fun p => (f p.1, p.2.rename f)).map (fun _ => (Val.null : Val U)) =
+        sets.map (fun _ => (Val.null : Val U)) := by
+      simp [List.map_map, Function.comp_def]
+    have hx : Sub (sets.map (·.1)) D := fun y hy => hs y (by
+      obtain ⟨q, hq, rfl⟩ := List.mem_map.mp hy
+      simp only [Pick.vars, List.mem_flatten, List.mem_map]
+      exact ⟨_, ⟨q, hq, rfl⟩, by simp⟩)
+    simp only [pickRows, Pick.rename, h1, h2, h3]
+    cases rows.getLast? with
+    | none =>
+      cases n
+      · exact h
+      · exact Agree.setAll inj _ _ _ _ hx h
+    | some r =>
+      dsimp only
+      rw [evalVals_map (ev := ev) (ev' := ev') (g := Expr.rename f) _ _
+        (fun e he' ρ => he e (by simpa [Pick.exprs] using he') ρ)]
+      cases evalVals ev (rowStore t.cols r) (sets.map (·.2)) with
+      | error k => exact rfl
+      | ok vs => exact Agree.setAll inj _ vs _ _ hx h
+  | .count x, hs, _ => by
+    simp only [pickRows, Pick.rename]
+    cases (toInt32 rows.length : Res U) with
+    | err k => exact rfl
+    | ok v => exact h.set inj (hs x (by simp [Pick.vars])) v
+  | .any x, hs, _ => by
+    simp only [pickRows, Pick.rename]
+    exact h.set inj (hs x (by simp [Pick.vars])) _
 
 /-! ## The lock-step simulation -/
 
@@ -293,6 +352,35 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
   | _ + 1, .raise _, _, _, _, h => ⟨rfl, h⟩
   | _ + 1, .reraise, _, _, _, h => ⟨rfl, h⟩
   | _ + 1, .commit, _, _, _, h => h
+  | _ + 1, .query t c p, a, b, hs, h => by
+    obtain ⟨hst, hw, hdb, hc⟩ := h
+    simp only [exec, Stmt.rename]
+    rw [keptRows_map (ev := fun ρ e => e.eval es a.store ρ) t c
+      (fun e he _ => Expr.eval_rename es hst e (fun y hy => hs y (by
+        simp only [Stmt.vars, he, Expr.varsOpt, List.mem_append]
+        exact Or.inl hy))), hdb]
+    cases keptRows (fun ρ e => e.eval es a.store ρ) t c (b.db.get t.name) with
+    | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
+    | ok rows =>
+      dsimp only
+      have hp := pickRows_rename inj (fun ρ e => e.eval es a.store ρ)
+        (fun ρ e => e.eval es b.store ρ) t hst rows p
+        (fun y hy => hs y (by simp [Stmt.vars, hy]))
+        (fun e he ρ => Expr.eval_rename es hst e (fun y hy => hs y (by
+          simp only [Stmt.vars, List.mem_append]
+          refine Or.inr ?_
+          cases p with
+          | row n sets =>
+            obtain ⟨x, hq⟩ : ∃ x, (x, e) ∈ sets := by simpa [Pick.exprs] using he
+            simp only [Pick.vars, List.mem_flatten, List.mem_map]
+            exact ⟨_, ⟨(x, e), hq, rfl⟩, by simp [hy]⟩
+          | count _ => simp [Pick.exprs] at he
+          | any _ => simp [Pick.exprs] at he)))
+      generalize pickRows (fun ρ e => e.eval es a.store ρ) t a.store rows p = rA at hp ⊢
+      generalize pickRows (fun ρ e => e.eval es b.store ρ) t b.store rows (p.rename f) = rB at hp ⊢
+      cases rA <;> cases rB <;> simp only [BindRel] at hp
+      · exact ⟨hp, hst, hw, hdb, hc⟩
+      · exact ⟨hp, hw, rfl, hc⟩
   | n + 1, .tryCatch u body hd, a, b, hs, h => by
     have ih := exec_rename es wm inj n body a b (fun y hy => hs y (by simp [Stmt.vars, hy])) h
     simp only [exec, Stmt.rename]
@@ -324,13 +412,6 @@ theorem paramValue_rename (es : ExprSem U) (p : Param) (hs : Sub p.vars D) (arg 
       | rfl
       | exact Expr.eval_rename es Agree.null _
           (fun y hy => hs y (by simp [Param.vars, hy]))
-
-/-- Related entry stores: the same error, or stores that agree. -/
-def BindRel (f : Var → Var) (D : List Var) :
-    Except ErrKind (Store U) → Except ErrKind (Store U) → Prop
-  | .error k, .error k' => k = k'
-  | .ok σA, .ok σB => Agree f D σA σB
-  | _, _ => False
 
 theorem Agree.bindParams (es : ExprSem U) (inj : InjOn f D) :
     ∀ (ps : List Param) (vs : List (Val U)) (σA σB : Store U), Sub (ps.map Param.vars).flatten D →

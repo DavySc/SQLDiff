@@ -40,7 +40,7 @@ Param := Param name:s ty:Ty mode:Mode default:Expr?
 Mode := In | Out | InOut
 Security := Caller | Owner
 Block := Block decls:[Stmt] body:[Node]
-Node := NStmt stmt:Stmt | NBlock block:Block | If cond:Expr then:[Node] els:[Node] | While cond:Expr body:[Node] | Call name:[s] args:[Arg] ret:Expr? | Setting name:s on:b | Try body:[Node] handlers:[Handler] | Throw args:[Expr] | Raise level:s? format:s? args:[Expr] using:[RaiseOpt] | Txn op:s name:s?
+Node := NStmt stmt:Stmt | NBlock block:Block | If cond:Expr then:[Node] els:[Node] | While cond:Expr body:[Node] | ForQuery var:s query:Select body:[Node] | Call name:[s] args:[Arg] ret:Expr? | Setting name:s on:b | Try body:[Node] handlers:[Handler] | Throw args:[Expr] | Raise level:s? format:s? args:[Expr] using:[RaiseOpt] | Txn op:s name:s?
 Handler := Handler conds:[s] body:[Node]
 RaiseOpt := RaiseOpt name:s value:Expr
 Arg := Arg name:s? value:Expr output:b
@@ -208,6 +208,12 @@ impl W {
             Node::While { cond, body } => {
                 self.open("While");
                 self.expr(cond);
+                self.list(body, |w, n| w.node(n));
+            }
+            Node::ForQuery { var, query, body } => {
+                self.open("ForQuery");
+                self.s(var);
+                self.select(query);
                 self.list(body, |w, n| w.node(n));
             }
             Node::Call { name, args, ret } => {

@@ -494,6 +494,93 @@ fn the_real_checker_confirms_data_statements_on_a_plain_table() {
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
 
+/// C3b end to end: a procedure that reads a plain table in the three shapes
+/// the converter writes (`SELECT @x = col` by key, which becomes a PL/pgSQL
+/// `FOR` block; `IF [NOT] EXISTS`; a scalar subquery by key) and counts
+/// rows is confirmed with `statements: c3b`; the table is sent although the
+/// procedure only reads it. A `SELECT @x = col` whose `WHERE` does not fix
+/// the key is refused: which row's value T-SQL keeps is unspecified.
+#[test]
+fn the_real_checker_confirms_reads_of_a_plain_table() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c3b-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "acct.sql",
+        "CREATE TABLE dbo.Acct (Id int NOT NULL, Qty int NULL, Total int NOT NULL, CONSTRAINT PK_Acct PRIMARY KEY (Id));\n",
+    );
+    let look = |wh: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.look @id int, @q int OUTPUT, @t int OUTPUT, @e int OUTPUT\nAS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SELECT @q = Qty, @t = Total FROM dbo.Acct WHERE {wh};\n  IF EXISTS (SELECT 1 FROM dbo.Acct WHERE Qty > @id)\n    SET @e = 1;\n  IF NOT EXISTS (SELECT 1 FROM dbo.Acct WHERE Qty > @id)\n    SET @e = 2;\n  ELSE\n    SET @e = 3;\n  SET @t = (SELECT Total FROM dbo.Acct WHERE Id = @id);\n  SELECT @e = COUNT(*) FROM dbo.Acct WHERE Qty > 0;\nEND\n"
+        )
+    };
+    write(&src, "look.sql", &look("Id = @id"));
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.look")
+            .unwrap()
+    };
+    // The converter writes the shapes the checker reads.
+    let r = run();
+    let out = std::fs::read_to_string(d.join("out/look.sql")).unwrap();
+    for shape in [
+        "FOR sqldiff_r IN SELECT Qty AS sqldiff_c1, Total AS sqldiff_c2 FROM Acct WHERE Id = p_id LOOP",
+        "IF NOT EXISTS (SELECT 1 FROM Acct WHERE Qty > p_id) THEN",
+        "p_t := (SELECT Total FROM Acct WHERE Id = p_id);",
+        "SELECT COUNT(*) INTO p_e FROM Acct WHERE Qty > 0;",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["statements"], "c3b", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    // COUNT(*) can overflow; `Id = @id` compares with `=`; the table is
+    // taken as declared. Reads send no rows-affected count.
+    for a in [
+        "ASM-TSQL-ARITH-ERRORS",
+        "ASM-TSQL-ANSI-NULLS",
+        "ASM-TABLES-AS-DECLARED",
+    ] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    assert!(!asm.contains(&"ASM-OBSERVER-ROWCOUNT"), "{r}");
+    write(&src, "look.sql", &look("Qty = @id"));
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+}
+
 /// C2b end to end: concatenation and ISNULL over bounded string variables
 /// are confirmed in the slice, and the leading SET CONCAT_NULL_YIELDS_NULL
 /// ON discharges ASM-CONCAT-NULL in the release gate. A string `=` is

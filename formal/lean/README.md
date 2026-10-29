@@ -10,17 +10,17 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Ast.lean` | Generated from the abstract syntax schema (`sqldiff_syntax::encode::SCHEMA`, `sqldiff_core::proof::lean_ast`): routines, statements and expressions as Lean types, and the decoder for their one-line encoding. Do not edit; the same bless command writes it |
 | `Sqldiff/Tree.lean` | The syntax tree as Lean types and its decoder: an unknown kind, a token where a node belongs or the reverse, or any other text fails to decode |
 | `Sqldiff/Gate.lean` | Programs, refinement (decision 1), the check, and `check_sound`: a confirmed answer means B refines A, for every semantics |
-| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); expressions are slice expressions (`SExpr`: variables, columns, 32-bit integer literals, NULL, `+ - * / %`, negation, comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
+| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); (C3b) the read `query t c pick` (`Pick`: assign from the one kept row, count the kept rows, test for one); expressions are slice expressions (`SExpr`: variables, columns, 32-bit integer literals, NULL, `+ - * / %`, negation, comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
 | `Sqldiff/Core/Semantics.lean` | Values (NULL, three-valued booleans, 32-bit integers, opaque values), errors (overflow, division by zero, constraint violations), the meaning of slice expressions, the database (tables as lists of rows, observed as bags), the data statements, the fuel-based, executable interpreter, what a caller observes (out parameters, returned value, world and database after a finished call; error kind and calls for a failed one; decision 1) and `Refines` |
-| `Sqldiff/Core/Data.lean` | The data statements: congruence lemmas (`insertRows_map`, `updateRows_map`, `deleteRows_map`) and statement atomicity (`exec_error_atomic`) |
+| `Sqldiff/Core/Data.lean` | The data statements: congruence lemmas (`insertRows_map`, `updateRows_map`, `deleteRows_map`, and (C3b) `keptRows_map`, `pickRows_map`) and statement atomicity (`exec_error_atomic`) |
 | `Sqldiff/Core/Rename.lean` | An injective renaming of a routine's variables is observationally the same routine (`refines_rename`) |
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes (with a result or an error), more fuel gives the same observation (`obs_mono`) |
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
 | `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
-| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice and the C3a data statements (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
+| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C3a data statements and the C3b queries (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer |
 | `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC4.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs), as `#guard`s checked on every build |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC4.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C3b queries; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs), as `#guard`s checked on every build |
 | `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
@@ -277,6 +277,70 @@ residuals; it does not cover the state after a failed call (C4), `MERGE`,
 Theorems with only the standard axioms: `check_sound`, `check_sound_c2a`,
 `refines_rename`, `obs_mono`, `Routine.obs_opFree`, `exec_error_atomic`
 and the congruence lemmas, and (C2b) `mkRtrim_eval` (`Axioms.lean`).
+
+### Phase C3b: single-table queries
+
+Checker 0.10.0. The core has one more statement, `query t c pick`
+(`Sqldiff.Core.Stmt.query`): the rows of table `t` where `c` is TRUE
+(`keptRows`), then `pick` assigns variables from them (`pickRows`):
+`row orNull sets` from the last kept row (nothing, or with `orNull` NULL,
+when none is kept), `count x` their number (an overflow beyond 2^31-1),
+`any x` whether there is one. It reads the database and writes only
+variables. The lowerings build it from exactly the shapes
+`sqldiff convert --to postgres` writes ("The C3b slice: queries" in
+`Sqldiff/Mirror/Lower.lean`, each rule with its claim, vendor text and
+probe):
+
+| Rule | T-SQL | PL/pgSQL | Probed (eval/queries) |
+|---|---|---|---|
+| 1 | `SELECT @x = e, ... FROM t WHERE c` | `DECLARE r record; BEGIN FOR r IN SELECT e AS a, ... FROM t WHERE c LOOP x := r.a; ... END LOOP; END;` | Q1 (one row, NULL column, no row keeps the value, two targets, key NULL), Q2 (several rows: an unspecified one) |
+| 2 | `SET @x = (SELECT e FROM t WHERE c)` | `x := (SELECT e FROM t WHERE c);` | Q5 (value, NULL on no row, 512 against 21000 on several) |
+| 3 | `IF [NOT] EXISTS (SELECT 1 FROM t [WHERE c])` | the same | Q4 (TRUE/FALSE, never UNKNOWN), Q7 (the select list is not evaluated, both engines) |
+| 4 | `SELECT @x = COUNT(*) FROM t [WHERE c]`, `SET @x = (SELECT COUNT(*) ...)` | `SELECT COUNT(*) INTO x FROM t [WHERE c];`, `x := (SELECT COUNT(*) ...)` | Q6 (0, 1, 3; `int` against `bigint`); overflow not probed |
+| Row counts | none of these sends one | none | Q3 |
+| Names | columns spelt as the catalog | a column that is also a variable (or the loop's record) is outside the spec | Q9 (42702 in a `FOR` query and in `EXISTS`) |
+| Own writes | a read sees the routine's earlier writes | the same | Q8 |
+
+The conditions that make rules 1 and 2 hold although neither vendor says
+which row a multi-row result assigns (rule 1) and both raise on it (rule
+2): the `WHERE` is a conjunction that fixes every primary-key column with
+`=` against a value that reads no column (`keyFixed`), so at most one row
+can match in any state an engine can be in (the key is in the trusted
+catalog, `ASM-TABLES-AS-DECLARED`; the core's choice on a state that
+breaks the key is not a claim about the engines); the values read no
+variable and cannot raise (`pickValue`: T-SQL may evaluate them on rows
+the `WHERE` drops, and reads variables per row); the targets are
+distinct `int` variables the `WHERE` does not read. The PL/pgSQL block
+is accepted only as the converter writes it: its one declaration a
+`record` without default, named like no variable of the routine, the
+loop its only statement, the loop's body exactly `xi := r.ai` in the
+order of the select list's aliases. `EXISTS` is the whole condition of
+an `IF`, its test held in a variable no dialect can name
+(`Sqldiff.Mirror.existsVar`, `"%exists"`), a local of both lowered
+routines that the certificate need not list. Queries stand only in
+procedures; `WHILE EXISTS`, `EXISTS` inside a larger condition, joins,
+aliases, hints, `TOP`, `ORDER BY`, `GROUP BY` and `DISTINCT` are outside
+the spec, as is PL/pgSQL `SELECT col INTO x` (NULL on no row, probed
+Q10).
+
+**What it rests on**, beyond C3a: the probes above and the vendor texts
+quoted from memory in `Lower.lean`; `ASM-TABLES-AS-DECLARED` for the read
+tables too (the Rust side now sends a plain table a routine only reads,
+`cert.rs`, `read_tables`); `ASM-TSQL-ANSI-NULLS` when a `WHERE` uses `=`;
+`ASM-TSQL-ARITH-ERRORS` when the routine counts rows; decision 1's serial
+execution (other sessions' writes are not modelled). No new residual id.
+A confirmed answer whose routines read a table carries `"statements":
+"c3b"`.
+
+**Proofs.** `check_sound` and `check_sound_c2a` keep their statements;
+the core lemmas gained the `query` case: the renaming simulation
+(`pickRows_rename`, `keptRows_map`), operator independence
+(`pickRows_map`), fuel monotonicity, statement atomicity of leaves, and
+the C4 settling. One C4 fact needed a correction for reads:
+`exec_setDb` (a statement that does not touch the database runs the
+same from any database) now also asks for no query, and a handler with a
+query is no longer a `failHandler` (it would read the database `undo`
+restores). Standard axioms only (`Axioms.lean`).
 
 ### Phase C4: errors and transactions
 

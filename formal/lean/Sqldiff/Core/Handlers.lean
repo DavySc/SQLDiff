@@ -97,7 +97,7 @@ def Stmt.noFail : Stmt → Bool
   | .ite c s t => c.total && s.noFail && t.noFail
   | .while c b => c.total && b.noFail
   | .tryCatch _ _ h => h.noFail
-  | .call .. | .insert .. | .update .. | .delete .. | .raise _ | .reraise => false
+  | .call .. | .insert .. | .update .. | .delete .. | .raise _ | .reraise | .query .. => false
 
 theorem Stmt.noFail_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).noFail = s.noFail
   | .reraise => rfl
@@ -108,7 +108,7 @@ theorem Stmt.noFail_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).noFail =
   | .while c b => by simp [Stmt.bindErr, Stmt.noFail, Stmt.noFail_bindErr k b]
   | .tryCatch u b h => rfl
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 theorem Stmt.hasWrite_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).hasWrite = s.hasWrite
   | .reraise => rfl
@@ -119,7 +119,7 @@ theorem Stmt.hasWrite_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).hasWri
   | .while c b => by simp [Stmt.bindErr, Stmt.hasWrite, Stmt.hasWrite_bindErr k b]
   | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.hasWrite, Stmt.hasWrite_bindErr k b]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 /-- A statement that is not one of `seq`, `ite`, `while`, `tryCatch`. -/
 def Stmt.compound : Stmt → Bool
@@ -134,6 +134,13 @@ theorem exec_leaf_error (es : ExprSem U) (wm : WorldModel U W) (n : Nat) (s : St
     (h : exec es wm (n + 1) s st = .error k st') : st' = st := by
   cases s with
   | ret e => cases e <;> simp only [exec] at h <;> (try split at h) <;> (cases h <;> rfl)
+  | query t c p =>
+    simp only [exec] at h
+    split at h
+    · cases h; rfl
+    · split at h
+      · cases h; rfl
+      · cases h
   | _ =>
     simp [Stmt.compound] at hc <;> (try simp only [exec] at h) <;>
       first
@@ -201,7 +208,8 @@ theorem exec_noFail (es : ExprSem U) (wm : WorldModel U W) :
     | returned v st1 => simp
     | outOfFuel st1 => simp
   | _ + 1, .call .., _, h, _, _ | _ + 1, .insert .., _, h, _, _ | _ + 1, .update .., _, h, _, _
-  | _ + 1, .delete .., _, h, _, _ | _ + 1, .raise _, _, h, _, _ | _ + 1, .reraise, _, h, _, _ => by
+  | _ + 1, .delete .., _, h, _, _ | _ + 1, .raise _, _, h, _, _ | _ + 1, .reraise, _, h, _, _
+  | _ + 1, .query .., _, h, _, _ => by
     simp [Stmt.noFail] at h
 
 /-! ## What leaves the database alone -/
@@ -227,6 +235,11 @@ theorem exec_db_of_noWrite (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .assign x e, st, _ => by
     simp only [exec]
     cases e.eval es st.store nullStore <;> rfl
+  | _ + 1, .query t c p, st, _ => by
+    simp only [exec]
+    split
+    · rfl
+    · split <;> rfl
   | n + 1, .seq s t, st, h => by
     simp only [Stmt.hasWrite, Bool.or_eq_false_iff] at h
     simp only [exec]
@@ -315,7 +328,7 @@ theorem Stmt.undoSafe_bindErr (k : ErrKind) :
     simp [Stmt.bindErr, Stmt.undoSafe, Stmt.undoSafe_bindErr k b, Stmt.hasWrite_bindErr]
   | .tryCatch u b h, w => by simp [Stmt.bindErr, Stmt.undoSafe, Stmt.hasWrite_bindErr]
   | .skip, _ | .assign .., _ | .ret _, _ | .call .., _ | .insert .., _ | .update .., _
-  | .delete .., _ | .raise _, _ | .commit, _ => rfl
+  | .delete .., _ | .raise _, _ | .commit, _ | .query .., _ => rfl
 
 theorem undoSafe_leaf_case (es : ExprSem U) (wm : WorldModel U W) (n : Nat) (s : Stmt)
     (st st' : State U W) (w : Bool) (k : ErrKind) (hc : s.compound = false)
@@ -458,6 +471,8 @@ theorem exec_undoSafe (es : ExprSem U) (wm : WorldModel U W) :
     undoSafe_leaf_case es wm n _ st st' w k rfl hu h
   | n + 1, .commit, st, w, k, st', hu, h =>
     undoSafe_leaf_case es wm n _ st st' w k rfl hu h
+  | n + 1, .query .., st, w, k, st', hu, h =>
+    undoSafe_leaf_case es wm n _ st st' w k rfl hu h
 
 /-! ## Settling: `undo` where it changes nothing -/
 
@@ -479,7 +494,7 @@ theorem Stmt.settle_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).settle =
   | .tryCatch u b h => by
     simp [Stmt.bindErr, Stmt.settle, Stmt.settle_bindErr k b, Stmt.undoSafe_bindErr]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 theorem Stmt.vars_settle : ∀ s : Stmt, s.settle.vars = s.vars
   | .seq s t => by simp [Stmt.settle, Stmt.vars, Stmt.vars_settle s, Stmt.vars_settle t]
@@ -487,7 +502,7 @@ theorem Stmt.vars_settle : ∀ s : Stmt, s.settle.vars = s.vars
   | .while c b => by simp [Stmt.settle, Stmt.vars, Stmt.vars_settle b]
   | .tryCatch u b h => by simp [Stmt.settle, Stmt.vars, Stmt.vars_settle b, Stmt.vars_settle h]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .reraise | .commit => rfl
+  | .reraise | .commit | .query .. => rfl
 
 /-- Settling changes no outcome: the same fuel gives the same result,
 state, error and calls. -/
@@ -529,6 +544,7 @@ theorem exec_settle (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .raise _, _ => rfl
   | _ + 1, .reraise, _ => rfl
   | _ + 1, .commit, _ => rfl
+  | _ + 1, .query .., _ => rfl
 
 def Routine.settle (r : Routine) : Routine := { r with body := r.body.settle }
 
@@ -596,7 +612,7 @@ theorem Stmt.noRet_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).noRet = s
   | .while c b => by simp [Stmt.bindErr, Stmt.noRet, Stmt.noRet_bindErr k b]
   | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.noRet, Stmt.noRet_bindErr k b]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 theorem Stmt.mustFail_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).mustFail = s.mustFail
   | .reraise => rfl
@@ -608,7 +624,7 @@ theorem Stmt.mustFail_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).mustFa
   | .while c b => rfl
   | .tryCatch u b h => rfl
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 theorem Stmt.hasCatch_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).hasCatch = s.hasCatch
   | .reraise => rfl
@@ -619,7 +635,7 @@ theorem Stmt.hasCatch_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).hasCat
   | .while c b => by simp [Stmt.bindErr, Stmt.hasCatch, Stmt.hasCatch_bindErr k b]
   | .tryCatch u b h => rfl
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 /-- A run without `RETURN` does not return. -/
 theorem exec_noRet (es : ExprSem U) (wm : WorldModel U W) :
@@ -685,6 +701,11 @@ theorem exec_noRet (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .delete t c, st, _, v, st' => by
     simp only [exec]
     split <;> simp
+  | _ + 1, .query t c p, st, _, v, st' => by
+    simp only [exec]
+    split
+    · simp
+    · split <;> simp
 
 /-- The run failed or was cut off: not `normal`, not `returned`. -/
 def Outcome.failing : Outcome U W → Bool
@@ -727,7 +748,8 @@ theorem exec_mustFail (es : ExprSem U) (wm : WorldModel U W) :
       · exact exec_mustFail es wm n t st h.2
   | _ + 1, .skip, _, h | _ + 1, .assign .., _, h | _ + 1, .ret _, _, h | _ + 1, .call .., _, h
   | _ + 1, .insert .., _, h | _ + 1, .update .., _, h | _ + 1, .delete .., _, h
-  | _ + 1, .while .., _, h | _ + 1, .tryCatch .., _, h | _ + 1, .commit, _, h => by
+  | _ + 1, .while .., _, h | _ + 1, .tryCatch .., _, h | _ + 1, .commit, _, h
+  | _ + 1, .query .., _, h => by
     simp [Stmt.mustFail] at h
 
 /-- The state with another database. -/
@@ -739,32 +761,46 @@ def Outcome.setDb (d : Db U) : Outcome U W → Outcome U W
   | .error k s => .error k (s.setDb d)
   | .outOfFuel s => .outOfFuel (s.setDb d)
 
-/-- A statement that does not touch the database runs the same from any
-database, which it leaves as it found it. -/
+theorem Stmt.hasQuery_bindErr (k : ErrKind) : ∀ s : Stmt, (s.bindErr k).hasQuery = s.hasQuery
+  | .reraise => rfl
+  | .seq s t => by
+    simp [Stmt.bindErr, Stmt.hasQuery, Stmt.hasQuery_bindErr k s, Stmt.hasQuery_bindErr k t]
+  | .ite c s t => by
+    simp [Stmt.bindErr, Stmt.hasQuery, Stmt.hasQuery_bindErr k s, Stmt.hasQuery_bindErr k t]
+  | .while c b => by simp [Stmt.bindErr, Stmt.hasQuery, Stmt.hasQuery_bindErr k b]
+  | .tryCatch u b h => by simp [Stmt.bindErr, Stmt.hasQuery, Stmt.hasQuery_bindErr k b]
+  | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
+  | .commit | .query .. => rfl
+
+/-- A statement that does not touch the database (no data statement, no
+call, and (C3b) no query) runs the same from any database, which it
+leaves as it found it. -/
 theorem exec_setDb (es : ExprSem U) (wm : WorldModel U W) (d : Db U) :
-    ∀ (n : Nat) (s : Stmt) (st : State U W), s.hasWrite = false →
+    ∀ (n : Nat) (s : Stmt) (st : State U W), s.hasWrite = false → s.hasQuery = false →
       exec es wm n s (st.setDb d) = (exec es wm n s st).setDb d
-  | 0, _, _, _ => rfl
-  | _ + 1, .skip, _, _ => rfl
-  | _ + 1, .commit, _, _ => rfl
-  | _ + 1, .raise _, _, _ => rfl
-  | _ + 1, .reraise, _, _ => rfl
-  | _ + 1, .ret none, _, _ => rfl
-  | _ + 1, .ret (some e), st, _ => by
+  | 0, _, _, _, _ => rfl
+  | _ + 1, .skip, _, _, _ => rfl
+  | _ + 1, .commit, _, _, _ => rfl
+  | _ + 1, .raise _, _, _, _ => rfl
+  | _ + 1, .reraise, _, _, _ => rfl
+  | _ + 1, .ret none, _, _, _ => rfl
+  | _ + 1, .ret (some e), st, _, _ => by
     simp only [exec, State.setDb]
     cases e.eval es st.store nullStore <;> rfl
-  | _ + 1, .assign x e, st, _ => by
+  | _ + 1, .assign x e, st, _, _ => by
     simp only [exec, State.setDb]
     cases e.eval es st.store nullStore <;> rfl
-  | n + 1, .seq s t, st, h => by
+  | n + 1, .seq s t, st, h, hq => by
     simp only [Stmt.hasWrite, Bool.or_eq_false_iff] at h
+    simp only [Stmt.hasQuery, Bool.or_eq_false_iff] at hq
     simp only [exec]
-    rw [exec_setDb es wm d n s st h.1]
+    rw [exec_setDb es wm d n s st h.1 hq.1]
     cases exec es wm n s st with
-    | normal st1 => exact exec_setDb es wm d n t st1 h.2
+    | normal st1 => exact exec_setDb es wm d n t st1 h.2 hq.2
     | _ => rfl
-  | n + 1, .ite c s t, st, h => by
+  | n + 1, .ite c s t, st, h, hq => by
     simp only [Stmt.hasWrite, Bool.or_eq_false_iff] at h
+    simp only [Stmt.hasQuery, Bool.or_eq_false_iff] at hq
     simp only [exec]
     have hc : c.eval es (st.setDb d).store nullStore = c.eval es st.store nullStore := rfl
     rw [hc]
@@ -773,10 +809,11 @@ theorem exec_setDb (es : ExprSem U) (wm : WorldModel U W) (d : Db U) :
     | ok v =>
       dsimp only
       split
-      · exact exec_setDb es wm d n s st h.1
-      · exact exec_setDb es wm d n t st h.2
-  | n + 1, .while c b, st, h => by
+      · exact exec_setDb es wm d n s st h.1 hq.1
+      · exact exec_setDb es wm d n t st h.2 hq.2
+  | n + 1, .while c b, st, h, hq => by
     have h' : b.hasWrite = false := by simpa [Stmt.hasWrite] using h
+    have hq' : b.hasQuery = false := by simpa [Stmt.hasQuery] using hq
     simp only [exec]
     have hc : c.eval es (st.setDb d).store nullStore = c.eval es st.store nullStore := rfl
     rw [hc]
@@ -785,25 +822,28 @@ theorem exec_setDb (es : ExprSem U) (wm : WorldModel U W) (d : Db U) :
     | ok v =>
       dsimp only
       split
-      · rw [exec_setDb es wm d n b st h']
+      · rw [exec_setDb es wm d n b st h' hq']
         cases exec es wm n b st with
-        | normal st1 => exact exec_setDb es wm d n (.while c b) st1 h
+        | normal st1 => exact exec_setDb es wm d n (.while c b) st1 h hq
         | _ => rfl
       · rfl
-  | n + 1, .tryCatch u b hd, st, h => by
+  | n + 1, .tryCatch u b hd, st, h, hq => by
     simp only [Stmt.hasWrite, Bool.or_eq_false_iff] at h
+    simp only [Stmt.hasQuery, Bool.or_eq_false_iff] at hq
     simp only [exec]
-    rw [exec_setDb es wm d n b st h.1]
+    rw [exec_setDb es wm d n b st h.1 hq.1]
     cases exec es wm n b st with
     | error k st1 =>
       have hh : (hd.bindErr k).hasWrite = false := by rw [Stmt.hasWrite_bindErr]; exact h.2
+      have hh' : (hd.bindErr k).hasQuery = false := by rw [Stmt.hasQuery_bindErr]; exact hq.2
       cases u
-      · exact exec_setDb es wm d n _ st1 hh
-      · have := exec_setDb es wm d n _ { st1 with db := st.db } hh
+      · exact exec_setDb es wm d n _ st1 hh hh'
+      · have := exec_setDb es wm d n _ { st1 with db := st.db } hh hh'
         simpa [State.setDb, Outcome.setDb] using this
     | _ => rfl
-  | _ + 1, .call .., _, h | _ + 1, .insert .., _, h | _ + 1, .update .., _, h
-  | _ + 1, .delete .., _, h => by simp [Stmt.hasWrite] at h
+  | _ + 1, .call .., _, h, _ | _ + 1, .insert .., _, h, _ | _ + 1, .update .., _, h, _
+  | _ + 1, .delete .., _, h, _ => by simp [Stmt.hasWrite] at h
+  | _ + 1, .query .., _, _, hq => by simp [Stmt.hasQuery] at hq
 
 /-- Two outcomes that agree except in the database of a failed or cut-off
 run. -/
@@ -827,8 +867,9 @@ theorem Outcome.simDb_setDb (d : Db U) :
   | .normal _, h | .returned _ _, h => by simp [Outcome.failing] at h
 
 /-- The handler of `tryCatch` may get `undo` though its body is not
-`undoSafe`: it always fails and does not touch the database. -/
-def Stmt.failHandler (h : Stmt) : Bool := h.mustFail && !h.hasWrite && !h.hasCatch
+`undoSafe`: it always fails and does not touch the database (no write,
+and (C3b) no read). -/
+def Stmt.failHandler (h : Stmt) : Bool := h.mustFail && !h.hasWrite && !h.hasQuery && !h.hasCatch
 
 /-- `settle`, and `undo` also on every `tryCatch` with a `failHandler`
 that is not inside the body of another `tryCatch`. -/
@@ -850,7 +891,7 @@ theorem Stmt.settleTop_bindErr (k : ErrKind) :
   | .tryCatch u b h => by
     simp [Stmt.bindErr, Stmt.settleTop, Stmt.settle_bindErr, Stmt.undoSafe_bindErr]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .commit => rfl
+  | .commit | .query .. => rfl
 
 theorem Stmt.settleTop_noCatch : ∀ s : Stmt, s.hasCatch = false → s.settleTop = s
   | .seq s t, h => by
@@ -864,7 +905,7 @@ theorem Stmt.settleTop_noCatch : ∀ s : Stmt, s.hasCatch = false → s.settleTo
     simp [Stmt.settleTop, Stmt.settleTop_noCatch b h]
   | .tryCatch .., h => by simp [Stmt.hasCatch] at h
   | .skip, _ | .assign .., _ | .ret _, _ | .call .., _ | .insert .., _ | .update .., _
-  | .delete .., _ | .raise _, _ | .reraise, _ | .commit, _ => rfl
+  | .delete .., _ | .raise _, _ | .reraise, _ | .commit, _ | .query .., _ => rfl
 
 theorem Stmt.vars_settleTop : ∀ s : Stmt, s.settleTop.vars = s.vars
   | .seq s t => by simp [Stmt.settleTop, Stmt.vars, Stmt.vars_settleTop s, Stmt.vars_settleTop t]
@@ -874,7 +915,7 @@ theorem Stmt.vars_settleTop : ∀ s : Stmt, s.settleTop.vars = s.vars
   | .tryCatch u b h => by
     simp [Stmt.settleTop, Stmt.vars, Stmt.vars_settle b, Stmt.vars_settleTop h]
   | .skip | .assign .. | .ret _ | .call .. | .insert .. | .update .. | .delete .. | .raise _
-  | .reraise | .commit => rfl
+  | .reraise | .commit | .query .. => rfl
 
 /-- `settleTop` changes an outcome at most in the database of a failed or
 cut-off run. -/
@@ -942,9 +983,10 @@ theorem exec_settleTop (es : ExprSem U) (wm : WorldModel U W) :
         subst hu
         simp only [hs, hf, Bool.false_or, ite_true, Bool.false_eq_true, ite_false]
         simp only [Stmt.failHandler, Bool.and_eq_true, Bool.not_eq_true'] at hf
-        obtain ⟨⟨hm, hw⟩, hc⟩ := hf
+        obtain ⟨⟨⟨hm, hw⟩, hq⟩, hc⟩ := hf
         rw [Stmt.settleTop_noCatch _ (by rw [Stmt.hasCatch_bindErr]; exact hc)]
         have := exec_setDb es wm st.db n (hd.bindErr k) st1 (by rw [Stmt.hasWrite_bindErr]; exact hw)
+          (by rw [Stmt.hasQuery_bindErr]; exact hq)
         simp only [State.setDb] at this
         rw [this]
         exact Outcome.simDb_setDb _ _
@@ -952,7 +994,7 @@ theorem exec_settleTop (es : ExprSem U) (wm : WorldModel U W) :
     | _ => exact Outcome.simDb_refl _
   | _ + 1, .skip, _ | _ + 1, .assign .., _ | _ + 1, .ret _, _ | _ + 1, .call .., _
   | _ + 1, .insert .., _ | _ + 1, .update .., _ | _ + 1, .delete .., _ | _ + 1, .raise _, _
-  | _ + 1, .reraise, _ | _ + 1, .commit, _ => Outcome.simDb_refl _
+  | _ + 1, .reraise, _ | _ + 1, .commit, _ | _ + 1, .query .., _ => Outcome.simDb_refl _
 
 def Routine.settleTop (r : Routine) : Routine := { r with body := r.body.settleTop }
 

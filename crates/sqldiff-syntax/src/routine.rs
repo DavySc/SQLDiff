@@ -9,7 +9,7 @@
 //! Anything outside this shape is an error, not an approximation: a
 //! routine that does not read is one whose conversion cannot be confirmed.
 
-use crate::abstract_syntax::{parse_stmt_exact, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use crate::abstract_syntax::{parse_stmt_exact, tokens, Expr, Parser, Select, Stmt, Tok, Type, K};
 use crate::{ast as cst, print, Dialect, SyntaxKind, SyntaxNode};
 use SyntaxKind::*;
 
@@ -88,6 +88,14 @@ pub enum Node {
     },
     While {
         cond: Expr,
+        body: Vec<Node>,
+    },
+    /// PL/pgSQL `FOR var IN query LOOP body END LOOP` (phase C3b): `var`
+    /// as written, the query a plain `SELECT`. Other `FOR` loops (integer
+    /// ranges, `EXECUTE`, cursors, `REVERSE`) are not read.
+    ForQuery {
+        var: String,
+        query: Box<Select>,
         body: Vec<Node>,
     },
     /// `EXEC [@rc =] proc args` (T-SQL), `CALL proc(args)` (PostgreSQL).
@@ -518,6 +526,9 @@ fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
         IF_STMT => if_stmt(u, d),
         LOOP_STMT => {
             let first = cst::first_words(u, 1);
+            if d == Dialect::Postgres && first.first().map(String::as_str) == Some("FOR") {
+                return for_query(u, d);
+            }
             if first.first().map(String::as_str) != Some("WHILE") {
                 return Err("only WHILE loops are read".into());
             }
@@ -535,6 +546,43 @@ fn node(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
         }
         k => Err(format!("{k:?} is not read yet")),
     }
+}
+
+/// PL/pgSQL `FOR var IN SELECT ... LOOP body END LOOP`: no label, no
+/// `REVERSE`, no `EXECUTE`, no integer range or cursor.
+fn for_query(u: &SyntaxNode, d: Dialect) -> RResult<Node> {
+    let own = upper_own(u);
+    if own != ["FOR", "LOOP", "END", "LOOP"] {
+        return Err(format!("a FOR loop written `{}`", own.join(" ")));
+    }
+    let kids: Vec<SyntaxNode> = u.children().collect();
+    let [c, b] = kids.as_slice() else {
+        return Err("a FOR loop of an unexpected shape".into());
+    };
+    if c.kind() != CONDITION || b.kind() != BRANCH {
+        return Err("a FOR loop of an unexpected shape".into());
+    }
+    let t = tokens(c);
+    let (var, rest) = match t.as_slice() {
+        [v, i, rest @ ..] if v.kind == K::Word && i.kind == K::Word && i.up == "IN" => {
+            (v.text.clone(), rest)
+        }
+        _ => return Err("only FOR loops over a query are read".into()),
+    };
+    if !rest.first().is_some_and(|x| x.up == "SELECT") {
+        return Err("only FOR loops over a SELECT are read".into());
+    }
+    let mut p = Parser::ext(rest, d);
+    let query = p.select()?;
+    if !p.at_end() {
+        return Err(p.err("unexpected tokens after the FOR query"));
+    }
+    whole(&p)?;
+    Ok(Node::ForQuery {
+        var,
+        query: Box::new(query),
+        body: branch(b, d)?,
+    })
 }
 
 /// Refuses what the extended parser read but left out of the tree: the
@@ -937,6 +985,15 @@ fn print_node(n: &Node, depth: usize, out: &mut String) -> RResult<()> {
         }
         Node::While { cond, body } => {
             line(depth, &format!("WHILE {} LOOP", print::expr(cond, D)?), out);
+            print_nodes(body, depth + 1, out)?;
+            line(depth, "END LOOP;", out);
+        }
+        Node::ForQuery { var, query, body } => {
+            line(
+                depth,
+                &format!("FOR {} IN {} LOOP", ident(var)?, print::select(query, D)?),
+                out,
+            );
             print_nodes(body, depth + 1, out)?;
             line(depth, "END LOOP;", out);
         }

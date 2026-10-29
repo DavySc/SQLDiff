@@ -7,8 +7,9 @@ mappings in DEPLOYMENT and table entries in CATALOG; C2b string pairs,
 with the collation fact in CATALOG and the string residuals; C4 pairs
 (TRY/CATCH against EXCEPTION blocks, THROW against RAISE, the
 rollback-and-rethrow idiom with COMMIT), with the C4 residuals and the
-`errors` field. Anything else is unconfirmed, including malformed
-requests.
+`errors` field; C3b queries (`SELECT @x = col` against the PL/pgSQL `FOR`
+block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`.
+Anything else is unconfirmed, including malformed requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
 """
@@ -520,7 +521,85 @@ cases += [
                  proc(["r"], [sparam("a", "In", VC10), sparam("b", "In", VC10), sparam("r", "InOut", VC20)], [],
                       [assign(pv("r"), pv("a"))])), "confirmed"),
 ]
+
+# C3b: single-table queries, in the shapes `sqldiff convert` writes, on the
+# C3a table: T-SQL SELECT @q = Qty against the PL/pgSQL FOR block, IF
+# [NOT] EXISTS, a scalar subquery, COUNT(*).
+
+
+def sel(items, target, where=NONE, into=()):
+    return C("Select", L(), "f", L(), "f", NONE, L(*items), L(*into), "f",
+             L(C("Table", L(*map(S, target)), NONE, L())), where, L(), NONE, L(), NONE, NONE, L(), NONE)
+
+
+def item(e, alias=NONE, assign_=NONE):
+    return C("SelItem", e, alias, assign_)
+
+
+def for_block(items, target, where, body, r="sqldiff_r"):
+    return C("NBlock", C("Block", L(C("Declare", S(r), C("Ty", S("RECORD"), L()), NONE)),
+                         L(C("ForQuery", S(r), sel(items, target, where), L(*body)))))
+
+
+def field(x, a, r="sqldiff_r"):
+    return assign(pv(x), C("Name", L(S(r), S(a))))
+
+
+COUNT_STAR = C("CallE", C("CallF", L(S("COUNT")), L(), "f", L(), "f", "f", "t"))
+Q_KEY_T = bin_("=", col("Id"), tv("@id"))
+Q_KEY_P = bin_("=", pv("id"), pv("p_id"))
+Q_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "p_id"), ("@q", "p_q"), ("%status", "%status")])
+
+
+def q_t(body):
+    return proc(["dbo", "look"], [param("@id", "In"), param("@q", "InOut")], [], body)
+
+
+def q_p(body):
+    return proc(["look"], [param("p_id", "In"), param("p_q", "InOut")], [], body)
+
+
+def req3q(i, a, b):
+    return req3(i, a=a, b=b, dep=D_DEP, cat=D_CAT, cert=Q_CERT)
+
+
+def exists_(target, where):
+    return C("Exists", sel([item(num(1))], target, where))
+
+
+SEL_T = C("NStmt", C("SSelect", sel([item(col("Qty"), assign_=S("@q"))], ["dbo", "Acct"], Q_KEY_T)))
+FOR_P = for_block([item(pv("qty"), alias=S("sqldiff_c1"))], ["acct"], Q_KEY_P, [field("p_q", "sqldiff_c1")])
+SCALAR_T = assign(tv("@q"), C("Subquery", sel([item(col("Total"))], ["dbo", "Acct"], Q_KEY_T)))
+SCALAR_P = assign(pv("p_q"), C("Subquery", sel([item(pv("total"))], ["acct"], Q_KEY_P)))
+EX_T = exists_(["dbo", "Acct"], bin_(">", col("Qty"), tv("@id")))
+EX_P = exists_(["acct"], bin_(">", pv("qty"), pv("p_id")))
+cases += [
+    ("83", req3q(83, q_t([SEL_T]), q_p([FOR_P])), "confirmed"),
+    # The WHERE fixes no key: which row's value T-SQL keeps is unspecified.
+    ("84", req3q(84, q_t([C("NStmt", C("SSelect", sel([item(col("Qty"), assign_=S("@q"))], ["dbo", "Acct"],
+                                                      bin_("=", col("Qty"), tv("@id")))))]),
+                 q_p([for_block([item(pv("qty"), alias=S("sqldiff_c1"))], ["acct"], bin_("=", pv("qty"), pv("p_id")),
+                                [field("p_q", "sqldiff_c1")])])), "unconfirmed"),
+    # IF EXISTS against IF NOT EXISTS with the branches kept.
+    ("85", req3q(85, q_t([C("If", EX_T, L(assign(tv("@q"), num(1))), L())]),
+                 q_p([C("If", C("Unary", S("NOT"), EX_P), L(assign(pv("p_q"), num(1))), L())])), "unconfirmed"),
+    ("86", req3q(86, q_t([C("If", EX_T, L(assign(tv("@q"), num(1))), L())]),
+                 q_p([C("If", EX_P, L(assign(pv("p_q"), num(1))), L())])), "confirmed"),
+    ("87", req3q(87, q_t([SCALAR_T]), q_p([SCALAR_P])), "confirmed"),
+    # SELECT @q = ... keeps @q on no row; the scalar subquery sets NULL.
+    ("88", req3q(88, q_t([SEL_T]), q_p([assign(pv("p_q"), C("Subquery", sel([item(pv("qty"))], ["acct"], Q_KEY_P)))])),
+     "unconfirmed"),
+    ("89", req3q(89, q_t([ABORT, C("NStmt", C("SSelect", sel([item(COUNT_STAR, assign_=S("@q"))], ["dbo", "Acct"])))]),
+                 q_p([C("NStmt", C("SSelect", sel([item(COUNT_STAR)], ["acct"], into=[pv("p_q")])))])), "confirmed"),
+    # The FOR loop's body reads a field the select list does not alias.
+    ("90", req3q(90, q_t([SEL_T]), q_p([for_block([item(pv("qty"), alias=S("sqldiff_c1"))], ["acct"], Q_KEY_P,
+                                                  [field("p_q", "sqldiff_c2")])])), "unconfirmed"),
+]
 THEOREMS = {
+    "83": "Sqldiff.Mirror.check_sound_c2a",
+    "86": "Sqldiff.Mirror.check_sound_c2a",
+    "87": "Sqldiff.Mirror.check_sound_c2a",
+    "89": "Sqldiff.Mirror.check_sound_c2a",
     "82": "Sqldiff.Mirror.check_sound",
     "69": "Sqldiff.Mirror.check_sound_c2a",
     "70": "Sqldiff.Mirror.check_sound",
@@ -543,6 +622,10 @@ THEOREMS = {
 }
 # The fields a confirmed /3 answer adds (Main.lean); none on /2 or unconfirmed answers.
 EXTRA = {
+    "83": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},
+    "86": {"scalars": "c2a", "residual": [], "statements": "c3b"},
+    "87": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},
+    "89": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS"], "statements": "c3b"},
     "31": {"scalars": "uninterpreted", "statements": "c1"},
     "40": {"scalars": "uninterpreted", "statements": "c1"},
     # The call to log_value can fail after the callee wrote (0.8.0).

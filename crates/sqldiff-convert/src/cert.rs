@@ -15,7 +15,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
 use sqldiff_core::proof::{self, Checker, MirrorColumn, MirrorRequest, MirrorTable};
-use sqldiff_syntax::abstract_syntax::{tokens, Stmt, K};
+use sqldiff_syntax::abstract_syntax::{tokens, Expr, From, Select, Stmt, K};
 use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
 use sqldiff_syntax::{encode, parse, plain_table, Dialect, SyntaxKind, SyntaxNode};
 
@@ -52,8 +52,9 @@ pub struct Certificate {
     /// expression has its meaning in the spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scalars: Option<String>,
-    /// The checker's statement slice for a confirmation: `c3a` when the
-    /// routine's data statements were in it, `c1` when it had none.
+    /// The checker's statement slice for a confirmation: `c3b` when the
+    /// routine reads a table (with or without data statements), `c3a` when
+    /// its data statements were in it, `c1` when it had none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub statements: Option<String>,
     /// `c4` when the routine's error handling and transactions were in the
@@ -176,7 +177,7 @@ fn returns_value(nodes: &[Node]) -> bool {
         Node::Stmt(Stmt::Return(Some(_))) => true,
         Node::Block(b) => returns_value(&b.body),
         Node::If { then, els, .. } => returns_value(then) || returns_value(els),
-        Node::While { body, .. } => returns_value(body),
+        Node::While { body, .. } | Node::ForQuery { body, .. } => returns_value(body),
         Node::Try { body, handlers } => {
             returns_value(body) || handlers.iter().any(|h| returns_value(&h.body))
         }
@@ -245,7 +246,7 @@ fn tsql_locals(nodes: &[Node], out: &mut Vec<String>) {
                 tsql_locals(then, out);
                 tsql_locals(els, out);
             }
-            Node::While { body, .. } => tsql_locals(body, out),
+            Node::While { body, .. } | Node::ForQuery { body, .. } => tsql_locals(body, out),
             Node::Try { body, handlers } => {
                 tsql_locals(body, out);
                 for h in handlers {
@@ -270,7 +271,7 @@ fn begins_tran_outside_try(nodes: &[Node]) -> bool {
         Node::Txn { op, .. } => op.eq_ignore_ascii_case("BEGIN"),
         Node::Block(b) => begins_tran_outside_try(&b.body),
         Node::If { then, els, .. } => begins_tran_outside_try(then) || begins_tran_outside_try(els),
-        Node::While { body, .. } => begins_tran_outside_try(body),
+        Node::While { body, .. } | Node::ForQuery { body, .. } => begins_tran_outside_try(body),
         _ => false,
     })
 }
@@ -284,7 +285,7 @@ fn callees(nodes: &[Node], out: &mut Vec<Vec<String>>) {
                 callees(then, out);
                 callees(els, out);
             }
-            Node::While { body, .. } => callees(body, out),
+            Node::While { body, .. } | Node::ForQuery { body, .. } => callees(body, out),
             Node::Try { body, handlers } => {
                 callees(body, out);
                 for h in handlers {
@@ -314,11 +315,63 @@ fn written_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
                 written_tables(then, out);
                 written_tables(els, out);
             }
-            Node::While { body, .. } => written_tables(body, out),
+            Node::While { body, .. } | Node::ForQuery { body, .. } => written_tables(body, out),
             Node::Try { body, handlers } => {
                 written_tables(body, out);
                 for h in handlers {
                     written_tables(&h.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The tables in a query's `FROM`, as written (C3b: the checker reads only
+/// a one-table `FROM`; anything else is refused there).
+fn from_tables(q: &Select, out: &mut Vec<Vec<String>>) {
+    for f in &q.from {
+        if let From::Table { name, .. } = f {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+}
+
+/// The tables a routine's queries read, as written, in the shapes the
+/// checker's C3b slice reads: `SELECT @x = ...`, `SET @x = (SELECT ...)`,
+/// `IF [NOT] EXISTS (SELECT ...)` (formal/lean/Sqldiff/Mirror/Lower.lean,
+/// "The C3b slice: queries").
+fn read_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
+    for n in nodes {
+        match n {
+            Node::Stmt(Stmt::Select(q)) | Node::Stmt(Stmt::Assign(_, Expr::Subquery(q))) => {
+                from_tables(q, out)
+            }
+            Node::Block(b) => read_tables(&b.body, out),
+            Node::If { cond, then, els } => {
+                match cond {
+                    Expr::Exists(q) => from_tables(q, out),
+                    Expr::Unary(op, x) if op.eq_ignore_ascii_case("NOT") => {
+                        if let Expr::Exists(q) = x.as_ref() {
+                            from_tables(q, out);
+                        }
+                    }
+                    _ => {}
+                }
+                read_tables(then, out);
+                read_tables(els, out);
+            }
+            Node::While { body, .. } => read_tables(body, out),
+            Node::ForQuery { query, body, .. } => {
+                from_tables(query, out);
+                read_tables(body, out);
+            }
+            Node::Try { body, handlers } => {
+                read_tables(body, out);
+                for h in handlers {
+                    read_tables(&h.body, out);
                 }
             }
             _ => {}
@@ -628,8 +681,11 @@ pub fn mirror_request(
     }
     let mut written = Vec::new();
     written_tables(&a.body.body, &mut written);
+    // C3b: the tables the routine reads are sent on the same conditions.
+    let mut used = written.clone();
+    read_tables(&a.body.body, &mut used);
     let (mut table_pairs, mut table_catalog) = (Vec::new(), Vec::<MirrorTable>::new());
-    for w in &written {
+    for w in &used {
         if !mappable(w) {
             continue;
         }
@@ -649,6 +705,8 @@ pub fn mirror_request(
     if !table_catalog.is_empty() {
         assumptions.push(TABLES_AS_DECLARED.to_string());
     }
+    // Only writes send a rows-affected count: `SELECT @x = ...`, `IF EXISTS`
+    // and `SET @x = (subquery)` do not (eval/queries Q3).
     if !written.is_empty() && !row_counts {
         assumptions.push("ASM-OBSERVER-ROWCOUNT".to_string());
     }

@@ -466,6 +466,40 @@ def deleteRows (ev : Store U → Expr → Res U) (t : TableDef) (c : Option Expr
       | .error k => .error k
       | .ok rs' => .ok (if b then rs' else r :: rs')
 
+/-! ## Queries (C3b)
+
+A query reads one table and assigns variables (`Stmt.query`, `Pick`).
+The vendor rules are on the lowering (`Sqldiff.Mirror`, "The C3b slice:
+queries"). -/
+
+/-- The rows where `c` is TRUE, in list order; the first error wins. -/
+def keptRows (ev : Store U → Expr → Res U) (t : TableDef) (c : Option Expr) :
+    List (Row U) → Except ErrKind (List (Row U))
+  | [] => .ok []
+  | r :: rs => match keeps ev (rowStore t.cols r) c with
+    | .error k => .error k
+    | .ok b => match keptRows ev t c rs with
+      | .error k => .error k
+      | .ok rs' => .ok (if b then r :: rs' else rs')
+
+/-- Each variable of `xs` gets the value in its position, left to right. -/
+def Store.setAll (σ : Store U) : List Var → List (Val U) → Store U
+  | x :: xs, v :: vs => (σ.set x v).setAll xs vs
+  | _, _ => σ
+
+/-- What a pick makes of the kept rows: the new store, or an error. -/
+def pickRows (ev : Store U → Expr → Res U) (t : TableDef) (σ : Store U) (rows : List (Row U)) :
+    Pick → Except ErrKind (Store U)
+  | .row orNull sets => match rows.getLast? with
+    | none => .ok (if orNull then σ.setAll (sets.map (·.1)) (sets.map fun _ => .null) else σ)
+    | some r => match evalVals ev (rowStore t.cols r) (sets.map (·.2)) with
+      | .error k => .error k
+      | .ok vs => .ok (σ.setAll (sets.map (·.1)) vs)
+  | .count x => match (toInt32 rows.length : Res U) with
+    | .err k => .error k
+    | .ok v => .ok (σ.set x v)
+  | .any x => .ok (σ.set x (.bool !rows.isEmpty))
+
 /-! ## The interpreter
 
 `exec es wm n s st` runs statement `s` from state `st` with fuel `n`. Fuel
@@ -531,6 +565,12 @@ def exec (es : ExprSem U) (wm : WorldModel U W) : Nat → Stmt → State U W →
   | _ + 1, .raise k, st => .error k st
   | _ + 1, .reraise, st => .error (.other "reraise") st
   | _ + 1, .commit, st => .normal st
+  | _ + 1, .query t c p, st =>
+    match keptRows (fun ρ e => e.eval es st.store ρ) t c (st.db.get t.name) with
+    | .error k => .error k st
+    | .ok rows => match pickRows (fun ρ e => e.eval es st.store ρ) t st.store rows p with
+      | .error k => .error k st
+      | .ok σ => .normal { st with store := σ }
 
 /-! ## A routine's run and what a caller observes (decision 1) -/
 

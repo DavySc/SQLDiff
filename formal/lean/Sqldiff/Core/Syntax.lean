@@ -196,6 +196,31 @@ inductive Arg where
   | ref (x : Var)
 deriving DecidableEq, Repr
 
+/-- What a query statement (C3b, `Stmt.query`) does with the rows of its
+table where its condition is TRUE:
+
+* `row orNull sets`: each `(x, e)` of `sets` assigns `x` the value of `e`
+  on the last such row, all evaluated on that row before any is assigned
+  (T-SQL `SELECT @x = e, ... FROM t WHERE c`, the PL/pgSQL `FOR` loop the
+  converter writes for it). With no such row, nothing is assigned, or,
+  with `orNull`, every `x` is set to NULL (a scalar subquery, `SET @x =
+  (SELECT e FROM t WHERE c)`). The lowerings build it only where at most
+  one row can be TRUE (`Sqldiff.Mirror`, "The C3b slice: queries"), so
+  "the last" is the only one; which one a database with several would
+  give is not specified by either vendor, and the core's choice is not a
+  claim about them.
+* `count x`: `x` is the number of such rows, a 32-bit integer
+  (`SELECT @x = COUNT(*) FROM t WHERE c`); more than `intMax` rows is an
+  overflow.
+* `any x`: `x` is TRUE when there is such a row, else FALSE (`EXISTS`),
+  never NULL. The lowerings put it into a variable no routine can name
+  (`Sqldiff.Mirror.existsVar`) and test that in the `IF`. -/
+inductive Pick where
+  | row (orNull : Bool) (sets : List (Var × Expr))
+  | count (x : Var)
+  | any (x : Var)
+deriving DecidableEq, Repr
+
 /-- Statements. A block is a sequence (`seq`); the empty block is
 `skip`. Calls name another routine, which the world runs (see
 `Sqldiff.Core.WorldModel`); they are never inlined.
@@ -234,7 +259,14 @@ Phase C4 adds error handling and transaction control:
 * `commit`: T-SQL `COMMIT` and PL/pgSQL `COMMIT`, where the lowerings
   admit them (`Sqldiff.Mirror`, "The C4 rules"): it changes nothing a
   finished call shows, so it does nothing. A statement of its own, not
-  `skip`, so that a confirmation names it (`ASM-NO-CALLER-TXN`). -/
+  `skip`, so that a confirmation names it (`ASM-NO-CALLER-TXN`).
+
+Phase C3b adds a read:
+
+* `query t c p`: the rows of `t` where `c` is TRUE (every row when `c` is
+  `none`; the expressions see the row's columns), then `p` (`Pick`)
+  assigns variables from them. It writes no table. Its meaning is
+  `Sqldiff.Core.keptRows` and `pickRows`. -/
 inductive Stmt where
   | skip
   | assign (x : Var) (e : Expr)
@@ -250,6 +282,7 @@ inductive Stmt where
   | raise (k : ErrKind)
   | reraise
   | commit
+  | query (t : TableDef) (cond : Option Expr) (p : Pick)
 deriving DecidableEq, Repr
 
 /-- The handler of an error `k`: every `reraise` of `s` becomes `raise k`,
@@ -334,6 +367,16 @@ def Expr.varsOpt : Option Expr → List Var
   | some e => e.vars
   | none => []
 
+/-- The variables a pick writes and reads. -/
+def Pick.vars : Pick → List Var
+  | .row _ sets => (sets.map fun p => p.1 :: p.2.vars).flatten
+  | .count x | .any x => [x]
+
+/-- The variables a pick writes. -/
+def Pick.targets : Pick → List Var
+  | .row _ sets => sets.map (·.1)
+  | .count x | .any x => [x]
+
 def Stmt.vars : Stmt → List Var
   | .skip => []
   | .assign x e => x :: e.vars
@@ -348,6 +391,7 @@ def Stmt.vars : Stmt → List Var
   | .delete _ c => Expr.varsOpt c
   | .tryCatch _ b h => b.vars ++ h.vars
   | .raise _ | .reraise | .commit => []
+  | .query _ c p => Expr.varsOpt c ++ p.vars
 
 def Param.vars (p : Param) : List Var :=
   p.name :: (match p.default with | some e => e.vars | none => [])
@@ -391,6 +435,11 @@ def Arg.rename (f : Var → Var) : Arg → Arg
   | .val e => .val (e.rename f)
   | .ref x => .ref (f x)
 
+def Pick.rename (f : Var → Var) : Pick → Pick
+  | .row n sets => .row n (sets.map fun p => (f p.1, p.2.rename f))
+  | .count x => .count (f x)
+  | .any x => .any (f x)
+
 def Stmt.rename (f : Var → Var) : Stmt → Stmt
   | .skip => .skip
   | .assign x e => .assign (f x) (e.rename f)
@@ -406,6 +455,7 @@ def Stmt.rename (f : Var → Var) : Stmt → Stmt
   | .raise k => .raise k
   | .reraise => .reraise
   | .commit => .commit
+  | .query t c p => .query t (c.map (Expr.rename f)) (p.rename f)
 
 def Param.rename (f : Var → Var) (p : Param) : Param :=
   { p with name := f p.name, default := p.default.map (Expr.rename f) }
@@ -432,6 +482,11 @@ def Arg.opFree : Arg → Bool
   | .val e => e.opFree
   | .ref _ => true
 
+/-- The expressions a pick evaluates (on the row it picks). -/
+def Pick.exprs : Pick → List Expr
+  | .row _ sets => sets.map (·.2)
+  | .count _ | .any _ => []
+
 def Stmt.opFree : Stmt → Bool
   | .skip => true
   | .assign _ e => e.opFree
@@ -446,6 +501,7 @@ def Stmt.opFree : Stmt → Bool
   | .delete _ c => c.all Expr.opFree
   | .tryCatch _ b h => b.opFree && h.opFree
   | .raise _ | .reraise | .commit => true
+  | .query _ c p => c.all Expr.opFree && p.exprs.all Expr.opFree
 
 def Param.opFree (p : Param) : Bool :=
   match p.default with
@@ -470,6 +526,7 @@ def Stmt.exprs : Stmt → List Expr
   | .delete _ c => c.toList
   | .tryCatch _ b h => b.exprs ++ h.exprs
   | .raise _ | .reraise | .commit => []
+  | .query _ c p => c.toList ++ p.exprs
 
 /-- Every expression of a routine: parameter defaults and the body's. -/
 def Routine.exprs (r : Routine) : List Expr :=
@@ -611,6 +668,7 @@ def Stmt.failsHere : Stmt → Bool
     (Stmt.update t sets c).violates || sets.any (fun p => p.2.raise) || c.any Expr.raise
   | .delete _ c => c.any Expr.raise
   | .raise _ | .reraise => true
+  | .query _ c p => c.any Expr.raise || p.exprs.any Expr.raise || (p matches .count _)
   | _ => false
 
 /-- Some statement of `s` can fail, and the error leave `s`: an error in
@@ -666,9 +724,26 @@ def Stmt.dmlSafe : Stmt → Bool
     !(c.any Expr.raise) && !(sets.any fun p => Expr.test SExpr.constRaise p.2) &&
       !((Stmt.update t sets c).violates && sets.any fun p => p.2.raise)
   | .delete _ c => !(c.any Expr.raise)
+  | .query _ c p => !(c.any Expr.raise) && !(p.exprs.any Expr.raise)
   | .seq s t | .ite _ s t | .tryCatch _ s t => s.dmlSafe && t.dmlSafe
   | .while _ b => b.dmlSafe
   | _ => true
+
+/-- `s` reads a table (C3b): a query. -/
+def Stmt.hasQuery : Stmt → Bool
+  | .query .. => true
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.hasQuery || t.hasQuery
+  | .while _ b => b.hasQuery
+  | _ => false
+
+/-- `s` counts rows (C3b): `COUNT(*)` is an integer and can overflow,
+which T-SQL reports as an error only under its arithmetic settings
+(`ASM-TSQL-ARITH-ERRORS`). -/
+def Stmt.hasCount : Stmt → Bool
+  | .query _ _ (.count _) => true
+  | .seq s t | .ite _ s t | .tryCatch _ s t => s.hasCount || t.hasCount
+  | .while _ b => b.hasCount
+  | _ => false
 
 /-- Some run of the routine might fail: an expression can raise, a
 data statement can violate a constraint, or a callee can fail. -/
@@ -680,6 +755,10 @@ def Routine.errAfterWrite (r : Routine) : Bool := r.body.errAfterWrite false
 def Routine.hasData (r : Routine) : Bool := r.body.hasData
 
 def Routine.dmlSafe (r : Routine) : Bool := r.body.dmlSafe
+
+def Routine.hasQuery (r : Routine) : Bool := r.body.hasQuery
+
+def Routine.hasCount (r : Routine) : Bool := r.body.hasCount
 
 /-! ## Handlers and transactions (C4)
 
