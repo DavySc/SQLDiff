@@ -50,6 +50,10 @@ pub struct Options {
     pub proof: crate::proof::Settings,
     /// Side channels the caller reads (decision 1).
     pub observer: crate::observer::Observer,
+    /// What a conversion recorded about which output came from which input
+    /// (`sqldiff_convert` units). When set, cross-dialect statement pairing
+    /// pairs only statements the anchors link (`equiv::Anchor`).
+    pub anchors: Vec<crate::equiv::Anchor>,
 }
 
 impl Default for Options {
@@ -65,6 +69,7 @@ impl Default for Options {
             declared: BTreeMap::new(),
             proof: crate::proof::Settings::default(),
             observer: crate::observer::Observer::default(),
+            anchors: Vec::new(),
         }
     }
 }
@@ -246,7 +251,7 @@ pub fn diff(a: &Artifact, b: &Artifact, opts: &Options) -> Report {
                 findings.push(rules::analysis::to_finding(side, &h, Verdict::Unknown));
             }
         }
-        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b);
+        eq = equiv::compare(&aa, &ab, &schema_a, &schema_b, &opts.anchors);
         findings.append(&mut eq.findings);
         // Rows-affected counts across dialects (decision 1, observer profile).
         let (ca, cb) = (
