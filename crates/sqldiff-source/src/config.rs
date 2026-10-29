@@ -53,6 +53,7 @@ impl LayerKind {
 }
 
 /// Names and hashes of what produced a result, for the provenance bar and exports.
+/// A private pack is named by its `pack.toml` path and has no version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerRef {
     pub kind: LayerKind,
@@ -318,14 +319,15 @@ impl Resolved {
         ] {
             for p in paths {
                 let pack = Pack::load(&p)?;
-                if packs
+                if let Some((_, q)) = packs
                     .iter()
-                    .any(|(_, q): &(LayerKind, Pack)| q.meta.name == pack.meta.name)
+                    .find(|(_, q): &&(LayerKind, Pack)| q.meta.name == pack.meta.name)
                 {
+                    // Named by path: either pack may be private.
                     return Err(Error::new(format!(
-                        "pack `{}` is loaded twice ({})",
-                        pack.meta.name,
-                        p.display()
+                        "two packs have the same name: {} and {}",
+                        q.path.display(),
+                        pack.path.display()
                     )));
                 }
                 packs.push((kind, pack));
@@ -368,10 +370,16 @@ impl Resolved {
                 path: Some(p.path.clone()),
                 format: p.policy.format.clone(),
             });
+            // A private pack is named by its file only: its name and version
+            // would reach JSON provenance, snapshots and `sqldiff config`.
+            let private = *kind == LayerKind::PrivatePack;
             layers.push(LayerRef {
                 kind: *kind,
-                name: p.meta.name.clone(),
-                version: Some(p.meta.version.clone()),
+                name: match private {
+                    true => p.path.display().to_string(),
+                    false => p.meta.name.clone(),
+                },
+                version: (!private).then(|| p.meta.version.clone()),
                 hash: p.hash.clone(),
             });
             merge(&mut policy, &p.policy);

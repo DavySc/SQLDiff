@@ -166,11 +166,12 @@ fn tree_pairs_by_pack_rules() {
     let v = run(&["--pack", p.to_str().unwrap()]);
     assert_eq!(v["pairs"].as_array().unwrap().len(), 1);
     assert!(v["only_a"].as_array().unwrap().is_empty());
+    // `--pack` loads a private pack, named by its file.
     assert!(v["provenance"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|l| l["name"] == "t"));
+        .any(|l| l["kind"] == "private_pack" && l["name"] == p.to_str().unwrap()));
     assert!(v["pairs"][0]["findings"]
         .as_array()
         .unwrap()

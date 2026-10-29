@@ -127,12 +127,18 @@ fn bundled_config_is_loaded_beside_the_executable() {
     assert!(o.status.success(), "{}", stderr(&o));
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     let layers = v["layers"].as_array().unwrap();
+    // The private pack is named by its file, never by its name or version.
     assert!(
-        layers
-            .iter()
-            .any(|l| l["kind"] == "private_pack" && l["name"] == "org conventions"),
+        layers.iter().any(|l| l["kind"] == "private_pack"
+            && l["name"]
+                .as_str()
+                .unwrap()
+                .replace('\\', "/")
+                .ends_with("org_conventions/pack.toml")
+            && l.get("version").is_none()),
         "{layers:?}"
     );
+    assert!(!o.stdout.windows(15).any(|w| w == b"org conventions"));
     assert!(
         layers
             .iter()
