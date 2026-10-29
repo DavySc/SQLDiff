@@ -2603,3 +2603,168 @@ outcome = [
   { label = "error", when = { create = "00000", state = "!00000" }, verdict = "open", meaning = "An error, as T-SQL (or the expression is not accepted there; SQLSTATE recorded)." },
   { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Another result (in N1)." },
 ]
+
+# ---------------------------------------------------------------- V33 date and timestamp strings
+# The converter writes a T-SQL date or datetime2 literal assigned to a variable
+# in the ISO form (crates/sqldiff-convert/src/tsql.rs date_store), and the
+# engine reads it as the CAST the IBM i "Timestamp strings" and "Date strings"
+# pages describe (crates/sqldiff-core/src/equiv/literal.rs). Each probe assigns
+# a string to a TIMESTAMP(7) or DATE variable: N1 is year * 10000 + month * 100
+# + day, N2 hour * 10000 + minute * 100 + second, TEXT the timestamp as VARCHAR.
+
+[[procedure]]
+name = "V33_TS7"
+commit = "*NONE"
+params = "IN S VARCHAR(40)"
+body = """
+BEGIN
+  DECLARE V TIMESTAMP(7);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = S;
+    SET O_N1 = YEAR(V) * 10000 + MONTH(V) * 100 + DAY(V);
+    SET O_N2 = HOUR(V) * 10000 + MINUTE(V) * 100 + SECOND(V);
+    SET O_TEXT = VARCHAR(V);
+  END;
+END
+"""
+
+[[procedure]]
+name = "V33_TS7_CONST"
+commit = "*NONE"
+body = """
+BEGIN
+  DECLARE V TIMESTAMP(7);
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = '9999-12-31 23:59:59.9999999';
+    SET O_N1 = YEAR(V) * 10000 + MONTH(V) * 100 + DAY(V);
+    SET O_N2 = HOUR(V) * 10000 + MINUTE(V) * 100 + SECOND(V);
+    SET O_TEXT = VARCHAR(V);
+  END;
+END
+"""
+
+[[procedure]]
+name = "V33_DATE"
+commit = "*NONE"
+params = "IN S VARCHAR(40)"
+body = """
+BEGIN
+  DECLARE V DATE;
+  SET O_STATE = '00000';
+  SET O_CODE = 0;
+  BEGIN
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+      GET DIAGNOSTICS CONDITION 1 O_STATE = RETURNED_SQLSTATE,
+        O_CODE = DB2_RETURNED_SQLCODE;
+    SET V = S;
+    SET O_N1 = YEAR(V) * 10000 + MONTH(V) * 100 + DAY(V);
+  END;
+END
+"""
+
+[[probe]]
+id = "V33-TS-ISO"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7"
+args = ["'2020-01-01 00:00:00'"]
+question = "The ISO timestamp string '2020-01-01 00:00:00' assigned to a TIMESTAMP(7) variable: is it 2020-01-01 00:00:00?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings (ISO form); that an assignment reads it as a cast does is inferred."
+outcome = [
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101", n2 = "=0" }, verdict = "consistent", meaning = "Assigned and read as that timestamp." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded): the converter must not assign this form." },
+]
+
+[[probe]]
+id = "V33-TS-ISO-FRACTION"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7"
+args = ["'2020-01-01 10:00:00.5'"]
+question = "'2020-01-01 10:00:00.5' assigned to a TIMESTAMP(7) variable: is it 10:00:00.5000000 (padded with zeros)?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings: missing fraction digits are zeros."
+outcome = [
+  { label = "padded", when = { create = "00000", state = "00000", n1 = "=20200101", n2 = "=100000", text = "contains:.5000000" }, verdict = "consistent", meaning = "Read with the fraction padded to 7 digits." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2, TEXT)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-TS-END-OF-TIME"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7_CONST"
+question = "The constant '9999-12-31 23:59:59.9999999' assigned to a TIMESTAMP(7) variable (what the converter writes for T-SQL's end of time): does it keep all 7 digits?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings (0 to 12 fraction digits); the assignment of a constant is what the converter writes."
+outcome = [
+  { label = "exact", when = { create = "00000", state = "00000", n1 = "=99991231", n2 = "=235959", text = "contains:.9999999" }, verdict = "consistent", meaning = "Assigned exactly, with 7 fraction digits." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2, TEXT)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-TS-IBM-SQL"
+fact = "V33"
+role = "decisive"
+procedure = "V33_TS7"
+args = ["'2020-01-01-10.00.00.5'"]
+question = "The IBM SQL form '2020-01-01-10.00.00.5' assigned to a TIMESTAMP(7) variable: is it 2020-01-01 10:00:00.5?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings (IBM SQL form)."
+outcome = [
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101", n2 = "=100000", text = "contains:.5000000" }, verdict = "consistent", meaning = "Assigned and read as that timestamp." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1, N2, TEXT)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-DATE-ISO"
+fact = "V33"
+role = "decisive"
+procedure = "V33_DATE"
+args = ["'2020-01-01'"]
+question = "The ISO date string '2020-01-01' assigned to a DATE variable: is it 2020-01-01?"
+source = "IBM i 7.4 SQL Reference, Date strings (ISO form); that an assignment reads it as a cast does is inferred."
+outcome = [
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101" }, verdict = "consistent", meaning = "Assigned and read as that date." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "contradicts", meaning = "Assigned with another value (N1)." },
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "contradicts", meaning = "Not accepted (SQLSTATE and SQLCODE recorded)." },
+]
+
+[[probe]]
+id = "V33-DATE-COMPACT"
+fact = "V33"
+role = "info"
+procedure = "V33_DATE"
+args = ["'20200101'"]
+question = "T-SQL's compact '20200101' assigned to a DATE variable: rejected (no Db2 for i date string form), as the docs read?"
+source = "IBM i 7.4 SQL Reference, Date strings: no 8-digit form; why the converter rewrites these literals."
+outcome = [
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Rejected: the rewrite to ISO is needed." },
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=20200101" }, verdict = "open", meaning = "Accepted as 2020-01-01: the rewrite is not needed, but stays correct." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Accepted as another date (N1)." },
+]
+
+[[probe]]
+id = "V33-TS-COMPACT"
+fact = "V33"
+role = "info"
+procedure = "V33_TS7"
+args = ["'99991231 23:59:59.9999999'"]
+question = "T-SQL's '99991231 23:59:59.9999999' assigned to a TIMESTAMP(7) variable: rejected, as the docs read?"
+source = "IBM i 7.6 SQL Reference, Timestamp strings: no form with a space and no dashes; why the converter rewrites these literals."
+outcome = [
+  { label = "rejected", when = { create = "00000", state = "!00000" }, verdict = "consistent", meaning = "Rejected: the rewrite to ISO is needed." },
+  { label = "read", when = { create = "00000", state = "00000", n1 = "=99991231", n2 = "=235959" }, verdict = "open", meaning = "Accepted as the end of time: the rewrite is not needed, but stays correct." },
+  { label = "other", when = { create = "00000", state = "00000" }, verdict = "open", meaning = "Accepted as another value (N1, N2, TEXT)." },
+]
