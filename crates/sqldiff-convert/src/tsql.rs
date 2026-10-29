@@ -4380,10 +4380,7 @@ impl<'a> Cx<'a> {
             .iter()
             .any(|t| t.is("SYSTEM_VERSIONING") || t.is("SYSTEM_TIME"))
         {
-            return no(self.pick(
-                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: in PostgreSQL versioning is the history trigger of the converted CREATE TABLE; turning it off, dropping the period or adding it later needs those triggers changed to match; no rule yet",
-                "ALTER TABLE … SYSTEM_VERSIONING / PERIOD FOR SYSTEM_TIME: Db2 for i system-period tables are not converted yet (their facts are not verified on IBM i); no rule yet",
-            ));
+            return self.alter_versioning(&ts);
         }
         let first = sig(&ts)[0];
         if find_word(&ts, first + 1, "ALTER").is_some() {

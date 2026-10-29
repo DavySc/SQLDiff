@@ -54,6 +54,10 @@ pub mod asm {
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
     );
+    pub const PERIOD_WRITE: (&str, &str) = (
+        "ASM-TEMPORAL-PERIOD-WRITE",
+        "The statement gives a period column of a system-versioned table a value: assumes the code runs while versioning is off and the period dropped (SYSTEM_VERSIONING = OFF, DROP PERIOD FOR SYSTEM_TIME; in PostgreSQL the converted versioning triggers disabled), as data loads do, so both sides store the value as given. While versioning is on, both sides refuse the statement; while only the period remains, SQL Server refuses it and PostgreSQL stores the value",
+    );
     pub const UNTYPED_STORE: (&str, &str) = (
         "ASM-UNTYPED-STORE",
         "Values stored in columns or variables of unknown type (no catalog) convert the same on both sides: no fraction goes into an integer, no number into a bit or boolean, no string longer than the column, and no text into a number",
@@ -491,16 +495,20 @@ impl<'a> Canon<'a> {
     }
 
     /// A statement writes `col`: refused for a column the database computes
-    /// (period, computed, GENERATED ALWAYS), whose explicit values one side
-    /// rejects or replaces depending on settings and triggers the statement
-    /// does not show.
-    fn written(&self, table: &str, col: &str) -> R<()> {
-        let generated = self
+    /// (computed, GENERATED ALWAYS), whose explicit values one side rejects
+    /// or replaces depending on settings and triggers the statement does not
+    /// show. A period column of a system-versioned table is the exception:
+    /// code writes it only with the period dropped, a state the statement
+    /// does not show either, so that is an assumption.
+    fn written(&mut self, table: &str, col: &str) -> R<()> {
+        let (generated, period) = self
             .schema
             .table(Self::base_table(table))
             .and_then(|t| t.column(col))
-            .is_some_and(|c| c.generated);
-        if generated {
+            .map_or((false, false), |c| (c.generated, c.period));
+        if period {
+            self.assume(asm::PERIOD_WRITE);
+        } else if generated {
             return Err(format!("writes the generated column {col}"));
         }
         Ok(())
