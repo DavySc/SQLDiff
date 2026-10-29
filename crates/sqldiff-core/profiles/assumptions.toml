@@ -1338,9 +1338,9 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-DEFAULT-CONSTRAINT-NAME"
-statement = "Nothing refers to a column default by its constraint name: PostgreSQL defaults have no name."
+statement = "The column has no default yet when the default is added, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name."
 discharge = "deployment"
-fact = "No later statement drops or alters the default constraint by name."
+fact = "The column has no default before the statement runs, and no later statement drops or alters the default constraint by name."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]

@@ -1041,7 +1041,7 @@ pub mod asm {
     );
     pub const DEFAULT_NAME: (&str, &str) = (
         "ASM-DEFAULT-CONSTRAINT-NAME",
-        "Nothing refers to the column default by its constraint name: PostgreSQL defaults have no name",
+        "The column has no default yet, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name",
     );
     pub const SCHEMA_OWNER: (&str, &str) = (
         "ASM-SCHEMA-OWNER",
@@ -1741,9 +1741,8 @@ fn defaults(x: &SetDefault, y: &SetDefault, na: &str, nb: &str, ev: &mut Vec<Eve
     if tx.0.is_none() {
         ev.push(Event::Asm(super::canon::asm::DEFAULT_SCHEMA));
     }
-    if x.name.is_some() != y.name.is_some() {
-        ev.push(Event::Asm(asm::DEFAULT_NAME));
-    }
+    // T-SQL adds a default (named or not), PostgreSQL sets one.
+    ev.push(Event::Asm(asm::DEFAULT_NAME));
     ev.push(Event::Default {
         a: x.value.clone(),
         b: y.value.clone(),

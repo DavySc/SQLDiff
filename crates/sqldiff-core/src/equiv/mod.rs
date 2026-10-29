@@ -1235,6 +1235,133 @@ fn table_vars(
     }
 }
 
+/// Whether a T-SQL file gives the column of `sd` a default (or makes it an
+/// identity) before `at`: in the CREATE TABLE of its table or an earlier
+/// `ADD DEFAULT … FOR` it. `None` when that CREATE TABLE is not read.
+fn default_before(side: &Analyzed, at: &SyntaxNode, sd: &ddl::SetDefault) -> Option<bool> {
+    let d = side.dialect();
+    let want = ddl::object_key(&sd.table, d).ok()?;
+    let col = table::key(&sd.column, d).ok()?;
+    for n in side.root.descendants() {
+        if n.kind() != sqldiff_syntax::SyntaxKind::STATEMENT
+            || n.text_range().start() >= at.text_range().start()
+        {
+            continue;
+        }
+        let ts = ast::tokens(&n);
+        if let Ok(c) = table::created_name(&ts) {
+            if ddl::object_key(&c, d).ok() != Some(want.clone()) {
+                continue;
+            }
+            let t = table::parse(&ts, d).ok()?;
+            let has = t.columns.iter().any(|c| {
+                table::key(&c.name, d).ok().as_ref() == Some(&col)
+                    && (c.default.is_some() || c.identity.is_some())
+            });
+            if has {
+                return Some(true);
+            }
+        } else if let Ok(ddl::Ddl::Default(o)) = ddl::parse(&ts, d) {
+            if ddl::object_key(&o.table, d).ok() == Some(want.clone())
+                && table::key(&o.column, d).ok() == Some(col.clone())
+            {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Where `at` sits among the file's top-level statements (and routines)
+/// that concern an object: `C` creates it, `D` drops it, `M` names it
+/// otherwise (a run of these counts once), `X` is `at`'s own. For a schema
+/// (`schema`), any statement naming the schema concerns it. `None` when the
+/// object's name cannot be read.
+fn object_events(
+    side: &Analyzed,
+    at: &SyntaxNode,
+    name: &[table::Name],
+    schema: bool,
+) -> Option<String> {
+    use ast::K;
+    let d = side.dialect();
+    let key = |n: &[table::Name]| -> Option<(Option<String>, String)> {
+        if schema {
+            let [s] = n else { return None };
+            Some((None, table::key(s, d).ok()?))
+        } else {
+            ddl::object_key(n, d).ok()
+        }
+    };
+    let want = key(name)?;
+    let word = &want.1;
+    let items: Vec<SyntaxNode> = cst::structural_children(&side.root)
+        .into_iter()
+        .flat_map(|n| {
+            if n.kind() == sqldiff_syntax::SyntaxKind::BATCH {
+                cst::structural_children(&n)
+            } else {
+                vec![n]
+            }
+        })
+        .collect();
+    let mut out = String::new();
+    for it in &items {
+        let c = if it.text_range().contains_range(at.text_range()) {
+            'X'
+        } else {
+            let ts = ast::tokens(it);
+            let names =
+                |t: &ast::Tok| table::name_of(t).is_some_and(|n| n.text.eq_ignore_ascii_case(word));
+            if !ts.iter().any(names) {
+                continue;
+            }
+            // `CREATE … KIND name` / `DROP KIND [IF EXISTS] name` of the
+            // object itself.
+            let own = (|| {
+                let verb = ts.first()?.up.clone();
+                if verb != "CREATE" && verb != "DROP" {
+                    return None;
+                }
+                let k = ts.iter().position(|t| {
+                    t.kind == K::Word
+                        && matches!(
+                            t.up.as_str(),
+                            "TABLE"
+                                | "VIEW"
+                                | "PROC"
+                                | "PROCEDURE"
+                                | "FUNCTION"
+                                | "SEQUENCE"
+                                | "SCHEMA"
+                                | "TRIGGER"
+                                | "TYPE"
+                                | "INDEX"
+                        )
+                })?;
+                if (ts[k].up == "SCHEMA") != schema || ts[k].up == "INDEX" {
+                    return None;
+                }
+                let mut i = k + 1;
+                if ts.get(i).is_some_and(|t| t.up == "IF") {
+                    i += if ts.get(i + 1).is_some_and(|t| t.up == "NOT") {
+                        3
+                    } else {
+                        2
+                    };
+                }
+                let (n, _) = table::dotted(&ts, i).ok()?;
+                (key(&n)? == want).then_some(if verb == "CREATE" { 'C' } else { 'D' })
+            })();
+            own.unwrap_or('M')
+        };
+        if !(c == 'M' && out.ends_with('M')) {
+            out.push(c);
+        }
+    }
+    out.contains('X').then_some(out)
+}
+
 /// Whether `x` runs exactly once per run of its routine or script:
 /// no enclosing branch, loop, handler or TRY/CATCH, and no enclosing block
 /// with an EXCEPTION section (a PostgreSQL subtransaction that undoes it
@@ -1767,32 +1894,42 @@ fn ddl_stmts(
                 continue;
             }
         }
-        // A table's default or DROP comes after the file creates the table
-        // on both sides, or on neither.
-        let table_named = |dd: &ddl::Ddl| match dd {
-            ddl::Ddl::Default(x) => Some(x.table.clone()),
-            ddl::Ddl::Drop(x) if x.kind == "TABLE" => Some(x.name.clone()),
+        // A DROP or a table's default sits in the same place on both sides
+        // among the file's statements that create, drop or name its object
+        // (for a schema: anything in it).
+        let target = |dd: &ddl::Ddl| match dd {
+            ddl::Ddl::Default(x) => Some((x.table.clone(), false)),
+            ddl::Ddl::Drop(x) => Some((x.name.clone(), x.kind == "SCHEMA")),
             _ => None,
         };
-        if let (Some(nx), Some(ny)) = (table_named(dx), table_named(dy)) {
-            let created_before = |side: &Analyzed, u: &Unit, n: &[table::Name], at: &SyntaxNode| {
-                let d = side.dialect();
-                let want = ddl::stored_key(n, d).ok();
-                u.tables.iter().any(|(t, _)| {
-                    table::created_name(&ast::tokens(t))
-                        .ok()
-                        .and_then(|c| ddl::stored_key(&c, d).ok())
-                        == want
-                        && t.text_range().start() < at.text_range().start()
-                })
-            };
-            if created_before(a, ua, &nx, x.node) != created_before(b, ub, &ny, y.node) {
+        if let (Some((nx, sx)), Some((ny, sy))) = (target(dx), target(dy)) {
+            let ex = object_events(a, x.node, &nx, sx);
+            let ey = object_events(b, y.node, &ny, sy);
+            if ex.is_none() || ex != ey {
                 unknown(
                     out,
-                    "the file creates the table before it on one side and not on the other".into(),
+                    "the file creates, drops or uses its object in another order around it on the two sides".into(),
                 );
                 continue;
             }
+        }
+        // SQL Server refuses a second default on a column (Msg 1781) where
+        // PostgreSQL's SET DEFAULT replaces the one there.
+        let second = [(a, x.node, dx), (b, y.node, dy)]
+            .into_iter()
+            .find_map(|(side, n, dd)| match dd {
+                ddl::Ddl::Default(sd) if side.dialect() == Dialect::Tsql => {
+                    match default_before(side, n, sd) {
+                        Some(false) => None,
+                        Some(true) => Some("the file already gives the column a default (or an identity) before it: SQL Server refuses a second default, PostgreSQL replaces it"),
+                        None => Some("the file creates the column's table in a form not read, so whether the column has a default already is unknown"),
+                    }
+                }
+                _ => None,
+            });
+        if let Some(why) = second {
+            unknown(out, why.into());
+            continue;
         }
         // PostgreSQL names are compared up to letter case only where no
         // other name differs from them only in case.

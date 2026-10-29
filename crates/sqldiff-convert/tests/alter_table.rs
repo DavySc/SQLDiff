@@ -110,3 +110,17 @@ fn turning_a_constraint_off_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_second_default_is_refused() {
+    let src = "CREATE TABLE t (id int NOT NULL PRIMARY KEY, v int NULL DEFAULT 1)\nGO\nALTER TABLE t ADD DEFAULT 2 FOR v\nGO\n";
+    let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+    let at = src.find("ALTER TABLE").unwrap();
+    let u = c
+        .units
+        .iter()
+        .filter(|u| u.src.start <= at && at < u.src.end)
+        .min_by_key(|u| u.src.end - u.src.start)
+        .unwrap();
+    assert_eq!(u.status, Status::NotConverted, "{}", c.output);
+}

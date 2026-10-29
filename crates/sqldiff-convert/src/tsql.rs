@@ -4545,6 +4545,11 @@ impl<'a> Cx<'a> {
                     if tname.iter().any(|b| b.eq_ignore_ascii_case(&colname)) {
                         return no("ALTER TABLE … ADD DEFAULT … FOR a BIT column: no rule yet");
                     }
+                    if find_word(&ts, 0, "TABLE")
+                        .is_some_and(|t| self.table_col_has_default(&ts[t + 1..act], &colname))
+                    {
+                        return no("ALTER TABLE … ADD DEFAULT … FOR a column that already has a default or is an identity: SQL Server refuses it (Msg 1781), PostgreSQL's SET DEFAULT would replace the default");
+                    }
                     let mut value = trimmed(&ts[d + 1..f]);
                     while value.len() > 2
                         && value[0].k == L_PAREN
@@ -4553,7 +4558,7 @@ impl<'a> Cx<'a> {
                         value = trimmed(&value[1..value.len() - 1]);
                     }
                     self.step_ts("tsql.table.add-default", &ts[act..]);
-                    self.note(Status::Assumptions, "ASM-DEFAULT-CONSTRAINT-NAME", "The default becomes ALTER COLUMN … SET DEFAULT: PostgreSQL defaults have no name, so a later ALTER TABLE … DROP CONSTRAINT of it finds no constraint.");
+                    self.note(Status::Assumptions, "ASM-DEFAULT-CONSTRAINT-NAME", "The default becomes ALTER COLUMN … SET DEFAULT. Assumes the column has no default yet: SQL Server refuses a second default (Msg 1781) where SET DEFAULT replaces it. PostgreSQL defaults have no name, so a later ALTER TABLE … DROP CONSTRAINT of it finds no constraint.");
                     let v = self.expr(value).trim().to_string();
                     let c = self.expr(col).trim().to_string();
                     return Ok(format!("{head} ALTER COLUMN {c} SET DEFAULT {v}"));
