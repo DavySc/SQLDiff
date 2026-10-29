@@ -27,6 +27,12 @@ opened there loads) which packs were loaded: a shared pack by name, version
 and path, a private pack (`private_packs`, and every `--pack` or pack field)
 by path only. "No pack loaded" means built-in rules and config files only.
 Comparisons opened from Home load the packs `sqldiff-gui` was started with.
+The command line follows the same rule: the provenance in JSON output
+(`tree`, `pairs`, `queue`), the `config:` line of `pairs --diff`,
+`sqldiff config` and snapshot bundles name a private pack by its
+`pack.toml` path, with no version, and so does the error for two packs
+of the same name. `sqldiff pack validate` still prints the name of the
+pack it is given.
 
 Merging: ordered rule lists (`pairing.rules`, `dialect_map`, `overrides`) are
 tried higher layer first; maps (`assumptions`, `dialect_versions`) and keyed
