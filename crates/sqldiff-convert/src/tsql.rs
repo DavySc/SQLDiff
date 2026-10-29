@@ -68,6 +68,7 @@ pub(crate) fn convert(
         in_cast: false,
         return_code: false,
         txn_control: false,
+        wrapper: None,
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
@@ -191,6 +192,10 @@ struct Cx<'a> {
     /// PostgreSQL: the procedure body COMMITs or ROLLs BACK, which a
     /// SECURITY DEFINER procedure may not.
     txn_control: bool,
+    /// PostgreSQL: where the `BEGIN TRAN` and the `COMMIT` of a transaction
+    /// that wraps all the durable work of the routine or script start
+    /// ([`txn_wrapper`]); both are dropped.
+    wrapper: Option<(usize, usize)>,
     decls: Vec<Decl>,
     /// The unit being converted was refused because of where it stands, not
     /// for want of a rule: the idiom rules, which see statements out of
@@ -409,12 +414,17 @@ impl<'a> Cx<'a> {
         self.tables.clear();
         self.savepoints.clear();
         self.dynamic.clear();
+        self.wrapper = None;
     }
 
     fn do_block(&mut self, out: &mut Out, b: &SyntaxNode) {
         self.mode = Mode::Do;
         self.reset();
         self.dynamic = dynamic_sql_vars(&tokens(b));
+        self.drop_known_dynamic(b);
+        if !self.db2() {
+            self.wrapper = txn_wrapper(b);
+        }
         let mut body = Out::default();
         self.body_elements(&mut body, b, INDENT);
         if self.db2() {
@@ -550,6 +560,9 @@ impl<'a> Cx<'a> {
         self.txn_control = false;
         let all = tokens(r);
         self.dynamic = dynamic_sql_vars(&all);
+        let mode = std::mem::replace(&mut self.mode, if func { Mode::Func } else { Mode::Proc });
+        self.drop_known_dynamic(r);
+        self.mode = mode;
         let body_at = all.len()
             - r.children()
                 .find(|c| c.kind() == ROUTINE_BODY)
@@ -693,6 +706,9 @@ impl<'a> Cx<'a> {
         let body = r.children().find(|c| c.kind() == ROUTINE_BODY).ok_or(No(
             "routine without a body: the statement is cut short or malformed".into(),
         ))?;
+        if !self.db2() && !func {
+            self.wrapper = txn_wrapper(&body);
+        }
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
         match block {
@@ -1129,6 +1145,100 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// Dynamic SQL whose text is known before it runs (`equiv::dynamic`):
+    /// the statement inside is converted by the same rules and run with
+    /// `EXECUTE '<converted text>'`. The variable keeps the T-SQL text, which
+    /// nothing runs any more; the engine compares the statement inside the
+    /// string with the one inside the `EXECUTE`.
+    fn dynamic_exec(&mut self, n: &SyntaxNode) -> R<String> {
+        let (text, notes) = self.dynamic_inner(n).map_err(No)?;
+        for x in notes {
+            if x.status > Status::Converted {
+                self.note(
+                    x.status,
+                    &x.rule,
+                    &format!("In the dynamic SQL: {}", x.text),
+                );
+            }
+        }
+        self.step_node("tsql.stmt.dynamic-known-text", n);
+        Ok(format!("EXECUTE '{}'", text.replace('\'', "''")))
+    }
+
+    /// The converted statement a dynamic SQL statement runs, with the notes
+    /// of its conversion, or why it cannot be converted.
+    fn dynamic_inner(&self, n: &SyntaxNode) -> Result<(String, Vec<Note>), String> {
+        use sqldiff_core::equiv::dynamic::{self, Text};
+        if self.db2() {
+            return Err(
+                "dynamic SQL: not converted for Db2 for i yet; use EXECUTE IMMEDIATE after review"
+                    .into(),
+            );
+        }
+        if self.mode != Mode::Proc && self.mode != Mode::Do || self.trigger.is_some() {
+            return Err("dynamic SQL outside a procedure or script block".into());
+        }
+        let text = match dynamic::tsql_text(n) {
+            Text::Known(t) => t,
+            Text::Null => {
+                return Err("dynamic SQL whose text is NULL: T-SQL runs nothing and PostgreSQL EXECUTE NULL fails; remove the statement after review".into())
+            }
+            Text::Unknown(why) => {
+                return Err(format!(
+                    "dynamic SQL whose text is not known before it runs ({why}): use EXECUTE format(…) after review; the checker cannot compare it"
+                ))
+            }
+        };
+        if text.trim().is_empty() {
+            return Err("dynamic SQL with empty text: T-SQL runs nothing; remove the statement after review".into());
+        }
+        if let Some(why) = dynamic::tsql_inner_refusal(&text) {
+            return Err(format!("dynamic SQL with known text, not converted: {why}"));
+        }
+        let root = sqldiff_syntax::parse(&text, Dialect::Tsql).syntax();
+        let inner = convert(&root, &text, self.to, self.catalog);
+        let [u] = inner.units.as_slice() else {
+            return Err("dynamic SQL with known text, not converted: its statement did not convert to one statement".into());
+        };
+        if let Some(bad) = u.notes.iter().find(|x| x.status > Status::Decision) {
+            return Err(format!(
+                "dynamic SQL with known text, not converted: {}",
+                bad.text
+            ));
+        }
+        let out = inner.text[u.out.0..u.out.1].trim();
+        // Comment lines the rules keep (`-- SET NOCOUNT ON: …`) are not code.
+        if out.lines().any(|l| l.trim_start().starts_with("--")) || out.contains('$') {
+            return Err("dynamic SQL with known text, not converted: the converted statement holds comments or `$`".into());
+        }
+        Ok((out.trim_end_matches(';').to_string(), u.notes.clone()))
+    }
+
+    /// Takes off `self.dynamic` the variables that only known-text dynamic
+    /// SQL runs: those statements now run the converted text, not the
+    /// variable, so its T-SQL text no longer reaches PostgreSQL.
+    fn drop_known_dynamic(&mut self, scope: &SyntaxNode) {
+        if self.dynamic.is_empty() {
+            return;
+        }
+        let sites: Vec<SyntaxNode> = scope
+            .descendants()
+            .filter(sqldiff_core::equiv::dynamic::is_tsql)
+            .collect();
+        let known: Vec<bool> = sites
+            .iter()
+            .map(|d| self.dynamic_inner(d).is_ok())
+            .collect();
+        // Kept while some statement that is not converted this way runs it.
+        self.dynamic.retain(|v| {
+            sites.iter().zip(&known).any(|(d, ok)| {
+                !*ok && tokens(d)
+                    .iter()
+                    .any(|t| t.k == VARIABLE && t.s[1..].eq_ignore_ascii_case(v))
+            })
+        });
+    }
+
     /// A statement that assigns a variable later run as dynamic SQL builds
     /// T-SQL text: the rules convert the statement, not the SQL in the string,
     /// so the unit cannot count as converted.
@@ -1527,6 +1637,7 @@ impl<'a> Cx<'a> {
             "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
             "SAVE" if self.db2() => self.save(&ts)?,
             "SAVE" => return no("SAVE TRANSACTION: use SAVEPOINT, but a PL/pgSQL body cannot; use a nested BEGIN … EXCEPTION block"),
+            "EXEC" | "EXECUTE" if sqldiff_core::equiv::dynamic::is_tsql(n) => self.dynamic_exec(n)?,
             "EXEC" | "EXECUTE" => self.exec(&ts)?,
             "CREATE" => self.create(&ts)?,
             "ALTER" if w(1) == "TABLE" => self.alter_table(&ts)?,
@@ -2995,11 +3106,26 @@ impl<'a> Cx<'a> {
                 if self.in_catch {
                     return self.misplaced("ROLLBACK/COMMIT inside an exception handler is not allowed in PostgreSQL; the failed block is already rolled back");
                 }
+                let at = s.first().map(|&j| ts[j].pos.0);
+                if let (Some(at), Some((b, c))) = (at, self.wrapper) {
+                    if at == b || at == c {
+                        // The CALL (or DO) is one transaction already, and
+                        // inside a caller's transaction both sides leave the
+                        // work to the caller: nothing to choose.
+                        self.step_ts("tsql.txn.wrapper", &ts);
+                        return Ok(if at == b {
+                            "-- BEGIN TRANSACTION: the call is one transaction in PostgreSQL"
+                        } else {
+                            "-- COMMIT: the work commits with the call (or with the caller's transaction)"
+                        }
+                        .into());
+                    }
+                }
                 if kw == "BEGIN" {
-                    self.note(Status::Decision, "pg.proc-transaction", "A PostgreSQL procedure already runs inside a transaction; BEGIN TRAN is dropped. Nested-transaction behaviour (@@TRANCOUNT) does not exist.");
+                    self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "BEGIN TRAN is dropped: a PostgreSQL procedure already runs inside a transaction, and the COMMITs that follow end it. That holds when the procedure is CALLed outside a transaction block (autocommit); inside a caller's transaction T-SQL nests (@@TRANCOUNT) and PostgreSQL refuses the COMMIT.");
                     return Ok("-- BEGIN TRANSACTION: implicit in PostgreSQL".into());
                 }
-                self.note(Status::Decision, "pg.proc-transaction", "COMMIT/ROLLBACK in a procedure only works when it is CALLed outside an explicit transaction block. In T-SQL a COMMIT inside the caller's transaction only decrements @@TRANCOUNT; here it commits the caller's work too.");
+                self.note(Status::Assumptions, "ASM-NO-CALLER-TXN", "COMMIT/ROLLBACK stays: right when the procedure is CALLed outside a transaction block (autocommit). Inside a caller's transaction T-SQL's inner COMMIT only decrements @@TRANCOUNT, where PostgreSQL refuses it (invalid transaction termination).");
                 self.txn_control = true;
                 Ok(kw.to_string())
             }
@@ -4868,7 +4994,7 @@ impl<'a> Cx<'a> {
 
     fn ci_note(&mut self) {
         let text = self.pick(
-            "String comparison: T-SQL's default collation is case-insensitive, and T-SQL ignores trailing spaces when it compares; PostgreSQL compares case-sensitively and counts trailing spaces in varchar and text. Equal only if the data's case is consistent (or use a case-insensitive collation) and no compared value differs from another only by trailing spaces.",
+            "String comparison: T-SQL's default collation is case-insensitive, and T-SQL ignores trailing spaces when it compares; PostgreSQL compares case-sensitively and counts trailing spaces in varchar and text. Equal only if no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (the default equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters).",
             "String comparison: T-SQL's default collation is case-insensitive; Db2 for i compares by the sort sequence, case-sensitively with the default *HEX. Both ignore trailing blanks (fact V8). Equal only if the data's case is consistent (or the routine uses SRTSEQ(*LANGIDSHR)).",
         ).to_string();
         self.note(Status::Assumptions, "ASM-CI-COLLATION", &text);
@@ -5677,6 +5803,127 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
         }
     }
     out
+}
+
+/// The `BEGIN TRAN` and `COMMIT` (where each starts) of a body whose durable
+/// work all runs inside that one transaction, so that a PostgreSQL CALL or
+/// DO, which is one transaction already, behaves the same without them:
+/// autocommit commits the work with the call, and inside a caller's
+/// transaction both sides leave it to the caller (T-SQL's inner COMMIT only
+/// decrements @@TRANCOUNT). Checked on SQL Server 2022 and PostgreSQL 18.
+///
+/// The body's own list (BEGIN … END blocks flattened) holds exactly one
+/// `BEGIN TRAN` and, after it, one `COMMIT`; before them only declarations,
+/// SET, PRINT and SELECT without INTO, after them at most `RETURN n`.
+/// Nowhere else in the body: transaction control, @@TRANCOUNT, XACT_STATE,
+/// TRY/CATCH, THROW, RAISERROR, EXEC, GOTO, another RETURN or a table
+/// variable. A failing statement must end the transaction alike:
+/// `SET XACT_ABORT ON` before the BEGIN, or only one statement inside that
+/// writes (a statement fails as a whole).
+fn txn_wrapper(body: &SyntaxNode) -> Option<(usize, usize)> {
+    fn flat(n: &SyntaxNode, out: &mut Vec<SyntaxNode>) {
+        for c in n.children() {
+            if c.kind() == BLOCK || c.kind().is_container() {
+                flat(&c, out);
+            } else if c.kind().is_unit() {
+                out.push(c);
+            }
+        }
+    }
+    let at = |n: &SyntaxNode| tokens(n).iter().find(|t| t.sig()).map(|t| t.pos.0);
+    let words = |n: &SyntaxNode| -> Vec<String> {
+        tokens(n)
+            .iter()
+            .filter(|t| t.sig())
+            .take(2)
+            .map(|t| t.up())
+            .collect()
+    };
+    let is_begin = |n: &SyntaxNode| {
+        let w = words(n);
+        n.kind() == STATEMENT
+            && w.len() == 2
+            && w[0] == "BEGIN"
+            && matches!(w[1].as_str(), "TRAN" | "TRANSACTION")
+    };
+    let neutral = |n: &SyntaxNode| {
+        n.kind() == STATEMENT
+            && match first_word(n).as_str() {
+                "DECLARE" | "SET" | "PRINT" => true,
+                "SELECT" => !tokens(n).iter().any(|t| t.is("INTO")),
+                _ => false,
+            }
+    };
+    let all: Vec<T> = tokens(body).into_iter().filter(|t| t.sig()).collect();
+    let banned = all.iter().any(|t| {
+        [
+            "ROLLBACK",
+            "SAVE",
+            "THROW",
+            "RAISERROR",
+            "EXEC",
+            "EXECUTE",
+            "GOTO",
+            "XACT_STATE",
+        ]
+        .iter()
+        .any(|w| t.is(w))
+            || t.s.eq_ignore_ascii_case("@@TRANCOUNT")
+    }) || all
+        .windows(2)
+        .any(|w| w[0].k == VARIABLE && w[1].is("TABLE"))
+        || body.descendants().any(|d| d.kind() == TRY_CATCH);
+    if banned || all.iter().filter(|t| t.is("COMMIT")).count() != 1 {
+        return None;
+    }
+    let mut top = Vec::new();
+    flat(body, &mut top);
+    let begins: Vec<usize> = (0..top.len()).filter(|&i| is_begin(&top[i])).collect();
+    let begun = all
+        .windows(2)
+        .filter(|w| w[0].is("BEGIN") && (w[1].is("TRAN") || w[1].is("TRANSACTION")))
+        .count();
+    let [b] = begins[..] else { return None };
+    let c =
+        (0..top.len()).find(|&i| first_word(&top[i]) == "COMMIT" && top[i].kind() == STATEMENT)?;
+    if begun != 1 || c < b {
+        return None;
+    }
+    // After the COMMIT, a statement that fails would leave T-SQL's work
+    // committed and roll PostgreSQL's back: only a last `RETURN` or
+    // `RETURN <number>`.
+    let ret_last = |i: usize| {
+        let w: Vec<T> = tokens(&top[i])
+            .into_iter()
+            .filter(|t| t.sig() && t.k != SEMICOLON)
+            .collect();
+        i + 1 == top.len()
+            && w.first().is_some_and(|t| t.is("RETURN"))
+            && (w.len() == 1 || w.len() == 2 && w[1].s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    if !(0..b).all(|i| neutral(&top[i])) || !(c + 1..top.len()).all(ret_last) {
+        return None;
+    }
+    let xact_abort = top[..b].iter().any(|n| {
+        let w: Vec<String> = tokens(n)
+            .iter()
+            .filter(|t| t.sig())
+            .map(|t| t.up())
+            .collect();
+        w == ["SET", "XACT_ABORT", "ON"] || w == ["SET", "XACT_ABORT", "ON", ";"]
+    }) && !all
+        .windows(2)
+        .any(|w| w[0].is("XACT_ABORT") && w[1].is("OFF"));
+    let writes: Vec<&SyntaxNode> = top[b + 1..c].iter().filter(|n| !neutral(n)).collect();
+    if !xact_abort && (writes.len() > 1 || writes.iter().any(|n| n.kind() != STATEMENT)) {
+        return None;
+    }
+    // A RETURN before the COMMIT leaves T-SQL's transaction open.
+    let returns = all.iter().filter(|t| t.is("RETURN")).count();
+    if returns > usize::from(ret_last(top.len().wrapping_sub(1))) {
+        return None;
+    }
+    Some((at(&top[b])?, at(&top[c])?))
 }
 
 /// The first keyword of a unit, upper case.
