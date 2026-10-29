@@ -458,7 +458,7 @@ fn comment_near_misses() {
     unknown(
         &extprop("N'Kept things'", table),
         "COMMENT ON TABLE public.\"Things\" IS 'Kept things';",
-        "keeps its capitals",
+        "catalog has no table public.Things",
     );
     // Commented twice: PostgreSQL keeps only the last comment.
     let two = format!(

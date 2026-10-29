@@ -26,7 +26,7 @@ pub mod xwit;
 
 use std::collections::BTreeMap;
 
-use sqldiff_syntax::{ast as cst, SyntaxNode};
+use sqldiff_syntax::{ast as cst, Dialect, SyntaxNode};
 
 use crate::artifact::Analyzed;
 use crate::model::{
@@ -78,10 +78,12 @@ fn side_name(a: &Analyzed) -> String {
     format!("side {:?} ({})", a.side, a.dialect().display_name())
 }
 
-/// Lowers every data statement of a unit.
-fn items(unit: &Unit, schema: &Schema, by_name: bool) -> Vec<Item> {
+/// Lowers every data statement of a unit, to compare with statements in
+/// dialect `other`.
+fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Item> {
     let mut c = Canon::new(unit, schema);
     c.by_name = by_name;
+    c.fold_quoted = other == Dialect::Tsql;
     let mut out = Vec::new();
     let mut stmts = unit.stmts.iter().enumerate().peekable();
     let mut ctl = unit.ctl.iter().peekable();
@@ -324,8 +326,8 @@ fn compare_units(
     if ua.txn_control || ub.txn_control {
         out.assume(asm::make(asm::NO_CALLER_TXN));
     }
-    let ia = items(ua, sa, false);
-    let ib = items(ub, sb, false);
+    let ia = items(ua, sa, false, ub.dialect);
+    let ib = items(ub, sb, false, ua.dialect);
     if std::env::var_os("SQLDIFF_DEBUG_TERMS").is_some() {
         for (name, items) in [("A", &ia), ("B", &ib)] {
             for it in items.iter() {
@@ -631,18 +633,22 @@ fn same_stmt(
     na: &str,
     nb: &str,
 ) -> Same {
-    let lowered =
-        |toks: &[ast::Tok], u: &Unit, s: &Schema| -> Result<(Term, Vec<Assumption>), String> {
-            let st = ast::parse_stmt(toks, u.dialect)?;
-            let mut c = Canon::new(u, s);
-            let t = c.stmt(&st)?;
-            Ok((t, std::mem::take(&mut c.asm)))
-        };
-    let (tx, mut asms) = match lowered(x, ua, sa) {
+    let lowered = |toks: &[ast::Tok],
+                   u: &Unit,
+                   s: &Schema,
+                   other: &Unit|
+     -> Result<(Term, Vec<Assumption>), String> {
+        let st = ast::parse_stmt(toks, u.dialect)?;
+        let mut c = Canon::new(u, s);
+        c.fold_quoted = other.dialect == Dialect::Tsql;
+        let t = c.stmt(&st)?;
+        Ok((t, std::mem::take(&mut c.asm)))
+    };
+    let (tx, mut asms) = match lowered(x, ua, sa, ub) {
         Ok(v) => v,
         Err(e) => return Same::Unknown(format!("{na}: {e}")),
     };
-    let (ty, by) = match lowered(y, ub, sb) {
+    let (ty, by) = match lowered(y, ub, sb, ua) {
         Ok(v) => v,
         Err(e) => return Same::Unknown(format!("{nb}: {e}")),
     };
@@ -1075,6 +1081,22 @@ fn table_pair(
     };
     let mut found = false;
     let sch = std::cell::OnceCell::new();
+    let with_table = || {
+        sch.get_or_init(|| {
+            (
+                sa.with_ddl(&p.ddl.0, a.dialect()),
+                sb.with_ddl(&p.ddl.1, b.dialect()),
+            )
+        })
+    };
+    let pg = sqldiff_syntax::Dialect::Postgres;
+    if a.dialect() == pg || b.dialect() == pg {
+        let (sa2, sb2) = with_table();
+        if let Err(e) = ta.case_check(sa2).and_then(|_| tb.case_check(sb2)) {
+            unknown(out, e);
+            return;
+        }
+    }
     for e in table::compare(&ta, &tb, &na, &nb) {
         match e {
             table::Event::Asm(x) => add(&mut asms, asm::make(x)),
@@ -1134,12 +1156,7 @@ fn table_pair(
                 b: eb,
                 at,
             } => {
-                let (sa2, sb2) = sch.get_or_init(|| {
-                    (
-                        sa.with_ddl(&p.ddl.0, a.dialect()),
-                        sb.with_ddl(&p.ddl.1, b.dialect()),
-                    )
-                });
+                let (sa2, sb2) = with_table();
                 // A check rejects the rows its predicate makes false:
                 // those `WHERE NOT (predicate)` selects.
                 let rejected = |e: &[ast::Tok], name: &[ast::Tok]| {
@@ -1208,12 +1225,12 @@ fn col_facts(
     col: &str,
 ) -> Option<ddl::ColFacts> {
     let d = side.dialect();
-    let want = ddl::object_key(table, d).ok()?;
+    let want = ddl::stored_key(table, d).ok()?;
     for (node, _) in &u.tables {
         let Ok(t) = table::parse(&ast::tokens(node), d) else {
             continue;
         };
-        if ddl::object_key(&t.name, d).ok().as_ref() != Some(&want) {
+        if ddl::stored_key(&t.name, d).ok().as_ref() != Some(&want) {
             continue;
         }
         let c = table::column_by_key(&t, col)?;
@@ -1375,18 +1392,23 @@ fn ddl_stmts(
             .filter_map(|(n, _)| {
                 let toks = ast::tokens(n);
                 let t = table::parse(&toks, d).ok()?;
-                ddl::object_key(&t.name, d).ok()
+                ddl::stored_key(&t.name, d).ok()
             })
             .collect();
         for s in v.iter() {
             let Ok(ddl::Ddl::Index(ix)) = &s.ddl else {
                 continue;
             };
-            let Ok((schema, _)) = ddl::object_key(&ix.table, d) else {
+            let Ok((schema, _)) = ddl::stored_key(&ix.table, d) else {
                 continue;
             };
-            let Ok(n) = table::key(&ix.name, d) else {
-                continue;
+            let n = if d == sqldiff_syntax::Dialect::Postgres {
+                table::stored(&ix.name)
+            } else {
+                let Ok(n) = table::key(&ix.name, d) else {
+                    continue;
+                };
+                n
             };
             let k = (schema, n);
             if seen.contains(&k) {
@@ -1456,11 +1478,11 @@ fn ddl_stmts(
         if let (ddl::Ddl::Index(ix), ddl::Ddl::Index(iy)) = (dx, dy) {
             let before = |side: &Analyzed, u: &Unit, ix: &ddl::Index, at: &SyntaxNode| {
                 let d = side.dialect();
-                let want = ddl::object_key(&ix.table, d).ok();
+                let want = ddl::stored_key(&ix.table, d).ok();
                 u.tables.iter().any(|(n, _)| {
                     table::parse(&ast::tokens(n), d)
                         .ok()
-                        .and_then(|t| ddl::object_key(&t.name, d).ok())
+                        .and_then(|t| ddl::stored_key(&t.name, d).ok())
                         == want
                         && n.text_range().start() > at.text_range().start()
                 })
@@ -1472,6 +1494,34 @@ fn ddl_stmts(
                 );
                 continue;
             }
+        }
+        // PostgreSQL names are compared up to letter case only where no
+        // other name differs from them only in case.
+        let case_check = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {
+            let d = side.dialect();
+            if d != sqldiff_syntax::Dialect::Postgres {
+                return Ok(());
+            }
+            let file_table = match dd {
+                ddl::Ddl::Index(ix) => {
+                    let want = ddl::stored_key(&ix.table, d).ok();
+                    u.tables.iter().find(|(n, _)| {
+                        table::parse(&ast::tokens(n), d)
+                            .ok()
+                            .and_then(|t| ddl::stored_key(&t.name, d).ok())
+                            == want
+                    })
+                }
+                _ => None,
+            };
+            match file_table {
+                Some((n, _)) => ddl::case_check(dd, &s.with_ddl(&n.text().to_string(), d)),
+                None => ddl::case_check(dd, s),
+            }
+        };
+        if let Err(e) = case_check(a, ua, sa, dx).and_then(|_| case_check(b, ub, sb, dy)) {
+            unknown(out, e);
+            continue;
         }
         let table_of = |d: &ddl::Ddl| match d {
             ddl::Ddl::Index(i) => Some((i.table.clone(), i.table_toks.clone())),
@@ -3185,8 +3235,8 @@ pub fn refine_modified(
     }
     let ua = lower::lower(a);
     let ub = lower::lower(b);
-    let ia = items(&ua, sa, true);
-    let ib = items(&ub, sb, true);
+    let ia = items(&ua, sa, true, ub.dialect);
+    let ib = items(&ub, sb, true, ua.dialect);
     let find = |items: &[Item], side: Side, f: &Finding| -> Option<usize> {
         let loc = if side == Side::A {
             f.a.as_ref()?

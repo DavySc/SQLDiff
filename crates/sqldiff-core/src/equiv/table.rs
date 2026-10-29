@@ -1257,17 +1257,24 @@ pub enum Event {
     },
 }
 
-/// The name a part resolves to: T-SQL names ignore case (case-insensitive
-/// catalog collation, `ASM-IDENT-FOLD`), PostgreSQL folds unquoted names to
-/// lower case. A quoted PostgreSQL name with capitals matches no unquoted
-/// name the rest of the converted code writes.
-pub(super) fn key(n: &Name, d: Dialect) -> R<String> {
-    match d {
-        Dialect::Postgres if n.quoted && n.text != n.text.to_lowercase() => Err(format!(
-            "the quoted name \"{}\" keeps its capitals in PostgreSQL",
-            n.text
-        )),
-        _ => Ok(n.text.to_lowercase()),
+/// The name a part resolves to, up to letter case: T-SQL names ignore case
+/// (case-insensitive catalog collation, `ASM-IDENT-FOLD`), PostgreSQL folds
+/// unquoted names to lower case. A quoted PostgreSQL name keeps its case in
+/// PostgreSQL; it folds here only to meet the T-SQL name, and
+/// `Table::case_check` (`ddl::case_check` for indexes) first makes sure that
+/// no other name the statement or the catalog holds differs from it only in
+/// letter case.
+pub(super) fn key(n: &Name, _d: Dialect) -> R<String> {
+    Ok(n.text.to_lowercase())
+}
+
+/// The name as PostgreSQL stores it: a quoted name as written, others in
+/// lower case.
+pub(super) fn stored(n: &Name) -> String {
+    if n.quoted {
+        n.text.clone()
+    } else {
+        n.text.to_lowercase()
     }
 }
 
@@ -1283,11 +1290,54 @@ fn table_key(parts: &[Name], d: Dialect) -> R<(Option<String>, String)> {
         Dialect::Postgres => "public",
         Dialect::Db2i => return Err("Db2 for i tables are not compared".into()),
     };
-    match ks.as_slice() {
-        [t] => Ok((None, t.clone())),
-        [s, t] if s == default => Ok((None, t.clone())),
-        [s, t] => Ok((Some(s.clone()), t.clone())),
+    // The default schema by its stored spelling: PostgreSQL's "Public" is
+    // another schema.
+    let is_default = |n: &Name| match d {
+        Dialect::Postgres => stored(n) == default,
+        _ => n.text.eq_ignore_ascii_case(default),
+    };
+    match (ks.as_slice(), parts) {
+        ([t], _) => Ok((None, t.clone())),
+        ([_, t], [s, _]) if is_default(s) => Ok((None, t.clone())),
+        ([s, t], _) => Ok((Some(s.clone()), t.clone())),
         _ => Err("a name with more than two parts".into()),
+    }
+}
+
+impl Table {
+    /// PostgreSQL: whether this table's names may be compared up to letter
+    /// case (`key`), given `schema`, the catalog with this table added (see
+    /// `Schema::case_check`). Names of other objects (referenced tables and
+    /// their columns, sequences) must be catalog names when quoting keeps
+    /// their capitals.
+    pub fn case_check(&self, schema: &super::schema::Schema) -> R<()> {
+        if self.dialect != Dialect::Postgres {
+            return Ok(());
+        }
+        let own = self
+            .name
+            .iter()
+            .chain(self.columns.iter().map(|c| &c.name))
+            .chain(self.keys.iter().flat_map(|k| k.name.iter().chain(&k.cols)))
+            .chain(self.fks.iter().flat_map(|f| f.name.iter().chain(&f.cols)))
+            .chain(self.checks.iter().filter_map(|c| c.name.as_ref()));
+        for n in own {
+            schema.case_check(&stored(n), false)?;
+        }
+        let seqs: Vec<Vec<Name>> = self
+            .columns
+            .iter()
+            .filter_map(|c| sequence(c.default.as_ref()?, self.dialect))
+            .collect();
+        let other = self
+            .fks
+            .iter()
+            .flat_map(|f| f.table.iter().chain(f.ref_cols.iter().flatten()))
+            .chain(seqs.iter().flatten());
+        for n in other {
+            schema.case_check(&stored(n), true)?;
+        }
+        Ok(())
     }
 }
 
