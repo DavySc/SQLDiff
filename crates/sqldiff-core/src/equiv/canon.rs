@@ -94,6 +94,14 @@ pub mod asm {
         "ASM-PAGE-COUNT-NOT-NULL",
         "The row count and offset of TOP / LIMIT / FETCH / OFFSET are never NULL: T-SQL raises an error for NULL (Msg 1014), PostgreSQL reads LIMIT NULL as no limit and OFFSET NULL as 0, and Db2 for i was not checked",
     );
+    pub const RAISERROR_TEXT: (&str, &str) = (
+        "ASM-RAISERROR-TEXT",
+        "The RAISERROR message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space, where PostgreSQL keeps the text as it is",
+    );
+    pub const RAISERROR_FORMAT: (&str, &str) = (
+        "ASM-RAISERROR-FORMAT",
+        "The variable RAISERROR takes as its message holds no % sign: T-SQL reads it as a format, so % starts a substitution",
+    );
     pub const RESULT_TYPES: (&str, &str) = (
         "ASM-RESULT-TYPES",
         "Declared result column types hold the selected values without conversion",
@@ -2700,6 +2708,74 @@ impl<'a> Canon<'a> {
             }
             Stmt::Message(_) => Err("a message that is not a string literal".into()),
         }
+    }
+
+    /// A message or raised error a format builds (`lower::Msg`): the text
+    /// as literal pieces and shown values, `message` (informational, as
+    /// `PRINT` and `RAISE NOTICE`) or `raise-error`. A value is shown only
+    /// when its text is the same on both sides: a variable-length string
+    /// (not blank-padded `char`), or an integer of at most 32 bits for
+    /// T-SQL `%d` (bigint is an error there). The NULL text is part of the
+    /// term, so T-SQL `(null)` meets only a PostgreSQL `COALESCE(x, '(null)')`.
+    pub fn message(&mut self, m: &super::lower::Msg) -> R<Term> {
+        use super::lower::{MsgPart, Spec};
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        // Most characters the text can have (None: no bound), and whether it
+        // can be empty.
+        let mut most = Some(0usize);
+        let mut empty = true;
+        for p in &m.parts {
+            match p {
+                MsgPart::Text(s) => {
+                    most = most.map(|x| x + s.chars().count());
+                    empty &= s.is_empty();
+                    text.push_str(s);
+                }
+                MsgPart::Arg { value, null, spec } => {
+                    let (t, ty) = self.expr(value)?;
+                    let Some(ty) = ty else {
+                        return Err("a message value of unknown type".into());
+                    };
+                    let (head, width) = match (spec, ty.fam) {
+                        (Spec::Str, Fam::VarChar) => ("msg-str", ty.len.map(|l| l as usize)),
+                        (Spec::Int, Fam::Int)
+                            if self.d != Dialect::Tsql || ty.len.is_some_and(|b| b <= 32) =>
+                        {
+                            // "-2147483648"
+                            empty = false;
+                            ("msg-int", Some(11))
+                        }
+                        (Spec::Str, _) => {
+                            return Err(
+                                "a message value that is not a variable-length string".into()
+                            )
+                        }
+                        (Spec::Int, _) => {
+                            return Err("a %d message value that is not an int".into())
+                        }
+                    };
+                    empty &= null.is_empty() || head == "msg-int";
+                    most = most
+                        .zip(width)
+                        .map(|(x, w)| x + w.max(null.chars().count()));
+                    if !text.is_empty() {
+                        parts.push(n("str", vec![a(std::mem::take(&mut text))]));
+                    }
+                    parts.push(n(head, vec![t, a(null.clone())]));
+                }
+            }
+        }
+        if !text.is_empty() || parts.is_empty() {
+            parts.push(n("str", vec![a(text)]));
+        }
+        if m.tsql && (empty || most.map_or(true, |x| x > 2047)) {
+            self.assume(asm::RAISERROR_TEXT);
+        }
+        if m.format_var {
+            self.assume(asm::RAISERROR_FORMAT);
+        }
+        Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
 
     fn resultset(&mut self, q: &Select) -> R<Term> {
