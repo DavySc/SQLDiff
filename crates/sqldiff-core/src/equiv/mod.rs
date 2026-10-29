@@ -890,6 +890,30 @@ fn line_at(side: &Analyzed, off: usize) -> crate::model::Location {
     side.location(off, end.max(off + 1).min(text.len().max(off)))
 }
 
+/// The scripts' `CREATE TABLE` statements paired by the table they create,
+/// in order: only when every statement reads, no side creates one name
+/// twice, and the pairs keep both sides' order. `None` otherwise.
+fn tables_by_name(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit) -> Option<Vec<(usize, usize)>> {
+    let keys = |side: &Analyzed, u: &Unit| -> Option<Vec<(Option<String>, String)>> {
+        let ks = u
+            .tables
+            .iter()
+            .map(|(n, _)| {
+                table::created_name(&ast::tokens(n))
+                    .and_then(|name| table::table_key(&name, side.dialect()))
+                    .ok()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut seen = std::collections::BTreeSet::new();
+        ks.iter().all(|k| seen.insert(k.clone())).then_some(ks)
+    };
+    let (ka, kb) = (keys(a, ua)?, keys(b, ub)?);
+    let pairs = crate::normalize::lcs_pairs(&ka, &kb);
+    // Every name both sides create is paired: otherwise the order differs.
+    let common = ka.iter().filter(|k| kb.contains(k)).count();
+    (pairs.len() == common).then_some(pairs)
+}
+
 /// Compares the scripts' `CREATE TABLE` statements, in order (`table.rs`).
 #[allow(clippy::too_many_arguments)]
 fn tables(
@@ -906,7 +930,24 @@ fn tables(
         return;
     }
     let (na, nb) = (side_name(a), side_name(b));
-    if ua.tables.len() != ub.tables.len() {
+    let pairs: Vec<(usize, usize)> = if ua.tables.len() == ub.tables.len() {
+        (0..ua.tables.len()).map(|i| (i, i)).collect()
+    } else if let Some(pairs) = tables_by_name(a, b, ua, ub) {
+        // A table one side does not create (a statement the conversion
+        // did not convert) is not compared; the others meet their own
+        // counterparts.
+        for (side, u, name, is_a) in [(a, ua, &na, true), (b, ub, &nb, false)] {
+            for (i, (node, _)) in u.tables.iter().enumerate() {
+                if !pairs.iter().any(|p| if is_a { p.0 == i } else { p.1 == i }) {
+                    out.unknown_reasons.push(format!(
+                        "{name} line {}: a CREATE TABLE is not compared: the other side creates no table of that name",
+                        side.line_of(node)
+                    ));
+                }
+            }
+        }
+        pairs
+    } else {
         for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
             for (node, _) in &u.tables {
                 out.unknown_reasons.push(format!(
@@ -918,8 +959,11 @@ fn tables(
             }
         }
         return;
-    }
-    for ((xa, pa), (xb, pb)) in ua.tables.iter().zip(&ub.tables) {
+    };
+    for (xa, pa, xb, pb) in pairs.iter().map(|&(i, j)| {
+        let ((xa, pa), (xb, pb)) = (&ua.tables[i], &ub.tables[j]);
+        (xa, pa, xb, pb)
+    }) {
         let (la, lb) = (a.line_of(xa), b.line_of(xb));
         let unknown = |out: &mut Outcome, why: String| {
             out.unknown_reasons.push(format!(
@@ -1398,6 +1442,33 @@ fn ddl_stmts(
                 continue;
             }
         }
+        // A table's default or DROP comes after the file creates the table
+        // on both sides, or on neither.
+        let table_named = |dd: &ddl::Ddl| match dd {
+            ddl::Ddl::Default(x) => Some(x.table.clone()),
+            ddl::Ddl::Drop(x) if x.kind == "TABLE" => Some(x.name.clone()),
+            _ => None,
+        };
+        if let (Some(nx), Some(ny)) = (table_named(dx), table_named(dy)) {
+            let created_before = |side: &Analyzed, u: &Unit, n: &[table::Name], at: &SyntaxNode| {
+                let d = side.dialect();
+                let want = ddl::stored_key(n, d).ok();
+                u.tables.iter().any(|(t, _)| {
+                    table::created_name(&ast::tokens(t))
+                        .ok()
+                        .and_then(|c| ddl::stored_key(&c, d).ok())
+                        == want
+                        && t.text_range().start() < at.text_range().start()
+                })
+            };
+            if created_before(a, ua, &nx, x.node) != created_before(b, ub, &ny, y.node) {
+                unknown(
+                    out,
+                    "the file creates the table before it on one side and not on the other".into(),
+                );
+                continue;
+            }
+        }
         // PostgreSQL names are compared up to letter case only where no
         // other name differs from them only in case.
         let case_check = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {
@@ -1491,6 +1562,31 @@ fn ddl_stmts(
                         at,
                         ids,
                     );
+                }
+                ddl::Event::Default { a: ea, b: eb, at } => {
+                    let select = |e: &[ast::Tok]| {
+                        let mut v = vec![synth(K::Word, "SELECT")];
+                        v.extend(e.iter().cloned());
+                        v
+                    };
+                    match same_stmt(&select(&ea), &select(&eb), ua, ub, sa, sb, &na, &nb) {
+                        Same::Yes(xs) => xs.into_iter().for_each(|x| add(&mut asms, x)),
+                        Same::No(class, rule, w) => {
+                            found = true;
+                            finding(
+                                out,
+                                rule,
+                                class,
+                                format!("Column defaults (A line {la}, B line {lb}) differ: {w}"),
+                                at,
+                                Vec::new(),
+                            );
+                        }
+                        Same::Unknown(w) => {
+                            decided = false;
+                            unknown(out, format!("the defaults were not shown equal: {w}"));
+                        }
+                    }
                 }
                 ddl::Event::Filter {
                     unique,

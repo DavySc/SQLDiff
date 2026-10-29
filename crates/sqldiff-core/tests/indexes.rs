@@ -473,8 +473,8 @@ fn a_partition_scheme_shapes_only_storage() {
 fn statements_beside_several_routines_are_each_reported() {
     // A file with two routines is not compared; the statements outside them
     // must not count as compared either.
-    let a = "CREATE SCHEMA Sales;\nGO\nCREATE PROCEDURE dbo.A AS SELECT 1;\nGO\nCREATE PROCEDURE dbo.B AS SELECT 2;\nGO\nDROP TABLE dbo.Old;\n";
-    let b = "CREATE SCHEMA Salesx;\nCREATE PROCEDURE A() LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE PROCEDURE B() LANGUAGE sql AS $$ SELECT 2 $$;\nDROP TABLE Old;\n";
+    let a = "CREATE SCHEMA Sales;\nGO\nCREATE PROCEDURE dbo.A AS SELECT 1;\nGO\nCREATE PROCEDURE dbo.B AS SELECT 2;\nGO\nTRUNCATE TABLE dbo.Old;\n";
+    let b = "CREATE SCHEMA Salesx;\nCREATE PROCEDURE A() LANGUAGE sql AS $$ SELECT 1 $$;\nCREATE PROCEDURE B() LANGUAGE sql AS $$ SELECT 2 $$;\nTRUNCATE TABLE Old;\n";
     let r = run(a, b);
     assert!(rules(&r).contains(&"equiv.schema-name"), "{:?}", rules(&r));
     assert!(
