@@ -309,7 +309,7 @@ id = "ASM-DATEADD-RANGE"
 statement = "DATEADD results stay within the range of their type."
 discharge = "deployment"
 fact = "The data never moves a date past the type's range."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-DATEADD-TIME-WRAP"
@@ -323,7 +323,7 @@ id = "ASM-DATEADD-YEAR-END"
 statement = "T-SQL DATEADD clamps years and quarters to the month end as it does months (not checked)."
 discharge = "nothing"
 fact = "A check of the behaviour on SQL Server."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-DATETIME-PRECISION"

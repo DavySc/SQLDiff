@@ -62,6 +62,14 @@ pub mod asm {
         "ASM-UNTYPED-NONCHAR",
         "Values whose type is unknown (no catalog) are not character strings, real (single precision), T-SQL tinyint or decimals of 38 digits, so comparison and arithmetic mean the same on both sides",
     );
+    pub const DATEADD_RANGE: (&str, &str) = (
+        "ASM-DATEADD-RANGE",
+        "DATEADD results stay within the range of their type: T-SQL raises an error past 9999-12-31 (or before 0001-01-01), where PostgreSQL returns the date",
+    );
+    pub const DATEADD_YEAR_END: (&str, &str) = (
+        "ASM-DATEADD-YEAR-END",
+        "T-SQL DATEADD clamps years to the month end as it does months (2024-02-29 + 1 year = 2025-02-28), as PostgreSQL does; Microsoft documents the rule for months only",
+    );
     pub const UNTYPED_CAST: (&str, &str) = (
         "ASM-UNTYPED-CAST",
         "Values of unknown type (no catalog) that are cast to a number or string are integers, or strings cast to a string type, which convert the same on both sides (a decimal or float to an integer, a float to text and text to a number do not)",
@@ -1210,6 +1218,17 @@ impl<'a> Canon<'a> {
                 (n("bytes", vec![a(hex)]), None)
             }
             Expr::Cast(x, ty) => {
+                if let Expr::Bin(op, l, r) = x.as_ref() {
+                    if self.d == Dialect::Postgres
+                        && op == "+"
+                        && ty.name.eq_ignore_ascii_case("DATE")
+                        && ty.args.is_empty()
+                    {
+                        if let Some(t) = self.pg_date_add(l, r, true)? {
+                            return Ok(t);
+                        }
+                    }
+                }
                 let dst = Ty::from_type(ty, self.d, true);
                 // A string literal cast to a type whose conversion is modelled
                 // stands for the value it converts to ('12' as int is 12 on
@@ -1735,6 +1754,15 @@ impl<'a> Canon<'a> {
                     return self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty));
                 }
             }
+            (Dialect::Tsql, "dateadd") if argc == 3 && plain => {
+                if let Some(field) = dateadd_field(&c.args[0]) {
+                    let k = self.expr(&c.args[1])?;
+                    let d = self.expr(&c.args[2])?;
+                    if let Some(t) = self.date_add(field, k, d) {
+                        return Ok(t);
+                    }
+                }
+            }
             // CONVERT(varchar(n), x, style) of a date or date-time: the text
             // to_char prints with the matching format.
             (Dialect::Tsql, "convert") if argc == 3 && plain => {
@@ -2141,6 +2169,86 @@ impl<'a> Canon<'a> {
         })
     }
 
+    /// `d + n` (a number of days) or `d + make_interval(…)` in PostgreSQL,
+    /// as the `date-add` T-SQL DATEADD lowers to. `to_date`: the sum is
+    /// cast to date, which turns PostgreSQL's timestamp result of a date
+    /// plus an interval back into a date. `None` for any other sum.
+    fn pg_date_add(&mut self, l: &Expr, r: &Expr, to_date: bool) -> R<Option<(Term, Option<Ty>)>> {
+        let interval = match r {
+            Expr::Call(c) if is_make_interval(c) => Some(c),
+            _ => None,
+        };
+        // Only these two shapes; anything else is lowered as it was.
+        if interval.is_none() && to_date {
+            return Ok(None);
+        }
+        let d = self.expr(l)?;
+        let is_date = d.1.is_some_and(|t| t.fam == Fam::Date);
+        let (field, k) = match interval {
+            Some(c) => {
+                // Exactly one amount other than a zero literal.
+                let given: Vec<usize> = (0..c.args.len())
+                    .filter(|&i| !is_zero_literal(&c.args[i]))
+                    .collect();
+                let [i] = given.as_slice() else {
+                    return Ok(None);
+                };
+                // date + interval is a timestamp: only its cast back to date
+                // is DATEADD on a date.
+                if is_date != to_date {
+                    return Ok(None);
+                }
+                (MAKE_INTERVAL_FIELDS[*i], self.expr(&c.args[*i])?)
+            }
+            None if is_date => ("days", self.expr(r)?),
+            None => return Ok(None),
+        };
+        Ok(self.date_add(field, k, d))
+    }
+
+    /// DATEADD of `k` `field`s (`years` … `secs`, PostgreSQL's
+    /// make_interval names) to `d`, where both engines give the same
+    /// value: `k` an integer of at most 32 bits (T-SQL converts other
+    /// numbers to int, truncating; PostgreSQL's secs keeps a fraction), and
+    /// `d` a date (whole days or longer; T-SQL rejects smaller parts) or a
+    /// timestamp without T-SQL's datetime/smalldatetime ticks, which round.
+    /// Both add months by moving a day the month lacks to its last day,
+    /// and add hours, minutes and seconds exactly. The result has `d`'s
+    /// type, as in T-SQL.
+    fn date_add(
+        &mut self,
+        field: &str,
+        k: (Term, Option<Ty>),
+        d: (Term, Option<Ty>),
+    ) -> Option<(Term, Option<Ty>)> {
+        let (kt, kty) = k;
+        let (dt, dty) = d;
+        let kty = kty?;
+        if kty.fam != Fam::Int || kty.len.map_or(true, |b| b > 32) {
+            return None;
+        }
+        let dty = dty?;
+        let ok = match dty.fam {
+            Fam::Date => matches!(field, "years" | "months" | "weeks" | "days"),
+            Fam::Timestamp => dty.scale.is_none(),
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+        // A week is seven days on both sides; a literal count is folded so
+        // `d + 14` meets two weeks.
+        let (field, kt) = match (field, int_literal(&kt)) {
+            ("weeks", Some(w)) => ("days", n("num", vec![a((w * 7).to_string())])),
+            _ => (field, kt),
+        };
+        self.assume(asm::DATEADD_RANGE);
+        if field == "years" {
+            self.assume(asm::DATEADD_YEAR_END);
+        }
+        Some((n("date-add", vec![a(field), kt, dt]), Some(dty)))
+    }
+
     /// A date part as an integer: `year`, `month`, `day`, `hour`,
     /// `minute`, `second` (truncated) or `dow` (Sunday 0), of a date,
     /// timestamp (without time zone) or time where both dialects define it.
@@ -2218,6 +2326,11 @@ impl<'a> Canon<'a> {
     }
 
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
+        if self.d == Dialect::Postgres && op == "+" {
+            if let Some(t) = self.pg_date_add(l, r, false)? {
+                return Ok(t);
+            }
+        }
         if op == "AND" || op == "OR" {
             let mut parts = Vec::new();
             for side in [l, r] {
@@ -3201,11 +3314,12 @@ impl<'a> Canon<'a> {
                 returning_into,
                 on_conflict,
             } => {
-                if cols.is_empty() {
-                    return Err("INSERT without a column list".into());
-                }
                 let table = self.table_key(target);
-                let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
+                let cols: Vec<String> = if cols.is_empty() {
+                    self.all_columns(&table, source)?
+                } else {
+                    cols.iter().map(|c| lc(c)).collect()
+                };
                 if let Some((keys, action)) = on_conflict {
                     return self.on_conflict(&table, &cols, source, keys, action, returning);
                 }
@@ -3323,8 +3437,43 @@ impl<'a> Canon<'a> {
             Stmt::Message(Expr::Str(s)) if s.chars().count() <= 4000 => {
                 Ok(n("message", vec![n("str", vec![a(s.clone())])]))
             }
-            Stmt::Message(_) => Err("a message that is not a string literal".into()),
+            Stmt::Message(e) => self.print(e),
         }
+    }
+
+    /// A message that is an expression: T-SQL `PRINT e`, PL/pgSQL
+    /// `RAISE NOTICE '%', e`. Only a variable-length string or an integer,
+    /// whose text is the same on both sides: PRINT converts an integer to
+    /// its digits, as PostgreSQL shows it. A NULL shows as an empty line in
+    /// T-SQL and as `<NULL>` in PostgreSQL, which is part of the term, so a
+    /// T-SQL PRINT meets `RAISE NOTICE '%', COALESCE(e, '')`. PRINT cuts a
+    /// message off after 8,000 bytes (4,000 characters for nvarchar), so the
+    /// T-SQL string must be declared at most 4,000 characters long.
+    fn print(&mut self, e: &Expr) -> R<Term> {
+        let (t, ty) = self.expr(e)?;
+        let Some(ty) = ty else {
+            return Err("a message value of unknown type".into());
+        };
+        let null = match self.d {
+            Dialect::Tsql => "",
+            Dialect::Postgres => "<NULL>",
+            Dialect::Db2i => return Err("a message that is not a string literal".into()),
+        };
+        let head = match ty.fam {
+            Fam::VarChar if self.d != Dialect::Tsql || ty.len.is_some_and(|l| l <= 4000) => {
+                "msg-str"
+            }
+            Fam::VarChar => {
+                return Err("a PRINT value that may be longer than 4,000 characters".into())
+            }
+            Fam::Int => "msg-int",
+            _ => {
+                return Err(
+                    "a message value that is not a variable-length string or an integer".into(),
+                )
+            }
+        };
+        Ok(n("message", vec![n(head, vec![t, a(null)])]))
     }
 
     /// A message or raised error a format builds (`lower::Msg`): the text
@@ -3356,6 +3505,10 @@ impl<'a> Canon<'a> {
                     };
                     let (head, width) = match (spec, ty.fam) {
                         (Spec::Str, Fam::VarChar) => ("msg-str", ty.len.map(|l| l as usize)),
+                        // PostgreSQL `CAST(x AS text)` of a string is its text.
+                        (Spec::Int, Fam::VarChar) if !m.tsql => {
+                            ("msg-str", ty.len.map(|l| l as usize))
+                        }
                         (Spec::Int, Fam::Int)
                             if self.d != Dialect::Tsql || ty.len.is_some_and(|b| b <= 32) =>
                         {
@@ -3499,8 +3652,11 @@ impl<'a> Canon<'a> {
         let assigns: Vec<&SelItem> = sel.items.iter().filter(|i| i.assign.is_some()).collect();
         if !assigns.is_empty() {
             // T-SQL `SELECT @v = col FROM ...`: keeps the last row; zero rows leave @v unchanged.
-            if assigns.len() != sel.items.len() || assigns.len() != 1 {
-                return Err("SELECT assigning several variables is not supported".into());
+            if assigns.len() != sel.items.len() {
+                return Err("SELECT mixing assignments with other items".into());
+            }
+            if assigns.len() > 1 {
+                return self.assign_row(sel);
             }
             if let Some((var, v)) = sel.bare_assign() {
                 return self.stmt(&Stmt::Assign(var, v.clone()));
@@ -3546,6 +3702,121 @@ impl<'a> Canon<'a> {
             ) => Err("SELECT without INTO in PL/pgSQL".into()),
             _ => self.resultset(sel),
         }
+    }
+
+    /// The columns an INSERT without a column list fills: every column of
+    /// the table, in the catalog's order. Only for a table without identity
+    /// or computed columns: T-SQL leaves those out of the list, PostgreSQL
+    /// fills them too. The values must then match the columns one for one
+    /// (`insert_row`, `insert`), where PostgreSQL would also accept fewer.
+    fn all_columns(&self, table: &str, source: &InsertSource) -> R<Vec<String>> {
+        if matches!(source, InsertSource::Default) {
+            return Ok(Vec::new());
+        }
+        let temp;
+        let t = match table.strip_prefix("temp:") {
+            Some(_) => {
+                temp = self.temp_table(table);
+                temp.as_ref()
+            }
+            None => self.schema.table_exact(
+                table.rsplit_once('.').map(|(s, _)| s),
+                Self::base_table(table),
+            ),
+        };
+        let Some(t) = t else {
+            return Err(
+                "INSERT without a column list into a table whose definition is not known".into(),
+            );
+        };
+        if t.columns.iter().any(|c| c.identity || c.generated) {
+            return Err(
+                "INSERT without a column list into a table with an identity or computed column"
+                    .into(),
+            );
+        }
+        if !t.complete || t.columns.is_empty() {
+            return Err(
+                "INSERT without a column list into a table whose columns are not all known".into(),
+            );
+        }
+        Ok(t.columns.iter().map(|c| c.name.clone()).collect())
+    }
+
+    /// The one table variable or temporary table of this unit (`DECLARE
+    /// @t TABLE (…)`, `CREATE TEMP TABLE t (…)`) that the key `temp:…`
+    /// names, read from its column list.
+    fn temp_table(&self, key: &str) -> Option<super::schema::Table> {
+        use sqldiff_syntax::abstract_syntax::K;
+        let mut found = Vec::new();
+        for (node, _) in &self.unit.table_vars {
+            let ts = sqldiff_syntax::abstract_syntax::tokens(node);
+            let open = ts.iter().position(|t| t.kind == K::LParen)?;
+            let parts: Vec<String> = match self.d {
+                Dialect::Tsql => ts.get(1).map(|t| vec![t.text.clone()])?,
+                Dialect::Postgres => {
+                    let at = ts.iter().position(|t| t.up == "TABLE")? + 1;
+                    ts[at..open]
+                        .iter()
+                        .filter(|t| t.kind != K::Dot)
+                        .map(|t| t.text.clone())
+                        .collect()
+                }
+                Dialect::Db2i => return None,
+            };
+            let (k, _) =
+                Self::table_name(&parts, &self.unit.other_temps, self.unit.routine.as_deref());
+            if k == key {
+                let text = node.text().to_string();
+                let from = ts[open].off - usize::from(node.text_range().start());
+                found.push(format!("CREATE TABLE t {}", text.get(from..)?));
+            }
+        }
+        let [ddl] = found.as_slice() else {
+            return None;
+        };
+        Schema::default().with_ddl(ddl, self.d).table("t").cloned()
+    }
+
+    /// T-SQL `SELECT @a = x, @b = y FROM …` (and the PL/pgSQL loop block
+    /// the conversion writes for it): each row assigns every variable, so
+    /// after the last row each holds that row's value, and with no row each
+    /// keeps its own, as for one variable. Each value goes through its
+    /// variable's assignment conversion. The pairs are kept in variable
+    /// order, which does not matter once no item reads an assigned
+    /// variable: T-SQL then assigns the same values in any order. A query
+    /// that reads one, or assigns a variable twice, is refused.
+    fn assign_row(&mut self, sel: &Select) -> R<Term> {
+        let mut targets = Vec::new();
+        for it in &sel.items {
+            let v = it.assign.clone().unwrap_or_default();
+            let (sym, ty) = self.target_sym(&Expr::Var(v))?;
+            if targets.iter().any(|(s, _)| *s == sym) {
+                return Err("SELECT assigning a variable twice".into());
+            }
+            targets.push((sym, ty));
+        }
+        let (mut parts, items) = self.query_parts(sel, QCtx::Into)?;
+        let mut pairs: Vec<(Term, Term)> = Vec::new();
+        for ((sym, ty), v) in targets.into_iter().zip(items) {
+            let v = self.conv_var(&ty, v).0;
+            pairs.push((sym, v));
+        }
+        let reads_target = parts
+            .iter()
+            .chain(pairs.iter().map(|(_, v)| v))
+            .any(|t| t.any(&|x| pairs.iter().any(|(s, _)| x == s)));
+        if reads_target {
+            return Err("SELECT reading a variable it assigns".into());
+        }
+        pairs.sort();
+        let (syms, vals): (Vec<Term>, Vec<Term>) = pairs.into_iter().unzip();
+        parts.insert(1, n("items", vals));
+        let q = n("q", parts);
+        Ok(n(
+            "assign-row",
+            vec![n("targets", syms), self.scalar(q, "last", "unchanged")],
+        ))
     }
 
     fn insert(&mut self, table: &str, cols: &[String], source: &InsertSource) -> R<Term> {
@@ -5238,4 +5509,61 @@ fn empty_query(q: &Select) -> Option<Vec<String>> {
         }] if plain && is_false && hints.is_empty() => Some(name.clone()),
         _ => None,
     }
+}
+
+/// PostgreSQL's make_interval parameters in order (the parser writes named
+/// arguments out by position); each one left out is zero.
+const MAKE_INTERVAL_FIELDS: [&str; 7] =
+    ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+
+fn is_make_interval(c: &Call) -> bool {
+    let builtin = match c.name.as_slice() {
+        [f] => f,
+        [s, f] if s.eq_ignore_ascii_case("pg_catalog") => f,
+        _ => return false,
+    };
+    builtin.eq_ignore_ascii_case("make_interval")
+        && (1..=MAKE_INTERVAL_FIELDS.len()).contains(&c.args.len())
+        && !c.distinct
+        && c.order.is_empty()
+        && !c.star
+        && !c.over
+        && !c.within_group
+}
+
+fn is_zero_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Num(s) if s.parse::<f64>().is_ok_and(|v| v == 0.0))
+}
+
+/// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
+/// amounts round (milliseconds and smaller) and quarters have none.
+fn dateadd_field(e: &Expr) -> Option<&'static str> {
+    let Expr::Name(p) = e else {
+        return None;
+    };
+    let [part] = p.as_slice() else {
+        return None;
+    };
+    // DATEADD adds days for dayofyear and weekday, as for day.
+    Some(match lc(part).as_str() {
+        "year" | "yy" | "yyyy" => "years",
+        "month" | "mm" | "m" => "months",
+        "week" | "wk" | "ww" => "weeks",
+        "dayofyear" | "dy" | "y" | "day" | "dd" | "d" | "weekday" | "dw" | "w" => "days",
+        "hour" | "hh" => "hours",
+        "minute" | "mi" | "n" => "mins",
+        "second" | "ss" | "s" => "secs",
+        _ => return None,
+    })
+}
+
+/// The value of an integer literal term (`num` or a negated one).
+fn int_literal(t: &Term) -> Option<i64> {
+    if t.is("neg") {
+        return t.kid(0).and_then(int_literal).map(|v| -v);
+    }
+    if !t.is("num") {
+        return None;
+    }
+    t.kid(0).and_then(Term::atom)?.parse().ok()
 }

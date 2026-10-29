@@ -247,6 +247,9 @@ pub struct Table {
     pub columns: Vec<Column>,
     /// Primary key and unique constraints or indexes, column names lower-cased.
     pub keys: Vec<Vec<String>>,
+    /// The catalog read every column (`catalog::Table::columns_known`), so
+    /// `columns` is the table's full column list in order.
+    pub complete: bool,
 }
 
 impl Table {
@@ -551,6 +554,7 @@ impl Schema {
                     name,
                     columns,
                     keys,
+                    complete: t.columns_known,
                 },
             );
         }

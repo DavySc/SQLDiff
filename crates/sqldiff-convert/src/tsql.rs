@@ -1764,8 +1764,25 @@ impl<'a> Cx<'a> {
             "PRINT" => {
                 let at = *s.get(1).ok_or(No("PRINT without a value".into()))?;
                 self.step_ts_with("tsql.stmt.print", &ts, "raise-notice");
-                let e = self.expr(&ts[at..]);
-                format!("RAISE NOTICE '%', {}", e.trim())
+                // PRINT shows NULL as an empty line, RAISE as <NULL>; RAISE
+                // shows any value through its text.
+                let end = ts
+                    .iter()
+                    .rposition(|t| t.sig() && t.k != SEMICOLON)
+                    .map_or(ts.len(), |j| j + 1);
+                let value = &ts[at..end.max(at)];
+                let e = self.expr(value);
+                let rest = self.expr(&ts[end.max(at)..]);
+                let e = e.trim();
+                let lit = matches!(sig(trimmed(value)).as_slice(), [i] if trimmed(value)[*i].k == STRING);
+                let shown = if lit {
+                    e.to_string()
+                } else if self.expr_dt(value) == Some(Dt::Text) {
+                    format!("COALESCE({e}, '')")
+                } else {
+                    format!("COALESCE(CAST({e} AS text), '')")
+                };
+                format!("RAISE NOTICE '%', {shown}{}", rest.trim())
             }
             "RETURN" => self.ret(&ts)?,
             "BREAK" | "CONTINUE" if self.db2() => {
