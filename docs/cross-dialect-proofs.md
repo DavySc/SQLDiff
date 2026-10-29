@@ -193,6 +193,23 @@ A failed call is a failed statement: in a procedure without `SET XACT_ABORT
 ON` or a rethrowing CATCH, T-SQL goes on with the next statement and
 PostgreSQL stops (`equiv.error-continues`).
 
+**Versioning switches.** T-SQL `ALTER TABLE t SET (SYSTEM_VERSIONING = OFF |
+ON (HISTORY_TABLE = h …))` and `DROP | ADD PERIOD FOR SYSTEM_TIME` against
+PostgreSQL `ALTER TABLE t ENABLE | DISABLE TRIGGER …` are paired like calls, by
+the table. The T-SQL catalog must show `t` created with `PERIOD FOR
+SYSTEM_TIME` and `SYSTEM_VERSIONING = ON`, with the period and history table
+the statement names; the PostgreSQL statement must switch exactly the triggers
+the converted CREATE TABLE names after the table: `t_versioning` and
+`t_versioning_truncate` disabled for OFF and enabled for ON, `t_period_update`
+disabled for DROP PERIOD and enabled for ADD PERIOD. Equal under
+`ASM-TEMPORAL-SWITCH` (those triggers are the converted versioning triggers,
+and the checks SQL Server makes on these statements are not relied on). `ALL`
+and `USER` are not compared. A write to a period column is compared as a
+plain write under `ASM-TEMPORAL-PERIOD-WRITE`; an INSERT that leaves a period
+column out, in a unit that switches the table's versioning or writes its
+period columns, is not compared (SQL Server takes the default or fails,
+PostgreSQL stores `-infinity`).
+
 **Comments.** The extended property's levels name the object: a schema; a
 table, view, procedure or function; a table's or view's column; a table's
 index or constraint. The PostgreSQL comment must name the same object, which
