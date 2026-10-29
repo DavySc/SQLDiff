@@ -277,6 +277,27 @@ fact = "The data never recurses deeper than the limit."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-CURSOR-GLOBAL"
+statement = "No error or RETURN leaves a T-SQL cursor declared without LOCAL open (it would stay in the session and the next DECLARE of it would fail)."
+discharge = "deployment"
+fact = "The routine is not left between the cursor's DECLARE and DEALLOCATE, or the database default is LOCAL cursors."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-CURSOR-ORDER"
+statement = "What a cursor loop does does not depend on the order of rows its ORDER BY leaves open."
+discharge = "nothing"
+fact = "A per-routine review of the loop, or an ORDER BY on a unique key."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-CURSOR-SNAPSHOT"
+statement = "A cursor loop fetches the rows its query gives at OPEN: no other session or trigger changes them during the loop, and the values do not depend on when a row is fetched."
+discharge = "deployment"
+fact = "No concurrent writers to the cursor's tables while the routine runs, and no time- or session-dependent functions in its query."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-DATALENGTH"
 statement = "DATALENGTH and octet_length count the same bytes (they differ for NVARCHAR: UTF-16 against UTF-8)."
 discharge = "deployment"
@@ -501,6 +522,13 @@ statement = "No value depends on the 7th fraction digit of the seconds: datetime
 discharge = "deployment"
 fact = "The data has at most microsecond precision."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/table.rs"]
+
+[[assumption]]
+id = "ASM-GRANT-PRINCIPAL"
+statement = "The target role a GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY outranks the grant."
+discharge = "deployment"
+fact = "How T-SQL users and roles map to PostgreSQL roles, and the DENY statements on the object."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]
 id = "ASM-HAND-WRITTEN"

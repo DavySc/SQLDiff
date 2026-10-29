@@ -11,6 +11,7 @@ pub mod ast;
 mod call;
 pub mod canon;
 pub mod compare;
+pub mod cursor;
 pub mod ddl;
 pub mod dynamic;
 pub mod edit;
@@ -99,6 +100,8 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
         c.reset();
         let mut nodes = vec![s.node.clone()];
         let res = match (&s.msg, &s.ast) {
+            // A statement of a cursor loop.
+            _ if s.cursor.is_some() => c.cursor_op(s.cursor.as_ref().unwrap()),
             // A message a format builds: compared as its text.
             (Some(m), _) => c.message(m),
             (None, Err(e)) => Err(e.clone()),
@@ -164,6 +167,11 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
         C::While(e) => (
             "ctl-while",
             e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
+        ),
+        // Both dialects' tests of the FETCH just before (`cursor.rs`).
+        C::FetchWhile(key) => (
+            "ctl-while",
+            Ok(vec![n("cursor-found", vec![a(key.clone())])]),
         ),
         C::Else => ("ctl-else", Ok(vec![])),
         C::End => ("ctl-end", Ok(vec![])),
@@ -381,6 +389,34 @@ fn compare_units(
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
     error_continues(a, b, ua, ub, &ia, &ib, out);
+    linked(a, b, ua, ub, out);
+}
+
+/// A statement compared as part of another (`Unit::linked`: a T-SQL
+/// cursor's DECLARE with its OPEN, its DEALLOCATE with its CLOSE) is not
+/// shown equivalent when that other is not.
+fn linked(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, out: &mut Outcome) {
+    for (side, u, is_a) in [(a, ua, true), (b, ub, false)] {
+        let name = side_name(side);
+        for (main, part) in &u.linked {
+            let (s, e) = cst::sig_range(main);
+            let at = side.line_of(main);
+            let prefix = format!("{name} line {at}:");
+            let undecided = out.unknown_reasons.iter().any(|r| r.starts_with(&prefix))
+                || out.findings.iter().any(|f| {
+                    let l = if is_a { &f.a } else { &f.b };
+                    f.verdict != Verdict::Equal
+                        && l.as_ref()
+                            .is_some_and(|l| l.byte_start < e && s < l.byte_end)
+                });
+            if undecided {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: compared as part of the statement at line {at}, which was not shown equivalent",
+                    side.line_of(part)
+                ));
+            }
+        }
+    }
 }
 
 /// With a conversion's trace, whether call `xn` (side A) and its
@@ -2185,6 +2221,32 @@ fn ddl_stmts(
         };
         if let Err(e) = case_check(a, ua, sa, dx).and_then(|_| case_check(b, ub, sb, dy)) {
             unknown(out, e);
+            continue;
+        }
+        // `GRANT … ON name` names a table in PostgreSQL; on the T-SQL side
+        // it might as well be a function, a procedure or a sequence. Only a
+        // table the file creates or the catalog has is compared.
+        let grant_table = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {
+            let ddl::Ddl::Grant(g) = dd else {
+                return true;
+            };
+            let d = side.dialect();
+            let Ok(want) = ddl::stored_key(&g.object, d) else {
+                return false;
+            };
+            u.tables.iter().any(|(n, _)| {
+                table::parse(&ast::tokens(n), d)
+                    .ok()
+                    .and_then(|t| ddl::stored_key(&t.name, d).ok())
+                    .as_ref()
+                    == Some(&want)
+            }) || s.table_exact(want.0.as_deref(), &want.1).is_some()
+        };
+        if !grant_table(a, ua, sa, dx) || !grant_table(b, ub, sb, dy) {
+            unknown(
+                out,
+                "GRANT on an object that is not a table the file creates or the catalog has".into(),
+            );
             continue;
         }
         let table_of = |d: &ddl::Ddl| match d {

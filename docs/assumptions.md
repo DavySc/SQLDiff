@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 51 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 92 |
-| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 28 |
-| | Total | 190 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 95 |
+| `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
+| | Total | 194 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -79,6 +79,9 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-CONCURRENT-WRITERS` | Other sessions can change the tables the routine reads while it runs. | `deployment` | Whether other sessions write the tables while the routine runs. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-CONSTRAINT-ROWS-VALID` | The rows already in the table satisfy a constraint that ALTER TABLE … CHECK CONSTRAINT turns on: PostgreSQL's VALIDATE CONSTRAINT checks them, T-SQL does not. | `deployment` | The table holds no row that breaks the constraint when the statement runs. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-CTE-MAXRECURSION` | A recursive CTE stays within T-SQL's recursion limit (the target has none). | `deployment` | The data never recurses deeper than the limit. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-CURSOR-GLOBAL` | No error or RETURN leaves a T-SQL cursor declared without LOCAL open (it would stay in the session and the next DECLARE of it would fail). | `deployment` | The routine is not left between the cursor's DECLARE and DEALLOCATE, or the database default is LOCAL cursors. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-CURSOR-ORDER` | What a cursor loop does does not depend on the order of rows its ORDER BY leaves open. | `nothing` | A per-routine review of the loop, or an ORDER BY on a unique key. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-CURSOR-SNAPSHOT` | A cursor loop fetches the rows its query gives at OPEN: no other session or trigger changes them during the loop, and the values do not depend on when a row is fetched. | `deployment` | No concurrent writers to the cursor's tables while the routine runs, and no time- or session-dependent functions in its query. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-DATALENGTH` | DATALENGTH and octet_length count the same bytes (they differ for NVARCHAR: UTF-16 against UTF-8). | `deployment` | The values measured hold no NVARCHAR data, or callers do not depend on the byte count. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DATEADD-RANGE` | DATEADD results stay within the range of their type. | `deployment` | The data never moves a date past the type's range. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DATEADD-TIME-WRAP` | T-SQL DATEADD on a time wraps around midnight (not documented, not checked). | `nothing` | A check of the behaviour on SQL Server. | `sqldiff-convert/src/tsql.rs` |
@@ -113,6 +116,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-EXTPROP-COMMENT` | Whoever reads the T-SQL extended property reads the target's comment instead (one unnamed comment per object). | `deployment` | The tools that read the property. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/call.rs` |
 | `ASM-FACT-*` | A vendor fact holds as tabled in the dialect profile (named by its number, e.g. ASM-FACT-V2). | `nothing` | The vendor fact checked on a real system (docs/vendor-facts-verification.md). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/equiv/literal.rs`<br>`sqldiff-core/src/ir/interp.rs` |
 | `ASM-FRACTIONAL-SECONDS` | No value depends on the 7th fraction digit of the seconds: datetime2(7) and time(7) values are whole microseconds (T-SQL keeps 7 digits, the target 6 and rounds the last). | `deployment` | The data has at most microsecond precision. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/table.rs` |
+| `ASM-GRANT-PRINCIPAL` | The target role a GRANT names stands for the same users as the T-SQL principal of that name, and no T-SQL DENY outranks the grant. | `deployment` | How T-SQL users and roles map to PostgreSQL roles, and the DENY statements on the object. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-HAND-WRITTEN` | A unit's output written by hand means what the source means, beyond what the check compares. | `nothing` | A reviewer reading the text against the source (a review decision, per unit). | `sqldiff-convert/src/tree.rs` |
 | `ASM-HEX-BINARY` | A 0x... constant is used as a binary value, not converted to a number. | `catalog` | The type of what the constant is compared with or stored into. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-IDENT-FOLD` | Names on both sides name the same objects after case folding: unquoted names, and quoted PostgreSQL names that no other name of the statement or catalog matches up to letter case. | `catalog` | The object names in both catalogs and the T-SQL catalog collation. (fact key `collation`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
