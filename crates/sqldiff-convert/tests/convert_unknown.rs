@@ -148,11 +148,11 @@ fn only_findings_about_the_pair_leave_a_unit_undecided() {
 
 #[test]
 fn a_statement_the_engine_never_compared_is_not_converted() {
-    // The engine does not model TRUNCATE TABLE: the rules' output for it
-    // may be right, but nothing compared it with the original.
-    let src = format!("{ORDERS}TRUNCATE TABLE dbo.Orders;\nGO\n");
+    // The engine does not model ALTER TABLE … ENABLE TRIGGER: the rules'
+    // output for it may be right, but nothing compared it with the original.
+    let src = format!("{ORDERS}ALTER TABLE dbo.Orders ENABLE TRIGGER ALL;\nGO\n");
     let c = convert(&src, Dialect::Postgres);
-    let at = src.find("TRUNCATE TABLE").unwrap();
+    let at = src.find("ALTER TABLE").unwrap();
     let u = c
         .units
         .iter()
@@ -165,7 +165,7 @@ fn a_statement_the_engine_never_compared_is_not_converted() {
         .iter()
         .find(|n| n.rule == sqldiff_convert::NOT_COMPARED)
         .unwrap_or_else(|| panic!("{:?}", u.notes));
-    assert!(n.text.contains("TRUNCATE"), "{}", n.text);
+    assert!(n.text.contains("ALTER TABLE"), "{}", n.text);
     // The table itself is compared, and converts.
     let t = c.units.iter().find(|u| u.src.start == 0).unwrap();
     assert!(t.status <= Status::Assumptions, "{:?}", t.notes);

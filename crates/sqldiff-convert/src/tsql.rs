@@ -4673,8 +4673,7 @@ impl<'a> Cx<'a> {
                     .collect();
                 let sep = self.pick(", ADD ", " ADD ");
                 return self.with_bit_cols(cols, |cx| {
-                    let defs: R<Vec<String>> =
-                        items.iter().map(|c| cx.constraint_def(c)).collect();
+                    let defs: R<Vec<String>> = items.iter().map(|c| cx.constraint_def(c)).collect();
                     Ok(format!("{head}{}", defs?.join(sep)))
                 });
             }

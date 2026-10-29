@@ -2000,6 +2000,30 @@ fn ddl_stmts(
             unknown(out, why.into());
             continue;
         }
+        // A TRUNCATE inside a branch, loop or handler is placed by count
+        // only; and a row count read after it may count it.
+        if matches!(dx, ddl::Ddl::Truncate(_)) {
+            if !runs_once(x.node) || !runs_once(y.node) {
+                unknown(out, "it sits inside a branch, loop or error handler".into());
+                continue;
+            }
+            let counts = |side: &Analyzed| {
+                side.root
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .any(|t| {
+                        let up = t.text().to_ascii_uppercase();
+                        matches!(up.as_str(), "@@ROWCOUNT" | "ROWCOUNT_BIG" | "ROW_COUNT")
+                    })
+            };
+            if counts(a) || counts(b) {
+                unknown(
+                    out,
+                    "the file reads a row count, which the statement may set".into(),
+                );
+                continue;
+            }
+        }
         // PostgreSQL names are compared up to letter case only where no
         // other name differs from them only in case.
         let case_check = |side: &Analyzed, u: &Unit, s: &Schema, dd: &ddl::Ddl| {

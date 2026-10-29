@@ -143,7 +143,11 @@ fn key_constraints_added_later_lose_clustered_and_sort_order() {
         Dialect::Postgres,
     )
     .unwrap();
-    assert!(c.units.iter().any(|u| u.status == Status::NotConverted), "{}", c.output);
+    assert!(
+        c.units.iter().any(|u| u.status == Status::NotConverted),
+        "{}",
+        c.output
+    );
 }
 
 #[test]
@@ -156,9 +160,16 @@ fn drop_trigger_is_refused_and_truncate_restarts_identity() {
     .unwrap();
     let out = &c.output;
     assert!(!out.contains("\nDROP TRIGGER"), "{out}");
-    assert!(out.contains("TRUNCATE TABLE dbo.Orders RESTART IDENTITY;") || out.contains("TRUNCATE TABLE Orders RESTART IDENTITY;"), "{out}");
+    assert!(
+        out.contains("TRUNCATE TABLE dbo.Orders RESTART IDENTITY;")
+            || out.contains("TRUNCATE TABLE Orders RESTART IDENTITY;"),
+        "{out}"
+    );
     assert_eq!(
-        c.units.iter().filter(|u| u.status == Status::NotConverted).count(),
+        c.units
+            .iter()
+            .filter(|u| u.status == Status::NotConverted)
+            .count(),
         1,
         "{out}"
     );
