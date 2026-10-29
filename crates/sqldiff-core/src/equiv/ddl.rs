@@ -1,7 +1,7 @@
 //! `CREATE INDEX`, `CREATE SEQUENCE` and `CREATE SCHEMA` compared across
 //! dialects: T-SQL against PostgreSQL or Db2 for i. Also, T-SQL against
-//! PostgreSQL only: `DROP TABLE / VIEW / PROCEDURE / FUNCTION / SEQUENCE /
-//! SCHEMA` and a column default added after the table
+//! PostgreSQL only: `GRANT`, `DROP TABLE / VIEW / PROCEDURE / FUNCTION /
+//! SEQUENCE / SCHEMA` and a column default added after the table
 //! (`ADD [CONSTRAINT n] DEFAULT v FOR c` against `ALTER COLUMN c SET DEFAULT v`).
 //!
 //! Like `table.rs`, each statement is read completely, and a clause the
@@ -24,7 +24,9 @@
 use sqldiff_syntax::Dialect;
 
 use super::ast::{Tok, K};
-use super::table::{close, dotted, filegroup, key, name_of, number, split, text, word, Name};
+use super::table::{
+    close, dotted, filegroup, key, name_of, number, split, text, text_name, word, Name,
+};
 
 type R<T> = Result<T, String>;
 
@@ -86,6 +88,20 @@ pub struct SchemaDef {
     pub off: usize,
 }
 
+/// `GRANT privileges ON table TO principals [WITH GRANT OPTION]` (T-SQL
+/// `ON [OBJECT::]name`): the object privileges both dialects grant one to
+/// one on a table or view.
+#[derive(Debug, Clone)]
+pub struct Grant {
+    pub dialect: Dialect,
+    /// Upper case, sorted.
+    pub privileges: Vec<String>,
+    pub object: Vec<Name>,
+    pub grantees: Vec<Name>,
+    pub grant_option: bool,
+    pub off: usize,
+}
+
 /// `DROP kind [IF EXISTS] name`: one object.
 #[derive(Debug, Clone)]
 pub struct DropDef {
@@ -127,6 +143,7 @@ pub enum Ddl {
     Index(Index),
     Sequence(Sequence),
     Schema(SchemaDef),
+    Grant(Grant),
     Drop(DropDef),
     Default(SetDefault),
     Truncate(Truncate),
@@ -138,6 +155,7 @@ impl Ddl {
             Ddl::Index(_) => "CREATE INDEX",
             Ddl::Sequence(_) => "CREATE SEQUENCE",
             Ddl::Schema(_) => "CREATE SCHEMA",
+            Ddl::Grant(_) => "GRANT",
             Ddl::Drop(d) => match d.kind {
                 "TABLE" => "DROP TABLE",
                 "VIEW" => "DROP VIEW",
@@ -153,11 +171,11 @@ impl Ddl {
 }
 
 /// Whether a statement's first words make it one of the statements this
-/// module reads (`CREATE … INDEX`, `CREATE SEQUENCE`, `CREATE SCHEMA`, and
-/// the `DROP` and `ALTER TABLE` of `is_drop_or_alter`).
+/// module reads (`CREATE … INDEX`, `CREATE SEQUENCE`, `CREATE SCHEMA`,
+/// `GRANT`, and the `DROP` and `ALTER TABLE` of `is_drop_or_alter`).
 pub fn is_ddl(words: &[String]) -> bool {
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
-    if is_drop_or_alter(words) {
+    if w(0) == "GRANT" || is_drop_or_alter(words) {
         return true;
     }
     if w(0) != "CREATE" {
@@ -275,6 +293,11 @@ pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
         Ddl::Schema(c) if c.dialect == Dialect::Postgres => {
             schema.case_check(&stored(&c.name), false)?;
         }
+        Ddl::Grant(g) if g.dialect == Dialect::Postgres => {
+            for n in &g.object {
+                schema.case_check(&stored(n), true)?;
+            }
+        }
         Ddl::Drop(x) if x.dialect == Dialect::Postgres => {
             for n in &x.name {
                 schema.case_check(&stored(n), x.kind == "TABLE")?;
@@ -312,6 +335,20 @@ pub fn pair_key(x: &Ddl) -> R<String> {
             format!("sequence {}.{n}", s.unwrap_or_default())
         }
         Ddl::Schema(s) => format!("schema {}", fold(&s.name, s.dialect)?),
+        Ddl::Grant(g) => {
+            let (s, o) = object_key(&g.object, g.dialect)?;
+            let to = g
+                .grantees
+                .iter()
+                .map(|n| fold(n, g.dialect))
+                .collect::<R<Vec<_>>>()?;
+            format!(
+                "grant {} on {}.{o} to {}",
+                g.privileges.join(","),
+                s.unwrap_or_default(),
+                to.join(",")
+            )
+        }
         Ddl::Drop(x) if x.kind == "SCHEMA" => {
             format!("drop schema {}", fold(&x.name[0], x.dialect)?)
         }
@@ -348,6 +385,9 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Ddl> {
     }
     if word(ts.first(), "TRUNCATE") {
         return truncate(ts, d).map(Ddl::Truncate);
+    }
+    if word(ts.first(), "GRANT") {
+        return grant(ts, d).map(Ddl::Grant);
     }
     if !word(ts.first(), "CREATE") {
         return Err("not a CREATE statement".into());
@@ -1044,6 +1084,130 @@ fn schema(ts: &[Tok], d: Dialect) -> R<SchemaDef> {
     })
 }
 
+/// The object privileges GRANT gives alike in T-SQL and PostgreSQL.
+const GRANT_PRIVILEGES: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE", "REFERENCES"];
+
+/// `GRANT p [, p] ON [OBJECT:: | TABLE] name TO g [, g] [WITH GRANT OPTION]`.
+/// Anything else (column lists, ALL, a schema, a database permission,
+/// EXECUTE, `AS`) is refused: its scope differs between the dialects.
+fn grant(ts: &[Tok], d: Dialect) -> R<Grant> {
+    if d == Dialect::Db2i {
+        return Err("GRANT on Db2 for i is not compared".into());
+    }
+    let mut privileges = Vec::new();
+    let mut i = 1;
+    loop {
+        let p = ts
+            .get(i)
+            .filter(|t| t.kind == K::Word)
+            .ok_or("GRANT without a privilege")?;
+        if !GRANT_PRIVILEGES.contains(&p.up.as_str()) {
+            return Err(format!(
+                "GRANT {} (only {} are compared)",
+                p.up,
+                GRANT_PRIVILEGES.join(", ")
+            ));
+        }
+        privileges.push(p.up.clone());
+        i += 1;
+        match ts.get(i) {
+            Some(t) if t.kind == K::Comma => i += 1,
+            Some(t) if t.kind == K::LParen => return Err("GRANT on columns".into()),
+            _ => break,
+        }
+    }
+    if !word(ts.get(i), "ON") {
+        return Err("GRANT of a database permission (no ON)".into());
+    }
+    i += 1;
+    match d {
+        Dialect::Tsql => {
+            if word(ts.get(i), "OBJECT") && ts.get(i + 1).is_some_and(|t| t.text == "::") {
+                i += 2;
+            } else if ts.get(i + 1).is_some_and(|t| t.text == "::") {
+                return Err(format!(
+                    "GRANT … ON {}:: (a permission on a whole class of objects)",
+                    ts[i].up
+                ));
+            }
+        }
+        _ => {
+            if word(ts.get(i), "TABLE") {
+                i += 1;
+            } else if ts.get(i).is_some_and(|t| {
+                t.kind == K::Word
+                    && matches!(
+                        t.up.as_str(),
+                        "ALL"
+                            | "SCHEMA"
+                            | "SEQUENCE"
+                            | "FUNCTION"
+                            | "PROCEDURE"
+                            | "ROUTINE"
+                            | "DATABASE"
+                            | "TYPE"
+                            | "DOMAIN"
+                            | "LANGUAGE"
+                            | "FOREIGN"
+                            | "LARGE"
+                            | "TABLESPACE"
+                            | "PARAMETER"
+                    )
+                    && ts
+                        .get(i + 1)
+                        .is_some_and(|n| matches!(n.kind, K::Word | K::Quoted))
+            }) {
+                return Err(format!("GRANT … ON {} (not a table)", ts[i].up));
+            }
+        }
+    }
+    let (object, j) = dotted(ts, i)?;
+    i = j;
+    if !word(ts.get(i), "TO") {
+        return Err(format!("GRANT with `{}`", text(&ts[i.min(ts.len())..])));
+    }
+    i += 1;
+    let mut grantees = Vec::new();
+    loop {
+        if ["GROUP", "CURRENT_USER", "SESSION_USER", "CURRENT_ROLE"]
+            .iter()
+            .any(|w| word(ts.get(i), w))
+        {
+            return Err(format!("GRANT TO {}", ts[i].up));
+        }
+        let g = ts
+            .get(i)
+            .and_then(name_of)
+            .ok_or("GRANT without a grantee")?;
+        grantees.push(g);
+        i += 1;
+        if ts.get(i).is_some_and(|t| t.kind == K::Comma) {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let mut grant_option = false;
+    if word(ts.get(i), "WITH") && word(ts.get(i + 1), "GRANT") && word(ts.get(i + 2), "OPTION") {
+        grant_option = true;
+        i += 3;
+    }
+    if i != ts.len() {
+        return Err(format!("GRANT with `{}`", text(&ts[i..])));
+    }
+    privileges.sort();
+    privileges.dedup();
+    grantees.sort_by_key(|n| n.text.to_lowercase());
+    Ok(Grant {
+        dialect: d,
+        privileges,
+        object,
+        grantees,
+        grant_option,
+        off: ts[0].off,
+    })
+}
+
 /// A key column's facts, from its table.
 #[derive(Debug, Clone)]
 pub struct ColFacts {
@@ -1102,6 +1266,10 @@ pub mod asm {
         "ASM-SEQUENCE-TYPE",
         "Expressions that use the sequence's next value do not depend on its data type beyond the values it hands out (T-SQL tinyint becomes smallint)",
     );
+    pub const GRANT_PRINCIPAL: (&str, &str) = (
+        "ASM-GRANT-PRINCIPAL",
+        "The target role a GRANT names stands for the same users as the T-SQL principal of that name (T-SQL compares principal names without letter case), and no T-SQL DENY on the object outranks the grant (PostgreSQL has no DENY)",
+    );
     pub const DROP_DEPENDENTS: (&str, &str) = (
         "ASM-DROP-NO-DEPENDENTS",
         "No view, routine or other object depends on the dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP (RESTRICT) where SQL Server drops a table or view under a view that is not schema-bound",
@@ -1112,7 +1280,7 @@ pub mod asm {
     );
     pub const TRUNCATE: (&str, &str) = (
         "ASM-TRUNCATE",
-        "TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no sequence other than an identity column's belongs to it (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe)",
+        "TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no ON TRUNCATE trigger is on the target table (T-SQL has none to fire), no sequence other than an identity column's belongs to it (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe)",
     );
     pub const SCHEMA_OWNER: (&str, &str) = (
         "ASM-SCHEMA-OWNER",
@@ -1139,6 +1307,7 @@ pub fn compare(
         (Ddl::Index(a), Ddl::Index(b)) => indexes(a, b, na, nb, cols, &mut ev),
         (Ddl::Sequence(a), Ddl::Sequence(b)) => sequences(a, b, na, nb, &mut ev),
         (Ddl::Schema(a), Ddl::Schema(b)) => schemas(a, b, na, nb, &mut ev),
+        (Ddl::Grant(a), Ddl::Grant(b)) => grants(a, b, na, nb, &mut ev),
         (Ddl::Drop(a), Ddl::Drop(b)) => drops(a, b, na, nb, &mut ev),
         (Ddl::Default(a), Ddl::Default(b)) => defaults(a, b, na, nb, &mut ev),
         (Ddl::Truncate(a), Ddl::Truncate(b)) => truncates(a, b, na, nb, &mut ev),
@@ -1717,6 +1886,72 @@ fn schemas(x: &SchemaDef, y: &SchemaDef, na: &str, nb: &str, ev: &mut Vec<Event>
         ev.push(Event::Note(format!(
             "CREATE SCHEMA on {on} also creates a library with a journal and SQL catalog views"
         )));
+    }
+    Ok(())
+}
+
+/// Two GRANTs give the same privileges on the same object to the same
+/// principals, with or without the right to grant them on.
+fn grants(x: &Grant, y: &Grant, na: &str, nb: &str, ev: &mut Vec<Event>) -> R<()> {
+    let (da, db) = (x.dialect, y.dialect);
+    if !matches!(
+        (da, db),
+        (Dialect::Tsql, Dialect::Postgres) | (Dialect::Postgres, Dialect::Tsql)
+    ) {
+        return Err("GRANT is compared only between T-SQL and PostgreSQL".into());
+    }
+    let at = (x.off, y.off);
+    ev.push(Event::Asm(super::canon::asm::IDENT_FOLD));
+    let names =
+        |g: &Grant| -> R<Vec<String>> { g.grantees.iter().map(|n| fold(n, g.dialect)).collect() };
+    let mut diffs = Vec::new();
+    if object_key(&x.object, da)? != object_key(&y.object, db)? {
+        diffs.push(format!(
+            "{na} grants on {} and {nb} on {}",
+            text_name(&x.object),
+            text_name(&y.object)
+        ));
+    }
+    if x.privileges != y.privileges {
+        diffs.push(format!(
+            "{na} grants {} and {nb} {}",
+            x.privileges.join(", "),
+            y.privileges.join(", ")
+        ));
+    }
+    if names(x)? != names(y)? {
+        diffs.push(format!(
+            "{na} grants to {} and {nb} to {}",
+            x.grantees
+                .iter()
+                .map(|n| n.text.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            y.grantees
+                .iter()
+                .map(|n| n.text.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if x.grant_option != y.grant_option {
+        diffs.push(format!(
+            "{} grants WITH GRANT OPTION and {} does not",
+            if x.grant_option { na } else { nb },
+            if x.grant_option { nb } else { na }
+        ));
+    }
+    if diffs.is_empty() {
+        ev.push(Event::Asm(asm::GRANT_PRINCIPAL));
+    } else {
+        ev.push(Event::Diff {
+            rule: "equiv.grant",
+            witness: format!(
+                "{}, so another set of users may run other statements on the object",
+                diffs.join("; ")
+            ),
+            at,
+        });
     }
     Ok(())
 }

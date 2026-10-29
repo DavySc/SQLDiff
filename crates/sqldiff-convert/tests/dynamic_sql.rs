@@ -156,3 +156,34 @@ fn db2_is_not_converted_yet() {
     assert_eq!(u.status, Status::NotConverted);
     assert!(reason(u).contains("Db2 for i"), "{}", reason(u));
 }
+
+#[test]
+fn sp_executesql_parameters_become_using() {
+    let src = proc("    DECLARE @a int = 1;\n    DECLARE @id int = 2;\n    EXEC sp_executesql N'UPDATE dbo.t SET a = @v WHERE id = @k', N'@v int, @k int', @v = @a, @k = @id;");
+    let c = pg(&src);
+    assert!(
+        c.output
+            .contains("EXECUTE 'UPDATE t SET a = $1 WHERE id = $2' USING v_a, v_id;"),
+        "{}",
+        c.output
+    );
+    let u = unit(&c, &src, "sp_executesql");
+    assert_eq!(u.status, Status::Assumptions, "{:?}\n{}", u.notes, c.output);
+}
+
+#[test]
+fn parameters_passed_with_a_conversion_are_not_converted() {
+    // A bigint passed to an int parameter: T-SQL converts it as it passes it.
+    let src = proc("    DECLARE @b bigint = 1;\n    EXEC sp_executesql N'UPDATE dbo.t SET a = @v WHERE id = 1', N'@v int', @v = @b;");
+    let c = pg(&src);
+    let u = unit(&c, &src, "sp_executesql");
+    assert_eq!(u.status, Status::NotConverted);
+    assert!(reason(u).contains("parameter's own type"), "{}", reason(u));
+    // A literal value.
+    let src =
+        proc("    EXEC sp_executesql N'UPDATE dbo.t SET a = @v WHERE id = 1', N'@v int', @v = 3;");
+    let c = pg(&src);
+    let u = unit(&c, &src, "sp_executesql");
+    assert_eq!(u.status, Status::NotConverted);
+    assert!(reason(u).contains("not a variable"), "{}", reason(u));
+}
