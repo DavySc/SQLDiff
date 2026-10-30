@@ -629,8 +629,8 @@ pub struct ReadCol {
     /// nor `NOT NULL` reads as nullable, the weaker claim.
     pub not_null: bool,
     /// A column of the primary key the `CREATE TABLE` declares; none when
-    /// the key is `DEFERRABLE` (a PostgreSQL deferred key may hold two
-    /// equal keys until the transaction commits).
+    /// the statement says `DEFERRABLE` or `INITIALLY` anywhere (a PostgreSQL
+    /// deferred key may hold two equal keys until the transaction commits).
     pub key: bool,
 }
 
@@ -688,7 +688,18 @@ struct ColFacts {
 }
 
 fn col_facts(t: &[Tok]) -> ColFacts {
-    let w = top_words(t);
+    // The words of a `CASE ... END` in a default (`DEFAULT CASE WHEN 1 IS
+    // NOT NULL THEN 1 END`) say nothing of the column: left out.
+    let mut w = Vec::new();
+    let mut case = 0usize;
+    for x in top_words(t) {
+        match x.1 {
+            "CASE" => case += 1,
+            "END" if case > 0 => case -= 1,
+            _ if case == 0 => w.push(x),
+            _ => {}
+        }
+    }
     let word = |k: usize| w.get(k).map(|x| x.1);
     let mut f = ColFacts {
         pk: false,
@@ -696,6 +707,10 @@ fn col_facts(t: &[Tok]) -> ColFacts {
         null: false,
         opaque: false,
     };
+    if case > 0 {
+        // An unclosed `CASE`: nothing after it was read.
+        f.opaque = true;
+    }
     for (k, &(_, x)) in w.iter().enumerate() {
         match x {
             "PRIMARY" if word(k + 1) == Some("KEY") => f.pk = true,
@@ -703,11 +718,17 @@ fn col_facts(t: &[Tok]) -> ColFacts {
             "NULL" if !(k > 0 && matches!(word(k - 1), Some("DEFAULT" | "SET"))) => f.null = true,
             "COLLATE" | "MASKED" | "ENCRYPTED" | "SPARSE" | "FILESTREAM" | "ROWGUIDCOL"
             | "HIDDEN" | "PERSISTED" | "STORED" | "VIRTUAL" => f.opaque = true,
-            // `GENERATED ... AS IDENTITY` is an identity column, whose values
-            // are ordinary integers once stored; any other `GENERATED` (a
-            // PostgreSQL generated column, a T-SQL period column) is opaque.
+            // Exactly `GENERATED {ALWAYS | BY DEFAULT} AS IDENTITY` is an
+            // identity column, whose values are ordinary integers once
+            // stored; any other `GENERATED` (a PostgreSQL generated column,
+            // also one followed by a constraint named `identity`, a T-SQL
+            // period column) is opaque.
             "GENERATED" => {
-                let ident = w[k + 1..].iter().take(4).any(|&(_, y)| y == "IDENTITY");
+                let next: Vec<&str> = w[k + 1..].iter().take(4).map(|&(_, y)| y).collect();
+                let ident = matches!(
+                    next.as_slice(),
+                    ["ALWAYS", "AS", "IDENTITY", ..] | ["BY", "DEFAULT", "AS", "IDENTITY", ..]
+                );
                 if !ident {
                     f.opaque = true;
                 }
@@ -716,6 +737,35 @@ fn col_facts(t: &[Tok]) -> ColFacts {
         }
     }
     f
+}
+
+/// (C3d part 2) The element (of `CREATE TABLE`, or what `ALTER TABLE ...
+/// ADD` adds) starting at `e` is a constraint, an inline index or a
+/// period, not a column. `named`: it follows `CONSTRAINT name`, after which
+/// only a constraint may stand. Words reserved in both dialects (`UNIQUE`,
+/// `CHECK`, `FOREIGN`, `PRIMARY KEY`) always start one; the others only in
+/// their dialect and form, since there they may be a column's name
+/// (PostgreSQL `ALTER TABLE t ADD exclude integer` adds a column):
+/// PostgreSQL `EXCLUDE` followed by `USING` or `(`; T-SQL `PERIOD FOR`
+/// (`PERIOD FOR SYSTEM_TIME`) and T-SQL `INDEX` (an inline index, a
+/// reserved word there).
+fn constraint_head(e: &[Tok], d: Dialect, named: bool) -> bool {
+    let up = |i: usize| {
+        e.get(i)
+            .filter(|x| x.kind == K::Word)
+            .map(|x| x.up.as_str())
+    };
+    match up(0) {
+        Some("UNIQUE" | "CHECK" | "FOREIGN") => true,
+        Some("PRIMARY") => up(1) == Some("KEY"),
+        Some("EXCLUDE") => {
+            d == Dialect::Postgres
+                && (up(1) == Some("USING") || e.get(1).is_some_and(|x| x.kind == K::LParen))
+        }
+        Some("PERIOD") => d == Dialect::Tsql && !named && up(1) == Some("FOR"),
+        Some("INDEX") => d == Dialect::Tsql && !named,
+        _ => false,
+    }
 }
 
 /// After a column's type: the words that may start what follows it in a
@@ -795,14 +845,13 @@ pub fn read_only(n: &SyntaxNode, d: Dialect) -> Result<ReadTable, String> {
             continue;
         }
         let up = q.peek().map(|x| x.up.clone()).unwrap_or_default();
-        let constraint = q.peek().is_some_and(|x| x.kind == K::Word)
-            && matches!(
-                up.as_str(),
-                "UNIQUE" | "CHECK" | "FOREIGN" | "EXCLUDE" | "INDEX" | "PERIOD"
-            );
-        if constraint {
-            // A constraint, an inline index or the period of a system-versioned
-            // table: no read sees it.
+        // A constraint, an inline index or the period of a system-versioned
+        // table: no read sees it. `UNIQUE`, `CHECK` and `FOREIGN` are
+        // reserved in both dialects; `EXCLUDE`, `PERIOD` and (PostgreSQL)
+        // `INDEX` are not, so `exclude integer` is a column: each counts
+        // only in its dialect and its form (`constraint_head`).
+        let named = q.pos() != 0;
+        if q.peek().is_some_and(|x| x.kind == K::Word) && constraint_head(&e[q.pos()..], d, named) {
             continue;
         }
         if up == "LIKE" && q.peek().is_some_and(|x| x.kind == K::Word) {
@@ -907,17 +956,20 @@ pub fn read_only(n: &SyntaxNode, d: Dialect) -> Result<ReadTable, String> {
             return Err(q.err("a table option"));
         }
     }
-    // Any `DEFERRABLE` (not `NOT DEFERRABLE`) in the statement, on the key
-    // or not: the table then has no key here.
+    // Any `DEFERRABLE` (not `NOT DEFERRABLE`) or `INITIALLY` in the
+    // statement, on the key or not: the table then has no key here.
+    // `INITIALLY DEFERRED` alone makes a PostgreSQL key deferrable
+    // (`condeferrable`), and a deferred key may hold two equal keys inside
+    // a caller's transaction; `NOT DEFERRABLE INITIALLY IMMEDIATE` is
+    // refused with it, the weaker reading.
     let words: Vec<&str> = t
         .iter()
         .filter(|x| x.kind == K::Word)
         .map(|x| x.up.as_str())
         .collect();
-    let deferrable = words
-        .iter()
-        .enumerate()
-        .any(|(k, x)| *x == "DEFERRABLE" && (k == 0 || words[k - 1] != "NOT"));
+    let deferrable = words.iter().enumerate().any(|(k, x)| {
+        *x == "INITIALLY" || (*x == "DEFERRABLE" && (k == 0 || words[k - 1] != "NOT"))
+    });
     if let Some(k) = key {
         for c in k {
             let col = cols
@@ -974,7 +1026,8 @@ pub fn creates_other_table(n: &SyntaxNode, d: Dialect) -> Option<Vec<String>> {
 /// (`cert.rs`, `Tables::read`): an index of any kind (not T-SQL
 /// `DROP_EXISTING`, which may rebuild the key's index); `ALTER TABLE` that
 /// adds one constraint (`CHECK`, `UNIQUE`, `FOREIGN KEY`, `PRIMARY KEY`,
-/// T-SQL `DEFAULT ... FOR`, PostgreSQL `EXCLUDE`), validates or turns on or
+/// T-SQL `DEFAULT ... FOR`, PostgreSQL `EXCLUDE USING` or `EXCLUDE (`, as
+/// `constraint_head` tells them from a column), validates or turns on or
 /// off a constraint check (`[NO]CHECK CONSTRAINT`, `VALIDATE CONSTRAINT`),
 /// or enables or disables triggers; T-SQL `ENABLE`/`DISABLE TRIGGER`;
 /// PostgreSQL `CREATE TRIGGER` and `CREATE VIEW` (T-SQL triggers and views
@@ -1088,20 +1141,16 @@ fn alter_leaves_reads(t: &[Tok], d: Dialect) -> Result<bool, String> {
         if top_comma {
             return Ok(false);
         }
-        if p.eat_kw("CONSTRAINT") {
+        let named = p.eat_kw("CONSTRAINT");
+        if named {
             p.ident()?;
         }
-        let ok = match p
-            .peek()
-            .filter(|x| x.kind == K::Word)
-            .map(|x| x.up.as_str())
-        {
-            Some("CHECK" | "UNIQUE" | "FOREIGN") => true,
-            Some("PRIMARY") => p.is_kw_at(1, "KEY"),
-            Some("DEFAULT") => d == Dialect::Tsql,
-            Some("EXCLUDE") => d == Dialect::Postgres,
-            _ => false,
-        };
+        // T-SQL `ADD [CONSTRAINT n] DEFAULT v FOR c` (`DEFAULT` is reserved);
+        // no period or index is added here.
+        let ok = (d == Dialect::Tsql && p.is_kw("DEFAULT"))
+            || (p.peek().is_some_and(|x| x.kind == K::Word)
+                && !matches!(p.peek().map(|x| x.up.as_str()), Some("PERIOD" | "INDEX"))
+                && constraint_head(&t[p.pos()..], d, named));
         return Ok(ok);
     }
     // `[NO]CHECK CONSTRAINT {ALL | name, ...}`, `{ENABLE | DISABLE} TRIGGER
@@ -1707,6 +1756,148 @@ mod tests {
         ] {
             assert!(ro(sql, d).is_err(), "{sql}");
         }
+    }
+
+    /// C3d part 2, review: a word that starts a constraint in one dialect or
+    /// form may be a column's name; read as a constraint, the column list
+    /// would miss a real column and the checker an ambiguity (PostgreSQL
+    /// 42702 confirmed as equal).
+    #[test]
+    fn constraint_words_that_name_columns_are_columns() {
+        let names = |t: &ReadTable| t.cols.iter().map(|c| c.name.clone()).collect::<Vec<_>>();
+        let t = ro(
+            "CREATE TABLE t1 (id integer PRIMARY KEY, exclude integer, period integer, index integer, \
+             CONSTRAINT ex EXCLUDE USING gist (id WITH =), EXCLUDE (id WITH =));",
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(names(&t), ["id", "exclude", "period", "index"]);
+        assert!(t.cols[1..].iter().all(|c| c.ty == Some(ColType::Int)));
+        let t = ro(
+            "CREATE TABLE dbo.T2 (K int NOT NULL PRIMARY KEY, period int NOT NULL, exclude int NULL, \
+             [index] int NULL, INDEX ix NONCLUSTERED (K));",
+            Dialect::Tsql,
+        )
+        .unwrap();
+        assert_eq!(names(&t), ["K", "period", "exclude", "index"]);
+        // The T-SQL period and the PostgreSQL exclusion constraint still read
+        // as no column.
+        let t = ro(
+            "CREATE TABLE dbo.T3 (K int NOT NULL PRIMARY KEY, \
+             F datetime2(7) GENERATED ALWAYS AS ROW START NOT NULL, \
+             T datetime2(7) GENERATED ALWAYS AS ROW END NOT NULL, PERIOD FOR SYSTEM_TIME (F, T));",
+            Dialect::Tsql,
+        )
+        .unwrap();
+        assert_eq!(names(&t), ["K", "F", "T"]);
+        // Not a constraint in the other dialect: a column (opaque, its type
+        // unread) or refused, never skipped.
+        assert!(ro(
+            "CREATE TABLE t (a int NULL, EXCLUDE (a WITH =));",
+            Dialect::Tsql
+        )
+        .map_or(true, |t| names(&t).contains(&"EXCLUDE".to_string())));
+        assert!(ro(
+            "CREATE TABLE t (a integer, PERIOD FOR SYSTEM_TIME (a, a));",
+            Dialect::Postgres
+        )
+        .map_or(true, |t| names(&t).contains(&"PERIOD".to_string())));
+        // `ALTER TABLE ... ADD`: a column of that name keeps the table out.
+        let leaves = |sql: &str, d: Dialect| leaves_reads(&stmt(sql, d), d);
+        for (sql, d) in [
+            ("ALTER TABLE t1 ADD exclude integer;", Dialect::Postgres),
+            ("ALTER TABLE t1 ADD period integer;", Dialect::Postgres),
+            ("ALTER TABLE t1 ADD index integer;", Dialect::Postgres),
+            ("ALTER TABLE dbo.t1 ADD exclude int NULL;", Dialect::Tsql),
+            ("ALTER TABLE dbo.t1 ADD period int NULL;", Dialect::Tsql),
+            (
+                "ALTER TABLE dbo.t1 ADD PERIOD FOR SYSTEM_TIME (F, T);",
+                Dialect::Tsql,
+            ),
+            ("ALTER TABLE dbo.t1 ADD EXCLUDE (a WITH =);", Dialect::Tsql),
+            (
+                "ALTER TABLE t1 ADD CONSTRAINT c PERIOD FOR SYSTEM_TIME (F, T);",
+                Dialect::Tsql,
+            ),
+        ] {
+            assert!(!leaves(sql, d), "{sql}");
+        }
+        for (sql, d) in [
+            (
+                "ALTER TABLE t1 ADD EXCLUDE USING gist (a WITH =);",
+                Dialect::Postgres,
+            ),
+            ("ALTER TABLE t1 ADD EXCLUDE (a WITH =);", Dialect::Postgres),
+            (
+                "ALTER TABLE t1 ADD CONSTRAINT c CHECK (a > 0);",
+                Dialect::Postgres,
+            ),
+            ("ALTER TABLE dbo.t1 ADD DEFAULT 0 FOR a;", Dialect::Tsql),
+        ] {
+            assert!(leaves(sql, d), "{sql}");
+        }
+    }
+
+    /// C3d part 2, review: only `GENERATED {ALWAYS | BY DEFAULT} AS
+    /// IDENTITY` is an identity column; a generated column followed by a
+    /// constraint named `identity` raises where SQL Server returns the
+    /// stored value (22012).
+    #[test]
+    fn only_an_identity_is_read_through_generated() {
+        let t = ro(
+            "CREATE TABLE t1 (id integer PRIMARY KEY, \
+             v integer GENERATED ALWAYS AS (1/(id-id)) CONSTRAINT identity CHECK (true), \
+             w integer GENERATED ALWAYS AS (id) STORED CONSTRAINT identity2 CHECK (true), \
+             a integer GENERATED ALWAYS AS IDENTITY, b integer GENERATED BY DEFAULT AS IDENTITY);",
+            Dialect::Postgres,
+        )
+        .unwrap();
+        assert_eq!(
+            shape(&t),
+            [
+                ("id", Some(ColType::Int), true, true),
+                ("v", None, false, false),
+                ("w", None, false, false),
+                ("a", Some(ColType::Int), false, false),
+                ("b", Some(ColType::Int), false, false),
+            ]
+        );
+    }
+
+    /// C3d part 2, review: `INITIALLY DEFERRED` alone makes a PostgreSQL key
+    /// deferrable; any `INITIALLY` leaves the table without a key.
+    #[test]
+    fn initially_deferred_keeps_no_key() {
+        for sql in [
+            "CREATE TABLE t (a integer PRIMARY KEY INITIALLY DEFERRED, b integer);",
+            "CREATE TABLE t (a integer, b integer, PRIMARY KEY (a) INITIALLY DEFERRED);",
+            "CREATE TABLE t (a integer PRIMARY KEY, b integer UNIQUE INITIALLY DEFERRED);",
+            "CREATE TABLE t (a integer PRIMARY KEY NOT DEFERRABLE INITIALLY IMMEDIATE);",
+        ] {
+            let t = ro(sql, Dialect::Postgres).unwrap();
+            assert!(t.cols.iter().all(|c| !c.key), "{sql}");
+        }
+    }
+
+    /// C3d part 2, review: the words of a `CASE` in a default say nothing of
+    /// the column (`IS NOT NULL` there is no `NOT NULL`).
+    #[test]
+    fn a_case_in_a_default_says_nothing_of_the_column() {
+        let t = ro(
+            "CREATE TABLE dbo.t (k int NOT NULL PRIMARY KEY, \
+             a int DEFAULT CASE WHEN 1 IS NOT NULL THEN 1 END, \
+             b int DEFAULT CASE WHEN CASE WHEN 1 = 1 THEN 1 END IS NOT NULL THEN 1 END NOT NULL);",
+            Dialect::Tsql,
+        )
+        .unwrap();
+        assert_eq!(
+            shape(&t),
+            [
+                ("k", Some(ColType::Int), true, true),
+                ("a", Some(ColType::Int), false, false),
+                ("b", Some(ColType::Int), true, false),
+            ]
+        );
     }
 
     /// C3d part 2: the statements that cannot change what a read returns.
