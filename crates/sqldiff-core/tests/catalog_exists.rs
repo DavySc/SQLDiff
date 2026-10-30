@@ -107,7 +107,12 @@ fn a_sys_view_is_not_a_postgres_table_of_the_same_name() {
     );
     // The same lookup on one side only is still equal to itself.
     let same = |d: Dialect, text: &str| {
-        diff(&Artifact::new("a.sql", d, text), &Artifact::new("b.sql", d, text), &Options::default()).verdict()
+        diff(
+            &Artifact::new("a.sql", d, text),
+            &Artifact::new("b.sql", d, text),
+            &Options::default(),
+        )
+        .verdict()
     };
     assert!(matches!(
         same(Dialect::Tsql, "SELECT COUNT(*) FROM sys.databases;"),

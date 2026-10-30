@@ -32,7 +32,11 @@ fn proven(body: &str, want: &str) {
     let u = unit(&c);
     assert_eq!(u.checked, Status::Converted, "{:?}\n{}", u.notes, c.output);
     assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
-    assert!(u.notes.iter().any(|n| n.rule == "ASM-CATALOG-EXISTS"), "{:?}", u.notes);
+    assert!(
+        u.notes.iter().any(|n| n.rule == "ASM-CATALOG-EXISTS"),
+        "{:?}",
+        u.notes
+    );
     assert!(!c.output.contains("sys."), "{}", c.output);
 }
 
@@ -116,14 +120,8 @@ fn instance_metadata_is_refused_by_property() {
         "SET @e = CAST(SERVERPROPERTY('EngineEdition') AS int)",
         "PostgreSQL has no editions",
     );
-    refused(
-        "SET @e = DB_ID(N'x')",
-        "SQL Server database id",
-    );
-    refused(
-        "SET @e = OBJECT_ID(N'dbo.t')",
-        "SQL Server object id",
-    );
+    refused("SET @e = DB_ID(N'x')", "SQL Server database id");
+    refused("SET @e = OBJECT_ID(N'dbo.t')", "SQL Server object id");
 }
 
 /// Db2 for i: no rule converts the check; the view is refused instead of
@@ -140,5 +138,11 @@ END
     let c = convert(src, Dialect::Tsql, Dialect::Db2i).unwrap();
     let u = c.units.iter().find(|u| u.src.line == 5).unwrap();
     assert_eq!(u.status, Status::NotConverted, "{:?}", u.notes);
-    assert!(u.notes.iter().any(|n| n.rule == "not-converted.server-metadata"), "{:?}", u.notes);
+    assert!(
+        u.notes
+            .iter()
+            .any(|n| n.rule == "not-converted.server-metadata"),
+        "{:?}",
+        u.notes
+    );
 }

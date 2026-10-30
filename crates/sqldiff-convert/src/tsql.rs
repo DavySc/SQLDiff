@@ -6583,7 +6583,10 @@ impl<'a> Cx<'a> {
         let open = open.filter(|&p| ts[p].k == L_PAREN)?;
         let close = matching(ts, open)?;
         let inner = &ts[open + 1..close];
-        let text: Vec<&str> = sig(inner).into_iter().map(|i| inner[i].s.as_str()).collect();
+        let text: Vec<&str> = sig(inner)
+            .into_iter()
+            .map(|i| inner[i].s.as_str())
+            .collect();
         let root = sqldiff_syntax::parse(&text.join(" "), Dialect::Tsql).syntax();
         let toks = sqldiff_syntax::abstract_syntax::tokens(&root);
         let mut p = sqldiff_syntax::abstract_syntax::Parser::new(&toks, Dialect::Tsql);

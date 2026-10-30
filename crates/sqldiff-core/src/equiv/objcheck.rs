@@ -164,7 +164,12 @@ pub fn tsql(q: &Select) -> Option<Check> {
     let mut types = types?;
     types.sort();
     types.dedup();
-    let kind = match types.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+    let kind = match types
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
         ["U"] => Kind::Table,
         ["P"] | ["P", "PC"] => Kind::Procedure,
         _ => return None,
@@ -204,9 +209,7 @@ pub fn postgres(q: &Select) -> Option<Check> {
         let c = table(left, &["pg_catalog", "pg_proc"])?;
         (c, Kind::Procedure, "pronamespace", "proname")
     };
-    let is = |e: &Expr, q: &str, c: &str| {
-        matches!(col(e), Some((Some(x), y)) if x == q && y == c)
-    };
+    let is = |e: &Expr, q: &str, c: &str| matches!(col(e), Some((Some(x), y)) if x == q && y == c);
     match on {
         Expr::Bin(op, l, r)
             if op == "="
@@ -337,7 +340,9 @@ fn table(f: &From, name: &[&str]) -> Option<String> {
     if !same || !hints.is_empty() {
         return None;
     }
-    let q = alias.clone().unwrap_or_else(|| name[name.len() - 1].to_string());
+    let q = alias
+        .clone()
+        .unwrap_or_else(|| name[name.len() - 1].to_string());
     (!q.starts_with('"')).then(|| q.to_ascii_lowercase())
 }
 
