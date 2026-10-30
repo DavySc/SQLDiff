@@ -207,3 +207,30 @@ fn bit_columns_in_if_and_while_conditions_read_as_boolean() {
     }
     assert!(!o.contains("= 0)"), "{o}");
 }
+
+#[test]
+fn a_rollback_postgresql_never_runs_needs_no_decision() {
+    // Ola's CATCH: `IF XACT_STATE() <> 0 ROLLBACK`, then carry on. The
+    // PostgreSQL conversion refuses transaction control inside TRY and
+    // CATCH, so no ROLLBACK of its own empties the temporary table.
+    let src = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @t TABLE (id int);\n  BEGIN TRY\n    INSERT INTO dbo.x (id) VALUES (1);\n  END TRY\n  BEGIN CATCH\n    IF XACT_STATE() <> 0\n    BEGIN\n      ROLLBACK TRANSACTION\n    END\n    SELECT COUNT(*) FROM @t;\n  END CATCH\nEND\n";
+    let c = conv(src, Dialect::Postgres);
+    let u = unit(&c, src, "DECLARE @t");
+    assert!(
+        !rules(u).contains(&"pg.table-variable-rollback"),
+        "{:?}",
+        rules(u)
+    );
+    assert!(!c.output.contains("\n    ROLLBACK;"), "{}", c.output);
+}
+
+#[test]
+fn bit_columns_inside_a_derived_table_read_as_boolean() {
+    // Ola's `UPDATE … FROM @t t INNER JOIN (SELECT … FROM @s s WHERE
+    // s.Selected = 1 GROUP BY …) d ON …`: the derived table's own tables
+    // type its columns.
+    let src = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @t TABLE (ID int IDENTITY PRIMARY KEY, Name nvarchar(100), StartPosition int);\n  DECLARE @s TABLE (Name nvarchar(100), StartPosition int, Selected bit DEFAULT 0);\n  UPDATE t\n  SET t.StartPosition = d.StartPosition\n  FROM @t t\n  INNER JOIN (SELECT t2.Name, MIN(s.StartPosition) AS StartPosition\n              FROM @t t2\n              INNER JOIN @s s ON t2.Name = s.Name\n              WHERE s.Selected = 1\n              GROUP BY t2.Name) d\n  ON t.Name = d.Name;\nEND\n";
+    let c = conv(src, Dialect::Postgres);
+    assert!(c.output.contains("WHERE s.Selected = TRUE"), "{}", c.output);
+    assert!(!c.output.contains("s.Selected = 1"), "{}", c.output);
+}
