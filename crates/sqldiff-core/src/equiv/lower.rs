@@ -4,7 +4,9 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{parse_stmt, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use super::ast::{
+    parse_stmt_lowered, parse_stmt_output, tokens, Expr, Output, Parser, Stmt, Tok, Type, K,
+};
 use super::cursor::{CursorLoop, CursorOp};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
@@ -93,6 +95,9 @@ pub struct LStmt {
     /// A message or error built from a format (`ast` then says why it is
     /// not a plain statement): compared as its text (`Canon::message`).
     pub msg: Option<Msg>,
+    /// The rows the statement returns (T-SQL OUTPUT, PostgreSQL RETURNING
+    /// that is not INTO variables), which `ast` leaves out.
+    pub output: Option<Output>,
     /// A statement of a cursor loop (`cursor.rs`; `ast` then says why it is
     /// not a plain statement): compared as `Canon::cursor_op` says.
     pub cursor: Option<CursorOp>,
@@ -166,6 +171,15 @@ pub enum CtlKind {
     /// call against call (`call.rs`); the marker keeps its place in the
     /// branch.
     Call,
+    /// The start of a T-SQL TRY part, or of a PL/pgSQL block whose
+    /// `EXCEPTION WHEN OTHERS` handler is read: `try … catch … end`.
+    Try,
+    /// The start of the CATCH block or handler: the branch taken when a
+    /// statement of the TRY part (the block) fails.
+    Catch,
+    /// T-SQL `THROW;` in a CATCH block, PL/pgSQL `RAISE;` in a handler: the
+    /// caught error is raised again.
+    Rethrow,
 }
 
 #[derive(Debug, Clone)]
@@ -225,6 +239,10 @@ pub struct Unit {
     pub stops_on_error: bool,
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
+    /// The entries of `uncovered` that are transaction statements between
+    /// data statements: the behaviour model may have compared those
+    /// (`ir::behaviour::Behaviour::txn_compared`).
+    pub txn_placed: Vec<SyntaxNode>,
     pub notes: Vec<String>,
     /// Security context of a routine (scripts and views: the caller's).
     pub security: Security,
@@ -252,6 +270,8 @@ pub struct Unit {
     /// Name of the artifact's one routine: names the temporary table each
     /// table variable became (`classify::table_variable_table`).
     pub routine: Option<String>,
+    /// That routine's name parts as its header writes them, unquoted.
+    pub routine_parts: Vec<String>,
     /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
     /// temporary tables (`classify::temp_table_names`). A table variable
     /// converted to one of them is named as it; otherwise `@t` keeps the key
@@ -265,6 +285,23 @@ pub struct Unit {
     /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.t`, placed like `table_vars`:
     /// the drop before a converted table variable's `CREATE TEMP TABLE`.
     pub temp_drops: Vec<(SyntaxNode, usize)>,
+    /// The tables the unit itself creates for its own use: T-SQL table
+    /// variables and `#` tables, PostgreSQL `CREATE TEMP TABLE`, Db2 for i
+    /// `DECLARE GLOBAL TEMPORARY TABLE`. Their columns are typed for the
+    /// unit's statements as a catalog table's are (`mod.rs`, `local_schema`).
+    pub local_tables: Vec<SyntaxNode>,
+    /// PostgreSQL: the unqualified names of the temporary tables the unit
+    /// creates (lower case). PostgreSQL looks in `pg_temp` first, so the bare
+    /// name is the temporary table, as `#t` is in T-SQL.
+    pub local_temps: std::collections::HashSet<String>,
+    /// T-SQL `CREATE TABLE #t`, with the number of statements before it:
+    /// compared against the PostgreSQL `CREATE TEMP TABLE t` it became
+    /// (`mod.rs`, `temp_tables`).
+    pub temp_tables: Vec<(SyntaxNode, usize)>,
+    /// T-SQL `DROP TABLE [IF EXISTS] #t`; PostgreSQL `DROP TABLE [IF EXISTS]
+    /// t` of a temporary table the unit created (`local_temps`). Placed like
+    /// `temp_tables`.
+    pub temp_table_drops: Vec<(SyntaxNode, usize)>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
     /// Cursor loops of the shape `cursor.rs` compares.
@@ -275,7 +312,22 @@ pub struct Unit {
     /// with its OPEN, its DEALLOCATE with its CLOSE): (compared, part).
     /// What leaves the compared one undecided leaves the part so too.
     pub linked: Vec<(SyntaxNode, SyntaxNode)>,
-    /// How many IFs and loops the statement being lowered sits in.
+    /// A CATCH or `EXCEPTION WHEN OTHERS` body was compared, or a CATCH
+    /// that rolls back and rethrows was read inside an IF or a loop: what
+    /// runs after an error is the behaviour model's to compare
+    /// (`mod.rs::error_continues` leaves it, as it leaves an uncovered one).
+    pub catches: bool,
+    /// CATCH blocks and `EXCEPTION WHEN OTHERS` handlers are lowered as
+    /// `try … catch … end` branches (`lower_against`); otherwise they stay
+    /// uncovered, as against Db2 for i, whose EXIT handlers are not read.
+    catch_branches: bool,
+    /// The CATCH bodies around the statement being lowered, innermost last.
+    guards: Vec<Guard>,
+    /// A statement that starts a transaction was lowered.
+    began: bool,
+    /// What each IF, loop and CATCH around it is, innermost last.
+    flow: Vec<&'static str>,
+    /// How many IFs, loops and CATCH bodies the statement being lowered sits in.
     depth: usize,
     /// The labels of the loops around it, innermost last (upper case).
     loops: Vec<Option<String>>,
@@ -334,6 +386,7 @@ fn empty(d: Dialect) -> Unit {
         txn_control: false,
         stops_on_error: false,
         txn_stmts: Vec::new(),
+        txn_placed: Vec::new(),
         notes: Vec::new(),
         security: Security::Caller,
         security_cite: None,
@@ -345,21 +398,48 @@ fn empty(d: Dialect) -> Unit {
         local_ids: None,
         trigger: None,
         routine: None,
+        routine_parts: Vec::new(),
         other_temps: Default::default(),
         table_vars: Vec::new(),
         temp_drops: Vec::new(),
+        local_tables: Vec::new(),
+        local_temps: Default::default(),
+        temp_tables: Vec::new(),
+        temp_table_drops: Vec::new(),
         ctl: Vec::new(),
         cursor_loops: Vec::new(),
         cursor_vars: Vec::new(),
         linked: Vec::new(),
+        catches: false,
+        catch_branches: false,
+        guards: Vec::new(),
+        began: false,
+        flow: Vec::new(),
         depth: 0,
         loops: Vec::new(),
     }
 }
 
+/// Lowers the artifact to compare it with one in dialect `other`.
+pub fn lower_against(a: &Analyzed, other: Dialect) -> Unit {
+    lower_with(a, catch_branches(a.dialect(), other))
+}
+
+/// Lowers the artifact on its own: CATCH blocks and handlers stay uncovered.
 pub fn lower(a: &Analyzed) -> Unit {
+    lower_with(a, false)
+}
+
+/// Whether a comparison of dialects `d` and `other` reads CATCH blocks and
+/// `EXCEPTION WHEN OTHERS` handlers as branches: T-SQL and PostgreSQL.
+fn catch_branches(d: Dialect, other: Dialect) -> bool {
+    d != Dialect::Db2i && other != Dialect::Db2i
+}
+
+fn lower_with(a: &Analyzed, catch_branches: bool) -> Unit {
     let d = a.dialect();
     let mut u = empty(d);
+    u.catch_branches = catch_branches;
     let routines: Vec<SyntaxNode> = a
         .root
         .descendants()
@@ -378,6 +458,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         [r] => {
             u.in_block = true;
             u.routine = sqldiff_syntax::ast::routine_name(r);
+            u.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
             header(r, &mut u);
             // Statements outside the routine (other than batch separators) are
             // not covered, except the tables it creates, compared table against
@@ -485,7 +566,8 @@ pub fn lower(a: &Analyzed) -> Unit {
 fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
     use SyntaxKind::{BRANCH, CONDITION, DECLARE_SECTION, LOOP_STMT, STATEMENT};
     let d = u.dialect;
-    if d != Dialect::Postgres {
+    // Its query reads a table: inside a CATCH body, as `guarded` decides.
+    if d != Dialect::Postgres || guarded(c, u).is_some() {
         return false;
     }
     let kids: Vec<SyntaxNode> = c.children().collect();
@@ -523,7 +605,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         [v, kw, rest @ ..] if v.kind == K::Word && v.up == r && kw.up == "IN" => rest,
         _ => return false,
     };
-    let Ok(Stmt::Select(mut sel)) = parse_stmt(query, d) else {
+    let Ok(Stmt::Select(mut sel)) = parse_stmt_lowered(query, d) else {
         return false;
     };
     // `v := r.c`, each variable and each column once.
@@ -578,6 +660,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         ast: Ok(Stmt::Select(sel)),
         from_declare: false,
         msg: None,
+        output: None,
         cursor: None,
     });
     true
@@ -760,8 +843,11 @@ fn tsql_block(n: &SyntaxNode) -> bool {
 }
 
 /// Lowers one segment of a script.
-pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
+/// Lowers one segment of a script, to compare it with one in dialect
+/// `other`.
+pub fn lower_segment(d: Dialect, seg: &Segment, other: Dialect) -> Unit {
     let mut u = empty(d);
+    u.catch_branches = catch_branches(d, other);
     if let (true, [r]) = (seg.routine, seg.nodes.as_slice()) {
         // As `lower` lowers the one routine of an artifact.
         u.in_block = true;
@@ -784,6 +870,7 @@ pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
         .collect();
     if let [r] = routines.as_slice() {
         u.routine = cst::routine_name(r);
+        u.routine_parts = cst::routine_name_parts(r);
     }
     for n in &seg.nodes {
         unit(n, &mut u);
@@ -871,6 +958,7 @@ fn place_txn(u: &mut Unit) {
             _ => data.iter().any(|(o, is_return)| *o > at && !is_return),
         };
         if misplaced {
+            u.txn_placed.push(node.clone());
             u.uncovered
                 .push((node, format!("{} between data statements", kind.label())));
         }
@@ -894,7 +982,7 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
             .push((r.clone(), "an unrecognised routine header".into()));
         return;
     };
-    let mut p = Parser::new(&toks[kw + 1..], d);
+    let mut p = Parser::lowering(&toks[kw + 1..], d);
     if p.qname().is_err() {
         u.uncovered
             .push((r.clone(), "an unrecognised routine name".into()));
@@ -1030,7 +1118,7 @@ pub(crate) fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
     if toks.get(i).is_some_and(|t| t.up == "AS") {
         i += 1;
     }
-    let mut p = Parser::new(&toks[i..], d);
+    let mut p = Parser::lowering(&toks[i..], d);
     let ty: Type = p.ty().ok()?;
     let mut default: Option<Vec<String>> = None;
     for t in &toks[i + p.i..] {
@@ -1092,6 +1180,7 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         | SyntaxKind::ROUTINE_BODY
         | SyntaxKind::TRY_BLOCK => walk(c, u),
         SyntaxKind::BLOCK if assign_loop(c, u) => {}
+        SyntaxKind::BLOCK if u.catch_branches && others_handler(c).is_some() => try_block(c, u),
         SyntaxKind::BLOCK => {
             let w = cst::first_words(c, 2);
             if w.get(1).is_some_and(|x| x == "ATOMIC") {
@@ -1114,11 +1203,14 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
         SyntaxKind::STATEMENT => statement(c, u),
         SyntaxKind::IF_STMT if u.trigger.is_none() => if_stmt(c, u),
         SyntaxKind::LOOP_STMT if u.trigger.is_none() => loop_stmt(c, u),
+        // A handler decides how the whole routine goes on after an error,
+        // which one inside an IF or loop does not.
+        SyntaxKind::HANDLER if u.depth > 0 => inside_flow(c, u, "error handling"),
+        SyntaxKind::TRY_CATCH if u.catch_branches => try_catch(c, u),
+        SyntaxKind::EXCEPTION_SECTION if u.catch_branches => exception_section(c, u),
         // A CATCH or handler decides how the whole routine goes on after an
         // error (`stops_on_error`), which one inside an IF or loop does not.
-        SyntaxKind::TRY_CATCH | SyntaxKind::HANDLER if u.depth > 0 => {
-            inside_flow(c, u, "error handling")
-        }
+        SyntaxKind::TRY_CATCH if u.depth > 0 => inside_flow(c, u, "error handling"),
         SyntaxKind::TRY_CATCH => {
             for part in c.children() {
                 match part.kind() {
@@ -1161,11 +1253,389 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
     }
 }
 
-/// A construct that is compared at the top level but not inside an IF or a
-/// loop.
+/// A construct that is compared at the top level but not inside an IF, a
+/// loop or a CATCH block.
 fn inside_flow(c: &SyntaxNode, u: &mut Unit, what: &str) {
+    let around = u.flow.last().copied().unwrap_or("an IF or a loop");
     u.uncovered
-        .push((c.clone(), format!("{what} inside an IF or a loop")));
+        .push((c.clone(), format!("{what} inside {around}")));
+}
+
+/// T-SQL `BEGIN TRY … END TRY BEGIN CATCH … END CATCH`. The TRY part is
+/// lowered in place. A CATCH that only rolls back and rethrows lets the
+/// error end the routine (the converter drops it); at the top level that
+/// decides how the whole routine goes on after an error (`stops_on_error`).
+/// Any other CATCH is a branch taken on an error (`catch_body`).
+fn try_catch(c: &SyntaxNode, u: &mut Unit) {
+    let d = u.dialect;
+    let kids: Vec<SyntaxNode> = c.children().collect();
+    let [t, k] = kids.as_slice() else {
+        u.uncovered.push((c.clone(), "error handling".into()));
+        return;
+    };
+    if t.kind() != SyntaxKind::TRY_BLOCK || k.kind() != SyntaxKind::CATCH_BLOCK {
+        u.uncovered.push((c.clone(), "error handling".into()));
+        return;
+    }
+    if is_rollback_rethrow(k, d) {
+        walk(t, u);
+        u.txn_control = true;
+        if u.depth == 0 {
+            u.stops_on_error = true;
+        } else {
+            u.catches = true;
+        }
+        return;
+    }
+    // The TRY part stays at its own depth: what is compared only outside
+    // IFs and loops is compared in it as it was before CATCH bodies were
+    // read; the markers keep its statements paired with the TRY part's.
+    mark_at(u, CtlKind::Try, t, c);
+    walk(t, u);
+    catch_body(c, k, k, &cst::structural_children(t), u);
+}
+
+/// The `WHEN OTHERS THEN` body of a PL/pgSQL block's EXCEPTION section when
+/// it is its only handler.
+fn others_handler(block: &SyntaxNode) -> Option<SyntaxNode> {
+    let sec = block
+        .children()
+        .find(|n| n.kind() == SyntaxKind::EXCEPTION_SECTION)?;
+    let [h] = sec.children().collect::<Vec<_>>().try_into().ok()?;
+    if h.kind() != SyntaxKind::EXCEPTION_HANDLER {
+        return None;
+    }
+    let [cond, body] = h.children().collect::<Vec<_>>().try_into().ok()?;
+    let ts = tokens(&cond);
+    (cond.kind() == SyntaxKind::CONDITION
+        && body.kind() == SyntaxKind::BRANCH
+        && matches!(ts.as_slice(), [t] if t.kind == K::Word && t.up == "OTHERS"))
+    .then_some(body)
+}
+
+/// A PL/pgSQL block with an `EXCEPTION WHEN OTHERS` handler: `try`, its
+/// statements, then the handler (`exception_section`).
+fn try_block(c: &SyntaxNode, u: &mut Unit) {
+    mark(u, CtlKind::Try, c);
+    walk(c, u);
+}
+
+/// A PL/pgSQL block's `EXCEPTION` section: one `WHEN OTHERS THEN` handler is
+/// a branch taken on an error (`catch_body`), as a T-SQL CATCH is. The block
+/// is a subtransaction, so the handler runs after what the block changed in
+/// the database was undone; the behaviour model compares that
+/// (`ASM-TRY-SUBTRANSACTION`), and `catch_body` keeps the handler's
+/// statements from depending on it.
+fn exception_section(c: &SyntaxNode, u: &mut Unit) {
+    let Some((block, body)) = c.parent().and_then(|b| others_handler(&b).map(|h| (b, h))) else {
+        u.uncovered.push((c.clone(), "an EXCEPTION section".into()));
+        return;
+    };
+    let try_part: Vec<SyntaxNode> = cst::structural_children(&block)
+        .into_iter()
+        .filter(|n| {
+            !matches!(
+                n.kind(),
+                SyntaxKind::EXCEPTION_SECTION | SyntaxKind::DECLARE_SECTION
+            )
+        })
+        .collect();
+    catch_body(&block, c, &body, &try_part, u);
+}
+
+/// The statements of a CATCH block or `WHEN OTHERS` handler (`body`), as the
+/// branch `catch … end` of the `try` that `opener` (the TRY/CATCH, the
+/// block) opened, run when a statement of `try_part` fails.
+///
+/// A CATCH starts from the state the failure left, which the two dialects
+/// leave differently, so a statement in it is compared only where that
+/// state cannot show (`Guard`); the others are not covered, with the reason.
+/// The error itself, and whether the routine goes on after it, are the
+/// behaviour model's (`catches`).
+fn catch_body(
+    opener: &SyntaxNode,
+    node: &SyntaxNode,
+    body: &SyntaxNode,
+    try_part: &[SyntaxNode],
+    u: &mut Unit,
+) {
+    let guard = Guard::new(try_part, u.dialect);
+    u.catches = true;
+    mark_at(u, CtlKind::Catch, node, opener);
+    u.depth += 1;
+    u.flow.push("a CATCH block");
+    u.guards.push(guard);
+    walk(body, u);
+    u.guards.pop();
+    u.flow.pop();
+    u.depth -= 1;
+    mark_at(u, CtlKind::End, opener, opener);
+}
+
+/// What a CATCH body may read, given the TRY part before it. When a
+/// statement of the TRY part fails:
+///
+/// - T-SQL keeps what the TRY part completed before it (unless XACT_ABORT is
+///   ON or a transaction is rolled back), and PostgreSQL has undone it: a
+///   CATCH statement that reads or changes tables, calls a routine or runs a
+///   cursor could see different data. Such statements are compared only when
+///   the TRY part changes nothing in the database, or only with the
+///   INSERT, UPDATE, DELETE or MERGE it ends with.
+/// - A T-SQL statement that fails may already have assigned some of its
+///   variables: a `SELECT @v = …` keeps the value of the rows before the
+///   failing one, `SELECT @a = 1, @b = 1/0` sets `@a`, and `UPDATE … SET
+///   @v = …` keeps its last value although the update is rolled back (SQL
+///   Server 2022, checked). A SET assigns nothing when it fails, and a
+///   PL/pgSQL statement never assigns part of its targets. A CATCH statement
+///   that reads a variable the TRY part assigns other than with SET or a
+///   DECLARE's initial value is not compared.
+/// - When a transaction is open, SQL Server makes it uncommittable on some
+///   errors even with XACT_ABORT OFF (a conversion error, Msg 245), and a
+///   CATCH statement that writes then fails (Msg 3930); PostgreSQL has
+///   rolled back to the block's savepoint and the write succeeds (both
+///   checked). With no transaction open the CATCH writes on both sides
+///   (XACT_ABORT ON too). A CATCH statement that changes the database is
+///   compared under ASM-NO-CALLER-TXN, and not at all after the routine
+///   started a transaction or when the TRY part calls a routine or runs
+///   dynamic SQL (`catch_writes`).
+#[derive(Debug, Clone, Default)]
+struct Guard {
+    /// The TRY part may change the database (or does something not read).
+    try_changes: bool,
+    /// T-SQL variables (lower case, with `@`) a failing TRY statement may
+    /// leave partly assigned.
+    partial: std::collections::HashSet<String>,
+    /// The TRY part calls a routine or runs dynamic SQL, which may start a
+    /// transaction.
+    try_calls: bool,
+}
+
+impl Guard {
+    fn new(try_part: &[SyntaxNode], d: Dialect) -> Self {
+        let mut g = Guard::default();
+        // A failing statement leaves nothing of what it did on either side,
+        // so a write that ends the TRY part (and a call's or dynamic SQL's
+        // statements are not one statement) has changed nothing when the
+        // CATCH starts: either it failed, or it never ran.
+        let last_write = try_part.last().filter(|n| {
+            n.kind() == SyntaxKind::STATEMENT
+                && stmt_kind(n, d).is_write()
+                && !is_call(n, d)
+                && !super::dynamic::is_tsql(n)
+                && super::dynamic::pg_text(n).is_none()
+        });
+        for n in try_part {
+            for s in n
+                .descendants()
+                .filter(|x| x.kind() == SyntaxKind::STATEMENT)
+            {
+                let ts = tokens(&s);
+                let kind = stmt_kind(&s, d);
+                if !reads_only(&ts, kind, d) && last_write != Some(&s) {
+                    g.try_changes = true;
+                }
+                if is_call(&s, d)
+                    || super::dynamic::is_tsql(&s)
+                    || super::dynamic::pg_text(&s).is_some()
+                {
+                    g.try_calls = true;
+                }
+                if d == Dialect::Tsql && !matches!(kind, StmtKind::Assign | StmtKind::Declare) {
+                    g.partial.extend(assigned_vars(&ts));
+                }
+            }
+            // Constructs the statements above do not show.
+            if n.descendants_with_tokens().any(|e| {
+                matches!(
+                    e.kind(),
+                    SyntaxKind::ERROR | SyntaxKind::ROUTINE | SyntaxKind::HANDLER
+                )
+            }) {
+                g.try_changes = true;
+            }
+        }
+        g
+    }
+}
+
+/// Whether a statement only computes values: an assignment, a declaration
+/// (not of a table or cursor), RETURN, a message, a raised error, a loop
+/// exit, or a SELECT that does not create a table.
+fn reads_only(ts: &[Tok], kind: StmtKind, d: Dialect) -> bool {
+    let first = ts.first().map(|t| t.up.as_str()).unwrap_or("");
+    let has = |w: &str| ts.iter().any(|t| t.kind == K::Word && t.up == w);
+    match kind {
+        StmtKind::Assign | StmtKind::Return | StmtKind::Raise => !has("EXEC") && !has("EXECUTE"),
+        StmtKind::Declare => !has("TABLE") && !has("CURSOR"),
+        // T-SQL `SELECT … INTO #t` creates a table; PL/pgSQL `SELECT … INTO
+        // v` assigns variables.
+        StmtKind::Select => {
+            d != Dialect::Tsql
+                || !ts
+                    .windows(2)
+                    .any(|w| w[0].kind == K::Word && w[0].up == "INTO" && w[1].kind != K::Var)
+        }
+        StmtKind::Other => matches!(first, "PRINT" | "RAISE" | "BREAK" | "CONTINUE" | "EXIT"),
+        _ => false,
+    }
+}
+
+/// T-SQL variables a statement assigns other than as SET does: `@v =` (and
+/// `@v +=` …) in a SELECT list, an UPDATE's SET or `EXEC @rc =`, `@v
+/// OUTPUT`, and FETCH … INTO targets. Over-approximates: a comparison
+/// `@v = x` in a WHERE counts too, and so does `@v OUTPUT`, which SQL
+/// Server was seen not to copy back when the call fails.
+fn assigned_vars(ts: &[Tok]) -> Vec<String> {
+    let fetch = ts.first().is_some_and(|t| t.up == "FETCH");
+    let mut into = false;
+    let mut out = Vec::new();
+    for (i, t) in ts.iter().enumerate() {
+        if t.kind == K::Word && t.up == "INTO" {
+            into = true;
+        }
+        if t.kind != K::Var || t.text.starts_with("@@") {
+            continue;
+        }
+        let next = ts.get(i + 1);
+        let assigns = next.is_some_and(|n| {
+            matches!(
+                n.text.as_str(),
+                "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^="
+            ) || (n.kind == K::Word && matches!(n.up.as_str(), "OUTPUT" | "OUT"))
+        });
+        if assigns || (fetch && into) {
+            out.push(t.text.to_lowercase());
+        }
+    }
+    out
+}
+
+/// A statement inside a CATCH body that changes the database: compared
+/// only with no transaction open when the CATCH runs (`Guard`). `None` when
+/// it is compared; ASM-NO-CALLER-TXN is then recorded.
+fn catch_writes(c: &SyntaxNode, u: &mut Unit) -> Option<String> {
+    if u.guards.is_empty() || reads_only(&tokens(c), stmt_kind(c, u.dialect), u.dialect) {
+        return None;
+    }
+    if u.began || u.guards.iter().any(|g| g.try_calls) {
+        return Some(
+            "a statement inside a CATCH block that changes the database while a transaction may be open (SQL Server makes it uncommittable on some errors and the change then fails; PostgreSQL rolls back to the block's savepoint and makes it)"
+                .into(),
+        );
+    }
+    let x = super::canon::asm::make(super::canon::asm::NO_CALLER_TXN);
+    if !u.assumptions.iter().any(|a| a.id == x.id) {
+        u.assumptions.push(x);
+    }
+    None
+}
+
+/// T-SQL `THROW;`, PL/pgSQL `RAISE;`: the caught error raised again.
+fn rethrow(c: &SyntaxNode, d: Dialect) -> bool {
+    let ts: Vec<Tok> = tokens(c)
+        .into_iter()
+        .filter(|t| t.kind != K::Semi)
+        .collect();
+    match (d, ts.as_slice()) {
+        (Dialect::Tsql, [t]) => t.kind == K::Word && t.up == "THROW",
+        (Dialect::Postgres, [t]) => t.kind == K::Word && t.up == "RAISE",
+        _ => false,
+    }
+}
+
+/// Why a statement, or an IF or loop condition, inside a CATCH body is not
+/// compared (`Guard`); `None` when it is.
+fn guarded(c: &SyntaxNode, u: &Unit) -> Option<String> {
+    if u.guards.is_empty() {
+        return None;
+    }
+    let ts = tokens(c);
+    let kind = if c.kind() == SyntaxKind::STATEMENT {
+        stmt_kind(c, u.dialect)
+    } else {
+        StmtKind::Assign
+    };
+    if u.guards.iter().any(|g| g.try_changes) && uses_tables(&ts, kind) {
+        return Some(
+            "a statement inside a CATCH block that reads or changes tables, after a TRY part that may change the database (T-SQL keeps what the TRY part did before the error, PostgreSQL undoes it)"
+                .into(),
+        );
+    }
+    // What the last statement or the error left: T-SQL `@@ROWCOUNT`,
+    // `@@ERROR`, `@@TRANCOUNT`, `@@FETCH_STATUS`; PL/pgSQL `FOUND` and
+    // `GET DIAGNOSTICS`.
+    let state = ts.iter().find(|t| {
+        (t.kind == K::Var && t.text.starts_with("@@"))
+            || (t.kind == K::Word && matches!(t.up.as_str(), "FOUND" | "DIAGNOSTICS"))
+    });
+    if let Some(t) = state {
+        return Some(format!(
+            "a statement inside a CATCH block that reads `{}`, which the error leaves differently on the two sides",
+            t.text
+        ));
+    }
+    let read = ts.iter().find(|t| {
+        t.kind == K::Var
+            && u.guards
+                .iter()
+                .any(|g| g.partial.contains(&t.text.to_lowercase()))
+    });
+    read.map(|v| {
+        format!(
+            "a statement inside a CATCH block that reads `{}`, which a failing statement of the TRY part may have assigned in part (T-SQL keeps such partial assignments, PostgreSQL makes none)",
+            v.text
+        )
+    })
+}
+
+/// Whether a statement (or condition) may read or change a table, a cursor
+/// or the session, or call a routine: anything but values computed from
+/// variables, parameters and built-in functions. A schema-qualified call
+/// `s.f(` may be a user function that reads tables.
+fn uses_tables(ts: &[Tok], kind: StmtKind) -> bool {
+    if !matches!(
+        kind,
+        StmtKind::Assign
+            | StmtKind::Select
+            | StmtKind::Return
+            | StmtKind::Raise
+            | StmtKind::Declare
+            | StmtKind::Other
+    ) {
+        return true;
+    }
+    let words = [
+        "FROM",
+        "JOIN",
+        "INTO",
+        "UPDATE",
+        "DELETE",
+        "INSERT",
+        "MERGE",
+        "TRUNCATE",
+        "TABLE",
+        "EXEC",
+        "EXECUTE",
+        "CALL",
+        "PERFORM",
+        "FETCH",
+        "OPEN",
+        "CLOSE",
+        "CURSOR",
+        "DEALLOCATE",
+        "NEXTVAL",
+        "CURRVAL",
+        "SETVAL",
+        "LASTVAL",
+    ];
+    ts.iter()
+        .any(|t| t.kind == K::Word && words.contains(&t.up.as_str()))
+        || ts.windows(4).any(|w| {
+            matches!(w[0].kind, K::Word | K::Quoted)
+                && w[1].kind == K::Dot
+                && matches!(w[2].kind, K::Word | K::Quoted)
+                && w[3].kind == K::LParen
+        })
 }
 
 fn mark(u: &mut Unit, kind: CtlKind, node: &SyntaxNode) {
@@ -1187,7 +1657,7 @@ fn condition(c: &SyntaxNode, d: Dialect) -> Result<Expr, String> {
 }
 
 fn expression(toks: &[Tok], d: Dialect) -> Result<Expr, String> {
-    let mut p = Parser::new(toks, d);
+    let mut p = Parser::lowering(toks, d);
     let e = p.expr()?;
     if !p.at_end() {
         return Err("unexpected tokens after the condition".into());
@@ -1218,6 +1688,15 @@ fn if_stmt(c: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((c.clone(), "an IF statement".into()));
         return;
     }
+    if let Some(why) = kids
+        .iter()
+        .filter(|k| k.kind() == CONDITION)
+        .find_map(|k| guarded(k, u))
+    {
+        u.uncovered
+            .push((c.clone(), format!("an IF whose condition is {why}")));
+        return;
+    }
     // The conditions opened so far: an ELSE closes the branch of the last.
     let mut opened: Vec<&SyntaxNode> = Vec::new();
     let mut cond: Option<&SyntaxNode> = None;
@@ -1234,7 +1713,9 @@ fn if_stmt(c: &SyntaxNode, u: &mut Unit) {
             opened.push(cn);
         }
         u.depth += 1;
+        u.flow.push("an IF or a loop");
         walk(k, u);
+        u.flow.pop();
         u.depth -= 1;
     }
     for cn in opened.into_iter().rev() {
@@ -1275,15 +1756,22 @@ fn loop_stmt(c: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((c.clone(), "a loop".into()));
         return;
     }
+    if let Some(why) = guarded(cond, u) {
+        u.uncovered
+            .push((c.clone(), format!("a loop whose condition is {why}")));
+        return;
+    }
     let kind = match u.cursor_loops.iter().find(|l| l.lp == *c) {
         Some(l) => CtlKind::FetchWhile(l.key.clone()),
         None => CtlKind::While(condition(cond, u.dialect)),
     };
     mark(u, kind, cond);
     u.depth += 1;
+    u.flow.push("an IF or a loop");
     u.loops.push(label);
     walk(body, u);
     u.loops.pop();
+    u.flow.pop();
     u.depth -= 1;
     mark_at(u, CtlKind::End, c, cond);
 }
@@ -1363,6 +1851,19 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     let kind = stmt_kind(c, d);
     let words = cst::first_words(c, 3);
     let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    if kind == StmtKind::TxnBegin
+        || (kind == StmtKind::TxnSetting && w(1) == "IMPLICIT_TRANSACTIONS")
+    {
+        u.began = true;
+    }
+    if let Some(why) = guarded(c, u).or_else(|| catch_writes(c, u)) {
+        u.uncovered.push((c.clone(), why));
+        return;
+    }
+    if !u.guards.is_empty() && rethrow(c, d) {
+        mark(u, CtlKind::Rethrow, c);
+        return;
+    }
     if jump(c, u) || cursor_stmt(c, u) {
         return;
     }
@@ -1391,6 +1892,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             _ => None,
         };
         if let Some(what) = what.filter(|_| !is_call(c, d)) {
+            // Where a COMMIT sits is the behaviour model's to compare.
+            if kind == StmtKind::TxnCommit {
+                u.txn_placed.push(c.clone());
+            }
             return inside_flow(c, u, what);
         }
     }
@@ -1408,12 +1913,38 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             ast,
             from_declare: false,
             msg,
+            output: None,
             cursor: None,
         });
         return;
     }
+    if table_var_decl(c, d) || temp_create(c, d) {
+        u.local_tables.push(c.clone());
+        if d == Dialect::Postgres {
+            let ts = tokens(c);
+            // `CREATE TEMP TABLE [IF NOT EXISTS] name (` with a one-part name.
+            let at = if ts.get(3).is_some_and(|t| t.up == "IF") {
+                6
+            } else {
+                3
+            };
+            if let [n, next, ..] = ts.get(at..).unwrap_or_default() {
+                if n.kind == K::Word && next.kind != K::Dot {
+                    u.local_temps.insert(n.text.to_lowercase());
+                }
+            }
+        }
+    }
     if table_var_decl(c, d) {
         u.table_vars.push((c.clone(), u.stmts.len()));
+        return;
+    }
+    if temp_create(c, d) {
+        u.temp_tables.push((c.clone(), u.stmts.len()));
+        return;
+    }
+    if temp_table_drop(c, d, &u.local_temps).is_some() {
+        u.temp_table_drops.push((c.clone(), u.stmts.len()));
         return;
     }
     if temp_drop(c, d) {
@@ -1449,7 +1980,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let mut ast = parse_stmt(&toks, d);
+            let (mut ast, output) = match parse_stmt_output(&toks, d) {
+                Ok((s, o)) => (Ok(s), o),
+                Err(e) => (Err(e), None),
+            };
             let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {
@@ -1474,6 +2008,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 ast,
                 from_declare,
                 msg: None,
+                output,
                 cursor: None,
             });
         }
@@ -1485,6 +2020,18 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         // Indexes, sequences and schemas: compared statement against
         // statement (`ddl.rs`).
         StmtKind::Ddl if u.kind == UnitKind::Script && is_create_ddl(c, d) => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
+        // An index on a temporary table the unit created (T-SQL `#t`,
+        // PostgreSQL a `local_temps` name): compared statement against
+        // statement, as a script's.
+        StmtKind::Ddl if temp_index(c, d, &u.local_temps) => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
+        // A routine's TRUNCATE: compared statement against statement too,
+        // in its place among the data statements (`mod.rs::ddl_stmts` checks
+        // that it runs once).
+        StmtKind::Ddl if cst::first_words(c, 1) == ["TRUNCATE"] => {
             u.ddl.push((c.clone(), u.stmts.len()));
         }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
@@ -1506,7 +2053,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                             })) =>
                 {
                     let body: Vec<Tok> = toks[at + 1..].to_vec();
-                    let ast = parse_stmt(&body, d);
+                    let ast = parse_stmt_lowered(&body, d);
                     u.kind = UnitKind::View;
                     u.stmts.push(LStmt {
                         node: c.clone(),
@@ -1514,6 +2061,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                         ast,
                         from_declare: false,
                         msg: None,
+                        output: None,
                         cursor: None,
                     });
                 }
@@ -1539,6 +2087,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => {
             u.txn_control = true;
             u.stops_on_error = true;
+        }
+        _ if d == Dialect::Tsql && w(0) == ":" => {
+            let what = format!(
+                "a SQLCMD directive `:{}` (not SQL; a file it includes is compared on its own)",
+                w(1).to_lowercase()
+            );
+            u.uncovered.push((c.clone(), what));
         }
         _ => {
             let what = format!(
@@ -1638,6 +2193,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
         ast: Err("a cursor statement".into()),
         from_declare: false,
         msg: None,
+        output: None,
         cursor: Some(op),
     });
     true
@@ -1728,6 +2284,68 @@ fn table_var_decl(c: &SyntaxNode, d: Dialect) -> bool {
         Dialect::Db2i => {
             w(0) == "DECLARE" && w(1) == "GLOBAL" && w(2) == "TEMPORARY" && w(3) == "TABLE"
         }
+    }
+}
+
+/// T-SQL `CREATE TABLE #t`.
+fn temp_create(c: &SyntaxNode, d: Dialect) -> bool {
+    d == Dialect::Tsql
+        && cst::first_words(c, 2) == ["CREATE", "TABLE"]
+        && tokens(c).get(2).is_some_and(|t| t.text.starts_with('#'))
+}
+
+/// `CREATE [UNIQUE] [NONCLUSTERED] INDEX name ON t` where `t` is a T-SQL
+/// `#t` or a PostgreSQL temporary table of `temps`.
+fn temp_index(c: &SyntaxNode, d: Dialect, temps: &std::collections::HashSet<String>) -> bool {
+    let ts = tokens(c);
+    if !ts.first().is_some_and(|t| t.up == "CREATE") {
+        return false;
+    }
+    let Some(i) = ts.iter().position(|t| t.up == "INDEX") else {
+        return false;
+    };
+    if !(ts.get(i + 2).is_some_and(|t| t.up == "ON")) {
+        return false;
+    }
+    match (d, ts.get(i + 3), ts.get(i + 4)) {
+        (_, _, Some(n)) if n.kind == K::Dot => false,
+        (Dialect::Tsql, Some(t), _) => t.text.starts_with('#') && !t.text.starts_with("##"),
+        (Dialect::Postgres, Some(t), _) => {
+            t.kind == K::Word && temps.contains(&t.text.to_lowercase())
+        }
+        _ => false,
+    }
+}
+
+/// T-SQL `DROP TABLE [IF EXISTS] #t`, PostgreSQL `DROP TABLE [IF EXISTS] t`
+/// of one of `temps`: the table's name (lower case, without `#`) and
+/// whether IF EXISTS is said.
+pub fn temp_table_drop(
+    c: &SyntaxNode,
+    d: Dialect,
+    temps: &std::collections::HashSet<String>,
+) -> Option<(String, bool)> {
+    let ts = tokens(c);
+    let ts = match ts.last() {
+        Some(t) if t.kind == K::Semi => &ts[..ts.len() - 1],
+        _ => &ts[..],
+    };
+    if !(ts.len() >= 3 && ts[0].up == "DROP" && ts[1].up == "TABLE") {
+        return None;
+    }
+    let if_exists =
+        ts.get(2).is_some_and(|t| t.up == "IF") && ts.get(3).is_some_and(|t| t.up == "EXISTS");
+    let [n] = &ts[if if_exists { 4 } else { 2 }..] else {
+        return None;
+    };
+    match d {
+        Dialect::Tsql => {
+            let rest = n.text.strip_prefix('#')?;
+            (!rest.starts_with('#')).then(|| (rest.to_lowercase(), if_exists))
+        }
+        Dialect::Postgres => (n.kind == K::Word && temps.contains(&n.text.to_lowercase()))
+            .then(|| (n.text.to_lowercase(), if_exists)),
+        Dialect::Db2i => None,
     }
 }
 
@@ -1826,7 +2444,7 @@ fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
         _ => return None,
     };
     let expr = |ts: &[Tok]| -> Result<Expr, String> {
-        let mut p = Parser::new(ts, d);
+        let mut p = Parser::lowering(ts, d);
         let e = p.expr()?;
         if p.at_end() {
             Ok(e)
@@ -2009,7 +2627,7 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
         _ => return Err("RAISERROR WITH LOG or SETERROR".into()),
     }
     let expr = |ts: &[Tok]| -> Result<Expr, String> {
-        let mut p = Parser::new(ts, Dialect::Tsql);
+        let mut p = Parser::lowering(ts, Dialect::Tsql);
         let e = p.expr()?;
         if p.at_end() {
             Ok(e)
@@ -2119,7 +2737,7 @@ fn note(u: &mut Unit, s: &str) {
 fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
     let toks = tokens(s);
     let d = u.dialect;
-    let mut p = Parser::new(&toks, d);
+    let mut p = Parser::lowering(&toks, d);
     let ok = (|| -> Result<(String, Type, usize), String> {
         let n = p.qname()?;
         if n.len() != 1 {
@@ -2155,7 +2773,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((s.clone(), "a declaration".into()));
         return;
     }
-    let mut p = Parser::new(&rest[1..], d);
+    let mut p = Parser::lowering(&rest[1..], d);
     let ast = p.expr().and_then(|e| {
         if p.at_end() {
             Ok(Stmt::Assign(super::ast::Expr::Name(vec![name.clone()]), e))
@@ -2169,6 +2787,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         ast,
         from_declare: true,
         msg: None,
+        output: None,
         cursor: None,
     });
 }

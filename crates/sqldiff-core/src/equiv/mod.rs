@@ -18,6 +18,7 @@ pub mod edit;
 pub mod eval;
 pub mod literal;
 pub mod lower;
+pub mod objcheck;
 pub mod options;
 pub mod schema;
 pub mod script;
@@ -54,6 +55,11 @@ pub struct Outcome {
     pub refinements: Vec<String>,
     /// The statement pairs decided here (`coverage::unreceipted`).
     pub receipts: Vec<crate::coverage::Receipt>,
+    /// Transaction statements between data statements, which statement-level
+    /// equivalence does not compare: (side A?, where the statement starts,
+    /// the unknown reason). The engine keeps the reason unless the
+    /// behaviour model compared the routine that holds the statement.
+    pub txn_unknown: Vec<(bool, usize, String)>,
 }
 
 impl Outcome {
@@ -119,7 +125,10 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
                     None => c.stmt(&ast::Stmt::Return(None)),
                 }
             }
-            (None, Ok(st)) => c.stmt(st),
+            (None, Ok(st)) => match &s.output {
+                Some(o) => c.output_stmt(st, o),
+                None => c.stmt(st),
+            },
         };
         let (term, err) = match res {
             Ok(t) => (t, None),
@@ -155,8 +164,8 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
 }
 
 /// The item of an IF or loop marker (`lower::CtlKind`): `ctl-if(cond)`,
-/// `ctl-while(cond)`, `ctl-else`, `ctl-end`, `ctl-break`, `ctl-continue`,
-/// `ctl-call(callee)`.
+/// `ctl-while(cond)`, `ctl-try`, `ctl-catch`, `ctl-else`, `ctl-end`,
+/// `ctl-break`, `ctl-continue`, `ctl-rethrow`, `ctl-call(callee)`.
 fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
     use lower::CtlKind as C;
     let (head, res): (&str, Result<Vec<Term>, String>) = match &m.kind {
@@ -173,6 +182,9 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
             "ctl-while",
             Ok(vec![n("cursor-found", vec![a(key.clone())])]),
         ),
+        C::Try => ("ctl-try", Ok(vec![])),
+        C::Catch => ("ctl-catch", Ok(vec![])),
+        C::Rethrow => ("ctl-rethrow", Ok(vec![])),
         C::Else => ("ctl-else", Ok(vec![])),
         C::End => ("ctl-end", Ok(vec![])),
         C::Break => ("ctl-break", Ok(vec![])),
@@ -261,8 +273,12 @@ pub fn compare(
         }
         return out;
     }
-    let pairs =
-        script::segment_pairs(a, b).unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
+    let pairs = script::segment_pairs(a, b, anchors, &mut out).unwrap_or_else(|| {
+        vec![(
+            lower::lower_against(a, b.dialect()),
+            lower::lower_against(b, a.dialect()),
+        )]
+    });
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
@@ -283,6 +299,64 @@ fn tv_names(a: &Analyzed, b: &Analyzed, ua: &mut Unit, ub: &mut Unit) {
     }
 }
 
+/// `schema` with the tables the unit creates for its own use, under the
+/// keys its statements name them by: a column of a table variable or a
+/// temporary table has its declared type, as a catalog table's column has.
+fn local_schema<'s>(schema: &'s Schema, u: &Unit) -> std::borrow::Cow<'s, Schema> {
+    let mut tables = Vec::new();
+    for node in &u.local_tables {
+        let text = node.text().to_string();
+        let words = cst::first_words(node, 2);
+        // `DECLARE @t [AS] TABLE (columns)` as `CREATE TABLE t (columns)`.
+        if u.dialect == Dialect::Tsql && words.first().is_some_and(|w| w == "DECLARE") {
+            let Some(open) = text.find('(') else {
+                continue;
+            };
+            let var = ast::tokens(node).get(1).map(|t| t.text.clone());
+            tables.push((format!("CREATE TABLE local_table {}", &text[open..]), var));
+        } else {
+            tables.push((text, None));
+        }
+    }
+    let key_of = |var: &Option<String>, schema: Option<&str>, name: &str| {
+        let parts: Vec<String> = match (var, schema) {
+            (Some(v), _) => vec![v.clone()],
+            (None, Some(s)) => vec![s.to_string(), name.to_string()],
+            (None, None) => vec![name.to_string()],
+        };
+        Canon::table_name(&parts, &u.other_temps, &u.local_temps, u.routine.as_deref())
+            .0
+            .to_lowercase()
+    };
+    // A name created twice in the unit (dropped and created again) has no
+    // one column list for all its statements: it stays untyped.
+    let mut keys: BTreeMap<String, usize> = BTreeMap::new();
+    for (ddl, var) in &tables {
+        let mut key = None;
+        Schema::default().with_local(ddl, u.dialect, |s, n| {
+            let k = key_of(var, s, n);
+            key = Some(k.clone());
+            k
+        });
+        if let Some(k) = key {
+            *keys.entry(k).or_default() += 1;
+        }
+    }
+    let mut out = std::borrow::Cow::Borrowed(schema);
+    for (ddl, var) in &tables {
+        let once = |k: &str| keys.get(k) == Some(&1);
+        let mut key = String::new();
+        let s = out.with_local(ddl, u.dialect, |s, n| {
+            key = key_of(var, s, n);
+            key.clone()
+        });
+        if let Some(s) = s.filter(|_| once(&key)) {
+            out = std::borrow::Cow::Owned(s);
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compare_units(
     a: &Analyzed,
@@ -294,13 +368,20 @@ fn compare_units(
     anchors: &[Anchor],
     out: &mut Outcome,
 ) {
+    let (la, lb) = (local_schema(sa, ua), local_schema(sb, ub));
+    let (sa, sb) = (la.as_ref(), lb.as_ref());
     let (na, nb) = (side_name(a), side_name(b));
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
             let at = side.line_of(node);
-            out.unknown_reasons.push(format!(
-                "{name} line {at}: {what} is not covered by statement-level equivalence"
-            ));
+            let why =
+                format!("{name} line {at}: {what} is not covered by statement-level equivalence");
+            if u.txn_placed.contains(node) {
+                let start = usize::from(node.text_range().start());
+                out.txn_unknown.push((std::ptr::eq(side, a), start, why));
+                continue;
+            }
+            out.unknown_reasons.push(why);
             // The statements inside anything uncovered (an IF, loop, CATCH,
             // handler, or a routine beside others) were not compared either:
             // each is named on its own line, so none of them counts as
@@ -326,9 +407,10 @@ fn compare_units(
     signature(ua, ub, &na, &nb, out);
     script::locals(a, b, ua, ub, &na, &nb, out);
     tables(a, b, ua, ub, sa, sb, out);
-    table_vars(a, b, ua, ub, sa, sb, out);
+    let mut places = Vec::new();
+    table_vars(a, b, ua, ub, sa, sb, &mut places, out);
     dynamic_sql(a, b, ua, ub, sa, sb, out);
-    ddl_stmts(a, b, ua, ub, sa, sb, out);
+    ddl_stmts(a, b, ua, ub, sa, sb, &mut places, out);
     for x in ua.assumptions.iter().chain(&ub.assumptions) {
         out.assume(x.clone());
     }
@@ -388,6 +470,11 @@ fn compare_units(
     let gaps = [gaps(a, ua, &ia), gaps(b, ub, &ib)];
     let pairs = pair_items(a, b, &ia, &ib, &gaps, anchors, wit.as_ref(), out);
     calls(a, b, ua, ub, sa, sb, anchors, ((&ia, &ib), &pairs), out);
+    for p in places {
+        if !same_place_paired((&ia, &ib), &pairs, &p.x, &p.y, anchors) {
+            out.unknown_reasons.push(p.reason);
+        }
+    }
     error_continues(a, b, ua, ub, &ia, &ib, out);
     linked(a, b, ua, ub, out);
 }
@@ -419,6 +506,15 @@ fn linked(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, out: &mut Outcome) {
     }
 }
 
+/// A statement compared on its own whose place among the data statements
+/// differs by count: it is not compared (`reason`) unless the conversion's
+/// trace places it among the same statements (`same_place_paired`).
+struct Place {
+    x: SyntaxNode,
+    y: SyntaxNode,
+    reason: String,
+}
+
 /// With a conversion's trace, whether call `xn` (side A) and its
 /// counterpart `yn` (side B) sit among the same data statements although
 /// the sides hold different numbers of statements before them (a statement
@@ -444,7 +540,24 @@ fn same_place_paired(
     // Whether every node of the item is before the call (`Some(true)`) or
     // after it (`Some(false)`); `None` when it holds or straddles the call.
     let before = |it: &Item, call: (usize, usize)| {
-        let r: Vec<(usize, usize)> = it.nodes.iter().map(cst::sig_range).collect();
+        // A TRY's markers hold the statements of its TRY part (`lower::
+        // try_catch`): each stands where it starts, its END where it ends.
+        let r: Vec<(usize, usize)> = match (it.term.head(), it.nodes.first()) {
+            ("ctl-try" | "ctl-catch", Some(n)) => {
+                let at = cst::sig_range(n).0;
+                vec![(at, at)]
+            }
+            ("ctl-end", Some(n))
+                if matches!(
+                    n.kind(),
+                    sqldiff_syntax::SyntaxKind::TRY_CATCH | sqldiff_syntax::SyntaxKind::BLOCK
+                ) =>
+            {
+                let at = cst::sig_range(n).1;
+                vec![(at, at)]
+            }
+            _ => it.nodes.iter().map(cst::sig_range).collect(),
+        };
         if r.iter().all(|x| x.1 <= call.0) {
             Some(true)
         } else if r.iter().all(|x| x.0 >= call.1) {
@@ -1085,10 +1198,13 @@ fn same_stmt(
                    s: &Schema,
                    other: &Unit|
      -> Result<(Term, Vec<Assumption>), String> {
-        let st = ast::parse_stmt(toks, u.dialect)?;
+        let (st, out) = ast::parse_stmt_output(toks, u.dialect)?;
         let mut c = Canon::new(u, s);
         c.fold_quoted = other.dialect == Dialect::Tsql;
-        let t = c.stmt(&st)?;
+        let t = match &out {
+            Some(o) => c.output_stmt(&st, o)?,
+            None => c.stmt(&st)?,
+        };
         Ok((t, std::mem::take(&mut c.asm)))
     };
     let (tx, mut asms) = match lowered(x, ua, sa, ub) {
@@ -1114,13 +1230,7 @@ fn same_stmt(
         }
     }
     let m = &c.mismatches[0];
-    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| {
-        format!(
-            "A has `{}` where B has `{}`",
-            compare::render(&m.a),
-            compare::render(&m.b)
-        )
-    }))
+    Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| compare::mismatch_text(m)))
 }
 
 /// The rest of the line from byte `off`, white space trimmed.
@@ -1239,10 +1349,17 @@ fn table_vars(
     ub: &Unit,
     sa: &Schema,
     sb: &Schema,
+    places: &mut Vec<Place>,
     out: &mut Outcome,
 ) {
     use ast::K;
-    if ua.table_vars.is_empty() && ub.table_vars.is_empty() && ub.temp_drops.is_empty() {
+    if ua.table_vars.is_empty()
+        && ub.table_vars.is_empty()
+        && ub.temp_drops.is_empty()
+        && ua.temp_tables.is_empty()
+        && ua.temp_table_drops.is_empty()
+        && ub.temp_table_drops.is_empty()
+    {
         return;
     }
     let (na, nb) = (side_name(a), side_name(b));
@@ -1436,6 +1553,218 @@ fn table_vars(
         };
         table_pair(a, b, ua, ub, sa, sb, &pair, out);
     }
+    // T-SQL `CREATE TABLE #t` against the PostgreSQL `CREATE TEMP TABLE t`
+    // it became, and their DROPs.
+    let mut used_drop_a = vec![false; ua.temp_table_drops.len()];
+    let mut used_drop_b = vec![false; ub.temp_table_drops.len()];
+    let drop_of = |side: &Analyzed, u: &Unit, n: &SyntaxNode| {
+        lower::temp_table_drop(n, side.dialect(), &u.local_temps)
+    };
+    for (xa, pa) in &ua.temp_tables {
+        let la = a.line_of(xa);
+        let ta = ast::tokens(xa);
+        let hash = ta.get(2).map(|t| t.text.clone()).unwrap_or_default();
+        let unknown = |out: &mut Outcome, why: String| {
+            out.unknown_reasons.push(format!(
+                "{na} line {la}: the temporary table {hash} is not compared: {why}"
+            ));
+        };
+        if db != sqldiff_syntax::Dialect::Postgres {
+            unknown(
+                out,
+                "only a #temp table converted from T-SQL to PostgreSQL is compared".into(),
+            );
+            continue;
+        }
+        let want = hash.trim_start_matches('#').to_lowercase();
+        if hash.starts_with("##") || want.is_empty() {
+            unknown(out, "a global temporary table".into());
+            continue;
+        }
+        let found = ub.table_vars.iter().enumerate().find(|(k, (xb, _))| {
+            !used_b[*k] && {
+                let p = creation(xb).1;
+                p == [want.clone()] || p == [temp_schema.to_string(), want.clone()]
+            }
+        });
+        let Some((k, (xb, pb))) = found else {
+            unknown(out, format!("{nb} creates no temporary table {want}"));
+            continue;
+        };
+        used_b[k] = true;
+        let lb = b.line_of(xb);
+        if pa != pb {
+            places.push(Place {
+                x: xa.clone(),
+                y: xb.clone(),
+                reason: format!("{na} line {la}: the temporary table {hash} is not compared: it comes after {pa} statement(s) on one side and {pb} on the other"),
+            });
+        }
+        if let Some(x) = [(xa, &na), (xb, &nb)]
+            .into_iter()
+            .find(|(x, _)| !runs_once(x))
+        {
+            unknown(
+                out,
+                format!(
+                    "{} creates it inside a branch, loop or error-handling block",
+                    x.1
+                ),
+            );
+            continue;
+        }
+        // The DROP of it on each side: one, run once, in the same place.
+        let drops = |side: &Analyzed, u: &Unit| -> Vec<usize> {
+            u.temp_table_drops
+                .iter()
+                .enumerate()
+                .filter(|(_, (n, _))| drop_of(side, u, n).is_some_and(|(t, _)| t == want))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let (dxa, dxb) = (drops(a, ua), drops(b, ub));
+        let routine = ua.kind != UnitKind::Script;
+        let drop_ok = match (dxa.as_slice(), dxb.as_slice()) {
+            ([], []) if !routine => Ok(None),
+            ([], []) => Err(format!("neither side drops it: T-SQL drops it when the procedure ends, {nb} keeps it for the session, so a second call fails")),
+            ([i], [j]) => {
+                let (da_, db_) = (&ua.temp_table_drops[*i], &ub.temp_table_drops[*j]);
+                let fa = drop_of(a, ua, &da_.0).map(|x| x.1);
+                let fb = drop_of(b, ub, &db_.0).map(|x| x.1);
+                if da_.1 != db_.1 {
+                    places.push(Place {
+                        x: da_.0.clone(),
+                        y: db_.0.clone(),
+                        reason: format!("{na} line {}: the DROP of the temporary table {hash} is not compared: it comes after {} statement(s) on one side and {} on the other", a.line_of(&da_.0), da_.1, db_.1),
+                    });
+                }
+                if fa != fb {
+                    Err("IF EXISTS on one DROP and not on the other".into())
+                } else if !runs_once(&da_.0) || !runs_once(&db_.0) {
+                    Err("a DROP of it sits inside a branch, loop or error-handling block".into())
+                } else if da_.0.text_range().start() < xa.text_range().start()
+                    || db_.0.text_range().start() < xb.text_range().start()
+                {
+                    Err("a DROP of it comes before its CREATE".into())
+                } else {
+                    Ok(Some((*i, *j)))
+                }
+            }
+            _ => Err("it is dropped on one side only, or more than once".into()),
+        };
+        let drop_pair = match drop_ok {
+            Ok(x) => x,
+            Err(why) => {
+                unknown(out, why);
+                continue;
+            }
+        };
+        // Leaving between CREATE and DROP skips the DROP on PostgreSQL only.
+        let leaves = |side: &Analyzed, from: &SyntaxNode, to: Option<&SyntaxNode>| {
+            let (s0, s1) = (
+                from.text_range().end(),
+                to.map(|t| t.text_range().start())
+                    .unwrap_or(side.root.text_range().end()),
+            );
+            side.root
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.text_range().start() >= s0 && t.text_range().end() <= s1)
+                .any(|t| {
+                    matches!(
+                        t.text().to_ascii_uppercase().as_str(),
+                        "RETURN" | "GOTO" | "EXIT"
+                    )
+                })
+        };
+        if let Some((i, j)) = drop_pair {
+            if leaves(a, xa, Some(&ua.temp_table_drops[i].0))
+                || leaves(b, xb, Some(&ub.temp_table_drops[j].0))
+            {
+                unknown(
+                    out,
+                    "the routine can return between its CREATE and its DROP, which T-SQL's end-of-procedure drop covers and PostgreSQL's does not".into(),
+                );
+                continue;
+            }
+            used_drop_a[i] = true;
+            used_drop_b[j] = true;
+        }
+        // Nothing on B uses the table before it is created.
+        let start = usize::from(xb.text_range().start());
+        let used_before = b
+            .root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| usize::from(t.text_range().end()) <= start)
+            .any(|t| t.text().eq_ignore_ascii_case(&want));
+        if used_before {
+            unknown(
+                out,
+                format!("{nb} uses {want} before line {lb}, where it is created"),
+            );
+            continue;
+        }
+        let (tb, _, j) = creation(xb);
+        let (Some(oa), Some(ob)) = (
+            ta.iter().position(|t| t.kind == K::LParen),
+            (j < tb.len() && tb[j].kind == K::LParen).then_some(j),
+        ) else {
+            unknown(out, "no column list".into());
+            continue;
+        };
+        let (Ok(ca), Ok(cb)) = (table::close(&ta, oa), table::close(&tb, ob)) else {
+            unknown(out, "unbalanced parentheses".into());
+            continue;
+        };
+        if ta[ca + 1..].iter().any(|t| t.kind != K::Semi)
+            || tb[cb + 1..].iter().any(|t| t.kind != K::Semi)
+        {
+            unknown(
+                out,
+                "options after the column list (ON COMMIT may empty or drop the table)".into(),
+            );
+            continue;
+        }
+        out.assume(asm::make(TEMP_TABLE));
+        let name_off = (ta[2].off, tb[j - 1].off);
+        let head = |off: usize| {
+            let at = |mut t: ast::Tok| {
+                t.off = off;
+                t
+            };
+            vec![
+                at(synth(K::Word, "CREATE")),
+                at(synth(K::Word, "TABLE")),
+                at(synth(K::Word, temp_schema)),
+                at(synth(K::Dot, ".")),
+                at(synth(K::Word, &want)),
+            ]
+        };
+        let mut ca_toks = head(name_off.0);
+        ca_toks.extend(ta[oa..=ca].iter().cloned());
+        let mut cb_toks = head(name_off.1);
+        cb_toks.extend(tb[ob..=cb].iter().cloned());
+        let pair = TablePair {
+            what: format!("the temporary table {hash}"),
+            xa,
+            xb,
+            ddl: (ast_text(&ca_toks), ast_text(&cb_toks)),
+            ta: ca_toks,
+            tb: cb_toks,
+        };
+        table_pair(a, b, ua, ub, sa, sb, &pair, out);
+    }
+    for (side, u, used, name) in [(a, ua, &used_drop_a, &na), (b, ub, &used_drop_b, &nb)] {
+        for (k, (x, _)) in u.temp_table_drops.iter().enumerate() {
+            if !used[k] {
+                out.unknown_reasons.push(format!(
+                    "{name} line {}: a DROP of a temporary table is not covered by statement-level equivalence",
+                    side.line_of(x)
+                ));
+            }
+        }
+    }
     for (k, (xb, _)) in ub.table_vars.iter().enumerate() {
         if !used_b[k] {
             out.unknown_reasons.push(format!(
@@ -1608,6 +1937,11 @@ fn runs_once(x: &SyntaxNode) -> bool {
 }
 
 /// The table variable assumption the converter states (`ASM-TABLE-VARIABLE`).
+const TEMP_TABLE: (&str, &str) = (
+    "ASM-TEMP-TABLE",
+    "A #temp table converted to a session-scoped temporary table is not created twice in one session: no temporary table of its name exists when the procedure creates it (T-SQL creates its own beside a caller's #t, PostgreSQL fails), and the procedure is not left by an error between creating and dropping it (T-SQL drops the table then, PostgreSQL keeps it)",
+);
+
 const TABLE_VARIABLE: (&str, &str) = (
     "ASM-TABLE-VARIABLE",
     "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows",
@@ -1930,6 +2264,7 @@ fn ddl_stmts(
     ub: &Unit,
     sa: &Schema,
     sb: &Schema,
+    places: &mut Vec<Place>,
     out: &mut Outcome,
 ) {
     use ast::K;
@@ -1947,7 +2282,22 @@ fn ddl_stmts(
         u.ddl
             .iter()
             .map(|(node, pos)| {
-                let ddl = ddl::parse(&ast::tokens(node), side.dialect());
+                let mut ddl = ddl::parse(&ast::tokens(node), side.dialect());
+                // An index on a temporary table the unit created: named as
+                // T-SQL names it (`#t`), so it pairs with the original.
+                if let Ok(ddl::Ddl::Index(ix)) = &mut ddl {
+                    if let [t] = ix.table.as_slice() {
+                        if side.dialect() == sqldiff_syntax::Dialect::Postgres
+                            && !t.quoted
+                            && u.local_temps.contains(&t.text.to_lowercase())
+                        {
+                            ix.table = vec![table::Name {
+                                text: format!("#{}", t.text),
+                                quoted: false,
+                            }];
+                        }
+                    }
+                }
                 let key = ddl.as_ref().ok().and_then(|x| ddl::pair_key(x).ok());
                 Stmt {
                     node,
@@ -2128,14 +2478,15 @@ fn ddl_stmts(
             ));
         };
         if x.pos != y.pos {
-            unknown(
-                out,
-                format!(
-                    "it comes after {} data statement(s) on one side and {} on the other",
+            // Decided once the data statements are paired (`Place`).
+            places.push(Place {
+                x: x.node.clone(),
+                y: y.node.clone(),
+                reason: format!(
+                    "{na} line {la}: the {what} (and {nb} line {lb}) is not compared: it comes after {} data statement(s) on one side and {} on the other",
                     x.pos, y.pos
                 ),
-            );
-            continue;
+            });
         }
         // An index must follow its table on both sides when the file creates it.
         if let (ddl::Ddl::Index(ix), ddl::Ddl::Index(iy)) = (dx, dy) {
@@ -2194,6 +2545,30 @@ fn ddl_stmts(
         if let Some(why) = second {
             unknown(out, why.into());
             continue;
+        }
+        // A TRUNCATE inside a branch, loop or handler is placed by count
+        // only; and a row count read after it may count it.
+        if matches!(dx, ddl::Ddl::Truncate(_)) {
+            if !runs_once(x.node) || !runs_once(y.node) {
+                unknown(out, "it sits inside a branch, loop or error handler".into());
+                continue;
+            }
+            let counts = |side: &Analyzed| {
+                side.root
+                    .descendants_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .any(|t| {
+                        let up = t.text().to_ascii_uppercase();
+                        matches!(up.as_str(), "@@ROWCOUNT" | "ROWCOUNT_BIG" | "ROW_COUNT")
+                    })
+            };
+            if counts(a) || counts(b) {
+                unknown(
+                    out,
+                    "the file reads a row count, which the statement may set".into(),
+                );
+                continue;
+            }
         }
         // PostgreSQL names are compared up to letter case only where no
         // other name differs from them only in case.
@@ -2439,6 +2814,8 @@ fn error_continues(
     // decides whether the script goes on (the behaviour model's business).
     if !o.in_block
         || t.stops_on_error
+        || t.catches
+        || o.catches
         || !matches!(t.kind, UnitKind::Proc | UnitKind::Script)
         || !t.uncovered.is_empty()
         || !o.uncovered.is_empty()
@@ -2481,7 +2858,20 @@ fn error_continues(
         Item(usize),
         Call(usize),
         Dyn(usize),
+        Ddl(usize),
     }
+    // DDL compared on its own (TRUNCATE, a #temp table, its index and DROP)
+    // fails and changes what it changes like a call.
+    let ddls: Vec<SyntaxNode> = if t.kind == UnitKind::Proc {
+        t.ddl
+            .iter()
+            .chain(&t.temp_tables)
+            .chain(&t.temp_table_drops)
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let call_of = |it: &Item| {
         t.calls
             .iter()
@@ -2520,6 +2910,11 @@ fn error_continues(
                 .filter(|_| t.kind == UnitKind::Proc)
                 .map(|(i, (n, _))| (cst::sig_range(n).0, E::Dyn(i))),
         )
+        .chain(
+            ddls.iter()
+                .enumerate()
+                .map(|(i, n)| (cst::sig_range(n).0, E::Ddl(i))),
+        )
         .collect();
     seq.sort_by_key(|x| x.0);
     // Calls inside a script's IF or loop are not in `seq` as effects.
@@ -2528,11 +2923,11 @@ fn error_continues(
     }
     let head = |e: E| match e {
         E::Item(i) => items[i].term.head(),
-        E::Call(_) | E::Dyn(_) => "call",
+        E::Call(_) | E::Dyn(_) | E::Ddl(_) => "call",
     };
     let is_effect = |e: E| match e {
         E::Item(i) => !is_ctl(&items[i]) && effect(&items[i].term),
-        E::Call(_) | E::Dyn(_) => true,
+        E::Call(_) | E::Dyn(_) | E::Ddl(_) => true,
     };
     // The END of each IF, ELSE and WHILE marker, and each END's opener.
     let mut close = vec![usize::MAX; seq.len()];
@@ -2540,8 +2935,8 @@ fn error_continues(
     let mut stack: Vec<usize> = Vec::new();
     for (k, (_, e)) in seq.iter().enumerate() {
         match head(*e) {
-            "ctl-if" | "ctl-while" => stack.push(k),
-            "ctl-else" => {}
+            "ctl-if" | "ctl-while" | "ctl-try" => stack.push(k),
+            "ctl-else" | "ctl-catch" => {}
             "ctl-end" => {
                 if let Some(o) = stack.pop() {
                     opener[k] = o;
@@ -2552,7 +2947,7 @@ fn error_continues(
         }
     }
     for k in 0..seq.len() {
-        if head(seq[k].1) == "ctl-else" {
+        if matches!(head(seq[k].1), "ctl-else" | "ctl-catch") {
             close[k] = (k..seq.len())
                 .find(|&e| head(seq[e].1) == "ctl-end" && opener[e] < k)
                 .unwrap_or(usize::MAX);
@@ -2574,9 +2969,9 @@ fn error_continues(
         while k < seq.len() {
             let e = seq[k].1;
             match head(e) {
-                "ctl-if" | "ctl-while" => depth += 1,
+                "ctl-if" | "ctl-while" | "ctl-try" => depth += 1,
                 // The branch around `p` ends: skip the ELSE branches.
-                "ctl-else" if depth == 0 => {
+                "ctl-else" | "ctl-catch" if depth == 0 => {
                     k = close[k];
                     continue;
                 }
@@ -2627,7 +3022,8 @@ fn error_continues(
             }
             match items[k].term.head() {
                 // These cannot fail; a call marker's call is in `seq`.
-                "ctl-else" | "ctl-end" | "ctl-break" | "ctl-continue" | "ctl-call" => continue,
+                "ctl-else" | "ctl-catch" | "ctl-end" | "ctl-break" | "ctl-continue"
+                | "ctl-call" => continue,
                 _ => {}
             }
             if items[k].nodes.len() == 1 && script::cannot_fail(t, &items[k].nodes[0]) {
@@ -2635,7 +3031,7 @@ fn error_continues(
             }
         }
         // Where a failing IF or WHILE condition goes on is not modelled.
-        let cond = matches!(head(e), "ctl-if" | "ctl-while");
+        let cond = matches!(head(e), "ctl-if" | "ctl-while" | "ctl-try");
         match after(i, cond) {
             Next::Sure(j) => {
                 found = Some((i, j));
@@ -2653,6 +3049,7 @@ fn error_continues(
                 E::Item(k) => line(tside, &items[k].nodes),
                 E::Call(k) => tside.line_of(&t.calls[k].0),
                 E::Dyn(k) => tside.line_of(&t.dynamic[k].0),
+                E::Ddl(k) => tside.line_of(&ddls[k]),
             };
             let tname = side_name(tside);
             let oname = side_name(oside);
@@ -2669,6 +3066,7 @@ fn error_continues(
             E::Item(k) => items[k].nodes.clone(),
             E::Call(k) => vec![t.calls[k].0.clone()],
             E::Dyn(k) => vec![t.dynamic[k].0.clone()],
+            E::Ddl(k) => vec![ddls[k].clone()],
         }
     };
     let (xn, yn) = (nodes(seq[i].1), nodes(seq[j].1));
@@ -2688,7 +3086,7 @@ fn error_continues(
     let class = ChangeClass::Transactional;
     let anchor_text = match seq[i].1 {
         E::Item(k) => items[k].term.to_string(),
-        E::Call(_) | E::Dyn(_) => xn[0].text().to_string(),
+        E::Call(_) | E::Dyn(_) | E::Ddl(_) => xn[0].text().to_string(),
     };
     let anchor = crate::normalize::hash_strs(std::iter::once(anchor_text.as_str()));
     out.findings.push(Finding {
@@ -2840,6 +3238,16 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
                 "Arguments fit the shorter of the declared parameter types",
             )),
             _ => {}
+        }
+        // PostgreSQL ignores a parameter type's length, precision and scale
+        // (`call::asms::PARAM_TYPMOD`): the body then sees what callers pass.
+        let pg = [(ua.dialect, x.ty), (ub.dialect, y.ty)]
+            .into_iter()
+            .find(|(d, _)| *d == Dialect::Postgres);
+        if ua.dialect != ub.dialect
+            && pg.is_some_and(|(_, t)| t.is_some_and(|t| canon::untypmod(t) != t))
+        {
+            out.assume(asm::make(call::asms::PARAM_TYPMOD));
         }
         let bits = matches!((x.ty, y.ty), (Some(tx), Some(ty)) if bit_bool(tx, ty));
         match (&x.default, &y.default) {
@@ -3391,12 +3799,27 @@ fn pair_items(
                     } else {
                         (&na, &gaps[0][x.gap])
                     };
+                    // With a trace the gap was written from this very
+                    // statement: the reason names the gap's line, so it
+                    // lands on the output piece that left the statement
+                    // uncompared, not on every piece written from it (a
+                    // declaration moved to the top of the block is compared
+                    // on its own).
+                    if is_a && !anchors.is_empty() {
+                        format!(
+                            "{gname} line {}: the statement at {name} line {} is not paired: its counterpart may be in this {}, which is not compared",
+                            g.line,
+                            line(side, &it.nodes),
+                            g.what
+                        )
+                    } else {
                     format!(
                         "{name} line {}: statement is not paired: its counterpart may be in {} at {gname} line {}, which is not compared",
                         line(side, &it.nodes),
                         g.what,
                         g.line
                     )
+                    }
                 }
                 None if moved.contains(&(is_a, i)) => format!(
                     "{name} line {}: statement is not paired: the conversion put it in another order among the statements it is paired with",
@@ -3476,13 +3899,19 @@ fn flow_seq(items: &[Item], gaps: &[Gap], k: &mut usize, g: &mut usize) -> Vec<E
             return out;
         };
         match it.term.head() {
-            "ctl-else" | "ctl-end" => return out,
-            "ctl-if" | "ctl-while" => {
+            "ctl-else" | "ctl-catch" | "ctl-end" => return out,
+            "ctl-if" | "ctl-while" | "ctl-try" => {
                 let open = *k;
                 *k += 1;
                 let mut parts = vec![(None, flow_seq(items, gaps, k, g))];
-                let is_if = it.term.is("ctl-if");
-                while is_if && items.get(*k).is_some_and(|x| x.term.is("ctl-else")) {
+                // The marker that starts each further branch: ELSE of an IF,
+                // CATCH of a TRY.
+                let sep = match it.term.head() {
+                    "ctl-if" => "ctl-else",
+                    "ctl-try" => "ctl-catch",
+                    _ => "",
+                };
+                while items.get(*k).is_some_and(|x| x.term.is(sep)) {
                     let e = *k;
                     *k += 1;
                     parts.push((Some(e), flow_seq(items, gaps, k, g)));
@@ -3647,11 +4076,11 @@ fn branches(items: &[Item]) -> Vec<(Option<usize>, Option<usize>)> {
     for (i, it) in items.iter().enumerate() {
         let frame = stack.last().map(|x| x.1);
         match it.term.head() {
-            "ctl-if" | "ctl-while" => {
+            "ctl-if" | "ctl-while" | "ctl-try" => {
                 out.push((frame, None));
                 stack.push((i, i));
             }
-            "ctl-else" => match stack.pop() {
+            "ctl-else" | "ctl-catch" => match stack.pop() {
                 Some((opener, _)) => {
                     out.push((stack.last().map(|x| x.1), Some(opener)));
                     stack.push((opener, i));
@@ -3803,6 +4232,9 @@ fn compare_pair(
         let what = |it: &Item| match it.term.head() {
             "ctl-if" => "an IF condition",
             "ctl-while" => "a WHILE condition",
+            "ctl-try" => "the start of a TRY part",
+            "ctl-catch" => "the start of a CATCH block or exception handler",
+            "ctl-rethrow" => "a rethrow of the caught error",
             "ctl-else" => "the start of an ELSE branch",
             "ctl-end" => "the end of an IF or loop",
             "ctl-break" => "a loop exit",
@@ -3939,13 +4371,7 @@ fn compare_pair(
         }
     }
     let m = unexplained[0];
-    let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| {
-        format!(
-            "A has `{}` where B has `{}`",
-            compare::render(&m.a),
-            compare::render(&m.b)
-        )
-    });
+    let what = compare::describe_unknown(m, &na, &nb).unwrap_or_else(|| compare::mismatch_text(m));
     push(
         out,
         "equiv.unproven",
@@ -3996,8 +4422,8 @@ pub fn refine_modified(
     {
         return;
     }
-    let ua = lower::lower(a);
-    let ub = lower::lower(b);
+    let ua = lower::lower_against(a, b.dialect());
+    let ub = lower::lower_against(b, a.dialect());
     let ia = items(&ua, sa, true, ub.dialect);
     let ib = items(&ub, sb, true, ua.dialect);
     let find = |items: &[Item], side: Side, f: &Finding| -> Option<usize> {

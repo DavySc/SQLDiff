@@ -133,7 +133,7 @@ fn script_with_variables_becomes_a_do_block() {
     let c = tsql(src);
     assert_eq!(
         c.output,
-        "DO $$\nDECLARE\n  v_n integer;\nBEGIN\n  -- DECLARE @n: moved to the DECLARE section\n  SELECT COUNT(*) INTO v_n FROM t;\n  RAISE NOTICE '%', v_n;\nEND\n$$;\n"
+        "DO $$\nDECLARE\n  v_n integer;\nBEGIN\n  -- DECLARE @n: moved to the DECLARE section\n  SELECT COUNT(*) INTO v_n FROM t;\n  RAISE NOTICE '%', COALESCE(CAST(v_n AS text), '');\nEND\n$$;\n"
     );
     // An aggregate without grouping returns exactly one row: nothing to assume.
     assert!(!has_rule(
@@ -170,11 +170,36 @@ fn rollback_rethrow_idiom_lets_the_error_propagate() {
 fn try_catch_becomes_an_exception_block() {
     let src = "CREATE PROCEDURE p AS\nBEGIN\n  BEGIN TRY\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH\n    PRINT ERROR_MESSAGE();\n  END CATCH\nEND\n";
     let c = tsql(src);
-    assert!(c.output.contains("  BEGIN\n    DELETE FROM t;\n  EXCEPTION WHEN OTHERS THEN\n    RAISE NOTICE '%', SQLERRM;\n  END;\n"), "{}", c.output);
+    assert!(c.output.contains("  BEGIN\n    DELETE FROM t;\n  EXCEPTION WHEN OTHERS THEN\n    RAISE NOTICE '%', COALESCE(CAST(SQLERRM AS text), '');\n  END;\n"), "{}", c.output);
     assert!(has_rule(
         unit(&c, src, "BEGIN TRY"),
         "ASM-TRY-SUBTRANSACTION"
     ));
+}
+
+/// `BEGIN TRY;` and `BEGIN;` (WWI, the PolyBase sample): the terminator
+/// after the opener is not a statement left unconverted.
+#[test]
+fn terminator_after_a_block_opener() {
+    let src = "CREATE PROCEDURE p @x int AS\nBEGIN\n  BEGIN TRY;\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH;\n    THROW;\n  END CATCH;\n  IF @x IS NULL\n  BEGIN;\n    SET @x = 20;\n  END;\nEND\n";
+    let c = tsql(src);
+    assert!(
+        c.units.iter().all(|u| u.status != Status::NotConverted),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output
+            .contains("  BEGIN\n    DELETE FROM t;\n  EXCEPTION WHEN OTHERS THEN\n"),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output
+            .contains("  IF p_x IS NULL THEN\n    p_x := 20;\n  END IF;\n"),
+        "{}",
+        c.output
+    );
 }
 
 #[test]
@@ -350,7 +375,7 @@ fn type_defaults_follow_tsql() {
 /// (the SQL Server period end becomes 10000-01-01 00:00:00); six are kept.
 #[test]
 fn seven_digit_time_literals_are_noted() {
-    let c = tsql("SELECT k FROM t WHERE e = '9999-12-31 23:59:59.9999999';");
+    let c = tsql("SELECT k FROM t WHERE e = '2020-01-01 10:00:00.1234567';");
     assert!(has_rule(&c.units[0], "ASM-LITERAL-FRACTION"));
     for src in [
         "SELECT k FROM t WHERE e = '9999-12-31 23:59:59.999999';",

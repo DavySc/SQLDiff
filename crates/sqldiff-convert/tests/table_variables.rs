@@ -162,3 +162,48 @@ fn rollback_and_rethrow_needs_no_decision() {
         c.output
     );
 }
+
+#[test]
+fn bit_columns_of_table_variables_and_temp_tables_read_as_boolean() {
+    // Ola Hallengren's `@URLs` has `Mirror bit` and reads `Mirror = 0`; a
+    // kept `= 0` is a type error on the boolean column PostgreSQL gets.
+    let src = "CREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @URLs TABLE (ID int, DirectoryPath nvarchar(4000), Mirror bit);\n  CREATE TABLE #t (Name nvarchar(100), Flag bit);\n  INSERT INTO @URLs (ID, DirectoryPath, Mirror) VALUES (1, N'x', 0);\n  INSERT INTO #t (Name, Flag) VALUES (N'a', 1);\n  SELECT @n = COUNT(*) FROM @URLs WHERE Mirror = 0;\n  SELECT @n = COUNT(*) FROM #t WHERE Flag = 1;\n  SELECT @n = COUNT(*) FROM @URLs u WHERE u.Mirror = 1;\nEND\n";
+    let c = conv(src, Dialect::Postgres);
+    let o = &c.output;
+    for want in [
+        "VALUES (1, 'x', FALSE);",
+        "VALUES ('a', TRUE);",
+        "WHERE Mirror = FALSE;",
+        "WHERE Flag = TRUE;",
+        "WHERE u.Mirror = TRUE;",
+    ] {
+        assert!(o.contains(want), "{want}\n{o}");
+    }
+    for needle in [
+        "INSERT INTO @URLs",
+        "INSERT INTO #t",
+        "FROM @URLs WHERE",
+        "FROM #t WHERE",
+        "FROM @URLs u",
+    ] {
+        let u = unit(&c, src, needle);
+        assert_eq!(u.status, Status::Assumptions, "{needle}: {u:#?}\n{o}");
+    }
+}
+
+#[test]
+fn bit_columns_in_if_and_while_conditions_read_as_boolean() {
+    // Ola's DatabaseBackup: `IF (SELECT COUNT(*) FROM @Directories WHERE
+    // Mirror = 0) <> …`. The condition's subqueries know their tables'
+    // column types, a catalog table's as a table variable's.
+    let src = "CREATE TABLE dbo.Jobs (ID int PRIMARY KEY, Done bit NOT NULL);\nGO\nCREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @Directories TABLE (ID int, Mirror bit);\n  INSERT INTO @Directories (ID, Mirror) VALUES (1, 0);\n  IF (SELECT COUNT(*) FROM @Directories WHERE Mirror = 0) <> (SELECT COUNT(*) FROM @Directories WHERE Mirror = 1)\n  BEGIN\n    SET @n = 1;\n  END\n  WHILE EXISTS (SELECT * FROM dbo.Jobs WHERE Done = 0) SET @n = 2;\nEND\n";
+    let c = conv(src, Dialect::Postgres);
+    let o = &c.output;
+    for want in [
+        "IF (SELECT COUNT(*) FROM pg_temp.tv_p_directories WHERE Mirror = FALSE) <> (SELECT COUNT(*) FROM pg_temp.tv_p_directories WHERE Mirror = TRUE) THEN",
+        "WHILE EXISTS (SELECT * FROM Jobs WHERE Done = FALSE) LOOP",
+    ] {
+        assert!(o.contains(want), "{want}\n{o}");
+    }
+    assert!(!o.contains("= 0)"), "{o}");
+}

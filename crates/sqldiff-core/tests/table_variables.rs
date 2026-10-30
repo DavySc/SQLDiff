@@ -230,3 +230,95 @@ fn a_dgtt_with_start_with_binds() {
         reasons(&r)
     );
 }
+
+/// Ola Hallengren's `@URLs` with its `Mirror bit`, read with `= 0`; on
+/// PostgreSQL the column is boolean, compared with `cmp` and stored as `val`.
+fn mirror(cmp: &str, val: &str) -> (String, String) {
+    let a = "CREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @URLs TABLE (ID int, DirectoryPath nvarchar(4000), Mirror bit);\n  INSERT INTO @URLs (ID, DirectoryPath, Mirror) VALUES (1, N'x', 0);\n  SELECT @n = COUNT(*) FROM @URLs WHERE Mirror = 0;\nEND\n".to_string();
+    let b = format!("CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.tv_p_ur_ls;\n  CREATE TEMP TABLE pg_temp.tv_p_ur_ls (\n    ID integer,\n    DirectoryPath varchar(4000),\n    Mirror boolean\n  );\n  INSERT INTO pg_temp.tv_p_ur_ls (ID, DirectoryPath, Mirror) VALUES (1, 'x', {val});\n  SELECT COUNT(*) INTO p_n FROM pg_temp.tv_p_ur_ls WHERE Mirror {cmp};\nEND;\n$$;\n");
+    (a, b)
+}
+
+#[test]
+fn table_variable_columns_have_their_declared_types() {
+    // A bit column turned boolean, still compared with 0: PostgreSQL has no
+    // `boolean = integer`. Without the column's type this passed.
+    let (a, b) = mirror("= 0", "FALSE");
+    let r = run(&a, &b, P);
+    assert_eq!(r.verdict(), Verdict::Different, "{}", reasons(&r));
+    assert!(
+        r.findings.iter().any(|f| f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    // And a number stored in it.
+    let (a, b) = mirror("= FALSE", "0");
+    let r = run(&a, &b, P);
+    assert_eq!(r.verdict(), Verdict::Different, "{}", reasons(&r));
+    // Written as the converter writes it, the two are equal.
+    let (a, b) = mirror("= FALSE", "FALSE");
+    let r = run(&a, &b, P);
+    assert!(
+        r.findings.is_empty() && r.unknown_reasons.is_empty(),
+        "{}",
+        reasons(&r)
+    );
+}
+
+#[test]
+fn temp_table_columns_have_their_declared_types() {
+    // `#t` became `CREATE TEMP TABLE t`: the bare name is the temporary
+    // table (PostgreSQL looks in pg_temp first) and its columns are typed.
+    let a = "CREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  CREATE TABLE #t (Name nvarchar(100), Flag bit);\n  INSERT INTO #t (Name, Flag) VALUES (N'a', 1);\n  SELECT @n = COUNT(*) FROM #t WHERE Flag = 1;\nEND\n";
+    let b = |cmp: &str| {
+        format!("CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  CREATE TEMP TABLE t (\n    Name varchar(100),\n    Flag boolean\n  );\n  INSERT INTO t (Name, Flag) VALUES ('a', TRUE);\n  SELECT COUNT(*) INTO p_n FROM t WHERE Flag {cmp};\nEND;\n$$;\n")
+    };
+    let r = run(a, &b("= 1"), P);
+    assert_eq!(r.verdict(), Verdict::Different, "{}", reasons(&r));
+    assert!(
+        r.findings.iter().any(|f| f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    let r = run(a, &b("= TRUE"), P);
+    assert!(
+        !r.findings
+            .iter()
+            .any(|f| f.rule == "write.unpaired" || f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    // A permanent `t` written before the temporary one exists is still a
+    // durable write that must pair.
+    let b2 = "CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  INSERT INTO t (Name, Flag) VALUES ('a', TRUE);\n  CREATE TEMP TABLE t (\n    Name varchar(100),\n    Flag boolean\n  );\n  INSERT INTO t (Name, Flag) VALUES ('a', TRUE);\n  SELECT COUNT(*) INTO p_n FROM t WHERE Flag = TRUE;\nEND;\n$$;\n";
+    let r = run(a, b2, P);
+    assert!(
+        r.findings.iter().any(|f| f.rule == "write.unpaired"),
+        "{}",
+        reasons(&r)
+    );
+}
+
+#[test]
+fn a_local_table_created_twice_stays_untyped_and_if_not_exists_is_read() {
+    let a = "CREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  CREATE TABLE #t (Name nvarchar(100), Flag bit);\n  INSERT INTO #t (Name, Flag) VALUES (N'a', 1);\n  SELECT @n = COUNT(*) FROM #t WHERE Flag = 1;\nEND\n";
+    // `IF NOT EXISTS`: the bare name is still the temporary table, typed.
+    let b = "CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  CREATE TEMP TABLE IF NOT EXISTS t (\n    Name varchar(100),\n    Flag boolean\n  );\n  INSERT INTO t (Name, Flag) VALUES ('a', TRUE);\n  SELECT COUNT(*) INTO p_n FROM t WHERE Flag = 1;\nEND;\n$$;\n";
+    let r = run(a, b, P);
+    assert!(
+        r.findings.iter().any(|f| f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    // Created twice with other columns: no one type holds for every
+    // statement, so none is used (the later CREATE does not type the
+    // statements before it).
+    let b = "CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  CREATE TEMP TABLE t (\n    Name varchar(100),\n    Flag integer\n  );\n  INSERT INTO t (Name, Flag) VALUES ('a', 1);\n  SELECT COUNT(*) INTO p_n FROM t WHERE Flag = 1;\n  DROP TABLE t;\n  CREATE TEMP TABLE t (\n    Name varchar(100),\n    Flag boolean\n  );\nEND;\n$$;\n";
+    let r = run(a, b, P);
+    assert!(
+        !r.findings.iter().any(|f| f.rule == "equiv.bool-type-error"),
+        "{}",
+        reasons(&r)
+    );
+    assert_ne!(r.verdict(), Verdict::Equal, "{}", reasons(&r));
+}

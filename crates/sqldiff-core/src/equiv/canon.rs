@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use sqldiff_syntax::Dialect;
 
 use super::ast::{
-    Call, ConflictAction, Expr, From, InsertSource, JsonCol, MergeAction, OrderItem, SelItem,
-    Select, Stmt, Type,
+    Call, ConflictAction, Expr, From, InsertSource, JsonCol, MergeAction, OrderItem, Output,
+    SelItem, Select, Stmt, Type,
 };
 use super::literal::{self, Target};
 use super::lower::{Unit, UnitKind};
@@ -37,9 +37,25 @@ pub mod asm {
         "ASM-TSQL-DATEFIRST-7",
         "The T-SQL session keeps SET DATEFIRST 7 (the us_english default): DATEPART(weekday) counts Sunday as 1",
     );
+    pub const PROCID_NAME: (&str, &str) = (
+        "ASM-PROCID-NAME",
+        "SQL Server stores the routine under the name and schema its header writes, letter for letter (OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) become them as literals)",
+    );
+    pub const TSQL_ANSI_NULLS: (&str, &str) = (
+        "ASM-TSQL-ANSI-NULLS",
+        "The T-SQL routine was created with ANSI_NULLS ON (its sys.sql_modules.uses_ansi_nulls is 1)",
+    );
+    pub const TSQL_QUOTED_IDENTIFIER: (&str, &str) = (
+        "ASM-TSQL-QUOTED-IDENTIFIER",
+        "The T-SQL routine was created with QUOTED_IDENTIFIER ON (its sys.sql_modules.uses_quoted_identifier is 1)",
+    );
     pub const SAME_DATABASE_NAME: (&str, &str) = (
         "ASM-SAME-DATABASE-NAME",
         "The PostgreSQL database has the same name, letter for letter, as the SQL Server database",
+    );
+    pub const QUOTENAME_IDENT: (&str, &str) = (
+        "ASM-QUOTENAME-IDENT",
+        "QUOTENAME's result is used only as an identifier, never as text, and is at most 128 characters: QUOTENAME brackets ([a]]b]) where quote_ident double-quotes only when needed (\"a]b\")",
     );
     pub const TSQL_CI: (&str, &str) = (
         "ASM-TSQL-CI-COLLATION",
@@ -49,7 +65,7 @@ pub mod asm {
     /// case-sensitive one is kept, and flagged with this per statement.
     pub const CI_COLLATION: (&str, &str) = (
         "ASM-CI-COLLATION",
-        "String equality and LIKE give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar), and no value LIKE tests has trailing spaces or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL); the other side compares those values as different",
+        "String equality, LIKE and the substrings REPLACE and CHARINDEX find give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (SQL Server 2022's default SQL_Latin1_General_CP1_CI_AS finds N'æ' = N'ae', N'ß' = N'ss' and full-width N'Ａ' = N'A' and ignores NCHAR(0) in nvarchar), and no value LIKE tests has trailing spaces or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL); the other side compares those values as different",
     );
     pub const CASE_FOLD: (&str, &str) = (
         "ASM-CASE-FOLD",
@@ -62,6 +78,14 @@ pub mod asm {
     pub const UNTYPED: (&str, &str) = (
         "ASM-UNTYPED-NONCHAR",
         "Values whose type is unknown (no catalog) are not character strings, real (single precision), T-SQL tinyint or decimals of 38 digits, so comparison and arithmetic mean the same on both sides",
+    );
+    pub const DATEADD_RANGE: (&str, &str) = (
+        "ASM-DATEADD-RANGE",
+        "DATEADD results stay within the range of their type: T-SQL raises an error past 9999-12-31 (or before 0001-01-01), where PostgreSQL returns the date",
+    );
+    pub const DATEADD_YEAR_END: (&str, &str) = (
+        "ASM-DATEADD-YEAR-END",
+        "T-SQL DATEADD clamps years to the month end as it does months (2024-02-29 + 1 year = 2025-02-28), as PostgreSQL does; Microsoft documents the rule for months only",
     );
     pub const UNTYPED_CAST: (&str, &str) = (
         "ASM-UNTYPED-CAST",
@@ -139,6 +163,18 @@ pub mod asm {
         "ASM-VALUES-ROW-ORDER",
         "A multi-row VALUES list gets the values the table generates (identity, sequence defaults) in the order its rows are written on both sides",
     );
+    pub const OUTPUT_INTO_TARGET: (&str, &str) = (
+        "ASM-OUTPUT-INTO-TARGET",
+        "The table OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key: SQL Server rejects the statement otherwise (Msg 331, 332, 333), where the PostgreSQL insert runs",
+    );
+    pub const OUTPUT_ROW_ORDER: (&str, &str) = (
+        "ASM-OUTPUT-ROW-ORDER",
+        "The rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order",
+    );
+    pub const RETURN_NULL_WARNING: (&str, &str) = (
+        "ASM-TSQL-RETURN-NULL-WARNING",
+        "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)",
+    );
     pub const NO_CALLER_TXN: (&str, &str) = (
         "ASM-NO-CALLER-TXN",
         "The caller does not hold an open transaction",
@@ -195,6 +231,16 @@ pub mod asm {
     pub const IDENT_FOLD: (&str, &str) = (
         "ASM-IDENT-FOLD",
         "Names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, or, in PostgreSQL, from the quoted names the statements write, which no other name of the statement or the catalog matches up to letter case; and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
+    );
+    /// `sqldiff convert` keeps a call unproven unless the converted callee's
+    /// own file is converted or under assumptions, and carries those.
+    pub const UDF_CALLEE: (&str, &str) = (
+        "ASM-UDF-CALLEE",
+        "The user function a call names on side B is the conversion of the one it names on side A, and that conversion is shown equal, or equal under the assumptions its file lists, in the file that creates it",
+    );
+    pub const UDF_CALL_CONTEXT: (&str, &str) = (
+        "ASM-UDF-CALL-CONTEXT",
+        "A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it: it reads no data the calling statement or another session changes while the statement runs, and no clock (SQL Server reads SYSDATETIME() at each call inside a function, PostgreSQL's statement_timestamp() and now() give the calling statement's or transaction's start)",
     );
     pub const ROUTINE_LABEL: (&str, &str) = (
         "ASM-ROUTINE-LABEL",
@@ -275,9 +321,106 @@ pub struct Canon<'a> {
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
     /// bit read through a derived table still meets numbers as a bit.
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
+    /// The rows the statement being lowered returns (see `output_stmt`).
+    output: Option<Output>,
     /// The column types of each cursor's query, by key, from its OPEN
     /// (`cursor_op`); kept across statements.
     cursor_cols: HashMap<String, Vec<Option<Ty>>>,
+    /// Why a cursor's OPEN was not read, by cursor key: its FETCHes say so.
+    cursor_failed: HashMap<String, String>,
+}
+
+/// T-SQL `OBJECT_NAME(@@PROCID)` / `OBJECT_SCHEMA_NAME(@@PROCID)` in a
+/// procedure: its own name or schema as the header writes it
+/// (`asm::PROCID_NAME`). `None` elsewhere (a script's @@PROCID is 0, a
+/// trigger's is the trigger, an inline table-valued function or an inlined
+/// scalar function runs in its caller's query), for a temporary procedure,
+/// and for a schema the header leaves out (the creator's default schema).
+pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
+    let name = c.name.last()?.to_ascii_lowercase();
+    let schema = match name.as_str() {
+        "object_name" => false,
+        "object_schema_name" => true,
+        _ => return None,
+    };
+    let procid = matches!(c.args.as_slice(), [Expr::Var(v)] if v.eq_ignore_ascii_case("@@procid"));
+    if u.dialect != Dialect::Tsql
+        || c.name.len() != 1
+        || !procid
+        || c.distinct
+        || c.star
+        || u.kind != UnitKind::Proc
+    {
+        return None;
+    }
+    let parts = &u.routine_parts;
+    let last = parts.last().filter(|l| !l.starts_with('#'))?;
+    if !schema {
+        return Some(last.clone());
+    }
+    (parts.len() >= 2).then(|| parts[parts.len() - 2].clone())
+}
+
+/// T-SQL `(SELECT uses_ansi_nulls FROM sys.sql_modules WHERE object_id =
+/// @@PROCID) = 1` (or `uses_quoted_identifier`) in a procedure:
+/// the running routine tests its own setting, which every converted routine
+/// is assumed to have been created with (the converter writes `true`).
+fn module_setting_test(u: &Unit, e: &Expr) -> Option<(&'static str, &'static str)> {
+    if u.dialect != Dialect::Tsql || u.kind != UnitKind::Proc {
+        return None;
+    }
+    let Expr::Bin(op, l, r) = e else { return None };
+    let (Expr::Subquery(q), Expr::Num(one)) = (l.as_ref(), r.as_ref()) else {
+        return None;
+    };
+    if op != "=" || one != "1" {
+        return None;
+    }
+    let plain = q.ctes.is_empty()
+        && !q.for_json
+        && q.set_ops.is_empty()
+        && !q.distinct
+        && q.top.is_none()
+        && q.into.is_empty()
+        && q.group_by.is_empty()
+        && q.having.is_none()
+        && q.order_by.is_empty()
+        && q.offset.is_none()
+        && q.limit.is_none()
+        && q.locking.is_empty()
+        && q.values.is_none();
+    let is = |x: &str, y: &str| x.eq_ignore_ascii_case(y);
+    let modules = matches!(q.from.as_slice(), [From::Table { name, alias: None, hints }]
+        if hints.is_empty() && matches!(name.as_slice(), [s, m] if is(s, "sys") && is(m, "sql_modules")));
+    let procid = matches!(&q.where_, Some(Expr::Bin(op, c, v))
+        if op == "="
+            && matches!(c.as_ref(), Expr::Name(p) if matches!(p.as_slice(), [x] if is(x, "object_id")))
+            && matches!(v.as_ref(), Expr::Var(v) if is(v, "@@procid")));
+    let setting = match q.items.as_slice() {
+        [SelItem {
+            expr: Expr::Name(p),
+            alias: None,
+            assign: None,
+        }] => match p.as_slice() {
+            [x] if is(x, "uses_ansi_nulls") => asm::TSQL_ANSI_NULLS,
+            [x] if is(x, "uses_quoted_identifier") => asm::TSQL_QUOTED_IDENTIFIER,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (plain && modules && procid).then_some(setting)
+}
+
+/// `e` with a T-SQL `OBJECT_NAME(@@PROCID)` (see `own_name`) read as the
+/// string literal it is.
+pub(super) fn own_name_literal<'e>(u: &Unit, e: &'e Expr) -> std::borrow::Cow<'e, Expr> {
+    match e {
+        Expr::Call(c) => match own_name(u, c) {
+            Some(s) => std::borrow::Cow::Owned(Expr::Str(s)),
+            None => std::borrow::Cow::Borrowed(e),
+        },
+        _ => std::borrow::Cow::Borrowed(e),
+    }
 }
 
 /// Lower-case hex digits of a byte string written in hex, `None` unless
@@ -418,9 +561,11 @@ impl<'a> Canon<'a> {
             excluded: None,
             sub_bits: HashMap::new(),
             cursor_cols: HashMap::new(),
+            cursor_failed: HashMap::new(),
             by_name: false,
             fold_quoted: false,
             names: Vec::new(),
+            output: None,
         }
     }
 
@@ -432,6 +577,7 @@ impl<'a> Canon<'a> {
         self.seen_tables.clear();
         self.excluded = None;
         self.names.clear();
+        self.output = None;
     }
 
     fn assume(&mut self, x: (&str, &str)) {
@@ -456,11 +602,14 @@ impl<'a> Canon<'a> {
     /// (and database) unless the schema is the default one (none written,
     /// T-SQL `dbo`, PostgreSQL `public`). Temporary tables get `temp:`; a
     /// table variable `@t` of routine `routine` converted to one of
-    /// `other_temps` gets that table's key (`classify::table_variable_table`).
+    /// `other_temps` gets that table's key (`classify::table_variable_table`),
+    /// and so does a bare name in `local_temps` (a PostgreSQL temporary
+    /// table the unit created, which the bare name finds first).
     /// Returns the key and, for a default schema, how it was written.
     pub fn table_name(
         parts: &[String],
         other_temps: &std::collections::HashSet<String>,
+        local_temps: &std::collections::HashSet<String>,
         routine: Option<&str>,
     ) -> (String, Option<String>) {
         let last = parts.last().map(|s| lc(s)).unwrap_or_default();
@@ -471,6 +620,9 @@ impl<'a> Canon<'a> {
             if other_temps.contains(&t) {
                 return (format!("temp:{t}"), None);
             }
+        }
+        if parts.len() == 1 && local_temps.contains(&last) {
+            return (format!("temp:{last}"), None);
         }
         let temp = last.starts_with('#')
             || last.starts_with('@')
@@ -498,8 +650,20 @@ impl<'a> Canon<'a> {
 
     /// `table_name`, remembering the name for the statement's item.
     fn table_key(&mut self, parts: &[String]) -> String {
-        let (key, default) =
-            Self::table_name(parts, &self.unit.other_temps, self.unit.routine.as_deref());
+        let (key, default) = Self::table_name(
+            parts,
+            &self.unit.other_temps,
+            &self.unit.local_temps,
+            self.unit.routine.as_deref(),
+        );
+        // T-SQL `sys.name` is SQL Server's own catalog view; a table of that
+        // name on another side is some other table, never its counterpart.
+        let key = match parts {
+            [.., s, _] if self.d != Dialect::Tsql && lc(s) == "sys" => {
+                format!("{}:{key}", self.d.id())
+            }
+            _ => key,
+        };
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);
@@ -1035,6 +1199,10 @@ impl<'a> Canon<'a> {
     // ---- expressions ----------------------------------------------------
 
     pub fn expr(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        if let Some(x) = module_setting_test(self.unit, e) {
+            self.assume(x);
+            return self.expr(&Expr::Special("TRUE".into()));
+        }
         Ok(match e {
             Expr::Name(parts) => self.resolve(parts)?,
             Expr::Var(v) => {
@@ -1218,6 +1386,17 @@ impl<'a> Canon<'a> {
                 (n("bytes", vec![a(hex)]), None)
             }
             Expr::Cast(x, ty) => {
+                if let Expr::Bin(op, l, r) = x.as_ref() {
+                    if self.d == Dialect::Postgres
+                        && op == "+"
+                        && ty.name.eq_ignore_ascii_case("DATE")
+                        && ty.args.is_empty()
+                    {
+                        if let Some(t) = self.pg_date_add(l, r, true)? {
+                            return Ok(t);
+                        }
+                    }
+                }
                 let dst = Ty::from_type(ty, self.d, true);
                 // A string literal cast to a type whose conversion is modelled
                 // stands for the value it converts to ('12' as int is 12 on
@@ -1272,6 +1451,23 @@ impl<'a> Canon<'a> {
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
+            // The converter's CHARINDEX of a needle that may be empty:
+            // CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END.
+            Expr::Case(None, whens, Some(els))
+                if self.d == Dialect::Postgres && charindex_case(whens, els).is_some() =>
+            {
+                let (hay, needle) = charindex_case(whens, els).unwrap();
+                let (h, hty) = self.expr(hay)?;
+                let (x, xty) = self.expr(needle)?;
+                if [hty, xty]
+                    .iter()
+                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
+                {
+                    let ci = self.collation_marker();
+                    return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
+                }
+                (n("dfn", vec![self.dtag(), a("charindex-case"), h, x]), None)
+            }
             Expr::Case(op, whens, els) => {
                 let mut kids = Vec::new();
                 match op {
@@ -1313,7 +1509,15 @@ impl<'a> Canon<'a> {
                 });
                 (n("case", kids), ty)
             }
-            Expr::Exists(q) => (n("exists", vec![self.query(q, QCtx::Exists)?.0]), None),
+            Expr::Exists(q) => match super::objcheck::of(q, self.d) {
+                // A catalog existence check: the same term on both sides
+                // when it looks for the same kind and name.
+                Some(c) => {
+                    self.assume(super::objcheck::ASSUMPTION);
+                    (n("catalog-exists", vec![a(c.kind.name()), a(c.name)]), None)
+                }
+                None => (n("exists", vec![self.query(q, QCtx::Exists)?.0]), None),
+            },
             Expr::Subquery(q) => {
                 let (t, ty) = self.query(q, QCtx::Scalar)?;
                 (n("subq", vec![t]), ty)
@@ -1668,11 +1872,114 @@ impl<'a> Canon<'a> {
         }
     }
 
+    /// A call to a scalar user function the side's catalog holds: `ufn`
+    /// with the function's name and the values its parameters receive, the
+    /// same term in T-SQL and PostgreSQL. Each argument goes through the
+    /// conversion to its parameter's type the side applies: SQL Server cuts,
+    /// rounds and pads to the declared type, PostgreSQL ignores its length,
+    /// precision and scale (eval/user-functions), so an argument the
+    /// parameter does not take unchanged on both sides leaves the two terms
+    /// apart. The function itself is the conversion of the other side's,
+    /// compared in the file that creates it (`ASM-UDF-CALLEE`, which
+    /// `sqldiff convert` checks against that file's own status), and called
+    /// in a statement it may run once per row or fewer times
+    /// (`ASM-UDF-CALL-CONTEXT`). `None` when the call is not of that form.
+    fn user_fn(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
+        if !matches!(self.d, Dialect::Tsql | Dialect::Postgres)
+            || c.name.len() != 2
+            || c.distinct
+            || c.star
+            || c.over
+            || !c.order.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(view) = self.schema.catalog() else {
+            return Ok(None);
+        };
+        let parts: Vec<crate::catalog::Ident> = c
+            .name
+            .iter()
+            .map(|x| match x.strip_prefix('"') {
+                Some(q) => crate::catalog::Ident::new(q, true),
+                None => crate::catalog::Ident::new(x.as_str(), false),
+            })
+            .collect();
+        let found: Vec<&crate::catalog::Routine> = match view.routines(&parts) {
+            crate::catalog::Lookup::Found(rs) => rs
+                .into_iter()
+                .filter(|r| r.kind == crate::catalog::RoutineKind::Function)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let [r] = found.as_slice() else {
+            return Ok(None);
+        };
+        let Some(ret) = &r.returns else {
+            return Ok(None);
+        };
+        let set = ["TABLE", "SETOF", "RECORD", "VOID", "TRIGGER"];
+        if set.iter().any(|x| ret.base.starts_with(x))
+            || r.params.len() != c.args.len()
+            || r.params
+                .iter()
+                .any(|p| p.mode != crate::catalog::ParamMode::In)
+        {
+            return Ok(None);
+        }
+        let pg = |t: Ty| match self.d {
+            Dialect::Postgres => untypmod(t),
+            _ => t,
+        };
+        let (schema, name) = (lc(&c.name[0]), lc(&c.name[1]));
+        let default = matches!(
+            (self.d, schema.as_str()),
+            (Dialect::Tsql, "dbo") | (Dialect::Postgres, "public")
+        );
+        let key = if default {
+            name
+        } else {
+            format!("{schema}.{name}")
+        };
+        let params: Vec<Ty> = r
+            .params
+            .iter()
+            .map(|p| pg(super::schema::ty_of(&p.data_type, self.d)))
+            .collect();
+        // PostgreSQL returns the value without the declared length,
+        // precision and scale; under `ASM-UDF-CALLEE` it is the value the
+        // T-SQL function returns, which has them.
+        let ret = super::schema::ty_of(ret, self.d);
+        let mut kids = vec![a(key.clone())];
+        for (x, p) in c.args.iter().zip(params) {
+            let v = self.expr(x)?;
+            kids.push(self.conv_var(&Some(p), v).0);
+        }
+        if default {
+            self.assume(asm::DEFAULT_SCHEMA);
+        }
+        let id = format!("{}:{key}", asm::UDF_CALLEE.0);
+        if !self.asm.iter().any(|y| y.id == id) {
+            self.asm.push(Assumption::default(
+                &id,
+                &format!("{} (here `{}`)", asm::UDF_CALLEE.1, r.display()),
+            ));
+        }
+        self.assume(asm::UDF_CALL_CONTEXT);
+        Ok(Some((n("ufn", kids), Some(ret))))
+    }
+
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
+        if c.over {
+            return self.window(c);
+        }
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a
         // built-in unqualified only.
         if c.name.len() > 1 {
+            if let Some(t) = self.user_fn(c)? {
+                return Ok(t);
+            }
             let mut args = vec![
                 self.dtag(),
                 a(c.name.iter().map(|x| lc(x)).collect::<Vec<_>>().join(".")),
@@ -1685,6 +1992,13 @@ impl<'a> Canon<'a> {
         let d = self.d;
         let argc = c.args.len();
         let plain = !c.distinct && c.order.is_empty() && !c.star;
+        // OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID): the
+        // running procedure's or function's own name, as its header writes
+        // it (the converter writes the same literal).
+        if let Some(part) = own_name(self.unit, c) {
+            self.assume(asm::PROCID_NAME);
+            return self.expr(&Expr::Str(part));
+        }
         // Aggregates and functions with special forms first.
         match (d, name.as_str()) {
             (_, "count") if c.order.is_empty() => {
@@ -1741,6 +2055,15 @@ impl<'a> Canon<'a> {
                 };
                 if let Some(ty) = ty {
                     return self.expr(&Expr::Cast(Box::new(c.args[1].clone()), ty));
+                }
+            }
+            (Dialect::Tsql, "dateadd") if argc == 3 && plain => {
+                if let Some(field) = dateadd_field(&c.args[0]) {
+                    let k = self.expr(&c.args[1])?;
+                    let d = self.expr(&c.args[2])?;
+                    if let Some(t) = self.date_add(field, k, d) {
+                        return Ok(t);
+                    }
                 }
             }
             // CONVERT(varchar(n), x, style) of a date or date-time: the text
@@ -1897,6 +2220,121 @@ impl<'a> Canon<'a> {
                         first_ty,
                     )
                 }
+            }
+            // REPLACE matches `from` under the collation: case-insensitively
+            // in T-SQL (by default), exactly in PostgreSQL. The collation is
+            // kept as a marker, as in `strcmp`, so the two are equal only
+            // under ASM-CI-COLLATION in a conversion check. varchar only
+            // (PostgreSQL strips char padding first), and only where T-SQL
+            // cannot cut the result at 8,000 bytes.
+            (Dialect::Tsql | Dialect::Postgres, "replace", 3)
+                if args
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar))
+                    && replace_fits(d, &c.args, &args) =>
+            {
+                let ci = self.collation_marker();
+                let mut kids = vec![a(ci)];
+                kids.extend(args.into_iter().map(|x| x.0));
+                (
+                    n("strreplace", kids),
+                    first_ty.map(|t| Ty { len: None, ..t }),
+                )
+            }
+            // CHARINDEX(needle, s): 0 for an empty needle. PostgreSQL's
+            // strpos(s, needle) agrees once the needle cannot be empty, or
+            // inside the converter's `CASE WHEN length(x) = 0 THEN 0 ELSE
+            // strpos(s, x) END` (lowered in `expr`). Collation as for REPLACE;
+            // positions under ASM-TSQL-LEN-BMP.
+            (Dialect::Tsql, "charindex", 2)
+                if args
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar)) =>
+            {
+                let ci = self.collation_marker();
+                // Positions count UTF-16 code units in T-SQL (non-_SC
+                // collations), code points in PostgreSQL.
+                self.assume(asm::LEN_BMP);
+                let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
+                (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+            }
+            (Dialect::Postgres, "strpos", 2)
+                if args
+                    .iter()
+                    .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar))
+                    && nonempty_text(&c.args[1]) =>
+            {
+                let ci = self.collation_marker();
+                let (hay, needle) = (args[0].0.clone(), args[1].0.clone());
+                (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+            }
+            // LTRIM / RTRIM with one argument remove spaces only, on both
+            // sides (not tabs, NBSP or ideographic spaces). varchar only:
+            // PostgreSQL strips char padding first.
+            (Dialect::Tsql | Dialect::Postgres, "ltrim" | "rtrim", 1)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar) =>
+            {
+                let x = args[0].0.clone();
+                (n("trim", vec![a(&name[..1]), x]), first_ty)
+            }
+            // QUOTENAME brackets ([a]]b]), quote_ident double-quotes only
+            // when needed ("a]b"): the same identifier, not the same text.
+            // Equal only under ASM-QUOTENAME-IDENT, which the converter notes.
+            (Dialect::Tsql, "quotename", 1) | (Dialect::Postgres, "quote_ident", 1)
+                if first_ty.is_some_and(|t| t.is_string()) =>
+            {
+                self.assume(asm::QUOTENAME_IDENT);
+                let x = args[0].0.clone();
+                (n("quoteident", vec![x]), Some(Ty::of(Fam::VarChar)))
+            }
+            // CEILING / FLOOR: the same value of a number. The result types
+            // differ (T-SQL keeps int and decimal(p, 0); PostgreSQL gives
+            // double precision for an int and an unconstrained numeric), so
+            // each side keeps its own and what follows is typed apart.
+            // PostgreSQL takes ceil(double precision) for an integer, which
+            // is exact only up to int (bigint above 2^53 is rounded).
+            (Dialect::Tsql, "ceiling" | "floor", 1)
+            | (Dialect::Postgres, "ceil" | "ceiling" | "floor", 1)
+                if first_ty.is_some_and(|t| {
+                    t.is_numeric()
+                        && (d == Dialect::Tsql
+                            || t.fam != Fam::Int
+                            || t.len.is_some_and(|l| l <= 32))
+                }) =>
+            {
+                let t = first_ty.unwrap();
+                let ty = match (d, t.fam) {
+                    (Dialect::Tsql, Fam::Exact) => Ty {
+                        scale: Some(0),
+                        ..t
+                    },
+                    (Dialect::Tsql, _) => t,
+                    (_, Fam::Exact) => Ty::of(Fam::Exact),
+                    _ => Ty {
+                        fam: Fam::Float,
+                        len: Some(53),
+                        scale: None,
+                    },
+                };
+                let h = if name == "floor" { "floor" } else { "ceil" };
+                let x = args[0].0.clone();
+                (n(h, vec![x]), Some(ty))
+            }
+            // SQRT of an integer or a float is the correctly rounded double
+            // on both sides; PostgreSQL's sqrt(numeric) is a numeric with
+            // other digits, so decimals are left out.
+            (Dialect::Tsql | Dialect::Postgres, "sqrt", 1)
+                if first_ty.is_some_and(|t| matches!(t.fam, Fam::Int | Fam::Float)) =>
+            {
+                let x = args[0].0.clone();
+                (
+                    n("sqrt", vec![x]),
+                    Some(Ty {
+                        fam: Fam::Float,
+                        len: Some(53),
+                        scale: None,
+                    }),
+                )
             }
             // LEN counts characters without trailing spaces: PostgreSQL's
             // length(rtrim(x)) (rtrim removes only spaces, as LEN ignores
@@ -2149,6 +2587,102 @@ impl<'a> Canon<'a> {
         })
     }
 
+    /// `d + n` (a number of days) or `d + make_interval(…)` in PostgreSQL,
+    /// as the `date-add` T-SQL DATEADD lowers to. `to_date`: the sum is
+    /// cast to date, which turns PostgreSQL's timestamp result of a date
+    /// plus an interval back into a date. `None` for any other sum.
+    fn pg_date_add(&mut self, l: &Expr, r: &Expr, to_date: bool) -> R<Option<(Term, Option<Ty>)>> {
+        let interval = match r {
+            Expr::Call(c) if is_make_interval(c) => Some(c),
+            _ => None,
+        };
+        // Only these two shapes; anything else is lowered as it was.
+        if interval.is_none() && to_date {
+            return Ok(None);
+        }
+        let d = self.expr(l)?;
+        let is_date = d.1.is_some_and(|t| t.fam == Fam::Date);
+        let (field, k) = match interval {
+            Some(c) => {
+                // Exactly one amount other than a zero literal.
+                let given: Vec<usize> = (0..c.args.len())
+                    .filter(|&i| !is_zero_literal(&c.args[i]))
+                    .collect();
+                let [i] = given.as_slice() else {
+                    return Ok(None);
+                };
+                // date + interval is a timestamp: only its cast back to date
+                // is DATEADD on a date.
+                if is_date != to_date {
+                    return Ok(None);
+                }
+                (MAKE_INTERVAL_FIELDS[*i], self.expr(&c.args[*i])?)
+            }
+            None if is_date => ("days", self.expr(r)?),
+            None => return Ok(None),
+        };
+        Ok(self.date_add(field, k, d))
+    }
+
+    /// DATEADD of `k` `field`s (`years` … `secs`, PostgreSQL's
+    /// make_interval names) to `d`, where both engines give the same
+    /// value: `k` an integer of at most 32 bits (T-SQL converts other
+    /// numbers to int, truncating; PostgreSQL's secs keeps a fraction), and
+    /// `d` a date (whole days or longer; T-SQL rejects smaller parts) or a
+    /// timestamp without T-SQL's datetime/smalldatetime ticks, which round.
+    /// Both add months by moving a day the month lacks to its last day,
+    /// and add hours, minutes and seconds exactly. The result has `d`'s
+    /// type, as in T-SQL.
+    fn date_add(
+        &mut self,
+        field: &str,
+        k: (Term, Option<Ty>),
+        d: (Term, Option<Ty>),
+    ) -> Option<(Term, Option<Ty>)> {
+        let (kt, kty) = k;
+        let (dt, dty) = d;
+        let kty = kty?;
+        if kty.fam != Fam::Int || kty.len.map_or(true, |b| b > 32) {
+            return None;
+        }
+        let dty = dty?;
+        let ok = match dty.fam {
+            Fam::Date => matches!(field, "years" | "months" | "weeks" | "days"),
+            Fam::Timestamp => dty.scale.is_none(),
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+        // A week is seven days on both sides; a literal count is folded so
+        // `d + 14` meets two weeks.
+        let (field, kt) = match (field, int_literal(&kt)) {
+            ("weeks", Some(w)) => ("days", n("num", vec![a((w * 7).to_string())])),
+            _ => (field, kt),
+        };
+        self.assume(asm::DATEADD_RANGE);
+        if field == "years" {
+            self.assume(asm::DATEADD_YEAR_END);
+        }
+        Some((n("date-add", vec![a(field), kt, dt]), Some(dty)))
+    }
+
+    /// The collation of a string match, as `strcmp` writes it: `ci` in
+    /// T-SQL (ASM-TSQL-CI-COLLATION), `cs` in PostgreSQL and Db2 for i.
+    fn collation_marker(&mut self) -> &'static str {
+        match self.d {
+            Dialect::Tsql => {
+                self.assume(asm::TSQL_CI);
+                "ci"
+            }
+            Dialect::Postgres => "cs",
+            Dialect::Db2i => {
+                self.assume(asm::DB2_SRTSEQ);
+                "cs"
+            }
+        }
+    }
+
     /// A date part as an integer: `year`, `month`, `day`, `hour`,
     /// `minute`, `second` (truncated) or `dow` (Sunday 0), of a date,
     /// timestamp (without time zone) or time where both dialects define it.
@@ -2225,7 +2759,31 @@ impl<'a> Canon<'a> {
         Ok(Some(self.cast(dst, v)))
     }
 
+    /// An aggregate `OVER ()`: the aggregate of all the rows the query
+    /// returns (after WHERE, GROUP BY and HAVING, before DISTINCT, ORDER BY
+    /// and paging), repeated on each row, in both dialects. Only COUNT,
+    /// MIN, MAX, SUM and AVG, lowered as without OVER (so a string MIN or
+    /// a SUM keeps its dialect); ranking functions are refused, which
+    /// T-SQL requires an ORDER BY for.
+    fn window(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
+        let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
+        if c.name.len() != 1 || !matches!(name.as_str(), "count" | "min" | "max" | "sum" | "avg") {
+            return Err(format!("{name}() OVER is not supported"));
+        }
+        let plain = Call {
+            over: false,
+            ..c.clone()
+        };
+        let (t, ty) = self.call(&plain)?;
+        Ok((n("win", vec![t]), ty))
+    }
+
     fn binary(&mut self, op: &str, l: &Expr, r: &Expr) -> R<(Term, Option<Ty>)> {
+        if self.d == Dialect::Postgres && op == "+" {
+            if let Some(t) = self.pg_date_add(l, r, false)? {
+                return Ok(t);
+            }
+        }
         if op == "AND" || op == "OR" {
             let mut parts = Vec::new();
             for side in [l, r] {
@@ -2931,6 +3489,9 @@ impl<'a> Canon<'a> {
 
     /// Query parts without the select list, plus the select items.
     fn query_parts(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        if !s.set_ops.is_empty() {
+            return self.set_query(s, ctx);
+        }
         if let Some(rows) = &s.values {
             let mut rs = Vec::new();
             for r in rows {
@@ -2949,6 +3510,174 @@ impl<'a> Canon<'a> {
         let r = self.query_inner(s, ctx);
         self.scopes.pop();
         r
+    }
+
+    /// `q1 UNION [ALL] q2 …`, EXCEPT, INTERSECT, with an ORDER BY of the
+    /// whole: `(setq (setop OP left right [coll]) (order …))`, the items
+    /// being the result columns `(ocol k)`. Left to right, as both T-SQL
+    /// and PostgreSQL group UNION and EXCEPT (the parser refuses INTERSECT
+    /// mixed with the others, which binds tighter in both). Only where both
+    /// give the same rows:
+    /// - each column has one known type in every branch, so neither
+    ///   dialect converts a branch's values to a common type (their rules
+    ///   for that differ);
+    /// - UNION, EXCEPT and INTERSECT without ALL remove duplicates by `=`,
+    ///   so string columns compare under each dialect's collation (kept as
+    ///   the dialect, as for DISTINCT);
+    /// - no branch has its own ORDER BY, TOP or paging, assignments or
+    ///   INTO, and the whole has no TOP, paging or locking (where a T-SQL
+    ///   TOP applies to the first branch and a PostgreSQL LIMIT to the
+    ///   whole);
+    /// - EXCEPT ALL and INTERSECT ALL, which T-SQL lacks, are refused;
+    /// - the ORDER BY names a result column (by its name in the first
+    ///   branch, or its position).
+    fn set_query(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        if s.top.is_some()
+            || s.limit.is_some()
+            || s.offset.is_some()
+            || !s.locking.is_empty()
+            || s.for_json
+            || !s.ctes.is_empty()
+            || !s.into.is_empty()
+        {
+            return Err("a set operation with TOP, paging, locking or INTO".into());
+        }
+        let mut head = s.clone();
+        head.set_ops.clear();
+        head.order_by.clear();
+        let mut branches: Vec<(Option<&str>, &Select)> = vec![(None, &head)];
+        for (op, b) in &s.set_ops {
+            branches.push((Some(op.as_str()), b));
+        }
+        let mut acc: Option<Term> = None;
+        let mut col_tys: Vec<Option<Ty>> = Vec::new();
+        let mut col_terms: Vec<Vec<Term>> = Vec::new();
+        for (op, b) in branches {
+            if b.top.is_some()
+                || b.limit.is_some()
+                || b.offset.is_some()
+                || !b.order_by.is_empty()
+                || !b.locking.is_empty()
+                || b.for_json
+                || !b.ctes.is_empty()
+                || !b.into.is_empty()
+                || !b.set_ops.is_empty()
+                || b.items.iter().any(|i| i.assign.is_some())
+            {
+                return Err(
+                    "a set operation branch with its own ORDER BY, TOP, paging, INTO or assignment"
+                        .into(),
+                );
+            }
+            let (mut parts, items) = self.query_parts(b, QCtx::Scalar)?;
+            if col_tys.is_empty() && acc.is_none() {
+                col_tys = items.iter().map(|x| x.1).collect();
+                col_terms = vec![Vec::new(); items.len()];
+            } else if items.len() != col_tys.len() {
+                return Err("set operation branches with different numbers of columns".into());
+            }
+            for (k, (t, ty)) in items.iter().enumerate() {
+                if ty.is_none() || *ty != col_tys[k] {
+                    return Err(format!(
+                        "set operation column {} has different or unknown types in its branches",
+                        k + 1
+                    ));
+                }
+                col_terms[k].push(t.clone());
+            }
+            parts.insert(1, n("items", items.into_iter().map(|x| x.0).collect()));
+            let q = n("q", parts);
+            acc = Some(match (acc, op) {
+                (None, _) => q,
+                (Some(l), Some(op)) => {
+                    let h = match op {
+                        "UNION ALL" => "union-all",
+                        "UNION" => "union",
+                        "EXCEPT" => "except",
+                        "INTERSECT" => "intersect",
+                        _ => return Err(format!("{op} is not supported")),
+                    };
+                    let mut kids = vec![a(h), l, q];
+                    if h != "union-all" && col_tys.iter().any(|t| t.is_some_and(|t| t.is_string()))
+                    {
+                        kids.push(n("coll", vec![self.dtag()]));
+                    }
+                    n("setop", kids)
+                }
+                (Some(_), None) => unreachable!("only the first branch has no operator"),
+            });
+        }
+        let acc = acc.ok_or("an empty set operation")?;
+        // Result columns, named as the first branch names them.
+        let names: Vec<Option<String>> = head
+            .items
+            .iter()
+            .map(|it| {
+                it.alias.clone().map(|x| lc(&x)).or_else(|| match &it.expr {
+                    Expr::Name(p) => p.last().map(|x| lc(x)),
+                    _ => None,
+                })
+            })
+            .collect();
+        let mut order = Vec::new();
+        for o in &s.order_by {
+            let k = match &o.expr {
+                Expr::Num(v) => v
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|k| (1..=col_tys.len()).contains(k))
+                    .map(|k| k - 1),
+                Expr::Name(p) if p.len() == 1 => {
+                    let want = lc(&p[0]);
+                    let hits: Vec<usize> = (0..names.len())
+                        .filter(|&k| names[k].as_deref() == Some(want.as_str()))
+                        .collect();
+                    match hits.as_slice() {
+                        [k] => Some(*k),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+            .ok_or("an ORDER BY of a set operation that is not one result column")?;
+            let nulls_first = o.nulls_first.unwrap_or(match self.d {
+                Dialect::Tsql => !o.desc,
+                Dialect::Postgres | Dialect::Db2i => o.desc,
+            });
+            let not_null = col_terms[k].iter().all(|t| self.not_null(t) == Some(true));
+            let nulls = match (not_null, nulls_first) {
+                (true, _) => "n/a",
+                (false, true) => "nf?",
+                (false, false) => "nl?",
+            };
+            let mut kids = vec![
+                n("ocol", vec![a(k.to_string())]),
+                a(if o.desc { "desc" } else { "asc" }),
+                a(nulls),
+            ];
+            if col_tys[k].is_some_and(|t| t.is_string()) {
+                kids.push(self.dtag());
+            }
+            order.push(n("ord", kids));
+        }
+        let items = col_tys
+            .iter()
+            .enumerate()
+            .map(|(k, ty)| {
+                let t = n("ocol", vec![a(k.to_string())]);
+                let t = match ctx {
+                    QCtx::Set => n("item", vec![t, a(names[k].clone().unwrap_or_default())]),
+                    _ => t,
+                };
+                (t, *ty)
+            })
+            .collect();
+        let items = if ctx == QCtx::Exists {
+            Vec::new()
+        } else {
+            items
+        };
+        Ok((vec![a("setq"), acc, n("order", order)], items))
     }
 
     fn query_inner(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
@@ -3268,7 +3997,139 @@ impl<'a> Canon<'a> {
         self.stmt_unfolded(s)
     }
 
+    /// Lowers a statement that returns the rows it changed (T-SQL OUTPUT,
+    /// PostgreSQL RETURNING; see `ast::Output`).
+    pub fn output_stmt(&mut self, s: &Stmt, o: &Output) -> R<Term> {
+        self.output = Some(o.clone());
+        let t = self.stmt(s);
+        self.output = None;
+        t
+    }
+
+    /// `(output-into DML TABLE (set (kv COL VALUE)...))`: the data change
+    /// `DML` and the rows it writes to `TABLE`, one per changed row, with
+    /// VALUE read from the row before (`old`) or after (`new`) the change.
+    /// T-SQL names the images `deleted` and `inserted`; PostgreSQL 18 names
+    /// them `old` and `new`, and a bare or table-qualified column means the
+    /// row after an INSERT or UPDATE and the row before a DELETE (checked
+    /// on PostgreSQL 18). Only images, variables and constants are taken:
+    /// no FROM list, subqueries or `*`. Rows returned to the caller (no
+    /// INTO) are not compared.
+    fn output_unfolded(&mut self, s: &Stmt, o: &Output) -> R<Term> {
+        self.output = None;
+        let (kind, target, alias) = match s {
+            Stmt::Insert {
+                target,
+                returning,
+                on_conflict: None,
+                ..
+            } if returning.is_empty() => ("insert", target, None),
+            Stmt::Update {
+                target,
+                alias,
+                from,
+                ..
+            } if from.is_empty() => ("update", target, alias.as_ref()),
+            Stmt::Delete {
+                target,
+                alias,
+                from,
+                ..
+            } if from.is_empty() => ("delete", target, alias.as_ref()),
+            _ => return Err("OUTPUT or RETURNING of this statement is not compared".into()),
+        };
+        let Some((into, cols)) = &o.into else {
+            return Err(
+                "rows returned to the caller by OUTPUT or RETURNING are not compared".into(),
+            );
+        };
+        if cols.is_empty() {
+            return Err("OUTPUT … INTO without a column list".into());
+        }
+        if cols.len() != o.items.len() {
+            return Err("OUTPUT … INTO column count does not match its items".into());
+        }
+        let dml = self.stmt_unfolded(s)?;
+        let table = self.table_key(target);
+        let Some(t) = self.schema.table(Self::base_table(&table)).cloned() else {
+            return Err(format!("the columns of {table} are not known"));
+        };
+        let cur = if kind == "delete" {
+            OLD_IMAGE
+        } else {
+            NEW_IMAGE
+        };
+        // What qualifies the changed row in PostgreSQL: the alias, else the
+        // table's name.
+        let qual = alias.or(target.last()).map(|x| lc(x)).unwrap_or_default();
+        let image = |x: &str| -> R<&'static str> {
+            match (self.d, x) {
+                (Dialect::Tsql, "inserted") if kind != "delete" => Ok(NEW_IMAGE),
+                (Dialect::Tsql, "deleted") if kind != "insert" => Ok(OLD_IMAGE),
+                (Dialect::Postgres, "new") if kind != "delete" => Ok(NEW_IMAGE),
+                (Dialect::Postgres, "old") if kind != "insert" => Ok(OLD_IMAGE),
+                (Dialect::Postgres, q) if q == qual => Ok(cur),
+                _ => Err(format!(
+                    "OUTPUT or RETURNING names `{x}`, which is not a row image of this statement"
+                )),
+            }
+        };
+        let mut items = Vec::new();
+        for it in &o.items {
+            let var = |x: &str| self.sym(x).is_some();
+            items.push(output_item(&it.expr, self.d, &t, cur, &image, &var)?);
+        }
+        let bind = |img: &str| Binding {
+            key: img.to_string(),
+            table: table.clone(),
+            derived: Some(
+                t.columns
+                    .iter()
+                    .map(|c| {
+                        let side = if img == NEW_IMAGE { "new" } else { "old" };
+                        (
+                            c.name.clone(),
+                            n("image", vec![a(side), a(table.clone()), a(c.name.clone())]),
+                            Some(c.ty),
+                        )
+                    })
+                    .collect(),
+            ),
+            unique: None,
+        };
+        self.scopes.push(vec![bind(NEW_IMAGE), bind(OLD_IMAGE)]);
+        let vals: R<Vec<(Term, Option<Ty>)>> = items.iter().map(|e| self.expr(e)).collect();
+        self.scopes.pop();
+        let vals = vals?;
+        if vals.iter().any(|(v, _)| has_head(v, "col")) {
+            return Err("OUTPUT or RETURNING reads a column outside the changed row".into());
+        }
+        let out = self.table_key(into);
+        let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
+        let mut kv = Vec::new();
+        for (c, v) in cols.iter().zip(vals) {
+            self.written(&out, c)?;
+            let (v, _) = self.conv_col(&out, c, v);
+            kv.push(n("kv", vec![a(c.clone()), v]));
+        }
+        kv.sort();
+        if self.d == Dialect::Tsql {
+            self.assume(asm::OUTPUT_INTO_TARGET);
+        }
+        let all_listed = self
+            .schema
+            .table(Self::base_table(&out))
+            .is_some_and(|t| t.columns.iter().all(|c| cols.contains(&c.name)));
+        if !all_listed {
+            self.assume(asm::OUTPUT_ROW_ORDER);
+        }
+        Ok(n("output-into", vec![dml, a(out), n("set", kv)]))
+    }
+
     fn stmt_unfolded(&mut self, s: &Stmt) -> R<Term> {
+        if let Some(o) = self.output.clone() {
+            return self.output_unfolded(s, &o);
+        }
         self.seen_tables.clear();
         self.single_row = false;
         match s {
@@ -3281,11 +4142,12 @@ impl<'a> Canon<'a> {
                 returning_into,
                 on_conflict,
             } => {
-                if cols.is_empty() {
-                    return Err("INSERT without a column list".into());
-                }
                 let table = self.table_key(target);
-                let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
+                let cols: Vec<String> = if cols.is_empty() {
+                    self.all_columns(&table, source)?
+                } else {
+                    cols.iter().map(|c| lc(c)).collect()
+                };
                 if let Some((keys, action)) = on_conflict {
                     return self.on_conflict(&table, &cols, source, keys, action, returning);
                 }
@@ -3377,12 +4239,19 @@ impl<'a> Canon<'a> {
                     (_, Expr::Subquery(q)) => {
                         let (q, qty) = self.query(q, QCtx::Scalar)?;
                         let v = (self.scalar(q, "error", "null"), qty);
-                        let ret = self.unit.returns;
+                        let ret = self.returned();
                         Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
                     _ => {
                         let v = self.expr(e)?;
-                        let ret = self.unit.returns;
+                        // A T-SQL procedure returns an int status.
+                        let ret = match (self.unit.dialect, self.unit.kind) {
+                            (Dialect::Tsql, UnitKind::Proc) => Some(Ty {
+                                len: Some(32),
+                                ..Ty::of(Fam::Int)
+                            }),
+                            _ => self.returned(),
+                        };
                         Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
                 }
@@ -3396,8 +4265,56 @@ impl<'a> Canon<'a> {
             Stmt::Message(Expr::Str(s)) if s.chars().count() <= 4000 => {
                 Ok(n("message", vec![n("str", vec![a(s.clone())])]))
             }
-            Stmt::Message(_) => Err("a message that is not a string literal".into()),
+            Stmt::Message(e) => self.print(e),
         }
+    }
+
+    /// The type a RETURN converts its value to. PostgreSQL drops the length,
+    /// precision and scale of a function's return type: `RETURNS varchar(5)`
+    /// returns 'abcdefgh' whole and `RETURNS numeric(10,2)` returns 1.005
+    /// unrounded, where SQL Server cuts and rounds (checked on PostgreSQL 18
+    /// and SQL Server 2022, eval/user-functions).
+    fn returned(&self) -> Option<Ty> {
+        let ret = self.unit.returns?;
+        if self.d != Dialect::Postgres {
+            return Some(ret);
+        }
+        Some(untypmod(ret))
+    }
+
+    /// A message that is an expression: T-SQL `PRINT e`, PL/pgSQL
+    /// `RAISE NOTICE '%', e`. Only a variable-length string or an integer,
+    /// whose text is the same on both sides: PRINT converts an integer to
+    /// its digits, as PostgreSQL shows it. A NULL shows as an empty line in
+    /// T-SQL and as `<NULL>` in PostgreSQL, which is part of the term, so a
+    /// T-SQL PRINT meets `RAISE NOTICE '%', COALESCE(e, '')`. PRINT cuts a
+    /// message off after 8,000 bytes (4,000 characters for nvarchar), so the
+    /// T-SQL string must be declared at most 4,000 characters long.
+    fn print(&mut self, e: &Expr) -> R<Term> {
+        let (t, ty) = self.expr(e)?;
+        let Some(ty) = ty else {
+            return Err("a message value of unknown type".into());
+        };
+        let null = match self.d {
+            Dialect::Tsql => "",
+            Dialect::Postgres => "<NULL>",
+            Dialect::Db2i => return Err("a message that is not a string literal".into()),
+        };
+        let head = match ty.fam {
+            Fam::VarChar if self.d != Dialect::Tsql || ty.len.is_some_and(|l| l <= 4000) => {
+                "msg-str"
+            }
+            Fam::VarChar => {
+                return Err("a PRINT value that may be longer than 4,000 characters".into())
+            }
+            Fam::Int => "msg-int",
+            _ => {
+                return Err(
+                    "a message value that is not a variable-length string or an integer".into(),
+                )
+            }
+        };
+        Ok(n("message", vec![n(head, vec![t, a(null)])]))
     }
 
     /// A message or raised error a format builds (`lower::Msg`): the text
@@ -3429,6 +4346,10 @@ impl<'a> Canon<'a> {
                     };
                     let (head, width) = match (spec, ty.fam) {
                         (Spec::Str, Fam::VarChar) => ("msg-str", ty.len.map(|l| l as usize)),
+                        // PostgreSQL `CAST(x AS text)` of a string is its text.
+                        (Spec::Int, Fam::VarChar) if !m.tsql => {
+                            ("msg-str", ty.len.map(|l| l as usize))
+                        }
                         (Spec::Int, Fam::Int)
                             if self.d != Dialect::Tsql || ty.len.is_some_and(|b| b <= 32) =>
                         {
@@ -3477,8 +4398,17 @@ impl<'a> Canon<'a> {
         use super::cursor::CursorOp;
         match op {
             CursorOp::Open { key, query, tsql } => {
-                let q = query.as_ref().map_err(Clone::clone)?;
-                let (mut parts, items) = self.query_parts(q, QCtx::Scalar)?;
+                let read = query
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|q| self.query_parts(q, QCtx::Scalar));
+                let (mut parts, items) = match read {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.cursor_failed.insert(key.clone(), e.clone());
+                        return Err(e);
+                    }
+                };
                 let from: Vec<Term> = parts.get(1).map(|f| f.kids().to_vec()).unwrap_or_default();
                 let order: Vec<Term> = parts.get(5).map(|o| o.kids().to_vec()).unwrap_or_default();
                 if order.is_empty() || !self.total_order(&from, &order) {
@@ -3494,11 +4424,17 @@ impl<'a> Canon<'a> {
                 Ok(n("cursor-open", vec![a(key.clone()), n("q", parts)]))
             }
             CursorOp::Fetch { key, targets } => {
-                let cols = self
-                    .cursor_cols
-                    .get(key)
-                    .cloned()
-                    .ok_or("a FETCH whose cursor's OPEN was not read")?;
+                let cols = match self.cursor_cols.get(key) {
+                    Some(c) => c.clone(),
+                    None => {
+                        return Err(match self.cursor_failed.get(key) {
+                            Some(why) => format!(
+                                "a FETCH of a cursor whose query was not read (in its OPEN: {why})"
+                            ),
+                            None => "a FETCH whose cursor's OPEN was not read".into(),
+                        })
+                    }
+                };
                 if cols.len() != targets.len() {
                     return Err(
                         "a FETCH into another number of variables than the cursor has columns"
@@ -3572,8 +4508,11 @@ impl<'a> Canon<'a> {
         let assigns: Vec<&SelItem> = sel.items.iter().filter(|i| i.assign.is_some()).collect();
         if !assigns.is_empty() {
             // T-SQL `SELECT @v = col FROM ...`: keeps the last row; zero rows leave @v unchanged.
-            if assigns.len() != sel.items.len() || assigns.len() != 1 {
-                return Err("SELECT assigning several variables is not supported".into());
+            if assigns.len() != sel.items.len() {
+                return Err("SELECT mixing assignments with other items".into());
+            }
+            if assigns.len() > 1 {
+                return self.assign_row(sel);
             }
             if let Some((var, v)) = sel.bare_assign() {
                 return self.stmt(&Stmt::Assign(var, v.clone()));
@@ -3619,6 +4558,125 @@ impl<'a> Canon<'a> {
             ) => Err("SELECT without INTO in PL/pgSQL".into()),
             _ => self.resultset(sel),
         }
+    }
+
+    /// The columns an INSERT without a column list fills: every column of
+    /// the table, in the catalog's order. Only for a table without identity
+    /// or computed columns: T-SQL leaves those out of the list, PostgreSQL
+    /// fills them too. The values must then match the columns one for one
+    /// (`insert_row`, `insert`), where PostgreSQL would also accept fewer.
+    fn all_columns(&self, table: &str, source: &InsertSource) -> R<Vec<String>> {
+        if matches!(source, InsertSource::Default) {
+            return Ok(Vec::new());
+        }
+        let temp;
+        let t = match table.strip_prefix("temp:") {
+            Some(_) => {
+                temp = self.temp_table(table);
+                temp.as_ref()
+            }
+            None => self.schema.table_exact(
+                table.rsplit_once('.').map(|(s, _)| s),
+                Self::base_table(table),
+            ),
+        };
+        let Some(t) = t else {
+            return Err(
+                "INSERT without a column list into a table whose definition is not known".into(),
+            );
+        };
+        if t.columns.iter().any(|c| c.identity || c.generated) {
+            return Err(
+                "INSERT without a column list into a table with an identity or computed column"
+                    .into(),
+            );
+        }
+        if !t.complete || t.columns.is_empty() {
+            return Err(
+                "INSERT without a column list into a table whose columns are not all known".into(),
+            );
+        }
+        Ok(t.columns.iter().map(|c| c.name.clone()).collect())
+    }
+
+    /// The one table variable or temporary table of this unit (`DECLARE
+    /// @t TABLE (…)`, `CREATE TEMP TABLE t (…)`) that the key `temp:…`
+    /// names, read from its column list.
+    fn temp_table(&self, key: &str) -> Option<super::schema::Table> {
+        use sqldiff_syntax::abstract_syntax::K;
+        let mut found = Vec::new();
+        for (node, _) in &self.unit.table_vars {
+            let ts = sqldiff_syntax::abstract_syntax::tokens(node);
+            let open = ts.iter().position(|t| t.kind == K::LParen)?;
+            let parts: Vec<String> = match self.d {
+                Dialect::Tsql => ts.get(1).map(|t| vec![t.text.clone()])?,
+                Dialect::Postgres => {
+                    let at = ts.iter().position(|t| t.up == "TABLE")? + 1;
+                    ts[at..open]
+                        .iter()
+                        .filter(|t| t.kind != K::Dot)
+                        .map(|t| t.text.clone())
+                        .collect()
+                }
+                Dialect::Db2i => return None,
+            };
+            let (k, _) = Self::table_name(
+                &parts,
+                &self.unit.other_temps,
+                &self.unit.local_temps,
+                self.unit.routine.as_deref(),
+            );
+            if k == key {
+                let text = node.text().to_string();
+                let from = ts[open].off - usize::from(node.text_range().start());
+                found.push(format!("CREATE TABLE t {}", text.get(from..)?));
+            }
+        }
+        let [ddl] = found.as_slice() else {
+            return None;
+        };
+        Schema::default().with_ddl(ddl, self.d).table("t").cloned()
+    }
+
+    /// T-SQL `SELECT @a = x, @b = y FROM …` (and the PL/pgSQL loop block
+    /// the conversion writes for it): each row assigns every variable, so
+    /// after the last row each holds that row's value, and with no row each
+    /// keeps its own, as for one variable. Each value goes through its
+    /// variable's assignment conversion. The pairs are kept in variable
+    /// order, which does not matter once no item reads an assigned
+    /// variable: T-SQL then assigns the same values in any order. A query
+    /// that reads one, or assigns a variable twice, is refused.
+    fn assign_row(&mut self, sel: &Select) -> R<Term> {
+        let mut targets = Vec::new();
+        for it in &sel.items {
+            let v = it.assign.clone().unwrap_or_default();
+            let (sym, ty) = self.target_sym(&Expr::Var(v))?;
+            if targets.iter().any(|(s, _)| *s == sym) {
+                return Err("SELECT assigning a variable twice".into());
+            }
+            targets.push((sym, ty));
+        }
+        let (mut parts, items) = self.query_parts(sel, QCtx::Into)?;
+        let mut pairs: Vec<(Term, Term)> = Vec::new();
+        for ((sym, ty), v) in targets.into_iter().zip(items) {
+            let v = self.conv_var(&ty, v).0;
+            pairs.push((sym, v));
+        }
+        let reads_target = parts
+            .iter()
+            .chain(pairs.iter().map(|(_, v)| v))
+            .any(|t| t.any(&|x| pairs.iter().any(|(s, _)| x == s)));
+        if reads_target {
+            return Err("SELECT reading a variable it assigns".into());
+        }
+        pairs.sort();
+        let (syms, vals): (Vec<Term>, Vec<Term>) = pairs.into_iter().unzip();
+        parts.insert(1, n("items", vals));
+        let q = n("q", parts);
+        Ok(n(
+            "assign-row",
+            vec![n("targets", syms), self.scalar(q, "last", "unchanged")],
+        ))
     }
 
     fn insert(&mut self, table: &str, cols: &[String], source: &InsertSource) -> R<Term> {
@@ -3749,6 +4807,7 @@ impl<'a> Canon<'a> {
     /// Db2 `SELECT c INTO v FROM FINAL TABLE (INSERT ...)`.
     fn final_table(&mut self, sel: &Select, kind: &str, stmt: &Stmt) -> R<Term> {
         if kind != "FINAL"
+            || !sel.set_ops.is_empty()
             || sel.where_.is_some()
             || !sel.group_by.is_empty()
             || !sel.order_by.is_empty()
@@ -3872,6 +4931,7 @@ impl<'a> Canon<'a> {
                 alias: Some(sa),
                 cols,
             } if query.from.is_empty()
+                && query.set_ops.is_empty()
                 && query.values.is_none()
                 && cols.is_empty()
                 && query.where_.is_none() =>
@@ -4635,6 +5695,54 @@ impl<'a> Canon<'a> {
         Ok(n("delete", vec![a(table), w]))
     }
 
+    /// `assign(return_code, coalesce(v, 0))` then `return` in a PostgreSQL
+    /// procedure, `return_code` being its INOUT parameter of that name and
+    /// `v` an integer literal or an integer variable or parameter: `v`, and
+    /// whether it may be NULL.
+    fn return_code(&self, x: &Term, y: &Term) -> Option<(Term, bool)> {
+        if self.unit.dialect != Dialect::Postgres
+            || self.unit.kind != UnitKind::Proc
+            || !y.is("return")
+            || !y.kids().is_empty()
+            || !x.is("assign")
+        {
+            return None;
+        }
+        let param = |s: &Term| {
+            let k = s.kid(0)?.atom()?.strip_prefix('p')?.parse::<usize>().ok()?;
+            self.unit.params.get(k.checked_sub(1)?)
+        };
+        let target = x.kid(0).filter(|s| s.is("sym")).and_then(param)?;
+        if target.name != "return_code" || !target.out {
+            return None;
+        }
+        let v = x.kid(1).filter(|v| {
+            v.is("fn")
+                && v.kids().len() == 3
+                && v.kid(0).and_then(Term::atom) == Some("coalesce")
+                && v.kid(2) == Some(&n("num", vec![a("0")]))
+        })?;
+        let v = v.kid(1)?;
+        let int = |t: &Option<Ty>| {
+            t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|b| b > 1 && b <= 32))
+        };
+        if v.is("num") {
+            v.kid(0)?.atom()?.parse::<i32>().ok()?;
+            return Some((v.clone(), false));
+        }
+        if !v.is("sym") {
+            return None;
+        }
+        let name = v.kid(0)?.atom()?;
+        let k = name[1..].parse::<usize>().ok()?.checked_sub(1)?;
+        let ty = match name.as_bytes().first()? {
+            b'l' => self.unit.locals.get(k)?.ty,
+            b'p' => self.unit.params.get(k)?.ty,
+            _ => return None,
+        };
+        int(&ty).then(|| (v.clone(), true))
+    }
+
     /// Statement list of the unit, after the cross-statement lifts.
     pub fn lift(&mut self, stmts: Vec<Item>) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
@@ -4671,6 +5779,25 @@ impl<'a> Canon<'a> {
                 }
             }
             out.push(it);
+        }
+        // PostgreSQL procedure converted from T-SQL: `return_code :=
+        // COALESCE(v, 0); RETURN;` is T-SQL's `RETURN v` (a procedure's
+        // status is never NULL: T-SQL returns 0 instead). Only for an
+        // integer `v` the assignment stores as it is (no conversion), so
+        // T-SQL's conversion of `v` to int changes nothing either.
+        let mut i = 0;
+        while i + 1 < out.len() {
+            match self.return_code(&out[i].term, &out[i + 1].term) {
+                Some((v, may_be_null)) => {
+                    let next = out.remove(i + 1);
+                    out[i].term = n("return", vec![v]);
+                    out[i].absorb(next);
+                    if may_be_null {
+                        out[i].asm.push(asm::make(asm::RETURN_NULL_WARNING));
+                    }
+                }
+                None => i += 1,
+            }
         }
         // Inline `assign(local, v); return(local)` when the local is fresh.
         let mut i = 0;
@@ -4777,6 +5904,85 @@ impl Item {
 /// page, lock)`). It aggregates even when WHERE matches no row; HAVING, TOP 0
 /// or OFFSET can drop that row. Only an aggregate in the select list itself
 /// counts, not one inside a subquery.
+const INT32: Ty = Ty {
+    fam: Fam::Int,
+    len: Some(32),
+    scale: None,
+};
+
+/// A string expression that is never empty (NULL aside): a non-empty
+/// literal, or a `||` chain with one.
+fn nonempty_text(e: &Expr) -> bool {
+    match e {
+        Expr::Str(s) => !s.is_empty(),
+        Expr::Bin(op, l, r) if op == "||" => nonempty_text(l) || nonempty_text(r),
+        _ => false,
+    }
+}
+
+/// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END`: (s, x).
+fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
+    let [(Expr::Bin(op, l, r), Expr::Num(zero))] = whens else {
+        return None;
+    };
+    let call = |e: &'e Expr, name: &str, argc: usize| match e {
+        Expr::Call(c)
+            if c.name.len() == 1
+                && c.name[0].eq_ignore_ascii_case(name)
+                && c.args.len() == argc
+                && !c.distinct
+                && !c.star
+                && c.order.is_empty() =>
+        {
+            Some(&c.args)
+        }
+        _ => None,
+    };
+    let x = &call(l, "length", 1)?[0];
+    let pos = call(els, "strpos", 2)?;
+    (op == "=" && zero == "0" && matches!(r.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
+        .then_some((&pos[0], x))
+}
+
+/// Whether REPLACE(s, from, to) cannot outgrow what T-SQL returns uncut:
+/// 8,000 bytes for a non-MAX value, so 4,000 UTF-16 code units (nvarchar)
+/// or 4,000 bytes (varchar, also under a UTF-8 collation) to be safe.
+/// `from` is counted in characters (never more than its units or bytes),
+/// `to` in UTF-8 bytes (never fewer than its UTF-16 units or its bytes in
+/// any code page; a typed `to` at 4 bytes a character). Then the result
+/// is never longer than `s` when `to` is no longer than any non-empty
+/// `from` (an empty `from` changes nothing), or `s` has a known length
+/// whose worst growth stays within the bound. PostgreSQL never cuts.
+fn replace_fits(d: Dialect, e: &[Expr], args: &[(Term, Option<Ty>)]) -> bool {
+    if d != Dialect::Tsql {
+        return true;
+    }
+    let min_from = match &e[1] {
+        Expr::Str(s) => s.chars().count() as u32,
+        _ => 1,
+    }
+    .max(1);
+    let max_to = match &e[2] {
+        Expr::Str(s) => Some(s.len() as u32),
+        _ => args[2].1.and_then(|t| t.len).map(|l| l.saturating_mul(4)),
+    };
+    let Some(max_to) = max_to else {
+        return false;
+    };
+    if max_to <= min_from {
+        return true;
+    }
+    match args[0].1.and_then(|t| t.len) {
+        Some(len) => {
+            (len / min_from + 1)
+                .saturating_mul(max_to)
+                .saturating_add(len)
+                <= 4000
+        }
+        None => false,
+    }
+}
+
 /// T-SQL CONVERT styles with a PostgreSQL to_char format that prints the
 /// same text: (style, format, length). Checked on SQL Server 2022 and
 /// PostgreSQL 18 for date, datetime and datetime2 (eval/builtins/2026-10-29).
@@ -4844,7 +6050,8 @@ fn exactly_one(q: &Term) -> bool {
 
 /// An aggregate call in this expression, outside any subquery.
 fn aggregates(t: &Term) -> bool {
-    if t.is("q") {
+    // An aggregate OVER () keeps every row.
+    if t.is("q") || t.is("win") {
         return false;
     }
     // MIN and MAX of one argument; a string's comparison is the dialect's.
@@ -4859,6 +6066,25 @@ fn aggregates(t: &Term) -> bool {
         || (t.is("fn") && t.kids().len() == 2 && named(t.kid(0), &["min", "max"]))
         || (t.is("dfn") && t.kids().len() == 3 && named(t.kid(1), &["min", "max", "sum", "avg"]))
         || t.kids().iter().any(aggregates)
+}
+
+/// A PostgreSQL routine's parameter or return type as PostgreSQL uses it:
+/// without length, precision and scale (`CREATE FUNCTION` keeps only the
+/// base type). Time types keep their largest precision, 6.
+pub(super) fn untypmod(t: Ty) -> Ty {
+    match t.fam {
+        Fam::VarChar | Fam::Char | Fam::Exact | Fam::Binary => Ty {
+            len: None,
+            scale: None,
+            ..t
+        },
+        Fam::Timestamp | Fam::TimestampTz | Fam::Time => Ty {
+            len: Some(6),
+            scale: None,
+            ..t
+        },
+        _ => t,
+    }
 }
 
 fn ret_ty_of(t: &Term) -> Option<Ty> {
@@ -5468,4 +6694,136 @@ fn json_type_tag(d: Dialect, t: &Type) -> Option<String> {
         _ => return None,
     };
     Some(tag)
+}
+
+/// Scope keys of the row images an OUTPUT or RETURNING item reads; no
+/// name a statement can spell.
+const NEW_IMAGE: &str = "\u{1}new";
+const OLD_IMAGE: &str = "\u{1}old";
+
+/// An OUTPUT / RETURNING item with every column it names rewritten to
+/// `image.column` (`NEW_IMAGE` or `OLD_IMAGE`). `image` maps a qualifier
+/// to its image; an unqualified name is a column of the changed row (`cur`)
+/// in PostgreSQL when the table has it, and otherwise left for `resolve`
+/// (a PL/pgSQL variable); a name that is both a column and a variable
+/// (`var`) is refused, as PL/pgSQL raises "column reference is ambiguous"
+/// for it. Subqueries, `*` and window functions are refused.
+fn output_item(
+    e: &Expr,
+    d: Dialect,
+    t: &super::schema::Table,
+    cur: &str,
+    image: &dyn Fn(&str) -> R<&'static str>,
+    var: &dyn Fn(&str) -> bool,
+) -> R<Expr> {
+    let go = |x: &Expr| output_item(x, d, t, cur, image, var);
+    let bx = |x: &Expr| go(x).map(Box::new);
+    Ok(match e {
+        Expr::Name(p) if p.len() == 1 => {
+            if d == Dialect::Tsql {
+                return Err("an unqualified column in OUTPUT (name inserted. or deleted.)".into());
+            }
+            if t.column(&p[0]).is_some() {
+                if var(&p[0]) {
+                    return Err(format!("`{}` names both a column and a variable", lc(&p[0])));
+                }
+                Expr::Name(vec![cur.to_string(), p[0].clone()])
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Name(p) => {
+            let (col, qual) = p.split_last().expect("a qualified name");
+            let q = qual.last().map(|x| lc(x)).unwrap_or_default();
+            if qual.len() > 1 && d == Dialect::Tsql {
+                return Err("a schema-qualified column in OUTPUT".into());
+            }
+            if qual.len() > 1 && !matches!(image(&q), Ok(i) if i == cur) {
+                return Err(format!("`{}` in RETURNING", p.join(".")));
+            }
+            Expr::Name(vec![image(&q)?.to_string(), col.clone()])
+        }
+        Expr::Var(_) | Expr::Num(_) | Expr::Str(_) | Expr::Null | Expr::Special(_) => e.clone(),
+        Expr::Call(c) if !c.over && c.order.is_empty() && !c.distinct => {
+            let mut c2 = (**c).clone();
+            c2.args = c.args.iter().map(go).collect::<R<_>>()?;
+            Expr::Call(Box::new(c2))
+        }
+        Expr::Bin(op, x, y) => Expr::Bin(op.clone(), bx(x)?, bx(y)?),
+        Expr::Unary(op, x) => Expr::Unary(op.clone(), bx(x)?),
+        Expr::IsNull(x, b) => Expr::IsNull(bx(x)?, *b),
+        Expr::Cast(x, ty) => Expr::Cast(bx(x)?, ty.clone()),
+        Expr::Case(op, whens, els) => Expr::Case(
+            op.as_deref().map(bx).transpose()?,
+            whens
+                .iter()
+                .map(|(w, v)| Ok((go(w)?, go(v)?)))
+                .collect::<R<_>>()?,
+            els.as_deref().map(bx).transpose()?,
+        ),
+        Expr::Extract(f, x) => Expr::Extract(f.clone(), bx(x)?),
+        _ => return Err("an OUTPUT or RETURNING item other than columns of the changed row, variables, constants and functions of them".into()),
+    })
+}
+
+/// Whether `t` holds a node with head `h`.
+fn has_head(t: &Term, h: &str) -> bool {
+    t.is(h) || t.kids().iter().any(|k| has_head(k, h))
+}
+
+/// PostgreSQL's make_interval parameters in order (the parser writes named
+/// arguments out by position); each one left out is zero.
+const MAKE_INTERVAL_FIELDS: [&str; 7] =
+    ["years", "months", "weeks", "days", "hours", "mins", "secs"];
+
+fn is_make_interval(c: &Call) -> bool {
+    let builtin = match c.name.as_slice() {
+        [f] => f,
+        [s, f] if s.eq_ignore_ascii_case("pg_catalog") => f,
+        _ => return false,
+    };
+    builtin.eq_ignore_ascii_case("make_interval")
+        && (1..=MAKE_INTERVAL_FIELDS.len()).contains(&c.args.len())
+        && !c.distinct
+        && c.order.is_empty()
+        && !c.star
+        && !c.over
+        && !c.within_group
+}
+
+fn is_zero_literal(e: &Expr) -> bool {
+    matches!(e, Expr::Num(s) if s.parse::<f64>().is_ok_and(|v| v == 0.0))
+}
+
+/// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
+/// amounts round (milliseconds and smaller) and quarters have none.
+fn dateadd_field(e: &Expr) -> Option<&'static str> {
+    let Expr::Name(p) = e else {
+        return None;
+    };
+    let [part] = p.as_slice() else {
+        return None;
+    };
+    // DATEADD adds days for dayofyear and weekday, as for day.
+    Some(match lc(part).as_str() {
+        "year" | "yy" | "yyyy" => "years",
+        "month" | "mm" | "m" => "months",
+        "week" | "wk" | "ww" => "weeks",
+        "dayofyear" | "dy" | "y" | "day" | "dd" | "d" | "weekday" | "dw" | "w" => "days",
+        "hour" | "hh" => "hours",
+        "minute" | "mi" | "n" => "mins",
+        "second" | "ss" | "s" => "secs",
+        _ => return None,
+    })
+}
+
+/// The value of an integer literal term (`num` or a negated one).
+fn int_literal(t: &Term) -> Option<i64> {
+    if t.is("neg") {
+        return t.kid(0).and_then(int_literal).map(|v| -v);
+    }
+    if !t.is("num") {
+        return None;
+    }
+    t.kid(0).and_then(Term::atom)?.parse().ok()
 }

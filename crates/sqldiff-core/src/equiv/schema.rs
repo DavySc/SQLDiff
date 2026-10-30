@@ -247,6 +247,9 @@ pub struct Table {
     pub columns: Vec<Column>,
     /// Primary key and unique constraints or indexes, column names lower-cased.
     pub keys: Vec<Vec<String>>,
+    /// The catalog read every column (`catalog::Table::columns_known`), so
+    /// `columns` is the table's full column list in order.
+    pub complete: bool,
 }
 
 impl Table {
@@ -417,6 +420,34 @@ impl Schema {
         s
     }
 
+    /// This schema with the one table `ddl` creates added under the key
+    /// `key` gives its schema and name (a statement's table key, such as
+    /// `temp:t`): a table the unit creates for its own use (a table
+    /// variable, a temporary table), which no catalog holds. `None` when
+    /// `ddl` is not one table with known columns.
+    pub fn with_local(
+        &self,
+        ddl: &str,
+        d: Dialect,
+        key: impl FnOnce(Option<&str>, &str) -> String,
+    ) -> Option<Schema> {
+        let mut cat = Catalog::default();
+        ddl::load_tree(&mut cat, &parse(ddl, d).syntax(), d);
+        let [t] = cat.tables.as_slice() else {
+            return None;
+        };
+        if !t.columns_known || t.columns.is_empty() {
+            return None;
+        }
+        let key = key(t.schema.as_deref(), &t.name).to_lowercase();
+        let extra = Schema::from_view(&CatalogView::new(d, &[&cat]));
+        let table = extra.tables.into_values().next()?;
+        let mut s = self.clone();
+        s.ambiguous.remove(&key);
+        s.tables.insert(key, table);
+        Some(s)
+    }
+
     /// PostgreSQL: whether a name, spelled as PostgreSQL stores it (a quoted
     /// name as written, others in lower case), may be compared with T-SQL
     /// names up to letter case (`ASM-IDENT-FOLD`). Not when the catalog holds
@@ -551,6 +582,7 @@ impl Schema {
                     name,
                     columns,
                     keys,
+                    complete: t.columns_known,
                 },
             );
         }
@@ -558,7 +590,7 @@ impl Schema {
     }
 }
 
-fn ty_of(t: &DataType, d: Dialect) -> Ty {
+pub(super) fn ty_of(t: &DataType, d: Dialect) -> Ty {
     if !t.is_known() {
         return Ty::of(Fam::Other);
     }

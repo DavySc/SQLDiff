@@ -38,7 +38,7 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{parse_stmt, tokens, Expr, Select, Stmt, Tok, K};
+use super::ast::{parse_stmt_lowered, tokens, Expr, Select, Stmt, Tok, K};
 use super::lower::Unit;
 use crate::classify::{stmt_kind, write_target, StmtKind};
 
@@ -474,7 +474,7 @@ fn shape(
     for t in &targets {
         dead_after(&end, lp, u, t)?;
     }
-    let query_ast = match parse_stmt(&query, d) {
+    let query_ast = match parse_stmt_lowered(&query, d) {
         Ok(Stmt::Select(s)) => Ok(s),
         Ok(_) => Err("a cursor query that is not a SELECT".to_string()),
         Err(e) => Err(e),

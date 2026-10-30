@@ -234,8 +234,15 @@ fact = "The data never holds an empty string or an exponent where it is cast."
 sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[assumption]]
+id = "ASM-CATALOG-EXISTS"
+statement = "A check whether a dbo table or procedure exists sees the same objects on both sides: the SQL Server user table (type U) or T-SQL procedure (type P) exists exactly when its converted table (relkind r or p) or procedure (prokind p) exists in PostgreSQL's default schema when the check runs, under a name equal up to letter case; the session running the check can see the object in SQL Server's catalog (holds a permission on it), the SQL Server database collation is case-insensitive, and no CLR procedure (type PC) of that name exists."
+discharge = "deployment"
+fact = "The PostgreSQL default schema holds the converted counterparts of the SQL Server tables and procedures such checks name, and no others of those names; the sessions running the checks hold a permission on those objects in SQL Server; the SQL Server database collation is case-insensitive; dbo has no CLR procedure of those names."
+sites = ["sqldiff-core/src/equiv/objcheck.rs"]
+
+[[assumption]]
 id = "ASM-CI-COLLATION"
-statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern (no [ or \\): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys; not ordering."
+statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern (no [ or \\): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys, and the substrings REPLACE and CHARINDEX find (T-SQL finds 'b' in 'ABC', PostgreSQL's replace and strpos do not); not ordering."
 discharge = "catalog"
 fact = "The collations of both sides (T-SQL's default is case-insensitive) and the data."
 fact_key = "collation"
@@ -309,7 +316,7 @@ id = "ASM-DATEADD-RANGE"
 statement = "DATEADD results stay within the range of their type."
 discharge = "deployment"
 fact = "The data never moves a date past the type's range."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-DATEADD-TIME-WRAP"
@@ -323,7 +330,7 @@ id = "ASM-DATEADD-YEAR-END"
 statement = "T-SQL DATEADD clamps years and quarters to the month end as it does months (not checked)."
 discharge = "nothing"
 fact = "A check of the behaviour on SQL Server."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-DATETIME-PRECISION"
@@ -651,6 +658,20 @@ fact = "The callers pass such documents: on these, OPENJSON and PostgreSQL's jso
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
+id = "ASM-OUTPUT-INTO-TARGET"
+statement = "The table an OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key (SQL Server rejects the statement otherwise, Msg 331 to 333; the PostgreSQL insert runs)."
+discharge = "catalog"
+fact = "The SQL Server catalog of the OUTPUT table: no enabled triggers, CHECK constraints or rules, no foreign key referencing it or referenced by it."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-OUTPUT-ROW-ORDER"
+statement = "Rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order."
+discharge = "deployment"
+fact = "Nothing relies on which generated value each written row gets."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SEQUENCE-DEFAULT-TRIGGER"
 statement = "Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name."
 discharge = "deployment"
@@ -785,11 +806,18 @@ fact = "The operands' types."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-PROCID-NAME"
+statement = "SQL Server stores the routine under the name and schema its header writes, letter for letter (OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) become them as literals)."
+discharge = "catalog"
+fact = "sys.objects name and schema of the routine: not renamed with sp_rename, nor first created under another letter case and then altered."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-QUOTENAME-IDENT"
 statement = "The result of QUOTENAME is used as an identifier, never as text, and is at most 128 characters."
 discharge = "nothing"
 fact = "A reading of how the routine uses the result."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-RAISERROR-FORMAT"
@@ -940,6 +968,13 @@ fact = "A rounding in the converted writes, or callers that write whole minutes.
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-TABLE-STAND-IN"
+statement = "A table whose CREATE TABLE was not converted is created in the target with the columns and types the rules give the rest of it (its refused parts left out), and a view over it as converted."
+discharge = "generated"
+fact = "The table's target CREATE TABLE, written by hand into the review ledger: a rerun binds against it and this assumption goes."
+sites = ["sqldiff-convert/src/refused.rs"]
+
+[[assumption]]
 id = "ASM-TABLE-VARIABLE"
 statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"
@@ -948,10 +983,10 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMP-TABLE"
-statement = "A #temp table converted to a session- or job-scoped temporary table is not created twice in one session."
+statement = "A #temp table converted to a session- or job-scoped temporary table is not created twice in one session: no temporary table of its name exists when the procedure creates it (T-SQL creates its own beside a caller's #t), and the procedure is not left by an error between creating and dropping it (T-SQL drops the table then, the target keeps it)."
 discharge = "deployment"
 fact = "How sessions run the code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMPLATE-DIRECTIVE"
@@ -1106,7 +1141,7 @@ id = "ASM-TSQL-ANSI-NULLS"
 statement = "The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN."
 discharge = "catalog"
 fact = "sys.sql_modules.uses_ansi_nulls for the routine."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ANSI-NULL-DEFAULT"
@@ -1183,7 +1218,7 @@ id = "ASM-TSQL-QUOTED-IDENTIFIER"
 statement = "The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string."
 discharge = "deployment"
 fact = "The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier)."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ARITH-ERRORS"
@@ -1197,7 +1232,7 @@ id = "ASM-TSQL-RETURN-NULL-WARNING"
 statement = "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)."
 discharge = "deployment"
 fact = "How callers handle messages."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-CALLER-XACT-ABORT-OFF"
@@ -1279,6 +1314,20 @@ statement = "SYSDATETIME() is evaluated once per statement (observed SQL Server 
 discharge = "nothing"
 fact = "Vendor fact V20 documented or checked."
 sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-UDF-CALL-CONTEXT"
+statement = "A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it."
+discharge = "deployment"
+fact = "The function reads no data the calling statement or another session changes while the statement runs, and no clock."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-UDF-CALLEE"
+statement = "The user function a call names on side B is the conversion of the one it names on side A, compared in the file that creates it."
+discharge = "generated"
+fact = "The callee is converted in the same tree and its file is converted or under assumptions (sqldiff convert checks this and carries those assumptions)."
+sites = ["sqldiff-convert/src/callees.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-UNDECLARED-VAR"
@@ -1418,4 +1467,11 @@ id = "ASM-DROP-NO-DEPENDENTS"
 statement = "No view, routine or other object depends on a dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP, SQL Server drops a table or view under a view that is not schema-bound."
 discharge = "catalog"
 fact = "The target catalog's dependencies (pg_depend) on the object are only those dropped with it, and its routine name has one signature."
+sites = ["sqldiff-core/src/equiv/ddl.rs"]
+
+[[assumption]]
+id = "ASM-TRUNCATE"
+statement = "TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no ON TRUNCATE trigger is on the target table (T-SQL has none to fire), no sequence other than an identity column's belongs to the table (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe)."
+discharge = "catalog"
+fact = "No indexed view refers to the source table; the target table has no TRUNCATE trigger and owns only its identity column's sequence, whose START WITH is the T-SQL seed."
 sites = ["sqldiff-core/src/equiv/ddl.rs"]

@@ -467,6 +467,10 @@ pub fn convert_with(
             .collect();
         b.flag(&files, results.iter_mut().map(|(c, _)| c), a.from);
     }
+    // A call to a converted user function holds when the function's own
+    // conversion does.
+    let mut convs: Vec<&mut Conversion> = results.iter_mut().map(|(c, _)| c).collect();
+    crate::callees::resolve(inputs, &mut convs, a.from);
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();
@@ -624,10 +628,14 @@ fn convert_files(
         helpers: a.helpers.clone(),
         ..Options::default()
     };
+    let files: Vec<(&str, &str)> = inputs
+        .iter()
+        .map(|i| (i.rel.as_str(), i.text.as_str()))
+        .collect();
+    let mut stand_ins = crate::refused::StandIns::default();
     if let Some(source) = source {
-        opts.facts_a = vec![source];
         let texts = drafts.iter().map(|d| d.output());
-        opts.facts_b = vec![Arc::new(match base {
+        let mut target = match base {
             Some(b) => crate::base::over(
                 &b.target,
                 texts,
@@ -636,7 +644,19 @@ fn convert_files(
                 None,
             ),
             None => catalog(texts, a.to, out, None),
-        })];
+        };
+        // Tables whose CREATE TABLE was refused for a part of it stand in
+        // for binding, without that part; what uses them is flagged below.
+        stand_ins = crate::refused::StandIns::build(
+            &files,
+            drafts.iter().map(|d| d.output()),
+            &mut target,
+            a.from,
+            a.to,
+            Some(&source),
+        );
+        opts.facts_a = vec![source];
+        opts.facts_b = vec![Arc::new(target)];
     }
     // Pass 2: check every draft.
     hooks.stop_if_cancelled()?;
@@ -652,9 +672,12 @@ fn convert_files(
         progress.tick();
         Some((c, t.elapsed().as_secs_f64()))
     });
-    done.into_iter()
+    let mut done: Vec<(Conversion, f64)> = done
+        .into_iter()
         .map(|d| d.ok_or_else(|| CANCELLED.to_string()))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    stand_ins.flag(&files, done.iter_mut().map(|(c, _)| c), a.from, a.to);
+    Ok(done)
 }
 
 /// Reads the review ledger in `out`, if there is one.

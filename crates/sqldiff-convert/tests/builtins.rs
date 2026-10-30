@@ -167,9 +167,9 @@ fn database_name_is_an_assumption() {
 fn instance_metadata_is_refused_with_its_reason() {
     refused(
         "SET @r = CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max));",
-        "describes the SQL Server instance",
+        "the SQL Server version",
     );
-    refused("SET @r = OBJECT_NAME(@@PROCID);", "@@PROCID");
+    refused("SET @r = OBJECT_DEFINITION(@@PROCID);", "@@PROCID");
     refused("SET @i = OBJECT_ID(N'dbo.t');", "SQL Server object id");
     refused(
         "SET @r = JSON_MODIFY(@s, '$.a', 1);",
@@ -179,4 +179,86 @@ fn instance_metadata_is_refused_with_its_reason() {
         "SET @i = ABS(CHECKSUM(NEWID())) % 10;",
         "SQL Server's own hash",
     );
+}
+
+/// Proven under the case-insensitive collation assumption, which the unit
+/// carries for the reviewer.
+#[track_caller]
+fn proven_ci(stmt: &str, want: &str) {
+    proven(stmt, want);
+    let (c, _) = run(stmt);
+    let u = unit(&c);
+    assert!(
+        u.notes.iter().any(|n| n.rule == "ASM-CI-COLLATION"),
+        "{stmt}: {:?}",
+        u.notes
+    );
+}
+
+#[test]
+fn substring_matches_are_proven_under_the_collation_assumption() {
+    proven_ci(
+        "SET @r = REPLACE(@s, N'a', N'b');",
+        "v_r := REPLACE(p_s, 'a', 'b');",
+    );
+    proven_ci("SET @i = CHARINDEX(N',', @s);", "v_i := strpos(p_s, ',');");
+    proven_ci(
+        "SET @i = CHARINDEX(@s, N'abc');",
+        "v_i := (CASE WHEN length(p_s) = 0 THEN 0 ELSE strpos('abc', p_s) END);",
+    );
+}
+
+#[test]
+fn trims_and_quotes_are_proven() {
+    proven("SET @r = LTRIM(RTRIM(@s));", "v_r := LTRIM(RTRIM(p_s));");
+    proven("SET @r = QUOTENAME(@s);", "v_r := quote_ident(p_s);");
+    let (c, _) = run("SET @r = QUOTENAME(@s);");
+    assert!(unit(&c)
+        .notes
+        .iter()
+        .any(|n| n.rule == "ASM-QUOTENAME-IDENT"));
+}
+
+/// OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) in a procedure
+/// are its own name and schema as the header writes them.
+#[test]
+fn own_name_from_procid() {
+    proven("SET @r = OBJECT_NAME(@@PROCID);", "v_r := 'p';");
+    proven("SET @r = OBJECT_SCHEMA_NAME(@@PROCID);", "v_r := 'dbo';");
+    let (c, _) = run("SET @r = OBJECT_NAME(@@PROCID);");
+    assert!(unit(&c).notes.iter().any(|n| n.rule == "ASM-PROCID-NAME"));
+}
+
+/// Where the procedure's own name or schema is not known, they stay refused.
+#[test]
+fn own_name_from_procid_needs_a_named_module() {
+    let unit_at = |src: &str, line: usize| {
+        let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        let u = c.units.iter().find(|u| u.src.line == line).unwrap().clone();
+        (u, c.output)
+    };
+    // No schema in the header: the creator's default schema.
+    let (u, out) = unit_at(
+        "CREATE PROCEDURE [Get Name]\nAS\nBEGIN\n    DECLARE @r nvarchar(max);\n    SET @r = OBJECT_SCHEMA_NAME(@@PROCID);\n    SET @r = OBJECT_NAME(@@PROCID);\nEND\n",
+        5,
+    );
+    assert_eq!(u.status, Status::NotConverted, "{out}");
+    assert!(
+        u.notes.iter().any(|n| n.text.contains("names no schema")),
+        "{:?}",
+        u.notes
+    );
+    assert!(out.contains("v_r := 'Get Name';"), "{out}");
+    // A function may run inlined in its caller's query.
+    let (u, out) = unit_at(
+        "CREATE FUNCTION dbo.F()\nRETURNS nvarchar(128)\nAS\nBEGIN\n    RETURN OBJECT_NAME(@@PROCID);\nEND\n",
+        5,
+    );
+    assert_eq!(u.status, Status::NotConverted, "{out}");
+    // A script outside any module: @@PROCID is 0.
+    let (u, out) = unit_at(
+        "DECLARE @r nvarchar(max);\nSET @r = OBJECT_NAME(@@PROCID);\nPRINT @r;\n",
+        2,
+    );
+    assert_eq!(u.status, Status::NotConverted, "{out}");
 }

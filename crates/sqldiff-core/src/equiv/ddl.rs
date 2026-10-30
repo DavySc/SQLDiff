@@ -127,6 +127,17 @@ pub struct SetDefault {
     pub off: usize,
 }
 
+/// T-SQL `TRUNCATE TABLE t`; PostgreSQL `TRUNCATE [TABLE] t [RESTART |
+/// CONTINUE IDENTITY] [RESTRICT]`. One table.
+#[derive(Debug, Clone)]
+pub struct Truncate {
+    pub dialect: Dialect,
+    pub table: Vec<Name>,
+    /// PostgreSQL RESTART IDENTITY (T-SQL always restarts).
+    pub restart: bool,
+    pub off: usize,
+}
+
 #[derive(Debug, Clone)]
 pub enum Ddl {
     Index(Index),
@@ -135,6 +146,7 @@ pub enum Ddl {
     Grant(Grant),
     Drop(DropDef),
     Default(SetDefault),
+    Truncate(Truncate),
 }
 
 impl Ddl {
@@ -153,6 +165,7 @@ impl Ddl {
                 _ => "DROP SCHEMA",
             },
             Ddl::Default(_) => "column default",
+            Ddl::Truncate(_) => "TRUNCATE TABLE",
         }
     }
 }
@@ -182,6 +195,7 @@ fn is_drop_or_alter(words: &[String]) -> bool {
     match w(0) {
         "DROP" => drop_kind(w(1)).is_some(),
         "ALTER" => w(1) == "TABLE",
+        "TRUNCATE" => true,
         _ => false,
     }
 }
@@ -294,6 +308,11 @@ pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
                 schema.case_check(&stored(n), true)?;
             }
         }
+        Ddl::Truncate(x) if x.dialect == Dialect::Postgres => {
+            for n in &x.table {
+                schema.case_check(&stored(n), true)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -345,6 +364,10 @@ pub fn pair_key(x: &Ddl) -> R<String> {
                 fold(&x.column, x.dialect)?
             )
         }
+        Ddl::Truncate(x) => {
+            let (s, t) = object_key(&x.table, x.dialect)?;
+            format!("truncate {}.{t}", s.unwrap_or_default())
+        }
     })
 }
 
@@ -359,6 +382,9 @@ pub fn parse(ts: &[Tok], d: Dialect) -> R<Ddl> {
     }
     if word(ts.first(), "ALTER") {
         return set_default(ts, d).map(Ddl::Default);
+    }
+    if word(ts.first(), "TRUNCATE") {
+        return truncate(ts, d).map(Ddl::Truncate);
     }
     if word(ts.first(), "GRANT") {
         return grant(ts, d).map(Ddl::Grant);
@@ -567,11 +593,14 @@ fn index(ts: &[Tok], d: Dialect) -> R<Index> {
         return Err("CREATE INDEX ON ONLY (a partitioned table's parent)".into());
     }
     let (table, j) = dotted(ts, i)?;
-    if table
-        .iter()
-        .any(|n| n.text.starts_with('#') || n.text.starts_with('@'))
-    {
-        return Err("an index on a temporary table or table variable".into());
+    // A local #temp table (one part) is read: `mod.rs` names the
+    // PostgreSQL temporary table it became the same way. Global ##tables
+    // and table variables are not.
+    let local_temp = |n: &Name| n.text.starts_with('#') && !n.text.starts_with("##");
+    if table.iter().any(|n| {
+        (n.text.starts_with('#') && !(table.len() == 1 && local_temp(n))) || n.text.starts_with('@')
+    }) {
+        return Err("an index on a global temporary table or a table variable".into());
     }
     if iname.len() == 2 {
         let (si, _) = object_key(&iname, d)?;
@@ -868,6 +897,47 @@ fn drop(ts: &[Tok], d: Dialect) -> R<DropDef> {
         kind,
         name,
         if_exists,
+        off: ts[0].off,
+    })
+}
+
+fn truncate(ts: &[Tok], d: Dialect) -> R<Truncate> {
+    let what = || format!("the TRUNCATE `{}`", text(ts));
+    let mut i = 1;
+    match d {
+        Dialect::Db2i => return Err("TRUNCATE on Db2 for i is not compared yet".into()),
+        Dialect::Tsql if !word(ts.get(1), "TABLE") => return Err(what()),
+        _ => {}
+    }
+    if word(ts.get(i), "TABLE") {
+        i += 1;
+    }
+    // ONLY leaves inheriting tables out; T-SQL has none to leave.
+    if word(ts.get(i), "ONLY") {
+        return Err(what());
+    }
+    let (table, mut j) = dotted(ts, i)?;
+    let mut restart = false;
+    if d == Dialect::Postgres {
+        if word(ts.get(j), "RESTART") && word(ts.get(j + 1), "IDENTITY") {
+            restart = true;
+            j += 2;
+        } else if word(ts.get(j), "CONTINUE") && word(ts.get(j + 1), "IDENTITY") {
+            j += 2;
+        }
+        if word(ts.get(j), "RESTRICT") {
+            j += 1;
+        }
+    }
+    // Several tables, CASCADE (truncates the tables that refer to it),
+    // T-SQL WITH (PARTITIONS …).
+    if j != ts.len() {
+        return Err(what());
+    }
+    Ok(Truncate {
+        dialect: d,
+        table,
+        restart: restart || d == Dialect::Tsql,
         off: ts[0].off,
     })
 }
@@ -1211,6 +1281,10 @@ pub mod asm {
         "ASM-DEFAULT-CONSTRAINT-NAME",
         "The column has no default yet, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name",
     );
+    pub const TRUNCATE: (&str, &str) = (
+        "ASM-TRUNCATE",
+        "TRUNCATE behaves alike on both: no indexed view or other schema-bound object refers to the table (SQL Server refuses the TRUNCATE then), no ON TRUNCATE trigger is on the target table (T-SQL has none to fire), no sequence other than an identity column's belongs to it (RESTART IDENTITY restarts every sequence the table owns), the identity starts where the T-SQL seed does, and no other session reads the table across it (PostgreSQL's TRUNCATE is not MVCC-safe)",
+    );
     pub const SCHEMA_OWNER: (&str, &str) = (
         "ASM-SCHEMA-OWNER",
         "The schema's owner on the target holds the privileges its owner holds on the source: the role it names, or the user running the script, which stands for T-SQL dbo (the database owner)",
@@ -1239,6 +1313,7 @@ pub fn compare(
         (Ddl::Grant(a), Ddl::Grant(b)) => grants(a, b, na, nb, &mut ev),
         (Ddl::Drop(a), Ddl::Drop(b)) => drops(a, b, na, nb, &mut ev),
         (Ddl::Default(a), Ddl::Default(b)) => defaults(a, b, na, nb, &mut ev),
+        (Ddl::Truncate(a), Ddl::Truncate(b)) => truncates(a, b, na, nb, &mut ev),
         _ => Err(format!("{} against {}", x.what(), y.what())),
     };
     if let Err(e) = r {
@@ -1983,6 +2058,40 @@ fn defaults(x: &SetDefault, y: &SetDefault, na: &str, nb: &str, ev: &mut Vec<Eve
         b: y.value.clone(),
         at,
     });
+    Ok(())
+}
+
+/// Two TRUNCATEs: the same table, and the identity restarted on both
+/// (T-SQL always resets it to its seed).
+fn truncates(x: &Truncate, y: &Truncate, na: &str, nb: &str, ev: &mut Vec<Event>) -> R<()> {
+    tsql_pg(x.dialect, y.dialect)?;
+    let at = (x.off, y.off);
+    ev.push(Event::Asm(super::canon::asm::IDENT_FOLD));
+    let (tx, ty) = (
+        object_key(&x.table, x.dialect)?,
+        object_key(&y.table, y.dialect)?,
+    );
+    if tx != ty {
+        ev.push(Event::Diff {
+            rule: "equiv.truncate-table",
+            witness: format!(
+                "{na} empties {} and {nb} {}",
+                super::table::text_name(&x.table),
+                super::table::text_name(&y.table)
+            ),
+            at,
+        });
+        return Ok(());
+    }
+    if !(x.restart && y.restart) {
+        return Err(
+            "PostgreSQL TRUNCATE without RESTART IDENTITY keeps the identity counter, where T-SQL resets it to its seed".into(),
+        );
+    }
+    if tx.0.is_none() {
+        ev.push(Event::Asm(super::canon::asm::DEFAULT_SCHEMA));
+    }
+    ev.push(Event::Asm(asm::TRUNCATE));
     Ok(())
 }
 

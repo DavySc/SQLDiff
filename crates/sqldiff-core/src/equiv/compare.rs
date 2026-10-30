@@ -100,6 +100,15 @@ fn collation_kids(a: &Term, b: &Term) -> Option<&'static [usize]> {
                 .all(|&(i, f)| a.kid(i).zip(b.kid(i)).is_some_and(|(x, y)| f(x) && f(y)));
             ok.then_some(&[1, 2])
         }
+        // REPLACE / CHARINDEX against replace / strpos: only the
+        // case sensitivity of the substring match.
+        "strreplace" | "strpos"
+            if a.kid(0).zip(b.kid(0)).is_some_and(|(x, y)| {
+                matches!((x.atom(), y.atom()), (Some("ci" | "cs"), Some("ci" | "cs")))
+            }) =>
+        {
+            Some(&[0])
+        }
         "coll-eq" | "coll-like" | "collate" | "distinct"
             if a.kid(0)
                 .zip(b.kid(0))
@@ -858,6 +867,32 @@ fn operands(strcmp: &Term) -> String {
 }
 
 /// Short SQL-like rendering of a term for witnesses and messages.
+/// "A has `x` where B has `y`" for a mismatch the engine cannot explain.
+/// When the two differ only in their dialect tag (a construct lowered per
+/// dialect, such as `dfn tsql replace …` against `dfn postgres replace …`),
+/// the terms that carry the tags are named instead, with their dialects.
+pub fn mismatch_text(m: &Mismatch) -> String {
+    let dialect = |t: &Term| match t.atom() {
+        Some("tsql") => Some("T-SQL"),
+        Some("postgres") => Some("PostgreSQL"),
+        Some("db2i") => Some("Db2 for i"),
+        _ => None,
+    };
+    if let (Some(da), Some(db), Some(pa), Some(pb)) = (
+        dialect(&m.a),
+        dialect(&m.b),
+        m.parent_a.as_ref(),
+        m.parent_b.as_ref(),
+    ) {
+        return format!(
+            "A has `{}` ({da}) where B has `{}` ({db})",
+            render(pa),
+            render(pb)
+        );
+    }
+    format!("A has `{}` where B has `{}`", render(&m.a), render(&m.b))
+}
+
 pub fn render(t: &Term) -> String {
     let s = render_inner(t);
     if s.chars().count() > 80 {
@@ -903,6 +938,15 @@ fn render_inner(t: &Term) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        "ufn" => format!(
+            "{}({})",
+            r(0),
+            k.iter()
+                .skip(1)
+                .map(render_inner)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         "dfn" => format!(
             "{}({})",
             r(1),
@@ -915,6 +959,11 @@ fn render_inner(t: &Term) -> String {
         "concat" => format!("{} || {}", r(0), r(1)),
         "cmp" => format!("{} {} {}", r(1), r(0), r(2)),
         "strcmp" => format!("{} {} {}", r(3), r(0), r(4)),
+        "strreplace" => format!("replace({}, {}, {}) ({})", r(1), r(2), r(3), r(0)),
+        "strpos" => format!("position of {} in {} ({})", r(2), r(1), r(0)),
+        "trim" => format!("{}trim({})", r(0), r(1)),
+        "quoteident" => format!("quoted identifier {}", r(0)),
+        "ceil" | "floor" | "sqrt" => format!("{}({})", t.head(), r(0)),
         "daydiff" => format!("days between {} and {}", r(0), r(1)),
         "time" => format!("time({})", r(0)),
         _ => t.to_string(),
