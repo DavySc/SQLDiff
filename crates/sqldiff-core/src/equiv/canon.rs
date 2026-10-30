@@ -1331,7 +1331,10 @@ impl<'a> Canon<'a> {
                     false => (t, lo, hi),
                 };
                 let mut kids = vec![t, lo, hi, a(neg.to_string())];
-                if ty.map_or(true, |t| t.is_string()) {
+                // Strings by collation, uuids by each dialect's byte order.
+                if ty.map_or(true, |t| t.is_string())
+                    || tys.iter().any(|t| t.is_some_and(|t| t.fam == Fam::Uuid))
+                {
                     kids.push(self.dtag());
                 }
                 (n("between", kids), None)
@@ -2501,7 +2504,7 @@ impl<'a> Canon<'a> {
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
-                Some(t) if t.is_string() => (
+                Some(t) if t.is_string() || t.fam == Fam::Uuid => (
                     n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
                     first_ty,
                 ),
@@ -2869,6 +2872,15 @@ impl<'a> Canon<'a> {
                 if string {
                     return Ok((
                         self.strcmp(op, (lt, lty), (rt, rty)),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
+                // SQL Server orders uniqueidentifier by its byte groups, last
+                // group first; PostgreSQL orders uuid byte by byte.
+                if any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>") {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-uuid", vec![self.dtag(), a(op), x, y]),
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
@@ -3297,8 +3309,9 @@ impl<'a> Canon<'a> {
             };
             let mut kids = vec![t, a(if o.desc { "desc" } else { "asc" }), a(nulls)];
             match ty {
-                // Character ordering depends on the collation of each dialect.
-                Some(t) if t.is_string() => kids.push(self.dtag()),
+                // Character ordering depends on the collation of each dialect,
+                // uuid ordering on its byte order (last group first in T-SQL).
+                Some(t) if t.is_string() || t.fam == Fam::Uuid => kids.push(self.dtag()),
                 None => self.assume(asm::UNTYPED),
                 _ => {}
             }
@@ -3590,7 +3603,7 @@ impl<'a> Canon<'a> {
                 a(if o.desc { "desc" } else { "asc" }),
                 a(nulls),
             ];
-            if col_tys[k].is_some_and(|t| t.is_string()) {
+            if col_tys[k].is_some_and(|t| t.is_string() || t.fam == Fam::Uuid) {
                 kids.push(self.dtag());
             }
             order.push(n("ord", kids));
