@@ -239,6 +239,23 @@ procedure for a bigint argument to an int parameter nor for 1 to a boolean;
 gives an OUT parameter NULL whatever is passed; an INOUT parameter receives the
 value; copying back into a shorter `varchar` variable fails; an INOUT argument that needs any cast (a `varchar(10)` variable for a `text` parameter, `int` for `bigint`) fails the call as not writable.
 
+**User function calls.** A call of a scalar user function inside an
+expression is the same call on both sides when each side's catalog holds the
+function and every argument reaches its parameter the same way
+(`Canon::user_fn`, `ASM-UDF-CALLEE:name`, `ASM-UDF-CALL-CONTEXT`). The
+converter writes T-SQL `dbo.f(x)` as PostgreSQL `f(x)`. Such an unqualified
+PostgreSQL call, compared with T-SQL, counts as the user function `f` of the
+default schema under `ASM-PG-UNQUALIFIED-FUNCTION`, except when `f` is the
+name of any `pg_catalog` function of PostgreSQL 18
+(`profiles/pg18_catalog_functions.txt`, 2,787 names read from a 18.6 server;
+`pg_catalog` is searched before the schemas of `search_path` unless it lists
+it later) or one of its 164 keywords that are not unreserved
+(`profiles/pg18_keywords.txt`, from `pg_get_keywords()`: the grammar forms
+written like calls, such as `trim`, `coalesce`, `xmlelement` or
+`json_object`, are no `pg_catalog` function, and unquoted they always run
+the built-in). Such a call may reach the built-in, and it stays not
+compared.
+
 ## Dynamic SQL
 
 T-SQL `EXEC (…)` and `EXEC [sys.]sp_executesql …` run a string as a batch;

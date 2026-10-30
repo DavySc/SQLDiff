@@ -93,6 +93,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
     let mut c = Canon::new(unit, schema);
     c.by_name = by_name;
     c.fold_quoted = other == Dialect::Tsql;
+    c.other = Some(other);
     let mut out = Vec::new();
     let mut stmts = unit.stmts.iter().enumerate().peekable();
     let mut ctl = unit.ctl.iter().peekable();
@@ -1202,6 +1203,7 @@ fn same_stmt(
         let (st, out) = ast::parse_stmt_output(toks, u.dialect)?;
         let mut c = Canon::new(u, s);
         c.fold_quoted = other.dialect == Dialect::Tsql;
+        c.other = Some(other.dialect);
         let t = match &out {
             Some(o) => c.output_stmt(&st, o)?,
             None => c.stmt(&st)?,

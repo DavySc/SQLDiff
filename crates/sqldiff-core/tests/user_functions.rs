@@ -32,6 +32,27 @@ AS
 BEGIN
     RETURN @Qty * @Unit;
 END;
+GO
+CREATE FUNCTION dbo.Twice(@Qty int)
+RETURNS int
+AS
+BEGIN
+    RETURN 2 * @Qty;
+END;
+GO
+CREATE FUNCTION dbo.Left(@Code nvarchar(5))
+RETURNS int
+AS
+BEGIN
+    RETURN 1;
+END;
+GO
+CREATE FUNCTION dbo.Trim(@Code nvarchar(5))
+RETURNS int
+AS
+BEGIN
+    RETURN 1;
+END;
 ";
 
 const CAT_P: &str = "CREATE SCHEMA app;
@@ -40,6 +61,12 @@ CREATE FUNCTION app.getcode(p_code varchar(5)) RETURNS integer
 LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
 CREATE FUNCTION app.price(p_qty integer, p_unit numeric(10,2)) RETURNS numeric(10,2)
 LANGUAGE plpgsql AS $$ BEGIN RETURN p_qty * p_unit; END $$;
+CREATE FUNCTION twice(p_qty integer) RETURNS integer
+LANGUAGE plpgsql AS $$ BEGIN RETURN 2 * p_qty; END $$;
+CREATE FUNCTION \"left\"(p_code varchar(5)) RETURNS integer
+LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
+CREATE FUNCTION \"trim\"(p_code varchar(5)) RETURNS integer
+LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
 ";
 
 fn opts() -> Options {
@@ -218,5 +245,111 @@ fn postgresql_ignores_a_parameter_types_length() {
         !asms(&r).contains(&"ASM-PG-PARAMETER-TYPMOD"),
         "{:?}",
         asms(&r)
+    );
+}
+
+/// The converter writes T-SQL `dbo.f(x)` as PostgreSQL `f(x)`. Unqualified,
+/// the call is the same call when the PostgreSQL catalog holds `f` in the
+/// default schema and no pg_catalog function of PostgreSQL 18 has its name
+/// (pg_catalog is searched first): `ASM-PG-UNQUALIFIED-FUNCTION`.
+#[test]
+fn an_unqualified_call_of_a_converted_dbo_function_is_the_same_call() {
+    for p in [
+        "UPDATE app.items SET codeid = Twice(p_qty) WHERE id = p_id;",
+        "UPDATE app.items SET codeid = twice(p_qty) WHERE id = p_id;",
+    ] {
+        let r = compare(
+            "UPDATE App.Items SET CodeId = dbo.Twice(@Qty) WHERE Id = @Id;",
+            p,
+        );
+        assert_eq!(
+            r.verdict(),
+            Verdict::EqualUnderAssumptions,
+            "{p}\n{:#?}\n{:?}",
+            r.findings,
+            r.unknown_reasons
+        );
+        let ids = asms(&r);
+        for id in [
+            "ASM-UDF-CALLEE:twice",
+            "ASM-DEFAULT-SCHEMA",
+            "ASM-PG-UNQUALIFIED-FUNCTION",
+        ] {
+            assert!(ids.contains(&id), "{id}: {ids:?}");
+        }
+    }
+    // Qualified with public: no search, no assumption about it.
+    let r = compare(
+        "UPDATE App.Items SET CodeId = dbo.Twice(@Qty) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = public.twice(p_qty) WHERE id = p_id;",
+    );
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:?}",
+        r.unknown_reasons
+    );
+    assert!(
+        !asms(&r).contains(&"ASM-PG-UNQUALIFIED-FUNCTION"),
+        "{:?}",
+        asms(&r)
+    );
+}
+
+#[test]
+fn an_unqualified_call_pg_catalog_could_take_is_not_compared() {
+    // pg_catalog has left(): PostgreSQL may call it instead of the user's.
+    let r = compare(
+        "UPDATE App.Items SET CodeId = dbo.Left(@Code) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = left(p_code) WHERE id = p_id;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+    // trim is a keyword: unquoted, the grammar's TRIM runs, never a user
+    // function, and it is no pg_catalog function (pg_get_keywords).
+    let r = compare(
+        "UPDATE App.Items SET CodeId = dbo.Trim(@Code) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = trim(p_code) WHERE id = p_id;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+    // A function of another schema is not the unqualified one.
+    let r = compare(
+        "UPDATE App.Items SET CodeId = App.GetCode(@Code) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = getcode(p_code) WHERE id = p_id;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+    // Nor is an unqualified call another function's.
+    let r = compare(
+        "UPDATE App.Items SET CodeId = dbo.Twice(@Qty) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = twice(p_id) WHERE id = p_id;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+}
+
+#[test]
+fn the_pg_catalog_list_is_postgresql_18s() {
+    let r = compare(
+        "UPDATE App.Items SET CodeId = dbo.Twice(@Qty) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = now() WHERE id = p_id;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
     );
 }
