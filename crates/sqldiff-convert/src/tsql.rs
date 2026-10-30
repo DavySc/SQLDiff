@@ -88,6 +88,7 @@ pub(crate) fn convert(
         decls: Vec::new(),
         context: false,
         dynamic: Vec::new(),
+        dynamic_from: Vec::new(),
         scope: None,
         local: std::cell::OnceCell::new(),
         own_tables: Vec::new(),
@@ -260,6 +261,10 @@ struct Cx<'a> {
     /// Variables (lower case, without `@`) whose value is run as dynamic SQL
     /// in this routine or script: `EXEC (@sql)`, `sp_executesql @sql`.
     dynamic: Vec<String>,
+    /// For each variable in `dynamic`: the assignments (by text range) whose
+    /// value reaches a statement that runs it and is not converted, or None
+    /// when any assignment may (`drop_known_dynamic`).
+    dynamic_from: Vec<(String, Option<Vec<Span>>)>,
     /// The tables of the statement being converted, for column types.
     scope: Option<Scope>,
     /// Without a tree catalog: one read from this input, made when needed.
@@ -509,6 +514,7 @@ impl<'a> Cx<'a> {
         self.rolls_back = false;
         self.savepoints.clear();
         self.dynamic.clear();
+        self.dynamic_from.clear();
         self.wrapper = None;
         self.autocommit.clear();
     }
@@ -1482,6 +1488,7 @@ impl<'a> Cx<'a> {
     /// SQL runs: those statements now run the converted text, not the
     /// variable, so its T-SQL text no longer reaches PostgreSQL.
     fn drop_known_dynamic(&mut self, scope: &SyntaxNode) {
+        self.dynamic_from.clear();
         if self.dynamic.is_empty() {
             return;
         }
@@ -1493,14 +1500,27 @@ impl<'a> Cx<'a> {
             .iter()
             .map(|d| self.dynamic_inner(d).is_ok())
             .collect();
+        let runs = |d: &SyntaxNode, v: &str| {
+            tokens(d)
+                .iter()
+                .any(|t| t.k == VARIABLE && t.s[1..].eq_ignore_ascii_case(v))
+        };
         // Kept while some statement that is not converted this way runs it.
-        self.dynamic.retain(|v| {
-            sites.iter().zip(&known).any(|(d, ok)| {
-                !*ok && tokens(d)
-                    .iter()
-                    .any(|t| t.k == VARIABLE && t.s[1..].eq_ignore_ascii_case(v))
-            })
-        });
+        self.dynamic
+            .retain(|v| sites.iter().zip(&known).any(|(d, ok)| !*ok && runs(d, v)));
+        // Of its assignments, only those whose value such a statement reads
+        // build T-SQL text that stays T-SQL; the rest reach only converted
+        // texts. Unknown when the reading of one of those texts stops.
+        let from = |v: &str| {
+            let mut from = Vec::new();
+            for (d, ok) in sites.iter().zip(&known) {
+                if !*ok && runs(d, v) {
+                    from.extend(sqldiff_core::equiv::dynamic::tsql_text_sources(d)?);
+                }
+            }
+            Some(from)
+        };
+        self.dynamic_from = self.dynamic.iter().map(|v| (v.clone(), from(v))).collect();
     }
 
     /// A statement that assigns a variable later run as dynamic SQL builds
@@ -1512,9 +1532,17 @@ impl<'a> Cx<'a> {
         }
         let ts = tokens(n);
         let s = sig(&ts);
+        let at: Span = (n.text_range().start().into(), n.text_range().end().into());
+        // A variable of `dynamic` whose value from this statement may reach
+        // a text that stays T-SQL.
+        let builds = |v: &str| {
+            self.dynamic_from
+                .iter()
+                .any(|(d, from)| d == v && from.as_ref().map_or(true, |f| f.contains(&at)))
+        };
         let assigns = s.windows(2).any(|w| {
             ts[w[0]].k == VARIABLE
-                && self.dynamic.contains(&ts[w[0]].s[1..].to_ascii_lowercase())
+                && builds(&ts[w[0]].s[1..].to_ascii_lowercase())
                 && ts[w[1]].k == OP
                 && matches!(ts[w[1]].s.as_str(), "=" | "+=")
                 && s.first()
@@ -1522,7 +1550,7 @@ impl<'a> Cx<'a> {
         }) || s.first().is_some_and(|&f| ts[f].is("DECLARE"))
             && s.windows(2).any(|w| {
                 ts[w[0]].k == VARIABLE
-                    && self.dynamic.contains(&ts[w[0]].s[1..].to_ascii_lowercase())
+                    && builds(&ts[w[0]].s[1..].to_ascii_lowercase())
                     && ts[w[1]].k != COMMA
                     && s.iter()
                         .any(|&j| j > w[0] && ts[j].k == OP && ts[j].s == "=")
@@ -2102,9 +2130,10 @@ impl<'a> Cx<'a> {
                     return no("DROP … IF EXISTS: not checked for Db2 for i; test for the object in QSYS2 (for example QSYS2.SYSTABLES) first");
                 }
                 if !self.db2() && w(1) == "TRIGGER" {
-                    return no("DROP TRIGGER: PostgreSQL drops a trigger by name ON its table, which the T-SQL statement does not name; a converted trigger may also have a trigger function to drop");
+                    self.drop_trigger(&ts)?
+                } else {
+                    self.expr(&ts)
                 }
-                self.expr(&ts)
             }
             "TRUNCATE" if ts.iter().any(|t| t.is("WITH")) => {
                 return no("TRUNCATE TABLE … WITH (PARTITIONS …): no rule yet");
@@ -2666,7 +2695,7 @@ impl<'a> Cx<'a> {
         let notes = self.take_notes();
         let trace = self.take_trace();
         let q = dedent(q.trim_end(), column(self.src, Self::range(n).0));
-        let q: String = q.lines().map(|l| format!("  {l}\n")).collect();
+        let q = crate::out::indented(2, &q);
         self.cursors.push(Decl {
             src: Self::range(n),
             lines: vec![format!(
@@ -10190,11 +10219,19 @@ fn column(src: &str, at: usize) -> usize {
     at - src[..at].rfind('\n').map_or(0, |p| p + 1)
 }
 
-/// Removes up to `n` leading spaces from every line but the first.
+/// A byte range of the input, start and end.
+type Span = (usize, usize);
+
+/// Removes up to `n` leading spaces from every line but the first, except
+/// lines that continue a string literal: those spaces are part of its value.
 fn dedent(text: &str, n: usize) -> String {
+    let quoted = crate::out::quoted_breaks(text);
     let mut out = String::new();
     for (i, line) in text.split('\n').enumerate() {
-        if i > 0 {
+        if i > 0 && quoted[i - 1] {
+            out.push('\n');
+            out.push_str(line);
+        } else if i > 0 {
             out.push('\n');
             let strip = line.len() - line.trim_start_matches(' ').len();
             out.push_str(&line[strip.min(n)..]);

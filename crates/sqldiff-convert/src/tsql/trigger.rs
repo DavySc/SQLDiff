@@ -423,6 +423,124 @@ impl Cx<'_> {
     }
 }
 
+impl Cx<'_> {
+    /// `DROP TRIGGER [IF EXISTS] [schema.]name` (PostgreSQL). PostgreSQL
+    /// drops a trigger `ON` its table, which T-SQL does not name: the table
+    /// comes from the tree's CREATE TRIGGER of that name, which must be the
+    /// only definition read for it (T-SQL trigger names are unique per
+    /// schema, Msg 2714, and a trigger lives in its table's schema, Msg
+    /// 2103). The trigger function the CREATE TRIGGER became is dropped
+    /// after it: left behind, it would keep a later DROP SCHEMA from
+    /// succeeding. Checked on SQL Server 2022 and PostgreSQL 18 (project
+    /// files eval/drop-trigger/2026-10-30).
+    pub(super) fn drop_trigger(&mut self, ts: &[T]) -> R<String> {
+        let s = sig(ts);
+        let up = |k: usize| s.get(k).map(|&i| ts[i].up()).unwrap_or_default();
+        let mut k = 2;
+        let if_exists = up(k) == "IF" && up(k + 1) == "EXISTS";
+        if if_exists {
+            k += 2;
+        }
+        let mut end = s.len();
+        while end > k && ts[s[end - 1]].k == SEMICOLON {
+            end -= 1;
+        }
+        let rest = &s[k..end];
+        if rest.iter().any(|&i| ts[i].is("ON")) {
+            return no("DROP TRIGGER … ON DATABASE / ALL SERVER drops a DDL trigger; PostgreSQL has event triggers, with other events and no rule here");
+        }
+        if rest.iter().any(|&i| ts[i].k == COMMA) {
+            // SQL Server goes on past a name that fails and drops the rest.
+            return no("DROP TRIGGER of several triggers: SQL Server drops the others when one is missing; write one DROP TRIGGER per trigger");
+        }
+        let (Some(&first), Some(&last)) = (rest.first(), rest.last()) else {
+            return no("DROP TRIGGER without a name");
+        };
+        let name = name_parts(&ts[first..=last])
+            .filter(|p| p.len() <= 2)
+            .ok_or(No("DROP TRIGGER: the trigger name is not understood".into()))?;
+        let cat = self.type_catalog().ok_or(No(
+            "DROP TRIGGER: no catalog to find the trigger's table in".into(),
+        ))?;
+        let (schema, tname) = match name.as_slice() {
+            [s, n] => (Some(s.as_str()), n.as_str()),
+            [n] => (None, n.as_str()),
+            _ => unreachable!(),
+        };
+        let defs = cat.triggers_named(Dialect::Tsql, schema, tname);
+        let shown = self.source(&ts[first..=last]).trim().to_string();
+        let Some(def) = defs.first().copied().cloned() else {
+            return no(format!("DROP TRIGGER: PostgreSQL drops a trigger ON its table, and no CREATE TRIGGER {shown} in the converted files says which table that is"));
+        };
+        let same = |a: &sqldiff_core::catalog::Trigger| {
+            let low = |v: &[String]| v.iter().map(|x| x.to_lowercase()).collect::<Vec<_>>();
+            low(&a.table) == low(&def.table)
+                && a.events == def.events
+                && a.instead == def.instead
+                && a.schema.as_deref().map(str::to_lowercase)
+                    == def.schema.as_deref().map(str::to_lowercase)
+        };
+        if !defs.iter().all(|d| same(d)) {
+            return no(format!("DROP TRIGGER: the converted files define the trigger {shown} more than once, differently, so which table and events it has is not known"));
+        }
+        if def.instead {
+            return no(
+                "DROP TRIGGER of an INSTEAD OF trigger, which is not converted for PostgreSQL",
+            );
+        }
+        if def.events.len() != 1 {
+            return no(format!("DROP TRIGGER: the trigger {shown} has several events and became one PostgreSQL trigger and function per event; no rule drops them together yet"));
+        }
+        // Names as the CREATE TRIGGER's conversion writes them: dbo dropped,
+        // a name that needs quoting refused (the CREATE may have written it
+        // otherwise).
+        let mut dbo = false;
+        let mut out = |parts: &[String], what: &str| -> R<String> {
+            let mut v = Vec::new();
+            for (n, p) in parts.iter().enumerate() {
+                if n + 1 < parts.len() && p.eq_ignore_ascii_case("dbo") {
+                    dbo = true;
+                    continue;
+                }
+                let q = quoted(&format!("[{}]", p.replace(']', "]]")));
+                if q.starts_with('"') {
+                    return no(format!("DROP TRIGGER: the {what} name {p} needs quotes in PostgreSQL, and how its CREATE TRIGGER wrote it is not known"));
+                }
+                v.push(q);
+            }
+            Ok(v.join("."))
+        };
+        let table = out(&def.table, "table")?;
+        let own: Vec<String> = def
+            .schema
+            .iter()
+            .cloned()
+            .chain([def.name.clone()])
+            .collect();
+        let fname = out(&own, "trigger")?;
+        let (fschema, fbase) = match split_last(&fname) {
+            Some((a, b)) => (format!("{a}."), b.to_string()),
+            None => (String::new(), fname.clone()),
+        };
+        let (func, trig) = trigger_names(&fschema, &fbase, "")?;
+        if dbo {
+            let text = self
+                .pick(
+                    "The dbo schema is dropped: objects are assumed to be found through search_path (usually the public schema).",
+                    "",
+                )
+                .to_string();
+            self.note(Status::Assumptions, "ASM-DBO-SCHEMA", &text);
+        }
+        self.note(Status::Assumptions, "ASM-TRIGGER-DROP", &format!("PostgreSQL drops a trigger ON its table: {table}, which the CREATE TRIGGER of {shown} in the converted files names, and its trigger function {func}() goes with it. Equal when the database's trigger {shown} is the one that CREATE TRIGGER defines."));
+        self.step_ts("tsql.stmt.drop-trigger", ts);
+        let ie = if if_exists { "IF EXISTS " } else { "" };
+        Ok(format!(
+            "DROP TRIGGER {ie}{trig} ON {table};\nDROP FUNCTION IF EXISTS {func}();"
+        ))
+    }
+}
+
 /// `a.b."c d"` → (`a.b`, `"c d"`): the text before and after the last dot
 /// outside quotes.
 fn split_last(name: &str) -> Option<(&str, &str)> {

@@ -1066,6 +1066,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.stmt.drop-trigger"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/trigger.rs"]
+
+[[rule]]
 id = "tsql.stmt.throw"
 kind = "converter"
 proof = "lemma:Sqldiff.Mirror/C4 errors and transactions/THROW and RAISE EXCEPTION"
