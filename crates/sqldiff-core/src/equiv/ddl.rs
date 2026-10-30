@@ -593,11 +593,14 @@ fn index(ts: &[Tok], d: Dialect) -> R<Index> {
         return Err("CREATE INDEX ON ONLY (a partitioned table's parent)".into());
     }
     let (table, j) = dotted(ts, i)?;
-    if table
-        .iter()
-        .any(|n| n.text.starts_with('#') || n.text.starts_with('@'))
-    {
-        return Err("an index on a temporary table or table variable".into());
+    // A local #temp table (one part) is read: `mod.rs` names the
+    // PostgreSQL temporary table it became the same way. Global ##tables
+    // and table variables are not.
+    let local_temp = |n: &Name| n.text.starts_with('#') && !n.text.starts_with("##");
+    if table.iter().any(|n| {
+        (n.text.starts_with('#') && !(table.len() == 1 && local_temp(n))) || n.text.starts_with('@')
+    }) {
+        return Err("an index on a global temporary table or a table variable".into());
     }
     if iname.len() == 2 {
         let (si, _) = object_key(&iname, d)?;
