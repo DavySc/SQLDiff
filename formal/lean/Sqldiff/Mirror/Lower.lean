@@ -120,6 +120,19 @@ structure CatCol where
   dflt : Option SExpr := none
 deriving Repr
 
+/-- (C3d part 2) A column of a read-only table whose type is outside the
+slice (T-SQL `decimal`, `char(n)`, `datetime2(7)`, a computed column, a
+column with a `COLLATE` clause, ...): a name only. Its name as the
+target catalog spells it (folded), its spelling in the T-SQL table, and
+whether it is part of the primary key (then no column of the table is a
+key, `CatTable.keyVisible`). It takes part in name resolution
+(`Scope.holders`), but no expression may read it ("The C3d tables"). -/
+structure OpqCol where
+  name : Core.Col
+  tsql : String
+  key : Bool
+deriving Repr
+
 /-- A target table and how the T-SQL table it corresponds to spells its
 columns (the state correspondence of decision 1: rows related column by
 column, the identity on values). What the catalog asserts about the table
@@ -137,10 +150,33 @@ plain columns, and no row of the slice can exceed their key size limits
 (see "The C3c tables"): they then change no result. String columns have
 the database's default collation (no `COLLATE` clause) and, in SQL Server,
 were created with `ANSI_PADDING ON`. The Rust side sends a table only
-when its catalogs show all of this. -/
+when its catalogs show all of this.
+
+(C3d part 2) A **read-only** table (`readOnly`) is one the two routines
+only read: no lowering writes it (`writeTableOf`). For it the catalog
+asserts less, only what a read can see ("The C3d tables" below): both
+tables have the columns `cols` and `opaqueCols`, no others, with these names
+(an opaque column is a name only, of any type); each column of `cols` has
+the type `kind` names, holds no NULL when `notNull` says so, and (a string
+column) has the database's default collation; when every primary-key
+column, on both sides, is in `cols` with a key type, the primary key is
+exactly the columns with `key` and is not `DEFERRABLE` in PostgreSQL;
+neither table is under a row-level security policy (SQL Server security
+policy, PostgreSQL policy with row security enabled), a rule or dynamic
+data masking, and the PostgreSQL table has no inheritance children or
+partitions. Everything
+else is allowed, because no read sees it: other constraints (`CHECK`,
+`UNIQUE`, foreign keys), defaults of any kind, identity, sequences,
+computed and generated columns (opaque), indexes, triggers, system
+versioning (a plain `FROM` reads the current rows: eval/queries Q17). -/
 structure CatTable where
   name : String
   cols : List CatCol
+  /-- (C3d part 2) The columns whose type is outside the slice, by name
+  only (`OpqCol`); only a read-only table has any. -/
+  opaqueCols : List OpqCol := []
+  /-- (C3d part 2) The routines only read the table. -/
+  readOnly : Bool := false
 deriving Repr
 
 /-- The target catalog (trusted like every catalog fact; its hash goes in
@@ -240,10 +276,13 @@ an expression resolves as follows (`resolveName`).
 /-- (C3d) A source of a query block: its reference name (the alias, else
 the last part of the table's name; T-SQL as written, PostgreSQL folded)
 and its columns, each as a statement spells it with the block's core
-column (`Core.srcCol`). -/
+column (`Core.srcCol`). (C3d part 2) `opaqueNames`: the spellings of its
+opaque columns (`OpqCol`), names that resolve to nothing a statement may
+read but that count for every name the block resolves (`holders`). -/
 structure Src where
   ref : String
   cols : List (String × Core.Col)
+  opaqueNames : List String := []
 deriving Repr
 
 /-- The columns in scope: each as a statement may write it (the T-SQL
@@ -265,9 +304,15 @@ structure Scope where
 
 /-- (C3d) The sources of a block with a column spelt `x` (T-SQL: up to
 ASCII case, which is what a case-insensitive collation compares), with
-their positions. -/
+their positions. (C3d part 2) An opaque column counts as any other: the
+engines resolve a name against every column of every source, whatever
+its type, so a name that is an opaque column of another source is
+ambiguous (T-SQL 209, PostgreSQL 42702) and a PL/pgSQL variable spelt as
+one is the column-variable conflict (42702; eval/queries Q19). The one
+holder of an opaque name resolves to nothing (`resolveName`: it is not in
+`Src.cols`), so the name is outside the spec. -/
 def Scope.holders (d : Dialect) (sc : Scope) (x : String) : List (Src × Nat) :=
-  sc.srcs.zipIdx.filter fun (s, _) => s.cols.any fun (k, _) => match d with
+  sc.srcs.zipIdx.filter fun (s, _) => (s.cols.map (·.1) ++ s.opaqueNames).any fun k => match d with
     | .tsql _ _ => k.toLower == x.toLower
     | .pg _ _ _ => k == x
 
@@ -2260,23 +2305,59 @@ def colKey (d : Dialect) (c : CatCol) : String :=
 
 /-- The table can be used: names ASCII and distinct; T-SQL spellings
 distinct up to case; (C3c) every column's type and default as "The C3c
-tables" admits them (`CatCol.ok`). -/
+tables" admits them (`CatCol.ok`). (C3d part 2) The opaque columns'
+names too, among the others; only a read-only table has opaque columns,
+and in one a key column may have any type of the slice (a string or bit
+key, like an opaque one, only leaves the table without a key,
+`keyVisible`). -/
 def CatTable.wellFormed (t : CatTable) : Bool :=
-  !t.cols.isEmpty && t.cols.all (fun c => c.name.toList.all fun (ch : Char) => ch.toNat < 128) &&
+  let names := t.cols.map (·.name) ++ t.opaqueCols.map (·.name)
+  !t.cols.isEmpty && names.all (fun n => n.toList.all fun (ch : Char) => ch.toNat < 128) &&
     -- (C3d) No `.` in a column's name, so that a block's `i.c` (`Core.srcCol`)
     -- reads as one source's column.
-    t.cols.all (fun c => !c.name.toList.contains '.') &&
-    distinct (t.cols.map (·.name)) &&
-    caseSafe (t.cols.map (·.tsql)) &&
-    t.cols.all CatCol.ok
+    names.all (fun n => !n.toList.contains '.') &&
+    distinct names &&
+    caseSafe (t.cols.map (·.tsql) ++ t.opaqueCols.map (·.tsql)) &&
+    (t.readOnly || t.opaqueCols.isEmpty) &&
+    t.cols.all fun c => (if t.readOnly then { c with key := false } else c).ok
 
-/-- The catalog table a data statement names, if it can be used. -/
+/-- (C3d part 2) The primary key is visible: no opaque column is a key
+column, and every key column has a type `Core.keyOf` reads (an integer, a
+date, a timestamp). Always so for a table that is not read-only and
+`wellFormed` (`CatCol.ok`). Otherwise the table has no key in the core
+(`toDef`): the key closure cannot determine it, and a key of the slice
+columns alone would be a part of the real key, which two rows may share
+("The C3d tables"). -/
+def CatTable.keyVisible (t : CatTable) : Bool :=
+  t.opaqueCols.all (!·.key) &&
+    t.cols.all fun c => !c.key || match c.kind with
+      | .int _ | .date | .ts _ => true
+      | _ => false
+
+/-- The catalog table a statement names, if it can be used. A data
+statement asks `writeTableOf`, which refuses a read-only table. -/
 def tableOf (d : Dialect) (target : List String) : Option CatTable :=
   let (Γ, key) : Catalog × Option String := match d with
     | .tsql dep Γ => (Γ, lookup dep.tables (dotted target))
     | .pg Γ _ _ => (Γ, some (dotted (target.map pgName)))
   key.bind fun n =>
     (Γ.tables.find? (·.name == n)).bind fun t => if t.wellFormed then some t else none
+
+/-- (C3d part 2) The catalog table a data statement (`INSERT`, `UPDATE`,
+`DELETE`) writes: one `tableOf` admits that is not read-only. Every write
+in the spec goes through it ("The C3d tables"). -/
+def writeTableOf (d : Dialect) (target : List String) : Option CatTable :=
+  (tableOf d target).bind fun t => if t.readOnly then none else some t
+
+/-- (C3d part 2) No data statement writes a read-only table: every write
+lowering finds its table through `writeTableOf`. -/
+theorem writeTableOf_not_readOnly {d : Dialect} {target : List String} {t : CatTable}
+    (h : writeTableOf d target = some t) : t.readOnly = false := by
+  unfold writeTableOf at h
+  cases ho : tableOf d target with
+  | none => simp [ho] at h
+  | some u =>
+    cases hr : u.readOnly <;> simp_all
 
 /-- A column named in an `INSERT` column list or as a `SET` target. -/
 def colOf (d : Dialect) (t : CatTable) (x : String) : Option CatCol :=
@@ -2294,8 +2375,21 @@ def scopeOf (d : Dialect) (t : CatTable) (target : List String) : Scope :=
       | .pg _ _ _ => target.getLast?.map pgName
     colTys := t.cols.map fun c => (c.name, c.kind) }
 
+/-- The table as the core sees it. (C3d part 2) For a read-only table, its
+projection on the slice columns `cols` (the opaque ones dropped), with the
+key only when it is visible (`keyVisible`; "The C3d tables"). -/
 def CatTable.toDef (t : CatTable) : Core.TableDef :=
-  ⟨t.name, t.cols.map fun c => ⟨c.name, c.notNull, c.key⟩⟩
+  ⟨t.name, t.cols.map fun c => ⟨c.name, c.notNull, c.key && t.keyVisible⟩⟩
+
+/-- (C3d part 2) The core table has a key only when the catalog's key is
+wholly visible (`keyVisible`): no opaque key column, every key column of
+a type `Core.keyOf` reads. -/
+theorem CatTable.keyVisible_of_hasKey {t : CatTable} (h : t.toDef.hasKey = true) :
+    t.keyVisible = true := by
+  simp only [CatTable.toDef, Core.TableDef.hasKey, List.any_map, List.any_eq_true,
+    Function.comp_def, Bool.and_eq_true] at h
+  obtain ⟨_, _, _, hv⟩ := h
+  exact hv
 
 def CatTable.isKey (t : CatTable) (c : Core.Col) : Bool :=
   t.cols.any fun d => d.name == c && d.key
@@ -2625,6 +2719,124 @@ and PostgreSQL may fold a constant part while planning. `ORDER BY`,
 joins, subqueries inside conditions, and writes from queries stay
 outside (later parts of C3d). -/
 
+/-! ## The C3d tables: read-only tables
+
+Phase C3d, part 2, lets a query read a table that the C3a, C3b and C3c
+rules keep out because of what it carries besides its columns: foreign
+keys, `UNIQUE` and `CHECK` constraints, identity, defaults of any kind,
+computed columns, system versioning, and columns of types outside the
+slice. Such a table is **read-only** (`CatTable.readOnly`): no write of
+either routine names it. "eval/queries Qn" for `n` from 16 on is probe
+`Qn` of `eval/queries/tables-{mssql,postgres}.sql` with their `.out`
+files, run on SQL Server 2022 (16.0.4305.5) and PostgreSQL 18.6 on
+2026-10-30. **The vendor quotes below were written from memory** and
+need checking against the pages; the probes are what the rules rest on.
+
+**Only reads.** `INSERT`, `UPDATE` and `DELETE` find their table through
+`writeTableOf`, which refuses a read-only one (reason code
+`stmt:<kind>:table:read-only`); the slice check (`sliceStmt`) does the
+same; `MERGE`, `TRUNCATE` and every other write are outside the spec in
+any case. A call is the world's effect (`Core.WorldModel.call`), which
+may change any table, a read-only one included, as it may change tables
+outside the catalog: the opaque columns are, like those tables, part of
+the database the world sees and the core does not (a callee's effect on
+the projection may depend on them; `Refines` quantifies over every world
+model). So the routines' own statements never write the table, and its
+rows change only by the world, alike on both sides.
+
+**The projection.** The core's table is the projection of the real one
+on the columns of the slice (`CatTable.toDef`): each real row gives one
+core row, multiplicity kept (tables are lists, read as bags, "The
+database" in `Core/Semantics.lean`). A read of the core table gives
+what the engines' read gives exactly when no expression reads a column
+outside the projection and nothing in the read depends on the row as a
+whole: the select list of `SELECT @x = ...`, the scalar subquery and
+the `FOR` block's query are slice expressions over named columns
+(`pickValue`), `COUNT(*)` counts rows, `EXISTS` tests for one and its
+select list (`1` or `*`) is not evaluated (eval/queries Q7, and Q16 for
+`SELECT *` over a computed column that raises), every condition reads
+named columns, and a whole-row reference (a PL/pgSQL reference name read
+as a value) is outside the spec ("Names in a query block"). An opaque
+column is never in `Src.cols`, so neither resolution of a name
+(`resolveName`, `resolveQual`) gives it: a statement that names one is
+outside the spec, on the C1 path too (`stmt:select:column:opaque`).
+
+**What reads do not see.** A `CHECK`, `UNIQUE` or foreign-key
+constraint, a default, an identity property, a trigger and an index act
+only when a row is written: SQL Server and PostgreSQL check a constraint
+"when data is inserted or updated" and fire DML triggers on `INSERT`,
+`UPDATE` and `DELETE` only ("CREATE TABLE (Transact-SQL)", "CREATE
+TRIGGER (Transact-SQL)"; PostgreSQL 5.4 "Constraints", "CREATE
+TRIGGER"; from memory). A T-SQL computed column that is not persisted is
+computed when a query reads it: a read that does not name it does not
+compute it ("Specify computed columns in a table", from memory). Probed,
+eval/queries Q16: a table with a foreign key, `UNIQUE`, `CHECK`,
+identity, an expression default, an index, `decimal` and `datetime2(7)`
+columns, a persisted computed column and a non-persisted one whose
+expression raises (`1/0` on every row) gives the same `COUNT`, `EXISTS`
+(also `SELECT *`), pick by key across a join and scalar subquery as the
+plain table with the same rows, and the raising column raises (8134) only
+in a query that names it, also in a `WHERE` (Q19); PostgreSQL likewise,
+with identity, `numeric`, `timestamp`, a stored generated column and a
+virtual one (PostgreSQL 18's default kind) that raises 22012 only where
+named. A system-versioned table read with a plain
+`FROM` (no `FOR SYSTEM_TIME`, which the parser does not read) gives its
+current rows only, never its history ("Temporal tables", from memory);
+probed, eval/queries Q17 (after an `UPDATE` and a `DELETE` of three
+rows, `COUNT` is 2, the pick by key gives the updated value, the deleted
+key no row, and the history table holds the 2 old versions).
+
+**What does change a read, and keeps a table out** (the Rust side,
+`cert.rs`, sends no such table; the catalog asserts it). A SQL Server
+security policy's filter predicate and a PostgreSQL row-level security
+policy hide rows from a read ("Row-level security", "CREATE SECURITY
+POLICY (Transact-SQL)"; PostgreSQL 5.9 "Row Security Policies", from
+memory). Probed, eval/queries Q18: under a filter predicate (`owner =
+USER_NAME()`) SQL Server's `COUNT` drops from 3 to 1, for `dbo` and for
+another user; PostgreSQL's from 3 to 1 for the table's owner once row
+security is enabled and forced (enabled alone, the owner still reads 3;
+a superuser bypasses it). A PostgreSQL rule, inheritance child or partition changes what
+`FROM t` reads; dynamic data masking changes what a read of the masked
+column gives (such a column is opaque), as does a `COLLATE` clause under
+the binary-collation fact (such a column is opaque too); a statement that
+adds, drops, renames or retypes a column, drops the table or the key, or
+runs as dynamic SQL makes the DDL no description of the table.
+
+**Names** (`Scope.holders`). An opaque column is a column for name
+resolution: an unqualified name that is an opaque column of one source
+and a column of another is ambiguous (T-SQL 209, PostgreSQL 42702), and
+a PL/pgSQL variable spelt as an opaque column of a source conflicts with
+it (42702): the engines resolve names before they look at types. Probed,
+eval/queries Q19: 209 and 42702 for a name that is a `decimal`
+(`numeric`) column of one table and an integer column of the other,
+none once qualified; 42702 for a parameter spelt as a `numeric` column
+in the converter's `FOR` query. So the
+holder of a name counts every column, opaque or not, and an opaque
+holder resolves to nothing (`resolveName`).
+
+**Keys.** The key closure (`Core.Block.atMostOne`) and its meaning
+`Core.kept_length_le_one` ask that the core's rows have distinct keys.
+The projection keeps the real rows' key values only when the whole
+primary key is in it: a key column that is opaque, or a string or `bit`
+column (outside `Core.keyOf`), leaves the table without a key in the core
+(`CatTable.keyVisible`), since two rows may share the visible part of a
+key (Q16: two rows with one `ord_id` and two `line_no`). A table
+without a key is still read: `COUNT(*)`, `EXISTS` and the scalar
+subquery (over a block it cannot close, the scalar subquery counts as
+able to fail, `Core.Stmt.failsHere`) need no key; only `SELECT @x = ...`
+and its `FOR` block need the closure. A `UNIQUE` constraint is not used
+as a key (outside C3d part 2). The Rust side sends key flags only when
+both tables declare the same primary key in their `CREATE TABLE`, on
+columns of key types on both sides, not `DEFERRABLE` (a PostgreSQL
+deferred key may hold two equal keys until the transaction commits).
+
+**Nullability.** `notNull` is claimed only where both DDLs say `NOT NULL`
+(or the column is a key column of both): a column nullable on one side
+only is read as nullable, the weaker claim (`kept_length_le_one` then
+asks fewer columns to be non-NULL; no write reaches the table). A T-SQL
+column that says neither `NULL` nor `NOT NULL` is read as nullable,
+whatever `ANSI_NULL_DFLT_ON` made it. -/
+
 /-- The variable an `EXISTS` test is put in. A PL/pgSQL `"%exists"` can
 spell it; `wellScoped` and the renaming's injectivity refuse the
 collision (see the C3b rules). -/
@@ -2704,7 +2916,10 @@ and columns (`Core.srcCol`), the kinds of all columns, and the sources an
 expression may name. -/
 def blockScope (d : Dialect) (srcs : List (CatTable × String)) (vis : List Nat) : Scope :=
   { srcs := srcs.zipIdx.map fun ((t, r), i) =>
-      ⟨r, t.cols.map fun c => (colKey d c, Core.srcCol i c.name)⟩
+      { ref := r, cols := t.cols.map fun c => (colKey d c, Core.srcCol i c.name)
+        opaqueNames := t.opaqueCols.map fun c => match d with
+          | .tsql _ _ => c.tsql
+          | .pg _ _ _ => c.name }
     colTys := (srcs.zipIdx.map fun ((t, _), i) =>
       t.cols.map fun c => (Core.srcCol i c.name, c.kind)).flatten
     vis := vis }
@@ -2978,7 +3193,7 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
     | .pg _ _ _, _ => none
   | .Insert tgt cols (.SrcValues rows) [] [] none => do
     if !dataOk d k then none else
-    let t ← tableOf d tgt
+    let t ← writeTableOf d tgt
     let ccs ← cols.mapM (colOf d t)
     let cs := ccs.map (·.name)
     if cs.isEmpty || !distinct cs || rows.isEmpty || !rows.all (·.length == cs.length) then none
@@ -2989,7 +3204,7 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
       pure [.insert t.toDef (cs ++ dfl.map (·.1)) (rows'.map (· ++ dfl.map (·.2)))]
   | .Update tgt none sets [] wh => do
     if !dataOk d k then none else
-    let t ← tableOf d tgt
+    let t ← writeTableOf d tgt
     let sc := scopeOf d t tgt
     let sets' ← sets.mapM fun
       | .Set [c] e => do
@@ -3004,7 +3219,7 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
       pure [.update t.toDef sets' wh']
   | .Delete tgt none [] wh => do
     if !dataOk d k then none else
-    let t ← tableOf d tgt
+    let t ← writeTableOf d tgt
     let wh' ← lowerOpt d env (scopeOf d t tgt) wh
     pure [.delete t.toDef wh']
   | .Insert .. | .Update .. | .Delete .. | .Merge .. | .Message .. => none
@@ -4338,12 +4553,12 @@ def sliceStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt 
     | some e => (ty.map fun t => valueFits d env {} t e).getD false
   -- C3c: string values too; `colValue` holds them to the column.
   | .Insert _ _ (.SrcValues rows) _ _ _ => rows.all (·.all (anyValueOk d env {}))
-  | .Update tgt _ sets _ wh => match tableOf d tgt with
+  | .Update tgt _ sets _ wh => match writeTableOf d tgt with
     | some t =>
       let sc := scopeOf d t tgt
       sets.all (fun | .Set _ e => anyValueOk d env sc e) && wh.all (condOk d env sc)
     | none => false
-  | .Delete tgt _ _ wh => match tableOf d tgt with
+  | .Delete tgt _ _ wh => match writeTableOf d tgt with
     | some t => wh.all (condOk d env (scopeOf d t tgt))
     | none => false
   | _ => false

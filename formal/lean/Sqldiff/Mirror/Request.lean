@@ -29,6 +29,9 @@ string in lower-case hex, two digits per byte:
                 TABLE NAME=COL/COL/... a target table (folded, `.`-joined as
                                      the PL/pgSQL code names it) and its
                                      columns in declaration order, at least one
+                   or NAME=COL/...=r (C3d part 2) a read-only table
+                                     (`CatTable.readOnly`), which may have
+                                     opaque columns
                 COL NAME.SPEC, NAME.SPEC.NAME or NAME.SPEC.NAME.DEFAULT
                                      the column (folded), its type and
                                      constraints, optionally its spelling
@@ -46,7 +49,10 @@ string in lower-case hex, two digits per byte:
                                      `varchar(DIGITS)`
                                      (`CatCol.kind`; a string key column, a
                                      length outside 1..4000, decodes but the
-                                     table is not usable: `CatTable.wellFormed`)
+                                     table is not usable: `CatTable.wellFormed`;
+                                     (C3d part 2) in a read-only table a
+                                     string key column is usable and leaves
+                                     the table without a key)
                      j               (C2c) `bigint` (PostgreSQL `bigint`/`int8`)
                      h               (C2c) `smallint` (`smallint`/`int2`)
                      b               (C2c) T-SQL `bit`, PostgreSQL `boolean`
@@ -56,6 +62,12 @@ string in lower-case hex, two digits per byte:
                      t DIGIT         (C2c) T-SQL `datetime2(DIGIT)`, PostgreSQL
                                      `timestamp(DIGIT)`, DIGIT 0..6 (7 decodes
                                      but the table is not usable)
+                     o               (C3d part 2) an opaque column
+                                     (`OpqCol`): a name only, of a type
+                                     outside the slice; its k flag says it
+                                     is a key column (then the table has no
+                                     key); no DEFAULT. Only in a read-only
+                                     table (else the table is not usable)
                 DEFAULT i INT        (C3c) an integer literal, `-` allowed:
                                      `i0`, `i-1` (`Sqldiff.Mirror.intLit?`;
                                      (C2c) for a `j` column the 64-bit range,
@@ -101,7 +113,10 @@ answers a request with a `v`/`w` column or a DEFAULT "the catalog does
 not decode"; a C3c checker reads every older request as before. (C2c) A
 checker older than C2c answers a request with a `j`, `h`, `b`, `d` or
 `t` column, or a `b`/`d`/`t` DEFAULT, "the catalog does not decode"; a
-C2c checker reads every older request as before.
+C2c checker reads every older request as before. (C3d part 2) A checker
+older than 0.17.0 answers a request with a read-only TABLE (`=r`) or an
+`o` column "the catalog does not decode"; a 0.17.0 checker reads every
+older request as before.
 
 The answer: `check`, plus the fields `extra` adds to a confirmed answer
 (`"scalars"`, `"residual"` for a C2a answer, `"statements"` and
@@ -206,21 +221,29 @@ def dflt? (s : String) : Option Core.SExpr :=
   | 't' :: hs => (name? (String.ofList hs)).bind fun t => (tsLit? 6 t).map .ts
   | _ => none
 
-def col? (s : String) : Option CatCol := do
+/-- A column: one of the slice (`CatCol`, `inl`) or (C3d part 2) an opaque
+one (`OpqCol`, `inr`: SPEC `o` with the flags, no DEFAULT; its `n` flag
+is read and dropped). -/
+def col? (s : String) : Option (CatCol ⊕ OpqCol) := do
   let (n, sp, t, df) ← match s.splitOn "." with
     | [n, sp] => some (n, sp, none, none)
     | [n, sp, t] => some (n, sp, some t, none)
     | [n, sp, t, df] => some (n, sp, some t, some df)
     | _ => none
   let name ← name? n
-  let (kind, notNull, key) ← spec? sp
   let tsql ← match t with
     | some t => name? t
     | none => some (if name.startsWith "\"" then String.ofList (name.toList.drop 1) else name)
-  let dflt ← match df with
-    | some df => (dflt? df).map some
-    | none => some none
-  pure { name, tsql, notNull, key, kind, dflt }
+  match sp.toList with
+  | 'o' :: fl => do
+    let (_, key) ← flags? fl
+    if df.isSome then none else pure (.inr { name, tsql, key })
+  | _ => do
+    let (kind, notNull, key) ← spec? sp
+    let dflt ← match df with
+      | some df => (dflt? df).map some
+      | none => some none
+    pure (.inl { name, tsql, notNull, key, kind, dflt })
 
 /-- (C2c) A callee parameter's type: the hex of its name, then `.` and the
 hex of each type argument (`74494d455354414d50.36` is `TIMESTAMP(6)`). -/
@@ -245,10 +268,18 @@ def entry? (e : String) : Option Entry :=
   if e.startsWith "!" then
     if e == "!binary-collation" then some .binaryCollation else none
   else
-  match e.splitOn "=" with
-  | [n, cs] => do
+  let table (n cs : String) (readOnly : Bool) : Option Entry := do
     let cols ← (cs.splitOn "/").mapM col?
-    pure (.table { name := ← name? n, cols })
+    let name ← name? n
+    let t : CatTable :=
+      { name := name
+        cols := cols.filterMap fun c => c.getLeft?
+        opaqueCols := cols.filterMap fun c => c.getRight?
+        readOnly := readOnly }
+    pure (.table t)
+  match e.splitOn "=" with
+  | [n, cs] => table n cs false
+  | [n, cs, "r"] => table n cs true
   | [_] => match e.splitOn ":" with
     | [n, ms] => do pure (.routine (← name? n) (← ms.toList.mapM mode?) none)
     | [n, ms, ts] => do
@@ -467,6 +498,35 @@ def extra (dep cat ra rb : String) (ans : Answer) : String :=
     (fun g => g.tables.map (·.wellFormed)) == some [false]
 #guard (catalog? "74=74.t3.74.t323032342d30312d30315430303a30303a30302e313233").map
     (fun g => g.tables.map (·.wellFormed)) == some [true]
+-- C3d part 2: a read-only table (`=r`) with an opaque column `p` spelt
+-- `P` in T-SQL, the key `id`; the same with the opaque column in the key
+-- (it decodes, and leaves the table without a key); an opaque column
+-- without `=r` decodes into an unusable table; anything after `=` other
+-- than `r`, a DEFAULT on an opaque column, or an unknown flag does not
+-- decode.
+#guard (catalog? "74=6964.ink.4964/70.on.50=r").map
+    (fun g => g.tables.map fun t => (t.readOnly, t.wellFormed, t.cols.map (·.name),
+      t.opaqueCols.map fun c => (c.name, c.tsql, c.key), t.toDef.hasKey)) ==
+  some [(true, true, ["id"], [("p", "P", false)], true)]
+-- The line `crates/sqldiff-core/src/proof.rs` writes (its test
+-- `a_mirror_request_encodes_tables_as_the_checker_reads_them`): `q` an
+-- opaque key column, so no key.
+#guard (catalog? "74=6964.ink.4964/70.o.50/71.ok.51=r").map
+    (fun g => g.tables.map fun t => (t.wellFormed, t.cols.map (·.tsql),
+      t.opaqueCols.map fun c => (c.tsql, c.key), t.toDef.hasKey)) ==
+  some [(true, ["Id"], [("P", false), ("Q", true)], false)]
+#guard (catalog? "74=6964.ink/70.onk=r").map
+    (fun g => g.tables.map fun t => (t.wellFormed, t.toDef.hasKey)) == some [(true, false)]
+#guard (catalog? "74=6964.ink/70.o").map
+    (fun g => g.tables.map fun t => (t.readOnly, t.wellFormed)) == some [(false, false)]
+#guard (catalog? "74=6964.ink=r").map (fun g => g.tables.map (·.readOnly)) == some [true]
+#guard (catalog? "74=6964.ink=w").isNone
+#guard (catalog? "74=6964.ink=r=r").isNone
+#guard (catalog? "74=70.o.70.i1=r").isNone
+#guard (catalog? "74=70.ox=r").isNone
+-- A string key in a read-only table: usable, without a key.
+#guard (catalog? "74=63.v5k/6e.i=r").map
+    (fun g => g.tables.map fun t => (t.wellFormed, t.toDef.hasKey)) == some [(true, false)]
 -- Malformed: a non-ISO date default, a bit default other than 0/1, no digit after `t`.
 #guard (catalog? "74=64.d.64.d32303234").isNone
 #guard (catalog? "74=62.b.62.b2").isNone

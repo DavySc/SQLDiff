@@ -160,8 +160,11 @@ def blockNameReason (d : Dialect) (sc : Scope) (x : String) : String :=
   else match d with
     | .pg _ vars _ =>
       if hs.length == 1 && vars.contains n && !sc.srcs.any (·.ref == n) then "name:column-variable"
+      else if hs.any (fun (s, _) => s.opaqueNames.contains n) then "stmt:select:column:opaque"
       else "expr:name:unresolved"
-    | .tsql _ _ => "expr:name:unresolved"
+    | .tsql _ _ =>
+      if hs.any (fun (s, _) => s.opaqueNames.any (·.toLower == n.toLower)) then "stmt:select:column:opaque"
+      else "expr:name:unresolved"
 
 /-- A form the rules refuse whatever its sub-expressions. -/
 def ownReason (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option String
@@ -190,7 +193,12 @@ def ownReason (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option Str
   -- aliased table's own name, a PL/pgSQL variable or the routine's name.
   | .Name [q, c] =>
     if sc.srcs.isEmpty then some "expr:name:qualified"
-    else if (resolveQual d sc q c).isNone then some "stmt:select:from:qualifier"
+    else if (resolveQual d sc q c).isNone then
+      -- (C3d part 2) The one source `q` names has `c` as an opaque column.
+      let opq := match d with
+        | .tsql _ _ => sc.srcs.any fun s => s.ref == q && s.opaqueNames.contains c
+        | .pg _ _ _ => sc.srcs.any fun s => s.ref == pgName q && s.opaqueNames.contains (pgName c)
+      some (if opq then "stmt:select:column:opaque" else "stmt:select:from:qualifier")
     else none
   | .Name _ => some "expr:name:qualified"
   | .Star _ => some "expr:star"
@@ -325,6 +333,13 @@ def whyTable (d : Dialect) (pre : String) (tgt : List String) : List String :=
   match key.bind fun n => Γ.tables.find? (·.name == n) with
   | some t => if t.wellFormed then [] else [pre ++ ":table:not-plain"]
   | none => [pre ++ ":table:unknown"]
+
+/-- (C3d part 2) Why `writeTableOf` refuses the table a data statement
+names: as `whyTable`, or a read-only table (`:table:read-only`). -/
+def whyWriteTable (d : Dialect) (pre : String) (tgt : List String) : List String :=
+  match tableOf d tgt with
+  | some t => if t.readOnly then [pre ++ ":table:read-only"] else []
+  | none => whyTable d pre tgt
 
 /-- Why `querySpec` refuses a query: a clause outside the shape
 (`selParts`), or its `FROM` (`readFrom`): an item of another form, or a
@@ -537,8 +552,8 @@ def whyStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (s : Ast.Stmt) : L
         (if returning.isEmpty && retInto.isEmpty then [] else ["stmt:insert:returning"]) ++
         (if conflict.isSome then ["stmt:insert:conflict"] else []) ++
         whyDataOk d k ++
-        match tableOf d tgt with
-        | none => whyTable d "stmt:insert" tgt
+        match writeTableOf d tgt with
+        | none => whyWriteTable d "stmt:insert" tgt
         | some t =>
           let ccs := cols.filterMap (colOf d t)
           if cols.isEmpty || ccs.length != cols.length || !distinct (ccs.map (·.name)) then
@@ -554,8 +569,8 @@ def whyStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (s : Ast.Stmt) : L
       (if froms.isEmpty then [] else ["stmt:update:from"]) ++
         (if alias.isSome then ["stmt:update:alias"] else []) ++
         whyDataOk d k ++
-        match tableOf d tgt with
-        | none => whyTable d "stmt:update" tgt
+        match writeTableOf d tgt with
+        | none => whyWriteTable d "stmt:update" tgt
         | some t =>
           let sc := scopeOf d t tgt
           (if sets.isEmpty then ["stmt:update:cols"] else []) ++
@@ -573,8 +588,8 @@ def whyStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (s : Ast.Stmt) : L
       (if froms.isEmpty then [] else ["stmt:delete:from"]) ++
         (if alias.isSome then ["stmt:delete:alias"] else []) ++
         whyDataOk d k ++
-        match tableOf d tgt with
-        | none => whyTable d "stmt:delete" tgt
+        match writeTableOf d tgt with
+        | none => whyWriteTable d "stmt:delete" tgt
         | some t => match wh with
           | some w => ifLowerFails d env (scopeOf d t tgt) w
           | none => []
