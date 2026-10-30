@@ -132,6 +132,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.func.isnull` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.len` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string variable, parameter or literal of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.string_agg` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.geography.point-constant` | `converter` | engine | SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical | `sqldiff-convert/src/tsql/geography.rs` |
 | `tsql.global-temp` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.clustered` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.nulls-not-distinct` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

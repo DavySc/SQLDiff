@@ -155,6 +155,10 @@ pub mod asm {
         "ASM-RAISERROR-TEXT",
         "The RAISERROR message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space, where PostgreSQL keeps the text as it is",
     );
+    pub const RAISERROR_SEVERITY: (&str, &str) = (
+        "ASM-RAISERROR-SEVERITY",
+        "The RAISERROR severity variable is not NULL and at most 18: T-SQL raises error 2754 instead for 19 and above without WITH LOG, and for a NULL severity uses the value the variable held before it became NULL (SQL Server 2022)",
+    );
     pub const RAISERROR_FORMAT: (&str, &str) = (
         "ASM-RAISERROR-FORMAT",
         "The variable RAISERROR takes as its message holds no % sign: T-SQL reads it as a format, so % starts a substitution",
@@ -633,6 +637,18 @@ impl<'a> Canon<'a> {
         self.names.clear();
         self.output = None;
         self.rows = false;
+    }
+
+    /// The geography point a constant is: `0x…` in T-SQL, `'…'` (hex EWKB)
+    /// in PostgreSQL.
+    fn geog_point(&self, t: &Term) -> Option<super::geography::Point> {
+        use super::geography as g;
+        let text = t.kid(0).and_then(Term::atom)?;
+        match (self.d, t.head()) {
+            (Dialect::Tsql, "bytes") => g::from_sqlserver(&g::unhex(text)?),
+            (Dialect::Postgres, "str") => g::from_ewkb(&g::unhex(text)?),
+            _ => None,
+        }
     }
 
     /// SQL Server cannot compare geography, text, ntext, image or xml values
@@ -1919,6 +1935,25 @@ impl<'a> Canon<'a> {
         // ("Invalid endian flag value", checked on PostGIS 3.6), and the
         // two parse text differently.
         if dst.fam == Fam::Geography && v.1.map_or(true, |t| t.fam != Fam::Geography) {
+            // A point constant both read alike: SQL Server's binary form,
+            // PostGIS's hex EWKB text (super::geography has the runs).
+            if let Some(p) = self.geog_point(&v.0) {
+                let bits =
+                    |f: Option<f64>| a(f.map_or("-".into(), |f| format!("{:016x}", f.to_bits())));
+                return (
+                    n(
+                        "geog",
+                        vec![
+                            a(p.srid.to_string()),
+                            bits(Some(p.x)),
+                            bits(Some(p.y)),
+                            bits(p.z),
+                            bits(p.m),
+                        ],
+                    ),
+                    to,
+                );
+            }
             return (
                 n(
                     "dcast",
@@ -4891,6 +4926,16 @@ impl<'a> Canon<'a> {
         }
         if m.format_var {
             self.assume(asm::RAISERROR_FORMAT);
+        }
+        // An int severity variable: a wider one may overflow (Msg 8115) and
+        // a fraction or string is converted first.
+        if let Some(sev) = &m.severity {
+            match self.expr(sev)? {
+                (_, Some(ty)) if ty.fam == Fam::Int && ty.len.is_some_and(|b| b <= 32) => {
+                    self.assume(asm::RAISERROR_SEVERITY);
+                }
+                _ => return Err("a RAISERROR severity that is not an int variable".into()),
+            }
         }
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }

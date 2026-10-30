@@ -736,6 +736,13 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.geography.point-constant"
+kind = "converter"
+proof = "engine"
+note = "SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
 id = "tsql.global-temp"
 kind = "converter"
 proof = "engine"

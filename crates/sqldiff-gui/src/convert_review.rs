@@ -75,6 +75,11 @@ struct Loaded {
     tree: Tree,
     /// Per file (report order): unit ids, in the conversion's unit order.
     ids: Vec<Vec<String>>,
+    /// Indices into `inputs`, sorted by path, and (file, unit) indices
+    /// into `ids`, sorted by id (then file and unit): lookups without a
+    /// copy of a path or an id.
+    by_path: Vec<u32>,
+    by_id: Vec<(u32, u32)>,
     instances: Option<Instances>,
     /// Ledger lines that were not applied, with why.
     not_applied: Vec<String>,
@@ -626,9 +631,28 @@ impl Review {
 
     /// File index and unit index of a unit, by path and id.
     fn find(&self, path: &str, unit: &str) -> Option<(usize, usize)> {
-        let f = self.loaded.inputs.iter().position(|i| i.rel == path)?;
-        let k = self.loaded.ids[f].iter().position(|id| id == unit)?;
-        Some((f, k))
+        self.with_id(unit)
+            .find(|&(f, _)| self.loaded.inputs[f].rel == path)
+    }
+
+    /// File index of a path.
+    fn file_index(&self, path: &str) -> Option<usize> {
+        let l = &self.loaded;
+        l.by_path
+            .binary_search_by(|&f| l.inputs[f as usize].rel.as_str().cmp(path))
+            .ok()
+            .map(|i| l.by_path[i] as usize)
+    }
+
+    /// File and unit indices of the units with this id, in report order.
+    fn with_id<'a>(&'a self, unit: &'a str) -> impl Iterator<Item = (usize, usize)> + 'a {
+        let l = &self.loaded;
+        let id = |&(f, k): &(u32, u32)| l.ids[f as usize][k as usize].as_str();
+        let start = l.by_id.partition_point(|e| id(e) < unit);
+        l.by_id[start..]
+            .iter()
+            .take_while(move |e| id(e) == unit)
+            .map(|&(f, k)| (f as usize, k as usize))
     }
 
     fn unit_review(&self, f: usize, id: &str) -> Option<&UnitReviewReport> {
@@ -738,12 +762,9 @@ impl Review {
                 .iter()
                 .filter_map(|id| {
                     // The ids are unique per file; the item names only its first file.
-                    self.loaded
-                        .inputs
-                        .iter()
-                        .enumerate()
-                        .find(|(f, _)| self.loaded.ids[*f].iter().any(|x| x == id))
-                        .and_then(|(_, i)| self.unit(&i.rel, id))
+                    self.with_id(id)
+                        .next()
+                        .and_then(|(f, _)| self.unit(&self.loaded.inputs[f].rel, id))
                 })
                 .collect(),
             _ => Vec::new(),
@@ -763,7 +784,7 @@ impl Review {
     /// A whole input file (`side` `in`) or its conversion (`out`), as the
     /// unit lines count them.
     pub fn file(&self, path: &str, side: &str) -> Option<String> {
-        let f = self.loaded.inputs.iter().position(|i| i.rel == path)?;
+        let f = self.file_index(path)?;
         match side {
             "in" => Some(self.loaded.inputs[f].text.clone()),
             "out" => Some(self.loaded.tree.conversions[f].output.clone()),
@@ -1013,6 +1034,8 @@ fn empty() -> Loaded {
             conversions: Vec::new(),
         },
         ids: Vec::new(),
+        by_path: Vec::new(),
+        by_id: Vec::new(),
         instances: None,
         not_applied: Vec::new(),
         out_differs: Vec::new(),
@@ -1066,11 +1089,20 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
     };
     let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
     let gate = judge(&mut t, &inputs, s, instances.as_ref());
-    let ids = inputs
+    let ids: Vec<Vec<String>> = inputs
         .iter()
         .zip(&t.conversions)
         .map(|(i, c)| review::unit_ids(&i.rel, &i.text, c))
         .collect();
+    let mut by_path: Vec<u32> = (0..inputs.len() as u32).collect();
+    by_path.sort_by(|&a, &b| inputs[a as usize].rel.cmp(&inputs[b as usize].rel));
+    let mut by_id: Vec<(u32, u32)> = ids
+        .iter()
+        .enumerate()
+        .flat_map(|(f, v)| (0..v.len() as u32).map(move |k| (f as u32, k)))
+        .collect();
+    // Stable: the same id stays in report order.
+    by_id.sort_by(|&(f, k), &(g, j)| ids[f as usize][k as usize].cmp(&ids[g as usize][j as usize]));
     let out_differs = t
         .report
         .files
@@ -1086,6 +1118,8 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
         unreadable,
         tree: t,
         ids,
+        by_path,
+        by_id,
         instances,
         not_applied,
         out_differs,
@@ -1149,22 +1183,50 @@ fn written_texts(out: &std::path::Path) -> Result<Vec<String>, String> {
 
 /// The page with a payload embedded.
 pub fn page(state: &StateView) -> String {
-    let payload = serde_json::json!({
-        "state": state,
-        "dialects": sqldiff_core::Dialect::ALL.iter().map(|d| serde_json::json!({
-            "id": d.id(), "name": d.display_name(), "lex": crate::convert::LexInfo::of(*d),
-        })).collect::<Vec<_>>(),
-        "keywords": crate::styled_keywords(),
-    });
-    let json = serde_json::to_string(&payload)
-        .unwrap()
-        .replace("</", "<\\/");
-    REVIEW_HTML
-        .replace("/*__SQLDIFF_LEXER__*/", lexer())
-        .replace(
-            "/*__SQLDIFF_PAYLOAD__*/null",
-            &format!("/*__SQLDIFF_PAYLOAD__*/{json}"),
-        )
+    // Serialized straight from the state: a `serde_json::Value` of a large
+    // tree's queue takes many times the memory of its text.
+    #[derive(Serialize)]
+    struct DialectView {
+        id: &'static str,
+        name: &'static str,
+        lex: crate::convert::LexInfo,
+    }
+    #[derive(Serialize)]
+    struct Payload<'a> {
+        state: &'a StateView,
+        dialects: Vec<DialectView>,
+        keywords: Vec<&'static str>,
+    }
+    let payload = Payload {
+        state,
+        dialects: sqldiff_core::Dialect::ALL
+            .iter()
+            .map(|d| DialectView {
+                id: d.id(),
+                name: d.display_name(),
+                lex: crate::convert::LexInfo::of(*d),
+            })
+            .collect(),
+        keywords: crate::styled_keywords(),
+    };
+    let json = serde_json::to_string(&payload).unwrap();
+    let html = REVIEW_HTML.replace("/*__SQLDIFF_LEXER__*/", lexer());
+    let (head, tail) = html
+        .split_once("/*__SQLDIFF_PAYLOAD__*/null")
+        .expect("payload marker in review.html");
+    let mut out = String::with_capacity(html.len() + json.len() + json.len() / 64);
+    out.push_str(head);
+    out.push_str("/*__SQLDIFF_PAYLOAD__*/");
+    // `</` would end the script.
+    let mut rest = json.as_str();
+    while let Some(i) = rest.find("</") {
+        out.push_str(&rest[..i]);
+        out.push_str("<\\/");
+        rest = &rest[i + 2..];
+    }
+    out.push_str(rest);
+    out.push_str(tail);
+    out
 }
 
 /// Convert mode's highlighter (`lexSql`, `hlLines` and what they need), so

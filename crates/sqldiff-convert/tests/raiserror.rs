@@ -2,8 +2,10 @@
 //! `tsql.stmt.raiserror`): 0 to 10 an informational `RAISE NOTICE`, 11 to
 //! 18 `RAISE EXCEPTION … USING ERRCODE = 'P0001'`. Values are shown as
 //! T-SQL shows them (`(null)` for NULL), and the engine compares the
-//! message with what it became. Forms whose meaning depends on a value
-//! (a variable severity, a message number) or that the rule does not read
+//! message with what it became. An int severity variable becomes
+//! `IF v > 10 THEN RAISE EXCEPTION … ELSE RAISE NOTICE … END IF` under
+//! ASM-RAISERROR-SEVERITY. Forms whose meaning depends on a value (a
+//! message number, a severity expression) or that the rule does not read
 //! (width, precision, flags, WITH LOG) stay refused, as does Db2 for i.
 
 use sqldiff_convert::{check, rewrite_in, Conversion, Status, Unit};
@@ -153,9 +155,14 @@ fn an_error_becomes_an_exception() {
 
 #[test]
 fn forms_that_depend_on_a_value_or_are_not_read_stay_refused() {
+    // A bigint severity may overflow (Msg 8115), an expression is not read.
     refused(
-        "  RAISERROR('%s', @n, 1, @e);",
-        "severity that is not a literal",
+        "  RAISERROR('%s', @b, 1, @e);",
+        "severity variable that is not a declared int",
+    );
+    refused(
+        "  RAISERROR('%s', @n + 1, 1, @e);",
+        "severity that is not a literal or a variable",
     );
     refused("  RAISERROR('x', 20, 1) WITH LOG;", "WITH LOG");
     refused("  RAISERROR('x', 19, 1);", "severity 19 or more");
@@ -191,4 +198,29 @@ fn forms_that_depend_on_a_value_or_are_not_read_stay_refused() {
         "form not understood",
     );
     refused("  RAISERROR('café', 10, 1);", "code page");
+}
+
+#[test]
+fn a_severity_variable_decides_between_exception_and_notice() {
+    // Ola Hallengren's error cursor and CATCH blocks.
+    let c = proven(
+        "  RAISERROR('%s', @n, 1, @e) WITH NOWAIT;",
+        "IF v_n > 10 THEN\n    RAISE EXCEPTION '%', COALESCE(v_e, '(null)') USING ERRCODE = 'P0001';\n  ELSE\n    RAISE NOTICE '%', COALESCE(v_e, '(null)');\n  END IF;",
+    );
+    let r = rules(raise(&c));
+    for id in [
+        "ASM-RAISERROR-SEVERITY",
+        "ASM-THROW-ERRCODE",
+        "ASM-RAISERROR-INFO",
+    ] {
+        assert!(r.contains(&id), "{id}: {r:?}");
+    }
+    // As with a literal 16: T-SQL carries on after the error, PostgreSQL
+    // stops, so a later write is not shown equal.
+    let c = pg("  RAISERROR('no row', @n, 1);\n  UPDATE dbo.t SET v = 1 WHERE id = @id;");
+    let u = raise(&c);
+    assert_eq!(u.status, Status::Differs, "{:#?}", u.notes);
+    // Db2 for i stays refused.
+    let c = convert_to("  RAISERROR('%s', @n, 1, @e);", Dialect::Db2i);
+    assert_eq!(raise(&c).status, Status::NotConverted);
 }
