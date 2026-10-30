@@ -1222,7 +1222,7 @@ sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/profiles/rules/tsql-pg.rul
 
 [[assumption]]
 id = "ASM-TSQL-STRING-ARGS"
-statement = "Every argument a caller passes to a converted T-SQL routine is a value of the parameter's declared type: a string fits the declared length (and, for varchar, its code page), a smallint, bit, date or datetime2(p) argument is of that type (T-SQL truncates a string, narrows or rounds a value of another type on entry, silently or with an error; PostgreSQL's caller passes the value of its own type)."
+statement = "Every argument a caller passes to a converted T-SQL routine is a value of the parameter's declared type: a string fits the declared length (and, for varchar, its code page), an int, bigint, smallint, bit, date or datetime2(p) argument is of that type (T-SQL truncates a string, narrows or rounds a value of another type on entry, silently or with an error, and turns 1.5 passed to an int into 1; PostgreSQL's caller passes the value of its own type or finds no routine)."
 discharge = "deployment"
 fact = "What callers pass."
 sites = ["sqldiff-convert/src/cert.rs"]

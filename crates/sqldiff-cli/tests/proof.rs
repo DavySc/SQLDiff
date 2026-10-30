@@ -380,7 +380,8 @@ fn the_real_checker_lets_the_release_gate_pass_in_the_c2a_slice() {
     let config = write(
         &d,
         "config.toml",
-        "[deployment]\naccept = [\"ASM-RETURN-CODE\", \"ASM-NO-CALLER-TXN\"]\n",
+        // `@a int`: callers pass values of the parameter's type.
+        "[deployment]\naccept = [\"ASM-RETURN-CODE\", \"ASM-NO-CALLER-TXN\", \"ASM-TSQL-STRING-ARGS\"]\n",
     );
     let run = |config: Option<&str>| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_sqldiff"));

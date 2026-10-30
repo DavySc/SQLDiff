@@ -1095,15 +1095,20 @@ pub fn mirror_request(
     }
     // T-SQL truncates a string argument to its parameter's length and
     // PostgreSQL does not; the C2a residual names it, a C1 answer does not.
-    // C2c: so do `smallint`, `bit`, `date` and `datetime2` parameters (a
+    // C2c: so do the parameters of every other type of the slice (a
     // `datetime2(7)` value is rounded on entry, an `int` narrowed or made
-    // 0/1): callers pass values of the parameter's declared type.
+    // 0/1, a `1.5` passed to an `int` or `bigint` truncated to 1 where
+    // PostgreSQL finds no procedure): callers pass values of the
+    // parameter's declared type.
     let stringy = |t: &str| {
         let t = t.to_ascii_lowercase();
         t.contains("char")
             || t == "sysname"
             || t.contains("text")
-            || matches!(t.as_str(), "smallint" | "bit" | "date" | "datetime2")
+            || matches!(
+                t.as_str(),
+                "int" | "integer" | "bigint" | "smallint" | "bit" | "date" | "datetime2"
+            )
     };
     if a.params.iter().any(|p| stringy(&p.ty.name)) {
         assumptions.push(STRING_ARGS.to_string());

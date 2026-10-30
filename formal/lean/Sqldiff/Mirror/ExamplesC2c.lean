@@ -805,12 +805,15 @@ integer on both sides. `-9223372036854775808` is `numeric` in T-SQL and
 #guard isC2a (checkS "@big" (.Num "-9223372036854775808") "p_big" (.Num "-9223372036854775808"))
 #guard (tT (.Bin "+" (tv "@big") (.Num "-9223372036854775808"))).isNone
 
-/- N2. A T-SQL routine with a `smallint`, `bit`, `date` or `datetime2`
-parameter names `ASM-TSQL-STRING-ARGS` (now: every argument a caller
-passes is a value of the parameter's declared type). -/
+/- N2. A T-SQL routine with a parameter of a slice type names
+`ASM-TSQL-STRING-ARGS` (every argument a caller passes is a value of the
+parameter's declared type); (re-review) `int` and `bigint` too: an outside
+caller passing `1.5` to an `int` gets 1 in T-SQL. -/
 #guard tsqlStringParams (tsqlProc ["p"] [inT "@d" date] []) &&
   tsqlStringParams (tsqlProc ["p"] [inT "@s" smallint] []) &&
   tsqlStringParams (tsqlProc ["p"] [inT "@t" (dt2 6)] []) &&
-  !tsqlStringParams (tsqlProc ["p"] [inT "@i", inT "@b" bigint] [])
+  tsqlStringParams (tsqlProc ["p"] [inT "@i"] []) &&
+  tsqlStringParams (tsqlProc ["p"] [inT "@b" bigint] []) &&
+  !tsqlStringParams (tsqlProc ["p"] [] [])
 
 end Sqldiff.Mirror.ExamplesC2c

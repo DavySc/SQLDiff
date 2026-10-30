@@ -245,9 +245,9 @@ passes that both engines can hold (a T-SQL caller's dates are within
 six digits), which is the argument correspondence of decision 1, and
 `ASM-TSQL-STRING-ARGS`, whose statement now says that every argument is
 a value of its parameter's declared type and which a routine with a
-`smallint`, `bit`, `date` or `datetime2` parameter names too (a
-`datetime2(7)` value is rounded on entry, an `int` narrowed or made
-0/1); for columns, `ASM-TABLES-AS-DECLARED` as in C3c. A pair whose
+parameter of any slice type names (a `datetime2(7)` value is rounded on
+entry, an `int` narrowed or made 0/1, a `1.5` passed to an `int` or
+`bigint` truncated to 1 where PostgreSQL finds no procedure); for columns, `ASM-TABLES-AS-DECLARED` as in C3c. A pair whose
 variables' declared types differ is answered "the declared types of the
 variables do not correspond". No new residual id and no new answer
 field; the request's ROUTINE entries gain the callees' parameter types; `check_sound` and `check_sound_c2a` keep their
