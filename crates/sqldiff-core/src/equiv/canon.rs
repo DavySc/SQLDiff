@@ -81,7 +81,7 @@ pub mod asm {
     );
     pub const DATEADD_RANGE: (&str, &str) = (
         "ASM-DATEADD-RANGE",
-        "DATEADD results stay within the range of their type: T-SQL raises an error past 9999-12-31 (or before 0001-01-01), where PostgreSQL returns the date",
+        "DATEADD results stay within the range of their type: T-SQL raises an error outside it (date and datetime2 0001-01-01 to 9999-12-31, datetime 1753-01-01 to 9999-12-31, smalldatetime 1900-01-01 to 2079-06-06), where PostgreSQL returns the date",
     );
     pub const DATEADD_YEAR_END: (&str, &str) = (
         "ASM-DATEADD-YEAR-END",
@@ -2421,7 +2421,9 @@ impl<'a> Canon<'a> {
             // table has a column named `minute`.
             if let (0, Dialect::Tsql, Expr::Name(p)) = (k, d, x) {
                 if p.len() == 1 && DATEPART_FNS.contains(&name.as_str()) {
-                    args.push((n("dpart", vec![a(lc(&p[0]))]), None));
+                    // Synonyms (`mi`, `n`) read as the part's name.
+                    let part = tsql_datepart(&p[0]).map_or_else(|| lc(&p[0]), str::to_string);
+                    args.push((n("dpart", vec![a(part)]), None));
                     continue;
                 }
             }
@@ -2920,7 +2922,9 @@ impl<'a> Canon<'a> {
     /// value: `k` an integer of at most 32 bits (T-SQL converts other
     /// numbers to int, truncating; PostgreSQL's secs keeps a fraction), and
     /// `d` a date (whole days or longer; T-SQL rejects smaller parts) or a
-    /// timestamp without T-SQL's datetime/smalldatetime ticks, which round.
+    /// timestamp. On T-SQL datetime every whole unit keeps its 1/300 s
+    /// ticks; smalldatetime keeps whole minutes for every unit but seconds,
+    /// which it rounds to the minute, so seconds are not proven there.
     /// Both add months by moving a day the month lacks to its last day,
     /// and add hours, minutes and seconds exactly. The result has `d`'s
     /// type, as in T-SQL.
@@ -7615,8 +7619,6 @@ fn is_zero_literal(e: &Expr) -> bool {
     matches!(e, Expr::Num(s) if s.parse::<f64>().is_ok_and(|v| v == 0.0))
 }
 
-/// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
-/// amounts round (milliseconds and smaller) and quarters have none.
 /// T-SQL functions whose first argument is a date part keyword.
 const DATEPART_FNS: [&str; 7] = [
     "dateadd",
@@ -7628,6 +7630,8 @@ const DATEPART_FNS: [&str; 7] = [
     "date_bucket",
 ];
 
+/// The make_interval field a T-SQL DATEADD datepart adds; the parts whose
+/// amounts round (milliseconds and smaller) and quarters have none.
 fn dateadd_field(e: &Expr) -> Option<&'static str> {
     let Expr::Name(p) = e else {
         return None;

@@ -36,6 +36,15 @@ fn a_date_part_is_not_the_column_of_that_name() {
         let b = format!("UPDATE t SET dt = (dt + make_interval({field} => 5)) WHERE id = 1;");
         assert!(equal(&a, &b), "{a}");
     }
+    // A synonym is the same part: DATEADD(mi, …) as DATEADD(minute, …).
+    assert!(equal(
+        "UPDATE dbo.t SET dt = DATEADD(mi, 5, dt) WHERE id = 1;",
+        "UPDATE t SET dt = (dt + make_interval(mins => 5)) WHERE id = 1;"
+    ));
+    assert!(equal(
+        "UPDATE dbo.t SET n = DATEDIFF(dd, a, b) WHERE id = 1;",
+        "UPDATE t SET n = ((b)::date - (a)::date) WHERE id = 1;"
+    ));
     // The column itself is still a column.
     assert!(!equal(
         "UPDATE dbo.t SET dt = DATEADD(minute, 5, dt) WHERE id = 1;",
