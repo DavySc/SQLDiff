@@ -154,11 +154,19 @@ And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
 * `ASM-NO-CALLER-TXN`, when an error can reach a handler, or the routine
   has transaction statements (also those of the rollback-and-rethrow
   idiom, which lowers to its body), or its conversion commits (`bTxn`:
-  the PL/pgSQL routine has a `COMMIT`, which lowers to nothing): the caller holds no open transaction
+  the PL/pgSQL routine has a `COMMIT`, which lowers to nothing), or
+  (review of C3d) an error can leave the routine (`Core.Routine.mayFail`,
+  with or without a write before it): the caller holds no open transaction
   (T-SQL: `@@TRANCOUNT` 0 on entry and `IMPLICIT_TRANSACTIONS OFF`;
   PostgreSQL: a top-level `CALL` outside a transaction block). Otherwise
   a handled error dooms the caller's T-SQL transaction under `XACT_ABORT
-  ON`, and PostgreSQL's `COMMIT` fails.
+  ON`, and PostgreSQL's `COMMIT` fails; and an error that leaves the
+  routine under `XACT_ABORT ON` dooms the caller's transaction, whose own
+  earlier work is then lost (`XACT_STATE()` -1, `COMMIT` 3930), where a
+  PostgreSQL caller that catches the error in an exception block keeps
+  its earlier work (eval/queries Q15, both engines; without a caller
+  transaction both keep it). A C2a confirmation of a routine that can
+  fail is one whose T-SQL side aborts on errors (`inC2a`).
 * `ASM-THROW-ERRCODE`, when the routine raises an error of its own:
   callers do not tell such errors apart by the T-SQL error number (the
   PostgreSQL caller sees SQLSTATE P0001).
@@ -177,7 +185,8 @@ def residual (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : List
     (if ca.hasDateAdd then ["ASM-DATEADD-RANGE"] else []) ++
     (if ca.hasYearAdd then ["ASM-DATEADD-YEAR-END"] else []) ++
     (if ca.hasCatch then ["ASM-CATCH-CORE-ERRORS"] else []) ++
-    (if ca.catches || ca.hasCommit || tsqlTxn a || bTxn then ["ASM-NO-CALLER-TXN"] else []) ++
+    (if ca.catches || ca.hasCommit || tsqlTxn a || bTxn || ca.mayFail then ["ASM-NO-CALLER-TXN"]
+      else []) ++
     (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else [])
 
 /-- The routines use C4: a handler, a raised error or transaction

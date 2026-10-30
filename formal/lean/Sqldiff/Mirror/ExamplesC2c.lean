@@ -243,7 +243,7 @@ def checkV (a b : Ast.Routine) (cert : Cert := vCert) : Answer := check depv Γv
 -- parameters take values of their type from a T-SQL caller.)
 #guard residualOf depv Γv procT ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR",
-    "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END"]
+    "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"]
 #guard (lowerT depv Γv procT).map (fun r => residual procT r true) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR",
     "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"]

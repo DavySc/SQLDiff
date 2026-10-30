@@ -140,7 +140,7 @@ def lookP (body : List Ast.Node := lookBodyP) (ps : List Ast.Param :=
 
 #guard isC2a (checkQ lookT lookP)
 -- `COUNT(*)` can overflow (2^31 rows); `Id = @id` compares with `=`.
-#guard residualOf depq Γq lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
+#guard residualOf depq Γq lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 #guard (lowerT depq Γq lookT).map Core.Routine.hasQuery == some true
 -- The `EXISTS` variable is a local of both lowered routines.
 #guard (lowerT depq Γq lookT).map (·.locals) == some [existsVar]

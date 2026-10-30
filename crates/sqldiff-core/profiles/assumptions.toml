@@ -736,7 +736,7 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/bind/mod.rs"]
 
 [[assumption]]
 id = "ASM-NO-CALLER-TXN"
-statement = "The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block."
+statement = "The caller does not hold an open transaction: T-SQL runs the routine in autocommit (IMPLICIT_TRANSACTIONS OFF, no BEGIN TRAN around the call), and PostgreSQL CALLs it at top level, outside a transaction block. Otherwise an error that leaves the routine under XACT_ABORT ON dooms the caller's T-SQL transaction and loses the caller's own earlier work (XACT_STATE() -1, COMMIT fails with 3930), where a PostgreSQL caller that catches the error in an exception block keeps it (eval/queries Q15); the checker names this for every routine that can fail."
 discharge = "deployment"
 fact = "How callers call the routine."
 sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs", "sqldiff-core/src/ir/behaviour.rs", "sqldiff-core/src/ir/interp.rs"]

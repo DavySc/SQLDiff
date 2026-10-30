@@ -247,9 +247,10 @@ pub const C2A_RESIDUALS: [&str; 12] = [
 
 /// Residual ids the checker names whenever a routine needs them, so a
 /// `c2a` confirmation without one proves the converter's note of it.
-/// Not every residual: `ASM-NO-CALLER-TXN` is named only around handlers
-/// and transaction control, while an error that ends a plain routine also
-/// meets the caller's transaction.
+/// Not every residual: `ASM-NO-CALLER-TXN` is named around handlers,
+/// transaction control and (checker 0.16.0) whenever an error can leave the
+/// routine, but the converter notes it for more than these (a `COMMIT`
+/// after an autocommitted statement), so its absence discharges nothing.
 pub const NAMED_WHEN_NEEDED: [&str; 1] = ["ASM-CONCAT-NULL"];
 
 /// Converter assumptions a `c2a` confirmation in the C4 slice (`errors`

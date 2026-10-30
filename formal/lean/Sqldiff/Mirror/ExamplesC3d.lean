@@ -152,7 +152,7 @@ def lookP (body : List Ast.Node := lookBodyP)
 /-! ## Confirmed -/
 
 #guard isC2a (checkJ lookT lookP)
-#guard residualOf depj Γj lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
+#guard residualOf depj Γj lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 
 /- The lowered `SELECT @q = o.Qty, @s = c.Score FROM dbo.Ord AS o JOIN
 dbo.Cust c ON c.Id = o.CustId WHERE o.Id = @id`: two sources, columns
@@ -239,6 +239,16 @@ def scalarP (wh : Ast.Expr) : Ast.Routine :=
   (scalarP (.Bin ">" (qn "o" "Qty") (pv "p_id"))) rCert)
 #guard isC2a (checkJ (scalarT (.Bin ">" (qn "o" "Qty") (tv "@id")) [xactAbort])
   (scalarP (.Bin ">" (qn "o" "Qty") (pv "p_id"))) rCert)
+/- (Review of C3d.) An error that leaves a T-SQL routine under `XACT_ABORT
+ON` dooms a caller's open transaction, losing the caller's own earlier
+work, where a PostgreSQL caller's exception block keeps it (eval/queries
+Q15): a routine that can fail names `ASM-NO-CALLER-TXN` even without a
+write; one that cannot (a pick through a closed block) does not. -/
+#guard residualOf depj Γj (scalarT (.Bin ">" (qn "o" "Qty") (tv "@id")) [xactAbort]) ==
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+#guard residualOf depj Γj (scalarT (eq (qn "o" "Id") (tv "@id"))) ==
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
+#guard residualOf depj Γj selfT == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
 
 /-! ## Refused: the key closure
 

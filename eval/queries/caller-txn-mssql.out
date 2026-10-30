@@ -1,0 +1,13 @@
+Changed database context to 'probe_c3d_txn'.
+Q15a cardinality (512): error 512, XACT_STATE -1, @@TRANCOUNT 1
+Q15a cardinality (512): COMMIT error 3930
+Q15a cardinality (512): the caller's row survives: 0
+Q15a division by zero (8134): error 8134, XACT_STATE -1, @@TRANCOUNT 1
+Q15a division by zero (8134): COMMIT error 3930
+Q15a division by zero (8134): the caller's row survives: 0
+Q15a no error: no error
+Q15a no error: COMMIT ok
+Q15a no error: the caller's row survives: 1
+Q15b autocommit: error 512, @@TRANCOUNT 0
+Q15b autocommit: the caller's row survives: 1
+Changed database context to 'master'.

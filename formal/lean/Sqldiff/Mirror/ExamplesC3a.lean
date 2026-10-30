@@ -131,7 +131,7 @@ def bumpP (body : List Ast.Node := bumpBodyP) (params : List Ast.Param := [inP "
 -- What the answer carries: the session facts, and that the routine can
 -- fail (the `INSERT` on a duplicate key, an overflow) after writing.
 #guard (residualOf depd Γd bumpT) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 #guard ((lowerT depd Γd bumpT).map Core.Routine.hasData) == some true
 
 /-- The lowered T-SQL procedure, as the core sees it: column names are the

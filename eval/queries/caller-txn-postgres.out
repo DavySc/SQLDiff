@@ -1,0 +1,11 @@
+NOTICE:  database "probe_c3d_txn" does not exist, skipping
+NOTICE:  Q15a cardinality (21000): error 21000
+NOTICE:  Q15a cardinality (21000): the caller's row survives: 1
+NOTICE:  Q15a division by zero (22012): error 22012
+NOTICE:  Q15a division by zero (22012): the caller's row survives: 1
+NOTICE:  Q15a no error: no error
+NOTICE:  Q15a no error: the caller's row survives: 1
+ERROR:  more than one row returned by a subquery used as an expression
+Q15b top-level CALL: the caller's row survives: 1
+ERROR:  more than one row returned by a subquery used as an expression
+Q15c transaction block: the caller's row survives: 0
