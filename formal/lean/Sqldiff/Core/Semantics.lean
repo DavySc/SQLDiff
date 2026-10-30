@@ -10,6 +10,7 @@ state, the data statements, one step of the interpreter per statement, a
 routine's run, what a caller observes, and `Refines`.
 -/
 import Sqldiff.Core.Syntax
+import Sqldiff.Core.Calendar
 
 namespace Sqldiff.Core
 
@@ -18,15 +19,21 @@ variable {U W : Type}
 /-! ## Values and errors (C2a, C3a) -/
 
 /-- A value. `null` is SQL NULL, and also UNKNOWN, the third truth value:
-a three-valued boolean is `bool true`, `bool false` or `null`. `int` is a
-32-bit signed integer (T-SQL `int`, PostgreSQL `integer`); the slice's
-operators keep it in range (`toInt32`). `str` is a character string (C2b):
+a three-valued boolean is `bool true`, `bool false` or `null`, and (C2c)
+also the value of a T-SQL `bit` or a PostgreSQL `boolean`. `int` is a
+signed integer; the slice's operators keep it in the range of their width
+(`toIntW`: 16, 32 or 64 bits, T-SQL `smallint`/`int`/`bigint`). `str` is a character string (C2b):
 a sequence of Unicode characters, the same value whichever T-SQL
 (`varchar`, `nvarchar`) or PostgreSQL (`varchar`, `text`) type holds it;
 the empty string is not NULL. Which strings each type can hold, and what
 happens to one that does not fit, is the lowering's business
-(`Sqldiff.Mirror`, "The C2b slice: strings"). `opaque` is any value
-outside the slice (decimals, dates, ...): only uninterpreted operators
+(`Sqldiff.Mirror`, "The C2b slice: strings"). (C2c) `date` is a day of the proleptic Gregorian calendar, as days since
+0001-01-01 (`Sqldiff.Core.Calendar`; T-SQL `date`, PostgreSQL `date`),
+and `ts` a timestamp without time zone, as microseconds since
+0001-01-01T00:00:00 (T-SQL `datetime2(p)`, `p ≤ 6`, PostgreSQL
+`timestamp(p)`); which values each type can hold is the lowering's
+business. `opaque` is any value
+outside the slice (decimals, times, ...): only uninterpreted operators
 and the world make or read one, so theorems hold for every type `U` of
 them. -/
 inductive Val (U : Type) where
@@ -35,6 +42,8 @@ inductive Val (U : Type) where
   | int (i : Int)
   | opaque (u : U)
   | str (s : String)
+  | date (d : Int)
+  | ts (us : Int)
 deriving DecidableEq, Repr
 
 -- `ErrKind`, why a statement fails, is in `Sqldiff.Core.Syntax`: C4's
@@ -80,19 +89,37 @@ both lowerings map to. -/
 def intMin : Int := -2147483648
 def intMax : Int := 2147483647
 
-/-- A mathematical result as a 32-bit integer, or overflow. -/
-def toInt32 (i : Int) : Res U :=
-  if intMin ≤ i ∧ i ≤ intMax then .ok (.int i) else .err .overflow
+/-- The range of a width (C2c). -/
+def IW.min : IW → Int
+  | .i16 => -32768
+  | .i32 => intMin
+  | .i64 => -9223372036854775808
 
-/-- Integer arithmetic. Division truncates toward zero (`Int.tdiv`) and
-the remainder takes the sign of the dividend (`Int.tmod`); a zero divisor
-raises, and so does a result outside the range (`intMin / -1`). -/
-def arithInt : AOp → Int → Int → Res U
-  | .add, a, b => toInt32 (a + b)
-  | .sub, a, b => toInt32 (a - b)
-  | .mul, a, b => toInt32 (a * b)
-  | .div, a, b => if b = 0 then .err .divByZero else toInt32 (a.tdiv b)
-  | .mod, a, b => if b = 0 then .err .divByZero else toInt32 (a.tmod b)
+def IW.max : IW → Int
+  | .i16 => 32767
+  | .i32 => intMax
+  | .i64 => 9223372036854775807
+
+/-- `i` is within the width. -/
+def IW.fits (w : IW) (i : Int) : Bool := decide (w.min ≤ i ∧ i ≤ w.max)
+
+/-- A mathematical result as an integer of the width, or overflow. -/
+def toIntW (w : IW) (i : Int) : Res U :=
+  if w.min ≤ i ∧ i ≤ w.max then .ok (.int i) else .err .overflow
+
+/-- A mathematical result as a 32-bit integer, or overflow. -/
+def toInt32 (i : Int) : Res U := toIntW .i32 i
+
+/-- Integer arithmetic at a width. Division truncates toward zero
+(`Int.tdiv`) and the remainder takes the sign of the dividend
+(`Int.tmod`); a zero divisor raises, and so does a result outside the
+width (`intMin / -1`). -/
+def arithInt (w : IW) : AOp → Int → Int → Res U
+  | .add, a, b => toIntW w (a + b)
+  | .sub, a, b => toIntW w (a - b)
+  | .mul, a, b => toIntW w (a * b)
+  | .div, a, b => if b = 0 then .err .divByZero else toIntW w (a.tdiv b)
+  | .mod, a, b => if b = 0 then .err .divByZero else toIntW w (a.tmod b)
 
 def cmpInt : COp → Int → Int → Bool
   | .eq, a, b => a == b
@@ -122,6 +149,45 @@ def intOp2 (f : Int → Int → Res U) : Val U → Val U → Res U
   | _, .null => .ok .null
   | .int x, .int y => f x y
   | _, _ => typeErr
+
+/-- A comparison of two values of one kind (C2c): integers, dates or
+timestamps; `=` and `<>` of two booleans (a bit against `0`/`1`, a
+boolean against `TRUE`/`FALSE`); NULL if either is NULL; another pairing
+is a type error. -/
+def cmpVal (o : COp) : Val U → Val U → Res U
+  | .null, _ => .ok .null
+  | _, .null => .ok .null
+  | .int x, .int y => .ok (.bool (cmpInt o x y))
+  | .date x, .date y => .ok (.bool (cmpInt o x y))
+  | .ts x, .ts y => .ok (.bool (cmpInt o x y))
+  | .bool x, .bool y => match o with
+    | .eq => .ok (.bool (x == y))
+    | .ne => .ok (.bool (x != y))
+    | _ => typeErr
+  | _, _ => typeErr
+
+/-- `DATEADD` on a date or a timestamp (C2c): the day, month or year
+arithmetic of `Sqldiff.Core.Calendar`, the time of day of a timestamp
+kept; NULL if either operand is NULL. The result is not held to any
+range (`Sqldiff.Mirror`, "The C2c slice", `ASM-DATEADD-RANGE`). -/
+def dateAddVal (p : DPart) : Val U → Val U → Res U
+  | .null, _ => .ok .null
+  | _, .null => .ok .null
+  | .int k, .date d => .ok (.date (dateAddDays p k d))
+  | .int k, .ts us => .ok (.ts (Calendar.addToTs (dateAddDays p k) us))
+  | _, _ => typeErr
+where
+  dateAddDays (p : DPart) (k d : Int) : Int :=
+    match p with
+    | .day => d + k
+    | .month => Calendar.addMonths k d
+    | .year => Calendar.addMonths (12 * k) d
+
+/-- The date of a date or a timestamp (C2c): the day number. -/
+def dayVal : Val U → Option Int
+  | .date d => some d
+  | .ts us => some (Calendar.dayOf us)
+  | _ => none
 
 /-- A strict string operator: NULL if either operand is NULL. -/
 def strOp2 (f : String → String → Res U) : Val U → Val U → Res U
@@ -196,13 +262,13 @@ def SExpr.eval (σ ρ : Store U) : SExpr → Res U
   | .col c => .ok (ρ c)
   | .int n => .ok (.int n)
   | .null => .ok .null
-  | .arith o a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (intOp2 (arithInt o))
-  | .neg a => match a.eval σ ρ with
+  | .arith w o a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (intOp2 (arithInt w o))
+  | .neg w a => match a.eval σ ρ with
     | .err k => .err k
     | .ok .null => .ok .null
-    | .ok (.int x) => toInt32 (-x)
+    | .ok (.int x) => toIntW w (-x)
     | .ok _ => typeErr
-  | .cmp o a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (intOp2 fun x y => .ok (.bool (cmpInt o x y)))
+  | .cmp o a b => bind2 (a.eval σ ρ) (b.eval σ ρ) (cmpVal o)
   | .and a b => bind2 (a.eval σ ρ) (b.eval σ ρ) and3
   | .or a b => bind2 (a.eval σ ρ) (b.eval σ ρ) or3
   | .not a => match a.eval σ ρ with
@@ -231,6 +297,29 @@ def SExpr.eval (σ ρ : Store U) : SExpr → Res U
     | .err k => .err k
     | .ok .null => .ok .null
     | .ok (.str s) => .ok (.int s.length)
+    | .ok _ => typeErr
+  | .bool b => .ok (.bool b)
+  | .date d => .ok (.date d)
+  | .ts us => .ok (.ts us)
+  | .dateAdd p n d => bind2 (n.eval σ ρ) (d.eval σ ρ) (dateAddVal p)
+  | .dateDiff a b => bind2 (a.eval σ ρ) (b.eval σ ρ) fun v w =>
+    match v, w with
+    | .null, _ => .ok .null
+    | _, .null => .ok .null
+    | v, w => match dayVal v, dayVal w with
+      | some x, some y => .ok (.int (y - x))
+      | _, _ => typeErr
+  | .toDate a => match a.eval σ ρ with
+    | .err k => .err k
+    | .ok .null => .ok .null
+    | .ok v => match dayVal v with
+      | some d => .ok (.date d)
+      | none => typeErr
+  | .toTs a => match a.eval σ ρ with
+    | .err k => .err k
+    | .ok .null => .ok .null
+    | .ok (.date d) => .ok (.ts (d * Calendar.usPerDay))
+    | .ok (.ts us) => .ok (.ts us)
     | .ok _ => typeErr
 
 /-! ## The database (C3a)
@@ -403,11 +492,17 @@ def isNullV : Val U → Bool
 def rowOk (t : List ColDef) (r : Row U) : Bool :=
   (t.zip r).all fun p => !(p.1.required && isNullV p.2)
 
+/-- A key value as an integer: an integer, or (C2c) a date or timestamp
+by its day or microsecond number (a key column has one type, so the
+kinds never meet within one column). -/
 def keyVal : Val U → Option Int
   | .int i => some i
+  | .date d => some d
+  | .ts us => some us
   | _ => none
 
-/-- The row's primary key, `none` when a key value is not an integer. -/
+/-- The row's primary key, `none` when a key value is not an integer, a
+date or a timestamp. -/
 def keyOf (t : List ColDef) (r : Row U) : Option (List Int) :=
   ((t.zip r).filter (·.1.key)).mapM fun p => keyVal p.2
 
