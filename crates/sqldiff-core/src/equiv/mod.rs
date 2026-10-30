@@ -16,6 +16,7 @@ pub mod ddl;
 pub mod dynamic;
 pub mod edit;
 pub mod eval;
+pub mod like;
 pub mod literal;
 pub mod lower;
 pub mod objcheck;

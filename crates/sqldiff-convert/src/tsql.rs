@@ -6020,7 +6020,12 @@ impl<'a> Cx<'a> {
                     self.note(Status::Differs, "tsql.end-of-time-literal", "This literal is the end of time at 100 ns precision (DATETIME2(7)). PostgreSQL keeps microseconds and rounds it up to 10000-01-01 00:00:00, so it no longer equals the largest stored value (a system-versioned table's current rows end at 9999-12-31 23:59:59.999999). Write '9999-12-31 23:59:59.999999' if it means the end of time.");
                 }
                 if !eot {
-                    o.push_str(lit);
+                    let like = !self.db2() && prev_sig(ts, i).is_some_and(|p| ts[p].is("LIKE"));
+                    if like {
+                        self.like_pattern(ts, i, lit, o);
+                    } else {
+                        o.push_str(lit);
+                    }
                     self.string_compare(ts, i);
                     self.fraction_note(t, lit);
                 }
@@ -6312,6 +6317,42 @@ impl<'a> Cx<'a> {
         if hit {
             self.step_ts("tsql.expr.string-compare", &ts[i..=i]);
             self.ci_note();
+        }
+    }
+
+    /// PostgreSQL: a literal LIKE pattern in PostgreSQL's syntax
+    /// (`like::tsql_to_postgres`): T-SQL's `[c]` classes become the
+    /// character, escaped with `\` where PostgreSQL would read a wildcard,
+    /// and T-SQL's literal `\` is doubled, since `\` is PostgreSQL's default
+    /// escape. A class with no exact form, or an ESCAPE clause, is refused.
+    fn like_pattern(&mut self, ts: &[T], i: usize, lit: &str, o: &mut String) {
+        let at = &ts[i..=i];
+        if next_sig(ts, i).is_some_and(|j| ts[j].is("ESCAPE")) {
+            self.step_ts("tsql.expr.like-pattern", at);
+            self.note(
+                Status::NotConverted,
+                "tsql.expr.like-pattern",
+                "LIKE … ESCAPE: not converted yet; T-SQL's brackets and PostgreSQL's escapes interact differently with an escape character",
+            );
+            o.push_str(lit);
+            return;
+        }
+        let value = string_value(lit);
+        match sqldiff_core::equiv::like::tsql_to_postgres(&value) {
+            Ok(p) if p == value => o.push_str(lit),
+            Ok(p) => {
+                self.step_ts_with("tsql.expr.like-pattern", at, p.clone());
+                o.push_str(&format!("'{}'", p.replace('\'', "''")));
+            }
+            Err(why) => {
+                self.step_ts("tsql.expr.like-pattern", at);
+                self.note(
+                    Status::NotConverted,
+                    "tsql.expr.like-pattern",
+                    &format!("LIKE pattern: {why}"),
+                );
+                o.push_str(lit);
+            }
         }
     }
 

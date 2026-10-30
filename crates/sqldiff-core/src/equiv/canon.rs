@@ -1338,16 +1338,22 @@ impl<'a> Canon<'a> {
             }
             Expr::Like(x, p, neg, ci) => {
                 let (x, ty) = self.expr(x)?;
-                // A varchar value against a literal pattern without `[` or
-                // `\` differs across dialects only by the collation
-                // (`coll-like`): case, trailing spaces of the value (T-SQL
-                // varchar drops them) and characters the collation expands
-                // (checked on SQL Server 2022). T-SQL `[...]` is a character
-                // class and PostgreSQL's `\` an escape; a char value is
-                // blank-padded on one side only.
-                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
-                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
-                let p = self.expr(p)?.0;
+                // A varchar value against a literal pattern both dialects
+                // read the same way (`like::canonical`: T-SQL's `[c]` is the
+                // character, PostgreSQL's `\` an escape) differs across
+                // dialects only by the collation (`coll-like`): case,
+                // trailing spaces of the value (T-SQL varchar drops them) and
+                // characters the collation expands (checked on SQL Server
+                // 2022). A char value is blank-padded on one side only.
+                let pat = match p.as_ref() {
+                    Expr::Str(s) => super::like::canonical(s, self.d),
+                    _ => None,
+                };
+                let plain = pat.is_some() && ty.is_some_and(|t| t.fam == Fam::VarChar);
+                let p = match pat {
+                    Some(c) => n("likepat", vec![a(c)]),
+                    None => self.expr(p)?.0,
+                };
                 let coll = if plain {
                     n("coll-like", vec![self.dtag()])
                 } else {

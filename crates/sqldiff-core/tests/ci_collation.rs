@@ -2,7 +2,8 @@
 //! statement whose result T-SQL's case-insensitive, trailing-space-blind
 //! string equality can change is flagged with `ASM-CI-COLLATION` for the
 //! reviewer. Plain diffs still report the difference. Ordering depends on
-//! more than case and trailing spaces and stays not proven.
+//! more than case and trailing spaces and stays not proven; LIKE counts
+//! only with a literal pattern both dialects read the same way.
 
 use sqldiff_core::equiv::compare::ci_collation_scope;
 use sqldiff_core::{diff, Artifact, Dialect, Options, Report, Verdict};
@@ -135,9 +136,9 @@ fn ordering_is_not_covered() {
 
 /// LIKE on varchar with a literal pattern differs only by the collation
 /// (case, the value's trailing spaces, expanded characters; checked on SQL
-/// Server 2022 and PostgreSQL 18). A `[` (T-SQL character class) or `\`
-/// (PostgreSQL escape) in the pattern, a pattern that is not a literal and a
-/// blank-padded char value are not covered.
+/// Server 2022 and PostgreSQL 18). T-SQL classes with no exact PostgreSQL
+/// form, a pattern that is not a literal and a blank-padded char value are
+/// not covered.
 #[test]
 fn like_on_varchar_with_a_plain_pattern_is_flagged() {
     flagged(&convert(
@@ -150,6 +151,7 @@ fn like_on_varchar_with_a_plain_pattern_is_flagged() {
     ));
     for body in [
         "SELECT customer_id FROM customer WHERE email LIKE '[ab]%';",
+        // Copied verbatim: `\` is a literal in T-SQL, an escape in PostgreSQL.
         "SELECT customer_id FROM customer WHERE email LIKE 'a\\_%';",
         "SELECT customer_id FROM customer WHERE email LIKE nick;",
         "SELECT customer_id FROM customer WHERE code LIKE 'a%';",
@@ -168,6 +170,53 @@ fn like_on_varchar_with_a_plain_pattern_is_flagged() {
     // A plain diff keeps it unproven.
     let body = "SELECT customer_id FROM customer WHERE email LIKE 'a%';";
     not_equal(&run(&view(T, body), T, &view(P, body), P, true, false));
+}
+
+/// LIKE with a literal pattern both dialects read the same way differs only
+/// in case and trailing spaces (checked on SQL Server 2022 and PostgreSQL
+/// 18): flagged. The pattern itself must match, in each dialect's syntax.
+#[test]
+fn like_with_a_literal_pattern_is_flagged() {
+    let pair = |ts: &str, pg: &str| {
+        run(
+            &view(
+                T,
+                &format!("SELECT customer_id FROM customer WHERE email LIKE '{ts}';"),
+            ),
+            T,
+            &view(
+                P,
+                &format!("SELECT customer_id FROM customer WHERE email LIKE '{pg}';"),
+            ),
+            P,
+            true,
+            true,
+        )
+    };
+    flagged(&pair("a%", "a%"));
+    flagged(&pair("%[%]%", "%\\%%"));
+    flagged(&pair("a[_]b", "a\\_b"));
+    flagged(&pair("a[[]b", "a[b"));
+    flagged(&pair("%\\", "%\\\\"));
+    // Read verbatim, the patterns mean other things.
+    not_equal(&pair("%[%]%", "%[%]%"));
+    not_equal(&pair("%\\", "%\\"));
+    not_equal(&pair("a_b", "a\\_b"));
+    // T-SQL classes with no exact PostgreSQL form are not read.
+    not_equal(&pair("[ab]%", "[ab]%"));
+    // A pattern computed at run time is read by each dialect's own rules.
+    let dynamic = |d: Dialect| view(d, "SELECT customer_id FROM customer WHERE email LIKE nick;");
+    not_equal(&run(&dynamic(T), T, &dynamic(P), P, true, true));
+    // A plain diff still reports the difference.
+    let r = run(
+        &view(T, "SELECT customer_id FROM customer WHERE email LIKE 'a%';"),
+        T,
+        &view(P, "SELECT customer_id FROM customer WHERE email LIKE 'a%';"),
+        P,
+        true,
+        false,
+    );
+    not_equal(&r);
 }
 
 /// The assumption covers the collation only: any other change between the
