@@ -2511,7 +2511,9 @@ impl<'a> Cx<'a> {
             if d.text_range().end() <= start && self.wrapper.is_none() && !quiet(&d) {
                 return Err("it writes before the statement that returns the rows, which T-SQL commits on its own, so the write stays when that statement fails, while a function RETURNS TABLE undoes it with the error".into());
             }
-            if d.text_range().start() >= end && !matches!(first_word(&d).as_str(), "RETURN" | "COMMIT") {
+            if d.text_range().start() >= end
+                && !matches!(first_word(&d).as_str(), "RETURN" | "COMMIT")
+            {
                 return Err("it runs statements after the one that returns the rows, and one that fails there does so after T-SQL sent the rows, while a function RETURNS TABLE then returns none".into());
             }
         }
