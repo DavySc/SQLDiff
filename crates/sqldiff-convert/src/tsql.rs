@@ -60,6 +60,7 @@ pub(crate) fn convert(
         seen_work: false,
         tables: HashMap::new(),
         routine: None,
+        routine_parts: Vec::new(),
         rolls_back: false,
         savepoints: Vec::new(),
         vars: HashMap::new(),
@@ -187,6 +188,9 @@ struct Cx<'a> {
     /// Name of the routine being converted: part of its table variables'
     /// temporary table names (`classify::table_variable_table`).
     routine: Option<String>,
+    /// The name parts of the procedure or function being converted, as its
+    /// header writes them, unquoted (`OBJECT_NAME(@@PROCID)`).
+    routine_parts: Vec<String>,
     /// The routine or script rolls back outside a CATCH that only rolls back
     /// and rethrows (PostgreSQL: a rollback empties a temporary table).
     rolls_back: bool,
@@ -447,6 +451,7 @@ impl<'a> Cx<'a> {
         self.tables.clear();
         self.own_tables.clear();
         self.routine = None;
+        self.routine_parts.clear();
         self.rolls_back = false;
         self.savepoints.clear();
         self.dynamic.clear();
@@ -601,6 +606,7 @@ impl<'a> Cx<'a> {
     fn proc_or_func(&mut self, out: &mut Out, r: &SyntaxNode, func: bool) -> R<Option<String>> {
         self.reset();
         self.routine = sqldiff_syntax::ast::routine_name(r);
+        self.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
         self.rolls_back = rolls_back(r);
         self.ret_bit = false;
         self.return_code = false;
@@ -1851,6 +1857,23 @@ impl<'a> Cx<'a> {
                 let label = s.get(1).map(|&i| tsql_unquote(&ts[i].s)).unwrap_or_default();
                 return no(goto(n, &label));
             }
+            ":" if w(1) == "R" && !self.db2() => {
+                // The file named after `:r`, as written (quotes removed).
+                let path = self.source(&ts[s[1]..]);
+                let path = path[path.find([' ', '\t']).unwrap_or(path.len())..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                if path.is_empty() || path.contains("$(") {
+                    return no(sqlcmd(&w(1)));
+                }
+                let unix = path.replace('\\', "/");
+                self.note(Status::Decision, "tsql.sqlcmd-include", &format!("`:r {path}` is a SQLCMD include, not SQL, and was dropped. The included file is converted on its own, under the same path in the output tree: run its conversion at this point (with psql: \\ir '{}').", unix.replace('\'', "''")));
+                self.step_ts_with("tsql.stmt.sqlcmd-include", &ts, "dropped");
+                format!("-- :r {path}: run the converted file here (psql: \\ir '{}')", unix.replace('\'', "''"))
+            }
             ":" => return no(sqlcmd(&w(1))),
             "DROP" => {
                 if w(1) == "INDEX" && find_word(&ts, s[1], "ON").is_some() {
@@ -1885,6 +1908,20 @@ impl<'a> Cx<'a> {
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
             )),
+            "WAITFOR" => return no(self.pick(
+                "WAITFOR: PostgreSQL's pg_sleep waits a number of seconds; WAITFOR DELAY takes a time of day as text or datetime and WAITFOR TIME a clock time; no checked rule for converting the value",
+                "WAITFOR: Db2 for i SQL has no statement that waits; no rule",
+            )),
+            "BEGIN" if w(1) == "ATOMIC" => return no("BEGIN ATOMIC WITH (…): the body of a natively compiled module (In-Memory OLTP), with its own isolation level and language; no rule (convert it as an ordinary body after review)"),
+            "ALTER" if w(1) == "ROLE" && matches!(w(3).as_str(), "ADD" | "DROP") => return no(self.pick(
+                "ALTER ROLE … ADD/DROP MEMBER: PostgreSQL's forms are GRANT role TO member and REVOKE role FROM member, but the role and the database user it names map to PostgreSQL roles only by a decision about logins and users, which has no rule",
+                "ALTER ROLE … ADD/DROP MEMBER: Db2 for i has no database roles; grant to group profiles instead; no rule",
+            )),
+            "ALTER" if w(1) == "INDEX" => return no(self.pick(
+                "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
+                "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
+            )),
+            "REVERT" => return no("REVERT ends an EXECUTE AS context, which is not converted; no rule"),
             _ => return no("no rule for this statement yet"),
         };
         let text = dedent(text.trim_end(), ind);
@@ -5889,6 +5926,26 @@ impl<'a> Cx<'a> {
                 return end;
             }
         }
+        if !self.db2() && t.k == L_PAREN {
+            if let Some((setting, end)) = module_setting_test(ts, i) {
+                if self.own_name_part(false).is_ok() {
+                    let (rule, why) = match setting {
+                        "uses_ansi_nulls" => (
+                            "ASM-TSQL-ANSI-NULLS",
+                            "the routine was created with ANSI_NULLS ON",
+                        ),
+                        _ => (
+                            "ASM-TSQL-QUOTED-IDENTIFIER",
+                            "the routine was created with QUOTED_IDENTIFIER ON",
+                        ),
+                    };
+                    self.step_ts("tsql.expr.module-setting", &ts[i..end]);
+                    self.note(Status::Assumptions, rule, &format!("(SELECT {setting} FROM sys.sql_modules WHERE object_id = @@PROCID) = 1 reads the running routine's own setting and becomes true: {why}, the setting every converted routine is assumed to have."));
+                    o.push_str("true");
+                    return end;
+                }
+            }
+        }
         match t.k {
             INFERRED_TERMINATOR => {}
             VARIABLE => {
@@ -6389,6 +6446,29 @@ impl<'a> Cx<'a> {
         Some(r)
     }
 
+    /// The running procedure's own name (`OBJECT_NAME(@@PROCID)`) or schema
+    /// (`OBJECT_SCHEMA_NAME(@@PROCID)`), as its header writes it, or why it
+    /// is not known.
+    fn own_name_part(&self, schema: bool) -> Result<String, &'static str> {
+        if self.mode != Mode::Proc || self.trigger.is_some() {
+            return Err("only a procedure's own name is known here (outside a module @@PROCID is 0, in a trigger it is the trigger's id, and an inlined function may see its caller's)");
+        }
+        let parts = &self.routine_parts;
+        let Some(last) = parts.last() else {
+            return Err("the routine's name could not be read");
+        };
+        if last.starts_with('#') {
+            return Err("a temporary procedure's stored name is not the name it was created with");
+        }
+        if !schema {
+            return Ok(last.clone());
+        }
+        match parts.len() {
+            n if n >= 2 => Ok(parts[n - 2].clone()),
+            _ => Err("the header names no schema, so the routine's schema is its creator's default schema, which the source does not show"),
+        }
+    }
+
     fn now(&mut self) -> String {
         if self.db2() {
             self.note(Status::Assumptions, "ASM-TIME-SOURCE", "Current time: both evaluate once per statement (fact V20), but Db2 for i uses the job's time zone where T-SQL uses the server clock. Equal if the job runs in the server's time zone. CURRENT TIMESTAMP has 6 fractional digits.");
@@ -6545,6 +6625,21 @@ impl<'a> Cx<'a> {
             ("DATEDIFF", 3) => {
                 self.note(Status::NotConverted, "tsql.datediff", "DATEDIFF counts boundaries crossed (DATEDIFF(year, '2024-12-31', '2025-01-01') = 1); PostgreSQL subtraction gives elapsed time. Needs a per-unit rewrite.");
                 return None;
+            }
+            ("OBJECT_NAME" | "OBJECT_SCHEMA_NAME", 1) if is_procid(a[0]) => {
+                let part = match self.own_name_part(name == "OBJECT_SCHEMA_NAME") {
+                    Ok(p) => p,
+                    Err(why) => {
+                        self.note(
+                            Status::NotConverted,
+                            &format!("tsql.{}", name.to_ascii_lowercase()),
+                            &format!("{name}(@@PROCID): {why}"),
+                        );
+                        return None;
+                    }
+                };
+                self.note(Status::Assumptions, "ASM-PROCID-NAME", PROCID_NAME);
+                format!("'{}'", part.replace('\'', "''"))
             }
             (
                 "OBJECT_ID" | "FORMAT" | "STR" | "STUFF" | "PATINDEX" | "DATENAME" | "SUSER_SNAME"
@@ -8196,6 +8291,45 @@ fn date_part(p: &str) -> Option<&'static str> {
         "second" | "ss" | "s" => "second",
         _ => return None,
     })
+}
+
+/// `ASM-PROCID-NAME`: `OBJECT_NAME(@@PROCID)` and `OBJECT_SCHEMA_NAME(@@PROCID)`
+/// become the routine's own name and schema as literals.
+const PROCID_NAME: &str = "OBJECT_NAME(@@PROCID) / OBJECT_SCHEMA_NAME(@@PROCID) become the routine's own name and schema as its header writes them: equal while SQL Server stores the routine under that name, letter for letter (it was not renamed with sp_rename, nor first created under a name of another letter case and then altered).";
+
+/// `(SELECT uses_ansi_nulls FROM sys.sql_modules WHERE [object_id] =
+/// @@PROCID) = 1` (or `uses_quoted_identifier`) at `ts[i]`, the opening
+/// parenthesis: the setting and the index after the `1`.
+fn module_setting_test(ts: &[T], i: usize) -> Option<(&'static str, usize)> {
+    let s: Vec<usize> = sig(&ts[i..]).into_iter().map(|k| k + i).take(14).collect();
+    let w = |k: usize| s.get(k).map(|&j| &ts[j]);
+    let word = |k: usize, x: &str| {
+        w(k).is_some_and(|t| {
+            matches!(t.k, IDENT | QUOTED_IDENT) && tsql_unquote(&t.s).eq_ignore_ascii_case(x)
+        })
+    };
+    let setting = ["uses_ansi_nulls", "uses_quoted_identifier"]
+        .into_iter()
+        .find(|x| word(2, x))?;
+    let ok = w(0).is_some_and(|t| t.k == L_PAREN)
+        && w(1).is_some_and(|t| t.is("SELECT"))
+        && w(3).is_some_and(|t| t.is("FROM"))
+        && word(4, "sys")
+        && w(5).is_some_and(|t| t.k == DOT)
+        && word(6, "sql_modules")
+        && w(7).is_some_and(|t| t.is("WHERE"))
+        && word(8, "object_id")
+        && w(9).is_some_and(|t| t.k == OP && t.s == "=")
+        && w(10).is_some_and(|t| t.k == VARIABLE && t.s.eq_ignore_ascii_case("@@PROCID"))
+        && w(11).is_some_and(|t| t.k == R_PAREN)
+        && w(12).is_some_and(|t| t.k == OP && t.s == "=")
+        && w(13).is_some_and(|t| t.k == NUMBER && t.s == "1");
+    ok.then(|| (setting, s[13] + 1))
+}
+
+/// An argument that is exactly `@@PROCID`.
+fn is_procid(arg: &[T]) -> bool {
+    matches!(sig(arg).as_slice(), [i] if arg[*i].k == VARIABLE && arg[*i].s.eq_ignore_ascii_case("@@PROCID"))
 }
 
 /// Why a T-SQL built-in has no rule: the ones whose result describes SQL

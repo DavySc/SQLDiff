@@ -37,7 +37,7 @@ fn a_refused_initial_value_leaves_its_declaration_compared() {
 AS
 BEGIN
   DECLARE @A nvarchar(max)
-  DECLARE @SchemaName nvarchar(max) = OBJECT_SCHEMA_NAME(@@PROCID)
+  DECLARE @SchemaName nvarchar(max) = OBJECT_DEFINITION(@@PROCID)
   DECLARE @B int = 1
   SET @A = N'x'
 END
