@@ -700,6 +700,13 @@ impl<'a> Parser<'a> {
         if self.eat_kw("AS") {
             return Ok(Some(self.any_ident()?));
         }
+        // T-SQL's reserved OPTION starts the query hints, `OPTION (…)`.
+        if self.d == Dialect::Tsql
+            && self.is_kw("OPTION")
+            && self.peek_at(1).is_some_and(|t| t.kind == K::LParen)
+        {
+            return Ok(None);
+        }
         match self.peek() {
             Some(t)
                 if (t.kind == K::Word && !is_reserved(&t.up) && !is_clause_start(&t.up))
