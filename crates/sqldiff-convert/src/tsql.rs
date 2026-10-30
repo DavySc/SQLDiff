@@ -1860,7 +1860,7 @@ impl<'a> Cx<'a> {
             ":" if w(1) == "R" && !self.db2() => {
                 // The file named after `:r`, as written (quotes removed).
                 let path = self.source(&ts[s[1]..]);
-                let path = path[path.find([' ', '\t']).map_or(path.len(), |k| k)..]
+                let path = path[path.find([' ', '\t']).unwrap_or(path.len())..]
                     .trim()
                     .trim_end_matches(';')
                     .trim()
