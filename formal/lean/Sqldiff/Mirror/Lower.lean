@@ -3494,6 +3494,21 @@ def storeTy (d : Dialect) (ty : Ast.Ty) : Option (Option Nat × Bool) :=
     else none
   | none, _, _ => none
 
+/-- A store into a target of a type outside the slice: a certainly
+non-character type takes a value outside the slice (the C1 path), a
+string type without a slice length the strings that fit (C2b). -/
+def storeNonSlice (d : Dialect) (ty : Ast.Ty) (vt : Option (SExpr × STy)) : Bool :=
+      if nonCharType ty then true else
+      match storeTy d ty with
+      | none => false
+      | some (n, wt) =>
+        -- No length and every character: any value is kept.
+        if n.isNone && (wt || (d matches .pg _ _)) then true else
+        match vt with
+        | some (_, .nul) => true
+        | some (_, .str m w) => fitsLen n m && (wt || !w)
+        | _ => false
+
 /-- A store into a target declared `ty` of the NULL literal (`isNull`),
 or of a value whose slice type is `vt` (`none`: outside the slice),
 changes no value. -/
@@ -3531,17 +3546,11 @@ def storeOkTy (d : Dialect) (ty : Option Ast.Ty) (isNull : Bool) (vt : Option (S
     -- A value outside the slice into an integer or a certainly
     -- non-character type, or an unbounded string: the C1 path, as before.
     | some _, none => intType d ty || nonCharType ty || unbounded
-    | none, _ =>
-      if nonCharType ty then true else
-      match storeTy d ty with
-      | none => false
-      | some (n, wt) =>
-        -- No length and every character: any value is kept.
-        if n.isNone && (wt || (d matches .pg _ _)) then true else
-        match vt with
-        | some (_, .nul) => true
-        | some (_, .str m w) => fitsLen n m && (wt || !w)
-        | _ => false
+    -- (C2c) A value of a slice type other than a string into a variable of
+    -- a type outside the slice converts (a `datetime2(6)` into a
+    -- `datetime` rounds to 1/300 s, a `timestamp` keeps it): outside.
+    | none, some (_, t) => if (t matches .str ..) || t == .nul then storeNonSlice d ty vt else false
+    | none, none => storeNonSlice d ty vt
 
 /-- A store of `v` into a target declared `ty` changes no value. (C2c) A
 string literal stored into a date or timestamp is in the spec only in

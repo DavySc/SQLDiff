@@ -550,16 +550,16 @@ def checkS (x : String) (vt : Ast.Expr) (y : String) (vp : Ast.Expr) : Answer :=
 #guard reasonOf (checkS "@when" (tv "@id") "p_when" (pv "p_id")) == reasonOutsideT
 -- A `datetime2(7)` or a `datetime` local: no value of the slice, the C1
 -- path as before (a store into it is not held).
-#guard isC1 (check depv Γv ⟨[("@x", "v_x"), (statusVar, statusVar)]⟩
+-- A `datetime2(7)` local against a `timestamp(6)` one: the declared
+-- types differ (the conversion's `ASM-FRACTIONAL-SECONDS`), refused.
+#guard reasonOf (check depv Γv ⟨[("@x", "v_x"), (statusVar, statusVar)]⟩
   (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (dt2 7) none, set (tv "@x") (fn "SYSDATETIME" [])])
-  (pgProc ["s"] [] [.Declare "v_x" (some (ts 6)) none] [set (pv "v_x") (fn "sysdatetime" [])]))
--- A literal into a `datetime2(7)` is a string on the C1 path; into the
--- `timestamp(6)` of the conversion it is a timestamp of the slice: the
--- sides differ (the conversion needs `ASM-FRACTIONAL-SECONDS`).
+  (pgProc ["s"] [] [.Declare "v_x" (some (ts 6)) none] [set (pv "v_x") (fn "sysdatetime" [])])) ==
+  "the declared types of the variables do not correspond"
 #guard reasonOf (check depv Γv ⟨[("@x", "v_x"), (statusVar, statusVar)]⟩
   (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (dt2 7) none, set (tv "@x") (str "2024-01-01T00:00:00")])
   (pgProc ["s"] [] [.Declare "v_x" (some (ts 6)) none] [set (pv "v_x") (str "2024-01-01T00:00:00")]))
-  == "the lowered routines differ beyond the renaming"
+  == "the declared types of the variables do not correspond"
 #guard (lowerT depv Γv (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (.Ty "DATETIME" []) none,
   declT "@i" int none, set (tv "@i") (datediff "day" (tv "@x") (tv "@x"))])).isNone
 -- Parameter defaults in the literal forms.

@@ -189,6 +189,37 @@ def usesC4 (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : Bool :
 def residualOf (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option (List String) :=
   (lowerT dep Γ a).map (residual a)
 
+/-- (C2c) A T-SQL variable's declared type and that of the PL/pgSQL
+variable the certificate gives it correspond: the same slice type (a
+string type of the slice on both, any lengths, as `sigCorr`), or, for a
+type outside the slice, the same type as written. Both engines convert
+a value stored into a variable to its declared type, so two variables of
+different types keep different values: T-SQL `DECLARE @x datetime` and
+PL/pgSQL `v_x timestamp` given one `datetime2(6)` value hold `.123333`
+and `.123456` (review of C2c, on the C1 path). -/
+def localTyCorr (ta tp : Ast.Ty) : Bool :=
+  let dt : Dialect := .tsql { rowCounts := false, routines := [] } ∅
+  let dp : Dialect := .pg ∅ []
+  match valTypeOf dt ta, valTypeOf dp tp with
+  | some (.str ..), some (.str ..) => true
+  | some x, some y => x == y
+  | none, none => match ta, tp with
+    | .Ty n as, .Ty m bs => n.toUpper == m.toUpper && as == bs
+  | _, _ => false
+
+/-- Every variable the certificate pairs, declared on both sides (the
+T-SQL routine's parameters and locals, `envT`; the PL/pgSQL routine's as
+declared, `envPDecl`), is declared with corresponding types; a name the
+T-SQL side does not declare (the status) is not compared. -/
+def varsCorr (cert : Cert) (a b : Ast.Routine) : Bool :=
+  let ea := envT a
+  let eb := envPDecl b
+  cert.vars.all fun (x, y) => match lookup ea x, lookup eb (pgName y) with
+    | some ta, some tp => localTyCorr ta tp
+    -- An undeclared PL/pgSQL name is refused by the scope check and the
+    -- renaming test; the status is not a T-SQL declaration.
+    | _, _ => true
+
 def theoremC1 : String := "Sqldiff.Mirror.check_sound"
 def theoremC2a : String := "Sqldiff.Mirror.check_sound_c2a"
 
@@ -208,6 +239,8 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
       .unconfirmed "the routines run with different privileges"
     else if !sigCorr a b then
       .unconfirmed "the parameter or return types do not correspond"
+    else if !varsCorr cert a b then
+      .unconfirmed "the declared types of the variables do not correspond"
     else if !cert.consistent then
       .unconfirmed "certificate: a T-SQL variable is given two PL/pgSQL names"
     else if !cert.injective then
@@ -264,6 +297,8 @@ theorem check_sound (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.R
     split at h
     · cases h
     split at h
+    · cases h
+    split at h
     · next hok =>
       obtain ⟨inj, heq⟩ := hok
       rw [heq]
@@ -288,6 +323,8 @@ theorem check_sound_c2a (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : A
     unfold check at h
     rw [ha, hb] at h
     simp only at h
+    split at h
+    · cases h
     split at h
     · cases h
     split at h
