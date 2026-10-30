@@ -200,14 +200,14 @@ pub const BASE_SUSPECT: &str = "ASM-BASE-SUSPECT";
 /// an unqualified name. Without a default schema (Db2 for i), an unqualified
 /// name may be any schema's.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct Key {
-    routine: bool,
-    schema: Option<String>,
-    name: String,
+pub(crate) struct Key {
+    pub(crate) routine: bool,
+    pub(crate) schema: Option<String>,
+    pub(crate) name: String,
 }
 
 impl Key {
-    fn new(d: Dialect, routine: bool, schema: Option<&str>, name: &str) -> Key {
+    pub(crate) fn new(d: Dialect, routine: bool, schema: Option<&str>, name: &str) -> Key {
         let schema = match schema {
             Some(s) => Some(key(d, s)),
             None => default_schema(d).map(|s| key(d, &Ident::plain(s).stored(d))),
@@ -219,7 +219,7 @@ impl Key {
         }
     }
 
-    fn of_parts(d: Dialect, parts: &[Ident]) -> Option<Key> {
+    pub(crate) fn of_parts(d: Dialect, parts: &[Ident]) -> Option<Key> {
         let (name, schema) = match parts {
             [n] => (n, None),
             [s, n] => (n, Some(s.stored(d))),
@@ -230,7 +230,7 @@ impl Key {
 
     /// The same name, whether a table or a routine: what a reference in a
     /// statement, which does not say which, can mean.
-    fn same_name(&self, o: &Key) -> bool {
+    pub(crate) fn same_name(&self, o: &Key) -> bool {
         self.name == o.name
             && (self.schema == o.schema || self.schema.is_none() || o.schema.is_none())
     }
@@ -242,24 +242,24 @@ impl Key {
     }
 }
 
-struct Object {
-    key: Key,
-    kind: &'static str,
-    name: String,
+pub(crate) struct Object {
+    pub(crate) key: Key,
+    pub(crate) kind: &'static str,
+    pub(crate) name: String,
 }
 
 /// A top-level statement of a base file.
-struct Node {
-    start: usize,
-    end: usize,
-    line: usize,
+pub(crate) struct Node {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) line: usize,
     /// What it creates.
-    defines: Vec<Object>,
+    pub(crate) defines: Vec<Object>,
     /// The table it alters or puts an index or a trigger on.
     touches: Option<Key>,
 }
 
-fn nodes(text: &str, d: Dialect) -> Vec<Node> {
+pub(crate) fn nodes(text: &str, d: Dialect) -> Vec<Node> {
     let root = sqldiff_syntax::parse(text, d).syntax();
     let mut out = Vec::new();
     for node in root.descendants() {
@@ -307,10 +307,11 @@ fn nodes(text: &str, d: Dialect) -> Vec<Node> {
 }
 
 /// Every name in `text` that may name a table, view or routine, with its
-/// offset: each dotted name, by its last two parts. Columns and aliases are
-/// among them; a column named like a suspect object flags too (a false
-/// alarm, never a miss).
-fn refs_at(text: &str, d: Dialect) -> Vec<(usize, Key)> {
+/// offset: each dotted name by every two adjacent parts (`s.t.c` names the
+/// table `s.t` and the column `c` of `t`), a name alone by itself. Columns
+/// and aliases are among them; a column named like a suspect object flags
+/// too (a false alarm, never a miss).
+pub(crate) fn refs_at(text: &str, d: Dialect) -> Vec<(usize, Key)> {
     use sqldiff_core::tokens::{of_node, qualified};
     let root = sqldiff_syntax::parse(text, d).syntax();
     let t = of_node(&root);
@@ -323,9 +324,14 @@ fn refs_at(text: &str, d: Dialect) -> Vec<(usize, Key)> {
             continue;
         }
         let (parts, next) = qualified(&t, i);
-        let tail = &parts[parts.len().saturating_sub(2)..];
-        if let Some(k) = Key::of_parts(d, tail) {
-            out.push((t[i].start, k));
+        let pairs: Vec<&[Ident]> = match parts.len() {
+            0 | 1 => vec![&parts[..]],
+            _ => parts.windows(2).collect(),
+        };
+        for p in pairs {
+            if let Some(k) = Key::of_parts(d, p) {
+                out.push((t[i].start, k));
+            }
         }
         i = next.max(i + 1);
     }
