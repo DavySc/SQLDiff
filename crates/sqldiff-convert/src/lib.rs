@@ -16,6 +16,7 @@ use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
 pub mod base;
+pub mod callees;
 pub mod cert;
 pub mod drift;
 pub mod gate;

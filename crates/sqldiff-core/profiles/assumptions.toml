@@ -1267,6 +1267,20 @@ fact = "Vendor fact V20 documented or checked."
 sites = ["sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
+id = "ASM-UDF-CALL-CONTEXT"
+statement = "A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it."
+discharge = "deployment"
+fact = "The function reads no data the calling statement or another session changes while the statement runs, and no clock."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-UDF-CALLEE"
+statement = "The user function a call names on side B is the conversion of the one it names on side A, compared in the file that creates it."
+discharge = "generated"
+fact = "The callee is converted in the same tree and its file is converted or under assumptions (sqldiff convert checks this and carries those assumptions)."
+sites = ["sqldiff-convert/src/callees.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-UNDECLARED-VAR"
 statement = "A variable used without a declaration in the unit is declared elsewhere in the routine under its converted name."
 discharge = "generated"

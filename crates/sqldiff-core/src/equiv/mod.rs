@@ -2929,6 +2929,16 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
             )),
             _ => {}
         }
+        // PostgreSQL ignores a parameter type's length, precision and scale
+        // (`call::asms::PARAM_TYPMOD`): the body then sees what callers pass.
+        let pg = [(ua.dialect, x.ty), (ub.dialect, y.ty)]
+            .into_iter()
+            .find(|(d, _)| *d == Dialect::Postgres);
+        if ua.dialect != ub.dialect
+            && pg.is_some_and(|(_, t)| t.is_some_and(|t| canon::untypmod(t) != t))
+        {
+            out.assume(asm::make(call::asms::PARAM_TYPMOD));
+        }
         let bits = matches!((x.ty, y.ty), (Some(tx), Some(ty)) if bit_bool(tx, ty));
         match (&x.default, &y.default) {
             (Some(dx), Some(dy))

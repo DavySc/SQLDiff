@@ -11,10 +11,10 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 | Discharge | Meaning | Ids |
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 52 |
-| `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 95 |
+| `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 20 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 96 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 195 |
+| | Total | 197 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -217,6 +217,8 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TSQL-STRING-AGG-8000` | The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that). | `deployment` | The data never aggregates a longer list. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-STRING-ARGS` | Every string argument a caller passes to a converted T-SQL routine fits the parameter's declared length (and, for varchar, its code page): T-SQL truncates it silently, PostgreSQL does not. | `deployment` | What callers pass. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-SYSDATETIME-PER-STATEMENT` | SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20). | `nothing` | Vendor fact V20 documented or checked. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-UDF-CALL-CONTEXT` | A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it. | `deployment` | The function reads no data the calling statement or another session changes while the statement runs, and no clock. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-UDF-CALLEE` | The user function a call names on side B is the conversion of the one it names on side A, compared in the file that creates it. | `generated` | The callee is converted in the same tree and its file is converted or under assumptions (sqldiff convert checks this and carries those assumptions). | `sqldiff-convert/src/callees.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-UNDECLARED-VAR` | A variable used without a declaration in the unit is declared elsewhere in the routine under its converted name. | `generated` | The routine converted as a whole, with the declaration. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-UNTYPED-CAST` | Values of unknown type that are cast convert the same on both sides (integers, or strings to strings). | `catalog` | The values' types. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-UNTYPED-NONCHAR` | Values of unknown type are not character strings, real, T-SQL tinyint or 38-digit decimals. | `catalog` | The values' types. | `sqldiff-core/src/equiv/canon.rs` |

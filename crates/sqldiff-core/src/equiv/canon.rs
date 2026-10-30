@@ -200,6 +200,16 @@ pub mod asm {
         "ASM-IDENT-FOLD",
         "Names on both sides name the same objects and columns after case folding: the PostgreSQL (lower case) and Db2 for i (upper case) objects were created from unquoted names, or, in PostgreSQL, from the quoted names the statements write, which no other name of the statement or the catalog matches up to letter case; and T-SQL resolves names case-insensitively (case-insensitive catalog collation)",
     );
+    /// `sqldiff convert` keeps a call unproven unless the converted callee's
+    /// own file is converted or under assumptions, and carries those.
+    pub const UDF_CALLEE: (&str, &str) = (
+        "ASM-UDF-CALLEE",
+        "The user function a call names on side B is the conversion of the one it names on side A, and that conversion is shown equal, or equal under the assumptions its file lists, in the file that creates it",
+    );
+    pub const UDF_CALL_CONTEXT: (&str, &str) = (
+        "ASM-UDF-CALL-CONTEXT",
+        "A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it: it reads no data the calling statement or another session changes while the statement runs, and no clock (SQL Server reads SYSDATETIME() at each call inside a function, PostgreSQL's statement_timestamp() and now() give the calling statement's or transaction's start)",
+    );
     pub const ROUTINE_LABEL: (&str, &str) = (
         "ASM-ROUTINE-LABEL",
         "The routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful: its result depends only on its arguments and data that does not change while the calling statement runs, so evaluating it fewer times gives the same results",
@@ -1710,11 +1720,111 @@ impl<'a> Canon<'a> {
         }
     }
 
+    /// A call to a scalar user function the side's catalog holds: `ufn`
+    /// with the function's name and the values its parameters receive, the
+    /// same term in T-SQL and PostgreSQL. Each argument goes through the
+    /// conversion to its parameter's type the side applies: SQL Server cuts,
+    /// rounds and pads to the declared type, PostgreSQL ignores its length,
+    /// precision and scale (eval/user-functions), so an argument the
+    /// parameter does not take unchanged on both sides leaves the two terms
+    /// apart. The function itself is the conversion of the other side's,
+    /// compared in the file that creates it (`ASM-UDF-CALLEE`, which
+    /// `sqldiff convert` checks against that file's own status), and called
+    /// in a statement it may run once per row or fewer times
+    /// (`ASM-UDF-CALL-CONTEXT`). `None` when the call is not of that form.
+    fn user_fn(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
+        if !matches!(self.d, Dialect::Tsql | Dialect::Postgres)
+            || c.name.len() != 2
+            || c.distinct
+            || c.star
+            || c.over
+            || !c.order.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(view) = self.schema.catalog() else {
+            return Ok(None);
+        };
+        let parts: Vec<crate::catalog::Ident> = c
+            .name
+            .iter()
+            .map(|x| match x.strip_prefix('"') {
+                Some(q) => crate::catalog::Ident::new(q, true),
+                None => crate::catalog::Ident::new(x.as_str(), false),
+            })
+            .collect();
+        let found: Vec<&crate::catalog::Routine> = match view.routines(&parts) {
+            crate::catalog::Lookup::Found(rs) => rs
+                .into_iter()
+                .filter(|r| r.kind == crate::catalog::RoutineKind::Function)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let [r] = found.as_slice() else {
+            return Ok(None);
+        };
+        let Some(ret) = &r.returns else {
+            return Ok(None);
+        };
+        let set = ["TABLE", "SETOF", "RECORD", "VOID", "TRIGGER"];
+        if set.iter().any(|x| ret.base.starts_with(x))
+            || r.params.len() != c.args.len()
+            || r.params
+                .iter()
+                .any(|p| p.mode != crate::catalog::ParamMode::In)
+        {
+            return Ok(None);
+        }
+        let pg = |t: Ty| match self.d {
+            Dialect::Postgres => untypmod(t),
+            _ => t,
+        };
+        let (schema, name) = (lc(&c.name[0]), lc(&c.name[1]));
+        let default = matches!(
+            (self.d, schema.as_str()),
+            (Dialect::Tsql, "dbo") | (Dialect::Postgres, "public")
+        );
+        let key = if default {
+            name
+        } else {
+            format!("{schema}.{name}")
+        };
+        let params: Vec<Ty> = r
+            .params
+            .iter()
+            .map(|p| pg(super::schema::ty_of(&p.data_type, self.d)))
+            .collect();
+        // PostgreSQL returns the value without the declared length,
+        // precision and scale; under `ASM-UDF-CALLEE` it is the value the
+        // T-SQL function returns, which has them.
+        let ret = super::schema::ty_of(ret, self.d);
+        let mut kids = vec![a(key.clone())];
+        for (x, p) in c.args.iter().zip(params) {
+            let v = self.expr(x)?;
+            kids.push(self.conv_var(&Some(p), v).0);
+        }
+        if default {
+            self.assume(asm::DEFAULT_SCHEMA);
+        }
+        let id = format!("{}:{key}", asm::UDF_CALLEE.0);
+        if !self.asm.iter().any(|y| y.id == id) {
+            self.asm.push(Assumption::default(
+                &id,
+                &format!("{} (here `{}`)", asm::UDF_CALLEE.1, r.display()),
+            ));
+        }
+        self.assume(asm::UDF_CALL_CONTEXT);
+        Ok(Some((n("ufn", kids), Some(ret))))
+    }
+
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a
         // built-in unqualified only.
         if c.name.len() > 1 {
+            if let Some(t) = self.user_fn(c)? {
+                return Ok(t);
+            }
             let mut args = vec![
                 self.dtag(),
                 a(c.name.iter().map(|x| lc(x)).collect::<Vec<_>>().join(".")),
@@ -3573,7 +3683,7 @@ impl<'a> Canon<'a> {
                     (_, Expr::Subquery(q)) => {
                         let (q, qty) = self.query(q, QCtx::Scalar)?;
                         let v = (self.scalar(q, "error", "null"), qty);
-                        let ret = self.unit.returns;
+                        let ret = self.returned();
                         Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
                     _ => {
@@ -3584,7 +3694,7 @@ impl<'a> Canon<'a> {
                                 len: Some(32),
                                 ..Ty::of(Fam::Int)
                             }),
-                            _ => self.unit.returns,
+                            _ => self.returned(),
                         };
                         Ok(n("return", vec![self.conv_var(&ret, v).0]))
                     }
@@ -3601,6 +3711,19 @@ impl<'a> Canon<'a> {
             }
             Stmt::Message(e) => self.print(e),
         }
+    }
+
+    /// The type a RETURN converts its value to. PostgreSQL drops the length,
+    /// precision and scale of a function's return type: `RETURNS varchar(5)`
+    /// returns 'abcdefgh' whole and `RETURNS numeric(10,2)` returns 1.005
+    /// unrounded, where SQL Server cuts and rounds (checked on PostgreSQL 18
+    /// and SQL Server 2022, eval/user-functions).
+    fn returned(&self) -> Option<Ty> {
+        let ret = self.unit.returns?;
+        if self.d != Dialect::Postgres {
+            return Some(ret);
+        }
+        Some(untypmod(ret))
     }
 
     /// A message that is an expression: T-SQL `PRINT e`, PL/pgSQL
@@ -5359,6 +5482,25 @@ fn aggregates(t: &Term) -> bool {
         || (t.is("fn") && t.kids().len() == 2 && named(t.kid(0), &["min", "max"]))
         || (t.is("dfn") && t.kids().len() == 3 && named(t.kid(1), &["min", "max", "sum", "avg"]))
         || t.kids().iter().any(aggregates)
+}
+
+/// A PostgreSQL routine's parameter or return type as PostgreSQL uses it:
+/// without length, precision and scale (`CREATE FUNCTION` keeps only the
+/// base type). Time types keep their largest precision, 6.
+pub(super) fn untypmod(t: Ty) -> Ty {
+    match t.fam {
+        Fam::VarChar | Fam::Char | Fam::Exact | Fam::Binary => Ty {
+            len: None,
+            scale: None,
+            ..t
+        },
+        Fam::Timestamp | Fam::TimestampTz | Fam::Time => Ty {
+            len: Some(6),
+            scale: None,
+            ..t
+        },
+        _ => t,
+    }
 }
 
 fn ret_ty_of(t: &Term) -> Option<Ty> {
