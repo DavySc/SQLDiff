@@ -155,7 +155,8 @@ def lookP (body : List Ast.Node := lookBodyP)
 /-! ## Confirmed -/
 
 #guard isC2a (checkJ lookT lookP)
-#guard residualOf depj Γj lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+#guard residualOf depj Γj lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS",
+  "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 
 /- The lowered `SELECT @q = o.Qty, @s = c.Score FROM dbo.Ord AS o JOIN
 dbo.Cust c ON c.Id = o.CustId WHERE o.Id = @id`: two sources, columns
@@ -246,12 +247,13 @@ def scalarP (wh : Ast.Expr) : Ast.Routine :=
 ON` dooms a caller's open transaction, losing the caller's own earlier
 work, where a PostgreSQL caller's exception block keeps it (eval/queries
 Q15): a routine that can fail names `ASM-NO-CALLER-TXN` even without a
-write; one that cannot (a pick through a closed block) does not. -/
+write; one that cannot (a pick through a closed block) does not. Every
+read names `ASM-TSQL-ROWCOUNT-0` (checker 0.15.0). -/
 #guard residualOf depj Γj (scalarT (.Bin ">" (qn "o" "Qty") (tv "@id")) [xactAbort]) ==
-  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard residualOf depj Γj (scalarT (eq (qn "o" "Id") (tv "@id"))) ==
-  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
-#guard residualOf depj Γj selfT == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
+#guard residualOf depj Γj selfT == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
 
 /-! ## Refused: the key closure
 

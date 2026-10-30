@@ -1110,11 +1110,11 @@ EXTRA = {
     "124": {"why": ["node:call:type"]},
     "125": {"why": ["node:call:type"]},
     # C3d: query blocks.
-    "126": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+    "126": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"],
             "statements": "c3b"},
     "127": {"why": ["stmt:select:many-rows"]},
     "128": {"scalars": "uninterpreted", "statements": "c3b"},
-    "129": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"],
+    "129": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"],
             "statements": "c3b"},
     "130": {"why": ["name:ambiguous"]},
     "131": {"why": ["stmt:select:from:qualifier"]},

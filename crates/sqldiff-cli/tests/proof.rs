@@ -661,10 +661,16 @@ fn the_real_checker_confirms_a_join_read_by_key() {
         .iter()
         .map(|a| a.as_str().unwrap())
         .collect();
+    // The scalar subquery over the join can raise `cardinality` under
+    // `XACT_ABORT ON`, which dooms a caller's transaction
+    // (ASM-NO-CALLER-TXN, eval/queries Q15); every read is limited by a
+    // caller's `SET ROWCOUNT` (ASM-TSQL-ROWCOUNT-0, eval/session).
     for a in [
         "ASM-TSQL-ARITH-ERRORS",
         "ASM-TSQL-ANSI-NULLS",
         "ASM-TABLES-AS-DECLARED",
+        "ASM-NO-CALLER-TXN",
+        "ASM-TSQL-ROWCOUNT-0",
     ] {
         assert!(asm.contains(&a), "{a}: {r}");
     }
