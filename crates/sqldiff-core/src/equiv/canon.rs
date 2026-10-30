@@ -1383,7 +1383,13 @@ impl<'a> Canon<'a> {
                 // (`%` aside), each dialect's way (`like::escaped_value`).
                 let escaped = match super::like::escaped_value(p, self.d) {
                     Some(v) => match self.expr(v)? {
-                        (v, Some(t)) if t.fam == Fam::VarChar => Some(v),
+                        // T-SQL's REPLACE cuts a result that is not MAX at
+                        // 8,000 bytes, and the escaping can triple x.
+                        (v, Some(t))
+                            if t.fam == Fam::VarChar && t.len.map_or(true, |l| l * 3 <= 4000) =>
+                        {
+                            Some(v)
+                        }
                         _ => None,
                     },
                     None => None,
@@ -5432,7 +5438,16 @@ impl<'a> Canon<'a> {
                 ) else {
                     continue;
                 };
-                if !col.is("col") || other.any(&|s| s.is("col") || s.is("subq")) {
+                // A literal, variable or parameter, maybe converted: not a
+                // call such as NEWID(), which changes per row.
+                fn constant(t: &Term) -> bool {
+                    match t.head() {
+                        "num" | "flt" | "bool" | "str" | "sym" => true,
+                        "conv" | "cast" => t.kids().last().is_some_and(constant),
+                        _ => false,
+                    }
+                }
+                if !col.is("col") || !constant(other) {
                     continue;
                 }
                 let exact = self

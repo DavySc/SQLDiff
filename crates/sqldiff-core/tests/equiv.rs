@@ -342,6 +342,15 @@ fn update_from_with_one_value_for_every_match() {
         verdict("UPDATE p SET unit_price = (SELECT MAX(x.unit_price) FROM price_feed AS x WHERE x.item_id = f.item_id) FROM price_feed AS f WHERE f.unit_price = 5"),
         "a subquery",
     );
+    // A call that changes per row is no pin.
+    let r = verdict("UPDATE p SET unit_price = f.unit_price FROM price_feed AS f WHERE f.item_id = p.item_id AND f.unit_price = RAND()");
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.witness.contains("at most one row")),
+        "pinned by a call: {:?}",
+        r.findings
+    );
     // Strings equal under T-SQL's collation may differ in case.
     not_equal(
         verdict("UPDATE i SET name = c.email FROM customer AS c WHERE c.customer_id > i.item_id AND c.email = 'a'"),

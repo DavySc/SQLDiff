@@ -10,7 +10,7 @@ use sqldiff_core::catalog::{ddl, Catalog};
 use sqldiff_core::{Artifact, Dialect, Options};
 
 const TABLES: &str =
-    "CREATE TABLE dbo.files (file_id int NOT NULL PRIMARY KEY, path varchar(200) NOT NULL);\n";
+    "CREATE TABLE dbo.files (file_id int NOT NULL PRIMARY KEY, path varchar(200) NOT NULL, note varchar(2000) NULL);\n";
 
 fn convert(stmt: &str) -> Conversion {
     let src = format!("{stmt}\n");
@@ -90,6 +90,13 @@ fn an_escaped_value_pattern_is_rewritten_and_proven() {
     );
     let u = c.units.last().unwrap();
     assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
+    // T-SQL's REPLACE cuts a non-MAX result at 8,000 bytes: a value whose
+    // escaping may not fit stays unproven.
+    let c = convert(
+        "SELECT a.file_id FROM dbo.files a JOIN dbo.files b ON a.path LIKE REPLACE(REPLACE(b.note,'[','[[]'),'_','[_]');",
+    );
+    let u = c.units.last().unwrap();
+    assert!(u.status >= Status::Unproven, "{:?} {}", u.status, c.output);
     // Another escaping is copied and stays unproven.
     let c = convert(
         "SELECT a.file_id FROM dbo.files a JOIN dbo.files b ON a.path LIKE REPLACE(b.path,'_','[_]');",
