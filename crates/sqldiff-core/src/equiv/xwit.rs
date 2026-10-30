@@ -964,14 +964,15 @@ fn isolated(need: &Need, others: [&[&Term]; 2]) -> R<()> {
                 return Err(format!("another statement uses {tab}"));
             }
         }
+        let param = |v: &Term| {
+            v.is("sym")
+                && v.kid(0)
+                    .and_then(Term::atom)
+                    .is_some_and(|id| params.iter().any(|p| p == id))
+        };
         if t.any(&|x| {
-            x.is("assign")
-                && x.kid(0).is_some_and(|v| {
-                    v.is("sym")
-                        && v.kid(0)
-                            .and_then(Term::atom)
-                            .is_some_and(|id| params.iter().any(|p| p == id))
-                })
+            (x.is("assign") && x.kid(0).is_some_and(param))
+                || (x.is("assign-row") && x.kid(0).is_some_and(|ts| ts.kids().iter().any(param)))
         }) {
             return Err("another statement assigns a parameter the witness reads".into());
         }

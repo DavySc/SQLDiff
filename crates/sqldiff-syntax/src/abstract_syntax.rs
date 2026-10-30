@@ -104,6 +104,28 @@ pub enum Expr {
     Extract(String, Box<Expr>),
 }
 
+/// The parameters, in order, and their defaults of the PostgreSQL built-ins
+/// whose named arguments are read: `make_interval` (PostgreSQL 18 manual,
+/// 9.9 Date/Time Functions: `make_interval ( [ years int [, months int
+/// [, weeks int [, days int [, hours int [, mins int [, secs double
+/// precision ]]]]]]] )`, each defaulting to zero).
+fn named_params(name: &[String]) -> Option<&'static [(&'static str, &'static str)]> {
+    let builtin = match name {
+        [f] => f,
+        [s, f] if s.eq_ignore_ascii_case("pg_catalog") => f,
+        _ => return None,
+    };
+    builtin.eq_ignore_ascii_case("make_interval").then_some(&[
+        ("years", "0"),
+        ("months", "0"),
+        ("weeks", "0"),
+        ("days", "0"),
+        ("hours", "0"),
+        ("mins", "0"),
+        ("secs", "0.0"),
+    ])
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     pub name: Vec<String>,
@@ -1159,7 +1181,7 @@ impl<'a> Parser<'a> {
         } else if self.eat_kind(K::RParen) {
         } else {
             c.distinct = self.eat_kw("DISTINCT");
-            c.args = self.expr_list()?;
+            c.args = self.call_args(&c.name)?;
             if self.eat_kws(&["ORDER", "BY"]) {
                 c.order = self.order_list()?;
             }
@@ -1177,6 +1199,65 @@ impl<'a> Parser<'a> {
             return Err("window functions and FILTER are not supported".into());
         }
         Ok(Expr::Call(Box::new(c)))
+    }
+
+    /// The arguments of a call. PostgreSQL named arguments (`name => v`)
+    /// are read only for built-ins whose parameters are known here, and are
+    /// placed by name, with each left-out parameter's default written out;
+    /// an unknown or repeated name, or a positional argument after a named
+    /// one, is refused as PostgreSQL refuses it.
+    fn call_args(&mut self, name: &[String]) -> PResult<Vec<Expr>> {
+        let named_at = |p: &Self| {
+            p.d == Dialect::Postgres
+                && p.peek().is_some_and(|t| t.kind == K::Word)
+                && p.peek_at(1)
+                    .is_some_and(|t| t.kind == K::Op && t.text == "=>")
+        };
+        let mut args = Vec::new();
+        let mut named: Vec<(String, Expr)> = Vec::new();
+        loop {
+            if named_at(self) {
+                let n = self.any_ident()?.to_lowercase();
+                self.i += 1;
+                named.push((n, self.expr()?));
+            } else if !named.is_empty() {
+                return Err(self.err("positional argument after a named one"));
+            } else {
+                args.push(self.expr()?);
+            }
+            if !self.eat_kind(K::Comma) {
+                break;
+            }
+        }
+        if named.is_empty() {
+            return Ok(args);
+        }
+        let shown = name.join(".");
+        let params = named_params(name)
+            .ok_or_else(|| format!("named arguments to {shown}() are not supported"))?;
+        if args.len() > params.len() {
+            return Err(format!(
+                "{shown}() takes at most {} arguments",
+                params.len()
+            ));
+        }
+        let mut slots: Vec<Option<Expr>> = args.into_iter().map(Some).collect();
+        slots.resize(params.len(), None);
+        for (n, v) in named {
+            let k = params
+                .iter()
+                .position(|(p, _)| *p == n)
+                .ok_or_else(|| format!("{shown}() has no parameter {n}"))?;
+            if slots[k].is_some() {
+                return Err(format!("{shown}() is given parameter {n} twice"));
+            }
+            slots[k] = Some(v);
+        }
+        Ok(slots
+            .into_iter()
+            .zip(params)
+            .map(|(v, (_, default))| v.unwrap_or_else(|| Expr::Num(default.to_string())))
+            .collect())
     }
 
     fn case(&mut self) -> PResult<Expr> {

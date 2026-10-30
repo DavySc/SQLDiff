@@ -228,6 +228,10 @@ pub struct Unit {
     pub stops_on_error: bool,
     /// Top-level BEGIN TRAN / COMMIT statements, checked for position.
     pub txn_stmts: Vec<(SyntaxNode, StmtKind)>,
+    /// The entries of `uncovered` that are transaction statements between
+    /// data statements: the behaviour model may have compared those
+    /// (`ir::behaviour::Behaviour::txn_compared`).
+    pub txn_placed: Vec<SyntaxNode>,
     pub notes: Vec<String>,
     /// Security context of a routine (scripts and views: the caller's).
     pub security: Security,
@@ -268,6 +272,15 @@ pub struct Unit {
     /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.t`, placed like `table_vars`:
     /// the drop before a converted table variable's `CREATE TEMP TABLE`.
     pub temp_drops: Vec<(SyntaxNode, usize)>,
+    /// The tables the unit itself creates for its own use: T-SQL table
+    /// variables and `#` tables, PostgreSQL `CREATE TEMP TABLE`, Db2 for i
+    /// `DECLARE GLOBAL TEMPORARY TABLE`. Their columns are typed for the
+    /// unit's statements as a catalog table's are (`mod.rs`, `local_schema`).
+    pub local_tables: Vec<SyntaxNode>,
+    /// PostgreSQL: the unqualified names of the temporary tables the unit
+    /// creates (lower case). PostgreSQL looks in `pg_temp` first, so the bare
+    /// name is the temporary table, as `#t` is in T-SQL.
+    pub local_temps: std::collections::HashSet<String>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
     /// Cursor loops of the shape `cursor.rs` compares.
@@ -337,6 +350,7 @@ fn empty(d: Dialect) -> Unit {
         txn_control: false,
         stops_on_error: false,
         txn_stmts: Vec::new(),
+        txn_placed: Vec::new(),
         notes: Vec::new(),
         security: Security::Caller,
         security_cite: None,
@@ -351,6 +365,8 @@ fn empty(d: Dialect) -> Unit {
         other_temps: Default::default(),
         table_vars: Vec::new(),
         temp_drops: Vec::new(),
+        local_tables: Vec::new(),
+        local_temps: Default::default(),
         ctl: Vec::new(),
         cursor_loops: Vec::new(),
         cursor_vars: Vec::new(),
@@ -875,6 +891,7 @@ fn place_txn(u: &mut Unit) {
             _ => data.iter().any(|(o, is_return)| *o > at && !is_return),
         };
         if misplaced {
+            u.txn_placed.push(node.clone());
             u.uncovered
                 .push((node, format!("{} between data statements", kind.label())));
         }
@@ -1395,6 +1412,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             _ => None,
         };
         if let Some(what) = what.filter(|_| !is_call(c, d)) {
+            // Where a COMMIT sits is the behaviour model's to compare.
+            if kind == StmtKind::TxnCommit {
+                u.txn_placed.push(c.clone());
+            }
             return inside_flow(c, u, what);
         }
     }
@@ -1416,6 +1437,23 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             cursor: None,
         });
         return;
+    }
+    if table_var_decl(c, d) || temp_create(c, d) {
+        u.local_tables.push(c.clone());
+        if d == Dialect::Postgres {
+            let ts = tokens(c);
+            // `CREATE TEMP TABLE [IF NOT EXISTS] name (` with a one-part name.
+            let at = if ts.get(3).is_some_and(|t| t.up == "IF") {
+                6
+            } else {
+                3
+            };
+            if let [n, next, ..] = ts.get(at..).unwrap_or_default() {
+                if n.kind == K::Word && next.kind != K::Dot {
+                    u.local_temps.insert(n.text.to_lowercase());
+                }
+            }
+        }
     }
     if table_var_decl(c, d) {
         u.table_vars.push((c.clone(), u.stmts.len()));
@@ -1494,6 +1532,12 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         // Indexes, sequences and schemas: compared statement against
         // statement (`ddl.rs`).
         StmtKind::Ddl if u.kind == UnitKind::Script && is_create_ddl(c, d) => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
+        // A routine's TRUNCATE: compared statement against statement too,
+        // in its place among the data statements (`mod.rs::ddl_stmts` checks
+        // that it runs once).
+        StmtKind::Ddl if cst::first_words(c, 1) == ["TRUNCATE"] => {
             u.ddl.push((c.clone(), u.stmts.len()));
         }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
@@ -1740,6 +1784,13 @@ fn table_var_decl(c: &SyntaxNode, d: Dialect) -> bool {
             w(0) == "DECLARE" && w(1) == "GLOBAL" && w(2) == "TEMPORARY" && w(3) == "TABLE"
         }
     }
+}
+
+/// T-SQL `CREATE TABLE #t`.
+fn temp_create(c: &SyntaxNode, d: Dialect) -> bool {
+    d == Dialect::Tsql
+        && cst::first_words(c, 2) == ["CREATE", "TABLE"]
+        && tokens(c).get(2).is_some_and(|t| t.text.starts_with('#'))
 }
 
 /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.…`. Other drops are compared

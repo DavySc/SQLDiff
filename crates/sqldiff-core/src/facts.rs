@@ -59,7 +59,7 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
         } else {
             Default::default()
         };
-        let durable = |p: &[String]| !is_temp_target(p);
+        let durable = |p: &[String]| !is_temp_target(p) && !pg_temp_before(&node, p, d);
         for (k, p) in before.into_iter().filter(|(_, p)| durable(p)) {
             out.push(Write {
                 upsert: k == StmtKind::Merge,
@@ -86,6 +86,41 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
         }
     }
     out
+}
+
+/// PostgreSQL: a one-part `target` that a `CREATE TEMP TABLE target`
+/// earlier in the same routine (or script) created. PostgreSQL looks in
+/// `pg_temp` first, so the write goes to that temporary table, as a write to
+/// `#t` does in T-SQL.
+fn pg_temp_before(node: &SyntaxNode, target: &[String], d: sqldiff_syntax::Dialect) -> bool {
+    let [name] = target else {
+        return false;
+    };
+    if d != sqldiff_syntax::Dialect::Postgres || name.starts_with('"') {
+        return false;
+    }
+    let scope = node
+        .ancestors()
+        .find(|n| n.kind() == SyntaxKind::ROUTINE)
+        .or_else(|| node.ancestors().last());
+    let Some(scope) = scope else {
+        return false;
+    };
+    let at = node.text_range().start();
+    scope.descendants().any(|c| {
+        if c.kind() != SyntaxKind::STATEMENT || c.text_range().start() >= at {
+            return false;
+        }
+        let toks: Vec<_> = ast::sig_tokens(&c).take(5).collect();
+        let up = |i: usize| toks.get(i).map(|t| t.text().to_ascii_uppercase());
+        up(0).as_deref() == Some("CREATE")
+            && matches!(up(1).as_deref(), Some("TEMP" | "TEMPORARY"))
+            && up(2).as_deref() == Some("TABLE")
+            && toks
+                .get(3)
+                .is_some_and(|t| t.text().eq_ignore_ascii_case(name))
+            && !toks.get(4).is_some_and(|t| t.text() == ".")
+    })
 }
 
 /// T-SQL `CREATE TABLE … WITH (SYSTEM_VERSIONING = ON (HISTORY_TABLE = h))`:

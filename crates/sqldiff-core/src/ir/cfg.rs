@@ -659,6 +659,25 @@ impl Lowerer {
             let name = call_name(n)?;
             return Some(("Call".to_string(), name));
         }
+        // TRUNCATE empties its table: a write like a DELETE, kept or undone
+        // with the transaction.
+        if kind == StmtKind::Ddl {
+            let toks: Vec<SyntaxToken> = ast::sig_tokens(n).collect();
+            if toks.first().map(upper).as_deref() == Some("TRUNCATE") {
+                let mut i = 1;
+                while toks
+                    .get(i)
+                    .is_some_and(|t| matches!(upper(t).as_str(), "TABLE" | "ONLY"))
+                {
+                    i += 1;
+                }
+                let parts = ast::qualified_name_at(&toks, i);
+                if parts.is_empty() || self.temp_of(&parts).is_some() {
+                    return None;
+                }
+                return Some(("Truncate".to_string(), parts.last()?.clone()));
+            }
+        }
         None
     }
 
