@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 179 | 31 (17%) | 6 (3%) | 142 (79%) |
+| `converter` | 180 | 31 (17%) | 6 (3%) | 143 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 208 | 34 (16%) | 8 (4%) | 166 (80%) |
+| **All** | 209 | 34 (16%) | 8 (4%) | 167 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -132,6 +132,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.func.isnull` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.len` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string variable, parameter or literal of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.string_agg` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.geography.point-constant` | `converter` | engine | SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical | `sqldiff-convert/src/tsql/geography.rs` |
 | `tsql.global-temp` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.clustered` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.nulls-not-distinct` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
