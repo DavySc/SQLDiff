@@ -10,20 +10,21 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Ast.lean` | Generated from the abstract syntax schema (`sqldiff_syntax::encode::SCHEMA`, `sqldiff_core::proof::lean_ast`): routines, statements and expressions as Lean types, and the decoder for their one-line encoding. Do not edit; the same bless command writes it |
 | `Sqldiff/Tree.lean` | The syntax tree as Lean types and its decoder: an unknown kind, a token where a node belongs or the reverse, or any other text fails to decode |
 | `Sqldiff/Gate.lean` | Programs, refinement (decision 1), the check, and `check_sound`: a confirmed answer means B refines A, for every semantics |
-| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); (C3b) the read `query t c pick` (`Pick`: assign from the one kept row, count the kept rows, test for one); expressions are slice expressions (`SExpr`: variables, columns, integer literals, NULL, `+ - * / %` and negation at a width (C2c: 16, 32 or 64 bits), comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`; (C2c) bit, date and timestamp literals, `DATEADD` by day, month or year, `DATEDIFF` by day, the date of a timestamp, a date at midnight) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
+| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); (C3b) the read `query q pick` (`Pick`: assign from the one kept row, count the kept rows, test for one), (C3d) over a query block (`Block`: catalog tables, their product kept where every condition is TRUE, the key closure `Block.atMostOne`); expressions are slice expressions (`SExpr`: variables, columns, integer literals, NULL, `+ - * / %` and negation at a width (C2c: 16, 32 or 64 bits), comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`; (C2c) bit, date and timestamp literals, `DATEADD` by day, month or year, `DATEDIFF` by day, the date of a timestamp, a date at midnight) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
 | `Sqldiff/Core/Calendar.lean` | (C2c) The proleptic Gregorian calendar of the core's dates (days since 0001-01-01) and timestamps (microseconds): day numbers from and to civil dates, leap years, the month and year addition with the month-end clamp, checked against the vendors' own counts |
 | `Sqldiff/Core/Semantics.lean` | Values (NULL, three-valued booleans, 32-bit integers, opaque values), errors (overflow, division by zero, constraint violations), the meaning of slice expressions, the database (tables as lists of rows, observed as bags), the data statements, the fuel-based, executable interpreter, what a caller observes (out parameters, returned value, world and database after a finished call; error kind and calls for a failed one; decision 1) and `Refines` |
-| `Sqldiff/Core/Data.lean` | The data statements: congruence lemmas (`insertRows_map`, `updateRows_map`, `deleteRows_map`, and (C3b) `keptRows_map`, `pickRows_map`) and statement atomicity (`exec_error_atomic`) |
+| `Sqldiff/Core/Data.lean` | The data statements: congruence lemmas (`insertRows_map`, `updateRows_map`, `deleteRows_map`, and (C3b, C3d) `keepsAll_map`, `keptTuples_map`, `blockRows_map`, `keptTuples_congr`, `pickRows_map`) and statement atomicity (`exec_error_atomic`) |
+| `Sqldiff/Core/Fidelity.lean` | (C3d) `kept_length_le_one`: the key closure keeps at most one tuple on a database whose tables have distinct primary keys (`TableOk`), which is what lets the lowering assign from "the" row of a `SELECT @x = ...` over a join |
 | `Sqldiff/Core/Rename.lean` | An injective renaming of a routine's variables is observationally the same routine (`refines_rename`) |
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes (with a result or an error), more fuel gives the same observation (`obs_mono`) |
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
 | `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
-| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C2b strings, the C2c typed values (integer widths, `bit` against `boolean`, `date` and `datetime2(p)` against `date` and `timestamp(p)`), the C3a data statements, the C3b queries and the C3c tables (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
+| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C2b strings, the C2c typed values (integer widths, `bit` against `boolean`, `date` and `datetime2(p)` against `date` and `timestamp(p)`), the C3a data statements, the C3b queries, the C3c tables and (C3d) the query blocks, joins, aliases and qualified names (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer; (0.13.0) `why`, the reason codes of the routine the check refuses |
 | `Sqldiff/Mirror/Diagnose.lean` | (0.13.0) Untrusted refusal diagnostics: `whyT` and `whyP` name the constructs `lowerT`/`lowerP` refuse, as the codes of "Refusal diagnostics" below, using the lowering functions as oracles node by node; no theorem depends on it |
 | `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry; C2c: the typed-value column types `j`, `h`, `b`, `d`, `t<p>` and their defaults); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC2c.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C2c typed values, with the runs of the date arithmetic and the width overflows; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
-| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.14.0 |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC2c.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC3d.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C2c typed values, with the runs of the date arithmetic and the width overflows; C3a with table states; C3b queries; C3c string columns, defaults; C3d query blocks, with the runs through a join and the `cardinality` error; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
+| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.16.0 |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
 | `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
@@ -351,7 +352,9 @@ and the congruence lemmas, and (C2b) `mkRtrim_eval` (`Axioms.lean`).
 
 ### Phase C3b: single-table queries
 
-Checker 0.10.0. The core has one more statement, `query t c pick`
+Checker 0.10.0. (C3d, checker 0.16.0, reads a query block instead of
+one table and replaces `keyFixed` by the key closure; see "The C3d
+slice" below.) The core has one more statement, `query t c pick`
 (`Sqldiff.Core.Stmt.query`): the rows of table `t` where `c` is TRUE
 (`keptRows`), then `pick` assigns variables from them (`pickRows`):
 `row orNull sets` from the last kept row (nothing, or with `orNull` NULL,
@@ -444,6 +447,69 @@ routine's expressions need. No new answer field or Lean residual; the
 proofs are untouched (`check_sound` and `check_sound_c2a` keep their
 statements; `Axioms.lean` unchanged). `ExamplesC3c` has the confirmed and
 refused pairs and interpreter runs.
+
+### The C3d slice: query blocks (part 1)
+
+Checker 0.16.0. The core's read statement is now `query q pick` over a
+query block (`Sqldiff.Core.Block`, `Query`): the catalog tables of a
+`FROM` in order (a table may stand twice, under two aliases) and the
+conditions, every `ON` of an inner join and then the `WHERE`, each split
+at its top-level `AND`s. Its rows are the tuples of the product of the
+tables' rows (nested loops in `FROM` order, `tuples`) where every
+condition is TRUE (`blockRows`); an expression reads column `c` of the
+source at position `i` as the core column `i.c` (`srcCol`), so sources
+are told apart by position, never by alias spelling. A C3b one-table
+query is a block of one source (its terms now spell columns `0.c`). The
+rules ("The C3d blocks" in `Sqldiff/Mirror/Lower.lean`, each with its
+vendor citation, **quoted from memory**, and its probe) cover the four
+C3b statement shapes over a block, in procedures only:
+
+| Rule | Claim | Probed (eval/queries, `blocks-{mssql,postgres}`) |
+|---|---|---|
+| The `FROM` | catalog tables (with or without alias, no hints) in a comma list, `[INNER] JOIN ... ON`, `CROSS JOIN`; the rows are the product's tuples where every `ON` and the `WHERE` are TRUE (an inner join's predicate means the same in `ON` and in `WHERE`); `LEFT`/`RIGHT`/`FULL` joins, `APPLY`, derived tables, `VALUES`, table functions, `USING`, `NATURAL`, parenthesised joins are outside | Q11 (the same count with the condition in `ON`, in `WHERE`, with a comma list and with `CROSS JOIN`; products of two and three tables; a NULL join key matches nothing; a self-join) |
+| `ON` scope | an `ON` names only the sources of its own join (a table joined later or another comma item is 4104 against 42P01) | Q12 |
+| Reference names | the alias, else the table's last name part; an aliased table's own name is no qualifier (4104, 42P01); ASCII and distinct, T-SQL up to case (1013), PostgreSQL folded (42712); aliases that swap two tables' names resolve to the aliased tables | Q12 |
+| Qualified `q.c` | the one source named `q`: T-SQL spelt exactly (a qualifier or a column in another case does not resolve in a case-sensitive database: 4104, 207), PostgreSQL folded; a PostgreSQL qualifier is never a variable, the `FOR` record or the routine's name (a record as qualifier 42702, the loop's own record 55000, the routine's name with a parameter of the column's name 42702) | Q12 |
+| Unqualified `c` | the one source that has the column (two: 209 against 42702; T-SQL counts them up to case); in PostgreSQL never also a variable (C3a's rule over every source: 42702) or a reference name | Q12 |
+| `SELECT @x = ...` and its `FOR` block | only on a block the **key closure** determines (`Core.Block.atMostOne`): each primary-key column of each table equated (`=` of one kind, `Core.eqFixes`) with an expression over tables already determined, variables the pick does not assign and constants; string equality, a date against a timestamp, `IS NULL`, `UNIQUE` indexes and nullable columns are never steps. `Core.kept_length_le_one` proves at most one tuple on a database whose keys are distinct | Q11 (by key across a join, no row on a NULL join key, a self-join, a two-column key fixed from another table) |
+| Scalar subquery | over any block: NULL on no row, the value on one, on more than one the new error kind `cardinality` (T-SQL 512, PostgreSQL 21000) with the variable kept; it counts as able to fail unless the block is closed (`Core.Stmt.failsHere`), so without `SET XACT_ABORT ON` it is then a `check_sound` answer | Q13 (NULL, 200, 512 against 21000, and the error ending an `XACT_ABORT ON` procedure) |
+| `COUNT(*)`, `EXISTS` | over any block | Q11 |
+
+**Proofs.** `check_sound` and `check_sound_c2a` keep their statements.
+The core lemmas gained the block: the renaming simulation and operator
+independence through `keepsAll_map`, `keptTuples_map`, `blockRows_map`
+and `keptTuples_congr` (`Core/Data.lean`) and the new `pickRows`, fuel
+monotonicity, leaf atomicity and the C4 settling (`exec_leaf_error`,
+`exec_db_of_noWrite`, `exec_setDb` keep their cases). The new
+`Sqldiff/Core/Fidelity.lean` proves `kept_length_le_one`: on a database
+where every table's rows have one value per column, no NULL in a
+required column and distinct primary keys (`TableOk`), a block that
+`atMostOne` admits keeps at most one tuple; the lowering builds
+`Pick.row false` only on such a block (`rowPick`). Standard axioms only
+(`Axioms.lean`, which now also fails when it has an error of its own).
+
+**What it rests on**, beyond C3b and C3c: the probes above (SQL Server
+2022, 16.0.4305.5, and PostgreSQL 18.6) and the vendor texts quoted from
+memory in `Lower.lean`; `ASM-TABLES-AS-DECLARED` for every table of a
+block (the Rust side now sends the tables on both sides of a join,
+`cert.rs`, `from_tables`); `ASM-TSQL-ANSI-NULLS` when a condition uses
+`=`. No new residual id and no new answer field: a confirmation that
+reads tables carries `"statements":"c3b"`. Outside, for the later parts
+of C3d: aggregates other than `COUNT(*)`, `GROUP BY`, `DISTINCT`, `ORDER
+BY` with `TOP`, outer joins, subqueries inside conditions, writes from
+queries; and tables that are not plain (a foreign key, `UNIQUE`,
+`CHECK`, identity), which still keep a corpus table out of the catalog
+even where it is only read.
+
+Two C3b expectations changed by design: a one-table query with an alias,
+and a scalar subquery whose `WHERE` does not fix the key, are now in the
+spec (`ExamplesC3b`). `ExamplesC3d` has the converter's pair (a pick by
+key through a join, a scalar subquery over an inner join, a count over a
+comma list, `EXISTS` over a cross join), a self-join, a two-column key
+fixed from another table, the refused boundaries, and interpreter runs
+on eval/queries' rows (the pick through the join, the `cardinality`
+error on both sides); `test_gate.py` cases 126 to 132 exercise the
+protocol.
 
 ### Phase C4: errors and transactions
 
@@ -567,13 +633,17 @@ routine refused without any stage naming a reason gets
 | `routine:param:default` | A parameter default that is not NULL or a slice value fitting the declared type, or that reads a variable |
 | `routine:unclassified` | The lowering refused the routine and no stage named a reason (should not happen; it keeps the field non-empty) |
 | `stmt:select:result-set` | A `SELECT` that assigns no variable (T-SQL: no `@x =`; PL/pgSQL: no `INTO`): a result set |
-| `stmt:select:from:join`, `:multi`, `:sub`, `:values`, `:func`, `:hints`, `:alias`, `:data-change`, `:none` | The `FROM`: a join, several sources, a derived table, `VALUES`, a table function, table hints, a table alias, a DML source, no `FROM` |
+| `stmt:select:from:join:<kind>`, `:sub`, `:values`, `:func`, `:hints`, `:data-change`, `:none` | The `FROM`: (0.16.0) a join other than inner or cross (`stmt:select:from:join:left`, `:right`, `:full`), a derived table, `VALUES`, a table function, table hints, a DML source, no `FROM`. (0.16.0) Inner and cross joins, comma lists and aliases are in the spec; `:join` without a kind, `:multi` and `:alias` are gone |
+| `stmt:select:from:ref` | (0.16.0) Two sources of a block with one reference name (T-SQL up to case: 1013; PostgreSQL 42712), or a non-ASCII alias |
+| `stmt:select:from:qualifier` | (0.16.0) A qualified name `q.c` in a query whose `q` names no source the expression may see (an aliased table's own name, a table joined later in an `ON`), is spelt in another case (T-SQL), is a PL/pgSQL variable, the `FOR` block's record or the routine's name, or whose `c` is no column of that source |
+| `name:ambiguous` | (0.16.0) An unqualified name that is a column of two sources of the block (209, 42702) |
+| `name:column-variable` | (0.16.0) A PL/pgSQL unqualified name that is a column of a source of the block and also a variable (42702) |
 | `stmt:select:cte`, `:setop`, `:distinct`, `:top`, `:group`, `:having`, `:order`, `:offset`, `:locking`, `:for-json` | A `WITH`, a set operation, `DISTINCT`, `TOP`, `GROUP BY`, `HAVING`, `ORDER BY`, `OFFSET`/`LIMIT`, a locking clause, `FOR JSON` |
 | `stmt:select:into` | An `INTO` the rules refuse: T-SQL `SELECT ... INTO`, PL/pgSQL `SELECT col INTO x` (NULL on no row, probed Q10), `INTO STRICT`, several targets |
 | `stmt:select:agg:<fn>` | An aggregate in a select list outside the C3b `COUNT(*)` shape (`stmt:select:agg:sum`; `:count` for a `COUNT(*)` beside other items) |
 | `stmt:select:value` | A picked value that reads a variable (`SELECT @x = @x + c`, a running total), can raise, or is a condition |
 | `stmt:select:item`, `stmt:select:items` | A select item with both an alias and an assignment, or an unaliased item in a `FOR` block; a select list of the wrong length for the shape |
-| `stmt:select:where:not-key` | The `WHERE` does not fix every primary-key column with `=` (which row T-SQL keeps is unspecified) |
+| `stmt:select:many-rows` | (0.16.0, in place of `stmt:select:where:not-key`) `SELECT @x = ...` or its `FOR` block over a block the key closure does not determine: it may keep several rows, and which one T-SQL assigns is unspecified |
 | `stmt:select:table:unknown` | The table is not in the deployment's table map or the target catalog |
 | `stmt:select:table:not-plain` | The table is in the catalog but not usable (`CatTable.wellFormed`: a string key, a default that does not fit, ...) |
 | `stmt:select:target:<type>` | A pick into a variable whose declared type does not take the value (`stmt:select:target:varchar_10` for an `int` column) |
@@ -609,8 +679,8 @@ routine refused without any stage naming a reason gets
 | `node:<ctor>` | Another refused node, by its constructor (`node:if`, `node:nblock`, `node:raise` for a `RAISE` in T-SQL, ...) |
 | `expr:subquery`, `expr:exists`, `expr:in-query` | A subquery, `EXISTS` or `IN (SELECT ...)` inside an expression (not one of the whole-statement C3b shapes) |
 | `expr:star` | `*` as an expression |
-| `expr:name:qualified` | A two-part name (`t.c`) |
-| `expr:name:unresolved` | A bare name that is no column of the statement's table (T-SQL), or a PL/pgSQL name that is both a column of the target and a variable, or the table's own name (an undeclared PL/pgSQL name is `routine:scope:undeclared`) |
+| `expr:name:qualified` | A two-part name (`t.c`) outside a query, or a name of three parts or more |
+| `expr:name:unresolved` | A bare name that is no column of the statement's table (T-SQL), or a PL/pgSQL name that is both a column of the target and a variable, or the table's own name (an undeclared PL/pgSQL name is `routine:scope:undeclared`); (0.16.0) in a query block, a name that is no column a condition may see, or a PL/pgSQL reference name |
 | `expr:var:global:<name>` | A T-SQL `@@x` read (`expr:var:global:rowcount`, `:trancount`, `:error`) |
 | `expr:pg-var` | A `@x` variable in PL/pgSQL |
 | `expr:fn:error:<name>` | An error function (`error_number`, `error_message`, ..., `xact_state`) or PL/pgSQL `sqlstate`/`sqlerrm` |
