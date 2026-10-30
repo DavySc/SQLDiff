@@ -340,7 +340,15 @@ CREATE TRIGGER {} BEFORE TRUNCATE ON {table}
             if !a.name.eq_ignore_ascii_case(&b.name) {
                 return no(format!("history table {history}: column {} at ordinal {} is {} in the table; SQL Server refuses it (Msg 13524)", b.name, n + 1, a.name));
             }
-            if a.data_type != b.data_type {
+            // The type, not its spelling (`NVARCHAR (MAX)`, `nvarchar(max)`).
+            let ty = |c: &sqldiff_core::catalog::Column| {
+                (
+                    c.data_type.base.clone(),
+                    c.data_type.args.clone(),
+                    c.data_type.max,
+                )
+            };
+            if ty(a) != ty(b) || (!a.data_type.is_known() && a.data_type.text != b.data_type.text) {
                 return no(format!("history table {history}: column {} has another type than in the table; SQL Server refuses it", b.name));
             }
         }
