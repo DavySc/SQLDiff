@@ -39,12 +39,15 @@ def custT : CatTable :=
       ⟨"score", "Score", false, false, .int .i32, none⟩, ⟨"name", "Name", false, false, .str 10 false, none⟩] }
 def evT : CatTable :=
   { name := "ev", cols := [⟨"d", "D", true, true, .date, none⟩, ⟨"n", "N", false, false, .int .i32, none⟩] }
+/-- A table keyed by a `datetime2(6)`/`timestamp(6)` column. -/
+def evtT : CatTable :=
+  { name := "evt", cols := [⟨"t", "T", true, true, .ts 6, none⟩, ⟨"n", "N", false, false, .int .i32, none⟩] }
 
-def Γj : Catalog := { routines := [], tables := [ordT, custT, twoK, evT, pairT] }
+def Γj : Catalog := { routines := [], tables := [ordT, custT, twoK, evT, pairT, evtT] }
 def depj : Deployment :=
   { rowCounts := false, routines := [],
     tables := [("dbo.Ord", "ord"), ("dbo.Cust", "cust"), ("dbo.Two", "two"), ("dbo.Ev", "ev"),
-      ("dbo.Pair", "pair")] }
+      ("dbo.Pair", "pair"), ("dbo.Evt", "evt")] }
 
 /-! ## Building blocks -/
 
@@ -286,6 +289,17 @@ def evT' (ty : Ast.Ty) : Ast.Routine :=
 #guard (lowerT depj Γj (evT' (.Ty "DATE" []))).isSome
 #guard (lowerT depj Γj (evT' (.Ty "DATETIME2" ["6"]))).isNone
 #guard whyT depj Γj (evT' (.Ty "DATETIME2" ["6"])) == ["stmt:select:many-rows"]
+/- The other way round is a step: a timestamp key against a `date`
+variable is `t = toTs(@d)`, the date widened to midnight on both engines
+(review of C3d), which fixes the key. -/
+def evtT' (ty : Ast.Ty) : Ast.Routine :=
+  tsqlProc ["r"] [inT "@d" ty, ioT "@q"] [selectF [asg "@q" (qn "e" "N")]
+    [tbl ["dbo", "Evt"] (some "e")] (some (eq (qn "e" "T") (tv "@d")))]
+#guard (lowerT depj Γj (evtT' (.Ty "DATE" []))).isSome
+#guard (lowerT depj Γj (evtT' (.Ty "DATETIME2" ["6"]))).isSome
+#guard (lowerT depj Γj (evtT' (.Ty "DATE" []))).map (·.body) ==
+  some (.seq (.assign statusVar (.lit 0)) (.query ⟨⟨[evtT.toDef],
+    [.sc (.cmp .eq (.col "0.t") (.toTs (.var "@d")))]⟩⟩ (.row false [("@q", .sc (.col "0.n"))])))
 /- A step through string equality: under the binary-collation fact a
 `Name = @n` is `streq` in the core (T-SQL `rtrim` on both sides), never
 `i.k = e`, and `Name` is no key either. -/

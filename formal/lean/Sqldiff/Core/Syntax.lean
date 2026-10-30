@@ -730,9 +730,13 @@ def SExpr.cols : SExpr → List Col
 /-- The equalities a condition states between a column and an
 expression: `n = e` and `e = n` with the core's `=` (`COp.eq`), which is
 TRUE only for two values of one kind that are equal (`cmpVal`). String
-equality (`streq`, under the T-SQL padding `rtrim`), a date against a
-timestamp (`toTs`), `IS NULL` and every C1 operator are no such
-equality. -/
+equality (`streq`, under the T-SQL padding `rtrim`), `IS NULL` and every
+C1 operator are no such equality. A date compared with a timestamp is
+`toTs` of the date against the timestamp (C2c): when the column is the
+timestamp, `n = toTs e` fixes it (both engines widen the date to
+midnight, exactly); when the column is the date, the column is the side
+wrapped in `toTs`, which is no `n`, so it is no step (several timestamps
+of one day could not fix it anyway). -/
 def eqFixes : Expr → List (Col × SExpr)
   | .sc (.cmp .eq a b) =>
     (match a with | .col n => [(n, b)] | _ => []) ++ (match b with | .col n => [(n, a)] | _ => [])

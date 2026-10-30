@@ -2585,9 +2585,13 @@ eval/queries Q12 (1013, 42712).
   only columns of sources already determined, variables the pick does
   not assign (no condition reads a target) and constants; every source
   must be determined. String equality (`streq`, under T-SQL's padding),
-  a date against a timestamp (`toTs`), `IS NULL`, a key of a `UNIQUE`
-  index (not in the catalog) and nullable columns are never steps; a key
-  column is `NOT NULL`. T-SQL compares an `int` key with a `bigint`
+  `IS NULL`, a key of a `UNIQUE` index (not in the catalog) and nullable
+  columns are never steps; a key column is `NOT NULL`. A date compared
+  with a timestamp is `toTs` of the date (C2c): a timestamp key column
+  equated with a date is a step (`k = toTs e`; both engines widen the
+  date to midnight, exactly; checked by the review of C3d on both
+  engines), a date key column equated with a timestamp is not (the
+  column is the side wrapped in `toTs`). T-SQL compares an `int` key with a `bigint`
   value by widening the `int` and PostgreSQL by its cross-type `=`
   operator, both exact, as the core's integers are (C2c; the C3b rule
   already took a `bigint` variable against an `int` key). Probed,

@@ -471,7 +471,7 @@ C3b statement shapes over a block, in procedures only:
 | Reference names | the alias, else the table's last name part; an aliased table's own name is no qualifier (4104, 42P01); ASCII and distinct, T-SQL up to case (1013), PostgreSQL folded (42712); aliases that swap two tables' names resolve to the aliased tables | Q12 |
 | Qualified `q.c` | the one source named `q`: T-SQL spelt exactly (a qualifier or a column in another case does not resolve in a case-sensitive database: 4104, 207), PostgreSQL folded; a PostgreSQL qualifier is never a variable, the `FOR` record or the routine's name (a record as qualifier 42702, the loop's own record 55000, the routine's name with a parameter of the column's name 42702) | Q12 |
 | Unqualified `c` | the one source that has the column (two: 209 against 42702; T-SQL counts them up to case); in PostgreSQL never also a variable (C3a's rule over every source: 42702) or a reference name | Q12 |
-| `SELECT @x = ...` and its `FOR` block | only on a block the **key closure** determines (`Core.Block.atMostOne`): each primary-key column of each table equated (`=` of one kind, `Core.eqFixes`) with an expression over tables already determined, variables the pick does not assign and constants; string equality, a date against a timestamp, `IS NULL`, `UNIQUE` indexes and nullable columns are never steps. `Core.kept_length_le_one` proves at most one tuple on a database whose keys are distinct | Q11 (by key across a join, no row on a NULL join key, a self-join, a two-column key fixed from another table) |
+| `SELECT @x = ...` and its `FOR` block | only on a block the **key closure** determines (`Core.Block.atMostOne`): each primary-key column of each table equated (`=` of one kind, `Core.eqFixes`) with an expression over tables already determined, variables the pick does not assign and constants; string equality, `IS NULL`, `UNIQUE` indexes and nullable columns are never steps, nor is a date key column against a timestamp (the column is the side wrapped in `toTs`), while a timestamp key column against a date is (`k = toTs e`: both engines widen the date to midnight). `Core.kept_length_le_one` proves at most one tuple on a database whose keys are distinct | Q11 (by key across a join, no row on a NULL join key, a self-join, a two-column key fixed from another table) |
 | Scalar subquery | over any block: NULL on no row, the value on one, on more than one the new error kind `cardinality` (T-SQL 512, PostgreSQL 21000) with the variable kept; it counts as able to fail unless the block is closed (`Core.Stmt.failsHere`), so without `SET XACT_ABORT ON` it is then a `check_sound` answer | Q13 (NULL, 200, 512 against 21000, and the error ending an `XACT_ABORT ON` procedure) |
 | `COUNT(*)`, `EXISTS` | over any block | Q11 |
 
@@ -487,6 +487,22 @@ required column and distinct primary keys (`TableOk`), a block that
 `atMostOne` admits keeps at most one tuple; the lowering builds
 `Pick.row false` only on such a block (`rowPick`). Standard axioms only
 (`Axioms.lean`, which now also fails when it has an error of its own).
+
+**Review of C3d** (three fixes, each with a regression). (1) A table
+named in another case than its DDL (`dbo.ORD` for `dbo.Ord`) was sent
+and confirmed, though a case-sensitive SQL Server database raises 208
+where PostgreSQL folds the name: the certificate now sends a table only
+when it is spelt exactly as declared, whatever collation the deployment
+states (`cert.rs`; this held for C3a and C3b tables too). (2) Under `SET
+XACT_ABORT ON` an error that leaves the routine dooms a caller's open
+T-SQL transaction and loses the caller's own earlier work (`XACT_STATE()`
+-1, `COMMIT` 3930), where a PostgreSQL caller's exception block keeps it;
+probed, eval/queries Q15 (`caller-txn-{mssql,postgres}`: 512 and 8134
+against 21000 and 22012; without a caller transaction both keep the
+row). A routine that can fail (`Core.Routine.mayFail`) now names
+`ASM-NO-CALLER-TXN`, write or no write, whose statement now says so. (3)
+A timestamp key fixed by a date is a step (`k = toTs e`), a date key
+against a timestamp is not (wording only).
 
 **What it rests on**, beyond C3b and C3c: the probes above (SQL Server
 2022, 16.0.4305.5, and PostgreSQL 18.6) and the vendor texts quoted from
@@ -568,7 +584,8 @@ page; **nothing is probed**: `eval/` has no run of any of it):
 **Residuals** added to a C2a answer: `ASM-CATCH-CORE-ERRORS` (the routine
 has a handler: inside a handled block no error is raised that the core
 does not model, or such an error is caught alike), `ASM-NO-CALLER-TXN`
-(an error can reach a handler, or there is transaction control: no
+(an error can reach a handler, or there is transaction control, or
+(checker 0.16.0, review of C3d) an error can leave the routine: no
 transaction is open when the routine is called, `IMPLICIT_TRANSACTIONS
 OFF`, and the PostgreSQL `CALL` is top-level outside a transaction
 block), `ASM-THROW-ERRCODE` (the routine raises its own error: callers do
