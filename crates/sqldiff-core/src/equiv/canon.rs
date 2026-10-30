@@ -171,6 +171,14 @@ pub mod asm {
         "ASM-OUTPUT-ROW-ORDER",
         "The rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order",
     );
+    pub const RESULT_SET_FUNCTION: (&str, &str) = (
+        "ASM-RESULT-SET-FUNCTION",
+        "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)",
+    );
+    pub const OUTPUT_TARGET_TRIGGERS: (&str, &str) = (
+        "ASM-OUTPUT-TARGET-TRIGGERS",
+        "The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows",
+    );
     pub const RETURN_NULL_WARNING: (&str, &str) = (
         "ASM-TSQL-RETURN-NULL-WARNING",
         "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)",
@@ -320,6 +328,8 @@ pub struct Canon<'a> {
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
     /// The rows the statement being lowered returns (see `output_stmt`).
     output: Option<Output>,
+    /// The statement's rows reach the caller (`result_stmt`).
+    rows: bool,
     /// The column types of each cursor's query, by key, from its OPEN
     /// (`cursor_op`); kept across statements.
     cursor_cols: HashMap<String, Vec<Option<Ty>>>,
@@ -582,6 +592,7 @@ impl<'a> Canon<'a> {
             other: None,
             names: Vec::new(),
             output: None,
+            rows: false,
         }
     }
 
@@ -594,6 +605,7 @@ impl<'a> Canon<'a> {
         self.excluded = None;
         self.names.clear();
         self.output = None;
+        self.rows = false;
     }
 
     /// SQL Server cannot compare geography, text, ntext, image or xml values
@@ -905,7 +917,14 @@ impl<'a> Canon<'a> {
                     continue;
                 }
                 if let Some(d) = &b.derived {
-                    return match d.iter().find(|(x, _, _)| x == col) {
+                    // A row image's columns are the catalog's (lower case):
+                    // a quoted name is checked like a table's column, by
+                    // the folding pass of `stmt`.
+                    let image = b.key == NEW_IMAGE || b.key == OLD_IMAGE;
+                    let folded = col.strip_prefix('"').map(str::to_lowercase);
+                    return match d.iter().find(|(x, _, _)| {
+                        x == col || image && folded.as_deref() == Some(x.as_str())
+                    }) {
                         Some((_, t, ty)) => Ok((t.clone(), *ty)),
                         None => Err(format!("{qual}.{col} is not a column of the source")),
                     };
@@ -4136,6 +4155,80 @@ impl<'a> Canon<'a> {
         t
     }
 
+    /// Lowers a statement whose rows reach the caller (`Unit::results`): a
+    /// T-SQL procedure's SELECT or OUTPUT without INTO, a PL/pgSQL `RETURN
+    /// QUERY`. PostgreSQL requires each column of a RETURN QUERY to have
+    /// exactly the declared type ("structure of query does not match
+    /// function result type"), and does not apply a declared length, scale
+    /// or precision to the rows (both checked on PostgreSQL 18.6): only a
+    /// column that is a CAST to its declared type, as written, is compared.
+    pub fn result_stmt(&mut self, s: &Stmt, o: Option<&Output>) -> R<Term> {
+        // PostgreSQL INSERT keeps its RETURNING list in the statement.
+        if let (
+            Stmt::Insert {
+                returning,
+                returning_into,
+                ..
+            },
+            None,
+        ) = (s, o)
+        {
+            if !returning.is_empty() && returning_into.is_empty() {
+                let o = Output {
+                    items: returning.clone(),
+                    into: None,
+                };
+                let mut s = s.clone();
+                if let Stmt::Insert { returning, .. } = &mut s {
+                    returning.clear();
+                }
+                return self.result_stmt(&s, Some(&o));
+            }
+        }
+        if self.d == Dialect::Postgres {
+            let items: Vec<&Expr> = match (s, o) {
+                (_, Some(o)) => o.items.iter().map(|i| &i.expr).collect(),
+                (Stmt::Select(q), None) => q.items.iter().map(|i| &i.expr).collect(),
+                _ => return Err("RETURN QUERY of this statement is not compared".into()),
+            };
+            self.declared_casts(&items)?;
+        }
+        self.rows = true;
+        let t = match o {
+            Some(o) => self.output_stmt(s, o),
+            None => self.stmt(s),
+        };
+        self.rows = false;
+        t
+    }
+
+    /// Checks that the columns of a RETURN QUERY are CASTs to the function's
+    /// declared result types, one for one.
+    fn declared_casts(&self, items: &[&Expr]) -> R<()> {
+        let u = self.unit;
+        if u.kind != UnitKind::TableFn || u.sql_body || u.ret_types.is_empty() {
+            return Err("RETURN QUERY outside a PL/pgSQL function RETURNS TABLE".into());
+        }
+        if items.len() != u.ret_types.len() {
+            return Err(
+                "RETURN QUERY returns a different number of columns than RETURNS TABLE declares"
+                    .into(),
+            );
+        }
+        for (i, (e, decl)) in items.iter().zip(&u.ret_types).enumerate() {
+            match (e, decl) {
+                (Expr::Cast(_, ty), Some(d)) if ty == d => {}
+                _ => {
+                    return Err(format!(
+                        "RETURN QUERY column {} is not a CAST to its declared type: PostgreSQL requires exactly that type, and only such a column is compared",
+                        i + 1
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `(output-into DML TABLE (set (kv COL VALUE)...))`: the data change
     /// `DML` and the rows it writes to `TABLE`, one per changed row, with
     /// VALUE read from the row before (`old`) or after (`new`) the change.
@@ -4168,16 +4261,21 @@ impl<'a> Canon<'a> {
             } if from.is_empty() => ("delete", target, alias.as_ref()),
             _ => return Err("OUTPUT or RETURNING of this statement is not compared".into()),
         };
-        let Some((into, cols)) = &o.into else {
-            return Err(
-                "rows returned to the caller by OUTPUT or RETURNING are not compared".into(),
-            );
-        };
-        if cols.is_empty() {
-            return Err("OUTPUT … INTO without a column list".into());
-        }
-        if cols.len() != o.items.len() {
-            return Err("OUTPUT … INTO column count does not match its items".into());
+        let rows = std::mem::take(&mut self.rows);
+        match &o.into {
+            None if !rows => {
+                return Err(
+                    "rows returned to the caller by OUTPUT or RETURNING are not compared".into(),
+                )
+            }
+            None => {}
+            Some((_, cols)) if cols.is_empty() => {
+                return Err("OUTPUT … INTO without a column list".into());
+            }
+            Some((_, cols)) if cols.len() != o.items.len() => {
+                return Err("OUTPUT … INTO column count does not match its items".into());
+            }
+            Some(_) => {}
         }
         let dml = self.stmt_unfolded(s)?;
         let table = self.table_key(target);
@@ -4234,6 +4332,30 @@ impl<'a> Canon<'a> {
         if vals.iter().any(|(v, _)| has_head(v, "col")) {
             return Err("OUTPUT or RETURNING reads a column outside the changed row".into());
         }
+        let Some((into, cols)) = &o.into else {
+            // `(output-rows DML (items (item VALUE NAME)...))`: the rows the
+            // caller receives, named as the client sees them.
+            let mut named = Vec::new();
+            for (i, ((v, _), it)) in vals.into_iter().zip(&o.items).enumerate() {
+                let name = match (self.d, &it.alias, &it.expr) {
+                    (Dialect::Postgres, _, _) => {
+                        let (x, _) = &self.unit.ret_cols[i];
+                        colname(self.d, "decl", &returned_name(self.d, x))
+                    }
+                    (_, Some(x), _) => colname(self.d, "alias", &returned_name(self.d, x)),
+                    (_, None, Expr::Name(p)) => match p.last() {
+                        Some(x) => colname(self.d, "col", &returned_name(self.d, x)),
+                        None => colname(self.d, "expr", ""),
+                    },
+                    _ => colname(self.d, "expr", ""),
+                };
+                named.push(n("item", vec![v, name]));
+            }
+            if self.d == Dialect::Tsql {
+                self.assume(asm::OUTPUT_TARGET_TRIGGERS);
+            }
+            return Ok(n("output-rows", vec![dml, n("items", named)]));
+        };
         let out = self.table_key(into);
         let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
         let mut kv = Vec::new();
@@ -4685,7 +4807,7 @@ impl<'a> Canon<'a> {
                 Dialect::Postgres,
                 UnitKind::ScalarFn | UnitKind::TableFn | UnitKind::Proc | UnitKind::Trigger,
                 false,
-            ) => Err("SELECT without INTO in PL/pgSQL".into()),
+            ) if !self.rows => Err("SELECT without INTO in PL/pgSQL".into()),
             _ => self.resultset(sel),
         }
     }
