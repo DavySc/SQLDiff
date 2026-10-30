@@ -18,10 +18,11 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
 | `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
 | `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C3a data statements, the C3b queries and the C3c tables (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
-| `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer |
+| `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer; (0.13.0) `why`, the reason codes of the routine the check refuses |
+| `Sqldiff/Mirror/Diagnose.lean` | (0.13.0) Untrusted refusal diagnostics: `whyT` and `whyP` name the constructs `lowerT`/`lowerP` refuse, as the codes of "Refusal diagnostics" below, using the lowering functions as oracles node by node; no theorem depends on it |
 | `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs), as `#guard`s checked on every build |
-| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
+| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.13.0 |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
 | `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
@@ -451,3 +452,103 @@ transactions, `XACT_STATE()`/`@@TRANCOUNT` reads, calls in handled
 blocks, condition-specific handlers, error messages and numbers, the
 state after an error that leaves the routine, and explicit transactions
 opened by the caller.
+
+### Refusal diagnostics (checker 0.13.0)
+
+`lowerT` and `lowerP` are partial and say only "outside the spec". So
+that a corpus can be read for what keeps it out, an unconfirmed `/3`
+answer whose reason is "the T-SQL routine is outside the C1 spec" or
+"the PL/pgSQL routine is outside the C1 spec" carries one more field
+after `reason`, `"why":["code", ...]` (`Sqldiff.Mirror.why` in
+`Check.lean`, `Sqldiff/Mirror/Diagnose.lean`): the constructs the
+lowering refused in that routine (the T-SQL one when both are refused),
+as codes `family:detail`, ASCII and lower-case over `[a-z0-9:_/.-]`,
+distinct, in the order the constructs stand, at most 24, never empty. A
+user or type name in a detail is sanitised to that set (`sanitise`:
+`tyName`'s `decimal(18,2)` is `decimal_18_2`, `nvarchar(max)` is
+`nvarchar_max`, `@@ROWCOUNT` is `rowcount`); `<type>` is the declared
+type as `tyName` spells it, or `untyped`. No other answer carries the
+field; every reason text, every other field and the request format are
+unchanged.
+
+**Untrusted.** The diagnostic is computed after the answer is decided,
+only when a lowering has refused, by asking the lowering functions
+themselves node by node (`lowerParam`, `txnBracket`, `storesStmt`,
+`lowerNode`, `lowerStmt`, `lowerExpr`, `typed`, ...) and classifying each
+refused node by its abstract-syntax shape; it recurses into the children
+the lowering refuses, so a failing inner node is named and its parent
+only when every child lowers. It changes no answer, `check` is untouched,
+no theorem mentions it, and `Axioms.lean` is unchanged. Where no code of
+the table fits, the lower-cased constructor name is the detail
+(`stmt:sselect`, `node:if`, `expr:cast`) so that nothing is silent, and a
+routine refused without any stage naming a reason gets
+`routine:unclassified`.
+
+| Code | Meaning |
+|---|---|
+| `routine:function` | A procedure-only shape in a function: a query (`SELECT @x = ...`, `IF EXISTS`, a scalar subquery, the `FOR` block) |
+| `routine:block-decls` | The T-SQL body block has a `DECLARE` section (the parser never writes one) |
+| `routine:scope:undeclared` | A variable read or written that is neither a parameter nor a declared local (`wellScoped`) |
+| `routine:scope:duplicate` | A name declared twice, or a local with a parameter's name, or the `FOR` block's record named like a variable |
+| `routine:names:case` | Two T-SQL names equal up to ASCII case (`@a`, `@A`: one variable or two depends on the collation) |
+| `routine:names:non-ascii` | A variable name with a character outside ASCII |
+| `routine:param:<type>` | A parameter of a type no value of the slice fits, with a default (`routine:param:decimal_18_2`) |
+| `routine:param:default` | A parameter default that is not NULL or a slice value fitting the declared type, or that reads a variable |
+| `routine:unclassified` | The lowering refused the routine and no stage named a reason (should not happen; it keeps the field non-empty) |
+| `stmt:select:result-set` | A `SELECT` that assigns no variable (T-SQL: no `@x =`; PL/pgSQL: no `INTO`): a result set |
+| `stmt:select:from:join`, `:multi`, `:sub`, `:values`, `:func`, `:hints`, `:alias`, `:data-change`, `:none` | The `FROM`: a join, several sources, a derived table, `VALUES`, a table function, table hints, a table alias, a DML source, no `FROM` |
+| `stmt:select:cte`, `:setop`, `:distinct`, `:top`, `:group`, `:having`, `:order`, `:offset`, `:locking`, `:for-json` | A `WITH`, a set operation, `DISTINCT`, `TOP`, `GROUP BY`, `HAVING`, `ORDER BY`, `OFFSET`/`LIMIT`, a locking clause, `FOR JSON` |
+| `stmt:select:into` | An `INTO` the rules refuse: T-SQL `SELECT ... INTO`, PL/pgSQL `SELECT col INTO x` (NULL on no row, probed Q10), `INTO STRICT`, several targets |
+| `stmt:select:agg:<fn>` | An aggregate in a select list outside the C3b `COUNT(*)` shape (`stmt:select:agg:sum`; `:count` for a `COUNT(*)` beside other items) |
+| `stmt:select:value` | A picked value that reads a variable (`SELECT @x = @x + c`, a running total), can raise, or is a condition |
+| `stmt:select:item`, `stmt:select:items` | A select item with both an alias and an assignment, or an unaliased item in a `FOR` block; a select list of the wrong length for the shape |
+| `stmt:select:where:not-key` | The `WHERE` does not fix every primary-key column with `=` (which row T-SQL keeps is unspecified) |
+| `stmt:select:table:unknown` | The table is not in the deployment's table map or the target catalog |
+| `stmt:select:table:not-plain` | The table is in the catalog but not usable (`CatTable.wellFormed`: a string key, a default that does not fit, ...) |
+| `stmt:select:target:<type>` | A pick into a variable whose declared type does not take the value (`stmt:select:target:varchar_10` for an `int` column) |
+| `stmt:insert:select`, `:default`, `:returning`, `:conflict` | `INSERT ... SELECT`, `DEFAULT VALUES`, `RETURNING`/`OUTPUT` (where the parser keeps it), `ON CONFLICT` |
+| `stmt:insert:cols` | No column list, an unknown or repeated column, no row, or a row of the wrong length |
+| `stmt:insert:table:unknown`, `:not-plain` | As for `SELECT` |
+| `stmt:insert:value` | A value the slice cannot type for the column, or that may not fit it (a string into `int`, 21 characters into `varchar(20)`) |
+| `stmt:update:from`, `:alias`, `:key`, `:multi-set`, `:cols`, `:value`, `:table:unknown`, `:table:not-plain` | `UPDATE ... FROM`, a table alias, a key column set, `SET (a, b) = ...`, no or an unknown column, a value as for `INSERT`, the table as for `SELECT` |
+| `stmt:delete:from`, `:alias`, `:table:unknown`, `:table:not-plain` | A second `FROM`/`USING`, a table alias, the table as for `SELECT` |
+| `stmt:merge` | `MERGE` |
+| `stmt:message` | `PRINT`/`RAISE NOTICE`-like messages |
+| `stmt:declare:pg` | A `DECLARE` in a PL/pgSQL body (declarations belong to the `DECLARE` section) |
+| `stmt:assign:target` | An assignment or `OUTPUT` target that is no variable (`@@x`, a qualified name) |
+| `stmt:return:pg-proc` | `RETURN e` in a PL/pgSQL procedure |
+| `stmt:dml:function` | A data statement in a function |
+| `stmt:dml:rowcounts` | A T-SQL data statement while the deployment observes row counts |
+| `stmt:<ctor>` | Another refused statement, by its constructor (`stmt:sselect`, `stmt:assign`, ...) |
+| `node:for-query` | A `FOR` loop over a query outside the converter's block, or that block with another shape (record, aliases, body) |
+| `node:block-decls` | A nested block with declarations (other than the converter's `FOR` block) |
+| `node:call:handled`, `:args`, `:ret`, `:name` | A call inside a handled body; a named argument, too many arguments, or one that does not lower; `EXEC @rc = p`; a callee the deployment or the catalog does not name |
+| `node:setting:<name>` | A `SET` the rules do not know, or off (`node:setting:ansi_nulls`, `:xact_abort` for `OFF`, `:nocount` while row counts are observed) |
+| `node:try:handlers` | A `TRY` with handlers other than one `CATCH` / one `WHEN OTHERS` |
+| `node:try:function` | `TRY`/`CATCH` in a T-SQL function |
+| `node:try:idiom` | The rollback-and-rethrow idiom where it may not stand (inside `IF`, `WHILE`, a block or another handler); its body is diagnosed where it stands |
+| `node:throw:args`, `:function`, `:place` | `THROW n, m, s` outside the literal forms; `THROW` in a function; a bare `THROW;` or `RAISE;` outside a handler |
+| `node:raise:level`, `:format`, `:opts` | `RAISE` with a level other than `EXCEPTION`; a format with `%`, arguments, or nothing to say; options other than `MESSAGE` and `ERRCODE = 'P0001'` |
+| `node:txn:no-xact-abort` | A transaction statement in a T-SQL routine that does not start with `SET XACT_ABORT ON` |
+| `node:txn:bracket` | `BEGIN TRAN`/`COMMIT` that do not form a bracket: one left open, or a `RETURN`, call, `TRY` or transaction statement between them |
+| `node:txn:nested` | A `BEGIN TRAN` inside an open one |
+| `node:txn:<op>` | A transaction statement the rules refuse by its op or place: `node:txn:begin`/`:commit` outside a bracket (or, PL/pgSQL, where `COMMIT` may not stand: a function, `SECURITY DEFINER`, a handled block), `:rollback` outside the idiom, `:save`, `:named` for a named transaction |
+| `node:txn:function` | A transaction statement in a function |
+| `node:<ctor>` | Another refused node, by its constructor (`node:if`, `node:nblock`, `node:raise` for a `RAISE` in T-SQL, ...) |
+| `expr:subquery`, `expr:exists`, `expr:in-query` | A subquery, `EXISTS` or `IN (SELECT ...)` inside an expression (not one of the whole-statement C3b shapes) |
+| `expr:star` | `*` as an expression |
+| `expr:name:qualified` | A two-part name (`t.c`) |
+| `expr:name:unresolved` | A bare name that is no column of the statement's table (T-SQL), or a PL/pgSQL name that is both a column of the target and a variable, or the table's own name (an undeclared PL/pgSQL name is `routine:scope:undeclared`) |
+| `expr:var:global:<name>` | A T-SQL `@@x` read (`expr:var:global:rowcount`, `:trancount`, `:error`) |
+| `expr:pg-var` | A `@x` variable in PL/pgSQL |
+| `expr:fn:error:<name>` | An error function (`error_number`, `error_message`, ..., `xact_state`) or PL/pgSQL `sqlstate`/`sqlerrm` |
+| `expr:fn:distinct`, `:order`, `:over`, `:star`, `:within-group` | A call with `DISTINCT`, `ORDER BY`, `OVER`, `*`, `WITHIN GROUP` |
+| `expr:fn:<name>` | A function outside the slice where the rules need a slice value (`expr:fn:upper`, `expr:fn:isnull` over strings that may truncate) |
+| `expr:<ctor>` | Another expression outside the slice where one is needed, by its constructor (`expr:cast`, `expr:bin`, `expr:name` for a variable of another type, ...) |
+| `store:assign:<type>`, `store:declare:<type>`, `store:return:<type>` | A store that could change its value ("String stores, on every path"): `SET`/`:=`, a `DECLARE` default, a function's `RETURN`, with the target's declared type (`store:assign:varchar_20`, `store:declare:untyped`); the value's form follows when it is outside the slice |
+| `store:call` | An `OUTPUT`/`OUT`/`INOUT` copy-back into a variable that cannot take every value |
+| `store:pick:<type>`, `store:for:<type>` | A C3b pick (`SELECT @x = col`, a scalar subquery, `SELECT ... INTO`) or a `FOR` block assignment into a variable the value may not fit |
+
+`test_gate.py` asserts the field on every outside-spec request and its
+absence on every other answer; `ExamplesDiag.lean` has one or more
+`#guard`s per family.
