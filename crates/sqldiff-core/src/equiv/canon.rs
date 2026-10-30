@@ -171,6 +171,14 @@ pub mod asm {
         "ASM-OUTPUT-ROW-ORDER",
         "The rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order",
     );
+    pub const RESULT_SET_FUNCTION: (&str, &str) = (
+        "ASM-RESULT-SET-FUNCTION",
+        "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)",
+    );
+    pub const OUTPUT_TARGET_TRIGGERS: (&str, &str) = (
+        "ASM-OUTPUT-TARGET-TRIGGERS",
+        "The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows",
+    );
     pub const RETURN_NULL_WARNING: (&str, &str) = (
         "ASM-TSQL-RETURN-NULL-WARNING",
         "Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides)",
@@ -331,6 +339,8 @@ pub struct Canon<'a> {
     sub_bits: HashMap<String, Vec<(String, Ty)>>,
     /// The rows the statement being lowered returns (see `output_stmt`).
     output: Option<Output>,
+    /// The statement's rows reach the caller (`result_stmt`).
+    rows: bool,
     /// The column types of each cursor's query, by key, from its OPEN
     /// (`cursor_op`); kept across statements.
     cursor_cols: HashMap<String, Vec<Option<Ty>>>,
@@ -593,6 +603,7 @@ impl<'a> Canon<'a> {
             other: None,
             names: Vec::new(),
             output: None,
+            rows: false,
         }
     }
 
@@ -605,10 +616,12 @@ impl<'a> Canon<'a> {
         self.excluded = None;
         self.names.clear();
         self.output = None;
+        self.rows = false;
     }
 
-    /// SQL Server cannot compare geography values (GROUP BY, DISTINCT, IN,
-    /// set operations, = all fail); PostGIS compares their bounding boxes.
+    /// SQL Server cannot compare geography, text, ntext, image or xml values
+    /// (GROUP BY, DISTINCT, IN, set operations, = all fail); PostGIS
+    /// compares geography bounding boxes, PostgreSQL has no xml equality.
     /// The marker keeps such a comparison apart from the other dialect's;
     /// no assumption discharges it.
     fn geog_cmp(&self) -> Term {
@@ -915,7 +928,14 @@ impl<'a> Canon<'a> {
                     continue;
                 }
                 if let Some(d) = &b.derived {
-                    return match d.iter().find(|(x, _, _)| x == col) {
+                    // A row image's columns are the catalog's (lower case):
+                    // a quoted name is checked like a table's column, by
+                    // the folding pass of `stmt`.
+                    let image = b.key == NEW_IMAGE || b.key == OLD_IMAGE;
+                    let folded = col.strip_prefix('"').map(str::to_lowercase);
+                    return match d.iter().find(|(x, _, _)| {
+                        x == col || image && folded.as_deref() == Some(x.as_str())
+                    }) {
                         Some((_, t, ty)) => Ok((t.clone(), *ty)),
                         None => Err(format!("{qual}.{col} is not a column of the source")),
                     };
@@ -992,7 +1012,13 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
-            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid | Fam::Geography => true,
+            Fam::Date
+            | Fam::Interval
+            | Fam::Bool
+            | Fam::Uuid
+            | Fam::Geography
+            | Fam::Text
+            | Fam::NoCompare => true,
         }
     }
 
@@ -1277,6 +1303,24 @@ impl<'a> Canon<'a> {
                 None,
             ),
             Expr::Call(c) => self.call(c)?,
+            // The converter's CHARINDEX of a needle that may be empty:
+            // strpos(s, x) - (length(x) = 0)::int, which is 0 for an empty
+            // needle and NULL for a NULL argument, as CHARINDEX is.
+            Expr::Bin(op, l, r)
+                if self.d == Dialect::Postgres && op == "-" && charindex_sub(l, r).is_some() =>
+            {
+                let (hay, needle) = charindex_sub(l, r).unwrap();
+                let (h, hty) = self.expr(hay)?;
+                let (x, xty) = self.expr(needle)?;
+                if [hty, xty]
+                    .iter()
+                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
+                {
+                    let ci = self.collation_marker();
+                    return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
+                }
+                (n("dfn", vec![self.dtag(), a("charindex-sub"), h, x]), None)
+            }
             Expr::Bin(op, l, r) => self.binary(op, l, r)?,
             Expr::Unary(op, x) => {
                 let (t, ty) = self.expr(x)?;
@@ -1324,10 +1368,10 @@ impl<'a> Canon<'a> {
                     items = items.into_iter().map(Self::bit_value).collect();
                 }
                 items.sort();
-                let geog = ty.is_some_and(|t| t.fam == Fam::Geography)
+                let geog = ty.is_some_and(|t| t.compares_per_dialect())
                     || item_tys
                         .iter()
-                        .any(|t| t.is_some_and(|t| t.fam == Fam::Geography));
+                        .any(|t| t.is_some_and(|t| t.compares_per_dialect()));
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
                 if geog {
                     kids.push(self.geog_cmp());
@@ -1354,10 +1398,10 @@ impl<'a> Canon<'a> {
                 let mut kids = vec![t, q.0, a(neg.to_string())];
                 // The subquery's column type is not tracked, so only a known
                 // non-string operand avoids the collation.
-                if ty.map_or(true, |t| t.is_string()) {
-                    kids.push(self.dtag());
-                } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                if ty.is_some_and(|t| t.compares_per_dialect()) {
                     kids.push(self.geog_cmp());
+                } else if ty.map_or(true, |t| t.is_string()) {
+                    kids.push(self.dtag());
                 }
                 (n("inq", kids), None)
             }
@@ -1532,32 +1576,15 @@ impl<'a> Canon<'a> {
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
-            // The converter's CHARINDEX of a needle that may be empty:
-            // CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END.
-            Expr::Case(None, whens, Some(els))
-                if self.d == Dialect::Postgres && charindex_case(whens, els).is_some() =>
-            {
-                let (hay, needle) = charindex_case(whens, els).unwrap();
-                let (h, hty) = self.expr(hay)?;
-                let (x, xty) = self.expr(needle)?;
-                if [hty, xty]
-                    .iter()
-                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
-                {
-                    let ci = self.collation_marker();
-                    return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
-                }
-                (n("dfn", vec![self.dtag(), a("charindex-case"), h, x]), None)
-            }
             Expr::Case(op, whens, els) => {
                 let mut kids = Vec::new();
                 match op {
                     Some(o) => {
                         let (t, ty) = self.expr(o)?;
-                        if ty.map_or(true, |t| t.is_string()) {
-                            kids.push(self.dtag());
-                        } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                        if ty.is_some_and(|t| t.compares_per_dialect()) {
                             kids.push(self.geog_cmp());
+                        } else if ty.map_or(true, |t| t.is_string()) {
+                            kids.push(self.dtag());
                         }
                         kids.push(t);
                     }
@@ -1967,7 +1994,7 @@ impl<'a> Canon<'a> {
             // numeric half away from zero and float half to even.
             (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
             (Float, Float) => Rule::Same,
-            (Uuid, Uuid) | (Geography, Geography) => Rule::Same,
+            (Uuid, Uuid) | (Geography, Geography) | (NoCompare, NoCompare) => Rule::Same,
             // Explicit casts truncate silently on both sides, and storing too
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
@@ -1975,7 +2002,7 @@ impl<'a> Canon<'a> {
             // PostgreSQL drops a CHAR value's trailing blanks when it becomes
             // varchar or text; SQL Server keeps them.
             (Char, VarChar) if self.d == Dialect::Postgres => Rule::Dialect,
-            (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
+            (Char | VarChar | Text, Char | VarChar | Text) if how != How::Var => Rule::Same,
             (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
             // Fewer fractional digits round differently: PostgreSQL rounds a
             // half away from 2000-01-01 and to 24:00:00.
@@ -2156,7 +2183,7 @@ impl<'a> Canon<'a> {
                     if c.distinct {
                         if tys
                             .iter()
-                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                            .any(|t| t.is_some_and(|t| t.compares_per_dialect()))
                         {
                             kids.push(self.geog_cmp());
                         } else if tys.iter().any(|t| t.is_some_and(|t| t.is_string())) {
@@ -2172,9 +2199,13 @@ impl<'a> Canon<'a> {
             | (Dialect::Db2i, "listagg")
                 if argc == 2 && !c.distinct =>
             {
-                let (x, _) = self.expr(&c.args[0])?;
+                let (x, xty) = self.expr(&c.args[0])?;
                 let (sep, _) = self.expr(&c.args[1])?;
                 let order = self.order_terms(&c.order, None)?;
+                // SQL Server refuses text and ntext here (Msg 8116).
+                if d == Dialect::Tsql && xty.is_some_and(|t| t.fam == Fam::Text) {
+                    return Ok((n("dfn", vec![self.dtag(), a("string_agg"), x, sep]), None));
+                }
                 match d {
                     Dialect::Tsql => self.assume(asm::STRING_AGG_8000),
                     Dialect::Db2i => self.assume(asm::LISTAGG_LEN),
@@ -2312,6 +2343,27 @@ impl<'a> Canon<'a> {
         for x in &c.args {
             args.push(self.expr(x)?);
         }
+        // SQL Server refuses text and ntext in most built-ins (Msg 8116,
+        // NULLIF Msg 402); these take them.
+        if d == Dialect::Tsql
+            && args.iter().any(|x| x.1.is_some_and(|t| t.fam == Fam::Text))
+            && !matches!(
+                name.as_str(),
+                "substring"
+                    | "patindex"
+                    | "datalength"
+                    | "isnull"
+                    | "coalesce"
+                    | "charindex"
+                    | "textptr"
+            )
+        {
+            let kids = [self.dtag(), a(&name)]
+                .into_iter()
+                .chain(args.into_iter().map(|x| x.0))
+                .collect();
+            return Ok((n("dfn", kids), None));
+        }
         let first_ty = args.first().and_then(|x| x.1);
         let portable = |h: &str, args: Vec<(Term, Option<Ty>)>, ty| {
             (
@@ -2395,11 +2447,12 @@ impl<'a> Canon<'a> {
                     first_ty.map(|t| Ty { len: None, ..t }),
                 )
             }
-            // CHARINDEX(needle, s): 0 for an empty needle. PostgreSQL's
-            // strpos(s, needle) agrees once the needle cannot be empty, or
-            // inside the converter's `CASE WHEN length(x) = 0 THEN 0 ELSE
-            // strpos(s, x) END` (lowered in `expr`). Collation as for REPLACE;
-            // positions under ASM-TSQL-LEN-BMP.
+            // CHARINDEX(needle, s): 0 for an empty needle, NULL for a NULL
+            // argument (CHARINDEX('', 'abc') = 0, CHARINDEX('', NULL) IS
+            // NULL on SQL Server 2022). PostgreSQL's strpos(s, needle) agrees
+            // once the needle cannot be empty, or inside the converter's
+            // `strpos(s, x) - (length(x) = 0)::int` (lowered in `expr`).
+            // Collation as for REPLACE; positions under ASM-TSQL-LEN-BMP.
             (Dialect::Tsql, "charindex", 2)
                 if args
                     .iter()
@@ -3002,6 +3055,18 @@ impl<'a> Canon<'a> {
             |f: &dyn Fn(&Ty) -> bool| lty.as_ref().is_some_and(f) || rty.as_ref().is_some_and(f);
         match op {
             "=" | "<>" | "<" | ">" | "<=" | ">=" => {
+                // SQL Server orders uniqueidentifier by its byte groups, last
+                // group first; PostgreSQL orders uuid byte by byte. SQL Server
+                // cannot compare geography, text, ntext, image or xml at all.
+                if any(&|t| t.compares_per_dialect())
+                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
+                {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
                 let string = any(&|t| t.is_string());
                 let known = lty.is_some() || rty.is_some();
                 if string && any(&|t| !t.is_string()) {
@@ -3016,18 +3081,6 @@ impl<'a> Canon<'a> {
                 if string {
                     return Ok((
                         self.strcmp(op, (lt, lty), (rt, rty)),
-                        Some(Ty::of(Fam::Bool)),
-                    ));
-                }
-                // SQL Server orders uniqueidentifier by its byte groups, last
-                // group first; PostgreSQL orders uuid byte by byte. SQL Server
-                // has no comparison of geography at all.
-                if any(&|t| t.fam == Fam::Geography)
-                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
-                {
-                    let (x, y, op) = order_operands(op, lt, rt);
-                    return Ok((
-                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
@@ -3084,7 +3137,8 @@ impl<'a> Canon<'a> {
                 Ok(self.concat_bin(lt, lty, rt, rty))
             }
             "+" if self.d == Dialect::Tsql && (any(&|t| t.is_string()) || l_or_r_is_str(l, r)) => {
-                if any(&|t| t.is_numeric() || t.is_temporal()) {
+                // SQL Server refuses `+` on text and ntext (Msg 402).
+                if any(&|t| t.is_numeric() || t.is_temporal() || t.fam == Fam::Text) {
                     return Ok((n("dfn", vec![a("tsql"), a("+"), lt, rt]), None));
                 }
                 if lty.is_none() || rty.is_none() {
@@ -3772,7 +3826,7 @@ impl<'a> Canon<'a> {
                     if h != "union-all"
                         && col_tys
                             .iter()
-                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                            .any(|t| t.is_some_and(|t| t.compares_per_dialect()))
                     {
                         kids.push(self.geog_cmp());
                     }
@@ -3888,8 +3942,8 @@ impl<'a> Canon<'a> {
         for g in &s.group_by {
             let (t, ty) = self.expr(g)?;
             group.push(match ty {
+                Some(t2) if t2.compares_per_dialect() => n("geog-key", vec![self.geog_cmp(), t]),
                 Some(t2) if t2.is_string() => n("collate", vec![self.dtag(), t]),
-                Some(t2) if t2.fam == Fam::Geography => n("geog-key", vec![self.geog_cmp(), t]),
                 None => {
                     self.assume(asm::UNTYPED);
                     t
@@ -3902,7 +3956,7 @@ impl<'a> Canon<'a> {
             a("all")
         } else if items
             .iter()
-            .any(|x| x.1.is_some_and(|t| t.fam == Fam::Geography))
+            .any(|x| x.1.is_some_and(|t| t.compares_per_dialect()))
         {
             n("distinct-geog", vec![self.geog_cmp()])
         } else if items.iter().any(|x| x.1.is_some_and(|t| t.is_string())) {
@@ -4186,6 +4240,80 @@ impl<'a> Canon<'a> {
         t
     }
 
+    /// Lowers a statement whose rows reach the caller (`Unit::results`): a
+    /// T-SQL procedure's SELECT or OUTPUT without INTO, a PL/pgSQL `RETURN
+    /// QUERY`. PostgreSQL requires each column of a RETURN QUERY to have
+    /// exactly the declared type ("structure of query does not match
+    /// function result type"), and does not apply a declared length, scale
+    /// or precision to the rows (both checked on PostgreSQL 18.6): only a
+    /// column that is a CAST to its declared type, as written, is compared.
+    pub fn result_stmt(&mut self, s: &Stmt, o: Option<&Output>) -> R<Term> {
+        // PostgreSQL INSERT keeps its RETURNING list in the statement.
+        if let (
+            Stmt::Insert {
+                returning,
+                returning_into,
+                ..
+            },
+            None,
+        ) = (s, o)
+        {
+            if !returning.is_empty() && returning_into.is_empty() {
+                let o = Output {
+                    items: returning.clone(),
+                    into: None,
+                };
+                let mut s = s.clone();
+                if let Stmt::Insert { returning, .. } = &mut s {
+                    returning.clear();
+                }
+                return self.result_stmt(&s, Some(&o));
+            }
+        }
+        if self.d == Dialect::Postgres {
+            let items: Vec<&Expr> = match (s, o) {
+                (_, Some(o)) => o.items.iter().map(|i| &i.expr).collect(),
+                (Stmt::Select(q), None) => q.items.iter().map(|i| &i.expr).collect(),
+                _ => return Err("RETURN QUERY of this statement is not compared".into()),
+            };
+            self.declared_casts(&items)?;
+        }
+        self.rows = true;
+        let t = match o {
+            Some(o) => self.output_stmt(s, o),
+            None => self.stmt(s),
+        };
+        self.rows = false;
+        t
+    }
+
+    /// Checks that the columns of a RETURN QUERY are CASTs to the function's
+    /// declared result types, one for one.
+    fn declared_casts(&self, items: &[&Expr]) -> R<()> {
+        let u = self.unit;
+        if u.kind != UnitKind::TableFn || u.sql_body || u.ret_types.is_empty() {
+            return Err("RETURN QUERY outside a PL/pgSQL function RETURNS TABLE".into());
+        }
+        if items.len() != u.ret_types.len() {
+            return Err(
+                "RETURN QUERY returns a different number of columns than RETURNS TABLE declares"
+                    .into(),
+            );
+        }
+        for (i, (e, decl)) in items.iter().zip(&u.ret_types).enumerate() {
+            match (e, decl) {
+                (Expr::Cast(_, ty), Some(d)) if ty == d => {}
+                _ => {
+                    return Err(format!(
+                        "RETURN QUERY column {} is not a CAST to its declared type: PostgreSQL requires exactly that type, and only such a column is compared",
+                        i + 1
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `(output-into DML TABLE (set (kv COL VALUE)...))`: the data change
     /// `DML` and the rows it writes to `TABLE`, one per changed row, with
     /// VALUE read from the row before (`old`) or after (`new`) the change.
@@ -4218,16 +4346,21 @@ impl<'a> Canon<'a> {
             } if from.is_empty() => ("delete", target, alias.as_ref()),
             _ => return Err("OUTPUT or RETURNING of this statement is not compared".into()),
         };
-        let Some((into, cols)) = &o.into else {
-            return Err(
-                "rows returned to the caller by OUTPUT or RETURNING are not compared".into(),
-            );
-        };
-        if cols.is_empty() {
-            return Err("OUTPUT … INTO without a column list".into());
-        }
-        if cols.len() != o.items.len() {
-            return Err("OUTPUT … INTO column count does not match its items".into());
+        let rows = std::mem::take(&mut self.rows);
+        match &o.into {
+            None if !rows => {
+                return Err(
+                    "rows returned to the caller by OUTPUT or RETURNING are not compared".into(),
+                )
+            }
+            None => {}
+            Some((_, cols)) if cols.is_empty() => {
+                return Err("OUTPUT … INTO without a column list".into());
+            }
+            Some((_, cols)) if cols.len() != o.items.len() => {
+                return Err("OUTPUT … INTO column count does not match its items".into());
+            }
+            Some(_) => {}
         }
         let dml = self.stmt_unfolded(s)?;
         let table = self.table_key(target);
@@ -4284,6 +4417,30 @@ impl<'a> Canon<'a> {
         if vals.iter().any(|(v, _)| has_head(v, "col")) {
             return Err("OUTPUT or RETURNING reads a column outside the changed row".into());
         }
+        let Some((into, cols)) = &o.into else {
+            // `(output-rows DML (items (item VALUE NAME)...))`: the rows the
+            // caller receives, named as the client sees them.
+            let mut named = Vec::new();
+            for (i, ((v, _), it)) in vals.into_iter().zip(&o.items).enumerate() {
+                let name = match (self.d, &it.alias, &it.expr) {
+                    (Dialect::Postgres, _, _) => {
+                        let (x, _) = &self.unit.ret_cols[i];
+                        colname(self.d, "decl", &returned_name(self.d, x))
+                    }
+                    (_, Some(x), _) => colname(self.d, "alias", &returned_name(self.d, x)),
+                    (_, None, Expr::Name(p)) => match p.last() {
+                        Some(x) => colname(self.d, "col", &returned_name(self.d, x)),
+                        None => colname(self.d, "expr", ""),
+                    },
+                    _ => colname(self.d, "expr", ""),
+                };
+                named.push(n("item", vec![v, name]));
+            }
+            if self.d == Dialect::Tsql {
+                self.assume(asm::OUTPUT_TARGET_TRIGGERS);
+            }
+            return Ok(n("output-rows", vec![dml, n("items", named)]));
+        };
         let out = self.table_key(into);
         let cols: Vec<String> = cols.iter().map(|c| lc(c)).collect();
         let mut kv = Vec::new();
@@ -4735,7 +4892,7 @@ impl<'a> Canon<'a> {
                 Dialect::Postgres,
                 UnitKind::ScalarFn | UnitKind::TableFn | UnitKind::Proc | UnitKind::Trigger,
                 false,
-            ) => Err("SELECT without INTO in PL/pgSQL".into()),
+            ) if !self.rows => Err("SELECT without INTO in PL/pgSQL".into()),
             _ => self.resultset(sel),
         }
     }
@@ -6192,9 +6349,17 @@ fn literal_chars(t: &Term) -> u32 {
     }
 }
 
-/// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END`: (s, x).
-fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
-    let [(Expr::Bin(op, l, r), Expr::Num(zero))] = whens else {
+/// `strpos(s, x) - (length(x) = 0)::int`: (s, x). Exactly this shape: a
+/// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END` is 0, not NULL,
+/// for an empty needle and a NULL haystack, so it is not CHARINDEX.
+fn charindex_sub<'e>(l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
+    let Expr::Cast(cond, ty) = r else {
+        return None;
+    };
+    if !matches!(ty.name.as_str(), "INT" | "INTEGER" | "INT4") || !ty.args.is_empty() {
+        return None;
+    }
+    let Expr::Bin(op, len, zero) = cond.as_ref() else {
         return None;
     };
     let call = |e: &'e Expr, name: &str, argc: usize| match e {
@@ -6210,9 +6375,9 @@ fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e E
         }
         _ => None,
     };
-    let x = &call(l, "length", 1)?[0];
-    let pos = call(els, "strpos", 2)?;
-    (op == "=" && zero == "0" && matches!(r.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
+    let x = &call(len, "length", 1)?[0];
+    let pos = call(l, "strpos", 2)?;
+    (op == "=" && matches!(zero.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
         .then_some((&pos[0], x))
 }
 

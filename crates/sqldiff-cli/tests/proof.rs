@@ -231,7 +231,7 @@ fn the_real_checker_confirms_a_converted_procedure() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&o.stdout);
     assert!(
-        stdout.contains("certificates: 1 of 2 routines confirmed"),
+        stdout.contains("proof: 1 of 2 routines confirmed"),
         "{stdout}\n{}",
         String::from_utf8_lossy(&o.stderr)
     );
@@ -288,7 +288,7 @@ fn the_real_checker_confirms_a_converted_try_catch() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&o.stdout);
     assert!(
-        stdout.contains("certificates: 1 of 2 routines confirmed"),
+        stdout.contains("proof: 1 of 2 routines confirmed"),
         "{stdout}\n{}",
         String::from_utf8_lossy(&o.stderr)
     );
@@ -349,7 +349,7 @@ fn the_real_checker_and_the_release_gate_name_what_needs_a_review() {
     let stdout = String::from_utf8_lossy(&o.stdout);
     assert_eq!(o.status.code(), Some(1), "{stdout}");
     assert!(
-        stdout.contains("certificates: 1 of 1 routines confirmed"),
+        stdout.contains("proof: 1 of 1 routines confirmed"),
         "{stdout}"
     );
     assert!(
@@ -831,10 +831,7 @@ fn the_real_checker_ties_a_caller_to_its_callee() {
     };
     let good =
         run("CREATE PROCEDURE dbo.q @n int OUTPUT\nAS\nBEGIN\n  SET @n = ISNULL(@n, 0);\nEND\n");
-    assert!(
-        good.contains("certificates: 2 of 2 routines confirmed"),
-        "{good}"
-    );
+    assert!(good.contains("proof: 2 of 2 routines confirmed"), "{good}");
     assert!(!good.contains("ASM-CALLEE-CONFIRMED"), "{good}");
     let bad = run("CREATE PROCEDURE dbo.q @n int OUTPUT\nAS\nBEGIN\n  SAVE TRANSACTION s;\nEND\n");
     assert!(bad.contains("ASM-CALLEE-CONFIRMED:dbo.q"), "{bad}");

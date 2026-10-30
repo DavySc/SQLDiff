@@ -1060,6 +1060,31 @@ pub fn routine_header(node: &SyntaxNode, dialect: Dialect) -> Option<RoutineHead
     Some(h)
 }
 
+/// A PL/pgSQL function's `RETURNS TABLE (…)` columns, with the span of each
+/// name: output parameters, so the body sees them as variables (PostgreSQL
+/// manual, "Declaring Function Parameters"). Empty for any other routine,
+/// including a `LANGUAGE sql` one.
+pub fn pg_table_columns(node: &SyntaxNode) -> Vec<(Param, (usize, usize))> {
+    let t = tokens::header(node);
+    let plpgsql = t.windows(2).any(|w| {
+        w[0].is_kw("LANGUAGE") && w[1].text.trim_matches('\'').eq_ignore_ascii_case("plpgsql")
+    });
+    let Some(r) = find_kw(&t, 0, "RETURNS") else {
+        return Vec::new();
+    };
+    if !plpgsql
+        || !t.get(r + 1).is_some_and(|x| x.is_kw("TABLE"))
+        || !t.get(r + 2).is_some_and(|x| x.is(SyntaxKind::L_PAREN))
+    {
+        return Vec::new();
+    }
+    let c = close_paren(&t, r + 2);
+    split_commas(&t[r + 3..c.min(t.len())])
+        .into_iter()
+        .filter_map(|el| param(el, Dialect::Postgres, RoutineKind::Function))
+        .collect()
+}
+
 fn param(el: &[Tok], dialect: Dialect, kind: RoutineKind) -> Option<(Param, (usize, usize))> {
     let mut k = 0;
     let mut mode = ParamMode::In;

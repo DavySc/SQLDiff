@@ -66,6 +66,124 @@ pub struct Certificate {
     pub span: (usize, usize),
     #[serde(flatten)]
     pub answer: Answer,
+    /// For an unconfirmed answer, the refusal's codes (`family:detail`,
+    /// see [`reason_code`]): the checker's own when it gave them, else one
+    /// code read from the reason. Empty for a confirmation.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub why: Vec<String>,
+}
+
+/// Where a certificate's refusal comes from, as one code `family:detail`
+/// in ASCII lower case, from the reason text a certificate carries. The
+/// families: `read` (the routine reader refused the source or the output
+/// routine), `pair` (the two routines could not be paired or renamed),
+/// `check` (the checker was missing, failed, or refused the pair). The
+/// checker's own codes (`MirrorAnswer::why`) take precedence; this is the
+/// fallback for reasons produced on the Rust side and for a checker
+/// without codes. A reason outside every known family is
+/// `<family>:other`, never dropped.
+pub fn reason_code(reason: &str) -> String {
+    const SHAPE: [&str; 2] = [
+        "the source routine is outside the verified shape: ",
+        "the output routine is outside the verified shape: ",
+    ];
+    if let Some(rest) = SHAPE.iter().find_map(|p| reason.strip_prefix(p)) {
+        return read_code(rest);
+    }
+    if reason == "the output has no routine for it" {
+        return "pair:no-output".into();
+    }
+    if let Some(rest) = reason.strip_prefix("no renaming pairs the two routines: ") {
+        return format!(
+            "pair:renaming:{}",
+            if rest.contains("parameters") {
+                "params"
+            } else if rest.contains("local variables") {
+                "locals"
+            } else if rest.contains("source names map") {
+                "names"
+            } else {
+                "other"
+            }
+        );
+    }
+    if reason == "no checker" {
+        return "check:none".into();
+    }
+    if reason.starts_with("checker failed") || reason.contains("does not speak") {
+        return "check:transport".into();
+    }
+    check_code(reason)
+}
+
+/// The code of a reason the routine reader gave (`sqldiff_syntax::routine`).
+fn read_code(e: &str) -> String {
+    fn lower(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    }
+    // The backticked word of "unsupported statement `X`" and the token of
+    // "expected PROCEDURE or FUNCTION at `TRIGGER`".
+    let quoted = |e: &str| e.split('`').nth(1).map(lower);
+    if e.starts_with("dynamic SQL") {
+        "read:dynamic-sql".into()
+    } else if e.contains("FOR JSON") {
+        "read:for-json".into()
+    } else if e.starts_with("unsupported routine option") {
+        "read:routine-option".into()
+    } else if e.starts_with("unsupported parameter option") {
+        "read:parameter-option".into()
+    } else if e.starts_with("expected PROCEDURE or FUNCTION") {
+        format!("read:kind:{}", quoted(e).unwrap_or_else(|| "other".into()))
+    } else if let Some(k) = e.strip_suffix(" is not a routine") {
+        format!("read:kind:{}", lower(k))
+    } else if e.starts_with("table-valued results") {
+        "read:table-valued".into()
+    } else if e.starts_with("unsupported declaration") {
+        // A cursor or a table variable.
+        "read:declaration".into()
+    } else if e.starts_with("unsupported statement `") {
+        format!("read:stmt:{}", quoted(e).unwrap_or_else(|| "other".into()))
+    } else if let Some(k) = e
+        .strip_suffix(" is not read yet")
+        .filter(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_uppercase() || b == b'_'))
+    {
+        // A statement kind the reader has no rule for (`CURSOR_STMT`).
+        format!("read:stmt:{}", lower(k))
+    } else {
+        "read:other".into()
+    }
+}
+
+/// The code of a reason the checker gave without codes of its own.
+fn check_code(r: &str) -> String {
+    let detail = if r == "a procedure and a function" {
+        "kind"
+    } else if r.contains("privileges") {
+        "privileges"
+    } else if r.contains("parameter or return types") {
+        "signature"
+    } else if r.starts_with("certificate:") {
+        "certificate"
+    } else if r.contains("differ beyond the renaming") {
+        "differ"
+    } else if r.contains("schema") {
+        "schema"
+    } else if r.contains("does not decode") {
+        "decode"
+    } else if r.contains("outside the C1 spec") {
+        "spec"
+    } else {
+        "other"
+    };
+    format!("check:{detail}")
 }
 
 /// A source to target name pairing.
@@ -1011,6 +1129,7 @@ pub fn certify(
             answer: Answer::Unconfirmed {
                 reason: String::new(),
             },
+            why: Vec::new(),
         };
         // The output routine of the same name, if exactly one.
         let key = pair_key(&name, from);
@@ -1075,6 +1194,7 @@ pub fn certify(
                                         }
                                     }
                                     proof::Answer::Unconfirmed { reason } => {
+                                        c.why = m.why.clone();
                                         Answer::Unconfirmed { reason }
                                     }
                                 }
@@ -1084,6 +1204,11 @@ pub fn certify(
                 }
             }
         };
+        if let Answer::Unconfirmed { reason } = &c.answer {
+            if c.why.is_empty() {
+                c.why = vec![reason_code(reason)];
+            }
+        }
         certs.push(c);
     }
     certs
@@ -1545,5 +1670,171 @@ END
             "{ddl}GO\nCREATE PROCEDURE dbo.q @p sysname AS\nBEGIN\n  DECLARE @rc int;\n  EXEC @rc = @p;\nEND\n"
         );
         assert!(read(&by_name).get("acct").is_none());
+    }
+
+    /// Every message family the routine reader (`sqldiff_syntax::routine`
+    /// and the statement reader it uses), the pairing and the checker
+    /// produce has its code; nothing falls through unnamed.
+    #[test]
+    fn every_refusal_has_a_code() {
+        let shape = |e: &str| format!("the source routine is outside the verified shape: {e}");
+        let out = |e: &str| format!("the output routine is outside the verified shape: {e}");
+        for (reason, code) in [
+            // The reader.
+            (shape("dynamic SQL is not read"), "read:dynamic-sql"),
+            (out("dynamic SQL is not read"), "read:dynamic-sql"),
+            (
+                shape("FOR JSON options is not kept in the syntax tree"),
+                "read:for-json",
+            ),
+            (shape("unsupported FOR JSON option at `ROOT`"), "read:for-json"),
+            (
+                shape("unsupported routine option at `RECOMPILE`"),
+                "read:routine-option",
+            ),
+            (
+                shape("unsupported parameter option at `READONLY`"),
+                "read:parameter-option",
+            ),
+            (
+                shape("expected PROCEDURE or FUNCTION at `TRIGGER`"),
+                "read:kind:trigger",
+            ),
+            (shape("expected PROCEDURE or FUNCTION at `VIEW`"), "read:kind:view"),
+            (
+                shape("expected PROCEDURE or FUNCTION at end of statement"),
+                "read:kind:other",
+            ),
+            (shape("CREATE_VIEW is not a routine"), "read:kind:create-view"),
+            (
+                shape("table-valued results are not read yet"),
+                "read:table-valued",
+            ),
+            (shape("unsupported statement `WAITFOR`"), "read:stmt:waitfor"),
+            (shape("unsupported statement `RAISERROR`"), "read:stmt:raiserror"),
+            (shape("CURSOR_STMT is not read yet"), "read:stmt:cursor-stmt"),
+            (shape("unsupported declaration"), "read:declaration"),
+            (shape("unsupported declaration at `CURSOR`"), "read:declaration"),
+            // The reader's other refusals: shapes it does not read.
+            (shape("exception handlers are not read yet"), "read:other"),
+            (shape("Db2 for i routines are not read yet"), "read:other"),
+            (shape("a block written `BEGIN X`"), "read:other"),
+            (shape("only WHILE loops are read"), "read:other"),
+            (shape("THROW takes no arguments or three"), "read:other"),
+            (shape("unsupported MERGE clause"), "read:other"),
+            (shape("the body contains its own quote"), "read:other"),
+            (shape("a PL/pgSQL body that is not one block"), "read:other"),
+            (shape("unexpected tokens in EXEC at `WITH`"), "read:other"),
+            // Pairing.
+            ("the output has no routine for it".to_string(), "pair:no-output"),
+            (
+                "no renaming pairs the two routines: 2 parameters in the source, 1 in the output"
+                    .to_string(),
+                "pair:renaming:params",
+            ),
+            (
+                "no renaming pairs the two routines: 1 local variables in the source, 0 declared in the output".to_string(),
+                "pair:renaming:locals",
+            ),
+            (
+                "no renaming pairs the two routines: two source names map to `v_x`".to_string(),
+                "pair:renaming:names",
+            ),
+            // The checker.
+            ("no checker".to_string(), "check:none"),
+            (
+                "checker failed: no answer within 30s".to_string(),
+                "check:transport",
+            ),
+            (
+                "the checker does not speak sqldiff-check/3".to_string(),
+                "check:transport",
+            ),
+            ("a procedure and a function".to_string(), "check:kind"),
+            (
+                "the routines run with different privileges".to_string(),
+                "check:privileges",
+            ),
+            (
+                "the parameter or return types do not correspond".to_string(),
+                "check:signature",
+            ),
+            (
+                "certificate: a T-SQL variable has no PL/pgSQL name".to_string(),
+                "check:certificate",
+            ),
+            (
+                "the lowered routines differ beyond the renaming".to_string(),
+                "check:differ",
+            ),
+            (
+                "the request's abstract syntax schema is not this checker's: generate formal/lean/Sqldiff/Ast.lean again and rebuild".to_string(),
+                "check:schema",
+            ),
+            ("routine A does not decode".to_string(), "check:decode"),
+            ("the catalog does not decode".to_string(), "check:decode"),
+            (
+                "the T-SQL routine is outside the C1 spec".to_string(),
+                "check:spec",
+            ),
+            (
+                "the PL/pgSQL routine is outside the C1 spec".to_string(),
+                "check:spec",
+            ),
+            ("malformed request".to_string(), "check:other"),
+            ("".to_string(), "check:other"),
+        ] {
+            assert_eq!(reason_code(&reason), code, "{reason:?}");
+        }
+    }
+
+    /// A certificate's `why` is the code of its reason, or the checker's
+    /// own codes when it gave them.
+    #[test]
+    fn a_refused_certificate_carries_its_codes() {
+        let src = "CREATE PROCEDURE dbo.p @s nvarchar(100) AS BEGIN EXEC (@s); END\n";
+        let d = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres);
+        let certs = certify(
+            src,
+            d.output(),
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            None,
+        );
+        assert_eq!(certs[0].why, ["read:dynamic-sql"], "{:?}", certs[0]);
+        let json = serde_json::to_value(&certs[0]).unwrap();
+        assert_eq!(json["why"][0], "read:dynamic-sql");
+        assert_eq!(json["answer"], "unconfirmed");
+
+        #[derive(Debug)]
+        struct Codes;
+        impl Checker for Codes {
+            fn name(&self) -> String {
+                "codes".into()
+            }
+            fn check(&self, _: &proof::Request) -> proof::Answer {
+                unreachable!()
+            }
+            fn check_mirror(&self, _: &MirrorRequest) -> proof::MirrorAnswer {
+                let mut m = proof::MirrorAnswer::from(proof::Answer::Unconfirmed {
+                    reason: "the lowered routines differ beyond the renaming".into(),
+                });
+                m.why = vec!["check:differ:assign".into(), "check:differ:if".into()];
+                m
+            }
+        }
+        let d = crate::rewrite(TSQL, Dialect::Tsql, Dialect::Postgres);
+        let certs = certify(
+            TSQL,
+            d.output(),
+            Dialect::Tsql,
+            Dialect::Postgres,
+            &Trusted::default(),
+            Some(&Codes),
+        );
+        assert_eq!(certs[0].why, ["check:differ:assign", "check:differ:if"]);
+        let json = serde_json::to_value(&certs[0]).unwrap();
+        assert_eq!(json["why"].as_array().unwrap().len(), 2);
     }
 }

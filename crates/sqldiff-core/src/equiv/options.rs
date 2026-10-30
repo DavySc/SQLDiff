@@ -249,8 +249,10 @@ impl Opts<'_> {
                 for c in split_commas(&toks[i + 1..close]) {
                     if let Some(n) = c.first() {
                         let mut p = Parser::new(&c[1..], d);
-                        let ty = p.ty().ok().map(|t| Ty::from_type(&t, d, false));
+                        let decl = p.ty().ok();
+                        let ty = decl.as_ref().map(|t| Ty::from_type(t, d, false));
                         u.ret_cols.push((cst::unquote(&n.text).to_lowercase(), ty));
+                        u.ret_types.push(decl);
                     }
                 }
                 i = close + 1;

@@ -216,6 +216,11 @@ pub struct MirrorAnswer {
     /// `c4` when the routine's error handling and transaction control were
     /// in the C4 slice.
     pub errors: Option<String>,
+    /// With an unconfirmed answer, the checker's reason codes
+    /// (`family:detail`, ASCII lower case), one per thing it refused;
+    /// empty when the checker gave none (an older checker, or a
+    /// confirmation).
+    pub why: Vec<String>,
 }
 
 impl From<Answer> for MirrorAnswer {
@@ -226,6 +231,7 @@ impl From<Answer> for MirrorAnswer {
             residual: Vec::new(),
             statements: None,
             errors: None,
+            why: Vec::new(),
         }
     }
 }

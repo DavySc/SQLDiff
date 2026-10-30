@@ -322,17 +322,31 @@ fn substring_matches_follow_the_collation() {
                 Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]),
             ),
             ("CHARINDEX(',' + S2, S)", "strpos(S, ',' || S2)", CI),
-            // An empty needle: CHARINDEX 0, strpos 1.
+            // An empty needle: CHARINDEX 0, strpos 1. The converter's
+            // correction keeps NULL for a NULL argument, as CHARINDEX does.
             ("CHARINDEX(S2, S)", "strpos(S, S2)", NotEq),
             ("CHARINDEX('', S)", "strpos(S, '')", NotEq),
             (
                 "CHARINDEX(S2, S)",
-                "CASE WHEN length(S2) = 0 THEN 0 ELSE strpos(S, S2) END",
+                "strpos(S, S2) - (length(S2) = 0)::int",
                 CI,
             ),
+            // The haystack tested instead of the needle.
             (
                 "CHARINDEX(S2, S)",
-                "CASE WHEN length(S) = 0 THEN 0 ELSE strpos(S, S2) END",
+                "strpos(S, S2) - (length(S) = 0)::int",
+                NotEq,
+            ),
+            // A CASE giving 0 for an empty needle gives 0 for S2 = '' and
+            // S NULL too, where CHARINDEX('', NULL) is NULL.
+            (
+                "CHARINDEX(S2, S)",
+                "CASE WHEN length(S2) = 0 THEN 0 ELSE strpos(S, S2) END",
+                NotEq,
+            ),
+            (
+                "CHARINDEX('', S)",
+                "CASE WHEN length('') = 0 THEN 0 ELSE strpos(S, '') END",
                 NotEq,
             ),
             ("CHARINDEX('a', C)", "strpos(C, 'a')", NotEq),

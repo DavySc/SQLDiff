@@ -31,6 +31,9 @@ pub struct Certificates {
     pub checker: Option<String>,
     #[serde(skip)]
     pub from: sqldiff_core::Dialect,
+    /// The counts and the refusal histogram, as `totals.proof` in
+    /// `conversion-report.json`.
+    pub summary: crate::tree::ProofTotals,
     pub files: Vec<FileCertificates>,
 }
 
@@ -233,9 +236,8 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
     let not_applied = tree::review_in(&mut t, &inputs, &job.out)?;
     // The last point a job stops at: from here on the output is written.
     hooks.stop_if_cancelled()?;
-    let (json, md) = tree::write(&t, &job.out)?;
-    let q = queue::build(&t.report, inst.as_ref(), job.queue_all);
-    let (qjson, qmd) = queue::write(&q, &job.out)?;
+    // The certificates come first: the report carries each unit's proof,
+    // so it is written once, with them.
     let certificates = if job.proof.mode == sqldiff_core::proof::Mode::Off {
         None
     } else {
@@ -290,15 +292,25 @@ pub fn convert_into(job: &Job, hooks: &Hooks) -> Result<Written, String> {
                 });
             }
         }
-        let c = Certificates {
+        let summary = tree::annotate_proof(&mut t, &inputs, &files);
+        Some(Certificates {
             checker: checker.map(|k| k.name()),
             from: job.tree.from,
+            summary,
             files,
-        };
-        let path = job.out.join("certificates.json");
-        let text = serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?;
-        std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
-        Some((c, path))
+        })
+    };
+    let (json, md) = tree::write(&t, &job.out)?;
+    let q = queue::build(&t.report, inst.as_ref(), job.queue_all);
+    let (qjson, qmd) = queue::write(&q, &job.out)?;
+    let certificates = match certificates {
+        None => None,
+        Some(c) => {
+            let path = job.out.join("certificates.json");
+            let text = serde_json::to_string_pretty(&c).map_err(|e| e.to_string())?;
+            std::fs::write(&path, text + "\n").map_err(|e| format!("{}: {e}", path.display()))?;
+            Some((c, path))
+        }
     };
     Ok(Written {
         inputs,

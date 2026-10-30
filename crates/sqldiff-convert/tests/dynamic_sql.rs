@@ -112,6 +112,29 @@ fn texts_that_run_differently_are_not_converted() {
     }
 }
 
+/// `EXEC (N'EXEC dbo.q')` is not turned into `EXECUTE 'CALL q()'`: a
+/// procedure called through `EXECUTE` cannot commit, and the callee's
+/// conversion may hold `COMMIT` (`tsql.txn.autocommit`), which PostgreSQL
+/// then refuses with 2D000 and writes nothing.
+#[test]
+fn a_procedure_call_inside_the_text_is_not_converted() {
+    for text in ["EXEC dbo.q", "EXECUTE dbo.q 1"] {
+        let src = proc(&format!("    EXECUTE (N'{text}');"));
+        let c = pg(&src);
+        assert!(!c.output.contains("CALL q("), "{text}: {}", c.output);
+        let u = unit(&c, &src, "EXECUTE (N'");
+        assert_eq!(u.status, Status::NotConverted, "{text}: {:?}", u.notes);
+        let why = reason(u);
+        assert!(
+            why.starts_with("dynamic SQL with known text, not converted")
+                && why.contains("calls a procedure")
+                && why.contains("cannot commit")
+                && why.contains("EXEC dbo.q"),
+            "{text}: {why}"
+        );
+    }
+}
+
 #[test]
 fn a_statement_with_no_rule_inside_the_text_is_not_converted() {
     let src = proc("    EXECUTE (N'CREATE SERVER AUDIT a TO APPLICATION_LOG');");
