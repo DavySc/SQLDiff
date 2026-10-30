@@ -102,20 +102,20 @@ theorem exec_opFree (es es' : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .raise _, _, _ => rfl
   | _ + 1, .reraise, _, _ => rfl
   | _ + 1, .commit, _, _ => rfl
-  | _ + 1, .query t c p, st, h => by
+  | _ + 1, .query q p, st, h => by
     simp only [Stmt.opFree, Bool.and_eq_true, List.all_eq_true] at h
-    have hk := keptRows_map (ev := fun ρ e => e.eval es st.store ρ)
-      (ev' := fun ρ e => e.eval es' st.store ρ) (g := fun e => e) t c
-      (fun e he ρ => (Expr.eval_opFree es es' st.store ρ e (by subst he; simpa using h.1)).symm)
-      (st.db.get t.name)
-    simp only [Option.map_id'] at hk
-    simp only [exec, hk]
-    cases keptRows (fun ρ e => e.eval es st.store ρ) t c (st.db.get t.name) with
+    have hk := keptTuples_congr (ev := fun ρ e => e.eval es st.store ρ)
+      (ev' := fun ρ e => e.eval es' st.store ρ) q.blk
+      (fun e he ρ => (Expr.eval_opFree es es' st.store ρ e (h.1 e he)).symm)
+      (tuples (q.blk.srcs.map fun t => st.db.get t.name))
+    simp only [exec, blockRows, hk]
+    cases keptTuples (fun ρ e => e.eval es st.store ρ) q.blk
+        (tuples (q.blk.srcs.map fun t => st.db.get t.name)) with
     | error _ => rfl
     | ok rows =>
       dsimp only
       rw [pickRows_map (ev := fun ρ e => e.eval es st.store ρ)
-        (ev' := fun ρ e => e.eval es' st.store ρ) t st.store rows p
+        (ev' := fun ρ e => e.eval es' st.store ρ) q.blk.srcs st.store rows p
         (fun e he ρ => (Expr.eval_opFree es es' st.store ρ e (h.2 e he)).symm)]
   | n + 1, .tryCatch u b h, st, hop => by
     simp only [Stmt.opFree, Bool.and_eq_true] at hop

@@ -147,13 +147,14 @@ def lookP (body : List Ast.Node := lookBodyP) (ps : List Ast.Param :=
 #guard (lowerP Γq lookP).map (·.locals) == some [existsVar]
 
 /- The lowered T-SQL `SELECT @q = Qty, @t = Total ... WHERE Id = @id`, as
-the core sees it. -/
+the core sees it: (C3d) a block of one source, whose columns are `0.c`
+(`Core.srcCol`). -/
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q", ioT "@t"]
     [selectT [asg "@q" (tc "Qty"), asg "@t" (tc "Total")] ["dbo", "Acct"] (some keyT)])).map
     (·.body) ==
   some (.seq (.assign statusVar (.lit 0))
-    (.query acctDef (some (.sc (.cmp .eq (.col "id") (.var "@id"))))
-      (.row false [("@q", .sc (.col "qty")), ("@t", .sc (.col "total"))])))
+    (.query ⟨⟨[acctDef], [.sc (.cmp .eq (.col "0.id") (.var "@id"))]⟩⟩
+      (.row false [("@q", .sc (.col "0.qty")), ("@t", .sc (.col "0.total"))])))
 
 /- Nothing can fail without `COUNT` (a `WHERE` and values that cannot
 raise): in the slice without `XACT_ABORT ON`. -/
@@ -387,10 +388,16 @@ would be 2; the count then sets 0. Seen without the count: -/
 #guard runD (lowerT depq Γq (lookT (lookBodyT.take 3))) [I 1, I 4, I 4, I 4] [("acct", [])] ==
   some (.done [I 4, I 4, I 2, I 0] none 0 [("acct", [])] [])
 /- A database that breaks the key (two rows with key 1): no engine can
-be in this state (the primary key, `ASM-TABLES-AS-DECLARED`); the core
-takes the last row in list order, the same on both sides, which is no
-claim about either engine (eval/queries Q2). -/
-#guard runD lT [I 1, N, N, N] [("acct", [[I 1, I 10, I 0], [I 1, I 11, I 1]])] ==
-  some (.done [I 11, I 1, I 2, I 0] none 0 [("acct", [[I 1, I 10, I 0], [I 1, I 11, I 1]])] [])
+be in this state (the primary key, `ASM-TABLES-AS-DECLARED`). The
+`SELECT @q = ...` takes the last row in list order, the same on both
+sides, which is no claim about either engine (eval/queries Q2); (C3d) the
+scalar subquery `SET @t = (SELECT Total ... WHERE Id = @id)` then sees
+two rows and raises `cardinality`, as both engines would (eval/queries
+Q5, Q13), the same on both sides. -/
+def badKey : Db Unit := [("acct", [[I 1, I 10, I 0], [I 1, I 11, I 1]])]
+#guard runD lT [I 1, N, N, N] badKey == some (.failed .cardinality [])
+#guard runD lP [I 1, N, N, N] badKey == runD lT [I 1, N, N, N] badKey
+#guard runD (lowerT depq Γq (lookT (lookBodyT.take 1))) [I 1, N, N, N] badKey ==
+  some (.done [I 11, I 1, N, I 0] none 0 badKey [])
 
 end Sqldiff.Mirror.ExamplesC3b

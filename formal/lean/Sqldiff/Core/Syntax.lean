@@ -17,7 +17,10 @@ adds data: tables of rows of values, described by the target catalog
 (`SExpr.col`). Phase C4 adds handled errors (`tryCatch`, `raise`,
 `reraise`) and `commit`. Phase C2c adds integer widths, bit/boolean,
 date and timestamp values with their literals, comparisons and the
-day/month/year arithmetic.
+day/month/year arithmetic. Phase C3b reads one table (`query`); phase
+C3d makes the read a query block (`Block`): several tables of the
+catalog, their product filtered by conditions, read through columns
+named by the source's position (`srcCol`).
 -/
 
 namespace Sqldiff.Core
@@ -51,6 +54,22 @@ structure TableDef where
 deriving DecidableEq, Repr
 
 def TableDef.hasKey (t : TableDef) : Bool := t.cols.any (·.key)
+
+/-- (C3d) The core column through which a query block reads column `c`
+of its source at position `i` (counted from 0 in `FROM` order): `i.c`.
+Sources are told apart by position, not by table name or alias, so two
+aliases of one table are two sources (a self-join) and the two lowerings
+need not agree on how aliases are spelt. The block's row store
+(`Sqldiff.Core.tupleStore`) gives a name to the first source that has it
+(`ownerFrom`), so the semantics needs no injectivity of this naming; the
+key closure checks ownership where it relies on it (`Block.determines`),
+and `Sqldiff.Mirror.CatTable.wellFormed` keeps `.` out of column names
+all the same. -/
+def srcCol (i : Nat) (c : Col) : Col := toString i ++ "." ++ c
+
+/-- (C3d) The columns of source `i` as the block names them. -/
+def srcCols (i : Nat) (t : TableDef) : List ColDef :=
+  t.cols.map fun d => { d with name := srcCol i d.name }
 
 /-- Parameter modes. T-SQL `OUTPUT` is `inout` (the callee sees the value
 the caller passed); PostgreSQL `OUT` is `out` (the callee sees NULL). -/
@@ -226,6 +245,11 @@ inductive ErrKind where
   | constraint
   | other (code : String)
   | user
+  /-- (C3d) A scalar subquery that returns more than one row: T-SQL error
+  512 ("Subquery returned more than 1 value"), PostgreSQL SQLSTATE 21000
+  (`cardinality_violation`, "more than one row returned by a subquery
+  used as an expression"); eval/queries Q5 and Q13. -/
+  | cardinality
 deriving DecidableEq, Repr
 
 /-- An argument of a call: a value, or a variable the callee writes back
@@ -244,11 +268,13 @@ table where its condition is TRUE:
   (T-SQL `SELECT @x = e, ... FROM t WHERE c`, the PL/pgSQL `FOR` loop the
   converter writes for it). With no such row, nothing is assigned, or,
   with `orNull`, every `x` is set to NULL (a scalar subquery, `SET @x =
-  (SELECT e FROM t WHERE c)`). The lowerings build it only where at most
-  one row can be TRUE (`Sqldiff.Mirror`, "The C3b slice: queries"), so
-  "the last" is the only one; which one a database with several would
-  give is not specified by either vendor, and the core's choice is not a
-  claim about them.
+  (SELECT e FROM t WHERE c)`). (C3d) With `orNull`, more than one row is
+  the error `cardinality`, as both engines raise it. Without `orNull` the
+  lowerings build it only where at most one row can be TRUE on a
+  database that satisfies the catalog (`Block.atMostOne`,
+  `Sqldiff.Core.kept_length_le_one`), so "the last" is the only one;
+  which one a database with several would give is not specified by
+  either vendor, and the core's choice is not a claim about them.
 * `count x`: `x` is the number of such rows, a 32-bit integer
   (`SELECT @x = COUNT(*) FROM t WHERE c`); more than `intMax` rows is an
   overflow.
@@ -259,6 +285,24 @@ inductive Pick where
   | row (orNull : Bool) (sets : List (Var × Expr))
   | count (x : Var)
   | any (x : Var)
+deriving DecidableEq, Repr
+
+/-- (C3d) A query block: the catalog tables of a `FROM` (`srcs`, in
+order; a table may stand twice, under two aliases) and its conditions
+(`conds`): every `ON` of an inner join and the `WHERE`, each split at its
+top-level `AND`s, in `FROM` order and then the `WHERE`. Its rows are the
+tuples of the product of the sources' rows (nested loops in `FROM`
+order) where every condition is TRUE (`Sqldiff.Core.blockRows`). Cross
+joins and comma lists add no condition. -/
+structure Block where
+  srcs : List TableDef
+  conds : List Expr
+deriving DecidableEq, Repr
+
+/-- (C3d) A query: a block. The later parts of C3d add an ordering and a
+row limit here; until then a query has neither. -/
+structure Query where
+  blk : Block
 deriving DecidableEq, Repr
 
 /-- Statements. A block is a sequence (`seq`); the empty block is
@@ -302,12 +346,13 @@ Phase C4 adds error handling and transaction control:
   `ASM-NO-CALLER-TXN` from the transaction statements of the source
   (`Sqldiff.Mirror`, "The C4 rules").
 
-Phase C3b adds a read:
+Phase C3b adds a read, which C3d widens to a query block:
 
-* `query t c p`: the rows of `t` where `c` is TRUE (every row when `c` is
-  `none`; the expressions see the row's columns), then `p` (`Pick`)
-  assigns variables from them. It writes no table. Its meaning is
-  `Sqldiff.Core.keptRows` and `pickRows`. -/
+* `query q p`: the rows of the block `q.blk` (the tuples of its sources'
+  rows where every condition is TRUE; the expressions see the tuple's
+  columns, `srcCol`), then `p` (`Pick`) assigns variables from them. It
+  writes no table. Its meaning is `Sqldiff.Core.blockRows` and
+  `pickRows`. -/
 inductive Stmt where
   | skip
   | assign (x : Var) (e : Expr)
@@ -323,7 +368,7 @@ inductive Stmt where
   | raise (k : ErrKind)
   | reraise
   | commit
-  | query (t : TableDef) (cond : Option Expr) (p : Pick)
+  | query (q : Query) (p : Pick)
 deriving DecidableEq, Repr
 
 /-- The handler of an error `k`: every `reraise` of `s` becomes `raise k`,
@@ -437,7 +482,7 @@ def Stmt.vars : Stmt → List Var
   | .delete _ c => Expr.varsOpt c
   | .tryCatch _ b h => b.vars ++ h.vars
   | .raise _ | .reraise | .commit => []
-  | .query _ c p => Expr.varsOpt c ++ p.vars
+  | .query q p => (q.blk.conds.map Expr.vars).flatten ++ p.vars
 
 def Param.vars (p : Param) : List Var :=
   p.name :: (match p.default with | some e => e.vars | none => [])
@@ -493,6 +538,10 @@ def Pick.rename (f : Var → Var) : Pick → Pick
   | .count x => .count (f x)
   | .any x => .any (f x)
 
+/-- (C3d) The query with its conditions' variables renamed. -/
+def Query.rename (f : Var → Var) (q : Query) : Query :=
+  { blk := { q.blk with conds := q.blk.conds.map (Expr.rename f) } }
+
 def Stmt.rename (f : Var → Var) : Stmt → Stmt
   | .skip => .skip
   | .assign x e => .assign (f x) (e.rename f)
@@ -508,7 +557,7 @@ def Stmt.rename (f : Var → Var) : Stmt → Stmt
   | .raise k => .raise k
   | .reraise => .reraise
   | .commit => .commit
-  | .query t c p => .query t (c.map (Expr.rename f)) (p.rename f)
+  | .query q p => .query (q.rename f) (p.rename f)
 
 def Param.rename (f : Var → Var) (p : Param) : Param :=
   { p with name := f p.name, default := p.default.map (Expr.rename f) }
@@ -554,7 +603,7 @@ def Stmt.opFree : Stmt → Bool
   | .delete _ c => c.all Expr.opFree
   | .tryCatch _ b h => b.opFree && h.opFree
   | .raise _ | .reraise | .commit => true
-  | .query _ c p => c.all Expr.opFree && p.exprs.all Expr.opFree
+  | .query q p => q.blk.conds.all Expr.opFree && p.exprs.all Expr.opFree
 
 def Param.opFree (p : Param) : Bool :=
   match p.default with
@@ -579,7 +628,7 @@ def Stmt.exprs : Stmt → List Expr
   | .delete _ c => c.toList
   | .tryCatch _ b h => b.exprs ++ h.exprs
   | .raise _ | .reraise | .commit => []
-  | .query _ c p => c.toList ++ p.exprs
+  | .query q p => q.blk.conds ++ p.exprs
 
 /-- Every expression of a routine: parameter defaults and the body's. -/
 def Routine.exprs (r : Routine) : List Expr :=
@@ -657,6 +706,93 @@ def Routine.hasLen (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasLen)
 def Routine.hasDateAdd (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasDateAdd)
 
 def Routine.hasYearAdd (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasYearAdd)
+
+/-! ## At most one row (C3d)
+
+When a query block can keep at most one row, on a database that
+satisfies the catalog (every row has a primary key, no two rows of a
+table share one): the key closure. `Sqldiff.Core.kept_length_le_one`
+(`Sqldiff/Core/Fidelity.lean`) proves that `Block.atMostOne` gives it.
+The lowerings ask it of `SELECT @x = ...` and its `FOR` block (a pick
+without `orNull`, where neither vendor says which of several rows is
+assigned), and `Stmt.failsHere` uses it to see that a scalar subquery
+cannot raise `cardinality`. -/
+
+/-- The columns an expression reads. -/
+def SExpr.cols : SExpr → List Col
+  | .col c => [c]
+  | .var _ | .int _ | .null | .str _ | .bool _ | .date _ | .ts _ => []
+  | .arith _ _ a b | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b
+  | .streq a b | .dateAdd _ a b | .dateDiff a b => a.cols ++ b.cols
+  | .neg _ a | .not a | .isNull a _ | .rtrim a | .len a | .toDate a | .toTs a => a.cols
+  | .cond c a b => c.cols ++ a.cols ++ b.cols
+
+/-- The equalities a condition states between a column and an
+expression: `n = e` and `e = n` with the core's `=` (`COp.eq`), which is
+TRUE only for two values of one kind that are equal (`cmpVal`). String
+equality (`streq`, under the T-SQL padding `rtrim`), a date against a
+timestamp (`toTs`), `IS NULL` and every C1 operator are no such
+equality. -/
+def eqFixes : Expr → List (Col × SExpr)
+  | .sc (.cmp .eq a b) =>
+    (match a with | .col n => [(n, b)] | _ => []) ++ (match b with | .col n => [(n, a)] | _ => [])
+  | _ => []
+
+/-- The position, counted from the source at position `i`, of the first
+of the sources `ts` that has a column named `n` (`srcCols`); none when no
+source has it. -/
+def ownerFrom : Nat → List TableDef → Col → Option Nat
+  | _, [], _ => none
+  | i, t :: ts, n =>
+    if (srcCols i t).any (·.name == n) then some 0 else (ownerFrom (i + 1) ts n).map (· + 1)
+
+/-- The source of the block a column name reads. -/
+def Block.owner (b : Block) (n : Col) : Option Nat := ownerFrom 0 b.srcs n
+
+/-- Source `i` of the block, table `t`, is determined once the sources
+`done` are: it has a primary key, its column names are distinct, and for
+every key column `k` some condition states `i.k = e` (`eqFixes`), where
+the name `i.k` reads source `i` and `e` reads only columns of the sources
+`done` (and variables and constants, which a query cannot change). Two
+tuples that agree on the sources `done` and keep every condition TRUE
+then agree on the key of source `i`, and so on its row. -/
+def Block.determines (b : Block) (done : List Nat) (i : Nat) (t : TableDef) : Bool :=
+  t.hasKey && decide (((srcCols i t).map (·.name)).Nodup) &&
+    (t.cols.filter (·.key)).all fun d =>
+      b.conds.any fun c => (eqFixes c).any fun (n, e) =>
+        n == srcCol i d.name && b.owner n == some i &&
+          e.cols.all fun m => match b.owner m with
+            | some j => done.contains j
+            | none => false
+
+/-- The sources `is`, in this order, are each determined by the ones
+before them (and `done`). -/
+def Block.chain (b : Block) : List Nat → List Nat → Bool
+  | _, [] => true
+  | done, i :: is =>
+    (match b.srcs[i]? with
+      | some t => b.determines done i t
+      | none => false) && b.chain (i :: done) is
+
+/-- The key closure: the sources in the order they become determined,
+each the first not yet determined that `determines` admits. -/
+def Block.closure (b : Block) : List Nat := go b.srcs.length []
+where
+  go : Nat → List Nat → List Nat
+    | 0, done => done.reverse
+    | n + 1, done =>
+      match (List.range b.srcs.length).find? (fun i =>
+          !done.contains i && match b.srcs[i]? with
+            | some t => b.determines done i t
+            | none => false) with
+      | some i => go n (i :: done)
+      | none => done.reverse
+
+/-- Every source of the block is determined: on a database where every
+table's rows have distinct primary keys, the block keeps at most one
+tuple (`Sqldiff.Core.kept_length_le_one`). -/
+def Block.atMostOne (b : Block) : Bool :=
+  b.chain [] b.closure && (List.range b.srcs.length).all b.closure.contains
 
 /-! ## What a routine's data statements can do (C3a)
 
@@ -740,7 +876,12 @@ def Stmt.failsHere : Stmt → Bool
     (Stmt.update t sets c).violates || sets.any (fun p => p.2.raise) || c.any Expr.raise
   | .delete _ c => c.any Expr.raise
   | .raise _ | .reraise => true
-  | .query _ c p => c.any Expr.raise || p.exprs.any Expr.raise || (p matches .count _)
+  -- (C3d) A scalar subquery raises `cardinality` on more than one row,
+  -- which a block that keeps at most one cannot give on a database that
+  -- satisfies the catalog.
+  | .query q p =>
+    q.blk.conds.any Expr.raise || p.exprs.any Expr.raise || (p matches .count _) ||
+      ((p matches .row true _) && !q.blk.atMostOne)
   | _ => false
 
 /-- Some statement of `s` can fail, and the error leave `s`: an error in
@@ -796,7 +937,7 @@ def Stmt.dmlSafe : Stmt → Bool
     !(c.any Expr.raise) && !(sets.any fun p => Expr.test SExpr.constRaise p.2) &&
       !((Stmt.update t sets c).violates && sets.any fun p => p.2.raise)
   | .delete _ c => !(c.any Expr.raise)
-  | .query _ c p => !(c.any Expr.raise) && !(p.exprs.any Expr.raise)
+  | .query q p => !(q.blk.conds.any Expr.raise) && !(p.exprs.any Expr.raise)
   | .seq s t | .ite _ s t | .tryCatch _ s t => s.dmlSafe && t.dmlSafe
   | .while _ b => b.dmlSafe
   | _ => true
@@ -812,7 +953,7 @@ def Stmt.hasQuery : Stmt → Bool
 which T-SQL reports as an error only under its arithmetic settings
 (`ASM-TSQL-ARITH-ERRORS`). -/
 def Stmt.hasCount : Stmt → Bool
-  | .query _ _ (.count _) => true
+  | .query _ (.count _) => true
   | .seq s t | .ite _ s t | .tryCatch _ s t => s.hasCount || t.hasCount
   | .while _ b => b.hasCount
   | _ => false

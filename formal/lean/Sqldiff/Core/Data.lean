@@ -89,33 +89,58 @@ theorem deleteRows_map (t : TableDef) (c : Option Expr)
     simp only [deleteRows]
     rw [keeps_map _ c hc, deleteRows_map t c hc rs]
 
-/-- (C3b) The rows a query keeps. -/
-theorem keptRows_map (t : TableDef) (c : Option Expr)
-    (hc : ∀ e, c = some e → ∀ ρ, ev' ρ (g e) = ev ρ e) :
-    ∀ rs : List (Row U), keptRows ev' t (c.map g) rs = keptRows ev t c rs
-  | [] => rfl
-  | r :: rs => by
-    simp only [keptRows]
-    rw [keeps_map _ c hc, keptRows_map t c hc rs]
+/-- (C3d) A block's conditions on one tuple. -/
+theorem keepsAll_map (ρ : Store U) :
+    ∀ cs : List Expr, (∀ e ∈ cs, ∀ ρ, ev' ρ (g e) = ev ρ e) →
+      keepsAll ev' ρ (cs.map g) = keepsAll ev ρ cs
+  | [], _ => rfl
+  | c :: cs, h => by
+    simp only [List.map_cons, keepsAll]
+    rw [h c (by simp) ρ, keepsAll_map ρ cs (fun e he => h e (by simp [he]))]
 
-/-- (C3b) A pick whose expressions agree, the variables unchanged. -/
-theorem pickRows_map (t : TableDef) (σ : Store U) (rows : List (Row U)) :
+/-- (C3b, C3d) The tuples a block keeps, its conditions mapped. -/
+theorem keptTuples_map (b : Block) (hc : ∀ e ∈ b.conds, ∀ ρ, ev' ρ (g e) = ev ρ e) :
+    ∀ Ts : List (List (Row U)),
+      keptTuples ev' { b with conds := b.conds.map g } Ts = keptTuples ev b Ts
+  | [] => rfl
+  | T :: Ts => by
+    simp only [keptTuples]
+    rw [keepsAll_map _ b.conds hc, keptTuples_map b hc Ts]
+
+theorem blockRows_map (b : Block) (db : Db U) (hc : ∀ e ∈ b.conds, ∀ ρ, ev' ρ (g e) = ev ρ e) :
+    blockRows ev' { b with conds := b.conds.map g } db = blockRows ev b db :=
+  keptTuples_map b hc _
+
+/-- (C3b, C3d) A pick whose expressions agree, the variables unchanged. -/
+theorem pickRows_map (srcs : List TableDef) (σ : Store U) (rows : List (List (Row U))) :
     ∀ p : Pick, (∀ e ∈ p.exprs, ∀ ρ, ev' ρ e = ev ρ e) →
-      pickRows ev' t σ rows p = pickRows ev t σ rows p
+      pickRows ev' srcs σ rows p = pickRows ev srcs σ rows p
   | .row n sets, h => by
     simp only [pickRows]
-    cases rows.getLast? with
-    | none => rfl
-    | some r =>
-      dsimp only
-      have := evalVals_map (ev := ev) (ev' := ev') (g := fun e => e) (rowStore t.cols r)
-        (sets.map (·.2)) (fun e he ρ => h e (by simpa [Pick.exprs] using he) ρ)
-      simp only [List.map_id'] at this
-      rw [this]
+    split
+    · rfl
+    · cases rows.getLast? with
+      | none => rfl
+      | some r =>
+        dsimp only
+        have := evalVals_map (ev := ev) (ev' := ev') (g := fun e => e) (tupleStore 0 srcs r)
+          (sets.map (·.2)) (fun e he ρ => h e (by simpa [Pick.exprs] using he) ρ)
+        simp only [List.map_id'] at this
+        rw [this]
   | .count _, _ => rfl
   | .any _, _ => rfl
 
 end
+
+/-- (C3d) The tuples a block keeps, with two evaluators that agree on its
+conditions. -/
+theorem keptTuples_congr {ev ev' : Store U → Expr → Res U} (b : Block)
+    (hc : ∀ e ∈ b.conds, ∀ ρ, ev' ρ e = ev ρ e) :
+    ∀ Ts : List (List (Row U)), keptTuples ev' b Ts = keptTuples ev b Ts := by
+  intro Ts
+  have h := keptTuples_map (ev := ev) (ev' := ev') (g := fun e => e) b hc Ts
+  simp only [List.map_id'] at h
+  exact h
 
 /-! ## Statement atomicity -/
 

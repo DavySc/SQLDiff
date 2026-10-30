@@ -2257,7 +2257,7 @@ def dataOk (d : Dialect) (k : Ast.RoutineKind) : Bool :=
 
 Phase C3b reads one table of the target catalog, in exactly the shapes
 `sqldiff convert --to postgres` writes, lowered to the core's `query`
-(`Sqldiff.Core.Stmt.query`, `Pick`, `keptRows`, `pickRows`). Each rule
+(`Sqldiff.Core.Stmt.query`, `Pick`, `blockRows`, `pickRows`). Each rule
 states the claim, the vendor text and the probe status, as for C2a.
 "eval/queries Qn" is probe `Qn` of `eval/queries/{mssql,postgres}.sql`
 with their `.out` files, run on SQL Server 2022 and PostgreSQL 18 on
@@ -2308,7 +2308,7 @@ reads would add PostgreSQL's volatility and snapshot rules to the spec).
    ends with one of them).
 
    Which row "last" is depends on the plan on both sides, so the rule
-   asks that **at most one row can match** (`keyFixed`): `c` is a
+   asks that **at most one row can match** (`Core.Block.atMostOne`): `c` is a
    conjunction (`AND`, in the slice) with, for every column of the
    table's primary key, a conjunct `k = e` or `e = k` where `e` reads no
    column. Every row `c` keeps then has the key `e` gives, the same
@@ -2348,7 +2348,7 @@ reads would add PostgreSQL's volatility and snapshot rules to the spec).
    512, PostgreSQL 21000 `cardinality_violation`, "Scalar Subqueries",
    4.2.11; "Subqueries" (Transact-SQL); from memory). Probed,
    eval/queries Q5 (300, NULL, 512 against 21000 with the variable kept,
-   both engines). The same `keyFixed` `WHERE` is required, so the error
+   both engines). The same key-fixing `WHERE` is required, so the error
    cannot happen (it is then not in the core), and the same rules for
    `e` and `x`.
 
@@ -2436,11 +2436,20 @@ structure QSpec where
   /-- The conditions with the names each sees, the `WHERE` last. -/
   conds : List (Scope × Ast.Expr)
 
+/-- The names of the catalog table `t`, written `tgt`, as the source at
+position `i` of a query block (`Core.srcCol`). -/
+def srcScope (d : Dialect) (t : CatTable) (tgt : List String) (i : Nat) : Scope :=
+  { cols := t.cols.map fun c => (colKey d c, Core.srcCol i c.name)
+    rel := match d with
+      | .tsql _ _ => none
+      | .pg _ _ => tgt.getLast?.map pgName
+    colTys := t.cols.map fun c => (Core.srcCol i c.name, c.kind) }
+
 /-- The `FROM` list: one catalog table without alias or hints. -/
 def readFrom (d : Dialect) : List Ast.From → Option (List CatTable × Scope × List (Scope × Ast.Expr))
   | [.Table tgt none []] => do
     let t ← tableOf d tgt
-    pure ([t], scopeOf d t tgt, [])
+    pure ([t], srcScope d t tgt 0, [])
   | _ => none
 
 /-- The one reader of a query (see `QSpec`). -/
@@ -2490,34 +2499,32 @@ def conjuncts : SExpr → List SExpr
   | .and a b => conjuncts a ++ conjuncts b
   | s => [s]
 
-/-- `c = e` or `e = c`, `e` reading no column. -/
-def fixesCol (c : Core.Col) : SExpr → Bool
-  | .cmp .eq (.col c') e => c' == c && !e.hasCol
-  | .cmp .eq e (.col c') => c' == c && !e.hasCol
-  | _ => false
+/-- A lowered condition split at its top-level `AND`s (a slice `AND` of
+two conditions that cannot raise keeps a tuple exactly when both keep it:
+`Core.and3`); a condition on the C1 path stays whole. -/
+def splitConj : Core.Expr → List Core.Expr
+  | .sc s => (conjuncts s).map .sc
+  | e => [e]
 
-/-- The condition fixes every column of the table's primary key with `=`,
-so at most one row of a database that satisfies the key is kept. -/
-def keyFixed (t : CatTable) : Option Core.Expr → Bool
-  | some (.sc s) =>
-    t.cols.any (·.key) && (t.cols.filter (·.key)).all fun k => (conjuncts s).any (fixesCol k.name)
-  | _ => false
+/-- The lowered query block: its tables and its lowered conditions, each
+split at its `AND`s (`Core.Block`). -/
+def lowerBlock (d : Dialect) (env : TyEnv) (s : QSpec) : Option Core.Block := do
+  let cs ← s.conds.mapM fun (sc, c) => lowerExpr d env sc c
+  pure { srcs := s.tabs.map CatTable.toDef, conds := cs.flatMap splitConj }
 
-/-- The lowered query: its table and its lowered `WHERE`. -/
-def lowerWhere (d : Dialect) (env : TyEnv) (s : QSpec) : Option (CatTable × Option Core.Expr) :=
-  match s.tabs, s.conds with
-  | [t], [] => some (t, none)
-  | [t], [(sc, c)] => (lowerExpr d env sc c).map fun c' => (t, some c')
-  | _, _ => none
+/-- The variables a block's conditions read. -/
+def blockVars (b : Core.Block) : List Var := (b.conds.map Core.Expr.vars).flatten
 
 /-- `.row`: distinct targets of the values' types (`pickTarget`) that the
-condition does not read, and a condition that fixes the key. -/
-def rowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (orNull : Bool)
+conditions do not read, and a block that keeps at most one row
+(`Core.Block.atMostOne`: the key closure, whose meaning is
+`Sqldiff.Core.kept_length_le_one`). -/
+def rowPick (d : Dialect) (env : TyEnv) (b : Core.Block) (orNull : Bool)
     (sets : List (Var × Core.Expr × STy)) : Option Stmt :=
   let xs := sets.map (·.1)
   if !sets.isEmpty && distinct xs && sets.all (fun (x, _, ty) => pickTarget d env x ty) &&
-      !(xs.any (Core.Expr.varsOpt c).contains) && keyFixed t c then
-    some (.query t.toDef c (.row orNull (sets.map fun (x, e, _) => (x, e))))
+      !(xs.any (blockVars b).contains) && b.atMostOne then
+    some (.query ⟨b⟩ (.row orNull (sets.map fun (x, e, _) => (x, e))))
   else none
 
 /-- `.count`: an `int` target that the condition does not read. (C2c) Not
@@ -2525,10 +2532,9 @@ a `bigint` target: T-SQL `COUNT(*)` is `int` and raises 8115 beyond
 2^31-1 rows whatever the target, PostgreSQL's `count` is `bigint` and
 fits a `bigint` target (eval/values V2: the types), so the two differ
 there, which the core's `count` (an overflow on both) does not show. -/
-def countPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (x : Var) :
-    Option Stmt :=
-  if intVarW d env x == some .i32 && !(Core.Expr.varsOpt c).contains x then
-    some (.query t.toDef c (.count x))
+def countPick (d : Dialect) (env : TyEnv) (b : Core.Block) (x : Var) : Option Stmt :=
+  if intVarW d env x == some .i32 && !(blockVars b).contains x then
+    some (.query ⟨b⟩ (.count x))
   else none
 
 /-- The T-SQL picks `@x = e` of a select list. -/
@@ -2543,11 +2549,11 @@ t [WHERE c]` (rules 1 and 4). -/
 def lowerSelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
   let s ← querySpec d sel
   if !s.into.isEmpty || s.strict then none else
-  let (t, c) ← lowerWhere d env s
-  let row : Option Stmt := do rowPick d env t c false (← assignItems d env s.sc s.items)
+  let b ← lowerBlock d env s
+  let row : Option Stmt := do rowPick d env b false (← assignItems d env s.sc s.items)
   match s.items with
   | [.SelItem e none (some v)] =>
-    if countStar e then do countPick d env t c (← target d (.Var v)) else row
+    if countStar e then do countPick d env b (← target d (.Var v)) else row
   | _ => row
 
 /-- PL/pgSQL `SELECT COUNT(*) INTO x FROM t [WHERE c]` (rule 4). -/
@@ -2557,8 +2563,8 @@ def lowerSelectP (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt :=
   | [.SelItem e none none], [x], false =>
     if countStar e then do
       let x ← target d x
-      let (t, c) ← lowerWhere d env s
-      countPick d env t c x
+      let b ← lowerBlock d env s
+      countPick d env b x
     else none
   | _, _, _ => none
 
@@ -2566,11 +2572,11 @@ def lowerSelectP (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt :=
 def lowerScalar (d : Dialect) (env : TyEnv) (x : Var) (sel : Ast.Select) : Option Stmt := do
   let s ← querySpec d sel
   if !s.into.isEmpty || s.strict then none else
-  let (t, c) ← lowerWhere d env s
+  let b ← lowerBlock d env s
   match s.items with
   | [.SelItem e none none] =>
-    if countStar e then countPick d env t c x
-    else rowPick d env t c true [(x, ← pickValue d env s.sc e)]
+    if countStar e then countPick d env b x
+    else rowPick d env b true [(x, ← pickValue d env s.sc e)]
   | _ => none
 
 /-- The condition of an `IF` that is `EXISTS (q)` (`false`) or `NOT EXISTS
@@ -2584,8 +2590,8 @@ def existsCond : Ast.Expr → Option (Ast.Select × Bool)
 def lowerExists (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
   let s ← querySpec d sel
   if !s.into.isEmpty || s.strict || !existsItems s.items then none else
-  let (t, c) ← lowerWhere d env s
-  pure (.query t.toDef c (.any existsVar))
+  let b ← lowerBlock d env s
+  pure (.query ⟨b⟩ (.any existsVar))
 
 /-- (C3b) The dialect a `FOR` loop's query is read in: its record is a
 variable there (`lowerForBlock`). -/
@@ -2627,13 +2633,13 @@ def lowerForBlock (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String)
     let d' := Dialect.pg Γ (vars ++ [r])
     let s ← querySpec d' sel
     if !s.into.isEmpty || s.strict then none else
-    let (t, c) ← lowerWhere d' env s
+    let b ← lowerBlock d' env s
     let cols ← aliasItems d' env s.sc s.items
     let asg ← body.mapM (fieldAssign r)
     if asg.length != cols.length || !distinct (cols.map (·.1)) ||
         !(asg.zip cols).all (fun (p, q) => p.2 == q.1) || (asg.map (·.1)).contains r then none
     else
-    let st ← rowPick d' env t c false ((asg.zip cols).map fun (p, q) => (p.1, q.2))
+    let st ← rowPick d' env b false ((asg.zip cols).map fun (p, q) => (p.1, q.2))
     pure [st]
 
 /-! ## Statements -/

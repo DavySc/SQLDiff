@@ -12,6 +12,10 @@ ALLOWED = {"propext", "Classical.choice", "Quot.sound"}
 
 text = sys.stdin.read()
 print(text, end="")
+# The pipe drops Lean's exit code: an unknown constant or any other error in
+# Axioms.lean must fail the gate, not leave its line out of the count.
+if re.search(r"^[^\n]*:\d+:\d+: error", text, re.M):
+    sys.exit("Axioms.lean has errors")
 seen = 0
 for m in re.finditer(r"'([^']+)' (does not depend on any axioms|depends on axioms: \[([^\]]*)\])", text):
     seen += 1

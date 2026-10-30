@@ -301,7 +301,7 @@ def whySpec (d : Dialect) (sel : Ast.Select) : List String :=
       | .Table tgt _ _ => whyTable d "stmt:select" tgt
       | _ => []
 
-/-- Why `lowerWhere` refuses a query `querySpec` reads: a condition that
+/-- Why `lowerBlock` refuses a query `querySpec` reads: a condition that
 does not lower. -/
 def whyConds (d : Dialect) (env : TyEnv) (s : QSpec) : List String :=
   s.conds.flatMap fun (sc, c) => ifLowerFails d env sc c
@@ -316,11 +316,11 @@ def whyPick (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : List Strin
 
 /-- Why `rowPick` refuses the targets and the condition: a target of the
 wrong type, a `WHERE` that fixes no key. -/
-def whyRowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr)
+def whyRowPick (d : Dialect) (env : TyEnv) (b : Core.Block)
     (sets : List (Var × Core.Expr × STy)) : List String :=
   (sets.filterMap fun (x, _, ty) =>
     if pickTarget d env x ty then none else some ("stmt:select:target:" ++ varDetail env x)) ++
-    (if keyFixed t c then [] else ["stmt:select:where:not-key"])
+    (if b.atMostOne then [] else ["stmt:select:where:not-key"])
 
 /-- Why `countPick` refuses its target. -/
 def whyCount (d : Dialect) (env : TyEnv) (x : Var) : List String :=
@@ -332,9 +332,9 @@ def whySelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
   | none => whySpec d sel
   | some s =>
     if !s.into.isEmpty || s.strict then ["stmt:select:into"] else
-    match lowerWhere d env s with
+    match lowerBlock d env s with
     | none => whyConds d env s
-    | some (t, c) =>
+    | some b =>
       let row : List String :=
         let bad := s.items.flatMap fun
           | .SelItem e none (some v) =>
@@ -344,7 +344,7 @@ def whySelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
           | .SelItem _ (some _) (some _) => ["stmt:select:item"]
         if !bad.isEmpty then bad else
         match assignItems d env s.sc s.items with
-        | some sets => whyRowPick d env t c sets
+        | some sets => whyRowPick d env b sets
         | none => []
       match s.items with
       | [.SelItem e none (some v)] =>
@@ -369,7 +369,7 @@ def whySelectP (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
         if countStar e then
           match target d x with
           | none => ["stmt:assign:target"]
-          | some x => match lowerWhere d env s with
+          | some x => match lowerBlock d env s with
             | none => whyConds d env s
             | some _ => whyCount d env x
         else ["stmt:select:into"]
@@ -381,14 +381,14 @@ def whyScalar (d : Dialect) (env : TyEnv) (x : Var) (sel : Ast.Select) : List St
   | none => whySpec d sel
   | some s =>
     if !s.into.isEmpty || s.strict then ["stmt:select:into"] else
-    match lowerWhere d env s with
+    match lowerBlock d env s with
     | none => whyConds d env s
-    | some (t, c) => match s.items with
+    | some b => match s.items with
       | [.SelItem e none none] =>
         if countStar e then whyCount d env x
         else match pickValue d env s.sc e with
           | none => whyPick d env s.sc e
-          | some v => whyRowPick d env t c [(x, v)]
+          | some v => whyRowPick d env b [(x, v)]
       | [_] => ["stmt:select:item"]
       | _ => ["stmt:select:items"]
 
@@ -417,9 +417,9 @@ def whyFor (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : 
     | none => whySpec d' sel
     | some s =>
       if !s.into.isEmpty || s.strict then ["stmt:select:into"] else
-      match lowerWhere d' env s with
+      match lowerBlock d' env s with
       | none => whyConds d' env s
-      | some (t, c) =>
+      | some b =>
         let bad := s.items.flatMap fun
           | .SelItem e (some _) none =>
             if (pickValue d' env s.sc e).isNone then whyPick d' env s.sc e else []
@@ -430,7 +430,7 @@ def whyFor (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : 
           if asg.length != cols.length || !distinct (cols.map (·.1)) ||
               !(asg.zip cols).all (fun (p, q) => p.2 == q.1) || (asg.map (·.1)).contains r then
             ["node:for-query"]
-          else whyRowPick d' env t c ((asg.zip cols).map fun (p, q) => (p.1, q.2))
+          else whyRowPick d' env b ((asg.zip cols).map fun (p, q) => (p.1, q.2))
         | _, _ => ["node:for-query"]
 
 /-! ## Statements -/

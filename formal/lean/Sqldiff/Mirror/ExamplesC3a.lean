@@ -351,7 +351,8 @@ def endOf (r : Option Core.Routine) (args : List V) (db : Db Unit) : Option (Str
         | .arithmetic => "arithmetic"
         | .constraint => "constraint"
         | .other _ => "other"
-        | .user => "user", st.db)
+        | .user => "user"
+        | .cardinality => "cardinality", st.db)
       | .outOfFuel st => ("out of fuel", st.db))
 
 /- An arithmetic error part-way through an `UPDATE`: `total + @n` on
