@@ -25,7 +25,7 @@ fn run(from: &str) -> Conversion {
 fn notes(c: &Conversion) -> Vec<(Status, String)> {
     c.units
         .iter()
-        .flat_map(|u| u.notes.iter().map(|n| (n.status, n.rule.clone())))
+        .flat_map(|u| u.notes.iter().map(|n| (n.status, n.rule.to_string())))
         .collect()
 }
 

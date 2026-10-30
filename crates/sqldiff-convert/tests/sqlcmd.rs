@@ -18,7 +18,7 @@ fn reason(src: &str) -> String {
     let c = pg(src);
     let u = &c.units[0];
     assert_eq!(u.status, Status::NotConverted, "{src}\n{}", c.output);
-    u.notes[0].text.clone()
+    u.notes[0].text.to_string()
 }
 
 #[test]

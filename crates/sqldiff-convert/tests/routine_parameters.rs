@@ -58,7 +58,7 @@ fn rules(t: &Tree) -> Vec<String> {
     t.conversions[0]
         .units
         .iter()
-        .flat_map(|u| u.notes.iter().map(|n| n.rule.clone()))
+        .flat_map(|u| u.notes.iter().map(|n| n.rule.to_string()))
         .chain(
             t.conversions[0]
                 .output_check

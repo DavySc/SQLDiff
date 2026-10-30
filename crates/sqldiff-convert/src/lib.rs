@@ -12,6 +12,7 @@
 //! once expression trees and the semantic IR land.
 
 use serde::{Deserialize, Serialize};
+pub use shared::Shared;
 use sqldiff_core::{Artifact, Dialect, Options, Report};
 use sqldiff_syntax::{parse, LineIndex};
 
@@ -27,6 +28,7 @@ mod out;
 pub mod queue;
 mod refused;
 pub mod review;
+pub mod shared;
 mod table_vars;
 mod template;
 mod tok;
@@ -75,9 +77,10 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
     pub status: Status,
-    /// Stable rule id, e.g. `ASM-CI-COLLATION` or `tsql.merge`.
-    pub rule: String,
-    pub text: String,
+    /// Stable rule id, e.g. `ASM-CI-COLLATION` or `tsql.merge`. Both are
+    /// shared with every equal note of the tree (`shared::Pool`).
+    pub rule: Shared,
+    pub text: Shared,
 }
 
 /// One rewrite the rules made: which rule, on which input bytes. Unlike a
@@ -258,7 +261,7 @@ impl Draft {
             .flat_map(|u| &u.notes)
             .filter(|n| n.status >= at_least)
             .max_by_key(|n| n.status)
-            .map(|n| n.text.clone())
+            .map(|n| n.text.to_string())
     }
 
     /// Adds a note to unit `i` (a hand-written text that could not be applied).
@@ -496,11 +499,12 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                         at,
                         Note {
                             status: Status::Unproven,
-                            rule: f.rule.clone(),
+                            rule: f.rule.clone().into(),
                             text: format!(
                                 "The engine could not show the output equivalent to the input: {}",
                                 f.witness
-                            ),
+                            )
+                            .into(),
                         },
                     );
                 }
@@ -575,7 +579,7 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                     Note {
                         status: Status::Unproven,
                         rule: NOT_COMPARED.into(),
-                        text: text.clone(),
+                        text: text.clone().into(),
                     },
                 );
             }
@@ -608,12 +612,13 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                 0,
                 Note {
                     status: Status::Differs,
-                    rule: f.rule.clone(),
+                    rule: f.rule.clone().into(),
                     text: format!(
                         "The output does not check as {}: {}",
                         to.display_name(),
                         without_side(&f.witness)
-                    ),
+                    )
+                    .into(),
                 },
             );
         }
@@ -635,7 +640,8 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                         "The output does not parse as {}: {}",
                         to.display_name(),
                         d.message
-                    ),
+                    )
+                    .into(),
                 },
             );
         }
@@ -660,8 +666,8 @@ pub fn check(input: &str, draft: Draft, opts: &Options) -> Conversion {
                 at,
                 Note {
                     status: Status::Assumptions,
-                    rule: x.id.clone(),
-                    text: x.text.clone(),
+                    rule: x.id.clone().into(),
+                    text: x.text.clone().into(),
                 },
             );
         }
@@ -835,7 +841,7 @@ fn refuse_all(root: &sqldiff_syntax::SyntaxNode, text: &str, reason: &str, rule:
             vec![Note {
                 status: Status::NotConverted,
                 rule: rule.into(),
-                text: reason.to_string(),
+                text: reason.to_string().into(),
             }],
             vec![Step {
                 rule: rule.into(),

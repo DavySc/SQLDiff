@@ -24,7 +24,7 @@ fn first(input: &str, c: &Conversion, s: Status) -> (usize, String, String) {
         .find(|n| n.status == s)
         .map(|n| n.rule.clone())
         .unwrap_or_default();
-    (i, ids[i].clone(), rule)
+    (i, ids[i].clone(), rule.to_string())
 }
 
 /// The unit whose input holds `needle`, its id and its first assumption.
@@ -41,7 +41,7 @@ fn at(input: &str, c: &Conversion, needle: &str) -> (usize, String, String) {
         .find(|n| n.status == Status::Assumptions)
         .map(|n| n.rule.clone())
         .unwrap_or_else(|| panic!("no assumption on {needle}: {:?}", c.units[i].notes));
-    (i, unit_ids(PATH, input, c)[i].clone(), rule)
+    (i, unit_ids(PATH, input, c)[i].clone(), rule.to_string())
 }
 
 fn record(input: &str, c: &Conversion, unit: &str, rule: &str, state: State, by: By) -> Record {

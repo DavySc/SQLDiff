@@ -340,8 +340,8 @@ impl<'a> Cx<'a> {
         if !self.notes.iter().any(|n| n.rule == rule) {
             self.notes.push(Note {
                 status,
-                rule: rule.to_string(),
-                text: text.to_string(),
+                rule: rule.to_string().into(),
+                text: text.to_string().into(),
             });
         }
     }
@@ -476,7 +476,7 @@ impl<'a> Cx<'a> {
             vec![Note {
                 status: Status::NotConverted,
                 rule: rule.into(),
-                text: reason.to_string(),
+                text: reason.to_string().into(),
             }],
             vec![crate::Step {
                 rule: rule.into(),
@@ -1242,17 +1242,17 @@ impl<'a> Cx<'a> {
         let mut notes = vec![Note {
             status: Status::Converted,
             rule: "idiom-rules".into(),
-            text: format!("Converted by the idiom rules ({}).", p.rules.join(", ")),
+            text: format!("Converted by the idiom rules ({}).", p.rules.join(", ")).into(),
         }];
         notes.extend(p.notes.iter().map(|a| Note {
             status: a.status.into(),
-            rule: a.rule.clone(),
-            text: a.text.clone(),
+            rule: a.rule.clone().into(),
+            text: a.text.clone().into(),
         }));
         notes.extend(p.assumptions.iter().map(|(id, text)| Note {
             status: Status::Assumptions,
-            rule: id.clone(),
-            text: text.clone(),
+            rule: id.clone().into(),
+            text: text.clone().into(),
         }));
         if undeclared {
             notes.push(Note {
@@ -1619,7 +1619,7 @@ impl<'a> Cx<'a> {
         self.notes
             .iter()
             .find(|n| n.status == Status::NotConverted)
-            .map(|n| n.text.clone())
+            .map(|n| n.text.to_string())
     }
 
     fn if_stmt(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, elsif: bool) {

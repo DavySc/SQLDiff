@@ -708,13 +708,16 @@ fn convert_files(
     hooks.stop_if_cancelled()?;
     let work = slots(inputs.iter().zip(drafts));
     let progress = Progress::new(work.len(), hooks);
+    // Equal note texts are kept once, as each file is done.
+    let pool = crate::shared::Pool::default();
     let done = parallel(jobs, &work, |w| {
         let (input, draft) = w.lock().unwrap().take().unwrap();
         if hooks.cancelled() {
             return None;
         }
         let t = Instant::now();
-        let c = crate::check(&input.text, draft, &opts);
+        let mut c = crate::check(&input.text, draft, &opts);
+        pool.share_notes(&mut c);
         progress.tick();
         Some((c, t.elapsed().as_secs_f64()))
     });
@@ -749,13 +752,13 @@ fn hand_note(r: &crate::review::Record, unchecked: bool) -> crate::Note {
         crate::Note {
             status: Status::Unproven,
             rule: "hand-written.unchecked".into(),
-            text: format!("Written by hand by {who}. A template unit written by hand is not checked by convert: the instance check (`sqldiff instances`) judges it."),
+            text: format!("Written by hand by {who}. A template unit written by hand is not checked by convert: the instance check (`sqldiff instances`) judges it.").into(),
         }
     } else {
         crate::Note {
             status: Status::Assumptions,
             rule: "ASM-HAND-WRITTEN".into(),
-            text: format!("Written by hand by {who}; checked like the rules' output. The check allows the same dialect mappings it allows the rules (a dropped `dbo` schema, mapped types), which a text written by hand may lean on without saying so; the rules' assumptions and decisions for this unit are kept. Accept this once the text has been read against the source."),
+            text: format!("Written by hand by {who}; checked like the rules' output. The check allows the same dialect mappings it allows the rules (a dropped `dbo` schema, mapped types), which a text written by hand may lean on without saying so; the rules' assumptions and decisions for this unit are kept. Accept this once the text has been read against the source.").into(),
         }
     }
 }
@@ -790,7 +793,8 @@ fn hand_written_draft(l: &crate::review::Ledger, i: &Input, d: &mut crate::Draft
                     crate::Note {
                         status: Status::Differs,
                         rule: "review.text-not-applied".into(),
-                        text: format!("The hand-written text for this unit was not applied: {e}."),
+                        text: format!("The hand-written text for this unit was not applied: {e}.")
+                            .into(),
                     },
                 );
             }
@@ -820,7 +824,8 @@ fn hand_written_template(l: &crate::review::Ledger, i: &Input, c: &mut Conversio
                 .map(|e| crate::Note {
                     status: Status::Differs,
                     rule: "review.text-not-applied".into(),
-                    text: format!("The hand-written text for this unit was not applied: {e}."),
+                    text: format!("The hand-written text for this unit was not applied: {e}.")
+                        .into(),
                 })
         } else {
             None
@@ -1080,13 +1085,16 @@ fn convert_templates(
     let work = slots(jobs_list.iter().zip(drafts));
     let progress = Progress::new(work.len(), hooks);
     let delimiters = tm.placeholders.delimiters();
+    // Equal note texts are kept once, as each template is done.
+    let pool = crate::shared::Pool::default();
     let done = parallel(jobs, &work, |w| {
         let (j, draft) = w.lock().unwrap().take().unwrap();
         if hooks.cancelled() {
             return None;
         }
         let t0 = Instant::now();
-        let c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
+        let mut c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
+        pool.share_notes(&mut c);
         progress.tick();
         Some((c, t0.elapsed().as_secs_f64()))
     });
@@ -1508,7 +1516,10 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
     let (mut units, mut converted_units) = (Vec::new(), Vec::new());
     for ((u, &l), id) in c.units.iter().zip(lines).zip(ids) {
         let worst: Vec<&crate::Note> = u.notes.iter().filter(|n| n.status == u.status).collect();
-        let mut reason = worst.first().map(|n| n.text.clone()).unwrap_or_default();
+        let mut reason = worst
+            .first()
+            .map(|n| n.text.to_string())
+            .unwrap_or_default();
         if reason.is_empty() && u.status == Status::Differs {
             // The engine's diff found it: say what.
             reason = u
@@ -1540,7 +1551,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
             } else if worst.is_empty() {
                 vec!["engine".to_string()]
             } else {
-                worst.iter().map(|n| n.rule.clone()).collect()
+                worst.iter().map(|n| n.rule.to_string()).collect()
             },
             reason,
             findings,

@@ -600,7 +600,7 @@ pub fn check_template(
                 text: format!(
                     "The template's generator directives ({}) were converted as comments, without the text they add; this unit holds only if the woven output does, so check the woven instances.",
                     directives.join(", ")
-                ),
+                ).into(),
             });
         }
         if let Some(h) = &harness {
@@ -619,7 +619,7 @@ pub fn check_template(
             u.notes.push(Note {
                 status: Status::Assumptions,
                 rule: "ASM-TEMPLATE-FRAGMENT".into(),
-                text,
+                text: text.into(),
             });
         }
         let mut used: Vec<&str> = Vec::new();
@@ -645,7 +645,7 @@ pub fn check_template(
                     if k.label().starts_with('e') { "an" } else { "a" },
                     k.label(),
                     to.display_name()
-                ),
+                ).into(),
             });
         }
         if !used.is_empty() {
@@ -656,7 +656,7 @@ pub fn check_template(
                     "{} converted as names: every value the generator fills in must be a name {} accepts as written here.",
                     used.join(", "),
                     to.display_name()
-                ),
+                ).into(),
             });
             if stand.across {
                 u.notes.push(Note {
@@ -665,7 +665,7 @@ pub fn check_template(
                     text: format!(
                         "Names with {} were bound against what other templates define, as if one weave fills each placeholder with the same value in every template; an instance woven with other values binds elsewhere, so check the woven instances.",
                         used.join(", ")
-                    ),
+                    ).into(),
                 });
             }
         }
@@ -708,7 +708,7 @@ pub fn check_template(
             u.notes.push(Note {
                 status: Status::Differs,
                 rule: "template.special-form-lost".into(),
-                text,
+                text: text.into(),
             });
         }
     }
@@ -723,7 +723,7 @@ pub fn check_template(
     let respell = |text: &str| respell(text, t, stem, &written, &specials);
     for u in &mut c.units {
         for n in &mut u.notes {
-            n.text = respell(&n.text);
+            n.text = respell(&n.text).into();
         }
     }
     // The output's own check: its side is the restored output.
@@ -901,8 +901,8 @@ fn leaked(
     let mut inner: Vec<String> = Vec::new();
     for u in c.units.iter().filter(|u| u.status > Status::Assumptions) {
         for n in u.notes.iter().filter(|n| n.status > Status::Assumptions) {
-            if !inner.contains(&n.text) {
-                inner.push(n.text.clone());
+            if !inner.iter().any(|t| *t == n.text) {
+                inner.push(n.text.to_string());
             }
         }
     }
@@ -921,7 +921,7 @@ fn leaked(
         notes: vec![Note {
             status: Status::Differs,
             rule: "template.context-leak".into(),
-            text: why.clone(),
+            text: why.clone().into(),
         }],
         trace: Vec::new(),
         src: all,

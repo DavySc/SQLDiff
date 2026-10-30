@@ -500,7 +500,7 @@ pub fn undischargeable(u: &Unit) -> Vec<String> {
             Status::Unproven | Status::Differs | Status::NotConverted => true,
             Status::Converted | Status::Assumptions | Status::Decision => false,
         })
-        .map(|n| n.rule.clone())
+        .map(|n| n.rule.to_string())
         .collect();
     // The status and the engine's part as backstops: a raised status is never
     // discharged, whatever notes it came with.
@@ -524,7 +524,7 @@ fn judge(id: &str, u: &Unit, decisions: Vec<Applied>) -> UnitReview {
         match n.status {
             Status::Assumptions if cur(State::Accepted, &n.rule) => {}
             Status::Decision if cur(State::Picked, &n.rule) => {}
-            Status::Assumptions | Status::Decision => open.push(n.rule.clone()),
+            Status::Assumptions | Status::Decision => open.push(n.rule.to_string()),
             Status::Converted | Status::Unproven | Status::Differs | Status::NotConverted => {}
         }
     }

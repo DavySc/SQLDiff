@@ -927,7 +927,7 @@ impl Review {
                 .notes
                 .iter()
                 .filter(|n| n.status == s)
-                .map(|n| n.rule.clone())
+                .map(|n| n.rule.to_string())
                 .collect();
             v.dedup();
             v
@@ -946,8 +946,8 @@ impl Review {
                 .iter()
                 .map(|n| NoteView {
                     status: n.status,
-                    rule: n.rule.clone(),
-                    text: n.text.clone(),
+                    rule: n.rule.to_string(),
+                    text: n.text.to_string(),
                 })
                 .collect(),
             findings,
@@ -1134,7 +1134,7 @@ fn open_assumptions(u: &Unit, rv: Option<&UnitReviewReport>) -> Vec<String> {
         .notes
         .iter()
         .filter(|n| n.status == Status::Assumptions)
-        .map(|n| n.rule.clone())
+        .map(|n| n.rule.to_string())
         .filter(|r| rv.map_or(true, |rv| rv.open.contains(r)))
         .collect();
     v.dedup();

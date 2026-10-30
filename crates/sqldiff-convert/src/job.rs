@@ -146,7 +146,7 @@ impl Certificates {
                                         // needed, and did not name here.
                                         || (crate::cert::NAMED_WHEN_NEEDED
                                             .contains(&n.rule.as_str())
-                                            && !c.assumptions.contains(&n.rule))
+                                            && !c.assumptions.iter().any(|a| *a == n.rule))
                                         || (c.errors.as_deref() == Some("c4")
                                             && crate::cert::DISCHARGED_BY_C4
                                                 .contains(&n.rule.as_str())))
@@ -158,8 +158,8 @@ impl Certificates {
                         }
                         _ => true,
                     };
-                    if open && !seen.contains(&n.rule) {
-                        seen.push(n.rule.clone());
+                    if open && !seen.iter().any(|s| *s == n.rule) {
+                        seen.push(n.rule.to_string());
                         why.push(match n.status {
                             crate::Status::Assumptions => format!(
                                 "{}: rests on {}, which the deployment profile does not accept",
