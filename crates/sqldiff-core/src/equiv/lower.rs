@@ -4,7 +4,7 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{parse_stmt, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use super::ast::{parse_stmt, parse_stmt_output, tokens, Expr, Output, Parser, Stmt, Tok, Type, K};
 use super::cursor::{CursorLoop, CursorOp};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
@@ -93,6 +93,9 @@ pub struct LStmt {
     /// A message or error built from a format (`ast` then says why it is
     /// not a plain statement): compared as its text (`Canon::message`).
     pub msg: Option<Msg>,
+    /// The rows the statement returns (T-SQL OUTPUT, PostgreSQL RETURNING
+    /// that is not INTO variables), which `ast` leaves out.
+    pub output: Option<Output>,
     /// A statement of a cursor loop (`cursor.rs`; `ast` then says why it is
     /// not a plain statement): compared as `Canon::cursor_op` says.
     pub cursor: Option<CursorOp>,
@@ -280,6 +283,14 @@ pub struct Unit {
     /// creates (lower case). PostgreSQL looks in `pg_temp` first, so the bare
     /// name is the temporary table, as `#t` is in T-SQL.
     pub local_temps: std::collections::HashSet<String>,
+    /// T-SQL `CREATE TABLE #t`, with the number of statements before it:
+    /// compared against the PostgreSQL `CREATE TEMP TABLE t` it became
+    /// (`mod.rs`, `temp_tables`).
+    pub temp_tables: Vec<(SyntaxNode, usize)>,
+    /// T-SQL `DROP TABLE [IF EXISTS] #t`; PostgreSQL `DROP TABLE [IF EXISTS]
+    /// t` of a temporary table the unit created (`local_temps`). Placed like
+    /// `temp_tables`.
+    pub temp_table_drops: Vec<(SyntaxNode, usize)>,
     /// IF and WHILE markers, in order among `stmts` (`CtlKind`).
     pub ctl: Vec<Ctl>,
     /// Cursor loops of the shape `cursor.rs` compares.
@@ -367,6 +378,8 @@ fn empty(d: Dialect) -> Unit {
         temp_drops: Vec::new(),
         local_tables: Vec::new(),
         local_temps: Default::default(),
+        temp_tables: Vec::new(),
+        temp_table_drops: Vec::new(),
         ctl: Vec::new(),
         cursor_loops: Vec::new(),
         cursor_vars: Vec::new(),
@@ -598,6 +611,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         ast: Ok(Stmt::Select(sel)),
         from_declare: false,
         msg: None,
+        output: None,
         cursor: None,
     });
     true
@@ -1434,6 +1448,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
             ast,
             from_declare: false,
             msg,
+            output: None,
             cursor: None,
         });
         return;
@@ -1457,6 +1472,14 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
     }
     if table_var_decl(c, d) {
         u.table_vars.push((c.clone(), u.stmts.len()));
+        return;
+    }
+    if temp_create(c, d) {
+        u.temp_tables.push((c.clone(), u.stmts.len()));
+        return;
+    }
+    if temp_table_drop(c, d, &u.local_temps).is_some() {
+        u.temp_table_drops.push((c.clone(), u.stmts.len()));
         return;
     }
     if temp_drop(c, d) {
@@ -1492,7 +1515,10 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let mut ast = parse_stmt(&toks, d);
+            let (mut ast, output) = match parse_stmt_output(&toks, d) {
+                Ok((s, o)) => (Ok(s), o),
+                Err(e) => (Err(e), None),
+            };
             let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {
@@ -1517,6 +1543,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 ast,
                 from_declare,
                 msg: None,
+                output,
                 cursor: None,
             });
         }
@@ -1528,6 +1555,12 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         // Indexes, sequences and schemas: compared statement against
         // statement (`ddl.rs`).
         StmtKind::Ddl if u.kind == UnitKind::Script && is_create_ddl(c, d) => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
+        // An index on a temporary table the unit created (T-SQL `#t`,
+        // PostgreSQL a `local_temps` name): compared statement against
+        // statement, as a script's.
+        StmtKind::Ddl if temp_index(c, d, &u.local_temps) => {
             u.ddl.push((c.clone(), u.stmts.len()));
         }
         // A routine's TRUNCATE: compared statement against statement too,
@@ -1563,6 +1596,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                         ast,
                         from_declare: false,
                         msg: None,
+                        output: None,
                         cursor: None,
                     });
                 }
@@ -1694,6 +1728,7 @@ fn cursor_stmt(c: &SyntaxNode, u: &mut Unit) -> bool {
         ast: Err("a cursor statement".into()),
         from_declare: false,
         msg: None,
+        output: None,
         cursor: Some(op),
     });
     true
@@ -1792,6 +1827,61 @@ fn temp_create(c: &SyntaxNode, d: Dialect) -> bool {
     d == Dialect::Tsql
         && cst::first_words(c, 2) == ["CREATE", "TABLE"]
         && tokens(c).get(2).is_some_and(|t| t.text.starts_with('#'))
+}
+
+/// `CREATE [UNIQUE] [NONCLUSTERED] INDEX name ON t` where `t` is a T-SQL
+/// `#t` or a PostgreSQL temporary table of `temps`.
+fn temp_index(c: &SyntaxNode, d: Dialect, temps: &std::collections::HashSet<String>) -> bool {
+    let ts = tokens(c);
+    if !ts.first().is_some_and(|t| t.up == "CREATE") {
+        return false;
+    }
+    let Some(i) = ts.iter().position(|t| t.up == "INDEX") else {
+        return false;
+    };
+    if !(ts.get(i + 2).is_some_and(|t| t.up == "ON")) {
+        return false;
+    }
+    match (d, ts.get(i + 3), ts.get(i + 4)) {
+        (_, _, Some(n)) if n.kind == K::Dot => false,
+        (Dialect::Tsql, Some(t), _) => t.text.starts_with('#') && !t.text.starts_with("##"),
+        (Dialect::Postgres, Some(t), _) => {
+            t.kind == K::Word && temps.contains(&t.text.to_lowercase())
+        }
+        _ => false,
+    }
+}
+
+/// T-SQL `DROP TABLE [IF EXISTS] #t`, PostgreSQL `DROP TABLE [IF EXISTS] t`
+/// of one of `temps`: the table's name (lower case, without `#`) and
+/// whether IF EXISTS is said.
+pub fn temp_table_drop(
+    c: &SyntaxNode,
+    d: Dialect,
+    temps: &std::collections::HashSet<String>,
+) -> Option<(String, bool)> {
+    let ts = tokens(c);
+    let ts = match ts.last() {
+        Some(t) if t.kind == K::Semi => &ts[..ts.len() - 1],
+        _ => &ts[..],
+    };
+    if !(ts.len() >= 3 && ts[0].up == "DROP" && ts[1].up == "TABLE") {
+        return None;
+    }
+    let if_exists =
+        ts.get(2).is_some_and(|t| t.up == "IF") && ts.get(3).is_some_and(|t| t.up == "EXISTS");
+    let [n] = &ts[if if_exists { 4 } else { 2 }..] else {
+        return None;
+    };
+    match d {
+        Dialect::Tsql => {
+            let rest = n.text.strip_prefix('#')?;
+            (!rest.starts_with('#')).then(|| (rest.to_lowercase(), if_exists))
+        }
+        Dialect::Postgres => (n.kind == K::Word && temps.contains(&n.text.to_lowercase()))
+            .then(|| (n.text.to_lowercase(), if_exists)),
+        Dialect::Db2i => None,
+    }
 }
 
 /// PostgreSQL `DROP TABLE IF EXISTS pg_temp.…`. Other drops are compared
@@ -2232,6 +2322,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         ast,
         from_declare: true,
         msg: None,
+        output: None,
         cursor: None,
     });
 }
