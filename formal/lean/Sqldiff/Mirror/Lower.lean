@@ -61,7 +61,7 @@ import Sqldiff.Mirror.Names
 
 namespace Sqldiff.Mirror
 
-open Sqldiff.Core (Var Stmt Arg seqList SExpr AOp COp)
+open Sqldiff.Core (Var Stmt Arg seqList SExpr AOp COp IW DPart)
 
 /-! ## Trusted inputs -/
 
@@ -83,6 +83,21 @@ structure Deployment where
   schema of `ASM-DEFAULT-SCHEMA`), as for routines. Phase C3a. -/
   tables : List (String × String) := []
 
+/-- The type of a catalog column: an integer of a width (C3a: the 32-bit
+one; C2c: `smallint`, `bigint`), (C3c) a string column, T-SQL
+`varchar(n)` (`wide = false`) or `nvarchar(n)` (`wide = true`) and
+PostgreSQL `varchar(n)` with the same `n`, `1 ≤ n ≤ 4000`
+(`CatTable.wellFormed`), (C2c) T-SQL `bit` against `boolean`, `date`,
+and `datetime2(p)` against `timestamp(p)`, `p ≤ 6` ("The C2c slice:
+typed values"). -/
+inductive ColKind where
+  | int (w : IW)
+  | str (n : Nat) (wide : Bool)
+  | bit
+  | date
+  | ts (p : Nat)
+deriving DecidableEq, Repr
+
 /-- A column of a target table (C3a): its name as the target catalog
 spells it (folded as `pgName` folds; the core's column), its spelling in
 the T-SQL table it corresponds to, and its constraints. (C3c) Its type
@@ -94,15 +109,14 @@ structure CatCol where
   tsql : String
   notNull : Bool
   key : Bool
-  /-- (C3c) `none`: the 32-bit integer. `some (n, wide)`: a string
-  column, T-SQL `varchar(n)` (`wide = false`) or `nvarchar(n)` (`wide =
-  true`) and PostgreSQL `varchar(n)` with the same `n`, `1 ≤ n ≤ 4000`
-  (`CatTable.wellFormed`). -/
-  str : Option (Nat × Bool) := none
+  /-- The column's type (`ColKind`); the 32-bit integer when not given,
+  as in C3a and C3b. -/
+  kind : ColKind := .int .i32
   /-- (C3c) The default both tables declare for the column, a constant:
-  an integer literal (`SExpr.int`) or a string literal (`SExpr.str`).
-  `none`: no default, or `DEFAULT NULL`, which an `INSERT` treats alike
-  (the column is NULL). -/
+  an integer literal (`SExpr.int`), a string literal (`SExpr.str`),
+  (C2c) a bit (`SExpr.bool`), a date (`SExpr.date`) or a timestamp
+  (`SExpr.ts`) literal. `none`: no default, or `DEFAULT NULL`, which an
+  `INSERT` treats alike (the column is NULL). -/
   dflt : Option SExpr := none
 deriving Repr
 
@@ -149,6 +163,12 @@ structure Catalog where
   answer names it as `ASM-BINARY-COLLATION` where a comparison uses it.
   See "The C2b slice: strings". -/
   binaryCollation : Bool := false
+  /-- (C2c) The declared parameter types of the PostgreSQL routines a
+  `CALL` can reach, as their DDL spells them, by folded name. A call is in
+  the spec only when every argument is shown to have exactly its
+  parameter's type ("Calls" below); a routine without an entry here takes
+  no arguments in the spec. -/
+  routineTys : List (String × List Ast.Ty) := []
 
 /-- The empty catalog. -/
 instance : EmptyCollection Catalog := ⟨{ routines := [] }⟩
@@ -218,9 +238,9 @@ PostgreSQL, the target's reference name. Empty outside data statements. -/
 structure Scope where
   cols : List (String × Core.Col) := []
   rel : Option String := none
-  /-- (C3c) The string columns among `cols` and their types
-  (`CatCol.str`); every other column is an integer. -/
-  strCols : List (Core.Col × (Nat × Bool)) := []
+  /-- (C3c, C2c) The kinds of the columns (`CatCol.kind`); a column not
+  listed is the 32-bit integer. -/
+  colTys : List (Core.Col × ColKind) := []
 
 /-- A one-part name: a column (`inl`), a variable (`inr`), or outside the
 spec (`none`). Outside data statements a T-SQL name is outside the spec
@@ -266,42 +286,78 @@ the three-valued booleans of conditions and the NULL literal.
   which this rule assumes.
 * Type arguments (`int(4)`) put a declaration outside the slice. -/
 
-/-- The type of an expression of the slice. `nul` is the NULL literal,
-which takes the integer type from where it stands (a value position:
+/-- The type of an expression of the slice. `int w` is a signed integer
+of width `w` (C2c: `smallint`, `int`, `bigint`; before C2c the one
+integer type was the 32-bit one). `nul` is the NULL literal,
+which takes the type from where it stands (a value position:
 assignment, `COALESCE`/`ISNULL` argument, `CASE` result). `str n wide`
 is a string (C2b, "The C2b slice: strings"): `n` bounds the length of
 every value it can have (`none`: no bound), in T-SQL in bytes for
 `varchar` and in UTF-16 code units for `nvarchar` (so also in
 characters), in PostgreSQL in characters; `wide` says that a T-SQL value
 may hold characters outside the database's code page (it comes from an
-`nvarchar`); it is always `false` in PostgreSQL. -/
+`nvarchar`); it is always `false` in PostgreSQL. (C2c) `bit` is a T-SQL
+`bit` or a PostgreSQL `boolean` value (a three-valued boolean that can
+be stored; `bool` is a condition), `date` a date and `ts p` a timestamp
+without time zone with `p` fractional digits of its seconds ("The C2c
+slice: typed values"). -/
 inductive STy where
-  | int
+  | int (w : IW)
   | bool
   | nul
   | str (n : Option Nat) (wide : Bool)
+  | bit
+  | date
+  | ts (p : Nat)
 deriving DecidableEq, Repr
 
 /-- The declared types of a routine's variables, by lowered name. -/
 abbrev TyEnv := List (Var × Ast.Ty)
 
-/-- The declared type is the slice's integer type. -/
-def intType : Dialect → Ast.Ty → Bool
-  | .tsql _ _, .Ty n [] => n.toUpper == "INT" || n.toUpper == "INTEGER"
-  | .pg _ _, .Ty n [] => n.toUpper == "INT" || n.toUpper == "INTEGER" || n.toUpper == "INT4"
-  | _, _ => false
+/-- The width of a declared integer type of the slice (C2c: "Integer
+widths" below), `none` for any other type. -/
+def intWidth : Dialect → Ast.Ty → Option IW
+  | .tsql _ _, .Ty n [] =>
+    let u := n.toUpper
+    if u == "INT" || u == "INTEGER" then some .i32
+    else if u == "BIGINT" then some .i64
+    else if u == "SMALLINT" then some .i16
+    else none
+  | .pg _ _, .Ty n [] =>
+    let u := n.toUpper
+    if u == "INT" || u == "INTEGER" || u == "INT4" then some .i32
+    else if u == "BIGINT" || u == "INT8" then some .i64
+    else if u == "SMALLINT" || u == "INT2" then some .i16
+    else none
+  | _, _ => none
 
-def intVar (d : Dialect) (env : TyEnv) (x : Var) : Bool :=
-  match lookup env x with
-  | some t => intType d t
-  | none => false
+/-- The declared type is an integer type of the slice (any width). -/
+def intType (d : Dialect) (ty : Ast.Ty) : Bool := (intWidth d ty).isSome
 
-/-- A value position takes an integer or the NULL literal. -/
+/-- The width of an integer variable. -/
+def intVarW (d : Dialect) (env : TyEnv) (x : Var) : Option IW :=
+  (lookup env x).bind (intWidth d)
+
+def intVar (d : Dialect) (env : TyEnv) (x : Var) : Bool := (intVarW d env x).isSome
+
+/-- A value position that T-SQL converts to `int` (the return status, a
+call argument) takes an integer of at most 32 bits or the NULL literal:
+a `smallint` widens without a conversion that could fail. -/
 def valTy : STy → Bool
-  | .int => true
+  | .int .i16 | .int .i32 => true
   | .nul => true
-  | .bool => false
-  | .str .. => false
+  | _ => false
+
+/-- The widths, ordered: a value of a narrower width fits a wider one. -/
+def _root_.Sqldiff.Core.IW.rank : IW → Nat
+  | .i16 => 16
+  | .i32 => 32
+  | .i64 => 64
+
+def _root_.Sqldiff.Core.IW.le (a b : IW) : Bool := a.rank ≤ b.rank
+
+/-- The width of an arithmetic result: the wider operand's. -/
+def _root_.Sqldiff.Core.IW.join (a b : IW) : IW := if a.le b then b else a
 
 /-! ## The C2a slice: literals
 
@@ -322,21 +378,39 @@ number's text, `-5` as `Num "-5"`), without a leading zero, and in the
   `-2147483648` are `integer`, `2147483648` is `bigint`).
 * Underscores (PostgreSQL 16 and later accept `1_000`), hexadecimal,
   exponents and leading zeros are outside the slice: `String.toInt?`
-  accepts underscores, so this rule reads the digits itself. -/
+  accepts underscores, so this rule reads the digits itself.
+* (C2c) PostgreSQL: a constant outside the 32-bit range that fits 64
+  bits "is presumed to be type bigint" (4.1.2.6), typed `int .i64`
+  (`int64Lit?`). Probed, eval/values V2 (`2147483648` is `bigint`). In
+  T-SQL such a constant is `numeric(p,0)` ("Constants (Transact-SQL)":
+  "Integer constants greater than 2,147,483,647 are converted to the
+  decimal data type, not the bigint data type"; probed, eval/values V2:
+  `2147483648` is `numeric(10,0)`), outside the slice as an operand
+  (decimals are a later part), except as the whole value stored into a
+  `bigint` or compared with one (`coerce`), where the `numeric` to
+  `bigint` conversion is exact and the comparison converts the `bigint`
+  to `numeric` without a change of value ("Data type precedence"). -/
 
 def digitsVal : List Char → Nat → Option Nat
   | [], acc => some acc
   | c :: cs, acc =>
     if '0' ≤ c && c ≤ '9' then digitsVal cs (acc * 10 + (c.toNat - '0'.toNat)) else none
 
-def intLit? (s : String) : Option Int :=
+/-- A decimal integer constant of at most `maxDigits` digits, optionally
+after `-`, without a leading zero, within the width. -/
+def intLitW? (w : IW) (maxDigits : Nat) (s : String) : Option Int :=
   let (neg, ds) : Bool × List Char := match s.toList with
     | '-' :: ds => (true, ds)
     | ds => (false, ds)
-  if ds.isEmpty || ds.length > 10 || (ds.length > 1 && ds.head? == some '0') then none
+  if ds.isEmpty || ds.length > maxDigits || (ds.length > 1 && ds.head? == some '0') then none
   else (digitsVal ds 0).bind fun n =>
     let v : Int := if neg then -(n : Int) else n
-    if Core.intMin ≤ v ∧ v ≤ Core.intMax then some v else none
+    if w.fits v then some v else none
+
+def intLit? (s : String) : Option Int := intLitW? .i32 10 s
+
+/-- (C2c) A constant of the 64-bit range (PostgreSQL `bigint`). -/
+def int64Lit? (s : String) : Option Int := intLitW? .i64 19 s
 
 /-! ## The C2a slice: operators
 
@@ -717,6 +791,249 @@ probed for strings.
 
 **`IS [NOT] NULL`** of a string: TRUE or FALSE, as for integers. -/
 
+/-! ## The C2c slice: typed values
+
+C2c adds values beyond `int` and strings: the integer widths `smallint`
+and `bigint`, T-SQL `bit` against PostgreSQL `boolean`, and `date` and
+`datetime2(p)` (`p ≤ 6`) against PostgreSQL `date` and `timestamp(p)`,
+with their literals, comparisons, stores and the day/month/year
+arithmetic, in exactly the forms `sqldiff convert --to postgres` writes.
+Each rule states its claim, the vendor text and the probe. "eval/values
+Vn" is probe `Vn` of `eval/values/{mssql,postgres}.sql` with their
+`.out` files, run on SQL Server 2022 and PostgreSQL 18 on 2026-10-30.
+**Every vendor quote in this section was written from memory** (the
+vendor sites were not reachable when it was written) and needs checking
+against the page named; the probes are what the rules rest on.
+`decimal`, `datetime`, `smalldatetime`, `datetimeoffset`, `time`,
+`datetime2(7)`, `datetime2` without a precision (which is `datetime2(7)`)
+and `tinyint` stay outside (an `ASM-FRACTIONAL-SECONDS` or `ASM-TINYINT`
+conversion is not an identity).
+
+**Integer widths** (`intWidth`). T-SQL `smallint` (16 bits), `int`
+(32) and `bigint` (64) against PostgreSQL `smallint`/`int2`,
+`integer`/`int`/`int4` and `bigint`/`int8`: the same ranges ("int,
+bigint, smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table
+8.2). A value is an integer of its width (`STy.int w`,
+`Sqldiff.Core.Val.int`); the width is the operator's business.
+
+* **Arithmetic** `+ - * /` on two integers has the wider operand's width
+  and raises on overflow, in both dialects ("Data type precedence
+  (Transact-SQL)": the operand of higher precedence, `bigint` over `int`
+  over `smallint`; PostgreSQL 10.2 "Operators": the operator whose types
+  the operands convert to implicitly, `int2 + int4` being `int4`,
+  `int4 + int8` being `int8`). Two `smallint`s give a `smallint` in both
+  (not an `int`): probed, eval/values V1 (`smallint + smallint` is
+  `smallint` on both, `32767 + 32767` raises 8115 against 22003; `int +
+  bigint` is `bigint`; `bigint + 1`, `* 2` and `min / -1` overflow with
+  8115 against 22003; `bigint / 7` truncates alike; `bigint / 0` is 8134
+  against 22012). The core computes at the result's width
+  (`Sqldiff.Core.arithInt`, `toIntW`). **Division of two `smallint`s**
+  is a `smallint` division and raises on `-32768 / -1` on both engines
+  (probed, V1: 8115 against 22003), as the core's 16-bit overflow does.
+  A literal divisor is an `int`, so `@s / -1` is an `int` division and
+  gives 32768 on both (probed, V1). `%` keeps its literal-divisor rule
+  at every width (`smallint % smallint` of `-32768 % -1` is 8115 against
+  0, `bigint % -1` of the minimum is 8115 against 0, probed V1).
+* **Negation** `-x` keeps the width and raises on `-(-32768)` for a
+  `smallint` in both (probed, V1: 8115 against 22003).
+* **Comparisons** of two integers of any widths are the slice's
+  comparisons: the narrower operand converts to the wider without a
+  change of value.
+* **Stores between widths** (`fitsSTy`). A value stored into a wider
+  type keeps its value (probed, V2); into a narrower one both engines
+  convert and raise when it does not fit (probed, V2: `int` 40000 into
+  `smallint` is error 220 against 22003, `bigint` 3000000000 into `int`
+  8115 against 22003). The core stores a value as it is, so a narrowing
+  store is in the spec only when the value provably fits: a literal in
+  the target's range, or a value of the target's width or narrower; the
+  rest is outside, on every path (as for strings, "String stores, on
+  every path"). `COUNT(*)` is a T-SQL `int` and a PostgreSQL `bigint`
+  (probed, V2), so it stores into an `int` variable only (C3b rule 4, as
+  before): into a `bigint` T-SQL still raises 8115 beyond 2^31-1 rows
+  and PostgreSQL does not (the 2^31 rows are not probed; the types
+  are), into a `smallint` both may raise. A `bit`, date or timestamp
+  value stored into an integer is outside too: T-SQL stores a bit as 0
+  or 1 and PL/pgSQL raises 22P02 (probed, V3).
+* `COALESCE`, `ISNULL`, `CASE` over integers of several widths take the
+  widest (the highest precedence in T-SQL; PostgreSQL 10.5 resolves to
+  the common type); `ISNULL(x, y)` keeps `x`'s type, so `y` must fit it.
+* Parameters and results: `bigint` and `smallint` correspond to
+  themselves (`tyCorr`). A call argument must have exactly its callee's
+  parameter type, which the request names ("Argument types" in
+  "Calls"): PostgreSQL has no implicit `integer` to `smallint` or
+  `boolean` conversion in procedure resolution (42883), and an `INOUT`
+  variable that needs one is not writable. The declared types of the
+  variables the certificate pairs must correspond too (`localTyCorr`,
+  `Check.lean`), and a slice value is not stored into a variable of a
+  type outside the slice (`storeOkTy`): both engines convert on the
+  store, differently (a `datetime2(6)` value into T-SQL `datetime` and
+  PostgreSQL `timestamp`: `.123333` against `.123456`).
+
+**`bit` against `boolean`** (`bitType`). The converter maps T-SQL `bit`
+to `boolean` (crates/sqldiff-convert/src/tsql/bits.rs). A `bit` holds
+0, 1 or NULL; a `boolean` FALSE, TRUE or NULL; the correspondence is
+0 to FALSE and 1 to TRUE (`Sqldiff.Core.Val.bool`, the same value a
+comparison gives). "bit (Transact-SQL)": "The string values TRUE and
+FALSE can be converted to bit values"; "Converting to bit promotes any
+nonzero value to 1". Probed, V3 (`2`, `-5`, `'TRUE'` store 1; `0`,
+`'FALSE'` store 0).
+
+* **Stores** into a `bit`/`boolean` variable or column: the T-SQL
+  literals `0` and `1` against PostgreSQL `FALSE` and `TRUE`, NULL, or
+  another `bit` value (`coerce`, `fitsSTy`). Any other value (`2`, an
+  `int` expression, a string) is outside the spec: T-SQL converts it
+  ("any nonzero value to 1") where PostgreSQL has no assignment cast
+  from the numbers (the converter writes `(v <> 0)` for those, outside
+  this slice).
+* **Comparisons** `@b = 1`, `@b = 0`, `@b <> 1`, `@b <> 0` (either
+  operand order) against `b = TRUE`, `b = FALSE`, `b <> TRUE`,
+  `b <> FALSE`, the forms the converter writes (`tsql.bit.compare`):
+  T-SQL converts the `bit` to `int` ("Data type precedence": `int` over
+  `bit`; probed, V3: `@b + 0` is `int`) and compares, so `@b = 1` is
+  TRUE for 1, FALSE for 0, UNKNOWN for NULL; PostgreSQL `b = TRUE` is
+  `b` itself, three-valued (9.1 "Logical Operators"). Both lower to the
+  comparison `cmp eq|ne b (bool k)` (`bitCmp`), which keeps
+  `ASM-TSQL-ANSI-NULLS` in the residual: under `ANSI_NULLS OFF` a NULL
+  bit `<> 1` is TRUE in T-SQL, UNKNOWN in PostgreSQL (review of C2c:
+  SQL Server 1, PostgreSQL 0). Probed, V3: the three-valued tables agree
+  on both engines for 1, 0 and NULL, and `NOT NULL` is UNKNOWN. `@b = 2` (never TRUE), a
+  comparison of two `bit`s, `bit` in `COALESCE`/`ISNULL` with a number,
+  and arithmetic on a `bit` are outside.
+* `IS [NOT] NULL` as for integers. A `bit` is never a key column
+  (`CatCol.ok`).
+
+**`date` and `datetime2(p)` against `date` and `timestamp(p)`**
+(`dateType`, `tsType`). Values are days of the proleptic Gregorian
+calendar (`Sqldiff.Core.Calendar`, `Val.date`) and microseconds
+(`Val.ts`); `datetime2(p)` keeps `p` fractional digits, `timestamp(p)`
+the same ("datetime2 (Transact-SQL)": "fractional seconds precision ...
+0 to 7"; PostgreSQL 8.5: `timestamp [(p)]`, "p ... from 0 to 6"); a
+PostgreSQL `timestamp` without `p` is `timestamp(6)` (8.5: "the
+default is 6"; `tsType`). `p = 7` has no mirror and is outside, so is
+`datetime2` without a precision ("the default precision is 7"). The
+ranges: T-SQL 0001-01-01 to 9999-12-31 for both types ("date
+(Transact-SQL)", "datetime2 (Transact-SQL)"); PostgreSQL's is wider
+(8.5, Table 8.9: 4713 BC to 5874897 AD for `date`). A value a T-SQL
+caller can pass is in both ranges, and a value a routine makes is held
+in range by `ASM-DATEADD-RANGE` below; the core holds every day number.
+
+* **Literals** (`dateLit?`, `tsLit?`, `coerce`). A string literal in a
+  position whose type is `date` is in the slice only as
+  `'YYYY-MM-DD'` (four, two and two digits, a date of the calendar);
+  in a `datetime2(p)`/`timestamp(p)` position only as
+  `'YYYY-MM-DDThh:mm:ss[.f]'` with `hh < 24`, `mm < 60`, `ss < 60` and
+  at most `p` fractional digits. T-SQL: these are the ISO 8601 forms,
+  which "aren't affected by the SET LANGUAGE and SET DATEFORMAT session
+  locale settings" ("datetime2 (Transact-SQL)", ISO 8601; "date
+  (Transact-SQL)": the `YYYY-MM-DD` form is ISO 8601 and not affected
+  either). Probed, V4: under `DATEFORMAT ydm`, `dmy` and `LANGUAGE
+  British` a `date` and a `datetime2` read `2024-01-02` as January 2
+  (a `datetime`, outside the spec, reads it as February 1 under `ydm`).
+  PostgreSQL: `YYYY-MM-DD` is "ISO 8601; January 8 in any mode" (8.5.2,
+  Table 8.10), and the `T` separator of ISO 8601 is accepted in time
+  stamp input (8.5.1.3); probed, V4 under `DateStyle` `SQL, DMY`,
+  `Postgres, YMD` and `German, DMY`. A literal with more fractional
+  digits than `p` is outside: both engines round, but not alike at a
+  half (probed, V4: `.1234565` into six digits is `.123457` in SQL
+  Server and `.123456` in PostgreSQL). An invalid date is an error on
+  both (V4: `2024-02-30` is 241 against 22008) and outside. Every other
+  form (`'20240102'`, `'01/02/2024'`, a date-only literal where a
+  timestamp is needed, a literal with a time zone) is outside. The
+  explicit `CAST('...' AS date)` and `CAST('...' AS datetime2(p))`
+  (`timestamp(p)`) of such a literal is the same value (V4: the types).
+* **Comparisons** `= <> < <= > >=` of two dates, or of two timestamps
+  (any precisions), are the slice's three-valued comparisons by day or
+  microsecond number ("date (Transact-SQL)", "datetime2 (Transact-SQL)":
+  the types support the comparison operators; PostgreSQL 9.9, Table 9.33;
+  `ASM-TSQL-ANSI-NULLS` as for integers). A date against a timestamp
+  compares the date at midnight (`toTs`): T-SQL converts the `date` to
+  `datetime2` ("Data type precedence": `datetime2` over `date`; "date
+  (Transact-SQL)", "Converting date to other date and time types": the
+  time is "00:00:00.0000000"), PostgreSQL casts `date` to `timestamp`
+  (8.5: a date is a timestamp "at midnight"). Probed, V5.
+* **Stores**: a date into a `date`, a timestamp of at most `p` digits
+  into a `datetime2(p)`/`timestamp(p)` (a wider precision keeps the
+  value exactly: probed V4, `.123` into six digits), a date into a
+  timestamp as midnight (`toTs`; probed V5), NULL. A timestamp into a
+  `date` by assignment is outside: both engines truncate (probed V5),
+  but the core would store the timestamp (write `CAST(x AS date)`). A
+  timestamp into a narrower precision is outside: both engines round
+  (probed V4, `.1235` into three digits is `.124` on both), whether
+  alike at every half is not probed.
+* **`CAST(x AS date)`** of a timestamp drops the time (`toDate`;
+  "date (Transact-SQL)", "Converting other date and time types to the
+  date data type": "the time part is truncated"; PostgreSQL 9.9, "date
+  (timestamp)" truncates; probed, V5: `23:59:59.999999` gives the same
+  day). Of a date it is the date.
+* **`DATEADD(day | month | year, n, d)`** (T-SQL; the dateparts also as
+  `dd`, `d`, `mm`, `m`, `yy`, `yyyy`, "DATEADD (Transact-SQL)") against
+  the converter's forms (`tsql.dateadd`, crates/sqldiff-convert/src/
+  tsql.rs): on a `date`, `(d + n)` and `(d - m)` for days and
+  `(d + make_interval(months => n))::date`, `(d + make_interval(years
+  => n))::date`; on a `datetime2(p)`, `(d + make_interval(days | months
+  | years => n))`; `n` an `int` (or `smallint`) expression of the slice.
+  `date + make_interval(...)` without the `::date` is a `timestamp` in
+  PostgreSQL (probed, V6: `pg_typeof`; `(d + make_interval(months =>
+  1)) + 1` raises 42883), so it is typed `ts 6` (`pgIntervalAddTy`) and
+  only the cast makes it a date again (`mkToDate`, whose fold is
+  `mkToDate_dateAdd_eval`); the converter always writes the cast
+  (probed, V6: a nested `DATEADD` gives 2024-03-01 and 59 days on both).
+  Both lower to `dateAdd part n d`: days are added to the day number;
+  months and years move the month, keeping the day of the month or
+  clamping it to the result month's last day ("DATEADD (Transact-SQL)":
+  "If the day of the month in the return month is less than the day of
+  the month in date, the last day of the return month is returned";
+  PostgreSQL 9.9: `date + interval` and `timestamp + interval`, "adding
+  a month ... the last day of February"); the time of day of a
+  timestamp is kept. Probed, V6 (2024-01-31 + 1 month = 2024-02-29, +
+  13 months = 2025-02-28, 2024-03-31 - 1 month = 2024-02-29, 2024-02-29
+  + 1 year = 2025-02-28, - 1 year = 2023-02-28, + 4 years = 2028-02-29,
+  days across February, the time kept, NULL for a NULL operand, the
+  result types; the same on both engines). Microsoft's page states the
+  clamp for months only, so a confirmation with `DATEADD(year, ...)`
+  names `ASM-DATEADD-YEAR-END`, as the converter does; V6 shows it. The
+  result is not held to a range: T-SQL raises 517 when it leaves
+  0001-01-01 to 9999-12-31 and PostgreSQL returns the value (probed,
+  V6: `9999-12-31 + 1 day`, `0001-06-01 - 1 year`, and `+ 1 month` on
+  a `datetime2` at the end, 517 against `10000-01-01`, `0001-06-01 BC`
+  and `10000-01-31`; `+ 2147483647 days` is 517 against 22008), so a
+  confirmation with `DATEADD` names `ASM-DATEADD-RANGE` (the result
+  stays in the range), as the converter does. `DATEADD` with any other
+  datepart (`week`, `quarter`, `hour`, ...), on another type, with a
+  `bigint` number, a string date or a date-only literal, is outside, and
+  so is a PostgreSQL `make_interval` with another argument set.
+* **`DATEDIFF(day, a, b)`** (also `dd`, `d`) against the converter's
+  `((b)::date - (a)::date)` (`tsql.datediff`): the number of day
+  boundaries crossed from `a` to `b`, the day number of `b`'s date minus
+  that of `a`'s, an `int` ("DATEDIFF (Transact-SQL)": "the count ... of
+  the specified datepart boundaries crossed"; PostgreSQL 9.9: `date -
+  date → integer`, "Subtract dates, producing the number of days
+  elapsed"). Both lower to `dateDiff a' b'` with each argument's date
+  (`toDate` on a timestamp, `mkToDate`). Probed, V7
+  (`2024-01-01T23:59` to `2024-01-02T00:01` is 1, reversed -1, a day
+  of 23 hours 59 minutes is 0, 61 days across February, 3652058 days
+  from 0001-01-01 to 9999-12-31, NULL; the same on both). The count
+  cannot overflow within the range. Other dateparts are outside.
+* `IS [NOT] NULL`, `COALESCE` and `CASE` over two dates or two
+  timestamps (the widest precision), as for integers. Reads of the
+  clock (`SYSDATETIME()`, `GETDATE()`, `now()`, `clock_timestamp()`),
+  `DATEPART`, `EOMONTH`, formatting and string conversions are outside.
+* Parameters and results: `date` corresponds to `date`;
+  `datetime2(6)` to `timestamp(6)` or `timestamp` only (`tyCorr`):
+  PostgreSQL drops a parameter's and a result's type modifier ("Parameters
+  carry no length", C2b), so a `timestamp(3)` parameter keeps six
+  digits where a `datetime2(3)` one rounds an argument to three.
+  Locals may have any `p ≤ 6`. A `date` or `datetime2(p)` column may be
+  a key column (exact equality on both, `Core.keyVal`); probed, V8 (a
+  duplicate date key is 2627 against 23505, and typed columns store and
+  read back their values, defaults included, on both).
+
+**Catalog columns** (`ColKind`, "The C3c tables"): `bigint`, `smallint`,
+`bit`/`boolean`, `date` and `datetime2(p)`/`timestamp(p)` columns, with
+constant defaults in the literal forms above (`0`/`1` against
+`FALSE`/`TRUE` for a bit column, the ISO literals for dates; `CatCol.ok`).
+Probed, V8. -/
+
 /-- Digits as a number; nothing else (no sign, no `MAX`). -/
 def natArg? (s : String) : Option Nat :=
   if s.isEmpty then none else digitsVal s.toList 0
@@ -762,11 +1079,53 @@ def strType : Dialect → Ast.Ty → Option (Option Nat × Bool)
 def strVar (d : Dialect) (env : TyEnv) (x : Var) : Option (Option Nat × Bool) :=
   (lookup env x).bind (strType d)
 
-/-- The type of a variable of the slice: the integer type or a string
-type (C2b). -/
+/-- (C2c) The declared type is T-SQL `bit` or PostgreSQL `boolean`. -/
+def bitType : Dialect → Ast.Ty → Bool
+  | .tsql _ _, .Ty n [] => n.toUpper == "BIT"
+  | .pg _ _, .Ty n [] => n.toUpper == "BOOLEAN" || n.toUpper == "BOOL"
+  | _, _ => false
+
+/-- (C2c) The declared type is `date` (both dialects). -/
+def dateType : Dialect → Ast.Ty → Bool
+  | _, .Ty n [] => n.toUpper == "DATE"
+  | _, _ => false
+
+/-- (C2c) The declared type is T-SQL `datetime2(p)` or PostgreSQL
+`timestamp(p)` (also `timestamp(p) without time zone`, and without
+`(p)`: six digits), `p ≤ 6`: its precision. -/
+def tsType : Dialect → Ast.Ty → Option Nat
+  | .tsql _ _, .Ty n [a] =>
+    if n.toUpper == "DATETIME2" then (natArg? a).bind fun p => if p ≤ 6 then some p else none
+    else none
+  | .pg _ _, .Ty n args =>
+    let u := n.toUpper
+    if u == "TIMESTAMP" || u == "TIMESTAMP WITHOUT TIME ZONE" then
+      match args with
+      | [] => some 6
+      | [a] => (natArg? a).bind fun p => if p ≤ 6 then some p else none
+      | _ => none
+    else none
+  | _, _ => none
+
+/-- The slice type of a declared type, if it has one (C2a integers, C2b
+strings, C2c widths, bit, date and timestamps). -/
+def valTypeOf (d : Dialect) (ty : Ast.Ty) : Option STy :=
+  match intWidth d ty with
+  | some w => some (.int w)
+  | none =>
+    match strType d ty with
+    | some (n, w) => some (.str n w)
+    | none =>
+      if bitType d ty then some .bit
+      else if dateType d ty then some .date
+      else (tsType d ty).map .ts
+
+/-- The type of a variable of the slice. -/
 def varTy (d : Dialect) (env : TyEnv) (x : Var) : Option STy :=
-  if intVar d env x then some .int
-  else (strVar d env x).map fun (n, w) => .str n w
+  (lookup env x).bind (valTypeOf d)
+
+/-- The declared type of a variable, as a slice type, for a store into it. -/
+def wantOf (d : Dialect) (env : TyEnv) (x : Var) : Option STy := varTy d env x
 
 /-- A string literal of the slice: printable ASCII, no backslash. -/
 def strLitOk (s : String) : Bool :=
@@ -792,6 +1151,68 @@ def fitsLen : Option Nat → Option Nat → Bool
   | none, _ => true
   | some n, some m => m ≤ n
   | some _, none => false
+
+/-- (C2c) `n` decimal digits as a number. -/
+def fixedDigits (n : Nat) (cs : List Char) : Option Nat :=
+  if cs.length == n then digitsVal cs 0 else none
+
+/-- (C2c) `'YYYY-MM-DD'`, a date of the calendar within 0001-01-01 and
+9999-12-31, as its day number ("Literals" in "The C2c slice"). -/
+def dateLit? (s : String) : Option Int :=
+  match s.splitOn "-" with
+  | [y, m, d] => do
+    let y ← fixedDigits 4 y.toList
+    let m ← fixedDigits 2 m.toList
+    let d ← fixedDigits 2 d.toList
+    if Core.Calendar.validDate y m d then some (Core.Calendar.daysFromCivil y m d) else none
+  | _ => none
+
+/-- (C2c) `'YYYY-MM-DDThh:mm:ss[.f]'` with at most `p` fractional digits,
+as microseconds since 0001-01-01T00:00:00. -/
+def tsLit? (p : Nat) (s : String) : Option Int :=
+  match s.splitOn "T" with
+  | [d, t] => do
+    let day ← dateLit? d
+    let (hms, frac) : String × List Char := match t.splitOn "." with
+      | [hms] => (hms, [])
+      | [hms, f] => (hms, f.toList)
+      | _ => ("", ['x'])
+    let (h, mi, se) ← match hms.splitOn ":" with
+      | [h, mi, se] => do pure (← fixedDigits 2 h.toList, ← fixedDigits 2 mi.toList,
+          ← fixedDigits 2 se.toList)
+      | _ => none
+    if h ≥ 24 || mi ≥ 60 || se ≥ 60 || frac.isEmpty && (t.splitOn ".").length > 1 ||
+        frac.length > p then none
+    else
+    let us ← digitsVal (frac ++ List.replicate (6 - frac.length) '0') 0
+    some (day * Core.Calendar.usPerDay + (((h * 60 + mi) * 60 + se) * 1000000 + us : Nat))
+  | _ => none
+
+/-- (C2c) A literal read by the type of the position it stands in
+(`want`): the T-SQL `bit` literals `0` and `1` and the PostgreSQL
+`FALSE`/`TRUE` (the latter also typed on their own, `typed`), and the
+ISO date and timestamp literals, with `CAST(... AS type)` around them or
+not. `none`: no such literal; the position then takes what `typed`
+gives. -/
+def coerce (d : Dialect) (want : STy) : Ast.Expr → Option (SExpr × STy)
+  | .Num "0" => if (d matches .tsql _ _) && want == .bit then some (.bool false, .bit) else none
+  | .Num "1" => if (d matches .tsql _ _) && want == .bit then some (.bool true, .bit) else none
+  -- T-SQL: a constant beyond the `int` range is `numeric(p,0)`; stored into
+  -- a `bigint`, or compared with one, it is the integer it spells ("Integer
+  -- widths": the conversion is exact), and nothing else is done with it.
+  | .Num s => match d, want with
+    | .tsql _ _, .int .i64 => if (intLit? s).isNone then (int64Lit? s).map fun n => (.int n, .int .i64) else none
+    | _, _ => none
+  | .Str s => match want with
+    | .date => (dateLit? s).map fun v => (.date v, .date)
+    | .ts p => (tsLit? p s).map fun v => (.ts v, .ts p)
+    | _ => none
+  | .Cast (.Str s) ty =>
+    if dateType d ty then (dateLit? s).map fun v => (.date v, .date)
+    else match tsType d ty with
+      | some p => (tsLit? p s).map fun v => (.ts v, .ts p)
+      | none => none
+  | _ => none
 
 /-- `rtrim`, folded on a literal and on an `rtrim`
 (`Sqldiff.Mirror.mkRtrim_eval`: the same meaning). Both lowerings use it,
@@ -824,37 +1245,79 @@ theorem mkRtrim_eval {U : Type} (σ ρ : Core.Store U) (a : SExpr) :
     | ok v => cases v <;> simp [rtrimSp_idem, Core.typeErr]
   | _ => rfl
 
-/-- (C3c) The type of a column read: an integer, or a string of the
-column's length, `wide` for a T-SQL `nvarchar` ("The C3c tables"). -/
+/-- (C3c, C2c) The slice type of a column of a kind: a string of the
+column's length is `wide` for a T-SQL `nvarchar` ("The C3c tables"). -/
+def kindTy (d : Dialect) : ColKind → STy
+  | .int w => .int w
+  | .str n w => .str (some n) (w && (d matches .tsql _ _))
+  | .bit => .bit
+  | .date => .date
+  | .ts p => .ts p
+
+/-- (C3c) The type of a column read. -/
 def colTy (d : Dialect) (sc : Scope) (c : Core.Col) : STy :=
-  match lookup sc.strCols c with
-  | some (n, w) => .str (some n) (w && (d matches .tsql _ _))
-  | none => .int
+  match lookup sc.colTys c with
+  | some k => kindTy d k
+  | none => .int .i32
 
 /-- The type `COALESCE` or `CASE` gives two value arguments, or `none`
-when they do not go together (an integer and a string, or a boolean). -/
+when they do not go together (an integer and a string, or a boolean;
+(C2c) integers of two widths take the wider, timestamps the wider
+precision). -/
 def joinTy : STy → STy → Option STy
   | .nul, .nul => some .nul
-  | .nul, .int | .int, .nul | .int, .int => some .int
+  | .nul, .int w | .int w, .nul => some (.int w)
+  | .int w, .int v => some (.int (w.join v))
   | .nul, .str n w | .str n w, .nul => some (.str n w)
   | .str n w, .str m v => some (.str (maxB n m) (w || v))
+  | .nul, .bit | .bit, .nul | .bit, .bit => some .bit
+  | .nul, .date | .date, .nul | .date, .date => some .date
+  | .nul, .ts p | .ts p, .nul => some (.ts p)
+  | .ts p, .ts q => some (.ts (max p q))
   | _, _ => none
 
-/-- A value type: an integer, a string or the NULL literal. -/
+/-- A value type: an integer, a string, (C2c) a bit, a date, a
+timestamp, or the NULL literal. -/
 def isVal : STy → Bool
   | .bool => false
   | _ => true
 
-/-- A value of type `vt` can be stored in a variable, parameter or result
-declared `ty` without a conversion the core does not show: an integer
-(or NULL) into the slice's integer type; a string (or NULL) that fits
-into a string type ("Assignment converts, differently"). -/
-def fitsTy (d : Dialect) (ty : Ast.Ty) (vt : STy) : Bool :=
-  if intType d ty then vt == .int || vt == .nul
-  else match strType d ty, vt with
-    | some _, .nul => true
-    | some (n, wt), .str m w => fitsLen n m && (wt || !w)
-    | _, _ => false
+/-- (C2c) A value `v` (its slice form and type) can be stored into a slot
+of slice type `want` without a conversion that could change it or
+fail, and the form stored (a date into a timestamp slot at midnight,
+`toTs`): NULL into anything; an integer into a width it fits (its own
+width or wider, or a literal in the target's range: "Stores between
+widths"); a string that fits ("Assignment converts, differently"); a bit
+into a bit; a date into a date; a timestamp of at most the slot's
+precision, or a date, into a timestamp. -/
+def fitValue (want : STy) : SExpr × STy → Option SExpr
+  | (v, .nul) => some v
+  | (v, .int w) => match want with
+    | .int t => if w.le t then some v else match v with
+      | .int n => if t.fits n then some v else none
+      | _ => none
+    | _ => none
+  | (v, .str m w) => match want with
+    | .str n wt => if fitsLen n m && (wt || !w) then some v else none
+    | _ => none
+  | (v, .bit) => if want == .bit then some v else none
+  | (v, .date) => match want with
+    | .date => some v
+    | .ts _ => some (.toTs v)
+    | _ => none
+  | (v, .ts q) => match want with
+    | .ts p => if q ≤ p then some v else none
+    | _ => none
+  | (_, .bool) => none
+
+def fitsSTy (want : STy) (v : SExpr × STy) : Bool := (fitValue want v).isSome
+
+/-- A value can be stored in a variable, parameter or result declared
+`ty` without a conversion the core does not show (`fitValue`). -/
+def fitsTy (d : Dialect) (ty : Ast.Ty) (v : SExpr × STy) : Bool :=
+  match valTypeOf d ty with
+  | some want => fitsSTy want v
+  | none => false
 
 def arithOp? : String → Option AOp
   | "+" => some .add
@@ -891,15 +1354,47 @@ def eqForm (o : String) (e : SExpr) : Option (SExpr × STy) :=
   else if o == "<>" then some (.not e, .bool)
   else none
 
+/-- (C2c) The `bit` comparison forms: T-SQL `@b = 1` and PostgreSQL
+`b = TRUE` are `cmp eq b (bool true)`, `= 0`/`= FALSE` the same with
+`false`, `<>` with `ne`; the literal on either side, put on the right.
+They stay comparisons (not `b` or `NOT b`, which mean the same under
+`ANSI_NULLS ON`), so `SExpr.hasEqNe` sees them and a confirmation names
+`ASM-TSQL-ANSI-NULLS`: under `ANSI_NULLS OFF` a NULL bit `<> 1` is TRUE in
+T-SQL (SQL Server 1, PostgreSQL 0, eval/values V3). -/
+def bitCmp (o : String) (x : SExpr) (lit : Bool) : Option (SExpr × STy) :=
+  if o == "=" then some (.cmp .eq x (.bool lit), .bool)
+  else if o == "<>" then some (.cmp .ne x (.bool lit), .bool)
+  else none
+
 def binTy (d : Dialect) (o : String) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
-  | (a, .int), (b, .int) =>
+  | (a, .int w), (b, .int v) =>
+    let r := w.join v
     match arithOp? o, cmpOp? o with
     | some .mod, _ => match b with
-      | .int k => if k = 0 ∨ k = -1 then none else some (.arith .mod a b, .int)
+      | .int k => if k = 0 ∨ k = -1 then none else some (.arith r .mod a b, .int r)
       | _ => none
-    | some op, _ => some (.arith op a b, .int)
+    | some op, _ => some (.arith r op a b, .int r)
     | none, some c => some (.cmp c a b, .bool)
     | none, none => none
+  -- C2c: dates and timestamps compare; a date against a timestamp at midnight.
+  | (a, .date), (b, .date) => (cmpOp? o).map fun c => (.cmp c a b, .bool)
+  | (a, .ts _), (b, .ts _) => (cmpOp? o).map fun c => (.cmp c a b, .bool)
+  | (a, .date), (b, .ts _) => (cmpOp? o).map fun c => (.cmp c (.toTs a) b, .bool)
+  | (a, .ts _), (b, .date) => (cmpOp? o).map fun c => (.cmp c a (.toTs b), .bool)
+  -- C2c: the `bit` forms the converter writes, with the literal on either side.
+  | (.bool k, .bit), (x, .bit) => bitCmp o x k
+  | (x, .bit), (.bool k, .bit) => bitCmp o x k
+  -- C2c, PostgreSQL: `d + n` and `d - n` on a date, `b - a` on two dates.
+  | (a, .date), (b, .int v) =>
+    match d with
+    | .pg _ _ =>
+      if o == "+" && v.le .i32 then some (.dateAdd .day b a, .date)
+      -- Only an `int` literal: `d - 2147483648` is `date - bigint`.
+      else if o == "-" && v.le .i32 then match b with
+        | .int k => some (.dateAdd .day (.int (-k)) a, .date)
+        | _ => none
+      else none
+    | .tsql _ _ => none
   | (a, .bool), (b, .bool) =>
     if a.mayRaise || b.mayRaise then none
     else if o.toUpper == "AND" then some (.and a b, .bool)
@@ -919,7 +1414,7 @@ def binTy (d : Dialect) (o : String) : SExpr × STy → SExpr × STy → Option 
   | _, _ => none
 
 def unTy (o : String) : SExpr × STy → Option (SExpr × STy)
-  | (a, .int) => if o == "-" then some (.neg a, .int) else none
+  | (a, .int w) => if o == "-" then some (.neg w a, .int w) else none
   | (a, .bool) => if o.toUpper == "NOT" then some (.not a, .bool) else none
   | _ => none
 
@@ -929,9 +1424,10 @@ def joinAll : List STy → Option STy
   | [] => some .nul
   | t :: ts => (joinAll ts).bind (joinTy t)
 
-/-- A value type with a value: an integer or a string, not only NULL. -/
+/-- A value type with a value: an integer, a string, (C2c) a bit, a date
+or a timestamp, not only NULL. -/
 def typedVal : STy → Bool
-  | .int | .str .. => true
+  | .int _ | .str .. | .bit | .date | .ts _ => true
   | _ => false
 
 /-- `coalesce x1 (coalesce x2 ... xn)`. -/
@@ -950,8 +1446,8 @@ def callTy (d : Dialect) (name : String) (raw : List Ast.Expr) (args : List (SEx
       (joinAll (args.map (·.2))).bind fun t =>
         if typedVal t then (coalesceBuild (args.map (·.1))).map (·, t) else none
     else none
-  | "ISNULL", [(x, .int), (y, ty)], .tsql _ _ =>
-    if valTy ty && !y.mayRaise then some (.coalesce x y, .int) else none
+  | "ISNULL", [(x, .int w), (y, ty)], .tsql _ _ =>
+    if fitsSTy (.int w) (y, ty) && !y.mayRaise then some (.coalesce x y, .int w) else none
   | "ISNULL", [(x, .str (some n) wx), (y, ty)], .tsql _ _ =>
     let isVar := match raw with
       | .Var _ :: _ => true
@@ -962,11 +1458,86 @@ def callTy (d : Dialect) (name : String) (raw : List Ast.Expr) (args : List (SEx
       | _ => false
     if isVar && yOk && !y.mayRaise then some (.coalesce x y, .str (some n) wx) else none
   | "RTRIM", [(x, .str n w)], _ => some (mkRtrim x, .str n w)
-  | "LEN", [(x, .str _ _)], .tsql _ _ => some (.len (mkRtrim x), .int)
-  | "LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int)
-  | "CHAR_LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int)
-  | "CHARACTER_LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int)
+  | "LEN", [(x, .str _ _)], .tsql _ _ => some (.len (mkRtrim x), .int .i32)
+  | "LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int .i32)
+  | "CHAR_LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int .i32)
+  | "CHARACTER_LENGTH", [(x, .str _ _)], .pg _ _ => some (.len x, .int .i32)
   | _, _, _ => none
+
+/-- (C2c) A T-SQL datepart of `DATEADD`/`DATEDIFF` the slice knows, with
+its abbreviations ("DATEADD (Transact-SQL)", the datepart table). -/
+def datePart? (e : Ast.Expr) : Option DPart :=
+  match e with
+  | .Name [n] =>
+    let u := n.toLower
+    if u == "day" || u == "dd" || u == "d" then some .day
+    else if u == "month" || u == "mm" || u == "m" then some .month
+    else if u == "year" || u == "yy" || u == "yyyy" then some .year
+    else none
+  | _ => none
+
+/-- (C2c) The date of a date or timestamp value: itself, or `toDate`. -/
+def mkToDate : SExpr × STy → Option SExpr
+  | (a, .date) => some a
+  -- PostgreSQL `(d + make_interval(...))::date` with `d` a date: the
+  -- timestamp at midnight moved by the interval, then its date, which is
+  -- the date moved (`mkToDate_dateAdd_eval`).
+  | (.dateAdd p n (.toTs a), .ts _) => some (.dateAdd p n a)
+  | (a, .ts _) => some (.toDate a)
+  | _ => none
+
+/-- (C2c) The fold of `mkToDate` means the same on a date (or NULL): the
+date at midnight moved by days, months or years, then its date, is the
+date moved. Which values a date variable can hold is the typing's
+business (`typed` puts `toTs` only on date-typed expressions). -/
+theorem mkToDate_dateAdd_eval {U : Type} (σ ρ : Core.Store U) (p : DPart) (n a : SExpr)
+    (ha : a.eval σ ρ = .ok .null ∨ ∃ d, a.eval σ ρ = .ok (.date d)) :
+    (SExpr.toDate (.dateAdd p n (.toTs a))).eval σ ρ = (SExpr.dateAdd p n a).eval σ ρ := by
+  simp only [SExpr.eval]
+  rcases ha with ha | ⟨d, ha⟩
+  · rw [ha]; cases n.eval σ ρ with
+    | err k => rfl
+    | ok v => cases v <;> rfl
+  · rw [ha]; cases hn : n.eval σ ρ with
+    | err k => rfl
+    | ok v =>
+      cases v <;> simp [Core.bind2, Core.dateAddVal, Core.dayVal, Core.typeErr,
+        Core.Calendar.dayOf_addToTs]
+
+/-- (C2c) The one part a PostgreSQL `make_interval(...)` call sets, with
+its number, as the parser hands the call over: seven positional
+arguments, the unset ones `0` (`0.0` for the seconds); only
+`years`, `months` or `days`, one of them. -/
+def intervalPart (args : List Ast.Expr) : Option (DPart × Nat) :=
+  let zero (e : Ast.Expr) : Bool := e matches .Num "0"
+  match args with
+  | [y, mo, w, dd, h, mi, se] =>
+    if !(zero w && zero h && zero mi && (se matches .Num "0.0")) then none
+    else if !zero y && zero mo && zero dd then some (.year, 0)
+    else if zero y && !zero mo && zero dd then some (.month, 1)
+    else if zero y && zero mo && !zero dd then some (.day, 3)
+    else none
+  | _ => none
+
+/-- (C2c) `DATEADD`'s result on a date or timestamp `dt` with the number
+`n` (an `int` or `smallint` of the slice). -/
+def dateAddTy (p : DPart) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
+  | (n, .int w), (dt, .date) => if w.le .i32 then some (.dateAdd p n dt, .date) else none
+  | (n, .int w), (dt, .ts q) => if w.le .i32 then some (.dateAdd p n dt, .ts q) else none
+  | _, _ => none
+
+/-- (C2c) PostgreSQL `dt + make_interval(...)`: on a timestamp, a
+timestamp; on a date, also a timestamp (`date + interval →
+timestamp`, PostgreSQL 9.9, Table 9.33; probed: `pg_typeof(date
+'2024-01-31' + make_interval(months => 1))` is `timestamp without time
+zone`), the date at midnight moved, of six fractional digits. Only an
+explicit `::date` or `CAST(... AS date)` makes it a date again
+(`mkToDate`); `+ 1`, `- k` and `- date` on it are outside the slice
+(PostgreSQL: no `timestamp + integer`; `timestamp - date` is an
+`interval`). -/
+def pgIntervalAddTy (p : DPart) : SExpr × STy → SExpr × STy → Option (SExpr × STy)
+  | (n, .int w), (dt, .date) => if w.le .i32 then some (.dateAdd p n (.toTs dt), .ts 6) else none
+  | n, dt => dateAddTy p n dt
 
 /-- `cond c1 r1 (cond c2 r2 ... e)`. -/
 def caseBuild : List ((SExpr × STy) × (SExpr × STy)) → SExpr → Option SExpr
@@ -981,10 +1552,21 @@ def caseTy (ws : List ((SExpr × STy) × (SExpr × STy))) (els : Option (SExpr �
   else (joinAll tys).bind fun t =>
     if typedVal t then (caseBuild ws ((els.map (·.1)).getD .null)).map (·, t) else none
 
+/-- (C2c) The type a literal next to a value of type `t`, under the
+operator `o`, is read at: a bit, a date or a timestamp; a `bigint` only
+under a comparison (a T-SQL constant beyond the `int` range is `numeric`
+in arithmetic); nothing for the rest. -/
+def literalWant (o : String) : STy → Option STy
+  | .bit => some .bit
+  | .date => some .date
+  | .ts p => some (.ts p)
+  | .int .i64 => if (cmpOp? o).isSome then some (.int .i64) else none
+  | _ => none
+
 mutual
   /-- The slice form of an expression and its type, or `none` when the
   expression is outside the slice. A variable is in the slice when it is
-  declared with the slice's integer type (`env`). -/
+  declared with a type of the slice (`env`). -/
   def typed (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option (SExpr × STy)
     | .Var v => match d with
       | .tsql _ _ => (varTy d env v).map (.var v, ·)
@@ -993,19 +1575,87 @@ mutual
       | some (.inl c) => some (.col c, colTy d sc c)
       | some (.inr v) => (varTy d env v).map (.var v, ·)
       | none => none
-    | .Num s => (intLit? s).map fun n => (.int n, .int)
+    | .Num s => match intLit? s with
+      | some n => some (.int n, .int .i32)
+      | none => match d with
+        -- C2c: a bigint constant in PostgreSQL; numeric in T-SQL, outside.
+        | .pg _ _ => (int64Lit? s).map fun n => (.int n, .int .i64)
+        | .tsql _ _ => none
     | .Str s => if strLitOk s then some (.str s, .str (some (max 1 s.length)) false) else none
     | .Null => some (.null, .nul)
+    -- C2c: PostgreSQL `TRUE`/`FALSE` are bit values.
+    | .Special n => match d with
+      | .pg _ _ =>
+        if n.toUpper == "TRUE" then some (.bool true, .bit)
+        else if n.toUpper == "FALSE" then some (.bool false, .bit)
+        else none
+      | .tsql _ _ => none
+    -- C2c, PostgreSQL: `d + make_interval(...)` on a date or timestamp,
+    -- the call's seven arguments as the parser hands them over.
+    | .Bin "+" dt rhs@(.CallE (.CallF [f] [y, mo, w, dd, h, mi, se] false [] false false false)) =>
+      if (d matches .pg _ _) && f.toLower == "make_interval" then do
+        let (p, i) ← intervalPart [y, mo, w, dd, h, mi, se]
+        let dt' ← typed d env sc dt
+        let n' ← match i with
+          | 0 => typed d env sc y
+          | 1 => typed d env sc mo
+          | _ => typed d env sc dd
+        guardC (pgIntervalAddTy p n' dt')
+      else do
+        let a' ← typed d env sc dt
+        let b' ← typed d env sc rhs
+        guardC (binTy d "+" a' b')
     | .Bin o a b => do
-      let a' ← typed d env sc a
-      let b' ← typed d env sc b
-      guardC (binTy d o a' b')
+      -- C2c: a literal takes the type of the other operand (a bit against
+      -- `0`/`1`, a date against `'YYYY-MM-DD'`, a T-SQL constant beyond the
+      -- `int` range compared with a `bigint`).
+      let a0 := typed d env sc a
+      let b0 := typed d env sc b
+      let lit (t : STy) (e : Ast.Expr) : Option (SExpr × STy) :=
+        (literalWant o t).bind fun w => coerce d w e
+      let (a', b') ← match a0, b0 with
+        | some a', some b' =>
+          match lit b'.2 a with
+          | some a'' => some (a'', b')
+          | none => match lit a'.2 b with
+            | some b'' => some (a', b'')
+            | none => some (a', b')
+        | some a', none => (lit a'.2 b).map (a', ·)
+        | none, some b' => (lit b'.2 a).map (·, b')
+        | none, none => none
+      -- C2c, PostgreSQL: `(b)::date - (a)::date` is DATEDIFF(day, a, b).
+      match d, o, a', b' with
+      | .pg _ _, "-", (x, .date), (y, .date) => guardC (some (.dateDiff y x, .int .i32))
+      | _, _, _, _ => guardC (binTy d o a' b')
     | .Unary o a => do
       let a' ← typed d env sc a
       guardC (unTy o a')
     | .IsNull x isNot => do
       let (x', tx) ← typed d env sc x
       if typedVal tx then guardC (some (.isNull x' isNot, .bool)) else none
+    -- C2c: `CAST(x AS date)` of a timestamp, and the cast literals.
+    | .Cast x ty => match coerce d .nul (.Cast x ty) with
+      | some v => some v
+      | none => do
+        let x' ← typed d env sc x
+        if dateType d ty then (mkToDate x').map (·, .date) else none
+    -- C2c, T-SQL: DATEADD and DATEDIFF with their datepart as written.
+    | .CallE (.CallF [n] [part, a, b] false [] false false false) =>
+      if (d matches .tsql _ _) && n.toUpper == "DATEADD" then do
+        let p ← datePart? part
+        let a' ← typed d env sc a
+        let b' ← typed d env sc b
+        guardC (dateAddTy p a' b')
+      else if (d matches .tsql _ _) && n.toUpper == "DATEDIFF" then do
+        if datePart? part != some .day then none else
+        let a' ← typed d env sc a
+        let b' ← typed d env sc b
+        let x ← mkToDate a'
+        let y ← mkToDate b'
+        guardC (some (.dateDiff x y, .int .i32))
+      else do
+        let args' ← typedList d env sc [part, a, b]
+        guardC (callTy d n [part, a, b] args')
     | .CallE (.CallF [n] args false [] false false false) => do
       let args' ← typedList d env sc args
       guardC (callTy d n args args')
@@ -1037,6 +1687,14 @@ mutual
       let ws' ← typedWhens d env sc ws
       pure ((c', r') :: ws')
 end
+
+/-- The slice form of `e` in a position of type `want` (C2c): a literal
+the position reads (`coerce`), else what `e` is on its own. -/
+def typedTo (d : Dialect) (env : TyEnv) (sc : Scope) (want : Option STy) (e : Ast.Expr) :
+    Option (SExpr × STy) :=
+  match want.bind fun w => coerce d w e with
+  | some v => some v
+  | none => typed d env sc e
 
 /-! ## Expressions
 
@@ -1156,6 +1814,20 @@ mutual
       let ws' ← lowerWhens d env sc ws
       pure (c' :: r' :: ws')
 end
+
+/-- (C2c) A value stored into a slot of slice type `want` (a variable, a
+parameter default, a column): a literal the slot reads (`coerce`), then
+the value fitted to the slot (`fitValue`, which may add `toTs`); when
+the value is outside the slice, or the slot has no slice type, the C1
+path (`lowerExpr`), where "String stores, on every path" and the
+narrowing rule hold the store. -/
+def lowerValue (d : Dialect) (env : TyEnv) (sc : Scope) (want : Option STy) (e : Ast.Expr) :
+    Option Core.Expr :=
+  match want, typedTo d env sc want e with
+  | some w, some v => match fitValue w v with
+    | some s => some (.sc s)
+    | none => lowerExpr d env sc e
+  | _, _ => lowerExpr d env sc e
 
 /-- The variable an assignment or an `OUTPUT` argument names. -/
 def target : Dialect → Ast.Expr → Option Var
@@ -1490,26 +2162,27 @@ length `1 ≤ n ≤ 4000` that is not a key column; a default that is an
 integer of the 32-bit range for an integer column, or a string literal of
 the slice that fits for a string column. -/
 def CatCol.ok (c : CatCol) : Bool :=
-  (match c.str with
-    | none => true
-    | some (n, _) => decide (1 ≤ n ∧ n ≤ tsqlMaxLen) && !c.key) &&
-  match c.dflt, c.str with
+  (match c.kind with
+    | .int _ | .date => true
+    | .str n _ => decide (1 ≤ n ∧ n ≤ tsqlMaxLen) && !c.key
+    | .bit => !c.key
+    | .ts p => p ≤ 6) &&
+  match c.dflt, c.kind with
   | none, _ => true
-  | some (.int i), none => decide (Core.intMin ≤ i ∧ i ≤ Core.intMax)
-  | some (.str s), some (n, _) => strLitOk s && decide (s.length ≤ n)
+  | some (.int i), .int w => w.fits i
+  | some (.str s), .str n _ => strLitOk s && decide (s.length ≤ n)
+  | some (.bool _), .bit => true
+  | some (.date v), .date => decide (0 ≤ v ∧ v ≤ 3652058)
+  | some (.ts us), .ts p =>
+    decide (0 ≤ us ∧ us < 3652059 * Core.Calendar.usPerDay) && us % (10 ^ (6 - p) : Nat) == 0
   | _, _ => false
 
 /-- (C3c) A value of type `vt` can be stored in column `c` as it is: NULL;
 an integer into an integer column; a string whose bound is at most the
 column's length into a string column, and into a T-SQL `varchar` only
 one that is not `wide` ("Writes" above). -/
-def colFits (c : CatCol) : STy → Bool
-  | .nul => true
-  | .int => c.str.isNone
-  | .str m w => match c.str with
-    | some (n, wide) => fitsLen (some n) m && (wide || !w)
-    | none => false
-  | .bool => false
+def colFits (d : Dialect) (c : CatCol) (v : SExpr × STy) : Option SExpr :=
+  fitValue (kindTy d c.kind) v
 
 /-- (C3c) The left-out columns of an `INSERT` into `t` with column list
 `cs` that have a default, each with its literal ("Constant defaults"). -/
@@ -1554,7 +2227,7 @@ def scopeOf (d : Dialect) (t : CatTable) (target : List String) : Scope :=
     rel := match d with
       | .tsql _ _ => none
       | .pg _ _ => target.getLast?.map pgName
-    strCols := t.cols.filterMap fun c => c.str.map (c.name, ·) }
+    colTys := t.cols.map fun c => (c.name, c.kind) }
 
 def CatTable.toDef (t : CatTable) : Core.TableDef :=
   ⟨t.name, t.cols.map fun c => ⟨c.name, c.notNull, c.key⟩⟩
@@ -1568,8 +2241,8 @@ above), (C3c) a string of the slice that fits or the NULL literal into a
 string column (`colFits`, "The C3c tables"), else outside the spec. -/
 def colValue (d : Dialect) (env : TyEnv) (sc : Scope) (c : CatCol) (e : Ast.Expr) :
     Option Core.Expr :=
-  match typed d env sc e with
-  | some (s, t) => if colFits c t then some (.sc s) else none
+  match typedTo d env sc (some (kindTy d c.kind)) e with
+  | some v => (colFits d c v).map .sc
   | none => none
 
 /-- A data statement may stand here: in a procedure, and in T-SQL only
@@ -1768,10 +2441,17 @@ def pickValue (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) :
 the string fits is a store, held by `storesRoutine`: "String stores, on
 every path"), either for NULL. -/
 def pickTarget (d : Dialect) (env : TyEnv) (x : Var) : STy → Bool
-  | .int => intVar d env x
+  | .int w => match intVarW d env x with
+    | some t => w.le t
+    | none => false
   | .str .. => (strVar d env x).isSome
-  | .nul => intVar d env x || (strVar d env x).isSome
+  | .nul => (varTy d env x).isSome
   | .bool => false
+  | .bit => varTy d env x == some .bit
+  | .date => varTy d env x == some .date
+  | .ts p => match varTy d env x with
+    | some (.ts q) => p ≤ q
+    | _ => false
 
 /-- The conjuncts of a condition. -/
 def conjuncts : SExpr → List SExpr
@@ -1809,10 +2489,14 @@ def rowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (o
     some (.query t.toDef c (.row orNull (sets.map fun (x, e, _) => (x, e))))
   else none
 
-/-- `.count`: an `int` target that the condition does not read. -/
+/-- `.count`: an `int` target that the condition does not read. (C2c) Not
+a `bigint` target: T-SQL `COUNT(*)` is `int` and raises 8115 beyond
+2^31-1 rows whatever the target, PostgreSQL's `count` is `bigint` and
+fits a `bigint` target (eval/values V2: the types), so the two differ
+there, which the core's `count` (an overflow on both) does not show. -/
 def countPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (x : Var) :
     Option Stmt :=
-  if intVar d env x && !(Core.Expr.varsOpt c).contains x then
+  if intVarW d env x == some .i32 && !(Core.Expr.varsOpt c).contains x then
     some (.query t.toDef c (.count x))
   else none
 
@@ -1954,7 +2638,7 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
     pure [s]
   | .Assign t v => do
     let x ← target d t
-    let v' ← lowerExpr d env {} v
+    let v' ← lowerValue d env {} (wantOf d env x) v
     pure [.assign x v']
   | .Return none => some [.ret none]
   | .Return (some e) => do
@@ -1963,10 +2647,10 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
     | _, .Function => pure [.ret (some e')]
     | .tsql _ _, .Procedure => pure [.assign statusVar (statusExpr d env e e'), .ret none]
     | .pg _ _, .Procedure => none
-  | .Declare x _ dflt => match d, dflt with
+  | .Declare x ty dflt => match d, dflt with
     | .tsql _ _, none => some []
     | .tsql _ _, some e => do
-      let e' ← lowerExpr d env {} e
+      let e' ← lowerValue d env {} (ty.bind (valTypeOf d)) e
       pure [.assign x e']
     | .pg _ _, _ => none
   | .Insert tgt cols (.SrcValues rows) [] [] none => do
@@ -2010,34 +2694,131 @@ argument is a variable that receives the parameter's final value; without
 is renamed through the deployment. `EXEC @rc = p` is outside the spec: the
 status is the callee's *last* parameter in the core (above), so placing
 `@rc` needs the callee's arity, which the check does not take as input. -/
-def lowerTsqlArg (d : Dialect) (env : TyEnv) : Ast.Arg → Option Arg
+def lowerTsqlArgShape (d : Dialect) (env : TyEnv) : Ast.Arg → Option Arg
   | .Arg (some _) _ _ => none -- named arguments: the core binds by position
   | .Arg none e true => (target d e).map .ref
   | .Arg none e false => (lowerExpr d env {} e).map .val
+
+/-! ### Argument types (C2c)
+
+The core binds an argument to a parameter as it is, and neither engine
+does: T-SQL converts an argument to the parameter's type (an `int` into a
+`smallint` parameter is narrowed, raising 220 when it does not fit; a
+`bit` parameter takes any number as 0 or 1), and PostgreSQL resolves a
+`CALL` by the arguments' types, with implicit casts only: an `integer`
+argument finds no procedure with a `smallint` or `boolean` parameter
+(42883, "procedure cs(integer) does not exist"), and a variable in an
+`INOUT` position that needs a cast is "not writable" (probed on
+PostgreSQL 18 with the converter's output, review of C2c). Before C2c the
+callee's types were not looked at, which was sound only while every
+callee confirmed was an `int` routine; with `smallint`, `bigint`, `bit`
+and dates in signatures (`tyCorr`) it is not. So every argument must be
+shown to have exactly its parameter's type (`argKindOk`): the request
+names each callee's parameter types (`Catalog.routineTys`, PostgreSQL's
+DDL; the callee's own confirmation ties them to its T-SQL types by
+`sigCorr`, `ASM-CALLEE-CONFIRMED`), and a value argument must be a slice
+value of that type (or NULL; the T-SQL literals a `bit`, `date` or
+`datetime2` parameter reads, as for a store: `coerce`), an `OUTPUT` or
+`INOUT` variable must be declared with that type. A string parameter
+takes a string (any lengths, as `sigCorr`); a parameter of a type
+outside the slice takes no argument in the spec. -/
+
+/-- The slice type of a callee's parameter, from its PostgreSQL type. -/
+def paramWant (ty : Ast.Ty) : Option STy := valTypeOf (.pg ∅ []) ty
+
+/-- A value of type `t` is exactly of the parameter's type `want`: the
+same slice type, or the NULL literal; for a string, a string that fits.
+T-SQL truncates a string argument longer than the callee's parameter on
+entry (and a `varchar` parameter replaces characters outside its code
+page), PostgreSQL keeps it (it drops a parameter's length): callee
+`dbo.q @s varchar(3)` given a `varchar(10)` variable holding `'abcdef'`
+sees `abc` in SQL Server, `abcdef` in PostgreSQL (re-review of C2c). So
+in T-SQL a string argument must have a bound at most the parameter's
+length and come from no `nvarchar` (the PostgreSQL DDL does not say
+whether the T-SQL parameter is `varchar` or `nvarchar`; `tyCorr` ties its
+length to the T-SQL one); an unbounded parameter, or an argument whose
+bound is unknown, is outside the spec. PostgreSQL keeps any string. -/
+def sameKind (d : Dialect) (want t : STy) : Bool :=
+  match want, t with
+  | _, .nul => true
+  | .str n _, .str m w => match d with
+    | .tsql _ _ => n.isSome && fitsLen n m && !w
+    | .pg _ _ => true
+  | w, t => w == t
+
+/-- A value argument of the parameter's type. -/
+def argValueOk (d : Dialect) (env : TyEnv) (want : STy) (e : Ast.Expr) : Bool :=
+  match typedTo d env {} (some want) e with
+  | some (_, t) => sameKind d want t
+  | none => false
+
+/-- An `OUTPUT`/`INOUT` variable declared with the parameter's type (its
+value is passed in: for a string, its declared length must fit). -/
+def argRefOk (d : Dialect) (env : TyEnv) (want : STy) (x : Var) : Bool :=
+  match varTy d env x with
+  | some t => t != .nul && sameKind d want t
+  | none => false
+
+/-- The argument in a position whose parameter is declared `ty` has its
+type (`argValueOk`, `argRefOk`). -/
+def argKindOk (d : Dialect) (env : TyEnv) (ty : Ast.Ty) (a : Ast.Arg) (ref : Bool) : Bool :=
+  match paramWant ty, a with
+  | none, _ => false
+  | some w, .Arg _ e _ =>
+    if ref then (target d e).any (argRefOk d env w) else argValueOk d env w e
+
+/-- A value argument, lowered with the parameter's type (a `bit` literal
+`1` is the boolean, as `TRUE` is). -/
+def lowerArgValue (d : Dialect) (env : TyEnv) (ty : Ast.Ty) (e : Ast.Expr) : Option Core.Expr :=
+  lowerValue d env {} (paramWant ty) e
+
+def lowerTsqlArg (d : Dialect) (env : TyEnv) (ty : Ast.Ty) (a : Ast.Arg) : Option Arg :=
+  match a with
+  | .Arg (some _) _ _ => none
+  | .Arg none e out =>
+    if !argKindOk d env ty a out then none
+    else if out then (target d e).map .ref
+    else (lowerArgValue d env ty e).map .val
 
 /-- PostgreSQL `CALL p(args)`: positional arguments only; an argument in
 an `OUT` or `INOUT` position (the catalog says which) must be a variable,
 and receives the parameter's final value; trailing parameters without an
 argument take their defaults. -/
-def lowerPgArg (d : Dialect) (env : TyEnv) : Ast.Mode × Ast.Arg → Option Arg
+def lowerPgArgShape (d : Dialect) (env : TyEnv) : Ast.Mode × Ast.Arg → Option Arg
   | (_, .Arg (some _) _ _) => none
   | (_, .Arg none _ true) => none -- `OUTPUT` is T-SQL syntax
   | (.In, .Arg none e false) => (lowerExpr d env {} e).map .val
   | (_, .Arg none e false) => (target d e).map .ref
 
+def lowerPgArg (d : Dialect) (env : TyEnv) (ty : Ast.Ty) : Ast.Mode × Ast.Arg → Option Arg
+  | (m, a) => match lowerPgArgShape d env (m, a) with
+    | none => none
+    | some (.ref x) => if argKindOk d env ty a true then some (.ref x) else none
+    | some (.val _) => match a with
+      | .Arg _ e _ =>
+        if argKindOk d env ty a false then (lowerArgValue d env ty e).map .val else none
+
+/-- The parameter types of a callee (`Catalog.routineTys`); none when the
+request does not give them. -/
+def calleeTys (Γ : Catalog) (callee : String) : List Ast.Ty :=
+  (lookup Γ.routineTys callee).getD []
+
 def lowerCall (d : Dialect) (env : TyEnv) (n : List String) (args : List Ast.Arg)
     (ret : Option Ast.Expr) : Option Stmt :=
   match d with
-  | .tsql dep _ => do
+  | .tsql dep Γ => do
     if ret.isSome then none else
     let callee ← lookup dep.routines (dotted n)
-    let args' ← args.mapM (lowerTsqlArg d env)
+    let tys := calleeTys Γ callee
+    if args.length > tys.length then none else
+    let args' ← (tys.zip args).mapM fun (ty, a) => lowerTsqlArg d env ty a
     pure (.call callee args')
   | .pg Γ _ => do
     let callee := dotted (n.map pgName)
     let modes ← lookup Γ.routines callee
-    if args.length ≤ modes.length && ret.isNone then
-      let args' ← (modes.zip args).mapM (lowerPgArg d env)
+    let tys := calleeTys Γ callee
+    if args.length ≤ modes.length && args.length ≤ tys.length && ret.isNone then
+      let args' ← ((modes.zip tys).zip args).mapM fun ((m, ty), a) => lowerPgArg d env ty (m, a)
       pure (.call callee args')
     else none
 
@@ -2605,8 +3386,8 @@ return types" below). -/
 def dfltOk (d : Dialect) (env : TyEnv) (ty : Ast.Ty) : Option Ast.Expr → Bool
   | none => true
   | some .Null => true
-  | some e => match typed d env {} e with
-    | some (_, t) => fitsTy d ty t
+  | some e => match typedTo d env {} (valTypeOf d ty) e with
+    | some v => fitsTy d ty v
     | none => false
 
 def lowerParam (d : Dialect) (env : TyEnv) : Ast.Param → Option Core.Param
@@ -2616,9 +3397,10 @@ def lowerParam (d : Dialect) (env : TyEnv) : Ast.Param → Option Core.Param
       | .pg _ _ => pgName name
     if !dfltOk d env ty dflt then none else
     -- A default that reads a variable is refused by both engines.
-    match lowerOpt d env {} dflt with
-    | some e => if (e.map Core.Expr.vars).getD [] = [] then some ⟨name, lowerMode mode, e⟩ else none
-    | none => none
+    match dflt.map (lowerValue d env {} (valTypeOf d ty)) with
+    | none => some ⟨name, lowerMode mode, none⟩
+    | some (some e) => if e.vars = [] then some ⟨name, lowerMode mode, some e⟩ else none
+    | some none => none
 
 /-- Every name is ASCII. -/
 def asciiNames (xs : List String) : Bool :=
@@ -2725,35 +3507,89 @@ def storeTy (d : Dialect) (ty : Ast.Ty) : Option (Option Nat × Bool) :=
     else none
   | none, _, _ => none
 
+/-- A store into a target of a type outside the slice: a certainly
+non-character type takes a value outside the slice (the C1 path), a
+string type without a slice length the strings that fit (C2b). -/
+def storeNonSlice (d : Dialect) (ty : Ast.Ty) (vt : Option (SExpr × STy)) : Bool :=
+      if nonCharType ty then true else
+      match storeTy d ty with
+      | none => false
+      | some (n, wt) =>
+        -- No length and every character: any value is kept.
+        if n.isNone && (wt || (d matches .pg _ _)) then true else
+        match vt with
+        | some (_, .nul) => true
+        | some (_, .str m w) => fitsLen n m && (wt || !w)
+        | _ => false
+
 /-- A store into a target declared `ty` of the NULL literal (`isNull`),
 or of a value whose slice type is `vt` (`none`: outside the slice),
 changes no value. -/
-def storeOkTy (d : Dialect) (ty : Option Ast.Ty) (isNull : Bool) (vt : Option STy) : Bool :=
+def storeOkTy (d : Dialect) (ty : Option Ast.Ty) (isNull : Bool) (vt : Option (SExpr × STy)) :
+    Bool :=
   if isNull then true else
   match ty with
   | none => false
   | some ty =>
-    if intType d ty || nonCharType ty then true else
-    match storeTy d ty with
-    | none => false
-    | some (n, wt) =>
+    -- A string target without a length that takes every value.
+    let unbounded : Bool := match strType d ty with
+      | some (none, wt) => wt || (d matches .pg _ _)
+      | _ => false
+    match valTypeOf d ty, vt with
+    -- C2c: an integer into an integer slot must fit it (a narrowing to a
+    -- width it may not fit: "Stores between widths"); a value into a
+    -- bit, date or timestamp slot must be of its type (a timestamp into a
+    -- date, a wider precision, a number into a bit: outside).
+    | some (.int t), some (v, .int w) => fitsSTy (.int t) (v, .int w)
+    | some (.int _), some (_, .nul) => true
+    -- A string into an integer: the C1 path, as before (C2b).
+    | some (.int _), some (_, .str ..) => true
+    -- (C2c) A bit, a date, a timestamp or a condition into an integer:
+    -- outside. T-SQL stores a bit as 0 or 1, PL/pgSQL raises 22P02
+    -- (eval/values V3); a date into an integer fails in both, differently.
+    | some (.int _), some _ => false
+    | some (.str n wt), some (_, v) =>
       -- No length and every character: any value is kept.
       if n.isNone && (wt || (d matches .pg _ _)) then true else
-      match vt with
-      | some .nul => true
-      | some (.str m w) => fitsLen n m && (wt || !w)
+      match v with
+      | .nul => true
+      | .str m w => fitsLen n m && (wt || !w)
       | _ => false
+    | some want, some v => fitsSTy want v
+    -- A value outside the slice into an integer or a certainly
+    -- non-character type, or an unbounded string: the C1 path, as before.
+    | some _, none => intType d ty || nonCharType ty || unbounded
+    -- (C2c) A value of a slice type other than a string into a variable of
+    -- a type outside the slice converts (a `datetime2(6)` into a
+    -- `datetime` rounds to 1/300 s, a `timestamp` keeps it): outside.
+    -- A string into a type outside the slice: only into a string type
+    -- (T-SQL `varchar(max)`, `nvarchar(max)`), never into one T-SQL and
+    -- PostgreSQL read strings into by their own rules (`time`, a date
+    -- type, `numeric`: re-review of C2c).
+    | none, some (_, t) =>
+      if t == .nul then true
+      else if (t matches .str ..) && (storeTy d ty).isSome then storeNonSlice d ty vt
+      else false
+    | none, none => storeNonSlice d ty vt
 
-/-- A store of `v` into a target declared `ty` changes no value. -/
+/-- A store of `v` into a target declared `ty` changes no value. (C2c) A
+string literal stored into a date or timestamp is in the spec only in
+the ISO forms the slice reads (`coerce`): T-SQL reads any other form by
+the session's `DATEFORMAT` and `LANGUAGE`, PostgreSQL by its
+`DateStyle`, so no C1 operator stands for it. -/
 def storeOk (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : Bool :=
-  storeOkTy d ty (v matches .Null) ((typed d env {} v).map (·.2))
+  let want := ty.bind (valTypeOf d)
+  match want, v with
+  | some .date, .Str _ | some (.ts _), .Str _ | some .date, .Cast (.Str _) _
+  | some (.ts _), .Cast (.Str _) _ => (want.bind fun w => coerce d w v).isSome
+  | _, _ => storeOkTy d ty (v matches .Null) (typedTo d env {} want v)
 
-/-- (C3c) The type of the select item `e` of the query `q`, typed with
-the query's table in scope: the value a pick stores. -/
-def itemTy (d : Dialect) (env : TyEnv) (q : Ast.Select) (e : Ast.Expr) : Option STy := do
+/-- (C3c) The select item `e` of the query `q`, typed with the query's
+table in scope: the value a pick stores. -/
+def itemTy (d : Dialect) (env : TyEnv) (q : Ast.Select) (e : Ast.Expr) : Option (SExpr × STy) := do
   let (_, _, _, tgt, _) ← selParts q
   let t ← tableOf d tgt
-  (typed d env (scopeOf d t tgt) e).map (·.2)
+  typed d env (scopeOf d t tgt) e
 
 /-- (C3c) The stores of a query's picks (C3b rules 1, 2 and 4): each
 target variable with the select item it gets. A string column read into
@@ -2918,8 +3754,8 @@ def hasStatus (ps : List Core.Param) : Bool :=
 block runs on entry, in declaration order, when there is a default. -/
 def lowerDecl (d : Dialect) (env : TyEnv) : Ast.Stmt → Option (Var × List Stmt)
   | .Declare x _ none => some (pgName x, [])
-  | .Declare x _ (some e) =>
-    (lowerExpr d env {} e).map fun e' => (pgName x, [.assign (pgName x) e'])
+  | .Declare x ty (some e) =>
+    (lowerValue d env {} (ty.bind (valTypeOf d)) e).map fun e' => (pgName x, [.assign (pgName x) e'])
   | _ => none
 
 /-- The declared types of a PL/pgSQL routine's variables, folded: what a
@@ -3011,19 +3847,22 @@ other. Corresponding types (`tyCorr`), as the converter writes them:
   `ASM-C1-OPERATORS` caveat, as for a C2b assignment that does not fit;
   `ExamplesC2b`.) `max` lengths, `char(n)`, `bpchar` and the rest are
   outside;
-* on the C1 path only (these types are not in the slice, so an answer
-  with them names `check_sound`): T-SQL `bigint` and PostgreSQL `bigint`
-  or `int8`, `smallint` and `smallint` or `int2`, without type
-  arguments. Each is the same range of integers in both ("int, bigint,
-  smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table 8.2), so
-  neither side converts an argument the other passes through. Every other
-  type is
+* (C2c) T-SQL `bigint` and PostgreSQL `bigint` or `int8`, `smallint`
+  and `smallint` or `int2`, without type arguments: the same range of
+  integers in both ("int, bigint, smallint, and tinyint (Transact-SQL)";
+  PostgreSQL 8.1.1, Table 8.2), so neither side converts an argument the
+  other passes through; `bit` and `boolean`/`bool`; `date` (a T-SQL
+  caller's dates are in PostgreSQL's wider range); `datetime2(6)` and
+  `timestamp(6)` or `timestamp` ("The C2c slice: typed values"). Every
+  other type is
   outside the spec as a parameter or return type, also where the
-  converter maps it: `tinyint` to `smallint` (the range widens), `bit` to
-  `boolean`, `decimal(p,s)`/`numeric(p,s)` (PostgreSQL drops a parameter's
+  converter maps it: `tinyint` to `smallint` (the range widens),
+  `decimal(p,s)`/`numeric(p,s)` (PostgreSQL drops a parameter's
   type modifiers, so T-SQL rounds an argument to scale `s` and PostgreSQL
-  does not), `datetime`, `datetime2`, `time` (precision), `char(n)`
-  (padding), `date` (PostgreSQL's range is wider), `varchar(max)` to
+  does not), `datetime`, `datetime2(p)` with `p < 6` (the same dropped
+  modifier: T-SQL rounds an argument to `p` digits, PostgreSQL keeps
+  six), `datetime2(7)`, `time` (precision), `char(n)`
+  (padding), `varchar(max)` to
   `text`, `uniqueidentifier` to `uuid` (text form), and user types.
 
 The trailing PL/pgSQL `INOUT return_code` parameter of a procedure (the
@@ -3047,23 +3886,28 @@ truncated, which `ASM-TSQL-STRING-ARGS` excludes (callers pass values
 that fit). Probed on PostgreSQL 18.6 (2026-10-28): `s varchar(3) DEFAULT
 'abcdef'` holds `abcdef`; the T-SQL truncation is the C2b `DECLARE` probe. -/
 
-/-- A T-SQL type and the PostgreSQL type it corresponds to on the C1 path
-only (upper-case names, no type arguments). -/
-def c1Types : List (String × List String) :=
-  [("BIGINT", ["BIGINT", "INT8"]), ("SMALLINT", ["SMALLINT", "INT2"])]
-
-/-- A T-SQL parameter or return type and a PostgreSQL one correspond. -/
+/-- A T-SQL parameter or return type and a PostgreSQL one correspond
+(C2c: integers of the same width, `bit` and `boolean`, `date`, and
+`datetime2(6)` with `timestamp(6)` or `timestamp`; a T-SQL
+`datetime2(p)` with `p < 6` rounds an argument that PostgreSQL, having
+dropped the modifier, keeps, so it is outside). -/
 def tyCorr (ta tp : Ast.Ty) : Bool :=
-  let int : Bool := match ta, tp with
-    | .Ty a [], .Ty p [] =>
-      (a.toUpper == "INT" || a.toUpper == "INTEGER") &&
-        (p.toUpper == "INT" || p.toUpper == "INTEGER" || p.toUpper == "INT4")
+  let dt : Dialect := .tsql { rowCounts := false, routines := [] } ∅
+  let dp : Dialect := .pg ∅ []
+  -- A string type of the slice on both, the PostgreSQL one without a
+  -- length or with the T-SQL one (re-review of C2c: a caller's argument is
+  -- held to the PostgreSQL DDL's length, `sameKind`, which must then be
+  -- the T-SQL parameter's).
+  let str : Bool := match strTypeT ta, strTypeP tp with
+    | some (n, _), some (m, _) => m.isNone || m == n
     | _, _ => false
-  let str : Bool := (strTypeT ta).isSome && (strTypeP tp).isSome
-  let c1 : Bool := match ta, tp with
-    | .Ty a [], .Ty p [] => ((lookup c1Types a.toUpper).map (·.contains p.toUpper)).getD false
+  str ||
+    match valTypeOf dt ta, valTypeOf dp tp with
+    | some (.int w), some (.int v) => w == v
+    | some .bit, some .bit => true
+    | some .date, some .date => true
+    | some (.ts 6), some (.ts 6) => true
     | _, _ => false
-  int || str || c1
 
 def paramTy : Ast.Param → Ast.Ty
   | .Param _ t _ _ => t
@@ -3113,8 +3957,15 @@ def anyValueOk (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : Bool :=
 
 /-- A value stored in something declared `ty`. -/
 def valueFits (d : Dialect) (env : TyEnv) (sc : Scope) (ty : Ast.Ty) (e : Ast.Expr) : Bool :=
-  match typed d env sc e with
-  | some (_, t) => fitsTy d ty t
+  match typedTo d env sc (valTypeOf d ty) e with
+  | some v => fitsTy d ty v
+  | none => false
+
+/-- (C2c) A call argument of the slice: a value of a slice type other
+than a string (`sliceNode`). -/
+def callArgOk (d : Dialect) (env : TyEnv) (e : Ast.Expr) : Bool :=
+  match typed d env {} e with
+  | some (_, t) => isVal t && !(t matches .str ..)
   | none => false
 
 /-- A condition: a three-valued boolean of the slice. -/
@@ -3180,7 +4031,10 @@ mutual
     | .While c b => condOk d env {} c && sliceNodes d env wenv ret b
     -- C3b: the loop's body is the record's fields, checked by the lowering.
     | .ForQuery r q _ => querySlice (withRecord d r) env q
-    | .Call _ args _ => args.all fun | .Arg _ e _ => valueOk d env {} e
+    -- (C2c) Any value of the slice but a string: the lowering holds each
+    -- argument to its parameter's type (`argKindOk`); a string may be too
+    -- long for the T-SQL callee's parameter, which truncates it.
+    | .Call _ args _ => args.all fun | .Arg _ e _ => callArgOk d env e
     | .Setting .. => true
     -- The handler of the rollback-and-rethrow idiom is not lowered.
     | .Try b hs =>
@@ -3206,7 +4060,7 @@ def sliceParam (d : Dialect) (env : TyEnv) : Ast.Param → Bool
   | .Param _ ty _ (some e) => valueFits d env {} ty e
 
 /-- A type a function of the slice may return. -/
-def retTypeOk (d : Dialect) (ty : Ast.Ty) : Bool := intType d ty || (strType d ty).isSome
+def retTypeOk (d : Dialect) (ty : Ast.Ty) : Bool := (valTypeOf d ty).isSome
 
 def sliceRoutine (d : Dialect) (env wenv : TyEnv) : Ast.Routine → Bool
   | .Routine kind _ params returns _ _ body =>
@@ -3235,11 +4089,18 @@ def concatNullOn : Ast.Routine → Bool
   | .Routine _ _ _ _ _ _ (.Block _ body) =>
     (leadingSettings body).contains ("CONCAT_NULL_YIELDS_NULL", true)
 
-/-- The T-SQL routine has a parameter of a string type of the slice: the
-confirmation rests on the arguments fitting it (`ASM-TSQL-STRING-ARGS`,
-C2b). -/
+/-- The T-SQL routine has a parameter of a type of the slice (C2b: a
+string; C2c: every type, `int` and `bigint` too): the confirmation rests
+on every argument a caller passes being a value of the parameter's type
+(`ASM-TSQL-STRING-ARGS`: a longer string is truncated, a `datetime2(7)`
+or `datetime` value rounded, a `1.5` passed to an `int` truncated to 1,
+an `int` narrowed or made 0/1 on entry, where PostgreSQL's caller passes
+the value of its own type or finds no procedure). -/
+def typedArgParam (ty : Ast.Ty) : Bool :=
+  (valTypeOf (.tsql { rowCounts := false, routines := [] } ∅) ty).isSome
+
 def tsqlStringParams : Ast.Routine → Bool
-  | .Routine _ _ params _ _ _ _ => params.any fun | .Param _ ty _ _ => (strTypeT ty).isSome
+  | .Routine _ _ params _ _ _ _ => params.any fun | .Param _ ty _ _ => typedArgParam ty
 
 /-- The T-SQL routine has a transaction statement (C4): `BEGIN TRAN`,
 `COMMIT`, or the `ROLLBACK` of the rollback-and-rethrow idiom. -/

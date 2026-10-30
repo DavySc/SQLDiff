@@ -199,7 +199,16 @@ def decimal : Ast.Ty := .Ty "DECIMAL" ["18", "2"]
 #guard wT (.Routine .Function ["dbo", "f"] [inT "@s" (vc 5)] (some (vc 5)) .Caller none (.Block []
     [ret (some (.Bin "+" (tv "@s") (.Str "x")))])) == ["store:return:varchar_5"]
 #guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.Call ["dbo", "log_value"] [arg (tv "@s") true] none])
-    (d := dep) (g := Γ) == ["store:call"]
+    (d := dep) (g := { Γ with routineTys := [("log_value", [vc 20, integer, integer])] }) ==
+  ["store:call"]
+-- (C2c re-review) Into an unbounded `text` parameter a T-SQL string
+-- argument is outside the spec: the T-SQL callee's length is not known.
+#guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.Call ["dbo", "log_value"] [arg (tv "@s") true] none])
+    (d := dep) (g := { Γ with routineTys := [("log_value", [.Ty "TEXT" [], integer, integer])] }) ==
+  ["store:call", "node:call:type"]
+-- (C2c) The same variable into an `integer` parameter: the types differ.
+#guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.Call ["dbo", "log_value"] [arg (tv "@s") true] none])
+    (d := dep) (g := Γ) == ["store:call", "node:call:type"]
 #guard wT (tsqlProc ["dbo", "p"] [inT "@id", ioT "@s" (vc 3)]
     [selectT [asg "@s" (.Str "abcd")] ["dbo", "Acct"] (some keyT)]) == ["store:pick:varchar_3"]
 #guard wP (pgProc ["p"] [inP "p_id"] [.Declare "v_s" (some (vc 3)) none]
@@ -208,9 +217,10 @@ def decimal : Ast.Ty := .Ty "DECIMAL" ["18", "2"]
 -- The declared type is named as `tyName` spells it, sanitised.
 #guard wP (pgProc ["p"] [inP "p_id"] [.Declare "v_s" (some (vc 20)) none]
     [set (pv "v_s") (fn "upper" [pv "v_s"])]) == ["store:assign:varchar_20", "expr:fn:upper"]
--- A local of a type PostgreSQL does not have: the variable itself is outside the slice.
+-- A local of a type PostgreSQL does not have: the variable itself is outside
+-- the slice, named by its type (C2c, `type:<type>`).
 #guard wP (pgProc ["p"] [inP "p_id"] [.Declare "v_s" (some (.Ty "NVARCHAR" ["MAX"])) none]
-    [set (pv "v_s") (fn "upper" [pv "v_s"])]) == ["store:assign:nvarchar_max", "expr:name"]
+    [set (pv "v_s") (fn "upper" [pv "v_s"])]) == ["store:assign:nvarchar_max", "type:nvarchar_max"]
 #guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.NStmt (.Declare "@t" none (some (tv "@s")))]) ==
   ["store:declare:untyped"]
 

@@ -10,7 +10,9 @@ rollback-and-rethrow idiom with COMMIT), with the C4 residuals and the
 `errors` field; C3b queries (`SELECT @x = col` against the PL/pgSQL `FOR`
 block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`;
 C3c string columns and constant defaults in the CATALOG; (0.13.0) the
-`why` reason codes on an unconfirmed answer whose routine is outside the
+`why` reason codes; (0.14.0) C2c typed values (integer widths, bit against
+boolean, date and datetime2 with DATEADD/DATEDIFF, typed columns in the
+CATALOG); the `why` reason codes on an unconfirmed answer whose routine is outside the
 spec (Sqldiff/Mirror/Diagnose.lean), and their absence on every other
 answer, confirmed or not.
 Anything else is unconfirmed, including malformed requests.
@@ -150,7 +152,8 @@ def p_routine(status):
 P_MIRROR = p_routine(fn("COALESCE", pv("v_x"), num(0)))
 P_TODAY = p_routine(pv("v_x"))
 DEP = f"0,{hx('dbo.log_value')}:{hx('log_value')}"
-CAT = f"{hx('log_value')}:ibb"
+# (C2c) The callee's parameter types, `/`-separated, one per mode letter.
+CAT = f"{hx('log_value')}:ibb:" + "/".join([hx("INTEGER")] * 3)
 CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in
                 [("@a", "p_a"), ("@b", "p_b"), ("@x", "v_x"), ("%status", "return_code")])
 P3 = "sqldiff-check/3"
@@ -512,7 +515,7 @@ cases += [
     # OUTPUT copy-back into @r varchar(20): the callee's value has no bound.
     ("80", req3(80, a=s_t([call(["dbo", "log_value"], (tv("@a"), "f"), (tv("@r"), "t"))]),
                 b=s_p([call(["log_value"], (pv("a"), "f"), (pv("r"), "f"))]),
-                cat=CAT, cert=S_CERT), "unconfirmed"),
+                cat=f"{hx('log_value')}:ibb:" + "/".join([hx("TEXT")] * 3), cert=S_CERT), "unconfirmed"),
     # The PostgreSQL side alone: x varchar(3) := 'abcdef' raises (a local
     # keeps its length), where T-SQL's @x varchar(10) holds it.
     ("81", req3(81, a=s_t([C("NStmt", C("Declare", S("@x"), VC10, string("abcdef"))), assign(tv("@r"), tv("@x"))]),
@@ -682,7 +685,242 @@ cases += [
         C("NStmt", C("Update", L(S("acct")), S("a"), L(C("Set", L(S("qty")), num(1))), L(), NONE))])),
      "unconfirmed"),
 ]
+# C2c: typed values. T-SQL dbo.Ev (Id int PRIMARY KEY, D date, T datetime2(6),
+# B bit NOT NULL, N bigint, S smallint DEFAULT 0) is the target table ev; the
+# pair is eval/values' procedure as the converter writes it (ExamplesC2c.lean).
+V_DEP = f"0;{hx('dbo.Ev')}:{hx('ev')}"
+V_CAT = (f"{hx('ev')}={hx('id')}.ink.{hx('Id')}/{hx('d')}.d.{hx('D')}/{hx('t')}.t6.{hx('T')}"
+         f"/{hx('b')}.bn.{hx('B')}/{hx('n')}.j.{hx('N')}/{hx('s')}.h.{hx('S')}.i0")
+V_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in
+                  [("@id", "p_id"), ("@big", "p_big"), ("@flag", "p_flag"), ("@when", "p_when"),
+                   ("@ts", "p_ts"), ("%status", "%status"), ("@d", "v_d"), ("@b", "v_b"),
+                   ("@s", "v_s"), ("@n", "v_n"), ("@t", "v_t"), ("@i", "v_i")])
+DATE, DT2_6, DT2_7, TS6, BIT, BOOL, BIGINT, SMALLINT = (
+    ty("DATE"), ty("DATETIME2", "6"), ty("DATETIME2", "7"), ty("TIMESTAMP", "6"), ty("BIT"),
+    ty("BOOLEAN"), ty("BIGINT"), ty("SMALLINT"))
+TRUE, FALSE = C("Special", S("TRUE")), C("Special", S("FALSE"))
+
+
+def cast(e, t):
+    return C("Cast", e, t)
+
+
+def dateadd(part, n, d):
+    return fn("DATEADD", pv(part), n, d)
+
+
+def make_interval(part, n):
+    z = num(0)
+    return fn("make_interval", n if part == "years" else z, n if part == "months" else z, z,
+              n if part == "days" else z, z, z, C("Num", S("0.0")))
+
+
+def if_(c, then):
+    return C("If", c, L(*then), L())
+
+
+def decl(x, t, v=NONE):
+    return C("NStmt", C("Declare", S(x), t, v))
+
+
+V_KEY_T = bin_("=", col("Id"), tv("@id"))
+V_KEY_P = bin_("=", pv("Id"), pv("p_id"))
+
+
+def v_t(extra=(), t_decl=DT2_6, s_value=num(5), b_value=num(0)):
+    return proc(["dbo", "p"], [param("@id", "In"), sparam("@big", "In", BIGINT), sparam("@flag", "In", BIT),
+                               sparam("@when", "In", DATE), sparam("@ts", "InOut", DT2_6)], [], [
+        ABORT, C("Setting", S("NOCOUNT"), "t"),
+        decl("@d", DATE, string("2024-01-31")), decl("@b", BIT, num(1)), decl("@s", SMALLINT, s_value),
+        decl("@n", BIGINT), decl("@t", t_decl, string("2024-01-01T23:59:00.123456")), decl("@i", INT),
+        assign(tv("@n"), bin_("+", tv("@big"), num(1))),
+        assign(tv("@b"), b_value),
+        assign(tv("@d"), dateadd("day", num(1), tv("@d"))),
+        assign(tv("@d"), dateadd("month", tv("@id"), tv("@d"))),
+        assign(tv("@d"), dateadd("year", C("Num", S("-1")), tv("@d"))),
+        assign(tv("@t"), dateadd("day", num(2), tv("@t"))),
+        assign(tv("@i"), fn("DATEDIFF", pv("day"), tv("@d"), tv("@t"))),
+        assign(tv("@d"), cast(tv("@t"), DATE)),
+        if_(bin_("=", tv("@b"), num(1)), [assign(tv("@i"), num(1))]),
+        if_(bin_("AND", bin_("=", tv("@flag"), num(1)), bin_("<", tv("@d"), tv("@when"))),
+            [assign(tv("@i"), num(4))]),
+        if_(bin_("=", tv("@d"), string("2024-01-01")), [assign(tv("@i"), num(5))]),
+        if_(bin_(">=", tv("@t"), string("2024-01-01T00:00:00")), [assign(tv("@i"), num(6))]),
+        if_(C("IsNull", tv("@ts"), "f"), [assign(tv("@ts"), tv("@t"))]),
+        ins(["dbo", "Ev"], ["Id", "D", "T", "B", "N"], [[tv("@id"), tv("@d"), tv("@t"), num(1), tv("@n")]]),
+        upd(["dbo", "Ev"], [("B", num(0)), ("D", dateadd("day", num(1), col("D")))], V_KEY_T),
+        C("NStmt", C("SSelect", sel([item(col("N"), assign_=S("@n")), item(col("D"), assign_=S("@d"))],
+                                    ["dbo", "Ev"], V_KEY_T))),
+        *extra])
+
+
+def v_p(extra=()):
+    return proc(["p"], [param("p_id", "In"), sparam("p_big", "In", BIGINT), sparam("p_flag", "In", BOOL),
+                        sparam("p_when", "In", DATE), sparam("p_ts", "InOut", TS6)],
+                [C("Declare", S("v_d"), DATE, NONE), C("Declare", S("v_b"), BOOL, NONE),
+                 C("Declare", S("v_s"), SMALLINT, NONE), C("Declare", S("v_n"), BIGINT, NONE),
+                 C("Declare", S("v_t"), TS6, NONE), C("Declare", S("v_i"), INT, NONE)], [
+        assign(pv("v_d"), string("2024-01-31")), assign(pv("v_b"), TRUE), assign(pv("v_s"), num(5)),
+        assign(pv("v_t"), string("2024-01-01T23:59:00.123456")),
+        assign(pv("v_n"), bin_("+", pv("p_big"), num(1))),
+        assign(pv("v_b"), FALSE),
+        assign(pv("v_d"), bin_("+", pv("v_d"), num(1))),
+        assign(pv("v_d"), cast(bin_("+", pv("v_d"), make_interval("months", pv("p_id"))), DATE)),
+        assign(pv("v_d"), cast(bin_("+", pv("v_d"), make_interval("years", C("Num", S("-1")))), DATE)),
+        assign(pv("v_t"), bin_("+", pv("v_t"), make_interval("days", num(2)))),
+        assign(pv("v_i"), bin_("-", cast(pv("v_t"), DATE), cast(pv("v_d"), DATE))),
+        assign(pv("v_d"), cast(pv("v_t"), DATE)),
+        if_(bin_("=", pv("v_b"), TRUE), [assign(pv("v_i"), num(1))]),
+        if_(bin_("AND", bin_("=", pv("p_flag"), TRUE), bin_("<", pv("v_d"), pv("p_when"))),
+            [assign(pv("v_i"), num(4))]),
+        if_(bin_("=", pv("v_d"), string("2024-01-01")), [assign(pv("v_i"), num(5))]),
+        if_(bin_(">=", pv("v_t"), string("2024-01-01T00:00:00")), [assign(pv("v_i"), num(6))]),
+        if_(C("IsNull", pv("p_ts"), "f"), [assign(pv("p_ts"), pv("v_t"))]),
+        ins(["Ev"], ["Id", "D", "T", "B", "N"], [[pv("p_id"), pv("v_d"), pv("v_t"), TRUE, pv("v_n")]]),
+        C("Txn", S("COMMIT"), NONE),
+        upd(["Ev"], [("B", FALSE), ("D", bin_("+", pv("D"), num(1)))], V_KEY_P),
+        C("Txn", S("COMMIT"), NONE),
+        for_block([item(pv("N"), alias=S("sqldiff_c1")), item(pv("D"), alias=S("sqldiff_c2"))], ["Ev"], V_KEY_P,
+                  [field("v_n", "sqldiff_c1"), field("v_d", "sqldiff_c2")]),
+        *extra])
+
+
+def req3v(i, a=None, b=None, cat=V_CAT):
+    return req3(i, a=v_t() if a is None else a, b=v_p() if b is None else b, dep=V_DEP, cat=cat,
+                cert=V_CERT)
+
+
+cases += [
+    ("104", req3v(104), "confirmed"),
+    # A datetime2(7) local: its literal is a string, the conversion's a timestamp.
+    ("105", req3v(105, a=v_t(t_decl=DT2_7)), "unconfirmed"),
+    # An int into the smallint local: a narrowing store.
+    ("106", req3v(106, a=v_t(s_value=tv("@id"))), "unconfirmed"),
+    # A bit stored from 2.
+    ("107", req3v(107, a=v_t(b_value=num(2))), "unconfirmed"),
+    # A literal that is not ISO 8601, and DATEADD(hour, ...).
+    ("108", req3v(108, a=v_t(extra=[assign(tv("@d"), string("01/02/2024"))])), "unconfirmed"),
+    ("109", req3v(109, a=v_t(extra=[assign(tv("@t"), dateadd("hour", num(1), tv("@t")))])), "unconfirmed"),
+    # A constant beyond bigint; a bigint column written from an int is fine, a
+    # smallint column from an int is not.
+    ("110", req3v(110, a=v_t(extra=[ins(["dbo", "Ev"], ["Id", "B", "S"], [[num(2), num(1), tv("@id")]])])),
+     "unconfirmed"),
+    # A malformed SPEC: the catalog does not decode; a bit key column: not usable.
+    ("111", req3v(111, cat=V_CAT.replace(".t6.", ".t.")), "unconfirmed"),
+    ("112", req3v(112, cat=V_CAT.replace(".bn.", ".bnk.")), "unconfirmed"),
+]
+# Review of C2c: each pair below was confirmed before the fix.
+# B1: PostgreSQL `date + make_interval(...)` is a timestamp; `+ 1` on it is
+# no date arithmetic (PostgreSQL: no operator timestamp + integer).
+def f1_t():
+    return proc(["dbo", "f1"], [param("@id", "In"), sparam("@d", "In", DATE), sparam("@r", "InOut", DATE)], [],
+                [ABORT, assign(tv("@r"), dateadd("day", num(1), dateadd("month", tv("@id"), tv("@d"))))])
+
+
+def f1_p(cast_date):
+    inner = bin_("+", pv("p_d"), make_interval("months", pv("p_id")))
+    return proc(["f1"], [param("p_id", "In"), sparam("p_d", "In", DATE), sparam("p_r", "InOut", DATE)], [],
+                [assign(pv("p_r"), bin_("+", cast(inner, DATE) if cast_date else inner, num(1)))])
+
+
+F1_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@id", "p_id"), ("@d", "p_d"), ("@r", "p_r"), ("%status", "%status")])
+# B2: an int argument into a smallint callee (PostgreSQL 42883).
+CS_DEP = f"0,{hx('dbo.cs')}:{hx('cs')}"
+
+
+def cs_cat(t):
+    return f"{hx('cs')}:i:{hx(t)}"
+
+
+CS_T = proc(["dbo", "f5"], [param("@i", "In")], [], [ABORT, call(["dbo", "cs"], (tv("@i"), "f"))])
+CS_P = proc(["f5"], [param("p_i", "In")], [], [call(["cs"], (pv("p_i"), "f"))])
+CS_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@i", "p_i"), ("%status", "%status")])
+# B3: `@b <> 1` against `b <> TRUE` names ASM-TSQL-ANSI-NULLS.
+AN_T = proc(["dbo", "an"], [sparam("@b", "In", BIT), param("@r", "InOut")], [],
+            [ABORT, assign(tv("@r"), num(0)), if_(bin_("<>", tv("@b"), num(1)), [assign(tv("@r"), num(1))])])
+AN_P = proc(["an"], [sparam("p_b", "In", BOOL), param("p_r", "InOut")], [],
+            [assign(pv("p_r"), num(0)), if_(bin_("<>", pv("p_b"), TRUE), [assign(pv("p_r"), num(1))])])
+AN_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@b", "p_b"), ("@r", "p_r"), ("%status", "%status")])
+# M1: a datetime2(6) value through a T-SQL datetime local and a PL/pgSQL
+# timestamp local (SQL Server .123333, PostgreSQL .123456).
+M1_T = proc(["dbo", "f3"], [sparam("@t", "In", DT2_6), sparam("@r", "InOut", DT2_6)], [],
+            [ABORT, decl("@x", ty("DATETIME")), assign(tv("@x"), tv("@t")), assign(tv("@r"), tv("@x"))])
+M1_P = proc(["f3"], [sparam("p_t", "In", ty("TIMESTAMP")), sparam("p_r", "InOut", ty("TIMESTAMP"))],
+            [C("Declare", S("v_x"), ty("TIMESTAMP"), NONE)],
+            [assign(pv("v_x"), pv("p_t")), assign(pv("p_r"), pv("v_x"))])
+M1_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@t", "p_t"), ("@r", "p_r"), ("@x", "v_x"), ("%status", "%status")])
+cases += [
+    ("113", req3(113, a=f1_t(), b=f1_p(False), dep="0", cat="-", cert=F1_CERT), "unconfirmed"),
+    ("114", req3(114, a=f1_t(), b=f1_p(True), dep="0", cat="-", cert=F1_CERT), "confirmed"),
+    ("115", req3(115, a=CS_T, b=CS_P, dep=CS_DEP, cat=cs_cat("SMALLINT"), cert=CS_CERT), "unconfirmed"),
+    ("116", req3(116, a=CS_T, b=CS_P, dep=CS_DEP, cat=cs_cat("INTEGER"), cert=CS_CERT), "confirmed"),
+    ("117", req3(117, a=CS_T, b=CS_P, dep=CS_DEP, cat=f"{hx('cs')}:i", cert=CS_CERT), "unconfirmed"),
+    ("118", req3(118, a=AN_T, b=AN_P, dep="0", cat="-", cert=AN_CERT), "confirmed"),
+    ("119", req3(119, a=M1_T, b=M1_P, dep="0", cat="-", cert=M1_CERT), "unconfirmed"),
+]
+# Re-review of C2c. R1: a type outside the slice corresponds to nothing.
+# T-SQL `time` is time(7) and keeps .1234567 < .1234568 (1); PostgreSQL's
+# time(6) rounds both to .123457 (0).
+TIME = ty("TIME")
+
+
+def tm_t(stores):
+    sets = [assign(tv("@a"), string("12:00:00.1234567")), assign(tv("@b"), string("12:00:00.1234568"))]
+    return proc(["dbo", "tm"], [param("@r", "InOut")], [],
+                [ABORT, decl("@a", TIME), decl("@b", TIME)] + (sets if stores else [])
+                + [assign(tv("@r"), num(0)), if_(bin_("<", tv("@a"), tv("@b")), [assign(tv("@r"), num(1))])])
+
+
+def tm_p(stores):
+    sets = [assign(pv("v_a"), string("12:00:00.1234567")), assign(pv("v_b"), string("12:00:00.1234568"))]
+    return proc(["tm"], [param("p_r", "InOut")],
+                [C("Declare", S("v_a"), TIME, NONE), C("Declare", S("v_b"), TIME, NONE)],
+                (sets if stores else [])
+                + [assign(pv("p_r"), num(0)), if_(bin_("<", pv("v_a"), pv("v_b")), [assign(pv("p_r"), num(1))])])
+
+
+TM_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@r", "p_r"), ("@a", "v_a"), ("@b", "v_b"), ("%status", "%status")])
+# R2: a string argument must fit the callee's declared length: `EXEC dbo.q
+# @v` with @v varchar(10) holding 'abcdef' reaches q(@s varchar(3)) as
+# 'abc' in SQL Server and whole in PostgreSQL.
+Q_DEP = f"0,{hx('dbo.q')}:{hx('q')}"
+
+
+def q_cat(t, *args):
+    return f"{hx('q')}:i:" + ".".join([hx(t)] + [hx(a) for a in args])
+
+
+def q_t(arg, decls=()):
+    return proc(["dbo", "f6"], [param("@i", "In")], [], [ABORT] + list(decls) + [call(["dbo", "q"], (arg, "f"))])
+
+
+def q_p(arg, decls=()):
+    return proc(["f6"], [param("p_i", "In")], list(decls), [call(["q"], (arg, "f"))])
+
+
+Q_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@i", "p_i"), ("@v", "v_v"), ("%status", "%status")])
+Q10_DECL_T = [decl("@v", VC10)]
+Q10_DECL_P = [C("Declare", S("v_v"), VC10, NONE)]
+Q3_DECL_T = [decl("@v", VC3)]
+Q3_DECL_P = [C("Declare", S("v_v"), VC3, NONE)]
+cases += [
+    ("120", req3(120, a=tm_t(True), b=tm_p(True), dep="0", cat="-", cert=TM_CERT), "unconfirmed"),
+    ("121", req3(121, a=tm_t(False), b=tm_p(False), dep="0", cat="-", cert=TM_CERT), "unconfirmed"),
+    ("122", req3(122, a=q_t(tv("@v"), Q10_DECL_T), b=q_p(pv("v_v"), Q10_DECL_P), dep=Q_DEP,
+                 cat=q_cat("VARCHAR", "3"), cert=Q_CERT), "unconfirmed"),
+    ("123", req3(123, a=q_t(tv("@v"), Q3_DECL_T), b=q_p(pv("v_v"), Q3_DECL_P), dep=Q_DEP,
+                 cat=q_cat("VARCHAR", "3"), cert=Q_CERT), "confirmed"),
+    ("124", req3(124, a=q_t(string("abcd")), b=q_p(string("abcd")), dep=Q_DEP,
+                 cat=q_cat("VARCHAR", "3"), cert=Q_CERT), "unconfirmed"),
+    ("125", req3(125, a=q_t(string("abc")), b=q_p(string("abc")), dep=Q_DEP,
+                 cat=q_cat("TEXT"), cert=Q_CERT), "unconfirmed"),
+]
 THEOREMS = {
+    "114": "Sqldiff.Mirror.check_sound_c2a",
+    "116": "Sqldiff.Mirror.check_sound_c2a",
+    "123": "Sqldiff.Mirror.check_sound",
+    "118": "Sqldiff.Mirror.check_sound_c2a",
+    "104": "Sqldiff.Mirror.check_sound_c2a",
     "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
     "86": "Sqldiff.Mirror.check_sound_c2a",
@@ -712,7 +950,8 @@ THEOREMS = {
 # unconfirmed /3 answer whose routine is outside the spec adds `why` (0.13.0),
 # the reason codes of Sqldiff/Mirror/Diagnose.lean; no other answer does.
 EXTRA = {
-    "35": {"why": ["node:call:name"]},
+    # (C2c) Without a catalog the callee's parameter types are not known either.
+    "35": {"why": ["node:call:type"]},
     "36": {"why": ["node:call:name"]},
     # A T-SQL routine as the PL/pgSQL side: every construct named, in order.
     "38": {"why": ["stmt:declare:pg", "expr:pg-var", "stmt:assign:target", "node:call:name",
@@ -732,7 +971,7 @@ EXTRA = {
     "77": {"why": ["store:assign:varchar_20", "expr:fn:upper"]},
     "78": {"why": ["store:declare:varchar_3"]},
     "79": {"why": ["store:return:varchar_5"]},
-    "80": {"why": ["store:call"]},
+    "80": {"why": ["store:call", "node:call:type"]},
     "81": {"why": ["store:declare:varchar_3"]},
     "84": {"why": ["stmt:select:where:not-key"]},
     "90": {"why": ["node:for-query"]},
@@ -749,25 +988,66 @@ EXTRA = {
     "91": {"scalars": "c2a",
            "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
            "statements": "c3b"},
-    "83": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},
-    "86": {"scalars": "c2a", "residual": [], "statements": "c3b"},
-    "87": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},
-    "89": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS"], "statements": "c3b"},
+    "104": {"scalars": "c2a",
+            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS",
+                         "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"],
+            "statements": "c3b", "errors": "c4"},
+    "105": {"why": ["store:declare:datetime2_7", "type:datetime2_7", "stmt:insert:value"]},
+    "114": {"scalars": "c2a",
+            "residual": ["ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE"],
+            "statements": "c1"},
+    "115": {"why": ["node:call:type"]},
+    "116": {"scalars": "c2a",
+            "residual": ["ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
+            "statements": "c1"},
+    "117": {"why": ["node:call:type"]},
+    "118": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+            "statements": "c1"},
+    "119": {"why": ["store:assign:datetime"]},
+    # Re-review of C2c: a string into `time`; an argument longer than, or
+    # with no bound against, the callee's declared length.
+    "120": {"why": ["store:assign:time"]},
+    "122": {"why": ["node:call:type"]},
+    "123": {"scalars": "uninterpreted", "statements": "c1"},
+    "124": {"why": ["node:call:type"]},
+    "125": {"why": ["node:call:type"]},
+    "106": {"why": ["store:declare:smallint"]},
+    "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
+    "108": {"why": ["store:assign:date", "expr:date-literal"]},
+    "109": {"why": ["expr:dateadd:part"]},
+    "110": {"why": ["stmt:insert:value"]},
+    "112": {"why": ["stmt:insert:table:not-plain", "stmt:update:table:not-plain",
+                    "stmt:select:table:not-plain"]},
+    "83": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+           "statements": "c3b"},
+    "86": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c3b"},
+    "87": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
+           "statements": "c3b"},
+    "89": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-STRING-ARGS"],
+           "statements": "c3b"},
     "31": {"scalars": "uninterpreted", "statements": "c1"},
     "40": {"scalars": "uninterpreted", "statements": "c1"},
     # The call to log_value can fail after the callee wrote (0.8.0).
-    "41": {"scalars": "c2a", "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR"],
+    "41": {"scalars": "c2a",
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
            "statements": "c1"},
     "69": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
     "70": {"scalars": "uninterpreted", "statements": "c1"},
     "82": {"scalars": "uninterpreted", "statements": "c1"},
-    "71": {"scalars": "c2a", "residual": ["ASM-STATE-AFTER-ERROR"], "statements": "c1"},
+    "71": {"scalars": "c2a",
+           "residual": ["ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
+           "statements": "c1"},
     "74": {"scalars": "c2a",
-           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-NO-CALLER-TXN"],
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS",
+                        "ASM-NO-CALLER-TXN"],
            "statements": "c3a", "errors": "c4"},
-    "42": {"scalars": "c2a", "residual": [], "statements": "c1"},
+    "42": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
     "44": {"scalars": "c2a",
-           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR"],
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR",
+                        "ASM-TSQL-STRING-ARGS"],
            "statements": "c3a"},
     "50": {"scalars": "uninterpreted", "statements": "c3a"},
     "51": {"scalars": "c2a", "residual": ["ASM-CONCAT-NULL", "ASM-TSQL-STRING-ARGS"], "statements": "c1"},
@@ -777,17 +1057,20 @@ EXTRA = {
     "56": {"scalars": "c2a", "residual": ["ASM-TSQL-LEN-BMP", "ASM-TSQL-STRING-ARGS"], "statements": "c1"},
     "59": {"scalars": "c2a", "residual": ["ASM-TSQL-STRING-ARGS"], "statements": "c1"},
     "60": {"scalars": "c2a",
-           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN"],
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-STRING-ARGS", "ASM-CATCH-CORE-ERRORS",
+                        "ASM-NO-CALLER-TXN"],
            "statements": "c1", "errors": "c4"},
     "61": {"scalars": "c2a",
-           "residual": ["ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN", "ASM-THROW-ERRCODE"],
+           "residual": ["ASM-TSQL-STRING-ARGS", "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN",
+                        "ASM-THROW-ERRCODE"],
            "statements": "c3a", "errors": "c4"},
     "62": {"scalars": "c2a",
-           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-CATCH-CORE-ERRORS",
-                        "ASM-NO-CALLER-TXN"],
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS",
+                        "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN"],
            "statements": "c3a", "errors": "c4"},
     "64": {"scalars": "c2a",
-           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-NO-CALLER-TXN"],
+           "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS",
+                        "ASM-NO-CALLER-TXN"],
            "statements": "c3a", "errors": "c4"},
 }
 inp = "".join(line + "\n" for _, line, _ in cases)

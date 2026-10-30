@@ -37,10 +37,10 @@ count); the catalog below is what the checker is told. -/
 
 def cust : CatTable :=
   { name := "cust"
-    cols := [⟨"id", "Id", true, true, none, none⟩,
-      ⟨"name", "Name", true, false, some (20, false), none⟩,
-      ⟨"city", "City", false, false, some (30, true), some (.str "Paris")⟩,
-      ⟨"qty", "Qty", true, false, none, some (.int 0)⟩] }
+    cols := [⟨"id", "Id", true, true, .int .i32, none⟩,
+      ⟨"name", "Name", true, false, .str 20 false, none⟩,
+      ⟨"city", "City", false, false, .str 30 true, some (.str "Paris")⟩,
+      ⟨"qty", "Qty", true, false, .int .i32, some (.int 0)⟩] }
 
 def depc : Deployment := { rowCounts := false, routines := [], tables := [("dbo.Cust", "cust")] }
 def Γc : Catalog := { routines := [], tables := [cust] }
@@ -275,34 +275,34 @@ def custWith (i : Nat) (c : CatCol) : Catalog :=
 def anyIns : Ast.Routine := procT [ins ["dbo", "Cust"] ["Id", "Name"] [[tv "@id", str "a"]]]
 #guard (lowerT depc Γc anyIns).isSome
 -- A string key (eval/tables T6: `'a'` and `'a '` are one key in SQL Server).
-#guard !(custWith 1 ⟨"name", "Name", true, true, some (20, false), none⟩).tables.all (·.wellFormed)
-#guard (lowerT depc (custWith 1 ⟨"name", "Name", true, true, some (20, false), none⟩) anyIns).isNone
+#guard !(custWith 1 ⟨"name", "Name", true, true, .str 20 false, none⟩).tables.all (·.wellFormed)
+#guard (lowerT depc (custWith 1 ⟨"name", "Name", true, true, .str 20 false, none⟩) anyIns).isNone
 -- A length of 0 or over 4000.
-#guard (lowerT depc (custWith 1 ⟨"name", "Name", true, false, some (0, false), none⟩) anyIns).isNone
-#guard (lowerT depc (custWith 1 ⟨"name", "Name", true, false, some (4001, false), none⟩) anyIns).isNone
+#guard (lowerT depc (custWith 1 ⟨"name", "Name", true, false, .str 0 false, none⟩) anyIns).isNone
+#guard (lowerT depc (custWith 1 ⟨"name", "Name", true, false, .str 4001 false, none⟩) anyIns).isNone
 -- Defaults: too long for the column (eval/tables T4: 2628 against 22001),
 -- a string for an integer column, an integer for a string column, one
 -- outside the 32-bit range, a non-ASCII or backslash string, an expression.
-#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, some (3, true), some (.str "Paris")⟩)
+#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, .str 3 true, some (.str "Paris")⟩)
   anyIns).isNone
-#guard (lowerT depc (custWith 3 ⟨"qty", "Qty", true, false, none, some (.str "0")⟩) anyIns).isNone
-#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, some (30, true), some (.int 0)⟩)
+#guard (lowerT depc (custWith 3 ⟨"qty", "Qty", true, false, .int .i32, some (.str "0")⟩) anyIns).isNone
+#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, .str 30 true, some (.int 0)⟩)
   anyIns).isNone
-#guard (lowerT depc (custWith 3 ⟨"qty", "Qty", true, false, none, some (.int 2147483648)⟩)
+#guard (lowerT depc (custWith 3 ⟨"qty", "Qty", true, false, .int .i32, some (.int 2147483648)⟩)
   anyIns).isNone
-#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, some (30, true), some (.str "é")⟩)
+#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, .str 30 true, some (.str "é")⟩)
   anyIns).isNone
-#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, some (30, true), some (.str "a\\b")⟩)
+#guard (lowerT depc (custWith 2 ⟨"city", "City", false, false, .str 30 true, some (.str "a\\b")⟩)
   anyIns).isNone
-#guard (lowerT depc (custWith 3 ⟨"qty", "Qty", true, false, none,
-  some (.arith .add (.int 1) (.int 1))⟩) anyIns).isNone
+#guard (lowerT depc (custWith 3 ⟨"qty", "Qty", true, false, .int .i32,
+  some (.arith .i32 .add (.int 1) (.int 1))⟩) anyIns).isNone
 -- A default on a key column is a value like any other.
-#guard (lowerT depc (custWith 0 ⟨"id", "Id", true, true, none, some (.int 1)⟩)
+#guard (lowerT depc (custWith 0 ⟨"id", "Id", true, true, .int .i32, some (.int 1)⟩)
   (procT [ins ["dbo", "Cust"] ["Name"] [[str "a"]]])).isSome
 
 /-! ## A default on the key: the second `INSERT` is a duplicate -/
 
-def Γk : Catalog := custWith 0 ⟨"id", "Id", true, true, none, some (.int 1)⟩
+def Γk : Catalog := custWith 0 ⟨"id", "Id", true, true, .int .i32, some (.int 1)⟩
 def twiceT : Ast.Routine :=
   procT [ins ["dbo", "Cust"] ["Name"] [[str "a"]], ins ["dbo", "Cust"] ["Name"] [[str "b"]]]
 def twiceP : Ast.Routine :=

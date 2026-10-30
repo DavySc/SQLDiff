@@ -22,7 +22,7 @@ The table is C3a's `acct` (`Id` key, `Qty` nullable, `Total NOT NULL`),
 columns. -/
 
 def twoK : CatTable :=
-  { name := "two", cols := [⟨"a", "A", true, true, none, none⟩, ⟨"b", "B", true, true, none, none⟩, ⟨"v", "V", false, false, none, none⟩] }
+  { name := "two", cols := [⟨"a", "A", true, true, .int .i32, none⟩, ⟨"b", "B", true, true, .int .i32, none⟩, ⟨"v", "V", false, false, .int .i32, none⟩] }
 
 def Γq : Catalog := { Γd with tables := Γd.tables ++ [twoK] }
 def depq : Deployment := { depd with tables := depd.tables ++ [("dbo.Two", "two")] }
@@ -140,7 +140,7 @@ def lookP (body : List Ast.Node := lookBodyP) (ps : List Ast.Param :=
 
 #guard isC2a (checkQ lookT lookP)
 -- `COUNT(*)` can overflow (2^31 rows); `Id = @id` compares with `=`.
-#guard residualOf depq Γq lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS"]
+#guard residualOf depq Γq lookT == some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
 #guard (lowerT depq Γq lookT).map Core.Routine.hasQuery == some true
 -- The `EXISTS` variable is a local of both lowered routines.
 #guard (lowerT depq Γq lookT).map (·.locals) == some [existsVar]
@@ -167,7 +167,7 @@ def readP : Ast.Routine :=
     .If (existsT ["acct"] none) [] [set (pv "p_q") .Null]]
 def readCert : Cert := ⟨[("@id", "p_id"), ("@q", "p_q"), (statusVar, statusVar)]⟩
 #guard isC2a (checkQ readT readP readCert)
-#guard residualOf depq Γq readT == some ["ASM-TSQL-ANSI-NULLS"]
+#guard residualOf depq Γq readT == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
 -- `SELECT *` in `EXISTS`, `e = k` the other way round, and `@x` in the
 -- `WHERE` of a read with the key fixed by a literal.
 #guard isC2a (checkQ
@@ -225,8 +225,11 @@ def selAcct (wh : Option Ast.Expr) (items : List Ast.SelItem := [asg "@q" (tc "Q
 -- A table without a key.
 #guard (lowerT depq Γq (tsqlProc ["r"] [ioT "@q"]
   [selectT [asg "@q" (tc "A")] ["dbo", "Pair"] (some (.Bin "=" (tc "A") (num 1)))])).isNone
--- The key on the C1 path (a `bigint` variable): not seen as fixed.
+-- (C2c) A `bigint` variable compares with the `int` key in the slice.
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id" bigint, ioT "@q"]
+  [selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT)])).isSome
+-- The key on the C1 path (a `decimal` variable): not seen as fixed.
+#guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id" (.Ty "DECIMAL" ["10", "0"]), ioT "@q"]
   [selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT)])).isNone
 
 /-! ## Refused: what the values and targets may be -/
@@ -239,8 +242,13 @@ def selAcct (wh : Option Ast.Expr) (items : List Ast.SelItem := [asg "@q" (tc "Q
 #guard (lowerT depq Γq (selAcct (some keyT) [asg "@q" (.Bin "+" (tv "@q") (tc "Qty"))])).isNone
 #guard (lowerT depq Γq (selAcct (some keyT) [asg "@q" (.Bin "+" (tc "Qty") (num 1))])).isNone
 #guard (lowerT depq Γq (selAcct (some keyT) [asg "@q" (tc "Qty"), asg "@q" (tc "Total")])).isNone
--- A target that is not `int` (the store would convert).
+-- (C2c) A `bigint` target takes an `int` column; a `smallint` one, or a
+-- `decimal`, would convert.
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q" bigint]
+  [selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT)])).isSome
+#guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q" (.Ty "SMALLINT" [])]
+  [selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT)])).isNone
+#guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q" (.Ty "DECIMAL" ["10", "0"])]
   [selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT)])).isNone
 -- A select list without assignments (a result set), or mixed.
 #guard (lowerT depq Γq (selAcct (some keyT) [item (tc "Qty")])).isNone

@@ -14,7 +14,9 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
-use sqldiff_core::proof::{self, Checker, MirrorColumn, MirrorDefault, MirrorRequest, MirrorTable};
+use sqldiff_core::proof::{
+    self, Checker, MirrorColumn, MirrorDefault, MirrorRequest, MirrorTable, MirrorType,
+};
 use sqldiff_syntax::abstract_syntax::{tokens, Expr, From, Select, Stmt, K};
 use sqldiff_syntax::routine::{self, Mode, Node, Routine, RoutineKind};
 use sqldiff_syntax::{encode, parse, plain_table, Dialect, SyntaxKind, SyntaxNode};
@@ -221,7 +223,8 @@ pub const C1_NO_ERRORS: &str = "ASM-C1-NO-ERRORS";
 /// With strings (C2b): sessions concatenate NULL to NULL, collations are
 /// binary (only sent when the deployment accepts it), `LEN` sees no
 /// character outside the BMP, and string arguments fit their parameters.
-pub const C2A_RESIDUALS: [&str; 10] = [
+/// With dates (C2c): the two DATEADD facts the converter notes too.
+pub const C2A_RESIDUALS: [&str; 12] = [
     "ASM-TSQL-ARITH-ERRORS",
     "ASM-TSQL-ANSI-NULLS",
     "ASM-STATE-AFTER-ERROR",
@@ -229,6 +232,11 @@ pub const C2A_RESIDUALS: [&str; 10] = [
     BINARY_COLLATION,
     "ASM-TSQL-LEN-BMP",
     STRING_ARGS,
+    // C2c: a DATEADD result stays within 0001-01-01 and 9999-12-31 (T-SQL
+    // raises 517 past them, PostgreSQL returns the value), and years clamp
+    // February 29 to February 28 as months clamp (eval/values V6).
+    "ASM-DATEADD-RANGE",
+    "ASM-DATEADD-YEAR-END",
     // C4: only errors the core models reach a handler, no caller
     // transaction around a handled error or transaction control, and
     // callers ignore the number of an error the routine raises.
@@ -719,32 +727,63 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
 }
 
 /// (C3c) The column type of the checker's catalog for a T-SQL column and
-/// the PostgreSQL column converted from it: `int` against `integer`, and
-/// `varchar(n)` or `nvarchar(n)` against `varchar(n)` with the same `n`
-/// (the converter's mapping); anything else does not pair.
-fn pair_type(a: plain_table::ColType, b: plain_table::ColType) -> Option<Option<(u32, bool)>> {
-    use plain_table::ColType::{Int, NVarchar, Varchar};
+/// the PostgreSQL column converted from it: `int` against `integer`,
+/// `varchar(n)` or `nvarchar(n)` against `varchar(n)` with the same `n`,
+/// (C2c) `bigint`, `smallint` and `date` against themselves, `bit` against
+/// `boolean`, `datetime2(p)` against `timestamp(p)` (the converter's
+/// mapping); anything else does not pair.
+fn pair_type(a: plain_table::ColType, b: plain_table::ColType) -> Option<MirrorType> {
+    use plain_table::ColType::{BigInt, Bool, Date, Int, NVarchar, SmallInt, Timestamp, Varchar};
     match (a, b) {
-        (Int, Int) => Some(None),
-        (Varchar(n), Varchar(m)) if n == m => Some(Some((n, false))),
-        (NVarchar(n), Varchar(m)) if n == m => Some(Some((n, true))),
+        (Int, Int) => Some(MirrorType::Int),
+        (BigInt, BigInt) => Some(MirrorType::BigInt),
+        (SmallInt, SmallInt) => Some(MirrorType::SmallInt),
+        (Varchar(n), Varchar(m)) if n == m => Some(MirrorType::Str {
+            len: n,
+            wide: false,
+        }),
+        (NVarchar(n), Varchar(m)) if n == m => Some(MirrorType::Str { len: n, wide: true }),
+        (Bool, Bool) => Some(MirrorType::Bool),
+        (Date, Date) => Some(MirrorType::Date),
+        (Timestamp(p), Timestamp(q)) if p == q => Some(MirrorType::Timestamp(p)),
         _ => None,
     }
 }
 
 /// (C3c) The default both columns declare, the same constant (`None` for
-/// none on both sides), or why they do not pair.
+/// none on both sides), or why they do not pair. (C2c) For a bit column
+/// T-SQL `0`/`1` pairs with PostgreSQL `FALSE`/`TRUE`; for a date or
+/// timestamp column the same ISO literal on both sides.
 fn pair_default(
+    ty: MirrorType,
     a: &Option<plain_table::ColDefault>,
     b: &Option<plain_table::ColDefault>,
 ) -> Option<Option<MirrorDefault>> {
     use plain_table::ColDefault;
-    match (a, b) {
-        (None, None) => Some(None),
-        (Some(ColDefault::Int(x)), Some(ColDefault::Int(y))) if x == y => {
-            Some(Some(MirrorDefault::Int(*x)))
+    match (ty, a, b) {
+        (_, None, None) => Some(None),
+        (MirrorType::Bool, Some(ColDefault::Int(x)), Some(ColDefault::Bool(y)))
+            if (*x == 1) == *y =>
+        {
+            Some(Some(MirrorDefault::Bool(*y)))
         }
-        (Some(ColDefault::Str(x)), Some(ColDefault::Str(y))) if x == y => {
+        (MirrorType::Bool, Some(ColDefault::Bool(x)), Some(ColDefault::Bool(y))) if x == y => {
+            Some(Some(MirrorDefault::Bool(*y)))
+        }
+        (MirrorType::Date, Some(ColDefault::Str(x)), Some(ColDefault::Str(y))) if x == y => {
+            Some(Some(MirrorDefault::Date(x.clone())))
+        }
+        (MirrorType::Timestamp(_), Some(ColDefault::Str(x)), Some(ColDefault::Str(y)))
+            if x == y =>
+        {
+            Some(Some(MirrorDefault::Timestamp(x.clone())))
+        }
+        (
+            MirrorType::Int | MirrorType::BigInt | MirrorType::SmallInt,
+            Some(ColDefault::Int(x)),
+            Some(ColDefault::Int(y)),
+        ) if x == y => Some(Some(MirrorDefault::Int(*x))),
+        (MirrorType::Str { .. }, Some(ColDefault::Str(x)), Some(ColDefault::Str(y))) if x == y => {
             Some(Some(MirrorDefault::Str(x.clone())))
         }
         _ => None,
@@ -754,7 +793,9 @@ fn pair_default(
 /// (C3c) The T-SQL table has a `varchar` column (the one `ANSI_PADDING`
 /// applies to; eval/tables T3).
 pub fn has_varchar(t: &MirrorTable) -> bool {
-    t.cols.iter().any(|c| matches!(c.str, Some((_, false))))
+    t.cols
+        .iter()
+        .any(|c| matches!(c.ty, MirrorType::Str { wide: false, .. }))
 }
 
 impl Tables {
@@ -847,14 +888,14 @@ impl Tables {
                         return None;
                     }
                     // C3c: the type and the default as both DDLs show them.
-                    let str = pair_type(x.ty, y.ty)?;
-                    let default = pair_default(&x.default, &y.default)?;
+                    let ty = pair_type(x.ty, y.ty)?;
+                    let default = pair_default(ty, &x.default, &y.default)?;
                     Some(MirrorColumn {
                         name: pg_name(&y.name),
                         tsql: x.name.clone(),
                         not_null: y.not_null,
                         key: y.key,
-                        str,
+                        ty,
                         default,
                     })
                 })
@@ -1054,9 +1095,20 @@ pub fn mirror_request(
     }
     // T-SQL truncates a string argument to its parameter's length and
     // PostgreSQL does not; the C2a residual names it, a C1 answer does not.
+    // C2c: so do the parameters of every other type of the slice (a
+    // `datetime2(7)` value is rounded on entry, an `int` narrowed or made
+    // 0/1, a `1.5` passed to an `int` or `bigint` truncated to 1 where
+    // PostgreSQL finds no procedure): callers pass values of the
+    // parameter's declared type.
     let stringy = |t: &str| {
         let t = t.to_ascii_lowercase();
-        t.contains("char") || t == "sysname" || t.contains("text")
+        t.contains("char")
+            || t == "sysname"
+            || t.contains("text")
+            || matches!(
+                t.as_str(),
+                "int" | "integer" | "bigint" | "smallint" | "bit" | "date" | "datetime2"
+            )
     };
     if a.params.iter().any(|p| stringy(&p.ty.name)) {
         assumptions.push(STRING_ARGS.to_string());
@@ -1078,11 +1130,31 @@ pub fn mirror_request(
             (name, r.params.iter().map(|p| mode_letter(p.mode)).collect())
         })
         .collect();
+    // C2c: the callees' parameter types, as their PostgreSQL DDL declares
+    // them; the checker holds each argument to its parameter's type.
+    let catalog_types = output_routines
+        .iter()
+        .map(|r| {
+            let name = r
+                .name
+                .iter()
+                .map(|p| pg_name(p))
+                .collect::<Vec<_>>()
+                .join(".");
+            let types = r
+                .params
+                .iter()
+                .map(|p| (p.ty.name.clone(), p.ty.args.clone()))
+                .collect();
+            (name, types)
+        })
+        .collect();
     Ok((
         MirrorRequest {
             row_counts,
             routines,
             catalog,
+            catalog_types,
             tables: table_pairs,
             table_catalog,
             binary_collation: trusted.binary_collation,
@@ -1464,23 +1536,33 @@ END
         };
         let t = tables("");
         let cust = t.get("cust").expect("a plain table");
-        type Col<'a> = (&'a str, Option<(u32, bool)>, Option<MirrorDefault>);
+        type Col<'a> = (&'a str, MirrorType, Option<MirrorDefault>);
         let cols: Vec<Col> = cust
             .cols
             .iter()
-            .map(|c| (c.name.as_str(), c.str, c.default.clone()))
+            .map(|c| (c.name.as_str(), c.ty, c.default.clone()))
             .collect();
         assert_eq!(
             cols,
             [
-                ("id", None, None),
-                ("name", Some((20, false)), None),
+                ("id", MirrorType::Int, None),
+                (
+                    "name",
+                    MirrorType::Str {
+                        len: 20,
+                        wide: false
+                    },
+                    None
+                ),
                 (
                     "city",
-                    Some((30, true)),
+                    MirrorType::Str {
+                        len: 30,
+                        wide: true
+                    },
                     Some(MirrorDefault::Str("Paris".into()))
                 ),
-                ("qty", None, Some(MirrorDefault::Int(0))),
+                ("qty", MirrorType::Int, Some(MirrorDefault::Int(0))),
             ]
         );
         // A write to a table with a varchar column names ANSI_PADDING; a read
