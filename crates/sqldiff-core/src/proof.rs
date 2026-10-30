@@ -253,6 +253,12 @@ pub struct MirrorRequest {
     /// Target routines (folded names) and their parameter modes, one of
     /// `i`, `o`, `b` (IN, OUT, INOUT) per parameter.
     pub catalog: Vec<(String, String)>,
+    /// (C2c) The declared types of those routines' parameters, by name, as
+    /// the PostgreSQL DDL spells them (type name and its arguments). A
+    /// call is in the checker's spec only when every argument has exactly
+    /// its parameter's type, so a routine without an entry here takes no
+    /// argument in the spec (`Sqldiff.Mirror.Catalog.routineTys`).
+    pub catalog_types: Vec<(String, Vec<ParamType>)>,
     /// T-SQL table names (`.`-joined, as written) and the target table
     /// each one is (trusted: the deployment's schema mapping, C3a).
     pub tables: Vec<(String, String)>,
@@ -270,11 +276,16 @@ pub struct MirrorRequest {
     pub target: String,
 }
 
+/// (C2c) A callee parameter's declared type: the type name as the DDL
+/// spells it and its arguments (`TIMESTAMP`, `["6"]`).
+pub type ParamType = (String, Vec<String>);
+
 /// A table of the target catalog for the C3a slice
 /// (`Sqldiff.Mirror.CatTable`). Sending one asserts that both databases
-/// have it with these columns (`int`, or (C3c) the string types of
-/// [`MirrorColumn::str`]), nullability, primary key and (C3c) constant
-/// defaults, and nothing else that changes a write: no other constraint,
+/// have it with these columns (`int`, or (C3c) the string types and (C2c)
+/// the typed-value types of [`MirrorColumn::ty`]), nullability, primary
+/// key and (C3c) constant defaults, and nothing else that changes a
+/// write: no other constraint,
 /// default, identity, sequence, computed column, trigger, rule or
 /// row-level security; a key neither deferrable nor `IGNORE_DUP_KEY`; no
 /// inheritance children; not a temporary table or table variable; (C3c)
@@ -298,20 +309,40 @@ pub struct MirrorColumn {
     pub not_null: bool,
     /// A column of the primary key.
     pub key: bool,
-    /// (C3c) A string column: `(n, wide)` is T-SQL `varchar(n)` (`wide`
-    /// false) or `nvarchar(n)` (true) against PostgreSQL `varchar(n)`.
-    /// `None`: `int`/`integer`. Sent only when both DDLs show it.
-    pub str: Option<(u32, bool)>,
+    /// The column's type, as both DDLs show it ([`MirrorType`]).
+    pub ty: MirrorType,
     /// (C3c) The constant default both DDLs declare; `None` for none or
     /// `DEFAULT NULL`.
     pub default: Option<MirrorDefault>,
 }
 
-/// (C3c) A column default the checker takes as given.
+/// A column type of the checker's catalog (`Sqldiff.Mirror.ColKind`):
+/// the 32-bit integer, (C3c) a string column, `(n, wide)` for T-SQL
+/// `varchar(n)` (`wide` false) or `nvarchar(n)` (true) against PostgreSQL
+/// `varchar(n)`, and (C2c) `bigint`, `smallint`, T-SQL `bit` against
+/// `boolean`, `date`, and T-SQL `datetime2(p)` against `timestamp(p)`,
+/// `p <= 6`. Sent only when both DDLs show it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorType {
+    Int,
+    BigInt,
+    SmallInt,
+    Str { len: u32, wide: bool },
+    Bool,
+    Date,
+    Timestamp(u32),
+}
+
+/// (C3c) A column default the checker takes as given; (C2c) a bit (T-SQL
+/// `0`/`1` against `FALSE`/`TRUE`), and a date or timestamp literal in the
+/// ISO 8601 form the checker reads, as written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MirrorDefault {
     Int(i32),
     Str(String),
+    Bool(bool),
+    Date(String),
+    Timestamp(String),
 }
 
 fn hex(s: &str) -> String {
@@ -355,13 +386,19 @@ impl MirrorRequest {
                 .cols
                 .iter()
                 .map(|c| {
-                    // SPEC (Request.lean): the type (`i`, or (C3c) `v<n>` /
-                    // `w<n>`), then `n` for NOT NULL, then `k` for a key
-                    // column; (C3c) the default as a fourth field.
-                    let mut spec = match c.str {
-                        None => "i".to_string(),
-                        Some((n, false)) => format!("v{n}"),
-                        Some((n, true)) => format!("w{n}"),
+                    // SPEC (Request.lean): the type (`i`, (C3c) `v<n>` /
+                    // `w<n>`, (C2c) `j`, `h`, `b`, `d`, `t<p>`), then `n` for
+                    // NOT NULL, then `k` for a key column; (C3c) the default
+                    // as a fourth field.
+                    let mut spec = match c.ty {
+                        MirrorType::Int => "i".to_string(),
+                        MirrorType::BigInt => "j".to_string(),
+                        MirrorType::SmallInt => "h".to_string(),
+                        MirrorType::Str { len, wide: false } => format!("v{len}"),
+                        MirrorType::Str { len, wide: true } => format!("w{len}"),
+                        MirrorType::Bool => "b".to_string(),
+                        MirrorType::Date => "d".to_string(),
+                        MirrorType::Timestamp(p) => format!("t{p}"),
                     };
                     match (c.key, c.not_null) {
                         (true, _) => spec.push_str("nk"),
@@ -372,6 +409,9 @@ impl MirrorRequest {
                         None => String::new(),
                         Some(MirrorDefault::Int(i)) => format!(".i{i}"),
                         Some(MirrorDefault::Str(v)) => format!(".s{}", hex(v)),
+                        Some(MirrorDefault::Bool(b)) => format!(".b{}", u8::from(*b)),
+                        Some(MirrorDefault::Date(v)) => format!(".d{}", hex(v)),
+                        Some(MirrorDefault::Timestamp(v)) => format!(".t{}", hex(v)),
                     };
                     format!("{}.{spec}.{}{default}", hex(&c.name), hex(&c.tsql))
                 })
@@ -379,10 +419,32 @@ impl MirrorRequest {
                 .join("/");
             format!("{}={cols}", hex(&t.name))
         });
+        // ROUTINE (Request.lean): `NAME:MODES`, or (C2c) `NAME:MODES:TYPES`
+        // with one type per mode letter, `/`-separated, each the type's name
+        // then `.` and each argument, all hex.
+        let types_of = |n: &str| {
+            self.catalog_types
+                .iter()
+                .find(|(m, _)| m == n)
+                .map(|(_, ts)| {
+                    ts.iter()
+                        .map(|(t, args)| {
+                            std::iter::once(hex(t))
+                                .chain(args.iter().map(|a| hex(a)))
+                                .collect::<Vec<_>>()
+                                .join(".")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+        };
         let catalog = self
             .catalog
             .iter()
-            .map(|(n, m)| format!("{}:{m}", hex(n)))
+            .map(|(n, m)| match types_of(n) {
+                Some(ts) => format!("{}:{m}:{ts}", hex(n)),
+                None => format!("{}:{m}", hex(n)),
+            })
             .chain(tables)
             .chain(
                 self.binary_collation
@@ -746,7 +808,7 @@ mod tests {
             tsql: tsql.into(),
             not_null,
             key,
-            str: None,
+            ty: MirrorType::Int,
             default: None,
         };
         let r = MirrorRequest {
@@ -763,6 +825,7 @@ mod tests {
                 ],
             }],
             binary_collation: true,
+            catalog_types: Vec::new(),
             renaming: Vec::new(),
             source: "(R)".into(),
             target: "(R)".into(),
@@ -782,11 +845,17 @@ mod tests {
         r.table_catalog[0].cols = vec![
             col("id", "id", true, true),
             MirrorColumn {
-                str: Some((20, false)),
+                ty: MirrorType::Str {
+                    len: 20,
+                    wide: false,
+                },
                 ..col("name", "name", true, false)
             },
             MirrorColumn {
-                str: Some((30, true)),
+                ty: MirrorType::Str {
+                    len: 30,
+                    wide: true,
+                },
                 default: Some(MirrorDefault::Str("Paris".into())),
                 ..col("city", "City", false, false)
             },
@@ -801,6 +870,70 @@ mod tests {
             f[5],
             "70:ib,61636374=6964.ink.6964/6e616d65.v20n.6e616d65/63697479.w30.43697479.s5061726973/\
              717479.in.517479.i-1"
+        );
+        // C2c: the typed-value columns, as Request.lean's example decodes
+        // them (eval/values V8: `d date PRIMARY KEY`, `n bigint`, `s smallint
+        // DEFAULT 0`, `b bit NOT NULL DEFAULT 0`, `t datetime2(6) DEFAULT
+        // '2000-01-01T00:00:00'`).
+        r.catalog = Vec::new();
+        r.table_catalog[0] = MirrorTable {
+            name: "ev".into(),
+            cols: vec![
+                MirrorColumn {
+                    ty: MirrorType::Date,
+                    ..col("d", "d", true, true)
+                },
+                MirrorColumn {
+                    ty: MirrorType::BigInt,
+                    ..col("n", "n", false, false)
+                },
+                MirrorColumn {
+                    ty: MirrorType::SmallInt,
+                    default: Some(MirrorDefault::Int(0)),
+                    ..col("s", "s", true, false)
+                },
+                MirrorColumn {
+                    ty: MirrorType::Bool,
+                    default: Some(MirrorDefault::Bool(false)),
+                    ..col("b", "b", true, false)
+                },
+                MirrorColumn {
+                    ty: MirrorType::Timestamp(6),
+                    default: Some(MirrorDefault::Timestamp("2000-01-01T00:00:00".into())),
+                    ..col("t", "t", false, false)
+                },
+            ],
+        };
+        let l = r.line(1).unwrap();
+        let f: Vec<&str> = l.split('\t').collect();
+        assert_eq!(
+            f[5],
+            "6576=64.dnk.64/6e.j.6e/73.hn.73.i0/62.bn.62.b0/74.t6.74.t323030302d30312d30315430303a30303a3030"
+        );
+        r.table_catalog[0].cols = vec![MirrorColumn {
+            ty: MirrorType::Date,
+            default: Some(MirrorDefault::Date("2024-02-29".into())),
+            ..col("d", "d", false, false)
+        }];
+        let l = r.line(1).unwrap();
+        assert_eq!(
+            l.split('\t').nth(5).unwrap(),
+            "6576=64.d.64.d323032342d30322d3239"
+        );
+        // C2c: a callee's parameter types follow its modes.
+        r.catalog = vec![("p".into(), "ib".into())];
+        r.catalog_types = vec![(
+            "p".into(),
+            vec![
+                ("INTEGER".into(), Vec::new()),
+                ("TIMESTAMP".into(), vec!["6".into()]),
+            ],
+        )];
+        r.table_catalog = Vec::new();
+        let l = r.line(1).unwrap();
+        assert_eq!(
+            l.split('\t').nth(5).unwrap(),
+            "70:ib:494e5445474552/54494d455354414d50.36"
         );
     }
 }

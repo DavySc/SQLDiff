@@ -139,23 +139,42 @@ def exprFallback : Ast.Expr → String
   | .Special _ => "expr:special"
   | .Extract .. => "expr:extract"
 
+/-- (C2c) A variable read where the lowering needs a slice value, declared
+with a type the slice has no values for (`datetime2(7)`, `datetime`,
+`time`, `decimal(18,2)`, ...): `type:<type>`. -/
+def typeCode (d : Dialect) (env : TyEnv) (x : Var) : Option String :=
+  match lookup env x with
+  | some ty => if (valTypeOf d ty).isNone then some ("type:" ++ tyDetail (some ty)) else none
+  | none => none
+
 /-- A form the rules refuse whatever its sub-expressions. -/
-def ownReason (d : Dialect) (sc : Scope) : Ast.Expr → Option String
+def ownReason (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option String
   | .Var v => match d with
     | .tsql _ _ =>
-      if v.startsWith "@@" then some ("expr:var:global:" ++ sanitise (String.ofList (v.toList.drop 2))) else none
+      if v.startsWith "@@" then some ("expr:var:global:" ++ sanitise (String.ofList (v.toList.drop 2)))
+      else typeCode d env v
     | .pg _ _ => some "expr:pg-var"
   | .Name [x] => match d with
     | .pg _ _ =>
       let n := pgName x
       if n == "sqlstate" || n == "sqlerrm" then some ("expr:fn:error:" ++ n)
-      else if (resolveName d sc x).isNone then some "expr:name:unresolved" else none
+      else match resolveName d sc x with
+        | none => some "expr:name:unresolved"
+        | some (.inr v) => typeCode d env v
+        | some (.inl _) => none
     | .tsql _ _ => if (resolveName d sc x).isNone then some "expr:name:unresolved" else none
   | .Name _ => some "expr:name:qualified"
   | .Star _ => some "expr:star"
   | .InQuery .. => some "expr:in-query"
   | .Exists _ => some "expr:exists"
   | .Subquery _ => some "expr:subquery"
+  -- C2c: DATEADD and DATEDIFF with a datepart outside the slice.
+  | .CallE (.CallF [n] [part, _, _] false [] false false false) =>
+    if (d matches .tsql _ _) && n.toUpper == "DATEADD" && (datePart? part).isNone then
+      some "expr:dateadd:part"
+    else if (d matches .tsql _ _) && n.toUpper == "DATEDIFF" && datePart? part != some .day then
+      some "expr:datediff:part"
+    else none
   | .CallE (.CallF n _ distinct order withinGroup over star) =>
     if (d matches .tsql _ _) && errorFns.contains (dotted n).toUpper then
       some ("expr:fn:error:" ++ sanitise (dotted n))
@@ -167,21 +186,47 @@ def ownReason (d : Dialect) (sc : Scope) : Ast.Expr → Option String
     else none
   | _ => none
 
-partial def whyExpr (d : Dialect) (sc : Scope) (ok : Ast.Expr → Bool) (e : Ast.Expr) :
-    List String :=
-  match ownReason d sc e with
+partial def whyExpr (d : Dialect) (env : TyEnv) (sc : Scope) (ok : Ast.Expr → Bool)
+    (e : Ast.Expr) : List String :=
+  match ownReason d env sc e with
   | some r => [r]
   | none =>
-    let inner := ((subExprs e).filter fun k => !ok k).flatMap (whyExpr d sc ok)
+    -- C2c: DATEADD and DATEDIFF need their date (and number) arguments in
+    -- the slice; the datepart is a name no scope resolves.
+    let typedOk (k : Ast.Expr) : Bool := (typed d env sc k).isSome
+    let inner := match d, e with
+      | .tsql _ _, .CallE (.CallF [n] [_, a, b] false [] false false false) =>
+        if n.toUpper == "DATEADD" || n.toUpper == "DATEDIFF" then
+          ([a, b].filter fun k => !typedOk k).flatMap (whyExpr d env sc typedOk)
+        else ((subExprs e).filter fun k => !ok k).flatMap (whyExpr d env sc ok)
+      -- The converter's `make_interval` form: the date and the one number.
+      | .pg _ _, .Bin "+" dt (.CallE (.CallF [f] [y, mo, _, dd, _, _, _] false [] false false false)) =>
+        if f.toLower == "make_interval" then
+          ([dt, y, mo, dd].filter fun k => !typedOk k).flatMap (whyExpr d env sc typedOk)
+        else ((subExprs e).filter fun k => !ok k).flatMap (whyExpr d env sc ok)
+      | _, _ => ((subExprs e).filter fun k => !ok k).flatMap (whyExpr d env sc ok)
     orElse inner (exprFallback e)
 
 /-- Why `lowerExpr` refuses `e`. -/
 def whyLower (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : List String :=
-  whyExpr d sc (fun k => (lowerExpr d env sc k).isSome) e
+  whyExpr d env sc (fun k => (lowerExpr d env sc k).isSome) e
 
 /-- Why `typed` refuses `e` (a value the rules need in the slice). -/
 def whyTyped (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : List String :=
-  whyExpr d sc (fun k => (typed d env sc k).isSome) e
+  whyExpr d env sc (fun k => (typed d env sc k).isSome) e
+
+/-- (C2c) Why a value in a position of type `want` is refused: a string
+literal where a date or timestamp is read but not in the ISO form, or
+with more fractional digits than kept (`expr:date-literal`); a literal
+in a bit position other than `0`/`1` (T-SQL) or `TRUE`/`FALSE`
+(`expr:bit-literal`); else why `typed` refuses it. -/
+def whyValue (d : Dialect) (env : TyEnv) (sc : Scope) (want : Option STy) (e : Ast.Expr) :
+    List String :=
+  match want, e with
+  | some .date, .Str _ | some (.ts _), .Str _ | some .date, .Cast (.Str _) _
+  | some (.ts _), .Cast (.Str _) _ => ["expr:date-literal"]
+  | some .bit, .Num _ | some .bit, .Str _ | some .bit, .Special _ => ["expr:bit-literal"]
+  | _, _ => if (typed d env sc e).isSome then [] else whyTyped d env sc e
 
 /-- The codes of `e` when `lowerExpr` refuses it, nothing otherwise. -/
 def ifLowerFails (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : List String :=
@@ -270,7 +315,7 @@ def whyRowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr)
 
 /-- Why `countPick` refuses its target. -/
 def whyCount (d : Dialect) (env : TyEnv) (x : Var) : List String :=
-  if intVar d env x then [] else ["stmt:select:target:" ++ varDetail env x]
+  if intVarW d env x == some .i32 then [] else ["stmt:select:target:" ++ varDetail env x]
 
 /-- Why `lowerSelectT` refuses T-SQL `SELECT ...`. -/
 def whySelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
@@ -388,9 +433,10 @@ def whyFor (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : 
 /-- Why `colValue` refuses a value written to column `c`. -/
 def whyColValue (d : Dialect) (env : TyEnv) (sc : Scope) (code : String) (c : CatCol)
     (e : Ast.Expr) : List String :=
-  match typed d env sc e with
-  | none => code :: whyTyped d env sc e
-  | some (_, ty) => if colFits c ty then [] else [code]
+  let want := kindTy d c.kind
+  match typedTo d env sc (some want) e with
+  | none => code :: whyValue d env sc (some want) e
+  | some v => if (colFits d c v).isSome then [] else [code]
 
 /-- Why `dataOk` refuses a data statement here. -/
 def whyDataOk (d : Dialect) (k : Ast.RoutineKind) : List String :=
@@ -424,16 +470,20 @@ def whyStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (s : Ast.Stmt) : L
         | .tsql _ _ => if (lowerSelectT d env q).isSome then [] else whySelectT d env q
         | .pg _ _ => if (lowerSelectP d env q).isSome then [] else whySelectP d env q
     | .Assign t v =>
-      (if (target d t).isNone then ["stmt:assign:target"] else []) ++ ifLowerFails d env {} v
+      match target d t with
+      | none => "stmt:assign:target" :: ifLowerFails d env {} v
+      | some x =>
+        if (lowerValue d env {} (wantOf d env x) v).isSome then [] else whyLower d env {} v
     | .Return none => []
     | .Return (some e) =>
       ifLowerFails d env {} e ++
         match d, k with
         | .pg _ _, .Procedure => ["stmt:return:pg-proc"]
         | _, _ => []
-    | .Declare _ _ dflt => match d, dflt with
+    | .Declare _ ty dflt => match d, dflt with
       | .pg _ _, _ => ["stmt:declare:pg"]
-      | .tsql _ _, some e => ifLowerFails d env {} e
+      | .tsql _ _, some e =>
+        if (lowerValue d env {} (ty.bind (valTypeOf d)) e).isSome then [] else whyLower d env {} e
       | .tsql _ _, none => []
     | .Insert tgt cols src returning retInto conflict =>
       (match src with
@@ -495,23 +545,34 @@ def whyCall (d : Dialect) (env : TyEnv) (n : List String) (args : List Ast.Arg)
     (ret : Option Ast.Expr) : List String :=
   (if ret.isSome then ["node:call:ret"] else []) ++
     match d with
-    | .tsql dep _ =>
-      (if (lookup dep.routines (dotted n)).isNone then ["node:call:name"] else []) ++
-        args.flatMap fun a =>
-          if (lowerTsqlArg d env a).isSome then [] else
-          "node:call:args" :: match a with
-            | .Arg none e false => whyLower d env {} e
-            | _ => []
+    | .tsql dep Γ =>
+      match lookup dep.routines (dotted n) with
+      | none => ["node:call:name"]
+      | some callee =>
+        let tys := calleeTys Γ callee
+        (if args.length ≤ tys.length then [] else ["node:call:type"]) ++
+          (tys.zip args).flatMap fun (ty, a) =>
+            if (lowerTsqlArg d env ty a).isSome then []
+            else if (lowerTsqlArgShape d env a).isNone then
+              "node:call:args" :: match a with
+                | .Arg none e false => whyLower d env {} e
+                | _ => []
+            else ["node:call:type"]
     | .pg Γ _ =>
-      match lookup Γ.routines (dotted (n.map pgName)) with
+      let callee := dotted (n.map pgName)
+      match lookup Γ.routines callee with
       | none => ["node:call:name"]
       | some modes =>
+        let tys := calleeTys Γ callee
         (if args.length ≤ modes.length then [] else ["node:call:args"]) ++
-          (modes.zip args).flatMap fun (m, a) =>
-            if (lowerPgArg d env (m, a)).isSome then [] else
-            "node:call:args" :: match m, a with
-              | .In, .Arg none e false => whyLower d env {} e
-              | _, _ => []
+          (if args.length ≤ tys.length then [] else ["node:call:type"]) ++
+          ((modes.zip tys).zip args).flatMap fun ((m, ty), a) =>
+            if (lowerPgArg d env ty (m, a)).isSome then []
+            else if (lowerPgArgShape d env (m, a)).isNone then
+              "node:call:args" :: match m, a with
+                | .In, .Arg none e false => whyLower d env {} e
+                | _, _ => []
+            else ["node:call:type"]
 
 /-- Why `txnBracket` refuses a statement list: a `BEGIN TRAN` inside an
 open one (`nested`), a `COMMIT` with none open, one left open at the end,
@@ -621,10 +682,18 @@ def queryTable (d : Dialect) (q : Ast.Select) : Option CatTable := do
   let (_, _, _, tgt, _) ← selParts q
   tableOf d tgt
 
-/-- The value of a store that is not in the slice, by its form (a function,
-a cast, ...): why the store cannot be shown to keep it. -/
-def whyStoreValue (d : Dialect) (env : TyEnv) (v : Ast.Expr) : List String :=
-  if (v matches .Null) || (typed d env {} v).isSome then [] else whyTyped d env {} v
+/-- The value of a store into a target declared `ty` that is not in the
+slice, by its form (a function, a cast, a literal the target does not
+read, ...): why the store cannot be shown to keep it. -/
+def whyStoreValue (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : List String :=
+  let want := ty.bind (valTypeOf d)
+  if v matches .Null then [] else
+  match typedTo d env {} want v with
+  | some tv =>
+    -- In the slice but not fitting the target: a literal of the wrong
+    -- form is named (`expr:bit-literal`), a narrowing only by its store.
+    if (want.map fun w => fitsSTy w tv).getD true then [] else whyValue d env {} want v
+  | none => whyValue d env {} want v
 
 /-- Why `storesStmt` refuses a statement: the target of the store and its
 declared type, and the value's form when it is outside the slice. A
@@ -648,10 +717,12 @@ def whyStoresStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) (known 
         else some ("store:pick:" ++ varDetail wenv x)
     | _, _ => []
   | .Assign t v => match target d t with
-    | some x => if known x then ("store:assign:" ++ varDetail wenv x) :: whyStoreValue d env v else []
+    | some x =>
+      if known x then ("store:assign:" ++ varDetail wenv x) :: whyStoreValue d env (lookup wenv x) v
+      else []
     | none => []
-  | .Declare _ ty (some v) => ("store:declare:" ++ tyDetail ty) :: whyStoreValue d env v
-  | .Return (some v) => ("store:return:" ++ tyDetail ret) :: whyStoreValue d env v
+  | .Declare _ ty (some v) => ("store:declare:" ++ tyDetail ty) :: whyStoreValue d env ty v
+  | .Return (some v) => ("store:return:" ++ tyDetail ret) :: whyStoreValue d env ret v
   | _ => []
 
 mutual
@@ -709,7 +780,7 @@ slice value fitting the declared type (`routine:param:default`), or a
 type no value of the slice fits (`routine:param:<type>`). -/
 def whyParam (d : Dialect) (env : TyEnv) : Ast.Param → List String
   | .Param _ ty _ dflt =>
-    if !dfltOk d env ty dflt && !intType d ty && (strType d ty).isNone then
+    if !dfltOk d env ty dflt && (valTypeOf d ty).isNone then
       ["routine:param:" ++ tyDetail (some ty)]
     else ["routine:param:default"]
 

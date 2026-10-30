@@ -1,0 +1,91 @@
+Changed database context to 'probe_c2c'.
+V1 smallint + smallint: type=smallint
+V1 -smallint: type=smallint
+V1 smallint 32767 + 32767: error 8115
+V1 -(-32768 smallint): error 8115
+V1 smallint min / -1: no error, value=32768
+V1 smallint / smallint: type=smallint; smallint % smallint: type=smallint; smallint * smallint: type=smallint
+V1 smallint + int: type=int
+V1 smallint + bigint: type=bigint
+V1 int + int: type=int
+V1 int + bigint: type=bigint
+V1 bigint / int: type=bigint value=4294967298
+V1 bigint % int: type=bigint value=0
+V1 -bigint / -1: value=9223372036854775807
+V1 int + 1 overflow: error 8115
+V1 bigint + 1 overflow: error 8115
+V1 bigint * 2 overflow: error 8115
+V1 bigint min / -1: error 8115
+V1 bigint min % -1: error 8115
+V1 bigint / 0: error 8134
+V1 bigint / 7 truncates: value=-14285714285
+V1 smallint -32768 / smallint -1: error 8115
+V1 smallint -32768 % smallint -1: error 8115
+V2 literal 2147483647: type=int
+V2 literal 2147483648: type=numeric(10,0)
+V2 literal 32767: type=int
+V2 literal -2147483648: type=int; -2147483648 + 0: type=int; -9223372036854775808: type=numeric
+V2 (-2147483648 + -1) - -1: error 8115
+V2 widening stores keep the value: int=32767 bigint=32767
+V2 int 40000 into smallint: error 220
+V2 bigint 3000000000 into int: error 8115
+V2 literal 40000 into smallint: error 220
+V2 COUNT(*) into bigint: value=3 count type=int
+V3 bit stores: 2=1 -5=1 0=0 TRUE=1 FALSE=0 1=1
+V3 bit + 0: type=int
+V3 bit = 2 with bit 1: not true
+V3 three-valued: [1: =1 not=0 not<>1 <>0 notnull] [0: not=1 =0 <>1 not<>0 notnull] [N: not=1 not=0 not<>1 not<>0 isnull]
+V3 NULL = 1 is: unknown
+V3 bit 1 stored into int: no error, value=1
+V4 DATEFORMAT ydm: date=2024-01-02 datetime2=2024-01-02T03:04:05 (datetime=2024-02-01T00:00:00)
+V4 DATEFORMAT dmy: date=2024-01-02 datetime2=2024-01-02T03:04:05.500000
+V4 LANGUAGE British: date=2024-01-02 datetime2=2024-01-02T03:04:05.123456
+V4 seven digits into datetime2(6): 2024-01-01T00:00:00.123457
+V4 .1234565 into datetime2(6): 2024-01-01T00:00:00.123457
+V4 .9999995 into datetime2(6): 2024-01-01T00:00:01
+V4 four digits into datetime2(3): 2024-01-01T00:00:00.124
+V4 datetime2(6) .123456 into datetime2(3): 2024-01-01T00:00:00.123
+V4 datetime2(6) .1235 into datetime2(3): 2024-01-01T00:00:00.124
+V4 datetime2(3) into datetime2(6): 2024-01-01T00:00:00.123000
+V4 2024-02-30: error 241
+V4 range ends: 0001-01-01 9999-12-31T23:59:59.999999
+V4 literal types: date datetime2
+V5 date into datetime2(6): 2024-03-15T00:00:00
+V5 CAST(datetime2 AS date): 2024-03-15
+V5 datetime2 stored into date: 2024-03-15
+V5 date = datetime2 (same day, 23:59): not true; date < datetime2: true
+V5 date = datetime2 midnight: true
+V5 date comparisons: < true <= true <> false
+V5 NULL date comparison: unknown
+V6 2024-01-31 + 1 month: 2024-02-29
+V6 2024-01-31 + 13 months: 2025-02-28
+V6 2024-03-31 - 1 month: 2024-02-29
+V6 2024-02-29 + 1 year: 2025-02-28
+V6 2024-02-29 - 1 year: 2023-02-28
+V6 2024-02-29 + 4 years: 2028-02-29
+V6 2024-01-31 + 1 day: 2024-02-01
+V6 2024-03-01 - 1 day: 2024-02-29
+V6 2023-12-31 + 60 days: 2024-02-29
+V6 datetime2 + 1 month keeps the time: 2024-02-29T10:20:30.123456
+V6 datetime2 + 2 days keeps the time: 2024-02-02T10:20:30.123456
+V6 datetime2 + 1 year: 2025-02-28T01:02:03
+V6 nested: DATEADD(day, 1, DATEADD(month, 1, 2024-01-31)) = 2024-03-01; DATEDIFF(day, 2024-01-01, DATEADD(month, 1, 2024-01-31)) = 59
+V6 DATEADD types: date datetime2(6)
+V6 DATEADD NULL number: NULL; NULL date: NULL
+V6 9999-12-31 + 1 day: error 517
+V6 0001-06-01 - 1 year: error 517
+V6 datetime2 9999-12-31 + 1 month: error 517
+V6 + 2147483647 days: error 517
+V7 23:59 to next 00:01: 1; reversed: -1; type=int
+V7 00:00 to 23:59 same day: 0
+V7 dates 2023-12-31 to 2024-03-01: 61
+V7 date to datetime2: 1
+V7 0001-01-01 to 9999-12-31: 3652058
+V7 NULL: NULL
+V8 read back: n=3000000000 s=-7 b=1 t=2024-01-31T10:20:30.123456
+V8 defaults: n=NULL s=0 b=0 t=2000-01-01T00:00:00
+V8 after UPDATE: key 2024-02-29 b=0 t=2024-02-01T10:20:30.123456
+V8 duplicate date key: error 2627
+V8 rows with b = 0: 2
+V8 rows with d > 2024-02-01: 1
+Changed database context to 'master'.

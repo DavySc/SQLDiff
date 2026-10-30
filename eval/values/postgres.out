@@ -1,0 +1,90 @@
+NOTICE:  database "probe_c2c" does not exist, skipping
+NOTICE:  V1 smallint + integer: type=integer
+NOTICE:  V1 smallint + bigint: type=bigint
+NOTICE:  V1 integer + integer: type=integer
+NOTICE:  V1 integer + bigint: type=bigint
+NOTICE:  V1 bigint / integer: type=bigint value=4294967298
+NOTICE:  V1 bigint % integer: type=bigint value=0
+NOTICE:  V1 -bigint / -1: value=9223372036854775807
+NOTICE:  V1 smallint + smallint: type=smallint
+NOTICE:  V1 -smallint: type=smallint
+NOTICE:  V1 smallint 32767 + 32767: error 22003
+NOTICE:  V1 -(-32768 smallint): error 22003
+NOTICE:  V1 smallint min / -1: no error, value=32768
+NOTICE:  V1 smallint / smallint: type=smallint; smallint % smallint: type=smallint; smallint * smallint: type=smallint
+NOTICE:  V1 int + 1 overflow: error 22003
+NOTICE:  V1 bigint + 1 overflow: error 22003
+NOTICE:  V1 bigint * 2 overflow: error 22003
+NOTICE:  V1 bigint min / -1: error 22003
+NOTICE:  V1 bigint min % -1: no error, value=0
+NOTICE:  V1 bigint / 0: error 22012
+NOTICE:  V1 bigint / 7 truncates: value=-14285714285
+NOTICE:  V1 smallint -32768 / smallint -1: error 22003
+NOTICE:  V1 smallint -32768 % smallint -1: no error, value=0
+NOTICE:  V2 literal 2147483647: type=integer
+NOTICE:  V2 literal 2147483648: type=bigint
+NOTICE:  V2 literal 32767: type=integer
+NOTICE:  V2 literal -2147483648: type=integer; -2147483648 + 0: type=integer; -9223372036854775808: type=bigint
+NOTICE:  V2 (-2147483648 + -1) - -1: error 22003
+NOTICE:  V2 widening stores keep the value: int=32767 bigint=32767
+NOTICE:  V2 int 40000 into smallint: error 22003
+NOTICE:  V2 bigint 3000000000 into int: error 22003
+NOTICE:  V2 literal 40000 into smallint: error 22003
+NOTICE:  V2 COUNT(*) into bigint: value=3 count type=bigint
+NOTICE:  V3 three-valued: [1: =1 not=0 not<>1 <>0 notnull] [0: not=1 =0 <>1 not<>0 notnull] [0: not=1 not=0 not<>1 not<>0 isnull]
+NOTICE:  V3 NULL = TRUE is unknown: yes
+NOTICE:  V3 NOT NULL is unknown: yes
+NOTICE:  V3 boolean TRUE stored into integer: error 22P02
+NOTICE:  V4 DateStyle SQL, DMY: date=2024-01-02 timestamp=2024-01-02T03:04:05.000000
+NOTICE:  V4 DateStyle Postgres, YMD: date=2024-01-02 timestamp=2024-01-02T03:04:05.500000
+NOTICE:  V4 DateStyle German, DMY: date=2024-01-02 timestamp=2024-01-02T03:04:05.123456
+NOTICE:  V4 seven digits into timestamp(6): 2024-01-01T00:00:00.123457
+NOTICE:  V4 .1234565 into timestamp(6): 2024-01-01T00:00:00.123456
+NOTICE:  V4 .9999995 into timestamp(6): 2024-01-01T00:00:01.000000
+NOTICE:  V4 four digits into timestamp(3): 2024-01-01T00:00:00.124000
+NOTICE:  V4 timestamp(6) .123456 into timestamp(3): 2024-01-01T00:00:00.123000
+NOTICE:  V4 timestamp(6) .1235 into timestamp(3): 2024-01-01T00:00:00.124000
+NOTICE:  V4 timestamp(3) into timestamp(6): 2024-01-01T00:00:00.123000
+NOTICE:  V4 2024-02-30: error 22008
+NOTICE:  V4 range ends: 0001-01-01 9999-12-31T23:59:59.999999
+NOTICE:  V4 literal types: date timestamp without time zone
+NOTICE:  V5 date into timestamp(6): 2024-03-15T00:00:00.000000
+NOTICE:  V5 CAST(timestamp AS date): 2024-03-15
+NOTICE:  V5 timestamp stored into date: 2024-03-15
+NOTICE:  V5 date = timestamp (same day, 23:59): not true; date < timestamp: true
+NOTICE:  V5 date = timestamp midnight: true
+NOTICE:  V5 date comparisons: < true <= true <> false
+NOTICE:  V5 NULL date comparison: unknown
+NOTICE:  V6 2024-01-31 + 1 month: 2024-02-29
+NOTICE:  V6 2024-01-31 + 13 months: 2025-02-28
+NOTICE:  V6 2024-03-31 - 1 month: 2024-02-29
+NOTICE:  V6 2024-02-29 + 1 year: 2025-02-28
+NOTICE:  V6 2024-02-29 - 1 year: 2023-02-28
+NOTICE:  V6 2024-02-29 + 4 years: 2028-02-29
+NOTICE:  V6 2024-01-31 + 1 day: 2024-02-01
+NOTICE:  V6 2024-03-01 - 1 day: 2024-02-29
+NOTICE:  V6 2023-12-31 + 60 days: 2024-02-29
+NOTICE:  V6 timestamp + 1 month keeps the time: 2024-02-29T10:20:30.123456
+NOTICE:  V6 timestamp + 2 days keeps the time: 2024-02-02T10:20:30.123456
+NOTICE:  V6 timestamp + 1 year: 2025-02-28T01:02:03.000000
+NOTICE:  V6 result types: date date timestamp without time zone
+NOTICE:  V6 date + make_interval without a cast: type=timestamp without time zone
+NOTICE:  V6 nested: ((d + make_interval(months => 1))::date + 1) = 2024-03-01; ((d + make_interval(months => 1))::date - date 2024-01-01) = 59
+NOTICE:  V6 (date + make_interval) + 1 without a cast: error 42883
+NOTICE:  V6 NULL number: NULL; NULL date: NULL
+NOTICE:  V6 9999-12-31 + 1 day: no error, 10000-01-01
+NOTICE:  V6 0001-06-01 - 1 year: no error, 0001-06-01 BC
+NOTICE:  V6 timestamp 9999-12-31 + 1 month: no error, 10000-01-31T00:00:00
+NOTICE:  V6 + 2147483647 days: error 22008
+NOTICE:  V7 23:59 to next 00:01: 1; reversed: -1; type=integer
+NOTICE:  V7 00:00 to 23:59 same day: 0
+NOTICE:  V7 dates 2023-12-31 to 2024-03-01: 61
+NOTICE:  V7 date to timestamp: 1
+NOTICE:  V7 0001-01-01 to 9999-12-31: 3652058
+NOTICE:  V7 NULL: NULL
+NOTICE:  V8 read back: n=3000000000 s=-7 b=1 t=2024-01-31T10:20:30.123456
+NOTICE:  V8 defaults: n=NULL s=0 b=0 t=2000-01-01T00:00:00.000000
+NOTICE:  V8 after UPDATE: key 2024-02-29 b=0 t=2024-02-01T10:20:30.123456
+NOTICE:  V8 duplicate date key: error 23505
+NOTICE:  V8 rows with b = FALSE: 2
+NOTICE:  V8 rows with d > 2024-02-01: 1
