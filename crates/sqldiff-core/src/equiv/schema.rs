@@ -43,6 +43,12 @@ pub enum Fam {
     /// to agree; SQL Server cannot compare or order one, PostGIS compares
     /// bounding boxes.
     Geography,
+    /// T-SQL text and ntext: strings SQL Server cannot compare or sort
+    /// (only IS NULL and LIKE work on them, checked on SQL Server 2022).
+    Text,
+    /// Values one side cannot compare or sort at all: T-SQL image and xml,
+    /// PostgreSQL xml. Only a value kept as it is is known to agree.
+    NoCompare,
     Other,
 }
 
@@ -64,7 +70,16 @@ impl Ty {
     }
 
     pub fn is_string(&self) -> bool {
-        matches!(self.fam, Fam::Char | Fam::VarChar)
+        matches!(self.fam, Fam::Char | Fam::VarChar | Fam::Text)
+    }
+
+    /// Whether comparing two values of this type (=, IN, GROUP BY, DISTINCT,
+    /// set operations) is the dialect's own: SQL Server cannot compare
+    /// geography, text, ntext, image or xml (Msg 305, 306, 402, 421, 5335,
+    /// 8117), PostGIS compares geography boxes, PostgreSQL has no xml
+    /// equality.
+    pub fn compares_per_dialect(&self) -> bool {
+        matches!(self.fam, Fam::Geography | Fam::Text | Fam::NoCompare)
     }
 
     /// Whether each dialect orders values of this type its own way: strings
@@ -73,7 +88,7 @@ impl Ty {
     pub fn orders_per_dialect(&self) -> bool {
         matches!(
             self.fam,
-            Fam::Char | Fam::VarChar | Fam::Uuid | Fam::Geography
+            Fam::Char | Fam::VarChar | Fam::Uuid | Fam::Geography | Fam::Text | Fam::NoCompare
         )
     }
 
@@ -180,6 +195,9 @@ impl Ty {
             "VARCHAR" | "NVARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" | "VARCHAR2" => {
                 fam_len(Fam::VarChar, tsql_default)
             }
+            "TEXT" | "NTEXT" if d == Dialect::Tsql => Ty::of(Fam::Text),
+            "IMAGE" | "XML" if d == Dialect::Tsql => Ty::of(Fam::NoCompare),
+            "XML" if d == Dialect::Postgres => Ty::of(Fam::NoCompare),
             "TEXT" => Ty::of(Fam::VarChar),
             // T-SQL sysname is nvarchar(128) NOT NULL.
             "SYSNAME" if d == Dialect::Tsql => Ty {
