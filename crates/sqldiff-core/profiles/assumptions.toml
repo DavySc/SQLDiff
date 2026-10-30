@@ -955,7 +955,7 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
 id = "ASM-ROWCOUNT-FOUND"
-statement = "No INSTEAD OF trigger, and no PostgreSQL BEFORE ROW trigger that returns NULL, acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through."
+statement = "No INSTEAD OF trigger, no PostgreSQL BEFORE ROW trigger that returns NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through."
 discharge = "catalog"
 fact = "The triggers on the written tables and views in the catalog."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]

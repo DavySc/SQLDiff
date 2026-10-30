@@ -117,32 +117,65 @@ fn a_postgresql_commit_in_between_keeps_found() {
     ));
 }
 
+/// The IF writes and the assigned variable is stored, so what the SELECT
+/// finds and which branch runs are both observable.
 #[test]
 fn rowcount_after_select_assign_is_found() {
     // The converter's block for a SELECT that assigns variables.
-    let b = "  DECLARE
+    let block = |q: &str| {
+        format!(
+            "  DECLARE
   sqldiff_r record;
   BEGIN
-  FOR sqldiff_r IN SELECT v AS sqldiff_c1 FROM t WHERE id > p_id ORDER BY id NULLS FIRST LIMIT 1 LOOP
+  FOR sqldiff_r IN SELECT v AS sqldiff_c1 FROM t WHERE {q} LOOP
   p_v := sqldiff_r.sqldiff_c1;
   END LOOP;
-  END;";
+  END;"
+        )
+    };
+    let then_a = "UPDATE dbo.t SET v = @v WHERE id = @id;";
+    let then_b = "UPDATE t SET v = p_v WHERE id = p_id; END IF;";
+    let b1 = block("id > p_id ORDER BY id NULLS FIRST LIMIT 1");
     let a = "    SELECT TOP 1 @v = v FROM dbo.t WHERE id > @id ORDER BY id;";
     assert!(equal(
-        &format!("{a}\n    IF @@ROWCOUNT = 0 RETURN;"),
-        &format!("{b}\n  IF NOT FOUND THEN RETURN; END IF;")
+        &format!("{a}\n    IF @@ROWCOUNT = 0 {then_a}"),
+        &format!("{b1}\n  IF NOT FOUND THEN {then_b}")
     ));
     // At most one row: a count of 1 is a row found.
     assert!(equal(
-        &format!("{a}\n    IF @@ROWCOUNT = 1 RETURN;"),
-        &format!("{b}\n  IF FOUND THEN RETURN; END IF;")
+        &format!("{a}\n    IF @@ROWCOUNT = 1 {then_a}"),
+        &format!("{b1}\n  IF FOUND THEN {then_b}")
+    ));
+    assert!(equal(
+        &format!("    SELECT TOP (1) @v = v FROM dbo.t WHERE id > @id ORDER BY id;\n    IF @@ROWCOUNT = 1 {then_a}"),
+        &format!("{b1}\n  IF FOUND THEN {then_b}")
+    ));
+    // Another query before the IF is not equal.
+    assert!(!equal(
+        &format!("    SELECT TOP 1 @v = v FROM dbo.t WHERE id < @id ORDER BY id;\n    IF @@ROWCOUNT = 0 {then_a}"),
+        &format!("{b1}\n  IF NOT FOUND THEN {then_b}")
     ));
     // Without TOP 1 a count of 1 is not "a row found".
     let many = "    SELECT @v = v FROM dbo.t WHERE id > @id;";
     assert!(!equal(
-        &format!("{many}\n    IF @@ROWCOUNT = 1 RETURN;"),
-        &format!("{b}\n  IF FOUND THEN RETURN; END IF;")
+        &format!("{many}\n    IF @@ROWCOUNT = 1 {then_a}"),
+        &format!("{}\n  IF FOUND THEN {then_b}", block("id > p_id"))
     ));
+    // WITH TIES and PERCENT may return more than one row.
+    let ties = block("id > p_id ORDER BY v NULLS FIRST FETCH FIRST 1 ROWS WITH TIES");
+    for a in [
+        "    SELECT TOP 1 WITH TIES @v = v FROM dbo.t WHERE id > @id ORDER BY v;",
+        "    SELECT TOP (1) WITH TIES @v = v FROM dbo.t WHERE id > @id ORDER BY v;",
+        "    SELECT TOP 1 PERCENT @v = v FROM dbo.t WHERE id > @id ORDER BY v;",
+    ] {
+        assert!(
+            !equal(
+                &format!("{a}\n    IF @@ROWCOUNT = 1 {then_a}"),
+                &format!("{ties}\n  IF FOUND THEN {then_b}")
+            ),
+            "{a}"
+        );
+    }
 }
 
 #[test]

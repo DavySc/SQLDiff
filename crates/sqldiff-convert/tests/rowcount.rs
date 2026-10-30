@@ -97,6 +97,19 @@ fn other_rowcount_reads_are_refused() {
         "more than one row",
     );
     refused(
+        "    SELECT TOP 1 WITH TIES @v = v FROM dbo.t WHERE id > @id ORDER BY v;\n    IF @@ROWCOUNT = 1 RETURN;",
+        "more than one row",
+    );
+    refused(
+        "    SELECT TOP 1 PERCENT @v = v FROM dbo.t WHERE id > @id ORDER BY v;\n    IF @@ROWCOUNT = 1 RETURN;",
+        "more than one row",
+    );
+    // A variable in WHERE is a comparison, not an assignment.
+    refused(
+        "    SELECT v FROM dbo.t WHERE @id = id;\n    IF @@ROWCOUNT = 0 RETURN;",
+        "other than INSERT, UPDATE, DELETE",
+    );
+    refused(
         "    UPDATE dbo.t SET v = @v WHERE id = @id;\n    IF @@ROWCOUNT = 2 RETURN;",
         "GET DIAGNOSTICS",
     );

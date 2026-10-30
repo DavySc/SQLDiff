@@ -31,7 +31,7 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 pub mod asm {
     pub const ROWCOUNT_FOUND: (&str, &str) = (
         "ASM-ROWCOUNT-FOUND",
-        "No INSTEAD OF trigger, and no PostgreSQL BEFORE ROW trigger that returns NULL, acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through",
+        "No INSTEAD OF trigger, no PostgreSQL BEFORE ROW trigger that returns NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through",
     );
     pub const LEN_BMP: (&str, &str) = (
         "ASM-TSQL-LEN-BMP",

@@ -1619,7 +1619,7 @@ impl<'a> Cx<'a> {
             if let Some(found) = self.rowcount_if(n) {
                 match found {
                     Ok(found) => {
-                        self.note(Status::Assumptions, "ASM-ROWCOUNT-FOUND", "@@ROWCOUNT right after an INSERT, UPDATE, DELETE or a SELECT that assigns variables becomes FOUND: both tell whether the statement touched or returned a row (an AFTER trigger changes neither; checked on SQL Server 2022 and PostgreSQL 18). Equal when no INSTEAD OF trigger and no BEFORE ROW trigger returning NULL acts on the written table: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL counts only the rows its triggers let through.");
+                        self.note(Status::Assumptions, "ASM-ROWCOUNT-FOUND", "@@ROWCOUNT right after an INSERT, UPDATE, DELETE or a SELECT that assigns variables becomes FOUND: both tell whether the statement touched or returned a row (an AFTER trigger changes neither; checked on SQL Server 2022 and PostgreSQL 18). Equal when no INSTEAD OF trigger, no BEFORE ROW trigger returning NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on the written table: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL counts only the rows its triggers let through.");
                         let cond = if found { "FOUND" } else { "NOT FOUND" };
                         self.header_unit(
                             out,
@@ -1725,12 +1725,14 @@ impl<'a> Cx<'a> {
             "INSERT" | "UPDATE" | "DELETE" => !has("OUTPUT") && !has("EXEC") && !has("EXECUTE"),
             // A SELECT that assigns variables from a table: FOUND is set when
             // it returns a row, as @@ROWCOUNT counts the rows it returns.
-            "SELECT" => {
-                has("FROM")
-                    && top
+            "SELECT" => top
+                .iter()
+                .position(|&i| pts[i].is("FROM"))
+                .is_some_and(|f| {
+                    top[..f]
                         .windows(2)
                         .any(|w| pts[w[0]].k == VARIABLE && pts[w[1]].k == OP && pts[w[1]].s == "=")
-            }
+                }),
             _ => false,
         };
         if !ok {
@@ -1740,12 +1742,16 @@ impl<'a> Cx<'a> {
             Some(f) => f,
             // `= 1` is FOUND only when the statement returns at most one row.
             None => {
-                let head: Vec<String> = sig(&pts).iter().take(5).map(|&i| pts[i].up()).collect();
+                // Not WITH TIES or PERCENT, which may return more rows.
+                let head: Vec<String> = sig(&pts).iter().take(6).map(|&i| pts[i].up()).collect();
                 let head: Vec<&str> = head.iter().map(String::as_str).collect();
-                let top1 = matches!(
-                    head.as_slice(),
-                    ["SELECT", "TOP", "1", ..] | ["SELECT", "TOP", "(", "1", ")"]
-                );
+                let top1 = match head.as_slice() {
+                    ["SELECT", "TOP", "(", "1", ")", rest @ ..]
+                    | ["SELECT", "TOP", "1", rest @ ..] => {
+                        !matches!(rest.first(), Some(&"WITH" | &"PERCENT"))
+                    }
+                    _ => false,
+                };
                 if !top1 {
                     return Some(Err("IF @@ROWCOUNT = 1 after a statement that may touch more than one row: FOUND only tells whether there was a row (no rule yet)".into()));
                 }

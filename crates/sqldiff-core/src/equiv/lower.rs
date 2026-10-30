@@ -1865,12 +1865,15 @@ fn rows_test(cond: &SyntaxNode, stmt: &SyntaxNode, d: Dialect) -> Option<(bool, 
         (Dialect::Tsql, ["@@ROWCOUNT", "<>" | "!=" | ">", "0"] | ["@@ROWCOUNT", ">=", "1"]) => true,
         // At most one row: a count of 1 is a row found.
         (Dialect::Tsql, ["@@ROWCOUNT", "=", "1"]) => {
-            let p: Vec<String> = tokens(&prev).iter().take(5).map(|t| t.up.clone()).collect();
+            // Not WITH TIES or PERCENT, which may return more rows.
+            let p: Vec<String> = tokens(&prev).iter().take(6).map(|t| t.up.clone()).collect();
             let p: Vec<&str> = p.iter().map(String::as_str).collect();
-            if !matches!(
-                p.as_slice(),
-                ["SELECT", "TOP", "1", ..] | ["SELECT", "TOP", "(", "1", ")"]
-            ) {
+            let rest = match p.as_slice() {
+                ["SELECT", "TOP", "(", "1", ")", rest @ ..] => rest,
+                ["SELECT", "TOP", "1", rest @ ..] => rest,
+                _ => return None,
+            };
+            if matches!(rest.first(), Some(&"WITH" | &"PERCENT")) {
                 return None;
             }
             true
@@ -1926,11 +1929,15 @@ fn rows_stmt(n: &SyntaxNode, d: Dialect) -> Option<&'static str> {
         _ => return None,
     };
     let ok = match (d, kind) {
+        // An assignment in the select list, before FROM (`WHERE @id = id`
+        // is a comparison).
         (Dialect::Tsql, "select") => {
-            has("FROM")
-                && top
+            let from = top.iter().position(|x| x.kind == K::Word && x.up == "FROM");
+            from.is_some_and(|f| {
+                top[..f]
                     .windows(2)
                     .any(|w| w[0].kind == K::Var && w[1].kind == K::Op && w[1].text == "=")
+            })
         }
         (Dialect::Tsql, _) => !has("OUTPUT") && !has("EXEC") && !has("EXECUTE"),
         (Dialect::Postgres, "select") => has("INTO") && has("FROM"),
