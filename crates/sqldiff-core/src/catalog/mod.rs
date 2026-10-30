@@ -307,11 +307,80 @@ pub struct Catalog {
     /// Schemas created explicitly.
     #[serde(default)]
     pub schemas: Vec<String>,
+    /// DML triggers, each definition as read (two definitions of one name
+    /// are both kept, so a lookup can tell the name is not unique).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<Trigger>,
+}
+
+/// A DML trigger: T-SQL `CREATE TRIGGER name ON table {FOR|AFTER|INSTEAD
+/// OF} events`, PostgreSQL `CREATE TRIGGER name … events ON table …
+/// EXECUTE FUNCTION f()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trigger {
+    /// The schema part of the trigger's name as written, if any. A T-SQL
+    /// trigger lives in its table's schema (SQL Server refuses another,
+    /// Msg 2103); a PostgreSQL trigger has no schema of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    pub name: String,
+    /// The table's name parts, as stored.
+    pub table: Vec<String>,
+    /// `INSERT`, `UPDATE`, `DELETE` (and PostgreSQL `TRUNCATE`), in the
+    /// order written.
+    pub events: Vec<String>,
+    /// `INSTEAD OF` (`BEFORE` and `AFTER` are not told apart).
+    #[serde(default)]
+    pub instead: bool,
+    /// PostgreSQL: the function the trigger executes, name parts as stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<Vec<String>>,
+}
+
+impl Trigger {
+    /// The schema the trigger is found in by name: its own, or its table's.
+    pub fn home(&self) -> Option<&str> {
+        self.schema.as_deref().or(match self.table.as_slice() {
+            [.., s, _] => Some(s.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl Catalog {
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty() && self.routines.is_empty() && self.schemas.is_empty()
+        self.tables.is_empty()
+            && self.routines.is_empty()
+            && self.schemas.is_empty()
+            && self.triggers.is_empty()
+    }
+
+    /// Adds a trigger definition, unless the same one is there already.
+    pub fn put_trigger(&mut self, t: Trigger) {
+        if !self.triggers.contains(&t) {
+            self.triggers.push(t);
+        }
+    }
+
+    /// The definitions of the trigger that `schema.name` names in
+    /// `dialect`: T-SQL finds a trigger in its table's schema, and an
+    /// unqualified name in the default schema (dbo). Every definition read
+    /// for that name, so the caller can tell whether they agree.
+    pub fn triggers_named(
+        &self,
+        dialect: Dialect,
+        schema: Option<&str>,
+        name: &str,
+    ) -> Vec<&Trigger> {
+        let def = default_schema(dialect).unwrap_or_default();
+        let want = key(dialect, schema.unwrap_or(def));
+        self.triggers
+            .iter()
+            .filter(|t| {
+                key(dialect, &t.name) == key(dialect, name)
+                    && key(dialect, t.home().unwrap_or(def)) == want
+            })
+            .collect()
     }
 
     /// Adds or replaces a table (same schema and name).
@@ -365,6 +434,9 @@ impl Catalog {
         }
         for r in &other.routines {
             self.put_routine(dialect, r.clone());
+        }
+        for t in &other.triggers {
+            self.put_trigger(t.clone());
         }
         for s in &other.schemas {
             if !self
