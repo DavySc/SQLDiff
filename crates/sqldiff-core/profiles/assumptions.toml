@@ -235,9 +235,9 @@ sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[assumption]]
 id = "ASM-CATALOG-EXISTS"
-statement = "A check whether a dbo table or procedure exists sees the same objects on both sides: the SQL Server user table (type U) or T-SQL procedure (type P, not CLR) exists exactly when its converted table (relkind r or p) or procedure (prokind p) exists in PostgreSQL's default schema when the check runs, under a name equal up to letter case."
+statement = "A check whether a dbo table or procedure exists sees the same objects on both sides: the SQL Server user table (type U) or T-SQL procedure (type P) exists exactly when its converted table (relkind r or p) or procedure (prokind p) exists in PostgreSQL's default schema when the check runs, under a name equal up to letter case; the session running the check can see the object in SQL Server's catalog (holds a permission on it), the SQL Server database collation is case-insensitive, and no CLR procedure (type PC) of that name exists."
 discharge = "deployment"
-fact = "The PostgreSQL default schema holds the converted counterparts of the SQL Server tables and procedures such checks name, and no others of those names."
+fact = "The PostgreSQL default schema holds the converted counterparts of the SQL Server tables and procedures such checks name, and no others of those names; the sessions running the checks hold a permission on those objects in SQL Server; the SQL Server database collation is case-insensitive; dbo has no CLR procedure of those names."
 sites = ["sqldiff-core/src/equiv/objcheck.rs"]
 
 [[assumption]]

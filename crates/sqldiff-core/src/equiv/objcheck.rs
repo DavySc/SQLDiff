@@ -57,7 +57,7 @@ pub struct Check {
 
 pub const ASSUMPTION: (&str, &str) = (
     "ASM-CATALOG-EXISTS",
-    "A check whether a table or procedure exists sees the same objects on both sides: a SQL Server user table (sys.objects type U) or T-SQL procedure (type P, not a CLR procedure) in dbo exists exactly when its converted table (pg_class relkind r or p) or procedure (pg_proc prokind p) exists in PostgreSQL's default schema when the check runs (current_schema()), under a name equal up to letter case",
+    "A check whether a table or procedure exists sees the same objects on both sides: a SQL Server user table (sys.objects type U) or T-SQL procedure (type P) in dbo exists exactly when its converted table (pg_class relkind r or p) or procedure (pg_proc prokind p) exists in PostgreSQL's default schema when the check runs (current_schema()), under a name equal up to letter case. This needs: the session running the check can see the object in SQL Server's catalog (holds a permission on it; PostgreSQL's catalogs show every object to everyone), the SQL Server database collation is case-insensitive (the T-SQL name test follows it, lower() does not), and no CLR procedure (type PC) of that name exists in dbo (it has no PostgreSQL counterpart)",
 );
 
 /// The check a T-SQL `EXISTS` subquery makes, if it is one of the shapes
