@@ -878,6 +878,62 @@ fn ansi_on(n: &SyntaxNode, d: Dialect) -> bool {
     )
 }
 
+/// `CREATE … INDEX` or `ALTER TABLE … ADD CONSTRAINT n {PRIMARY KEY |
+/// UNIQUE | FOREIGN KEY | CHECK}`.
+fn routine_ddl(c: &SyntaxNode) -> bool {
+    let words = cst::first_words(c, 6);
+    let w = |i: usize| words.get(i).map(String::as_str).unwrap_or("");
+    match w(0) {
+        "CREATE" => (1..5).any(|i| w(i) == "INDEX"),
+        "ALTER" => w(1) == "TABLE" && super::ddl::adds_constraint(&tokens(c)),
+        _ => false,
+    }
+}
+
+/// T-SQL `ALTER TABLE t CHECK CONSTRAINT n` or PostgreSQL `ALTER TABLE
+/// [ONLY] t VALIDATE CONSTRAINT n` whose previous statement adds n to t,
+/// checking the rows already there (`ddl::Ddl::Constraint`).
+fn recheck_after_add(c: &SyntaxNode, d: Dialect) -> bool {
+    use super::ddl::{self, Ddl};
+    let toks: Vec<Tok> = tokens(c)
+        .into_iter()
+        .filter(|t| t.kind != K::Semi)
+        .collect();
+    let word = |i: usize, w: &str| toks.get(i).is_some_and(|t| t.kind == K::Word && t.up == w);
+    if !(word(0, "ALTER") && word(1, "TABLE")) {
+        return false;
+    }
+    let mut i = 2;
+    if d == Dialect::Postgres && word(i, "ONLY") {
+        i += 1;
+    }
+    let Ok((table, j)) = super::table::dotted(&toks, i) else {
+        return false;
+    };
+    let verb = match d {
+        Dialect::Tsql => "CHECK",
+        Dialect::Postgres => "VALIDATE",
+        Dialect::Db2i => return false,
+    };
+    if !(word(j, verb) && word(j + 1, "CONSTRAINT") && toks.len() == j + 3) {
+        return false;
+    }
+    let Some(name) = super::table::name_of(&toks[j + 2]) else {
+        return false;
+    };
+    let Some(prev) = c.prev_sibling() else {
+        return false;
+    };
+    if prev.kind() != SyntaxKind::STATEMENT {
+        return false;
+    }
+    let Ok(Ddl::Constraint(added)) = ddl::parse(&tokens(&prev), d) else {
+        return false;
+    };
+    ddl::stored_key(&added.table, d).ok() == ddl::stored_key(&table, d).ok()
+        && super::table::stored(&added.name) == super::table::stored(&name)
+}
+
 /// A PostgreSQL or Db2 for i statement `CREATE [OR REPLACE] VIEW …`.
 fn view_stmt(n: &SyntaxNode) -> bool {
     let w = cst::first_words(n, 4);
@@ -2136,6 +2192,14 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                 cursor: None,
             });
         }
+        // `ALTER TABLE t CHECK CONSTRAINT n` (T-SQL) or `VALIDATE CONSTRAINT
+        // n` (PostgreSQL) right after the statement that added n with its
+        // rows checked: the constraint is enabled and holds, so neither does
+        // anything.
+        StmtKind::Ddl if recheck_after_add(c, d) => note(
+            u,
+            "CHECK CONSTRAINT / VALIDATE CONSTRAINT right after adding the constraint with its rows checked: nothing left to do on either side",
+        ),
         // A script's own `CREATE TABLE`: compared table against table
         // (`table.rs`), in its place among the data statements.
         StmtKind::Ddl if u.kind == UnitKind::Script && is_create_table(c, d) => {
@@ -2150,6 +2214,12 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         // PostgreSQL a `local_temps` name): compared statement against
         // statement, as a script's.
         StmtKind::Ddl if temp_index(c, d, &u.local_temps) => {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
+        // A procedure's CREATE INDEX or ALTER TABLE … ADD CONSTRAINT:
+        // compared statement against statement, in its place among the data
+        // statements (`mod.rs::ddl_stmts` checks that it runs once).
+        StmtKind::Ddl if u.kind == UnitKind::Proc && routine_ddl(c) => {
             u.ddl.push((c.clone(), u.stmts.len()));
         }
         // A routine's TRUNCATE: compared statement against statement too,

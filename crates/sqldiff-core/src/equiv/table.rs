@@ -585,6 +585,27 @@ fn check(ts: &[Tok], i: usize, d: Dialect, name: Option<Name>) -> R<(Check, usiz
     ))
 }
 
+/// One constraint item of `ALTER TABLE … ADD`, read as a table's: its keys,
+/// foreign keys, checks and the storage clauses passed over.
+#[allow(clippy::type_complexity)]
+pub(super) fn constraint_item(
+    ts: &[Tok],
+    d: Dialect,
+) -> R<(Vec<Key>, Vec<ForeignKey>, Vec<Check>, Vec<String>)> {
+    let mut t = Table {
+        dialect: d,
+        name: Vec::new(),
+        name_toks: Vec::new(),
+        columns: Vec::new(),
+        keys: Vec::new(),
+        fks: Vec::new(),
+        checks: Vec::new(),
+        storage: Vec::new(),
+    };
+    table_constraint(ts, d, &mut t)?;
+    Ok((t.keys, t.fks, t.checks, t.storage))
+}
+
 fn table_constraint(ts: &[Tok], d: Dialect, t: &mut Table) -> R<()> {
     let mut i = 0;
     let mut name = None;
