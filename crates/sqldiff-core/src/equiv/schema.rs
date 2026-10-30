@@ -33,6 +33,16 @@ pub enum Fam {
     /// Db2 for i VARBINARY and BLOB); `len` None means unbounded (MAX).
     /// Fixed-length BINARY(n) stays `Other`: T-SQL pads it with zeros.
     Binary,
+    /// T-SQL uniqueidentifier, PostgreSQL uuid: a 16-byte identifier. Only
+    /// a uuid kept as it is (assigned, stored or cast to uuid) is known to
+    /// agree; its text (upper case in T-SQL, lower case in PostgreSQL), its
+    /// order and every other conversion are left to the dialects.
+    Uuid,
+    /// T-SQL geography, PostGIS geography without a type modifier. Only a
+    /// value kept as it is (assigned, stored or cast to geography) is known
+    /// to agree; SQL Server cannot compare or order one, PostGIS compares
+    /// bounding boxes.
+    Geography,
     Other,
 }
 
@@ -55,6 +65,16 @@ impl Ty {
 
     pub fn is_string(&self) -> bool {
         matches!(self.fam, Fam::Char | Fam::VarChar)
+    }
+
+    /// Whether each dialect orders values of this type its own way: strings
+    /// by collation, uuids by byte order (SQL Server compares the last
+    /// byte group first), geography not at all in SQL Server.
+    pub fn orders_per_dialect(&self) -> bool {
+        matches!(
+            self.fam,
+            Fam::Char | Fam::VarChar | Fam::Uuid | Fam::Geography
+        )
     }
 
     pub fn is_numeric(&self) -> bool {
@@ -210,6 +230,9 @@ impl Ty {
             "TIME" => Self::time_ty(Fam::Time, n(0), d),
             "INTERVAL" if d == Dialect::Postgres => Ty::of(Fam::Interval),
             "BOOLEAN" | "BOOL" => Ty::of(Fam::Bool),
+            "UNIQUEIDENTIFIER" if d == Dialect::Tsql => Ty::of(Fam::Uuid),
+            "UUID" if d == Dialect::Postgres => Ty::of(Fam::Uuid),
+            "GEOGRAPHY" if d != Dialect::Db2i && t.args.is_empty() => Ty::of(Fam::Geography),
             "VARBINARY" | "BINARY VARYING" => fam_len(Fam::Binary, tsql_default),
             "BYTEA" if d == Dialect::Postgres => Ty::of(Fam::Binary),
             "BLOB" | "BINARY LARGE OBJECT" if d == Dialect::Db2i => Ty {
@@ -598,14 +621,13 @@ pub(super) fn ty_of(t: &DataType, d: Dialect) -> Ty {
     if t.max {
         args.insert(0, "MAX".to_string());
     }
-    Ty::from_type(
-        &Type {
-            name: t.base.clone(),
-            args,
-        },
-        d,
-        false,
-    )
+    // `[sys].[geography]`: a T-SQL system type named with its schema.
+    let qualified = t.base.replace(['[', ']'], "").replace(" . ", ".");
+    let name = match qualified.strip_prefix("SYS.") {
+        Some(base) if d == Dialect::Tsql => base.to_string(),
+        _ => t.base.clone(),
+    };
+    Ty::from_type(&Type { name, args }, d, false)
 }
 
 #[cfg(test)]

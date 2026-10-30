@@ -239,6 +239,23 @@ procedure for a bigint argument to an int parameter nor for 1 to a boolean;
 gives an OUT parameter NULL whatever is passed; an INOUT parameter receives the
 value; copying back into a shorter `varchar` variable fails; an INOUT argument that needs any cast (a `varchar(10)` variable for a `text` parameter, `int` for `bigint`) fails the call as not writable.
 
+**User function calls.** A call of a scalar user function inside an
+expression is the same call on both sides when each side's catalog holds the
+function and every argument reaches its parameter the same way
+(`Canon::user_fn`, `ASM-UDF-CALLEE:name`, `ASM-UDF-CALL-CONTEXT`). The
+converter writes T-SQL `dbo.f(x)` as PostgreSQL `f(x)`. Such an unqualified
+PostgreSQL call, compared with T-SQL, counts as the user function `f` of the
+default schema under `ASM-PG-UNQUALIFIED-FUNCTION`, except when `f` is the
+name of any `pg_catalog` function of PostgreSQL 18
+(`profiles/pg18_catalog_functions.txt`, 2,787 names read from a 18.6 server;
+`pg_catalog` is searched before the schemas of `search_path` unless it lists
+it later) or one of its 164 keywords that are not unreserved
+(`profiles/pg18_keywords.txt`, from `pg_get_keywords()`: the grammar forms
+written like calls, such as `trim`, `coalesce`, `xmlelement` or
+`json_object`, are no `pg_catalog` function, and unquoted they always run
+the built-in). Such a call may reach the built-in, and it stays not
+compared.
+
 ## Dynamic SQL
 
 T-SQL `EXEC (…)` and `EXEC [sys.]sp_executesql …` run a string as a batch;
@@ -482,7 +499,13 @@ above:
   literal that fits. Every literal the code assigns must still convert to the
   same value on both sides (T-SQL truncates `1.5` into an `int` to 1,
   PostgreSQL rounds it to 2; `'abcdef'` into `varchar(3)` is cut off in
-  T-SQL and raises in PostgreSQL), else the variable is not proven;
+  T-SQL and raises in PostgreSQL), else the variable is not proven. A string
+  value assigned to a shorter string variable (`SET @Bank = 'Woodgrove Bank '
+  + @City` into `nvarchar(50)`) is kept as it is under the same
+  `ASM-VARIABLE-LENGTH`, unless its literal parts alone are longer than the
+  variable; a `uniqueidentifier` / `uuid` copied into a variable of that type
+  is kept as it is, any other conversion of it (to text: upper case in
+  T-SQL, lower case in PostgreSQL) is not proven;
 - otherwise compared only when every write to the variable, on both sides,
   is a literal that converts to the same known value (`'20200101'` into
   `datetime2(7)` and into `timestamp`); any other write (`SELECT … INTO`,

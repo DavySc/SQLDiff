@@ -242,7 +242,7 @@ sites = ["sqldiff-core/src/equiv/objcheck.rs"]
 
 [[assumption]]
 id = "ASM-CI-COLLATION"
-statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern (no [ or \\): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys, and the substrings REPLACE and CHARINDEX find (T-SQL finds 'b' in 'ABC', PostgreSQL's replace and strpos do not); not ordering."
+statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern both dialects read the same way (T-SQL's [c] class written as the character, a literal \\ escaped for PostgreSQL; other classes and ESCAPE are not converted): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys, and the substrings REPLACE and CHARINDEX find (T-SQL finds 'b' in 'ABC', PostgreSQL's replace and strpos do not); not ordering."
 discharge = "catalog"
 fact = "The collations of both sides (T-SQL's default is case-insensitive) and the data."
 fact_key = "collation"
@@ -791,6 +791,13 @@ fact = "Callers pass values that fit the declared parameter types."
 sites = ["sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
+id = "ASM-PG-UNQUALIFIED-FUNCTION"
+statement = "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no schema search_path lists before it has a function of that name and arguments, and pg_catalog (searched first) has no function of that name and it is no keyword the grammar reads itself (checked against PostgreSQL 18's)."
+discharge = "deployment"
+fact = "The server's search_path and the functions of the schemas it lists."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-PG-VARIABLE-CONFLICT-ERROR"
 statement = "plpgsql.variable_conflict is `error` (the default) for the function."
 discharge = "deployment"
@@ -1180,7 +1187,7 @@ sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-LEN-BMP"
-statement = "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
+statement = "Strings a T-SQL LEN counts, or a LIKE _ steps over, have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
 discharge = "deployment"
 fact = "The data the routines see, or the collation."
 sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]

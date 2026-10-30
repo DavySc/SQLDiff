@@ -236,6 +236,34 @@ def p5P (body : List Ast.Node := [insAcctP (pv "p_id") (num 1), txn "COMMIT"]) :
 #guard isC2a (check depd Γd idCert p5T p5P)
 #guard residualOf depd Γd p5T == some ["ASM-NO-CALLER-TXN"]
 
+/-! ### A `COMMIT` after each statement T-SQL commits on its own
+
+Under `XACT_ABORT ON` and without `BEGIN TRAN`, T-SQL commits each
+statement on its own; the converter writes a `COMMIT` after each
+(`tsql.txn.autocommit`). The `COMMIT`s lower to nothing, and the
+confirmation names `ASM-NO-CALLER-TXN` from them. -/
+
+def autoT : Ast.Routine :=
+  tsqlProc ["dbo", "p5"] [inT "@id"] [xactAbort, nocount,
+    insAcct (tv "@id") (num 1), bumpAllT]
+def autoP (body : List Ast.Node := [insAcctP (pv "p_id") (num 1), txn "COMMIT", bumpAllP,
+    txn "COMMIT"]) : Ast.Routine :=
+  pgProc ["p5"] [inP "p_id"] [] body
+
+#guard isC2a (check depd Γd idCert autoT autoP)
+-- Without the `COMMIT`s too: they change nothing a finished call shows.
+#guard isC2a (check depd Γd idCert autoT (autoP [insAcctP (pv "p_id") (num 1), bumpAllP]))
+-- The T-SQL routine has no transaction statement; its conversion's `COMMIT`s name the assumption.
+#guard (lowerT depd Γd autoT).map (residual autoT · (pgTxn (autoP))) ==
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-NO-CALLER-TXN"]
+#guard (lowerT depd Γd autoT).map (residual autoT ·) ==
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR"]
+#guard (lowerT depd Γd autoT).map (usesC4 autoT · (pgTxn (autoP))) == some true
+-- A `COMMIT` inside an exception block is outside the spec (P13).
+#guard reasonOf (check depd Γd idCert autoT
+    (autoP [blockP [insAcctP (pv "p_id") (num 1), txn "COMMIT"] [reraiseP], bumpAllP])) ==
+  "the PL/pgSQL routine is outside the C1 spec"
+
 /-! ### Nested handlers -/
 
 def nestT : Ast.Routine :=

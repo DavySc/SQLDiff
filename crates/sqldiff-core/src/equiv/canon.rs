@@ -31,7 +31,7 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 pub mod asm {
     pub const LEN_BMP: (&str, &str) = (
         "ASM-TSQL-LEN-BMP",
-        "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
+        "Strings a T-SQL LEN counts, or a LIKE `_` steps over, have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
     );
     pub const DATEFIRST_7: (&str, &str) = (
         "ASM-TSQL-DATEFIRST-7",
@@ -238,6 +238,10 @@ pub mod asm {
         "ASM-UDF-CALLEE",
         "The user function a call names on side B is the conversion of the one it names on side A, and that conversion is shown equal, or equal under the assumptions its file lists, in the file that creates it",
     );
+    pub const PG_UNQUALIFIED_FUNCTION: (&str, &str) = (
+        "ASM-PG-UNQUALIFIED-FUNCTION",
+        "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no function of that name and arguments sits in a schema search_path lists before it, and pg_catalog, which PostgreSQL searches first unless search_path lists it later, has no function of that name, and it is no keyword the grammar reads itself (checked against PostgreSQL 18's)",
+    );
     pub const UDF_CALL_CONTEXT: (&str, &str) = (
         "ASM-UDF-CALL-CONTEXT",
         "A user function called in a statement returns the same value for the same arguments throughout the statement, however often each side runs it: it reads no data the calling statement or another session changes while the statement runs, and no clock (SQL Server reads SYSDATETIME() at each call inside a function, PostgreSQL's statement_timestamp() and now() give the calling statement's or transaction's start)",
@@ -316,6 +320,10 @@ pub struct Canon<'a> {
     /// PostgreSQL compared with T-SQL: quoted names may fold to lower case
     /// (see `stmt`).
     pub fold_quoted: bool,
+    /// The dialect of the statements this one is compared with, when known:
+    /// an unqualified PostgreSQL call may then be the conversion of a T-SQL
+    /// `dbo` function (`user_fn`).
+    pub other: Option<Dialect>,
     /// Table names of the statement being lowered (see `Item::names`).
     pub names: Vec<(String, Option<String>)>,
     /// Bit and boolean columns of derived tables (`sub:alias`), by name: a
@@ -480,6 +488,24 @@ fn lc(s: &str) -> String {
     }
 }
 
+/// The names of PostgreSQL 18's pg_catalog functions (profiles/).
+const PG_CATALOG_FUNCTIONS: &str = include_str!("../../profiles/pg18_catalog_functions.txt");
+/// PostgreSQL 18's keywords that are not unreserved (profiles/): among them
+/// the grammar forms written like calls (`trim`, `coalesce`, `xmlelement`,
+/// `json_object`), which are no pg_catalog function.
+const PG_KEYWORDS: &str = include_str!("../../profiles/pg18_keywords.txt");
+
+/// An unquoted PostgreSQL call of `name` (folded) may reach a built-in
+/// before a user function of the same name: pg_catalog has a function of
+/// that name, or the name is a keyword the grammar reads itself.
+fn pg_builtin_name(name: &str) -> bool {
+    let k = name.to_lowercase();
+    PG_CATALOG_FUNCTIONS
+        .lines()
+        .chain(PG_KEYWORDS.lines())
+        .any(|l| !l.starts_with('#') && l == k)
+}
+
 /// How `lc` treats a PostgreSQL statement's names.
 enum Folding {
     Off,
@@ -564,6 +590,7 @@ impl<'a> Canon<'a> {
             cursor_failed: HashMap::new(),
             by_name: false,
             fold_quoted: false,
+            other: None,
             names: Vec::new(),
             output: None,
         }
@@ -578,6 +605,14 @@ impl<'a> Canon<'a> {
         self.excluded = None;
         self.names.clear();
         self.output = None;
+    }
+
+    /// SQL Server cannot compare geography values (GROUP BY, DISTINCT, IN,
+    /// set operations, = all fail); PostGIS compares their bounding boxes.
+    /// The marker keeps such a comparison apart from the other dialect's;
+    /// no assumption discharges it.
+    fn geog_cmp(&self) -> Term {
+        n("geog-cmp", vec![self.dtag()])
     }
 
     fn assume(&mut self, x: (&str, &str)) {
@@ -957,7 +992,7 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
-            Fam::Date | Fam::Interval | Fam::Bool => true,
+            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid | Fam::Geography => true,
         }
     }
 
@@ -1289,7 +1324,14 @@ impl<'a> Canon<'a> {
                     items = items.into_iter().map(Self::bit_value).collect();
                 }
                 items.sort();
+                let geog = ty.is_some_and(|t| t.fam == Fam::Geography)
+                    || item_tys
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.fam == Fam::Geography));
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
+                if geog {
+                    kids.push(self.geog_cmp());
+                }
                 // Like `=`: string membership depends on the collation. With
                 // a string operand and string items it is string equality
                 // (`coll-eq`); otherwise a conversion may take part.
@@ -1314,6 +1356,8 @@ impl<'a> Canon<'a> {
                 // non-string operand avoids the collation.
                 if ty.map_or(true, |t| t.is_string()) {
                     kids.push(self.dtag());
+                } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                    kids.push(self.geog_cmp());
                 }
                 (n("inq", kids), None)
             }
@@ -1342,23 +1386,60 @@ impl<'a> Canon<'a> {
                     false => (t, lo, hi),
                 };
                 let mut kids = vec![t, lo, hi, a(neg.to_string())];
-                if ty.map_or(true, |t| t.is_string()) {
+                // Strings by collation, uuids by each dialect's byte order.
+                if ty.map_or(true, |t| t.is_string())
+                    || tys
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.orders_per_dialect()))
+                {
                     kids.push(self.dtag());
                 }
                 (n("between", kids), None)
             }
             Expr::Like(x, p, neg, ci) => {
                 let (x, ty) = self.expr(x)?;
-                // A varchar value against a literal pattern without `[` or
-                // `\` differs across dialects only by the collation
-                // (`coll-like`): case, trailing spaces of the value (T-SQL
-                // varchar drops them) and characters the collation expands
-                // (checked on SQL Server 2022). T-SQL `[...]` is a character
-                // class and PostgreSQL's `\` an escape; a char value is
-                // blank-padded on one side only.
-                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
-                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
-                let p = self.expr(p)?.0;
+                // A varchar value against a literal pattern both dialects
+                // read the same way (`like::canonical`: T-SQL's `[c]` is the
+                // character, PostgreSQL's `\` an escape) differs across
+                // dialects only by the collation (`coll-like`): case,
+                // trailing spaces of the value (T-SQL varchar drops them) and
+                // characters the collation expands (checked on SQL Server
+                // 2022). A char value is blank-padded on one side only.
+                let pat = match p.as_ref() {
+                    Expr::Str(s) => super::like::canonical(s, self.d),
+                    _ => None,
+                };
+                // A value escaped into a pattern that matches only itself
+                // (`%` aside), each dialect's way (`like::escaped_value`).
+                let escaped = match super::like::escaped_value(p, self.d) {
+                    Some(v) => match self.expr(v)? {
+                        // T-SQL's REPLACE cuts a result that is not MAX at
+                        // 8,000 bytes, and the escaping can triple x.
+                        (v, Some(t))
+                            if t.fam == Fam::VarChar && t.len.map_or(true, |l| l * 3 <= 4000) =>
+                        {
+                            Some(v)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let plain = (pat.is_some() || escaped.is_some())
+                    && ty.is_some_and(|t| t.fam == Fam::VarChar);
+                // Under a non-_SC collation T-SQL's `_` matches no character
+                // outside the BMP (N'a😀' LIKE N'a_' and N'a__' are both
+                // false on SQL Server 2022); PostgreSQL's matches one.
+                if plain
+                    && self.d == Dialect::Tsql
+                    && pat.as_deref().is_some_and(super::like::steps_one)
+                {
+                    self.assume(asm::LEN_BMP);
+                }
+                let p = match (pat, escaped) {
+                    (Some(c), _) => n("likepat", vec![a(c)]),
+                    (None, Some(v)) => n("likeescaped", vec![v]),
+                    (None, None) => self.expr(p)?.0,
+                };
                 let coll = if plain {
                     n("coll-like", vec![self.dtag()])
                 } else {
@@ -1475,6 +1556,8 @@ impl<'a> Canon<'a> {
                         let (t, ty) = self.expr(o)?;
                         if ty.map_or(true, |t| t.is_string()) {
                             kids.push(self.dtag());
+                        } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                            kids.push(self.geog_cmp());
                         }
                         kids.push(t);
                     }
@@ -1745,6 +1828,25 @@ impl<'a> Canon<'a> {
         if matches!(v.0.head(), "null") {
             return (n(head, vec![Self::ty_term(&to), v.0]), to);
         }
+        // Only a geography value is one on both sides: SQL Server reads
+        // 0xE6100000010C… in its own serialization, which PostGIS rejects
+        // ("Invalid endian flag value", checked on PostGIS 3.6), and the
+        // two parse text differently.
+        if dst.fam == Fam::Geography && v.1.map_or(true, |t| t.fam != Fam::Geography) {
+            return (
+                n(
+                    "dcast",
+                    vec![
+                        self.dtag(),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&v.1),
+                        v.0,
+                    ],
+                ),
+                to,
+            );
+        }
         if v.1.is_none() {
             let castable = matches!(
                 dst.fam,
@@ -1763,6 +1865,23 @@ impl<'a> Canon<'a> {
             Rule::Trunc | Rule::Dialect
                 if whole && dst.fam == Fam::Int && self.d != Dialect::Db2i =>
             {
+                Rule::Same
+            }
+            // A string assigned to a shorter variable: SQL Server cuts it
+            // off and PostgreSQL raises, so the two agree only on a string
+            // that fits, which ASM-VARIABLE-LENGTH (the variables' pairing
+            // takes it for every bounded T-SQL string variable) states. It
+            // is then kept as storing it would keep it. Not for a string
+            // whose literal parts alone are too long: that one is cut off.
+            Rule::Dialect
+                if how == How::Var
+                    && self.d != Dialect::Db2i
+                    && dst.is_string()
+                    && v.1.is_some_and(|s| s.is_string())
+                    && dst.len.map_or(true, |l| literal_chars(&v.0) <= l)
+                    && matches!(self.conv_rule(v.1, dst, How::Store), Rule::Same) =>
+            {
+                self.assume(super::script::VARIABLE_LENGTH);
                 Rule::Same
             }
             r => r,
@@ -1848,6 +1967,7 @@ impl<'a> Canon<'a> {
             // numeric half away from zero and float half to even.
             (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
             (Float, Float) => Rule::Same,
+            (Uuid, Uuid) | (Geography, Geography) => Rule::Same,
             // Explicit casts truncate silently on both sides, and storing too
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
@@ -1885,8 +2005,16 @@ impl<'a> Canon<'a> {
     /// in a statement it may run once per row or fewer times
     /// (`ASM-UDF-CALL-CONTEXT`). `None` when the call is not of that form.
     fn user_fn(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
+        // The converter writes T-SQL `dbo.f(x)` as `f(x)`: unqualified, a
+        // PostgreSQL call compared with T-SQL may be that conversion, unless
+        // a built-in of the name could take it first.
+        let unqualified = c.name.len() == 1
+            && self.d == Dialect::Postgres
+            && self.other == Some(Dialect::Tsql)
+            && !c.name[0].starts_with('"')
+            && !pg_builtin_name(&c.name[0]);
         if !matches!(self.d, Dialect::Tsql | Dialect::Postgres)
-            || c.name.len() != 2
+            || (c.name.len() != 2 && !unqualified)
             || c.distinct
             || c.star
             || c.over
@@ -1931,11 +2059,15 @@ impl<'a> Canon<'a> {
             Dialect::Postgres => untypmod(t),
             _ => t,
         };
-        let (schema, name) = (lc(&c.name[0]), lc(&c.name[1]));
-        let default = matches!(
-            (self.d, schema.as_str()),
-            (Dialect::Tsql, "dbo") | (Dialect::Postgres, "public")
-        );
+        let (schema, name) = match c.name.as_slice() {
+            [n] => (String::new(), lc(n)),
+            _ => (lc(&c.name[0]), lc(&c.name[1])),
+        };
+        let default = unqualified
+            || matches!(
+                (self.d, schema.as_str()),
+                (Dialect::Tsql, "dbo") | (Dialect::Postgres, "public")
+            );
         let key = if default {
             name
         } else {
@@ -1958,6 +2090,9 @@ impl<'a> Canon<'a> {
         if default {
             self.assume(asm::DEFAULT_SCHEMA);
         }
+        if unqualified {
+            self.assume(asm::PG_UNQUALIFIED_FUNCTION);
+        }
         let id = format!("{}:{key}", asm::UDF_CALLEE.0);
         if !self.asm.iter().any(|y| y.id == id) {
             self.asm.push(Assumption::default(
@@ -1972,6 +2107,11 @@ impl<'a> Canon<'a> {
     fn call(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
         if c.over {
             return self.window(c);
+        }
+        if c.name.len() == 1 && self.other == Some(Dialect::Tsql) && self.d == Dialect::Postgres {
+            if let Some(t) = self.user_fn(c)? {
+                return Ok(t);
+            }
         }
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
         // A qualified name is a user function, even `dbo.max`: T-SQL calls a
@@ -2006,8 +2146,22 @@ impl<'a> Canon<'a> {
                 if c.star {
                     kids.push(a("*"));
                 } else {
+                    let mut tys = Vec::new();
                     for x in &c.args {
-                        kids.push(self.expr(x)?.0);
+                        let (t, ty) = self.expr(x)?;
+                        kids.push(t);
+                        tys.push(ty);
+                    }
+                    // COUNT(DISTINCT …) compares its values as DISTINCT does.
+                    if c.distinct {
+                        if tys
+                            .iter()
+                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                        {
+                            kids.push(self.geog_cmp());
+                        } else if tys.iter().any(|t| t.is_some_and(|t| t.is_string())) {
+                            kids.push(n("distinct", vec![self.dtag()]));
+                        }
                     }
                 }
                 // COUNT returns int in T-SQL and bigint elsewhere; equal while it fits.
@@ -2494,7 +2648,7 @@ impl<'a> Canon<'a> {
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
-                Some(t) if t.is_string() => (
+                Some(t) if t.orders_per_dialect() => (
                     n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
                     first_ty,
                 ),
@@ -2862,6 +3016,18 @@ impl<'a> Canon<'a> {
                 if string {
                     return Ok((
                         self.strcmp(op, (lt, lty), (rt, rty)),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
+                // SQL Server orders uniqueidentifier by its byte groups, last
+                // group first; PostgreSQL orders uuid byte by byte. SQL Server
+                // has no comparison of geography at all.
+                if any(&|t| t.fam == Fam::Geography)
+                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
+                {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
@@ -3290,8 +3456,9 @@ impl<'a> Canon<'a> {
             };
             let mut kids = vec![t, a(if o.desc { "desc" } else { "asc" }), a(nulls)];
             match ty {
-                // Character ordering depends on the collation of each dialect.
-                Some(t) if t.is_string() => kids.push(self.dtag()),
+                // Character ordering depends on the collation of each dialect,
+                // uuid ordering on its byte order (last group first in T-SQL).
+                Some(t) if t.orders_per_dialect() => kids.push(self.dtag()),
                 None => self.assume(asm::UNTYPED),
                 _ => {}
             }
@@ -3602,6 +3769,13 @@ impl<'a> Canon<'a> {
                     {
                         kids.push(n("coll", vec![self.dtag()]));
                     }
+                    if h != "union-all"
+                        && col_tys
+                            .iter()
+                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                    {
+                        kids.push(self.geog_cmp());
+                    }
                     n("setop", kids)
                 }
                 (Some(_), None) => unreachable!("only the first branch has no operator"),
@@ -3655,7 +3829,7 @@ impl<'a> Canon<'a> {
                 a(if o.desc { "desc" } else { "asc" }),
                 a(nulls),
             ];
-            if col_tys[k].is_some_and(|t| t.is_string()) {
+            if col_tys[k].is_some_and(|t| t.orders_per_dialect()) {
                 kids.push(self.dtag());
             }
             order.push(n("ord", kids));
@@ -3715,6 +3889,7 @@ impl<'a> Canon<'a> {
             let (t, ty) = self.expr(g)?;
             group.push(match ty {
                 Some(t2) if t2.is_string() => n("collate", vec![self.dtag(), t]),
+                Some(t2) if t2.fam == Fam::Geography => n("geog-key", vec![self.geog_cmp(), t]),
                 None => {
                     self.assume(asm::UNTYPED);
                     t
@@ -3725,6 +3900,11 @@ impl<'a> Canon<'a> {
         // DISTINCT compares strings under each dialect's collation.
         let distinct = if !s.distinct {
             a("all")
+        } else if items
+            .iter()
+            .any(|x| x.1.is_some_and(|t| t.fam == Fam::Geography))
+        {
+            n("distinct-geog", vec![self.geog_cmp()])
         } else if items.iter().any(|x| x.1.is_some_and(|t| t.is_string())) {
             n("distinct", vec![self.dtag()])
         } else {
@@ -5220,8 +5400,8 @@ impl<'a> Canon<'a> {
                 Some(w) => self.cond(&w)?.0,
                 None => a("-"),
             };
-            self.unique_match(&table, &from_t, &subs, &w)?;
             let kv = self.update_sets(&table, sets)?;
+            self.unique_match(&table, &from_t, &subs, &w, &kv)?;
             Ok(n(
                 "update-from",
                 vec![a(table), n("set", kv), n("from", from_t), w],
@@ -5244,6 +5424,7 @@ impl<'a> Canon<'a> {
         from: &[Term],
         subs: &[(String, Option<Vec<String>>)],
         w: &Term,
+        kv: &[Term],
     ) -> R<()> {
         fn conj(t: &Term) -> Vec<Term> {
             if t.is("and") {
@@ -5397,10 +5578,88 @@ impl<'a> Canon<'a> {
             }
         }
         if ls.iter().all(|(t, _)| bound.contains(t)) {
-            Ok(())
-        } else {
-            fail()
+            return Ok(());
         }
+        // Several matches give the same new values when SET reads only the
+        // target, the statement's variables, and columns of the other tables
+        // that WHERE or an inner join pins to one value by `=` against
+        // something constant over the statement (`s.Selected = 1`). Only
+        // types whose equal values are the same value count: not strings
+        // (case), floats (-0) or time-zone offsets.
+        let mut pinned: Vec<(String, String)> = Vec::new();
+        for c in &all {
+            if !(c.is("cmp") && c.kid(0).and_then(Term::atom) == Some("=")) {
+                continue;
+            }
+            let (Some(x), Some(y)) = (c.kid(1), c.kid(2)) else {
+                continue;
+            };
+            for (col, other) in [(x, y), (y, x)] {
+                let (Some(tb), Some(cn)) = (
+                    col.kid(0).and_then(Term::atom),
+                    col.kid(1).and_then(Term::atom),
+                ) else {
+                    continue;
+                };
+                // A literal, variable or parameter, maybe converted: not a
+                // call such as NEWID(), which changes per row.
+                fn constant(t: &Term) -> bool {
+                    match t.head() {
+                        "num" | "flt" | "bool" | "str" | "sym" => true,
+                        "conv" | "cast" => t.kids().last().is_some_and(constant),
+                        _ => false,
+                    }
+                }
+                if !col.is("col") || !constant(other) {
+                    continue;
+                }
+                let exact = self
+                    .schema
+                    .table(Self::base_table(tb))
+                    .and_then(|tab| tab.column(cn))
+                    .is_some_and(|c| {
+                        matches!(
+                            c.ty.fam,
+                            Fam::Int
+                                | Fam::Exact
+                                | Fam::Bool
+                                | Fam::Date
+                                | Fam::Timestamp
+                                | Fam::Time
+                        )
+                    });
+                if exact && !bound.iter().any(|b| b == tb) {
+                    pinned.push((tb.to_string(), cn.to_string()));
+                }
+            }
+        }
+        let read_only_pinned = kv.iter().all(|k| {
+            !k.any(&|s| {
+                s.is("subq")
+                    || s.is("col")
+                        && match (s.kid(0).and_then(Term::atom), s.kid(1).and_then(Term::atom)) {
+                            (Some(tb), Some(cn)) => {
+                                tb != target && !pinned.iter().any(|(pt, pc)| pt == tb && pc == cn)
+                            }
+                            _ => true,
+                        }
+            })
+        });
+        if read_only_pinned {
+            if !pinned.is_empty() {
+                pinned.sort();
+                pinned.dedup();
+                let cols: Vec<String> = pinned.iter().map(|(t, c)| format!("{t}.{c}")).collect();
+                self.discharge(format!(
+                    "SET reads only the target and {}, one value for every match",
+                    cols.join(", ")
+                ));
+            } else {
+                self.discharge("SET reads only the target, one value for every match".into());
+            }
+            return Ok(());
+        }
+        fail()
     }
 
     fn delete(
@@ -5920,6 +6179,19 @@ fn nonempty_text(e: &Expr) -> bool {
     }
 }
 
+/// The characters a string term has at least: its literals, also inside
+/// concatenations.
+fn literal_chars(t: &Term) -> u32 {
+    match t.head() {
+        "str" => t
+            .kid(0)
+            .and_then(Term::atom)
+            .map_or(0, |s| s.chars().count() as u32),
+        "concat" => t.kids().iter().map(literal_chars).sum(),
+        _ => 0,
+    }
+}
+
 /// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END`: (s, x).
 fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
     let [(Expr::Bin(op, l, r), Expr::Num(zero))] = whens else {
@@ -5953,8 +6225,18 @@ fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e E
 /// is never longer than `s` when `to` is no longer than any non-empty
 /// `from` (an empty `from` changes nothing), or `s` has a known length
 /// whose worst growth stays within the bound. PostgreSQL never cuts.
+/// A `to` that is a part of the concatenation `from` (REPLACE(s, @d + ' ',
+/// @d)) is never longer than it either; the substring found is `from`
+/// itself under ASM-CI-COLLATION, which comparing the case-insensitive
+/// match against PostgreSQL's exact one takes anyway.
 fn replace_fits(d: Dialect, e: &[Expr], args: &[(Term, Option<Ty>)]) -> bool {
     if d != Dialect::Tsql {
+        return true;
+    }
+    fn part_of(from: &Term, to: &Term) -> bool {
+        from.is("concat") && from.kids().iter().any(|k| k == to || part_of(k, to))
+    }
+    if part_of(&args[1].0, &args[2].0) {
         return true;
     }
     let min_from = match &e[1] {
