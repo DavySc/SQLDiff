@@ -946,7 +946,7 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
-            Fam::Date | Fam::Interval | Fam::Bool => true,
+            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid => true,
         }
     }
 
@@ -1754,6 +1754,23 @@ impl<'a> Canon<'a> {
             {
                 Rule::Same
             }
+            // A string assigned to a shorter variable: SQL Server cuts it
+            // off and PostgreSQL raises, so the two agree only on a string
+            // that fits, which ASM-VARIABLE-LENGTH (the variables' pairing
+            // takes it for every bounded T-SQL string variable) states. It
+            // is then kept as storing it would keep it. Not for a string
+            // whose literal parts alone are too long: that one is cut off.
+            Rule::Dialect
+                if how == How::Var
+                    && self.d != Dialect::Db2i
+                    && dst.is_string()
+                    && v.1.is_some_and(|s| s.is_string())
+                    && dst.len.map_or(true, |l| literal_chars(&v.0) <= l)
+                    && matches!(self.conv_rule(v.1, dst, How::Store), Rule::Same) =>
+            {
+                self.assume(super::script::VARIABLE_LENGTH);
+                Rule::Same
+            }
             r => r,
         };
         match rule {
@@ -1837,6 +1854,7 @@ impl<'a> Canon<'a> {
             // numeric half away from zero and float half to even.
             (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
             (Float, Float) => Rule::Same,
+            (Uuid, Uuid) => Rule::Same,
             // Explicit casts truncate silently on both sides, and storing too
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
@@ -5827,6 +5845,19 @@ fn nonempty_text(e: &Expr) -> bool {
     }
 }
 
+/// The characters a string term has at least: its literals, also inside
+/// concatenations.
+fn literal_chars(t: &Term) -> u32 {
+    match t.head() {
+        "str" => t
+            .kid(0)
+            .and_then(Term::atom)
+            .map_or(0, |s| s.chars().count() as u32),
+        "concat" => t.kids().iter().map(literal_chars).sum(),
+        _ => 0,
+    }
+}
+
 /// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END`: (s, x).
 fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
     let [(Expr::Bin(op, l, r), Expr::Num(zero))] = whens else {
@@ -5860,8 +5891,18 @@ fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e E
 /// is never longer than `s` when `to` is no longer than any non-empty
 /// `from` (an empty `from` changes nothing), or `s` has a known length
 /// whose worst growth stays within the bound. PostgreSQL never cuts.
+/// A `to` that is a part of the concatenation `from` (REPLACE(s, @d + ' ',
+/// @d)) is never longer than it either; the substring found is `from`
+/// itself under ASM-CI-COLLATION, which comparing the case-insensitive
+/// match against PostgreSQL's exact one takes anyway.
 fn replace_fits(d: Dialect, e: &[Expr], args: &[(Term, Option<Ty>)]) -> bool {
     if d != Dialect::Tsql {
+        return true;
+    }
+    fn part_of(from: &Term, to: &Term) -> bool {
+        from.is("concat") && from.kids().iter().any(|k| k == to || part_of(k, to))
+    }
+    if part_of(&args[1].0, &args[2].0) {
         return true;
     }
     let min_from = match &e[1] {
