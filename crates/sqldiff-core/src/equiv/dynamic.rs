@@ -194,7 +194,7 @@ pub fn exec_params(stmt: &SyntaxNode) -> Result<Option<Passed>, String> {
         parts[1]
     };
     jumps(stmt)?;
-    let v = Reader { depth: 0 }.expr(stmt, decl)?;
+    let v = Reader::default().expr(stmt, decl)?;
     let Some(text) = v.s else {
         return Err("the parameter list is NULL".into());
     };
@@ -349,17 +349,26 @@ pub fn same_type(x: &[Tok], y: &[Tok]) -> bool {
 /// The text a T-SQL dynamic SQL statement runs, when the code alone fixes it.
 pub fn tsql_text(stmt: &SyntaxNode) -> Text {
     let ts = tokens(stmt);
-    match tsql_text_of(stmt, &ts) {
+    match tsql_text_of(stmt, &ts, &mut Reader::default()) {
         Ok(Some(s)) => Text::Known(s),
         Ok(None) => Text::Null,
         Err(e) => Text::Unknown(e),
     }
 }
 
-fn tsql_text_of(stmt: &SyntaxNode, ts: &[Tok]) -> Result<Option<String>, String> {
+/// The assignment statements whose values the text of `stmt` is read from
+/// (`tsql_text`), by their text ranges: of these assignments, only those values
+/// reach the text. `None` when the text is not known (NULL is known): then
+/// any earlier assignment may reach it.
+pub fn tsql_text_sources(stmt: &SyntaxNode) -> Option<Vec<(usize, usize)>> {
+    let mut r = Reader::default();
+    tsql_text_of(stmt, &tokens(stmt), &mut r).ok()?;
+    Some(r.seen)
+}
+
+fn tsql_text_of(stmt: &SyntaxNode, ts: &[Tok], r: &mut Reader) -> Result<Option<String>, String> {
     let form = exec_form(ts).ok_or("not dynamic SQL")?;
     jumps(stmt)?;
-    let mut r = Reader { depth: 0 };
     match form {
         Form::Paren(s, e) => {
             if e + 1 != ts.len() {
@@ -459,8 +468,11 @@ struct Decl {
     len: Option<usize>,
 }
 
+#[derive(Default)]
 struct Reader {
     depth: usize,
+    /// The assignment statements read, in the order reached.
+    seen: Vec<(usize, usize)>,
 }
 
 impl Reader {
@@ -673,6 +685,8 @@ impl Reader {
             ));
         }
         let ts = tokens(p);
+        self.seen
+            .push((p.text_range().start().into(), p.text_range().end().into()));
         let is_var = |t: &Tok| t.kind == K::Var && t.text[1..].eq_ignore_ascii_case(name);
         match ts.as_slice() {
             [set, v, op, rest @ ..] if set.kind == K::Word && set.up == "SET" && is_var(v) => {
