@@ -1166,7 +1166,7 @@ sites = ["sqldiff-convert/src/cert.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-LEN-BMP"
-statement = "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
+statement = "Strings a T-SQL LEN counts, or a LIKE _ steps over, have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC): LEN counts the characters PostgreSQL length counts."
 discharge = "deployment"
 fact = "The data the routines see, or the collation."
 sites = ["sqldiff-convert/src/cert.rs", "sqldiff-core/profiles/rules/tsql-pg.rules", "sqldiff-core/src/equiv/canon.rs"]

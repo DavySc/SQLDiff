@@ -9,6 +9,9 @@
 //!   other character, and `-` inside brackets is a range or, at an end, a
 //!   literal whose order follows the collation: all refused here, as are
 //!   classes of several characters and negated ones.
+//! - T-SQL's `_` under a non-_SC collation matches no character outside the
+//!   BMP (`N'a😀' LIKE N'a_'` and `N'a__'` are both false); PostgreSQL's
+//!   matches one code point. The comparison notes `ASM-TSQL-LEN-BMP`.
 //! - PostgreSQL: `\` escapes the next character (the default ESCAPE), a
 //!   trailing lone `\` is refused; `[` is a literal.
 //!
@@ -116,6 +119,11 @@ pub fn canonical(p: &str, d: Dialect) -> Option<String> {
     .map(|t| render(&t))
 }
 
+/// Whether a pattern in the form `canonical` gives has a `_` wildcard.
+pub fn steps_one(canonical: &str) -> bool {
+    postgres(canonical).is_ok_and(|t| t.contains(&Tok::One))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +151,7 @@ mod tests {
         assert_eq!(canonical("a\\", Dialect::Postgres), None);
         // PostgreSQL's `\x` is the literal x.
         assert_eq!(canonical("a\\b", Dialect::Postgres).as_deref(), Some("ab"));
+        assert!(steps_one("a_%"));
+        assert!(!steps_one("a\\_%"));
     }
 }

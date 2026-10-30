@@ -194,6 +194,12 @@ fn like_with_a_literal_pattern_is_flagged() {
         )
     };
     flagged(&pair("a%", "a%"));
+    assert!(!ids(&pair("a%", "a%")).contains(&"ASM-TSQL-LEN-BMP"));
+    // T-SQL's `_` steps over no character outside the BMP (non-_SC
+    // collation; checked on SQL Server 2022), PostgreSQL's over one.
+    let r = pair("a_b", "a_b");
+    flagged(&r);
+    assert!(ids(&r).contains(&"ASM-TSQL-LEN-BMP"), "{:?}", ids(&r));
     flagged(&pair("%[%]%", "%\\%%"));
     flagged(&pair("a[_]b", "a\\_b"));
     flagged(&pair("a[[]b", "a[b"));
