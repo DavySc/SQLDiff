@@ -1,0 +1,16 @@
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+CREATE FUNCTION
+CREATE TRIGGER
+NOTICE:  top1-none found=f x=-1
+NOTICE:  top1-one (perform false inside) found=t x=1
+NOTICE:  update-trigger found=t
+NOTICE:  update rowcount=2
+NOTICE:  update-none found=f
+NOTICE:  delete-none found=f
+NOTICE:  select-into found=t
+DO
+DROP TABLE
+DROP TABLE
+DROP FUNCTION

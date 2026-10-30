@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 180 | 35 (19%) | 6 (3%) | 139 (77%) |
+| `converter` | 182 | 35 (19%) | 6 (3%) | 141 (77%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 209 | 38 (18%) | 8 (4%) | 163 (78%) |
+| **All** | 211 | 38 (18%) | 8 (4%) | 165 (78%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -132,6 +132,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.func.isnull` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.len` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string variable, parameter or literal of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.string_agg` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.geography.point-constant` | `converter` | engine | SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical | `sqldiff-convert/src/tsql/geography.rs` |
 | `tsql.global-temp` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.clustered` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.nulls-not-distinct` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
@@ -159,6 +160,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.routine.return-code` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | `INOUT return_code integer DEFAULT NULL` as the last parameter, the status set to 0 first | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.returns` | `converter` | lemma: `Sqldiff.Mirror/Parameter and return types` | int and slice string return types; others engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.view` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.rowcount.found` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.schema.authorization-dbo` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.select.assign` | `converter` | engine | `SELECT @x = e` without FROM as `x := e`; not read as an assignment by the Lean lowering | `sqldiff-convert/src/tsql.rs` |
 | `tsql.select.assign-into` | `converter` | lemma: `Sqldiff.Mirror/C3b queries/rule 4` | `SELECT @x = COUNT(*) FROM t [WHERE c]` into an int variable only (`SELECT COUNT(*) INTO x`); every other SELECT ... INTO engine (ASM-SELECT-ASSIGN-CARDINALITY) | `sqldiff-convert/src/tsql.rs` |

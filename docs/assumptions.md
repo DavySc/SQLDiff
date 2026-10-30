@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 56 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 105 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 106 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 211 |
+| | Total | 213 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -80,7 +80,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-CONCAT-NULL` | T-SQL sessions run with CONCAT_NULL_YIELDS_NULL ON (the default). | `deployment` | No session sets CONCAT_NULL_YIELDS_NULL OFF. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-CONCURRENT-WRITERS` | Other sessions can change the tables the routine reads while it runs. | `deployment` | Whether other sessions write the tables while the routine runs. | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-CONSTRAINT-ROWS-VALID` | The rows already in the table satisfy a constraint that ALTER TABLE … CHECK CONSTRAINT turns on: PostgreSQL's VALIDATE CONSTRAINT checks them, T-SQL does not. | `deployment` | The table holds no row that breaks the constraint when the statement runs. | `sqldiff-convert/src/tsql.rs` |
-| `ASM-CTE-MAXRECURSION` | A recursive CTE stays within T-SQL's recursion limit (the target has none). | `deployment` | The data never recurses deeper than the limit. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-CTE-MAXRECURSION` | A recursive CTE stays within T-SQL's recursion limit (the target has none). | `deployment` | The data never recurses deeper than the limit. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-CURSOR-GLOBAL` | No error or RETURN leaves a T-SQL cursor declared without LOCAL open (it would stay in the session and the next DECLARE of it would fail). | `deployment` | The routine is not left between the cursor's DECLARE and DEALLOCATE, or the database default is LOCAL cursors. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-CURSOR-ORDER` | What a cursor loop does does not depend on the order of rows its ORDER BY leaves open. | `nothing` | A per-routine review of the loop, or an ORDER BY on a unique key. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-CURSOR-SNAPSHOT` | A cursor loop fetches the rows its query gives at OPEN: no other session or trigger changes them during the loop, and the values do not depend on when a row is fetched. | `deployment` | No concurrent writers to the cursor's tables while the routine runs, and no time- or session-dependent functions in its query. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
@@ -162,6 +162,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-QUOTENAME-IDENT` | The result of QUOTENAME is used as an identifier, never as text, and is at most 128 characters. | `nothing` | A reading of how the routine uses the result. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAISERROR-FORMAT` | The variable RAISERROR takes as its message holds no % sign (T-SQL reads it as a format). | `deployment` | The values the routine puts in the message variable. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAISERROR-INFO` | Callers read an informational RAISERROR message by its text, not its message number (50000), severity or state, which a PostgreSQL notice does not carry. | `deployment` | How callers read informational messages. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-RAISERROR-SEVERITY` | A RAISERROR severity variable is not NULL and at most 18 (T-SQL raises error 2754 for 19 and above without WITH LOG, and for a NULL severity uses the value the variable held before). | `deployment` | The values the routine puts in the severity variable (verified on SQL Server 2022: above 10 is an error, 10 and below, negatives included, a message). | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAISERROR-TEXT` | A RAISERROR message is 1 to 2,047 characters long (T-SQL cuts a longer one and sends an empty one as a space). | `deployment` | The values the message is built from. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAND-PER-QUERY` | A statement with RAND() produces a single value (T-SQL evaluates it once per query, the target once per row). | `generated` | The converted statement draws the value once (a variable). | `sqldiff-convert/src/tsql.rs` |
 | `ASM-READ-COMMITTED` | The routine runs at READ COMMITTED (the default). | `deployment` | The isolation level of the callers' sessions. (fact key `isolation`) | `sqldiff-core/src/ir/behaviour.rs` |
@@ -175,6 +176,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-ROUTINE-LABEL` | A routine's STABLE, IMMUTABLE or DETERMINISTIC label is truthful. | `catalog` | The routine's body in the catalog. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-ROUTINE-REPLACE` | CREATE OR REPLACE replaces the existing routine (its parameter list is unchanged); otherwise the old one stays beside it. | `catalog` | The existing routine's signature on the target. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-ROW-*` | A row of the dialect's semantic profile holds as tabled (the rest of the id is the row). | `nothing` | The profile row checked against the engine (eval/ probes). | `sqldiff-core/src/ir/interp.rs` |
+| `ASM-ROWCOUNT-FOUND` | No INSTEAD OF trigger, no PostgreSQL BEFORE ROW trigger that returns NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through. | `catalog` | The triggers on the written tables and views in the catalog. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SAME-DATABASE-NAME` | The PostgreSQL database has the same name, letter for letter, as the SQL Server database (DB_NAME() becomes current_database()). | `deployment` | The database names on both sides. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-SCHEMA-OWNER` | The schema's owner on the target holds the privileges its owner holds on the source. | `deployment` | The roles and grants of the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-SELECT-ASSIGN-CARDINALITY` | A query that assigns variables returns at most one row. | `catalog` | A unique key over the query's predicate. | `sqldiff-convert/src/tsql.rs` |

@@ -24,6 +24,7 @@ use crate::tok::{
 use crate::{Note, Status};
 
 mod bits;
+mod geography;
 mod paging;
 mod temporal;
 mod trigger;
@@ -1615,6 +1616,35 @@ impl<'a> Cx<'a> {
     }
 
     fn if_stmt(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize, elsif: bool) {
+        if !elsif && !self.db2() {
+            if let Some(found) = self.rowcount_if(n) {
+                match found {
+                    Ok(found) => {
+                        self.note(Status::Assumptions, "ASM-ROWCOUNT-FOUND", "@@ROWCOUNT right after an INSERT, UPDATE, DELETE or a SELECT that assigns variables becomes FOUND: both tell whether the statement touched or returned a row (an AFTER trigger changes neither; checked on SQL Server 2022 and PostgreSQL 18). Equal when no INSTEAD OF trigger, no BEFORE ROW trigger returning NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on the written table: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL counts only the rows its triggers let through.");
+                        let cond = if found { "FOUND" } else { "NOT FOUND" };
+                        self.header_unit(
+                            out,
+                            n,
+                            indent,
+                            &format!("IF {cond} THEN"),
+                            "tsql.rowcount.found",
+                        );
+                        let branches: Vec<SyntaxNode> =
+                            n.children().filter(|c| c.kind() == BRANCH).collect();
+                        if let Some(b) = branches.first() {
+                            self.stmts(out, b, indent + INDENT);
+                        }
+                        if let Some(e) = branches.get(1) {
+                            out.lines(indent, "ELSE");
+                            self.stmts(out, e, indent + INDENT);
+                        }
+                        out.lines(indent, "END IF;");
+                        return;
+                    }
+                    Err(reason) => return self.refuse(out, n, indent, &reason),
+                }
+            }
+        }
         let cond = self.condition(n);
         if let Some(reason) = self.blocked() {
             if elsif {
@@ -1645,6 +1675,91 @@ impl<'a> Cx<'a> {
         if !elsif {
             out.lines(indent, "END IF;");
         }
+    }
+
+    /// `IF @@ROWCOUNT = 0` (`<> 0`, `> 0`; `= 1` after a SELECT TOP 1)
+    /// right after the statement it reads: Some(Ok(true)) for FOUND,
+    /// Some(Ok(false)) for NOT FOUND, Some(Err) when the condition reads
+    /// @@ROWCOUNT in a way FOUND cannot tell, None when it does not read it.
+    fn rowcount_if(&self, n: &SyntaxNode) -> Option<Result<bool, String>> {
+        let ts = n
+            .children()
+            .find(|c| c.kind() == CONDITION)
+            .map(|c| tokens(&c))?;
+        if !ts
+            .iter()
+            .any(|t| t.k == VARIABLE && t.s.eq_ignore_ascii_case("@@ROWCOUNT"))
+        {
+            return None;
+        }
+        let words: Vec<String> = ts
+            .iter()
+            .filter(|t| t.sig())
+            .map(|t| t.s.to_ascii_uppercase())
+            .collect();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let words = match words.as_slice() {
+            ["(", inner @ .., ")"] => inner,
+            w => w,
+        };
+        let test = match words {
+            ["@@ROWCOUNT", "=", "0"] => Some(false),
+            ["@@ROWCOUNT", "<>" | "!=" | ">", "0"] | ["@@ROWCOUNT", ">=", "1"] => Some(true),
+            ["@@ROWCOUNT", "=", "1"] => None,
+            _ => return Some(Err("@@ROWCOUNT other than `IF @@ROWCOUNT = 0` or `<> 0` right after the statement it reads: use GET DIAGNOSTICS n = ROW_COUNT right after the statement (no rule yet)".into())),
+        };
+        let mut prev = n.prev_sibling();
+        while prev.as_ref().is_some_and(|p| !p.kind().is_unit()) {
+            prev = prev.and_then(|p| p.prev_sibling());
+        }
+        let Some(prev) = prev.filter(|p| p.kind() == STATEMENT) else {
+            return Some(Err("IF @@ROWCOUNT that does not follow an INSERT, UPDATE, DELETE or SELECT in the same block: the count it reads is not known here".into()));
+        };
+        let pts = tokens(&prev);
+        let ds = crate::tok::depths(&pts);
+        let top: Vec<usize> = (0..pts.len())
+            .filter(|&i| pts[i].sig() && ds[i] == 0)
+            .collect();
+        let first = top.first().map(|&i| pts[i].up()).unwrap_or_default();
+        let has = |w: &str| top.iter().any(|&i| pts[i].is(w));
+        let ok = match first.as_str() {
+            "INSERT" | "UPDATE" | "DELETE" => !has("OUTPUT") && !has("EXEC") && !has("EXECUTE"),
+            // A SELECT that assigns variables from a table: FOUND is set when
+            // it returns a row, as @@ROWCOUNT counts the rows it returns.
+            "SELECT" => top
+                .iter()
+                .position(|&i| pts[i].is("FROM"))
+                .is_some_and(|f| {
+                    top[..f]
+                        .windows(2)
+                        .any(|w| pts[w[0]].k == VARIABLE && pts[w[1]].k == OP && pts[w[1]].s == "=")
+                }),
+            _ => false,
+        };
+        if !ok {
+            return Some(Err("IF @@ROWCOUNT after a statement other than INSERT, UPDATE, DELETE (without OUTPUT) or a SELECT that assigns variables from a table: not converted".into()));
+        }
+        let found = match test {
+            Some(f) => f,
+            // `= 1` is FOUND only when the statement returns at most one row.
+            None => {
+                // Not WITH TIES or PERCENT, which may return more rows.
+                let head: Vec<String> = sig(&pts).iter().take(6).map(|&i| pts[i].up()).collect();
+                let head: Vec<&str> = head.iter().map(String::as_str).collect();
+                let top1 = match head.as_slice() {
+                    ["SELECT", "TOP", "(", "1", ")", rest @ ..]
+                    | ["SELECT", "TOP", "1", rest @ ..] => {
+                        !matches!(rest.first(), Some(&"WITH" | &"PERCENT"))
+                    }
+                    _ => false,
+                };
+                if !top1 {
+                    return Some(Err("IF @@ROWCOUNT = 1 after a statement that may touch more than one row: FOUND only tells whether there was a row (no rule yet)".into()));
+                }
+                true
+            }
+        };
+        Some(Ok(found))
     }
 
     fn while_stmt(&mut self, out: &mut Out, n: &SyntaxNode, indent: usize) {
@@ -1974,7 +2089,7 @@ impl<'a> Cx<'a> {
             "CONTINUE" => "CONTINUE".into(),
             "THROW" => self.throw(&ts)?,
             "RAISERROR" if self.db2() => return no("RAISERROR: severity decides whether it is an error at all; rewrite as SIGNAL (an error or a warning SQLSTATE)"),
-            "RAISERROR" => self.raiserror(&ts)?,
+            "RAISERROR" => self.raiserror(&ts, ind)?,
             "BEGIN" if matches!(w(1).as_str(), "TRAN" | "TRANSACTION") => self.txn("BEGIN", &ts)?,
             "COMMIT" => self.txn("COMMIT", &ts)?,
             "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
@@ -2710,7 +2825,29 @@ impl<'a> Cx<'a> {
     }
 
     fn dml(&mut self, ts: &[T]) -> R<String> {
-        let ts = Self::body_toks(ts);
+        let mut ts = Self::body_toks(ts);
+        // A closing `OPTION (MAXRECURSION n)`: the recursion limit of the
+        // statement's CTEs, which ASM-CTE-MAXRECURSION states. Dropped as
+        // in a SELECT; other hints stay as written.
+        if let Some(o) = find_word(&ts, 0, "OPTION") {
+            if let Some(r) = next_sig(&ts, o).and_then(|p| matching(&ts, p)) {
+                let hint: Vec<String> = sig(&ts[o..=r]).iter().map(|&j| ts[o + j].up()).collect();
+                let last = sig(&ts).last().copied();
+                if last == Some(r)
+                    && hint.len() == 5
+                    && hint[2] == "MAXRECURSION"
+                    && hint[3].bytes().all(|b| b.is_ascii_digit())
+                {
+                    self.note(
+                        Status::Converted,
+                        "tsql.query-hints",
+                        "OPTION (MAXRECURSION n) was dropped: PostgreSQL has no recursion limit (a recursive CTE carries ASM-CTE-MAXRECURSION).",
+                    );
+                    self.step_ts("tsql.query-hints", &ts[o..=r]);
+                    ts.truncate(o);
+                }
+            }
+        }
         let s = sig(&ts);
         if let Some(o) = find_word(&ts, 0, "OUTPUT") {
             if self.db2() {
@@ -4008,7 +4145,9 @@ impl<'a> Cx<'a> {
     /// may use `%s`, `%d`, `%i` and `%%` only. Checked on SQL Server 2022:
     /// a NULL argument shows as `(null)`, so each value becomes
     /// `COALESCE(value, '(null)')` (PostgreSQL would show `<NULL>`).
-    fn raiserror(&mut self, ts: &[T]) -> R<String> {
+    /// `ind`: the statement's column, which the caller strips from every
+    /// line but the first.
+    fn raiserror(&mut self, ts: &[T], ind: usize) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
         let form = || No("RAISERROR form not understood".into());
@@ -4026,21 +4165,31 @@ impl<'a> Cx<'a> {
         if args.len() < 3 {
             return Err(form());
         }
+        let var = |cx: &Self, t: &T| -> Option<(String, Dt)> {
+            let v = cx.vars.get(&t.s.get(1..)?.to_ascii_lowercase())?;
+            (t.k == VARIABLE && !t.s.starts_with("@@")).then(|| (v.name.clone(), v.dt))
+        };
+        // A severity variable (an int) decides at run time: above 10 an
+        // error, otherwise a message (negative ones too).
+        let mut severity = None;
         let error = match trimmed(args[1]) {
             [t] if t.k == NUMBER => match t.s.parse::<u32>() {
                 Ok(0..=10) => false,
                 Ok(11..=18) => true,
                 _ => return no("RAISERROR severity 19 or more: needs WITH LOG and ends the connection from 20; rewrite by hand"),
             },
-            _ => return no("RAISERROR with a severity that is not a literal: whether it is an error or a message depends on its value"),
+            [t] if t.k == VARIABLE => match var(self, t) {
+                Some((name, Dt::Int)) => {
+                    severity = Some(name);
+                    true
+                }
+                _ => return no("RAISERROR with a severity variable that is not a declared int, smallint or tinyint: not converted"),
+            },
+            _ => return no("RAISERROR with a severity that is not a literal or a variable: whether it is an error or a message depends on its value"),
         };
         if error && self.trigger.is_some() {
             return self.misplaced("RAISERROR of severity 11 or more in a trigger: T-SQL carries on with the trigger, PostgreSQL fails the statement that fired it");
         }
-        let var = |cx: &Self, t: &T| -> Option<(String, Dt)> {
-            let v = cx.vars.get(&t.s.get(1..)?.to_ascii_lowercase())?;
-            (t.k == VARIABLE && !t.s.starts_with("@@")).then(|| (v.name.clone(), v.dt))
-        };
         // The PostgreSQL format, its values, and whether any value is shown.
         let mut fmt = String::new();
         let mut values = Vec::new();
@@ -4116,6 +4265,16 @@ impl<'a> Cx<'a> {
         }
         let fmt = fmt.replace('\'', "''");
         let values: String = values.iter().map(|v| format!(", {v}")).collect();
+        if let Some(sev) = severity {
+            self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-by-severity");
+            self.note(Status::Assumptions, "ASM-RAISERROR-SEVERITY", "The severity variable is not NULL and at most 18: T-SQL raises error 2754 instead for a severity of 19 or more without WITH LOG, and for a NULL severity uses whatever value the variable held before it became NULL (SQL Server 2022).");
+            self.note(Status::Assumptions, "ASM-THROW-ERRCODE", "The T-SQL error number (50000), severity and state are not carried over: callers see SQLSTATE P0001 with the same message.");
+            self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
+            let pad = " ".repeat(ind);
+            return Ok(format!(
+                "IF {sev} > 10 THEN\n{pad}  RAISE EXCEPTION '{fmt}'{values} USING ERRCODE = 'P0001';\n{pad}ELSE\n{pad}  RAISE NOTICE '{fmt}'{values};\n{pad}END IF;"
+            ));
+        }
         if error {
             self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-exception");
             self.note(Status::Assumptions, "ASM-THROW-ERRCODE", "The T-SQL error number (50000), severity and state are not carried over: callers see SQLSTATE P0001 with the same message.");
@@ -6607,6 +6766,7 @@ impl<'a> Cx<'a> {
         let paged = self.paging(ts);
         let ts: &[T] = &paged;
         let mut edits = self.bit_edits(ts);
+        self.geography_edits(ts, &mut edits);
         if let Some(outer) = self.bit_outer.take() {
             edits.wrap(outer);
         }
@@ -7513,6 +7673,27 @@ impl<'a> Cx<'a> {
                     self.note(Status::NotConverted, "tsql.charindex", "CHARINDEX of a computed needle: CHARINDEX finds an empty needle nowhere (0), strpos at 1, so the needle must be tested first. Store it in a variable, then convert.");
                     return None;
                 }
+            }
+            // CHARINDEX(x, s, start): searching from `start` is searching
+            // the whole string when start < 1, and NULL when start is NULL.
+            // PostgreSQL's strpos has no start, so it searches
+            // substr(s, start) (the whole string for start < 1, NULL for
+            // NULL) and adds start - 1 back; a position of 0 (not found) and
+            // an empty needle give 0. `- 1 + greatest(start, 1)` cannot
+            // overflow, as `strpos + start - 1` could for an empty needle
+            // and start 2147483647. Checked against SQL Server 2022 under a
+            // case-sensitive collation for 576 needle, string and start
+            // combinations (NULL, empty, negative, 0, past the end, the int
+            // bounds): eval/builtins/2026-10-30-am. Every argument is read
+            // more than once, so each must be safe to evaluate twice.
+            ("CHARINDEX", 3) => {
+                if !(simple_operand(a[0]) && simple_operand(a[1]) && additive_operand(a[2])) {
+                    self.note(Status::NotConverted, "tsql.charindex", "CHARINDEX with a start position whose arguments are computed: the PostgreSQL form reads each argument more than once. Store them in variables, then convert.");
+                    return None;
+                }
+                self.ci_note();
+                let (x, y, st) = (e(self, 0), e(self, 1), e(self, 2));
+                format!("((strpos(substr({y}, {st}), {x}) - 1 + greatest({st}, 1)) * (strpos(substr({y}, {st}), {x}) > 0 AND length({x}) > 0)::int)")
             }
             ("NEWID", 0) => "gen_random_uuid()".into(),
             ("DB_NAME", 0) => {
@@ -9672,6 +9853,23 @@ fn nonempty_literal(ts: &[T]) -> bool {
         }
         _ => false,
     }
+}
+
+/// Simple operands joined by `+` or `-` (`EndPosition + 1`): safe to
+/// evaluate twice.
+fn additive_operand(ts: &[T]) -> bool {
+    let ts = trimmed(ts);
+    let ds = crate::tok::depths(ts);
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for (i, t) in ts.iter().enumerate() {
+        if t.k == OP && (t.s == "+" || t.s == "-") && ds[i] == 0 {
+            parts.push(&ts[from..i]);
+            from = i + 1;
+        }
+    }
+    parts.push(&ts[from..]);
+    parts.iter().all(|p| simple_operand(p))
 }
 
 /// One variable, column name or literal: safe to evaluate twice.

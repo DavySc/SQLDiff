@@ -434,3 +434,50 @@ CREATE OR REPLACE TRIGGER tr_update AFTER UPDATE ON orders REFERENCING NEW TABLE
         r.unknown_reasons
     );
 }
+
+/// RAISERROR of severity 11 to 18 ignores the trigger's XACT_ABORT: the
+/// T-SQL trigger goes on and the statement that fired it is kept, where
+/// PostgreSQL fails it (SQL Server 2022). ASM-TRIGGER-ERROR does not cover
+/// it, even for a RAISERROR that is the trigger's last statement.
+#[test]
+fn a_raiserror_error_in_a_trigger_is_not_compared() {
+    let insert =
+        "INSERT INTO audit_log (order_id, action, qty) SELECT order_id, 'u', qty FROM inserted;";
+    let tsql = |body: &str| {
+        format!("CREATE TRIGGER dbo.orders_tu ON dbo.orders FOR UPDATE AS\nBEGIN\n{body}\nEND")
+    };
+    let pg = |body: &str| orders_tu_pg(&format!("{body}\n  RETURN NULL;"), FRAME);
+    let raise = "  RAISE EXCEPTION 'boom' USING ERRCODE = 'P0001';";
+    for (t, p) in [
+        (
+            format!("  RAISERROR('boom', 16, 1);\n  {insert}"),
+            format!("{raise}\n  {insert}"),
+        ),
+        (
+            format!("  {insert}\n  RAISERROR('boom', 16, 1);"),
+            format!("  {insert}\n{raise}"),
+        ),
+    ] {
+        let r = run(&tsql(&t), &pg(&p));
+        assert!(!equal(&r), "{t}\n{:?}", r.assumptions);
+        assert!(
+            r.unknown_reasons
+                .iter()
+                .any(|x| x.contains("does not end the T-SQL trigger")),
+            "{:?}",
+            r.unknown_reasons
+        );
+    }
+    // A message carries on on both sides.
+    let r = run(
+        &tsql(&format!("  RAISERROR('note', 10, 1);\n  {insert}")),
+        &pg(&format!("  RAISE NOTICE 'note';\n  {insert}")),
+    );
+    assert!(
+        !r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("does not end the T-SQL trigger")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
