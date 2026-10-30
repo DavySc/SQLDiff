@@ -266,6 +266,8 @@ pub struct Canon<'a> {
     /// The column types of each cursor's query, by key, from its OPEN
     /// (`cursor_op`); kept across statements.
     cursor_cols: HashMap<String, Vec<Option<Ty>>>,
+    /// Why a cursor's OPEN was not read, by cursor key: its FETCHes say so.
+    cursor_failed: HashMap<String, String>,
 }
 
 /// Lower-case hex digits of a byte string written in hex, `None` unless
@@ -406,6 +408,7 @@ impl<'a> Canon<'a> {
             excluded: None,
             sub_bits: HashMap::new(),
             cursor_cols: HashMap::new(),
+            cursor_failed: HashMap::new(),
             by_name: false,
             fold_quoted: false,
             names: Vec::new(),
@@ -3393,8 +3396,17 @@ impl<'a> Canon<'a> {
         use super::cursor::CursorOp;
         match op {
             CursorOp::Open { key, query, tsql } => {
-                let q = query.as_ref().map_err(Clone::clone)?;
-                let (mut parts, items) = self.query_parts(q, QCtx::Scalar)?;
+                let read = query
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|q| self.query_parts(q, QCtx::Scalar));
+                let (mut parts, items) = match read {
+                    Ok(x) => x,
+                    Err(e) => {
+                        self.cursor_failed.insert(key.clone(), e.clone());
+                        return Err(e);
+                    }
+                };
                 let from: Vec<Term> = parts.get(1).map(|f| f.kids().to_vec()).unwrap_or_default();
                 let order: Vec<Term> = parts.get(5).map(|o| o.kids().to_vec()).unwrap_or_default();
                 if order.is_empty() || !self.total_order(&from, &order) {
@@ -3410,11 +3422,17 @@ impl<'a> Canon<'a> {
                 Ok(n("cursor-open", vec![a(key.clone()), n("q", parts)]))
             }
             CursorOp::Fetch { key, targets } => {
-                let cols = self
-                    .cursor_cols
-                    .get(key)
-                    .cloned()
-                    .ok_or("a FETCH whose cursor's OPEN was not read")?;
+                let cols = match self.cursor_cols.get(key) {
+                    Some(c) => c.clone(),
+                    None => {
+                        return Err(match self.cursor_failed.get(key) {
+                            Some(why) => format!(
+                                "a FETCH of a cursor whose query was not read (in its OPEN: {why})"
+                            ),
+                            None => "a FETCH whose cursor's OPEN was not read".into(),
+                        })
+                    }
+                };
                 if cols.len() != targets.len() {
                     return Err(
                         "a FETCH into another number of variables than the cursor has columns"
