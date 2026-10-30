@@ -17,6 +17,7 @@ pub mod dynamic;
 pub mod edit;
 pub mod eval;
 pub mod literal;
+pub mod objcheck;
 pub mod lower;
 pub mod options;
 pub mod schema;
