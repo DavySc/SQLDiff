@@ -150,6 +150,13 @@ BEGIN
   RAISE NOTICE '%', o;
   RAISE NOTICE 'V3 NULL = TRUE is unknown: %', CASE WHEN (v = TRUE) IS NULL THEN 'yes' ELSE 'no' END;
   RAISE NOTICE 'V3 NOT NULL is unknown: %', CASE WHEN (NOT v) IS NULL THEN 'yes' ELSE 'no' END;
+  DECLARE iv integer; bv boolean := TRUE;
+  BEGIN
+    iv := bv;
+    RAISE NOTICE 'V3 boolean TRUE stored into integer: no error, value=%', iv;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE NOTICE 'V3 boolean TRUE stored into integer: error %', SQLSTATE;
+  END;
 END; $$;
 CALL v3();
 

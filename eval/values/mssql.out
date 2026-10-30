@@ -32,6 +32,7 @@ V3 bit + 0: type=int
 V3 bit = 2 with bit 1: not true
 V3 three-valued: [1: =1 not=0 not<>1 <>0 notnull] [0: not=1 =0 <>1 not<>0 notnull] [N: not=1 not=0 not<>1 not<>0 isnull]
 V3 NULL = 1 is: unknown
+V3 bit 1 stored into int: no error, value=1
 V4 DATEFORMAT ydm: date=2024-01-02 datetime2=2024-01-02T03:04:05 (datetime=2024-02-01T00:00:00)
 V4 DATEFORMAT dmy: date=2024-01-02 datetime2=2024-01-02T03:04:05.500000
 V4 LANGUAGE British: date=2024-01-02 datetime2=2024-01-02T03:04:05.123456

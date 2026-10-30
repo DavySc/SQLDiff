@@ -322,7 +322,7 @@ def whyRowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr)
 
 /-- Why `countPick` refuses its target. -/
 def whyCount (d : Dialect) (env : TyEnv) (x : Var) : List String :=
-  if intVar d env x then [] else ["stmt:select:target:" ++ varDetail env x]
+  if intVarW d env x == some .i32 then [] else ["stmt:select:target:" ++ varDetail env x]
 
 /-- Why `lowerSelectT` refuses T-SQL `SELECT ...`. -/
 def whySelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=

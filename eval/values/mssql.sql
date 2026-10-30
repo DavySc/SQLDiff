@@ -195,6 +195,15 @@ BEGIN
   END
   PRINT @out;
   PRINT 'V3 NULL = 1 is: ' + CASE WHEN @v = 1 THEN 'true' WHEN NOT (@v = 1) THEN 'false' ELSE 'unknown' END;
+  DECLARE @iv int;
+  SET @b = 1;
+  BEGIN TRY
+    SET @iv = @b;
+    PRINT 'V3 bit 1 stored into int: no error, value=' + CAST(@iv AS varchar(11));
+  END TRY
+  BEGIN CATCH
+    PRINT 'V3 bit 1 stored into int: error ' + CAST(ERROR_NUMBER() AS varchar(11));
+  END CATCH
 END
 GO
 EXEC dbo.v3;

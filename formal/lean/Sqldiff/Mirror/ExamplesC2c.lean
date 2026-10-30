@@ -88,7 +88,7 @@ BEGIN
   INSERT INTO dbo.Ev (Id, D, T, B, N) VALUES (@id, @d, @t, 1, @n);
   UPDATE dbo.Ev SET B = 0, D = DATEADD(day, 1, D) WHERE Id = @id;
   SELECT @n = N, @d = D FROM dbo.Ev WHERE Id = @id;
-  SELECT @n = COUNT(*) FROM dbo.Ev;
+  SELECT @i = COUNT(*) FROM dbo.Ev;
 END
 ```
 
@@ -132,7 +132,7 @@ BEGIN
     v_d := sqldiff_r.sqldiff_c2;
   END LOOP;
   END;
-  SELECT COUNT(*) INTO v_n FROM Ev;
+  SELECT COUNT(*) INTO v_i FROM Ev;
 END; $$;
 ```
 -/
@@ -184,7 +184,7 @@ def bodyT : List Ast.Node := [
   ins ["dbo", "Ev"] ["Id", "D", "T", "B", "N"] [[tv "@id", tv "@d", tv "@t", num 1, tv "@n"]],
   upd ["dbo", "Ev"] [("B", num 0), ("D", dateadd "day" (num 1) (tc "D"))] (some keyT),
   selectT [asg "@n" (tc "N"), asg "@d" (tc "D")] ["dbo", "Ev"] (some keyT),
-  selectT [asg "@n" countStarE] ["dbo", "Ev"] none]
+  selectT [asg "@i" countStarE] ["dbo", "Ev"] none]
 
 def declsP : List Ast.Stmt :=
   [.Declare "v_d" (some date) none, .Declare "v_b" (some boolean) none,
@@ -218,7 +218,7 @@ def bodyP : List Ast.Node := [
   .Txn "COMMIT" none,
   forBlock [als (pv "N") "sqldiff_c1", als (pv "D") "sqldiff_c2"] ["Ev"] (some keyP)
     [field "v_n" "sqldiff_r" "sqldiff_c1", field "v_d" "sqldiff_r" "sqldiff_c2"],
-  .NStmt (.SSelect (sel [item countStarE] ["Ev"] none [pv "v_n"]))]
+  .NStmt (.SSelect (sel [item countStarE] ["Ev"] none [pv "v_i"]))]
 
 def procT (body : List Ast.Node := bodyT) (ps : List Ast.Param := paramsT) : Ast.Routine :=
   tsqlProc ["dbo", "p"] ps ([xactAbort, nocount] ++ body)
@@ -522,8 +522,9 @@ def checkS (x : String) (vt : Ast.Expr) (y : String) (vp : Ast.Expr) : Answer :=
 #guard reasonOf (checkS "@flag" (str "TRUE") "p_flag" tru) == reasonOutsideT
 #guard reasonOf (checkS "@flag" (.Bin "=" (tv "@id") (num 1)) "p_flag" (.Bin "=" (pv "p_id") (num 1)))
   == reasonOutsideT
--- A bit into an `int` is the C1 path, as any value outside the slice.
-#guard isC1 (checkS "@id" (tv "@flag") "p_id" (pv "p_flag"))
+-- A bit into an `int`: T-SQL stores 0 or 1, PL/pgSQL raises 22P02 (V3).
+#guard reasonOf (checkS "@id" (tv "@flag") "p_id" (pv "p_flag")) == reasonOutsideT
+#guard reasonOf (checkS "@id" (tv "@when") "p_id" (pv "p_when")) == reasonOutsideT
 -- Dates: the ISO literals, a date into a timestamp; a timestamp into a
 -- date, a wider precision, other literal forms: outside.
 #guard isC2a (checkS "@when" (str "2024-02-29") "p_when" (str "2024-02-29"))
@@ -612,12 +613,15 @@ def depk : Deployment := { depv with tables := depv.tables ++ [("dbo.EvK", "evk"
 #guard (lowerT depv Γv (procT [ins ["dbo", "Ev"] ["Id", "B", "S"] [[num 1, num 1, num 7]]])).isSome
 #guard (lowerT depv Γv (procT [ins ["dbo", "Ev"] ["Id", "B", "T"] [[num 1, num 1, str "2024-01-01"]]])).isNone
 #guard (lowerT depv Γv (procT [ins ["dbo", "Ev"] ["Id", "B", "T"] [[num 1, num 1, tv "@when"]]])).isSome
--- `COUNT(*)` into a `bigint` (C3b rule 4 widened), not into a `smallint`.
+-- `COUNT(*)` into an `int` only: into a `bigint` T-SQL still overflows at
+-- 2^31 rows and PostgreSQL does not; into a `smallint` it may not fit.
 #guard (lowerT depv Γv (procT [selectT [asg "@n" countStarE] ["dbo", "Ev"] none,
-  declT "@n" bigint none])).isSome
+  declT "@n" bigint none])).isNone
 #guard (lowerT depv Γv (procT [selectT [asg "@s" countStarE] ["dbo", "Ev"] none,
   declT "@s" smallint none])).isNone
 #guard (lowerP Γv (pgProc ["p"] [] [.Declare "v_n" (some bigint) none]
+  [.NStmt (.SSelect (sel [item countStarE] ["Ev"] none [pv "v_n"]))])).isNone
+#guard (lowerP Γv (pgProc ["p"] [] [.Declare "v_n" (some integer) none]
   [.NStmt (.SSelect (sel [item countStarE] ["Ev"] none [pv "v_n"]))])).isSome
 -- A pick of a bigint column into an int variable, or a timestamp into a
 -- date, is outside; into its own type or wider it is in.

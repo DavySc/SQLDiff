@@ -30,6 +30,7 @@ NOTICE:  V2 COUNT(*) into bigint: value=3 count type=bigint
 NOTICE:  V3 three-valued: [1: =1 not=0 not<>1 <>0 notnull] [0: not=1 =0 <>1 not<>0 notnull] [0: not=1 not=0 not<>1 not<>0 isnull]
 NOTICE:  V3 NULL = TRUE is unknown: yes
 NOTICE:  V3 NOT NULL is unknown: yes
+NOTICE:  V3 boolean TRUE stored into integer: error 22P02
 NOTICE:  V4 DateStyle SQL, DMY: date=2024-01-02 timestamp=2024-01-02T03:04:05.000000
 NOTICE:  V4 DateStyle Postgres, YMD: date=2024-01-02 timestamp=2024-01-02T03:04:05.500000
 NOTICE:  V4 DateStyle German, DMY: date=2024-01-02 timestamp=2024-01-02T03:04:05.123456

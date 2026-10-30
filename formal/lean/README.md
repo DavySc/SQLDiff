@@ -215,7 +215,7 @@ convert --to postgres` writes (`tsql.bit.compare`, `tsql.bit.store`,
 |---|---|---|
 | Integer widths | T-SQL `smallint`/`int`/`bigint` against `smallint`/`int2`, `integer`/`int`/`int4`, `bigint`/`int8`; `+ - * /` at the wider operand's width, overflow raises (8115 against 22003); two `smallint`s give a `smallint` on both; `smallint` division only by a literal other than 0 and -1 (`-32768 / -1` is 32768 on both, no error); `%` keeps its literal-divisor rule; comparisons across widths | V1 |
 | Integer literals | PostgreSQL types a constant beyond the `int` range `bigint`; T-SQL types it `numeric(p,0)`, so it is in the slice only as the whole value stored into a `bigint` or compared with one (an exact conversion), never as an arithmetic operand | V2 |
-| Stores between widths | widening keeps the value; a narrowing store is in the spec only when the value provably fits (a literal in range, or a value of the target's width or narrower), on every path (`int` 40000 into `smallint` is 220 against 22003); `COUNT(*)` into an `int` or a `bigint` variable, never a `smallint` | V2 |
+| Stores between widths | widening keeps the value; a narrowing store is in the spec only when the value provably fits (a literal in range, or a value of the target's width or narrower), on every path (`int` 40000 into `smallint` is 220 against 22003); `COUNT(*)` into an `int` variable only: into a `bigint` T-SQL still raises 8115 beyond 2^31-1 rows (its `COUNT` is `int`) and PostgreSQL's `bigint` count does not; a `bit`, date or timestamp stored into an integer is outside (T-SQL stores a bit as 0/1, PL/pgSQL raises 22P02) | V2, V3 |
 | `bit` against `boolean` | stores from the literals `0`/`1` against `FALSE`/`TRUE`, NULL or another bit; the comparisons `@b = 1`, `= 0`, `<> 1`, `<> 0` against `b = TRUE`, `= FALSE`, `<> TRUE`, `<> FALSE` (either operand order) lower to the variable or its `NOT`, three-valued alike on both; `IS [NOT] NULL`; any other store (`2`, an int, a string) or comparison is outside; never a key column | V3 |
 | Literals | `'YYYY-MM-DD'` where a date is read, `'YYYY-MM-DDThh:mm:ss[.f]'` with at most `p` digits where a `datetime2(p)`/`timestamp(p)` is read, in a store, a comparison, a parameter default, a column default, or under `CAST(... AS date \| datetime2(p) \| timestamp(p))`: the ISO 8601 forms, which neither `DATEFORMAT`/`LANGUAGE` nor `DateStyle` affect; more fractional digits than kept are outside (both engines round, not alike at a half: `.1234565` is `.123457` against `.123456`); every other form is outside, as a store too | V4 |
 | Comparisons and stores | `= <> < <= > >=` of two dates or two timestamps; a date against a timestamp at midnight (`toTs`); a date into a `date`, a timestamp of at most `p` digits into a `datetime2(p)`, a date into a timestamp (midnight); a timestamp into a date (both truncate) and into a narrower precision (both round) are outside; `CAST(x AS date)` of a timestamp drops the time | V4, V5 |
@@ -228,7 +228,8 @@ Outside, by decision: `datetime2(7)` and `datetime2` without a precision
 (no PostgreSQL mirror), `datetime`, `smalldatetime`, `datetimeoffset`,
 `time`, `tinyint`, `decimal` (a later part); reads of the clock
 (`SYSDATETIME()`, `GETDATE()`, `now()`, `clock_timestamp()`), `DATEPART`,
-`EOMONTH`, formatting and string conversions; `bit` in arithmetic,
+`EOMONTH`, formatting and string conversions; `COUNT(*)` into a
+`bigint` (see the table); `bit` in arithmetic,
 `COALESCE`/`ISNULL` with a number, or against another bit; `@s + 1` stored
 back into a `smallint` (the literal is an `int`, so the sum is, and the
 store narrows). A variable of one of these types is still read on the C1

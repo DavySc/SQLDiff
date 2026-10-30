@@ -841,8 +841,12 @@ bigint, smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table
   the target's range, or a value of the target's width or narrower; the
   rest is outside, on every path (as for strings, "String stores, on
   every path"). `COUNT(*)` is a T-SQL `int` and a PostgreSQL `bigint`
-  (probed, V2), so it stores into an `int` or a `bigint` variable (C3b
-  rule 4), never a `smallint`.
+  (probed, V2), so it stores into an `int` variable only (C3b rule 4, as
+  before): into a `bigint` T-SQL still raises 8115 beyond 2^31-1 rows
+  and PostgreSQL does not (the 2^31 rows are not probed; the types
+  are), into a `smallint` both may raise. A `bit`, date or timestamp
+  value stored into an integer is outside too: T-SQL stores a bit as 0
+  or 1 and PL/pgSQL raises 22P02 (probed, V3).
 * `COALESCE`, `ISNULL`, `CASE` over integers of several widths take the
   widest (the highest precedence in T-SQL; PostgreSQL 10.5 resolves to
   the common type); `ISNULL(x, y)` keeps `x`'s type, so `y` must fit it.
@@ -2428,10 +2432,14 @@ def rowPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (o
     some (.query t.toDef c (.row orNull (sets.map fun (x, e, _) => (x, e))))
   else none
 
-/-- `.count`: an `int` target that the condition does not read. -/
+/-- `.count`: an `int` target that the condition does not read. (C2c) Not
+a `bigint` target: T-SQL `COUNT(*)` is `int` and raises 8115 beyond
+2^31-1 rows whatever the target, PostgreSQL's `count` is `bigint` and
+fits a `bigint` target (eval/values V2: the types), so the two differ
+there, which the core's `count` (an overflow on both) does not show. -/
 def countPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) (x : Var) :
     Option Stmt :=
-  if pickTarget d env x (.int .i32) && !(Core.Expr.varsOpt c).contains x then
+  if intVarW d env x == some .i32 && !(Core.Expr.varsOpt c).contains x then
     some (.query t.toDef c (.count x))
   else none
 
@@ -3364,8 +3372,13 @@ def storeOkTy (d : Dialect) (ty : Option Ast.Ty) (isNull : Bool) (vt : Option (S
     -- bit, date or timestamp slot must be of its type (a timestamp into a
     -- date, a wider precision, a number into a bit: outside).
     | some (.int t), some (v, .int w) => fitsSTy (.int t) (v, .int w)
-    -- Anything else into an integer: the C1 path, as before.
-    | some (.int _), some _ => true
+    | some (.int _), some (_, .nul) => true
+    -- A string into an integer: the C1 path, as before (C2b).
+    | some (.int _), some (_, .str ..) => true
+    -- (C2c) A bit, a date, a timestamp or a condition into an integer:
+    -- outside. T-SQL stores a bit as 0 or 1, PL/pgSQL raises 22P02
+    -- (eval/values V3); a date into an integer fails in both, differently.
+    | some (.int _), some _ => false
     | some (.str n wt), some (_, v) =>
       -- No length and every character: any value is kept.
       if n.isNone && (wt || (d matches .pg _ _)) then true else
