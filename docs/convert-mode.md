@@ -23,6 +23,8 @@ A statement the engine never compared never counts as converted. Every reason th
 
 A rule never guesses: if any part of a statement has no rule (for example `@@ERROR`, `UPDATE … FROM` with a join, `DATEDIFF(week, …)`), the whole statement is commented out and marked not converted.
 
+Every rule id a note or a trace step carries (`tsql.ctl.if`, `pg.sqlstate`, `idiom.rollback-rethrow`, a rule-file head such as `len/length`) is registered in `crates/sqldiff-core/profiles/rule-proofs.toml` with what backs it, a lemma of the Lean lowering, a vendor fact or the engine alone; [proof-coverage.md](proof-coverage.md) is generated from that registry.
+
 ### Idiom rules
 
 Before a statement is commented out, it goes to the idiom rules (`sqldiff_core::rules`, see [idiom-rules.md](idiom-rules.md)), which recognise whole patterns rather than tokens: `MERGE` and `IF EXISTS` upserts → `INSERT … ON CONFLICT`, `IF NOT EXISTS … INSERT` → `ON CONFLICT DO NOTHING`, the `LEFT JOIN … IS NULL` delete → `NOT EXISTS`, `INSERT` + `SCOPE_IDENTITY()` → `RETURNING … INTO` or `lastval()`, and `sp_getapplock` with its return-code check → `pg_advisory_xact_lock`. Their output replaces the comment when they convert the statement completely, with their notes (and an `idiom-rules` note naming the rules) on the unit. Patterns that span statements (`INSERT` + `SCOPE_IDENTITY`, `sp_getapplock` + its check) become one unit, since the token rules cannot see them as a pair.
