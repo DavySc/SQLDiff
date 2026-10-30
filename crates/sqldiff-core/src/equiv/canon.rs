@@ -4282,6 +4282,9 @@ impl<'a> Canon<'a> {
                     .flatten()
             })
             .collect();
+        // A member lowered again starts from the state before the first
+        // lowering: assumptions it added and tables it numbered go with it.
+        let before = self.clone();
         let (mut ps, is) = loop {
             let outer = self.rec_bounds.len();
             for ((c, _), b) in typed.iter().zip(&bounds) {
@@ -4322,6 +4325,7 @@ impl<'a> Canon<'a> {
                     *b = None;
                 }
             }
+            *self = before.clone();
         };
         if is.len() != typed.len() {
             return Err(format!(
@@ -7305,7 +7309,6 @@ fn charindex_sub<'e>(l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
         .then_some((&pos[0], x))
 }
 
-/// An integer of at most 32 bits that is not a T-SQL bit.
 /// `(substr s 1 n)` for LEFT, `(substr s (charlen(s) - n + 1) n)` for
 /// RIGHT: the terms PostgreSQL's substr forms lower to.
 fn substr_end(right: bool, s: Term, k: Term) -> Term {
@@ -7329,6 +7332,7 @@ fn fits_int32(b: Bound) -> bool {
     b.0 <= 1 && b.1 < 1 << 30
 }
 
+/// An integer of at most 32 bits that is not a T-SQL bit.
 fn is_int32(t: &Option<Ty>) -> bool {
     t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| (2..=32).contains(&l)))
 }
