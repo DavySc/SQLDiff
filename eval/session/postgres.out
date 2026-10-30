@@ -1,0 +1,6 @@
+NOTICE:  table "t" does not exist, skipping
+NOTICE:  R0 SET rowcount = 1: error 42704
+NOTICE:  R1 rows updated, as the routine counts them: 3, as the caller counts them afterwards: 3
+NOTICE:  R2 DELETE of 3 rows leaves 0
+NOTICE:  R2 INSERT of 3 rows inserts 3
+NOTICE:  R3 key pick=30 count=3 exists=1 subquery=20

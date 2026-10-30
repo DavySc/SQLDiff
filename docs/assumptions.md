@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 57 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 106 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 107 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 213 |
+| | Total | 214 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -230,6 +230,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TSQL-PLUS-IS-CONCAT` | Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates. | `catalog` | The operands' types. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-QUOTED-IDENTIFIER` | The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string. | `deployment` | The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier). | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-RETURN-NULL-WARNING` | Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides). | `deployment` | How callers handle messages. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
+| `ASM-TSQL-ROWCOUNT-0` | Callers run the routine with SET ROWCOUNT 0 (the default): a caller's SET ROWCOUNT n is inherited by the routine and limits the rows its INSERT, UPDATE, DELETE and SELECT statements touch or read; PostgreSQL has no such setting (probed on SQL Server 2022, eval/session). | `deployment` | The session settings of the callers: no SET ROWCOUNT other than 0 before a call. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-STRING-AGG-8000` | The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that). | `deployment` | The data never aggregates a longer list. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-STRING-ARGS` | Every argument a caller passes to a converted T-SQL routine is a value of the parameter's declared type: a string fits the declared length (and, for varchar, its code page), an int, bigint, smallint, bit, date or datetime2(p) argument is of that type (T-SQL truncates a string, narrows or rounds a value of another type on entry, silently or with an error, and turns 1.5 passed to an int into 1; PostgreSQL's caller passes the value of its own type or finds no routine). | `deployment` | What callers pass. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-SYSDATETIME-PER-STATEMENT` | SYSDATETIME() is evaluated once per statement (observed SQL Server behaviour, not documented; fact V20). | `nothing` | Vendor fact V20 documented or checked. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |

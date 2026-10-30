@@ -128,7 +128,8 @@ def p3P (h : List Ast.Node := [raiseP "dup"]) : Ast.Routine :=
 
 #guard isC2a (check depd Γd idCert p3T p3P)
 #guard residualOf depd Γd p3T ==
-  some ["ASM-TSQL-STRING-ARGS", "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN", "ASM-THROW-ERRCODE"]
+  some ["ASM-TSQL-STRING-ARGS", "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN", "ASM-THROW-ERRCODE",
+    "ASM-TSQL-ROWCOUNT-0"]
 -- Key 1 exists: the caller sees the routine's own error, of kind `user`.
 #guard runD (lowerT depd Γd p3T) [I 1] db0 == some (.failed .user [])
 #guard runD (lowerP Γd p3P) [I 1] db0 == some (.failed .user [])
@@ -168,7 +169,8 @@ def p4P (h : List Ast.Node := [reraiseP]) : Ast.Routine :=
 
 #guard isC2a (check depd Γd idCert p4T p4P)
 #guard residualOf depd Γd p4T ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-CATCH-CORE-ERRORS", "ASM-NO-CALLER-TXN"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-CATCH-CORE-ERRORS",
+    "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 /-- Row 9's `total` is at the top of the range. -/
 def dbFull : Db Unit := [("acct", [[I 9, N, I 2147483647]]), ("pair", [])]
 -- Key 4: the row is inserted, then `Total + 1` overflows on row 9. Both
@@ -218,7 +220,8 @@ def p2P (body : List Ast.Node := p4BodyP ++ [txn "COMMIT"]) (sec : Ast.Security 
 
 #guard isC2a (check depd Γd idCert p2T p2P)
 #guard residualOf depd Γd p2T ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN",
+    "ASM-TSQL-ROWCOUNT-0"]
 -- The unguarded `ROLLBACK; THROW;`: the body opens and commits the transaction.
 #guard isC2a (check depd Γd idCert (p2T [txn "ROLLBACK", rethrowT]) p2P)
 -- The same without `BEGIN TRAN ... COMMIT` in either.
@@ -233,7 +236,8 @@ def p5P (body : List Ast.Node := [insAcctP (pv "p_id") (num 1), txn "COMMIT"]) :
   pgProc ["p5"] [inP "p_id"] [] body
 
 #guard isC2a (check depd Γd idCert p5T p5P)
-#guard residualOf depd Γd p5T == some ["ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+#guard residualOf depd Γd p5T ==
+  some ["ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 
 /-! ### A `COMMIT` after each statement T-SQL commits on its own
 
@@ -254,9 +258,10 @@ def autoP (body : List Ast.Node := [insAcctP (pv "p_id") (num 1), txn "COMMIT", 
 #guard isC2a (check depd Γd idCert autoT (autoP [insAcctP (pv "p_id") (num 1), bumpAllP]))
 -- The T-SQL routine has no transaction statement; its conversion's `COMMIT`s name the assumption.
 #guard (lowerT depd Γd autoT).map (residual autoT · (pgTxn (autoP))) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN",
+    "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depd Γd autoT).map (residual autoT ·) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depd Γd autoT).map (usesC4 autoT · (pgTxn (autoP))) == some true
 -- A `COMMIT` inside an exception block is outside the spec (P13).
 #guard reasonOf (check depd Γd idCert autoT

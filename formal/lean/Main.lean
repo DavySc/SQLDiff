@@ -129,6 +129,15 @@ confirmed). A pair whose variables' declared types differ is answered
 "the declared types of the variables do not correspond". New reason
 codes `type:<name>`, `expr:date-literal`, `expr:bit-literal`,
 `expr:dateadd:part`, `expr:datediff:part`, `node:call:type`.
+
+0.15.0 names one more residual, `ASM-TSQL-ROWCOUNT-0`, in a `"c2a"`
+answer whose T-SQL routine has a data statement or a query (`"statements"`
+`"c3a"` or `"c3b"`): callers run the routine with `SET ROWCOUNT 0`, the
+default. A caller's `SET ROWCOUNT n` is inherited by the routine and
+limits the rows its `INSERT`, `UPDATE`, `DELETE` and `SELECT` statements
+touch or read, and PostgreSQL has no such setting (eval/session). No
+other answer changes; a reader that does not know the id must not treat
+the answer as a C2a one. Request format unchanged.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -183,7 +192,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.14.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.15.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0
