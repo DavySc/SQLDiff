@@ -24,6 +24,7 @@ use crate::tok::{
 use crate::{Note, Status};
 
 mod bits;
+mod geography;
 mod paging;
 mod temporal;
 mod trigger;
@@ -6607,6 +6608,7 @@ impl<'a> Cx<'a> {
         let paged = self.paging(ts);
         let ts: &[T] = &paged;
         let mut edits = self.bit_edits(ts);
+        self.geography_edits(ts, &mut edits);
         if let Some(outer) = self.bit_outer.take() {
             edits.wrap(outer);
         }
