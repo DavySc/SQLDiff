@@ -1,0 +1,4 @@
+psql:callee-case-postgres.sql:7: NOTICE:  procedure look(pg_catalog.int4) does not exist, skipping
+psql:callee-case-postgres.sql:9: NOTICE:  callee look: no error, v 7
+psql:callee-case-postgres.sql:10: NOTICE:  callee LOOK: no error, v 7
+psql:callee-case-postgres.sql:11: NOTICE:  callee PUBLIC.LOOK: no error, v 7
