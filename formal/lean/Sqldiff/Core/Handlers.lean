@@ -138,7 +138,7 @@ theorem exec_leaf_error (es : ExprSem U) (wm : WorldModel U W) (n : Nat) (s : St
     (h : exec es wm (n + 1) s st = .error k st') : st' = st := by
   cases s with
   | ret e => cases e <;> simp only [exec] at h <;> (try split at h) <;> (cases h <;> rfl)
-  | query t c p =>
+  | query q p =>
     simp only [exec] at h
     split at h
     · cases h; rfl
@@ -239,7 +239,7 @@ theorem exec_db_of_noWrite (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .assign x e, st, _ => by
     simp only [exec]
     cases e.eval es st.store nullStore <;> rfl
-  | _ + 1, .query t c p, st, _ => by
+  | _ + 1, .query q p, st, _ => by
     simp only [exec]
     split
     · rfl
@@ -705,7 +705,7 @@ theorem exec_noRet (es : ExprSem U) (wm : WorldModel U W) :
   | _ + 1, .delete t c, st, _, v, st' => by
     simp only [exec]
     split <;> simp
-  | _ + 1, .query t c p, st, _, v, st' => by
+  | _ + 1, .query q p, st, _, v, st' => by
     simp only [exec]
     split
     · simp

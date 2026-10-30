@@ -1,0 +1,29 @@
+NOTICE:  database "probe_c3d" does not exist, skipping
+NOTICE:  Q11 on-pooling: join-on-where=2 comma=2 cross=2 all-in-on=2
+NOTICE:  Q11 product: a x b=12 a x b x c=36
+NOTICE:  Q11 null join key: a.id=2 joins=0 self on NULL=0
+NOTICE:  Q11 self-join: x.bid=y.id rows=3 y.id=x.id rows=4
+NOTICE:  Q11 pick by key across a join: n=30 m=200
+NOTICE:  Q11 pick, no row (NULL join key): n=-1 m=-1
+NOTICE:  Q11 pick through a self-join: n=20
+NOTICE:  Q11 pick, two-column key fixed from another table: v=21
+NOTICE:  Q11 exists over a join: FALSE
+NOTICE:  Q11 exists over a cross join: TRUE
+NOTICE:  Q12 unqualified name in two tables: error 42702
+NOTICE:  Q12 aliased table's own name: error 42P01
+NOTICE:  Q12 one exposed name twice: error 42712
+NOTICE:  Q12 ON names a later table: error 42P01
+NOTICE:  Q12 ON names a comma table: error 42P01
+NOTICE:  Q12 aliases swap the table names: no error
+NOTICE:  Q12 alias folded: no error
+NOTICE:  Q12 alias hides the table name: b.n=10 a.m=200
+NOTICE:  Q12 qualifier that is an integer variable: v=10
+NOTICE:  Q12 qualifier that is a record variable: error 42702
+NOTICE:  Q12 qualifier that is the loop record: error 55000
+NOTICE:  Q12 qualifier that is the routine name: error 42702
+-1
+NOTICE:  Q12 column of the second table and a variable: error 42702
+NOTICE:  Q13 scalar over a join, n > 30: v=NULL
+NOTICE:  Q13 scalar over a join, n > 20: v=200
+NOTICE:  Q13 scalar over a join, n > 5: error 21000, v=-1
+NOTICE:  Q13 two rows: error 21000 reaches the caller, v=-1

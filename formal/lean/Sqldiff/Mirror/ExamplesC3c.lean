@@ -124,7 +124,7 @@ def addP : Ast.Routine := procP addBodyP addDeclsP
 -- `NOT NULL` column can fail (`XACT_ABORT ON`), after a write; the T-SQL
 -- parameter `@c` is a string. No string comparison: no collation fact.
 #guard residualOf depc Γc addT ==
-  some ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
+  some ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depc Γc addT).map Core.Routine.hasQuery == some true
 
 /- The lowered `INSERT`: the left-out columns with a default, `City` and

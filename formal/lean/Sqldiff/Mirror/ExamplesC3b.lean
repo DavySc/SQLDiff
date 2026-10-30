@@ -141,20 +141,21 @@ def lookP (body : List Ast.Node := lookBodyP) (ps : List Ast.Param :=
 #guard isC2a (checkQ lookT lookP)
 -- `COUNT(*)` can overflow (2^31 rows); `Id = @id` compares with `=`.
 #guard residualOf depq Γq lookT ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depq Γq lookT).map Core.Routine.hasQuery == some true
 -- The `EXISTS` variable is a local of both lowered routines.
 #guard (lowerT depq Γq lookT).map (·.locals) == some [existsVar]
 #guard (lowerP Γq lookP).map (·.locals) == some [existsVar]
 
 /- The lowered T-SQL `SELECT @q = Qty, @t = Total ... WHERE Id = @id`, as
-the core sees it. -/
+the core sees it: (C3d) a block of one source, whose columns are `0.c`
+(`Core.srcCol`). -/
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q", ioT "@t"]
     [selectT [asg "@q" (tc "Qty"), asg "@t" (tc "Total")] ["dbo", "Acct"] (some keyT)])).map
     (·.body) ==
   some (.seq (.assign statusVar (.lit 0))
-    (.query acctDef (some (.sc (.cmp .eq (.col "id") (.var "@id"))))
-      (.row false [("@q", .sc (.col "qty")), ("@t", .sc (.col "total"))])))
+    (.query ⟨⟨[acctDef], [.sc (.cmp .eq (.col "0.id") (.var "@id"))]⟩⟩
+      (.row false [("@q", .sc (.col "0.qty")), ("@t", .sc (.col "0.total"))])))
 
 /- Nothing can fail without `COUNT` (a `WHERE` and values that cannot
 raise): in the slice without `XACT_ABORT ON`. -/
@@ -255,7 +256,8 @@ def selAcct (wh : Option Ast.Expr) (items : List Ast.SelItem := [asg "@q" (tc "Q
 -- A select list without assignments (a result set), or mixed.
 #guard (lowerT depq Γq (selAcct (some keyT) [item (tc "Qty")])).isNone
 #guard (lowerT depq Γq (selAcct (some keyT) [asg "@q" (tc "Qty"), item (tc "Total")])).isNone
--- `TOP`, `ORDER BY`, an alias, a hint, a join: outside the shape.
+-- `TOP`, `ORDER BY`, a hint: outside the shape. (C3d: an alias and a
+-- join are in, `ExamplesC3d`.)
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"] [.NStmt (.SSelect
   (.Select [] false [] false (some (num 1)) [asg "@q" (tc "Qty")] [] false
     [.Table ["dbo", "Acct"] none []] (some keyT) [] none [] none none [] none))])).isNone
@@ -264,7 +266,7 @@ def selAcct (wh : Option Ast.Expr) (items : List Ast.SelItem := [asg "@q" (tc "Q
     [.Table ["dbo", "Acct"] none ["NOLOCK"]] (some keyT) [] none [] none none [] none))])).isNone
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"] [.NStmt (.SSelect
   (.Select [] false [] false none [asg "@q" (tc "Qty")] [] false
-    [.Table ["dbo", "Acct"] (some "a") []] (some keyT) [] none [] none none [] none))])).isNone
+    [.Table ["dbo", "Acct"] (some "a") []] (some keyT) [] none [] none none [] none))])).isSome
 -- In a function.
 #guard (lowerT depq Γq (.Routine .Function ["f"] [inT "@id"] (some int) .Caller none
   (.Block [] [declT "@q" none, selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT),
@@ -327,11 +329,15 @@ def okFor : Ast.Node :=
   [.While (existsT ["dbo", "Acct"] none) [del ["dbo", "Acct"] none]])).isNone
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id"]
   [.If (.Bin "AND" (existsT ["dbo", "Acct"] none) (.Bin ">" (tv "@id") (num 0))) [] []])).isNone
--- A scalar subquery that is part of a value, or without the key fixed.
+-- A scalar subquery that is part of a value.
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"]
   [set (tv "@q") (.Bin "+" (.Subquery (sel [item (tc "Qty")] ["dbo", "Acct"] (some keyT))) (num 1))])).isNone
+-- (C3d) A scalar subquery without the key fixed is in: more than one row
+-- is the core's `cardinality` error, as on both engines (eval/queries
+-- Q5, Q13). It can fail, so without `XACT_ABORT ON` the routine is no
+-- C2a confirmation (`ExamplesC3d`).
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"]
-  [set (tv "@q") (.Subquery (sel [item (tc "Qty")] ["dbo", "Acct"] (some (.Bin "=" (tc "Qty") (tv "@id")))))])).isNone
+  [set (tv "@q") (.Subquery (sel [item (tc "Qty")] ["dbo", "Acct"] (some (.Bin "=" (tc "Qty") (tv "@id")))))])).isSome
 
 /-! ## Refused: the shapes differ
 
@@ -389,10 +395,16 @@ would be 2; the count then sets 0. Seen without the count: -/
 #guard runD (lowerT depq Γq (lookT (lookBodyT.take 3))) [I 1, I 4, I 4, I 4] [("acct", [])] ==
   some (.done [I 4, I 4, I 2, I 0] none 0 [("acct", [])] [])
 /- A database that breaks the key (two rows with key 1): no engine can
-be in this state (the primary key, `ASM-TABLES-AS-DECLARED`); the core
-takes the last row in list order, the same on both sides, which is no
-claim about either engine (eval/queries Q2). -/
-#guard runD lT [I 1, N, N, N] [("acct", [[I 1, I 10, I 0], [I 1, I 11, I 1]])] ==
-  some (.done [I 11, I 1, I 2, I 0] none 0 [("acct", [[I 1, I 10, I 0], [I 1, I 11, I 1]])] [])
+be in this state (the primary key, `ASM-TABLES-AS-DECLARED`). The
+`SELECT @q = ...` takes the last row in list order, the same on both
+sides, which is no claim about either engine (eval/queries Q2); (C3d) the
+scalar subquery `SET @t = (SELECT Total ... WHERE Id = @id)` then sees
+two rows and raises `cardinality`, as both engines would (eval/queries
+Q5, Q13), the same on both sides. -/
+def badKey : Db Unit := [("acct", [[I 1, I 10, I 0], [I 1, I 11, I 1]])]
+#guard runD lT [I 1, N, N, N] badKey == some (.failed .cardinality [])
+#guard runD lP [I 1, N, N, N] badKey == runD lT [I 1, N, N, N] badKey
+#guard runD (lowerT depq Γq (lookT (lookBodyT.take 1))) [I 1, N, N, N] badKey ==
+  some (.done [I 11, I 1, N, I 0] none 0 badKey [])
 
 end Sqldiff.Mirror.ExamplesC3b

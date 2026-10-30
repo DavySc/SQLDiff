@@ -165,8 +165,8 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.rowcount.found` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.schema.authorization-dbo` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.select.assign` | `converter` | engine | `SELECT @x = e` without FROM as `x := e`; not read as an assignment by the Lean lowering | `sqldiff-convert/src/tsql.rs` |
-| `tsql.select.assign-into` | `converter` | lemma: `Sqldiff.Mirror/C3b queries/rule 4` | `SELECT @x = COUNT(*) FROM t [WHERE c]` into an int variable only (`SELECT COUNT(*) INTO x`); every other SELECT ... INTO engine (ASM-SELECT-ASSIGN-CARDINALITY) | `sqldiff-convert/src/tsql.rs` |
-| `tsql.select.assign-loop` | `converter` | lemma: `Sqldiff.Mirror/C3b queries/rule 1` | one plain table, a WHERE that fixes every primary-key column, int or fitting string targets, procedures only; other queries engine | `sqldiff-convert/src/tsql.rs` |
+| `tsql.select.assign-into` | `converter` | lemma: `Sqldiff.Mirror/C3b queries/rule 4` | `SELECT @x = COUNT(*) FROM ... [WHERE c]` over a table or (C3d) a block of tables, into an int variable only (`SELECT COUNT(*) INTO x`); every other SELECT ... INTO engine (ASM-SELECT-ASSIGN-CARDINALITY) | `sqldiff-convert/src/tsql.rs` |
+| `tsql.select.assign-loop` | `converter` | lemma: `Sqldiff.Mirror/C3b queries/rule 1` | one plain table or (C3d) a block of them (inner and cross joins, comma lists, aliases, qualified names) whose every table the key closure determines, int or fitting string targets, procedures only; other queries engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.select.dummy-from` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.select.top` | `converter` | engine | PostgreSQL LIMIT engine; Db2 for i FETCH FIRST below the outer query rests on V32 (ASM-FACT-V32) | `sqldiff-convert/src/tsql/paging.rs` |
 | `tsql.sequence` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
@@ -186,7 +186,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.stmt.result-set` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.return` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | the `return-code` form in a procedure (`return_code := COALESCE(e, 0); RETURN;`); the trigger form (`RETURN NULL`) engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.set-option` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
-| `tsql.stmt.set-variable` | `converter` | lemma: `Sqldiff.Mirror/Statements` | `SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM t WHERE c)` (C3b rule 2); compound operators (`+=`) engine | `sqldiff-convert/src/tsql.rs` |
+| `tsql.stmt.set-variable` | `converter` | lemma: `Sqldiff.Mirror/Statements` | `SET @x = e` with `e` in the slice (`x := e`), and `SET @x = (SELECT e FROM ...)` over a table or (C3d) a block of tables, more than one row the cardinality error (C3b rule 2); compound operators (`+=`) engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.sqlcmd-include` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.throw` | `converter` | lemma: `Sqldiff.Mirror/C4 errors and transactions/THROW and RAISE EXCEPTION` | a literal number from 50000, a literal message and state (`raise`), and `THROW;` directly in a handler (`rethrow`, 'Re-raising'); variables as arguments engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.truncate` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

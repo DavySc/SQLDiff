@@ -257,11 +257,14 @@ def autoP (body : List Ast.Node := [insAcctP (pv "p_id") (num 1), txn "COMMIT", 
 -- Without the `COMMIT`s too: they change nothing a finished call shows.
 #guard isC2a (check depd Γd idCert autoT (autoP [insAcctP (pv "p_id") (num 1), bumpAllP]))
 -- The T-SQL routine has no transaction statement; its conversion's `COMMIT`s name the assumption.
+-- (Review of C3d: the routine can fail, so it names the assumption on its
+-- own too: an error that leaves it dooms a caller's T-SQL transaction,
+-- eval/queries Q15.)
 #guard (lowerT depd Γd autoT).map (residual autoT · (pgTxn (autoP))) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN",
     "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depd Γd autoT).map (residual autoT ·) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depd Γd autoT).map (usesC4 autoT · (pgTxn (autoP))) == some true
 -- A `COMMIT` inside an exception block is outside the spec (P13).
 #guard reasonOf (check depd Γd idCert autoT

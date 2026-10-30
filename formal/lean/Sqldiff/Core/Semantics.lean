@@ -64,6 +64,9 @@ inductive ErrClass where
   | constraint
   | other (code : String)
   | user
+  /-- (C3d) More than one row where a scalar subquery needs at most one:
+  T-SQL 512, PostgreSQL 21000. -/
+  | cardinality
 deriving DecidableEq, Repr
 
 def ErrKind.cls : ErrKind → ErrClass
@@ -72,6 +75,7 @@ def ErrKind.cls : ErrKind → ErrClass
   | .constraint => .constraint
   | .other c => .other c
   | .user => .user
+  | .cardinality => .cardinality
 
 /-- The result of evaluating an expression: a value (possibly NULL) or an
 error. -/
@@ -561,33 +565,71 @@ def deleteRows (ev : Store U → Expr → Res U) (t : TableDef) (c : Option Expr
       | .error k => .error k
       | .ok rs' => .ok (if b then rs' else r :: rs')
 
-/-! ## Queries (C3b)
+/-! ## Queries (C3b, C3d)
 
-A query reads one table and assigns variables (`Stmt.query`, `Pick`).
-The vendor rules are on the lowering (`Sqldiff.Mirror`, "The C3b slice:
-queries"). -/
+A query reads a block of tables and assigns variables (`Stmt.query`,
+`Block`, `Pick`). The vendor rules are on the lowering (`Sqldiff.Mirror`,
+"The C3b slice: queries", "The C3d blocks"). -/
 
-/-- The rows where `c` is TRUE, in list order; the first error wins. -/
-def keptRows (ev : Store U → Expr → Res U) (t : TableDef) (c : Option Expr) :
-    List (Row U) → Except ErrKind (List (Row U))
-  | [] => .ok []
-  | r :: rs => match keeps ev (rowStore t.cols r) c with
-    | .error k => .error k
-    | .ok b => match keptRows ev t c rs with
+/-- The columns of a tuple of rows, one row per source of a block from
+position `i` on: the name `j.c` (`srcCol`) is column `c` of the row of
+source `j`. A name goes to the first source that has it (`ownerFrom`);
+any other name is NULL. -/
+def tupleStore : Nat → List TableDef → List (Row U) → Store U
+  | i, t :: ts, r :: rs => fun n =>
+    if (srcCols i t).any (·.name == n) then rowStore (srcCols i t) r n
+    else tupleStore (i + 1) ts rs n
+  | _, _, _ => nullStore
+
+/-- Every way of taking one element of each list, the first list varying
+slowest: the product of a block's sources, as nested loops in `FROM`
+order. -/
+def tuples {α : Type} : List (List α) → List (List α)
+  | [] => [[]]
+  | rs :: rss => rs.flatMap fun r => (tuples rss).map (r :: ·)
+
+/-- A block's conditions on one tuple, left to right, the first error
+winning: TRUE when every condition is TRUE (FALSE and UNKNOWN drop the
+tuple). -/
+def keepsAll (ev : Store U → Expr → Res U) (ρ : Store U) : List Expr → Except ErrKind Bool
+  | [] => .ok true
+  | c :: cs => match ev ρ c with
+    | .err k => .error k
+    | .ok v => match keepsAll ev ρ cs with
       | .error k => .error k
-      | .ok rs' => .ok (if b then r :: rs' else rs')
+      | .ok b => .ok (isTrue v && b)
+
+/-- The tuples a block keeps, in order; the first error wins. -/
+def keptTuples (ev : Store U → Expr → Res U) (b : Block) :
+    List (List (Row U)) → Except ErrKind (List (List (Row U)))
+  | [] => .ok []
+  | T :: Ts => match keepsAll ev (tupleStore 0 b.srcs T) b.conds with
+    | .error k => .error k
+    | .ok k => match keptTuples ev b Ts with
+      | .error e => .error e
+      | .ok Ts' => .ok (if k then T :: Ts' else Ts')
+
+/-- The rows of a block on a database: the tuples of its sources' rows
+where every condition is TRUE. -/
+def blockRows (ev : Store U → Expr → Res U) (b : Block) (db : Db U) :
+    Except ErrKind (List (List (Row U))) :=
+  keptTuples ev b (tuples (b.srcs.map fun t => db.get t.name))
 
 /-- Each variable of `xs` gets the value in its position, left to right. -/
 def Store.setAll (σ : Store U) : List Var → List (Val U) → Store U
   | x :: xs, v :: vs => (σ.set x v).setAll xs vs
   | _, _ => σ
 
-/-- What a pick makes of the kept rows: the new store, or an error. -/
-def pickRows (ev : Store U → Expr → Res U) (t : TableDef) (σ : Store U) (rows : List (Row U)) :
-    Pick → Except ErrKind (Store U)
-  | .row orNull sets => match rows.getLast? with
+/-- What a pick makes of the kept tuples of a block with sources `srcs`:
+the new store, or an error. (C3d) A scalar subquery (`orNull`) with more
+than one row raises `cardinality`. -/
+def pickRows (ev : Store U → Expr → Res U) (srcs : List TableDef) (σ : Store U)
+    (rows : List (List (Row U))) : Pick → Except ErrKind (Store U)
+  | .row orNull sets =>
+    if orNull && 1 < rows.length then .error .cardinality else
+    match rows.getLast? with
     | none => .ok (if orNull then σ.setAll (sets.map (·.1)) (sets.map fun _ => .null) else σ)
-    | some r => match evalVals ev (rowStore t.cols r) (sets.map (·.2)) with
+    | some r => match evalVals ev (tupleStore 0 srcs r) (sets.map (·.2)) with
       | .error k => .error k
       | .ok vs => .ok (σ.setAll (sets.map (·.1)) vs)
   | .count x => match (toInt32 rows.length : Res U) with
@@ -660,10 +702,10 @@ def exec (es : ExprSem U) (wm : WorldModel U W) : Nat → Stmt → State U W →
   | _ + 1, .raise k, st => .error k st
   | _ + 1, .reraise, st => .error (.other "reraise") st
   | _ + 1, .commit, st => .normal st
-  | _ + 1, .query t c p, st =>
-    match keptRows (fun ρ e => e.eval es st.store ρ) t c (st.db.get t.name) with
+  | _ + 1, .query q p, st =>
+    match blockRows (fun ρ e => e.eval es st.store ρ) q.blk st.db with
     | .error k => .error k st
-    | .ok rows => match pickRows (fun ρ e => e.eval es st.store ρ) t st.store rows p with
+    | .ok rows => match pickRows (fun ρ e => e.eval es st.store ρ) q.blk.srcs st.store rows p with
       | .error k => .error k st
       | .ok σ => .normal { st with store := σ }
 

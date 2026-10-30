@@ -259,9 +259,10 @@ pub const ROWCOUNT_0: &str = "ASM-TSQL-ROWCOUNT-0";
 
 /// Residual ids the checker names whenever a routine needs them, so a
 /// `c2a` confirmation without one proves the converter's note of it.
-/// Not every residual: `ASM-NO-CALLER-TXN` is named only around handlers
-/// and transaction control, while an error that ends a plain routine also
-/// meets the caller's transaction.
+/// Not every residual: `ASM-NO-CALLER-TXN` is named around handlers,
+/// transaction control and (checker 0.16.0) whenever an error can leave the
+/// routine, but the converter notes it for more than these (a `COMMIT`
+/// after an autocommitted statement), so its absence discharges nothing.
 pub const NAMED_WHEN_NEEDED: [&str; 1] = ["ASM-CONCAT-NULL"];
 
 /// Converter assumptions a `c2a` confirmation in the C4 slice (`errors`
@@ -478,22 +479,33 @@ fn written_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
     }
 }
 
-/// The tables in a query's `FROM`, as written (C3b: the checker reads only
-/// a one-table `FROM`; anything else is refused there).
+/// The tables in a query's `FROM`, as written: each item of the list and,
+/// (C3d) inside a join, both sides (the checker reads inner and cross joins
+/// of catalog tables; other joins and sources are refused there).
 fn from_tables(q: &Select, out: &mut Vec<Vec<String>>) {
-    for f in &q.from {
-        if let From::Table { name, .. } = f {
-            if !out.contains(name) {
-                out.push(name.clone());
+    fn walk(f: &From, out: &mut Vec<Vec<String>>) {
+        match f {
+            From::Table { name, .. } => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
             }
+            From::Join { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            _ => {}
         }
+    }
+    for f in &q.from {
+        walk(f, out);
     }
 }
 
 /// The tables a routine's queries read, as written, in the shapes the
 /// checker's C3b slice reads: `SELECT @x = ...`, `SET @x = (SELECT ...)`,
 /// `IF [NOT] EXISTS (SELECT ...)` (formal/lean/Sqldiff/Mirror/Lower.lean,
-/// "The C3b slice: queries").
+/// "The C3b slice: queries"), (C3d) over every table of a join.
 fn read_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
     for n in nodes {
         match n {
@@ -1095,7 +1107,12 @@ fn request_with(
         }
         let (to, dbo) = target_routine(w);
         let Some(t) = tables.get(&to) else { continue };
-        if trusted.binary_collation && tables.declared(&to) != Some(w.as_slice()) {
+        // Spelt exactly as the DDL declares it, whatever the collation the
+        // deployment states: in a case-sensitive SQL Server database
+        // `dbo.ORD` does not reach `dbo.Ord` (208, Invalid object name),
+        // while PostgreSQL folds both to `ord`. A table named any other way
+        // is not sent, so the checker refuses what reads or writes it.
+        if tables.declared(&to) != Some(w.as_slice()) {
             continue;
         }
         if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
@@ -1710,6 +1727,79 @@ END
             "GO\nCREATE PROCEDURE dbo.q AS BEGIN ALTER TABLE dbo.Acct ADD z int NULL; END\n",
         ] {
             assert!(tables(extra).get("acct").is_none(), "{extra}");
+        }
+    }
+
+    /// C3d: every table of a join, on either side and in a comma list, is
+    /// sent to the checker; a table the routine does not read is not.
+    #[test]
+    fn the_tables_of_a_join_reach_the_checker() {
+        let ddl =
+            "CREATE TABLE dbo.Ord (Id int NOT NULL PRIMARY KEY, Qty int NULL, CustId int NULL);\n\
+                   CREATE TABLE dbo.Cust (Id int NOT NULL PRIMARY KEY, Score int NULL);\n\
+                   CREATE TABLE dbo.Two (A int NOT NULL, B int NOT NULL, V int NULL, \
+                   CONSTRAINT PK_Two PRIMARY KEY (A, B));\n\
+                   CREATE TABLE dbo.Idle (Id int NOT NULL PRIMARY KEY);\n";
+        let proc = "CREATE PROCEDURE dbo.p @id int, @q int OUTPUT AS\nBEGIN\n  \
+                    SELECT @q = c.Score FROM dbo.Ord AS o JOIN dbo.Cust c ON c.Id = o.CustId \
+                    WHERE o.Id = @id;\n  \
+                    SELECT @q = COUNT(*) FROM dbo.Ord o, dbo.Two CROSS JOIN dbo.Cust;\nEND\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let t = Tables::read(&[ddl], &[&convert(ddl)], Dialect::Tsql, Dialect::Postgres);
+        let a = routines(proc, Dialect::Tsql).remove(0).2.unwrap();
+        let b = routines(&convert(proc), Dialect::Postgres)
+            .remove(0)
+            .2
+            .unwrap();
+        let trusted = Trusted {
+            tables: t.clone(),
+            ..Default::default()
+        };
+        let (r, asm) = mirror_request(&a, &b, &[], &trusted).unwrap();
+        let names: Vec<&str> = r.table_catalog.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["ord", "cust", "two"], "{r:?}");
+        assert_eq!(
+            r.tables,
+            [("dbo.Ord", "ord"), ("dbo.Cust", "cust"), ("dbo.Two", "two")]
+                .map(|(x, y)| (x.to_string(), y.to_string()))
+        );
+        assert!(asm.iter().any(|x| x == TABLES_AS_DECLARED), "{asm:?}");
+        // Reads send no rows-affected count.
+        assert!(!asm.iter().any(|x| x == "ASM-OBSERVER-ROWCOUNT"), "{asm:?}");
+        // A table named in another case than its DDL, or without the schema
+        // its DDL gives, is not sent, whatever the collation the deployment
+        // states: a case-sensitive SQL Server database raises 208 for
+        // `dbo.ORD` where PostgreSQL folds it to `ord` (review of C3d).
+        for (spelt, binary) in [
+            ("dbo.ORD", false),
+            ("dbo.ord", false),
+            ("ORD", false),
+            ("Ord", false),
+            ("DBO.Ord", false),
+            ("dbo.ORD", true),
+        ] {
+            let p = format!(
+                "CREATE PROCEDURE dbo.p @id int, @q int OUTPUT AS\nBEGIN\n  \
+                 SELECT @q = c.Score FROM {spelt} AS o JOIN dbo.Cust c ON c.Id = o.CustId \
+                 WHERE o.Id = @id;\nEND\n"
+            );
+            let a = routines(&p, Dialect::Tsql).remove(0).2.unwrap();
+            let b = routines(&convert(&p), Dialect::Postgres)
+                .remove(0)
+                .2
+                .unwrap();
+            let trusted = Trusted {
+                tables: t.clone(),
+                binary_collation: binary,
+                ..Default::default()
+            };
+            let (r, _) = mirror_request(&a, &b, &[], &trusted).unwrap();
+            let names: Vec<&str> = r.table_catalog.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["cust"], "{spelt}: {r:?}");
         }
     }
 

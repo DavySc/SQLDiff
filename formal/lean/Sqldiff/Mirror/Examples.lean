@@ -463,7 +463,7 @@ caller sees of that after the failure differs between the dialects (C4),
 so the answer names `ASM-STATE-AFTER-ERROR`, and the failed observation
 above has no world. -/
 #guard (residualOf dep Γ callThenDivT) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 /- A callee's own error (a duplicate key, say) is not in the core, where a
 call never fails. Without `SET XACT_ABORT ON`, SQL Server goes on after
 the failed `EXEC` and sets `@r = 1`; PostgreSQL's `CALL` fails and ends
@@ -478,7 +478,7 @@ def calleeP : Ast.Routine :=
     [set (pv "r") (num 0), .Call ["log_value"] [arg pa false] none, set (pv "r") (num 1)]
 #guard isC1 (check dep Γ pairCert (calleeT []) calleeP)
 #guard isC2a (check dep Γ pairCert (calleeT [xactAbort]) calleeP)
-#guard residualOf dep Γ (calleeT [xactAbort]) == some ["ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"]
+#guard residualOf dep Γ (calleeT [xactAbort]) == some ["ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 
 -- The slice's meaning, operator by operator (`SExpr.eval`).
 def σ2 (a b : V) : Core.Store Unit := fun x => if x = "a" then a else if x = "b" then b else .null
@@ -592,7 +592,7 @@ lower like `COALESCE`. -/
 #guard isC2a (check dep ∅ pairCert (pairT false (fn "ISNULL" [ta, tb]) bigint)
     (pairP (fn "COALESCE" [pa, pb]) bigint))
 -- PostgreSQL has no `ISNULL` function: never the slice's `coalesce`.
-#guard (typed (.pg ∅ []) [("a", integer), ("b", integer)] {} (fn "ISNULL" [pa, pb])).isNone
+#guard (typed (.pg ∅ [] []) [("a", integer), ("b", integer)] {} (fn "ISNULL" [pa, pb])).isNone
 
 /-! ### `CASE` -/
 
@@ -686,7 +686,7 @@ def badCase (a : Ast.Expr) : Ast.Expr :=
 #guard isC1 (check dep ∅ pairCert (pairT false ta (.Ty "VARCHAR" ["10"]))
   (pairP pa (.Ty "VARCHAR" ["10"])))
 -- `int(4)` is not the slice's type.
-#guard !intType (.pg ∅ []) (.Ty "INT" ["4"])
+#guard !intType (.pg ∅ [] []) (.Ty "INT" ["4"])
 -- `NULL` compared with `=`: outside the slice (session settings change it).
 #guard isC1 (checkPair false (.Case none [.When2 (.Bin "=" ta .Null) (num 1)] (some (num 0)))
   (.Case none [.When2 (.Bin "=" pa .Null) (num 1)] (some (num 0))))
@@ -718,7 +718,7 @@ def fnCert : Cert := ⟨[("@a", "a")]⟩
     (.Block [] [ret (some (fn "COALESCE" [pa, num 0]))])))
 
 #guard (residualOf dep Γ (pairT true (.Bin "/" ta tb))) ==
-  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-STRING-ARGS"]
+  some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 #guard (residualOf dep Γ ifT) == some ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"]
 #guard (residualOf dep Γ (pairT false (fn "ISNULL" [ta, tb]))) == some ["ASM-TSQL-STRING-ARGS"]
 
@@ -735,7 +735,7 @@ def srcAbort : Ast.Routine :=
 #guard isC2a (check dep Γ cert srcAbort mirrorP)
 -- The call to `log_value` can fail after the callee wrote (its errors are
 -- not in the core), so the state after a failed call is not relied on.
-#guard (residualOf dep Γ srcAbort) == some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"]
+#guard (residualOf dep Γ srcAbort) == some ["ASM-TSQL-ARITH-ERRORS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS", "ASM-NO-CALLER-TXN"]
 -- The two status lines are still needed.
 #guard !isConfirmed (check dep Γ cert srcAbort todayP)
 
