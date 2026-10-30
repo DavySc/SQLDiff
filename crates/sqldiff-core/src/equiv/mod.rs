@@ -3252,7 +3252,7 @@ fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
     for (i, (x, y)) in ua.params.iter().zip(&ub.params).enumerate() {
         match (x.ty, y.ty) {
             // A T-SQL bit becomes a PostgreSQL boolean: the converter's
-            // pg.bit-boolean decision, and the terms treat them alike.
+            // default mapping (ASM-BIT-BOOLEAN), and the terms treat them alike.
             (Some(tx), Some(ty)) if bit_bool(tx, ty) => {}
             (Some(tx), Some(ty)) if tx.fam != ty.fam => out.unknown_reasons.push(format!(
                 "parameter {} is {:?} on {na} and {:?} on {nb}",

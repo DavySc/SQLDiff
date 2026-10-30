@@ -7128,7 +7128,7 @@ impl<'a> Cx<'a> {
                 num("smallint")
             }
             "BIT" => {
-                self.note(Status::Decision, "pg.bit-boolean", "BIT becomes boolean: comparisons with 1/0 must become TRUE/FALSE. Use smallint instead to keep numeric comparisons.");
+                self.note(Status::Assumptions, "ASM-BIT-BOOLEAN", "BIT becomes boolean (the default mapping): code outside this conversion that reads or writes it must use FALSE/TRUE where T-SQL used 0/1.");
                 ("boolean".into(), false, false)
             }
             "DECIMAL" | "NUMERIC" | "DEC" if args.is_empty() => num("numeric(18,0)"),
