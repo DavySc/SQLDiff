@@ -28,3 +28,6 @@ import Sqldiff.Core.Handlers
 #print axioms Sqldiff.Core.pickRows_map
 #print axioms Sqldiff.Core.pickRows_rename
 #print axioms Sqldiff.Core.exec_setDb
+-- C2c: typed values.
+#print axioms Sqldiff.Mirror.mkToDate_dateAdd_eval
+#print axioms Sqldiff.Core.Calendar.dayOf_addToTs

@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 180 | 31 (17%) | 6 (3%) | 143 (79%) |
+| `converter` | 180 | 35 (19%) | 6 (3%) | 139 (77%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 209 | 34 (16%) | 8 (4%) | 167 (80%) |
+| **All** | 209 | 38 (18%) | 8 (4%) | 163 (78%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -72,11 +72,11 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.bit.boolean-default` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.bit.case-result` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.coalesce` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
-| `tsql.bit.compare` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
+| `tsql.bit.compare` | `converter` | lemma: `Sqldiff.Mirror/C2c typed values/bit against boolean` | a bit variable or column against the literals 0/1 (TRUE/FALSE); comparisons with other numbers, strings or lists, BETWEEN and IN stay on the engine | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.concat` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.in` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.bit.not` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
-| `tsql.bit.store` | `converter` | engine |  | `sqldiff-convert/src/tsql/bits.rs` |
+| `tsql.bit.store` | `converter` | lemma: `Sqldiff.Mirror/C2c typed values/bit against boolean` | the literals 0/1 (FALSE/TRUE) and NULL stored into a bit variable or column; a number or expression stored as (v <> 0), and CASE results, stay on the engine | `sqldiff-convert/src/tsql/bits.rs` |
 | `tsql.builtin` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.catalog.exists` | `converter` | engine | a catalog existence test; `IF EXISTS (SELECT 1 FROM t ...)` on a plain table is C3b rule 3 and leaves no step | `sqldiff-convert/src/tsql.rs` |
 | `tsql.charindex` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
@@ -93,8 +93,8 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.cursor.while` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.database.filegroup` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.datalength` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
-| `tsql.dateadd` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
-| `tsql.datediff` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.dateadd` | `converter` | lemma: `Sqldiff.Mirror/C2c typed values/DATEADD` | day, month and year on a date or datetime2(p), p at most 6, with an int number (ASM-DATEADD-RANGE, ASM-DATEADD-YEAR-END); other dateparts, types and numbers stay on the engine | `sqldiff-convert/src/tsql.rs` |
+| `tsql.datediff` | `converter` | lemma: `Sqldiff.Mirror/C2c typed values/DATEDIFF` | day only, on dates and datetime2(p), p at most 6; month and year stay on the engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.decl.hoist` | `converter` | lemma: `Sqldiff.Mirror/Blocks/declTys` | the lowering gathers T-SQL DECLAREs where they stand and PL/pgSQL ones from the block header, so the move changes nothing it reads | `sqldiff-convert/src/tsql.rs` |
 | `tsql.decl.init` | `converter` | lemma: `Sqldiff.Mirror/Statements` | `DECLARE @x t = e` as the assignment `x := e` after the declaration, `e` in the slice | `sqldiff-convert/src/tsql.rs` |
 | `tsql.decl.table-variable` | `converter` | engine | PostgreSQL TEMP table engine; the Db2 for i NOT LOGGED table rests on V16 (ASM-TABLE-VARIABLE) | `sqldiff-convert/src/tsql.rs` |

@@ -15,7 +15,9 @@ adds data: tables of rows of values, described by the target catalog
 (`TableDef`), and three single-table statements, `insert`, `update` and
 `delete`, whose expressions may read the columns of the row at hand
 (`SExpr.col`). Phase C4 adds handled errors (`tryCatch`, `raise`,
-`reraise`) and `commit`.
+`reraise`) and `commit`. Phase C2c adds integer widths, bit/boolean,
+date and timestamp values with their literals, comparisons and the
+day/month/year arithmetic.
 -/
 
 namespace Sqldiff.Core
@@ -60,8 +62,18 @@ deriving DecidableEq, Repr
 
 /-! ## The C2a slice -/
 
-/-- Arithmetic on 32-bit signed integers. `div` truncates toward zero and
-`mod` takes the sign of the dividend (`Sqldiff.Core.arithInt`). -/
+/-- The width of a signed integer (C2c): T-SQL `smallint`/`int`/`bigint`,
+PostgreSQL `smallint`/`integer`/`bigint`. An arithmetic operator carries
+the width of its result; a value outside it is an overflow
+(`Sqldiff.Core.toIntW`). -/
+inductive IW where
+  | i16
+  | i32
+  | i64
+deriving DecidableEq, Repr
+
+/-- Arithmetic on signed integers of a width. `div` truncates toward zero
+and `mod` takes the sign of the dividend (`Sqldiff.Core.arithInt`). -/
 inductive AOp where
   | add
   | sub
@@ -70,7 +82,8 @@ inductive AOp where
   | mod
 deriving DecidableEq, Repr
 
-/-- Comparisons of 32-bit integers; the result is three-valued. -/
+/-- Comparisons of two integers, two dates or two timestamps of the same
+kind (C2c); the result is three-valued. -/
 inductive COp where
   | eq
   | ne
@@ -78,6 +91,14 @@ inductive COp where
   | gt
   | le
   | ge
+deriving DecidableEq, Repr
+
+/-- The part a `DATEADD` adds (C2c): days, months (the day clamped to the
+result month's last day) or years (twelve months). -/
+inductive DPart where
+  | day
+  | month
+  | year
 deriving DecidableEq, Repr
 
 /-- Expressions of the C2a slice. Their meaning is fixed by the core
@@ -97,6 +118,18 @@ lowering puts the padding in with `rtrim`), and `len a` the number of
 characters. Which dialect construct lowers to which is the lowering's
 business (`Sqldiff.Mirror`, "The C2b slice: strings").
 
+C2c adds typed values beyond `int` and strings: `arith` and `neg` carry
+the width of their result (`IW`: 16, 32 or 64 bits), `bool b` is a bit
+or boolean literal (T-SQL `bit` `0`/`1`, PostgreSQL `FALSE`/`TRUE`, the
+same value as a comparison gives), `date d` a date (days since
+0001-01-01, proleptic Gregorian, `Sqldiff.Core.Calendar`), `ts us` a
+timestamp without time zone (microseconds since 0001-01-01T00:00:00),
+`dateAdd p n d` adds `n` days, months or years to a date or timestamp,
+`dateDiff a b` is the number of day boundaries from `a` to `b`
+(`b`'s date minus `a`'s date), `toDate a` drops the time of a timestamp
+and `toTs a` is a date at midnight (`Sqldiff.Mirror`, "The C2c slice:
+typed values").
+
 The core does not type them; the lowerings build them only from
 expressions they have typed (`Sqldiff.Mirror.typed`). A variable read is
 always `var`, whatever the variable's type, so a routine outside the slice
@@ -105,8 +138,8 @@ inductive SExpr where
   | var (x : Var)
   | int (n : Int)
   | null
-  | arith (o : AOp) (a b : SExpr)
-  | neg (a : SExpr)
+  | arith (w : IW) (o : AOp) (a b : SExpr)
+  | neg (w : IW) (a : SExpr)
   | cmp (o : COp) (a b : SExpr)
   | and (a b : SExpr)
   | or (a b : SExpr)
@@ -120,6 +153,13 @@ inductive SExpr where
   | rtrim (a : SExpr)
   | streq (a b : SExpr)
   | len (a : SExpr)
+  | bool (b : Bool)
+  | date (d : Int)
+  | ts (us : Int)
+  | dateAdd (p : DPart) (n d : SExpr)
+  | dateDiff (a b : SExpr)
+  | toDate (a : SExpr)
+  | toTs (a : SExpr)
 deriving DecidableEq, Repr
 
 /-- Expressions. `sc s` is an expression of the slice. `op f args`
@@ -333,8 +373,8 @@ def SExpr.vars : SExpr → List Var
   | .var x => [x]
   | .int _ => []
   | .null => []
-  | .arith _ a b => a.vars ++ b.vars
-  | .neg a => a.vars
+  | .arith _ _ a b => a.vars ++ b.vars
+  | .neg _ a => a.vars
   | .cmp _ a b => a.vars ++ b.vars
   | .and a b => a.vars ++ b.vars
   | .or a b => a.vars ++ b.vars
@@ -348,6 +388,11 @@ def SExpr.vars : SExpr → List Var
   | .rtrim a => a.vars
   | .streq a b => a.vars ++ b.vars
   | .len a => a.vars
+  | .bool _ | .date _ | .ts _ => []
+  | .dateAdd _ n d => n.vars ++ d.vars
+  | .dateDiff a b => a.vars ++ b.vars
+  | .toDate a => a.vars
+  | .toTs a => a.vars
 
 mutual
   def Expr.vars : Expr → List Var
@@ -406,8 +451,8 @@ def SExpr.rename (f : Var → Var) : SExpr → SExpr
   | .var x => .var (f x)
   | .int n => .int n
   | .null => .null
-  | .arith o a b => .arith o (a.rename f) (b.rename f)
-  | .neg a => .neg (a.rename f)
+  | .arith w o a b => .arith w o (a.rename f) (b.rename f)
+  | .neg w a => .neg w (a.rename f)
   | .cmp o a b => .cmp o (a.rename f) (b.rename f)
   | .and a b => .and (a.rename f) (b.rename f)
   | .or a b => .or (a.rename f) (b.rename f)
@@ -421,6 +466,13 @@ def SExpr.rename (f : Var → Var) : SExpr → SExpr
   | .rtrim a => .rtrim (a.rename f)
   | .streq a b => .streq (a.rename f) (b.rename f)
   | .len a => .len (a.rename f)
+  | .bool b => .bool b
+  | .date d => .date d
+  | .ts us => .ts us
+  | .dateAdd p n d => .dateAdd p (n.rename f) (d.rename f)
+  | .dateDiff a b => .dateDiff (a.rename f) (b.rename f)
+  | .toDate a => .toDate (a.rename f)
+  | .toTs a => .toTs (a.rename f)
 
 mutual
   def Expr.rename (f : Var → Var) : Expr → Expr
@@ -537,29 +589,34 @@ def Routine.exprs (r : Routine) : List Expr :=
 arithmetic or negation (overflow, division by zero). Conservative: a
 literal divisor or a constant operand does not count as safe. -/
 def SExpr.mayRaise : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ | .str _ => false
-  | .arith .. | .neg _ => true
-  | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .streq a b =>
+  | .var _ | .int _ | .null | .col _ | .str _ | .bool _ | .date _ | .ts _ => false
+  | .arith .. | .neg .. => true
+  | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .streq a b
+  | .dateAdd _ a b | .dateDiff a b =>
     a.mayRaise || b.mayRaise
-  | .not a | .isNull a _ | .rtrim a | .len a => a.mayRaise
+  | .not a | .isNull a _ | .rtrim a | .len a | .toDate a | .toTs a => a.mayRaise
   | .cond c a b => c.mayRaise || a.mayRaise || b.mayRaise
 
 /-- The expression compares with `=` or `<>`, the comparisons T-SQL's
 `ANSI_NULLS OFF` changes. -/
 def SExpr.hasEqNe : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ | .str _ => false
+  | .var _ | .int _ | .null | .col _ | .str _ | .bool _ | .date _ | .ts _ => false
   | .cmp o a b => o == .eq || o == .ne || a.hasEqNe || b.hasEqNe
   | .streq _ _ => true
-  | .arith _ a b | .and a b | .or a b | .coalesce a b | .concat a b => a.hasEqNe || b.hasEqNe
-  | .neg a | .not a | .isNull a _ | .rtrim a | .len a => a.hasEqNe
+  | .arith _ _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .dateAdd _ a b
+  | .dateDiff a b => a.hasEqNe || b.hasEqNe
+  | .neg _ a | .not a | .isNull a _ | .rtrim a | .len a | .toDate a | .toTs a => a.hasEqNe
   | .cond c a b => c.hasEqNe || a.hasEqNe || b.hasEqNe
 
 /-- Some subterm (the expression itself included) satisfies `p`. -/
 def SExpr.anySub (p : SExpr → Bool) : SExpr → Bool
-  | s@(.var _) | s@(.int _) | s@.null | s@(.col _) | s@(.str _) => p s
-  | s@(.arith _ a b) | s@(.cmp _ a b) | s@(.and a b) | s@(.or a b) | s@(.coalesce a b)
-  | s@(.concat a b) | s@(.streq a b) => p s || a.anySub p || b.anySub p
-  | s@(.neg a) | s@(.not a) | s@(.isNull a _) | s@(.rtrim a) | s@(.len a) => p s || a.anySub p
+  | s@(.var _) | s@(.int _) | s@.null | s@(.col _) | s@(.str _) | s@(.bool _) | s@(.date _)
+  | s@(.ts _) => p s
+  | s@(.arith _ _ a b) | s@(.cmp _ a b) | s@(.and a b) | s@(.or a b) | s@(.coalesce a b)
+  | s@(.concat a b) | s@(.streq a b) | s@(.dateAdd _ a b) | s@(.dateDiff a b) =>
+    p s || a.anySub p || b.anySub p
+  | s@(.neg _ a) | s@(.not a) | s@(.isNull a _) | s@(.rtrim a) | s@(.len a) | s@(.toDate a)
+  | s@(.toTs a) => p s || a.anySub p
   | s@(.cond c a b) => p s || c.anySub p || a.anySub p || b.anySub p
 
 /-- The expression concatenates strings (C2b: `ASM-CONCAT-NULL`). -/
@@ -570,6 +627,16 @@ def SExpr.hasStrEq : SExpr → Bool := SExpr.anySub fun | .streq .. => true | _ 
 
 /-- The expression counts characters (C2b: `ASM-TSQL-LEN-BMP`). -/
 def SExpr.hasLen : SExpr → Bool := SExpr.anySub fun | .len _ => true | _ => false
+
+/-- The expression adds to a date (C2c: `ASM-DATEADD-RANGE`, the result
+stays within 0001-01-01 and 9999-12-31, where T-SQL raises and
+PostgreSQL does not). -/
+def SExpr.hasDateAdd : SExpr → Bool := SExpr.anySub fun | .dateAdd .. => true | _ => false
+
+/-- The expression adds years to a date (C2c: `ASM-DATEADD-YEAR-END`, the
+clamp of February 29 to February 28, which Microsoft's page does not
+state). -/
+def SExpr.hasYearAdd : SExpr → Bool := SExpr.anySub fun | .dateAdd .year .. => true | _ => false
 
 /-- An uninterpreted operator counts as raising and as comparing: what it
 does is unknown. -/
@@ -587,6 +654,10 @@ def Routine.hasStrEq (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasStr
 
 def Routine.hasLen (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasLen)
 
+def Routine.hasDateAdd (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasDateAdd)
+
+def Routine.hasYearAdd (r : Routine) : Bool := r.exprs.any (Expr.test SExpr.hasYearAdd)
+
 /-! ## What a routine's data statements can do (C3a)
 
 These decide whether a confirmation is in the slice
@@ -595,11 +666,11 @@ These decide whether a confirmation is in the slice
 
 /-- The expression reads a column. -/
 def SExpr.hasCol : SExpr → Bool
-  | .var _ | .int _ | .null | .str _ => false
+  | .var _ | .int _ | .null | .str _ | .bool _ | .date _ | .ts _ => false
   | .col _ => true
-  | .arith _ a b | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b
-  | .streq a b => a.hasCol || b.hasCol
-  | .neg a | .not a | .isNull a _ | .rtrim a | .len a => a.hasCol
+  | .arith _ _ a b | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b
+  | .streq a b | .dateAdd _ a b | .dateDiff a b => a.hasCol || b.hasCol
+  | .neg _ a | .not a | .isNull a _ | .rtrim a | .len a | .toDate a | .toTs a => a.hasCol
   | .cond c a b => c.hasCol || a.hasCol || b.hasCol
 
 /-- A part of the expression that reads no column can raise. PostgreSQL
@@ -608,12 +679,12 @@ constants and may fold such a part while planning, so it can raise even
 when no row is written (`Sqldiff.Mirror`, "Constant parts of a data
 statement"). For an expression without columns this is `mayRaise`. -/
 def SExpr.constRaise : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ | .str _ => false
-  | .arith _ a b => if a.hasCol || b.hasCol then a.constRaise || b.constRaise else true
-  | .neg a => if a.hasCol then a.constRaise else true
-  | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .streq a b =>
-    a.constRaise || b.constRaise
-  | .not a | .isNull a _ | .rtrim a | .len a => a.constRaise
+  | .var _ | .int _ | .null | .col _ | .str _ | .bool _ | .date _ | .ts _ => false
+  | .arith _ _ a b => if a.hasCol || b.hasCol then a.constRaise || b.constRaise else true
+  | .neg _ a => if a.hasCol then a.constRaise else true
+  | .cmp _ a b | .and a b | .or a b | .coalesce a b | .concat a b | .streq a b
+  | .dateAdd _ a b | .dateDiff a b => a.constRaise || b.constRaise
+  | .not a | .isNull a _ | .rtrim a | .len a | .toDate a | .toTs a => a.constRaise
   | .cond c a b => c.constRaise || a.constRaise || b.constRaise
 
 /-- The expression can raise; an uninterpreted operator counts. -/
@@ -628,10 +699,10 @@ not NULL (a state that satisfies the catalog): an integer literal, a
 required column, arithmetic on such values (which may raise, but not give
 NULL), and `COALESCE`/`CASE` whose result is one of them. -/
 def SExpr.nonNull (t : TableDef) : SExpr → Bool
-  | .int _ => true
+  | .int _ | .bool _ | .date _ | .ts _ => true
   | .col c => t.requires c
-  | .arith _ a b => a.nonNull t && b.nonNull t
-  | .neg a => a.nonNull t
+  | .arith _ _ a b | .dateAdd _ a b | .dateDiff a b => a.nonNull t && b.nonNull t
+  | .neg _ a | .toDate a | .toTs a => a.nonNull t
   | .coalesce a b => a.nonNull t || b.nonNull t
   | .cond _ a b => a.nonNull t && b.nonNull t
   | _ => false

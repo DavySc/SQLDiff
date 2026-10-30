@@ -380,7 +380,8 @@ fn the_real_checker_lets_the_release_gate_pass_in_the_c2a_slice() {
     let config = write(
         &d,
         "config.toml",
-        "[deployment]\naccept = [\"ASM-RETURN-CODE\", \"ASM-NO-CALLER-TXN\"]\n",
+        // `@a int`: callers pass values of the parameter's type.
+        "[deployment]\naccept = [\"ASM-RETURN-CODE\", \"ASM-NO-CALLER-TXN\", \"ASM-TSQL-STRING-ARGS\"]\n",
     );
     let run = |config: Option<&str>| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_sqldiff"));
@@ -684,6 +685,292 @@ fn the_real_checker_confirms_a_table_with_strings_defaults_and_an_index() {
     );
     let r = run();
     assert_eq!(r["answer"], "unconfirmed", "{r}");
+}
+
+/// C2c end to end: a procedure with a `bigint` and a `bit` variable, a
+/// `date` column written from a literal and compared, `DATEADD(day, ...)`
+/// and `DATEADD(month, ...)` on a date, is confirmed by `check_sound_c2a`
+/// and names the two DATEADD facts; a date literal outside the ISO form
+/// and a `DATEADD(hour, ...)` are refused.
+#[test]
+fn the_real_checker_confirms_typed_values() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2c-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "ev.sql",
+        "CREATE TABLE dbo.Ev (Id int NOT NULL, D date NULL, B bit NOT NULL, N bigint NULL, \
+         CONSTRAINT PK_Ev PRIMARY KEY (Id));\nGO\n",
+    );
+    let proc = |tail: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.mark @id int, @big bigint, @flag bit, @when date OUTPUT\nAS\nBEGIN\n  \
+             SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  DECLARE @b bit = 1;\n  DECLARE @n bigint;\n  \
+             DECLARE @d date = '2024-01-31';\n  SET @n = @big + @id;\n  \
+             SET @d = DATEADD(day, 1, @d);\n  SET @d = DATEADD(month, 1, @d);\n  \
+             IF @flag = 1 SET @b = 0;\n  \
+             IF @b = 1 AND @d < '2024-12-31' SET @when = @d;\n  \
+             INSERT INTO dbo.Ev (Id, D, B, N) VALUES (@id, @d, @b, @n);\n  \
+             UPDATE dbo.Ev SET D = DATEADD(day, 7, D), B = 1 WHERE Id = @id;\n  \
+             SELECT @when = D FROM dbo.Ev WHERE Id = @id;\n{tail}END\n"
+        )
+    };
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.mark")
+            .unwrap()
+    };
+    write(&src, "mark.sql", &proc(""));
+    let r = run();
+    // The converter writes the forms the checker reads: boolean literals,
+    // date arithmetic as `+ n` and `make_interval`, the typed columns.
+    let out = std::fs::read_to_string(d.join("out/mark.sql")).unwrap();
+    for shape in [
+        "v_b := TRUE;",
+        "IF p_flag = TRUE THEN",
+        "v_d := (v_d + 1);",
+        "v_d := (v_d + make_interval(months => 1))::date;",
+        "IF v_b = TRUE AND v_d < '2024-12-31' THEN",
+        "UPDATE Ev SET D = (D + 7), B = TRUE WHERE Id = p_id;",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["scalars"], "c2a", "{r}");
+    assert_eq!(r["statements"], "c3b", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for a in [
+        "ASM-TSQL-ARITH-ERRORS",
+        "ASM-TSQL-ANSI-NULLS",
+        "ASM-DATEADD-RANGE",
+        "ASM-TABLES-AS-DECLARED",
+    ] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    // No year is added: the year-end fact is not named.
+    assert!(!asm.contains(&"ASM-DATEADD-YEAR-END"), "{r}");
+    // A date literal T-SQL reads by DATEFORMAT, or DATEADD(hour, ...) on a
+    // date (which T-SQL itself refuses): outside the spec.
+    write(&src, "mark.sql", &proc("  SET @d = '01/02/2024';\n"));
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    write(
+        &src,
+        "mark.sql",
+        &proc("  SET @d = DATEADD(hour, 1, @d);\n"),
+    );
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+}
+
+/// C2c review: the converter's calls are confirmed only when each argument
+/// has exactly its callee's parameter type (an `int` into a `smallint`
+/// parameter finds no procedure in PostgreSQL, 42883); `@b <> 1` against
+/// `b <> TRUE` names `ASM-TSQL-ANSI-NULLS`; a nested `DATEADD`, which the
+/// converter writes with `::date`, is confirmed.
+#[test]
+fn the_real_checker_holds_call_arguments_and_bit_comparisons() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2c-review");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let callee = |name: &str, ty: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.{name} @x {ty} AS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  \
+             DECLARE @y {ty};\n  SET @y = @x;\nEND\nGO\n"
+        )
+    };
+    write(
+        &src,
+        "c.sql",
+        &format!(
+            "{}{}{}CREATE PROCEDURE dbo.callers @i int, @b bit, @r int OUTPUT AS\nBEGIN\n  \
+             SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  EXEC dbo.ci @i;\n  EXEC dbo.cb @b;\n  \
+             EXEC dbo.cb 1;\n  SET @r = 0;\n  IF @b <> 1 SET @r = 1;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.narrow @i int AS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  \
+             EXEC dbo.cs @i;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.nd @id int, @d date, @w date, @r date OUTPUT, @i int OUTPUT AS\nBEGIN\n  \
+             SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SET @r = DATEADD(day, 1, DATEADD(month, @id, @d));\n  \
+             SET @i = DATEDIFF(day, @w, DATEADD(month, @id, @d));\nEND\nGO\n",
+            callee("cs", "smallint"),
+            callee("cb", "bit"),
+            callee("ci", "int")
+        ),
+    );
+    Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--overwrite", "--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let out = std::fs::read_to_string(d.join("out/c.sql")).unwrap();
+    for shape in [
+        "CALL cs(p_i);",
+        "CALL cb(TRUE);",
+        "IF p_b <> TRUE THEN",
+        "(p_d + make_interval(months => p_id))::date + 1",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap();
+    let routine = |name: &str| {
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == name)
+            .unwrap()
+    };
+    let r = routine("dbo.narrow");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    assert_eq!(r["why"][0], "node:call:type", "{r}");
+    let r = routine("dbo.callers");
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for a in ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    for name in ["dbo.cs", "dbo.cb", "dbo.ci", "dbo.nd"] {
+        let r = routine(name);
+        assert_eq!(r["answer"], "confirmed", "{r}");
+    }
+}
+
+/// Re-review of C2c end to end. A `time` local is `time(7)` in SQL Server
+/// and `time(6)` in PostgreSQL: `.1234567 < .1234568` is 1 against 0, so
+/// a type outside the slice corresponds to nothing and a string stores
+/// into it on neither side. A string argument must fit the callee's
+/// declared length: `dbo.q @s varchar(3)` sees `abc` of a `varchar(10)`
+/// holding `abcdef` in SQL Server, the whole value in PostgreSQL. An `int`
+/// parameter names ASM-TSQL-STRING-ARGS (an outside caller's `1.5`).
+#[test]
+fn the_real_checker_refuses_time_locals_and_long_string_arguments() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2c-rereview");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let head = "AS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n";
+    write(
+        &src,
+        "t.sql",
+        &format!(
+            "CREATE PROCEDURE dbo.tm @r int OUTPUT {head}  DECLARE @a time;\n  DECLARE @b time;\n  \
+             SET @a = '12:00:00.1234567';\n  SET @b = '12:00:00.1234568';\n  \
+             IF @a < @b SET @r = 1; ELSE SET @r = 0;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.tn @r int OUTPUT {head}  DECLARE @a time;\n  DECLARE @b time;\n  \
+             IF @a < @b SET @r = 1; ELSE SET @r = 0;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.q @s varchar(3), @r int OUTPUT {head}  SET @r = LEN(@s);\nEND\nGO\n\
+             CREATE PROCEDURE dbo.pc @r int OUTPUT {head}  DECLARE @v varchar(10);\n  \
+             SET @v = 'abcdef';\n  EXEC dbo.q @v, @r OUTPUT;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.pl @r int OUTPUT {head}  EXEC dbo.q 'abcd', @r OUTPUT;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.p3 @r int OUTPUT {head}  DECLARE @v varchar(3);\n  \
+             SET @v = 'abc';\n  EXEC dbo.q @v, @r OUTPUT;\nEND\nGO\n"
+        ),
+    );
+    Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--overwrite", "--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let out = std::fs::read_to_string(d.join("out/t.sql")).unwrap();
+    for shape in ["v_a time;", "CALL q(v_v, p_r);", "p_s varchar(3)"] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap();
+    let routine = |name: &str| {
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == name)
+            .unwrap()
+    };
+    let r = routine("dbo.tm");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    assert_eq!(r["why"][0], "store:assign:time", "{r}");
+    let r = routine("dbo.tn");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    for name in ["dbo.pc", "dbo.pl"] {
+        let r = routine(name);
+        assert_eq!(r["answer"], "unconfirmed", "{r}");
+        assert_eq!(r["why"][0], "node:call:type", "{r}");
+    }
+    for name in ["dbo.q", "dbo.p3"] {
+        let r = routine(name);
+        assert_eq!(r["answer"], "confirmed", "{r}");
+        let asm: Vec<&str> = r["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(asm.contains(&"ASM-TSQL-STRING-ARGS"), "{r}");
+    }
 }
 
 /// C2b end to end: concatenation and ISNULL over bounded string variables
