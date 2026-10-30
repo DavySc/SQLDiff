@@ -184,13 +184,13 @@ fn quoted_columns_of_the_changed_row() {
     };
     let r = diff(
         &Artifact::new("a.sql", T, a),
-        &Artifact::new("b.sql", P, &b("\"Lineage Key\"")),
+        &Artifact::new("b.sql", P, b("\"Lineage Key\"")),
         &opts,
     );
     assert_eq!(r.verdict(), Verdict::EqualUnderAssumptions, "{}", why(&r));
     let r = diff(
         &Artifact::new("a.sql", T, a),
-        &Artifact::new("b.sql", P, &b("\"Table Name\"")),
+        &Artifact::new("b.sql", P, b("\"Table Name\"")),
         &opts,
     );
     assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{}", why(&r));
