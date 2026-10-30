@@ -4,6 +4,7 @@ import Sqldiff.Core.Fuel
 import Sqldiff.Core.OpFree
 import Sqldiff.Core.Data
 import Sqldiff.Core.Handlers
+import Sqldiff.Core.Fidelity
 
 -- CI compares this output against the allowlist in check_axioms.py.
 #print axioms Sqldiff.Gate.check_sound
@@ -30,6 +31,8 @@ import Sqldiff.Core.Handlers
 #print axioms Sqldiff.Core.pickRows_map
 #print axioms Sqldiff.Core.pickRows_rename
 #print axioms Sqldiff.Core.exec_setDb
+-- C3d: the key closure keeps at most one tuple.
+#print axioms Sqldiff.Core.kept_length_le_one
 -- C2c: typed values.
 #print axioms Sqldiff.Mirror.mkToDate_dateAdd_eval
 #print axioms Sqldiff.Core.Calendar.dayOf_addToTs
