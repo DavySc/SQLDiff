@@ -596,6 +596,14 @@ impl<'a> Canon<'a> {
         self.output = None;
     }
 
+    /// SQL Server cannot compare geography values (GROUP BY, DISTINCT, IN,
+    /// set operations, = all fail); PostGIS compares their bounding boxes.
+    /// The marker keeps such a comparison apart from the other dialect's;
+    /// no assumption discharges it.
+    fn geog_cmp(&self) -> Term {
+        n("geog-cmp", vec![self.dtag()])
+    }
+
     fn assume(&mut self, x: (&str, &str)) {
         if !self.asm.iter().any(|y| y.id == x.0) {
             self.asm.push(asm::make(x));
@@ -973,7 +981,7 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
-            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid => true,
+            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid | Fam::Geography => true,
         }
     }
 
@@ -1305,7 +1313,14 @@ impl<'a> Canon<'a> {
                     items = items.into_iter().map(Self::bit_value).collect();
                 }
                 items.sort();
+                let geog = ty.is_some_and(|t| t.fam == Fam::Geography)
+                    || item_tys
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.fam == Fam::Geography));
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
+                if geog {
+                    kids.push(self.geog_cmp());
+                }
                 // Like `=`: string membership depends on the collation. With
                 // a string operand and string items it is string equality
                 // (`coll-eq`); otherwise a conversion may take part.
@@ -1330,6 +1345,8 @@ impl<'a> Canon<'a> {
                 // non-string operand avoids the collation.
                 if ty.map_or(true, |t| t.is_string()) {
                     kids.push(self.dtag());
+                } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                    kids.push(self.geog_cmp());
                 }
                 (n("inq", kids), None)
             }
@@ -1360,7 +1377,9 @@ impl<'a> Canon<'a> {
                 let mut kids = vec![t, lo, hi, a(neg.to_string())];
                 // Strings by collation, uuids by each dialect's byte order.
                 if ty.map_or(true, |t| t.is_string())
-                    || tys.iter().any(|t| t.is_some_and(|t| t.fam == Fam::Uuid))
+                    || tys
+                        .iter()
+                        .any(|t| t.is_some_and(|t| t.orders_per_dialect()))
                 {
                     kids.push(self.dtag());
                 }
@@ -1526,6 +1545,8 @@ impl<'a> Canon<'a> {
                         let (t, ty) = self.expr(o)?;
                         if ty.map_or(true, |t| t.is_string()) {
                             kids.push(self.dtag());
+                        } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                            kids.push(self.geog_cmp());
                         }
                         kids.push(t);
                     }
@@ -1796,6 +1817,25 @@ impl<'a> Canon<'a> {
         if matches!(v.0.head(), "null") {
             return (n(head, vec![Self::ty_term(&to), v.0]), to);
         }
+        // Only a geography value is one on both sides: SQL Server reads
+        // 0xE6100000010C… in its own serialization, which PostGIS rejects
+        // ("Invalid endian flag value", checked on PostGIS 3.6), and the
+        // two parse text differently.
+        if dst.fam == Fam::Geography && v.1.map_or(true, |t| t.fam != Fam::Geography) {
+            return (
+                n(
+                    "dcast",
+                    vec![
+                        self.dtag(),
+                        a(how.name()),
+                        Self::ty_term(&to),
+                        Self::ty_term(&v.1),
+                        v.0,
+                    ],
+                ),
+                to,
+            );
+        }
         if v.1.is_none() {
             let castable = matches!(
                 dst.fam,
@@ -1916,7 +1956,7 @@ impl<'a> Canon<'a> {
             // numeric half away from zero and float half to even.
             (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
             (Float, Float) => Rule::Same,
-            (Uuid, Uuid) => Rule::Same,
+            (Uuid, Uuid) | (Geography, Geography) => Rule::Same,
             // Explicit casts truncate silently on both sides, and storing too
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
@@ -2095,8 +2135,22 @@ impl<'a> Canon<'a> {
                 if c.star {
                     kids.push(a("*"));
                 } else {
+                    let mut tys = Vec::new();
                     for x in &c.args {
-                        kids.push(self.expr(x)?.0);
+                        let (t, ty) = self.expr(x)?;
+                        kids.push(t);
+                        tys.push(ty);
+                    }
+                    // COUNT(DISTINCT …) compares its values as DISTINCT does.
+                    if c.distinct {
+                        if tys
+                            .iter()
+                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                        {
+                            kids.push(self.geog_cmp());
+                        } else if tys.iter().any(|t| t.is_some_and(|t| t.is_string())) {
+                            kids.push(n("distinct", vec![self.dtag()]));
+                        }
                     }
                 }
                 // COUNT returns int in T-SQL and bigint elsewhere; equal while it fits.
@@ -2583,7 +2637,7 @@ impl<'a> Canon<'a> {
             (_, "lower" | "lcase", 1) => portable("lower", args, first_ty),
             (_, "abs", 1) => portable("abs", args, first_ty),
             (_, "min" | "max", 1) => match first_ty {
-                Some(t) if t.is_string() || t.fam == Fam::Uuid => (
+                Some(t) if t.orders_per_dialect() => (
                     n("dfn", vec![self.dtag(), a(name.clone()), args[0].0.clone()]),
                     first_ty,
                 ),
@@ -2955,11 +3009,14 @@ impl<'a> Canon<'a> {
                     ));
                 }
                 // SQL Server orders uniqueidentifier by its byte groups, last
-                // group first; PostgreSQL orders uuid byte by byte.
-                if any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>") {
+                // group first; PostgreSQL orders uuid byte by byte. SQL Server
+                // has no comparison of geography at all.
+                if any(&|t| t.fam == Fam::Geography)
+                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
+                {
                     let (x, y, op) = order_operands(op, lt, rt);
                     return Ok((
-                        n("cmp-uuid", vec![self.dtag(), a(op), x, y]),
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
@@ -3390,7 +3447,7 @@ impl<'a> Canon<'a> {
             match ty {
                 // Character ordering depends on the collation of each dialect,
                 // uuid ordering on its byte order (last group first in T-SQL).
-                Some(t) if t.is_string() || t.fam == Fam::Uuid => kids.push(self.dtag()),
+                Some(t) if t.orders_per_dialect() => kids.push(self.dtag()),
                 None => self.assume(asm::UNTYPED),
                 _ => {}
             }
@@ -3629,6 +3686,13 @@ impl<'a> Canon<'a> {
                     {
                         kids.push(n("coll", vec![self.dtag()]));
                     }
+                    if h != "union-all"
+                        && col_tys
+                            .iter()
+                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                    {
+                        kids.push(self.geog_cmp());
+                    }
                     n("setop", kids)
                 }
                 (Some(_), None) => unreachable!("only the first branch has no operator"),
@@ -3682,7 +3746,7 @@ impl<'a> Canon<'a> {
                 a(if o.desc { "desc" } else { "asc" }),
                 a(nulls),
             ];
-            if col_tys[k].is_some_and(|t| t.is_string() || t.fam == Fam::Uuid) {
+            if col_tys[k].is_some_and(|t| t.orders_per_dialect()) {
                 kids.push(self.dtag());
             }
             order.push(n("ord", kids));
@@ -3742,6 +3806,7 @@ impl<'a> Canon<'a> {
             let (t, ty) = self.expr(g)?;
             group.push(match ty {
                 Some(t2) if t2.is_string() => n("collate", vec![self.dtag(), t]),
+                Some(t2) if t2.fam == Fam::Geography => n("geog-key", vec![self.geog_cmp(), t]),
                 None => {
                     self.assume(asm::UNTYPED);
                     t
@@ -3752,6 +3817,11 @@ impl<'a> Canon<'a> {
         // DISTINCT compares strings under each dialect's collation.
         let distinct = if !s.distinct {
             a("all")
+        } else if items
+            .iter()
+            .any(|x| x.1.is_some_and(|t| t.fam == Fam::Geography))
+        {
+            n("distinct-geog", vec![self.geog_cmp()])
         } else if items.iter().any(|x| x.1.is_some_and(|t| t.is_string())) {
             n("distinct", vec![self.dtag()])
         } else {
