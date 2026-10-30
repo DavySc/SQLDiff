@@ -36,7 +36,7 @@ variable {U W : Type}
 /-- The expression evaluates without an error for every variable and
 column value. -/
 def SExpr.total : SExpr → Bool
-  | .var _ | .int _ | .null | .col _ | .str _ => true
+  | .var _ | .int _ | .null | .col _ | .str _ | .bool _ | .date _ | .ts _ => true
   | .isNull a _ => a.total
   | .coalesce a b => a.total && b.total
   | .cond c a b => c.total && a.total && b.total
@@ -49,6 +49,9 @@ theorem SExpr.eval_total (σ ρ : Store U) :
   | .null, _, _ => by simp [SExpr.eval]
   | .col _, _, _ => by simp [SExpr.eval]
   | .str _, _, _ => by simp [SExpr.eval]
+  | .bool _, _, _ => by simp [SExpr.eval]
+  | .date _, _, _ => by simp [SExpr.eval]
+  | .ts _, _, _ => by simp [SExpr.eval]
   | .isNull a n, h, k => by
     simp only [SExpr.total] at h
     simp only [SExpr.eval]
@@ -74,8 +77,9 @@ theorem SExpr.eval_total (σ ρ : Store U) :
       split
       · exact SExpr.eval_total σ ρ a h.1.2 k
       · exact SExpr.eval_total σ ρ b h.2 k
-  | .arith .., h, _ | .neg _, h, _ | .cmp .., h, _ | .and .., h, _ | .or .., h, _ | .not _, h, _
-  | .concat .., h, _ | .rtrim _, h, _ | .streq .., h, _ | .len _, h, _ => by
+  | .arith .., h, _ | .neg .., h, _ | .cmp .., h, _ | .and .., h, _ | .or .., h, _ | .not _, h, _
+  | .concat .., h, _ | .rtrim _, h, _ | .streq .., h, _ | .len _, h, _ | .dateAdd .., h, _
+  | .dateDiff .., h, _ | .toDate _, h, _ | .toTs _, h, _ => by
     simp [SExpr.total] at h
 
 def Expr.total : Expr → Bool
