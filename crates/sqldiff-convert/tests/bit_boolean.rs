@@ -343,3 +343,29 @@ fn between_derived_tables_and_bit_arithmetic() {
         assert!(u.status >= Status::Unproven, "{src}\n{:?}\n{}", u.notes, c.output);
     }
 }
+
+#[test]
+fn insert_select_and_cte_columns_stored_in_a_bit() {
+    let src = "CREATE PROCEDURE dbo.Q\nAS\nBEGIN\n    SET XACT_ABORT ON;\n    BEGIN TRAN;\n    INSERT dbo.Flags (Id, IsActive, IsDeleted, Score) SELECT Id + 100, 0, NULL, Score FROM dbo.Flags;\n    WITH C AS (SELECT Id, CASE WHEN Score > 0 THEN 1 ELSE 0 END AS Pos, IsActive FROM dbo.Flags)\n    INSERT INTO dbo.Flags (Id, IsActive, IsDeleted, Score) SELECT Id + 200, Pos, IsActive, 1 FROM C;\n    WITH D AS (SELECT f.Id FROM dbo.Flags AS f WHERE f.IsActive = 1)\n    INSERT INTO dbo.Flags (Id, IsActive, IsDeleted, Score) SELECT Id + 300, 1, 0, 0 FROM D;\n    COMMIT;\nEND\n";
+    let c = pg(src);
+    // INSERT without INTO: the target's bit columns still decide.
+    has(&c, "SELECT Id + 100, FALSE, NULL, Score FROM Flags;");
+    // A CTE column: the number it holds is stored as `(x <> 0)`, a bit
+    // passed through as it is.
+    has(&c, "SELECT Id + 200, (Pos <> 0), IsActive, 1 FROM C;");
+    // A comparison inside a CTE reads the table's bit.
+    has(&c, "WHERE f.IsActive = TRUE)");
+    has(&c, "SELECT Id + 300, TRUE, FALSE, 0 FROM D;");
+    for needle in ["Id + 100", "Id + 200", "Id + 300"] {
+        let u = unit(&c, src, needle);
+        let f: Vec<_> = u.findings.iter().map(|&i| &c.report.findings[i]).collect();
+        assert!(
+            u.status < Status::Unproven,
+            "{needle}: {f:#?}\n{}",
+            c.output
+        );
+    }
+    // A CTE named like the table: its column is a number, not the bit.
+    let c = pg("CREATE PROCEDURE dbo.R\nAS\nBEGIN\n    WITH Flags AS (SELECT Id, Score AS IsActive FROM dbo.Flags)\n    UPDATE dbo.Flags SET Score = (SELECT COUNT(*) FROM Flags AS x WHERE x.IsActive = 0);\nEND\n");
+    has(&c, "WHERE x.IsActive = 0)");
+}
