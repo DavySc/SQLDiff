@@ -99,8 +99,10 @@ fn point_constants_read_to_the_same_point() {
         t,
         "UPDATE C SET L1 = '0101000020E6100000C982781332C455C0610619B7874A4240'::geography WHERE Id = 1;"
     ));
-    // Latitude and longitude swapped, another SRID, Z dropped.
+    // The latitude's last mantissa bit, latitude and longitude swapped,
+    // another SRID, Z dropped.
     for b in [
+        "UPDATE C SET L1 = '0101000020E6100000C982781332C455C0600619B7874A4240'::geography WHERE Id = 1;",
         "UPDATE C SET L1 = '0101000020E6100000610619B7874A4240C982781332C455C0'::geography WHERE Id = 1;",
         "UPDATE C SET L1 = '0101000020AD100000C982781332C455C0610619B7874A4240'::geography WHERE Id = 1;",
     ] {
