@@ -22,10 +22,10 @@ const TSQL: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  SET XACT_ABORT ON;\n  DE
 
 /// The PostgreSQL procedure with `create` for the table's creation.
 fn pg(create: &str) -> String {
-    format!("CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n{create}\n  INSERT INTO pg_temp.tv_p_errors (Severity) VALUES (16);\n  DELETE FROM pg_temp.tv_p_errors WHERE Severity < 10;\nEND;\n$$;\n")
+    format!("CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n{create}\n  INSERT INTO pg_temp.tv__dbo__p__errors (Severity) VALUES (16);\n  DELETE FROM pg_temp.tv__dbo__p__errors WHERE Severity < 10;\nEND;\n$$;\n")
 }
 
-const CREATE: &str = "  DROP TABLE IF EXISTS pg_temp.tv_p_errors;\n  CREATE TEMP TABLE pg_temp.tv_p_errors (\n    ID integer GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) PRIMARY KEY,\n    Severity integer NOT NULL\n  );";
+const CREATE: &str = "  DROP TABLE IF EXISTS pg_temp.tv__dbo__p__errors;\n  CREATE TEMP TABLE pg_temp.tv__dbo__p__errors (\n    ID integer GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) PRIMARY KEY,\n    Severity integer NOT NULL\n  );";
 
 fn reasons(r: &Report) -> String {
     format!("{:#?}\n{:#?}", r.findings, r.unknown_reasons)
@@ -35,30 +35,106 @@ fn reasons(r: &Report) -> String {
 fn names_carry_the_routine_and_fit_postgresql() {
     assert_eq!(
         table_variable_table(Some("dbo.CommandExecute"), "@Errors"),
-        "tv_commandexecute_errors"
+        "tv__dbo__commandexecute__errors"
     );
     assert_eq!(
         table_variable_table(Some("[dbo].[Command_Execute]"), "@tmpDatabases"),
-        "tv_commandexecute_tmp_databases"
+        "tv__dbo__command_execute__tmpdatabases"
     );
-    // A script's table variables cannot meet a routine's: `tv__` never
-    // starts a routine's name (its routine part is never empty).
+    // A script's table variables cannot meet a routine's: one part against
+    // at least two.
     assert_eq!(table_variable_table(None, "@x"), "tv__x");
+    assert_ne!(
+        table_variable_table(None, "@p__t"),
+        table_variable_table(Some("p"), "@t")
+    );
     let long = table_variable_table(
         Some("dbo.IndexOptimize"),
         "@CurrentUpdateStatisticsWithClauseArguments",
     );
-    assert!(long.len() <= 63, "{long}");
+    assert_eq!(long.len(), 63, "{long}");
     assert!(
-        long.starts_with("tv_indexoptimize_current_update_statistics"),
+        long.starts_with("tv__dbo__indexoptimize__currentupdatestatistics"),
         "{long}"
     );
+    assert!(long.contains("___"), "{long}");
     assert_ne!(
         long,
         table_variable_table(
             Some("dbo.IndexOptimize"),
             "@CurrentUpdateStatisticsWithClauseArguments2"
         )
+    );
+}
+
+#[test]
+fn names_are_injective_over_the_routines_of_a_session() {
+    // A called routine's DROP TABLE IF EXISTS must never hit its caller's
+    // table: dbo.a_b calling dbo.ab, and dbo.p calling app.p, both logged
+    // the callee's rows on PostgreSQL when the schema and the underscores
+    // were dropped from the name.
+    assert_eq!(table_variable_table(Some("dbo.ab"), "@t"), "tv__dbo__ab__t");
+    assert_eq!(
+        table_variable_table(Some("dbo.a_b"), "@t"),
+        "tv__dbo__a_b__t"
+    );
+    assert_eq!(table_variable_table(Some("app.p"), "@t"), "tv__app__p__t");
+    assert_eq!(table_variable_table(Some("dbo.p"), "@t"), "tv__dbo__p__t");
+    // Parts whose join would not read back get the hash of the whole key,
+    // after three underscores, which no plain name holds.
+    assert_ne!(
+        table_variable_table(Some("dbo.a"), "@b_c"),
+        table_variable_table(Some("dbo.a_b"), "@c")
+    );
+    assert_ne!(
+        table_variable_table(Some("dbo.a_"), "@b"),
+        table_variable_table(Some("dbo.a"), "@_b")
+    );
+    assert_ne!(
+        table_variable_table(Some("dbo.a__b"), "@c"),
+        table_variable_table(Some("dbo.a.b"), "@c")
+    );
+    let spaced = table_variable_table(Some("[dbo].[a b]"), "@t");
+    assert_ne!(spaced, table_variable_table(Some("dbo.a_b"), "@t"));
+    assert!(spaced.starts_with("tv__dbo__a_b__t___"), "{spaced}");
+    assert_eq!(spaced.len(), "tv__dbo__a_b__t___".len() + 8, "{spaced}");
+    // The hash is stable (FNV-1a of `dbo.a b@t`): the engine and the
+    // converter, on any build, compute the same name.
+    assert_eq!(spaced, "tv__dbo__a_b__t___c0ff7c8b");
+    // Case does not distinguish routines or variables.
+    assert_eq!(
+        table_variable_table(Some("DBO.AB"), "@T"),
+        table_variable_table(Some("dbo.ab"), "@t")
+    );
+}
+
+#[test]
+fn the_engine_pairs_a_callee_only_with_its_own_table() {
+    let tsql = "CREATE PROCEDURE dbo.a_b AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @t TABLE (i int NOT NULL);\n  INSERT INTO @t (i) VALUES (1);\nEND\n";
+    let pg = |name: &str| {
+        format!("CREATE OR REPLACE PROCEDURE a_b()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.{name};\n  CREATE TEMP TABLE pg_temp.{name} (\n    i integer NOT NULL\n  );\n  INSERT INTO pg_temp.{name} (i) VALUES (1);\nEND;\n$$;\n")
+    };
+    let r = run(tsql, &pg("tv__dbo__a_b__t"), P);
+    assert_eq!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{}",
+        reasons(&r)
+    );
+    // dbo.ab's table, which the old name made the same.
+    let r = run(tsql, &pg("tv__dbo__ab__t"), P);
+    assert_ne!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{}",
+        reasons(&r)
+    );
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("creates no temporary table pg_temp.tv__dbo__a_b__t")),
+        "{}",
+        reasons(&r)
     );
 }
 
@@ -96,7 +172,7 @@ fn a_column_that_differs_is_found() {
 
 #[test]
 fn creation_without_drop_is_not_proven() {
-    let b = pg(&CREATE.replace("  DROP TABLE IF EXISTS pg_temp.tv_p_errors;\n", ""));
+    let b = pg(&CREATE.replace("  DROP TABLE IF EXISTS pg_temp.tv__dbo__p__errors;\n", ""));
     let r = run(TSQL, &b, P);
     assert!(
         r.unknown_reasons
@@ -124,12 +200,12 @@ fn on_commit_drop_is_not_proven() {
 #[test]
 fn another_name_is_not_paired() {
     // The caller's table: a routine that reads it is not the conversion.
-    let b = pg(CREATE).replace("tv_p_errors", "tv_caller_errors");
+    let b = pg(CREATE).replace("tv__dbo__p__errors", "tv__dbo__caller__errors");
     let r = run(TSQL, &b, P);
     assert!(
         r.unknown_reasons
             .iter()
-            .any(|x| x.contains("creates no temporary table pg_temp.tv_p_errors")),
+            .any(|x| x.contains("creates no temporary table pg_temp.tv__dbo__p__errors")),
         "{}",
         reasons(&r)
     );
@@ -138,7 +214,9 @@ fn another_name_is_not_paired() {
 
 #[test]
 fn use_before_creation_is_not_proven() {
-    let b = pg(&format!("  DELETE FROM pg_temp.tv_p_errors;\n{CREATE}"));
+    let b = pg(&format!(
+        "  DELETE FROM pg_temp.tv__dbo__p__errors;\n{CREATE}"
+    ));
     let r = run(TSQL, &b, P);
     assert!(
         r.unknown_reasons.iter().any(|x| x.contains("before line")),
@@ -171,8 +249,8 @@ fn a_rollback_is_not_proven_on_postgresql() {
         "  DELETE FROM @Errors WHERE Severity < 10;\n  BEGIN TRAN;\n  ROLLBACK;\n",
     );
     let b = pg(CREATE).replace(
-        "  DELETE FROM pg_temp.tv_p_errors WHERE Severity < 10;\n",
-        "  DELETE FROM pg_temp.tv_p_errors WHERE Severity < 10;\n  ROLLBACK;\n",
+        "  DELETE FROM pg_temp.tv__dbo__p__errors WHERE Severity < 10;\n",
+        "  DELETE FROM pg_temp.tv__dbo__p__errors WHERE Severity < 10;\n  ROLLBACK;\n",
     );
     let r = run(&a, &b, P);
     assert!(
@@ -207,9 +285,9 @@ fn every_table_variable_of_a_routine_pairs_with_its_own_drop() {
     // and CREATE where its DECLARE stands, so they sit at one place.
     let a = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @A TABLE (ID int, Done bit DEFAULT 0);\n  DECLARE @B TABLE (ID int, Name nvarchar(10) DEFAULT N'x');\n  INSERT INTO @A (ID) VALUES (1);\n  INSERT INTO @B (ID) VALUES (2);\nEND\n";
     let b = |second_drop: &str| {
-        format!("CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.tv_p_a;\n  CREATE TEMP TABLE pg_temp.tv_p_a (\n    ID integer,\n    Done boolean DEFAULT FALSE\n  );\n  DROP TABLE IF EXISTS pg_temp.{second_drop};\n  CREATE TEMP TABLE pg_temp.tv_p_b (\n    ID integer,\n    Name varchar(10) DEFAULT 'x'\n  );\n  INSERT INTO pg_temp.tv_p_a (ID) VALUES (1);\n  INSERT INTO pg_temp.tv_p_b (ID) VALUES (2);\nEND;\n$$;\n")
+        format!("CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.tv__dbo__p__a;\n  CREATE TEMP TABLE pg_temp.tv__dbo__p__a (\n    ID integer,\n    Done boolean DEFAULT FALSE\n  );\n  DROP TABLE IF EXISTS pg_temp.{second_drop};\n  CREATE TEMP TABLE pg_temp.tv__dbo__p__b (\n    ID integer,\n    Name varchar(10) DEFAULT 'x'\n  );\n  INSERT INTO pg_temp.tv__dbo__p__a (ID) VALUES (1);\n  INSERT INTO pg_temp.tv__dbo__p__b (ID) VALUES (2);\nEND;\n$$;\n")
     };
-    let r = run(a, &b("tv_p_b"), P);
+    let r = run(a, &b("tv__dbo__p__b"), P);
     assert_eq!(
         r.verdict(),
         Verdict::EqualUnderAssumptions,
@@ -218,7 +296,7 @@ fn every_table_variable_of_a_routine_pairs_with_its_own_drop() {
     );
     assert!(r.unknown_reasons.is_empty(), "{}", reasons(&r));
     // Without its own drop the second table is not proven.
-    let r = run(a, &b("tv_p_other"), P);
+    let r = run(a, &b("tv__dbo__p__other"), P);
     assert!(
         r.unknown_reasons.iter().any(|x| x.contains("@B")),
         "{}",
@@ -229,7 +307,7 @@ fn every_table_variable_of_a_routine_pairs_with_its_own_drop() {
 #[test]
 fn db2_declaration_must_keep_rows_on_rollback() {
     let b = |opts: &str| {
-        format!("CREATE OR REPLACE PROCEDURE p ()\nLANGUAGE SQL\nBEGIN\n  DECLARE GLOBAL TEMPORARY TABLE SESSION.tv_p_errors (\n    ID INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) NOT NULL PRIMARY KEY,\n    Severity INTEGER NOT NULL\n  ) {opts};\n  INSERT INTO SESSION.tv_p_errors (Severity) VALUES (16);\n  DELETE FROM SESSION.tv_p_errors WHERE Severity < 10;\nEND;\n")
+        format!("CREATE OR REPLACE PROCEDURE p ()\nLANGUAGE SQL\nBEGIN\n  DECLARE GLOBAL TEMPORARY TABLE SESSION.tv__dbo__p__errors (\n    ID INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) NOT NULL PRIMARY KEY,\n    Severity INTEGER NOT NULL\n  ) {opts};\n  INSERT INTO SESSION.tv__dbo__p__errors (Severity) VALUES (16);\n  DELETE FROM SESSION.tv__dbo__p__errors WHERE Severity < 10;\nEND;\n")
     };
     let logged = run(
         TSQL,
@@ -267,7 +345,7 @@ fn db2_declaration_must_keep_rows_on_rollback() {
 #[test]
 fn a_dgtt_with_start_with_binds() {
     // `START WITH` inside the identity options is not the table's AS query.
-    let b = "CREATE OR REPLACE PROCEDURE p ()\nLANGUAGE SQL\nBEGIN\n  DECLARE GLOBAL TEMPORARY TABLE SESSION.tv_p_errors (ID INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) NOT NULL PRIMARY KEY, Message VARCHAR(10)) ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE;\n  INSERT INTO SESSION.tv_p_errors (Message) VALUES ('x');\nEND;\n";
+    let b = "CREATE OR REPLACE PROCEDURE p ()\nLANGUAGE SQL\nBEGIN\n  DECLARE GLOBAL TEMPORARY TABLE SESSION.tv__dbo__p__errors (ID INTEGER GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) NOT NULL PRIMARY KEY, Message VARCHAR(10)) ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE;\n  INSERT INTO SESSION.tv__dbo__p__errors (Message) VALUES ('x');\nEND;\n";
     let r = diff(
         &Artifact::new("b.sql", Dialect::Db2i, b),
         &Artifact::new("b.sql", Dialect::Db2i, b),
@@ -284,7 +362,7 @@ fn a_dgtt_with_start_with_binds() {
 /// PostgreSQL the column is boolean, compared with `cmp` and stored as `val`.
 fn mirror(cmp: &str, val: &str) -> (String, String) {
     let a = "CREATE PROCEDURE dbo.p @n int OUTPUT AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @URLs TABLE (ID int, DirectoryPath nvarchar(4000), Mirror bit);\n  INSERT INTO @URLs (ID, DirectoryPath, Mirror) VALUES (1, N'x', 0);\n  SELECT @n = COUNT(*) FROM @URLs WHERE Mirror = 0;\nEND\n".to_string();
-    let b = format!("CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.tv_p_ur_ls;\n  CREATE TEMP TABLE pg_temp.tv_p_ur_ls (\n    ID integer,\n    DirectoryPath varchar(4000),\n    Mirror boolean\n  );\n  INSERT INTO pg_temp.tv_p_ur_ls (ID, DirectoryPath, Mirror) VALUES (1, 'x', {val});\n  SELECT COUNT(*) INTO p_n FROM pg_temp.tv_p_ur_ls WHERE Mirror {cmp};\nEND;\n$$;\n");
+    let b = format!("CREATE OR REPLACE PROCEDURE p(INOUT p_n integer)\nLANGUAGE plpgsql\nAS $$\nBEGIN\n  DROP TABLE IF EXISTS pg_temp.tv__dbo__p__urls;\n  CREATE TEMP TABLE pg_temp.tv__dbo__p__urls (\n    ID integer,\n    DirectoryPath varchar(4000),\n    Mirror boolean\n  );\n  INSERT INTO pg_temp.tv__dbo__p__urls (ID, DirectoryPath, Mirror) VALUES (1, 'x', {val});\n  SELECT COUNT(*) INTO p_n FROM pg_temp.tv__dbo__p__urls WHERE Mirror {cmp};\nEND;\n$$;\n");
     (a, b)
 }
 

@@ -50,11 +50,13 @@ pub(crate) fn convert(
     src: &str,
     to: Dialect,
     catalog: Option<&sqldiff_core::catalog::Catalog>,
+    claims: &crate::table_vars::Claims,
 ) -> Out {
     let mut cx = Cx {
         src,
         to,
         catalog,
+        claims,
         loops: Vec::new(),
         labels: 0,
         cursors: Vec::new(),
@@ -176,6 +178,10 @@ struct Cx<'a> {
     to: Dialect,
     /// The source catalog of the whole tree being converted, when there is one.
     catalog: Option<&'a sqldiff_core::catalog::Catalog>,
+    /// The temporary table names the tree's table variables claim, by the
+    /// routine that first declared one: a table variable that would take
+    /// another routine's name is refused.
+    claims: &'a crate::table_vars::Claims,
     /// Db2: labels of the enclosing WHILE loops (LEAVE/ITERATE need one).
     loops: Vec<String>,
     /// Db2: loop labels handed out in this routine or script.
@@ -1427,7 +1433,7 @@ impl<'a> Cx<'a> {
             }
         };
         let root = sqldiff_syntax::parse(&wrapped, Dialect::Tsql).syntax();
-        let inner = convert(&root, &wrapped, self.to, self.catalog);
+        let inner = convert(&root, &wrapped, self.to, self.catalog, self.claims);
         let units: Vec<_> = inner
             .units
             .iter()
@@ -3849,6 +3855,15 @@ impl<'a> Cx<'a> {
                 "two table variables of this routine would both become {table}; rename one"
             ));
         }
+        // Every routine of the tree creates its tables in the one temporary
+        // schema, dropping a table of the same name first: a name shared
+        // with another routine would let one replace the other's table when
+        // both are active in a session.
+        if let Some(c) = self.claims.clash(&name, self.routine.as_deref()) {
+            return no(format!(
+                "the table variable would become {table}, the same temporary table as {c}: a routine that calls the other would replace its table; rename one of the variables or routines"
+            ));
+        }
         let mut cols = Vec::new();
         let pk = primary_key_columns(&ts[open + 1..close]);
         for item in split_commas(&ts[open + 1..close]) {
@@ -3859,7 +3874,7 @@ impl<'a> Cx<'a> {
         self.own_table(&v.s, &ts[open + 1..close]);
         self.step_ts_with("tsql.decl.table-variable", ts, table.clone());
         if self.db2() {
-            self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again. Its name carries the routine's, so a routine it calls does not replace it; assumes the routine is not re-entered (called from itself, directly or through other routines) while the table is in use.");
+            self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a NOT LOGGED global temporary table with ON ROLLBACK PRESERVE ROWS, so a rollback keeps its rows as T-SQL does (fact V16; under *NONE the ON ROLLBACK clause does not apply). It lives until the job ends rather than the batch; WITH REPLACE empties it when the code runs again. Its name carries the routine's schema and name, so no other routine of this tree creates a table of that name; assumes the routine is not re-entered (called from itself, directly or through other routines) while the table is in use, and that no routine outside the tree that can be active in the same job declares a table variable whose converted name is the same.");
             return Ok(format!(
                 "DECLARE GLOBAL TEMPORARY TABLE {table} ({}\n) ON COMMIT PRESERVE ROWS NOT LOGGED ON ROLLBACK PRESERVE ROWS WITH REPLACE",
                 cols.join(",")
@@ -3868,7 +3883,7 @@ impl<'a> Cx<'a> {
         if self.rolls_back {
             self.note(Status::Decision, "pg.table-variable-rollback", "This routine rolls back. PostgreSQL's ROLLBACK empties the temporary table of rows written since the transaction began (and drops it when it was created in that transaction), while a table variable keeps its rows. Check that the table is not read after a rollback (or recreate and refill it there).");
         }
-        self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a TEMP table in pg_temp, dropped and created again where the DECLARE stands, so each run starts empty (the DROP sends a notice when there is no table yet). It lives until the session ends rather than the batch, keeps its rows on COMMIT, and its name carries the routine's, so a routine it calls does not replace it. A ROLLBACK empties it where a table variable keeps its rows: the routine itself does not roll back, so assumes no routine it calls rolls the transaction back, and the routine is not re-entered (called from itself, directly or through other routines), while the table is in use.");
+        self.note(Status::Assumptions, "ASM-TABLE-VARIABLE", "The table variable becomes a TEMP table in pg_temp, dropped and created again where the DECLARE stands, so each run starts empty (the DROP sends a notice when there is no table yet). It lives until the session ends rather than the batch, keeps its rows on COMMIT, and its name carries the routine's schema and name, so no other routine of this tree creates a table of that name. A ROLLBACK empties it where a table variable keeps its rows: the routine itself does not roll back, so assumes no routine it calls rolls the transaction back, the routine is not re-entered (called from itself, directly or through other routines) while the table is in use, and no routine outside the tree that can be active in the same session declares a table variable whose converted name is the same.");
         Ok(format!(
             "DROP TABLE IF EXISTS {table};\nCREATE TEMP TABLE {table} ({}\n)",
             cols.join(",")
