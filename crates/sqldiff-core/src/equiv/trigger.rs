@@ -230,6 +230,27 @@ pub(super) fn pairs(
         };
         let ua = lower::lower_trigger(Dialect::Tsql, &body, ev.ctx(table.clone(), true));
         let ub = lower::lower_trigger(Dialect::Postgres, &fbody, ev.ctx(tr.table.clone(), false));
+        // RAISERROR of severity 11 to 18 ignores the trigger's XACT_ABORT:
+        // the T-SQL trigger goes on and the statement that fired it stays
+        // (SQL Server 2022), where PostgreSQL fails that statement.
+        // ASM-TRIGGER-ERROR does not cover it.
+        let mut raised = Vec::new();
+        for s in &ua.stmts {
+            if s.msg.as_ref().is_some_and(|m| m.tsql && m.error)
+                && !s
+                    .node
+                    .ancestors()
+                    .any(|n| n.kind() == SyntaxKind::TRY_BLOCK)
+                && !raised.contains(&s.node)
+            {
+                raised.push(s.node.clone());
+                out.unknown_reasons.push(format!(
+                    "{}the RAISERROR at line {} raises an error that does not end the T-SQL trigger: it goes on and the statement that fired it is kept, where PostgreSQL fails that statement: not compared",
+                    at,
+                    a.line_of(&s.node)
+                ));
+            }
+        }
         let (ga, gb) = (guarded(&ua), guarded(&ub));
         if ga != gb {
             let (with, without) = if ga { ("A", "B") } else { ("B", "A") };
