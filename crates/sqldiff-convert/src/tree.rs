@@ -457,6 +457,49 @@ pub fn convert_with(
     out: Option<&Path>,
     hooks: &Hooks,
 ) -> Result<Tree, String> {
+    convert_kept(a, inputs, unreadable, out, hooks, false)
+}
+
+/// [`convert_with`] for a review, which reads of the engine's reports only
+/// their findings and assumptions: the rest of each file's reports is
+/// dropped as soon as the file is checked (`crate::trim_reports`), so a
+/// large tree is never held whole. The report and every status are the
+/// same. Every other caller gets the reports whole from `convert_with`.
+pub fn convert_for_review(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: Option<&Path>,
+    hooks: &Hooks,
+) -> Result<Tree, String> {
+    convert_kept(a, inputs, unreadable, out, hooks, true)
+}
+
+/// What is kept of each file as it is checked: its notes, shared with the
+/// tree's (`shared::Pool`), and with `trim` only what a review reads of the
+/// engine's reports.
+struct Finish {
+    pool: crate::shared::Pool,
+    trim: bool,
+}
+
+impl Finish {
+    fn apply(&self, c: &mut Conversion) {
+        self.pool.share_notes(c);
+        if self.trim {
+            crate::trim_reports(c);
+        }
+    }
+}
+
+fn convert_kept(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: Option<&Path>,
+    hooks: &Hooks,
+    trim: bool,
+) -> Result<Tree, String> {
     let started = Instant::now();
     if !crate::supported(a.from, a.to) {
         return Err(format!(
@@ -495,9 +538,32 @@ pub fn convert_with(
             hooks,
         )?),
     };
+    let finish = Finish {
+        pool: Default::default(),
+        trim,
+    };
     let results = match &a.template {
-        None => convert_files(a, label, inputs, jobs, ledger, base.as_ref(), hooks)?,
-        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger, base.as_ref(), hooks)?,
+        None => convert_files(
+            a,
+            label,
+            inputs,
+            jobs,
+            ledger,
+            base.as_ref(),
+            hooks,
+            &finish,
+        )?,
+        Some(tm) => convert_templates(
+            a,
+            label,
+            tm,
+            inputs,
+            jobs,
+            ledger,
+            base.as_ref(),
+            hooks,
+            &finish,
+        )?,
     };
     let mut results = results;
     if let Some(b) = &base {
@@ -628,6 +694,7 @@ pub(crate) fn dest_under(out: &Path, rel: &str) -> Result<PathBuf, String> {
 
 /// Converts plain SQL files: rules with the source catalog of the whole
 /// tree, then a check of every draft against both trees' catalogs.
+#[allow(clippy::too_many_arguments)]
 fn convert_files(
     a: &Args,
     out: &Path,
@@ -636,6 +703,7 @@ fn convert_files(
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
     hooks: &Hooks,
+    finish: &Finish,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
@@ -708,8 +776,6 @@ fn convert_files(
     hooks.stop_if_cancelled()?;
     let work = slots(inputs.iter().zip(drafts));
     let progress = Progress::new(work.len(), hooks);
-    // Equal note texts are kept once, as each file is done.
-    let pool = crate::shared::Pool::default();
     let done = parallel(jobs, &work, |w| {
         let (input, draft) = w.lock().unwrap().take().unwrap();
         if hooks.cancelled() {
@@ -717,7 +783,7 @@ fn convert_files(
         }
         let t = Instant::now();
         let mut c = crate::check(&input.text, draft, &opts);
-        pool.share_notes(&mut c);
+        finish.apply(&mut c);
         progress.tick();
         Some((c, t.elapsed().as_secs_f64()))
     });
@@ -949,6 +1015,7 @@ fn convert_templates(
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
     hooks: &Hooks,
+    finish: &Finish,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
     for i in inputs {
@@ -1085,8 +1152,6 @@ fn convert_templates(
     let work = slots(jobs_list.iter().zip(drafts));
     let progress = Progress::new(work.len(), hooks);
     let delimiters = tm.placeholders.delimiters();
-    // Equal note texts are kept once, as each template is done.
-    let pool = crate::shared::Pool::default();
     let done = parallel(jobs, &work, |w| {
         let (j, draft) = w.lock().unwrap().take().unwrap();
         if hooks.cancelled() {
@@ -1094,7 +1159,7 @@ fn convert_templates(
         }
         let t0 = Instant::now();
         let mut c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
-        pool.share_notes(&mut c);
+        finish.apply(&mut c);
         progress.tick();
         Some((c, t0.elapsed().as_secs_f64()))
     });

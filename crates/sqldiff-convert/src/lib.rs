@@ -73,6 +73,23 @@ impl Status {
     }
 }
 
+/// Drops what is read of neither engine report of `c` once its file is
+/// checked and its units have their statuses: of each report only the
+/// findings (units point into them) and the assumptions (the deployment
+/// report reads them) stay. For a review (`tree::convert_for_review`).
+pub fn trim_reports(c: &mut Conversion) {
+    for r in [&mut c.report, &mut c.output_check] {
+        r.witnesses = Vec::new();
+        r.diagnostics = Vec::new();
+        r.normalizations = Vec::new();
+        r.unknown_reasons = Vec::new();
+        r.discharged = Vec::new();
+        r.suppressed = Vec::new();
+        r.refinements = Vec::new();
+        r.proof = None;
+    }
+}
+
 /// Why a unit has the status it has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
