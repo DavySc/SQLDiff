@@ -149,8 +149,9 @@ def typeCode (d : Dialect) (env : TyEnv) (x : Var) : Option String :=
 
 /-- (C3d) Why a one-part name in a query block does not resolve: a column
 of two sources (`name:ambiguous`), in PL/pgSQL a column that is also a
-variable (`name:column-variable`), else no column the name may see (or
-a reference name: a whole-row reference). -/
+variable (`name:column-variable`), (C3d part 2, review) a PostgreSQL
+system column's name (`name:system-column`, `pgSystemCols`), else no
+column the name may see (or a reference name: a whole-row reference). -/
 def blockNameReason (d : Dialect) (sc : Scope) (x : String) : String :=
   let n := match d with
     | .tsql _ _ => x
@@ -159,7 +160,8 @@ def blockNameReason (d : Dialect) (sc : Scope) (x : String) : String :=
   if hs.length ≥ 2 then "name:ambiguous"
   else match d with
     | .pg _ vars _ =>
-      if hs.length == 1 && vars.contains n && !sc.srcs.any (·.ref == n) then "name:column-variable"
+      if pgSystemCols.contains n then "name:system-column"
+      else if hs.length == 1 && vars.contains n && !sc.srcs.any (·.ref == n) then "name:column-variable"
       else if hs.any (fun (s, _) => s.opaqueNames.contains n) then "stmt:select:column:opaque"
       else "expr:name:unresolved"
     | .tsql _ _ =>
@@ -184,6 +186,7 @@ def ownReason (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option Str
     | .pg _ _ _ =>
       let n := pgName x
       if n == "sqlstate" || n == "sqlerrm" then some ("expr:fn:error:" ++ n)
+      else if sc.rel.isSome && pgSystemCols.contains n then some "name:system-column"
       else match resolveName d sc x with
         | none => some "expr:name:unresolved"
         | some (.inr v) => typeCode d env v
@@ -194,9 +197,10 @@ def ownReason (d : Dialect) (env : TyEnv) (sc : Scope) : Ast.Expr → Option Str
   | .Name [q, c] =>
     if sc.srcs.isEmpty then some "expr:name:qualified"
     else if (resolveQual d sc q c).isNone then
-      -- (C3d part 2) The one source `q` names has `c` as an opaque column.
+      -- (C3d part 2) The one source `q` names has `c` as an opaque column
+      -- (T-SQL: spelt in any case, as `holders` compares).
       let opq := match d with
-        | .tsql _ _ => sc.srcs.any fun s => s.ref == q && s.opaqueNames.contains c
+        | .tsql _ _ => sc.srcs.any fun s => s.ref == q && s.opaqueNames.any (·.toLower == c.toLower)
         | .pg _ _ _ => sc.srcs.any fun s => s.ref == pgName q && s.opaqueNames.contains (pgName c)
       some (if opq then "stmt:select:column:opaque" else "stmt:select:from:qualifier")
     else none

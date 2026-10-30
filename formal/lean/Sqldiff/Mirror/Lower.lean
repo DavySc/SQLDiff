@@ -263,8 +263,11 @@ an expression resolves as follows (`resolveName`).
   variable is the column; a name that is the table's own reference name
   (the last part of the target's name) and not a column is a whole-row
   reference, outside the spec (and an ambiguity error, too, when a
-  variable has that name); any other name is a variable, which must be
-  declared (`wellScoped`). Not probed.
+  variable has that name); (C3d part 2, review) so is, in an `UPDATE` or
+  `DELETE`, a system column's name (`pgSystemCols`: `tableoid`, `xmin`,
+  `cmin`, `xmax`, `cmax`, `ctid`), which every table has (42702 for a
+  variable so spelt, probed, eval/queries Q20); any other name is a
+  variable, which must be declared (`wellScoped`). Not probed.
 * In both dialects, the column list of `INSERT` and the column a `SET`
   assigns are columns, never variables ("Variable Substitution": in
   `INSERT INTO dest (col) ...`, "col must be a column of dest"), resolved
@@ -316,10 +319,21 @@ def Scope.holders (d : Dialect) (sc : Scope) (x : String) : List (Src × Nat) :=
     | .tsql _ _ => k.toLower == x.toLower
     | .pg _ _ _ => k == x
 
+/-- (C3d part 2, review) PostgreSQL's system columns, which every table
+has without declaring them (PostgreSQL 18 manual, 5.6 "System Columns",
+from memory): a PL/pgSQL variable spelt as one, in a query over a table or
+in an `UPDATE`'s or `DELETE`'s `WHERE`, is the column-variable conflict
+(42702; probed for all six, eval/queries Q20). In a scope with a table such
+a name resolves to nothing (`resolveName`). No catalog column has such a
+name: PostgreSQL refuses a user column that does. -/
+def pgSystemCols : List String := ["tableoid", "xmin", "cmin", "xmax", "cmax", "ctid"]
+
 /-- A one-part name: a column (`inl`), a variable (`inr`), or outside the
 spec (`none`). Outside data statements a T-SQL name is outside the spec
 and a PostgreSQL name is a variable, as in C1. (C3d) In a query block,
-see "Names in a query block" below. -/
+see "Names in a query block" below. (C3d part 2, review) A PostgreSQL
+name that is a system column (`pgSystemCols`) is outside the spec in a
+query block and in an `UPDATE` or `DELETE`: every table has it. -/
 def resolveName (d : Dialect) (sc : Scope) (x : String) : Option (Sum Core.Col Var) :=
   if !sc.srcs.isEmpty then
     match d with
@@ -328,7 +342,8 @@ def resolveName (d : Dialect) (sc : Scope) (x : String) : Option (Sum Core.Col V
       | _ => none
     | .pg _ vars _ =>
       let n := pgName x
-      if n == "sqlstate" || n == "sqlerrm" || sc.srcs.any (·.ref == n) then none else
+      if n == "sqlstate" || n == "sqlerrm" || pgSystemCols.contains n || sc.srcs.any (·.ref == n)
+      then none else
       match sc.holders d n with
       | [] => some (.inr n)
       | [(s, i)] =>
@@ -341,6 +356,8 @@ def resolveName (d : Dialect) (sc : Scope) (x : String) : Option (Sum Core.Col V
     let n := pgName x
     -- C4: the error variables of a handler are outside the spec.
     if n == "sqlstate" || n == "sqlerrm" then none else
+    -- C3d part 2, review: a system column of the statement's table.
+    if sc.rel.isSome && pgSystemCols.contains n then none else
     match lookup sc.cols n with
     | some c => if vars.contains n then none else some (.inl c)
     | none => if sc.rel == some n then none else some (.inr n)
@@ -2662,8 +2679,11 @@ eval/queries Q12 (1013, 42712).
   database too). In PostgreSQL a name that is a column of any source and
   also a variable is outside (C3a's rule, now over every source; probed,
   eval/queries Q12: 42702 for a column of the second table), and so is a
-  reference name (a whole-row reference); a name that is no column of
-  any source is a variable. T-SQL names are never variables.
+  reference name (a whole-row reference) and (C3d part 2, review) a
+  system column's name (`pgSystemCols`), a column of every table (probed,
+  eval/queries Q20: 42702 for each of the six as a variable, in the
+  converter's query and in an `UPDATE`'s `WHERE`); a name that is no
+  column of any source is a variable. T-SQL names are never variables.
 
 **The picks.**
 

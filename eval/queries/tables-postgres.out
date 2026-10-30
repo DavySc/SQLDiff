@@ -14,3 +14,15 @@ NOTICE:  Q18 policy enabled and forced, owner: count=1
 NOTICE:  Q19 numeric and integer column, unqualified: error 42702
 NOTICE:  Q19 numeric and integer column, qualified: no error
 NOTICE:  Q19 variable spelt as a numeric column: error 42702
+NOTICE:  Q20 variable tableoid in SELECT INTO: error 42702
+NOTICE:  Q20 variable tableoid in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable xmin in SELECT INTO: error 42702
+NOTICE:  Q20 variable xmin in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable cmin in SELECT INTO: error 42702
+NOTICE:  Q20 variable cmin in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable xmax in SELECT INTO: error 42702
+NOTICE:  Q20 variable xmax in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable cmax in SELECT INTO: error 42702
+NOTICE:  Q20 variable cmax in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable ctid in SELECT INTO: error 42702
+NOTICE:  Q20 variable ctid in UPDATE WHERE: error 42702

@@ -136,6 +136,84 @@ EXCEPTION WHEN OTHERS THEN
   RAISE NOTICE 'Q19 variable spelt as a numeric column: error %', SQLSTATE;
 END $$;
 CALL q19_var(1);
+
+-- Q20 system columns (review of C3d part 2): every table has the hidden
+-- columns tableoid, xmin, cmin, xmax, cmax and ctid. A PL/pgSQL variable
+-- spelt as one, used in a query over a table (the converter's SELECT ... INTO
+-- shape) or in an UPDATE's WHERE, is the column-variable conflict too.
+CREATE OR REPLACE PROCEDURE q20_try(sql text, label text) LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE sql;
+  RAISE NOTICE 'Q20 %: no error', label;
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'Q20 %: error %', label, SQLSTATE;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_sel_tableoid(tableoid integer) LANGUAGE plpgsql AS $$
+DECLARE v integer;
+BEGIN
+  SELECT COUNT(*) INTO v FROM line_plain WHERE ord_id = 1 AND tableoid IS NOT NULL;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_upd_tableoid(tableoid integer) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE line_plain SET qty = qty WHERE ord_id = -1 AND tableoid IS NOT NULL;
+END $$;
+CALL q20_try('CALL q20_sel_tableoid(1)', 'variable tableoid in SELECT INTO');
+CALL q20_try('CALL q20_upd_tableoid(1)', 'variable tableoid in UPDATE WHERE');
+CREATE OR REPLACE PROCEDURE q20_sel_xmin(xmin integer) LANGUAGE plpgsql AS $$
+DECLARE v integer;
+BEGIN
+  SELECT COUNT(*) INTO v FROM line_plain WHERE ord_id = 1 AND xmin IS NOT NULL;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_upd_xmin(xmin integer) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE line_plain SET qty = qty WHERE ord_id = -1 AND xmin IS NOT NULL;
+END $$;
+CALL q20_try('CALL q20_sel_xmin(1)', 'variable xmin in SELECT INTO');
+CALL q20_try('CALL q20_upd_xmin(1)', 'variable xmin in UPDATE WHERE');
+CREATE OR REPLACE PROCEDURE q20_sel_cmin(cmin integer) LANGUAGE plpgsql AS $$
+DECLARE v integer;
+BEGIN
+  SELECT COUNT(*) INTO v FROM line_plain WHERE ord_id = 1 AND cmin IS NOT NULL;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_upd_cmin(cmin integer) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE line_plain SET qty = qty WHERE ord_id = -1 AND cmin IS NOT NULL;
+END $$;
+CALL q20_try('CALL q20_sel_cmin(1)', 'variable cmin in SELECT INTO');
+CALL q20_try('CALL q20_upd_cmin(1)', 'variable cmin in UPDATE WHERE');
+CREATE OR REPLACE PROCEDURE q20_sel_xmax(xmax integer) LANGUAGE plpgsql AS $$
+DECLARE v integer;
+BEGIN
+  SELECT COUNT(*) INTO v FROM line_plain WHERE ord_id = 1 AND xmax IS NOT NULL;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_upd_xmax(xmax integer) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE line_plain SET qty = qty WHERE ord_id = -1 AND xmax IS NOT NULL;
+END $$;
+CALL q20_try('CALL q20_sel_xmax(1)', 'variable xmax in SELECT INTO');
+CALL q20_try('CALL q20_upd_xmax(1)', 'variable xmax in UPDATE WHERE');
+CREATE OR REPLACE PROCEDURE q20_sel_cmax(cmax integer) LANGUAGE plpgsql AS $$
+DECLARE v integer;
+BEGIN
+  SELECT COUNT(*) INTO v FROM line_plain WHERE ord_id = 1 AND cmax IS NOT NULL;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_upd_cmax(cmax integer) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE line_plain SET qty = qty WHERE ord_id = -1 AND cmax IS NOT NULL;
+END $$;
+CALL q20_try('CALL q20_sel_cmax(1)', 'variable cmax in SELECT INTO');
+CALL q20_try('CALL q20_upd_cmax(1)', 'variable cmax in UPDATE WHERE');
+CREATE OR REPLACE PROCEDURE q20_sel_ctid(ctid integer) LANGUAGE plpgsql AS $$
+DECLARE v integer;
+BEGIN
+  SELECT COUNT(*) INTO v FROM line_plain WHERE ord_id = 1 AND ctid IS NOT NULL;
+END $$;
+CREATE OR REPLACE PROCEDURE q20_upd_ctid(ctid integer) LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE line_plain SET qty = qty WHERE ord_id = -1 AND ctid IS NOT NULL;
+END $$;
+CALL q20_try('CALL q20_sel_ctid(1)', 'variable ctid in SELECT INTO');
+CALL q20_try('CALL q20_upd_ctid(1)', 'variable ctid in UPDATE WHERE');
 \c postgres
 DROP DATABASE probe_c3d2;
 DROP ROLE probe_owner;

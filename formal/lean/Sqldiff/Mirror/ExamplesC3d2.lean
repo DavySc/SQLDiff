@@ -5,7 +5,9 @@ wholly visible ("The C3d tables" in `Sqldiff/Mirror/Lower.lean`). A read
 of a read-only table is confirmed; a write to one is refused; a column
 outside the slice is a name only, never read, and counts for ambiguity
 and the PL/pgSQL column-variable conflict; a key with an opaque or a
-string part leaves the table without a key. Runs of the core interpreter
+string part leaves the table without a key; (review) a PL/pgSQL variable
+spelt as a system column is no variable in a query over a table or an
+`UPDATE`'s `WHERE`. Runs of the core interpreter
 show the projection read alike on both sides. Every `#guard` runs on
 every `lake build`.
 -/
@@ -230,6 +232,36 @@ A parameter `price` in a query over `line`, whose `price` is opaque
 -- The same parameter under another name reads as a variable.
 #guard (lowerP Γr (forR (qn "l" "qty") (and_ byKeyP (.Bin ">" (qn "l" "qty") (pv "p_price")))
   [inP "p_id", ioP "p_q", inP "p_price"])).isSome
+
+-- (Review) A qualified opaque column in another case is still the opaque
+-- column for the diagnostics (as `holders` compares T-SQL names).
+#guard whyT depr Γr (pickR [tbl ["dbo", "Line"] (some "l")] (some byKeyT) (qn "l" "PRICE")) ==
+  ["stmt:select:column:opaque"]
+
+/-! ## Refused: a PL/pgSQL variable spelt as a system column (review)
+
+Every PostgreSQL table has the columns `tableoid`, `xmin`, `cmin`, `xmax`,
+`cmax` and `ctid`. A variable so spelt, in the converter's query over a
+table or in an `UPDATE`'s `WHERE`, is the column-variable conflict
+(42702 for all six, eval/queries Q20); the checker read it as the
+variable. Under another name it is one. -/
+
+#guard pgSystemCols.all fun n =>
+  (lowerP Γr (forR (qn "l" "qty") (and_ byKeyP (.Bin ">" (qn "l" "qty") (pv n)))
+    [inP "p_id", ioP "p_q", inP n])).isNone
+#guard whyP Γr (forR (qn "l" "qty") (and_ byKeyP (.Bin ">" (qn "l" "qty") (pv "XMin")))
+  [inP "p_id", ioP "p_q", inP "xmin"]) == ["name:system-column"]
+#guard (lowerP Γr (forR (qn "l" "qty") (and_ byKeyP (.Bin ">" (qn "l" "qty") (pv "p_xmin")))
+  [inP "p_id", ioP "p_q", inP "p_xmin"])).isSome
+def updSys (n : String) : Ast.Routine :=
+  pgProc ["r"] [inP "p_id", ioP "p_q", inP n] []
+    [upd ["feed"] [("itemid", pv "p_id")] (some (.IsNull (pv n) false))]
+#guard (lowerP Γw (updSys "p_ctid")).isSome
+#guard pgSystemCols.all fun n => (lowerP Γw (updSys n)).isNone
+#guard whyP Γw (updSys "ctid") == ["name:system-column"]
+-- An `INSERT ... VALUES` has no table in scope: the variable is read.
+#guard (lowerP Γw (pgProc ["r"] [inP "p_id", ioP "p_q", inP "ctid"] []
+  [ins ["feed"] ["itemid"] [[pv "ctid"]]])).isSome
 
 /-! ## Keys with an opaque part
 
