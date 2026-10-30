@@ -524,9 +524,11 @@ async function submit(body, after) {
 
 async function apply(st, advance) {
   const idx = S.selIndex;
-  S.st = st; S.reviewed = st.reviewed;
+  // A new read: rows loaded before may be stale (a unit decided since
+  // still shows its open assumption), so none is kept.
+  S.st = st; S.reviewed = st.reviewed; S.items = new Map();
   await loadList();
-  // A pick stays while its unit is listed with an open assumption.
+  // A pick stays while its unit is listed again with an open assumption.
   for (const k of [...S.picked]) if (!(S.items.get(k) || { open_assumptions: [] }).open_assumptions.length) S.picked.delete(k);
   renderHeader(); renderQueue();
   const here = S.sel && !S.sel.startsWith("@") ? await near(`from=${encodeURIComponent(S.sel)}`) : null;
