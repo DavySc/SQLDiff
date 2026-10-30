@@ -268,11 +268,11 @@ fn fetched_variables_are_not_read_after_the_loop() {
 fn a_fetch_names_why_its_query_was_not_read() {
     let r = not_equal(
         &t(
-            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.t UNION ALL SELECT id, v FROM dbo.log ORDER BY id;",
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, MAX(v) OVER (PARTITION BY v) FROM dbo.t ORDER BY id;",
             T_LOOP,
         ),
         &p(
-            "  OPEN cur_c FOR SELECT id, v FROM t UNION ALL SELECT id, v FROM log ORDER BY id;",
+            "  OPEN cur_c FOR SELECT id, MAX(v) OVER (PARTITION BY v) FROM t ORDER BY id;",
             P_LOOP,
         ),
     );
@@ -283,13 +283,38 @@ fn a_fetch_names_why_its_query_was_not_read() {
         .chain(r.findings.iter().map(|f| f.witness.as_str()))
         .collect();
     assert!(
-        texts.iter().any(|x| x
-            .contains("a FETCH of a cursor whose query was not read (in its OPEN: set operations")),
+        texts.iter().any(|x| x.contains(
+            "a FETCH of a cursor whose query was not read (in its OPEN: window functions"
+        )),
         "{texts:#?}"
     );
     assert!(
         !texts.iter().any(|x| x.contains("OPEN was not read")),
         "{texts:#?}"
+    );
+}
+
+#[test]
+fn a_cursor_over_a_union_all() {
+    equal(
+        &t(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.t UNION ALL SELECT id, v FROM dbo.log ORDER BY id;",
+            T_LOOP,
+        ),
+        &p(
+            "  OPEN cur_c FOR SELECT id, v FROM t UNION ALL SELECT id, v FROM log ORDER BY id;",
+            P_LOOP,
+        ),
+    );
+    not_equal(
+        &t(
+            "  DECLARE c CURSOR LOCAL FAST_FORWARD FOR SELECT id, v FROM dbo.t UNION ALL SELECT id, v FROM dbo.log ORDER BY id;",
+            T_LOOP,
+        ),
+        &p(
+            "  OPEN cur_c FOR SELECT id, v FROM t UNION SELECT id, v FROM log ORDER BY id;",
+            P_LOOP,
+        ),
     );
 }
 

@@ -4,7 +4,7 @@
 
 use sqldiff_syntax::{ast as cst, Dialect, SyntaxKind, SyntaxNode};
 
-use super::ast::{parse_stmt, tokens, Expr, Parser, Stmt, Tok, Type, K};
+use super::ast::{parse_stmt_lowered, tokens, Expr, Parser, Stmt, Tok, Type, K};
 use super::cursor::{CursorLoop, CursorOp};
 use super::schema::Ty;
 use crate::artifact::Analyzed;
@@ -539,7 +539,7 @@ fn assign_loop(c: &SyntaxNode, u: &mut Unit) -> bool {
         [v, kw, rest @ ..] if v.kind == K::Word && v.up == r && kw.up == "IN" => rest,
         _ => return false,
     };
-    let Ok(Stmt::Select(mut sel)) = parse_stmt(query, d) else {
+    let Ok(Stmt::Select(mut sel)) = parse_stmt_lowered(query, d) else {
         return false;
     };
     // `v := r.c`, each variable and each column once.
@@ -911,7 +911,7 @@ fn header(r: &SyntaxNode, u: &mut Unit) {
             .push((r.clone(), "an unrecognised routine header".into()));
         return;
     };
-    let mut p = Parser::new(&toks[kw + 1..], d);
+    let mut p = Parser::lowering(&toks[kw + 1..], d);
     if p.qname().is_err() {
         u.uncovered
             .push((r.clone(), "an unrecognised routine name".into()));
@@ -1047,7 +1047,7 @@ pub(crate) fn param(toks: &[Tok], d: Dialect) -> Option<Param> {
     if toks.get(i).is_some_and(|t| t.up == "AS") {
         i += 1;
     }
-    let mut p = Parser::new(&toks[i..], d);
+    let mut p = Parser::lowering(&toks[i..], d);
     let ty: Type = p.ty().ok()?;
     let mut default: Option<Vec<String>> = None;
     for t in &toks[i + p.i..] {
@@ -1204,7 +1204,7 @@ fn condition(c: &SyntaxNode, d: Dialect) -> Result<Expr, String> {
 }
 
 fn expression(toks: &[Tok], d: Dialect) -> Result<Expr, String> {
-    let mut p = Parser::new(toks, d);
+    let mut p = Parser::lowering(toks, d);
     let e = p.expr()?;
     if !p.at_end() {
         return Err("unexpected tokens after the condition".into());
@@ -1487,7 +1487,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let mut ast = parse_stmt(&toks, d);
+            let mut ast = parse_stmt_lowered(&toks, d);
             let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {
@@ -1550,7 +1550,7 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
                             })) =>
                 {
                     let body: Vec<Tok> = toks[at + 1..].to_vec();
-                    let ast = parse_stmt(&body, d);
+                    let ast = parse_stmt_lowered(&body, d);
                     u.kind = UnitKind::View;
                     u.stmts.push(LStmt {
                         node: c.clone(),
@@ -1877,7 +1877,7 @@ fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
         _ => return None,
     };
     let expr = |ts: &[Tok]| -> Result<Expr, String> {
-        let mut p = Parser::new(ts, d);
+        let mut p = Parser::lowering(ts, d);
         let e = p.expr()?;
         if p.at_end() {
             Ok(e)
@@ -2060,7 +2060,7 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
         _ => return Err("RAISERROR WITH LOG or SETERROR".into()),
     }
     let expr = |ts: &[Tok]| -> Result<Expr, String> {
-        let mut p = Parser::new(ts, Dialect::Tsql);
+        let mut p = Parser::lowering(ts, Dialect::Tsql);
         let e = p.expr()?;
         if p.at_end() {
             Ok(e)
@@ -2170,7 +2170,7 @@ fn note(u: &mut Unit, s: &str) {
 fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
     let toks = tokens(s);
     let d = u.dialect;
-    let mut p = Parser::new(&toks, d);
+    let mut p = Parser::lowering(&toks, d);
     let ok = (|| -> Result<(String, Type, usize), String> {
         let n = p.qname()?;
         if n.len() != 1 {
@@ -2206,7 +2206,7 @@ fn pg_declaration(s: &SyntaxNode, u: &mut Unit) {
         u.uncovered.push((s.clone(), "a declaration".into()));
         return;
     }
-    let mut p = Parser::new(&rest[1..], d);
+    let mut p = Parser::lowering(&rest[1..], d);
     let ast = p.expr().and_then(|e| {
         if p.at_end() {
             Ok(Stmt::Assign(super::ast::Expr::Name(vec![name.clone()]), e))
