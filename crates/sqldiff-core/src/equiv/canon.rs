@@ -596,8 +596,9 @@ impl<'a> Canon<'a> {
         self.output = None;
     }
 
-    /// SQL Server cannot compare geography values (GROUP BY, DISTINCT, IN,
-    /// set operations, = all fail); PostGIS compares their bounding boxes.
+    /// SQL Server cannot compare geography, text, ntext, image or xml values
+    /// (GROUP BY, DISTINCT, IN, set operations, = all fail); PostGIS
+    /// compares geography bounding boxes, PostgreSQL has no xml equality.
     /// The marker keeps such a comparison apart from the other dialect's;
     /// no assumption discharges it.
     fn geog_cmp(&self) -> Term {
@@ -981,7 +982,13 @@ impl<'a> Canon<'a> {
             // IMAGE, MONEY, an alias type, …): the store may pad, cut off,
             // round or fail.
             Fam::Other => false,
-            Fam::Date | Fam::Interval | Fam::Bool | Fam::Uuid | Fam::Geography => true,
+            Fam::Date
+            | Fam::Interval
+            | Fam::Bool
+            | Fam::Uuid
+            | Fam::Geography
+            | Fam::Text
+            | Fam::NoCompare => true,
         }
     }
 
@@ -1313,10 +1320,10 @@ impl<'a> Canon<'a> {
                     items = items.into_iter().map(Self::bit_value).collect();
                 }
                 items.sort();
-                let geog = ty.is_some_and(|t| t.fam == Fam::Geography)
+                let geog = ty.is_some_and(|t| t.compares_per_dialect())
                     || item_tys
                         .iter()
-                        .any(|t| t.is_some_and(|t| t.fam == Fam::Geography));
+                        .any(|t| t.is_some_and(|t| t.compares_per_dialect()));
                 let mut kids = vec![t, n("list", items), a(neg.to_string())];
                 if geog {
                     kids.push(self.geog_cmp());
@@ -1343,10 +1350,10 @@ impl<'a> Canon<'a> {
                 let mut kids = vec![t, q.0, a(neg.to_string())];
                 // The subquery's column type is not tracked, so only a known
                 // non-string operand avoids the collation.
-                if ty.map_or(true, |t| t.is_string()) {
-                    kids.push(self.dtag());
-                } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                if ty.is_some_and(|t| t.compares_per_dialect()) {
                     kids.push(self.geog_cmp());
+                } else if ty.map_or(true, |t| t.is_string()) {
+                    kids.push(self.dtag());
                 }
                 (n("inq", kids), None)
             }
@@ -1543,10 +1550,10 @@ impl<'a> Canon<'a> {
                 match op {
                     Some(o) => {
                         let (t, ty) = self.expr(o)?;
-                        if ty.map_or(true, |t| t.is_string()) {
-                            kids.push(self.dtag());
-                        } else if ty.is_some_and(|t| t.fam == Fam::Geography) {
+                        if ty.is_some_and(|t| t.compares_per_dialect()) {
                             kids.push(self.geog_cmp());
+                        } else if ty.map_or(true, |t| t.is_string()) {
+                            kids.push(self.dtag());
                         }
                         kids.push(t);
                     }
@@ -1956,7 +1963,7 @@ impl<'a> Canon<'a> {
             // numeric half away from zero and float half to even.
             (Exact | Float, Int) if self.d == Dialect::Tsql => Rule::Trunc,
             (Float, Float) => Rule::Same,
-            (Uuid, Uuid) | (Geography, Geography) => Rule::Same,
+            (Uuid, Uuid) | (Geography, Geography) | (NoCompare, NoCompare) => Rule::Same,
             // Explicit casts truncate silently on both sides, and storing too
             // long a string fails on both; a T-SQL variable truncates where a
             // PL/pgSQL one fails. CHAR pads on both; what differs is how
@@ -1964,7 +1971,7 @@ impl<'a> Canon<'a> {
             // PostgreSQL drops a CHAR value's trailing blanks when it becomes
             // varchar or text; SQL Server keeps them.
             (Char, VarChar) if self.d == Dialect::Postgres => Rule::Dialect,
-            (Char | VarChar, Char | VarChar) if how != How::Var => Rule::Same,
+            (Char | VarChar | Text, Char | VarChar | Text) if how != How::Var => Rule::Same,
             (Timestamp | Date, Date) | (Date, Timestamp) => Rule::Same,
             // Fewer fractional digits round differently: PostgreSQL rounds a
             // half away from 2000-01-01 and to 24:00:00.
@@ -2145,7 +2152,7 @@ impl<'a> Canon<'a> {
                     if c.distinct {
                         if tys
                             .iter()
-                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                            .any(|t| t.is_some_and(|t| t.compares_per_dialect()))
                         {
                             kids.push(self.geog_cmp());
                         } else if tys.iter().any(|t| t.is_some_and(|t| t.is_string())) {
@@ -2161,9 +2168,13 @@ impl<'a> Canon<'a> {
             | (Dialect::Db2i, "listagg")
                 if argc == 2 && !c.distinct =>
             {
-                let (x, _) = self.expr(&c.args[0])?;
+                let (x, xty) = self.expr(&c.args[0])?;
                 let (sep, _) = self.expr(&c.args[1])?;
                 let order = self.order_terms(&c.order, None)?;
+                // SQL Server refuses text and ntext here (Msg 8116).
+                if d == Dialect::Tsql && xty.is_some_and(|t| t.fam == Fam::Text) {
+                    return Ok((n("dfn", vec![self.dtag(), a("string_agg"), x, sep]), None));
+                }
                 match d {
                     Dialect::Tsql => self.assume(asm::STRING_AGG_8000),
                     Dialect::Db2i => self.assume(asm::LISTAGG_LEN),
@@ -2300,6 +2311,27 @@ impl<'a> Canon<'a> {
         let mut args = Vec::new();
         for x in &c.args {
             args.push(self.expr(x)?);
+        }
+        // SQL Server refuses text and ntext in most built-ins (Msg 8116,
+        // NULLIF Msg 402); these take them.
+        if d == Dialect::Tsql
+            && args.iter().any(|x| x.1.is_some_and(|t| t.fam == Fam::Text))
+            && !matches!(
+                name.as_str(),
+                "substring"
+                    | "patindex"
+                    | "datalength"
+                    | "isnull"
+                    | "coalesce"
+                    | "charindex"
+                    | "textptr"
+            )
+        {
+            let kids = [self.dtag(), a(&name)]
+                .into_iter()
+                .chain(args.into_iter().map(|x| x.0))
+                .collect();
+            return Ok((n("dfn", kids), None));
         }
         let first_ty = args.first().and_then(|x| x.1);
         let portable = |h: &str, args: Vec<(Term, Option<Ty>)>, ty| {
@@ -2991,6 +3023,18 @@ impl<'a> Canon<'a> {
             |f: &dyn Fn(&Ty) -> bool| lty.as_ref().is_some_and(f) || rty.as_ref().is_some_and(f);
         match op {
             "=" | "<>" | "<" | ">" | "<=" | ">=" => {
+                // SQL Server orders uniqueidentifier by its byte groups, last
+                // group first; PostgreSQL orders uuid byte by byte. SQL Server
+                // cannot compare geography, text, ntext, image or xml at all.
+                if any(&|t| t.compares_per_dialect())
+                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
+                {
+                    let (x, y, op) = order_operands(op, lt, rt);
+                    return Ok((
+                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
+                        Some(Ty::of(Fam::Bool)),
+                    ));
+                }
                 let string = any(&|t| t.is_string());
                 let known = lty.is_some() || rty.is_some();
                 if string && any(&|t| !t.is_string()) {
@@ -3005,18 +3049,6 @@ impl<'a> Canon<'a> {
                 if string {
                     return Ok((
                         self.strcmp(op, (lt, lty), (rt, rty)),
-                        Some(Ty::of(Fam::Bool)),
-                    ));
-                }
-                // SQL Server orders uniqueidentifier by its byte groups, last
-                // group first; PostgreSQL orders uuid byte by byte. SQL Server
-                // has no comparison of geography at all.
-                if any(&|t| t.fam == Fam::Geography)
-                    || (any(&|t| t.fam == Fam::Uuid) && !matches!(op, "=" | "<>"))
-                {
-                    let (x, y, op) = order_operands(op, lt, rt);
-                    return Ok((
-                        n("cmp-dialect", vec![self.dtag(), a(op), x, y]),
                         Some(Ty::of(Fam::Bool)),
                     ));
                 }
@@ -3073,7 +3105,8 @@ impl<'a> Canon<'a> {
                 Ok(self.concat_bin(lt, lty, rt, rty))
             }
             "+" if self.d == Dialect::Tsql && (any(&|t| t.is_string()) || l_or_r_is_str(l, r)) => {
-                if any(&|t| t.is_numeric() || t.is_temporal()) {
+                // SQL Server refuses `+` on text and ntext (Msg 402).
+                if any(&|t| t.is_numeric() || t.is_temporal() || t.fam == Fam::Text) {
                     return Ok((n("dfn", vec![a("tsql"), a("+"), lt, rt]), None));
                 }
                 if lty.is_none() || rty.is_none() {
@@ -3689,7 +3722,7 @@ impl<'a> Canon<'a> {
                     if h != "union-all"
                         && col_tys
                             .iter()
-                            .any(|t| t.is_some_and(|t| t.fam == Fam::Geography))
+                            .any(|t| t.is_some_and(|t| t.compares_per_dialect()))
                     {
                         kids.push(self.geog_cmp());
                     }
@@ -3805,8 +3838,8 @@ impl<'a> Canon<'a> {
         for g in &s.group_by {
             let (t, ty) = self.expr(g)?;
             group.push(match ty {
+                Some(t2) if t2.compares_per_dialect() => n("geog-key", vec![self.geog_cmp(), t]),
                 Some(t2) if t2.is_string() => n("collate", vec![self.dtag(), t]),
-                Some(t2) if t2.fam == Fam::Geography => n("geog-key", vec![self.geog_cmp(), t]),
                 None => {
                     self.assume(asm::UNTYPED);
                     t
@@ -3819,7 +3852,7 @@ impl<'a> Canon<'a> {
             a("all")
         } else if items
             .iter()
-            .any(|x| x.1.is_some_and(|t| t.fam == Fam::Geography))
+            .any(|x| x.1.is_some_and(|t| t.compares_per_dialect()))
         {
             n("distinct-geog", vec![self.geog_cmp()])
         } else if items.iter().any(|x| x.1.is_some_and(|t| t.is_string())) {
