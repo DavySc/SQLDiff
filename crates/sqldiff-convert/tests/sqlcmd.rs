@@ -24,12 +24,18 @@ fn reason(src: &str) -> String {
 #[test]
 fn sqlcmd_is_not_sql() {
     // `:r` is an include: dropped with a decision to run the included
-    // file's conversion there; the engine compared nothing, so not proven.
+    // file's conversion there. That decision is its outcome, not "not
+    // compared": there is no SQL to compare.
     let c = pg(":r .\\pds100-ins-app-people.sql\n:r \"..\\x\\b.sql\"\nSELECT 1;\n");
     let r: Vec<_> = c.units.iter().filter(|u| u.src.line <= 2).collect();
     assert_eq!(r.len(), 2, "{:#?}", c.units);
     for u in r {
-        assert_eq!(u.status, Status::Unproven, "{}", c.output);
+        assert_eq!(u.status, Status::Decision, "{}", c.output);
+        assert!(
+            u.notes.iter().all(|n| n.rule != "equiv.not-compared"),
+            "{:#?}",
+            u.notes
+        );
         assert!(
             u.notes
                 .iter()
