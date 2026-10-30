@@ -156,13 +156,23 @@ fn an_aggregate_over_all_rows() {
         "  SET @n = (SELECT MAX(v) OVER () FROM dbo.t);",
         "  v_n := (SELECT MAX(v) FROM t);",
     );
-    // Partitions, window ordering and ranking functions are not read.
+    // Partitions and window ordering of aggregates are not read.
     not_equal(
         "  INSERT INTO dbo.r (id, v) SELECT id, MAX(v) OVER (PARTITION BY w) FROM dbo.t;",
         "  INSERT INTO r (id, v) SELECT id, MAX(v) OVER (PARTITION BY w) FROM t;",
     );
-    not_equal(
+    // ROW_NUMBER() OVER (ORDER BY ...) numbers by its keys (ASM-ORDER-TOTAL
+    // where they may tie); another direction numbers otherwise.
+    equal(
         "  INSERT INTO dbo.r (id, v) SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM dbo.t;",
         "  INSERT INTO r (id, v) SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t;",
+    );
+    not_equal(
+        "  INSERT INTO dbo.r (id, v) SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM dbo.t;",
+        "  INSERT INTO r (id, v) SELECT id, ROW_NUMBER() OVER (ORDER BY id DESC) FROM t;",
+    );
+    not_equal(
+        "  INSERT INTO dbo.r (id, v) SELECT id, ROW_NUMBER() OVER (PARTITION BY w ORDER BY id) FROM dbo.t;",
+        "  INSERT INTO r (id, v) SELECT id, ROW_NUMBER() OVER (PARTITION BY w ORDER BY id) FROM t;",
     );
 }
