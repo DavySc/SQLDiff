@@ -672,8 +672,25 @@ fn dynamic_sql(n: &SyntaxNode, d: Dialect) -> bool {
         t.get(j)
             .is_some_and(|y| matches!(y.kind, K::LParen | K::Var | K::Str))
     };
+    // A PostgreSQL table trigger names the function it runs, `CREATE
+    // [OR REPLACE] [CONSTRAINT] TRIGGER ... EXECUTE FUNCTION|PROCEDURE f()`:
+    // no text is run, and the function's body is read as a routine of its
+    // own. Only in that statement: in PL/pgSQL `EXECUTE function` runs the
+    // text of a variable named `function`.
+    let trigger = d == Dialect::Postgres && {
+        let head: Vec<&str> = t.iter().take(5).map(|x| x.up.as_str()).collect();
+        let rest = match head.as_slice() {
+            ["CREATE", "OR", "REPLACE", rest @ ..] => rest,
+            ["CREATE", rest @ ..] => rest,
+            _ => &[][..],
+        };
+        matches!(rest, ["TRIGGER", ..] | ["CONSTRAINT", "TRIGGER", ..])
+    };
     t.iter().enumerate().any(|(i, x)| {
-        let exec = x.up == "EXEC" || x.up == "EXECUTE";
+        let names_function = trigger
+            && t.get(i + 1)
+                .is_some_and(|y| y.up == "FUNCTION" || y.up == "PROCEDURE");
+        let exec = (x.up == "EXEC" || x.up == "EXECUTE") && !names_function;
         // `EXEC @rc = dbo.p` captures a return code: what runs is the
         // named procedure, unless it too is a variable (`EXEC @rc = @p`).
         let rc = t.get(i + 1).is_some_and(|y| y.kind == K::Var)
@@ -1635,7 +1652,9 @@ fn partial_renaming(a: &Routine, b: &Routine) -> Renaming {
 /// answer about trees with statements left out (`check:differ`,
 /// `check:certificate`, `check:signature`, `pair:*`, ...) say only that
 /// the trees differ, which leaving statements out makes them do.
-const LOWERING_FAMILIES: [&str; 6] = ["routine:", "stmt:", "node:", "expr:", "store:", "type:"];
+const LOWERING_FAMILIES: [&str; 7] = [
+    "routine:", "stmt:", "node:", "expr:", "store:", "type:", "name:",
+];
 
 /// A routine with a left-out statement is never confirmed (C0.10).
 ///
@@ -1915,12 +1934,11 @@ END
                 "CREATE INDEX ix ON dbo.Acct (Qty) WHERE Qty IS NOT NULL;\n",
                 true,
             ),
-            // A trigger keeps no read-only table out, but its conversion's
-            // `CREATE TRIGGER ... EXECUTE FUNCTION` counts as PostgreSQL
-            // dynamic SQL (`dynamic_sql`), which keeps every table out.
+            // A trigger fires on writes only; its conversion's `CREATE
+            // TRIGGER ... EXECUTE FUNCTION` runs no text (`dynamic_sql`).
             (
                 "GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n",
-                false,
+                true,
             ),
             (
                 "ALTER TABLE dbo.Acct ADD CONSTRAINT ck CHECK (Qty > 0);\n",
@@ -2345,6 +2363,33 @@ END
         let read = |src: &str| routines(src, Dialect::Tsql).remove(0).2.unwrap();
         assert!(begins_tran_outside_try(&read(bracket).body.body));
         assert!(!begins_tran_outside_try(&read(idiom).body.body));
+    }
+
+    #[test]
+    fn a_trigger_naming_its_function_runs_no_text() {
+        let dynamic = |text: &str| {
+            parse(text, Dialect::Postgres)
+                .syntax()
+                .descendants()
+                .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+                .any(|n| dynamic_sql(&n, Dialect::Postgres))
+        };
+        for text in [
+            "CREATE TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE FUNCTION f();\n",
+            "CREATE OR REPLACE TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE PROCEDURE f();\n",
+            "CREATE CONSTRAINT TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE FUNCTION f();\n",
+        ] {
+            assert!(!dynamic(text), "{text}");
+        }
+        // Elsewhere `EXECUTE function` runs the text of a variable so named,
+        // and an event trigger fires on DDL.
+        for text in [
+            "DO $$ DECLARE function text := 'SELECT 1'; BEGIN EXECUTE function; END $$;\n",
+            "EXECUTE function;\n",
+            "CREATE EVENT TRIGGER et ON ddl_command_end EXECUTE FUNCTION f();\n",
+        ] {
+            assert!(dynamic(text), "{text}");
+        }
     }
 
     #[test]
