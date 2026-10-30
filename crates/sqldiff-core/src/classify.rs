@@ -259,6 +259,109 @@ pub fn write_target(node: &SyntaxNode) -> Option<Vec<String>> {
     (!parts.is_empty()).then_some(parts)
 }
 
+/// A statement's data-modifying CTEs (kind and target) and its OUTPUT … INTO
+/// tables.
+pub type SideWrites = (Vec<(StmtKind, Vec<String>)>, Vec<Vec<String>>);
+
+/// Writes a statement makes besides its own: the data-modifying CTEs of
+/// `WITH o AS (INSERT|UPDATE|DELETE …) …`, which run first, and the table
+/// of a T-SQL `OUTPUT … INTO t`, written after.
+pub fn side_writes(node: &SyntaxNode) -> SideWrites {
+    let toks: Vec<SyntaxToken> = ast::sig_tokens(node).collect();
+    let w = |i: usize| toks.get(i).and_then(word);
+    let close = |open: usize| {
+        let mut depth = 0;
+        for (j, t) in toks.iter().enumerate().skip(open) {
+            match t.kind() {
+                SyntaxKind::L_PAREN => depth += 1,
+                SyntaxKind::R_PAREN => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    };
+    let target_at = |mut i: usize| {
+        while matches!(w(i).as_deref(), Some("INTO" | "FROM" | "ONLY")) {
+            i += 1;
+        }
+        ast::qualified_name_at(&toks, i)
+    };
+    let mut before = Vec::new();
+    if w(0).as_deref() == Some("WITH") {
+        let mut i = 1;
+        if w(i).as_deref() == Some("RECURSIVE") {
+            i += 1;
+        }
+        loop {
+            i += 1; // the name
+            if toks.get(i).is_some_and(|t| t.kind() == SyntaxKind::L_PAREN) {
+                match close(i) {
+                    Some(j) => i = j + 1,
+                    None => break,
+                }
+            }
+            if w(i).as_deref() != Some("AS") {
+                break;
+            }
+            i += 1;
+            while matches!(w(i).as_deref(), Some("NOT" | "MATERIALIZED")) {
+                i += 1;
+            }
+            if !toks.get(i).is_some_and(|t| t.kind() == SyntaxKind::L_PAREN) {
+                break;
+            }
+            let Some(j) = close(i) else { break };
+            let kind = match w(i + 1).as_deref() {
+                Some("INSERT") => Some(StmtKind::Insert),
+                Some("UPDATE") => Some(StmtKind::Update),
+                Some("DELETE") => Some(StmtKind::Delete),
+                Some("MERGE") => Some(StmtKind::Merge),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let parts = target_at(i + 2);
+                if !parts.is_empty() {
+                    before.push((kind, parts));
+                }
+            }
+            if !toks
+                .get(j + 1)
+                .is_some_and(|t| t.kind() == SyntaxKind::COMMA)
+            {
+                break;
+            }
+            i = j + 2;
+        }
+    }
+    let mut after = Vec::new();
+    let mut depth = 0i32;
+    let mut output = false;
+    for (i, t) in toks.iter().enumerate() {
+        match t.kind() {
+            SyntaxKind::L_PAREN => depth += 1,
+            SyntaxKind::R_PAREN => depth -= 1,
+            _ if depth == 0 => match word(t).as_deref() {
+                Some("OUTPUT") => output = true,
+                Some("INTO") if output => {
+                    let parts = ast::qualified_name_at(&toks, i + 1);
+                    if !parts.is_empty() {
+                        after.push(parts);
+                    }
+                    break;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    (before, after)
+}
+
 /// T-SQL `DELETE a FROM t a` / `UPDATE a SET .. FROM t AS a`: the target is an alias.
 fn resolve_alias(toks: &[SyntaxToken], from: usize, alias: &str) -> Option<Vec<String>> {
     let mut i = from;

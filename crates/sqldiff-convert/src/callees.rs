@@ -111,7 +111,7 @@ pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
                     )),
                 };
                 let c = &mut *convs[i];
-                let at = calling_units(&inputs[i].text, c, k);
+                let at = calling_units(&inputs[i].text, c, k, outcome.is_err());
                 for u in at {
                     let u = &mut c.units[u];
                     match &outcome {
@@ -192,15 +192,19 @@ fn carried(c: &Conversion) -> Vec<Note> {
 }
 
 /// The units that call `k`: the innermost ones whose source text calls it
-/// by name, else every unit with its assumption.
-fn calling_units(text: &str, c: &Conversion, k: &str) -> Vec<usize> {
+/// by name, else every unit with its assumption. `wide` (the call is not
+/// proven) takes every unit whose text names the function at all, in a
+/// comment or a spelling the match above misses (`dbo./**/f(`) too: a unit
+/// it wrongly includes is only kept from counting.
+fn calling_units(text: &str, c: &Conversion, k: &str, wide: bool) -> Vec<usize> {
     let rule = format!("{UDF_CALLEE}{k}");
     let with: Vec<usize> = (0..c.units.len())
         .filter(|&i| c.units[i].notes.iter().any(|n| n.rule == rule))
         .collect();
-    let call = match k.contains('.') {
-        true => format!("{k}("),
-        false => format!("dbo.{k}("),
+    let call = match (wide, k.contains('.')) {
+        (true, _) => k.rsplit('.').next().unwrap_or(k).to_string(),
+        (false, true) => format!("{k}("),
+        (false, false) => format!("dbo.{k}("),
     };
     let calls = |i: usize| {
         let s = &c.units[i].src;
@@ -216,6 +220,9 @@ fn calling_units(text: &str, c: &Conversion, k: &str) -> Vec<usize> {
     let hits: Vec<usize> = with.iter().copied().filter(|&i| calls(i)).collect();
     if hits.is_empty() {
         return with;
+    }
+    if wide {
+        return hits;
     }
     let span = |i: usize| (c.units[i].src.start, c.units[i].src.end);
     hits.iter()

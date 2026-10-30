@@ -637,6 +637,20 @@ fact = "The converted statement takes the value once (a variable), or a reading 
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-OUTPUT-INTO-TARGET"
+statement = "The table an OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key (SQL Server rejects the statement otherwise, Msg 331 to 333; the PostgreSQL insert runs)."
+discharge = "catalog"
+fact = "The SQL Server catalog of the OUTPUT table: no enabled triggers, CHECK constraints or rules, no foreign key referencing it or referenced by it."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-OUTPUT-ROW-ORDER"
+statement = "Rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order."
+discharge = "deployment"
+fact = "Nothing relies on which generated value each written row gets."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SEQUENCE-DEFAULT-TRIGGER"
 statement = "Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name."
 discharge = "deployment"
@@ -934,10 +948,10 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMP-TABLE"
-statement = "A #temp table converted to a session- or job-scoped temporary table is not created twice in one session."
+statement = "A #temp table converted to a session- or job-scoped temporary table is not created twice in one session: no temporary table of its name exists when the procedure creates it (T-SQL creates its own beside a caller's #t), and the procedure is not left by an error between creating and dropping it (T-SQL drops the table then, the target keeps it)."
 discharge = "deployment"
 fact = "How sessions run the code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMPLATE-DIRECTIVE"
