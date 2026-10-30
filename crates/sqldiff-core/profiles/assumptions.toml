@@ -778,7 +778,7 @@ sites = ["sqldiff-core/src/equiv/call.rs"]
 
 [[assumption]]
 id = "ASM-PG-UNQUALIFIED-FUNCTION"
-statement = "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no schema search_path lists before it has a function of that name and arguments, and pg_catalog (searched first) has no function of that name (checked against PostgreSQL 18's)."
+statement = "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no schema search_path lists before it has a function of that name and arguments, and pg_catalog (searched first) has no function of that name and it is no keyword the grammar reads itself (checked against PostgreSQL 18's)."
 discharge = "deployment"
 fact = "The server's search_path and the functions of the schemas it lists."
 sites = ["sqldiff-core/src/equiv/canon.rs"]

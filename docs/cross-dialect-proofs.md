@@ -247,9 +247,14 @@ converter writes T-SQL `dbo.f(x)` as PostgreSQL `f(x)`. Such an unqualified
 PostgreSQL call, compared with T-SQL, counts as the user function `f` of the
 default schema under `ASM-PG-UNQUALIFIED-FUNCTION`, except when `f` is the
 name of any `pg_catalog` function of PostgreSQL 18
-(`profiles/pg18_catalog_functions.txt`, 2,787 names read from a 18.6 server):
+(`profiles/pg18_catalog_functions.txt`, 2,787 names read from a 18.6 server;
 `pg_catalog` is searched before the schemas of `search_path` unless it lists
-it later, so such a call may reach the built-in, and it stays not compared.
+it later) or one of its 164 keywords that are not unreserved
+(`profiles/pg18_keywords.txt`, from `pg_get_keywords()`: the grammar forms
+written like calls, such as `trim`, `coalesce`, `xmlelement` or
+`json_object`, are no `pg_catalog` function, and unquoted they always run
+the built-in). Such a call may reach the built-in, and it stays not
+compared.
 
 ## Dynamic SQL
 

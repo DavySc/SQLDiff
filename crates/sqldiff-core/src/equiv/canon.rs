@@ -229,7 +229,7 @@ pub mod asm {
     );
     pub const PG_UNQUALIFIED_FUNCTION: (&str, &str) = (
         "ASM-PG-UNQUALIFIED-FUNCTION",
-        "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no function of that name and arguments sits in a schema search_path lists before it, and pg_catalog, which PostgreSQL searches first unless search_path lists it later, has no function of that name (checked against PostgreSQL 18's)",
+        "An unqualified PostgreSQL function call reaches the user function of that name in the default schema: no function of that name and arguments sits in a schema search_path lists before it, and pg_catalog, which PostgreSQL searches first unless search_path lists it later, has no function of that name, and it is no keyword the grammar reads itself (checked against PostgreSQL 18's)",
     );
     pub const UDF_CALL_CONTEXT: (&str, &str) = (
         "ASM-UDF-CALL-CONTEXT",
@@ -479,13 +479,19 @@ fn lc(s: &str) -> String {
 
 /// The names of PostgreSQL 18's pg_catalog functions (profiles/).
 const PG_CATALOG_FUNCTIONS: &str = include_str!("../../profiles/pg18_catalog_functions.txt");
+/// PostgreSQL 18's keywords that are not unreserved (profiles/): among them
+/// the grammar forms written like calls (`trim`, `coalesce`, `xmlelement`,
+/// `json_object`), which are no pg_catalog function.
+const PG_KEYWORDS: &str = include_str!("../../profiles/pg18_keywords.txt");
 
-/// pg_catalog has a function named `name` (as written, folded), which an
-/// unqualified call may reach before a user function of the same name.
-fn pg_catalog_function(name: &str) -> bool {
+/// An unquoted PostgreSQL call of `name` (folded) may reach a built-in
+/// before a user function of the same name: pg_catalog has a function of
+/// that name, or the name is a keyword the grammar reads itself.
+fn pg_builtin_name(name: &str) -> bool {
     let k = name.to_lowercase();
     PG_CATALOG_FUNCTIONS
         .lines()
+        .chain(PG_KEYWORDS.lines())
         .any(|l| !l.starts_with('#') && l == k)
 }
 
@@ -1897,12 +1903,12 @@ impl<'a> Canon<'a> {
     fn user_fn(&mut self, c: &Call) -> R<Option<(Term, Option<Ty>)>> {
         // The converter writes T-SQL `dbo.f(x)` as `f(x)`: unqualified, a
         // PostgreSQL call compared with T-SQL may be that conversion, unless
-        // a pg_catalog function of the name could take it first.
+        // a built-in of the name could take it first.
         let unqualified = c.name.len() == 1
             && self.d == Dialect::Postgres
             && self.other == Some(Dialect::Tsql)
             && !c.name[0].starts_with('"')
-            && !pg_catalog_function(&c.name[0]);
+            && !pg_builtin_name(&c.name[0]);
         if !matches!(self.d, Dialect::Tsql | Dialect::Postgres)
             || (c.name.len() != 2 && !unqualified)
             || c.distinct

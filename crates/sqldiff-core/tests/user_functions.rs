@@ -46,6 +46,13 @@ AS
 BEGIN
     RETURN 1;
 END;
+GO
+CREATE FUNCTION dbo.Trim(@Code nvarchar(5))
+RETURNS int
+AS
+BEGIN
+    RETURN 1;
+END;
 ";
 
 const CAT_P: &str = "CREATE SCHEMA app;
@@ -57,6 +64,8 @@ LANGUAGE plpgsql AS $$ BEGIN RETURN p_qty * p_unit; END $$;
 CREATE FUNCTION twice(p_qty integer) RETURNS integer
 LANGUAGE plpgsql AS $$ BEGIN RETURN 2 * p_qty; END $$;
 CREATE FUNCTION \"left\"(p_code varchar(5)) RETURNS integer
+LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
+CREATE FUNCTION \"trim\"(p_code varchar(5)) RETURNS integer
 LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$;
 ";
 
@@ -293,6 +302,17 @@ fn an_unqualified_call_pg_catalog_could_take_is_not_compared() {
     let r = compare(
         "UPDATE App.Items SET CodeId = dbo.Left(@Code) WHERE Id = @Id;",
         "UPDATE app.items SET codeid = left(p_code) WHERE id = p_id;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+    // trim is a keyword: unquoted, the grammar's TRIM runs, never a user
+    // function, and it is no pg_catalog function (pg_get_keywords).
+    let r = compare(
+        "UPDATE App.Items SET CodeId = dbo.Trim(@Code) WHERE Id = @Id;",
+        "UPDATE app.items SET codeid = trim(p_code) WHERE id = p_id;",
     );
     assert!(
         !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
