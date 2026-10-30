@@ -551,7 +551,7 @@ protocol.
 Checker 0.17.0. The core is unchanged. A catalog table may be
 **read-only** (`CatTable.readOnly`, a TABLE entry ending in `=r`): no
 `INSERT`, `UPDATE` or `DELETE` of either routine writes it
-(`writeTableOf`; `writeTableOf_not_readOnly`), so it may carry what no
+(`writeTableOf`; theorem `lowerStmt_writes_not_readOnly`), so it may carry what no
 read sees, and it may have **opaque** columns (`OpqCol`, SPEC `o`):
 columns whose type is outside the slice, names only. The core reads the
 table's projection on its slice columns (`CatTable.toDef`), with the
@@ -562,12 +562,12 @@ quotes **from memory**):
 
 | Rule | Claim | Probed (eval/queries, `tables-{mssql,postgres}`) |
 |---|---|---|
-| Only reads | every write lowering finds its table through `writeTableOf`, which refuses a read-only one (`stmt:<kind>:table:read-only`); a call is the world's effect, which may change any table, as it may change tables outside the catalog | n/a |
+| Only reads | every write lowering finds its table through `writeTableOf`, which refuses a read-only one (`stmt:<kind>:table:read-only`): theorem `lowerStmt_writes_not_readOnly`, a data statement `lowerStmt` lowers names no read-only table, and data statements reach the core only through `lowerStmt`; the slice check and the diagnostics use `writeTableOf` by construction (`writeTableOf_not_readOnly` covers `writeTableOf` alone); a call is the world's effect, which may change any table, as it may change tables outside the catalog | n/a |
 | The projection | a read of the projection gives what the engines' read gives: the rows keep their multiplicity, every expression names its columns, `COUNT(*)` counts rows, `EXISTS`'s select list (`1`, `*`) is not evaluated, whole-row references are outside the spec | Q16 (`COUNT`, `EXISTS` with `SELECT 1` and `SELECT *`, a pick by key across a join, a scalar subquery: the same as the plain twin; a raising computed or virtual column raises, 8134 and 22012, only where named) |
 | What reads do not see | foreign keys, `UNIQUE`, `CHECK`, defaults of any kind, identity, computed and generated columns, indexes, triggers act only on writes; a system-versioned table read with a plain `FROM` gives its current rows (`FOR SYSTEM_TIME` reads as a hint and is refused) | Q16, Q17 (current rows only after an `UPDATE` and a `DELETE`) |
 | What keeps a table out | a security policy's filter predicate, PostgreSQL row-level security, rules, inheritance and partitions change what `FROM t` returns; masking, encryption, a `COLLATE` clause make a column opaque | Q18 (3 rows to 1 under a filter predicate; under forced row security for the owner) |
-| Names | an opaque column counts for resolution (`Scope.holders`): unqualified, a name that is an opaque column of one source and a column of another is ambiguous (209, 42702); a PL/pgSQL variable spelt as one conflicts with it (42702); the one holder of an opaque name resolves to nothing (`stmt:select:column:opaque`) | Q19 |
-| Keys | the key closure uses a key only when it is wholly visible; two rows may share a visible part of a key; a table without a key is still read by `COUNT(*)`, `EXISTS` and the scalar subquery | Q16 (two rows with one `ord_id`) |
+| Names | an opaque column counts for resolution (`Scope.holders`): unqualified, a name that is an opaque column of one source and a column of another is ambiguous (209, 42702); a PL/pgSQL variable spelt as one conflicts with it (42702); the one holder of an opaque name resolves to nothing (`stmt:select:column:opaque`). (Review) A PostgreSQL system column (`tableoid`, `xmin`, `cmin`, `xmax`, `cmax`, `ctid`, `pgSystemCols`) is a column of every table: in a query block and in an `UPDATE` or `DELETE` such a name resolves to nothing (`name:system-column`) | Q19, Q20 (42702 for a variable spelt as each of the six, in the converter's query and in an `UPDATE`'s `WHERE`) |
+| Keys | the key closure uses a key only when it is wholly visible; two rows may share a visible part of a key; a table without a key is still read by `COUNT(*)`, `EXISTS` and the scalar subquery; `Core.TableOk` asks distinct keys only of a table with a key, and every source of a closed block has one (`chain_hasKey`) | Q16 (two rows with one `ord_id`) |
 | Nullability | `NOT NULL` only where both DDLs say so (the weaker claim) | n/a |
 
 **What it rests on**, beyond C3d part 1: the probes above (SQL Server
@@ -580,11 +580,20 @@ partitions). The Rust side (`cert.rs`, `plain_table::read_only`,
 `plain_table::leaves_reads`) sends a table that is not plain as
 read-only when both sides define it once, the definitions pair by column
 name, and nothing else in either tree names it but statements that
-cannot change a read; the trees include the base catalogs' DDL. No new
-residual id and no new answer field. `ExamplesC3d2` has the confirmed
+cannot change a read; the trees include the base catalogs' DDL. Since
+the review, dynamic SQL is an allow-list (any `EXEC` of a procedure the
+tree does not declare, a PostgreSQL `DO` block, a routine body no scan
+reads, a top-level call of an undeclared routine keeps every table out),
+`EXCLUDE`, `PERIOD` and `INDEX` start a constraint only in their dialect
+and form, only `GENERATED ... AS IDENTITY` is an identity, any
+`INITIALLY` leaves a table without a key, and a `pg_` table or one another
+schema also defines is not sent. No new residual id and no new answer
+field. `ExamplesC3d2` has the confirmed
 reads, the refused writes, opaque reads, ambiguities, the column-variable
 conflict and keys with an opaque part, with interpreter runs over the
-projection; `test_gate.py` cases 133 to 139 exercise the protocol.
+projection, and (review) the system-column conflict, two equal T-SQL
+spellings and a qualified opaque column in another case;
+`test_gate.py` cases 133 to 141 exercise the protocol.
 
 ### Phase C4: errors and transactions
 
@@ -714,6 +723,7 @@ routine refused without any stage naming a reason gets
 | `stmt:select:from:qualifier` | (0.16.0) A qualified name `q.c` in a query whose `q` names no source the expression may see (an aliased table's own name, a table joined later in an `ON`), is spelt in another case (T-SQL), is a PL/pgSQL variable, the `FOR` block's record or the routine's name, or whose `c` is no column of that source |
 | `name:ambiguous` | (0.16.0) An unqualified name that is a column of two sources of the block (209, 42702); (0.17.0) an opaque column counts |
 | `name:column-variable` | (0.16.0) A PL/pgSQL unqualified name that is a column of a source of the block and also a variable (42702); (0.17.0) an opaque column counts |
+| `name:system-column` | (0.17.0) A PL/pgSQL unqualified name spelt as a system column (`tableoid`, `xmin`, `cmin`, `xmax`, `cmax`, `ctid`) in a query block or in an `UPDATE` or `DELETE`: a column of every table (42702 for a variable so spelt) |
 | `stmt:select:cte`, `:setop`, `:distinct`, `:top`, `:group`, `:having`, `:order`, `:offset`, `:locking`, `:for-json` | A `WITH`, a set operation, `DISTINCT`, `TOP`, `GROUP BY`, `HAVING`, `ORDER BY`, `OFFSET`/`LIMIT`, a locking clause, `FOR JSON` |
 | `stmt:select:into` | An `INTO` the rules refuse: T-SQL `SELECT ... INTO`, PL/pgSQL `SELECT col INTO x` (NULL on no row, probed Q10), `INTO STRICT`, several targets |
 | `stmt:select:agg:<fn>` | An aggregate in a select list outside the C3b `COUNT(*)` shape (`stmt:select:agg:sum`; `:count` for a `COUNT(*)` beside other items) |
@@ -722,7 +732,7 @@ routine refused without any stage naming a reason gets
 | `stmt:select:many-rows` | (0.16.0, in place of `stmt:select:where:not-key`) `SELECT @x = ...` or its `FOR` block over a block the key closure does not determine: it may keep several rows, and which one T-SQL assigns is unspecified |
 | `stmt:select:table:unknown` | The table is not in the deployment's table map or the target catalog |
 | `stmt:select:table:not-plain` | The table is in the catalog but not usable (`CatTable.wellFormed`: a string key, a default that does not fit, ...) |
-| `stmt:select:column:opaque` | (0.17.0) A name, qualified or not, that is an opaque column of a read-only table (a type outside the slice): a name only, never read |
+| `stmt:select:column:opaque` | (0.17.0) A name, qualified or not (T-SQL in any case), that is an opaque column of a read-only table (a type outside the slice): a name only, never read |
 | `stmt:select:target:<type>` | A pick into a variable whose declared type does not take the value (`stmt:select:target:varchar_10` for an `int` column) |
 | `stmt:insert:select`, `:default`, `:returning`, `:conflict` | `INSERT ... SELECT`, `DEFAULT VALUES`, `RETURNING`/`OUTPUT` (where the parser keeps it), `ON CONFLICT` |
 | `stmt:insert:cols` | No column list, an unknown or repeated column, no row, or a row of the wrong length |
