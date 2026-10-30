@@ -254,7 +254,8 @@ def selAcct (wh : Option Ast.Expr) (items : List Ast.SelItem := [asg "@q" (tc "Q
 -- A select list without assignments (a result set), or mixed.
 #guard (lowerT depq Γq (selAcct (some keyT) [item (tc "Qty")])).isNone
 #guard (lowerT depq Γq (selAcct (some keyT) [asg "@q" (tc "Qty"), item (tc "Total")])).isNone
--- `TOP`, `ORDER BY`, an alias, a hint, a join: outside the shape.
+-- `TOP`, `ORDER BY`, a hint: outside the shape. (C3d: an alias and a
+-- join are in, `ExamplesC3d`.)
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"] [.NStmt (.SSelect
   (.Select [] false [] false (some (num 1)) [asg "@q" (tc "Qty")] [] false
     [.Table ["dbo", "Acct"] none []] (some keyT) [] none [] none none [] none))])).isNone
@@ -263,7 +264,7 @@ def selAcct (wh : Option Ast.Expr) (items : List Ast.SelItem := [asg "@q" (tc "Q
     [.Table ["dbo", "Acct"] none ["NOLOCK"]] (some keyT) [] none [] none none [] none))])).isNone
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"] [.NStmt (.SSelect
   (.Select [] false [] false none [asg "@q" (tc "Qty")] [] false
-    [.Table ["dbo", "Acct"] (some "a") []] (some keyT) [] none [] none none [] none))])).isNone
+    [.Table ["dbo", "Acct"] (some "a") []] (some keyT) [] none [] none none [] none))])).isSome
 -- In a function.
 #guard (lowerT depq Γq (.Routine .Function ["f"] [inT "@id"] (some int) .Caller none
   (.Block [] [declT "@q" none, selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some keyT),
@@ -326,11 +327,15 @@ def okFor : Ast.Node :=
   [.While (existsT ["dbo", "Acct"] none) [del ["dbo", "Acct"] none]])).isNone
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id"]
   [.If (.Bin "AND" (existsT ["dbo", "Acct"] none) (.Bin ">" (tv "@id") (num 0))) [] []])).isNone
--- A scalar subquery that is part of a value, or without the key fixed.
+-- A scalar subquery that is part of a value.
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"]
   [set (tv "@q") (.Bin "+" (.Subquery (sel [item (tc "Qty")] ["dbo", "Acct"] (some keyT))) (num 1))])).isNone
+-- (C3d) A scalar subquery without the key fixed is in: more than one row
+-- is the core's `cardinality` error, as on both engines (eval/queries
+-- Q5, Q13). It can fail, so without `XACT_ABORT ON` the routine is no
+-- C2a confirmation (`ExamplesC3d`).
 #guard (lowerT depq Γq (tsqlProc ["r"] [inT "@id", ioT "@q"]
-  [set (tv "@q") (.Subquery (sel [item (tc "Qty")] ["dbo", "Acct"] (some (.Bin "=" (tc "Qty") (tv "@id")))))])).isNone
+  [set (tv "@q") (.Subquery (sel [item (tc "Qty")] ["dbo", "Acct"] (some (.Bin "=" (tc "Qty") (tv "@id")))))])).isSome
 
 /-! ## Refused: the shapes differ
 

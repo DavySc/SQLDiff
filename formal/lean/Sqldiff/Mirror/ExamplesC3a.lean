@@ -200,7 +200,7 @@ setting. -/
   "the PL/pgSQL routine is outside the C1 spec"
 -- `found` is a variable of every PL/pgSQL routine: a column of that name
 -- would be ambiguous too.
-#guard resolveName (.pg Γd ["found"]) (scopeOf (.pg Γd []) { acct with cols := [⟨"found", "found", false, false, .int .i32, none⟩] } ["acct"]) "found" == none
+#guard resolveName (.pg Γd ["found"] []) (scopeOf (.pg Γd [] []) { acct with cols := [⟨"found", "found", false, false, .int .i32, none⟩] } ["acct"]) "found" == none
 -- The table's own name is a whole-row reference in PostgreSQL.
 #guard reasonOf (checkD safeT
     (pgProc ["r"] [inP "p_id"] [] [

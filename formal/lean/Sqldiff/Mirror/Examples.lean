@@ -592,7 +592,7 @@ lower like `COALESCE`. -/
 #guard isC2a (check dep ∅ pairCert (pairT false (fn "ISNULL" [ta, tb]) bigint)
     (pairP (fn "COALESCE" [pa, pb]) bigint))
 -- PostgreSQL has no `ISNULL` function: never the slice's `coalesce`.
-#guard (typed (.pg ∅ []) [("a", integer), ("b", integer)] {} (fn "ISNULL" [pa, pb])).isNone
+#guard (typed (.pg ∅ [] []) [("a", integer), ("b", integer)] {} (fn "ISNULL" [pa, pb])).isNone
 
 /-! ### `CASE` -/
 
@@ -686,7 +686,7 @@ def badCase (a : Ast.Expr) : Ast.Expr :=
 #guard isC1 (check dep ∅ pairCert (pairT false ta (.Ty "VARCHAR" ["10"]))
   (pairP pa (.Ty "VARCHAR" ["10"])))
 -- `int(4)` is not the slice's type.
-#guard !intType (.pg ∅ []) (.Ty "INT" ["4"])
+#guard !intType (.pg ∅ [] []) (.Ty "INT" ["4"])
 -- `NULL` compared with `=`: outside the slice (session settings change it).
 #guard isC1 (checkPair false (.Case none [.When2 (.Bin "=" ta .Null) (num 1)] (some (num 0)))
   (.Case none [.When2 (.Bin "=" pa .Null) (num 1)] (some (num 0))))

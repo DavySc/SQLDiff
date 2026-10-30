@@ -206,7 +206,7 @@ re-review of C2c). A pair would join only with a probe showing every
 store the lowering admits to be identical, and none has one. -/
 def localTyCorr (ta tp : Ast.Ty) : Bool :=
   let dt : Dialect := .tsql { rowCounts := false, routines := [] } ∅
-  let dp : Dialect := .pg ∅ []
+  let dp : Dialect := .pg ∅ [] []
   match valTypeOf dt ta, valTypeOf dp tp with
   | some (.str ..), some (.str ..) => true
   | some x, some y => x == y

@@ -129,6 +129,20 @@ confirmed). A pair whose variables' declared types differ is answered
 "the declared types of the variables do not correspond". New reason
 codes `type:<name>`, `expr:date-literal`, `expr:bit-literal`,
 `expr:dateadd:part`, `expr:datediff:part`, `node:call:type`.
+
+0.16.0 (C3d part 1) reads query blocks in the C3b statement shapes:
+several catalog tables, `[INNER] JOIN ... ON` and `CROSS JOIN`, comma
+lists, aliases (self-joins too) and qualified names ("The C3d blocks" in
+`Sqldiff/Mirror/Lower.lean`). `SELECT @x = ...` and its `FOR` block need
+the key closure (`Core.Block.atMostOne`, `Core.kept_length_le_one`); a
+scalar subquery stands over any block, its more-than-one-row error (512,
+21000) the new error class `cardinality`. A confirmation that reads
+tables still carries `"statements":"c3b"`. New reason codes
+`stmt:select:many-rows` (in place of `stmt:select:where:not-key`),
+`stmt:select:from:join:<kind>` (in place of `stmt:select:from:join`),
+`stmt:select:from:qualifier`, `stmt:select:from:ref`, `name:ambiguous`,
+`name:column-variable`; `stmt:select:from:alias` and
+`stmt:select:from:multi` are gone. Request format unchanged.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -183,7 +197,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.14.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.16.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

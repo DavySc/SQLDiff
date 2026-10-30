@@ -72,20 +72,23 @@ def decimal : Ast.Ty := .Ty "DECIMAL" ["18", "2"]
 
 -- A result set: `SELECT Qty FROM dbo.Acct WHERE Id = @id`.
 #guard wT (pT [selectT [item (tc "Qty")] ["dbo", "Acct"] (some keyT)]) == ["stmt:select:result-set"]
--- A join, an alias, `TOP`, `ORDER BY`.
+-- An outer join (C3d: inner and cross joins and aliases are in), `TOP`,
+-- `ORDER BY`.
 #guard wT (pT [.NStmt (.SSelect (.Select [] false [] false none [asg "@q" (tc "Qty")] [] false
-    [.Join "inner" (.Table ["dbo", "Acct"] none []) (.Table ["dbo", "Pair"] none []) none] none [] none
-    [] none none [] none))]) == ["stmt:select:from:join"]
+    [.Join "LEFT" (.Table ["dbo", "Acct"] none []) (.Table ["dbo", "Pair"] none [])
+      (some (.Bin "=" (tc "Id") (tc "A")))] none [] none
+    [] none none [] none))]) == ["stmt:select:from:join:left"]
 #guard wT (pT [.NStmt (.SSelect (.Select [] false [] false (some (num 1)) [asg "@q" (tc "Qty")] []
     false [.Table ["dbo", "Acct"] (some "a") []] none [] none [.OrderItem (tc "Id") false none] none
-    none [] none))]) == ["stmt:select:top", "stmt:select:from:alias", "stmt:select:order"]
+    none [] none))]) == ["stmt:select:top", "stmt:select:order"]
 -- `SELECT @q = SUM(Qty)`, `SELECT @q = COUNT(*)` with a `GROUP BY`.
 #guard wT (pT [selectT [asg "@q" (fn "SUM" [tc "Qty"])] ["dbo", "Acct"] none]) == ["stmt:select:agg:sum"]
 #guard wT (pT [.NStmt (.SSelect (.Select [] false [] false none [asg "@q" countStarE] [] false
     [.Table ["dbo", "Acct"] none []] none [tc "Id"] none [] none none [] none))]) == ["stmt:select:group"]
--- A `WHERE` that fixes no key; a running total; a pick into a string.
+-- A `WHERE` that fixes no key (C3d: the block may keep more than one
+-- row); a running total; a pick into a string.
 #guard wT (pT [selectT [asg "@q" (tc "Qty")] ["dbo", "Acct"] (some (.Bin "=" (tc "Qty") (tv "@id")))]) ==
-  ["stmt:select:where:not-key"]
+  ["stmt:select:many-rows"]
 #guard wT (pT [selectT [asg "@q" (.Bin "+" (tv "@q") (tc "Qty"))] ["dbo", "Acct"] (some keyT)]) ==
   ["stmt:select:value"]
 #guard wT (tsqlProc ["dbo", "p"] [inT "@id", ioT "@s" (vc 10)]

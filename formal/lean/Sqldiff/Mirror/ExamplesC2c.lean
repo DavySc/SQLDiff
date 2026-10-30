@@ -374,7 +374,7 @@ def envT : TyEnv := [("@id", int), ("@big", bigint), ("@s", smallint), ("@b", bi
 def envP : TyEnv := [("p_id", integer), ("p_big", bigint), ("v_s", smallint), ("v_b", boolean),
   ("v_d", date), ("v_t", ts 6), ("v_t3", ts 3), ("v_tz", .Ty "TIMESTAMPTZ" [])]
 def tT (e : Ast.Expr) : Option (SExpr × STy) := typed (.tsql depv Γv) envT {} e
-def tP (e : Ast.Expr) : Option (SExpr × STy) := typed (.pg Γv []) envP {} e
+def tP (e : Ast.Expr) : Option (SExpr × STy) := typed (.pg Γv [] []) envP {} e
 
 -- Widths: the wider operand's; comparisons across widths.
 #guard tT (.Bin "+" (tv "@id") (tv "@big")) == some (.arith .i64 .add (.var "@id") (.var "@big"), .int .i64)
@@ -852,7 +852,7 @@ def tmCert : Cert := ⟨[("@r", "p_r"), ("@a", "v_a"), ("@b", "v_b"), (statusVar
     (some (SExpr.str "1.5", STy.str (some 3) false)) == false &&
   storeOkTy (.tsql { rowCounts := false, routines := [] } ∅) (some (.Ty "MONEY" [])) false
     (some (SExpr.str "1.23456", STy.str (some 7) false)) == false &&
-  storeOkTy (.pg ∅ []) (some (.Ty "TIME" [])) false (some (SExpr.str "12:00", STy.str (some 5) false)) == false
+  storeOkTy (.pg ∅ [] []) (some (.Ty "TIME" [])) false (some (SExpr.str "12:00", STy.str (some 5) false)) == false
 
 /- R2 (re-review). A string argument must fit the callee's declared
 length (`q(p_s varchar(3))` in the request): T-SQL truncates a longer

@@ -973,7 +973,7 @@ EXTRA = {
     "79": {"why": ["store:return:varchar_5"]},
     "80": {"why": ["store:call", "node:call:type"]},
     "81": {"why": ["store:declare:varchar_3"]},
-    "84": {"why": ["stmt:select:where:not-key"]},
+    "84": {"why": ["stmt:select:many-rows"]},
     "90": {"why": ["node:for-query"]},
     "92": {"why": ["stmt:insert:value", "stmt:update:value", "expr:fn:rtrim"]},
     "93": {"why": ["stmt:insert:table:not-plain", "stmt:update:table:not-plain", "stmt:select:table:not-plain"]},
