@@ -55,3 +55,44 @@ fn comparisons_are_not_shown_equal() {
     }
     assert!(bad.is_empty(), "shown equal:\n{}", bad.join("\n"));
 }
+
+#[test]
+fn built_ins_sql_server_refuses_are_not_shown_equal() {
+    // UPPER, LOWER, LEFT, LEN, REPLACE and STRING_AGG: Msg 8116; `+` and
+    // NULLIF: Msg 402.
+    let mut bad = Vec::new();
+    for c in ["T", "N"] {
+        for (a, b) in [
+            (format!("UPPER({c})"), format!("upper({c})")),
+            (format!("LOWER({c})"), format!("lower({c})")),
+            (format!("LEFT({c}, 3)"), format!("left({c}, 3)")),
+            (format!("LEN({c})"), format!("length(rtrim({c}))")),
+            (
+                format!("REPLACE({c}, 'a', 'b')"),
+                format!("replace({c}, 'a', 'b')"),
+            ),
+            (format!("NULLIF({c}, 'a')"), format!("nullif({c}, 'a')")),
+            (format!("{c} + 'x'"), format!("{c} || 'x'")),
+            (format!("'x' + {c}"), format!("'x' || {c}")),
+        ] {
+            let a = format!("SELECT {a} AS v FROM dbo.D;");
+            if equal(&a, &format!("SELECT {b} AS v FROM D;")) {
+                bad.push(a);
+            }
+        }
+        let a = format!("SELECT STRING_AGG({c}, ',') AS v FROM dbo.D;");
+        if equal(&a, &format!("SELECT string_agg({c}, ',') AS v FROM D;")) {
+            bad.push(a);
+        }
+    }
+    assert!(bad.is_empty(), "shown equal:\n{}", bad.join("\n"));
+}
+
+#[test]
+fn built_ins_that_take_text_still_compare() {
+    for c in ["T", "N"] {
+        let a = format!("SELECT COALESCE({c}, 'x') AS v FROM dbo.D;");
+        let b = format!("SELECT coalesce({c}, 'x') AS v FROM D;");
+        assert!(equal(&a, &b), "{a}");
+    }
+}

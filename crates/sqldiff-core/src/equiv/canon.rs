@@ -2168,9 +2168,13 @@ impl<'a> Canon<'a> {
             | (Dialect::Db2i, "listagg")
                 if argc == 2 && !c.distinct =>
             {
-                let (x, _) = self.expr(&c.args[0])?;
+                let (x, xty) = self.expr(&c.args[0])?;
                 let (sep, _) = self.expr(&c.args[1])?;
                 let order = self.order_terms(&c.order, None)?;
+                // SQL Server refuses text and ntext here (Msg 8116).
+                if d == Dialect::Tsql && xty.is_some_and(|t| t.fam == Fam::Text) {
+                    return Ok((n("dfn", vec![self.dtag(), a("string_agg"), x, sep]), None));
+                }
                 match d {
                     Dialect::Tsql => self.assume(asm::STRING_AGG_8000),
                     Dialect::Db2i => self.assume(asm::LISTAGG_LEN),
@@ -2307,6 +2311,27 @@ impl<'a> Canon<'a> {
         let mut args = Vec::new();
         for x in &c.args {
             args.push(self.expr(x)?);
+        }
+        // SQL Server refuses text and ntext in most built-ins (Msg 8116,
+        // NULLIF Msg 402); these take them.
+        if d == Dialect::Tsql
+            && args.iter().any(|x| x.1.is_some_and(|t| t.fam == Fam::Text))
+            && !matches!(
+                name.as_str(),
+                "substring"
+                    | "patindex"
+                    | "datalength"
+                    | "isnull"
+                    | "coalesce"
+                    | "charindex"
+                    | "textptr"
+            )
+        {
+            let kids = [self.dtag(), a(&name)]
+                .into_iter()
+                .chain(args.into_iter().map(|x| x.0))
+                .collect();
+            return Ok((n("dfn", kids), None));
         }
         let first_ty = args.first().and_then(|x| x.1);
         let portable = |h: &str, args: Vec<(Term, Option<Ty>)>, ty| {
@@ -3080,7 +3105,8 @@ impl<'a> Canon<'a> {
                 Ok(self.concat_bin(lt, lty, rt, rty))
             }
             "+" if self.d == Dialect::Tsql && (any(&|t| t.is_string()) || l_or_r_is_str(l, r)) => {
-                if any(&|t| t.is_numeric() || t.is_temporal()) {
+                // SQL Server refuses `+` on text and ntext (Msg 402).
+                if any(&|t| t.is_numeric() || t.is_temporal() || t.fam == Fam::Text) {
                     return Ok((n("dfn", vec![a("tsql"), a("+"), lt, rt]), None));
                 }
                 if lty.is_none() || rty.is_none() {
