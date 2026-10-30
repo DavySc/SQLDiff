@@ -2354,7 +2354,9 @@ impl<'a> Cx<'a> {
                 .find(|&&j| j > f)
                 .map(|&j| ts[j].up())
                 .unwrap_or_default();
-            return no(format!("its result set is built with FOR {what}, whose rows are not its columns"));
+            return no(format!(
+                "its result set is built with FOR {what}, whose rows are not its columns"
+            ));
         }
         let end = ["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "FOR", "OPTION"]
             .iter()
