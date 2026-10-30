@@ -854,4 +854,32 @@ def tmCert : Cert := ⟨[("@r", "p_r"), ("@a", "v_a"), ("@b", "v_b"), (statusVar
     (some (SExpr.str "1.23456", STy.str (some 7) false)) == false &&
   storeOkTy (.pg ∅ []) (some (.Ty "TIME" [])) false (some (SExpr.str "12:00", STy.str (some 5) false)) == false
 
+/- R2 (re-review). A string argument must fit the callee's declared
+length (`q(p_s varchar(3))` in the request): T-SQL truncates a longer
+value to the parameter, PostgreSQL drops the length and keeps it. A
+`varchar(10)` variable, `'abcd'`, an `nvarchar` value, and any argument
+to a `text` parameter (no bound to fit) are outside. -/
+def vc (n : Nat) : Ast.Ty := .Ty "VARCHAR" [toString n]
+def nvc (n : Nat) : Ast.Ty := .Ty "NVARCHAR" [toString n]
+def qCert : Cert := ⟨[("@i", "p_i"), ("@v", "v_v"), (statusVar, statusVar)]⟩
+def qCall (pty tv' pv' : Ast.Ty) : Answer :=
+  check (callDep "q") (callΓ "q" .In pty) qCert
+    (callT [declT "@v" tv' none] "q" (tv "@v") false) (callP [.Declare "v_v" (some pv') none] "q" (pv "v_v"))
+#guard reasonOf (qCall (vc 3) (vc 10) (vc 10)) == reasonOutsideT
+#guard whyT (callDep "q") (callΓ "q" .In (vc 3)) (callT [declT "@v" (vc 10) none] "q" (tv "@v") false) ==
+  ["node:call:type"]
+#guard reasonOf (qCall (vc 3) (nvc 3) (vc 3)) == reasonOutsideT
+#guard reasonOf (qCall (.Ty "TEXT" []) (vc 3) (vc 3)) == reasonOutsideT
+#guard isConfirmed (qCall (vc 3) (vc 3) (vc 3)) && isConfirmed (qCall (vc 3) (vc 2) (vc 2))
+#guard isConfirmed (check (callDep "q") (callΓ "q" .In (vc 3)) qCert
+  (callT [] "q" (str "abc") false) (callP [] "q" (str "abc")))
+#guard reasonOf (check (callDep "q") (callΓ "q" .In (vc 3)) qCert
+  (callT [] "q" (str "abcd") false) (callP [] "q" (str "abcd"))) == reasonOutsideT
+#guard reasonOf (check (callDep "q") (callΓ "q" .In (.Ty "TEXT" [])) qCert
+  (callT [] "q" (str "abc") false) (callP [] "q" (str "abc"))) == reasonOutsideT
+-- The callee's own pair: its PostgreSQL length must be the T-SQL one (or
+-- none), so the request's length is the one T-SQL truncates to.
+#guard tyCorr (vc 3) (vc 3) && tyCorr (nvc 3) (vc 3) && tyCorr (vc 3) (.Ty "TEXT" []) &&
+  !tyCorr (vc 3) (vc 10)
+
 end Sqldiff.Mirror.ExamplesC2c

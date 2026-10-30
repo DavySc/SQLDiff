@@ -199,8 +199,13 @@ def decimal : Ast.Ty := .Ty "DECIMAL" ["18", "2"]
 #guard wT (.Routine .Function ["dbo", "f"] [inT "@s" (vc 5)] (some (vc 5)) .Caller none (.Block []
     [ret (some (.Bin "+" (tv "@s") (.Str "x")))])) == ["store:return:varchar_5"]
 #guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.Call ["dbo", "log_value"] [arg (tv "@s") true] none])
-    (d := dep) (g := { Γ with routineTys := [("log_value", [.Ty "TEXT" [], integer, integer])] }) ==
+    (d := dep) (g := { Γ with routineTys := [("log_value", [vc 20, integer, integer])] }) ==
   ["store:call"]
+-- (C2c re-review) Into an unbounded `text` parameter a T-SQL string
+-- argument is outside the spec: the T-SQL callee's length is not known.
+#guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.Call ["dbo", "log_value"] [arg (tv "@s") true] none])
+    (d := dep) (g := { Γ with routineTys := [("log_value", [.Ty "TEXT" [], integer, integer])] }) ==
+  ["store:call", "node:call:type"]
 -- (C2c) The same variable into an `integer` parameter: the types differ.
 #guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.Call ["dbo", "log_value"] [arg (tv "@s") true] none])
     (d := dep) (g := Γ) == ["store:call", "node:call:type"]

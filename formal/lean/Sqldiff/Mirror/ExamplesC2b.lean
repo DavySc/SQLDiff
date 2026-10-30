@@ -320,7 +320,10 @@ def sigP (pt rt : Ast.Ty) : Ast.Routine :=
 -- keeps no length on a result, probed); with `text`, C2a.
 #guard isC1 (check dep ∅ fnCert sigT (sigP (vc 10) (vc 10)))
 #guard isC2a (check dep ∅ fnCert sigT (sigP text text))
-#guard tyCorr (nvc 10) (vc 10) && tyCorr (vc 10) (.Ty "CHARACTER VARYING" ["20"])
+#guard tyCorr (nvc 10) (vc 10) && tyCorr (vc 10) (.Ty "CHARACTER VARYING" ["10"]) && tyCorr (vc 10) text
+-- (C2c re-review) A PostgreSQL length other than the T-SQL one does not
+-- correspond: a caller's string argument is held to the PostgreSQL DDL's.
+#guard !tyCorr (vc 10) (.Ty "CHARACTER VARYING" ["20"]) && !tyCorr (vc 20) (vc 10)
 #guard tyCorr int (.Ty "INT4" []) && tyCorr (.Ty "INTEGER" []) integer
 -- (C2c) `bigint` and `smallint` with themselves, `bit` with `boolean`,
 -- `date`, and `datetime2(6)` with `timestamp(6)` or `timestamp`.

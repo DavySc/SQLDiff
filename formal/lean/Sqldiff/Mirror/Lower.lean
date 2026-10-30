@@ -2727,23 +2727,36 @@ outside the slice takes no argument in the spec. -/
 def paramWant (ty : Ast.Ty) : Option STy := valTypeOf (.pg ∅ []) ty
 
 /-- A value of type `t` is exactly of the parameter's type `want`: the
-same slice type, any string for a string, or the NULL literal. -/
-def sameKind (want t : STy) : Bool :=
+same slice type, or the NULL literal; for a string, a string that fits.
+T-SQL truncates a string argument longer than the callee's parameter on
+entry (and a `varchar` parameter replaces characters outside its code
+page), PostgreSQL keeps it (it drops a parameter's length): callee
+`dbo.q @s varchar(3)` given a `varchar(10)` variable holding `'abcdef'`
+sees `abc` in SQL Server, `abcdef` in PostgreSQL (re-review of C2c). So
+in T-SQL a string argument must have a bound at most the parameter's
+length and come from no `nvarchar` (the PostgreSQL DDL does not say
+whether the T-SQL parameter is `varchar` or `nvarchar`; `tyCorr` ties its
+length to the T-SQL one); an unbounded parameter, or an argument whose
+bound is unknown, is outside the spec. PostgreSQL keeps any string. -/
+def sameKind (d : Dialect) (want t : STy) : Bool :=
   match want, t with
   | _, .nul => true
-  | .str .., .str .. => true
+  | .str n _, .str m w => match d with
+    | .tsql _ _ => n.isSome && fitsLen n m && !w
+    | .pg _ _ => true
   | w, t => w == t
 
 /-- A value argument of the parameter's type. -/
 def argValueOk (d : Dialect) (env : TyEnv) (want : STy) (e : Ast.Expr) : Bool :=
   match typedTo d env {} (some want) e with
-  | some (_, t) => sameKind want t
+  | some (_, t) => sameKind d want t
   | none => false
 
-/-- An `OUTPUT`/`INOUT` variable declared with the parameter's type. -/
+/-- An `OUTPUT`/`INOUT` variable declared with the parameter's type (its
+value is passed in: for a string, its declared length must fit). -/
 def argRefOk (d : Dialect) (env : TyEnv) (want : STy) (x : Var) : Bool :=
   match varTy d env x with
-  | some t => t != .nul && sameKind want t
+  | some t => t != .nul && sameKind d want t
   | none => false
 
 /-- The argument in a position whose parameter is declared `ty` has its
@@ -3881,7 +3894,13 @@ dropped the modifier, keeps, so it is outside). -/
 def tyCorr (ta tp : Ast.Ty) : Bool :=
   let dt : Dialect := .tsql { rowCounts := false, routines := [] } ∅
   let dp : Dialect := .pg ∅ []
-  let str : Bool := (strTypeT ta).isSome && (strTypeP tp).isSome
+  -- A string type of the slice on both, the PostgreSQL one without a
+  -- length or with the T-SQL one (re-review of C2c: a caller's argument is
+  -- held to the PostgreSQL DDL's length, `sameKind`, which must then be
+  -- the T-SQL parameter's).
+  let str : Bool := match strTypeT ta, strTypeP tp with
+    | some (n, _), some (m, _) => m.isNone || m == n
+    | _, _ => false
   str ||
     match valTypeOf dt ta, valTypeOf dp tp with
     | some (.int w), some (.int v) => w == v

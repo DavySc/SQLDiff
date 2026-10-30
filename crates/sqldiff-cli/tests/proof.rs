@@ -887,6 +887,92 @@ fn the_real_checker_holds_call_arguments_and_bit_comparisons() {
     }
 }
 
+/// Re-review of C2c end to end. A `time` local is `time(7)` in SQL Server
+/// and `time(6)` in PostgreSQL: `.1234567 < .1234568` is 1 against 0, so
+/// a type outside the slice corresponds to nothing and a string stores
+/// into it on neither side. A string argument must fit the callee's
+/// declared length: `dbo.q @s varchar(3)` sees `abc` of a `varchar(10)`
+/// holding `abcdef` in SQL Server, the whole value in PostgreSQL. An `int`
+/// parameter names ASM-TSQL-STRING-ARGS (an outside caller's `1.5`).
+#[test]
+fn the_real_checker_refuses_time_locals_and_long_string_arguments() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2c-rereview");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let head = "AS\nBEGIN\n  SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n";
+    write(
+        &src,
+        "t.sql",
+        &format!(
+            "CREATE PROCEDURE dbo.tm @r int OUTPUT {head}  DECLARE @a time;\n  DECLARE @b time;\n  \
+             SET @a = '12:00:00.1234567';\n  SET @b = '12:00:00.1234568';\n  \
+             IF @a < @b SET @r = 1; ELSE SET @r = 0;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.tn @r int OUTPUT {head}  DECLARE @a time;\n  DECLARE @b time;\n  \
+             IF @a < @b SET @r = 1; ELSE SET @r = 0;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.q @s varchar(3), @r int OUTPUT {head}  SET @r = LEN(@s);\nEND\nGO\n\
+             CREATE PROCEDURE dbo.pc @r int OUTPUT {head}  DECLARE @v varchar(10);\n  \
+             SET @v = 'abcdef';\n  EXEC dbo.q @v, @r OUTPUT;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.pl @r int OUTPUT {head}  EXEC dbo.q 'abcd', @r OUTPUT;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.p3 @r int OUTPUT {head}  DECLARE @v varchar(3);\n  \
+             SET @v = 'abc';\n  EXEC dbo.q @v, @r OUTPUT;\nEND\nGO\n"
+        ),
+    );
+    Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--overwrite", "--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let out = std::fs::read_to_string(d.join("out/t.sql")).unwrap();
+    for shape in ["v_a time;", "CALL q(v_v, p_r);", "p_s varchar(3)"] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap();
+    let routine = |name: &str| {
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == name)
+            .unwrap()
+    };
+    let r = routine("dbo.tm");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    assert_eq!(r["why"][0], "store:assign:time", "{r}");
+    let r = routine("dbo.tn");
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    for name in ["dbo.pc", "dbo.pl"] {
+        let r = routine(name);
+        assert_eq!(r["answer"], "unconfirmed", "{r}");
+        assert_eq!(r["why"][0], "node:call:type", "{r}");
+    }
+    for name in ["dbo.q", "dbo.p3"] {
+        let r = routine(name);
+        assert_eq!(r["answer"], "confirmed", "{r}");
+        let asm: Vec<&str> = r["assumptions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(asm.contains(&"ASM-TSQL-STRING-ARGS"), "{r}");
+    }
+}
+
 /// C2b end to end: concatenation and ISNULL over bounded string variables
 /// are confirmed in the slice, and the leading SET CONCAT_NULL_YIELDS_NULL
 /// ON discharges ASM-CONCAT-NULL in the release gate. A string `=` is

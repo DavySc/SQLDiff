@@ -880,13 +880,45 @@ def tm_p(stores):
 
 
 TM_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@r", "p_r"), ("@a", "v_a"), ("@b", "v_b"), ("%status", "%status")])
+# R2: a string argument must fit the callee's declared length: `EXEC dbo.q
+# @v` with @v varchar(10) holding 'abcdef' reaches q(@s varchar(3)) as
+# 'abc' in SQL Server and whole in PostgreSQL.
+Q_DEP = f"0,{hx('dbo.q')}:{hx('q')}"
+
+
+def q_cat(t, *args):
+    return f"{hx('q')}:i:" + ".".join([hx(t)] + [hx(a) for a in args])
+
+
+def q_t(arg, decls=()):
+    return proc(["dbo", "f6"], [param("@i", "In")], [], [ABORT] + list(decls) + [call(["dbo", "q"], (arg, "f"))])
+
+
+def q_p(arg, decls=()):
+    return proc(["f6"], [param("p_i", "In")], list(decls), [call(["q"], (arg, "f"))])
+
+
+Q_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@i", "p_i"), ("@v", "v_v"), ("%status", "%status")])
+Q10_DECL_T = [decl("@v", VC10)]
+Q10_DECL_P = [C("Declare", S("v_v"), VC10, NONE)]
+Q3_DECL_T = [decl("@v", VC3)]
+Q3_DECL_P = [C("Declare", S("v_v"), VC3, NONE)]
 cases += [
     ("120", req3(120, a=tm_t(True), b=tm_p(True), dep="0", cat="-", cert=TM_CERT), "unconfirmed"),
     ("121", req3(121, a=tm_t(False), b=tm_p(False), dep="0", cat="-", cert=TM_CERT), "unconfirmed"),
+    ("122", req3(122, a=q_t(tv("@v"), Q10_DECL_T), b=q_p(pv("v_v"), Q10_DECL_P), dep=Q_DEP,
+                 cat=q_cat("VARCHAR", "3"), cert=Q_CERT), "unconfirmed"),
+    ("123", req3(123, a=q_t(tv("@v"), Q3_DECL_T), b=q_p(pv("v_v"), Q3_DECL_P), dep=Q_DEP,
+                 cat=q_cat("VARCHAR", "3"), cert=Q_CERT), "confirmed"),
+    ("124", req3(124, a=q_t(string("abcd")), b=q_p(string("abcd")), dep=Q_DEP,
+                 cat=q_cat("VARCHAR", "3"), cert=Q_CERT), "unconfirmed"),
+    ("125", req3(125, a=q_t(string("abc")), b=q_p(string("abc")), dep=Q_DEP,
+                 cat=q_cat("TEXT"), cert=Q_CERT), "unconfirmed"),
 ]
 THEOREMS = {
     "114": "Sqldiff.Mirror.check_sound_c2a",
     "116": "Sqldiff.Mirror.check_sound_c2a",
+    "123": "Sqldiff.Mirror.check_sound",
     "118": "Sqldiff.Mirror.check_sound_c2a",
     "104": "Sqldiff.Mirror.check_sound_c2a",
     "91": "Sqldiff.Mirror.check_sound_c2a",
@@ -939,7 +971,7 @@ EXTRA = {
     "77": {"why": ["store:assign:varchar_20", "expr:fn:upper"]},
     "78": {"why": ["store:declare:varchar_3"]},
     "79": {"why": ["store:return:varchar_5"]},
-    "80": {"why": ["store:call"]},
+    "80": {"why": ["store:call", "node:call:type"]},
     "81": {"why": ["store:declare:varchar_3"]},
     "84": {"why": ["stmt:select:where:not-key"]},
     "90": {"why": ["node:for-query"]},
@@ -972,8 +1004,13 @@ EXTRA = {
     "118": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
             "statements": "c1"},
     "119": {"why": ["store:assign:datetime"]},
-    # Re-review of C2c: a string into `time`.
+    # Re-review of C2c: a string into `time`; an argument longer than, or
+    # with no bound against, the callee's declared length.
     "120": {"why": ["store:assign:time"]},
+    "122": {"why": ["node:call:type"]},
+    "123": {"scalars": "uninterpreted", "statements": "c1"},
+    "124": {"why": ["node:call:type"]},
+    "125": {"why": ["node:call:type"]},
     "106": {"why": ["store:declare:smallint"]},
     "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
     "108": {"why": ["store:assign:date", "expr:date-literal"]},
