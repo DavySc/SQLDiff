@@ -1781,6 +1781,7 @@ mod tests {
             tables: _,
             routines: _,
             schemas: _,
+            triggers: _,
         } = Catalog::default();
         let base = key(&facts(DDL));
         for (what, old, new) in [

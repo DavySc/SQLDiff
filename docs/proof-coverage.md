@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 179 | 35 (20%) | 6 (3%) | 138 (77%) |
+| `converter` | 181 | 35 (19%) | 6 (3%) | 140 (77%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 208 | 38 (18%) | 8 (4%) | 162 (78%) |
+| **All** | 210 | 38 (18%) | 8 (4%) | 164 (78%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -132,6 +132,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.func.isnull` | `converter` | lemma: `Sqldiff.Mirror/C2a operators/ISNULL` | int arguments (C2a), or a string variable or parameter with a fallback that fits it (C2b strings/ISNULL); other types engine (ASM-ISNULL-TYPE) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.len` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string variable, parameter or literal of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.string_agg` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.geography.point-constant` | `converter` | engine | SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical | `sqldiff-convert/src/tsql/geography.rs` |
 | `tsql.global-temp` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.clustered` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.index.nulls-not-distinct` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
@@ -171,6 +172,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.sqlcmd-include` | `converter` | engine |  | `sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.break` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.continue` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.stmt.drop-trigger` | `converter` | engine |  | `sqldiff-convert/src/tsql/trigger.rs` |
 | `tsql.stmt.dynamic-known-text` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.dynamic-parameters` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.exec` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

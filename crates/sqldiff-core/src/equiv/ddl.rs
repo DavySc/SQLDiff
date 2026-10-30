@@ -106,11 +106,32 @@ pub struct Grant {
 #[derive(Debug, Clone)]
 pub struct DropDef {
     pub dialect: Dialect,
-    /// `TABLE`, `VIEW`, `PROCEDURE`, `FUNCTION`, `SEQUENCE` or `SCHEMA`.
+    /// `TABLE`, `VIEW`, `PROCEDURE`, `FUNCTION`, `SEQUENCE`, `SCHEMA` or
+    /// `TRIGGER`.
     pub kind: &'static str,
     pub name: Vec<Name>,
     pub if_exists: bool,
+    /// PostgreSQL `DROP TRIGGER name ON table`: the table (empty otherwise).
+    pub table: Vec<Name>,
+    /// PostgreSQL: the trigger function a `DROP FUNCTION IF EXISTS f()`
+    /// right after the DROP TRIGGER drops with it (set by the caller).
+    pub function: Option<Vec<Name>>,
     pub off: usize,
+}
+
+impl DropDef {
+    /// What the drop is paired by: schema (`None` for the default one) and
+    /// name. A trigger is found in its table's schema: PostgreSQL's by its
+    /// table, T-SQL's by its own name (SQL Server keeps a trigger in its
+    /// table's schema, Msg 2103).
+    pub fn key(&self) -> R<(Option<String>, String)> {
+        if self.kind == "TRIGGER" && !self.table.is_empty() {
+            let mut parts: Vec<Name> = self.table[..self.table.len() - 1].to_vec();
+            parts.extend(self.name.iter().cloned());
+            return object_key(&parts, self.dialect);
+        }
+        object_key(&self.name, self.dialect)
+    }
 }
 
 /// A column default set after the table: T-SQL `ALTER TABLE t ADD
@@ -187,6 +208,7 @@ impl Ddl {
                 "PROCEDURE" => "DROP PROCEDURE",
                 "FUNCTION" => "DROP FUNCTION",
                 "SEQUENCE" => "DROP SEQUENCE",
+                "TRIGGER" => "DROP TRIGGER",
                 _ => "DROP SCHEMA",
             },
             Ddl::Default(_) => "column default",
@@ -238,6 +260,7 @@ fn drop_kind(w: &str) -> Option<&'static str> {
         "FUNCTION" => "FUNCTION",
         "SEQUENCE" => "SEQUENCE",
         "SCHEMA" => "SCHEMA",
+        "TRIGGER" => "TRIGGER",
         _ => return None,
     })
 }
@@ -332,6 +355,9 @@ pub fn case_check(x: &Ddl, schema: &super::schema::Schema) -> R<()> {
             for n in &x.name {
                 schema.case_check(&stored(n), x.kind == "TABLE")?;
             }
+            for n in &x.table {
+                schema.case_check(&stored(n), true)?;
+            }
         }
         Ddl::Default(x) if x.dialect == Dialect::Postgres => {
             for n in x.table.iter().chain(std::iter::once(&x.column)) {
@@ -401,7 +427,7 @@ pub fn pair_key(x: &Ddl) -> R<String> {
             format!("drop schema {}", fold(&x.name[0], x.dialect)?)
         }
         Ddl::Drop(x) => {
-            let (s, n) = object_key(&x.name, x.dialect)?;
+            let (s, n) = x.key()?;
             format!("drop {} {}.{n}", x.kind, s.unwrap_or_default())
         }
         Ddl::Default(x) => {
@@ -942,6 +968,27 @@ fn drop(ts: &[Tok], d: Dialect) -> R<DropDef> {
     if ts.get(j).is_some_and(|t| t.kind == K::LParen) {
         return Err(format!("DROP {kind} with an argument list"));
     }
+    let mut table = Vec::new();
+    if kind == "TRIGGER" {
+        match d {
+            // T-SQL `ON DATABASE` / `ON ALL SERVER`: a DDL trigger.
+            Dialect::Tsql if word(ts.get(j), "ON") => {
+                return Err("DROP TRIGGER of a DDL trigger (ON DATABASE / ALL SERVER)".into());
+            }
+            Dialect::Postgres => {
+                if !word(ts.get(j), "ON") {
+                    return Err("DROP TRIGGER without ON table".into());
+                }
+                let (t, k) = dotted(ts, j + 1)?;
+                if name.len() != 1 || t.len() > 2 {
+                    return Err("DROP TRIGGER with a qualified trigger name".into());
+                }
+                table = t;
+                j = k;
+            }
+            _ => {}
+        }
+    }
     if d == Dialect::Postgres && word(ts.get(j), "RESTRICT") {
         j += 1;
     }
@@ -956,8 +1003,29 @@ fn drop(ts: &[Tok], d: Dialect) -> R<DropDef> {
         kind,
         name,
         if_exists,
+        table,
+        function: None,
         off: ts[0].off,
     })
+}
+
+/// PostgreSQL `DROP FUNCTION IF EXISTS f()`: the function's name. The form
+/// the conversion of a DROP TRIGGER writes after it for the trigger's
+/// function.
+pub fn trigger_function_drop(ts: &[Tok]) -> Option<Vec<Name>> {
+    let ts = match ts.last() {
+        Some(t) if t.kind == K::Semi => &ts[..ts.len() - 1],
+        _ => ts,
+    };
+    if !(word(ts.first(), "DROP")
+        && word(ts.get(1), "FUNCTION")
+        && word(ts.get(2), "IF")
+        && word(ts.get(3), "EXISTS"))
+    {
+        return None;
+    }
+    let (name, j) = dotted(ts, 4).ok()?;
+    (ts.len() == j + 2 && ts[j].kind == K::LParen && ts[j + 1].kind == K::RParen).then_some(name)
 }
 
 fn truncate(ts: &[Tok], d: Dialect) -> R<Truncate> {
@@ -1405,6 +1473,10 @@ pub mod asm {
     pub const DROP_DEPENDENTS: (&str, &str) = (
         "ASM-DROP-NO-DEPENDENTS",
         "No view, routine or other object depends on the dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP (RESTRICT) where SQL Server drops a table or view under a view that is not schema-bound",
+    );
+    pub const TRIGGER_DROP: (&str, &str) = (
+        "ASM-TRIGGER-DROP",
+        "The trigger the DROP TRIGGER names is the one the converted files' CREATE TRIGGER of that name defines: on that table, and on the target with the trigger function its conversion wrote, which no other trigger runs",
     );
     pub const DEFAULT_NAME: (&str, &str) = (
         "ASM-DEFAULT-CONSTRAINT-NAME",
@@ -2113,10 +2185,7 @@ fn drops(x: &DropDef, y: &DropDef, na: &str, nb: &str, ev: &mut Vec<Event>) -> R
             (None, fold(&y.name[0], y.dialect)?),
         )
     } else {
-        (
-            object_key(&x.name, x.dialect)?,
-            object_key(&y.name, y.dialect)?,
-        )
+        (x.key()?, y.key()?)
     };
     if x.kind != y.kind || kx != ky {
         ev.push(Event::Diff {
@@ -2147,9 +2216,12 @@ fn drops(x: &DropDef, y: &DropDef, na: &str, nb: &str, ev: &mut Vec<Event>) -> R
         });
         return Ok(());
     }
-    // A schema is dropped only when empty, on both.
-    if x.kind != "SCHEMA" {
-        ev.push(Event::Asm(asm::DROP_DEPENDENTS));
+    // A schema is dropped only when empty, on both. Nothing depends on a
+    // trigger; which table and function it has is checked by the caller.
+    match x.kind {
+        "SCHEMA" => {}
+        "TRIGGER" => ev.push(Event::Asm(asm::TRIGGER_DROP)),
+        _ => ev.push(Event::Asm(asm::DROP_DEPENDENTS)),
     }
     Ok(())
 }

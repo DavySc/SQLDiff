@@ -499,7 +499,7 @@ statement = "Objects in T-SQL schema dbo are found in the target's default schem
 discharge = "deployment"
 fact = "The target's default schema holds the converted objects."
 fact_key = "default_schema"
-sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/instances.rs", "sqldiff-convert/src/lib.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-convert/src/tsql/trigger.rs", "sqldiff-core/profiles/rules/tsql-pg.rules"]
 
 [[assumption]]
 id = "ASM-DEFAULT-SCHEMA"
@@ -1121,6 +1121,13 @@ statement = "TINYINT values stay within 0-255 (the converted SMALLINT accepts mo
 discharge = "generated"
 fact = "A CHECK on the converted column, or callers that write only 0-255."
 sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-TRIGGER-DROP"
+statement = "The trigger a DROP TRIGGER names is the one the converted files' CREATE TRIGGER defines: on that table, and on the target with the function its conversion wrote, which no other trigger runs."
+discharge = "catalog"
+fact = "The target's trigger of that name on that table and the function it executes."
+sites = ["sqldiff-convert/src/tsql/trigger.rs", "sqldiff-core/src/equiv/ddl.rs"]
 
 [[assumption]]
 id = "ASM-TRIGGER-ERROR"

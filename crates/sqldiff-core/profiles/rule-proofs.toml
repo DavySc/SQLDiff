@@ -736,6 +736,13 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.geography.point-constant"
+kind = "converter"
+proof = "engine"
+note = "SQL Server point bytes to PostGIS EWKB; eval/geography shows the doubles bit-identical"
+sites = ["sqldiff-convert/src/tsql/geography.rs"]
+
+[[rule]]
 id = "tsql.global-temp"
 kind = "converter"
 proof = "engine"
@@ -1058,6 +1065,12 @@ id = "tsql.stmt.sqlcmd-include"
 kind = "converter"
 proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.stmt.drop-trigger"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql/trigger.rs"]
 
 [[rule]]
 id = "tsql.stmt.throw"

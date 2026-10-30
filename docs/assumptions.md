@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 55 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 56 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 105 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 210 |
+| | Total | 211 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -109,7 +109,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-DB2-USRPRF-USER` | A Db2 for i routine without SET OPTION USRPRF runs with the caller's authority (system naming at creation; fact V25, not checked). | `deployment` | The naming mode the routines are created with. (fact key `db2i_naming`) | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-DB2-UTC` | The job's current UTC offset gives UTC time (off by the change around a daylight-saving switch). | `deployment` | The job's time zone, and whether the code runs around a switch. (fact key `time_zone`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-DB2I-RESERVED-UNCHECKED` | A name is not a Db2 for i reserved word (no verified list is built in). | `nothing` | A verified reserved-word list, or the name created on a real system. | `sqldiff-convert/src/names.rs` |
-| `ASM-DBO-SCHEMA` | Objects in T-SQL schema dbo are found in the target's default schema (search_path, CURRENT SCHEMA or library list). | `deployment` | The target's default schema holds the converted objects. (fact key `default_schema`) | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
+| `ASM-DBO-SCHEMA` | Objects in T-SQL schema dbo are found in the target's default schema (search_path, CURRENT SCHEMA or library list). | `deployment` | The target's default schema holds the converted objects. (fact key `default_schema`) | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/instances.rs`<br>`sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `ASM-DEFAULT-CONSTRAINT-NAME` | The column has no default yet when the default is added, and nothing refers to the default by its constraint name: SQL Server refuses a second default on a column (Msg 1781) where PostgreSQL's SET DEFAULT replaces it, and PostgreSQL defaults have no name. | `deployment` | The column has no default before the statement runs, and no later statement drops or alters the default constraint by name. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-DEFAULT-SCHEMA` | Unqualified names, T-SQL dbo and PostgreSQL public resolve to the same schema on both sides. | `deployment` | The default schema in effect on both sides. (fact key `default_schema`) | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-DROP-NO-DEPENDENTS` | No view, routine or other object depends on a dropped object, and a dropped routine's name is not overloaded: PostgreSQL refuses such a DROP, SQL Server drops a table or view under a view that is not schema-bound. | `catalog` | The target catalog's dependencies (pg_depend) on the object are only those dropped with it, and its routine name has one signature. | `sqldiff-core/src/equiv/ddl.rs` |
@@ -200,6 +200,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-THROW-ERRCODE` | Callers do not depend on the T-SQL error number of a raised error (they see a fixed SQLSTATE and the same message). | `deployment` | How callers handle the error. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-TIME-SOURCE` | The session's time zone is the server's (the current time follows the session, T-SQL's the server clock). | `deployment` | The sessions' time zone. (fact key `time_zone`) | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TINYINT` | TINYINT values stay within 0-255 (the converted SMALLINT accepts more). | `generated` | A CHECK on the converted column, or callers that write only 0-255. | `sqldiff-convert/src/tsql.rs` |
+| `ASM-TRIGGER-DROP` | The trigger a DROP TRIGGER names is the one the converted files' CREATE TRIGGER defines: on that table, and on the target with the function its conversion wrote, which no other trigger runs. | `catalog` | The target's trigger of that name on that table and the function it executes. | `sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/src/equiv/ddl.rs` |
 | `ASM-TRIGGER-ERROR` | Callers do not catch an error raised in the trigger and carry on (T-SQL dooms the transaction). | `deployment` | How callers handle errors from writes to the table. | `sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/src/equiv/trigger.rs` |
 | `ASM-TRIGGER-ORDER` | Several AFTER triggers for one event on the table do not depend on each other's effects. | `catalog` | The other triggers on the table. | `sqldiff-convert/src/tsql/trigger.rs`<br>`sqldiff-core/src/equiv/trigger.rs` |
 | `ASM-TRIGGER-REENTRY-OTHERS` | The other UPDATE triggers on the table do nothing when their images are empty, and no BEFORE trigger changes the columns the trigger tests. | `catalog` | The other triggers on the table. | `sqldiff-core/src/equiv/trigger.rs` |
