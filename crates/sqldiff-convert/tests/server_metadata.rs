@@ -146,3 +146,21 @@ END
         u.notes
     );
 }
+
+/// #190's own-setting test reads sys.sql_modules and is converted, not
+/// refused as server metadata.
+#[test]
+fn module_setting_check_is_not_refused_as_metadata() {
+    let src = "CREATE PROCEDURE dbo.p\nAS\nBEGIN\n  DECLARE @e int = 0\n  IF NOT (SELECT uses_ansi_nulls FROM sys.sql_modules WHERE [object_id] = @@PROCID) = 1 SET @e = 1\nEND\n";
+    let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+    let u = c.units.iter().find(|u| u.src.line == 5).unwrap();
+    assert!(
+        !u.notes.iter().any(|n| n.rule.ends_with("server-metadata")),
+        "{:?}",
+        u.notes
+    );
+    assert!(!c
+        .output
+        .lines()
+        .any(|l| !l.trim_start().starts_with("--") && l.contains("sys.")));
+}
