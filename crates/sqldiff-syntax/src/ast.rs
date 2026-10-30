@@ -87,15 +87,23 @@ pub fn sig_range(node: &SyntaxNode) -> (usize, usize) {
 
 /// Name of a routine (`CREATE PROCEDURE a.b ...`), parts unquoted and joined with `.`.
 pub fn routine_name(node: &SyntaxNode) -> Option<String> {
+    let parts = routine_name_parts(node);
+    (!parts.is_empty()).then(|| parts.join("."))
+}
+
+/// The routine's name parts as its header writes them, unquoted
+/// (`[dbo].[p]` → `dbo`, `p`); empty when there is none.
+pub fn routine_name_parts(node: &SyntaxNode) -> Vec<String> {
     let toks: Vec<SyntaxToken> = sig_tokens(node).collect();
-    let i = toks.iter().position(|t| {
+    let Some(i) = toks.iter().position(|t| {
         t.kind() == IDENT
             && ["PROCEDURE", "PROC", "FUNCTION", "TRIGGER", "VIEW"]
                 .iter()
                 .any(|k| t.text().eq_ignore_ascii_case(k))
-    })?;
-    let parts = qualified_name_at(&toks, i + 1);
-    (!parts.is_empty()).then(|| parts.join("."))
+    }) else {
+        return Vec::new();
+    };
+    qualified_name_at(&toks, i + 1)
 }
 
 /// Reads a qualified name (`a.b.c`, `lib/file`) starting at `toks[i]`.

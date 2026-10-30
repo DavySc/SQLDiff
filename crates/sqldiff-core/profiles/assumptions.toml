@@ -771,6 +771,13 @@ fact = "The operands' types."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-PROCID-NAME"
+statement = "SQL Server stores the routine under the name and schema its header writes, letter for letter (OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) become them as literals)."
+discharge = "catalog"
+fact = "sys.objects name and schema of the routine: not renamed with sp_rename, nor first created under another letter case and then altered."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-QUOTENAME-IDENT"
 statement = "The result of QUOTENAME is used as an identifier, never as text, and is at most 128 characters."
 discharge = "nothing"
@@ -1092,7 +1099,7 @@ id = "ASM-TSQL-ANSI-NULLS"
 statement = "The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN."
 discharge = "catalog"
 fact = "sys.sql_modules.uses_ansi_nulls for the routine."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ANSI-NULL-DEFAULT"
@@ -1169,7 +1176,7 @@ id = "ASM-TSQL-QUOTED-IDENTIFIER"
 statement = "The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string."
 discharge = "deployment"
 fact = "The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier)."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ARITH-ERRORS"

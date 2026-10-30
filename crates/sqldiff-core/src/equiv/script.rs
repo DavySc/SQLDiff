@@ -462,7 +462,8 @@ fn assigned_literals(u: &Unit, l: &Local) -> Option<Vec<Term>> {
         if !names(u.dialect, &t, &l.name) {
             continue;
         }
-        out.push(match (e, &ty) {
+        let e = super::canon::own_name_literal(u, e);
+        out.push(match (e.as_ref(), &ty) {
             (Expr::Null, _) => a("null"),
             (Expr::Str(v), Some(table::Ty::Str { len, .. })) => {
                 if len.is_some_and(|n| v.chars().count() > n as usize) {
@@ -740,7 +741,7 @@ pub(super) fn cannot_fail(u: &Unit, node: &SyntaxNode) -> bool {
     };
     let string = matches!(ty, Some(table::Ty::Str { .. }));
     let binary = matches!(ty, Some(table::Ty::Binary { .. }));
-    match v {
+    match super::canon::own_name_literal(u, v).as_ref() {
         Expr::Null => true,
         Expr::Str(_) if string => true,
         // A binary constant is cut off or zero-padded to the variable's

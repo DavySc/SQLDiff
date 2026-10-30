@@ -386,3 +386,49 @@ fn unproven_built_ins_are_named() {
         "{text}"
     );
 }
+
+/// A procedure's `OBJECT_NAME(@@PROCID)` / `OBJECT_SCHEMA_NAME(@@PROCID)`
+/// against the literal the converter writes: its own name and schema, letter
+/// for letter, under ASM-PROCID-NAME.
+#[test]
+fn own_name_from_procid() {
+    let run = |header: &str, a: &str, b: &str| {
+        diff(
+            &Artifact::new(
+                "a.sql",
+                Dialect::Tsql,
+                format!("CREATE PROCEDURE {header}\nAS\nBEGIN\n    DECLARE @r nvarchar(max);\n    SET @r = {a};\n    INSERT INTO dbo.L (s) VALUES (@r);\nEND\n"),
+            ),
+            &Artifact::new(
+                "b.sql",
+                Dialect::Postgres,
+                format!("CREATE OR REPLACE PROCEDURE p()\nLANGUAGE plpgsql\nAS $$\nDECLARE\n    v_r text;\nBEGIN\n    v_r := {b};\n    INSERT INTO L (s) VALUES (v_r);\nEND;\n$$;\n"),
+            ),
+            &Options {
+                catalog_a: vec![Artifact::new("c.sql", Dialect::Tsql, "CREATE TABLE dbo.L (s nvarchar(max) NULL);")],
+                catalog_b: vec![Artifact::new("c.sql", Dialect::Postgres, "CREATE TABLE L (s text NULL);")],
+                ..Options::default()
+            },
+        )
+    };
+    let equal = |r: &Report| matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions);
+    let r = run("[dbo].[Proc_A]", "OBJECT_NAME(@@PROCID)", "'Proc_A'");
+    assert!(equal(&r), "{:?} {:?}", r.verdict(), r.findings);
+    assert!(r.assumptions.iter().any(|x| x.id == "ASM-PROCID-NAME"));
+    let r = run("[dbo].[Proc_A]", "OBJECT_SCHEMA_NAME(@@PROCID)", "'dbo'");
+    assert!(equal(&r), "{:?} {:?}", r.verdict(), r.findings);
+    // Another name, another letter case, another schema.
+    for (header, a, b) in [
+        ("[dbo].[Proc_A]", "OBJECT_NAME(@@PROCID)", "'Proc_B'"),
+        ("[dbo].[Proc_A]", "OBJECT_NAME(@@PROCID)", "'proc_a'"),
+        ("[dbo].[Proc_A]", "OBJECT_SCHEMA_NAME(@@PROCID)", "'Proc_A'"),
+        ("Sales.Proc_A", "OBJECT_SCHEMA_NAME(@@PROCID)", "'dbo'"),
+        // No schema in the header: the creator's default schema, unknown.
+        ("Proc_A", "OBJECT_SCHEMA_NAME(@@PROCID)", "'dbo'"),
+        // Another object's id.
+        ("[dbo].[Proc_A]", "OBJECT_NAME(@@SPID)", "'Proc_A'"),
+    ] {
+        let r = run(header, a, b);
+        assert!(!equal(&r), "{header} {a} = {b}: {:?}", r.verdict());
+    }
+}

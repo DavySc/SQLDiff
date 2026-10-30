@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 52 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 53 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 19 |
 | `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 95 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 195 |
+| | Total | 196 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -148,6 +148,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-PG-VARIABLE-CONFLICT-ERROR` | plpgsql.variable_conflict is `error` (the default) for the function. | `deployment` | The server's and the function's plpgsql.variable_conflict setting. (fact key `pg_variable_conflict`) | `sqldiff-core/src/bind/query.rs` |
 | `ASM-PLUS-NUMERIC` | The operands of a `+` kept as addition are numbers. | `catalog` | The operands' types. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-POSTGIS-GEOGRAPHY` | PostgreSQL: the postgis extension is installed and its types are on the search path; a T-SQL GEOGRAPHY value is carried unchanged as a PostGIS geography (spatial methods are converted, or refused, on their own). | `deployment` | The target database has CREATE EXTENSION postgis. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/bind/mod.rs` |
+| `ASM-PROCID-NAME` | SQL Server stores the routine under the name and schema its header writes, letter for letter (OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) become them as literals). | `catalog` | sys.objects name and schema of the routine: not renamed with sp_rename, nor first created under another letter case and then altered. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-QUOTENAME-IDENT` | The result of QUOTENAME is used as an identifier, never as text, and is at most 128 characters. | `nothing` | A reading of how the routine uses the result. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAISERROR-FORMAT` | The variable RAISERROR takes as its message holds no % sign (T-SQL reads it as a format). | `deployment` | The values the routine puts in the message variable. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RAISERROR-INFO` | Callers read an informational RAISERROR message by its text, not its message number (50000), severity or state, which a PostgreSQL notice does not carry. | `deployment` | How callers read informational messages. | `sqldiff-convert/src/tsql.rs` |
@@ -197,7 +198,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TRY-HANDLER` | The TRY part raises no compile or name-resolution error (T-SQL's CATCH skips those, an SQLEXCEPTION handler does not). | `catalog` | Every name in the TRY part binds against the catalog. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-TRY-SUBTRANSACTION` | Undoing the TRY part's completed statements on an error matches T-SQL (XACT_ABORT ON, or a CATCH that rolls back). | `deployment` | The callers' XACT_ABORT setting, or a reading of the CATCH block. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-TSQL-ANSI-NULL-DEFAULT` | T-SQL columns declared without NULL or NOT NULL are nullable (ANSI_NULL_DFLT_ON when the table was created). | `catalog` | The columns' nullability in the T-SQL catalog. | `sqldiff-core/src/equiv/table.rs` |
-| `ASM-TSQL-ANSI-NULLS` | The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN. | `catalog` | sys.sql_modules.uses_ansi_nulls for the routine. | `sqldiff-convert/src/cert.rs` |
+| `ASM-TSQL-ANSI-NULLS` | The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN. | `catalog` | sys.sql_modules.uses_ansi_nulls for the routine. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-ANSI-PADDING` | The T-SQL varchar columns a converted routine writes were created with ANSI_PADDING ON (the default), so they keep the trailing spaces of a value as PostgreSQL does; under OFF SQL Server trims them on every write. | `catalog` | SQL Server's sys.columns: is_ansi_padded = 1 for those columns. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-ARITH-ERRORS` | T-SQL raises an error on integer overflow and division by zero: ANSI_WARNINGS and ARITHABORT are not both OFF for the session. | `deployment` | The session settings of the callers. | `sqldiff-convert/src/cert.rs` |
 | `ASM-TSQL-CALLER-XACT-ABORT-OFF` | The caller's XACT_ABORT setting is OFF. | `deployment` | The callers' XACT_ABORT setting. (fact key `tsql_xact_abort`) | `sqldiff-core/src/equiv/mod.rs`<br>`sqldiff-core/src/ir/behaviour.rs`<br>`sqldiff-core/src/ir/interp.rs`<br>`sqldiff-core/src/ledger.rs` |
@@ -212,7 +213,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-TSQL-MONEY-ROUNDING` | T-SQL rounds a value with more than four decimals to money half away from zero, as PostgreSQL rounds to numeric(..., 4). | `nothing` | The behaviour checked on SQL Server. | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-TSQL-OWNERSHIP-CHAIN` | Callers hold the privileges the statements need themselves (T-SQL skips checks along an ownership chain). | `deployment` | The callers' grants on the target. | `sqldiff-convert/src/lib.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-PLUS-IS-CONCAT` | Operands of T-SQL `+` next to a string literal are character strings, so `+` concatenates. | `catalog` | The operands' types. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
-| `ASM-TSQL-QUOTED-IDENTIFIER` | The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string. | `deployment` | The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier). | `sqldiff-convert/src/cert.rs` |
+| `ASM-TSQL-QUOTED-IDENTIFIER` | The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string. | `deployment` | The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier). | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-RETURN-NULL-WARNING` | Callers do not read the warning T-SQL sends when a procedure returns NULL (the status is 0 on both sides). | `deployment` | How callers handle messages. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-STRING-AGG-8000` | The aggregated list stays under 8000 bytes (T-SQL STRING_AGG of a non-MAX input errors past that). | `deployment` | The data never aggregates a longer list. | `sqldiff-core/profiles/rules/tsql-pg.rules`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-TSQL-STRING-ARGS` | Every string argument a caller passes to a converted T-SQL routine fits the parameter's declared length (and, for varchar, its code page): T-SQL truncates it silently, PostgreSQL does not. | `deployment` | What callers pass. | `sqldiff-convert/src/cert.rs` |

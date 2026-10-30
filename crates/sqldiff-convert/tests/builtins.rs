@@ -169,7 +169,7 @@ fn instance_metadata_is_refused_with_its_reason() {
         "SET @r = CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max));",
         "describes the SQL Server instance",
     );
-    refused("SET @r = OBJECT_NAME(@@PROCID);", "@@PROCID");
+    refused("SET @r = OBJECT_DEFINITION(@@PROCID);", "@@PROCID");
     refused("SET @i = OBJECT_ID(N'dbo.t');", "SQL Server object id");
     refused(
         "SET @r = JSON_MODIFY(@s, '$.a', 1);",
@@ -217,4 +217,42 @@ fn trims_and_quotes_are_proven() {
         .notes
         .iter()
         .any(|n| n.rule == "ASM-QUOTENAME-IDENT"));
+}
+
+/// OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) in a procedure
+/// are its own name and schema as the header writes them.
+#[test]
+fn own_name_from_procid() {
+    proven("SET @r = OBJECT_NAME(@@PROCID);", "v_r := 'p';");
+    proven("SET @r = OBJECT_SCHEMA_NAME(@@PROCID);", "v_r := 'dbo';");
+    let (c, _) = run("SET @r = OBJECT_NAME(@@PROCID);");
+    assert!(unit(&c).notes.iter().any(|n| n.rule == "ASM-PROCID-NAME"));
+}
+
+/// Where the procedure's own name or schema is not known, they stay refused.
+#[test]
+fn own_name_from_procid_needs_a_named_module() {
+    let unit_at = |src: &str, line: usize| {
+        let c = convert(src, Dialect::Tsql, Dialect::Postgres).unwrap();
+        let u = c.units.iter().find(|u| u.src.line == line).unwrap().clone();
+        (u, c.output)
+    };
+    // No schema in the header: the creator's default schema.
+    let (u, out) = unit_at(
+        "CREATE PROCEDURE [Get Name]\nAS\nBEGIN\n    DECLARE @r nvarchar(max);\n    SET @r = OBJECT_SCHEMA_NAME(@@PROCID);\n    SET @r = OBJECT_NAME(@@PROCID);\nEND\n",
+        5,
+    );
+    assert_eq!(u.status, Status::NotConverted, "{out}");
+    assert!(
+        u.notes.iter().any(|n| n.text.contains("names no schema")),
+        "{:?}",
+        u.notes
+    );
+    assert!(out.contains("v_r := 'Get Name';"), "{out}");
+    // A script outside any module: @@PROCID is 0.
+    let (u, out) = unit_at(
+        "DECLARE @r nvarchar(max);\nSET @r = OBJECT_NAME(@@PROCID);\nPRINT @r;\n",
+        2,
+    );
+    assert_eq!(u.status, Status::NotConverted, "{out}");
 }

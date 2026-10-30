@@ -177,6 +177,31 @@ fn try_catch_becomes_an_exception_block() {
     ));
 }
 
+/// `BEGIN TRY;` and `BEGIN;` (WWI, the PolyBase sample): the terminator
+/// after the opener is not a statement left unconverted.
+#[test]
+fn terminator_after_a_block_opener() {
+    let src = "CREATE PROCEDURE p @x int AS\nBEGIN\n  BEGIN TRY;\n    DELETE FROM t;\n  END TRY\n  BEGIN CATCH;\n    THROW;\n  END CATCH;\n  IF @x IS NULL\n  BEGIN;\n    SET @x = 20;\n  END;\nEND\n";
+    let c = tsql(src);
+    assert!(
+        c.units.iter().all(|u| u.status != Status::NotConverted),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output
+            .contains("  BEGIN\n    DELETE FROM t;\n  EXCEPTION WHEN OTHERS THEN\n"),
+        "{}",
+        c.output
+    );
+    assert!(
+        c.output
+            .contains("  IF p_x IS NULL THEN\n    p_x := 20;\n  END IF;\n"),
+        "{}",
+        c.output
+    );
+}
+
 #[test]
 fn constructs_without_rules_are_kept_as_comments() {
     let src = "MERGE t USING s ON t.id = s.id WHEN MATCHED THEN DELETE;\nUPDATE t SET a = s.a FROM t JOIN s ON s.id = t.id;\nSELECT DATEDIFF(week, a, b) FROM t;\n";

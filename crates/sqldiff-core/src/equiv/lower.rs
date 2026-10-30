@@ -256,6 +256,8 @@ pub struct Unit {
     /// Name of the artifact's one routine: names the temporary table each
     /// table variable became (`classify::table_variable_table`).
     pub routine: Option<String>,
+    /// That routine's name parts as its header writes them, unquoted.
+    pub routine_parts: Vec<String>,
     /// T-SQL compared against PostgreSQL or Db2 for i: the other side's
     /// temporary tables (`classify::temp_table_names`). A table variable
     /// converted to one of them is named as it; otherwise `@t` keeps the key
@@ -359,6 +361,7 @@ fn empty(d: Dialect) -> Unit {
         local_ids: None,
         trigger: None,
         routine: None,
+        routine_parts: Vec::new(),
         other_temps: Default::default(),
         table_vars: Vec::new(),
         temp_drops: Vec::new(),
@@ -394,6 +397,7 @@ pub fn lower(a: &Analyzed) -> Unit {
         [r] => {
             u.in_block = true;
             u.routine = sqldiff_syntax::ast::routine_name(r);
+            u.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
             header(r, &mut u);
             // Statements outside the routine (other than batch separators) are
             // not covered, except the tables it creates, compared table against
@@ -800,6 +804,7 @@ pub fn lower_segment(d: Dialect, seg: &Segment) -> Unit {
         .collect();
     if let [r] = routines.as_slice() {
         u.routine = cst::routine_name(r);
+        u.routine_parts = cst::routine_name_parts(r);
     }
     for n in &seg.nodes {
         unit(n, &mut u);
@@ -1583,6 +1588,13 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         StmtKind::TxnSetting if w(1) == "XACT_ABORT" && w(2) == "ON" => {
             u.txn_control = true;
             u.stops_on_error = true;
+        }
+        _ if d == Dialect::Tsql && w(0) == ":" => {
+            let what = format!(
+                "a SQLCMD directive `:{}` (not SQL; a file it includes is compared on its own)",
+                w(1).to_lowercase()
+            );
+            u.uncovered.push((c.clone(), what));
         }
         _ => {
             let what = format!(
