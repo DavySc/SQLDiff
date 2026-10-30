@@ -51,11 +51,11 @@ theorem SExpr.eval_rename {σA σB ρ : Store U} (h : Agree f D σA σB) :
     rw [h x (hs x (by simp [SExpr.vars]))]
   | .int _, _ => rfl
   | .null, _ => rfl
-  | .arith _ a b, hs => by
+  | .arith _ _ a b, hs => by
     simp only [SExpr.rename, SExpr.eval]
     rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
       SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
-  | .neg a, hs => by
+  | .neg _ a, hs => by
     simp only [SExpr.rename, SExpr.eval]
     rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy]))]
   | .cmp _ a b, hs => by
@@ -98,6 +98,23 @@ theorem SExpr.eval_rename {σA σB ρ : Store U} (h : Agree f D σA σB) :
     rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
       SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
   | .len a, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .bool _, _ => rfl
+  | .date _, _ => rfl
+  | .ts _, _ => rfl
+  | .dateAdd _ a b, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
+      SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .dateDiff a b, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy])),
+      SExpr.eval_rename h b (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .toDate a, hs => by
+    simp only [SExpr.rename, SExpr.eval]
+    rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy]))]
+  | .toTs a, hs => by
     simp only [SExpr.rename, SExpr.eval]
     rw [SExpr.eval_rename h a (fun y hy => hs y (by simp [SExpr.vars, hy]))]
 
