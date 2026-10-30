@@ -1398,7 +1398,23 @@ impl<'a> Canon<'a> {
                     Expr::Str(s) => super::like::canonical(s, self.d),
                     _ => None,
                 };
-                let plain = pat.is_some() && ty.is_some_and(|t| t.fam == Fam::VarChar);
+                // A value escaped into a pattern that matches only itself
+                // (`%` aside), each dialect's way (`like::escaped_value`).
+                let escaped = match super::like::escaped_value(p, self.d) {
+                    Some(v) => match self.expr(v)? {
+                        // T-SQL's REPLACE cuts a result that is not MAX at
+                        // 8,000 bytes, and the escaping can triple x.
+                        (v, Some(t))
+                            if t.fam == Fam::VarChar && t.len.map_or(true, |l| l * 3 <= 4000) =>
+                        {
+                            Some(v)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let plain = (pat.is_some() || escaped.is_some())
+                    && ty.is_some_and(|t| t.fam == Fam::VarChar);
                 // Under a non-_SC collation T-SQL's `_` matches no character
                 // outside the BMP (N'a😀' LIKE N'a_' and N'a__' are both
                 // false on SQL Server 2022); PostgreSQL's matches one.
@@ -1408,9 +1424,10 @@ impl<'a> Canon<'a> {
                 {
                     self.assume(asm::LEN_BMP);
                 }
-                let p = match pat {
-                    Some(c) => n("likepat", vec![a(c)]),
-                    None => self.expr(p)?.0,
+                let p = match (pat, escaped) {
+                    (Some(c), _) => n("likepat", vec![a(c)]),
+                    (None, Some(v)) => n("likeescaped", vec![v]),
+                    (None, None) => self.expr(p)?.0,
                 };
                 let coll = if plain {
                     n("coll-like", vec![self.dtag()])
@@ -5300,8 +5317,8 @@ impl<'a> Canon<'a> {
                 Some(w) => self.cond(&w)?.0,
                 None => a("-"),
             };
-            self.unique_match(&table, &from_t, &subs, &w)?;
             let kv = self.update_sets(&table, sets)?;
+            self.unique_match(&table, &from_t, &subs, &w, &kv)?;
             Ok(n(
                 "update-from",
                 vec![a(table), n("set", kv), n("from", from_t), w],
@@ -5324,6 +5341,7 @@ impl<'a> Canon<'a> {
         from: &[Term],
         subs: &[(String, Option<Vec<String>>)],
         w: &Term,
+        kv: &[Term],
     ) -> R<()> {
         fn conj(t: &Term) -> Vec<Term> {
             if t.is("and") {
@@ -5467,10 +5485,88 @@ impl<'a> Canon<'a> {
             }
         }
         if ls.iter().all(|(t, _)| bound.contains(t)) {
-            Ok(())
-        } else {
-            fail()
+            return Ok(());
         }
+        // Several matches give the same new values when SET reads only the
+        // target, the statement's variables, and columns of the other tables
+        // that WHERE or an inner join pins to one value by `=` against
+        // something constant over the statement (`s.Selected = 1`). Only
+        // types whose equal values are the same value count: not strings
+        // (case), floats (-0) or time-zone offsets.
+        let mut pinned: Vec<(String, String)> = Vec::new();
+        for c in &all {
+            if !(c.is("cmp") && c.kid(0).and_then(Term::atom) == Some("=")) {
+                continue;
+            }
+            let (Some(x), Some(y)) = (c.kid(1), c.kid(2)) else {
+                continue;
+            };
+            for (col, other) in [(x, y), (y, x)] {
+                let (Some(tb), Some(cn)) = (
+                    col.kid(0).and_then(Term::atom),
+                    col.kid(1).and_then(Term::atom),
+                ) else {
+                    continue;
+                };
+                // A literal, variable or parameter, maybe converted: not a
+                // call such as NEWID(), which changes per row.
+                fn constant(t: &Term) -> bool {
+                    match t.head() {
+                        "num" | "flt" | "bool" | "str" | "sym" => true,
+                        "conv" | "cast" => t.kids().last().is_some_and(constant),
+                        _ => false,
+                    }
+                }
+                if !col.is("col") || !constant(other) {
+                    continue;
+                }
+                let exact = self
+                    .schema
+                    .table(Self::base_table(tb))
+                    .and_then(|tab| tab.column(cn))
+                    .is_some_and(|c| {
+                        matches!(
+                            c.ty.fam,
+                            Fam::Int
+                                | Fam::Exact
+                                | Fam::Bool
+                                | Fam::Date
+                                | Fam::Timestamp
+                                | Fam::Time
+                        )
+                    });
+                if exact && !bound.iter().any(|b| b == tb) {
+                    pinned.push((tb.to_string(), cn.to_string()));
+                }
+            }
+        }
+        let read_only_pinned = kv.iter().all(|k| {
+            !k.any(&|s| {
+                s.is("subq")
+                    || s.is("col")
+                        && match (s.kid(0).and_then(Term::atom), s.kid(1).and_then(Term::atom)) {
+                            (Some(tb), Some(cn)) => {
+                                tb != target && !pinned.iter().any(|(pt, pc)| pt == tb && pc == cn)
+                            }
+                            _ => true,
+                        }
+            })
+        });
+        if read_only_pinned {
+            if !pinned.is_empty() {
+                pinned.sort();
+                pinned.dedup();
+                let cols: Vec<String> = pinned.iter().map(|(t, c)| format!("{t}.{c}")).collect();
+                self.discharge(format!(
+                    "SET reads only the target and {}, one value for every match",
+                    cols.join(", ")
+                ));
+            } else {
+                self.discharge("SET reads only the target, one value for every match".into());
+            }
+            return Ok(());
+        }
+        fail()
     }
 
     fn delete(

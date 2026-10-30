@@ -22,6 +22,8 @@
 
 use sqldiff_syntax::Dialect;
 
+use super::ast::Expr;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
     Any,
@@ -117,6 +119,30 @@ pub fn canonical(p: &str, d: Dialect) -> Option<String> {
         Dialect::Db2i => None,
     }
     .map(|t| render(&t))
+}
+
+/// The value x of a pattern that matches x itself with `%` its only
+/// wildcard, each dialect's way: T-SQL `REPLACE(REPLACE(x, '[', '[[]'), '_',
+/// '[_]')` (Ola Hallengren's idiom: `[[]` and `[_]` are the literal
+/// characters, `\` is a literal anyway) and PostgreSQL `replace(replace(x,
+/// '\', '\\'), '_', '\_')` (its escape character escaped first).
+pub fn escaped_value(p: &Expr, d: Dialect) -> Option<&Expr> {
+    let (first, second) = match d {
+        Dialect::Tsql => (("[", "[[]"), ("_", "[_]")),
+        Dialect::Postgres => (("\\", "\\\\"), ("_", "\\_")),
+        Dialect::Db2i => return None,
+    };
+    fn replace<'e>(e: &'e Expr, (from, to): (&str, &str)) -> Option<&'e Expr> {
+        let Expr::Call(c) = e else { return None };
+        let plain = matches!(&c.name[..], [n] if n.eq_ignore_ascii_case("replace"))
+            && !(c.distinct || c.over || c.star || c.within_group)
+            && c.order.is_empty();
+        match &c.args[..] {
+            [x, Expr::Str(f), Expr::Str(t)] if plain && f == from && t == to => Some(x),
+            _ => None,
+        }
+    }
+    replace(replace(p, second)?, first)
 }
 
 /// Whether a pattern in the form `canonical` gives has a `_` wildcard.
