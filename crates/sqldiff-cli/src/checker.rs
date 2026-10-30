@@ -163,21 +163,26 @@ fn parse(reply: &str, id: u64) -> Result<MirrorAnswer, String> {
         },
         _ => return Err(format!("unexpected answer: {reply}")),
     };
-    let residual = match &v["residual"] {
-        serde_json::Value::Null => Vec::new(),
+    let strings = |field: &str| match &v[field] {
+        serde_json::Value::Null => Ok(Vec::new()),
         serde_json::Value::Array(xs) => xs
             .iter()
             .map(|x| x.as_str().map(str::to_string))
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| format!("unexpected residual: {reply}"))?,
-        _ => return Err(format!("unexpected residual: {reply}")),
+            .ok_or_else(|| format!("unexpected {field}: {reply}")),
+        _ => Err(format!("unexpected {field}: {reply}")),
     };
+    let residual = strings("residual")?;
+    // Reason codes beside an unconfirmed answer's `reason`; a checker
+    // without them is read as before.
+    let why = strings("why")?;
     Ok(MirrorAnswer {
         answer,
         scalars: v["scalars"].as_str().map(str::to_string),
         residual,
         statements: v["statements"].as_str().map(str::to_string),
         errors: v["errors"].as_str().map(str::to_string),
+        why,
     })
 }
 
@@ -233,6 +238,18 @@ mod tests {
         assert_eq!(m.statements.as_deref(), Some("c3a"));
         assert_eq!(m.errors.as_deref(), Some("c4"));
         assert_eq!(m.residual, ["ASM-X"]);
+        assert!(m.why.is_empty());
+        let m = parse(
+            r#"{"id":"3","proof":"unconfirmed","reason":"r","why":["check:differ","check:kind"]}"#,
+            3,
+        )
+        .unwrap();
+        assert_eq!(m.why, ["check:differ", "check:kind"]);
+        assert!(parse(
+            r#"{"id":"3","proof":"unconfirmed","reason":"r","why":[1]}"#,
+            3
+        )
+        .is_err());
         for bad in [
             r#"{"id":"4","proof":"confirmed","theorem":"T"}"#,
             r#"{"id":"3","proof":"confirmed"}"#,
