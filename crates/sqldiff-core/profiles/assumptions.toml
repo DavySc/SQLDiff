@@ -940,6 +940,13 @@ fact = "A rounding in the converted writes, or callers that write whole minutes.
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-TABLE-STAND-IN"
+statement = "A table whose CREATE TABLE was not converted is created in the target with the columns and types the rules give the rest of it (its refused parts left out), and a view over it as converted."
+discharge = "generated"
+fact = "The table's target CREATE TABLE, written by hand into the review ledger: a rerun binds against it and this assumption goes."
+sites = ["sqldiff-convert/src/refused.rs"]
+
+[[assumption]]
 id = "ASM-TABLE-VARIABLE"
 statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"

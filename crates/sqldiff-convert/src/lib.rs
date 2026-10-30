@@ -24,6 +24,7 @@ pub mod job;
 pub mod names;
 mod out;
 pub mod queue;
+mod refused;
 pub mod review;
 mod template;
 mod tok;
@@ -245,6 +246,17 @@ impl Draft {
                 )
             }),
         )
+    }
+
+    /// The text of the worst rule note at `at_least` or worse, if any.
+    pub(crate) fn worst_note(&self, at_least: Status) -> Option<String> {
+        self.raw
+            .units
+            .iter()
+            .flat_map(|u| &u.notes)
+            .filter(|n| n.status >= at_least)
+            .max_by_key(|n| n.status)
+            .map(|n| n.text.clone())
     }
 
     /// Adds a note to unit `i` (a hand-written text that could not be applied).
