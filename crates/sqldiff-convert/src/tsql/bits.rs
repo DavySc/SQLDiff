@@ -26,6 +26,212 @@
 
 use super::*;
 
+/// A CTE of the statement being converted: its name and column list
+/// (lower case, unquoted) and its query's tokens.
+pub(super) struct CteDef {
+    pub name: String,
+    pub cols: Option<Vec<String>>,
+    pub body: Vec<T>,
+}
+
+/// The CTEs of a statement that starts with WITH.
+pub(super) fn cte_defs(ts: &[T]) -> Vec<CteDef> {
+    let Some(bodies) = super::cte_bodies(ts) else {
+        return Vec::new();
+    };
+    bodies
+        .into_iter()
+        .map(|(name, body)| {
+            // `name (cols) AS (`: the list before AS.
+            let cols = body
+                .start
+                .checked_sub(1)
+                .and_then(|open| prev_sig(ts, open))
+                .and_then(|as_| prev_sig(ts, as_))
+                .filter(|&c| ts[c].k == R_PAREN)
+                .and_then(|c| opening(ts, c).map(|o| (o, c)))
+                .map(|(o, c)| {
+                    split_commas(&ts[o + 1..c])
+                        .iter()
+                        .map(|c| {
+                            trimmed(c)
+                                .iter()
+                                .map(|t| tsql_unquote(&t.s).to_ascii_lowercase())
+                                .collect()
+                        })
+                        .collect()
+                });
+            CteDef {
+                name,
+                cols,
+                body: ts[body].to_vec(),
+            }
+        })
+        .collect()
+}
+
+/// The index of the CTE `name` (one part) among the first `visible`.
+fn cte_named(ctes: &[CteDef], name: &[String], visible: usize) -> Option<usize> {
+    match name {
+        [n] => ctes[..visible.min(ctes.len())]
+            .iter()
+            .rposition(|c| &c.name == n),
+        _ => None,
+    }
+}
+
+/// What a select item's values hold, as far as storing them in a bit goes.
+#[derive(Clone, Copy, PartialEq)]
+enum Held {
+    Bit,
+    Number,
+}
+
+const QUERY_END: [&str; 11] = [
+    "FROM",
+    "WHERE",
+    "GROUP",
+    "HAVING",
+    "ORDER",
+    "UNION",
+    "EXCEPT",
+    "INTERSECT",
+    "OPTION",
+    "INTO",
+    "FOR",
+];
+
+/// First and last significant token of each select list item.
+type Items = Vec<(usize, usize)>;
+
+/// The items of the select list after the SELECT at `sel`, and the word
+/// that ends it, if one does. None for `SELECT TOP` and a `*` item.
+fn select_items(ts: &[T], sel: usize) -> Option<(Items, Option<usize>)> {
+    let ds = crate::tok::depths(ts);
+    let d = ds[sel];
+    let mut start = next_sig(ts, sel)?;
+    if ts[start].is("DISTINCT") || ts[start].is("ALL") {
+        start = next_sig(ts, start)?;
+    }
+    if ts[start].is("TOP") {
+        return None;
+    }
+    let mut items = Vec::new();
+    let mut first: Option<usize> = None;
+    let mut last = start;
+    let mut stop = None;
+    for j in start..ts.len() {
+        let t = &ts[j];
+        if !t.sig() {
+            continue;
+        }
+        if ds[j] < d || t.k == SEMICOLON {
+            break;
+        }
+        if ds[j] == d && QUERY_END.iter().any(|w| t.is(w)) {
+            stop = Some(j);
+            break;
+        }
+        if ds[j] == d && t.k == COMMA {
+            items.push((first.take()?, last));
+            continue;
+        }
+        if t.k == OP && t.s == "*" && (first.is_none() || ts[last].k == DOT) {
+            return None;
+        }
+        first.get_or_insert(j);
+        last = j;
+    }
+    items.push((first?, last));
+    Some((items, stop))
+}
+
+/// The expression of a select item: without `AS alias`, a trailing alias
+/// or a leading `alias =`.
+fn item_expr(ts: &[T], f: usize, l: usize) -> (usize, usize) {
+    let named = |t: &T| {
+        t.k == QUOTED_IDENT || t.k == IDENT && !sqldiff_core::normalize::is_keyword(&t.up())
+    };
+    if named(&ts[f]) {
+        if let Some(eq) = next_sig(ts, f).filter(|&q| q < l && ts[q].k == OP && ts[q].s == "=") {
+            if let Some(n) = next_sig(ts, eq) {
+                return (n, l);
+            }
+        }
+    }
+    let Some(p) = prev_sig(ts, l).filter(|&p| p >= f) else {
+        return (f, l);
+    };
+    if ts[p].is("AS") {
+        return (f, prev_sig(ts, p).filter(|&b| b >= f).unwrap_or(f));
+    }
+    let before = &ts[p];
+    if named(&ts[l])
+        && (matches!(
+            before.k,
+            QUOTED_IDENT | R_PAREN | STRING | NUMBER | VARIABLE
+        ) || before.k == IDENT && (named(before) || before.is("END")))
+    {
+        return (f, p);
+    }
+    (f, l)
+}
+
+/// The name a select item gives its column: its alias, or the column it
+/// reads (lower case, unquoted).
+fn item_name(ts: &[T], f: usize, l: usize) -> Option<String> {
+    let (a, b) = item_expr(ts, f, l);
+    if (a, b) != (f, l) {
+        let n = if b < l { l } else { f };
+        return Some(tsql_unquote(&ts[n].s).to_ascii_lowercase());
+    }
+    super::name_parts(&ts[f..=l]).and_then(|p| p.last().cloned())
+}
+
+/// The only FROM item after the FROM at `from` (its name parts and alias,
+/// lower case): None for a join, several items, a derived table or hints.
+fn single_from(ts: &[T], from: Option<usize>) -> Option<(Vec<String>, Option<String>)> {
+    let from = from.filter(|&f| ts[f].is("FROM"))?;
+    let ds = crate::tok::depths(ts);
+    let d = ds[from];
+    let mut j = next_sig(ts, from)?;
+    let st = j;
+    while let Some(dot) = next_sig(ts, j).filter(|&n| ts[n].k == DOT) {
+        j = next_sig(ts, dot)?;
+    }
+    let name = super::name_parts(&ts[st..=j])?;
+    let mut alias = None;
+    let mut next = next_sig(ts, j);
+    if next.is_some_and(|n| ts[n].is("AS")) {
+        next = next.and_then(|n| next_sig(ts, n));
+    }
+    if let Some(n) = next.filter(|&n| {
+        ts[n].k == QUOTED_IDENT
+            || ts[n].k == IDENT && !sqldiff_core::normalize::is_keyword(&ts[n].up())
+    }) {
+        alias = Some(tsql_unquote(&ts[n].s).to_ascii_lowercase());
+        next = next_sig(ts, n);
+    }
+    let ends = |n: usize| {
+        ds[n] < d
+            || ts[n].k == SEMICOLON
+            || ds[n] == d
+                && [
+                    "WHERE",
+                    "GROUP",
+                    "HAVING",
+                    "ORDER",
+                    "UNION",
+                    "EXCEPT",
+                    "INTERSECT",
+                    "OPTION",
+                ]
+                .iter()
+                .any(|w| ts[n].is(w))
+    };
+    next.map_or(true, ends).then_some((name, alias))
+}
+
 /// Edits to one token slice, by token index.
 #[derive(Default)]
 pub(super) struct BitEdits {
@@ -548,6 +754,7 @@ impl Cx<'_> {
                 IDENT if t.is("BETWEEN") => self.bit_between(ts, i, &mut e),
                 IDENT if t.is("IN") => self.bit_in(ts, i, &mut e),
                 IDENT if t.is("VALUES") => self.bit_values(ts, i, &mut e),
+                IDENT if t.is("SELECT") => self.bit_insert_select(ts, i, &mut e),
                 IDENT if t.is("COALESCE") || t.is("CONCAT") => {
                     let Some(p) = next_sig(ts, i).filter(|&p| ts[p].k == L_PAREN) else {
                         continue;
@@ -778,20 +985,14 @@ impl Cx<'_> {
         }
     }
 
-    /// `INSERT [INTO] t (cols) VALUES (…), (…)`: values stored in bit columns.
-    fn bit_values(&mut self, ts: &[T], i: usize, e: &mut BitEdits) {
-        let Some(close) = prev_sig(ts, i).filter(|&c| ts[c].k == R_PAREN) else {
-            return;
-        };
-        let Some(open) = opening(ts, close) else {
-            return;
-        };
-        let Some(name_end) = prev_sig(ts, open) else {
-            return;
-        };
-        let Some(name_start) = operand_start(ts, name_end) else {
-            return;
-        };
+    /// Which columns of the INSERT column list that ends at `close` are bit
+    /// columns, by position; None when the table or a column is not known
+    /// or none is a bit.
+    fn insert_bit_cols(&self, ts: &[T], close: usize) -> Option<Vec<bool>> {
+        use sqldiff_core::catalog::Ident;
+        let open = opening(ts, close)?;
+        let name_end = prev_sig(ts, open)?;
+        let name_start = operand_start(ts, name_end)?;
         let parts: Vec<String> = ts[name_start..=name_end]
             .iter()
             .filter(|t| matches!(t.k, IDENT | QUOTED_IDENT | VARIABLE))
@@ -802,31 +1003,27 @@ impl Cx<'_> {
             alias: None,
             named: true,
         };
-        let cols: Vec<String> = split_commas(&ts[open + 1..close])
+        let table = self.entry_table(&entry)?;
+        let bit: Vec<bool> = split_commas(&ts[open + 1..close])
             .iter()
             .map(|c| {
-                trimmed(c)
-                    .iter()
-                    .map(|t| tsql_unquote(&t.s))
-                    .collect::<String>()
+                let c: String = trimmed(c).iter().map(|t| tsql_unquote(&t.s)).collect();
+                table
+                    .column(Dialect::Tsql, &Ident::plain(c))
+                    .is_some_and(|c| c.data_type.base == "BIT")
             })
             .collect();
-        let bit: Vec<bool> = {
-            use sqldiff_core::catalog::Ident;
-            let Some(table) = self.entry_table(&entry) else {
-                return;
-            };
-            cols.iter()
-                .map(|c| {
-                    table
-                        .column(Dialect::Tsql, &Ident::plain(c.clone()))
-                        .is_some_and(|c| c.data_type.base == "BIT")
-                })
-                .collect()
-        };
-        if !bit.contains(&true) {
+        bit.contains(&true).then_some(bit)
+    }
+
+    /// `INSERT [INTO] t (cols) VALUES (…), (…)`: values stored in bit columns.
+    fn bit_values(&mut self, ts: &[T], i: usize, e: &mut BitEdits) {
+        let Some(close) = prev_sig(ts, i).filter(|&c| ts[c].k == R_PAREN) else {
             return;
-        }
+        };
+        let Some(bit) = self.insert_bit_cols(ts, close) else {
+            return;
+        };
         let mut j = i;
         while let Some(row) = next_sig(ts, j).filter(|&p| ts[p].k == L_PAREN) {
             let Some(rend) = matching(ts, row) else {
@@ -848,6 +1045,212 @@ impl Cx<'_> {
                 Some(c) => j = c,
                 None => break,
             }
+        }
+    }
+
+    /// `INSERT [INTO] t (cols) SELECT …`: the select items stored in bit
+    /// columns, in each branch of a UNION. An item that reads a column of
+    /// one of the statement's CTEs is stored by what that column holds (a
+    /// number becomes `(c <> 0)`, as T-SQL stores it in a bit); any other
+    /// item as a value in VALUES. An item no rule can store stays as it
+    /// was: the engine compares the statement.
+    fn bit_insert_select(&mut self, ts: &[T], i: usize, e: &mut BitEdits) {
+        let Some(close) = prev_sig(ts, i).filter(|&c| ts[c].k == R_PAREN) else {
+            return;
+        };
+        let Some(name) = opening(ts, close)
+            .and_then(|o| prev_sig(ts, o))
+            .and_then(|n| operand_start(ts, n))
+        else {
+            return;
+        };
+        // `INSERT t (…)` reaches here from the table name: its INSERT is
+        // written by the statement (as INSERT INTO).
+        match prev_sig(ts, name) {
+            Some(k) if ts[k].is("INTO") || ts[k].is("INSERT") => {}
+            None if self.stmt_insert => {}
+            _ => return,
+        }
+        let Some(bit) = self.insert_bit_cols(ts, close) else {
+            return;
+        };
+        let ctes = std::mem::take(&mut self.stmt_ctes);
+        let mut sel = i;
+        while let Some((items, stop)) = select_items(ts, sel) {
+            let from = single_from(ts, stop);
+            for (k, &(f, l)) in items.iter().enumerate() {
+                if bit.get(k) != Some(&true) {
+                    continue;
+                }
+                let (f, l) = item_expr(ts, f, l);
+                // A column read from a CTE; a literal or CASE is stored as
+                // in VALUES.
+                let cte = super::name_parts(&ts[f..=l]).is_some()
+                    && from
+                        .as_ref()
+                        .is_some_and(|(n, _)| cte_named(&ctes, n, ctes.len()).is_some());
+                if cte {
+                    match self.held(&ctes, ctes.len(), ts, f, l, from.as_ref(), 0) {
+                        Some(Held::Bit) => continue,
+                        Some(Held::Number) => {
+                            e.pre.insert(f, "(".into());
+                            e.post.insert(l, " <> 0)".into());
+                            e.steps.push(("tsql.bit.store", f, l));
+                            continue;
+                        }
+                        None => {}
+                    }
+                }
+                // Applied only when every part of the value has a rewrite.
+                let mut one = BitEdits::default();
+                if self.store(ts, f, l, &mut one) {
+                    e.wrap(one);
+                }
+            }
+            // The next branch of a UNION, EXCEPT or INTERSECT.
+            let Some(op) =
+                stop.filter(|&o| ["UNION", "EXCEPT", "INTERSECT"].iter().any(|w| ts[o].is(w)))
+            else {
+                break;
+            };
+            let next = next_sig(ts, op)
+                .filter(|&n| !ts[n].is("ALL"))
+                .or_else(|| next_sig(ts, op).and_then(|a| next_sig(ts, a)));
+            match next.filter(|&n| ts[n].is("SELECT")) {
+                Some(n) => sel = n,
+                None => break,
+            }
+        }
+        self.stmt_ctes = ctes;
+    }
+
+    /// What the values of the select item `ts[f..=l]` hold, read through
+    /// the statement's first `visible` CTEs and the catalog: a bit, a
+    /// number, or not known (None). `from` is the item's query's only FROM
+    /// item (name, alias).
+    #[allow(clippy::too_many_arguments)]
+    fn held(
+        &self,
+        ctes: &[CteDef],
+        visible: usize,
+        ts: &[T],
+        f: usize,
+        l: usize,
+        from: Option<&(Vec<String>, Option<String>)>,
+        depth: u32,
+    ) -> Option<Held> {
+        if depth > 32 {
+            return None;
+        }
+        let (mut f, mut l) = (f, l);
+        while ts[f].k == L_PAREN && matching(ts, f) == Some(l) {
+            (f, l) = (next_sig(ts, f)?, prev_sig(ts, l)?);
+        }
+        let v = &ts[f..=l];
+        if let [i] = sig(v).as_slice() {
+            match v[*i].k {
+                NUMBER => return Some(Held::Number),
+                VARIABLE => {
+                    return match self.expr_dt(v)? {
+                        Dt::Bit => Some(Held::Bit),
+                        Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money => Some(Held::Number),
+                        _ => None,
+                    }
+                }
+                _ => {}
+            }
+        }
+        // A CASE: what every result other than NULL holds.
+        if ts[f].is("CASE") && case_end(ts, f) == Some(l) {
+            let mut all = None;
+            for (rf, rl) in case_results(ts, f) {
+                if rf == rl && ts[rf].is("NULL") {
+                    continue;
+                }
+                let h = self.held(ctes, visible, ts, rf, rl, from, depth + 1)?;
+                if all.is_some_and(|a| a != h) {
+                    return None;
+                }
+                all = Some(h);
+            }
+            return all;
+        }
+        if ts[f].is("CAST") || ts[f].is("CONVERT") {
+            return match self.expr_dt(v)? {
+                Dt::Bit => Some(Held::Bit),
+                Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money => Some(Held::Number),
+                _ => None,
+            };
+        }
+        // A column of the FROM item: a CTE before this query, or a table.
+        let parts = super::name_parts(v)?;
+        let (fname, falias) = from?;
+        let (q, col) = match parts.as_slice() {
+            [c] => (None, c),
+            [q, c] => (Some(q), c),
+            _ => return None,
+        };
+        if q.is_some_and(|q| match falias {
+            Some(a) => a != q,
+            None => fname.last() != Some(q),
+        }) {
+            return None;
+        }
+        if let Some(k) = cte_named(ctes, fname, visible) {
+            let body = &ctes[k].body;
+            let sel = sig(body)
+                .first()
+                .copied()
+                .filter(|&s| body[s].is("SELECT"))?;
+            let (items, stop) = select_items(body, sel)?;
+            // One query: a UNION's column holds what each branch does.
+            if stop.is_some_and(|o| {
+                ["UNION", "EXCEPT", "INTERSECT"]
+                    .iter()
+                    .any(|w| body[o].is(w))
+            }) {
+                return None;
+            }
+            let at = match &ctes[k].cols {
+                Some(cols) => cols.iter().position(|c| c == col)?,
+                None => {
+                    let named: Vec<usize> = items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &(a, b))| item_name(body, a, b).as_ref() == Some(col))
+                        .map(|(n, _)| n)
+                        .collect();
+                    match named.as_slice() {
+                        [n] => *n,
+                        _ => return None,
+                    }
+                }
+            };
+            if ctes[k]
+                .cols
+                .as_ref()
+                .is_some_and(|c| c.len() != items.len())
+            {
+                return None;
+            }
+            let (a, b) = *items.get(at)?;
+            let (a, b) = item_expr(body, a, b);
+            let inner = single_from(body, stop);
+            return self.held(ctes, k, body, a, b, inner.as_ref(), depth + 1);
+        }
+        let entry = ScopeEntry {
+            name: fname.clone(),
+            alias: None,
+            named: true,
+        };
+        let c = self.entry_table(&entry)?.column(
+            Dialect::Tsql,
+            &sqldiff_core::catalog::Ident::plain(col.clone()),
+        )?;
+        match Dt::of(&c.data_type.base, &c.data_type.args) {
+            Dt::Bit => Some(Held::Bit),
+            Dt::Int | Dt::BigInt | Dt::Fraction | Dt::Money => Some(Held::Number),
+            _ => None,
         }
     }
 
