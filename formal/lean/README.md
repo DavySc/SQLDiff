@@ -224,7 +224,7 @@ convert --to postgres` writes (`tsql.bit.compare`, `tsql.bit.store`,
 | Columns | `bigint`, `smallint`, `bit`/`boolean`, `date`, `datetime2(p)`/`timestamp(p)` columns with constant defaults in the forms above (SPEC `j`, `h`, `b`, `d`, `t<p>`; defaults `b0`/`b1`, `d<hex>`, `t<hex>`); a date or timestamp key column; the Rust side sends them when both DDLs show them (`plain_table::ColType`, `cert.rs::pair_type`) | V8 |
 | Signatures | `bigint` and `smallint` with themselves, `bit` with `boolean`, `date`, `datetime2(6)` with `timestamp(6)` or `timestamp` (PostgreSQL drops a parameter's and a result's precision, so a `datetime2(p < 6)` parameter is outside) | not probed |
 | Calls | every argument has exactly its callee's parameter type, which the request names (ROUTINE `NAME:MODES:TYPES`, `Catalog.routineTys`, from the PostgreSQL DDL): a value of that slice type (or NULL; the T-SQL literals a `bit` or date parameter reads), an `OUTPUT`/`INOUT` variable declared with it; a string for a string parameter (C1 path only); a callee whose types the request does not give takes no argument. Before C2c an argument was not compared with the callee, which was sound only while confirmed callees were `int` routines: an `int` into a `smallint` or `boolean` parameter finds no procedure in PostgreSQL (42883), a `smallint` variable in an `INOUT integer` position is not writable, where T-SQL converts | review of C2c, on PostgreSQL 18 |
-| Variable types | the declared types of the variables the certificate pairs correspond (`localTyCorr`: the same slice type, any string lengths, or the same type outside the slice), and a slice value other than a string is not stored into a variable of a type outside the slice: a `datetime2(6)` value through T-SQL `datetime` and PostgreSQL `timestamp` locals is `.123333` against `.123456` (review of C2c); refused on the C1 path too | review of C2c |
+| Variable types | the declared types of the variables the certificate pairs correspond (`localTyCorr`: the same slice type, any string lengths), and nothing but NULL, or a string into a string type such as `varchar(max)`, is stored into a variable of a type outside the slice: a `datetime2(6)` value through T-SQL `datetime` and PostgreSQL `timestamp` locals is `.123333` against `.123456` (review of C2c). A type outside the slice corresponds to nothing, not even the type of the same name: T-SQL `time` is `time(7)` and PostgreSQL's `time(6)`, so `'12:00:00.1234567' < '12:00:00.1234568'` is 1 against 0, and at one precision they round differently at a half (`time(6)`); T-SQL `numeric` is `numeric(18,0)` and rounds `1.5` to 2; `money` keeps four decimals (re-review of C2c, the first through the converter). The list of non-slice pairs that correspond is empty: a pair joins it only with a probe showing every store the lowering admits identical. Refused on the C1 path too | review and re-review of C2c |
 
 Outside, by decision: `datetime2(7)` and `datetime2` without a precision
 (no PostgreSQL mirror), `datetime`, `smalldatetime`, `datetimeoffset`,
@@ -234,8 +234,8 @@ Outside, by decision: `datetime2(7)` and `datetime2` without a precision
 `bigint` (see the table); `bit` in arithmetic,
 `COALESCE`/`ISNULL` with a number, or against another bit; `@s + 1` stored
 back into a `smallint` (the literal is an `int`, so the sum is, and the
-store narrows). A variable of one of these types is still read on the C1
-path as before (`check_sound`, under `ASM-C1-OPERATORS`).
+store narrows). A variable of one of these types is outside on every
+path, the C1 path included (re-review of C2c; see "Variable types").
 
 **What it rests on**, beyond C2a and C2b: the probes above and the vendor
 texts quoted from memory in `Lower.lean`; `ASM-DATEADD-RANGE` and

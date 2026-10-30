@@ -858,7 +858,32 @@ cases += [
     ("118", req3(118, a=AN_T, b=AN_P, dep="0", cat="-", cert=AN_CERT), "confirmed"),
     ("119", req3(119, a=M1_T, b=M1_P, dep="0", cat="-", cert=M1_CERT), "unconfirmed"),
 ]
+# Re-review of C2c. R1: a type outside the slice corresponds to nothing.
+# T-SQL `time` is time(7) and keeps .1234567 < .1234568 (1); PostgreSQL's
+# time(6) rounds both to .123457 (0).
+TIME = ty("TIME")
 
+
+def tm_t(stores):
+    sets = [assign(tv("@a"), string("12:00:00.1234567")), assign(tv("@b"), string("12:00:00.1234568"))]
+    return proc(["dbo", "tm"], [param("@r", "InOut")], [],
+                [ABORT, decl("@a", TIME), decl("@b", TIME)] + (sets if stores else [])
+                + [assign(tv("@r"), num(0)), if_(bin_("<", tv("@a"), tv("@b")), [assign(tv("@r"), num(1))])])
+
+
+def tm_p(stores):
+    sets = [assign(pv("v_a"), string("12:00:00.1234567")), assign(pv("v_b"), string("12:00:00.1234568"))]
+    return proc(["tm"], [param("p_r", "InOut")],
+                [C("Declare", S("v_a"), TIME, NONE), C("Declare", S("v_b"), TIME, NONE)],
+                (sets if stores else [])
+                + [assign(pv("p_r"), num(0)), if_(bin_("<", pv("v_a"), pv("v_b")), [assign(pv("p_r"), num(1))])])
+
+
+TM_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in [("@r", "p_r"), ("@a", "v_a"), ("@b", "v_b"), ("%status", "%status")])
+cases += [
+    ("120", req3(120, a=tm_t(True), b=tm_p(True), dep="0", cat="-", cert=TM_CERT), "unconfirmed"),
+    ("121", req3(121, a=tm_t(False), b=tm_p(False), dep="0", cat="-", cert=TM_CERT), "unconfirmed"),
+]
 THEOREMS = {
     "114": "Sqldiff.Mirror.check_sound_c2a",
     "116": "Sqldiff.Mirror.check_sound_c2a",
@@ -935,7 +960,7 @@ EXTRA = {
             "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS",
                          "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"],
             "statements": "c3b", "errors": "c4"},
-    "105": {"why": ["type:datetime2_7", "stmt:insert:value"]},
+    "105": {"why": ["store:declare:datetime2_7", "type:datetime2_7", "stmt:insert:value"]},
     "114": {"scalars": "c2a",
             "residual": ["ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE"],
             "statements": "c1"},
@@ -947,6 +972,8 @@ EXTRA = {
     "118": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS"],
             "statements": "c1"},
     "119": {"why": ["store:assign:datetime"]},
+    # Re-review of C2c: a string into `time`.
+    "120": {"why": ["store:assign:time"]},
     "106": {"why": ["store:declare:smallint"]},
     "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
     "108": {"why": ["store:assign:date", "expr:date-literal"]},

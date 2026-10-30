@@ -3549,7 +3549,14 @@ def storeOkTy (d : Dialect) (ty : Option Ast.Ty) (isNull : Bool) (vt : Option (S
     -- (C2c) A value of a slice type other than a string into a variable of
     -- a type outside the slice converts (a `datetime2(6)` into a
     -- `datetime` rounds to 1/300 s, a `timestamp` keeps it): outside.
-    | none, some (_, t) => if (t matches .str ..) || t == .nul then storeNonSlice d ty vt else false
+    -- A string into a type outside the slice: only into a string type
+    -- (T-SQL `varchar(max)`, `nvarchar(max)`), never into one T-SQL and
+    -- PostgreSQL read strings into by their own rules (`time`, a date
+    -- type, `numeric`: re-review of C2c).
+    | none, some (_, t) =>
+      if t == .nul then true
+      else if (t matches .str ..) && (storeTy d ty).isSome then storeNonSlice d ty vt
+      else false
     | none, none => storeNonSlice d ty vt
 
 /-- A store of `v` into a target declared `ty` changes no value. (C2c) A

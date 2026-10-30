@@ -191,20 +191,25 @@ def residualOf (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option (Lis
 
 /-- (C2c) A T-SQL variable's declared type and that of the PL/pgSQL
 variable the certificate gives it correspond: the same slice type (a
-string type of the slice on both, any lengths, as `sigCorr`), or, for a
-type outside the slice, the same type as written. Both engines convert
-a value stored into a variable to its declared type, so two variables of
-different types keep different values: T-SQL `DECLARE @x datetime` and
-PL/pgSQL `v_x timestamp` given one `datetime2(6)` value hold `.123333`
-and `.123456` (review of C2c, on the C1 path). -/
+string type of the slice on both, any lengths, as `sigCorr`). Both
+engines convert a value stored into a variable to its declared type, so
+two variables of different types keep different values: T-SQL `DECLARE
+@x datetime` and PL/pgSQL `v_x timestamp` given one `datetime2(6)` value
+hold `.123333` and `.123456` (review of C2c, on the C1 path). A type
+outside the slice corresponds to nothing, not even to the type of the
+same name: the same name is not the same type (T-SQL `time` is
+`time(7)`, PostgreSQL's `time(6)`; at one precision they round
+differently: `time(6)` `.1234565` against `.1234566` compares 0 on SQL
+Server, 1 on PostgreSQL; T-SQL `numeric` is `numeric(18,0)` and rounds
+1.5 to 2, PostgreSQL's keeps 1.5; `money` keeps four decimals in T-SQL;
+re-review of C2c). A pair would join only with a probe showing every
+store the lowering admits to be identical, and none has one. -/
 def localTyCorr (ta tp : Ast.Ty) : Bool :=
   let dt : Dialect := .tsql { rowCounts := false, routines := [] } ∅
   let dp : Dialect := .pg ∅ []
   match valTypeOf dt ta, valTypeOf dp tp with
   | some (.str ..), some (.str ..) => true
   | some x, some y => x == y
-  | none, none => match ta, tp with
-    | .Ty n as, .Ty m bs => n.toUpper == m.toUpper && as == bs
   | _, _ => false
 
 /-- Every variable the certificate pairs, declared on both sides (the

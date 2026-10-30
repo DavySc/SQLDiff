@@ -558,10 +558,12 @@ def checkS (x : String) (vt : Ast.Expr) (y : String) (vp : Ast.Expr) : Answer :=
   (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (dt2 7) none, set (tv "@x") (fn "SYSDATETIME" [])])
   (pgProc ["s"] [] [.Declare "v_x" (some (ts 6)) none] [set (pv "v_x") (fn "sysdatetime" [])])) ==
   "the declared types of the variables do not correspond"
+-- (C2c re-review) A string into a type outside the slice is no store of
+-- the spec: T-SQL refuses the routine before the types are compared.
 #guard reasonOf (check depv Γv ⟨[("@x", "v_x"), (statusVar, statusVar)]⟩
   (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (dt2 7) none, set (tv "@x") (str "2024-01-01T00:00:00")])
   (pgProc ["s"] [] [.Declare "v_x" (some (ts 6)) none] [set (pv "v_x") (str "2024-01-01T00:00:00")]))
-  == "the declared types of the variables do not correspond"
+  == reasonOutsideT
 #guard (lowerT depv Γv (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (.Ty "DATETIME" []) none,
   declT "@i" int none, set (tv "@i") (datediff "day" (tv "@x") (tv "@x"))])).isNone
 -- Parameter defaults in the literal forms.
@@ -783,7 +785,11 @@ def m1Cert : Cert := ⟨[("@t", "p_t"), ("@r", "p_r"), ("@x", "v_x"), (statusVar
 #guard !localTyCorr (dt2 7) (ts 6) && localTyCorr (dt2 6) (.Ty "TIMESTAMP" []) &&
   localTyCorr (dt2 3) (ts 3) && !localTyCorr (dt2 3) (ts 6)
 #guard localTyCorr bit boolean && localTyCorr smallint (.Ty "INT2" []) && !localTyCorr int bigint
-#guard localTyCorr (.Ty "VARCHAR" ["10"]) (.Ty "TEXT" []) && localTyCorr (.Ty "XML" []) (.Ty "xml" [])
+#guard localTyCorr (.Ty "VARCHAR" ["10"]) (.Ty "TEXT" [])
+-- (C2c re-review) A type outside the slice corresponds to nothing, not even
+-- its own name: T-SQL `time` is `time(7)`, PostgreSQL's `time(6)`.
+#guard !localTyCorr (.Ty "XML" []) (.Ty "xml" []) && !localTyCorr (.Ty "TIME" []) (.Ty "TIME" []) &&
+  !localTyCorr (.Ty "NUMERIC" []) (.Ty "NUMERIC" []) && !localTyCorr (.Ty "MONEY" []) (.Ty "MONEY" [])
 #guard !localTyCorr (.Ty "DECIMAL" ["18", "2"]) (.Ty "NUMERIC" ["18", "2"])
 #guard reasonOf (check depv Γv ⟨[("@x", "v_x"), (statusVar, statusVar)]⟩
   (tsqlProc ["dbo", "s"] [] [xactAbort, declT "@x" (.Ty "DATETIME" []) none,
@@ -815,5 +821,37 @@ caller passing `1.5` to an `int` gets 1 in T-SQL. -/
   tsqlStringParams (tsqlProc ["p"] [inT "@i"] []) &&
   tsqlStringParams (tsqlProc ["p"] [inT "@b" bigint] []) &&
   !tsqlStringParams (tsqlProc ["p"] [] [])
+
+/- R1 (re-review). A type outside the slice corresponds to nothing, and a
+string stores into it on neither side: T-SQL `time` is `time(7)` and
+keeps `12:00:00.1234567` and `.1234568` apart (the comparison is 1);
+PostgreSQL's `time` is `time(6)` and rounds both to `.123457` (0). The
+converter writes `TIME` as `time` (tsql.rs). -/
+def tmTy : Ast.Ty := .Ty "TIME" []
+def tmT (a b : Option Ast.Expr) : Ast.Routine :=
+  tsqlProc ["dbo", "tm"] [ioT "@r"] ([xactAbort, nocount, declT "@a" tmTy none, declT "@b" tmTy none] ++
+    (a.map (fun e => [set (tv "@a") e])).getD [] ++ (b.map (fun e => [set (tv "@b") e])).getD [] ++
+    [.If (.Bin "<" (tv "@a") (tv "@b")) [set (tv "@r") (num 1)] [set (tv "@r") (num 0)]])
+def tmP (a b : Option Ast.Expr) : Ast.Routine :=
+  pgProc ["tm"] [ioP "p_r"] [.Declare "v_a" (some tmTy) none, .Declare "v_b" (some tmTy) none]
+    ((a.map (fun e => [set (pv "v_a") e])).getD [] ++ (b.map (fun e => [set (pv "v_b") e])).getD [] ++
+    [.If (.Bin "<" (pv "v_a") (pv "v_b")) [set (pv "p_r") (num 1)] [set (pv "p_r") (num 0)]])
+def tmCert : Cert := ⟨[("@r", "p_r"), ("@a", "v_a"), ("@b", "v_b"), (statusVar, statusVar)]⟩
+#guard reasonOf (check depv Γv tmCert
+  (tmT (some (str "12:00:00.1234567")) (some (str "12:00:00.1234568")))
+  (tmP (some (str "12:00:00.1234567")) (some (str "12:00:00.1234568")))) == reasonOutsideT
+#guard wT (tmT (some (str "12:00:00.1234567")) none) == ["store:assign:time"]
+-- An integer into it neither; and with no store at all, the two locals'
+-- types still do not correspond.
+#guard reasonOf (check depv Γv tmCert (tmT (some (tv "@r")) none) (tmP (some (pv "p_r")) none)) ==
+  reasonOutsideT
+#guard reasonOf (check depv Γv tmCert (tmT none none) (tmP none none)) ==
+  "the declared types of the variables do not correspond"
+-- `numeric` (T-SQL `numeric(18,0)` rounds `1.5` to 2) and `money`.
+#guard storeOkTy (.tsql { rowCounts := false, routines := [] } ∅) (some (.Ty "NUMERIC" [])) false
+    (some (SExpr.str "1.5", STy.str (some 3) false)) == false &&
+  storeOkTy (.tsql { rowCounts := false, routines := [] } ∅) (some (.Ty "MONEY" [])) false
+    (some (SExpr.str "1.23456", STy.str (some 7) false)) == false &&
+  storeOkTy (.pg ∅ []) (some (.Ty "TIME" [])) false (some (SExpr.str "12:00", STy.str (some 5) false)) == false
 
 end Sqldiff.Mirror.ExamplesC2c
