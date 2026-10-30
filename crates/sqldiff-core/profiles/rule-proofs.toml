@@ -677,6 +677,13 @@ note = "a variable read; the rename (`p_`/`v_` prefix) is the certificate's rena
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.from.openjson"
+kind = "converter"
+proof = "engine"
+note = "OPENJSON ... WITH in FROM → a jsonb_array_elements derived table; the engine compares the column list (key, strict or lax, type) under ASM-OPENJSON-VALUES"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.from.table-function"
 kind = "converter"
 proof = "engine"
@@ -808,6 +815,13 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 id = "tsql.query-hints"
 kind = "converter"
 proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.openjson"
+kind = "converter"
+proof = "engine"
+note = "the note on an OPENJSON form that is not converted; it rewrites nothing"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

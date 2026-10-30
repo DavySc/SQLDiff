@@ -3175,11 +3175,10 @@ impl<'a> Cx<'a> {
                 }
             }
         }
-        if chains
-            .iter()
-            .flatten()
-            .any(|st| find_word(st.leaf.toks, 0, "WITH").is_some() || hinted(st.leaf.toks))
-        {
+        if chains.iter().flatten().any(|st| {
+            !st.leaf.is_openjson()
+                && (find_word(st.leaf.toks, 0, "WITH").is_some() || hinted(st.leaf.toks))
+        }) {
             return Err(why("table hints are not converted"));
         }
         let mut moved: Vec<&[T]> = Vec::new();
@@ -3263,6 +3262,13 @@ impl<'a> Cx<'a> {
         let wh: Option<&[T]> = (end < ts.len()).then(|| &ts[end + 1..]);
         self.unique_join(&tkey, &chains, &moved, wh, &ts[set + 1..from])
             .map_err(|w| why(&w))?;
+        if chains.iter().flatten().any(|st| st.leaf.is_openjson()) {
+            self.note(
+                Status::Assumptions,
+                "ASM-OPENJSON-ONE-ROW",
+                "The JSON document the UPDATE reads with OPENJSON is one object, not an array: each target row then meets at most one row of it (with several, SQL Server and PostgreSQL each pick one unpredictably).",
+            );
+        }
 
         self.step_ts("tsql.dml.update-from", ts);
         // SET list: PostgreSQL takes no table name before a column.
@@ -3398,7 +3404,10 @@ impl<'a> Cx<'a> {
                 let grouped = |key: Option<&Vec<String>>| {
                     key.is_some_and(|k| k.iter().all(|c| cols.contains(c)))
                 };
-                let unique = if !st.leaf.table {
+                // OPENJSON: one row for an object (ASM-OPENJSON-ONE-ROW).
+                let unique = if st.leaf.is_openjson() {
+                    true
+                } else if !st.leaf.table {
                     derived_query(st.leaf.toks).is_some_and(|q| grouped(cte_group_key(q).as_ref()))
                 } else {
                     match self.update_cte(&st.leaf.name) {
@@ -6448,6 +6457,13 @@ impl<'a> Cx<'a> {
                 return end;
             }
         }
+        if !self.db2() && t.is("OPENJSON") && from_item_start(ts, i) {
+            if let Some((text, end)) = self.openjson_pg(ts, i) {
+                self.step_ts("tsql.from.openjson", &ts[i..end]);
+                o.push_str(&text);
+                return end;
+            }
+        }
         if !self.db2() && t.is("REPLACE") && prev_sig(ts, i).is_some_and(|p| ts[p].is("LIKE")) {
             if let Some((e, end)) = like_escaped_value(ts, i) {
                 // Ola's `LIKE REPLACE(REPLACE(x,'[','[[]'),'_','[_]')`: x
@@ -6730,6 +6746,15 @@ impl<'a> Cx<'a> {
             self.step_ts("tsql.trigger.missing-image", &ts[..1]);
             return format!("{r}{}", self.expr(&ts[1..])).trim().to_string();
         }
+        if !self.db2() && leaf.is_openjson() {
+            let first = sig(ts)[0];
+            if let Some((text, end)) = self.openjson_pg(ts, first) {
+                self.step_ts("tsql.from.openjson", &ts[first..end]);
+                return format!("{text}{}", self.expr(&ts[end..]))
+                    .trim()
+                    .to_string();
+            }
+        }
         if self.db2() && !leaf.table && !leaf.name.is_empty() {
             if let Some((call, end)) = self.table_function_db2(ts, 0) {
                 self.step_ts("tsql.from.table-function", &ts[..end]);
@@ -6792,6 +6817,148 @@ impl<'a> Cx<'a> {
             text.push_str(self.expr(&ts[last..=last]).trim());
         }
         Some((text, close + 1))
+    }
+
+    /// PostgreSQL: `OPENJSON(@v) WITH (col type ['[lax|strict] $.key'], ...)
+    /// [AS x]` in FROM becomes a derived table over the document's
+    /// elements, the form the engine compares with OPENJSON
+    /// (`sqldiff_core::equiv::canon`, `pg_json_rows`): each column casts
+    /// `e ->> 'key'` (lax) or the strict path's value to the type T-SQL
+    /// converts it to. Only a variable's document, keys spelled as plain
+    /// names and the column types whose conversions agree (nvarchar, int,
+    /// bigint, decimal, date, bit); anything else is left as it is, with a
+    /// note. Returns the text and the index after the WITH list.
+    fn openjson_pg(&mut self, ts: &[T], i: usize) -> Option<(String, usize)> {
+        let refuse = |cx: &mut Self, why: &str| {
+            cx.note(
+                Status::NotConverted,
+                "tsql.openjson",
+                &format!("OPENJSON in FROM {why}; it has no PostgreSQL rule."),
+            );
+            None
+        };
+        let open = next_sig(ts, i).filter(|&p| ts[p].k == L_PAREN)?;
+        let close = matching(ts, open)?;
+        let args = split_commas(&ts[open + 1..close]);
+        let src: Vec<&T> = args
+            .first()
+            .map(|a| a.iter().filter(|t| t.sig()).collect())
+            .unwrap_or_default();
+        let ([_], [v]) = (args.as_slice(), src.as_slice()) else {
+            return refuse(self, "with a path argument");
+        };
+        if v.k != VARIABLE {
+            return refuse(self, "reading something other than a variable");
+        }
+        let src = self.var_ref(v);
+        let Some(with) = next_sig(ts, close).filter(|&w| ts[w].is("WITH")) else {
+            return refuse(self, "without a WITH schema");
+        };
+        let p = next_sig(ts, with).filter(|&p| ts[p].k == L_PAREN)?;
+        let end = matching(ts, p)?;
+        let mut items = Vec::new();
+        for c in split_commas(&ts[p + 1..end]) {
+            let c: Vec<&T> = c.iter().filter(|t| t.sig()).collect();
+            let (name, rest) = c.split_first()?;
+            let ty_end = match rest.get(1) {
+                Some(t) if t.k == L_PAREN => rest.iter().position(|t| t.k == R_PAREN)? + 1,
+                _ => 1,
+            };
+            let ty: Vec<String> = rest
+                .get(..ty_end)?
+                .iter()
+                .map(|t| t.s.to_ascii_uppercase())
+                .collect();
+            let path = match &rest[ty_end..] {
+                [] => None,
+                [s] if s.k == STRING => Some(string_value(&s.s)),
+                _ => return refuse(self, "with AS JSON"),
+            };
+            let pg_ty = match ty.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+                ["NVARCHAR", "(", "MAX", ")"] => "text".to_string(),
+                ["NVARCHAR", "(", n, ")"]
+                    if n.parse::<u32>().is_ok_and(|n| (1..=4000).contains(&n)) =>
+                {
+                    format!("varchar({n})")
+                }
+                ["INT"] => "integer".into(),
+                ["BIGINT"] => "bigint".into(),
+                ["DECIMAL" | "NUMERIC", "(", p, ")"]
+                    if p.parse::<u32>().is_ok_and(|p| (1..=38).contains(&p)) =>
+                {
+                    format!("numeric({p}, 0)")
+                }
+                ["DECIMAL" | "NUMERIC", "(", p, ",", s, ")"]
+                    if p.parse::<u32>().is_ok_and(|p| (1..=38).contains(&p))
+                        && s.parse::<u32>().is_ok_and(|s| s <= p.parse().unwrap_or(0)) =>
+                {
+                    format!("numeric({p}, {s})")
+                }
+                ["DATE"] => "date".into(),
+                ["BIT"] => "boolean".into(),
+                _ => {
+                    let t = rest[..ty_end]
+                        .iter()
+                        .map(|t| t.s.as_str())
+                        .collect::<String>();
+                    return refuse(self, &format!("with a {t} column"));
+                }
+            };
+            let col = match name.k {
+                QUOTED_IDENT => tsql_unquote(&name.s),
+                _ => name.s.clone(),
+            };
+            let (strict, key) = match path.as_deref() {
+                None => (false, col.as_str()),
+                Some(p) => match p.strip_prefix("strict ") {
+                    Some(r) => (true, r.strip_prefix("$.").unwrap_or("")),
+                    None => (
+                        false,
+                        p.strip_prefix("lax ")
+                            .unwrap_or(p)
+                            .strip_prefix("$.")
+                            .unwrap_or(""),
+                    ),
+                },
+            };
+            let plain = key
+                .chars()
+                .next()
+                .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+                && key.chars().all(|x| x.is_ascii_alphanumeric() || x == '_');
+            if !plain {
+                return refuse(self, "with a path other than [lax|strict] $.key");
+            }
+            let read = if strict {
+                format!("jsonb_path_query_first(e, 'strict $.\"{key}\"') #>> '{{}}'")
+            } else {
+                format!("e ->> '{key}'")
+            };
+            let out = match name.k {
+                QUOTED_IDENT => quoted(&name.s),
+                _ => name.s.clone(),
+            };
+            items.push(format!("CAST({read} AS {pg_ty}) AS {out}"));
+        }
+        let aliased = next_sig(ts, end).is_some_and(|k| match ts[k].k {
+            QUOTED_IDENT => true,
+            IDENT => !NOT_AN_ALIAS.iter().any(|w| ts[k].is(w)),
+            _ => false,
+        });
+        self.note(
+            Status::Assumptions,
+            "ASM-OPENJSON-VALUES",
+            "OPENJSON becomes a jsonb derived table. Equal when the document is valid JSON (an object or an array of objects) without duplicate keys, \\u0000 or unpaired surrogate escapes, and each value a column reads is null or a plain value of its type: BMP strings for nvarchar, integers in range for int and bigint, numbers without exponent for decimal, 'yyyy-mm-dd' for date, true/false/0/1 for bit.",
+        );
+        let j = format!("CAST({src} AS jsonb)");
+        let mut text = format!(
+            "(SELECT {} FROM jsonb_array_elements(CASE jsonb_typeof({j}) WHEN 'object' THEN CASE {j} WHEN '{{}}' THEN '[]' ELSE jsonb_build_array({j}) END ELSE {j} END) AS e)",
+            items.join(", ")
+        );
+        if !aliased {
+            text.push_str(" AS openjson");
+        }
+        Some((text, end + 1))
     }
 
     /// `STRING_AGG(x, sep) [WITHIN GROUP (ORDER BY …)]` → `string_agg(x, sep [ORDER BY …])`.
@@ -8392,6 +8559,11 @@ struct Leaf<'a> {
 }
 
 impl Leaf<'_> {
+    /// `OPENJSON(…) [WITH (…)] [AS x]`.
+    fn is_openjson(&self) -> bool {
+        !self.table && self.name == ["openjson"]
+    }
+
     /// Whether the DELETE target `t` names this table: by its alias, or by
     /// a one-part name equal to the last part of an unaliased table.
     fn binds(&self, t: &[String]) -> bool {
@@ -8794,8 +8966,15 @@ fn leaf(ts: &[T]) -> Result<Leaf<'_>, String> {
             return bad();
         };
         if s.get(k).is_some_and(|&i| ts[i].k == L_PAREN) {
-            // A table-valued function call.
-            let close = matching(ts, s[k]).ok_or("unbalanced parentheses")?;
+            // A table-valued function call; OPENJSON's WITH list is part of it.
+            let mut close = matching(ts, s[k]).ok_or("unbalanced parentheses")?;
+            let after = s.iter().position(|&i| i > close).unwrap_or(s.len());
+            if name == ["openjson"]
+                && s.get(after).is_some_and(|&i| ts[i].is("WITH"))
+                && s.get(after + 1).is_some_and(|&i| ts[i].k == L_PAREN)
+            {
+                close = matching(ts, s[after + 1]).ok_or("unbalanced parentheses")?;
+            }
             (
                 name,
                 false,

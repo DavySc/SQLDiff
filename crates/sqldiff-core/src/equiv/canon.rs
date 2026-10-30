@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use sqldiff_syntax::Dialect;
 
 use super::ast::{
-    Call, ConflictAction, Expr, From, InsertSource, MergeAction, OrderItem, Output, SelItem,
-    Select, Stmt,
+    Call, ConflictAction, Expr, From, InsertSource, JsonCol, MergeAction, OrderItem, Output,
+    SelItem, Select, Stmt, Type,
 };
 use super::literal::{self, Target};
 use super::lower::{Unit, UnitKind};
@@ -215,12 +215,23 @@ pub mod asm {
         "ASM-TSQL-CI-COLLATION",
         "Identifiers and variables compare case-insensitively (case-insensitive catalog collation)",
     );
-    /// Decision 1: across dialects, result column names that differ only in
-    /// letter case are equal when the client matches names that way.
     pub const END_OF_TIME: (&str, &str) = (
         "ASM-END-OF-TIME",
         "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written for PostgreSQL as '9999-12-31 23:59:59.999999' (PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00): it is only an open-end sentinel, compared with values converted by the same rule (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit the same way rather than rounding it; no value lies between the two",
     );
+    /// T-SQL OPENJSON and its PostgreSQL jsonb form (`json_rows`) agree on
+    /// the documents in this statement only.
+    pub const OPENJSON_VALUES: (&str, &str) = (
+        "ASM-OPENJSON-VALUES",
+        "The JSON documents read with OPENJSON are valid JSON (nothing after the value), an object or an array of objects, with no duplicate keys, no \\u0000 escape and no unpaired surrogate escape; each value a WITH column reads is null or a scalar in its type's plain form: a string of Basic Multilingual Plane characters for nvarchar, an integer number in range for int and bigint, a number without exponent for decimal, a 'yyyy-mm-dd' string for date, true, false, 0 or 1 for bit",
+    );
+    /// An OPENJSON source of UPDATE … FROM reads one row per target row.
+    pub const OPENJSON_ONE_ROW: (&str, &str) = (
+        "ASM-OPENJSON-ONE-ROW",
+        "The JSON document an UPDATE … FROM reads with OPENJSON is one object, not an array: it gives at most one row, so each target row meets at most one (with several, SQL Server and PostgreSQL each pick one unpredictably)",
+    );
+    /// Decision 1: across dialects, result column names that differ only in
+    /// letter case are equal when the client matches names that way.
     pub const RESULT_NAMES_CI: (&str, &str) = (
         "ASM-RESULT-NAMES-CI",
         "Clients read result columns by name case-insensitively (PostgreSQL returns an unquoted alias such as OrderId as orderid; T-SQL returns it as written)",
@@ -3559,6 +3570,11 @@ impl<'a> Canon<'a> {
                 if !cols.is_empty() {
                     return Err("derived column lists are not supported".into());
                 }
+                if self.d == Dialect::Postgres {
+                    if let Some((src, fields)) = pg_json_rows(query) {
+                        return self.json_rows(src, &fields, alias);
+                    }
+                }
                 // `(SELECT * FROM t WHERE false)`: the conversion of an image
                 // the trigger's event has no rows for.
                 if let (Some(_), Some(table)) = (&self.unit.trigger, empty_query(query)) {
@@ -3602,10 +3618,77 @@ impl<'a> Canon<'a> {
                 });
                 Ok(n("sub", vec![q.0]))
             }
+            From::Func {
+                name,
+                args,
+                schema,
+                paths,
+                alias,
+            } if self.d == Dialect::Tsql => match openjson_fields(name, args, schema, paths) {
+                Some((src, fields)) => self.json_rows(src, &fields, alias),
+                None => Err("OPENJSON without a WITH schema, with a path argument, AS JSON or a path other than [lax|strict] $.key is not supported".into()),
+            },
             From::Values { .. } | From::DataChange { .. } | From::Func { .. } => Err(
                 "VALUES, table function or data-change table in FROM is not supported here".into(),
             ),
         }
+    }
+
+    /// The rows of a JSON document (T-SQL OPENJSON or its PostgreSQL form,
+    /// see [`pg_json_rows`]), under `alias` or `openjson`. Both sides lower
+    /// to `(openjson table src (cols (jc name key mode type)...))`; a column reads
+    /// as `(col table name)` with its own side's type.
+    fn json_rows(&mut self, src: &Expr, fields: &[JsonField], alias: &Option<String>) -> R<Term> {
+        let (st, _) = self.expr(src)?;
+        if !st.is("sym") {
+            return Err(
+                "OPENJSON of something other than a parameter or variable is not supported".into(),
+            );
+        }
+        let key = alias
+            .as_deref()
+            .map(lc)
+            .unwrap_or_else(|| "openjson".into());
+        if self.scopes.iter().flatten().any(|b| b.key == key) {
+            return Err(format!("a second table named `{key}` next to OPENJSON"));
+        }
+        let table = format!("oj:{key}");
+        let mut cols = Vec::new();
+        let mut derived: Vec<(String, Term, Option<Ty>)> = Vec::new();
+        for f in fields {
+            let tag = json_type_tag(self.d, &f.ty).ok_or_else(|| {
+                format!(
+                    "an OPENJSON column of type {} is not supported",
+                    f.ty.name.to_lowercase()
+                )
+            })?;
+            let mode = if f.strict { "strict" } else { "lax" };
+            let name = lc(f.name.trim_matches(['[', ']', '"']));
+            // The key in hex: JSON keys are case-sensitive, whatever case
+            // rules apply to names and atoms.
+            let key: String = f.key.bytes().map(|b| format!("{b:02x}")).collect();
+            cols.push(n(
+                "jc",
+                vec![a(name.clone()), a(format!("key:{key}")), a(mode), a(tag)],
+            ));
+            if derived.iter().any(|(c, _, _)| *c == name) {
+                return Err(format!("OPENJSON column `{name}` twice"));
+            }
+            let ty = Ty::from_type(&f.ty, self.d, true);
+            derived.push((
+                name.clone(),
+                n("col", vec![a(table.clone()), a(name)]),
+                Some(ty),
+            ));
+        }
+        self.assume(asm::OPENJSON_VALUES);
+        self.scopes.last_mut().unwrap().push(Binding {
+            key,
+            table: table.clone(),
+            derived: Some(derived),
+            unique: None,
+        });
+        Ok(n("openjson", vec![a(table), st, n("cols", cols)]))
     }
 
     /// A relation with the columns of `table` and no rows, under `alias`.
@@ -5516,6 +5599,7 @@ impl<'a> Canon<'a> {
             match t.head() {
                 "t" => Some(t.kid(0).and_then(Term::atom).unwrap_or("").to_string()),
                 "sub" => subs.next().map(|s| s.0.clone()),
+                "openjson" => t.kid(0).and_then(Term::atom).map(str::to_string),
                 _ => None,
             }
         }
@@ -5526,7 +5610,7 @@ impl<'a> Canon<'a> {
             subs: &mut Subs,
         ) -> bool {
             match t.head() {
-                "t" | "sub" => {
+                "t" | "sub" | "openjson" => {
                     let Some(name) = name(t, subs) else {
                         return false;
                     };
@@ -5539,7 +5623,8 @@ impl<'a> Canon<'a> {
                     else {
                         return false;
                     };
-                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub")) {
+                    if !leaves(l, out, all, subs) || !(r.is("t") || r.is("sub") || r.is("openjson"))
+                    {
                         return false;
                     }
                     let Some(name) = name(r, subs) else {
@@ -5575,6 +5660,14 @@ impl<'a> Canon<'a> {
             let mut progress = false;
             for (t, on) in &ls {
                 if bound.contains(t) {
+                    continue;
+                }
+                // A JSON object is one row (`{}` none): every target row
+                // meets at most one.
+                if t.starts_with("oj:") {
+                    self.assume(asm::OPENJSON_ONE_ROW);
+                    bound.push(t.clone());
+                    progress = true;
                     continue;
                 }
                 let cs = match on {
@@ -6834,6 +6927,220 @@ fn empty_query(q: &Select) -> Option<Vec<String>> {
         }] if plain && is_false && hints.is_empty() => Some(name.clone()),
         _ => None,
     }
+}
+
+/// One column of a JSON row source: the key it reads, whether its path is
+/// strict, and its declared type.
+struct JsonField {
+    name: String,
+    key: String,
+    strict: bool,
+    ty: Type,
+}
+
+/// A JSON object key that every path syntax spells the same way.
+fn plain_key(k: &str) -> bool {
+    let mut c = k.chars();
+    c.next()
+        .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+        && c.all(|x| x.is_ascii_alphanumeric() || x == '_')
+}
+
+/// T-SQL `OPENJSON(src) WITH (col type ['[lax|strict] $.key'], ...)`: the
+/// source and the columns, `None` for other forms (a path argument, `AS
+/// JSON`, paths into nested values).
+fn openjson_fields<'e>(
+    name: &[String],
+    args: &'e [Expr],
+    schema: &[(String, Type)],
+    paths: &[JsonCol],
+) -> Option<(&'e Expr, Vec<JsonField>)> {
+    let ([f], [src]) = (name, args) else {
+        return None;
+    };
+    if !f.eq_ignore_ascii_case("OPENJSON") || schema.is_empty() || schema.len() != paths.len() {
+        return None;
+    }
+    let mut fields = Vec::new();
+    for ((col, ty), p) in schema.iter().zip(paths) {
+        if p.as_json {
+            return None;
+        }
+        let (strict, key) = match p.path.as_deref() {
+            None => (false, col.as_str()),
+            Some(path) => {
+                let (strict, rest) = match path.strip_prefix("strict ") {
+                    Some(r) => (true, r),
+                    None => (false, path.strip_prefix("lax ").unwrap_or(path)),
+                };
+                (strict, rest.strip_prefix("$.")?)
+            }
+        };
+        if !plain_key(key) {
+            return None;
+        }
+        fields.push(JsonField {
+            name: col.clone(),
+            key: key.to_string(),
+            strict,
+            ty: ty.clone(),
+        });
+    }
+    Some((src, fields))
+}
+
+/// `name(args)`: a plain call of the function `name`.
+fn is_call(e: &Expr, name: &str, args: &[&Expr]) -> bool {
+    matches!(e, Expr::Call(c)
+        if matches!(c.name.as_slice(), [f] if f.eq_ignore_ascii_case(name))
+            && c.args.len() == args.len()
+            && c.args.iter().zip(args).all(|(x, y)| x == *y)
+            && !c.distinct
+            && c.order.is_empty()
+            && !c.within_group
+            && !c.over
+            && !c.star)
+}
+
+/// The PostgreSQL form of a T-SQL OPENJSON row source, as the converter
+/// writes it (verified on SQL Server 2022 and PostgreSQL 18, see
+/// docs/vendor-facts-verification.md, OPENJSON):
+///
+/// ```sql
+/// (SELECT CAST(e ->> 'Key' AS t) AS Col,
+///         CAST(jsonb_path_query_first(e, 'strict $."Key"') #>> '{}' AS t) AS Col2
+///  FROM jsonb_array_elements(CASE jsonb_typeof(CAST(src AS jsonb))
+///      WHEN 'object' THEN CASE CAST(src AS jsonb) WHEN '{}' THEN '[]'
+///          ELSE jsonb_build_array(CAST(src AS jsonb)) END
+///      ELSE CAST(src AS jsonb) END) AS e) AS alias
+/// ```
+///
+/// OPENJSON reads an object as one row, except `{}` which has none, and an
+/// array as one row per element; a lax path reads NULL where a key is
+/// missing or the element is not an object, a strict path fails there.
+fn pg_json_rows(q: &Select) -> Option<(&Expr, Vec<JsonField>)> {
+    let rest = Select {
+        items: Vec::new(),
+        from: Vec::new(),
+        ..q.clone()
+    };
+    if rest != Select::default() {
+        return None;
+    }
+    let [From::Func {
+        name,
+        args,
+        schema,
+        alias: Some(e),
+        ..
+    }] = q.from.as_slice()
+    else {
+        return None;
+    };
+    if !schema.is_empty()
+        || !matches!(name.as_slice(), [f] if f.eq_ignore_ascii_case("jsonb_array_elements"))
+    {
+        return None;
+    }
+    let [Expr::Case(Some(kind), whens, Some(j))] = args.as_slice() else {
+        return None;
+    };
+    let Expr::Cast(src, jt) = &**j else {
+        return None;
+    };
+    if !jt.name.eq_ignore_ascii_case("JSONB") || !jt.args.is_empty() {
+        return None;
+    }
+    let [(Expr::Str(object), Expr::Case(Some(j2), inner, Some(one)))] = whens.as_slice() else {
+        return None;
+    };
+    let [(Expr::Str(empty), Expr::Str(none))] = inner.as_slice() else {
+        return None;
+    };
+    if !(is_call(kind, "jsonb_typeof", &[j])
+        && object == "object"
+        && j2 == j
+        && empty == "{}"
+        && none == "[]"
+        && is_call(one, "jsonb_build_array", &[j]))
+    {
+        return None;
+    }
+    let elem = |x: &Expr| matches!(x, Expr::Name(p) if matches!(p.as_slice(), [y] if y.eq_ignore_ascii_case(e)));
+    let mut fields = Vec::new();
+    for it in &q.items {
+        let (Expr::Cast(x, ty), Some(name), None) = (&it.expr, &it.alias, &it.assign) else {
+            return None;
+        };
+        let Expr::Bin(op, l, r) = &**x else {
+            return None;
+        };
+        let (strict, key) = match (op.as_str(), &**l, &**r) {
+            ("->>", l, Expr::Str(k)) if elem(l) => (false, k.clone()),
+            ("#>>", Expr::Call(c), Expr::Str(top)) if top == "{}" => {
+                let [l, Expr::Str(path)] = c.args.as_slice() else {
+                    return None;
+                };
+                let k = path.strip_prefix("strict $.\"")?.strip_suffix('"')?;
+                if !(elem(l)
+                    && is_call(
+                        &Expr::Call(c.clone()),
+                        "jsonb_path_query_first",
+                        &[l, &Expr::Str(path.clone())],
+                    ))
+                {
+                    return None;
+                }
+                (true, k.to_string())
+            }
+            _ => return None,
+        };
+        if !plain_key(&key) {
+            return None;
+        }
+        fields.push(JsonField {
+            name: name.clone(),
+            key,
+            strict,
+            ty: ty.clone(),
+        });
+    }
+    (!fields.is_empty()).then_some((&**src, fields))
+}
+
+/// The value a JSON column converts to, the same on both sides: the T-SQL
+/// type and the PostgreSQL type the converter writes for it. `None` for the
+/// types whose conversions were not compared.
+fn json_type_tag(d: Dialect, t: &Type) -> Option<String> {
+    let up = t.name.to_ascii_uppercase();
+    let num = |i: usize| t.args.get(i).and_then(|a| a.parse::<u32>().ok());
+    let tag = match (d, up.as_str(), t.args.len()) {
+        (Dialect::Tsql, "NVARCHAR", 1)
+        | (Dialect::Postgres, "VARCHAR" | "CHARACTER VARYING", 1) => match num(0) {
+            Some(n) if (1..=4000).contains(&n) => format!("str:{n}"),
+            None if d == Dialect::Tsql && t.args[0].eq_ignore_ascii_case("MAX") => "str:max".into(),
+            _ => return None,
+        },
+        (Dialect::Postgres, "TEXT", 0) => "str:max".into(),
+        (Dialect::Tsql, "INT", 0) | (Dialect::Postgres, "INT" | "INTEGER" | "INT4", 0) => {
+            "int".into()
+        }
+        (Dialect::Tsql | Dialect::Postgres, "BIGINT", 0) | (Dialect::Postgres, "INT8", 0) => {
+            "bigint".into()
+        }
+        (Dialect::Tsql | Dialect::Postgres, "DECIMAL" | "NUMERIC", 1 | 2) => {
+            let p = num(0)?;
+            let s = if t.args.len() == 2 { num(1)? } else { 0 };
+            if !(1..=38).contains(&p) || s > p {
+                return None;
+            }
+            format!("dec:{p}:{s}")
+        }
+        (Dialect::Tsql | Dialect::Postgres, "DATE", 0) => "date".into(),
+        (Dialect::Tsql, "BIT", 0) | (Dialect::Postgres, "BOOLEAN" | "BOOL", 0) => "bool".into(),
+        _ => return None,
+    };
+    Some(tag)
 }
 
 /// Scope keys of the row images an OUTPUT or RETURNING item reads; no

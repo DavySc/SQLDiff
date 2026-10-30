@@ -1,0 +1,19 @@
+NOTICE:  drop cascades to table application.cities
+DROP SCHEMA
+NOTICE:  drop cascades to function webapi.updatecityfromjson(text,integer,integer)
+DROP SCHEMA
+CREATE SCHEMA
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 2
+CREATE PROCEDURE
+CALL
+CALL
+1|Zürich😀|7||9
+2|B|2|20|0
+ERROR:  JSON object does not contain key "CityName"
+CONTEXT:  SQL statement "UPDATE Application.Cities SET CityName = json.CityName,
+  		StateProvinceID = json.StateProvinceID,
+  		LatestRecordedPopulation = json.LatestRecordedPopulation,
+  		LastEditedBy = p_user_id FROM (SELECT CAST(jsonb_path_query_first(e, 'strict $."CityName"') #>> '{}' AS varchar(50)) AS CityName, CAST(jsonb_path_query_first(e, 'strict $."StateProvinceID"') #>> '{}' AS integer) AS StateProvinceID, CAST(e ->> 'LatestRecordedPopulation' AS bigint) AS LatestRecordedPopulation FROM jsonb_array_elements(CASE jsonb_typeof(CAST(p_city AS jsonb)) WHEN 'object' THEN CASE CAST(p_city AS jsonb) WHEN '{}' THEN '[]' ELSE jsonb_build_array(CAST(p_city AS jsonb)) END ELSE CAST(p_city AS jsonb) END) AS e) as json WHERE Application.Cities.CityID = p_city_id"
+PL/pgSQL function webapi.updatecityfromjson(text,integer,integer) line 3 at SQL statement

@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 175 | 31 (18%) | 6 (3%) | 138 (79%) |
+| `converter` | 177 | 31 (18%) | 6 (3%) | 140 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 204 | 34 (17%) | 8 (4%) | 162 (79%) |
+| **All** | 206 | 34 (17%) | 8 (4%) | 164 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -124,6 +124,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.expr.undeclared-variable` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.expr.unicode-literal` | `converter` | lemma: `Sqldiff.Mirror/C2b strings/Literals` | `N'...'` of printable ASCII without a backslash reads as the same literal as `'...'` | `sqldiff-convert/src/tsql.rs` |
 | `tsql.expr.variable` | `converter` | lemma: `Sqldiff.Mirror/Expressions` | a variable read; the rename (`p_`/`v_` prefix) is the certificate's renaming, checked injective | `sqldiff-convert/src/tsql.rs` |
+| `tsql.from.openjson` | `converter` | engine | OPENJSON ... WITH in FROM → a jsonb_array_elements derived table; the engine compares the column list (key, strict or lax, type) under ASM-OPENJSON-VALUES | `sqldiff-convert/src/tsql.rs` |
 | `tsql.from.table-function` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.from.table-hint` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.func.*` | `converter` | engine | Every rewritten built-in call, named after the function (`tsql.func.getdate`); the members with a lemma are listed on their own | `sqldiff-convert/src/tsql.rs` |
@@ -141,6 +142,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.merge.by-target` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.merge.into` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.nchar` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.openjson` | `converter` | engine | the note on an OPENJSON form that is not converted; it rewrites nothing | `sqldiff-convert/src/tsql.rs` |
 | `tsql.order.nulls` | `converter` | axiom: V19 | NULLS FIRST/LAST after T-SQL's placement (ASM-FACT-V19); the Db2 for i part of V19 is unverified | `sqldiff-convert/src/tsql/paging.rs` |
 | `tsql.partition-scheme` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.plan-hint` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
