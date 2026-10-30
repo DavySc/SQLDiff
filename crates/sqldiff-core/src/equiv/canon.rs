@@ -1387,6 +1387,83 @@ impl<'a> Canon<'a> {
         None
     }
 
+    /// T-SQL CHARINDEX's type: bigint when the searched string is
+    /// varchar(max) or nvarchar(max), int otherwise, unknown when that is
+    /// not known (SQL Server 2022, eval/cte/2026-10-30/charindex-max).
+    fn charindex_ty(&mut self, hay: &Expr, ty: &Option<Ty>) -> Option<Ty> {
+        match self.tsql_max(hay, ty)? {
+            true => Some(Ty {
+                len: Some(64),
+                ..INT32
+            }),
+            false => Some(INT32),
+        }
+    }
+
+    /// Whether a T-SQL string is varchar(max) or nvarchar(max) (None: not
+    /// known). A string of known length is not; a variable, parameter or
+    /// catalog column is as declared (a declared non-MAX type has a
+    /// length); REPLACE, the trims, UPPER, LOWER, LEFT, RIGHT, SUBSTRING
+    /// and ISNULL are when their first argument is, `+` when either side
+    /// is (SQL Server 2022, eval/cte/2026-10-30/charindex-max). A derived
+    /// table's or CTE's column of unknown length may be either.
+    fn tsql_max(&mut self, e: &Expr, ty: &Option<Ty>) -> Option<bool> {
+        let t = (*ty)?;
+        if t.fam != Fam::VarChar {
+            return None;
+        }
+        if t.len.is_some() {
+            return Some(false);
+        }
+        let of = |c: &mut Self, e: &Expr| {
+            let ty = c.expr(e).ok()?.1;
+            c.tsql_max(e, &ty)
+        };
+        match e {
+            Expr::Var(v) if !v.starts_with("@@") => Some(true),
+            // A catalog column, as declared.
+            Expr::Name(p) => {
+                let t = self.resolve(p).ok()?.0;
+                if !t.is("col") {
+                    return None;
+                }
+                let ct = self.col_ty(t.kid(0)?.atom()?, t.kid(1)?.atom()?).0?;
+                (ct.fam == Fam::VarChar && ct.len.is_none()).then_some(true)
+            }
+            Expr::Cast(_, to) => Some(
+                to.args
+                    .first()
+                    .is_some_and(|a| a.eq_ignore_ascii_case("max")),
+            ),
+            Expr::Bin(op, l, r) if op == "+" => match (of(self, l), of(self, r)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            Expr::Call(c)
+                if c.name.len() == 1
+                    && !c.over
+                    && !c.args.is_empty()
+                    && [
+                        "replace",
+                        "ltrim",
+                        "rtrim",
+                        "upper",
+                        "lower",
+                        "left",
+                        "right",
+                        "substring",
+                        "isnull",
+                    ]
+                    .iter()
+                    .any(|f| c.name[0].eq_ignore_ascii_case(f)) =>
+            {
+                of(self, &c.args[0])
+            }
+            _ => None,
+        }
+    }
+
     // ---- expressions ----------------------------------------------------
 
     pub fn expr(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
@@ -2684,7 +2761,7 @@ impl<'a> Canon<'a> {
                 // Positions count UTF-16 code units in T-SQL (non-_SC
                 // collations), code points in PostgreSQL.
                 self.assume(asm::LEN_BMP);
-                let ty = charindex_ty(&args[1].1);
+                let ty = self.charindex_ty(&c.args[1], &args[1].1);
                 let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
                 (n("strpos", vec![a(ci), hay, needle]), ty)
             }
@@ -3922,22 +3999,24 @@ impl<'a> Canon<'a> {
         if own(query) || own(step) || !step.set_ops.is_empty() {
             return Err("a recursive CTE with ORDER BY, TOP, paging, INTO or assignment".into());
         }
-        let mut windowed = false;
+        // Both dialects reject an aggregate there; a window function is
+        // computed over each step's rows.
+        let mut folds = false;
         for e in step.items.iter().map(|i| &i.expr).chain(&step.where_) {
             super::eval::walk_expr(e, &mut |x| {
-                if matches!(x, Expr::Call(c) if c.over) {
-                    windowed = true;
+                if matches!(x, Expr::Call(c) if c.over) || super::eval::is_aggregate(x) {
+                    folds = true;
                 }
             });
         }
         if step.distinct
             || !step.group_by.is_empty()
             || step.having.is_some()
-            || windowed
+            || folds
             || step.items.iter().any(|i| matches!(i.expr, Expr::Star(_)))
         {
             return Err(
-                "a recursive CTE whose recursive member has DISTINCT, GROUP BY, HAVING, a window function or *"
+                "a recursive CTE whose recursive member has DISTINCT, GROUP BY, HAVING, an aggregate, a window function or *"
                     .into(),
             );
         }
@@ -6884,19 +6963,6 @@ const INT32: Ty = Ty {
     len: Some(32),
     scale: None,
 };
-
-/// T-SQL CHARINDEX's type: bigint when the searched string is
-/// varchar(max) or nvarchar(max), int otherwise (SQL Server 2022,
-/// eval/cte/2026-10-30).
-fn charindex_ty(hay: &Option<Ty>) -> Option<Ty> {
-    Some(match hay.and_then(|t| t.len) {
-        Some(_) => INT32,
-        None => Ty {
-            len: Some(64),
-            ..INT32
-        },
-    })
-}
 
 /// A string expression that is never empty (NULL aside): a non-empty
 /// literal, or a `||` chain with one.

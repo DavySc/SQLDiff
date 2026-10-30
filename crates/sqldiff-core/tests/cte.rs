@@ -140,6 +140,23 @@ END;",
     );
 }
 
+/// CHARINDEX is bigint only in a MAX string: in a bounded one, also after
+/// REPLACE or `+`, it is int and stores in an int column as strpos does.
+#[test]
+fn charindex_in_a_bounded_string_is_int() {
+    for (a, b) in [
+        ("REPLACE(@List, N';', N',')", "replace(p_list, ';', ',')"),
+        ("@List + N','", "p_list || ','"),
+        ("LTRIM(RTRIM(@List))", "ltrim(rtrim(p_list))"),
+    ] {
+        assert_equal(
+            &format!("INSERT INTO dbo.E (Id, V) SELECT Id, CHARINDEX(N',', {a}) FROM dbo.D;"),
+            &format!("INSERT INTO E (Id, V) SELECT Id, strpos({b}, ',') FROM D;"),
+            &["ASM-TSQL-LEN-BMP"],
+        );
+    }
+}
+
 #[test]
 fn near_misses_stay_apart() {
     let a = COUNT_A;
@@ -192,6 +209,11 @@ fn near_misses_stay_apart() {
         (
             "WITH N (i, r) AS (SELECT 1, CAST(1 AS bigint) UNION ALL SELECT i + 1, ROW_NUMBER() OVER (ORDER BY i) FROM N WHERE i < @n) INSERT INTO dbo.E (Id, V) SELECT i, i FROM N;",
             "WITH RECURSIVE N (i, r) AS (SELECT 1, CAST(1 AS bigint) UNION ALL SELECT i + 1, row_number() OVER (ORDER BY i) FROM N WHERE i < p_n) INSERT INTO E (Id, V) SELECT i, i FROM N;",
+        ),
+        // An aggregate in the recursive member (both dialects reject it).
+        (
+            "WITH N (i) AS (SELECT 1 UNION ALL SELECT MAX(i) + 1 FROM N WHERE i < @n) INSERT INTO dbo.E (Id, V) SELECT i, i FROM N;",
+            "WITH RECURSIVE N (i) AS (SELECT 1 UNION ALL SELECT MAX(i) + 1 FROM N WHERE i < p_n) INSERT INTO E (Id, V) SELECT i, i FROM N;",
         ),
         // The recursive member reads the CTE twice.
         (
