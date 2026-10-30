@@ -31,6 +31,14 @@
 //! - A `#temp` table created in the dynamic batch is dropped when the batch
 //!   ends; the batch cannot see the caller's variables; without XACT_ABORT a
 //!   failing statement inside it lets the next one run.
+//! - A procedure called through PL/pgSQL `EXECUTE` runs in a context that
+//!   forbids transaction control: when its body holds `COMMIT` (the
+//!   converter's `tsql.txn.autocommit` rule writes one after each
+//!   autocommitted write) PostgreSQL raises 2D000, "invalid transaction
+//!   termination", and nothing is written, where T-SQL `EXEC (N'EXEC
+//!   dbo.q')` runs the procedure and keeps its writes. The callee's body may
+//!   be outside the tree, so a procedure call is never an admissible inner
+//!   statement; a static `EXEC dbo.q` is compared as a call instead.
 //! - `sp_executesql` converts each value to its parameter's type as it
 //!   passes it (2.7 to `int` gives 2) and fails when a declared parameter is
 //!   not passed; PostgreSQL `EXECUTE … USING` types `$n` by the value (`USING
@@ -971,8 +979,9 @@ pub fn pg_bind_params(root: &SyntaxNode, count: usize) -> Result<String, String>
 /// statement against a PostgreSQL `EXECUTE`, if it cannot: more or less than
 /// one statement, the caller's variables, `#temp` tables (dropped when the
 /// batch ends), result sets (PostgreSQL `EXECUTE` discards them), session
-/// settings, database switches, transaction control and batch-level
-/// statements.
+/// settings, database switches, transaction control, batch-level
+/// statements, nested dynamic SQL and procedure calls (a procedure called
+/// through PostgreSQL `EXECUTE` cannot commit).
 pub fn tsql_inner_refusal(text: &str) -> Option<String> {
     tsql_inner_refusal_with(text, &[])
 }
@@ -1030,17 +1039,31 @@ pub fn tsql_inner_refusal_with(text: &str, params: &[String]) -> Option<String> 
     let w = |i: usize| ts.get(i).map(|t| t.up.as_str()).unwrap_or("");
     match w(0) {
         "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "CREATE" | "ALTER" | "DROP" | "TRUNCATE"
-        | "EXEC" | "EXECUTE" | "GRANT" | "REVOKE" | "DENY" => {}
+        | "GRANT" | "REVOKE" | "DENY" => {}
         "SELECT" | "WITH" => {
             return Some("the text is a query: T-SQL returns its rows to the client, PostgreSQL EXECUTE discards them".into())
+        }
+        "EXEC" | "EXECUTE" => {
+            if is_tsql(stmt) {
+                return Some("the text runs dynamic SQL itself".into());
+            }
+            // Not provable from the caller: the callee's body may be outside
+            // the tree, and its conversion may hold COMMIT.
+            return Some("the text calls a procedure: a procedure called through PostgreSQL EXECUTE cannot commit, and PostgreSQL raises 2D000 (invalid transaction termination) when the callee's conversion holds COMMIT, where T-SQL runs it and keeps its writes; call it statically (`EXEC dbo.q`) instead".into());
         }
         w => return Some(format!("the text is a `{w}` statement, which is not compared inside dynamic SQL")),
     }
     if ts.iter().any(|t| t.kind == K::Word && t.up == "OUTPUT") {
         return Some("the text has an OUTPUT clause, which returns rows".into());
     }
-    if is_tsql(stmt) {
-        return Some("the text runs dynamic SQL itself".into());
+    // A call anywhere in the statement (`INSERT ... EXEC dbo.q`) runs the
+    // procedure through EXECUTE just the same; `INSERT ... EXECUTE ('...')`
+    // is nested dynamic SQL.
+    if ts
+        .iter()
+        .any(|t| t.kind == K::Word && (t.up == "EXEC" || t.up == "EXECUTE"))
+    {
+        return Some("the text calls a procedure or runs dynamic SQL inside its statement (`INSERT ... EXEC`): a procedure called through PostgreSQL EXECUTE cannot commit, and nested dynamic SQL is not compared".into());
     }
     None
 }
@@ -1218,6 +1241,22 @@ mod tests {
         assert!(tsql_inner_refusal("UPDATE dbo.t SET a = @x").is_some_and(|w| w.contains("@x")));
         assert!(tsql_inner_refusal("SET NOCOUNT ON").is_some());
         assert!(tsql_inner_refusal("USE master").is_some());
+        assert!(tsql_inner_refusal("EXEC dbo.q").is_some_and(|w| w.contains("calls a procedure")));
+        assert!(
+            tsql_inner_refusal("EXECUTE dbo.q 1;").is_some_and(|w| w.contains("calls a procedure"))
+        );
+        assert!(tsql_inner_refusal("EXEC (N'DROP TABLE dbo.t')")
+            .is_some_and(|w| w.contains("dynamic SQL itself")));
+        for text in [
+            "INSERT INTO dbo.t (a) EXEC dbo.q",
+            "INSERT INTO dbo.t EXEC dbo.q 1",
+            "INSERT dbo.t EXECUTE ('SELECT 1')",
+        ] {
+            assert!(
+                tsql_inner_refusal(text).is_some_and(|w| w.contains("INSERT ... EXEC")),
+                "{text}"
+            );
+        }
         assert_eq!(
             tsql_inner_refusal_with("UPDATE dbo.t SET a = @V", &["v".into()]),
             None

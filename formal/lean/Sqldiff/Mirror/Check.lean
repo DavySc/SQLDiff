@@ -35,6 +35,7 @@ import Sqldiff.Core.Rename
 import Sqldiff.Core.OpFree
 import Sqldiff.Core.Handlers
 import Sqldiff.Mirror.Lower
+import Sqldiff.Mirror.Diagnose
 import Sqldiff.Gate
 
 namespace Sqldiff.Mirror
@@ -205,6 +206,23 @@ def check (dep : Deployment) (Γ : Catalog) (cert : Cert) (a b : Ast.Routine) : 
       .confirmed (if inC2a dep Γ a b ca cb then theoremC2a else theoremC1)
     else
       .unconfirmed "the lowered routines differ beyond the renaming"
+
+/-- The reasons `check` gives when a routine does not lower; the answer
+then carries `why` (checker 0.13.0, `Sqldiff.Mirror.Request.extra`). -/
+def reasonOutsideT : String := "the T-SQL routine is outside the C1 spec"
+def reasonOutsideP : String := "the PL/pgSQL routine is outside the C1 spec"
+
+/-- Why the pair is outside the spec: the untrusted reason codes
+(`Sqldiff.Mirror.whyT`, `whyP`, `Sqldiff/Mirror/Diagnose.lean`) for the
+routine `check` refuses, the T-SQL one first as `check` tests them;
+nothing when both lower. It is computed only for an answer whose reason
+is `reasonOutsideT` or `reasonOutsideP`, never changes an answer, and
+no theorem mentions it. -/
+def why (dep : Deployment) (Γ : Catalog) (a b : Ast.Routine) : List String :=
+  match lowerT dep Γ a, lowerP Γ b with
+  | none, _ => whyT dep Γ a
+  | some _, none => whyP Γ b
+  | some _, some _ => []
 
 /-- A confirmed answer means: both routines are inside the spec, and the
 PL/pgSQL routine refines the T-SQL one, for every meaning of the

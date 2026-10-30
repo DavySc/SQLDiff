@@ -55,8 +55,10 @@ impl Drop for Fixture {
 }
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
+// A parameter without a default after one with a default: PostgreSQL
+// needs them reordered, a decision.
 const DECIDING: &str =
-    "CREATE PROCEDURE dbo.q AS\nBEGIN\n  DECLARE @f bit = 1;\n  UPDATE t SET a = 1;\nEND\n";
+    "CREATE PROCEDURE dbo.q @x int = 1, @y int AS\nBEGIN\n  UPDATE t SET a = 1;\nEND\n";
 const REFUSED: &str = "CREATE PROCEDURE dbo.r AS\nBEGIN\n  SELECT @@ERROR;\nEND\n";
 
 fn tiers_of(q: &Queue, path: &str) -> Vec<u8> {

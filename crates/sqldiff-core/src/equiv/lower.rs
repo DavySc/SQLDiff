@@ -205,6 +205,18 @@ pub struct CallAt {
     pub after: usize,
 }
 
+/// A statement whose rows reach the caller (`Unit::results`).
+#[derive(Debug, Clone, Copy)]
+pub struct ResultStmt {
+    /// Its index in `Unit::stmts`.
+    pub at: usize,
+    /// Runs exactly once whenever the routine gets that far: not inside an
+    /// IF, a loop, a TRY or CATCH part or a block with an EXCEPTION section.
+    pub top: bool,
+    /// A RETURN comes before it, so some runs may end without it.
+    pub after_return: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Unit {
     pub dialect: Dialect,
@@ -213,6 +225,11 @@ pub struct Unit {
     pub returns: Option<Ty>,
     /// Declared RETURNS TABLE columns and their types.
     pub ret_cols: Vec<(String, Option<Ty>)>,
+    /// The declared types of `ret_cols` as written.
+    pub ret_types: Vec<Option<Type>>,
+    /// The statements whose rows reach the caller: a T-SQL procedure's
+    /// SELECT or OUTPUT without INTO, a PL/pgSQL `RETURN QUERY`.
+    pub results: Vec<ResultStmt>,
     /// PostgreSQL `LANGUAGE sql`: the last query is the result.
     pub sql_body: bool,
     pub locals: Vec<Local>,
@@ -375,6 +392,8 @@ fn empty(d: Dialect) -> Unit {
         params: Vec::new(),
         returns: None,
         ret_cols: Vec::new(),
+        ret_types: Vec::new(),
+        results: Vec::new(),
         sql_body: false,
         locals: Vec::new(),
         stmts: Vec::new(),
@@ -1310,6 +1329,18 @@ fn unit(c: &SyntaxNode, u: &mut Unit) {
     }
 }
 
+/// Whether `c` sits in a TRY or CATCH part, or in a block with an EXCEPTION
+/// section: an error there may be caught after rows were already returned.
+fn in_handled_block(c: &SyntaxNode) -> bool {
+    c.ancestors().any(|p| match p.kind() {
+        SyntaxKind::TRY_BLOCK | SyntaxKind::CATCH_BLOCK | SyntaxKind::TRY_CATCH => true,
+        SyntaxKind::BLOCK => p
+            .children()
+            .any(|k| k.kind() == SyntaxKind::EXCEPTION_SECTION),
+        _ => false,
+    })
+}
+
 /// A construct that is compared at the top level but not inside an IF, a
 /// loop or a CATCH block.
 fn inside_flow(c: &SyntaxNode, u: &mut Unit, what: &str) {
@@ -2037,10 +2068,39 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         | StmtKind::Return
         | StmtKind::Declare => {
             let toks = tokens(c);
-            let (mut ast, output) = match parse_stmt_output(&toks, d) {
+            // PL/pgSQL `RETURN QUERY q`: the statement is `q`, its rows the
+            // function's result.
+            let query = d == Dialect::Postgres
+                && toks.len() > 2
+                && toks[0].up == "RETURN"
+                && toks[1].up == "QUERY";
+            let (mut ast, output) = match parse_stmt_output(&toks[if query { 2 } else { 0 }..], d) {
                 Ok((s, o)) => (Ok(s), o),
                 Err(e) => (Err(e), None),
             };
+            let rows = match &ast {
+                _ if query => true,
+                Ok(Stmt::Select(q)) => {
+                    d == Dialect::Tsql
+                        && u.kind == UnitKind::Proc
+                        && q.into.is_empty()
+                        && q.items.iter().all(|i| i.assign.is_none())
+                }
+                Ok(_) => {
+                    d == Dialect::Tsql
+                        && u.kind == UnitKind::Proc
+                        && output.as_ref().is_some_and(|o| o.into.is_none())
+                }
+                Err(_) => false,
+            };
+            if rows {
+                let after_return = u.stmts.iter().any(|s| matches!(s.ast, Ok(Stmt::Return(_))));
+                u.results.push(ResultStmt {
+                    at: u.stmts.len(),
+                    top: u.depth == 0 && !in_handled_block(c),
+                    after_return,
+                });
+            }
             let mut from_declare = false;
             if let Ok(Stmt::Declare { name, ty, default }) = &ast {
                 u.locals.push(Local {

@@ -10,11 +10,11 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 
 | Discharge | Meaning | Ids |
 |---|---|---|
-| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 54 |
+| `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 55 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 99 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 101 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 203 |
+| | Total | 206 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -56,6 +56,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-BIND-TRIGGER-ROW` | The trigger's table has the columns the trigger body reads from NEW and OLD. | `catalog` | The trigger table's columns in the catalog. | `sqldiff-core/src/bind/query.rs` |
 | `ASM-BIND-TYPE` | A type the code names is a user-defined type or domain that exists in the target database. | `catalog` | The type's definition in the catalog. | `sqldiff-core/src/bind/mod.rs` |
 | `ASM-BIND-UNREAD` | Text SQLDiff could not read (placeholders, an unreadable routine header, a parse problem) does not change what the statements bind to. | `nothing` | A file that parses without placeholders; until then a reviewer reads the unread text. | `sqldiff-core/src/bind/doubt.rs` |
+| `ASM-BIT-BOOLEAN` | Code and applications outside the conversion that read or write a converted bit use false and true where T-SQL used 0 and 1. | `deployment` | BIT becomes boolean, the default PostgreSQL mapping (decided by the owner 2026-10-30); the callers are adapted with the deployment. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-BIT-BOOLEAN-COLUMN` | The T-SQL bit column's 0 and 1 are the PostgreSQL boolean column's false and true. | `deployment` | The data migration maps bit 0 and 1 to false and true (the value correspondence of the deployment). | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-BIT-SMALLINT` | Only 0, 1 and NULL are written to a T-SQL bit converted to SMALLINT. | `generated` | A CHECK (x IN (0, 1)) on the converted column, or callers that write only 0, 1 and NULL. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/bits.rs` |
 | `ASM-BUILTIN-ABSENT` | The dialect has no built-in function with a name the code calls (it is not on SQLDiff's built-in list). | `catalog` | The target's function list in the catalog. | `sqldiff-core/src/bind/query.rs` |
@@ -142,6 +143,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-ORDER-TOTAL` | The ORDER BY keys are unique, so both sides return the same rows in the same order. | `catalog` | A unique key over the ORDER BY columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OUTPUT-INTO-TARGET` | The table an OUTPUT … INTO writes has no enabled trigger, CHECK constraint or rule and is on neither side of a foreign key (SQL Server rejects the statement otherwise, Msg 331 to 333; the PostgreSQL insert runs). | `catalog` | The SQL Server catalog of the OUTPUT table: no enabled triggers, CHECK constraints or rules, no foreign key referencing it or referenced by it. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OUTPUT-ROW-ORDER` | Rows OUTPUT … INTO or RETURNING writes get the values their table generates (identity, sequence defaults) in the same order on both sides; neither engine specifies the order. | `deployment` | Nothing relies on which generated value each written row gets. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-OUTPUT-TARGET-TRIGGERS` | The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows. | `catalog` | The SQL Server catalog of the changed table: no enabled triggers. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-OWNER-PRIVILEGES` | The routine owner holds every privilege its statements need on both sides. | `deployment` | The owner's grants on the target. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PAGE-COUNT-NOT-NULL` | The row count and offset of TOP, LIMIT, FETCH and OFFSET are never NULL: T-SQL raises an error for NULL, PostgreSQL reads it as no limit (OFFSET NULL as 0). | `deployment` | Callers never pass a NULL row count or offset, and the routine never computes one. | `sqldiff-convert/src/tsql/paging.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-PAGE-UNORDERED` | A row limit or offset without ORDER BY keeps rows that each engine picks: any such rows will do. | `nothing` | A reading of the statement: its callers accept any rows (an ORDER BY would make it deterministic). | `sqldiff-core/src/equiv/canon.rs` |
@@ -161,6 +163,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-READ-COMMITTED` | The routine runs at READ COMMITTED (the default). | `deployment` | The isolation level of the callers' sessions. (fact key `isolation`) | `sqldiff-core/src/ir/behaviour.rs` |
 | `ASM-READ-UNCOMMITTED` | Reading only committed rows where T-SQL reads uncommitted ones gives the same results (concurrency is not observed). | `deployment` | Callers do not depend on dirty reads. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-RESULT-NAMES-CI` | Clients read result columns by name case-insensitively. | `deployment` | How the clients read result columns. | `sqldiff-core/src/equiv/canon.rs` |
+| `ASM-RESULT-SET-FUNCTION` | Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error). | `deployment` | How the application calls the procedure and reads its result set. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RESULT-TYPES` | Declared result column types hold the selected values without conversion. | `catalog` | The types of the selected columns. | `sqldiff-core/src/equiv/canon.rs` |
 | `ASM-RETURN-CODE` | Callers read a PostgreSQL procedure's return code from its return_code INOUT parameter. | `deployment` | How callers read the return code. | `sqldiff-convert/src/cert.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `ASM-RETURN-LENGTHS` | Returned values fit the shorter of the two sides' declared return types. | `catalog` | The types of the returned expressions. | `sqldiff-core/src/equiv/mod.rs` |

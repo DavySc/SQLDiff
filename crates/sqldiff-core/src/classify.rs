@@ -203,6 +203,13 @@ pub fn stmt_kind(node: &SyntaxNode, dialect: Dialect) -> StmtKind {
         "COMMIT" | "END" => StmtKind::TxnCommit,
         "ROLLBACK" | "ABORT" => StmtKind::TxnRollback,
         "SAVE" | "SAVEPOINT" | "RELEASE" => StmtKind::Savepoint,
+        // PL/pgSQL `RETURN QUERY` of a data change: the change is a write.
+        "RETURN" if w1 == "QUERY" => match w(2).as_str() {
+            "INSERT" => StmtKind::Insert,
+            "UPDATE" => StmtKind::Update,
+            "DELETE" => StmtKind::Delete,
+            _ => StmtKind::Return,
+        },
         "RETURN" => StmtKind::Return,
         "THROW" | "RAISERROR" | "SIGNAL" | "RESIGNAL" => StmtKind::Raise,
         "RAISE" => {

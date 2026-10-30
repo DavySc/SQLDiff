@@ -1,6 +1,6 @@
 //! T-SQL bit next to numbers, for PostgreSQL's boolean.
 //!
-//! BIT becomes boolean (the `pg.bit-boolean` decision). T-SQL reads a bit as
+//! BIT becomes boolean (the default mapping, under `ASM-BIT-BOOLEAN`). T-SQL reads a bit as
 //! the number 0 or 1; PostgreSQL has no comparison, arithmetic, assignment
 //! or cast between boolean and the numbers except `integer::boolean` and
 //! `boolean::integer` (checked on SQL Server 2022 and PostgreSQL 18,
