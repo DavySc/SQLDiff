@@ -1,0 +1,7 @@
+-- SQL Server 2022:
+Msg 467, Level 16, State 1, Server 1db4dfcf32f0, Line 1
+GROUP BY, HAVING, or aggregate functions are not allowed in the recursive part of a recursive common table expression 'N'.
+-- PostgreSQL 18 (WITH RECURSIVE):
+ERROR:  aggregate functions are not allowed in a recursive query's recursive term
+LINE 1: ...ITH RECURSIVE N (i) AS (SELECT 1 UNION ALL SELECT MAX(i) + 1...
+                                                             ^
