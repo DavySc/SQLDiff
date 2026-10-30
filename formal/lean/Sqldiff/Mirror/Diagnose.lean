@@ -234,7 +234,7 @@ def ifLowerFails (d : Dialect) (env : TyEnv) (sc : Scope) (e : Ast.Expr) : List 
 
 /-! ## Queries -/
 
-/-- The shape of a `SELECT` that `selParts` refuses. -/
+/-- The shape of one `FROM` item that `readFrom` refuses. -/
 def whyFromOne : Ast.From → List String
   | .Table _ alias hints =>
     (if alias.isSome then ["stmt:select:from:alias"] else []) ++
@@ -288,14 +288,23 @@ def whyTable (d : Dialect) (pre : String) (tgt : List String) : List String :=
   | some t => if t.wellFormed then [] else [pre ++ ":table:not-plain"]
   | none => [pre ++ ":table:unknown"]
 
-/-- Why `queryOn` refuses a query: its table, or its `WHERE`. -/
-def whyQueryOn (d : Dialect) (env : TyEnv) (pre : String) (tgt : List String)
-    (wh : Option Ast.Expr) : List String :=
-  match tableOf d tgt with
-  | none => whyTable d pre tgt
-  | some t => match wh with
-    | some w => ifLowerFails d env (scopeOf d t tgt) w
-    | none => []
+/-- Why `querySpec` refuses a query: a clause outside the shape
+(`selParts`), or its `FROM` (`readFrom`): an item of another form, or a
+table the deployment or the catalog does not give. -/
+def whySpec (d : Dialect) (sel : Ast.Select) : List String :=
+  match selParts sel with
+  | none => whySelShape sel
+  | some (_, _, _, froms, _) =>
+    let shape := whyFrom froms
+    if !shape.isEmpty then shape else
+    froms.flatMap fun
+      | .Table tgt _ _ => whyTable d "stmt:select" tgt
+      | _ => []
+
+/-- Why `lowerWhere` refuses a query `querySpec` reads: a condition that
+does not lower. -/
+def whyConds (d : Dialect) (env : TyEnv) (s : QSpec) : List String :=
+  s.conds.flatMap fun (sc, c) => ifLowerFails d env sc c
 
 /-- Why `pickValue` refuses a select item: an aggregate, a value outside
 the slice (by its form), or one that reads a variable, can raise or is a
@@ -319,27 +328,25 @@ def whyCount (d : Dialect) (env : TyEnv) (x : Var) : List String :=
 
 /-- Why `lowerSelectT` refuses T-SQL `SELECT ...`. -/
 def whySelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
-  match selParts sel with
-  | none => whySelShape sel
-  | some (items, into, strict, tgt, wh) =>
-    if !into.isEmpty || strict then ["stmt:select:into"] else
-    match queryOn d env tgt wh with
-    | none => whyQueryOn d env "stmt:select" tgt wh
-    | some (t, sc, c) =>
+  match querySpec d sel with
+  | none => whySpec d sel
+  | some s =>
+    if !s.into.isEmpty || s.strict then ["stmt:select:into"] else
+    match lowerWhere d env s with
+    | none => whyConds d env s
+    | some (t, c) =>
       let row : List String :=
-        let bad := items.flatMap fun
+        let bad := s.items.flatMap fun
           | .SelItem e none (some v) =>
             (if (target d (.Var v)).isNone then ["stmt:assign:target"] else []) ++
-              (if (pickValue d env sc e).isNone then whyPick d env sc e else [])
+              (if (pickValue d env s.sc e).isNone then whyPick d env s.sc e else [])
           | .SelItem _ _ none => ["stmt:select:result-set"]
           | .SelItem _ (some _) (some _) => ["stmt:select:item"]
         if !bad.isEmpty then bad else
-        match items.mapM (fun
-            | .SelItem e none (some v) => do pure (← target d (.Var v), ← pickValue d env sc e)
-            | _ => none) with
+        match assignItems d env s.sc s.items with
         | some sets => whyRowPick d env t c sets
         | none => []
-      match items with
+      match s.items with
       | [.SelItem e none (some v)] =>
         if countStar e then
           match target d (.Var v) with
@@ -352,47 +359,47 @@ def whySelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
 set), `STRICT`, or an `INTO` other than `COUNT(*)` into one variable
 (`SELECT col INTO x` is NULL on no row). -/
 def whySelectP (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
-  match selParts sel with
-  | none => whySelShape sel
-  | some (items, into, strict, tgt, wh) =>
-    if into.isEmpty then ["stmt:select:result-set"]
-    else if strict then ["stmt:select:into"]
-    else match items, into with
+  match querySpec d sel with
+  | none => whySpec d sel
+  | some s =>
+    if s.into.isEmpty then ["stmt:select:result-set"]
+    else if s.strict then ["stmt:select:into"]
+    else match s.items, s.into with
       | [.SelItem e none none], [x] =>
         if countStar e then
           match target d x with
           | none => ["stmt:assign:target"]
-          | some x => match queryOn d env tgt wh with
-            | none => whyQueryOn d env "stmt:select" tgt wh
+          | some x => match lowerWhere d env s with
+            | none => whyConds d env s
             | some _ => whyCount d env x
         else ["stmt:select:into"]
       | _, _ => ["stmt:select:into"]
 
 /-- Why `lowerScalar` refuses `x := (SELECT ...)`. -/
 def whyScalar (d : Dialect) (env : TyEnv) (x : Var) (sel : Ast.Select) : List String :=
-  match selParts sel with
-  | none => whySelShape sel
-  | some (items, into, strict, tgt, wh) =>
-    if !into.isEmpty || strict then ["stmt:select:into"] else
-    match queryOn d env tgt wh with
-    | none => whyQueryOn d env "stmt:select" tgt wh
-    | some (t, sc, c) => match items with
+  match querySpec d sel with
+  | none => whySpec d sel
+  | some s =>
+    if !s.into.isEmpty || s.strict then ["stmt:select:into"] else
+    match lowerWhere d env s with
+    | none => whyConds d env s
+    | some (t, c) => match s.items with
       | [.SelItem e none none] =>
         if countStar e then whyCount d env x
-        else match pickValue d env sc e with
-          | none => whyPick d env sc e
+        else match pickValue d env s.sc e with
+          | none => whyPick d env s.sc e
           | some v => whyRowPick d env t c [(x, v)]
       | [_] => ["stmt:select:item"]
       | _ => ["stmt:select:items"]
 
 /-- Why `lowerExists` refuses `EXISTS (SELECT ...)`. -/
 def whyExists (d : Dialect) (env : TyEnv) (sel : Ast.Select) : List String :=
-  match selParts sel with
-  | none => whySelShape sel
-  | some (items, into, strict, tgt, wh) =>
-    if !into.isEmpty || strict then ["stmt:select:into"]
-    else if !existsItems items then ["stmt:select:items"]
-    else whyQueryOn d env "stmt:select" tgt wh
+  match querySpec d sel with
+  | none => whySpec d sel
+  | some s =>
+    if !s.into.isEmpty || s.strict then ["stmt:select:into"]
+    else if !existsItems s.items then ["stmt:select:items"]
+    else whyConds d env s
 
 /-- Why `lowerForBlock` refuses the converter's `FOR` block. -/
 def whyFor (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : Ast.Ty)
@@ -406,21 +413,19 @@ def whyFor (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : 
     else if vars.contains r then ["routine:scope:duplicate"]
     else
     let d' := Dialect.pg Γ (vars ++ [r])
-    match selParts sel with
-    | none => whySelShape sel
-    | some (items, into, strict, tgt, wh) =>
-      if !into.isEmpty || strict then ["stmt:select:into"] else
-      match queryOn d' env tgt wh with
-      | none => whyQueryOn d' env "stmt:select" tgt wh
-      | some (t, sc, c) =>
-        let bad := items.flatMap fun
+    match querySpec d' sel with
+    | none => whySpec d' sel
+    | some s =>
+      if !s.into.isEmpty || s.strict then ["stmt:select:into"] else
+      match lowerWhere d' env s with
+      | none => whyConds d' env s
+      | some (t, c) =>
+        let bad := s.items.flatMap fun
           | .SelItem e (some _) none =>
-            if (pickValue d' env sc e).isNone then whyPick d' env sc e else []
+            if (pickValue d' env s.sc e).isNone then whyPick d' env s.sc e else []
           | _ => ["stmt:select:item"]
         if !bad.isEmpty then bad else
-        match items.mapM (fun
-            | .SelItem e (some a) none => do pure (pgName a, ← pickValue d' env sc e)
-            | _ => none), body.mapM (fieldAssign r) with
+        match aliasItems d' env s.sc s.items, body.mapM (fieldAssign r) with
         | some cols, some asg =>
           if asg.length != cols.length || !distinct (cols.map (·.1)) ||
               !(asg.zip cols).all (fun (p, q) => p.2 == q.1) || (asg.map (·.1)).contains r then
@@ -679,8 +684,8 @@ end
 
 /-- The usable catalog table of a plain query, if any. -/
 def queryTable (d : Dialect) (q : Ast.Select) : Option CatTable := do
-  let (_, _, _, tgt, _) ← selParts q
-  tableOf d tgt
+  let s ← querySpec d q
+  s.tabs.head?
 
 /-- The value of a store into a target declared `ty` that is not in the
 slice, by its form (a function, a cast, a literal the target does not
@@ -705,17 +710,12 @@ def whyStoresStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) (known 
   | .Assign t (.Subquery q) => match target d t, queryTable d q with
     | some x, some _ => if known x then ["store:pick:" ++ varDetail wenv x] else []
     | _, _ => []
-  | .SSelect q => match selParts q, queryTable d q with
-    | some (items, into, _, _, _), some _ =>
-      let assigned := items.filterMap fun
-        | .SelItem e _ (some v) => (target d (.Var v)).map (·, e)
-        | _ => none
-      let intos := (into.zip items).filterMap fun
-        | (x, .SelItem e _ _) => (target d x).map (·, e)
-      (assigned ++ intos).filterMap fun (x, e) =>
+  | .SSelect q => match querySpec d q with
+    | some s =>
+      (pickStores d s).filterMap fun (x, e) =>
         if !known x || storeOkTy d (lookup wenv x) false (itemTy d env q e) then none
         else some ("store:pick:" ++ varDetail wenv x)
-    | _, _ => []
+    | none => []
   | .Assign t v => match target d t with
     | some x =>
       if known x then ("store:assign:" ++ varDetail wenv x) :: whyStoreValue d env (lookup wenv x) v
@@ -736,8 +736,8 @@ mutual
     | .If _ t e => whyStoresNodes d env wenv ret known t ++ whyStoresNodes d env wenv ret known e
     | .While _ b => whyStoresNodes d env wenv ret known b
     | .ForQuery r q b =>
-      let items := match selParts q with
-        | some (items, _, _, _, _) => items
+      let items := match querySpec (withRecord d r) q with
+        | some s => s.items
         | none => []
       b.flatMap fun n => match fieldAssign (pgName r) n with
         | some (x, a) =>

@@ -2408,14 +2408,46 @@ spell it; `wellScoped` and the renaming's injectivity refuse the
 collision (see the C3b rules). -/
 def existsVar : Var := "%exists"
 
-/-- The parts of a plain one-table `SELECT`: its items, its `INTO`
-targets and `STRICT`, the table's name and the `WHERE`. Anything else in
-the query puts it outside the spec. -/
+/-- The clauses of a plain `SELECT`: its items, its `INTO` targets and
+`STRICT`, its `FROM` list and its `WHERE`. Anything else in the query
+(`WITH`, `FOR JSON`, a set operation, `DISTINCT`, `TOP`, `GROUP BY`,
+`HAVING`, `ORDER BY`, paging, a locking clause, `VALUES`) puts it outside
+the spec. -/
 def selParts : Ast.Select →
-    Option (List Ast.SelItem × List Ast.Expr × Bool × List String × Option Ast.Expr)
-  | .Select [] false [] false none items into strict [.Table tgt none []] wh [] none [] none none []
-      none => some (items, into, strict, tgt, wh)
+    Option (List Ast.SelItem × List Ast.Expr × Bool × List Ast.From × Option Ast.Expr)
+  | .Select [] false [] false none items into strict froms wh [] none [] none none [] none =>
+    some (items, into, strict, froms, wh)
   | _ => none
+
+/-- A query as every reader of it sees it: the lowering (`lowerSelectT`,
+`lowerSelectP`, `lowerScalar`, `lowerExists`, `lowerForBlock`), the store
+check (`itemTy`, `pickStoresOk`, `forStoresOk`), the slice check
+(`querySlice`) and the diagnostics (`Sqldiff.Mirror.whySpec`) all read a
+query through `querySpec`, so they cannot disagree about its tables, the
+names in scope or its conditions. -/
+structure QSpec where
+  items : List Ast.SelItem
+  into : List Ast.Expr
+  strict : Bool
+  /-- The catalog tables of the `FROM`, in order. -/
+  tabs : List CatTable
+  /-- The names the select list and the `WHERE` see. -/
+  sc : Scope
+  /-- The conditions with the names each sees, the `WHERE` last. -/
+  conds : List (Scope × Ast.Expr)
+
+/-- The `FROM` list: one catalog table without alias or hints. -/
+def readFrom (d : Dialect) : List Ast.From → Option (List CatTable × Scope × List (Scope × Ast.Expr))
+  | [.Table tgt none []] => do
+    let t ← tableOf d tgt
+    pure ([t], scopeOf d t tgt, [])
+  | _ => none
+
+/-- The one reader of a query (see `QSpec`). -/
+def querySpec (d : Dialect) (q : Ast.Select) : Option QSpec := do
+  let (items, into, strict, froms, wh) ← selParts q
+  let (tabs, sc, ons) ← readFrom d froms
+  pure { items, into, strict, tabs, sc, conds := ons ++ wh.toList.map (sc, ·) }
 
 /-- `COUNT(*)`. -/
 def countStar : Ast.Expr → Bool
@@ -2471,13 +2503,12 @@ def keyFixed (t : CatTable) : Option Core.Expr → Bool
     t.cols.any (·.key) && (t.cols.filter (·.key)).all fun k => (conjuncts s).any (fixesCol k.name)
   | _ => false
 
-/-- A query of the table: its scope and its lowered `WHERE`. -/
-def queryOn (d : Dialect) (env : TyEnv) (tgt : List String) (wh : Option Ast.Expr) :
-    Option (CatTable × Scope × Option Core.Expr) := do
-  let t ← tableOf d tgt
-  let sc := scopeOf d t tgt
-  let c ← lowerOpt d env sc wh
-  pure (t, sc, c)
+/-- The lowered query: its table and its lowered `WHERE`. -/
+def lowerWhere (d : Dialect) (env : TyEnv) (s : QSpec) : Option (CatTable × Option Core.Expr) :=
+  match s.tabs, s.conds with
+  | [t], [] => some (t, none)
+  | [t], [(sc, c)] => (lowerExpr d env sc c).map fun c' => (t, some c')
+  | _, _ => none
 
 /-- `.row`: distinct targets of the values' types (`pickTarget`) that the
 condition does not read, and a condition that fixes the key. -/
@@ -2500,43 +2531,46 @@ def countPick (d : Dialect) (env : TyEnv) (t : CatTable) (c : Option Core.Expr) 
     some (.query t.toDef c (.count x))
   else none
 
+/-- The T-SQL picks `@x = e` of a select list. -/
+def assignItems (d : Dialect) (env : TyEnv) (sc : Scope) (items : List Ast.SelItem) :
+    Option (List (Var × Core.Expr × STy)) :=
+  items.mapM fun
+    | .SelItem e none (some v) => do pure (← target d (.Var v), ← pickValue d env sc e)
+    | _ => none
+
 /-- T-SQL `SELECT @x = e, ... FROM t WHERE c` and `SELECT @x = COUNT(*) FROM
 t [WHERE c]` (rules 1 and 4). -/
 def lowerSelectT (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
-  let (items, into, strict, tgt, wh) ← selParts sel
-  if !into.isEmpty || strict then none else
-  let (t, sc, c) ← queryOn d env tgt wh
-  let row : Option Stmt := do
-    let sets ← items.mapM fun
-      | .SelItem e none (some v) => do pure (← target d (.Var v), ← pickValue d env sc e)
-      | _ => none
-    rowPick d env t c false sets
-  match items with
+  let s ← querySpec d sel
+  if !s.into.isEmpty || s.strict then none else
+  let (t, c) ← lowerWhere d env s
+  let row : Option Stmt := do rowPick d env t c false (← assignItems d env s.sc s.items)
+  match s.items with
   | [.SelItem e none (some v)] =>
     if countStar e then do countPick d env t c (← target d (.Var v)) else row
   | _ => row
 
 /-- PL/pgSQL `SELECT COUNT(*) INTO x FROM t [WHERE c]` (rule 4). -/
 def lowerSelectP (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
-  let (items, into, strict, tgt, wh) ← selParts sel
-  match items, into, strict with
+  let s ← querySpec d sel
+  match s.items, s.into, s.strict with
   | [.SelItem e none none], [x], false =>
     if countStar e then do
       let x ← target d x
-      let (t, _, c) ← queryOn d env tgt wh
+      let (t, c) ← lowerWhere d env s
       countPick d env t c x
     else none
   | _, _, _ => none
 
 /-- `x := (SELECT e FROM t WHERE c)` in either dialect (rules 2 and 4). -/
 def lowerScalar (d : Dialect) (env : TyEnv) (x : Var) (sel : Ast.Select) : Option Stmt := do
-  let (items, into, strict, tgt, wh) ← selParts sel
-  if !into.isEmpty || strict then none else
-  let (t, sc, c) ← queryOn d env tgt wh
-  match items with
+  let s ← querySpec d sel
+  if !s.into.isEmpty || s.strict then none else
+  let (t, c) ← lowerWhere d env s
+  match s.items with
   | [.SelItem e none none] =>
     if countStar e then countPick d env t c x
-    else rowPick d env t c true [(x, ← pickValue d env sc e)]
+    else rowPick d env t c true [(x, ← pickValue d env s.sc e)]
   | _ => none
 
 /-- The condition of an `IF` that is `EXISTS (q)` (`false`) or `NOT EXISTS
@@ -2548,9 +2582,9 @@ def existsCond : Ast.Expr → Option (Ast.Select × Bool)
 
 /-- `EXISTS (SELECT 1 FROM t [WHERE c])` (rule 3). -/
 def lowerExists (d : Dialect) (env : TyEnv) (sel : Ast.Select) : Option Stmt := do
-  let (items, into, strict, tgt, wh) ← selParts sel
-  if !into.isEmpty || strict || !existsItems items then none else
-  let (t, _, c) ← queryOn d env tgt wh
+  let s ← querySpec d sel
+  if !s.into.isEmpty || s.strict || !existsItems s.items then none else
+  let (t, c) ← lowerWhere d env s
   pure (.query t.toDef c (.any existsVar))
 
 /-- (C3b) The dialect a `FOR` loop's query is read in: its record is a
@@ -2572,6 +2606,13 @@ def fieldAssign (r : String) : Ast.Node → Option (Var × String)
     if pgName r' == r then some (pgName x, pgName a) else none
   | _ => none
 
+/-- The aliased items `e AS a` of a `FOR` loop's query, folded. -/
+def aliasItems (d : Dialect) (env : TyEnv) (sc : Scope) (items : List Ast.SelItem) :
+    Option (List (String × Core.Expr × STy)) :=
+  items.mapM fun
+    | .SelItem e (some a) none => do pure (pgName a, ← pickValue d env sc e)
+    | _ => none
+
 /-- The PL/pgSQL block `DECLARE r record; BEGIN FOR r IN SELECT e1 AS a1,
 ... FROM t WHERE c LOOP x1 := r.a1; ... END LOOP; END;` (rule 1). -/
 def lowerForBlock (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String) (ty : Ast.Ty)
@@ -2584,18 +2625,16 @@ def lowerForBlock (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) (r : String)
     else
     -- The record is a variable for the query's names.
     let d' := Dialect.pg Γ (vars ++ [r])
-    let (items, into, strict, tgt, wh) ← selParts sel
-    if !into.isEmpty || strict then none else
-    let (t, sc, c) ← queryOn d' env tgt wh
-    let cols ← items.mapM fun
-      | .SelItem e (some a) none => do pure (pgName a, ← pickValue d' env sc e)
-      | _ => none
+    let s ← querySpec d' sel
+    if !s.into.isEmpty || s.strict then none else
+    let (t, c) ← lowerWhere d' env s
+    let cols ← aliasItems d' env s.sc s.items
     let asg ← body.mapM (fieldAssign r)
     if asg.length != cols.length || !distinct (cols.map (·.1)) ||
         !(asg.zip cols).all (fun (p, q) => p.2 == q.1) || (asg.map (·.1)).contains r then none
     else
-    let s ← rowPick d' env t c false ((asg.zip cols).map fun (p, q) => (p.1, q.2))
-    pure [s]
+    let st ← rowPick d' env t c false ((asg.zip cols).map fun (p, q) => (p.1, q.2))
+    pure [st]
 
 /-! ## Statements -/
 
@@ -3587,9 +3626,8 @@ def storeOk (d : Dialect) (env : TyEnv) (ty : Option Ast.Ty) (v : Ast.Expr) : Bo
 /-- (C3c) The select item `e` of the query `q`, typed with the query's
 table in scope: the value a pick stores. -/
 def itemTy (d : Dialect) (env : TyEnv) (q : Ast.Select) (e : Ast.Expr) : Option (SExpr × STy) := do
-  let (_, _, _, tgt, _) ← selParts q
-  let t ← tableOf d tgt
-  typed d env (scopeOf d t tgt) e
+  let s ← querySpec d q
+  typed d env s.sc e
 
 /-- (C3c) The stores of a query's picks (C3b rules 1, 2 and 4): each
 target variable with the select item it gets. A string column read into
@@ -3605,8 +3643,8 @@ item `e AS a` of the query, and `e` fits `x`. Any other body is refused
 here; `lowerForBlock` refuses it too. -/
 def forStoresOk (d : Dialect) (env wenv : TyEnv) (r : String) (q : Ast.Select)
     (body : List Ast.Node) : Bool :=
-  let items := match selParts q with
-    | some (items, _, _, _, _) => items
+  let items := match querySpec (withRecord d r) q with
+    | some s => s.items
     | none => []
   body.all fun n => match fieldAssign (pgName r) n with
     | some (x, a) =>
@@ -3643,21 +3681,25 @@ def callStoresOk (d : Dialect) (wenv : TyEnv) (n : List String) (args : List Ast
         | some x => copyOk d wenv x
         | none => false
 
+/-- The stores of a `SELECT` statement: each `@x = e` of the select list
+(T-SQL), each `INTO` target with the item in its position (PL/pgSQL). -/
+def pickStores (d : Dialect) (s : QSpec) : List (Var × Ast.Expr) :=
+  let assigned := s.items.filterMap fun
+    | .SelItem e _ (some v) => (target d (.Var v)).map (·, e)
+    | _ => none
+  let intos := (s.into.zip s.items).filterMap fun
+    | (x, .SelItem e _ _) => (target d x).map (·, e)
+  assigned ++ intos
+
 def storesStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
   -- C3c: a scalar subquery's one item, and the picks of `SELECT @x = e` and
   -- `SELECT ... INTO x`.
-  | .Assign t (.Subquery q) => match target d t, selParts q with
-    | some x, some ([.SelItem e _ _], _, _, _, _) => pickStoresOk d env wenv q [(x, e)]
+  | .Assign t (.Subquery q) => match target d t, querySpec d q with
+    | some x, some { items := [.SelItem e _ _], .. } => pickStoresOk d env wenv q [(x, e)]
     | some x, _ => storeOk d env (lookup wenv x) (.Subquery q)
     | none, _ => true -- refused by `lowerStmt`
-  | .SSelect q => match selParts q with
-    | some (items, into, _, _, _) =>
-      let assigned := items.filterMap fun
-        | .SelItem e _ (some v) => (target d (.Var v)).map (·, e)
-        | _ => none
-      let intos := (into.zip items).filterMap fun
-        | (x, .SelItem e _ _) => (target d x).map (·, e)
-      pickStoresOk d env wenv q (assigned ++ intos)
+  | .SSelect q => match querySpec d q with
+    | some s => pickStoresOk d env wenv q (pickStores d s)
     | none => true -- refused by `lowerStmt`
   | .Assign t v => match target d t with
     | some x => storeOk d env (lookup wenv x) v
@@ -3987,13 +4029,11 @@ whose items are `COUNT(*)`, the `1` or `*` of `EXISTS`, or values of the
 slice. The lowering checks the rest of the shape (`lowerSelectT`,
 `lowerScalar`, `lowerExists`, `lowerForBlock`). -/
 def querySlice (d : Dialect) (env : TyEnv) (q : Ast.Select) : Bool :=
-  match selParts q with
-  | some (items, _, _, tgt, wh) => match tableOf d tgt with
-    | some t =>
-      let sc := scopeOf d t tgt
-      wh.all (condOk d env sc) &&
-        (existsItems items || items.all fun | .SelItem e _ _ => countStar e || anyValueOk d env sc e)
-    | none => false
+  match querySpec d q with
+  | some s =>
+    s.conds.all (fun (sc, c) => condOk d env sc c) &&
+      (existsItems s.items ||
+        s.items.all fun | .SelItem e _ _ => countStar e || anyValueOk d env s.sc e)
   | none => false
 
 def sliceStmt (d : Dialect) (env wenv : TyEnv) (ret : Option Ast.Ty) : Ast.Stmt → Bool
