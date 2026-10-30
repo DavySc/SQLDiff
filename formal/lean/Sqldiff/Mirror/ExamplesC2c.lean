@@ -403,13 +403,18 @@ def tP (e : Ast.Expr) : Option (SExpr × STy) := typed (.pg Γv []) envP {} e
 #guard tT (fn "ISNULL" [tv "@s", num 7]) == some (.coalesce (.var "@s") (.int 7), .int .i16)
 #guard (tT (fn "ISNULL" [tv "@s", num 40000])).isNone
 -- Bits: the converter's comparison forms, on either side (V3).
-#guard tT (.Bin "=" (tv "@b") (num 1)) == some (.var "@b", .bool)
-#guard tT (.Bin "=" (num 0) (tv "@b")) == some (.not (.var "@b"), .bool)
-#guard tT (.Bin "<>" (tv "@b") (num 1)) == some (.not (.var "@b"), .bool)
-#guard tT (.Bin "<>" (tv "@b") (num 0)) == some (.var "@b", .bool)
-#guard tP (.Bin "=" (pv "v_b") tru) == some (.var "v_b", .bool)
-#guard tP (.Bin "=" fls (pv "v_b")) == some (.not (.var "v_b"), .bool)
-#guard tP (.Bin "<>" (pv "v_b") tru) == some (.not (.var "v_b"), .bool)
+-- They stay comparisons, so `ASM-TSQL-ANSI-NULLS` is named (review of C2c).
+#guard tT (.Bin "=" (tv "@b") (num 1)) == some (.cmp .eq (.var "@b") (.bool true), .bool)
+#guard tT (.Bin "=" (num 0) (tv "@b")) == some (.cmp .eq (.var "@b") (.bool false), .bool)
+#guard tT (.Bin "<>" (tv "@b") (num 1)) == some (.cmp .ne (.var "@b") (.bool true), .bool)
+#guard tT (.Bin "<>" (tv "@b") (num 0)) == some (.cmp .ne (.var "@b") (.bool false), .bool)
+#guard tP (.Bin "=" (pv "v_b") tru) == some (.cmp .eq (.var "v_b") (.bool true), .bool)
+#guard tP (.Bin "=" fls (pv "v_b")) == some (.cmp .eq (.var "v_b") (.bool false), .bool)
+#guard tP (.Bin "<>" (pv "v_b") tru) == some (.cmp .ne (.var "v_b") (.bool true), .bool)
+-- Three-valued as on both engines (V3): NULL `<> 1` is UNKNOWN under `ANSI_NULLS ON`.
+#guard evl (.cmp .ne (.var "a") (.bool true)) N N == .ok N
+#guard evl (.cmp .ne (.var "a") (.bool true)) (.bool false) N == .ok (.bool true)
+#guard evl (.cmp .eq (.var "a") (.bool false)) (.bool false) N == .ok (.bool true)
 #guard (tT (.Bin "=" (tv "@b") (num 2))).isNone
 #guard (tT (.Bin "<" (tv "@b") (num 1))).isNone
 #guard (tT (.Bin "=" (tv "@b") (tv "@b"))).isNone

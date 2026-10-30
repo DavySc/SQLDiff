@@ -878,9 +878,11 @@ nonzero value to 1". Probed, V3 (`2`, `-5`, `'TRUE'` store 1; `0`,
   `bit`; probed, V3: `@b + 0` is `int`) and compares, so `@b = 1` is
   TRUE for 1, FALSE for 0, UNKNOWN for NULL; PostgreSQL `b = TRUE` is
   `b` itself, three-valued (9.1 "Logical Operators"). Both lower to the
-  variable, `@b = 0` and `b = FALSE` to its `NOT`, `<>` to the other
-  one. Probed, V3: the three-valued tables agree on both engines for 1,
-  0 and NULL, and `NOT NULL` is UNKNOWN. `@b = 2` (never TRUE), a
+  comparison `cmp eq|ne b (bool k)` (`bitCmp`), which keeps
+  `ASM-TSQL-ANSI-NULLS` in the residual: under `ANSI_NULLS OFF` a NULL
+  bit `<> 1` is TRUE in T-SQL, UNKNOWN in PostgreSQL (review of C2c:
+  SQL Server 1, PostgreSQL 0). Probed, V3: the three-valued tables agree
+  on both engines for 1, 0 and NULL, and `NOT NULL` is UNKNOWN. `@b = 2` (never TRUE), a
   comparison of two `bit`s, `bit` in `COALESCE`/`ISNULL` with a number,
   and arithmetic on a `bit` are outside.
 * `IS [NOT] NULL` as for integers. A `bit` is never a key column
@@ -1339,11 +1341,15 @@ def eqForm (o : String) (e : SExpr) : Option (SExpr × STy) :=
   else none
 
 /-- (C2c) The `bit` comparison forms: T-SQL `@b = 1` and PostgreSQL
-`b = TRUE` are `b`, `= 0`/`= FALSE` its negation, `<>` the other way;
-the literal on either side. -/
+`b = TRUE` are `cmp eq b (bool true)`, `= 0`/`= FALSE` the same with
+`false`, `<>` with `ne`; the literal on either side, put on the right.
+They stay comparisons (not `b` or `NOT b`, which mean the same under
+`ANSI_NULLS ON`), so `SExpr.hasEqNe` sees them and a confirmation names
+`ASM-TSQL-ANSI-NULLS`: under `ANSI_NULLS OFF` a NULL bit `<> 1` is TRUE in
+T-SQL (SQL Server 1, PostgreSQL 0, eval/values V3). -/
 def bitCmp (o : String) (x : SExpr) (lit : Bool) : Option (SExpr × STy) :=
-  if o == "=" then some (if lit then x else .not x, .bool)
-  else if o == "<>" then some (if lit then .not x else x, .bool)
+  if o == "=" then some (.cmp .eq x (.bool lit), .bool)
+  else if o == "<>" then some (.cmp .ne x (.bool lit), .bool)
   else none
 
 def binTy (d : Dialect) (o : String) : SExpr × STy → SExpr × STy → Option (SExpr × STy)

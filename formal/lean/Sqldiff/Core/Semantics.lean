@@ -151,13 +151,19 @@ def intOp2 (f : Int → Int → Res U) : Val U → Val U → Res U
   | _, _ => typeErr
 
 /-- A comparison of two values of one kind (C2c): integers, dates or
-timestamps; NULL if either is NULL; another pairing is a type error. -/
+timestamps; `=` and `<>` of two booleans (a bit against `0`/`1`, a
+boolean against `TRUE`/`FALSE`); NULL if either is NULL; another pairing
+is a type error. -/
 def cmpVal (o : COp) : Val U → Val U → Res U
   | .null, _ => .ok .null
   | _, .null => .ok .null
   | .int x, .int y => .ok (.bool (cmpInt o x y))
   | .date x, .date y => .ok (.bool (cmpInt o x y))
   | .ts x, .ts y => .ok (.bool (cmpInt o x y))
+  | .bool x, .bool y => match o with
+    | .eq => .ok (.bool (x == y))
+    | .ne => .ok (.bool (x != y))
+    | _ => typeErr
   | _, _ => typeErr
 
 /-- `DATEADD` on a date or a timestamp (C2c): the day, month or year
