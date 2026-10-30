@@ -1056,6 +1056,15 @@ pub fn tsql_inner_refusal_with(text: &str, params: &[String]) -> Option<String> 
     if ts.iter().any(|t| t.kind == K::Word && t.up == "OUTPUT") {
         return Some("the text has an OUTPUT clause, which returns rows".into());
     }
+    // A call anywhere in the statement (`INSERT ... EXEC dbo.q`) runs the
+    // procedure through EXECUTE just the same; `INSERT ... EXECUTE ('...')`
+    // is nested dynamic SQL.
+    if ts
+        .iter()
+        .any(|t| t.kind == K::Word && (t.up == "EXEC" || t.up == "EXECUTE"))
+    {
+        return Some("the text calls a procedure or runs dynamic SQL inside its statement (`INSERT ... EXEC`): a procedure called through PostgreSQL EXECUTE cannot commit, and nested dynamic SQL is not compared".into());
+    }
     None
 }
 
@@ -1238,6 +1247,16 @@ mod tests {
         );
         assert!(tsql_inner_refusal("EXEC (N'DROP TABLE dbo.t')")
             .is_some_and(|w| w.contains("dynamic SQL itself")));
+        for text in [
+            "INSERT INTO dbo.t (a) EXEC dbo.q",
+            "INSERT INTO dbo.t EXEC dbo.q 1",
+            "INSERT dbo.t EXECUTE ('SELECT 1')",
+        ] {
+            assert!(
+                tsql_inner_refusal(text).is_some_and(|w| w.contains("INSERT ... EXEC")),
+                "{text}"
+            );
+        }
         assert_eq!(
             tsql_inner_refusal_with("UPDATE dbo.t SET a = @V", &["v".into()]),
             None
