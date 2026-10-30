@@ -671,32 +671,38 @@ fn listed_units_carry_their_hashes_and_what_no_decision_discharges() {
 
 #[test]
 fn the_page_gets_the_gates_first_blockers_and_how_many_there_are() {
-    let f = Fixture::new("gate-shown", &[("a.sql", ASSUMING), ("t.sql", PLAIN)]);
+    // A blocker or more per file: more than the review keeps.
+    let names: Vec<String> = (0..GATE_BLOCKERS_SHOWN + 5)
+        .map(|i| format!("p{i}.sql"))
+        .collect();
+    let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), ASSUMING)).collect();
+    let f = Fixture::new("gate-shown", &files);
     let r = f.open();
-    let mut st = r.state(false);
-    let g = st.gate.as_mut().expect("judged");
-    let first = g.blockers[0].clone();
-    g.blockers = vec![first; GATE_BLOCKERS_SHOWN + 5];
-    let full = serde_json::to_value(&*g).unwrap();
-    let v = serde_json::to_value(&st).unwrap();
-    let shown = v["gate"]["blockers"].as_array().unwrap();
-    assert_eq!(shown.len(), GATE_BLOCKERS_SHOWN);
-    assert_eq!(v["gate"]["blockers_total"], GATE_BLOCKERS_SHOWN + 5);
-    // Everything else as the gate has it.
-    let mut expect = full;
-    expect["blockers"] = serde_json::Value::Array(shown.clone());
-    expect["blockers_total"] = (GATE_BLOCKERS_SHOWN + 5).into();
-    assert_eq!(v["gate"], expect);
-    // `/api/gate` gives the state's gate, error and time.
+    // The gate as `sqldiff review-status` judges it, every blocker listed.
+    let a = f.args();
+    let (inputs, unreadable) = tree::read(&a).unwrap();
+    let mut t = tree::convert(&a, &inputs, unreadable, Some(&f.out())).unwrap();
+    tree::review(&mut t, &inputs, &Ledger::default(), "(none)");
+    let full = sqldiff_convert::gate::check(&t, &a, &f.out(), None).unwrap();
+    assert!(
+        full.blockers.len() > GATE_BLOCKERS_SHOWN,
+        "{}",
+        full.blockers.len()
+    );
+    let g = r.gate().unwrap();
+    assert_eq!(g.blockers.len(), GATE_BLOCKERS_SHOWN);
+    assert_eq!(g.blockers_total, full.blockers.len());
+    // The first blockers, and everything else as the gate has it.
+    let mut expect = serde_json::to_value(&full).unwrap();
+    expect["blockers"] = serde_json::to_value(&full.blockers[..GATE_BLOCKERS_SHOWN]).unwrap();
+    expect["blockers_total"] = full.blockers.len().into();
     let st = serde_json::to_value(r.state(false)).unwrap();
+    assert_eq!(st["gate"], expect);
+    // `/api/gate` gives the state's gate, error and time.
     let gate = serde_json::to_value(r.gate_state()).unwrap();
     for k in ["gate", "gate_error", "gate_judged"] {
         assert_eq!(gate[k], st[k], "{k}");
     }
-    assert_eq!(
-        st["gate"]["blockers_total"],
-        st["gate"]["blockers"].as_array().unwrap().len()
-    );
 }
 
 #[test]

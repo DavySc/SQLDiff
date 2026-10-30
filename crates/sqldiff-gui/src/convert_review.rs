@@ -94,7 +94,7 @@ struct Loaded {
     /// The done gate as `sqldiff review-status` judged the tree on this
     /// read, or why it could not be judged; when, and the files it judged
     /// (`stamp`): once they change, the verdict no longer stands.
-    gate: Result<Gate, String>,
+    gate: Result<ShownGate, String>,
     judged: String,
     stamp: Stamp,
 }
@@ -207,8 +207,7 @@ pub struct StateView {
     /// The done gate (`sqldiff review-status`): the only place "done" comes
     /// from. `gate_error` says why it could not be judged. Sent with its
     /// first [`GATE_BLOCKERS_SHOWN`] blockers and `blockers_total`.
-    #[serde(serialize_with = "gate_shown")]
-    pub gate: Option<Gate>,
+    pub gate: Option<ShownGate>,
     pub gate_error: Option<String>,
     pub gate_judged: String,
     /// The packs loaded (a private pack by path only).
@@ -218,8 +217,7 @@ pub struct StateView {
 /// The done gate alone, as [`StateView`] has it (`GET /api/gate`).
 #[derive(Debug, Clone, Serialize)]
 pub struct GateState {
-    #[serde(serialize_with = "gate_shown")]
-    pub gate: Option<Gate>,
+    pub gate: Option<ShownGate>,
     pub gate_error: Option<String>,
     pub gate_judged: String,
 }
@@ -229,41 +227,49 @@ pub struct GateState {
 /// page's payload several times larger than everything else on it.
 pub const GATE_BLOCKERS_SHOWN: usize = 100;
 
-fn gate_shown<S: serde::Serializer>(g: &Option<Gate>, s: S) -> Result<S::Ok, S::Error> {
-    #[derive(Serialize)]
-    struct Shown<'a> {
-        complete: bool,
-        blockers: &'a [gate::Blocker],
-        blockers_total: usize,
-        counts: &'a BTreeMap<String, usize>,
-        accepted: &'a [gate::Accepted],
-        units: usize,
-        nothing_found: usize,
-        instances: Option<bool>,
+/// The done gate as the review keeps and shows it: its first
+/// [`GATE_BLOCKERS_SHOWN`] blockers and how many there are, the rest as
+/// `sqldiff review-status` judged it. Only these are kept, not every
+/// blocker: on a large tree they took a sixth of what the review held, and
+/// every request copied them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShownGate {
+    pub complete: bool,
+    pub blockers: Vec<gate::Blocker>,
+    pub blockers_total: usize,
+    pub counts: BTreeMap<String, usize>,
+    pub accepted: Vec<gate::Accepted>,
+    pub units: usize,
+    pub nothing_found: usize,
+    pub instances: Option<bool>,
+}
+
+impl From<Gate> for ShownGate {
+    fn from(g: Gate) -> ShownGate {
+        // Every field named, so a field added to `Gate` cannot be left out here.
+        let Gate {
+            complete,
+            mut blockers,
+            counts,
+            accepted,
+            units,
+            nothing_found,
+            instances,
+        } = g;
+        let blockers_total = blockers.len();
+        blockers.truncate(GATE_BLOCKERS_SHOWN);
+        blockers.shrink_to_fit();
+        ShownGate {
+            complete,
+            blockers,
+            blockers_total,
+            counts,
+            accepted,
+            units,
+            nothing_found,
+            instances,
+        }
     }
-    // Every field named, so a field added to `Gate` cannot be left out here.
-    let Some(Gate {
-        complete,
-        blockers,
-        counts,
-        accepted,
-        units,
-        nothing_found,
-        instances,
-    }) = g
-    else {
-        return s.serialize_none();
-    };
-    s.serialize_some(&Shown {
-        complete: *complete,
-        blockers: &blockers[..blockers.len().min(GATE_BLOCKERS_SHOWN)],
-        blockers_total: blockers.len(),
-        counts,
-        accepted,
-        units: *units,
-        nothing_found: *nothing_found,
-        instances: *instances,
-    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -500,7 +506,7 @@ impl Review {
 
     /// The done gate as last judged, or why it could not be judged; never
     /// a verdict on files that changed since (`GATE_STALE`).
-    pub fn gate(&self) -> Result<Gate, String> {
+    pub fn gate(&self) -> Result<ShownGate, String> {
         match stamp(&self.setup) == self.loaded.stamp {
             true => self.loaded.gate.clone(),
             false => Err(GATE_STALE.into()),
@@ -1087,8 +1093,10 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
             (t, started.elapsed().as_secs_f64() * 1000.0, true)
         }
     };
+    // A conversion handed over (a run's, a stored one) may not be trimmed yet.
+    trim(&mut t);
     let not_applied = tree::review_in(&mut t, &inputs, &s.out)?;
-    let gate = judge(&mut t, &inputs, s, instances.as_ref());
+    let gate = judge(&mut t, &inputs, s, instances.as_ref()).map(ShownGate::from);
     let ids: Vec<Vec<String>> = inputs
         .iter()
         .zip(&t.conversions)
@@ -1130,6 +1138,29 @@ fn load(s: &Setup, prev: Option<Loaded>, hooks: &tree::Hooks) -> Result<Loaded, 
         judged: sqldiff_review::time::now(),
         stamp,
     })
+}
+
+/// Drops what nothing reads of a conversion once it is converted: of the
+/// engine's two reports per file (its diff, and the output's own check)
+/// only the findings stay, which units point into and the unit view shows;
+/// the statuses, notes and report were taken from the rest already. On a
+/// large tree this is a fifth of what the review holds. Done before the
+/// ledger is applied and the gate judged, which reuse the memory. A stored
+/// conversion is stored trimmed: reopening it reads what this one does.
+fn trim(t: &mut Tree) {
+    for c in &mut t.conversions {
+        for r in [&mut c.report, &mut c.output_check] {
+            r.witnesses = Vec::new();
+            r.diagnostics = Vec::new();
+            r.normalizations = Vec::new();
+            r.assumptions = Vec::new();
+            r.unknown_reasons = Vec::new();
+            r.discharged = Vec::new();
+            r.suppressed = Vec::new();
+            r.refinements = Vec::new();
+            r.proof = None;
+        }
+    }
 }
 
 /// Back to the conversion as it came from the engine: no ledger applied.
