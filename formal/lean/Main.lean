@@ -172,7 +172,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.13.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.14.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

@@ -37,13 +37,35 @@ string in lower-case hex, two digits per byte:
                                      `varchar(DIGITS)`
                      w DIGITS        (C3c) T-SQL `nvarchar(DIGITS)`, PostgreSQL
                                      `varchar(DIGITS)`
-                                     (`CatCol.str`; a string key column, a
+                                     (`CatCol.kind`; a string key column, a
                                      length outside 1..4000, decodes but the
                                      table is not usable: `CatTable.wellFormed`)
+                     j               (C2c) `bigint` (PostgreSQL `bigint`/`int8`)
+                     h               (C2c) `smallint` (`smallint`/`int2`)
+                     b               (C2c) T-SQL `bit`, PostgreSQL `boolean`
+                                     (a bit key column decodes but the table
+                                     is not usable)
+                     d               (C2c) `date`
+                     t DIGIT         (C2c) T-SQL `datetime2(DIGIT)`, PostgreSQL
+                                     `timestamp(DIGIT)`, DIGIT 0..6 (7 decodes
+                                     but the table is not usable)
                 DEFAULT i INT        (C3c) an integer literal, `-` allowed:
-                                     `i0`, `i-1` (`Sqldiff.Mirror.intLit?`)
+                                     `i0`, `i-1` (`Sqldiff.Mirror.intLit?`;
+                                     (C2c) for a `j` column the 64-bit range,
+                                     `int64Lit?`; any literal decodes, one
+                                     outside its column's range makes the
+                                     table unusable)
                         s HEX        (C3c) a string literal, its UTF-8 bytes
                                      as for NAME (`s` alone: the empty string)
+                        b0, b1       (C2c) a bit default, T-SQL `0`/`1` and
+                                     PostgreSQL `FALSE`/`TRUE`
+                        d HEX        (C2c) a date literal `YYYY-MM-DD`, its
+                                     bytes as for NAME (`dateLit?`)
+                        t HEX        (C2c) a timestamp literal
+                                     `YYYY-MM-DDThh:mm:ss[.f]` with at most
+                                     six fractional digits (`tsLit?`; more
+                                     digits than the column keeps make the
+                                     table unusable)
                                      Both tables declare the default; DEFAULT
                                      NULL is sent as no DEFAULT (`CatCol.dflt`)
                 FACT !binary-collation (C2b) `Catalog.binaryCollation`: the
@@ -69,7 +91,10 @@ A TABLE entry asserts every fact `Sqldiff.Mirror.CatTable` lists (no
 other constraint, default, trigger, ...): the Rust side sends a table only
 when the catalogs show all of them. (C3c) A checker older than C3c
 answers a request with a `v`/`w` column or a DEFAULT "the catalog does
-not decode"; a C3c checker reads every older request as before.
+not decode"; a C3c checker reads every older request as before. (C2c) A
+checker older than C2c answers a request with a `j`, `h`, `b`, `d` or
+`t` column, or a `b`/`d`/`t` DEFAULT, "the catalog does not decode"; a
+C2c checker reads every older request as before.
 
 The answer: `check`, plus the fields `extra` adds to a confirmed answer
 (`"scalars"`, `"residual"` for a C2a answer, `"statements"` and
@@ -139,27 +164,39 @@ def flags? : List Char → Option (Bool × Bool)
   | ['n', 'k'] => some (true, true)
   | _ => none
 
-/-- A column's type, constraints and (C3c) string type: `(str, notNull,
-key)`. `i` with the C3a flags decodes as before. -/
-def spec? (s : String) : Option (Option (Nat × Bool) × Bool × Bool) :=
+/-- A column's type (`ColKind`) and constraints: `(kind, notNull, key)`.
+`i` with the C3a flags decodes as before. -/
+def spec? (s : String) : Option (ColKind × Bool × Bool) :=
+  let plain (k : ColKind) (fl : List Char) : Option (ColKind × Bool × Bool) :=
+    (flags? fl).map fun (n, key) => (k, n, key)
   match s.toList with
-  | 'i' :: fl => (flags? fl).map fun (n, k) => (none, n, k)
+  | 'i' :: fl => plain (.int .i32) fl
+  | 'j' :: fl => plain (.int .i64) fl
+  | 'h' :: fl => plain (.int .i16) fl
+  | 'b' :: fl => plain .bit fl
+  | 'd' :: fl => plain .date fl
+  | 't' :: p :: fl => if p.isDigit then plain (.ts (p.toNat - '0'.toNat)) fl else none
   | c :: rest =>
     if c == 'v' || c == 'w' then
       let ds := rest.takeWhile Char.isDigit
       if ds.isEmpty then none else do
         let len ← digitsVal ds 0
         let (n, k) ← flags? (rest.drop ds.length)
-        pure (some (len, c == 'w'), n, k)
+        pure (.str len (c == 'w'), n, k)
     else none
   | [] => none
 
 /-- (C3c) A column's default: `i` and an integer literal, `s` and the hex
-of a string. -/
+of a string; (C2c) `b0`/`b1`, `d` and the hex of a date literal, `t` and
+the hex of a timestamp literal. -/
 def dflt? (s : String) : Option Core.SExpr :=
   match s.toList with
-  | 'i' :: ds => (intLit? (String.ofList ds)).map .int
+  | 'i' :: ds => (int64Lit? (String.ofList ds)).map .int
   | 's' :: hs => (name? (String.ofList hs)).map .str
+  | ['b', '0'] => some (.bool false)
+  | ['b', '1'] => some (.bool true)
+  | 'd' :: hs => (name? (String.ofList hs)).bind fun t => (dateLit? t).map .date
+  | 't' :: hs => (name? (String.ofList hs)).bind fun t => (tsLit? 6 t).map .ts
   | _ => none
 
 def col? (s : String) : Option CatCol := do
@@ -169,14 +206,14 @@ def col? (s : String) : Option CatCol := do
     | [n, sp, t, df] => some (n, sp, some t, some df)
     | _ => none
   let name ← name? n
-  let (str, notNull, key) ← spec? sp
+  let (kind, notNull, key) ← spec? sp
   let tsql ← match t with
     | some t => name? t
     | none => some (if name.startsWith "\"" then String.ofList (name.toList.drop 1) else name)
   let dflt ← match df with
     | some df => (dflt? df).map some
     | none => some none
-  pure { name, tsql, notNull, key, str, dflt }
+  pure { name, tsql, notNull, key, kind, dflt }
 
 /-- A catalog entry: a routine, a table, or (C2b) the collation fact. -/
 inductive Entry where
@@ -330,19 +367,19 @@ def extra (dep cat ra rb : String) (ans : Answer) : String :=
 -- nvarchar(30)` with DEFAULT 'Paris', `qty int` NOT NULL DEFAULT -1.
 #guard (catalog? ("74=6964.ink/6e616d65.v20n/63697479.w30.43697479.s5061726973/" ++
     "717479.in.517479.i-1")).map
-    (fun g => g.tables.map fun t => t.cols.map fun c => (c.name, c.tsql, c.notNull, c.key, c.str,
+    (fun g => g.tables.map fun t => t.cols.map fun c => (c.name, c.tsql, c.notNull, c.key, c.kind,
       c.dflt)) ==
-  some [[("id", "id", true, true, none, none),
-    ("name", "name", true, false, some (20, false), none),
-    ("city", "City", false, false, some (30, true), some (.str "Paris")),
-    ("qty", "Qty", true, false, none, some (.int (-1)))]]
+  some [[("id", "id", true, true, .int .i32, none),
+    ("name", "name", true, false, .str 20 false, none),
+    ("city", "City", false, false, .str 30 true, some (.str "Paris")),
+    ("qty", "Qty", true, false, .int .i32, some (.int (-1)))]]
 -- The line `crates/sqldiff-core/src/proof.rs` writes for the same table
 -- (its test `a_mirror_request_encodes_tables_as_the_checker_reads_them`).
 #guard (catalog? ("70:ib,61636374=6964.ink.6964/6e616d65.v20n.6e616d65/" ++
     "63697479.w30.43697479.s5061726973/717479.in.517479.i-1")).map
-    (fun g => g.tables.map fun t => (t.wellFormed, t.cols.map fun c => (c.name, c.str, c.dflt))) ==
-  some [(true, [("id", none, none), ("name", some (20, false), none),
-    ("city", some (30, true), some (.str "Paris")), ("qty", none, some (.int (-1)))])]
+    (fun g => g.tables.map fun t => (t.wellFormed, t.cols.map fun c => (c.name, c.kind, c.dflt))) ==
+  some [(true, [("id", .int .i32, none), ("name", .str 20 false, none),
+    ("city", .str 30 true, some (.str "Paris")), ("qty", .int .i32, some (.int (-1)))])]
 -- The empty string as a default; a string key decodes (and is refused by `wellFormed`).
 #guard (catalog? "74=63.v5.63.s").map (fun g => g.tables.map fun t => t.cols.map (·.dflt)) ==
   some [[some (.str "")]]
@@ -352,7 +389,10 @@ def extra (dep cat ra rb : String) (ans : Answer) : String :=
 #guard (catalog? "74=63.vn").isNone
 #guard (catalog? "74=63.v5x").isNone
 #guard (catalog? "74=63.x5").isNone
-#guard (catalog? "74=63.i.63.i2147483648").isNone
+-- A 32-bit column with a bigint-sized default decodes; the table is unusable.
+#guard (catalog? "74=63.i.63.i2147483648").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=63.j.63.i2147483648").map (fun g => g.tables.map (·.wellFormed)) == some [true]
+#guard (catalog? "74=63.i.63.i9223372036854775808").isNone
 #guard (catalog? "74=63.i.63.x1").isNone
 #guard (catalog? "74=63.i.63.s4").isNone
 #guard (catalog? "74=63.i.63.i1.0").isNone
@@ -367,5 +407,35 @@ def extra (dep cat ra rb : String) (ans : Answer) : String :=
 #guard (catalog? "74=63.w4000").map (fun g => g.tables.map (·.wellFormed)) == some [true]
 #guard (catalog? "74=").isNone
 #guard (catalog? "74=6964").isNone
+-- C2c: typed columns. `d date PRIMARY KEY`, `n bigint`, `s smallint NOT NULL
+-- DEFAULT 0`, `b bit NOT NULL DEFAULT 0`, `t datetime2(6) DEFAULT
+-- '2000-01-01T00:00:00'` (eval/values V8), as proof.rs writes them.
+#guard (catalog? ("6576=64.dnk.64/6e.j.6e/73.hn.73.i0/62.bn.62.b0/" ++
+    "74.t6.74.t323030302d30312d30315430303a30303a3030")).map
+    (fun g => g.tables.map fun t => (t.wellFormed, t.cols.map fun c => (c.name, c.kind, c.dflt))) ==
+  some [(true, [("d", .date, none), ("n", .int .i64, none), ("s", .int .i16, some (.int 0)),
+    ("b", .bit, some (.bool false)),
+    ("t", .ts 6, some (.ts (Core.Calendar.daysFromCivil 2000 1 1 * Core.Calendar.usPerDay)))])]
+-- A date default (`'2024-02-29'`), and the unusable ones: a bit key, a
+-- `datetime2(7)`, a smallint default out of range, a default of another
+-- kind, a timestamp default with more digits than the column keeps.
+#guard (catalog? "74=64.d.64.d323032342d30322d3239").map
+    (fun g => g.tables.map fun t => (t.wellFormed, t.cols.map (·.dflt))) ==
+  some [(true, [some (.date (Core.Calendar.daysFromCivil 2024 2 29))])]
+#guard (catalog? "74=62.bnk").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=74.t7").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=73.h.73.i40000").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=73.h.73.i-32768").map (fun g => g.tables.map (·.wellFormed)) == some [true]
+#guard (catalog? "74=62.b.62.i1").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=64.d.64.s32303234").map (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=74.t3.74.t323032342d30312d30315430303a30303a30302e31323334").map
+    (fun g => g.tables.map (·.wellFormed)) == some [false]
+#guard (catalog? "74=74.t3.74.t323032342d30312d30315430303a30303a30302e313233").map
+    (fun g => g.tables.map (·.wellFormed)) == some [true]
+-- Malformed: a non-ISO date default, a bit default other than 0/1, no digit after `t`.
+#guard (catalog? "74=64.d.64.d32303234").isNone
+#guard (catalog? "74=62.b.62.b2").isNone
+#guard (catalog? "74=74.t").isNone
+#guard (catalog? "74=74.tx").isNone
 
 end Sqldiff.Mirror.Request

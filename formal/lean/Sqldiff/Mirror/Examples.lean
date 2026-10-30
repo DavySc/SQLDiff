@@ -475,19 +475,19 @@ def calleeP : Ast.Routine :=
 -- The slice's meaning, operator by operator (`SExpr.eval`).
 def σ2 (a b : V) : Core.Store Unit := fun x => if x = "a" then a else if x = "b" then b else .null
 def ev (s : SExpr) (a b : V) : Core.Res Unit := s.eval (σ2 a b) Core.nullStore
-#guard ev (.arith .div (.var "a") (.var "b")) (I 7) (I 2) == .ok (I 3)
-#guard ev (.arith .div (.var "a") (.var "b")) (I (-7)) (I 2) == .ok (I (-3))
-#guard ev (.arith .mod (.var "a") (.int 2)) (I (-7)) N == .ok (I (-1))
-#guard ev (.arith .mod (.var "a") (.int (-2))) (I 7) N == .ok (I 1)
-#guard ev (.arith .div (.var "a") (.var "b")) (I 1) (I 0) == .err .divByZero
-#guard ev (.arith .add (.var "a") (.var "b")) (I 2147483647) (I 1) == .err .overflow
-#guard ev (.arith .mul (.var "a") (.var "b")) (I 65536) (I 32768) == .err .overflow
-#guard ev (.arith .sub (.var "a") (.var "b")) (I (-2147483648)) (I 1) == .err .overflow
-#guard ev (.arith .div (.var "a") (.var "b")) (I (-2147483648)) (I (-1)) == .err .overflow
-#guard ev (.neg (.var "a")) (I (-2147483648)) N == .err .overflow
+#guard ev (.arith .i32 .div (.var "a") (.var "b")) (I 7) (I 2) == .ok (I 3)
+#guard ev (.arith .i32 .div (.var "a") (.var "b")) (I (-7)) (I 2) == .ok (I (-3))
+#guard ev (.arith .i32 .mod (.var "a") (.int 2)) (I (-7)) N == .ok (I (-1))
+#guard ev (.arith .i32 .mod (.var "a") (.int (-2))) (I 7) N == .ok (I 1)
+#guard ev (.arith .i32 .div (.var "a") (.var "b")) (I 1) (I 0) == .err .divByZero
+#guard ev (.arith .i32 .add (.var "a") (.var "b")) (I 2147483647) (I 1) == .err .overflow
+#guard ev (.arith .i32 .mul (.var "a") (.var "b")) (I 65536) (I 32768) == .err .overflow
+#guard ev (.arith .i32 .sub (.var "a") (.var "b")) (I (-2147483648)) (I 1) == .err .overflow
+#guard ev (.arith .i32 .div (.var "a") (.var "b")) (I (-2147483648)) (I (-1)) == .err .overflow
+#guard ev (.neg .i32 (.var "a")) (I (-2147483648)) N == .err .overflow
 -- A NULL operand gives NULL, but the other operand is still evaluated.
-#guard ev (.arith .add (.var "a") (.var "b")) N (I 1) == .ok N
-#guard ev (.arith .add (.var "a") (.arith .div (.var "b") (.int 0))) N (I 1) == .err .divByZero
+#guard ev (.arith .i32 .add (.var "a") (.var "b")) N (I 1) == .ok N
+#guard ev (.arith .i32 .add (.var "a") (.arith .i32 .div (.var "b") (.int 0))) N (I 1) == .err .divByZero
 -- Three-valued comparisons and connectives.
 #guard ev (.cmp .eq (.var "a") (.var "b")) N N == .ok N
 #guard ev (.cmp .ne (.var "a") (.var "b")) (I 1) N == .ok N
@@ -502,9 +502,9 @@ def ev (s : SExpr) (a b : V) : Core.Res Unit := s.eval (σ2 a b) Core.nullStore
 #guard ev (.isNull (.var "a") false) N N == .ok (.bool true)
 #guard ev (.isNull (.var "a") true) N N == .ok (.bool false)
 -- `COALESCE` and `CASE` evaluate only what they need.
-#guard ev (.coalesce (.var "a") (.arith .div (.int 1) (.var "b"))) (I 3) (I 0) == .ok (I 3)
-#guard ev (.coalesce (.var "a") (.arith .div (.int 1) (.var "b"))) N (I 0) == .err .divByZero
-#guard ev (.cond (.cmp .eq (.var "b") (.int 0)) .null (.arith .div (.var "a") (.var "b")))
+#guard ev (.coalesce (.var "a") (.arith .i32 .div (.int 1) (.var "b"))) (I 3) (I 0) == .ok (I 3)
+#guard ev (.coalesce (.var "a") (.arith .i32 .div (.int 1) (.var "b"))) N (I 0) == .err .divByZero
+#guard ev (.cond (.cmp .eq (.var "b") (.int 0)) .null (.arith .i32 .div (.var "a") (.var "b")))
   (I 1) (I 0) == .ok N
 -- An UNKNOWN `WHEN` goes on to the next branch.
 #guard ev (.cond (.cmp .eq (.var "b") (.int 0)) (.int 1) (.int 2)) (I 1) N == .ok (I 2)
@@ -579,11 +579,10 @@ lower like `COALESCE`. -/
 #guard reasonOf (checkPair true (fn "ISNULL" [ta, .Bin "+" tb (num 1)])
     (fn "COALESCE" [pa, .Bin "+" pb (num 1)])) ==
   "the lowered routines differ beyond the renaming"
-/- With `bigint` (outside the slice) `ISNULL` and `COALESCE` stay two
-operators: `ASM-ISNULL-TYPE` is not discharged there. -/
-#guard reasonOf (check dep ∅ pairCert (pairT false (fn "ISNULL" [ta, tb]) bigint)
-    (pairP (fn "COALESCE" [pa, pb]) bigint)) ==
-  "the lowered routines differ beyond the renaming"
+/- With `bigint` (in the slice since C2c) `ISNULL` and `COALESCE` are one
+`coalesce`, as for `int`. -/
+#guard isC2a (check dep ∅ pairCert (pairT false (fn "ISNULL" [ta, tb]) bigint)
+    (pairP (fn "COALESCE" [pa, pb]) bigint))
 -- PostgreSQL has no `ISNULL` function: never the slice's `coalesce`.
 #guard (typed (.pg ∅ []) [("a", integer), ("b", integer)] {} (fn "ISNULL" [pa, pb])).isNone
 
@@ -651,7 +650,10 @@ def badCase (a : Ast.Expr) : Ast.Expr :=
 #guard intLit? "1e3" == none
 #guard intLit? "--5" == none
 #guard intLit? "" == none
-#guard isC1 (checkPair false (.Num "2147483648") (.Num "2147483648"))
+-- C2c: `2147483648` into an `int` variable is a PostgreSQL `bigint` that
+-- may not fit (22003), a T-SQL `numeric` outside the slice (8115 on the
+-- store): the store is outside the spec ("Stores between widths").
+#guard reasonOf (checkPair false (.Num "2147483648") (.Num "2147483648")) == reasonOutsideP
 -- `AND` with an operand that can raise: evaluation order is unspecified.
 #guard isC1 (check dep ∅ pairCert
   (tsqlProc ["r"] [inT "@a", inT "@b", ioT "@r"] [xactAbort,
@@ -700,8 +702,8 @@ def fnCert : Cert := ⟨[("@a", "a")]⟩
   (fnP [ret (some (fn "COALESCE" [pa, num 0]))]))
 #guard isC1 (check dep ∅ fnCert (fnT [ret (some (.Bin "+" ta (num 1)))])
   (fnP [ret (some (.Bin "+" pa (num 1)))]))
--- A function returning `bigint` is not in the slice.
-#guard isC1 (check dep ∅ fnCert
+-- A function returning `bigint` is in the slice (C2c).
+#guard isC2a (check dep ∅ fnCert
   (.Routine .Function ["f"] [inT "@a"] (some bigint) .Caller none
     (.Block [] [ret (some (fn "ISNULL" [ta, num 0]))]))
   (.Routine .Function ["f"] [inP "a"] (some bigint) .Caller none

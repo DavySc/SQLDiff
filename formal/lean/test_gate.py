@@ -10,7 +10,9 @@ rollback-and-rethrow idiom with COMMIT), with the C4 residuals and the
 `errors` field; C3b queries (`SELECT @x = col` against the PL/pgSQL `FOR`
 block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`;
 C3c string columns and constant defaults in the CATALOG; (0.13.0) the
-`why` reason codes on an unconfirmed answer whose routine is outside the
+`why` reason codes; (0.14.0) C2c typed values (integer widths, bit against
+boolean, date and datetime2 with DATEADD/DATEDIFF, typed columns in the
+CATALOG); the `why` reason codes on an unconfirmed answer whose routine is outside the
 spec (Sqldiff/Mirror/Diagnose.lean), and their absence on every other
 answer, confirmed or not.
 Anything else is unconfirmed, including malformed requests.
@@ -682,7 +684,132 @@ cases += [
         C("NStmt", C("Update", L(S("acct")), S("a"), L(C("Set", L(S("qty")), num(1))), L(), NONE))])),
      "unconfirmed"),
 ]
+# C2c: typed values. T-SQL dbo.Ev (Id int PRIMARY KEY, D date, T datetime2(6),
+# B bit NOT NULL, N bigint, S smallint DEFAULT 0) is the target table ev; the
+# pair is eval/values' procedure as the converter writes it (ExamplesC2c.lean).
+V_DEP = f"0;{hx('dbo.Ev')}:{hx('ev')}"
+V_CAT = (f"{hx('ev')}={hx('id')}.ink.{hx('Id')}/{hx('d')}.d.{hx('D')}/{hx('t')}.t6.{hx('T')}"
+         f"/{hx('b')}.bn.{hx('B')}/{hx('n')}.j.{hx('N')}/{hx('s')}.h.{hx('S')}.i0")
+V_CERT = ",".join(f"{hx(a)}:{hx(b)}" for a, b in
+                  [("@id", "p_id"), ("@big", "p_big"), ("@flag", "p_flag"), ("@when", "p_when"),
+                   ("@ts", "p_ts"), ("%status", "%status"), ("@d", "v_d"), ("@b", "v_b"),
+                   ("@s", "v_s"), ("@n", "v_n"), ("@t", "v_t"), ("@i", "v_i")])
+DATE, DT2_6, DT2_7, TS6, BIT, BOOL, BIGINT, SMALLINT = (
+    ty("DATE"), ty("DATETIME2", "6"), ty("DATETIME2", "7"), ty("TIMESTAMP", "6"), ty("BIT"),
+    ty("BOOLEAN"), ty("BIGINT"), ty("SMALLINT"))
+TRUE, FALSE = C("Special", S("TRUE")), C("Special", S("FALSE"))
+
+
+def cast(e, t):
+    return C("Cast", e, t)
+
+
+def dateadd(part, n, d):
+    return fn("DATEADD", pv(part), n, d)
+
+
+def make_interval(part, n):
+    z = num(0)
+    return fn("make_interval", n if part == "years" else z, n if part == "months" else z, z,
+              n if part == "days" else z, z, z, C("Num", S("0.0")))
+
+
+def if_(c, then):
+    return C("If", c, L(*then), L())
+
+
+def decl(x, t, v=NONE):
+    return C("NStmt", C("Declare", S(x), t, v))
+
+
+V_KEY_T = bin_("=", col("Id"), tv("@id"))
+V_KEY_P = bin_("=", pv("Id"), pv("p_id"))
+
+
+def v_t(extra=(), t_decl=DT2_6, s_value=num(5), b_value=num(0)):
+    return proc(["dbo", "p"], [param("@id", "In"), sparam("@big", "In", BIGINT), sparam("@flag", "In", BIT),
+                               sparam("@when", "In", DATE), sparam("@ts", "InOut", DT2_6)], [], [
+        ABORT, C("Setting", S("NOCOUNT"), "t"),
+        decl("@d", DATE, string("2024-01-31")), decl("@b", BIT, num(1)), decl("@s", SMALLINT, s_value),
+        decl("@n", BIGINT), decl("@t", t_decl, string("2024-01-01T23:59:00.123456")), decl("@i", INT),
+        assign(tv("@n"), bin_("+", tv("@big"), num(1))),
+        assign(tv("@b"), b_value),
+        assign(tv("@d"), dateadd("day", num(1), tv("@d"))),
+        assign(tv("@d"), dateadd("month", tv("@id"), tv("@d"))),
+        assign(tv("@d"), dateadd("year", C("Num", S("-1")), tv("@d"))),
+        assign(tv("@t"), dateadd("day", num(2), tv("@t"))),
+        assign(tv("@i"), fn("DATEDIFF", pv("day"), tv("@d"), tv("@t"))),
+        assign(tv("@d"), cast(tv("@t"), DATE)),
+        if_(bin_("=", tv("@b"), num(1)), [assign(tv("@i"), num(1))]),
+        if_(bin_("AND", bin_("=", tv("@flag"), num(1)), bin_("<", tv("@d"), tv("@when"))),
+            [assign(tv("@i"), num(4))]),
+        if_(bin_("=", tv("@d"), string("2024-01-01")), [assign(tv("@i"), num(5))]),
+        if_(bin_(">=", tv("@t"), string("2024-01-01T00:00:00")), [assign(tv("@i"), num(6))]),
+        if_(C("IsNull", tv("@ts"), "f"), [assign(tv("@ts"), tv("@t"))]),
+        ins(["dbo", "Ev"], ["Id", "D", "T", "B", "N"], [[tv("@id"), tv("@d"), tv("@t"), num(1), tv("@n")]]),
+        upd(["dbo", "Ev"], [("B", num(0)), ("D", dateadd("day", num(1), col("D")))], V_KEY_T),
+        C("NStmt", C("SSelect", sel([item(col("N"), assign_=S("@n")), item(col("D"), assign_=S("@d"))],
+                                    ["dbo", "Ev"], V_KEY_T))),
+        *extra])
+
+
+def v_p(extra=()):
+    return proc(["p"], [param("p_id", "In"), sparam("p_big", "In", BIGINT), sparam("p_flag", "In", BOOL),
+                        sparam("p_when", "In", DATE), sparam("p_ts", "InOut", TS6)],
+                [C("Declare", S("v_d"), DATE, NONE), C("Declare", S("v_b"), BOOL, NONE),
+                 C("Declare", S("v_s"), SMALLINT, NONE), C("Declare", S("v_n"), BIGINT, NONE),
+                 C("Declare", S("v_t"), TS6, NONE), C("Declare", S("v_i"), INT, NONE)], [
+        assign(pv("v_d"), string("2024-01-31")), assign(pv("v_b"), TRUE), assign(pv("v_s"), num(5)),
+        assign(pv("v_t"), string("2024-01-01T23:59:00.123456")),
+        assign(pv("v_n"), bin_("+", pv("p_big"), num(1))),
+        assign(pv("v_b"), FALSE),
+        assign(pv("v_d"), bin_("+", pv("v_d"), num(1))),
+        assign(pv("v_d"), cast(bin_("+", pv("v_d"), make_interval("months", pv("p_id"))), DATE)),
+        assign(pv("v_d"), cast(bin_("+", pv("v_d"), make_interval("years", C("Num", S("-1")))), DATE)),
+        assign(pv("v_t"), bin_("+", pv("v_t"), make_interval("days", num(2)))),
+        assign(pv("v_i"), bin_("-", cast(pv("v_t"), DATE), cast(pv("v_d"), DATE))),
+        assign(pv("v_d"), cast(pv("v_t"), DATE)),
+        if_(bin_("=", pv("v_b"), TRUE), [assign(pv("v_i"), num(1))]),
+        if_(bin_("AND", bin_("=", pv("p_flag"), TRUE), bin_("<", pv("v_d"), pv("p_when"))),
+            [assign(pv("v_i"), num(4))]),
+        if_(bin_("=", pv("v_d"), string("2024-01-01")), [assign(pv("v_i"), num(5))]),
+        if_(bin_(">=", pv("v_t"), string("2024-01-01T00:00:00")), [assign(pv("v_i"), num(6))]),
+        if_(C("IsNull", pv("p_ts"), "f"), [assign(pv("p_ts"), pv("v_t"))]),
+        ins(["Ev"], ["Id", "D", "T", "B", "N"], [[pv("p_id"), pv("v_d"), pv("v_t"), TRUE, pv("v_n")]]),
+        C("Txn", S("COMMIT"), NONE),
+        upd(["Ev"], [("B", FALSE), ("D", bin_("+", pv("D"), num(1)))], V_KEY_P),
+        C("Txn", S("COMMIT"), NONE),
+        for_block([item(pv("N"), alias=S("sqldiff_c1")), item(pv("D"), alias=S("sqldiff_c2"))], ["Ev"], V_KEY_P,
+                  [field("v_n", "sqldiff_c1"), field("v_d", "sqldiff_c2")]),
+        *extra])
+
+
+def req3v(i, a=None, b=None, cat=V_CAT):
+    return req3(i, a=v_t() if a is None else a, b=v_p() if b is None else b, dep=V_DEP, cat=cat,
+                cert=V_CERT)
+
+
+cases += [
+    ("104", req3v(104), "confirmed"),
+    # A datetime2(7) local: its literal is a string, the conversion's a timestamp.
+    ("105", req3v(105, a=v_t(t_decl=DT2_7)), "unconfirmed"),
+    # An int into the smallint local: a narrowing store.
+    ("106", req3v(106, a=v_t(s_value=tv("@id"))), "unconfirmed"),
+    # A bit stored from 2.
+    ("107", req3v(107, a=v_t(b_value=num(2))), "unconfirmed"),
+    # A literal that is not ISO 8601, and DATEADD(hour, ...).
+    ("108", req3v(108, a=v_t(extra=[assign(tv("@d"), string("01/02/2024"))])), "unconfirmed"),
+    ("109", req3v(109, a=v_t(extra=[assign(tv("@t"), dateadd("hour", num(1), tv("@t")))])), "unconfirmed"),
+    # A constant beyond bigint; a bigint column written from an int is fine, a
+    # smallint column from an int is not.
+    ("110", req3v(110, a=v_t(extra=[ins(["dbo", "Ev"], ["Id", "B", "S"], [[num(2), num(1), tv("@id")]])])),
+     "unconfirmed"),
+    # A malformed SPEC: the catalog does not decode; a bit key column: not usable.
+    ("111", req3v(111, cat=V_CAT.replace(".t6.", ".t.")), "unconfirmed"),
+    ("112", req3v(112, cat=V_CAT.replace(".bn.", ".bnk.")), "unconfirmed"),
+]
 THEOREMS = {
+    "104": "Sqldiff.Mirror.check_sound_c2a",
     "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
     "86": "Sqldiff.Mirror.check_sound_c2a",
@@ -749,6 +876,18 @@ EXTRA = {
     "91": {"scalars": "c2a",
            "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
            "statements": "c3b"},
+    "104": {"scalars": "c2a",
+            "residual": ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-DATEADD-RANGE",
+                         "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"],
+            "statements": "c3b", "errors": "c4"},
+    "105": {"why": ["type:datetime2_7", "stmt:insert:value"]},
+    "106": {"why": ["store:declare:smallint"]},
+    "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
+    "108": {"why": ["store:assign:date", "expr:date-literal"]},
+    "109": {"why": ["expr:dateadd:part"]},
+    "110": {"why": ["stmt:insert:value"]},
+    "112": {"why": ["stmt:insert:table:not-plain", "stmt:update:table:not-plain",
+                    "stmt:select:table:not-plain"]},
     "83": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},
     "86": {"scalars": "c2a", "residual": [], "statements": "c3b"},
     "87": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS"], "statements": "c3b"},

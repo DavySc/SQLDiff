@@ -133,6 +133,17 @@ And, for strings (C2b, `Sqldiff.Mirror`, "The C2b slice: strings"):
   page), so T-SQL does not truncate or replace it on entry and the
   PostgreSQL routine sees the same value.
 
+And, for dates (C2c, `Sqldiff.Mirror`, "The C2c slice: typed values"):
+
+* `ASM-DATEADD-RANGE`, when an expression adds to a date or timestamp
+  (`DATEADD`, the converter's `+ n` and `+ make_interval(...)`): the
+  result stays within 0001-01-01 and 9999-12-31, where T-SQL raises 517
+  and PostgreSQL returns the value (eval/values V6); the core holds every
+  day number.
+* `ASM-DATEADD-YEAR-END`, when an expression adds years: February 29
+  plus a year is February 28, which both engines do (eval/values V6) but
+  Microsoft's page states for months only.
+
 And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
 
 * `ASM-CATCH-CORE-ERRORS`, when the routine has a handler: inside a
@@ -163,6 +174,8 @@ def residual (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : List
     (if ca.hasStrEq then ["ASM-BINARY-COLLATION"] else []) ++
     (if ca.hasLen then ["ASM-TSQL-LEN-BMP"] else []) ++
     (if tsqlStringParams a then ["ASM-TSQL-STRING-ARGS"] else []) ++
+    (if ca.hasDateAdd then ["ASM-DATEADD-RANGE"] else []) ++
+    (if ca.hasYearAdd then ["ASM-DATEADD-YEAR-END"] else []) ++
     (if ca.hasCatch then ["ASM-CATCH-CORE-ERRORS"] else []) ++
     (if ca.catches || ca.hasCommit || tsqlTxn a || bTxn then ["ASM-NO-CALLER-TXN"] else []) ++
     (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else [])

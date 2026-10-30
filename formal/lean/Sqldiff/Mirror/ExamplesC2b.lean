@@ -322,11 +322,16 @@ def sigP (pt rt : Ast.Ty) : Ast.Routine :=
 #guard isC2a (check dep ∅ fnCert sigT (sigP text text))
 #guard tyCorr (nvc 10) (vc 10) && tyCorr (vc 10) (.Ty "CHARACTER VARYING" ["20"])
 #guard tyCorr int (.Ty "INT4" []) && tyCorr (.Ty "INTEGER" []) integer
--- On the C1 path only `bigint` and `smallint`, without arguments.
+-- (C2c) `bigint` and `smallint` with themselves, `bit` with `boolean`,
+-- `date`, and `datetime2(6)` with `timestamp(6)` or `timestamp`.
 #guard tyCorr bigint (.Ty "INT8" []) && tyCorr (.Ty "SMALLINT" []) (.Ty "INT2" [])
 #guard !tyCorr int bigint && !tyCorr bigint int && !tyCorr (.Ty "TINYINT" []) (.Ty "SMALLINT" [])
 #guard !tyCorr (.Ty "DECIMAL" ["10", "2"]) (.Ty "NUMERIC" ["10", "2"])
-#guard !tyCorr (.Ty "BIT" []) (.Ty "BOOLEAN" []) && !tyCorr (.Ty "DATE" []) (.Ty "DATE" [])
+#guard tyCorr (.Ty "BIT" []) (.Ty "BOOLEAN" []) && tyCorr (.Ty "DATE" []) (.Ty "DATE" [])
+#guard tyCorr (.Ty "DATETIME2" ["6"]) (.Ty "TIMESTAMP" ["6"]) &&
+  tyCorr (.Ty "DATETIME2" ["6"]) (.Ty "TIMESTAMP" [])
+#guard !tyCorr (.Ty "DATETIME2" ["3"]) (.Ty "TIMESTAMP" ["3"]) &&
+  !tyCorr (.Ty "DATETIME2" []) (.Ty "TIMESTAMP" []) && !tyCorr (.Ty "BIT" []) (.Ty "INT2" [])
 #guard !tyCorr (.Ty "VARCHAR" ["MAX"]) text && !tyCorr (.Ty "CHAR" ["10"]) (.Ty "CHAR" ["10"])
 -- A procedure's trailing `return_code` must be the integer type.
 #guard reasonOf (check dep Γ cert srcT (match mirrorP with
@@ -353,7 +358,10 @@ def dfltCert : Cert := ⟨[("@r", "r"), ("@s", "s"), (statusVar, statusVar)]⟩
 -- A default outside the slice (an integer into a string, a non-slice
 -- literal) is outside the spec, even on the C1 path.
 #guard (lowerT dep ∅ (dfltT (num 7))).isNone
-#guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" bigint .In (some (.Num "2147483648"))] [])).isNone
+-- (C2c) A `bigint` default beyond the `int` range is the integer it spells.
+#guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" bigint .In (some (.Num "2147483648"))] [])).isSome
+#guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" bigint .In (some (.Num "9223372036854775808"))] [])).isNone
+#guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" int .In (some (.Num "2147483648"))] [])).isNone
 #guard (lowerT dep ∅ (tsqlProc ["dbo", "pd"] [.Param "@n" bigint .In (some .Null)] [])).isSome
 
 /-! ## The core's string operators (`SExpr.eval`) -/
@@ -445,7 +453,7 @@ def long26 : Ast.Expr := str "abcdefghijklmnopqrstuvwxyz"
 -- `INSERT`/`UPDATE`: a string value is never written to an `int` column
 -- (`colValue`), on either path; (C3c) a string column takes one that fits
 -- (`ExamplesC3c`).
-#guard (colValue (.tsql dep ∅) [] {} ⟨"c", "c", false, false, none, none⟩ (str "a")).isNone
-#guard (colValue (.tsql dep ∅) [] {} ⟨"c", "c", false, false, some (1, false), none⟩ (str "a")).isSome
+#guard (colValue (.tsql dep ∅) [] {} ⟨"c", "c", false, false, .int .i32, none⟩ (str "a")).isNone
+#guard (colValue (.tsql dep ∅) [] {} ⟨"c", "c", false, false, .str 1 false, none⟩ (str "a")).isSome
 
 end Sqldiff.Mirror.ExamplesC2b

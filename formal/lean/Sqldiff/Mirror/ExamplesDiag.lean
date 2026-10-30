@@ -208,9 +208,10 @@ def decimal : Ast.Ty := .Ty "DECIMAL" ["18", "2"]
 -- The declared type is named as `tyName` spells it, sanitised.
 #guard wP (pgProc ["p"] [inP "p_id"] [.Declare "v_s" (some (vc 20)) none]
     [set (pv "v_s") (fn "upper" [pv "v_s"])]) == ["store:assign:varchar_20", "expr:fn:upper"]
--- A local of a type PostgreSQL does not have: the variable itself is outside the slice.
+-- A local of a type PostgreSQL does not have: the variable itself is outside
+-- the slice, named by its type (C2c, `type:<type>`).
 #guard wP (pgProc ["p"] [inP "p_id"] [.Declare "v_s" (some (.Ty "NVARCHAR" ["MAX"])) none]
-    [set (pv "v_s") (fn "upper" [pv "v_s"])]) == ["store:assign:nvarchar_max", "expr:name"]
+    [set (pv "v_s") (fn "upper" [pv "v_s"])]) == ["store:assign:nvarchar_max", "type:nvarchar_max"]
 #guard wT (tsqlProc ["dbo", "p"] [ioT "@s" (vc 20)] [.NStmt (.Declare "@t" none (some (tv "@s")))]) ==
   ["store:declare:untyped"]
 
