@@ -6,7 +6,9 @@
 use sqldiff_syntax::{ast, SyntaxKind, SyntaxNode};
 
 use crate::artifact::Analyzed;
-use crate::classify::{is_temp_target, nested_write, stmt_kind, write_target, StmtKind};
+use crate::classify::{
+    is_temp_target, nested_write, side_writes, stmt_kind, write_target, StmtKind,
+};
 
 #[derive(Debug, Clone)]
 pub struct Write {
@@ -52,15 +54,36 @@ pub fn writes(a: &Analyzed) -> Vec<Write> {
         } else {
             continue;
         };
-        if is_temp_target(&parts) || pg_temp_before(&node, &parts, d) {
-            continue;
+        let (before, after) = if direct {
+            side_writes(&node)
+        } else {
+            Default::default()
+        };
+        let durable = |p: &[String]| !is_temp_target(p) && !pg_temp_before(&node, p, d);
+        for (k, p) in before.into_iter().filter(|(_, p)| durable(p)) {
+            out.push(Write {
+                upsert: k == StmtKind::Merge,
+                node: node.clone(),
+                kind: k,
+                target: p.last().cloned().unwrap_or_default(),
+            });
         }
-        out.push(Write {
-            upsert: kind == StmtKind::Merge || (direct && has_on_conflict(&node)),
-            node,
-            kind,
-            target: parts.last().cloned().unwrap_or_default(),
-        });
+        if durable(&parts) {
+            out.push(Write {
+                upsert: kind == StmtKind::Merge || (direct && has_on_conflict(&node)),
+                node: node.clone(),
+                kind,
+                target: parts.last().cloned().unwrap_or_default(),
+            });
+        }
+        for p in after.into_iter().filter(|p| durable(p)) {
+            out.push(Write {
+                upsert: false,
+                node: node.clone(),
+                kind: StmtKind::Insert,
+                target: p.last().cloned().unwrap_or_default(),
+            });
+        }
     }
     out
 }

@@ -423,6 +423,21 @@ pub(crate) fn is_reserved(up: &str) -> bool {
 
 pub type PResult<T> = Result<T, String>;
 
+/// The rows a data change statement returns: T-SQL `OUTPUT inserted.x,
+/// deleted.y [INTO t (cols)]`, PostgreSQL `UPDATE/DELETE … RETURNING …`
+/// (no INTO), and PostgreSQL `WITH o AS (<dml> RETURNING …) INSERT INTO t
+/// (cols) SELECT <every returned column> FROM o`, which is OUTPUT … INTO.
+/// Read only by [`parse_stmt_output`]; the statement tree leaves it out.
+/// Items are as written: which row image a name means (`inserted` or
+/// `deleted`, `new` or `old`, a bare or table-qualified column) is the
+/// reader's to resolve.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Output {
+    pub items: Vec<SelItem>,
+    /// The table the rows go to and its column list (empty when not given).
+    pub into: Option<(Vec<String>, Vec<String>)>,
+}
+
 pub struct Parser<'a> {
     t: &'a [Tok],
     pub i: usize,
@@ -437,9 +452,13 @@ pub struct Parser<'a> {
     /// tokens as well; [`parse_stmt_exact`] refuses any of these.
     pub dropped: Vec<&'static str>,
     /// Constructs only readers that lower them take (`parse_stmt_lowered`,
-    /// [`Parser::lowering`]):
+    /// [`parse_stmt_output`], [`Parser::lowering`]):
     /// UNION, EXCEPT and INTERSECT, and aggregates `OVER ()`.
     pub lowered: bool,
+    /// Read OUTPUT / RETURNING into [`Parser::output`] instead of refusing
+    /// them ([`parse_stmt_output`]).
+    pub keep_output: bool,
+    pub output: Option<Output>,
 }
 
 impl<'a> Parser<'a> {
@@ -451,6 +470,8 @@ impl<'a> Parser<'a> {
             ext: false,
             dropped: Vec::new(),
             lowered: false,
+            keep_output: false,
+            output: None,
         }
     }
 
@@ -470,6 +491,8 @@ impl<'a> Parser<'a> {
             ext: true,
             dropped: Vec::new(),
             lowered: true,
+            keep_output: false,
+            output: None,
         }
     }
 
@@ -1833,28 +1856,173 @@ impl<'a> Parser<'a> {
 
     /// T-SQL `OUTPUT inserted.x, ... [INTO target [(cols)]]`: skipped by
     /// the extended parser (the evaluator compares the write itself).
+    /// With [`Parser::keep_output`] it is kept in [`Parser::output`].
     fn output(&mut self) -> PResult<()> {
         if !self.is_kw("OUTPUT") {
             return Ok(());
         }
-        if !self.ext {
+        if !self.ext && !self.keep_output {
             return Err("OUTPUT clauses are not supported".into());
         }
         self.i += 1;
-        self.dropped.push("an OUTPUT clause");
+        let mut items = Vec::new();
         loop {
-            self.sel_item()?;
+            items.push(self.sel_item()?);
             if !self.eat_kind(K::Comma) {
                 break;
             }
         }
+        let mut into = None;
         if self.eat_kw("INTO") {
-            self.qname_or_var()?;
-            if self.is_kind(K::LParen) {
-                self.col_list()?;
+            let target = self.qname_or_var()?;
+            let cols = if self.is_kind(K::LParen) {
+                self.col_list()?
+            } else {
+                Vec::new()
+            };
+            into = Some((target, cols));
+        }
+        if self.ext {
+            self.dropped.push("an OUTPUT clause");
+            return Ok(());
+        }
+        self.keep(Output { items, into })
+    }
+
+    fn keep(&mut self, out: Output) -> PResult<()> {
+        if self.output.is_some() {
+            return Err("two OUTPUT or RETURNING clauses".into());
+        }
+        self.output = Some(out);
+        Ok(())
+    }
+
+    /// PostgreSQL `RETURNING items` of an UPDATE or DELETE, kept with
+    /// [`Parser::keep_output`] and refused otherwise; `INTO` after it
+    /// (PL/pgSQL) is refused.
+    fn returning_items(&mut self, what: &str) -> PResult<()> {
+        if !self.is_kw("RETURNING") {
+            return Ok(());
+        }
+        if !self.keep_output || self.d != Dialect::Postgres {
+            return Err(format!("{what} RETURNING is not supported"));
+        }
+        self.i += 1;
+        let mut items = Vec::new();
+        loop {
+            items.push(self.sel_item()?);
+            if !self.eat_kind(K::Comma) {
+                break;
             }
         }
-        Ok(())
+        if self.is_kw("INTO") {
+            return Err(format!("{what} RETURNING INTO is not supported"));
+        }
+        self.keep(Output { items, into: None })
+    }
+
+    /// Whether the statement is `WITH name AS (INSERT|UPDATE|DELETE …`.
+    fn dml_cte_ahead(&self) -> bool {
+        self.keep_output
+            && self.d == Dialect::Postgres
+            && self.is_kw("WITH")
+            && self
+                .peek_at(1)
+                .is_some_and(|t| t.kind == K::Word || t.kind == K::Quoted)
+            && self.is_kw_at(2, "AS")
+            && self.peek_at(3).is_some_and(|t| t.kind == K::LParen)
+            && ["INSERT", "UPDATE", "DELETE"]
+                .iter()
+                .any(|w| self.is_kw_at(4, w))
+    }
+
+    /// PostgreSQL `WITH o AS (<dml> RETURNING items) INSERT INTO t [(cols)]
+    /// SELECT c1, …, cn FROM o`, where c1 … cn are the names of the returned
+    /// columns, each once and in order: the rows the statement changed go to
+    /// `t`, as T-SQL `OUTPUT … INTO t` sends them. Returns the inner
+    /// statement; the rest is kept in [`Parser::output`].
+    fn output_cte(&mut self) -> PResult<Stmt> {
+        self.expect_kw("WITH")?;
+        let name = self.ident()?;
+        self.expect_kw("AS")?;
+        self.expect_kind(K::LParen)?;
+        let dml = match self.peek().map(|t| t.up.clone()).as_deref() {
+            Some("INSERT") => match self.insert()? {
+                Stmt::Insert {
+                    target,
+                    cols,
+                    source,
+                    returning,
+                    returning_into,
+                    on_conflict,
+                } if !returning.is_empty() && returning_into.is_empty() => {
+                    self.keep(Output {
+                        items: returning,
+                        into: None,
+                    })?;
+                    Stmt::Insert {
+                        target,
+                        cols,
+                        source,
+                        returning: Vec::new(),
+                        returning_into,
+                        on_conflict,
+                    }
+                }
+                _ => return Err("a data-modifying CTE without RETURNING".into()),
+            },
+            Some("UPDATE") => self.update()?,
+            Some("DELETE") => self.delete()?,
+            _ => return Err("expected INSERT, UPDATE or DELETE".into()),
+        };
+        let Some(Output { items, into: None }) = self.output.take() else {
+            return Err("a data-modifying CTE without RETURNING".into());
+        };
+        self.expect_kind(K::RParen)?;
+        self.expect_kw("INSERT")?;
+        self.expect_kw("INTO")?;
+        let target = self.qname()?;
+        let cols = if self.is_kind(K::LParen) {
+            self.col_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect_kw("SELECT")?;
+        let mut names = Vec::new();
+        loop {
+            names.push(self.ident()?);
+            if !self.eat_kind(K::Comma) {
+                break;
+            }
+        }
+        self.expect_kw("FROM")?;
+        if self.qname()? != [name] {
+            return Err("the INSERT does not read the data-modifying CTE".into());
+        }
+        // Each returned column once, in order, by the name it is returned as.
+        let returned: Vec<Option<String>> = items
+            .iter()
+            .map(|i| match (&i.alias, &i.expr) {
+                (Some(a), _) => Some(a.to_lowercase()),
+                (None, Expr::Name(p)) => p.last().map(|x| x.to_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let names: Vec<String> = names.iter().map(|x| x.to_lowercase()).collect();
+        let distinct = (1..names.len()).all(|i| !names[..i].contains(&names[i]));
+        let same = names.len() == returned.len()
+            && names
+                .iter()
+                .zip(&returned)
+                .all(|(n, r)| r.as_ref() == Some(n));
+        if !same || !distinct {
+            return Err("the INSERT does not take every returned column once, in order".into());
+        }
+        self.keep(Output {
+            items,
+            into: Some((target, cols)),
+        })?;
+        Ok(dml)
     }
 
     fn qname_or_var(&mut self) -> PResult<Vec<String>> {
@@ -1874,6 +2042,7 @@ impl<'a> Parser<'a> {
         };
         let s = match t.up.as_str() {
             "SELECT" | "VALUES" => Stmt::Select(Box::new(self.select()?)),
+            "WITH" if self.dml_cte_ahead() => self.output_cte()?,
             "WITH" => match self.with_update()? {
                 Some(u) => u,
                 None if self.ext => Stmt::Select(Box::new(self.select()?)),
@@ -2209,9 +2378,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if self.is_kw("RETURNING") {
-            return Err("UPDATE RETURNING is not supported".into());
-        }
+        self.returning_items("UPDATE")?;
         Ok(Stmt::Update {
             target,
             alias,
@@ -2232,12 +2399,19 @@ impl<'a> Parser<'a> {
             self.dropped.push("ONLY");
         }
         let target = self.qname()?;
-        let alias =
-            if self.is_kw("FROM") || self.is_kw("WHERE") || self.is_kw("USING") || self.at_end() {
-                None
-            } else {
-                self.alias()?
-            };
+        let alias = if self.is_kw("FROM")
+            || self.is_kw("WHERE")
+            || self.is_kw("USING")
+            || self.is_kw("OUTPUT")
+            || self.at_end()
+        {
+            None
+        } else {
+            self.alias()?
+        };
+        if self.d == Dialect::Tsql && self.keep_output {
+            self.output()?;
+        }
         let mut from = Vec::new();
         if (self.d == Dialect::Tsql && self.eat_kw("FROM")) || self.eat_kw("USING") {
             from = self.table_list()?;
@@ -2248,9 +2422,10 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        if self.is_kw("RETURNING") || self.is_kw("OUTPUT") {
-            return Err("DELETE RETURNING/OUTPUT is not supported".into());
+        if self.is_kw("OUTPUT") {
+            return Err("DELETE OUTPUT is not supported here".into());
         }
+        self.returning_items("DELETE")?;
         Ok(Stmt::Delete {
             target,
             alias,
@@ -2474,6 +2649,26 @@ pub fn parse_stmt_exact(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
         return Err(format!("{what} is not kept in the syntax tree"));
     }
     Ok(s)
+}
+
+/// [`parse_stmt`], also reading the rows the statement returns (see
+/// [`Output`]); `None` when it returns none.
+pub fn parse_stmt_output(toks: &[Tok], d: Dialect) -> PResult<(Stmt, Option<Output>)> {
+    let mut p = Parser::lowering(toks, d);
+    p.keep_output = true;
+    let s = p.stmt()?;
+    if !p.at_end() {
+        return Err(p.err("unexpected trailing tokens"));
+    }
+    if p.output.is_some()
+        && !matches!(
+            s,
+            Stmt::Insert { .. } | Stmt::Update { .. } | Stmt::Delete { .. }
+        )
+    {
+        return Err("OUTPUT or RETURNING inside another statement".into());
+    }
+    Ok((s, p.output))
 }
 
 pub fn parse_stmt(toks: &[Tok], d: Dialect) -> PResult<Stmt> {
