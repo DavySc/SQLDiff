@@ -1975,7 +1975,7 @@ impl<'a> Cx<'a> {
             "CONTINUE" => "CONTINUE".into(),
             "THROW" => self.throw(&ts)?,
             "RAISERROR" if self.db2() => return no("RAISERROR: severity decides whether it is an error at all; rewrite as SIGNAL (an error or a warning SQLSTATE)"),
-            "RAISERROR" => self.raiserror(&ts)?,
+            "RAISERROR" => self.raiserror(&ts, ind)?,
             "BEGIN" if matches!(w(1).as_str(), "TRAN" | "TRANSACTION") => self.txn("BEGIN", &ts)?,
             "COMMIT" => self.txn("COMMIT", &ts)?,
             "ROLLBACK" => self.txn("ROLLBACK", &ts)?,
@@ -4009,7 +4009,9 @@ impl<'a> Cx<'a> {
     /// may use `%s`, `%d`, `%i` and `%%` only. Checked on SQL Server 2022:
     /// a NULL argument shows as `(null)`, so each value becomes
     /// `COALESCE(value, '(null)')` (PostgreSQL would show `<NULL>`).
-    fn raiserror(&mut self, ts: &[T]) -> R<String> {
+    /// `ind`: the statement's column, which the caller strips from every
+    /// line but the first.
+    fn raiserror(&mut self, ts: &[T], ind: usize) -> R<String> {
         let ts = Self::body_toks(ts);
         let s = sig(&ts);
         let form = || No("RAISERROR form not understood".into());
@@ -4027,21 +4029,31 @@ impl<'a> Cx<'a> {
         if args.len() < 3 {
             return Err(form());
         }
+        let var = |cx: &Self, t: &T| -> Option<(String, Dt)> {
+            let v = cx.vars.get(&t.s.get(1..)?.to_ascii_lowercase())?;
+            (t.k == VARIABLE && !t.s.starts_with("@@")).then(|| (v.name.clone(), v.dt))
+        };
+        // A severity variable (an int) decides at run time: above 10 an
+        // error, otherwise a message (negative ones too).
+        let mut severity = None;
         let error = match trimmed(args[1]) {
             [t] if t.k == NUMBER => match t.s.parse::<u32>() {
                 Ok(0..=10) => false,
                 Ok(11..=18) => true,
                 _ => return no("RAISERROR severity 19 or more: needs WITH LOG and ends the connection from 20; rewrite by hand"),
             },
-            _ => return no("RAISERROR with a severity that is not a literal: whether it is an error or a message depends on its value"),
+            [t] if t.k == VARIABLE => match var(self, t) {
+                Some((name, Dt::Int)) => {
+                    severity = Some(name);
+                    true
+                }
+                _ => return no("RAISERROR with a severity variable that is not a declared int, smallint or tinyint: not converted"),
+            },
+            _ => return no("RAISERROR with a severity that is not a literal or a variable: whether it is an error or a message depends on its value"),
         };
         if error && self.trigger.is_some() {
             return self.misplaced("RAISERROR of severity 11 or more in a trigger: T-SQL carries on with the trigger, PostgreSQL fails the statement that fired it");
         }
-        let var = |cx: &Self, t: &T| -> Option<(String, Dt)> {
-            let v = cx.vars.get(&t.s.get(1..)?.to_ascii_lowercase())?;
-            (t.k == VARIABLE && !t.s.starts_with("@@")).then(|| (v.name.clone(), v.dt))
-        };
         // The PostgreSQL format, its values, and whether any value is shown.
         let mut fmt = String::new();
         let mut values = Vec::new();
@@ -4117,6 +4129,16 @@ impl<'a> Cx<'a> {
         }
         let fmt = fmt.replace('\'', "''");
         let values: String = values.iter().map(|v| format!(", {v}")).collect();
+        if let Some(sev) = severity {
+            self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-by-severity");
+            self.note(Status::Assumptions, "ASM-RAISERROR-SEVERITY", "The severity variable is not NULL and at most 18: T-SQL raises error 2754 instead for a severity of 19 or more without WITH LOG, and for a NULL severity uses whatever value the variable held before it became NULL (SQL Server 2022).");
+            self.note(Status::Assumptions, "ASM-THROW-ERRCODE", "The T-SQL error number (50000), severity and state are not carried over: callers see SQLSTATE P0001 with the same message.");
+            self.note(Status::Assumptions, "ASM-RAISERROR-INFO", "Callers read the message by its text: a T-SQL informational RAISERROR also carries message number 50000, its severity and state, which a PostgreSQL notice does not.");
+            let pad = " ".repeat(ind);
+            return Ok(format!(
+                "IF {sev} > 10 THEN\n{pad}  RAISE EXCEPTION '{fmt}'{values} USING ERRCODE = 'P0001';\n{pad}ELSE\n{pad}  RAISE NOTICE '{fmt}'{values};\n{pad}END IF;"
+            ));
+        }
         if error {
             self.step_ts_with("tsql.stmt.raiserror", &ts, "raise-exception");
             self.note(Status::Assumptions, "ASM-THROW-ERRCODE", "The T-SQL error number (50000), severity and state are not carried over: callers see SQLSTATE P0001 with the same message.");
