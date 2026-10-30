@@ -350,7 +350,7 @@ fn type_defaults_follow_tsql() {
 /// (the SQL Server period end becomes 10000-01-01 00:00:00); six are kept.
 #[test]
 fn seven_digit_time_literals_are_noted() {
-    let c = tsql("SELECT k FROM t WHERE e = '9999-12-31 23:59:59.9999999';");
+    let c = tsql("SELECT k FROM t WHERE e = '2020-01-01 10:00:00.1234567';");
     assert!(has_rule(&c.units[0], "ASM-LITERAL-FRACTION"));
     for src in [
         "SELECT k FROM t WHERE e = '9999-12-31 23:59:59.999999';",

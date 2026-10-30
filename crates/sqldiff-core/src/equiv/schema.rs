@@ -590,7 +590,7 @@ impl Schema {
     }
 }
 
-fn ty_of(t: &DataType, d: Dialect) -> Ty {
+pub(super) fn ty_of(t: &DataType, d: Dialect) -> Ty {
     if !t.is_known() {
         return Ty::of(Fam::Other);
     }

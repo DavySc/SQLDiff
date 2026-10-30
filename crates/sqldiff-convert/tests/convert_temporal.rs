@@ -346,9 +346,28 @@ fn switching_versioning_needs_the_tables_definition() {
     }
 }
 
+/// Compared with a value, T-SQL's end of time is written with PostgreSQL's
+/// 6 digits under ASM-END-OF-TIME (Davy, 2026-10-29), in any spelling T-SQL
+/// reads; elsewhere a 7-digit end of time still differs.
 #[test]
 fn the_end_of_time_literal_differs_on_postgresql() {
-    let src = "SELECT GroupID FROM Sales.Groups WHERE ValidTo = '9999-12-31 23:59:59.9999999';\n";
+    for lit in ["9999-12-31 23:59:59.9999999", "99991231 23:59:59.9999999"] {
+        let src = format!("SELECT GroupID FROM Sales.Groups WHERE ValidTo = '{lit}';\n");
+        let c = in_tree(&src, &[MAIN, ARCHIVE]);
+        assert!(
+            c.output.contains("ValidTo = '9999-12-31 23:59:59.999999'"),
+            "{}",
+            c.output
+        );
+        // The engine's comparison needs the catalogs (tests/user_functions.rs).
+        assert!(
+            c.units[0].status < Status::Differs,
+            "{:?}",
+            c.units[0].notes
+        );
+        assert!(rules(&c).contains(&"ASM-END-OF-TIME"), "{:?}", rules(&c));
+    }
+    let src = "SELECT GroupID, '9999-12-31 23:59:59.9999999' AS e FROM Sales.Groups;\n";
     let c = pg(src);
     assert_eq!(c.units[0].status, Status::Differs, "{:?}", c.units[0].notes);
     assert!(
