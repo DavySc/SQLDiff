@@ -904,6 +904,12 @@ proof = "engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
+id = "tsql.rowcount.found"
+kind = "converter"
+proof = "engine"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.schema.authorization-dbo"
 kind = "converter"
 proof = "engine"
