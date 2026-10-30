@@ -104,7 +104,7 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
             c.reset();
             out.push(ctl_item(&mut c, unit, m));
         }
-        let Some((_, s)) = stmts.next() else { break };
+        let Some((at, s)) = stmts.next() else { break };
         c.reset();
         let mut nodes = vec![s.node.clone()];
         let res = match (&s.msg, &s.ast) {
@@ -126,6 +126,11 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
                     },
                     None => c.stmt(&ast::Stmt::Return(None)),
                 }
+            }
+            // Rows the caller receives: a T-SQL procedure's result set, a
+            // PL/pgSQL RETURN QUERY.
+            (None, Ok(st)) if unit.results.iter().any(|r| r.at == at) => {
+                c.result_stmt(st, s.output.as_ref())
             }
             (None, Ok(st)) => match &s.output {
                 Some(o) => c.output_stmt(st, o),
@@ -373,6 +378,18 @@ fn compare_units(
     let (la, lb) = (local_schema(sa, ua), local_schema(sb, ub));
     let (sa, sb) = (la.as_ref(), lb.as_ref());
     let (na, nb) = (side_name(a), side_name(b));
+    // A procedure that became a function RETURNS TABLE: its `RETURN 0`
+    // sets the status every T-SQL procedure returns anyway, which nothing
+    // reads from the function, so it is a plain RETURN.
+    let (za, zb);
+    let (ua, ub) = match result_set_function(ua, ub, &na, &nb) {
+        Some(Ok(())) => {
+            za = zero_status(ua);
+            zb = zero_status(ub);
+            (&za, &zb)
+        }
+        _ => (ua, ub),
+    };
     for (side, u, name) in [(a, ua, &na), (b, ub, &nb)] {
         for (node, what) in &u.uncovered {
             let at = side.line_of(node);
@@ -3232,9 +3249,148 @@ fn security(a: &Analyzed, b: &Analyzed, ua: &Unit, ub: &Unit, touches: bool, out
     }
 }
 
+/// A T-SQL procedure that returns one result set against the PL/pgSQL
+/// function RETURNS TABLE it became (Davy's decision of 2026-10-30): `None`
+/// for any other pair of units. Comparable only when each side returns its
+/// rows from one statement that runs exactly once whenever the routine gets
+/// that far, after no RETURN, and the procedure has no OUTPUT parameters
+/// (the function has no other way to hand values back). Two result sets
+/// would reach a T-SQL client apart, where RETURN QUERY appends rows to one;
+/// a run that ends before the statement sends no result set, where the
+/// function returns no rows.
+fn result_set_function(ua: &Unit, ub: &Unit, na: &str, nb: &str) -> Option<Result<(), String>> {
+    let (p, f, np, nf) = match (ua.kind, ub.kind) {
+        (UnitKind::Proc, UnitKind::TableFn) => (ua, ub, na, nb),
+        (UnitKind::TableFn, UnitKind::Proc) => (ub, ua, nb, na),
+        _ => return None,
+    };
+    if p.dialect != Dialect::Tsql || f.dialect != Dialect::Postgres || f.sql_body {
+        return None;
+    }
+    let one = |u: &Unit, name: &str, what: &str| {
+        match u.results.as_slice() {
+        [r] if r.top && !r.after_return => Ok(()),
+        [r] if !r.top => Err(format!(
+            "{name} returns its {what} from inside an IF, a loop or error handling; a procedure becomes a function RETURNS TABLE only when that statement runs exactly once"
+        )),
+        [_] => Err(format!(
+            "{name} may RETURN before its {what}: a T-SQL client then gets no result set, a function caller no rows"
+        )),
+        [] => Err(format!("{name} returns no {what}")),
+        _ => Err(format!(
+            "{name} has several statements that return rows: T-SQL sends each as its own result set, RETURN QUERY appends them to one"
+        )),
+    }
+    };
+    Some((|| {
+        if p.params.iter().any(|x| x.out) {
+            return Err(format!(
+                "{np} has OUTPUT parameters and {nf} is a function RETURNS TABLE; calling conventions are not compared"
+            ));
+        }
+        one(p, np, "result set")?;
+        one(f, nf, "RETURN QUERY")?;
+        result_set_atomic(p, np, nf)
+    })())
+}
+
+/// The function runs inside its caller's statement, so an error anywhere in
+/// it undoes all of its writes and returns no rows. The T-SQL procedure
+/// matches that only when no work it commits on its own comes before its
+/// result set, and nothing that can still fail comes after it: a durable
+/// write before the result set is autocommitted unless one explicit
+/// transaction (under SET XACT_ABORT ON) spans both, and a statement after
+/// it fails once the rows have reached the client.
+fn result_set_atomic(p: &Unit, np: &str, nf: &str) -> Result<(), String> {
+    use crate::classify::{is_temp_target, stmt_kind, write_target, StmtKind as K};
+    use sqldiff_syntax::SyntaxKind as SK;
+    let r = &p.stmts[p.results[0].at].node;
+    let (rs, re) = (r.text_range().start(), r.text_range().end());
+    let Some(body) = r
+        .ancestors()
+        .find(|a| matches!(a.kind(), SK::ROUTINE_BODY | SK::ROUTINE))
+    else {
+        return Err(format!("{np}: the body of the routine is not known"));
+    };
+    let durable = |d: &SyntaxNode| match stmt_kind(d, Dialect::Tsql) {
+        K::Select => cst::sig_tokens(d).any(|t| t.text().eq_ignore_ascii_case("INTO")),
+        k if k.is_write() => !write_target(d).is_some_and(|t| is_temp_target(&t)),
+        K::Assign
+        | K::SessionSetting
+        | K::Declare
+        | K::TxnSetting
+        | K::TxnBegin
+        | K::TxnCommit
+        | K::Raise
+        | K::Return
+        | K::Block
+        | K::If
+        | K::Loop
+        | K::Case
+        | K::Label
+        | K::Container => false,
+        _ => true,
+    };
+    let mut first_write = None;
+    let mut begin = None;
+    let mut commit = None;
+    for d in body.descendants().filter(|d| d.kind().is_unit() && d != r) {
+        let range = d.text_range();
+        let kind = stmt_kind(&d, Dialect::Tsql);
+        match kind {
+            K::TxnRollback | K::Savepoint => {
+                return Err(format!(
+                    "{np} rolls back explicitly, and {nf}, a function RETURNS TABLE, cannot"
+                ))
+            }
+            K::TxnBegin if begin.is_none() => begin = Some(range.start()),
+            K::TxnCommit if commit.is_none() => commit = Some(range.start()),
+            K::TxnBegin | K::TxnCommit => {
+                return Err(format!(
+                    "{np} runs several transactions, which T-SQL commits one by one, and {nf} runs in its caller's one statement"
+                ))
+            }
+            _ => {}
+        }
+        if range.end() <= rs && durable(&d) {
+            first_write.get_or_insert(range.start());
+        }
+        if range.start() >= re && !matches!(kind, K::Return | K::TxnCommit) {
+            return Err(format!(
+                "{np} runs statements after its result set: one that fails does so after the rows reached the T-SQL client, while {nf} then returns no rows"
+            ));
+        }
+    }
+    let Some(w) = first_write else { return Ok(()) };
+    match (begin, commit) {
+        (Some(b), Some(c)) if p.stops_on_error && b <= w && c >= re => Ok(()),
+        _ => Err(format!(
+            "{np} writes before its result set outside one transaction that also spans the result set: T-SQL commits that write on its own, so it stays when the result set fails, while {nf} runs in its caller's statement and the error undoes it"
+        )),
+    }
+}
+
+/// `u` with each T-SQL `RETURN 0` read as `RETURN` (see `compare_units`).
+fn zero_status(u: &Unit) -> Unit {
+    let mut u = u.clone();
+    if u.dialect == Dialect::Tsql {
+        for s in &mut u.stmts {
+            if matches!(&s.ast, Ok(ast::Stmt::Return(Some(ast::Expr::Num(v)))) if v == "0") {
+                s.ast = Ok(ast::Stmt::Return(None));
+            }
+        }
+    }
+    u
+}
+
 fn signature(ua: &Unit, ub: &Unit, na: &str, nb: &str, out: &mut Outcome) {
     let result_kind = |k: UnitKind| matches!(k, UnitKind::View | UnitKind::TableFn);
-    if ua.kind != ub.kind && !(result_kind(ua.kind) && result_kind(ub.kind)) {
+    if let Some(why) = result_set_function(ua, ub, na, nb) {
+        match why {
+            Ok(()) => out.assume(asm::make(asm::RESULT_SET_FUNCTION)),
+            Err(why) => out.unknown_reasons.push(why),
+        }
+    } else if ua.kind != ub.kind && !(result_kind(ua.kind) && result_kind(ub.kind)) {
         out.unknown_reasons.push(format!(
             "{na} is a {} and {nb} is a {}; calling conventions are not compared",
             ua.kind.label(),

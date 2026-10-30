@@ -665,6 +665,20 @@ fact = "Nothing relies on which generated value each written row gets."
 sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
+id = "ASM-OUTPUT-TARGET-TRIGGERS"
+statement = "The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows."
+discharge = "catalog"
+fact = "The SQL Server catalog of the changed table: no enabled triggers."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-RESULT-SET-FUNCTION"
+statement = "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)."
+discharge = "deployment"
+fact = "How the application calls the procedure and reads its result set."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SEQUENCE-DEFAULT-TRIGGER"
 statement = "Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name."
 discharge = "deployment"

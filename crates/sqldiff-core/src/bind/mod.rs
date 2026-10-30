@@ -204,7 +204,9 @@ pub(crate) struct Binder<'a> {
     local: Catalog,
     ordinals: HashMap<String, usize>,
     trigger: Option<TriggerCtx>,
-    /// `#variable_conflict` directive in a PL/pgSQL body.
+    /// `#variable_conflict use_column` in a PL/pgSQL body: a name that is
+    /// both a column and a variable means the column. (`use_variable` is
+    /// left to the default check, which reports the name.)
     pg_conflict_directive: bool,
     /// T-SQL GOTO labels of the current batch.
     goto_labels: Vec<String>,
@@ -228,7 +230,13 @@ pub fn bind(a: &Analyzed, input: &BindInput) -> Bound {
         local: Catalog::default(),
         ordinals: HashMap::new(),
         trigger: None,
-        pg_conflict_directive: a.artifact.text.contains("#variable_conflict"),
+        pg_conflict_directive: a
+            .artifact
+            .text
+            .to_ascii_lowercase()
+            .split("#variable_conflict")
+            .skip(1)
+            .any(|r| r.trim_start().starts_with("use_column")),
         goto_labels: Vec::new(),
         later: Catalog::default(),
     };
@@ -596,6 +604,23 @@ impl<'a> Binder<'a> {
                 for (p, span) in h.routine.params.iter().zip(&h.param_spans) {
                     self.check_type(&p.data_type, *span, stmt);
                     if !p.name.is_empty() {
+                        let quoted = self.text[span.0..span.1].starts_with('"');
+                        self.declare(
+                            DeclKind::Parameter,
+                            &p.name,
+                            quoted,
+                            span.0,
+                            span.1,
+                            Some(p.data_type.clone()),
+                            None,
+                        );
+                    }
+                }
+                // RETURNS TABLE columns are output parameters of a PL/pgSQL
+                // function: a query naming a column of the same name is
+                // ambiguous (checked on PostgreSQL 18.6).
+                if self.d == Dialect::Postgres {
+                    for (p, span) in ddl::pg_table_columns(node) {
                         let quoted = self.text[span.0..span.1].starts_with('"');
                         self.declare(
                             DeclKind::Parameter,

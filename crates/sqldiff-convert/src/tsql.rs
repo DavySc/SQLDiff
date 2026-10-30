@@ -75,6 +75,11 @@ pub(crate) fn convert(
         in_try: false,
         in_cast: false,
         return_code: false,
+        rows_fn: false,
+        results: Vec::new(),
+        rows_failed: None,
+        rows_why: None,
+        stmt_top: false,
         txn_control: false,
         wrapper: None,
         autocommit: Vec::new(),
@@ -215,6 +220,20 @@ struct Cx<'a> {
     in_cast: bool,
     /// A procedure returns a value somewhere: it gets an INOUT `return_code`.
     return_code: bool,
+    /// PostgreSQL: the procedure returns a result set, so it becomes a
+    /// function RETURNS TABLE (Davy's decision of 2026-10-30).
+    rows_fn: bool,
+    /// The result columns (name, type) of each result set converted to
+    /// RETURN QUERY in the routine.
+    results: Vec<Vec<(String, String)>>,
+    /// Why a procedure that returns a result set cannot become a function.
+    rows_failed: Option<String>,
+    /// Why a procedure that returns a result set was not made a function.
+    rows_why: Option<String>,
+    /// The statement being converted runs exactly once whenever the
+    /// routine gets that far: directly in the routine body, outside any IF,
+    /// loop or TRY … CATCH.
+    stmt_top: bool,
     /// PostgreSQL: the procedure body COMMITs or ROLLs BACK, which a
     /// SECURITY DEFINER procedure may not.
     txn_control: bool,
@@ -362,6 +381,23 @@ impl<'a> Cx<'a> {
     fn misplaced<T>(&mut self, reason: &str) -> R<T> {
         self.context = true;
         no(reason)
+    }
+
+    /// Why the procedure was not made a function RETURNS TABLE, as a clause.
+    fn rows_why(&self) -> String {
+        match (&self.rows_why, self.mode) {
+            (Some(w), Mode::Proc) if !self.db2() => {
+                format!(", and it was not made a function RETURNS TABLE because {w}")
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Refuses a statement of a procedure that returns a result set, and
+    /// with it the function it would become.
+    fn rows_refuse<T>(&mut self, reason: &str) -> R<T> {
+        self.rows_failed.get_or_insert_with(|| reason.to_string());
+        self.misplaced(reason)
     }
 
     fn take_notes(&mut self) -> Vec<Note> {
@@ -619,6 +655,10 @@ impl<'a> Cx<'a> {
         self.rolls_back = pg_rolls_back(r);
         self.ret_bit = false;
         self.return_code = false;
+        self.rows_fn = false;
+        self.results.clear();
+        self.rows_failed = None;
+        self.rows_why = None;
         self.txn_control = false;
         let all = tokens(r);
         self.dynamic = dynamic_sql_vars(&all);
@@ -666,6 +706,7 @@ impl<'a> Cx<'a> {
         }
         let mut params = Vec::new();
         let mut seen_default = false;
+        let mut has_output = false;
         for p in split_commas(&ptoks) {
             let p = trimmed(p);
             let Some(v) = p.first().filter(|t| t.k == VARIABLE) else {
@@ -706,6 +747,7 @@ impl<'a> Cx<'a> {
                 },
             );
             let output = p.iter().any(|t| t.is("OUTPUT") || t.is("OUT"));
+            has_output |= output;
             if output && func {
                 return self.misplaced("OUTPUT parameters on a function");
             }
@@ -774,12 +816,33 @@ impl<'a> Cx<'a> {
             if self.wrapper.is_none() && !owner {
                 self.autocommit = autocommit_points(&body).unwrap_or_default();
             }
+            match self.rows_plan(&body, has_output) {
+                // A function cannot commit: its one writing statement
+                // commits with the caller's statement, as T-SQL commits it.
+                Ok(true) => {
+                    self.rows_fn = true;
+                    self.autocommit.clear();
+                }
+                Ok(false) => {}
+                Err(why) => self.rows_why = Some(why),
+            }
         }
         let mut b = Out::default();
         let block = body.children().find(|c| c.kind() == BLOCK);
         match block {
             Some(blk) if body.children().count() == 1 => self.body_elements(&mut b, &blk, INDENT),
             _ => self.body_elements(&mut b, &body, INDENT),
+        }
+        if self.rows_fn {
+            if let Some(why) = self.rows_failed.take() {
+                return no(why);
+            }
+            if self.txn_control {
+                return no("returns a result set and controls its transaction: a PostgreSQL function RETURNS TABLE cannot commit or roll back");
+            }
+            if self.results.len() != 1 {
+                return no("returns a result set that was not converted");
+            }
         }
         if self.return_code && !self.db2() {
             params.push("INOUT return_code integer DEFAULT NULL".into());
@@ -841,9 +904,28 @@ impl<'a> Cx<'a> {
             .flat_map(|d| d.lines.iter().map(String::as_str))
             .collect();
         let tag = dollar_tag(&[&b.text, &decls.join("\n")]);
+        let mut kind = if func { "FUNCTION" } else { "PROCEDURE" };
+        // A result set: the rows of the function's one RETURN QUERY. Its
+        // output columns are variables in the body, so a query naming a
+        // column of the same name must mean the column.
+        let mut pragma = "";
+        if self.rows_fn {
+            kind = "FUNCTION";
+            let cols: Vec<String> = self.results[0]
+                .iter()
+                .map(|(n, t)| format!("{n} {t}"))
+                .collect();
+            returns = format!("\nRETURNS TABLE ({})", cols.join(", "));
+            pragma = "\n#variable_conflict use_column";
+            self.step_ts("tsql.routine.result-set-function", ts);
+            self.note(
+                Status::Assumptions,
+                "ASM-RESULT-SET-FUNCTION",
+                "The procedure returns a result set, so it became a function RETURNS TABLE: callers read its rows with SELECT … FROM the function where they ran EXEC, see PostgreSQL column types, and get no rows when a statement fails (SQL Server may have sent some before the error).",
+            );
+        }
         let header = format!(
-            "CREATE OR REPLACE {} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS {tag}",
-            if func { "FUNCTION" } else { "PROCEDURE" },
+            "CREATE OR REPLACE {kind} {name}({}){returns}\nLANGUAGE plpgsql{security}\nAS {tag}{pragma}",
             params.join(", ")
         );
         let (s, _) = Self::range(r);
@@ -1734,6 +1816,7 @@ impl<'a> Cx<'a> {
     }
 
     fn stmt_in_scope(&mut self, n: &SyntaxNode) -> R<String> {
+        self.stmt_top = top_stmt(n);
         let mut ts = tokens(n);
         if self.db2() {
             // A query's own FROM-less SELECT is handled in `select`.
@@ -1775,14 +1858,21 @@ impl<'a> Cx<'a> {
             "WITH" if cte_list(&ts).is_some_and(|(_, v)| !ts[v].is("SELECT")) => {
                 self.with_dml(&ts)?
             }
+            "SELECT" if self.rows_fn && self.mode == Mode::Proc && select_rows(&ts) => {
+                match self.result_select(&ts) {
+                    Ok(q) => q,
+                    Err(No(why)) => return self.rows_refuse(&why),
+                }
+            }
             "SELECT" | "WITH" => {
                 let (q, assigns) = self.select(&ts)?;
                 if self.mode != Mode::Top && !assigns {
                     if self.db2() && self.mode == Mode::Proc {
                         return Ok(self.result_set(n, &q));
                     }
+                    let why = format!("returns a result set: a PostgreSQL procedure cannot{}; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed", self.rows_why());
                     return self.misplaced(self.pick(
-                        "returns a result set: a PostgreSQL procedure cannot; use a function RETURNS TABLE, a refcursor, or PERFORM if the rows are not needed",
+                        &why,
                         "returns a result set: only a procedure can (through a cursor WITH RETURN), not a function or a compound statement",
                     ));
                 }
@@ -2219,6 +2309,230 @@ impl<'a> Cx<'a> {
         }
     }
 
+    /// PostgreSQL: the columns of a procedure's result set (a SELECT), for
+    /// the function RETURNS TABLE it becomes: per column, the range of its
+    /// expression in `ts`, its name token and its type in the source
+    /// catalog, plus the range of the select list. Only columns of the
+    /// statement's tables with a catalog type are taken, each with a name;
+    /// no UNION, EXCEPT or INTERSECT.
+    fn result_columns(&self, ts: &[T]) -> R<ResultCols> {
+        let s = sig(ts);
+        for w in ["UNION", "EXCEPT", "INTERSECT"] {
+            if find_word(ts, 0, w).is_some() {
+                return no(format!(
+                    "its result set is built with {w}, whose column types are not derived"
+                ));
+            }
+        }
+        // The select list: after SELECT, DISTINCT and TOP, up to FROM.
+        let mut k = 1;
+        while s
+            .get(k)
+            .is_some_and(|&i| ts[i].is("ALL") || ts[i].is("DISTINCT"))
+        {
+            k += 1;
+        }
+        if s.get(k).is_some_and(|&i| ts[i].is("TOP")) {
+            k += 1;
+            if let Some(&i) = s.get(k).filter(|&&i| ts[i].k == L_PAREN) {
+                let close = matching(ts, i).unwrap_or(ts.len());
+                k = s.iter().position(|&j| j > close).unwrap_or(s.len());
+            } else {
+                k += 1;
+            }
+            while s
+                .get(k)
+                .is_some_and(|&i| ts[i].is("PERCENT") || ts[i].is("WITH") || ts[i].is("TIES"))
+            {
+                k += 1;
+            }
+        }
+        let start = *s.get(k).ok_or(No("a SELECT without columns".into()))?;
+        if let Some(f) = find_word(ts, start, "FOR") {
+            let what = s
+                .iter()
+                .find(|&&j| j > f)
+                .map(|&j| ts[j].up())
+                .unwrap_or_default();
+            return no(format!(
+                "its result set is built with FOR {what}, whose rows are not its columns"
+            ));
+        }
+        let end = ["FROM", "WHERE", "GROUP", "HAVING", "ORDER", "FOR", "OPTION"]
+            .iter()
+            .filter_map(|w| find_word(ts, start, w))
+            .min()
+            .unwrap_or(ts.len());
+        let mut cols = Vec::new();
+        let mut at = start;
+        for (n, item) in split_commas(&ts[start..end]).iter().enumerate() {
+            let base = at;
+            at += item.len() + 1;
+            let si: Vec<usize> = sig(item).into_iter().map(|i| i + base).collect();
+            // `name = expr`, `expr AS name`, `column name`, `column`.
+            let (expr, name) = match si.as_slice() {
+                [a, e, ..]
+                    if matches!(ts[*a].k, IDENT | QUOTED_IDENT)
+                        && ts[*e].k == OP
+                        && ts[*e].s == "=" =>
+                {
+                    ((e + 1, si[si.len() - 1] + 1), *a)
+                }
+                [f, .., x, a] if ts[*x].is("AS") && matches!(ts[*a].k, IDENT | QUOTED_IDENT) => {
+                    ((*f, *x), *a)
+                }
+                [f, .., a]
+                    if matches!(ts[*a].k, IDENT | QUOTED_IDENT)
+                        && name_parts(&ts[*f..*a]).is_some() =>
+                {
+                    ((*f, *a), *a)
+                }
+                [f, .., c] if name_parts(&ts[*f..=*c]).is_some() => ((*f, c + 1), *c),
+                [c] if name_parts(&ts[*c..=*c]).is_some() => ((*c, c + 1), *c),
+                _ => return no(format!("result column {} has no name", n + 1)),
+            };
+            let Some(dt) = self.column_type(&ts[expr.0..expr.1]) else {
+                return no(format!(
+                    "result column {} ({}) is not a column of the query's tables with a type in the source catalog, so the function cannot declare its type",
+                    n + 1,
+                    tsql_unquote(&ts[name].s)
+                ));
+            };
+            cols.push((expr, name, dt));
+        }
+        Ok(ResultCols {
+            list: (start, end),
+            cols,
+        })
+    }
+
+    /// PostgreSQL: the result set of a procedure that becomes a function
+    /// RETURNS TABLE, `RETURN QUERY` of the SELECT with each column cast to
+    /// the type its RETURNS TABLE column declares (`result_columns`).
+    /// PostgreSQL requires exactly that type (checked on PostgreSQL 18.6);
+    /// the cast is written in T-SQL, to the column's own type, so it changes
+    /// no value and is converted like any other.
+    fn result_select(&mut self, ts: &[T]) -> R<String> {
+        if !self.stmt_top {
+            return no("returns its result set from inside an IF, a loop or TRY … CATCH: a PostgreSQL function RETURNS TABLE returns the rows of a statement that runs exactly once");
+        }
+        let ts = Self::body_toks(ts);
+        let ts = ts.as_slice();
+        let rc = self.result_columns(ts)?;
+        let rule = "tsql.routine.result-set";
+        let made = |k, s: &str, at| T::made(k, s, at, rule);
+        let (start, end) = rc.list;
+        let mut out: Vec<T> = ts[..start].to_vec();
+        let mut cols = Vec::new();
+        for (n, ((e0, e1), name, dt)) in rc.cols.iter().enumerate() {
+            let at = ts[*e0].pos.0;
+            let ty = type_tokens(dt, at, rule);
+            let (pg_ty, _, _) = self.ty_map(&ty)?;
+            let pg_name = self
+                .expr(std::slice::from_ref(&ts[*name]))
+                .trim()
+                .to_string();
+            cols.push((pg_name, pg_ty));
+            if n > 0 {
+                out.push(made(COMMA, ",", at));
+                out.push(made(WHITESPACE, " ", at));
+            }
+            out.push(made(IDENT, "CAST", at));
+            out.push(made(L_PAREN, "(", at));
+            out.extend(trimmed(&ts[*e0..*e1]).iter().cloned());
+            for w in [" ", "AS", " "] {
+                out.push(made(if w == " " { WHITESPACE } else { IDENT }, w, at));
+            }
+            out.extend(ty);
+            out.push(made(R_PAREN, ")", at));
+            for w in [" ", "AS", " "] {
+                out.push(made(if w == " " { WHITESPACE } else { IDENT }, w, at));
+            }
+            out.push(ts[*name].clone());
+        }
+        out.push(made(WHITESPACE, " ", ts.get(end).map_or(0, |t| t.pos.0)));
+        out.extend(ts[end..].iter().cloned());
+        let (q, assigns) = self.select(&out)?;
+        if assigns {
+            return no("a SELECT that assigns variables as well as returning rows");
+        }
+        self.step_ts_with(rule, ts, "return-query");
+        self.results.push(cols);
+        Ok(format!("RETURN QUERY {q}"))
+    }
+
+    /// PostgreSQL: whether a procedure that returns a result set can become
+    /// a function RETURNS TABLE (`Ok(true)`), and why not. `Ok(false)` when
+    /// it returns none. The function returns the rows of one statement
+    /// that runs exactly once, hands back nothing else (no OUTPUT
+    /// parameters, no status but 0) and cannot commit, so the procedure
+    /// writes in at most one statement outside an explicit transaction.
+    fn rows_plan(&mut self, body: &SyntaxNode, has_output: bool) -> Result<bool, String> {
+        let sets: Vec<SyntaxNode> = body
+            .descendants()
+            .filter(|n| n.kind() == STATEMENT && is_result_stmt(&tokens(n)))
+            .collect();
+        let [n] = sets.as_slice() else {
+            return match sets.len() {
+                0 => Ok(false),
+                k => Err(format!("it returns {k} result sets, which T-SQL sends to the caller one by one, and a function RETURNS TABLE returns one set of rows")),
+            };
+        };
+        if has_output {
+            return Err(
+                "it has OUTPUT parameters, and a function RETURNS TABLE hands back only its rows"
+                    .into(),
+            );
+        }
+        if !top_stmt(n) {
+            return Err("the statement that returns the rows sits inside an IF, a loop or TRY … CATCH, and a function RETURNS TABLE returns the rows of a statement that runs exactly once".into());
+        }
+        for r in body
+            .descendants()
+            .filter(|r| r.kind() == STATEMENT && first_word(r) == "RETURN")
+        {
+            let ts = tokens(&r);
+            let s = sig(&ts);
+            if let Some(&v) = s.get(1).filter(|&&v| ts[v].k != SEMICOLON) {
+                if !(ts[v].s == "0" && !s.get(2).is_some_and(|&j| ts[j].k != SEMICOLON)) {
+                    return Err("it returns a status other than 0, and a function RETURNS TABLE hands back only its rows".into());
+                }
+            }
+        }
+        // The function runs in its caller's statement, so an error undoes
+        // all of it and returns no rows (`equiv::result_set_atomic`): before
+        // the result set nothing T-SQL commits on its own, unless the one
+        // wrapping transaction spans it; after it nothing that can fail.
+        let (start, end) = (n.text_range().start(), n.text_range().end());
+        for d in body
+            .descendants()
+            .filter(|d| d.kind() == STATEMENT && d != n)
+        {
+            if d.text_range().end() <= start && self.wrapper.is_none() && !quiet(&d) {
+                return Err("it writes before the statement that returns the rows, which T-SQL commits on its own, so the write stays when that statement fails, while a function RETURNS TABLE undoes it with the error".into());
+            }
+            if d.text_range().start() >= end
+                && !matches!(first_word(&d).as_str(), "RETURN" | "COMMIT")
+            {
+                return Err("it runs statements after the one that returns the rows, and one that fails there does so after T-SQL sent the rows, while a function RETURNS TABLE then returns none".into());
+            }
+        }
+        let ts = tokens(n);
+        let outer = std::mem::replace(&mut self.scope, scope_of(&ts));
+        let ts = Self::body_toks(&ts);
+        let r = if first_word(n) == "SELECT" {
+            self.result_columns(&ts).map(|_| ())
+        } else {
+            match find_word(&ts, 0, "OUTPUT") {
+                Some(o) => self.output_columns(&ts, o).map(|_| ()),
+                None => no("an OUTPUT clause not understood"),
+            }
+        };
+        self.scope = outer;
+        r.map_err(|No(w)| w)?;
+        Ok(true)
+    }
+
     /// Db2: a result set of a procedure becomes a cursor WITH RETURN, declared
     /// with the variables and opened where the query stood.
     fn result_set(&mut self, n: &SyntaxNode, q: &str) -> String {
@@ -2448,7 +2762,13 @@ impl<'a> Cx<'a> {
             ));
         }
         let Some(into) = find_word(ts, o + 1, "INTO").filter(|&i| i < e) else {
-            return Err(why("OUTPUT without INTO returns the rows to the caller, and a PostgreSQL procedure cannot return a result set; use a function RETURNS TABLE with RETURN QUERY … RETURNING, or OUTPUT … INTO a table variable"));
+            if self.rows_fn && self.mode == Mode::Proc {
+                return match self.output_rows(ts, o) {
+                    Ok(t) => Ok(t),
+                    Err(No(w)) => self.rows_refuse(&format!("OUTPUT clause: {w}")),
+                };
+            }
+            return Err(why(&format!("OUTPUT without INTO returns the rows to the caller, and a PostgreSQL procedure cannot return a result set{}; use a function RETURNS TABLE with RETURN QUERY … RETURNING, or OUTPUT … INTO a table variable", self.rows_why())));
         };
         let target_ts = trimmed(&ts[into + 1..e]);
         let open = target_ts.iter().position(|t| t.k == L_PAREN);
@@ -2564,6 +2884,137 @@ impl<'a> Cx<'a> {
             "WITH sqldiff_output AS (\n  {}\n  RETURNING {}\n)\nINSERT INTO {target_name} ({cols})\nSELECT {cols} FROM sqldiff_output",
             body.trim(),
             out.join(", ")
+        ))
+    }
+
+    /// PostgreSQL: the items of an OUTPUT clause without INTO, for the
+    /// function RETURNS TABLE a procedure becomes: per item, `new` or `old`,
+    /// the index of its column token, of its name token and the column's
+    /// type in the source catalog; plus where the clause ends. Only columns
+    /// of `inserted` and `deleted` are taken, of a table whose columns the
+    /// catalog holds, without table hints.
+    fn output_columns(&self, ts: &[T], o: usize) -> R<(Vec<OutputCol>, usize)> {
+        let s = sig(ts);
+        let verb = ts[s[0]].up();
+        let ends: &[&str] = if verb == "INSERT" {
+            &["VALUES", "SELECT", "DEFAULT", "EXEC", "EXECUTE"]
+        } else {
+            &["FROM", "WHERE", "OPTION"]
+        };
+        let e = ends
+            .iter()
+            .filter_map(|w| find_word(ts, o + 1, w))
+            .min()
+            .unwrap_or(ts.len());
+        if verb == "INSERT" && e == ts.len() {
+            return no("the INSERT's rows are not a VALUES list or a query");
+        }
+        if verb != "INSERT" && find_word(ts, o + 1, "FROM").is_some() {
+            return no("an UPDATE or DELETE with a FROM list (OUTPUT may read its tables); not converted yet");
+        }
+        let target = match verb.as_str() {
+            "UPDATE" => trimmed(&ts[s[0] + 1..find_word(ts, 0, "SET").unwrap_or(o)]).to_vec(),
+            _ => {
+                let from = s[1..]
+                    .iter()
+                    .copied()
+                    .find(|&j| !ts[j].is("INTO") && !ts[j].is("FROM"))
+                    .unwrap_or(o);
+                let end = (from..o)
+                    .find(|&j| ts[j].k == L_PAREN || ts[j].is("WITH") || ts[j].is("OUTPUT"))
+                    .unwrap_or(o);
+                trimmed(&ts[from..end]).to_vec()
+            }
+        };
+        if find_word(&ts[..o], 0, "WITH").is_some() || hinted(&ts[..o]) {
+            return no("table hints on the target are not converted");
+        }
+        let parts = name_parts(&target).ok_or(No("the target is not a table name".into()))?;
+        if parts.last().is_some_and(|n| n == "new" || n == "old") {
+            return no("the table is named new or old, which RETURNING reads as the row images");
+        }
+        let table = self
+            .catalog_table(&parts)
+            .filter(|t| t.columns_known)
+            .ok_or(No("the source catalog does not hold the columns of the table it changes, so the function cannot declare their types".into()))?;
+        let mut items = Vec::new();
+        let mut at = o + 1;
+        for (n, item) in split_commas(&ts[o + 1..e]).iter().enumerate() {
+            let base = at;
+            at += item.len() + 1;
+            let si: Vec<usize> = sig(item).into_iter().map(|i| i + base).collect();
+            let named = |a: usize| matches!(ts[a].k, IDENT | QUOTED_IDENT);
+            let (q, d, c, name) = match si.as_slice() {
+                [q, d, c] => (*q, *d, *c, *c),
+                [q, d, c, x, a] if ts[*x].is("AS") && named(*a) => (*q, *d, *c, *a),
+                [q, d, c, a] if named(*a) => (*q, *d, *c, *a),
+                _ => {
+                    return no(format!(
+                        "item {}: only a column of inserted or deleted is returned",
+                        n + 1
+                    ))
+                }
+            };
+            if ts[d].k != DOT || !(ts[q].is("INSERTED") || ts[q].is("DELETED")) || !named(c) {
+                return no(format!(
+                    "item {}: only a column of inserted or deleted is returned",
+                    n + 1
+                ));
+            }
+            let image = match (ts[q].is("INSERTED"), verb.as_str()) {
+                (true, "DELETE") => return no("inserted in a DELETE"),
+                (false, "INSERT") => return no("deleted in an INSERT"),
+                (true, _) => "new",
+                (false, _) => "old",
+            };
+            let cname = tsql_unquote(&ts[c].s);
+            let Some(col) = table.column(
+                Dialect::Tsql,
+                &sqldiff_core::catalog::Ident::plain(cname.clone()),
+            ) else {
+                return no(format!(
+                    "item {}: {cname} is not a column of the table",
+                    n + 1
+                ));
+            };
+            items.push(OutputCol {
+                image,
+                col: c,
+                name,
+                ty: col.data_type.clone(),
+            });
+        }
+        Ok((items, e))
+    }
+
+    /// PostgreSQL: OUTPUT without INTO in a procedure that becomes a function
+    /// RETURNS TABLE: `RETURN QUERY <dml> RETURNING CAST(new.c AS type), …`,
+    /// each item cast to its column's type, which the function declares
+    /// (`output_columns`, `result_select`).
+    fn output_rows(&mut self, ts: &[T], o: usize) -> R<String> {
+        if !self.stmt_top {
+            return no("returns its rows from inside an IF, a loop or TRY … CATCH: a PostgreSQL function RETURNS TABLE returns the rows of a statement that runs exactly once");
+        }
+        let (oc, e) = self.output_columns(ts, o)?;
+        let rule = "tsql.routine.result-set";
+        let mut items = Vec::new();
+        let mut cols = Vec::new();
+        for it in &oc {
+            let ty = type_tokens(&it.ty, ts[it.col].pos.0, rule);
+            let (pg_ty, _, _) = self.ty_map(&ty)?;
+            let c = self.expr(&ts[it.col..=it.col]);
+            items.push(format!("CAST({}.{} AS {pg_ty})", it.image, c.trim()));
+            let pg_name = self.expr(&ts[it.name..=it.name]).trim().to_string();
+            cols.push((pg_name, pg_ty));
+        }
+        let rest: Vec<T> = ts[..o].iter().chain(&ts[e..]).cloned().collect();
+        let body = self.dml(&rest)?;
+        self.step_ts_with(rule, &ts[o..e], "returning");
+        self.results.push(cols);
+        Ok(format!(
+            "RETURN QUERY {}\n  RETURNING {}",
+            body.trim(),
+            items.join(", ")
         ))
     }
 
@@ -3439,6 +3890,14 @@ impl<'a> Cx<'a> {
                 Ok(format!("RETURN {v}"))
             }
             (Mode::Do, _) if self.db2() => self.misplaced("RETURN in a script: a Db2 for i compound statement cannot return; put a label on the block and LEAVE it"),
+            // The status every procedure returns when it says nothing else.
+            (Mode::Proc, Some(v)) if self.rows_fn && v == "0" => {
+                self.step_ts_with("tsql.stmt.return", &ts, "status-zero");
+                Ok("RETURN".into())
+            }
+            (Mode::Proc, Some(_)) if self.rows_fn => self.rows_refuse(
+                "returns a result set and a status other than 0: a PostgreSQL function RETURNS TABLE hands back only its rows",
+            ),
             (Mode::Proc, Some(v)) => {
                 self.return_code = true;
                 self.step_ts_with("tsql.stmt.return", &ts, "return-code");
@@ -7464,6 +7923,132 @@ fn primary_key_columns(items: &[T]) -> Vec<String> {
     out
 }
 
+/// A statement that commits nothing on its own: declarations, settings,
+/// messages, RETURN, transaction statements and a SELECT that stores nothing.
+fn quiet(n: &SyntaxNode) -> bool {
+    let ts = tokens(n);
+    let s = sig(&ts);
+    match s.first().map(|&i| ts[i].up()).as_deref() {
+        Some("DECLARE" | "SET" | "PRINT" | "THROW" | "RETURN" | "BEGIN" | "COMMIT") => true,
+        Some("SELECT") => find_word(&ts, 0, "INTO").is_none(),
+        _ => false,
+    }
+}
+
+/// Whether the rows of a T-SQL procedure's statement reach the caller: a
+/// SELECT that assigns nothing and stores nothing (`select_rows`), or an
+/// INSERT, UPDATE or DELETE with OUTPUT but no INTO.
+fn is_result_stmt(ts: &[T]) -> bool {
+    let s = sig(ts);
+    match s.first().map(|&i| ts[i].up()).as_deref() {
+        Some("SELECT") => select_rows(ts),
+        Some("INSERT" | "UPDATE" | "DELETE") => output_rows(ts),
+        _ => false,
+    }
+}
+
+/// The columns of a result set (`Cx::result_columns`).
+struct ResultCols {
+    /// The select list's token range.
+    list: (usize, usize),
+    /// Per column: its expression's token range, its name token, its type.
+    cols: Vec<((usize, usize), usize, sqldiff_core::catalog::DataType)>,
+}
+
+/// An item of OUTPUT without INTO (`Cx::output_columns`).
+struct OutputCol {
+    image: &'static str,
+    col: usize,
+    name: usize,
+    ty: sqldiff_core::catalog::DataType,
+}
+
+/// T-SQL tokens for a catalog type, made up by `rule` at offset `at`.
+fn type_tokens(dt: &sqldiff_core::catalog::DataType, at: usize, rule: &'static str) -> Vec<T> {
+    let made = |k, s: &str| T::made(k, s, at, rule);
+    let mut ty = vec![made(IDENT, &dt.base)];
+    if dt.max || !dt.args.is_empty() {
+        ty.push(made(L_PAREN, "("));
+        if dt.max {
+            ty.push(made(IDENT, "MAX"));
+        }
+        for (j, a) in dt.args.iter().enumerate() {
+            if j > 0 {
+                ty.push(made(COMMA, ","));
+            }
+            ty.push(made(NUMBER, &a.to_string()));
+        }
+        ty.push(made(R_PAREN, ")"));
+    }
+    ty
+}
+
+/// Whether a SELECT returns its rows: it assigns no variable (`SELECT @v =
+/// …`) and has no INTO (`SELECT … INTO #t` creates a table).
+fn select_rows(ts: &[T]) -> bool {
+    let s = sig(ts);
+    let mut k = 1;
+    while s
+        .get(k)
+        .is_some_and(|&i| ts[i].is("ALL") || ts[i].is("DISTINCT"))
+    {
+        k += 1;
+    }
+    if s.get(k).is_some_and(|&i| ts[i].is("TOP")) {
+        k += 1;
+        if let Some(&i) = s.get(k).filter(|&&i| ts[i].k == L_PAREN) {
+            let close = matching(ts, i).unwrap_or(ts.len());
+            k = s.iter().position(|&j| j > close).unwrap_or(s.len());
+        } else {
+            k += 1;
+        }
+        while s
+            .get(k)
+            .is_some_and(|&i| ts[i].is("PERCENT") || ts[i].is("WITH") || ts[i].is("TIES"))
+        {
+            k += 1;
+        }
+    }
+    let assigns = matches!(
+        (s.get(k), s.get(k + 1)),
+        (Some(&v), Some(&e)) if ts[v].k == VARIABLE && ts[e].k == OP && ts[e].s.ends_with('=')
+    );
+    !assigns && find_word(ts, 0, "INTO").is_none()
+}
+
+/// Whether an INSERT, UPDATE or DELETE has an OUTPUT clause without INTO.
+fn output_rows(ts: &[T]) -> bool {
+    let Some(o) = find_word(ts, 0, "OUTPUT") else {
+        return false;
+    };
+    let insert = sig(ts).first().is_some_and(|&i| ts[i].is("INSERT"));
+    let ends: &[&str] = if insert {
+        &["VALUES", "SELECT", "DEFAULT", "EXEC", "EXECUTE"]
+    } else {
+        &["FROM", "WHERE", "OPTION"]
+    };
+    let e = ends
+        .iter()
+        .filter_map(|w| find_word(ts, o + 1, w))
+        .min()
+        .unwrap_or(ts.len());
+    find_word(ts, o + 1, "INTO").filter(|&i| i < e).is_none()
+}
+
+/// Whether a statement sits directly in a routine body (its BEGIN … END
+/// included), outside any IF, loop or TRY … CATCH.
+fn top_stmt(n: &SyntaxNode) -> bool {
+    let mut p = n.parent();
+    while let Some(x) = p {
+        match x.kind() {
+            ROUTINE_BODY => return true,
+            BLOCK => p = x.parent(),
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Where a T-SQL body commits a statement on its own, for a PostgreSQL
 /// procedure or DO block, which is one transaction unless it commits: the
 /// start of every statement that writes (a table, a temporary table, a
@@ -9682,6 +10267,37 @@ impl Cx<'_> {
                     return None;
                 }
                 found = Some(dt);
+            }
+        }
+        found
+    }
+
+    /// The source catalog's type of a column reference, by the statement's
+    /// tables, as `column_dt` finds it.
+    fn column_type(&self, ts: &[T]) -> Option<sqldiff_core::catalog::DataType> {
+        use sqldiff_core::catalog::Ident;
+        let parts = name_parts(ts)?;
+        let scope = self.scope.as_ref()?;
+        let (q, col) = match parts.as_slice() {
+            [c] => (None, c),
+            [.., q, c] => (Some(q), c),
+            [] => return None,
+        };
+        let mut found: Option<sqldiff_core::catalog::DataType> = None;
+        for e in &scope.entries {
+            let here = q.map_or(true, |q| match &e.alias {
+                Some(a) => a == q,
+                None => e.name.last() == Some(q),
+            });
+            if !here {
+                continue;
+            }
+            let t = self.entry_table(e)?;
+            if let Some(c) = t.column(Dialect::Tsql, &Ident::plain(col.clone())) {
+                if found.as_ref().is_some_and(|f| f != &c.data_type) {
+                    return None;
+                }
+                found = Some(c.data_type.clone());
             }
         }
         found
