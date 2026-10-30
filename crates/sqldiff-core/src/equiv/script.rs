@@ -61,13 +61,13 @@ pub(super) fn segment_pairs(
     }
     // A plain segment that lowers to nothing (`SET NOCOUNT ON` alone) has
     // nothing to pair with; a block or routine always has its partner.
-    fn lowered<'s>(an: &Analyzed, s: &'s [Segment]) -> Vec<(&'s Segment, Unit)> {
+    fn lowered<'s>(an: &Analyzed, s: &'s [Segment], other: Dialect) -> Vec<(&'s Segment, Unit)> {
         s.iter()
-            .map(|g| (g, lower::lower_segment(an.dialect(), g)))
+            .map(|g| (g, lower::lower_segment(an.dialect(), g, other)))
             .filter(|(g, u)| g.block || g.routine || !nothing(u))
             .collect()
     }
-    let (ua, ub) = (lowered(a, &sa), lowered(b, &sb));
+    let (ua, ub) = (lowered(a, &sa, b.dialect()), lowered(b, &sb, a.dialect()));
     if ua.len() != ub.len()
         || ua
             .iter()
@@ -94,7 +94,7 @@ pub(super) fn segment_pairs(
                 nodes: vec![node.clone()],
                 ..g.clone()
             };
-            let u = lower::lower_segment(a.dialect(), &one);
+            let u = lower::lower_segment(a.dialect(), &one, b.dialect());
             if nothing(&u) {
                 continue;
             }

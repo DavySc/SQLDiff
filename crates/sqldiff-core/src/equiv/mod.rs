@@ -163,8 +163,8 @@ fn items(unit: &Unit, schema: &Schema, by_name: bool, other: Dialect) -> Vec<Ite
 }
 
 /// The item of an IF or loop marker (`lower::CtlKind`): `ctl-if(cond)`,
-/// `ctl-while(cond)`, `ctl-else`, `ctl-end`, `ctl-break`, `ctl-continue`,
-/// `ctl-call(callee)`.
+/// `ctl-while(cond)`, `ctl-try`, `ctl-catch`, `ctl-else`, `ctl-end`,
+/// `ctl-break`, `ctl-continue`, `ctl-rethrow`, `ctl-call(callee)`.
 fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
     use lower::CtlKind as C;
     let (head, res): (&str, Result<Vec<Term>, String>) = match &m.kind {
@@ -181,6 +181,9 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
             "ctl-while",
             Ok(vec![n("cursor-found", vec![a(key.clone())])]),
         ),
+        C::Try => ("ctl-try", Ok(vec![])),
+        C::Catch => ("ctl-catch", Ok(vec![])),
+        C::Rethrow => ("ctl-rethrow", Ok(vec![])),
         C::Else => ("ctl-else", Ok(vec![])),
         C::End => ("ctl-end", Ok(vec![])),
         C::Break => ("ctl-break", Ok(vec![])),
@@ -269,8 +272,12 @@ pub fn compare(
         }
         return out;
     }
-    let pairs = script::segment_pairs(a, b, anchors, &mut out)
-        .unwrap_or_else(|| vec![(lower::lower(a), lower::lower(b))]);
+    let pairs = script::segment_pairs(a, b, anchors, &mut out).unwrap_or_else(|| {
+        vec![(
+            lower::lower_against(a, b.dialect()),
+            lower::lower_against(b, a.dialect()),
+        )]
+    });
     for (mut ua, mut ub) in pairs {
         script::name_locals(&mut ua, &mut ub);
         tv_names(a, b, &mut ua, &mut ub);
@@ -532,7 +539,24 @@ fn same_place_paired(
     // Whether every node of the item is before the call (`Some(true)`) or
     // after it (`Some(false)`); `None` when it holds or straddles the call.
     let before = |it: &Item, call: (usize, usize)| {
-        let r: Vec<(usize, usize)> = it.nodes.iter().map(cst::sig_range).collect();
+        // A TRY's markers hold the statements of its TRY part (`lower::
+        // try_catch`): each stands where it starts, its END where it ends.
+        let r: Vec<(usize, usize)> = match (it.term.head(), it.nodes.first()) {
+            ("ctl-try" | "ctl-catch", Some(n)) => {
+                let at = cst::sig_range(n).0;
+                vec![(at, at)]
+            }
+            ("ctl-end", Some(n))
+                if matches!(
+                    n.kind(),
+                    sqldiff_syntax::SyntaxKind::TRY_CATCH | sqldiff_syntax::SyntaxKind::BLOCK
+                ) =>
+            {
+                let at = cst::sig_range(n).1;
+                vec![(at, at)]
+            }
+            _ => it.nodes.iter().map(cst::sig_range).collect(),
+        };
         if r.iter().all(|x| x.1 <= call.0) {
             Some(true)
         } else if r.iter().all(|x| x.0 >= call.1) {
@@ -2789,6 +2813,8 @@ fn error_continues(
     // decides whether the script goes on (the behaviour model's business).
     if !o.in_block
         || t.stops_on_error
+        || t.catches
+        || o.catches
         || !matches!(t.kind, UnitKind::Proc | UnitKind::Script)
         || !t.uncovered.is_empty()
         || !o.uncovered.is_empty()
@@ -2908,8 +2934,8 @@ fn error_continues(
     let mut stack: Vec<usize> = Vec::new();
     for (k, (_, e)) in seq.iter().enumerate() {
         match head(*e) {
-            "ctl-if" | "ctl-while" => stack.push(k),
-            "ctl-else" => {}
+            "ctl-if" | "ctl-while" | "ctl-try" => stack.push(k),
+            "ctl-else" | "ctl-catch" => {}
             "ctl-end" => {
                 if let Some(o) = stack.pop() {
                     opener[k] = o;
@@ -2920,7 +2946,7 @@ fn error_continues(
         }
     }
     for k in 0..seq.len() {
-        if head(seq[k].1) == "ctl-else" {
+        if matches!(head(seq[k].1), "ctl-else" | "ctl-catch") {
             close[k] = (k..seq.len())
                 .find(|&e| head(seq[e].1) == "ctl-end" && opener[e] < k)
                 .unwrap_or(usize::MAX);
@@ -2942,9 +2968,9 @@ fn error_continues(
         while k < seq.len() {
             let e = seq[k].1;
             match head(e) {
-                "ctl-if" | "ctl-while" => depth += 1,
+                "ctl-if" | "ctl-while" | "ctl-try" => depth += 1,
                 // The branch around `p` ends: skip the ELSE branches.
-                "ctl-else" if depth == 0 => {
+                "ctl-else" | "ctl-catch" if depth == 0 => {
                     k = close[k];
                     continue;
                 }
@@ -2995,7 +3021,8 @@ fn error_continues(
             }
             match items[k].term.head() {
                 // These cannot fail; a call marker's call is in `seq`.
-                "ctl-else" | "ctl-end" | "ctl-break" | "ctl-continue" | "ctl-call" => continue,
+                "ctl-else" | "ctl-catch" | "ctl-end" | "ctl-break" | "ctl-continue"
+                | "ctl-call" => continue,
                 _ => {}
             }
             if items[k].nodes.len() == 1 && script::cannot_fail(t, &items[k].nodes[0]) {
@@ -3003,7 +3030,7 @@ fn error_continues(
             }
         }
         // Where a failing IF or WHILE condition goes on is not modelled.
-        let cond = matches!(head(e), "ctl-if" | "ctl-while");
+        let cond = matches!(head(e), "ctl-if" | "ctl-while" | "ctl-try");
         match after(i, cond) {
             Next::Sure(j) => {
                 found = Some((i, j));
@@ -3871,13 +3898,19 @@ fn flow_seq(items: &[Item], gaps: &[Gap], k: &mut usize, g: &mut usize) -> Vec<E
             return out;
         };
         match it.term.head() {
-            "ctl-else" | "ctl-end" => return out,
-            "ctl-if" | "ctl-while" => {
+            "ctl-else" | "ctl-catch" | "ctl-end" => return out,
+            "ctl-if" | "ctl-while" | "ctl-try" => {
                 let open = *k;
                 *k += 1;
                 let mut parts = vec![(None, flow_seq(items, gaps, k, g))];
-                let is_if = it.term.is("ctl-if");
-                while is_if && items.get(*k).is_some_and(|x| x.term.is("ctl-else")) {
+                // The marker that starts each further branch: ELSE of an IF,
+                // CATCH of a TRY.
+                let sep = match it.term.head() {
+                    "ctl-if" => "ctl-else",
+                    "ctl-try" => "ctl-catch",
+                    _ => "",
+                };
+                while items.get(*k).is_some_and(|x| x.term.is(sep)) {
                     let e = *k;
                     *k += 1;
                     parts.push((Some(e), flow_seq(items, gaps, k, g)));
@@ -4042,11 +4075,11 @@ fn branches(items: &[Item]) -> Vec<(Option<usize>, Option<usize>)> {
     for (i, it) in items.iter().enumerate() {
         let frame = stack.last().map(|x| x.1);
         match it.term.head() {
-            "ctl-if" | "ctl-while" => {
+            "ctl-if" | "ctl-while" | "ctl-try" => {
                 out.push((frame, None));
                 stack.push((i, i));
             }
-            "ctl-else" => match stack.pop() {
+            "ctl-else" | "ctl-catch" => match stack.pop() {
                 Some((opener, _)) => {
                     out.push((stack.last().map(|x| x.1), Some(opener)));
                     stack.push((opener, i));
@@ -4198,6 +4231,9 @@ fn compare_pair(
         let what = |it: &Item| match it.term.head() {
             "ctl-if" => "an IF condition",
             "ctl-while" => "a WHILE condition",
+            "ctl-try" => "the start of a TRY part",
+            "ctl-catch" => "the start of a CATCH block or exception handler",
+            "ctl-rethrow" => "a rethrow of the caught error",
             "ctl-else" => "the start of an ELSE branch",
             "ctl-end" => "the end of an IF or loop",
             "ctl-break" => "a loop exit",
@@ -4385,8 +4421,8 @@ pub fn refine_modified(
     {
         return;
     }
-    let ua = lower::lower(a);
-    let ub = lower::lower(b);
+    let ua = lower::lower_against(a, b.dialect());
+    let ub = lower::lower_against(b, a.dialect());
     let ia = items(&ua, sa, true, ub.dialect);
     let ib = items(&ub, sb, true, ua.dialect);
     let find = |items: &[Item], side: Side, f: &Finding| -> Option<usize> {

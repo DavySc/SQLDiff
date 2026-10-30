@@ -220,14 +220,16 @@ END;
 }
 
 #[test]
-fn statements_inside_an_uncovered_catch_are_named_line_by_line() {
-    // A CATCH that does not only roll back and rethrow is not compared; the
-    // statements inside it were not compared either.
+fn catch_statements_that_could_see_the_try_parts_work_are_named_line_by_line() {
+    // The TRY part deletes from two tables: when the second DELETE fails,
+    // T-SQL keeps the first and PostgreSQL has undone it, so the CATCH
+    // statements that use tables are not compared, each with the reason.
     let tsql = "CREATE PROCEDURE dbo.p
 AS
 BEGIN
     BEGIN TRY
         DELETE FROM dbo.t;
+        DELETE FROM dbo.u;
     END TRY
     BEGIN CATCH
         INSERT INTO dbo.log (msg) VALUES ('failed');
@@ -240,6 +242,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   DELETE FROM t;
+  DELETE FROM u;
 EXCEPTION WHEN OTHERS THEN
   INSERT INTO log (msg) VALUES ('failed');
   UPDATE t SET v = 0;
@@ -248,8 +251,10 @@ $$;
 ";
     let r = run(tsql, pg, Dialect::Postgres);
     for want in [
-        "side A (T-SQL) line 8: a statement inside a CATCH block at line 7 is not covered",
-        "side A (T-SQL) line 9: a statement inside a CATCH block at line 7 is not covered",
+        "side A (T-SQL) line 9: a statement inside a CATCH block that reads or changes tables, after a TRY part that may change the database",
+        "side A (T-SQL) line 10: a statement inside a CATCH block that reads or changes tables, after a TRY part that may change the database",
+        "side B (PostgreSQL) line 8: a statement inside a CATCH block that reads or changes tables",
+        "side B (PostgreSQL) line 9: a statement inside a CATCH block that reads or changes tables",
     ] {
         assert!(
             r.unknown_reasons.iter().any(|x| x.starts_with(want)),
