@@ -167,10 +167,67 @@ fn an_error_is_compared_with_an_exception() {
         "  RAISERROR('boom', 16, 1);",
         "  RAISE EXCEPTION 'boom' USING ERRCODE = '22012';",
     );
-    // A severity that is not a literal could be either.
+    // A severity variable could be either.
     not_equal(
         "  DECLARE @s int = 16;\n  RAISERROR('boom', @s, 1);",
         "  RAISE EXCEPTION 'boom' USING ERRCODE = 'P0001';",
+    );
+}
+
+/// A severity variable: an error above 10, a message otherwise (verified on
+/// SQL Server 2022, negatives included), as the IF its conversion writes.
+const BY_SEVERITY: &str = "  IF v_n > 10 THEN\n    RAISE EXCEPTION 'boom %', COALESCE(v_e, '(null)') USING ERRCODE = 'P0001';\n  ELSE\n    RAISE NOTICE 'boom %', COALESCE(v_e, '(null)');\n  END IF;";
+
+#[test]
+fn a_severity_variable_is_compared_with_an_if() {
+    let r = equal(
+        "  RAISERROR('boom %s', @n, 1, @e) WITH NOWAIT;",
+        BY_SEVERITY,
+    );
+    assert!(ids(&r).contains(&"ASM-RAISERROR-SEVERITY"), "{:?}", ids(&r));
+    let t = "  RAISERROR('boom %s', @n, 1, @e);";
+    // Another threshold: severity 10 is a message.
+    not_equal(t, &BY_SEVERITY.replace("v_n > 10", "v_n >= 10"));
+    not_equal(t, &BY_SEVERITY.replace("v_n > 10", "v_n > 11"));
+    // Branches swapped.
+    not_equal(
+        t,
+        "  IF v_n > 10 THEN\n    RAISE NOTICE 'boom %', COALESCE(v_e, '(null)');\n  ELSE\n    RAISE EXCEPTION 'boom %', COALESCE(v_e, '(null)') USING ERRCODE = 'P0001';\n  END IF;",
+    );
+    // `NOT v_n <= 10` is the same for an int, but a NULL takes the other
+    // branch: not read as equal.
+    not_equal(
+        t,
+        "  IF v_n <= 10 THEN\n    RAISE NOTICE 'boom %', COALESCE(v_e, '(null)');\n  ELSE\n    RAISE EXCEPTION 'boom %', COALESCE(v_e, '(null)') USING ERRCODE = 'P0001';\n  END IF;",
+    );
+    // Another variable, another message, or one branch only.
+    not_equal(t, &BY_SEVERITY.replace("v_n > 10", "v_b > 10"));
+    not_equal(t, &BY_SEVERITY.replacen("boom", "bang", 1));
+    not_equal(
+        t,
+        "  IF v_n > 10 THEN\n    RAISE EXCEPTION 'boom %', COALESCE(v_e, '(null)') USING ERRCODE = 'P0001';\n  END IF;",
+    );
+    not_equal(
+        t,
+        "  RAISE EXCEPTION 'boom %', COALESCE(v_e, '(null)') USING ERRCODE = 'P0001';",
+    );
+    // A bigint severity may overflow in T-SQL (Msg 8115).
+    not_equal(
+        "  RAISERROR('boom %s', @b, 1, @e);",
+        &BY_SEVERITY.replace("v_n > 10", "v_b > 10"),
+    );
+}
+
+#[test]
+fn t_sql_carries_on_after_a_severity_variable_error() {
+    let r = not_equal(
+        "  RAISERROR('boom %s', @n, 1, @e);\n  UPDATE dbo.t SET v = 1 WHERE id = @id;",
+        &format!("{BY_SEVERITY}\n  UPDATE t SET v = 1 WHERE id = p_id;"),
+    );
+    assert!(
+        r.findings.iter().any(|f| f.verdict == Verdict::Different),
+        "{:#?}",
+        r.findings
     );
 }
 
@@ -191,5 +248,55 @@ fn t_sql_carries_on_after_an_error() {
     equal(
         "  RAISERROR('step', 10, 1);\n  UPDATE dbo.t SET v = 1 WHERE id = @id;",
         "  RAISE NOTICE 'step';\n  UPDATE t SET v = 1 WHERE id = p_id;",
+    );
+}
+
+#[test]
+fn t_sql_carries_on_after_an_error_in_a_catch_or_under_xact_abort() {
+    // RAISERROR ignores XACT_ABORT ON, and in a CATCH block nothing catches
+    // it: the procedure goes on (SQL Server 2022). PL/pgSQL stops at RAISE.
+    // These were counted equal while the error path was left to other
+    // checks.
+    let r = run(
+        "  SET XACT_ABORT ON;\n  RAISERROR('boom', 16, 1);\n  RAISERROR('done', 10, 1);",
+        "  RAISE EXCEPTION 'boom' USING ERRCODE = 'P0001';\n  RAISE NOTICE 'done';",
+    );
+    assert_ne!(r.verdict(), Verdict::EqualUnderAssumptions, "{:?}", ids(&r));
+    assert!(
+        r.unknown_reasons
+            .iter()
+            .any(|x| x.contains("RAISERROR does not honour XACT_ABORT")),
+        "{:?}",
+        r.unknown_reasons
+    );
+    for sev in ["16", "@n"] {
+        let raise = if sev == "16" {
+            "    RAISE EXCEPTION 'caught' USING ERRCODE = 'P0001';".to_string()
+        } else {
+            "    IF v_n > 10 THEN\n      RAISE EXCEPTION 'caught' USING ERRCODE = 'P0001';\n    ELSE\n      RAISE NOTICE 'caught';\n    END IF;".to_string()
+        };
+        let r = run(
+            &format!("  BEGIN TRY\n    RAISERROR('boom', 16, 1);\n  END TRY\n  BEGIN CATCH\n    RAISERROR('caught', {sev}, 1);\n    RAISERROR('more', 10, 1);\n  END CATCH"),
+            &format!("  BEGIN\n    RAISE EXCEPTION 'boom' USING ERRCODE = 'P0001';\n  EXCEPTION WHEN OTHERS THEN\n{raise}\n    RAISE NOTICE 'more';\n  END;"),
+        );
+        assert_ne!(
+            r.verdict(),
+            Verdict::EqualUnderAssumptions,
+            "{sev}: {:?}",
+            ids(&r)
+        );
+        assert!(
+            r.unknown_reasons
+                .iter()
+                .any(|x| x.contains("line 13") && x.contains("goes on")),
+            "{sev}: {:?}",
+            r.unknown_reasons
+        );
+    }
+    // Inside TRY both sides go to the handler; last in the CATCH nothing
+    // runs after it.
+    equal(
+        "  BEGIN TRY\n    RAISERROR('boom', 16, 1);\n  END TRY\n  BEGIN CATCH\n    RAISERROR('caught', 16, 1);\n  END CATCH",
+        "  BEGIN\n    RAISE EXCEPTION 'boom' USING ERRCODE = 'P0001';\n  EXCEPTION WHEN OTHERS THEN\n    RAISE EXCEPTION 'caught' USING ERRCODE = 'P0001';\n  END;",
     );
 }
