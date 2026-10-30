@@ -37,6 +37,18 @@ pub mod asm {
         "ASM-TSQL-DATEFIRST-7",
         "The T-SQL session keeps SET DATEFIRST 7 (the us_english default): DATEPART(weekday) counts Sunday as 1",
     );
+    pub const PROCID_NAME: (&str, &str) = (
+        "ASM-PROCID-NAME",
+        "SQL Server stores the routine under the name and schema its header writes, letter for letter (OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) become them as literals)",
+    );
+    pub const TSQL_ANSI_NULLS: (&str, &str) = (
+        "ASM-TSQL-ANSI-NULLS",
+        "The T-SQL routine was created with ANSI_NULLS ON (its sys.sql_modules.uses_ansi_nulls is 1)",
+    );
+    pub const TSQL_QUOTED_IDENTIFIER: (&str, &str) = (
+        "ASM-TSQL-QUOTED-IDENTIFIER",
+        "The T-SQL routine was created with QUOTED_IDENTIFIER ON (its sys.sql_modules.uses_quoted_identifier is 1)",
+    );
     pub const SAME_DATABASE_NAME: (&str, &str) = (
         "ASM-SAME-DATABASE-NAME",
         "The PostgreSQL database has the same name, letter for letter, as the SQL Server database",
@@ -307,6 +319,99 @@ pub struct Canon<'a> {
     cursor_failed: HashMap<String, String>,
 }
 
+/// T-SQL `OBJECT_NAME(@@PROCID)` / `OBJECT_SCHEMA_NAME(@@PROCID)` in a
+/// procedure: its own name or schema as the header writes it
+/// (`asm::PROCID_NAME`). `None` elsewhere (a script's @@PROCID is 0, a
+/// trigger's is the trigger, an inline table-valued function or an inlined
+/// scalar function runs in its caller's query), for a temporary procedure,
+/// and for a schema the header leaves out (the creator's default schema).
+pub(super) fn own_name(u: &Unit, c: &Call) -> Option<String> {
+    let name = c.name.last()?.to_ascii_lowercase();
+    let schema = match name.as_str() {
+        "object_name" => false,
+        "object_schema_name" => true,
+        _ => return None,
+    };
+    let procid = matches!(c.args.as_slice(), [Expr::Var(v)] if v.eq_ignore_ascii_case("@@procid"));
+    if u.dialect != Dialect::Tsql
+        || c.name.len() != 1
+        || !procid
+        || c.distinct
+        || c.star
+        || u.kind != UnitKind::Proc
+    {
+        return None;
+    }
+    let parts = &u.routine_parts;
+    let last = parts.last().filter(|l| !l.starts_with('#'))?;
+    if !schema {
+        return Some(last.clone());
+    }
+    (parts.len() >= 2).then(|| parts[parts.len() - 2].clone())
+}
+
+/// T-SQL `(SELECT uses_ansi_nulls FROM sys.sql_modules WHERE object_id =
+/// @@PROCID) = 1` (or `uses_quoted_identifier`) in a procedure:
+/// the running routine tests its own setting, which every converted routine
+/// is assumed to have been created with (the converter writes `true`).
+fn module_setting_test(u: &Unit, e: &Expr) -> Option<(&'static str, &'static str)> {
+    if u.dialect != Dialect::Tsql || u.kind != UnitKind::Proc {
+        return None;
+    }
+    let Expr::Bin(op, l, r) = e else { return None };
+    let (Expr::Subquery(q), Expr::Num(one)) = (l.as_ref(), r.as_ref()) else {
+        return None;
+    };
+    if op != "=" || one != "1" {
+        return None;
+    }
+    let plain = q.ctes.is_empty()
+        && !q.for_json
+        && q.set_ops.is_empty()
+        && !q.distinct
+        && q.top.is_none()
+        && q.into.is_empty()
+        && q.group_by.is_empty()
+        && q.having.is_none()
+        && q.order_by.is_empty()
+        && q.offset.is_none()
+        && q.limit.is_none()
+        && q.locking.is_empty()
+        && q.values.is_none();
+    let is = |x: &str, y: &str| x.eq_ignore_ascii_case(y);
+    let modules = matches!(q.from.as_slice(), [From::Table { name, alias: None, hints }]
+        if hints.is_empty() && matches!(name.as_slice(), [s, m] if is(s, "sys") && is(m, "sql_modules")));
+    let procid = matches!(&q.where_, Some(Expr::Bin(op, c, v))
+        if op == "="
+            && matches!(c.as_ref(), Expr::Name(p) if matches!(p.as_slice(), [x] if is(x, "object_id")))
+            && matches!(v.as_ref(), Expr::Var(v) if is(v, "@@procid")));
+    let setting = match q.items.as_slice() {
+        [SelItem {
+            expr: Expr::Name(p),
+            alias: None,
+            assign: None,
+        }] => match p.as_slice() {
+            [x] if is(x, "uses_ansi_nulls") => asm::TSQL_ANSI_NULLS,
+            [x] if is(x, "uses_quoted_identifier") => asm::TSQL_QUOTED_IDENTIFIER,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    (plain && modules && procid).then_some(setting)
+}
+
+/// `e` with a T-SQL `OBJECT_NAME(@@PROCID)` (see `own_name`) read as the
+/// string literal it is.
+pub(super) fn own_name_literal<'e>(u: &Unit, e: &'e Expr) -> std::borrow::Cow<'e, Expr> {
+    match e {
+        Expr::Call(c) => match own_name(u, c) {
+            Some(s) => std::borrow::Cow::Owned(Expr::Str(s)),
+            None => std::borrow::Cow::Borrowed(e),
+        },
+        _ => std::borrow::Cow::Borrowed(e),
+    }
+}
+
 /// Lower-case hex digits of a byte string written in hex, `None` unless
 /// every character is a hex digit and they make whole bytes.
 pub(super) fn hex_bytes(s: &str) -> Option<String> {
@@ -540,6 +645,14 @@ impl<'a> Canon<'a> {
             &self.unit.local_temps,
             self.unit.routine.as_deref(),
         );
+        // T-SQL `sys.name` is SQL Server's own catalog view; a table of that
+        // name on another side is some other table, never its counterpart.
+        let key = match parts {
+            [.., s, _] if self.d != Dialect::Tsql && lc(s) == "sys" => {
+                format!("{}:{key}", self.d.id())
+            }
+            _ => key,
+        };
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);
@@ -1075,6 +1188,10 @@ impl<'a> Canon<'a> {
     // ---- expressions ----------------------------------------------------
 
     pub fn expr(&mut self, e: &Expr) -> R<(Term, Option<Ty>)> {
+        if let Some(x) = module_setting_test(self.unit, e) {
+            self.assume(x);
+            return self.expr(&Expr::Special("TRUE".into()));
+        }
         Ok(match e {
             Expr::Name(parts) => self.resolve(parts)?,
             Expr::Var(v) => {
@@ -1381,7 +1498,15 @@ impl<'a> Canon<'a> {
                 });
                 (n("case", kids), ty)
             }
-            Expr::Exists(q) => (n("exists", vec![self.query(q, QCtx::Exists)?.0]), None),
+            Expr::Exists(q) => match super::objcheck::of(q, self.d) {
+                // A catalog existence check: the same term on both sides
+                // when it looks for the same kind and name.
+                Some(c) => {
+                    self.assume(super::objcheck::ASSUMPTION);
+                    (n("catalog-exists", vec![a(c.kind.name()), a(c.name)]), None)
+                }
+                None => (n("exists", vec![self.query(q, QCtx::Exists)?.0]), None),
+            },
             Expr::Subquery(q) => {
                 let (t, ty) = self.query(q, QCtx::Scalar)?;
                 (n("subq", vec![t]), ty)
@@ -1856,6 +1981,13 @@ impl<'a> Canon<'a> {
         let d = self.d;
         let argc = c.args.len();
         let plain = !c.distinct && c.order.is_empty() && !c.star;
+        // OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID): the
+        // running procedure's or function's own name, as its header writes
+        // it (the converter writes the same literal).
+        if let Some(part) = own_name(self.unit, c) {
+            self.assume(asm::PROCID_NAME);
+            return self.expr(&Expr::Str(part));
+        }
         // Aggregates and functions with special forms first.
         match (d, name.as_str()) {
             (_, "count") if c.order.is_empty() => {

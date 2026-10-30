@@ -130,6 +130,15 @@ struct Parser<'a> {
 impl<'a> Parser<'a> {
     // ---- token access ----------------------------------------------------
 
+    /// Whether the trivia before the next significant token holds a line
+    /// break.
+    fn line_break_ahead(&self) -> bool {
+        self.tokens[self.pos..]
+            .iter()
+            .take_while(|t| t.kind.is_trivia())
+            .any(|t| self.src[t.start..t.end].contains('\n'))
+    }
+
     fn sig_index(&self, n: usize) -> Option<usize> {
         let mut seen = 0;
         for i in self.pos..self.tokens.len() {
@@ -492,6 +501,7 @@ impl<'a> Parser<'a> {
                 } else {
                     self.start_at(cp, BLOCK);
                     self.bump();
+                    self.bump_tsql_opener_semicolon();
                     self.with_stops(&["END"], |p| p.parse_list());
                     self.expect_end(None);
                     self.finish();
@@ -532,6 +542,7 @@ impl<'a> Parser<'a> {
         self.start(TRY_BLOCK);
         self.bump(); // BEGIN
         self.bump(); // TRY
+        self.bump_tsql_opener_semicolon();
         self.with_stops(&["END"], |p| p.parse_list());
         self.expect_end(Some("TRY"));
         self.finish();
@@ -540,6 +551,7 @@ impl<'a> Parser<'a> {
             self.start(CATCH_BLOCK);
             self.bump();
             self.bump();
+            self.bump_tsql_opener_semicolon();
             self.with_stops(&["END"], |p| p.parse_list());
             self.expect_end(Some("CATCH"));
             self.finish();
@@ -547,6 +559,15 @@ impl<'a> Parser<'a> {
             self.diag_here("expected BEGIN CATCH");
         }
         self.finish();
+    }
+
+    /// T-SQL accepts a terminator right after `BEGIN`, `BEGIN TRY` and
+    /// `BEGIN CATCH` (`BEGIN TRY;`); it belongs to the opener, not to an
+    /// empty statement in the block.
+    fn bump_tsql_opener_semicolon(&mut self) {
+        if self.nth_kind(0) == Some(SEMICOLON) {
+            self.bump();
+        }
     }
 
     fn parse_pg_block(&mut self, cp: Checkpoint) {
@@ -1013,8 +1034,14 @@ impl<'a> Parser<'a> {
         let mut prev_word = String::new();
         let mut prev_kind = None;
         let mut seen: HashSet<String> = HashSet::new();
+        // A SQLCMD directive (`:r file`, `:setvar x y`) is one line.
+        let sqlcmd = tsql && self.nth_kind(0) == Some(COLON);
         while let Some(k) = self.nth_kind(0) {
             if k == BATCH_SEP {
+                break;
+            }
+            if sqlcmd && !first && self.line_break_ahead() {
+                self.builder.token(INFERRED_TERMINATOR.into(), "");
                 break;
             }
             if k == SEMICOLON {
@@ -1201,6 +1228,34 @@ mod tests {
             .find(|n| n.kind() == STATEMENT && ast::first_words(n, 1) == ["ROLLBACK"])
             .unwrap();
         assert!(ast::ends_with_inferred_terminator(&rollback));
+    }
+
+    /// SQLCMD directives are one line each, even without `GO` between them.
+    #[test]
+    fn tsql_sqlcmd_directive_is_one_line() {
+        let u = units(
+            ":r .\\a.sql\n:r \"..\\b c.sql\"\n:setvar x 1\nSELECT 1",
+            Dialect::Tsql,
+        );
+        assert_eq!(u.len(), 4, "{u:?}");
+    }
+
+    /// `BEGIN TRY;`, `BEGIN CATCH;` and `BEGIN;`: the terminator belongs to
+    /// the opener, so no empty statement starts the block.
+    #[test]
+    fn tsql_terminator_after_block_opener() {
+        let text = "BEGIN TRY;\n INSERT INTO t VALUES (1)\nEND TRY\nBEGIN CATCH;\n THROW\nEND CATCH;\nIF @a = 1\nBEGIN;\n SET @b = 2;\nEND;";
+        let p = parse(text, Dialect::Tsql);
+        assert!(p.diagnostics.is_empty(), "{:?}", p.diagnostics);
+        let root = p.syntax();
+        let stmts: Vec<String> = root
+            .descendants()
+            .filter(|n| n.kind() == STATEMENT)
+            .map(|n| n.text().to_string().trim().to_string())
+            .collect();
+        assert!(stmts.iter().all(|s| s != ";"), "{stmts:?}");
+        assert_eq!(stmts.len(), 3, "{stmts:?}");
+        assert_eq!(root.to_string(), text);
     }
 
     #[test]

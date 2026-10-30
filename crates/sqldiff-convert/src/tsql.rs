@@ -34,6 +34,9 @@ const BIT_SMALLINT: &str = "BIT becomes SMALLINT, which keeps comparisons with 1
 
 /// Rule id of a refusal because of where the unit stands.
 const CONTEXT: &str = "not-converted.context";
+/// The rule of a statement refused for SQL Server metadata (`sys.*`,
+/// SERVERPROPERTY, OBJECT_ID, …), so the review lists them as one group.
+const METADATA: &str = "tsql.server-metadata";
 
 /// The idiom rules (`sqldiff_core::rules`), for what the token rules refuse.
 mod rules {
@@ -60,6 +63,7 @@ pub(crate) fn convert(
         seen_work: false,
         tables: HashMap::new(),
         routine: None,
+        routine_parts: Vec::new(),
         rolls_back: false,
         savepoints: Vec::new(),
         vars: HashMap::new(),
@@ -187,6 +191,9 @@ struct Cx<'a> {
     /// Name of the routine being converted: part of its table variables'
     /// temporary table names (`classify::table_variable_table`).
     routine: Option<String>,
+    /// The name parts of the procedure or function being converted, as its
+    /// header writes them, unquoted (`OBJECT_NAME(@@PROCID)`).
+    routine_parts: Vec<String>,
     /// The routine or script rolls back outside a CATCH that only rolls back
     /// and rethrows (PostgreSQL: a rollback empties a temporary table).
     rolls_back: bool,
@@ -390,10 +397,16 @@ impl<'a> Cx<'a> {
                 format!("RAISE EXCEPTION '{msg}';\n")
             });
         }
+        let metadata = self
+            .notes
+            .iter()
+            .any(|n| n.rule == METADATA && n.text == reason);
         self.notes.clear();
         self.trace.clear();
         let rule = if std::mem::take(&mut self.context) {
             CONTEXT
+        } else if metadata {
+            "not-converted.server-metadata"
         } else {
             "not-converted"
         };
@@ -447,6 +460,7 @@ impl<'a> Cx<'a> {
         self.tables.clear();
         self.own_tables.clear();
         self.routine = None;
+        self.routine_parts.clear();
         self.rolls_back = false;
         self.savepoints.clear();
         self.dynamic.clear();
@@ -601,6 +615,7 @@ impl<'a> Cx<'a> {
     fn proc_or_func(&mut self, out: &mut Out, r: &SyntaxNode, func: bool) -> R<Option<String>> {
         self.reset();
         self.routine = sqldiff_syntax::ast::routine_name(r);
+        self.routine_parts = sqldiff_syntax::ast::routine_name_parts(r);
         self.rolls_back = rolls_back(r);
         self.ret_bit = false;
         self.return_code = false;
@@ -1851,6 +1866,23 @@ impl<'a> Cx<'a> {
                 let label = s.get(1).map(|&i| tsql_unquote(&ts[i].s)).unwrap_or_default();
                 return no(goto(n, &label));
             }
+            ":" if w(1) == "R" && !self.db2() => {
+                // The file named after `:r`, as written (quotes removed).
+                let path = self.source(&ts[s[1]..]);
+                let path = path[path.find([' ', '\t']).unwrap_or(path.len())..]
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .trim_matches('"')
+                    .to_string();
+                if path.is_empty() || path.contains("$(") {
+                    return no(sqlcmd(&w(1)));
+                }
+                let unix = path.replace('\\', "/");
+                self.note(Status::Decision, "tsql.sqlcmd-include", &format!("`:r {path}` is a SQLCMD include, not SQL, and was dropped. The included file is converted on its own, under the same path in the output tree: run its conversion at this point (with psql: \\ir '{}').", unix.replace('\'', "''")));
+                self.step_ts_with("tsql.stmt.sqlcmd-include", &ts, "dropped");
+                format!("-- :r {path}: run the converted file here (psql: \\ir '{}')", unix.replace('\'', "''"))
+            }
             ":" => return no(sqlcmd(&w(1))),
             "DROP" => {
                 if w(1) == "INDEX" && find_word(&ts, s[1], "ON").is_some() {
@@ -1885,6 +1917,20 @@ impl<'a> Cx<'a> {
                 "USE: connect to the other database instead; PostgreSQL cannot switch databases in a session",
                 "USE: Db2 for i has one database per system; use SET SCHEMA or qualify names with the library",
             )),
+            "WAITFOR" => return no(self.pick(
+                "WAITFOR: PostgreSQL's pg_sleep waits a number of seconds; WAITFOR DELAY takes a time of day as text or datetime and WAITFOR TIME a clock time; no checked rule for converting the value",
+                "WAITFOR: Db2 for i SQL has no statement that waits; no rule",
+            )),
+            "BEGIN" if w(1) == "ATOMIC" => return no("BEGIN ATOMIC WITH (…): the body of a natively compiled module (In-Memory OLTP), with its own isolation level and language; no rule (convert it as an ordinary body after review)"),
+            "ALTER" if w(1) == "ROLE" && matches!(w(3).as_str(), "ADD" | "DROP") => return no(self.pick(
+                "ALTER ROLE … ADD/DROP MEMBER: PostgreSQL's forms are GRANT role TO member and REVOKE role FROM member, but the role and the database user it names map to PostgreSQL roles only by a decision about logins and users, which has no rule",
+                "ALTER ROLE … ADD/DROP MEMBER: Db2 for i has no database roles; grant to group profiles instead; no rule",
+            )),
+            "ALTER" if w(1) == "INDEX" => return no(self.pick(
+                "ALTER INDEX (REBUILD, REORGANIZE, DISABLE, SET …): maintenance with no exact PostgreSQL counterpart (REINDEX rebuilds, nothing disables an index); no rule",
+                "ALTER INDEX: maintenance with no exact Db2 for i counterpart; no rule",
+            )),
+            "REVERT" => return no("REVERT ends an EXECUTE AS context, which is not converted; no rule"),
             _ => return no("no rule for this statement yet"),
         };
         let text = dedent(text.trim_end(), ind);
@@ -5889,6 +5935,26 @@ impl<'a> Cx<'a> {
                 return end;
             }
         }
+        if !self.db2() && t.k == L_PAREN {
+            if let Some((setting, end)) = module_setting_test(ts, i) {
+                if self.own_name_part(false).is_ok() {
+                    let (rule, why) = match setting {
+                        "uses_ansi_nulls" => (
+                            "ASM-TSQL-ANSI-NULLS",
+                            "the routine was created with ANSI_NULLS ON",
+                        ),
+                        _ => (
+                            "ASM-TSQL-QUOTED-IDENTIFIER",
+                            "the routine was created with QUOTED_IDENTIFIER ON",
+                        ),
+                    };
+                    self.step_ts("tsql.expr.module-setting", &ts[i..end]);
+                    self.note(Status::Assumptions, rule, &format!("(SELECT {setting} FROM sys.sql_modules WHERE object_id = @@PROCID) = 1 reads the running routine's own setting and becomes true: {why}, the setting every converted routine is assumed to have."));
+                    o.push_str("true");
+                    return end;
+                }
+            }
+        }
         match t.k {
             INFERRED_TERMINATOR => {}
             VARIABLE => {
@@ -5903,6 +5969,11 @@ impl<'a> Cx<'a> {
                 return self.drop_dbo(ts, i);
             }
             QUOTED_IDENT => {
+                if tsql_unquote(&t.s).eq_ignore_ascii_case("sys")
+                    && next_sig(ts, i).is_some_and(|d| ts[d].k == DOT)
+                {
+                    self.sys_catalog_note(ts, i);
+                }
                 let q = quoted(&t.s);
                 if q != t.s {
                     self.step_ts("tsql.expr.quoted-ident", &ts[i..=i]);
@@ -6014,6 +6085,16 @@ impl<'a> Cx<'a> {
                         return r + 1;
                     }
                 }
+                if up == "EXISTS" && !self.db2() {
+                    if let Some((text, end)) = self.catalog_exists(ts, nx) {
+                        self.step_ts("tsql.catalog.exists", &ts[i..=end]);
+                        o.push_str(&text);
+                        return end + 1;
+                    }
+                }
+                if up == "SYS" && nx.is_some_and(|d| ts[d].k == DOT) {
+                    self.sys_catalog_note(ts, i);
+                }
                 if up == "STRING_AGG" {
                     if let Some((text, end)) = self.string_agg(ts, nx) {
                         self.step_ts("tsql.func.string_agg", &ts[i..=end]);
@@ -6074,7 +6155,7 @@ impl<'a> Cx<'a> {
                             ts[q].is("AS") && next_sig(ts, q).is_some_and(|p| ts[p].k == L_PAREN)
                         });
                         if call {
-                            self.unmapped_builtin(&t.s);
+                            self.unmapped_builtin(&t.s, &ts[p + 1..r]);
                         }
                     }
                 }
@@ -6389,6 +6470,29 @@ impl<'a> Cx<'a> {
         Some(r)
     }
 
+    /// The running procedure's own name (`OBJECT_NAME(@@PROCID)`) or schema
+    /// (`OBJECT_SCHEMA_NAME(@@PROCID)`), as its header writes it, or why it
+    /// is not known.
+    fn own_name_part(&self, schema: bool) -> Result<String, &'static str> {
+        if self.mode != Mode::Proc || self.trigger.is_some() {
+            return Err("only a procedure's own name is known here (outside a module @@PROCID is 0, in a trigger it is the trigger's id, and an inlined function may see its caller's)");
+        }
+        let parts = &self.routine_parts;
+        let Some(last) = parts.last() else {
+            return Err("the routine's name could not be read");
+        };
+        if last.starts_with('#') {
+            return Err("a temporary procedure's stored name is not the name it was created with");
+        }
+        if !schema {
+            return Ok(last.clone());
+        }
+        match parts.len() {
+            n if n >= 2 => Ok(parts[n - 2].clone()),
+            _ => Err("the header names no schema, so the routine's schema is its creator's default schema, which the source does not show"),
+        }
+    }
+
     fn now(&mut self) -> String {
         if self.db2() {
             self.note(Status::Assumptions, "ASM-TIME-SOURCE", "Current time: both evaluate once per statement (fact V20), but Db2 for i uses the job's time zone where T-SQL uses the server clock. Equal if the job runs in the server's time zone. CURRENT TIMESTAMP has 6 fractional digits.");
@@ -6546,6 +6650,21 @@ impl<'a> Cx<'a> {
                 self.note(Status::NotConverted, "tsql.datediff", "DATEDIFF counts boundaries crossed (DATEDIFF(year, '2024-12-31', '2025-01-01') = 1); PostgreSQL subtraction gives elapsed time. Needs a per-unit rewrite.");
                 return None;
             }
+            ("OBJECT_NAME" | "OBJECT_SCHEMA_NAME", 1) if is_procid(a[0]) => {
+                let part = match self.own_name_part(name == "OBJECT_SCHEMA_NAME") {
+                    Ok(p) => p,
+                    Err(why) => {
+                        self.note(
+                            Status::NotConverted,
+                            &format!("tsql.{}", name.to_ascii_lowercase()),
+                            &format!("{name}(@@PROCID): {why}"),
+                        );
+                        return None;
+                    }
+                };
+                self.note(Status::Assumptions, "ASM-PROCID-NAME", PROCID_NAME);
+                format!("'{}'", part.replace('\'', "''"))
+            }
             (
                 "OBJECT_ID" | "FORMAT" | "STR" | "STUFF" | "PATINDEX" | "DATENAME" | "SUSER_SNAME"
                 | "XACT_STATE" | "ERROR_SEVERITY" | "ERROR_STATE" | "ERROR_LINE"
@@ -6556,11 +6675,12 @@ impl<'a> Cx<'a> {
                     Some(why) => format!("{name}(): {why}"),
                     None => format!("{name}() has no rule yet."),
                 };
-                self.note(
-                    Status::NotConverted,
-                    &format!("tsql.{}", name.to_ascii_lowercase()),
-                    &text,
-                );
+                let rule = if server_metadata(name) {
+                    METADATA.to_string()
+                } else {
+                    format!("tsql.{}", name.to_ascii_lowercase())
+                };
+                self.note(Status::NotConverted, &rule, &text);
                 return None;
             }
             _ => return None,
@@ -6719,25 +6839,95 @@ impl<'a> Cx<'a> {
 
     /// A call kept as written must exist in the target: a T-SQL built-in the
     /// target does not have refuses the unit instead of passing through.
-    fn unmapped_builtin(&mut self, name: &str) {
+    /// PostgreSQL: `EXISTS (…)` at `ts[open]` that checks whether a dbo
+    /// table or procedure exists (`sqldiff_core::equiv::objcheck`) becomes
+    /// the same check on pg_catalog. The text and the closing parenthesis.
+    fn catalog_exists(&mut self, ts: &[T], open: Option<usize>) -> Option<(String, usize)> {
+        use sqldiff_core::equiv::objcheck;
+        let open = open.filter(|&p| ts[p].k == L_PAREN)?;
+        let close = matching(ts, open)?;
+        let inner = &ts[open + 1..close];
+        let text: Vec<&str> = sig(inner)
+            .into_iter()
+            .map(|i| inner[i].s.as_str())
+            .collect();
+        let root = sqldiff_syntax::parse(&text.join(" "), Dialect::Tsql).syntax();
+        let toks = sqldiff_syntax::abstract_syntax::tokens(&root);
+        let mut p = sqldiff_syntax::abstract_syntax::Parser::new(&toks, Dialect::Tsql);
+        let q = p.select().ok()?;
+        if !p.at_end() {
+            return None;
+        }
+        let c = objcheck::tsql(&q)?;
+        let what = match c.kind {
+            objcheck::Kind::Table => "table (relkind r or p)",
+            objcheck::Kind::Procedure => "procedure (prokind p)",
+        };
+        let text = format!(
+            "The check whether dbo.{} exists becomes the same check on pg_catalog: a {what} of that name, compared without regard to letter case, in the default schema (current_schema()), where the converted object is created. {}.",
+            c.name,
+            objcheck::ASSUMPTION.1
+        );
+        self.note(Status::Assumptions, objcheck::ASSUMPTION.0, &text);
+        Some((objcheck::postgres_text(&c), close))
+    }
+
+    /// `sys.name` at `ts[i]`: a SQL Server catalog view, dynamic management
+    /// view or system function, which the target does not have.
+    fn sys_catalog_note(&mut self, ts: &[T], i: usize) {
+        let Some(n) = next_sig(ts, i).and_then(|d| next_sig(ts, d)) else {
+            return;
+        };
+        if !matches!(ts[n].k, IDENT | QUOTED_IDENT) {
+            return;
+        }
+        let name = tsql_unquote(&ts[n].s).to_ascii_lowercase();
+        // System procedures (sys.sp_executesql, sys.sp_addextendedproperty)
+        // and types (sys.geography) have rules of their own.
+        if name.starts_with("sp_") || KNOWN_TYPES.contains(&name.to_ascii_uppercase().as_str()) {
+            return;
+        }
+        let text = if self.db2() {
+            format!("sys.{name} is SQL Server's system catalog; Db2 for i keeps its own catalog (QSYS2) with other rows and columns: rewrite this lookup by hand.")
+        } else {
+            format!("sys.{name}: {}", sys_catalog_refusal(&name))
+        };
+        self.note(Status::NotConverted, METADATA, &text);
+    }
+
+    fn unmapped_builtin(&mut self, name: &str, args: &[T]) {
         use sqldiff_core::catalog::builtins::{self, Availability};
         let tsql = builtins::of(Dialect::Tsql).function(name, "9999") != Availability::Unknown;
         let target = builtins::of(self.to).function(name, "9999") != Availability::Unknown;
         if tsql && !target {
             let up = name.to_ascii_uppercase();
+            // SERVERPROPERTY's property says what the check is about.
+            let prop = match sig(args).as_slice() {
+                [i] if up == "SERVERPROPERTY" && args[*i].k == STRING => {
+                    let p = string_value(&args[*i].s);
+                    serverproperty_refusal(&p).map(|why| (p, why))
+                }
+                _ => None,
+            };
             let why = if self.db2() {
                 None
             } else {
                 builtin_refusal(&up)
             };
-            let text = match why {
-                Some(why) => format!("{up}(): {why}"),
-                None => format!(
+            let text = match (prop, why) {
+                (Some((p, why)), _) if !self.db2() => format!("{up}('{p}'): {why}"),
+                (_, Some(why)) => format!("{up}(): {why}"),
+                _ => format!(
                     "{up}() is a T-SQL built-in that {} does not have; no rule yet.",
                     self.to.display_name()
                 ),
             };
-            self.note(Status::NotConverted, "tsql.builtin", &text);
+            let rule = if server_metadata(&up) {
+                METADATA
+            } else {
+                "tsql.builtin"
+            };
+            self.note(Status::NotConverted, rule, &text);
         }
     }
 
@@ -8198,6 +8388,45 @@ fn date_part(p: &str) -> Option<&'static str> {
     })
 }
 
+/// `ASM-PROCID-NAME`: `OBJECT_NAME(@@PROCID)` and `OBJECT_SCHEMA_NAME(@@PROCID)`
+/// become the routine's own name and schema as literals.
+const PROCID_NAME: &str = "OBJECT_NAME(@@PROCID) / OBJECT_SCHEMA_NAME(@@PROCID) become the routine's own name and schema as its header writes them: equal while SQL Server stores the routine under that name, letter for letter (it was not renamed with sp_rename, nor first created under a name of another letter case and then altered).";
+
+/// `(SELECT uses_ansi_nulls FROM sys.sql_modules WHERE [object_id] =
+/// @@PROCID) = 1` (or `uses_quoted_identifier`) at `ts[i]`, the opening
+/// parenthesis: the setting and the index after the `1`.
+fn module_setting_test(ts: &[T], i: usize) -> Option<(&'static str, usize)> {
+    let s: Vec<usize> = sig(&ts[i..]).into_iter().map(|k| k + i).take(14).collect();
+    let w = |k: usize| s.get(k).map(|&j| &ts[j]);
+    let word = |k: usize, x: &str| {
+        w(k).is_some_and(|t| {
+            matches!(t.k, IDENT | QUOTED_IDENT) && tsql_unquote(&t.s).eq_ignore_ascii_case(x)
+        })
+    };
+    let setting = ["uses_ansi_nulls", "uses_quoted_identifier"]
+        .into_iter()
+        .find(|x| word(2, x))?;
+    let ok = w(0).is_some_and(|t| t.k == L_PAREN)
+        && w(1).is_some_and(|t| t.is("SELECT"))
+        && w(3).is_some_and(|t| t.is("FROM"))
+        && word(4, "sys")
+        && w(5).is_some_and(|t| t.k == DOT)
+        && word(6, "sql_modules")
+        && w(7).is_some_and(|t| t.is("WHERE"))
+        && word(8, "object_id")
+        && w(9).is_some_and(|t| t.k == OP && t.s == "=")
+        && w(10).is_some_and(|t| t.k == VARIABLE && t.s.eq_ignore_ascii_case("@@PROCID"))
+        && w(11).is_some_and(|t| t.k == R_PAREN)
+        && w(12).is_some_and(|t| t.k == OP && t.s == "=")
+        && w(13).is_some_and(|t| t.k == NUMBER && t.s == "1");
+    ok.then(|| (setting, s[13] + 1))
+}
+
+/// An argument that is exactly `@@PROCID`.
+fn is_procid(arg: &[T]) -> bool {
+    matches!(sig(arg).as_slice(), [i] if arg[*i].k == VARIABLE && arg[*i].s.eq_ignore_ascii_case("@@PROCID"))
+}
+
 /// Why a T-SQL built-in has no rule: the ones whose result describes SQL
 /// Server itself, or whose target counterpart was checked and differs.
 fn builtin_refusal(name: &str) -> Option<&'static str> {
@@ -8221,6 +8450,70 @@ fn builtin_refusal(name: &str) -> Option<&'static str> {
         "FORMAT" => "uses .NET format strings and culture; to_char's patterns differ. No checked rule.",
         _ => return None,
     })
+}
+
+/// T-SQL built-ins that read SQL Server's own metadata (instance, database,
+/// object ids): their refusals share one rule, `tsql.server-metadata`, with
+/// the `sys` views, so a reviewer finds them in one group.
+fn server_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "SERVERPROPERTY"
+            | "DATABASEPROPERTYEX"
+            | "OBJECT_ID"
+            | "DB_ID"
+            | "SCHEMA_NAME"
+            | "SCHEMA_ID"
+            | "OBJECTPROPERTY"
+            | "OBJECTPROPERTYEX"
+            | "COLUMNPROPERTY"
+            | "INDEXPROPERTY"
+            | "TYPE_ID"
+            | "HAS_PERMS_BY_NAME"
+            | "IS_ROLEMEMBER"
+            | "IS_SRVROLEMEMBER"
+    )
+}
+
+/// Why SERVERPROPERTY(prop) is not converted, by property (SQL Server 2022
+/// documents each one under SERVERPROPERTY).
+fn serverproperty_refusal(prop: &str) -> Option<&'static str> {
+    Some(match prop.trim().to_ascii_lowercase().as_str() {
+        "isxtpsupported" => "IsXTPSupported asks whether the instance supports In-Memory OLTP. PostgreSQL has no memory-optimized tables (a converted MEMORY_OPTIMIZED table is an ordinary table), so a branch that sets up In-Memory OLTP has no PostgreSQL meaning: decide by hand whether it runs (usually: drop it).",
+        "isfulltextinstalled" => "IsFullTextInstalled asks whether SQL Server's full-text search is installed. PostgreSQL's text search (tsvector, GIN indexes) is built in but works differently: rewrite the full-text set-up by hand.",
+        "ispolybaseinstalled" => "IsPolybaseInstalled asks whether PolyBase is installed. PostgreSQL reads external data through foreign data wrappers instead: rewrite the external-table set-up by hand.",
+        "productversion" | "productmajorversion" | "productminorversion" | "productbuild"
+        | "productbuildtype" | "productlevel" | "productupdatelevel" | "productupdatetype"
+        | "productupdatereference" | "resourceversion" => "the SQL Server version or update level. PostgreSQL numbers its versions differently (server_version_num), so a version check written for SQL Server does not carry over: decide by hand which PostgreSQL versions the code needs.",
+        "engineedition" | "editionid" | "edition" => "the SQL Server edition (Enterprise, Express, Azure SQL Database = 5, Managed Instance = 8, …). PostgreSQL has no editions: decide by hand which branch applies on PostgreSQL.",
+        "ishadrenabled" | "isclustered" | "hadrmanagerstatus" => "whether the instance runs Always On availability groups or a failover cluster. PostgreSQL replication and failover are configured differently and have no such property: rewrite the high-availability checks by hand.",
+        "servername" | "instancename" | "machinename" | "computernamephysicalnetbios" => "the SQL Server instance or machine name. PostgreSQL has no instance name (cluster_name and inet_server_addr() are other things): write the name the code needs as a value.",
+        "instancedefaultbackuppath" | "instancedefaultdatapath" | "instancedefaultlogpath" => "a SQL Server default directory. PostgreSQL backups are taken outside SQL (pg_dump, pg_basebackup) and have no server-side default path.",
+        "collation" | "collationid" | "lcid" | "sqlsortorder" | "sqlsortordername"
+        | "sqlcharset" | "sqlcharsetname" | "comparisonstyle" => "the instance's default collation. PostgreSQL databases have their own collation and ctype (pg_database.datcollate), named differently: decide by hand what the check needs.",
+        _ => return None,
+    })
+}
+
+/// Why `sys.name` is not converted.
+fn sys_catalog_refusal(name: &str) -> &'static str {
+    match name {
+        "database_principals" | "server_principals" | "database_role_members"
+        | "server_role_members" | "database_permissions" | "server_permissions"
+        | "sql_logins" | "login_token" | "user_token" => "SQL Server security principals and permissions. PostgreSQL roles are shared by the whole cluster and are neither SQL Server logins nor database users or roles: rewrite the security check by hand (pg_roles, pg_auth_members, has_*_privilege).",
+        "server_audits" | "server_audit_specifications" | "database_audit_specifications"
+        | "server_audit_specification_details" | "database_audit_specification_details" => "SQL Server Audit. PostgreSQL has no built-in audit (the pgaudit extension is configured differently): drop or rewrite the auditing set-up by hand.",
+        "column_master_keys" | "column_encryption_keys" | "column_encryption_key_values"
+        | "symmetric_keys" | "asymmetric_keys" | "certificates" | "credentials" => "SQL Server encryption keys, certificates and credentials (Always Encrypted, TDE). PostgreSQL has no such objects: the encryption set-up does not carry over and needs a decision.",
+        "external_data_sources" | "external_file_formats" | "external_tables" => "PolyBase external data. PostgreSQL reads external data through foreign data wrappers: rewrite by hand.",
+        "databases" | "master_files" | "database_files" | "configurations" | "filegroups"
+        | "data_spaces" | "partition_schemes" | "partition_functions"
+        | "destination_data_spaces" | "backup_devices" | "availability_groups"
+        | "availability_replicas" | "availability_databases_cluster" => "SQL Server instance, storage or availability configuration. PostgreSQL keeps its own (pg_database, pg_settings, tablespaces, replication settings) with other rows and meanings: rewrite this lookup by hand.",
+        n if n.starts_with("dm_") => "a dynamic management view of the running SQL Server (sessions, requests, backups, availability groups). PostgreSQL's statistics views (pg_stat_activity, pg_stat_replication, …) report other things: rewrite this lookup by hand.",
+        n if n.starts_with("fn_") => "a SQL Server system function. PostgreSQL has no counterpart with the same result: rewrite by hand.",
+        _ => "SQL Server's system catalog. PostgreSQL keeps its own catalog (pg_catalog, information_schema) with other rows, columns and ids. Only a check whether a dbo table or procedure exists is converted (EXISTS (SELECT * FROM sys.objects WHERE object_id = OBJECT_ID(N'dbo.X') AND type IN (N'U')), or the same through sys.schemas by name); rewrite this lookup by hand.",
+    }
 }
 
 /// DATEPART's `weekday` and its abbreviations.

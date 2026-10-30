@@ -234,6 +234,13 @@ fact = "The data never holds an empty string or an exponent where it is cast."
 sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[assumption]]
+id = "ASM-CATALOG-EXISTS"
+statement = "A check whether a dbo table or procedure exists sees the same objects on both sides: the SQL Server user table (type U) or T-SQL procedure (type P) exists exactly when its converted table (relkind r or p) or procedure (prokind p) exists in PostgreSQL's default schema when the check runs, under a name equal up to letter case; the session running the check can see the object in SQL Server's catalog (holds a permission on it), the SQL Server database collation is case-insensitive, and no CLR procedure (type PC) of that name exists."
+discharge = "deployment"
+fact = "The PostgreSQL default schema holds the converted counterparts of the SQL Server tables and procedures such checks name, and no others of those names; the sessions running the checks hold a permission on those objects in SQL Server; the SQL Server database collation is case-insensitive; dbo has no CLR procedure of those names."
+sites = ["sqldiff-core/src/equiv/objcheck.rs"]
+
+[[assumption]]
 id = "ASM-CI-COLLATION"
 statement = "String comparisons give the same result on both sides: no compared value differs from another only in letter case, in trailing spaces, or in characters T-SQL's collation treats as equal (T-SQL ignores trailing spaces in =, <> and <, and its default collation equates N'æ' and N'ae', N'ß' and N'ss', full- and half-width letters, and ignores NCHAR(0) in nvarchar; PostgreSQL varchar and text under a deterministic collation do none of this). For LIKE on varchar with a literal pattern (no [ or \\): no tested value has trailing spaces (T-SQL varchar drops them: 'ab ' LIKE '%b' is true) or matches its pattern only up to letter case or such characters (N'æx' LIKE N'ae%' is true in T-SQL). Covers equality, IN lists, joins, GROUP BY, DISTINCT, LIKE, unique keys and foreign keys, and the substrings REPLACE and CHARINDEX find (T-SQL finds 'b' in 'ABC', PostgreSQL's replace and strpos do not); not ordering."
 discharge = "catalog"
@@ -785,6 +792,13 @@ fact = "The operands' types."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-PROCID-NAME"
+statement = "SQL Server stores the routine under the name and schema its header writes, letter for letter (OBJECT_NAME(@@PROCID) and OBJECT_SCHEMA_NAME(@@PROCID) become them as literals)."
+discharge = "catalog"
+fact = "sys.objects name and schema of the routine: not renamed with sp_rename, nor first created under another letter case and then altered."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-QUOTENAME-IDENT"
 statement = "The result of QUOTENAME is used as an identifier, never as text, and is at most 128 characters."
 discharge = "nothing"
@@ -1113,7 +1127,7 @@ id = "ASM-TSQL-ANSI-NULLS"
 statement = "The T-SQL routine was created with ANSI_NULLS ON: = and <> with NULL are UNKNOWN."
 discharge = "catalog"
 fact = "sys.sql_modules.uses_ansi_nulls for the routine."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ANSI-NULL-DEFAULT"
@@ -1190,7 +1204,7 @@ id = "ASM-TSQL-QUOTED-IDENTIFIER"
 statement = "The T-SQL routine was created with QUOTED_IDENTIFIER ON, so a double-quoted identifier in it is a name, not a string."
 discharge = "deployment"
 fact = "The session setting the routines were deployed with (sys.sql_modules.uses_quoted_identifier)."
-sites = ["sqldiff-convert/src/cert.rs"]
+sites = ["sqldiff-convert/src/cert.rs", "sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-TSQL-ARITH-ERRORS"

@@ -23,7 +23,29 @@ fn reason(src: &str) -> String {
 
 #[test]
 fn sqlcmd_is_not_sql() {
-    assert!(reason(":r .\\pds100-ins-app-people.sql\n").contains("includes another file"));
+    // `:r` is an include: dropped with a decision to run the included
+    // file's conversion there; the engine compared nothing, so not proven.
+    let c = pg(":r .\\pds100-ins-app-people.sql\n:r \"..\\x\\b.sql\"\nSELECT 1;\n");
+    let r: Vec<_> = c.units.iter().filter(|u| u.src.line <= 2).collect();
+    assert_eq!(r.len(), 2, "{:#?}", c.units);
+    for u in r {
+        assert_eq!(u.status, Status::Unproven, "{}", c.output);
+        assert!(
+            u.notes
+                .iter()
+                .any(|n| n.status == Status::Decision && n.text.contains("SQLCMD include")),
+            "{:#?}",
+            u.notes
+        );
+    }
+    assert!(
+        c.output.contains("\\ir './pds100-ins-app-people.sql'"),
+        "{}",
+        c.output
+    );
+    assert!(c.output.contains("\\ir '../x/b.sql'"), "{}", c.output);
+    // An include named by a SQLCMD variable stays not converted.
+    assert!(reason(":r $(Dir)\\a.sql\n").contains("includes another file"));
     let r = reason("SELECT * FROM [$(Db)].dbo.t;\n");
     assert!(
         r.contains("SQLCMD variable") && r.contains("template"),
