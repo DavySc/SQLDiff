@@ -140,7 +140,8 @@ fn character_functions() {
 #[test]
 fn charindex_of_an_empty_needle_is_zero() {
     // strpos finds '' at 1, CHARINDEX nowhere (0): only a needle that cannot
-    // be empty is passed straight through.
+    // be empty is passed straight through. The correction keeps NULL for a
+    // NULL argument, as CHARINDEX does (CHARINDEX('', NULL) is NULL).
     let (_, line) = run("SET @i = CHARINDEX(N'a', @s);");
     assert_eq!(line, "v_i := strpos(p_s, 'a');");
     let (_, line) = run("SET @i = CHARINDEX(@s + N',', N'a,b');");
@@ -148,7 +149,7 @@ fn charindex_of_an_empty_needle_is_zero() {
     let (_, line) = run("SET @i = CHARINDEX(@s, N'abc');");
     assert_eq!(
         line,
-        "v_i := (CASE WHEN length(p_s) = 0 THEN 0 ELSE strpos('abc', p_s) END);"
+        "v_i := (strpos('abc', p_s) - (length(p_s) = 0)::int);"
     );
     refused("SET @i = CHARINDEX(LTRIM(@s), N'abc');", "computed needle");
 }
@@ -204,7 +205,7 @@ fn substring_matches_are_proven_under_the_collation_assumption() {
     proven_ci("SET @i = CHARINDEX(N',', @s);", "v_i := strpos(p_s, ',');");
     proven_ci(
         "SET @i = CHARINDEX(@s, N'abc');",
-        "v_i := (CASE WHEN length(p_s) = 0 THEN 0 ELSE strpos('abc', p_s) END);",
+        "v_i := (strpos('abc', p_s) - (length(p_s) = 0)::int);",
     );
 }
 

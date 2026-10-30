@@ -14,8 +14,10 @@ use sqldiff_gui::convert_review::{
 
 const ASSUMING: &str = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  UPDATE dbo.t SET a = 1;\nEND\n";
 const ASSUMING_2: &str = "CREATE PROCEDURE dbo.p2 AS\nBEGIN\n  UPDATE dbo.t SET a = 2;\nEND\n";
+// A parameter without a default after one with a default: PostgreSQL
+// needs them reordered, a decision.
 const DECIDING: &str =
-    "CREATE PROCEDURE dbo.q AS\nBEGIN\n  DECLARE @f bit = 1;\n  UPDATE t SET a = 1;\nEND\n";
+    "CREATE PROCEDURE dbo.q @x int = 1, @y int AS\nBEGIN\n  UPDATE t SET a = 1;\nEND\n";
 const REFUSED: &str = "CREATE PROCEDURE dbo.r AS\nBEGIN\n  SELECT @@ERROR;\nEND\n";
 const PLAIN: &str = "CREATE TABLE t (a int NOT NULL);\n";
 const AT: &str = "2026-10-26T12:00:00Z";

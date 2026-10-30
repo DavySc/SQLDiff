@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 174 | 35 (20%) | 6 (3%) | 133 (76%) |
+| `converter` | 175 | 35 (20%) | 6 (3%) | 134 (77%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 203 | 38 (19%) | 8 (4%) | 157 (77%) |
+| **All** | 204 | 38 (19%) | 8 (4%) | 158 (77%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -48,7 +48,6 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `len/length` | `translate` | lemma: `Sqldiff.Mirror/C2b strings/LEN` | `LEN(x)` against `length(rtrim(x))` on a string of the slice (ASM-TSQL-LEN-BMP) | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `newid/gen-random-uuid` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
 | `nolock/plain-read` | `translate` | engine |  | `sqldiff-core/profiles/rules/tsql-pg.rules` |
-| `pg.bit-boolean` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `pg.bit-number` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `pg.lastval` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `pg.name-collision` | `converter` | engine |  | `sqldiff-convert/src/instances.rs` |
@@ -153,6 +152,8 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.routine.function` | `converter` | lemma: `Sqldiff.Mirror/Routines` | scalar functions; TRY/CATCH, THROW, transactions, data statements and queries are procedure-only in the spec | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.param` | `converter` | lemma: `Sqldiff.Mirror/Routines/lowerParam` | name, mode and a NULL or slice default; the types under 'Parameter and return types' | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.procedure` | `converter` | lemma: `Sqldiff.Mirror/Routines` | CREATE [OR ALTER] PROCEDURE against CREATE OR REPLACE PROCEDURE ... LANGUAGE plpgsql; the body is checked statement by statement | `sqldiff-convert/src/tsql.rs` |
+| `tsql.routine.result-set` | `converter` | engine | the casts of a result set's columns to their declared types (RETURN QUERY needs exact types, checked on PostgreSQL 18.6) | `sqldiff-convert/src/tsql.rs` |
+| `tsql.routine.result-set-function` | `converter` | engine | a procedure's one result set as a function RETURNS TABLE under ASM-RESULT-SET-FUNCTION | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.return-code` | `converter` | lemma: `Sqldiff.Mirror/T-SQL return status` | `INOUT return_code integer DEFAULT NULL` as the last parameter, the status set to 0 first | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.returns` | `converter` | lemma: `Sqldiff.Mirror/Parameter and return types` | int and slice string return types; others engine | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine.view` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

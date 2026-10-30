@@ -245,8 +245,8 @@ BEGIN
 END",
     );
     for want in [
-        "UPDATE pg_temp.tv_p_t AS x SET v = 1 WHERE x.id = 1;",
-        "UPDATE pg_temp.tv_p_t AS x SET v = o.qty FROM orders AS o WHERE o.order_id = x.id;",
+        "UPDATE pg_temp.tv__dbo__p__t AS x SET v = 1 WHERE x.id = 1;",
+        "UPDATE pg_temp.tv__dbo__p__t AS x SET v = o.qty FROM orders AS o WHERE o.order_id = x.id;",
     ] {
         // The statement's own unit: the smallest that holds it.
         let u = c
@@ -281,9 +281,9 @@ BEGIN
 END",
     );
     for want in [
-        "SET selected = s.selected FROM pg_temp.tv_p_s s WHERE (t.name = s.name) AND (s.selected = TRUE);",
-        "SET pos = s.pos + t.id FROM pg_temp.tv_p_s s WHERE t.name = s.name AND s.pos = p_n;",
-        "SET selected = FALSE FROM pg_temp.tv_p_s s WHERE t.name = s.name;",
+        "SET selected = s.selected FROM pg_temp.tv__dbo__p__s s WHERE (t.name = s.name) AND (s.selected = TRUE);",
+        "SET pos = s.pos + t.id FROM pg_temp.tv__dbo__p__s s WHERE t.name = s.name AND s.pos = p_n;",
+        "SET selected = FALSE FROM pg_temp.tv__dbo__p__s s WHERE t.name = s.name;",
     ] {
         let u = c
             .units

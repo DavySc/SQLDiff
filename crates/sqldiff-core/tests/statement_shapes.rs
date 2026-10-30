@@ -299,13 +299,13 @@ fn insert_without_a_column_list() {
 fn insert_without_a_column_list_into_a_table_variable() {
     let tsql = "  DECLARE @s TABLE (street nvarchar(20), n int);\n  INSERT INTO @s VALUES (N'Elm', 1), (N'Oak', 2);";
     let pg = |cols: &str, insert: &str| {
-        format!("  DROP TABLE IF EXISTS pg_temp.tv_p_s;\n  CREATE TEMP TABLE pg_temp.tv_p_s ({cols});\n  {insert}")
+        format!("  DROP TABLE IF EXISTS pg_temp.tv__dbo__p__s;\n  CREATE TEMP TABLE pg_temp.tv__dbo__p__s ({cols});\n  {insert}")
     };
     equal(
         tsql,
         &pg(
             "street varchar(20), n integer",
-            "INSERT INTO pg_temp.tv_p_s VALUES ('Elm', 1), ('Oak', 2);",
+            "INSERT INTO pg_temp.tv__dbo__p__s VALUES ('Elm', 1), ('Oak', 2);",
         ),
     );
     // The columns in another order take other values.
@@ -313,14 +313,14 @@ fn insert_without_a_column_list_into_a_table_variable() {
         tsql,
         &pg(
             "n integer, street varchar(20)",
-            "INSERT INTO pg_temp.tv_p_s (street, n) VALUES (2, 'Elm'), (1, 'Oak');",
+            "INSERT INTO pg_temp.tv__dbo__p__s (street, n) VALUES (2, 'Elm'), (1, 'Oak');",
         ),
     );
     not_equal(
         tsql,
         &pg(
             "street varchar(20), n integer",
-            "INSERT INTO pg_temp.tv_p_s VALUES ('Elm', 2), ('Oak', 1);",
+            "INSERT INTO pg_temp.tv__dbo__p__s VALUES ('Elm', 2), ('Oak', 1);",
         ),
     );
 }

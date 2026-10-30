@@ -142,6 +142,13 @@ fact = "A file that parses without placeholders; until then a reviewer reads the
 sites = ["sqldiff-core/src/bind/doubt.rs"]
 
 [[assumption]]
+id = "ASM-BIT-BOOLEAN"
+statement = "Code and applications outside the conversion that read or write a converted bit use false and true where T-SQL used 0 and 1."
+discharge = "deployment"
+fact = "BIT becomes boolean, the default PostgreSQL mapping (decided by the owner 2026-10-30); the callers are adapted with the deployment."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
 id = "ASM-BIT-BOOLEAN-COLUMN"
 statement = "The T-SQL bit column's 0 and 1 are the PostgreSQL boolean column's false and true."
 discharge = "deployment"
@@ -658,6 +665,20 @@ fact = "Nothing relies on which generated value each written row gets."
 sites = ["sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
+id = "ASM-OUTPUT-TARGET-TRIGGERS"
+statement = "The table a statement with OUTPUT but no INTO changes has no enabled trigger: SQL Server rejects the statement otherwise (Msg 334), where PostgreSQL returns the rows."
+discharge = "catalog"
+fact = "The SQL Server catalog of the changed table: no enabled triggers."
+sites = ["sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
+id = "ASM-RESULT-SET-FUNCTION"
+statement = "Callers of the procedure that became a PostgreSQL function RETURNS TABLE read its rows with SELECT … FROM the function (in the order it returns them) where they ran EXEC, and accept that the columns have the PostgreSQL types and that a failing statement returns no rows (SQL Server may have sent some before the error)."
+discharge = "deployment"
+fact = "How the application calls the procedure and reads its result set."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-SEQUENCE-DEFAULT-TRIGGER"
 statement = "Db2 for i: no INSERT writes NULL into a column whose T-SQL default is NEXT VALUE FOR (T-SQL refuses it; the converted BEFORE INSERT trigger fills in the next value), and nothing drops the default by its constraint name."
 discharge = "deployment"
@@ -969,9 +990,9 @@ sites = ["sqldiff-convert/src/refused.rs"]
 
 [[assumption]]
 id = "ASM-TABLE-VARIABLE"
-statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, and on PostgreSQL no transaction is rolled back while it holds rows."
+statement = "A table variable converted to a session- or job-scoped temporary table is not read after the batch that filled it, its routine is not re-entered while the table is in use, no routine outside the converted tree that can be active in the same session declares a table variable whose converted name (`tv__<schema>__<routine>__<variable>`) is the same, and on PostgreSQL no transaction is rolled back while it holds rows."
 discharge = "deployment"
-fact = "How the job or session runs the code, and what the routines it calls do."
+fact = "How the job or session runs the code, what the routines it calls do, and which routines outside the tree share its sessions."
 sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]

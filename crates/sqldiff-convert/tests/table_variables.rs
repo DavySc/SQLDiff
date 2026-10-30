@@ -40,15 +40,15 @@ fn postgresql_gets_a_fresh_temp_table_and_the_engine_proves_it() {
     let c = conv(PROC, Dialect::Postgres);
     let o = &c.output;
     assert!(
-        o.contains("DROP TABLE IF EXISTS pg_temp.tv_logerrors_errors;\n  CREATE TEMP TABLE pg_temp.tv_logerrors_errors ("),
+        o.contains("DROP TABLE IF EXISTS pg_temp.tv__dbo__logerrors__errors;\n  CREATE TEMP TABLE pg_temp.tv__dbo__logerrors__errors ("),
         "{o}"
     );
     assert!(
-        o.contains("INSERT INTO pg_temp.tv_logerrors_errors (Severity) VALUES (p_n);"),
+        o.contains("INSERT INTO pg_temp.tv__dbo__logerrors__errors (Severity) VALUES (p_n);"),
         "{o}"
     );
     assert!(
-        o.contains("DELETE FROM pg_temp.tv_logerrors_errors WHERE Severity < 10;"),
+        o.contains("DELETE FROM pg_temp.tv__dbo__logerrors__errors WHERE Severity < 10;"),
         "{o}"
     );
     for needle in [
@@ -71,7 +71,7 @@ fn db2_names_carry_the_routine() {
     let c = conv(PROC, Dialect::Db2i);
     let o = &c.output;
     assert!(
-        o.contains("DECLARE GLOBAL TEMPORARY TABLE SESSION.tv_logerrors_errors ("),
+        o.contains("DECLARE GLOBAL TEMPORARY TABLE SESSION.tv__dbo__logerrors__errors ("),
         "{o}"
     );
     assert!(
@@ -90,9 +90,174 @@ fn caller_and_callee_get_their_own_tables() {
     let src = "CREATE PROCEDURE dbo.Inner AS\nBEGIN\n  DECLARE @Errors TABLE (Severity int);\n  INSERT INTO @Errors (Severity) VALUES (1);\nEND\nGO\nCREATE PROCEDURE dbo.Outer AS\nBEGIN\n  DECLARE @Errors TABLE (Severity int);\n  INSERT INTO @Errors (Severity) VALUES (2);\n  EXEC dbo.Inner;\n  SELECT COUNT(*) FROM @Errors;\nEND\n";
     for (d, schema) in [(Dialect::Postgres, "pg_temp"), (Dialect::Db2i, "SESSION")] {
         let o = conv(src, d).output;
-        assert!(o.contains(&format!("{schema}.tv_inner_errors")), "{o}");
-        assert!(o.contains(&format!("{schema}.tv_outer_errors")), "{o}");
+        assert!(
+            o.contains(&format!("{schema}.tv__dbo__inner__errors")),
+            "{o}"
+        );
+        assert!(
+            o.contains(&format!("{schema}.tv__dbo__outer__errors")),
+            "{o}"
+        );
     }
+}
+
+#[test]
+fn the_schema_and_the_underscores_tell_routines_apart() {
+    // dbo.a_b calling dbo.ab, and dbo.p calling app.p: SQL Server logs the
+    // caller's row, PostgreSQL logged the callee's when both routines'
+    // tables had one name and the callee's DROP replaced the caller's.
+    let pairs = [
+        ("dbo.ab", "dbo.a_b", "tv__dbo__ab__t", "tv__dbo__a_b__t"),
+        ("app.p", "dbo.p", "tv__app__p__t", "tv__dbo__p__t"),
+    ];
+    for (callee, caller, callee_table, caller_table) in pairs {
+        let callee_src = format!(
+            "CREATE PROCEDURE {callee} AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @t TABLE (i int NOT NULL);\n  INSERT INTO @t (i) VALUES (100);\n  INSERT INTO dbo.log (v) SELECT i FROM @t;\nEND\n"
+        );
+        let caller_src = format!(
+            "CREATE PROCEDURE {caller} AS\nBEGIN\n  SET XACT_ABORT ON;\n  DECLARE @t TABLE (i int NOT NULL);\n  INSERT INTO @t (i) VALUES (1);\n  EXEC {callee};\n  INSERT INTO dbo.log (v) SELECT i FROM @t;\nEND\n"
+        );
+        for (d, schema) in [(Dialect::Postgres, "pg_temp"), (Dialect::Db2i, "SESSION")] {
+            // Each routine on its own (the engine names a unit's routine
+            // only when the text holds one): its table carries its schema
+            // and name, and the engine pairs the DECLARE and the writes.
+            for (src, table, value) in [
+                (&callee_src, callee_table, "100"),
+                (&caller_src, caller_table, "1"),
+            ] {
+                let c = conv(src, d);
+                let o = &c.output;
+                assert!(o.contains(&format!("{schema}.{table} (")), "{d:?}: {o}");
+                assert!(
+                    o.contains(&format!(
+                        "INSERT INTO {schema}.{table} (i) VALUES ({value});"
+                    )),
+                    "{d:?}: {o}"
+                );
+                let u = unit(&c, src, "DECLARE @t");
+                assert!(
+                    rules(u).contains(&"ASM-TABLE-VARIABLE"),
+                    "{d:?}: {:?}",
+                    rules(u)
+                );
+                if d == Dialect::Postgres {
+                    // Db2 for i column types have no verified facts yet.
+                    for needle in ["DECLARE @t", "INSERT INTO @t"] {
+                        let u = unit(&c, src, needle);
+                        assert_eq!(u.status, Status::Assumptions, "{d:?} {needle}: {u:#?}\n{o}");
+                    }
+                }
+            }
+            // Both in one text: two tables, not one.
+            let o = conv(&format!("{callee_src}GO\n{caller_src}"), d).output;
+            assert!(
+                o.contains(&format!("{schema}.{callee_table} (")),
+                "{d:?}: {o}"
+            );
+            assert!(
+                o.contains(&format!("{schema}.{caller_table} (")),
+                "{d:?}: {o}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_clash_of_names_is_refused() {
+    // Two routine names that sanitise to the same text and whose keys
+    // (`dbo.<name>@t`) share one FNV-1a hash: the only way two routines can
+    // map a table variable to one name. The later one is refused, naming
+    // the first.
+    let src = "CREATE PROCEDURE [dbo].[a b%c d%e^f~g] AS\nBEGIN\n  DECLARE @t TABLE (i int);\n  INSERT INTO @t (i) VALUES (1);\nEND\nGO\nCREATE PROCEDURE [dbo].[a-b&c~d!e%f=g] AS\nBEGIN\n  DECLARE @t TABLE (i int);\n  INSERT INTO @t (i) VALUES (2);\nEND\n";
+    for d in [Dialect::Postgres, Dialect::Db2i] {
+        let c = conv(src, d);
+        let o = &c.output;
+        // One table is created, the first routine's.
+        assert_eq!(
+            o.matches("tv__dbo__a_b_c_d_e_f_g__t___10717326 (\n")
+                .count(),
+            1,
+            "{d:?}: {o}"
+        );
+        let second = src.rfind("DECLARE @t").unwrap();
+        let u = c
+            .units
+            .iter()
+            .find(|u| u.src.start == second)
+            .unwrap_or_else(|| panic!("no unit for the second DECLARE: {:#?}", c.units));
+        assert_eq!(u.status, Status::NotConverted, "{d:?}: {u:#?}");
+        assert!(
+            says(
+                u,
+                "the same temporary table as @t of routine dbo.a b%c d%e^f~g"
+            ),
+            "{d:?}: {u:#?}"
+        );
+        // The first routine's table is its own.
+        let first = src.find("DECLARE @t").unwrap();
+        let u = c.units.iter().find(|u| u.src.start == first).unwrap();
+        assert_ne!(u.status, Status::NotConverted, "{d:?}: {u:#?}");
+    }
+}
+
+#[test]
+fn the_clash_check_spans_the_files_of_a_tree() {
+    let dir = std::env::temp_dir().join(format!("sqldiff-tv-clash-{}", std::process::id()));
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    // File order is tree order: `a.sql` claims the name, `b.sql` is refused.
+    std::fs::write(
+        src.join("b.sql"),
+        "CREATE PROCEDURE [dbo].[a-b&c~d!e%f=g] AS\nBEGIN\n  DECLARE @t TABLE (i int);\n  INSERT INTO @t (i) VALUES (2);\nEND\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("a.sql"),
+        "CREATE PROCEDURE [dbo].[a b%c d%e^f~g] AS\nBEGIN\n  DECLARE @t TABLE (i int);\n  INSERT INTO @t (i) VALUES (1);\nEND\n",
+    )
+    .unwrap();
+    let a = sqldiff_convert::tree::Args {
+        src: src.clone(),
+        from: Dialect::Tsql,
+        to: Dialect::Postgres,
+        jobs: Some(2),
+        no_catalog: false,
+        template: None,
+        extensions: sqldiff_convert::tree::extensions(Vec::new()),
+        helpers: Vec::new(),
+        catalogs: Vec::new(),
+        catalogs_b: Vec::new(),
+        deployment: Default::default(),
+    };
+    let (inputs, unreadable) = sqldiff_convert::tree::read(&a).unwrap();
+    let t = sqldiff_convert::tree::convert(&a, &inputs, unreadable, None).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let file = |rel: &str| {
+        let i = t
+            .report
+            .files
+            .iter()
+            .position(|f| f.path == rel)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {rel}: {:?}",
+                    t.report.files.iter().map(|f| &f.path).collect::<Vec<_>>()
+                )
+            });
+        &t.conversions[i]
+    };
+    let a_units = &file("a.sql").units;
+    assert!(
+        a_units.iter().any(|u| u.status != Status::NotConverted
+            && u.notes.iter().any(|n| n.rule == "ASM-TABLE-VARIABLE")),
+        "{a_units:#?}"
+    );
+    let b_units = &file("b.sql").units;
+    assert!(
+        b_units.iter().any(|u| u.status == Status::NotConverted
+            && says(u, "@t of routine dbo.a b%c d%e^f~g (a.sql)")),
+        "{b_units:#?}"
+    );
 }
 
 #[test]
@@ -102,7 +267,11 @@ fn a_declare_that_runs_more_than_once_is_refused() {
     let src = "CREATE PROCEDURE dbo.p AS\nBEGIN\n  DECLARE @i int = 0;\n  WHILE @i < 2\n  BEGIN\n    DECLARE @seen TABLE (id int);\n    INSERT INTO @seen (id) VALUES (@i);\n    SET @i += 1;\n  END\nEND\n";
     for d in [Dialect::Postgres, Dialect::Db2i] {
         let c = conv(src, d);
-        assert!(!c.output.contains("tv_p_seen ("), "{d:?}: {}", c.output);
+        assert!(
+            !c.output.contains("tv__dbo__p__seen ("),
+            "{d:?}: {}",
+            c.output
+        );
         assert!(
             c.units
                 .iter()
@@ -157,7 +326,8 @@ fn rollback_and_rethrow_needs_no_decision() {
         rules(u)
     );
     assert!(
-        c.output.contains("CREATE TEMP TABLE pg_temp.tv_p_t ("),
+        c.output
+            .contains("CREATE TEMP TABLE pg_temp.tv__dbo__p__t ("),
         "{}",
         c.output
     );
@@ -200,7 +370,7 @@ fn bit_columns_in_if_and_while_conditions_read_as_boolean() {
     let c = conv(src, Dialect::Postgres);
     let o = &c.output;
     for want in [
-        "IF (SELECT COUNT(*) FROM pg_temp.tv_p_directories WHERE Mirror = FALSE) <> (SELECT COUNT(*) FROM pg_temp.tv_p_directories WHERE Mirror = TRUE) THEN",
+        "IF (SELECT COUNT(*) FROM pg_temp.tv__dbo__p__directories WHERE Mirror = FALSE) <> (SELECT COUNT(*) FROM pg_temp.tv__dbo__p__directories WHERE Mirror = TRUE) THEN",
         "WHILE EXISTS (SELECT * FROM Jobs WHERE Done = FALSE) LOOP",
     ] {
         assert!(o.contains(want), "{want}\n{o}");
