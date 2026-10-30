@@ -1821,8 +1821,10 @@ pub fn review_in(t: &mut Tree, inputs: &[Input], out: &Path) -> Result<Vec<Strin
 pub fn review(t: &mut Tree, inputs: &[Input], ledger: &crate::review::Ledger, path: &str) {
     let (mut units_reviewed, mut files_reviewed) = (0, 0);
     let base = t.report.base_hash.clone();
+    let by_path = ledger.by_path();
     for ((f, c), input) in t.report.files.iter_mut().zip(&t.conversions).zip(inputs) {
-        let fr = crate::review::review_file_in(&f.path, &input.text, c, ledger, base.as_deref());
+        let records = by_path.get(f.path.as_str()).map_or(&[][..], Vec::as_slice);
+        let fr = crate::review::review_records(&f.path, &input.text, c, records, base.as_deref());
         let mut by_id: std::collections::HashMap<String, crate::review::UnitReview> =
             fr.units.into_iter().map(|u| (u.id.clone(), u)).collect();
         let mut outdated = 0;
