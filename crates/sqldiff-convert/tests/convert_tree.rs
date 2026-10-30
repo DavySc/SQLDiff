@@ -56,7 +56,12 @@ fn a_tsql_builtin_the_target_lacks_is_not_converted() {
         for needle in ["HASHBYTES", "SERVERPROPERTY"] {
             let u = unit(&c, src, needle);
             assert_eq!(u.status, Status::NotConverted, "{needle}\n{}", c.output);
-            assert!(has_rule(u, "not-converted"), "{:?}", u.notes);
+            // SQL Server metadata is grouped under its own review cause.
+            let rule = match needle {
+                "SERVERPROPERTY" => "not-converted.server-metadata",
+                _ => "not-converted",
+            };
+            assert!(has_rule(u, rule), "{:?}", u.notes);
         }
         assert!(
             !c.output

@@ -645,6 +645,14 @@ impl<'a> Canon<'a> {
             &self.unit.local_temps,
             self.unit.routine.as_deref(),
         );
+        // T-SQL `sys.name` is SQL Server's own catalog view; a table of that
+        // name on another side is some other table, never its counterpart.
+        let key = match parts {
+            [.., s, _] if self.d != Dialect::Tsql && lc(s) == "sys" => {
+                format!("{}:{key}", self.d.id())
+            }
+            _ => key,
+        };
         let x = (key.clone(), default);
         if !self.names.contains(&x) {
             self.names.push(x);
@@ -1490,7 +1498,15 @@ impl<'a> Canon<'a> {
                 });
                 (n("case", kids), ty)
             }
-            Expr::Exists(q) => (n("exists", vec![self.query(q, QCtx::Exists)?.0]), None),
+            Expr::Exists(q) => match super::objcheck::of(q, self.d) {
+                // A catalog existence check: the same term on both sides
+                // when it looks for the same kind and name.
+                Some(c) => {
+                    self.assume(super::objcheck::ASSUMPTION);
+                    (n("catalog-exists", vec![a(c.kind.name()), a(c.name)]), None)
+                }
+                None => (n("exists", vec![self.query(q, QCtx::Exists)?.0]), None),
+            },
             Expr::Subquery(q) => {
                 let (t, ty) = self.query(q, QCtx::Scalar)?;
                 (n("subq", vec![t]), ty)

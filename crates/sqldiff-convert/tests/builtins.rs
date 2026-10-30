@@ -167,7 +167,7 @@ fn database_name_is_an_assumption() {
 fn instance_metadata_is_refused_with_its_reason() {
     refused(
         "SET @r = CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(max));",
-        "describes the SQL Server instance",
+        "the SQL Server version",
     );
     refused("SET @r = OBJECT_DEFINITION(@@PROCID);", "@@PROCID");
     refused("SET @i = OBJECT_ID(N'dbo.t');", "SQL Server object id");

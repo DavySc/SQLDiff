@@ -18,6 +18,7 @@ pub mod edit;
 pub mod eval;
 pub mod literal;
 pub mod lower;
+pub mod objcheck;
 pub mod options;
 pub mod schema;
 pub mod script;
