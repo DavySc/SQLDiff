@@ -2081,8 +2081,12 @@ impl<'a> Parser<'a> {
     /// or has no RECURSIVE and no query names its own CTE (that name is
     /// then a table). Any other list is refused. A name counts wherever it
     /// stands outside a qualifier (`cte.col`), so a column or alias of that
-    /// name refuses too. MATERIALIZED and NOT MATERIALIZED are refused.
+    /// name refuses too. MATERIALIZED and NOT MATERIALIZED are refused, and
+    /// so is Db2 for i, whose rules are not checked here.
     fn with_list(&mut self) -> PResult<Vec<Cte>> {
+        if self.d == Dialect::Db2i {
+            return Err("common table expressions are not compared for Db2 for i".into());
+        }
         self.expect_kw("WITH")?;
         let recursive = self.eat_kw("RECURSIVE");
         if recursive && self.d != Dialect::Postgres {
@@ -2124,7 +2128,10 @@ impl<'a> Parser<'a> {
                             _ => return false,
                         };
                         same_name(&text, &c.name)
-                            && !self.t.get(body.start + k + 1).is_some_and(|n| n.kind == K::Dot)
+                            && !self
+                                .t
+                                .get(body.start + k + 1)
+                                .is_some_and(|n| n.kind == K::Dot)
                     })
                 };
                 if recursive && ctes[i + 1..].iter().any(names) {

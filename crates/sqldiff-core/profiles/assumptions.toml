@@ -288,7 +288,7 @@ id = "ASM-CTE-MAXRECURSION"
 statement = "A recursive CTE stays within T-SQL's recursion limit (the target has none)."
 discharge = "deployment"
 fact = "The data never recurses deeper than the limit."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-CURSOR-GLOBAL"

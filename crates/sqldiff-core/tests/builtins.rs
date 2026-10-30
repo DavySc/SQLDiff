@@ -480,3 +480,46 @@ fn own_name_from_procid_not_in_functions() {
         r.verdict()
     );
 }
+
+/// SUBSTRING and NULLIF, as in Ola Hallengren's list splits. SUBSTRING gave
+/// the same result on SQL Server 2022 and PostgreSQL 18 for all 480 string,
+/// start and length combinations of eval/cte/2026-10-30 (NULL, negative,
+/// zero, past either end, the 32-bit bounds, errors for a negative
+/// length).
+#[test]
+fn substring_and_nullif() {
+    check(&[
+        (
+            "SUBSTRING(S, Q, 2)",
+            "SUBSTRING(S, Q, 2)",
+            Eq(&["ASM-TSQL-LEN-BMP"]),
+        ),
+        (
+            "SUBSTRING(N, Q, Q)",
+            "substr(N, Q, Q)",
+            Eq(&["ASM-TSQL-LEN-BMP"]),
+        ),
+        ("SUBSTRING(S, Q, 2)", "SUBSTRING(S, Q, 3)", NotEq),
+        ("SUBSTRING(S, Q, 2)", "SUBSTRING(S, 2, Q)", NotEq),
+        // char padding: PostgreSQL strips it first.
+        ("SUBSTRING(C, Q, 2)", "SUBSTRING(C, Q, 2)", NotEq),
+        // substring takes an integer.
+        ("SUBSTRING(S, B, 2)", "SUBSTRING(S, B, 2)", NotEq),
+        ("NULLIF(Q, 0)", "NULLIF(Q, 0)", Eq(&[])),
+        ("NULLIF(B, Q)", "NULLIF(B, Q)", Eq(&[])),
+        ("NULLIF(Q, 0)", "NULLIF(Q, 1)", NotEq),
+        ("NULLIF(Q, 0)", "NULLIF(0, Q)", NotEq),
+        // Strings compare under the collation.
+        ("NULLIF(S, 'a')", "NULLIF(S, 'a')", NotEq),
+    ]);
+    // CHARINDEX in a MAX string is a bigint (SQL Server 2022), as LEN is:
+    // ISNULL then keeps the replacement whole, as COALESCE does.
+    check_as(
+        &[(
+            "ISNULL(NULLIF(CHARINDEX(',', N), 0), LEN(N) + 1)",
+            "COALESCE(NULLIF(strpos(N, ','), 0), length(rtrim(N)) + 1)",
+            Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]),
+        )],
+        true,
+    );
+}

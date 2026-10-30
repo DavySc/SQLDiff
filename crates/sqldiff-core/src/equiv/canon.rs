@@ -27,6 +27,9 @@ pub type R<T> = Result<T, String>;
 /// Lowered query parts without the select list, and the select items with their types.
 type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 
+/// The columns of a common table expression: name and type.
+type CteCols = Vec<(String, Option<Ty>)>;
+
 /// Assumption identifiers and texts used by the equivalence rules.
 pub mod asm {
     pub const LEN_BMP: (&str, &str) = (
@@ -376,7 +379,7 @@ enum CteScope {
         key: String,
         name: String,
         cols: Vec<String>,
-        query: Select,
+        query: Box<Select>,
         used: bool,
     },
     /// The CTE's own name inside its query (or a recursive CTE's anchor),
@@ -536,7 +539,9 @@ fn rec_step<'q>(key: &str, q: &'q Select) -> Option<&'q Select> {
     };
     match step.from.as_slice() {
         [From::Table { name, hints, .. }]
-            if op == "UNION ALL" && hints.is_empty() && matches!(name.as_slice(), [x] if lc(x) == key) =>
+            if op == "UNION ALL"
+                && hints.is_empty()
+                && matches!(name.as_slice(), [x] if lc(x) == key) =>
         {
             Some(step)
         }
@@ -551,7 +556,7 @@ fn cte_columns(
     key: &str,
     cols: &[String],
     items: Vec<(Term, Option<Ty>)>,
-) -> R<(Vec<Term>, Vec<(String, Option<Ty>)>)> {
+) -> R<(Vec<Term>, CteCols)> {
     if !cols.is_empty() && cols.len() != items.len() {
         return Err(format!(
             "the common table expression `{key}` names {} columns for {} items",
@@ -564,7 +569,11 @@ fn cte_columns(
     for (i, (t, ty)) in items.into_iter().enumerate() {
         let (value, given) = match t.kids() {
             [v, name] if t.is("item") => (v.clone(), name.atom().unwrap_or("").to_string()),
-            _ => return Err(format!("the common table expression `{key}` returns no named items")),
+            _ => {
+                return Err(format!(
+                    "the common table expression `{key}` returns no named items"
+                ))
+            }
         };
         let name = match cols.get(i) {
             Some(c) => lc(c),
@@ -2527,6 +2536,46 @@ impl<'a> Canon<'a> {
                 let ty = args.iter().find_map(|x| x.1);
                 portable("coalesce", args, ty)
             }
+            // NULLIF(a, b): NULL when a = b, else a, in both dialects.
+            // Integers only (strings compare under the collation). T-SQL
+            // types the result as `a`, PostgreSQL as the common type of
+            // both: the same value either way.
+            (Dialect::Tsql | Dialect::Postgres, "nullif", 2)
+                if args.iter().all(|x| {
+                    x.1.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l >= 2))
+                }) =>
+            {
+                let ty = match d {
+                    Dialect::Tsql => first_ty,
+                    _ => args.iter().filter_map(|x| x.1).max_by_key(|t| t.len),
+                };
+                portable("nullif", args, ty)
+            }
+            // SUBSTRING(s, start, length): the same characters for every
+            // start and length, NULL, negative (an error for a negative
+            // length), zero and past either end included (SQL Server 2022
+            // nvarchar(max) against PostgreSQL 18 text, 480 combinations,
+            // eval/cte/2026-10-30). varchar only (PostgreSQL strips char
+            // padding first); a PostgreSQL start and length of at most 32
+            // bits, as substring takes; positions under ASM-TSQL-LEN-BMP.
+            (Dialect::Tsql, "substring", 3) | (Dialect::Postgres, "substring" | "substr", 3)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && args[1..].iter().all(|x| match d {
+                        Dialect::Tsql => {
+                            x.1.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l >= 2))
+                        }
+                        _ => x.1.is_some_and(|t| {
+                            t.fam == Fam::Int && t.len.is_some_and(|l| (2..=32).contains(&l))
+                        }),
+                    }) =>
+            {
+                self.assume(asm::LEN_BMP);
+                let ty = match d {
+                    Dialect::Tsql => first_ty,
+                    _ => Some(Ty::of(Fam::VarChar)),
+                };
+                (n("substr", args.into_iter().map(|x| x.0).collect()), ty)
+            }
             (Dialect::Tsql, "isnull", 2) => {
                 // ISNULL takes the type of its first argument; it equals COALESCE
                 // when the replacement is stored in that type unchanged.
@@ -2604,8 +2653,9 @@ impl<'a> Canon<'a> {
                 // Positions count UTF-16 code units in T-SQL (non-_SC
                 // collations), code points in PostgreSQL.
                 self.assume(asm::LEN_BMP);
+                let ty = charindex_ty(&args[1].1);
                 let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
-                (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+                (n("strpos", vec![a(ci), hay, needle]), ty)
             }
             (Dialect::Postgres, "strpos", 2)
                 if args
@@ -3673,7 +3723,7 @@ impl<'a> Canon<'a> {
                 key: lc(&c.name),
                 name: c.name.clone(),
                 cols: c.cols.clone(),
-                query: c.query.clone(),
+                query: Box::new(c.query.clone()),
                 used: false,
             });
         }
@@ -3795,12 +3845,7 @@ impl<'a> Canon<'a> {
 
     /// The FROM term of CTE `key`'s query and its columns: the column list
     /// when given, else the names the query gives its items.
-    fn cte_query(
-        &mut self,
-        key: &str,
-        cols: &[String],
-        query: &Select,
-    ) -> R<(Term, Vec<(String, Option<Ty>)>)> {
+    fn cte_query(&mut self, key: &str, cols: &[String], query: &Select) -> R<(Term, CteCols)> {
         if let Some(step) = rec_step(key, query) {
             return self.rec_cte(key, cols, query, step);
         }
@@ -3828,7 +3873,7 @@ impl<'a> Canon<'a> {
         cols: &[String],
         query: &Select,
         step: &Select,
-    ) -> R<(Term, Vec<(String, Option<Ty>)>)> {
+    ) -> R<(Term, CteCols)> {
         let own = |q: &Select| {
             q.top.is_some()
                 || q.limit.is_some()
@@ -3904,7 +3949,11 @@ impl<'a> Canon<'a> {
                 ));
             }
         }
-        let (is, _) = cte_columns(key, &columns.iter().map(|c| c.0.clone()).collect::<Vec<_>>(), is)?;
+        let (is, _) = cte_columns(
+            key,
+            &columns.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+            is,
+        )?;
         if self.d == Dialect::Tsql {
             self.assume(asm::CTE_MAXRECURSION);
         }
@@ -6804,6 +6853,19 @@ const INT32: Ty = Ty {
     len: Some(32),
     scale: None,
 };
+
+/// T-SQL CHARINDEX's type: bigint when the searched string is
+/// varchar(max) or nvarchar(max), int otherwise (SQL Server 2022,
+/// eval/cte/2026-10-30).
+fn charindex_ty(hay: &Option<Ty>) -> Option<Ty> {
+    Some(match hay.and_then(|t| t.len) {
+        Some(_) => INT32,
+        None => Ty {
+            len: Some(64),
+            ..INT32
+        },
+    })
+}
 
 /// A string expression that is never empty (NULL aside): a non-empty
 /// literal, or a `||` chain with one.
