@@ -2812,9 +2812,10 @@ impl<'a> Canon<'a> {
             {
                 let ci = self.collation_marker();
                 self.assume(asm::LEN_BMP);
+                let ty = self.charindex_ty(&c.args[1], &args[1].1);
                 let (needle, hay, start) =
                     (args[0].0.clone(), args[1].0.clone(), args[2].0.clone());
-                (n("strpos", vec![a(ci), hay, needle, start]), Some(INT32))
+                (n("strpos", vec![a(ci), hay, needle, start]), ty)
             }
             (Dialect::Postgres, "strpos", 2)
                 if args

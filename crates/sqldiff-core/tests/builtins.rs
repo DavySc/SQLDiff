@@ -566,13 +566,21 @@ fn substring_and_nullif() {
         ("NULLIF(S, 'a')", "NULLIF(S, 'a')", NotEq),
     ]);
     // CHARINDEX in a MAX string is a bigint (SQL Server 2022), as LEN is:
-    // ISNULL then keeps the replacement whole, as COALESCE does.
+    // ISNULL then keeps the replacement whole, as COALESCE does. With a
+    // start position too.
     check_as(
-        &[(
-            "ISNULL(NULLIF(CHARINDEX(',', N), 0), LEN(N) + 1)",
-            "COALESCE(NULLIF(strpos(N, ','), 0), length(rtrim(N)) + 1)",
-            Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]),
-        )],
+        &[
+            (
+                "ISNULL(NULLIF(CHARINDEX(',', N), 0), LEN(N) + 1)",
+                "COALESCE(NULLIF(strpos(N, ','), 0), length(rtrim(N)) + 1)",
+                Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]),
+            ),
+            (
+                "ISNULL(NULLIF(CHARINDEX(',', N, Q), 0), LEN(N) + 1)",
+                "COALESCE(NULLIF(((strpos(substr(N, Q), ',') - 1 + greatest(Q, 1)) * (strpos(substr(N, Q), ',') > 0 AND length(',') > 0)::int), 0), length(rtrim(N)) + 1)",
+                Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]),
+            ),
+        ],
         true,
     );
 }
