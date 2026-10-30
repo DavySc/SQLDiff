@@ -292,12 +292,23 @@ pub type ParamType = (String, Vec<String>);
 /// only non-unique indexes whose entries stay within the engines' size
 /// limits; string columns with the database's default collation, created
 /// in SQL Server with `ANSI_PADDING ON`.
+///
+/// (C3d part 2) A **read-only** table (`read_only`) asserts less, only
+/// what a read sees: both tables have exactly these columns, by name; each
+/// column of the slice has its type, holds no NULL where `not_null` says
+/// so and (a string column) the database's default collation; key flags,
+/// when sent, are the primary key both declare, not deferrable; no
+/// row-level security, rule, masking, inheritance or partitions. Its
+/// opaque columns ([`MirrorType::Opaque`]) are names only. The checker
+/// refuses every write to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MirrorTable {
     /// Folded, `.`-joined as the PL/pgSQL code names it.
     pub name: String,
     /// In declaration order.
     pub cols: Vec<MirrorColumn>,
+    /// (C3d part 2) The routines only read it (`Sqldiff.Mirror.CatTable.readOnly`).
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -327,10 +338,17 @@ pub enum MirrorType {
     Int,
     BigInt,
     SmallInt,
-    Str { len: u32, wide: bool },
+    Str {
+        len: u32,
+        wide: bool,
+    },
     Bool,
     Date,
     Timestamp(u32),
+    /// (C3d part 2) A column of a read-only table whose type is outside the
+    /// slice (or whose reads the slice cannot take as stored): a name only
+    /// (`Sqldiff.Mirror.OpqCol`).
+    Opaque,
 }
 
 /// (C3c) A column default the checker takes as given; (C2c) a bit (T-SQL
@@ -399,8 +417,11 @@ impl MirrorRequest {
                         MirrorType::Bool => "b".to_string(),
                         MirrorType::Date => "d".to_string(),
                         MirrorType::Timestamp(p) => format!("t{p}"),
+                        // C3d part 2: an opaque column, its key flag only.
+                        MirrorType::Opaque => "o".to_string(),
                     };
-                    match (c.key, c.not_null) {
+                    match (c.key, c.not_null && c.ty != MirrorType::Opaque) {
+                        (true, _) if c.ty == MirrorType::Opaque => spec.push('k'),
                         (true, _) => spec.push_str("nk"),
                         (false, true) => spec.push('n'),
                         (false, false) => {}
@@ -417,7 +438,12 @@ impl MirrorRequest {
                 })
                 .collect::<Vec<_>>()
                 .join("/");
-            format!("{}={cols}", hex(&t.name))
+            // C3d part 2: a read-only table ends in `=r`.
+            if t.read_only {
+                format!("{}={cols}=r", hex(&t.name))
+            } else {
+                format!("{}={cols}", hex(&t.name))
+            }
         });
         // ROUTINE (Request.lean): `NAME:MODES`, or (C2c) `NAME:MODES:TYPES`
         // with one type per mode letter, `/`-separated, each the type's name
@@ -823,6 +849,7 @@ mod tests {
                     col("qty", "Qty", false, false),
                     col("total", "Total", true, false),
                 ],
+                read_only: false,
             }],
             binary_collation: true,
             catalog_types: Vec::new(),
@@ -903,6 +930,7 @@ mod tests {
                     ..col("t", "t", false, false)
                 },
             ],
+            read_only: false,
         };
         let l = r.line(1).unwrap();
         let f: Vec<&str> = l.split('\t').collect();
@@ -919,6 +947,30 @@ mod tests {
         assert_eq!(
             l.split('\t').nth(5).unwrap(),
             "6576=64.d.64.d323032342d30322d3239"
+        );
+        // C3d part 2: a read-only table `t` with the key `id`, an opaque
+        // column `p` (spelt `P`, NOT NULL dropped: an opaque column is a name
+        // only) and an opaque key column `q`, as Request.lean's example
+        // decodes it.
+        r.table_catalog[0] = MirrorTable {
+            name: "t".into(),
+            cols: vec![
+                col("id", "Id", true, true),
+                MirrorColumn {
+                    ty: MirrorType::Opaque,
+                    ..col("p", "P", true, false)
+                },
+                MirrorColumn {
+                    ty: MirrorType::Opaque,
+                    ..col("q", "Q", true, true)
+                },
+            ],
+            read_only: true,
+        };
+        let l = r.line(1).unwrap();
+        assert_eq!(
+            l.split('\t').nth(5).unwrap(),
+            "74=6964.ink.4964/70.o.50/71.ok.51=r"
         );
         // C2c: a callee's parameter types follow its modes.
         r.catalog = vec![("p".into(), "ib".into())];

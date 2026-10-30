@@ -156,6 +156,31 @@ also named in a `"c2a"` answer whose routine can fail (an error under
 `XACT_ABORT ON` dooms a caller's T-SQL transaction, eval/queries Q15),
 and a table is sent only when spelt as its DDL declares it. Request
 format unchanged.
+
+0.17.0 (C3d part 2) reads read-only tables: a CATALOG TABLE entry may end
+in `=r` (`CatTable.readOnly`), and its columns may have the SPEC `o`, an
+opaque column (`OpqCol`: a type outside the slice, a name only). No
+`INSERT`, `UPDATE` or `DELETE` writes a read-only table (`writeTableOf`;
+theorem `lowerStmt_writes_not_readOnly`: a data statement `lowerStmt`
+lowers names no read-only table, and data statements reach the core only
+through it); the core reads its projection on the slice
+columns, with its primary key only when the key is wholly visible
+(`CatTable.keyVisible`, `CatTable.keyVisible_of_hasKey`); an opaque column
+counts for name resolution (ambiguity, the PL/pgSQL column-variable
+conflict) and resolves to nothing ("The C3d tables" in
+`Sqldiff/Mirror/Lower.lean`). In a read-only table a string key column
+is usable and leaves the table without a key. A confirmation that reads
+one still carries `"statements":"c3b"`. New reason codes
+`stmt:insert:table:read-only`, `stmt:update:table:read-only`,
+`stmt:delete:table:read-only` and `stmt:select:column:opaque`. A
+PL/pgSQL name spelt as a system column (`tableoid`, `xmin`, `cmin`,
+`xmax`, `cmax`, `ctid`) resolves to nothing in a query block and in an
+`UPDATE` or `DELETE` (42702 for a variable so spelt, eval/queries Q20):
+reason code `name:system-column`. `Core.TableOk` asks distinct keys only
+of a table with a key; `CatTable.wellFormed` asks T-SQL spellings
+distinct up to case, also two equal ones. An older
+checker answers a request with `=r` or `o` "the catalog does not
+decode"; this checker reads every older request as before.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -210,7 +235,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.16.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.17.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0

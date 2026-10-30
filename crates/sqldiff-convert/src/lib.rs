@@ -28,6 +28,7 @@ mod out;
 pub mod queue;
 mod refused;
 pub mod review;
+pub(crate) mod scan;
 pub mod shared;
 mod table_vars;
 mod template;

@@ -477,3 +477,44 @@ END
         );
     }
 }
+
+/// C3d part 2: system-versioned tables are now read-only catalog tables, so
+/// a query that reads another state of one (`FOR SYSTEM_TIME`) must keep a
+/// shape the checker refuses: `AS OF` reads as a table hint (which
+/// `readJoin` refuses, `stmt:select:from:hints`), and every other form does
+/// not read at all. A plain `FROM` reads without hints.
+#[test]
+fn a_system_time_query_keeps_a_hint_or_does_not_read() {
+    use sqldiff_syntax::abstract_syntax::{From, Stmt};
+    let proc = |from: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.c @id int, @n int OUTPUT AS
+BEGIN
+  SELECT @n = c.N FROM {from} WHERE c.Id = @id;
+END
+"
+        )
+    };
+    let hints = |from: &str| -> Option<Vec<String>> {
+        let r = routines(&proc(from), Dialect::Tsql).remove(0).ok()?;
+        let [Node::Stmt(Stmt::Select(q))] = r.body.body.as_slice() else {
+            panic!("{:?}", r.body.body);
+        };
+        let [From::Table { hints, .. }] = q.from.as_slice() else {
+            panic!("{:?}", q.from);
+        };
+        Some(hints.clone())
+    };
+    assert_eq!(hints("dbo.Color AS c"), Some(Vec::new()));
+    assert!(
+        hints("dbo.Color FOR SYSTEM_TIME AS OF '2020-01-01' AS c").is_some_and(|h| !h.is_empty())
+    );
+    for from in [
+        "dbo.Color FOR SYSTEM_TIME ALL AS c",
+        "dbo.Color FOR SYSTEM_TIME BETWEEN '2020-01-01' AND '2021-01-01' AS c",
+        "dbo.Color FOR SYSTEM_TIME FROM '2020-01-01' TO '2021-01-01' AS c",
+        "dbo.Color FOR SYSTEM_TIME CONTAINED IN ('2020-01-01', '2021-01-01') AS c",
+    ] {
+        assert!(hints(from).map_or(true, |h| !h.is_empty()), "{from}");
+    }
+}

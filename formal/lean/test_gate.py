@@ -13,7 +13,9 @@ C3c string columns and constant defaults in the CATALOG; (0.13.0) the
 `why` reason codes; (0.14.0) C2c typed values (integer widths, bit against
 boolean, date and datetime2 with DATEADD/DATEDIFF, typed columns in the
 CATALOG); (0.16.0) C3d query blocks (joins, aliases, qualified names, the
-key closure, a scalar subquery over a join); the `why` reason codes on an unconfirmed answer whose routine is outside the
+key closure, a scalar subquery over a join); (0.17.0) C3d read-only tables
+(`=r`, opaque columns `o`; a PL/pgSQL variable spelt as a system column);
+the `why` reason codes on an unconfirmed answer whose routine is outside the
 spec (Sqldiff/Mirror/Diagnose.lean), and their absence on every other
 answer, confirmed or not.
 Anything else is unconfirmed, including malformed requests.
@@ -1008,6 +1010,67 @@ cases += [
                                                           bin_("=", qn("o", "Id"), tv("@id")))))]),
                   j_p([J_FOR_P])), "unconfirmed"),
 ]
+# C3d part 2: read-only tables. The same pair over a read-only cust (`=r`)
+# with an opaque column Qty (decimal, a name only), or an opaque key part.
+def r_cat(cust_extra=f"/{hx('qty')}.o.{hx('Qty')}", ro="=r"):
+    return (f"{hx('ord')}={hx('id')}.ink.{hx('Id')}/{hx('qty')}.i.{hx('Qty')}/{hx('custid')}.i.{hx('CustId')},"
+            f"{hx('cust')}={hx('id')}.ink.{hx('Id')}/{hx('score')}.i.{hx('Score')}{cust_extra}{ro}")
+
+
+def req3r(i, a, b, cat=None):
+    return req3(i, a=a, b=b, dep=J_DEP, cat=cat or r_cat(), cert=Q_CERT_J)
+
+
+def j_sel_t(item_e, where):
+    return C("NStmt", C("SSelect", sel_f([item(item_e, assign_=S("@q"))], oc_t(ON_KEY_T), where)))
+
+
+cases += [
+    # A read of the read-only table, by key through the join: confirmed.
+    ("133", req3r(133, j_t([J_SEL_T]), j_p([J_FOR_P])), "confirmed"),
+    # Qty unqualified: a column of ord and an opaque column of cust (209, 42702).
+    ("134", req3r(134, j_t([j_sel_t(qn("c", "Score"),
+                                    bin_("AND", bin_("=", qn("o", "Id"), tv("@id")), bin_(">", col("Qty"), num(0))))]),
+                  j_p([J_FOR_P])), "unconfirmed"),
+    # The opaque column read.
+    ("135", req3r(135, j_t([j_sel_t(qn("c", "Qty"), bin_("=", qn("o", "Id"), tv("@id")))]),
+                  j_p([J_FOR_P])), "unconfirmed"),
+    # A write to the read-only table.
+    ("136", req3r(136, j_t([upd(["dbo", "Cust"], [("Score", num(1))], bin_("=", col("Id"), tv("@id")))]),
+                  j_p([upd(["cust"], [("score", num(1))], bin_("=", pv("id"), pv("p_id")))])), "unconfirmed"),
+    # The key's second column is opaque: the pick through the join is no
+    # longer closed.
+    ("137", req3r(137, j_t([J_SEL_T]), j_p([J_FOR_P]), cat=r_cat(f"/{hx('code')}.ok.{hx('Code')}")),
+     "unconfirmed"),
+    # An opaque column in a table that is not read-only: the table is unusable.
+    ("138", req3r(138, j_t([J_SEL_T]), j_p([J_FOR_P]), cat=r_cat(ro="")), "unconfirmed"),
+    # Anything after `=` but `r` does not decode.
+    ("139", req3r(139, j_t([J_SEL_T]), j_p([J_FOR_P]), cat=r_cat(ro="=w")), "unconfirmed"),
+]
+
+
+# Review of C3d part 2: a PL/pgSQL parameter spelt as a system column (xmin)
+# in the query over the table is the column-variable conflict (42702,
+# eval/queries Q20); spelt otherwise (p_min) it is a variable.
+def sys_pair(i, pg_name):
+    cond_t = bin_("AND", bin_("=", qn("o", "Id"), tv("@id")), bin_(">", qn("c", "Score"), tv("@min")))
+    cond_p = bin_("AND", bin_("=", qn("o", "id"), pv("p_id")), bin_(">", qn("c", "score"), pv(pg_name)))
+    a = proc(["dbo", "look"], [param("@id", "In"), param("@q", "InOut"), param("@min", "In")], [],
+             [C("NStmt", C("SSelect", sel_f([item(qn("c", "Score"), assign_=S("@q"))], oc_t(ON_KEY_T), cond_t)))])
+    b = proc(["look"], [param("p_id", "In"), param("p_q", "InOut"), param(pg_name, "In")], [],
+             [C("NBlock", C("Block", L(C("Declare", S("sqldiff_r"), C("Ty", S("RECORD"), L()), NONE)),
+                                L(C("ForQuery", S("sqldiff_r"),
+                                    sel_f([item(qn("c", "score"), alias=S("sqldiff_c1"))], oc_p(ON_KEY_P), cond_p),
+                                    L(field("p_q", "sqldiff_c1"))))))])
+    cert = ",".join(f"{hx(x)}:{hx(y)}" for x, y in
+                    [("@id", "p_id"), ("@q", "p_q"), ("@min", pg_name), ("%status", "%status")])
+    return req3(i, a=a, b=b, dep=J_DEP, cat=r_cat(), cert=cert)
+
+
+cases += [
+    ("140", sys_pair(140, "xmin"), "unconfirmed"),
+    ("141", sys_pair(141, "p_min"), "confirmed"),
+]
 THEOREMS = {
     "114": "Sqldiff.Mirror.check_sound_c2a",
     "116": "Sqldiff.Mirror.check_sound_c2a",
@@ -1016,6 +1079,8 @@ THEOREMS = {
     "126": "Sqldiff.Mirror.check_sound_c2a",
     "128": "Sqldiff.Mirror.check_sound",
     "129": "Sqldiff.Mirror.check_sound_c2a",
+    "133": "Sqldiff.Mirror.check_sound_c2a",
+    "141": "Sqldiff.Mirror.check_sound_c2a",
     "104": "Sqldiff.Mirror.check_sound_c2a",
     "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
@@ -1119,6 +1184,17 @@ EXTRA = {
     "130": {"why": ["name:ambiguous"]},
     "131": {"why": ["stmt:select:from:qualifier"]},
     "132": {"why": ["stmt:select:from:join:left"]},
+    # C3d part 2: read-only tables.
+    "133": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"],
+            "statements": "c3b"},
+    "134": {"why": ["name:ambiguous"]},
+    "135": {"why": ["stmt:select:column:opaque"]},
+    "136": {"why": ["stmt:update:table:read-only"]},
+    "137": {"why": ["stmt:select:many-rows"]},
+    "138": {"why": ["stmt:select:table:not-plain"]},
+    "140": {"why": ["name:system-column"]},
+    "141": {"scalars": "c2a", "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-TSQL-STRING-ARGS", "ASM-TSQL-ROWCOUNT-0"],
+            "statements": "c3b"},
     "106": {"why": ["store:declare:smallint"]},
     "107": {"why": ["store:assign:bit", "expr:bit-literal"]},
     "108": {"why": ["store:assign:date", "expr:date-literal"]},

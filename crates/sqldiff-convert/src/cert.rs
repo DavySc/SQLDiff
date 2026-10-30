@@ -11,6 +11,7 @@
 //! the target routines' parameter modes from the converted output itself,
 //! and whether row counts are observed from the observer profile.
 
+use crate::scan::Scan;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
@@ -94,6 +95,9 @@ pub fn reason_code(reason: &str) -> String {
     }
     if reason == "the output has no routine for it" {
         return "pair:no-output".into();
+    }
+    if reason == NAME_TOO_LONG {
+        return "pair:name-too-long".into();
     }
     if let Some(rest) = reason.strip_prefix("no renaming pairs the two routines: ") {
         return format!(
@@ -331,6 +335,61 @@ fn returns_value(nodes: &[Node]) -> bool {
 /// letters folded to lower case, and only those: PostgreSQL leaves other
 /// letters as written in a UTF-8 database (`CREATE PROCEDURE Ärger` makes
 /// `"Ärger"`), and so does `Sqldiff.Mirror.pgName`.
+/// (Third review of C3d part 2) PostgreSQL keeps the first 63 bytes of an
+/// identifier (`NAMEDATALEN - 1`) and drops the rest silently.
+pub const PG_NAME_BYTES: usize = 63;
+
+/// The reason a pair is refused when a PostgreSQL name in it may not be
+/// the one written (`pair:name-too-long`).
+const NAME_TOO_LONG: &str = "a PostgreSQL name in the output routine is longer than 63 bytes, \
+     or its name is another routine's after truncation";
+
+/// An identifier as PostgreSQL stores it: its first 63 bytes, cut at a
+/// character boundary.
+fn pg_truncated(n: &str) -> String {
+    let mut end = n.len().min(PG_NAME_BYTES);
+    while !n.is_char_boundary(end) {
+        end -= 1;
+    }
+    n[..end].to_string()
+}
+
+/// (Third review) The output routine `b` (spanning `span` of `output`)
+/// may not be the routine its text names: one of its identifiers (its
+/// name, a parameter, a local, a callee, a table, a column) is longer than
+/// 63 bytes, which PostgreSQL truncates, or its name truncated is another
+/// output routine's (the later `CREATE OR REPLACE` replaces the first).
+fn name_too_long(
+    output: &str,
+    span: (usize, usize),
+    name: &str,
+    out: &[Read],
+    to: Dialect,
+) -> bool {
+    if to != Dialect::Postgres {
+        return false;
+    }
+    let text = output.get(span.0..span.1).unwrap_or_default();
+    let long = parse(text, to)
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .map(|t| sqldiff_syntax::abstract_syntax::Tok::from_syntax(&t))
+        .filter_map(|t| crate::scan::name_part(&t, to))
+        .any(|p| p.trim_start_matches('"').len() > PG_NAME_BYTES);
+    let short = |n: &str| {
+        n.split('.')
+            .map(|p| pg_truncated(&pg_name(p)))
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let mine = short(name);
+    let clash = out
+        .iter()
+        .any(|(n, _, _, _)| pg_name(n) != pg_name(name) && short(n) == mine);
+    long || clash
+}
+
 pub fn pg_name(n: &str) -> String {
     if n.starts_with('"') {
         n.to_string()
@@ -571,6 +630,28 @@ pub const ANSI_PADDING: &str = "ASM-TSQL-ANSI-PADDING";
 /// filter or option) does not keep the table out when no entry of it can
 /// exceed the engine's size limit (`PlainIndex::fits`); a T-SQL tree that
 /// turns `ANSI_PADDING` off keeps out every table with a `varchar` column.
+///
+/// (C3d part 2) Every other table each side defines once with a `CREATE
+/// TABLE` the read-only reader reads (`plain_table::read_only`) is sent
+/// read-only ([`MirrorTable::read_only`], `read_only_table`) when the two
+/// definitions pair by column name and nothing else in either tree names it
+/// but statements that cannot change what a read returns
+/// (`plain_table::leaves_reads`, another table's definition, a T-SQL view or
+/// trigger); the checker refuses every write to it. The trees include the
+/// base catalogs' DDL (`--catalog`, `--catalog-b` or its conversion,
+/// `base::Base::ddl`), so their tables reach the checker on the same terms.
+/// Anything a tree may run that no scan of it sees keeps every table out
+/// (`scan`, since the third review an allow-list of top-level statement
+/// kinds and of the calls in bodies, defaults, views and data statements:
+/// a statement of another kind, a node the parser cannot read, a
+/// PostgreSQL `U&` name, an `EXEC` or call of what the tree does not
+/// declare, DDL in a body other than a table's or an index's), as does a
+/// T-SQL change of the database's collation. (Review) A table is sent
+/// neither plain nor read-only when its last name starts with `pg_`
+/// (PostgreSQL resolves it in `pg_catalog` first), another schema defines a
+/// table of the same last name, which may hide it on PostgreSQL's
+/// `search_path`, or a part of its name has 63 bytes or more (PostgreSQL
+/// truncates identifiers to 63).
 #[derive(Debug, Clone, Default)]
 pub struct Tables {
     /// Each table with its T-SQL name as declared.
@@ -604,6 +685,32 @@ fn words(n: &SyntaxNode, d: Dialect, out: &mut Vec<String>) {
     }
 }
 
+/// (C3d part 2) The words of a `CREATE` statement's head, before its first
+/// `ON`, `AS` or `(`: the name of the index, view or trigger it defines
+/// (and a few keywords). An index or a view is a relation of that name,
+/// which may hide a table of the same name in another schema on
+/// PostgreSQL's `search_path`, so it counts for that name.
+fn head_words(n: &SyntaxNode, d: Dialect, out: &mut Vec<String>) {
+    let t = tokens(n);
+    if t.first().map(|x| x.up.as_str()) != Some("CREATE") {
+        return;
+    }
+    for t in t {
+        if t.kind == K::LParen || (t.kind == K::Word && (t.up == "ON" || t.up == "AS")) {
+            break;
+        }
+        match t.kind {
+            K::Word => out.push(t.text.to_lowercase()),
+            K::Quoted => out.push(
+                sqldiff_syntax::abstract_syntax::quoted_name(&t.text, d)
+                    .trim_start_matches('"')
+                    .to_lowercase(),
+            ),
+            _ => {}
+        }
+    }
+}
+
 fn is_ddl(n: &SyntaxNode) -> bool {
     tokens(n).first().is_some_and(|t| {
         matches!(
@@ -627,33 +734,6 @@ fn string_words(n: &SyntaxNode, out: &mut Vec<String>) {
     }
 }
 
-/// Dynamic SQL: a string run as a statement, whose text no scan can see
-/// when it is built at run time. T-SQL `EXEC (...)`, `EXEC @s`,
-/// `sp_executesql`; PL/pgSQL `EXECUTE` (in PostgreSQL always dynamic).
-fn dynamic_sql(n: &SyntaxNode, d: Dialect) -> bool {
-    let t = tokens(n);
-    let runs_text = |j: usize| {
-        t.get(j)
-            .is_some_and(|y| matches!(y.kind, K::LParen | K::Var | K::Str))
-    };
-    t.iter().enumerate().any(|(i, x)| {
-        let exec = x.up == "EXEC" || x.up == "EXECUTE";
-        // `EXEC @rc = dbo.p` captures a return code: what runs is the
-        // named procedure, unless it too is a variable (`EXEC @rc = @p`).
-        let rc = t.get(i + 1).is_some_and(|y| y.kind == K::Var)
-            && t.get(i + 2)
-                .is_some_and(|y| y.kind == K::Op && y.text == "=");
-        (exec && d == Dialect::Postgres)
-            || (exec
-                && if rc {
-                    runs_text(i + 3)
-                } else {
-                    runs_text(i + 1)
-                })
-            || x.up == "SP_EXECUTESQL"
-    })
-}
-
 /// What a tree's DDL says about its tables ([`definitions`]).
 #[derive(Default)]
 struct Ddl {
@@ -672,6 +752,14 @@ struct Ddl {
     /// A T-SQL `ALTER DATABASE ... COLLATE`: columns created before it keep
     /// the old collation, so no column is known to have the database's.
     collation_changed: bool,
+    /// (C3d part 2) Every `CREATE TABLE` the read-only reader reads
+    /// (`plain_table::read_only`), plain ones included.
+    ro_defs: Vec<plain_table::ReadTable>,
+    /// (C3d part 2) Every word named by a statement that may change what a
+    /// read of a table returns: all but the read-only definitions and the
+    /// statements of `plain_table::leaves_reads`; T-SQL views; T-SQL
+    /// triggers but for the DDL and strings in their bodies (as routines).
+    named_ro: Vec<String>,
 }
 
 /// A statement that may turn `ANSI_PADDING` off: `SET ANSI_PADDING OFF`,
@@ -700,10 +788,15 @@ fn collation_changed(n: &SyntaxNode) -> bool {
 /// named elsewhere, whether the tree runs dynamic SQL anywhere, and
 /// whether it turns `ANSI_PADDING` off.
 fn definitions(texts: &[&str], d: Dialect) -> Ddl {
+    // C3d part 2, review: what a tree runs is an allow-list of statement
+    // kinds and calls (`scan`); anything else may change any table.
+    let scan = Scan::new(texts, d);
     let (mut defs, mut named, mut dynamic) = (Vec::new(), Vec::new(), false);
     let (mut indexes, mut padding, mut collation) = (Vec::new(), false, false);
+    let (mut ro_defs, mut named_ro) = (Vec::new(), Vec::new());
     for text in texts {
         let root = parse(text, d).syntax();
+        dynamic |= scan.unseen(&root);
         let mut it = root.preorder();
         while let Some(ev) = it.next() {
             let rowan::WalkEvent::Enter(n) = ev else {
@@ -716,27 +809,43 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
                         .take(4)
                         .find(|t| !matches!(t.up.as_str(), "CREATE" | "OR" | "ALTER" | "REPLACE"))
                         .map(|t| t.up.clone());
-                    if matches!(kind.as_deref(), Some("PROCEDURE" | "PROC" | "FUNCTION")) {
-                        // The body names its tables; only DDL in it counts, and
-                        // any table named in a string (DDL kept as text).
+                    // The DDL and the strings of a routine body (a table named
+                    // in a string: DDL kept as text).
+                    let body_words = |out: &mut Vec<String>| {
                         for s in n
                             .descendants()
                             .filter(|s| s.kind() == SyntaxKind::STATEMENT)
                         {
                             if is_ddl(&s) {
-                                words(&s, d, &mut named);
+                                words(&s, d, out);
                             } else {
-                                string_words(&s, &mut named);
+                                string_words(&s, out);
                             }
                         }
-                        dynamic |= dynamic_sql(&n, d);
+                    };
+                    if matches!(kind.as_deref(), Some("PROCEDURE" | "PROC" | "FUNCTION")) {
+                        // The body names its tables; only DDL in it counts, and
+                        // any table named in a string (DDL kept as text).
+                        body_words(&mut named);
+                        body_words(&mut named_ro);
                     } else {
                         words(&n, d, &mut named);
+                        // C3d part 2: a T-SQL view changes no table, and a
+                        // trigger fires on writes only: a read fires none. What
+                        // its body may run is held to the scan's call rule,
+                        // as a procedure's is.
+                        match (d, kind.as_deref()) {
+                            (Dialect::Tsql, Some("VIEW")) => head_words(&n, d, &mut named_ro),
+                            (Dialect::Tsql, Some("TRIGGER")) => {
+                                head_words(&n, d, &mut named_ro);
+                                body_words(&mut named_ro);
+                            }
+                            _ => words(&n, d, &mut named_ro),
+                        }
                     }
                     it.skip_subtree();
                 }
                 SyntaxKind::STATEMENT => {
-                    dynamic |= dynamic_sql(&n, d);
                     padding |= d == Dialect::Tsql && padding_off(&n);
                     collation |= d == Dialect::Tsql && collation_changed(&n);
                     match plain_table::read(&n, d) {
@@ -747,6 +856,24 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
                         Err(_) => match plain_table::index(&n, d) {
                             Ok(ix) => indexes.push(ix),
                             Err(_) => words(&n, d, &mut named),
+                        },
+                    }
+                    // C3d part 2: a table definition, or a statement that
+                    // cannot change what a read returns, does not keep a
+                    // read-only table out; anything else naming it does.
+                    match plain_table::read_only(&n, d) {
+                        Ok(t) => ro_defs.push(t),
+                        Err(_) if plain_table::leaves_reads(&n, d) => {
+                            head_words(&n, d, &mut named_ro)
+                        }
+                        // Another table (`LIKE t`, `AS SELECT ... FROM t`, a
+                        // temporary one): only the name it defines counts.
+                        Err(_) => match plain_table::creates_other_table(&n, d) {
+                            Some(name) => named_ro.extend(
+                                name.iter()
+                                    .map(|x| x.trim_start_matches('"').to_lowercase()),
+                            ),
+                            None => words(&n, d, &mut named_ro),
                         },
                     }
                     it.skip_subtree();
@@ -762,6 +889,8 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
         dynamic,
         padding_off: padding,
         collation_changed: collation,
+        ro_defs,
+        named_ro,
     }
 }
 
@@ -829,6 +958,64 @@ fn pair_default(
     }
 }
 
+/// (C3d part 2) The read-only table of the checker's catalog for a T-SQL
+/// table and the PostgreSQL table converted from it, or `None` when they do
+/// not pair: the same number of columns, the same names in the same order
+/// under the converter's naming (ASCII), and at least one column of the
+/// slice. A column is of the slice when both sides' types are and pair
+/// (`pair_type`), else opaque (a name only: no read takes its value). It is
+/// `NOT NULL` only when both sides say so (or it is a key column); key
+/// flags are sent only when both declare the same primary key in the
+/// `CREATE TABLE`, not deferrable (`plain_table::ReadCol::key`), and they
+/// are sent as declared, also on an opaque or string column: the checker
+/// then reads the table without a key (`CatTable.keyVisible`). No default
+/// is sent: no read sees one.
+fn read_only_table(
+    key: String,
+    a: &plain_table::ReadTable,
+    b: &plain_table::ReadTable,
+) -> Option<MirrorTable> {
+    if a.cols.len() != b.cols.len()
+        || !a
+            .cols
+            .iter()
+            .zip(&b.cols)
+            .all(|(x, y)| x.name.is_ascii() && pg_name(&x.name) == pg_name(&y.name))
+    {
+        return None;
+    }
+    let keyed =
+        a.cols.iter().any(|x| x.key) && a.cols.iter().zip(&b.cols).all(|(x, y)| x.key == y.key);
+    let cols: Vec<MirrorColumn> = a
+        .cols
+        .iter()
+        .zip(&b.cols)
+        .map(|(x, y)| {
+            let ty = match (x.ty, y.ty) {
+                (Some(p), Some(q)) => pair_type(p, q).unwrap_or(MirrorType::Opaque),
+                _ => MirrorType::Opaque,
+            };
+            let key = keyed && x.key;
+            MirrorColumn {
+                name: pg_name(&y.name),
+                tsql: x.name.clone(),
+                not_null: ty != MirrorType::Opaque && (key || (x.not_null && y.not_null)),
+                key,
+                ty,
+                default: None,
+            }
+        })
+        .collect();
+    if cols.iter().all(|c| c.ty == MirrorType::Opaque) {
+        return None;
+    }
+    Some(MirrorTable {
+        name: key,
+        cols,
+        read_only: true,
+    })
+}
+
 /// (C3c) The T-SQL table has a `varchar` column (the one `ANSI_PADDING`
 /// applies to; eval/tables T3).
 pub fn has_varchar(t: &MirrorTable) -> bool {
@@ -868,10 +1055,40 @@ impl Tables {
                 .trim_start_matches('"')
                 .to_lowercase()
         };
+        // C3d part 2, review: every table either side defines, by its
+        // target name. Another schema's table of the same last name may hide
+        // this one on PostgreSQL's `search_path` (or a T-SQL user's default
+        // schema), whether or not a reader reads it.
+        let defined: Vec<String> = src_ddl
+            .defs
+            .iter()
+            .map(|x| target_routine(&x.name).0)
+            .chain(src_ddl.ro_defs.iter().map(|x| target_routine(&x.name).0))
+            .chain(out_ddl.defs.iter().map(|x| pg(&x.name)))
+            .chain(out_ddl.ro_defs.iter().map(|x| pg(&x.name)))
+            .collect();
+        // A table out of reach: a `pg_` name, which PostgreSQL resolves in
+        // `pg_catalog` first (`pg_user` is the catalog's view whatever the
+        // routine's schema), or one another schema also defines; (third
+        // review) or a name part of 63 bytes or more: PostgreSQL truncates
+        // a longer identifier to 63 bytes, so a longer name is another
+        // relation's (or none), and a 63-byte one is what any longer
+        // spelling of another relation becomes.
+        let out_of_reach = |key: &str| {
+            let last = last_of(key);
+            last.starts_with("pg_")
+                || key
+                    .split('.')
+                    .any(|p| p.trim_start_matches('"').len() >= PG_NAME_BYTES)
+                || defined.iter().any(|k| k != key && last_of(k) == last)
+        };
         let mut by_target = Vec::new();
         for a in src {
             let key = target_routine(&a.name).0;
             let last = last_of(&key);
+            if out_of_reach(&key) {
+                continue;
+            }
             let once = src
                 .iter()
                 .filter(|x| target_routine(&x.name).0 == key)
@@ -940,12 +1157,48 @@ impl Tables {
                 })
                 .collect();
             if let Some(cols) = cols {
-                let t = MirrorTable { name: key, cols };
+                let t = MirrorTable {
+                    name: key,
+                    cols,
+                    read_only: false,
+                };
                 // A `varchar` column created under `ANSI_PADDING OFF` trims
                 // trailing spaces on writes (eval/tables T3).
                 if src_ddl.padding_off && has_varchar(&t) {
                     continue;
                 }
+                by_target.push((t, a.name.clone()));
+            }
+        }
+        // C3d part 2: every other table defined once on each side, named by
+        // nothing that can change a read, whose two definitions pair, is a
+        // read-only table.
+        for a in &src_ddl.ro_defs {
+            let key = target_routine(&a.name).0;
+            if by_target.iter().any(|(t, _)| t.name == key) {
+                continue;
+            }
+            let last = last_of(&key);
+            let once = src_ddl
+                .ro_defs
+                .iter()
+                .filter(|x| target_routine(&x.name).0 == key)
+                .count()
+                == 1;
+            let bs: Vec<_> = out_ddl
+                .ro_defs
+                .iter()
+                .filter(|x| pg(&x.name) == key)
+                .collect();
+            let [b] = bs.as_slice() else { continue };
+            if !once
+                || out_of_reach(&key)
+                || src_ddl.named_ro.contains(&last)
+                || out_ddl.named_ro.contains(&last)
+            {
+                continue;
+            }
+            if let Some(t) = read_only_table(key, a, b) {
                 by_target.push((t, a.name.clone()));
             }
         }
@@ -957,6 +1210,13 @@ impl Tables {
             .iter()
             .find(|t| t.0.name == target)
             .map(|t| &t.0)
+    }
+
+    /// The table, when it is sent as one the routines may write (not
+    /// read-only, C3d part 2).
+    #[cfg(test)]
+    fn writable(&self, target: &str) -> Option<&MirrorTable> {
+        self.get(target).filter(|t| !t.read_only)
     }
 
     /// The T-SQL name the table was declared with.
@@ -1290,6 +1550,15 @@ pub fn certify(
             (_, Some(Err(e))) => Answer::Unconfirmed {
                 reason: format!("the output routine is outside the verified shape: {e}"),
             },
+            (Ok(_), Some(Ok(_)))
+                if same
+                    .first()
+                    .is_some_and(|(n, sp, _, _)| name_too_long(output, *sp, n, &out, to)) =>
+            {
+                Answer::Unconfirmed {
+                    reason: NAME_TOO_LONG.into(),
+                }
+            }
             (Ok(a), Some(Ok(b))) => {
                 c.source = Some(sha(&encode::routine(&a)));
                 c.target = Some(sha(&encode::routine(&b)));
@@ -1450,7 +1719,9 @@ fn partial_renaming(a: &Routine, b: &Routine) -> Renaming {
 /// answer about trees with statements left out (`check:differ`,
 /// `check:certificate`, `check:signature`, `pair:*`, ...) say only that
 /// the trees differ, which leaving statements out makes them do.
-const LOWERING_FAMILIES: [&str; 6] = ["routine:", "stmt:", "node:", "expr:", "store:", "type:"];
+const LOWERING_FAMILIES: [&str; 7] = [
+    "routine:", "stmt:", "node:", "expr:", "store:", "type:", "name:",
+];
 
 /// A routine with a left-out statement is never confirmed (C0.10).
 ///
@@ -1759,17 +2030,41 @@ END
             tables("CREATE INDEX ix ON dbo.Acct (Qty);\n").get("acct"),
             Some(acct)
         );
-        // Anything else that names the table keeps it out.
-        for extra in [
-            "CREATE UNIQUE INDEX ix ON dbo.Acct (Qty);\n",
-            "CREATE INDEX ix ON dbo.Acct (Qty) WHERE Qty IS NOT NULL;\n",
-            "GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n",
-            "ALTER TABLE dbo.Acct ADD CONSTRAINT ck CHECK (Qty > 0);\n",
-            "CREATE TABLE dbo.Line (Id int NOT NULL REFERENCES dbo.Acct (Id));\n",
-            "CREATE TABLE dbo.Acct (Id int NOT NULL PRIMARY KEY);\n",
-            "GO\nCREATE PROCEDURE dbo.q AS BEGIN ALTER TABLE dbo.Acct ADD z int NULL; END\n",
+        // Anything else that names the table keeps it out as a table the
+        // routines may write; (C3d part 2) what cannot change a read leaves it
+        // a read-only table, the rest keeps it out altogether.
+        for (extra, read_only) in [
+            ("CREATE UNIQUE INDEX ix ON dbo.Acct (Qty);\n", true),
+            (
+                "CREATE INDEX ix ON dbo.Acct (Qty) WHERE Qty IS NOT NULL;\n",
+                true,
+            ),
+            // A trigger fires on writes only; its conversion's `CREATE
+            // TRIGGER ... EXECUTE FUNCTION` runs no text (`scan`).
+            (
+                "GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n",
+                true,
+            ),
+            (
+                "ALTER TABLE dbo.Acct ADD CONSTRAINT ck CHECK (Qty > 0);\n",
+                true,
+            ),
+            (
+                "CREATE TABLE dbo.Line (Id int NOT NULL REFERENCES dbo.Acct (Id));\n",
+                true,
+            ),
+            (
+                "CREATE TABLE dbo.Acct (Id int NOT NULL PRIMARY KEY);\n",
+                false,
+            ),
+            (
+                "GO\nCREATE PROCEDURE dbo.q AS BEGIN ALTER TABLE dbo.Acct ADD z int NULL; END\n",
+                false,
+            ),
         ] {
-            assert!(tables(extra).get("acct").is_none(), "{extra}");
+            let t = tables(extra);
+            assert!(t.writable("acct").is_none(), "{extra}");
+            assert_eq!(t.get("acct").is_some(), read_only, "{extra}");
         }
     }
 
@@ -1922,7 +2217,7 @@ END
             "CREATE INDEX IX_Name ON dbo.Cust (Name);\n",
             "CREATE NONCLUSTERED INDEX IX_City ON dbo.Cust (City DESC) INCLUDE (Qty);\n",
         ] {
-            assert!(tables(extra).get("cust").is_some(), "{extra}");
+            assert!(tables(extra).writable("cust").is_some(), "{extra}");
         }
         // Anything else keeps it out.
         for extra in [
@@ -1932,20 +2227,22 @@ END
             "CREATE INDEX IX_Nope ON dbo.Cust (Nope);\n",
             "SET ANSI_PADDING OFF;\n",
         ] {
-            assert!(tables(extra).get("cust").is_none(), "{extra}");
+            assert!(tables(extra).writable("cust").is_none(), "{extra}");
         }
         // An index whose PostgreSQL entry may exceed the btree limit: 700
         // characters may take 2800 bytes (eval/tables T8), though 700 bytes
         // fit SQL Server's 1700.
         let wide = "CREATE TABLE dbo.W (Id int NOT NULL PRIMARY KEY, V varchar(700) NULL);\n\
                     CREATE INDEX IX_V ON dbo.W (V);\n";
-        assert!(tables_of(wide, &convert(wide)).get("w").is_none());
+        assert!(tables_of(wide, &convert(wide)).writable("w").is_none());
         let wide_ok = wide.replace("700", "600");
-        assert!(tables_of(&wide_ok, &convert(&wide_ok)).get("w").is_some());
+        assert!(tables_of(&wide_ok, &convert(&wide_ok))
+            .writable("w")
+            .is_some());
         // Types and defaults must pair: an output edited to another length,
         // to text, without the default, with another default.
         let out = convert(ddl);
-        assert!(tables_of(ddl, &out).get("cust").is_some());
+        assert!(tables_of(ddl, &out).writable("cust").is_some());
         // An index on another spelling of the table's name, on one side
         // only (the other side's tree as converted from the bare DDL), and
         // padding turned off for the database or the server.
@@ -1957,8 +2254,12 @@ END
             "ALTER DATABASE CURRENT COLLATE Latin1_General_100_BIN2;\n",
         ] {
             let src = format!("{ddl}{extra}");
-            assert!(tables_of(&src, &out).get("cust").is_none(), "{extra}");
+            assert!(tables_of(&src, &out).writable("cust").is_none(), "{extra}");
         }
+        // After a change of the database's collation no table is sent, not
+        // even read-only (C3d part 2).
+        let src = format!("{ddl}ALTER DATABASE CURRENT COLLATE Latin1_General_100_BIN2;\n");
+        assert!(tables_of(&src, &out).get("cust").is_none());
         for extra in [
             "CREATE INDEX ix_name ON public.cust (name);\n",
             "CREATE INDEX ix_name ON \"public\".\"cust\" (name);\n",
@@ -1966,7 +2267,10 @@ END
             "CREATE INDEX ix_name ON dbo.cust (name);\n",
         ] {
             let edited = format!("{out}{extra}");
-            assert!(tables_of(ddl, &edited).get("cust").is_none(), "{extra}");
+            assert!(
+                tables_of(ddl, &edited).writable("cust").is_none(),
+                "{extra}"
+            );
         }
         for (from, to) in [
             ("Name varchar(20)", "Name varchar(21)"),
@@ -1977,11 +2281,184 @@ END
         ] {
             assert!(out.contains(from), "{from} in {out}");
             let edited = out.replace(from, to);
-            assert!(tables_of(ddl, &edited).get("cust").is_none(), "{to}");
+            assert!(tables_of(ddl, &edited).writable("cust").is_none(), "{to}");
         }
         // A default only one side shows, the other way round.
         let src = ddl.replace(" DEFAULT 0", "");
-        assert!(tables_of(&src, &out).get("cust").is_none());
+        assert!(tables_of(&src, &out).writable("cust").is_none());
+    }
+
+    /// C3d part 2: a table the routines only read may carry what no read
+    /// sees; it is sent read-only, its out-of-slice columns opaque, its key
+    /// only when both sides declare it whole. What can change a read keeps
+    /// it out.
+    #[test]
+    fn read_only_tables_reach_the_checker() {
+        let ddl = "CREATE TABLE dbo.Item (Id int IDENTITY(1,1) NOT NULL PRIMARY KEY, \
+                   Name varchar(20) NOT NULL, Price decimal(12,2) NOT NULL, \
+                   Added datetime2 NOT NULL DEFAULT SYSDATETIME());\n\
+                   CREATE TABLE dbo.Line (OrdId int NOT NULL, LineNo int NOT NULL, \
+                   ItemId int NOT NULL REFERENCES dbo.Item (Id), Qty int NOT NULL CHECK (Qty > 0), \
+                   Code char(4) NOT NULL, CONSTRAINT PK_Line PRIMARY KEY (OrdId, LineNo));\n\
+                   CREATE TABLE dbo.Tag (Code char(4) NOT NULL PRIMARY KEY, N int NULL);\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let tables_of =
+            |src: &str, out: &str| Tables::read(&[src], &[out], Dialect::Tsql, Dialect::Postgres);
+        let tables = |extra: &str| {
+            let src = format!("{ddl}{extra}");
+            tables_of(&src, &convert(&src))
+        };
+        let t = tables("");
+        let shape = |n: &str| {
+            let m = t.get(n).unwrap_or_else(|| panic!("{n} is sent"));
+            assert!(m.read_only, "{n}");
+            m.cols
+                .iter()
+                .map(|c| (c.name.clone(), c.ty, c.not_null, c.key))
+                .collect::<Vec<_>>()
+        };
+        let col = |n: &str, ty, nn, k| (n.to_string(), ty, nn, k);
+        let vc20 = MirrorType::Str {
+            len: 20,
+            wide: false,
+        };
+        assert_eq!(
+            shape("item"),
+            [
+                col("id", MirrorType::Int, true, true),
+                col("name", vc20, true, false),
+                col("price", MirrorType::Opaque, false, false),
+                col("added", MirrorType::Opaque, false, false),
+            ]
+        );
+        assert_eq!(
+            shape("line"),
+            [
+                col("ordid", MirrorType::Int, true, true),
+                col("lineno", MirrorType::Int, true, true),
+                col("itemid", MirrorType::Int, true, false),
+                col("qty", MirrorType::Int, true, false),
+                col("code", MirrorType::Opaque, false, false),
+            ]
+        );
+        // The key is the opaque column: sent as declared, the checker reads
+        // the table without a key.
+        assert_eq!(
+            shape("tag"),
+            [
+                col("code", MirrorType::Opaque, false, true),
+                col("n", MirrorType::Int, false, false),
+            ]
+        );
+        // No default is sent, and a T-SQL column's spelling is kept.
+        assert!(t
+            .get("item")
+            .unwrap()
+            .cols
+            .iter()
+            .all(|c| c.default.is_none()));
+        assert_eq!(t.get("line").unwrap().cols[2].tsql, "ItemId");
+        // What cannot change a read leaves the tables read-only.
+        for extra in [
+            "CREATE UNIQUE INDEX UX_Name ON dbo.Item (Name) WHERE Name > 'a';\n",
+            "ALTER TABLE dbo.Line ADD CONSTRAINT CK_Qty2 CHECK (Qty < 1000);\n",
+            "ALTER TABLE dbo.Line NOCHECK CONSTRAINT ALL;\n",
+            "GO\nCREATE VIEW dbo.V AS SELECT Id, Name FROM dbo.Item;\nGO\n",
+            "EXEC sys.sp_addextendedproperty @name = N'MS_Description', @value = N'items', \
+             @level0type = N'SCHEMA', @level0name = 'dbo', @level1type = N'TABLE', @level1name = 'Item';\n",
+            "CREATE TABLE dbo.Other (Id int NOT NULL PRIMARY KEY, ItemId int NULL REFERENCES dbo.Item (Id));\n",
+        ] {
+            let t = tables(extra);
+            for n in ["item", "line"] {
+                assert!(t.get(n).is_some_and(|m| m.read_only), "{n}: {extra}");
+            }
+        }
+        // What can, or what the reader cannot show harmless, keeps the table
+        // out (and only that table). An index or a view named like the table
+        // may hide it on PostgreSQL's search_path.
+        for (extra, out) in [
+            ("CREATE INDEX Item ON dbo.Line (Qty);\n", "item"),
+            ("GO\nCREATE VIEW rpt.Item AS SELECT Id FROM dbo.Item;\nGO\n", "item"),
+            ("ALTER TABLE dbo.Item ADD Extra int NULL;\n", "item"),
+            ("ALTER TABLE dbo.Item ALTER COLUMN Name varchar(30) NOT NULL;\n", "item"),
+            ("ALTER TABLE dbo.Item DROP CONSTRAINT PK_Item;\n", "item"),
+            ("GRANT SELECT ON dbo.Item TO someone;\n", "item"),
+            ("INSERT INTO dbo.Item (Name, Price, Added) VALUES ('a', 1, '2020-01-01');\n", "item"),
+            ("CREATE TABLE dbo.Item (Id int NOT NULL PRIMARY KEY);\n", "item"),
+            ("GO\nCREATE PROCEDURE dbo.q AS BEGIN ALTER TABLE dbo.Line DROP COLUMN Code; END\n", "line"),
+            ("GO\nCREATE PROCEDURE dbo.q AS BEGIN DECLARE @s nvarchar(100) = N'DROP TABLE dbo.Line'; END\n", "line"),
+        ] {
+            let t = tables(extra);
+            assert!(t.get(out).is_none(), "{out}: {extra}");
+            let other = if out == "item" { "line" } else { "item" };
+            assert!(t.get(other).is_some_and(|m| m.read_only), "{other}: {extra}");
+        }
+        // Dynamic SQL anywhere, or a T-SQL trigger that runs it, keeps every
+        // table out.
+        for extra in [
+            // (Third review) A security policy is off the statement list.
+            "GO\nCREATE FUNCTION dbo.f (@n varchar(20)) RETURNS TABLE WITH SCHEMABINDING AS \
+             RETURN SELECT 1 AS ok WHERE @n = USER_NAME();\nGO\n\
+             CREATE SECURITY POLICY dbo.P ADD FILTER PREDICATE dbo.f(Name) ON dbo.Item;\n",
+            // C3d part 2, review: an undeclared procedure, `sp_rename` among
+            // them, may do anything (`scan`).
+            "EXEC sp_rename 'dbo.Item.Name', 'Title', 'COLUMN';\n",
+            "GO\nCREATE PROCEDURE dbo.q @s nvarchar(100) AS BEGIN EXEC (@s); END\n",
+            "GO\nCREATE TRIGGER dbo.tr ON dbo.Other AFTER INSERT AS BEGIN EXEC sp_executesql N'SELECT 1'; END\n",
+        ] {
+            let src = format!("{ddl}{extra}");
+            let t = tables_of(&src, &convert(ddl));
+            assert!(t.get("item").is_none() && t.get("line").is_none(), "{extra}");
+        }
+        // The two definitions must pair: the same column names in the same
+        // order; a column whose types do not pair is opaque; a key that the
+        // other side does not declare is no key; nullability is claimed only
+        // where both sides say NOT NULL.
+        let out = convert(ddl);
+        for (from, to) in [
+            ("ItemId integer", "ItemNo integer"),
+            ("Qty integer NOT NULL CHECK (Qty > 0),", ""),
+        ] {
+            assert!(out.contains(from), "{from} in {out}");
+            assert!(
+                tables_of(ddl, &out.replace(from, to)).get("line").is_none(),
+                "{to}"
+            );
+        }
+        let edited = out
+            .replace("Name varchar(20) NOT NULL", "Name varchar(21) NULL")
+            .replace(
+                "CONSTRAINT PK_Line PRIMARY KEY (OrdId, LineNo)",
+                "UNIQUE (OrdId, LineNo)",
+            );
+        assert!(edited != out);
+        let t = tables_of(ddl, &edited);
+        assert_eq!(t.get("item").unwrap().cols[1].ty, MirrorType::Opaque);
+        assert!(t.get("line").unwrap().cols.iter().all(|c| !c.key));
+        let edited = out.replace("Qty integer NOT NULL", "Qty integer NULL");
+        assert!(edited != out);
+        assert!(!tables_of(ddl, &edited).get("line").unwrap().cols[3].not_null);
+        // A routine that writes a read-only table sends it as it is: the
+        // checker refuses the write (`stmt:update:table:read-only`).
+        let proc = "CREATE PROCEDURE dbo.p @id int AS\nBEGIN\n  \
+                    UPDATE dbo.Line SET Qty = 1 WHERE OrdId = @id AND LineNo = 1;\nEND\n";
+        let a = routines(proc, Dialect::Tsql).remove(0).2.unwrap();
+        let b = routines(&convert(proc), Dialect::Postgres)
+            .remove(0)
+            .2
+            .unwrap();
+        let trusted = Trusted {
+            tables: tables(""),
+            ..Default::default()
+        };
+        let (req, _) = mirror_request(&a, &b, &[], &trusted).unwrap();
+        assert_eq!(req.table_catalog.len(), 1);
+        assert!(req.table_catalog[0].read_only);
+        assert!(req.line(1).unwrap().contains("=r"));
     }
 
     #[test]
@@ -1994,6 +2471,270 @@ END
         let read = |src: &str| routines(src, Dialect::Tsql).remove(0).2.unwrap();
         assert!(begins_tran_outside_try(&read(bracket).body.body));
         assert!(!begins_tran_outside_try(&read(idiom).body.body));
+    }
+
+    /// C3d part 2, review (F4): dynamic SQL is an allow-list. An `EXEC` keeps
+    /// every table out unless it calls a procedure the tree declares, by
+    /// name, or sets an extended property; on PostgreSQL a `DO` block, a body
+    /// no scan reads and a top-level call of an undeclared routine do too.
+    /// Each of these ran DDL at deployment that no name scan saw (a policy,
+    /// row-level security, a rename).
+    #[test]
+    fn only_calls_the_tree_shows_are_not_dynamic() {
+        let ddl = "CREATE TABLE dbo.Item (Id int NOT NULL PRIMARY KEY, Name varchar(20) NOT NULL, \
+                   Price decimal(12,2) NOT NULL);\n\
+                   CREATE TABLE dbo.Line (OrdId int NOT NULL PRIMARY KEY, ItemId int NOT NULL);\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let both_in = |src: &str, out: &str| {
+            let t = Tables::read(&[src], &[out], Dialect::Tsql, Dialect::Postgres);
+            let (i, l) = (t.get("item").is_some(), t.get("line").is_some());
+            assert_eq!(i, l, "{src}\n{out}");
+            i
+        };
+        let out = convert(ddl);
+        assert!(both_in(ddl, &out));
+        // T-SQL, at the top level or in a routine.
+        for extra in [
+            "GO\nDECLARE @s nvarchar(100) = N'SELECT 1';\nEXEC sp_sqlexec @s;\n",
+            "GO\nDECLARE @s nvarchar(100) = N'SELECT 1';\nEXEC [sp_executesql] @s;\n",
+            "GO\nDECLARE @s nvarchar(100) = N'SELECT 1';\nEXEC sys.[sp_executesql] @s;\n",
+            "GO\nDECLARE @s nvarchar(100) = N'SELECT 1';\nEXEC sp_MSforeachtable @s;\n",
+            "GO\nDECLARE @h int, @s nvarchar(100) = N'SELECT 1';\nEXEC sp_prepexec @h OUTPUT, NULL, @s;\n",
+            "GO\nDECLARE @c nvarchar(100) = N'dbo.' + NCHAR(84) + N'1.V';\nEXEC sp_rename @c, N'Z', 'COLUMN';\n",
+            "GO\nEXEC dbo.Setup;\n",
+            "GO\nEXECUTE AS USER = 'someone';\n",
+            "GO\nsp_executesql N'SELECT 1';\n",
+            "GO\nSetup;\n",
+            "GO\nSELECT * FROM OPENQUERY(loopback, 'SELECT 1');\n",
+            "GO\nCREATE PROCEDURE dbo.Clr AS EXTERNAL NAME A.B.C;\nGO\nEXEC dbo.Clr;\n",
+            "GO\nCREATE PROCEDURE dbo.q AS BEGIN EXEC dbo.NotHere; END\n",
+            "GO\nCREATE PROCEDURE dbo.q AS BEGIN EXEC dbo.Item_Name; END\n",
+            "GO\nCREATE PROCEDURE sp_mine AS BEGIN RETURN 1; END\nGO\nEXEC sp_mine;\n",
+            // (Third review) At the top level only an extended property may be
+            // set by `EXEC`; a declared procedure runs there too.
+            "GO\nCREATE PROCEDURE dbo.R AS BEGIN RETURN 1; END\nGO\nEXEC dbo.R;\n",
+        ] {
+            assert!(!both_in(&format!("{ddl}{extra}"), &out), "{extra}");
+        }
+        for extra in [
+            "GO\nEXEC sys.sp_addextendedproperty @name = N'd', @value = N'x', \
+             @level0type = N'SCHEMA', @level0name = 'dbo';\n",
+            "GO\nEXEC [sp_updateextendedproperty] @name = N'd', @value = N'y';\n",
+            "GO\nCREATE PROCEDURE dbo.R AS BEGIN RETURN 1; END\nGO\n\
+             CREATE PROCEDURE [dbo].[q] WITH EXECUTE AS OWNER AS BEGIN EXEC [DBO].[r]; END\n",
+        ] {
+            assert!(both_in(&format!("{ddl}{extra}"), &out), "{extra}");
+        }
+        // PostgreSQL.
+        for extra in [
+            "DO $$ BEGIN EXECUTE 'CREATE POLICY p ON ' || chr(105) || 'tem USING (false)'; END $$;\n",
+            "DO 'BEGIN NULL; END';\n",
+            "DO LANGUAGE plpgsql $$ BEGIN NULL; END $$;\n",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS 'BEGIN NULL; END';\n",
+            "CREATE FUNCTION f() RETURNS void LANGUAGE sql AS 'SELECT 1';\nSELECT f();\n",
+            "CREATE FUNCTION f() RETURNS int LANGUAGE plpython3u AS $$ return 1 $$;\n",
+            "CREATE FUNCTION f(int) RETURNS int AS 'MODULE_PATHNAME', 'f' LANGUAGE C;\n",
+            "CREATE FUNCTION f(int) RETURNS int LANGUAGE internal AS 'int4abs';\n",
+            "SELECT not_declared();\n",
+            "SELECT set_config('search_path', 's', false);\n",
+            "CALL elsewhere.p();\n",
+            "INSERT INTO other (a) VALUES (g());\n",
+            "CREATE FUNCTION pg_mine() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\nSELECT pg_mine();\n",
+            "COPY other FROM PROGRAM 'cat x';\n",
+        ] {
+            assert!(!both_in(ddl, &format!("{out}{extra}")), "{extra}");
+        }
+        for extra in [
+            "CREATE FUNCTION h() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;\nSELECT h();\n",
+            "CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$;\nCALL p();\n",
+            "SELECT lower('A'), pg_catalog.upper('b'), CAST(1 AS numeric(10, 2)), '1'::varchar(3);\n",
+        ] {
+            assert!(both_in(ddl, &format!("{out}{extra}")), "{extra}");
+        }
+    }
+
+    /// C3d part 2, review: a table PostgreSQL may not resolve to its own
+    /// definition is sent neither plain nor read-only: a `pg_` name
+    /// (`pg_catalog` is searched first: `pg_user` is the catalog's view), or
+    /// one another schema also defines, readable or not (F5, F7).
+    #[test]
+    fn tables_another_relation_may_hide_are_not_sent() {
+        let plain = "CREATE TABLE dbo.Acct (Id int NOT NULL PRIMARY KEY, Qty int NULL);\n";
+        let ro = "CREATE TABLE dbo.Item (Id int NOT NULL PRIMARY KEY, Price decimal(12,2) NULL);\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let read =
+            |src: &str, out: &str| Tables::read(&[src], &[out], Dialect::Tsql, Dialect::Postgres);
+        let base = format!("{plain}{ro}");
+        let t = read(&base, &convert(&base));
+        assert!(t.get("acct").is_some_and(|m| !m.read_only));
+        assert!(t.get("item").is_some_and(|m| m.read_only));
+        let pg = base.replace("Acct", "pg_acct").replace("Item", "Pg_Item");
+        let t = read(&pg, &convert(&pg));
+        assert!(t.get("pg_acct").is_none() && t.get("pg_item").is_none());
+        // Another schema's definition, plain, read-only or neither, on either
+        // side, keeps the table of that last name out, and only it.
+        for (src_extra, out_extra) in [
+            (
+                "",
+                "CREATE TABLE s.acct (id integer NOT NULL PRIMARY KEY, qty integer);\n",
+            ),
+            (
+                "",
+                "CREATE TABLE s.item (id integer NOT NULL PRIMARY KEY, price numeric(12,2));\n",
+            ),
+            ("", "CREATE TABLE s.acct (id integer) INHERITS (u);\n"),
+            ("CREATE TABLE rpt.Acct (Id int NOT NULL PRIMARY KEY);\n", ""),
+            (
+                "CREATE TABLE rpt.Item (Id int NOT NULL, X decimal(1,0) NULL);\n",
+                "",
+            ),
+        ] {
+            let src = format!("{base}{src_extra}");
+            let t = read(&src, &format!("{}{out_extra}", convert(&base)));
+            let (gone, kept) = if format!("{src_extra}{out_extra}")
+                .to_lowercase()
+                .contains("acct")
+            {
+                ("acct", "item")
+            } else {
+                ("item", "acct")
+            };
+            assert!(t.get(gone).is_none(), "{gone}: {src_extra}{out_extra}");
+            assert!(t.get(kept).is_some(), "{kept}: {src_extra}{out_extra}");
+        }
+    }
+
+    /// C3d part 2, third review: what a T-SQL trigger or view runs keeps a
+    /// writable plain table out too (F3: before, a trigger's dynamic SQL
+    /// kept only read-only tables out, and a view's `OPENQUERY` none), and
+    /// a table whose PostgreSQL name has a part of 63 bytes or more is not
+    /// sent (F1: a longer name is truncated to another relation's).
+    #[test]
+    fn third_review_tables_stay_out() {
+        let ddl = "CREATE TABLE dbo.Acct (Id int NOT NULL PRIMARY KEY, Qty int NULL);\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let read =
+            |src: &str| Tables::read(&[src], &[&convert(src)], Dialect::Tsql, Dialect::Postgres);
+        assert!(read(ddl).writable("acct").is_some());
+        for extra in [
+            "GO\nCREATE TABLE dbo.Log (Id int NOT NULL PRIMARY KEY);\nGO\n\
+             CREATE TRIGGER dbo.tr ON dbo.Log AFTER INSERT AS\nBEGIN\n  \
+             DECLARE @s nvarchar(200) = N'ALTER TABLE dbo.' + NCHAR(65) + N'cct ADD CONSTRAINT ck CHECK (Qty < 100)';\n  \
+             EXEC (@s);\nEND\nGO\nINSERT INTO dbo.Log (Id) VALUES (1);\n",
+            "GO\nCREATE VIEW dbo.v AS SELECT x FROM OPENQUERY(loopback, 'SELECT 1 AS x');\nGO\n",
+            "GO\nComment;\n",
+        ] {
+            assert!(read(&format!("{ddl}{extra}")).get("acct").is_none(), "{extra}");
+        }
+        for (len, sent) in [(62, true), (63, false), (66, false)] {
+            let name: String = std::iter::once('T')
+                .chain(std::iter::repeat('x').take(len - 1))
+                .collect();
+            let src = ddl.replace("Acct", &name);
+            let t = read(&src);
+            assert_eq!(t.get(&name.to_lowercase()).is_some(), sent, "{len}");
+        }
+    }
+
+    /// C3d part 2, third review (F5): two procedures whose PostgreSQL names
+    /// are the same after truncation to 63 bytes are one routine (the later
+    /// `CREATE OR REPLACE` replaces the first), and a longer name in a
+    /// routine may be another's: such a pair is not confirmed, whatever the
+    /// checker says (`pair:name-too-long`).
+    #[test]
+    fn a_name_postgresql_truncates_is_never_confirmed() {
+        fn confirmed() -> proof::MirrorAnswer {
+            let mut m = proof::MirrorAnswer::from(proof::Answer::Confirmed {
+                theorem: "Sqldiff.Mirror.check_sound_c2a".into(),
+            });
+            m.scalars = Some("c2a".into());
+            m.statements = Some("c1".into());
+            m
+        }
+        let proc = |name: &str, param: &str, n: i32| {
+            format!(
+                "CREATE PROCEDURE dbo.{name} {param} int, @q int OUTPUT\nAS\nBEGIN\n  \
+                 SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SET @q = {param} + {n};\nEND\nGO\n"
+            )
+        };
+        let answers = |src: &str| {
+            let out = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string();
+            let k = Always::new(confirmed);
+            certify(
+                src,
+                &out,
+                Dialect::Tsql,
+                Dialect::Postgres,
+                &Trusted::default(),
+                Some(&k),
+            )
+            .into_iter()
+            .map(|c| (matches!(c.answer, Answer::Confirmed { .. }), c.why))
+            .collect::<Vec<_>>()
+        };
+        let long = "ComputeTheReplenishmentQuantityForTheWarehousePlanningModuleVersion";
+        assert!(long.len() > 63);
+        let too_long = (false, vec!["pair:name-too-long".to_string()]);
+        // Two names alike in their first 63 bytes.
+        let src = format!(
+            "{}{}",
+            proc(&format!("{long}One"), "@n", 1),
+            proc(&format!("{long}Two"), "@n", 2)
+        );
+        assert_eq!(answers(&src), [too_long.clone(), too_long.clone()]);
+        // A long parameter name.
+        let p = format!("@{}", "p".repeat(70));
+        assert_eq!(
+            answers(&proc("Short", &p, 1)),
+            std::slice::from_ref(&too_long)
+        );
+        // The same routines under short names are confirmed by the checker.
+        assert_eq!(answers(&proc("Short", "@n", 1)), [(true, vec![])]);
+        let src = format!("{}{}", proc("One", "@n", 1), proc("Two", "@n", 2));
+        assert_eq!(answers(&src), [(true, vec![]), (true, vec![])]);
+    }
+
+    #[test]
+    fn a_trigger_naming_its_function_runs_no_text() {
+        // (Review) The function must be one the tree declares, with a body
+        // the scan reads; the trigger itself runs no text.
+        const F: &str = "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\n";
+        let dynamic = |text: &str| {
+            let scan = Scan::new(&[text], Dialect::Postgres);
+            scan.unseen(&parse(text, Dialect::Postgres).syntax())
+        };
+        for text in [
+            "CREATE TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE FUNCTION f();\n",
+            "CREATE OR REPLACE TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE PROCEDURE f();\n",
+            "CREATE CONSTRAINT TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE FUNCTION f();\n",
+        ] {
+            assert!(!dynamic(&format!("{F}{text}")), "{text}");
+            assert!(dynamic(text), "undeclared: {text}");
+        }
+        // Elsewhere `EXECUTE function` runs the text of a variable so named,
+        // and an event trigger fires on DDL.
+        for text in [
+            "DO $$ DECLARE function text := 'SELECT 1'; BEGIN EXECUTE function; END $$;\n",
+            "EXECUTE function;\n",
+            "CREATE EVENT TRIGGER et ON ddl_command_end EXECUTE FUNCTION f();\n",
+            "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$ DECLARE function text; BEGIN EXECUTE function; END $$;\n",
+        ] {
+            assert!(dynamic(&format!("{F}{text}")), "{text}");
+        }
     }
 
     #[test]
@@ -2092,11 +2833,16 @@ END
         );
         assert!(read(&built).get("acct").is_none());
         // Capturing a return code is not dynamic SQL; running a procedure
-        // named by a variable is.
+        // named by a variable is. (C3d part 2, review) The procedure called
+        // is one the tree declares; an undeclared one may run anything.
         let rc = format!(
-            "{ddl}GO\nCREATE PROCEDURE dbo.q AS\nBEGIN\n  DECLARE @rc int;\n  EXEC @rc = dbo.r;\nEND\n"
+            "{ddl}GO\nCREATE PROCEDURE dbo.r AS\nBEGIN\n  RETURN 1;\nEND\nGO\n\
+             CREATE PROCEDURE dbo.q AS\nBEGIN\n  DECLARE @rc int;\n  EXEC @rc = dbo.r;\nEND\n"
         );
         assert!(read(&rc).get("acct").is_some());
+        assert!(read(&rc.replace("EXEC @rc = dbo.r", "EXEC @rc = dbo.s"))
+            .get("acct")
+            .is_none());
         let by_name = format!(
             "{ddl}GO\nCREATE PROCEDURE dbo.q @p sysname AS\nBEGIN\n  DECLARE @rc int;\n  EXEC @rc = @p;\nEND\n"
         );
@@ -2158,6 +2904,7 @@ END
             (shape("unexpected tokens in EXEC at `WITH`"), "read:other"),
             // Pairing.
             ("the output has no routine for it".to_string(), "pair:no-output"),
+            (NAME_TOO_LONG.to_string(), "pair:name-too-long"),
             (
                 "no renaming pairs the two routines: 2 parameters in the source, 1 in the output"
                     .to_string(),

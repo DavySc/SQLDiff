@@ -183,6 +183,13 @@ pub struct Base {
     pub statements: Vec<StatementReport>,
     pub hash: Option<String>,
     suspects: Vec<Suspect>,
+    /// (C3d part 2) The DDL each side binds against, for the proof
+    /// checker's tables (`cert::Tables::read`): the source files' texts, and
+    /// the target's: the `--catalog-b` files' texts, or else each base
+    /// statement as converted, leaving out those that define or change a
+    /// suspect object (a table defined there then has no target definition
+    /// and stays out).
+    pub ddl: (Vec<String>, Vec<String>),
 }
 
 /// A suspect base object, for flagging what uses it.
@@ -450,6 +457,10 @@ pub fn prepare(
             statements: Vec::new(),
             hash: hash(files, b),
             suspects: Vec::new(),
+            ddl: (
+                files.iter().map(|f| f.text.clone()).collect(),
+                b.iter().map(|f| f.text.clone()).collect(),
+            ),
         });
     }
     let target_origin = format!("base catalogs {} (converted)", names.join(", "));
@@ -657,6 +668,10 @@ pub fn prepare(
             .then(a.line.cmp(&b.line))
     });
     let objects = objects.into_iter().map(|(_, o)| o).collect();
+    let ddl_b = (0..pieces.len())
+        .filter(|&i| !keys(i).any(|k| suspect.iter().any(|(x, _)| x == k)))
+        .map(|i| outputs[i].clone())
+        .collect();
     Ok(Base {
         source: Arc::try_unwrap(source).unwrap_or_else(|a| (*a).clone()),
         target,
@@ -666,6 +681,7 @@ pub fn prepare(
         statements,
         hash: hash(files, &[]),
         suspects,
+        ddl: (files.iter().map(|f| f.text.clone()).collect(), ddl_b),
     })
 }
 

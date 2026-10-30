@@ -1246,6 +1246,7 @@ fn empty() -> Loaded {
             },
             outputs: Vec::new(),
             conversions: Vec::new(),
+            base_ddl: Default::default(),
         },
         ids: Vec::new(),
         by_path: Vec::new(),

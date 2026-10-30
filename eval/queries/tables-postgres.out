@@ -1,0 +1,28 @@
+NOTICE:  database "probe_c3d2" does not exist, skipping
+NOTICE:  role "probe_owner" does not exist, skipping
+NOTICE:  Q16 count: table=2 plain=2
+NOTICE:  Q16 pick by key across a join: table=7 plain=7
+NOTICE:  Q16 scalar subquery: table=1 plain=1
+NOTICE:  Q16 exists select 1: TRUE
+NOTICE:  Q16 exists select * (raising virtual column): TRUE
+NOTICE:  Q16 rows sharing the key part ord_id=1: 2
+NOTICE:  Q16 the raising column named: error 22012
+NOTICE:  Q16 the stored generated column: 10
+NOTICE:  Q18 no policy, owner: count=3
+NOTICE:  Q18 policy enabled, owner (not forced): count=3
+NOTICE:  Q18 policy enabled and forced, owner: count=1
+NOTICE:  Q19 numeric and integer column, unqualified: error 42702
+NOTICE:  Q19 numeric and integer column, qualified: no error
+NOTICE:  Q19 variable spelt as a numeric column: error 42702
+NOTICE:  Q20 variable tableoid in SELECT INTO: error 42702
+NOTICE:  Q20 variable tableoid in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable xmin in SELECT INTO: error 42702
+NOTICE:  Q20 variable xmin in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable cmin in SELECT INTO: error 42702
+NOTICE:  Q20 variable cmin in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable xmax in SELECT INTO: error 42702
+NOTICE:  Q20 variable xmax in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable cmax in SELECT INTO: error 42702
+NOTICE:  Q20 variable cmax in UPDATE WHERE: error 42702
+NOTICE:  Q20 variable ctid in SELECT INTO: error 42702
+NOTICE:  Q20 variable ctid in UPDATE WHERE: error 42702

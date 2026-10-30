@@ -19,12 +19,12 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes (with a result or an error), more fuel gives the same observation (`obs_mono`) |
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
 | `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
-| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C2b strings, the C2c typed values (integer widths, `bit` against `boolean`, `date` and `datetime2(p)` against `date` and `timestamp(p)`), the C3a data statements, the C3b queries, the C3c tables and (C3d) the query blocks, joins, aliases and qualified names (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
+| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C2b strings, the C2c typed values (integer widths, `bit` against `boolean`, `date` and `datetime2(p)` against `date` and `timestamp(p)`), the C3a data statements, the C3b queries, the C3c tables and (C3d) the query blocks, joins, aliases and qualified names and read-only tables with opaque columns (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer; (0.13.0) `why`, the reason codes of the routine the check refuses |
 | `Sqldiff/Mirror/Diagnose.lean` | (0.13.0) Untrusted refusal diagnostics: `whyT` and `whyP` name the constructs `lowerT`/`lowerP` refuse, as the codes of "Refusal diagnostics" below, using the lowering functions as oracles node by node; no theorem depends on it |
-| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry; C2c: the typed-value column types `j`, `h`, `b`, `d`, `t<p>` and their defaults); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC2c.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC3d.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C2c typed values, with the runs of the date arithmetic and the width overflows; C3a with table states; C3b queries; C3c string columns, defaults; C3d query blocks, with the runs through a join and the `cardinality` error; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
-| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.16.0 |
+| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry; C2c: the typed-value column types `j`, `h`, `b`, `d`, `t<p>` and their defaults; 0.17.0: read-only tables `=r` and opaque columns `o`); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC2c.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC3d.lean`, `Sqldiff/Mirror/ExamplesC3d2.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C2c typed values, with the runs of the date arithmetic and the width overflows; C3a with table states; C3b queries; C3c string columns, defaults; C3d query blocks, with the runs through a join and the `cardinality` error; (C3d part 2) read-only tables, with runs over a projection; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
+| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.17.0 |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
 | `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
@@ -546,6 +546,62 @@ on eval/queries' rows (the pick through the join, the `cardinality`
 error on both sides); `test_gate.py` cases 126 to 132 exercise the
 protocol.
 
+### The C3d slice: read-only catalog tables (part 2)
+
+Checker 0.17.0. The core is unchanged. A catalog table may be
+**read-only** (`CatTable.readOnly`, a TABLE entry ending in `=r`): no
+`INSERT`, `UPDATE` or `DELETE` of either routine writes it
+(`writeTableOf`; theorem `lowerStmt_writes_not_readOnly`), so it may carry what no
+read sees, and it may have **opaque** columns (`OpqCol`, SPEC `o`):
+columns whose type is outside the slice, names only. The core reads the
+table's projection on its slice columns (`CatTable.toDef`), with the
+primary key only when the key is wholly visible (`CatTable.keyVisible`,
+`CatTable.keyVisible_of_hasKey`: no opaque, string or `bit` key column).
+The rules ("The C3d tables" in `Sqldiff/Mirror/Lower.lean`, vendor
+quotes **from memory**):
+
+| Rule | Claim | Probed (eval/queries, `tables-{mssql,postgres}`) |
+|---|---|---|
+| Only reads | every write lowering finds its table through `writeTableOf`, which refuses a read-only one (`stmt:<kind>:table:read-only`): theorem `lowerStmt_writes_not_readOnly`, a data statement `lowerStmt` lowers names no read-only table, and data statements reach the core only through `lowerStmt`; the slice check and the diagnostics use `writeTableOf` by construction (`writeTableOf_not_readOnly` covers `writeTableOf` alone); a call is the world's effect, which may change any table, as it may change tables outside the catalog | n/a |
+| The projection | a read of the projection gives what the engines' read gives: the rows keep their multiplicity, every expression names its columns, `COUNT(*)` counts rows, `EXISTS`'s select list (`1`, `*`) is not evaluated, whole-row references are outside the spec | Q16 (`COUNT`, `EXISTS` with `SELECT 1` and `SELECT *`, a pick by key across a join, a scalar subquery: the same as the plain twin; a raising computed or virtual column raises, 8134 and 22012, only where named) |
+| What reads do not see | foreign keys, `UNIQUE`, `CHECK`, defaults of any kind, identity, computed and generated columns, indexes, triggers act only on writes; a system-versioned table read with a plain `FROM` gives its current rows (`FOR SYSTEM_TIME` reads as a hint and is refused) | Q16, Q17 (current rows only after an `UPDATE` and a `DELETE`) |
+| What keeps a table out | a security policy's filter predicate, PostgreSQL row-level security, rules, inheritance and partitions change what `FROM t` returns; masking, encryption, a `COLLATE` clause make a column opaque | Q18 (3 rows to 1 under a filter predicate; under forced row security for the owner) |
+| Names | an opaque column counts for resolution (`Scope.holders`): unqualified, a name that is an opaque column of one source and a column of another is ambiguous (209, 42702); a PL/pgSQL variable spelt as one conflicts with it (42702); the one holder of an opaque name resolves to nothing (`stmt:select:column:opaque`). (Review) A PostgreSQL system column (`tableoid`, `xmin`, `cmin`, `xmax`, `cmax`, `ctid`, `pgSystemCols`) is a column of every table: in a query block and in an `UPDATE` or `DELETE` such a name resolves to nothing (`name:system-column`) | Q19, Q20 (42702 for a variable spelt as each of the six, in the converter's query and in an `UPDATE`'s `WHERE`) |
+| Keys | the key closure uses a key only when it is wholly visible; two rows may share a visible part of a key; a table without a key is still read by `COUNT(*)`, `EXISTS` and the scalar subquery; `Core.TableOk` asks distinct keys only of a table with a key, and every source of a closed block has one (`chain_hasKey`) | Q16 (two rows with one `ord_id`) |
+| Nullability | `NOT NULL` only where both DDLs say so (the weaker claim) | n/a |
+
+**What it rests on**, beyond C3d part 1: the probes above (SQL Server
+2022, 16.0.4305.5, and PostgreSQL 18.6) and the vendor texts quoted
+from memory; `ASM-TABLES-AS-DECLARED`, whose statement now covers base
+catalogs and says what it asserts of a read-only table (its columns by
+name, the slice columns' types, nullability and collation, the key when
+sent, and no row-level security, rule, masking, inheritance or
+partitions), and of every table that no temporary table with its name
+exists in the calling session (a caller's PostgreSQL `TEMP TABLE`
+shadows it). The Rust side (`cert.rs`, `plain_table::read_only`,
+`plain_table::leaves_reads`) sends a table that is not plain as
+read-only when both sides define it once, the definitions pair by column
+name, and nothing else in either tree names it but statements that
+cannot change a read; the trees include the base catalogs' DDL. Since
+the reviews, what a tree runs is an allow-list
+(`crates/sqldiff-convert/src/scan.rs`): every top-level statement of a
+listed kind, every call in a body, default, view or data statement of a
+declared routine or a pure built-in, no node the parser cannot read and
+no `U&` name, else every table is out; a table name part of 63 bytes or
+more is not sent, and a pair whose output routine has a longer
+identifier, or a name another routine's truncates to, is refused on the
+Rust side (`pair:name-too-long`),
+`EXCLUDE`, `PERIOD` and `INDEX` start a constraint only in their dialect
+and form, only `GENERATED ... AS IDENTITY` is an identity, any
+`INITIALLY` leaves a table without a key, and a `pg_` table or one another
+schema also defines is not sent. No new residual id and no new answer
+field. `ExamplesC3d2` has the confirmed
+reads, the refused writes, opaque reads, ambiguities, the column-variable
+conflict and keys with an opaque part, with interpreter runs over the
+projection, and (review) the system-column conflict, two equal T-SQL
+spellings and a qualified opaque column in another case;
+`test_gate.py` cases 133 to 141 exercise the protocol.
+
 ### Phase C4: errors and transactions
 
 The core has handled errors and transaction control
@@ -672,8 +728,9 @@ routine refused without any stage naming a reason gets
 | `stmt:select:from:join:<kind>`, `:sub`, `:values`, `:func`, `:hints`, `:data-change`, `:none` | The `FROM`: (0.16.0) a join other than inner or cross (`stmt:select:from:join:left`, `:right`, `:full`), a derived table, `VALUES`, a table function, table hints, a DML source, no `FROM`. (0.16.0) Inner and cross joins, comma lists and aliases are in the spec; `:join` without a kind, `:multi` and `:alias` are gone |
 | `stmt:select:from:ref` | (0.16.0) Two sources of a block with one reference name (T-SQL up to case: 1013; PostgreSQL 42712), or a non-ASCII alias |
 | `stmt:select:from:qualifier` | (0.16.0) A qualified name `q.c` in a query whose `q` names no source the expression may see (an aliased table's own name, a table joined later in an `ON`), is spelt in another case (T-SQL), is a PL/pgSQL variable, the `FOR` block's record or the routine's name, or whose `c` is no column of that source |
-| `name:ambiguous` | (0.16.0) An unqualified name that is a column of two sources of the block (209, 42702) |
-| `name:column-variable` | (0.16.0) A PL/pgSQL unqualified name that is a column of a source of the block and also a variable (42702) |
+| `name:ambiguous` | (0.16.0) An unqualified name that is a column of two sources of the block (209, 42702); (0.17.0) an opaque column counts |
+| `name:column-variable` | (0.16.0) A PL/pgSQL unqualified name that is a column of a source of the block and also a variable (42702); (0.17.0) an opaque column counts |
+| `name:system-column` | (0.17.0) A PL/pgSQL unqualified name spelt as a system column (`tableoid`, `xmin`, `cmin`, `xmax`, `cmax`, `ctid`) in a query block or in an `UPDATE` or `DELETE`: a column of every table (42702 for a variable so spelt) |
 | `stmt:select:cte`, `:setop`, `:distinct`, `:top`, `:group`, `:having`, `:order`, `:offset`, `:locking`, `:for-json` | A `WITH`, a set operation, `DISTINCT`, `TOP`, `GROUP BY`, `HAVING`, `ORDER BY`, `OFFSET`/`LIMIT`, a locking clause, `FOR JSON` |
 | `stmt:select:into` | An `INTO` the rules refuse: T-SQL `SELECT ... INTO`, PL/pgSQL `SELECT col INTO x` (NULL on no row, probed Q10), `INTO STRICT`, several targets |
 | `stmt:select:agg:<fn>` | An aggregate in a select list outside the C3b `COUNT(*)` shape (`stmt:select:agg:sum`; `:count` for a `COUNT(*)` beside other items) |
@@ -682,10 +739,12 @@ routine refused without any stage naming a reason gets
 | `stmt:select:many-rows` | (0.16.0, in place of `stmt:select:where:not-key`) `SELECT @x = ...` or its `FOR` block over a block the key closure does not determine: it may keep several rows, and which one T-SQL assigns is unspecified |
 | `stmt:select:table:unknown` | The table is not in the deployment's table map or the target catalog |
 | `stmt:select:table:not-plain` | The table is in the catalog but not usable (`CatTable.wellFormed`: a string key, a default that does not fit, ...) |
+| `stmt:select:column:opaque` | (0.17.0) A name, qualified or not (T-SQL in any case), that is an opaque column of a read-only table (a type outside the slice): a name only, never read |
 | `stmt:select:target:<type>` | A pick into a variable whose declared type does not take the value (`stmt:select:target:varchar_10` for an `int` column) |
 | `stmt:insert:select`, `:default`, `:returning`, `:conflict` | `INSERT ... SELECT`, `DEFAULT VALUES`, `RETURNING`/`OUTPUT` (where the parser keeps it), `ON CONFLICT` |
 | `stmt:insert:cols` | No column list, an unknown or repeated column, no row, or a row of the wrong length |
 | `stmt:insert:table:unknown`, `:not-plain` | As for `SELECT` |
+| `stmt:insert:table:read-only`, `stmt:update:table:read-only`, `stmt:delete:table:read-only` | (0.17.0) A write to a read-only table (`writeTableOf`) |
 | `stmt:insert:value` | A value the slice cannot type for the column, or that may not fit it (a string into `int`, 21 characters into `varchar(20)`) |
 | `stmt:update:from`, `:alias`, `:key`, `:multi-set`, `:cols`, `:value`, `:table:unknown`, `:table:not-plain` | `UPDATE ... FROM`, a table alias, a key column set, `SET (a, b) = ...`, no or an unknown column, a value as for `INSERT`, the table as for `SELECT` |
 | `stmt:delete:from`, `:alias`, `:table:unknown`, `:table:not-plain` | A second `FROM`/`USING`, a table alias, the table as for `SELECT` |
