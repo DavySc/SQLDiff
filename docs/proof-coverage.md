@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 178 | 31 (17%) | 6 (3%) | 141 (79%) |
+| `converter` | 179 | 31 (17%) | 6 (3%) | 142 (79%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 207 | 34 (16%) | 8 (4%) | 165 (80%) |
+| **All** | 208 | 34 (16%) | 8 (4%) | 166 (80%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -195,6 +195,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.table.columnstore` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-column` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-concat` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.table.computed-iso126` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.computed-json` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.identity` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.table.inline-index` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

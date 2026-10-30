@@ -229,7 +229,13 @@ pub mod asm {
     /// `json` form (`json_path`).
     pub const JSON_PATH_VALUES: (&str, &str) = (
         "ASM-JSON-PATH-VALUES",
-        "The JSON documents read with JSON_QUERY or JSON_VALUE are valid JSON objects or arrays (nothing after the value) with no duplicate keys, no key written with escapes, no \\u0000 escape and no unpaired surrogate escape, and each string JSON_VALUE reads is at most 4,000 characters",
+        "The JSON documents read with JSON_QUERY or JSON_VALUE, or tested with ISJSON, are valid JSON objects or arrays (nothing after the value) with no duplicate keys, no key written with escapes, no \\u0000 escape and no unpaired surrogate escape, and each string JSON_VALUE reads is at most 4,000 characters",
+    );
+    /// T-SQL `TRY_CONVERT(datetime2, x, 126)` and its PostgreSQL form
+    /// (`ISO126_PG`).
+    pub const ISO126_VALUES: (&str, &str) = (
+        "ASM-ISO126-VALUES",
+        "Each string read with TRY_CONVERT(datetime2, x, 126) is NULL, has the form yyyy-mm-ddThh:mi:ss optionally followed by '.' and up to 7 digits, or is a string SQL Server's style 126 does not accept either (it also accepts a date alone, blanks, a bare year, month names, a space for the T, AM/PM and offsets, which the PostgreSQL form reads as NULL)",
     );
     /// An OPENJSON source of UPDATE … FROM reads one row per target row.
     pub const OPENJSON_ONE_ROW: (&str, &str) = (
@@ -1582,6 +1588,19 @@ impl<'a> Canon<'a> {
                 let v = self.expr(x)?;
                 self.cast(dst, v)
             }
+            // The converter's TRY_CONVERT(datetime2, x, 126) and ISJSON(x).
+            Expr::Case(None, _, _)
+                if self.d == Dialect::Postgres && pg_template_arg(ISO126_PG, e).is_some() =>
+            {
+                let x = pg_template_arg(ISO126_PG, e).unwrap();
+                self.iso126(x)?
+            }
+            Expr::Case(None, _, _)
+                if self.d == Dialect::Postgres && pg_template_arg(ISJSON_PG, e).is_some() =>
+            {
+                let x = pg_template_arg(ISJSON_PG, e).unwrap();
+                self.isjson(x)?
+            }
             // The converter's JSON_QUERY/JSON_VALUE of a top-level key.
             Expr::Case(None, whens, None)
                 if self.d == Dialect::Postgres && pg_json_path(whens).is_some() =>
@@ -2178,6 +2197,14 @@ impl<'a> Canon<'a> {
         if let Some(part) = own_name(self.unit, c) {
             self.assume(asm::PROCID_NAME);
             return self.expr(&Expr::Str(part));
+        }
+        if d == Dialect::Tsql && plain && !c.within_group {
+            if name == "try_convert" && tsql_iso126(&c.args) {
+                return self.iso126(&c.args[1]);
+            }
+            if name == "isjson" && argc == 1 {
+                return self.isjson(&c.args[0]);
+            }
         }
         if d == Dialect::Tsql && plain && !c.within_group {
             if let Some((query, src, key)) = tsql_json_path(&name, &c.args) {
@@ -3656,6 +3683,57 @@ impl<'a> Canon<'a> {
     /// see [`pg_json_rows`]), under `alias` or `openjson`. Both sides lower
     /// to `(openjson table src (cols (jc name key mode type)...))`; a column reads
     /// as `(col table name)` with its own side's type.
+    /// T-SQL `TRY_CONVERT(datetime2(7), x, 126)` and the converter's
+    /// PostgreSQL form `ISO126_PG` of `x`: one term under
+    /// ASM-ISO126-VALUES. In the PostgreSQL form, `CAST(c AS json) ->>
+    /// 'key'` reads as JSON_VALUE(c, '$.key'): the pattern test takes no
+    /// object or array text and no string over 4,000 characters, the values
+    /// JSON_VALUE reads as NULL. The value has 7 fraction digits in T-SQL
+    /// and 6 in PostgreSQL (ASM-FRACTIONAL-SECONDS).
+    fn iso126(&mut self, x: &Expr) -> R<(Term, Option<Ty>)> {
+        let (v, ty) = match x {
+            Expr::Bin(op, j, k) if self.d == Dialect::Postgres && op == "->>" => {
+                match (&**j, &**k) {
+                    (Expr::Cast(c, jt), Expr::Str(key))
+                        if jt.name.eq_ignore_ascii_case("JSON")
+                            && jt.args.is_empty()
+                            && plain_key(key) =>
+                    {
+                        self.json_path(false, c, key)?
+                    }
+                    _ => self.expr(x)?,
+                }
+            }
+            _ => self.expr(x)?,
+        };
+        if !ty.is_some_and(|t| t.is_string()) {
+            return Ok((n("dfn", vec![self.dtag(), a("iso126"), v]), None));
+        }
+        self.assume(asm::ISO126_VALUES);
+        self.assume(super::table::asm::FRACTIONAL_SECONDS);
+        Ok((
+            n("iso126", vec![v]),
+            Some(Ty {
+                fam: Fam::Timestamp,
+                len: Some(7),
+                scale: None,
+            }),
+        ))
+    }
+
+    /// T-SQL `ISJSON(x)` and the converter's PostgreSQL form `ISJSON_PG`:
+    /// one term under ASM-JSON-PATH-VALUES (on valid JSON objects and
+    /// arrays both give 1; PostgreSQL's cast fails on invalid JSON, where
+    /// ISJSON gives 0).
+    fn isjson(&mut self, x: &Expr) -> R<(Term, Option<Ty>)> {
+        let (v, ty) = self.expr(x)?;
+        if !ty.is_some_and(|t| t.is_string()) {
+            return Ok((n("dfn", vec![self.dtag(), a("isjson"), v]), None));
+        }
+        self.assume(asm::JSON_PATH_VALUES);
+        Ok((n("isjson", vec![v]), Some(INT32)))
+    }
+
     /// T-SQL `JSON_QUERY(x, '$.key')` / `JSON_VALUE(x, '$.key')` (lax) and
     /// the converter's PostgreSQL `json` form (`pg_json_path`): one term
     /// under ASM-JSON-PATH-VALUES. The source must be a string on both
@@ -7034,6 +7112,145 @@ fn openjson_fields<'e>(
 }
 
 /// `name(args)`: a plain call of the function `name`.
+/// The PostgreSQL form of T-SQL `TRY_CONVERT(datetime2(7), x, 126)` on the
+/// strings of ASM-ISO126-VALUES, `x` a string: NULL unless `x` is
+/// `yyyy-mm-ddThh:mi:ss[.f…]` (1 to 7 fraction digits) with a valid
+/// date and time, else that timestamp, the fraction cut to 6 digits. Only
+/// immutable functions, so a generated column can use it (a cast from text
+/// to timestamp is not immutable). Checked against SQL Server 2022 on
+/// 1,447 strings (eval/json-path).
+pub const ISO126_PG: &str = "CASE WHEN regexp_like(__x__, '^(?!0000)[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,7})?$') THEN CASE WHEN date_part('day', make_date(CAST(substr(__x__, 1, 4) AS integer), CAST(substr(__x__, 6, 2) AS integer), 1) + CAST(substr(__x__, 9, 2) AS integer) - 1) = CAST(substr(__x__, 9, 2) AS integer) THEN make_timestamp(CAST(substr(__x__, 1, 4) AS integer), CAST(substr(__x__, 6, 2) AS integer), CAST(substr(__x__, 9, 2) AS integer), CAST(substr(__x__, 12, 2) AS integer), CAST(substr(__x__, 15, 2) AS integer), CAST(substr(__x__, 18, 2) AS double precision)) + CAST(rpad(substr(__x__, 21, 6), 6, '0') AS integer) * interval '1 microsecond' END END";
+
+/// The PostgreSQL form of T-SQL `ISJSON(x)`, `x` a string: NULL for NULL,
+/// 1 for a JSON object or array, 0 for other JSON (an error for text that
+/// is not JSON, where ISJSON gives 0).
+pub const ISJSON_PG: &str = "CASE WHEN __x__ IS NULL THEN NULL WHEN json_typeof(CAST(__x__ AS json)) IN ('object', 'array') THEN 1 ELSE 0 END";
+
+/// `template` with `__x__` replaced by the text `x` (parenthesized unless
+/// it is a plain name).
+pub fn pg_template(template: &str, x: &str) -> String {
+    let plain = x
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"');
+    template.replace(
+        "__x__",
+        &if plain {
+            x.to_string()
+        } else {
+            format!("({x})")
+        },
+    )
+}
+
+/// The `x` of `e` when `e` is exactly the PostgreSQL template with `x` in
+/// place of `__x__`.
+fn pg_template_arg<'e>(template: &str, e: &'e Expr) -> Option<&'e Expr> {
+    static PARSED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Option<Expr>>>> =
+        std::sync::OnceLock::new();
+    let tpl = PARSED
+        .get_or_init(Default::default)
+        .lock()
+        .ok()?
+        .entry(template.to_string())
+        .or_insert_with(|| {
+            let toks = super::ast::tokens(
+                &sqldiff_syntax::parse(&format!("SELECT {template}"), Dialect::Postgres).syntax(),
+            );
+            let mut p = super::ast::Parser::ext(&toks[1..], Dialect::Postgres);
+            let x = p.expr().ok()?;
+            p.at_end().then_some(x)
+        })
+        .clone()?;
+    // The first place `__x__` appears in the template, found in `e`.
+    let x = first_hole(&tpl, e)?;
+    (subst(&tpl, x)? == *e).then_some(x)
+}
+
+fn is_hole(t: &Expr) -> bool {
+    matches!(t, Expr::Name(p) if matches!(p.as_slice(), [h] if h == "__x__"))
+}
+
+/// What `e` holds where `t` first holds the hole, walking both alike.
+fn first_hole<'e>(t: &Expr, e: &'e Expr) -> Option<&'e Expr> {
+    if is_hole(t) {
+        return Some(e);
+    }
+    let pairs: Vec<(&Expr, &'e Expr)> = match (t, e) {
+        (Expr::Call(a), Expr::Call(b)) if a.args.len() == b.args.len() => {
+            a.args.iter().zip(&b.args).collect()
+        }
+        (Expr::Bin(_, a1, a2), Expr::Bin(_, b1, b2)) => vec![(&**a1, &**b1), (&**a2, &**b2)],
+        (Expr::Unary(_, a), Expr::Unary(_, b))
+        | (Expr::IsNull(a, _), Expr::IsNull(b, _))
+        | (Expr::Cast(a, _), Expr::Cast(b, _)) => vec![(&**a, &**b)],
+        (Expr::InList(a, xs, _), Expr::InList(b, ys, _)) if xs.len() == ys.len() => {
+            std::iter::once((&**a, &**b))
+                .chain(xs.iter().zip(ys))
+                .collect()
+        }
+        (Expr::Case(None, w1, e1), Expr::Case(None, w2, e2)) if w1.len() == w2.len() => {
+            let mut v: Vec<(&Expr, &'e Expr)> = Vec::new();
+            for ((c1, r1), (c2, r2)) in w1.iter().zip(w2) {
+                v.push((c1, c2));
+                v.push((r1, r2));
+            }
+            if let (Some(a), Some(b)) = (e1, e2) {
+                v.push((&**a, &**b));
+            }
+            v
+        }
+        _ => return None,
+    };
+    pairs.into_iter().find_map(|(a, b)| first_hole(a, b))
+}
+
+/// `t` with every hole replaced by `x`; `None` for forms templates do not use.
+fn subst(t: &Expr, x: &Expr) -> Option<Expr> {
+    let go = |y: &Expr| subst(y, x);
+    let bx = |y: &Expr| go(y).map(Box::new);
+    Some(match t {
+        _ if is_hole(t) => x.clone(),
+        Expr::Name(_) | Expr::Num(_) | Expr::Str(_) | Expr::Null => t.clone(),
+        Expr::Call(c) => {
+            let mut c2 = (**c).clone();
+            c2.args = c.args.iter().map(go).collect::<Option<_>>()?;
+            Expr::Call(Box::new(c2))
+        }
+        Expr::Bin(op, a, b) => Expr::Bin(op.clone(), bx(a)?, bx(b)?),
+        Expr::Unary(op, a) => Expr::Unary(op.clone(), bx(a)?),
+        Expr::IsNull(a, b) => Expr::IsNull(bx(a)?, *b),
+        Expr::Cast(a, ty) => Expr::Cast(bx(a)?, ty.clone()),
+        Expr::InList(a, xs, not) => {
+            Expr::InList(bx(a)?, xs.iter().map(go).collect::<Option<_>>()?, *not)
+        }
+        Expr::Case(None, whens, els) => Expr::Case(
+            None,
+            whens
+                .iter()
+                .map(|(w, v)| Some((go(w)?, go(v)?)))
+                .collect::<Option<_>>()?,
+            match els {
+                Some(e) => Some(bx(e)?),
+                None => None,
+            },
+        ),
+        _ => return None,
+    })
+}
+
+/// `TRY_CONVERT(datetime2[(7)], x, 126)`.
+fn tsql_iso126(args: &[Expr]) -> bool {
+    let ty = match &args.first() {
+        Some(Expr::Name(p)) => matches!(p.as_slice(), [t] if t.eq_ignore_ascii_case("datetime2")),
+        Some(Expr::Call(t)) => {
+            matches!(t.name.as_slice(), [n] if n.eq_ignore_ascii_case("datetime2"))
+                && matches!(t.args.as_slice(), [Expr::Num(p)] if p == "7")
+        }
+        _ => false,
+    };
+    ty && args.len() == 3 && matches!(&args[2], Expr::Num(s) if s == "126")
+}
+
 /// T-SQL `JSON_QUERY(x, '[lax ]$.key')` or `JSON_VALUE(…)` of a plain
 /// top-level key: (whether JSON_QUERY, x, key).
 fn tsql_json_path<'e>(name: &str, args: &'e [Expr]) -> Option<(bool, &'e Expr, String)> {

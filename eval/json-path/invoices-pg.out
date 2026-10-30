@@ -1,0 +1,13 @@
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 6
+1|NULL|Aakriti Byrraju
+2|2013-01-01 12:34:56.000000|NULL
+3|NULL|NULL
+4|2016-02-29 23:59:59.123456|NULL
+5|NULL|NULL
+6|NULL|NULL
+ERROR:  new row for relation "invoices" violates check constraint "ck_sales_invoices_returneddeliverydata_must_be_valid_json"
+DETAIL:  Failing row contains (7, 5, null, null).
+NOTICE:  drop cascades to table sales.invoices
+DROP SCHEMA

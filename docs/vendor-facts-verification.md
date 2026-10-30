@@ -339,7 +339,11 @@ The PostgreSQL conversion of a computed column `JSON_QUERY(col, '$.key')` or `JS
   - a key written with escapes (`{"\u0054ags":[1]}`): SQL Server does not match it to `$.Tags`, PostgreSQL does (OPENJSON, by contrast, matches it);
   - JSON_VALUE of a string over 4,000 characters: SQL Server gives NULL, and the PostgreSQL `varchar(4000)` column rejects the write.
 - `jsonb` would not do: it rewrites fragments (`{"a":1}` becomes `{"a": 1}`) and numbers (`1e2` becomes `100`).
-- A generated column cannot cast text to `timestamp` in PostgreSQL ("generation expression is not immutable"), so `TRY_CONVERT(datetime2, JSON_VALUE(…), 126)` has no plain form.
+- A generated column cannot cast text to `timestamp` in PostgreSQL ("generation expression is not immutable"). `TRY_CONVERT(datetime2(7), x, 126)` therefore becomes `canon::ISO126_PG`, built from immutable functions. Checked on 1,447 strings (`iso126-*`, `python3 iso126-cmp.py`):
+  - 1,278 give the same value or NULL on both. That covers every string of the form `yyyy-mm-ddThh:mi:ss[.f]`, including invalid dates and times (`2013-02-30`, `24:00:00`, `:60`), year 0000, and a trailing `.` with no digits. SQL Server reads the trailing `.` as NULL, and WWI writes it whenever the time has a fraction (`CONVERT(nvarchar(20), datetime2, 126)` cuts after the `.`).
+  - 25 differ only in a 7th fraction digit, which SQL Server keeps and PostgreSQL cannot hold (`ASM-FRACTIONAL-SECONDS`).
+  - 144 are forms SQL Server also reads and the PostgreSQL form reads as NULL: a date alone, blanks (1900-01-01), a bare year, month names, a space or ` T` for the T, AM/PM, offsets, a leading tab. `ASM-ISO126-VALUES` excludes them.
+- `ISJSON(x) <> 0` in a CHECK against `json_typeof(CAST(x AS json)) IN ('object', 'array')`. Both give 1 for every object and array of the 32 `cases` texts, 0 for scalars, and NULL for NULL. Text that is not JSON makes ISJSON 0 and the cast fail, so both refuse the row. The converted Sales.Invoices refuses `'5'` on both (`invoices-*`).
 
 ### OPENJSON and PostgreSQL jsonb — Confirmed (SQL Server, PostgreSQL)
 

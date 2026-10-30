@@ -100,6 +100,7 @@ pub(crate) fn convert(
         trigger: None,
         seq_defaults: Vec::new(),
         table_cols: Vec::new(),
+        in_table_check: false,
         table_items: Vec::new(),
         left_out_indexes: Vec::new(),
         update_ctes: Vec::new(),
@@ -288,6 +289,8 @@ struct Cx<'a> {
     seq_defaults: Vec<(String, String)>,
     /// The columns of the table being created (lower case, unquoted).
     table_cols: Vec<String>,
+    /// Converting a CHECK constraint: ISJSON has a rule there only.
+    in_table_check: bool,
     /// The column list items of the table being created.
     table_items: Vec<Vec<T>>,
     /// Indexes the conversion left out (columnstore), lower case.
@@ -5608,6 +5611,14 @@ impl<'a> Cx<'a> {
     /// without what only shapes the key's index: CLUSTERED / NONCLUSTERED
     /// and a sort order in the key's column list.
     fn constraint_def(&mut self, it: &[T]) -> R<String> {
+        let saved = self.in_table_check;
+        self.in_table_check = it.iter().any(|t| t.is("CHECK"));
+        let r = self.constraint_def_inner(it);
+        self.in_table_check = saved;
+        r
+    }
+
+    fn constraint_def_inner(&mut self, it: &[T]) -> R<String> {
         // The key's index: storage options (not IGNORE_DUP_KEY = ON, which
         // changes what the key accepts), a filegroup or a partition scheme.
         let it = &self.strip_constraint_storage(it)?;
@@ -5895,6 +5906,23 @@ impl<'a> Cx<'a> {
                 if not_null { " NOT NULL" } else { "" }
             ));
         }
+        if let Some((ty, expr, json)) = self.computed_iso126(e, it[as_at].pos.0)? {
+            self.step_ts("tsql.table.computed-iso126", &it[as_at..]);
+            self.note(Status::Assumptions, "ASM-ISO126-VALUES", &format!(
+                "The computed column {0} becomes a STORED generated column that reads the text the way TRY_CONVERT(datetime2, …, 126) does, with plain immutable functions (a cast from text to timestamp is not immutable, so a generated column cannot use it): yyyy-mm-ddThh:mi:ss with an optional '.' and 1 to 7 digits gives that date and time when it is valid, anything else NULL. The same value for strings of that form, and for the strings SQL Server rejects too (ASM-ISO126-VALUES: SQL Server also reads a date alone, blanks, a bare year, month names, a space for the T, AM/PM and offsets, which become NULL here); a 7th fraction digit is cut (ASM-FRACTIONAL-SECONDS).{1} {2} Both refuse a value written into the column. Not the same: an INSERT without a column list skips {0} in T-SQL but not in PostgreSQL (the engine compares no such INSERT), and PostgreSQL accepts the keyword DEFAULT for it.",
+                name.trim(),
+                if json { " The JSON_VALUE inside reads as ->>: the pattern test rejects the object and array text and the strings over 4,000 characters that JSON_VALUE reads as NULL (ASM-JSON-PATH-VALUES)." } else { "" },
+                if persisted { "T-SQL stores it too (PERSISTED)." } else { "T-SQL computes it when the row is read, PostgreSQL when the row is written." }
+            ));
+            if json {
+                self.note(Status::Assumptions, "ASM-JSON-PATH-VALUES", "The JSON documents read are valid JSON objects or arrays without duplicate keys, keys written with escapes, or \\u0000 and unpaired surrogate escapes.");
+            }
+            return Ok(format!(
+                "{} {ty} GENERATED ALWAYS AS ({expr}) STORED{}",
+                name.trim(),
+                if not_null { " NOT NULL" } else { "" }
+            ));
+        }
         if let Some((ty, expr)) = self.computed_json(e, it[as_at].pos.0)? {
             self.step_ts("tsql.table.computed-json", &it[as_at..]);
             self.note(Status::Assumptions, "ASM-JSON-PATH-VALUES", &format!(
@@ -6094,6 +6122,34 @@ impl<'a> Cx<'a> {
     /// and a number's digits as written, as SQL Server returns them. `None`
     /// when `e` is neither call; refused for other paths and sources.
     fn computed_json(&mut self, e: &[T], at: usize) -> R<Option<(String, String)>> {
+        let Some((query, x, key)) = self.json_call(e)? else {
+            return Ok(None);
+        };
+        let expr = if query {
+            format!("CASE WHEN json_typeof({x} -> '{key}') IN ('object', 'array') THEN CAST({x} -> '{key}' AS text) END")
+        } else {
+            format!("CASE WHEN json_typeof({x} -> '{key}') NOT IN ('object', 'array') THEN {x} ->> '{key}' END")
+        };
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-json");
+        let ty = [
+            made(IDENT, "nvarchar"),
+            made(L_PAREN, "("),
+            if query {
+                made(IDENT, "max")
+            } else {
+                made(NUMBER, "4000")
+            },
+            made(R_PAREN, ")"),
+        ];
+        let (ty, _, _) = self.ty(&ty)?;
+        Ok(Some((ty, expr)))
+    }
+
+    /// `JSON_QUERY(col, '$.key')` or `JSON_VALUE(col, '$.key')` of a
+    /// varying-string column of the table, lax mode, a top-level key:
+    /// (whether JSON_QUERY, `CAST(col AS json)`, key). `None` when `e` is
+    /// neither call; refused for other paths and sources.
+    fn json_call(&mut self, e: &[T]) -> R<Option<(bool, String, String)>> {
         let es = sig(e);
         let query = match es.first().map(|&k| &e[k]) {
             Some(t) if t.is("JSON_QUERY") => true,
@@ -6134,24 +6190,79 @@ impl<'a> Cx<'a> {
             .ok_or_else(|| No(REASON.into()))?
             .to_string();
         let x = format!("CAST({} AS json)", self.expr(trimmed(src)).trim());
-        let expr = if query {
-            format!("CASE WHEN json_typeof({x} -> '{key}') IN ('object', 'array') THEN CAST({x} -> '{key}' AS text) END")
-        } else {
-            format!("CASE WHEN json_typeof({x} -> '{key}') NOT IN ('object', 'array') THEN {x} ->> '{key}' END")
+        Ok(Some((query, x, key)))
+    }
+
+    /// `TRY_CONVERT(datetime2[(7)], v, 126)` of `v` a JSON_VALUE (as
+    /// `json_call` takes it) or a varying-string column of the table: the
+    /// PostgreSQL type of datetime2(7) and `canon::ISO126_PG` of `v`, plain
+    /// immutable functions a generated column can use. A JSON_VALUE reads
+    /// as `CAST(col AS json) ->> 'key'`: the pattern test of ISO126_PG
+    /// rejects the object and array text and the strings over 4,000
+    /// characters JSON_VALUE reads as NULL.
+    fn computed_iso126(&mut self, e: &[T], at: usize) -> R<Option<(String, String, bool)>> {
+        let es = sig(e);
+        if !(es.len() >= 3
+            && e[es[0]].is("TRY_CONVERT")
+            && e[es[1]].k == L_PAREN
+            && matching(e, es[1]) == Some(*es.last().unwrap()))
+        {
+            return Ok(None);
+        }
+        const REASON: &str = "computed column: TRY_CONVERT is converted only to datetime2 or datetime2(7) with style 126, of a JSON_VALUE or a string column of the table";
+        let args = split_commas(&e[es[1] + 1..*es.last().unwrap()]);
+        let [ty, v, style] = args.as_slice() else {
+            return no(REASON);
         };
-        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-json");
-        let ty = [
-            made(IDENT, "nvarchar"),
-            made(L_PAREN, "("),
-            if query {
-                made(IDENT, "max")
-            } else {
-                made(NUMBER, "4000")
+        let ty_ok = match sig(ty)
+            .iter()
+            .map(|&k| &ty[k])
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [t] => tsql_unquote(&t.s).eq_ignore_ascii_case("datetime2"),
+            [t, o, n, c] => {
+                tsql_unquote(&t.s).eq_ignore_ascii_case("datetime2")
+                    && o.k == L_PAREN
+                    && n.s == "7"
+                    && c.k == R_PAREN
+            }
+            _ => false,
+        };
+        let mut st = trimmed(style);
+        while st.len() > 2 && st[0].k == L_PAREN && matching(st, 0) == Some(st.len() - 1) {
+            st = trimmed(&st[1..st.len() - 1]);
+        }
+        if !ty_ok || !matches!(st, [n] if n.s == "126") {
+            return no(REASON);
+        }
+        let v = trimmed(v);
+        let (x, json) = match self.json_call(v)? {
+            Some((false, x, key)) => (format!("{x} ->> '{key}'"), true),
+            Some(_) => return no(REASON),
+            None => match v {
+                [c] if matches!(c.k, IDENT | QUOTED_IDENT)
+                    && !c.s.starts_with('@')
+                    && self.string_column(c).is_some() =>
+                {
+                    (self.expr(v).trim().to_string(), false)
+                }
+                _ => return no(REASON),
             },
+        };
+        let made = |k, s: &str| T::made(k, s, at, "tsql.table.computed-iso126");
+        let ty = [
+            made(IDENT, "datetime2"),
+            made(L_PAREN, "("),
+            made(NUMBER, "7"),
             made(R_PAREN, ")"),
         ];
         let (ty, _, _) = self.ty(&ty)?;
-        Ok(Some((ty, expr)))
+        Ok(Some((
+            ty,
+            sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISO126_PG, &x),
+            json,
+        )))
     }
 
     fn alter_table(&mut self, ts: &[T]) -> R<String> {
@@ -7339,6 +7450,14 @@ impl<'a> Cx<'a> {
                     e(self, 1)
                 };
                 format!("COALESCE({x}, {y})")
+            }
+            // In a CHECK constraint, under ASM-JSON-PATH-VALUES: on the
+            // documents it allows both give 1; on text that is not JSON the
+            // cast fails where ISJSON gives 0, and both refuse the row.
+            ("ISJSON", 1) if self.in_table_check => {
+                self.note(Status::Assumptions, "ASM-JSON-PATH-VALUES", "ISJSON in a CHECK constraint becomes json_typeof of the value cast to json: 1 for an object or array, 0 for other JSON, NULL for NULL. Text that is not JSON makes ISJSON 0 and the cast fail, so both refuse the row, with another error. The rows are the same when the documents are valid JSON objects or arrays without duplicate keys, keys written with escapes, or \\u0000 and unpaired surrogate escapes (ASM-JSON-PATH-VALUES).");
+                let x = e(self, 0);
+                sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISJSON_PG, &x)
             }
             ("LEN", 1) => format!("length(rtrim({}))", e(self, 0)),
             ("DATALENGTH", 1) => {
