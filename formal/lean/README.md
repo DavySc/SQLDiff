@@ -10,19 +10,20 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Ast.lean` | Generated from the abstract syntax schema (`sqldiff_syntax::encode::SCHEMA`, `sqldiff_core::proof::lean_ast`): routines, statements and expressions as Lean types, and the decoder for their one-line encoding. Do not edit; the same bless command writes it |
 | `Sqldiff/Tree.lean` | The syntax tree as Lean types and its decoder: an unknown kind, a token where a node belongs or the reverse, or any other text fails to decode |
 | `Sqldiff/Gate.lean` | Programs, refinement (decision 1), the check, and `check_sound`: a confirmed answer means B refines A, for every semantics |
-| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); (C3b) the read `query t c pick` (`Pick`: assign from the one kept row, count the kept rows, test for one); expressions are slice expressions (`SExpr`: variables, columns, 32-bit integer literals, NULL, `+ - * / %`, negation, comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
+| `Sqldiff/Core/Syntax.lean` | The core language of phases C1, C2a, C3a and C4 ([verified-conversion.md](../../docs/verified-conversion.md), decision 9): parameters with modes and defaults, locals, assignment, `if`, `while`, `return`, sequences, calls, and the data statements `insert`, `update`, `delete` on a table definition (`TableDef`); (C3b) the read `query t c pick` (`Pick`: assign from the one kept row, count the kept rows, test for one); expressions are slice expressions (`SExpr`: variables, columns, integer literals, NULL, `+ - * / %` and negation at a width (C2c: 16, 32 or 64 bits), comparisons, `AND OR NOT`, `IS [NOT] NULL`, `coalesce`, `CASE WHEN`; (C2c) bit, date and timestamp literals, `DATEADD` by day, month or year, `DATEDIFF` by day, the date of a timestamp, a date at midnight) or uninterpreted operators; (C4) `tryCatch`, `raise`, `reraise`, `commit` and the error kind `user`; what a routine's statements can do (raise, violate a constraint, fail after a write, reach a handler) |
+| `Sqldiff/Core/Calendar.lean` | (C2c) The proleptic Gregorian calendar of the core's dates (days since 0001-01-01) and timestamps (microseconds): day numbers from and to civil dates, leap years, the month and year addition with the month-end clamp, checked against the vendors' own counts |
 | `Sqldiff/Core/Semantics.lean` | Values (NULL, three-valued booleans, 32-bit integers, opaque values), errors (overflow, division by zero, constraint violations), the meaning of slice expressions, the database (tables as lists of rows, observed as bags), the data statements, the fuel-based, executable interpreter, what a caller observes (out parameters, returned value, world and database after a finished call; error kind and calls for a failed one; decision 1) and `Refines` |
 | `Sqldiff/Core/Data.lean` | The data statements: congruence lemmas (`insertRows_map`, `updateRows_map`, `deleteRows_map`, and (C3b) `keptRows_map`, `pickRows_map`) and statement atomicity (`exec_error_atomic`) |
 | `Sqldiff/Core/Rename.lean` | An injective renaming of a routine's variables is observationally the same routine (`refines_rename`) |
 | `Sqldiff/Core/Fuel.lean` | Once a run finishes (with a result or an error), more fuel gives the same observation (`obs_mono`) |
 | `Sqldiff/Core/OpFree.lean` | A routine without uninterpreted operators means the same whatever they mean (`Routine.obs_opFree`) |
 | `Sqldiff/Core/Handlers.lean` | (C4) When T-SQL `TRY`/`CATCH` and a PL/pgSQL exception block mean the same: a body that cannot fail after a write (`Stmt.undoSafe`, `exec_undoSafe`), settling `undo` where it changes no outcome (`exec_settle`), and where it changes only the database of a failed call (`exec_settleTop`, `Routine.obs_settleTop`, `refines_settleTop_rename`) |
-| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C3a data statements, the C3b queries and the C3c tables (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
+| `Sqldiff/Mirror/Lower.lean` | `lowerT` and `lowerP`: the T-SQL and PL/pgSQL spec of the C1 constructs, the C2a slice, the C2b strings, the C2c typed values (integer widths, `bit` against `boolean`, `date` and `datetime2(p)` against `date` and `timestamp(p)`), the C3a data statements, the C3b queries and the C3c tables (each rule with its vendor citation and probe status), as lowerings of the generated `Sqldiff.Ast.Routine` into the core; the trusted inputs (`Deployment`, `Catalog` with its tables); partial (`none` is "outside the spec"); `sliceT`, `sliceP`, `abortsT`: whether a routine is in the C2a slice |
 | `Sqldiff/Mirror/Check.lean` | The mirror check with an untrusted certificate (the variable renaming), `check_sound`, `check_sound_c2a` and the residual assumptions of a C2a answer; (0.13.0) `why`, the reason codes of the routine the check refuses |
 | `Sqldiff/Mirror/Diagnose.lean` | (0.13.0) Untrusted refusal diagnostics: `whyT` and `whyP` name the constructs `lowerT`/`lowerP` refuse, as the codes of "Refusal diagnostics" below, using the lowering functions as oracles node by node; no theorem depends on it |
-| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
-| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
-| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.13.0 |
+| `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry; C2c: the typed-value column types `j`, `h`, `b`, `d`, `t<p>` and their defaults); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
+| `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC2c.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C2c typed values, with the runs of the date arithmetic and the width overflows; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
+| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.14.0 |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
 | `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
@@ -67,9 +68,11 @@ parameter, position by position, and the return types
 (`Sqldiff.Mirror.sigCorr`, "Parameter and return types" in
 `Sqldiff/Mirror/Lower.lean`): T-SQL `int`/`integer` with PostgreSQL
 `integer`/`int`/`int4`, a C2b string type with a C2b string type (any
-lengths: PostgreSQL drops a parameter's and a result's length), and on
-the C1 path only `bigint` and `smallint` with themselves; any other pair
-is answered "the parameter or return types do not correspond". A
+lengths: PostgreSQL drops a parameter's and a result's length), and
+(C2c) `bigint` and `smallint` with themselves, `bit` with `boolean`,
+`date`, and `datetime2(6)` with `timestamp(6)` or `timestamp`; any
+other pair is answered "the parameter or return types do not
+correspond". A
 procedure's trailing `INOUT return_code` must be an integer. A parameter
 default must be NULL or a slice value that fits the declared type (T-SQL
 truncates a default, PostgreSQL, having dropped the length, does not),
@@ -147,8 +150,10 @@ with `ANSI_NULLS ON`). The other trusted inputs are unchanged (the
 lowering, `dep`, `Γ`, the parsers).
 
 What stays under `ASM-C1-OPERATORS` (a `check_sound` answer): every
-other type (`bigint`, `decimal`, strings, dates, `bit`, ...), casts and
-implicit conversions, function calls other than `COALESCE`/`ISNULL`,
+other type (`decimal`, `datetime`, `time`, `tinyint`, ...; strings are
+C2b, integer widths, `bit`, `date` and `datetime2` are C2c), casts and
+implicit conversions other than C2c's `CAST(... AS date)`, function
+calls other than `COALESCE`/`ISNULL` and C2c's `DATEADD`/`DATEDIFF`,
 `%` with a variable divisor, simple `CASE`, `IN`, `BETWEEN`, `LIKE`,
 comparisons with a NULL literal, `AND`/`OR` over operands that can raise,
 and T-SQL routines whose expressions can raise, or that call a
@@ -187,6 +192,62 @@ asserted), `ASM-TSQL-LEN-BMP` (`LEN`: no character outside the BMP, or an
 SC collation), `ASM-TSQL-STRING-ARGS` (a T-SQL string parameter: callers
 pass values that fit it). The answer format is unchanged (`"scalars":
 "c2a"`, the same theorems); the checker reports `0.6.0`.
+
+### Phase C2c: typed values beyond `int` and strings
+
+Checker 0.14.0. The core has integer widths (`Sqldiff.Core.IW`: 16, 32
+and 64 bits; `arith` and `neg` carry the width of their result and
+overflow at it), bit/boolean literals (`SExpr.bool`, the same value a
+comparison gives), dates and timestamps (`Val.date`: days since
+0001-01-01 of the proleptic Gregorian calendar, `Val.ts`: microseconds
+since 0001-01-01T00:00:00; `Sqldiff/Core/Calendar.lean`), comparisons
+of two dates or two timestamps, `dateAdd` by day, month or year (the
+month-end clamp, the time of day kept), `dateDiff` by day (day boundaries
+crossed), `toDate` and `toTs`. The rules, each with its vendor citation
+(**all quoted from memory**) and its probe, are in "The C2c slice: typed
+values" of `Sqldiff/Mirror/Lower.lean`; `eval/values/{mssql,postgres}.sql`
+with their `.out` files (V1 to V8) is the probe, run on SQL Server 2022
+and PostgreSQL 18 on 2026-10-30. The forms are exactly the ones `sqldiff
+convert --to postgres` writes (`tsql.bit.compare`, `tsql.bit.store`,
+`tsql.dateadd`, `tsql.datediff`).
+
+| Rule | Claim | Probed (eval/values) |
+|---|---|---|
+| Integer widths | T-SQL `smallint`/`int`/`bigint` against `smallint`/`int2`, `integer`/`int`/`int4`, `bigint`/`int8`; `+ - * /` at the wider operand's width, overflow raises (8115 against 22003); two `smallint`s give a `smallint` on both; `smallint` division only by a literal other than 0 and -1 (`-32768 / -1` is 32768 on both, no error); `%` keeps its literal-divisor rule; comparisons across widths | V1 |
+| Integer literals | PostgreSQL types a constant beyond the `int` range `bigint`; T-SQL types it `numeric(p,0)`, so it is in the slice only as the whole value stored into a `bigint` or compared with one (an exact conversion), never as an arithmetic operand | V2 |
+| Stores between widths | widening keeps the value; a narrowing store is in the spec only when the value provably fits (a literal in range, or a value of the target's width or narrower), on every path (`int` 40000 into `smallint` is 220 against 22003); `COUNT(*)` into an `int` or a `bigint` variable, never a `smallint` | V2 |
+| `bit` against `boolean` | stores from the literals `0`/`1` against `FALSE`/`TRUE`, NULL or another bit; the comparisons `@b = 1`, `= 0`, `<> 1`, `<> 0` against `b = TRUE`, `= FALSE`, `<> TRUE`, `<> FALSE` (either operand order) lower to the variable or its `NOT`, three-valued alike on both; `IS [NOT] NULL`; any other store (`2`, an int, a string) or comparison is outside; never a key column | V3 |
+| Literals | `'YYYY-MM-DD'` where a date is read, `'YYYY-MM-DDThh:mm:ss[.f]'` with at most `p` digits where a `datetime2(p)`/`timestamp(p)` is read, in a store, a comparison, a parameter default, a column default, or under `CAST(... AS date \| datetime2(p) \| timestamp(p))`: the ISO 8601 forms, which neither `DATEFORMAT`/`LANGUAGE` nor `DateStyle` affect; more fractional digits than kept are outside (both engines round, not alike at a half: `.1234565` is `.123457` against `.123456`); every other form is outside, as a store too | V4 |
+| Comparisons and stores | `= <> < <= > >=` of two dates or two timestamps; a date against a timestamp at midnight (`toTs`); a date into a `date`, a timestamp of at most `p` digits into a `datetime2(p)`, a date into a timestamp (midnight); a timestamp into a date (both truncate) and into a narrower precision (both round) are outside; `CAST(x AS date)` of a timestamp drops the time | V4, V5 |
+| `DATEADD` | `day \| month \| year` (and their abbreviations) with an `int` number on a date or `datetime2(p)` against the converter's `(d + n)`, `(d - m)`, `(d + make_interval(months \| years => n))::date` and `(t + make_interval(days \| months \| years => n))`: days added, months and years moved with the day clamped to the result month's last day, the time kept; the result is not held to a range (T-SQL raises 517 past 9999-12-31 where PostgreSQL returns the value: `ASM-DATEADD-RANGE`); years name `ASM-DATEADD-YEAR-END` (Microsoft's page states the clamp for months); other dateparts, a `bigint` number, a string date are outside | V6 |
+| `DATEDIFF` | `day` only, against `((b)::date - (a)::date)`: the day number of `b`'s date minus `a`'s, an `int`; other dateparts outside | V7 |
+| Columns | `bigint`, `smallint`, `bit`/`boolean`, `date`, `datetime2(p)`/`timestamp(p)` columns with constant defaults in the forms above (SPEC `j`, `h`, `b`, `d`, `t<p>`; defaults `b0`/`b1`, `d<hex>`, `t<hex>`); a date or timestamp key column; the Rust side sends them when both DDLs show them (`plain_table::ColType`, `cert.rs::pair_type`) | V8 |
+| Signatures | `bigint` and `smallint` with themselves, `bit` with `boolean`, `date`, `datetime2(6)` with `timestamp(6)` or `timestamp` (PostgreSQL drops a parameter's and a result's precision, so a `datetime2(p < 6)` parameter is outside); a `bigint` argument to a call is outside the slice (the callee's type is not known, and PostgreSQL has no implicit `bigint` to `integer` conversion) | not probed |
+
+Outside, by decision: `datetime2(7)` and `datetime2` without a precision
+(no PostgreSQL mirror), `datetime`, `smalldatetime`, `datetimeoffset`,
+`time`, `tinyint`, `decimal` (a later part); reads of the clock
+(`SYSDATETIME()`, `GETDATE()`, `now()`, `clock_timestamp()`), `DATEPART`,
+`EOMONTH`, formatting and string conversions; `bit` in arithmetic,
+`COALESCE`/`ISNULL` with a number, or against another bit; `@s + 1` stored
+back into a `smallint` (the literal is an `int`, so the sum is, and the
+store narrows). A variable of one of these types is still read on the C1
+path as before (`check_sound`, under `ASM-C1-OPERATORS`).
+
+**What it rests on**, beyond C2a and C2b: the probes above and the vendor
+texts quoted from memory in `Lower.lean`; `ASM-DATEADD-RANGE` and
+`ASM-DATEADD-YEAR-END` in `residual` (`Check.lean`); values a caller
+passes that both engines can hold (a T-SQL caller's dates are within
+0001-01-01 and 9999-12-31, a PostgreSQL caller's timestamps have at most
+six digits), which is the argument correspondence of decision 1; for
+columns, `ASM-TABLES-AS-DECLARED` as in C3c. No new residual id and no
+new answer field; `check_sound` and `check_sound_c2a` keep their
+statements, the core lemmas (the renaming simulation, "cannot fail")
+gained the new cases, and `Axioms.lean` is unchanged (standard axioms
+only). `ExamplesC2c` has the confirmed pair (eval/values' procedure as
+the converter writes it), the interpreter runs of the date arithmetic and
+the width overflows, and the refused forms; `test_gate.py` cases 104 to
+112 exercise the protocol.
 
 ### Phase C3a: single-table data statements
 
@@ -493,6 +554,7 @@ routine refused without any stage naming a reason gets
 | `routine:names:case` | Two T-SQL names equal up to ASCII case (`@a`, `@A`: one variable or two depends on the collation) |
 | `routine:names:non-ascii` | A variable name with a character outside ASCII |
 | `routine:param:<type>` | A parameter of a type no value of the slice fits, with a default (`routine:param:decimal_18_2`) |
+| `type:<type>` | (0.14.0) A variable read where the lowering needs a value of the slice, declared with a type the slice has no values for (`type:datetime2_7`, `type:datetime`, `type:timestamptz`, `type:nvarchar_max`) |
 | `routine:param:default` | A parameter default that is not NULL or a slice value fitting the declared type, or that reads a variable |
 | `routine:unclassified` | The lowering refused the routine and no stage named a reason (should not happen; it keeps the field non-empty) |
 | `stmt:select:result-set` | A `SELECT` that assigns no variable (T-SQL: no `@x =`; PL/pgSQL: no `INTO`): a result set |
@@ -544,8 +606,12 @@ routine refused without any stage naming a reason gets
 | `expr:fn:error:<name>` | An error function (`error_number`, `error_message`, ..., `xact_state`) or PL/pgSQL `sqlstate`/`sqlerrm` |
 | `expr:fn:distinct`, `:order`, `:over`, `:star`, `:within-group` | A call with `DISTINCT`, `ORDER BY`, `OVER`, `*`, `WITHIN GROUP` |
 | `expr:fn:<name>` | A function outside the slice where the rules need a slice value (`expr:fn:upper`, `expr:fn:isnull` over strings that may truncate) |
+| `expr:date-literal` | (0.14.0) A string literal where a date or timestamp is read that is not `'YYYY-MM-DD'` or `'YYYY-MM-DDThh:mm:ss[.f]'`, or has more fractional digits than the type keeps |
+| `expr:bit-literal` | (0.14.0) A value stored into a `bit`/`boolean` that is not `0`/`1` (T-SQL) or `TRUE`/`FALSE` (PostgreSQL), NULL or another bit |
+| `expr:dateadd:part`, `expr:datediff:part` | (0.14.0) `DATEADD` with a datepart other than `day`, `month`, `year` (and their abbreviations); `DATEDIFF` with one other than `day` |
+| `expr:div:smallint` | (0.14.0) A division of two `smallint`s without a literal divisor (both engines give 32768 for `-32768 / -1`) |
 | `expr:<ctor>` | Another expression outside the slice where one is needed, by its constructor (`expr:cast`, `expr:bin`, `expr:name` for a variable of another type, ...) |
-| `store:assign:<type>`, `store:declare:<type>`, `store:return:<type>` | A store that could change its value ("String stores, on every path"): `SET`/`:=`, a `DECLARE` default, a function's `RETURN`, with the target's declared type (`store:assign:varchar_20`, `store:declare:untyped`); the value's form follows when it is outside the slice |
+| `store:assign:<type>`, `store:declare:<type>`, `store:return:<type>` | A store that could change its value ("String stores, on every path"; (0.14.0) a narrowing of an integer width, a bit or a date from a literal of the wrong form, a timestamp into a date): `SET`/`:=`, a `DECLARE` default, a function's `RETURN`, with the target's declared type (`store:assign:varchar_20`, `store:assign:smallint`, `store:declare:untyped`); the value's form follows when it is outside the slice |
 | `store:call` | An `OUTPUT`/`OUT`/`INOUT` copy-back into a variable that cannot take every value |
 | `store:pick:<type>`, `store:for:<type>` | A C3b pick (`SELECT @x = col`, a scalar subquery, `SELECT ... INTO`) or a `FOR` block assignment into a variable the value may not fit |
 

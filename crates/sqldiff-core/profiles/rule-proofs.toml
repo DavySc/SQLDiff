@@ -357,7 +357,8 @@ sites = ["sqldiff-convert/src/tsql/bits.rs"]
 [[rule]]
 id = "tsql.bit.compare"
 kind = "converter"
-proof = "engine"
+proof = "lemma:Sqldiff.Mirror/C2c typed values/bit against boolean"
+note = "a bit variable or column against the literals 0/1 (TRUE/FALSE); comparisons with other numbers, strings or lists, BETWEEN and IN stay on the engine"
 sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[rule]]
@@ -381,7 +382,8 @@ sites = ["sqldiff-convert/src/tsql/bits.rs"]
 [[rule]]
 id = "tsql.bit.store"
 kind = "converter"
-proof = "engine"
+proof = "lemma:Sqldiff.Mirror/C2c typed values/bit against boolean"
+note = "the literals 0/1 (FALSE/TRUE) and NULL stored into a bit variable or column; a number or expression stored as (v <> 0), and CASE results, stay on the engine"
 sites = ["sqldiff-convert/src/tsql/bits.rs"]
 
 [[rule]]
@@ -487,13 +489,15 @@ sites = ["sqldiff-convert/src/tsql.rs"]
 [[rule]]
 id = "tsql.dateadd"
 kind = "converter"
-proof = "engine"
+proof = "lemma:Sqldiff.Mirror/C2c typed values/DATEADD"
+note = "day, month and year on a date or datetime2(p), p at most 6, with an int number (ASM-DATEADD-RANGE, ASM-DATEADD-YEAR-END); other dateparts, types and numbers stay on the engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]
 id = "tsql.datediff"
 kind = "converter"
-proof = "engine"
+proof = "lemma:Sqldiff.Mirror/C2c typed values/DATEDIFF"
+note = "day only, on dates and datetime2(p), p at most 6; month and year stay on the engine"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

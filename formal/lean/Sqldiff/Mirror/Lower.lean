@@ -3664,19 +3664,22 @@ other. Corresponding types (`tyCorr`), as the converter writes them:
   `ASM-C1-OPERATORS` caveat, as for a C2b assignment that does not fit;
   `ExamplesC2b`.) `max` lengths, `char(n)`, `bpchar` and the rest are
   outside;
-* on the C1 path only (these types are not in the slice, so an answer
-  with them names `check_sound`): T-SQL `bigint` and PostgreSQL `bigint`
-  or `int8`, `smallint` and `smallint` or `int2`, without type
-  arguments. Each is the same range of integers in both ("int, bigint,
-  smallint, and tinyint (Transact-SQL)"; PostgreSQL 8.1.1, Table 8.2), so
-  neither side converts an argument the other passes through. Every other
-  type is
+* (C2c) T-SQL `bigint` and PostgreSQL `bigint` or `int8`, `smallint`
+  and `smallint` or `int2`, without type arguments: the same range of
+  integers in both ("int, bigint, smallint, and tinyint (Transact-SQL)";
+  PostgreSQL 8.1.1, Table 8.2), so neither side converts an argument the
+  other passes through; `bit` and `boolean`/`bool`; `date` (a T-SQL
+  caller's dates are in PostgreSQL's wider range); `datetime2(6)` and
+  `timestamp(6)` or `timestamp` ("The C2c slice: typed values"). Every
+  other type is
   outside the spec as a parameter or return type, also where the
-  converter maps it: `tinyint` to `smallint` (the range widens), `bit` to
-  `boolean`, `decimal(p,s)`/`numeric(p,s)` (PostgreSQL drops a parameter's
+  converter maps it: `tinyint` to `smallint` (the range widens),
+  `decimal(p,s)`/`numeric(p,s)` (PostgreSQL drops a parameter's
   type modifiers, so T-SQL rounds an argument to scale `s` and PostgreSQL
-  does not), `datetime`, `datetime2`, `time` (precision), `char(n)`
-  (padding), `date` (PostgreSQL's range is wider), `varchar(max)` to
+  does not), `datetime`, `datetime2(p)` with `p < 6` (the same dropped
+  modifier: T-SQL rounds an argument to `p` digits, PostgreSQL keeps
+  six), `datetime2(7)`, `time` (precision), `char(n)`
+  (padding), `varchar(max)` to
   `text`, `uniqueidentifier` to `uuid` (text form), and user types.
 
 The trailing PL/pgSQL `INOUT return_code` parameter of a procedure (the
