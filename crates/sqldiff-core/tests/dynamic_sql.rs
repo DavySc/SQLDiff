@@ -153,6 +153,34 @@ fn texts_the_batch_runs_differently_are_unknown() {
     }
 }
 
+/// A procedure called through PostgreSQL `EXECUTE` cannot commit: when the
+/// callee's conversion holds `COMMIT`, `CALL q()` fails with 2D000 and
+/// writes nothing, where T-SQL `EXEC (N'EXEC dbo.q')` runs it and keeps its
+/// writes. The callee's body may be outside the tree, so the pair is never
+/// equal, whatever `q` holds.
+#[test]
+fn a_procedure_call_inside_the_text_is_not_equal() {
+    let r = run(
+        &tsql("    EXEC (N'EXEC dbo.q');"),
+        &pg("    EXECUTE 'CALL q()';"),
+    );
+    assert_ne!(r.verdict(), Verdict::Equal, "{:#?}", r.findings);
+    assert_ne!(
+        r.verdict(),
+        Verdict::EqualUnderAssumptions,
+        "{:#?} {:?}",
+        r.assumptions,
+        r.findings
+    );
+    assert!(
+        dynamic_reasons(&r)
+            .iter()
+            .any(|x| x.contains("calls a procedure") && x.contains("cannot commit")),
+        "{:?}",
+        r.unknown_reasons
+    );
+}
+
 #[test]
 fn unequal_counts_are_unknown() {
     let r = run(
