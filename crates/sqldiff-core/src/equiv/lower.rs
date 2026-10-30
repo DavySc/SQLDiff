@@ -118,6 +118,10 @@ pub struct Msg {
     /// The format is a variable (`RAISERROR (@v, …)`): a `%` in its value
     /// is a format specification.
     pub format_var: bool,
+    /// T-SQL `RAISERROR (…, @severity, …)`: the variable decides at run time
+    /// whether it is an error (above 10) or a message. Lowered as
+    /// `if(@severity > 10) raise-error else message end`.
+    pub severity: Option<super::ast::Expr>,
 }
 
 #[derive(Debug, Clone)]
@@ -2051,6 +2055,9 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         return;
     }
     if let Some((ast, msg)) = message(c, d) {
+        if let Some(sev) = msg.as_ref().and_then(|m| m.severity.clone()) {
+            return by_severity(c, u, ast, msg.unwrap(), sev);
+        }
         u.stmts.push(LStmt {
             node: c.clone(),
             toks: tokens(c),
@@ -2616,6 +2623,33 @@ fn is_create_ddl(c: &SyntaxNode, d: Dialect) -> bool {
             .is_some_and(|p| matches!(p.kind(), SyntaxKind::SOURCE_FILE | SyntaxKind::BATCH))
 }
 
+/// A T-SQL `RAISERROR` whose severity is a variable, as the IF its
+/// conversion writes: `if(@severity > 10)` the error, `else` the message.
+fn by_severity(c: &SyntaxNode, u: &mut Unit, ast: Result<Stmt, String>, m: Msg, sev: Expr) {
+    let cond = Expr::Bin(">".into(), Box::new(sev), Box::new(Expr::Num("10".into())));
+    let stmt = |error: bool| LStmt {
+        node: c.clone(),
+        toks: tokens(c),
+        ast: ast.clone(),
+        from_declare: false,
+        msg: Some(Msg { error, ..m.clone() }),
+        output: None,
+        cursor: None,
+    };
+    mark(u, CtlKind::If(Ok(cond)), c);
+    u.stmts.push(stmt(true));
+    mark(u, CtlKind::Else, c);
+    u.stmts.push(stmt(false));
+    mark(u, CtlKind::End, c);
+}
+
+/// Whether an IF marker's node is a RAISERROR (`by_severity`), not a
+/// condition.
+pub(super) fn severity_if(node: &SyntaxNode) -> bool {
+    node.kind() != SyntaxKind::CONDITION
+        && cst::first_words(node, 1).first().map(String::as_str) == Some("RAISERROR")
+}
+
 /// What a message statement lowers to: a plain statement, or a message
 /// built from a format.
 type Lowered = (Result<Stmt, String>, Option<Msg>);
@@ -2753,6 +2787,7 @@ fn message(c: &SyntaxNode, d: Dialect) -> Option<Lowered> {
                 parts,
                 tsql: false,
                 format_var: false,
+                severity: None,
             };
             Ok((Err("a RAISE compared as its message".into()), Some(msg)))
         })();
@@ -2845,13 +2880,19 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
     let [fmt, sev, _state, args @ ..] = args.as_slice() else {
         return Err("RAISERROR with fewer than three arguments".into());
     };
-    let error = match sev {
+    // A severity variable: SQL Server 2022 raises an error above 10 and
+    // sends a message otherwise (negative severities too); 19 and more
+    // without WITH LOG raise error 2754 instead, and a NULL severity takes
+    // the value the variable held before (`Canon::message` assumes neither
+    // happens).
+    let (error, severity) = match sev {
         Expr::Num(s) => match s.parse::<u32>() {
-            Ok(0..=10) => false,
-            Ok(11..=18) => true,
+            Ok(0..=10) => (false, None),
+            Ok(11..=18) => (true, None),
             _ => return Err("a RAISERROR severity outside 0 to 18".into()),
         },
-        _ => return Err("a RAISERROR severity that is not a literal".into()),
+        Expr::Var(v) if !v.starts_with("@@") => (true, Some(sev.clone())),
+        _ => return Err("a RAISERROR severity that is not a literal or a variable".into()),
     };
     let null = "(null)".to_string();
     let mut parts = Vec::new();
@@ -2927,6 +2968,7 @@ fn raiserror(toks: &[Tok]) -> Result<Msg, String> {
         parts,
         tsql: true,
         format_var,
+        severity,
     })
 }
 

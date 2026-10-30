@@ -151,6 +151,10 @@ pub mod asm {
         "ASM-RAISERROR-TEXT",
         "The RAISERROR message is 1 to 2,047 characters long: T-SQL cuts a longer one to 2,044 characters and '...', and sends an empty one as a single space, where PostgreSQL keeps the text as it is",
     );
+    pub const RAISERROR_SEVERITY: (&str, &str) = (
+        "ASM-RAISERROR-SEVERITY",
+        "The RAISERROR severity variable is not NULL and at most 18: T-SQL raises error 2754 instead for 19 and above without WITH LOG, and for a NULL severity uses the value the variable held before it became NULL (SQL Server 2022)",
+    );
     pub const RAISERROR_FORMAT: (&str, &str) = (
         "ASM-RAISERROR-FORMAT",
         "The variable RAISERROR takes as its message holds no % sign: T-SQL reads it as a format, so % starts a substitution",
@@ -4875,6 +4879,16 @@ impl<'a> Canon<'a> {
         }
         if m.format_var {
             self.assume(asm::RAISERROR_FORMAT);
+        }
+        // An int severity variable: a wider one may overflow (Msg 8115) and
+        // a fraction or string is converted first.
+        if let Some(sev) = &m.severity {
+            match self.expr(sev)? {
+                (_, Some(ty)) if ty.fam == Fam::Int && ty.len.is_some_and(|b| b <= 32) => {
+                    self.assume(asm::RAISERROR_SEVERITY);
+                }
+                _ => return Err("a RAISERROR severity that is not an int variable".into()),
+            }
         }
         Ok(n(if m.error { "raise-error" } else { "message" }, parts))
     }
