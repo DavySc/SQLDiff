@@ -31,7 +31,7 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 pub mod asm {
     pub const LEN_BMP: (&str, &str) = (
         "ASM-TSQL-LEN-BMP",
-        "Strings a T-SQL LEN counts have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
+        "Strings a T-SQL LEN counts, or a LIKE `_` steps over, have no character outside the Basic Multilingual Plane, or the collation is supplementary-character aware (_SC)",
     );
     pub const DATEFIRST_7: (&str, &str) = (
         "ASM-TSQL-DATEFIRST-7",
@@ -1338,16 +1338,31 @@ impl<'a> Canon<'a> {
             }
             Expr::Like(x, p, neg, ci) => {
                 let (x, ty) = self.expr(x)?;
-                // A varchar value against a literal pattern without `[` or
-                // `\` differs across dialects only by the collation
-                // (`coll-like`): case, trailing spaces of the value (T-SQL
-                // varchar drops them) and characters the collation expands
-                // (checked on SQL Server 2022). T-SQL `[...]` is a character
-                // class and PostgreSQL's `\` an escape; a char value is
-                // blank-padded on one side only.
-                let plain = ty.is_some_and(|t| t.fam == Fam::VarChar)
-                    && matches!(p.as_ref(), Expr::Str(s) if !s.contains(['[', '\\']));
-                let p = self.expr(p)?.0;
+                // A varchar value against a literal pattern both dialects
+                // read the same way (`like::canonical`: T-SQL's `[c]` is the
+                // character, PostgreSQL's `\` an escape) differs across
+                // dialects only by the collation (`coll-like`): case,
+                // trailing spaces of the value (T-SQL varchar drops them) and
+                // characters the collation expands (checked on SQL Server
+                // 2022). A char value is blank-padded on one side only.
+                let pat = match p.as_ref() {
+                    Expr::Str(s) => super::like::canonical(s, self.d),
+                    _ => None,
+                };
+                let plain = pat.is_some() && ty.is_some_and(|t| t.fam == Fam::VarChar);
+                // Under a non-_SC collation T-SQL's `_` matches no character
+                // outside the BMP (N'a😀' LIKE N'a_' and N'a__' are both
+                // false on SQL Server 2022); PostgreSQL's matches one.
+                if plain
+                    && self.d == Dialect::Tsql
+                    && pat.as_deref().is_some_and(super::like::steps_one)
+                {
+                    self.assume(asm::LEN_BMP);
+                }
+                let p = match pat {
+                    Some(c) => n("likepat", vec![a(c)]),
+                    None => self.expr(p)?.0,
+                };
                 let coll = if plain {
                     n("coll-like", vec![self.dtag()])
                 } else {
