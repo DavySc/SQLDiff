@@ -700,6 +700,13 @@ impl<'a> Parser<'a> {
         if self.eat_kw("AS") {
             return Ok(Some(self.any_ident()?));
         }
+        // T-SQL's reserved OPTION starts the query hints, `OPTION (…)`.
+        if self.d == Dialect::Tsql
+            && self.is_kw("OPTION")
+            && self.peek_at(1).is_some_and(|t| t.kind == K::LParen)
+        {
+            return Ok(None);
+        }
         match self.peek() {
             Some(t)
                 if (t.kind == K::Word && !is_reserved(&t.up) && !is_clause_start(&t.up))
@@ -1354,6 +1361,15 @@ impl<'a> Parser<'a> {
     // ---- queries -------------------------------------------------------
 
     pub fn select(&mut self) -> PResult<Select> {
+        if self.is_kw("WITH") && self.lowered && !self.ext {
+            let ctes = self.with_list()?;
+            let mut s = self.select()?;
+            if !s.ctes.is_empty() {
+                return Err("nested WITH".into());
+            }
+            s.ctes = ctes;
+            return Ok(s);
+        }
         if self.is_kw("WITH") {
             if !self.ext {
                 return Err("common table expressions are not supported".into());
@@ -2057,6 +2073,140 @@ impl<'a> Parser<'a> {
         Ok(dml)
     }
 
+    /// `WITH [RECURSIVE] name [(cols)] AS (query), …` for the equivalence
+    /// lowering, which reads every CTE the T-SQL way: a CTE's query sees
+    /// the CTEs before it, and its own name is the CTE itself (recursion).
+    /// PostgreSQL agrees when its list has RECURSIVE and no query names a
+    /// later CTE (RECURSIVE makes that name the later CTE, T-SQL a table),
+    /// or has no RECURSIVE and no query names its own CTE (that name is
+    /// then a table). Any other list is refused. A name counts wherever it
+    /// stands outside a qualifier (`cte.col`), so a column or alias of that
+    /// name refuses too. MATERIALIZED and NOT MATERIALIZED are refused, and
+    /// so is Db2 for i, whose rules are not checked here.
+    fn with_list(&mut self) -> PResult<Vec<Cte>> {
+        if self.d == Dialect::Db2i {
+            return Err("common table expressions are not compared for Db2 for i".into());
+        }
+        self.expect_kw("WITH")?;
+        let recursive = self.eat_kw("RECURSIVE");
+        if recursive && self.d != Dialect::Postgres {
+            return Err("recursive common table expressions are not supported".into());
+        }
+        let mut ctes: Vec<Cte> = Vec::new();
+        let mut bodies = Vec::new();
+        loop {
+            let name = self.ident()?;
+            if ctes.iter().any(|c| same_name(&c.name, &name)) {
+                return Err(format!("two common table expressions named `{name}`"));
+            }
+            let cols = if self.is_kind(K::LParen) {
+                self.col_list()?
+            } else {
+                Vec::new()
+            };
+            self.expect_kw("AS")?;
+            if self.is_kw("MATERIALIZED") || self.is_kw("NOT") {
+                return Err("MATERIALIZED common table expressions are not supported".into());
+            }
+            self.expect_kind(K::LParen)?;
+            let start = self.i;
+            let query = self.select()?;
+            bodies.push(start..self.i);
+            self.expect_kind(K::RParen)?;
+            ctes.push(Cte { name, cols, query });
+            if !self.eat_kind(K::Comma) {
+                break;
+            }
+        }
+        if self.d == Dialect::Postgres {
+            for (i, body) in bodies.iter().enumerate() {
+                let names = |c: &Cte| {
+                    self.t[body.clone()].iter().enumerate().any(|(k, t)| {
+                        let text = match t.kind {
+                            K::Word => t.text.clone(),
+                            K::Quoted => quoted_name(&t.text, self.d),
+                            _ => return false,
+                        };
+                        same_name(&text, &c.name)
+                            && !self
+                                .t
+                                .get(body.start + k + 1)
+                                .is_some_and(|n| n.kind == K::Dot)
+                    })
+                };
+                if recursive && ctes[i + 1..].iter().any(names) {
+                    return Err("a recursive CTE list where a query names a CTE defined after it is not supported".into());
+                }
+                if !recursive && names(&ctes[i]) {
+                    return Err(
+                        "a CTE whose query names itself without RECURSIVE is not supported".into(),
+                    );
+                }
+            }
+        }
+        Ok(ctes)
+    }
+
+    /// `WITH … SELECT` or `WITH … INSERT … SELECT` for the equivalence
+    /// lowering: the CTEs go to the query, the only place the INSERT may
+    /// name them (not as its target, nor in OUTPUT, RETURNING or ON
+    /// CONFLICT). A T-SQL `OPTION (MAXRECURSION n)` at the end is read and
+    /// left out: it only stops a deeper recursion with an error, which the
+    /// lowering states as an assumption for every recursive CTE.
+    fn with_stmt(&mut self) -> PResult<Stmt> {
+        let ctes = self.with_list()?;
+        let st = if self.is_kw("INSERT") {
+            let had_output = self.output.is_some();
+            let mut st = self.insert()?;
+            let Stmt::Insert {
+                target,
+                source,
+                returning,
+                on_conflict,
+                ..
+            } = &mut st
+            else {
+                unreachable!("insert() returns an INSERT")
+            };
+            if let [t] = &target[..] {
+                if ctes.iter().any(|c| same_name(&c.name, t)) {
+                    return Err("INSERT into a common table expression is not supported".into());
+                }
+            }
+            if !returning.is_empty() || on_conflict.is_some() || self.output.is_some() != had_output
+            {
+                return Err(
+                    "WITH … INSERT with OUTPUT, RETURNING or ON CONFLICT is not supported".into(),
+                );
+            }
+            let InsertSource::Query(q) = source else {
+                return Err("WITH … INSERT … VALUES is not supported".into());
+            };
+            if !q.ctes.is_empty() {
+                return Err("nested WITH".into());
+            }
+            q.ctes = ctes;
+            st
+        } else {
+            let mut s = self.select()?;
+            if !s.ctes.is_empty() {
+                return Err("nested WITH".into());
+            }
+            s.ctes = ctes;
+            Stmt::Select(Box::new(s))
+        };
+        if self.d == Dialect::Tsql
+            && self.is_kw("OPTION")
+            && self.peek_at(1).is_some_and(|t| t.kind == K::LParen)
+            && self.is_kw_at(2, "MAXRECURSION")
+            && self.peek_at(3).is_some_and(|t| t.kind == K::Num)
+            && self.peek_at(4).is_some_and(|t| t.kind == K::RParen)
+        {
+            self.i += 5;
+        }
+        Ok(st)
+    }
+
     fn qname_or_var(&mut self) -> PResult<Vec<String>> {
         match self.peek() {
             Some(t) if t.kind == K::Var => {
@@ -2078,6 +2228,7 @@ impl<'a> Parser<'a> {
             "WITH" => match self.with_update()? {
                 Some(u) => u,
                 None if self.ext => Stmt::Select(Box::new(self.select()?)),
+                None if self.lowered => self.with_stmt()?,
                 None => return Err("common table expressions are not supported".into()),
             },
             "INSERT" => self.insert()?,
@@ -2615,6 +2766,16 @@ pub fn group_key(q: &Select) -> Option<Vec<String>> {
         key.push(out);
     }
     Some(key)
+}
+
+/// Two names as [`quoted_name`] gives them: a `"`-marked name only as
+/// written, any other up to letter case.
+fn same_name(x: &str, y: &str) -> bool {
+    if x.starts_with('"') || y.starts_with('"') {
+        x == y
+    } else {
+        x.eq_ignore_ascii_case(y)
+    }
 }
 
 pub fn quoted_name(raw: &str, d: Dialect) -> String {

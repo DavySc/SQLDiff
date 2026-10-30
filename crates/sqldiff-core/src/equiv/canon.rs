@@ -27,6 +27,9 @@ pub type R<T> = Result<T, String>;
 /// Lowered query parts without the select list, and the select items with their types.
 type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 
+/// The columns of a common table expression: name and type.
+type CteCols = Vec<(String, Option<Ty>)>;
+
 /// Assumption identifiers and texts used by the equivalence rules.
 pub mod asm {
     pub const ROWCOUNT_FOUND: (&str, &str) = (
@@ -219,6 +222,11 @@ pub mod asm {
     );
     /// Same id as [`TSQL_CI`]: T-SQL has one case-insensitive collation
     /// assumption, stated for names here and for string comparisons there.
+    /// Same id and text as the converter's note on a recursive CTE.
+    pub const CTE_MAXRECURSION: (&str, &str) = (
+        "ASM-CTE-MAXRECURSION",
+        "A recursive CTE stays within T-SQL's recursion limit (MAXRECURSION, 100 levels by default), which PostgreSQL does not have: T-SQL stops a deeper recursion with an error",
+    );
     pub const TSQL_CI_NAMES: (&str, &str) = (
         "ASM-TSQL-CI-COLLATION",
         "Identifiers and variables compare case-insensitively (case-insensitive catalog collation)",
@@ -366,6 +374,41 @@ pub struct Canon<'a> {
     cursor_cols: HashMap<String, Vec<Option<Ty>>>,
     /// Why a cursor's OPEN was not read, by cursor key: its FETCHes say so.
     cursor_failed: HashMap<String, String>,
+    /// The common table expressions in scope, outermost first (see
+    /// `cte_ref`).
+    ctes: Vec<CteScope>,
+}
+
+/// A common table expression in scope while a statement is lowered.
+#[derive(Debug, Clone)]
+enum CteScope {
+    /// Read where a FROM item names it, as a derived table of its query.
+    Def {
+        key: String,
+        name: String,
+        cols: Vec<String>,
+        query: Box<Select>,
+        used: bool,
+    },
+    /// The CTE's own name inside its query (or a recursive CTE's anchor),
+    /// where the lowering does not read it.
+    Own { key: String },
+    /// A recursive CTE's rows of the previous step, inside its recursive
+    /// member: read once, as that member's only FROM item.
+    Rec {
+        key: String,
+        table: String,
+        cols: Vec<(String, Ty)>,
+        read: bool,
+    },
+}
+
+impl CteScope {
+    fn key(&self) -> &str {
+        match self {
+            CteScope::Def { key, .. } | CteScope::Own { key } | CteScope::Rec { key, .. } => key,
+        }
+    }
 }
 
 /// T-SQL `OBJECT_NAME(@@PROCID)` / `OBJECT_SCHEMA_NAME(@@PROCID)` in a
@@ -494,6 +537,67 @@ fn colname(d: Dialect, kind: &str, name: &str) -> Term {
 /// Folded name; names whose quoting is significant (leading `"`) keep their
 /// case, except while a PostgreSQL statement is lowered again with its
 /// quoted names folded (see `Canon::stmt`).
+/// The recursive member of CTE `key`'s query: `anchor UNION ALL step`
+/// where `step` has one FROM item, a one-part name of the CTE. `None` for
+/// any other query, which is then lowered as a plain derived table (where
+/// the CTE's own name is refused).
+fn rec_step<'q>(key: &str, q: &'q Select) -> Option<&'q Select> {
+    let [(op, step)] = q.set_ops.as_slice() else {
+        return None;
+    };
+    match step.from.as_slice() {
+        [From::Table { name, hints, .. }]
+            if op == "UNION ALL"
+                && hints.is_empty()
+                && matches!(name.as_slice(), [x] if lc(x) == key) =>
+        {
+            Some(step)
+        }
+        _ => None,
+    }
+}
+
+/// The items of a CTE's query named as its columns, `(item value name)`:
+/// by the column list when given, else by the names the query gives them,
+/// each named and once.
+fn cte_columns(
+    key: &str,
+    cols: &[String],
+    items: Vec<(Term, Option<Ty>)>,
+) -> R<(Vec<Term>, CteCols)> {
+    if !cols.is_empty() && cols.len() != items.len() {
+        return Err(format!(
+            "the common table expression `{key}` names {} columns for {} items",
+            cols.len(),
+            items.len()
+        ));
+    }
+    let mut terms = Vec::new();
+    let mut columns: Vec<(String, Option<Ty>)> = Vec::new();
+    for (i, (t, ty)) in items.into_iter().enumerate() {
+        let (value, given) = match t.kids() {
+            [v, name] if t.is("item") => (v.clone(), name.atom().unwrap_or("").to_string()),
+            _ => {
+                return Err(format!(
+                    "the common table expression `{key}` returns no named items"
+                ))
+            }
+        };
+        let name = match cols.get(i) {
+            Some(c) => lc(c),
+            None => given,
+        };
+        if name.is_empty() || columns.iter().any(|(c, _)| *c == name) {
+            return Err(format!(
+                "the common table expression `{key}` has an unnamed or repeated column"
+            ));
+        }
+        terms.push(n("item", vec![value, a(name.clone())]));
+        columns.push((name, ty));
+    }
+    Ok((terms, columns))
+}
+
 fn lc(s: &str) -> String {
     let (stored, quoted) = match s.strip_prefix('"') {
         Some(q) => (q.to_string(), true),
@@ -618,6 +722,7 @@ impl<'a> Canon<'a> {
             sub_bits: HashMap::new(),
             cursor_cols: HashMap::new(),
             cursor_failed: HashMap::new(),
+            ctes: Vec::new(),
             by_name: false,
             fold_quoted: false,
             other: None,
@@ -629,6 +734,7 @@ impl<'a> Canon<'a> {
 
     pub fn reset(&mut self) {
         self.scopes.clear();
+        self.ctes.clear();
         self.asm.clear();
         self.discharged.clear();
         self.single_row = false;
@@ -1287,6 +1393,83 @@ impl<'a> Canon<'a> {
             v.0 = Self::bit_value(v.0.clone());
         }
         None
+    }
+
+    /// T-SQL CHARINDEX's type: bigint when the searched string is
+    /// varchar(max) or nvarchar(max), int otherwise, unknown when that is
+    /// not known (SQL Server 2022, eval/cte/2026-10-30/charindex-max).
+    fn charindex_ty(&mut self, hay: &Expr, ty: &Option<Ty>) -> Option<Ty> {
+        match self.tsql_max(hay, ty)? {
+            true => Some(Ty {
+                len: Some(64),
+                ..INT32
+            }),
+            false => Some(INT32),
+        }
+    }
+
+    /// Whether a T-SQL string is varchar(max) or nvarchar(max) (None: not
+    /// known). A string of known length is not; a variable, parameter or
+    /// catalog column is as declared (a declared non-MAX type has a
+    /// length); REPLACE, the trims, UPPER, LOWER, LEFT, RIGHT, SUBSTRING
+    /// and ISNULL are when their first argument is, `+` when either side
+    /// is (SQL Server 2022, eval/cte/2026-10-30/charindex-max). A derived
+    /// table's or CTE's column of unknown length may be either.
+    fn tsql_max(&mut self, e: &Expr, ty: &Option<Ty>) -> Option<bool> {
+        let t = (*ty)?;
+        if t.fam != Fam::VarChar {
+            return None;
+        }
+        if t.len.is_some() {
+            return Some(false);
+        }
+        let of = |c: &mut Self, e: &Expr| {
+            let ty = c.expr(e).ok()?.1;
+            c.tsql_max(e, &ty)
+        };
+        match e {
+            Expr::Var(v) if !v.starts_with("@@") => Some(true),
+            // A catalog column, as declared.
+            Expr::Name(p) => {
+                let t = self.resolve(p).ok()?.0;
+                if !t.is("col") {
+                    return None;
+                }
+                let ct = self.col_ty(t.kid(0)?.atom()?, t.kid(1)?.atom()?).0?;
+                (ct.fam == Fam::VarChar && ct.len.is_none()).then_some(true)
+            }
+            Expr::Cast(_, to) => Some(
+                to.args
+                    .first()
+                    .is_some_and(|a| a.eq_ignore_ascii_case("max")),
+            ),
+            Expr::Bin(op, l, r) if op == "+" => match (of(self, l), of(self, r)) {
+                (Some(true), _) | (_, Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            },
+            Expr::Call(c)
+                if c.name.len() == 1
+                    && !c.over
+                    && !c.args.is_empty()
+                    && [
+                        "replace",
+                        "ltrim",
+                        "rtrim",
+                        "upper",
+                        "lower",
+                        "left",
+                        "right",
+                        "substring",
+                        "isnull",
+                    ]
+                    .iter()
+                    .any(|f| c.name[0].eq_ignore_ascii_case(f)) =>
+            {
+                of(self, &c.args[0])
+            }
+            _ => None,
+        }
     }
 
     // ---- expressions ----------------------------------------------------
@@ -2492,6 +2675,46 @@ impl<'a> Canon<'a> {
                 let ty = args.iter().find_map(|x| x.1);
                 portable("coalesce", args, ty)
             }
+            // NULLIF(a, b): NULL when a = b, else a, in both dialects.
+            // Integers only (strings compare under the collation). T-SQL
+            // types the result as `a`, PostgreSQL as the common type of
+            // both: the same value either way.
+            (Dialect::Tsql | Dialect::Postgres, "nullif", 2)
+                if args.iter().all(|x| {
+                    x.1.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l >= 2))
+                }) =>
+            {
+                let ty = match d {
+                    Dialect::Tsql => first_ty,
+                    _ => args.iter().filter_map(|x| x.1).max_by_key(|t| t.len),
+                };
+                portable("nullif", args, ty)
+            }
+            // SUBSTRING(s, start, length): the same characters for every
+            // start and length, NULL, negative (an error for a negative
+            // length), zero and past either end included (SQL Server 2022
+            // nvarchar(max) against PostgreSQL 18 text, 480 combinations,
+            // eval/cte/2026-10-30). varchar only (PostgreSQL strips char
+            // padding first); a PostgreSQL start and length of at most 32
+            // bits, as substring takes; positions under ASM-TSQL-LEN-BMP.
+            (Dialect::Tsql, "substring", 3) | (Dialect::Postgres, "substring" | "substr", 3)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && args[1..].iter().all(|x| match d {
+                        Dialect::Tsql => {
+                            x.1.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l >= 2))
+                        }
+                        _ => x.1.is_some_and(|t| {
+                            t.fam == Fam::Int && t.len.is_some_and(|l| (2..=32).contains(&l))
+                        }),
+                    }) =>
+            {
+                self.assume(asm::LEN_BMP);
+                let ty = match d {
+                    Dialect::Tsql => first_ty,
+                    _ => Some(Ty::of(Fam::VarChar)),
+                };
+                (n("substr", args.into_iter().map(|x| x.0).collect()), ty)
+            }
             (Dialect::Tsql, "isnull", 2) => {
                 // ISNULL takes the type of its first argument; it equals COALESCE
                 // when the replacement is stored in that type unchanged.
@@ -2569,8 +2792,9 @@ impl<'a> Canon<'a> {
                 // Positions count UTF-16 code units in T-SQL (non-_SC
                 // collations), code points in PostgreSQL.
                 self.assume(asm::LEN_BMP);
+                let ty = self.charindex_ty(&c.args[1], &args[1].1);
                 let (needle, hay) = (args[0].0.clone(), args[1].0.clone());
-                (n("strpos", vec![a(ci), hay, needle]), Some(INT32))
+                (n("strpos", vec![a(ci), hay, needle]), ty)
             }
             // CHARINDEX(needle, s, start), against the converter's
             // `(strpos(substr(s, start), x) - 1 + greatest(start, 1)) *
@@ -2588,9 +2812,10 @@ impl<'a> Canon<'a> {
             {
                 let ci = self.collation_marker();
                 self.assume(asm::LEN_BMP);
+                let ty = self.charindex_ty(&c.args[1], &args[1].1);
                 let (needle, hay, start) =
                     (args[0].0.clone(), args[1].0.clone(), args[2].0.clone());
-                (n("strpos", vec![a(ci), hay, needle, start]), Some(INT32))
+                (n("strpos", vec![a(ci), hay, needle, start]), ty)
             }
             (Dialect::Postgres, "strpos", 2)
                 if args
@@ -3650,6 +3875,258 @@ impl<'a> Canon<'a> {
 
     // ---- queries --------------------------------------------------------
 
+    /// Lowers `s` without its WITH list, the list's CTEs in scope.
+    fn with_ctes<T>(&mut self, s: &Select, f: impl FnOnce(&mut Self, &Select) -> R<T>) -> R<T> {
+        let base = self.ctes.len();
+        for c in &s.ctes {
+            self.ctes.push(CteScope::Def {
+                key: lc(&c.name),
+                name: c.name.clone(),
+                cols: c.cols.clone(),
+                query: Box::new(c.query.clone()),
+                used: false,
+            });
+        }
+        let mut body = s.clone();
+        body.ctes.clear();
+        let r = f(self, &body);
+        self.ctes.truncate(base);
+        r
+    }
+
+    /// The innermost CTE in scope that a one-part FROM name names. Both
+    /// dialects look a one-part name up among the CTEs first; a qualified
+    /// name is always a table.
+    fn cte_at(&mut self, name: &[String]) -> Option<usize> {
+        let [x] = name else { return None };
+        if self.ctes.is_empty() {
+            return None;
+        }
+        let key = lc(x);
+        let k = self.ctes.iter().rposition(|c| c.key() == key)?;
+        if let CteScope::Def { name, .. } = &self.ctes[k] {
+            if self.d == Dialect::Tsql && name != x {
+                self.assume(asm::TSQL_CI_NAMES);
+            }
+        }
+        Some(k)
+    }
+
+    /// A FROM item that names the CTE `self.ctes[k]`, read as the derived
+    /// table of its query, as both T-SQL and PostgreSQL read a CTE that
+    /// only reads. That holds for a CTE read once: PostgreSQL may compute
+    /// a CTE read twice once, T-SQL computes it for each read, which
+    /// differs when its query is not deterministic (NEWID(), random()), so
+    /// a second read is refused. The query sees the CTEs before it, and
+    /// the outer query's columns not at all.
+    ///
+    /// A recursive CTE is `anchor UNION ALL step` where `step` reads the
+    /// CTE as its only FROM item (`rec_cte`).
+    fn cte_ref(&mut self, k: usize, alias: &Option<String>) -> R<Term> {
+        match &mut self.ctes[k] {
+            CteScope::Own { key } => {
+                return Err(format!(
+                    "the common table expression `{key}` named inside its own query, other than as the one FROM item of a recursive member, is not supported"
+                ))
+            }
+            CteScope::Rec {
+                key,
+                table,
+                cols,
+                read,
+            } => {
+                if *read {
+                    return Err(format!(
+                        "the recursive common table expression `{key}` read twice in its recursive member"
+                    ));
+                }
+                *read = true;
+                let bkey = alias.as_deref().map(lc).unwrap_or_else(|| key.clone());
+                let table = table.clone();
+                let derived = cols
+                    .iter()
+                    .map(|(c, ty)| {
+                        (
+                            c.clone(),
+                            n("col", vec![a(table.clone()), a(c.clone())]),
+                            Some(*ty),
+                        )
+                    })
+                    .collect();
+                self.scopes.last_mut().unwrap().push(Binding {
+                    key: bkey,
+                    table: table.clone(),
+                    derived: Some(derived),
+                    unique: None,
+                });
+                return Ok(n("rec-self", vec![a(table)]));
+            }
+            CteScope::Def { used: true, key, .. } => {
+                return Err(format!(
+                    "the common table expression `{key}` read more than once is not supported: PostgreSQL may compute it once, T-SQL computes it for each read"
+                ))
+            }
+            CteScope::Def { .. } => {}
+        }
+        let def = self.ctes[k].clone();
+        let CteScope::Def {
+            key, cols, query, ..
+        } = &def
+        else {
+            unreachable!("matched above")
+        };
+        let key = key.clone();
+        // The query sees the scopes before it, and its own name as `Own`.
+        let tail = self.ctes.split_off(k + 1);
+        self.ctes[k] = CteScope::Own { key: key.clone() };
+        let saved = std::mem::take(&mut self.scopes);
+        let r = self.cte_query(&key, cols, query);
+        self.scopes = saved;
+        self.ctes[k] = def.clone();
+        if let CteScope::Def { used, .. } = &mut self.ctes[k] {
+            *used = true;
+        }
+        self.ctes.extend(tail);
+        let (term, columns) = r?;
+        let bkey = alias.as_deref().map(lc).unwrap_or(key);
+        let table = format!("sub:{bkey}");
+        let derived = columns
+            .into_iter()
+            .map(|(c, ty)| (c.clone(), n("col", vec![a(table.clone()), a(c)]), ty))
+            .collect();
+        self.scopes.last_mut().unwrap().push(Binding {
+            key: bkey,
+            table,
+            derived: Some(derived),
+            unique: None,
+        });
+        Ok(term)
+    }
+
+    /// The FROM term of CTE `key`'s query and its columns: the column list
+    /// when given, else the names the query gives its items.
+    fn cte_query(&mut self, key: &str, cols: &[String], query: &Select) -> R<(Term, CteCols)> {
+        if let Some(step) = rec_step(key, query) {
+            return self.rec_cte(key, cols, query, step);
+        }
+        let (mut parts, items) = self.query_parts(query, QCtx::Set)?;
+        let (items, columns) = cte_columns(key, cols, items)?;
+        parts.insert(1, n("items", items));
+        Ok((n("sub", vec![n("q", parts)]), columns))
+    }
+
+    /// A recursive CTE: `anchor UNION ALL step`, where the step reads the
+    /// CTE once, as its only FROM item. Both dialects then return the
+    /// anchor's rows and, again and again, the step's rows for the rows the
+    /// last round added, until a round adds none (T-SQL: "Recursive Queries
+    /// Using Common Table Expressions"; PostgreSQL 18 manual 7.8.2). The
+    /// step works one row at a time (no DISTINCT, grouping, window
+    /// function, TOP or paging), so the order T-SQL and PostgreSQL work in
+    /// does not change the rows. Each column has one known type, the same
+    /// in anchor and step: T-SQL refuses other types, and PostgreSQL takes
+    /// the anchor's. T-SQL stops past MAXRECURSION with an error,
+    /// PostgreSQL never (ASM-CTE-MAXRECURSION). The term is `(rec-cte
+    /// anchor step)`, the step reading `(rec-self rec:N)`.
+    fn rec_cte(
+        &mut self,
+        key: &str,
+        cols: &[String],
+        query: &Select,
+        step: &Select,
+    ) -> R<(Term, CteCols)> {
+        let own = |q: &Select| {
+            q.top.is_some()
+                || q.limit.is_some()
+                || q.offset.is_some()
+                || !q.order_by.is_empty()
+                || !q.locking.is_empty()
+                || q.for_json
+                || !q.into.is_empty()
+                || !q.ctes.is_empty()
+                || q.values.is_some()
+                || q.items.iter().any(|i| i.assign.is_some())
+        };
+        let mut anchor = query.clone();
+        anchor.set_ops.clear();
+        if own(query) || own(step) || !step.set_ops.is_empty() {
+            return Err("a recursive CTE with ORDER BY, TOP, paging, INTO or assignment".into());
+        }
+        // Both dialects reject an aggregate there; a window function is
+        // computed over each step's rows.
+        let mut folds = false;
+        for e in step.items.iter().map(|i| &i.expr).chain(&step.where_) {
+            super::eval::walk_expr(e, &mut |x| {
+                if matches!(x, Expr::Call(c) if c.over) || super::eval::is_aggregate(x) {
+                    folds = true;
+                }
+            });
+        }
+        if step.distinct
+            || !step.group_by.is_empty()
+            || step.having.is_some()
+            || folds
+            || step.items.iter().any(|i| matches!(i.expr, Expr::Star(_)))
+        {
+            return Err(
+                "a recursive CTE whose recursive member has DISTINCT, GROUP BY, HAVING, an aggregate, a window function or *"
+                    .into(),
+            );
+        }
+        let (mut pa, ia) = self.query_parts(&anchor, QCtx::Set)?;
+        let (ia, columns) = cte_columns(key, cols, ia)?;
+        let mut typed = Vec::new();
+        for (c, ty) in &columns {
+            let ty = ty.ok_or_else(|| {
+                format!("the recursive CTE `{key}` has column `{c}` of unknown type")
+            })?;
+            typed.push((c.clone(), ty));
+        }
+        let depth = self
+            .ctes
+            .iter()
+            .filter(|c| matches!(c, CteScope::Rec { .. }))
+            .count();
+        let k = self.ctes.len() - 1;
+        let table = format!("rec:{depth}");
+        self.ctes[k] = CteScope::Rec {
+            key: key.to_string(),
+            table: table.clone(),
+            cols: typed.clone(),
+            read: false,
+        };
+        let step_parts = self.query_parts(step, QCtx::Set);
+        self.ctes[k] = CteScope::Own {
+            key: key.to_string(),
+        };
+        let (mut ps, is) = step_parts?;
+        if is.len() != typed.len() {
+            return Err(format!(
+                "the recursive CTE `{key}`: anchor and recursive member return different numbers of columns"
+            ));
+        }
+        for ((_, ty), (c, aty)) in is.iter().zip(&typed) {
+            if *ty != Some(*aty) {
+                return Err(format!(
+                    "the recursive CTE `{key}`: column `{c}` has another or an unknown type in the recursive member"
+                ));
+            }
+        }
+        let (is, _) = cte_columns(
+            key,
+            &columns.iter().map(|c| c.0.clone()).collect::<Vec<_>>(),
+            is,
+        )?;
+        if self.d == Dialect::Tsql {
+            self.assume(asm::CTE_MAXRECURSION);
+        }
+        pa.insert(1, n("items", ia));
+        ps.insert(1, n("items", is));
+        Ok((
+            n("rec-cte", vec![a(table), n("q", pa), n("q", ps)]),
+            columns,
+        ))
+    }
+
     fn push_from(&mut self, from: &[From]) -> R<Vec<Term>> {
         let mut terms = Vec::new();
         for f in from {
@@ -3663,6 +4140,9 @@ impl<'a> Canon<'a> {
             From::Table { name, alias, hints } => {
                 if !hints.is_empty() {
                     return Err("table hints in FROM are not supported".into());
+                }
+                if let Some(k) = self.cte_at(name) {
+                    return self.cte_ref(k, alias);
                 }
                 // The image a T-SQL trigger's event has no rows for.
                 if let Some(tr) = &self.unit.trigger {
@@ -3697,7 +4177,7 @@ impl<'a> Canon<'a> {
                 if !cols.is_empty() {
                     return Err("derived column lists are not supported".into());
                 }
-                if self.d == Dialect::Postgres {
+                if self.d == Dialect::Postgres && query.ctes.is_empty() {
                     if let Some((src, fields)) = pg_json_rows(query) {
                         return self.json_rows(src, &fields, alias);
                     }
@@ -3914,6 +4394,9 @@ impl<'a> Canon<'a> {
 
     /// Query parts without the select list, plus the select items.
     fn query_parts(&mut self, s: &Select, ctx: QCtx) -> R<Parts> {
+        if !s.ctes.is_empty() {
+            return self.with_ctes(s, |c, body| c.query_parts(body, ctx));
+        }
         if !s.set_ops.is_empty() {
             return self.set_query(s, ctx);
         }
@@ -4674,6 +5157,9 @@ impl<'a> Canon<'a> {
         self.seen_tables.clear();
         self.single_row = false;
         match s {
+            Stmt::Select(sel) if !sel.ctes.is_empty() => {
+                self.with_ctes(sel, |c, body| c.select_stmt(body))
+            }
             Stmt::Select(sel) => self.select_stmt(sel),
             Stmt::Insert {
                 target,
