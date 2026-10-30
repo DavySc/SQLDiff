@@ -4063,11 +4063,20 @@ def concatNullOn : Ast.Routine → Bool
   | .Routine _ _ _ _ _ _ (.Block _ body) =>
     (leadingSettings body).contains ("CONCAT_NULL_YIELDS_NULL", true)
 
-/-- The T-SQL routine has a parameter of a string type of the slice: the
-confirmation rests on the arguments fitting it (`ASM-TSQL-STRING-ARGS`,
-C2b). -/
+/-- The T-SQL routine has a parameter of a string type of the slice, or
+(C2c) a `smallint`, `bit`, `date` or `datetime2(p)` one: the confirmation
+rests on every argument a caller passes being a value of the
+parameter's type (`ASM-TSQL-STRING-ARGS`: a longer string is truncated,
+a `datetime2(7)` or `datetime` value rounded, an `int` narrowed or made
+0/1 on entry, where PostgreSQL's caller passes the value of its own
+type). -/
+def typedArgParam (ty : Ast.Ty) : Bool :=
+  let d : Dialect := .tsql { rowCounts := false, routines := [] } ∅
+  (strTypeT ty).isSome || bitType d ty || dateType d ty || (tsType d ty).isSome ||
+    intWidth d ty == some .i16
+
 def tsqlStringParams : Ast.Routine → Bool
-  | .Routine _ _ params _ _ _ _ => params.any fun | .Param _ ty _ _ => (strTypeT ty).isSome
+  | .Routine _ _ params _ _ _ _ => params.any fun | .Param _ ty _ _ => typedArgParam ty
 
 /-- The T-SQL routine has a transaction statement (C4): `BEGIN TRAN`,
 `COMMIT`, or the `ROLLBACK` of the rollback-and-rethrow idiom. -/
