@@ -94,6 +94,13 @@ decodes as before, so the format stays backward compatible; an older
 checker answers a request with them "the catalog does not decode". No new
 answer field or residual: a confirmation over string columns is a
 `"c3a"`/`"c3b"` answer whose residual names the C2b facts it uses.
+
+0.12.0: T-SQL and PL/pgSQL `COMMIT` lower to nothing (they changed
+nothing a finished call shows before either), so a conversion with a
+`COMMIT` after each statement T-SQL commits on its own (autocommit) is
+read like one without. The residual and the `"errors":"c4"` field now
+also come from the PL/pgSQL routine's `COMMIT`s, so such a confirmation
+still names `ASM-NO-CALLER-TXN`. Request format unchanged.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -130,7 +137,7 @@ def handle (line : String) : String :=
       else if p == mirrorProtocol && da == "mirror" then
         -- The same ten fields: kind, deployment, catalog, certificate, routines.
         let a := Sqldiff.Mirror.Request.answer schema ta xa db tb xb
-        answerLine id a (Sqldiff.Mirror.Request.extra ta xa tb a)
+        answerLine id a (Sqldiff.Mirror.Request.extra ta xa tb xb a)
       else
         answerLine "0" (.unconfirmed "malformed request")
     else
@@ -147,7 +154,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.11.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.12.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0
