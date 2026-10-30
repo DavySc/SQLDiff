@@ -1253,11 +1253,11 @@ fn same_stmt(
     Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| compare::mismatch_text(m)))
 }
 
-/// The rest of the line from byte `off`, white space trimmed.
 /// Constraint names are scoped differently: T-SQL keeps every constraint
-/// name in `sys.objects`, unique per schema (Msg 2714); PostgreSQL wants a
-/// constraint name unique per table, and a PRIMARY KEY or UNIQUE name, which
-/// is also its index's name, unique among the schema's tables and indexes.
+/// name, DEFAULT ones included, in `sys.objects` with the tables, unique per
+/// schema (Msg 2714); PostgreSQL wants a constraint name unique per table,
+/// and a PRIMARY KEY or UNIQUE name, which is also its index's name, unique
+/// among the schema's tables and indexes.
 /// A file that reuses a name where either side refuses it is not compared:
 /// the other side may well accept it.
 fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outcome) {
@@ -1274,6 +1274,8 @@ fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outc
     let mut named: Vec<(Option<String>, String, String, bool, usize)> = Vec::new();
     // Tables and indexes: relations of the schema.
     let mut relations: Vec<(Option<String>, String)> = Vec::new();
+    // T-SQL: the names in `sys.objects` (tables and every named constraint).
+    let mut objects: Vec<(Option<String>, String, usize)> = Vec::new();
     for (n, _) in &u.tables {
         let toks = ast::tokens(n);
         let Ok(t) = table::parse(&toks, d) else {
@@ -1283,11 +1285,27 @@ fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outc
             continue;
         };
         relations.push((schema.clone(), tname.clone()));
+        if !pg {
+            objects.push((
+                schema.clone(),
+                tname.clone(),
+                toks.first().map_or(0, |t| t.off),
+            ));
+            // `CONSTRAINT n` anywhere in the table: keys, checks and the
+            // column defaults, whose names the table's parse does not keep.
+            for w in toks.windows(2) {
+                if table::word(Some(&w[0]), "CONSTRAINT") {
+                    if let Some(cn) = table::name_of(&w[1]).as_ref().and_then(norm) {
+                        objects.push((schema.clone(), cn, w[1].off));
+                    }
+                }
+            }
+        }
         let keys = t.keys.iter().map(|k| (&k.name, true, k.off));
         let fks = t.fks.iter().map(|f| (&f.name, false, f.off));
         let checks = t.checks.iter().map(|c| (&c.name, false, c.off));
         for (cn, ix, off) in keys.chain(fks).chain(checks) {
-            if let Some(cn) = cn.as_ref().and_then(&norm) {
+            if let Some(cn) = cn.as_ref().and_then(norm) {
                 named.push((schema.clone(), tname.clone(), cn, ix, off));
             }
         }
@@ -1300,7 +1318,15 @@ fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outc
                     continue;
                 };
                 let ix = matches!(c.added, ddl::Added::Key(_));
+                objects.push((schema.clone(), cn.clone(), c.off));
                 named.push((schema, tname, cn, ix, c.off));
+            }
+            Ok(ddl::Ddl::Default(x)) => {
+                if let (Ok((schema, _)), Some(cn)) =
+                    (ddl::stored_key(&x.table, d), x.name.as_ref().and_then(norm))
+                {
+                    objects.push((schema, cn, x.off));
+                }
             }
             Ok(ddl::Ddl::Index(ix)) => {
                 if let (Ok((schema, _)), Some(n)) = (ddl::stored_key(&ix.table, d), norm(&ix.name))
@@ -1320,9 +1346,7 @@ fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outc
                 .map(|(_, o)| o)
         };
         let why = if !pg {
-            others()
-                .any(|o| o.0 == *schema && o.2 == *cn)
-                .then_some("T-SQL constraint names are unique per schema, so SQL Server refuses one of them (Msg 2714)")
+            None
         } else if others().any(|o| o.0 == *schema && o.1 == *tname && o.2 == *cn) {
             Some("PostgreSQL refuses a second constraint of that name on the table")
         } else if *ix
@@ -1340,8 +1364,17 @@ fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outc
             ));
         }
     }
+    for (i, (schema, cn, off)) in objects.iter().enumerate() {
+        if objects[..i].iter().any(|o| o.0 == *schema && o.1 == *cn) {
+            out.unknown_reasons.push(format!(
+                "{name} line {}: the name {cn} is used again in this schema and is not compared: T-SQL constraint names are unique per schema among its tables and constraints, so SQL Server refuses it (Msg 2714)",
+                line_at(side, *off).start_line
+            ));
+        }
+    }
 }
 
+/// The rest of the line from byte `off`, white space trimmed.
 fn line_at(side: &Analyzed, off: usize) -> crate::model::Location {
     let text = &side.artifact.text;
     let off = off.min(text.len());

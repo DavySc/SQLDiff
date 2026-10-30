@@ -240,4 +240,19 @@ fn constraint_names_reused_where_one_side_refuses_them_are_not_compared() {
     let t = "CREATE TABLE dbo.A (id int NOT NULL PRIMARY KEY);\nGO\nCREATE TABLE dbo.B (id int NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES dbo.A (id));\nGO\nCREATE TABLE dbo.C (id int NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES dbo.A (id));\n";
     let p = "CREATE TABLE A (id integer NOT NULL PRIMARY KEY);\nCREATE TABLE B (id integer NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES A (id));\nCREATE TABLE C (id integer NOT NULL, CONSTRAINT FK_X FOREIGN KEY (id) REFERENCES A (id));\n";
     unknown(t, p, "Msg 2714");
+    // A constraint named like a table, or like a DEFAULT constraint: one
+    // `sys.objects` namespace in SQL Server.
+    let (t, p) = script(
+        "ALTER TABLE dbo.Customer ADD CONSTRAINT Sale UNIQUE (id);",
+        "ALTER TABLE Customer ADD CONSTRAINT Sale_k UNIQUE (id);",
+    );
+    unknown(&t, &p, "Msg 2714");
+    let (t, p) = script(
+        "ALTER TABLE dbo.Sale ADD CONSTRAINT DF_X DEFAULT (0) FOR note;\nGO\nALTER TABLE dbo.Customer ADD CONSTRAINT DF_X UNIQUE (id);",
+        "ALTER TABLE Sale ALTER COLUMN note SET DEFAULT 0;\nALTER TABLE Customer ADD CONSTRAINT DF_X UNIQUE (id);",
+    );
+    unknown(&t, &p, "Msg 2714");
+    let t = "CREATE TABLE dbo.A (id int NOT NULL, n int NOT NULL CONSTRAINT DF_X DEFAULT (0));\nGO\nALTER TABLE dbo.A ADD CONSTRAINT DF_X UNIQUE (id);\n";
+    let p = "CREATE TABLE A (id integer NOT NULL, n integer NOT NULL DEFAULT 0);\nALTER TABLE A ADD CONSTRAINT DF_X UNIQUE (id);\n";
+    unknown(t, p, "Msg 2714");
 }
