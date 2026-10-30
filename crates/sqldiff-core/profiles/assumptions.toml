@@ -142,6 +142,13 @@ fact = "A file that parses without placeholders; until then a reviewer reads the
 sites = ["sqldiff-core/src/bind/doubt.rs"]
 
 [[assumption]]
+id = "ASM-BIT-BOOLEAN"
+statement = "Code and applications outside the conversion that read or write a converted bit use false and true where T-SQL used 0 and 1."
+discharge = "deployment"
+fact = "BIT becomes boolean, the default PostgreSQL mapping (decided by the owner 2026-10-30); the callers are adapted with the deployment."
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
 id = "ASM-BIT-BOOLEAN-COLUMN"
 statement = "The T-SQL bit column's 0 and 1 are the PostgreSQL boolean column's false and true."
 discharge = "deployment"
