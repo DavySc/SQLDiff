@@ -460,6 +460,49 @@ pub fn convert_with(
     out: Option<&Path>,
     hooks: &Hooks,
 ) -> Result<Tree, String> {
+    convert_kept(a, inputs, unreadable, out, hooks, false)
+}
+
+/// [`convert_with`] for a review, which reads of the engine's reports only
+/// their findings and assumptions: the rest of each file's reports is
+/// dropped as soon as the file is checked (`crate::trim_reports`), so a
+/// large tree is never held whole. The report and every status are the
+/// same. Every other caller gets the reports whole from `convert_with`.
+pub fn convert_for_review(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: Option<&Path>,
+    hooks: &Hooks,
+) -> Result<Tree, String> {
+    convert_kept(a, inputs, unreadable, out, hooks, true)
+}
+
+/// What is kept of each file as it is checked: its notes, shared with the
+/// tree's (`shared::Pool`), and with `trim` only what a review reads of the
+/// engine's reports.
+struct Finish {
+    pool: crate::shared::Pool,
+    trim: bool,
+}
+
+impl Finish {
+    fn apply(&self, c: &mut Conversion) {
+        self.pool.share_notes(c);
+        if self.trim {
+            crate::trim_reports(c);
+        }
+    }
+}
+
+fn convert_kept(
+    a: &Args,
+    inputs: &[Input],
+    unreadable: Vec<String>,
+    out: Option<&Path>,
+    hooks: &Hooks,
+    trim: bool,
+) -> Result<Tree, String> {
     let started = Instant::now();
     if !crate::supported(a.from, a.to) {
         return Err(format!(
@@ -498,9 +541,32 @@ pub fn convert_with(
             hooks,
         )?),
     };
+    let finish = Finish {
+        pool: Default::default(),
+        trim,
+    };
     let results = match &a.template {
-        None => convert_files(a, label, inputs, jobs, ledger, base.as_ref(), hooks)?,
-        Some(tm) => convert_templates(a, label, tm, inputs, jobs, ledger, base.as_ref(), hooks)?,
+        None => convert_files(
+            a,
+            label,
+            inputs,
+            jobs,
+            ledger,
+            base.as_ref(),
+            hooks,
+            &finish,
+        )?,
+        Some(tm) => convert_templates(
+            a,
+            label,
+            tm,
+            inputs,
+            jobs,
+            ledger,
+            base.as_ref(),
+            hooks,
+            &finish,
+        )?,
     };
     let mut results = results;
     if let Some(b) = &base {
@@ -632,6 +698,7 @@ pub(crate) fn dest_under(out: &Path, rel: &str) -> Result<PathBuf, String> {
 
 /// Converts plain SQL files: rules with the source catalog of the whole
 /// tree, then a check of every draft against both trees' catalogs.
+#[allow(clippy::too_many_arguments)]
 fn convert_files(
     a: &Args,
     out: &Path,
@@ -640,6 +707,7 @@ fn convert_files(
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
     hooks: &Hooks,
+    finish: &Finish,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     // Catalogs from the whole tree, so names defined in other files bind:
     // the source catalog also lets the rules see other files' procedures.
@@ -718,7 +786,8 @@ fn convert_files(
             return None;
         }
         let t = Instant::now();
-        let c = crate::check(&input.text, draft, &opts);
+        let mut c = crate::check(&input.text, draft, &opts);
+        finish.apply(&mut c);
         progress.tick();
         Some((c, t.elapsed().as_secs_f64()))
     });
@@ -753,13 +822,13 @@ fn hand_note(r: &crate::review::Record, unchecked: bool) -> crate::Note {
         crate::Note {
             status: Status::Unproven,
             rule: "hand-written.unchecked".into(),
-            text: format!("Written by hand by {who}. A template unit written by hand is not checked by convert: the instance check (`sqldiff instances`) judges it."),
+            text: format!("Written by hand by {who}. A template unit written by hand is not checked by convert: the instance check (`sqldiff instances`) judges it.").into(),
         }
     } else {
         crate::Note {
             status: Status::Assumptions,
             rule: "ASM-HAND-WRITTEN".into(),
-            text: format!("Written by hand by {who}; checked like the rules' output. The check allows the same dialect mappings it allows the rules (a dropped `dbo` schema, mapped types), which a text written by hand may lean on without saying so; the rules' assumptions and decisions for this unit are kept. Accept this once the text has been read against the source."),
+            text: format!("Written by hand by {who}; checked like the rules' output. The check allows the same dialect mappings it allows the rules (a dropped `dbo` schema, mapped types), which a text written by hand may lean on without saying so; the rules' assumptions and decisions for this unit are kept. Accept this once the text has been read against the source.").into(),
         }
     }
 }
@@ -794,7 +863,8 @@ fn hand_written_draft(l: &crate::review::Ledger, i: &Input, d: &mut crate::Draft
                     crate::Note {
                         status: Status::Differs,
                         rule: "review.text-not-applied".into(),
-                        text: format!("The hand-written text for this unit was not applied: {e}."),
+                        text: format!("The hand-written text for this unit was not applied: {e}.")
+                            .into(),
                     },
                 );
             }
@@ -824,7 +894,8 @@ fn hand_written_template(l: &crate::review::Ledger, i: &Input, c: &mut Conversio
                 .map(|e| crate::Note {
                     status: Status::Differs,
                     rule: "review.text-not-applied".into(),
-                    text: format!("The hand-written text for this unit was not applied: {e}."),
+                    text: format!("The hand-written text for this unit was not applied: {e}.")
+                        .into(),
                 })
         } else {
             None
@@ -948,6 +1019,7 @@ fn convert_templates(
     ledger: Option<&crate::review::Ledger>,
     base: Option<&crate::base::Base>,
     hooks: &Hooks,
+    finish: &Finish,
 ) -> Result<Vec<(Conversion, f64)>, String> {
     let mut parsed: Vec<(Template, sqldiff_core::composition::PlaceholderBasis)> = Vec::new();
     for i in inputs {
@@ -1090,7 +1162,8 @@ fn convert_templates(
             return None;
         }
         let t0 = Instant::now();
-        let c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
+        let mut c = crate::check_template(&j.template, draft, &stand, &opts, j.basis, delimiters);
+        finish.apply(&mut c);
         progress.tick();
         Some((c, t0.elapsed().as_secs_f64()))
     });
@@ -1512,7 +1585,10 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
     let (mut units, mut converted_units) = (Vec::new(), Vec::new());
     for ((u, &l), id) in c.units.iter().zip(lines).zip(ids) {
         let worst: Vec<&crate::Note> = u.notes.iter().filter(|n| n.status == u.status).collect();
-        let mut reason = worst.first().map(|n| n.text.clone()).unwrap_or_default();
+        let mut reason = worst
+            .first()
+            .map(|n| n.text.to_string())
+            .unwrap_or_default();
         if reason.is_empty() && u.status == Status::Differs {
             // The engine's diff found it: say what.
             reason = u
@@ -1544,7 +1620,7 @@ fn file_report(rel: &str, input: &str, c: &Conversion, lines: &[usize], secs: f6
             } else if worst.is_empty() {
                 vec!["engine".to_string()]
             } else {
-                worst.iter().map(|n| n.rule.clone()).collect()
+                worst.iter().map(|n| n.rule.to_string()).collect()
             },
             reason,
             findings,

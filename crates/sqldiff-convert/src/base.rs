@@ -386,9 +386,12 @@ fn why(c: &Conversion, u: &crate::Unit) -> (Vec<String>, String) {
     let rules = if worst.is_empty() {
         vec!["engine".to_string()]
     } else {
-        worst.iter().map(|n| n.rule.clone()).collect()
+        worst.iter().map(|n| n.rule.to_string()).collect()
     };
-    let mut reason = worst.first().map(|n| n.text.clone()).unwrap_or_default();
+    let mut reason = worst
+        .first()
+        .map(|n| n.text.to_string())
+        .unwrap_or_default();
     if reason.is_empty() {
         reason = u
             .findings
@@ -786,7 +789,7 @@ impl Base {
                     text: format!(
                         "Uses base objects whose own conversion is not plain: {}. The target catalog holds the rules' conversion of them, which may not be what the target has; the base catalogs report says why. Accept this once that is checked (a column or alias named like one of them also counts).",
                         hit.join("; ")
-                    ),
+                    ).into(),
                 });
                 u.status = u.status.max(Status::Assumptions);
                 changed = true;

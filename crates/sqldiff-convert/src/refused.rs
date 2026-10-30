@@ -443,7 +443,7 @@ impl StandIns {
                     text: format!(
                         "Uses tables whose CREATE TABLE was not converted, or views over them: {}. The statement holds once the target table is created with the stand-in's columns and types; accept this when it is (a column or alias named like the table also counts).",
                         parts.join("; ")
-                    ),
+                    ).into(),
                 });
                 if !touched.is_empty() {
                     let at = u.notes.partition_point(|n| n.status >= Status::Unproven);
@@ -455,7 +455,7 @@ impl StandIns {
                             text: format!(
                                 "May use a refused column, whose target form is not known, so this is not compared: {}.",
                                 touched.join("; ")
-                            ),
+                            ).into(),
                         },
                     );
                     u.status = u.status.max(Status::Unproven);

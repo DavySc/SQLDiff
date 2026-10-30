@@ -27,7 +27,10 @@ fn has_rule(u: &Unit, rule: &str) -> bool {
 }
 
 fn reason(u: &Unit) -> String {
-    u.notes.first().map(|n| n.text.clone()).unwrap_or_default()
+    u.notes
+        .first()
+        .map(|n| n.text.to_string())
+        .unwrap_or_default()
 }
 
 fn proc(body: &str) -> String {

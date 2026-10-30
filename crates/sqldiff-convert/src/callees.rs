@@ -138,7 +138,7 @@ pub fn resolve(inputs: &[Input], convs: &mut [&mut Conversion], from: Dialect) {
                                     Note {
                                         status: Status::Unproven,
                                         rule: CALLEE_RULE.into(),
-                                        text,
+                                        text: text.into(),
                                     },
                                 );
                                 changed = true;

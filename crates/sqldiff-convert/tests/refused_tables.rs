@@ -69,7 +69,7 @@ fn units(t: &Tree, path: &str) -> Vec<(Status, Vec<String>)> {
         .units
         .iter()
         .map(|u| {
-            let mut r: Vec<String> = u.notes.iter().map(|n| n.rule.clone()).collect();
+            let mut r: Vec<String> = u.notes.iter().map(|n| n.rule.to_string()).collect();
             r.extend(
                 u.findings
                     .iter()

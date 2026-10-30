@@ -284,9 +284,11 @@ pub struct Trusted {
     pub row_counts: bool,
     /// The deployment profile accepts [`BINARY_COLLATION`].
     pub binary_collation: bool,
-    /// The T-SQL routines the source tree declares, names as written: under
-    /// a binary collation names are case-sensitive, so a call reaches a
-    /// declared routine only when spelled exactly as declared.
+    /// The T-SQL routines the source tree declares, names as written. A call
+    /// is mapped only when spelt exactly as declared, whatever the collation
+    /// the deployment states: in a case-sensitive SQL Server database
+    /// `EXEC dbo.LOOK` does not reach `dbo.look` (2812), while PostgreSQL
+    /// folds both (eval/queries/callee-case-*).
     pub declared_routines: Vec<Vec<String>>,
     /// The routines of the whole converted tree, read back from the output:
     /// the target catalog a call is checked against (a callee may be in
@@ -1286,7 +1288,10 @@ fn request_with(
     let mut routines = Vec::new();
     for c in calls {
         // Not mapped, the call stays unknown to the checker, which refuses.
-        if !mappable(&c) || (trusted.binary_collation && !trusted.declared_routines.contains(&c)) {
+        // Spelt exactly as declared, as tables are below: a case-sensitive
+        // database need not have a binary collation, so the deployment's
+        // collation fact cannot vouch for another spelling.
+        if !mappable(&c) || !trusted.declared_routines.contains(&c) {
             continue;
         }
         let (to, dbo) = target_routine(&c);
@@ -1858,7 +1863,10 @@ END
             a[1].2.as_ref().unwrap(),
             b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
             &readable,
-            &Trusted::default(),
+            &Trusted {
+                declared_routines: declared_routines(&[src], Dialect::Tsql),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(req.routines, [("dbo.q".to_string(), "q".to_string())]);
@@ -1871,6 +1879,41 @@ END
         let line = req.line(9).unwrap();
         assert!(line.starts_with("sqldiff-check/3\t9\t"), "{line}");
         assert_eq!(line.split('\t').count(), 10, "{line}");
+    }
+
+    #[test]
+    fn a_callee_is_mapped_only_as_declared_brackets_aside() {
+        let mapped = |decl: &str, call: &str| {
+            let src = format!(
+                "CREATE PROCEDURE {decl} @n int AS BEGIN SET @n = @n + 1; END\nGO\n\
+                 CREATE PROCEDURE dbo.p AS BEGIN DECLARE @v int = 1; EXEC {call} @v; END\n"
+            );
+            let out = crate::rewrite(&src, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string();
+            let (a, b) = (
+                routines(&src, Dialect::Tsql),
+                routines(&out, Dialect::Postgres),
+            );
+            let trusted = Trusted {
+                declared_routines: declared_routines(&[&src], Dialect::Tsql),
+                ..Default::default()
+            };
+            let (req, _) = mirror_request(
+                a[1].2.as_ref().unwrap(),
+                b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
+                &[],
+                &trusted,
+            )
+            .unwrap();
+            !req.routines.is_empty()
+        };
+        assert!(mapped("dbo.Look", "dbo.Look"));
+        assert!(mapped("[dbo].[Look]", "dbo.Look"));
+        assert!(mapped("dbo.Look", "[dbo].[Look]"));
+        // 2812 in a case-sensitive database (eval/queries/callee-case-mssql.out).
+        assert!(!mapped("dbo.Look", "dbo.LOOK"));
+        assert!(!mapped("dbo.Look", "DBO.Look"));
     }
 
     #[test]
@@ -2411,20 +2454,37 @@ END
             .remove(0)
             .2
             .unwrap_or_else(|e| panic!("{e}\n{out}"));
-        let (req, asm) = mirror_request(&a, &b, &[], &Trusted::default()).unwrap();
+        let declared = |names: &[&[&str]]| Trusted {
+            declared_routines: names
+                .iter()
+                .map(|n| n.iter().map(|p| p.to_string()).collect())
+                .collect(),
+            ..Default::default()
+        };
+        let all = declared(&[&["q"], &["dbo", "r"], &["dbo", "Ärger"]]);
+        let (req, asm) = mirror_request(&a, &b, &[], &all).unwrap();
         // `q` resolves through sales first in T-SQL; Ä folds differently.
         assert_eq!(req.routines, [("dbo.r".to_string(), "r".to_string())]);
         assert!(
             asm.iter().any(|x| x == "ASM-CALLEE-CONFIRMED:dbo.r"),
             "{asm:?}"
         );
-        // Under a binary collation only the declared spelling reaches it.
-        let bin = Trusted {
-            binary_collation: true,
-            declared_routines: vec![vec!["dbo".into(), "R".into()]],
-            ..Default::default()
-        };
-        let (req, _) = mirror_request(&a, &b, &[], &bin).unwrap();
+        // A callee the tree does not declare stays unknown.
+        let (req, _) = mirror_request(&a, &b, &[], &Trusted::default()).unwrap();
+        assert!(req.routines.is_empty(), "{:?}", req.routines);
+        // Only the declared spelling reaches it, whatever the collation: a
+        // case-sensitive database raises 2812 for `dbo.r` against `dbo.R`
+        // (eval/queries/callee-case-mssql.out), binary collation or not.
+        for binary_collation in [false, true] {
+            let other = Trusted {
+                binary_collation,
+                ..declared(&[&["dbo", "R"]])
+            };
+            let (req, _) = mirror_request(&a, &b, &[], &other).unwrap();
+            assert!(req.routines.is_empty(), "{:?}", req.routines);
+        }
+        let schema = declared(&[&["DBO", "r"]]);
+        let (req, _) = mirror_request(&a, &b, &[], &schema).unwrap();
         assert!(req.routines.is_empty(), "{:?}", req.routines);
     }
 

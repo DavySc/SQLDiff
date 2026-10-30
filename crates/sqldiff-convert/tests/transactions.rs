@@ -64,7 +64,7 @@ fn decisions(c: &Conversion) -> Vec<String> {
         .iter()
         .flat_map(|u| &u.notes)
         .filter(|n| n.status == Status::Decision)
-        .map(|n| n.rule.clone())
+        .map(|n| n.rule.to_string())
         .collect()
 }
 

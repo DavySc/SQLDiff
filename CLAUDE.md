@@ -36,7 +36,64 @@ coordinate through GitHub, which every session can read:
   you will.
 - **Do not start an item or change an area another open PR claims.** If you
   must, comment on that PR first and wait for an answer.
+- **A claim ends when its PR merges or closes.** After that the area is free:
+  change it without asking, but merge `main` first and build on the merged
+  work (its tests, behaviour and doc comments), not on the code as it was
+  before.
 - **When done**, mark the PR ready for review and drop `[claim]` from the
   title. If you give the item up, close the draft with a line saying so.
 - Fixes that span claims (a false "equal" found in someone else's area) go
   in their own small PR naming the claim they touch.
+- A `[claim]` draft is not ready for review: reviewers leave it alone until
+  it is marked ready.
+
+## Accuracy rules every change keeps
+
+- **Never loosen the gate.** A statement the engine never compared does not
+  count as converted, and a wrong "equal" is worse than "not proven". Do not
+  trade correctness for speed or coverage without the owner's explicit OK.
+- **No new assumption without the owner's OK.** A new `ASM-*` id, or a wider
+  reading of an existing one, needs the owner's explicit approval before it
+  merges. Register it in `crates/sqldiff-core/profiles/assumptions.toml` and
+  regenerate `docs/assumptions.md` with
+  `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test assumptions`. An
+  assumption the owner withdrew is not proposed again without new evidence.
+- **An assumption says everything it covers.** When a change widens an
+  existing `ASM-*` id (with the owner's OK) to cover more cases (more types,
+  units or statements), update its text in the code and its statement and fact in
+  `assumptions.toml` so a reviewer who accepts it sees the new bounds; for
+  example ASM-DATEADD-RANGE names the datetime and smalldatetime ranges
+  since #225.
+- **Doc comments follow the code.** When a change alters what a function
+  proves or refuses, update its doc comment in the same commit, and keep a
+  `///` comment directly on the item it documents.
+- **Rule ids are registered.** Adding, renaming, removing or moving a
+  converter rule id means updating
+  `crates/sqldiff-core/profiles/rule-proofs.toml` and regenerating
+  `docs/proof-coverage.md` with
+  `SQLDIFF_BLESS=1 cargo test -p sqldiff-core --test rule_proofs`.
+- **Db2 means Db2 for i.** Nothing for Db2 for z/OS or Db2 LUW enters the
+  code, and their documentation is not evidence for Db2 for i behaviour.
+  Vendor facts get the next free `V<n>` in docs/vendor-facts-verification.md;
+  name it in your claim so two sessions do not take the same number.
+- **Private configuration stays out.** Packs and configs marked private never
+  go into the repository, CI or GitHub (docs/private-overlay.md).
+- **A test must observe what it proves.** An engine test whose assigned
+  variable is never read proves nothing; add an effect (a write, a SELECT)
+  after the statement under test.
+
+## Tests and builds
+
+- CI also runs on Windows with `core.autocrlf=true`. A test that reads a
+  file from the repository (fixtures, corpus, assets) must pass with CRLF
+  line endings: normalize them, or pin byte-compared files to LF in
+  `.gitattributes`.
+- The disk is small. Run tests with `TMPDIR` pointing at a directory in your
+  scratchpad (e.g. `TMPDIR=<scratchpad>/tt`), and delete `target/debug` when
+  the disk fills up. Rebuild after switching branches before trusting a
+  result.
+
+## Merging
+
+A PR merges once a session that did not write it has reviewed it and CI is
+green; nothing waits on the owner. Authors do not merge their own PRs.
