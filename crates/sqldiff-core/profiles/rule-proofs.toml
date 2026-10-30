@@ -811,6 +811,13 @@ note = "NULLS FIRST/LAST after T-SQL's placement (ASM-FACT-V19); the Db2 for i p
 sites = ["sqldiff-convert/src/tsql/paging.rs"]
 
 [[rule]]
+id = "tsql.parsename"
+kind = "converter"
+proof = "engine"
+note = "a refusal: PARSENAME the pattern form would read more than once is not converted"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
 id = "tsql.partition-scheme"
 kind = "converter"
 proof = "engine"
@@ -833,6 +840,13 @@ id = "tsql.openjson"
 kind = "converter"
 proof = "engine"
 note = "the note on an OPENJSON form that is not converted; it rewrites nothing"
+sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[rule]]
+id = "tsql.right"
+kind = "converter"
+proof = "engine"
+note = "a refusal: RIGHT of a computed string or count is not converted"
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[rule]]

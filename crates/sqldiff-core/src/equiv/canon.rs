@@ -30,6 +30,10 @@ type Parts = (Vec<Term>, Vec<(Term, Option<Ty>)>);
 /// The columns of a common table expression: name and type.
 type CteCols = Vec<(String, Option<Ty>)>;
 
+/// A whole number's size, `|v| <= m * L + k` as (m, k), where L is the most
+/// characters a string holds.
+type Bound = (u32, u64);
+
 /// Assumption identifiers and texts used by the equivalence rules.
 pub mod asm {
     pub const ROWCOUNT_FOUND: (&str, &str) = (
@@ -377,6 +381,9 @@ pub struct Canon<'a> {
     /// The common table expressions in scope, outermost first (see
     /// `cte_ref`).
     ctes: Vec<CteScope>,
+    /// Size bounds of a recursive CTE's integer columns while its recursive
+    /// member is lowered (`size_bound`): table, column, bound.
+    rec_bounds: Vec<(String, String, Bound)>,
 }
 
 /// A common table expression in scope while a statement is lowered.
@@ -723,6 +730,7 @@ impl<'a> Canon<'a> {
             cursor_cols: HashMap::new(),
             cursor_failed: HashMap::new(),
             ctes: Vec::new(),
+            rec_bounds: Vec::new(),
             by_name: false,
             fold_quoted: false,
             other: None,
@@ -735,6 +743,7 @@ impl<'a> Canon<'a> {
     pub fn reset(&mut self) {
         self.scopes.clear();
         self.ctes.clear();
+        self.rec_bounds.clear();
         self.asm.clear();
         self.discharged.clear();
         self.single_row = false;
@@ -1395,6 +1404,46 @@ impl<'a> Canon<'a> {
         None
     }
 
+    /// A bound on an integer term's size: a position in or length of a
+    /// string (CHARINDEX, strpos, LEN, length) is at most L, a literal its
+    /// value, a sum or difference the sum of the bounds, NULLIF its first
+    /// argument, COALESCE its largest argument, a recursive CTE's column
+    /// the bound its recursive member keeps (`rec_cte`).
+    fn size_bound(&self, t: &Term) -> Option<Bound> {
+        match t.head() {
+            "strpos" | "strlen" | "charlen" => Some((1, 0)),
+            "num" => {
+                let v: i64 = t.kid(0)?.atom()?.parse().ok()?;
+                Some((0, v.unsigned_abs()))
+            }
+            "neg" => self.size_bound(t.kid(0)?),
+            "add" | "sub" => {
+                let (x, y) = (self.size_bound(t.kid(0)?)?, self.size_bound(t.kid(1)?)?);
+                Some((x.0 + y.0, x.1.checked_add(y.1)?))
+            }
+            "fn" => match (t.kid(0)?.atom()?, t.kids()) {
+                ("nullif", [_, x, _]) => self.size_bound(x),
+                ("coalesce", [_, rest @ ..]) if !rest.is_empty() => {
+                    let mut b = (0, 0);
+                    for x in rest {
+                        let y = self.size_bound(x)?;
+                        b = (b.0.max(y.0), b.1.max(y.1));
+                    }
+                    Some(b)
+                }
+                _ => None,
+            },
+            "col" => {
+                let (tab, col) = (t.kid(0)?.atom()?, t.kid(1)?.atom()?);
+                self.rec_bounds
+                    .iter()
+                    .find(|(x, c, _)| x == tab && c == col)
+                    .map(|b| b.2)
+            }
+            _ => None,
+        }
+    }
+
     /// T-SQL CHARINDEX's type: bigint when the searched string is
     /// varchar(max) or nvarchar(max), int otherwise, unknown when that is
     /// not known (SQL Server 2022, eval/cte/2026-10-30/charindex-max).
@@ -1517,6 +1566,29 @@ impl<'a> Canon<'a> {
                 ),
                 None,
             ),
+            Expr::Call(c)
+                if self.d == Dialect::Postgres
+                    && c.name.len() == 1
+                    && c.name[0].eq_ignore_ascii_case("nullif")
+                    && pg_parsename(e).is_some() =>
+            {
+                let (x, k) = pg_parsename(e).unwrap();
+                let (v, ty) = self.expr(x)?;
+                if !ty.is_some_and(|t| t.fam == Fam::VarChar) {
+                    return Ok((n("dfn", vec![self.dtag(), a("parsename"), v]), None));
+                }
+                self.assume(asm::LEN_BMP);
+                // At most 128 characters, as T-SQL's nvarchar(128): each
+                // part's pattern takes 128, and undoubling only shortens.
+                (
+                    n("parsename", vec![v, n("num", vec![a(k.to_string())])]),
+                    Some(Ty {
+                        fam: Fam::VarChar,
+                        len: Some(128),
+                        scale: None,
+                    }),
+                )
+            }
             Expr::Call(c) => self.call(c)?,
             // The converter's CHARINDEX of a needle that may be empty:
             // strpos(s, x) - (length(x) = 0)::int, which is 0 for an empty
@@ -2016,6 +2088,17 @@ impl<'a> Canon<'a> {
         if let Some(src) = v.1 {
             if src == dst && src.fam != Fam::Other {
                 return v;
+            }
+            // A bigint no larger than a position in a string fits an int,
+            // which both dialects' cast keeps (and would refuse past it).
+            if src.fam == Fam::Int
+                && dst.fam == Fam::Int
+                && dst.len == Some(32)
+                && src.len.is_some_and(|l| l > 32)
+                && self.size_bound(&v.0).is_some_and(fits_int32)
+            {
+                self.assume(super::table::asm::VALUE_SIZE);
+                return (v.0, to);
             }
         }
         self.convert(dst, v, How::Cast)
@@ -2715,6 +2798,61 @@ impl<'a> Canon<'a> {
                 };
                 (n("substr", args.into_iter().map(|x| x.0).collect()), ty)
             }
+            // PARSENAME(x, k) of a string, k a literal from 1 to 4, against
+            // the converter's `parsename_pg(k)`: one term. The result is
+            // nvarchar(128).
+            (Dialect::Tsql, "parsename", 2)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && matches!(&c.args[1], Expr::Num(v) if matches!(v.as_str(), "1" | "2" | "3" | "4")) =>
+            {
+                self.assume(asm::LEN_BMP);
+                let (x, k) = (args[0].0.clone(), args[1].0.clone());
+                (
+                    n("parsename", vec![x, k]),
+                    Some(Ty {
+                        fam: Fam::VarChar,
+                        len: Some(128),
+                        scale: None,
+                    }),
+                )
+            }
+            // LEFT(s, n) is SUBSTRING(s, 1, n), RIGHT(s, n) is SUBSTRING(s,
+            // (characters of s) - n + 1, n), trailing spaces counted, a
+            // negative n an error (SQL Server 2022 against PostgreSQL 18's
+            // substr, 176 cases, eval/builtins/2026-10-30-lr). PostgreSQL's
+            // left and right take a negative n as "all but", so they agree
+            // only for a literal count from 0 up; the converter writes
+            // substr otherwise. varchar only, as for SUBSTRING.
+            (Dialect::Tsql, "left" | "right", 2)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && args[1]
+                        .1
+                        .is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l >= 2)) =>
+            {
+                self.assume(asm::LEN_BMP);
+                let (x, k) = (args[0].0.clone(), args[1].0.clone());
+                (substr_end(name == "right", x, k), first_ty)
+            }
+            (Dialect::Postgres, "left" | "right", 2)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && matches!(&c.args[1], Expr::Num(v) if v.parse::<u32>().is_ok()) =>
+            {
+                self.assume(asm::LEN_BMP);
+                let (x, k) = (args[0].0.clone(), args[1].0.clone());
+                (
+                    substr_end(name == "right", x, k),
+                    Some(Ty::of(Fam::VarChar)),
+                )
+            }
+            // length(s) of a varchar: its characters, trailing spaces
+            // counted (RIGHT's count, above).
+            (Dialect::Postgres, "length", 1)
+                if first_ty.is_some_and(|t| t.fam == Fam::VarChar)
+                    && !matches!(&c.args[0], Expr::Call(r) if r.name.len() == 1
+                        && r.name[0].eq_ignore_ascii_case("rtrim")) =>
+            {
+                (n("charlen", vec![args[0].0.clone()]), Some(INT32))
+            }
             (Dialect::Tsql, "isnull", 2) => {
                 // ISNULL takes the type of its first argument; it equals COALESCE
                 // when the replacement is stored in that type unchanged.
@@ -2802,13 +2940,18 @@ impl<'a> Canon<'a> {
             // (lowered in `expr`): equal for every needle, string and start,
             // NULL, empty, start < 1 or past the end included (SQL Server
             // 2022 against PostgreSQL 18 under a case-sensitive collation,
-            // eval/builtins/2026-10-30-am). A 32-bit start only: substr
-            // takes an integer.
+            // eval/builtins/2026-10-30-am). T-SQL takes a bigint start too
+            // (a position in a MAX string is one; past the end it gives 0,
+            // eval/cte/2026-10-30/charindex-max-tsql); PostgreSQL's substr
+            // takes an integer, which its side checks, so equal start terms
+            // hold the same value.
             (Dialect::Tsql, "charindex", 3)
                 if args[..2]
                     .iter()
                     .all(|x| x.1.is_some_and(|t| t.fam == Fam::VarChar))
-                    && is_int32(&args[2].1) =>
+                    && args[2]
+                        .1
+                        .is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| l >= 2)) =>
             {
                 let ci = self.collation_marker();
                 self.assume(asm::LEN_BMP);
@@ -3151,6 +3294,22 @@ impl<'a> Canon<'a> {
     /// cast to date, which turns PostgreSQL's timestamp result of a date
     /// plus an interval back into a date. `None` for any other sum.
     fn pg_date_add(&mut self, l: &Expr, r: &Expr, to_date: bool) -> R<Option<(Term, Option<Ty>)>> {
+        // The operands are lowered again when this is not DATEADD: a table
+        // they read must keep its occurrence number.
+        let seen = self.seen_tables.clone();
+        let t = self.pg_date_add_once(l, r, to_date)?;
+        if t.is_none() {
+            self.seen_tables = seen;
+        }
+        Ok(t)
+    }
+
+    fn pg_date_add_once(
+        &mut self,
+        l: &Expr,
+        r: &Expr,
+        to_date: bool,
+    ) -> R<Option<(Term, Option<Ty>)>> {
         let interval = match r {
             Expr::Call(c) if is_make_interval(c) => Some(c),
             _ => None,
@@ -3326,6 +3485,27 @@ impl<'a> Canon<'a> {
     /// T-SQL requires an ORDER BY for.
     fn window(&mut self, c: &Call) -> R<(Term, Option<Ty>)> {
         let name = lc(c.name.last().map(String::as_str).unwrap_or(""));
+        // ROW_NUMBER() OVER (ORDER BY keys): a bigint in both dialects. Rows
+        // with equal keys are numbered in any order, so the numbers agree
+        // only when the keys are unique (ASM-ORDER-TOTAL); each key's NULL
+        // placement is compared as in a query's ORDER BY.
+        if c.name.len() == 1 && name == "row_number" {
+            if !c.args.is_empty() || c.order.is_empty() || c.distinct || c.star || c.within_group {
+                return Err(
+                    "row_number() OVER without ORDER BY, or with arguments, is not supported"
+                        .into(),
+                );
+            }
+            let order = self.order_terms(&c.order, None)?;
+            self.assume(asm::ORDER_TOTAL);
+            return Ok((
+                n("win", vec![n("rownum", order)]),
+                Some(Ty {
+                    len: Some(64),
+                    ..INT32
+                }),
+            ));
+        }
         if c.name.len() != 1 || !matches!(name.as_str(), "count" | "min" | "max" | "sum" | "avg") {
             return Err(format!("{name}() OVER is not supported"));
         }
@@ -4088,17 +4268,61 @@ impl<'a> Canon<'a> {
             .count();
         let k = self.ctes.len() - 1;
         let table = format!("rec:{depth}");
-        self.ctes[k] = CteScope::Rec {
-            key: key.to_string(),
-            table: table.clone(),
-            cols: typed.clone(),
-            read: false,
+        // Each integer column is first taken to stay within its anchor
+        // value's size bound. A column whose recursive value, under those
+        // bounds, may be larger loses its bound and the member is lowered
+        // again; the bounds left hold for every row by induction on the
+        // recursion depth.
+        let mut bounds: Vec<Option<Bound>> = ia
+            .iter()
+            .zip(&typed)
+            .map(|(v, (_, ty))| {
+                (ty.fam == Fam::Int)
+                    .then(|| v.kid(0).and_then(|v| self.size_bound(v)))
+                    .flatten()
+            })
+            .collect();
+        let (mut ps, is) = loop {
+            let outer = self.rec_bounds.len();
+            for ((c, _), b) in typed.iter().zip(&bounds) {
+                if let Some(b) = b {
+                    self.rec_bounds.push((table.clone(), c.clone(), *b));
+                }
+            }
+            self.ctes[k] = CteScope::Rec {
+                key: key.to_string(),
+                table: table.clone(),
+                cols: typed.clone(),
+                read: false,
+            };
+            let step_parts = self.query_parts(step, QCtx::Set);
+            self.ctes[k] = CteScope::Own {
+                key: key.to_string(),
+            };
+            let kept: Vec<bool> = match &step_parts {
+                Ok((_, is)) => is
+                    .iter()
+                    .zip(&bounds)
+                    .map(
+                        |((v, _), b)| match (b, v.kid(0).and_then(|v| self.size_bound(v))) {
+                            (None, _) => true,
+                            (Some(b), Some(s)) => s.0 <= b.0 && s.1 <= b.1,
+                            (Some(_), None) => false,
+                        },
+                    )
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            self.rec_bounds.truncate(outer);
+            if kept.iter().all(|&x| x) {
+                break step_parts?;
+            }
+            for (b, keep) in bounds.iter_mut().zip(kept) {
+                if !keep {
+                    *b = None;
+                }
+            }
         };
-        let step_parts = self.query_parts(step, QCtx::Set);
-        self.ctes[k] = CteScope::Own {
-            key: key.to_string(),
-        };
-        let (mut ps, is) = step_parts?;
         if is.len() != typed.len() {
             return Err(format!(
                 "the recursive CTE `{key}`: anchor and recursive member return different numbers of columns"
@@ -7082,6 +7306,29 @@ fn charindex_sub<'e>(l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
 }
 
 /// An integer of at most 32 bits that is not a T-SQL bit.
+/// `(substr s 1 n)` for LEFT, `(substr s (charlen(s) - n + 1) n)` for
+/// RIGHT: the terms PostgreSQL's substr forms lower to.
+fn substr_end(right: bool, s: Term, k: Term) -> Term {
+    let start = if right {
+        let mut v = vec![
+            n("sub", vec![n("charlen", vec![s.clone()]), k.clone()]),
+            n("num", vec![a("1")]),
+        ];
+        v.sort();
+        n("add", v)
+    } else {
+        n("num", vec![a("1")])
+    };
+    n("substr", vec![s, start, k])
+}
+
+/// Whether a size bound keeps a value within int: a string holds fewer
+/// than 2^30 characters (ASM-VALUE-SIZE-1GB: at most 1 GB, a character at
+/// least a byte), so `L + k` with k below 2^30 is below 2^31.
+fn fits_int32(b: Bound) -> bool {
+    b.0 <= 1 && b.1 < 1 << 30
+}
+
 fn is_int32(t: &Option<Ty>) -> bool {
     t.is_some_and(|t| t.fam == Fam::Int && t.len.is_some_and(|l| (2..=32).contains(&l)))
 }
@@ -7756,6 +8003,50 @@ pub const ISO126_PG: &str = "CASE WHEN regexp_like(__x__, '^(?!0000)[0-9]{4}-(0[
 /// is not JSON, where ISJSON gives 0).
 pub const ISJSON_PG: &str = "CASE WHEN __x__ IS NULL THEN NULL WHEN json_typeof(CAST(__x__ AS json)) IN ('object', 'array') THEN 1 ELSE 0 END";
 
+/// The PostgreSQL form of T-SQL `PARSENAME(x, k)` for k from 1 to 4.
+/// PARSENAME reads x as a name of up to four parts joined by `.`, each
+/// `[…]` (`]]` for `]`), `"…"` (`""` for `"`) or plain (no `.`, `[`, `]`
+/// or `"`; the last one not empty), every part at most 128 characters
+/// once unquoted; the k-th part from the right, unquoted, is the result,
+/// and NULL when it is empty, missing or the name is not one. The form
+/// matches the name against one regular expression per way the k-th part
+/// can be written, capturing its text. Equal to PARSENAME on all 19,608
+/// strings of up to five characters from `ab.[]" ` and on long, empty,
+/// escaped and non-ASCII parts (SQL Server 2022 against PostgreSQL 18,
+/// eval/builtins/2026-10-30-parsename); lengths are characters under
+/// ASM-TSQL-LEN-BMP.
+pub fn parsename_pg(k: u32) -> String {
+    let bracket = r"\[(?:[^]]|]]){0,128}]";
+    let quoted = r#""(?:[^"]|""){0,128}""#;
+    let plain = |last: bool| format!(r#"[^].["]{{{},128}}"#, u32::from(last));
+    let regex = |kind: char| {
+        let part = |i: u32| {
+            if i != k {
+                return format!("(?:{bracket}|{quoted}|{})", plain(i == 1));
+            }
+            match kind {
+                '[' => r"\[((?:[^]]|]]){0,128})]".to_string(),
+                '"' => r#""((?:[^"]|""){0,128})""#.to_string(),
+                _ => format!("({})", plain(i == 1)),
+            }
+        };
+        let r = format!(
+            r"^(?:(?:(?:{}\.)?{}\.)?{}\.)?{}$",
+            part(4),
+            part(3),
+            part(2),
+            part(1)
+        );
+        format!("substring(__x__, '{}')", r.replace('\'', "''"))
+    };
+    format!(
+        r#"NULLIF(COALESCE(replace({}, ']]', ']'), replace({}, '""', '"'), {}), '')"#,
+        regex('['),
+        regex('"'),
+        regex('.')
+    )
+}
+
 /// `template` with `__x__` replaced by the text `x` (parenthesized unless
 /// it is a plain name).
 pub fn pg_template(template: &str, x: &str) -> String {
@@ -7794,6 +8085,16 @@ fn pg_template_arg<'e>(template: &str, e: &'e Expr) -> Option<&'e Expr> {
     // The first place `__x__` appears in the template, found in `e`.
     let x = first_hole(&tpl, e)?;
     (subst(&tpl, x)? == *e).then_some(x)
+}
+
+/// The `x` and `k` of the converter's `parsename_pg(k)` form.
+fn pg_parsename(e: &Expr) -> Option<(&Expr, u32)> {
+    static FORMS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let forms = FORMS.get_or_init(|| (1..=4).map(parsename_pg).collect());
+    forms
+        .iter()
+        .zip(1..)
+        .find_map(|(f, k)| pg_template_arg(f, e).map(|x| (x, k)))
 }
 
 fn is_hole(t: &Expr) -> bool {

@@ -12,11 +12,11 @@ A lemma backs a rule, not a unit: a unit is confirmed only when the checker acce
 
 | Kind | Rules | Lemma | Axiom | Engine |
 |---|---|---|---|---|
-| `converter` | 182 | 35 (19%) | 6 (3%) | 141 (77%) |
+| `converter` | 184 | 35 (19%) | 6 (3%) | 143 (78%) |
 | `translate` | 15 | 3 (20%) | 1 (7%) | 11 (73%) |
 | `idiom` | 10 | 0 (0%) | 1 (10%) | 9 (90%) |
 | `lint` | 4 | 0 (0%) | 0 (0%) | 4 (100%) |
-| **All** | 211 | 38 (18%) | 8 (4%) | 165 (78%) |
+| **All** | 213 | 38 (18%) | 8 (4%) | 167 (78%) |
 
 A family (`tsql.func.*`) counts as one rule; the members registered on their own count on their own.
 
@@ -145,9 +145,11 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.nchar` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.openjson` | `converter` | engine | the note on an OPENJSON form that is not converted; it rewrites nothing | `sqldiff-convert/src/tsql.rs` |
 | `tsql.order.nulls` | `converter` | axiom: V19 | NULLS FIRST/LAST after T-SQL's placement (ASM-FACT-V19); the Db2 for i part of V19 is unverified | `sqldiff-convert/src/tsql/paging.rs` |
+| `tsql.parsename` | `converter` | engine | a refusal: PARSENAME the pattern form would read more than once is not converted | `sqldiff-convert/src/tsql.rs` |
 | `tsql.partition-scheme` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.plan-hint` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.query-hints` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.right` | `converter` | engine | a refusal: RIGHT of a computed string or count is not converted | `sqldiff-convert/src/tsql.rs` |
 | `tsql.routine-options` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/trigger.rs` |
 | `tsql.routine-options-dropped` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/trigger.rs` |
 | `tsql.routine.alter` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

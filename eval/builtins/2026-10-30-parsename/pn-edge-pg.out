@@ -1,0 +1,47 @@
+CREATE TABLE
+INSERT 0 32
+plain128|128|N|N|N
+plain129|N|N|N|N
+plain200|N|N|N|N
+brk128|128|N|N|N
+brk129|N|N|N|N
+brk126|126|N|N|N
+two128|128|128|N|N
+two64|63|64|N|N
+two64b|64|64|N|N
+tab|1|3|N|N
+nl|3|N|N|N
+quote|3|N|N|N
+at|2|2|N|N
+uni|2|1|N|N
+bslash|3|N|N|N
+pipe|3|N|N|N
+null|N|N|N|N
+empty|N|N|N|N
+five|N|N|N|N
+four|1|1|1|1
+nested|3|N|N|N
+dq|3|N|N|N
+long2nd|N|N|N|N
+long1st|N|N|N|N
+esc128|128|N|N|N
+esc129|N|N|N|N
+dq128|128|N|N|N
+sp129|N|N|N|N
+bmp128|128|N|N|N
+bmp129|N|N|N|N
+long4|N|N|N|N
+trail129|N|N|N|N
+tab|<c>|<a	b>|N|N
+nl|<a
+b>|N|N|N
+quote|<a'b>|N|N|N
+at|<#b>|<@a>|N|N
+uni|<ü𝄞>|<é>|N|N
+bslash|<a\b>|N|N|N
+pipe|<a|b>|N|N|N
+empty|N|N|N|N
+five|N|N|N|N
+four|<d>|<c>|<b>|<a>
+nested|<a[b>|N|N|N
+dq|<a"b>|N|N|N

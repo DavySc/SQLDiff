@@ -1241,6 +1241,25 @@ impl<'a> Parser<'a> {
             self.i += 3;
             c.over = true;
         }
+        // ROW_NUMBER() OVER (ORDER BY …): the rows numbered in that order,
+        // its window ORDER BY kept in `order` (ROW_NUMBER takes none of its
+        // own).
+        if self.lowered
+            && self.is_kw("OVER")
+            && self.is_kind_at(1, K::LParen)
+            && self.is_kw_at(2, "ORDER")
+            && self.is_kw_at(3, "BY")
+            && c.name.len() == 1
+            && c.name[0].eq_ignore_ascii_case("row_number")
+            && c.args.is_empty()
+            && !c.star
+            && !c.within_group
+        {
+            self.i += 4;
+            c.order = self.order_list()?;
+            self.expect_kind(K::RParen)?;
+            c.over = true;
+        }
         if self.is_kw("OVER") || self.is_kw("FILTER") {
             return Err("window functions and FILTER are not supported".into());
         }

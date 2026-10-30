@@ -106,6 +106,8 @@ pub(crate) fn convert(
         table_items: Vec::new(),
         left_out_indexes: Vec::new(),
         update_ctes: Vec::new(),
+        stmt_ctes: Vec::new(),
+        stmt_insert: false,
     };
     let mut out = Out::default();
     let els: Vec<SyntaxElement> = root.children_with_tokens().collect();
@@ -304,6 +306,11 @@ struct Cx<'a> {
     /// The CTEs of the `WITH … UPDATE … FROM` being converted (lower case),
     /// with the GROUP BY key their query returns (`group_key`), if any.
     update_ctes: Vec<(String, Option<Vec<String>>)>,
+    /// The CTEs of the `WITH … INSERT` being converted, for what the
+    /// columns it stores in a bit hold.
+    stmt_ctes: Vec<bits::CteDef>,
+    /// An INSERT is being converted: `t (cols) SELECT` is its target.
+    stmt_insert: bool,
 }
 
 /// A refusal: the unit is kept as a comment with this reason.
@@ -2784,11 +2791,15 @@ impl<'a> Cx<'a> {
             }
         }
         let prefix = self.with_list(&ts, verb);
+        if what == "INSERT" {
+            self.stmt_ctes = bits::cte_defs(&ts);
+        }
         let body = match prefix {
             Ok(_) => self.dml(&ts[verb..]),
             Err(_) => Ok(String::new()),
         };
         self.update_ctes.clear();
+        self.stmt_ctes.clear();
         let (prefix, body) = (prefix?, body?);
         Ok(format!("{} {}", prefix.trim(), body.trim_start()))
     }
@@ -2825,6 +2836,14 @@ impl<'a> Cx<'a> {
     }
 
     fn dml(&mut self, ts: &[T]) -> R<String> {
+        let insert = ts.iter().find(|t| t.sig()).is_some_and(|t| t.is("INSERT"));
+        let was = std::mem::replace(&mut self.stmt_insert, insert);
+        let r = self.dml_once(ts);
+        self.stmt_insert = was;
+        r
+    }
+
+    fn dml_once(&mut self, ts: &[T]) -> R<String> {
         let mut ts = Self::body_toks(ts);
         // A closing `OPTION (MAXRECURSION n)`: the recursion limit of the
         // statement's CTEs, which ASM-CTE-MAXRECURSION states. Dropped as
@@ -7648,6 +7667,48 @@ impl<'a> Cx<'a> {
                 let x = e(self, 0);
                 sqldiff_core::equiv::canon::pg_template(sqldiff_core::equiv::canon::ISJSON_PG, &x)
             }
+            // LEFT and RIGHT: PostgreSQL's left and right read a negative
+            // count as "all but", where T-SQL raises (Msg 536). A literal
+            // count from 0 up keeps them; otherwise substr, which raises on
+            // a negative length too and agrees on every string and count
+            // (trailing spaces, NULL, past the end; SQL Server 2022 against
+            // PostgreSQL 18, eval/builtins/2026-10-30-lr). RIGHT reads the
+            // string and the count twice, so both must be safe to.
+            ("LEFT" | "RIGHT", 2) if a[1].iter().any(|t| t.sig()) => {
+                let count = trimmed(a[1]);
+                if let [t] = count {
+                    if t.k == NUMBER && t.s.parse::<u32>().is_ok() {
+                        return None;
+                    }
+                }
+                let (x, k) = (e(self, 0), e(self, 1));
+                if name == "LEFT" {
+                    format!("substr({x}, 1, {k})")
+                } else if simple_operand(a[0]) && length_operand(a[1]) {
+                    format!("substr({x}, length({x}) - ({k}) + 1, {k})")
+                } else {
+                    self.note(Status::NotConverted, "tsql.right", "RIGHT with a computed string or count: PostgreSQL's right reads a negative count as \"all but\" where T-SQL raises, and the substr form reads both twice. Store them in variables, then convert.");
+                    return None;
+                }
+            }
+            // PARSENAME(x, k), k from 1 to 4: the regular-expression form
+            // `parsename_pg` (equal on every name, sqldiff_core has the
+            // runs). It reads x six times, so x must be safe to.
+            ("PARSENAME", 2) => {
+                let k = match trimmed(a[1]) {
+                    [t] if t.k == NUMBER => t.s.parse::<u32>().ok().filter(|k| (1..=4).contains(k)),
+                    _ => None,
+                };
+                let Some(k) = k.filter(|_| simple_operand(a[0])) else {
+                    self.note(Status::NotConverted, "tsql.parsename", "PARSENAME of a computed name or with a part number other than a literal from 1 to 4: the PostgreSQL form reads the name several times. Store it in a variable, then convert.");
+                    return None;
+                };
+                let x = e(self, 0);
+                sqldiff_core::equiv::canon::pg_template(
+                    &sqldiff_core::equiv::canon::parsename_pg(k),
+                    &x,
+                )
+            }
             ("LEN", 1) => format!("length(rtrim({}))", e(self, 0)),
             ("DATALENGTH", 1) => {
                 self.note(Status::Assumptions, "ASM-DATALENGTH", "DATALENGTH becomes octet_length: byte counts differ for NVARCHAR (UTF-16 in T-SQL, UTF-8 in PostgreSQL).");
@@ -9872,6 +9933,32 @@ fn additive_operand(ts: &[T]) -> bool {
     parts.iter().all(|p| simple_operand(p))
 }
 
+/// Sums and differences of simple operands and LEN or DATALENGTH of one:
+/// safe to evaluate twice.
+fn length_operand(ts: &[T]) -> bool {
+    let ts = trimmed(ts);
+    let ds = crate::tok::depths(ts);
+    let mut parts = Vec::new();
+    let mut from = 0;
+    for (i, t) in ts.iter().enumerate() {
+        if t.k == OP && (t.s == "+" || t.s == "-") && ds[i] == 0 {
+            parts.push(&ts[from..i]);
+            from = i + 1;
+        }
+    }
+    parts.push(&ts[from..]);
+    parts.iter().all(|p| {
+        let p = trimmed(p);
+        let s = sig(p);
+        simple_operand(p)
+            || s.len() >= 4
+                && (p[s[0]].is("LEN") || p[s[0]].is("DATALENGTH"))
+                && p[s[1]].k == L_PAREN
+                && matching(p, s[1]) == Some(s[s.len() - 1])
+                && simple_operand(&p[s[1] + 1..s[s.len() - 1]])
+    })
+}
+
 /// One variable, column name or literal: safe to evaluate twice.
 fn simple_operand(ts: &[T]) -> bool {
     let ts = trimmed(ts);
@@ -10637,9 +10724,13 @@ fn written_tables(ts: &[T]) -> Vec<String> {
 }
 
 fn scope_of(ts: &[T]) -> Option<Scope> {
-    if cte_list(ts).is_some() {
-        return None;
-    }
+    // A CTE read is no catalog table: its entries stay unknown, so its
+    // columns and every unqualified name have no type.
+    let ctes = match cte_list(ts) {
+        Some((names, _)) => names,
+        None if sig(ts).first().is_some_and(|&f| ts[f].is("WITH")) => return None,
+        None => Vec::new(),
+    };
     let s = sig(ts);
     let mut entries = Vec::new();
     let mut nested = Vec::new();
@@ -10739,6 +10830,11 @@ fn scope_of(ts: &[T]) -> Option<Scope> {
         }
     }
     entries.extend(nested);
+    for e in &mut entries {
+        if matches!(e.name.as_slice(), [n] if ctes.contains(n)) {
+            e.named = false;
+        }
+    }
     Some(Scope { entries })
 }
 
