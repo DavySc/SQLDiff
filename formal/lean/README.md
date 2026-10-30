@@ -576,7 +576,9 @@ from memory; `ASM-TABLES-AS-DECLARED`, whose statement now covers base
 catalogs and says what it asserts of a read-only table (its columns by
 name, the slice columns' types, nullability and collation, the key when
 sent, and no row-level security, rule, masking, inheritance or
-partitions). The Rust side (`cert.rs`, `plain_table::read_only`,
+partitions), and of every table that no temporary table with its name
+exists in the calling session (a caller's PostgreSQL `TEMP TABLE`
+shadows it). The Rust side (`cert.rs`, `plain_table::read_only`,
 `plain_table::leaves_reads`) sends a table that is not plain as
 read-only when both sides define it once, the definitions pair by column
 name, and nothing else in either tree names it but statements that

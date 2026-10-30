@@ -149,8 +149,13 @@ Indexes other than the primary key's are non-unique, unfiltered and on
 plain columns, and no row of the slice can exceed their key size limits
 (see "The C3c tables"): they then change no result. String columns have
 the database's default collation (no `COLLATE` clause) and, in SQL Server,
-were created with `ANSI_PADDING ON`. The Rust side sends a table only
-when its catalogs show all of this.
+were created with `ANSI_PADDING ON`. (Review of C3d part 2) For every
+table, plain or read-only: no temporary table with its name exists in the
+calling session (in PostgreSQL a caller's `TEMP TABLE t1` shadows `t1`,
+since `pg_temp` is searched first, and the converter writes T-SQL `#T1` as
+`CREATE TEMP TABLE T1`). The Rust side sends a table only
+when its catalogs show all of this; the calling session is
+`ASM-TABLES-AS-DECLARED`'s to state.
 
 (C3d part 2) A **read-only** table (`readOnly`) is one the two routines
 only read: no lowering writes it (`writeTableOf`). For it the catalog
