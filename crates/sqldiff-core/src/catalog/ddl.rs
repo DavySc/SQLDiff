@@ -7,7 +7,7 @@ use sqldiff_syntax::{parse, Dialect, SyntaxKind, SyntaxNode};
 
 use super::{
     Catalog, Column, DataType, Ident, Index, Key, Param, ParamMode, Routine, RoutineKind, Table,
-    TableKind, Versioning,
+    TableKind, Trigger, Versioning,
 };
 use crate::tokens::{self, close_paren, find_kw, qualified, split_commas, Tok};
 
@@ -45,7 +45,14 @@ pub fn load_tree(cat: &mut Catalog, root: &SyntaxNode, dialect: Dialect) {
                             let t = view_table(cat, dialect, h.name.clone(), cols, &body);
                             cat.put_table(dialect, t);
                         }
-                        None => cat.put_routine(dialect, h.routine),
+                        None => {
+                            if h.routine.kind == RoutineKind::Trigger && dialect == Dialect::Tsql {
+                                if let Some(t) = tsql_trigger(&tokens::header(&node), dialect) {
+                                    cat.put_trigger(t);
+                                }
+                            }
+                            cat.put_routine(dialect, h.routine)
+                        }
                     }
                 }
             }
@@ -103,6 +110,11 @@ pub fn apply_statement(cat: &mut Catalog, t: &[Tok], dialect: Dialect) {
             Some("SCHEMA") => {
                 if let Some(n) = t.get(i + 1).filter(|x| x.is_name()) {
                     cat.schemas.push(n.ident().stored(dialect));
+                }
+            }
+            Some("TRIGGER" | "CONSTRAINT") if dialect == Dialect::Postgres => {
+                if let Some(tr) = pg_trigger(t, dialect) {
+                    cat.put_trigger(tr);
                 }
             }
             _ => {}
@@ -1275,6 +1287,87 @@ pub fn pg_trigger_statement(t: &[Tok]) -> Option<(Vec<Ident>, TriggerInfo)> {
         return None;
     }
     Some((name, trigger_info(&t[..ex], kw)))
+}
+
+/// T-SQL `CREATE|ALTER TRIGGER name ON table [WITH …] {FOR|AFTER|INSTEAD
+/// OF} events AS`; `None` for a DDL trigger (`ON DATABASE`, `ON ALL
+/// SERVER`) or a header not read.
+fn tsql_trigger(t: &[Tok], dialect: Dialect) -> Option<Trigger> {
+    let kw = t.iter().position(|x| x.is_kw("TRIGGER"))?;
+    let (name, on) = qualified(t, kw + 1);
+    if name.is_empty() || name.len() > 2 || !t.get(on)?.is_kw("ON") {
+        return None;
+    }
+    if t.get(on + 1)?.is_any_kw(&["DATABASE", "ALL"]) {
+        return None;
+    }
+    let (table, mut i) = qualified(t, on + 1);
+    if table.is_empty() || table.len() > 2 {
+        return None;
+    }
+    if t.get(i).is_some_and(|x| x.is_kw("WITH")) {
+        i = (i..t.len()).find(|&j| t[j].is_any_kw(&["FOR", "AFTER", "INSTEAD"]))?;
+    }
+    let instead = t.get(i)?.is_kw("INSTEAD");
+    i += if instead { 2 } else { 1 };
+    let mut events = Vec::new();
+    while let Some(x) = t.get(i) {
+        if x.is_any_kw(&["INSERT", "UPDATE", "DELETE"]) {
+            let e = x.upper();
+            if !events.contains(&e) {
+                events.push(e);
+            }
+        } else if !x.is(SyntaxKind::COMMA) {
+            break;
+        }
+        i += 1;
+    }
+    if events.is_empty() {
+        return None;
+    }
+    let (schema, name) = stored_name(&name, dialect)?;
+    Some(Trigger {
+        schema,
+        name,
+        table: table.iter().map(|p| p.stored(dialect)).collect(),
+        events,
+        instead,
+        function: None,
+    })
+}
+
+/// PostgreSQL `CREATE [OR REPLACE] [CONSTRAINT] TRIGGER name {BEFORE |
+/// AFTER | INSTEAD OF} event [OR …] ON table … EXECUTE {FUNCTION |
+/// PROCEDURE} f(…)`.
+fn pg_trigger(t: &[Tok], dialect: Dialect) -> Option<Trigger> {
+    let (function, info) = pg_trigger_statement(t)?;
+    let kw = t.iter().position(|x| x.is_kw("TRIGGER"))?;
+    let name = t.get(kw + 1).filter(|x| x.is_name())?.ident();
+    let timing = t.get(kw + 2)?;
+    if !timing.is_any_kw(&["BEFORE", "AFTER", "INSTEAD"]) || info.table.is_empty() {
+        return None;
+    }
+    let on = find_kw(t, kw + 2, "ON")?;
+    let mut events = Vec::new();
+    for x in &t[kw + 3..on] {
+        if x.is_any_kw(&["INSERT", "UPDATE", "DELETE", "TRUNCATE"]) {
+            let e = x.upper();
+            if !events.contains(&e) {
+                events.push(e);
+            }
+        }
+    }
+    if events.is_empty() {
+        return None;
+    }
+    Some(Trigger {
+        schema: None,
+        name: name.stored(dialect),
+        table: info.table.iter().map(|p| p.stored(dialect)).collect(),
+        events,
+        instead: timing.is_kw("INSTEAD"),
+        function: Some(function.iter().map(|p| p.stored(dialect)).collect()),
+    })
 }
 
 fn trigger_info(t: &[Tok], from: usize) -> TriggerInfo {

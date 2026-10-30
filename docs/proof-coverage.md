@@ -172,6 +172,7 @@ A family (`tsql.func.*`) counts as one rule; the members registered on their own
 | `tsql.sqlcmd-include` | `converter` | engine |  | `sqldiff-convert/src/lib.rs`<br>`sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.break` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.continue` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
+| `tsql.stmt.drop-trigger` | `converter` | engine |  | `sqldiff-convert/src/tsql/trigger.rs` |
 | `tsql.stmt.dynamic-known-text` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.dynamic-parameters` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |
 | `tsql.stmt.exec` | `converter` | engine |  | `sqldiff-convert/src/tsql.rs` |

@@ -1942,6 +1942,155 @@ fn object_events(
     out.contains('X').then_some(out)
 }
 
+/// A T-SQL `DROP TRIGGER` against the PostgreSQL `DROP TRIGGER … ON table`
+/// and `DROP FUNCTION IF EXISTS f()` it became. PostgreSQL names the
+/// table, T-SQL does not: side A's catalog must define the trigger once (or
+/// alike every time) with one event, AFTER or FOR, on that table; side B's
+/// must define the PostgreSQL trigger on that table for that event,
+/// running `f`, which no other trigger runs. Neither file may create, drop
+/// or otherwise name the trigger elsewhere, so the catalog's definition is
+/// the one in force where the DROP runs.
+fn trigger_drop(
+    a: &Analyzed,
+    b: &Analyzed,
+    sa: &Schema,
+    sb: &Schema,
+    (na, x): (&SyntaxNode, &ddl::DropDef),
+    (nb, y): (&SyntaxNode, &ddl::DropDef),
+) -> Result<(), String> {
+    use crate::catalog::Trigger;
+    let (t, p) = match (x.dialect, y.dialect) {
+        (Dialect::Tsql, Dialect::Postgres) => ((a, sa, na, x), (b, sb, nb, y)),
+        (Dialect::Postgres, Dialect::Tsql) => ((b, sb, nb, y), (a, sa, na, x)),
+        _ => return Err("only T-SQL against PostgreSQL is compared".into()),
+    };
+    let names = |parts: &[String], quoted: bool| -> Vec<table::Name> {
+        parts
+            .iter()
+            .map(|s| table::Name {
+                text: s.clone(),
+                quoted,
+            })
+            .collect()
+    };
+    // The definitions read for a name; all alike, or none is trusted.
+    let one = |defs: Vec<&Trigger>, what: &str| -> Result<Trigger, String> {
+        let first = defs
+            .first()
+            .copied()
+            .cloned()
+            .ok_or_else(|| format!("no CREATE TRIGGER of it is in {what}'s catalog"))?;
+        if defs.iter().any(|d| **d != first) {
+            return Err(format!(
+                "{what}'s catalog defines the trigger more than once, differently"
+            ));
+        }
+        Ok(first)
+    };
+    // Side A: the T-SQL trigger.
+    let (ts_name, ts_schema) = match t.3.name.as_slice() {
+        [n] => (n, None),
+        [s, n] => (n, Some(s.text.as_str())),
+        _ => return Err("a trigger name with a database part".into()),
+    };
+    let cat_t = t.1.catalog().ok_or("no catalog for the T-SQL side")?;
+    let def_t = one(
+        cat_t
+            .catalog
+            .triggers_named(Dialect::Tsql, ts_schema, &ts_name.text),
+        side_name(t.0).as_str(),
+    )?;
+    if def_t.instead || def_t.events.len() != 1 {
+        return Err("the T-SQL trigger is INSTEAD OF or has several events".into());
+    }
+    let table_t = ddl::object_key(&names(&def_t.table, false), Dialect::Tsql)?;
+    let table_p = ddl::object_key(&p.3.table, Dialect::Postgres)?;
+    if table_t != table_p {
+        return Err(format!(
+            "the T-SQL trigger is on {}, the PostgreSQL DROP TRIGGER names {}",
+            def_t.table.join("."),
+            table::text_name(&p.3.table)
+        ));
+    }
+    // Side B: the PostgreSQL trigger on that table, and its function.
+    let cat_p = p.1.catalog().ok_or("no catalog for the PostgreSQL side")?;
+    let pname = ddl::object_key(&p.3.name, Dialect::Postgres)?.1;
+    let on_table = |d: &&Trigger| {
+        ddl::object_key(&names(&d.table, true), Dialect::Postgres)
+            .ok()
+            .as_ref()
+            == Some(&table_p)
+    };
+    let def_p = one(
+        cat_p
+            .catalog
+            .triggers
+            .iter()
+            .filter(|d| d.name == pname)
+            .filter(on_table)
+            .collect(),
+        side_name(p.0).as_str(),
+    )?;
+    if def_p.instead || def_p.events != def_t.events {
+        return Err(format!(
+            "the PostgreSQL trigger fires on {} and the T-SQL trigger on {}",
+            def_p.events.join(", "),
+            def_t.events.join(", ")
+        ));
+    }
+    let func = def_p
+        .function
+        .clone()
+        .ok_or("the PostgreSQL trigger's function is not known")?;
+    let fkey = |n: &[table::Name]| ddl::object_key(n, Dialect::Postgres).ok();
+    let dropped = p
+        .3
+        .function
+        .as_ref()
+        .ok_or("the PostgreSQL side does not drop the trigger's function, which stays behind (a later DROP SCHEMA then fails)")?;
+    if fkey(dropped).is_none() || fkey(dropped) != fkey(&names(&func, true)) {
+        return Err(format!(
+            "the PostgreSQL side drops the function {}(), and the trigger runs {}()",
+            table::text_name(dropped),
+            func.join(".")
+        ));
+    }
+    if cat_p.catalog.triggers.iter().any(|d| {
+        *d != def_p && d.function.as_ref().map(|f| fkey(&names(f, true))) == Some(fkey(dropped))
+    }) {
+        return Err("another PostgreSQL trigger runs the same function".into());
+    }
+    // Neither file names the trigger anywhere else.
+    for (side, node, n) in [(t.0, t.2, ts_name), (p.0, p.2, &p.3.name[0])] {
+        let own = |tok: &sqldiff_syntax::SyntaxToken| {
+            node.text_range().contains_range(tok.text_range())
+                || node.next_sibling().is_some_and(|f| {
+                    side.dialect() == Dialect::Postgres
+                        && f.text_range().contains_range(tok.text_range())
+                })
+        };
+        let elsewhere = side
+            .root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|tok| !own(tok))
+            .any(|tok| {
+                matches!(
+                    tok.kind(),
+                    sqldiff_syntax::SyntaxKind::IDENT | sqldiff_syntax::SyntaxKind::QUOTED_IDENT
+                ) && cst::unquote(tok.text()).eq_ignore_ascii_case(&n.text)
+            });
+        if elsewhere {
+            return Err(format!(
+                "{} also creates, drops or names the trigger {} elsewhere",
+                side_name(side),
+                n.text
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Whether `x` runs exactly once per run of its routine or script:
 /// no enclosing branch, loop, handler or TRY/CATCH, and no enclosing block
 /// with an EXCEPTION section (a PostgreSQL subtransaction that undoes it
@@ -2324,10 +2473,35 @@ fn ddl_stmts(
         key: Option<String>,
     }
     fn read<'n>(side: &Analyzed, u: &'n Unit) -> Vec<Stmt<'n>> {
+        // PostgreSQL: the `DROP FUNCTION IF EXISTS f()` right after a DROP
+        // TRIGGER is part of it (the trigger's function, checked against
+        // the catalog in `trigger_drop`).
+        let mut absorbed: Vec<usize> = Vec::new();
+        let mut functions: Vec<Option<Vec<table::Name>>> = vec![None; u.ddl.len()];
+        if side.dialect() == Dialect::Postgres {
+            for (i, w) in u.ddl.windows(2).enumerate() {
+                let ((n, _), (next, _)) = (&w[0], &w[1]);
+                if cst::first_words(n, 2) != ["DROP", "TRIGGER"]
+                    || n.next_sibling().as_ref() != Some(next)
+                    || absorbed.contains(&i)
+                {
+                    continue;
+                }
+                if let Some(f) = ddl::trigger_function_drop(&ast::tokens(next)) {
+                    functions[i] = Some(f);
+                    absorbed.push(i + 1);
+                }
+            }
+        }
         u.ddl
             .iter()
-            .map(|(node, pos)| {
+            .enumerate()
+            .filter(|(i, _)| !absorbed.contains(i))
+            .map(|(i, (node, pos))| {
                 let mut ddl = ddl::parse(&ast::tokens(node), side.dialect());
+                if let Ok(ddl::Ddl::Drop(x)) = &mut ddl {
+                    x.function = functions[i].clone();
+                }
                 // An index on a temporary table the unit created: named as
                 // T-SQL names it (`#t`), so it pairs with the original.
                 if let Ok(ddl::Ddl::Index(ix)) = &mut ddl {
@@ -2557,9 +2731,20 @@ fn ddl_stmts(
         // A DROP or a table's default sits in the same place on both sides
         // among the file's statements that create, drop or name its object
         // (for a schema: anything in it).
+        if let (ddl::Ddl::Drop(tx), ddl::Ddl::Drop(ty)) = (dx, dy) {
+            if tx.kind == "TRIGGER" && ty.kind == "TRIGGER" {
+                match trigger_drop(a, b, sa, sb, (x.node, tx), (y.node, ty)) {
+                    Ok(()) => {}
+                    Err(why) => {
+                        unknown(out, why);
+                        continue;
+                    }
+                }
+            }
+        }
         let target = |dd: &ddl::Ddl| match dd {
             ddl::Ddl::Default(x) => Some((x.table.clone(), false)),
-            ddl::Ddl::Drop(x) => Some((x.name.clone(), x.kind == "SCHEMA")),
+            ddl::Ddl::Drop(x) if x.kind != "TRIGGER" => Some((x.name.clone(), x.kind == "SCHEMA")),
             _ => None,
         };
         if let (Some((nx, sx)), Some((ny, sy))) = (target(dx), target(dy)) {

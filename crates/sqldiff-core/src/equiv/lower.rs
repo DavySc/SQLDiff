@@ -2151,6 +2151,18 @@ fn statement(c: &SyntaxNode, u: &mut Unit) {
         StmtKind::Ddl if cst::first_words(c, 1) == ["TRUNCATE"] => {
             u.ddl.push((c.clone(), u.stmts.len()));
         }
+        // A routine's DROP TRIGGER, and on PostgreSQL the DROP FUNCTION
+        // right after it that drops the trigger's function: compared
+        // statement against statement (`mod.rs::trigger_drop`).
+        StmtKind::Ddl
+            if cst::first_words(c, 2) == ["DROP", "TRIGGER"]
+                || (d == Dialect::Postgres
+                    && super::ddl::trigger_function_drop(&tokens(c)).is_some()
+                    && c.prev_sibling()
+                        .is_some_and(|p| cst::first_words(&p, 2) == ["DROP", "TRIGGER"])) =>
+        {
+            u.ddl.push((c.clone(), u.stmts.len()));
+        }
         StmtKind::Ddl if u.kind == UnitKind::Script && u.stmts.is_empty() => {
             // `CREATE [OR REPLACE] VIEW name AS query` parsed as one statement.
             let toks = tokens(c);
