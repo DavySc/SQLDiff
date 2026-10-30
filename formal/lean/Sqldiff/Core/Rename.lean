@@ -208,8 +208,8 @@ theorem Agree.setAll (inj : InjOn f D) :
 
 /-- (C3b) A pick and its renaming, on the same rows, with expressions that
 agree through the renaming. -/
-theorem pickRows_rename (inj : InjOn f D) (ev ev' : Store U → Expr → Res U) (t : TableDef)
-    {σA σB : Store U} (h : Agree f D σA σB) (rows : List (Row U)) :
+theorem pickRows_rename (inj : InjOn f D) (ev ev' : Store U → Expr → Res U) (t : List TableDef)
+    {σA σB : Store U} (h : Agree f D σA σB) (rows : List (List (Row U))) :
     ∀ p : Pick, Sub p.vars D → (∀ e ∈ p.exprs, ∀ ρ, ev' ρ (e.rename f) = ev ρ e) →
       BindRel f D (pickRows ev t σA rows p) (pickRows ev' t σB rows (p.rename f))
   | .row n sets, hs, he => by
@@ -226,18 +226,20 @@ theorem pickRows_rename (inj : InjOn f D) (ev ev' : Store U → Expr → Res U) 
       simp only [Pick.vars, List.mem_flatten, List.mem_map]
       exact ⟨_, ⟨q, hq, rfl⟩, by simp⟩)
     simp only [pickRows, Pick.rename, h1, h2, h3]
-    cases rows.getLast? with
-    | none =>
-      cases n
-      · exact h
-      · exact Agree.setAll inj _ _ _ _ hx h
-    | some r =>
-      dsimp only
-      rw [evalVals_map (ev := ev) (ev' := ev') (g := Expr.rename f) _ _
-        (fun e he' ρ => he e (by simpa [Pick.exprs] using he') ρ)]
-      cases evalVals ev (rowStore t.cols r) (sets.map (·.2)) with
-      | error k => exact rfl
-      | ok vs => exact Agree.setAll inj _ vs _ _ hx h
+    split
+    · exact rfl
+    · cases rows.getLast? with
+      | none =>
+        cases n
+        · exact h
+        · exact Agree.setAll inj _ _ _ _ hx h
+      | some r =>
+        dsimp only
+        rw [evalVals_map (ev := ev) (ev' := ev') (g := Expr.rename f) _ _
+          (fun e he' ρ => he e (by simpa [Pick.exprs] using he') ρ)]
+        cases evalVals ev (tupleStore 0 t r) (sets.map (·.2)) with
+        | error k => exact rfl
+        | ok vs => exact Agree.setAll inj _ vs _ _ hx h
   | .count x, hs, _ => by
     simp only [pickRows, Pick.rename]
     cases (toInt32 rows.length : Res U) with
@@ -369,19 +371,19 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
   | _ + 1, .raise _, _, _, _, h => ⟨rfl, h⟩
   | _ + 1, .reraise, _, _, _, h => ⟨rfl, h⟩
   | _ + 1, .commit, _, _, _, h => h
-  | _ + 1, .query t c p, a, b, hs, h => by
+  | _ + 1, .query q p, a, b, hs, h => by
     obtain ⟨hst, hw, hdb, hc⟩ := h
-    simp only [exec, Stmt.rename]
-    rw [keptRows_map (ev := fun ρ e => e.eval es a.store ρ) t c
+    simp only [exec, Stmt.rename, Query.rename]
+    rw [blockRows_map (ev := fun ρ e => e.eval es a.store ρ) q.blk b.db
       (fun e he _ => Expr.eval_rename es hst e (fun y hy => hs y (by
-        simp only [Stmt.vars, he, Expr.varsOpt, List.mem_append]
-        exact Or.inl hy))), hdb]
-    cases keptRows (fun ρ e => e.eval es a.store ρ) t c (b.db.get t.name) with
+        simp only [Stmt.vars, List.mem_append, List.mem_flatten, List.mem_map]
+        exact Or.inl ⟨_, ⟨e, he, rfl⟩, hy⟩))), hdb]
+    cases blockRows (fun ρ e => e.eval es a.store ρ) q.blk b.db with
     | error k => exact ⟨rfl, hst, hw, hdb, hc⟩
     | ok rows =>
       dsimp only
       have hp := pickRows_rename inj (fun ρ e => e.eval es a.store ρ)
-        (fun ρ e => e.eval es b.store ρ) t hst rows p
+        (fun ρ e => e.eval es b.store ρ) q.blk.srcs hst rows p
         (fun y hy => hs y (by simp [Stmt.vars, hy]))
         (fun e he ρ => Expr.eval_rename es hst e (fun y hy => hs y (by
           simp only [Stmt.vars, List.mem_append]
@@ -393,8 +395,8 @@ theorem exec_rename (es : ExprSem U) (wm : WorldModel U W) (inj : InjOn f D) :
             exact ⟨_, ⟨(x, e), hq, rfl⟩, by simp [hy]⟩
           | count _ => simp [Pick.exprs] at he
           | any _ => simp [Pick.exprs] at he)))
-      generalize pickRows (fun ρ e => e.eval es a.store ρ) t a.store rows p = rA at hp ⊢
-      generalize pickRows (fun ρ e => e.eval es b.store ρ) t b.store rows (p.rename f) = rB at hp ⊢
+      generalize pickRows (fun ρ e => e.eval es a.store ρ) q.blk.srcs a.store rows p = rA at hp ⊢
+      generalize pickRows (fun ρ e => e.eval es b.store ρ) q.blk.srcs b.store rows (p.rename f) = rB at hp ⊢
       cases rA <;> cases rB <;> simp only [BindRel] at hp
       · exact ⟨hp, hst, hw, hdb, hc⟩
       · exact ⟨hp, hw, rfl, hc⟩

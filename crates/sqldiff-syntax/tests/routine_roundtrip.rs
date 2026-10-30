@@ -373,3 +373,107 @@ $$;
         );
     }
 }
+
+/// C3d: a query over several tables reads with its joins, aliases and
+/// qualified names in both dialects and prints back as the same tree; the
+/// forms the checker has no rule for either do not read (`APPLY`, `USING`,
+/// a parenthesised join, a block label) or keep a shape the checker
+/// refuses (an outer join's kind).
+#[test]
+fn query_blocks_read_with_their_joins_and_aliases() {
+    use sqldiff_syntax::abstract_syntax::{Expr, From, Stmt};
+    let pg = "CREATE PROCEDURE look(p_id integer, INOUT p_q integer)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  DECLARE
+  sqldiff_r record;
+  BEGIN
+  FOR sqldiff_r IN SELECT c.Score AS sqldiff_c1 FROM Ord AS o JOIN Cust c ON c.Id = o.CustId, Two CROSS JOIN Pair WHERE o.Id = p_id LOOP
+    p_q := sqldiff_r.sqldiff_c1;
+  END LOOP;
+  END;
+END;
+$$;
+";
+    let r = routines(pg, Dialect::Postgres).remove(0).unwrap();
+    let [Node::Block(b)] = r.body.body.as_slice() else {
+        panic!("{:?}", r.body.body);
+    };
+    let [Node::ForQuery { query, .. }] = b.body.as_slice() else {
+        panic!("{:?}", b.body);
+    };
+    let [From::Join {
+        kind,
+        left,
+        right,
+        on: Some(_),
+    }, From::Join {
+        kind: k2, on: None, ..
+    }] = query.from.as_slice()
+    else {
+        panic!("{:?}", query.from);
+    };
+    assert_eq!((kind.as_str(), k2.as_str()), ("INNER", "CROSS"));
+    assert!(matches!(left.as_ref(), From::Table { alias: Some(a), .. } if a == "o"));
+    assert!(matches!(right.as_ref(), From::Table { alias: Some(a), .. } if a == "c"));
+    assert!(
+        matches!(&query.items[0].expr, Expr::Name(p) if p == &["c".to_string(), "Score".to_string()])
+    );
+    assert_eq!(reprint(&r), r);
+    // T-SQL: the same FROM, with `INNER JOIN` read as `INNER` too.
+    let t = "CREATE PROCEDURE dbo.look @id int, @q int OUTPUT AS
+BEGIN
+  SELECT @q = c.Score FROM dbo.Ord AS o INNER JOIN dbo.Cust c ON c.Id = o.CustId WHERE o.Id = @id;
+END
+";
+    let r = routines(t, Dialect::Tsql).remove(0).unwrap();
+    let [Node::Stmt(Stmt::Select(q))] = r.body.body.as_slice() else {
+        panic!("{:?}", r.body.body);
+    };
+    assert!(matches!(q.from.as_slice(), [From::Join { kind, .. }] if kind == "INNER"));
+    // An outer join keeps its kind (the checker refuses it).
+    let t = t.replace("INNER JOIN", "LEFT JOIN");
+    let r = routines(&t, Dialect::Tsql).remove(0).unwrap();
+    let [Node::Stmt(Stmt::Select(q))] = r.body.body.as_slice() else {
+        panic!("{:?}", r.body.body);
+    };
+    assert!(matches!(q.from.as_slice(), [From::Join { kind, .. }] if kind == "LEFT"));
+    // Forms with no rule do not read.
+    for from in [
+        "dbo.Ord AS o CROSS APPLY dbo.Cust c",
+        "dbo.Ord AS o OUTER APPLY dbo.Cust c",
+        "(dbo.Ord AS o JOIN dbo.Cust c ON c.Id = o.CustId)",
+    ] {
+        let t = format!(
+            "CREATE PROCEDURE dbo.look @id int, @q int OUTPUT AS\nBEGIN\n  SELECT @q = c.Score FROM {from} WHERE o.Id = @id;\nEND\n"
+        );
+        assert!(routines(&t, Dialect::Tsql).remove(0).is_err(), "{from}");
+    }
+    for from in [
+        "Ord AS o JOIN Cust c USING (Id)",
+        "Ord AS o NATURAL JOIN Cust c",
+        "(Ord AS o JOIN Cust c ON c.Id = o.CustId)",
+    ] {
+        let text = pg.replace(
+            "Ord AS o JOIN Cust c ON c.Id = o.CustId, Two CROSS JOIN Pair",
+            from,
+        );
+        assert!(
+            routines(&text, Dialect::Postgres).remove(0).is_err(),
+            "{from}"
+        );
+    }
+    // A label on the block around the loop, or on the routine's block: a
+    // label qualifies variables (`l.x`), so it is not read.
+    for (from, to) in [
+        ("  DECLARE\n  sqldiff_r", "  <<l>>\n  DECLARE\n  sqldiff_r"),
+        ("AS $$\nBEGIN", "AS $$\n<<outer>>\nBEGIN"),
+    ] {
+        let text = pg.replacen(from, to, 1);
+        assert!(
+            routines(&text, Dialect::Postgres).remove(0).is_err(),
+            "{to}"
+        );
+    }
+}

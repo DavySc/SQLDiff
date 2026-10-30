@@ -132,7 +132,7 @@ def bumpP (body : List Ast.Node := bumpBodyP) (params : List Ast.Param := [inP "
 -- fail (the `INSERT` on a duplicate key, an overflow) after writing.
 #guard (residualOf depd Γd bumpT) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS",
-    "ASM-TSQL-ROWCOUNT-0"]
+    "ASM-NO-CALLER-TXN", "ASM-TSQL-ROWCOUNT-0"]
 #guard ((lowerT depd Γd bumpT).map Core.Routine.hasData) == some true
 
 /-- The lowered T-SQL procedure, as the core sees it: column names are the
@@ -201,7 +201,7 @@ setting. -/
   "the PL/pgSQL routine is outside the C1 spec"
 -- `found` is a variable of every PL/pgSQL routine: a column of that name
 -- would be ambiguous too.
-#guard resolveName (.pg Γd ["found"]) (scopeOf (.pg Γd []) { acct with cols := [⟨"found", "found", false, false, .int .i32, none⟩] } ["acct"]) "found" == none
+#guard resolveName (.pg Γd ["found"] []) (scopeOf (.pg Γd [] []) { acct with cols := [⟨"found", "found", false, false, .int .i32, none⟩] } ["acct"]) "found" == none
 -- The table's own name is a whole-row reference in PostgreSQL.
 #guard reasonOf (checkD safeT
     (pgProc ["r"] [inP "p_id"] [] [
@@ -352,7 +352,8 @@ def endOf (r : Option Core.Routine) (args : List V) (db : Db Unit) : Option (Str
         | .arithmetic => "arithmetic"
         | .constraint => "constraint"
         | .other _ => "other"
-        | .user => "user", st.db)
+        | .user => "user"
+        | .cardinality => "cardinality", st.db)
       | .outOfFuel st => ("out of fuel", st.db))
 
 /- An arithmetic error part-way through an `UPDATE`: `total + @n` on

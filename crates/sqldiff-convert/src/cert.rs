@@ -259,9 +259,10 @@ pub const ROWCOUNT_0: &str = "ASM-TSQL-ROWCOUNT-0";
 
 /// Residual ids the checker names whenever a routine needs them, so a
 /// `c2a` confirmation without one proves the converter's note of it.
-/// Not every residual: `ASM-NO-CALLER-TXN` is named only around handlers
-/// and transaction control, while an error that ends a plain routine also
-/// meets the caller's transaction.
+/// Not every residual: `ASM-NO-CALLER-TXN` is named around handlers,
+/// transaction control and (checker 0.16.0) whenever an error can leave the
+/// routine, but the converter notes it for more than these (a `COMMIT`
+/// after an autocommitted statement), so its absence discharges nothing.
 pub const NAMED_WHEN_NEEDED: [&str; 1] = ["ASM-CONCAT-NULL"];
 
 /// Converter assumptions a `c2a` confirmation in the C4 slice (`errors`
@@ -283,9 +284,11 @@ pub struct Trusted {
     pub row_counts: bool,
     /// The deployment profile accepts [`BINARY_COLLATION`].
     pub binary_collation: bool,
-    /// The T-SQL routines the source tree declares, names as written: under
-    /// a binary collation names are case-sensitive, so a call reaches a
-    /// declared routine only when spelled exactly as declared.
+    /// The T-SQL routines the source tree declares, names as written. A call
+    /// is mapped only when spelt exactly as declared, whatever the collation
+    /// the deployment states: in a case-sensitive SQL Server database
+    /// `EXEC dbo.LOOK` does not reach `dbo.look` (2812), while PostgreSQL
+    /// folds both (eval/queries/callee-case-*).
     pub declared_routines: Vec<Vec<String>>,
     /// The routines of the whole converted tree, read back from the output:
     /// the target catalog a call is checked against (a callee may be in
@@ -478,22 +481,33 @@ fn written_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
     }
 }
 
-/// The tables in a query's `FROM`, as written (C3b: the checker reads only
-/// a one-table `FROM`; anything else is refused there).
+/// The tables in a query's `FROM`, as written: each item of the list and,
+/// (C3d) inside a join, both sides (the checker reads inner and cross joins
+/// of catalog tables; other joins and sources are refused there).
 fn from_tables(q: &Select, out: &mut Vec<Vec<String>>) {
-    for f in &q.from {
-        if let From::Table { name, .. } = f {
-            if !out.contains(name) {
-                out.push(name.clone());
+    fn walk(f: &From, out: &mut Vec<Vec<String>>) {
+        match f {
+            From::Table { name, .. } => {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
             }
+            From::Join { left, right, .. } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            _ => {}
         }
+    }
+    for f in &q.from {
+        walk(f, out);
     }
 }
 
 /// The tables a routine's queries read, as written, in the shapes the
 /// checker's C3b slice reads: `SELECT @x = ...`, `SET @x = (SELECT ...)`,
 /// `IF [NOT] EXISTS (SELECT ...)` (formal/lean/Sqldiff/Mirror/Lower.lean,
-/// "The C3b slice: queries").
+/// "The C3b slice: queries"), (C3d) over every table of a join.
 fn read_tables(nodes: &[Node], out: &mut Vec<Vec<String>>) {
     for n in nodes {
         match n {
@@ -1067,7 +1081,10 @@ fn request_with(
     let mut routines = Vec::new();
     for c in calls {
         // Not mapped, the call stays unknown to the checker, which refuses.
-        if !mappable(&c) || (trusted.binary_collation && !trusted.declared_routines.contains(&c)) {
+        // Spelt exactly as declared, as tables are below: a case-sensitive
+        // database need not have a binary collation, so the deployment's
+        // collation fact cannot vouch for another spelling.
+        if !mappable(&c) || !trusted.declared_routines.contains(&c) {
             continue;
         }
         let (to, dbo) = target_routine(&c);
@@ -1095,7 +1112,12 @@ fn request_with(
         }
         let (to, dbo) = target_routine(w);
         let Some(t) = tables.get(&to) else { continue };
-        if trusted.binary_collation && tables.declared(&to) != Some(w.as_slice()) {
+        // Spelt exactly as the DDL declares it, whatever the collation the
+        // deployment states: in a case-sensitive SQL Server database
+        // `dbo.ORD` does not reach `dbo.Ord` (208, Invalid object name),
+        // while PostgreSQL folds both to `ord`. A table named any other way
+        // is not sent, so the checker refuses what reads or writes it.
+        if tables.declared(&to) != Some(w.as_slice()) {
             continue;
         }
         if dbo && !assumptions.iter().any(|x| x == "ASM-DBO-SCHEMA") {
@@ -1632,7 +1654,10 @@ END
             a[1].2.as_ref().unwrap(),
             b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
             &readable,
-            &Trusted::default(),
+            &Trusted {
+                declared_routines: declared_routines(&[src], Dialect::Tsql),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(req.routines, [("dbo.q".to_string(), "q".to_string())]);
@@ -1645,6 +1670,41 @@ END
         let line = req.line(9).unwrap();
         assert!(line.starts_with("sqldiff-check/3\t9\t"), "{line}");
         assert_eq!(line.split('\t').count(), 10, "{line}");
+    }
+
+    #[test]
+    fn a_callee_is_mapped_only_as_declared_brackets_aside() {
+        let mapped = |decl: &str, call: &str| {
+            let src = format!(
+                "CREATE PROCEDURE {decl} @n int AS BEGIN SET @n = @n + 1; END\nGO\n\
+                 CREATE PROCEDURE dbo.p AS BEGIN DECLARE @v int = 1; EXEC {call} @v; END\n"
+            );
+            let out = crate::rewrite(&src, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string();
+            let (a, b) = (
+                routines(&src, Dialect::Tsql),
+                routines(&out, Dialect::Postgres),
+            );
+            let trusted = Trusted {
+                declared_routines: declared_routines(&[&src], Dialect::Tsql),
+                ..Default::default()
+            };
+            let (req, _) = mirror_request(
+                a[1].2.as_ref().unwrap(),
+                b[1].2.as_ref().unwrap_or_else(|e| panic!("{e}\n{out}")),
+                &[],
+                &trusted,
+            )
+            .unwrap();
+            !req.routines.is_empty()
+        };
+        assert!(mapped("dbo.Look", "dbo.Look"));
+        assert!(mapped("[dbo].[Look]", "dbo.Look"));
+        assert!(mapped("dbo.Look", "[dbo].[Look]"));
+        // 2812 in a case-sensitive database (eval/queries/callee-case-mssql.out).
+        assert!(!mapped("dbo.Look", "dbo.LOOK"));
+        assert!(!mapped("dbo.Look", "DBO.Look"));
     }
 
     #[test]
@@ -1710,6 +1770,79 @@ END
             "GO\nCREATE PROCEDURE dbo.q AS BEGIN ALTER TABLE dbo.Acct ADD z int NULL; END\n",
         ] {
             assert!(tables(extra).get("acct").is_none(), "{extra}");
+        }
+    }
+
+    /// C3d: every table of a join, on either side and in a comma list, is
+    /// sent to the checker; a table the routine does not read is not.
+    #[test]
+    fn the_tables_of_a_join_reach_the_checker() {
+        let ddl =
+            "CREATE TABLE dbo.Ord (Id int NOT NULL PRIMARY KEY, Qty int NULL, CustId int NULL);\n\
+                   CREATE TABLE dbo.Cust (Id int NOT NULL PRIMARY KEY, Score int NULL);\n\
+                   CREATE TABLE dbo.Two (A int NOT NULL, B int NOT NULL, V int NULL, \
+                   CONSTRAINT PK_Two PRIMARY KEY (A, B));\n\
+                   CREATE TABLE dbo.Idle (Id int NOT NULL PRIMARY KEY);\n";
+        let proc = "CREATE PROCEDURE dbo.p @id int, @q int OUTPUT AS\nBEGIN\n  \
+                    SELECT @q = c.Score FROM dbo.Ord AS o JOIN dbo.Cust c ON c.Id = o.CustId \
+                    WHERE o.Id = @id;\n  \
+                    SELECT @q = COUNT(*) FROM dbo.Ord o, dbo.Two CROSS JOIN dbo.Cust;\nEND\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let t = Tables::read(&[ddl], &[&convert(ddl)], Dialect::Tsql, Dialect::Postgres);
+        let a = routines(proc, Dialect::Tsql).remove(0).2.unwrap();
+        let b = routines(&convert(proc), Dialect::Postgres)
+            .remove(0)
+            .2
+            .unwrap();
+        let trusted = Trusted {
+            tables: t.clone(),
+            ..Default::default()
+        };
+        let (r, asm) = mirror_request(&a, &b, &[], &trusted).unwrap();
+        let names: Vec<&str> = r.table_catalog.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["ord", "cust", "two"], "{r:?}");
+        assert_eq!(
+            r.tables,
+            [("dbo.Ord", "ord"), ("dbo.Cust", "cust"), ("dbo.Two", "two")]
+                .map(|(x, y)| (x.to_string(), y.to_string()))
+        );
+        assert!(asm.iter().any(|x| x == TABLES_AS_DECLARED), "{asm:?}");
+        // Reads send no rows-affected count.
+        assert!(!asm.iter().any(|x| x == "ASM-OBSERVER-ROWCOUNT"), "{asm:?}");
+        // A table named in another case than its DDL, or without the schema
+        // its DDL gives, is not sent, whatever the collation the deployment
+        // states: a case-sensitive SQL Server database raises 208 for
+        // `dbo.ORD` where PostgreSQL folds it to `ord` (review of C3d).
+        for (spelt, binary) in [
+            ("dbo.ORD", false),
+            ("dbo.ord", false),
+            ("ORD", false),
+            ("Ord", false),
+            ("DBO.Ord", false),
+            ("dbo.ORD", true),
+        ] {
+            let p = format!(
+                "CREATE PROCEDURE dbo.p @id int, @q int OUTPUT AS\nBEGIN\n  \
+                 SELECT @q = c.Score FROM {spelt} AS o JOIN dbo.Cust c ON c.Id = o.CustId \
+                 WHERE o.Id = @id;\nEND\n"
+            );
+            let a = routines(&p, Dialect::Tsql).remove(0).2.unwrap();
+            let b = routines(&convert(&p), Dialect::Postgres)
+                .remove(0)
+                .2
+                .unwrap();
+            let trusted = Trusted {
+                tables: t.clone(),
+                binary_collation: binary,
+                ..Default::default()
+            };
+            let (r, _) = mirror_request(&a, &b, &[], &trusted).unwrap();
+            let names: Vec<&str> = r.table_catalog.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["cust"], "{spelt}: {r:?}");
         }
     }
 
@@ -1882,20 +2015,37 @@ END
             .remove(0)
             .2
             .unwrap_or_else(|e| panic!("{e}\n{out}"));
-        let (req, asm) = mirror_request(&a, &b, &[], &Trusted::default()).unwrap();
+        let declared = |names: &[&[&str]]| Trusted {
+            declared_routines: names
+                .iter()
+                .map(|n| n.iter().map(|p| p.to_string()).collect())
+                .collect(),
+            ..Default::default()
+        };
+        let all = declared(&[&["q"], &["dbo", "r"], &["dbo", "Ärger"]]);
+        let (req, asm) = mirror_request(&a, &b, &[], &all).unwrap();
         // `q` resolves through sales first in T-SQL; Ä folds differently.
         assert_eq!(req.routines, [("dbo.r".to_string(), "r".to_string())]);
         assert!(
             asm.iter().any(|x| x == "ASM-CALLEE-CONFIRMED:dbo.r"),
             "{asm:?}"
         );
-        // Under a binary collation only the declared spelling reaches it.
-        let bin = Trusted {
-            binary_collation: true,
-            declared_routines: vec![vec!["dbo".into(), "R".into()]],
-            ..Default::default()
-        };
-        let (req, _) = mirror_request(&a, &b, &[], &bin).unwrap();
+        // A callee the tree does not declare stays unknown.
+        let (req, _) = mirror_request(&a, &b, &[], &Trusted::default()).unwrap();
+        assert!(req.routines.is_empty(), "{:?}", req.routines);
+        // Only the declared spelling reaches it, whatever the collation: a
+        // case-sensitive database raises 2812 for `dbo.r` against `dbo.R`
+        // (eval/queries/callee-case-mssql.out), binary collation or not.
+        for binary_collation in [false, true] {
+            let other = Trusted {
+                binary_collation,
+                ..declared(&[&["dbo", "R"]])
+            };
+            let (req, _) = mirror_request(&a, &b, &[], &other).unwrap();
+            assert!(req.routines.is_empty(), "{:?}", req.routines);
+        }
+        let schema = declared(&[&["DBO", "r"]]);
+        let (req, _) = mirror_request(&a, &b, &[], &schema).unwrap();
         assert!(req.routines.is_empty(), "{:?}", req.routines);
     }
 

@@ -1,0 +1,29 @@
+Changed database context to 'probe_c3d'.
+Q11 on-pooling: join-on-where=2 comma=2 cross=2 all-in-on=2
+Q11 product: a x b=12 a x b x c=36
+Q11 null join key: a.id=2 joins=0 self on NULL=0
+Q11 self-join: x.bid=y.id rows=3 y.id=x.id rows=4
+Q11 pick by key across a join: n=30 m=200
+Q11 pick, no row (NULL join key): n=-1 m=-1
+Q11 pick through a self-join: n=20
+Q11 pick, two-column key fixed from another table: v=21
+Q11 exists over a join: FALSE
+Q11 exists over a cross join: TRUE
+Q12 unqualified name in two tables: error 209
+Q12 aliased table's own name: error 4104
+Q12 one exposed name twice: error 1013
+Q12 ON names a later table: error 4104
+Q12 ON names a comma table: error 4104
+Q12 aliases swap the table names: no error
+Q12 alias hides the table name: b.n=10 a.m=200
+Q12 unqualified names of one table each: n=30 m=200
+Changed database context to 'probe_c3d_cs'.
+Q12 CS database, alias as spelt: no error
+Q12 CS database, alias in another case: error 4104
+Q12 CS database, column in another case: error 207
+Changed database context to 'probe_c3d'.
+Q13 scalar over a join, n > 30: v=NULL
+Q13 scalar over a join, n > 20: v=200
+Q13 scalar over a join, n > 5: error 512, v=-1
+Q13 XACT_ABORT ON, two rows: error 512 reaches the caller, v=-1
+Changed database context to 'master'.

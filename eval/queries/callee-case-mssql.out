@@ -1,0 +1,8 @@
+Changed database context to 'probe_callee_cs'.
+callee case-sensitive, dbo.look: no error, @v 7
+callee case-sensitive, dbo.LOOK: error 2812
+callee case-sensitive, DBO.look: error 2812
+Changed database context to 'probe_callee_ci'.
+callee case-insensitive, dbo.LOOK: no error, @v 7
+callee case-insensitive, DBO.look: no error, @v 7
+Changed database context to 'master'.
