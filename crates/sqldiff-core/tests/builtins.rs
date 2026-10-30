@@ -299,6 +299,15 @@ fn substring_matches_follow_the_collation() {
             // Grows from an unknown length: T-SQL may cut at 8,000 bytes.
             ("REPLACE(N, , '')", "replace(N, , '')", NotEq),
             ("REPLACE(S, S2, N)", "replace(S, S2, N)", NotEq),
+            // `to` is a part of `from`: never longer, so never cut.
+            ("REPLACE(V, S2 + ' ', S2)", "replace(V, S2 || ' ', S2)", CI),
+            ("REPLACE(N, ' ' + S2, S2)", "replace(N, ' ' || S2, S2)", CI),
+            ("REPLACE(V, S2 + ' ', S)", "replace(V, S2 || ' ', S)", NotEq),
+            (
+                "REPLACE(V, S2, S2 + ' ')",
+                "replace(V, S2, S2 || ' ')",
+                NotEq,
+            ),
             // One character for one, but 😀 is two UTF-16 units (four UTF-8
             // bytes): 4,000 'a's become 8,000 units, which T-SQL cuts.
             ("REPLACE(W, N'a', N'😀')", "replace(W, 'a', '😀')", NotEq),

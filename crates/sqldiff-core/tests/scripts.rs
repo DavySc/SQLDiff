@@ -232,6 +232,49 @@ fn literals_assigned_to_same_types() {
 }
 
 #[test]
+fn strings_assigned_to_shorter_variables() {
+    // 15 + 50 characters into nvarchar(50): SQL Server cuts a longer value
+    // off, PostgreSQL raises; the same under ASM-VARIABLE-LENGTH.
+    let r = equal(
+        "SET XACT_ABORT ON;\nDECLARE @city nvarchar(50);\nDECLARE @bank nvarchar(50);\nSET @city = (SELECT MethodName FROM dbo.Methods WHERE MethodID = 1);\nSET @bank = 'Woodgrove Bank ' + @city;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, @bank, NULL);",
+        "DO $$\nDECLARE\n  v_city varchar(50);\n  v_bank varchar(50);\nBEGIN\n  v_city := (SELECT MethodName FROM Methods WHERE MethodID = 1);\n  v_bank := 'Woodgrove Bank ' || v_city;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, v_bank, NULL);\nEND\n$$;",
+    );
+    assert!(
+        r.assumptions.iter().any(|a| a.id == "ASM-VARIABLE-LENGTH"),
+        "{:?}",
+        r.assumptions
+    );
+    // Its literal alone does not fit: always cut off in T-SQL.
+    let r = run(
+        "SET XACT_ABORT ON;\nDECLARE @city nvarchar(50);\nDECLARE @bank nvarchar(10);\nSET @city = (SELECT MethodName FROM dbo.Methods WHERE MethodID = 1);\nSET @bank = 'Woodgrove Bank ' + @city;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (2, @bank, NULL);",
+        "DO $$\nDECLARE\n  v_city varchar(50);\n  v_bank varchar(10);\nBEGIN\n  v_city := (SELECT MethodName FROM Methods WHERE MethodID = 1);\n  v_bank := 'Woodgrove Bank ' || v_city;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (2, v_bank, NULL);\nEND\n$$;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+}
+
+#[test]
+fn a_uuid_copied_to_a_uuid_variable() {
+    equal(
+        "SET XACT_ABORT ON;\nDECLARE @a uniqueidentifier;\nDECLARE @b uniqueidentifier;\nSET @b = @a;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, CASE WHEN @b = @a THEN 'same' ELSE 'other' END, NULL);",
+        "DO $$\nDECLARE\n  v_a uuid;\n  v_b uuid;\nBEGIN\n  v_b := v_a;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, CASE WHEN v_b = v_a THEN 'same' ELSE 'other' END, NULL);\nEND\n$$;",
+    );
+    // As text: upper case in T-SQL, lower case in PostgreSQL.
+    let r = run(
+        "SET XACT_ABORT ON;\nDECLARE @a uniqueidentifier;\nDECLARE @s varchar(36);\nSET @s = @a;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (1, @s, NULL);",
+        "DO $$\nDECLARE\n  v_a uuid;\n  v_s varchar(36);\nBEGIN\n  v_s := v_a;\n  INSERT INTO Methods (MethodID, MethodName, ValidFrom) VALUES (1, v_s, NULL);\nEND\n$$;",
+    );
+    assert!(
+        !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+        "{:?}",
+        r.verdict()
+    );
+}
+
+#[test]
 fn variables_match_by_name_when_a_declaration_is_dropped() {
     equal(
         "DECLARE @Unused int;\nDECLARE @Id int = 1;\nINSERT dbo.Methods (MethodID, MethodName, ValidFrom) VALUES (@Id, 'x', NULL);",
