@@ -686,6 +686,114 @@ fn the_real_checker_confirms_a_table_with_strings_defaults_and_an_index() {
     assert_eq!(r["answer"], "unconfirmed", "{r}");
 }
 
+/// C2c end to end: a procedure with a `bigint` and a `bit` variable, a
+/// `date` column written from a literal and compared, `DATEADD(day, ...)`
+/// and `DATEADD(month, ...)` on a date, is confirmed by `check_sound_c2a`
+/// and names the two DATEADD facts; a date literal outside the ISO form
+/// and a `DATEADD(hour, ...)` are refused.
+#[test]
+fn the_real_checker_confirms_typed_values() {
+    let Some(real) = std::env::var_os("SQLDIFF_REAL_CHECK") else {
+        return;
+    };
+    let _turn = turn();
+    let d = scratch("c2c-real");
+    let src = d.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    write(
+        &src,
+        "ev.sql",
+        "CREATE TABLE dbo.Ev (Id int NOT NULL, D date NULL, B bit NOT NULL, N bigint NULL, \
+         CONSTRAINT PK_Ev PRIMARY KEY (Id));\nGO\n",
+    );
+    let proc = |tail: &str| {
+        format!(
+            "CREATE PROCEDURE dbo.mark @id int, @big bigint, @flag bit, @when date OUTPUT\nAS\nBEGIN\n  \
+             SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  DECLARE @b bit = 1;\n  DECLARE @n bigint;\n  \
+             DECLARE @d date = '2024-01-31';\n  SET @n = @big + @id;\n  \
+             SET @d = DATEADD(day, 1, @d);\n  SET @d = DATEADD(month, 1, @d);\n  \
+             IF @flag = 1 SET @b = 0;\n  \
+             IF @b = 1 AND @d < '2024-12-31' SET @when = @d;\n  \
+             INSERT INTO dbo.Ev (Id, D, B, N) VALUES (@id, @d, @b, @n);\n  \
+             UPDATE dbo.Ev SET D = DATEADD(day, 7, D), B = 1 WHERE Id = @id;\n  \
+             SELECT @when = D FROM dbo.Ev WHERE Id = @id;\n{tail}END\n"
+        )
+    };
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+            .args([
+                "convert",
+                &src.display().to_string(),
+                "--to",
+                "postgres",
+                "--out",
+            ])
+            .arg(d.join("out"))
+            .args(["--overwrite", "--isolated", "--proof", "report"])
+            .env("SQLDIFF_CHECK", &real)
+            .output()
+            .unwrap();
+        let c: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(d.join("out/certificates.json")).unwrap(),
+        )
+        .unwrap();
+        c["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|f| f["routines"].as_array().unwrap().clone())
+            .find(|r| r["routine"] == "dbo.mark")
+            .unwrap()
+    };
+    write(&src, "mark.sql", &proc(""));
+    let r = run();
+    // The converter writes the forms the checker reads: boolean literals,
+    // date arithmetic as `+ n` and `make_interval`, the typed columns.
+    let out = std::fs::read_to_string(d.join("out/mark.sql")).unwrap();
+    for shape in [
+        "v_b := TRUE;",
+        "IF p_flag = TRUE THEN",
+        "v_d := (v_d + 1);",
+        "v_d := (v_d + make_interval(months => 1))::date;",
+        "IF v_b = TRUE AND v_d < '2024-12-31' THEN",
+        "UPDATE Ev SET D = (D + 7), B = TRUE WHERE Id = p_id;",
+    ] {
+        assert!(out.contains(shape), "{shape}:\n{out}");
+    }
+    assert_eq!(r["answer"], "confirmed", "{r}");
+    assert_eq!(r["theorems"][0], "Sqldiff.Mirror.check_sound_c2a", "{r}");
+    assert_eq!(r["scalars"], "c2a", "{r}");
+    assert_eq!(r["statements"], "c3b", "{r}");
+    let asm: Vec<&str> = r["assumptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap())
+        .collect();
+    for a in [
+        "ASM-TSQL-ARITH-ERRORS",
+        "ASM-TSQL-ANSI-NULLS",
+        "ASM-DATEADD-RANGE",
+        "ASM-TABLES-AS-DECLARED",
+    ] {
+        assert!(asm.contains(&a), "{a}: {r}");
+    }
+    // No year is added: the year-end fact is not named.
+    assert!(!asm.contains(&"ASM-DATEADD-YEAR-END"), "{r}");
+    // A date literal T-SQL reads by DATEFORMAT, or DATEADD(hour, ...) on a
+    // date (which T-SQL itself refuses): outside the spec.
+    write(&src, "mark.sql", &proc("  SET @d = '01/02/2024';\n"));
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+    write(
+        &src,
+        "mark.sql",
+        &proc("  SET @d = DATEADD(hour, 1, @d);\n"),
+    );
+    let r = run();
+    assert_eq!(r["answer"], "unconfirmed", "{r}");
+}
+
 /// C2b end to end: concatenation and ISNULL over bounded string variables
 /// are confirmed in the slice, and the leading SET CONCAT_NULL_YIELDS_NULL
 /// ON discharges ASM-CONCAT-NULL in the release gate. A string `=` is
