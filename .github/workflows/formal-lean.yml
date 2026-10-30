@@ -11,22 +11,15 @@ name: Lean checker
 # CLI; Lean 4.19's own linker produced macOS binaries dyld refuses
 # ("__DATA_CONST segment missing SG_READ_ONLY flag"), Lean 4.35 does not.
 
-# Every change to the checker, the request format it reads, the generated
-# Lean syntax types, or the CLI code that runs it builds and tests it, on
-# pull requests and on main.
+# Every push to main (or the verification branch) builds and tests the
+# checker: what the Rust CLI's proof tests send it depends on the converter
+# and the engine too, so a path filter there let a converter change break
+# `the_real_checker` tests unseen. Pull requests run it when they touch the
+# checker, the request format, the generated Lean syntax types, the CLI
+# code that runs it, or the converter whose output it reads.
 on:
   push:
     branches: [main, verification]
-    paths:
-      - "formal/lean/**"
-      - ".github/workflows/formal-lean.yml"
-      # The request format and the generated Lean syntax types.
-      - "crates/sqldiff-core/src/proof.rs"
-      - "crates/sqldiff-syntax/src/kind.rs"
-      - "crates/sqldiff-syntax/src/encode.rs"
-      # The CLI side of the protocol (`the_real_checker`).
-      - "crates/sqldiff-cli/src/checker.rs"
-      - "crates/sqldiff-cli/tests/proof.rs"
   pull_request:
     paths:
       - "formal/lean/**"
@@ -38,6 +31,8 @@ on:
       # The CLI side of the protocol (`the_real_checker`).
       - "crates/sqldiff-cli/src/checker.rs"
       - "crates/sqldiff-cli/tests/proof.rs"
+      # What the converter writes and the certificate it sends.
+      - "crates/sqldiff-convert/src/**"
   workflow_dispatch:
 
 jobs:
