@@ -1063,6 +1063,76 @@ fn the_real_checker_refuses_what_the_review_found() {
         &PG.replace("TABLE line", "TABLE pg_line"),
         unknown,
     );
+    // Third review: what a deployment runs is an allow-list of statement
+    // kinds and calls. A `U&` name (F1), a call run later by a declared
+    // body, a default or a view, a psql meta-command, an extension (F2), a
+    // change of `search_path` (F4), a procedure called without `EXEC` (F6)
+    // keep the table out.
+    count("Line");
+    for b in [
+        "ALTER TABLE U&\"\\006Cine\" RENAME COLUMN qty TO ordid2;\n",
+        "CREATE EXTENSION dblink;\nCREATE FUNCTION setup() RETURNS void LANGUAGE plpgsql AS $$\n\
+         BEGIN PERFORM dblink_exec('dbname=x', 'SELECT 1'); END $$;\nSELECT setup();\n",
+        "CREATE TABLE deploy_log (id integer, note text DEFAULT dblink_exec('dbname=x', 'SELECT 1'));\n",
+        "CREATE VIEW deploy_v AS SELECT dblink_exec('dbname=x', 'SELECT 1') AS r;\n",
+        "SELECT format('SELECT %s', 1) \\gexec\n",
+        "CREATE SCHEMA app;\nALTER DATABASE rr SET search_path = app, public;\n",
+    ] {
+        refused(TABLES, &format!("{PG}{b}"), unknown);
+    }
+    refused(&format!("{TABLES}Comment;\nGO\n"), PG, unknown);
+    refused(
+        &format!(
+            "{TABLES}CREATE TABLE dbo.Log (Id int NOT NULL PRIMARY KEY);\nGO\n\
+             CREATE TRIGGER dbo.tr ON dbo.Log AFTER INSERT AS\nBEGIN\n  \
+             DECLARE @s nvarchar(100) = N'SELECT 1';\n  EXEC (@s);\nEND\nGO\n"
+        ),
+        PG,
+        unknown,
+    );
+    assert_eq!(run(TABLES, PG).0, "confirmed");
+    // F5: two procedures alike in their first 63 bytes of PostgreSQL name.
+    let long = "ComputeTheReplenishmentQuantityForTheWarehousePlanningModuleVersion";
+    for f in std::fs::read_dir(&src).unwrap() {
+        std::fs::remove_file(f.unwrap().path()).unwrap();
+    }
+    for (n, k) in [("One", 1), ("Two", 2)] {
+        write(
+            &src,
+            &format!("{n}.sql"),
+            &format!(
+                "CREATE PROCEDURE dbo.{long}{n} @n int, @q int OUTPUT\nAS\nBEGIN\n  \
+                 SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SET @q = @n + {k};\nEND\n"
+            ),
+        );
+    }
+    let o = Command::new(env!("CARGO_BIN_EXE_sqldiff"))
+        .args([
+            "convert",
+            &src.display().to_string(),
+            "--to",
+            "postgres",
+            "--out",
+        ])
+        .arg(d.join("out"))
+        .args(["--overwrite", "--isolated", "--proof", "report"])
+        .env("SQLDIFF_CHECK", &real)
+        .output()
+        .unwrap();
+    let c: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(d.join("out/certificates.json")).unwrap())
+            .unwrap_or_else(|e| panic!("{e}: {o:?}"));
+    let rs: Vec<serde_json::Value> = c["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|f| f["routines"].as_array().unwrap().clone())
+        .collect();
+    assert_eq!(rs.len(), 2, "{c}");
+    for r in rs {
+        assert_eq!(r["answer"], "unconfirmed", "{r}");
+        assert_eq!(r["why"][0], "pair:name-too-long", "{r}");
+    }
 }
 
 /// C3c end to end: a procedure over a table with a `varchar` and an
