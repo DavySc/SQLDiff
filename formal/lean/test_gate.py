@@ -9,7 +9,10 @@ with the collation fact in CATALOG and the string residuals; C4 pairs
 rollback-and-rethrow idiom with COMMIT), with the C4 residuals and the
 `errors` field; C3b queries (`SELECT @x = col` against the PL/pgSQL `FOR`
 block, `EXISTS`, scalar subqueries, `COUNT(*)`), with `statements` `c3b`;
-C3c string columns and constant defaults in the CATALOG.
+C3c string columns and constant defaults in the CATALOG; (0.13.0) the
+`why` reason codes on an unconfirmed answer whose routine is outside the
+spec (Sqldiff/Mirror/Diagnose.lean), and their absence on every other
+answer, confirmed or not.
 Anything else is unconfirmed, including malformed requests.
 
 Usage: python3 test_gate.py PATH-TO-BINARY
@@ -658,6 +661,27 @@ cases += [
     ("97", req3c(97, cat=c_cat(name="v")), "unconfirmed"),
     ("98", req3c(98, cat=c_cat(city=f"w30.{hx('City')}.x1")), "unconfirmed"),
 ]
+# 0.13.0: refusal diagnostics. One routine per family; the unconfirmed
+# cases above whose reason is "outside the C1 spec" carry `why` too (EXTRA).
+DEC = ty("DECIMAL", "18", "2")
+cases += [
+    # A result set: SELECT Qty FROM dbo.Acct WHERE Id = @id assigns nothing.
+    ("99", req3q(99, q_t([C("NStmt", C("SSelect", sel([item(col("Qty"))], ["dbo", "Acct"], Q_KEY_T)))]),
+                 q_p([FOR_P])), "unconfirmed"),
+    # A setting the rules do not know, and @@ROWCOUNT: both named, in order.
+    ("100", req3q(100, q_t([C("Setting", S("ANSI_NULLS"), "f"), assign(tv("@q"), tv("@@ROWCOUNT"))]),
+                  q_p([assign(pv("p_q"), num(1))])), "unconfirmed"),
+    # The T-SQL side lowers; the PL/pgSQL procedure returns a value.
+    ("101", req3q(101, q_t([ABORT]), q_p([C("NStmt", C("Return", num(1)))])), "unconfirmed"),
+    # A decimal(18,2) parameter with a default: the type is named, sanitised.
+    ("102", req3(102, a=proc(["dbo", "pd"], [C("Param", S("@d"), DEC, C("In"), num(1))], [], []),
+                 b=proc(["pd"], [C("Param", S("d"), DEC, C("In"), num(1))], [], []),
+                 dep="0", cat="-", cert=f"{hx('%status')}:{hx('%status')}"), "unconfirmed"),
+    # UPDATE acct a SET ... on the PL/pgSQL side.
+    ("103", req3d(103, b=proc(["bump"], [param("p_id", "In"), param("p_n", "In")], [], [
+        C("NStmt", C("Update", L(S("acct")), S("a"), L(C("Set", L(S("qty")), num(1))), L(), NONE))])),
+     "unconfirmed"),
+]
 THEOREMS = {
     "91": "Sqldiff.Mirror.check_sound_c2a",
     "83": "Sqldiff.Mirror.check_sound_c2a",
@@ -684,8 +708,44 @@ THEOREMS = {
     "56": "Sqldiff.Mirror.check_sound_c2a",
     "59": "Sqldiff.Mirror.check_sound_c2a",
 }
-# The fields a confirmed /3 answer adds (Main.lean); none on /2 or unconfirmed answers.
+# The fields a confirmed /3 answer adds (Main.lean); none on /2 answers. An
+# unconfirmed /3 answer whose routine is outside the spec adds `why` (0.13.0),
+# the reason codes of Sqldiff/Mirror/Diagnose.lean; no other answer does.
 EXTRA = {
+    "35": {"why": ["node:call:name"]},
+    "36": {"why": ["node:call:name"]},
+    # A T-SQL routine as the PL/pgSQL side: every construct named, in order.
+    "38": {"why": ["stmt:declare:pg", "expr:pg-var", "stmt:assign:target", "node:call:name",
+                   "stmt:return:pg-proc"]},
+    "45": {"why": ["stmt:update:table:unknown", "stmt:insert:table:unknown"]},
+    "46": {"why": ["stmt:update:table:unknown", "stmt:insert:table:unknown"]},
+    "48": {"why": ["expr:name:unresolved"]},
+    "49": {"why": ["stmt:dml:rowcounts"]},
+    "58": {"why": ["store:assign:varchar_20", "expr:fn:isnull"]},
+    "65": {"why": ["expr:fn:error:error_number"]},
+    "66": {"why": ["node:raise:level"]},
+    "68": {"why": ["routine:param:default"]},
+    "72": {"why": ["node:raise:opts"]},
+    "73": {"why": ["node:txn:begin", "node:txn:commit", "node:txn:rollback"]},
+    "75": {"why": ["node:try:idiom", "node:txn:begin", "node:txn:commit"]},
+    "76": {"why": ["store:assign:varchar_20"]},
+    "77": {"why": ["store:assign:varchar_20", "expr:fn:upper"]},
+    "78": {"why": ["store:declare:varchar_3"]},
+    "79": {"why": ["store:return:varchar_5"]},
+    "80": {"why": ["store:call"]},
+    "81": {"why": ["store:declare:varchar_3"]},
+    "84": {"why": ["stmt:select:where:not-key"]},
+    "90": {"why": ["node:for-query"]},
+    "92": {"why": ["stmt:insert:value", "stmt:update:value", "expr:fn:rtrim"]},
+    "93": {"why": ["stmt:insert:table:not-plain", "stmt:update:table:not-plain", "stmt:select:table:not-plain"]},
+    "94": {"why": ["stmt:insert:table:not-plain", "stmt:update:table:not-plain", "stmt:select:table:not-plain"]},
+    "95": {"why": ["stmt:insert:value"]},
+    "96": {"why": ["stmt:insert:value"]},
+    "99": {"why": ["stmt:select:result-set"]},
+    "100": {"why": ["node:setting:ansi_nulls", "expr:var:global:rowcount"]},
+    "101": {"why": ["stmt:return:pg-proc"]},
+    "102": {"why": ["routine:param:decimal_18_2"]},
+    "103": {"why": ["stmt:update:alias"]},
     "91": {"scalars": "c2a",
            "residual": ["ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR", "ASM-TSQL-STRING-ARGS"],
            "statements": "c3b"},
@@ -744,4 +804,12 @@ for (want_id, line, want), got in zip(cases, answers):
         base = {"id", "proof", "reason"}
     extra = {k: v for k, v in got.items() if k not in base}
     assert extra == EXTRA.get(want_id, {}), got
+    if "why" in got:
+        # The codes are what the README's table promises: ASCII `family:detail`,
+        # distinct, at most 24, only on the two outside-spec reasons.
+        assert got["proof"] == "unconfirmed" and got["reason"].endswith("is outside the C1 spec"), got
+        assert got["why"] and len(got["why"]) <= 24 and len(set(got["why"])) == len(got["why"]), got
+        assert all(re.fullmatch(r"[a-z0-9_/.-]+(:[a-z0-9_/.-]+)+", c) for c in got["why"]), got
+    elif got["proof"] == "unconfirmed":
+        assert not got["reason"].endswith("is outside the C1 spec"), got
 print(f"gate protocol ok ({len(cases)} cases)")

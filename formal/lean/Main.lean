@@ -28,6 +28,17 @@ Answers. `/2` and an unconfirmed `/3`:
   {"id":ID,"proof":"confirmed","theorem":NAME}
   {"id":ID,"proof":"unconfirmed","reason":TEXT}
 
+An unconfirmed `/3` answer whose reason is "the T-SQL routine is outside
+the C1 spec" or "the PL/pgSQL routine is outside the C1 spec" has one
+more field after `reason` (0.13.0, `Sqldiff.Mirror.Request.extra`):
+
+  {"id":ID,"proof":"unconfirmed","reason":TEXT,"why":["stmt:select:from:join","expr:subquery"]}
+
+`why` names the constructs the lowering refused in that routine, as reason
+codes `family:detail` (the table is in README.md, "Refusal diagnostics");
+it is untrusted, informational, never empty there and absent everywhere
+else.
+
 A confirmed `/3` answer has more fields after `theorem`
 (`Sqldiff.Mirror.Request.extra`); a reader that ignores unknown fields
 reads it as before:
@@ -101,6 +112,12 @@ nothing a finished call shows before either), so a conversion with a
 read like one without. The residual and the `"errors":"c4"` field now
 also come from the PL/pgSQL routine's `COMMIT`s, so such a confirmation
 still names `ASM-NO-CALLER-TXN`. Request format unchanged.
+
+0.13.0: an unconfirmed answer whose routine is outside the spec carries
+`"why"`, the reason codes above (`Sqldiff/Mirror/Diagnose.lean`). No
+answer changes: the codes are computed after the check, from the
+untrusted diagnostic, and no theorem depends on them. Every reason text,
+every other field and the request format are unchanged.
 -/
 import Sqldiff.Gate
 import Sqldiff.Mirror.Request
@@ -112,11 +129,12 @@ def protocol : String := "sqldiff-check/2"
 def mirrorProtocol : String := "sqldiff-check/3"
 
 /-- The JSON answer. `id` is digits and the other strings are constants
-of this program, so nothing needs escaping. -/
+of this program (the `why` codes are ASCII `[a-z0-9:_/.-]`), so nothing
+needs escaping. -/
 def answerLine (id : String) (a : Answer) (extra : String := "") : String :=
   match a with
   | .confirmed t => s!"\{\"id\":\"{id}\",\"proof\":\"confirmed\",\"theorem\":\"{t}\"{extra}}"
-  | .unconfirmed r => s!"\{\"id\":\"{id}\",\"proof\":\"unconfirmed\",\"reason\":\"{r}\"}"
+  | .unconfirmed r => s!"\{\"id\":\"{id}\",\"proof\":\"unconfirmed\",\"reason\":\"{r}\"{extra}}"
 
 /-- The answer for a well-formed request. -/
 def decide (schema da ta xa db tb xb : String) : Answer :=
@@ -154,7 +172,7 @@ partial def serve (inp out : IO.FS.Stream) : IO Unit := do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["--version"] then
-    IO.println s!"sqldiff-check 0.12.0 ({protocol}, {mirrorProtocol})"
+    IO.println s!"sqldiff-check 0.13.0 ({protocol}, {mirrorProtocol})"
     return 0
   serve (← IO.getStdin) (← IO.getStdout)
   return 0
