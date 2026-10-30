@@ -948,10 +948,10 @@ sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMP-TABLE"
-statement = "A #temp table converted to a session- or job-scoped temporary table is not created twice in one session."
+statement = "A #temp table converted to a session- or job-scoped temporary table is not created twice in one session: no temporary table of its name exists when the procedure creates it (T-SQL creates its own beside a caller's #t), and the procedure is not left by an error between creating and dropping it (T-SQL drops the table then, the target keeps it)."
 discharge = "deployment"
 fact = "How sessions run the code."
-sites = ["sqldiff-convert/src/tsql.rs"]
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/mod.rs"]
 
 [[assumption]]
 id = "ASM-TEMPLATE-DIRECTIVE"
