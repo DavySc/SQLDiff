@@ -261,7 +261,11 @@ compared.
 T-SQL `EXEC (…)` and `EXEC [sys.]sp_executesql …` run a string as a batch;
 PL/pgSQL `EXECUTE '…'` runs a string as one statement. Both are compared by
 the statement their text runs (`equiv/dynamic.rs`), paired in order and in
-the same place among the data statements, like calls.
+the same place among the data statements, like calls. Where the converter
+refused a T-SQL dynamic statement, it writes `RAISE EXCEPTION 'sqldiff:
+statement at source line N was not converted'` in its place: a T-SQL dynamic
+statement at a line so named has no counterpart and is not compared, and
+the others pair in order when the counts then match.
 
 The T-SQL text must be fixed by the code alone: string literals, `NCHAR(n)`
 and `CHAR(n)` of a constant, `QUOTENAME` and `+` over those, and local

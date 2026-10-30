@@ -819,6 +819,33 @@ fn calls(
     }
 }
 
+/// The source lines that a PostgreSQL text names in the converter's
+/// refusal `RAISE EXCEPTION 'sqldiff: statement at source line N was not
+/// converted'`.
+fn refused_lines(p: &Analyzed) -> Vec<usize> {
+    use sqldiff_syntax::SyntaxKind;
+    p.root
+        .descendants()
+        .filter(|n| n.kind() == SyntaxKind::STATEMENT)
+        .filter_map(|n| {
+            let ts = ast::tokens(&n);
+            let ts: Vec<&ast::Tok> = ts.iter().filter(|t| t.text != ";").collect();
+            let [r, e, m] = ts.as_slice() else {
+                return None;
+            };
+            if r.up != "RAISE" || e.up != "EXCEPTION" || m.kind != ast::K::Str {
+                return None;
+            }
+            ast::string_value(&m.text)
+                .ok()?
+                .strip_prefix("sqldiff: statement at source line ")?
+                .strip_suffix(" was not converted")?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
 /// Compares dynamic SQL (`dynamic.rs`): T-SQL `EXEC (…)` / `sp_executesql`
 /// against PL/pgSQL `EXECUTE '…'`, paired in order, each by the one
 /// statement its text runs. The texts are compared like two files, so the
@@ -852,7 +879,37 @@ fn dynamic_sql(
         (Dialect::Postgres, Dialect::Tsql) => Some(false),
         _ => None,
     };
-    let paired = t_is_a.is_some() && ua.dynamic.len() == ub.dynamic.len();
+    // The converter writes `RAISE EXCEPTION 'sqldiff: statement at source
+    // line N was not converted'` in place of a statement it refuses: a T-SQL
+    // dynamic statement at line N then has no PostgreSQL counterpart. Without
+    // those, the rest pair in order when the counts match.
+    let mut da: Vec<&(SyntaxNode, lower::CallAt)> = ua.dynamic.iter().collect();
+    let mut db: Vec<&(SyntaxNode, lower::CallAt)> = ub.dynamic.iter().collect();
+    if let (Some(t_is_a), true) = (t_is_a, ua.dynamic.len() != ub.dynamic.len()) {
+        let (t, p, dt, dp) = if t_is_a {
+            (a, b, &mut da, &db)
+        } else {
+            (b, a, &mut db, &da)
+        };
+        let raised = refused_lines(p);
+        let kept: Vec<_> = dt
+            .iter()
+            .copied()
+            .filter(|(n, _)| !raised.contains(&t.line_of(n)))
+            .collect();
+        if kept.len() == dp.len() {
+            let tn = side_name(t);
+            for (n, _) in dt.iter().filter(|(n, _)| raised.contains(&t.line_of(n))) {
+                out.unknown_reasons.push(format!(
+                    "{tn} line {}: the dynamic SQL {} is not compared: it was not converted (PostgreSQL raises an error in its place)",
+                    t.line_of(n),
+                    shown(n)
+                ));
+            }
+            *dt = kept;
+        }
+    }
+    let paired = t_is_a.is_some() && da.len() == db.len();
     if !paired {
         let why = if t_is_a.is_none() {
             "only T-SQL against PostgreSQL is".to_string()
@@ -885,7 +942,7 @@ fn dynamic_sql(
                 .iter()
                 .all(|s| matches!(s.ast, Ok(ast::Stmt::Assign(..))))
     };
-    for (k, ((xn, at_a), (yn, at_b))) in ua.dynamic.iter().zip(&ub.dynamic).enumerate() {
+    for (k, ((xn, at_a), (yn, at_b))) in da.into_iter().zip(db).enumerate() {
         let (la, lb) = (a.line_of(xn), b.line_of(yn));
         let unknown = |out: &mut Outcome, why: &str| {
             out.unknown_reasons.push(format!(
