@@ -12,9 +12,9 @@ An id `ASM-NAME:qualifier` is an instance of `ASM-NAME` (binding assumptions nam
 |---|---|---|
 | `catalog` | A fact a catalog snapshot holds: keys, types, collation, triggers, routines | 55 |
 | `generated` | Code the converter or the generator writes: a constraint, a cast, the converted callee, the woven instances | 21 |
-| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 100 |
+| `deployment` | A declaration about the deployment no artifact shows: callers, sessions, data | 101 |
 | `nothing` | None of these: a vendor fact still to verify, an engine limit, or a per-routine review. A deployment profile cannot accept it | 29 |
-| | Total | 205 |
+| | Total | 206 |
 
 A deployment profile (`[deployment] accept`, docs/packs-and-config.md) may accept any id whose discharge is not `nothing`. Accepting does not change a verdict: the unit stays "equal under assumptions" and the report names the profile that accepted each assumption.
 
@@ -56,6 +56,7 @@ Keys of `[deployment.facts]`. A fact asserted there is reported as the user's ow
 | `ASM-BIND-TRIGGER-ROW` | The trigger's table has the columns the trigger body reads from NEW and OLD. | `catalog` | The trigger table's columns in the catalog. | `sqldiff-core/src/bind/query.rs` |
 | `ASM-BIND-TYPE` | A type the code names is a user-defined type or domain that exists in the target database. | `catalog` | The type's definition in the catalog. | `sqldiff-core/src/bind/mod.rs` |
 | `ASM-BIND-UNREAD` | Text SQLDiff could not read (placeholders, an unreadable routine header, a parse problem) does not change what the statements bind to. | `nothing` | A file that parses without placeholders; until then a reviewer reads the unread text. | `sqldiff-core/src/bind/doubt.rs` |
+| `ASM-BIT-BOOLEAN` | Code and applications outside the conversion that read or write a converted bit use false and true where T-SQL used 0 and 1. | `deployment` | BIT becomes boolean, the default PostgreSQL mapping (decided by the owner 2026-10-30); the callers are adapted with the deployment. | `sqldiff-convert/src/tsql.rs` |
 | `ASM-BIT-BOOLEAN-COLUMN` | The T-SQL bit column's 0 and 1 are the PostgreSQL boolean column's false and true. | `deployment` | The data migration maps bit 0 and 1 to false and true (the value correspondence of the deployment). | `sqldiff-core/src/equiv/table.rs` |
 | `ASM-BIT-SMALLINT` | Only 0, 1 and NULL are written to a T-SQL bit converted to SMALLINT. | `generated` | A CHECK (x IN (0, 1)) on the converted column, or callers that write only 0, 1 and NULL. | `sqldiff-convert/src/tsql.rs`<br>`sqldiff-convert/src/tsql/bits.rs` |
 | `ASM-BUILTIN-ABSENT` | The dialect has no built-in function with a name the code calls (it is not on SQLDiff's built-in list). | `catalog` | The target's function list in the catalog. | `sqldiff-core/src/bind/query.rs` |

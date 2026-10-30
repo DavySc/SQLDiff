@@ -1292,6 +1292,24 @@ impl<'a> Canon<'a> {
                 None,
             ),
             Expr::Call(c) => self.call(c)?,
+            // The converter's CHARINDEX of a needle that may be empty:
+            // strpos(s, x) - (length(x) = 0)::int, which is 0 for an empty
+            // needle and NULL for a NULL argument, as CHARINDEX is.
+            Expr::Bin(op, l, r)
+                if self.d == Dialect::Postgres && op == "-" && charindex_sub(l, r).is_some() =>
+            {
+                let (hay, needle) = charindex_sub(l, r).unwrap();
+                let (h, hty) = self.expr(hay)?;
+                let (x, xty) = self.expr(needle)?;
+                if [hty, xty]
+                    .iter()
+                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
+                {
+                    let ci = self.collation_marker();
+                    return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
+                }
+                (n("dfn", vec![self.dtag(), a("charindex-sub"), h, x]), None)
+            }
             Expr::Bin(op, l, r) => self.binary(op, l, r)?,
             Expr::Unary(op, x) => {
                 let (t, ty) = self.expr(x)?;
@@ -1546,23 +1564,6 @@ impl<'a> Canon<'a> {
                 }
                 let v = self.expr(x)?;
                 self.cast(dst, v)
-            }
-            // The converter's CHARINDEX of a needle that may be empty:
-            // CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END.
-            Expr::Case(None, whens, Some(els))
-                if self.d == Dialect::Postgres && charindex_case(whens, els).is_some() =>
-            {
-                let (hay, needle) = charindex_case(whens, els).unwrap();
-                let (h, hty) = self.expr(hay)?;
-                let (x, xty) = self.expr(needle)?;
-                if [hty, xty]
-                    .iter()
-                    .all(|t| t.is_some_and(|t| t.fam == Fam::VarChar))
-                {
-                    let ci = self.collation_marker();
-                    return Ok((n("strpos", vec![a(ci), h, x]), Some(INT32)));
-                }
-                (n("dfn", vec![self.dtag(), a("charindex-case"), h, x]), None)
             }
             Expr::Case(op, whens, els) => {
                 let mut kids = Vec::new();
@@ -2435,11 +2436,12 @@ impl<'a> Canon<'a> {
                     first_ty.map(|t| Ty { len: None, ..t }),
                 )
             }
-            // CHARINDEX(needle, s): 0 for an empty needle. PostgreSQL's
-            // strpos(s, needle) agrees once the needle cannot be empty, or
-            // inside the converter's `CASE WHEN length(x) = 0 THEN 0 ELSE
-            // strpos(s, x) END` (lowered in `expr`). Collation as for REPLACE;
-            // positions under ASM-TSQL-LEN-BMP.
+            // CHARINDEX(needle, s): 0 for an empty needle, NULL for a NULL
+            // argument (CHARINDEX('', 'abc') = 0, CHARINDEX('', NULL) IS
+            // NULL on SQL Server 2022). PostgreSQL's strpos(s, needle) agrees
+            // once the needle cannot be empty, or inside the converter's
+            // `strpos(s, x) - (length(x) = 0)::int` (lowered in `expr`).
+            // Collation as for REPLACE; positions under ASM-TSQL-LEN-BMP.
             (Dialect::Tsql, "charindex", 2)
                 if args
                     .iter()
@@ -6254,9 +6256,17 @@ fn literal_chars(t: &Term) -> u32 {
     }
 }
 
-/// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END`: (s, x).
-fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
-    let [(Expr::Bin(op, l, r), Expr::Num(zero))] = whens else {
+/// `strpos(s, x) - (length(x) = 0)::int`: (s, x). Exactly this shape: a
+/// `CASE WHEN length(x) = 0 THEN 0 ELSE strpos(s, x) END` is 0, not NULL,
+/// for an empty needle and a NULL haystack, so it is not CHARINDEX.
+fn charindex_sub<'e>(l: &'e Expr, r: &'e Expr) -> Option<(&'e Expr, &'e Expr)> {
+    let Expr::Cast(cond, ty) = r else {
+        return None;
+    };
+    if !matches!(ty.name.as_str(), "INT" | "INTEGER" | "INT4") || !ty.args.is_empty() {
+        return None;
+    }
+    let Expr::Bin(op, len, zero) = cond.as_ref() else {
         return None;
     };
     let call = |e: &'e Expr, name: &str, argc: usize| match e {
@@ -6272,9 +6282,9 @@ fn charindex_case<'e>(whens: &'e [(Expr, Expr)], els: &'e Expr) -> Option<(&'e E
         }
         _ => None,
     };
-    let x = &call(l, "length", 1)?[0];
-    let pos = call(els, "strpos", 2)?;
-    (op == "=" && zero == "0" && matches!(r.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
+    let x = &call(len, "length", 1)?[0];
+    let pos = call(l, "strpos", 2)?;
+    (op == "=" && matches!(zero.as_ref(), Expr::Num(z) if z == "0") && &pos[1] == x)
         .then_some((&pos[0], x))
 }
 
