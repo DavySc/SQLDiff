@@ -938,6 +938,15 @@ fn render_inner(t: &Term) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        "ufn" => format!(
+            "{}({})",
+            r(0),
+            k.iter()
+                .skip(1)
+                .map(render_inner)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         "dfn" => format!(
             "{}({})",
             r(1),

@@ -467,6 +467,10 @@ pub fn convert_with(
             .collect();
         b.flag(&files, results.iter_mut().map(|(c, _)| c), a.from);
     }
+    // A call to a converted user function holds when the function's own
+    // conversion does.
+    let mut convs: Vec<&mut Conversion> = results.iter_mut().map(|(c, _)| c).collect();
+    crate::callees::resolve(inputs, &mut convs, a.from);
     let mut files = Vec::new();
     let mut outputs = Vec::new();
     let mut conversions = Vec::new();

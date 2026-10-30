@@ -5932,13 +5932,27 @@ impl<'a> Cx<'a> {
                 if lit != t.s {
                     self.step_ts("tsql.expr.unicode-literal", &ts[i..=i]);
                 }
-                if !self.db2() && rounds_past_year_9999(&string_value(lit)) {
+                // T-SQL's end of time compared with a value (a temporal
+                // table's ValidTo): written with 6 digits under
+                // ASM-END-OF-TIME, as in a store (`end_of_time_store`). The
+                // engine compares the two, so against anything but a
+                // datetime2(7) value (a string, a shorter time) they stay
+                // apart.
+                let eot = !self.db2() && end_of_time(&string_value(lit)) && compared(ts, i);
+                if eot {
+                    self.note(Status::Assumptions, "ASM-END-OF-TIME", END_OF_TIME_NOTE);
+                    self.step_ts("tsql.expr.end-of-time-literal", &ts[i..=i]);
+                    o.push_str("'9999-12-31 23:59:59.999999'");
+                    self.string_compare(ts, i);
+                } else if !self.db2() && rounds_past_year_9999(&string_value(lit)) {
                     self.step_ts("tsql.end-of-time-literal", &ts[i..=i]);
                     self.note(Status::Differs, "tsql.end-of-time-literal", "This literal is the end of time at 100 ns precision (DATETIME2(7)). PostgreSQL keeps microseconds and rounds it up to 10000-01-01 00:00:00, so it no longer equals the largest stored value (a system-versioned table's current rows end at 9999-12-31 23:59:59.999999). Write '9999-12-31 23:59:59.999999' if it means the end of time.");
                 }
-                o.push_str(lit);
-                self.string_compare(ts, i);
-                self.fraction_note(t, lit);
+                if !eot {
+                    o.push_str(lit);
+                    self.string_compare(ts, i);
+                    self.fraction_note(t, lit);
+                }
             }
             // `0x01 + @b`: every operand is binary, so `+` concatenates.
             OP if t.s == "+" && self.binary_chain(ts) => {
@@ -6301,7 +6315,7 @@ impl<'a> Cx<'a> {
         if text != "9999-12-31 23:59:59.9999999" {
             return None;
         }
-        self.note(Status::Assumptions, "ASM-END-OF-TIME", "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written '9999-12-31 23:59:59.999999': PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00. Equal only if the value is just an open-end sentinel, compared with values converted the same way (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit rather than rounding it.");
+        self.note(Status::Assumptions, "ASM-END-OF-TIME", END_OF_TIME_NOTE);
         self.step_ts("tsql.expr.end-of-time-literal", &ts[i..=i]);
         Some("'9999-12-31 23:59:59.999999'".into())
     }
@@ -8258,6 +8272,37 @@ fn style_format(dt: Dt, style: u32) -> Option<(&'static str, u32)> {
 fn string_builtin(ts: &[T], i: usize) -> bool {
     let qualified = prev_sig(ts, i).is_some_and(|d| ts[d].k == DOT);
     !qualified && ["CHAR", "NCHAR", "DB_NAME"].iter().any(|w| ts[i].is(w))
+}
+
+const END_OF_TIME_NOTE: &str = "T-SQL's end of time '9999-12-31 23:59:59.9999999' is written '9999-12-31 23:59:59.999999': PostgreSQL keeps 6 fraction digits and would round it to 10000-01-01 00:00:00. Equal only if the value is just an open-end sentinel, compared with values converted the same way (such as temporal ValidTo columns), and data moved from SQL Server truncates its 7th digit rather than rounding it.";
+
+/// Whether the token at `i` is an operand of a comparison, not the value
+/// a variable is set to (`SET @v = '…'`, `@v = '…'` in a SELECT, which
+/// look the same).
+fn compared(ts: &[T], i: usize) -> bool {
+    let cmp = |j: Option<usize>| {
+        j.is_some_and(|j| {
+            ts[j].k == OP
+                && matches!(
+                    ts[j].s.as_str(),
+                    "=" | "<>" | "!=" | "<" | ">" | "<=" | ">="
+                )
+        })
+    };
+    let assigned = prev_sig(ts, i)
+        .filter(|&j| ts[j].s == "=")
+        .and_then(|j| prev_sig(ts, j))
+        .is_some_and(|v| ts[v].k == VARIABLE);
+    !assigned && (cmp(prev_sig(ts, i)) || cmp(next_sig(ts, i)))
+}
+
+/// A string literal's value that T-SQL reads as its end of time,
+/// '9999-12-31 23:59:59.9999999', in any spelling it accepts (WideWorld-
+/// Importers writes '99991231 23:59:59.9999999').
+fn end_of_time(v: &str) -> bool {
+    use sqldiff_core::equiv::literal::{iso_tsql, Target};
+    iso_tsql(v, Target::Timestamp { digits: 7 })
+        .is_some_and(|(text, _)| text == "9999-12-31 23:59:59.9999999")
 }
 
 /// A date-time text whose fractional seconds PostgreSQL's microseconds
