@@ -139,9 +139,9 @@ fn update_from_without_a_unique_match_is_refused() {
         // The LEFT JOIN's table is fixed only by WHERE, which does not limit it.
         "UPDATE o SET total = p.amount FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id LEFT JOIN dbo.order_items p ON p.order_id = i.order_id WHERE p.item_id = 1;",
         // An unknown table.
-        "UPDATE o SET total = 1 FROM dbo.orders o JOIN dbo.other x ON x.id = o.order_id;",
+        "UPDATE o SET total = x.v FROM dbo.orders o JOIN dbo.other x ON x.id = o.order_id;",
         // A condition with OR is not a key match.
-        "UPDATE o SET total = 1 FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id OR i.item_id = 0;",
+        "UPDATE o SET total = i.amount FROM dbo.orders o JOIN dbo.order_items i ON i.item_id = o.order_id OR i.item_id = 0;",
     ] {
         let (c, _) = tsql(stmt);
         let (out, u) = last(&c);
@@ -262,6 +262,59 @@ END",
             u.notes
         );
     }
+}
+
+/// Several matches give one value when SET reads only the target and
+/// columns WHERE or an inner join pins to a number or a variable (Ola's
+/// `SET t.Selected = s.Selected … WHERE s.Selected = 1`).
+#[test]
+fn update_from_with_one_value_for_every_match_is_proven() {
+    let (c, _) = tsql(
+        "CREATE PROCEDURE dbo.p @n int AS
+BEGIN
+  SET XACT_ABORT ON;
+  DECLARE @t TABLE (id int NOT NULL PRIMARY KEY, name nvarchar(128) NULL, selected bit NULL, pos int NULL);
+  DECLARE @s TABLE (name nvarchar(max) NULL, selected bit NULL, pos int NULL);
+  UPDATE t SET t.selected = s.selected FROM @t t INNER JOIN @s s ON t.name = s.name WHERE s.selected = 1;
+  UPDATE t SET t.pos = s.pos + t.id FROM @t t INNER JOIN @s s ON t.name = s.name AND s.pos = @n;
+  UPDATE t SET t.selected = 0 FROM @t t INNER JOIN @s s ON t.name = s.name;
+END",
+    );
+    for want in [
+        "SET selected = s.selected FROM pg_temp.tv_p_s s WHERE (t.name = s.name) AND (s.selected = TRUE);",
+        "SET pos = s.pos + t.id FROM pg_temp.tv_p_s s WHERE t.name = s.name AND s.pos = p_n;",
+        "SET selected = FALSE FROM pg_temp.tv_p_s s WHERE t.name = s.name;",
+    ] {
+        let u = c
+            .units
+            .iter()
+            .filter(|u| c.output[u.out.start..u.out.end].contains(want))
+            .min_by_key(|u| u.out.end - u.out.start)
+            .unwrap_or_else(|| panic!("{want}\n{}", c.output));
+        assert!(
+            u.status < Status::Unproven,
+            "{want}: {:?} {:?}",
+            u.status,
+            u.notes
+        );
+    }
+    // A column pinned by nothing, or read through a subquery, still needs a key.
+    let (c, _) = tsql(
+        "CREATE PROCEDURE dbo.q AS
+BEGIN
+  SET XACT_ABORT ON;
+  DECLARE @t TABLE (id int NOT NULL PRIMARY KEY, name nvarchar(128) NULL, pos int NULL);
+  DECLARE @s TABLE (name nvarchar(max) NULL, pos int NULL);
+  UPDATE t SET t.pos = s.pos FROM @t t INNER JOIN @s s ON t.name = s.name;
+END",
+    );
+    assert!(
+        c.units
+            .iter()
+            .any(|u| u.notes.iter().any(|n| n.text.contains("at most one row"))),
+        "{}",
+        c.output
+    );
 }
 
 /// Shapes the UPDATE … FROM rule refuses but the fallback rules still

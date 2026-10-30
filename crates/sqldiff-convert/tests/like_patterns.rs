@@ -74,3 +74,26 @@ fn patterns_without_an_exact_form_are_refused() {
         assert_eq!(u.status, Status::NotConverted, "{ts}: {}", c.output);
     }
 }
+
+/// Ola Hallengren's `LIKE REPLACE(REPLACE(x,'[','[[]'),'_','[_]')` matches x
+/// with `%` its only wildcard; PostgreSQL escapes its own escape first.
+#[test]
+fn an_escaped_value_pattern_is_rewritten_and_proven() {
+    let c = convert(
+        "SELECT a.file_id FROM dbo.files a JOIN dbo.files b ON a.path LIKE REPLACE(REPLACE(b.path,'[','[[]'),'_','[_]');",
+    );
+    assert!(
+        c.output
+            .contains("a.path LIKE replace(replace(b.path, '\\', '\\\\'), '_', '\\_')"),
+        "{}",
+        c.output
+    );
+    let u = c.units.last().unwrap();
+    assert_eq!(u.status, Status::Assumptions, "{:?}", u.notes);
+    // Another escaping is copied and stays unproven.
+    let c = convert(
+        "SELECT a.file_id FROM dbo.files a JOIN dbo.files b ON a.path LIKE REPLACE(b.path,'_','[_]');",
+    );
+    let u = c.units.last().unwrap();
+    assert!(u.status >= Status::Unproven, "{:?} {}", u.status, c.output);
+}

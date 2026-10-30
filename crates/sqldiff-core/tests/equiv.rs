@@ -280,6 +280,75 @@ fn update_from_join_moves_the_target_condition_to_where() {
     not_equal(run(&ts("JOIN", key), T, named, P, true), "target in ON");
 }
 
+/// `UPDATE … FROM` whose target rows may meet several rows: equal only when
+/// SET reads the target and columns that WHERE or an inner join pins with
+/// `=` to something constant, of a type whose equal values are one value.
+#[test]
+fn update_from_with_one_value_for_every_match() {
+    let ts = |stmt: &str| format!("CREATE PROCEDURE dbo.reprice AS BEGIN {stmt}; END");
+    let pg = |stmt: &str| format!("CREATE PROCEDURE reprice() LANGUAGE sql AS $$ {stmt}; $$;");
+    // T-SQL names the target among the FROM tables, PostgreSQL in UPDATE.
+    let verdict = |stmt: &str| {
+        let (alias, table) = if stmt.starts_with("UPDATE p") {
+            ("p", "item_price")
+        } else {
+            ("i", "item")
+        };
+        let set_at = stmt.find(" SET").unwrap();
+        let from_at = stmt.rfind(" FROM ").unwrap();
+        let a = format!(
+            "{} FROM {table} AS {alias}, {}",
+            &stmt[..from_at],
+            &stmt[from_at + 6..]
+        );
+        let b = format!("UPDATE {table} AS {alias}{}", &stmt[set_at..]);
+        run(&ts(&a), T, &pg(&b), P, true)
+    };
+    let equal = |r: Report, why: &str| {
+        assert!(
+            matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    let not_equal = |r: Report, why: &str| {
+        assert!(
+            !matches!(r.verdict(), Verdict::Equal | Verdict::EqualUnderAssumptions),
+            "{why}: {:?}",
+            r.findings
+        )
+    };
+    equal(
+        verdict("UPDATE p SET unit_price = f.unit_price FROM price_feed AS f WHERE f.item_id = p.item_id AND f.unit_price = 5"),
+        "pinned by WHERE",
+    );
+    equal(
+        verdict("UPDATE p SET unit_price = p.unit_price + 1 FROM price_feed AS f WHERE f.item_id < p.item_id"),
+        "SET reads only the target",
+    );
+    not_equal(
+        verdict("UPDATE p SET unit_price = f.unit_price FROM price_feed AS f WHERE f.item_id = p.item_id"),
+        "several prices",
+    );
+    not_equal(
+        verdict("UPDATE p SET unit_price = f.unit_price FROM price_feed AS f WHERE f.item_id = p.item_id AND f.unit_price = f.item_id"),
+        "pinned to another column",
+    );
+    not_equal(
+        verdict("UPDATE p SET unit_price = f.unit_price FROM price_feed AS f WHERE f.item_id = p.item_id OR f.unit_price = 5"),
+        "under OR",
+    );
+    not_equal(
+        verdict("UPDATE p SET unit_price = (SELECT MAX(x.unit_price) FROM price_feed AS x WHERE x.item_id = f.item_id) FROM price_feed AS f WHERE f.unit_price = 5"),
+        "a subquery",
+    );
+    // Strings equal under T-SQL's collation may differ in case.
+    not_equal(
+        verdict("UPDATE i SET name = c.email FROM customer AS c WHERE c.customer_id > i.item_id AND c.email = 'a'"),
+        "pinned by a string",
+    );
+}
+
 /// How SQL Server binds a T-SQL `UPDATE … FROM` target (checked on SQL
 /// Server 2022): to the FROM reference of the same table, aliased or not,
 /// and to a join of its own when the table is not in FROM. Where only one

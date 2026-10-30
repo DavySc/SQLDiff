@@ -2804,7 +2804,7 @@ impl<'a> Cx<'a> {
             }
         }
         let wh: Option<&[T]> = (end < ts.len()).then(|| &ts[end + 1..]);
-        self.unique_join(&tkey, &chains, &moved, wh)
+        self.unique_join(&tkey, &chains, &moved, wh, &ts[set + 1..from])
             .map_err(|w| why(&w))?;
 
         self.step_ts("tsql.dml.update-from", ts);
@@ -2889,6 +2889,7 @@ impl<'a> Cx<'a> {
         chains: &[Vec<Step>],
         moved: &[&[T]],
         wh: Option<&[T]>,
+        sets: &[T],
     ) -> Result<(), String> {
         let mut all: Vec<&[T]> = moved.to_vec();
         all.extend(wh);
@@ -2956,6 +2957,44 @@ impl<'a> Cx<'a> {
             if !progress {
                 break;
             }
+        }
+        // Several matches give the same values when SET reads only the
+        // target and columns pinned by `= <number or variable>` in WHERE or
+        // an inner join (`SET t.Selected = s.Selected … WHERE s.Selected =
+        // 1`). The engine checks the column types.
+        let pinned: Vec<Vec<String>> = all.iter().flat_map(|c| pinned_columns(c)).collect();
+        let one_value = split_commas(sets).iter().all(|item| {
+            let item = trimmed(item);
+            let Some(eq) = (0..item.len()).find(|&i| item[i].k == OP && item[i].s == "=") else {
+                return false;
+            };
+            let rhs = &item[eq + 1..];
+            bare_columns(rhs).is_empty()
+                && sig(rhs).into_iter().all(|i| {
+                    let t = &rhs[i];
+                    if t.is("SELECT") {
+                        return false;
+                    }
+                    if !(matches!(t.k, IDENT | QUOTED_IDENT)
+                        && next_sig(rhs, i).is_some_and(|j| rhs[j].k == DOT))
+                    {
+                        return true;
+                    }
+                    let q = tsql_unquote(&t.s).to_ascii_lowercase();
+                    let c = next_sig(rhs, i)
+                        .and_then(|j| next_sig(rhs, j))
+                        .map(|j| tsql_unquote(&rhs[j].s).to_ascii_lowercase());
+                    let three = next_sig(rhs, i)
+                        .and_then(|j| next_sig(rhs, j))
+                        .and_then(|j| next_sig(rhs, j))
+                        .is_some_and(|j| rhs[j].k == DOT);
+                    !three
+                        && (q.eq_ignore_ascii_case(target)
+                            || c.is_some_and(|c| pinned.iter().any(|p| p[0] == q && p[1] == c)))
+                })
+        });
+        if one_value {
+            return Ok(());
         }
         match leaves.iter().find(|st| !bound.contains(&key_of(&st.leaf))) {
             None => Ok(()),
@@ -5935,6 +5974,18 @@ impl<'a> Cx<'a> {
                 return end;
             }
         }
+        if !self.db2() && t.is("REPLACE") && prev_sig(ts, i).is_some_and(|p| ts[p].is("LIKE")) {
+            if let Some((e, end)) = like_escaped_value(ts, i) {
+                // Ola's `LIKE REPLACE(REPLACE(x,'[','[[]'),'_','[_]')`: x
+                // with `%` the only wildcard. PostgreSQL's form escapes its
+                // own escape character first.
+                let x = self.expr(e).trim().to_string();
+                let text = format!("replace(replace({x}, '\\', '\\\\'), '_', '\\_')");
+                self.step_ts_with("tsql.expr.like-pattern", &ts[i..end], text.clone());
+                o.push_str(&text);
+                return end;
+            }
+        }
         if !self.db2() && t.k == L_PAREN {
             if let Some((setting, end)) = module_setting_test(ts, i) {
                 if self.own_name_part(false).is_ok() {
@@ -7944,6 +7995,38 @@ fn equalities(ts: &[T]) -> Vec<(Vec<String>, Vec<String>)> {
     out
 }
 
+/// The columns a condition's top-level AND terms set equal to a number or
+/// a variable, each as `[table, column]` (lower case).
+fn pinned_columns(ts: &[T]) -> Vec<Vec<String>> {
+    let ds = crate::tok::depths(ts);
+    if (0..ts.len()).any(|i| ds[i] == 0 && ts[i].is("OR")) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0;
+    for i in 0..=ts.len() {
+        if i < ts.len() && !(ds[i] == 0 && ts[i].is("AND")) {
+            continue;
+        }
+        let t = trimmed(&ts[start..i]);
+        start = i + 1;
+        let ops: Vec<usize> = (0..t.len()).filter(|&i| t[i].k == OP).collect();
+        let [op] = ops[..] else { continue };
+        if t[op].s != "=" {
+            continue;
+        }
+        let constant = |x: &[T]| matches!(trimmed(x), [t] if matches!(t.k, VARIABLE | NUMBER));
+        for (col, other) in [(&t[..op], &t[op + 1..]), (&t[op + 1..], &t[..op])] {
+            if constant(other) {
+                if let Some(p) = name_parts(trimmed(col)).filter(|p| p.len() == 2) {
+                    out.push(p.iter().map(|x| x.to_ascii_lowercase()).collect());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Unqualified column names in a condition: words that are not keywords,
 /// not part of a dotted name, not a function name and not a type after AS.
 fn bare_columns(ts: &[T]) -> Vec<String> {
@@ -8908,6 +8991,31 @@ fn dynamic_sql_vars(ts: &[T]) -> Vec<String> {
     vars.sort();
     vars.dedup();
     vars
+}
+
+/// `REPLACE(REPLACE(x, '[', '[[]'), '_', '[_]')` at `i`: the tokens of x
+/// and the index after the call. The pattern it makes matches x itself, with
+/// `%` the only wildcard (`[[]` and `[_]` are the literal characters).
+fn like_escaped_value(ts: &[T], i: usize) -> Option<(&[T], usize)> {
+    // The arguments of the call whose name is at `at`, and the index after it.
+    fn call(ts: &[T], at: usize) -> Option<(Vec<&[T]>, usize)> {
+        let open = next_sig(ts, at).filter(|&j| ts[j].k == L_PAREN)?;
+        let close = matching(ts, open)?;
+        Some((split_commas(&ts[open + 1..close]), close + 1))
+    }
+    let lit =
+        |x: &[T], v: &str| matches!(trimmed(x), [t] if t.k == STRING && t.s == format!("'{v}'"));
+    let (outer, end) = call(ts, i)?;
+    let [inner, u, ue] = outer[..] else {
+        return None;
+    };
+    let inner = trimmed(inner);
+    if !(lit(u, "_") && lit(ue, "[_]") && inner.first()?.is("REPLACE")) {
+        return None;
+    }
+    let (args, after) = call(inner, 0)?;
+    let [x, b, be] = args[..] else { return None };
+    (after == inner.len() && lit(b, "[") && lit(be, "[[]")).then_some((trimmed(x), end))
 }
 
 /// The text of a T-SQL string literal (`N'it''s'` → `it's`).
