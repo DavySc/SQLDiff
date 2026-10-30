@@ -11,6 +11,7 @@
 //! the target routines' parameter modes from the converted output itself,
 //! and whether row counts are observed from the observer profile.
 
+use crate::scan::Scan;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqldiff_core::assumptions;
@@ -94,6 +95,9 @@ pub fn reason_code(reason: &str) -> String {
     }
     if reason == "the output has no routine for it" {
         return "pair:no-output".into();
+    }
+    if reason == NAME_TOO_LONG {
+        return "pair:name-too-long".into();
     }
     if let Some(rest) = reason.strip_prefix("no renaming pairs the two routines: ") {
         return format!(
@@ -331,6 +335,61 @@ fn returns_value(nodes: &[Node]) -> bool {
 /// letters folded to lower case, and only those: PostgreSQL leaves other
 /// letters as written in a UTF-8 database (`CREATE PROCEDURE Ärger` makes
 /// `"Ärger"`), and so does `Sqldiff.Mirror.pgName`.
+/// (Third review of C3d part 2) PostgreSQL keeps the first 63 bytes of an
+/// identifier (`NAMEDATALEN - 1`) and drops the rest silently.
+pub const PG_NAME_BYTES: usize = 63;
+
+/// The reason a pair is refused when a PostgreSQL name in it may not be
+/// the one written (`pair:name-too-long`).
+const NAME_TOO_LONG: &str = "a PostgreSQL name in the output routine is longer than 63 bytes, \
+     or its name is another routine's after truncation";
+
+/// An identifier as PostgreSQL stores it: its first 63 bytes, cut at a
+/// character boundary.
+fn pg_truncated(n: &str) -> String {
+    let mut end = n.len().min(PG_NAME_BYTES);
+    while !n.is_char_boundary(end) {
+        end -= 1;
+    }
+    n[..end].to_string()
+}
+
+/// (Third review) The output routine `b` (spanning `span` of `output`)
+/// may not be the routine its text names: one of its identifiers (its
+/// name, a parameter, a local, a callee, a table, a column) is longer than
+/// 63 bytes, which PostgreSQL truncates, or its name truncated is another
+/// output routine's (the later `CREATE OR REPLACE` replaces the first).
+fn name_too_long(
+    output: &str,
+    span: (usize, usize),
+    name: &str,
+    out: &[Read],
+    to: Dialect,
+) -> bool {
+    if to != Dialect::Postgres {
+        return false;
+    }
+    let text = output.get(span.0..span.1).unwrap_or_default();
+    let long = parse(text, to)
+        .syntax()
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .map(|t| sqldiff_syntax::abstract_syntax::Tok::from_syntax(&t))
+        .filter_map(|t| crate::scan::name_part(&t, to))
+        .any(|p| p.trim_start_matches('"').len() > PG_NAME_BYTES);
+    let short = |n: &str| {
+        n.split('.')
+            .map(|p| pg_truncated(&pg_name(p)))
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let mine = short(name);
+    let clash = out
+        .iter()
+        .any(|(n, _, _, _)| pg_name(n) != pg_name(name) && short(n) == mine);
+    long || clash
+}
+
 pub fn pg_name(n: &str) -> String {
     if n.starts_with('"') {
         n.to_string()
@@ -581,14 +640,18 @@ pub const ANSI_PADDING: &str = "ASM-TSQL-ANSI-PADDING";
 /// trigger); the checker refuses every write to it. The trees include the
 /// base catalogs' DDL (`--catalog`, `--catalog-b` or its conversion,
 /// `base::Base::ddl`), so their tables reach the checker on the same terms.
-/// Dynamic SQL anywhere (`dynamic_sql`: since the review an allow-list, so
-/// any `EXEC` of a procedure the tree does not declare, a PostgreSQL `DO`
-/// block, a routine body no scan reads, a top-level call of an undeclared
-/// routine), and a T-SQL change of the database's collation, still keep
-/// every table out. (Review) A table is sent neither plain nor read-only
-/// when its last name starts with `pg_` (PostgreSQL resolves it in
-/// `pg_catalog` first) or another schema defines a table of the same last
-/// name, which may hide it on PostgreSQL's `search_path`.
+/// Anything a tree may run that no scan of it sees keeps every table out
+/// (`scan`, since the third review an allow-list of top-level statement
+/// kinds and of the calls in bodies, defaults, views and data statements:
+/// a statement of another kind, a node the parser cannot read, a
+/// PostgreSQL `U&` name, an `EXEC` or call of what the tree does not
+/// declare, DDL in a body other than a table's or an index's), as does a
+/// T-SQL change of the database's collation. (Review) A table is sent
+/// neither plain nor read-only when its last name starts with `pg_`
+/// (PostgreSQL resolves it in `pg_catalog` first), another schema defines a
+/// table of the same last name, which may hide it on PostgreSQL's
+/// `search_path`, or a part of its name has 63 bytes or more (PostgreSQL
+/// truncates identifiers to 63).
 #[derive(Debug, Clone, Default)]
 pub struct Tables {
     /// Each table with its T-SQL name as declared.
@@ -671,545 +734,6 @@ fn string_words(n: &SyntaxNode, out: &mut Vec<String>) {
     }
 }
 
-/// (C3d part 2, review) The T-SQL procedures that run text or change
-/// names in ways no scan of the tree can see, also when called without
-/// `EXEC` as the first statement of a batch, and the rowset functions that
-/// run a statement on a server, possibly this one. Any mention of one is
-/// dynamic SQL, whatever the tree declares.
-const TSQL_TEXT_RUNNERS: [&str; 22] = [
-    "sp_executesql",
-    "sp_sqlexec",
-    "sp_prepexec",
-    "sp_prepexecrpc",
-    "sp_prepare",
-    "sp_execute",
-    "sp_cursoropen",
-    "sp_cursorprepare",
-    "sp_cursorprepexec",
-    "sp_cursorexecute",
-    "sp_msforeachtable",
-    "sp_msforeachdb",
-    "sp_msforeach_worker",
-    "sp_rename",
-    "xp_cmdshell",
-    "sp_send_dbmail",
-    "sp_start_job",
-    "sp_add_jobstep",
-    "sp_update_jobstep",
-    "openquery",
-    "openrowset",
-    "opendatasource",
-];
-
-/// (C3d part 2, review) The system procedures an `EXEC` may call without
-/// counting as dynamic SQL: they set or drop an extended property, a
-/// description no read sees. Unqualified or in `sys` or `dbo`.
-const TSQL_HARMLESS_PROCS: [&str; 3] = [
-    "sp_addextendedproperty",
-    "sp_updateextendedproperty",
-    "sp_dropextendedproperty",
-];
-
-/// The words that start a T-SQL statement. A top-level statement that
-/// starts with any other name is a procedure call without `EXEC` (allowed
-/// as the first statement of a batch, "EXECUTE (Transact-SQL)").
-const TSQL_STATEMENT_WORDS: [&str; 62] = [
-    "SELECT",
-    "INSERT",
-    "UPDATE",
-    "DELETE",
-    "MERGE",
-    "CREATE",
-    "ALTER",
-    "DROP",
-    "DECLARE",
-    "SET",
-    "IF",
-    "ELSE",
-    "WHILE",
-    "BEGIN",
-    "END",
-    "RETURN",
-    "PRINT",
-    "RAISERROR",
-    "THROW",
-    "EXEC",
-    "EXECUTE",
-    "USE",
-    "GRANT",
-    "REVOKE",
-    "DENY",
-    "TRUNCATE",
-    "WITH",
-    "COMMIT",
-    "ROLLBACK",
-    "SAVE",
-    "BREAK",
-    "CONTINUE",
-    "GOTO",
-    "WAITFOR",
-    "OPEN",
-    "CLOSE",
-    "FETCH",
-    "DEALLOCATE",
-    "ENABLE",
-    "DISABLE",
-    "DBCC",
-    "BACKUP",
-    "RESTORE",
-    "CHECKPOINT",
-    "KILL",
-    "BULK",
-    "READTEXT",
-    "WRITETEXT",
-    "UPDATETEXT",
-    "SETUSER",
-    "SHUTDOWN",
-    "RECONFIGURE",
-    "REVERT",
-    "MOVE",
-    "RECEIVE",
-    "SEND",
-    "GET",
-    "COMMENT",
-    "ADD",
-    "TRY",
-    "CATCH",
-    "GO",
-];
-
-/// The words that may stand before `(` in a PostgreSQL statement without
-/// calling a routine: clauses, operators, the special forms the grammar
-/// spells like calls (`COALESCE`, `EXTRACT`, ...) and type names with a
-/// modifier.
-const PG_PAREN_WORDS: [&str; 71] = [
-    "IN",
-    "EXISTS",
-    "VALUES",
-    "AS",
-    "OVER",
-    "FILTER",
-    "CAST",
-    "ANY",
-    "ALL",
-    "SOME",
-    "ROW",
-    "ARRAY",
-    "USING",
-    "ON",
-    "WHERE",
-    "AND",
-    "OR",
-    "NOT",
-    "SELECT",
-    "THEN",
-    "ELSE",
-    "WHEN",
-    "CASE",
-    "FROM",
-    "JOIN",
-    "INTO",
-    "BY",
-    "HAVING",
-    "RETURNING",
-    "SET",
-    "LATERAL",
-    "TABLE",
-    "WITH",
-    "MATERIALIZED",
-    "UNION",
-    "INTERSECT",
-    "EXCEPT",
-    "IS",
-    "LIKE",
-    "ILIKE",
-    "BETWEEN",
-    "DISTINCT",
-    "LIMIT",
-    "OFFSET",
-    "CONFLICT",
-    "DO",
-    "CUBE",
-    "ROLLUP",
-    "SETS",
-    "GROUPING",
-    "ROWS",
-    "RANGE",
-    "GROUPS",
-    "WITHIN",
-    "COALESCE",
-    "NULLIF",
-    "GREATEST",
-    "LEAST",
-    "EXTRACT",
-    "POSITION",
-    "SUBSTRING",
-    "OVERLAY",
-    "TRIM",
-    "INTERVAL",
-    "NUMERIC",
-    "DECIMAL",
-    "VARCHAR",
-    "CHAR",
-    "CHARACTER",
-    "TIMESTAMP",
-    "TIME",
-];
-
-/// (C3d part 2, review) PostgreSQL built-ins a top-level statement may
-/// call without counting as dynamic SQL: they read their arguments and
-/// change nothing (no sequence, setting, lock or file). Unqualified or in
-/// `pg_catalog`. Anything else a top-level statement calls that the tree
-/// does not declare may run any statement.
-const PG_PURE_BUILTINS: [&str; 64] = [
-    "count",
-    "sum",
-    "min",
-    "max",
-    "avg",
-    "lower",
-    "upper",
-    "length",
-    "char_length",
-    "character_length",
-    "octet_length",
-    "abs",
-    "round",
-    "trunc",
-    "floor",
-    "ceil",
-    "ceiling",
-    "mod",
-    "power",
-    "sqrt",
-    "sign",
-    "now",
-    "clock_timestamp",
-    "statement_timestamp",
-    "transaction_timestamp",
-    "concat",
-    "concat_ws",
-    "substr",
-    "left",
-    "right",
-    "btrim",
-    "ltrim",
-    "rtrim",
-    "lpad",
-    "rpad",
-    "replace",
-    "reverse",
-    "initcap",
-    "repeat",
-    "chr",
-    "ascii",
-    "strpos",
-    "split_part",
-    "to_char",
-    "to_date",
-    "to_timestamp",
-    "to_number",
-    "date_trunc",
-    "date_part",
-    "make_date",
-    "make_time",
-    "make_timestamp",
-    "make_interval",
-    "age",
-    "format",
-    "md5",
-    "string_agg",
-    "array_agg",
-    "bool_and",
-    "bool_or",
-    "row_number",
-    "rank",
-    "dense_rank",
-    "lag",
-];
-
-/// A part of a name as the dialect compares it: quotes and brackets
-/// removed; T-SQL in lower case (its names compare without case under the
-/// collations the slice admits); PostgreSQL folded (`"Foo` for a quoted
-/// name whose case matters, as `quoted_name` keeps it).
-fn name_part(t: &sqldiff_syntax::abstract_syntax::Tok, d: Dialect) -> Option<String> {
-    match t.kind {
-        K::Word => Some(t.text.to_lowercase()),
-        K::Quoted => {
-            let q = sqldiff_syntax::abstract_syntax::quoted_name(&t.text, d);
-            Some(match d {
-                Dialect::Tsql => q.to_lowercase(),
-                _ => q,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// The dotted name starting at `t[i]`, its parts as `name_part` gives
-/// them, and the position after it; `None` when no name starts there or a
-/// part is missing (`db..p`).
-fn name_at(
-    t: &[sqldiff_syntax::abstract_syntax::Tok],
-    i: usize,
-    d: Dialect,
-) -> Option<(Vec<String>, usize)> {
-    let mut parts = vec![name_part(t.get(i)?, d)?];
-    let mut j = i + 1;
-    while t.get(j).is_some_and(|x| x.kind == K::Dot) {
-        parts.push(name_part(t.get(j + 1)?, d)?);
-        j += 2;
-    }
-    Some((parts, j))
-}
-
-/// (C3d part 2, review) A PostgreSQL routine whose body no scan reads: a
-/// body given as a string (`AS '...'`, also a C or internal function's
-/// object file and symbol), one the reader keeps as one dollar-quoted
-/// token (a language it does not parse), or a `LANGUAGE` other than
-/// `plpgsql` and `sql`.
-fn pg_body_unread(n: &SyntaxNode) -> bool {
-    let toks: Vec<sqldiff_syntax::SyntaxToken> = n
-        .children_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| !t.kind().is_trivia())
-        .collect();
-    let quoted = toks.windows(2).any(|w| {
-        w[0].kind() == SyntaxKind::IDENT
-            && w[0].text().eq_ignore_ascii_case("AS")
-            && matches!(w[1].kind(), SyntaxKind::STRING | SyntaxKind::DOLLAR_STRING)
-    });
-    let language = toks.windows(2).any(|w| {
-        w[0].kind() == SyntaxKind::IDENT
-            && w[0].text().eq_ignore_ascii_case("LANGUAGE")
-            && !matches!(
-                w[1].text()
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .to_lowercase()
-                    .as_str(),
-                "plpgsql" | "sql"
-            )
-    });
-    quoted || language || toks.iter().any(|t| t.kind() == SyntaxKind::DOLLAR_STRING)
-}
-
-/// (C3d part 2, review) The routines a tree declares and whose bodies its
-/// scan reads, each name's parts as `name_part` gives them: the targets an
-/// `EXEC` or a top-level call may name without counting as dynamic SQL.
-/// Not a T-SQL CLR routine (`EXTERNAL NAME`), nor a PostgreSQL routine
-/// whose body is not read (`pg_body_unread`), which run what no scan sees.
-fn declared_bodies(texts: &[&str], d: Dialect) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    for text in texts {
-        let root = parse(text, d).syntax();
-        for n in root
-            .descendants()
-            .filter(|n| n.kind() == SyntaxKind::ROUTINE)
-        {
-            let t = tokens(&n);
-            let Some(k) = t
-                .iter()
-                .take(4)
-                .position(|x| !matches!(x.up.as_str(), "CREATE" | "OR" | "ALTER" | "REPLACE"))
-            else {
-                continue;
-            };
-            if !matches!(t[k].up.as_str(), "PROCEDURE" | "PROC" | "FUNCTION") {
-                continue;
-            }
-            let clr = d == Dialect::Tsql
-                && t.windows(2)
-                    .any(|w| w[0].up == "EXTERNAL" && w[1].up == "NAME");
-            if clr || (d == Dialect::Postgres && pg_body_unread(&n)) {
-                continue;
-            }
-            if let Some((parts, _)) = name_at(&t, k + 1, d) {
-                out.push(parts);
-            }
-        }
-    }
-    out
-}
-
-/// (C3d part 2, review) A T-SQL call of the procedure named at `t[j]` that
-/// runs nothing a scan of the tree cannot see: one the tree declares
-/// (`declared_bodies`), compared with brackets and case removed, or an
-/// extended-property procedure. A one-part `sp_` or `xp_` name resolves to
-/// the system procedure first and is never the declared one.
-fn tsql_call_seen(
-    t: &[sqldiff_syntax::abstract_syntax::Tok],
-    j: usize,
-    declared: &[Vec<String>],
-) -> bool {
-    let Some((parts, _)) = name_at(t, j, Dialect::Tsql) else {
-        return false;
-    };
-    let last = parts.last().map(String::as_str).unwrap_or_default();
-    if TSQL_HARMLESS_PROCS.contains(&last)
-        && (parts.len() == 1 || (parts.len() == 2 && matches!(parts[0].as_str(), "sys" | "dbo")))
-    {
-        return true;
-    }
-    if last.starts_with("sp_") || last.starts_with("xp_") {
-        return false;
-    }
-    declared.contains(&parts)
-}
-
-/// Dynamic SQL: a statement whose effect no scan of the tree can see, so
-/// that it may change any table (C3d part 2: an allow-list since the
-/// review).
-///
-/// * T-SQL: every `EXEC`/`EXECUTE`, unless it calls a procedure the tree
-///   declares (`declared_bodies`) or an extended-property procedure
-///   (`tsql_call_seen`), by name (not `EXEC (...)`, `EXEC @s`, `EXEC
-///   @rc = @p`); `EXEC @rc = p` is the call of `p`. A routine's `WITH
-///   EXECUTE AS` option runs nothing. A top-level statement that starts
-///   with a name (a call without `EXEC`) is held to the same. Any mention
-///   of a procedure that runs text or renames (`TSQL_TEXT_RUNNERS`) or of
-///   a rowset function that runs a statement on a server.
-/// * PostgreSQL: every `EXECUTE` (in PL/pgSQL always text), but a table
-///   trigger's `EXECUTE FUNCTION f()`; a `DO` block; `COPY ... PROGRAM`; a
-///   top-level statement (`n` a `STATEMENT`) that calls a routine the tree
-///   does not declare, other than a built-in that changes nothing
-///   (`PG_PURE_BUILTINS`). A routine whose body is not read counts in
-///   `definitions` (`pg_body_unread`).
-fn dynamic_sql(n: &SyntaxNode, d: Dialect, declared: &[Vec<String>]) -> bool {
-    let t = tokens(n);
-    let up = |i: usize| {
-        t.get(i)
-            .filter(|x| x.kind == K::Word)
-            .map(|x| x.up.as_str())
-    };
-    match d {
-        Dialect::Tsql => {
-            let runs_text = |j: usize| {
-                t.get(j).map_or(true, |y| {
-                    matches!(y.kind, K::LParen | K::Var | K::Str | K::Param)
-                })
-            };
-            let mention = t.iter().any(|x| {
-                matches!(x.kind, K::Word | K::Quoted)
-                    && name_part(x, d).is_some_and(|w| TSQL_TEXT_RUNNERS.contains(&w.as_str()))
-            });
-            let exec = t.iter().enumerate().any(|(i, x)| {
-                if !(x.kind == K::Word && (x.up == "EXEC" || x.up == "EXECUTE")) {
-                    return false;
-                }
-                // `WITH [option, ] EXECUTE AS {CALLER | SELF | OWNER | 'user'}`
-                // in a routine's head: an option, no call.
-                let option = up(i + 1) == Some("AS")
-                    && i > 0
-                    && (t[i - 1].kind == K::Comma || up(i - 1) == Some("WITH"));
-                if option {
-                    return false;
-                }
-                // `EXEC @rc = p` captures p's return code.
-                let rc = t.get(i + 1).is_some_and(|y| y.kind == K::Var)
-                    && t.get(i + 2)
-                        .is_some_and(|y| y.kind == K::Op && y.text == "=");
-                let j = if rc { i + 3 } else { i + 1 };
-                runs_text(j) || !tsql_call_seen(&t, j, declared)
-            });
-            // A procedure called without `EXEC`: the first statement of a batch.
-            let bare = n.kind() == SyntaxKind::STATEMENT
-                && t.first().is_some_and(|x| {
-                    x.kind == K::Quoted
-                        || (x.kind == K::Word && !TSQL_STATEMENT_WORDS.contains(&x.up.as_str()))
-                })
-                && !tsql_call_seen(&t, 0, declared);
-            mention || exec || bare
-        }
-        _ => {
-            // A PostgreSQL table trigger names the function it runs, `CREATE
-            // [OR REPLACE] [CONSTRAINT] TRIGGER ... EXECUTE FUNCTION|PROCEDURE
-            // f()`: no text is run, and the function's body is read as a
-            // routine of its own. Only in that statement: in PL/pgSQL
-            // `EXECUTE function` runs the text of a variable named `function`.
-            let trigger = {
-                let head: Vec<&str> = t.iter().take(5).map(|x| x.up.as_str()).collect();
-                let rest = match head.as_slice() {
-                    ["CREATE", "OR", "REPLACE", rest @ ..] => rest,
-                    ["CREATE", rest @ ..] => rest,
-                    _ => &[][..],
-                };
-                matches!(rest, ["TRIGGER", ..] | ["CONSTRAINT", "TRIGGER", ..])
-            };
-            let execute = t.iter().enumerate().any(|(i, x)| {
-                x.up == "EXECUTE"
-                    && !(trigger
-                        && t.get(i + 1)
-                            .is_some_and(|y| y.up == "FUNCTION" || y.up == "PROCEDURE"))
-            });
-            let block = up(0) == Some("DO");
-            let program = up(0) == Some("COPY") && t.iter().any(|x| x.up == "PROGRAM");
-            let calls = n.kind() == SyntaxKind::STATEMENT
-                && matches!(
-                    up(0),
-                    Some(
-                        "SELECT"
-                            | "CALL"
-                            | "PERFORM"
-                            | "VALUES"
-                            | "WITH"
-                            | "INSERT"
-                            | "UPDATE"
-                            | "DELETE"
-                            | "MERGE"
-                            | "EXPLAIN"
-                            | "COPY"
-                            | "TABLE"
-                    )
-                )
-                && pg_calls_unseen(&t, declared);
-            execute || block || program || calls
-        }
-    }
-}
-
-/// (C3d part 2, review) A PostgreSQL statement calls a routine that is
-/// neither declared in the tree with a body the scan reads
-/// (`declared_bodies`; a `pg_` name resolves in `pg_catalog` first) nor a
-/// built-in that changes nothing (`PG_PURE_BUILTINS`). A call is a name
-/// before `(` that is no clause word (`PG_PAREN_WORDS`), no type after
-/// `::` or `AS`, no table after `INTO` and no `WITH` query's name; anything
-/// unsure counts as a call.
-fn pg_calls_unseen(t: &[sqldiff_syntax::abstract_syntax::Tok], declared: &[Vec<String>]) -> bool {
-    let d = Dialect::Postgres;
-    (0..t.len()).any(|i| {
-        if !(matches!(t[i].kind, K::Word | K::Quoted)
-            && t.get(i + 1).is_some_and(|y| y.kind == K::LParen))
-        {
-            return false;
-        }
-        // The start of the dotted name ending at `i`.
-        let mut s = i;
-        while s >= 2 && t[s - 1].kind == K::Dot && matches!(t[s - 2].kind, K::Word | K::Quoted) {
-            s -= 2;
-        }
-        let one = s == i;
-        if one && t[i].kind == K::Word && PG_PAREN_WORDS.contains(&t[i].up.as_str()) {
-            return false;
-        }
-        let prev = s.checked_sub(1).map(|k| &t[k]);
-        if prev.is_some_and(|p| {
-            (p.kind == K::Op && p.text == "::")
-                || (p.kind == K::Word
-                    && matches!(p.up.as_str(), "AS" | "INTO" | "WITH" | "RECURSIVE"))
-        }) {
-            return false;
-        }
-        let Some((parts, _)) = name_at(t, s, d) else {
-            return true;
-        };
-        let last = parts.last().map(String::as_str).unwrap_or_default();
-        let builtin = PG_PURE_BUILTINS.contains(&last)
-            && (parts.len() == 1 || (parts.len() == 2 && parts[0] == "pg_catalog"));
-        let own = !last.starts_with("pg_") && declared.contains(&parts);
-        !(builtin || own)
-    })
-}
-
 /// What a tree's DDL says about its tables ([`definitions`]).
 #[derive(Default)]
 struct Ddl {
@@ -1236,9 +760,6 @@ struct Ddl {
     /// statements of `plain_table::leaves_reads`; T-SQL views; T-SQL
     /// triggers but for the DDL and strings in their bodies (as routines).
     named_ro: Vec<String>,
-    /// (C3d part 2) A T-SQL trigger or view runs dynamic SQL: it may change
-    /// any table when it fires, so no table is read-only.
-    ro_blocked: bool,
 }
 
 /// A statement that may turn `ANSI_PADDING` off: `SET ANSI_PADDING OFF`,
@@ -1267,12 +788,15 @@ fn collation_changed(n: &SyntaxNode) -> bool {
 /// named elsewhere, whether the tree runs dynamic SQL anywhere, and
 /// whether it turns `ANSI_PADDING` off.
 fn definitions(texts: &[&str], d: Dialect) -> Ddl {
-    let declared = declared_bodies(texts, d);
+    // C3d part 2, review: what a tree runs is an allow-list of statement
+    // kinds and calls (`scan`); anything else may change any table.
+    let scan = Scan::new(texts, d);
     let (mut defs, mut named, mut dynamic) = (Vec::new(), Vec::new(), false);
     let (mut indexes, mut padding, mut collation) = (Vec::new(), false, false);
-    let (mut ro_defs, mut named_ro, mut ro_blocked) = (Vec::new(), Vec::new(), false);
+    let (mut ro_defs, mut named_ro) = (Vec::new(), Vec::new());
     for text in texts {
         let root = parse(text, d).syntax();
+        dynamic |= scan.unseen(&root);
         let mut it = root.preorder();
         while let Some(ev) = it.next() {
             let rowan::WalkEvent::Enter(n) = ev else {
@@ -1304,37 +828,24 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
                         // any table named in a string (DDL kept as text).
                         body_words(&mut named);
                         body_words(&mut named_ro);
-                        dynamic |= dynamic_sql(&n, d, &declared);
-                        // C3d part 2, review: a PostgreSQL body no scan reads (a
-                        // string, another language) may run anything.
-                        dynamic |= d == Dialect::Postgres && pg_body_unread(&n);
-                    } else if d == Dialect::Postgres && kind.as_deref() == Some("DO") {
-                        // C3d part 2, review: a `DO` block runs at deployment.
-                        words(&n, d, &mut named);
-                        dynamic = true;
                     } else {
                         words(&n, d, &mut named);
                         // C3d part 2: a T-SQL view changes no table, and a
                         // trigger fires on writes only: a read fires none. What
-                        // its body may run when it fires counts as for a
-                        // procedure, dynamic SQL for every table.
+                        // its body may run is held to the scan's call rule,
+                        // as a procedure's is.
                         match (d, kind.as_deref()) {
                             (Dialect::Tsql, Some("VIEW")) => head_words(&n, d, &mut named_ro),
                             (Dialect::Tsql, Some("TRIGGER")) => {
                                 head_words(&n, d, &mut named_ro);
                                 body_words(&mut named_ro);
-                                ro_blocked |= dynamic_sql(&n, d, &declared);
                             }
-                            _ => {
-                                words(&n, d, &mut named_ro);
-                                dynamic |= dynamic_sql(&n, d, &declared);
-                            }
+                            _ => words(&n, d, &mut named_ro),
                         }
                     }
                     it.skip_subtree();
                 }
                 SyntaxKind::STATEMENT => {
-                    dynamic |= dynamic_sql(&n, d, &declared);
                     padding |= d == Dialect::Tsql && padding_off(&n);
                     collation |= d == Dialect::Tsql && collation_changed(&n);
                     match plain_table::read(&n, d) {
@@ -1380,7 +891,6 @@ fn definitions(texts: &[&str], d: Dialect) -> Ddl {
         collation_changed: collation,
         ro_defs,
         named_ro,
-        ro_blocked,
     }
 }
 
@@ -1559,10 +1069,18 @@ impl Tables {
             .collect();
         // A table out of reach: a `pg_` name, which PostgreSQL resolves in
         // `pg_catalog` first (`pg_user` is the catalog's view whatever the
-        // routine's schema), or one another schema also defines.
+        // routine's schema), or one another schema also defines; (third
+        // review) or a name part of 63 bytes or more: PostgreSQL truncates
+        // a longer identifier to 63 bytes, so a longer name is another
+        // relation's (or none), and a 63-byte one is what any longer
+        // spelling of another relation becomes.
         let out_of_reach = |key: &str| {
             let last = last_of(key);
-            last.starts_with("pg_") || defined.iter().any(|k| k != key && last_of(k) == last)
+            last.starts_with("pg_")
+                || key
+                    .split('.')
+                    .any(|p| p.trim_start_matches('"').len() >= PG_NAME_BYTES)
+                || defined.iter().any(|k| k != key && last_of(k) == last)
         };
         let mut by_target = Vec::new();
         for a in src {
@@ -1655,9 +1173,6 @@ impl Tables {
         // C3d part 2: every other table defined once on each side, named by
         // nothing that can change a read, whose two definitions pair, is a
         // read-only table.
-        if src_ddl.ro_blocked || out_ddl.ro_blocked {
-            return Tables { by_target };
-        }
         for a in &src_ddl.ro_defs {
             let key = target_routine(&a.name).0;
             if by_target.iter().any(|(t, _)| t.name == key) {
@@ -2035,6 +1550,15 @@ pub fn certify(
             (_, Some(Err(e))) => Answer::Unconfirmed {
                 reason: format!("the output routine is outside the verified shape: {e}"),
             },
+            (Ok(_), Some(Ok(_)))
+                if same
+                    .first()
+                    .is_some_and(|(n, sp, _, _)| name_too_long(output, *sp, n, &out, to)) =>
+            {
+                Answer::Unconfirmed {
+                    reason: NAME_TOO_LONG.into(),
+                }
+            }
             (Ok(a), Some(Ok(b))) => {
                 c.source = Some(sha(&encode::routine(&a)));
                 c.target = Some(sha(&encode::routine(&b)));
@@ -2516,7 +2040,7 @@ END
                 true,
             ),
             // A trigger fires on writes only; its conversion's `CREATE
-            // TRIGGER ... EXECUTE FUNCTION` runs no text (`dynamic_sql`).
+            // TRIGGER ... EXECUTE FUNCTION` runs no text (`scan`).
             (
                 "GO\nCREATE TRIGGER tr ON dbo.Acct AFTER INSERT AS BEGIN SET NOCOUNT ON; END\n",
                 true,
@@ -2859,9 +2383,6 @@ END
         for (extra, out) in [
             ("CREATE INDEX Item ON dbo.Line (Qty);\n", "item"),
             ("GO\nCREATE VIEW rpt.Item AS SELECT Id FROM dbo.Item;\nGO\n", "item"),
-            ("GO\nCREATE FUNCTION dbo.f (@n varchar(20)) RETURNS TABLE WITH SCHEMABINDING AS \
-              RETURN SELECT 1 AS ok WHERE @n = USER_NAME();\nGO\n\
-              CREATE SECURITY POLICY dbo.P ADD FILTER PREDICATE dbo.f(Name) ON dbo.Item;\n", "item"),
             ("ALTER TABLE dbo.Item ADD Extra int NULL;\n", "item"),
             ("ALTER TABLE dbo.Item ALTER COLUMN Name varchar(30) NOT NULL;\n", "item"),
             ("ALTER TABLE dbo.Item DROP CONSTRAINT PK_Item;\n", "item"),
@@ -2879,8 +2400,12 @@ END
         // Dynamic SQL anywhere, or a T-SQL trigger that runs it, keeps every
         // table out.
         for extra in [
+            // (Third review) A security policy is off the statement list.
+            "GO\nCREATE FUNCTION dbo.f (@n varchar(20)) RETURNS TABLE WITH SCHEMABINDING AS \
+             RETURN SELECT 1 AS ok WHERE @n = USER_NAME();\nGO\n\
+             CREATE SECURITY POLICY dbo.P ADD FILTER PREDICATE dbo.f(Name) ON dbo.Item;\n",
             // C3d part 2, review: an undeclared procedure, `sp_rename` among
-            // them, may do anything (`dynamic_sql`).
+            // them, may do anything (`scan`).
             "EXEC sp_rename 'dbo.Item.Name', 'Title', 'COLUMN';\n",
             "GO\nCREATE PROCEDURE dbo.q @s nvarchar(100) AS BEGIN EXEC (@s); END\n",
             "GO\nCREATE TRIGGER dbo.tr ON dbo.Other AFTER INSERT AS BEGIN EXEC sp_executesql N'SELECT 1'; END\n",
@@ -2989,6 +2514,9 @@ END
             "GO\nCREATE PROCEDURE dbo.q AS BEGIN EXEC dbo.NotHere; END\n",
             "GO\nCREATE PROCEDURE dbo.q AS BEGIN EXEC dbo.Item_Name; END\n",
             "GO\nCREATE PROCEDURE sp_mine AS BEGIN RETURN 1; END\nGO\nEXEC sp_mine;\n",
+            // (Third review) At the top level only an extended property may be
+            // set by `EXEC`; a declared procedure runs there too.
+            "GO\nCREATE PROCEDURE dbo.R AS BEGIN RETURN 1; END\nGO\nEXEC dbo.R;\n",
         ] {
             assert!(!both_in(&format!("{ddl}{extra}"), &out), "{extra}");
         }
@@ -2997,8 +2525,7 @@ END
              @level0type = N'SCHEMA', @level0name = 'dbo';\n",
             "GO\nEXEC [sp_updateextendedproperty] @name = N'd', @value = N'y';\n",
             "GO\nCREATE PROCEDURE dbo.R AS BEGIN RETURN 1; END\nGO\n\
-             CREATE PROCEDURE [dbo].[q] WITH EXECUTE AS OWNER AS BEGIN EXEC [DBO].[r]; END\n\
-             GO\nEXEC dbo.q;\n",
+             CREATE PROCEDURE [dbo].[q] WITH EXECUTE AS OWNER AS BEGIN EXEC [DBO].[r]; END\n",
         ] {
             assert!(both_in(&format!("{ddl}{extra}"), &out), "{extra}");
         }
@@ -3085,21 +2612,118 @@ END
         }
     }
 
+    /// C3d part 2, third review: what a T-SQL trigger or view runs keeps a
+    /// writable plain table out too (F3: before, a trigger's dynamic SQL
+    /// kept only read-only tables out, and a view's `OPENQUERY` none), and
+    /// a table whose PostgreSQL name has a part of 63 bytes or more is not
+    /// sent (F1: a longer name is truncated to another relation's).
+    #[test]
+    fn third_review_tables_stay_out() {
+        let ddl = "CREATE TABLE dbo.Acct (Id int NOT NULL PRIMARY KEY, Qty int NULL);\n";
+        let convert = |s: &str| {
+            crate::rewrite(s, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string()
+        };
+        let read =
+            |src: &str| Tables::read(&[src], &[&convert(src)], Dialect::Tsql, Dialect::Postgres);
+        assert!(read(ddl).writable("acct").is_some());
+        for extra in [
+            "GO\nCREATE TABLE dbo.Log (Id int NOT NULL PRIMARY KEY);\nGO\n\
+             CREATE TRIGGER dbo.tr ON dbo.Log AFTER INSERT AS\nBEGIN\n  \
+             DECLARE @s nvarchar(200) = N'ALTER TABLE dbo.' + NCHAR(65) + N'cct ADD CONSTRAINT ck CHECK (Qty < 100)';\n  \
+             EXEC (@s);\nEND\nGO\nINSERT INTO dbo.Log (Id) VALUES (1);\n",
+            "GO\nCREATE VIEW dbo.v AS SELECT x FROM OPENQUERY(loopback, 'SELECT 1 AS x');\nGO\n",
+            "GO\nComment;\n",
+        ] {
+            assert!(read(&format!("{ddl}{extra}")).get("acct").is_none(), "{extra}");
+        }
+        for (len, sent) in [(62, true), (63, false), (66, false)] {
+            let name: String = std::iter::once('T')
+                .chain(std::iter::repeat('x').take(len - 1))
+                .collect();
+            let src = ddl.replace("Acct", &name);
+            let t = read(&src);
+            assert_eq!(t.get(&name.to_lowercase()).is_some(), sent, "{len}");
+        }
+    }
+
+    /// C3d part 2, third review (F5): two procedures whose PostgreSQL names
+    /// are the same after truncation to 63 bytes are one routine (the later
+    /// `CREATE OR REPLACE` replaces the first), and a longer name in a
+    /// routine may be another's: such a pair is not confirmed, whatever the
+    /// checker says (`pair:name-too-long`).
+    #[test]
+    fn a_name_postgresql_truncates_is_never_confirmed() {
+        fn confirmed() -> proof::MirrorAnswer {
+            let mut m = proof::MirrorAnswer::from(proof::Answer::Confirmed {
+                theorem: "Sqldiff.Mirror.check_sound_c2a".into(),
+            });
+            m.scalars = Some("c2a".into());
+            m.statements = Some("c1".into());
+            m
+        }
+        let proc = |name: &str, param: &str, n: i32| {
+            format!(
+                "CREATE PROCEDURE dbo.{name} {param} int, @q int OUTPUT\nAS\nBEGIN\n  \
+                 SET XACT_ABORT ON;\n  SET NOCOUNT ON;\n  SET @q = {param} + {n};\nEND\nGO\n"
+            )
+        };
+        let answers = |src: &str| {
+            let out = crate::rewrite(src, Dialect::Tsql, Dialect::Postgres)
+                .output()
+                .to_string();
+            let k = Always::new(confirmed);
+            certify(
+                src,
+                &out,
+                Dialect::Tsql,
+                Dialect::Postgres,
+                &Trusted::default(),
+                Some(&k),
+            )
+            .into_iter()
+            .map(|c| (matches!(c.answer, Answer::Confirmed { .. }), c.why))
+            .collect::<Vec<_>>()
+        };
+        let long = "ComputeTheReplenishmentQuantityForTheWarehousePlanningModuleVersion";
+        assert!(long.len() > 63);
+        let too_long = (false, vec!["pair:name-too-long".to_string()]);
+        // Two names alike in their first 63 bytes.
+        let src = format!(
+            "{}{}",
+            proc(&format!("{long}One"), "@n", 1),
+            proc(&format!("{long}Two"), "@n", 2)
+        );
+        assert_eq!(answers(&src), [too_long.clone(), too_long.clone()]);
+        // A long parameter name.
+        let p = format!("@{}", "p".repeat(70));
+        assert_eq!(
+            answers(&proc("Short", &p, 1)),
+            std::slice::from_ref(&too_long)
+        );
+        // The same routines under short names are confirmed by the checker.
+        assert_eq!(answers(&proc("Short", "@n", 1)), [(true, vec![])]);
+        let src = format!("{}{}", proc("One", "@n", 1), proc("Two", "@n", 2));
+        assert_eq!(answers(&src), [(true, vec![]), (true, vec![])]);
+    }
+
     #[test]
     fn a_trigger_naming_its_function_runs_no_text() {
+        // (Review) The function must be one the tree declares, with a body
+        // the scan reads; the trigger itself runs no text.
+        const F: &str = "CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;\n";
         let dynamic = |text: &str| {
-            parse(text, Dialect::Postgres)
-                .syntax()
-                .descendants()
-                .filter(|n| n.kind() == SyntaxKind::STATEMENT)
-                .any(|n| dynamic_sql(&n, Dialect::Postgres, &[]))
+            let scan = Scan::new(&[text], Dialect::Postgres);
+            scan.unseen(&parse(text, Dialect::Postgres).syntax())
         };
         for text in [
             "CREATE TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE FUNCTION f();\n",
             "CREATE OR REPLACE TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE PROCEDURE f();\n",
             "CREATE CONSTRAINT TRIGGER tr AFTER INSERT ON acct FOR EACH ROW EXECUTE FUNCTION f();\n",
         ] {
-            assert!(!dynamic(text), "{text}");
+            assert!(!dynamic(&format!("{F}{text}")), "{text}");
+            assert!(dynamic(text), "undeclared: {text}");
         }
         // Elsewhere `EXECUTE function` runs the text of a variable so named,
         // and an event trigger fires on DDL.
@@ -3107,8 +2731,9 @@ END
             "DO $$ DECLARE function text := 'SELECT 1'; BEGIN EXECUTE function; END $$;\n",
             "EXECUTE function;\n",
             "CREATE EVENT TRIGGER et ON ddl_command_end EXECUTE FUNCTION f();\n",
+            "CREATE FUNCTION g() RETURNS void LANGUAGE plpgsql AS $$ DECLARE function text; BEGIN EXECUTE function; END $$;\n",
         ] {
-            assert!(dynamic(text), "{text}");
+            assert!(dynamic(&format!("{F}{text}")), "{text}");
         }
     }
 
@@ -3279,6 +2904,7 @@ END
             (shape("unexpected tokens in EXEC at `WITH`"), "read:other"),
             // Pairing.
             ("the output has no routine for it".to_string(), "pair:no-output"),
+            (NAME_TOO_LONG.to_string(), "pair:name-too-long"),
             (
                 "no renaming pairs the two routines: 2 parameters in the source, 1 in the output"
                     .to_string(),
