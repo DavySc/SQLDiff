@@ -2250,8 +2250,8 @@ not show the caller's transaction state, so the Rust side names this for
 every routine with a `BEGIN TRAN` outside a `TRY`
 (`ASM-TSQL-DOOMED-TXN`, crates/sqldiff-convert/src/cert.rs). A finished call shows the database
 with everything committed, as without the transaction, so `BEGIN TRAN`
-lowers to nothing and `COMMIT` to the core's `commit`, which does
-nothing. Outside the spec: a `COMMIT` without its `BEGIN TRAN` (error
+and `COMMIT` lower to nothing (a confirmation names `ASM-NO-CALLER-TXN`
+from the transaction statements themselves, `tsqlTxn`). Outside the spec: a `COMMIT` without its `BEGIN TRAN` (error
 3902), a `BEGIN TRAN` without its `COMMIT` (error 266 at the end of the
 procedure; probed, P10, with `@@TRANCOUNT = 1` left to the caller), nesting (`@@TRANCOUNT` 2), a `RETURN` between
 them, `ROLLBACK` except in the idiom below, `SAVE TRAN`, named
@@ -2292,7 +2292,14 @@ DEFINER procedure cannot execute transaction control statements";
 cannot execute transaction control statements" (V17). The last is
 `ASM-NO-CALLER-TXN` again: the procedure is called by a top-level `CALL`
 outside a transaction block, from a chain of `CALL`s and `DO`s only.
-Then `COMMIT` cannot fail and changes nothing a finished call shows.
+Then `COMMIT` cannot fail and changes nothing a finished call shows, so
+it lowers to nothing, wherever the converter puts it: after a T-SQL
+transaction's last statement, or after each statement T-SQL commits on
+its own (autocommit, rule `tsql.txn.autocommit`). What a `COMMIT` keeps
+when a later statement fails is the database after a failed call, which
+a failed observation does not carry (`ASM-STATE-AFTER-ERROR`). A
+confirmation names `ASM-NO-CALLER-TXN` from the `COMMIT`s themselves
+(`pgTxn`).
 `ROLLBACK`, `COMMIT AND CHAIN` and the rest are outside the spec.
 Probed: P9 (an error ends a top-level `CALL` and rolls back all its
 writes), P9b (a `COMMIT` keeps what came before it), P13 (`COMMIT` in a
@@ -2435,8 +2442,8 @@ def lowerTxn (d : Dialect) (cx : Ctx) (op : String) (name : Option String) : Opt
   if name.isSome then none
   else match d, op.toUpper with
     | .tsql _ _, "BEGIN" => if cx.txn then some [] else none
-    | .tsql _ _, "COMMIT" => if cx.txn then some [.commit] else none
-    | .pg _ _, "COMMIT" => if cx.commit then some [.commit] else none
+    | .tsql _ _, "COMMIT" => if cx.txn then some [] else none
+    | .pg _ _, "COMMIT" => if cx.commit then some [] else none
     | _, _ => none
 
 /-- `THROW` (T-SQL) and `RAISE` (PL/pgSQL). -/
@@ -3237,6 +3244,10 @@ def tsqlStringParams : Ast.Routine → Bool
 /-- The T-SQL routine has a transaction statement (C4): `BEGIN TRAN`,
 `COMMIT`, or the `ROLLBACK` of the rollback-and-rethrow idiom. -/
 def tsqlTxn : Ast.Routine → Bool
+  | .Routine _ _ _ _ _ _ (.Block _ body) => hasTxnNodes body
+
+/-- The PL/pgSQL routine has a transaction statement (C4): a `COMMIT`. -/
+def pgTxn : Ast.Routine → Bool
   | .Routine _ _ _ _ _ _ (.Block _ body) => hasTxnNodes body
 
 end Sqldiff.Mirror

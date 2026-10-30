@@ -141,7 +141,8 @@ And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
   PL/pgSQL `WHEN OTHERS`.
 * `ASM-NO-CALLER-TXN`, when an error can reach a handler, or the routine
   has transaction statements (also those of the rollback-and-rethrow
-  idiom, which lowers to its body): the caller holds no open transaction
+  idiom, which lowers to its body), or its conversion commits (`bTxn`:
+  the PL/pgSQL routine has a `COMMIT`, which lowers to nothing): the caller holds no open transaction
   (T-SQL: `@@TRANCOUNT` 0 on entry and `IMPLICIT_TRANSACTIONS OFF`;
   PostgreSQL: a top-level `CALL` outside a transaction block). Otherwise
   a handled error dooms the caller's T-SQL transaction under `XACT_ABORT
@@ -153,7 +154,7 @@ And, for errors and transactions (C4, `Sqldiff.Mirror`, "The C4 rules"):
 `ASM-STATE-AFTER-ERROR` is decided on the settled routine
 (`Core.Routine.settle`): a handled body that cannot fail after a write
 leaves nothing behind when it fails, which is what `undo` says. -/
-def residual (a : Ast.Routine) (ca : Core.Routine) : List String :=
+def residual (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : List String :=
   (if ca.mayRaise || ca.hasCount then ["ASM-TSQL-ARITH-ERRORS"] else []) ++
     (if ca.hasEqNe then ["ASM-TSQL-ANSI-NULLS"] else []) ++
     (if ca.settle.errAfterWrite then ["ASM-STATE-AFTER-ERROR"] else []) ++
@@ -162,13 +163,13 @@ def residual (a : Ast.Routine) (ca : Core.Routine) : List String :=
     (if ca.hasLen then ["ASM-TSQL-LEN-BMP"] else []) ++
     (if tsqlStringParams a then ["ASM-TSQL-STRING-ARGS"] else []) ++
     (if ca.hasCatch then ["ASM-CATCH-CORE-ERRORS"] else []) ++
-    (if ca.catches || ca.hasCommit || tsqlTxn a then ["ASM-NO-CALLER-TXN"] else []) ++
+    (if ca.catches || ca.hasCommit || tsqlTxn a || bTxn then ["ASM-NO-CALLER-TXN"] else []) ++
     (if ca.raisesUser then ["ASM-THROW-ERRCODE"] else [])
 
 /-- The routines use C4: a handler, a raised error or transaction
 control (the `"errors"` field of an answer). -/
-def usesC4 (a : Ast.Routine) (ca : Core.Routine) : Bool :=
-  ca.hasCatch || ca.raisesUser || ca.hasCommit || tsqlTxn a
+def usesC4 (a : Ast.Routine) (ca : Core.Routine) (bTxn : Bool := false) : Bool :=
+  ca.hasCatch || ca.raisesUser || ca.hasCommit || tsqlTxn a || bTxn
 
 /-- The residual of a T-SQL routine, when it lowers. -/
 def residualOf (dep : Deployment) (Γ : Catalog) (a : Ast.Routine) : Option (List String) :=
