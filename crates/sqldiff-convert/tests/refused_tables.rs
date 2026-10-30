@@ -278,3 +278,30 @@ fn a_view_over_a_stand_in_carries_it_to_its_users() {
     assert!(st >= Status::Unproven, "{rules:?}");
     assert!(has(&rules, "tree.refused-column"), "{rules:?}");
 }
+
+#[test]
+fn dynamic_sql_naming_a_stand_in_carries_it() {
+    // The engine compares dynamic SQL whose text is known, and that binds
+    // against the stand-in: the name inside the string counts.
+    let fx = Fixture::new(
+        "dynamic",
+        &[
+            PEOPLE,
+            (
+                "src/scripts/rename.sql",
+                "EXEC('UPDATE app.people SET full_name = N''x'' WHERE person_id = 1');\n",
+            ),
+            (
+                "src/scripts/search.sql",
+                "EXEC('SELECT person_id FROM app.people WHERE search_name = N''x''');\n",
+            ),
+        ],
+    );
+    let t = fx.convert();
+    let (st, rules) = one(&t, "scripts/rename.sql");
+    assert!(st >= Status::Assumptions, "{rules:?}");
+    assert!(has(&rules, "ASM-TABLE-STAND-IN"), "{rules:?}");
+    let (st, rules) = one(&t, "scripts/search.sql");
+    assert!(st >= Status::Unproven, "{rules:?}");
+    assert!(has(&rules, "tree.refused-column"), "{rules:?}");
+}

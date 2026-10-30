@@ -312,9 +312,13 @@ pub(crate) fn nodes(text: &str, d: Dialect) -> Vec<Node> {
 /// and aliases are among them; a column named like a suspect object flags
 /// too (a false alarm, never a miss).
 pub(crate) fn refs_at(text: &str, d: Dialect) -> Vec<(usize, Key)> {
-    use sqldiff_core::tokens::{of_node, qualified};
     let root = sqldiff_syntax::parse(text, d).syntax();
-    let t = of_node(&root);
+    refs_in(&sqldiff_core::tokens::of_node(&root), d)
+}
+
+/// `refs_at` over tokens already read.
+pub(crate) fn refs_in(t: &[sqldiff_core::tokens::Tok], d: Dialect) -> Vec<(usize, Key)> {
+    use sqldiff_core::tokens::qualified;
     let mut out = Vec::new();
     let mut i = 0;
     while i < t.len() {
@@ -323,7 +327,7 @@ pub(crate) fn refs_at(text: &str, d: Dialect) -> Vec<(usize, Key)> {
             i += 1;
             continue;
         }
-        let (parts, next) = qualified(&t, i);
+        let (parts, next) = qualified(t, i);
         let pairs: Vec<&[Ident]> = match parts.len() {
             0 | 1 => vec![&parts[..]],
             _ => parts.windows(2).collect(),

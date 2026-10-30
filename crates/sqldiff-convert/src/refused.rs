@@ -23,7 +23,7 @@ use sqldiff_core::tokens::{close_paren, of_node, qualified, split_commas, texts,
 use sqldiff_core::Dialect;
 use sqldiff_syntax::SyntaxKind;
 
-use crate::base::{nodes, refs_at, Key, Node};
+use crate::base::{nodes, refs_at, refs_in, Key, Node};
 use crate::{Conversion, Note, Status};
 
 /// The rule a unit naming a stand-in table carries.
@@ -368,18 +368,18 @@ impl StandIns {
         if self.tables.is_empty() {
             return;
         }
-        let tokens = |text: &str, d: Dialect| of_node(&sqldiff_syntax::parse(text, d).syntax());
         for (fi, ((_, text), c)) in files.iter().zip(convs).enumerate() {
             // Names in the source and in the output: a name the source
             // holds in a string (sp_addextendedproperty) is a name in the
-            // output (COMMENT ON).
-            let (src_toks, out_toks) = (tokens(text, from), tokens(&c.output, to));
+            // output (COMMENT ON). Names in SQL held in a string (dynamic
+            // SQL whose text is known, which the engine compares) count too.
+            let (src_toks, out_toks) = (tokens(text, from, 0), tokens(&c.output, to, 0));
             let mut hits: Vec<Vec<usize>> = vec![Vec::new(); c.units.len()];
-            let found = refs_at(text, from)
+            let found = refs_in(&src_toks, from)
                 .into_iter()
                 .map(|(at, r)| (innermost(c, at, false), r))
                 .chain(
-                    refs_at(&c.output, to)
+                    refs_in(&out_toks, to)
                         .into_iter()
                         .map(|(at, r)| (innermost(c, at, true), r)),
                 );
@@ -496,6 +496,40 @@ fn without_columns(c: &Catalog, d: Dialect, table: &Key, cols: &[(usize, String)
         }
     }
     c
+}
+
+/// The tokens of `text`, each string literal followed by the tokens of the
+/// SQL it may hold (at the literal's place), to a few levels of nesting.
+fn tokens(text: &str, d: Dialect, depth: usize) -> Vec<Tok> {
+    let mut out = Vec::new();
+    for t in of_node(&sqldiff_syntax::parse(text, d).syntax()) {
+        let inner = (depth < 3 && matches!(t.kind, SyntaxKind::STRING | SyntaxKind::DOLLAR_STRING))
+            .then(|| literal(&t.text))
+            .flatten();
+        let (start, end) = (t.start, t.end);
+        out.push(t);
+        if let Some(sql) = inner {
+            out.extend(tokens(&sql, d, depth + 1).into_iter().map(|mut x| {
+                x.start = start;
+                x.end = end;
+                x
+            }));
+        }
+    }
+    out
+}
+
+/// A string literal's text: `N'…'`, `E'…'`, `'…'` with doubled quotes, or
+/// `$tag$…$tag$`.
+fn literal(raw: &str) -> Option<String> {
+    if let Some(rest) = raw.strip_prefix('$') {
+        let tag_end = rest.find('$')? + 2;
+        let tag = &raw[..tag_end];
+        return raw[tag_end..].strip_suffix(tag).map(str::to_string);
+    }
+    let open = raw.find('\'')?;
+    let body = raw[open + 1..].strip_suffix('\'')?;
+    Some(body.replace("''", "'"))
 }
 
 /// The innermost unit whose source (or output) holds byte `at`.
