@@ -876,6 +876,13 @@ fact = "How callers read informational messages."
 sites = ["sqldiff-convert/src/tsql.rs"]
 
 [[assumption]]
+id = "ASM-RAISERROR-SEVERITY"
+statement = "A RAISERROR severity variable is not NULL and at most 18 (T-SQL raises error 2754 for 19 and above without WITH LOG, and for a NULL severity uses the value the variable held before)."
+discharge = "deployment"
+fact = "The values the routine puts in the severity variable (verified on SQL Server 2022: above 10 is an error, 10 and below, negatives included, a message)."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
+
+[[assumption]]
 id = "ASM-RAISERROR-TEXT"
 statement = "A RAISERROR message is 1 to 2,047 characters long (T-SQL cuts a longer one and sends an empty one as a space)."
 discharge = "deployment"
@@ -952,6 +959,13 @@ statement = "CREATE OR REPLACE replaces the existing routine (its parameter list
 discharge = "catalog"
 fact = "The existing routine's signature on the target."
 sites = ["sqldiff-convert/src/tsql.rs"]
+
+[[assumption]]
+id = "ASM-ROWCOUNT-FOUND"
+statement = "No INSTEAD OF trigger, no PostgreSQL BEFORE ROW trigger that returns NULL and no PostgreSQL rule (CREATE RULE … DO INSTEAD) acts on a table or view whose write @@ROWCOUNT is tested: T-SQL counts the statement's rows even when an INSTEAD OF trigger writes others, PostgreSQL's FOUND counts only the rows its triggers let through."
+discharge = "catalog"
+fact = "The triggers on the written tables and views in the catalog."
+sites = ["sqldiff-convert/src/tsql.rs", "sqldiff-core/src/equiv/canon.rs"]
 
 [[assumption]]
 id = "ASM-ROW-*"

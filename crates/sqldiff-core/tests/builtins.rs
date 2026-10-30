@@ -360,6 +360,59 @@ fn substring_matches_follow_the_collation() {
     ]);
 }
 
+/// The converter's CHARINDEX(x, s, start). Equal under the collation for
+/// every start (eval/builtins/2026-10-30-am: 576 combinations on SQL Server
+/// 2022 and PostgreSQL 18); any other shape stays apart.
+#[test]
+fn charindex_with_a_start_position() {
+    const CI: Want = Eq(&["ASM-CI-COLLATION", "ASM-TSQL-LEN-BMP"]);
+    let pg = |s: &str, x: &str, st: &str| {
+        format!("((strpos(substr({s}, {st}), {x}) - 1 + greatest({st}, 1)) * (strpos(substr({s}, {st}), {x}) > 0 AND length({x}) > 0)::int)")
+    };
+    let cases: Vec<(String, String, Want)> = vec![
+        ("CHARINDEX(S2, S, Q)".into(), pg("S", "S2", "Q"), CI),
+        ("CHARINDEX(S2, S, Q + 1)".into(), pg("S", "S2", "Q + 1"), CI),
+        ("CHARINDEX(',', S, 1)".into(), pg("S", "','", "1"), CI),
+        // Another start, string or needle.
+        ("CHARINDEX(S2, S, Q)".into(), pg("S", "S2", "Q + 1"), NotEq),
+        ("CHARINDEX(S2, S, Q)".into(), pg("S2", "S", "Q"), NotEq),
+        // A bigint start: substr takes an integer.
+        ("CHARINDEX(S2, S, B)".into(), pg("S", "S2", "B"), NotEq),
+        // char pads: PostgreSQL strips the padding first.
+        ("CHARINDEX('a', C, Q)".into(), pg("C", "'a'", "Q"), NotEq),
+        // `strpos + start - 1` overflows for an empty needle at start
+        // 2147483647; greatest(start, 0) is off by one for start 0.
+        (
+            "CHARINDEX(S2, S, Q)".into(),
+            "((strpos(substr(S, Q), S2) + greatest(Q, 1) - 1) * (strpos(substr(S, Q), S2) > 0 AND length(S2) > 0)::int)".into(),
+            NotEq,
+        ),
+        (
+            "CHARINDEX(S2, S, Q)".into(),
+            "((strpos(substr(S, Q), S2) - 1 + greatest(Q, 0)) * (strpos(substr(S, Q), S2) > 0 AND length(S2) > 0)::int)".into(),
+            NotEq,
+        ),
+        // Without the empty-needle test: strpos finds '' at 1.
+        (
+            "CHARINDEX(S2, S, Q)".into(),
+            "((strpos(substr(S, Q), S2) - 1 + greatest(Q, 1)) * (strpos(substr(S, Q), S2) > 0)::int)".into(),
+            NotEq,
+        ),
+        // The two-argument form is not the three-argument one.
+        ("CHARINDEX(S2, S, Q)".into(), "strpos(S, S2) - (length(S2) = 0)::int".into(), NotEq),
+    ];
+    let cases: Vec<(&str, &str, Want)> = cases
+        .iter()
+        .map(|(a, b, w)| (a.as_str(), b.as_str(), *w))
+        .collect();
+    check_as(&cases, true);
+    check(&[(
+        "CHARINDEX(S2, S, Q)",
+        "((strpos(substr(S, Q), S2) - 1 + greatest(Q, 1)) * (strpos(substr(S, Q), S2) > 0 AND length(S2) > 0)::int)",
+        NotEq,
+    )]);
+}
+
 #[test]
 fn trims_quotes_and_numbers() {
     check(&[

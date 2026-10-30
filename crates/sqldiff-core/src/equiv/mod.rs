@@ -185,6 +185,18 @@ fn ctl_item(c: &mut Canon, unit: &Unit, m: &lower::Ctl) -> Item {
             "ctl-while",
             e.clone().and_then(|e| c.condition(&e)).map(|t| vec![t]),
         ),
+        // Both dialects' tests of whether the statement just before touched
+        // or returned a row (`lower::rows_test`).
+        C::RowsIf(found, stmt) => {
+            c.assume(canon::asm::ROWCOUNT_FOUND);
+            (
+                "ctl-if",
+                Ok(vec![n(
+                    "rows-found",
+                    vec![a(*stmt), a(if *found { "true" } else { "false" })],
+                )]),
+            )
+        }
         // Both dialects' tests of the FETCH just before (`cursor.rs`).
         C::FetchWhile(key) => (
             "ctl-while",
@@ -1311,6 +1323,127 @@ fn same_stmt(
     Same::Unknown(compare::describe_unknown(m, na, nb).unwrap_or_else(|| compare::mismatch_text(m)))
 }
 
+/// Constraint names are scoped differently: T-SQL keeps every constraint
+/// name, DEFAULT ones included, in `sys.objects` with the tables, unique per
+/// schema (Msg 2714); PostgreSQL wants a constraint name unique per table,
+/// and a PRIMARY KEY or UNIQUE name, which is also its index's name, unique
+/// among the schema's tables and indexes.
+/// A file that reuses a name where either side refuses it is not compared:
+/// the other side may well accept it.
+fn constraint_name_clashes(side: &Analyzed, u: &Unit, name: &str, out: &mut Outcome) {
+    let d = side.dialect();
+    let pg = d == sqldiff_syntax::Dialect::Postgres;
+    let norm = |n: &table::Name| {
+        if pg {
+            Some(table::stored(n))
+        } else {
+            table::key(n, d).ok()
+        }
+    };
+    // (schema, table, constraint name, names an index, offset)
+    let mut named: Vec<(Option<String>, String, String, bool, usize)> = Vec::new();
+    // Tables and indexes: relations of the schema.
+    let mut relations: Vec<(Option<String>, String)> = Vec::new();
+    // T-SQL: the names in `sys.objects` (tables and every named constraint).
+    let mut objects: Vec<(Option<String>, String, usize)> = Vec::new();
+    for (n, _) in &u.tables {
+        let toks = ast::tokens(n);
+        let Ok(t) = table::parse(&toks, d) else {
+            continue;
+        };
+        let Ok((schema, tname)) = ddl::stored_key(&t.name, d) else {
+            continue;
+        };
+        relations.push((schema.clone(), tname.clone()));
+        if !pg {
+            objects.push((
+                schema.clone(),
+                tname.clone(),
+                toks.first().map_or(0, |t| t.off),
+            ));
+            // `CONSTRAINT n` anywhere in the table: keys, checks and the
+            // column defaults, whose names the table's parse does not keep.
+            for w in toks.windows(2) {
+                if table::word(Some(&w[0]), "CONSTRAINT") {
+                    if let Some(cn) = table::name_of(&w[1]).as_ref().and_then(norm) {
+                        objects.push((schema.clone(), cn, w[1].off));
+                    }
+                }
+            }
+        }
+        let keys = t.keys.iter().map(|k| (&k.name, true, k.off));
+        let fks = t.fks.iter().map(|f| (&f.name, false, f.off));
+        let checks = t.checks.iter().map(|c| (&c.name, false, c.off));
+        for (cn, ix, off) in keys.chain(fks).chain(checks) {
+            if let Some(cn) = cn.as_ref().and_then(norm) {
+                named.push((schema.clone(), tname.clone(), cn, ix, off));
+            }
+        }
+    }
+    for (node, _) in &u.ddl {
+        match ddl::parse(&ast::tokens(node), d) {
+            Ok(ddl::Ddl::Constraint(c)) => {
+                let (Ok((schema, tname)), Some(cn)) = (ddl::stored_key(&c.table, d), norm(&c.name))
+                else {
+                    continue;
+                };
+                let ix = matches!(c.added, ddl::Added::Key(_));
+                objects.push((schema.clone(), cn.clone(), c.off));
+                named.push((schema, tname, cn, ix, c.off));
+            }
+            Ok(ddl::Ddl::Default(x)) => {
+                if let (Ok((schema, _)), Some(cn)) =
+                    (ddl::stored_key(&x.table, d), x.name.as_ref().and_then(norm))
+                {
+                    objects.push((schema, cn, x.off));
+                }
+            }
+            Ok(ddl::Ddl::Index(ix)) => {
+                if let (Ok((schema, _)), Some(n)) = (ddl::stored_key(&ix.table, d), norm(&ix.name))
+                {
+                    relations.push((schema, n));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (i, (schema, tname, cn, ix, off)) in named.iter().enumerate() {
+        let others = || {
+            named
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, o)| o)
+        };
+        let why = if !pg {
+            None
+        } else if others().any(|o| o.0 == *schema && o.1 == *tname && o.2 == *cn) {
+            Some("PostgreSQL refuses a second constraint of that name on the table")
+        } else if *ix
+            && (relations.contains(&(schema.clone(), cn.clone()))
+                || others().any(|o| o.3 && o.0 == *schema && o.2 == *cn))
+        {
+            Some("a PRIMARY KEY or UNIQUE constraint's name is also its index's name, which PostgreSQL wants unique among the schema's tables and indexes")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            out.unknown_reasons.push(format!(
+                "{name} line {}: the constraint name {cn} is used again in this schema and is not compared: {why}",
+                line_at(side, *off).start_line
+            ));
+        }
+    }
+    for (i, (schema, cn, off)) in objects.iter().enumerate() {
+        if objects[..i].iter().any(|o| o.0 == *schema && o.1 == *cn) {
+            out.unknown_reasons.push(format!(
+                "{name} line {}: the name {cn} is used again in this schema and is not compared: T-SQL constraint names are unique per schema among its tables and constraints, so SQL Server refuses it (Msg 2714)",
+                line_at(side, *off).start_line
+            ));
+        }
+    }
+}
+
 /// The rest of the line from byte `off`, white space trimmed.
 fn line_at(side: &Analyzed, off: usize) -> crate::model::Location {
     let text = &side.artifact.text;
@@ -2152,6 +2285,12 @@ fn trigger_drop(
 /// no enclosing branch, loop, handler or TRY/CATCH, and no enclosing block
 /// with an EXCEPTION section (a PostgreSQL subtransaction that undoes it
 /// before its handler runs).
+/// Whether `x` sits in a routine's body (a DO block counts).
+fn in_routine(x: &SyntaxNode) -> bool {
+    x.ancestors()
+        .any(|a| a.kind() == sqldiff_syntax::SyntaxKind::ROUTINE_BODY)
+}
+
 fn runs_once(x: &SyntaxNode) -> bool {
     use sqldiff_syntax::SyntaxKind as S;
     for a in x.ancestors().skip(1) {
@@ -2519,10 +2658,12 @@ fn ddl_stmts(
     out: &mut Outcome,
 ) {
     use ast::K;
+    let (na, nb) = (side_name(a), side_name(b));
+    constraint_name_clashes(a, ua, &na, out);
+    constraint_name_clashes(b, ub, &nb, out);
     if ua.ddl.is_empty() && ub.ddl.is_empty() {
         return;
     }
-    let (na, nb) = (side_name(a), side_name(b));
     struct Stmt<'n> {
         node: &'n SyntaxNode,
         pos: usize,
@@ -2764,11 +2905,17 @@ fn ddl_stmts(
                 ),
             });
         }
-        // An index must follow its table on both sides when the file creates it.
-        if let (ddl::Ddl::Index(ix), ddl::Ddl::Index(iy)) = (dx, dy) {
-            let before = |side: &Analyzed, u: &Unit, ix: &ddl::Index, at: &SyntaxNode| {
+        // An index or a constraint must follow its table on both sides when
+        // the file creates it.
+        let on_table = |dd: &ddl::Ddl| match dd {
+            ddl::Ddl::Index(i) => Some(i.table.clone()),
+            ddl::Ddl::Constraint(c) => Some(c.table.clone()),
+            _ => None,
+        };
+        if let (Some(tx), Some(ty)) = (on_table(dx), on_table(dy)) {
+            let before = |side: &Analyzed, u: &Unit, table: &[table::Name], at: &SyntaxNode| {
                 let d = side.dialect();
-                let want = ddl::stored_key(&ix.table, d).ok();
+                let want = ddl::stored_key(table, d).ok();
                 u.tables.iter().any(|(n, _)| {
                     table::parse(&ast::tokens(n), d)
                         .ok()
@@ -2777,10 +2924,10 @@ fn ddl_stmts(
                         && n.text_range().start() > at.text_range().start()
                 })
             };
-            if before(a, ua, ix, x.node) || before(b, ub, iy, y.node) {
+            if before(a, ua, &tx, x.node) || before(b, ub, &ty, y.node) {
                 unknown(
                     out,
-                    "the file creates the index's table after the index on one side".into(),
+                    format!("the file creates the table of the {what} after it on one side"),
                 );
                 continue;
             }
@@ -2833,9 +2980,14 @@ fn ddl_stmts(
             unknown(out, why.into());
             continue;
         }
-        // A TRUNCATE inside a branch, loop or handler is placed by count
-        // only; and a row count read after it may count it.
-        if matches!(dx, ddl::Ddl::Truncate(_)) {
+        // A TRUNCATE (or a routine's index or constraint) inside a branch,
+        // loop or handler is placed by count only; and a row count read
+        // after it may count it.
+        if matches!(
+            dx,
+            ddl::Ddl::Truncate(_) | ddl::Ddl::Index(_) | ddl::Ddl::Constraint(_)
+        ) && (matches!(dx, ddl::Ddl::Truncate(_)) || in_routine(x.node) || in_routine(y.node))
+        {
             if !runs_once(x.node) || !runs_once(y.node) {
                 unknown(out, "it sits inside a branch, loop or error handler".into());
                 continue;
@@ -2913,6 +3065,7 @@ fn ddl_stmts(
         }
         let table_of = |d: &ddl::Ddl| match d {
             ddl::Ddl::Index(i) => Some((i.table.clone(), i.table_toks.clone())),
+            ddl::Ddl::Constraint(c) => Some((c.table.clone(), c.table_toks.clone())),
             _ => None,
         };
         let (tx, ty) = (table_of(dx), table_of(dy));
@@ -3076,6 +3229,73 @@ fn ddl_stmts(
     }
 }
 
+/// A T-SQL RAISERROR of severity 11 to 18 outside TRY: T-SQL goes on after
+/// it even under XACT_ABORT ON and in a CATCH block (SQL Server 2022),
+/// where PL/pgSQL stops at `RAISE EXCEPTION`. When `error_continues` leaves
+/// the error path to other checks (a CATCH, XACT_ABORT ON, statements not
+/// lowered), nothing compares what runs after such an error: a RAISERROR
+/// with anything after it (or in a loop around it) is not compared.
+fn raise_continues(
+    tside: &Analyzed,
+    oside: &Analyzed,
+    t: &Unit,
+    items: &[Item],
+    out: &mut Outcome,
+) {
+    use sqldiff_syntax::SyntaxKind;
+    let range = cst::sig_range;
+    let mut later: Vec<(usize, usize)> = items
+        .iter()
+        .filter(|it| !is_ctl(it) && !(it.term.is("return") && it.term.kids().is_empty()))
+        .filter_map(|it| it.nodes.first().map(range))
+        .collect();
+    later.extend(
+        t.calls
+            .iter()
+            .chain(&t.dynamic)
+            .map(|(n, _)| range(n))
+            .chain(t.uncovered.iter().map(|(n, _)| range(n)))
+            .chain(
+                t.ddl
+                    .iter()
+                    .chain(&t.temp_tables)
+                    .chain(&t.temp_table_drops)
+                    .map(|(n, _)| range(n)),
+            ),
+    );
+    let mut seen = Vec::new();
+    for it in items {
+        let Some(node) = it.nodes.first() else {
+            continue;
+        };
+        if !it.term.is("raise-error")
+            || it.err.is_some()
+            || seen.contains(node)
+            || node.ancestors().any(|n| n.kind() == SyntaxKind::TRY_BLOCK)
+        {
+            continue;
+        }
+        seen.push(node.clone());
+        let own = range(node);
+        // What a loop around it runs again.
+        let lp = node
+            .ancestors()
+            .find(|n| n.kind() == SyntaxKind::LOOP_STMT)
+            .map(|n| range(&n));
+        let runs_after = |r: &(usize, usize)| {
+            *r != own && (r.0 >= own.1 || lp.is_some_and(|l| l.0 <= r.0 && r.1 <= l.1))
+        };
+        if later.iter().any(runs_after) {
+            let tname = side_name(tside);
+            out.unknown_reasons.push(format!(
+                "{tname} line {}: after this RAISERROR error {tname} goes on with the next statement (RAISERROR does not honour XACT_ABORT, and outside TRY nothing catches it), where {} stops at the error: what runs after it is not compared",
+                tside.line_of(node),
+                side_name(oside)
+            ));
+        }
+    }
+}
+
 /// T-SQL keeps executing a procedure after a statement fails (unless
 /// XACT_ABORT is on or a CATCH rethrows); PostgreSQL and Db2 for i stop at
 /// the error. Any later statement with an effect then runs on one side only.
@@ -3099,15 +3319,17 @@ fn error_continues(
     let o = if t_is_a { ub } else { ua };
     // Plain script statements on the other side run one by one: the client
     // decides whether the script goes on (the behaviour model's business).
-    if !o.in_block
-        || t.stops_on_error
+    if !o.in_block || !matches!(t.kind, UnitKind::Proc | UnitKind::Script) {
+        return;
+    }
+    if t.stops_on_error
         || t.catches
         || o.catches
-        || !matches!(t.kind, UnitKind::Proc | UnitKind::Script)
         || !t.uncovered.is_empty()
         || !o.uncovered.is_empty()
         || items.iter().any(|it| it.err.is_some())
     {
+        raise_continues(tside, oside, t, items, out);
         return;
     }
     let out_param = |s: &Term| {
@@ -3314,6 +3536,11 @@ fn error_continues(
                 _ => {}
             }
             if items[k].nodes.len() == 1 && script::cannot_fail(t, &items[k].nodes[0]) {
+                continue;
+            }
+            // The IF of a RAISERROR's severity variable compares an int
+            // with 10 (`Canon::message` refuses another type).
+            if items[k].term.is("ctl-if") && lower::severity_if(&items[k].nodes[0]) {
                 continue;
             }
         }

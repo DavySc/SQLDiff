@@ -209,6 +209,26 @@ fn substring_matches_are_proven_under_the_collation_assumption() {
     );
 }
 
+/// CHARINDEX with a start position (eval/builtins/2026-10-30-am): strpos
+/// of the rest of the string, moved back by start - 1, 0 when not found or
+/// for an empty needle; every argument is read more than once.
+#[test]
+fn charindex_with_a_start_position() {
+    proven_ci(
+        "SET @i = CHARINDEX(N',', @s, @i + 1);",
+        "v_i := ((strpos(substr(p_s, v_i + 1), ',') - 1 + greatest(v_i + 1, 1)) * (strpos(substr(p_s, v_i + 1), ',') > 0 AND length(',') > 0)::int);",
+    );
+    proven_ci(
+        "SET @i = CHARINDEX(@s, N'a,b', 1);",
+        "v_i := ((strpos(substr('a,b', 1), p_s) - 1 + greatest(1, 1)) * (strpos(substr('a,b', 1), p_s) > 0 AND length(p_s) > 0)::int);",
+    );
+    refused("SET @i = CHARINDEX(N',', LTRIM(@s), 2);", "start position");
+    refused(
+        "SET @i = CHARINDEX(N',', @s, LEN(@s) - 2);",
+        "start position",
+    );
+}
+
 #[test]
 fn trims_and_quotes_are_proven() {
     proven("SET @r = LTRIM(RTRIM(@s));", "v_r := LTRIM(RTRIM(p_s));");
