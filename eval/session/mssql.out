@@ -1,0 +1,11 @@
+Changed database context to 'probe_rowcount'.
+R1 ROWCOUNT 0 (default): rows updated, as the routine counts them: 3
+R1 caller SET ROWCOUNT 1: rows updated, as the routine counts them: 1, as the caller counts them afterwards: 1
+R2 caller SET ROWCOUNT 1: DELETE of 3 rows leaves 2
+R2 caller SET ROWCOUNT 1: INSERT of 3 rows inserts 1
+R3 under ROWCOUNT 0:
+R3 key pick=30 count=3 exists=1 subquery=20 last of several=3
+R3 under the caller's ROWCOUNT 1:
+R3 key pick=30 count=3 exists=1 subquery=20 last of several=1
+R4 routine SET ROWCOUNT 0 first: rows updated 3; the caller's next UPDATE, still under its ROWCOUNT 1, updates 1
+Changed database context to 'master'.

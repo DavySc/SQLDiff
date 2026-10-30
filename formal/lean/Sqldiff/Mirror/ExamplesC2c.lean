@@ -238,15 +238,17 @@ def checkV (a b : Ast.Routine) (cert : Cert := vCert) : Answer := check depv Γv
 #guard (lowerP Γv procP).isSome
 #guard isC2a (checkV procT procP)
 -- What it rests on: arithmetic errors (`+`), `=` (`ANSI_NULLS`), a failure
--- after a write, the two `DATEADD` facts, and the converter's `COMMIT`s.
+-- after a write, the two `DATEADD` facts, the caller's `ROWCOUNT` (a data
+-- statement and a query), and the converter's `COMMIT`s.
 -- (`ASM-TSQL-STRING-ARGS`: the `bit`, `date` and `datetime2(6)`
 -- parameters take values of their type from a T-SQL caller.)
 #guard residualOf depv Γv procT ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR",
-    "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END"]
+    "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-TSQL-ROWCOUNT-0"]
 #guard (lowerT depv Γv procT).map (fun r => residual procT r true) ==
   some ["ASM-TSQL-ARITH-ERRORS", "ASM-TSQL-ANSI-NULLS", "ASM-STATE-AFTER-ERROR",
-    "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN"]
+    "ASM-TSQL-STRING-ARGS", "ASM-DATEADD-RANGE", "ASM-DATEADD-YEAR-END", "ASM-NO-CALLER-TXN",
+    "ASM-TSQL-ROWCOUNT-0"]
 
 /-! ## Runs of the lowered routine
 

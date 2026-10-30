@@ -23,7 +23,7 @@ The verified gate of [the verification roadmap](../../docs/verification-roadmap.
 | `Sqldiff/Mirror/Diagnose.lean` | (0.13.0) Untrusted refusal diagnostics: `whyT` and `whyP` name the constructs `lowerT`/`lowerP` refuse, as the codes of "Refusal diagnostics" below, using the lowering functions as oracles node by node; no theorem depends on it |
 | `Sqldiff/Mirror/Request.lean` | The fields of a `sqldiff-check/3` mirror request and their decoding (C3a: table mappings in DEPLOYMENT, table entries in CATALOG; C3c: string column types and defaults in a table entry; C2c: the typed-value column types `j`, `h`, `b`, `d`, `t<p>` and their defaults); the extra answer fields (`scalars`, `residual`, `statements`, and (C4) `errors`) |
 | `Sqldiff/Mirror/Examples.lean`, `Sqldiff/Mirror/ExamplesC2b.lean`, `Sqldiff/Mirror/ExamplesC2c.lean`, `Sqldiff/Mirror/ExamplesC3a.lean`, `Sqldiff/Mirror/ExamplesC3b.lean`, `Sqldiff/Mirror/ExamplesC3c.lean`, `Sqldiff/Mirror/ExamplesC4.lean`, `Sqldiff/Mirror/ExamplesDiag.lean` | Confirmed and refused pairs and interpreter runs (C1 and C2a; C2b strings; C2c typed values, with the runs of the date arithmetic and the width overflows; C3a with table states; C3b queries; C3c string columns, defaults; C4 handlers, raised errors and transactions, with the runs that show why a refused pair differs; the reason codes of refused routines, one or more per family), as `#guard`s checked on every build |
-| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.14.0 |
+| `Main.lean` | The executable: one tab-separated request per line on stdin (`sqldiff-check/2`, with the schema hash; `sqldiff-check/3` for the mirror check, with the abstract syntax schema hash), one JSON answer per line on stdout (the answer format is documented there; an unconfirmed `/3` answer whose routine is outside the spec carries `why`, the reason codes). A request whose schema hash is not the checker's, or whose trees or routines do not decode, is unconfirmed. The checker reports version 0.15.0 |
 | `Axioms.lean`, `check_axioms.py` | `#print axioms` for every theorem the gate relies on, checked against the allowlist (Lean's three standard axioms; vendor facts only through a signed `SPEC.lock`, decision 5) |
 | `test_gate.py` | Protocol tests against the built binary |
 | `measure.py` | Start-up, throughput, size and linked libraries (decision 2 budgets) |
@@ -325,7 +325,21 @@ corrects C2a, which observed the world after a failed call.)
   read (the deployment's choice, as before);
 - the residuals of the answer: `ASM-TSQL-ARITH-ERRORS`,
   `ASM-TSQL-ANSI-NULLS` (it also decides which rows a `WHERE` with `=`
-  matches), and `ASM-STATE-AFTER-ERROR`;
+  matches), `ASM-STATE-AFTER-ERROR`, and (checker 0.15.0)
+  `ASM-TSQL-ROWCOUNT-0`: callers run the routine with `SET ROWCOUNT 0`,
+  the default. A caller's `SET ROWCOUNT n` is inherited by the routine
+  and limits the rows its `INSERT`, `UPDATE`, `DELETE` and `SELECT`
+  statements touch or read, and PostgreSQL has no such setting
+  (`eval/session`, R1 to R4, SQL Server 2022 and PostgreSQL 18.6: under a
+  caller's `SET ROWCOUNT 1` an `UPDATE` and a `DELETE` of three rows
+  touch one and a three-row `INSERT ... VALUES` inserts one; the
+  converted procedure touches all three). Every routine with a data
+  statement or a query names it (`Sqldiff.Mirror.residual`), and the
+  Rust side adds it to every confirmation whose `statements` is `c3a` or
+  `c3b` (also on the C1 path and from an older checker). It is not
+  discharged by the routine's text: the reader keeps only `ON`/`OFF`
+  options as `Setting`s, so a routine that begins with `SET ROWCOUNT 0`
+  is outside the spec;
 - the parser: `sqldiff_syntax` reads routines with the extended parser,
   which drops a T-SQL `OUTPUT` clause on `INSERT`/`UPDATE` and the
   qualifier of `SET t.c = e`; the Lean side cannot see either, so the Rust
@@ -400,7 +414,12 @@ quoted from memory in `Lower.lean`; `ASM-TABLES-AS-DECLARED` for the read
 tables too (the Rust side now sends a plain table a routine only reads,
 `cert.rs`, `read_tables`); `ASM-TSQL-ANSI-NULLS` when a `WHERE` uses `=`;
 `ASM-TSQL-ARITH-ERRORS` when the routine counts rows; decision 1's serial
-execution (other sessions' writes are not modelled). No new residual id.
+execution (other sessions' writes are not modelled). No new residual id
+in C3b; since checker 0.15.0 a routine that reads names
+`ASM-TSQL-ROWCOUNT-0` (see C3a). The read shapes return at most one row
+each and showed no change under a caller's `SET ROWCOUNT 1`
+(`eval/session` R3), where a pick over several rows did; they name it all
+the same, since the setting applies to every `SELECT`.
 A confirmed answer whose routines read a table carries `"statements":
 "c3b"`.
 
