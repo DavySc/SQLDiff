@@ -499,7 +499,13 @@ above:
   literal that fits. Every literal the code assigns must still convert to the
   same value on both sides (T-SQL truncates `1.5` into an `int` to 1,
   PostgreSQL rounds it to 2; `'abcdef'` into `varchar(3)` is cut off in
-  T-SQL and raises in PostgreSQL), else the variable is not proven;
+  T-SQL and raises in PostgreSQL), else the variable is not proven. A string
+  value assigned to a shorter string variable (`SET @Bank = 'Woodgrove Bank '
+  + @City` into `nvarchar(50)`) is kept as it is under the same
+  `ASM-VARIABLE-LENGTH`, unless its literal parts alone are longer than the
+  variable; a `uniqueidentifier` / `uuid` copied into a variable of that type
+  is kept as it is, any other conversion of it (to text: upper case in
+  T-SQL, lower case in PostgreSQL) is not proven;
 - otherwise compared only when every write to the variable, on both sides,
   is a literal that converts to the same known value (`'20200101'` into
   `datetime2(7)` and into `timestamp`); any other write (`SELECT … INTO`,

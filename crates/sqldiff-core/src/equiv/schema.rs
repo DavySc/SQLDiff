@@ -33,6 +33,11 @@ pub enum Fam {
     /// Db2 for i VARBINARY and BLOB); `len` None means unbounded (MAX).
     /// Fixed-length BINARY(n) stays `Other`: T-SQL pads it with zeros.
     Binary,
+    /// T-SQL uniqueidentifier, PostgreSQL uuid: a 16-byte identifier. Only
+    /// a uuid kept as it is (assigned, stored or cast to uuid) is known to
+    /// agree; its text (upper case in T-SQL, lower case in PostgreSQL), its
+    /// order and every other conversion are left to the dialects.
+    Uuid,
     Other,
 }
 
@@ -210,6 +215,8 @@ impl Ty {
             "TIME" => Self::time_ty(Fam::Time, n(0), d),
             "INTERVAL" if d == Dialect::Postgres => Ty::of(Fam::Interval),
             "BOOLEAN" | "BOOL" => Ty::of(Fam::Bool),
+            "UNIQUEIDENTIFIER" if d == Dialect::Tsql => Ty::of(Fam::Uuid),
+            "UUID" if d == Dialect::Postgres => Ty::of(Fam::Uuid),
             "VARBINARY" | "BINARY VARYING" => fam_len(Fam::Binary, tsql_default),
             "BYTEA" if d == Dialect::Postgres => Ty::of(Fam::Binary),
             "BLOB" | "BINARY LARGE OBJECT" if d == Dialect::Db2i => Ty {
