@@ -151,7 +151,9 @@ fn create_table() {
         "CREATE TABLE T (\n    Id integer GENERATED ALWAYS AS IDENTITY (START WITH 1 INCREMENT BY 1) NOT NULL PRIMARY KEY,\n    Flag boolean NOT NULL DEFAULT FALSE,\n    At timestamp(3) NULL\n);\n"
     );
     let u = &c.units[0];
-    assert_eq!(u.status, Status::Decision); // BIT → boolean
+    // BIT → boolean is the default mapping, an assumption (not a decision).
+    assert_eq!(u.status, Status::Assumptions);
+    assert!(has_rule(u, "ASM-BIT-BOOLEAN"));
     assert!(has_rule(u, "ASM-IDENTITY"));
 }
 

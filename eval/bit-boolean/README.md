@@ -16,3 +16,5 @@ What the runs show, and what the rules rely on:
 - A bit cast to text is `'1'` in SQL Server, while a boolean cast to text is `'true'` (and `'t'` in `concat`). False sorts before true, as 0 before 1.
 
 If you change a bit rule, add the probe here and run it on both engines first. The Db2 for i questions are in `probes/db2i` (fact V28).
+
+The samples were recorded on 2026-10-26, when BIT → boolean was the `pg.bit-boolean` decision; since 2026-10-30 it is the default mapping and the converter writes `ASM-BIT-BOOLEAN` in that comment. The SQL is unchanged.
