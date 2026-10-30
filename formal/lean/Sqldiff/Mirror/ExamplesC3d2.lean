@@ -100,6 +100,9 @@ def strKeyT : CatTable :=
 #guard !{ itemT with opaqueCols := [opq "nm" "NAME"] }.wellFormed
 #guard !{ itemT with opaqueCols := [opq "a.b" "A"] }.wellFormed
 #guard !{ itemT with opaqueCols := [opq "é" "é"] }.wellFormed
+-- (Review) Two equal T-SQL spellings, which `caseSafe` alone admits.
+#guard !{ itemT with opaqueCols := [opq "nm2" "Name"] }.wellFormed
+#guard !{ itemT with cols := itemT.cols ++ [({ name := "id2", tsql := "Id", notNull := true, key := false } : CatCol)] }.wellFormed
 -- At least one slice column.
 #guard !{ feedT with cols := [] }.wellFormed
 

@@ -38,4 +38,5 @@ import Sqldiff.Core.Fidelity
 #print axioms Sqldiff.Core.Calendar.dayOf_addToTs
 -- C3d part 2: read-only tables are never written; a core key is a visible one.
 #print axioms Sqldiff.Mirror.writeTableOf_not_readOnly
+#print axioms Sqldiff.Mirror.lowerStmt_writes_not_readOnly
 #print axioms Sqldiff.Mirror.CatTable.keyVisible_of_hasKey

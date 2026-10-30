@@ -160,7 +160,8 @@ tables have the columns `cols` and `opaqueCols`, no others, with these names
 the type `kind` names, holds no NULL when `notNull` says so, and (a string
 column) has the database's default collation; when every primary-key
 column, on both sides, is in `cols` with a key type, the primary key is
-exactly the columns with `key` and is not `DEFERRABLE` in PostgreSQL;
+exactly the columns with `key` and is neither `DEFERRABLE` nor
+`INITIALLY DEFERRED` in PostgreSQL;
 neither table is under a row-level security policy (SQL Server security
 policy, PostgreSQL policy with row security enabled), a rule or dynamic
 data masking, and the PostgreSQL table has no inheritance children or
@@ -2321,7 +2322,8 @@ def colKey (d : Dialect) (c : CatCol) : String :=
   | .pg _ _ _ => c.name
 
 /-- The table can be used: names ASCII and distinct; T-SQL spellings
-distinct up to case; (C3c) every column's type and default as "The C3c
+distinct up to case (also two equal spellings, which `caseSafe` alone
+lets through); (C3c) every column's type and default as "The C3c
 tables" admits them (`CatCol.ok`). (C3d part 2) The opaque columns'
 names too, among the others; only a read-only table has opaque columns,
 and in one a key column may have any type of the slice (a string or bit
@@ -2335,6 +2337,7 @@ def CatTable.wellFormed (t : CatTable) : Bool :=
     names.all (fun n => !n.toList.contains '.') &&
     distinct names &&
     caseSafe (t.cols.map (·.tsql) ++ t.opaqueCols.map (·.tsql)) &&
+    distinct ((t.cols.map (·.tsql) ++ t.opaqueCols.map (·.tsql)).map (·.toLower)) &&
     (t.readOnly || t.opaqueCols.isEmpty) &&
     t.cols.all fun c => (if t.readOnly then { c with key := false } else c).ok
 
@@ -2366,8 +2369,8 @@ in the spec goes through it ("The C3d tables"). -/
 def writeTableOf (d : Dialect) (target : List String) : Option CatTable :=
   (tableOf d target).bind fun t => if t.readOnly then none else some t
 
-/-- (C3d part 2) No data statement writes a read-only table: every write
-lowering finds its table through `writeTableOf`. -/
+/-- (C3d part 2) `writeTableOf` never gives a read-only table. That no
+lowered data statement writes one is `lowerStmt_writes_not_readOnly`. -/
 theorem writeTableOf_not_readOnly {d : Dialect} {target : List String} {t : CatTable}
     (h : writeTableOf d target = some t) : t.readOnly = false := by
   unfold writeTableOf at h
@@ -2754,9 +2757,14 @@ need checking against the pages; the probes are what the rules rest on.
 
 **Only reads.** `INSERT`, `UPDATE` and `DELETE` find their table through
 `writeTableOf`, which refuses a read-only one (reason code
-`stmt:<kind>:table:read-only`); the slice check (`sliceStmt`) does the
-same; `MERGE`, `TRUNCATE` and every other write are outside the spec in
-any case. A call is the world's effect (`Core.WorldModel.call`), which
+`stmt:<kind>:table:read-only`); `MERGE`, `TRUNCATE` and every other
+write are outside the spec in any case. Theorem
+`lowerStmt_writes_not_readOnly`: a data statement `lowerStmt` lowers
+names a table that is not read-only, and data statements reach the core
+only through `lowerStmt`. The slice check (`sliceStmt`) and the
+diagnostics find the table through `writeTableOf` too, by construction
+(`writeTableOf_not_readOnly` covers `writeTableOf` alone).
+A call is the world's effect (`Core.WorldModel.call`), which
 may change any table, a read-only one included, as it may change tables
 outside the catalog: the opaque columns are, like those tables, part of
 the database the world sees and the core does not (a callee's effect on
@@ -2847,7 +2855,9 @@ able to fail, `Core.Stmt.failsHere`) need no key; only `SELECT @x = ...`
 and its `FOR` block need the closure. A `UNIQUE` constraint is not used
 as a key (outside C3d part 2). The Rust side sends key flags only when
 both tables declare the same primary key in their `CREATE TABLE`, on
-columns of key types on both sides, not `DEFERRABLE` (a PostgreSQL
+columns of key types on both sides, with no `DEFERRABLE` or `INITIALLY`
+anywhere in the statement (`INITIALLY DEFERRED` alone makes a PostgreSQL
+key deferrable; review of C3d part 2) (a PostgreSQL
 deferred key may hold two equal keys until the transaction commits).
 
 **Nullability.** `notNull` is claimed only where both DDLs say `NOT NULL`
@@ -3243,6 +3253,48 @@ def lowerStmt (d : Dialect) (env : TyEnv) (k : Ast.RoutineKind) : Ast.Stmt → O
     let wh' ← lowerOpt d env (scopeOf d t tgt) wh
     pure [.delete t.toDef wh']
   | .Insert .. | .Update .. | .Delete .. | .Merge .. | .Message .. => none
+
+/-- (C3d part 2) The table a data statement writes, as it names it. -/
+def writtenTable : Ast.Stmt → Option (List String)
+  | .Insert tgt .. | .Update tgt .. | .Delete tgt .. | .Merge tgt .. => some tgt
+  | _ => none
+
+/-- What `writeTableOf` gives is the catalog's table, and not read-only. -/
+theorem writeTableOf_spec {d : Dialect} {target : List String} {t : CatTable}
+    (h : writeTableOf d target = some t) : tableOf d target = some t ∧ t.readOnly = false := by
+  unfold writeTableOf at h
+  cases ho : tableOf d target with
+  | none => simp [ho] at h
+  | some u =>
+    cases hr : u.readOnly <;> simp_all
+
+/-- (C3d part 2) **No lowered statement writes a read-only table.** A data
+statement (`INSERT`, `UPDATE`, `DELETE`, `MERGE`) that `lowerStmt` lowers
+names a table of the catalog (`tableOf`) that is not read-only. Data
+statements reach the core only through `lowerStmt` (the `NStmt` case of
+`lowerNode`), so no routine the check lowers writes a read-only table.
+The slice check (`sliceStmt`) and the diagnostics (`Diagnose.lean`) find
+the table through `writeTableOf` too, by construction. -/
+theorem lowerStmt_writes_not_readOnly {d : Dialect} {env : TyEnv} {k : Ast.RoutineKind}
+    {s : Ast.Stmt} {ss : List Stmt} {tgt : List String}
+    (h : lowerStmt d env k s = some ss) (hw : writtenTable s = some tgt) :
+    ∃ t, tableOf d tgt = some t ∧ t.readOnly = false := by
+  cases hwt : writeTableOf d tgt with
+  | some t => exact ⟨t, writeTableOf_spec hwt⟩
+  | none =>
+    exfalso
+    cases s with
+    | Insert tgt' cols src ret ri oc =>
+      simp only [writtenTable, Option.some.injEq] at hw; subst hw
+      cases src <;> cases ret <;> cases ri <;> cases oc <;> simp [lowerStmt, hwt] at h
+    | Update tgt' a sets fr wh =>
+      simp only [writtenTable, Option.some.injEq] at hw; subst hw
+      cases a <;> cases fr <;> simp [lowerStmt, hwt] at h
+    | Delete tgt' a fr wh =>
+      simp only [writtenTable, Option.some.injEq] at hw; subst hw
+      cases a <;> cases fr <;> simp [lowerStmt, hwt] at h
+    | Merge => simp [lowerStmt] at h
+    | _ => simp [writtenTable] at hw
 
 /-! ## Calls -/
 

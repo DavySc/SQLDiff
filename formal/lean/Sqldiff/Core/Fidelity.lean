@@ -35,13 +35,16 @@ variable {U : Type}
 
 /-- The rows of table `t` satisfy its definition: each row has one value
 per column, no required column (`NOT NULL` or key) is NULL, each row has
-a key of integers, dates or timestamps (`keyOf`), and no two rows have
-the same key. Both engines keep every table in such a state at every
-statement boundary (the primary key is not deferrable in PostgreSQL, and
-checked on every write in SQL Server; `ASM-TABLES-AS-DECLARED`). -/
+a key of integers, dates or timestamps (`keyOf`), and, when the table has
+a key (`TableDef.hasKey`), no two rows have the same key. A table without
+a key may hold equal rows (`keyOf` is `some []` for every row), so the
+distinctness is asked only of a keyed one. Both engines keep every table
+in such a state at every statement boundary (the primary key is not
+deferrable in PostgreSQL, and checked on every write in SQL Server;
+`ASM-TABLES-AS-DECLARED`). -/
 def TableOk (t : TableDef) (rs : List (Row U)) : Prop :=
   (∀ r ∈ rs, r.length = t.cols.length ∧ rowOk t.cols r = true ∧ (keyOf t.cols r).isSome = true) ∧
-    rs.Pairwise fun r r' => keyOf t.cols r ≠ keyOf t.cols r'
+    (t.hasKey = true → rs.Pairwise fun r r' => keyOf t.cols r ≠ keyOf t.cols r')
 
 theorem pairwise_eq_of {α β : Type} {f : α → β} :
     ∀ {l : List α}, l.Pairwise (fun a b => f a ≠ f b) →
@@ -56,12 +59,14 @@ theorem pairwise_eq_of {α β : Type} {f : α → β} :
     · exact pairwise_eq_of h.2 ha' hb' he
 
 theorem TableOk.eq_of_key {t : TableDef} {rs : List (Row U)} (h : TableOk t rs)
+    (hkey : t.hasKey = true)
     {r r' : Row U} (hr : r ∈ rs) (hr' : r' ∈ rs) (hk : keyOf t.cols r = keyOf t.cols r') :
     r = r' :=
-  pairwise_eq_of h.2 hr hr' hk
+  pairwise_eq_of (h.2 hkey) hr hr' hk
 
-theorem TableOk.nodup {t : TableDef} {rs : List (Row U)} (h : TableOk t rs) : rs.Nodup :=
-  h.2.imp fun hk e => hk (by rw [e])
+theorem TableOk.nodup {t : TableDef} {rs : List (Row U)} (h : TableOk t rs)
+    (hkey : t.hasKey = true) : rs.Nodup :=
+  (h.2 hkey).imp fun hk e => hk (by rw [e])
 
 /-! ## The product -/
 
@@ -326,7 +331,7 @@ theorem chain_agree (db : Db U) (hdb : ∀ t ∈ b.srcs, TableOk t (db.get t.nam
       -- Source `i` is determined: both tuples have the same row there.
       simp only [Block.determines, Bool.and_eq_true, decide_eq_true_eq, List.all_eq_true,
         List.any_eq_true] at hi
-      obtain ⟨⟨_, hnd⟩, hkeys⟩ := hi
+      obtain ⟨⟨hhk, hnd⟩, hkeys⟩ := hi
       have hsrc : ∀ {X : List (Row U)}, X ∈ tuples (b.srcs.map fun t => db.get t.name) →
           ∃ r, X[i]? = some r ∧ r ∈ db.get t.name := by
         intro X hX
@@ -378,7 +383,7 @@ theorem chain_agree (db : Db U) (hdb : ∀ t ∈ b.srcs, TableOk t (db.get t.nam
         simp only [Nat.zero_add] at hs1 hs2
         rw [← hs1, ← hs2]; exact hv1
       have hkey := keyOf_eq i t r r' (htok.1 r hrm).1 (htok.1 r' hrm').1 hnd hagree
-      have hrr := htok.eq_of_key hrm hrm' hkey
+      have hrr := htok.eq_of_key hhk hrm hrm' hkey
       subst hrr
       have hd' : ∀ j ∈ i :: done, T[j]? = T'[j]? := by
         intro j hj
@@ -390,6 +395,19 @@ theorem chain_agree (db : Db U) (hdb : ∀ t ∈ b.srcs, TableOk t (db.get t.nam
       simp only [List.cons_append, List.mem_cons, List.mem_append] at hj ⊢
       rcases hj with h | h | h <;> simp [h]
     · cases hi
+
+/-- Every source the chain goes through is determined, so it has a key. -/
+theorem chain_hasKey : ∀ (is done : List Nat), b.chain done is = true →
+    ∀ i ∈ is, ∀ t, b.srcs[i]? = some t → t.hasKey = true
+  | [], _, _, i, hi, _, _ => by simp at hi
+  | j :: is, done, hc, i, hi, t, ht => by
+    simp only [Block.chain, Bool.and_eq_true] at hc
+    obtain ⟨hj, hc⟩ := hc
+    rcases List.mem_cons.mp hi with rfl | hi
+    · rw [ht] at hj
+      simp only [Block.determines, Bool.and_eq_true] at hj
+      exact hj.1.1
+    · exact chain_hasKey is (j :: done) hc i hi t ht
 
 /-- **The key closure gives at most one tuple.** On a database where
 every source's table satisfies its definition (`TableOk`: distinct
@@ -404,10 +422,17 @@ theorem kept_length_le_one (db : Db U) (hb : b.atMostOne = true)
   simp only [Block.atMostOne, Bool.and_eq_true, List.all_eq_true] at hb
   obtain ⟨hc, hcov⟩ := hb
   obtain ⟨hsub, hkeep⟩ := keptTuples_sub _ rows h
+  -- Every source is in the closure, so it has a key and its rows are
+  -- distinct.
+  have hkeyed : ∀ t ∈ b.srcs, t.hasKey = true := by
+    intro t ht
+    obtain ⟨i, hi, hti⟩ := List.getElem_of_mem ht
+    exact chain_hasKey b b.closure [] hc i (by simpa using hcov i (List.mem_range.mpr hi)) t
+      (by rw [List.getElem?_eq_getElem hi, hti])
   have hnd : (tuples (b.srcs.map fun t => db.get t.name)).Nodup :=
     tuples_nodup _ (fun rs hrs => by
       obtain ⟨t, ht, rfl⟩ := List.mem_map.mp hrs
-      exact (hdb t ht).nodup)
+      exact (hdb t ht).nodup (hkeyed t ht))
   have hrows : rows.Nodup := hnd.sublist hsub
   have heq : ∀ T ∈ rows, ∀ T' ∈ rows, T = T' := by
     intro T hT T' hT'
