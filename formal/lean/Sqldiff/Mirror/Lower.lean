@@ -2508,8 +2508,12 @@ self-join through two aliases (3 and 4 rows); `EXISTS` over a join and a
 cross join; the same on both engines. Order is not observed (the C3a
 bag reading); which tuple a pick takes is ruled below. `LEFT`, `RIGHT`,
 `FULL` joins, `APPLY`, derived tables, `VALUES`, table functions,
-`LATERAL`, `NATURAL` and `USING` stay outside (the parser keeps
-`LEFT`/`RIGHT`/`FULL` as join kinds and refuses the rest).
+`LATERAL`, `NATURAL` and `USING` stay outside: the parser keeps
+`LEFT`/`RIGHT`/`FULL` as join kinds, which `readJoin` refuses, refuses
+`APPLY`, `NATURAL`, `USING` and a parenthesised join outright
+(`crates/sqldiff-syntax/tests/routine_roundtrip.rs`), and whatever else it
+reads `readJoin` refuses: it takes catalog tables and inner and cross
+joins of them only.
 
 **Where an `ON` looks.** An `ON` may name only the sources of its own
 join (the tables joined so far in that `FROM` item): T-SQL raises 4104
