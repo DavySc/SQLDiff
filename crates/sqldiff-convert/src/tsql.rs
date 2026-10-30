@@ -1994,9 +1994,10 @@ impl<'a> Cx<'a> {
                     return no("DROP … IF EXISTS: not checked for Db2 for i; test for the object in QSYS2 (for example QSYS2.SYSTABLES) first");
                 }
                 if !self.db2() && w(1) == "TRIGGER" {
-                    return no("DROP TRIGGER: PostgreSQL drops a trigger by name ON its table, which the T-SQL statement does not name; a converted trigger may also have a trigger function to drop");
+                    self.drop_trigger(&ts)?
+                } else {
+                    self.expr(&ts)
                 }
-                self.expr(&ts)
             }
             "TRUNCATE" if ts.iter().any(|t| t.is("WITH")) => {
                 return no("TRUNCATE TABLE … WITH (PARTITIONS …): no rule yet");

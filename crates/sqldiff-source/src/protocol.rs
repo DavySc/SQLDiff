@@ -346,6 +346,8 @@ impl Catalog {
             tables,
             routines,
             schemas: Vec::new(),
+            // The live catalog names a table's triggers only (`Table::triggers`).
+            triggers: Vec::new(),
         }
     }
 }
